@@ -24,6 +24,7 @@ use crate::placement_index::PlacementIndex;
 use crate::scheduling;
 
 use anyhow::Result;
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use hyprstream_rpc::identity::Did;
 use hyprstream_util::ttl_cache::TtlCache;
 use parking_lot::RwLock;
@@ -1035,9 +1036,9 @@ impl DiscoveryService {
             .set(Arc::clone(&source))
             .map_err(|_| anyhow::anyhow!("process Discovery authority is already consumed"))?;
         if let Some(identity) = deployment_identity {
-            PROCESS_REGISTRY_VERIFIER
-                .set(identity)
-                .map_err(|_| anyhow::anyhow!("deployment registry verifier is already installed"))?;
+            PROCESS_REGISTRY_VERIFIER.set(identity).map_err(|_| {
+                anyhow::anyhow!("deployment registry verifier is already installed")
+            })?;
         }
         PRODUCTION_RESOLVER
             .set(Arc::new(DiscoveryServiceResolver {
@@ -1281,6 +1282,10 @@ static PROCESS_REGISTRY_VERIFIER: std::sync::OnceLock<RegistryDeploymentVerifier
 const DEPLOYMENT_CA_ROOT_PATH: &str = "/etc/hyprstream/trust/deployment-ca.ed25519";
 const REGISTRY_DEPLOYMENT_CREDENTIAL_PATH: &str =
     "/run/hyprstream/credentials/registry-service.jwt";
+const REGISTRY_DEPLOYMENT_CREDENTIAL_PROFILE: &str = "hyprstream.registry-deployment.v1";
+const REGISTRY_DEPLOYMENT_CREDENTIAL_AUDIENCE: &str = "urn:hyprstream:service:registry";
+const REGISTRY_DEPLOYMENT_CREDENTIAL_MAX_TTL_SECONDS: i64 = 3_600;
+const REGISTRY_DEPLOYMENT_CREDENTIAL_CLOCK_SKEW_SECONDS: i64 = 60;
 
 /// Opaque verification-only view of the authenticated deployment registry.
 /// It exposes neither the raw key nor an authority replacement operation.
@@ -1323,6 +1328,307 @@ struct TrustedRegistryDeploymentCredentials {
     registry_credential: String,
 }
 
+/// JSON value decoded while preserving the security property that every object
+/// member has exactly one interpretation. `serde_json::Value` alone accepts a
+/// duplicate member with last-value-wins semantics, which is unsuitable for a
+/// credential profile.
+struct UniqueJson(serde_json::Value);
+
+impl<'de> serde::Deserialize<'de> for UniqueJson {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct Visitor;
+
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = UniqueJson;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("JSON without duplicate object members")
+            }
+
+            fn visit_unit<E>(self) -> std::result::Result<Self::Value, E> {
+                Ok(UniqueJson(serde_json::Value::Null))
+            }
+
+            fn visit_bool<E>(self, value: bool) -> std::result::Result<Self::Value, E> {
+                Ok(UniqueJson(serde_json::Value::Bool(value)))
+            }
+
+            fn visit_i64<E>(self, value: i64) -> std::result::Result<Self::Value, E> {
+                Ok(UniqueJson(serde_json::Value::Number(value.into())))
+            }
+
+            fn visit_u64<E>(self, value: u64) -> std::result::Result<Self::Value, E> {
+                Ok(UniqueJson(serde_json::Value::Number(value.into())))
+            }
+
+            fn visit_f64<E>(self, value: f64) -> std::result::Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                serde_json::Number::from_f64(value)
+                    .map(serde_json::Value::Number)
+                    .map(UniqueJson)
+                    .ok_or_else(|| E::custom("non-finite JSON number"))
+            }
+
+            fn visit_str<E>(self, value: &str) -> std::result::Result<Self::Value, E> {
+                Ok(UniqueJson(serde_json::Value::String(value.to_owned())))
+            }
+
+            fn visit_string<E>(self, value: String) -> std::result::Result<Self::Value, E> {
+                Ok(UniqueJson(serde_json::Value::String(value)))
+            }
+
+            fn visit_none<E>(self) -> std::result::Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                self.visit_unit()
+            }
+
+            fn visit_some<D>(self, deserializer: D) -> std::result::Result<Self::Value, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                <UniqueJson as serde::Deserialize>::deserialize(deserializer)
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> std::result::Result<Self::Value, A::Error>
+            where
+                A: serde::de::SeqAccess<'de>,
+            {
+                let mut values = Vec::new();
+                while let Some(value) = seq.next_element::<UniqueJson>()? {
+                    values.push(value.0);
+                }
+                Ok(UniqueJson(serde_json::Value::Array(values)))
+            }
+
+            fn visit_map<A>(self, mut map: A) -> std::result::Result<Self::Value, A::Error>
+            where
+                A: serde::de::MapAccess<'de>,
+            {
+                let mut values = serde_json::Map::new();
+                while let Some((key, value)) = map.next_entry::<String, UniqueJson>()? {
+                    if values.insert(key.clone(), value.0).is_some() {
+                        return Err(serde::de::Error::custom(format!(
+                            "duplicate JSON member {key:?}"
+                        )));
+                    }
+                }
+                Ok(UniqueJson(serde_json::Value::Object(values)))
+            }
+        }
+
+        deserializer.deserialize_any(Visitor)
+    }
+}
+
+fn exact_json_object<'a>(
+    value: &'a serde_json::Value,
+    expected: &[&str],
+    description: &str,
+) -> Result<&'a serde_json::Map<String, serde_json::Value>> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("{description} must be a JSON object"))?;
+    for member in object.keys() {
+        anyhow::ensure!(
+            expected.contains(&member.as_str()),
+            "{description} contains unexpected member {member:?}"
+        );
+    }
+    for member in expected {
+        anyhow::ensure!(
+            object.contains_key(*member),
+            "{description} is missing member {member:?}"
+        );
+    }
+    Ok(object)
+}
+
+fn exact_string_member<'a>(
+    object: &'a serde_json::Map<String, serde_json::Value>,
+    member: &str,
+    description: &str,
+) -> Result<&'a str> {
+    object[member]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("{description}.{member} must be a string"))
+}
+
+fn exact_i64_member(
+    object: &serde_json::Map<String, serde_json::Value>,
+    member: &str,
+    description: &str,
+) -> Result<i64> {
+    object[member]
+        .as_i64()
+        .ok_or_else(|| anyhow::anyhow!("{description}.{member} must be an integer"))
+}
+
+fn decode_canonical_jwt_segment(segment: &str, description: &str, limit: usize) -> Result<Vec<u8>> {
+    anyhow::ensure!(!segment.is_empty(), "{description} is empty");
+    anyhow::ensure!(segment.len() <= limit, "{description} is too large");
+    let decoded = URL_SAFE_NO_PAD
+        .decode(segment)
+        .map_err(|error| anyhow::anyhow!("{description} is not unpadded base64url: {error}"))?;
+    anyhow::ensure!(
+        URL_SAFE_NO_PAD.encode(&decoded) == segment,
+        "{description} is not canonical unpadded base64url"
+    );
+    Ok(decoded)
+}
+
+fn parse_unique_jwt_json(
+    segment: &str,
+    description: &str,
+    limit: usize,
+) -> Result<serde_json::Value> {
+    let bytes = decode_canonical_jwt_segment(segment, description, limit)?;
+    let mut deserializer = serde_json::Deserializer::from_slice(&bytes);
+    let value = <UniqueJson as serde::Deserialize>::deserialize(&mut deserializer)
+        .map_err(|error| anyhow::anyhow!("{description} is malformed: {error}"))?;
+    deserializer
+        .end()
+        .map_err(|error| anyhow::anyhow!("{description} has trailing data: {error}"))?;
+    Ok(value.0)
+}
+
+fn deployment_domain(ca_verifying_key: &VerifyingKey) -> String {
+    hyprstream_rpc::auth::jwk_thumbprint(&hyprstream_rpc::auth::JwkThumbprintInput::Ed25519 {
+        x: ca_verifying_key.as_bytes(),
+    })
+}
+
+fn validate_registry_deployment_credential_profile(
+    token: &str,
+    ca_verifying_key: &VerifyingKey,
+) -> Result<[u8; 32]> {
+    let mut segments = token.split('.');
+    let protected_segment = segments.next().unwrap_or_default();
+    let claims_segment = segments.next().unwrap_or_default();
+    let signature_segment = segments.next().unwrap_or_default();
+    anyhow::ensure!(
+        segments.next().is_none(),
+        "credential must contain exactly three segments"
+    );
+    decode_canonical_jwt_segment(signature_segment, "credential signature", 128)?;
+
+    let protected = parse_unique_jwt_json(protected_segment, "protected header", 4_096)?;
+    let protected = exact_json_object(&protected, &["alg", "typ", "kid"], "protected header")?;
+    anyhow::ensure!(
+        exact_string_member(protected, "alg", "protected header")? == "EdDSA",
+        "protected header alg must be exactly EdDSA"
+    );
+    anyhow::ensure!(
+        exact_string_member(protected, "typ", "protected header")? == "wit+jwt",
+        "protected header typ must be exactly wit+jwt"
+    );
+    let domain = deployment_domain(ca_verifying_key);
+    anyhow::ensure!(
+        exact_string_member(protected, "kid", "protected header")? == domain,
+        "protected header kid does not bind the pinned deployment CA"
+    );
+
+    let claims = parse_unique_jwt_json(claims_segment, "credential claims", 16_384)?;
+    let claims = exact_json_object(
+        &claims,
+        &[
+            "iss",
+            "sub",
+            "aud",
+            "exp",
+            "nbf",
+            "iat",
+            "deployment_domain",
+            "profile",
+            "cnf",
+        ],
+        "credential claims",
+    )?;
+    anyhow::ensure!(
+        exact_string_member(claims, "sub", "credential claims")? == "service:registry",
+        "credential subject must be exactly service:registry"
+    );
+    let intended_issuer = format!("urn:hyprstream:deployment:{domain}");
+    anyhow::ensure!(
+        exact_string_member(claims, "iss", "credential claims")? == intended_issuer,
+        "credential issuer does not bind the pinned deployment domain"
+    );
+    anyhow::ensure!(
+        exact_string_member(claims, "aud", "credential claims")?
+            == REGISTRY_DEPLOYMENT_CREDENTIAL_AUDIENCE,
+        "credential audience must be exactly {REGISTRY_DEPLOYMENT_CREDENTIAL_AUDIENCE}"
+    );
+    anyhow::ensure!(
+        exact_string_member(claims, "deployment_domain", "credential claims")? == domain,
+        "credential deployment_domain does not bind the pinned deployment CA"
+    );
+    anyhow::ensure!(
+        exact_string_member(claims, "profile", "credential claims")?
+            == REGISTRY_DEPLOYMENT_CREDENTIAL_PROFILE,
+        "credential profile must be exactly {REGISTRY_DEPLOYMENT_CREDENTIAL_PROFILE}"
+    );
+
+    let now = chrono::Utc::now().timestamp();
+    let exp = exact_i64_member(claims, "exp", "credential claims")?;
+    let nbf = exact_i64_member(claims, "nbf", "credential claims")?;
+    let iat = exact_i64_member(claims, "iat", "credential claims")?;
+    anyhow::ensure!(exp > now, "credential has expired");
+    anyhow::ensure!(
+        nbf <= now + REGISTRY_DEPLOYMENT_CREDENTIAL_CLOCK_SKEW_SECONDS,
+        "credential is not yet valid"
+    );
+    anyhow::ensure!(
+        iat <= now + REGISTRY_DEPLOYMENT_CREDENTIAL_CLOCK_SKEW_SECONDS,
+        "credential was issued in the future"
+    );
+    anyhow::ensure!(nbf <= iat, "credential nbf is after iat");
+    anyhow::ensure!(iat < exp, "credential iat is not before exp");
+    anyhow::ensure!(
+        exp - iat <= REGISTRY_DEPLOYMENT_CREDENTIAL_MAX_TTL_SECONDS,
+        "credential lifetime exceeds the one-hour profile limit"
+    );
+
+    let cnf = exact_json_object(&claims["cnf"], &["jwk"], "credential claims.cnf")?;
+    let jwk = exact_json_object(
+        &cnf["jwk"],
+        &["kty", "crv", "x"],
+        "credential claims.cnf.jwk",
+    )?;
+    anyhow::ensure!(
+        exact_string_member(jwk, "kty", "credential claims.cnf.jwk")? == "OKP",
+        "credential cnf.jwk.kty must be exactly OKP"
+    );
+    anyhow::ensure!(
+        exact_string_member(jwk, "crv", "credential claims.cnf.jwk")? == "Ed25519",
+        "credential cnf.jwk.crv must be exactly Ed25519"
+    );
+    let x = exact_string_member(jwk, "x", "credential claims.cnf.jwk")?;
+    let key = decode_canonical_jwt_segment(x, "credential cnf.jwk.x", 64)?;
+    let key: [u8; 32] = key
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("credential cnf.jwk.x must decode to exactly 32 bytes"))?;
+
+    // Signature verification is deliberately last: no parsed material can mint
+    // authority unless the exact closed profile is authenticated by the fixed CA.
+    let verified = hyprstream_rpc::auth::jwt::decode(
+        token,
+        ca_verifying_key,
+        Some(REGISTRY_DEPLOYMENT_CREDENTIAL_AUDIENCE),
+    )
+    .map_err(|error| anyhow::anyhow!("credential signature rejected: {error}"))?;
+    anyhow::ensure!(
+        verified.sub == "service:registry" && verified.cnf_key_bytes() == Some(key),
+        "verified credential differs from the exact deployment profile"
+    );
+    Ok(key)
+}
+
 #[cfg(unix)]
 fn read_os_owned_file(path: &std::path::Path, description: &str) -> Result<Vec<u8>> {
     use std::os::unix::fs::MetadataExt as _;
@@ -1330,9 +1636,15 @@ fn read_os_owned_file(path: &std::path::Path, description: &str) -> Result<Vec<u
     anyhow::ensure!(path.is_absolute(), "{description} path must be absolute");
     let metadata = std::fs::symlink_metadata(path)
         .map_err(|error| anyhow::anyhow!("{description} is unavailable at {path:?}: {error}"))?;
-    anyhow::ensure!(metadata.file_type().is_file(), "{description} is not a regular file");
+    anyhow::ensure!(
+        metadata.file_type().is_file(),
+        "{description} is not a regular file"
+    );
     anyhow::ensure!(metadata.uid() == 0, "{description} is not owned by root");
-    anyhow::ensure!(metadata.mode() & 0o022 == 0, "{description} is group/world writable");
+    anyhow::ensure!(
+        metadata.mode() & 0o022 == 0,
+        "{description} is group/world writable"
+    );
     for parent in path.ancestors().skip(1) {
         let parent_metadata = std::fs::symlink_metadata(parent).map_err(|error| {
             anyhow::anyhow!("{description} parent {parent:?} is unavailable: {error}")
@@ -1371,25 +1683,20 @@ fn load_trusted_registry_deployment_credentials() -> Result<TrustedRegistryDeplo
         "registry deployment credential",
     )?)
     .map_err(|error| anyhow::anyhow!("registry deployment credential is not UTF-8: {error}"))?;
-    Ok(TrustedRegistryDeploymentCredentials { ca_verifying_key, registry_credential })
+    Ok(TrustedRegistryDeploymentCredentials {
+        ca_verifying_key,
+        registry_credential,
+    })
 }
 
 fn authenticate_registry_deployment_credentials(
     credentials: TrustedRegistryDeploymentCredentials,
 ) -> Result<AuthenticatedRegistryDeploymentIdentity> {
-    let claims = hyprstream_rpc::auth::jwt::decode(
+    let key_bytes = validate_registry_deployment_credential_profile(
         &credentials.registry_credential,
         &credentials.ca_verifying_key,
-        None,
     )
     .map_err(|error| anyhow::anyhow!("registry deployment credential rejected: {error}"))?;
-    anyhow::ensure!(
-        claims.sub == "service:registry",
-        "deployment credential is not for service:registry"
-    );
-    let key_bytes = claims
-        .cnf_key_bytes()
-        .ok_or_else(|| anyhow::anyhow!("registry deployment credential has no cnf.jwk"))?;
     let verifying_key = VerifyingKey::from_bytes(&key_bytes)
         .map_err(|error| anyhow::anyhow!("registry credential key is malformed: {error}"))?;
     Ok(AuthenticatedRegistryDeploymentIdentity {
@@ -1426,11 +1733,8 @@ pub fn bootstrap_deployment_process(signing_key: SigningKey) -> Result<()> {
     let discovery_vk = hyprstream_service::global_trust_store()
         .resolve_one("discovery")
         .ok_or_else(|| anyhow::anyhow!("trust store has no authenticated discovery key"))?;
-    let discovery_client = crate::DiscoveryClient::for_local_bootstrap(
-        signing_key,
-        discovery_vk,
-        None,
-    )?;
+    let discovery_client =
+        crate::DiscoveryClient::for_local_bootstrap(signing_key, discovery_vk, None)?;
     DiscoveryService::bootstrap_authenticated_process(authority, discovery_client)
 }
 
@@ -1803,6 +2107,7 @@ fn parse_announced_iroh(endpoint: &str) -> anyhow::Result<TransportConfig> {
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod resolver_tests {
     use super::*;
+    use ed25519_dalek::Signer as _;
     use hyprstream_crypto::pq::{ml_dsa_generate_keypair, ml_dsa_vk_bytes};
     use hyprstream_pds::at9p::{
         CapsuleBody, HybridKeyPair, ServiceEndpoint, ServiceEntry, ServiceType,
@@ -1811,6 +2116,294 @@ mod resolver_tests {
     use hyprstream_pds::at9p_duplicity::AcceptedAt9pState;
     use hyprstream_pds::at9p_sign::{sign_capsule, sign_update_record};
     use hyprstream_rpc::transport::{BindMode, EndpointType};
+
+    fn sign_registry_credential_json(
+        ca: &SigningKey,
+        protected_json: &str,
+        claims_json: &str,
+    ) -> String {
+        let protected = URL_SAFE_NO_PAD.encode(protected_json.as_bytes());
+        let claims = URL_SAFE_NO_PAD.encode(claims_json.as_bytes());
+        let signing_input = format!("{protected}.{claims}");
+        let signature = ca.sign(signing_input.as_bytes());
+        format!(
+            "{signing_input}.{}",
+            URL_SAFE_NO_PAD.encode(signature.to_bytes())
+        )
+    }
+
+    fn exact_registry_credential_values(
+        ca: &SigningKey,
+        registry: &SigningKey,
+    ) -> (serde_json::Value, serde_json::Value) {
+        let domain = deployment_domain(&ca.verifying_key());
+        let now = chrono::Utc::now().timestamp();
+        (
+            serde_json::json!({"alg":"EdDSA", "typ":"wit+jwt", "kid":domain}),
+            serde_json::json!({
+                "iss": format!("urn:hyprstream:deployment:{domain}"),
+                "sub": "service:registry",
+                "aud": REGISTRY_DEPLOYMENT_CREDENTIAL_AUDIENCE,
+                "exp": now + 3600,
+                "nbf": now,
+                "iat": now,
+                "deployment_domain": domain,
+                "profile": REGISTRY_DEPLOYMENT_CREDENTIAL_PROFILE,
+                "cnf": {"jwk": {
+                    "kty": "OKP",
+                    "crv": "Ed25519",
+                    "x": URL_SAFE_NO_PAD.encode(registry.verifying_key().as_bytes()),
+                }},
+            }),
+        )
+    }
+
+    fn exact_registry_credential(ca: &SigningKey, registry: &SigningKey) -> String {
+        let (protected, claims) = exact_registry_credential_values(ca, registry);
+        sign_registry_credential_json(ca, &protected.to_string(), &claims.to_string())
+    }
+
+    fn authenticate_test_registry_credential(
+        ca: &SigningKey,
+        credential: String,
+    ) -> Result<AuthenticatedRegistryDeploymentIdentity> {
+        authenticate_registry_deployment_credentials(TrustedRegistryDeploymentCredentials {
+            ca_verifying_key: ca.verifying_key(),
+            registry_credential: credential,
+        })
+    }
+
+    fn assert_registry_credential_rejected(
+        ca: &SigningKey,
+        protected: &serde_json::Value,
+        claims: &serde_json::Value,
+        case: &str,
+    ) {
+        let credential =
+            sign_registry_credential_json(ca, &protected.to_string(), &claims.to_string());
+        assert!(
+            authenticate_test_registry_credential(ca, credential).is_err(),
+            "invalid deployment credential accepted: {case}"
+        );
+    }
+
+    #[test]
+    fn exact_registry_deployment_credential_installs_the_exact_bound_jwk() {
+        let ca = SigningKey::from_bytes(&[0x31; 32]);
+        let registry = SigningKey::from_bytes(&[0x32; 32]);
+        let witness =
+            authenticate_test_registry_credential(&ca, exact_registry_credential(&ca, &registry))
+                .expect("exact deployment credential profile");
+        assert!(witness.verifier.matches(&registry.verifying_key()));
+    }
+
+    #[test]
+    fn deployment_credential_rejects_every_protected_and_trust_dimension() {
+        let ca = SigningKey::from_bytes(&[0x33; 32]);
+        let other_ca = SigningKey::from_bytes(&[0x34; 32]);
+        let registry = SigningKey::from_bytes(&[0x35; 32]);
+        let (protected, claims) = exact_registry_credential_values(&ca, &registry);
+
+        for (case, member, value) in [
+            ("access token type", "typ", serde_json::json!("at+jwt")),
+            (
+                "application access token type",
+                "typ",
+                serde_json::json!("application/at+jwt"),
+            ),
+            ("generic JWT type", "typ", serde_json::json!("JWT")),
+            ("wrong-case type", "typ", serde_json::json!("WIT+JWT")),
+            ("whitespace type", "typ", serde_json::json!("wit+jwt ")),
+            ("alternate algorithm", "alg", serde_json::json!("ES256")),
+            ("wrong key id", "kid", serde_json::json!("attacker")),
+        ] {
+            let mut changed = protected.clone();
+            changed[member] = value;
+            assert_registry_credential_rejected(&ca, &changed, &claims, case);
+        }
+        for missing in ["typ", "alg", "kid"] {
+            let mut changed = protected.clone();
+            changed
+                .as_object_mut()
+                .expect("header object")
+                .remove(missing);
+            assert_registry_credential_rejected(&ca, &changed, &claims, missing);
+        }
+        let mut unknown = protected.clone();
+        unknown["crit"] = serde_json::json!([]);
+        assert_registry_credential_rejected(&ca, &unknown, &claims, "unknown header member");
+
+        let credential = exact_registry_credential(&ca, &registry);
+        assert!(
+            authenticate_test_registry_credential(&other_ca, credential).is_err(),
+            "CA substitution accepted"
+        );
+        let signed_by_other = {
+            let (other_header, _) = exact_registry_credential_values(&other_ca, &registry);
+            sign_registry_credential_json(&other_ca, &other_header.to_string(), &claims.to_string())
+        };
+        assert!(
+            authenticate_test_registry_credential(&ca, signed_by_other).is_err(),
+            "signature substitution accepted"
+        );
+    }
+
+    #[test]
+    fn deployment_credential_rejects_every_claim_and_time_dimension() {
+        let ca = SigningKey::from_bytes(&[0x36; 32]);
+        let registry = SigningKey::from_bytes(&[0x37; 32]);
+        let (protected, claims) = exact_registry_credential_values(&ca, &registry);
+        let now = chrono::Utc::now().timestamp();
+
+        for (case, member, value) in [
+            ("wrong subject", "sub", serde_json::json!("service:model")),
+            (
+                "wrong issuer",
+                "iss",
+                serde_json::json!("https://attacker.invalid"),
+            ),
+            (
+                "wrong audience",
+                "aud",
+                serde_json::json!("service:registry"),
+            ),
+            (
+                "audience array",
+                "aud",
+                serde_json::json!([REGISTRY_DEPLOYMENT_CREDENTIAL_AUDIENCE]),
+            ),
+            (
+                "wrong deployment domain",
+                "deployment_domain",
+                serde_json::json!("attacker"),
+            ),
+            (
+                "wrong profile",
+                "profile",
+                serde_json::json!("hyprstream.registry-deployment.v2"),
+            ),
+            ("expired", "exp", serde_json::json!(now - 1)),
+            ("future nbf", "nbf", serde_json::json!(now + 61)),
+            ("future iat", "iat", serde_json::json!(now + 61)),
+            ("nbf after iat", "nbf", serde_json::json!(now + 1)),
+            ("excessive lifetime", "exp", serde_json::json!(now + 3601)),
+        ] {
+            let mut changed = claims.clone();
+            changed[member] = value;
+            assert_registry_credential_rejected(&ca, &protected, &changed, case);
+        }
+        for missing in [
+            "iss",
+            "sub",
+            "aud",
+            "exp",
+            "nbf",
+            "iat",
+            "deployment_domain",
+            "profile",
+            "cnf",
+        ] {
+            let mut changed = claims.clone();
+            changed
+                .as_object_mut()
+                .expect("claims object")
+                .remove(missing);
+            assert_registry_credential_rejected(&ca, &protected, &changed, missing);
+        }
+        let mut unknown = claims.clone();
+        unknown["scope"] = serde_json::json!("registry");
+        assert_registry_credential_rejected(&ca, &protected, &unknown, "unknown claim");
+    }
+
+    #[test]
+    fn deployment_credential_rejects_every_confirmation_and_jwk_dimension() {
+        let ca = SigningKey::from_bytes(&[0x38; 32]);
+        let registry = SigningKey::from_bytes(&[0x39; 32]);
+        let (protected, claims) = exact_registry_credential_values(&ca, &registry);
+
+        for (case, member, value) in [
+            ("RSA declaration", "kty", serde_json::json!("RSA")),
+            ("EC declaration", "kty", serde_json::json!("EC")),
+            ("P-256 curve", "crv", serde_json::json!("P-256")),
+            ("alternate OKP curve", "crv", serde_json::json!("X25519")),
+            ("malformed x", "x", serde_json::json!("%%%")),
+            (
+                "padded x",
+                "x",
+                serde_json::json!(format!(
+                    "{}=",
+                    URL_SAFE_NO_PAD.encode(registry.verifying_key().as_bytes())
+                )),
+            ),
+            (
+                "short x",
+                "x",
+                serde_json::json!(URL_SAFE_NO_PAD.encode([0u8; 31])),
+            ),
+        ] {
+            let mut changed = claims.clone();
+            changed["cnf"]["jwk"][member] = value;
+            assert_registry_credential_rejected(&ca, &protected, &changed, case);
+        }
+        for missing in ["kty", "crv", "x"] {
+            let mut changed = claims.clone();
+            changed["cnf"]["jwk"]
+                .as_object_mut()
+                .expect("jwk object")
+                .remove(missing);
+            assert_registry_credential_rejected(&ca, &protected, &changed, missing);
+        }
+        for incompatible in ["alg", "use", "key_ops", "kid"] {
+            let mut changed = claims.clone();
+            changed["cnf"]["jwk"][incompatible] = serde_json::json!("unexpected");
+            assert_registry_credential_rejected(&ca, &protected, &changed, incompatible);
+        }
+        let mut ambiguous = claims.clone();
+        ambiguous["cnf"]["jkt"] = serde_json::json!("thumbprint");
+        assert_registry_credential_rejected(&ca, &protected, &ambiguous, "jwk plus jkt");
+        let mut alternate = claims.clone();
+        alternate["cnf"] = serde_json::json!({"jkt":"thumbprint"});
+        assert_registry_credential_rejected(&ca, &protected, &alternate, "jkt only");
+    }
+
+    #[test]
+    fn deployment_credential_duplicate_members_fail_closed_at_every_level() {
+        let ca = SigningKey::from_bytes(&[0x3a; 32]);
+        let registry = SigningKey::from_bytes(&[0x3b; 32]);
+        let domain = deployment_domain(&ca.verifying_key());
+        let (_, claims) = exact_registry_credential_values(&ca, &registry);
+        let duplicate_headers = [
+            format!(r#"{{"alg":"EdDSA","alg":"ES256","typ":"wit+jwt","kid":"{domain}"}}"#),
+            format!(r#"{{"alg":"EdDSA","typ":"wit+jwt","typ":"at+jwt","kid":"{domain}"}}"#),
+            format!(r#"{{"alg":"EdDSA","typ":"wit+jwt","kid":"{domain}","kid":"attacker"}}"#),
+        ];
+        for header in duplicate_headers {
+            let token = sign_registry_credential_json(&ca, &header, &claims.to_string());
+            assert!(authenticate_test_registry_credential(&ca, token).is_err());
+        }
+
+        let now = chrono::Utc::now().timestamp();
+        let x = URL_SAFE_NO_PAD.encode(registry.verifying_key().as_bytes());
+        let protected = serde_json::json!({"alg":"EdDSA", "typ":"wit+jwt", "kid":domain});
+        for duplicate_claims in [
+            format!(
+                r#"{{"iss":"urn:hyprstream:deployment:{domain}","sub":"service:registry","sub":"service:model","aud":"{REGISTRY_DEPLOYMENT_CREDENTIAL_AUDIENCE}","exp":{},"nbf":{now},"iat":{now},"deployment_domain":"{domain}","profile":"{REGISTRY_DEPLOYMENT_CREDENTIAL_PROFILE}","cnf":{{"jwk":{{"kty":"OKP","crv":"Ed25519","x":"{x}"}}}}}}"#,
+                now + 3600
+            ),
+            format!(
+                r#"{{"iss":"urn:hyprstream:deployment:{domain}","sub":"service:registry","aud":"{REGISTRY_DEPLOYMENT_CREDENTIAL_AUDIENCE}","exp":{},"nbf":{now},"iat":{now},"deployment_domain":"{domain}","profile":"{REGISTRY_DEPLOYMENT_CREDENTIAL_PROFILE}","cnf":{{"jwk":{{"kty":"OKP","crv":"Ed25519","x":"{x}"}},"jwk":{{"kty":"RSA","crv":"P-256","x":"{x}"}}}}}}"#,
+                now + 3600
+            ),
+            format!(
+                r#"{{"iss":"urn:hyprstream:deployment:{domain}","sub":"service:registry","aud":"{REGISTRY_DEPLOYMENT_CREDENTIAL_AUDIENCE}","exp":{},"nbf":{now},"iat":{now},"deployment_domain":"{domain}","profile":"{REGISTRY_DEPLOYMENT_CREDENTIAL_PROFILE}","cnf":{{"jwk":{{"kty":"OKP","kty":"RSA","crv":"Ed25519","x":"{x}"}}}}}}"#,
+                now + 3600
+            ),
+        ] {
+            let token =
+                sign_registry_credential_json(&ca, &protected.to_string(), &duplicate_claims);
+            assert!(authenticate_test_registry_credential(&ca, token).is_err());
+        }
+    }
 
     #[test]
     fn production_authority_api_inventory_has_no_public_composition_chain() {
@@ -1829,7 +2422,10 @@ mod resolver_tests {
             "pub struct AuthenticatedRegistryDeploymentIdentity",
             "into_verifying_key",
         ] {
-            assert!(!service_factory.contains(forbidden), "authority seam returned: {forbidden}");
+            assert!(
+                !service_factory.contains(forbidden),
+                "authority seam returned: {forbidden}"
+            );
         }
         let discovery = include_str!("service.rs");
         let production = discovery
@@ -2171,15 +2767,14 @@ mod resolver_tests {
             assert!(error.to_string().contains("not installed"));
             return;
         }
-        let status = std::process::Command::new(
-            std::env::current_exe().expect("discovery test executable"),
-        )
-        .arg("--exact")
-        .arg("service::resolver_tests::isolated_process_without_bootstrap_fails_closed")
-        .arg("--nocapture")
-        .env(CHILD, "1")
-        .status()
-        .expect("isolated resolver subprocess");
+        let status =
+            std::process::Command::new(std::env::current_exe().expect("discovery test executable"))
+                .arg("--exact")
+                .arg("service::resolver_tests::isolated_process_without_bootstrap_fails_closed")
+                .arg("--nocapture")
+                .env(CHILD, "1")
+                .status()
+                .expect("isolated resolver subprocess");
         assert!(status.success(), "isolated resolver subprocess failed");
     }
 
@@ -2240,12 +2835,11 @@ mod resolver_tests {
         const CHILD: &str = "HYPRSTREAM_TEST_FIXED_REGISTRY_CREDENTIAL_CHILD";
         const ATTACKER_KEY: &str = "HYPRSTREAM_TEST_ATTACKER_REGISTRY_KEY";
         if std::env::var_os(CHILD).is_some() {
-            let key_bytes: [u8; 32] = hex::decode(
-                std::env::var(ATTACKER_KEY).expect("attacker registry key"),
-            )
-            .expect("attacker key hex")
-            .try_into()
-            .expect("attacker key length");
+            let key_bytes: [u8; 32] =
+                hex::decode(std::env::var(ATTACKER_KEY).expect("attacker registry key"))
+                    .expect("attacker key hex")
+                    .try_into()
+                    .expect("attacker key length");
             let attacker = VerifyingKey::from_bytes(&key_bytes).expect("attacker key");
             match load_trusted_registry_deployment_credentials() {
                 Ok(credentials) => {
@@ -2258,7 +2852,9 @@ mod resolver_tests {
                 }
                 Err(error) => assert!(
                     error.to_string().contains(DEPLOYMENT_CA_ROOT_PATH)
-                        || error.to_string().contains(REGISTRY_DEPLOYMENT_CREDENTIAL_PATH),
+                        || error
+                            .to_string()
+                            .contains(REGISTRY_DEPLOYMENT_CREDENTIAL_PATH),
                     "startup did not fail at the fixed OS-owned seam: {error}"
                 ),
             }
@@ -2268,23 +2864,22 @@ mod resolver_tests {
         let alternate = tempfile::tempdir().expect("alternate credential directory");
         let ca = SigningKey::from_bytes(&[0x71; 32]);
         let registry = SigningKey::from_bytes(&[0x72; 32]);
-        let now = chrono::Utc::now().timestamp();
-        let claims = hyprstream_rpc::auth::Claims::new(
-            "service:registry".to_owned(),
-            now,
-            now + 3600,
+        let jwt = exact_registry_credential(&ca, &registry);
+        std::fs::write(
+            alternate.path().join("ca-pubkey"),
+            ca.verifying_key().as_bytes(),
         )
-        .with_cnf_jwk(registry.verifying_key().as_bytes());
-        let jwt = hyprstream_rpc::auth::jwt::encode_service_jwt(&claims, &ca);
-        std::fs::write(alternate.path().join("ca-pubkey"), ca.verifying_key().as_bytes())
-            .expect("alternate CA");
+        .expect("alternate CA");
         std::fs::write(alternate.path().join("registry-service-jwt"), jwt)
             .expect("alternate registry JWT");
         let user_config = alternate.path().join("user-config");
         let user_credentials = user_config.join("hyprstream/credentials");
         std::fs::create_dir_all(&user_credentials).expect("user credential fallback");
-        std::fs::copy(alternate.path().join("ca-pubkey"), user_credentials.join("ca-pubkey"))
-            .expect("user CA copy");
+        std::fs::copy(
+            alternate.path().join("ca-pubkey"),
+            user_credentials.join("ca-pubkey"),
+        )
+        .expect("user CA copy");
         std::fs::copy(
             alternate.path().join("registry-service-jwt"),
             user_credentials.join("registry-service-jwt"),
@@ -2332,20 +2927,12 @@ mod resolver_tests {
         );
         let ca = SigningKey::from_bytes(&[0x62; 32]);
         let registry = SigningKey::from_bytes(&[0x63; 32]);
-        let now = chrono::Utc::now().timestamp();
-        let claims = hyprstream_rpc::auth::Claims::new(
-            "service:registry".to_owned(),
-            now,
-            now + 3600,
-        )
-        .with_cnf_jwk(registry.verifying_key().as_bytes());
-        let witness = authenticate_registry_deployment_credentials(
-            TrustedRegistryDeploymentCredentials {
+        let witness =
+            authenticate_registry_deployment_credentials(TrustedRegistryDeploymentCredentials {
                 ca_verifying_key: ca.verifying_key(),
-                registry_credential: hyprstream_rpc::auth::jwt::encode_service_jwt(&claims, &ca),
-            },
-        )
-        .expect("trusted pair");
+                registry_credential: exact_registry_credential(&ca, &registry),
+            })
+            .expect("trusted pair");
         std::env::set_var("CREDENTIALS_DIRECTORY", "post-start-attacker-directory");
         std::env::set_var("XDG_CONFIG_HOME", "post-start-attacker-config");
         assert!(witness.verifier.matches(&registry.verifying_key()));
@@ -2372,33 +2959,31 @@ mod resolver_tests {
                     attested_by: None,
                 },
             );
-            let authority = authenticate_discovery_bootstrap_identity(
-                authenticated_registry_identity(0x51),
-            )
-                .expect("authenticate process resolver");
+            let authority =
+                authenticate_discovery_bootstrap_identity(authenticated_registry_identity(0x51))
+                    .expect("authenticate process resolver");
             DiscoveryService::bootstrap_authenticated_process(
                 authority,
                 crate::DiscoveryClient::new(Arc::new(NoopBootstrapClient)),
             )
             .expect("install process resolver");
             assert!(production_rpc_client("model", signing, None).is_ok());
-            assert!(authenticate_discovery_bootstrap_identity(authenticated_registry_identity(
-                0x52
-            ))
-            .is_err());
+            assert!(
+                authenticate_discovery_bootstrap_identity(authenticated_registry_identity(0x52))
+                    .is_err()
+            );
             return;
         }
         let deployment = tempfile::tempdir().expect("deployment data root");
-        let status = std::process::Command::new(
-            std::env::current_exe().expect("discovery test executable"),
-        )
-        .arg("--exact")
-        .arg("service::resolver_tests::process_bootstrap_precedes_first_generated_client")
-        .arg("--nocapture")
-        .env(CHILD, "1")
-        .env("XDG_DATA_HOME", deployment.path())
-        .status()
-        .expect("resolver bootstrap subprocess");
+        let status =
+            std::process::Command::new(std::env::current_exe().expect("discovery test executable"))
+                .arg("--exact")
+                .arg("service::resolver_tests::process_bootstrap_precedes_first_generated_client")
+                .arg("--nocapture")
+                .env(CHILD, "1")
+                .env("XDG_DATA_HOME", deployment.path())
+                .status()
+                .expect("resolver bootstrap subprocess");
         assert!(status.success(), "resolver bootstrap subprocess failed");
     }
 
@@ -2420,7 +3005,9 @@ mod resolver_tests {
     fn authenticated_process_bootstrap_has_exactly_one_concurrent_consumer() {
         const CHILD: &str = "HYPRSTREAM_TEST_RESOLVER_CONCURRENT_CHILD";
         if std::env::var_os(CHILD).is_some() {
-            let store = hyprstream_service::deployment_data_dir().unwrap().join("pds-store");
+            let store = hyprstream_service::deployment_data_dir()
+                .unwrap()
+                .join("pds-store");
             std::fs::create_dir_all(&store).unwrap();
             drop(rocksdb::DB::open_default(&store).unwrap());
             seed_registry_for_bootstrap(0x48);
@@ -2433,13 +3020,13 @@ mod resolver_tests {
                         authenticate_discovery_bootstrap_identity(authenticated_registry_identity(
                             0x53,
                         ))
-                            .and_then(|authority| {
-                                DiscoveryService::bootstrap_authenticated_process(
-                                    authority,
-                                    crate::DiscoveryClient::new(Arc::new(NoopBootstrapClient)),
-                                )
-                            })
-                            .is_ok()
+                        .and_then(|authority| {
+                            DiscoveryService::bootstrap_authenticated_process(
+                                authority,
+                                crate::DiscoveryClient::new(Arc::new(NoopBootstrapClient)),
+                            )
+                        })
+                        .is_ok()
                     })
                 })
                 .collect();
@@ -2477,15 +3064,18 @@ mod resolver_tests {
             let first = DiscoveryService::bootstrap_authenticated_process(
                 authority,
                 crate::DiscoveryClient::new(Arc::new(NoopBootstrapClient)),
-            ).expect_err("missing checkpoint store unexpectedly installed");
+            )
+            .expect_err("missing checkpoint store unexpectedly installed");
             assert!(first.to_string().contains("failed to open"));
-            let store = hyprstream_service::deployment_data_dir().unwrap().join("pds-store");
+            let store = hyprstream_service::deployment_data_dir()
+                .unwrap()
+                .join("pds-store");
             std::fs::create_dir_all(&store).unwrap();
             drop(rocksdb::DB::open_default(&store).unwrap());
             let second =
                 authenticate_discovery_bootstrap_identity(authenticated_registry_identity(0x55))
-                .err()
-                .expect("failed bootstrap authority was replayed");
+                    .err()
+                    .expect("failed bootstrap authority was replayed");
             assert!(second.to_string().contains("already sealed or consumed"));
             return;
         }

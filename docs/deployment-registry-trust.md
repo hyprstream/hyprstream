@@ -34,3 +34,32 @@ monotonic checkpoints. The accepted state remains self-addressed as
 `did:at9p:<cid512>` and is still subject to the canonical/hash/signature GATE and
 checkpoint/currentness validation described in
 [`at9p-accepted-state.md`](at9p-accepted-state.md).
+
+## Registry credential profile
+
+`registry-service.jwt` is a closed, one-hour-maximum deployment credential, not
+a generic JWT or access token. Let `D` be the RFC 7638 Ed25519 JWK thumbprint of
+the exact public key installed as `deployment-ca.ed25519`. Provisioning must use
+the following profile exactly:
+
+- The protected header contains only `alg`, `typ`, and `kid`, with values
+  `EdDSA`, `wit+jwt`, and `D`, respectively.
+- The claims object contains only `iss`, `sub`, `aud`, `exp`, `nbf`, `iat`,
+  `deployment_domain`, `profile`, and `cnf`. `iss` is
+  `urn:hyprstream:deployment:D`; `sub` is `service:registry`; `aud` is
+  `urn:hyprstream:service:registry`; `deployment_domain` is `D`; and `profile`
+  is `hyprstream.registry-deployment.v1`.
+- `exp`, `nbf`, and `iat` are integer NumericDate values. The credential must be
+  currently valid (with at most 60 seconds of future clock skew), `nbf <= iat <
+  exp`, and `exp - iat <= 3600`.
+- `cnf` contains only one `jwk`; no `jkt` or alternate confirmation member is
+  permitted. The JWK contains only `kty: "OKP"`, `crv: "Ed25519"`, and `x`.
+  `x` is canonical unpadded base64url for exactly 32 bytes and is the registry
+  public key installed as the process's verification-only PDS authority.
+
+All JSON objects are parsed with duplicate-member rejection. Unknown members,
+optional JOSE/JWK metadata (`crit`, `use`, `key_ops`, or a JWK-local `alg` or
+`kid`), audience arrays, padded/noncanonical base64url, alternate algorithms or
+token types, and a signature or key identifier that does not bind the pinned CA
+fail closed before a registry witness can be minted. The credential file is the
+compact JWT itself with no surrounding whitespace or trailing newline.
