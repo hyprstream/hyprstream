@@ -182,8 +182,26 @@ pub struct PdsRecordStore {
     /// Trusted deployment identity that certifies the purpose-derived key on
     /// daemon-authenticated accepted-state envelopes. This is verification
     /// material only; the resolver still holds no signing key.
-    at9p_acceptance_identity: Option<ed25519_dalek::VerifyingKey>,
+    at9p_acceptance_identity: Option<At9pAcceptanceVerifier>,
     at9p_advance_lock: parking_lot::Mutex<()>,
+}
+
+enum At9pAcceptanceVerifier {
+    Deployment(hyprstream_discovery::RegistryDeploymentVerifier),
+    Local(ed25519_dalek::VerifyingKey),
+}
+
+impl At9pAcceptanceVerifier {
+    fn verify_strict(
+        &self,
+        message: &[u8],
+        signature: &ed25519_dalek::Signature,
+    ) -> AnyResult<()> {
+        match self {
+            Self::Deployment(identity) => identity.verify_strict(message, signature),
+            Self::Local(identity) => identity.verify_strict(message, signature).map_err(Into::into),
+        }
+    }
 }
 
 enum RecordBacking {
@@ -230,8 +248,19 @@ impl PdsRecordStore {
     }
 
     /// Pin the deployment identity that certifies accepted-state envelopes.
-    pub fn with_at9p_acceptance_identity(mut self, identity: ed25519_dalek::VerifyingKey) -> Self {
-        self.at9p_acceptance_identity = Some(identity);
+    pub(crate) fn with_at9p_deployment_verifier(
+        mut self,
+        identity: hyprstream_discovery::RegistryDeploymentVerifier,
+    ) -> Self {
+        self.at9p_acceptance_identity = Some(At9pAcceptanceVerifier::Deployment(identity));
+        self
+    }
+
+    pub(crate) fn with_at9p_acceptance_identity(
+        mut self,
+        identity: ed25519_dalek::VerifyingKey,
+    ) -> Self {
+        self.at9p_acceptance_identity = Some(At9pAcceptanceVerifier::Local(identity));
         self
     }
 
@@ -261,7 +290,7 @@ impl PdsRecordStore {
     fn load_at9p_state(
         &self,
         subject_cid512: &str,
-        acceptance_identity: &ed25519_dalek::VerifyingKey,
+        acceptance_identity: &At9pAcceptanceVerifier,
     ) -> AnyResult<Option<AcceptedAt9pState>> {
         match &self.backing {
             RecordBacking::ReadWrite(db) => {
@@ -272,6 +301,17 @@ impl PdsRecordStore {
                 load_at9p_state_from_db(&db, subject_cid512, acceptance_identity)
             }
         }
+    }
+
+    fn load_at9p_state_with_key(
+        &self,
+        subject_cid512: &str,
+        acceptance_identity: ed25519_dalek::VerifyingKey,
+    ) -> AnyResult<Option<AcceptedAt9pState>> {
+        self.load_at9p_state(
+            subject_cid512,
+            &At9pAcceptanceVerifier::Local(acceptance_identity),
+        )
     }
 
     /// Typed accepted-current state read path for resolver/admission consumers.
@@ -345,10 +385,11 @@ impl PdsRecordStore {
             bail!("accepted did:at9p state write attempted on a read-only PDS store");
         };
         let _advance = self.at9p_advance_lock.lock();
+        let local_verifier = At9pAcceptanceVerifier::Local(acceptance_identity.verifying_key());
         let current = load_at9p_state_from_db(
             db,
             &state.subject_cid512,
-            &acceptance_identity.verifying_key(),
+            &local_verifier,
         )?;
         if current.as_ref().map(AcceptedAt9pState::watermark) != expected {
             return current.map_or_else(
@@ -504,7 +545,7 @@ fn encode_at9p_checkpoint(
 fn decode_at9p_checkpoint(
     subject: &str,
     bytes: &[u8],
-    identity: &ed25519_dalek::VerifyingKey,
+    identity: &At9pAcceptanceVerifier,
 ) -> AnyResult<At9pCheckpoint> {
     anyhow::ensure!(
         bytes.len() == AT9P_CHECKPOINT_LEN,
@@ -557,7 +598,7 @@ fn decode_at9p_checkpoint(
 fn load_at9p_state_from_db(
     db: &rocksdb::DB,
     subject: &str,
-    identity: &ed25519_dalek::VerifyingKey,
+    identity: &At9pAcceptanceVerifier,
 ) -> AnyResult<Option<AcceptedAt9pState>> {
     let snapshot = db.snapshot();
     let envelope = snapshot.get(at9p_state_key(subject))?;
@@ -628,7 +669,7 @@ fn encode_at9p_state(
 fn decode_at9p_state(
     subject_cid512: &str,
     bytes: &[u8],
-    acceptance_identity: &ed25519_dalek::VerifyingKey,
+    acceptance_identity: &At9pAcceptanceVerifier,
 ) -> AnyResult<AcceptedAt9pState> {
     anyhow::ensure!(
         bytes.len() >= AT9P_ACCEPTANCE_PREFIX_LEN + AT9P_STATE_HEADER_LEN + ED25519_SIGNATURE_LEN,
@@ -754,7 +795,7 @@ struct RocksAt9pStateStore {
 impl WatermarkStore for RocksAt9pStateStore {
     fn get(&self, subject_cid512: &str) -> AnyResult<Option<AcceptedAt9pState>> {
         self.store
-            .load_at9p_state(subject_cid512, &self.acceptance_identity.verifying_key())
+            .load_at9p_state_with_key(subject_cid512, self.acceptance_identity.verifying_key())
     }
 
     fn conditional_advance(
@@ -1898,9 +1939,9 @@ mod pds_store_tests {
         );
         assert_eq!(
             store
-                .load_at9p_state(
+                .load_at9p_state_with_key(
                     &did[DID_AT9P_PREFIX.len()..],
-                    &acceptance_identity.verifying_key()
+                    acceptance_identity.verifying_key()
                 )
                 .expect("load")
                 .expect("state")

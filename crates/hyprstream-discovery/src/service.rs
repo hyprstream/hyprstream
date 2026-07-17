@@ -946,6 +946,41 @@ impl DiscoveryService {
     /// # Ok::<(), anyhow::Error>(())
     /// ```
     ///
+    /// ```compile_fail
+    /// # use ed25519_dalek::SigningKey;
+    /// let signing = SigningKey::from_bytes(&[7; 32]);
+    /// let mut context = hyprstream_service::ServiceContext::new(
+    ///     signing.clone(), signing.verifying_key(), false, "caller".into()
+    /// );
+    /// context.authenticate_registry_deployment_credential()?;
+    /// context.take_authenticated_registry_identity()?;
+    /// let _raw = context.authenticated_registry_identity()?;
+    /// # Ok::<(), anyhow::Error>(())
+    /// ```
+    ///
+    /// ```compile_fail
+    /// fn old_discovery_chain(
+    ///     identity: hyprstream_service::AuthenticatedRegistryDeploymentIdentity,
+    ///     client: hyprstream_discovery::DiscoveryClient,
+    /// ) {
+    ///     let authority = hyprstream_discovery::authenticate_discovery_bootstrap(identity).unwrap();
+    ///     hyprstream_discovery::DiscoveryService::bootstrap_authenticated_process(authority, client).unwrap();
+    /// }
+    /// ```
+    ///
+    /// ```compile_fail
+    /// fn extract(verifier: hyprstream_discovery::RegistryDeploymentVerifier) {
+    ///     let _: ed25519_dalek::VerifyingKey = verifier.into_verifying_key();
+    /// }
+    /// ```
+    ///
+    /// ```compile_fail
+    /// use hyprstream_discovery::RegistryDeploymentVerifier;
+    /// fn forge(key: ed25519_dalek::VerifyingKey) -> RegistryDeploymentVerifier {
+    ///     RegistryDeploymentVerifier { verifying_key: key }
+    /// }
+    /// ```
+    ///
     /// The complete former public composition chain is unavailable to an
     /// external crate.
     /// ```compile_fail
@@ -961,8 +996,8 @@ impl DiscoveryService {
     /// }
     /// ```
     #[cfg(not(target_arch = "wasm32"))]
-    pub fn bootstrap_authenticated_process(
-        authority: AuthenticatedDiscoveryBootstrap,
+    fn bootstrap_authenticated_process(
+        authority: ProcessBootstrapAuthority,
         discovery_client: crate::DiscoveryClient,
     ) -> Result<()> {
         let authority = {
@@ -974,22 +1009,36 @@ impl DiscoveryService {
                     anyhow::bail!("authenticated Discovery bootstrap is unavailable or consumed");
                 }
             }
-            let AuthenticatedDiscoveryBootstrap {
-                seal: (),
-                store_path,
-                acceptance_identity,
-            } = authority;
-            ProcessBootstrapAuthority { store_path, acceptance_identity }
+            authority
         };
-        let source: Arc<dyn AcceptedStateSource> = Arc::new(
-            crate::checkpointed_pds::CheckpointedPdsAcceptedStateSource::open(
-                &authority.store_path,
-                authority.acceptance_identity,
-            )?,
-        );
+        let deployment_identity = match &authority.acceptance_identity {
+            ProcessAcceptanceIdentity::Deployment(identity) => Some(identity.clone()),
+            #[cfg(test)]
+            ProcessAcceptanceIdentity::Test(_) => None,
+        };
+        let source: Arc<dyn AcceptedStateSource> = match authority.acceptance_identity {
+            ProcessAcceptanceIdentity::Deployment(identity) => Arc::new(
+                crate::checkpointed_pds::CheckpointedPdsAcceptedStateSource::open(
+                    &authority.store_path,
+                    identity,
+                )?,
+            ),
+            #[cfg(test)]
+            ProcessAcceptanceIdentity::Test(identity) => Arc::new(
+                crate::checkpointed_pds::CheckpointedPdsAcceptedStateSource::open_test(
+                    &authority.store_path,
+                    identity,
+                )?,
+            ),
+        };
         PROCESS_ACCEPTED_STATE_SOURCE
             .set(Arc::clone(&source))
             .map_err(|_| anyhow::anyhow!("process Discovery authority is already consumed"))?;
+        if let Some(identity) = deployment_identity {
+            PROCESS_REGISTRY_VERIFIER
+                .set(identity)
+                .map_err(|_| anyhow::anyhow!("deployment registry verifier is already installed"))?;
+        }
         PRODUCTION_RESOLVER
             .set(Arc::new(DiscoveryServiceResolver {
                 announced_endpoints: Arc::new(RwLock::new(HashMap::new())),
@@ -1226,10 +1275,137 @@ static PROCESS_ACCEPTED_STATE_SOURCE: std::sync::OnceLock<Arc<dyn AcceptedStateS
     std::sync::OnceLock::new();
 static PRODUCTION_RESOLVER: std::sync::OnceLock<Arc<DiscoveryServiceResolver>> =
     std::sync::OnceLock::new();
+static PROCESS_REGISTRY_VERIFIER: std::sync::OnceLock<RegistryDeploymentVerifier> =
+    std::sync::OnceLock::new();
+
+const DEPLOYMENT_CA_ROOT_PATH: &str = "/etc/hyprstream/trust/deployment-ca.ed25519";
+const REGISTRY_DEPLOYMENT_CREDENTIAL_PATH: &str =
+    "/run/hyprstream/credentials/registry-service.jwt";
+
+/// Opaque verification-only view of the authenticated deployment registry.
+/// It exposes neither the raw key nor an authority replacement operation.
+#[derive(Clone)]
+pub struct RegistryDeploymentVerifier {
+    verifying_key: VerifyingKey,
+}
+
+impl RegistryDeploymentVerifier {
+    pub fn verify_strict(
+        &self,
+        message: &[u8],
+        signature: &ed25519_dalek::Signature,
+    ) -> Result<()> {
+        self.verifying_key
+            .verify_strict(message, signature)
+            .map_err(|error| anyhow::anyhow!("deployment registry signature rejected: {error}"))
+    }
+
+    pub fn matches(&self, key: &VerifyingKey) -> bool {
+        self.verifying_key == *key
+    }
+}
+
+/// Read the verification-only identity installed by trusted startup.
+pub fn deployment_registry_verifier() -> Result<RegistryDeploymentVerifier> {
+    PROCESS_REGISTRY_VERIFIER
+        .get()
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("deployment registry verifier is not installed"))
+}
+
+/// Non-cloneable proof privately minted from the fixed CA/JWT pair.
+struct AuthenticatedRegistryDeploymentIdentity {
+    verifier: RegistryDeploymentVerifier,
+}
+
+struct TrustedRegistryDeploymentCredentials {
+    ca_verifying_key: VerifyingKey,
+    registry_credential: String,
+}
+
+#[cfg(unix)]
+fn read_os_owned_file(path: &std::path::Path, description: &str) -> Result<Vec<u8>> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    anyhow::ensure!(path.is_absolute(), "{description} path must be absolute");
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|error| anyhow::anyhow!("{description} is unavailable at {path:?}: {error}"))?;
+    anyhow::ensure!(metadata.file_type().is_file(), "{description} is not a regular file");
+    anyhow::ensure!(metadata.uid() == 0, "{description} is not owned by root");
+    anyhow::ensure!(metadata.mode() & 0o022 == 0, "{description} is group/world writable");
+    for parent in path.ancestors().skip(1) {
+        let parent_metadata = std::fs::symlink_metadata(parent).map_err(|error| {
+            anyhow::anyhow!("{description} parent {parent:?} is unavailable: {error}")
+        })?;
+        anyhow::ensure!(
+            parent_metadata.file_type().is_dir(),
+            "{description} parent {parent:?} is not a directory"
+        );
+        anyhow::ensure!(
+            parent_metadata.uid() == 0 && parent_metadata.mode() & 0o022 == 0,
+            "{description} parent {parent:?} is writable or not root-owned"
+        );
+    }
+    std::fs::read(path)
+        .map_err(|error| anyhow::anyhow!("failed to read {description} at {path:?}: {error}"))
+}
+
+#[cfg(not(unix))]
+fn read_os_owned_file(_path: &std::path::Path, description: &str) -> Result<Vec<u8>> {
+    anyhow::bail!("{description} requires the OS-owned Unix deployment seam")
+}
+
+fn load_trusted_registry_deployment_credentials() -> Result<TrustedRegistryDeploymentCredentials> {
+    let ca_bytes = read_os_owned_file(
+        std::path::Path::new(DEPLOYMENT_CA_ROOT_PATH),
+        "deployment CA root",
+    )?;
+    let ca_bytes: [u8; 32] = ca_bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("deployment CA root must be 32 bytes"))?;
+    let ca_verifying_key = VerifyingKey::from_bytes(&ca_bytes)
+        .map_err(|error| anyhow::anyhow!("deployment CA root is malformed: {error}"))?;
+    let registry_credential = String::from_utf8(read_os_owned_file(
+        std::path::Path::new(REGISTRY_DEPLOYMENT_CREDENTIAL_PATH),
+        "registry deployment credential",
+    )?)
+    .map_err(|error| anyhow::anyhow!("registry deployment credential is not UTF-8: {error}"))?;
+    Ok(TrustedRegistryDeploymentCredentials { ca_verifying_key, registry_credential })
+}
+
+fn authenticate_registry_deployment_credentials(
+    credentials: TrustedRegistryDeploymentCredentials,
+) -> Result<AuthenticatedRegistryDeploymentIdentity> {
+    let claims = hyprstream_rpc::auth::jwt::decode(
+        &credentials.registry_credential,
+        &credentials.ca_verifying_key,
+        None,
+    )
+    .map_err(|error| anyhow::anyhow!("registry deployment credential rejected: {error}"))?;
+    anyhow::ensure!(
+        claims.sub == "service:registry",
+        "deployment credential is not for service:registry"
+    );
+    let key_bytes = claims
+        .cnf_key_bytes()
+        .ok_or_else(|| anyhow::anyhow!("registry deployment credential has no cnf.jwk"))?;
+    let verifying_key = VerifyingKey::from_bytes(&key_bytes)
+        .map_err(|error| anyhow::anyhow!("registry credential key is malformed: {error}"))?;
+    Ok(AuthenticatedRegistryDeploymentIdentity {
+        verifier: RegistryDeploymentVerifier { verifying_key },
+    })
+}
 
 struct ProcessBootstrapAuthority {
     store_path: std::path::PathBuf,
-    acceptance_identity: VerifyingKey,
+    acceptance_identity: ProcessAcceptanceIdentity,
+}
+
+enum ProcessAcceptanceIdentity {
+    Deployment(RegistryDeploymentVerifier),
+    #[cfg(test)]
+    Test(VerifyingKey),
 }
 
 enum ProcessBootstrapAuthorityState {
@@ -1241,40 +1417,56 @@ enum ProcessBootstrapAuthorityState {
 static PROCESS_BOOTSTRAP_AUTHORITY: parking_lot::Mutex<ProcessBootstrapAuthorityState> =
     parking_lot::Mutex::new(ProcessBootstrapAuthorityState::Unsealed);
 
-/// Opaque proof that the fixed deployment store and authenticated registry
-/// identity were resolved by the real startup path. Its fields are private,
-/// it is neither cloneable nor serializable, and dropping it leaves the
-/// process bootstrap terminally sealed.
+/// Atomically consume the fixed OS-owned deployment witness and install the
+/// process Discovery resolver. No credential path, CA, JWT, key, witness, or
+/// extraction callback crosses this boundary.
 #[cfg(not(target_arch = "wasm32"))]
-pub struct AuthenticatedDiscoveryBootstrap {
-    seal: (),
-    store_path: std::path::PathBuf,
-    acceptance_identity: VerifyingKey,
-}
-
-/// Authenticate and seal the process Discovery bootstrap authority.
-///
-/// This is the only public mint for [`AuthenticatedDiscoveryBootstrap`]. It
-/// accepts no context, path, key, callback, or other caller-selected authority.
-#[cfg(not(target_arch = "wasm32"))]
-pub fn authenticate_discovery_bootstrap(
-    registry_identity: hyprstream_service::AuthenticatedRegistryDeploymentIdentity,
-) -> Result<AuthenticatedDiscoveryBootstrap> {
-    authenticate_discovery_bootstrap_identity(registry_identity.into_verifying_key())
+pub fn bootstrap_deployment_process(signing_key: SigningKey) -> Result<()> {
+    let authority = authenticate_deployment_bootstrap()?;
+    let discovery_vk = hyprstream_service::global_trust_store()
+        .resolve_one("discovery")
+        .ok_or_else(|| anyhow::anyhow!("trust store has no authenticated discovery key"))?;
+    let discovery_client = crate::DiscoveryClient::for_local_bootstrap(
+        signing_key,
+        discovery_vk,
+        None,
+    )?;
+    DiscoveryService::bootstrap_authenticated_process(authority, discovery_client)
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn authenticate_discovery_bootstrap_identity(
-    acceptance_identity: ed25519_dalek::VerifyingKey,
-) -> Result<AuthenticatedDiscoveryBootstrap> {
+fn authenticate_deployment_bootstrap() -> Result<ProcessBootstrapAuthority> {
     let mut state = PROCESS_BOOTSTRAP_AUTHORITY.lock();
     anyhow::ensure!(
         matches!(*state, ProcessBootstrapAuthorityState::Unsealed),
         "Discovery bootstrap authority is already sealed or consumed"
     );
-    let store_path = hyprstream_service::deployment_data_dir()?.join("pds-store");
     *state = ProcessBootstrapAuthorityState::Sealed;
-    Ok(AuthenticatedDiscoveryBootstrap { seal: (), store_path, acceptance_identity })
+    drop(state);
+    let witness = authenticate_registry_deployment_credentials(
+        load_trusted_registry_deployment_credentials()?,
+    )?;
+    let store_path = hyprstream_service::deployment_data_dir()?.join("pds-store");
+    Ok(ProcessBootstrapAuthority {
+        store_path,
+        acceptance_identity: ProcessAcceptanceIdentity::Deployment(witness.verifier),
+    })
+}
+
+#[cfg(test)]
+fn authenticate_discovery_bootstrap_identity(
+    acceptance_identity: ed25519_dalek::VerifyingKey,
+) -> Result<ProcessBootstrapAuthority> {
+    let mut state = PROCESS_BOOTSTRAP_AUTHORITY.lock();
+    anyhow::ensure!(
+        matches!(*state, ProcessBootstrapAuthorityState::Unsealed),
+        "Discovery bootstrap authority is already sealed or consumed"
+    );
+    *state = ProcessBootstrapAuthorityState::Sealed;
+    Ok(ProcessBootstrapAuthority {
+        store_path: hyprstream_service::deployment_data_dir()?.join("pds-store"),
+        acceptance_identity: ProcessAcceptanceIdentity::Test(acceptance_identity),
+    })
 }
 
 /// Construct an ordinary production RPC client. Production authority cannot
@@ -1631,35 +1823,49 @@ mod resolver_tests {
             "pub fn consume_discovery_bootstrap_authority",
             "struct DiscoveryBootstrapAuthority",
             "discovery_authority:",
+            "pub fn authenticate_registry_deployment_credential",
+            "pub fn take_authenticated_registry_identity",
+            "pub fn authenticated_registry_identity",
+            "pub struct AuthenticatedRegistryDeploymentIdentity",
+            "into_verifying_key",
         ] {
             assert!(!service_factory.contains(forbidden), "authority seam returned: {forbidden}");
         }
         let discovery = include_str!("service.rs");
-        assert!(!discovery.contains("\n    pub fn install_process_bootstrap("));
-        assert!(discovery.contains("struct ProcessBootstrapAuthority {"));
-        assert!(discovery.contains("enum ProcessBootstrapAuthorityState {"));
-        let authentication = discovery
-            .split("pub fn authenticate_discovery_bootstrap(")
+        let production = discovery
+            .split("mod resolver_tests {")
+            .next()
+            .expect("production Discovery source");
+        assert!(!production.contains("\n    pub fn install_process_bootstrap("));
+        assert!(production.contains("struct ProcessBootstrapAuthority {"));
+        assert!(production.contains("enum ProcessBootstrapAuthorityState {"));
+        let authentication = production
+            .split("fn authenticate_deployment_bootstrap()")
             .nth(1)
-            .expect("authenticated bootstrap entrypoint")
-            .split("/// Construct an ordinary production RPC client")
+            .expect("private deployment authentication boundary")
+            .split("#[cfg(test)]\nfn authenticate_discovery_bootstrap_identity")
             .next()
             .expect("authentication body");
         assert!(authentication.contains("hyprstream_service::deployment_data_dir()"));
-        assert!(authentication.contains("AuthenticatedRegistryDeploymentIdentity"));
-        assert!(authentication.contains("registry_identity.into_verifying_key()"));
+        assert!(authentication.contains("load_trusted_registry_deployment_credentials()"));
+        assert!(authentication.contains("authenticate_registry_deployment_credentials("));
         assert!(!authentication.contains("global_trust_store()"));
         assert!(!authentication.contains("resolve_one("));
-        assert!(!authentication.contains("ServiceContext"));
         assert!(!authentication.contains("FnOnce"));
-        let capability = discovery
-            .split("pub struct AuthenticatedDiscoveryBootstrap {")
+        assert!(!production.contains("pub fn authenticate_discovery_bootstrap("));
+        assert!(!production.contains("pub struct AuthenticatedDiscoveryBootstrap"));
+        assert!(!production.contains("pub fn bootstrap_authenticated_process("));
+        assert!(production.contains("/etc/hyprstream/trust/deployment-ca.ed25519"));
+        assert!(production.contains("/run/hyprstream/credentials/registry-service.jwt"));
+        let loader = production
+            .split("fn load_trusted_registry_deployment_credentials()")
             .nth(1)
-            .expect("opaque capability")
-            .split('}')
+            .expect("fixed deployment loader")
+            .split("fn authenticate_registry_deployment_credentials(")
             .next()
-            .expect("capability fields");
-        assert!(!capability.contains("pub "));
+            .expect("loader body");
+        assert!(!loader.contains("CREDENTIALS_DIRECTORY"));
+        assert!(!loader.contains("dirs::config_dir"));
     }
 
     fn service() -> DiscoveryService {
@@ -2027,6 +2233,123 @@ mod resolver_tests {
 
     fn authenticated_registry_identity(tag: u8) -> ed25519_dalek::VerifyingKey {
         SigningKey::from_bytes(&[tag; 32]).verifying_key()
+    }
+
+    #[test]
+    fn redirected_credential_directories_have_zero_registry_authority() {
+        const CHILD: &str = "HYPRSTREAM_TEST_FIXED_REGISTRY_CREDENTIAL_CHILD";
+        const ATTACKER_KEY: &str = "HYPRSTREAM_TEST_ATTACKER_REGISTRY_KEY";
+        if std::env::var_os(CHILD).is_some() {
+            let key_bytes: [u8; 32] = hex::decode(
+                std::env::var(ATTACKER_KEY).expect("attacker registry key"),
+            )
+            .expect("attacker key hex")
+            .try_into()
+            .expect("attacker key length");
+            let attacker = VerifyingKey::from_bytes(&key_bytes).expect("attacker key");
+            match load_trusted_registry_deployment_credentials() {
+                Ok(credentials) => {
+                    let witness = authenticate_registry_deployment_credentials(credentials)
+                        .expect("fixed OS-owned credential pair must authenticate");
+                    assert!(
+                        !witness.verifier.matches(&attacker),
+                        "ambient credential pair selected production authority"
+                    );
+                }
+                Err(error) => assert!(
+                    error.to_string().contains(DEPLOYMENT_CA_ROOT_PATH)
+                        || error.to_string().contains(REGISTRY_DEPLOYMENT_CREDENTIAL_PATH),
+                    "startup did not fail at the fixed OS-owned seam: {error}"
+                ),
+            }
+            return;
+        }
+
+        let alternate = tempfile::tempdir().expect("alternate credential directory");
+        let ca = SigningKey::from_bytes(&[0x71; 32]);
+        let registry = SigningKey::from_bytes(&[0x72; 32]);
+        let now = chrono::Utc::now().timestamp();
+        let claims = hyprstream_rpc::auth::Claims::new(
+            "service:registry".to_owned(),
+            now,
+            now + 3600,
+        )
+        .with_cnf_jwk(registry.verifying_key().as_bytes());
+        let jwt = hyprstream_rpc::auth::jwt::encode_service_jwt(&claims, &ca);
+        std::fs::write(alternate.path().join("ca-pubkey"), ca.verifying_key().as_bytes())
+            .expect("alternate CA");
+        std::fs::write(alternate.path().join("registry-service-jwt"), jwt)
+            .expect("alternate registry JWT");
+        let user_config = alternate.path().join("user-config");
+        let user_credentials = user_config.join("hyprstream/credentials");
+        std::fs::create_dir_all(&user_credentials).expect("user credential fallback");
+        std::fs::copy(alternate.path().join("ca-pubkey"), user_credentials.join("ca-pubkey"))
+            .expect("user CA copy");
+        std::fs::copy(
+            alternate.path().join("registry-service-jwt"),
+            user_credentials.join("registry-service-jwt"),
+        )
+        .expect("user JWT copy");
+        let status = std::process::Command::new(std::env::current_exe().expect("test executable"))
+            .arg("--exact")
+            .arg("service::resolver_tests::redirected_credential_directories_have_zero_registry_authority")
+            .arg("--nocapture")
+            .env(CHILD, "1")
+            .env("CREDENTIALS_DIRECTORY", alternate.path())
+            .env("XDG_CONFIG_HOME", &user_config)
+            .env(ATTACKER_KEY, hex::encode(registry.verifying_key().as_bytes()))
+            .status()
+            .expect("redirected credential subprocess");
+        assert!(status.success(), "redirected credential subprocess failed");
+    }
+
+    #[test]
+    fn verified_registry_identity_ignores_policy_and_post_start_environment_mutation() {
+        const CHILD: &str = "HYPRSTREAM_TEST_POST_START_REGISTRY_ENV_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(
+                std::env::current_exe().expect("discovery test executable"),
+            )
+            .arg("--exact")
+            .arg("service::resolver_tests::verified_registry_identity_ignores_policy_and_post_start_environment_mutation")
+            .arg("--nocapture")
+            .env(CHILD, "1")
+            .status()
+            .expect("post-start environment subprocess");
+            assert!(status.success(), "post-start environment subprocess failed");
+            return;
+        }
+        let caller = SigningKey::from_bytes(&[0x61; 32]);
+        hyprstream_service::global_trust_store().insert(
+            caller.verifying_key(),
+            hyprstream_service::Attestation {
+                scopes: std::iter::once("registry".to_owned()).collect(),
+                subject: None,
+                jwt: None,
+                expires_at: 0,
+                attested_by: None,
+            },
+        );
+        let ca = SigningKey::from_bytes(&[0x62; 32]);
+        let registry = SigningKey::from_bytes(&[0x63; 32]);
+        let now = chrono::Utc::now().timestamp();
+        let claims = hyprstream_rpc::auth::Claims::new(
+            "service:registry".to_owned(),
+            now,
+            now + 3600,
+        )
+        .with_cnf_jwk(registry.verifying_key().as_bytes());
+        let witness = authenticate_registry_deployment_credentials(
+            TrustedRegistryDeploymentCredentials {
+                ca_verifying_key: ca.verifying_key(),
+                registry_credential: hyprstream_rpc::auth::jwt::encode_service_jwt(&claims, &ca),
+            },
+        )
+        .expect("trusted pair");
+        std::env::set_var("CREDENTIALS_DIRECTORY", "post-start-attacker-directory");
+        std::env::set_var("XDG_CONFIG_HOME", "post-start-attacker-config");
+        assert!(witness.verifier.matches(&registry.verifying_key()));
+        assert!(!witness.verifier.matches(&caller.verifying_key()));
     }
 
     #[test]

@@ -98,9 +98,9 @@ pub fn with_checkpointed_native_announcements(
     mut ctx: ServiceContext,
     service_names: &[String],
 ) -> anyhow::Result<ServiceContext> {
-    let acceptance_identity = ctx.authenticated_registry_identity()?;
+    let acceptance_identity = hyprstream_discovery::deployment_registry_verifier()?;
     let store = crate::services::discovery::PdsRecordStore::open_readonly(&pds_store_dir(&ctx)?)?
-        .with_at9p_acceptance_identity(acceptance_identity);
+        .with_at9p_deployment_verifier(acceptance_identity);
     let states = store.accepted_at9p_states()?;
     for service_name in service_names
         .iter()
@@ -721,7 +721,8 @@ fn create_registry_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawn
         let atproto_key: p256::ecdsa::SigningKey = (*active).clone();
         let acceptance_identity = ctx.service_signing_key("registry");
         anyhow::ensure!(
-            acceptance_identity.verifying_key() == ctx.authenticated_registry_identity()?,
+            hyprstream_discovery::deployment_registry_verifier()?
+                .matches(&acceptance_identity.verifying_key()),
             "registry signing credential does not match authenticated deployment identity"
         );
         // The alarm WAL must remain verifiable across OAuth key rotations and
@@ -1804,12 +1805,12 @@ fn create_discovery_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spaw
     // In-process factories share the stable node root. In IPC mode the
     // registry process signs with its stable service credential, whose public
     // key is anchored in the global service trust store.
-    let at9p_acceptance_identity = ctx.authenticated_registry_identity()?;
+    let at9p_acceptance_identity = hyprstream_discovery::deployment_registry_verifier()?;
     let pds_store_path = pds_store_dir(ctx)?;
     let pds_store = std::sync::Arc::new(
         open_pds_store_readonly(&pds_store_path)
             .context("failed to open PDS record store (read-only)")?
-            .with_at9p_acceptance_identity(at9p_acceptance_identity),
+            .with_at9p_deployment_verifier(at9p_acceptance_identity),
     );
     let record_resolver = std::sync::Arc::new(crate::services::discovery::PdsRecordResolver::new(
         pds_store,

@@ -102,8 +102,9 @@ pub mod podspec;
 pub use hyprstream_rpc::registry::SocketKind;
 pub use hyprstream_rpc::resolver::Resolver;
 pub use service::{
-    authenticate_discovery_bootstrap, AuthenticatedDiscoveryBootstrap, AuthorizationProvider,
-    DiscoveryService, RecordCarData, RecordResolver, production_rpc_client,
+    bootstrap_deployment_process, deployment_registry_verifier, AuthorizationProvider,
+    DiscoveryService, RecordCarData, RecordResolver, RegistryDeploymentVerifier,
+    production_rpc_client,
 };
 
 // Re-export generated types that consumers need

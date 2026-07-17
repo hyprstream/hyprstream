@@ -7,6 +7,7 @@ use hyprstream_pds::at9p::h512;
 use hyprstream_pds::at9p_duplicity::{AcceptedAt9pState, Watermark};
 use hyprstream_pds::at9p_gate::DID_AT9P_PREFIX;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 const AT9P_STATE_MAGIC: &[u8; 8] = b"AT9PST02";
 const AT9P_STATE_HEADER_LEN: usize = 8 + 1 + 8 + 64 + 1 + 4;
@@ -24,20 +25,47 @@ const AT9P_CHECKPOINT_AAD: &[u8] = b"hyprstream-at9p-monotonic-checkpoint/1";
 
 pub(super) struct CheckpointedPdsAcceptedStateSource {
     path: PathBuf,
-    acceptance_identity: ed25519_dalek::VerifyingKey,
+    acceptance_identity: Arc<dyn AcceptanceVerifier>,
+}
+
+trait AcceptanceVerifier: Send + Sync {
+    fn verify_strict(&self, message: &[u8], signature: &ed25519_dalek::Signature) -> Result<()>;
+}
+
+impl AcceptanceVerifier for crate::service::RegistryDeploymentVerifier {
+    fn verify_strict(&self, message: &[u8], signature: &ed25519_dalek::Signature) -> Result<()> {
+        self.verify_strict(message, signature)
+    }
+}
+
+#[cfg(test)]
+impl AcceptanceVerifier for ed25519_dalek::VerifyingKey {
+    fn verify_strict(&self, message: &[u8], signature: &ed25519_dalek::Signature) -> Result<()> {
+        self.verify_strict(message, signature).map_err(Into::into)
+    }
 }
 
 impl CheckpointedPdsAcceptedStateSource {
     pub(super) fn open(
         path: &Path,
-        acceptance_identity: ed25519_dalek::VerifyingKey,
+        acceptance_identity: crate::service::RegistryDeploymentVerifier,
     ) -> Result<Self> {
         let _probe = rocksdb::DB::open_for_read_only(&readonly_opts(), path, false)
             .with_context(|| format!("failed to open checkpointed PDS store at {path:?}"))?;
         Ok(Self {
             path: path.to_path_buf(),
-            acceptance_identity,
+            acceptance_identity: Arc::new(acceptance_identity),
         })
+    }
+
+    #[cfg(test)]
+    pub(super) fn open_test(
+        path: &Path,
+        acceptance_identity: ed25519_dalek::VerifyingKey,
+    ) -> Result<Self> {
+        let _probe = rocksdb::DB::open_for_read_only(&readonly_opts(), path, false)
+            .with_context(|| format!("failed to open checkpointed PDS store at {path:?}"))?;
+        Ok(Self { path: path.to_path_buf(), acceptance_identity: Arc::new(acceptance_identity) })
     }
 
     pub(super) fn accepted_state(&self, did: &str) -> Result<Option<AcceptedAt9pState>> {
@@ -45,7 +73,7 @@ impl CheckpointedPdsAcceptedStateSource {
             .strip_prefix(DID_AT9P_PREFIX)
             .ok_or_else(|| anyhow::anyhow!("identifier is not did:at9p: {did:?}"))?;
         let db = rocksdb::DB::open_for_read_only(&readonly_opts(), &self.path, false)?;
-        let state = load_at9p_state_from_db(&db, subject, &self.acceptance_identity)?;
+        let state = load_at9p_state_from_db(&db, subject, self.acceptance_identity.as_ref())?;
         if let Some(state) = &state {
             anyhow::ensure!(state.did == did, "accepted at9p state DID mismatch");
         }
@@ -99,7 +127,7 @@ fn checkpoint_message(subject: &str, payload: &[u8]) -> Result<Vec<u8>> {
 fn load_at9p_state_from_db(
     db: &rocksdb::DB,
     subject: &str,
-    identity: &ed25519_dalek::VerifyingKey,
+    identity: &dyn AcceptanceVerifier,
 ) -> Result<Option<AcceptedAt9pState>> {
     let snapshot = db.snapshot();
     let envelope = snapshot.get(state_key(subject))?;
@@ -127,7 +155,7 @@ fn load_at9p_state_from_db(
 fn decode_checkpoint(
     subject: &str,
     bytes: &[u8],
-    identity: &ed25519_dalek::VerifyingKey,
+    identity: &dyn AcceptanceVerifier,
 ) -> Result<At9pCheckpoint> {
     anyhow::ensure!(
         bytes.len() == AT9P_CHECKPOINT_LEN,
@@ -180,7 +208,7 @@ fn decode_checkpoint(
 fn decode_state(
     subject: &str,
     bytes: &[u8],
-    acceptance_identity: &ed25519_dalek::VerifyingKey,
+    acceptance_identity: &dyn AcceptanceVerifier,
 ) -> Result<AcceptedAt9pState> {
     anyhow::ensure!(
         bytes.len() >= AT9P_ACCEPTANCE_PREFIX_LEN + AT9P_STATE_HEADER_LEN + ED25519_SIGNATURE_LEN,
@@ -438,7 +466,7 @@ mod tests {
             .expect("write checkpoint");
         drop(db);
 
-        let source = CheckpointedPdsAcceptedStateSource::open(dir.path(), identity.verifying_key())
+        let source = CheckpointedPdsAcceptedStateSource::open_test(dir.path(), identity.verifying_key())
             .expect("open checkpointed source");
         let recovered = source
             .accepted_state(&state.did)
@@ -448,7 +476,7 @@ mod tests {
 
         let wrong_identity = ed25519_dalek::SigningKey::from_bytes(&[0x44; 32]);
         let rejected =
-            CheckpointedPdsAcceptedStateSource::open(dir.path(), wrong_identity.verifying_key())
+            CheckpointedPdsAcceptedStateSource::open_test(dir.path(), wrong_identity.verifying_key())
                 .expect("open same store")
                 .accepted_state(&state.did);
         assert!(
