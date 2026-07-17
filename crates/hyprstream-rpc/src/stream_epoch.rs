@@ -244,10 +244,14 @@ impl StreamEpochKeys {
     /// by the authenticated per-epoch sequence number.  The key and prefix both
     /// differ across direction/track/epoch.
     pub fn nonce(&self, sequence_number: u64) -> [u8; 12] {
-        let mut nonce = [0u8; 12];
-        nonce[..4].copy_from_slice(&self.nonce_domain);
-        nonce[4..].copy_from_slice(&sequence_number.to_be_bytes());
-        nonce
+        let sequence = sequence_number.to_be_bytes();
+        std::array::from_fn(|index| {
+            if index < self.nonce_domain.len() {
+                self.nonce_domain[index]
+            } else {
+                sequence[index - self.nonce_domain.len()]
+            }
+        })
     }
 
     pub fn epoch_namespace(&self) -> &[u8; 32] {
