@@ -5,17 +5,12 @@
 
 use async_trait::async_trait;
 use hyprstream_rpc::registry::{self, EndpointRegistry, SocketKind};
-#[cfg(test)]
-use hyprstream_rpc::resolver::select_service_candidate;
-use hyprstream_rpc::resolver::{
-    select_service_candidates, AcceptedStateEvidence, AnchoredKemRecipient, Resolver,
-    SelectedService, ServiceCandidate, ServiceQuery,
-};
+use hyprstream_rpc::resolver::{Resolver, ResolverProfile, ServiceQuery};
 use hyprstream_rpc::rpc_client::{CallOptions, RpcClient};
 use hyprstream_rpc::service::{EnvelopeContext, RequestService};
 use hyprstream_rpc::stream_consumer::StreamHandle;
-use hyprstream_rpc::transport::TransportConfig;
-use hyprstream_rpc::SigningKey;
+use hyprstream_rpc::transport::{EndpointType, TransportConfig};
+use hyprstream_rpc::{SigningKey, VerifyingKey};
 
 use crate::generated::discovery_client::{
     dispatch_discovery, serialize_response, AuthMetadata, AuthMetadataList, DiscoveryHandler,
@@ -76,6 +71,386 @@ fn unix_millis_now() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
+}
+
+/// Private checkpoint-bound projection used only while Discovery validates an
+/// announcement against the daemon-owned accepted-state source.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AcceptedStateEvidence {
+    service_did: Did,
+    digest: [u8; 64],
+    epoch: u64,
+    expires_at_unix_ms: i64,
+    response_ed25519: [u8; 32],
+    response_ml_dsa65: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AnchoredKemRecipient {
+    key_id: String,
+    recipient: hyprstream_rpc::crypto::hybrid_kem::RecipientPublic,
+    not_after_unix_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ServiceCandidate {
+    service_name: String,
+    service_did: Did,
+    response_verifying_key: [u8; 32],
+    response_ml_dsa65: Vec<u8>,
+    response_key_id: String,
+    request_kem_recipient: Option<AnchoredKemRecipient>,
+    transport: TransportConfig,
+    capabilities: BTreeSet<String>,
+    accepted_state: AcceptedStateEvidence,
+    source_signer: [u8; 32],
+    expires_at_unix_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CandidateDecision {
+    candidate_fingerprint: String,
+    accepted: bool,
+    reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResolutionEvidence {
+    accepted_state_digest: [u8; 64],
+    accepted_state_epoch: u64,
+    selected_fingerprint: String,
+    ordered_decisions: Vec<CandidateDecision>,
+}
+
+/// Private raw selection result. It can become production authority only via
+/// `ResolvedService::mint`, which requires the typed accepted-state witness.
+#[derive(Debug, Clone)]
+struct SelectedService {
+    service_name: String,
+    service_did: Did,
+    response_verifying_key: VerifyingKey,
+    response_ml_dsa65: Vec<u8>,
+    response_key_id: String,
+    request_kem_recipient: AnchoredKemRecipient,
+    transport: TransportConfig,
+    expires_at_unix_ms: i64,
+    evidence: ResolutionEvidence,
+}
+
+impl SelectedService {
+    fn same_authority(&self, other: &Self) -> bool {
+        self.service_name == other.service_name
+            && self.service_did == other.service_did
+            && self.response_verifying_key == other.response_verifying_key
+            && self.response_ml_dsa65 == other.response_ml_dsa65
+            && self.response_key_id == other.response_key_id
+            && self.request_kem_recipient == other.request_kem_recipient
+            && self.evidence.accepted_state_digest == other.evidence.accepted_state_digest
+            && self.evidence.accepted_state_epoch == other.evidence.accepted_state_epoch
+    }
+
+    #[cfg(test)]
+    fn service_name(&self) -> &str {
+        &self.service_name
+    }
+
+    fn service_did(&self) -> &Did {
+        &self.service_did
+    }
+
+    fn response_verifying_key(&self) -> VerifyingKey {
+        self.response_verifying_key
+    }
+
+    fn response_ml_dsa65(&self) -> &[u8] {
+        &self.response_ml_dsa65
+    }
+
+    #[cfg(test)]
+    fn request_kem_recipient(&self) -> &AnchoredKemRecipient {
+        &self.request_kem_recipient
+    }
+
+    fn transport(&self) -> &TransportConfig {
+        &self.transport
+    }
+
+    fn evidence(&self) -> &ResolutionEvidence {
+        &self.evidence
+    }
+
+    fn ensure_fresh(&self, now_unix_ms: i64) -> Result<()> {
+        anyhow::ensure!(
+            now_unix_ms < self.expires_at_unix_ms,
+            "resolved service snapshot expired; re-resolution required"
+        );
+        anyhow::ensure!(
+            now_unix_ms < self.request_kem_recipient.not_after_unix_ms,
+            "resolved request KEM recipient expired; re-resolution required"
+        );
+        Ok(())
+    }
+
+    fn crypto_stores(
+        &self,
+    ) -> Result<(
+        Arc<dyn hyprstream_rpc::crypto::hybrid_kem::KemTrustStore>,
+        Arc<dyn hyprstream_rpc::envelope::PqTrustStore>,
+    )> {
+        let ed = self.response_verifying_key.to_bytes();
+        let mut kem = hyprstream_rpc::crypto::hybrid_kem::KeyedKemTrustStore::new();
+        kem.bind(ed, self.request_kem_recipient.recipient.clone());
+        let pq_key = hyprstream_rpc::crypto::pq::ml_dsa_vk_from_bytes(&self.response_ml_dsa65)
+            .map_err(|e| anyhow::anyhow!("invalid resolved ML-DSA-65 response key: {e}"))?;
+        let mut pq = hyprstream_rpc::envelope::KeyedPqTrustStore::new();
+        pq.bind(ed, &pq_key);
+        Ok((Arc::new(kem), Arc::new(pq)))
+    }
+}
+
+fn canonical_service_name(name: &str) -> Result<String> {
+    let canonical = name.trim().to_ascii_lowercase();
+    anyhow::ensure!(!canonical.is_empty(), "service name is empty");
+    anyhow::ensure!(
+        canonical
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-'),
+        "service name contains non-canonical characters"
+    );
+    anyhow::ensure!(canonical == name, "service name is not canonical");
+    Ok(canonical)
+}
+
+fn network_reach(transport: &TransportConfig) -> bool {
+    matches!(
+        transport.endpoint,
+        EndpointType::Quic { .. } | EndpointType::Iroh { .. }
+    )
+}
+
+fn transport_fingerprint(transport: &TransportConfig) -> String {
+    blake3::hash(format!("{transport:?}").as_bytes())
+        .to_hex()
+        .to_string()
+}
+
+fn hash_framed(hasher: &mut blake3::Hasher, bytes: &[u8]) {
+    hasher.update(&(bytes.len() as u64).to_be_bytes());
+    hasher.update(bytes);
+}
+
+fn candidate_fingerprint(candidate: &ServiceCandidate) -> String {
+    let mut h = blake3::Hasher::new();
+    hash_framed(&mut h, candidate.service_name.as_bytes());
+    hash_framed(&mut h, candidate.service_did.as_str().as_bytes());
+    h.update(&candidate.response_verifying_key);
+    hash_framed(&mut h, &candidate.response_ml_dsa65);
+    hash_framed(&mut h, candidate.response_key_id.as_bytes());
+    if let Some(kem) = &candidate.request_kem_recipient {
+        hash_framed(&mut h, kem.key_id.as_bytes());
+        hash_framed(&mut h, &kem.recipient.encode());
+    }
+    hash_framed(
+        &mut h,
+        transport_fingerprint(&candidate.transport).as_bytes(),
+    );
+    for capability in &candidate.capabilities {
+        hash_framed(&mut h, capability.as_bytes());
+    }
+    h.update(&candidate.accepted_state.digest);
+    h.update(&candidate.accepted_state.epoch.to_be_bytes());
+    hash_framed(
+        &mut h,
+        candidate.accepted_state.service_did.as_str().as_bytes(),
+    );
+    h.update(&candidate.accepted_state.expires_at_unix_ms.to_be_bytes());
+    h.update(&candidate.accepted_state.response_ed25519);
+    hash_framed(&mut h, &candidate.accepted_state.response_ml_dsa65);
+    h.update(&candidate.source_signer);
+    h.update(&candidate.expires_at_unix_ms.to_be_bytes());
+    if let Some(kem) = &candidate.request_kem_recipient {
+        h.update(&kem.not_after_unix_ms.to_be_bytes());
+    }
+    h.finalize().to_hex().to_string()
+}
+
+fn rejection_reason(
+    query: &ServiceQuery,
+    candidate: &ServiceCandidate,
+    now_unix_ms: i64,
+) -> Option<&'static str> {
+    if canonical_service_name(&candidate.service_name)
+        .ok()
+        .as_deref()
+        != Some(query.service_name.as_str())
+    {
+        return Some("service-name-mismatch");
+    }
+    if !candidate.service_did.is_did_at9p()
+        || candidate.service_did != candidate.accepted_state.service_did
+    {
+        return Some("missing-or-mismatched-accepted-identity");
+    }
+    if candidate.source_signer != candidate.accepted_state.response_ed25519 {
+        return Some("announcement-signer-not-current");
+    }
+    if candidate.response_verifying_key != candidate.accepted_state.response_ed25519
+        || candidate.response_ml_dsa65 != candidate.accepted_state.response_ml_dsa65
+    {
+        return Some("response-key-not-current");
+    }
+    if !candidate
+        .response_key_id
+        .starts_with(&format!("{}#", candidate.service_did))
+        || hyprstream_rpc::crypto::pq::ml_dsa_vk_from_bytes(&candidate.response_ml_dsa65).is_err()
+    {
+        return Some("missing-or-invalid-response-key-material");
+    }
+    if !query
+        .required_capabilities
+        .is_subset(&candidate.capabilities)
+    {
+        return Some("missing-capability");
+    }
+    if candidate.expires_at_unix_ms <= now_unix_ms
+        || candidate.accepted_state.expires_at_unix_ms <= now_unix_ms
+    {
+        return Some("expired-candidate-or-state");
+    }
+    match query.profile {
+        ResolverProfile::NetworkDiscovery if !network_reach(&candidate.transport) => {
+            return Some("local-reach-for-network-profile");
+        }
+        ResolverProfile::LocalInproc
+            if !matches!(candidate.transport.endpoint, EndpointType::Inproc { .. }) =>
+        {
+            return Some("non-inproc-reach-for-local-profile");
+        }
+        ResolverProfile::Ipc
+            if !matches!(
+                candidate.transport.endpoint,
+                EndpointType::Ipc { .. } | EndpointType::SystemdFd { .. }
+            ) =>
+        {
+            return Some("non-ipc-reach-for-ipc-profile");
+        }
+        _ => {}
+    }
+    let Some(kem) = &candidate.request_kem_recipient else {
+        return Some("missing-request-kem-recipient");
+    };
+    if !kem
+        .key_id
+        .starts_with(&format!("{}#", candidate.service_did))
+        || kem.not_after_unix_ms <= now_unix_ms
+        || kem.recipient.suite_id
+            != hyprstream_rpc::crypto::hybrid_kem::SuiteId::HyKemX25519MlKem768
+        || kem.recipient.eks.len() != kem.recipient.suite_id.components().len()
+        || hyprstream_rpc::crypto::hybrid_kem::RecipientPublic::decode(&kem.recipient.encode())
+            .is_err()
+    {
+        return Some("invalid-expired-or-nonhybrid-kem-recipient");
+    }
+    None
+}
+
+fn select_service_candidate(
+    query: &ServiceQuery,
+    candidates: Vec<ServiceCandidate>,
+    now_unix_ms: i64,
+) -> Result<SelectedService> {
+    let mut decisions = Vec::with_capacity(candidates.len());
+    let mut valid = Vec::new();
+    for candidate in candidates {
+        let fingerprint = candidate_fingerprint(&candidate);
+        if let Some(reason) = rejection_reason(query, &candidate, now_unix_ms) {
+            decisions.push(CandidateDecision {
+                candidate_fingerprint: fingerprint,
+                accepted: false,
+                reason: reason.to_owned(),
+            });
+        } else {
+            decisions.push(CandidateDecision {
+                candidate_fingerprint: fingerprint.clone(),
+                accepted: true,
+                reason: "validated".to_owned(),
+            });
+            valid.push((fingerprint, candidate));
+        }
+    }
+    anyhow::ensure!(!valid.is_empty(), "no validated service candidates");
+    let authority = &valid[0].1;
+    anyhow::ensure!(
+        valid.iter().all(|(_, candidate)| {
+            candidate.service_did == authority.service_did
+                && candidate.response_verifying_key == authority.response_verifying_key
+                && candidate.response_ml_dsa65 == authority.response_ml_dsa65
+                && candidate.response_key_id == authority.response_key_id
+                && candidate.request_kem_recipient == authority.request_kem_recipient
+                && candidate.accepted_state == authority.accepted_state
+        }),
+        "ambiguous validated service authority"
+    );
+    valid.sort_by(|(af, a), (bf, b)| {
+        b.accepted_state
+            .epoch
+            .cmp(&a.accepted_state.epoch)
+            .then_with(|| b.expires_at_unix_ms.cmp(&a.expires_at_unix_ms))
+            .then_with(|| a.service_did.cmp(&b.service_did))
+            .then_with(|| {
+                transport_fingerprint(&a.transport).cmp(&transport_fingerprint(&b.transport))
+            })
+            .then_with(|| af.cmp(bf))
+    });
+    valid.dedup_by(|(af, _), (bf, _)| af == bf);
+    let (selected_fingerprint, selected) = valid.remove(0);
+    decisions.sort_by(|a, b| a.candidate_fingerprint.cmp(&b.candidate_fingerprint));
+    let response_verifying_key = VerifyingKey::from_bytes(&selected.response_verifying_key)
+        .map_err(|e| anyhow::anyhow!("invalid selected response verifying key: {e}"))?;
+    let request_kem_recipient = selected
+        .request_kem_recipient
+        .ok_or_else(|| anyhow::anyhow!("validated candidate lost request KEM recipient"))?;
+    let expires_at_unix_ms = selected
+        .expires_at_unix_ms
+        .min(selected.accepted_state.expires_at_unix_ms)
+        .min(request_kem_recipient.not_after_unix_ms);
+    Ok(SelectedService {
+        service_name: selected.service_name,
+        service_did: selected.service_did,
+        response_verifying_key,
+        response_ml_dsa65: selected.response_ml_dsa65,
+        response_key_id: selected.response_key_id,
+        request_kem_recipient,
+        transport: selected.transport,
+        expires_at_unix_ms,
+        evidence: ResolutionEvidence {
+            accepted_state_digest: selected.accepted_state.digest,
+            accepted_state_epoch: selected.accepted_state.epoch,
+            selected_fingerprint,
+            ordered_decisions: decisions,
+        },
+    })
+}
+
+fn select_service_candidates(
+    query: &ServiceQuery,
+    mut candidates: Vec<ServiceCandidate>,
+    now_unix_ms: i64,
+) -> Result<Vec<SelectedService>> {
+    let mut ordered = Vec::new();
+    loop {
+        let selected = match select_service_candidate(query, candidates.clone(), now_unix_ms) {
+            Ok(selected) => selected,
+            Err(error) if !ordered.is_empty() && error.to_string().contains("no validated") => {
+                break;
+            }
+            Err(error) => return Err(error),
+        };
+        let fingerprint = selected.evidence.selected_fingerprint.clone();
+        candidates.retain(|candidate| candidate_fingerprint(candidate) != fingerprint);
+        ordered.push(selected);
+    }
+    Ok(ordered)
 }
 
 /// Convert the wire `SelectorOp` (generated from `discovery.capnp`) to the
@@ -685,6 +1060,15 @@ static PRODUCTION_RESOLVER: std::sync::OnceLock<Arc<DiscoveryServiceResolver>> =
 ///
 /// ```compile_fail
 /// use hyprstream_discovery::{DiscoveryServiceResolver, ResolvedService};
+/// ```
+///
+/// Raw accepted evidence, candidates, selection, and the selected transport/key
+/// bundle are private to Discovery's checkpoint-verifying implementation.
+/// ```compile_fail
+/// use hyprstream_rpc::{
+///     select_service_candidate, AcceptedStateEvidence, AnchoredKemRecipient,
+///     SelectedService, ServiceCandidate,
+/// };
 /// ```
 pub fn production_rpc_client(
     service_name: &str,
