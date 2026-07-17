@@ -139,6 +139,11 @@ pub struct EnvelopeContext {
     /// Present on streaming requests; extracted from `RequestEnvelope.client_dh_public`.
     client_dh_public: Option<[u8; 32]>,
 
+    /// Authenticated, suite-complete ephemeral HyKEM recipient for an identified
+    /// stream.  This is only key material; handlers must still supply the
+    /// accepted-current [`IdentifiedStreamBinding`] and pass the key-release PEP.
+    client_kem_public: Option<crate::crypto::hybrid_kem::RecipientPublic>,
+
     /// Authenticated request transcript and one-shot response recipient.
     /// These are used only by the response seal chokepoint.
     pub(crate) request_iat: i64,
@@ -176,6 +181,7 @@ impl EnvelopeContext {
             cnf: envelope.cnf,
             envelope_wit_hash: envelope.envelope.wth,
             client_dh_public: envelope.envelope.client_dh_public,
+            client_kem_public: envelope.envelope.client_kem_public.clone(),
             request_iat: envelope.envelope.iat,
             request_nonce: envelope.envelope.nonce,
             response_kem_recipient: envelope.envelope.response_kem_recipient.clone(),
@@ -200,6 +206,7 @@ impl EnvelopeContext {
             cnf: envelope.cnf,
             envelope_wit_hash: envelope.envelope.wth,
             client_dh_public: envelope.envelope.client_dh_public,
+            client_kem_public: envelope.envelope.client_kem_public.clone(),
             request_iat: envelope.envelope.iat,
             request_nonce: envelope.envelope.nonce,
             response_kem_recipient: envelope.envelope.response_kem_recipient.clone(),
@@ -228,6 +235,7 @@ impl EnvelopeContext {
             cnf: [0u8; 32],
             envelope_wit_hash: None,
             client_dh_public: None,
+            client_kem_public: None,
             request_iat: 0,
             request_nonce: [0; 16],
             response_kem_recipient: None,
@@ -374,6 +382,11 @@ impl EnvelopeContext {
     /// Used by streaming handlers to derive shared secrets for HMAC chain keys.
     pub fn ephemeral_pubkey(&self) -> Option<[u8; 32]> {
         self.client_dh_public
+    }
+
+    /// Get the authenticated identified-stream HyKEM recipient.
+    pub fn stream_kem_recipient(&self) -> Option<&crate::crypto::hybrid_kem::RecipientPublic> {
+        self.client_kem_public.as_ref()
     }
 
     /// Whether this request came from a genuine in-process / IPC caller (#328).
@@ -699,8 +712,7 @@ pub trait RequestService: 'static {
         let protected = crate::auth::parse_protected_header(&token)
             .map_err(|e| anyhow::anyhow!("JWT header parse failed: {}", e))?;
         anyhow::ensure!(
-            crate::auth::is_rfc9068_access_token_type(&protected.typ)
-                || protected.typ == "wit+jwt",
+            crate::auth::is_rfc9068_access_token_type(&protected.typ) || protected.typ == "wit+jwt",
             "unsupported JWT typ"
         );
         let kid = Some(protected.kid.clone());
@@ -802,7 +814,10 @@ pub trait RequestService: 'static {
             }
             "ML-DSA-65-Ed25519" => {
                 if !unverified.iss.is_empty()
-                    && !key_source.local_issuers().iter().any(|issuer| issuer == &unverified.iss)
+                    && !key_source
+                        .local_issuers()
+                        .iter()
+                        .any(|issuer| issuer == &unverified.iss)
                 {
                     anyhow::bail!("local composite JWT issuer mismatch");
                 }
@@ -1141,6 +1156,7 @@ mod empty_iss_gate_tests {
             cnf: [0u8; 32],
             envelope_wit_hash: None,
             client_dh_public: None,
+            client_kem_public: None,
             request_iat: 0,
             request_nonce: [0; 16],
             response_kem_recipient: None,
@@ -1287,9 +1303,7 @@ mod empty_iss_gate_tests {
         let claims =
             Claims::new("alice".to_owned(), now, now + 60).with_issuer("https://local".to_owned());
         for typ in crate::auth::RFC9068_ACCESS_TOKEN_TYPES {
-            let header = format!(
-                r#"{{"alg":"ML-DSA-65-Ed25519","typ":"{typ}","kid":"{kid_a}"}}"#
-            );
+            let header = format!(r#"{{"alg":"ML-DSA-65-Ed25519","typ":"{typ}","kid":"{kid_a}"}}"#);
             let valid = composite_token(&header, &claims, &pq_a, &ed_a, false);
             assert!(
                 svc.verify_claims(&mut ctx_with_token(valid, false))
@@ -1332,15 +1346,21 @@ mod empty_iss_gate_tests {
                 false,
             ),
             (
-                format!(r#"{{"alg":"ML-DSA-65-Ed25519","typ":"Application/at+jwt","kid":"{kid_a}"}}"#),
+                format!(
+                    r#"{{"alg":"ML-DSA-65-Ed25519","typ":"Application/at+jwt","kid":"{kid_a}"}}"#
+                ),
                 false,
             ),
             (
-                format!(r#"{{"alg":"ML-DSA-65-Ed25519","typ":"application/AT+JWT","kid":"{kid_a}"}}"#),
+                format!(
+                    r#"{{"alg":"ML-DSA-65-Ed25519","typ":"application/AT+JWT","kid":"{kid_a}"}}"#
+                ),
                 false,
             ),
             (
-                format!(r#"{{"alg":"ML-DSA-65-Ed25519","typ":"application/at+jwt ","kid":"{kid_a}"}}"#),
+                format!(
+                    r#"{{"alg":"ML-DSA-65-Ed25519","typ":"application/at+jwt ","kid":"{kid_a}"}}"#
+                ),
                 false,
             ),
             (
@@ -1409,10 +1429,16 @@ mod empty_iss_gate_tests {
 
         let missing_issuer = Claims::new("alice".to_owned(), now, now + 60);
         let token = composite_token(&valid_header, &missing_issuer, &pq_a, &ed_a, false);
-        assert!(svc.verify_claims(&mut ctx_with_token(token, false)).await.is_err());
+        assert!(svc
+            .verify_claims(&mut ctx_with_token(token, false))
+            .await
+            .is_err());
         let wrong_issuer = claims.clone().with_issuer("https://other".to_owned());
         let token = composite_token(&valid_header, &wrong_issuer, &pq_a, &ed_a, false);
-        assert!(svc.verify_claims(&mut ctx_with_token(token, false)).await.is_err());
+        assert!(svc
+            .verify_claims(&mut ctx_with_token(token, false))
+            .await
+            .is_err());
     }
 
     #[test]
@@ -1505,6 +1531,7 @@ mod ipc_key_identity_tests {
             cnf: signer_pubkey,
             envelope_wit_hash: None,
             client_dh_public: None,
+            client_kem_public: None,
             request_iat: 0,
             request_nonce: [0; 16],
             response_kem_recipient: None,
@@ -1731,6 +1758,7 @@ mod accounting_audit_tests {
             cnf: [0u8; 32],
             envelope_wit_hash: None,
             client_dh_public: None,
+            client_kem_public: None,
             request_iat: 0,
             request_nonce: [0; 16],
             response_kem_recipient: None,
@@ -1785,6 +1813,7 @@ mod accounting_audit_tests {
             cnf: [0u8; 32],
             envelope_wit_hash: None,
             client_dh_public: None,
+            client_kem_public: None,
             request_iat: 0,
             request_nonce: [0; 16],
             response_kem_recipient: None,
@@ -1849,6 +1878,7 @@ mod accounting_audit_tests {
             cnf,
             envelope_wit_hash: None,
             client_dh_public: None,
+            client_kem_public: None,
             request_iat: 0,
             request_nonce: [0; 16],
             response_kem_recipient: None,

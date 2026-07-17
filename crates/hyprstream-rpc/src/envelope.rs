@@ -633,6 +633,14 @@ pub struct RequestEnvelope {
     /// ephemeral keypair to derive the shared secret for HMAC chain keys.
     pub client_dh_public: Option<[u8; 32]>,
 
+    /// Fresh, suite-complete HyKEM recipient for identified stream setup.
+    ///
+    /// This is authenticated inside the request envelope and is distinct from
+    /// both the legacy classical DH field and the one-shot unary-response
+    /// recipient.  The server must bind it into an [`IdentifiedStreamBinding`]
+    /// before deriving or releasing stream epoch keys.
+    pub client_kem_public: Option<crate::crypto::hybrid_kem::RecipientPublic>,
+
     /// Fresh per-call hybrid-KEM recipient for the unary response. This is
     /// distinct from both legacy `client_dh_public` and stream-plane
     /// `clientKemPublic`, and is carried only inside a sealed network request.
@@ -655,6 +663,7 @@ impl RequestEnvelope {
             delegation_token: None,
             wth: None,
             client_dh_public: None,
+            client_kem_public: None,
             response_kem_recipient: None,
             service_domain: None,
         }
@@ -690,6 +699,23 @@ impl RequestEnvelope {
     pub fn with_client_dh_public(mut self, key: [u8; 32]) -> Self {
         self.client_dh_public = Some(key);
         self
+    }
+
+    /// Set the identified stream's ephemeral, pinned-suite HyKEM recipient.
+    pub fn with_client_kem_public(
+        mut self,
+        recipient: crate::crypto::hybrid_kem::RecipientPublic,
+    ) -> EnvelopeResult<Self> {
+        recipient
+            .validate()
+            .map_err(|error| EnvelopeError::KeyExchange(error.to_string()))?;
+        if recipient.suite_id != crate::stream_epoch::IDENTIFIED_STREAM_SUITE {
+            return Err(EnvelopeError::KeyExchange(
+                "identified streams require the pinned X25519+ML-KEM-768 suite".into(),
+            ));
+        }
+        self.client_kem_public = Some(recipient);
+        Ok(self)
     }
 
     /// Set the one-shot HyKEM recipient for the corresponding unary response.
@@ -1613,6 +1639,7 @@ impl SignedEnvelope {
             delegation_token: None,
             wth: None,
             client_dh_public: None,
+            client_kem_public: None,
             response_kem_recipient: None,
             service_domain: None,
         }
@@ -2096,6 +2123,9 @@ impl ToCapnp for RequestEnvelope {
         if let Some(ref key) = self.client_dh_public {
             builder.set_client_dh_public(key);
         }
+        if let Some(ref recipient) = self.client_kem_public {
+            builder.set_client_kem_public(&recipient.encode());
+        }
         if let Some(ref recipient) = self.response_kem_recipient {
             builder.set_response_kem_recipient(&recipient.encode());
         }
@@ -2169,6 +2199,28 @@ impl FromCapnp for RequestEnvelope {
             }
         };
 
+        let client_kem_public = {
+            let data = reader.get_client_kem_public()?;
+            if data.is_empty() {
+                None
+            } else {
+                if data.len() > MAX_RESPONSE_KEM_RECIPIENT_BYTES {
+                    return Err(anyhow!(
+                        "clientKemPublic exceeds {} byte limit",
+                        MAX_RESPONSE_KEM_RECIPIENT_BYTES
+                    ));
+                }
+                let recipient = crate::crypto::hybrid_kem::RecipientPublic::decode(data)
+                    .map_err(|e| anyhow!("invalid clientKemPublic: {e}"))?;
+                if recipient.suite_id != crate::stream_epoch::IDENTIFIED_STREAM_SUITE {
+                    return Err(anyhow!(
+                        "clientKemPublic does not use the pinned identified-stream suite"
+                    ));
+                }
+                Some(recipient)
+            }
+        };
+
         let response_kem_recipient = {
             let data = reader.get_response_kem_recipient()?;
             if data.is_empty() {
@@ -2204,6 +2256,7 @@ impl FromCapnp for RequestEnvelope {
             delegation_token,
             wth,
             client_dh_public,
+            client_kem_public,
             response_kem_recipient,
             service_domain,
         })
@@ -3439,6 +3492,7 @@ mod tests {
             delegation_token: Some("delegated".to_owned()),
             wth: Some([0xAB; 32]),
             client_dh_public: Some([0xCD; 32]),
+            client_kem_public: None,
             response_kem_recipient: None,
             service_domain: None,
         };
@@ -3482,6 +3536,7 @@ mod tests {
             delegation_token: None,
             wth: None,
             client_dh_public: None,
+            client_kem_public: None,
             response_kem_recipient: None,
             service_domain: None,
         };
@@ -3544,6 +3599,7 @@ mod tests {
             delegation_token: None,
             wth: None,
             client_dh_public: None,
+            client_kem_public: None,
             response_kem_recipient: None,
             service_domain: None,
         };
@@ -3595,6 +3651,7 @@ mod tests {
                 delegation_token: None,
                 wth: None,
                 client_dh_public: None,
+                client_kem_public: None,
                 response_kem_recipient: None,
                 service_domain: None,
             },
@@ -3797,6 +3854,7 @@ mod tests {
             delegation_token: None,
             wth: None,
             client_dh_public: None,
+            client_kem_public: None,
             response_kem_recipient: None,
             service_domain: None,
         };
@@ -3843,6 +3901,7 @@ mod tests {
             delegation_token: None,
             wth: Some([0xAA; 32]),
             client_dh_public: None,
+            client_kem_public: None,
             response_kem_recipient: None,
             service_domain: None,
         };
