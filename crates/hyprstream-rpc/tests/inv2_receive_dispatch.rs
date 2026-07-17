@@ -206,7 +206,9 @@ fn browser_binding() -> BrowserRequestBinding {
         version: BROWSER_PROVISIONING_VERSION.to_owned(),
         service_name: "model".to_owned(),
         service_did: "did:at9p:test-service".to_owned(),
-        service_origin: "https://model.example:443".to_owned(),
+        service_origin: "https://model.example/".to_owned(),
+        webtransport_url: "https://model.example/wt".to_owned(),
+        certificate_hashes: vec![encode(&[0x44; 32])],
         capability: "hyprstream-rpc/1".to_owned(),
         scope: "model".to_owned(),
         carrier_profile: BrowserCarrierProfile::OwnedHybridWebTransport,
@@ -217,7 +219,6 @@ fn browser_binding() -> BrowserRequestBinding {
         accepted_state_digest: encode(&[0x33; 64]),
         accepted_state_epoch: 9,
         expires_at_unix_ms: i64::MAX,
-        projection_digest: encode(&[0x44; 32]),
     }
 }
 

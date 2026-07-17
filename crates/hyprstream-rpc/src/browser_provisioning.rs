@@ -22,6 +22,7 @@ pub const MAX_PROVISIONING_LIFETIME_MS: i64 = 60_000;
 pub const MAX_BROWSER_BINDING_BYTES: usize = 4096;
 pub const MAX_BROWSER_EXTENSION_BYTES: usize = 8 * 1024;
 pub const MAX_BROWSER_APPLICATION_BYTES: usize = 4 * 1024 * 1024;
+const MAX_BROWSER_CERTIFICATE_HASHES: usize = 16;
 const BROWSER_BOUND_PAYLOAD_MAGIC: &[u8; 16] = b"HYPR-BROWSER-V1\0";
 const BROWSER_EXTENSION_DOMAIN: &str = "hyprstream.browser-bound-request.v1";
 const BROWSER_REQUEST_DOMAIN: &[u8] = b"hyprstream.browser-request-digest.v1\0";
@@ -184,11 +185,15 @@ impl BrowserProvisioningDocument {
             accepted_state_digest: URL_SAFE_NO_PAD.encode(material.accepted_state_digest),
             accepted_state_epoch: material.accepted_state_epoch,
             expires_at_unix_ms: material.expires_at_unix_ms,
-            certificate_hashes: material
-                .certificate_hashes
-                .into_iter()
-                .map(|hash| URL_SAFE_NO_PAD.encode(hash))
-                .collect(),
+            certificate_hashes: {
+                let mut hashes = material.certificate_hashes;
+                hashes.sort();
+                hashes.dedup();
+                hashes
+                    .into_iter()
+                    .map(|hash| URL_SAFE_NO_PAD.encode(hash))
+                    .collect()
+            },
             application_hybrid_required: true,
             encrypted_objects_required: material.encrypted_objects_required,
             projection_signer_ed25519: String::new(),
@@ -241,6 +246,8 @@ pub struct BrowserRequestBinding {
     pub service_name: String,
     pub service_did: String,
     pub service_origin: String,
+    pub webtransport_url: String,
+    pub certificate_hashes: Vec<String>,
     pub capability: String,
     pub scope: String,
     pub carrier_profile: BrowserCarrierProfile,
@@ -251,7 +258,6 @@ pub struct BrowserRequestBinding {
     pub accepted_state_digest: String,
     pub accepted_state_epoch: u64,
     pub expires_at_unix_ms: i64,
-    pub projection_digest: String,
 }
 
 impl BrowserRequestBinding {
@@ -286,7 +292,28 @@ impl BrowserRequestBinding {
             self.service_did.starts_with("did:at9p:"),
             "browser binding requires did:at9p"
         );
-        parse_https_url(&self.service_origin, "browser binding service origin")?;
+        let service_origin = parse_https_url(&self.service_origin, "browser binding service origin")?;
+        let webtransport_url =
+            parse_https_url(&self.webtransport_url, "browser binding WebTransport route")?;
+        anyhow::ensure!(
+            self.service_origin == service_origin.as_str()
+                && self.webtransport_url == webtransport_url.as_str(),
+            "browser binding route evidence is not normalized"
+        );
+        anyhow::ensure!(
+            self.certificate_hashes.len() <= MAX_BROWSER_CERTIFICATE_HASHES,
+            "browser binding has too many certificate hashes"
+        );
+        let mut normalized_hashes = self.certificate_hashes.clone();
+        for hash in &normalized_hashes {
+            decode_exact::<32>(hash, "certificate hash")?;
+        }
+        normalized_hashes.sort();
+        normalized_hashes.dedup();
+        anyhow::ensure!(
+            normalized_hashes == self.certificate_hashes,
+            "browser binding certificate hashes are not normalized"
+        );
         validate_bounded_token(&self.capability, "browser binding capability", 128)?;
         validate_bounded_token(&self.scope, "browser binding scope", 512)?;
         validate_key_id(&self.response_key_id, &self.service_did, "response")?;
@@ -294,7 +321,6 @@ impl BrowserRequestBinding {
         decode_exact::<32>(&self.response_key_digest, "response key digest")?;
         decode_exact::<32>(&self.request_kem_digest, "request KEM digest")?;
         decode_exact::<64>(&self.accepted_state_digest, "accepted-state digest")?;
-        decode_exact::<32>(&self.projection_digest, "projection digest")?;
         anyhow::ensure!(
             self.accepted_state_epoch > 0,
             "browser binding epoch must be non-zero"
@@ -559,7 +585,6 @@ pub struct BrowserProvisioning {
     request_kem_recipient: RecipientPublic,
     accepted_state_digest: [u8; 64],
     certificate_hashes: Vec<[u8; 32]>,
-    fingerprint: [u8; 32],
 }
 
 impl std::fmt::Debug for BrowserProvisioning {
@@ -647,6 +672,11 @@ impl BrowserProvisioning {
 
         let origin = parse_https_url(&document.service_origin, "service origin")?;
         let route = parse_https_url(&document.webtransport_url, "WebTransport route")?;
+        anyhow::ensure!(
+            document.service_origin == origin.as_str()
+                && document.webtransport_url == route.as_str(),
+            "browser provisioning route evidence is not normalized"
+        );
         match document.carrier_profile {
             BrowserCarrierProfile::OwnedHybridWebTransport => {
                 anyhow::ensure!(
@@ -707,15 +737,29 @@ impl BrowserProvisioning {
         request_kem_recipient.validate()?;
         let accepted_state_digest =
             decode_exact::<64>(&document.accepted_state_digest, "accepted-state digest")?;
+        anyhow::ensure!(
+            document.certificate_hashes.len() <= MAX_BROWSER_CERTIFICATE_HASHES,
+            "browser provisioning has too many certificate hashes"
+        );
         let certificate_hashes = document
             .certificate_hashes
             .iter()
             .map(|value| decode_exact::<32>(value, "certificate hash"))
             .collect::<Result<Vec<_>>>()?;
+        let mut normalized_hashes = document.certificate_hashes.clone();
+        normalized_hashes.sort();
+        normalized_hashes.dedup();
+        anyhow::ensure!(
+            normalized_hashes == document.certificate_hashes,
+            "browser provisioning certificate hashes are not normalized"
+        );
 
         let canonical = serde_json::to_vec(&document)
             .context("failed to canonicalize browser provisioning document")?;
-        let fingerprint = *blake3::hash(&canonical).as_bytes();
+        anyhow::ensure!(
+            canonical.len() <= MAX_PROVISIONING_BYTES,
+            "browser provisioning document exceeds {MAX_PROVISIONING_BYTES} bytes"
+        );
         Ok(Self {
             document,
             server_verifying_key,
@@ -723,7 +767,6 @@ impl BrowserProvisioning {
             request_kem_recipient,
             accepted_state_digest,
             certificate_hashes,
-            fingerprint,
         })
     }
 
@@ -809,6 +852,8 @@ impl BrowserProvisioning {
             service_name: self.document.service_name.clone(),
             service_did: self.document.service_did.clone(),
             service_origin: self.document.service_origin.clone(),
+            webtransport_url: self.document.webtransport_url.clone(),
+            certificate_hashes: self.document.certificate_hashes.clone(),
             capability: self.document.capability.clone(),
             scope: self.document.scope.clone(),
             carrier_profile: self.document.carrier_profile,
@@ -819,7 +864,6 @@ impl BrowserProvisioning {
             accepted_state_digest: self.document.accepted_state_digest.clone(),
             accepted_state_epoch: self.document.accepted_state_epoch,
             expires_at_unix_ms: self.document.expires_at_unix_ms,
-            projection_digest: URL_SAFE_NO_PAD.encode(self.fingerprint),
         })
     }
 }
@@ -889,6 +933,22 @@ fn decode_exact<const N: usize>(value: &str, label: &str) -> Result<[u8; N]> {
     decode(value, label)?
         .try_into()
         .map_err(|_| anyhow::anyhow!("{label} must be exactly {N} bytes"))
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+fn ensure_provisioning_chunk_fits(
+    current_len: usize,
+    chunk_len: usize,
+    declared_len: usize,
+) -> Result<()> {
+    let next_len = current_len
+        .checked_add(chunk_len)
+        .context("browser provisioning response length overflow")?;
+    anyhow::ensure!(
+        next_len <= declared_len && next_len <= MAX_PROVISIONING_BYTES,
+        "browser provisioning response exceeded its bounded content-length"
+    );
+    Ok(())
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -977,20 +1037,39 @@ pub async fn fetch_browser_provisioning(
         content_length <= MAX_PROVISIONING_BYTES,
         "browser provisioning response exceeds {MAX_PROVISIONING_BYTES} bytes"
     );
-    let text_promise = response.text().map_err(|error| {
-        anyhow::anyhow!("browser provisioning response body unavailable: {error:?}")
-    })?;
-    let text = JsFuture::from(text_promise)
-        .await
-        .map_err(|error| anyhow::anyhow!("browser provisioning response read failed: {error:?}"))?
-        .as_string()
-        .ok_or_else(|| anyhow::anyhow!("browser provisioning response was not UTF-8 text"))?;
+    let body = response
+        .body()
+        .ok_or_else(|| anyhow::anyhow!("browser provisioning response omitted its body"))?;
+    let reader: web_sys::ReadableStreamDefaultReader = body.get_reader().unchecked_into();
+    let mut bytes = Vec::with_capacity(content_length);
+    loop {
+        let result = JsFuture::from(reader.read())
+            .await
+            .map_err(|error| anyhow::anyhow!("browser provisioning response read failed: {error:?}"))?;
+        let done = js_sys::Reflect::get(&result, &wasm_bindgen::JsValue::from_str("done"))
+            .map_err(|_| anyhow::anyhow!("browser provisioning response chunk omitted done"))?
+            .as_bool()
+            .ok_or_else(|| anyhow::anyhow!("browser provisioning response chunk had invalid done"))?;
+        if done {
+            break;
+        }
+        let value = js_sys::Reflect::get(&result, &wasm_bindgen::JsValue::from_str("value"))
+            .map_err(|_| anyhow::anyhow!("browser provisioning response chunk omitted value"))?;
+        let chunk = js_sys::Uint8Array::new(&value);
+        let chunk_len = usize::try_from(chunk.length())
+            .context("browser provisioning response chunk length overflow")?;
+        ensure_provisioning_chunk_fits(bytes.len(), chunk_len, content_length)?;
+        let start = bytes.len();
+        bytes.resize(start + chunk_len, 0);
+        chunk.copy_to(&mut bytes[start..]);
+    }
+    reader.release_lock();
     anyhow::ensure!(
-        text.len() == content_length && text.len() <= MAX_PROVISIONING_BYTES,
+        bytes.len() == content_length,
         "browser provisioning response size did not match its bounded content-length"
     );
     let now = chrono::Utc::now().timestamp_millis();
-    let provisioned = BrowserProvisioning::from_json(text.as_bytes(), expected, now)?;
+    let provisioned = BrowserProvisioning::from_json(&bytes, expected, now)?;
     let service_origin = parse_https_url(provisioned.service_origin(), "service origin")?;
     anyhow::ensure!(
         service_origin.host_str() == url.host_str(),
@@ -1054,8 +1133,8 @@ mod tests {
         BrowserProvisioningMaterial {
             service_name: "model".to_owned(),
             service_did: "did:at9p:test-service".to_owned(),
-            service_origin: "https://model.example:443".to_owned(),
-            webtransport_url: "https://model.example:443/wt".to_owned(),
+            service_origin: "https://model.example/".to_owned(),
+            webtransport_url: "https://model.example/wt".to_owned(),
             capability: "hyprstream-rpc/1".to_owned(),
             scope: "model".to_owned(),
             carrier_profile: BrowserCarrierProfile::OwnedHybridWebTransport,
@@ -1183,6 +1262,18 @@ mod tests {
             },
         )
         .is_err());
+    }
+
+    #[test]
+    fn streaming_body_cap_rejects_lying_length_and_oversize_before_growth() {
+        assert!(ensure_provisioning_chunk_fits(0, 9, 8).is_err());
+        assert!(ensure_provisioning_chunk_fits(
+            0,
+            MAX_PROVISIONING_BYTES + 1,
+            MAX_PROVISIONING_BYTES,
+        )
+        .is_err());
+        assert!(ensure_provisioning_chunk_fits(7, 1, 8).is_ok());
     }
 
     #[test]

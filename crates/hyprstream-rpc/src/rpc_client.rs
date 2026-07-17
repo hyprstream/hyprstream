@@ -472,8 +472,28 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
         ephemeral_pubkey: [u8; 32],
         options: CallOptions,
     ) -> Result<Vec<u8>> {
-        self.call_streaming_with_options_bound(payload, ephemeral_pubkey, options, None)
+        self.call_streaming_with_options_bound(payload, ephemeral_pubkey, options, None, None)
             .await
+    }
+
+
+    /// Send an option-bearing generated streaming request bound to its service and method.
+    pub async fn call_streaming_with_options_for_service_with_method(
+        &self,
+        service_domain: &str,
+        method_discriminator: u16,
+        payload: Vec<u8>,
+        ephemeral_pubkey: [u8; 32],
+        options: CallOptions,
+    ) -> Result<Vec<u8>> {
+        self.call_streaming_with_options_bound(
+            payload,
+            ephemeral_pubkey,
+            options,
+            Some(service_domain),
+            Some(method_discriminator),
+        )
+        .await
     }
 
     async fn call_streaming_with_options_bound(
@@ -482,6 +502,7 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
         ephemeral_pubkey: [u8; 32],
         options: CallOptions,
         service_domain: Option<&str>,
+        method_discriminator: Option<u16>,
     ) -> Result<Vec<u8>> {
         self.ensure_pre_seal_current().await?;
         let request_id = self.next_id();
@@ -494,7 +515,7 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
                 jwt,
                 options.delegated_bearer,
                 service_domain,
-                None,
+                method_discriminator,
             )
             .await?;
         let timeout = self.calculate_timeout();
@@ -512,7 +533,7 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
         payload: Vec<u8>,
         options: CallOptions,
     ) -> Result<Vec<u8>> {
-        self.call_with_options_bound(payload, options, None).await
+        self.call_with_options_bound(payload, options, None, None).await
     }
 
     /// Send an option-bearing request bound to a canonical destination.
@@ -522,8 +543,26 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
         payload: Vec<u8>,
         options: CallOptions,
     ) -> Result<Vec<u8>> {
-        self.call_with_options_bound(payload, options, Some(service_domain))
+        self.call_with_options_bound(payload, options, Some(service_domain), None)
             .await
+    }
+
+
+    /// Send an option-bearing generated request bound to its service and method.
+    pub async fn call_with_options_for_service_with_method(
+        &self,
+        service_domain: &str,
+        method_discriminator: u16,
+        payload: Vec<u8>,
+        options: CallOptions,
+    ) -> Result<Vec<u8>> {
+        self.call_with_options_bound(
+            payload,
+            options,
+            Some(service_domain),
+            Some(method_discriminator),
+        )
+        .await
     }
 
     async fn call_with_options_bound(
@@ -531,6 +570,7 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
         payload: Vec<u8>,
         options: CallOptions,
         service_domain: Option<&str>,
+        method_discriminator: Option<u16>,
     ) -> Result<Vec<u8>> {
         self.ensure_pre_seal_current().await?;
         let request_id = self.next_id();
@@ -543,7 +583,7 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
                 jwt,
                 options.delegated_bearer,
                 service_domain,
-                None,
+                method_discriminator,
             )
             .await?;
         let timeout = self.calculate_timeout();
@@ -880,6 +920,31 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
         StreamHandleImpl::open(&self.transport, stream_info, &secret_bytes, &pub_bytes).await
     }
 
+    /// Open a generated verified stream bound to its canonical service and method.
+    #[cfg(not(feature = "fips"))]
+    pub async fn open_stream_for_service_with_method(
+        &self,
+        service_domain: &str,
+        method_discriminator: u16,
+        payload: Vec<u8>,
+    ) -> Result<StreamHandleImpl<T>> {
+        use crate::crypto::generate_ephemeral_keypair;
+
+        let (secret, public) = generate_ephemeral_keypair();
+        let pub_bytes = public.to_bytes();
+        let response = self
+            .call_streaming_for_service_with_method(
+                service_domain,
+                method_discriminator,
+                payload,
+                pub_bytes,
+            )
+            .await?;
+        let stream_info = parse_stream_info(&response)?;
+        let secret_bytes = secret.scalar().to_bytes();
+        StreamHandleImpl::open(&self.transport, stream_info, &secret_bytes, &pub_bytes).await
+    }
+
     /// Open a verified streaming subscription with per-call authentication options.
     ///
     /// Same as `open_stream` but passes per-call JWT through the streaming
@@ -903,6 +968,33 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
         let secret_bytes = secret.scalar().to_bytes();
         StreamHandleImpl::open(&self.transport, stream_info, &secret_bytes, &pub_bytes).await
     }
+    /// Open an option-bearing generated stream bound to its canonical service and method.
+    #[cfg(not(feature = "fips"))]
+    pub async fn open_stream_with_options_for_service_with_method(
+        &self,
+        service_domain: &str,
+        method_discriminator: u16,
+        payload: Vec<u8>,
+        options: CallOptions,
+    ) -> Result<StreamHandleImpl<T>> {
+        use crate::crypto::generate_ephemeral_keypair;
+
+        let (secret, public) = generate_ephemeral_keypair();
+        let pub_bytes = public.to_bytes();
+        let response = self
+            .call_streaming_with_options_for_service_with_method(
+                service_domain,
+                method_discriminator,
+                payload,
+                pub_bytes,
+                options,
+            )
+            .await?;
+        let stream_info = parse_stream_info(&response)?;
+        let secret_bytes = secret.scalar().to_bytes();
+        StreamHandleImpl::open(&self.transport, stream_info, &secret_bytes, &pub_bytes).await
+    }
+
     /// Open a verified stream from pre-parsed StreamInfo + ephemeral keys.
     ///
     /// Use when the streaming RPC was already sent (e.g., via dispatch) and
@@ -1263,6 +1355,16 @@ mod request_kem_tests {
         Arc<LifecycleState>,
         Arc<AtomicUsize>,
     ) {
+        lifecycle_client_with_browser_binding(None)
+    }
+
+    fn lifecycle_client_with_browser_binding(
+        browser_binding: Option<crate::browser_provisioning::BrowserRequestBinding>,
+    ) -> (
+        Arc<RpcClientImpl<LocalSigner, LifecycleTransport>>,
+        Arc<LifecycleState>,
+        Arc<AtomicUsize>,
+    ) {
         let (server_sk, server_vk) = generate_signing_keypair();
         let (client_sk, _client_vk) = generate_signing_keypair();
         let mut kem_store = KeyedKemTrustStore::new();
@@ -1295,6 +1397,12 @@ mod request_kem_tests {
         .with_request_kem_store(Arc::new(kem_store))
         .with_response_pq_store(Arc::new(pq_store))
         .with_response_secret_drop_probe(Arc::clone(&drops));
+        let client = match browser_binding {
+            Some(binding) => client
+                .with_browser_provisioning_binding(binding)
+                .expect("valid browser binding"),
+            None => client,
+        };
         (Arc::new(client), state, drops)
     }
 
@@ -1479,6 +1587,86 @@ mod request_kem_tests {
             !bytes.windows(b"payload".len()).any(|w| w == b"payload"),
             "cleartext payload must not appear on the wire"
         );
+    }
+
+    fn browser_test_binding() -> crate::browser_provisioning::BrowserRequestBinding {
+        use base64::Engine as _;
+        let encode = |bytes: &[u8]| {
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+        };
+        crate::browser_provisioning::BrowserRequestBinding {
+            version: crate::browser_provisioning::BROWSER_PROVISIONING_VERSION.to_owned(),
+            service_name: "model".to_owned(),
+            service_did: "did:at9p:test-service".to_owned(),
+            service_origin: "https://model.example/".to_owned(),
+            webtransport_url: "https://model.example/wt".to_owned(),
+            certificate_hashes: vec![encode(&[0x44; 32])],
+            capability: "hyprstream-rpc/1".to_owned(),
+            scope: "model".to_owned(),
+            carrier_profile: crate::browser_provisioning::BrowserCarrierProfile::OwnedHybridWebTransport,
+            response_key_id: "did:at9p:test-service#response".to_owned(),
+            response_key_digest: encode(&[0x11; 32]),
+            request_kem_key_id: "did:at9p:test-service#mesh-kem".to_owned(),
+            request_kem_digest: encode(&[0x22; 32]),
+            accepted_state_digest: encode(&[0x33; 64]),
+            accepted_state_epoch: 9,
+            expires_at_unix_ms: i64::MAX,
+        }
+    }
+
+    fn browser_capnp_request(method_discriminator: u16) -> Vec<u8> {
+        let mut request = Vec::with_capacity(32);
+        request.extend_from_slice(&0u32.to_le_bytes());
+        request.extend_from_slice(&3u32.to_le_bytes());
+        request.extend_from_slice(&(2u64 << 32).to_le_bytes());
+        request.extend_from_slice(&91u64.to_le_bytes());
+        request.extend_from_slice(&(method_discriminator as u64).to_le_bytes());
+        request
+    }
+
+    #[tokio::test]
+    async fn provisioned_generated_exports_reach_transport_after_bound_sealing() {
+        let binding = browser_test_binding();
+        let (client, state, _drops) = lifecycle_client_with_browser_binding(Some(binding));
+        let application = browser_capnp_request(7);
+
+        let unary = client
+            .call_for_service_with_method("model", 7, application.clone())
+            .await
+            .expect("bound generated unary reaches transport");
+        let optioned = client
+            .call_with_options_for_service_with_method(
+                "model",
+                7,
+                application.clone(),
+                CallOptions::new().jwt("test-jwt".to_owned()),
+            )
+            .await
+            .expect("bound generated options call reaches transport");
+        let streaming = client
+            .call_streaming_for_service_with_method(
+                "model",
+                7,
+                application.clone(),
+                [0x55; 32],
+            )
+            .await
+            .expect("bound generated streaming call reaches transport");
+
+        for (request_id, framed) in [(1, unary), (2, optioned), (3, streaming)] {
+            let (transcript, recovered) = crate::browser_provisioning::recover_request_payload(
+                &framed,
+                crate::browser_provisioning::BrowserTranscriptPolicy::Required {
+                    request_id,
+                    service_name: "model",
+                    carrier_profile: crate::browser_provisioning::BrowserCarrierProfile::OwnedHybridWebTransport,
+                },
+            )
+            .expect("transport returned sealed browser transcript");
+            assert_eq!(transcript.expect("browser transcript").method_discriminator, 7);
+            assert_eq!(recovered, application);
+        }
+        assert_eq!(state.recipients.lock().len(), 3, "all bound calls reached transport");
     }
 
     #[tokio::test]

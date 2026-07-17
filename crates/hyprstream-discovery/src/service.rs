@@ -1438,6 +1438,8 @@ impl DiscoveryServiceResolver {
         anyhow::ensure!(
             binding.service_did == current.service_did
                 && binding.service_origin == current.service_origin
+                && binding.webtransport_url == current.webtransport_url
+                && binding.certificate_hashes == current.certificate_hashes
                 && binding.response_key_id == current.response_key_id
                 && binding.request_kem_key_id == current.request_kem_key_id
                 && binding.accepted_state_epoch == current.accepted_state_epoch
@@ -2359,7 +2361,10 @@ fn parse_announced_quic(endpoint: &str) -> anyhow::Result<TransportConfig> {
     let rest = endpoint
         .strip_prefix("quic://")
         .ok_or_else(|| anyhow::anyhow!("announced QUIC endpoint must start with quic://"))?;
-    let (server_name, addr) = rest.split_once(':').ok_or_else(|| {
+    let (reach, encoded_hashes) = rest.split_once('#').map_or((rest, None), |(reach, hashes)| {
+        (reach, Some(hashes))
+    });
+    let (server_name, addr) = reach.split_once(':').ok_or_else(|| {
         anyhow::anyhow!("announced QUIC endpoint must be quic://<server-name>:<socket-addr>")
     })?;
     anyhow::ensure!(
@@ -2372,7 +2377,27 @@ fn parse_announced_quic(endpoint: &str) -> anyhow::Result<TransportConfig> {
         addr.port() != 0,
         "announced QUIC endpoint must not use port 0"
     );
-    Ok(TransportConfig::quic(addr, server_name).with_connect_mode())
+    let transport = if let Some(encoded_hashes) = encoded_hashes {
+        let hashes = encoded_hashes
+            .split(',')
+            .map(|value| {
+                URL_SAFE_NO_PAD
+                    .decode(value)
+                    .context("invalid announced QUIC certificate hash")?
+                    .try_into()
+                    .map_err(|_| anyhow::anyhow!("announced QUIC certificate hash must be 32 bytes"))
+            })
+            .collect::<Result<Vec<[u8; 32]>>>()?;
+        anyhow::ensure!(!hashes.is_empty(), "announced QUIC pin set is empty");
+        TransportConfig::quic_with_auth(
+            addr,
+            server_name,
+            hyprstream_rpc::transport::QuicServerAuth::pinned(hashes)?,
+        )
+    } else {
+        TransportConfig::quic(addr, server_name).with_connect_mode()
+    };
+    Ok(transport)
 }
 
 fn parse_announced_iroh(endpoint: &str) -> anyhow::Result<TransportConfig> {
@@ -3167,6 +3192,64 @@ mod resolver_tests {
 
         source.0.lock().as_mut().expect("fixture state").epoch += 1;
         assert!(resolver.verify_browser_binding(&binding).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn post_refetch_route_and_pin_rotation_rejects_dial_evidence() {
+        async fn binding_for(
+            resolver: &DiscoveryServiceResolver,
+        ) -> hyprstream_rpc::browser_provisioning::BrowserRequestBinding {
+            let document = resolver
+                .browser_provisioning(owned_browser_request())
+                .await
+                .expect("pre-seal refetch")
+                .sign_projection(&SigningKey::from_bytes(&[11; 32]))
+                .expect("sign projection");
+            let json = serde_json::to_vec(&document).expect("serialize projection");
+            hyprstream_rpc::browser_provisioning::BrowserProvisioning::from_json(
+                &json,
+                &owned_browser_request(),
+                unix_millis_now(),
+            )
+            .expect("validate projection")
+            .request_binding()
+            .expect("bind dial evidence")
+        }
+
+        let (resolver, _) = production_fixture(false);
+        let route_binding = binding_for(&resolver).await;
+        resolver
+            .announced_endpoints
+            .write()
+            .get_mut("model")
+            .and_then(|entries| entries.first_mut())
+            .expect("fixture route")
+            .endpoint = "quic://localhost:127.0.0.1:10".to_owned();
+        assert!(resolver.verify_browser_binding(&route_binding).await.is_err());
+
+        let (resolver, _) = production_fixture(false);
+        resolver
+            .announced_endpoints
+            .write()
+            .get_mut("model")
+            .and_then(|entries| entries.first_mut())
+            .expect("fixture pin")
+            .endpoint = format!(
+                "quic://localhost:127.0.0.1:9#{}",
+                URL_SAFE_NO_PAD.encode([0x51; 32])
+            );
+        let pin_binding = binding_for(&resolver).await;
+        resolver
+            .announced_endpoints
+            .write()
+            .get_mut("model")
+            .and_then(|entries| entries.first_mut())
+            .expect("fixture pin rotation")
+            .endpoint = format!(
+                "quic://localhost:127.0.0.1:9#{}",
+                URL_SAFE_NO_PAD.encode([0x52; 32])
+            );
+        assert!(resolver.verify_browser_binding(&pin_binding).await.is_err());
     }
 
     #[tokio::test]

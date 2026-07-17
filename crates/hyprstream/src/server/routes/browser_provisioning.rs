@@ -77,6 +77,13 @@ fn bounded_json_response<T: Serialize + ?Sized>(status: StatusCode, document: &T
             return StatusCode::SERVICE_UNAVAILABLE.into_response();
         }
     };
+    if body.len() > hyprstream_rpc::browser_provisioning::MAX_PROVISIONING_BYTES {
+        tracing::error!(
+            length = body.len(),
+            "browser projection exceeded the serialization bound"
+        );
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
     let Ok(content_length) = HeaderValue::from_str(&body.len().to_string()) else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
@@ -114,6 +121,15 @@ mod tests {
             BrowserCarrierProfile::OwnedHybridWebTransport,
         );
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn oversized_serialized_projection_fails_closed() {
+        let response = bounded_json_response(
+            StatusCode::OK,
+            &"x".repeat(hyprstream_rpc::browser_provisioning::MAX_PROVISIONING_BYTES + 1),
+        );
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[test]
