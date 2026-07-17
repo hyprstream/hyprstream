@@ -13,6 +13,8 @@ The generated text/HTML intentionally exercise xml2rfc's standard Internet-Draft
 - `registry/domain-separation.json` — local labels, transcript fields, canonicalization, bounds, and owning issues; it is not an external registry.
 - `registry/profile-vocabulary.json` — bounded roles, principal kinds, carrier profiles, inner control message kinds, state names, and safety ceilings shared by later drafts.
 - `registry/obligations.json` — machine-readable mapping for every RFCXML `MUST`/`MUST NOT` to a test or explicit specification-only owner/blocker.
+- `.python-version` — the exact Python renderer version, which xml2rfc records in generated HTML.
+- `xml2rfc-requirements.txt` — the complete pinned renderer environment; xml2rfc records dependency versions in HTML, so pinning only the top-level package is not reproducible.
 - `rfc/draft-hyprstream-privacypass-pqhybrid-00.xml` and generated `.txt`/`.html` — reproducible RFCXML v3 scaffold.
 
 ## Primary sources and status (2026-07-17)
@@ -58,23 +60,25 @@ Success is interoperability of ordinary Objects and byte identity, not confident
 
 ## Generation and validation
 
-Generated text and HTML are deterministic outputs of exactly xml2rfc 3.34.0:
+Generated text and HTML are deterministic outputs of the fully pinned xml2rfc 3.34.0 environment:
 
 ```bash
 python3 tools/generate_standards.py
 python3 tools/check_standards.py
 python3 tools/check_standards.py --check-generated \
-  --xml2rfc "$(uvx --from xml2rfc==3.34.0 which xml2rfc)"
+  --xml2rfc "$(uvx --isolated --from xml2rfc==3.34.0 \
+    --python "$(cat docs/standards/.python-version)" \
+    --with-requirements docs/standards/xml2rfc-requirements.txt which xml2rfc)"
 ```
 
-For a direct local command when `xml2rfc` is already installed at the exact version:
+For a direct local command when the complete requirements file is already installed:
 
 ```bash
 xml2rfc --version                     # must report 3.34.0
 python3 tools/check_standards.py --check-generated --xml2rfc xml2rfc
 ```
 
-The `Standards artifacts` GitHub Actions workflow installs `xml2rfc==3.34.0`, validates all three JSON files using only Python stdlib, parses RFCXML, ensures every normative RFCXML sentence is manifested, and fails if regenerated text or HTML differs byte-for-byte.
+The `Standards artifacts` GitHub Actions workflow installs the complete pinned toolchain, validates all three JSON files using only Python stdlib, parses RFCXML, ensures every normative RFCXML sentence is manifested, and fails if regenerated text or HTML differs byte-for-byte.
 
 ## Construction-selection blockers
 

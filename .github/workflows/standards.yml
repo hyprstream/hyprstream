@@ -26,7 +26,10 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
-      - name: Install exact xml2rfc version
-        run: python3 -m pip install --disable-pip-version-check xml2rfc==3.34.0
+      - uses: actions/setup-python@v6
+        with:
+          python-version-file: docs/standards/.python-version
+      - name: Install exact xml2rfc toolchain
+        run: python3 -m pip install --disable-pip-version-check --upgrade --requirement docs/standards/xml2rfc-requirements.txt
       - name: Validate registries, obligations, and stale output
         run: python3 tools/check_standards.py --check-generated --xml2rfc xml2rfc
