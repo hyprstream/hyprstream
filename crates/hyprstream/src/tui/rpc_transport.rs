@@ -3,10 +3,10 @@
 //! Deduplicated from `shell_handlers.rs` and `service.rs` — both callers now
 //! use `make_chat_spawner` and (optionally) `make_tool_caller` from this module.
 
+use ed25519_dalek::SigningKey;
+use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::sync::Arc;
-use parking_lot::RwLock;
-use ed25519_dalek::SigningKey;
 
 /// Build a `StreamSpawner` that drives inference via `ModelClient`.
 ///
@@ -24,8 +24,8 @@ pub fn make_chat_spawner(
 ) -> hyprstream_tui::chat_app::StreamSpawner {
     use hyprstream_rpc::streaming::StreamPayload;
 
-    use crate::services::generated::inference_client::{ChatMessage, ToolCall, ToolCallFunction};
     use crate::runtime::GenerationRequest;
+    use crate::services::generated::inference_client::{ChatMessage, ToolCall, ToolCallFunction};
     use crate::services::generated::model_client::ModelClient;
     use hyprstream_tui::chat_app::{ChatEvent, ChatHistoryEntry, ChatRole};
 
@@ -59,51 +59,15 @@ pub fn make_chat_spawner(
             };
 
             rt.block_on(async move {
-                // Resolve model service key via PolicyClient.
-                let policy_vk = sk_inner.verifying_key();
-                let policy_client = match crate::services::PolicyClient::from_installed_resolver(
-                    sk_inner.clone(),
-                    policy_vk,
-                    None,
-                ) {
+                let model_client = match ModelClient::from_resolver(sk_inner.clone(), None) {
                     Ok(c) => c,
                     Err(e) => {
-                        let _ = tx.send(ChatEvent::StreamError(format!("Failed to create PolicyClient: {e}")));
+                        let _ = tx.send(ChatEvent::StreamError(format!(
+                            "Failed to create ModelClient: {e}"
+                        )));
                         return;
                     }
                 };
-                let model_key_resp = match policy_client.resolve_service_key(
-                    &crate::services::generated::policy_client::ResolveServiceKey {
-                        service_name: "model".to_owned(),
-                    },
-                ).await {
-                    Ok(r) => r,
-                    Err(e) => {
-                        let _ = tx.send(ChatEvent::StreamError(format!("Failed to resolve model key: {e}")));
-                        return;
-                    }
-                };
-                let model_vk = match <[u8; 32]>::try_from(model_key_resp.verifying_key.as_slice()) {
-                    Ok(bytes) => match hyprstream_rpc::crypto::VerifyingKey::from_bytes(&bytes) {
-                        Ok(vk) => vk,
-                        Err(e) => {
-                            let _ = tx.send(ChatEvent::StreamError(format!("Invalid model key: {e}")));
-                            return;
-                        }
-                    },
-                    Err(_) => {
-                        let _ = tx.send(ChatEvent::StreamError("Invalid model key length".to_owned()));
-                        return;
-                    }
-                };
-                let model_client =
-                    match ModelClient::from_installed_resolver(sk_inner.clone(), model_vk, None) {
-                        Ok(c) => c,
-                        Err(e) => {
-                            let _ = tx.send(ChatEvent::StreamError(format!("Failed to create ModelClient: {e}")));
-                            return;
-                        }
-                    };
 
                 // Map ChatHistoryEntry → ChatMessage, handling all roles.
                 // Skip the trailing empty assistant placeholder — it's only a
@@ -111,9 +75,13 @@ pub fn make_chat_spawner(
                 // already injects the assistant-start token into the prompt.
                 // Including it causes a double `<|im_start|>assistant` prefix.
                 let history_slice = match history.last() {
-                    Some(e) if matches!(e.role, ChatRole::Assistant)
-                        && e.content.is_empty()
-                        && e.tool_calls.is_empty() => &history[..history.len() - 1],
+                    Some(e)
+                        if matches!(e.role, ChatRole::Assistant)
+                            && e.content.is_empty()
+                            && e.tool_calls.is_empty() =>
+                    {
+                        &history[..history.len() - 1]
+                    }
                     _ => &history[..],
                 };
 
@@ -129,7 +97,8 @@ pub fn make_chat_spawner(
                         ChatRole::Assistant if !e.tool_calls.is_empty() => ChatMessage {
                             role: "assistant".to_owned(),
                             content: e.content.clone(),
-                            tool_calls: e.tool_calls
+                            tool_calls: e
+                                .tool_calls
                                 .iter()
                                 .map(|tc| ToolCall {
                                     // Use the per-invocation correlation ID (not the
@@ -158,22 +127,24 @@ pub fn make_chat_spawner(
                     })
                     .collect();
 
-                let tools_json = tools_inner.as_ref()
+                let tools_json = tools_inner
+                    .as_ref()
                     .map(|t| serde_json::to_string(t).unwrap_or_default())
                     .unwrap_or_default();
                 let template_result = tokio::time::timeout(
                     std::time::Duration::from_secs(15),
-                    model_client
-                        .infer(&mr_inner)
-                        .apply_chat_template(&crate::services::generated::model_client::ChatTemplateRequest {
+                    model_client.infer(&mr_inner).apply_chat_template(
+                        &crate::services::generated::model_client::ChatTemplateRequest {
                             messages: messages.clone(),
                             add_generation_prompt: true,
                             tools_json: Some(tools_json.clone()).filter(|s| !s.is_empty()),
                             max_tokens: Some(gen_cfg.max_tokens as u32),
                             enable_thinking: None,
                             template_vars_json: None,
-                        }),
-                ).await;
+                        },
+                    ),
+                )
+                .await;
                 let prompt = match template_result {
                     Ok(Ok(p)) => crate::config::TemplatedPrompt::new(p),
                     Ok(Err(e)) => {
@@ -182,7 +153,8 @@ pub fn make_chat_spawner(
                     }
                     Err(_elapsed) => {
                         let _ = tx.send(ChatEvent::TemplateError(
-                            "chat template timed out after 15s — model service may be busy".to_owned(),
+                            "chat template timed out after 15s — model service may be busy"
+                                .to_owned(),
                         ));
                         return;
                     }
@@ -198,13 +170,14 @@ pub fn make_chat_spawner(
                 };
 
                 use crate::services::generated::model_client::InferRpc;
-                let mut handle = match InferRpc::generate_stream(&model_client.infer(&mr_inner), &req).await {
-                    Ok(h) => h,
-                    Err(e) => {
-                        let _ = tx.send(ChatEvent::StreamError(e.to_string()));
-                        return;
-                    }
-                };
+                let mut handle =
+                    match InferRpc::generate_stream(&model_client.infer(&mr_inner), &req).await {
+                        Ok(h) => h,
+                        Err(e) => {
+                            let _ = tx.send(ChatEvent::StreamError(e.to_string()));
+                            return;
+                        }
+                    };
 
                 let mut cancel_rx = cancel_rx;
                 loop {
@@ -262,7 +235,11 @@ pub fn make_chat_spawner(
 /// - `openai_tools` is the full OpenAI-format tool list for `apply_chat_template`
 pub fn make_tool_caller(
     signing_key: &SigningKey,
-) -> (hyprstream_tui::chat_app::ToolCaller, HashMap<String, String>, Vec<serde_json::Value>) {
+) -> (
+    hyprstream_tui::chat_app::ToolCaller,
+    HashMap<String, String>,
+    Vec<serde_json::Value>,
+) {
     use crate::services::generated::mcp_client::McpClient as GenMcpClient;
     use hyprstream_tui::chat_app::ChatEvent;
 
@@ -279,23 +256,7 @@ pub fn make_tool_caller(
                 .build()
                 .ok()?;
             rt.block_on(async move {
-                // Resolve MCP service key via PolicyClient.
-                let policy_vk = sk_fetch.verifying_key();
-                let policy_client = crate::services::PolicyClient::from_installed_resolver(
-                    sk_fetch.clone(),
-                    policy_vk,
-                    None,
-                ).ok()?;
-                let mcp_key_resp = policy_client.resolve_service_key(
-                    &crate::services::generated::policy_client::ResolveServiceKey {
-                        service_name: "mcp".to_owned(),
-                    },
-                ).await.ok()?;
-                let mcp_vk = hyprstream_rpc::crypto::VerifyingKey::from_bytes(
-                    mcp_key_resp.verifying_key.as_slice().try_into().ok()?
-                ).ok()?;
-                let gen: GenMcpClient =
-                    GenMcpClient::from_installed_resolver(sk_fetch, mcp_vk, None).ok()?;
+                let gen: GenMcpClient = GenMcpClient::from_resolver(sk_fetch, None).ok()?;
                 let tool_list = gen.list_tools().await.ok()?;
                 let mut descs = HashMap::new();
                 let mut tools = Vec::new();
@@ -322,8 +283,11 @@ pub fn make_tool_caller(
         .unwrap_or_default();
 
     // ── Build the caller closure ──────────────────────────────────────────────
-    let caller: hyprstream_tui::chat_app::ToolCaller =
-        std::sync::Arc::new(move |id: String, uuid: String, arguments: String, event_tx: std::sync::mpsc::SyncSender<ChatEvent>| {
+    let caller: hyprstream_tui::chat_app::ToolCaller = std::sync::Arc::new(
+        move |id: String,
+              uuid: String,
+              arguments: String,
+              event_tx: std::sync::mpsc::SyncSender<ChatEvent>| {
             let sk_c = sk.clone();
             let uuid_c = uuid.clone();
             std::thread::spawn(move || {
@@ -336,34 +300,7 @@ pub fn make_tool_caller(
                         Err(e) => return format!("error: {e}"),
                     };
                     rt.block_on(async move {
-                        // Resolve MCP service key via PolicyClient.
-                        let policy_vk = sk_c.verifying_key();
-                        let policy_client = match crate::services::PolicyClient::from_installed_resolver(
-                            sk_c.clone(),
-                            policy_vk,
-                            None,
-                        ) {
-                            Ok(c) => c,
-                            Err(e) => return format!("error: failed to create PolicyClient: {e}"),
-                        };
-                        let mcp_vk = match policy_client.resolve_service_key(
-                            &crate::services::generated::policy_client::ResolveServiceKey {
-                                service_name: "mcp".to_owned(),
-                            },
-                        ).await {
-                            Ok(resp) => {
-                                let bytes: [u8; 32] = match resp.verifying_key.as_slice().try_into() {
-                                    Ok(b) => b,
-                                    Err(_) => return "error: invalid MCP key length".to_owned(),
-                                };
-                                match hyprstream_rpc::crypto::VerifyingKey::from_bytes(&bytes) {
-                                    Ok(vk) => vk,
-                                    Err(e) => return format!("error: invalid MCP key: {e}"),
-                                }
-                            },
-                            Err(e) => return format!("error: failed to resolve MCP key: {e}"),
-                        };
-                        let mcp_client = match GenMcpClient::from_installed_resolver(sk_c, mcp_vk, None) {
+                        let mcp_client = match GenMcpClient::from_resolver(sk_c, None) {
                             Ok(c) => c,
                             Err(e) => return format!("error: failed to create McpClient: {e}"),
                         };
@@ -392,7 +329,8 @@ pub fn make_tool_caller(
                     result: result_str,
                 });
             });
-        });
+        },
+    );
 
     (caller, descriptions, openai_tools)
 }

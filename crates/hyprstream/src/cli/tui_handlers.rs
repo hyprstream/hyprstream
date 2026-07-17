@@ -12,7 +12,7 @@
 // CLI handlers intentionally print to stdout/stderr for user interaction
 #![allow(clippy::print_stdout, clippy::print_stderr, clippy::expect_used)]
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result};
 use ed25519_dalek::SigningKey;
 use std::io::Write;
 use tracing::info;
@@ -26,30 +26,7 @@ use crate::services::generated::tui_client::{TuiClient, ConnectRequest, DisplayM
 pub fn create_tui_client(signing_key: &SigningKey) -> Result<TuiClient> {
     let sk = signing_key.clone();
 
-    // Bootstrap: PolicyService uses the root key in inproc mode
-    let policy_vk = signing_key.verifying_key();
-    let policy_client = crate::services::PolicyClient::from_installed_resolver(
-        sk.clone(), policy_vk, None,
-    ).context("Failed to create PolicyClient")?;
-    let server_vk = {
-        let resp = tokio::task::block_in_place(|| {
-            let rt = tokio::runtime::Handle::current();
-            rt.block_on(policy_client.resolve_service_key(
-                &crate::services::generated::policy_client::ResolveServiceKey {
-                    service_name: "tui".to_owned(),
-                },
-            ))
-        });
-        let response = resp.context(
-            "TUI service is not registered with PolicyService; identity-bound service resolution is required",
-        )?;
-        let bytes: [u8; 32] = response.verifying_key.as_slice().try_into()
-            .map_err(|_| anyhow!("PolicyService returned an invalid TUI verifying-key length"))?;
-        hyprstream_rpc::crypto::VerifyingKey::from_bytes(&bytes)
-            .context("PolicyService returned an invalid TUI Ed25519 key")?
-    };
-
-    TuiClient::from_installed_resolver(sk, server_vk, None).context("Failed to create TuiClient")
+    TuiClient::from_resolver(sk, None).context("Failed to create TuiClient")
 }
 
 /// Attach to an existing TUI session.

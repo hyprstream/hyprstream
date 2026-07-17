@@ -2105,7 +2105,7 @@ mod tests {
                         Ok(bytes::Bytes::new())
                     }));
                 hyprstream_rpc::dial::register_inproc("multiprocess-unused-discovery", &unused);
-                let discovery = crate::services::DiscoveryClient::for_endpoint(
+                let discovery = crate::services::DiscoveryClient::for_local_endpoint_bootstrap(
                     "inproc://multiprocess-unused-discovery",
                     SigningKey::from_bytes(&[0x76; 32]),
                     SigningKey::from_bytes(&[0x77; 32]).verifying_key(),

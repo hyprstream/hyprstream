@@ -163,61 +163,14 @@ pub async fn handle_shell_tui(
     let models = fetch_models(signing_key, models_dir).await;
 
     // Model load-status channel (background polling → event loop).
-    // Resolve model + worker keys via PolicyClient.
-    let policy_vk = signing_key.verifying_key();
-    let policy_client = crate::services::PolicyClient::from_installed_resolver(
-        signing_key.clone(),
-        policy_vk,
-        None,
+    let model_client = crate::services::generated::model_client::ModelClient::from_resolver(
+        signing_key.clone(), None,
     )?;
-    let model_vk_resp = policy_client.resolve_service_key(
-        &crate::services::generated::policy_client::ResolveServiceKey {
-            service_name: "model".to_owned(),
-        },
-    ).await.context("Failed to resolve model service key")?;
-    let model_server_vk = hyprstream_rpc::crypto::VerifyingKey::from_bytes(
-        model_vk_resp.verifying_key.as_slice().try_into()
-            .context("Invalid model key length")?,
-    ).context("Invalid model key")?;
-    let worker_vk_resp = policy_client.resolve_service_key(
-        &crate::services::generated::policy_client::ResolveServiceKey {
-            service_name: "worker".to_owned(),
-        },
-    ).await.context("Failed to resolve worker service key")?;
-    let worker_server_vk = hyprstream_rpc::crypto::VerifyingKey::from_bytes(
-        worker_vk_resp.verifying_key.as_slice().try_into()
-            .context("Invalid worker key length")?,
-    ).context("Invalid worker key")?;
-    let model_client = {
-        crate::services::generated::model_client::ModelClient::from_installed_resolver(
-            signing_key.clone(),
-            model_server_vk,
-            None,
-        )?
-    };
     // Worker client for sandbox/container/image management.
     let worker_client = {
-        hyprstream_workers::runtime::WorkerClient::from_installed_resolver(
-            signing_key.clone(),
-            worker_server_vk,
-            None,
-        )?
+        hyprstream_workers::runtime::WorkerClient::from_resolver(signing_key.clone(), None)?
     };
-    let registry_server_vk = match policy_client.resolve_service_key(
-        &crate::services::generated::policy_client::ResolveServiceKey {
-            service_name: "registry".to_owned(),
-        },
-    ).await {
-        Ok(resp) => hyprstream_rpc::crypto::VerifyingKey::from_bytes(
-            resp.verifying_key.as_slice().try_into().unwrap_or(&[0u8; 32]),
-        ).unwrap_or_else(|_| signing_key.verifying_key()),
-        Err(_) => signing_key.verifying_key(),
-    };
-    let registry = crate::services::RegistryClient::from_installed_resolver(
-        signing_key.clone(),
-        registry_server_vk,
-        None,
-    )?;
+    let registry = crate::services::RegistryClient::from_resolver(signing_key.clone(), None)?;
 
     let (model_status_tx, mut model_status_rx) =
         tokio::sync::mpsc::channel::<ModelStatusUpdate>(32);
@@ -1595,51 +1548,8 @@ async fn fetch_models(
     models_dir: &std::path::Path,
 ) -> Vec<ModelEntry> {
 
-    // Resolve registry + model keys via PolicyClient
-    let policy_vk = signing_key.verifying_key();
-    let policy_client = match crate::services::PolicyClient::from_installed_resolver(
-        signing_key.clone(), policy_vk, None,
-    ) {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::warn!("Failed to create PolicyClient: {e}");
-            return Vec::new();
-        }
-    };
-    let registry_server_vk = match policy_client.resolve_service_key(
-        &crate::services::generated::policy_client::ResolveServiceKey {
-            service_name: "registry".to_owned(),
-        },
-    ).await {
-        Ok(resp) => match <[u8; 32]>::try_from(resp.verifying_key.as_slice()) {
-            Ok(bytes) => hyprstream_rpc::crypto::VerifyingKey::from_bytes(&bytes)
-                .unwrap_or_else(|_| signing_key.verifying_key()),
-            Err(_) => signing_key.verifying_key(),
-        },
-        Err(e) => {
-            tracing::warn!("Failed to resolve registry key: {e}");
-            signing_key.verifying_key()
-        }
-    };
-    let model_server_vk = match policy_client.resolve_service_key(
-        &crate::services::generated::policy_client::ResolveServiceKey {
-            service_name: "model".to_owned(),
-        },
-    ).await {
-        Ok(resp) => match <[u8; 32]>::try_from(resp.verifying_key.as_slice()) {
-            Ok(bytes) => hyprstream_rpc::crypto::VerifyingKey::from_bytes(&bytes)
-                .unwrap_or_else(|_| signing_key.verifying_key()),
-            Err(_) => signing_key.verifying_key(),
-        },
-        Err(e) => {
-            tracing::warn!("Failed to resolve model key: {e}");
-            signing_key.verifying_key()
-        }
-    };
-
-    let registry: crate::services::RegistryClient = match crate::services::RegistryClient::from_installed_resolver(
+    let registry: crate::services::RegistryClient = match crate::services::RegistryClient::from_resolver(
         signing_key.clone(),
-        registry_server_vk,
         None,
     ) {
         Ok(c) => c,
@@ -1648,9 +1558,8 @@ async fn fetch_models(
             return Vec::new();
         }
     };
-    let model_client_for_status = match crate::services::generated::model_client::ModelClient::from_installed_resolver(
+    let model_client_for_status = match crate::services::generated::model_client::ModelClient::from_resolver(
         signing_key.clone(),
-        model_server_vk,
         None,
     ) {
         Ok(c) => c,

@@ -32,7 +32,9 @@ use parking_lot::RwLock;
 
 use crate::identity::Did;
 use crate::registry::SocketKind;
+#[cfg(test)]
 use crate::rpc_client::{CallOptions, RpcClient};
+#[cfg(test)]
 use crate::stream_consumer::StreamHandle;
 use crate::transport::{EndpointType, TransportConfig};
 use crate::VerifyingKey;
@@ -130,7 +132,7 @@ pub struct ResolutionEvidence {
 
 /// One identity-bound, owned service resolution result.
 #[derive(Debug, Clone)]
-pub struct ResolvedService {
+pub struct SelectedService {
     service_name: String,
     service_did: Did,
     response_verifying_key: VerifyingKey,
@@ -143,8 +145,8 @@ pub struct ResolvedService {
     evidence: ResolutionEvidence,
 }
 
-impl ResolvedService {
-    fn same_authority(&self, other: &Self) -> bool {
+impl SelectedService {
+    pub fn same_authority(&self, other: &Self) -> bool {
         self.service_name == other.service_name
             && self.service_did == other.service_did
             && self.response_verifying_key == other.response_verifying_key
@@ -164,6 +166,10 @@ impl ResolvedService {
 
     pub fn response_verifying_key(&self) -> VerifyingKey {
         self.response_verifying_key
+    }
+
+    pub fn response_ml_dsa65(&self) -> &[u8] {
+        &self.response_ml_dsa65
     }
 
     pub fn response_key_id(&self) -> &str {
@@ -220,21 +226,22 @@ impl ResolvedService {
 
 /// Identity-bound service resolver used by generated clients.
 #[async_trait::async_trait]
+#[cfg(test)]
 pub trait ServiceResolver: Send + Sync {
-    async fn resolve_service(&self, query: ServiceQuery) -> anyhow::Result<ResolvedService>;
+    async fn resolve_service(&self, query: ServiceQuery) -> anyhow::Result<SelectedService>;
 
     /// Resolve the complete deterministic same-authority retry set.  The
     /// default preserves compatibility for resolvers with a single reach.
     async fn resolve_service_candidates(
         &self,
         query: ServiceQuery,
-    ) -> anyhow::Result<Vec<ResolvedService>> {
+    ) -> anyhow::Result<Vec<SelectedService>> {
         Ok(vec![self.resolve_service(query).await?])
     }
 
     /// Consult the authoritative accepted-state source immediately before dial.
     /// Implementations reject an advanced, expired, or missing head.
-    async fn ensure_current(&self, resolved: &ResolvedService) -> anyhow::Result<()>;
+    async fn ensure_current(&self, resolved: &SelectedService) -> anyhow::Result<()>;
 }
 
 /// RPC client which retains the identity-bound resolver through every lazy
@@ -242,6 +249,7 @@ pub trait ServiceResolver: Send + Sync {
 /// before sealing, and constructs the transport and crypto stores from the
 /// same snapshot.  A transport failure may advance only through the bounded,
 /// deterministic same-authority alternatives returned by that resolver.
+#[cfg(test)]
 pub struct ResolvedRpcClient {
     service_name: String,
     signing_key: crate::crypto::SigningKey,
@@ -250,6 +258,7 @@ pub struct ResolvedRpcClient {
     request_id: std::sync::atomic::AtomicU64,
 }
 
+#[cfg(test)]
 impl ResolvedRpcClient {
     pub fn new(
         service_name: impl Into<String>,
@@ -267,7 +276,7 @@ impl ResolvedRpcClient {
         })
     }
 
-    async fn snapshots(&self) -> anyhow::Result<Vec<ResolvedService>> {
+    async fn snapshots(&self) -> anyhow::Result<Vec<SelectedService>> {
         let query = ServiceQuery::network(self.service_name.clone())?;
         let max_attempts = query.max_attempts;
         let resolved = self.resolver.resolve_service_candidates(query).await?;
@@ -283,7 +292,7 @@ impl ResolvedRpcClient {
         Ok(resolved.into_iter().take(max_attempts).collect())
     }
 
-    fn client_for(&self, snapshot: &ResolvedService) -> anyhow::Result<Arc<dyn RpcClient>> {
+    fn client_for(&self, snapshot: &SelectedService) -> anyhow::Result<Arc<dyn RpcClient>> {
         let (kem, pq) = snapshot.crypto_stores()?;
         let signer = crate::signer::LocalSigner::new(self.signing_key.clone());
         crate::dial::dial_with_crypto_stores(
@@ -336,6 +345,7 @@ impl ResolvedRpcClient {
 }
 
 #[async_trait::async_trait]
+#[cfg(test)]
 impl RpcClient for ResolvedRpcClient {
     async fn call(&self, payload: Vec<u8>) -> anyhow::Result<Vec<u8>> {
         self.attempt(|c| {
@@ -588,12 +598,12 @@ fn rejection_reason(
 /// Run a bounded retry over an already validated deterministic order.
 /// The callback cannot request or substitute any out-of-plan candidate.
 pub async fn retry_validated_candidates<T, F, Fut>(
-    mut ordered: Vec<ResolvedService>,
+    mut ordered: Vec<SelectedService>,
     max_attempts: usize,
     mut attempt: F,
 ) -> anyhow::Result<T>
 where
-    F: FnMut(&ResolvedService) -> Fut,
+    F: FnMut(&SelectedService) -> Fut,
     Fut: std::future::Future<Output = anyhow::Result<T>>,
 {
     anyhow::ensure!(max_attempts > 0, "retry bound must be non-zero");
@@ -642,7 +652,7 @@ pub fn select_service_candidate(
     query: &ServiceQuery,
     candidates: Vec<ServiceCandidate>,
     now_unix_ms: i64,
-) -> anyhow::Result<ResolvedService> {
+) -> anyhow::Result<SelectedService> {
     let mut decisions = Vec::with_capacity(candidates.len());
     let mut valid = Vec::new();
     for candidate in candidates {
@@ -701,7 +711,7 @@ pub fn select_service_candidate(
         .expires_at_unix_ms
         .min(selected.accepted_state.expires_at_unix_ms)
         .min(request_kem_recipient.not_after_unix_ms);
-    Ok(ResolvedService {
+    Ok(SelectedService {
         service_name: selected.service_name,
         service_did: selected.service_did,
         response_verifying_key,
@@ -728,7 +738,7 @@ pub fn select_service_candidates(
     query: &ServiceQuery,
     mut candidates: Vec<ServiceCandidate>,
     now_unix_ms: i64,
-) -> anyhow::Result<Vec<ResolvedService>> {
+) -> anyhow::Result<Vec<SelectedService>> {
     let mut ordered = Vec::new();
     loop {
         let selected = match select_service_candidate(query, candidates.clone(), now_unix_ms) {
@@ -817,16 +827,19 @@ impl Resolver for NetworkDiscoveryResolver {
 // ============================================================================
 
 static GLOBAL_RESOLVER: RwLock<Option<Arc<dyn Resolver>>> = RwLock::new(None);
+#[cfg(test)]
 static GLOBAL_SERVICE_RESOLVER: RwLock<Option<Arc<dyn ServiceResolver>>> = RwLock::new(None);
 
 /// Install the identity-bound production resolver after explicit Discovery
 /// bootstrap. This is intentionally separate from the legacy endpoint-only
 /// resolver so `TransportConfig` never becomes an authority object.
+#[cfg(test)]
 pub fn set_global_service(resolver: Arc<dyn ServiceResolver>) {
     *GLOBAL_SERVICE_RESOLVER.write() = Some(resolver);
 }
 
 /// Clone the installed identity-bound resolver without retaining a lock guard.
+#[cfg(test)]
 pub fn try_global_service() -> Option<Arc<dyn ServiceResolver>> {
     GLOBAL_SERVICE_RESOLVER.read().clone()
 }
@@ -939,19 +952,19 @@ mod tests {
     }
 
     struct AlwaysAdvancedResolver {
-        snapshot: ResolvedService,
+        snapshot: SelectedService,
         resolves: AtomicUsize,
         checks: AtomicUsize,
     }
 
     #[async_trait::async_trait]
     impl ServiceResolver for AlwaysAdvancedResolver {
-        async fn resolve_service(&self, _query: ServiceQuery) -> anyhow::Result<ResolvedService> {
+        async fn resolve_service(&self, _query: ServiceQuery) -> anyhow::Result<SelectedService> {
             self.resolves.fetch_add(1, Ordering::SeqCst);
             Ok(self.snapshot.clone())
         }
 
-        async fn ensure_current(&self, _resolved: &ResolvedService) -> anyhow::Result<()> {
+        async fn ensure_current(&self, _resolved: &SelectedService) -> anyhow::Result<()> {
             self.checks.fetch_add(1, Ordering::SeqCst);
             anyhow::bail!("accepted state advanced")
         }
@@ -994,9 +1007,9 @@ mod tests {
         assert!(!crate::transport_traits::is_pre_dispatch_transport_error(
             &ordinary
         ));
-        let marked = anyhow::Error::new(
-            crate::transport_traits::PreDispatchTransportError::new(anyhow!("dial refused")),
-        );
+        let marked = anyhow::Error::new(crate::transport_traits::PreDispatchTransportError::new(
+            anyhow!("dial refused"),
+        ));
         assert!(crate::transport_traits::is_pre_dispatch_transport_error(
             &marked
         ));

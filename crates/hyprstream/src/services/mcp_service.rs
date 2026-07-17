@@ -175,23 +175,8 @@ pub struct ToolCallContext {
     pub user: String,
     /// ServiceContext for typed_client() / client() access (optional for backward compat)
     pub ctx: Option<Arc<ServiceContext>>,
-    /// PolicyClient for resolving peer verifying keys
+    /// Bootstrap Policy client used only for Policy operations.
     pub policy_client: PolicyClient,
-}
-
-impl ToolCallContext {
-    /// Resolve a peer service's verifying key via PolicyService RPC.
-    pub async fn resolve_peer_key(&self, service_name: &str) -> anyhow::Result<VerifyingKey> {
-        let resp = self.policy_client.resolve_service_key(
-            &crate::services::generated::policy_client::ResolveServiceKey {
-                service_name: service_name.to_owned(),
-            },
-        ).await?;
-        let bytes: [u8; 32] = resp.verifying_key.as_slice().try_into()
-            .map_err(|_| anyhow::anyhow!("Invalid verifying key length from PolicyService"))?;
-        VerifyingKey::from_bytes(&bytes)
-            .map_err(|e| anyhow::anyhow!("Invalid Ed25519 key: {e}"))
-    }
 }
 
 type ToolHandler = Arc<dyn Fn(ToolCallContext) -> BoxFuture<'static, anyhow::Result<ToolResult>> + Send + Sync>;
@@ -425,15 +410,13 @@ fn register_scoped_tools_recursive(
                             // StreamInfo library type directly (no serde_json::Value round-trip).
                             let stream_info: hyprstream_rpc::stream_info::StreamInfo = match service.as_str() {
                                 "registry" => {
-                                    let server_vk = ctx.resolve_peer_key("registry").await?;
-                                    let client: RegistryClient = RegistryClient::from_installed_resolver(
-                                        ctx.signing_key, server_vk, None,
+                                    let client: RegistryClient = RegistryClient::from_resolver(
+                                        ctx.signing_key, None,
                                     )?;
                                     client.call_scoped_streaming_method(&scope_refs, &method, &ctx.args, client_pubkey_bytes).await?
                                 }
                                 "model" => {
-                                    let server_vk = ctx.resolve_peer_key("model").await?;
-                                    let client = ModelClient::from_installed_resolver(ctx.signing_key, server_vk, None)?;
+                                    let client = ModelClient::from_resolver(ctx.signing_key, None)?;
                                     client.call_scoped_streaming_method(&scope_refs, &method, &ctx.args, client_pubkey_bytes).await?
                                 }
                                 _ => anyhow::bail!("No scoped streaming dispatch for service: {service}"),
@@ -513,15 +496,13 @@ async fn dispatch_scoped_call(
 ) -> anyhow::Result<ToolResult> {
     let result = match service {
         "registry" => {
-            let server_vk = ctx.resolve_peer_key("registry").await?;
-            let client: RegistryClient = RegistryClient::from_installed_resolver(
-                ctx.signing_key.clone(), server_vk, None,
+            let client: RegistryClient = RegistryClient::from_resolver(
+                ctx.signing_key.clone(), None,
             )?;
             client.call_scoped_method(scopes, method, &ctx.args).await?
         }
         "model" => {
-            let server_vk = ctx.resolve_peer_key("model").await?;
-            let client = ModelClient::from_installed_resolver(ctx.signing_key.clone(), server_vk, None)?;
+            let client = ModelClient::from_resolver(ctx.signing_key.clone(), None)?;
             client.call_scoped_method(scopes, method, &ctx.args).await?
         }
         _ => anyhow::bail!("No scoped dispatch for service: {service}"),
@@ -582,20 +563,17 @@ fn register_streaming_tool(
                 // #468: verified-capnp StreamInfo returned directly (no serde_json round-trip).
                 let stream_info: hyprstream_rpc::stream_info::StreamInfo = match service.as_str() {
                     "registry" => {
-                        let server_vk = ctx.resolve_peer_key("registry").await?;
-                        let client: RegistryClient = RegistryClient::from_installed_resolver(
-                            ctx.signing_key, server_vk, None,
+                        let client: RegistryClient = RegistryClient::from_resolver(
+                            ctx.signing_key, None,
                         )?;
                         client.call_streaming_method(&method, &ctx.args, client_pubkey_bytes).await?
                     }
                     "model" => {
-                        let server_vk = ctx.resolve_peer_key("model").await?;
-                        let client = ModelClient::from_installed_resolver(ctx.signing_key, server_vk, None)?;
+                        let client = ModelClient::from_resolver(ctx.signing_key, None)?;
                         client.call_streaming_method(&method, &ctx.args, client_pubkey_bytes).await?
                     }
                     "tui" => {
-                        let server_vk = ctx.resolve_peer_key("tui").await?;
-                        let client = TuiClient::from_installed_resolver(ctx.signing_key, server_vk, None)?;
+                        let client = TuiClient::from_resolver(ctx.signing_key, None)?;
                         client.call_streaming_method(&method, &ctx.args, client_pubkey_bytes).await?
                     }
                     _ => anyhow::bail!("No streaming support for service: {}", service),
@@ -700,25 +678,23 @@ async fn dispatch_schema_call(service: &str, method: &str, ctx: &ToolCallContext
 
     match service {
         "model" => {
-            let server_vk = ctx.resolve_peer_key("model").await?;
-            let client = ModelClient::from_installed_resolver(signing_key, server_vk, None)?;
+            let client = ModelClient::from_resolver(signing_key, None)?;
             client.call_method(method, &ctx.args).await
         }
         "registry" => {
-            let server_vk = ctx.resolve_peer_key("registry").await?;
-            let client: RegistryClient = RegistryClient::from_installed_resolver(
-                signing_key, server_vk, None,
+            let client: RegistryClient = RegistryClient::from_resolver(
+                signing_key, None,
             )?;
             client.call_method(method, &ctx.args).await
         }
         "policy" => {
-            let server_vk = ctx.resolve_peer_key("policy").await?;
+            let server_vk = hyprstream_service::global_trust_store().resolve_one("policy")
+                .ok_or_else(|| anyhow::anyhow!("trust store has no policy bootstrap key"))?;
             let client = PolicyClient::for_local_bootstrap(signing_key, server_vk, None)?;
             client.call_method(method, &ctx.args).await
         }
         "tui" => {
-            let server_vk = ctx.resolve_peer_key("tui").await?;
-            let client = TuiClient::from_installed_resolver(signing_key, server_vk, None)?;
+            let client = TuiClient::from_resolver(signing_key, None)?;
             client.call_method(method, &ctx.args).await
         }
         _ => anyhow::bail!("Unknown service: {service}"),
@@ -780,19 +756,6 @@ impl McpService {
             jwt_key_source: config.jwt_key_source,
             policy_client,
         })
-    }
-
-    /// Resolve a peer service's verifying key via PolicyService RPC.
-    async fn resolve_peer_key(&self, service_name: &str) -> anyhow::Result<VerifyingKey> {
-        let resp = self.policy_client.resolve_service_key(
-            &crate::services::generated::policy_client::ResolveServiceKey {
-                service_name: service_name.to_owned(),
-            },
-        ).await?;
-        let bytes: [u8; 32] = resp.verifying_key.as_slice().try_into()
-            .map_err(|_| anyhow::anyhow!("Invalid verifying key length from PolicyService"))?;
-        VerifyingKey::from_bytes(&bytes)
-            .map_err(|e| anyhow::anyhow!("Invalid Ed25519 key: {e}"))
     }
 
     /// Convert registry to rmcp Tool list (includes built-in refresh_tools meta-tool)
@@ -1056,10 +1019,8 @@ impl McpHandler for McpService {
     ) -> anyhow::Result<McpResponseVariant> {
         let loaded_model_count = {
             // Status check uses local identity (internal health check, no user context)
-            let server_vk = self.resolve_peer_key("model").await?;
-            let client = ModelClient::from_installed_resolver(
+            let client = ModelClient::from_resolver(
                 self.signing_key.clone(),
-                server_vk,
                 None,
             )?;
             client.status(&crate::services::generated::model_client::StatusRequest { model_ref: String::new() }).await

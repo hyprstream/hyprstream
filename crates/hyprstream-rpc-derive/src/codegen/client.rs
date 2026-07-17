@@ -698,77 +698,17 @@ pub fn generate_constructors(service_name: &str) -> TokenStream {
                 Ok(Self::new(rpc))
             }
 
-            /// Internal test seam for one already verified result. Ordinary
-            /// production callers retain the resolver via [`Self::from_resolver`].
-            #[cfg(test)]
-            fn from_resolved_for_test(
-                resolved: hyprstream_rpc::ResolvedService,
-                signing_key: hyprstream_rpc::crypto::SigningKey,
-                token: Option<String>,
-            ) -> anyhow::Result<Self> {
-                anyhow::ensure!(
-                    resolved.service_name() == Self::SERVICE_NAME,
-                    "resolved service name mismatch: expected {}, got {}",
-                    Self::SERVICE_NAME,
-                    resolved.service_name(),
-                );
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map_err(|_| anyhow::anyhow!("system clock is before Unix epoch"))?
-                    .as_millis() as i64;
-                resolved.ensure_fresh(now)?;
-                let (request_kem_store, response_pq_store) = resolved.crypto_stores()?;
-                let signer = hyprstream_rpc::signer::LocalSigner::new(signing_key);
-                let rpc = hyprstream_rpc::dial::dial_with_crypto_stores(
-                    resolved.transport(),
-                    signer,
-                    Some(resolved.response_verifying_key()),
-                    token,
-                    Some(request_kem_store),
-                    Some(response_pq_store),
-                )?;
-                Ok(Self::new(rpc))
-            }
-
             /// Ordinary production construction path through the identity-bound
-            /// resolver installed after Discovery bootstrap.
+            /// checkpoint/PDS resolver installed after Discovery bootstrap.
             pub fn from_resolver(
                 signing_key: hyprstream_rpc::crypto::SigningKey,
                 token: Option<String>,
             ) -> anyhow::Result<Self> {
-                let resolver = hyprstream_rpc::resolver::try_global_service()
-                    .ok_or_else(|| anyhow::anyhow!(
-                        "identity-bound service resolver is not installed"
-                    ))?;
-                Self::from_service_resolver(resolver, signing_key, token)
-            }
-
-            /// Transitional source-compatible ordinary constructor.  The
-            /// legacy destination argument is deliberately ignored: production
-            /// response/KEM authority comes only from the installed resolver.
-            pub fn from_installed_resolver(
-                signing_key: hyprstream_rpc::crypto::SigningKey,
-                _legacy_destination: hyprstream_rpc::crypto::VerifyingKey,
-                token: Option<String>,
-            ) -> anyhow::Result<Self> {
-                Self::from_resolver(signing_key, token)
-            }
-
-            /// Explicit resolver injection for hermetic clients and tests. The
-            /// resolver is consulted again for accepted-head currency immediately
-            /// before dial; this is not an independent key or reach lookup.
-            pub fn from_service_resolver(
-                resolver: std::sync::Arc<dyn hyprstream_rpc::ServiceResolver>,
-                signing_key: hyprstream_rpc::crypto::SigningKey,
-                token: Option<String>,
-            ) -> anyhow::Result<Self> {
-                let rpc = hyprstream_rpc::ResolvedRpcClient::new(
+                Ok(Self::new(hyprstream_discovery::production_rpc_client(
                     Self::SERVICE_NAME,
                     signing_key,
                     token,
-                    resolver,
-                )?;
-                Ok(Self::new(std::sync::Arc::new(rpc)))
+                )?))
             }
 
             /// Create a client from an `IdentityProvider` with automatic endpoint resolution.
@@ -1766,13 +1706,13 @@ mod resolved_service_codegen_tests {
     #[test]
     fn generated_clients_use_atomic_resolved_service_for_production() {
         let generated = generate_constructors("model").to_string();
-        assert!(generated.contains("from_resolved_for_test"));
-        assert!(!generated.contains("pub fn from_resolved"));
-        assert!(generated.contains("ServiceResolver"));
-        assert!(generated.contains("try_global_service"));
-        assert!(generated.contains("from_service_resolver"));
-        assert!(generated.contains("ResolvedRpcClient"));
-        assert!(generated.contains("from_installed_resolver"));
+        assert!(generated.contains("production_rpc_client"));
+        assert!(!generated.contains("SelectedService"));
+        assert!(!generated.contains("ServiceResolver"));
+        assert!(!generated.contains("try_global_service"));
+        assert!(!generated.contains("from_service_resolver"));
+        assert!(!generated.contains("ResolvedRpcClient"));
+        assert!(!generated.contains("from_installed_resolver"));
         assert_eq!(
             generated
                 .matches("local bootstrap refuses network transport")
@@ -1802,10 +1742,20 @@ mod resolved_service_codegen_tests {
                     stack.push(path);
                 } else if path.extension().and_then(|v| v.to_str()) == Some("rs") {
                     let source = std::fs::read_to_string(&path).expect("read Rust source");
-                    ordinary += source.matches("::from_installed_resolver(").count();
+                    ordinary += source.matches("::from_resolver(").count();
+                    if !path.ends_with("services/policy.rs") {
+                        assert!(
+                            !source.contains(".resolve_service_key("),
+                            "ordinary consumer performs an independent response-key lookup in {}",
+                            path.display(),
+                        );
+                    }
                     let registry_cli_bootstrap = path.ends_with("bin/main.rs")
                         && source.contains("Pre-Discovery CLI bootstrap")
-                        && source.matches("RegistryClient::for_local_bootstrap(").count() == 1;
+                        && source
+                            .matches("RegistryClient::for_local_bootstrap(")
+                            .count()
+                            == 1;
                     for line in source
                         .lines()
                         .filter(|line| line.contains("::for_local_bootstrap("))

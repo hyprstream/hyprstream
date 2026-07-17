@@ -15,6 +15,8 @@
 //! hyprstream              factory creates DiscoveryService, injects AuthorizationProvider
 //! ```
 
+extern crate self as hyprstream_discovery;
+
 // Re-export shared capnp modules so generated code's `crate::*_capnp` resolves
 pub use hyprstream_rpc::annotations_capnp;
 pub use hyprstream_rpc::common_capnp;
@@ -98,8 +100,8 @@ pub mod podspec;
 pub use hyprstream_rpc::registry::SocketKind;
 pub use hyprstream_rpc::resolver::Resolver;
 pub use service::{
-    AcceptedStateSource, AuthorizationProvider, DiscoveryService, DiscoveryServiceResolver,
-    RecordCarData, RecordResolver,
+    AcceptedStateSource, AuthorizationProvider, DiscoveryService, RecordCarData, RecordResolver,
+    production_rpc_client,
 };
 
 // Re-export generated types that consumers need

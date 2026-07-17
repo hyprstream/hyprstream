@@ -5,12 +5,15 @@
 
 use async_trait::async_trait;
 use hyprstream_rpc::registry::{self, EndpointRegistry, SocketKind};
+#[cfg(test)]
+use hyprstream_rpc::resolver::select_service_candidate;
 use hyprstream_rpc::resolver::{
-    select_service_candidate, select_service_candidates, AcceptedStateEvidence,
-    AnchoredKemRecipient, ResolvedService, Resolver, ServiceCandidate, ServiceQuery,
-    ServiceResolver,
+    select_service_candidates, AcceptedStateEvidence, AnchoredKemRecipient, Resolver,
+    SelectedService, ServiceCandidate, ServiceQuery,
 };
+use hyprstream_rpc::rpc_client::{CallOptions, RpcClient};
 use hyprstream_rpc::service::{EnvelopeContext, RequestService};
+use hyprstream_rpc::stream_consumer::StreamHandle;
 use hyprstream_rpc::transport::TransportConfig;
 use hyprstream_rpc::SigningKey;
 
@@ -209,8 +212,94 @@ pub trait AcceptedStateSource: Send + Sync {
     ) -> Result<Option<hyprstream_pds::at9p_duplicity::AcceptedAt9pState>>;
 }
 
+/// Opaque production authority minted only while holding the checkpoint/PDS
+/// accepted-state object. Raw announcement candidates never have this type.
+#[derive(Clone)]
+struct ResolvedService {
+    selected: SelectedService,
+}
+
+impl ResolvedService {
+    fn mint(
+        selected: SelectedService,
+        state: &hyprstream_pds::at9p_duplicity::AcceptedAt9pState,
+    ) -> Result<Self> {
+        anyhow::ensure!(
+            selected.service_did().as_str() == state.did,
+            "selected service DID is not the checkpoint-verified subject"
+        );
+        anyhow::ensure!(
+            selected.evidence().accepted_state_epoch == state.epoch,
+            "selected service epoch is not checkpoint current"
+        );
+        anyhow::ensure!(
+            selected.evidence().accepted_state_digest == state.head_digest,
+            "selected service digest is not checkpoint current"
+        );
+        let current_key = state
+            .current
+            .subject_keys
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("accepted state has no current response key"))?;
+        anyhow::ensure!(
+            selected.response_verifying_key().to_bytes().as_slice()
+                == current_key.ed25519_pub.as_slice(),
+            "selected response key is not accepted current key"
+        );
+        anyhow::ensure!(
+            selected.response_ml_dsa65() == current_key.mldsa65_pub.as_slice(),
+            "selected PQ response key is not accepted current key"
+        );
+        Ok(Self { selected })
+    }
+    fn same_authority(&self, other: &Self) -> bool {
+        self.selected.same_authority(&other.selected)
+    }
+}
+
+impl std::ops::Deref for ResolvedService {
+    type Target = SelectedService;
+    fn deref(&self) -> &Self::Target {
+        &self.selected
+    }
+}
+
+struct CurrentStreamHandle {
+    inner: Box<dyn StreamHandle>,
+    resolver: Arc<DiscoveryServiceResolver>,
+    snapshot: ResolvedService,
+    invalidated: bool,
+}
+
+#[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+#[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+impl StreamHandle for CurrentStreamHandle {
+    async fn next_payload(&mut self) -> Result<Option<hyprstream_rpc::streaming::StreamPayload>> {
+        anyhow::ensure!(!self.invalidated, "stream snapshot is invalidated");
+        if let Err(error) = self.resolver.ensure_current(&self.snapshot).await {
+            self.invalidated = true;
+            return Err(error);
+        }
+        self.inner.next_payload().await
+    }
+    async fn cancel(&mut self) -> Result<()> {
+        anyhow::ensure!(!self.invalidated, "stream snapshot is invalidated");
+        if let Err(error) = self.resolver.ensure_current(&self.snapshot).await {
+            self.invalidated = true;
+            return Err(error);
+        }
+        self.inner.cancel().await
+    }
+    fn stream_id(&self) -> &str {
+        self.inner.stream_id()
+    }
+    fn is_completed(&self) -> bool {
+        self.invalidated || self.inner.is_completed()
+    }
+}
+
 /// Cloneable production resolver installed after Discovery bootstrap.
-pub struct DiscoveryServiceResolver {
+struct DiscoveryServiceResolver {
     announced_endpoints: Arc<RwLock<HashMap<String, Vec<AnnouncedEndpoint>>>>,
     accepted_state_source: Arc<dyn AcceptedStateSource>,
 }
@@ -390,15 +479,27 @@ impl DiscoveryService {
 
     /// Build the resolver sharing only owned candidate/state handles. No
     /// Cap'n Proto reader or registry guard crosses the boundary.
-    pub fn production_resolver(&self) -> Result<Arc<dyn ServiceResolver>> {
+    pub fn install_production_resolver(&self) -> Result<()> {
         let source = self
             .accepted_state_source
             .clone()
             .ok_or_else(|| anyhow::anyhow!("Discovery accepted-state source is not installed"))?;
-        Ok(Arc::new(DiscoveryServiceResolver {
+        PRODUCTION_RESOLVER
+            .set(Arc::new(DiscoveryServiceResolver {
+                announced_endpoints: Arc::clone(&self.announced_endpoints),
+                accepted_state_source: source,
+            }))
+            .map_err(|_| anyhow::anyhow!("production service resolver is already installed"))
+    }
+
+    #[cfg(test)]
+    fn production_resolver(&self) -> Result<DiscoveryServiceResolver> {
+        Ok(DiscoveryServiceResolver {
             announced_endpoints: Arc::clone(&self.announced_endpoints),
-            accepted_state_source: source,
-        }))
+            accepted_state_source: self.accepted_state_source.clone().ok_or_else(|| {
+                anyhow::anyhow!("Discovery accepted-state source is not installed")
+            })?,
+        })
     }
 
     /// Get the global EndpointRegistry (D9: graceful error, not panic).
@@ -442,6 +543,17 @@ fn accepted_expiry_unix_ms(
 }
 
 impl DiscoveryServiceResolver {
+    #[cfg(test)]
+    async fn resolve_service(&self, query: ServiceQuery) -> Result<ResolvedService> {
+        let selected =
+            select_service_candidate(&query, self.acquire_candidates(&query)?, unix_millis_now())?;
+        let state = self
+            .accepted_state_source
+            .accepted_state(selected.service_did().as_str())?
+            .ok_or_else(|| anyhow::anyhow!("accepted state disappeared during resolution"))?;
+        ResolvedService::mint(selected, &state)
+    }
+
     fn acquire_candidates(&self, query: &ServiceQuery) -> Result<Vec<ServiceCandidate>> {
         let announced = self.announced_endpoints.read();
         let entries = announced
@@ -523,19 +635,22 @@ impl DiscoveryServiceResolver {
     }
 }
 
-#[async_trait]
-impl ServiceResolver for DiscoveryServiceResolver {
-    async fn resolve_service(&self, query: ServiceQuery) -> Result<ResolvedService> {
-        let candidates = self.acquire_candidates(&query)?;
-        select_service_candidate(&query, candidates, unix_millis_now())
-    }
-
+impl DiscoveryServiceResolver {
     async fn resolve_service_candidates(
         &self,
         query: ServiceQuery,
     ) -> Result<Vec<ResolvedService>> {
         let candidates = self.acquire_candidates(&query)?;
-        select_service_candidates(&query, candidates, unix_millis_now())
+        let selected = select_service_candidates(&query, candidates, unix_millis_now())?;
+        let mut resolved = Vec::with_capacity(selected.len());
+        for item in selected {
+            let state = self
+                .accepted_state_source
+                .accepted_state(item.service_did().as_str())?
+                .ok_or_else(|| anyhow::anyhow!("accepted state disappeared during resolution"))?;
+            resolved.push(ResolvedService::mint(item, &state)?);
+        }
+        Ok(resolved)
     }
 
     async fn ensure_current(&self, resolved: &ResolvedService) -> Result<()> {
@@ -555,6 +670,259 @@ impl ServiceResolver for DiscoveryServiceResolver {
             "accepted state expired; re-resolution required"
         );
         Ok(())
+    }
+}
+
+static PRODUCTION_RESOLVER: std::sync::OnceLock<Arc<DiscoveryServiceResolver>> =
+    std::sync::OnceLock::new();
+
+/// Construct an ordinary production RPC client. Production authority cannot
+/// be implemented, injected, or replaced by a downstream caller.
+///
+/// ```compile_fail
+/// use hyprstream_rpc::{ResolvedRpcClient, ServiceResolver};
+/// ```
+///
+/// ```compile_fail
+/// use hyprstream_discovery::{DiscoveryServiceResolver, ResolvedService};
+/// ```
+pub fn production_rpc_client(
+    service_name: &str,
+    signing_key: SigningKey,
+    token: Option<String>,
+) -> Result<Arc<dyn RpcClient>> {
+    let resolver = PRODUCTION_RESOLVER
+        .get()
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("checkpoint-backed production resolver is not installed"))?;
+    Ok(Arc::new(ProductionRpcClient::new(
+        service_name,
+        signing_key,
+        token,
+        resolver,
+    )?))
+}
+
+struct ProductionRpcClient {
+    service_name: String,
+    signing_key: SigningKey,
+    token: Option<String>,
+    resolver: Arc<DiscoveryServiceResolver>,
+    request_id: std::sync::atomic::AtomicU64,
+}
+
+impl ProductionRpcClient {
+    fn new(
+        service_name: &str,
+        signing_key: SigningKey,
+        token: Option<String>,
+        resolver: Arc<DiscoveryServiceResolver>,
+    ) -> Result<Self> {
+        anyhow::ensure!(
+            !service_name.is_empty()
+                && service_name
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-'),
+            "service name is not canonical"
+        );
+        Ok(Self {
+            service_name: service_name.to_owned(),
+            signing_key,
+            token,
+            resolver,
+            request_id: std::sync::atomic::AtomicU64::new(1),
+        })
+    }
+    async fn snapshots(&self) -> Result<Vec<ResolvedService>> {
+        let query = ServiceQuery::network(self.service_name.clone())?;
+        let max_attempts = query.max_attempts;
+        let snapshots = self.resolver.resolve_service_candidates(query).await?;
+        let authority = snapshots
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("resolver returned no validated alternatives"))?;
+        anyhow::ensure!(
+            snapshots.iter().all(|item| item.same_authority(authority)),
+            "resolver retry set crosses service authority"
+        );
+        Ok(snapshots.into_iter().take(max_attempts).collect())
+    }
+    fn client_for(&self, snapshot: &ResolvedService) -> Result<Arc<dyn RpcClient>> {
+        let (kem, pq) = snapshot.crypto_stores()?;
+        let signer = hyprstream_rpc::signer::LocalSigner::new(self.signing_key.clone());
+        hyprstream_rpc::dial::dial_with_crypto_stores(
+            snapshot.transport(),
+            signer,
+            Some(snapshot.response_verifying_key()),
+            self.token.clone(),
+            Some(kem),
+            Some(pq),
+        )
+    }
+    async fn attempt<T, F, Fut>(&self, mut call: F) -> Result<(T, ResolvedService)>
+    where
+        F: FnMut(Arc<dyn RpcClient>) -> Fut,
+        Fut: std::future::Future<Output = Result<T>>,
+    {
+        for refresh in 0..2 {
+            let mut last_transport_error = None;
+            let mut invalidated = None;
+            for snapshot in self.snapshots().await? {
+                if let Err(error) = self.resolver.ensure_current(&snapshot).await {
+                    invalidated = Some(error);
+                    break;
+                }
+                match call(self.client_for(&snapshot)?).await {
+                    Ok(value) => return Ok((value, snapshot)),
+                    Err(error)
+                        if hyprstream_rpc::transport_traits::is_pre_dispatch_transport_error(
+                            &error,
+                        ) =>
+                    {
+                        last_transport_error = Some(error);
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            if let Some(error) = invalidated {
+                if refresh == 0 {
+                    continue;
+                }
+                return Err(anyhow::anyhow!(
+                    "resolved service remained invalid after re-resolution: {error}"
+                ));
+            }
+            return Err(last_transport_error.unwrap_or_else(|| {
+                anyhow::anyhow!("validated same-authority alternatives exhausted")
+            }));
+        }
+        unreachable!("bounded re-resolution loop always returns")
+    }
+    fn checked_stream(
+        &self,
+        inner: Box<dyn StreamHandle>,
+        snapshot: ResolvedService,
+    ) -> Box<dyn StreamHandle> {
+        Box::new(CurrentStreamHandle {
+            inner,
+            resolver: Arc::clone(&self.resolver),
+            snapshot,
+            invalidated: false,
+        })
+    }
+}
+
+#[async_trait]
+impl RpcClient for ProductionRpcClient {
+    async fn call(&self, payload: Vec<u8>) -> Result<Vec<u8>> {
+        Ok(self
+            .attempt(|c| {
+                let p = payload.clone();
+                async move { c.call(p).await }
+            })
+            .await?
+            .0)
+    }
+    async fn call_for_service(&self, service: &str, payload: Vec<u8>) -> Result<Vec<u8>> {
+        anyhow::ensure!(
+            service == self.service_name,
+            "generated service authority mismatch"
+        );
+        let service = service.to_owned();
+        Ok(self
+            .attempt(|c| {
+                let p = payload.clone();
+                let s = service.clone();
+                async move { c.call_for_service(&s, p).await }
+            })
+            .await?
+            .0)
+    }
+    async fn call_with_options(&self, payload: Vec<u8>, options: CallOptions) -> Result<Vec<u8>> {
+        Ok(self
+            .attempt(|c| {
+                let p = payload.clone();
+                let o = options.clone();
+                async move { c.call_with_options(p, o).await }
+            })
+            .await?
+            .0)
+    }
+    async fn call_with_options_for_service(
+        &self,
+        service: &str,
+        payload: Vec<u8>,
+        options: CallOptions,
+    ) -> Result<Vec<u8>> {
+        anyhow::ensure!(
+            service == self.service_name,
+            "generated service authority mismatch"
+        );
+        let service = service.to_owned();
+        Ok(self
+            .attempt(|c| {
+                let p = payload.clone();
+                let o = options.clone();
+                let s = service.clone();
+                async move { c.call_with_options_for_service(&s, p, o).await }
+            })
+            .await?
+            .0)
+    }
+    async fn call_streaming(&self, payload: Vec<u8>, ephemeral: [u8; 32]) -> Result<Vec<u8>> {
+        Ok(self
+            .attempt(|c| {
+                let p = payload.clone();
+                async move { c.call_streaming(p, ephemeral).await }
+            })
+            .await?
+            .0)
+    }
+    async fn call_streaming_for_service(
+        &self,
+        service: &str,
+        payload: Vec<u8>,
+        ephemeral: [u8; 32],
+    ) -> Result<Vec<u8>> {
+        anyhow::ensure!(
+            service == self.service_name,
+            "generated service authority mismatch"
+        );
+        let service = service.to_owned();
+        Ok(self
+            .attempt(|c| {
+                let p = payload.clone();
+                let s = service.clone();
+                async move { c.call_streaming_for_service(&s, p, ephemeral).await }
+            })
+            .await?
+            .0)
+    }
+    async fn open_stream(&self, payload: Vec<u8>) -> Result<Box<dyn StreamHandle>> {
+        let (inner, snapshot) = self
+            .attempt(|c| {
+                let p = payload.clone();
+                async move { c.open_stream(p).await }
+            })
+            .await?;
+        Ok(self.checked_stream(inner, snapshot))
+    }
+    async fn open_stream_from_info(
+        &self,
+        info: hyprstream_rpc::stream_info::StreamInfo,
+        secret: [u8; 32],
+        public: [u8; 32],
+    ) -> Result<Box<dyn StreamHandle>> {
+        let (inner, snapshot) = self
+            .attempt(|c| {
+                let i = info.clone();
+                async move { c.open_stream_from_info(i, secret, public).await }
+            })
+            .await?;
+        Ok(self.checked_stream(inner, snapshot))
+    }
+    fn next_id(&self) -> u64 {
+        self.request_id
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     }
 }
 
@@ -851,6 +1219,59 @@ mod resolver_tests {
         assert!(error.to_string().contains("advanced or forked"));
     }
 
+    struct CountingStream(Arc<std::sync::atomic::AtomicUsize>);
+
+    #[async_trait]
+    impl StreamHandle for CountingStream {
+        async fn next_payload(
+            &mut self,
+        ) -> Result<Option<hyprstream_rpc::streaming::StreamPayload>> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(None)
+        }
+        async fn cancel(&mut self) -> Result<()> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+        fn stream_id(&self) -> &str {
+            "counting"
+        }
+        fn is_completed(&self) -> bool {
+            false
+        }
+    }
+
+    #[tokio::test]
+    async fn live_stream_continuation_fails_closed_after_snapshot_advance() {
+        let (resolver, source) = production_fixture(false);
+        let resolver = Arc::new(resolver);
+        let snapshot = resolver
+            .resolve_service_candidates(ServiceQuery::network("model").expect("query"))
+            .await
+            .expect("snapshot")
+            .remove(0);
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut stream = CurrentStreamHandle {
+            inner: Box::new(CountingStream(Arc::clone(&calls))),
+            resolver,
+            snapshot,
+            invalidated: false,
+        };
+        {
+            let mut guard = source.0.lock();
+            let state = guard.as_mut().expect("fixture state");
+            state.epoch += 1;
+            state.head_digest = [0x77; 64];
+        }
+        assert!(stream.next_payload().await.is_err());
+        assert!(stream.cancel().await.is_err());
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "invalid continuation dispatched an operation"
+        );
+    }
+
     #[tokio::test]
     async fn production_network_resolver_never_falls_back_to_local_reach() {
         let (resolver, _) = production_fixture(true);
@@ -873,7 +1294,7 @@ mod resolver_tests {
             .write()
             .insert("discovery".to_owned(), entries);
         let resolver = Arc::new(resolver);
-        hyprstream_rpc::resolver::set_global_service(resolver);
+        let _ = PRODUCTION_RESOLVER.set(resolver);
         let client_signing = SigningKey::from_bytes(&[0x44; 32]);
         let _client = crate::DiscoveryClient::from_resolver(client_signing, None)
             .unwrap_or_else(|e| panic!("generated resolver path failed: {e}"));

@@ -17,8 +17,8 @@ use anyhow::{anyhow, bail, Context as _, Result as AnyResult};
 use hyprstream_discovery::{RecordCarData, RecordResolver};
 use hyprstream_pds::at9p::h512;
 use hyprstream_pds::at9p_duplicity::{
-    AcceptedAt9pHead, AcceptedAt9pState, ConditionalAdvance, DuplicityGuard,
-    WalDuplicityAlarmSink, Watermark, WatermarkStore,
+    AcceptedAt9pHead, AcceptedAt9pState, ConditionalAdvance, DuplicityGuard, WalDuplicityAlarmSink,
+    Watermark, WatermarkStore,
 };
 use hyprstream_pds::at9p_gate::{verify_did_at9p, DID_AT9P_PREFIX};
 use hyprstream_pds::car::build_record_proof_car;
@@ -264,7 +264,9 @@ impl PdsRecordStore {
         acceptance_identity: &ed25519_dalek::VerifyingKey,
     ) -> AnyResult<Option<AcceptedAt9pState>> {
         match &self.backing {
-            RecordBacking::ReadWrite(db) => load_at9p_state_from_db(db, subject_cid512, acceptance_identity),
+            RecordBacking::ReadWrite(db) => {
+                load_at9p_state_from_db(db, subject_cid512, acceptance_identity)
+            }
             RecordBacking::ReadOnly(path) => {
                 let db = rocksdb::DB::open_for_read_only(&readonly_opts(), path, false)?;
                 load_at9p_state_from_db(&db, subject_cid512, acceptance_identity)
@@ -297,6 +299,41 @@ impl PdsRecordStore {
         Ok(Some(state))
     }
 
+    /// Enumerate every checkpoint-verified accepted state. This is the
+    /// production startup boundary used to build native announcements; a
+    /// missing checkpoint half or any verification failure aborts the read.
+    pub fn accepted_at9p_states(&self) -> AnyResult<Vec<AcceptedAt9pState>> {
+        let acceptance_identity = self
+            .at9p_acceptance_identity
+            .as_ref()
+            .ok_or_else(|| anyhow!("accepted-state verification identity is not configured"))?;
+        let read = |db: &rocksdb::DB| -> AnyResult<Vec<AcceptedAt9pState>> {
+            let prefix = b"at9p-state\0";
+            let mut states = Vec::new();
+            for item in db.iterator(rocksdb::IteratorMode::Start) {
+                let (key, _) = item?;
+                let Some(subject) = key.strip_prefix(prefix) else {
+                    continue;
+                };
+                let subject =
+                    std::str::from_utf8(subject).context("accepted-state key is not UTF-8")?;
+                let state = load_at9p_state_from_db(db, subject, acceptance_identity)?.ok_or_else(
+                    || anyhow!("accepted-state key disappeared during snapshot read"),
+                )?;
+                states.push(state);
+            }
+            states.sort_by(|a, b| a.did.cmp(&b.did));
+            Ok(states)
+        };
+        match &self.backing {
+            RecordBacking::ReadWrite(db) => read(db),
+            RecordBacking::ReadOnly(path) => {
+                let db = rocksdb::DB::open_for_read_only(&readonly_opts(), path, false)?;
+                read(&db)
+            }
+        }
+    }
+
     fn conditional_advance_at9p_state(
         &self,
         expected: Option<Watermark>,
@@ -308,7 +345,11 @@ impl PdsRecordStore {
             bail!("accepted did:at9p state write attempted on a read-only PDS store");
         };
         let _advance = self.at9p_advance_lock.lock();
-        let current = load_at9p_state_from_db(db, &state.subject_cid512, &acceptance_identity.verifying_key())?;
+        let current = load_at9p_state_from_db(
+            db,
+            &state.subject_cid512,
+            &acceptance_identity.verifying_key(),
+        )?;
         if current.as_ref().map(AcceptedAt9pState::watermark) != expected {
             return current.map_or_else(
                 || bail!("conditional accepted-state advance expected a durable head, but none exists"),
@@ -322,7 +363,8 @@ impl PdsRecordStore {
         batch.put(at9p_checkpoint_key(&state.subject_cid512), checkpoint);
         let mut options = rocksdb::WriteOptions::default();
         options.set_sync(true);
-        db.write_opt(batch, &options).context("synchronous accepted did:at9p state+checkpoint commit failed")?;
+        db.write_opt(batch, &options)
+            .context("synchronous accepted did:at9p state+checkpoint commit failed")?;
         Ok(ConditionalAdvance::Committed)
     }
 
@@ -427,7 +469,10 @@ fn acceptance_message(domain: &[u8], payload: &[u8]) -> Vec<u8> {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct At9pCheckpoint { watermark: Watermark, envelope_digest: [u8; 64] }
+struct At9pCheckpoint {
+    watermark: Watermark,
+    envelope_digest: [u8; 64],
+}
 
 fn checkpoint_message(subject: &str, payload: &[u8]) -> AnyResult<Vec<u8>> {
     let len = u32::try_from(subject.len()).context("at9p subject exceeds u32")?;
@@ -439,7 +484,11 @@ fn checkpoint_message(subject: &str, payload: &[u8]) -> AnyResult<Vec<u8>> {
     Ok(out)
 }
 
-fn encode_at9p_checkpoint(state: &AcceptedAt9pState, envelope: &[u8], identity: &ed25519_dalek::SigningKey) -> AnyResult<Vec<u8>> {
+fn encode_at9p_checkpoint(
+    state: &AcceptedAt9pState,
+    envelope: &[u8],
+    identity: &ed25519_dalek::SigningKey,
+) -> AnyResult<Vec<u8>> {
     use ed25519_dalek::Signer as _;
     let mut payload = Vec::with_capacity(AT9P_CHECKPOINT_LEN);
     payload.extend_from_slice(AT9P_CHECKPOINT_MAGIC);
@@ -452,25 +501,64 @@ fn encode_at9p_checkpoint(state: &AcceptedAt9pState, envelope: &[u8], identity: 
     Ok(payload)
 }
 
-fn decode_at9p_checkpoint(subject: &str, bytes: &[u8], identity: &ed25519_dalek::VerifyingKey) -> AnyResult<At9pCheckpoint> {
-    anyhow::ensure!(bytes.len() == AT9P_CHECKPOINT_LEN, "accepted at9p checkpoint length mismatch");
-    let payload = bytes.get(..AT9P_CHECKPOINT_PAYLOAD_LEN)
+fn decode_at9p_checkpoint(
+    subject: &str,
+    bytes: &[u8],
+    identity: &ed25519_dalek::VerifyingKey,
+) -> AnyResult<At9pCheckpoint> {
+    anyhow::ensure!(
+        bytes.len() == AT9P_CHECKPOINT_LEN,
+        "accepted at9p checkpoint length mismatch"
+    );
+    let payload = bytes
+        .get(..AT9P_CHECKPOINT_PAYLOAD_LEN)
         .ok_or_else(|| anyhow!("accepted at9p checkpoint payload missing"))?;
-    anyhow::ensure!(payload.starts_with(AT9P_CHECKPOINT_MAGIC), "accepted at9p checkpoint has bad version");
-    let sig = ed25519_dalek::Signature::from_bytes(bytes.get(AT9P_CHECKPOINT_PAYLOAD_LEN..)
-        .ok_or_else(|| anyhow!("accepted at9p checkpoint signature missing"))?.try_into()?);
-    identity.verify_strict(&checkpoint_message(subject, payload)?, &sig)
+    anyhow::ensure!(
+        payload.starts_with(AT9P_CHECKPOINT_MAGIC),
+        "accepted at9p checkpoint has bad version"
+    );
+    let sig = ed25519_dalek::Signature::from_bytes(
+        bytes
+            .get(AT9P_CHECKPOINT_PAYLOAD_LEN..)
+            .ok_or_else(|| anyhow!("accepted at9p checkpoint signature missing"))?
+            .try_into()?,
+    );
+    identity
+        .verify_strict(&checkpoint_message(subject, payload)?, &sig)
         .context("accepted at9p monotonic checkpoint signature rejected")?;
-    let epoch = u64::from_be_bytes(payload.get(8..16).ok_or_else(|| anyhow!("checkpoint epoch missing"))?.try_into()?);
-    let record_digest = payload.get(16..80).ok_or_else(|| anyhow!("checkpoint digest missing"))?.try_into()?;
-    let terminal = match payload.get(80) { Some(0) => false, Some(1) => true, _ => bail!("invalid checkpoint terminal flag") };
+    let epoch = u64::from_be_bytes(
+        payload
+            .get(8..16)
+            .ok_or_else(|| anyhow!("checkpoint epoch missing"))?
+            .try_into()?,
+    );
+    let record_digest = payload
+        .get(16..80)
+        .ok_or_else(|| anyhow!("checkpoint digest missing"))?
+        .try_into()?;
+    let terminal = match payload.get(80) {
+        Some(0) => false,
+        Some(1) => true,
+        _ => bail!("invalid checkpoint terminal flag"),
+    };
     Ok(At9pCheckpoint {
-        watermark: Watermark { epoch, record_digest, terminal },
-        envelope_digest: payload.get(81..145).ok_or_else(|| anyhow!("checkpoint envelope digest missing"))?.try_into()?,
+        watermark: Watermark {
+            epoch,
+            record_digest,
+            terminal,
+        },
+        envelope_digest: payload
+            .get(81..145)
+            .ok_or_else(|| anyhow!("checkpoint envelope digest missing"))?
+            .try_into()?,
     })
 }
 
-fn load_at9p_state_from_db(db: &rocksdb::DB, subject: &str, identity: &ed25519_dalek::VerifyingKey) -> AnyResult<Option<AcceptedAt9pState>> {
+fn load_at9p_state_from_db(
+    db: &rocksdb::DB,
+    subject: &str,
+    identity: &ed25519_dalek::VerifyingKey,
+) -> AnyResult<Option<AcceptedAt9pState>> {
     let snapshot = db.snapshot();
     let envelope = snapshot.get(at9p_state_key(subject))?;
     let checkpoint = snapshot.get(at9p_checkpoint_key(subject))?;
@@ -481,8 +569,14 @@ fn load_at9p_state_from_db(db: &rocksdb::DB, subject: &str, identity: &ed25519_d
         (Some(envelope), Some(checkpoint)) => {
             let state = decode_at9p_state(subject, &envelope, identity)?;
             let checkpoint = decode_at9p_checkpoint(subject, &checkpoint, identity)?;
-            anyhow::ensure!(checkpoint.watermark == state.watermark(), "accepted at9p checkpoint/body watermark mismatch");
-            anyhow::ensure!(checkpoint.envelope_digest == h512(&envelope), "accepted at9p checkpoint/state envelope mismatch");
+            anyhow::ensure!(
+                checkpoint.watermark == state.watermark(),
+                "accepted at9p checkpoint/body watermark mismatch"
+            );
+            anyhow::ensure!(
+                checkpoint.envelope_digest == h512(&envelope),
+                "accepted at9p checkpoint/state envelope mismatch"
+            );
             Ok(Some(state))
         }
     }
@@ -663,8 +757,17 @@ impl WatermarkStore for RocksAt9pStateStore {
             .load_at9p_state(subject_cid512, &self.acceptance_identity.verifying_key())
     }
 
-    fn conditional_advance(&self, expected: Option<Watermark>, state: &AcceptedAt9pState) -> AnyResult<ConditionalAdvance> {
-        self.store.conditional_advance_at9p_state(expected, state, &self.acceptance_identity, &self.audit_key)
+    fn conditional_advance(
+        &self,
+        expected: Option<Watermark>,
+        state: &AcceptedAt9pState,
+    ) -> AnyResult<ConditionalAdvance> {
+        self.store.conditional_advance_at9p_state(
+            expected,
+            state,
+            &self.acceptance_identity,
+            &self.audit_key,
+        )
     }
 }
 
@@ -1731,8 +1834,8 @@ mod pds_store_tests {
         let db_path = dir.path().join("pds");
         let store = Arc::new(PdsRecordStore::open(&db_path).expect("open"));
         let (g, n1, n2) = (at9p_signer(41), at9p_signer(42), at9p_signer(43));
-        let genesis = sign_capsule(at9p_body(&g, &[&n1], "genesis"), &g.ed, &g.pq)
-            .expect("genesis");
+        let genesis =
+            sign_capsule(at9p_body(&g, &[&n1], "genesis"), &g.ed, &g.pq).expect("genesis");
         let genesis_bytes = genesis.to_dag_cbor().expect("genesis bytes");
         let cid = genesis.cid512().expect("cid");
         let did = format!("{DID_AT9P_PREFIX}{cid}");
@@ -1787,7 +1890,10 @@ mod pds_store_tests {
         let thread_a = run(guard_a, candidate_a);
         let thread_b = run(guard_b, candidate_b);
         barrier.wait();
-        let results = [thread_a.join().expect("thread a"), thread_b.join().expect("thread b")];
+        let results = [
+            thread_a.join().expect("thread a"),
+            thread_b.join().expect("thread b"),
+        ];
         assert_eq!(
             results
                 .iter()
@@ -1798,7 +1904,10 @@ mod pds_store_tests {
         );
         assert_eq!(
             store
-                .load_at9p_state(&did[DID_AT9P_PREFIX.len()..], &acceptance_identity.verifying_key())
+                .load_at9p_state(
+                    &did[DID_AT9P_PREFIX.len()..],
+                    &acceptance_identity.verifying_key()
+                )
                 .expect("load")
                 .expect("state")
                 .epoch,
@@ -1999,41 +2108,74 @@ mod pds_store_tests {
         let alarm = dir.path().join("alarm");
         let store = Arc::new(PdsRecordStore::open(&db_path).expect("open"));
         let (g, n1, n2) = (at9p_signer(31), at9p_signer(32), at9p_signer(33));
-        let genesis = sign_capsule(at9p_body(&g, &[&n1], "genesis"), &g.ed, &g.pq).expect("genesis");
+        let genesis =
+            sign_capsule(at9p_body(&g, &[&n1], "genesis"), &g.ed, &g.pq).expect("genesis");
         let genesis_bytes = genesis.to_dag_cbor().expect("bytes");
         let cid = genesis.cid512().expect("cid");
         let did = format!("{DID_AT9P_PREFIX}{cid}");
         let publisher = production_at9p_publisher(Arc::clone(&store), &alarm);
-        publisher.ingest_at9p_genesis(&did, &genesis_bytes).expect("seed");
-        let RecordBacking::ReadWrite(db) = &store.backing else { panic!("writer") };
+        publisher
+            .ingest_at9p_genesis(&did, &genesis_bytes)
+            .expect("seed");
+        let RecordBacking::ReadWrite(db) = &store.backing else {
+            panic!("writer")
+        };
         let state_key = at9p_state_key(&cid);
         let checkpoint_key = at9p_checkpoint_key(&cid);
         let old_state = db.get(&state_key).unwrap().unwrap();
         let old_checkpoint = db.get(&checkpoint_key).unwrap().unwrap();
         let update = sign_update_record(
-            cid.clone(), 1, h512(&genesis_bytes), at9p_body(&n1, &[&n2], "rotated"),
-            "2099-01-01T00:00:00Z".to_owned(), &n1.ed, &n1.pq,
-        ).expect("update");
-        publisher.ingest_at9p_successor(&did, &update.to_dag_cbor().unwrap(), "2026-07-16T12:00:00Z").expect("advance");
+            cid.clone(),
+            1,
+            h512(&genesis_bytes),
+            at9p_body(&n1, &[&n2], "rotated"),
+            "2099-01-01T00:00:00Z".to_owned(),
+            &n1.ed,
+            &n1.pq,
+        )
+        .expect("update");
+        publisher
+            .ingest_at9p_successor(&did, &update.to_dag_cbor().unwrap(), "2026-07-16T12:00:00Z")
+            .expect("advance");
         let new_state = db.get(&state_key).unwrap().unwrap();
         let new_checkpoint = db.get(&checkpoint_key).unwrap().unwrap();
         db.delete(&state_key).expect("simulate state-half missing");
         assert!(publisher.accepted_at9p_state(&did, None).is_err());
         db.put(&state_key, &new_state).expect("restore state");
-        db.delete(&checkpoint_key).expect("simulate checkpoint-half missing");
+        db.delete(&checkpoint_key)
+            .expect("simulate checkpoint-half missing");
         assert!(publisher.accepted_at9p_state(&did, None).is_err());
-        db.put(&checkpoint_key, &new_checkpoint).expect("restore checkpoint");
+        db.put(&checkpoint_key, &new_checkpoint)
+            .expect("restore checkpoint");
         db.put(&state_key, old_state).expect("old envelope replay");
         assert!(publisher.accepted_at9p_state(&did, None).is_err());
         db.put(&state_key, new_state).expect("restore body");
-        db.put(&checkpoint_key, old_checkpoint).expect("old checkpoint replay");
+        db.put(&checkpoint_key, old_checkpoint)
+            .expect("old checkpoint replay");
         assert!(publisher.accepted_at9p_state(&did, None).is_err());
-        db.put(&checkpoint_key, new_checkpoint).expect("restore checkpoint");
+        db.put(&checkpoint_key, new_checkpoint)
+            .expect("restore checkpoint");
         assert_eq!(publisher.accepted_at9p_state(&did, None).unwrap().epoch, 1);
         drop(publisher);
         drop(store);
         let reopened = Arc::new(PdsRecordStore::open(&db_path).expect("reopen"));
-        assert_eq!(production_at9p_publisher(reopened, &alarm).accepted_at9p_state(&did, None).unwrap().epoch, 1);
+        assert_eq!(
+            production_at9p_publisher(reopened, &alarm)
+                .accepted_at9p_state(&did, None)
+                .unwrap()
+                .epoch,
+            1
+        );
+        let acceptance_identity = ed25519_dalek::SigningKey::from_bytes(&[90u8; 32]);
+        let readonly = PdsRecordStore::open_readonly(&db_path)
+            .expect("open real production read boundary")
+            .with_at9p_acceptance_identity(acceptance_identity.verifying_key());
+        let states = readonly
+            .accepted_at9p_states()
+            .expect("enumerate checkpoint-verified accepted states");
+        assert_eq!(states.len(), 1);
+        assert_eq!(states[0].did, did);
+        assert_eq!(states[0].epoch, 1);
     }
 
     #[test]

@@ -7313,6 +7313,7 @@ dependencies = [
  "ed25519-dalek 2.2.0",
  "futures",
  "hyprstream-discovery",
+ "hyprstream-pds",
  "hyprstream-rpc",
  "inventory",
  "nix 0.27.1",

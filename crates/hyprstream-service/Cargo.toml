@@ -13,6 +13,7 @@ crate-type = ["rlib"]  # rlib-only: OnceLock singletons must be shared workspace
 # Workspace crates
 hyprstream-rpc = { path = "../hyprstream-rpc" }
 hyprstream-discovery = { path = "../hyprstream-discovery" }
+hyprstream-pds = { path = "../hyprstream-pds" }
 
 # Async runtime
 tokio = { workspace = true }

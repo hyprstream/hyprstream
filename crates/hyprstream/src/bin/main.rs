@@ -501,11 +501,8 @@ fn handle_quick_command(
             || async move {
                 let keys_dir = ctx.models_dir().join(".registry").join("keys");
                 let signing_key = load_or_generate_signing_key(&keys_dir).await?;
-                let model_server_vk = resolve_service_vk("model")
-                    .ok_or_else(|| anyhow::anyhow!("Cannot resolve model service pubkey. Run 'hyprstream wizard -y' to generate bootstrap credentials."))?;
-                let model_client = hyprstream_core::services::generated::model_client::ModelClient::from_installed_resolver(
+                let model_client = hyprstream_core::services::generated::model_client::ModelClient::from_resolver(
                     signing_key,
-                    model_server_vk,
                     None,
                 )?;
                 let filters = parse_filters(&filter)?;
@@ -1190,10 +1187,8 @@ fn handle_quick_command(
                     };
 
                     use hyprstream_workers::runtime::WorkerClient;
-                    let worker_server_vk = resolve_service_vk("worker")
-                        .ok_or_else(|| anyhow::anyhow!("Cannot resolve worker pubkey. Run wizard."))?;
                     let worker_client =
-                        WorkerClient::from_installed_resolver(signing_key, worker_server_vk, None)?;
+                        WorkerClient::from_resolver(signing_key, None)?;
 
                     match action {
                         WorkerAction::List {
@@ -2183,6 +2178,10 @@ fn main() -> Result<()> {
 
                                 // Wire QUIC shared config (must be after key generation so jwt_verifying_key is set)
                                 if quic_cfg.enabled {
+                                    ctx = hyprstream_core::services::factories::with_checkpointed_native_announcements(
+                                        ctx,
+                                        &service_names,
+                                    )?;
                                     let qc = quic_cfg;
                                     let (cert_chain, key_der) = qc.load_tls_materials()
                                         .context("Failed to load QUIC TLS materials")?;
