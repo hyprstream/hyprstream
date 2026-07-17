@@ -6,12 +6,14 @@ on:
     paths:
       - 'docs/standards/**'
       - 'tools/check_standards.py'
+      - 'tools/check_pq_anonymous_issuance.py'
       - 'tools/generate_standards.py'
       - '.github/workflows/standards.yml'
   pull_request:
     paths:
       - 'docs/standards/**'
       - 'tools/check_standards.py'
+      - 'tools/check_pq_anonymous_issuance.py'
       - 'tools/generate_standards.py'
       - '.github/workflows/standards.yml'
 
@@ -32,4 +34,6 @@ jobs:
       - name: Install exact xml2rfc toolchain
         run: python3 -m pip install --disable-pip-version-check --upgrade --requirement docs/standards/xml2rfc-requirements.txt
       - name: Validate registries, obligations, and stale output
-        run: python3 tools/check_standards.py --check-generated --xml2rfc xml2rfc
+        run: |
+          python3 tools/check_pq_anonymous_issuance.py
+          python3 tools/check_standards.py --check-generated --xml2rfc xml2rfc

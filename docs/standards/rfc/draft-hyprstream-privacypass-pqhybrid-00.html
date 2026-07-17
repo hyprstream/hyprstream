@@ -1326,30 +1326,33 @@ li > p:last-of-type:only-child {
             <p id="section-toc.1-1.6.1"><a href="#section-6" class="auto internal xref">6</a>.  <a href="#name-transcript-registry" class="internal xref">Transcript Registry</a></p>
 </li>
           <li class="compact toc ulBare ulEmpty" id="section-toc.1-1.7">
-            <p id="section-toc.1-1.7.1"><a href="#section-7" class="auto internal xref">7</a>.  <a href="#name-state-machine-skeleton" class="internal xref">State-Machine Skeleton</a></p>
+            <p id="section-toc.1-1.7.1"><a href="#section-7" class="auto internal xref">7</a>.  <a href="#name-construction-status-and-exp" class="internal xref">Construction Status and Experimental Refusal Boundary</a></p>
 </li>
           <li class="compact toc ulBare ulEmpty" id="section-toc.1-1.8">
-            <p id="section-toc.1-1.8.1"><a href="#section-8" class="auto internal xref">8</a>.  <a href="#name-security-considerations" class="internal xref">Security Considerations</a></p>
+            <p id="section-toc.1-1.8.1"><a href="#section-8" class="auto internal xref">8</a>.  <a href="#name-state-machine-skeleton" class="internal xref">State-Machine Skeleton</a></p>
 </li>
           <li class="compact toc ulBare ulEmpty" id="section-toc.1-1.9">
-            <p id="section-toc.1-1.9.1"><a href="#section-9" class="auto internal xref">9</a>.  <a href="#name-privacy-considerations" class="internal xref">Privacy Considerations</a></p>
+            <p id="section-toc.1-1.9.1"><a href="#section-9" class="auto internal xref">9</a>.  <a href="#name-security-considerations" class="internal xref">Security Considerations</a></p>
 </li>
           <li class="compact toc ulBare ulEmpty" id="section-toc.1-1.10">
-            <p id="section-toc.1-1.10.1"><a href="#section-10" class="auto internal xref">10</a>. <a href="#name-iana-considerations" class="internal xref">IANA Considerations</a></p>
+            <p id="section-toc.1-1.10.1"><a href="#section-10" class="auto internal xref">10</a>. <a href="#name-privacy-considerations" class="internal xref">Privacy Considerations</a></p>
 </li>
           <li class="compact toc ulBare ulEmpty" id="section-toc.1-1.11">
-            <p id="section-toc.1-1.11.1"><a href="#section-11" class="auto internal xref">11</a>. <a href="#name-references" class="internal xref">References</a></p>
-<ul class="compact toc ulBare ulEmpty">
-<li class="compact toc ulBare ulEmpty" id="section-toc.1-1.11.2.1">
-                <p id="section-toc.1-1.11.2.1.1"><a href="#section-11.1" class="auto internal xref">11.1</a>.  <a href="#name-normative-references" class="internal xref">Normative References</a></p>
+            <p id="section-toc.1-1.11.1"><a href="#section-11" class="auto internal xref">11</a>. <a href="#name-iana-considerations" class="internal xref">IANA Considerations</a></p>
 </li>
-              <li class="compact toc ulBare ulEmpty" id="section-toc.1-1.11.2.2">
-                <p id="section-toc.1-1.11.2.2.1"><a href="#section-11.2" class="auto internal xref">11.2</a>.  <a href="#name-informative-references" class="internal xref">Informative References</a></p>
+          <li class="compact toc ulBare ulEmpty" id="section-toc.1-1.12">
+            <p id="section-toc.1-1.12.1"><a href="#section-12" class="auto internal xref">12</a>. <a href="#name-references" class="internal xref">References</a></p>
+<ul class="compact toc ulBare ulEmpty">
+<li class="compact toc ulBare ulEmpty" id="section-toc.1-1.12.2.1">
+                <p id="section-toc.1-1.12.2.1.1"><a href="#section-12.1" class="auto internal xref">12.1</a>.  <a href="#name-normative-references" class="internal xref">Normative References</a></p>
+</li>
+              <li class="compact toc ulBare ulEmpty" id="section-toc.1-1.12.2.2">
+                <p id="section-toc.1-1.12.2.2.1"><a href="#section-12.2" class="auto internal xref">12.2</a>.  <a href="#name-informative-references" class="internal xref">Informative References</a></p>
 </li>
             </ul>
 </li>
-          <li class="compact toc ulBare ulEmpty" id="section-toc.1-1.12">
-            <p id="section-toc.1-1.12.1"><a href="#appendix-A" class="auto internal xref"></a><a href="#name-authors-address" class="internal xref">Author's Address</a></p>
+          <li class="compact toc ulBare ulEmpty" id="section-toc.1-1.13">
+            <p id="section-toc.1-1.13.1"><a href="#appendix-A" class="auto internal xref"></a><a href="#name-authors-address" class="internal xref">Author's Address</a></p>
 </li>
         </ul>
 </nav>
@@ -1429,47 +1432,57 @@ li > p:last-of-type:only-child {
 <p id="section-6-2">The registry is local to this repository. It is not an IANA registry or a request to allocate Privacy Pass, MOQT, or any other codepoint.<a href="#section-6-2" class="pilcrow">¶</a></p>
 </section>
 </div>
-<div id="states">
+<div id="construction-status">
 <section id="section-7">
-      <h2 id="name-state-machine-skeleton">
-<a href="#section-7" class="section-number selfRef">7. </a><a href="#name-state-machine-skeleton" class="section-name selfRef">State-Machine Skeleton</a>
+      <h2 id="name-construction-status-and-exp">
+<a href="#section-7" class="section-number selfRef">7. </a><a href="#name-construction-status-and-exp" class="section-name selfRef">Construction Status and Experimental Refusal Boundary</a>
       </h2>
-<p id="section-7-1">Client states are: Idle; EntitlementChecked (optional); IssuancePrepared; TokenHeld; OuterSessionReady (optional); InnerControlSent; Released; SpentOrExpired; Denied. Issuer states are: ConfigurationResolved; IssuanceReceived; IssuanceAccepted; IssuanceRejected; KeyDraining. Origin states are: ChallengeIssued; OuterSessionObserved (optional); InnerControlReceived; StateResolved; BindingVerified; MACAuthorized; SpendCommitted; ReleaseCommitted; Denied. No transition to dispatch or release is defined from an outer-only state.<a href="#section-7-1" class="pilcrow">¶</a></p>
-<p id="section-7-2">Construction selection must define persistence, atomic spend/commit, retry, expiry, accepted-state advance, key rotation, crash recovery, and error behavior. Spend is committed only after all authorization checks and before dispatch or key release. A crash after spend commit may burn the one-use capability but cannot repeat authorization; a crash before spend commit cannot create an authorization success.<a href="#section-7-2" class="pilcrow">¶</a></p>
-<p id="section-7-3">The bounded inner control kinds are Challenge, IssuanceRequest, IssuanceResponse, Redemption, AuthorizationResult, KeyReleaseRequest, KeyReleaseResponse, and Error. The local scaffold limits one encrypted Object payload to 65536 bytes, one exchange to 16 Objects, and one session to 8 concurrent exchanges. These names and ceilings are application-profile inputs, not MOQT or Privacy Pass allocations; unknown kinds and versions reject.<a href="#section-7-3" class="pilcrow">¶</a></p>
+<p id="section-7-1">A 2026-07-17 primary-source audit found promising post-quantum blind-signature and anonymous-credential research, but no candidate supplied the complete reviewed Privacy Pass construction, fixed parameters, maintained implementation, canonical profile encoding and vectors, and analysis of this exact classical-plus-PQ composition. A production implementation MUST NOT issue, accept, redeem, clear a MAC, generate an authorization result, dispatch, or release a key under this profile while the PQ construction and token type are unselected. The experimental boundary checker MUST terminate a structurally valid fixture with the ConstructionUnselected refusal.<a href="#section-7-1" class="pilcrow">¶</a></p>
+<p id="section-7-2">The repository-local experimental boundary is a deterministic non-cryptographic fixture schema, not a token type or protocol encoding. The experimental boundary checker MUST require exactly two ordered roles, ClassicalAnonymous then PqAnonymous, combined with AND, and MUST reject a missing, duplicated, reordered, unknown, crossed, or stripped leg. The boundary MUST reject any holder DID, ATProto handle, account identifier, or other stable holder subject field. Each leg MUST use its dedicated Privacy Pass issuer-key purpose, and the boundary MUST reject cross-role key reuse or substitution of a mesh, PDS, response, or controller key. The boundary MUST require exact accepted-current issuer, audience, state epoch and digest, policy generation, expiry, redemption context, and resource-profile commitment values and MUST reject stale, rolled-back, expired, or crossed values. The experimental fixture boundary MUST derive its challenge digest from the canonical repository fixture challenge and MUST require the evaluator-authoritative context digest in every leg of every message.<a href="#section-7-2" class="pilcrow">¶</a></p>
+<p id="section-7-3">A structurally valid experimental fixture still terminates in the ConstructionUnselected refusal. It is not a positive cryptographic vector and cannot mint PqHybrid assurance. Standard classical Privacy Pass remains available only for its standard classical purpose; standard MOQT relays remain unchanged and forward ordinary opaque application Object bytes.<a href="#section-7-3" class="pilcrow">¶</a></p>
+</section>
+</div>
+<div id="states">
+<section id="section-8">
+      <h2 id="name-state-machine-skeleton">
+<a href="#section-8" class="section-number selfRef">8. </a><a href="#name-state-machine-skeleton" class="section-name selfRef">State-Machine Skeleton</a>
+      </h2>
+<p id="section-8-1">Client states are: Idle; EntitlementChecked (optional); IssuancePrepared; TokenHeld; OuterSessionReady (optional); InnerControlSent; Released; SpentOrExpired; Denied. Issuer states are: ConfigurationResolved; IssuanceReceived; IssuanceAccepted; IssuanceRejected; KeyDraining. Origin states are: ChallengeIssued; OuterSessionObserved (optional); InnerControlReceived; StateResolved; BindingVerified; MACAuthorized; SpendCommitted; ReleaseCommitted; Denied. No transition to dispatch or release is defined from an outer-only state.<a href="#section-8-1" class="pilcrow">¶</a></p>
+<p id="section-8-2">Construction selection must define persistence, atomic spend/commit, retry, expiry, accepted-state advance, key rotation, crash recovery, and error behavior. Spend is committed only after all authorization checks and before dispatch or key release. A crash after spend commit may burn the one-use capability but cannot repeat authorization; a crash before spend commit cannot create an authorization success.<a href="#section-8-2" class="pilcrow">¶</a></p>
+<p id="section-8-3">The bounded inner control kinds are Challenge, IssuanceRequest, IssuanceResponse, Redemption, AuthorizationResult, KeyReleaseRequest, KeyReleaseResponse, and Error. The local scaffold limits one encrypted Object payload to 65536 bytes, one exchange to 16 Objects, and one session to 8 concurrent exchanges. These names and ceilings are application-profile inputs, not MOQT or Privacy Pass allocations; unknown kinds and versions reject.<a href="#section-8-3" class="pilcrow">¶</a></p>
 </section>
 </div>
 <div id="security">
-<section id="section-8">
+<section id="section-9">
       <h2 id="name-security-considerations">
-<a href="#section-8" class="section-number selfRef">8. </a><a href="#name-security-considerations" class="section-name selfRef">Security Considerations</a>
+<a href="#section-9" class="section-number selfRef">9. </a><a href="#name-security-considerations" class="section-name selfRef">Security Considerations</a>
       </h2>
-<p id="section-8-1">Construction selection and independent review are prerequisites for any PqHybrid production claim. The profile requires exact binding to issuer, audience, accepted-state and policy generations, carrier profile, operation/resource, one-use PoP, and HyKEM recipient, but deliberately leaves their concrete encoding and primitive unselected.<a href="#section-8-1" class="pilcrow">¶</a></p>
+<p id="section-9-1">Construction selection and independent review are prerequisites for any PqHybrid production claim. The profile requires exact binding to issuer, audience, accepted-state and policy generations, carrier profile, operation/resource, one-use PoP, and HyKEM recipient, but deliberately leaves their concrete encoding and primitive unselected.<a href="#section-9-1" class="pilcrow">¶</a></p>
 </section>
 </div>
 <div id="privacy">
-<section id="section-9">
+<section id="section-10">
       <h2 id="name-privacy-considerations">
-<a href="#section-9" class="section-number selfRef">9. </a><a href="#name-privacy-considerations" class="section-name selfRef">Privacy Considerations</a>
+<a href="#section-10" class="section-number selfRef">10. </a><a href="#name-privacy-considerations" class="section-name selfRef">Privacy Considerations</a>
       </h2>
-<p id="section-9-1">The profile makes no issuance/redemption unlinkability claim against issuer-origin collusion, no traffic-analysis claim against an origin-relay or global observer, and no protection against PDS, ledger, storage, or cross-cell correlation beyond stated data minimization. See the companion privacy and threat analyses for the required collusion model.<a href="#section-9-1" class="pilcrow">¶</a></p>
+<p id="section-10-1">The profile makes no issuance/redemption unlinkability claim against issuer-origin collusion, no traffic-analysis claim against an origin-relay or global observer, and no protection against PDS, ledger, storage, or cross-cell correlation beyond stated data minimization. See the companion privacy and threat analyses for the required collusion model.<a href="#section-10-1" class="pilcrow">¶</a></p>
 </section>
 </div>
 <div id="iana">
-<section id="section-10">
+<section id="section-11">
       <h2 id="name-iana-considerations">
-<a href="#section-10" class="section-number selfRef">10. </a><a href="#name-iana-considerations" class="section-name selfRef">IANA Considerations</a>
+<a href="#section-11" class="section-number selfRef">11. </a><a href="#name-iana-considerations" class="section-name selfRef">IANA Considerations</a>
       </h2>
-<p id="section-10-1">This document requests no IANA actions and allocates no codepoints.<a href="#section-10-1" class="pilcrow">¶</a></p>
+<p id="section-11-1">This document requests no IANA actions and allocates no codepoints.<a href="#section-11-1" class="pilcrow">¶</a></p>
 </section>
 </div>
-<section id="section-11">
+<section id="section-12">
       <h2 id="name-references">
-<a href="#section-11" class="section-number selfRef">11. </a><a href="#name-references" class="section-name selfRef">References</a>
+<a href="#section-12" class="section-number selfRef">12. </a><a href="#name-references" class="section-name selfRef">References</a>
       </h2>
-<section id="section-11.1">
+<section id="section-12.1">
         <h3 id="name-normative-references">
-<a href="#section-11.1" class="section-number selfRef">11.1. </a><a href="#name-normative-references" class="section-name selfRef">Normative References</a>
+<a href="#section-12.1" class="section-number selfRef">12.1. </a><a href="#name-normative-references" class="section-name selfRef">Normative References</a>
         </h3>
 <dl class="references">
 <dt id="RFC2119">[RFC2119]</dt>
@@ -1494,9 +1507,9 @@ li > p:last-of-type:only-child {
 <dd class="break"></dd>
 </dl>
 </section>
-<section id="section-11.2">
+<section id="section-12.2">
         <h3 id="name-informative-references">
-<a href="#section-11.2" class="section-number selfRef">11.2. </a><a href="#name-informative-references" class="section-name selfRef">Informative References</a>
+<a href="#section-12.2" class="section-number selfRef">12.2. </a><a href="#name-informative-references" class="section-name selfRef">Informative References</a>
         </h3>
 <dl class="references">
 <dt id="RFC9794">[RFC9794]</dt>

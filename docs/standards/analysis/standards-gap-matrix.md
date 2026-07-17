@@ -12,6 +12,11 @@
 | [draft-ietf-moq-privacy-pass-auth-03](https://www.ietf.org/archive/id/draft-ietf-moq-privacy-pass-auth-03.html) | IETF Internet-Draft, work in progress | standard authorization-token/challenge surfaces for participating relays | Classical relay authorization remains coarse and cannot satisfy origin MAC/key release | outer plane only; #726 |
 | [draft-guo-privacypass-token-binding-02](https://www.ietf.org/archive/id/draft-guo-privacypass-token-binding-02.html) | Individual Internet-Draft, not adopted | binding design input | Not adopted and does not establish this profile's PQ assurance or HyKEM semantics | #1061 review/question; no normative dependency yet |
 | [RFC 9955](https://www.rfc-editor.org/info/rfc9955), Hybrid Signature Spectrums | Informational RFC | composition/non-separability terminology | Signatures are not a blind anonymous issuance primitive | terminology only; #1059/#1060 |
+| [draft-ietf-privacypass-arc-crypto-01](https://datatracker.ietf.org/doc/html/draft-ietf-privacypass-arc-crypto-01), ARC Cryptography | Privacy Pass WG Internet-Draft, work in progress | anonymous-credential protocol shape, canonical encodings, vectors | Uses classical group assumptions; its security considerations describe quantum discrete-log linkability/partitioning | research/protocol input only; not the PQ leg |
+| [Post-Quantum Privacy Pass via Post-Quantum Anonymous Credentials](https://eprint.iacr.org/2023/414) | IACR ePrint research preprint | Privacy Pass-specific PQ anonymous-credential design and prototype | Calls the result plausibly PQ; the evaluated backend lacked zero knowledge, and the reference code warns it is unreviewed and not production ready | do not select; track research and implementation review |
+| [Improved Lattice Blind Signatures from Recycled Entropy](https://doi.org/10.1007/978-3-032-01855-7_16) | Peer-reviewed CRYPTO 2025 paper | reviewed lattice blind-signature candidate | No adopted CFRG/Privacy Pass profile, maintained interoperable implementation, fixed profile parameters/vectors, or exact AND-composition review | primitive candidate only; #1060 remains blocked |
+| [PoMFRIT](https://www.usenix.org/conference/usenixsecurity26/presentation/baum) | USENIX Security 2026 paper | implemented blind-signature research | Described as plausibly PQ, depends on MAYO/security variants, and has no reviewed Privacy Pass profile or this composition analysis | research only; do not select |
+| [Late binding with PQ privacy](https://datatracker.ietf.org/meeting/interim-2026-privacypass-01/materials/slides-interim-2026-privacypass-01-sessa-late-binding-with-pq-unlinkability-00) | Privacy Pass interim presentation, 2026-05-13 | separates PQ unlinkability from PQ unforgeability | Records classical credential forgery after quantum key recovery and no concrete bounds/end-to-end analysis for the proposed direction | confirms open research dependency |
 
 ## Explicit non-allocations
 
@@ -25,4 +30,8 @@ This scaffold is a local, pre-I-D implementation profile. `domain-separation.jso
 4. Can existing MOQT Objects plus standard authorization-token surfaces carry all relay needs, leaving private data inside encrypted payloads?
 5. What exact replay/spend, audit, ledger, and state-rollback behavior is needed before a restricted key release is safe?
 
-The answers block #1060/#1061 production crypto and restricted anonymous portions of #1062/#1063/#726/#554/#555. They do not block independently scoped identified stream/group work.
+The detailed 2026-07-17 evidence and selection bar are recorded in
+`construction-selection-audit.md`. No candidate cleared the complete bar. The
+answers therefore still block #1060/#1061 production crypto and restricted
+anonymous portions of #1062/#1063/#726/#554/#555. They do not block
+independently scoped identified stream/group work.
