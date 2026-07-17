@@ -28,7 +28,7 @@ pub use service::spawner::{
 };
 
 pub use service::factory::{
-    get_factory, list_factories, NativeAnnouncementPublisher,
+    deployment_data_dir, get_factory, list_factories, NativeAnnouncementPublisher,
     NativeAnnouncementRequest, NativeServiceAnnouncement, QuicSharedConfig, ServiceContext,
     ServiceFactory, ServiceFactoryFn,
 };

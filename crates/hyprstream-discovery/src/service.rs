@@ -905,20 +905,58 @@ impl DiscoveryService {
     ///     let _ = authority.clone();
     /// }
     /// ```
+    ///
+    /// ```compile_fail
+    /// use hyprstream_discovery::AuthenticatedDiscoveryBootstrap;
+    /// fn forge(
+    ///     store_path: std::path::PathBuf,
+    ///     acceptance_identity: ed25519_dalek::VerifyingKey,
+    /// ) -> AuthenticatedDiscoveryBootstrap {
+    ///     AuthenticatedDiscoveryBootstrap { seal: (), store_path, acceptance_identity }
+    /// }
+    /// ```
+    ///
+    /// The complete former public composition chain is unavailable to an
+    /// external crate.
+    /// ```compile_fail
+    /// use hyprstream_discovery::DiscoveryService;
+    /// use hyprstream_service::ServiceContext;
+    /// fn inject(context: ServiceContext, client: hyprstream_discovery::DiscoveryClient) {
+    ///     context.seal_discovery_bootstrap_authority().unwrap();
+    ///     let authority = context
+    ///         .consume_discovery_bootstrap_authority(|path, key| Ok((path.to_owned(), key)))
+    ///         .unwrap();
+    ///     DiscoveryService::install_process_bootstrap(&context, client).unwrap();
+    ///     drop(authority);
+    /// }
+    /// ```
     #[cfg(not(target_arch = "wasm32"))]
-    pub fn install_process_bootstrap(
-        context: &hyprstream_service::ServiceContext,
+    pub fn bootstrap_authenticated_process(
+        authority: AuthenticatedDiscoveryBootstrap,
         discovery_client: crate::DiscoveryClient,
     ) -> Result<()> {
-        let source: Arc<dyn AcceptedStateSource> =
-            context.consume_discovery_bootstrap_authority(|path, acceptance_identity| {
-                Ok(Arc::new(
-                    crate::checkpointed_pds::CheckpointedPdsAcceptedStateSource::open(
-                        path,
-                        acceptance_identity,
-                    )?,
-                ) as Arc<dyn AcceptedStateSource>)
-            })?;
+        let authority = {
+            let mut state = PROCESS_BOOTSTRAP_AUTHORITY.lock();
+            match std::mem::replace(&mut *state, ProcessBootstrapAuthorityState::Consumed) {
+                ProcessBootstrapAuthorityState::Sealed => {}
+                previous => {
+                    *state = previous;
+                    anyhow::bail!("authenticated Discovery bootstrap is unavailable or consumed");
+                }
+            }
+            let AuthenticatedDiscoveryBootstrap {
+                seal: (),
+                store_path,
+                acceptance_identity,
+            } = authority;
+            ProcessBootstrapAuthority { store_path, acceptance_identity }
+        };
+        let source: Arc<dyn AcceptedStateSource> = Arc::new(
+            crate::checkpointed_pds::CheckpointedPdsAcceptedStateSource::open(
+                &authority.store_path,
+                authority.acceptance_identity,
+            )?,
+        );
         PROCESS_ACCEPTED_STATE_SOURCE
             .set(Arc::clone(&source))
             .map_err(|_| anyhow::anyhow!("process Discovery authority is already consumed"))?;
@@ -1158,6 +1196,50 @@ static PROCESS_ACCEPTED_STATE_SOURCE: std::sync::OnceLock<Arc<dyn AcceptedStateS
     std::sync::OnceLock::new();
 static PRODUCTION_RESOLVER: std::sync::OnceLock<Arc<DiscoveryServiceResolver>> =
     std::sync::OnceLock::new();
+
+struct ProcessBootstrapAuthority {
+    store_path: std::path::PathBuf,
+    acceptance_identity: VerifyingKey,
+}
+
+enum ProcessBootstrapAuthorityState {
+    Unsealed,
+    Sealed,
+    Consumed,
+}
+
+static PROCESS_BOOTSTRAP_AUTHORITY: parking_lot::Mutex<ProcessBootstrapAuthorityState> =
+    parking_lot::Mutex::new(ProcessBootstrapAuthorityState::Unsealed);
+
+/// Opaque proof that the fixed deployment store and authenticated registry
+/// identity were resolved by the real startup path. Its fields are private,
+/// it is neither cloneable nor serializable, and dropping it leaves the
+/// process bootstrap terminally sealed.
+#[cfg(not(target_arch = "wasm32"))]
+pub struct AuthenticatedDiscoveryBootstrap {
+    seal: (),
+    store_path: std::path::PathBuf,
+    acceptance_identity: VerifyingKey,
+}
+
+/// Authenticate and seal the process Discovery bootstrap authority.
+///
+/// This is the only public mint for [`AuthenticatedDiscoveryBootstrap`]. It
+/// accepts no context, path, key, callback, or other caller-selected authority.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn authenticate_discovery_bootstrap() -> Result<AuthenticatedDiscoveryBootstrap> {
+    let mut state = PROCESS_BOOTSTRAP_AUTHORITY.lock();
+    anyhow::ensure!(
+        matches!(*state, ProcessBootstrapAuthorityState::Unsealed),
+        "Discovery bootstrap authority is already sealed or consumed"
+    );
+    let store_path = hyprstream_service::deployment_data_dir()?.join("pds-store");
+    let acceptance_identity = hyprstream_service::global_trust_store()
+        .resolve_one("registry")
+        .ok_or_else(|| anyhow::anyhow!("trust store has no authenticated registry key"))?;
+    *state = ProcessBootstrapAuthorityState::Sealed;
+    Ok(AuthenticatedDiscoveryBootstrap { seal: (), store_path, acceptance_identity })
+}
 
 /// Construct an ordinary production RPC client. Production authority cannot
 /// be implemented, injected, or replaced by a downstream caller.
@@ -1501,6 +1583,45 @@ mod resolver_tests {
     use hyprstream_pds::at9p_duplicity::AcceptedAt9pState;
     use hyprstream_pds::at9p_sign::{sign_capsule, sign_update_record};
     use hyprstream_rpc::transport::{BindMode, EndpointType};
+
+    #[test]
+    fn production_authority_api_inventory_has_no_public_composition_chain() {
+        let service_factory = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../hyprstream-service/src/service/factory.rs"
+        ));
+        for forbidden in [
+            "pub fn seal_discovery_bootstrap_authority",
+            "pub fn consume_discovery_bootstrap_authority",
+            "struct DiscoveryBootstrapAuthority",
+            "discovery_authority:",
+        ] {
+            assert!(!service_factory.contains(forbidden), "authority seam returned: {forbidden}");
+        }
+        let discovery = include_str!("service.rs");
+        assert!(!discovery.contains("\n    pub fn install_process_bootstrap("));
+        assert!(discovery.contains("struct ProcessBootstrapAuthority {"));
+        assert!(discovery.contains("enum ProcessBootstrapAuthorityState {"));
+        let authentication = discovery
+            .split("pub fn authenticate_discovery_bootstrap()")
+            .nth(1)
+            .expect("authenticated bootstrap entrypoint")
+            .split("/// Construct an ordinary production RPC client")
+            .next()
+            .expect("authentication body");
+        assert!(authentication.contains("hyprstream_service::deployment_data_dir()"));
+        assert!(authentication.contains("global_trust_store()"));
+        assert!(!authentication.contains("ServiceContext"));
+        assert!(!authentication.contains("FnOnce"));
+        let capability = discovery
+            .split("pub struct AuthenticatedDiscoveryBootstrap {")
+            .nth(1)
+            .expect("opaque capability")
+            .split('}')
+            .next()
+            .expect("capability fields");
+        assert!(!capability.contains("pub "));
+    }
 
     fn service() -> DiscoveryService {
         let (sk, vk) = hyprstream_rpc::crypto::generate_signing_keypair();
@@ -1869,32 +1990,34 @@ mod resolver_tests {
     fn process_bootstrap_precedes_first_generated_client() {
         const CHILD: &str = "HYPRSTREAM_TEST_RESOLVER_BOOTSTRAP_CHILD";
         if std::env::var_os(CHILD).is_some() {
-            let models = tempfile::tempdir().expect("service-owned data root");
-            let store = models.path().join(".registry/pds-store");
+            let store = hyprstream_service::deployment_data_dir()
+                .expect("deployment-owned data root")
+                .join("pds-store");
             std::fs::create_dir_all(&store).expect("checkpoint store directory");
             drop(rocksdb::DB::open_default(&store).expect("empty checkpoint store"));
             let signing = SigningKey::from_bytes(&[0x47; 32]);
-            let context = hyprstream_service::ServiceContext::new(
-                signing.clone(),
+            hyprstream_service::global_trust_store().insert(
                 signing.verifying_key(),
-                false,
-                models.path().to_owned(),
+                hyprstream_service::Attestation {
+                    scopes: std::iter::once("registry".to_owned()).collect(),
+                    subject: None,
+                    jwt: None,
+                    expires_at: 0,
+                    attested_by: None,
+                },
             );
-            context
-                .seal_discovery_bootstrap_authority()
-                .expect("seal process authority");
-            DiscoveryService::install_process_bootstrap(
-                &context,
+            let authority = authenticate_discovery_bootstrap()
+                .expect("authenticate process resolver");
+            DiscoveryService::bootstrap_authenticated_process(
+                authority,
                 crate::DiscoveryClient::new(Arc::new(NoopBootstrapClient)),
             )
             .expect("install process resolver");
             assert!(production_rpc_client("model", signing, None).is_ok());
-            assert!(context.seal_discovery_bootstrap_authority().is_err());
-            assert!(context
-                .consume_discovery_bootstrap_authority(|_, _| Ok(()))
-                .is_err());
+            assert!(authenticate_discovery_bootstrap().is_err());
             return;
         }
+        let deployment = tempfile::tempdir().expect("deployment data root");
         let status = std::process::Command::new(
             std::env::current_exe().expect("discovery test executable"),
         )
@@ -1902,9 +2025,102 @@ mod resolver_tests {
         .arg("service::resolver_tests::process_bootstrap_precedes_first_generated_client")
         .arg("--nocapture")
         .env(CHILD, "1")
+        .env("XDG_DATA_HOME", deployment.path())
         .status()
         .expect("resolver bootstrap subprocess");
         assert!(status.success(), "resolver bootstrap subprocess failed");
+    }
+
+    fn seed_registry_for_bootstrap(tag: u8) {
+        let registry = SigningKey::from_bytes(&[tag; 32]);
+        hyprstream_service::global_trust_store().insert(
+            registry.verifying_key(),
+            hyprstream_service::Attestation {
+                scopes: std::iter::once("registry".to_owned()).collect(),
+                subject: None,
+                jwt: None,
+                expires_at: 0,
+                attested_by: None,
+            },
+        );
+    }
+
+    #[test]
+    fn authenticated_process_bootstrap_has_exactly_one_concurrent_consumer() {
+        const CHILD: &str = "HYPRSTREAM_TEST_RESOLVER_CONCURRENT_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let store = hyprstream_service::deployment_data_dir().unwrap().join("pds-store");
+            std::fs::create_dir_all(&store).unwrap();
+            drop(rocksdb::DB::open_default(&store).unwrap());
+            seed_registry_for_bootstrap(0x48);
+            let barrier = Arc::new(std::sync::Barrier::new(9));
+            let attempts: Vec<_> = (0..8)
+                .map(|_| {
+                    let barrier = Arc::clone(&barrier);
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        authenticate_discovery_bootstrap().and_then(|authority| {
+                            DiscoveryService::bootstrap_authenticated_process(
+                                authority,
+                                crate::DiscoveryClient::new(Arc::new(NoopBootstrapClient)),
+                            )
+                        }).is_ok()
+                    })
+                })
+                .collect();
+            barrier.wait();
+            assert_eq!(
+                attempts
+                    .into_iter()
+                    .map(|attempt| attempt.join().unwrap())
+                    .filter(|installed| *installed)
+                    .count(),
+                1
+            );
+            return;
+        }
+        let deployment = tempfile::tempdir().unwrap();
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("service::resolver_tests::authenticated_process_bootstrap_has_exactly_one_concurrent_consumer")
+            .arg("--nocapture")
+            .env(CHILD, "1")
+            .env("XDG_DATA_HOME", deployment.path())
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+
+    #[test]
+    fn authenticated_process_bootstrap_failure_is_terminal() {
+        const CHILD: &str = "HYPRSTREAM_TEST_RESOLVER_FAILURE_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            seed_registry_for_bootstrap(0x49);
+            let authority = authenticate_discovery_bootstrap().unwrap();
+            let first = DiscoveryService::bootstrap_authenticated_process(
+                authority,
+                crate::DiscoveryClient::new(Arc::new(NoopBootstrapClient)),
+            ).expect_err("missing checkpoint store unexpectedly installed");
+            assert!(first.to_string().contains("failed to open"));
+            let store = hyprstream_service::deployment_data_dir().unwrap().join("pds-store");
+            std::fs::create_dir_all(&store).unwrap();
+            drop(rocksdb::DB::open_default(&store).unwrap());
+            let second = authenticate_discovery_bootstrap()
+                .err()
+                .expect("failed bootstrap authority was replayed");
+            assert!(second.to_string().contains("already sealed or consumed"));
+            return;
+        }
+        let deployment = tempfile::tempdir().unwrap();
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("service::resolver_tests::authenticated_process_bootstrap_failure_is_terminal")
+            .arg("--nocapture")
+            .env(CHILD, "1")
+            .env("XDG_DATA_HOME", deployment.path())
+            .status()
+            .unwrap();
+        assert!(status.success());
     }
 
     #[tokio::test]

@@ -1419,11 +1419,11 @@ fn resolve_service_vk(service_name: &str) -> Option<VerifyingKey> {
 }
 
 /// Install this process's checkpoint-backed resolver before any ordinary
-/// generated client can be constructed. The context fixes the canonical store
-/// and authenticated registry identity; the Discovery bootstrap dial is local
+/// generated client can be constructed. Discovery derives and consumes the
+/// deployment-owned store plus authenticated registry identity internally;
+/// the public factory context supplies neither. The bootstrap dial is local
 /// only and supplies candidate announcements, never resolution authority.
 fn install_process_production_resolver(ctx: &ServiceContext) -> Result<()> {
-    ctx.seal_discovery_bootstrap_authority()?;
     let discovery_vk = hyprstream_service::global_trust_store()
         .resolve_one("discovery")
         .ok_or_else(|| anyhow::anyhow!("trust store has no authenticated discovery key"))?;
@@ -1432,8 +1432,9 @@ fn install_process_production_resolver(ctx: &ServiceContext) -> Result<()> {
         discovery_vk,
         None,
     )?;
-    hyprstream_discovery::DiscoveryService::install_process_bootstrap(
-        ctx,
+    let authority = hyprstream_discovery::authenticate_discovery_bootstrap()?;
+    hyprstream_discovery::DiscoveryService::bootstrap_authenticated_process(
+        authority,
         discovery_client,
     )
 }
@@ -2211,8 +2212,8 @@ fn main() -> Result<()> {
                                     }
                                 }
 
-                                // Consume and install this process's authority before any inventory
-                                // factory or downstream plugin can run.
+                                // Authenticate and install this process's authority before any
+                                // inventory factory or downstream plugin can run.
                                 install_process_production_resolver(&ctx)?;
 
                                 // Wire QUIC shared config (must be after key generation so jwt_verifying_key is set)
@@ -2839,7 +2840,7 @@ mod resolver_startup_controls {
         assert!(command_install < command_dispatch);
 
         let service_bootstrap = source
-            .find("// Consume and install this process's authority")
+            .find("// Authenticate and install this process's authority")
             .expect("service-process bootstrap marker");
         let first_factory = source[service_bootstrap..]
             .find("get_factory(")

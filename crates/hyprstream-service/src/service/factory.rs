@@ -33,20 +33,6 @@ use crate::service::spawner::Spawnable;
 use hyprstream_rpc::registry::{global as global_registry, SocketKind};
 use hyprstream_rpc::transport::TransportConfig;
 
-/// One-shot, non-cloneable witness for installing the production Discovery
-/// authority. Only [`ServiceContext`] can mint it, from the authenticated
-/// application identity and its canonical service-owned data directory.
-struct DiscoveryBootstrapAuthority {
-    store_path: std::path::PathBuf,
-    acceptance_identity: VerifyingKey,
-}
-
-enum DiscoveryAuthorityState {
-    Unsealed,
-    Sealed(Box<DiscoveryBootstrapAuthority>),
-    Consumed,
-}
-
 /// Complete, already-validated native announcement ready for publication.
 pub struct NativeAnnouncementRequest {
     pub service_name: String,
@@ -357,10 +343,6 @@ pub struct ServiceContext {
     /// Models directory path
     models_dir: std::path::PathBuf,
 
-    /// One-shot production authority latch. Interior mutability is required
-    /// because inventory factories receive a shared context.
-    discovery_authority: parking_lot::Mutex<DiscoveryAuthorityState>,
-
     /// Shared QUIC/WebTransport config (TLS materials + base settings).
     /// Per-service ports are resolved via `into_spawnable_quic()`.
     quic_shared: Option<QuicSharedConfig>,
@@ -419,7 +401,6 @@ impl ServiceContext {
             identity_provider,
             ipc,
             models_dir,
-            discovery_authority: parking_lot::Mutex::new(DiscoveryAuthorityState::Unsealed),
             quic_shared: None,
             oauth_issuer_url: None,
             federation_key_source: None,
@@ -770,69 +751,13 @@ impl ServiceContext {
         &self.models_dir
     }
 
-    /// Canonical service-owned deployment directory. It is derived from the
-    /// authenticated application's registry root, never from PDS-specific
-    /// configuration or process environment.
+    /// Canonical service-owned deployment directory.
+    ///
+    /// This deliberately ignores the caller-provided `models_dir`: public
+    /// `ServiceContext::new` creates local/factory context only and cannot
+    /// select the production Discovery authority root.
     pub fn deployment_data_dir(&self) -> anyhow::Result<std::path::PathBuf> {
-        Ok(self
-            .models_dir
-            .canonicalize()
-            .map_err(|error| {
-                anyhow::anyhow!("canonical service data root is unavailable: {error}")
-            })?
-            .join(".registry"))
-    }
-
-    /// Seal the sole production Discovery authority immediately after the
-    /// deployment credentials have been authenticated and before any service
-    /// factory or plugin is invoked.
-    pub fn seal_discovery_bootstrap_authority(&self) -> anyhow::Result<()> {
-        let mut slot = self.discovery_authority.lock();
-        anyhow::ensure!(
-            matches!(*slot, DiscoveryAuthorityState::Unsealed),
-            "Discovery bootstrap authority is already sealed or consumed"
-        );
-        let acceptance_identity = if self.ipc {
-            crate::service::trust_store::global_trust_store()
-                .resolve_one("registry")
-                .ok_or_else(|| anyhow::anyhow!("trust store has no authenticated registry key"))?
-        } else {
-            self.verifying_key
-        };
-        let store_path = self.deployment_data_dir()?.join("pds-store");
-        anyhow::ensure!(
-            store_path.is_absolute(),
-            "service-owned PDS path must be absolute"
-        );
-        *slot = DiscoveryAuthorityState::Sealed(Box::new(DiscoveryBootstrapAuthority {
-            store_path,
-            acceptance_identity,
-        }));
-        Ok(())
-    }
-
-    /// Consume the pre-sealed authority inside one terminal operation. The
-    /// opaque witness is never returned or nameable outside this crate, and
-    /// the state becomes `Consumed` before the callback runs (including when
-    /// the callback fails).
-    #[doc(hidden)]
-    pub fn consume_discovery_bootstrap_authority<T>(
-        &self,
-        consume: impl FnOnce(&std::path::Path, VerifyingKey) -> anyhow::Result<T>,
-    ) -> anyhow::Result<T> {
-        let mut slot = self.discovery_authority.lock();
-        match std::mem::replace(&mut *slot, DiscoveryAuthorityState::Consumed) {
-            DiscoveryAuthorityState::Sealed(authority) => {
-                drop(slot);
-                consume(&authority.store_path, authority.acceptance_identity)
-            }
-            state => {
-                *slot = state;
-                Err(anyhow::anyhow!(
-                    "Discovery bootstrap authority is unavailable or already consumed"
-                ))
-            }
-        }
+        deployment_data_dir()
     }
 
     /// Get transport config for a service endpoint from the registry.
@@ -924,6 +849,16 @@ impl ServiceContext {
     ) -> Box<dyn Spawnable> {
         self.into_spawnable_quic(service, None)
     }
+}
+
+/// Deployment-owned registry directory shared by the checkpoint writer and
+/// authenticated process bootstrap. No caller-provided context or path can
+/// influence this value.
+pub fn deployment_data_dir() -> anyhow::Result<std::path::PathBuf> {
+    let data_dir = hyprstream_rpc::paths::data_dir()
+        .ok_or_else(|| anyhow::anyhow!("deployment data directory is unavailable"))?;
+    anyhow::ensure!(data_dir.is_absolute(), "deployment data directory must be absolute");
+    Ok(data_dir.join("models/.registry"))
 }
 
 // ServiceClient trait removed — generated clients use Arc<dyn RpcClient> directly.
@@ -1085,74 +1020,46 @@ mod tests {
     }
 
     #[test]
-    fn production_authority_ignores_ambient_pair() {
+    fn public_context_cannot_select_production_authority() {
         const CHILD: &str = "HYPRSTREAM_TEST_AUTHORITY_CHILD";
-        const MODELS: &str = "HYPRSTREAM_TEST_AUTHORITY_MODELS";
+        const EXPECTED: &str = "HYPRSTREAM_TEST_AUTHORITY_EXPECTED";
         if std::env::var_os(CHILD).is_some() {
-            let models = std::path::PathBuf::from(std::env::var_os(MODELS).expect("models root"));
-            let application = SigningKey::from_bytes(&[0x71; 32]);
-            let context = ServiceContext::new(
-                application.clone(),
-                application.verifying_key(),
+            let expected = std::path::PathBuf::from(
+                std::env::var_os(EXPECTED).expect("deployment-owned expected path"),
+            );
+            let first = SigningKey::from_bytes(&[0x71; 32]);
+            let second = SigningKey::from_bytes(&[0x73; 32]);
+            let caller_one = tempfile::tempdir().expect("caller models one");
+            let caller_two = tempfile::tempdir().expect("caller models two");
+            let local_one = ServiceContext::new(
+                first.clone(),
+                first.verifying_key(),
                 false,
-                models.clone(),
+                caller_one.path().to_owned(),
             );
-            context
-                .seal_discovery_bootstrap_authority()
-                .expect("seal trusted startup authority");
-            assert!(context.seal_discovery_bootstrap_authority().is_err());
-            let (path, identity) = context
-                .consume_discovery_bootstrap_authority(|path, identity| {
-                    Ok((path.to_owned(), identity))
-                })
-                .expect("trusted startup authority");
-            assert_eq!(
-                path,
-                models.canonicalize().unwrap().join(".registry/pds-store")
-            );
-            assert_eq!(identity, application.verifying_key());
-            assert!(context
-                .consume_discovery_bootstrap_authority(|_, _| Ok(()))
-                .is_err());
-            assert!(context.seal_discovery_bootstrap_authority().is_err());
-
-            let registry = SigningKey::from_bytes(&[0x73; 32]);
-            crate::service::trust_store::global_trust_store().insert(
-                registry.verifying_key(),
-                crate::service::trust_store::Attestation {
-                    scopes: std::iter::once("registry".to_owned()).collect(),
-                    subject: None,
-                    jwt: None,
-                    expires_at: 0,
-                    attested_by: None,
-                },
-            );
-            let discovery = SigningKey::from_bytes(&[0x74; 32]);
-            let ipc_context = ServiceContext::new(
-                discovery.clone(),
-                discovery.verifying_key(),
+            let local_two = ServiceContext::new(
+                second.clone(),
+                second.verifying_key(),
                 true,
-                models,
+                caller_two.path().to_owned(),
             );
-            ipc_context
-                .seal_discovery_bootstrap_authority()
-                .expect("seal authenticated registry authority");
-            let ipc_identity = ipc_context
-                .consume_discovery_bootstrap_authority(|_, identity| Ok(identity))
-                .expect("authenticated registry authority");
-            assert_eq!(ipc_identity, registry.verifying_key());
+            assert_eq!(local_one.deployment_data_dir().unwrap(), expected);
+            assert_eq!(local_two.deployment_data_dir().unwrap(), expected);
+            assert_ne!(local_one.models_dir(), local_two.models_dir());
             return;
         }
 
-        let models = tempfile::tempdir().expect("service-owned data root");
+        let deployment = tempfile::tempdir().expect("deployment data root");
         let caller_store = tempfile::tempdir().expect("caller store");
         let caller = SigningKey::from_bytes(&[0x72; 32]);
+        let expected = deployment.path().join("hyprstream/models/.registry");
         let status = std::process::Command::new(std::env::current_exe().expect("test executable"))
             .arg("--exact")
-            .arg("service::factory::tests::production_authority_ignores_ambient_pair")
+            .arg("service::factory::tests::public_context_cannot_select_production_authority")
             .arg("--nocapture")
             .env(CHILD, "1")
-            .env(MODELS, models.path())
+            .env(EXPECTED, &expected)
+            .env("XDG_DATA_HOME", deployment.path())
             .env("HYPRSTREAM__PDS__STORE_PATH", caller_store.path())
             .env(
                 "HYPRSTREAM__PDS__ACCEPTANCE_IDENTITY",
@@ -1161,45 +1068,5 @@ mod tests {
             .status()
             .expect("authority mutation subprocess");
         assert!(status.success(), "authority mutation subprocess failed");
-    }
-
-    #[test]
-    fn production_authority_has_exactly_one_concurrent_consumer() {
-        let models = tempfile::tempdir().expect("service-owned data root");
-        let application = SigningKey::from_bytes(&[0x75; 32]);
-        let context = Arc::new(ServiceContext::new(
-            application.clone(),
-            application.verifying_key(),
-            false,
-            models.path().to_owned(),
-        ));
-        context
-            .seal_discovery_bootstrap_authority()
-            .expect("seal authority");
-        let barrier = Arc::new(std::sync::Barrier::new(9));
-        let mut attempts = Vec::new();
-        for _ in 0..8 {
-            let context = Arc::clone(&context);
-            let barrier = Arc::clone(&barrier);
-            attempts.push(std::thread::spawn(move || {
-                barrier.wait();
-                context
-                    .consume_discovery_bootstrap_authority(|_, _| Ok(()))
-                    .is_ok()
-            }));
-        }
-        barrier.wait();
-        assert_eq!(
-            attempts
-                .into_iter()
-                .map(|attempt| attempt.join().expect("consumer thread"))
-                .filter(|consumed| *consumed)
-                .count(),
-            1
-        );
-        assert!(context
-            .consume_discovery_bootstrap_authority(|_, _| Ok(()))
-            .is_err());
-        assert!(context.seal_discovery_bootstrap_authority().is_err());
     }
 }
