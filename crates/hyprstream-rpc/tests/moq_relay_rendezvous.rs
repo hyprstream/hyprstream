@@ -93,7 +93,7 @@ async fn moq_relay_rendezvous() -> Result<()> {
     let relay_task = tokio::spawn(relay_rpc.run());
 
     // The producer-advertised relay reach (this is exactly the `Role::Relay`
-    // Destination `producer_reach()` emits when a relay is configured).
+    // Destination `ProducerReachConfig::reach()` emits when a relay is configured).
     let relay_pin = cert_sha256(&relay_cert);
     let relay_reach = ReachTransport::Quic(QuicReach {
         addr: relay_addr.to_string(),

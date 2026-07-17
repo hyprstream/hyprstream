@@ -380,7 +380,8 @@ impl InferenceService {
         };
 
         // Create StreamChannel upfront.
-        let stream_channel = StreamChannel::new(signing_key.clone());
+        let stream_channel = StreamChannel::new(signing_key.clone())
+            .with_reach_config(hyprstream_rpc::moq_stream::ProducerReachConfig::default());
 
         Ok(InferenceService {
             inner: Arc::new(InferenceServiceInner {

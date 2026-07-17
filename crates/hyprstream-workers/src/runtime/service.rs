@@ -147,7 +147,10 @@ impl WorkerService {
         // Create event publisher for worker lifecycle events
         let event_publisher = EventPublisher::new("worker")?;
 
-        let stream_channel = Arc::new(StreamChannel::new(signing_key.clone()));
+        let stream_channel = Arc::new(
+            StreamChannel::new(signing_key.clone())
+                .with_reach_config(hyprstream_rpc::moq_stream::ProducerReachConfig::default()),
+        );
         Ok(Self {
             sandbox_pool,
             image_store,
@@ -1417,6 +1420,10 @@ impl WorkerHandler for WorkerService {
 
 #[async_trait(?Send)]
 impl RequestService for WorkerService {
+    fn producer_reach_config_handle(&self) -> Option<hyprstream_rpc::moq_stream::ProducerReachConfigHandle> {
+        Some(self.stream_channel.reach_config_handle())
+    }
+
     async fn handle_request(&self, ctx: &EnvelopeContext, payload: &[u8]) -> AnyhowResult<(Vec<u8>, Option<hyprstream_rpc::service::Continuation>)> {
         debug!(
             "Worker request from {} (request_id={})",

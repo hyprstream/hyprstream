@@ -51,7 +51,7 @@ use std::sync::{Arc, OnceLock};
 use anyhow::{anyhow, ensure, Context, Result};
 use bytes::Bytes;
 use moq_net::{BroadcastProducer, Group, OriginConsumer, OriginProducer, Track, TrackProducer};
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
 
 use crate::crypto::StreamHmacState;
@@ -92,21 +92,7 @@ pub fn global_moq_uds_path() -> Option<&'static Path> {
     GLOBAL_MOQ_UDS_PATH.get().map(PathBuf::as_path)
 }
 
-// ============================================================================
-// Process-global producer reach (#274) — the network-routable way external
-// subscribers reach this node's moq plane. Set once when the QUIC /
-// web_transport_quinn server binds; read by every StreamInfo producer site so
-// the `reach` field is built from ONE source (no per-site assembly, no drift),
-// the same Rust value `root_did_document()` uses for its QuicTransport entry.
-// ============================================================================
-
-/// The node's network-routable moq reach: the bound QUIC address, its TLS
-/// server name, and the leaf-cert SHA-256 pins. `None` until the daemon binds
-/// its `web_transport_quinn` server (UDS-only / unit-test deployments).
-static GLOBAL_PRODUCER_REACH: OnceLock<NodeStreamReach> = OnceLock::new();
-
-/// The node's own moq reach parameters — the single source for the `reach`
-/// list every StreamInfo producer publishes.
+/// Bound QUIC reach for one service's MoQ producer.
 #[derive(Clone, Debug)]
 pub struct NodeStreamReach {
     /// Bound socket address external subscribers dial (`/moq` over WebTransport).
@@ -117,118 +103,8 @@ pub struct NodeStreamReach {
     pub cert_hashes: Vec<[u8; 32]>,
 }
 
-/// Register the node's network-routable moq reach (idempotent — first wins).
-///
-/// Called once when the daemon binds its `web_transport_quinn` server, with the
-/// same `(addr, server_name, cert_hash)` the RPC endpoint registers and the
-/// DID-doc `#quic` entry advertises.
-pub fn init_global_producer_reach(reach: NodeStreamReach) -> bool {
-    GLOBAL_PRODUCER_REACH.set(reach).is_ok()
-}
-
-/// Borrow the node's registered network reach, if the QUIC server is bound.
-pub fn global_producer_reach() -> Option<&'static NodeStreamReach> {
-    GLOBAL_PRODUCER_REACH.get()
-}
-
-/// The node's own iroh `EndpointId` (Ed25519 public key) once the iroh substrate
-/// is bound (#357). Registered separately from [`GLOBAL_PRODUCER_REACH`] because
-/// the QUIC reach is set when the quinn server binds, whereas iroh binds slightly
-/// later in the same bootstrap; folding it back into the first-wins
-/// [`NodeStreamReach`] would require reordering the bind sequence.
-static GLOBAL_IROH_NODE_ID: OnceLock<[u8; 32]> = OnceLock::new();
-
-/// Register the node's iroh `EndpointId` so [`producer_reach`] can advertise an
-/// iroh-direct [`Destination`] for native peers (#357). Idempotent (first wins).
-///
-/// Called once when the daemon binds its iroh substrate (the `node_id` ==
-/// `signing_key.verifying_key()`, already covered by the node's DID).
-pub fn init_global_iroh_node_id(node_id: [u8; 32]) -> bool {
-    GLOBAL_IROH_NODE_ID.set(node_id).is_ok()
-}
-
-/// Borrow the node's registered iroh `EndpointId`, if the iroh substrate is bound.
-pub fn global_iroh_node_id() -> Option<&'static [u8; 32]> {
-    GLOBAL_IROH_NODE_ID.get()
-}
-
-// ============================================================================
-// Process-global producer-chosen moq RELAY (#358) — the rendezvous endpoint a
-// producing service advertises so that NEITHER the publisher NOR the subscriber
-// must be directly reachable by the other: both rendezvous through this relay.
-//
-// The relay is *producer-chosen* (default = the service's PDS / federation
-// anchor) and set once when the producing node learns its relay. It is the
-// network-routable `TransportConfig` of the relay's moq plane — the SAME codec
-// the DID document's transport `service` entries use ([`crate::service_entry`]),
-// so the advertised stream relay and the DID transport address never drift.
-//
-// The relay carries AEAD-sealed ciphertext it cannot read (the `enc_key` /
-// `TaggedPayload` path seals at source) and never holds the `mac_key` /
-// `enc_key`: it is blind by construction, not by trust. Per-PDS, shared, and
-// oblivious relays are therefore all safe for content confidentiality.
-// ============================================================================
-
-/// The producer-chosen moq relay this node rendezvouses through (#358).
-///
-/// Held as the wire-form [`crate::stream_info::TransportConfig`] (the reach
-/// codec), so the SAME value is both advertised verbatim in `StreamInfo.reach`
-/// and dialed (via the shared [`reach_to_transport_config`] resolver) by the
-/// relay client — no per-site assembly, no drift between the advertised stream
-/// relay and the dialed one.
-///
-/// `None` until the node is configured with a relay (no relay = direct-only
-/// advertisement, the S1/S2 behaviour). The default deployment co-locates this
-/// with the node's `#atproto_pds` DID service entry where the node is the PDS.
-static GLOBAL_RELAY_REACH: OnceLock<crate::stream_info::TransportConfig> = OnceLock::new();
-
-/// Register the producer-chosen moq relay endpoint (idempotent — first wins).
-///
-/// `relay` is the relay's network-routable transport in wire-reach form
-/// ([`crate::stream_info::TransportConfig`] — Quic / WebTransport or iroh). A
-/// node sources this from its resolved DID transport entry decoded by the SAME
-/// [`crate::service_entry`] codec the DID document uses (default: the PDS /
-/// federation anchor), never hand-assembled — see [`relay_reach_from_decoded`].
-///
-/// After this is set, [`producer_reach`] advertises a `Role::Relay`
-/// [`Destination`] and [`serve_origin_to_relay_background`] should be spawned to
-/// announce this node's broadcasts UP to the relay.
-pub fn init_global_relay_reach(relay: crate::stream_info::TransportConfig) -> bool {
-    GLOBAL_RELAY_REACH.set(relay).is_ok()
-}
-
-/// Borrow the producer-chosen relay endpoint (wire-reach form), if configured.
-pub fn global_relay_reach() -> Option<&'static crate::stream_info::TransportConfig> {
-    GLOBAL_RELAY_REACH.get()
-}
-
-// ============================================================================
-// Per-server reach context (#384) — de-singletonize GLOBAL_RELAY_REACH.
-//
-// Relay/reach choice is logically PER-STREAM, but was historically wired
-// PER-PROCESS through three `OnceLock` singletons (`GLOBAL_IROH_NODE_ID`,
-// `GLOBAL_PRODUCER_REACH`, `GLOBAL_RELAY_REACH`). That granularity prevented a
-// relay-only-anonymized stream X from coexisting with a direct stream Y in the
-// same process, blocked per-tenant relay isolation, and the first-write-wins
-// `OnceLock` semantics silently clobbered later writes.
-//
-// [`ProducerReachConfig`] carries the node/server's reach inputs as plain,
-// `Clone` config data (trivially `Send + Sync`). The reach list is built by its
-// [`ProducerReachConfig::reach`] METHOD reading its OWN fields — never process
-// globals. A per-stream relay override
-// ([`ProducerReachConfig::reach_with_relay`]) lets one stream pick a different
-// relay (or go relay-only / anonymized) while another in the same process stays
-// direct — the heterogeneous-anonymization property #384 requires.
-//
-// The process globals remain ONLY as a populated-once compatibility source for
-// the deprecated free-function [`producer_reach`]; new code threads a
-// `ProducerReachConfig` (see [`global_reach_config`]). (Tier 3 — scheduled
-// relay selection — is deliberately not built but not structurally precluded:
-// a scheduler can simply hand a per-stream override to `reach_with_relay`.)
-// ============================================================================
-
 /// A node/server's moq reach inputs (#384) — the per-server context that builds
-/// a producer's `StreamInfo.reach`, replacing the three `OnceLock` singletons.
+/// a producer's `StreamInfo.reach`.
 ///
 /// Plain config data (`Clone`, `Send + Sync`). The common-case relay is a
 /// server-global value (often an anycast PDS / federation-anchor address)
@@ -248,6 +124,10 @@ pub struct ProducerReachConfig {
     /// override may supersede this for an individual stream.
     pub relay: Option<crate::stream_info::TransportConfig>,
 }
+
+/// Mutable per-service reach source. The service spawner fills it with the
+/// actual QUIC and iroh bind results before the service accepts requests.
+pub type ProducerReachConfigHandle = Arc<RwLock<ProducerReachConfig>>;
 
 impl ProducerReachConfig {
     /// Build this server's `StreamInfo.reach` using its server-global relay.
@@ -361,32 +241,6 @@ pub enum RelayChoice {
     NoRelay,
 }
 
-/// Snapshot the process globals into a [`ProducerReachConfig`] (#384 compat).
-///
-/// Bridges the deprecated [`producer_reach`] free function (and call sites not
-/// yet threaded with a `ProducerReachConfig`) to the per-server context. New
-/// code should thread an explicit [`ProducerReachConfig`] instead — this reads
-/// the `OnceLock` singletons whose first-write-wins clobbering #384 removes.
-pub fn global_reach_config() -> ProducerReachConfig {
-    ProducerReachConfig {
-        iroh_node_id: global_iroh_node_id().copied(),
-        quic_reach: global_producer_reach().cloned(),
-        relay: global_relay_reach().cloned(),
-    }
-}
-
-/// Build the `StreamInfo.reach` list for a producer on this node (#274).
-///
-/// **Deprecated (#384):** reads the process-global `OnceLock` singletons, which
-/// cannot express per-stream / per-tenant relay choice and clobber on a second
-/// write. New code should construct a [`ProducerReachConfig`] (threaded from the
-/// daemon bind site) and call [`ProducerReachConfig::reach`] /
-/// [`ProducerReachConfig::reach_with_relay`]. Retained as a thin compatibility
-/// shim over [`global_reach_config`] for call sites not yet threaded.
-pub fn producer_reach() -> Vec<crate::stream_info::Destination> {
-    global_reach_config().reach()
-}
-
 /// Build the producer-chosen relay's wire-reach [`crate::stream_info::TransportConfig`]
 /// from a DID-document transport entry decoded by [`crate::service_entry`] (#358).
 ///
@@ -394,7 +248,7 @@ pub fn producer_reach() -> Vec<crate::stream_info::Destination> {
 /// address from drifting: a node resolves its relay's DID service entry (default
 /// `#atproto_pds`), decodes it with the shared [`crate::service_entry::decode_service_entry`]
 /// codec, and passes the resulting [`crate::transport::TransportConfig`] here to
-/// obtain the wire-reach form to register via [`init_global_relay_reach`].
+/// obtain the wire-reach form to place in a [`ProducerReachConfig`].
 ///
 /// Returns `None` for same-host transports (`ipc`/`inproc`/`systemd-fd`), which
 /// are never network-routable relay endpoints.
@@ -1768,8 +1622,8 @@ fn assert_relay_path_pinned(cfg: &crate::transport::TransportConfig) -> Result<(
 /// holds the session open, and reconnects on failure. The task runs for the
 /// process lifetime.
 ///
-/// Called once by the producing service's factory after [`init_global_relay_reach`]
-/// — typically with `global_moq_origin().producer()`. No-op-safe to omit when the
+/// Called by the producing service after its relay reach is configured —
+/// typically with `global_moq_origin().producer()`. No-op-safe to omit when the
 /// node has no relay (direct-only deployments).
 pub fn serve_origin_to_relay_background(
     producer: OriginProducer,
@@ -2647,7 +2501,7 @@ mod tests {
         use crate::transport::EndpointType;
 
         let node_id = [0x7u8; 32];
-        // This is exactly the Destination `producer_reach()` emits for the iroh arm.
+        // This is exactly the Destination `ProducerReachConfig::reach()` emits for iroh.
         let reach = Destination {
             role: Role::Direct,
             transport: ReachTransport::Iroh(IrohReach {
