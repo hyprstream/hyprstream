@@ -33,10 +33,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Compute immutable tag (Dockerfile content hash)
+      - name: Compute immutable tag (hash of all image inputs)
         id: tag
         run: |
-          h=$(git hash-object Dockerfile | cut -c1-12)
+          # Hash every input that affects image contents so the tag stays
+          # content-addressed: the Dockerfile AND rust-toolchain.toml (COPYed in to
+          # provision the pinned toolchain). Hashing only the Dockerfile would let a
+          # toolchain-only change overwrite the same date-tag with different bytes.
+          h=$(git hash-object Dockerfile rust-toolchain.toml | sha256sum | cut -c1-12)
           echo "sha=$h" >> "$GITHUB_OUTPUT"
           echo "date=$(date -u +%Y%m%d)" >> "$GITHUB_OUTPUT"
 
