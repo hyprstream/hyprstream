@@ -1,0 +1,35 @@
+name: Standards artifacts
+
+on:
+  push:
+    branches: ["main"]
+    paths:
+      - 'docs/standards/**'
+      - 'tools/check_standards.py'
+      - 'tools/generate_standards.py'
+      - '.github/workflows/standards.yml'
+  pull_request:
+    paths:
+      - 'docs/standards/**'
+      - 'tools/check_standards.py'
+      - 'tools/generate_standards.py'
+      - '.github/workflows/standards.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Validate registries and RFCXML outputs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version-file: docs/standards/.python-version
+      - name: Install exact xml2rfc toolchain
+        run: python3 -m pip install --disable-pip-version-check --upgrade --requirement docs/standards/xml2rfc-requirements.txt
+      - name: Validate registries, obligations, and stale output
+        run: python3 tools/check_standards.py --check-generated --xml2rfc xml2rfc

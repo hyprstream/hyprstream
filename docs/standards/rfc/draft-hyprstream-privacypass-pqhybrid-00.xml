@@ -1,0 +1,75 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rfc xmlns:xi="http://www.w3.org/2001/XInclude" version="3" category="info" docName="draft-hyprstream-privacypass-pqhybrid-00" ipr="trust200902" submissionType="independent">
+  <front>
+    <title abbrev="PQ Hybrid Privacy Pass Profile">Pre-I-D Profile: PQ-Hybrid Anonymous Authorization over Privacy Pass and MOQT</title>
+    <seriesInfo name="Internet-Draft" value="draft-hyprstream-privacypass-pqhybrid-00"/>
+    <author initials="H." surname="HyprStream" fullname="HyprStream Contributors"><organization>HyprStream</organization></author>
+    <date year="2026" month="July" day="17"/>
+    <area>General</area>
+    <workgroup>Independent Submission</workgroup>
+    <keyword>Privacy Pass</keyword><keyword>MOQT</keyword><keyword>post-quantum</keyword><keyword>authorization</keyword>
+    <abstract><t>This document is a pre-Internet-Draft work-in-progress profile skeleton. It records a separation between a classical outer MOQT admission plane and a future end-to-end PQ anonymous authorization/key-release plane. It does not select a post-quantum anonymous primitive, request a codepoint, define a Privacy Pass token type, or imply IETF endorsement or adoption.</t></abstract>
+    <note title="Pre-Submission Status"><t>This RFCXML source has not been submitted. Its generated artifacts contain standard Internet-Draft boilerplate solely to exercise the pre-submission toolchain; that boilerplate is not evidence of submission, IETF endorsement, adoption, working-group status, or codepoint allocation. The profile is intentionally incomplete pending construction selection and independent cryptographic and privacy review.</t></note>
+  </front>
+  <middle>
+    <section anchor="intro" numbered="true" toc="default"><name>Introduction</name>
+      <t>This skeleton applies the architecture of <xref target="RFC9576"/>, the HTTP scheme of <xref target="RFC9577"/> where HTTP is used, and the classical issuance protocols in <xref target="RFC9578"/> as references. Those documents do not select the PQ anonymous primitive required for a PqHybrid authorization claim. The MOQT carriage draft (<xref target="MOQT"/>) and MoQ Privacy Pass authentication draft (<xref target="MOQPP"/>) are work in progress. The individual token-binding draft (<xref target="PPBIND"/>) is not adopted. Hybrid terminology follows <xref target="RFC9794"/> and the signature-composition taxonomy in <xref target="RFC9955"/>.</t>
+    </section>
+    <section anchor="requirements" numbered="true" toc="default"><name>Requirements Language</name>
+      <t anchor="requirements-language">The key words MUST and MUST NOT in this document are to be interpreted as described in BCP 14 <xref target="RFC2119"/> <xref target="RFC8174"/> when, and only when, they appear in all capitals, as shown here.</t>
+    </section>
+    <section anchor="terms" numbered="true" toc="default"><name>Bounded Vocabulary</name>
+      <dl newline="false" spacing="normal">
+        <dt>Outer admission:</dt><dd>Classical, carrier-local relay admission, routing, rate control, or cache policy using standard MOQT/Privacy Pass surfaces.</dd>
+        <dt>Inner authorization:</dt><dd>End-to-end encrypted ordinary application Object material evaluated by the HyprStream origin.</dd>
+        <dt>Anonymous capability:</dt><dd>A future typed, verified authorization result, distinct from unauthenticated and identified principals.</dd>
+        <dt>Key release:</dt><dd>Release of a sealed unary response, stream traffic package, or group epoch package to the exact bound recipient.</dd>
+        <dt>Stock relay:</dt><dd>An unmodified classical MOQT relay that only forwards or caches ordinary Object bytes.</dd>
+      </dl>
+    </section>
+    <section anchor="separation" numbered="true" toc="default"><name>Assurance Separation</name>
+      <t>The outer admission result MUST NOT be accepted as inner authorization, MAC clearance, or authority to release plaintext or an epoch key. The origin MUST verify an inner capability and its exact binding before dispatch or key release. A relay MUST NOT be given or recover inner plaintext, decoded anonymous-capability or MAC-clearance material, a response key, a traffic key, or a group epoch key. Forwarding an opaque encrypted Object payload does not give the relay the enclosed plaintext material.</t>
+      <t>The future inner construction is not specified by this document. A classical entitlement or a hybrid signature wrapper is not by itself anonymous issuance and cannot raise an authorization result to PqHybrid. Issuer, origin, controller, and recipient keys are purpose-separated and selected from accepted-current state.</t>
+    </section>
+    <section anchor="moqt" numbered="true" toc="default"><name>Classical MOQT Relay Profile</name>
+      <t>Clients MUST send ordinary MOQT Object payload bytes that a stock relay can forward and cache unchanged. The profile MUST NOT require a MOQT extension or codepoint for the relay to forward the Object. A participating relay may use standard authorization-token surfaces for coarse admission; an unsupported private authorization profile must not make forwarding non-interoperable.</t>
+      <t>Private challenge, issuance, redemption, and key-release data are future encrypted application Object payloads. The relay-visible Object identity, size, timing, cache behavior, and routing metadata are not confidential by this document and no traffic-analysis resistance is claimed.</t>
+    </section>
+    <section anchor="registry" numbered="true" toc="default"><name>Transcript Registry</name>
+      <t>The local registry in domain-separation.json names labels, field bounds, canonicalization, and owners. Implementations MUST reject an unknown registry label, a non-canonical encoding, or an out-of-bounds transcript field before cryptographic processing. An implementation MUST NOT substitute a holder DID, ATProto handle, or relay route for an inner binding field.</t>
+      <t>The registry is local to this repository. It is not an IANA registry or a request to allocate Privacy Pass, MOQT, or any other codepoint.</t>
+    </section>
+    <section anchor="states" numbered="true" toc="default"><name>State-Machine Skeleton</name>
+      <t>Client states are: Idle; EntitlementChecked (optional); IssuancePrepared; TokenHeld; OuterSessionReady (optional); InnerControlSent; Released; SpentOrExpired; Denied. Issuer states are: ConfigurationResolved; IssuanceReceived; IssuanceAccepted; IssuanceRejected; KeyDraining. Origin states are: ChallengeIssued; OuterSessionObserved (optional); InnerControlReceived; StateResolved; BindingVerified; MACAuthorized; SpendCommitted; ReleaseCommitted; Denied. No transition to dispatch or release is defined from an outer-only state.</t>
+      <t>Construction selection must define persistence, atomic spend/commit, retry, expiry, accepted-state advance, key rotation, crash recovery, and error behavior. Spend is committed only after all authorization checks and before dispatch or key release. A crash after spend commit may burn the one-use capability but cannot repeat authorization; a crash before spend commit cannot create an authorization success.</t>
+      <t>The bounded inner control kinds are Challenge, IssuanceRequest, IssuanceResponse, Redemption, AuthorizationResult, KeyReleaseRequest, KeyReleaseResponse, and Error. The local scaffold limits one encrypted Object payload to 65536 bytes, one exchange to 16 Objects, and one session to 8 concurrent exchanges. These names and ceilings are application-profile inputs, not MOQT or Privacy Pass allocations; unknown kinds and versions reject.</t>
+    </section>
+    <section anchor="security" numbered="true" toc="default"><name>Security Considerations</name>
+      <t>Construction selection and independent review are prerequisites for any PqHybrid production claim. The profile requires exact binding to issuer, audience, accepted-state and policy generations, carrier profile, operation/resource, one-use PoP, and HyKEM recipient, but deliberately leaves their concrete encoding and primitive unselected.</t>
+    </section>
+    <section anchor="privacy" numbered="true" toc="default"><name>Privacy Considerations</name>
+      <t>The profile makes no issuance/redemption unlinkability claim against issuer-origin collusion, no traffic-analysis claim against an origin-relay or global observer, and no protection against PDS, ledger, storage, or cross-cell correlation beyond stated data minimization. See the companion privacy and threat analyses for the required collusion model.</t>
+    </section>
+    <section anchor="iana" numbered="true" toc="default"><name>IANA Considerations</name>
+      <t>This document requests no IANA actions and allocates no codepoints.</t>
+    </section>
+  </middle>
+  <back>
+    <references><name>References</name>
+      <references><name>Normative References</name>
+        <reference anchor="RFC2119" target="https://www.rfc-editor.org/info/rfc2119"><front><title>Key words for use in RFCs to Indicate Requirement Levels</title><seriesInfo name="BCP" value="14"/><seriesInfo name="RFC" value="2119"/><author initials="S." surname="Bradner" fullname="S. Bradner"/><date year="1997" month="March"/></front></reference>
+        <reference anchor="RFC8174" target="https://www.rfc-editor.org/info/rfc8174"><front><title>Ambiguity of Uppercase vs Lowercase in RFC 2119 Key Words</title><seriesInfo name="BCP" value="14"/><seriesInfo name="RFC" value="8174"/><author initials="B." surname="Leiba" fullname="B. Leiba"/><date year="2017" month="May"/></front></reference>
+        <reference anchor="RFC9576" target="https://www.rfc-editor.org/info/rfc9576"><front><title>The Privacy Pass Architecture</title><seriesInfo name="RFC" value="9576"/><author initials="A." surname="Davidson" fullname="A. Davidson"/><author initials="J." surname="Iyengar" fullname="J. Iyengar"/><author initials="C. A." surname="Wood" fullname="C. A. Wood"/><date year="2024" month="June"/></front></reference>
+        <reference anchor="RFC9577" target="https://www.rfc-editor.org/info/rfc9577"><front><title>The Privacy Pass HTTP Authentication Scheme</title><seriesInfo name="RFC" value="9577"/><author initials="T." surname="Pauly" fullname="T. Pauly"/><author initials="S." surname="Valdez" fullname="S. Valdez"/><author initials="C. A." surname="Wood" fullname="C. A. Wood"/><date year="2024" month="June"/></front></reference>
+        <reference anchor="RFC9578" target="https://www.rfc-editor.org/info/rfc9578"><front><title>Privacy Pass Issuance Protocols</title><seriesInfo name="RFC" value="9578"/><author initials="S." surname="Celi" fullname="S. Celi"/><author initials="A." surname="Davidson" fullname="A. Davidson"/><author initials="S." surname="Valdez" fullname="S. Valdez"/><author initials="C. A." surname="Wood" fullname="C. A. Wood"/><date year="2024" month="June"/></front></reference>
+      </references>
+      <references><name>Informative References</name>
+        <reference anchor="RFC9794" target="https://www.rfc-editor.org/info/rfc9794"><front><title>Terminology for Post-Quantum Traditional Hybrid Schemes</title><seriesInfo name="RFC" value="9794"/><author initials="F." surname="Driscoll" fullname="F. Driscoll"/><author initials="M." surname="Parsons" fullname="M. Parsons"/><author initials="B." surname="Hale" fullname="B. Hale"/><date year="2025" month="June"/></front></reference>
+        <reference anchor="MOQT" target="https://www.ietf.org/archive/id/draft-ietf-moq-transport-19.txt"><front><title>Media over QUIC Transport</title><seriesInfo name="Internet-Draft" value="draft-ietf-moq-transport-19"/><author initials="S." surname="Nandakumar" fullname="S. Nandakumar"/><author initials="V." surname="Vasiliev" fullname="V. Vasiliev"/><author initials="I." surname="Swett" fullname="I. Swett"/><author initials="A." surname="Frindell" fullname="A. Frindell"/><date year="2026" month="July" day="6"/></front></reference>
+        <reference anchor="MOQPP" target="https://www.ietf.org/archive/id/draft-ietf-moq-privacy-pass-auth-03.txt"><front><title>Privacy Pass Authentication for Media over QUIC (MoQ)</title><seriesInfo name="Internet-Draft" value="draft-ietf-moq-privacy-pass-auth-03"/><author initials="S." surname="Nandakumar" fullname="S. Nandakumar"/><author initials="C." surname="Jennings" fullname="C. Jennings"/><author initials="T." surname="Meunier" fullname="T. Meunier"/><date year="2026" month="July" day="6"/></front></reference>
+        <reference anchor="PPBIND" target="https://www.ietf.org/archive/id/draft-guo-privacypass-token-binding-02.txt"><front><title>Privacy Pass with Token Binding Extension</title><seriesInfo name="Internet-Draft" value="draft-guo-privacypass-token-binding-02"/><author initials="W." surname="Guo" fullname="W. Guo"/><author initials="L." surname="Xia" fullname="L. Xia"/><author initials="J." surname="Li" fullname="J. Li"/><author initials="Y." surname="Li" fullname="Y. Li"/><date year="2026" month="March" day="15"/></front></reference>
+        <reference anchor="RFC9955" target="https://www.rfc-editor.org/info/rfc9955"><front><title>Hybrid Signature Spectrums</title><seriesInfo name="RFC" value="9955"/><author initials="N." surname="Bindel" fullname="N. Bindel"/><author initials="B." surname="Hale" fullname="B. Hale"/><author initials="D." surname="Connolly" fullname="D. Connolly"/><author initials="F." surname="Driscoll" fullname="F. Driscoll"/><date year="2026" month="July"/></front></reference>
+      </references>
+    </references>
+  </back>
+</rfc>
