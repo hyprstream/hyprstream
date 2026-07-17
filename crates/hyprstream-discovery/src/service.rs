@@ -1504,6 +1504,41 @@ fn deployment_domain(ca_verifying_key: &VerifyingKey) -> String {
     })
 }
 
+fn validate_registry_credential_numeric_dates(
+    exp: i64,
+    nbf: i64,
+    iat: i64,
+    now: i64,
+) -> Result<()> {
+    for (name, value) in [("exp", exp), ("nbf", nbf), ("iat", iat)] {
+        anyhow::ensure!(
+            value >= 0,
+            "credential {name} must not precede the Unix epoch"
+        );
+    }
+
+    anyhow::ensure!(exp > now, "credential has expired");
+    let latest_future_time = now
+        .checked_add(REGISTRY_DEPLOYMENT_CREDENTIAL_CLOCK_SKEW_SECONDS)
+        .ok_or_else(|| anyhow::anyhow!("credential clock-skew boundary overflow"))?;
+    anyhow::ensure!(nbf <= latest_future_time, "credential is not yet valid");
+    anyhow::ensure!(
+        iat <= latest_future_time,
+        "credential was issued in the future"
+    );
+    anyhow::ensure!(nbf <= exp, "credential nbf is after exp");
+    anyhow::ensure!(nbf <= iat, "credential nbf is after iat");
+    anyhow::ensure!(iat < exp, "credential iat is not before exp");
+    let lifetime = exp
+        .checked_sub(iat)
+        .ok_or_else(|| anyhow::anyhow!("credential lifetime arithmetic overflow"))?;
+    anyhow::ensure!(
+        lifetime <= REGISTRY_DEPLOYMENT_CREDENTIAL_MAX_TTL_SECONDS,
+        "credential lifetime exceeds the inclusive one-hour profile limit"
+    );
+    Ok(())
+}
+
 fn validate_registry_deployment_credential_profile(
     token: &str,
     ca_verifying_key: &VerifyingKey,
@@ -1578,21 +1613,7 @@ fn validate_registry_deployment_credential_profile(
     let exp = exact_i64_member(claims, "exp", "credential claims")?;
     let nbf = exact_i64_member(claims, "nbf", "credential claims")?;
     let iat = exact_i64_member(claims, "iat", "credential claims")?;
-    anyhow::ensure!(exp > now, "credential has expired");
-    anyhow::ensure!(
-        nbf <= now + REGISTRY_DEPLOYMENT_CREDENTIAL_CLOCK_SKEW_SECONDS,
-        "credential is not yet valid"
-    );
-    anyhow::ensure!(
-        iat <= now + REGISTRY_DEPLOYMENT_CREDENTIAL_CLOCK_SKEW_SECONDS,
-        "credential was issued in the future"
-    );
-    anyhow::ensure!(nbf <= iat, "credential nbf is after iat");
-    anyhow::ensure!(iat < exp, "credential iat is not before exp");
-    anyhow::ensure!(
-        exp - iat <= REGISTRY_DEPLOYMENT_CREDENTIAL_MAX_TTL_SECONDS,
-        "credential lifetime exceeds the one-hour profile limit"
-    );
+    validate_registry_credential_numeric_dates(exp, nbf, iat, now)?;
 
     let cnf = exact_json_object(&claims["cnf"], &["jwk"], "credential claims.cnf")?;
     let jwk = exact_json_object(
@@ -2117,6 +2138,10 @@ mod resolver_tests {
     use hyprstream_pds::at9p_sign::{sign_capsule, sign_update_record};
     use hyprstream_rpc::transport::{BindMode, EndpointType};
 
+    fn checked_test_time(now: i64, offset: i64) -> i64 {
+        now.checked_add(offset).expect("test NumericDate offset")
+    }
+
     fn sign_registry_credential_json(
         ca: &SigningKey,
         protected_json: &str,
@@ -2144,7 +2169,7 @@ mod resolver_tests {
                 "iss": format!("urn:hyprstream:deployment:{domain}"),
                 "sub": "service:registry",
                 "aud": REGISTRY_DEPLOYMENT_CREDENTIAL_AUDIENCE,
-                "exp": now + 3600,
+                "exp": checked_test_time(now, 3600),
                 "nbf": now,
                 "iat": now,
                 "deployment_domain": domain,
@@ -2195,6 +2220,129 @@ mod resolver_tests {
             authenticate_test_registry_credential(&ca, exact_registry_credential(&ca, &registry))
                 .expect("exact deployment credential profile");
         assert!(witness.verifier.matches(&registry.verifying_key()));
+    }
+
+    #[test]
+    fn deployment_credential_numeric_dates_enforce_all_boundaries_and_orderings() {
+        let now = 1_000_000;
+
+        for (case, exp, nbf, iat) in [
+            (
+                "one-hour lifetime endpoint",
+                checked_test_time(now, 3600),
+                now,
+                now,
+            ),
+            (
+                "inside lifetime endpoint",
+                checked_test_time(now, 3599),
+                now,
+                now,
+            ),
+            (
+                "future-skew and lifetime endpoints",
+                checked_test_time(now, 3660),
+                checked_test_time(now, 60),
+                checked_test_time(now, 60),
+            ),
+        ] {
+            validate_registry_credential_numeric_dates(exp, nbf, iat, now)
+                .unwrap_or_else(|error| panic!("valid {case} rejected: {error}"));
+        }
+
+        for (case, exp, nbf, iat, validation_now) in [
+            (
+                "expired endpoint",
+                now,
+                now,
+                checked_test_time(now, -1),
+                now,
+            ),
+            (
+                "outside lifetime endpoint",
+                checked_test_time(now, 3601),
+                now,
+                now,
+                now,
+            ),
+            (
+                "future nbf outside skew",
+                checked_test_time(now, 3600),
+                checked_test_time(now, 61),
+                now,
+                now,
+            ),
+            (
+                "future iat outside skew",
+                checked_test_time(now, 3661),
+                now,
+                checked_test_time(now, 61),
+                now,
+            ),
+            (
+                "exp equal to iat",
+                checked_test_time(now, 1),
+                checked_test_time(now, 1),
+                checked_test_time(now, 1),
+                now,
+            ),
+            (
+                "exp before iat",
+                checked_test_time(now, 1),
+                now,
+                checked_test_time(now, 2),
+                now,
+            ),
+            (
+                "nbf after exp",
+                checked_test_time(now, 2),
+                checked_test_time(now, 3),
+                now,
+                now,
+            ),
+            (
+                "nbf after iat",
+                checked_test_time(now, 2),
+                checked_test_time(now, 1),
+                now,
+                now,
+            ),
+            ("negative exp", -1, 0, 0, -2),
+            ("negative nbf", checked_test_time(now, 1), -1, 0, now),
+            ("negative iat", checked_test_time(now, 1), 0, -1, now),
+            ("minimum and maximum extremes", i64::MAX, 0, i64::MIN, now),
+            ("all minimum extremes", i64::MIN, i64::MIN, i64::MIN, now),
+            ("all maximum extremes", i64::MAX, i64::MAX, i64::MAX, now),
+            (
+                "clock-skew boundary overflow",
+                i64::MAX,
+                i64::MAX - 1,
+                i64::MAX - 1,
+                i64::MAX - 1,
+            ),
+        ] {
+            assert!(
+                validate_registry_credential_numeric_dates(exp, nbf, iat, validation_now).is_err(),
+                "invalid NumericDate profile accepted: {case}"
+            );
+        }
+    }
+
+    #[test]
+    fn deployment_credential_rejects_signed_wraparound_lifetime_in_all_profiles() {
+        let ca = SigningKey::from_bytes(&[0x6a; 32]);
+        let registry = SigningKey::from_bytes(&[0x6b; 32]);
+        let (protected, mut claims) = exact_registry_credential_values(&ca, &registry);
+        claims["exp"] = serde_json::json!(i64::MAX);
+        claims["nbf"] = serde_json::json!(i64::MIN);
+        claims["iat"] = serde_json::json!(i64::MIN);
+
+        assert_registry_credential_rejected(
+            &ca,
+            &protected,
+            &claims,
+            "signed exp-minus-iat wraparound",
+        );
     }
 
     #[test]
@@ -2282,11 +2430,31 @@ mod resolver_tests {
                 "profile",
                 serde_json::json!("hyprstream.registry-deployment.v2"),
             ),
-            ("expired", "exp", serde_json::json!(now - 1)),
-            ("future nbf", "nbf", serde_json::json!(now + 61)),
-            ("future iat", "iat", serde_json::json!(now + 61)),
-            ("nbf after iat", "nbf", serde_json::json!(now + 1)),
-            ("excessive lifetime", "exp", serde_json::json!(now + 3601)),
+            (
+                "expired",
+                "exp",
+                serde_json::json!(checked_test_time(now, -1)),
+            ),
+            (
+                "future nbf",
+                "nbf",
+                serde_json::json!(checked_test_time(now, 61)),
+            ),
+            (
+                "future iat",
+                "iat",
+                serde_json::json!(checked_test_time(now, 61)),
+            ),
+            (
+                "nbf after iat",
+                "nbf",
+                serde_json::json!(checked_test_time(now, 1)),
+            ),
+            (
+                "excessive lifetime",
+                "exp",
+                serde_json::json!(checked_test_time(now, 3601)),
+            ),
         ] {
             let mut changed = claims.clone();
             changed[member] = value;
@@ -2383,20 +2551,21 @@ mod resolver_tests {
         }
 
         let now = chrono::Utc::now().timestamp();
+        let exp = checked_test_time(now, 3600);
         let x = URL_SAFE_NO_PAD.encode(registry.verifying_key().as_bytes());
         let protected = serde_json::json!({"alg":"EdDSA", "typ":"wit+jwt", "kid":domain});
         for duplicate_claims in [
             format!(
                 r#"{{"iss":"urn:hyprstream:deployment:{domain}","sub":"service:registry","sub":"service:model","aud":"{REGISTRY_DEPLOYMENT_CREDENTIAL_AUDIENCE}","exp":{},"nbf":{now},"iat":{now},"deployment_domain":"{domain}","profile":"{REGISTRY_DEPLOYMENT_CREDENTIAL_PROFILE}","cnf":{{"jwk":{{"kty":"OKP","crv":"Ed25519","x":"{x}"}}}}}}"#,
-                now + 3600
+                exp
             ),
             format!(
                 r#"{{"iss":"urn:hyprstream:deployment:{domain}","sub":"service:registry","aud":"{REGISTRY_DEPLOYMENT_CREDENTIAL_AUDIENCE}","exp":{},"nbf":{now},"iat":{now},"deployment_domain":"{domain}","profile":"{REGISTRY_DEPLOYMENT_CREDENTIAL_PROFILE}","cnf":{{"jwk":{{"kty":"OKP","crv":"Ed25519","x":"{x}"}},"jwk":{{"kty":"RSA","crv":"P-256","x":"{x}"}}}}}}"#,
-                now + 3600
+                exp
             ),
             format!(
                 r#"{{"iss":"urn:hyprstream:deployment:{domain}","sub":"service:registry","aud":"{REGISTRY_DEPLOYMENT_CREDENTIAL_AUDIENCE}","exp":{},"nbf":{now},"iat":{now},"deployment_domain":"{domain}","profile":"{REGISTRY_DEPLOYMENT_CREDENTIAL_PROFILE}","cnf":{{"jwk":{{"kty":"OKP","kty":"RSA","crv":"Ed25519","x":"{x}"}}}}}}"#,
-                now + 3600
+                exp
             ),
         ] {
             let token =

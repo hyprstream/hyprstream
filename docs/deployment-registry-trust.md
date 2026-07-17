@@ -49,9 +49,11 @@ the following profile exactly:
   `urn:hyprstream:deployment:D`; `sub` is `service:registry`; `aud` is
   `urn:hyprstream:service:registry`; `deployment_domain` is `D`; and `profile`
   is `hyprstream.registry-deployment.v1`.
-- `exp`, `nbf`, and `iat` are integer NumericDate values. The credential must be
-  currently valid (with at most 60 seconds of future clock skew), `nbf <= iat <
-  exp`, and `exp - iat <= 3600`.
+- `exp`, `nbf`, and `iat` are nonnegative integer NumericDate values. The
+  credential must be currently valid, with strict `exp > now` and `nbf <= iat <
+  exp`. The future-clock-skew endpoint is inclusive (`nbf` and `iat` may equal
+  `now + 60`), as is the lifetime endpoint (`exp - iat` may equal 3600). All
+  additions and subtractions are checked; overflow or underflow fails closed.
 - `cnf` contains only one `jwk`; no `jkt` or alternate confirmation member is
   permitted. The JWK contains only `kty: "OKP"`, `crv: "Ed25519"`, and `x`.
   `x` is canonical unpadded base64url for exactly 32 bytes and is the registry
