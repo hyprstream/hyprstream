@@ -304,6 +304,7 @@ impl StreamVerifier {
 
         let payloads_reader = block.get_payloads()?;
         let mut payloads = Vec::with_capacity(payloads_reader.len() as usize);
+        let mut pending_epoch_commit = None;
 
         let mut terminal_seen = self.terminal_seen;
         for i in 0..payloads_reader.len() {
@@ -311,15 +312,33 @@ impl StreamVerifier {
 
             use streaming_capnp::stream_payload::Which;
             let payload = match p.which()? {
-                Which::Data(data_result) => StreamPayload::Data(data_result?.to_vec()),
+                Which::Data(data_result) => {
+                    ensure!(
+                        self.epoch_ratchet.is_none(),
+                        "identified stream rejected cleartext Data payload"
+                    );
+                    StreamPayload::Data(data_result?.to_vec())
+                }
                 Which::Error(err_result) => {
+                    ensure!(
+                        self.epoch_ratchet.is_none(),
+                        "identified stream rejected cleartext Error payload"
+                    );
                     let err = err_result?;
                     StreamPayload::Error(err.get_message()?.to_string()?)
                 }
                 Which::Complete(complete_result) => {
+                    ensure!(
+                        self.epoch_ratchet.is_none(),
+                        "identified stream rejected cleartext Complete payload"
+                    );
                     StreamPayload::Complete(complete_result?.to_vec())
                 }
                 Which::Heartbeat(()) => {
+                    ensure!(
+                        self.epoch_ratchet.is_none(),
+                        "identified stream rejected cleartext Heartbeat payload"
+                    );
                     continue;
                 }
                 Which::Tagged(tagged_result) => {
@@ -327,7 +346,7 @@ impl StreamVerifier {
                     match self.enc_key {
                         // #321: transport AEAD ON — open the sealed payload back into
                         // Data/Complete/Error (fails closed on tamper / wrong key).
-                        Some(ref enc_key) => open_sealed_payload(
+                        Some(ref enc_key) => match open_sealed_payload_inner(
                             enc_key,
                             &self.topic,
                             block_epoch,
@@ -337,7 +356,21 @@ impl StreamVerifier {
                             tagged.get_payload()?,
                             tagged.get_nonce()?,
                             tagged.get_key_commitment()?,
-                        )?,
+                        )? {
+                            OpenedStreamPayload::Application(payload) => payload,
+                            OpenedStreamPayload::EpochCommit(commit) => {
+                                ensure!(
+                                    self.epoch_ratchet.is_some(),
+                                    "stream epoch control on a non-identified stream"
+                                );
+                                ensure!(
+                                    payloads_reader.len() == 1 && i == 0,
+                                    "stream epoch control must be the sole Object payload"
+                                );
+                                pending_epoch_commit = Some(commit);
+                                continue;
+                            }
+                        },
                         // No transport key (E2E notification path): pass Tagged through.
                         None => StreamPayload::Tagged {
                             tag: tagged.get_tag()?.to_vec(),
@@ -357,6 +390,14 @@ impl StreamVerifier {
                 terminal_seen = true;
             }
             payloads.push(payload);
+        }
+
+        if let Some(commit) = pending_epoch_commit {
+            // The control Object was authenticated and opened entirely under
+            // the current epoch. Only now atomically install the next epoch;
+            // failed validation leaves every verifier field unchanged.
+            self.accept_epoch_commit(&commit)?;
+            return Ok(Vec::new());
         }
 
         self.prev_mac = Some(new_prev);
@@ -391,6 +432,12 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 pub(crate) const SEALED_KIND_DATA: u8 = 0x00;
 pub(crate) const SEALED_KIND_COMPLETE: u8 = 0x01;
 pub(crate) const SEALED_KIND_ERROR: u8 = 0x02;
+pub(crate) const SEALED_KIND_EPOCH_COMMIT: u8 = 0x03;
+
+enum OpenedStreamPayload {
+    Application(StreamPayload),
+    EpochCommit(crate::stream_epoch::StreamEpochCommit),
+}
 
 /// Build the AEAD AAD (also the `encrypt_event` "prefix") binding each sealed
 /// payload to its `topic` and key-`epoch` (#321/#223). Reused verbatim by the
@@ -410,6 +457,7 @@ pub(crate) fn stream_aead_aad(
 /// Data/Complete/Error variant. Returns `Err` on tamper / wrong key (fail-closed).
 ///
 /// `epoch` is the StreamBlock's epoch and MUST match the seal-side AAD.
+#[cfg(test)]
 pub(crate) fn open_sealed_payload(
     enc_key: &[u8; 32],
     topic: &str,
@@ -421,6 +469,36 @@ pub(crate) fn open_sealed_payload(
     nonce: &[u8],
     key_commitment: &[u8],
 ) -> Result<StreamPayload> {
+    match open_sealed_payload_inner(
+        enc_key,
+        topic,
+        epoch,
+        sequence_number,
+        payload_index,
+        tag,
+        ciphertext,
+        nonce,
+        key_commitment,
+    )? {
+        OpenedStreamPayload::Application(payload) => Ok(payload),
+        OpenedStreamPayload::EpochCommit(_) => {
+            anyhow::bail!("stream epoch control is not an application payload")
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn open_sealed_payload_inner(
+    enc_key: &[u8; 32],
+    topic: &str,
+    epoch: u64,
+    sequence_number: u64,
+    payload_index: usize,
+    tag: &[u8],
+    ciphertext: &[u8],
+    nonce: &[u8],
+    key_commitment: &[u8],
+) -> Result<OpenedStreamPayload> {
     use crate::crypto::event_crypto::{check_key_commitment, decrypt_event_full};
 
     let nonce12: [u8; 12] = nonce
@@ -446,14 +524,21 @@ pub(crate) fn open_sealed_payload(
         .split_first()
         .ok_or_else(|| anyhow::anyhow!("stream AEAD: empty sealed plaintext (missing kind tag)"))?;
     match kind {
-        SEALED_KIND_DATA => Ok(StreamPayload::Data(body.to_vec())),
-        SEALED_KIND_COMPLETE => Ok(StreamPayload::Complete(body.to_vec())),
-        SEALED_KIND_ERROR => Ok(StreamPayload::Error(
+        SEALED_KIND_DATA => Ok(OpenedStreamPayload::Application(StreamPayload::Data(
+            body.to_vec(),
+        ))),
+        SEALED_KIND_COMPLETE => Ok(OpenedStreamPayload::Application(StreamPayload::Complete(
+            body.to_vec(),
+        ))),
+        SEALED_KIND_ERROR => Ok(OpenedStreamPayload::Application(StreamPayload::Error(
             std::str::from_utf8(body)
                 .map_err(|error| {
                     anyhow::anyhow!("stream AEAD: sealed error is not UTF-8: {error}")
                 })?
                 .to_owned(),
+        ))),
+        SEALED_KIND_EPOCH_COMMIT => Ok(OpenedStreamPayload::EpochCommit(
+            crate::stream_epoch::StreamEpochCommit::decode_control_object(body)?,
         )),
         other => anyhow::bail!("stream AEAD: unknown sealed kind tag {other:#x}"),
     }

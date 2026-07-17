@@ -48,7 +48,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, ensure, Context, Result};
 use bytes::Bytes;
 use moq_net::{BroadcastProducer, Group, OriginConsumer, OriginProducer, Track, TrackProducer};
 use parking_lot::Mutex;
@@ -755,29 +755,29 @@ pub struct MoqStreamPublisher {
 }
 
 impl MoqStreamPublisher {
-    /// Prepare (without installing) the authenticated next-epoch commit.
-    pub fn prepare_next_epoch(&self) -> Result<crate::stream_epoch::StreamEpochCommit> {
-        self.epoch_ratchet
-            .as_ref()
-            .ok_or_else(|| anyhow!("stream is not using the identified epoch profile"))?
-            .prepare_next()
-    }
-
-    /// Atomically install an authenticated epoch commit and reset only the
-    /// per-epoch sequence/MAC chain.  `next_group` deliberately does not reset,
-    /// so an immutable MOQT track/group/object identity is never reused with
-    /// different ciphertext.
-    pub fn commit_epoch(&mut self, commit: &crate::stream_epoch::StreamEpochCommit) -> Result<()> {
+    /// Publish an opaque, authenticated control Object under the current epoch,
+    /// then atomically advance the producer to the next epoch. The consumer
+    /// performs the same verify-before-advance transition from the wire Object.
+    /// `next_group` deliberately never resets, preserving immutable MOQT IDs.
+    pub fn publish_next_epoch(&mut self) -> Result<u64> {
         let ratchet = self
             .epoch_ratchet
-            .as_mut()
+            .as_ref()
             .ok_or_else(|| anyhow!("stream is not using the identified epoch profile"))?;
-        let keys = ratchet.commit_prepared(commit)?;
+        let commit = ratchet.prepare_next()?;
+        let mut pending = ratchet.clone();
+        let keys = pending.commit_prepared(&commit)?;
+
+        // The current keys authenticate and encrypt this control Object. Do not
+        // expose or install the pending epoch until stock MoQ accepted the Object.
+        self.write_block(&[StreamPayloadData::EpochCommit(commit)])?;
+
         self.hmac_state =
             StreamHmacState::new(*keys.producer_to_consumer.mac_key, self.topic.clone());
         self.enc_key = Some(*keys.producer_to_consumer.enc_key);
         self.next_sequence = 0;
-        Ok(())
+        self.epoch_ratchet = Some(pending);
+        Ok(keys.epoch)
     }
 
     /// Publish one binary payload as a StreamBlock group.
@@ -790,8 +790,9 @@ impl MoqStreamPublisher {
 
     /// Publish an error payload (terminal).
     pub async fn publish_error(&mut self, message: &str) -> Result<()> {
+        self.write_block(&[StreamPayloadData::Error(message.to_owned())])?;
         self.terminated = true;
-        self.write_block(&[StreamPayloadData::Error(message.to_owned())])
+        Ok(())
     }
 
     /// Complete the stream with metadata (terminal).
@@ -801,8 +802,9 @@ impl MoqStreamPublisher {
 
     /// Complete the stream without consuming `self`.
     pub async fn complete_ref(&mut self, metadata: &[u8]) -> Result<()> {
+        self.write_block(&[StreamPayloadData::Complete(metadata.to_vec())])?;
         self.terminated = true;
-        self.write_block(&[StreamPayloadData::Complete(metadata.to_vec())])
+        Ok(())
     }
 
     /// The opaque topic this publisher serves.
@@ -830,8 +832,19 @@ impl MoqStreamPublisher {
             .epoch_ratchet
             .as_ref()
             .map_or(0, StreamEpochRatchet::epoch);
+        let is_epoch_control = matches!(payloads, [StreamPayloadData::EpochCommit(_)]);
+        if is_epoch_control && self.enc_key.is_none() {
+            anyhow::bail!("identified stream epoch control cannot be serialized without AEAD");
+        }
         if let Some(state) = &self.epoch_ratchet {
-            if sequence_number >= state.binding().max_blocks_per_epoch() {
+            ensure!(
+                !payloads
+                    .iter()
+                    .any(|payload| matches!(payload, StreamPayloadData::Tagged { .. })),
+                "identified stream rejected pre-tagged payload bypass"
+            );
+            let limit = state.binding().max_blocks_per_epoch();
+            if sequence_number > limit || (sequence_number == limit && !is_epoch_control) {
                 anyhow::bail!(
                     "identified stream epoch {epoch} exhausted after {} blocks; authenticated rekey required",
                     state.binding().max_blocks_per_epoch()
@@ -839,13 +852,16 @@ impl MoqStreamPublisher {
             }
         }
         let group_id = self.next_group;
-        self.next_group += 1;
-        self.next_sequence = self
+        let next_group = self
+            .next_group
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("stream Group identity exhausted"))?;
+        let next_sequence = self
             .next_sequence
             .checked_add(1)
             .ok_or_else(|| anyhow!("stream sequence exhausted"))?;
 
-        // #321: on the mesh/DH path (`enc_key = Some`), seal each Data/Complete/Error
+        // #321: on the mesh/DH path (`enc_key = Some`), seal each application/control
         // payload with AES-256-GCM into a `Tagged` payload BEFORE the HMAC chain
         // runs (so the chain authenticates the ciphertext — no double-encryption,
         // ordering/anti-replay unchanged). The AEAD AAD/key-commitment are bound to the block's
@@ -921,7 +937,8 @@ impl MoqStreamPublisher {
             }
             None => signed_region,
         };
-        let mac = self.hmac_state.compute_next(&capnp_bytes);
+        let mut pending_hmac_state = self.hmac_state.clone();
+        let mac = pending_hmac_state.compute_next(&capnp_bytes);
 
         let mut frame = Vec::with_capacity(capnp_bytes.len() + 16);
         frame.extend_from_slice(&capnp_bytes);
@@ -930,6 +947,13 @@ impl MoqStreamPublisher {
         let mut group = self.track.create_group(Group::from(group_id))?;
         group.write_frame(Bytes::from(frame))?;
         group.finish()?;
+
+        // Publication is the commit point: failures above leave all sequence,
+        // identity, and chained-MAC state unchanged, so a retry cannot create a
+        // gap or reuse an already-advanced cryptographic state.
+        self.hmac_state = pending_hmac_state;
+        self.next_group = next_group;
+        self.next_sequence = next_sequence;
         Ok(())
     }
 }
@@ -1012,6 +1036,36 @@ impl MoqStreamHandle {
             mac_key,
             enc_key,
             topic,
+            None,
+            tx,
+            cancel.clone(),
+        ));
+        Self {
+            rx,
+            broadcast_path,
+            cancel,
+        }
+    }
+
+    /// Construct an identified-profile UDS consumer whose receive loop accepts
+    /// authenticated in-band epoch controls before delivering later Objects.
+    pub fn identified(
+        uds_path: String,
+        broadcast_path: String,
+        ratchet: crate::stream_epoch::StreamEpochRatchet,
+    ) -> Self {
+        let keys = ratchet.current_keys();
+        let topic = ratchet.route_topic().to_owned();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let (tx, rx) =
+            tokio::sync::mpsc::channel::<anyhow::Result<crate::streaming::StreamPayload>>(64);
+        tokio::spawn(moq_stream_handle_task(
+            uds_path,
+            broadcast_path.clone(),
+            *keys.producer_to_consumer.mac_key,
+            *keys.producer_to_consumer.enc_key,
+            topic,
+            Some(ratchet),
             tx,
             cancel.clone(),
         ));
@@ -1083,6 +1137,7 @@ impl MoqStreamHandle {
                 mac_key,
                 enc_key,
                 topic,
+                None,
                 tx,
                 cancel.clone(),
             ));
@@ -1094,6 +1149,7 @@ impl MoqStreamHandle {
                 mac_key,
                 enc_key,
                 topic,
+                None,
                 tx,
                 cancel.clone(),
             ));
@@ -1105,6 +1161,63 @@ impl MoqStreamHandle {
                     .send(Err(anyhow!(
                         "no dialable reach in StreamInfo and no local moq UDS plane — \
                          cannot subscribe to broadcast"
+                    )))
+                    .await;
+            });
+        }
+        Self {
+            rx,
+            broadcast_path,
+            cancel,
+        }
+    }
+
+    /// Construct an identified-profile network consumer. A standard relay sees
+    /// ordinary opaque Objects; this receive loop consumes authenticated epoch
+    /// controls and delivers application payloads only.
+    pub fn networked_identified(
+        reach: Vec<crate::stream_info::Destination>,
+        qos: &crate::stream_info::StreamOpt,
+        broadcast_path: String,
+        ratchet: crate::stream_epoch::StreamEpochRatchet,
+    ) -> Self {
+        let reach = select_reach(&reach, qos);
+        let keys = ratchet.current_keys();
+        let mac_key = *keys.producer_to_consumer.mac_key;
+        let enc_key = *keys.producer_to_consumer.enc_key;
+        let topic = ratchet.route_topic().to_owned();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let (tx, rx) =
+            tokio::sync::mpsc::channel::<anyhow::Result<crate::streaming::StreamPayload>>(64);
+        let has_dialable_reach = reach.iter().any(|d| reach_to_transport_config(d).is_some());
+        if has_dialable_reach {
+            tokio::spawn(moq_stream_handle_task_networked(
+                reach,
+                broadcast_path.clone(),
+                mac_key,
+                enc_key,
+                topic,
+                Some(ratchet),
+                tx,
+                cancel.clone(),
+            ));
+        } else if let Some(uds) = global_moq_uds_path() {
+            tokio::spawn(moq_stream_handle_task(
+                uds.to_string_lossy().into_owned(),
+                broadcast_path.clone(),
+                mac_key,
+                enc_key,
+                topic,
+                Some(ratchet),
+                tx,
+                cancel.clone(),
+            ));
+        } else {
+            tokio::spawn(async move {
+                let _ = tx
+                    .send(Err(anyhow!(
+                        "no dialable reach in StreamInfo and no local moq UDS plane — \
+                         cannot subscribe to identified broadcast"
                     )))
                     .await;
             });
@@ -1162,6 +1275,7 @@ async fn moq_stream_handle_task(
     mac_key: [u8; 32],
     enc_key: [u8; 32],
     topic: String,
+    epoch_ratchet: Option<crate::stream_epoch::StreamEpochRatchet>,
     tx: tokio::sync::mpsc::Sender<anyhow::Result<crate::streaming::StreamPayload>>,
     cancel: tokio_util::sync::CancellationToken,
 ) {
@@ -1219,6 +1333,9 @@ async fn moq_stream_handle_task(
     };
     // #321: AEAD ON for this DH-keyed mesh stream — open sealed Tagged blocks.
     let mut verifier = StreamVerifier::new(mac_key, topic.clone()).with_enc_key(enc_key);
+    if let Some(ratchet) = epoch_ratchet {
+        verifier = verifier.with_epoch_ratchet(ratchet);
+    }
     // #145: read groups by EXACT sequence (get_group), not arrival-order next_group.
     // Each Group is served on its own QUIC uni-stream, so Groups can arrive out of
     // order; next_group's monotonic cursor returns the first Group with sequence >=
@@ -1748,6 +1865,7 @@ async fn moq_stream_handle_task_networked(
     mac_key: [u8; 32],
     enc_key: [u8; 32],
     topic: String,
+    epoch_ratchet: Option<crate::stream_epoch::StreamEpochRatchet>,
     tx: tokio::sync::mpsc::Sender<anyhow::Result<crate::streaming::StreamPayload>>,
     cancel: tokio_util::sync::CancellationToken,
 ) {
@@ -1799,6 +1917,9 @@ async fn moq_stream_handle_task_networked(
     };
     // #321: AEAD ON for this DH-keyed mesh stream — open sealed Tagged blocks.
     let mut verifier = StreamVerifier::new(mac_key, topic.clone()).with_enc_key(enc_key);
+    if let Some(ratchet) = epoch_ratchet {
+        verifier = verifier.with_epoch_ratchet(ratchet);
+    }
     // #145: read groups by EXACT sequence (get_group), not arrival-order next_group.
     // Each Group is served on its own QUIC uni-stream, so Groups can arrive out of
     // order; next_group's monotonic cursor returns the first Group with sequence >=
@@ -1938,7 +2059,7 @@ pub fn verify_moq_frame_with_provenance(
     Ok(payloads)
 }
 
-/// Seal a single Data/Complete/Error payload into an AES-256-GCM `Tagged` payload
+/// Seal a single Data/Complete/Error/epoch-control payload into an AES-256-GCM `Tagged` payload
 /// (#321). The 1-byte kind tag is prepended to the plaintext so the consumer can
 /// restore the original variant. Already-Tagged/other variants pass through
 /// unchanged (already-Tagged is the E2E notification path).
@@ -1956,13 +2077,24 @@ fn seal_payload(
 ) -> Result<StreamPayloadData> {
     use crate::crypto::event_crypto::{encrypt_event, encrypt_event_with_nonce, EventPrivacy};
     use crate::stream_consumer::{
-        stream_aead_aad, SEALED_KIND_COMPLETE, SEALED_KIND_DATA, SEALED_KIND_ERROR,
+        stream_aead_aad, SEALED_KIND_COMPLETE, SEALED_KIND_DATA, SEALED_KIND_EPOCH_COMMIT,
+        SEALED_KIND_ERROR,
     };
 
+    let control_bytes = match payload {
+        StreamPayloadData::EpochCommit(commit) => Some(commit.encode_control_object()),
+        _ => None,
+    };
     let (kind, body): (u8, &[u8]) = match payload {
         StreamPayloadData::Data(d) => (SEALED_KIND_DATA, d),
         StreamPayloadData::Complete(d) => (SEALED_KIND_COMPLETE, d),
         StreamPayloadData::Error(message) => (SEALED_KIND_ERROR, message.as_bytes()),
+        StreamPayloadData::EpochCommit(_) => (
+            SEALED_KIND_EPOCH_COMMIT,
+            control_bytes
+                .as_deref()
+                .ok_or_else(|| anyhow!("stream epoch control encoding missing"))?,
+        ),
         // Leave non-sealed variants untouched.
         other => return Ok(other.clone()),
     };
@@ -2087,8 +2219,9 @@ mod tests {
             &client_keypair,
             ctx.kem_ciphertexts()
                 .expect("hybrid context has ciphertexts"),
-            binding,
+            binding.clone(),
         )?;
+        let initial_ratchet = client_ratchet.clone();
         let topic = ctx.topic().to_owned();
         let origin = origin();
         let mut publisher = origin.publisher(&ctx)?;
@@ -2098,9 +2231,12 @@ mod tests {
             "epoch block bound must fail closed"
         );
 
-        let commit = publisher.prepare_next_epoch()?;
-        publisher.commit_epoch(&commit)?;
+        assert_eq!(publisher.publish_next_epoch()?, 1);
         publisher.publish_data(b"epoch-one-secret").await?;
+
+        assert_eq!(publisher.publish_next_epoch()?, 2);
+        let private_error = "private model failure: customer prompt rejected";
+        publisher.publish_error(private_error).await?;
 
         let path = origin.broadcast_path(&topic);
         let bc = tokio::time::timeout(
@@ -2113,66 +2249,236 @@ mod tests {
         let mut verifier =
             StreamVerifier::new([0; 32], String::new()).with_epoch_ratchet(client_ratchet);
 
-        let mut group0 = track
-            .get_group(0)
-            .await?
-            .ok_or_else(|| anyhow!("epoch-zero Group missing"))?;
-        let frame0 = group0
-            .read_frame()
-            .await?
-            .ok_or_else(|| anyhow!("epoch-zero Object missing"))?;
+        let mut frames = Vec::new();
+        for group_id in 0..5 {
+            let mut group = track
+                .get_group(group_id)
+                .await?
+                .ok_or_else(|| anyhow!("identified Group {group_id} missing"))?;
+            frames.push(
+                group
+                    .read_frame()
+                    .await?
+                    .ok_or_else(|| anyhow!("identified Object {group_id} missing"))?,
+            );
+        }
+        let frame0 = &frames[0];
         assert!(
             !frame0
                 .windows(b"epoch-zero-secret".len())
                 .any(|window| window == b"epoch-zero-secret"),
             "stock relay-visible Object leaked plaintext"
         );
-        let first = verify_moq_frame(&mut verifier, &topic, &frame0)?;
+        let first = verify_moq_frame(&mut verifier, &topic, frame0)?;
         assert!(matches!(&first[0], StreamPayload::Data(data) if data == b"epoch-zero-secret"));
 
-        verifier.accept_epoch_commit(&commit)?;
+        let control0 = &frames[1];
         assert!(
-            verifier.accept_epoch_commit(&commit).is_err(),
-            "replayed epoch commit accepted"
+            !control0
+                .windows(b"HYSEPK01".len())
+                .any(|window| window == b"HYSEPK01")
+                && !control0
+                    .windows(32)
+                    .any(|window| window == binding.binding_hash()),
+            "relay-visible control Object exposed the epoch-control plaintext"
         );
-        let mut group1 = track
-            .get_group(1)
-            .await?
-            .ok_or_else(|| anyhow!("epoch-one Group missing"))?;
-        let frame1 = group1
-            .read_frame()
-            .await?
-            .ok_or_else(|| anyhow!("epoch-one Object missing"))?;
-        let second = verify_moq_frame(&mut verifier, &topic, &frame1)?;
+        assert!(verify_moq_frame(&mut verifier, &topic, control0)?.is_empty());
+        let second = verify_moq_frame(&mut verifier, &topic, &frames[2])?;
         assert!(matches!(&second[0], StreamPayload::Data(data) if data == b"epoch-one-secret"));
 
-        // Errors are application payloads too: rekey, publish one, and prove a
-        // stock relay cannot read the message while the endpoint restores the
-        // exact Error variant.
-        let error_commit = publisher.prepare_next_epoch()?;
-        publisher.commit_epoch(&error_commit)?;
-        let private_error = "private model failure: customer prompt rejected";
-        publisher.publish_error(private_error).await?;
-        verifier.accept_epoch_commit(&error_commit)?;
-        let mut group2 = track
-            .get_group(2)
-            .await?
-            .ok_or_else(|| anyhow!("error epoch Group missing"))?;
-        let frame2 = group2
-            .read_frame()
-            .await?
-            .ok_or_else(|| anyhow!("error epoch Object missing"))?;
+        assert!(verify_moq_frame(&mut verifier, &topic, &frames[3])?.is_empty());
         assert!(
-            !frame2
+            !frames[4]
                 .windows(private_error.len())
                 .any(|window| window == private_error.as_bytes()),
             "stock relay-visible Object leaked the private error string"
         );
-        let error = verify_moq_frame(&mut verifier, &topic, &frame2)?;
+        let error = verify_moq_frame(&mut verifier, &topic, &frames[4])?;
         assert!(matches!(&error[0], StreamPayload::Error(message) if message == private_error));
-        assert_ne!(frame0, frame1);
-        assert_ne!(frame1, frame2);
+
+        // Each negative control first consumes the real epoch-zero Object so
+        // it has the exact authenticated old-epoch chain state. A subsequent
+        // successful control+data delivery proves every rejection was causal
+        // and left verifier state unchanged.
+        let verifier_after_epoch_zero = || -> Result<StreamVerifier> {
+            let mut verifier = StreamVerifier::new([0; 32], String::new())
+                .with_epoch_ratchet(initial_ratchet.clone());
+            let payloads = verify_moq_frame(&mut verifier, &topic, &frames[0])?;
+            anyhow::ensure!(matches!(
+                &payloads[0],
+                StreamPayload::Data(data) if data == b"epoch-zero-secret"
+            ));
+            Ok(verifier)
+        };
+
+        let mut tampered = frames[1].to_vec();
+        let tampered_index = tampered.len() / 2;
+        tampered[tampered_index] ^= 0x80;
+        let mut tamper_verifier = verifier_after_epoch_zero()?;
+        assert!(verify_moq_frame(&mut tamper_verifier, &topic, &tampered).is_err());
+        assert!(verify_moq_frame(&mut tamper_verifier, &topic, &frames[1])?.is_empty());
+        assert!(matches!(
+            &verify_moq_frame(&mut tamper_verifier, &topic, &frames[2])?[0],
+            StreamPayload::Data(data) if data == b"epoch-one-secret"
+        ));
+
+        let mut replay_verifier = verifier_after_epoch_zero()?;
+        assert!(verify_moq_frame(&mut replay_verifier, &topic, &frames[1])?.is_empty());
+        assert!(verify_moq_frame(&mut replay_verifier, &topic, &frames[1]).is_err());
+        assert!(matches!(
+            &verify_moq_frame(&mut replay_verifier, &topic, &frames[2])?[0],
+            StreamPayload::Data(data) if data == b"epoch-one-secret"
+        ));
+
+        let previous_mac = &frames[0][frames[0].len() - 16..];
+        let mut skipped = initial_ratchet.prepare_next()?;
+        skipped.epoch += 1;
+        let skipped_frame = identified_test_frame(
+            &initial_ratchet,
+            &topic,
+            previous_mac,
+            1,
+            &StreamPayloadData::EpochCommit(skipped),
+        )?;
+        let mut skip_verifier = verifier_after_epoch_zero()?;
+        assert!(verify_moq_frame(&mut skip_verifier, &topic, &skipped_frame).is_err());
+        assert!(verify_moq_frame(&mut skip_verifier, &topic, &frames[1])?.is_empty());
+
+        let foreign_binding = IdentifiedStreamBinding::new(
+            StreamCarrierProfile::StandardPublicRelay,
+            StreamRouteRole::Relay,
+            "did:at9p:producer",
+            "did:at9p:consumer",
+            StreamAcceptedState {
+                identity_did: "did:at9p:producer".into(),
+                digest: [0x31; 64],
+                epoch: 3,
+            },
+            StreamAcceptedState {
+                identity_did: "did:at9p:consumer".into(),
+                digest: [0x41; 64],
+                epoch: 4,
+            },
+            "inference.generate",
+            "infer:model:qwen",
+            "local/streams/foreign",
+            "did:at9p:producer#mesh-kem",
+            "urn:hyprstream:stream-client:one-shot",
+            1,
+        )?;
+        let foreign = crate::stream_epoch::StreamEpochRatchet::from_hybrid_secret(
+            &[0xA5; 32],
+            foreign_binding,
+        )?;
+        let cross_stream_frame = identified_test_frame(
+            &initial_ratchet,
+            &topic,
+            previous_mac,
+            1,
+            &StreamPayloadData::EpochCommit(foreign.prepare_next()?),
+        )?;
+        let mut cross_verifier = verifier_after_epoch_zero()?;
+        assert!(verify_moq_frame(&mut cross_verifier, &topic, &cross_stream_frame).is_err());
+        assert!(verify_moq_frame(&mut cross_verifier, &topic, &frames[1])?.is_empty());
+
+        let clear_payloads = [
+            StreamPayloadData::Data(b"relay-visible forged data".to_vec()),
+            StreamPayloadData::Error("relay-visible forged error".into()),
+            StreamPayloadData::Complete(b"relay-visible forged completion".to_vec()),
+            StreamPayloadData::Data(initial_ratchet.prepare_next()?.encode_control_object()),
+        ];
+        for clear_payload in &clear_payloads {
+            let forged_clear =
+                identified_test_frame(&initial_ratchet, &topic, previous_mac, 1, clear_payload)?;
+            let mut clear_verifier = verifier_after_epoch_zero()?;
+            assert!(verify_moq_frame(&mut clear_verifier, &topic, &forged_clear).is_err());
+            assert!(verify_moq_frame(&mut clear_verifier, &topic, &frames[1])?.is_empty());
+        }
+
+        let clear_heartbeat = identified_clear_heartbeat_frame(&initial_ratchet, previous_mac, 1)?;
+        let mut heartbeat_verifier = verifier_after_epoch_zero()?;
+        assert!(verify_moq_frame(&mut heartbeat_verifier, &topic, &clear_heartbeat).is_err());
+        assert!(verify_moq_frame(&mut heartbeat_verifier, &topic, &frames[1])?.is_empty());
+
+        // Lost/reordered control and next-epoch data-before-control are the same
+        // fail-closed condition. The valid control remains acceptable afterward.
+        let mut reordered_verifier = verifier_after_epoch_zero()?;
+        assert!(verify_moq_frame(&mut reordered_verifier, &topic, &frames[2]).is_err());
+        assert!(verify_moq_frame(&mut reordered_verifier, &topic, &frames[1])?.is_empty());
+        assert!(matches!(
+            &verify_moq_frame(&mut reordered_verifier, &topic, &frames[2])?[0],
+            StreamPayload::Data(data) if data == b"epoch-one-secret"
+        ));
+
+        for pair in frames.windows(2) {
+            assert_ne!(pair[0], pair[1]);
+        }
         Ok(())
+    }
+
+    fn identified_test_frame(
+        ratchet: &crate::stream_epoch::StreamEpochRatchet,
+        topic: &str,
+        previous_mac: &[u8],
+        sequence_number: u64,
+        payload: &StreamPayloadData,
+    ) -> Result<Vec<u8>> {
+        let keys = ratchet.current_keys();
+        let nonce = keys.producer_to_consumer.nonce(
+            sequence_number
+                .checked_mul(1 << 16)
+                .ok_or_else(|| anyhow!("test stream payload nonce counter exhausted"))?,
+        );
+        let payload = if matches!(payload, StreamPayloadData::EpochCommit(_)) {
+            seal_payload(
+                &keys.producer_to_consumer.enc_key,
+                topic,
+                ratchet.epoch(),
+                sequence_number,
+                0,
+                Some(nonce),
+                payload,
+            )?
+        } else {
+            payload.clone()
+        };
+        let capnp = crate::streaming::encode_stream_block(
+            previous_mac,
+            sequence_number,
+            ratchet.epoch(),
+            &[payload],
+        )?;
+        let mac = crate::crypto::keyed_mac_truncated_parts(
+            &keys.producer_to_consumer.mac_key,
+            &[previous_mac, &capnp],
+        );
+        let mut frame = capnp;
+        frame.extend_from_slice(&mac);
+        Ok(frame)
+    }
+
+    fn identified_clear_heartbeat_frame(
+        ratchet: &crate::stream_epoch::StreamEpochRatchet,
+        previous_mac: &[u8],
+        sequence_number: u64,
+    ) -> Result<Vec<u8>> {
+        let mut msg = capnp::message::Builder::new_default();
+        {
+            let mut block = msg.init_root::<crate::streaming_capnp::stream_block::Builder>();
+            block.set_prev_mac(previous_mac);
+            block.set_sequence_number(sequence_number);
+            block.set_epoch(ratchet.epoch());
+            block.init_payloads(1).get(0).set_heartbeat(());
+        }
+        let mut capnp = Vec::new();
+        capnp::serialize::write_message(&mut capnp, &msg)?;
+        let keys = ratchet.current_keys();
+        let mac = crate::crypto::keyed_mac_truncated_parts(
+            &keys.producer_to_consumer.mac_key,
+            &[previous_mac, &capnp],
+        );
+        capnp.extend_from_slice(&mac);
+        Ok(capnp)
     }
 
     /// `AnyStreamPublisher` round-trip: publish via the type alias and verify

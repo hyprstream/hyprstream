@@ -29,6 +29,8 @@ const CONTROL_MAC_DOMAIN: &str = "hyprstream identified-stream control-mac v1";
 const REKEY_AUTH_DOMAIN: &str = "hyprstream identified-stream rekey-auth v1";
 const NONCE_DOMAIN: &str = "hyprstream identified-stream nonce-domain v1";
 const EPOCH_NAMESPACE_DOMAIN: &str = "hyprstream identified-stream epoch-namespace v1";
+const CONTROL_OBJECT_MAGIC: &[u8; 8] = b"HYSEPK01";
+const CONTROL_OBJECT_LEN: usize = 154;
 
 const MAX_TEXT: usize = 1024;
 const MAX_CAPABILITY: usize = 4096;
@@ -296,6 +298,47 @@ impl StreamEpochCommit {
         out.extend_from_slice(&self.producer_namespace);
         out.extend_from_slice(&self.consumer_namespace);
         out
+    }
+
+    /// Fixed, versioned control plaintext sealed inside an ordinary opaque
+    /// stream Object. Authentication is still provided by `auth_tag`, the
+    /// current-epoch AEAD, and the chained Object MAC.
+    pub fn encode_control_object(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(CONTROL_OBJECT_LEN);
+        out.extend_from_slice(CONTROL_OBJECT_MAGIC);
+        out.extend_from_slice(&IDENTIFIED_STREAM_VERSION.to_be_bytes());
+        out.extend_from_slice(&self.binding_hash);
+        out.extend_from_slice(&self.previous_epoch.to_be_bytes());
+        out.extend_from_slice(&self.epoch.to_be_bytes());
+        out.extend_from_slice(&self.producer_namespace);
+        out.extend_from_slice(&self.consumer_namespace);
+        out.extend_from_slice(&self.auth_tag);
+        out
+    }
+
+    /// Decode the control plaintext after current-epoch AEAD verification.
+    pub fn decode_control_object(bytes: &[u8]) -> Result<Self> {
+        ensure!(
+            bytes.len() == CONTROL_OBJECT_LEN,
+            "stream epoch control has invalid length {}",
+            bytes.len()
+        );
+        ensure!(
+            &bytes[..8] == CONTROL_OBJECT_MAGIC,
+            "stream epoch control magic mismatch"
+        );
+        ensure!(
+            u16::from_be_bytes(bytes[8..10].try_into()?) == IDENTIFIED_STREAM_VERSION,
+            "stream epoch control version mismatch"
+        );
+        Ok(Self {
+            binding_hash: bytes[10..42].try_into()?,
+            previous_epoch: u64::from_be_bytes(bytes[42..50].try_into()?),
+            epoch: u64::from_be_bytes(bytes[50..58].try_into()?),
+            producer_namespace: bytes[58..90].try_into()?,
+            consumer_namespace: bytes[90..122].try_into()?,
+            auth_tag: bytes[122..154].try_into()?,
+        })
     }
 }
 

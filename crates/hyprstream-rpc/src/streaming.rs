@@ -134,6 +134,9 @@ pub enum StreamPayloadData {
     Error(String),
     /// Completion with app-specific metadata
     Complete(Vec<u8>),
+    /// Internal identified-profile control plaintext. This variant must be
+    /// sealed into `Tagged` before Cap'n Proto serialization.
+    EpochCommit(crate::stream_epoch::StreamEpochCommit),
     /// Encrypted tagged payload with key commitment
     Tagged {
         tag: Vec<u8>,
@@ -1143,6 +1146,11 @@ pub fn encode_stream_block_with_provenance(
                 }
                 StreamPayloadData::Complete(data) => {
                     p.set_complete(data);
+                }
+                StreamPayloadData::EpochCommit(_) => {
+                    anyhow::bail!(
+                        "identified stream epoch control reached cleartext serialization"
+                    );
                 }
                 StreamPayloadData::Tagged {
                     tag,
