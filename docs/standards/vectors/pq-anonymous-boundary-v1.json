@@ -12,7 +12,8 @@
     "accepted_state_digest": "1010101010101010101010101010101010101010101010101010101010101010",
     "expiry": 2000000600,
     "redemption_context": "30303030303030303030303030303030",
-    "resource_profile_commitment": "4040404040404040404040404040404040404040404040404040404040404040"
+    "resource_profile_commitment": "4040404040404040404040404040404040404040404040404040404040404040",
+    "context_digest": "6060606060606060606060606060606060606060606060606060606060606060"
   },
   "baseline": {
     "messages": {
@@ -36,14 +37,14 @@
         "version": 1,
         "profile_id": "hs-pp-pqhybrid/experimental-boundary/v1",
         "composition": "and",
-        "challenge_digest": "5050505050505050505050505050505050505050505050505050505050505050",
+        "challenge_digest": "7912b38d7fd380923959141184e987b014ee75f1805e19e42c2747ddbd06a062",
         "legs": [
           {
             "role": "classical-anonymous",
             "purpose": "privacy-pass-classical-issuance",
             "issuer_key_id": "did:at9p:issuer-example#privacy-pass-classical-2026-07",
             "suite_id": "rfc9578-publicly-verifiable-v1",
-            "challenge_digest": "5050505050505050505050505050505050505050505050505050505050505050",
+            "challenge_digest": "7912b38d7fd380923959141184e987b014ee75f1805e19e42c2747ddbd06a062",
             "context_digest": "6060606060606060606060606060606060606060606060606060606060606060",
             "artifact": "c0"
           },
@@ -52,7 +53,7 @@
             "purpose": "privacy-pass-pq-anonymous-issuance",
             "issuer_key_id": "did:at9p:issuer-example#privacy-pass-pq-anonymous-unselected",
             "suite_id": null,
-            "challenge_digest": "5050505050505050505050505050505050505050505050505050505050505050",
+            "challenge_digest": "7912b38d7fd380923959141184e987b014ee75f1805e19e42c2747ddbd06a062",
             "context_digest": "6060606060606060606060606060606060606060606060606060606060606060",
             "artifact": ""
           }
@@ -63,14 +64,14 @@
         "version": 1,
         "profile_id": "hs-pp-pqhybrid/experimental-boundary/v1",
         "composition": "and",
-        "challenge_digest": "5050505050505050505050505050505050505050505050505050505050505050",
+        "challenge_digest": "7912b38d7fd380923959141184e987b014ee75f1805e19e42c2747ddbd06a062",
         "legs": [
           {
             "role": "classical-anonymous",
             "purpose": "privacy-pass-classical-issuance",
             "issuer_key_id": "did:at9p:issuer-example#privacy-pass-classical-2026-07",
             "suite_id": "rfc9578-publicly-verifiable-v1",
-            "challenge_digest": "5050505050505050505050505050505050505050505050505050505050505050",
+            "challenge_digest": "7912b38d7fd380923959141184e987b014ee75f1805e19e42c2747ddbd06a062",
             "context_digest": "6060606060606060606060606060606060606060606060606060606060606060",
             "artifact": "c1"
           },
@@ -79,7 +80,7 @@
             "purpose": "privacy-pass-pq-anonymous-issuance",
             "issuer_key_id": "did:at9p:issuer-example#privacy-pass-pq-anonymous-unselected",
             "suite_id": null,
-            "challenge_digest": "5050505050505050505050505050505050505050505050505050505050505050",
+            "challenge_digest": "7912b38d7fd380923959141184e987b014ee75f1805e19e42c2747ddbd06a062",
             "context_digest": "6060606060606060606060606060606060606060606060606060606060606060",
             "artifact": ""
           }
@@ -90,7 +91,7 @@
         "version": 1,
         "profile_id": "hs-pp-pqhybrid/experimental-boundary/v1",
         "composition": "and",
-        "challenge_digest": "5050505050505050505050505050505050505050505050505050505050505050",
+        "challenge_digest": "7912b38d7fd380923959141184e987b014ee75f1805e19e42c2747ddbd06a062",
         "issuer_id": "did:at9p:issuer-example",
         "audience": "did:at9p:origin-example",
         "suite_id": "unselected-pq-anonymous-construction",
@@ -106,7 +107,7 @@
             "purpose": "privacy-pass-classical-issuance",
             "issuer_key_id": "did:at9p:issuer-example#privacy-pass-classical-2026-07",
             "suite_id": "rfc9578-publicly-verifiable-v1",
-            "challenge_digest": "5050505050505050505050505050505050505050505050505050505050505050",
+            "challenge_digest": "7912b38d7fd380923959141184e987b014ee75f1805e19e42c2747ddbd06a062",
             "context_digest": "6060606060606060606060606060606060606060606060606060606060606060",
             "artifact": "c2"
           },
@@ -115,7 +116,7 @@
             "purpose": "privacy-pass-pq-anonymous-issuance",
             "issuer_key_id": "did:at9p:issuer-example#privacy-pass-pq-anonymous-unselected",
             "suite_id": null,
-            "challenge_digest": "5050505050505050505050505050505050505050505050505050505050505050",
+            "challenge_digest": "7912b38d7fd380923959141184e987b014ee75f1805e19e42c2747ddbd06a062",
             "context_digest": "6060606060606060606060606060606060606060606060606060606060606060",
             "artifact": ""
           }
@@ -124,7 +125,7 @@
       }
     }
   },
-  "baseline_canonical_sha256": "5545101a791689fc9292d6ae5b4c1f8ff9d6dc4721dbdfa38d2815b37d90f028",
+  "baseline_canonical_sha256": "75ac185880444f102424c55d61a3fcdb3c7151b9e3ec027c473bc12647b71a6a",
   "expected_production_refusal": "construction-unselected",
   "mutations": [
     {
@@ -154,11 +155,25 @@
       "expected_error": "token:unknown-leg"
     },
     {
-      "id": "crossed-leg-context",
+      "id": "crossed-leg-challenge-digest",
       "op": "replace",
       "path": ["messages", "token", "legs", 1, "challenge_digest"],
       "value": "7070707070707070707070707070707070707070707070707070707070707070",
       "expected_error": "token:crossed-challenge"
+    },
+    {
+      "id": "changed-challenge-without-digest",
+      "op": "replace",
+      "path": ["messages", "challenge", "challenge_nonce"],
+      "value": "21212121212121212121212121212121",
+      "expected_error": "issuance-request:challenge-hash"
+    },
+    {
+      "id": "crossed-leg-context-digest",
+      "op": "replace",
+      "path": ["messages", "issuance-request", "legs", 1, "context_digest"],
+      "value": "6161616161616161616161616161616161616161616161616161616161616161",
+      "expected_error": "issuance-request:crossed-context"
     },
     {
       "id": "stripped-to-classical-only",

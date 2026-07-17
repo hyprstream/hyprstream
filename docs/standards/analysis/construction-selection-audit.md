@@ -49,10 +49,11 @@ was retrieved at 2026-07-17T17:43:08Z (datatracker release 12.65.0,
 `draft-ietf-privacypass-public-metadata-issuance-03`. None specifies an adopted
 post-quantum-unforgeable anonymous token issuance suite; the two ARC drafts are
 the only anonymous-credential construction in that inventory and use the
-classical group construction discussed above. This enumerated snapshot makes
-the negative finding reproducible even as the live WG page changes. Recent
-research is promising, but selecting its algorithms, parameters, encodings, and
-composition here would invent a protocol rather than implement a reviewed one.
+classical group construction discussed above. This is a dated recorded
+inventory, not an archived or cryptographically pinned copy of the mutable
+datatracker database. Recent research is promising, but selecting its
+algorithms, parameters, encodings, and composition here would invent a protocol
+rather than implement a reviewed one.
 
 ## Implemented boundary
 
@@ -66,7 +67,8 @@ then reaches the mandatory `construction-unselected` refusal; no vector is a
 mintable or redeemable token.
 
 The checker proves the boundary rejects missing, duplicate, reordered, unknown,
-crossed, or stripped legs; holder-identifying fields; stale or crossed state;
+crossed, or stripped legs; challenge-fixture hash changes and crossed leg
+contexts; holder-identifying fields; stale or crossed state;
 policy rollback; expired or crossed expiry; wrong origin; crossed redemption or
 resource-profile bindings; malformed hex; and key-purpose or key-reuse
 substitutions. These are parser/profile negative controls, not evidence of

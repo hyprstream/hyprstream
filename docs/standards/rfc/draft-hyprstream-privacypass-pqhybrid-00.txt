@@ -214,10 +214,10 @@ Internet-Draft       PQ Hybrid Privacy Pass Profile            July 2026
    exact accepted-current issuer, audience, state epoch and digest,
    policy generation, expiry, redemption context, and resource-profile
    commitment values and MUST reject stale, rolled-back, expired, or
-   crossed values.
-
-
-
+   crossed values.  The experimental fixture boundary MUST derive its
+   challenge digest from the canonical repository fixture challenge and
+   MUST require the evaluator-authoritative context digest in every leg
+   of every message.
 
 
 

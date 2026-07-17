@@ -12,7 +12,7 @@ The generated text/HTML intentionally exercise xml2rfc's standard Internet-Draft
 - `analysis/standards-gap-matrix.md` — standards status, explicit non-allocations, construction questions.
 - `analysis/construction-selection-audit.md` — #1060 primary-source candidate audit and the precise reason no production construction is selected.
 - `registry/domain-separation.json` — local labels, transcript fields, canonicalization, bounds, and owning issues; it is not an external registry.
-- `registry/pq-anonymous-issuance.json` — canonical experimental message/AND-leg boundary with an unconditional production refusal.
+- `registry/pq-anonymous-issuance.json` — canonical experimental message/AND-leg boundary with a fixture-only challenge hash, exact evaluator context, and an unconditional production refusal.
 - `registry/profile-vocabulary.json` — bounded roles, principal kinds, carrier profiles, inner control message kinds, state names, and safety ceilings shared by later drafts.
 - `registry/obligations.json` — machine-readable mapping for every RFCXML `MUST`/`MUST NOT` to a test or explicit specification-only owner/blocker.
 - `vectors/pq-anonymous-boundary-v1.json` — deterministic non-cryptographic baseline and mutation-effective negative controls; it contains no mintable token.

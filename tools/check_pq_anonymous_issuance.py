@@ -64,6 +64,15 @@ def validate_registry(registry: dict[str, Any]) -> None:
     )
     require(registry.get("token_type") is None, "registry:token-type-must-be-unselected")
     require(registry.get("pq_construction") is None, "registry:pq-construction-must-be-unselected")
+    fixture_canonicalization = registry.get("fixture_canonicalization", {})
+    require(
+        fixture_canonicalization.get("challenge_digest")
+        == (
+            "lowercase SHA-256 hex of the canonical challenge fixture object under this "
+            "fixture encoding only; not a production protocol digest"
+        ),
+        "registry:fixture-challenge-digest",
+    )
 
     composition = registry.get("composition", {})
     require(composition.get("operator") == "and", "registry:composition")
@@ -132,6 +141,7 @@ def validate_legs(
     message: dict[str, Any],
     registry: dict[str, Any],
     challenge_digest: str,
+    expected_context_digest: str,
 ) -> None:
     require(message.get("composition") == "and", f"{kind}:composition")
     legs = message.get("legs")
@@ -163,6 +173,10 @@ def validate_legs(
                 maximum=bounds["digest_hex_chars"],
             ),
             f"{kind}:context-digest",
+        )
+        require(
+            leg["context_digest"] == expected_context_digest,
+            f"{kind}:crossed-context",
         )
         artifact = leg.get("artifact")
         require(
@@ -270,15 +284,35 @@ def validate_boundary(
         "challenge:resource-profile-commitment-binding",
     )
 
+    expected_challenge_digest = hashlib.sha256(canonical_json(challenge)).hexdigest()
     request_digest = messages["issuance-request"].get("challenge_digest")
     require(
         is_hex(request_digest, minimum=bounds["digest_hex_chars"], maximum=bounds["digest_hex_chars"]),
         "issuance-request:challenge-digest",
     )
+    require(
+        request_digest == expected_challenge_digest,
+        "issuance-request:challenge-hash",
+    )
+    expected_context_digest = evaluation.get("context_digest")
+    require(
+        is_hex(
+            expected_context_digest,
+            minimum=bounds["digest_hex_chars"],
+            maximum=bounds["digest_hex_chars"],
+        ),
+        "evaluation:context-digest",
+    )
     for kind in ("issuance-request", "issuance-response", "token"):
         message = messages[kind]
         require(message.get("challenge_digest") == request_digest, f"{kind}:crossed-challenge")
-        validate_legs(kind, message, registry, request_digest)
+        validate_legs(
+            kind,
+            message,
+            registry,
+            request_digest,
+            expected_context_digest,
+        )
 
     token = messages["token"]
     for field in (
