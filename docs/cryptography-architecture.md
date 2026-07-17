@@ -464,7 +464,8 @@ epoch committed. The publisher resets the per-epoch sequence and MAC chain but
 never resets its MOQT Group counter, so a cached track/group/object identity is
 never republished with different ciphertext.
 
-The profile is carrier-neutral. A standard MOQT relay forwards ordinary opaque
+The profile is carrier-neutral. Data, completion metadata, and error messages are
+all sealed before framing, so a standard MOQT relay forwards ordinary opaque
 Object bytes and receives neither the transcript nor traffic keys. Network key
 release is still a separate #726 authorization PEP; the generic
 `StreamKeyReleaseGate`/`StreamKeyReleasePrincipal` seam does not implement or

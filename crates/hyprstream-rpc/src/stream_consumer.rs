@@ -89,7 +89,7 @@ pub struct VerifierContract {
 pub struct StreamVerifier {
     key: [u8; 32],
     /// Transport-level AEAD key (#321). `Some` ⇒ a `Tagged` payload is opened
-    /// (AES-256-GCM, AAD bound to topic+epoch) back into Data/Complete; `None` ⇒
+    /// (AES-256-GCM, AAD bound to topic+epoch) back into Data/Complete/Error; `None` ⇒
     /// `Tagged` payloads pass through unchanged (the E2E notification path, which
     /// the app layer decrypts itself).
     enc_key: Option<[u8; 32]>,
@@ -130,7 +130,7 @@ impl StreamVerifier {
     /// Set the transport AEAD key so sealed `Tagged` payloads are opened (#321).
     ///
     /// Builder-style; pass the `enc_key` from `derive_client_stream_keys`. With it
-    /// set, the verifier decrypts each `Tagged` block back into Data/Complete and
+    /// set, the verifier decrypts each `Tagged` block back into Data/Complete/Error and
     /// fails closed on tamper / wrong key.
     pub fn with_enc_key(mut self, enc_key: [u8; 32]) -> Self {
         self.enc_key = Some(enc_key);
@@ -326,7 +326,7 @@ impl StreamVerifier {
                     let tagged = tagged_result?;
                     match self.enc_key {
                         // #321: transport AEAD ON — open the sealed payload back into
-                        // Data/Complete (fails closed on tamper / wrong key).
+                        // Data/Complete/Error (fails closed on tamper / wrong key).
                         Some(ref enc_key) => open_sealed_payload(
                             enc_key,
                             &self.topic,
@@ -386,10 +386,11 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 // ============================================================================
 
 /// Plaintext kind tag prepended inside the AEAD-sealed bytes so the open path can
-/// restore the original payload variant (`Data` vs `Complete`) without a schema
-/// change. Authenticated as part of the AEAD plaintext.
+/// restore the original payload variant without a schema change. Authenticated
+/// as part of the AEAD plaintext.
 pub(crate) const SEALED_KIND_DATA: u8 = 0x00;
 pub(crate) const SEALED_KIND_COMPLETE: u8 = 0x01;
+pub(crate) const SEALED_KIND_ERROR: u8 = 0x02;
 
 /// Build the AEAD AAD (also the `encrypt_event` "prefix") binding each sealed
 /// payload to its `topic` and key-`epoch` (#321/#223). Reused verbatim by the
@@ -406,7 +407,7 @@ pub(crate) fn stream_aead_aad(
 }
 
 /// Open an AEAD-sealed `Tagged` payload (#321), restoring the original
-/// Data/Complete variant. Returns `Err` on tamper / wrong key (fail-closed).
+/// Data/Complete/Error variant. Returns `Err` on tamper / wrong key (fail-closed).
 ///
 /// `epoch` is the StreamBlock's epoch and MUST match the seal-side AAD.
 pub(crate) fn open_sealed_payload(
@@ -447,6 +448,13 @@ pub(crate) fn open_sealed_payload(
     match kind {
         SEALED_KIND_DATA => Ok(StreamPayload::Data(body.to_vec())),
         SEALED_KIND_COMPLETE => Ok(StreamPayload::Complete(body.to_vec())),
+        SEALED_KIND_ERROR => Ok(StreamPayload::Error(
+            std::str::from_utf8(body)
+                .map_err(|error| {
+                    anyhow::anyhow!("stream AEAD: sealed error is not UTF-8: {error}")
+                })?
+                .to_owned(),
+        )),
         other => anyhow::bail!("stream AEAD: unknown sealed kind tag {other:#x}"),
     }
 }

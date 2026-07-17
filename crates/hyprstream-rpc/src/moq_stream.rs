@@ -735,7 +735,7 @@ impl MoqStreamOrigin {
 /// `BatchingConfig` in M2b for granularity parity.
 pub struct MoqStreamPublisher {
     hmac_state: StreamHmacState,
-    /// Transport-level AEAD key (#321). `Some` ⇒ each Data/Complete payload is
+    /// Transport-level AEAD key (#321). `Some` ⇒ each Data/Complete/Error payload is
     /// sealed with AES-256-GCM into a `Tagged` payload before the HMAC chain runs;
     /// `None` ⇒ cleartext (keyless notification path).
     enc_key: Option<[u8; 32]>,
@@ -845,11 +845,10 @@ impl MoqStreamPublisher {
             .checked_add(1)
             .ok_or_else(|| anyhow!("stream sequence exhausted"))?;
 
-        // #321: on the mesh/DH path (`enc_key = Some`), seal each Data/Complete
+        // #321: on the mesh/DH path (`enc_key = Some`), seal each Data/Complete/Error
         // payload with AES-256-GCM into a `Tagged` payload BEFORE the HMAC chain
         // runs (so the chain authenticates the ciphertext — no double-encryption,
-        // ordering/anti-replay unchanged). Error frames stay cleartext (operational
-        // status, terminal). The AEAD AAD/key-commitment are bound to the block's
+        // ordering/anti-replay unchanged). The AEAD AAD/key-commitment are bound to the block's
         // `epoch` (and topic), so a rekey can't replay a block across epochs.
         let sealed: Vec<StreamPayloadData>;
         let payloads: &[StreamPayloadData] = match self.enc_key {
@@ -1939,10 +1938,10 @@ pub fn verify_moq_frame_with_provenance(
     Ok(payloads)
 }
 
-/// Seal a single Data/Complete payload into an AES-256-GCM `Tagged` payload
+/// Seal a single Data/Complete/Error payload into an AES-256-GCM `Tagged` payload
 /// (#321). The 1-byte kind tag is prepended to the plaintext so the consumer can
-/// restore the original variant. Error/Tagged/other variants pass through
-/// unchanged (Error is operational, already-Tagged is the E2E notification path).
+/// restore the original variant. Already-Tagged/other variants pass through
+/// unchanged (already-Tagged is the E2E notification path).
 ///
 /// Shares its AAD + kind-tag framing with the cross-target open path
 /// ([`crate::stream_consumer::open_sealed_payload`]).
@@ -1956,11 +1955,14 @@ fn seal_payload(
     payload: &StreamPayloadData,
 ) -> Result<StreamPayloadData> {
     use crate::crypto::event_crypto::{encrypt_event, encrypt_event_with_nonce, EventPrivacy};
-    use crate::stream_consumer::{stream_aead_aad, SEALED_KIND_COMPLETE, SEALED_KIND_DATA};
+    use crate::stream_consumer::{
+        stream_aead_aad, SEALED_KIND_COMPLETE, SEALED_KIND_DATA, SEALED_KIND_ERROR,
+    };
 
     let (kind, body): (u8, &[u8]) = match payload {
         StreamPayloadData::Data(d) => (SEALED_KIND_DATA, d),
         StreamPayloadData::Complete(d) => (SEALED_KIND_COMPLETE, d),
+        StreamPayloadData::Error(message) => (SEALED_KIND_ERROR, message.as_bytes()),
         // Leave non-sealed variants untouched.
         other => return Ok(other.clone()),
     };
@@ -2143,7 +2145,33 @@ mod tests {
             .ok_or_else(|| anyhow!("epoch-one Object missing"))?;
         let second = verify_moq_frame(&mut verifier, &topic, &frame1)?;
         assert!(matches!(&second[0], StreamPayload::Data(data) if data == b"epoch-one-secret"));
+
+        // Errors are application payloads too: rekey, publish one, and prove a
+        // stock relay cannot read the message while the endpoint restores the
+        // exact Error variant.
+        let error_commit = publisher.prepare_next_epoch()?;
+        publisher.commit_epoch(&error_commit)?;
+        let private_error = "private model failure: customer prompt rejected";
+        publisher.publish_error(private_error).await?;
+        verifier.accept_epoch_commit(&error_commit)?;
+        let mut group2 = track
+            .get_group(2)
+            .await?
+            .ok_or_else(|| anyhow!("error epoch Group missing"))?;
+        let frame2 = group2
+            .read_frame()
+            .await?
+            .ok_or_else(|| anyhow!("error epoch Object missing"))?;
+        assert!(
+            !frame2
+                .windows(private_error.len())
+                .any(|window| window == private_error.as_bytes()),
+            "stock relay-visible Object leaked the private error string"
+        );
+        let error = verify_moq_frame(&mut verifier, &topic, &frame2)?;
+        assert!(matches!(&error[0], StreamPayload::Error(message) if message == private_error));
         assert_ne!(frame0, frame1);
+        assert_ne!(frame1, frame2);
         Ok(())
     }
 
