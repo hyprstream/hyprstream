@@ -195,11 +195,11 @@ Internet-Draft       PQ Hybrid Privacy Pass Profile            July 2026
    supplied the complete reviewed Privacy Pass construction, fixed
    parameters, maintained implementation, canonical profile encoding and
    vectors, and analysis of this exact classical-plus-PQ composition.  A
-   production implementation MUST NOT issue, accept, redeem, dispatch,
-   or release a key under this profile while the PQ construction and
-   token type are unselected.  The experimental boundary checker MUST
-   terminate a structurally valid fixture with the
-   ConstructionUnselected refusal.
+   production implementation MUST NOT issue, accept, redeem, clear a
+   MAC, generate an authorization result, dispatch, or release a key
+   under this profile while the PQ construction and token type are
+   unselected.  The experimental boundary checker MUST terminate a
+   structurally valid fixture with the ConstructionUnselected refusal.
 
    The repository-local experimental boundary is a deterministic non-
    cryptographic fixture schema, not a token type or protocol encoding.

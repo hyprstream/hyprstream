@@ -76,11 +76,11 @@
       "id": "PPQH-REQ-008",
       "keyword": "MUST NOT",
       "source": "construction-status",
-      "statement": "A production implementation MUST NOT issue, accept, redeem, dispatch, or release a key under this profile while the PQ construction and token type are unselected.",
+      "statement": "A production implementation MUST NOT issue, accept, redeem, clear a MAC, generate an authorization result, dispatch, or release a key under this profile while the PQ construction and token type are unselected.",
       "kind": "specification-only",
       "owner": "#1060",
-      "blocker": "No production issuance or redemption path exists and no reviewed PQ anonymous construction is selected.",
-      "planned_test": "production-issuer-origin-and-key-release-refuse-unselected-construction"
+      "blocker": "No production issuance, redemption, authorization-result, MAC-clearance, or key-release path exists and no reviewed PQ anonymous construction is selected.",
+      "planned_test": "production-issuer-origin-mac-authorization-and-key-release-refuse-unselected-construction"
     },
     {
       "id": "PPQH-REQ-009",
