@@ -10,6 +10,7 @@
   "fixture_canonicalization": {
     "encoding": "UTF-8 JSON with object keys sorted lexicographically, no insignificant whitespace, and only the string, integer, boolean, null, array, and object values admitted by this registry",
     "purpose": "deterministic repository-owned negative-control fixtures only; not a protocol encoding",
+    "message_version": "JSON integer 1 exactly; booleans and all other JSON types are rejected",
     "challenge_digest": "lowercase SHA-256 hex of the canonical challenge fixture object under this fixture encoding only; not a production protocol digest"
   },
   "composition": {

@@ -34,7 +34,7 @@ the `PqHybrid` authorization assurance used by Hyprstream.
 | [Post-Quantum Privacy Pass via Post-Quantum Anonymous Credentials](https://eprint.iacr.org/2023/414) and its [reference implementation](https://github.com/guruvamsi-policharla/zkdilithium) | The ePrint calls the construction “plausibly post-quantum,” uses a modified Dilithium and a conjectured 115-bit STARK setting, and reports 85–175 KB proofs. Section 4 says the benchmarked Winterfell backend did not support zero knowledge. The implementation labels itself an academic proof of concept that has not received careful code review and is not production ready. | Valuable Privacy Pass-specific research, but it does not supply a reviewed, production-capable zero-knowledge implementation or a current Privacy Pass token-type profile. Do not select it. |
 | [Improved Lattice Blind Signatures from Recycled Entropy](https://doi.org/10.1007/978-3-032-01855-7_16), CRYPTO 2025 | Peer-reviewed blind-signature research with standard lattice assumptions and a reported implementation; signatures remain roughly 40 KB. | A serious primitive candidate, but no CFRG/Privacy Pass profile, interoperable maintained implementation, fixed Hyprstream parameter set, canonical Privacy Pass encoding, vectors, side-channel review, or analysis of this exact AND composition was found. Primitive review alone is not the required profile review. |
 | [Concretely Efficient Blind Signatures Based on VOLE-in-the-Head Proofs and the MAYO Trapdoor](https://www.usenix.org/conference/usenixsecurity26/presentation/baum), USENIX Security 2026 | PoMFRIT is described by its authors as “plausibly post-quantum.” It combines VOLE-in-the-head with MAYO; the paper discusses a conjectured one-more-MAYO variant and implementation/security trade-offs. MAYO remained a NIST additional-signature candidate at this assessment date. | Not a standardized or reviewed Privacy Pass construction and not an acceptable basis for a production assurance claim. Track as research only. |
-| [Anonymous Rate-Limited Credentials Cryptography](https://datatracker.ietf.org/doc/html/draft-ietf-privacypass-arc-crypto-01) | An active Privacy Pass WG draft with concrete encodings and vectors, but its group construction is classical. Section 7.3 explains that a quantum discrete-log attack can partition/link clients. | Useful protocol-shape input, not the PQ anonymous leg. |
+| [Anonymous Rate-Limited Credentials Cryptography](https://datatracker.ietf.org/doc/html/draft-ietf-privacypass-arc-crypto-01) | An active Privacy Pass WG draft with concrete encodings and vectors, but its group construction is classical. Section 7.2 explains that a quantum discrete-log attack can partition/link clients. | Useful protocol-shape input, not the PQ anonymous leg. |
 | [Late binding with PQ privacy](https://datatracker.ietf.org/meeting/interim-2026-privacypass-01/materials/slides-interim-2026-privacypass-01-sessa-late-binding-with-pq-unlinkability-00), Privacy Pass interim, 2026-05-13 | Records that current ACT is PQ-unlinkable but forgeable after breaking BBS, and says the proposed late-binding idea lacks concrete unforgeability/unlinkability bounds and needs end-to-end analysis. | Confirms the standards community is still separating PQ privacy from PQ unforgeability. It is not a selected construction. |
 | [PACT workshop summary](https://datatracker.ietf.org/meeting/interim-2026-privacypass-01/materials/slides-interim-2026-privacypass-01-sessa-pact-workshop-update-00), 2026-05-13 | Places post-quantum adversaries in scope for unlinkability but presents a problem statement and preliminary realization directions rather than a complete PQ-unforgeable issuance construction. | Relevant requirements input; no implementable PQ token suite follows from it. |
 
@@ -67,11 +67,11 @@ then reaches the mandatory `construction-unselected` refusal; no vector is a
 mintable or redeemable token.
 
 The checker proves the boundary rejects missing, duplicate, reordered, unknown,
-crossed, or stripped legs; challenge-fixture hash changes and crossed leg
-contexts; holder-identifying fields; stale or crossed state;
-policy rollback; expired or crossed expiry; wrong origin; crossed redemption or
-resource-profile bindings; malformed hex; and key-purpose or key-reuse
-substitutions. These are parser/profile negative controls, not evidence of
+crossed, or stripped legs; non-integer message versions; challenge-fixture hash
+changes and crossed leg contexts; holder-identifying fields; stale or crossed
+state; policy rollback; expired or crossed expiry; wrong origin; crossed
+redemption or resource-profile bindings; malformed hex; and key-purpose or
+key-reuse substitutions. These are parser/profile negative controls, not evidence of
 cryptographic issuance.
 
 ## Precise dependency

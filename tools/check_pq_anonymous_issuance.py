@@ -48,8 +48,16 @@ def require(condition: bool, reason: str) -> None:
         raise BoundaryError(reason)
 
 
+def is_json_integer(value: Any) -> bool:
+    return type(value) is int
+
+
 def validate_registry(registry: dict[str, Any]) -> None:
-    require(registry.get("profile_version") == 1, "registry:profile-version")
+    profile_version = registry.get("profile_version")
+    require(
+        is_json_integer(profile_version) and profile_version == 1,
+        "registry:profile-version",
+    )
     require(
         registry.get("profile_id") == "hs-pp-pqhybrid/experimental-boundary/v1",
         "registry:profile-id",
@@ -65,6 +73,11 @@ def validate_registry(registry: dict[str, Any]) -> None:
     require(registry.get("token_type") is None, "registry:token-type-must-be-unselected")
     require(registry.get("pq_construction") is None, "registry:pq-construction-must-be-unselected")
     fixture_canonicalization = registry.get("fixture_canonicalization", {})
+    require(
+        fixture_canonicalization.get("message_version")
+        == "JSON integer 1 exactly; booleans and all other JSON types are rejected",
+        "registry:fixture-message-version",
+    )
     require(
         fixture_canonicalization.get("challenge_digest")
         == (
@@ -216,7 +229,8 @@ def validate_boundary(
         require(isinstance(message, dict), f"{kind}:object")
         exact_fields(message, schemas[kind], kind)
         require(message.get("kind") == kind, f"{kind}:kind")
-        require(message.get("version") == 1, f"{kind}:version")
+        version = message.get("version")
+        require(is_json_integer(version) and version == 1, f"{kind}:version")
         require(message.get("profile_id") == profile_id, f"{kind}:profile")
 
     challenge = messages["challenge"]
@@ -374,7 +388,11 @@ def main() -> int:
         registry = load_object(REGISTRY_PATH)
         vectors = load_object(VECTOR_PATH)
         validate_registry(registry)
-        require(vectors.get("vector_version") == 1, "vectors:version")
+        vector_version = vectors.get("vector_version")
+        require(
+            is_json_integer(vector_version) and vector_version == 1,
+            "vectors:version",
+        )
         require(vectors.get("profile_id") == registry["profile_id"], "vectors:profile")
         require(vectors.get("status") == "non-cryptographic-structural-fixture", "vectors:status")
 

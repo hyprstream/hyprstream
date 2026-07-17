@@ -176,6 +176,13 @@
       "expected_error": "issuance-request:crossed-context"
     },
     {
+      "id": "boolean-message-version",
+      "op": "replace",
+      "path": ["messages", "token", "version"],
+      "value": true,
+      "expected_error": "token:version"
+    },
+    {
       "id": "stripped-to-classical-only",
       "op": "replace",
       "path": ["messages", "token", "composition"],
