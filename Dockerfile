@@ -189,15 +189,12 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 ENV LIBTORCH=/opt/libtorch
 ENV LD_LIBRARY_PATH=/opt/libtorch/lib
 
-# Toolchain-independent CI tooling for the merge-gate job (rust.yml), baked here
-# so the job does not fetch these over the network at runtime (removes per-run
-# apt/curl round-trips and their flake risk; #1011 follow-up):
+# CI tooling for the merge-gate job (rust.yml), baked here so the job does not
+# fetch anything over the network at runtime (removes per-run round-trips and
+# their flake/supply-chain risk; #1011 follow-up):
 #   - git-lfs: git2db's LFS worktree tests shell out to the git-lfs binary.
 #   - cargo-nextest: pinned + SHA-256 verified (never get.nexte.st/latest — a
 #     mutable fetch that would otherwise run in an AWS-credentialed container).
-# Rust *targets* and *components* are toolchain-scoped and the repo pins its
-# toolchain via rust-toolchain.toml (channel + components + targets), so they are
-# NOT baked here — rustup provisions them for the pinned toolchain at first use.
 ARG NEXTEST_VERSION=0.9.140
 ARG NEXTEST_SHA256=8b3f4d4560b6b0f83774fecc6be07e47716dbad0eb0bb6c3890f478f4affe4b6
 RUN apt-get update && apt-get install -y --no-install-recommends git-lfs \
@@ -208,6 +205,19 @@ RUN apt-get update && apt-get install -y --no-install-recommends git-lfs \
     && tar zxf /tmp/nextest.tar.gz -C /root/.cargo/bin \
     && rm -f /tmp/nextest.tar.gz \
     && cargo-nextest --version && git-lfs --version
+
+# Pre-provision the repo's pinned Rust toolchain (channel + components + targets)
+# from rust-toolchain.toml so the merge gate does NOT rustup-download it at
+# runtime. Channel is read from the file (no version duplication); the component/
+# target adds operate on that active toolchain. build-image.yml rebuilds on
+# rust-toolchain.toml changes so the baked toolchain stays in sync with the pin.
+COPY rust-toolchain.toml /tmp/tc/rust-toolchain.toml
+RUN cd /tmp/tc \
+    && rustup show \
+    && rustup component add clippy rustfmt \
+    && rustup target add wasm32-unknown-unknown wasm32-wasip1 \
+    && rustup target list --installed | grep -qx wasm32-wasip1 \
+    && rm -rf /tmp/tc
 
 #############################################
 # Select Builder Based on Variant
