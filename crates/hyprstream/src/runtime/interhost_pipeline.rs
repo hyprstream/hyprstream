@@ -335,12 +335,13 @@ impl InterhostPipelinePlanner {
             }
         }
 
-        let mut candidates = hosts
-            .iter()
-            .map(|host| {
-                usable_bytes(host.available_vram_bytes, options).map(|usable| (host, usable))
-            })
-            .collect::<Result<Vec<_>>>()?;
+        let mut candidates = Vec::with_capacity(hosts.len());
+        for host in hosts {
+            let usable = usable_bytes(host.available_vram_bytes, options)?;
+            if usable > 0 {
+                candidates.push((host, usable));
+            }
+        }
         candidates.sort_by(|(left, left_bytes), (right, right_bytes)| {
             right_bytes
                 .cmp(left_bytes)
@@ -499,9 +500,7 @@ fn usable_bytes(available: u64, options: PlannerOptions) -> Result<u64> {
         / BASIS_POINTS as u128;
     let after_fraction =
         u64::try_from(after_fraction).map_err(|_| anyhow!("VRAM reserve calculation overflow"))?;
-    after_fraction
-        .checked_sub(options.runtime_reserve_bytes)
-        .ok_or_else(|| anyhow!("runtime reserve exceeds a host's available VRAM"))
+    Ok(after_fraction.saturating_sub(options.runtime_reserve_bytes))
 }
 
 /// Exact pipeline bubble/utilization sizing for `S` stages and `m`
@@ -596,6 +595,8 @@ pub struct PipelineJobRecovery {
     epoch: u64,
     state: PipelineJobState,
     in_flight: BTreeSet<u64>,
+    pending_replay: BTreeSet<u64>,
+    resume_draining: bool,
 }
 
 impl PipelineJobRecovery {
@@ -608,6 +609,8 @@ impl PipelineJobRecovery {
             epoch: 0,
             state: PipelineJobState::Running,
             in_flight: BTreeSet::new(),
+            pending_replay: BTreeSet::new(),
+            resume_draining: false,
         })
     }
 
@@ -631,12 +634,19 @@ impl PipelineJobRecovery {
                 self.epoch
             );
         }
+        self.pending_replay.remove(&microbatch_id);
         Ok(self.epoch)
     }
 
     pub fn complete(&mut self, epoch: u64, microbatch_id: u64) -> Result<CompletionDisposition> {
-        if epoch != self.epoch {
+        if epoch < self.epoch {
             return Ok(CompletionDisposition::StaleEpochDiscarded);
+        }
+        if epoch > self.epoch {
+            bail!(
+                "completion epoch {epoch} is ahead of current epoch {}",
+                self.epoch
+            );
         }
         if !self.in_flight.remove(&microbatch_id) {
             bail!("microbatch {microbatch_id} is not in flight in epoch {epoch}");
@@ -655,7 +665,9 @@ impl PipelineJobRecovery {
 
     #[must_use]
     pub fn drain_complete(&self) -> bool {
-        self.state == PipelineJobState::Draining && self.in_flight.is_empty()
+        self.state == PipelineJobState::Draining
+            && self.in_flight.is_empty()
+            && self.pending_replay.is_empty()
     }
 
     /// Abort the current epoch immediately after a stage failure.
@@ -672,17 +684,23 @@ impl PipelineJobRecovery {
         ) {
             bail!("pipeline job cannot fail a stage while {:?}", self.state);
         }
+        let resume_draining = self.state == PipelineJobState::Draining;
         let old_epoch = self.epoch;
-        self.epoch = self
+        let new_epoch = self
             .epoch
             .checked_add(1)
             .ok_or_else(|| anyhow!("pipeline epoch exhausted"))?;
-        let aborted_microbatches = std::mem::take(&mut self.in_flight).into_iter().collect();
+        let mut aborted = std::mem::take(&mut self.in_flight);
+        aborted.append(&mut self.pending_replay);
+        let aborted_microbatches = aborted.iter().copied().collect();
+        self.pending_replay = aborted;
+        self.epoch = new_epoch;
+        self.resume_draining = resume_draining;
         self.state = PipelineJobState::AwaitingReplacement;
         Ok(RestartDirective {
             failed_stage,
             old_epoch,
-            new_epoch: self.epoch,
+            new_epoch,
             aborted_microbatches,
             invalidate_all_kv: true,
         })
@@ -697,13 +715,41 @@ impl PipelineJobRecovery {
             bail!("a replacement pipeline requires at least one stage");
         }
         self.stage_count = stage_count;
-        self.state = PipelineJobState::Running;
+        self.state = if std::mem::take(&mut self.resume_draining) {
+            PipelineJobState::Draining
+        } else {
+            PipelineJobState::Running
+        };
         Ok(())
+    }
+
+    /// Re-admit work aborted by a failure without reopening normal admission.
+    ///
+    /// This is used after a replacement resumes a planned drain. Only IDs that
+    /// were already in flight before the failure may be replayed.
+    pub fn replay_aborted(&mut self, microbatch_id: u64) -> Result<u64> {
+        if self.state != PipelineJobState::Draining {
+            bail!("drain-only replay requires a replacement in Draining state");
+        }
+        if !self.pending_replay.contains(&microbatch_id) {
+            bail!("microbatch {microbatch_id} is not pending replay");
+        }
+        if !self.in_flight.insert(microbatch_id) {
+            bail!(
+                "microbatch {microbatch_id} is already in flight in epoch {}",
+                self.epoch
+            );
+        }
+        self.pending_replay.remove(&microbatch_id);
+        Ok(self.epoch)
     }
 
     pub fn finish(&mut self) -> Result<()> {
         if !self.in_flight.is_empty() {
             bail!("cannot finish a pipeline job with microbatches still in flight");
+        }
+        if !self.pending_replay.is_empty() {
+            bail!("cannot finish a pipeline job with microbatches pending replay");
         }
         if self.state == PipelineJobState::AwaitingReplacement {
             bail!("cannot finish while awaiting a replacement chain");
@@ -852,6 +898,24 @@ mod tests {
     }
 
     #[test]
+    fn host_below_runtime_reserve_does_not_poison_other_candidates() {
+        let model = synthetic_model(12, 10);
+        let plan = InterhostPipelinePlanner::plan(
+            &model,
+            &[host("undersized", 50), host("fits", 250)],
+            PlannerOptions {
+                reserve_basis_points: 0,
+                runtime_reserve_bytes: 100,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(plan.stages.len(), 1);
+        assert_eq!(plan.stages[0].host_id, "fits");
+        assert_eq!(plan.stages[0].usable_vram_bytes, 150);
+    }
+
+    #[test]
     fn config_json_drives_model_footprint_and_tied_head() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
@@ -965,6 +1029,19 @@ mod tests {
     }
 
     #[test]
+    fn completion_rejects_future_epoch_without_consuming_inflight_work() {
+        let mut recovery = PipelineJobRecovery::new(2).unwrap();
+        let epoch = recovery.admit(10).unwrap();
+
+        let error = recovery.complete(epoch + 1, 10).unwrap_err();
+        assert!(error.to_string().contains("ahead of current epoch"));
+        assert_eq!(
+            recovery.complete(epoch, 10).unwrap(),
+            CompletionDisposition::Accepted
+        );
+    }
+
+    #[test]
     fn maintenance_drain_stops_admission_but_finishes_inflight() {
         let mut recovery = PipelineJobRecovery::new(2).unwrap();
         let epoch = recovery.admit(7).unwrap();
@@ -973,6 +1050,37 @@ mod tests {
         assert!(!recovery.drain_complete());
         assert_eq!(
             recovery.complete(epoch, 7).unwrap(),
+            CompletionDisposition::Accepted
+        );
+        assert!(recovery.drain_complete());
+        recovery.finish().unwrap();
+        assert_eq!(recovery.state(), PipelineJobState::Completed);
+    }
+
+    #[test]
+    fn stage_failure_preserves_drain_and_only_replays_aborted_work() {
+        let mut recovery = PipelineJobRecovery::new(2).unwrap();
+        let old_epoch = recovery.admit(7).unwrap();
+        recovery.begin_drain().unwrap();
+
+        let restart = recovery.stage_failed(1).unwrap();
+        assert_eq!(restart.aborted_microbatches, vec![7]);
+        recovery.replacement_ready(2).unwrap();
+
+        assert_eq!(recovery.state(), PipelineJobState::Draining);
+        assert!(recovery.admit(8).is_err());
+        assert!(recovery.replay_aborted(8).is_err());
+        assert!(!recovery.drain_complete());
+        assert!(recovery.finish().is_err());
+
+        let replay_epoch = recovery.replay_aborted(7).unwrap();
+        assert_eq!(replay_epoch, restart.new_epoch);
+        assert_eq!(
+            recovery.complete(old_epoch, 7).unwrap(),
+            CompletionDisposition::StaleEpochDiscarded
+        );
+        assert_eq!(
+            recovery.complete(replay_epoch, 7).unwrap(),
             CompletionDisposition::Accepted
         );
         assert!(recovery.drain_complete());
