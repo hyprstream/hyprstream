@@ -428,6 +428,7 @@ async fn cleartext_envelope_rejected_on_iroh_receive() -> Result<()> {
         delegation_token: None,
         wth: None,
         client_dh_public: None,
+        client_kem_public: None,
         response_kem_recipient: None,
         service_domain: None,
     };
@@ -512,6 +513,7 @@ async fn false_encrypted_marker_never_reaches_custom_processor_over_iroh() -> Re
             delegation_token: None,
             wth: None,
             client_dh_public: None,
+            client_kem_public: None,
             response_kem_recipient: None,
             service_domain: None,
         },

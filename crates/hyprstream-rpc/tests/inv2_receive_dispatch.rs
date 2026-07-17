@@ -201,6 +201,7 @@ fn request_envelope(payload: &[u8]) -> RequestEnvelope {
         delegation_token: None,
         wth: None,
         client_dh_public: None,
+        client_kem_public: None,
         response_kem_recipient: None,
         service_domain: Some("inv2-sentinel".to_owned()),
     }

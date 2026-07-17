@@ -121,6 +121,7 @@ pub mod error;
 pub mod platform;
 pub mod rpc_client;
 pub mod stream_info;
+pub mod stream_epoch;
 pub mod zmtp_framing;
 
 // ============================================================================

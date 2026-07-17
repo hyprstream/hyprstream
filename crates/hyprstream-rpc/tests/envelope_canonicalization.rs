@@ -20,6 +20,7 @@ fn test_envelope_serialization_deterministic() {
         delegation_token: None,
         wth: None,
         client_dh_public: None,
+        client_kem_public: None,
         response_kem_recipient: None,
         service_domain: None,
     };
@@ -54,6 +55,7 @@ fn test_envelope_signature_verification_stable() {
         delegation_token: None,
         wth: None,
         client_dh_public: None,
+        client_kem_public: None,
         response_kem_recipient: None,
         service_domain: None,
     };
@@ -113,6 +115,7 @@ fn test_envelope_canonical_form() {
         delegation_token: None,
         wth: None,
         client_dh_public: None,
+        client_kem_public: None,
         response_kem_recipient: None,
         service_domain: None,
     };
@@ -143,6 +146,7 @@ fn test_envelope_with_authorization_deterministic() {
         delegation_token: None,
         wth: None,
         client_dh_public: None,
+        client_kem_public: None,
         response_kem_recipient: None,
         service_domain: None,
     };
@@ -168,6 +172,7 @@ fn test_envelope_different_data_different_bytes() {
         delegation_token: None,
         wth: None,
         client_dh_public: None,
+        client_kem_public: None,
         response_kem_recipient: Some(RecipientPublic {
             suite_id: SuiteId::HyKemX25519MlKem768,
             eks: vec![vec![0x11; 32], vec![0x22; 1184]],
@@ -184,6 +189,7 @@ fn test_envelope_different_data_different_bytes() {
         delegation_token: None,
         wth: None,
         client_dh_public: None,
+        client_kem_public: None,
         response_kem_recipient: Some(RecipientPublic {
             suite_id: SuiteId::HyKemX25519MlKem768,
             eks: vec![vec![0x33; 32], vec![0x44; 1184]],
@@ -217,6 +223,7 @@ fn test_populated_response_recipient_changes_canonical_bytes() {
         delegation_token: None,
         wth: None,
         client_dh_public: None,
+        client_kem_public: None,
         response_kem_recipient: Some(recipient(0x55, 0x66)),
         service_domain: Some("canonical-service".to_owned()),
     };

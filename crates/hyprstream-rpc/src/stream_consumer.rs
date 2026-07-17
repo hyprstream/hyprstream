@@ -9,10 +9,10 @@
 //! - `StreamHandleImpl<T>` — unified stream consumer over any `Transport`
 
 use std::collections::VecDeque;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{ensure, Result};
 use futures::StreamExt;
 
 use crate::crypto::{derive_stream_keys, keyed_mac_truncated, keyed_mac_truncated_parts};
@@ -104,6 +104,9 @@ pub struct StreamVerifier {
     seq_cursor: Option<u64>,
     /// Whether a terminal (`Complete`/`Error`) payload has been observed (for `completion`).
     terminal_seen: bool,
+    /// Explicit identified epoch state.  Epoch commits are accepted separately
+    /// and reset the chain atomically before any next-epoch Object is processed.
+    epoch_ratchet: Option<crate::stream_epoch::StreamEpochRatchet>,
 }
 
 impl StreamVerifier {
@@ -120,6 +123,7 @@ impl StreamVerifier {
             policy: None,
             seq_cursor: None,
             terminal_seen: false,
+            epoch_ratchet: None,
         }
     }
 
@@ -133,6 +137,38 @@ impl StreamVerifier {
         self
     }
 
+    /// Install the identified epoch profile at its current committed epoch.
+    pub fn with_epoch_ratchet(mut self, ratchet: crate::stream_epoch::StreamEpochRatchet) -> Self {
+        let keys = ratchet.current_keys();
+        self.key = *keys.producer_to_consumer.mac_key;
+        self.enc_key = Some(*keys.producer_to_consumer.enc_key);
+        self.topic = ratchet.route_topic().to_owned();
+        self.prev_mac = None;
+        self.seq_cursor = None;
+        self.epoch_ratchet = Some(ratchet);
+        self
+    }
+
+    /// Authenticate and atomically install the next epoch.  Failed, replayed,
+    /// skipped, or cross-stream commits leave the current verifier state intact.
+    pub fn accept_epoch_commit(
+        &mut self,
+        commit: &crate::stream_epoch::StreamEpochCommit,
+    ) -> Result<()> {
+        let ratchet = self
+            .epoch_ratchet
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("stream is not using the identified epoch profile"))?;
+        let mut pending = ratchet.clone();
+        let keys = pending.accept_commit(commit)?;
+        self.key = *keys.producer_to_consumer.mac_key;
+        self.enc_key = Some(*keys.producer_to_consumer.enc_key);
+        self.prev_mac = None;
+        self.seq_cursor = None;
+        self.epoch_ratchet = Some(pending);
+        Ok(())
+    }
+
     /// Create a verifier that enforces `policy` (#163) — used by codegen-generated consumers,
     /// where the contract is a compile-time constant from the service's API contract.
     pub fn with_policy(key: [u8; 32], topic: String, policy: VerifierContract) -> Self {
@@ -144,7 +180,10 @@ impl StreamVerifier {
     /// True if this stream's policy requires a terminal payload before EOF; the consumer must
     /// reject an EOF when this is true and [`StreamVerifier::terminal_seen`] is false.
     pub fn requires_terminal(&self) -> bool {
-        matches!(self.policy.map(|p| p.completion), Some(Completion::EndOfStream))
+        matches!(
+            self.policy.map(|p| p.completion),
+            Some(Completion::EndOfStream)
+        )
     }
 
     /// True once a terminal (`Complete`/`Error`) payload has been observed.
@@ -198,10 +237,10 @@ impl StreamVerifier {
             anyhow::bail!("MAC verification failed");
         }
 
-        // Update chain state
+        // Prepare the chain update, but do not mutate verifier state until the
+        // complete authenticated block (including AEAD payloads) is accepted.
         let mut new_prev = [0u8; 16];
         new_prev.copy_from_slice(received_mac);
-        self.prev_mac = Some(new_prev);
 
         // Parse StreamBlock with a borrowing (zero-copy) reader: the capnp `Reader`
         // references `capnp_data` directly instead of copying the whole block into an
@@ -212,11 +251,21 @@ impl StreamVerifier {
             capnp::message::ReaderOptions::default(),
         )?;
         let block = reader.get_root::<streaming_capnp::stream_block::Reader>()?;
+        let block_epoch = block.get_epoch();
+        if let Some(ratchet) = &self.epoch_ratchet {
+            ensure!(
+                block_epoch == ratchet.epoch(),
+                "stream block epoch {} is not committed epoch {}",
+                block_epoch,
+                ratchet.epoch()
+            );
+        }
 
         // Policy-selected ordering/replay enforcement (#163). The MAC already authenticates
         // `sequenceNumber` (it's inside the block, #219), so a tampered sequenceNumber fails
         // MAC above; here we enforce *position*. `None` policy ⇒ legacy behaviour (MAC chain
         // only, no sequenceNumber/completion checks).
+        let mut next_seq_cursor = self.seq_cursor;
         if let Some(policy) = self.policy {
             let sequence_number = block.get_sequence_number();
             match policy.ordering {
@@ -230,7 +279,11 @@ impl StreamVerifier {
                         }
                     }
                     // First block (late-join): accept its sequenceNumber, then enforce contiguity.
-                    self.seq_cursor = Some(sequence_number.saturating_add(1));
+                    next_seq_cursor = Some(
+                        sequence_number
+                            .checked_add(1)
+                            .ok_or_else(|| anyhow::anyhow!("stream sequenceNumber exhausted"))?,
+                    );
                 }
                 StreamOrdering::Unordered { .. } => {
                     // Media (out-of-order) needs a per-Group *self-authenticating* MAC, not the
@@ -247,19 +300,18 @@ impl StreamVerifier {
 
         // #321: the AEAD AAD binds each sealed payload to (topic, epoch); read the
         // block epoch so a sealed Tagged payload can only open under its own epoch.
-        let block_epoch = block.get_epoch();
+        let block_sequence = block.get_sequence_number();
 
         let payloads_reader = block.get_payloads()?;
         let mut payloads = Vec::with_capacity(payloads_reader.len() as usize);
 
+        let mut terminal_seen = self.terminal_seen;
         for i in 0..payloads_reader.len() {
             let p = payloads_reader.get(i);
 
             use streaming_capnp::stream_payload::Which;
             let payload = match p.which()? {
-                Which::Data(data_result) => {
-                    StreamPayload::Data(data_result?.to_vec())
-                }
+                Which::Data(data_result) => StreamPayload::Data(data_result?.to_vec()),
                 Which::Error(err_result) => {
                     let err = err_result?;
                     StreamPayload::Error(err.get_message()?.to_string()?)
@@ -279,6 +331,8 @@ impl StreamVerifier {
                             enc_key,
                             &self.topic,
                             block_epoch,
+                            block_sequence,
+                            i as usize,
                             tagged.get_tag()?,
                             tagged.get_payload()?,
                             tagged.get_nonce()?,
@@ -296,11 +350,18 @@ impl StreamVerifier {
             };
 
             // Track terminal observation for the `completion` axis (#163).
-            if matches!(payload, StreamPayload::Complete(_) | StreamPayload::Error(_)) {
-                self.terminal_seen = true;
+            if matches!(
+                payload,
+                StreamPayload::Complete(_) | StreamPayload::Error(_)
+            ) {
+                terminal_seen = true;
             }
             payloads.push(payload);
         }
+
+        self.prev_mac = Some(new_prev);
+        self.seq_cursor = next_seq_cursor;
+        self.terminal_seen = terminal_seen;
 
         Ok(payloads)
     }
@@ -333,8 +394,15 @@ pub(crate) const SEALED_KIND_COMPLETE: u8 = 0x01;
 /// Build the AEAD AAD (also the `encrypt_event` "prefix") binding each sealed
 /// payload to its `topic` and key-`epoch` (#321/#223). Reused verbatim by the
 /// publisher seal path; a block replayed under a different epoch fails AEAD open.
-pub(crate) fn stream_aead_aad(topic: &str, epoch: u64) -> String {
-    format!("{topic}|stream-aead-v1|epoch={epoch}")
+pub(crate) fn stream_aead_aad(
+    topic: &str,
+    epoch: u64,
+    sequence_number: u64,
+    payload_index: usize,
+) -> String {
+    format!(
+        "{topic}|identified-stream-object-v1|epoch={epoch}|sequence={sequence_number}|payload={payload_index}"
+    )
 }
 
 /// Open an AEAD-sealed `Tagged` payload (#321), restoring the original
@@ -345,6 +413,8 @@ pub(crate) fn open_sealed_payload(
     enc_key: &[u8; 32],
     topic: &str,
     epoch: u64,
+    sequence_number: u64,
+    payload_index: usize,
     tag: &[u8],
     ciphertext: &[u8],
     nonce: &[u8],
@@ -356,7 +426,10 @@ pub(crate) fn open_sealed_payload(
         .try_into()
         .map_err(|_| anyhow::anyhow!("stream AEAD: bad nonce length {}", nonce.len()))?;
     let commitment16: [u8; 16] = key_commitment.try_into().map_err(|_| {
-        anyhow::anyhow!("stream AEAD: bad key_commitment length {}", key_commitment.len())
+        anyhow::anyhow!(
+            "stream AEAD: bad key_commitment length {}",
+            key_commitment.len()
+        )
     })?;
 
     // Fast committing-AEAD rejection of a wrong-key block before the GCM open.
@@ -364,7 +437,7 @@ pub(crate) fn open_sealed_payload(
         anyhow::bail!("stream AEAD: key commitment mismatch (wrong key or tampered block)");
     }
 
-    let aad = stream_aead_aad(topic, epoch);
+    let aad = stream_aead_aad(topic, epoch, sequence_number, payload_index);
     let plaintext = decrypt_event_full(enc_key, &nonce12, tag, ciphertext, &aad)
         .map_err(|e| anyhow::anyhow!("stream AEAD open failed: {e}"))?;
 
@@ -451,12 +524,9 @@ impl<T: Transport> StreamHandleImpl<T> {
 
         // QoS contract from the signed StreamInfo handshake — enforced for both native and WASM paths.
         // #321: AEAD ON for this DH-keyed (mesh/networked) stream — open sealed Tagged blocks.
-        let verifier = StreamVerifier::with_policy(
-            *keys.mac_key,
-            keys.topic.clone(),
-            stream_info.qos.into(),
-        )
-        .with_enc_key(*keys.enc_key);
+        let verifier =
+            StreamVerifier::with_policy(*keys.mac_key, keys.topic.clone(), stream_info.qos.into())
+                .with_enc_key(*keys.enc_key);
 
         Ok(Self {
             subscriber,
@@ -515,11 +585,9 @@ impl<T: Transport> StreamHandleImpl<T> {
         if let Some(ref pub_handle) = self.publisher {
             let msg = build_stream_control_cancel();
             let mac = keyed_mac_truncated(&self.ctrl_mac_key, &msg);
-            pub_handle.send_frames(&[
-                self.ctrl_topic.as_bytes(),
-                &msg,
-                &mac,
-            ]).await?;
+            pub_handle
+                .send_frames(&[self.ctrl_topic.as_bytes(), &msg, &mac])
+                .await?;
         }
         Ok(())
     }
@@ -657,7 +725,10 @@ impl From<crate::stream_info::StreamOpt> for VerifierContract {
             crate::stream_info::Completion::EndOfStream => Completion::EndOfStream,
             crate::stream_info::Completion::None => Completion::Open,
         };
-        VerifierContract { ordering, completion }
+        VerifierContract {
+            ordering,
+            completion,
+        }
     }
 }
 
@@ -702,7 +773,10 @@ mod policy_tests {
         }
         input.extend_from_slice(&capnp_bytes);
         let mac = keyed_mac_truncated(key, &input);
-        (vec![topic.as_bytes().to_vec(), capnp_bytes, mac.to_vec()], mac)
+        (
+            vec![topic.as_bytes().to_vec(), capnp_bytes, mac.to_vec()],
+            mac,
+        )
     }
 
     #[test]
@@ -713,7 +787,10 @@ mod policy_tests {
         let mut v = StreamVerifier::with_policy(
             key,
             topic.to_owned(),
-            VerifierContract { ordering: StreamOrdering::Ordered, completion: Completion::Open },
+            VerifierContract {
+                ordering: StreamOrdering::Ordered,
+                completion: Completion::Open,
+            },
         );
         let (mut frame, _) = frame(&key, topic, None, 0, false);
         // Corrupt the MAC part (last element of the frame).
@@ -721,7 +798,10 @@ mod policy_tests {
         mac[0] ^= 0xFF; // flip a bit — constant_time_eq must reject this
         let err = v.verify(&frame).unwrap_err().to_string();
         assert!(
-            err.contains("MAC") || err.contains("mac") || err.contains("HMAC") || err.contains("invalid"),
+            err.contains("MAC")
+                || err.contains("mac")
+                || err.contains("HMAC")
+                || err.contains("invalid"),
             "tampered MAC should be rejected, got: {err}"
         );
     }
@@ -733,7 +813,10 @@ mod policy_tests {
         let mut v = StreamVerifier::with_policy(
             key,
             topic.to_owned(),
-            VerifierContract { ordering: StreamOrdering::Ordered, completion: Completion::Open },
+            VerifierContract {
+                ordering: StreamOrdering::Ordered,
+                completion: Completion::Open,
+            },
         );
         let (f5, m5) = frame(&key, topic, None, 5, false); // late-join at seq 5
         v.verify(&f5).unwrap();
@@ -764,7 +847,9 @@ mod policy_tests {
             key,
             topic.to_owned(),
             VerifierContract {
-                ordering: StreamOrdering::Unordered { anti_replay_window: 4 },
+                ordering: StreamOrdering::Unordered {
+                    anti_replay_window: 4,
+                },
                 completion: Completion::Open,
             },
         );
@@ -779,7 +864,10 @@ mod policy_tests {
         let mut v = StreamVerifier::with_policy(
             key,
             topic.to_owned(),
-            VerifierContract { ordering: StreamOrdering::Ordered, completion: Completion::EndOfStream },
+            VerifierContract {
+                ordering: StreamOrdering::Ordered,
+                completion: Completion::EndOfStream,
+            },
         );
         assert!(v.requires_terminal());
         assert!(!v.terminal_seen());
@@ -825,7 +913,10 @@ mod policy_tests {
         // in place of `dhPublic` to try to own the derived keys.
         let (_relay_secret, relay_pub) = generate_ephemeral_keypair();
         let relay_dh_public = relay_pub.to_bytes();
-        assert_ne!(real_dh_public, relay_dh_public, "test setup: keys must differ");
+        assert_ne!(
+            real_dh_public, relay_dh_public,
+            "test setup: keys must differ"
+        );
 
         // Producer derives the REAL stream keys from the real DH (ECDH with the
         // client's public) — these are the keys it seals every frame under.
@@ -847,7 +938,7 @@ mod policy_tests {
             p
         };
         use crate::crypto::event_crypto::{encrypt_event, EventPrivacy};
-        let aad = stream_aead_aad(&topic, epoch);
+        let aad = stream_aead_aad(&topic, epoch, 0, 0);
         let (tag, ciphertext, nonce, key_commitment) =
             encrypt_event(&real_enc, &aad, &plaintext, EventPrivacy::ZeroKnowledge).unwrap();
 
@@ -857,14 +948,15 @@ mod policy_tests {
         let consumer_keys =
             derive_stream_keys(&consumer_shared, &client_pub_bytes, &real_dh_public).unwrap();
         assert_eq!(
-            *consumer_keys.enc_key,
-            real_enc,
+            *consumer_keys.enc_key, real_enc,
             "consumer (real dhPublic) and producer derive the same enc_key"
         );
         let opened = open_sealed_payload(
             &consumer_keys.enc_key,
             &topic,
             epoch,
+            0,
+            0,
             &tag,
             &ciphertext,
             &nonce,
@@ -881,16 +973,18 @@ mod policy_tests {
         //    this branch — it keeps the authenticated `dhPublic`; this case shows
         //    what would happen if the substituted key were used.)
         let sub_shared = ristretto_dh_raw(&client_secret_bytes, &relay_dh_public).unwrap();
-        let sub_keys = derive_stream_keys(&sub_shared, &client_pub_bytes, &relay_dh_public).unwrap();
+        let sub_keys =
+            derive_stream_keys(&sub_shared, &client_pub_bytes, &relay_dh_public).unwrap();
         assert_ne!(
-            *sub_keys.enc_key,
-            real_enc,
+            *sub_keys.enc_key, real_enc,
             "substituted dhPublic MUST derive a different enc_key"
         );
         let subst_err = open_sealed_payload(
             &sub_keys.enc_key,
             &topic,
             epoch,
+            0,
+            0,
             &tag,
             &ciphertext,
             &nonce,
@@ -908,20 +1002,32 @@ mod policy_tests {
         //    belt-and-braces check on the chained-HMAC envelope.
         let real_mac = *real_keys.mac_key;
         let sub_mac = *sub_keys.mac_key;
-        assert_ne!(real_mac, sub_mac, "substituted dhPublic MUST derive a different mac_key");
+        assert_ne!(
+            real_mac, sub_mac,
+            "substituted dhPublic MUST derive a different mac_key"
+        );
         let (real_frame, _) = frame(&real_mac, &topic, None, 0, false);
         // Real consumer (real mac_key) verifies the producer's frame.
         let mut v_real = StreamVerifier::with_policy(
             real_mac,
             topic.clone(),
-            VerifierContract { ordering: StreamOrdering::Ordered, completion: Completion::Open },
+            VerifierContract {
+                ordering: StreamOrdering::Ordered,
+                completion: Completion::Open,
+            },
         );
-        assert!(v_real.verify(&real_frame).is_ok(), "real mac_key verifies the frame");
+        assert!(
+            v_real.verify(&real_frame).is_ok(),
+            "real mac_key verifies the frame"
+        );
         // Substituted consumer (relay mac_key) CANNOT verify the producer's frame.
         let mut v_sub = StreamVerifier::with_policy(
             sub_mac,
             topic,
-            VerifierContract { ordering: StreamOrdering::Ordered, completion: Completion::Open },
+            VerifierContract {
+                ordering: StreamOrdering::Ordered,
+                completion: Completion::Open,
+            },
         );
         assert!(
             v_sub.verify(&real_frame).is_err(),

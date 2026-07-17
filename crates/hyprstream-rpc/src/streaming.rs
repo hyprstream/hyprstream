@@ -45,7 +45,9 @@ use crate::crypto::derive_stream_keys;
 
 // DH key types - Ristretto255 (default) or P-256 (FIPS)
 #[cfg(not(feature = "fips"))]
-use crate::crypto::{ristretto_dh as dh_compute, RistrettoPublic as DhPublic, RistrettoSecret as DhSecret};
+use crate::crypto::{
+    ristretto_dh as dh_compute, RistrettoPublic as DhPublic, RistrettoSecret as DhSecret,
+};
 
 #[cfg(feature = "fips")]
 use crate::crypto::{p256_dh as dh_compute, P256PublicKey as DhPublic, P256SecretKey as DhSecret};
@@ -89,11 +91,21 @@ pub struct BatchingConfig {
     pub max_rate: f32,
 }
 
-fn default_min_batch_size() -> usize { 1 }
-fn default_max_batch_size() -> usize { 16 }
-fn default_max_block_bytes() -> usize { 65536 }
-fn default_min_rate() -> f32 { 1.0 }
-fn default_max_rate() -> f32 { 100.0 }
+fn default_min_batch_size() -> usize {
+    1
+}
+fn default_max_batch_size() -> usize {
+    16
+}
+fn default_max_block_bytes() -> usize {
+    65536
+}
+fn default_min_rate() -> f32 {
+    1.0
+}
+fn default_max_rate() -> f32 {
+    100.0
+}
 
 impl Default for BatchingConfig {
     fn default() -> Self {
@@ -220,10 +232,14 @@ pub struct StreamContext {
     reach_config: crate::moq_stream::ProducerReachConfig,
 
     /// Hybrid KEM ciphertexts to emit in `StreamInfo.kemCiphertexts` (S3 #554).
-    /// `Some` on the hybrid post-quantum path ([`from_hybrid`](Self::from_hybrid));
+    /// `Some` on the hybrid post-quantum path
+    /// ([`from_hybrid_identified`](Self::from_hybrid_identified));
     /// `None` on the legacy classical [`from_dh`](Self::from_dh) and the keyless
     /// [`new`](Self::new) paths.
     kem_ciphertexts: Option<Vec<u8>>,
+    /// Identified, transcript-bound epoch state.  Present only on the pinned
+    /// HyKEM path; legacy/keyless contexts cannot ratchet into this profile.
+    epoch_ratchet: Option<crate::stream_epoch::StreamEpochRatchet>,
 }
 
 impl StreamContext {
@@ -252,6 +268,7 @@ impl StreamContext {
             reach_config: crate::moq_stream::ProducerReachConfig::default(),
             // Keyless path: no hybrid KEM material.
             kem_ciphertexts: None,
+            epoch_ratchet: None,
         }
     }
 
@@ -300,8 +317,9 @@ impl StreamContext {
             reach_config: crate::moq_stream::global_reach_config(),
             // Classical (legacy) path: no hybrid KEM material; the client keys
             // off the server ephemeral `dhPublic`. Removed at the S5 fail-closed
-            // flip (#556) once all call-sites use `from_hybrid`.
+            // flip (#556) once all call-sites use `from_hybrid_identified`.
             kem_ciphertexts: None,
+            epoch_ratchet: None,
         })
     }
 
@@ -316,38 +334,51 @@ impl StreamContext {
     ///
     /// Fail-closed: a malformed / wrong-suite `client_kem_public` is rejected.
     /// This is the post-quantum replacement for [`from_dh`](Self::from_dh).
-    pub fn from_hybrid(client_kem_public: &[u8]) -> Result<Self> {
-        let (material, keys) =
-            crate::crypto::key_exchange::server_hybrid_stream_keys(client_kem_public)
+    pub fn from_hybrid_identified(
+        client_kem_public: &[u8],
+        binding: crate::stream_epoch::IdentifiedStreamBinding,
+    ) -> Result<Self> {
+        let (material, ratchet) =
+            crate::crypto::key_exchange::server_identified_stream_epoch(client_kem_public, binding)
                 .map_err(|e| anyhow::anyhow!("hybrid stream handshake: {e}"))?;
+        let keys = ratchet.current_keys();
+        let outbound = &keys.producer_to_consumer;
+        let inbound = &keys.consumer_to_producer;
 
         let stream_id = format!("stream-{}", uuid::Uuid::new_v4());
 
         Ok(Self {
             stream_id,
-            topic: keys.topic,
-            mac_key: *keys.mac_key,
+            topic: ratchet.route_topic().to_owned(),
+            mac_key: *outbound.mac_key,
             // Hybrid path: AEAD ON for the mesh stream plane (#321), keyed by the
             // post-quantum combiner secret.
-            enc_key: Some(*keys.enc_key),
+            enc_key: Some(*outbound.enc_key),
             // No classical server ephemeral pubkey on the hybrid path; the client
             // keys off `kem_ciphertexts`, not `dhPublic`.
             server_pubkey: [0u8; 32],
-            ctrl_topic: keys.ctrl_topic,
-            ctrl_mac_key: *keys.ctrl_mac_key,
+            ctrl_topic: ratchet.control_topic().to_owned(),
+            ctrl_mac_key: *inbound.control_mac_key,
             cancel_token: CancellationToken::new(),
             qos: crate::stream_info::StreamOpt::default(),
             relay_choice: crate::moq_stream::RelayChoice::default(),
             reach_config: crate::moq_stream::global_reach_config(),
             kem_ciphertexts: Some(material.encode()),
+            epoch_ratchet: Some(ratchet),
         })
     }
 
     /// The hybrid KEM ciphertexts to emit in `StreamInfo.kemCiphertexts` (S3 #554):
-    /// `Some` on the hybrid path ([`from_hybrid`](Self::from_hybrid)), `None`
+    /// `Some` on the hybrid path
+    /// ([`from_hybrid_identified`](Self::from_hybrid_identified)), `None`
     /// otherwise.
     pub fn kem_ciphertexts(&self) -> Option<&[u8]> {
         self.kem_ciphertexts.as_deref()
+    }
+
+    /// Clone the committed identified epoch state for a publisher/verifier.
+    pub fn epoch_ratchet(&self) -> Option<crate::stream_epoch::StreamEpochRatchet> {
+        self.epoch_ratchet.clone()
     }
 
     /// Get the stream ID (for logging/display).
@@ -445,7 +476,10 @@ impl StreamContext {
     /// not the process global. [`StreamChannel::prepare_stream_with_claims`]
     /// calls this when the channel was built with
     /// [`StreamChannel::with_reach_config`].
-    pub fn with_reach_config(mut self, reach_config: crate::moq_stream::ProducerReachConfig) -> Self {
+    pub fn with_reach_config(
+        mut self,
+        reach_config: crate::moq_stream::ProducerReachConfig,
+    ) -> Self {
         self.reach_config = reach_config;
         self
     }
@@ -466,7 +500,8 @@ impl StreamContext {
     /// overridable via [`with_reach_config`](Self::with_reach_config)) — so this
     /// no longer reads the process-global `OnceLock`s on each call.
     pub fn reach(&self) -> Vec<crate::stream_info::Destination> {
-        self.reach_config.reach_with_relay(self.relay_choice.clone())
+        self.reach_config
+            .reach_with_relay(self.relay_choice.clone())
     }
 }
 
@@ -478,7 +513,11 @@ impl StreamContext {
 #[derive(Debug, Clone)]
 pub enum ProgressUpdate {
     /// Progress update: stage, current, total
-    Progress { stage: String, current: usize, total: usize },
+    Progress {
+        stage: String,
+        current: usize,
+        total: usize,
+    },
     /// Operation completed successfully
     Complete(Vec<u8>),
     /// Operation failed with error
@@ -543,13 +582,15 @@ impl ChannelProgressReporter {
 
     /// Signal successful completion with metadata.
     pub fn complete(&self, metadata: Vec<u8>) -> Result<()> {
-        self.sender.blocking_send(ProgressUpdate::Complete(metadata))
+        self.sender
+            .blocking_send(ProgressUpdate::Complete(metadata))
             .map_err(|_| anyhow::anyhow!("Progress channel closed"))
     }
 
     /// Signal an error occurred.
     pub fn error(&self, message: &str) -> Result<()> {
-        self.sender.blocking_send(ProgressUpdate::Error(message.to_owned()))
+        self.sender
+            .blocking_send(ProgressUpdate::Error(message.to_owned()))
             .map_err(|_| anyhow::anyhow!("Progress channel closed"))
     }
 }
@@ -559,7 +600,9 @@ impl ChannelProgressReporter {
 /// Returns (sender, receiver) where:
 /// - sender: Pass to `ChannelProgressReporter::new()` for use in blocking operations
 /// - receiver: Poll in async context to forward updates to `StreamPublisher`
-pub fn progress_channel(buffer_size: usize) -> (
+pub fn progress_channel(
+    buffer_size: usize,
+) -> (
     tokio::sync::mpsc::Sender<ProgressUpdate>,
     tokio::sync::mpsc::Receiver<ProgressUpdate>,
 ) {
@@ -685,7 +728,8 @@ impl StreamChannel {
         client_ephemeral_pubkey: &[u8],
         expiry_secs: i64,
     ) -> Result<StreamContext> {
-        self.prepare_stream_with_claims(client_ephemeral_pubkey, expiry_secs, None).await
+        self.prepare_stream_with_claims(client_ephemeral_pubkey, expiry_secs, None)
+            .await
     }
 
     /// Prepare a stream with DH key exchange, pre-authorization, and claims.
@@ -730,7 +774,12 @@ impl StreamChannel {
     /// No-op on the moq path — topics are published lazily by
     /// `MoqStreamPublisher` on first frame; no pre-registration is needed.
     /// Kept for API compatibility with callers such as `NotificationService`.
-    pub async fn register_topic(&self, _topic: &str, _expiry: i64, _claims: Option<Claims>) -> Result<()> {
+    pub async fn register_topic(
+        &self,
+        _topic: &str,
+        _expiry: i64,
+        _claims: Option<Claims>,
+    ) -> Result<()> {
         Ok(())
     }
 
@@ -739,7 +788,10 @@ impl StreamChannel {
     /// Fails loudly if the process-global moq stream origin has not been
     /// initialized (server not started). In production the `streams` factory
     /// always calls `init_global_moq_origin` before any service handles requests.
-    pub async fn publisher(&self, ctx: &StreamContext) -> Result<crate::moq_stream::AnyStreamPublisher> {
+    pub async fn publisher(
+        &self,
+        ctx: &StreamContext,
+    ) -> Result<crate::moq_stream::AnyStreamPublisher> {
         let origin = crate::moq_stream::global_moq_origin()
             .ok_or_else(|| anyhow::anyhow!("no moq stream origin — server not initialized"))?;
         // #321: on the DH (mesh) path, sign each StreamBlock with the node's per-host
@@ -805,7 +857,10 @@ impl StreamChannel {
     /// Used by NotificationService where topics are registered via `register_topic()`
     /// and don't use DH-based key exchange. The transport MAC key is randomly generated
     /// (separate from notification E2E MAC which is embedded in the payload).
-    pub async fn publisher_for_topic(&self, topic: &str) -> Result<crate::moq_stream::AnyStreamPublisher> {
+    pub async fn publisher_for_topic(
+        &self,
+        topic: &str,
+    ) -> Result<crate::moq_stream::AnyStreamPublisher> {
         // Generate a random transport-level MAC key for the HMAC chain.
         // (Not the notification's E2E MAC — that's embedded in the payload.)
         let mut mac_key = [0u8; 32];
@@ -819,7 +874,6 @@ impl StreamChannel {
         );
         self.publisher(&ctx).await
     }
-
 }
 
 // ============================================================================
@@ -949,8 +1003,9 @@ fn max_concurrent_streams_per_service() -> usize {
 fn stream_admission_semaphore(service_name: &str) -> std::sync::Arc<tokio::sync::Semaphore> {
     use parking_lot::RwLock;
     use std::collections::HashMap;
-    static MAP: std::sync::OnceLock<RwLock<HashMap<String, std::sync::Arc<tokio::sync::Semaphore>>>> =
-        std::sync::OnceLock::new();
+    static MAP: std::sync::OnceLock<
+        RwLock<HashMap<String, std::sync::Arc<tokio::sync::Semaphore>>>,
+    > = std::sync::OnceLock::new();
     let map = MAP.get_or_init(|| RwLock::new(HashMap::new()));
     if let Some(sem) = map.read().get(service_name) {
         return std::sync::Arc::clone(sem);
@@ -959,7 +1014,9 @@ fn stream_admission_semaphore(service_name: &str) -> std::sync::Arc<tokio::sync:
         map.write()
             .entry(service_name.to_owned())
             .or_insert_with(|| {
-                std::sync::Arc::new(tokio::sync::Semaphore::new(max_concurrent_streams_per_service()))
+                std::sync::Arc::new(tokio::sync::Semaphore::new(
+                    max_concurrent_streams_per_service(),
+                ))
             }),
     )
 }
@@ -1087,7 +1144,12 @@ pub fn encode_stream_block_with_provenance(
                 StreamPayloadData::Complete(data) => {
                     p.set_complete(data);
                 }
-                StreamPayloadData::Tagged { tag, payload, nonce, key_commitment } => {
+                StreamPayloadData::Tagged {
+                    tag,
+                    payload,
+                    nonce,
+                    key_commitment,
+                } => {
                     let mut tagged = p.init_tagged();
                     tagged.set_tag(tag);
                     tagged.set_payload(payload);
@@ -1158,7 +1220,8 @@ mod tests {
 
         let mut inner_msg = Builder::new_default();
         {
-            let mut register = inner_msg.init_root::<crate::streaming_capnp::stream_register::Builder>();
+            let mut register =
+                inner_msg.init_root::<crate::streaming_capnp::stream_register::Builder>();
             register.set_topic(topic);
             register.set_exp(expiry);
         }
@@ -1196,12 +1259,10 @@ mod tests {
     /// which already verifies the self-asserted `cnf`'s EdDSA without a pin.
     #[test]
     fn stream_register_hybrid_verifies_only_when_pq_anchored() -> anyhow::Result<()> {
+        use crate::common_capnp;
         use crate::crypto::pq::{ml_dsa_generate_keypair, ml_dsa_vk_from_bytes};
         use crate::crypto::CryptoPolicy;
-        use crate::envelope::{
-            InMemoryNonceCache, KeyedPqTrustStore, SignedEnvelope,
-        };
-        use crate::common_capnp;
+        use crate::envelope::{InMemoryNonceCache, KeyedPqTrustStore, SignedEnvelope};
         use crate::FromCapnp;
 
         let signing_key = SigningKey::from_bytes(&[7u8; 32]);
@@ -1220,11 +1281,14 @@ mod tests {
             &mut std::io::Cursor::new(&bytes[..]),
             capnp::message::ReaderOptions::default(),
         )?;
-        let signed = SignedEnvelope::read_from(
-            reader.get_root::<common_capnp::signed_envelope::Reader>()?,
-        )?;
+        let signed =
+            SignedEnvelope::read_from(reader.get_root::<common_capnp::signed_envelope::Reader>()?)?;
 
-        assert_eq!(signed.policy, CryptoPolicy::Hybrid, "must sign Hybrid with PQ key");
+        assert_eq!(
+            signed.policy,
+            CryptoPolicy::Hybrid,
+            "must sign Hybrid with PQ key"
+        );
 
         // Anchored: the signer's ML-DSA vk is bound to its Ed25519 identity.
         let mut store = KeyedPqTrustStore::new();
@@ -1254,7 +1318,9 @@ mod tests {
         // But a tampered/forged inner EdDSA on an unanchored signer is still
         // rejected — the classical floor is a real signature check, not a bypass.
         let mut forged = signed.clone();
-        forged.cnf = SigningKey::from_bytes(&[9u8; 32]).verifying_key().to_bytes();
+        forged.cnf = SigningKey::from_bytes(&[9u8; 32])
+            .verifying_key()
+            .to_bytes();
         let nonce_forged = InMemoryNonceCache::new();
         assert!(
             forged
