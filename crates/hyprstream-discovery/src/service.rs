@@ -899,27 +899,40 @@ impl DiscoveryService {
     /// ```compile_fail
     /// use hyprstream_discovery::CheckpointedPdsAuthority;
     /// ```
+    ///
+    /// ```compile_fail
+    /// use hyprstream_discovery::DiscoveryService;
+    /// fn ambient_production_constructor() {
+    ///     let _ = DiscoveryService::new_production(todo!(), todo!(), todo!());
+    /// }
+    /// ```
+    ///
+    /// ```compile_fail
+    /// use hyprstream_service::DiscoveryBootstrapAuthority;
+    /// fn forge(path: std::path::PathBuf, key: ed25519_dalek::VerifyingKey) {
+    ///     let _ = DiscoveryBootstrapAuthority { store_path: path, acceptance_identity: key };
+    /// }
+    /// ```
+    ///
+    /// ```compile_fail
+    /// fn duplicate(authority: hyprstream_service::DiscoveryBootstrapAuthority) {
+    ///     let _ = authority.clone();
+    /// }
+    /// ```
     #[cfg(not(target_arch = "wasm32"))]
-    fn install_checkpointed_pds_resolver(&mut self) -> Result<()> {
-        let authority = crate::checkpointed_pds::CheckpointedPdsAuthority::from_deployment()?;
-        let source = Arc::new(authority.open_source()?);
+    pub fn install_bootstrap_authority(
+        &mut self,
+        authority: hyprstream_service::DiscoveryBootstrapAuthority,
+    ) -> Result<()> {
+        let (path, acceptance_identity) = authority.into_parts();
+        let source = Arc::new(
+            crate::checkpointed_pds::CheckpointedPdsAcceptedStateSource::open(
+                &path,
+                acceptance_identity,
+            )?,
+        );
         self.accepted_state_source = Some(source);
         self.install_production_resolver()
-    }
-
-    /// Construct the ordinary production service after the trusted daemon
-    /// bootstrap has fixed the durable PDS location and acceptance identity in
-    /// its deployment environment. The opaque authority is derived and
-    /// consumed inside this crate; no path/key parameters cross the API.
-    #[cfg(not(target_arch = "wasm32"))]
-    pub fn new_production(
-        signing_key: Arc<SigningKey>,
-        jwt_verifying_key: hyprstream_rpc::prelude::VerifyingKey,
-        transport: TransportConfig,
-    ) -> Result<Self> {
-        let mut service = Self::new(signing_key, jwt_verifying_key, transport);
-        service.install_checkpointed_pds_resolver()?;
-        Ok(service)
     }
 
     #[cfg(test)]

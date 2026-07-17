@@ -2176,6 +2176,11 @@ fn main() -> Result<()> {
                                     }
                                 }
 
+                                // Seal production resolution authority before any inventory service
+                                // factory or downstream plugin can run. Both inputs are derived inside
+                                // ServiceContext from the authenticated deployment context.
+                                ctx.seal_discovery_bootstrap_authority()?;
+
                                 // Wire QUIC shared config (must be after key generation so jwt_verifying_key is set)
                                 if quic_cfg.enabled {
                                     ctx = hyprstream_core::services::factories::with_checkpointed_native_announcements(
@@ -2222,6 +2227,53 @@ fn main() -> Result<()> {
                                         iroh_enabled: qc.iroh,
                                         // #358: producer-chosen relay rendezvous (None = direct-only).
                                         moq_relay,
+                                        native_announcement_publisher: Some(std::sync::Arc::new(
+                                            |request: hyprstream_service::NativeAnnouncementRequest| {
+                                                std::thread::spawn(move || {
+                                                    let runtime = match tokio::runtime::Builder::new_current_thread()
+                                                        .enable_all()
+                                                        .build()
+                                                    {
+                                                        Ok(runtime) => runtime,
+                                                        Err(error) => {
+                                                            tracing::warn!("Failed to create announcement runtime: {error}");
+                                                            return;
+                                                        }
+                                                    };
+                                                    runtime.block_on(async move {
+                                                        let client = match hyprstream_discovery::DiscoveryClient::for_local_bootstrap(
+                                                            request.signing_key,
+                                                            request.discovery_verifying_key,
+                                                            None,
+                                                        ) {
+                                                            Ok(client) => client,
+                                                            Err(error) => {
+                                                                tracing::warn!("Failed to build DiscoveryClient: {error}");
+                                                                return;
+                                                            }
+                                                        };
+                                                        let announcement = hyprstream_discovery::ServiceAnnouncement {
+                                                            service_name: request.service_name,
+                                                            socket_kind: "quic".to_owned(),
+                                                            endpoint: request.endpoint,
+                                                            service_jwt: request.service_jwt,
+                                                            service_did: request.service_did,
+                                                            capabilities: request.capabilities,
+                                                            accepted_state_digest: request.accepted_state_digest,
+                                                            accepted_state_epoch: request.accepted_state_epoch,
+                                                            response_key_id: request.response_key_id,
+                                                            request_kem_key_id: request.request_kem_key_id,
+                                                            request_kem_recipient: request.request_kem_recipient,
+                                                            expires_at_unix_ms: request.expires_at_unix_ms,
+                                                        };
+                                                        match client.announce(&announcement).await {
+                                                            Ok(_) => tracing::info!("Announced QUIC endpoint to DiscoveryService"),
+                                                            Err(error) => tracing::warn!("Failed to announce QUIC endpoint: {error}"),
+                                                        }
+                                                    });
+                                                });
+                                            },
+                                        )),
                                     };
                                     ctx = ctx.with_quic(shared);
                                 }

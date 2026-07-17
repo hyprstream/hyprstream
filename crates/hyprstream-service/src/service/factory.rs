@@ -33,6 +33,43 @@ use crate::service::spawner::Spawnable;
 use hyprstream_rpc::registry::{global as global_registry, SocketKind};
 use hyprstream_rpc::transport::TransportConfig;
 
+/// One-shot, non-cloneable witness for installing the production Discovery
+/// authority. Only [`ServiceContext`] can mint it, from the authenticated
+/// application identity and its canonical service-owned data directory.
+pub struct DiscoveryBootstrapAuthority {
+    store_path: std::path::PathBuf,
+    acceptance_identity: VerifyingKey,
+}
+
+impl DiscoveryBootstrapAuthority {
+    /// Consume the witness. This is intentionally the only way Discovery can
+    /// obtain the already-fixed authority inputs.
+    #[doc(hidden)]
+    pub fn into_parts(self) -> (std::path::PathBuf, VerifyingKey) {
+        (self.store_path, self.acceptance_identity)
+    }
+}
+
+/// Complete, already-validated native announcement ready for publication.
+pub struct NativeAnnouncementRequest {
+    pub service_name: String,
+    pub endpoint: String,
+    pub signing_key: SigningKey,
+    pub service_jwt: Option<String>,
+    pub discovery_verifying_key: VerifyingKey,
+    pub service_did: hyprstream_rpc::identity::Did,
+    pub capabilities: Vec<String>,
+    pub accepted_state_digest: Vec<u8>,
+    pub accepted_state_epoch: u64,
+    pub response_key_id: String,
+    pub request_kem_key_id: String,
+    pub request_kem_recipient: Vec<u8>,
+    pub expires_at_unix_ms: i64,
+}
+
+pub type NativeAnnouncementPublisher =
+    Arc<dyn Fn(NativeAnnouncementRequest) + Send + Sync + 'static>;
+
 /// Complete native announcement material verified against one accepted state.
 #[derive(Clone)]
 pub struct NativeServiceAnnouncement {
@@ -164,6 +201,9 @@ pub struct QuicSharedConfig {
     /// service's [`QuicLoopConfig`] so the spawner advertises a `Role::Relay` reach
     /// and links the origin UP to the relay.
     pub moq_relay: Option<hyprstream_rpc::stream_info::TransportConfig>,
+    /// Application-owned publisher. Keeping this callback here avoids making
+    /// orchestration depend on the Discovery implementation crate.
+    pub native_announcement_publisher: Option<NativeAnnouncementPublisher>,
 }
 
 impl QuicSharedConfig {
@@ -226,6 +266,7 @@ impl QuicSharedConfig {
         accepted: Option<NativeServiceAnnouncement>,
     ) -> hyprstream_rpc::service::QuicLoopConfig {
         let mut config = self.for_service(service_name, port);
+        let publisher = self.native_announcement_publisher.clone();
         config.on_quic_bound = Some(Box::new(move |svc_name, addr, sn| {
             let endpoint = format!("quic://{}:{}:{}", sn, addr.ip(), addr.port());
             let sk = signing_key.clone();
@@ -256,71 +297,43 @@ impl QuicSharedConfig {
                 );
             }
 
-            // Spawn async announce in a new thread since we may not be in a tokio context
             let discovery_vk = discovery_verifying_key;
             let policy_vk = policy_verifying_key;
-            std::thread::spawn(move || {
-                let rt = match tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                {
-                    Ok(rt) => rt,
-                    Err(e) => {
-                        tracing::warn!("Failed to create announce runtime: {}", e);
-                        return;
-                    }
-                };
-                rt.block_on(async {
-                    let Some(accepted) = accepted else {
-                        tracing::warn!("Refusing production network announcement for '{svc_name}': accepted native identity/KEM bundle is unavailable");
-                        return;
-                    };
-                    if let Err(error) = accepted.validate(&svc_name, &sk.verifying_key()) {
-                        tracing::warn!("Refusing production network announcement for '{svc_name}': {error}");
-                        return;
-                    }
-                    // Request JWT renewal from PolicyService if needed
-                    if needs_renewal {
-                        // TODO: Call PolicyService issueToken RPC for renewal.
-                        // Requires adding existingToken field to policy.capnp and
-                        // regenerating codegen. For now, log a warning.
-                        tracing::warn!(
-                            "Service JWT for '{svc_name}' expired or near-expiry. \
-                             Renewal RPC pending capnp schema update. \
-                             Re-run wizard to refresh JWTs."
-                        );
-                        let _ = policy_vk; // suppress unused warning
-                    }
-
-                    let client = match hyprstream_discovery::DiscoveryClient::for_local_bootstrap(
-                        sk,
-                        discovery_vk,
-                        None,
-                    ) {
-                        Ok(c) => c,
-                        Err(e) => {
-                            tracing::warn!("Failed to build DiscoveryClient: {}", e);
-                            return;
-                        }
-                    };
-                    match client.announce(&hyprstream_discovery::ServiceAnnouncement {
-                        service_name: svc_name,
-                        socket_kind: "quic".to_owned(),
-                        endpoint,
-                        service_jwt: jwt,
-                        service_did: accepted.service_did,
-                        capabilities: accepted.capabilities,
-                        accepted_state_digest: accepted.accepted_state_digest.to_vec(),
-                        accepted_state_epoch: accepted.accepted_state_epoch,
-                        response_key_id: accepted.response_key_id,
-                        request_kem_key_id: accepted.request_kem_key_id,
-                        request_kem_recipient: accepted.request_kem_recipient.encode(),
-                        expires_at_unix_ms: accepted.accepted_state_expires_at_unix_ms,
-                    }).await {
-                        Ok(_) => tracing::info!("Announced QUIC endpoint to DiscoveryService"),
-                        Err(e) => tracing::warn!("Failed to announce QUIC endpoint: {}", e),
-                    }
-                });
+            let Some(accepted) = accepted else {
+                tracing::warn!("Refusing production network announcement for '{svc_name}': accepted native identity/KEM bundle is unavailable");
+                return;
+            };
+            if let Err(error) = accepted.validate(&svc_name, &sk.verifying_key()) {
+                tracing::warn!(
+                    "Refusing production network announcement for '{svc_name}': {error}"
+                );
+                return;
+            }
+            if needs_renewal {
+                tracing::warn!(
+                    "Service JWT for '{svc_name}' expired or near-expiry. \
+                     Renewal RPC pending capnp schema update. Re-run wizard to refresh JWTs."
+                );
+                let _ = policy_vk;
+            }
+            let Some(publish) = publisher.clone() else {
+                tracing::warn!("Refusing production network announcement for '{svc_name}': publisher is unavailable");
+                return;
+            };
+            publish(NativeAnnouncementRequest {
+                service_name: svc_name,
+                endpoint,
+                signing_key: sk,
+                service_jwt: jwt,
+                discovery_verifying_key: discovery_vk,
+                service_did: accepted.service_did,
+                capabilities: accepted.capabilities,
+                accepted_state_digest: accepted.accepted_state_digest.to_vec(),
+                accepted_state_epoch: accepted.accepted_state_epoch,
+                response_key_id: accepted.response_key_id,
+                request_kem_key_id: accepted.request_kem_key_id,
+                request_kem_recipient: accepted.request_kem_recipient.encode(),
+                expires_at_unix_ms: accepted.accepted_state_expires_at_unix_ms,
             });
         }));
         config
@@ -346,6 +359,10 @@ pub struct ServiceContext {
 
     /// Models directory path
     models_dir: std::path::PathBuf,
+
+    /// One-shot production authority latch. Interior mutability is required
+    /// because inventory factories receive a shared context.
+    discovery_authority: parking_lot::Mutex<Option<DiscoveryBootstrapAuthority>>,
 
     /// Shared QUIC/WebTransport config (TLS materials + base settings).
     /// Per-service ports are resolved via `into_spawnable_quic()`.
@@ -405,6 +422,7 @@ impl ServiceContext {
             identity_provider,
             ipc,
             models_dir,
+            discovery_authority: parking_lot::Mutex::new(None),
             quic_shared: None,
             oauth_issuer_url: None,
             federation_key_source: None,
@@ -755,6 +773,58 @@ impl ServiceContext {
         &self.models_dir
     }
 
+    /// Canonical service-owned deployment directory. It is derived from the
+    /// authenticated application's registry root, never from PDS-specific
+    /// configuration or process environment.
+    pub fn deployment_data_dir(&self) -> anyhow::Result<std::path::PathBuf> {
+        Ok(self
+            .models_dir
+            .canonicalize()
+            .map_err(|error| {
+                anyhow::anyhow!("canonical service data root is unavailable: {error}")
+            })?
+            .join(".registry"))
+    }
+
+    /// Seal the sole production Discovery authority immediately after the
+    /// deployment credentials have been authenticated and before any service
+    /// factory or plugin is invoked.
+    pub fn seal_discovery_bootstrap_authority(&self) -> anyhow::Result<()> {
+        let mut slot = self.discovery_authority.lock();
+        anyhow::ensure!(
+            slot.is_none(),
+            "Discovery bootstrap authority was already sealed"
+        );
+        let acceptance_identity = if self.ipc {
+            crate::service::trust_store::global_trust_store()
+                .resolve_one("registry")
+                .ok_or_else(|| anyhow::anyhow!("trust store has no authenticated registry key"))?
+        } else {
+            self.verifying_key
+        };
+        let store_path = self.deployment_data_dir()?.join("pds-store");
+        anyhow::ensure!(
+            store_path.is_absolute(),
+            "service-owned PDS path must be absolute"
+        );
+        *slot = Some(DiscoveryBootstrapAuthority {
+            store_path,
+            acceptance_identity,
+        });
+        Ok(())
+    }
+
+    /// Consume the pre-sealed authority. Calling this method cannot derive a
+    /// new identity or path, and the slot cannot be replaced after sealing.
+    pub fn take_discovery_bootstrap_authority(
+        &self,
+    ) -> anyhow::Result<DiscoveryBootstrapAuthority> {
+        self.discovery_authority
+            .lock()
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("Discovery bootstrap authority is unavailable"))
+    }
+
     /// Get transport config for a service endpoint from the registry.
     ///
     /// This looks up the endpoint from the global EndpointRegistry.
@@ -968,6 +1038,7 @@ pub fn list_factories() -> impl Iterator<Item = &'static ServiceFactory> {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
     use super::*;
 
@@ -1001,5 +1072,81 @@ mod tests {
         assert!(announcement
             .validate("model", &signer.verifying_key())
             .is_err());
+    }
+
+    #[test]
+    fn production_authority_ignores_ambient_pair() {
+        const CHILD: &str = "HYPRSTREAM_TEST_AUTHORITY_CHILD";
+        const MODELS: &str = "HYPRSTREAM_TEST_AUTHORITY_MODELS";
+        if std::env::var_os(CHILD).is_some() {
+            let models = std::path::PathBuf::from(std::env::var_os(MODELS).expect("models root"));
+            let application = SigningKey::from_bytes(&[0x71; 32]);
+            let context = ServiceContext::new(
+                application.clone(),
+                application.verifying_key(),
+                false,
+                models.clone(),
+            );
+            context
+                .seal_discovery_bootstrap_authority()
+                .expect("seal trusted startup authority");
+            assert!(context.seal_discovery_bootstrap_authority().is_err());
+            let authority = context
+                .take_discovery_bootstrap_authority()
+                .expect("trusted startup authority");
+            let (path, identity) = authority.into_parts();
+            assert_eq!(
+                path,
+                models.canonicalize().unwrap().join(".registry/pds-store")
+            );
+            assert_eq!(identity, application.verifying_key());
+            assert!(context.take_discovery_bootstrap_authority().is_err());
+
+            let registry = SigningKey::from_bytes(&[0x73; 32]);
+            crate::service::trust_store::global_trust_store().insert(
+                registry.verifying_key(),
+                crate::service::trust_store::Attestation {
+                    scopes: std::iter::once("registry".to_owned()).collect(),
+                    subject: None,
+                    jwt: None,
+                    expires_at: 0,
+                    attested_by: None,
+                },
+            );
+            let discovery = SigningKey::from_bytes(&[0x74; 32]);
+            let ipc_context = ServiceContext::new(
+                discovery.clone(),
+                discovery.verifying_key(),
+                true,
+                models,
+            );
+            ipc_context
+                .seal_discovery_bootstrap_authority()
+                .expect("seal authenticated registry authority");
+            let (_, ipc_identity) = ipc_context
+                .take_discovery_bootstrap_authority()
+                .expect("authenticated registry authority")
+                .into_parts();
+            assert_eq!(ipc_identity, registry.verifying_key());
+            return;
+        }
+
+        let models = tempfile::tempdir().expect("service-owned data root");
+        let caller_store = tempfile::tempdir().expect("caller store");
+        let caller = SigningKey::from_bytes(&[0x72; 32]);
+        let status = std::process::Command::new(std::env::current_exe().expect("test executable"))
+            .arg("--exact")
+            .arg("service::factory::tests::production_authority_ignores_ambient_pair")
+            .arg("--nocapture")
+            .env(CHILD, "1")
+            .env(MODELS, models.path())
+            .env("HYPRSTREAM__PDS__STORE_PATH", caller_store.path())
+            .env(
+                "HYPRSTREAM__PDS__ACCEPTANCE_IDENTITY",
+                hex::encode(caller.verifying_key().to_bytes()),
+            )
+            .status()
+            .expect("authority mutation subprocess");
+        assert!(status.success(), "authority mutation subprocess failed");
     }
 }

@@ -87,43 +87,8 @@ fn get_or_init_git2db(models_dir: &std::path::Path) -> anyhow::Result<Arc<RwLock
 /// `<config_dir>/users.db` convention. The registry service (the sole
 /// publisher) opens it read-write; the discovery service (the resolver)
 /// opens it read-only — see `services::discovery::PdsRecordStore`.
-pub(crate) fn pds_store_dir() -> anyhow::Result<std::path::PathBuf> {
-    if let Ok(p) = std::env::var("HYPRSTREAM__PDS__STORE_PATH") {
-        return Ok(std::path::PathBuf::from(p));
-    }
-    if let Ok(c) = HyprConfig::load() {
-        return Ok(c.config_dir().join("pds-store"));
-    }
-    // Never fall back to a predictable, world-writable /tmp path for a durable,
-    // node-signed record store (#910a H2): another local user could pre-own it
-    // and have the node sign injected records as authentic. Fail closed.
-    let base = dirs::config_dir().ok_or_else(|| {
-        anyhow::anyhow!(
-            "cannot resolve a PDS store directory: set HYPRSTREAM__PDS__STORE_PATH \
-             (or a persistent volume in k8s) — refusing to fall back to /tmp for a \
-             durable, signable record store"
-        )
-    })?;
-    Ok(base.join("hyprstream").join("pds-store"))
-}
-
-/// Freeze the #1004 accepted-state authority at the trusted service bootstrap
-/// boundary. Discovery consumes these values only by minting its private opaque
-/// capability; no downstream Discovery API accepts a caller-selected pair.
-fn configure_discovery_deployment_authority(
-    store_path: &std::path::Path,
-    acceptance_identity: ed25519_dalek::VerifyingKey,
-) -> anyhow::Result<()> {
-    let store_path = store_path
-        .canonicalize()
-        .with_context(|| format!("failed to canonicalize PDS store at {store_path:?}"))?;
-    anyhow::ensure!(store_path.is_absolute(), "PDS store path must be absolute");
-    std::env::set_var("HYPRSTREAM__PDS__STORE_PATH", &store_path);
-    std::env::set_var(
-        "HYPRSTREAM__PDS__ACCEPTANCE_IDENTITY",
-        hex::encode(acceptance_identity.to_bytes()),
-    );
-    Ok(())
+pub(crate) fn pds_store_dir(ctx: &ServiceContext) -> anyhow::Result<std::path::PathBuf> {
+    Ok(ctx.deployment_data_dir()?.join("pds-store"))
 }
 
 /// Populate every ordinary network service announcement from a fresh
@@ -140,7 +105,7 @@ pub fn with_checkpointed_native_announcements(
     } else {
         ctx.verifying_key()
     };
-    let store = crate::services::discovery::PdsRecordStore::open_readonly(&pds_store_dir()?)?
+    let store = crate::services::discovery::PdsRecordStore::open_readonly(&pds_store_dir(&ctx)?)?
         .with_at9p_acceptance_identity(acceptance_identity);
     let states = store.accepted_at9p_states()?;
     for service_name in service_names
@@ -749,7 +714,7 @@ fn create_registry_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawn
     // only in the writer's memory — never in the record DB (#910a H1). Paths
     // fail closed rather than fall back to /tmp (H2).
     let pds_publisher = (|| -> anyhow::Result<crate::services::discovery::PdsPublisher> {
-        let store_dir = pds_store_dir()?;
+        let store_dir = pds_store_dir(ctx)?;
         let secrets_dir = crate::config::HyprConfig::resolve_secrets_dir()?;
         let es256_store =
             crate::auth::key_rotation::global_es256_key_store(&secrets_dir, &config.oauth);
@@ -1848,8 +1813,7 @@ fn create_discovery_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spaw
     } else {
         ctx.verifying_key()
     };
-    let pds_store_path = pds_store_dir()?;
-    configure_discovery_deployment_authority(&pds_store_path, at9p_acceptance_identity)?;
+    let pds_store_path = pds_store_dir(ctx)?;
     let pds_store = std::sync::Arc::new(
         open_pds_store_readonly(&pds_store_path)
             .context("failed to open PDS record store (read-only)")?
@@ -1859,14 +1823,15 @@ fn create_discovery_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spaw
         pds_store,
     ));
 
-    let mut discovery_service = DiscoveryService::new_production(
+    let mut discovery_service = DiscoveryService::new(
         Arc::new(sk),
         ctx.jwt_verifying_key(),
         ctx.transport("discovery", SocketKind::Rep),
-    )?
+    )
     .with_auth_provider(Box::new(auth_provider))
     .with_record_resolver(std::sync::Arc::clone(&record_resolver)
         as std::sync::Arc<dyn hyprstream_discovery::RecordResolver>);
+    discovery_service.install_bootstrap_authority(ctx.take_discovery_bootstrap_authority()?)?;
     if let Some(issuer) = ctx.oauth_issuer_url() {
         discovery_service = discovery_service.with_oauth_issuer(issuer.to_owned());
         // Use the issuer URL as the audience for discovery tokens
@@ -2042,48 +2007,6 @@ fn compute_tls_endorsement(
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-
-    static DEPLOYMENT_ENV_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
-
-    #[test]
-    fn trusted_bootstrap_overrides_caller_selected_authority_pair() {
-        let _guard = DEPLOYMENT_ENV_LOCK.lock();
-        let old_path = std::env::var_os("HYPRSTREAM__PDS__STORE_PATH");
-        let old_identity = std::env::var_os("HYPRSTREAM__PDS__ACCEPTANCE_IDENTITY");
-        let caller_store = tempfile::tempdir().unwrap();
-        let deployment_store = tempfile::tempdir().unwrap();
-        let caller_identity = ed25519_dalek::SigningKey::from_bytes(&[0x61; 32]);
-        let deployment_identity = ed25519_dalek::SigningKey::from_bytes(&[0x62; 32]);
-        std::env::set_var("HYPRSTREAM__PDS__STORE_PATH", caller_store.path());
-        std::env::set_var(
-            "HYPRSTREAM__PDS__ACCEPTANCE_IDENTITY",
-            hex::encode(caller_identity.verifying_key().to_bytes()),
-        );
-
-        configure_discovery_deployment_authority(
-            deployment_store.path(),
-            deployment_identity.verifying_key(),
-        )
-        .unwrap();
-
-        assert_eq!(
-            std::path::PathBuf::from(std::env::var_os("HYPRSTREAM__PDS__STORE_PATH").unwrap()),
-            deployment_store.path().canonicalize().unwrap()
-        );
-        assert_eq!(
-            std::env::var("HYPRSTREAM__PDS__ACCEPTANCE_IDENTITY").unwrap(),
-            hex::encode(deployment_identity.verifying_key().to_bytes())
-        );
-
-        match old_path {
-            Some(value) => std::env::set_var("HYPRSTREAM__PDS__STORE_PATH", value),
-            None => std::env::remove_var("HYPRSTREAM__PDS__STORE_PATH"),
-        }
-        match old_identity {
-            Some(value) => std::env::set_var("HYPRSTREAM__PDS__ACCEPTANCE_IDENTITY", value),
-            None => std::env::remove_var("HYPRSTREAM__PDS__ACCEPTANCE_IDENTITY"),
-        }
-    }
 
     /// Helper: generate an ECDSA P-256 key pair and return (pkcs8_der, public_key_der)
     fn generate_ecdsa_p256_pair() -> (Vec<u8>, Vec<u8>) {

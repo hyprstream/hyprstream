@@ -11,7 +11,11 @@ pub mod ordering;
 pub mod trust_store;
 
 pub use spawner::{InprocManager, Spawnable, SpawnedService};
-pub use factory::{get_factory, list_factories, NativeServiceAnnouncement, QuicSharedConfig, ServiceContext, ServiceFactory};
+pub use factory::{
+    get_factory, list_factories, DiscoveryBootstrapAuthority, NativeAnnouncementPublisher,
+    NativeAnnouncementRequest, NativeServiceAnnouncement, QuicSharedConfig, ServiceContext,
+    ServiceFactory,
+};
 pub use trust_store::{TrustStore, Attestation, global_trust_store};
 pub use manager::{detect as detect_service_manager, ServiceManager, StandaloneManager};
 #[cfg(feature = "systemd")]

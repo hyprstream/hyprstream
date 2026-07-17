@@ -19,6 +19,7 @@ k8s = ["dep:hyprstream-k8s"]
 [dependencies]
 # Workspace crates
 hyprstream-rpc = { path = "../hyprstream-rpc" }
+hyprstream-service = { path = "../hyprstream-service" }
 # K4c (#787) — optional, only for the `k8s` feature's placement→PodSpec map.
 hyprstream-k8s = { path = "../hyprstream-k8s", optional = true }
 hyprstream-util = { path = "../hyprstream-util" }
