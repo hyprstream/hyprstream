@@ -1845,8 +1845,7 @@ fn create_discovery_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spaw
     )
     .with_auth_provider(Box::new(auth_provider))
     .with_record_resolver(std::sync::Arc::clone(&record_resolver)
-        as std::sync::Arc<dyn hyprstream_discovery::RecordResolver>)
-    .with_accepted_state_source(record_resolver);
+        as std::sync::Arc<dyn hyprstream_discovery::RecordResolver>);
     if let Some(issuer) = ctx.oauth_issuer_url() {
         discovery_service = discovery_service.with_oauth_issuer(issuer.to_owned());
         // Use the issuer URL as the audience for discovery tokens
@@ -1881,7 +1880,10 @@ fn create_discovery_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spaw
     // Discovery has now been explicitly bootstrapped through the local registry
     // path. Replace only the identity-bound resolver; the endpoint-only legacy
     // resolver remains isolated for named bootstrap adapters.
-    discovery_service.install_production_resolver()?;
+    discovery_service.install_checkpointed_pds_resolver(
+        &pds_store_dir()?,
+        at9p_acceptance_identity,
+    )?;
 
     // TODO: DiscoveryService federation key source support
     // (federation_key_source not yet implemented on DiscoveryService)

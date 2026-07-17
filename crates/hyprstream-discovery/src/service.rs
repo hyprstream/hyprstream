@@ -29,6 +29,8 @@ use hyprstream_util::ttl_cache::TtlCache;
 use parking_lot::RwLock;
 use std::collections::{BTreeSet, HashMap};
 use std::net::SocketAddr;
+#[cfg(not(target_arch = "wasm32"))]
+use std::path::Path;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -580,7 +582,7 @@ struct AnnouncedEndpoint {
 
 /// Checkpoint-verifying accepted-current-state read used by production
 /// resolution. Implemented by the daemon-owned PDS reader from #1004.
-pub trait AcceptedStateSource: Send + Sync {
+pub(super) trait AcceptedStateSource: Send + Sync {
     fn accepted_state(
         &self,
         did: &str,
@@ -847,14 +849,15 @@ impl DiscoveryService {
         self
     }
 
-    pub fn with_accepted_state_source(mut self, source: Arc<dyn AcceptedStateSource>) -> Self {
+    #[cfg(test)]
+    fn with_accepted_state_source(mut self, source: Arc<dyn AcceptedStateSource>) -> Self {
         self.accepted_state_source = Some(source);
         self
     }
 
     /// Build the resolver sharing only owned candidate/state handles. No
     /// Cap'n Proto reader or registry guard crosses the boundary.
-    pub fn install_production_resolver(&self) -> Result<()> {
+    fn install_production_resolver(&self) -> Result<()> {
         let source = self
             .accepted_state_source
             .clone()
@@ -865,6 +868,42 @@ impl DiscoveryService {
                 accepted_state_source: source,
             }))
             .map_err(|_| anyhow::anyhow!("production service resolver is already installed"))
+    }
+
+    /// Install the production resolver from the concrete checkpoint-verified
+    /// #1004 PDS store. The store reader and accepted-state source are private;
+    /// callers can name only the durable store path and its pinned deployment
+    /// verification identity, never implement or inject resolution authority.
+    ///
+    /// ```compile_fail
+    /// use hyprstream_discovery::AcceptedStateSource;
+    /// ```
+    ///
+    /// ```compile_fail
+    /// use hyprstream_discovery::DiscoveryService;
+    /// fn inject(service: DiscoveryService) {
+    ///     service.with_accepted_state_source(todo!());
+    /// }
+    /// ```
+    ///
+    /// ```compile_fail
+    /// use hyprstream_discovery::DiscoveryService;
+    /// fn install_caller_authority(service: &DiscoveryService) {
+    ///     service.install_production_resolver().unwrap();
+    /// }
+    /// ```
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn install_checkpointed_pds_resolver(
+        &mut self,
+        store_path: &Path,
+        acceptance_identity: ed25519_dalek::VerifyingKey,
+    ) -> Result<()> {
+        let source = Arc::new(crate::checkpointed_pds::CheckpointedPdsAcceptedStateSource::open(
+            store_path,
+            acceptance_identity,
+        )?);
+        self.accepted_state_source = Some(source);
+        self.install_production_resolver()
     }
 
     #[cfg(test)]

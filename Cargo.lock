@@ -6975,9 +6975,11 @@ dependencies = [
  "parking_lot 0.12.4",
  "proptest",
  "rand 0.8.5",
+ "rocksdb",
  "serde",
  "serde_json",
  "serde_yaml",
+ "tempfile",
  "tokio",
  "tracing",
 ]

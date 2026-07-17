@@ -53,6 +53,8 @@ pub mod generated {
 }
 
 mod service;
+#[cfg(not(target_arch = "wasm32"))]
+mod checkpointed_pds;
 
 /// #893 (at9p D1) — `did:at9p` capsule resolver: turns a GATE-verified capsule
 /// into a dialable `TransportConfig::iroh` (sibling to
@@ -100,8 +102,7 @@ pub mod podspec;
 pub use hyprstream_rpc::registry::SocketKind;
 pub use hyprstream_rpc::resolver::Resolver;
 pub use service::{
-    AcceptedStateSource, AuthorizationProvider, DiscoveryService, RecordCarData, RecordResolver,
-    production_rpc_client,
+    AuthorizationProvider, DiscoveryService, RecordCarData, RecordResolver, production_rpc_client,
 };
 
 // Re-export generated types that consumers need
