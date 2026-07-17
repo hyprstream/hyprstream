@@ -26,7 +26,7 @@ The generated text/HTML intentionally exercise xml2rfc's standard Internet-Draft
 | `draft-ietf-moq-transport-19` | <https://www.ietf.org/archive/id/draft-ietf-moq-transport-19.html> | IETF Internet-Draft, work in progress |
 | `draft-ietf-moq-privacy-pass-auth-03` | <https://www.ietf.org/archive/id/draft-ietf-moq-privacy-pass-auth-03.html> | IETF Internet-Draft, work in progress |
 | `draft-guo-privacypass-token-binding-02` | <https://www.ietf.org/archive/id/draft-guo-privacypass-token-binding-02.html> | Individual Internet-Draft, not adopted |
-| `draft-ietf-pquip-hybrid-signature-spectrums-07` | <https://www.ietf.org/archive/id/draft-ietf-pquip-hybrid-signature-spectrums-07.html> | IETF Internet-Draft, work in progress |
+| RFC 9955, Hybrid Signature Spectrums | <https://www.rfc-editor.org/info/rfc9955> | Informational RFC |
 
 In particular, MOQT -19 Section 11.2 describes the Object payload as opaque to relays and Section 10.2.2 defines the `AUTHORIZATION TOKEN` message parameter. The MoQ Privacy Pass draft Section 3.5 profiles Privacy Pass on those authorization surfaces. Both MOQT documents remain works in progress; this profile does not treat their current text as an allocated Hyprstream extension.
 

@@ -11,7 +11,7 @@
 | [draft-ietf-moq-transport-19](https://www.ietf.org/archive/id/draft-ietf-moq-transport-19.html) | IETF Internet-Draft, work in progress | ordinary MOQT Objects, forwarding, caching, session/track mechanics | No mandatory Hyprstream PQ-anonymous extension is selected | use ordinary payloads; #726 |
 | [draft-ietf-moq-privacy-pass-auth-03](https://www.ietf.org/archive/id/draft-ietf-moq-privacy-pass-auth-03.html) | IETF Internet-Draft, work in progress | standard authorization-token/challenge surfaces for participating relays | Classical relay authorization remains coarse and cannot satisfy origin MAC/key release | outer plane only; #726 |
 | [draft-guo-privacypass-token-binding-02](https://www.ietf.org/archive/id/draft-guo-privacypass-token-binding-02.html) | Individual Internet-Draft, not adopted | binding design input | Not adopted and does not establish this profile's PQ assurance or HyKEM semantics | #1061 review/question; no normative dependency yet |
-| [draft-ietf-pquip-hybrid-signature-spectrums-07](https://www.ietf.org/archive/id/draft-ietf-pquip-hybrid-signature-spectrums-07.html) | IETF Internet-Draft, work in progress | composition/non-separability terminology | Signatures are not a blind anonymous issuance primitive | terminology only; #1059/#1060 |
+| [RFC 9955](https://www.rfc-editor.org/info/rfc9955), Hybrid Signature Spectrums | Informational RFC | composition/non-separability terminology | Signatures are not a blind anonymous issuance primitive | terminology only; #1059/#1060 |
 
 ## Explicit non-allocations
 

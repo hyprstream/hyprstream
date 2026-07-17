@@ -73,12 +73,12 @@ Table of Contents
 
    1.  Introduction  . . . . . . . . . . . . . . . . . . . . . . . .   2
    2.  Requirements Language . . . . . . . . . . . . . . . . . . . .   2
-   3.  Bounded Vocabulary  . . . . . . . . . . . . . . . . . . . . .   3
+   3.  Bounded Vocabulary  . . . . . . . . . . . . . . . . . . . . .   2
    4.  Assurance Separation  . . . . . . . . . . . . . . . . . . . .   3
    5.  Classical MOQT Relay Profile  . . . . . . . . . . . . . . . .   3
    6.  Transcript Registry . . . . . . . . . . . . . . . . . . . . .   4
    7.  State-Machine Skeleton  . . . . . . . . . . . . . . . . . . .   4
-   8.  Security Considerations . . . . . . . . . . . . . . . . . . .   5
+   8.  Security Considerations . . . . . . . . . . . . . . . . . . .   4
    9.  Privacy Considerations  . . . . . . . . . . . . . . . . . . .   5
    10. IANA Considerations . . . . . . . . . . . . . . . . . . . . .   5
    11. References  . . . . . . . . . . . . . . . . . . . . . . . . .   5
@@ -95,8 +95,7 @@ Table of Contents
    MOQT carriage draft ([MOQT]) and MoQ Privacy Pass authentication
    draft ([MOQPP]) are work in progress.  The individual token-binding
    draft ([PPBIND]) is not adopted.  Hybrid terminology follows
-   [RFC9794] and the work-in-progress PQUIP signature spectrum draft
-   ([PQUIP]).
+   [RFC9794] and the signature-composition taxonomy in [RFC9955].
 
 2.  Requirements Language
 
@@ -104,8 +103,9 @@ Table of Contents
    interpreted as described in BCP 14 [RFC2119] [RFC8174] when, and only
    when, they appear in all capitals, as shown here.
 
+3.  Bounded Vocabulary
 
-
+   Outer admission:  Classical, carrier-local relay admission, routing,
 
 
 
@@ -114,9 +114,6 @@ HyprStream               Expires 18 January 2027                [Page 2]
 Internet-Draft       PQ Hybrid Privacy Pass Profile            July 2026
 
 
-3.  Bounded Vocabulary
-
-   Outer admission:  Classical, carrier-local relay admission, routing,
       rate control, or cache policy using standard MOQT/Privacy Pass
       surfaces.
 
@@ -158,8 +155,11 @@ Internet-Draft       PQ Hybrid Privacy Pass Profile            July 2026
    coarse admission; an unsupported private authorization profile must
    not make forwarding non-interoperable.
 
-
-
+   Private challenge, issuance, redemption, and key-release data are
+   future encrypted application Object payloads.  The relay-visible
+   Object identity, size, timing, cache behavior, and routing metadata
+   are not confidential by this document and no traffic-analysis
+   resistance is claimed.
 
 
 
@@ -169,12 +169,6 @@ HyprStream               Expires 18 January 2027                [Page 3]
 
 Internet-Draft       PQ Hybrid Privacy Pass Profile            July 2026
 
-
-   Private challenge, issuance, redemption, and key-release data are
-   future encrypted application Object payloads.  The relay-visible
-   Object identity, size, timing, cache behavior, and routing metadata
-   are not confidential by this document and no traffic-analysis
-   resistance is claimed.
 
 6.  Transcript Registry
 
@@ -192,8 +186,8 @@ Internet-Draft       PQ Hybrid Privacy Pass Profile            July 2026
 
    Client states are: Idle; EntitlementChecked (optional);
    IssuancePrepared; TokenHeld; OuterSessionReady (optional);
-   InnerControlSent; Released; SpentOrExpired.  Issuer states are:
-   ConfigurationResolved; IssuanceReceived; IssuanceAccepted;
+   InnerControlSent; Released; SpentOrExpired; Denied.  Issuer states
+   are: ConfigurationResolved; IssuanceReceived; IssuanceAccepted;
    IssuanceRejected; KeyDraining.  Origin states are: ChallengeIssued;
    OuterSessionObserved (optional); InnerControlReceived; StateResolved;
    BindingVerified; MACAuthorized; SpendCommitted; ReleaseCommitted;
@@ -216,7 +210,13 @@ Internet-Draft       PQ Hybrid Privacy Pass Profile            July 2026
    are application-profile inputs, not MOQT or Privacy Pass allocations;
    unknown kinds and versions reject.
 
+8.  Security Considerations
 
+   Construction selection and independent review are prerequisites for
+   any PqHybrid production claim.  The profile requires exact binding to
+   issuer, audience, accepted-state and policy generations, carrier
+   profile, operation/resource, one-use PoP, and HyKEM recipient, but
+   deliberately leaves their concrete encoding and primitive unselected.
 
 
 
@@ -225,14 +225,6 @@ HyprStream               Expires 18 January 2027                [Page 4]
 
 Internet-Draft       PQ Hybrid Privacy Pass Profile            July 2026
 
-
-8.  Security Considerations
-
-   Construction selection and independent review are prerequisites for
-   any PqHybrid production claim.  The profile requires exact binding to
-   issuer, audience, accepted-state and policy generations, carrier
-   profile, operation/resource, one-use PoP, and HyKEM recipient, but
-   deliberately leaves their concrete encoding and primitive unselected.
 
 9.  Privacy Considerations
 
@@ -273,15 +265,6 @@ Internet-Draft       PQ Hybrid Privacy Pass Profile            July 2026
 
 11.2.  Informative References
 
-
-
-
-
-HyprStream               Expires 18 January 2027                [Page 5]
-
-Internet-Draft       PQ Hybrid Privacy Pass Profile            July 2026
-
-
    [RFC9794]  Driscoll, F., Parsons, M., and B. Hale, "Terminology for
               Post-Quantum Traditional Hybrid Schemes", RFC 9794, June
               2025, <https://www.rfc-editor.org/info/rfc9794>.
@@ -291,6 +274,13 @@ Internet-Draft       PQ Hybrid Privacy Pass Profile            July 2026
               Draft, draft-ietf-moq-transport-19, 6 July 2026,
               <https://www.ietf.org/archive/id/draft-ietf-moq-transport-
               19.txt>.
+
+
+
+HyprStream               Expires 18 January 2027                [Page 5]
+
+Internet-Draft       PQ Hybrid Privacy Pass Profile            July 2026
+
 
    [MOQPP]    Nandakumar, S., Jennings, C., and T. Meunier, "Privacy
               Pass Authentication for Media over QUIC (MoQ)", Work in
@@ -304,16 +294,26 @@ Internet-Draft       PQ Hybrid Privacy Pass Profile            July 2026
               2026, <https://www.ietf.org/archive/id/draft-guo-
               privacypass-token-binding-02.txt>.
 
-   [PQUIP]    Bindel, N., Hale, B., Connolly, D., and F. Driscoll,
-              "Hybrid Signature Spectrums", Work in Progress, Internet-
-              Draft, draft-ietf-pquip-hybrid-signature-spectrums-07, 20
-              June 2025, <https://www.ietf.org/archive/id/draft-ietf-
-              pquip-hybrid-signature-spectrums-07.txt>.
+   [RFC9955]  Bindel, N., Hale, B., Connolly, D., and F. Driscoll,
+              "Hybrid Signature Spectrums", RFC 9955, July 2026,
+              <https://www.rfc-editor.org/info/rfc9955>.
 
 Author's Address
 
    HyprStream Contributors
    HyprStream
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 

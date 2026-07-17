@@ -44,7 +44,7 @@ def validate_registry() -> list[str]:
     if "not an IANA" not in data.get("scope", ""):
         errors.append("registry scope must explicitly say it is not an IANA registry")
     canonical = data.get("canonicalization", {})
-    for key in ("encoding", "text", "integers", "bytes", "digest"):
+    for key in ("encoding", "identifiers", "integers", "octets", "digest", "boundary"):
         if not canonical.get(key):
             errors.append(f"canonicalization.{key} is required")
     fields = data.get("fields", {})
@@ -54,27 +54,30 @@ def validate_registry() -> list[str]:
     if not isinstance(labels, list) or not labels:
         return errors + ["labels must be a nonempty list"]
     seen: set[str] = set()
-    allowed_types = {"text", "bytes", "uint"}
+    allowed_classes = {"identifier", "opaque-octets", "nonnegative-integer"}
     for name, spec in fields.items():
         if not isinstance(spec, dict):
             errors.append(f"field {name}: definition must be an object")
             continue
-        if spec.get("type") not in allowed_types:
-            errors.append(f"field {name}: unsupported or missing type")
-        if not spec.get("canonical"):
-            errors.append(f"field {name}: canonical form is required")
-        if spec.get("type") == "uint":
+        value_class = spec.get("value_class")
+        if value_class not in allowed_classes:
+            errors.append(f"field {name}: unsupported or missing semantic value_class")
+        if not spec.get("selection_requirement"):
+            errors.append(f"field {name}: construction selection requirement is required")
+        if "type" in spec or "canonical" in spec:
+            errors.append(f"field {name}: representation-level type/canonical keys are forbidden")
+        if value_class == "nonnegative-integer":
             minimum, maximum = spec.get("minimum"), spec.get("maximum")
             if any(not isinstance(value, int) or isinstance(value, bool) for value in (minimum, maximum)):
-                errors.append(f"field {name}: uint requires integer minimum/maximum")
+                errors.append(f"field {name}: nonnegative-integer requires integer minimum/maximum")
             elif minimum < 0 or minimum > maximum:
-                errors.append(f"field {name}: uint bounds must satisfy 0 <= minimum <= maximum")
+                errors.append(f"field {name}: bounds must satisfy 0 <= minimum <= maximum")
         else:
             minimum, maximum = spec.get("min_bytes"), spec.get("max_bytes")
             if any(not isinstance(value, int) or isinstance(value, bool) for value in (minimum, maximum)):
-                errors.append(f"field {name}: byte/text requires integer min_bytes/max_bytes")
+                errors.append(f"field {name}: identifier/octet value requires integer min_bytes/max_bytes ceilings")
             elif minimum < 0 or minimum > maximum:
-                errors.append(f"field {name}: byte bounds must satisfy 0 <= min_bytes <= max_bytes")
+                errors.append(f"field {name}: resource ceilings must satisfy 0 <= min_bytes <= max_bytes")
     for label in labels:
         if not isinstance(label, dict):
             errors.append("each label definition must be an object")
@@ -144,6 +147,83 @@ def validate_vocabulary() -> list[str]:
     invariants = data.get("transition_invariants")
     if not isinstance(invariants, list) or not invariants:
         errors.append("transition_invariants must be a nonempty list")
+    errors += validate_vocabulary_xml_coherence(data)
+    return errors
+
+
+def normalized_name(value: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", value.lower())
+
+
+def validate_vocabulary_xml_coherence(data: dict) -> list[str]:
+    """Keep the RFCXML profile synchronized with the vocabulary source of truth."""
+    errors: list[str] = []
+    try:
+        root = ET.parse(XML).getroot()
+    except ET.ParseError as exc:
+        return [f"{XML}: invalid XML: {exc}"]
+    section = root.find("./middle/section[@anchor='states']")
+    if section is None:
+        return ["RFCXML states section is missing"]
+    paragraphs = [
+        " ".join(part.strip() for part in paragraph.itertext() if part.strip())
+        for paragraph in section.findall("./t")
+    ]
+    text = " ".join(paragraphs)
+    state_match = re.search(
+        r"Client states are: (.*?)\. Issuer states are: (.*?)\. Origin states are: (.*?)\.",
+        text,
+    )
+    if state_match is None:
+        errors.append("RFCXML state lists are missing or malformed")
+    else:
+        for role, listed in zip(("client", "issuer", "origin"), state_match.groups()):
+            actual = {
+                normalized_name(re.sub(r"\s*\(optional\)\s*", "", item))
+                for item in listed.split(";")
+            }
+            expected_values = data.get("states", {}).get(role, [])
+            expected = {normalized_name(value) for value in expected_values}
+            if actual != expected:
+                errors.append(
+                    f"RFCXML {role} states differ from profile-vocabulary.json: "
+                    f"missing={sorted(expected - actual)}, extra={sorted(actual - expected)}"
+                )
+    kinds_match = re.search(r"bounded inner control kinds are (.*?)\. The local scaffold limits", text)
+    if kinds_match is None:
+        errors.append("RFCXML bounded inner control kind list is missing or malformed")
+    else:
+        listed = kinds_match.group(1).replace(", and ", ", ").replace(" and ", ", ")
+        actual = {normalized_name(item) for item in listed.split(", ")}
+        expected = {
+            normalized_name(value)
+            for value in data.get("inner_control", {}).get("message_kinds", [])
+        }
+        if actual != expected:
+            errors.append(
+                "RFCXML inner control kinds differ from profile-vocabulary.json: "
+                f"missing={sorted(expected - actual)}, extra={sorted(actual - expected)}"
+            )
+    limits_match = re.search(
+        r"limits one encrypted Object payload to (\d+) bytes, one exchange to (\d+) Objects, "
+        r"and one session to (\d+) concurrent exchanges",
+        text,
+    )
+    if limits_match is None:
+        errors.append("RFCXML inner control limits are missing or malformed")
+    else:
+        actual_limits = tuple(int(value) for value in limits_match.groups())
+        control = data.get("inner_control", {})
+        expected_limits = (
+            control.get("max_object_payload_bytes"),
+            control.get("max_exchange_objects"),
+            control.get("max_concurrent_exchanges_per_session"),
+        )
+        if actual_limits != expected_limits:
+            errors.append(
+                f"RFCXML inner control limits {actual_limits} differ from "
+                f"profile-vocabulary.json {expected_limits}"
+            )
     return errors
 
 
