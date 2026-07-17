@@ -58,7 +58,7 @@
 //! NodeIds are reachable and correlate lookup traffic) is **unaffected** by this
 //! demotion — pkarr is still public. Its mitigation is oblivious-relay (#361);
 //! until then, operators that consider the side channel actionable should run a
-//! self-hosted `iroh-dns-server` via [`IrohSubstrate::from_endpoint`].
+//! self-hosted `iroh-dns-server` configured through the owned endpoint builder.
 
 use anyhow::Result;
 use iroh::endpoint::{Connection, presets};
@@ -81,13 +81,32 @@ pub struct IrohSubstrate {
     router: Router,
 }
 
+/// Capability proving an outbound iroh endpoint was constructed by
+/// [`IrohSubstrate::new`] with the owned hybrid-only crypto provider.
+///
+/// The inner endpoint is intentionally private: an already-bound iroh endpoint
+/// does not expose its effective provider, so arbitrary endpoints cannot be
+/// promoted into the process-global RPC/MoQ dialer.
+#[derive(Clone)]
+pub struct OwnedIrohClientEndpoint(Endpoint);
+
+impl OwnedIrohClientEndpoint {
+    pub(crate) fn install_into(
+        self,
+        slot: &std::sync::OnceLock<Endpoint>,
+    ) -> std::result::Result<(), Self> {
+        slot.set(self.0).map_err(Self)
+    }
+}
+
 impl IrohSubstrate {
     /// Build the substrate from raw 32-byte Ed25519 secret key material.
     ///
     /// Uses iroh's `presets::N0` for discovery (n0 DNS + pkarr) and relay
-    /// fallback. Operators wanting self-hosted discovery should bypass this
-    /// constructor and use [`IrohSubstrate::from_endpoint`] with a
-    /// pre-configured `iroh::Endpoint`.
+    /// fallback. Alternate discovery configuration must be added through an
+    /// owned builder that also installs this same hybrid-only provider; a
+    /// prebuilt endpoint cannot safely be accepted because iroh exposes no
+    /// effective-provider introspection after bind.
     ///
     /// **pkarr here is liveness-only** — see the module-level "D3" note. The
     /// published record carries reach hints (relay + direct addrs) for this
@@ -105,15 +124,14 @@ impl IrohSubstrate {
     {
         let endpoint = Endpoint::builder(presets::N0)
             .secret_key(SecretKey::from_bytes(&secret_key_bytes))
-            // PQ-hybrid TLS: pin X25519MLKEM768 on the iroh QUIC channel (#557 / S6).
-            // Overrides the preset's default (ring) provider; RFC 7250 raw-public-key
-            // identity binding is orthogonal to kx_groups and unaffected.
-            .crypto_provider(crate::transport::pq_provider::pq_crypto_provider())
+            // Owned mesh policy: require X25519MLKEM768 with no classical
+            // fallback. RFC 7250 raw-public-key identity is orthogonal to kx.
+            .crypto_provider(crate::transport::pq_provider::internal_mesh_crypto_provider())
             .bind()
             .await
             .map_err(|e| anyhow::anyhow!("iroh endpoint bind: {e}"))?;
 
-        Ok(Self::from_endpoint(endpoint, moq_handler, rpc_handler))
+        Ok(Self::from_owned_endpoint(endpoint, moq_handler, rpc_handler))
     }
 
     /// Build a hermetic direct-only substrate for unit tests.
@@ -136,19 +154,17 @@ impl IrohSubstrate {
     {
         let endpoint = Endpoint::builder(presets::Empty)
             .secret_key(SecretKey::from_bytes(&secret_key_bytes))
-            .crypto_provider(crate::transport::pq_provider::pq_crypto_provider())
+            .crypto_provider(crate::transport::pq_provider::internal_mesh_crypto_provider())
             .bind()
             .await
             .map_err(|e| anyhow::anyhow!("test iroh endpoint bind: {e}"))?;
 
-        Ok(Self::from_endpoint(endpoint, moq_handler, rpc_handler))
+        Ok(Self::from_owned_endpoint(endpoint, moq_handler, rpc_handler))
     }
 
-    /// Wrap a caller-built endpoint. Useful when the caller wants
-    /// non-default discovery (e.g. self-hosted `iroh-dns-server`), a
-    /// non-default crypto provider, or to share an existing endpoint
-    /// across substrates.
-    pub fn from_endpoint<M, R>(
+    /// Attach the owned ALPNs to an endpoint constructed immediately above.
+    /// Kept private because `Endpoint` does not reveal its effective provider.
+    fn from_owned_endpoint<M, R>(
         endpoint: Endpoint,
         moq_handler: M,
         rpc_handler: R,
@@ -174,6 +190,12 @@ impl IrohSubstrate {
     /// an ALPN not served by this substrate's router.
     pub fn endpoint(&self) -> &Endpoint {
         &self.endpoint
+    }
+
+    /// Clone the endpoint as an owned-provider capability for installation as
+    /// the shared outbound RPC and MoQ dial endpoint.
+    pub fn owned_client_endpoint(&self) -> OwnedIrohClientEndpoint {
+        OwnedIrohClientEndpoint(self.endpoint.clone())
     }
 
     /// Borrow the router (e.g. to inspect or to share lifetime).
@@ -270,10 +292,13 @@ impl ProtocolHandler for EchoHandler {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
     use iroh::TransportAddr;
+    use noq::crypto::rustls::HandshakeData;
     use rand::RngCore;
+    use std::sync::Arc;
 
     fn fresh_key() -> [u8; 32] {
         let mut k = [0u8; 32];
@@ -293,6 +318,20 @@ mod tests {
                 .into_iter()
                 .map(TransportAddr::Ip),
         )
+    }
+
+    fn assert_hybrid_handshake(conn: &Connection, alpn: &[u8]) {
+        let data = conn
+            .handshake_data()
+            .expect("completed iroh connection has handshake data")
+            .downcast::<HandshakeData>()
+            .expect("iroh uses noq rustls handshake data");
+        assert_eq!(data.protocol.as_deref(), Some(alpn));
+        assert_eq!(
+            data.negotiated_key_exchange_group,
+            Some(rustls::NamedGroup::X25519MLKEM768),
+            "owned iroh mesh must negotiate X25519MLKEM768"
+        );
     }
 
     /// Smoke test: build two substrates, dial direct (no DNS/pkarr), echo a
@@ -318,6 +357,7 @@ mod tests {
             let conn = client
                 .connect(server_addr.clone(), ALPN_HYPRSTREAM_RPC)
                 .await?;
+            assert_hybrid_handshake(&conn, ALPN_HYPRSTREAM_RPC);
             let (mut send, mut recv) = conn.open_bi().await?;
             send.write_all(b"hello rpc").await?;
             send.finish()?;
@@ -328,6 +368,7 @@ mod tests {
         // Streaming plane round-trip (echo here; real moq-net wiring lands in Phase 3).
         {
             let conn = client.connect(server_addr.clone(), ALPN_MOQ_LITE).await?;
+            assert_hybrid_handshake(&conn, ALPN_MOQ_LITE);
             let (mut send, mut recv) = conn.open_bi().await?;
             send.write_all(b"hello moq").await?;
             send.finish()?;
@@ -339,6 +380,36 @@ mod tests {
         assert_eq!(server.endpoint_id(), server_id);
 
         client.shutdown().await?;
+        server.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn internal_iroh_mesh_rejects_classical_only_peer() -> Result<()> {
+        let server = IrohSubstrate::new(fresh_key(), EchoHandler, EchoHandler).await?;
+        let server_addr = direct_addr(&server);
+        let classical_client = Endpoint::builder(presets::N0)
+            .secret_key(SecretKey::from_bytes(&fresh_key()))
+            .crypto_provider(Arc::new(rustls::crypto::ring::default_provider()))
+            .bind()
+            .await
+            .map_err(|e| anyhow::anyhow!("classical mutation endpoint bind: {e}"))?;
+
+        for alpn in [ALPN_HYPRSTREAM_RPC, ALPN_MOQ_LITE] {
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                classical_client.connect(server_addr.clone(), alpn),
+            )
+            .await
+            .expect("classical-only iroh mutation handshake must terminate");
+            assert!(
+                result.is_err(),
+                "internal iroh outbound endpoint reached owned ALPN {:?}",
+                String::from_utf8_lossy(alpn)
+            );
+        }
+
+        classical_client.close().await;
         server.shutdown().await?;
         Ok(())
     }

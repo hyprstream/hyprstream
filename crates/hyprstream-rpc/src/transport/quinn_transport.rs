@@ -621,8 +621,11 @@ impl Transport for QuinnTransport {
 /// Build a quinn WebTransport client session against a server with a CA-issued
 /// certificate, validated via the system root store and the DNS `server_name`
 /// (`QuicServerAuth::web_pki`). Dials `https://{server_name}:{port}/`.
-pub async fn connect_webpki(server_name: &str, port: u16) -> Result<web_transport_quinn::Session> {
-    let client = web_transport_quinn::ClientBuilder::new()
+pub async fn connect_webpki(
+    server_name: &str,
+    port: u16,
+) -> Result<web_transport_quinn::Session> {
+    let client = external_client_builder()?
         .with_system_roots()
         .map_err(|e| anyhow!("quinn client (system roots): {e}"))?;
     let url = url::Url::parse(&format!("https://{server_name}:{port}/"))
@@ -643,7 +646,7 @@ pub async fn connect_pinned_hashes(
     cert_hashes: &[[u8; 32]],
 ) -> Result<web_transport_quinn::Session> {
     let hashes: Vec<Vec<u8>> = cert_hashes.iter().map(|h| h.to_vec()).collect();
-    let client = web_transport_quinn::ClientBuilder::new()
+    let client = external_client_builder()?
         .with_server_certificate_hashes(hashes)
         .map_err(|e| anyhow!("quinn client build: {e}"))?;
     let url =
@@ -693,7 +696,7 @@ pub async fn connect_pinned_hashes_path(
     path: &str,
 ) -> Result<web_transport_quinn::Session> {
     let hashes: Vec<Vec<u8>> = cert_hashes.iter().map(|h| h.to_vec()).collect();
-    let client = web_transport_quinn::ClientBuilder::new()
+    let client = external_client_builder()?
         .with_server_certificate_hashes(hashes)
         .map_err(|e| anyhow!("quinn client build: {e}"))?;
     let url =
@@ -711,7 +714,7 @@ pub async fn connect_webpki_path(
     port: u16,
     path: &str,
 ) -> Result<web_transport_quinn::Session> {
-    let client = web_transport_quinn::ClientBuilder::new()
+    let client = external_client_builder()?
         .with_system_roots()
         .map_err(|e| anyhow!("quinn client (system roots): {e}"))?;
     let url = url::Url::parse(&format!("https://{server_name}:{port}{path}"))
@@ -720,6 +723,16 @@ pub async fn connect_webpki_path(
         .connect(url)
         .await
         .map_err(|e| anyhow!("quinn connect (webpki): {e}"))
+}
+
+/// Every native WebTransport client crosses the external-interoperability
+/// boundary. Install and validate the exact effective process policy before
+/// constructing the third-party builder, whose fallback otherwise depends on
+/// whichever rustls provider won process initialization.
+fn external_client_builder() -> Result<web_transport_quinn::ClientBuilder> {
+    crate::transport::pq_provider::install_pq_crypto_provider()
+        .map_err(|e| anyhow!("external WebTransport crypto policy: {e}"))?;
+    Ok(web_transport_quinn::ClientBuilder::new())
 }
 
 /// Convenience: pin by the full server cert DER (hashes it for you). Used by
@@ -748,6 +761,7 @@ pub fn cert_sha256(cert_der: &[u8]) -> [u8; 32] {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
     use bytes::Bytes;
@@ -785,7 +799,8 @@ mod tests {
     /// with a 0xCD marker prefix, client asserts on the response.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn quinn_rpc_round_trip() -> Result<()> {
-        crate::transport::pq_provider::install_pq_crypto_provider();
+        crate::transport::pq_provider::install_pq_crypto_provider()
+            .expect("install PQ provider");
 
         let processor = crate::transport::rpc_session::from_fn(|req: Bytes| async move {
             let mut out = Vec::with_capacity(1 + req.len());
@@ -816,8 +831,10 @@ mod tests {
     /// wrong => Err, empty set => Err = fail-closed).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn verify_peer_cert_pinned_accepts_right_rejects_wrong() -> Result<()> {
-        crate::transport::pq_provider::install_pq_crypto_provider();
-        let processor = crate::transport::rpc_session::from_fn(|req: Bytes| async move { Ok(req) });
+        crate::transport::pq_provider::install_pq_crypto_provider()
+            .expect("install PQ provider");
+        let processor =
+            crate::transport::rpc_session::from_fn(|req: Bytes| async move { Ok(req) });
         let (server, addr, cert_der) = build_server()?;
         let rpc_server =
             QuinnRpcServer::new(server, processor, fresh_signing_key()).with_test_trusted_carrier();
@@ -850,7 +867,8 @@ mod tests {
     /// rejected while the first is still live. The first keeps working.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn quinn_connection_cap_rejects_excess() -> Result<()> {
-        crate::transport::pq_provider::install_pq_crypto_provider();
+        crate::transport::pq_provider::install_pq_crypto_provider()
+            .expect("install PQ provider");
 
         let processor = crate::transport::rpc_session::from_fn(|req: Bytes| async move { Ok(req) });
 
@@ -899,7 +917,8 @@ mod tests {
     /// with "now safe to shut down" — no wall-clock sleep races.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn quinn_shutdown_drains_in_flight() -> Result<()> {
-        crate::transport::pq_provider::install_pq_crypto_provider();
+        crate::transport::pq_provider::install_pq_crypto_provider()
+            .expect("install PQ provider");
 
         let entered = Arc::new(tokio::sync::Notify::new());
         let entered_c = Arc::clone(&entered);
@@ -943,5 +962,120 @@ mod tests {
 
         let _ = server_task.await;
         Ok(())
+    }
+
+    async fn exercise_all_native_client_constructors() {
+        // Malformed hostnames make the WebPKI variants stop after builder
+        // construction. Pinned variants are polled briefly against a closed
+        // loopback port; cancellation is enough because policy enforcement is
+        // synchronous at the start of each constructor.
+        let _ = connect_webpki("[", 443).await;
+        let _ = connect_webpki_path("[", 443, "/moq").await;
+        let closed: std::net::SocketAddr = "127.0.0.1:9".parse().expect("test address");
+        let _ = tokio::time::timeout(
+            Duration::from_millis(50),
+            connect_pinned_hashes(closed, &[]),
+        )
+        .await;
+        let _ = tokio::time::timeout(
+            Duration::from_millis(50),
+            connect_pinned_hashes_path(closed, &[], "/moq"),
+        )
+        .await;
+    }
+
+    // These fixtures require fresh processes because rustls's default provider
+    // is a OnceLock. Their parent tests invoke them by exact test name.
+    #[tokio::test]
+    #[ignore = "subprocess provider fixture"]
+    async fn native_clients_install_external_policy_child() {
+        assert!(
+            rustls::crypto::CryptoProvider::get_default().is_none(),
+            "fixture must begin without a process provider"
+        );
+        exercise_all_native_client_constructors().await;
+        crate::transport::pq_provider::install_pq_crypto_provider()
+            .expect("actual client constructors must install the exact external policy");
+    }
+
+    #[tokio::test]
+    #[ignore = "subprocess provider fixture"]
+    async fn native_clients_reject_ring_first_child() {
+        rustls::crypto::ring::default_provider()
+            .install_default()
+            .expect("fixture must install ring first");
+
+        let err = connect_webpki("127.0.0.1", 9)
+            .await
+            .expect_err("ring-first WebPKI constructor must fail before dialing");
+        assert!(err.to_string().contains("crypto policy mismatch"));
+
+        let err = connect_webpki_path("127.0.0.1", 9, "/moq")
+            .await
+            .expect_err("ring-first WebPKI path constructor must fail before dialing");
+        assert!(err.to_string().contains("crypto policy mismatch"));
+
+        let addr = "127.0.0.1:9".parse().expect("test address");
+        let err = connect_pinned_hashes(addr, &[])
+            .await
+            .expect_err("ring-first pinned constructor must fail before dialing");
+        assert!(err.to_string().contains("crypto policy mismatch"));
+
+        let err = connect_pinned_hashes_path(addr, &[], "/moq")
+            .await
+            .expect_err("ring-first pinned path constructor must fail before dialing");
+        assert!(err.to_string().contains("crypto policy mismatch"));
+    }
+
+    fn run_provider_fixture(name: &str) -> std::process::Output {
+        let mut child =
+            std::process::Command::new(std::env::current_exe().expect("test executable path"))
+                .args(["--ignored", "--exact", name])
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .expect("spawn native client provider fixture");
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            if child
+                .try_wait()
+                .expect("poll native client fixture")
+                .is_some()
+            {
+                return child
+                    .wait_with_output()
+                    .expect("collect native client fixture output");
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("native client fixture {name} timed out after 30 seconds");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn native_clients_install_external_policy_in_fresh_process() {
+        let output = run_provider_fixture(
+            "transport::quinn_transport::tests::native_clients_install_external_policy_child",
+        );
+        assert!(
+            output.status.success(),
+            "fresh-process native clients failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn native_clients_reject_ring_first_in_fresh_process() {
+        let output = run_provider_fixture(
+            "transport::quinn_transport::tests::native_clients_reject_ring_first_child",
+        );
+        assert!(
+            output.status.success(),
+            "ring-first native client policy fixture failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 }

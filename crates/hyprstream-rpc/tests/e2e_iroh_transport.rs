@@ -187,7 +187,7 @@ fn shared_client_endpoint_blocking() -> iroh::Endpoint {
                         .await
                         .expect("bind shared client endpoint");
                         let endpoint = substrate.endpoint().clone();
-                        let _ = install_iroh_client_endpoint(endpoint.clone());
+                        let _ = install_iroh_client_endpoint(substrate.owned_client_endpoint());
                         tx.send(endpoint).expect("publish shared client endpoint");
                         substrate
                     });

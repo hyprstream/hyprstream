@@ -1,85 +1,294 @@
-//! Post-quantum hybrid TLS crypto provider (#557 / S6 of epic #550).
+//! Post-quantum hybrid TLS crypto-provider policies (#557 / S6 of epic #550).
 //!
-//! Pins the TLS 1.3 key exchange to **X25519MLKEM768** (the hybrid PQ group of
-//! draft-ietf-tls-ecdhe-mlkem / RFC 9370 framing) with classical **X25519** as a
-//! fallback for interop with non-PQ peers. ML-KEM is only available via the
-//! **aws-lc-rs** rustls provider — the `ring` provider this replaces has no
-//! ML-KEM, which is why every `ring::default_provider().install_default()` site
-//! is swapped for [`install_pq_crypto_provider`].
-//!
-//! This is transport-layer **defense-in-depth**. The real, transport-independent
-//! confidentiality guarantee is the application-layer hybrid KEM (`HyKEM`,
-//! [`crate::crypto::hybrid_kem`], S0) which also covers the wasm/browser path
-//! where we cannot touch the WebTransport TLS handshake. Here we harden the QUIC
-//! channel on the paths we own (zmtp, iroh, quinn/WebTransport).
-//!
-//! Native-only: rustls/aws-lc-rs are not part of the wasm32 build.
+//! The owned internal mesh (zmtp and both iroh ALPNs) is hybrid-only: it has no
+//! classical key-exchange fallback. The process-wide provider used by the
+//! external WebTransport/HTTP perimeter deliberately retains X25519 fallback
+//! for browser and third-party interoperability. Application-layer HyKEM is the
+//! primary, transport-independent confidentiality guarantee on every path.
 
 use std::sync::Arc;
 
 use rustls::crypto::{aws_lc_rs, CryptoProvider};
 
-/// Build the pinned PQ-hybrid crypto provider: aws-lc-rs with
-/// `kx_groups = [X25519MLKEM768, X25519]` (hybrid first, classical fallback). All
-/// other parameters are aws-lc-rs defaults (cipher suites, signature schemes).
-///
-/// Pinning `kx_groups` explicitly (rather than relying on the `prefer-post-quantum`
-/// default order) makes the policy deterministic and auditable: a PQ-capable peer
-/// negotiates X25519MLKEM768; a classical-only peer falls back to X25519 (the
-/// channel is then classical, but the app-layer HyKEM stays hybrid).
-fn build_provider() -> CryptoProvider {
+const INTERNAL_MESH_GROUPS: &[rustls::NamedGroup] = &[rustls::NamedGroup::X25519MLKEM768];
+const EXTERNAL_INTEROP_GROUPS: &[rustls::NamedGroup] = &[
+    rustls::NamedGroup::X25519MLKEM768,
+    rustls::NamedGroup::X25519,
+];
+
+/// The effective process-wide rustls provider does not match hyprstream's
+/// declared external-interoperability policy.
+#[derive(Debug)]
+pub struct ProviderPolicyError {
+    expected: &'static [rustls::NamedGroup],
+    boundary: &'static str,
+    actual: Vec<rustls::NamedGroup>,
+}
+
+impl std::fmt::Display for ProviderPolicyError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "rustls {} crypto policy mismatch: expected {:?}, got {:?}",
+            self.boundary, self.expected, self.actual
+        )
+    }
+}
+
+impl std::error::Error for ProviderPolicyError {}
+
+fn provider_with_groups(
+    groups: impl IntoIterator<Item = &'static dyn rustls::crypto::SupportedKxGroup>,
+) -> CryptoProvider {
     CryptoProvider {
-        kx_groups: vec![
-            aws_lc_rs::kx_group::X25519MLKEM768,
-            aws_lc_rs::kx_group::X25519,
-        ],
+        kx_groups: groups.into_iter().collect(),
         ..aws_lc_rs::default_provider()
     }
 }
 
-pub fn pq_crypto_provider() -> Arc<CryptoProvider> {
-    Arc::new(build_provider())
+fn external_interop_provider() -> CryptoProvider {
+    provider_with_groups([
+        aws_lc_rs::kx_group::X25519MLKEM768,
+        aws_lc_rs::kx_group::X25519,
+    ])
 }
 
-/// Install [`pq_crypto_provider`] as the process-wide rustls default.
+/// Provider for an owned internal-mesh connection. Classical fallback is
+/// intentionally absent, so an X25519-only peer fails the TLS handshake.
+pub fn internal_mesh_crypto_provider() -> Arc<CryptoProvider> {
+    Arc::new(provider_with_groups([aws_lc_rs::kx_group::X25519MLKEM768]))
+}
+
+/// Provider for an explicitly declared external-interoperability boundary.
+/// PQ hybrid is preferred, with classical X25519 retained for non-PQ peers.
+pub fn pq_crypto_provider() -> Arc<CryptoProvider> {
+    Arc::new(external_interop_provider())
+}
+
+fn group_names(provider: &CryptoProvider) -> Vec<rustls::NamedGroup> {
+    provider
+        .kx_groups
+        .iter()
+        .map(|group| group.name())
+        .collect()
+}
+
+fn validate_provider(
+    provider: &CryptoProvider,
+    expected: &'static [rustls::NamedGroup],
+    boundary: &'static str,
+) -> Result<(), ProviderPolicyError> {
+    let actual = group_names(provider);
+    if actual != expected {
+        return Err(ProviderPolicyError {
+            expected,
+            boundary,
+            actual,
+        });
+    }
+    Ok(())
+}
+
+/// Validate that a caller-supplied config uses the exact owned-mesh policy.
+/// This is intentionally stricter than merely preferring the hybrid group:
+/// any classical fallback makes the config unsuitable for an owned boundary.
+pub fn validate_internal_mesh_crypto_provider(
+    provider: &CryptoProvider,
+) -> Result<(), ProviderPolicyError> {
+    validate_provider(provider, INTERNAL_MESH_GROUPS, "owned-mesh")
+}
+
+/// Install and validate the external-interoperability provider as rustls's
+/// process-wide default.
 ///
-/// Idempotent — the first install in the process wins and later calls are a
-/// no-op (`install_default` returns `Err` once set; we ignore it). Must run
-/// before any rustls `ServerConfig`/`ClientConfig::builder()`, quinn endpoint, or
-/// web-transport endpoint that resolves the process default
-/// (`CryptoProvider::get_default()`). This is the single replacement for the
-/// former `rustls::crypto::ring::default_provider().install_default()` calls; it
-/// also covers the WebTransport (`web-transport-quinn`) path, whose builder has
-/// no provider setter and resolves the process default.
-pub fn install_pq_crypto_provider() {
-    // `install_default` consumes an owned `CryptoProvider` (not an `Arc`); the
-    // first install in the process wins and returns `Ok`, later calls return
-    // `Err(already_set)` which we ignore.
-    let _ = build_provider().install_default();
+/// rustls is first-install-wins. Consequently, silently ignoring
+/// `install_default` failure can leave a process on ring/X25519. This function
+/// always inspects the effective provider after installation and returns an
+/// error if an
+/// earlier initializer installed anything other than the exact declared
+/// external policy. Call it before constructing any WebTransport/rustls
+/// builder; a policy violation fails startup instead of downgrading transport.
+pub fn install_pq_crypto_provider() -> Result<(), ProviderPolicyError> {
+    let _ = external_interop_provider().install_default();
+
+    let provider = CryptoProvider::get_default().ok_or(ProviderPolicyError {
+        expected: EXTERNAL_INTEROP_GROUPS,
+        boundary: "process-default external-interoperability",
+        actual: Vec::new(),
+    })?;
+    validate_provider(
+        provider,
+        EXTERNAL_INTEROP_GROUPS,
+        "process-default external-interoperability",
+    )
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
 
-    /// The PQ-hybrid group MUST be offered first, with classical X25519 as the
-    /// only fallback — a regression here would silently drop transport PQ.
     #[test]
-    fn pins_x25519mlkem768_first_then_x25519() {
-        let provider = build_provider();
-        let names: Vec<rustls::NamedGroup> = provider.kx_groups.iter().map(|g| g.name()).collect();
+    fn external_interop_is_pq_first_with_declared_x25519_fallback() {
+        assert_eq!(group_names(&pq_crypto_provider()), EXTERNAL_INTEROP_GROUPS);
+    }
+
+    #[test]
+    fn internal_mesh_is_hybrid_only() {
         assert_eq!(
-            names.first().copied(),
-            Some(rustls::NamedGroup::X25519MLKEM768),
-            "X25519MLKEM768 must be the first (preferred) kx group"
+            group_names(&internal_mesh_crypto_provider()),
+            INTERNAL_MESH_GROUPS
         );
-        let pq = names
-            .iter()
-            .position(|n| *n == rustls::NamedGroup::X25519MLKEM768);
-        let classical = names.iter().position(|n| *n == rustls::NamedGroup::X25519);
+    }
+
+    #[test]
+    fn internal_mesh_rejects_external_reordered_and_duplicate_groups() {
+        let mutations = [
+            provider_with_groups([
+                aws_lc_rs::kx_group::X25519MLKEM768,
+                aws_lc_rs::kx_group::X25519,
+            ]),
+            provider_with_groups([
+                aws_lc_rs::kx_group::X25519,
+                aws_lc_rs::kx_group::X25519MLKEM768,
+            ]),
+            provider_with_groups([
+                aws_lc_rs::kx_group::X25519MLKEM768,
+                aws_lc_rs::kx_group::X25519MLKEM768,
+            ]),
+        ];
+
+        for provider in mutations {
+            validate_internal_mesh_crypto_provider(&provider)
+                .expect_err("every non-exact owned-mesh group list must be rejected");
+        }
+    }
+
+    #[test]
+    fn external_interop_live_handshake_allows_classical_peer() {
+        let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])
+            .expect("generate test certificate");
+        let cert = certified.cert.der().clone();
+        let key = rustls::pki_types::PrivatePkcs8KeyDer::from(certified.key_pair.serialize_der());
+        let server_config = rustls::ServerConfig::builder_with_provider(pq_crypto_provider())
+            .with_safe_default_protocol_versions()
+            .expect("external provider supports TLS 1.3")
+            .with_no_client_auth()
+            .with_single_cert(vec![cert.clone()], key.into())
+            .expect("valid test certificate");
+
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(cert).expect("add test root");
+        let client_config = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .expect("ring supports TLS 1.3")
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+
+        let mut server = rustls::ServerConnection::new(Arc::new(server_config))
+            .expect("build server connection");
+        let mut client = rustls::ClientConnection::new(
+            Arc::new(client_config),
+            "localhost".try_into().expect("valid server name"),
+        )
+        .expect("build client connection");
+
+        for _ in 0..8 {
+            let mut client_records = Vec::new();
+            client
+                .write_tls(&mut client_records)
+                .expect("write client TLS records");
+            if !client_records.is_empty() {
+                server
+                    .read_tls(&mut std::io::Cursor::new(client_records))
+                    .expect("read client TLS records");
+                server
+                    .process_new_packets()
+                    .expect("process client TLS records");
+            }
+
+            let mut server_records = Vec::new();
+            server
+                .write_tls(&mut server_records)
+                .expect("write server TLS records");
+            if !server_records.is_empty() {
+                client
+                    .read_tls(&mut std::io::Cursor::new(server_records))
+                    .expect("read server TLS records");
+                client
+                    .process_new_packets()
+                    .expect("process server TLS records");
+            }
+            if !client.is_handshaking() && !server.is_handshaking() {
+                break;
+            }
+        }
+        assert!(!client.is_handshaking() && !server.is_handshaking());
+        assert_eq!(
+            server
+                .negotiated_key_exchange_group()
+                .expect("completed handshake has a group")
+                .name(),
+            rustls::NamedGroup::X25519,
+            "classical fallback is allowed only by the external interop policy"
+        );
+    }
+
+    // This mutation must run in a fresh process because rustls's default is a
+    // OnceLock. The ignored child test is invoked explicitly by its parent.
+    #[test]
+    #[ignore = "subprocess mutation fixture"]
+    fn non_pq_provider_installed_first_child() {
+        rustls::crypto::ring::default_provider()
+            .install_default()
+            .expect("fresh child process must not already have a provider");
+        let error = install_pq_crypto_provider()
+            .expect_err("non-PQ provider must fail closed with a policy error");
+        panic!("expected ring-first policy rejection: {error}");
+    }
+
+    #[test]
+    fn non_pq_provider_installed_first_fails_closed() {
+        let name = "transport::pq_provider::tests::non_pq_provider_installed_first_child";
+        let output = run_provider_fixture(name);
         assert!(
-            matches!((pq, classical), (Some(p), Some(c)) if p < c),
-            "PQ-hybrid must be offered ahead of classical X25519, got {names:?}"
+            !output.status.success(),
+            "a ring provider installed first must make startup fail"
         );
+        let child_output = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            child_output.contains("crypto policy mismatch"),
+            "ring-first fixture must fail for the expected policy error: {child_output}"
+        );
+    }
+
+    fn run_provider_fixture(name: &str) -> std::process::Output {
+        let mut child =
+            std::process::Command::new(std::env::current_exe().expect("test executable path"))
+                .args(["--ignored", "--exact", name])
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .expect("spawn provider-ordering mutation child");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            if child.try_wait().expect("poll provider fixture").is_some() {
+                return child
+                    .wait_with_output()
+                    .expect("collect provider fixture output");
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("provider fixture {name} timed out after 30 seconds");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
     }
 }

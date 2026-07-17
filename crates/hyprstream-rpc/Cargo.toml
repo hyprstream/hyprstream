@@ -167,6 +167,11 @@ hyprstream-rpc-build = { path = "../hyprstream-rpc-build" }
 [dev-dependencies]
 tokio-test = { workspace = true }
 tracing-subscriber = { workspace = true }
+noq = { version = "=1.0.0-rc.0", default-features = false, features = ["rustls-aws-lc-rs"] }
+# Quinn hides the negotiated NamedGroup behind this upstream diagnostic feature.
+# Enabling it only for tests lets live zmtp assertions use handshake_data without
+# packet parsing or changing production wire behavior.
+quinn = { workspace = true, features = ["__rustls-post-quantum-test"] }
 
 [lints]
 workspace = true

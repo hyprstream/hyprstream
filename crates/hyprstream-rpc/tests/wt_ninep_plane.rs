@@ -86,7 +86,7 @@ impl NinePWtHandler for EchoNineP {
 /// stream round-trips bytes both directions.
 #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
 async fn wt_ninep_path_routes_to_handler_and_streams() -> Result<()> {
-    hyprstream_rpc::transport::install_pq_crypto_provider();
+    hyprstream_rpc::transport::install_pq_crypto_provider().expect("install PQ provider");
 
     let (server, addr, cert) = build_server()?;
     let invoked = Arc::new(tokio::sync::Notify::new());
@@ -135,7 +135,7 @@ async fn wt_ninep_path_routes_to_handler_and_streams() -> Result<()> {
 /// off. We assert the server task keeps running afterwards.
 #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
 async fn wt_ninep_without_handler_is_declined() -> Result<()> {
-    hyprstream_rpc::transport::install_pq_crypto_provider();
+    hyprstream_rpc::transport::install_pq_crypto_provider().expect("install PQ provider");
 
     let (server, addr, cert) = build_server()?;
     let processor =
@@ -151,27 +151,23 @@ async fn wt_ninep_without_handler_is_declined() -> Result<()> {
     let server_task = tokio::spawn(rpc.run());
 
     let pin = cert_sha256(&cert);
-    // The path mux runs after the WebTransport handshake. Once the `/9p` arm
-    // finds no handler it returns immediately, so the client can observe the
-    // explicit transport denial either while CONNECT completes or on its first
-    // stream operation. Both are valid; a successful echo or a hang is not.
-    let explicitly_denied = match connect_pinned_hashes_path(addr, &[pin], NINEP_PATH).await {
+    // Require the pinned WebTransport handshake to succeed first. This keeps a
+    // pin, TLS, or generic connection failure from masquerading as evidence
+    // that the `/9p` arm declined the session.
+    let session = connect_pinned_hashes_path(addr, &[pin], NINEP_PATH).await?;
+    let explicitly_denied = match session.open_bi().await {
         Err(_) => true,
-        Ok(session) => match session.open_bi().await {
-            Err(_) => true,
-            Ok((mut send, mut recv)) => {
-                if send.write_all(b"ping").await.is_err() {
-                    true
-                } else {
-                    let mut got = [0u8; 4];
-                    matches!(
-                        tokio::time::timeout(Duration::from_secs(3), recv.read_exact(&mut got),)
-                            .await,
-                        Ok(Err(_))
-                    )
-                }
+        Ok((mut send, mut recv)) => {
+            if send.write_all(b"ping").await.is_err() {
+                true
+            } else {
+                let mut got = [0u8; 4];
+                matches!(
+                    tokio::time::timeout(Duration::from_secs(3), recv.read_exact(&mut got),).await,
+                    Ok(Err(_))
+                )
             }
-        },
+        }
     };
     assert!(
         explicitly_denied,

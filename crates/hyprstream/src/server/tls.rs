@@ -108,8 +108,8 @@ pub async fn resolve_rustls_config(
     // Ensure the PQ-hybrid (aws-lc-rs, X25519MLKEM768) crypto provider is
     // installed for rustls (#557 / S6). Services that don't use QUIC (which
     // installs it via quinn) need this before any RustlsConfig can be created.
-    // Idempotent — ignores if already set.
-    hyprstream_rpc::transport::install_pq_crypto_provider();
+    // Idempotent, but fail closed if another provider was installed first.
+    hyprstream_rpc::transport::install_pq_crypto_provider()?;
 
     // Per-service override: both cert and key must be set
     if let (Some(cert), Some(key)) = (service_cert, service_key) {
