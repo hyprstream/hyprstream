@@ -142,6 +142,29 @@ mod tests {
     }
 
     #[test]
+    fn internal_mesh_rejects_external_reordered_and_duplicate_groups() {
+        let mutations = [
+            provider_with_groups([
+                aws_lc_rs::kx_group::X25519MLKEM768,
+                aws_lc_rs::kx_group::X25519,
+            ]),
+            provider_with_groups([
+                aws_lc_rs::kx_group::X25519,
+                aws_lc_rs::kx_group::X25519MLKEM768,
+            ]),
+            provider_with_groups([
+                aws_lc_rs::kx_group::X25519MLKEM768,
+                aws_lc_rs::kx_group::X25519MLKEM768,
+            ]),
+        ];
+
+        for provider in mutations {
+            validate_internal_mesh_crypto_provider(&provider)
+                .expect_err("every non-exact owned-mesh group list must be rejected");
+        }
+    }
+
+    #[test]
     fn external_interop_live_handshake_allows_classical_peer() {
         let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])
             .expect("generate test certificate");
@@ -221,23 +244,51 @@ mod tests {
         rustls::crypto::ring::default_provider()
             .install_default()
             .expect("fresh child process must not already have a provider");
-        install_pq_crypto_provider().expect("non-PQ provider must fail closed");
+        let error = install_pq_crypto_provider()
+            .expect_err("non-PQ provider must fail closed with a policy error");
+        panic!("expected ring-first policy rejection: {error}");
     }
 
     #[test]
     fn non_pq_provider_installed_first_fails_closed() {
-        let exe = std::env::current_exe().expect("test executable path");
-        let output = std::process::Command::new(exe)
-            .args([
-                "--ignored",
-                "--exact",
-                "transport::pq_provider::tests::non_pq_provider_installed_first_child",
-            ])
-            .output()
-            .expect("run provider-ordering mutation child");
+        let name = "transport::pq_provider::tests::non_pq_provider_installed_first_child";
+        let output = run_provider_fixture(name);
         assert!(
             !output.status.success(),
             "a ring provider installed first must make startup fail"
         );
+        let child_output = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            child_output.contains("crypto policy mismatch"),
+            "ring-first fixture must fail for the expected policy error: {child_output}"
+        );
+    }
+
+    fn run_provider_fixture(name: &str) -> std::process::Output {
+        let mut child =
+            std::process::Command::new(std::env::current_exe().expect("test executable path"))
+                .args(["--ignored", "--exact", name])
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .expect("spawn provider-ordering mutation child");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            if child.try_wait().expect("poll provider fixture").is_some() {
+                return child
+                    .wait_with_output()
+                    .expect("collect provider fixture output");
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("provider fixture {name} timed out after 30 seconds");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
     }
 }

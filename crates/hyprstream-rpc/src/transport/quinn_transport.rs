@@ -1028,10 +1028,31 @@ mod tests {
     }
 
     fn run_provider_fixture(name: &str) -> std::process::Output {
-        std::process::Command::new(std::env::current_exe().expect("test executable path"))
-            .args(["--ignored", "--exact", name])
-            .output()
-            .expect("run native client provider fixture")
+        let mut child =
+            std::process::Command::new(std::env::current_exe().expect("test executable path"))
+                .args(["--ignored", "--exact", name])
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .expect("spawn native client provider fixture");
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            if child
+                .try_wait()
+                .expect("poll native client fixture")
+                .is_some()
+            {
+                return child
+                    .wait_with_output()
+                    .expect("collect native client fixture output");
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("native client fixture {name} timed out after 30 seconds");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     #[test]
