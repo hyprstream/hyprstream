@@ -58,6 +58,78 @@ jobs:
             .
 
       - name: Push tags
+        id: push
         run: |
+          # --digestfile captures the pushed manifest digest (content-addressed);
+          # both tags point at the same image, so either yields the same digest.
+          podman push --digestfile /tmp/img.digest \
+            "$IMAGE:${{ steps.tag.outputs.date }}-${{ steps.tag.outputs.sha }}"
           podman push "$IMAGE:latest"
-          podman push "$IMAGE:${{ steps.tag.outputs.date }}-${{ steps.tag.outputs.sha }}"
+          echo "digest=$(cat /tmp/img.digest)" >> "$GITHUB_OUTPUT"
+
+      # -------------------------------------------------------------------------
+      # Auto-bump the digest CI pins (env.BUILDER_IMAGE in rust.yml). CI pins by
+      # digest for reproducibility; this opens a PR to move that pin whenever a new
+      # image is published, so the reproducibility costs no manual re-pinning. The
+      # PR self-validates: the merge gate runs against the new image, so a broken
+      # image simply never merges and the old digest stays live.
+      #
+      # The PR MUST be authored by a non-GITHUB_TOKEN identity: a PR opened with the
+      # default GITHUB_TOKEN can create a pull_request run, but it lands in an
+      # approval-required state and does not drive the required checks unattended, so
+      # the merge gate never self-validates. Use a fine-grained PAT (secret
+      # BUILDER_IMAGE_BUMP_TOKEN), scoped to THIS repo with only Contents + Pull
+      # requests write. (Actions OIDC cannot be used here — it federates to EXTERNAL
+      # providers like AWS, not to GitHub's own API.) If the secret is unset the bump
+      # step is skipped with a warning (image still published; bump rust.yml
+      # manually until the PAT is provisioned).
+      # -------------------------------------------------------------------------
+      - name: Rewrite the rust.yml pin if the digest changed
+        id: pin
+        run: |
+          new="$IMAGE@${{ steps.push.outputs.digest }}"
+          cur=$(grep -oE 'ghcr\.io/hyprstream/rust-builder-arm64@sha256:[0-9a-f]+' .github/workflows/rust.yml | head -1)
+          echo "current=$cur"
+          echo "new=$new"
+          if [ "$cur" = "$new" ]; then echo "changed=false" >> "$GITHUB_OUTPUT"; exit 0; fi
+          sed -i "s|ghcr\.io/hyprstream/rust-builder-arm64@sha256:[0-9a-f]*|$new|g" .github/workflows/rust.yml
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Check for the bump PAT
+        id: bot
+        env:
+          BOT: ${{ secrets.BUILDER_IMAGE_BUMP_TOKEN }}
+        run: |
+          if [ -n "$BOT" ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::BUILDER_IMAGE_BUMP_TOKEN not set — skipping the auto digest-bump PR (image is published; bump rust.yml manually until the PAT is provisioned)."
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Open digest-bump PR
+        if: steps.pin.outputs.changed == 'true' && steps.bot.outputs.present == 'true'
+        # Pinned to a full commit SHA (not a mutable tag): this step runs with a
+        # write-capable PAT, so an upstream tag move must not silently change what
+        # executes here.
+        uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1 # v8.1.1
+        with:
+          token: ${{ secrets.BUILDER_IMAGE_BUMP_TOKEN }}
+          branch: automation/bump-builder-image
+          base: main
+          add-paths: .github/workflows/rust.yml
+          commit-message: "ci: bump BUILDER_IMAGE to newly published rust-builder digest"
+          title: "ci: bump BUILDER_IMAGE digest (automated)"
+          labels: automation, ci
+          delete-branch: true
+          body: |
+            Automated bump of the `BUILDER_IMAGE` pin in `.github/workflows/rust.yml`
+            to the digest just published by `build-image.yml`.
+
+            - digest: `${{ steps.push.outputs.digest }}`
+            - tag: `${{ steps.tag.outputs.date }}-${{ steps.tag.outputs.sha }}`
+
+            **Self-validating:** the merge gate runs the full arm64 build+test against
+            this new image. If a baked tool is missing or wrong, this PR will not merge
+            and the previous digest stays live. Enable auto-merge if unattended bumps
+            are desired.
