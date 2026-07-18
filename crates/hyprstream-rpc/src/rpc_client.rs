@@ -488,6 +488,7 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
                 self.effective_jwt(),
                 None,
                 Some(service_domain),
+                None,
             )
             .await?;
         let timeout = self.calculate_timeout();
