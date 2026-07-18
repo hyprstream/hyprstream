@@ -536,6 +536,18 @@ pub trait RequestService: 'static {
     /// Ed25519 signing key for signing responses.
     fn signing_key(&self) -> SigningKey;
 
+    /// Mutable reach source filled by the unified service spawner after the
+    /// service's QUIC and iroh listeners bind.
+    fn producer_reach_config_handle(&self) -> Option<crate::moq_stream::ProducerReachConfigHandle> {
+        None
+    }
+
+    /// Optional per-service MoQ origin source. The unified spawner installs a
+    /// scoped origin here when this service has a relay configured.
+    fn moq_origin_handle(&self) -> Option<crate::moq_stream::MoqStreamOriginHandle> {
+        None
+    }
+
     /// ML-DSA-65 signing key for the post-quantum half of the response COSE
     /// composite (#275). When `Some`, `process_request` signs the
     /// `ResponseEnvelope` under the Hybrid policy (EdDSA + ML-DSA-65); when
@@ -1045,8 +1057,8 @@ pub struct QuicLoopConfig {
     pub on_iroh_bound: Option<Box<dyn FnOnce(String, [u8; 32]) + Send>>,
     /// #358: the producer-chosen moq RELAY this node rendezvouses through, in
     /// wire-reach form ([`crate::stream_info::TransportConfig`]). When set, the
-    /// spawner registers it via [`crate::moq_stream::init_global_relay_reach`] (so
-    /// `producer_reach()` advertises a `Role::Relay` reach) and links this node's
+    /// spawner places it in the service's `ProducerReachConfig` (so published
+    /// streams advertise a `Role::Relay` reach) and links this node's
     /// streaming origin UP to the relay
     /// ([`crate::moq_stream::serve_origin_to_relay_background`]) — restoring the
     /// rendezvous property: neither publisher nor subscriber need be directly
