@@ -1,0 +1,2 @@
+# xml2rfc 3.34.0 emits a few significant trailing spaces in HTML/CSS output.
+rfc/*.html -whitespace

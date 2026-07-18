@@ -1,0 +1,134 @@
+{
+  "manifest_version": 1,
+  "scope": "Normative keywords in docs/standards/rfc/draft-hyprstream-privacypass-pqhybrid-00.xml only. Each item maps one exact MUST/MUST NOT statement to an implemented test or a specification-only obligation with owner and blocker.",
+  "obligations": [
+    {
+      "id": "PPQH-REQ-001",
+      "keyword": "MUST NOT",
+      "source": "separation",
+      "statement": "The outer admission result MUST NOT be accepted as inner authorization, MAC clearance, or authority to release plaintext or an epoch key.",
+      "kind": "specification-only",
+      "owner": "#726/#1062",
+      "blocker": "Inner anonymous capability and origin PEP do not exist until #1060-#1062 select and implement the reviewed construction.",
+      "planned_test": "outer-classical-token-cannot-release-inner-key"
+    },
+    {
+      "id": "PPQH-REQ-002",
+      "keyword": "MUST",
+      "source": "separation",
+      "statement": "The origin MUST verify an inner capability and its exact binding before dispatch or key release.",
+      "kind": "specification-only",
+      "owner": "#1061/#1062/#1063/#726",
+      "blocker": "No selected PQ anonymous issuance or binding construction.",
+      "planned_test": "missing-or-cross-bound-inner-capability-rejects-before-dispatch"
+    },
+    {
+      "id": "PPQH-REQ-003",
+      "keyword": "MUST NOT",
+      "source": "separation",
+      "statement": "A relay MUST NOT be given or recover inner plaintext, decoded anonymous-capability or MAC-clearance material, a response key, a traffic key, or a group epoch key.",
+      "kind": "specification-only",
+      "owner": "#554/#555/#726",
+      "blocker": "Production object encryption and network key-release lifecycle remain pending.",
+      "planned_test": "stock-relay-packet-and-cache-inspection"
+    },
+    {
+      "id": "PPQH-REQ-004",
+      "keyword": "MUST",
+      "source": "moqt",
+      "statement": "Clients MUST send ordinary MOQT Object payload bytes that a stock relay can forward and cache unchanged.",
+      "kind": "specification-only",
+      "owner": "#726",
+      "blocker": "Nested encrypted control Object profile and stock relay harness are not implemented.",
+      "planned_test": "byte-identical-opaque-object-forward-and-cache"
+    },
+    {
+      "id": "PPQH-REQ-005",
+      "keyword": "MUST NOT",
+      "source": "moqt",
+      "statement": "The profile MUST NOT require a MOQT extension or codepoint for the relay to forward the Object.",
+      "kind": "specification-only",
+      "owner": "#726/#1059",
+      "blocker": "Requires final carriage review after #1060/#1061 construction selection.",
+      "planned_test": "unmodified-stock-relay-interoperability"
+    },
+    {
+      "id": "PPQH-REQ-006",
+      "keyword": "MUST",
+      "source": "registry",
+      "statement": "Implementations MUST reject an unknown registry label, a non-canonical encoding, or an out-of-bounds transcript field before cryptographic processing.",
+      "kind": "specification-only",
+      "owner": "#1060/#1061",
+      "blocker": "The construction-specific transcript parser and canonical wire encoding do not exist.",
+      "planned_test": "unknown-label-noncanonical-and-out-of-bounds-reject-before-crypto"
+    },
+    {
+      "id": "PPQH-REQ-007",
+      "keyword": "MUST NOT",
+      "source": "registry",
+      "statement": "An implementation MUST NOT substitute a holder DID, ATProto handle, or relay route for an inner binding field.",
+      "kind": "specification-only",
+      "owner": "#1061/#1062",
+      "blocker": "Canonical binding encoding and anonymous principal have not been selected/implemented.",
+      "planned_test": "holder-identity-and-route-substitution-reject"
+    },
+    {
+      "id": "PPQH-REQ-008",
+      "keyword": "MUST NOT",
+      "source": "construction-status",
+      "statement": "A production implementation MUST NOT issue, accept, redeem, clear a MAC, generate an authorization result, dispatch, or release a key under this profile while the PQ construction and token type are unselected.",
+      "kind": "specification-only",
+      "owner": "#1060",
+      "blocker": "No production issuance, redemption, authorization-result, MAC-clearance, or key-release path exists and no reviewed PQ anonymous construction is selected.",
+      "planned_test": "production-issuer-origin-mac-authorization-and-key-release-refuse-unselected-construction"
+    },
+    {
+      "id": "PPQH-REQ-009",
+      "keyword": "MUST",
+      "source": "construction-status",
+      "statement": "The experimental boundary checker MUST require exactly two ordered roles, ClassicalAnonymous then PqAnonymous, combined with AND, and MUST reject a missing, duplicated, reordered, unknown, crossed, or stripped leg.",
+      "kind": "implemented-test",
+      "test": "python3 tools/check_pq_anonymous_issuance.py (missing-pq-leg through stripped-to-classical-only)"
+    },
+    {
+      "id": "PPQH-REQ-010",
+      "keyword": "MUST",
+      "source": "construction-status",
+      "statement": "The boundary MUST reject any holder DID, ATProto handle, account identifier, or other stable holder subject field.",
+      "kind": "implemented-test",
+      "test": "python3 tools/check_pq_anonymous_issuance.py (holder-identifying-field)"
+    },
+    {
+      "id": "PPQH-REQ-011",
+      "keyword": "MUST",
+      "source": "construction-status",
+      "statement": "Each leg MUST use its dedicated Privacy Pass issuer-key purpose, and the boundary MUST reject cross-role key reuse or substitution of a mesh, PDS, response, or controller key.",
+      "kind": "implemented-test",
+      "test": "python3 tools/check_pq_anonymous_issuance.py (key-purpose-substitution and cross-purpose-key-reuse)"
+    },
+    {
+      "id": "PPQH-REQ-012",
+      "keyword": "MUST",
+      "source": "construction-status",
+      "statement": "The boundary MUST require exact accepted-current issuer, audience, state epoch and digest, policy generation, expiry, redemption context, and resource-profile commitment values and MUST reject stale, rolled-back, expired, or crossed values.",
+      "kind": "implemented-test",
+      "test": "python3 tools/check_pq_anonymous_issuance.py (state epoch/digest, policy, expiry, issuer/origin, redemption-context, and resource-profile controls)"
+    },
+    {
+      "id": "PPQH-REQ-013",
+      "keyword": "MUST",
+      "source": "construction-status",
+      "statement": "The experimental boundary checker MUST terminate a structurally valid fixture with the ConstructionUnselected refusal.",
+      "kind": "implemented-test",
+      "test": "python3 tools/check_pq_anonymous_issuance.py (baseline structural success followed by production refusal)"
+    },
+    {
+      "id": "PPQH-REQ-014",
+      "keyword": "MUST",
+      "source": "construction-status",
+      "statement": "The experimental fixture boundary MUST derive its challenge digest from the canonical repository fixture challenge and MUST require the evaluator-authoritative context digest in every leg of every message.",
+      "kind": "implemented-test",
+      "test": "python3 tools/check_pq_anonymous_issuance.py (changed-challenge-without-digest and crossed-leg-context-digest)"
+    }
+  ]
+}

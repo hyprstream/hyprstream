@@ -386,6 +386,7 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
                 request_id,
                 payload,
                 None,
+                None,
                 self.effective_jwt(),
                 None,
                 service_domain,
@@ -451,10 +452,42 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
                 request_id,
                 payload,
                 Some(ephemeral_pubkey),
+                None,
                 self.effective_jwt(),
                 None,
                 service_domain,
                 method_discriminator,
+            )
+            .await?;
+        let timeout = self.calculate_timeout();
+        let response_bytes = self.transport.send(signed_bytes, timeout).await?;
+        let (_req_id, inner) = self.unwrap_response(&response_bytes, request_id, pending)?;
+        Ok(inner)
+    }
+
+    /// Send an identified stream setup using the pinned classical+ML-KEM
+    /// recipient.  The caller retains the matching keypair and combines the
+    /// returned `StreamInfo.kemCiphertexts` with its accepted-current
+    /// [`IdentifiedStreamBinding`] before opening the stream.
+    pub async fn call_streaming_identified_for_service(
+        &self,
+        service_domain: &str,
+        payload: Vec<u8>,
+        recipient: crate::crypto::hybrid_kem::RecipientPublic,
+    ) -> Result<Vec<u8>> {
+        if recipient.suite_id != crate::stream_epoch::IDENTIFIED_STREAM_SUITE {
+            anyhow::bail!("identified stream recipient does not use the pinned HyKEM suite");
+        }
+        let request_id = self.next_id();
+        let (signed_bytes, pending) = self
+            .sign_envelope(
+                request_id,
+                payload,
+                None,
+                Some(recipient),
+                self.effective_jwt(),
+                None,
+                Some(service_domain),
             )
             .await?;
         let timeout = self.calculate_timeout();
@@ -512,6 +545,7 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
                 request_id,
                 payload,
                 Some(ephemeral_pubkey),
+                None,
                 jwt,
                 options.delegated_bearer,
                 service_domain,
@@ -579,6 +613,7 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
             .sign_envelope(
                 request_id,
                 payload,
+                None,
                 None,
                 jwt,
                 options.delegated_bearer,
@@ -717,6 +752,7 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
         request_id: u64,
         payload: Vec<u8>,
         ephemeral_pubkey: Option<[u8; 32]>,
+        stream_kem_recipient: Option<crate::crypto::hybrid_kem::RecipientPublic>,
         jwt: Option<String>,
         delegated_bearer: Option<String>,
         service_domain: Option<&str>,
@@ -747,6 +783,9 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
         }
         if let Some(key) = ephemeral_pubkey {
             envelope = envelope.with_client_dh_public(key);
+        }
+        if let Some(recipient) = stream_kem_recipient {
+            envelope = envelope.with_client_kem_public(recipient)?;
         }
         if let Some(service_domain) = service_domain {
             envelope = envelope.with_service_domain(service_domain)?;
@@ -1285,10 +1324,7 @@ mod request_kem_tests {
                 .service_domain
                 .as_deref()
                 .ok_or_else(|| anyhow::anyhow!("test request omitted service domain"))?;
-            self.state
-                .recipients
-                .lock()
-                .push(recipient.encode());
+            self.state.recipients.lock().push(recipient.encode());
             let pq_sk = crate::node_identity::derive_mesh_mldsa_key(&self.server_sk);
             let response = crate::envelope::ResponseEnvelope::new_signed_encrypted(
                 request.request_id,
@@ -1538,6 +1574,7 @@ mod request_kem_tests {
                 None,
                 None,
                 None,
+                None,
                 Some("test-service"),
                 None,
             )
@@ -1575,6 +1612,7 @@ mod request_kem_tests {
             .sign_envelope(
                 1,
                 b"payload".to_vec(),
+                None,
                 None,
                 None,
                 None,

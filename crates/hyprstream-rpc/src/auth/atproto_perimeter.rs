@@ -9,13 +9,15 @@
 //!
 //! ## What this module is / is not
 //!
-//! - **Is:** the `external Did → VerifiedKeyMaterial → SecurityContext` mapping plus
-//!   a mutable, admission-gated [`EnrollmentStore`]. It consumes the (mirrored)
-//!   #579 resolver and the *existing* epic MAC types ([`Assurance`],
+//! - **Is:** the `external Did → VerifiedKeyMaterial → SecurityContext` mapping,
+//!   mutable admission-gated [`EnrollmentStore`], and exact, DPoP-gated ATProto
+//!   OAuth-scope/lexicon → bounded interior UCAN+MAC translation. It consumes the
+//!   (mirrored) #579 resolver and the *existing* epic MAC types ([`Assurance`],
 //!   [`SecurityLabel`], [`SecurityContext`], [`VerifiedKeyMaterial`]) — it does
 //!   **not** re-declare any of them.
-//! - **Is not:** per-op enforcement (#548 S2), the OAuth-scope/lexicon → UCAN+MAC
-//!   half (split follow-up), or a concrete `did:plc`/`did:web` resolver (#579).
+//! - **Is not:** per-op enforcement (#548 S2), concrete DPoP proof verification
+//!   (performed by the OAuth boundary before translation), or a concrete
+//!   `did:plc`/`did:web` resolver (#579).
 //!
 //! ## Fail-closed
 //!
@@ -219,12 +221,227 @@ impl EnrollmentStore {
     }
 }
 
+/// An exact ATProto OAuth scope plus lexicon permission presented at the
+/// federation edge.
+///
+/// Scope strings and lexicon NSIDs are deliberately opaque here: accepting a
+/// prefix or wildcard would turn an OAuth permission we do not understand into
+/// an interior authority grant. The perimeter therefore maps only exact,
+/// administrator-configured pairs.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct AtprotoPermission {
+    /// The OAuth scope asserted by the already-verified ATProto authorization.
+    pub scope: String,
+    /// The lexicon NSID / operation the caller wants to use under `scope`.
+    pub lexicon: String,
+}
+
+impl AtprotoPermission {
+    /// Build an exact external permission. Empty or whitespace-containing
+    /// components are not valid OAuth scope tokens / lexicon NSIDs and are
+    /// rejected before they reach the mapping table.
+    pub fn new(scope: impl Into<String>, lexicon: impl Into<String>) -> Result<Self> {
+        let scope = scope.into();
+        let lexicon = lexicon.into();
+        if scope.is_empty() || scope.bytes().any(|b| b.is_ascii_whitespace()) {
+            return Err(anyhow!(
+                "perimeter authorization: invalid ATProto OAuth scope"
+            ));
+        }
+        if lexicon.is_empty() || lexicon.bytes().any(|b| b.is_ascii_whitespace()) {
+            return Err(anyhow!(
+                "perimeter authorization: invalid ATProto lexicon permission"
+            ));
+        }
+        Ok(Self { scope, lexicon })
+    }
+}
+
+/// Evidence that the surrounding OAuth resource server verified a DPoP proof
+/// and bound this authorization to its JWK thumbprint (`jkt`).
+///
+/// This module intentionally does not parse or verify DPoP JWTs: that belongs
+/// to the OAuth boundary (`services::oauth::dpop`) where the request method,
+/// URI, nonce, and replay cache are available. Requiring this value makes the
+/// dependency explicit and ensures a translation result is sender-bound rather
+/// than usable as a bearer grant.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VerifiedDpopBinding(String);
+
+impl VerifiedDpopBinding {
+    /// Construct from a `jkt` returned by a successful DPoP verifier.
+    ///
+    /// Callers MUST NOT construct this from an unverified request header; the
+    /// verifier is responsible for signature, `htm`/`htu`, nonce, and replay
+    /// validation. We reject empty/whitespace values so a missing proof cannot
+    /// be represented as a binding.
+    pub fn from_verified_jkt(jkt: impl Into<String>) -> Result<Self> {
+        let jkt = jkt.into();
+        if jkt.is_empty() || jkt.bytes().any(|b| b.is_ascii_whitespace()) {
+            return Err(anyhow!(
+                "perimeter authorization: missing verified DPoP binding"
+            ));
+        }
+        Ok(Self(jkt))
+    }
+
+    /// The verified sender-binding JWK thumbprint for token minting/audit.
+    pub fn jkt(&self) -> &str {
+        &self.0
+    }
+}
+
+/// A policy-approved, one-way translation from an exact ATProto permission to
+/// an interior UCAN capability and the greatest MAC object label it may target.
+///
+/// This is configuration supplied by the local authority, never by an external
+/// DID. `maximum_label` does not grant clearance: the enrolled peer must already
+/// dominate it, so an OAuth permission cannot raise MLS, assurance, or
+/// compartment clearance.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AtprotoPermissionMapping {
+    /// The exact interior capability the trusted gateway may place in a new
+    /// local UCAN. External ATProto records never carry that UCAN themselves.
+    pub capability: crate::auth::ucan::capability::Capability,
+    /// The bounded MAC label enforced alongside this translated capability.
+    pub maximum_label: SecurityLabel,
+}
+
+impl AtprotoPermissionMapping {
+    /// Create a mapping after rejecting wildcard interior authority. A broad
+    /// external grant must be expanded into individually reviewed exact entries
+    /// instead of being smuggled through `*` or a wildcard resource.
+    pub fn new(
+        capability: crate::auth::ucan::capability::Capability,
+        maximum_label: SecurityLabel,
+    ) -> Result<Self> {
+        let resource = capability.resource.as_str();
+        let ability = capability.ability.as_str();
+        if !resource.starts_with("mac://")
+            || resource.len() == "mac://".len()
+            || resource.contains('*')
+            || resource.bytes().any(|b| b.is_ascii_whitespace())
+            || ability.is_empty()
+            || ability.contains('*')
+            || ability.bytes().any(|b| b.is_ascii_whitespace())
+        {
+            return Err(anyhow!(
+                "perimeter authorization: mapping must contain an exact non-wildcard interior capability"
+            ));
+        }
+        Ok(Self {
+            capability,
+            maximum_label,
+        })
+    }
+}
+
+/// A configured, fail-closed ATProto OAuth/lexicon → UCAN+MAC translator.
+///
+/// It owns no DID resolver and has no network capability. Enrollment resolves
+/// and pins the DID before this translator is ever called; authorization reads
+/// only [`EnrolledPeer::context`]. This keeps did:web/did:plc/PLC resolution out
+/// of the per-operation authorization path by construction.
+#[derive(Clone, Default)]
+pub struct AtprotoPermissionTranslator {
+    mappings: HashMap<AtprotoPermission, AtprotoPermissionMapping>,
+}
+
+impl AtprotoPermissionTranslator {
+    /// Build from a closed, locally administered mapping table. Duplicate
+    /// external permissions are rejected rather than allowing load order to
+    /// select an authority unexpectedly.
+    pub fn new(
+        mappings: impl IntoIterator<Item = (AtprotoPermission, AtprotoPermissionMapping)>,
+    ) -> Result<Self> {
+        let mut table = HashMap::new();
+        for (permission, mapping) in mappings {
+            if table.insert(permission.clone(), mapping).is_some() {
+                return Err(anyhow!(
+                    "perimeter authorization: duplicate mapping for scope {:?}, lexicon {:?}",
+                    permission.scope,
+                    permission.lexicon
+                ));
+            }
+        }
+        Ok(Self { mappings: table })
+    }
+
+    /// Translate verified external permissions into narrowly bounded interior
+    /// capability requests.
+    ///
+    /// The OAuth resource server must verify DPoP before constructing
+    /// `dpop_binding`; the gateway then requires every permission to have an
+    /// exact local mapping and every target label to be dominated by the cached
+    /// enrollment context. Any missing mapping, over-clearance request, absent
+    /// peer, or malformed binding returns `Err` — there is no fallback,
+    /// wildcard, or default capability.
+    pub fn translate(
+        &self,
+        peer: &EnrolledPeer,
+        dpop_binding: VerifiedDpopBinding,
+        permissions: &[AtprotoPermission],
+    ) -> Result<TranslatedAtprotoAuthorization> {
+        if permissions.is_empty() {
+            return Err(anyhow!(
+                "perimeter authorization: no ATProto permissions presented (fail-closed)"
+            ));
+        }
+
+        let mut capabilities = Vec::with_capacity(permissions.len());
+        let mut maximum_labels = Vec::with_capacity(permissions.len());
+        for permission in permissions {
+            let mapping = self.mappings.get(permission).ok_or_else(|| {
+                anyhow!(
+                    "perimeter authorization: unmappable ATProto scope {:?} / lexicon {:?} (fail-closed)",
+                    permission.scope,
+                    permission.lexicon
+                )
+            })?;
+
+            // A translated OAuth permission is never a clearance grant. The
+            // pinned crypto-derived context is the independent MAC floor.
+            if !peer.context.can_access(&mapping.maximum_label) {
+                return Err(anyhow!(
+                    "perimeter authorization: peer {} cannot access mapped label {} (fail-closed)",
+                    peer.did,
+                    mapping.maximum_label
+                ));
+            }
+            capabilities.push(mapping.capability.clone());
+            maximum_labels.push(mapping.maximum_label);
+        }
+
+        Ok(TranslatedAtprotoAuthorization {
+            did: peer.did.clone(),
+            dpop_binding,
+            capabilities,
+            maximum_labels,
+        })
+    }
+}
+
+/// The bounded result of edge translation, ready for the trusted interior UCAN
+/// issuer / MAC compiler. It is deliberately not an external UCAN transport
+/// format: UCAN authoring and delegation remain inside HyprStream.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TranslatedAtprotoAuthorization {
+    /// The enrolled DID whose cached context bounded the translation.
+    pub did: Did,
+    /// Sender binding that must be retained by the local token/UCAN issuer.
+    pub dpop_binding: VerifiedDpopBinding,
+    /// Exact local capabilities to be authored into an interior UCAN.
+    pub capabilities: Vec<crate::auth::ucan::capability::Capability>,
+    /// Corresponding maximum MAC labels, checked against the cached context.
+    pub maximum_labels: Vec<SecurityLabel>,
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-    use crate::identity::{IdentityKeys, MlDsaVk};
     use crate::crypto::pq::ml_dsa_generate_keypair;
+    use crate::identity::{IdentityKeys, MlDsaVk};
 
     const DID_WEB: &str = "did:web:peer.example";
 
@@ -398,5 +615,146 @@ mod tests {
 
         // Native anchor still empty — no cross-contamination.
         assert!(native.is_empty());
+    }
+
+    fn classical_peer() -> EnrolledPeer {
+        let keys = IdentityKeys {
+            ed25519: Some([11u8; 32]),
+            ml_dsa_65: None,
+            assurance: Assurance::Classical,
+        };
+        AtprotoPerimeterGateway::new(FixtureResolver(keys))
+            .enroll(&admitted(Some(DID_WEB), [11u8; 32]))
+            .unwrap()
+    }
+
+    fn mapping(
+        ability: &str,
+        resource: &str,
+        maximum_label: SecurityLabel,
+    ) -> AtprotoPermissionMapping {
+        use crate::auth::ucan::capability::{Ability, Capability, Resource};
+        AtprotoPermissionMapping::new(
+            Capability::new(Resource::new(resource), Ability::new(ability)),
+            maximum_label,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn exact_permission_translates_to_bounded_interior_capability() {
+        let permission =
+            AtprotoPermission::new("atproto.transition:read", "ai.hyprstream.model.get").unwrap();
+        let max_label =
+            SecurityLabel::new(Level::Internal, Assurance::Classical, CompartmentSet::EMPTY);
+        let translator = AtprotoPermissionTranslator::new([(
+            permission.clone(),
+            mapping("read", "mac://model/qwen3", max_label),
+        )])
+        .unwrap();
+
+        let result = translator
+            .translate(
+                &classical_peer(),
+                VerifiedDpopBinding::from_verified_jkt("verified-jkt").unwrap(),
+                &[permission],
+            )
+            .unwrap();
+
+        assert_eq!(result.did.as_str(), DID_WEB);
+        assert_eq!(result.dpop_binding.jkt(), "verified-jkt");
+        assert_eq!(result.capabilities.len(), 1);
+        assert_eq!(result.capabilities[0].ability.as_str(), "read");
+        assert_eq!(
+            result.capabilities[0].resource.as_str(),
+            "mac://model/qwen3"
+        );
+        assert_eq!(result.maximum_labels, vec![max_label]);
+    }
+
+    #[test]
+    fn unmappable_scope_or_lexicon_fails_closed() {
+        let known =
+            AtprotoPermission::new("atproto.transition:read", "ai.hyprstream.model.get").unwrap();
+        let translator = AtprotoPermissionTranslator::new([(
+            known,
+            mapping(
+                "read",
+                "mac://model/qwen3",
+                SecurityLabel::new(Level::Public, Assurance::Classical, CompartmentSet::EMPTY),
+            ),
+        )])
+        .unwrap();
+        let unknown =
+            AtprotoPermission::new("atproto.transition:write", "ai.hyprstream.model.get").unwrap();
+
+        assert!(translator
+            .translate(
+                &classical_peer(),
+                VerifiedDpopBinding::from_verified_jkt("verified-jkt").unwrap(),
+                &[unknown],
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn mapped_permission_cannot_raise_cached_assurance_or_clearance() {
+        let permission =
+            AtprotoPermission::new("atproto.transition:read", "ai.hyprstream.model.get").unwrap();
+        let translator = AtprotoPermissionTranslator::new([(
+            permission.clone(),
+            mapping(
+                "read",
+                "mac://model/qwen3",
+                SecurityLabel::new(Level::Public, Assurance::PqHybrid, CompartmentSet::EMPTY),
+            ),
+        )])
+        .unwrap();
+
+        assert!(translator
+            .translate(
+                &classical_peer(),
+                VerifiedDpopBinding::from_verified_jkt("verified-jkt").unwrap(),
+                &[permission],
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn translator_rejects_wildcard_capabilities_and_duplicate_mappings() {
+        use crate::auth::ucan::capability::{Ability, Capability, Resource};
+        let label = SecurityLabel::new(Level::Public, Assurance::Classical, CompartmentSet::EMPTY);
+        assert!(AtprotoPermissionMapping::new(
+            Capability::new(Resource::new("mac://model/*"), Ability::new("read")),
+            label,
+        )
+        .is_err());
+        assert!(AtprotoPermissionMapping::new(
+            Capability::new(Resource::new("mac://model/qwen3"), Ability::new("read/*")),
+            label,
+        )
+        .is_err());
+
+        let permission =
+            AtprotoPermission::new("atproto.transition:read", "ai.hyprstream.model.get").unwrap();
+        let approved = mapping("read", "mac://model/qwen3", label);
+        assert!(AtprotoPermissionTranslator::new([
+            (permission.clone(), approved.clone()),
+            (permission, approved),
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn empty_permissions_and_missing_dpop_binding_fail_closed() {
+        let translator = AtprotoPermissionTranslator::default();
+        assert!(VerifiedDpopBinding::from_verified_jkt("").is_err());
+        assert!(translator
+            .translate(
+                &classical_peer(),
+                VerifiedDpopBinding::from_verified_jkt("verified-jkt").unwrap(),
+                &[],
+            )
+            .is_err());
     }
 }

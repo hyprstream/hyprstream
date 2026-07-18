@@ -437,6 +437,44 @@ fn derive_stream_keys(...) -> Result<StreamKeys> {
 }
 ```
 
+### Identified hybrid stream epochs (#554)
+
+`stream_epoch.rs` defines the production cryptographic profile that replaces the
+legacy Ristretto bootstrap as individual stream producers migrate. The client
+places a fresh, suite-complete `clientKemPublic` in the signed (and, on network
+carriers, sealed) request. The server accepts only the policy-pinned
+`HyKEM-X25519-MLKEM768` suite and returns its suite-identified component
+ciphertexts in the signed `StreamInfo.kemCiphertexts` field.
+
+The HyKEM combiner secret is mixed with one canonical identified-session binding:
+
+- explicit `owned-hybrid-transport` or `standard-public-relay` profile and the
+  direct/relay route role;
+- producer and consumer endpoint DIDs;
+- both accepted-state CID512 digests and epochs;
+- service, capability, track, and both KEM key IDs; and
+- the pinned suite and epoch block limit.
+
+Each direction and epoch expands separate MAC, AEAD, control, rekey-authentication,
+nonce-domain, and epoch-namespace material. AES-GCM nonces are deterministic
+`nonce_domain || sequenceNumber`; the domain changes across direction, track, and
+epoch. An authenticated `StreamEpochCommit` advances the one-way ratchet
+atomically: invalid, skipped, replayed, or cross-stream commits leave the prior
+epoch committed. The publisher resets the per-epoch sequence and MAC chain but
+never resets its MOQT Group counter, so a cached track/group/object identity is
+never republished with different ciphertext.
+
+The profile is carrier-neutral. Data, completion metadata, and error messages are
+all sealed before framing, so a standard MOQT relay forwards ordinary opaque
+Object bytes and receives neither the transcript nor traffic keys. Network key
+release is still a separate #726 authorization PEP; the generic
+`StreamKeyReleaseGate`/`StreamKeyReleasePrincipal` seam does not implement or
+claim restricted-anonymous #1060-#1062 authorization.
+
+The legacy `from_dh` constructors remain during the dependency-safe migration and
+are not evidence that #554 or the later global #556 downgrade-removal ticket is
+closed.
+
 ## Chained HMAC
 
 **Location:** `crates/hyprstream-rpc/src/crypto/hmac.rs`

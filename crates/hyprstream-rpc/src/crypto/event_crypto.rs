@@ -350,6 +350,32 @@ pub fn encrypt_event(
     Ok((tag, ciphertext, nonce, commitment))
 }
 
+/// Encrypt with an explicit nonce supplied by a stateful protocol.
+///
+/// This is crate-private because nonce uniqueness becomes the caller's
+/// responsibility.  The identified stream epoch profile derives the nonce from
+/// its direction/track/epoch domain plus the authenticated sequence number.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn encrypt_event_with_nonce(
+    group_key: &[u8; 32],
+    nonce: [u8; 12],
+    aad: &str,
+    plaintext: &[u8],
+) -> Result<(Vec<u8>, Vec<u8>, [u8; 12], [u8; 16]), String> {
+    let commitment = key_commitment(group_key, &nonce);
+    let aead_output = aes_gcm_encrypt(group_key, &nonce, plaintext, aad.as_bytes())?;
+    if aead_output.len() < 16 {
+        return Err("AEAD output too short".to_owned());
+    }
+    let split = aead_output.len() - 16;
+    Ok((
+        aead_output[split..].to_vec(),
+        aead_output[..split].to_vec(),
+        nonce,
+        commitment,
+    ))
+}
+
 /// Decrypt an event with full AAD binding (tag + ciphertext + prefix).
 ///
 /// This is the preferred decryption path for EventEnvelopeV2, which
@@ -717,9 +743,14 @@ mod tests {
         let leaf = "deadbeef".repeat(8); // 64 hex chars, like topic_leaf output
         let epoch = 7u64;
 
-        let (tag, ct, nonce, _commitment) =
-            encrypt_event_keyed(&group_key, &leaf, epoch, plaintext, EventPrivacy::ZeroKnowledge)
-                .unwrap();
+        let (tag, ct, nonce, _commitment) = encrypt_event_keyed(
+            &group_key,
+            &leaf,
+            epoch,
+            plaintext,
+            EventPrivacy::ZeroKnowledge,
+        )
+        .unwrap();
         let recovered = decrypt_event_keyed(&group_key, &nonce, &tag, &ct, &leaf, epoch).unwrap();
         assert_eq!(recovered, plaintext);
 

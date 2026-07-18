@@ -48,13 +48,14 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, ensure, Context, Result};
 use bytes::Bytes;
 use moq_net::{BroadcastProducer, Group, OriginConsumer, OriginProducer, Track, TrackProducer};
 use parking_lot::Mutex;
 use tokio_util::sync::CancellationToken;
 
 use crate::crypto::StreamHmacState;
+use crate::stream_epoch::StreamEpochRatchet;
 use crate::streaming::{StreamContext, StreamPayloadData, StreamVerifier};
 
 // ============================================================================
@@ -327,7 +328,10 @@ impl ProducerReachConfig {
             RelayChoice::NoRelay => None,
         };
         if let Some(relay) = relay {
-            reach.push(Destination { role: Role::Relay, transport: relay });
+            reach.push(Destination {
+                role: Role::Relay,
+                transport: relay,
+            });
         }
 
         reach
@@ -400,25 +404,33 @@ pub fn relay_reach_from_decoded(
     use crate::stream_info::{IrohReach, QuicReach, TransportConfig as ReachTransport};
     use crate::transport::EndpointType;
     match &config.endpoint {
-        EndpointType::Quic { addr, server_name, auth } => Some(ReachTransport::Quic(QuicReach {
+        EndpointType::Quic {
+            addr,
+            server_name,
+            auth,
+        } => Some(ReachTransport::Quic(QuicReach {
             addr: addr.to_string(),
             server_name: server_name.clone(),
-            cert_hashes: auth.accept_cert_hashes().iter().map(|h| h.to_vec()).collect(),
+            cert_hashes: auth
+                .accept_cert_hashes()
+                .iter()
+                .map(|h| h.to_vec())
+                .collect(),
         })),
-        EndpointType::Iroh { node_id, relay_url, .. } => {
+        EndpointType::Iroh {
+            node_id, relay_url, ..
+        } => {
             // A relay carries the moq stream → moql ALPN; relay_url passes through.
             Some(ReachTransport::Iroh(IrohReach {
                 node_id: *node_id,
-                alpn: String::from_utf8_lossy(
-                    crate::transport::iroh_substrate::ALPN_MOQ_LITE,
-                )
-                .into_owned(),
+                alpn: String::from_utf8_lossy(crate::transport::iroh_substrate::ALPN_MOQ_LITE)
+                    .into_owned(),
                 relay_url: relay_url.clone().unwrap_or_default(),
             }))
         }
-        EndpointType::Ipc { .. }
-        | EndpointType::SystemdFd { .. }
-        | EndpointType::Inproc { .. } => None,
+        EndpointType::Ipc { .. } | EndpointType::SystemdFd { .. } | EndpointType::Inproc { .. } => {
+            None
+        }
     }
 }
 
@@ -500,7 +512,11 @@ pub fn serve_moq_uds_background(origin: MoqStreamOrigin, path: PathBuf) {
                     tracing::debug!("moq UDS: unexpected plane 0x{plane:02x} — dropping");
                     return;
                 }
-                if let Err(e) = MoqServer::new().with_publish(consumer).accept(session).await {
+                if let Err(e) = MoqServer::new()
+                    .with_publish(consumer)
+                    .accept(session)
+                    .await
+                {
                     tracing::debug!("moq UDS session ended: {e}");
                 }
             });
@@ -673,32 +689,45 @@ impl MoqStreamOrigin {
         ctx: &StreamContext,
         provenance: Option<crate::stream_provenance::ProvenanceSigner>,
     ) -> Result<MoqStreamPublisher> {
-        let path = self.broadcast_path(ctx.topic());
-        let mut broadcast = self
-            .inner
-            .producer
-            .create_broadcast(path.as_str())
-            .ok_or_else(|| anyhow!("create_broadcast denied for {path}"))?;
-        let track = broadcast.create_track(Track::new(STREAM_TRACK))?;
+        ensure!(
+            !ctx.has_epoch_ratchet() || ctx.enc_key().is_some(),
+            "identified stream rejected a context with transport AEAD disabled"
+        );
+        // Hold the identified producer claim through all fallible MoQ setup.
+        // Every `StreamContext` clone shares this lock/slot. The ratchet is
+        // consumed only once setup succeeds, so a setup error remains retryable
+        // while successful construction cannot restart epoch/group/sequence
+        // zero or reuse the same AEAD key and nonce domain.
+        ctx.with_publisher_epoch_ratchet(|epoch_ratchet| {
+            let path = self.broadcast_path(ctx.topic());
+            let mut broadcast = self
+                .inner
+                .producer
+                .create_broadcast(path.as_str())
+                .ok_or_else(|| anyhow!("create_broadcast denied for {path}"))?;
+            let track = broadcast.create_track(Track::new(STREAM_TRACK))?;
 
-        // Retain the broadcast producer so it stays announced for the
-        // publisher's lifetime (dropping it would unannounce the broadcast).
-        // Replace-semantics: inserting the same path twice drops the old
-        // BroadcastProducer rather than accumulating indefinitely (#164).
-        self.inner.broadcasts.lock().insert(path, broadcast);
+            // Retain the broadcast producer so it stays announced for the
+            // publisher's lifetime (dropping it would unannounce the broadcast).
+            // Replace-semantics: inserting the same path twice drops the old
+            // BroadcastProducer rather than accumulating indefinitely (#164).
+            self.inner.broadcasts.lock().insert(path, broadcast);
 
-        Ok(MoqStreamPublisher {
-            hmac_state: StreamHmacState::new(*ctx.mac_key(), ctx.topic().to_owned()),
-            // #321: AEAD enc_key — `Some` only on the DH (mesh) path. `None` on the
-            // keyless `StreamContext::new` path (NotificationService topics, whose
-            // payloads are already E2E-encrypted), where transport AEAD is skipped.
-            enc_key: ctx.enc_key().copied(),
-            provenance,
-            track,
-            next_group: 0,
-            cancel_token: ctx.cancel_token().clone(),
-            terminated: false,
-            topic: ctx.topic().to_owned(),
+            Ok(MoqStreamPublisher {
+                hmac_state: StreamHmacState::new(*ctx.mac_key(), ctx.topic().to_owned()),
+                // #321: AEAD enc_key — `Some` only on the DH (mesh) path. `None` on the
+                // keyless `StreamContext::new` path (NotificationService topics, whose
+                // payloads are already E2E-encrypted), where transport AEAD is skipped.
+                enc_key: ctx.enc_key().copied(),
+                provenance,
+                track,
+                next_group: 0,
+                next_sequence: 0,
+                epoch_ratchet: epoch_ratchet.take(),
+                cancel_token: ctx.cancel_token().clone(),
+                terminated: false,
+                topic: ctx.topic().to_owned(),
+            })
         })
     }
 }
@@ -717,7 +746,7 @@ impl MoqStreamOrigin {
 /// `BatchingConfig` in M2b for granularity parity.
 pub struct MoqStreamPublisher {
     hmac_state: StreamHmacState,
-    /// Transport-level AEAD key (#321). `Some` ⇒ each Data/Complete payload is
+    /// Transport-level AEAD key (#321). `Some` ⇒ each Data/Complete/Error payload is
     /// sealed with AES-256-GCM into a `Tagged` payload before the HMAC chain runs;
     /// `None` ⇒ cleartext (keyless notification path).
     enc_key: Option<[u8; 32]>,
@@ -725,13 +754,43 @@ pub struct MoqStreamPublisher {
     /// hybrid COSE signature over its canonical signed region.
     provenance: Option<crate::stream_provenance::ProvenanceSigner>,
     track: TrackProducer,
+    /// Immutable MOQT Object identity: this counter never resets across rekeys.
     next_group: u64,
+    /// Authenticated sequence number within the committed key epoch.
+    next_sequence: u64,
+    /// Identified transcript-bound epoch state; absent on legacy/keyless paths.
+    epoch_ratchet: Option<crate::stream_epoch::StreamEpochRatchet>,
     cancel_token: CancellationToken,
     terminated: bool,
     topic: String,
 }
 
 impl MoqStreamPublisher {
+    /// Publish an opaque, authenticated control Object under the current epoch,
+    /// then atomically advance the producer to the next epoch. The consumer
+    /// performs the same verify-before-advance transition from the wire Object.
+    /// `next_group` deliberately never resets, preserving immutable MOQT IDs.
+    pub fn publish_next_epoch(&mut self) -> Result<u64> {
+        let ratchet = self
+            .epoch_ratchet
+            .as_ref()
+            .ok_or_else(|| anyhow!("stream is not using the identified epoch profile"))?;
+        let commit = ratchet.prepare_next()?;
+        let mut pending = ratchet.clone();
+        let keys = pending.commit_prepared(&commit)?;
+
+        // The current keys authenticate and encrypt this control Object. Do not
+        // expose or install the pending epoch until stock MoQ accepted the Object.
+        self.write_block(&[StreamPayloadData::EpochCommit(commit)])?;
+
+        self.hmac_state =
+            StreamHmacState::new(*keys.producer_to_consumer.mac_key, self.topic.clone());
+        self.enc_key = Some(*keys.producer_to_consumer.enc_key);
+        self.next_sequence = 0;
+        self.epoch_ratchet = Some(pending);
+        Ok(keys.epoch)
+    }
+
     /// Publish one binary payload as a StreamBlock group.
     pub async fn publish_data(&mut self, data: &[u8]) -> Result<()> {
         if self.cancel_token.is_cancelled() {
@@ -742,8 +801,9 @@ impl MoqStreamPublisher {
 
     /// Publish an error payload (terminal).
     pub async fn publish_error(&mut self, message: &str) -> Result<()> {
+        self.write_block(&[StreamPayloadData::Error(message.to_owned())])?;
         self.terminated = true;
-        self.write_block(&[StreamPayloadData::Error(message.to_owned())])
+        Ok(())
     }
 
     /// Complete the stream with metadata (terminal).
@@ -753,8 +813,9 @@ impl MoqStreamPublisher {
 
     /// Complete the stream without consuming `self`.
     pub async fn complete_ref(&mut self, metadata: &[u8]) -> Result<()> {
+        self.write_block(&[StreamPayloadData::Complete(metadata.to_vec())])?;
         self.terminated = true;
-        self.write_block(&[StreamPayloadData::Complete(metadata.to_vec())])
+        Ok(())
     }
 
     /// The opaque topic this publisher serves.
@@ -775,25 +836,85 @@ impl MoqStreamPublisher {
     /// Serialize payloads into a StreamBlock, chain the MAC, and append as a
     /// moq Group (one Frame = `capnp || mac`).
     fn write_block(&mut self, payloads: &[StreamPayloadData]) -> Result<()> {
-        // The StreamBlock sequenceNumber (#219) IS the moq Group id — unified so the
-        // in-block sequenceNumber the consumer authenticates matches the transport Group.
-        // epoch is 0 until the #223 key-epoch lifecycle lands.
-        let sequence_number = self.next_group;
-        self.next_group += 1;
-        let epoch = 0u64;
+        // `sequenceNumber` is per key epoch. `group_id` below is the immutable,
+        // lifetime-wide MOQT identity and deliberately never resets at rekey.
+        let sequence_number = self.next_sequence;
+        let epoch = self
+            .epoch_ratchet
+            .as_ref()
+            .map_or(0, StreamEpochRatchet::epoch);
+        let is_epoch_control = matches!(payloads, [StreamPayloadData::EpochCommit(_)]);
+        if is_epoch_control && self.enc_key.is_none() {
+            anyhow::bail!("identified stream epoch control cannot be serialized without AEAD");
+        }
+        if let Some(state) = &self.epoch_ratchet {
+            ensure!(
+                !payloads
+                    .iter()
+                    .any(|payload| matches!(payload, StreamPayloadData::Tagged { .. })),
+                "identified stream rejected pre-tagged payload bypass"
+            );
+            let limit = state.binding().max_blocks_per_epoch();
+            if sequence_number > limit || (sequence_number == limit && !is_epoch_control) {
+                anyhow::bail!(
+                    "identified stream epoch {epoch} exhausted after {} blocks; authenticated rekey required",
+                    state.binding().max_blocks_per_epoch()
+                );
+            }
+        }
+        let group_id = self.next_group;
+        let next_group = self
+            .next_group
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("stream Group identity exhausted"))?;
+        let next_sequence = self
+            .next_sequence
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("stream sequence exhausted"))?;
 
-        // #321: on the mesh/DH path (`enc_key = Some`), seal each Data/Complete
+        // #321: on the mesh/DH path (`enc_key = Some`), seal each application/control
         // payload with AES-256-GCM into a `Tagged` payload BEFORE the HMAC chain
         // runs (so the chain authenticates the ciphertext — no double-encryption,
-        // ordering/anti-replay unchanged). Error frames stay cleartext (operational
-        // status, terminal). The AEAD AAD/key-commitment are bound to the block's
+        // ordering/anti-replay unchanged). The AEAD AAD/key-commitment are bound to the block's
         // `epoch` (and topic), so a rekey can't replay a block across epochs.
         let sealed: Vec<StreamPayloadData>;
         let payloads: &[StreamPayloadData] = match self.enc_key {
             Some(ref enc_key) => {
+                let epoch_keys = self
+                    .epoch_ratchet
+                    .as_ref()
+                    .map(crate::stream_epoch::StreamEpochRatchet::current_keys);
                 sealed = payloads
                     .iter()
-                    .map(|p| seal_payload(enc_key, &self.topic, epoch, p))
+                    .enumerate()
+                    .map(|(index, p)| {
+                        let nonce = epoch_keys
+                            .as_ref()
+                            .map(|keys| {
+                                // One MoQ block currently carries one payload.  Keep
+                                // the index in the checked nonce position so future
+                                // batching cannot reuse a nonce silently.
+                                let counter = sequence_number
+                                    .checked_mul(1 << 16)
+                                    .and_then(|value| value.checked_add(index as u64))
+                                    .ok_or_else(|| {
+                                        anyhow!("stream payload nonce counter exhausted")
+                                    })?;
+                                Ok::<[u8; 12], anyhow::Error>(
+                                    keys.producer_to_consumer.nonce(counter),
+                                )
+                            })
+                            .transpose()?;
+                        seal_payload(
+                            enc_key,
+                            &self.topic,
+                            epoch,
+                            sequence_number,
+                            index,
+                            nonce,
+                            p,
+                        )
+                    })
                     .collect::<Result<Vec<_>>>()?;
                 &sealed
             }
@@ -827,15 +948,23 @@ impl MoqStreamPublisher {
             }
             None => signed_region,
         };
-        let mac = self.hmac_state.compute_next(&capnp_bytes);
+        let mut pending_hmac_state = self.hmac_state.clone();
+        let mac = pending_hmac_state.compute_next(&capnp_bytes);
 
         let mut frame = Vec::with_capacity(capnp_bytes.len() + 16);
         frame.extend_from_slice(&capnp_bytes);
         frame.extend_from_slice(&mac);
 
-        let mut group = self.track.create_group(Group::from(sequence_number))?;
+        let mut group = self.track.create_group(Group::from(group_id))?;
         group.write_frame(Bytes::from(frame))?;
         group.finish()?;
+
+        // Publication is the commit point: failures above leave all sequence,
+        // identity, and chained-MAC state unchanged, so a retry cannot create a
+        // gap or reuse an already-advanced cryptographic state.
+        self.hmac_state = pending_hmac_state;
+        self.next_group = next_group;
+        self.next_sequence = next_sequence;
         Ok(())
     }
 }
@@ -859,7 +988,12 @@ impl MoqStreamPublisher {
     }
 
     /// Publish a progress update (`stage:current:total`).
-    pub async fn publish_progress(&mut self, stage: &str, current: usize, total: usize) -> Result<()> {
+    pub async fn publish_progress(
+        &mut self,
+        stage: &str,
+        current: usize,
+        total: usize,
+    ) -> Result<()> {
         let data = format!("{}:{}:{}", stage, current, total);
         self.publish_data(data.as_bytes()).await
     }
@@ -905,9 +1039,52 @@ impl MoqStreamHandle {
         topic: String,
     ) -> Self {
         let cancel = tokio_util::sync::CancellationToken::new();
-        let (tx, rx) = tokio::sync::mpsc::channel::<anyhow::Result<crate::streaming::StreamPayload>>(64);
-        tokio::spawn(moq_stream_handle_task(uds_path, broadcast_path.clone(), mac_key, enc_key, topic, tx, cancel.clone()));
-        Self { rx, broadcast_path, cancel }
+        let (tx, rx) =
+            tokio::sync::mpsc::channel::<anyhow::Result<crate::streaming::StreamPayload>>(64);
+        tokio::spawn(moq_stream_handle_task(
+            uds_path,
+            broadcast_path.clone(),
+            mac_key,
+            enc_key,
+            topic,
+            None,
+            tx,
+            cancel.clone(),
+        ));
+        Self {
+            rx,
+            broadcast_path,
+            cancel,
+        }
+    }
+
+    /// Construct an identified-profile UDS consumer whose receive loop accepts
+    /// authenticated in-band epoch controls before delivering later Objects.
+    pub fn identified(
+        uds_path: String,
+        broadcast_path: String,
+        ratchet: crate::stream_epoch::StreamEpochRatchet,
+    ) -> Self {
+        let keys = ratchet.current_keys();
+        let topic = ratchet.route_topic().to_owned();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let (tx, rx) =
+            tokio::sync::mpsc::channel::<anyhow::Result<crate::streaming::StreamPayload>>(64);
+        tokio::spawn(moq_stream_handle_task(
+            uds_path,
+            broadcast_path.clone(),
+            *keys.producer_to_consumer.mac_key,
+            *keys.producer_to_consumer.enc_key,
+            topic,
+            Some(ratchet),
+            tx,
+            cancel.clone(),
+        ));
+        Self {
+            rx,
+            broadcast_path,
+            cancel,
+        }
     }
 
     /// Construct a handle that subscribes over the **network** (#274).
@@ -971,6 +1148,7 @@ impl MoqStreamHandle {
                 mac_key,
                 enc_key,
                 topic,
+                None,
                 tx,
                 cancel.clone(),
             ));
@@ -982,6 +1160,7 @@ impl MoqStreamHandle {
                 mac_key,
                 enc_key,
                 topic,
+                None,
                 tx,
                 cancel.clone(),
             ));
@@ -997,7 +1176,68 @@ impl MoqStreamHandle {
                     .await;
             });
         }
-        Self { rx, broadcast_path, cancel }
+        Self {
+            rx,
+            broadcast_path,
+            cancel,
+        }
+    }
+
+    /// Construct an identified-profile network consumer. A standard relay sees
+    /// ordinary opaque Objects; this receive loop consumes authenticated epoch
+    /// controls and delivers application payloads only.
+    pub fn networked_identified(
+        reach: Vec<crate::stream_info::Destination>,
+        qos: &crate::stream_info::StreamOpt,
+        broadcast_path: String,
+        ratchet: crate::stream_epoch::StreamEpochRatchet,
+    ) -> Self {
+        let reach = select_reach(&reach, qos);
+        let keys = ratchet.current_keys();
+        let mac_key = *keys.producer_to_consumer.mac_key;
+        let enc_key = *keys.producer_to_consumer.enc_key;
+        let topic = ratchet.route_topic().to_owned();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let (tx, rx) =
+            tokio::sync::mpsc::channel::<anyhow::Result<crate::streaming::StreamPayload>>(64);
+        let has_dialable_reach = reach.iter().any(|d| reach_to_transport_config(d).is_some());
+        if has_dialable_reach {
+            tokio::spawn(moq_stream_handle_task_networked(
+                reach,
+                broadcast_path.clone(),
+                mac_key,
+                enc_key,
+                topic,
+                Some(ratchet),
+                tx,
+                cancel.clone(),
+            ));
+        } else if let Some(uds) = global_moq_uds_path() {
+            tokio::spawn(moq_stream_handle_task(
+                uds.to_string_lossy().into_owned(),
+                broadcast_path.clone(),
+                mac_key,
+                enc_key,
+                topic,
+                Some(ratchet),
+                tx,
+                cancel.clone(),
+            ));
+        } else {
+            tokio::spawn(async move {
+                let _ = tx
+                    .send(Err(anyhow!(
+                        "no dialable reach in StreamInfo and no local moq UDS plane — \
+                         cannot subscribe to identified broadcast"
+                    )))
+                    .await;
+            });
+        }
+        Self {
+            rx,
+            broadcast_path,
+            cancel,
+        }
     }
 
     /// Receive the next stream payload.
@@ -1046,6 +1286,7 @@ async fn moq_stream_handle_task(
     mac_key: [u8; 32],
     enc_key: [u8; 32],
     topic: String,
+    epoch_ratchet: Option<crate::stream_epoch::StreamEpochRatchet>,
     tx: tokio::sync::mpsc::Sender<anyhow::Result<crate::streaming::StreamPayload>>,
     cancel: tokio_util::sync::CancellationToken,
 ) {
@@ -1055,35 +1296,57 @@ async fn moq_stream_handle_task(
 
     let session = match connect_uds(&uds_path, PLANE_MOQ).await {
         Ok(s) => s,
-        Err(e) => { let _ = tx.send(Err(anyhow!("moq UDS connect {uds_path}: {e}"))).await; return; }
+        Err(e) => {
+            let _ = tx
+                .send(Err(anyhow!("moq UDS connect {uds_path}: {e}")))
+                .await;
+            return;
+        }
     };
     let client_origin = Origin::random().produce();
     let client_consumer = client_origin.consume();
     let moq_client = MoqClient::new().with_consume(client_origin);
     let _session = match moq_client.connect(session).await {
         Ok(s) => s,
-        Err(e) => { let _ = tx.send(Err(anyhow!("moq handshake: {e}"))).await; return; }
+        Err(e) => {
+            let _ = tx.send(Err(anyhow!("moq handshake: {e}"))).await;
+            return;
+        }
     };
     let bc = match tokio::time::timeout(
         BROADCAST_ANNOUNCE_TIMEOUT,
         client_consumer.announced_broadcast(&broadcast_path),
-    ).await {
+    )
+    .await
+    {
         Ok(Some(bc)) => bc,
         Ok(None) => {
-            let _ = tx.send(Err(anyhow!("broadcast {broadcast_path} not announced"))).await;
+            let _ = tx
+                .send(Err(anyhow!("broadcast {broadcast_path} not announced")))
+                .await;
             return;
         }
         Err(_) => {
-            let _ = tx.send(Err(anyhow!("timeout waiting for broadcast {broadcast_path}"))).await;
+            let _ = tx
+                .send(Err(anyhow!(
+                    "timeout waiting for broadcast {broadcast_path}"
+                )))
+                .await;
             return;
         }
     };
     let track = match bc.subscribe_track(&Track::new(STREAM_TRACK)) {
         Ok(t) => t,
-        Err(e) => { let _ = tx.send(Err(anyhow!("subscribe_track: {e}"))).await; return; }
+        Err(e) => {
+            let _ = tx.send(Err(anyhow!("subscribe_track: {e}"))).await;
+            return;
+        }
     };
     // #321: AEAD ON for this DH-keyed mesh stream — open sealed Tagged blocks.
     let mut verifier = StreamVerifier::new(mac_key, topic.clone()).with_enc_key(enc_key);
+    if let Some(ratchet) = epoch_ratchet {
+        verifier = verifier.with_epoch_ratchet(ratchet);
+    }
     // #145: read groups by EXACT sequence (get_group), not arrival-order next_group.
     // Each Group is served on its own QUIC uni-stream, so Groups can arrive out of
     // order; next_group's monotonic cursor returns the first Group with sequence >=
@@ -1096,37 +1359,43 @@ async fn moq_stream_handle_task(
         if cancel.is_cancelled() {
             break;
         }
-        let mut group = match tokio::time::timeout(GROUP_IDLE_TIMEOUT, track.get_group(expected_seq)).await {
-            Ok(Ok(Some(g))) => g,
-            Ok(Ok(None)) => break, // track ended cleanly
-            Err(_elapsed) => {
-                let _ = tx.send(Err(anyhow!(
-                    "stream idle: no group for {}s",
-                    GROUP_IDLE_TIMEOUT.as_secs()
-                ))).await;
-                break;
-            }
-            Ok(Err(e)) => {
-                let _ = tx.send(Err(anyhow!("moq next_group: {e}"))).await;
-                break;
-            }
-        };
+        let mut group =
+            match tokio::time::timeout(GROUP_IDLE_TIMEOUT, track.get_group(expected_seq)).await {
+                Ok(Ok(Some(g))) => g,
+                Ok(Ok(None)) => break, // track ended cleanly
+                Err(_elapsed) => {
+                    let _ = tx
+                        .send(Err(anyhow!(
+                            "stream idle: no group for {}s",
+                            GROUP_IDLE_TIMEOUT.as_secs()
+                        )))
+                        .await;
+                    break;
+                }
+                Ok(Err(e)) => {
+                    let _ = tx.send(Err(anyhow!("moq next_group: {e}"))).await;
+                    break;
+                }
+            };
         expected_seq += 1;
-        let frame: bytes::Bytes = match tokio::time::timeout(FRAME_READ_TIMEOUT, group.read_frame()).await {
-            Ok(Ok(Some(f))) => f,
-            Ok(Ok(None)) => break, // group ended without a frame
-            Ok(Err(e)) => {
-                let _ = tx.send(Err(anyhow!("frame read error: {e}"))).await;
-                break;
-            }
-            Err(_elapsed) => {
-                let _ = tx.send(Err(anyhow!(
-                    "frame read timeout after {}s",
-                    FRAME_READ_TIMEOUT.as_secs()
-                ))).await;
-                break;
-            }
-        };
+        let frame: bytes::Bytes =
+            match tokio::time::timeout(FRAME_READ_TIMEOUT, group.read_frame()).await {
+                Ok(Ok(Some(f))) => f,
+                Ok(Ok(None)) => break, // group ended without a frame
+                Ok(Err(e)) => {
+                    let _ = tx.send(Err(anyhow!("frame read error: {e}"))).await;
+                    break;
+                }
+                Err(_elapsed) => {
+                    let _ = tx
+                        .send(Err(anyhow!(
+                            "frame read timeout after {}s",
+                            FRAME_READ_TIMEOUT.as_secs()
+                        )))
+                        .await;
+                    break;
+                }
+            };
         match verify_moq_frame(&mut verifier, &topic, &frame) {
             Ok(payloads) => {
                 for p in payloads {
@@ -1188,7 +1457,11 @@ pub fn wire_transport_to_dial(
                 // Pinned self-signed mesh (matches the DID-doc #quic entry).
                 QuicServerAuth::pinned(hashes).ok()?
             };
-            Some(TransportConfig::quic_with_auth(addr, q.server_name.clone(), auth))
+            Some(TransportConfig::quic_with_auth(
+                addr,
+                q.server_name.clone(),
+                auth,
+            ))
         }
         // #320/#357: dial the wire-advertised iroh reach by node_id. iroh binds
         // the dialed `moql` connection to this `EndpointId` (its Ed25519 pubkey);
@@ -1198,7 +1471,11 @@ pub fn wire_transport_to_dial(
         // native peer can dial by node_id alone (no direct addrs are carried on
         // the wire — see `IrohReach` in streaming.capnp).
         ReachTransport::Iroh(i) => {
-            let relay_url = if i.relay_url.is_empty() { None } else { Some(i.relay_url.clone()) };
+            let relay_url = if i.relay_url.is_empty() {
+                None
+            } else {
+                Some(i.relay_url.clone())
+            };
             Some(TransportConfig::iroh(i.node_id, Vec::new(), relay_url))
         }
     }
@@ -1219,26 +1496,34 @@ pub fn dial_transport_to_wire(
     use crate::stream_info::{IrohReach, QuicReach, TransportConfig as ReachTransport};
     use crate::transport::EndpointType;
     match &dial.endpoint {
-        EndpointType::Quic { addr, server_name, auth } => Some(ReachTransport::Quic(QuicReach {
+        EndpointType::Quic {
+            addr,
+            server_name,
+            auth,
+        } => Some(ReachTransport::Quic(QuicReach {
             addr: addr.to_string(),
             server_name: server_name.clone(),
-            cert_hashes: auth.accept_cert_hashes().iter().map(|h| h.to_vec()).collect(),
+            cert_hashes: auth
+                .accept_cert_hashes()
+                .iter()
+                .map(|h| h.to_vec())
+                .collect(),
         })),
         // The wire iroh reach carries the carrier address (nodeId) + relay only; direct
         // addrs are not published (privacy + iroh discovery), matching the
         // DID-doc `IrohTransport` entry shape (#280/#282).
-        EndpointType::Iroh { node_id, relay_url, .. } => Some(ReachTransport::Iroh(IrohReach {
+        EndpointType::Iroh {
+            node_id, relay_url, ..
+        } => Some(ReachTransport::Iroh(IrohReach {
             node_id: *node_id,
-            alpn: String::from_utf8_lossy(
-                crate::transport::iroh_substrate::ALPN_HYPRSTREAM_RPC,
-            )
-            .into_owned(),
+            alpn: String::from_utf8_lossy(crate::transport::iroh_substrate::ALPN_HYPRSTREAM_RPC)
+                .into_owned(),
             relay_url: relay_url.clone().unwrap_or_default(),
         })),
         // Same-host endpoints are never wire-advertised (#320).
-        EndpointType::Inproc { .. }
-        | EndpointType::Ipc { .. }
-        | EndpointType::SystemdFd { .. } => None,
+        EndpointType::Inproc { .. } | EndpointType::Ipc { .. } | EndpointType::SystemdFd { .. } => {
+            None
+        }
     }
 }
 
@@ -1297,7 +1582,12 @@ pub async fn connect_moq_reach(
         };
         match crate::dial::dial_stream(&cfg).await {
             Ok(stream_session) => match stream_session.connect_moq(&moq_client).await {
-                Ok(session) => return Ok(MoqReachConnection { consumer, _session: session }),
+                Ok(session) => {
+                    return Ok(MoqReachConnection {
+                        consumer,
+                        _session: session,
+                    })
+                }
                 Err(e) => last_err = Some(format!("moq handshake: {e}")),
             },
             Err(e) => last_err = Some(e.to_string()),
@@ -1313,7 +1603,10 @@ pub async fn connect_moq_reach(
             .connect(session)
             .await
             .map_err(|e| anyhow!("moq UDS handshake: {e}"))?;
-        return Ok(MoqReachConnection { consumer, _session: session });
+        return Ok(MoqReachConnection {
+            consumer,
+            _session: session,
+        });
     }
 
     // 3. Fail closed.
@@ -1362,7 +1655,11 @@ pub fn select_reach(
     let relay_first = !matches!(qos.retention, Retention::Live);
     let mut ordered: Vec<crate::stream_info::Destination> = Vec::with_capacity(advertised.len());
     // Stable partition: pull the preferred role to the front, keep within-role order.
-    let prefer = if relay_first { Role::Relay } else { Role::Direct };
+    let prefer = if relay_first {
+        Role::Relay
+    } else {
+        Role::Direct
+    };
     ordered.extend(advertised.iter().filter(|d| d.role == prefer).cloned());
     ordered.extend(advertised.iter().filter(|d| d.role != prefer).cloned());
     ordered
@@ -1535,7 +1832,10 @@ pub async fn run_relay_announce_link(
 
     // Reuse the ONE wire-reach → dial-config resolver so the relay is dialed by
     // the same code path (Quic / WebTransport / iroh) every direct reach uses.
-    let dest = crate::stream_info::Destination { role: crate::stream_info::Role::Relay, transport: relay.clone() };
+    let dest = crate::stream_info::Destination {
+        role: crate::stream_info::Role::Relay,
+        transport: relay.clone(),
+    };
     let cfg = reach_to_transport_config(&dest)
         .ok_or_else(|| anyhow!("relay reach is not a dialable network transport"))?;
 
@@ -1576,6 +1876,7 @@ async fn moq_stream_handle_task_networked(
     mac_key: [u8; 32],
     enc_key: [u8; 32],
     topic: String,
+    epoch_ratchet: Option<crate::stream_epoch::StreamEpochRatchet>,
     tx: tokio::sync::mpsc::Sender<anyhow::Result<crate::streaming::StreamPayload>>,
     cancel: tokio_util::sync::CancellationToken,
 ) {
@@ -1587,7 +1888,9 @@ async fn moq_stream_handle_task_networked(
     let conn = match connect_moq_reach(&reach).await {
         Ok(c) => c,
         Err(e) => {
-            let _ = tx.send(Err(anyhow!("moq networked dial failed: {e}"))).await;
+            let _ = tx
+                .send(Err(anyhow!("moq networked dial failed: {e}")))
+                .await;
             return;
         }
     };
@@ -1602,12 +1905,16 @@ async fn moq_stream_handle_task_networked(
     {
         Ok(Some(bc)) => bc,
         Ok(None) => {
-            let _ = tx.send(Err(anyhow!("broadcast {broadcast_path} not announced"))).await;
+            let _ = tx
+                .send(Err(anyhow!("broadcast {broadcast_path} not announced")))
+                .await;
             return;
         }
         Err(_) => {
             let _ = tx
-                .send(Err(anyhow!("timeout waiting for broadcast {broadcast_path}")))
+                .send(Err(anyhow!(
+                    "timeout waiting for broadcast {broadcast_path}"
+                )))
                 .await;
             return;
         }
@@ -1621,6 +1928,9 @@ async fn moq_stream_handle_task_networked(
     };
     // #321: AEAD ON for this DH-keyed mesh stream — open sealed Tagged blocks.
     let mut verifier = StreamVerifier::new(mac_key, topic.clone()).with_enc_key(enc_key);
+    if let Some(ratchet) = epoch_ratchet {
+        verifier = verifier.with_epoch_ratchet(ratchet);
+    }
     // #145: read groups by EXACT sequence (get_group), not arrival-order next_group.
     // Each Group is served on its own QUIC uni-stream, so Groups can arrive out of
     // order; next_group's monotonic cursor returns the first Group with sequence >=
@@ -1633,35 +1943,43 @@ async fn moq_stream_handle_task_networked(
         if cancel.is_cancelled() {
             break;
         }
-        let mut group = match tokio::time::timeout(GROUP_IDLE_TIMEOUT, track.get_group(expected_seq)).await {
-            Ok(Ok(Some(g))) => g,
-            Ok(Ok(None)) => break,
-            Err(_elapsed) => {
-                let _ = tx
-                    .send(Err(anyhow!("stream idle: no group for {}s", GROUP_IDLE_TIMEOUT.as_secs())))
-                    .await;
-                break;
-            }
-            Ok(Err(e)) => {
-                let _ = tx.send(Err(anyhow!("moq next_group: {e}"))).await;
-                break;
-            }
-        };
+        let mut group =
+            match tokio::time::timeout(GROUP_IDLE_TIMEOUT, track.get_group(expected_seq)).await {
+                Ok(Ok(Some(g))) => g,
+                Ok(Ok(None)) => break,
+                Err(_elapsed) => {
+                    let _ = tx
+                        .send(Err(anyhow!(
+                            "stream idle: no group for {}s",
+                            GROUP_IDLE_TIMEOUT.as_secs()
+                        )))
+                        .await;
+                    break;
+                }
+                Ok(Err(e)) => {
+                    let _ = tx.send(Err(anyhow!("moq next_group: {e}"))).await;
+                    break;
+                }
+            };
         expected_seq += 1;
-        let frame: bytes::Bytes = match tokio::time::timeout(FRAME_READ_TIMEOUT, group.read_frame()).await {
-            Ok(Ok(Some(f))) => f,
-            Ok(Ok(None)) => break,
-            Ok(Err(e)) => {
-                let _ = tx.send(Err(anyhow!("frame read error: {e}"))).await;
-                break;
-            }
-            Err(_elapsed) => {
-                let _ = tx
-                    .send(Err(anyhow!("frame read timeout after {}s", FRAME_READ_TIMEOUT.as_secs())))
-                    .await;
-                break;
-            }
-        };
+        let frame: bytes::Bytes =
+            match tokio::time::timeout(FRAME_READ_TIMEOUT, group.read_frame()).await {
+                Ok(Ok(Some(f))) => f,
+                Ok(Ok(None)) => break,
+                Ok(Err(e)) => {
+                    let _ = tx.send(Err(anyhow!("frame read error: {e}"))).await;
+                    break;
+                }
+                Err(_elapsed) => {
+                    let _ = tx
+                        .send(Err(anyhow!(
+                            "frame read timeout after {}s",
+                            FRAME_READ_TIMEOUT.as_secs()
+                        )))
+                        .await;
+                    break;
+                }
+            };
         match verify_moq_frame(&mut verifier, &topic, &frame) {
             Ok(payloads) => {
                 for p in payloads {
@@ -1752,10 +2070,10 @@ pub fn verify_moq_frame_with_provenance(
     Ok(payloads)
 }
 
-/// Seal a single Data/Complete payload into an AES-256-GCM `Tagged` payload
+/// Seal a single Data/Complete/Error/epoch-control payload into an AES-256-GCM `Tagged` payload
 /// (#321). The 1-byte kind tag is prepended to the plaintext so the consumer can
-/// restore the original variant. Error/Tagged/other variants pass through
-/// unchanged (Error is operational, already-Tagged is the E2E notification path).
+/// restore the original variant. Already-Tagged/other variants pass through
+/// unchanged (already-Tagged is the E2E notification path).
 ///
 /// Shares its AAD + kind-tag framing with the cross-target open path
 /// ([`crate::stream_consumer::open_sealed_payload`]).
@@ -1763,14 +2081,31 @@ fn seal_payload(
     enc_key: &[u8; 32],
     topic: &str,
     epoch: u64,
+    sequence_number: u64,
+    payload_index: usize,
+    nonce: Option<[u8; 12]>,
     payload: &StreamPayloadData,
 ) -> Result<StreamPayloadData> {
-    use crate::crypto::event_crypto::{encrypt_event, EventPrivacy};
-    use crate::stream_consumer::{stream_aead_aad, SEALED_KIND_COMPLETE, SEALED_KIND_DATA};
+    use crate::crypto::event_crypto::{encrypt_event, encrypt_event_with_nonce, EventPrivacy};
+    use crate::stream_consumer::{
+        stream_aead_aad, SEALED_KIND_COMPLETE, SEALED_KIND_DATA, SEALED_KIND_EPOCH_COMMIT,
+        SEALED_KIND_ERROR,
+    };
 
+    let control_bytes = match payload {
+        StreamPayloadData::EpochCommit(commit) => Some(commit.encode_control_object()),
+        _ => None,
+    };
     let (kind, body): (u8, &[u8]) = match payload {
         StreamPayloadData::Data(d) => (SEALED_KIND_DATA, d),
         StreamPayloadData::Complete(d) => (SEALED_KIND_COMPLETE, d),
+        StreamPayloadData::Error(message) => (SEALED_KIND_ERROR, message.as_bytes()),
+        StreamPayloadData::EpochCommit(_) => (
+            SEALED_KIND_EPOCH_COMMIT,
+            control_bytes
+                .as_deref()
+                .ok_or_else(|| anyhow!("stream epoch control encoding missing"))?,
+        ),
         // Leave non-sealed variants untouched.
         other => return Ok(other.clone()),
     };
@@ -1779,10 +2114,12 @@ fn seal_payload(
     plaintext.push(kind);
     plaintext.extend_from_slice(body);
 
-    let aad = stream_aead_aad(topic, epoch);
-    let (tag, ciphertext, nonce, key_commitment) =
-        encrypt_event(enc_key, &aad, &plaintext, EventPrivacy::ZeroKnowledge)
-            .map_err(|e| anyhow!("stream AEAD seal failed: {e}"))?;
+    let aad = stream_aead_aad(topic, epoch, sequence_number, payload_index);
+    let (tag, ciphertext, nonce, key_commitment) = match nonce {
+        Some(nonce) => encrypt_event_with_nonce(enc_key, nonce, &aad, &plaintext),
+        None => encrypt_event(enc_key, &aad, &plaintext, EventPrivacy::ZeroKnowledge),
+    }
+    .map_err(|e| anyhow!("stream AEAD seal failed: {e}"))?;
 
     Ok(StreamPayloadData::Tagged {
         tag,
@@ -1835,18 +2172,13 @@ mod tests {
         let mut verifier = StreamVerifier::new(mac_key, topic.clone()).with_enc_key(enc_key);
         let mut got: Vec<StreamPayload> = Vec::new();
         for _ in 0..3 {
-            let mut group = tokio::time::timeout(
-                std::time::Duration::from_secs(5),
-                track.next_group(),
-            )
-            .await??
-            .ok_or_else(|| anyhow!("next_group None"))?;
-            let frame = tokio::time::timeout(
-                std::time::Duration::from_secs(5),
-                group.read_frame(),
-            )
-            .await??
-            .ok_or_else(|| anyhow!("read_frame None"))?;
+            let mut group =
+                tokio::time::timeout(std::time::Duration::from_secs(5), track.next_group())
+                    .await??
+                    .ok_or_else(|| anyhow!("next_group None"))?;
+            let frame = tokio::time::timeout(std::time::Duration::from_secs(5), group.read_frame())
+                .await??
+                .ok_or_else(|| anyhow!("read_frame None"))?;
             got.extend(verify_moq_frame(&mut verifier, &topic, &frame)?);
         }
 
@@ -1854,6 +2186,318 @@ mod tests {
         assert!(matches!(&got[1], StreamPayload::Data(d) if d == b"world"));
         assert!(matches!(&got[2], StreamPayload::Complete(_)));
         Ok(())
+    }
+
+    /// #554 identified profile: a standards-compatible MoQT track carries only
+    /// opaque Object bytes, an authenticated rekey resets the per-epoch sequence
+    /// and traffic keys, and the relay-visible Group identity remains monotonic.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn identified_epoch_rekey_keeps_stock_moq_objects_opaque_and_immutable() -> Result<()> {
+        use crate::crypto::hybrid_kem::{generate_recipient, SuiteId};
+        use crate::crypto::key_exchange::client_identified_stream_epoch;
+        use crate::stream_epoch::{
+            IdentifiedStreamBinding, StreamAcceptedState, StreamCarrierProfile, StreamRouteRole,
+        };
+
+        let binding = IdentifiedStreamBinding::new(
+            StreamCarrierProfile::StandardPublicRelay,
+            StreamRouteRole::Relay,
+            "did:at9p:producer",
+            "did:at9p:consumer",
+            StreamAcceptedState {
+                identity_did: "did:at9p:producer".into(),
+                digest: [0x31; 64],
+                epoch: 3,
+            },
+            StreamAcceptedState {
+                identity_did: "did:at9p:consumer".into(),
+                digest: [0x41; 64],
+                epoch: 4,
+            },
+            "inference.generate",
+            "infer:model:qwen",
+            "local/streams/identified",
+            "did:at9p:producer#mesh-kem",
+            "urn:hyprstream:stream-client:one-shot",
+            1,
+        )?;
+        let client_keypair = generate_recipient(SuiteId::HyKemX25519MlKem768)?;
+        let ctx = StreamContext::from_hybrid_identified(
+            &client_keypair.public().encode(),
+            binding.clone(),
+        )?;
+        let client_ratchet = client_identified_stream_epoch(
+            &client_keypair,
+            ctx.kem_ciphertexts()
+                .expect("hybrid context has ciphertexts"),
+            binding.clone(),
+        )?;
+        let initial_ratchet = client_ratchet.clone();
+        let topic = ctx.topic().to_owned();
+        let origin = origin();
+        let duplicate_ctx = ctx.clone();
+        assert!(
+            origin.publisher(&ctx.clone().without_aead()).is_err(),
+            "identified context accepted an AEAD downgrade before publication"
+        );
+        let mut publisher = origin.publisher(&ctx)?;
+        assert!(
+            origin.publisher(&duplicate_ctx).is_err(),
+            "identified context clone created a second epoch-zero publisher"
+        );
+        publisher.publish_data(b"epoch-zero-secret").await?;
+        assert!(
+            publisher.publish_data(b"must-rekey-first").await.is_err(),
+            "epoch block bound must fail closed"
+        );
+
+        assert_eq!(publisher.publish_next_epoch()?, 1);
+        publisher.publish_data(b"epoch-one-secret").await?;
+
+        assert_eq!(publisher.publish_next_epoch()?, 2);
+        let private_error = "private model failure: customer prompt rejected";
+        publisher.publish_error(private_error).await?;
+
+        let path = origin.broadcast_path(&topic);
+        let bc = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            origin.consumer().announced_broadcast(path.as_str()),
+        )
+        .await?
+        .ok_or_else(|| anyhow!("broadcast not announced"))?;
+        let track = bc.subscribe_track(&Track::new(STREAM_TRACK))?;
+        let mut verifier =
+            StreamVerifier::new([0; 32], String::new()).with_epoch_ratchet(client_ratchet);
+
+        let mut frames = Vec::new();
+        for group_id in 0..5 {
+            let mut group =
+                tokio::time::timeout(std::time::Duration::from_secs(5), track.get_group(group_id))
+                    .await??
+                    .ok_or_else(|| anyhow!("identified Group {group_id} missing"))?;
+            frames.push(
+                tokio::time::timeout(std::time::Duration::from_secs(5), group.read_frame())
+                    .await??
+                    .ok_or_else(|| anyhow!("identified Object {group_id} missing"))?,
+            );
+        }
+        let frame0 = &frames[0];
+        assert!(
+            !frame0
+                .windows(b"epoch-zero-secret".len())
+                .any(|window| window == b"epoch-zero-secret"),
+            "stock relay-visible Object leaked plaintext"
+        );
+        let first = verify_moq_frame(&mut verifier, &topic, frame0)?;
+        assert!(matches!(&first[0], StreamPayload::Data(data) if data == b"epoch-zero-secret"));
+
+        let control0 = &frames[1];
+        assert!(
+            !control0
+                .windows(b"HYSEPK01".len())
+                .any(|window| window == b"HYSEPK01")
+                && !control0
+                    .windows(32)
+                    .any(|window| window == binding.binding_hash()),
+            "relay-visible control Object exposed the epoch-control plaintext"
+        );
+        assert!(verify_moq_frame(&mut verifier, &topic, control0)?.is_empty());
+        let second = verify_moq_frame(&mut verifier, &topic, &frames[2])?;
+        assert!(matches!(&second[0], StreamPayload::Data(data) if data == b"epoch-one-secret"));
+
+        assert!(verify_moq_frame(&mut verifier, &topic, &frames[3])?.is_empty());
+        assert!(
+            !frames[4]
+                .windows(private_error.len())
+                .any(|window| window == private_error.as_bytes()),
+            "stock relay-visible Object leaked the private error string"
+        );
+        let error = verify_moq_frame(&mut verifier, &topic, &frames[4])?;
+        assert!(matches!(&error[0], StreamPayload::Error(message) if message == private_error));
+
+        // Each negative control first consumes the real epoch-zero Object so
+        // it has the exact authenticated old-epoch chain state. A subsequent
+        // successful control+data delivery proves every rejection was causal
+        // and left verifier state unchanged.
+        let verifier_after_epoch_zero = || -> Result<StreamVerifier> {
+            let mut verifier = StreamVerifier::new([0; 32], String::new())
+                .with_epoch_ratchet(initial_ratchet.clone());
+            let payloads = verify_moq_frame(&mut verifier, &topic, &frames[0])?;
+            anyhow::ensure!(matches!(
+                &payloads[0],
+                StreamPayload::Data(data) if data == b"epoch-zero-secret"
+            ));
+            Ok(verifier)
+        };
+
+        let mut tampered = frames[1].to_vec();
+        let tampered_index = tampered.len() / 2;
+        tampered[tampered_index] ^= 0x80;
+        let mut tamper_verifier = verifier_after_epoch_zero()?;
+        assert!(verify_moq_frame(&mut tamper_verifier, &topic, &tampered).is_err());
+        assert!(verify_moq_frame(&mut tamper_verifier, &topic, &frames[1])?.is_empty());
+        assert!(matches!(
+            &verify_moq_frame(&mut tamper_verifier, &topic, &frames[2])?[0],
+            StreamPayload::Data(data) if data == b"epoch-one-secret"
+        ));
+
+        let mut replay_verifier = verifier_after_epoch_zero()?;
+        assert!(verify_moq_frame(&mut replay_verifier, &topic, &frames[1])?.is_empty());
+        assert!(verify_moq_frame(&mut replay_verifier, &topic, &frames[1]).is_err());
+        assert!(matches!(
+            &verify_moq_frame(&mut replay_verifier, &topic, &frames[2])?[0],
+            StreamPayload::Data(data) if data == b"epoch-one-secret"
+        ));
+
+        let previous_mac = &frames[0][frames[0].len() - 16..];
+        let mut skipped = initial_ratchet.prepare_next()?;
+        skipped.epoch += 1;
+        let skipped_frame = identified_test_frame(
+            &initial_ratchet,
+            &topic,
+            previous_mac,
+            1,
+            &StreamPayloadData::EpochCommit(skipped),
+        )?;
+        let mut skip_verifier = verifier_after_epoch_zero()?;
+        assert!(verify_moq_frame(&mut skip_verifier, &topic, &skipped_frame).is_err());
+        assert!(verify_moq_frame(&mut skip_verifier, &topic, &frames[1])?.is_empty());
+
+        let foreign_binding = IdentifiedStreamBinding::new(
+            StreamCarrierProfile::StandardPublicRelay,
+            StreamRouteRole::Relay,
+            "did:at9p:producer",
+            "did:at9p:consumer",
+            StreamAcceptedState {
+                identity_did: "did:at9p:producer".into(),
+                digest: [0x31; 64],
+                epoch: 3,
+            },
+            StreamAcceptedState {
+                identity_did: "did:at9p:consumer".into(),
+                digest: [0x41; 64],
+                epoch: 4,
+            },
+            "inference.generate",
+            "infer:model:qwen",
+            "local/streams/foreign",
+            "did:at9p:producer#mesh-kem",
+            "urn:hyprstream:stream-client:one-shot",
+            1,
+        )?;
+        let foreign = crate::stream_epoch::StreamEpochRatchet::from_hybrid_secret(
+            &[0xA5; 32],
+            foreign_binding,
+        )?;
+        let cross_stream_frame = identified_test_frame(
+            &initial_ratchet,
+            &topic,
+            previous_mac,
+            1,
+            &StreamPayloadData::EpochCommit(foreign.prepare_next()?),
+        )?;
+        let mut cross_verifier = verifier_after_epoch_zero()?;
+        assert!(verify_moq_frame(&mut cross_verifier, &topic, &cross_stream_frame).is_err());
+        assert!(verify_moq_frame(&mut cross_verifier, &topic, &frames[1])?.is_empty());
+
+        let clear_payloads = [
+            StreamPayloadData::Data(b"relay-visible forged data".to_vec()),
+            StreamPayloadData::Error("relay-visible forged error".into()),
+            StreamPayloadData::Complete(b"relay-visible forged completion".to_vec()),
+            StreamPayloadData::Data(initial_ratchet.prepare_next()?.encode_control_object()),
+        ];
+        for clear_payload in &clear_payloads {
+            let forged_clear =
+                identified_test_frame(&initial_ratchet, &topic, previous_mac, 1, clear_payload)?;
+            let mut clear_verifier = verifier_after_epoch_zero()?;
+            assert!(verify_moq_frame(&mut clear_verifier, &topic, &forged_clear).is_err());
+            assert!(verify_moq_frame(&mut clear_verifier, &topic, &frames[1])?.is_empty());
+        }
+
+        let clear_heartbeat = identified_clear_heartbeat_frame(&initial_ratchet, previous_mac, 1)?;
+        let mut heartbeat_verifier = verifier_after_epoch_zero()?;
+        assert!(verify_moq_frame(&mut heartbeat_verifier, &topic, &clear_heartbeat).is_err());
+        assert!(verify_moq_frame(&mut heartbeat_verifier, &topic, &frames[1])?.is_empty());
+
+        // Lost/reordered control and next-epoch data-before-control are the same
+        // fail-closed condition. The valid control remains acceptable afterward.
+        let mut reordered_verifier = verifier_after_epoch_zero()?;
+        assert!(verify_moq_frame(&mut reordered_verifier, &topic, &frames[2]).is_err());
+        assert!(verify_moq_frame(&mut reordered_verifier, &topic, &frames[1])?.is_empty());
+        assert!(matches!(
+            &verify_moq_frame(&mut reordered_verifier, &topic, &frames[2])?[0],
+            StreamPayload::Data(data) if data == b"epoch-one-secret"
+        ));
+
+        for pair in frames.windows(2) {
+            assert_ne!(pair[0], pair[1]);
+        }
+        Ok(())
+    }
+
+    fn identified_test_frame(
+        ratchet: &crate::stream_epoch::StreamEpochRatchet,
+        topic: &str,
+        previous_mac: &[u8],
+        sequence_number: u64,
+        payload: &StreamPayloadData,
+    ) -> Result<Vec<u8>> {
+        let keys = ratchet.current_keys();
+        let nonce = keys.producer_to_consumer.nonce(
+            sequence_number
+                .checked_mul(1 << 16)
+                .ok_or_else(|| anyhow!("test stream payload nonce counter exhausted"))?,
+        );
+        let payload = if matches!(payload, StreamPayloadData::EpochCommit(_)) {
+            seal_payload(
+                &keys.producer_to_consumer.enc_key,
+                topic,
+                ratchet.epoch(),
+                sequence_number,
+                0,
+                Some(nonce),
+                payload,
+            )?
+        } else {
+            payload.clone()
+        };
+        let capnp = crate::streaming::encode_stream_block(
+            previous_mac,
+            sequence_number,
+            ratchet.epoch(),
+            &[payload],
+        )?;
+        let mac = crate::crypto::keyed_mac_truncated_parts(
+            &keys.producer_to_consumer.mac_key,
+            &[previous_mac, &capnp],
+        );
+        let mut frame = capnp;
+        frame.extend_from_slice(&mac);
+        Ok(frame)
+    }
+
+    fn identified_clear_heartbeat_frame(
+        ratchet: &crate::stream_epoch::StreamEpochRatchet,
+        previous_mac: &[u8],
+        sequence_number: u64,
+    ) -> Result<Vec<u8>> {
+        let mut msg = capnp::message::Builder::new_default();
+        {
+            let mut block = msg.init_root::<crate::streaming_capnp::stream_block::Builder>();
+            block.set_prev_mac(previous_mac);
+            block.set_sequence_number(sequence_number);
+            block.set_epoch(ratchet.epoch());
+            block.init_payloads(1).get(0).set_heartbeat(());
+        }
+        let mut capnp = Vec::new();
+        capnp::serialize::write_message(&mut capnp, &msg)?;
+        let keys = ratchet.current_keys();
+        let mac = crate::crypto::keyed_mac_truncated_parts(
+            &keys.producer_to_consumer.mac_key,
+            &[previous_mac, &capnp],
+        );
+        capnp.extend_from_slice(&mac);
+        Ok(capnp)
     }
 
     /// `AnyStreamPublisher` round-trip: publish via the type alias and verify
@@ -1884,18 +2528,13 @@ mod tests {
         let mut verifier = StreamVerifier::new(mac_key, topic.clone()).with_enc_key(enc_key);
         let mut got: Vec<StreamPayload> = Vec::new();
         for _ in 0..2 {
-            let mut group = tokio::time::timeout(
-                std::time::Duration::from_secs(5),
-                track.next_group(),
-            )
-            .await??
-            .ok_or_else(|| anyhow!("next_group None"))?;
-            let frame = tokio::time::timeout(
-                std::time::Duration::from_secs(5),
-                group.read_frame(),
-            )
-            .await??
-            .ok_or_else(|| anyhow!("read_frame None"))?;
+            let mut group =
+                tokio::time::timeout(std::time::Duration::from_secs(5), track.next_group())
+                    .await??
+                    .ok_or_else(|| anyhow!("next_group None"))?;
+            let frame = tokio::time::timeout(std::time::Duration::from_secs(5), group.read_frame())
+                .await??
+                .ok_or_else(|| anyhow!("read_frame None"))?;
             got.extend(verify_moq_frame(&mut verifier, &topic, &frame)?);
         }
         assert!(matches!(&got[0], StreamPayload::Data(d) if d == b"ping"));
@@ -1910,7 +2549,11 @@ mod tests {
     fn iroh_reach_dial_wire_roundtrip() {
         use crate::transport::{EndpointType, TransportConfig};
         let node_id = [0x42u8; 32];
-        let dial = TransportConfig::iroh(node_id, Vec::new(), Some("https://relay.example".to_owned()));
+        let dial = TransportConfig::iroh(
+            node_id,
+            Vec::new(),
+            Some("https://relay.example".to_owned()),
+        );
         let wire = dial_transport_to_wire(&dial).expect("iroh dial → wire");
         match &wire {
             crate::stream_info::TransportConfig::Iroh(i) => {
@@ -1922,10 +2565,17 @@ mod tests {
         }
         let back = wire_transport_to_dial(&wire).expect("iroh wire → dial");
         match back.endpoint {
-            EndpointType::Iroh { node_id: n, relay_url, direct_addrs } => {
+            EndpointType::Iroh {
+                node_id: n,
+                relay_url,
+                direct_addrs,
+            } => {
                 assert_eq!(n, node_id);
                 assert_eq!(relay_url.as_deref(), Some("https://relay.example"));
-                assert!(direct_addrs.is_empty(), "wire iroh reach never carries direct addrs");
+                assert!(
+                    direct_addrs.is_empty(),
+                    "wire iroh reach never carries direct addrs"
+                );
             }
             other => panic!("expected dial Iroh, got {other:?}"),
         }
@@ -1937,7 +2587,9 @@ mod tests {
     #[test]
     fn same_host_endpoints_never_wire_advertised() {
         use crate::transport::TransportConfig;
-        assert!(dial_transport_to_wire(&TransportConfig::inproc("hyprstream/inference-x")).is_none());
+        assert!(
+            dial_transport_to_wire(&TransportConfig::inproc("hyprstream/inference-x")).is_none()
+        );
         assert!(dial_transport_to_wire(&TransportConfig::ipc("/tmp/x.sock")).is_none());
     }
 
@@ -1954,7 +2606,9 @@ mod tests {
         });
         let dial = wire_transport_to_dial(&wire).expect("decodes");
         // No relay + no direct addrs ⇒ application RPC dial() fails fast.
-        let signer = crate::signer::LocalSigner::new(crate::crypto::SigningKey::generate(&mut rand::rngs::OsRng));
+        let signer = crate::signer::LocalSigner::new(crate::crypto::SigningKey::generate(
+            &mut rand::rngs::OsRng,
+        ));
         assert!(
             crate::dial::dial(&dial, signer, None, None).is_err(),
             "RPC dial must require explicit reachability and response proof"
@@ -2002,16 +2656,33 @@ mod tests {
                 relay_url: String::new(),
             }),
         };
-        assert_eq!(reach.role, Role::Direct, "iroh reach is a direct producer reach");
+        assert_eq!(
+            reach.role,
+            Role::Direct,
+            "iroh reach is a direct producer reach"
+        );
 
         let cfg = reach_to_transport_config(&reach)
             .expect("an iroh reach with a node_id must resolve to a dialable TransportConfig");
         match cfg.endpoint {
-            EndpointType::Iroh { node_id: got, direct_addrs, relay_url } => {
-                assert_eq!(got, node_id, "resolved node_id must round-trip the advertised one");
+            EndpointType::Iroh {
+                node_id: got,
+                direct_addrs,
+                relay_url,
+            } => {
+                assert_eq!(
+                    got, node_id,
+                    "resolved node_id must round-trip the advertised one"
+                );
                 // S2 advertises node_id alone; discovery supplies reachability.
-                assert!(direct_addrs.is_empty(), "S2 iroh reach carries no direct addrs (pkarr)");
-                assert!(relay_url.is_none(), "S2 iroh reach carries no relay URL (pkarr)");
+                assert!(
+                    direct_addrs.is_empty(),
+                    "S2 iroh reach carries no direct addrs (pkarr)"
+                );
+                assert!(
+                    relay_url.is_none(),
+                    "S2 iroh reach carries no relay URL (pkarr)"
+                );
             }
             other => panic!("iroh reach must resolve to EndpointType::Iroh, got {other:?}"),
         }
@@ -2210,10 +2881,15 @@ mod tests {
             server_name: "pds".to_owned(),
             cert_hashes: vec![vec![1u8; 32]],
         });
-        let cfg = ProducerReachConfig { relay: Some(relay.clone()), ..Default::default() };
+        let cfg = ProducerReachConfig {
+            relay: Some(relay.clone()),
+            ..Default::default()
+        };
         let reach = cfg.reach();
         assert!(
-            reach.iter().any(|d| d.role == Role::Relay && d.transport == relay),
+            reach
+                .iter()
+                .any(|d| d.role == Role::Relay && d.transport == relay),
             "ProducerReachConfig::reach must advertise the configured Role::Relay reach"
         );
     }
@@ -2238,7 +2914,11 @@ mod tests {
 
         // Stream Y: server default → direct (iroh) THEN relay, direct-first order.
         let reach_y = cfg.reach();
-        assert_eq!(reach_y[0].role, Role::Direct, "Y must advertise its direct reach first");
+        assert_eq!(
+            reach_y[0].role,
+            Role::Direct,
+            "Y must advertise its direct reach first"
+        );
         assert!(
             reach_y.iter().any(|d| d.role == Role::Relay),
             "Y must also advertise the server-global relay"
@@ -2252,9 +2932,16 @@ mod tests {
             cert_hashes: vec![vec![9u8; 32]],
         });
         let reach_x = cfg.reach_with_relay(RelayChoice::Only(relay_only.clone()));
-        assert_eq!(reach_x.len(), 1, "relay-only stream X must omit all direct reaches");
+        assert_eq!(
+            reach_x.len(),
+            1,
+            "relay-only stream X must omit all direct reaches"
+        );
         assert_eq!(reach_x[0].role, Role::Relay, "X is relay-only (anonymized)");
-        assert_eq!(reach_x[0].transport, relay_only, "X uses its per-stream relay override");
+        assert_eq!(
+            reach_x[0].transport, relay_only,
+            "X uses its per-stream relay override"
+        );
         assert!(
             !reach_x.iter().any(|d| d.role == Role::Direct),
             "X must NOT leak a direct reach (server authority / anonymization)"
@@ -2262,7 +2949,10 @@ mod tests {
 
         // The two streams genuinely differ in the same process — the property the
         // singletons precluded.
-        assert_ne!(reach_x, reach_y, "X (relay-only) and Y (direct+relay) must differ");
+        assert_ne!(
+            reach_x, reach_y,
+            "X (relay-only) and Y (direct+relay) must differ"
+        );
     }
 
     /// Per-stream relay `Override` swaps the relay but KEEPS the direct reaches
@@ -2285,9 +2975,19 @@ mod tests {
             relay: Some(server_relay.clone()),
         };
         let reach = cfg.reach_with_relay(RelayChoice::Override(tenant_relay.clone()));
-        assert_eq!(reach[0].role, Role::Direct, "override keeps the direct reach, listed first");
-        let relay_d = reach.iter().find(|d| d.role == Role::Relay).expect("relay advertised");
-        assert_eq!(relay_d.transport, tenant_relay, "per-stream override replaces the server relay");
+        assert_eq!(
+            reach[0].role,
+            Role::Direct,
+            "override keeps the direct reach, listed first"
+        );
+        let relay_d = reach
+            .iter()
+            .find(|d| d.role == Role::Relay)
+            .expect("relay advertised");
+        assert_eq!(
+            relay_d.transport, tenant_relay,
+            "per-stream override replaces the server relay"
+        );
     }
 
     /// QoS-driven selection: live pipes prefer DIRECT, retained/fan-out prefer RELAY.
@@ -2298,15 +2998,31 @@ mod tests {
         // Pipe (Retention::Live) → direct-first; within-role order preserved.
         let pipe = Pipe::stream_opt();
         let ordered = select_reach(&advertised, &pipe);
-        assert_eq!(ordered[0].role, Role::Direct, "live pipe must try direct first");
-        assert_eq!(ordered[2].role, Role::Relay, "relay falls to the back for a live pipe");
-        assert_eq!(ordered[0], direct_iroh(1), "within-role advertised order preserved");
+        assert_eq!(
+            ordered[0].role,
+            Role::Direct,
+            "live pipe must try direct first"
+        );
+        assert_eq!(
+            ordered[2].role,
+            Role::Relay,
+            "relay falls to the back for a live pipe"
+        );
+        assert_eq!(
+            ordered[0],
+            direct_iroh(1),
+            "within-role advertised order preserved"
+        );
         assert_eq!(ordered[1], direct_iroh(2));
 
         // Job (retained/resumable) → relay-first.
         let job = Job::stream_opt();
         let ordered = select_reach(&advertised, &job);
-        assert_eq!(ordered[0].role, Role::Relay, "retained job must try relay first");
+        assert_eq!(
+            ordered[0].role,
+            Role::Relay,
+            "retained job must try relay first"
+        );
 
         // Log (retained) → relay-first.
         let log = Log::stream_opt();
@@ -2323,7 +3039,11 @@ mod tests {
         // Even with default (Live → direct-preferred) qos, no direct reach appears.
         let ordered = select_reach(&relay_only, &StreamOpt::default());
         assert_eq!(ordered.len(), 1, "selection must not add or drop reaches");
-        assert_eq!(ordered[0].role, Role::Relay, "a relay-only stream stays relay-only");
+        assert_eq!(
+            ordered[0].role,
+            Role::Relay,
+            "a relay-only stream stays relay-only"
+        );
         assert!(
             !ordered.iter().any(|d| d.role == Role::Direct),
             "the client must NOT fabricate a direct reach the service didn't advertise"
@@ -2335,7 +3055,10 @@ mod tests {
         let mut b = select_reach(&advertised, &Job::stream_opt());
         a.sort_by_key(|d| (d.role == Role::Relay, format!("{d:?}")));
         b.sort_by_key(|d| (d.role == Role::Relay, format!("{d:?}")));
-        assert_eq!(a, b, "selection must be a permutation of the advertised reach");
+        assert_eq!(
+            a, b,
+            "selection must be a permutation of the advertised reach"
+        );
     }
 
     /// `relay_reach_from_decoded` round-trips a DID-decoded transport into the
@@ -2350,7 +3073,8 @@ mod tests {
         }
         // Same-host transports are never relay endpoints.
         assert!(
-            relay_reach_from_decoded(&crate::transport::TransportConfig::ipc("/tmp/x.sock")).is_none(),
+            relay_reach_from_decoded(&crate::transport::TransportConfig::ipc("/tmp/x.sock"))
+                .is_none(),
             "a same-host ipc transport is not a network-routable relay"
         );
     }
@@ -2366,13 +3090,26 @@ mod tests {
             StreamPayloadData::Data(b"hello tokens".to_vec()),
             StreamPayloadData::Complete(b"{\"done\":true}".to_vec()),
         ] {
-            let sealed = seal_payload(&enc_key, topic, epoch, &payload).unwrap();
-            let StreamPayloadData::Tagged { tag, payload: ct, nonce, key_commitment } = &sealed
+            let sealed = seal_payload(&enc_key, topic, epoch, 0, 0, None, &payload).unwrap();
+            let StreamPayloadData::Tagged {
+                tag,
+                payload: ct,
+                nonce,
+                key_commitment,
+            } = &sealed
             else {
                 panic!("seal must produce a Tagged payload");
             };
             let opened = crate::stream_consumer::open_sealed_payload(
-                &enc_key, topic, epoch, tag, ct, nonce, key_commitment,
+                &enc_key,
+                topic,
+                epoch,
+                0,
+                0,
+                tag,
+                ct,
+                nonce,
+                key_commitment,
             )
             .unwrap();
             match (&payload, &opened) {
@@ -2390,23 +3127,52 @@ mod tests {
         let enc_key = [0x42u8; 32];
         let topic = "t";
         let epoch = 1u64;
-        let sealed =
-            seal_payload(&enc_key, topic, epoch, &StreamPayloadData::Data(b"secret".to_vec()))
-                .unwrap();
-        let StreamPayloadData::Tagged { tag, payload: ct, nonce, key_commitment } = &sealed else {
+        let sealed = seal_payload(
+            &enc_key,
+            topic,
+            epoch,
+            0,
+            0,
+            None,
+            &StreamPayloadData::Data(b"secret".to_vec()),
+        )
+        .unwrap();
+        let StreamPayloadData::Tagged {
+            tag,
+            payload: ct,
+            nonce,
+            key_commitment,
+        } = &sealed
+        else {
             panic!("expected Tagged");
         };
 
         // Wrong key.
         let wrong = [0x99u8; 32];
         assert!(crate::stream_consumer::open_sealed_payload(
-            &wrong, topic, epoch, tag, ct, nonce, key_commitment
+            &wrong,
+            topic,
+            epoch,
+            0,
+            0,
+            tag,
+            ct,
+            nonce,
+            key_commitment
         )
         .is_err());
 
         // Wrong epoch (AAD mismatch) — anti-replay across epochs.
         assert!(crate::stream_consumer::open_sealed_payload(
-            &enc_key, topic, 2, tag, ct, nonce, key_commitment
+            &enc_key,
+            topic,
+            2,
+            0,
+            0,
+            tag,
+            ct,
+            nonce,
+            key_commitment
         )
         .is_err());
 
@@ -2416,7 +3182,15 @@ mod tests {
             *b ^= 0xFF;
         }
         assert!(crate::stream_consumer::open_sealed_payload(
-            &enc_key, topic, epoch, tag, &bad_ct, nonce, key_commitment
+            &enc_key,
+            topic,
+            epoch,
+            0,
+            0,
+            tag,
+            &bad_ct,
+            nonce,
+            key_commitment
         )
         .is_err());
     }
@@ -2457,25 +3231,23 @@ mod tests {
         let mut track = bc.subscribe_track(&Track::new(STREAM_TRACK))?;
         let mut frames: Vec<bytes::Bytes> = Vec::new();
         for _ in 0..2 {
-            let mut group = tokio::time::timeout(
-                std::time::Duration::from_secs(5),
-                track.next_group(),
-            )
-            .await??
-            .ok_or_else(|| anyhow!("next_group None"))?;
-            let frame = tokio::time::timeout(
-                std::time::Duration::from_secs(5),
-                group.read_frame(),
-            )
-            .await??
-            .ok_or_else(|| anyhow!("read_frame None"))?;
+            let mut group =
+                tokio::time::timeout(std::time::Duration::from_secs(5), track.next_group())
+                    .await??
+                    .ok_or_else(|| anyhow!("next_group None"))?;
+            let frame = tokio::time::timeout(std::time::Duration::from_secs(5), group.read_frame())
+                .await??
+                .ok_or_else(|| anyhow!("read_frame None"))?;
             frames.push(frame);
         }
 
         // Roster anchoring the host's mesh ML-DSA key + enrolled-set closure.
         use ml_dsa::Keypair;
         let mut roster = KeyedPqTrustStore::new();
-        roster.bind(kid, &crate::node_identity::derive_mesh_mldsa_key(&host_ed).verifying_key());
+        roster.bind(
+            kid,
+            &crate::node_identity::derive_mesh_mldsa_key(&host_ed).verifying_key(),
+        );
         let enrolled = |k: &[u8; 32]| *k == kid;
 
         // Valid: verify HMAC + AEAD + provenance.
@@ -2489,7 +3261,11 @@ mod tests {
         let none_enrolled = |_: &[u8; 32]| false;
         let mut v2 = StreamVerifier::new(mac_key, topic.clone()).with_enc_key(enc_key);
         assert!(verify_moq_frame_with_provenance(
-            &mut v2, &topic, &frames[0], &empty, &none_enrolled
+            &mut v2,
+            &topic,
+            &frames[0],
+            &empty,
+            &none_enrolled
         )
         .is_err());
         Ok(())

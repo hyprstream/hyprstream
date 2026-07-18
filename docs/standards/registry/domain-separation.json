@@ -1,0 +1,104 @@
+{
+  "registry_version": 1,
+  "status": "local-pre-construction-registry",
+  "scope": "Local labels and transcript field contracts for draft-hyprstream-privacypass-pqhybrid-00. This is not an IANA, MOQT, or Privacy Pass codepoint registry and allocates no wire values.",
+  "canonicalization": {
+    "encoding": "construction-selected deterministic binary encoding; this registry does not yet select CBOR, Cap'n Proto, TLS presentation language, or another wire encoding",
+    "identifiers": "construction-selected representation and normalization; this registry only names logical identifier values and forbids implicit normalization",
+    "integers": "construction-selected representation and width; numeric minimum and maximum entries are semantic bounds only",
+    "octets": "construction-selected container representation; octet limits are pre-cryptographic resource ceilings, not a serialization choice",
+    "digest": "construction-selected algorithm, representation, and exact length; all are mandatory before production",
+    "boundary": "value_class describes pre-serialization semantics only; no entry in this registry selects a wire encoding, scalar serialization, normalization form, or codepoint"
+  },
+  "labels": [
+    {
+      "id": "hs-pp-pqhybrid/challenge/v1",
+      "purpose": "Binds a future issuance challenge to issuer, audience, accepted state, policy, and selected suite.",
+      "owner_issue": "#1060",
+      "status": "blocked-construction-selection",
+      "fields": ["issuer_id", "audience", "suite_id", "accepted_state_digest", "accepted_state_epoch", "policy_generation", "expiry", "challenge_nonce"]
+    },
+    {
+      "id": "hs-pp-pqhybrid/issuance/v1",
+      "purpose": "Separates an anonymous issuance transcript from redemption and token binding.",
+      "owner_issue": "#1060",
+      "status": "blocked-construction-selection",
+      "fields": ["challenge_digest", "issuance_request", "issuance_response"]
+    },
+    {
+      "id": "hs-pp-pqhybrid/redemption/v1",
+      "purpose": "Binds a one-use anonymous capability to its exact origin authorization context.",
+      "owner_issue": "#1061",
+      "status": "blocked-construction-selection",
+      "fields": ["issuer_id", "audience", "suite_id", "accepted_state_digest", "accepted_state_epoch", "policy_generation", "redemption_context", "token_nonce", "expiry"]
+    },
+    {
+      "id": "hs-pp-pqhybrid/binding/v1",
+      "purpose": "Binds a redemption to a fresh proof-of-possession and HyKEM recipient without naming a holder DID.",
+      "owner_issue": "#1061",
+      "status": "blocked-construction-selection",
+      "fields": ["redemption_digest", "carrier_profile", "session_transcript_digest", "operation", "resource_commitment", "pop_public_key", "hykem_recipient", "one_use_nonce"]
+    },
+    {
+      "id": "hs-pp-pqhybrid/unary/v1",
+      "purpose": "Binds anonymous authorization to canonical unary request and response-recipient fields.",
+      "owner_issue": "#1063",
+      "status": "specification-only",
+      "fields": ["binding_digest", "service", "method", "request_digest", "request_id", "request_nonce", "response_hykem_recipient"]
+    },
+    {
+      "id": "hs-pp-pqhybrid/moqt-control/v1",
+      "purpose": "Binds encrypted ordinary application control Objects to an outer MOQT session while preserving relay opacity.",
+      "owner_issue": "#726",
+      "status": "specification-only",
+      "fields": ["binding_digest", "moqt_session_transcript_digest", "operation", "namespace_commitment", "track_commitment", "group_or_epoch", "outer_admission_class"]
+    },
+    {
+      "id": "hs-pp-pqhybrid/key-release/v1",
+      "purpose": "Binds exact response, stream, or group key-package release to the verified capability and recipient.",
+      "owner_issue": "#554/#555/#726",
+      "status": "specification-only",
+      "fields": ["binding_digest", "release_kind", "resource_commitment", "track_or_group", "epoch", "direction", "recipient_key_id", "expiry"]
+    }
+  ],
+  "fields": {
+    "issuer_id": {"value_class": "identifier", "min_bytes": 1, "max_bytes": 512, "selection_requirement": "exact resolved accepted-current issuer identifier; construction selects representation"},
+    "audience": {"value_class": "identifier", "min_bytes": 1, "max_bytes": 512, "selection_requirement": "exact origin identifier; construction selects representation and no URL normalization is implicit"},
+    "suite_id": {"value_class": "identifier", "min_bytes": 1, "max_bytes": 64, "selection_requirement": "construction-selected reviewed suite name; unknown values reject"},
+    "accepted_state_digest": {"value_class": "opaque-octets", "min_bytes": 32, "max_bytes": 128, "selection_requirement": "algorithm, representation, and exact size selected by accepted-current state profile"},
+    "accepted_state_epoch": {"value_class": "nonnegative-integer", "minimum": 0, "maximum": 18446744073709551615, "selection_requirement": "construction selects representation"},
+    "policy_generation": {"value_class": "nonnegative-integer", "minimum": 0, "maximum": 18446744073709551615, "selection_requirement": "construction selects representation"},
+    "expiry": {"value_class": "nonnegative-integer", "minimum": 0, "maximum": 18446744073709551615, "selection_requirement": "semantic Unix seconds; construction selects representation and origin defines accepted clock skew"},
+    "challenge_nonce": {"value_class": "opaque-octets", "min_bytes": 16, "max_bytes": 64, "selection_requirement": "uniform random logical octet value; construction selects representation"},
+    "challenge_digest": {"value_class": "opaque-octets", "min_bytes": 32, "max_bytes": 128, "selection_requirement": "digest of the construction-selected challenge encoding"},
+    "issuance_request": {"value_class": "opaque-octets", "min_bytes": 1, "max_bytes": 65536, "selection_requirement": "construction-defined opaque request value and representation"},
+    "issuance_response": {"value_class": "opaque-octets", "min_bytes": 1, "max_bytes": 65536, "selection_requirement": "construction-defined opaque response value and representation"},
+    "redemption_context": {"value_class": "opaque-octets", "min_bytes": 16, "max_bytes": 256, "selection_requirement": "origin-generated opaque logical value; construction selects representation"},
+    "token_nonce": {"value_class": "opaque-octets", "min_bytes": 16, "max_bytes": 64, "selection_requirement": "one-use token identifier; construction selects representation and raw value is never logged"},
+    "redemption_digest": {"value_class": "opaque-octets", "min_bytes": 32, "max_bytes": 128, "selection_requirement": "digest of the construction-selected redemption encoding"},
+    "carrier_profile": {"value_class": "identifier", "min_bytes": 1, "max_bytes": 64, "selection_requirement": "one exact profile-vocabulary carrier value; construction selects representation"},
+    "session_transcript_digest": {"value_class": "opaque-octets", "min_bytes": 32, "max_bytes": 128, "selection_requirement": "digest of the carrier handshake/session transcript under the selected construction"},
+    "operation": {"value_class": "identifier", "min_bytes": 1, "max_bytes": 128, "selection_requirement": "exact construction-defined action identifier and representation"},
+    "resource_commitment": {"value_class": "opaque-octets", "min_bytes": 32, "max_bytes": 128, "selection_requirement": "commitment to the construction-selected resource/action encoding"},
+    "pop_public_key": {"value_class": "opaque-octets", "min_bytes": 32, "max_bytes": 8192, "selection_requirement": "construction-selected fresh one-use public key and representation"},
+    "hykem_recipient": {"value_class": "opaque-octets", "min_bytes": 32, "max_bytes": 16384, "selection_requirement": "accepted-current recipient material in construction-selected representation; no test-store fallback"},
+    "one_use_nonce": {"value_class": "opaque-octets", "min_bytes": 16, "max_bytes": 64, "selection_requirement": "fresh random logical octet value; construction selects representation"},
+    "binding_digest": {"value_class": "opaque-octets", "min_bytes": 32, "max_bytes": 128, "selection_requirement": "digest of the construction-selected binding encoding"},
+    "service": {"value_class": "identifier", "min_bytes": 1, "max_bytes": 256, "selection_requirement": "exact service identifier; construction selects representation"},
+    "method": {"value_class": "identifier", "min_bytes": 1, "max_bytes": 256, "selection_requirement": "exact method identifier; construction selects representation"},
+    "request_digest": {"value_class": "opaque-octets", "min_bytes": 32, "max_bytes": 128, "selection_requirement": "digest of construction-selected request bytes"},
+    "request_id": {"value_class": "nonnegative-integer", "minimum": 0, "maximum": 18446744073709551615, "selection_requirement": "construction selects representation"},
+    "request_nonce": {"value_class": "opaque-octets", "min_bytes": 16, "max_bytes": 64, "selection_requirement": "fresh logical nonce value; construction selects representation"},
+    "response_hykem_recipient": {"value_class": "opaque-octets", "min_bytes": 32, "max_bytes": 16384, "selection_requirement": "fresh response recipient material in construction-selected representation"},
+    "moqt_session_transcript_digest": {"value_class": "opaque-octets", "min_bytes": 32, "max_bytes": 128, "selection_requirement": "digest of the exact MOQT session transcript under the selected construction"},
+    "namespace_commitment": {"value_class": "opaque-octets", "min_bytes": 16, "max_bytes": 128, "selection_requirement": "construction-selected commitment to the namespace"},
+    "track_commitment": {"value_class": "opaque-octets", "min_bytes": 16, "max_bytes": 128, "selection_requirement": "construction-selected commitment to the track"},
+    "group_or_epoch": {"value_class": "nonnegative-integer", "minimum": 0, "maximum": 18446744073709551615, "selection_requirement": "construction selects representation"},
+    "outer_admission_class": {"value_class": "identifier", "min_bytes": 1, "max_bytes": 64, "selection_requirement": "exact coarse-admission result only; construction selects representation"},
+    "release_kind": {"value_class": "identifier", "min_bytes": 1, "max_bytes": 64, "selection_requirement": "one of unary-response, stream-epoch, or group-epoch; construction selects representation"},
+    "track_or_group": {"value_class": "opaque-octets", "min_bytes": 16, "max_bytes": 128, "selection_requirement": "construction-selected opaque identifier or commitment"},
+    "epoch": {"value_class": "nonnegative-integer", "minimum": 0, "maximum": 18446744073709551615, "selection_requirement": "construction selects representation"},
+    "direction": {"value_class": "identifier", "min_bytes": 1, "max_bytes": 32, "selection_requirement": "exact construction-defined direction identifier and representation"},
+    "recipient_key_id": {"value_class": "identifier", "min_bytes": 1, "max_bytes": 512, "selection_requirement": "exact accepted-current purpose-separated recipient key identifier; construction selects representation"}
+  }
+}
