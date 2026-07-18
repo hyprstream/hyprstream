@@ -1,5 +1,7 @@
 # Standards profile: PQ-hybrid anonymous authorization (pre-construction)
 
+> **Sibling profile:** [`resource-attestation.md`](resource-attestation.md) is the #1070 pre-construction profile for `draft-hyprstream-resource-attestation-00` (dual-attested resource ownership). It owns its own RFCXML, registries, vectors, and the `tools/check_resource_attestation.py` checker; it does not overlap this profile's Privacy Pass/MoQ sources.
+
 This directory is the reviewable #1059 documentation/tooling slice for #1058. It does **not** select a PQ anonymous primitive, define a Privacy Pass token type, allocate an IANA/MOQT/Privacy Pass codepoint, or claim IETF endorsement/adoption. Its RFCXML skeleton is a **pre-I-D work in progress** named `draft-hyprstream-privacypass-pqhybrid-00`.
 
 The generated text/HTML intentionally exercise xml2rfc's standard Internet-Draft boilerplate. The source has not been submitted, and the rendered boilerplate is not evidence of submission, adoption, endorsement, or an allocation.
