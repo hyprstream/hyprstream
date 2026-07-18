@@ -1338,21 +1338,18 @@ mod tests {
             "anchored Hybrid register must verify"
         );
 
-        // Not anchored: empty store under Hybrid falls back to the inner EdDSA
-        // classical floor (WNS per-identity) rather than failing closed. PQ is
-        // never trusted from the self-asserted COSE entry, so this is no weaker
-        // than the pre-existing classical `verify_any_signer` path.
+        // Not anchored: the mandatory Hybrid policy rejects the register even
+        // though its self-asserted composite is cryptographically well formed.
         let empty = KeyedPqTrustStore::new();
         let nonce_empty = InMemoryNonceCache::new();
         assert!(
             signed
                 .verify_any_signer_with(&nonce_empty, Some(&empty), CryptoPolicy::Hybrid)
-                .is_ok(),
-            "unanchored Hybrid register must verify via classical inner-EdDSA fallback"
+                .is_err(),
+            "unanchored Hybrid register must fail closed"
         );
 
-        // But a tampered/forged inner EdDSA on an unanchored signer is still
-        // rejected — the classical floor is a real signature check, not a bypass.
+        // A tampered/forged inner EdDSA is also rejected.
         let mut forged = signed.clone();
         forged.cnf = SigningKey::from_bytes(&[9u8; 32])
             .verifying_key()

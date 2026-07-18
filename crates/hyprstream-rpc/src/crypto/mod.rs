@@ -39,22 +39,21 @@ pub mod key_exchange;
 pub mod broadcast_primitives;
 pub mod signing;
 
-/// Runtime crypto mode selecting how envelopes/tokens are signed and verified.
+/// Policy-selected envelope/token signature suite.
 ///
 /// This REPLACES the old compile-time `pq-hybrid` cargo feature. PQ primitives
-/// (ML-DSA-65, ML-KEM-768) are always compiled; the policy chooses whether they
-/// are used at runtime.
+/// (ML-DSA-65, ML-KEM-768) are always compiled. Production exposes only the
+/// pinned hybrid suite: there is no runtime algorithm negotiation or downgrade.
 ///
 /// - `Hybrid` (default): sign with a COSE composite (EdDSA + ML-DSA-65) and
 ///   REQUIRE both components to verify.
-/// - `Classical`: sign with EdDSA only and accept EdDSA-only signatures. A
-///   `Classical` verifier still accepts a `Hybrid`-signed item via its EdDSA
-///   component (RFC 7517 skip-unknown interop).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CryptoPolicy {
-    /// EdDSA only (classical).
+    /// Test-only EdDSA mode for low-level compatibility fixtures. This variant
+    /// is absent from every production library build.
+    #[cfg(any(test, feature = "test-classical-policy"))]
     Classical,
-    /// EdDSA + ML-DSA-65 composite (post-quantum hybrid). Default.
+    /// Pinned EdDSA + ML-DSA-65 composite suite. Default and mandatory.
     #[default]
     Hybrid,
 }
@@ -62,7 +61,11 @@ pub enum CryptoPolicy {
 impl CryptoPolicy {
     /// Whether this policy emits/requires the post-quantum (ML-DSA-65) component.
     pub fn uses_pq(self) -> bool {
-        matches!(self, CryptoPolicy::Hybrid)
+        match self {
+            #[cfg(any(test, feature = "test-classical-policy"))]
+            CryptoPolicy::Classical => false,
+            CryptoPolicy::Hybrid => true,
+        }
     }
 }
 

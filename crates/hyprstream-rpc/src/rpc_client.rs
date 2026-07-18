@@ -583,7 +583,7 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
             pending,
             self.response_pq_store.as_deref(),
             self.response_verify_policy
-                .unwrap_or(crate::crypto::CryptoPolicy::Classical),
+                .unwrap_or(crate::crypto::CryptoPolicy::Hybrid),
         )
     }
 
@@ -721,12 +721,11 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
         let ed_pubkey = self.signer.pubkey();
         let signing_data: &[u8] = encrypted_envelope.as_deref().unwrap_or(&canonical);
 
-        if encrypted_envelope.is_some() && self.signer.pq_pubkey().is_none() {
-            anyhow::bail!(
-                "transport forbids cleartext envelopes but signer has no ML-DSA-65 \
-                 key; refusing to emit encrypted envelope without hybrid signature"
-            );
-        }
+        let pq_kid = self.signer.pq_pubkey().ok_or_else(|| {
+            anyhow::anyhow!(
+                "mandatory Hybrid suite requires an ML-DSA-65 signer key; refusing request"
+            )
+        })?;
 
         // Raw EdDSA signature (sig/cnf) retained for signer-pubkey advertisement
         // + the JWT cnf key-binding path.
@@ -742,42 +741,26 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
         // outer ML-DSA-65 layer over `canonical ‖ inner_eddsa_signature` so the
         // inner signature is bound into the outer (Strong-Non-Separable).
         //
-        // Hybrid iff the signer exposes an ML-DSA-65 key. In Hybrid mode the inner
-        // EdDSA layer binds the hybrid-composite alg-id into its AAD (#278), making
-        // it byte-distinct from a Classical inner layer.
-        let hybrid = self.signer.pq_pubkey().is_some();
+        // The inner EdDSA layer always binds the pinned hybrid-composite alg-id
+        // into its AAD (#278). There is no classical request construction path.
+        let hybrid = true;
         let ed_kid = ed_pubkey.to_vec();
         let ed_tbs =
             crate::crypto::cose_sign::inner_tbs(ed_kid.clone(), signing_data, &aad, hybrid);
         let ed_sig = self.signer.sign(&ed_tbs).await?.to_vec();
 
-        // Hybrid component when the signer exposes an ML-DSA-65 key.
-        let pq_entry = if let Some(pq_kid) = self.signer.pq_pubkey() {
-            let pq_tbs =
-                crate::crypto::cose_sign::outer_tbs(pq_kid.clone(), signing_data, &ed_sig, &aad);
-            // The inner EdDSA above was already bound to the hybrid-composite
-            // alg-id (`hybrid = pq_pubkey().is_some()`), so it cannot fall back to
-            // a classical inner. A signer that advertises a PQ key but declines to
-            // sign must therefore be a HARD ERROR, not a silent downgrade that
-            // would desync inner-AAD (hybrid) from outer-presence (none) and make
-            // the peer's inner verification fail (#278 review).
-            let pq_sig = self.signer.pq_sign(&pq_tbs).await?.ok_or_else(|| {
-                anyhow::anyhow!(
-                    "signer exposes a PQ public key but pq_sign() returned no \
-                         signature; refusing to emit a hybrid-bound inner without \
-                         its ML-DSA-65 outer (#278)"
-                )
-            })?;
-            Some((pq_kid, pq_sig))
-        } else {
-            None
-        };
-        let policy = if pq_entry.is_some() {
-            crate::crypto::CryptoPolicy::Hybrid
-        } else {
-            crate::crypto::CryptoPolicy::Classical
-        };
-        let cose = crate::crypto::cose_sign::assemble_composite_nested((ed_kid, ed_sig), pq_entry)?;
+        let pq_tbs =
+            crate::crypto::cose_sign::outer_tbs(pq_kid.clone(), signing_data, &ed_sig, &aad);
+        let pq_sig = self.signer.pq_sign(&pq_tbs).await?.ok_or_else(|| {
+            anyhow::anyhow!(
+                "signer exposes a PQ public key but pq_sign() returned no signature; \
+                 refusing to emit an incomplete mandatory Hybrid composite"
+            )
+        })?;
+        let cose = crate::crypto::cose_sign::assemble_composite_nested(
+            (ed_kid, ed_sig),
+            Some((pq_kid, pq_sig)),
+        )?;
 
         let signed = SignedEnvelope {
             envelope,
@@ -786,7 +769,7 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
             encrypted_envelope,
             client_ephemeral_public: None,
             cose,
-            policy,
+            policy: crate::crypto::CryptoPolicy::Hybrid,
             pq_kem_ciphertext: None,
         };
 

@@ -205,15 +205,17 @@ let verifying_key = signing_key.verifying_key();
 // verifiers resolve peer keys through the service trust store.
 ```
 
-## Hybrid (PQ/T) Signatures — WNS posture
+## Mandatory Hybrid (PQ/T) Signatures
 
 **Location:** `crates/hyprstream-rpc/src/crypto/cose_sign.rs`, `envelope.rs`
 
 Envelopes (request `SignedEnvelope` and response `ResponseEnvelope`) carry a nested
 COSE composite: an **inner EdDSA** `COSE_Sign1` and an **outer ML-DSA-65** (FIPS 204)
 `COSE_Sign1` over `payload ‖ inner_sig`. This is a **Weak Non-Separable (WNS)**
-construction in the IETF PQUIP taxonomy: the inner classical signature stays
-*independently verifiable by design*, enabling gradual PQ migration.
+construction in the IETF PQUIP taxonomy: the inner classical signature is
+structurally separable. Hyprstream's production policy nevertheless gives the
+two signature legs strict **AND semantics**: both must verify against anchored
+key material. Structural WNS is not an admission downgrade.
 
 ### Specs of record
 - **`draft-ietf-pquip-hybrid-signature-spectrums`** (PQUIP WG) — the SNS/WNS spectrum +
@@ -227,37 +229,30 @@ construction in the IETF PQUIP taxonomy: the inner classical signature stays
   (DID `#mesh-pq` Multikey).
 - PQUIP WG: <https://datatracker.ietf.org/wg/pquip/about/>
 
-### Verification rule (per-identity, NOT blanket fail-closed)
+### Verification rule — mandatory fail-closed hybrid
 ```rust
 // envelope.rs :: verify_cose (both SignedEnvelope and ResponseEnvelope)
-let anchored_pq = pq_store.and_then(|s| s.ml_dsa_key_for(&self.cnf));
-let require_pq = verify_policy.uses_pq() && anchored_pq.is_some();
+let anchored_pq = pq_store
+    .and_then(|store| store.ml_dsa_key_for(&self.cnf))
+    .ok_or("mandatory Hybrid suite requires an anchored ML-DSA-65 key")?;
+verify_composite(..., Some(&anchored_pq), ..., /* require_pq */ true)?;
 ```
-Enforce the ML-DSA-65 outer **only** for signer identities whose PQ key is anchored
-out-of-band (`KeyedPqTrustStore`, keyed by the signer's Ed25519 `cnf`). For an
-**unanchored** signer, fall back to the inner EdDSA (classical floor) rather than
-failing closed.
-
-This is safe because `ed_vk = VerifyingKey::from_bytes(&self.cnf)` — the PQ-lookup
-identity *is* the EdDSA-verified identity — and the response path constant-time-pins
-`cnf == expected_pubkey` when the server key is known:
+The ML-DSA-65 key is resolved only from an out-of-band `KeyedPqTrustStore`, keyed
+by the signer's Ed25519 `cnf`; it is never trusted from the COSE object. The
+response path also constant-time-pins `cnf == expected_pubkey` when the server
+key is known.
 
 | Signer state | Behavior | Guarantee |
 |---|---|---|
-| **anchored** | `require_pq = true` → outer enforced | un-downgradable Hybrid (a PQ adversary cannot forge ML-DSA) |
-| **unanchored** | classical inner-EdDSA floor | no weaker than the pre-PQ baseline |
+| **anchored, both signatures valid** | accept | exact pinned hybrid suite |
+| **unanchored or wrong anchor** | reject before payload use | no self-certification or classical floor |
+| **missing/invalid/reordered/duplicated outer** | reject | strict EdDSA + ML-DSA-65 AND semantics |
 
-> **Never** reintroduce blanket fail-closed Hybrid for unanchored peers: it rejected
-> all responses on a fresh install (empty `mesh_peers`), including a node verifying its
-> own in-process services. PQ is also **never** resolved from the self-asserted COSE
-> entry (that would reintroduce the self-cert weakness).
-
-### Rollout / known limitation
-The escape hatch `HYPRSTREAM_ENVELOPE_POLICY=classical` downgrades both directions in
-lock-step for staged rollout. In multi-process mode each service signs with its own
-Ed25519 key but only the node/OAuth `#mesh-pq` VM is published, so remote per-service
-identities verify at the classical floor until each service publishes/anchors its own
-`#mesh-pq` via DID resolution (tracked under #137 / #279).
+`CryptoPolicy::Classical` exists only in the `hyprstream-rpc` unit-test build for
+low-level compatibility fixtures. Production exposes one policy-selected pinned
+suite and reads no environment or in-band algorithm selector. A peer without the
+anchored ML-DSA signing key and anchored hybrid KEM recipient is not partially
+admitted; enrollment, construction, verification, or key release fails closed.
 
 ### DPoP keys are a separate keyspace from DID identity keys (#698 Decision D)
 
@@ -298,48 +293,47 @@ key; a DPoP proof key matching a registered key earns `PqHybrid` for that actor 
 
 ## Envelope Confidentiality
 
-**Location:** `crates/hyprstream-rpc/src/crypto/envelope_crypto.rs`, `envelope.rs`
+**Location:** `crates/hyprstream-rpc/src/crypto/cose_encrypt.rs`, `envelope.rs`
 
-Request envelopes support an optional **encrypted mode** (encrypt-then-sign). The
-serialized `RequestEnvelope` bytes are encrypted with **AES-256-GCM-SIV** and
-carried in `SignedEnvelope.encrypted_envelope`; the cleartext `envelope` field is
-unused on the wire in this mode.
+Network request and response envelopes use canonical COSE_Encrypt0 with
+AES-256-GCM-SIV. The recipient is an out-of-band anchored `#mesh-kem` key for the
+pinned `HyKemX25519MlKem768` suite; the encapsulated X25519 and ML-KEM-768
+components are carried in the protected COSE structure. The outer cleartext
+payload is empty. Missing recipients, missing either KEM contribution, unknown
+or substituted suite IDs, and cleartext on an untrusted carrier all fail before
+application dispatch or response use.
 
-Key agreement is X25519 static-ephemeral DH: the client generates an ephemeral
-X25519 keypair (`client_ephemeral_public`) and derives the AEAD key against the
-server's Ed25519 key converted to X25519 via the birational map
-(`to_montgomery()`), with the KDF context `hyprstream-envelope-v1`.
-
-Under the `Hybrid` crypto policy, encryption is a **hybrid KEM**: an ML-KEM-768
-encapsulation against the server's KEM key is combined with the X25519 secret,
-and the 1088-byte ciphertext travels in `SignedEnvelope.pq_kem_ciphertext`.
-`Hybrid` mode requires both the server ML-KEM key and an ML-DSA-65 signing key —
-it fails closed rather than silently downgrading.
-
-The signature (raw Ed25519 and the COSE composite) covers the encrypted
-signing-data:
+The mandatory hybrid signature covers the complete COSE_Encrypt0 bytes. Sealed
+responses additionally bind the retained request ID and expected service domain:
 
 ```
-signing_data = ciphertext ‖ client_ephemeral_public ‖ [pq_kem_ciphertext]
+request_signing_data  = canonical_cose_encrypt0
+response_signing_data = domain || request_id || service_domain || canonical_cose_encrypt0
 ```
 
-Constructors: `SignedEnvelope::new_signed_encrypted()` (classical) and
-`new_signed_encrypted_hybrid()` / `new_signed_encrypted_with_policy()` (hybrid).
+Constructors: `SignedEnvelope::new_signed_encrypted_mesh_kem()` for requests and
+`ResponseEnvelope::new_signed_encrypted()` for one-shot response recipients.
 
 ## Key Exchange
 
-**Location:** `crates/hyprstream-rpc/src/crypto/key_exchange.rs`
+**Location:** `crates/hyprstream-rpc/src/crypto/hybrid_kem.rs`,
+`crates/hyprstream-rpc/src/stream_epoch.rs`, and the legacy utility
+`crates/hyprstream-rpc/src/crypto/key_exchange.rs`
 
-Streaming responses use HMAC authentication instead of per-token Ed25519 signatures for performance. The HMAC key is derived from a Diffie-Hellman shared secret.
+Production identified streams derive authenticated-encryption, MAC, control, and
+ratchet keys from the pinned X25519 + ML-KEM-768 HyKEM suite. The older
+Ristretto255/P-256 helpers remain local cryptographic utilities and test/migration
+substrate; they are not valid network-suite negotiation outcomes.
 
 ### Supported Algorithms
 
-| Algorithm | Feature Flag | Description |
+| Suite / primitive | Selection | Description |
 |-----------|--------------|-------------|
-| Ristretto255 | Default | Prime-order group on Curve25519 |
-| ECDH P-256 | `fips` | NIST curve for FIPS 140-2 compliance |
+| `HyKemX25519MlKem768` | Mandatory production suite ID | X25519 + ML-KEM-768 combined with strict AND semantics |
+| Ristretto255 | Local utility / legacy migration | Prime-order group on Curve25519; never a production fallback |
+| ECDH P-256 | `fips` local utility | NIST curve helper; never substitutes for the mandatory application HyKEM suite |
 
-### Ristretto255 (Default)
+### Ristretto255 (local/legacy utility)
 
 Ristretto255 is preferred because it eliminates common DH vulnerabilities:
 
@@ -439,8 +433,7 @@ fn derive_stream_keys(...) -> Result<StreamKeys> {
 
 ### Identified hybrid stream epochs (#554)
 
-`stream_epoch.rs` defines the production cryptographic profile that replaces the
-legacy Ristretto bootstrap as individual stream producers migrate. The client
+`stream_epoch.rs` defines the production cryptographic profile. The client
 places a fresh, suite-complete `clientKemPublic` in the signed (and, on network
 carriers, sealed) request. The server accepts only the policy-pinned
 `HyKEM-X25519-MLKEM768` suite and returns its suite-identified component
@@ -464,16 +457,25 @@ epoch committed. The publisher resets the per-epoch sequence and MAC chain but
 never resets its MOQT Group counter, so a cached track/group/object identity is
 never republished with different ciphertext.
 
+The signed carrier policy has exactly two distinct values:
+`owned-hybrid-transport` and `standard-public-relay`. The selected value is bound
+into resolution/admission evidence, the HyKEM transcript, every epoch KDF, and
+Object AAD. A failed owned hybrid TLS/QUIC negotiation cannot select the public
+relay profile; public relay use must already be explicitly authorized. Classical
+transport is only an untrusted carrier and contributes no application assurance.
+
 The profile is carrier-neutral. Data, completion metadata, and error messages are
-all sealed before framing, so a standard MOQT relay forwards ordinary opaque
-Object bytes and receives neither the transcript nor traffic keys. Network key
-release is still a separate #726 authorization PEP; the generic
+all sealed before framing, so a stock MOQT relay forwards ordinary opaque Object
+bytes without understanding private Hyprstream metadata and receives neither the
+transcript nor traffic keys. Before CONNECT/key release/publication, public-relay
+mode requires an anchored hybrid recipient, both KEM contributions, accepted
+current state, endpoint proof, and the encrypted Object path. Network key release
+is still a separate #726 authorization PEP; the generic
 `StreamKeyReleaseGate`/`StreamKeyReleasePrincipal` seam does not implement or
 claim restricted-anonymous #1060-#1062 authorization.
 
-The legacy `from_dh` constructors remain during the dependency-safe migration and
-are not evidence that #554 or the later global #556 downgrade-removal ticket is
-closed.
+Legacy `from_dh` helpers are not reachable as an in-band downgrade from the
+identified production profile.
 
 ## Chained HMAC
 
@@ -777,7 +779,9 @@ for (chunk, mac) in chunks.iter().zip(macs.iter()) {
 | `crates/hyprstream-rpc/src/crypto/cose_sign.rs` | COSE composite (EdDSA + ML-DSA-65) sign/verify |
 | `crates/hyprstream-rpc/src/crypto/cose_sign1.rs` | COSE_Sign1 encoding + `external_aad` schema binding |
 | `crates/hyprstream-rpc/src/crypto/pq.rs` | Post-quantum primitives: ML-DSA-65, ML-KEM-768 |
-| `crates/hyprstream-rpc/src/crypto/envelope_crypto.rs` | Envelope encryption (X25519 DH + AES-256-GCM-SIV, hybrid ML-KEM) |
+| `crates/hyprstream-rpc/src/crypto/cose_encrypt.rs` | Canonical COSE_Encrypt0 sealing/opening |
+| `crates/hyprstream-rpc/src/crypto/hybrid_kem.rs` | Pinned X25519 + ML-KEM-768 HyKEM suite |
+| `crates/hyprstream-rpc/src/stream_epoch.rs` | Carrier-bound identified hybrid stream epochs |
 | `crates/hyprstream-rpc/src/crypto/key_exchange.rs` | Ristretto255/ECDH P-256 key exchange |
 | `crates/hyprstream-rpc/src/crypto/hmac.rs` | Chained HMAC for streaming |
 | `crates/hyprstream-rpc/src/crypto/group_key.rs` | Group-key wrapping for event confidentiality |

@@ -517,9 +517,8 @@ pub trait RequestService: 'static {
     fn signing_key(&self) -> SigningKey;
 
     /// ML-DSA-65 signing key for the post-quantum half of the response COSE
-    /// composite (#275). When `Some`, `process_request` signs the
-    /// `ResponseEnvelope` under the Hybrid policy (EdDSA + ML-DSA-65); when
-    /// `None` it signs Classical (EdDSA-only). The matching ML-DSA-65 public key
+    /// composite (#275). Returning `None` makes `process_request` fail closed
+    /// before dispatch; it never selects an EdDSA-only response. The matching ML-DSA-65 public key
     /// must be anchored in the client's PQ trust store for Hybrid verification
     /// to succeed (peer attestation).
     ///
@@ -531,10 +530,7 @@ pub trait RequestService: 'static {
     /// stores — Ed25519 signer pubkey → ML-DSA vk — is self-consistent, and the
     /// published `#mesh-pq` DID verification method equals this signing key.
     ///
-    /// Mirrors the request-side signing policy: the server emits the strongest
-    /// composite it has keys for; a Classical verifier still accepts it via the
-    /// inner EdDSA (skip-unknown interop). Override to return `None` to force
-    /// Classical-only responses.
+    /// Mirrors the request-side mandatory pinned suite.
     fn pq_signing_key(&self) -> Option<crate::crypto::pq::MlDsaSigningKey> {
         Some(crate::node_identity::derive_mesh_mldsa_key(
             &self.signing_key(),
@@ -593,8 +589,7 @@ pub trait RequestService: 'static {
     /// outright, independent of JWKS `kid_algs` hygiene. The default reads the
     /// process-global envelope verify config (Hybrid in production), so the
     /// per-call policy is test-isolated from sibling tests that mutate the
-    /// shared global — a mock/test service that needs EdDSA acceptance overrides
-    /// this to [`CryptoPolicy::Classical`].
+    /// shared global.
     fn jwt_verify_policy(&self) -> crate::crypto::CryptoPolicy {
         #[cfg(not(target_arch = "wasm32"))]
         {
@@ -602,7 +597,7 @@ pub trait RequestService: 'static {
         }
         #[cfg(target_arch = "wasm32")]
         {
-            crate::crypto::CryptoPolicy::Classical
+            crate::crypto::CryptoPolicy::Hybrid
         }
     }
 

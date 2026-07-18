@@ -407,7 +407,12 @@ async fn handle_stream<S>(
         }
         Err(e) => {
             tracing::warn!(error = ?e, "rpc-session: trusted-carrier processor error, sending stub error envelope");
-            build_error_envelope(&signing_key, None, &format!("processor error: {e}"))
+            let pq_signing_key = crate::node_identity::derive_mesh_mldsa_key(&signing_key);
+            build_error_envelope(
+                &signing_key,
+                &pq_signing_key,
+                &format!("processor error: {e}"),
+            )
         }
     };
 
@@ -431,27 +436,21 @@ async fn handle_stream<S>(
 /// the payload. Used when the processor itself fails — guarantees the client
 /// sees a parseable envelope rather than EOF.
 ///
-/// #275: emits a COSE composite. When `pq_signing_key` is `Some` the error
-/// envelope is Hybrid (EdDSA + ML-DSA-65); otherwise Classical (EdDSA-only).
-/// A Classical-only client still verifies it via the inner EdDSA (skip-unknown).
+/// #275: emits the mandatory Hybrid COSE composite. Callers must supply both
+/// signing components; this constructor has no classical fallback.
 pub fn build_error_envelope(
     signing_key: &SigningKey,
-    pq_signing_key: Option<&crate::crypto::pq::MlDsaSigningKey>,
+    pq_signing_key: &crate::crypto::pq::MlDsaSigningKey,
     message: &str,
 ) -> Bytes {
     use crate::ToCapnp;
     use capnp::{message::Builder, serialize};
-    let policy = if pq_signing_key.is_some() {
-        crate::crypto::CryptoPolicy::Hybrid
-    } else {
-        crate::crypto::CryptoPolicy::Classical
-    };
     let envelope = crate::envelope::ResponseEnvelope::new_signed_with_policy(
         0,
         message.as_bytes().to_vec(),
         signing_key,
-        pq_signing_key,
-        policy,
+        Some(pq_signing_key),
+        crate::crypto::CryptoPolicy::Hybrid,
     );
     let mut msg = Builder::new_default();
     {

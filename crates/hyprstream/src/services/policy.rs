@@ -120,13 +120,12 @@ impl PolicyService {
         self
     }
 
-    /// Sign a token, selecting the suite from [`CryptoPolicy`] (Fu3/#677).
+    /// Sign a token with the mandatory hybrid suite (Fu3/#677).
     ///
     /// The composite PQ signature (EdDSA + ML-DSA-65) is used under a Hybrid
-    /// policy; under Classical the Ed25519-only suite is used. **Hybrid fails
-    /// closed:** if the node is Hybrid but no ML-DSA-65 signing key is
-    /// provisioned, this returns `Err` rather than silently minting a
-    /// classical-only token — mirroring [`crate::mac::audit::CoseAuditSigner`],
+    /// policy. If no ML-DSA-65 signing key is provisioned, this returns `Err`
+    /// rather than silently minting a classical-only token — mirroring
+    /// [`crate::mac::audit::CoseAuditSigner`],
     /// which the S7 audit path already gates the same way. Previously this seam
     /// picked composite-vs-classical by *keystore state*, so a Hybrid node with
     /// an empty/rotating ML-DSA store quietly downgraded minted tokens.
@@ -135,34 +134,25 @@ impl PolicyService {
         claims: &hyprstream_rpc::auth::Claims,
         is_service: bool,
     ) -> Result<String> {
-        let policy = hyprstream_rpc::envelope::envelope_policy_from_env();
-        if policy.uses_pq() {
-            let snapshot = hyprstream_rpc::auth::global_composite_key_set()
-                .mint_snapshot()
-                .map_err(|error| anyhow!("composite authority unavailable: {error}"))?;
-            let signing = snapshot
-                .active_signing_pair(hyprstream_rpc::auth::CompositePairRole::Policy)
-                .and_then(hyprstream_rpc::auth::CompositeKeyPair::signing_keys);
-            let Some((ml_key, ed_key)) = signing else {
-                warn!("no authorized active Policy composite pair; refusing to mint");
-                return Err(anyhow!("hybrid token signing pair not provisioned"));
-            };
-            Ok(if is_service {
-                crate::auth::jwt::encode_composite_service_jwt(
-                    claims, &ml_key, &ed_key,
-                )
-            } else {
-                crate::auth::jwt::encode_composite_ml_dsa_65_ed25519(
-                    claims, &ml_key, &ed_key,
-                )
-            })
+        let snapshot = hyprstream_rpc::auth::global_composite_key_set()
+            .mint_snapshot()
+            .map_err(|error| anyhow!("composite authority unavailable: {error}"))?;
+        let signing = snapshot
+            .active_signing_pair(hyprstream_rpc::auth::CompositePairRole::Policy)
+            .and_then(hyprstream_rpc::auth::CompositeKeyPair::signing_keys);
+        let Some((ml_key, ed_key)) = signing else {
+            warn!("no authorized active Policy composite pair; refusing to mint");
+            return Err(anyhow!("hybrid token signing pair not provisioned"));
+        };
+        Ok(if is_service {
+            crate::auth::jwt::encode_composite_service_jwt(
+                claims, &ml_key, &ed_key,
+            )
         } else {
-            Ok(if is_service {
-                crate::auth::jwt::encode_service_jwt(claims, &self.jwt_signing_key)
-            } else {
-                crate::auth::jwt::encode(claims, &self.jwt_signing_key)
-            })
-        }
+            crate::auth::jwt::encode_composite_ml_dsa_65_ed25519(
+                claims, &ml_key, &ed_key,
+            )
+        })
     }
 
     /// Set the JWT key source for verifying JWTs (local and federated).
