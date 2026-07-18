@@ -35,17 +35,23 @@
 //! The HF `/get_xorb/{hash}/` route carries a *xorb hash* and **no `grantRepo`**,
 //! so it cannot be mapped onto the registry's `getBlob` (which is file-merkle +
 //! `grantRepo` and enforces per-repo entitlement — "the hash is not a
-//! capability"). #813 moves this route behind the Subject-threaded CAS mount so
-//! the policy boundary is the same `Mount` surface used by namespaces. The
-//! remaining work is attaching repo/compartment provenance labels to xorb objects
-//! so the mount can make a full AVC decision instead of the current authenticated
-//! floor.
+//! capability"). #813 moved this route behind the Subject-threaded CAS mount so
+//! the policy boundary is the same `Mount` surface used by namespaces, and
+//! #1094 made that boundary **enforcing**: the mount runs
+//! [`BootstrapCasAuthorizer`], where the day-one grant "any authenticated
+//! subject may read xorb X" is an explicit, audited policy object and
+//! everything else is default-deny — plane #1 of #1091's R4b
+//! compile-and-ratchet MAC rollout. The remaining work is attaching
+//! repo/compartment provenance labels to xorb objects (#699) and flowing
+//! subject clearances (#698) so grant breadth ratchets to 0 and the mount can
+//! make a full AVC decision; the ratchet path is documented on
+//! [`BootstrapCasAuthorizer`].
 
 use crate::config::{TlsConfig, XetConfig};
 use crate::server::AuthenticatedUser;
 use crate::server::tls::{resolve_rustls_config, serve_app};
 use crate::services::RegistryClient;
-use crate::storage::cas::{AllowAllCasAuthorizer, CasMount, CasSubstrate, DedupDomain};
+use crate::storage::cas::{BootstrapCasAuthorizer, CasMount, CasSubstrate, DedupDomain};
 use anyhow::Result;
 use axum::{
     Router,
@@ -73,7 +79,8 @@ pub const SERVICE_NAME: &str = "xet";
 pub struct XetState {
     /// L1 CAS substrate backing `/get_xorb` reads (shared with the registry's
     /// `getBlob` reconstruction path, #812). HTTP reads go through `CasMount`
-    /// so the authenticated Subject reaches the VFS policy boundary (#813).
+    /// so the authenticated Subject reaches the VFS policy boundary (#813),
+    /// enforced behind the #1094 bootstrap grant.
     pub store: CasSubstrate,
     /// Authenticated registry client — the write path (`/v1/xorbs`, `/v1/shards`)
     /// must translate through its `putBlob` RPC rather than writing directly.
@@ -212,7 +219,10 @@ async fn get_xorb_handler(
     let mount = CasMount::with_authorizer(
         state.store.clone(),
         DedupDomain::local_default(),
-        AllowAllCasAuthorizer,
+        // #1094 plane #1: enforcing authorizer behind the explicit day-one
+        // bootstrap grant ("any authenticated subject may read xorb X"),
+        // default-deny for everything else. Never AllowAll on this route.
+        BootstrapCasAuthorizer::new(),
     );
     let mut fid = match mount.walk(&["xorb", hash.as_str()], &subject).await {
         Ok(fid) => fid,
