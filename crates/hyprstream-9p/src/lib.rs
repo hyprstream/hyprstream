@@ -46,9 +46,11 @@ pub mod memory;
 // The browser/wasm build reaches the backend through the DMA/Wanix client path.
 #[cfg(not(target_arch = "wasm32"))]
 pub mod translator;
-// Attach-time MAC seam (#568): trait interface for verifying an attach
-// credential and authorizing per-op access, with inert (no-op) defaults.
-// Native-only alongside `translator`, its only consumer today.
+// 9P reference-monitor contract (S2 / #568): the attach-time token seam, the
+// per-op mediation composition (`ReferenceMonitor`), and fail-closed defaults.
+// Dormant groundwork — `Translator` runs without a monitor unless the
+// application installs one (activation is blocked on #698). Native-only
+// alongside `translator`, its only consumer today.
 #[cfg(not(target_arch = "wasm32"))]
 pub mod mac_seam;
 // `MountBackend` bridges a VFS `Mount` (+ `Subject`) to the `Backend` seam so
@@ -81,6 +83,7 @@ pub use translator::{
 };
 #[cfg(not(target_arch = "wasm32"))]
 pub use mac_seam::{
-    anonymous_floor, AccessDecider, Action, AllowAllDecider, AnonymousAuthenticator,
-    AttachAuthenticator, AuditSink, AuditedDecider, NullAuditSink,
+    anonymous_floor, AccessDecider, Action, AnonymousAuthenticator, AttachAuthenticator,
+    DenyAllDecider, DenyUnlabeledResolver, ObjectLabelResolver, ObjectRef, ReferenceMonitor,
+    SessionContext, VerifiedTokenScope,
 };

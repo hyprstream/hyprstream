@@ -34,12 +34,14 @@
 //! ## Stage 0: dormant, zero behavior change
 //!
 //! Nothing here flips a decider to enforcing. The composite resolver is
-//! constructed and testable, but the 9P PEP (`hyprstream-9p::mac_seam`) still
-//! defaults to [`AllowAllDecider`](hyprstream_9p::mac_seam::AllowAllDecider), so
-//! no request is allowed or denied differently than before this module existed.
-//! The value delivered now is the **coverage-gate evidence**: proof that a
-//! complete, well-formed genesis exists (or an explicit list of the gaps) so the
-//! activation decision has something to gate on.
+//! constructed and testable, but the 9P PEP (`hyprstream-9p::mac_seam`) stays
+//! dormant: no production [`Translator`](hyprstream_9p::Translator) has a
+//! [`ReferenceMonitor`](hyprstream_9p::mac_seam::ReferenceMonitor) installed,
+//! so no request is allowed or denied differently than before this module
+//! existed (activation is blocked on #698). The value delivered now is the
+//! **coverage-gate evidence**: proof that a complete, well-formed genesis
+//! exists (or an explicit list of the gaps) so the activation decision has
+//! something to gate on.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
