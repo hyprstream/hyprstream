@@ -2713,14 +2713,27 @@ fn main() -> Result<()> {
             let code_challenge = sub_m.get_one::<String>("code_challenge").cloned();
             let server = sub_m.get_one::<String>("server").cloned();
             let insecure = sub_m.get_flag("insecure");
+            // Pass the already-loaded config (honors `--config`) so the OAuth
+            // issuer URL and the local self-signed cert's secrets dir are
+            // resolved from the user's selected configuration, not re-derived
+            // from defaults (#450). `config_for_service` is the surviving
+            // clone (`config` itself is moved into AppContext above).
+            let sign_cfg = config_for_service.clone();
             with_runtime(
                 RuntimeConfig {
                     device: DeviceConfig::request_cpu(),
                     multi_threaded: false,
                 },
                 || async move {
-                    handle_sign_challenge(user_code, nonce, code_challenge, server, insecure)
-                        .await
+                    handle_sign_challenge(
+                        user_code,
+                        nonce,
+                        code_challenge,
+                        server,
+                        insecure,
+                        Some(&sign_cfg),
+                    )
+                    .await
                 },
             )?;
         }

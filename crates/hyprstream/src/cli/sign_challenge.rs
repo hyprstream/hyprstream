@@ -28,12 +28,18 @@ use ed25519_dalek::Signer;
 
 
 /// Handle `hyprstream sign-challenge [USER_CODE] [--nonce N] [--code-challenge CC]`
+///
+/// `config` is the already-loaded `HyprConfig` (honoring `--config`/env) so the
+/// OAuth issuer URL *and* the secrets directory holding the local self-signed
+/// cert are resolved from the user's selected configuration, not re-derived
+/// from defaults. `None` falls back to default config resolution.
 pub async fn handle_sign_challenge(
     user_code: Option<String>,
     nonce: Option<String>,
     code_challenge: Option<String>,
     server: Option<String>,
     insecure: bool,
+    config: Option<&crate::config::HyprConfig>,
 ) -> Result<()> {
     // Load user identity key from OS keyring
     let (signing_key, username) = load_user_signing_key()?;
@@ -41,7 +47,7 @@ pub async fn handle_sign_challenge(
     match (user_code, nonce, code_challenge) {
         // Device flow: sign-challenge ABCD-EFGH
         (Some(user_code), None, None) => {
-            handle_device_flow(signing_key, username, user_code, server, insecure).await
+            handle_device_flow(signing_key, username, user_code, server, insecure, config).await
         }
         // Auth code flow: sign-challenge --nonce N --code-challenge CC
         (None, Some(nonce), Some(code_challenge)) => {
@@ -78,14 +84,17 @@ async fn handle_device_flow(
     user_code: String,
     server: Option<String>,
     insecure: bool,
+    config: Option<&crate::config::HyprConfig>,
 ) -> Result<()> {
-    let base_url = resolve_server_url(server);
+    let base_url = resolve_server_url(server, config);
     let normalized = user_code.replace('-', "").to_uppercase();
 
     // Build an HTTP client that trusts the local self-signed dev cert by
     // default (Option B), or — when `--insecure` is passed — disables TLS
-    // verification entirely (Option A, opt-in with a warning).
-    let client = build_oauth_http_client(insecure)?;
+    // verification entirely (Option A, opt-in with a warning). Pass the
+    // loaded config so the cert is looked up in the --config-selected
+    // secrets directory, not a re-derived default location.
+    let client = build_oauth_http_client(insecure, config)?;
 
     let nonce_url = format!(
         "{}/oauth/device/nonce?user_code={}",
@@ -196,10 +205,20 @@ fn load_user_signing_key() -> Result<(ed25519_dalek::SigningKey, String)> {
     Ok((sk, username))
 }
 
-/// Resolve the OAuth server URL from the option or config/default.
-fn resolve_server_url(server: Option<String>) -> String {
+/// Resolve the OAuth server URL from the option or the loaded config.
+///
+/// `config` is the already-loaded configuration (honoring `--config`/env).
+/// We must NOT call `HyprConfig::load()` here: that re-derives the *default*
+/// config location and would ignore a user-supplied `--config`, so the
+/// issuer URL (and, downstream, the secrets dir for the local dev cert)
+/// would be read from the wrong place (#450). When `config` is `None` we
+/// fall back to a fresh default load for backward compatibility.
+fn resolve_server_url(server: Option<String>, config: Option<&crate::config::HyprConfig>) -> String {
     if let Some(s) = server {
         return s;
+    }
+    if let Some(c) = config {
+        return c.oauth.issuer_url();
     }
     crate::config::HyprConfig::load()
         .map(|c| c.oauth.issuer_url())
@@ -231,7 +250,10 @@ const LOCAL_TLS_CERT_SECRET: &str = "tls-cert";
 ///   the local dev cert is strictly additive. If the cert cannot be read
 ///   (e.g. the secrets directory does not exist yet, or the server uses a
 ///   real CA), we fall through to the system trust store.
-fn build_oauth_http_client(insecure: bool) -> Result<reqwest::Client> {
+fn build_oauth_http_client(
+    insecure: bool,
+    config: Option<&crate::config::HyprConfig>,
+) -> Result<reqwest::Client> {
     let mut builder = reqwest::Client::builder().timeout(std::time::Duration::from_secs(30));
 
     if insecure {
@@ -242,7 +264,7 @@ fn build_oauth_http_client(insecure: bool) -> Result<reqwest::Client> {
              Only use against a trusted local dev server."
         );
         builder = builder.danger_accept_invalid_certs(true);
-    } else if let Some(cert_der) = load_local_tls_cert() {
+    } else if let Some(cert_der) = load_local_tls_cert(config) {
         // Trust the project's own self-signed dev cert (stored as DER).
         // `from_pem` is backend-agnostic (works for both native-tls and
         // rustls reqwest backends), so convert DER → PEM here.
@@ -269,10 +291,15 @@ fn build_oauth_http_client(insecure: bool) -> Result<reqwest::Client> {
 /// Load the local self-signed TLS certificate (DER) from the shared secrets
 /// directory, if one is present.
 ///
+/// `config` is the already-loaded configuration (honoring `--config`/env) so
+/// the secrets directory is resolved consistently with wherever the OAuth
+/// server itself is reading from — `resolve_secrets_dir_for(config)`, NOT a
+/// default re-derivation that would miss a custom `--config`.
+///
 /// Returns `None` silently when the secrets directory or the cert is absent —
 /// callers fall back to the system trust store.
-fn load_local_tls_cert() -> Option<Vec<u8>> {
-    let secrets_dir = crate::config::HyprConfig::resolve_secrets_dir().ok()?;
+fn load_local_tls_cert(config: Option<&crate::config::HyprConfig>) -> Option<Vec<u8>> {
+    let secrets_dir = crate::config::HyprConfig::resolve_secrets_dir_for(config).ok()?;
     crate::auth::identity_store::read_secret(&secrets_dir, LOCAL_TLS_CERT_SECRET)
         .ok()
         .flatten()
