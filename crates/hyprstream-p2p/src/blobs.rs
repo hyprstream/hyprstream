@@ -6,25 +6,25 @@
 //! git-xet-filter and git2db:
 //!
 //! ```text
-//! put_object(Vec<u8>)      -> Sha256Hash
-//! get_object(&Sha256Hash)  -> Option<Vec<u8>>
+//! put_object(Vec<u8>)              -> Sha256Hash
+//! get_object(&Sha256Hash)          -> Option<Vec<u8>>
+//! put_object_by_cid(ContentCid, ..) -> ()
+//! get_object_by_cid(&ContentCid)    -> Option<Vec<u8>>
 //! ```
 //!
-//! # SHA256 ↔ BLAKE3 bridge
+//! # CID → BLAKE3 locator index
 //!
-//! iroh-blobs addresses content by BLAKE3, while the consumer contract is
-//! keyed by SHA256 (XET `MerkleHash` maps 1:1 onto `Sha256Hash`). Rather than
-//! re-keying the consumers, this module keeps the SHA256 facade and maintains
-//! a `sha256 → blake3` index at put time — the facade-preserving shape the
-//! epic ratified. The index is a *locator only*, never a trust root: bytes
-//! fetched through it are BLAKE3-verified by iroh-blobs on read and then
-//! re-verified here against the requested SHA256, so a corrupted or poisoned
-//! index entry can fail a lookup but can never serve wrong bytes.
+//! iroh-blobs addresses raw bytes by BLAKE3. Consumers address several domains:
+//! raw Git objects use SHA-256, while XET file reconstruction DAGs use a keyed
+//! BLAKE3 `MerkleHash`. Those are carried in a self-describing [`ContentCid`]
+//! and indexed to the raw iroh-blobs hash without collapsing algorithm or
+//! content-domain identity. SHA-256 methods remain compatibility wrappers that
+//! construct a `git-raw + sha2-256` CID.
 //!
 //! For the persistent (`FsStore`) backend the index is an append-only sidecar
-//! file (`sha256-blake3.index`, one `sha256hex blake3hex` line per object)
-//! loaded at open. Malformed or unverifiable lines are skipped with a warning
-//! (the object merely becomes unreachable via SHA256 until re-put).
+//! file (`sha256-blake3.index`, one `cid blake3hex` line per object) loaded at
+//! open. Legacy `sha256hex blake3hex` entries are upgraded in memory to a Git
+//! object CID. Malformed entries are skipped with a warning.
 //!
 //! # Scope
 //!
@@ -43,7 +43,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
 
 use crate::crypto::hash::{sha256_git, verify_sha256};
-use crate::{Error, Result, Sha256Hash};
+use crate::{ContentCid, Error, Result, Sha256Hash};
 
 /// Sidecar index file name (relative to the `FsStore` root).
 const INDEX_FILE: &str = "sha256-blake3.index";
@@ -62,13 +62,13 @@ impl Backend {
     }
 }
 
-/// Content-addressed object store backed by iroh-blobs, keyed by SHA256.
+/// Content-addressed object store backed by iroh-blobs, keyed by canonical CIDs.
 ///
-/// See the module docs for the SHA256 ↔ BLAKE3 bridging model.
+/// See the module docs for the CID → BLAKE3 locator model.
 pub struct IrohBlobStore {
     backend: Backend,
-    /// sha256 → blake3 mapping (locator only — reads re-verify SHA256).
-    index: Mutex<HashMap<Sha256Hash, Blake3Hash>>,
+    /// canonical content CID → raw-byte BLAKE3 mapping (locator only).
+    index: Mutex<HashMap<ContentCid, Blake3Hash>>,
     /// Append-only index persistence (fs backend only).
     index_path: Option<PathBuf>,
 }
@@ -86,7 +86,7 @@ impl IrohBlobStore {
     /// Open (or create) a persistent store rooted at `root`.
     ///
     /// Blob bytes live in the iroh-blobs `FsStore` under `root`; the
-    /// sha256→blake3 index is an append-only sidecar file next to it.
+    /// CID→blake3 index is an append-only sidecar file next to it.
     pub async fn open_fs(root: impl AsRef<Path>) -> Result<Self> {
         let root = root.as_ref();
         tokio::fs::create_dir_all(root).await?;
@@ -107,11 +107,12 @@ impl IrohBlobStore {
     /// Store an object, returning its SHA256 hash (the consumer-facing key).
     ///
     /// The bytes are added to the iroh-blobs store (BLAKE3-addressed, tagged
-    /// so garbage collection cannot reclaim them) and the sha256→blake3
+    /// so garbage collection cannot reclaim them) and the Git CID→blake3
     /// mapping is recorded.
     pub async fn put_object(&self, data: Vec<u8>) -> Result<Sha256Hash> {
         let sha256 = sha256_git(&data)?;
-        self.put_verified_object(sha256, data).await
+        self.put_verified_object(sha256.clone(), data).await?;
+        Ok(sha256)
     }
 
     /// Store bytes under an expected SHA256 key after re-verifying them.
@@ -130,6 +131,28 @@ impl IrohBlobStore {
             )));
         }
 
+        let cid = ContentCid::git_sha256(&expected_sha256)?;
+        self.put_object_by_cid(cid, data).await?;
+        Ok(expected_sha256)
+    }
+
+    /// Store bytes under an algorithm-preserving content CID.
+    ///
+    /// Raw Git SHA-256 CIDs are re-verified against the bytes here. An XET
+    /// Merkle CID addresses the reconstruction DAG rather than the raw file,
+    /// so its binding is established by the XET clean operation and the LFS
+    /// SHA-256 remains the end-to-end raw-file integrity check.
+    pub async fn put_object_by_cid(&self, cid: ContentCid, data: Vec<u8>) -> Result<()> {
+        verify_raw_cid_when_applicable(&cid, &data)?;
+        let raw_hash = Blake3Hash::new(&data);
+        if let Some(existing) = self.index.lock().await.get(&cid).copied() {
+            if existing != raw_hash {
+                return Err(Error::other(format!(
+                    "content CID {cid} is already bound to a different raw blob"
+                )));
+            }
+        }
+
         let tag = self
             .backend
             .store()
@@ -139,19 +162,24 @@ impl IrohBlobStore {
             .map_err(|e| Error::other(format!("iroh-blobs add failed: {e}")))?;
 
         let mut index = self.index.lock().await;
-        if index.insert(expected_sha256.clone(), tag.hash).is_none() {
-            if let Some(path) = &self.index_path {
-                append_index_entry(path, &expected_sha256, &tag.hash).await?;
+        match index.get(&cid) {
+            Some(existing) if *existing != tag.hash => {
+                return Err(Error::other(format!(
+                    "content CID {cid} is already bound to a different raw blob"
+                )));
+            }
+            Some(_) => {}
+            None => {
+                index.insert(cid.clone(), tag.hash);
+                if let Some(path) = &self.index_path {
+                    append_index_entry(path, &cid, &tag.hash).await?;
+                }
             }
         }
         drop(index);
 
-        tracing::debug!(
-            "stored object sha256={} blake3={}",
-            expected_sha256,
-            tag.hash
-        );
-        Ok(expected_sha256)
+        tracing::debug!(content_cid = %cid, blake3 = %tag.hash, "stored object");
+        Ok(())
     }
 
     /// Fetch an object by its SHA256 hash.
@@ -160,9 +188,15 @@ impl IrohBlobStore {
     /// index resolves but the retrieved bytes do not hash back to the
     /// requested SHA256 (poisoned/corrupt mapping — never served).
     pub async fn get_object(&self, hash: &Sha256Hash) -> Result<Option<Vec<u8>>> {
+        let cid = ContentCid::git_sha256(hash)?;
+        self.get_object_by_cid(&cid).await
+    }
+
+    /// Fetch an object by its self-describing content CID.
+    pub async fn get_object_by_cid(&self, cid: &ContentCid) -> Result<Option<Vec<u8>>> {
         let blake3 = {
             let index = self.index.lock().await;
-            match index.get(hash) {
+            match index.get(cid) {
                 Some(b3) => *b3,
                 None => return Ok(None),
             }
@@ -173,17 +207,13 @@ impl IrohBlobStore {
             Err(e) => {
                 // Index entry without a backing blob: unreachable object, not
                 // a hard error for a cache-shaped lookup API.
-                tracing::warn!("indexed blob {blake3} missing from store for sha256 {hash}: {e}");
+                tracing::warn!("indexed blob {blake3} missing from store for CID {cid}: {e}");
                 return Ok(None);
             }
         };
 
         let data = bytes.to_vec();
-        if !verify_sha256(&data, hash)? {
-            return Err(Error::other(format!(
-                "sha256 verification failed for object {hash} (index maps to blake3 {blake3})"
-            )));
-        }
+        verify_raw_cid_when_applicable(cid, &data)?;
         Ok(Some(data))
     }
 
@@ -192,15 +222,21 @@ impl IrohBlobStore {
     /// This is the seam F2 (#900) uses to announce/locate providers: the
     /// locator plane finds peers, iroh-blobs transfers by BLAKE3.
     pub async fn blake3_of(&self, hash: &Sha256Hash) -> Option<Blake3Hash> {
-        self.index.lock().await.get(hash).copied()
+        let cid = ContentCid::git_sha256(hash).ok()?;
+        self.blake3_of_cid(&cid).await
     }
 
-    /// Number of SHA256-addressable objects.
+    /// Resolve the raw-byte BLAKE3 hash backing a content CID, if known.
+    pub async fn blake3_of_cid(&self, cid: &ContentCid) -> Option<Blake3Hash> {
+        self.index.lock().await.get(cid).copied()
+    }
+
+    /// Number of CID-addressable objects.
     pub async fn len(&self) -> usize {
         self.index.lock().await.len()
     }
 
-    /// Whether the store has no SHA256-addressable objects.
+    /// Whether the store has no CID-addressable objects.
     pub async fn is_empty(&self) -> bool {
         self.index.lock().await.is_empty()
     }
@@ -220,7 +256,7 @@ impl IrohBlobStore {
 }
 
 /// Load the sidecar index, skipping (with a warning) any malformed lines.
-async fn load_index(path: &Path) -> Result<HashMap<Sha256Hash, Blake3Hash>> {
+async fn load_index(path: &Path) -> Result<HashMap<ContentCid, Blake3Hash>> {
     let mut index = HashMap::new();
     let contents = match tokio::fs::read_to_string(path).await {
         Ok(c) => c,
@@ -233,14 +269,20 @@ async fn load_index(path: &Path) -> Result<HashMap<Sha256Hash, Blake3Hash>> {
         if line.is_empty() {
             continue;
         }
-        let parsed = line.split_once(' ').and_then(|(sha_hex, b3_hex)| {
-            let sha = Sha256Hash::new(sha_hex).ok()?;
+        let parsed = line.split_once(' ').and_then(|(key, b3_hex)| {
+            let cid = ContentCid::new(key)
+                .or_else(|_| {
+                    // Backward compatibility for the original SHA256-only index.
+                    let sha = Sha256Hash::new(key)?;
+                    ContentCid::git_sha256(&sha)
+                })
+                .ok()?;
             let b3 = b3_hex.parse::<Blake3Hash>().ok()?;
-            Some((sha, b3))
+            Some((cid, b3))
         });
         match parsed {
-            Some((sha, b3)) => {
-                index.insert(sha, b3);
+            Some((cid, b3)) => {
+                index.insert(cid, b3);
             }
             None => {
                 tracing::warn!(
@@ -254,17 +296,38 @@ async fn load_index(path: &Path) -> Result<HashMap<Sha256Hash, Blake3Hash>> {
     Ok(index)
 }
 
-/// Append one `sha256hex blake3hex` line to the sidecar index.
-async fn append_index_entry(path: &Path, sha256: &Sha256Hash, blake3: &Blake3Hash) -> Result<()> {
+/// Append one `cid blake3hex` line to the sidecar index.
+async fn append_index_entry(path: &Path, cid: &ContentCid, blake3: &Blake3Hash) -> Result<()> {
     let mut file = tokio::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(path)
         .await?;
-    file.write_all(format!("{sha256} {blake3}\n").as_bytes())
+    file.write_all(format!("{cid} {blake3}\n").as_bytes())
         .await?;
     file.flush().await?;
     Ok(())
+}
+
+fn verify_raw_cid_when_applicable(cid: &ContentCid, data: &[u8]) -> Result<()> {
+    let decoded = cid.decoded()?;
+    use hyprstream_rpc::cid::{Codec, HashAlgo};
+
+    match (decoded.codec, decoded.multihash.algo) {
+        (Codec::GitRaw, HashAlgo::Sha2_256) => {
+            let expected = Sha256Hash::from_bytes(&decoded.multihash.digest)?;
+            if !verify_sha256(data, &expected)? {
+                return Err(Error::other(format!(
+                    "sha256 verification failed for Git object CID {cid}"
+                )));
+            }
+            Ok(())
+        }
+        (Codec::XetShard, HashAlgo::Blake3) if decoded.multihash.digest.len() == 32 => Ok(()),
+        (codec, algo) => Err(Error::other(format!(
+            "unsupported object CID domain: codec={codec:?}, algorithm={algo:?}"
+        ))),
+    }
 }
 
 #[cfg(test)]
@@ -336,6 +399,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_xet_cid_cannot_be_rebound_to_different_bytes() -> Result<()> {
+        let store = IrohBlobStore::new_memory();
+        let cid = ContentCid::xet_merkle(&[0x7b; 32])?;
+
+        store
+            .put_object_by_cid(cid.clone(), b"first reconstruction".to_vec())
+            .await?;
+        assert!(store
+            .put_object_by_cid(cid.clone(), b"different reconstruction".to_vec())
+            .await
+            .is_err());
+        assert_eq!(
+            store.get_object_by_cid(&cid).await?.as_deref(),
+            Some(b"first reconstruction".as_slice())
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_fs_persistence_across_reopen() -> Result<()> {
         let dir = TempDir::new()?;
         let data = b"persisted across reopen".to_vec();
@@ -370,21 +452,23 @@ mod tests {
             pair
         };
 
-        // Poison the sidecar: cross-wire a's sha256 to b's blake3.
+        // Poison the sidecar: cross-wire a's Git CID to b's blake3.
         let index_path = dir.path().join(INDEX_FILE);
         let contents = tokio::fs::read_to_string(&index_path).await?;
         let mut b3 = HashMap::new();
         for line in contents.lines() {
-            if let Some((sha, blake)) = line.split_once(' ') {
-                b3.insert(sha.to_owned(), blake.to_owned());
+            if let Some((cid, blake)) = line.split_once(' ') {
+                b3.insert(cid.to_owned(), blake.to_owned());
             }
         }
+        let cid_a = ContentCid::git_sha256(&sha_a)?;
+        let cid_b = ContentCid::git_sha256(&sha_b)?;
         let poisoned = format!(
             "{} {}\n{} {}\n",
-            sha_a,
-            b3[sha_b.as_str()],
-            sha_b,
-            b3[sha_a.as_str()]
+            cid_a,
+            b3[cid_b.as_str()],
+            cid_b,
+            b3[cid_a.as_str()]
         );
         tokio::fs::write(&index_path, poisoned).await?;
 

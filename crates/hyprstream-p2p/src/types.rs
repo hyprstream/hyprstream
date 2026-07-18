@@ -3,6 +3,65 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+/// Canonical CIDv1 envelope for an object-plane key.
+///
+/// The CID carries both the content domain (multicodec) and hash algorithm
+/// (multihash). Keeping the complete envelope at crate boundaries prevents
+/// equal-width digests such as an XET MerkleHash and SHA-256 from being
+/// silently reinterpreted as one another.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ContentCid(String);
+
+impl ContentCid {
+    /// Parse and validate a canonical CID understood by hyprstream.
+    pub fn new(cid: impl Into<String>) -> crate::Result<Self> {
+        let cid = cid.into();
+        hyprstream_rpc::cid::decode_cid(&cid)
+            .map_err(|e| crate::Error::other(format!("invalid content CID: {e}")))?;
+        Ok(Self(cid))
+    }
+
+    /// Address a raw Git object by its SHA-256 digest.
+    pub fn git_sha256(hash: &Sha256Hash) -> crate::Result<Self> {
+        let digest = hash.to_bytes();
+        let cid = hyprstream_rpc::cid::encode_cid(
+            hyprstream_rpc::cid::Codec::GitRaw,
+            hyprstream_rpc::cid::HashAlgo::Sha2_256,
+            &digest,
+        )
+        .map_err(|e| crate::Error::other(format!("failed to encode Git object CID: {e}")))?;
+        Ok(Self(cid))
+    }
+
+    /// Address a XET file reconstruction DAG by its real keyed-BLAKE3 Merkle hash.
+    pub fn xet_merkle(hash: &[u8]) -> crate::Result<Self> {
+        let cid = hyprstream_rpc::cid::encode_cid(
+            hyprstream_rpc::cid::Codec::XetShard,
+            hyprstream_rpc::cid::HashAlgo::Blake3,
+            hash,
+        )
+        .map_err(|e| crate::Error::other(format!("failed to encode XET Merkle CID: {e}")))?;
+        Ok(Self(cid))
+    }
+
+    /// Return the canonical CID text used for persistence and rendezvous derivation.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub(crate) fn decoded(&self) -> crate::Result<hyprstream_rpc::cid::Cid> {
+        hyprstream_rpc::cid::decode_cid(&self.0)
+            .map_err(|e| crate::Error::other(format!("invalid stored content CID: {e}")))
+    }
+}
+
+impl std::fmt::Display for ContentCid {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 /// Fixed-width domain prefixes for DHT key derivation (4 bytes each)
 /// These ensure SHA1 and SHA256 git objects are stored in separate DHT keyspaces
 const DOMAIN_SHA1: &[u8; 4] = b"sha1";
@@ -181,7 +240,6 @@ impl MutableKey {
     }
 }
 
-
 /// A Git SHA256 hash (64 hex characters)
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Sha256Hash(pub String);
@@ -199,7 +257,10 @@ impl Sha256Hash {
     /// Create from bytes
     pub fn from_bytes(bytes: &[u8]) -> crate::Result<Self> {
         if bytes.len() != 32 {
-            return Err(crate::Error::InvalidSha256(format!("Expected 32 bytes, got {}", bytes.len())));
+            return Err(crate::Error::InvalidSha256(format!(
+                "Expected 32 bytes, got {}",
+                bytes.len()
+            )));
         }
         Ok(Sha256Hash(hex::encode(bytes)))
     }
@@ -241,8 +302,6 @@ pub struct GitRefs {
     /// Creation timestamp
     pub created_at: u64,
 }
-
-
 
 /// GitTorrent URL variants
 #[derive(Debug, Clone)]
@@ -306,7 +365,6 @@ impl GitTorrentUrl {
         }
     }
 
-
     /// Get the commit hash if this is a commit-based URL
     pub fn commit_hash(&self) -> Option<&Sha256Hash> {
         match self {
@@ -345,35 +403,75 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_content_cid_preserves_xet_merkle_domain() -> crate::Result<()> {
+        let digest = [0x42; 32];
+        let merkle = ContentCid::xet_merkle(&digest)?;
+        let git = ContentCid::git_sha256(&Sha256Hash::from_bytes(&digest)?)?;
+
+        let decoded = merkle.decoded()?;
+        assert_eq!(decoded.codec, hyprstream_rpc::cid::Codec::XetShard);
+        assert_eq!(
+            decoded.multihash.algo,
+            hyprstream_rpc::cid::HashAlgo::Blake3
+        );
+        assert_eq!(decoded.multihash.digest, digest);
+        assert_ne!(
+            merkle, git,
+            "equal-width digest bytes in different domains must not alias"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn test_sha256_creation() -> crate::error::Result<()> {
-        let sha256 = Sha256Hash::new("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")?;
-        assert_eq!(sha256.as_str(), "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef");
+        let sha256 =
+            Sha256Hash::new("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")?;
+        assert_eq!(
+            sha256.as_str(),
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        );
         Ok(())
     }
 
     #[test]
     fn test_invalid_sha256() {
         assert!(Sha256Hash::new("invalid").is_err());
-        assert!(Sha256Hash::new("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdeg").is_err()); // invalid char
-        assert!(Sha256Hash::new("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcde").is_err()); // too short
+        assert!(Sha256Hash::new(
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdeg"
+        )
+        .is_err()); // invalid char
+        assert!(
+            Sha256Hash::new("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcde")
+                .is_err()
+        ); // too short
     }
 
     #[test]
     fn test_gittorrent_url_parsing() -> crate::error::Result<()> {
         // Test commit hash URL (new format)
-        let url = GitTorrentUrl::parse("gittorrent://0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")?;
+        let url = GitTorrentUrl::parse(
+            "gittorrent://0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        )?;
         match url {
             GitTorrentUrl::Commit { hash } => {
-                assert_eq!(hash.as_str(), "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef");
+                assert_eq!(
+                    hash.as_str(),
+                    "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                );
             }
             _ => panic!("Expected Commit variant"),
         }
 
         // Test commit hash with refs URL
-        let url = GitTorrentUrl::parse("gittorrent://0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef?refs")?;
+        let url = GitTorrentUrl::parse(
+            "gittorrent://0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef?refs",
+        )?;
         match url {
             GitTorrentUrl::CommitWithRefs { hash } => {
-                assert_eq!(hash.as_str(), "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef");
+                assert_eq!(
+                    hash.as_str(),
+                    "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                );
             }
             _ => panic!("Expected CommitWithRefs variant"),
         }
@@ -444,11 +542,15 @@ mod tests {
         // Too short
         assert!(GitHash::from_hex("0123456789").is_err());
         // Too long
-        assert!(GitHash::from_hex("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef00").is_err());
+        assert!(GitHash::from_hex(
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef00"
+        )
+        .is_err());
         // Invalid hex chars
         assert!(GitHash::from_hex("ghijklmnopqrstuvwxyz0123456789abcdef01234567").is_err());
         // Wrong length (not 40 or 64)
-        assert!(GitHash::from_hex("0123456789abcdef0123456789abcdef012345678").is_err()); // 41 chars
+        assert!(GitHash::from_hex("0123456789abcdef0123456789abcdef012345678").is_err());
+        // 41 chars
     }
 
     #[test]
@@ -503,5 +605,4 @@ mod tests {
         assert!(sha1.is_sha1());
         assert!(sha256.is_sha256());
     }
-
 }
