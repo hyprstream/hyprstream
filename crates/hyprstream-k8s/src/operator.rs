@@ -34,6 +34,7 @@ const MODEL_KIND: &str = "Model";
 const ADAPTER_KIND: &str = "Adapter";
 const TRAINING_RUN_KIND: &str = "TrainingRun";
 const INFERENCE_SERVICE_KIND: &str = "InferenceService";
+const TENANT_BINDING_KIND: &str = "TenantBinding";
 const TRAINING_RUN_FINALIZER: &str = "training.hyprstream.io/finalizer";
 const SERVING_APP_LABEL: &str = "hyprstream.io/serving-app";
 
@@ -245,6 +246,19 @@ pub struct OperatorState<R> {
     rpc: Arc<R>,
     config: OperatorConfig,
     tenant_bindings: TenantBindingCache,
+    /// The operator's tenant-grant issuer key (#929). `None` = the
+    /// `TenantBinding` controller compiles no grants (bindings stay the pure
+    /// namespace↔tenant map). Set by [`OperatorState::with_grant_issuer`] when
+    /// the `grant` feature is enabled and the operator was given issuer key
+    /// material at startup.
+    #[cfg(feature = "grant")]
+    tenant_grant_issuer: Option<Arc<crate::grant::TenantGrantIssuer>>,
+    /// Monotonic allocation-epoch counter for compiled grants (#929). Revocation
+    /// = stop renewing + bump the epoch; enforcers honor the epoch, never an
+    /// unbounded bearer token (#921). Seeded at startup; a future renewal layer
+    /// (S6 ZSP, #921 gap 2) owns *when* it bumps.
+    #[cfg(feature = "grant")]
+    grant_epoch: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl<R> OperatorState<R>
@@ -257,7 +271,24 @@ where
             rpc,
             config,
             tenant_bindings: TenantBindingCache::default(),
+            #[cfg(feature = "grant")]
+            tenant_grant_issuer: None,
+            #[cfg(feature = "grant")]
+            grant_epoch: Arc::new(std::sync::atomic::AtomicU64::new(1)),
         }
+    }
+
+    /// Set the operator's tenant-grant issuer (#929), enabling the
+    /// `TenantBinding` → grant compilation controller. `None` disables grant
+    /// compilation (the default); bindings reconcile to the no-grant `Bound`
+    /// status only. Only available with the `grant` feature.
+    #[cfg(feature = "grant")]
+    pub fn with_grant_issuer(
+        mut self,
+        issuer: Option<Arc<crate::grant::TenantGrantIssuer>>,
+    ) -> Self {
+        self.tenant_grant_issuer = issuer;
+        self
     }
 }
 
@@ -301,6 +332,24 @@ where
     R: HyprstreamOperatorRpc,
 {
     let state = Arc::new(OperatorState::new(client.clone(), rpc, config));
+
+    // When grant compilation is enabled, the `TenantBinding` controller runs as
+    // a detached background task alongside the model/serving controllers: it
+    // compiles entitlements into issuer-signed grants and reflects the compiled
+    // CIDs into status (#929). Detaching it (rather than `tokio::select!`-ing
+    // it in) avoids a `#[cfg]`-gated `select!` branch, which the macro cannot
+    // parse; its errors surface through tracing.
+    #[cfg(feature = "grant")]
+    {
+        let tb_client = client.clone();
+        let tb_state = Arc::clone(&state);
+        tokio::spawn(async move {
+            if let Err(error) = run_tenant_binding_controller(tb_client, tb_state).await {
+                tracing::warn!(%error, "tenantbinding controller exited");
+            }
+        });
+    }
+
     let models = run_model_controller(client.clone(), Arc::clone(&state));
     let adapters = run_adapter_controller(client.clone(), Arc::clone(&state));
     let training_runs = run_training_run_controller(client.clone(), Arc::clone(&state));
@@ -421,6 +470,137 @@ where
     })
     .await;
     Ok(())
+}
+
+// ── TenantBinding → grant compilation (#929) ─────────────────────────────────
+//
+// Only compiled when both `k8s` (controller runtime) and `grant` (the
+// compiler) features are on. The controller watches `TenantBinding` objects;
+// for each, it compiles the spec's `entitlement` into an issuer-signed grant
+// (the operator signs as issuer) and records the compiled grant/allocation CIDs
+// + epoch into `status`. The physical PDS publish of the allocation record into
+// the tenant's inventory is the deferred plumbing (#910); this controller mints
+// the grant and reflects the result as observed truth.
+
+#[cfg(feature = "grant")]
+pub async fn run_tenant_binding_controller<R>(
+    client: Client,
+    state: Arc<OperatorState<R>>,
+) -> Result<(), OperatorError>
+where
+    R: HyprstreamOperatorRpc,
+{
+    Controller::new(
+        Api::<TenantBinding>::all(client),
+        watcher::Config::default(),
+    )
+    .run(
+        reconcile_tenant_binding,
+        tenant_binding_error_policy::<R>,
+        state,
+    )
+    .for_each(|result| async move {
+        if let Err(error) = result {
+            tracing::warn!(%error, "tenantbinding reconcile failed");
+        }
+    })
+    .await;
+    Ok(())
+}
+
+#[cfg(feature = "grant")]
+async fn reconcile_tenant_binding<R>(
+    binding: Arc<TenantBinding>,
+    state: Arc<OperatorState<R>>,
+) -> Result<Action, OperatorError>
+where
+    R: HyprstreamOperatorRpc,
+{
+    use std::sync::atomic::Ordering;
+
+    // No issuer configured ⇒ grant compilation is disabled. Reflect a no-grant
+    // Bound status only when the status is stale, so the controller does not
+    // hot-loop an apiserver that has nothing to write.
+    let Some(issuer) = state.tenant_grant_issuer.clone() else {
+        if tenant_binding_status_observed_current(binding.as_ref()) {
+            return Ok(Action::requeue(state.config.requeue));
+        }
+        let status = crate::grant::compile_tenant_binding_status(
+            binding.as_ref(),
+            None,
+            0,
+            crate::grant::now_unix(),
+        );
+        patch_tenant_binding_status(&state.client, binding.as_ref(), status).await?;
+        return Ok(Action::requeue(state.config.requeue));
+    };
+
+    // Idempotent: skip when status already reflects this generation.
+    if tenant_binding_status_observed_current(binding.as_ref())
+        && binding
+            .status
+            .as_ref()
+            .and_then(|s| s.grant_cid.as_ref())
+            .is_some()
+            == binding.spec.entitlement.is_some()
+    {
+        return Ok(Action::requeue(state.config.requeue));
+    }
+
+    let epoch = state.grant_epoch.load(Ordering::Relaxed);
+    let now = crate::grant::now_unix();
+    let status = crate::grant::compile_tenant_binding_status(
+        binding.as_ref(),
+        Some(issuer.as_ref()),
+        epoch,
+        now,
+    );
+    patch_tenant_binding_status(&state.client, binding.as_ref(), status).await?;
+    Ok(Action::requeue(state.config.requeue))
+}
+
+#[cfg(feature = "grant")]
+fn tenant_binding_error_policy<R>(
+    _binding: Arc<TenantBinding>,
+    _error: &OperatorError,
+    state: Arc<OperatorState<R>>,
+) -> Action
+where
+    R: HyprstreamOperatorRpc,
+{
+    Action::requeue(state.config.requeue)
+}
+
+#[cfg(feature = "grant")]
+fn tenant_binding_status_observed_current(binding: &TenantBinding) -> bool {
+    binding
+        .status
+        .as_ref()
+        .and_then(|status| status.observed_generation)
+        == binding.meta().generation
+}
+
+#[cfg(feature = "grant")]
+async fn patch_tenant_binding_status(
+    client: &Client,
+    binding: &TenantBinding,
+    status: crate::mesh::TenantBindingStatus,
+) -> Result<TenantBinding, kube::Error> {
+    // TenantBinding is cluster-scoped, so the status patch goes to the
+    // all-namespaces Api rather than a namespaced one.
+    let api: Api<TenantBinding> = Api::all(client.clone());
+    let patch = json!({
+        "apiVersion": format!("mesh.hyprstream.io/{API_VERSION}"),
+        "kind": TENANT_BINDING_KIND,
+        "metadata": { "name": binding.name_any() },
+        "status": status,
+    });
+    api.patch_status(
+        &binding.name_any(),
+        &PatchParams::apply(OPERATOR_FIELD_MANAGER).force(),
+        &Patch::Apply(&patch),
+    )
+    .await
 }
 
 async fn reconcile_model<R>(
@@ -1720,6 +1900,7 @@ mod tests {
             TenantBindingSpec {
                 namespace: "team-a".to_owned(),
                 tenant: "did:web:tenant-a".to_owned(),
+                entitlement: None,
             },
         );
         let second = TenantBinding::new(
@@ -1727,6 +1908,7 @@ mod tests {
             TenantBindingSpec {
                 namespace: "team-a".to_owned(),
                 tenant: "did:web:tenant-b".to_owned(),
+                entitlement: None,
             },
         );
 
@@ -1747,6 +1929,7 @@ mod tests {
             TenantBindingSpec {
                 namespace: "team-a".to_owned(),
                 tenant: "did:web:tenant-a".to_owned(),
+                entitlement: None,
             },
         );
 
