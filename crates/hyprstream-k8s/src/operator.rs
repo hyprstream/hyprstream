@@ -325,8 +325,10 @@ pub enum OperatorError {
 /// Run Model, Adapter, TrainingRun, and InferenceService controllers until Ctrl-C.
 ///
 /// With the `grant` feature, this runs the `TenantBinding` controller too, but
-/// with no issuer configured: bindings reconcile to the no-grant status only.
-/// Use [`run_operator_with_grant_issuer`] to enable grant compilation (#929).
+/// with no issuer configured: bindings without an entitlement reconcile to the
+/// no-grant `Bound` status, and an authored entitlement is `Rejected` (no
+/// issuer to sign it). Use [`run_operator_with_grant_issuer`] to enable grant
+/// compilation (#929).
 pub async fn run_operator<R>(
     client: Client,
     rpc: Arc<R>,
