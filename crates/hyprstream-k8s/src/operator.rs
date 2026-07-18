@@ -535,19 +535,21 @@ where
         return Ok(Action::requeue(state.config.requeue));
     };
 
-    // Idempotent: skip when status already reflects this generation.
-    if tenant_binding_status_observed_current(binding.as_ref())
-        && binding
-            .status
-            .as_ref()
-            .and_then(|s| s.grant_cid.as_ref())
-            .is_some()
-            == binding.spec.entitlement.is_some()
-    {
+    // Load the revocation epoch BEFORE the idempotency check. The epoch is the
+    // revocation handle (#921): bumping it (e.g. operator-wide reissue) must
+    // recompile the grant even when the CRD `generation` is unchanged. Skipping
+    // before reading the epoch would silently drop a revocation, so the epoch
+    // match is the load-bearing part of the short-circuit below.
+    let epoch = state.grant_epoch.load(Ordering::Relaxed);
+
+    // Idempotent: skip only when the recorded status already reflects this CRD
+    // generation AND a grant compiled at the *current* epoch is present (both
+    // CIDs). For a binding with no entitlement, "current" means a no-grant
+    // status (epoch is irrelevant — no grant exists to revoke).
+    if tenant_binding_status_up_to_date(binding.as_ref(), epoch) {
         return Ok(Action::requeue(state.config.requeue));
     }
 
-    let epoch = state.grant_epoch.load(Ordering::Relaxed);
     let now = crate::grant::now_unix();
     let status = crate::grant::compile_tenant_binding_status(
         binding.as_ref(),
@@ -578,6 +580,39 @@ fn tenant_binding_status_observed_current(binding: &TenantBinding) -> bool {
         .as_ref()
         .and_then(|status| status.observed_generation)
         == binding.meta().generation
+}
+
+/// Whether a `TenantBinding`'s status is current enough to skip a reconcile at
+/// `epoch` (#929).
+///
+/// Two cases:
+/// - **Entitlement present** — the recorded grant must be compiled at the
+///   *current* epoch (`status.epoch == Some(epoch)`), with **both** compiled
+///   CIDs present, and the observed generation must match. A bumped epoch
+///   (revocation) or an edited entitlement (generation change) forces a
+///   recompile. The epoch match is load-bearing: it is what makes a
+///   revocation reissue the grant even when the CRD generation is unchanged.
+/// - **No entitlement** — "current" is a no-grant status (`grant_cid` is
+///   absent) at the observed generation; the epoch is irrelevant because no
+///   grant exists to revoke.
+///
+/// No status yet ⇒ not current (must reconcile).
+#[cfg(feature = "grant")]
+fn tenant_binding_status_up_to_date(binding: &TenantBinding, epoch: u64) -> bool {
+    let Some(status) = binding.status.as_ref() else {
+        return false;
+    };
+    if !tenant_binding_status_observed_current(binding) {
+        return false;
+    }
+    match binding.spec.entitlement.as_ref() {
+        Some(_) => {
+            status.epoch == Some(epoch)
+                && status.grant_cid.as_ref().is_some()
+                && status.allocation_cid.as_ref().is_some()
+        }
+        None => status.grant_cid.as_ref().is_none(),
+    }
 }
 
 #[cfg(feature = "grant")]
@@ -1772,7 +1807,7 @@ mod tests {
     use super::*;
     use crate::{
         AdapterSpec, InferenceServiceSpec, ModelSpec, ModelStage, TenantBindingSpec,
-        TrainingRunSpec,
+        TenantEntitlement, TenantGrantClass, TrainingRunSpec,
     };
 
     #[test]
@@ -2413,6 +2448,116 @@ mod tests {
                 &json!("HorizontalPodAutoscaler"),
                 &json!("ScaledObject"),
             ]
+        );
+    }
+
+    // ── TenantBinding → grant idempotency (#929, CodeRabbit revocation fix) ──
+
+    /// Build a TenantBinding whose status claims a grant compiled at `epoch`.
+    #[cfg(feature = "grant")]
+    fn bound_with_grant(observed_generation: Option<i64>, epoch: Option<u64>) -> TenantBinding {
+        let mut binding = TenantBinding::new(
+            "tb",
+            TenantBindingSpec {
+                namespace: "acme".to_owned(),
+                tenant: "did:web:acme".to_owned(),
+                entitlement: Some(TenantEntitlement {
+                    unit: "compute-second".to_owned(),
+                    amount: 100,
+                    class: TenantGrantClass::Underwritten,
+                    expiration: None,
+                }),
+            },
+        );
+        binding.status = Some(crate::mesh::TenantBindingStatus {
+            bound: Some(true),
+            phase: Some("Bound".to_owned()),
+            message: None,
+            observed_generation,
+            grant_cid: Some("bafyreibafyreibafyreibafyreibafyre".to_owned()),
+            allocation_cid: Some("bafyreibafyreibafyreibafyreibafyre".to_owned()),
+            epoch,
+        });
+        // meta().generation defaults to None on a ::new binding; align it with
+        // observed_generation so the observed-current check is exercisable.
+        binding.meta_mut().generation = observed_generation;
+        binding
+    }
+
+    /// A status compiled at the current epoch, with both CIDs present and the
+    /// generation observed, is up to date — no recompile needed.
+    #[cfg(feature = "grant")]
+    #[test]
+    fn grant_status_current_epoch_is_up_to_date() {
+        let binding = bound_with_grant(Some(3), Some(7));
+        assert!(
+            tenant_binding_status_up_to_date(&binding, 7),
+            "status at the current epoch with both CIDs must skip reconcile"
+        );
+    }
+
+    /// The load-bearing revocation case: bumping the epoch (revocation) MUST
+    /// invalidate the status even though the CRD generation is unchanged, so the
+    /// grant is recompiled at the new epoch. This is the exact regression
+    /// CodeRabbit flagged (the old short-circuit read the epoch too late).
+    #[cfg(feature = "grant")]
+    #[test]
+    fn grant_status_bumped_epoch_forces_recompile() {
+        let binding = bound_with_grant(Some(3), Some(7));
+        assert!(
+            !tenant_binding_status_up_to_date(&binding, 8),
+            "a bumped revocation epoch must force a recompile even when the \
+             generation is unchanged"
+        );
+    }
+
+    #[cfg(feature = "grant")]
+    #[test]
+    fn grant_status_stale_generation_forces_recompile() {
+        // observed_generation (2) lags the spec generation (5) → recompile.
+        let mut binding = bound_with_grant(Some(2), Some(7));
+        binding.meta_mut().generation = Some(5);
+        assert!(
+            !tenant_binding_status_up_to_date(&binding, 7),
+            "an edited spec (generation change) must force a recompile"
+        );
+    }
+
+    #[cfg(feature = "grant")]
+    #[test]
+    fn grant_status_missing_allocation_cid_forces_recompile() {
+        let mut binding = bound_with_grant(Some(3), Some(7));
+        // Wipe one CID — a partially-compiled grant is not current.
+        if let Some(status) = binding.status.as_mut() {
+            status.allocation_cid = None;
+        }
+        assert!(
+            !tenant_binding_status_up_to_date(&binding, 7),
+            "a missing allocation CID must force a recompile"
+        );
+    }
+
+    #[cfg(feature = "grant")]
+    #[test]
+    fn grant_status_no_entitlement_is_current_without_grant() {
+        // A binding with no entitlement is "current" once it carries a no-grant
+        // status at the observed generation; the epoch is irrelevant.
+        let mut binding = TenantBinding::new(
+            "tb",
+            TenantBindingSpec {
+                namespace: "acme".to_owned(),
+                tenant: "did:web:acme".to_owned(),
+                entitlement: None,
+            },
+        );
+        binding.meta_mut().generation = Some(1);
+        binding.status = Some(crate::mesh::TenantBindingStatus {
+            observed_generation: Some(1),
+            ..Default::default()
+        });
+        assert!(
+            tenant_binding_status_up_to_date(&binding, 99),
+            "a no-entitlement binding with a no-grant status is current at any epoch"
         );
     }
 }
