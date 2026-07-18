@@ -1,0 +1,89 @@
+; Canonical CDDL for draft-hyprstream-resource-attestation-00
+;
+; Status: pre-construction (2026-07-17). This CDDL is the normative field
+; structure for the resource-attestation profile. The production deterministic
+; encoding is DAG-CBOR (RFC 8949 deterministic CBOR + atproto map-key sort +
+; tag-42 CID) and is pending issue #1065. This source makes no codepoint request.
+
+resource-attestation-profile = "hs-resource-attestation/resource-intent/v1"
+
+; ResourceIntent is the canonical structure both attestations cover.
+; resource_id, content_cid, manifest_cid, and operation_id are independent.
+resource-intent = {
+  resource_id: identifier,
+  content_cid: identifier,
+  operation_id: identifier,
+  predecessor_version: uint,
+  owner_ref: ownership-ref,
+  controller_ref: controller-ref,
+  payer_ref: payer-ref,
+  profile: profile-name,
+  accepted_state_epoch: uint,
+  accepted_state_digest: bstr .size 32,
+  policy_generation: uint,
+  expiry: uint,
+}
+
+ownership-ref = identified-owner / pairwise-owner / committed-owner
+controller-ref = identified-controller / anonymous-capability-controller
+payer-ref = identified-payer / anonymous-entitlement-payer
+
+identified-owner = { kind: "identified", value: did }
+pairwise-owner  = { kind: "pairwise",  value: did }
+committed-owner = { kind: "committed",  value: commitment }
+
+identified-controller = { kind: "identified", value: did }
+anonymous-capability-controller = { kind: "anonymous-capability", value: commitment }
+
+identified-payer = { kind: "identified", value: did }
+anonymous-entitlement-payer = { kind: "anonymous-entitlement", value: commitment }
+
+profile-name = "identified-owner" / "pairwise-owner" / "committed-owner" /
+               "identified-controller" / "anonymous-capability-controller" /
+               "identified-payer" / "anonymous-entitlement-payer"
+
+; Manifest: joins both attestations over the identical canonical digest.
+; A finalized manifest cites resource_id, content_cid, its own manifest_cid,
+; and operation_id independently. No final manifest exists without both
+; attestations over byte-identical canonical ResourceIntent digests.
+manifest = {
+  resource_id: identifier,
+  content_cid: identifier,
+  manifest_cid: identifier,
+  operation_id: identifier,
+  predecessor_version: uint,
+  profile: profile-name,
+  accepted_state_epoch: uint,
+  accepted_state_digest: bstr .size 32,
+  policy_generation: uint,
+  expiry: uint,
+  fencing_token: bstr,
+  mac_attestation: attestation,
+  ledger_attestation: attestation,
+}
+
+attestation = {
+  role: "mac-title-control" / "ledger-economic",
+  covered_digest: bstr .size 32,  ; MUST equal sha256(canonical resource-intent)
+  assurance: "pq-hybrid" / "classical",
+}
+
+identifier = bstr .size (1..128)
+did = tstr .regexp "^did:"
+commitment = bstr .size (32..64)
+
+; Bounds (repository-local application ceilings; see resource-intent.json).
+max_manifest_bytes = 65536
+max_attestations_per_manifest = 2
+max_concurrent_transitions_per_resource = 1
+max_predecessor_chain_depth = 1024
+
+; Reference lifecycle states.
+happy-path-state = "requested" / "mac-authorized" / "ledger-reserved" /
+                   "materialized" / "ledger-posted" / "finalized"
+failure-state = "voiding" / "voided" / "quarantined" /
+                "reconciled" / "manual-review"
+
+; An unknown state, version, profile kind, or transition event MUST reject.
+; An unknown registry field, non-canonical encoding, or out-of-bounds field
+; MUST reject before attestation or registrar processing.

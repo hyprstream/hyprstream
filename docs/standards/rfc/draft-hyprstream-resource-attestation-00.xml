@@ -1,0 +1,111 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rfc xmlns:xi="http://www.w3.org/2001/XInclude" version="3" category="info" docName="draft-hyprstream-resource-attestation-00" ipr="trust200902" submissionType="independent">
+  <front>
+    <title abbrev="Resource Attestation">Pre-I-D Profile: Dual-Attested Resource Ownership for Hyprstream Resources</title>
+    <seriesInfo name="Internet-Draft" value="draft-hyprstream-resource-attestation-00"/>
+    <author initials="H." surname="HyprStream" fullname="HyprStream Contributors"><organization>HyprStream</organization></author>
+    <date year="2026" month="July" day="17"/>
+    <area>General</area>
+    <workgroup>Independent Submission</workgroup>
+    <keyword>resource ownership</keyword><keyword>attestation</keyword><keyword>MAC</keyword><keyword>9P</keyword><keyword>CAS</keyword>
+    <abstract><t>This document is a pre-Internet-Draft work-in-progress profile skeleton for dual-attested resource ownership in Hyprstream. It records the separation between a MAC title/control attestation, a ledger economic attestation, and a durable resource registrar that finalizes exactly one canonical successor per transition. It does not define a Privacy Pass token type, request a 9P opcode or IANA codepoint, or imply IETF endorsement or adoption.</t></abstract>
+    <note title="Pre-Submission Status"><t>This RFCXML source has not been submitted. Its generated artifacts contain standard Internet-Draft boilerplate solely to exercise the pre-submission toolchain; that boilerplate is not evidence of submission, IETF endorsement, adoption, working-group status, or codepoint allocation. The profile is intentionally incomplete pending the sibling implementation issues and independent cryptographic, privacy, protocol, and security review.</t></note>
+  </front>
+  <middle>
+    <section anchor="intro" numbered="true" toc="default"><name>Introduction</name>
+      <t>This skeleton records the authority boundaries, invariants, state machine, and privacy profiles for dual-attested Hyprstream resource ownership. It is the conformance and documentation closure artifact for the resource-ownership epic; it consumes the native MAC architecture, the PQ-hybrid anonymous-capability profile, and the 9P/CAS substrate without absorbing their scopes.</t>
+      <t>This profile references deterministic content addressing via <xref target="RFC6920"/>, CBOR canonicalization via <xref target="RFC8949"/>, and DAG-CBOR canonicalization as used by atproto. It does not normatively depend on Privacy Pass (<xref target="RFC9576"/>, <xref target="RFC9578"/>) or Media over QUIC Transport (<xref target="MOQT"/>); resource-intent application context proposed for those drafts is owned by the #1058/#1059 draft family and supplied by this profile only as reviewed requirements.</t>
+    </section>
+    <section anchor="requirements" numbered="true" toc="default"><name>Requirements Language</name>
+      <t anchor="requirements-language">The key words MUST and MUST NOT in this document are to be interpreted as described in BCP 14 <xref target="RFC2119"/> <xref target="RFC8174"/> when, and only when, they appear in all capitals, as shown here.</t>
+    </section>
+    <section anchor="terms" numbered="true" toc="default"><name>Bounded Vocabulary</name>
+      <dl newline="false" spacing="normal">
+        <dt>Owner:</dt><dd>The principal holding title to a resource; identified, pairwise, or committed.</dd>
+        <dt>Controller:</dt><dd>The principal holding control authority; identified or anonymous-capability.</dd>
+        <dt>Payer:</dt><dd>The principal whose entitlement settles the resource economically; identified or anonymous-entitlement.</dd>
+        <dt>Registrar:</dt><dd>The durable, serialized state machine that joins MAC and ledger attestations and finalizes one canonical successor.</dd>
+        <dt>Resource store:</dt><dd>Bytes and namespace projection; it does not independently invent title.</dd>
+        <dt>Proof plane:</dt><dd>Manifests, receipts, checkpoints, and selective-disclosure material; it is not a synchronous filesystem lock service.</dd>
+      </dl>
+    </section>
+    <section anchor="authority" numbered="true" toc="default"><name>Authority Boundaries</name>
+      <t anchor="authority-boundaries">MAC authority decides whether a principal may create, control, transfer, mutate, or delete a resource under the current policy and content-bound label. Ledger authority decides whether the identified or anonymous payer has a valid resource entitlement and what was reserved, consumed, released, or compensated. The resource registrar joins both attestations and selects the single canonical successor manifest. The resource store and proof plane hold bytes and manifests; they do not independently invent title.</t>
+      <t>Payment does not confer title and MAC authorization does not prove payment. Owner, controller, payer, issuer, ledger operator, and registrar are distinct typed roles.</t>
+    </section>
+    <section anchor="identity" numbered="true" toc="default"><name>Stable Resource Identity</name>
+      <t>Stable resource identity, content CID, manifest CID, and operation ID are separate. A construction MUST NOT define a resource identifier as a hash or signature over another of these identifiers. A finalized manifest MUST cite the stable resource identifier, the content CID it covers, its own manifest CID, and a deterministic operation ID independently.</t>
+      <t>Every request and external effect MUST be idempotent by deterministic operation ID. A registrar MUST NOT finalize two successors for one operation ID.</t>
+    </section>
+    <section anchor="dual-attestation" numbered="true" toc="default"><name>Dual Attestation</name>
+      <t anchor="dual-attestation-binding">No final resource manifest exists without both a MAC title/control attestation and a ledger economic attestation, each computed over the identical canonical ResourceIntent digest. A registrar MUST reject a manifest whose MAC attestation and ledger attestation are not over byte-identical canonical ResourceIntent digests.</t>
+      <t>A MAC-only or ledger-only attestation MUST NOT be accepted as a final resource manifest. Provisional material produced by either attestation alone MUST remain unavailable through the normal namespace.</t>
+    </section>
+    <section anchor="transition" numbered="true" toc="default"><name>Serialized Transition and Fencing</name>
+      <t>At most one finalized successor MAY advance a resource version. Every transition MUST carry an expected predecessor and version, and the registrar MUST finalize it by compare-and-swap guarded by a fencing token.</t>
+      <t>Two concurrent transitions for one predecessor or version MUST NOT both finalize. A stale, replayed, or crossed fencing token MUST NOT advance a resource version.</t>
+      <t>Every reservation MUST eventually post, void, or enter explicit quarantine or manual review. A crash or restart MUST NOT repeat a finalized transition or mint a second successor.</t>
+    </section>
+    <section anchor="visibility" numbered="true" toc="default"><name>Provisional Visibility</name>
+      <t>Provisional material MUST be unavailable through the normal namespace. Visibility of provisional material is a property of registrar state, not merely of byte existence in the resource store or proof plane.</t>
+      <t>Ordinary reads MUST remain MAC-only. Ledger and proof-plane I/O MUST NOT be placed on ordinary reads or on fine-grained 9P writes; bounded local leases settle at defined commit points only.</t>
+    </section>
+    <section anchor="assurance" numbered="true" toc="default"><name>Assurance Floor</name>
+      <t>The effective assurance of a resource operation is the minimum of entitlement assurance, issuer token assurance, binding assurance, MAC decision assurance, ledger attestation assurance, and key-release assurance. A classical outer admission result MUST NOT raise an inner resource operation to a post-quantum-hybrid assurance level. Hybrid terminology follows <xref target="RFC9794"/>.</t>
+      <t>Effective assurance MUST NOT exceed the assurance of any attestation it composes. Anonymous authorization MUST NOT fabricate a DID or stable holder identity.</t>
+    </section>
+    <section anchor="profiles" numbered="true" toc="default"><name>Privacy Profiles</name>
+      <t>Identified, pairwise, and committed-owner profiles, identified and anonymous-capability controller profiles, and identified and anonymous-entitlement payer profiles MUST remain distinct. A profile that accepts an anonymous controller or anonymous payer MUST NOT emit a stable holder DID, ATProto handle, or linkable entitlement identifier into an origin audit record, a public receipt, or a trust store.</t>
+      <t>The origin MAY learn an exact authorized operation without learning a stable holder DID. Issuance-side accounting MAY remain identified while redemption-side accounting records commitments, nullifiers, and aggregate issuer liabilities. Public proof records MUST use commitments; detailed receipts MUST be selectively disclosed or encrypted to authorized parties.</t>
+    </section>
+    <section anchor="receipt" numbered="true" toc="default"><name>Encrypted Receipt and Selective Disclosure</name>
+      <t>A public receipt or checkpoint MUST NOT reveal a raw anonymous token, a holder DID, a stable client key, or a linkable entitlement identifier. An encrypted receipt MUST be addressed only to a party authorized by the active profile and MUST be bound to the same canonical ResourceIntent digest as the manifest it accompanies.</t>
+      <t>Key-release and key-rotation history verification MUST NOT depend on a single classical signature over the resource history.</t>
+    </section>
+    <section anchor="state-machine" numbered="true" toc="default"><name>State-Machine and Recovery Skeleton</name>
+      <t>The reference happy-path lifecycle is Requested, then MacAuthorized, then LedgerReserved, then Materialized, then LedgerPosted, then Finalized. The reference failure and recovery lifecycle is Voiding to Voided, and Quarantined to Reconciled or ManualReview.</t>
+      <t>No transition to Finalized is defined from a state that lacks both attestations. No transition to ordinary namespace visibility is defined from a provisional state. Unknown states, versions, profile kinds, or transition events MUST reject.</t>
+    </section>
+    <section anchor="cas" numbered="true" toc="default"><name>Immutable CAS and Blob Reference</name>
+      <t>The first vertical of resource ownership is immutable content-addressed storage write-then-seal. A CAS or blob integration MUST NOT expose provisional bytes as a finalized resource. A content CID referenced by a manifest MUST match the bytes sealed by the content-addressed store.</t>
+      <t>This section records the resource-specific evidence boundary. The stock-relay and stock-carrier evidence that is shared with the #1058/#1059 draft family remains owned by those drafts.</t>
+    </section>
+    <section anchor="ninep" numbered="true" toc="default"><name>Mutable 9P Ownership Semantics</name>
+      <t>Mutable 9P title, directory-entry, rename, hard-link, bind, mount, and transfer semantics MUST follow only after the blob lifecycle and the crash and reconciliation suites pass. A 9P operation MUST NOT confer title that the registrar has not finalized.</t>
+      <t>The logical application label carried inside registrar and proof-plane records is not a registered or mandatory 9P opcode, MoQ track namespace, Privacy Pass token type, or external allocation.</t>
+    </section>
+    <section anchor="construction-status" numbered="true" toc="default"><name>Construction Status and Experimental Refusal Boundary</name>
+      <t>The sibling implementation issues for canonical ResourceIntent, registrar saga, MAC title attestation, ledger redemption, CAS integration, and 9P ownership semantics are not complete as of this draft. A production registrar MUST NOT finalize a resource manifest until both reviewed attestations exist over the identical canonical ResourceIntent digest and the crash, concurrency, privacy, and interoperability suites pass.</t>
+      <t>The repository-local experimental boundary is a deterministic non-cryptographic fixture schema for ResourceIntent canonicalization, not a token type, a 9P opcode, or a protocol encoding. The experimental boundary checker MUST require a MAC attestation and a ledger attestation over byte-identical canonical ResourceIntent digests and MUST reject a missing, duplicated, crossed, or downgraded attestation. The experimental boundary checker MUST terminate a structurally valid fixture with the ConstructionIncomplete refusal, because the canonical production ResourceIntent encoding, registrar, and reviewed attestations do not yet exist.</t>
+    </section>
+    <section anchor="registry" numbered="true" toc="default"><name>Local Registry</name>
+      <t>The local registry in resource-intent.json and resource-vocabulary.json names fields, roles, principal kinds, lifecycle states, bounds, and canonicalization. Implementations MUST reject an unknown registry field or label, a non-canonical ResourceIntent encoding, or an out-of-bounds field before attestation or registrar processing.</t>
+      <t>The registry is local to this repository. It is not an IANA registry or a request to allocate a 9P, MoQ, Privacy Pass, or any other codepoint.</t>
+    </section>
+    <section anchor="security" numbered="true" toc="default"><name>Security Considerations</name>
+      <t>Implementation of the sibling issues and independent security, privacy, cryptographic, protocol, and standards review are prerequisites for any production resource-manifest claim. This profile requires exact binding to canonical ResourceIntent digest, distinct typed roles, fencing-guarded compare-and-swap, and the assurance floor, but deliberately leaves the concrete canonical encoding, signature suite, and anonymous-construction selection to those issues.</t>
+    </section>
+    <section anchor="privacy" numbered="true" toc="default"><name>Privacy Considerations</name>
+      <t>This profile makes no unlinkability claim against issuer-origin-ledger collusion, no traffic-analysis claim against a global observer, and no protection against cross-cell correlation beyond the data minimization stated here and in the companion privacy and collusion analysis.</t>
+    </section>
+    <section anchor="iana" numbered="true" toc="default"><name>IANA Considerations</name>
+      <t>This document requests no IANA actions and allocates no codepoints.</t>
+    </section>
+  </middle>
+  <back>
+    <references><name>References</name>
+      <references><name>Normative References</name>
+        <reference anchor="RFC2119" target="https://www.rfc-editor.org/info/rfc2119"><front><title>Key words for use in RFCs to Indicate Requirement Levels</title><seriesInfo name="BCP" value="14"/><seriesInfo name="RFC" value="2119"/><author initials="S." surname="Bradner" fullname="S. Bradner"/><date year="1997" month="March"/></front></reference>
+        <reference anchor="RFC8174" target="https://www.rfc-editor.org/info/rfc8174"><front><title>Ambiguity of Uppercase vs Lowercase in RFC 2119 Key Words</title><seriesInfo name="BCP" value="14"/><seriesInfo name="RFC" value="8174"/><author initials="B." surname="Leiba" fullname="B. Leiba"/><date year="2017" month="May"/></front></reference>
+        <reference anchor="RFC6920" target="https://www.rfc-editor.org/info/rfc6920"><front><title>Naming Things with Hashes</title><seriesInfo name="RFC" value="6920"/><author initials="S." surname="Farrell" fullname="S. Farrell"/><author initials="D." surname="Kutscher" fullname="D. Kutscher"/><author initials="C." surname="Dannewitz" fullname="C. Dannewitz"/><author initials="B." surname="Ohlman" fullname="B. Ohlman"/><author initials="A." surname="Keranen" fullname="A. Keranen"/><author initials="P." surname="Hallam-Baker" fullname="P. Hallam-Baker"/><date year="2013" month="April"/></front></reference>
+        <reference anchor="RFC8949" target="https://www.rfc-editor.org/info/rfc8949"><front><title>Concise Binary Object Representation (CBOR)</title><seriesInfo name="RFC" value="8949"/><author initials="C." surname="Bormann" fullname="C. Bormann"/><author initials="P." surname="Hoffman" fullname="P. Hoffman"/><date year="2020" month="December"/></front></reference>
+      </references>
+      <references><name>Informative References</name>
+        <reference anchor="RFC9576" target="https://www.rfc-editor.org/info/rfc9576"><front><title>The Privacy Pass Architecture</title><seriesInfo name="RFC" value="9576"/><author initials="A." surname="Davidson" fullname="A. Davidson"/><author initials="J." surname="Iyengar" fullname="J. Iyengar"/><author initials="C. A." surname="Wood" fullname="C. A. Wood"/><date year="2024" month="June"/></front></reference>
+        <reference anchor="RFC9578" target="https://www.rfc-editor.org/info/rfc9578"><front><title>Privacy Pass Issuance Protocols</title><seriesInfo name="RFC" value="9578"/><author initials="S." surname="Celi" fullname="S. Celi"/><author initials="A." surname="Davidson" fullname="A. Davidson"/><author initials="S." surname="Valdez" fullname="S. Valdez"/><author initials="C. A." surname="Wood" fullname="C. A. Wood"/><date year="2024" month="June"/></front></reference>
+        <reference anchor="MOQT" target="https://www.ietf.org/archive/id/draft-ietf-moq-transport-19.txt"><front><title>Media over QUIC Transport</title><seriesInfo name="Internet-Draft" value="draft-ietf-moq-transport-19"/><author initials="S." surname="Nandakumar" fullname="S. Nandakumar"/><author initials="V." surname="Vasiliev" fullname="V. Vasiliev"/><author initials="I." surname="Swett" fullname="I. Swett"/><author initials="A." surname="Frindell" fullname="A. Frindell"/><date year="2026" month="July" day="6"/></front></reference>
+        <reference anchor="RFC9794" target="https://www.rfc-editor.org/info/rfc9794"><front><title>Terminology for Post-Quantum Traditional Hybrid Schemes</title><seriesInfo name="RFC" value="9794"/><author initials="F." surname="Driscoll" fullname="F. Driscoll"/><author initials="M." surname="Parsons" fullname="M. Parsons"/><author initials="B." surname="Hale" fullname="B. Hale"/><date year="2025" month="June"/></front></reference>
+      </references>
+    </references>
+  </back>
+</rfc>

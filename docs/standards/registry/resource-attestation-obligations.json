@@ -1,0 +1,292 @@
+{
+  "manifest_version": 1,
+  "scope": "Normative keywords in docs/standards/rfc/draft-hyprstream-resource-attestation-00.xml only. Each item maps one exact MUST/MUST NOT statement to an implemented test (exercised by the deterministic boundary checker and vectors owned by #1070) or a specification-only obligation with owner and blocker.",
+  "obligations": [
+    {
+      "id": "RA-REQ-001",
+      "keyword": "MUST NOT",
+      "source": "identity",
+      "statement": "A construction MUST NOT define a resource identifier as a hash or signature over another of these identifiers.",
+      "kind": "implemented-test",
+      "test": "python3 tools/check_resource_attestation.py (cyclic-identifier)"
+    },
+    {
+      "id": "RA-REQ-002",
+      "keyword": "MUST",
+      "source": "identity",
+      "statement": "A finalized manifest MUST cite the stable resource identifier, the content CID it covers, its own manifest CID, and a deterministic operation ID independently.",
+      "kind": "implemented-test",
+      "test": "python3 tools/check_resource_attestation.py (baseline manifest cites resource_id, content_cid, manifest_cid, and operation_id independently)"
+    },
+    {
+      "id": "RA-REQ-003",
+      "keyword": "MUST",
+      "source": "identity",
+      "statement": "Every request and external effect MUST be idempotent by deterministic operation ID.",
+      "kind": "implemented-test",
+      "test": "python3 tools/check_resource_attestation.py (replayed-operation-id)"
+    },
+    {
+      "id": "RA-REQ-004",
+      "keyword": "MUST NOT",
+      "source": "identity",
+      "statement": "A registrar MUST NOT finalize two successors for one operation ID.",
+      "kind": "implemented-test",
+      "test": "python3 tools/check_resource_attestation.py (replayed-operation-id and concurrent-successors)"
+    },
+    {
+      "id": "RA-REQ-005",
+      "keyword": "MUST",
+      "source": "dual-attestation",
+      "statement": "A registrar MUST reject a manifest whose MAC attestation and ledger attestation are not over byte-identical canonical ResourceIntent digests.",
+      "kind": "implemented-test",
+      "test": "python3 tools/check_resource_attestation.py (crossed-resourceintent-digest)"
+    },
+    {
+      "id": "RA-REQ-006",
+      "keyword": "MUST NOT",
+      "source": "dual-attestation",
+      "statement": "A MAC-only or ledger-only attestation MUST NOT be accepted as a final resource manifest.",
+      "kind": "implemented-test",
+      "test": "python3 tools/check_resource_attestation.py (mac-only-attestation and ledger-only-attestation)"
+    },
+    {
+      "id": "RA-REQ-007",
+      "keyword": "MUST",
+      "source": "dual-attestation",
+      "statement": "Provisional material produced by either attestation alone MUST remain unavailable through the normal namespace.",
+      "kind": "specification-only",
+      "owner": "#1069/#1071",
+      "blocker": "Namespace visibility gating by registrar state is not implemented; the durable registrar and mutable 9P ownership semantics are pending.",
+      "planned_test": "mac-only-or-ledger-only-provisional-unavailable-in-namespace"
+    },
+    {
+      "id": "RA-REQ-008",
+      "keyword": "MUST",
+      "source": "transition",
+      "statement": "Every transition MUST carry an expected predecessor and version, and the registrar MUST finalize it by compare-and-swap guarded by a fencing token.",
+      "kind": "implemented-test",
+      "test": "python3 tools/check_resource_attestation.py (stale-predecessor-version and missing-fencing-token)"
+    },
+    {
+      "id": "RA-REQ-009",
+      "keyword": "MUST NOT",
+      "source": "transition",
+      "statement": "Two concurrent transitions for one predecessor or version MUST NOT both finalize.",
+      "kind": "implemented-test",
+      "test": "python3 tools/check_resource_attestation.py (concurrent-successors)"
+    },
+    {
+      "id": "RA-REQ-010",
+      "keyword": "MUST NOT",
+      "source": "transition",
+      "statement": "A stale, replayed, or crossed fencing token MUST NOT advance a resource version.",
+      "kind": "implemented-test",
+      "test": "python3 tools/check_resource_attestation.py (stale-predecessor-version and crossed-fencing-token)"
+    },
+    {
+      "id": "RA-REQ-011",
+      "keyword": "MUST",
+      "source": "transition",
+      "statement": "Every reservation MUST eventually post, void, or enter explicit quarantine or manual review.",
+      "kind": "specification-only",
+      "owner": "#1069/#1072",
+      "blocker": "The durable registrar saga, outbox, and reconciler liveness are not implemented.",
+      "planned_test": "reservation-eventually-posts-voids-or-quarantines"
+    },
+    {
+      "id": "RA-REQ-012",
+      "keyword": "MUST NOT",
+      "source": "transition",
+      "statement": "A crash or restart MUST NOT repeat a finalized transition or mint a second successor.",
+      "kind": "implemented-test",
+      "test": "python3 tools/check_resource_attestation.py (crash-repeats-finalized)"
+    },
+    {
+      "id": "RA-REQ-013",
+      "keyword": "MUST",
+      "source": "visibility",
+      "statement": "Provisional material MUST be unavailable through the normal namespace.",
+      "kind": "specification-only",
+      "owner": "#1069/#1071",
+      "blocker": "Registrar-state-driven namespace visibility gating is not implemented.",
+      "planned_test": "provisional-material-unavailable-through-namespace"
+    },
+    {
+      "id": "RA-REQ-014",
+      "keyword": "MUST",
+      "source": "visibility",
+      "statement": "Ordinary reads MUST remain MAC-only.",
+      "kind": "specification-only",
+      "owner": "#547/#568",
+      "blocker": "The MAC policy enforcement point is not wired to production read paths.",
+      "planned_test": "ordinary-read-mac-only-no-ledger-or-proof-io"
+    },
+    {
+      "id": "RA-REQ-015",
+      "keyword": "MUST NOT",
+      "source": "visibility",
+      "statement": "Ledger and proof-plane I/O MUST NOT be placed on ordinary reads or on fine-grained 9P writes; bounded local leases settle at defined commit points only.",
+      "kind": "specification-only",
+      "owner": "#1069/#1071/#1072",
+      "blocker": "The read hot-path and fine-grained 9P write path do not yet enforce lease-only settlement.",
+      "planned_test": "read-hot-path-and-9p-write-free-of-ledger-proof-io"
+    },
+    {
+      "id": "RA-REQ-016",
+      "keyword": "MUST NOT",
+      "source": "assurance",
+      "statement": "A classical outer admission result MUST NOT raise an inner resource operation to a post-quantum-hybrid assurance level.",
+      "kind": "implemented-test",
+      "test": "python3 tools/check_resource_attestation.py (downgraded-assurance)"
+    },
+    {
+      "id": "RA-REQ-017",
+      "keyword": "MUST NOT",
+      "source": "assurance",
+      "statement": "Effective assurance MUST NOT exceed the assurance of any attestation it composes.",
+      "kind": "implemented-test",
+      "test": "python3 tools/check_resource_attestation.py (downgraded-assurance)"
+    },
+    {
+      "id": "RA-REQ-018",
+      "keyword": "MUST NOT",
+      "source": "assurance",
+      "statement": "Anonymous authorization MUST NOT fabricate a DID or stable holder identity.",
+      "kind": "implemented-test",
+      "test": "python3 tools/check_resource_attestation.py (anonymous-fabricates-did)"
+    },
+    {
+      "id": "RA-REQ-019",
+      "keyword": "MUST",
+      "source": "profiles",
+      "statement": "Identified, pairwise, and committed-owner profiles, identified and anonymous-capability controller profiles, and identified and anonymous-entitlement payer profiles MUST remain distinct.",
+      "kind": "implemented-test",
+      "test": "python3 tools/check_resource_attestation.py (crossed-profile-kind and registry profile distinctness)"
+    },
+    {
+      "id": "RA-REQ-020",
+      "keyword": "MUST NOT",
+      "source": "profiles",
+      "statement": "A profile that accepts an anonymous controller or anonymous payer MUST NOT emit a stable holder DID, ATProto handle, or linkable entitlement identifier into an origin audit record, a public receipt, or a trust store.",
+      "kind": "implemented-test",
+      "test": "python3 tools/check_resource_attestation.py (anonymous-fabricates-did and public-receipt-reveals-holder)"
+    },
+    {
+      "id": "RA-REQ-021",
+      "keyword": "MUST",
+      "source": "profiles",
+      "statement": "Public proof records MUST use commitments; detailed receipts MUST be selectively disclosed or encrypted to authorized parties.",
+      "kind": "specification-only",
+      "owner": "#1072/#928",
+      "blocker": "The selective-disclosure and encrypted-receipt proof-plane path is not implemented.",
+      "planned_test": "public-proof-uses-commitments-and-receipts-encrypted"
+    },
+    {
+      "id": "RA-REQ-022",
+      "keyword": "MUST NOT",
+      "source": "receipt",
+      "statement": "A public receipt or checkpoint MUST NOT reveal a raw anonymous token, a holder DID, a stable client key, or a linkable entitlement identifier.",
+      "kind": "implemented-test",
+      "test": "python3 tools/check_resource_attestation.py (public-receipt-reveals-holder)"
+    },
+    {
+      "id": "RA-REQ-023",
+      "keyword": "MUST",
+      "source": "receipt",
+      "statement": "An encrypted receipt MUST be addressed only to a party authorized by the active profile and MUST be bound to the same canonical ResourceIntent digest as the manifest it accompanies.",
+      "kind": "specification-only",
+      "owner": "#1072/#928",
+      "blocker": "The encrypted-receipt addressing and digest-binding implementation does not exist.",
+      "planned_test": "encrypted-receipt-authorized-recipient-and-digest-binding"
+    },
+    {
+      "id": "RA-REQ-024",
+      "keyword": "MUST NOT",
+      "source": "receipt",
+      "statement": "Key-release and key-rotation history verification MUST NOT depend on a single classical signature over the resource history.",
+      "kind": "specification-only",
+      "owner": "#1068/#1072",
+      "blocker": "The key-history verification path and hybrid-PQC key rotation for resource history are not implemented.",
+      "planned_test": "key-history-not-single-classical-signature"
+    },
+    {
+      "id": "RA-REQ-025",
+      "keyword": "MUST",
+      "source": "state-machine",
+      "statement": "Unknown states, versions, profile kinds, or transition events MUST reject.",
+      "kind": "implemented-test",
+      "test": "python3 tools/check_resource_attestation.py (unknown-state and unknown-profile-kind)"
+    },
+    {
+      "id": "RA-REQ-026",
+      "keyword": "MUST NOT",
+      "source": "cas",
+      "statement": "A CAS or blob integration MUST NOT expose provisional bytes as a finalized resource.",
+      "kind": "implemented-test",
+      "test": "python3 tools/check_resource_attestation.py (cas-exposes-provisional)"
+    },
+    {
+      "id": "RA-REQ-027",
+      "keyword": "MUST",
+      "source": "cas",
+      "statement": "A content CID referenced by a manifest MUST match the bytes sealed by the content-addressed store.",
+      "kind": "specification-only",
+      "owner": "#1066",
+      "blocker": "The immutable blob write-then-seal reference integration does not exist.",
+      "planned_test": "manifest-content-cid-matches-sealed-bytes"
+    },
+    {
+      "id": "RA-REQ-028",
+      "keyword": "MUST",
+      "source": "ninep",
+      "statement": "Mutable 9P title, directory-entry, rename, hard-link, bind, mount, and transfer semantics MUST follow only after the blob lifecycle and the crash and reconciliation suites pass.",
+      "kind": "specification-only",
+      "owner": "#1071",
+      "blocker": "Mutable 9P ownership semantics are not implemented and depend on the blob lifecycle and reconciliation suites.",
+      "planned_test": "mutable-9p-only-after-blob-lifecycle-and-reconciliation-suites"
+    },
+    {
+      "id": "RA-REQ-029",
+      "keyword": "MUST NOT",
+      "source": "ninep",
+      "statement": "A 9P operation MUST NOT confer title that the registrar has not finalized.",
+      "kind": "implemented-test",
+      "test": "python3 tools/check_resource_attestation.py (ninep-confers-unfinalized-title)"
+    },
+    {
+      "id": "RA-REQ-030",
+      "keyword": "MUST NOT",
+      "source": "construction-status",
+      "statement": "A production registrar MUST NOT finalize a resource manifest until both reviewed attestations exist over the identical canonical ResourceIntent digest and the crash, concurrency, privacy, and interoperability suites pass.",
+      "kind": "specification-only",
+      "owner": "#1065/#1066/#1067/#1068/#1069/#1071/#1072",
+      "blocker": "The sibling implementation issues are not complete and the required independent reviews and suites have not passed.",
+      "planned_test": "production-registrar-refuses-until-both-attestations-and-suites-pass"
+    },
+    {
+      "id": "RA-REQ-031",
+      "keyword": "MUST",
+      "source": "construction-status",
+      "statement": "The experimental boundary checker MUST require a MAC attestation and a ledger attestation over byte-identical canonical ResourceIntent digests and MUST reject a missing, duplicated, crossed, or downgraded attestation.",
+      "kind": "implemented-test",
+      "test": "python3 tools/check_resource_attestation.py (mac-only-attestation, ledger-only-attestation, duplicated-mac-attestation, crossed-resourceintent-digest, and downgraded-assurance)"
+    },
+    {
+      "id": "RA-REQ-032",
+      "keyword": "MUST",
+      "source": "construction-status",
+      "statement": "The experimental boundary checker MUST terminate a structurally valid fixture with the ConstructionIncomplete refusal, because the canonical production ResourceIntent encoding, registrar, and reviewed attestations do not yet exist.",
+      "kind": "implemented-test",
+      "test": "python3 tools/check_resource_attestation.py (baseline structural success followed by ConstructionIncomplete refusal)"
+    },
+    {
+      "id": "RA-REQ-033",
+      "keyword": "MUST",
+      "source": "registry",
+      "statement": "Implementations MUST reject an unknown registry field or label, a non-canonical ResourceIntent encoding, or an out-of-bounds field before attestation or registrar processing.",
+      "kind": "implemented-test",
+      "test": "python3 tools/check_resource_attestation.py (unknown-registry-field, non-canonical-encoding, and out-of-bounds-field)"
+    }
+  ]
+}

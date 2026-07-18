@@ -1,0 +1,91 @@
+{
+  "vocabulary_version": 1,
+  "status": "local-pre-construction-vocabulary",
+  "scope": "Bounded names and safety ceilings shared by the dual-attested resource ownership draft family owned by #1070. This file is not a wire schema, a 9P opcode registration, a Privacy Pass token type, an IANA registry, or a codepoint allocation, and it implies no such allocation.",
+  "roles": [
+    "owner",
+    "controller",
+    "payer",
+    "issuer",
+    "ledger-operator",
+    "registrar",
+    "resource-store",
+    "pds",
+    "mac-authority"
+  ],
+  "principal_kinds": {
+    "owner": [
+      "identified",
+      "pairwise",
+      "committed"
+    ],
+    "controller": [
+      "identified",
+      "anonymous-capability"
+    ],
+    "payer": [
+      "identified",
+      "anonymous-entitlement"
+    ]
+  },
+  "profiles": [
+    "identified-owner",
+    "pairwise-owner",
+    "committed-owner",
+    "identified-controller",
+    "anonymous-capability-controller",
+    "identified-payer",
+    "anonymous-entitlement-payer"
+  ],
+  "identifiers": {
+    "note": "Stable resource identity, content CID, manifest CID, and operation ID are distinct. No cyclic hash or signature construction is permitted.",
+    "kinds": [
+      "resource-id",
+      "content-cid",
+      "manifest-cid",
+      "operation-id",
+      "predecessor-version"
+    ]
+  },
+  "lifecycle": {
+    "logical_namespace": "hyprstream-resource-attestation-v1",
+    "note": "This logical application label is carried inside registrar and proof-plane records; it is not a registered or mandatory 9P opcode, MoQ track namespace, or Privacy Pass token type.",
+    "happy_path": [
+      "requested",
+      "mac-authorized",
+      "ledger-reserved",
+      "materialized",
+      "ledger-posted",
+      "finalized"
+    ],
+    "failure": [
+      "voiding",
+      "voided",
+      "quarantined",
+      "reconciled",
+      "manual-review"
+    ],
+    "unknown_state": "reject"
+  },
+  "bounds": {
+    "max_manifest_bytes": 65536,
+    "max_attestations_per_manifest": 8,
+    "max_concurrent_transitions_per_resource": 1,
+    "max_predecessor_chain_depth": 1024,
+    "note": "Repository-local application ceilings. Construction and profile review may lower them; any increase requires a profile revision."
+  },
+  "transition_invariants": [
+    "no final manifest exists without both MAC and ledger attestations over the identical canonical ResourceIntent digest",
+    "payment does not confer title and MAC authorization does not prove payment",
+    "at most one finalized successor may advance a resource version",
+    "every transition carries an expected predecessor or version and is finalized by compare-and-swap with a fencing token",
+    "stable resource identity, content CID, manifest CID, and operation ID remain separate",
+    "every request and external effect is idempotent by deterministic operation ID",
+    "every reservation eventually posts, voids, or enters explicit quarantine or manual review",
+    "provisional material is unavailable through the normal namespace",
+    "ordinary reads remain MAC-only and ledger or proof-plane I/O is not placed on the read hot path",
+    "identified, pairwise, committed-owner, and anonymous-controller or anonymous-payer profiles remain distinct and anonymous authorization never fabricates a DID",
+    "effective assurance is the minimum of entitlement, issuer token, binding, MAC decision, ledger attestation, and key-release assurance and classical outer admission cannot raise an inner resource operation",
+    "unknown states, versions, profile kinds, or transition events reject"
+  ]
+}
