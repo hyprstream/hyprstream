@@ -323,6 +323,10 @@ pub enum OperatorError {
 }
 
 /// Run Model, Adapter, TrainingRun, and InferenceService controllers until Ctrl-C.
+///
+/// With the `grant` feature, this runs the `TenantBinding` controller too, but
+/// with no issuer configured: bindings reconcile to the no-grant status only.
+/// Use [`run_operator_with_grant_issuer`] to enable grant compilation (#929).
 pub async fn run_operator<R>(
     client: Client,
     rpc: Arc<R>,
@@ -332,23 +336,46 @@ where
     R: HyprstreamOperatorRpc,
 {
     let state = Arc::new(OperatorState::new(client.clone(), rpc, config));
+    run_operator_with_state(client, state).await
+}
 
-    // When grant compilation is enabled, the `TenantBinding` controller runs as
-    // a detached background task alongside the model/serving controllers: it
-    // compiles entitlements into issuer-signed grants and reflects the compiled
-    // CIDs into status (#929). Detaching it (rather than `tokio::select!`-ing
-    // it in) avoids a `#[cfg]`-gated `select!` branch, which the macro cannot
-    // parse; its errors surface through tracing.
+/// Run every controller with the operator's tenant-grant issuer configured
+/// (#929): the `TenantBinding` controller compiles authored entitlements into
+/// issuer-signed grants. `None` behaves exactly like [`run_operator`].
+#[cfg(feature = "grant")]
+pub async fn run_operator_with_grant_issuer<R>(
+    client: Client,
+    rpc: Arc<R>,
+    config: OperatorConfig,
+    issuer: Option<Arc<crate::grant::TenantGrantIssuer>>,
+) -> Result<(), OperatorError>
+where
+    R: HyprstreamOperatorRpc,
+{
+    let state = Arc::new(OperatorState::new(client.clone(), rpc, config).with_grant_issuer(issuer));
+    run_operator_with_state(client, state).await
+}
+
+async fn run_operator_with_state<R>(
+    client: Client,
+    state: Arc<OperatorState<R>>,
+) -> Result<(), OperatorError>
+where
+    R: HyprstreamOperatorRpc,
+{
+    // With the `grant` feature, the `TenantBinding` controller (#929) runs
+    // under the same supervision set as the other controllers: its exit —
+    // clean or not — ends `run_operator` rather than leaving the operator
+    // silently degraded. The `select!` macro cannot parse a `#[cfg]`-gated
+    // branch, so the branch is unconditional and the feature-off build
+    // substitutes a never-resolving future.
     #[cfg(feature = "grant")]
-    {
-        let tb_client = client.clone();
-        let tb_state = Arc::clone(&state);
-        tokio::spawn(async move {
-            if let Err(error) = run_tenant_binding_controller(tb_client, tb_state).await {
-                tracing::warn!(%error, "tenantbinding controller exited");
-            }
-        });
-    }
+    let tenant_bindings: BoxFuture<'_, Result<(), OperatorError>> = Box::pin(
+        run_tenant_binding_controller(client.clone(), Arc::clone(&state)),
+    );
+    #[cfg(not(feature = "grant"))]
+    let tenant_bindings: BoxFuture<'_, Result<(), OperatorError>> =
+        Box::pin(futures::future::pending());
 
     let models = run_model_controller(client.clone(), Arc::clone(&state));
     let adapters = run_adapter_controller(client.clone(), Arc::clone(&state));
@@ -359,6 +386,10 @@ where
         result = adapters => result,
         result = training_runs => result,
         result = inference_services => result,
+        result = tenant_bindings => {
+            tracing::warn!("tenantbinding controller exited; shutting down operator");
+            result
+        }
         _ = tokio::signal::ctrl_c() => Ok(()),
     }
 }

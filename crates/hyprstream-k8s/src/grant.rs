@@ -220,7 +220,7 @@ impl TenantGrantIssuer {
         // (below) is the authoritative subject.
         let holder = binding.spec.tenant.as_str();
 
-        let capability = tenant_grant_capability(&self.issuer_did, holder, entitlement, epoch);
+        let capability = tenant_grant_capability(&self.issuer_did, holder, entitlement, epoch)?;
 
         let payload = UcanPayload {
             issuer: self.issuer_did.clone(),
@@ -377,6 +377,32 @@ impl TenantGrantVerifier {
             bail!("tenant grant signature missing the ML-DSA-65 leg (require_pq)");
         }
 
+        // 2b. The signed payload's issuer MUST be the DID of the anchored
+        //     Ed25519 key. Without this, a UCAN validly signed by the anchored
+        //     key could claim a different issuer identity in its payload.
+        let anchored_issuer = Did::from_ed25519(&self.issuer_ed_vk.to_bytes());
+        if compiled.ucan.payload.issuer != anchored_issuer {
+            bail!(
+                "UCAN payload issuer ({}) does not match the anchored issuer key ({})",
+                compiled.ucan.payload.issuer.as_str(),
+                anchored_issuer.as_str()
+            );
+        }
+
+        // 2c. The presented `grant_cid` MUST be the recomputed CID of the
+        //     presented UCAN. The signature covers only the UCAN payload — the
+        //     CID strings arrive alongside it, so an attacker could otherwise
+        //     pair a valid UCAN with an arbitrary `grant_cid` and a forged
+        //     allocation that references that same arbitrary string.
+        let recomputed_grant_cid = cid_v1_string(&compiled.ucan)?;
+        if recomputed_grant_cid != compiled.grant_cid {
+            bail!(
+                "presented grant CID ({}) does not match the UCAN's recomputed CID ({})",
+                compiled.grant_cid,
+                recomputed_grant_cid
+            );
+        }
+
         // 3. Delegation-chain liveness. A compiled tenant grant is a root
         //    (empty proofs), so this re-checks the not_before/expiration window
         //    against `now` — enforcers MUST reject an expired grant even if the
@@ -393,6 +419,37 @@ impl TenantGrantVerifier {
             bail!("allocation record canonical round-trip mismatch");
         }
 
+        // 4b. The presented `allocation_cid` MUST be the recomputed CID of the
+        //     presented record — same reasoning as the grant CID: the CID
+        //     string is unsigned transport metadata, never trusted as given.
+        let recomputed_allocation_cid = redecoded.cid().encode();
+        if recomputed_allocation_cid != compiled.allocation_cid {
+            bail!(
+                "presented allocation CID ({}) does not match the record's recomputed CID ({})",
+                compiled.allocation_cid,
+                recomputed_allocation_cid
+            );
+        }
+
+        // 4c. The allocation's issuer fields MUST be the anchored issuer: the
+        //     signature proves who signed the UCAN, but the allocation record
+        //     itself is unsigned here — an attacker could otherwise attach a
+        //     record naming a different issuer/unit-issuer to a valid UCAN.
+        if redecoded.issuer != anchored_issuer.as_str() {
+            bail!(
+                "allocation.issuer ({}) does not match the anchored issuer ({})",
+                redecoded.issuer,
+                anchored_issuer.as_str()
+            );
+        }
+        if redecoded.unit.issuer != anchored_issuer.as_str() {
+            bail!(
+                "allocation.unit.issuer ({}) does not match the anchored issuer ({})",
+                redecoded.unit.issuer,
+                anchored_issuer.as_str()
+            );
+        }
+
         // 5. The allocation's `grant` field MUST reference the presented UCAN's
         //    CID, binding the inventory line to the capability it draws down.
         if redecoded.grant != compiled.grant_cid {
@@ -403,10 +460,13 @@ impl TenantGrantVerifier {
             );
         }
 
-        // 6. The capability caveats must agree with the allocation fields
-        //    (unit/amount/epoch/class) — a compiler bug that emits divergent
-        //    fields is caught here, not at spend time.
-        verify_capability_matches_record(&compiled.ucan, &redecoded)?;
+        // 6. The capability must agree with the allocation record: exact
+        //    ability, holder bound through the signed resource, and caveats
+        //    matching the record fields (unit/amount/epoch/class). This is
+        //    what stops a holder-substitution: the holder lives in the
+        //    *signed* capability resource, so a forged record naming a
+        //    different holder cannot match it.
+        verify_capability_matches_record(&compiled.ucan, &anchored_issuer, &redecoded)?;
 
         Ok(VerifiedTenantGrant {
             holder: redecoded.holder,
@@ -481,9 +541,16 @@ fn tenant_grant_capability(
     holder: &str,
     entitlement: &TenantEntitlement,
     epoch: u64,
-) -> Capability {
-    let resource = CapabilityResource::new(format!("hs://tenant/{}/{}", issuer.as_str(), holder));
+) -> Result<Capability> {
+    let resource = CapabilityResource::new(tenant_grant_resource(issuer, holder));
     let ability = Ability::new(TENANT_GRANT_ABILITY);
+    // `CaveatValue::Int` is signed; a value that cannot be represented is a
+    // hard error, never a clamp — a clamped amount would mint a grant that
+    // fails its own verification, and a wrapped epoch would encode as negative.
+    let amount = i64::try_from(entitlement.amount)
+        .context("entitlement.amount exceeds i64::MAX and cannot be encoded as a caveat")?;
+    let epoch = i64::try_from(epoch)
+        .context("allocation epoch exceeds i64::MAX and cannot be encoded as a caveat")?;
     let mut caveats = Caveats::empty();
     caveats
         .0
@@ -492,34 +559,58 @@ fn tenant_grant_capability(
         "unit".to_owned(),
         CaveatValue::Text(entitlement.unit.clone()),
     );
-    caveats.0.insert(
-        "amount".to_owned(),
-        CaveatValue::Int(i64::try_from(entitlement.amount).unwrap_or(i64::MAX)),
-    );
     caveats
         .0
-        .insert("epoch".to_owned(), CaveatValue::Int(epoch as i64));
+        .insert("amount".to_owned(), CaveatValue::Int(amount));
+    caveats
+        .0
+        .insert("epoch".to_owned(), CaveatValue::Int(epoch));
     caveats.0.insert(
         "class".to_owned(),
         CaveatValue::Text(entitlement.class.as_str().to_owned()),
     );
-    Capability {
+    Ok(Capability {
         resource,
         ability,
         caveats,
-    }
+    })
 }
 
-/// Verify the UCAN capability's caveats match the allocation record's fields.
-fn verify_capability_matches_record(ucan: &Ucan, record: &AllocationRecord) -> Result<()> {
+/// The capability resource string binding an issuer's liability to a holder's
+/// balance: `hs://tenant/<issuer>/<holder>`. Single source of truth for both
+/// the compile side and the verify side's holder-binding check.
+fn tenant_grant_resource(issuer: &Did, holder: &str) -> String {
+    format!("hs://tenant/{}/{}", issuer.as_str(), holder)
+}
+
+/// Verify the UCAN capability matches the allocation record: exactly one
+/// capability with exactly [`TENANT_GRANT_ABILITY`], the holder bound through
+/// the signed resource string, and caveats matching the record's fields.
+fn verify_capability_matches_record(
+    ucan: &Ucan,
+    anchored_issuer: &Did,
+    record: &AllocationRecord,
+) -> Result<()> {
     let caps = ucan.capabilities();
     let cap = caps
         .first()
         .ok_or_else(|| anyhow!("tenant grant UCAN carries no capability"))?;
-    if !cap.ability.as_str().starts_with("ledger/") {
+    if cap.ability.as_str() != TENANT_GRANT_ABILITY {
         bail!(
-            "tenant grant capability has unexpected ability {}",
-            cap.ability
+            "tenant grant capability has unexpected ability {} (require exactly {})",
+            cap.ability,
+            TENANT_GRANT_ABILITY
+        );
+    }
+    // The holder is not a caveat — it lives in the signed resource string. The
+    // record's holder MUST reconstruct the exact resource the issuer signed,
+    // or the record names a substituted holder.
+    let expected_resource = tenant_grant_resource(anchored_issuer, &record.holder);
+    if cap.resource.as_str() != expected_resource {
+        bail!(
+            "grant capability resource ({}) does not bind the allocation holder ({})",
+            cap.resource.as_str(),
+            record.holder
         );
     }
     let cv = |key: &str| -> Result<&CaveatValue> {
@@ -536,12 +627,13 @@ fn verify_capability_matches_record(ucan: &Ucan, record: &AllocationRecord) -> R
         CaveatValue::Text(t) if t == &record.unit.code => {}
         other => bail!("grant caveat unit does not match record: {other:?}"),
     }
+    // Lossless compare: a negative caveat can never equal a u64 field.
     match cv("amount")? {
-        CaveatValue::Int(a) if *a as u64 == record.amount => {}
+        CaveatValue::Int(a) if u64::try_from(*a) == Ok(record.amount) => {}
         other => bail!("grant caveat amount does not match record: {other:?}"),
     }
     match cv("epoch")? {
-        CaveatValue::Int(e) if *e as u64 == record.epoch => {}
+        CaveatValue::Int(e) if u64::try_from(*e) == Ok(record.epoch) => {}
         other => bail!("grant caveat epoch does not match record: {other:?}"),
     }
     match cv("class")? {
@@ -768,6 +860,9 @@ mod tests {
             PdsGrantClass::Underwritten,
         )
         .unwrap();
+        // Keep the presented allocation CID consistent with the tampered
+        // record so the signed amount caveat is what catches the tamper.
+        compiled.allocation_cid = compiled.allocation.cid().encode();
 
         let err = verifier.verify(&compiled, now).unwrap_err();
         assert!(
@@ -790,7 +885,8 @@ mod tests {
         let binding = binding("compute-second", 5, TenantGrantClass::Prepaid);
 
         let entitlement = binding.spec.entitlement.as_ref().unwrap();
-        let capability = tenant_grant_capability(&issuer_did, &binding.spec.tenant, entitlement, 1);
+        let capability =
+            tenant_grant_capability(&issuer_did, &binding.spec.tenant, entitlement, 1).unwrap();
         let payload = UcanPayload {
             issuer: issuer_did.clone(),
             audience: issuer_did.clone(),
@@ -862,6 +958,135 @@ mod tests {
                 || err.to_string().contains("window"),
             "expired grant must be rejected: {err}"
         );
+    }
+
+    #[test]
+    fn verify_rejects_a_substituted_holder() {
+        // A valid signed UCAN paired with a forged allocation record naming a
+        // different holder: every unsigned field (grant ref, unit, amount,
+        // epoch, class, issuer, allocation CID) is made self-consistent, so
+        // only the signed capability resource can catch the substitution.
+        let issuer = TenantGrantIssuer::generate_for_test();
+        let verifier = TenantGrantVerifier::from_issuer(&issuer);
+        let now = 1_700_000_000u64;
+        let binding = binding("compute-second", 100, TenantGrantClass::Underwritten);
+        let mut compiled = issuer.compile(&binding, 1, now).unwrap();
+
+        compiled.allocation = AllocationRecord::new(
+            compiled.grant_cid.clone(),
+            PdsUnit {
+                code: "compute-second".to_owned(),
+                issuer: issuer.issuer_did().as_str().to_owned(),
+            },
+            100,
+            1,
+            issuer.issuer_did().as_str(),
+            "did:web:evil.example",
+            PdsGrantClass::Underwritten,
+        )
+        .unwrap();
+        compiled.allocation_cid = compiled.allocation.cid().encode();
+
+        let err = verifier.verify(&compiled, now).unwrap_err();
+        assert!(
+            err.to_string().contains("holder") || err.to_string().contains("resource"),
+            "substituted holder must be caught by the signed resource binding: {err}"
+        );
+    }
+
+    #[test]
+    fn verify_rejects_a_forged_grant_cid_binding() {
+        // The attacker controls both `grant_cid` and `allocation.grant`
+        // (neither is covered by the UCAN signature), so making them agree on
+        // an arbitrary string must still fail: the grant CID is recomputed
+        // from the presented UCAN, never trusted as given.
+        let issuer = TenantGrantIssuer::generate_for_test();
+        let verifier = TenantGrantVerifier::from_issuer(&issuer);
+        let now = 1_700_000_000u64;
+        let binding = binding("compute-second", 100, TenantGrantClass::Underwritten);
+        let mut compiled = issuer.compile(&binding, 1, now).unwrap();
+
+        let fake_cid = "bafyreifakefakefakefakefakefakefakefakefakefakefakefakefake".to_owned();
+        compiled.allocation.grant = fake_cid.clone();
+        compiled.grant_cid = fake_cid;
+        compiled.allocation_cid = compiled.allocation.cid().encode();
+
+        let err = verifier.verify(&compiled, now).unwrap_err();
+        assert!(
+            err.to_string().contains("recomputed"),
+            "forged grant CID must be caught by recomputation: {err}"
+        );
+    }
+
+    #[test]
+    fn verify_rejects_a_foreign_allocation_issuer() {
+        let issuer = TenantGrantIssuer::generate_for_test();
+        let verifier = TenantGrantVerifier::from_issuer(&issuer);
+        let now = 1_700_000_000u64;
+        let binding = binding("compute-second", 100, TenantGrantClass::Underwritten);
+        let mut compiled = issuer.compile(&binding, 1, now).unwrap();
+
+        compiled.allocation = AllocationRecord::new(
+            compiled.grant_cid.clone(),
+            PdsUnit {
+                code: "compute-second".to_owned(),
+                issuer: "did:web:other-operator.example".to_owned(),
+            },
+            100,
+            1,
+            "did:web:other-operator.example",
+            "did:web:tenant.acme.example",
+            PdsGrantClass::Underwritten,
+        )
+        .unwrap();
+        compiled.allocation_cid = compiled.allocation.cid().encode();
+
+        let err = verifier.verify(&compiled, now).unwrap_err();
+        assert!(
+            err.to_string().contains("issuer"),
+            "foreign allocation issuer must be rejected: {err}"
+        );
+    }
+
+    #[test]
+    fn verify_rejects_a_mismatched_allocation_cid() {
+        let issuer = TenantGrantIssuer::generate_for_test();
+        let verifier = TenantGrantVerifier::from_issuer(&issuer);
+        let now = 1_700_000_000u64;
+        let binding = binding("compute-second", 100, TenantGrantClass::Underwritten);
+        let mut compiled = issuer.compile(&binding, 1, now).unwrap();
+
+        compiled.allocation_cid = "bafyreinotwhatwascomputed".to_owned();
+
+        let err = verifier.verify(&compiled, now).unwrap_err();
+        assert!(
+            err.to_string().contains("allocation CID"),
+            "mismatched allocation CID must be rejected: {err}"
+        );
+    }
+
+    #[test]
+    fn compile_rejects_amount_above_i64_max() {
+        // No silent clamp: an amount that cannot be a signed caveat is a
+        // compile error, never a grant that fails its own verification.
+        let issuer = TenantGrantIssuer::generate_for_test();
+        let binding = binding(
+            "compute-second",
+            u64::MAX,
+            TenantGrantClass::Underwritten,
+        );
+        let err = issuer.compile(&binding, 1, 1_700_000_000).unwrap_err();
+        assert!(err.to_string().contains("amount"), "{err}");
+    }
+
+    #[test]
+    fn compile_rejects_epoch_above_i64_max() {
+        let issuer = TenantGrantIssuer::generate_for_test();
+        let binding = binding("compute-second", 1, TenantGrantClass::Underwritten);
+        let err = issuer
+            .compile(&binding, u64::MAX, 1_700_000_000)
+            .unwrap_err();
+        assert!(err.to_string().contains("epoch"), "{err}");
     }
 
     #[test]
