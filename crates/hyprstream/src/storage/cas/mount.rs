@@ -42,8 +42,9 @@ use async_trait::async_trait;
 use cas_serve::StoreError;
 use hyprstream_rpc::auth::mac::{Assurance, CompartmentSet, Lattice, Level, SecurityLabel};
 use hyprstream_rpc::Subject;
-use hyprstream_vfs::{DirEntry, Fid, Mount, MountError, Stat, OREAD, OTRUNC};
+use hyprstream_vfs::{DirEntry, Fid, Mount, MountError, Stat, ORDWR, OREAD, OTRUNC, OWRITE};
 use parking_lot::Mutex;
+use tokio::sync::Notify;
 
 use super::{CasError, CasSubstrate, DedupDomain};
 use crate::mac::ifc_join;
@@ -207,7 +208,14 @@ struct StagingSlot {
     owner: Subject,
     state: AtomicU8,
     buffer: Mutex<Vec<u8>>,
-    declared_labels: Mutex<Vec<SecurityLabel>>,
+    /// Running LUB of caller-declared labels plus how many were declared.
+    /// Folded incrementally (join is associative/commutative) so repeated
+    /// `label` commands stay O(1) memory — declared labels must not bypass the
+    /// byte quotas.
+    declared_labels: Mutex<Option<(SecurityLabel, usize)>>,
+    /// Signalled when a seal leaves `Sealing` (→ Sealed or Voided) so
+    /// concurrent commits can suspend instead of spinning.
+    seal_done: Notify,
     /// Set once the seal completes (Ok) or fails (Err). `Ok(cid)` after a
     /// successful commit; `Err(message)` after a seal failure that voided the
     /// slot. Read via ctl.
@@ -224,7 +232,8 @@ impl StagingSlot {
             owner,
             state: AtomicU8::new(SlotState::Open as u8),
             buffer: Mutex::new(Vec::new()),
-            declared_labels: Mutex::new(Vec::new()),
+            declared_labels: Mutex::new(None),
+            seal_done: Notify::new(),
             result: Mutex::new(None),
             outstanding: AtomicU64::new(0),
             slot_quota_bytes,
@@ -241,21 +250,35 @@ impl StagingSlot {
         self.buffer.lock().len()
     }
 
-    /// Push a caller-declared object label to be joined at seal time.
-    fn declare_label(&self, label: SecurityLabel) {
-        self.declared_labels.lock().push(label);
+    /// Fold a caller-declared object label into the running LUB (joined at
+    /// seal time). Rejected once the slot leaves `Open`: the state check runs
+    /// under the label lock, and the seal reads the join under the same lock
+    /// only after CAS'ing to `Sealing`, so a label accepted here is always
+    /// visible to the seal.
+    fn declare_label(&self, label: SecurityLabel) -> Result<(), MountError> {
+        let mut declared = self.declared_labels.lock();
+        if self.state() != SlotState::Open {
+            return Err(MountError::InvalidArgument(
+                "cannot declare labels on a slot that is no longer open".into(),
+            ));
+        }
+        *declared = Some(match *declared {
+            None => (label, 1),
+            Some((current, n)) => (ifc_join(&[current, label]), n.saturating_add(1)),
+        });
+        Ok(())
+    }
+
+    /// Count of labels declared so far (for ctl status).
+    fn label_count(&self) -> usize {
+        self.declared_labels.lock().map_or(0, |(_, n)| n)
     }
 
     /// The IFC-joined object label to plumb into the substrate at seal, or
     /// `None` if the caller declared nothing. This is the #699 carrier-(b)
     /// seam: subject clearance (#698) is not an input yet.
     fn joined_label(&self) -> Option<SecurityLabel> {
-        let labels = self.declared_labels.lock();
-        if labels.is_empty() {
-            None
-        } else {
-            Some(ifc_join(&labels))
-        }
+        self.declared_labels.lock().map(|(label, _)| label)
     }
 }
 
@@ -312,11 +335,21 @@ impl StagingRegistry {
         if slot.outstanding.fetch_sub(1, Ordering::AcqRel) != 1 {
             return;
         }
-        // Last reference gone.
-        if slot.state() == SlotState::Open {
+        // Last reference gone. CAS Open→Voided so an in-flight seal (Sealing)
+        // is never clobbered; the byte count is read under the buffer lock
+        // *after* winning the CAS so it pairs exactly with what was reserved.
+        if slot
+            .state
+            .compare_exchange(
+                SlotState::Open as u8,
+                SlotState::Voided as u8,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+        {
             // Cluck-without-commit → discard.
             let dropped = slot.buffer.lock().len() as u64;
-            slot.state.store(SlotState::Voided as u8, Ordering::Release);
             self.adjust_subject(&slot.owner, -(dropped as i64));
         }
         self.slots.lock().remove(id);
@@ -351,6 +384,27 @@ impl StagingRegistry {
         }
     }
 
+    /// Atomically check-and-reserve `growth` bytes of aggregate staging budget
+    /// under a single `subject_bytes` lock, so two concurrent writes cannot
+    /// both observe the same usage and overshoot the quota. Returns the
+    /// current usage on rejection.
+    fn try_reserve(&self, owner: &Subject, growth: u64, limit: u64) -> Result<(), u64> {
+        let key = owner_key(owner);
+        let mut map = self.subject_bytes.lock();
+        let current = map.get(&key).copied().unwrap_or(0);
+        let new_total = current.saturating_add(growth);
+        if new_total > limit {
+            return Err(current);
+        }
+        if new_total > 0 {
+            map.insert(key, new_total);
+        }
+        Ok(())
+    }
+
+    /// Current aggregate usage for a subject (test observability; production
+    /// paths reserve via [`Self::try_reserve`]).
+    #[cfg(test)]
     fn subject_usage(&self, owner: &Subject) -> u64 {
         self.subject_bytes
             .lock()
@@ -508,15 +562,28 @@ impl CasMount {
                         };
                     }
                     SlotState::Sealing => {
-                        // Another commit is mid-flight. Retry once; in practice
-                        // staging slots are single-writer, so this is rare.
-                        std::thread::yield_now();
+                        // Another commit is mid-`put`. Suspend until it leaves
+                        // Sealing (never spin — on a current-thread runtime a
+                        // spin here would starve the in-flight seal). `enable`
+                        // registers the waiter *before* the state re-check so
+                        // a `notify_waiters` between the failed CAS and the
+                        // await cannot be missed.
+                        let notified = slot.seal_done.notified();
+                        tokio::pin!(notified);
+                        notified.as_mut().enable();
+                        if slot.state() == SlotState::Sealing {
+                            notified.await;
+                        }
                         continue;
                     }
                     SlotState::Voided => {
-                        return Err(MountError::InvalidArgument(
-                            "cannot commit a voided staging slot".into(),
-                        ));
+                        // Surface a concurrent seal failure's message if any.
+                        return match slot.result.lock().clone() {
+                            Some(Err(e)) => Err(MountError::Io(e)),
+                            _ => Err(MountError::InvalidArgument(
+                                "cannot commit a voided staging slot".into(),
+                            )),
+                        };
                     }
                     SlotState::Open => continue,
                 },
@@ -534,6 +601,7 @@ impl CasMount {
                 let cid = manifest.cid.clone();
                 *slot.result.lock() = Some(Ok(cid.clone()));
                 slot.state.store(SlotState::Sealed as u8, Ordering::Release);
+                slot.seal_done.notify_waiters();
                 // Bytes have left staging (now durable in the substrate).
                 self.staging
                     .adjust_subject(&slot.owner, -(bytes.len() as i64));
@@ -543,6 +611,7 @@ impl CasMount {
                 let msg = err.to_string();
                 *slot.result.lock() = Some(Err(msg.clone()));
                 slot.state.store(SlotState::Voided as u8, Ordering::Release);
+                slot.seal_done.notify_waiters();
                 // Failure voids the slot; bytes are discarded.
                 self.staging
                     .adjust_subject(&slot.owner, -(bytes.len() as i64));
@@ -554,6 +623,7 @@ impl CasMount {
     /// Process one ctl command line. Returns bytes consumed (= line length).
     async fn ctl_command(
         &self,
+        id: &str,
         slot: &Arc<StagingSlot>,
         line: &str,
         caller: &Subject,
@@ -562,24 +632,41 @@ impl CasMount {
         match tokens.next() {
             None => Ok(()), // blank line
             Some("commit") => {
-                self.authorize(caller, CasMountObjectKind::Stage, "ctl", "stage:commit")?;
+                self.authorize(caller, CasMountObjectKind::Stage, id, "stage:commit")?;
                 self.seal_slot(slot).await.map(|_| ())
             }
             Some("abort") => {
-                if slot.state() == SlotState::Sealed {
-                    return Err(MountError::InvalidArgument(
-                        "cannot abort a sealed staging slot".into(),
-                    ));
+                // CAS Open→Voided so an in-flight seal is never clobbered: a
+                // commit that has already taken the bytes must not have its
+                // Sealed result overwritten by a racing abort.
+                match slot.state.compare_exchange(
+                    SlotState::Open as u8,
+                    SlotState::Voided as u8,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) => {
+                        let dropped = {
+                            let mut buf = slot.buffer.lock();
+                            let n = buf.len() as u64;
+                            buf.clear();
+                            n
+                        };
+                        self.staging.adjust_subject(&slot.owner, -(dropped as i64));
+                        Ok(())
+                    }
+                    Err(actual) => match SlotState::from_u8(actual) {
+                        SlotState::Sealed => Err(MountError::InvalidArgument(
+                            "cannot abort a sealed staging slot".into(),
+                        )),
+                        SlotState::Sealing => Err(MountError::InvalidArgument(
+                            "cannot abort while a commit is sealing".into(),
+                        )),
+                        // Idempotent: aborting a voided slot is a no-op.
+                        SlotState::Voided => Ok(()),
+                        SlotState::Open => unreachable!("CAS from Open cannot fail with Open"),
+                    },
                 }
-                let dropped = {
-                    let mut buf = slot.buffer.lock();
-                    let n = buf.len() as u64;
-                    buf.clear();
-                    n
-                };
-                slot.state.store(SlotState::Voided as u8, Ordering::Release);
-                self.staging.adjust_subject(&slot.owner, -(dropped as i64));
-                Ok(())
             }
             Some("label") => self.declare_label_cmd(slot, tokens.collect()),
             Some(cmd) => Err(MountError::InvalidArgument(format!(
@@ -623,15 +710,14 @@ impl CasMount {
                 .label(level, assurance, comps)
                 .map_err(|e| MountError::InvalidArgument(format!("label: {e}")))?
         };
-        slot.declare_label(label);
-        Ok(())
+        slot.declare_label(label)
     }
 
     /// Render the ctl status text.
     fn ctl_status(&self, slot: &Arc<StagingSlot>) -> String {
         match slot.state() {
             SlotState::Open => {
-                let labels = slot.declared_labels.lock().len();
+                let labels = slot.label_count();
                 format!(
                     "state=staging bytes={} labels={} quota={}\n",
                     slot.len(),
@@ -668,14 +754,39 @@ enum CasFid {
         id: String,
         opened: bool,
     },
+    /// `mode` is `Some(open-mode & 0x03)` once opened; reads require
+    /// OREAD/ORDWR and writes OWRITE/ORDWR — a fid opened write-only must not
+    /// read the staged bytes and vice versa.
     StageData {
         id: String,
-        opened: bool,
+        mode: Option<u8>,
     },
     StageCtl {
         id: String,
-        opened: bool,
+        mode: Option<u8>,
     },
+}
+
+/// Enforce that an opened stage fid's mode permits reading.
+fn check_readable(mode: Option<u8>) -> Result<(), MountError> {
+    match mode {
+        None => Err(MountError::InvalidArgument("fid is not open".into())),
+        Some(OREAD) | Some(ORDWR) => Ok(()),
+        Some(_) => Err(MountError::PermissionDenied(
+            "fid is not open for reading".into(),
+        )),
+    }
+}
+
+/// Enforce that an opened stage fid's mode permits writing.
+fn check_writable(mode: Option<u8>) -> Result<(), MountError> {
+    match mode {
+        None => Err(MountError::InvalidArgument("fid is not open".into())),
+        Some(OWRITE) | Some(ORDWR) => Ok(()),
+        Some(_) => Err(MountError::PermissionDenied(
+            "fid is not open for writing".into(),
+        )),
+    }
 }
 
 impl CasFid {
@@ -721,7 +832,7 @@ impl Mount for CasMount {
                 self.staging.inc_outstanding(&slot);
                 CasFid::StageData {
                     id: (*id).to_owned(),
-                    opened: false,
+                    mode: None,
                 }
             }
             ["stage", id, "ctl"] if !id.is_empty() => {
@@ -729,7 +840,7 @@ impl Mount for CasMount {
                 self.staging.inc_outstanding(&slot);
                 CasFid::StageCtl {
                     id: (*id).to_owned(),
-                    opened: false,
+                    mode: None,
                 }
             }
             _ => return Err(MountError::NotFound(components.join("/"))),
@@ -762,9 +873,9 @@ impl Mount for CasMount {
                 *opened = true;
                 Ok(())
             }
-            CasFid::StageData { id, opened } | CasFid::StageCtl { id, opened } => {
+            CasFid::StageData { id, mode: m } | CasFid::StageCtl { id, mode: m } => {
                 let _slot = self.slot_for(id, caller)?;
-                *opened = true;
+                *m = Some(mode & 0x03);
                 Ok(())
             }
         }
@@ -793,18 +904,16 @@ impl Mount for CasMount {
                 let bytes = self.read_all(*kind, address).await?;
                 Ok(slice_bytes(&bytes, offset, count))
             }
-            CasFid::StageData { id, opened } => {
-                if !opened {
-                    return Err(MountError::InvalidArgument("fid is not open".into()));
-                }
+            CasFid::StageData { id, mode } => {
+                check_readable(*mode)?;
                 let slot = self.slot_for(id, caller)?;
-                let bytes = slot.buffer.lock().clone();
+                // Slice under the lock — never clone the whole staged buffer
+                // (up to the slot quota) for a small positioned read.
+                let bytes = slot.buffer.lock();
                 Ok(slice_bytes(&bytes, offset, count))
             }
-            CasFid::StageCtl { id, opened } => {
-                if !opened {
-                    return Err(MountError::InvalidArgument("fid is not open".into()));
-                }
+            CasFid::StageCtl { id, mode } => {
+                check_readable(*mode)?;
                 let slot = self.slot_for(id, caller)?;
                 let status = self.ctl_status(&slot);
                 Ok(slice_bytes(status.as_bytes(), offset, count))
@@ -830,19 +939,10 @@ impl Mount for CasMount {
             .downcast_ref::<CasFid>()
             .ok_or_else(|| MountError::InvalidArgument("wrong fid type for CasMount".into()))?;
         match inner {
-            CasFid::StageData { id, opened } => {
-                if !opened {
-                    return Err(MountError::InvalidArgument("fid is not open".into()));
-                }
+            CasFid::StageData { id, mode } => {
+                check_writable(*mode)?;
                 let slot = self.slot_for(id, caller)?;
                 self.authorize(caller, CasMountObjectKind::Stage, id, "stage:write")?;
-
-                if slot.state() != SlotState::Open {
-                    return Err(MountError::InvalidArgument(format!(
-                        "staging slot {id} is not open for writes (state={:?})",
-                        slot.state()
-                    )));
-                }
 
                 let off = usize::try_from(offset)
                     .map_err(|_| MountError::InvalidArgument("write offset overflow".into()))?;
@@ -858,19 +958,36 @@ impl Mount for CasMount {
                     )));
                 }
 
-                // Per-Subject aggregate quota: account the growth delta.
                 let mut buf = slot.buffer.lock();
+                // Check the state *under the buffer lock*: the seal takes the
+                // buffer under this lock only after CAS'ing to Sealing, and
+                // abort/cluck clear it under this lock only after CAS'ing to
+                // Voided — so Open observed here means these bytes are either
+                // included in the seal or released with the void, never
+                // written to a buffer that was already taken.
+                if slot.state() != SlotState::Open {
+                    return Err(MountError::InvalidArgument(format!(
+                        "staging slot {id} is not open for writes (state={:?})",
+                        slot.state()
+                    )));
+                }
+
+                // Per-Subject aggregate quota: atomically check-and-reserve
+                // the growth delta so concurrent writes can't both pass the
+                // check and overshoot.
                 let prev_len = buf.len();
                 let growth = end.saturating_sub(prev_len);
-                let usage = self.staging.subject_usage(caller);
-                if growth > 0
-                    && usage.saturating_add(growth as u64)
-                        > self.staging_cfg.subject_quota_bytes as u64
-                {
-                    return Err(MountError::PermissionDenied(format!(
-                        "subject staging quota exceeded: {} + {growth} > {}",
-                        usage, self.staging_cfg.subject_quota_bytes
-                    )));
+                if growth > 0 {
+                    if let Err(usage) = self.staging.try_reserve(
+                        caller,
+                        growth as u64,
+                        self.staging_cfg.subject_quota_bytes as u64,
+                    ) {
+                        return Err(MountError::PermissionDenied(format!(
+                            "subject staging quota exceeded: {} + {growth} > {}",
+                            usage, self.staging_cfg.subject_quota_bytes
+                        )));
+                    }
                 }
 
                 if end > buf.len() {
@@ -880,20 +997,15 @@ impl Mount for CasMount {
                     buf[off..end].copy_from_slice(data);
                 }
                 drop(buf);
-                if growth > 0 {
-                    self.staging.adjust_subject(caller, growth as i64);
-                }
                 Ok(data.len() as u32)
             }
-            CasFid::StageCtl { id, opened } => {
-                if !opened {
-                    return Err(MountError::InvalidArgument("fid is not open".into()));
-                }
+            CasFid::StageCtl { id, mode } => {
+                check_writable(*mode)?;
                 let slot = self.slot_for(id, caller)?;
                 let line = std::str::from_utf8(data)
                     .map_err(|_| MountError::InvalidArgument("ctl command is not UTF-8".into()))?;
                 // Accept a single command per write (trailing newline trimmed).
-                self.ctl_command(&slot, line.trim_end_matches(['\n', '\r']), caller)
+                self.ctl_command(id, &slot, line.trim_end_matches(['\n', '\r']), caller)
                     .await?;
                 Ok(data.len() as u32)
             }
@@ -1622,6 +1734,144 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, MountError::InvalidArgument(_)));
+        mount.clunk(ctl, &caller).await;
+    }
+
+    #[tokio::test]
+    async fn stage_fid_open_modes_are_enforced() {
+        let dir = tempfile::tempdir().unwrap();
+        let mount = staging_mount(CasSubstrate::new(dir.path()), 1 << 20, 4 << 20);
+        let caller = Subject::new("alice");
+        let (id, _root) = create_stage(&mount, &caller).await;
+
+        // A write-only data fid must not read staged bytes.
+        let mut wo = mount.walk(&["stage", &id, "data"], &caller).await.unwrap();
+        mount.open(&mut wo, OWRITE, &caller).await.unwrap();
+        mount.write(&wo, 0, b"secret", &caller).await.unwrap();
+        let err = mount.read(&wo, 0, 64, &caller).await.unwrap_err();
+        assert!(matches!(err, MountError::PermissionDenied(_)));
+
+        // A read-only data fid must not write.
+        let mut ro = mount.walk(&["stage", &id, "data"], &caller).await.unwrap();
+        mount.open(&mut ro, OREAD, &caller).await.unwrap();
+        let err = mount.write(&ro, 0, b"x", &caller).await.unwrap_err();
+        assert!(matches!(err, MountError::PermissionDenied(_)));
+        assert_eq!(mount.read(&ro, 0, 64, &caller).await.unwrap(), b"secret");
+
+        // An unopened fid is rejected outright.
+        let unopened = mount.walk(&["stage", &id, "ctl"], &caller).await.unwrap();
+        let err = mount.read(&unopened, 0, 64, &caller).await.unwrap_err();
+        assert!(matches!(err, MountError::InvalidArgument(_)));
+
+        for f in [wo, ro, unopened] {
+            mount.clunk(f, &caller).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn abort_after_seal_is_rejected_and_abort_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let mount = staging_mount(CasSubstrate::new(dir.path()), 1 << 20, 4 << 20);
+        let caller = Subject::new("alice");
+
+        // Abort after a successful commit must not clobber the sealed state.
+        let (id, _root) = create_stage(&mount, &caller).await;
+        let (data, ctl) = open_data_ctl(&mount, &id, &caller).await;
+        mount
+            .write(&data, 0, b"sealed-bytes", &caller)
+            .await
+            .unwrap();
+        mount.write(&ctl, 0, b"commit\n", &caller).await.unwrap();
+        let err = mount.write(&ctl, 0, b"abort\n", &caller).await.unwrap_err();
+        assert!(matches!(err, MountError::InvalidArgument(_)));
+        let status = ctl_str(&mount, &ctl, &caller).await;
+        assert!(status.contains("state=sealed"), "got: {status}");
+        mount.clunk(data, &caller).await;
+        mount.clunk(ctl, &caller).await;
+
+        // A second abort of a voided slot is an idempotent no-op.
+        let (id2, _root2) = create_stage(&mount, &caller).await;
+        let (d2, c2) = open_data_ctl(&mount, &id2, &caller).await;
+        mount.write(&c2, 0, b"abort\n", &caller).await.unwrap();
+        mount.write(&c2, 0, b"abort\n", &caller).await.unwrap();
+        let status = ctl_str(&mount, &c2, &caller).await;
+        assert!(status.contains("state=voided"), "got: {status}");
+        mount.clunk(d2, &caller).await;
+        mount.clunk(c2, &caller).await;
+    }
+
+    #[tokio::test]
+    async fn label_after_seal_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let mount = staging_mount(CasSubstrate::new(dir.path()), 1 << 20, 4 << 20);
+        let caller = Subject::new("alice");
+        let (id, _root) = create_stage(&mount, &caller).await;
+        let (data, ctl) = open_data_ctl(&mount, &id, &caller).await;
+        mount.write(&data, 0, b"bytes", &caller).await.unwrap();
+        mount.write(&ctl, 0, b"commit\n", &caller).await.unwrap();
+        let err = mount
+            .write(&ctl, 0, b"label secret pqhybrid\n", &caller)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, MountError::InvalidArgument(_)));
+        mount.clunk(data, &caller).await;
+        mount.clunk(ctl, &caller).await;
+    }
+
+    #[tokio::test]
+    async fn concurrent_commits_converge_on_one_cid() {
+        let dir = tempfile::tempdir().unwrap();
+        let mount = staging_mount(CasSubstrate::new(dir.path()), 1 << 20, 4 << 20);
+        let caller = Subject::new("alice");
+        let (id, _root) = create_stage(&mount, &caller).await;
+        let (data, ctl) = open_data_ctl(&mount, &id, &caller).await;
+        mount
+            .write(&data, 0, b"raced-bytes", &caller)
+            .await
+            .unwrap();
+
+        // Two commits racing on the same slot: exactly one seals, the other
+        // waits on the seal (never spinning) and converges on the same CID.
+        let (a, b) = tokio::join!(
+            mount.write(&ctl, 0, b"commit\n", &caller),
+            mount.write(&ctl, 0, b"commit\n", &caller),
+        );
+        a.unwrap();
+        b.unwrap();
+        let status = ctl_str(&mount, &ctl, &caller).await;
+        assert!(status.contains("state=sealed cid="), "got: {status}");
+        mount.clunk(data, &caller).await;
+        mount.clunk(ctl, &caller).await;
+    }
+
+    #[tokio::test]
+    async fn commit_authorizes_with_staging_id_address() {
+        let dir = tempfile::tempdir().unwrap();
+        let authz = std::sync::Arc::new(RecordingAuthorizer::default());
+        let mount = CasMount::with_authorizer_and_staging(
+            CasSubstrate::new(dir.path()),
+            DedupDomain::local_default(),
+            authz.clone(),
+            StagingConfig::default(),
+        );
+        let caller = Subject::new("alice");
+        let (id, _root) = create_stage(&mount, &caller).await;
+        let (data, ctl) = open_data_ctl(&mount, &id, &caller).await;
+        mount
+            .write(&data, 0, b"authz-bytes", &caller)
+            .await
+            .unwrap();
+        mount.write(&ctl, 0, b"commit\n", &caller).await.unwrap();
+
+        // The commit authorization must address the staging id, not "ctl".
+        let commit_calls: Vec<_> = authz
+            .calls()
+            .into_iter()
+            .filter(|(_, _, _, op)| *op == "stage:commit")
+            .collect();
+        assert_eq!(commit_calls.len(), 1);
+        assert_eq!(commit_calls[0].2, id);
+        mount.clunk(data, &caller).await;
         mount.clunk(ctl, &caller).await;
     }
 
