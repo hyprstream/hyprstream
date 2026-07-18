@@ -1371,12 +1371,17 @@ impl SignedEnvelope {
     pub fn new_signed(envelope: RequestEnvelope, signing_key: &SigningKey) -> Self {
         // Default policy is Classical for the bare Ed25519-only constructor so
         // that callers that don't supply a PQ key produce verifiable envelopes.
+        // Infallible: Classical never requires a PQ key, so the only failure
+        // left is a CBOR-encoding error over fixed-shape COSE structures —
+        // fail loud rather than emit a fail-open empty composite.
+        #[allow(clippy::expect_used)]
         Self::new_signed_with_policy(
             envelope,
             signing_key,
             None,
             crate::crypto::CryptoPolicy::Classical,
         )
+        .expect("COSE composite signing must not fail for valid keys")
     }
 
     /// Create and dual-sign a new envelope with Ed25519 + ML-DSA-65 (Hybrid).
@@ -1385,12 +1390,17 @@ impl SignedEnvelope {
         signing_key: &SigningKey,
         pq_signing_key: &crate::crypto::pq::MlDsaSigningKey,
     ) -> Self {
+        // Infallible: the PQ key is statically present, so the only failure
+        // left is a CBOR-encoding error over fixed-shape COSE structures —
+        // fail loud rather than emit a fail-open empty composite.
+        #[allow(clippy::expect_used)]
         Self::new_signed_with_policy(
             envelope,
             signing_key,
             Some(pq_signing_key),
             crate::crypto::CryptoPolicy::Hybrid,
         )
+        .expect("COSE composite signing must not fail for valid keys")
     }
 
     /// Create and sign a new envelope under an explicit [`CryptoPolicy`].
@@ -1405,7 +1415,7 @@ impl SignedEnvelope {
         signing_key: &SigningKey,
         pq_signing_key: Option<&crate::crypto::pq::MlDsaSigningKey>,
         policy: crate::crypto::CryptoPolicy,
-    ) -> Self {
+    ) -> Result<Self> {
         if envelope.wth.is_none() {
             if let Some(jwt) = envelope.jwt_token() {
                 use sha2::{Digest, Sha256};
@@ -1415,15 +1425,13 @@ impl SignedEnvelope {
 
         let envelope_bytes = envelope.to_bytes();
         let signature = signing_key.sign(&envelope_bytes);
-        // SECURITY: no empty-cose fallback. A COSE build failure is a
-        // should-never-happen crypto-encoding error (CBOR-encoding fixed-shape
-        // COSE_Sign1 structures over valid keys); fail loud rather than silently
-        // emit an empty (and thus potentially fail-open) composite.
-        #[allow(clippy::expect_used)]
-        let cose = Self::build_cose(signing_key, pq_signing_key, policy, &envelope_bytes)
-            .expect("COSE composite signing must not fail for valid keys");
+        // SECURITY: no empty-cose fallback. A missing mandatory PQ key or a
+        // COSE encoding error is a fail-closed construction error propagated
+        // to the caller — never substitute an empty (and thus potentially
+        // fail-open) composite, never downgrade to classical.
+        let cose = Self::build_cose(signing_key, pq_signing_key, policy, &envelope_bytes)?;
 
-        Self {
+        Ok(Self {
             envelope,
             sig: signature.to_bytes(),
             cnf: signing_key.verifying_key().to_bytes(),
@@ -1432,7 +1440,7 @@ impl SignedEnvelope {
             cose,
             policy,
             pq_kem_ciphertext: None,
-        }
+        })
     }
 
     /// Build the nested COSE composite signature for the given signing-data per
@@ -2176,6 +2184,10 @@ impl ResponseEnvelope {
     /// This constructor is absent from production builds.
     #[cfg(any(test, feature = "test-classical-policy"))]
     pub fn new_signed(request_id: u64, payload: Vec<u8>, signing_key: &SigningKey) -> Self {
+        // Infallible: Classical never requires a PQ key, so the only failure
+        // left is a CBOR-encoding error over fixed-shape COSE structures —
+        // fail loud rather than emit a fail-open empty composite.
+        #[allow(clippy::expect_used)]
         Self::new_signed_with_policy(
             request_id,
             payload,
@@ -2183,6 +2195,7 @@ impl ResponseEnvelope {
             None,
             crate::crypto::CryptoPolicy::Classical,
         )
+        .expect("COSE composite signing must not fail for valid keys")
     }
 
     /// Create and dual-sign a response with Ed25519 + ML-DSA-65 (Hybrid).
@@ -2192,6 +2205,10 @@ impl ResponseEnvelope {
         signing_key: &SigningKey,
         pq_signing_key: &crate::crypto::pq::MlDsaSigningKey,
     ) -> Self {
+        // Infallible: the PQ key is statically present, so the only failure
+        // left is a CBOR-encoding error over fixed-shape COSE structures —
+        // fail loud rather than emit a fail-open empty composite.
+        #[allow(clippy::expect_used)]
         Self::new_signed_with_policy(
             request_id,
             payload,
@@ -2199,39 +2216,40 @@ impl ResponseEnvelope {
             Some(pq_signing_key),
             crate::crypto::CryptoPolicy::Hybrid,
         )
+        .expect("COSE composite signing must not fail for valid keys")
     }
 
     /// Create and sign a response under an explicit [`CryptoPolicy`].
     ///
     /// Mirrors [`SignedEnvelope::new_signed_with_policy`]:
     /// - `Hybrid`: EdDSA + ML-DSA-65 nested composite; `pq_signing_key` MUST be
-    ///   `Some`; absence is a fail-closed construction error.
+    ///   `Some`; absence is a fail-closed construction error returned as `Err`.
     ///
     /// `sig`/`cnf` are always populated with the raw EdDSA signature + signer
-    /// public key. The COSE build is **fail-closed**: a COSE encoding error
-    /// panics rather than silently emitting an empty (fail-open) composite,
-    /// matching the request side.
+    /// public key. The COSE build is **fail-closed**: a missing mandatory PQ
+    /// key or a COSE encoding error is propagated as `Err` rather than
+    /// silently emitting an empty (fail-open) composite, matching the request
+    /// side.
     pub fn new_signed_with_policy(
         request_id: u64,
         payload: Vec<u8>,
         signing_key: &SigningKey,
         pq_signing_key: Option<&crate::crypto::pq::MlDsaSigningKey>,
         policy: crate::crypto::CryptoPolicy,
-    ) -> Self {
+    ) -> Result<Self> {
         let signing_data = Self::signing_data(request_id, &payload);
 
         let signature_obj = signing_key.sign(&signing_data);
         let sig: [u8; 64] = signature_obj.to_bytes();
         let cnf: [u8; 32] = signing_key.verifying_key().to_bytes();
 
-        // SECURITY: no empty-cose fallback (mirrors SignedEnvelope). A COSE build
-        // failure is a should-never-happen crypto-encoding error; fail loud
-        // rather than emit a potentially fail-open empty composite.
-        #[allow(clippy::expect_used)]
-        let cose = Self::build_cose(signing_key, pq_signing_key, policy, &signing_data)
-            .expect("COSE composite signing must not fail for valid keys");
+        // SECURITY: no empty-cose fallback (mirrors SignedEnvelope). A missing
+        // mandatory PQ key or a COSE encoding error is a fail-closed
+        // construction error propagated to the caller — never substitute an
+        // empty (fail-open) composite, never downgrade to classical.
+        let cose = Self::build_cose(signing_key, pq_signing_key, policy, &signing_data)?;
 
-        Self {
+        Ok(Self {
             request_id,
             payload,
             encrypted_response: None,
@@ -2239,7 +2257,7 @@ impl ResponseEnvelope {
             cnf,
             cose,
             policy,
-        }
+        })
     }
 
     /// Seal a unary response to the request's one-shot recipient, then
@@ -3648,9 +3666,32 @@ mod tests {
             &sk,
             None,
             CryptoPolicy::Classical,
-        );
+        )
+        .expect("classical signing");
         signed.verify_with(&vk, &cache, None, CryptoPolicy::Classical)?;
         Ok(())
+    }
+
+    /// Hybrid construction without a PQ key is a fail-closed `Err` — not a
+    /// panic, and never a silent classical downgrade.
+    #[test]
+    fn m3_hybrid_without_pq_key_errors() {
+        let (sk, _vk) = generate_signing_keypair();
+        assert!(SignedEnvelope::new_signed_with_policy(
+            RequestEnvelope::anonymous(vec![1]),
+            &sk,
+            None,
+            CryptoPolicy::Hybrid,
+        )
+        .is_err());
+        assert!(ResponseEnvelope::new_signed_with_policy(
+            1,
+            vec![1],
+            &sk,
+            None,
+            CryptoPolicy::Hybrid,
+        )
+        .is_err());
     }
 
     /// hybrid: sign + verify composite (both EdDSA + ML-DSA-65 checked).

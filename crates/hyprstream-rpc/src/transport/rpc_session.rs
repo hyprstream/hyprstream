@@ -445,13 +445,21 @@ pub fn build_error_envelope(
 ) -> Bytes {
     use crate::ToCapnp;
     use capnp::{message::Builder, serialize};
-    let envelope = crate::envelope::ResponseEnvelope::new_signed_with_policy(
+    let envelope = match crate::envelope::ResponseEnvelope::new_signed_with_policy(
         0,
         message.as_bytes().to_vec(),
         signing_key,
         Some(pq_signing_key),
         crate::crypto::CryptoPolicy::Hybrid,
-    );
+    ) {
+        Ok(envelope) => envelope,
+        Err(e) => {
+            // Fail closed: never substitute a weaker envelope. The client sees
+            // EOF instead of a signed error response.
+            tracing::error!(error = ?e, "rpc-session: failed signing error envelope");
+            return Bytes::new();
+        }
+    };
     let mut msg = Builder::new_default();
     {
         let mut builder = msg.init_root::<crate::common_capnp::response_envelope::Builder>();

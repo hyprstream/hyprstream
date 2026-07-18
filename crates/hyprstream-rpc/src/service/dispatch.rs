@@ -69,12 +69,6 @@ where
     //    process-global verify configuration installed at startup (Hybrid
     //    ENFORCED in the daemon). This closes the prior fail-open where the
     //    site hardcoded Classical / no PQ store.
-    // Refuse before admission/dispatch if the service cannot emit the mandatory
-    // pinned hybrid response suite. Missing key material is never a signal to
-    // construct a classical response.
-    let response_pq_key = service.pq_signing_key().ok_or_else(|| {
-        anyhow::anyhow!("service has no ML-DSA-65 response signing key (mandatory Hybrid suite)")
-    })?;
     let pq_store_holder = crate::envelope::global_pq_store();
     let base = match verification {
         EnvelopeVerification::FixedSigner(pubkey) => {
@@ -120,6 +114,14 @@ where
             "authenticated network request omitted responseKemRecipient; dropping without response"
         );
     }
+    // Refuse before dispatch if the service cannot emit the mandatory pinned
+    // hybrid response suite. Missing key material is never a signal to
+    // construct a classical response. Deliberately checked only after envelope
+    // authentication: the default `pq_signing_key()` derives an ML-DSA key per
+    // call, and unauthenticated input must not be able to trigger that work.
+    let response_pq_key = service.pq_signing_key().ok_or_else(|| {
+        anyhow::anyhow!("service has no ML-DSA-65 response signing key (mandatory Hybrid suite)")
+    })?;
     let response_recipient = ctx.response_kem_recipient.clone();
     let request_iat = ctx.request_iat;
     let request_nonce = ctx.request_nonce;
@@ -140,13 +142,13 @@ where
             )
             .map_err(Into::into)
         } else {
-            Ok(ResponseEnvelope::new_signed_with_policy(
+            ResponseEnvelope::new_signed_with_policy(
                 request_id,
                 payload,
                 signing_key,
                 Some(&response_pq_key),
                 crate::crypto::CryptoPolicy::Hybrid,
-            ))
+            )
         }
     };
     debug!(

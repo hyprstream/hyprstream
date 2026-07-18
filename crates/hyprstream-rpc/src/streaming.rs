@@ -1272,8 +1272,18 @@ mod tests {
         } else {
             crate::crypto::CryptoPolicy::Classical
         };
-        let signed =
-            SignedEnvelope::new_signed_with_policy(envelope, signing_key, pq_signing_key, policy);
+        let signed = match SignedEnvelope::new_signed_with_policy(
+            envelope,
+            signing_key,
+            pq_signing_key,
+            policy,
+        ) {
+            Ok(signed) => signed,
+            Err(e) => {
+                tracing::error!("Failed to sign envelope: {e}");
+                return Vec::new();
+            }
+        };
         let mut msg = Builder::new_default();
         {
             let mut builder = msg.init_root::<common_capnp::signed_envelope::Builder>();

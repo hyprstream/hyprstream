@@ -306,9 +306,13 @@ application dispatch or response use.
 The mandatory hybrid signature covers the complete COSE_Encrypt0 bytes. Sealed
 responses additionally bind the retained request ID and expected service domain:
 
-```
+```text
 request_signing_data  = canonical_cose_encrypt0
-response_signing_data = domain || request_id || service_domain || canonical_cose_encrypt0
+response_signing_data = "hykem-rpc-response-signature-v2\0"
+                     || request_id (u64 LE)
+                     || len(service_domain) (u16 LE)
+                     || service_domain
+                     || canonical_cose_encrypt0
 ```
 
 Constructors: `SignedEnvelope::new_signed_encrypted_mesh_kem()` for requests and
