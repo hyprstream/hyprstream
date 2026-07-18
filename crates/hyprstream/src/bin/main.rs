@@ -232,6 +232,12 @@ fn build_cli() -> ClapCommand {
                     .long("server")
                     .required(false)
                     .help("OAuth server URL (default: from config or http://localhost:6791)"),
+            )
+            .arg(
+                Arg::new("insecure")
+                    .long("insecure")
+                    .action(clap::ArgAction::SetTrue)
+                    .help("Disable TLS certificate verification (use only against a trusted local dev server). By default the local self-signed dev cert is trusted automatically."),
             ),
     );
 
@@ -2706,13 +2712,28 @@ fn main() -> Result<()> {
             let nonce = sub_m.get_one::<String>("nonce").cloned();
             let code_challenge = sub_m.get_one::<String>("code_challenge").cloned();
             let server = sub_m.get_one::<String>("server").cloned();
+            let insecure = sub_m.get_flag("insecure");
+            // Pass the already-loaded config (honors `--config`) so the OAuth
+            // issuer URL and the local self-signed cert's secrets dir are
+            // resolved from the user's selected configuration, not re-derived
+            // from defaults (#450). `config_for_service` is the surviving
+            // clone (`config` itself is moved into AppContext above).
+            let sign_cfg = config_for_service.clone();
             with_runtime(
                 RuntimeConfig {
                     device: DeviceConfig::request_cpu(),
                     multi_threaded: false,
                 },
                 || async move {
-                    handle_sign_challenge(user_code, nonce, code_challenge, server).await
+                    handle_sign_challenge(
+                        user_code,
+                        nonce,
+                        code_challenge,
+                        server,
+                        insecure,
+                        Some(&sign_cfg),
+                    )
+                    .await
                 },
             )?;
         }
