@@ -962,18 +962,21 @@ impl Mount for CasMount {
                     })
                     .collect())
             }
-            CasFid::StageRoot { .. } => Ok(vec![
+            CasFid::StageRoot { id, .. } => Ok(vec![
                 DirEntry {
                     name: "data".to_owned(),
                     is_dir: false,
                     size: 0,
-                    stat: Some(staging_file_stat("data", 0)),
+                    // The qid path must include the staging id so 9P clients do
+                    // not alias `stage/<a>/data` with `stage/<b>/data` in a
+                    // qid-keyed cache (qid is 9P's file identity).
+                    stat: Some(staging_file_stat(id, "data", 0)),
                 },
                 DirEntry {
                     name: "ctl".to_owned(),
                     is_dir: false,
                     size: 0,
-                    stat: Some(staging_file_stat("ctl", 0)),
+                    stat: Some(staging_file_stat(id, "ctl", 0)),
                 },
             ]),
             other => Err(MountError::NotDirectory(
@@ -999,12 +1002,12 @@ impl Mount for CasMount {
             CasFid::StageRoot { id, .. } => Ok(staging_dir_stat(id)),
             CasFid::StageData { id, .. } => {
                 let slot = self.slot_for(id, caller)?;
-                Ok(staging_file_stat("data", slot.len() as u64))
+                Ok(staging_file_stat(id, "data", slot.len() as u64))
             }
             CasFid::StageCtl { id, .. } => {
                 let slot = self.slot_for(id, caller)?;
                 let len = self.ctl_status(&slot).len() as u64;
-                Ok(staging_file_stat("ctl", len))
+                Ok(staging_file_stat(id, "ctl", len))
             }
         }
     }
@@ -1085,11 +1088,16 @@ fn staging_dir_stat(id: &str) -> Stat {
     }
 }
 
-fn staging_file_stat(name: &str, size: u64) -> Stat {
+fn staging_file_stat(id: &str, name: &str, size: u64) -> Stat {
     Stat {
         qtype: QTFILE,
         version: 1,
-        path: hash_path(name),
+        // The qid path includes the staging id so two slots' `data` (or `ctl`)
+        // files never share a qid — qid is 9P's file identity, and a qid-keyed
+        // client cache would otherwise alias `stage/<a>/data` with
+        // `stage/<b>/data`. (Advisory hint only — see the qid-soundness note on
+        // `hyprstream_vfs::Stat`; authz never keys on this.)
+        path: hash_path(&format!("stage/{id}/{name}")),
         size,
         name: name.to_owned(),
         mtime: 0,
@@ -1615,5 +1623,50 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, MountError::InvalidArgument(_)));
         mount.clunk(ctl, &caller).await;
+    }
+
+    #[tokio::test]
+    async fn staging_qids_are_distinct_per_slot_and_file() {
+        // Regression guard for the qid-aliasing finding: a 9P client keys a
+        // file cache on qid path, so two slots' `data` files (and `data` vs
+        // `ctl`) MUST NOT share a qid. The path is hashed from
+        // `stage/{id}/{name}`.
+        let dir = tempfile::tempdir().unwrap();
+        let mount = staging_mount(CasSubstrate::new(dir.path()), 1 << 20, 4 << 20);
+        let caller = Subject::new("alice");
+        let (id1, root1) = create_stage(&mount, &caller).await;
+        let (id2, root2) = create_stage(&mount, &caller).await;
+
+        // Stat each slot's data + ctl directly (no open needed for stat).
+        let d1 = mount.walk(&["stage", &id1, "data"], &caller).await.unwrap();
+        let c1 = mount.walk(&["stage", &id1, "ctl"], &caller).await.unwrap();
+        let d2 = mount.walk(&["stage", &id2, "data"], &caller).await.unwrap();
+
+        let d1_stat = mount.stat(&d1, &caller).await.unwrap();
+        let c1_stat = mount.stat(&c1, &caller).await.unwrap();
+        let d2_stat = mount.stat(&d2, &caller).await.unwrap();
+
+        // Distinct slots' data files must not alias.
+        assert_ne!(
+            d1_stat.path, d2_stat.path,
+            "stage/<a>/data and stage/<b>/data must have distinct qids"
+        );
+        // data vs ctl within the same slot must not alias either.
+        assert_ne!(
+            d1_stat.path, c1_stat.path,
+            "stage/<id>/data and stage/<id>/ctl must have distinct qids"
+        );
+        // A qid of 0 would mean "unknown"; make sure these are real identities.
+        assert_ne!(d1_stat.path, 0);
+        assert_ne!(d2_stat.path, 0);
+
+        // readdir on a staging root also surfaces the per-slot qids.
+        let entries = mount.readdir(&root1, &caller).await.unwrap();
+        let data_entry = entries.iter().find(|e| e.name == "data").unwrap();
+        assert_eq!(data_entry.stat.as_ref().unwrap().path, d1_stat.path);
+
+        for f in [d1, c1, d2, root1, root2] {
+            mount.clunk(f, &caller).await;
+        }
     }
 }
