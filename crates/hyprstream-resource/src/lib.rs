@@ -452,8 +452,11 @@ impl DualAttestation {
     }
 }
 
-/// Registrar term changes on leadership/authority epoch; generation is
-/// monotonically increasing per resource inside that term.
+/// Registrar term is monotonically increasing across leadership/authority
+/// epochs (the #1069-owned backend term-allocation rule); generation is
+/// monotonically increasing per resource inside a term. The compare-and-apply
+/// contract orders numeric `(registrar_term, generation, resource_version)`
+/// tuples.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct FencingToken {
     pub resource_id: ResourceId,
@@ -605,6 +608,26 @@ pub enum RegistrarState {
     RejectedConflict,
 }
 
+impl RegistrarState {
+    /// Terminal states require exactly one matching `Resolution` record.
+    pub const fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            Self::Finalized | Self::Voided | Self::Compensated | Self::RejectedConflict
+        )
+    }
+
+    fn matches_resolution(self, resolution: &Resolution) -> bool {
+        matches!(
+            (self, resolution),
+            (Self::Finalized, Resolution::Finalized { .. })
+                | (Self::Voided, Resolution::Voided { .. })
+                | (Self::Compensated, Resolution::Compensated { .. })
+                | (Self::RejectedConflict, Resolution::RejectedConflict { .. })
+        )
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum QuarantineReason {
     LedgerOutcomeUnknown,
@@ -615,8 +638,25 @@ pub enum QuarantineReason {
     InvariantViolation,
 }
 
+/// The losing side's accounting disposition in a `Resolution::RejectedConflict`
+/// record. The referenced transfer MUST be durably confirmed by the economic
+/// authority before the terminal resolution is committed, so an identical
+/// retry or recovery query discovers the exact economic outcome.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum ConflictAccountingResolution {
+    /// Losing reservation released without posting.
+    Voided { void_transfer_id: TransferId },
+    /// Losing posted charge corrected by an immutable compensating transfer.
+    Compensated {
+        compensation_transfer_id: TransferId,
+    },
+}
+
 /// Immutable terminal resolution. `ManualReview` and `Quarantined` are never
-/// terminal until one of these records is durably committed.
+/// terminal until one of these records is durably committed. A record that
+/// references an accounting effect (`Voided`, `Compensated`, or the losing
+/// side's disposition in `RejectedConflict`) is committed only after the
+/// referenced transfer is durably confirmed.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Resolution {
     Finalized {
@@ -633,6 +673,7 @@ pub enum Resolution {
     RejectedConflict {
         winning_operation_id: OperationId,
         winning_version: u64,
+        losing_accounting: ConflictAccountingResolution,
     },
 }
 
@@ -642,14 +683,75 @@ pub struct ResolutionRef {
     pub outcome: Resolution,
 }
 
+/// Registrar snapshot of one operation. Fields are private: construction goes
+/// through [`RegistrationSnapshot::new`], which rejects terminal states
+/// without exactly one matching resolution and nonterminal states carrying
+/// one, so an inconsistent state/resolution pair is unrepresentable.
+///
+/// ```compile_fail
+/// use hyprstream_resource::RegistrationSnapshot;
+/// // No public fields or unchecked constructor exist.
+/// let forged = RegistrationSnapshot {};
+/// ```
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RegistrationSnapshot {
-    pub operation_id: OperationId,
-    pub intent_digest: IntentDigest,
-    pub state: RegistrarState,
-    pub fencing_token: FencingToken,
-    pub quarantine_reason: Option<QuarantineReason>,
-    pub resolution: Option<ResolutionRef>,
+    operation_id: OperationId,
+    intent_digest: IntentDigest,
+    state: RegistrarState,
+    fencing_token: FencingToken,
+    quarantine_reason: Option<QuarantineReason>,
+    resolution: Option<ResolutionRef>,
+}
+
+impl RegistrationSnapshot {
+    pub fn new(
+        operation_id: OperationId,
+        intent_digest: IntentDigest,
+        state: RegistrarState,
+        fencing_token: FencingToken,
+        quarantine_reason: Option<QuarantineReason>,
+        resolution: Option<ResolutionRef>,
+    ) -> Result<Self, ContractError> {
+        let consistent = match &resolution {
+            Some(reference) => state.is_terminal() && state.matches_resolution(&reference.outcome),
+            None => !state.is_terminal(),
+        };
+        if !consistent {
+            return Err(ContractError::InconsistentResolution);
+        }
+        Ok(Self {
+            operation_id,
+            intent_digest,
+            state,
+            fencing_token,
+            quarantine_reason,
+            resolution,
+        })
+    }
+
+    pub const fn operation_id(&self) -> OperationId {
+        self.operation_id
+    }
+
+    pub const fn intent_digest(&self) -> IntentDigest {
+        self.intent_digest
+    }
+
+    pub const fn state(&self) -> RegistrarState {
+        self.state
+    }
+
+    pub const fn fencing_token(&self) -> FencingToken {
+        self.fencing_token
+    }
+
+    pub const fn quarantine_reason(&self) -> Option<QuarantineReason> {
+        self.quarantine_reason
+    }
+
+    pub const fn resolution(&self) -> Option<&ResolutionRef> {
+        self.resolution.as_ref()
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -683,6 +785,7 @@ pub enum ContractError {
     WrongKeyPurpose,
     InvalidFinalizationProof,
     StaleProjection,
+    InconsistentResolution,
 }
 
 impl fmt::Display for ContractError {
@@ -762,6 +865,12 @@ pub trait ResourceRegistrar {
         content_cid: Option<&Cid>,
     ) -> Result<FinalizedResource, Self::Error>;
 
+    /// Commits the immutable terminal `Resolution`. When the resolution
+    /// references an accounting effect (`Voided`, `Compensated`, or the losing
+    /// side's disposition in `RejectedConflict`), the implementation MUST
+    /// durably confirm the referenced transfer with the economic authority
+    /// before committing the resolution; until then the operation remains
+    /// nonterminal.
     fn resolve(
         &self,
         operation_id: OperationId,

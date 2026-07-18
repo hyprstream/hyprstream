@@ -128,7 +128,9 @@ Terminal outcomes are explicit, never a generic "reconciled". A terminal outcome
 | `Finalized` | visible through ordered idempotent projection | retained | posted |
 | `Voided` | hidden; any projection withdrawn | eligible for GC | reservation released, never posted |
 | `Compensated` | hidden; any provisional projection withdrawn | eligible for GC after evidence | posted charge corrected by an immutable compensating transfer |
-| `RejectedConflict` | hidden; never projected for the losing claim | losing provisional bytes eligible for GC | loser voided or compensated per phase; winner named in the record |
+| `RejectedConflict` | hidden; never projected for the losing claim | losing provisional bytes eligible for GC | losing side's disposition recorded as a typed void/compensation transfer reference (`ConflictAccountingResolution`); winner named in the record |
+
+A `Resolution` that references an accounting effect — `Voided`, `Compensated`, or the losing side's disposition inside `RejectedConflict` — MUST be committed only after the referenced transfer is durably confirmed by the ledger; until then the operation remains nonterminal. The registration snapshot's state and resolution reference form one checked value: a terminal state requires exactly one matching resolution, and a nonterminal state forbids one — any other pair is rejected at construction (`RegistrationSnapshot::new`).
 
 `Quarantined` and `ManualReview` are **nonterminal**: they permit investigation and authority-approved recovery, but commit no externally visible consequence until exactly one `Resolution` is committed. An identical retry or recovery query reads the snapshot's resolution reference and returns the recorded outcome; it never re-derives one.
 
@@ -142,7 +144,7 @@ Terminal outcomes are explicit, never a generic "reconciled". A terminal outcome
 | Voiding | hidden | provisional only | void/compensation pending | retry effect |
 | Voided | hidden | eligible for GC | released | terminal resolution |
 | Compensated | hidden | eligible for GC after evidence | immutable compensation recorded | terminal resolution |
-| RejectedConflict | hidden | losing bytes eligible for GC | loser voided/compensated | terminal resolution |
+| RejectedConflict | hidden | losing bytes eligible for GC | loser voided or compensated per the recorded disposition | terminal resolution |
 | Quarantined (nonterminal) | hidden from ordinary namespace; restricted recovery namespace only | retained, immutable | unchanged pending investigation | reconciler/manual review, then exactly one Resolution |
 | ManualReview (nonterminal) | hidden by default | retained | unchanged | authority-approved recovery, then exactly one Resolution |
 
@@ -150,7 +152,7 @@ Quarantine is bounded operationally by configured age/depth alarms and admission
 
 ### Namespace projection ordering
 
-The namespace projects finalized registrar state through a durable outbox, and plain duplicate-idempotence is not sufficient: every projection effect is an **ordered desired-state event** carrying the deterministic operation ID, the registrar fencing token (registrar term plus per-resource generation), the resource version, and entry/path identity where applicable. Adapters compare-and-apply: they durably record the newest applied `(registrar term, generation, version)` per resource/entry, return the recorded outcome for exact duplicates, and **reject any effect that is not strictly newer**. A withdrawal identifies the transition/generation it withdraws — never the bare stable resource ID — so a delayed withdraw from an older delete/unlink cannot remove a newer finalized projection, and a delayed publish cannot recreate or regress a projection superseded by a newer transition. Stale-effect rejection is part of this semantic contract (ADRs RO-004/RO-005); adapter mechanics remain child-owned by #1071.
+The namespace projects finalized registrar state through a durable outbox, and plain duplicate-idempotence is not sufficient: every projection effect is an **ordered desired-state event** carrying the deterministic operation ID, the registrar fencing token (registrar term plus per-resource generation), the resource version, and entry/path identity where applicable. The registrar term is **monotonically increasing** across leadership/authority epochs — the backend term-allocation rule is #1069-owned — and the generation is monotonically increasing per resource within a term, so numeric `(registrar term, generation, version)` tuples are totally ordered. Adapters compare-and-apply: they durably record the newest applied `(registrar term, generation, version)` per resource/entry, return the recorded outcome for exact duplicates, and **reject any effect that is not strictly newer**. A withdrawal identifies the transition/generation it withdraws — never the bare stable resource ID — so a delayed withdraw from an older delete/unlink cannot remove a newer finalized projection, and a delayed publish cannot recreate or regress a projection superseded by a newer transition. Stale-effect rejection is part of this semantic contract (ADRs RO-004/RO-005); adapter mechanics remain child-owned by #1071.
 
 ### Private evidence versus public projection
 

@@ -3,11 +3,12 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use hyprstream_resource::{
-    Assurance, CanonicalResourceIntent, Cid, Commitment, ContractError, ContractVersion,
-    ControllerRef, Did, DigestSuite, DualAttestation, FinalizationProofVerifier,
-    FinalizationStatement, IntentCandidate, IntentClaims, IntentDigest, IntentFormatVersion,
-    IntentValidator, KeyPurpose, LedgerAttestation, LedgerPhase, MacAttestation, OperationId,
-    PayerRef, ResourceId, ResourceKind, ResourceOperation, Signature, SignatureEnvelope,
+    Assurance, CanonicalResourceIntent, Cid, Commitment, ConflictAccountingResolution,
+    ContractError, ContractVersion, ControllerRef, Did, DigestSuite, DualAttestation,
+    FinalizationProofVerifier, FinalizationStatement, IntentCandidate, IntentClaims, IntentDigest,
+    IntentFormatVersion, IntentValidator, KeyPurpose, LedgerAttestation, LedgerPhase,
+    MacAttestation, OperationId, PayerRef, RegistrarState, RegistrationSnapshot, Resolution,
+    ResolutionRef, ResourceId, ResourceKind, ResourceOperation, Signature, SignatureEnvelope,
     SignatureSuite, TransferId,
 };
 
@@ -181,5 +182,97 @@ fn forged_finalization_proof_is_rejected() {
         hyprstream_resource::FinalizedResource::verify(&intent, &dual, &statement, &RejectProof)
             .unwrap_err(),
         ContractError::InvalidFinalizationProof
+    );
+}
+
+#[test]
+fn registration_snapshot_enforces_state_resolution_invariant() {
+    let operation_id = OperationId::from_bytes([2; 16]);
+    let intent_digest = IntentDigest::from_bytes([7; 32]);
+    let fence = hyprstream_resource::FencingToken {
+        resource_id: ResourceId::from_bytes([1; 16]),
+        registrar_term: 1,
+        generation: 1,
+    };
+    let resolution = |outcome: Resolution| {
+        Some(ResolutionRef {
+            record_cid: Cid::from_validated_bytes(vec![8]),
+            outcome,
+        })
+    };
+    let conflict = Resolution::RejectedConflict {
+        winning_operation_id: OperationId::from_bytes([3; 16]),
+        winning_version: 2,
+        losing_accounting: ConflictAccountingResolution::Compensated {
+            compensation_transfer_id: TransferId::from_bytes([9; 16]),
+        },
+    };
+
+    // Terminal state with exactly one matching resolution: accepted.
+    let snapshot = RegistrationSnapshot::new(
+        operation_id,
+        intent_digest,
+        RegistrarState::RejectedConflict,
+        fence,
+        None,
+        resolution(conflict.clone()),
+    )
+    .unwrap();
+    assert_eq!(snapshot.state(), RegistrarState::RejectedConflict);
+    assert_eq!(snapshot.resolution().map(|r| &r.outcome), Some(&conflict));
+
+    // Nonterminal state without a resolution: accepted.
+    RegistrationSnapshot::new(
+        operation_id,
+        intent_digest,
+        RegistrarState::Quarantined,
+        fence,
+        Some(hyprstream_resource::QuarantineReason::FinalizationConflict),
+        None,
+    )
+    .unwrap();
+
+    // Terminal state without a resolution: rejected.
+    assert_eq!(
+        RegistrationSnapshot::new(
+            operation_id,
+            intent_digest,
+            RegistrarState::Finalized,
+            fence,
+            None,
+            None,
+        )
+        .unwrap_err(),
+        ContractError::InconsistentResolution
+    );
+
+    // Nonterminal state carrying a resolution: rejected.
+    assert_eq!(
+        RegistrationSnapshot::new(
+            operation_id,
+            intent_digest,
+            RegistrarState::ManualReview,
+            fence,
+            None,
+            resolution(conflict),
+        )
+        .unwrap_err(),
+        ContractError::InconsistentResolution
+    );
+
+    // Terminal state with a mismatched resolution variant: rejected.
+    assert_eq!(
+        RegistrationSnapshot::new(
+            operation_id,
+            intent_digest,
+            RegistrarState::RejectedConflict,
+            fence,
+            None,
+            resolution(Resolution::Voided {
+                void_transfer_id: TransferId::from_bytes([9; 16]),
+            }),
+        )
+        .unwrap_err(),
+        ContractError::InconsistentResolution
     );
 }
