@@ -1356,10 +1356,14 @@ impl DiscoveryServiceResolver {
                         );
                     };
                     let authority = format!("{server_name}:{}", addr.port());
-                    let url = format!("https://{authority}/");
+                    let origin = format!("https://{authority}/");
+                    let route = format!(
+                        "https://{authority}{}",
+                        hyprstream_rpc::browser_provisioning::BROWSER_RPC_PATH
+                    );
                     (
-                        url.clone(),
-                        url,
+                        origin,
+                        route,
                         auth.accept_cert_hashes().to_vec(),
                         BrowserRouteRole::Origin,
                         BrowserTransportSecurity::OwnedHybridRequired,

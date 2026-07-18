@@ -9,6 +9,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use hyprstream_rpc::auth::JtiBlocklist as _;
+use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
 use subtle::ConstantTimeEq as _;
@@ -265,6 +266,28 @@ pub async fn rate_limit_middleware(
         return (
             StatusCode::TOO_MANY_REQUESTS,
             "Rate limit exceeded — retry after window expires",
+        )
+            .into_response();
+    }
+
+    next.run(request).await
+}
+
+/// Rate-limit the public browser-provisioning route before accepted-state
+/// resolution or hybrid projection signing. A single stable bucket is
+/// intentional: this boundary may run without trustworthy peer-address
+/// metadata, and client-controlled forwarding headers must not select buckets.
+pub async fn browser_provisioning_rate_limit_middleware(
+    State(rate_limiter): State<Arc<RateLimiter>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    const PROVISIONING_BUCKET: &str = "browser-provisioning";
+    if rate_limiter.check_and_increment(PROVISIONING_BUCKET) {
+        warn!("Browser provisioning rate limit exceeded");
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            "Browser provisioning rate limit exceeded — retry after window expires",
         )
             .into_response();
     }
@@ -1338,5 +1361,54 @@ mod composite_aware_tests {
         )
         .unwrap();
         assert_eq!(claims.sub, "alice");
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod browser_provisioning_rate_limit_tests {
+    use super::*;
+    use axum::{body::Body, http::Request as HttpRequest, middleware, routing::get, Router};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn provisioning_limit_rejects_before_handler_work() {
+        let invoked = Arc::new(AtomicUsize::new(0));
+        let handler_invoked = Arc::clone(&invoked);
+        let limiter = Arc::new(RateLimiter::new(1, 60));
+        let app = Router::new()
+            .route(
+                "/provision",
+                get(move || {
+                    let handler_invoked = Arc::clone(&handler_invoked);
+                    async move {
+                        handler_invoked.fetch_add(1, Ordering::SeqCst);
+                        StatusCode::OK
+                    }
+                }),
+            )
+            .layer(middleware::from_fn_with_state(
+                limiter,
+                browser_provisioning_rate_limit_middleware,
+            ));
+
+        let first = app
+            .clone()
+            .oneshot(HttpRequest::get("/provision").body(Body::empty()).expect("request"))
+            .await
+            .expect("first response");
+        let rejected = app
+            .oneshot(HttpRequest::get("/provision").body(Body::empty()).expect("request"))
+            .await
+            .expect("limited response");
+
+        assert_eq!(first.status(), StatusCode::OK);
+        assert_eq!(rejected.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            invoked.load(Ordering::SeqCst),
+            1,
+            "rejected request must not enter resolver/signing handler work"
+        );
     }
 }

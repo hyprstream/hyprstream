@@ -49,8 +49,11 @@ enum CarrierClass {
     /// evidence the bytes stay inside the trust boundary (it can terminate at
     /// a proxy/tunnel), so it earns no exemption.
     Quic,
-    /// WebTransport session (browser or native `web_transport_quinn`).
-    WebTransport,
+    /// Native `web_transport_quinn` session. Network-untrusted, but it does not
+    /// claim browser provisioning provenance.
+    NativeWebTransport,
+    /// Browser-only WebTransport session selected by the dedicated CONNECT path.
+    BrowserWebTransport,
     /// Unknown or ambiguous origin. Fail-closed: treated as untrusted.
     Unknown,
 }
@@ -85,10 +88,17 @@ impl CarrierContext {
         }
     }
 
-    /// A WebTransport carrier. Untrusted.
+    /// A native WebTransport carrier. Untrusted, without browser provenance.
     pub fn web_transport() -> Self {
         Self {
-            class: CarrierClass::WebTransport,
+            class: CarrierClass::NativeWebTransport,
+        }
+    }
+
+    /// Browser WebTransport selected by the dedicated accept-boundary path.
+    pub fn browser_web_transport() -> Self {
+        Self {
+            class: CarrierClass::BrowserWebTransport,
         }
     }
 
@@ -109,7 +119,8 @@ impl CarrierContext {
             CarrierClass::Inproc | CarrierClass::TrustedUds => false,
             CarrierClass::Iroh
             | CarrierClass::Quic
-            | CarrierClass::WebTransport
+            | CarrierClass::NativeWebTransport
+            | CarrierClass::BrowserWebTransport
             | CarrierClass::Unknown => true,
         }
     }
@@ -117,7 +128,7 @@ impl CarrierContext {
     /// Browser requests must carry accepted-current evidence and pass a live
     /// checkpoint-backed check immediately before dispatch.
     pub(crate) fn requires_browser_provisioning(self) -> bool {
-        self.class == CarrierClass::WebTransport
+        self.class == CarrierClass::BrowserWebTransport
     }
 
     /// Short static label for logs/errors. Never used for policy.
@@ -127,7 +138,8 @@ impl CarrierContext {
             CarrierClass::TrustedUds => "uds",
             CarrierClass::Iroh => "iroh",
             CarrierClass::Quic => "quic",
-            CarrierClass::WebTransport => "webtransport",
+            CarrierClass::NativeWebTransport => "webtransport-native",
+            CarrierClass::BrowserWebTransport => "webtransport-browser",
             CarrierClass::Unknown => "unknown",
         }
     }
@@ -151,6 +163,9 @@ mod tests {
         assert!(CarrierContext::iroh().forbids_cleartext_envelope());
         assert!(CarrierContext::quic().forbids_cleartext_envelope(),);
         assert!(CarrierContext::web_transport().forbids_cleartext_envelope());
+        assert!(CarrierContext::browser_web_transport().forbids_cleartext_envelope());
+        assert!(!CarrierContext::web_transport().requires_browser_provisioning());
+        assert!(CarrierContext::browser_web_transport().requires_browser_provisioning());
         assert!(
             CarrierContext::untrusted_unknown().forbids_cleartext_envelope(),
             "missing/ambiguous context must follow the untrusted branch"

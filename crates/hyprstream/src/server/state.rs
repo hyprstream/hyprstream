@@ -74,6 +74,10 @@ pub struct ServerState {
 
     /// Per-subject request rate limiter (fixed window, 300 req/60s default).
     pub rate_limiter: Arc<crate::server::middleware::RateLimiter>,
+
+    /// Dedicated global limiter for public browser provisioning. This executes
+    /// before checkpoint resolution and hybrid projection signing.
+    pub browser_provisioning_rate_limiter: Arc<crate::server::middleware::RateLimiter>,
 }
 
 /// Metrics collector
@@ -174,6 +178,9 @@ impl ServerState {
             jti_blocklist,
             dpop_jti_seen: Arc::new(TtlCache::new(10_000, 64)),
             rate_limiter: Arc::new(crate::server::middleware::RateLimiter::new(300, 60)),
+            browser_provisioning_rate_limiter: Arc::new(
+                crate::server::middleware::RateLimiter::new(60, 60),
+            ),
         })
     }
 

@@ -17,6 +17,8 @@ use crate::crypto::VerifyingKey;
 use crate::envelope::{KeyedPqTrustStore, PqTrustStore};
 
 pub const BROWSER_PROVISIONING_VERSION: &str = "hyprstream.browser-provisioning.v1";
+/// WebTransport CONNECT path whose accept boundary requires browser provisioning.
+pub const BROWSER_RPC_PATH: &str = "/hyprstream/browser-rpc";
 pub const MAX_PROVISIONING_BYTES: usize = 32 * 1024;
 pub const MAX_PROVISIONING_LIFETIME_MS: i64 = 60_000;
 pub const MAX_BROWSER_BINDING_BYTES: usize = 4096;
@@ -100,7 +102,7 @@ impl BrowserProvisioningRequest {
         validate_bounded_token(&self.scope, "scope", 512)?;
         if self.carrier_profile == BrowserCarrierProfile::StandardPublicRelay {
             anyhow::ensure!(
-                self.scope != "*",
+                !self.scope.contains('*') && !self.scope.ends_with('/'),
                 "standard-public-relay requires an exact encrypted Object scope"
             );
         }
@@ -1414,6 +1416,29 @@ mod tests {
             &vec![0; MAX_BROWSER_APPLICATION_BYTES + 1]
         )
         .is_err());
+    }
+
+    #[test]
+    fn public_relay_scope_must_be_exact() {
+        let exact = BrowserProvisioningRequest::new(
+            "model",
+            "hyprstream-moq/1",
+            "tenant-a/track-a",
+            BrowserCarrierProfile::StandardPublicRelay,
+        );
+        assert!(exact.is_ok());
+        for wildcard in ["*", "tenant-a/*", "tenant-*/track-a", "tenant-a/"] {
+            assert!(
+                BrowserProvisioningRequest::new(
+                    "model",
+                    "hyprstream-moq/1",
+                    wildcard,
+                    BrowserCarrierProfile::StandardPublicRelay,
+                )
+                .is_err(),
+                "wildcard relay scope {wildcard:?} must be rejected"
+            );
+        }
     }
 
     #[test]

@@ -45,6 +45,18 @@ pub fn create_app(state: ServerState) -> Router {
     let cors_config = state.config.cors.clone();
     let timeout_duration = Duration::from_secs(state.config.request_timeout_secs);
 
+    // Public browser provisioning is independently rate-limited before the
+    // handler can resolve accepted state or perform hybrid signing.
+    let browser_provisioning_routes = Router::new()
+        .route(
+            "/.well-known/hyprstream/browser-provisioning/:service",
+            get(routes::browser_provisioning::browser_provisioning),
+        )
+        .layer(axum_middleware::from_fn_with_state(
+            Arc::clone(&state.browser_provisioning_rate_limiter),
+            middleware::browser_provisioning_rate_limit_middleware,
+        ));
+
     // Public routes (no auth required)
     let public_routes = Router::new()
         .route("/", get(health_check))
@@ -69,11 +81,8 @@ pub fn create_app(state: ServerState) -> Router {
             "/.well-known/planes",
             get(routes::ninep::wire_planes_metadata),
         )
-        .route(
-            "/.well-known/hyprstream/browser-provisioning/:service",
-            get(routes::browser_provisioning::browser_provisioning),
-        )
-        .route("/9p", get(routes::ninep::ninep_ws));
+        .route("/9p", get(routes::ninep::ninep_ws))
+        .merge(browser_provisioning_routes);
 
     // Protected routes (auth required)
     let protected_routes = Router::new()

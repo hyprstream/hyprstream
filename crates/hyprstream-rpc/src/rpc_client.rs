@@ -722,6 +722,21 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
         service_domain: Option<&str>,
         method_discriminator: Option<u16>,
     ) -> Result<(Vec<u8>, Option<PendingResponse>)> {
+        let inferred_method = if self.browser_provisioning_binding.is_some()
+            && method_discriminator.is_none()
+        {
+            Some(crate::browser_provisioning::canonical_method_discriminator(
+                &payload,
+            )?)
+        } else {
+            None
+        };
+        let service_domain = service_domain.or_else(|| {
+            self.browser_provisioning_binding
+                .as_ref()
+                .map(|binding| binding.service_name.as_str())
+        });
+        let method_discriminator = method_discriminator.or(inferred_method);
         let mut envelope = RequestEnvelope::new(payload);
         envelope.request_id = request_id;
         if let Some(token) = jwt {
@@ -1216,19 +1231,13 @@ impl<S: Signer, T: Transport + 'static> RpcClient for RpcClientImpl<S, T> {
 #[cfg(all(test, not(target_arch = "wasm32")))]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod request_kem_tests {
-    //! Coverage for the request KEM-store plumbing that `dial_wasm::dial` /
-    //! `dial_wasm::dial_with_kem_store` delegate to.
+    //! Coverage for request KEM-store plumbing and browser-dial defenses.
     //!
-    //! `dial_wasm` is `#![cfg(target_arch = "wasm32")]` and its bodies call
-    //! `WtConnection::connect()` (the browser WebTransport API), so they cannot
-    //! be exercised by native `cargo test`, and the workspace has no
-    //! `wasm-bindgen-test` browser runner. The security-relevant behavior those
-    //! functions delegate to, however — "a cleartext-forbidding carrier with a
-    //! forwarded `#mesh-kem` store encrypts, and with NO store fails closed" —
-    //! lives entirely in `RpcClientImpl::sign_envelope` and is fully testable
-    //! here over a mock forbidding transport. `dial_wasm`'s own logic is the
-    //! same `Some(store) => with_request_kem_store(store)` / `None => client`
-    //! match as native `dial` (already covered by the iroh e2e round-trip).
+    //! `dial_wasm` is `#![cfg(target_arch = "wasm32")]`, so native tests cannot
+    //! invoke its JS signer and WebTransport argument types. The public wasm
+    //! dial seams now return the provisioning-required error before transport
+    //! construction; the common-layer tests below retain defense-in-depth
+    //! coverage for cleartext refusal and encrypted request handling.
 
     use super::*;
     use crate::crypto::hybrid_kem::KeyedKemTrustStore;
@@ -1507,8 +1516,9 @@ mod request_kem_tests {
         SignedEnvelope::read_from(sr).expect("decode signed envelope")
     }
 
-    /// `None` store (what `dial_wasm::dial` passes) MUST fail closed on a
-    /// cleartext-forbidding carrier — never a cleartext downgrade.
+    /// `None` store on a cleartext-forbidding carrier MUST fail closed — never
+    /// a cleartext downgrade. Public wasm dial seams now reject earlier, before
+    /// transport construction; this remains common-layer defense in depth.
     #[tokio::test]
     async fn cleartext_forbidding_carrier_without_kem_store_fails_closed() {
         let (_server_sk, server_vk) = generate_signing_keypair();
@@ -1539,9 +1549,9 @@ mod request_kem_tests {
         );
     }
 
-    /// `Some(store)` (what `dial_wasm::dial_with_kem_store` forwards) with an
-    /// anchored recipient MUST produce an encrypted envelope — proving the
-    /// forwarded store is actually used to seal.
+    /// An anchored KEM store on a cleartext-forbidding carrier MUST encrypt.
+    /// This is common-layer defense in depth; public wasm dial seams cannot
+    /// construct an unprovisioned client even when callers supply stores.
     #[tokio::test]
     async fn cleartext_forbidding_carrier_with_kem_store_encrypts() {
         let (server_sk, server_vk) = generate_signing_keypair();
@@ -1622,6 +1632,44 @@ mod request_kem_tests {
         request.extend_from_slice(&91u64.to_le_bytes());
         request.extend_from_slice(&(method_discriminator as u64).to_le_bytes());
         request
+    }
+
+    #[tokio::test]
+    async fn legacy_exports_remain_additive_on_provisioned_clients() {
+        let binding = browser_test_binding();
+        let (client, state, _drops) = lifecycle_client_with_browser_binding(Some(binding));
+        let application = browser_capnp_request(7);
+
+        let unary = client
+            .call(application.clone())
+            .await
+            .expect("legacy unary export reaches transport");
+        let optioned = client
+            .call_with_options(
+                application.clone(),
+                CallOptions::new().jwt("test-jwt".to_owned()),
+            )
+            .await
+            .expect("legacy options export reaches transport");
+        let streaming = client
+            .call_streaming(application.clone(), [0x55; 32])
+            .await
+            .expect("legacy streaming export reaches transport");
+
+        for (request_id, framed) in [(1, unary), (2, optioned), (3, streaming)] {
+            let (transcript, recovered) = crate::browser_provisioning::recover_request_payload(
+                &framed,
+                crate::browser_provisioning::BrowserTranscriptPolicy::Required {
+                    request_id,
+                    service_name: "model",
+                    carrier_profile: crate::browser_provisioning::BrowserCarrierProfile::OwnedHybridWebTransport,
+                },
+            )
+            .expect("legacy export returned a sealed browser transcript");
+            assert_eq!(transcript.expect("browser transcript").method_discriminator, 7);
+            assert_eq!(recovered, application);
+        }
+        assert_eq!(state.recipients.lock().len(), 3);
     }
 
     #[tokio::test]

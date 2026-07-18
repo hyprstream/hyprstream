@@ -380,6 +380,8 @@ impl QuinnRpcServer {
                         // (`Request` Derefs to `ConnectRequest`, exposing `url`.)
                         let is_moq = request.url.path() == crate::dial::MOQ_PATH;
                         let is_ninep = request.url.path() == crate::dial::NINEP_PATH;
+                        let is_browser_rpc = request.url.path()
+                            == crate::browser_provisioning::BROWSER_RPC_PATH;
                         // Resolve the handshake INSIDE the task, bounded (#162),
                         // so a slow/stalled CONNECT never blocks the accept loop.
                         let session = match tokio::time::timeout(
@@ -556,6 +558,13 @@ impl QuinnRpcServer {
                         // INV-2 (#1042): this accept boundary terminates a
                         // WebTransport-over-QUIC session — an untrusted
                         // carrier even on a loopback address.
+                        // Browser provenance comes only from the CONNECT path
+                        // observed at this accept boundary, never request bytes.
+                        let rpc_carrier = if is_browser_rpc {
+                            crate::transport::carrier::CarrierContext::browser_web_transport()
+                        } else {
+                            carrier
+                        };
                         if let Err(e) = serve_rpc_connection(
                             session,
                             processor,
@@ -563,7 +572,7 @@ impl QuinnRpcServer {
                             stream_limit,
                             read_timeout,
                             shutdown,
-                            carrier,
+                            rpc_carrier,
                         )
                         .await
                         {

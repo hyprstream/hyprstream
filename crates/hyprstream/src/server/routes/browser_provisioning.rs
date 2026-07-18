@@ -144,7 +144,7 @@ mod tests {
             service_name: "model".to_owned(),
             service_did: "did:at9p:test".to_owned(),
             service_origin: "https://model.example/".to_owned(),
-            webtransport_url: "https://model.example/".to_owned(),
+            webtransport_url: "https://model.example/hyprstream/browser-rpc".to_owned(),
             capability: "hyprstream-rpc/1".to_owned(),
             scope: "model".to_owned(),
             carrier_profile: BrowserCarrierProfile::OwnedHybridWebTransport,

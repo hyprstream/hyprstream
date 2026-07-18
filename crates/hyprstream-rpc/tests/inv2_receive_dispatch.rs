@@ -369,7 +369,7 @@ async fn browser_dispatch_recovers_exact_bytes_and_rejects_post_refetch_advance(
         EnvelopeVerification::AnySigner,
         &k.server_sk,
         &envelope::InMemoryNonceCache::new(),
-        CarrierContext::web_transport(),
+        CarrierContext::browser_web_transport(),
     )
     .await
     .unwrap();
@@ -384,7 +384,7 @@ async fn browser_dispatch_recovers_exact_bytes_and_rejects_post_refetch_advance(
         EnvelopeVerification::AnySigner,
         &k.server_sk,
         &envelope::InMemoryNonceCache::new(),
-        CarrierContext::web_transport(),
+        CarrierContext::browser_web_transport(),
     )
     .await;
     assert!(rejected.is_err());
@@ -405,6 +405,7 @@ async fn cleartext_on_untrusted_carrier_rejected_before_handler() {
         CarrierContext::iroh(),
         CarrierContext::quic(),
         CarrierContext::web_transport(),
+        CarrierContext::browser_web_transport(),
         CarrierContext::untrusted_unknown(),
     ] {
         let signed = SignedEnvelope::new_signed_hybrid(
@@ -491,6 +492,7 @@ async fn missing_response_recipient_drops_without_handler_on_all_network_carrier
         CarrierContext::iroh(),
         CarrierContext::quic(),
         CarrierContext::web_transport(),
+        CarrierContext::browser_web_transport(),
         CarrierContext::untrusted_unknown(),
     ] {
         let request = request_envelope(b"must-not-dispatch");

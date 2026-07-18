@@ -18,7 +18,8 @@ use crate::util::*;
 pub fn generate_portable_scoped_clients(service_name: &str, resolved: &ResolvedSchema, types_crate: Option<&syn::Path>) -> TokenStream {
     let mut tokens = TokenStream::new();
     let pascal = to_pascal_case(service_name);
-    let capnp_mod_ident = format_ident!("{}_capnp", service_name);
+    let rust_service_name = service_name.replace('-', "_");
+    let capnp_mod_ident = format_ident!("{}_capnp", to_snake_case(&rust_service_name));
     let capnp_mod: TokenStream = match types_crate {
         Some(tc) => quote! { #tc::#capnp_mod_ident },
         None => quote! { crate::#capnp_mod_ident },
@@ -26,7 +27,7 @@ pub fn generate_portable_scoped_clients(service_name: &str, resolved: &ResolvedS
 
     for sc in &resolved.raw.scoped_clients {
         walk_portable_scoped(
-            &mut tokens, &pascal, &capnp_mod, sc, &[],
+            &mut tokens, service_name, &pascal, &capnp_mod, sc, &[],
             resolved, types_crate,
         );
     }
@@ -211,6 +212,7 @@ struct UnwrapLevel {
 
 fn walk_portable_scoped(
     tokens: &mut TokenStream,
+    service_name: &str,
     pascal: &str,
     capnp_mod: &TokenStream,
     sc: &ScopedClient,
@@ -219,17 +221,27 @@ fn walk_portable_scoped(
     types_crate: Option<&syn::Path>,
 ) {
     tokens.extend(generate_portable_scoped_client_recursive(
-        pascal, capnp_mod, sc, ancestors, resolved, types_crate,
+        service_name, pascal, capnp_mod, sc, ancestors, resolved, types_crate,
     ));
     let mut next_ancestors: Vec<&ScopedClient> = ancestors.to_vec();
     next_ancestors.push(sc);
     for nested in &sc.nested_clients {
-        walk_portable_scoped(tokens, pascal, capnp_mod, nested, &next_ancestors, resolved, types_crate);
+        walk_portable_scoped(
+            tokens,
+            service_name,
+            pascal,
+            capnp_mod,
+            nested,
+            &next_ancestors,
+            resolved,
+            types_crate,
+        );
     }
 }
 
 /// Generate a portable scoped client struct using `Arc<dyn RpcClient>`.
 fn generate_portable_scoped_client_recursive(
+    service_name: &str,
     pascal: &str,
     capnp_mod: &TokenStream,
     sc: &ScopedClient,
@@ -241,7 +253,6 @@ fn generate_portable_scoped_client_recursive(
     let response_type = format_ident!("{}ResponseVariant", sc.client_name);
     let outer_req_type = format_ident!("{}", to_snake_case(&format!("{pascal}Request")));
     let doc = format!("Scoped client for {} operations (transport-agnostic).", sc.factory_name);
-    let service_name = to_snake_case(pascal);
 
     // Struct fields: all ancestor scope fields + own scope fields
     let all_scope_field_defs: Vec<TokenStream> = ancestors.iter()
@@ -440,5 +451,38 @@ fn generate_portable_nested_factory_method(
                 #(#own_field_inits,)*
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod canonical_service_authority_tests {
+    use super::*;
+
+    #[test]
+    fn hyphenated_scoped_service_keeps_original_authority() {
+        let schema = ParsedSchema {
+            request_variants: Vec::new(),
+            response_variants: Vec::new(),
+            structs: Vec::new(),
+            scoped_clients: vec![ScopedClient {
+                factory_name: "document".to_owned(),
+                client_name: "DocumentClient".to_owned(),
+                scope_fields: Vec::new(),
+                inner_request_variants: Vec::new(),
+                inner_response_variants: Vec::new(),
+                capnp_inner_response: "document_response".to_owned(),
+                nested_clients: Vec::new(),
+            }],
+            enums: Vec::new(),
+            request_struct: None,
+            response_struct: None,
+        };
+        let resolved = ResolvedSchema::from(&schema);
+        let generated = generate_portable_scoped_clients("text-generation", &resolved, None)
+            .to_string();
+
+        assert!(generated.contains("text-generation"));
+        assert!(!generated.contains("text_generation\""));
+        assert!(generated.contains("text_generation_capnp"));
     }
 }

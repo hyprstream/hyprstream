@@ -45,9 +45,8 @@ use anyhow::{anyhow, Result};
 
 use crate::crypto::hybrid_kem::KemTrustStore;
 use crate::crypto::VerifyingKey;
-use crate::rpc_client::{RpcClient, RpcClientImpl};
+use crate::rpc_client::RpcClient;
 use crate::signer::JsSigner;
-use crate::web_transport::WtConnection;
 
 /// Dial a hyprstream server from the browser over WebTransport, returning a
 /// ready RPC client.
@@ -87,68 +86,38 @@ pub async fn dial(
         "unprovisioned browser WebTransport dial is disabled; resolve accepted-current browser provisioning first"))
 }
 
-/// Dial over WebTransport with an anchored `#mesh-kem` recipient trust store.
+/// Dial over WebTransport with pre-resolved stores.
 ///
-/// WebTransport is a cleartext-forbidding carrier
-/// ([`WtConnection::forbids_cleartext_envelope`] → `true`), so its request
-/// envelopes MUST be sealed to the server's anchored `#mesh-kem` recipient. This
-/// mirrors native [`crate::dial::dial_with_kem_store`]: without a store, every
-/// `call()` fails closed at sign time (no cleartext downgrade).
-///
-/// # Prerequisite
-///
-/// The browser must first resolve the server's `#mesh-kem` recipient key
-/// out-of-band (DID `keyAgreement` / peer attestation) and provision a
-/// [`KemTrustStore`]. That browser-side provisioning is tracked separately; the
-/// bare [`dial`] entrypoint (store `None`) therefore cannot yet complete an
-/// encrypted WebTransport request — use this entrypoint once a store exists.
+/// This legacy entry point remains exported for API compatibility but is
+/// intentionally disabled: stores alone do not prove accepted-current
+/// route, pin, service, scope, or state binding. Use `connectResolved`.
 pub async fn dial_with_kem_store(
-    url: &str,
-    cert_hash: Option<&str>,
-    signer: JsSigner,
-    server_verifying_key: Option<VerifyingKey>,
-    jwt: Option<String>,
-    request_kem_store: Option<Arc<dyn KemTrustStore>>,
+    _url: &str,
+    _cert_hash: Option<&str>,
+    _signer: JsSigner,
+    _server_verifying_key: Option<VerifyingKey>,
+    _jwt: Option<String>,
+    _request_kem_store: Option<Arc<dyn KemTrustStore>>,
 ) -> Result<Arc<dyn RpcClient>> {
-    dial_with_crypto_stores(
-        url,
-        cert_hash,
-        signer,
-        server_verifying_key,
-        jwt,
-        request_kem_store,
-        None,
-    )
-    .await
+    Err(anyhow!(
+        "unprovisioned browser WebTransport dial is disabled; resolve accepted-current browser provisioning first"
+    ))
 }
 
-/// WebTransport dial seam provisioning both request KEM and response hybrid
-/// signature anchors. The shared client then applies the same response
-/// carrier-check → verify → HyKEM-open ordering as native clients.
+/// Legacy crypto-store dial seam retained for source compatibility.
+/// Accepted-current browser provisioning is mandatory; use `connectResolved`.
 pub async fn dial_with_crypto_stores(
-    url: &str,
-    cert_hash: Option<&str>,
-    signer: JsSigner,
-    server_verifying_key: Option<VerifyingKey>,
-    jwt: Option<String>,
-    request_kem_store: Option<Arc<dyn KemTrustStore>>,
-    response_pq_store: Option<Arc<dyn crate::envelope::PqTrustStore>>,
+    _url: &str,
+    _cert_hash: Option<&str>,
+    _signer: JsSigner,
+    _server_verifying_key: Option<VerifyingKey>,
+    _jwt: Option<String>,
+    _request_kem_store: Option<Arc<dyn KemTrustStore>>,
+    _response_pq_store: Option<Arc<dyn crate::envelope::PqTrustStore>>,
 ) -> Result<Arc<dyn RpcClient>> {
-    let transport = WtConnection::connect(url, cert_hash).await?;
-    let client = RpcClientImpl::new(signer, transport, server_verifying_key);
-    let client = match request_kem_store {
-        Some(store) => client.with_request_kem_store(store),
-        None => client,
-    };
-    let client = match response_pq_store {
-        Some(store) => client.with_response_pq_store(store),
-        None => client,
-    };
-    let client = match jwt {
-        Some(t) => client.with_default_jwt(t),
-        None => client,
-    };
-    Ok(Arc::new(client) as Arc<dyn RpcClient>)
+    Err(anyhow!(
+        "unprovisioned browser WebTransport dial is disabled; resolve accepted-current browser provisioning first"
+    ))
 }
 
 /// Dial from raw URL + signer bytes, without a pre-built [`JsSigner`].
