@@ -38,6 +38,13 @@ anonymous-capability-controller = { kind: "anonymous-capability", value: commitm
 identified-payer = { kind: "identified", value: did }
 anonymous-entitlement-payer = { kind: "anonymous-entitlement", value: commitment }
 
+; The seven profile values are per-role privacy kinds, not complete intent
+; tuples. The three typed references above are the authoritative composite:
+; each reference kind is constrained by its own per-role union, and the
+; declared profile MUST match the kind of the typed reference it governs
+; (owner, controller, or payer). A crossed profile/reference combination
+; rejects (profile:ref-kind-mismatch); a reference kind outside its per-role
+; union rejects (profile:unknown-ref-kind).
 profile-name = "identified-owner" / "pairwise-owner" / "committed-owner" /
                "identified-controller" / "anonymous-capability-controller" /
                "identified-payer" / "anonymous-entitlement-payer"
@@ -46,6 +53,10 @@ profile-name = "identified-owner" / "pairwise-owner" / "committed-owner" /
 ; A finalized manifest cites resource_id, content_cid, its own manifest_cid,
 ; and operation_id independently. No final manifest exists without both
 ; attestations over byte-identical canonical ResourceIntent digests.
+; manifest_cid is self-addressed over the CID-free projection: the digest of
+; the canonical manifest encoding with the manifest_cid field itself omitted,
+; so the construction is non-cyclic and the identifiers stay independent.
+; The manifest operation_id equals the attested ResourceIntent operation_id.
 manifest = {
   resource_id: identifier,
   content_cid: identifier,
@@ -58,12 +69,21 @@ manifest = {
   policy_generation: uint,
   expiry: uint,
   fencing_token: bstr,
-  mac_attestation: attestation,
-  ledger_attestation: attestation,
+  mac_attestation: mac-attestation,
+  ledger_attestation: ledger-attestation,
 }
 
-attestation = {
-  role: "mac-title-control" / "ledger-economic",
+; Exactly one attestation of each authority type: the MAC slot carries the
+; fixed mac-title-control role and the ledger slot the fixed ledger-economic
+; role. A swapped or duplicated role is not schema-valid.
+mac-attestation = {
+  role: "mac-title-control",
+  covered_digest: bstr .size 32,  ; MUST equal sha256(canonical resource-intent)
+  assurance: "pq-hybrid" / "classical",
+}
+
+ledger-attestation = {
+  role: "ledger-economic",
   covered_digest: bstr .size 32,  ; MUST equal sha256(canonical resource-intent)
   assurance: "pq-hybrid" / "classical",
 }

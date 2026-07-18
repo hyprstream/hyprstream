@@ -291,6 +291,29 @@ KNOWN_PROFILES = {
 ANONYMOUS_PROFILES = {"anonymous-capability-controller", "anonymous-entitlement-payer"}
 INTENT_FIELD_MAX_VERSION = 1023  # predecessor_version ceiling per registry bounds
 
+# Per-role typed-reference kinds allowed by the CDDL unions, and the binding
+# from each profile name to the typed reference whose kind it must match.
+# The three typed references are the authoritative structure; the profile
+# field is consistent metadata, never an independent claim.
+ALLOWED_REF_KINDS = {
+    "owner_ref": {"identified", "pairwise", "committed"},
+    "controller_ref": {"identified", "anonymous-capability"},
+    "payer_ref": {"identified", "anonymous-entitlement"},
+}
+PROFILE_ROLE_BINDING = {
+    "identified-owner": ("owner_ref", "identified"),
+    "pairwise-owner": ("owner_ref", "pairwise"),
+    "committed-owner": ("owner_ref", "committed"),
+    "identified-controller": ("controller_ref", "identified"),
+    "anonymous-capability-controller": ("controller_ref", "anonymous-capability"),
+    "identified-payer": ("payer_ref", "identified"),
+    "anonymous-entitlement-payer": ("payer_ref", "anonymous-entitlement"),
+}
+
+# The four independent identifiers a finalized manifest must cite (RA-REQ-002).
+MANIFEST_REQUIRED_IDENTIFIERS = ("resource_id", "content_cid", "manifest_cid", "operation_id")
+INTENT_REQUIRED_IDENTIFIERS = ("resource_id", "content_cid", "operation_id")
+
 # Public receipt / checkpoint identifier classes prohibited by RA-REQ-022:
 # raw anonymous token, holder DID, stable client key, linkable entitlement
 # identifier. The scan is recursive over the closed receipt vocabulary so a
@@ -395,6 +418,9 @@ def _run_checks(baseline: dict, resource_intent: dict, canonical: str, vector: d
     for key in resource_intent:
         if key not in allowed_intent:
             return reject("resource-intent:unknown-field")
+    for key in INTENT_REQUIRED_IDENTIFIERS:
+        if key not in resource_intent:
+            return reject("resource-intent:missing-identifier")
     rid = resource_intent.get("resource_id", "")
     if isinstance(rid, str) and rid.startswith("sha256:"):
         return reject("resource-intent:cyclic-identifier")
@@ -418,6 +444,16 @@ def _run_checks(baseline: dict, resource_intent: dict, canonical: str, vector: d
         if isinstance(ref, dict) and str(ref.get("kind", "")).startswith("anonymous"):
             if str(ref.get("value", "")).startswith("did:"):
                 return reject("profile:anonymous-fabricates-did")
+    # Composite role binding: every typed reference must carry a kind from its
+    # own per-role union, and the declared profile must match the kind of the
+    # typed reference it governs. Crossed or swapped combinations reject.
+    for ref_key, allowed_kinds in ALLOWED_REF_KINDS.items():
+        ref = resource_intent.get(ref_key)
+        if not isinstance(ref, dict) or ref.get("kind") not in allowed_kinds:
+            return reject("profile:unknown-ref-kind")
+    bound_ref_key, bound_kind = PROFILE_ROLE_BINDING[profile]
+    if resource_intent[bound_ref_key].get("kind") != bound_kind:
+        return reject("profile:ref-kind-mismatch")
 
     # --- attestation temporal checks ---
     evaluation = vector.get("evaluation", {})
@@ -434,15 +470,24 @@ def _run_checks(baseline: dict, resource_intent: dict, canonical: str, vector: d
     # --- manifest structural checks ---
     if not isinstance(manifest, dict):
         return reject("manifest:non-canonical")
+    for key in MANIFEST_REQUIRED_IDENTIFIERS:
+        if key not in manifest:
+            return reject("manifest:missing-identifier")
     mac = manifest.get("mac_attestation")
     ledger = manifest.get("ledger_attestation")
     if not isinstance(mac, dict):
         return reject("manifest:duplicated-attestation" if isinstance(mac, list) else "manifest:ledger-only-not-final")
     if not isinstance(ledger, dict):
         return reject("manifest:duplicated-attestation" if isinstance(ledger, list) else "manifest:mac-only-not-final")
-    for role, att in (("mac", mac), ("ledger", ledger)):
-        if att.get("role") not in ("mac-title-control", "ledger-economic"):
+    # Exactly one attestation of each authority type: the MAC slot must carry
+    # the mac-title-control role and the ledger slot the ledger-economic role.
+    # A swapped or duplicated known role rejects; an unknown role rejects.
+    for expected_role, att in (("mac-title-control", mac), ("ledger-economic", ledger)):
+        role = att.get("role")
+        if role not in ("mac-title-control", "ledger-economic"):
             return reject("manifest:unknown-attestation-role")
+        if role != expected_role:
+            return reject("manifest:crossed-attestation-role")
 
     # --- digest identity ---
     if mac.get("covered_digest") != canonical or ledger.get("covered_digest") != canonical:
@@ -457,8 +502,13 @@ def _run_checks(baseline: dict, resource_intent: dict, canonical: str, vector: d
     current_fence_gen = evaluation.get("current_fencing_generation", "")
     if not isinstance(fencing, str) or not fencing:
         return reject("manifest:missing-fencing-token")
-    if current_fence_gen and not fencing.startswith(current_fence_gen):
+    # Unambiguous generation boundary: the token is either the generation
+    # itself or generation + "-" + suffix, so a same-prefix future generation
+    # (fence-gen-70 under fence-gen-7) cannot pass a bare prefix test.
+    if current_fence_gen and fencing != current_fence_gen and not fencing.startswith(current_fence_gen + "-"):
         return reject("manifest:crossed-fencing-token")
+    if fencing in set(evaluation.get("consumed_fencing_tokens", [])):
+        return reject("manifest:replayed-fencing-token")
     if "successor_set" in manifest:
         return reject("manifest:concurrent-successors")
     if manifest.get("resubmit_after_crash"):
@@ -466,6 +516,11 @@ def _run_checks(baseline: dict, resource_intent: dict, canonical: str, vector: d
     finalized = set(evaluation.get("finalized_operation_ids", []))
     if manifest.get("operation_id") in finalized:
         return reject("manifest:replayed-operation-id")
+    # The manifest operation ID must be the attested ResourceIntent operation
+    # ID; otherwise a replay could carry a fresh manifest operation ID and
+    # bypass the finalized-operation idempotency set.
+    if manifest.get("operation_id") != resource_intent.get("operation_id"):
+        return reject("manifest:crossed-operation-id")
     if manifest.get("predecessor_version") != resource_intent.get("predecessor_version"):
         return reject("manifest:stale-predecessor")
 
@@ -500,6 +555,15 @@ def _run_checks(baseline: dict, resource_intent: dict, canonical: str, vector: d
         return reject("manifest:expiry-binding")
     if manifest.get("resource_id") != resource_intent.get("resource_id"):
         return reject("manifest:crossed-resource")
+
+    # --- manifest self-addressing (non-cyclic CID-free projection) ---
+    # manifest_cid is the digest of the canonical manifest encoding with the
+    # manifest_cid field itself omitted, so the construction is well-founded
+    # (no digest over a structure that contains that digest). Checked last so
+    # a mutation of any other manifest field reports its own error first.
+    projection = {key: value for key, value in manifest.items() if key != "manifest_cid"}
+    if manifest.get("manifest_cid") != sha(projection):
+        return reject("manifest:manifest-cid-mismatch")
 
     return True, ""
 

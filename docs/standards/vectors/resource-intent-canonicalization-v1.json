@@ -12,6 +12,9 @@
     "current_fencing_generation": "fence-gen-7",
     "finalized_operation_ids": [
       "op-previously-finalized"
+    ],
+    "consumed_fencing_tokens": [
+      "fence-gen-7-consumed-op"
     ]
   },
   "baseline": {
@@ -490,6 +493,149 @@
       ],
       "value": "relay-routing",
       "expected_error": "manifest:unknown-attestation-role"
+    },
+    {
+      "id": "missing-resource-id",
+      "op": "delete",
+      "path": [
+        "baseline",
+        "manifest",
+        "resource_id"
+      ],
+      "expected_error": "manifest:missing-identifier"
+    },
+    {
+      "id": "missing-content-cid",
+      "op": "delete",
+      "path": [
+        "baseline",
+        "manifest",
+        "content_cid"
+      ],
+      "expected_error": "manifest:missing-identifier"
+    },
+    {
+      "id": "missing-manifest-cid",
+      "op": "delete",
+      "path": [
+        "baseline",
+        "manifest",
+        "manifest_cid"
+      ],
+      "expected_error": "manifest:missing-identifier"
+    },
+    {
+      "id": "missing-operation-id",
+      "op": "delete",
+      "path": [
+        "baseline",
+        "manifest",
+        "operation_id"
+      ],
+      "expected_error": "manifest:missing-identifier"
+    },
+    {
+      "id": "missing-intent-identifier",
+      "op": "delete",
+      "path": [
+        "baseline",
+        "resource_intent",
+        "content_cid"
+      ],
+      "expected_error": "resource-intent:missing-identifier"
+    },
+    {
+      "id": "swapped-attestation-roles",
+      "op": "replace",
+      "path": [
+        "baseline",
+        "manifest",
+        "mac_attestation",
+        "role"
+      ],
+      "value": "ledger-economic",
+      "expected_error": "manifest:crossed-attestation-role"
+    },
+    {
+      "id": "duplicated-known-role",
+      "op": "replace",
+      "path": [
+        "baseline",
+        "manifest",
+        "ledger_attestation",
+        "role"
+      ],
+      "value": "mac-title-control",
+      "expected_error": "manifest:crossed-attestation-role"
+    },
+    {
+      "id": "fencing-future-generation",
+      "op": "replace",
+      "path": [
+        "baseline",
+        "manifest",
+        "fencing_token"
+      ],
+      "value": "fence-gen-70-future",
+      "expected_error": "manifest:crossed-fencing-token"
+    },
+    {
+      "id": "replayed-fencing-token",
+      "op": "replace",
+      "path": [
+        "baseline",
+        "manifest",
+        "fencing_token"
+      ],
+      "value": "fence-gen-7-consumed-op",
+      "expected_error": "manifest:replayed-fencing-token"
+    },
+    {
+      "id": "crossed-operation-id",
+      "op": "replace",
+      "path": [
+        "baseline",
+        "manifest",
+        "operation_id"
+      ],
+      "value": "op-fresh-bypass-000000",
+      "expected_error": "manifest:crossed-operation-id"
+    },
+    {
+      "id": "manifest-cid-mismatch",
+      "op": "replace",
+      "path": [
+        "baseline",
+        "manifest",
+        "manifest_cid"
+      ],
+      "value": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "expected_error": "manifest:manifest-cid-mismatch"
+    },
+    {
+      "id": "profile-ref-kind-mismatch",
+      "op": "replace",
+      "path": [
+        "baseline",
+        "resource_intent",
+        "profile"
+      ],
+      "value": "committed-owner",
+      "expected_error": "profile:ref-kind-mismatch"
+    },
+    {
+      "id": "crossed-ref-kind",
+      "op": "replace",
+      "path": [
+        "baseline",
+        "resource_intent",
+        "payer_ref"
+      ],
+      "value": {
+        "kind": "anonymous-capability",
+        "value": "c0mm17m3n7-payer-crossed-kind"
+      },
+      "expected_error": "profile:unknown-ref-kind"
     }
   ],
   "mutation_categories": {
@@ -502,18 +648,31 @@
     "mutation": [
       "cyclic-identifier",
       "unknown-attestation-role",
-      "content-cid-mismatch"
+      "content-cid-mismatch",
+      "missing-resource-id",
+      "missing-content-cid",
+      "missing-manifest-cid",
+      "missing-operation-id",
+      "missing-intent-identifier",
+      "manifest-cid-mismatch"
     ],
     "replay": [
       "replayed-operation-id",
       "crash-repeats-finalized",
-      "replay-across-resource"
+      "replay-across-resource",
+      "replayed-fencing-token",
+      "crossed-operation-id"
     ],
     "crossing": [
       "crossed-resourceintent-digest",
       "crossed-fencing-token",
       "crossed-profile-kind",
-      "crossed-expiry"
+      "crossed-expiry",
+      "swapped-attestation-roles",
+      "duplicated-known-role",
+      "fencing-future-generation",
+      "crossed-ref-kind",
+      "profile-ref-kind-mismatch"
     ],
     "downgrade": [
       "downgraded-assurance",
@@ -538,7 +697,9 @@
       "concurrent-successors",
       "stale-predecessor-version",
       "crossed-fencing-token",
-      "missing-fencing-token"
+      "missing-fencing-token",
+      "fencing-future-generation",
+      "replayed-fencing-token"
     ],
     "provisional-visibility": [
       "mac-only-attestation",

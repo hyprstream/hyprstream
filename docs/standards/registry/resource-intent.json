@@ -27,7 +27,7 @@
       "value_class": "identifier",
       "min_bytes": 1,
       "max_bytes": 128,
-      "selection_requirement": "Self-addressed digest of the canonical manifest encoding, distinct from content_cid and resource_id. Pending #1065."
+      "selection_requirement": "Self-addressed digest of the CID-free projection: the canonical manifest encoding with the manifest_cid field itself omitted, so the construction is non-cyclic. Distinct from content_cid and resource_id and never defined as a hash over another identifier value alone. The boundary checker recomputes the projection digest (manifest-cid-mismatch rejects). Pending #1065."
     },
     "operation_id": {
       "value_class": "identifier",
@@ -63,19 +63,19 @@
       "value_class": "identifier",
       "min_bytes": 1,
       "max_bytes": 64,
-      "selection_requirement": "One of the distinct profiles in resource-vocabulary.json. Unknown profile kinds reject. Pending #1067/#1070."
+      "selection_requirement": "One of the distinct per-role privacy kinds in resource-vocabulary.json. The three typed references (owner_ref, controller_ref, payer_ref) are the authoritative composite; the allowed combinations are exactly: identified-owner, pairwise-owner, committed-owner bind owner_ref kind identified/pairwise/committed; identified-controller and anonymous-capability-controller bind controller_ref kind identified/anonymous-capability; identified-payer and anonymous-entitlement-payer bind payer_ref kind identified/anonymous-entitlement. The declared profile MUST match the kind of the typed reference it governs, and each reference kind MUST come from its own per-role union; crossed combinations reject (profile-ref-kind-mismatch, crossed-ref-kind). Unknown profile kinds reject. Pending #1067/#1070."
     },
     "mac_attestation": {
       "value_class": "opaque-octets",
       "min_bytes": 32,
       "max_bytes": 1024,
-      "selection_requirement": "MAC title/control attestation. Its covered_digest field MUST equal the canonical ResourceIntent digest. Pending #1068."
+      "selection_requirement": "MAC title/control attestation. Its role is fixed to mac-title-control; a swapped, duplicated, or unknown role rejects (swapped-attestation-roles, duplicated-known-role, unknown-attestation-role). Its covered_digest field MUST equal the canonical ResourceIntent digest. Pending #1068."
     },
     "ledger_attestation": {
       "value_class": "opaque-octets",
       "min_bytes": 32,
       "max_bytes": 1024,
-      "selection_requirement": "Ledger economic attestation. Its covered_digest field MUST equal the same canonical ResourceIntent digest as mac_attestation. Pending #1072."
+      "selection_requirement": "Ledger economic attestation. Its role is fixed to ledger-economic; a swapped, duplicated, or unknown role rejects. Its covered_digest field MUST equal the same canonical ResourceIntent digest as mac_attestation. Pending #1072."
     },
     "accepted_state_epoch": {
       "value_class": "nonnegative-integer",
@@ -100,6 +100,12 @@
       "minimum": 0,
       "maximum": 9223372036854775807,
       "selection_requirement": "Unix-seconds expiry. Expired or crossed attestations reject. Pending #1065."
+    },
+    "fencing_token": {
+      "value_class": "opaque-octets",
+      "min_bytes": 8,
+      "max_bytes": 128,
+      "selection_requirement": "Registrar fencing token guarding compare-and-swap finalization. Bound to an unambiguous registrar generation boundary (generation, or generation plus a delimited suffix); a stale, crossed, same-prefix-future-generation, or already-consumed token rejects (crossed-fencing-token, fencing-future-generation, replayed-fencing-token, missing-fencing-token). Pending #1069."
     }
   },
   "labels": [
@@ -133,10 +139,15 @@
         "content_cid",
         "manifest_cid",
         "operation_id",
+        "predecessor_version",
         "mac_attestation",
         "ledger_attestation",
         "profile",
-        "expiry"
+        "accepted_state_epoch",
+        "accepted_state_digest",
+        "policy_generation",
+        "expiry",
+        "fencing_token"
       ]
     }
   ],

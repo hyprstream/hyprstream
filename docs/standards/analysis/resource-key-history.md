@@ -8,7 +8,7 @@ Key-release and key-rotation history verification must not depend on a single cl
 
 ## Rationale
 
-A single classical signature over the resource history is a quantum-vulnerable single point of failure: an adversary who recovers a classical signing key can rewrite history undetectably. The resource-attestation profile therefore requires that history verification compose across hybrid-PQC signatures, consistent with the project-wide hybrid-PQC signing policy (EdDSA + ML-DSA-65 nested COSE), and that key rotation preserve a verifiable, append-only chain.
+A single classical signature over the resource history is a quantum-vulnerable single point of failure: an adversary who recovers a classical signing key can rewrite history undetectably. The resource-attestation profile therefore requires that history verification compose across hybrid-PQC signatures and that key rotation preserve a verifiable, append-only chain. The profile does not itself select an algorithm suite (`construction_status.selected_suite` remains null pre-construction); the concrete hybrid composition is whatever the project-wide hybrid-PQC signing policy selects at construction time (#1068/#1072).
 
 ## Design inputs (owned by #1068/#1072)
 

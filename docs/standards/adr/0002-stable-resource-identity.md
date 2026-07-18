@@ -13,7 +13,8 @@ Stable resource identity (`resource_id`), content CID (`content_cid`), manifest 
 ## Consequences
 
 - `resource_id` is stable across content, manifest, and operation changes; ownership and transfer bind to it.
-- `content_cid` binds to sealed bytes; `manifest_cid` is self-addressed; `operation_id` is deterministic for idempotency.
+- `content_cid` binds to sealed bytes; `operation_id` is deterministic for idempotency.
+- `manifest_cid` is self-addressed over the **CID-free projection**: the digest of the canonical manifest encoding with the `manifest_cid` field itself omitted. The construction is non-cyclic (no digest over a structure containing that digest), and no identifier is defined as a hash or signature over another identifier value alone; the manifest *cites* the other identifiers, it does not derive any of them (vector `manifest-cid-mismatch` rejects a manifest whose CID is not the projection digest).
 - Vector `cyclic-identifier` rejects an identifier defined as a hash of another (RA-REQ-001).
 - Every request and external effect is idempotent by deterministic operation ID (RA-REQ-003/004).
 

@@ -19,7 +19,7 @@
 
 ## Fail-closed posture
 
-Every unimplemented path fails closed: a structurally valid fixture terminates with `construction-incomplete`; a missing, crossed, downgraded, replayed, or concurrent transition rejects. No production manifest is finalized until both reviewed attestations exist over the identical canonical digest and the crash, concurrency, privacy, and interoperability suites pass.
+The **structural boundary checker** fails closed over everything it models: a structurally valid fixture terminates with `construction-incomplete`, and a missing, crossed, downgraded, replayed, or concurrent transition rejects. This is a structural-checker guarantee, not a proof about future runtime paths — the checker cannot establish that every not-yet-implemented production code path fails closed. Production finalization therefore remains disabled (`construction_status.production_refusal = construction-incomplete`) until the implementation gates below pass: no production manifest is finalized until both reviewed attestations exist over the identical canonical digest and the crash, concurrency, privacy, and interoperability suites pass.
 
 ## Production gates (acceptance criteria)
 

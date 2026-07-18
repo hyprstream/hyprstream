@@ -16,7 +16,7 @@
       "source": "identity",
       "statement": "A finalized manifest MUST cite the stable resource identifier, the content CID it covers, its own manifest CID, and a deterministic operation ID independently.",
       "kind": "implemented-test",
-      "test": "python3 tools/check_resource_attestation.py (baseline manifest cites resource_id, content_cid, manifest_cid, and operation_id independently)"
+      "test": "python3 tools/check_resource_attestation.py (missing-resource-id, missing-content-cid, missing-manifest-cid, missing-operation-id, missing-intent-identifier, crossed-operation-id, and manifest-cid-mismatch: every required identifier must be present, the manifest operation ID must equal the attested ResourceIntent operation ID, and manifest_cid must be the non-cyclic CID-free projection digest)"
     },
     {
       "id": "RA-REQ-003",
@@ -82,7 +82,7 @@
       "source": "transition",
       "statement": "A stale, replayed, or crossed fencing token MUST NOT advance a resource version.",
       "kind": "implemented-test",
-      "test": "python3 tools/check_resource_attestation.py (stale-predecessor-version and crossed-fencing-token)"
+      "test": "python3 tools/check_resource_attestation.py (crossed-fencing-token, fencing-future-generation, and replayed-fencing-token: stale-generation, crossed, same-prefix future-generation, and already-consumed fencing tokens all reject)"
     },
     {
       "id": "RA-REQ-011",
@@ -162,7 +162,7 @@
       "source": "profiles",
       "statement": "Identified, pairwise, and committed-owner profiles, identified and anonymous-capability controller profiles, and identified and anonymous-entitlement payer profiles MUST remain distinct.",
       "kind": "implemented-test",
-      "test": "python3 tools/check_resource_attestation.py (crossed-profile-kind and registry profile distinctness)"
+      "test": "python3 tools/check_resource_attestation.py (crossed-profile-kind, profile-ref-kind-mismatch, crossed-ref-kind, and registry profile distinctness: the declared profile must match the kind of the typed reference it governs and each reference kind must come from its own per-role union)"
     },
     {
       "id": "RA-REQ-020",
@@ -271,7 +271,7 @@
       "source": "construction-status",
       "statement": "The experimental boundary checker MUST require a MAC attestation and a ledger attestation over byte-identical canonical ResourceIntent digests and MUST reject a missing, duplicated, crossed, or downgraded attestation.",
       "kind": "implemented-test",
-      "test": "python3 tools/check_resource_attestation.py (mac-only-attestation, ledger-only-attestation, duplicated-mac-attestation, crossed-resourceintent-digest, and downgraded-assurance)"
+      "test": "python3 tools/check_resource_attestation.py (mac-only-attestation, ledger-only-attestation, duplicated-mac-attestation, swapped-attestation-roles, duplicated-known-role, crossed-resourceintent-digest, and downgraded-assurance)"
     },
     {
       "id": "RA-REQ-032",

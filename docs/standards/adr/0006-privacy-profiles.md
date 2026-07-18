@@ -8,7 +8,7 @@ A single "anonymous" profile that sometimes emits a stable holder DID would link
 
 ## Decision
 
-Seven profiles remain distinct: `identified-owner`, `pairwise-owner`, `committed-owner`, `identified-controller`, `anonymous-capability-controller`, `identified-payer`, `anonymous-entitlement-payer`. A profile that accepts an anonymous controller or payer must not emit a stable holder DID, ATProto handle, or linkable entitlement identifier into an origin audit record, public receipt, or trust store. Public proof records use commitments; detailed receipts are selectively disclosed or encrypted to authorized parties.
+Seven profile values remain distinct: `identified-owner`, `pairwise-owner`, `committed-owner`, `identified-controller`, `anonymous-capability-controller`, `identified-payer`, `anonymous-entitlement-payer`. These are **per-role privacy kinds, not complete intent tuples**: every ResourceIntent carries three typed references (`owner_ref`, `controller_ref`, `payer_ref`), each constrained to its own per-role union, and the declared profile MUST match the kind of the typed reference it governs. The three typed references are the authoritative composite; a crossed profile/reference combination or a reference kind outside its per-role union rejects (vectors `profile-ref-kind-mismatch`, `crossed-ref-kind`). A profile that accepts an anonymous controller or payer must not emit a stable holder DID, ATProto handle, or linkable entitlement identifier into an origin audit record, public receipt, or trust store. Public proof records use commitments; detailed receipts are selectively disclosed or encrypted to authorized parties.
 
 ## Consequences
 

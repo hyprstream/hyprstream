@@ -28,4 +28,4 @@ The first vertical of resource ownership is immutable content-addressed storage 
 
 ## Status
 
-Both plans are pre-construction; the implementations (#1066 CAS, #1071 9P) are not complete. The boundary checker enforces the structurally checkable rules today (`cas-exposes-provisional`, `cas:content-cid-mismatch`, `ninep:title-without-finalized`) and refuses a structurally valid fixture with `construction-incomplete`. No carrier-transport interoperability is claimed here; that evidence belongs to #1058/#1059.
+Both plans are pre-construction; the implementations (#1066 CAS, #1071 9P) are not complete. The boundary checker enforces the structurally checkable rules today (vectors `cas-exposes-provisional`, `content-cid-mismatch`, `ninep-confers-unfinalized-title`) and refuses a structurally valid fixture with `construction-incomplete`. No carrier-transport interoperability is claimed here; that evidence belongs to #1058/#1059.
