@@ -2006,7 +2006,7 @@ mod tests {
     async fn moq_stream_round_trip() -> Result<()> {
         let origin = origin();
         let (_client_secret, client_pub) = crate::crypto::generate_ephemeral_keypair();
-        let ctx = StreamContext::from_dh(&client_pub.to_bytes())?;
+        let ctx = StreamContext::from_third_party_interop_dh(&client_pub.to_bytes())?;
         let topic = ctx.topic().to_owned();
         let mac_key = *ctx.mac_key();
         // #321: DH path is AEAD-on; the verifier shares the same enc_key.
@@ -2364,7 +2364,7 @@ mod tests {
     async fn any_stream_publisher_moq_round_trip() -> Result<()> {
         let origin = origin();
         let (_client_secret, client_pub) = crate::crypto::generate_ephemeral_keypair();
-        let ctx = StreamContext::from_dh(&client_pub.to_bytes())?;
+        let ctx = StreamContext::from_third_party_interop_dh(&client_pub.to_bytes())?;
         let topic = ctx.topic().to_owned();
         let mac_key = *ctx.mac_key();
         // #321: DH path is AEAD-on; the verifier shares the same enc_key.
@@ -3065,7 +3065,7 @@ mod tests {
 
         let origin = origin();
         let (_cs, client_pub) = crate::crypto::generate_ephemeral_keypair();
-        let ctx = StreamContext::from_dh(&client_pub.to_bytes())?;
+        let ctx = StreamContext::from_third_party_interop_dh(&client_pub.to_bytes())?;
         let topic = ctx.topic().to_owned();
         let mac_key = *ctx.mac_key();
         let enc_key = *ctx.enc_key().expect("DH ctx has enc_key");

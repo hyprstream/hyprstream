@@ -809,7 +809,9 @@ impl RegistryService {
             .with_moq_origin_handle(self.moq_origin.clone());
 
         // 10 minutes expiry for clone operations
-        let stream_ctx = stream_channel.prepare_stream(client_pub_bytes, 600).await?;
+        let stream_ctx = stream_channel
+            .prepare_third_party_interop_stream(client_pub_bytes, 600)
+            .await?;
 
         debug!(
             stream_id = %stream_ctx.stream_id(),
@@ -1048,7 +1050,9 @@ impl RegistryService {
             .with_reach_config_handle(self.reach_config.clone())
             .with_moq_origin_handle(self.moq_origin.clone());
         // 10 minutes expiry — weights are GB-scale.
-        let stream_ctx = stream_channel.prepare_stream(client_pub_bytes, 600).await?;
+        let stream_ctx = stream_channel
+            .prepare_third_party_interop_stream(client_pub_bytes, 600)
+            .await?;
 
         debug!(
             stream_id = %stream_ctx.stream_id(),

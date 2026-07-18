@@ -316,7 +316,7 @@ impl MetricsHandler for MetricsService {
         let stream_ctx = self
             .inner
             .stream_channel
-            .prepare_stream(&q.ephemeral_pubkey, 600)
+            .prepare_third_party_interop_stream(&q.ephemeral_pubkey, 600)
             .await?;
 
         let broadcast_path = hyprstream_rpc::moq_stream::global_moq_origin()

@@ -909,7 +909,7 @@ impl WorkerService {
 
         // DH + pre-authorization via StreamChannel — atomic, no pending state
         let stream_ctx = self.stream_channel
-            .prepare_stream_with_claims(&client_pubkey, 600, claims).await
+            .prepare_third_party_interop_stream_with_claims(&client_pubkey, 600, claims).await
             .map_err(|e| anyhow::anyhow!("Stream preparation failed: {}", e))?
             .with_qos_preset::<hyprstream_rpc::stream_info::Pipe>();
 

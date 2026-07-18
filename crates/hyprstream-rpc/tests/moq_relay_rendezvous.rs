@@ -103,7 +103,7 @@ async fn moq_relay_rendezvous() -> Result<()> {
 
     // ── Stream identity (DH-derived topic + MAC key, shared producer/consumer) ──
     let (_client_secret, client_pub) = hyprstream_rpc::crypto::generate_ephemeral_keypair();
-    let ctx = StreamContext::from_dh(&client_pub.to_bytes())?;
+    let ctx = StreamContext::from_third_party_interop_dh(&client_pub.to_bytes())?;
     let topic = ctx.topic().to_owned();
     let mac_key = *ctx.mac_key();
 
@@ -156,12 +156,13 @@ async fn moq_relay_rendezvous() -> Result<()> {
     let mut track = bc.subscribe_track(&moq_net::Track::new(STREAM_TRACK))?;
 
     // ── Publish through the relay; verify the chained-HMAC end-to-end ──────────
-    // The producer (`from_dh` ctx) seals each payload under the DH `enc_key` (#321),
+    // The producer (third-party interoperability ctx) seals each payload under the
+    // DH `enc_key` (#321),
     // so the verifier must open it with the SAME key — otherwise `Tagged` frames pass
     // through undecrypted and never become `Data`/`Complete`. Mirrors the production
     // consumers (stream_consumer.rs + moq_stream.rs all call `.with_enc_key`).
     let mut verifier = StreamVerifier::new(mac_key, topic.clone())
-        .with_enc_key(*ctx.enc_key().expect("from_dh ctx derives the AEAD enc_key (#321)"));
+        .with_enc_key(*ctx.enc_key().expect("interop DH ctx derives the AEAD enc_key (#321)"));
     let mut got: Vec<StreamPayload> = Vec::new();
 
     // Publish one group at a time and drain it so the ordered chain is observed.
@@ -312,7 +313,7 @@ async fn relay_choice_only_anonymizes_stream_end_to_end() -> Result<()> {
 
     // ── Now drive ACTUAL delivery using ONLY the advertised (relay-only) reach ──
     let (_client_secret, client_pub) = hyprstream_rpc::crypto::generate_ephemeral_keypair();
-    let ctx = StreamContext::from_dh(&client_pub.to_bytes())?;
+    let ctx = StreamContext::from_third_party_interop_dh(&client_pub.to_bytes())?;
     let topic = ctx.topic().to_owned();
     let mac_key = *ctx.mac_key();
 
@@ -358,12 +359,13 @@ async fn relay_choice_only_anonymizes_stream_end_to_end() -> Result<()> {
     .ok_or_else(|| anyhow!("broadcast not announced via relay"))?;
     let track = bc.subscribe_track(&moq_net::Track::new(STREAM_TRACK))?;
 
-    // The producer (`from_dh` ctx) seals each payload under the DH `enc_key` (#321),
+    // The producer (third-party interoperability ctx) seals each payload under the
+    // DH `enc_key` (#321),
     // so the verifier must open it with the SAME key — otherwise `Tagged` frames pass
     // through undecrypted and never become `Data`/`Complete`. Mirrors the production
     // consumers (stream_consumer.rs + moq_stream.rs all call `.with_enc_key`).
     let mut verifier = StreamVerifier::new(mac_key, topic.clone())
-        .with_enc_key(*ctx.enc_key().expect("from_dh ctx derives the AEAD enc_key (#321)"));
+        .with_enc_key(*ctx.enc_key().expect("interop DH ctx derives the AEAD enc_key (#321)"));
     // Publish FIRST, then read the group (the moq group exists once published) —
     // matches the `next_frame` ordering in `moq_relay_rendezvous`.
     publisher.publish_data(b"anon").await?;

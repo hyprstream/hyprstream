@@ -3702,7 +3702,7 @@ impl DiscoveryHandler for DiscoveryService {
         _request_id: u64,
     ) -> Result<DiscoveryResponseVariant> {
         Ok(DiscoveryResponseVariant::Error(ErrorInfo {
-            message: "prepareStream removed — use StreamChannel::prepare_stream for authenticated streaming".to_owned(),
+            message: "prepareStream removed — use StreamChannel::prepare_identified_stream for authenticated streaming".to_owned(),
             code: "REMOVED".to_owned(),
             details: String::new(),
         }))
@@ -3715,7 +3715,7 @@ impl DiscoveryHandler for DiscoveryService {
     ) -> Result<DiscoveryResponseVariant> {
         Ok(DiscoveryResponseVariant::Error(ErrorInfo {
             message:
-                "getStream removed — use StreamChannel::prepare_stream for authenticated streaming"
+                "getStream removed — use StreamChannel::prepare_identified_stream for authenticated streaming"
                     .to_owned(),
             code: "REMOVED".to_owned(),
             details: String::new(),
@@ -3728,7 +3728,7 @@ impl DiscoveryHandler for DiscoveryService {
         _request_id: u64,
     ) -> Result<DiscoveryResponseVariant> {
         Ok(DiscoveryResponseVariant::Error(ErrorInfo {
-            message: "listStreams removed — use StreamChannel::prepare_stream for authenticated streaming".to_owned(),
+            message: "listStreams removed — use StreamChannel::prepare_identified_stream for authenticated streaming".to_owned(),
             code: "REMOVED".to_owned(),
             details: String::new(),
         }))

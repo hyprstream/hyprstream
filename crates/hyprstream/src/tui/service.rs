@@ -347,7 +347,7 @@ impl TuiService {
             // The blocks remain HMAC-chain authenticated. (AEAD stays mandatory + ON
             // for the DH-keyed mesh inference stream, whose consumer derives enc_key.)
             match ctx.ephemeral_pubkey() {
-                Some(pubkey) => Ok(StreamContext::from_dh(&pubkey)?
+                Some(pubkey) => Ok(StreamContext::from_third_party_interop_dh(&pubkey)?
                     .without_aead()
                     .with_reach_config(reach_config.clone())),
                 None => {

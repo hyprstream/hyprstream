@@ -570,7 +570,8 @@ impl InferenceService {
     /// This is the first phase of streaming that runs BEFORE the REP response is sent.
     /// The actual streaming happens in `execute_stream` which runs AFTER the response.
     ///
-    /// Uses `StreamContext::from_dh()` from hyprstream-rpc for DH key exchange:
+    /// Uses the explicitly named third-party interoperability DH edge from
+    /// hyprstream-rpc when no accepted identified-stream binding is available:
     /// 1. Server generates ephemeral Ristretto255 keypair
     /// 2. Server computes shared secret: DH(server_secret, client_ephemeral_pubkey)
     /// 3. Both parties derive topic and mac_key from shared secret using HKDF
@@ -608,7 +609,7 @@ impl InferenceService {
             .ok_or_else(|| anyhow!("StreamChannel not initialized"))?;
 
         let stream_ctx = stream_channel
-            .prepare_stream_with_claims(client_pub_bytes, expiry_secs, claims)
+            .prepare_third_party_interop_stream_with_claims(client_pub_bytes, expiry_secs, claims)
             .await?
             .with_qos_preset::<hyprstream_rpc::stream_info::Job>();
 
@@ -1069,7 +1070,7 @@ impl InferenceService {
         let claims = ctx.claims().cloned();
 
         let stream_ctx = stream_channel
-            .prepare_stream_with_claims(client_pub_ref, expiry_secs, claims)
+            .prepare_third_party_interop_stream_with_claims(client_pub_ref, expiry_secs, claims)
             .await?
             .with_qos_preset::<hyprstream_rpc::stream_info::Job>();
 
@@ -2130,7 +2131,7 @@ impl InferenceHandler for InferenceService {
         let claims = ctx.claims().cloned();
 
         let stream_ctx = stream_channel
-            .prepare_stream_with_claims(client_pub_ref, expiry_secs, claims)
+            .prepare_third_party_interop_stream_with_claims(client_pub_ref, expiry_secs, claims)
             .await?
             .with_qos_preset::<hyprstream_rpc::stream_info::Job>();
 
