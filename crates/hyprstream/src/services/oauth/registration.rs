@@ -58,6 +58,10 @@ pub struct RegistrationRequest {
     pub jwks: Option<serde_json::Value>,
     #[serde(default)]
     pub jwks_uri: Option<String>,
+    /// Optional `did:key` generated from the host's iroh node ID. PDS
+    /// deployments use it to associate the OAuth device grant with the host.
+    #[serde(default)]
+    pub hyprstream_node_did: Option<String>,
 }
 
 /// Dynamic client registration response (RFC 7591 §3.2.1).
@@ -169,6 +173,20 @@ pub async fn register_client(
         ).into_response();
     }
 
+    // Validate host identity metadata before persisting it. Invalid did:key
+    // values must never become an attachable PDS principal.
+    if let Some(did) = req.hyprstream_node_did.as_deref() {
+        if hyprstream_crypto::did_key::did_key_to_ed25519(did).is_err() {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "invalid_client_metadata",
+                    "error_description": "hyprstream_node_did must be an Ed25519 did:key"
+                })),
+            ).into_response();
+        }
+    }
+
     let client_id = uuid::Uuid::new_v4().to_string();
 
     let client = RegisteredClient {
@@ -182,6 +200,7 @@ pub async fn register_client(
         token_endpoint_auth_method: req.token_endpoint_auth_method.clone(),
         jwks: req.jwks.clone(),
         jwks_uri: req.jwks_uri.clone(),
+        hyprstream_node_did: req.hyprstream_node_did.clone(),
         is_cimd: false,
         registered_at: Instant::now(),
     };
@@ -462,6 +481,7 @@ pub async fn fetch_client_metadata(
             token_endpoint_auth_method: doc.token_endpoint_auth_method,
             jwks: doc.jwks,
             jwks_uri: doc.jwks_uri,
+            hyprstream_node_did: None,
             is_cimd: true,
             registered_at: Instant::now(),
         },

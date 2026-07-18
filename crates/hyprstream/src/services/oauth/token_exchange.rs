@@ -1009,6 +1009,7 @@ async fn issue_grant_refresh_token(
         resource: None,
         expires_at_unix: chrono::Utc::now().timestamp() + state.refresh_token_ttl as i64,
         verifying_key_bytes: None,
+        dpop_jkt: None,
         ucan_grant: grant_refresh,
     };
 
@@ -1164,6 +1165,7 @@ mod tests {
             resource: None,
             expires_at_unix: 9999999999,
             verifying_key_bytes: None,
+            dpop_jkt: None,
             ucan_grant: Some(super::super::state::UcanGrantRefresh {
                 grant_cbor_b64: "Zm9vYmFy".to_owned(),
                 grant_cid: blake3::hash(b"the-grant").to_hex().to_string(),

@@ -14,6 +14,7 @@ pub mod git_handlers;
 pub mod gpu_detect;
 pub mod handlers;
 pub mod policy_handlers;
+pub mod pds_handlers;
 pub mod quick;
 pub mod bootstrap_manager;
 pub mod remote_handlers;

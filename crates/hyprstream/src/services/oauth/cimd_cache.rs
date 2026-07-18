@@ -126,6 +126,7 @@ mod tests {
             token_endpoint_auth_method: None,
             jwks: None,
             jwks_uri: None,
+            hyprstream_node_did: None,
             is_cimd: true,
             registered_at: Instant::now(),
         }

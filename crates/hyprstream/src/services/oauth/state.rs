@@ -126,6 +126,9 @@ pub struct RegisteredClient {
     pub jwks: Option<serde_json::Value>,
     /// JWKS endpoint URL — alternative to inline `jwks`.
     pub jwks_uri: Option<String>,
+    /// Optional host `did:key` supplied by a PDS attachment client. Validated
+    /// during registration and retained for PDS identity association.
+    pub hyprstream_node_did: Option<String>,
     /// True if this client was registered via Client ID Metadata Document (HTTPS URL client_id)
     pub is_cimd: bool,
     pub registered_at: Instant,
@@ -290,6 +293,10 @@ pub struct RefreshTokenEntry {
     pub expires_at_unix: i64,
     /// Ed25519 verifying key bytes bound to this token (cnf key continuity on refresh).
     pub verifying_key_bytes: Option<[u8; 32]>,
+    /// RFC 9449 JWK thumbprint. When set, refresh requires a DPoP proof from
+    /// this exact key; it is carried forward during refresh-token rotation.
+    #[serde(default)]
+    pub dpop_jkt: Option<String>,
     /// Present only for UCAN-grant refresh tokens (`client_id` `ucan-grant:{sub}`).
     ///
     /// MAC #547 / B1 (#673): refresh of a UCAN grant is NOT a free re-mint — the

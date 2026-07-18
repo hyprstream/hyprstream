@@ -267,6 +267,7 @@ async fn oauth_self_protected_resource_metadata(
         "read:*:*".into(),
         "write:*:*".into(),
         "infer:model:*".into(),
+        "pds:attach".into(),
     ]);
 
     // Include the QUIC TLS cert hash so browsers can pin the self-signed certificate.

@@ -23,6 +23,7 @@ use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
 use super::state::{DeviceCodeStatus, OAuthState, RefreshTokenEntry};
+use hyprstream_rpc::auth::{JwkThumbprintInput, jwk_thumbprint};
 use crate::services::generated::policy_client::IssueToken;
 
 /// Device code grant type URN (RFC 8628).
@@ -502,6 +503,16 @@ async fn exchange_refresh_token(
         Some(Err(resp)) => return resp,
     };
 
+    // A sender-constrained token cannot be refreshed by another key or without
+    // a proof. The old token was already consumed to preserve rotation safety.
+    if !refresh_dpop_matches(entry.dpop_jkt.as_deref(), dpop_jkt.as_deref()) {
+        return token_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_dpop_proof",
+            Some("DPoP proof must use the key bound to this refresh token"),
+        );
+    }
+
     // Reconstruct verifying key from stored bytes (cnf continuity across refreshes).
     let stored_vk: Option<ed25519_dalek::VerifyingKey> = entry.verifying_key_bytes
         .and_then(|b| ed25519_dalek::VerifyingKey::from_bytes(&b).ok());
@@ -610,10 +621,46 @@ async fn exchange_device_code(
                 Some(Err(resp)) => return resp,
             };
 
+            // A PDS attachment client records the host's iroh did:key at
+            // registration. Its token request must demonstrate possession of
+            // exactly that Ed25519 key via DPoP before a credential is minted.
+            let registered_node_did = {
+                let clients = state.clients.read().await;
+                clients
+                    .get(&client_id)
+                    .and_then(|client| client.hyprstream_node_did.clone())
+            };
+            if !registered_host_dpop_matches(
+                registered_node_did.as_deref(),
+                dpop_jkt.as_deref(),
+            ) {
+                tracing::warn!(%client_id, "PDS host DID and DPoP key do not match");
+                return token_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_dpop_proof",
+                    Some("DPoP proof must use the registered host key"),
+                );
+            }
+
             // Device flow: no OIDC nonce and not initial OIDC auth.
             issue_token_with_refresh(&state, &client_id, scopes, resource, &approved_by, None, false, device_vk.as_ref(), dpop_jkt, vault_device_cookie).await
         }
     }
+}
+
+fn registered_host_dpop_matches(registered_node_did: Option<&str>, dpop_jkt: Option<&str>) -> bool {
+    let Some(node_did) = registered_node_did else {
+        return true;
+    };
+    let Ok(node_key) = hyprstream_crypto::did_key::did_key_to_ed25519(node_did) else {
+        return false;
+    };
+    let expected_jkt = jwk_thumbprint(&JwkThumbprintInput::Ed25519 { x: &node_key });
+    dpop_jkt == Some(expected_jkt.as_str())
+}
+
+fn refresh_dpop_matches(expected_jkt: Option<&str>, presented_jkt: Option<&str>) -> bool {
+    expected_jkt.is_none() || expected_jkt == presented_jkt
 }
 
 /// Generate a cryptographically random refresh token string.
@@ -714,6 +761,7 @@ async fn issue_token_with_refresh(
                     resource,
                     expires_at_unix: now + state.refresh_token_ttl as i64,
                     verifying_key_bytes: user_verifying_key.map(|vk| *vk.as_bytes()),
+                    dpop_jkt: dpop_jkt.clone(),
                     ucan_grant: None, // generic OAuth refresh; not a UCAN grant (MAC #547 B1)
                 };
                 if let Err(e) = state.put_refresh_token(&refresh_token, &entry, state.refresh_token_ttl as u64).await {
@@ -765,7 +813,7 @@ async fn issue_token_with_refresh(
 
             let mut response_json = serde_json::json!({
                 "access_token": token_info.token,
-                "token_type": "Bearer",
+                "token_type": if dpop_jkt.is_some() { "DPoP" } else { "Bearer" },
                 "expires_in": expires_in,
                 "scope": scope_str,
                 "refresh_token": refresh_token,
@@ -865,6 +913,33 @@ mod tests {
         let body = token_error_body("invalid_request", Some("code is required"));
         let obj = body.as_object().unwrap();
         assert_eq!(obj.get("error_description").and_then(|v| v.as_str()), Some("code is required"));
+    }
+
+    #[test]
+    fn registered_pds_host_requires_its_dpop_key() {
+        let key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let did = hyprstream_crypto::did_key::ed25519_to_did_key(key.verifying_key().as_bytes());
+        let matching_jkt = jwk_thumbprint(&JwkThumbprintInput::Ed25519 {
+            x: key.verifying_key().as_bytes(),
+        });
+
+        assert!(registered_host_dpop_matches(
+            Some(&did),
+            Some(&matching_jkt),
+        ));
+        assert!(!registered_host_dpop_matches(Some(&did), None));
+        assert!(!registered_host_dpop_matches(Some(&did), Some("other-key")));
+        assert!(!registered_host_dpop_matches(Some("did:key:zinvalid"), Some(&matching_jkt)));
+        assert!(registered_host_dpop_matches(None, None));
+    }
+
+    #[test]
+    fn dpop_bound_refresh_requires_the_original_key() {
+        assert!(refresh_dpop_matches(None, None));
+        assert!(refresh_dpop_matches(None, Some("new-key")));
+        assert!(refresh_dpop_matches(Some("bound-key"), Some("bound-key")));
+        assert!(!refresh_dpop_matches(Some("bound-key"), None));
+        assert!(!refresh_dpop_matches(Some("bound-key"), Some("other-key")));
     }
 
     #[test]
