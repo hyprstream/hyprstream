@@ -39,7 +39,9 @@ use hyprstream_rpc::auth::ucan::token::{Did, Ucan, UcanPayload};
 use hyprstream_rpc::crypto::pq::MlDsaSigningKey;
 
 use crate::mac::compiled::cose::{HybridPolicySigner, HybridPolicyVerifier};
-use crate::mac::compiled::{sign_policy, CompiledPolicy, PolicyDistError, PolicyLoader};
+use crate::mac::compiled::{
+    sign_policy, CompiledPolicy, PolicyApproval, PolicyDistError, PolicyLoader,
+};
 use crate::mac::compiler::{compile, PermissionMap};
 use crate::mac::lattice::{Lattice, LatticeVersion, SecurityLabel};
 use crate::mac::permission_map::ScopePermissionMap;
@@ -90,18 +92,19 @@ pub enum BootPolicyError {
 /// by `generation`) is the follow-up; until then, treat `installed == false` as
 /// "the earlier policy still governs the seam", never as a successful swap.
 ///
-/// ## Key provenance (self-issued smoke test, NOT a distributed trust anchor)
+/// ## Key provenance (self-issued baseline, NOT a distributed trust anchor)
 ///
-/// The signer and verifier are the SAME node keys and there are no approvals, so
-/// this is a self-signed, self-verified artifact: the round-trip exercises the
-/// real hybrid `sign_composite` → `verify_composite` path but proves nothing
+/// The signer and verifier are the SAME node keys and the approval is derived locally from
+/// this empty baseline, so this is a self-signed, self-approved artifact: the round-trip
+/// exercises the real hybrid `sign_composite` → `verify_composite` path but proves nothing
 /// about an external authority. The node's `ed_sk` (registry identity) and the
 /// `pq_sk` (drawn from the JWT-rotation ML-DSA store) are also a chimera pairing,
 /// not a purpose-built policy-authority key. **Before any *distributed* policy
 /// flow reuses this signer/verifier pairing, key provenance must be settled** —
 /// a dedicated policy-authority keypair whose verifying key is anchored in the
-/// PQ trust store, with `PolicyLoader::with_approval` populated — so the loader
-/// verifies against an anchored authority, not against the same key that signed.
+/// PQ trust store, with `PolicyLoader::with_approval` populated from a verified S5
+/// approval — so the loader verifies against an anchored authority and an independent
+/// approval, not values derived by the same node that signed.
 pub fn compile_sign_load_install(
     grant: &Ucan,
     lattice: &Lattice,
@@ -120,6 +123,13 @@ pub fn compile_sign_load_install(
         ed_sk,
         pq_sk: Some(pq_sk),
     };
+    // The dormant boot baseline is intentionally self-issued and empty. The production
+    // distribution path must replace this locally derived approval with the verified S5
+    // approval binding described above; PolicyLoader itself never permits a sig-only load.
+    let approval = PolicyApproval {
+        generation: policy.generation,
+        approved_hash: policy.policy_hash()?,
+    };
     let signed = sign_policy(&policy, &signer)?;
 
     // Verify ONCE at load (require_pq = true, fail-closed). Same key material —
@@ -136,7 +146,9 @@ pub fn compile_sign_load_install(
         pq_vk: Some(&pq_vk),
         require_pq: true,
     };
-    let loaded = PolicyLoader::new(verifier).load(&signed)?;
+    let loaded = PolicyLoader::new(verifier)
+        .with_approval(approval)
+        .load(&signed)?;
 
     let policy = Arc::new(loaded);
     let installed = install_compiled_policy(policy.clone());
