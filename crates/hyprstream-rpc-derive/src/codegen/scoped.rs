@@ -18,7 +18,8 @@ use crate::util::*;
 pub fn generate_portable_scoped_clients(service_name: &str, resolved: &ResolvedSchema, types_crate: Option<&syn::Path>) -> TokenStream {
     let mut tokens = TokenStream::new();
     let pascal = to_pascal_case(service_name);
-    let capnp_mod_ident = format_ident!("{}_capnp", service_name);
+    let rust_service_name = service_name.replace('-', "_");
+    let capnp_mod_ident = format_ident!("{}_capnp", to_snake_case(&rust_service_name));
     let capnp_mod: TokenStream = match types_crate {
         Some(tc) => quote! { #tc::#capnp_mod_ident },
         None => quote! { crate::#capnp_mod_ident },
@@ -26,7 +27,7 @@ pub fn generate_portable_scoped_clients(service_name: &str, resolved: &ResolvedS
 
     for sc in &resolved.raw.scoped_clients {
         walk_portable_scoped(
-            &mut tokens, &pascal, &capnp_mod, sc, &[],
+            &mut tokens, service_name, &pascal, &capnp_mod, sc, &[],
             resolved, types_crate,
         );
     }
@@ -158,19 +159,43 @@ fn generate_scoped_response_only(
 }
 
 /// Build a `ScopedMethodContext` chain from ancestors + current scope.
-fn build_scope_context(sc: &ScopedClient, ancestors: &[&ScopedClient]) -> ScopedMethodContext {
+fn build_scope_context(
+    sc: &ScopedClient,
+    ancestors: &[&ScopedClient],
+    resolved: &ResolvedSchema,
+) -> ScopedMethodContext {
+    let root_name = ancestors
+        .first()
+        .map_or(sc.factory_name.as_str(), |root| root.factory_name.as_str());
+    let root_method_discriminator = resolved
+        .raw
+        .request_struct
+        .as_ref()
+        .and_then(|request| request.union_fields().find(|field| field.name == root_name))
+        .map(|field| field.discriminant_value)
+        .or_else(|| {
+            resolved
+                .raw
+                .request_variants
+                .iter()
+                .position(|variant| variant.name == root_name)
+                .and_then(|index| u16::try_from(index).ok())
+        })
+        .unwrap_or(0);
     let mut parent_ctx: Option<Box<ScopedMethodContext>> = None;
     for ancestor in ancestors {
         parent_ctx = Some(Box::new(ScopedMethodContext {
             factory_name: ancestor.factory_name.clone(),
             scope_fields: ancestor.scope_fields.clone(),
             parent: parent_ctx,
+            root_method_discriminator,
         }));
     }
     ScopedMethodContext {
         factory_name: sc.factory_name.clone(),
         scope_fields: sc.scope_fields.clone(),
         parent: parent_ctx,
+        root_method_discriminator,
     }
 }
 
@@ -187,6 +212,7 @@ struct UnwrapLevel {
 
 fn walk_portable_scoped(
     tokens: &mut TokenStream,
+    service_name: &str,
     pascal: &str,
     capnp_mod: &TokenStream,
     sc: &ScopedClient,
@@ -195,17 +221,27 @@ fn walk_portable_scoped(
     types_crate: Option<&syn::Path>,
 ) {
     tokens.extend(generate_portable_scoped_client_recursive(
-        pascal, capnp_mod, sc, ancestors, resolved, types_crate,
+        service_name, pascal, capnp_mod, sc, ancestors, resolved, types_crate,
     ));
     let mut next_ancestors: Vec<&ScopedClient> = ancestors.to_vec();
     next_ancestors.push(sc);
     for nested in &sc.nested_clients {
-        walk_portable_scoped(tokens, pascal, capnp_mod, nested, &next_ancestors, resolved, types_crate);
+        walk_portable_scoped(
+            tokens,
+            service_name,
+            pascal,
+            capnp_mod,
+            nested,
+            &next_ancestors,
+            resolved,
+            types_crate,
+        );
     }
 }
 
 /// Generate a portable scoped client struct using `Arc<dyn RpcClient>`.
 fn generate_portable_scoped_client_recursive(
+    service_name: &str,
     pascal: &str,
     capnp_mod: &TokenStream,
     sc: &ScopedClient,
@@ -282,7 +318,7 @@ fn generate_portable_scoped_client_recursive(
     }
 
     // Request methods (portable mode)
-    let scope_ctx = build_scope_context(sc, ancestors);
+    let scope_ctx = build_scope_context(sc, ancestors, resolved);
     let request_methods: Vec<TokenStream> = sc.inner_request_variants.iter().map(|v| {
         generate_portable_request_method(
             capnp_mod,
@@ -318,12 +354,42 @@ fn generate_portable_scoped_client_recursive(
 
             /// Send a raw request and return the raw response bytes.
             pub async fn call(&self, payload: Vec<u8>) -> anyhow::Result<Vec<u8>> {
-                self.client.call(payload).await
+                self.client.call_for_service(#service_name, payload).await
+            }
+
+            /// Send a generated request with its canonical root method id.
+            async fn call_with_method(
+                &self,
+                method_discriminator: u16,
+                payload: Vec<u8>,
+            ) -> anyhow::Result<Vec<u8>> {
+                self.client
+                    .call_for_service_with_method(#service_name, method_discriminator, payload)
+                    .await
             }
 
             /// Send a streaming request with ephemeral DH pubkey.
             pub async fn call_streaming(&self, payload: Vec<u8>, ephemeral_pubkey: [u8; 32]) -> anyhow::Result<Vec<u8>> {
-                self.client.call_streaming(payload, ephemeral_pubkey).await
+                self.client
+                    .call_streaming_for_service(#service_name, payload, ephemeral_pubkey)
+                    .await
+            }
+
+            /// Send a generated streaming request with its canonical root method id.
+            async fn call_streaming_with_method(
+                &self,
+                method_discriminator: u16,
+                payload: Vec<u8>,
+                ephemeral_pubkey: [u8; 32],
+            ) -> anyhow::Result<Vec<u8>> {
+                self.client
+                    .call_streaming_for_service_with_method(
+                        #service_name,
+                        method_discriminator,
+                        payload,
+                        ephemeral_pubkey,
+                    )
+                    .await
             }
 
             /// Parse a scoped response from raw bytes.
@@ -385,5 +451,38 @@ fn generate_portable_nested_factory_method(
                 #(#own_field_inits,)*
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod canonical_service_authority_tests {
+    use super::*;
+
+    #[test]
+    fn hyphenated_scoped_service_keeps_original_authority() {
+        let schema = ParsedSchema {
+            request_variants: Vec::new(),
+            response_variants: Vec::new(),
+            structs: Vec::new(),
+            scoped_clients: vec![ScopedClient {
+                factory_name: "document".to_owned(),
+                client_name: "DocumentClient".to_owned(),
+                scope_fields: Vec::new(),
+                inner_request_variants: Vec::new(),
+                inner_response_variants: Vec::new(),
+                capnp_inner_response: "document_response".to_owned(),
+                nested_clients: Vec::new(),
+            }],
+            enums: Vec::new(),
+            request_struct: None,
+            response_struct: None,
+        };
+        let resolved = ResolvedSchema::from(&schema);
+        let generated = generate_portable_scoped_clients("text-generation", &resolved, None)
+            .to_string();
+
+        assert!(generated.contains("text-generation"));
+        assert!(!generated.contains("text_generation\""));
+        assert!(generated.contains("text_generation_capnp"));
     }
 }

@@ -864,6 +864,14 @@ mod automount_tests {
         ) -> anyhow::Result<Vec<u8>> {
             anyhow::bail!("NoopClient: no transport")
         }
+        async fn call_for_service_with_method(
+            &self,
+            _service_domain: &str,
+            _method_discriminator: u16,
+            _payload: Vec<u8>,
+        ) -> anyhow::Result<Vec<u8>> {
+            anyhow::bail!("NoopClient: no transport")
+        }
         async fn call_with_options(
             &self,
             _payload: Vec<u8>,
@@ -889,6 +897,15 @@ mod automount_tests {
         async fn call_streaming_for_service(
             &self,
             _service_domain: &str,
+            _payload: Vec<u8>,
+            _ephemeral_pubkey: [u8; 32],
+        ) -> anyhow::Result<Vec<u8>> {
+            anyhow::bail!("NoopClient: no transport")
+        }
+        async fn call_streaming_for_service_with_method(
+            &self,
+            _service_domain: &str,
+            _method_discriminator: u16,
             _payload: Vec<u8>,
             _ephemeral_pubkey: [u8; 32],
         ) -> anyhow::Result<Vec<u8>> {

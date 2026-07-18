@@ -1425,7 +1425,10 @@ fn resolve_service_vk(service_name: &str) -> Option<VerifyingKey> {
 }
 
 fn install_process_production_resolver(signing_key: &SigningKey) -> Result<()> {
-    hyprstream_discovery::bootstrap_deployment_process(signing_key.clone())
+    hyprstream_discovery::bootstrap_deployment_process(signing_key.clone())?;
+    hyprstream_rpc::envelope::install_browser_currentness_verifier(
+        hyprstream_discovery::production_browser_currentness_verifier()?,
+    )
 }
 
 /// Install the process-global envelope verify configuration (#152, #160).

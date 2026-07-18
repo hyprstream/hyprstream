@@ -81,7 +81,7 @@ impl NativeServiceAnnouncement {
                 .current
                 .services
                 .iter()
-                .any(|entry| entry.id == service_name),
+                .any(|entry| entry.id == format!("#{service_name}")),
             "accepted state does not authorize service {service_name}"
         );
         let current = state
@@ -101,7 +101,7 @@ impl NativeServiceAnnouncement {
         let recipient = hyprstream_rpc::node_identity::derive_mesh_kem_recipient(signer)?.public();
         let announcement = Self {
             service_did: did.clone(),
-            capabilities: vec!["hyprstream-rpc/1".to_owned()],
+            capabilities: vec!["hyprstream-rpc/1".to_owned(), "hyprstream-moq/1".to_owned()],
             accepted_state_digest: state.head_digest,
             accepted_state_epoch: state.epoch,
             accepted_state_expires_at_unix_ms: expires_at,
@@ -1002,7 +1002,7 @@ mod tests {
         let signer = SigningKey::from_bytes(&[0x51; 32]);
         let announcement = NativeServiceAnnouncement {
             service_did: hyprstream_rpc::identity::Did::from("did:at9p:test"),
-            capabilities: vec!["hyprstream-rpc/1".to_owned()],
+            capabilities: vec!["hyprstream-rpc/1".to_owned(), "hyprstream-moq/1".to_owned()],
             accepted_state_digest: [0x31; 64],
             accepted_state_epoch: 1,
             accepted_state_expires_at_unix_ms: i64::MAX,
