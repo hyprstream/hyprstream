@@ -76,13 +76,14 @@ impl NodeKind {
     }
 }
 
-/// Whether the method's scope action denotes a mutation (write/manage) vs a read (query).
+/// Whether the method's scope action denotes write/authority vs the schema's
+/// read class (`query`/`subscribe`).
 ///
 /// Scopes come from `$scope`/`$capability` (S3, #547). A `query` (or read-shaped)
-/// scope must project to a read-only node; anything else is treated as a mutation.
+/// scope must project to a read-only node; anything else is treated as authority.
 /// Empty scope (a `$scopeExempt` method) is treated as read (least authority).
-fn scope_is_mutation(scope: &str) -> bool {
-    !matches!(scope, "" | "query" | "read")
+fn scope_is_write_class(scope: &str) -> bool {
+    !matches!(scope, "" | "query" | "subscribe")
 }
 
 /// Whether a method name denotes a listing (projects to a directory by default).
@@ -98,7 +99,7 @@ pub fn infer_kind(scope: &str, arg: &CapnpType, name: &str, is_streaming: bool) 
     if is_streaming {
         return NodeKind::Stream;
     }
-    if scope_is_mutation(scope) {
+    if scope_is_write_class(scope) {
         return NodeKind::Ctl;
     }
     // Read-shaped (query/exempt): pick by argument shape.
@@ -158,17 +159,17 @@ pub fn resolve_kind(
 ///
 /// Returns `Err(message)` on contradiction, naming the offending method.
 pub fn validate_node(method_snake: &str, scope: &str, kind: NodeKind) -> Result<(), String> {
-    let mutation = scope_is_mutation(scope);
-    if mutation && kind.is_read_only() {
+    let write_class = scope_is_write_class(scope);
+    if write_class && kind.is_read_only() {
         return Err(format!(
-            "method `{method_snake}`: write/manage scope `{scope}` cannot project to a \
+            "method `{method_snake}`: write/authority-class scope `{scope}` cannot project to a \
              read-only VFS node (`{kind:?}`) — a 9P read must be side-effect-free; \
              use `$vfsKind(ctl)` or `$vfsKind(stream)`"
         ));
     }
-    if !mutation && matches!(kind, NodeKind::Ctl) {
+    if !write_class && matches!(kind, NodeKind::Ctl) {
         return Err(format!(
-            "method `{method_snake}`: query scope `{scope}` cannot project to a `ctl` node \
+            "method `{method_snake}`: read-class scope `{scope}` cannot project to a `ctl` node \
              — a control-file write invokes the method; use a read kind \
              (`$vfsKind(file|dir|query)`) or give the method a write scope"
         ));
@@ -481,6 +482,9 @@ mod tests {
         assert!(validate_node("list", "query", NodeKind::Dir).is_ok());
         assert!(validate_node("get", "query", NodeKind::File).is_ok());
         assert!(validate_node("search", "query", NodeKind::Query).is_ok());
+        assert!(validate_node("watch", "subscribe", NodeKind::Stream).is_ok());
+        assert!(validate_node("snapshot", "subscribe", NodeKind::File).is_ok());
+        assert!(validate_node("watch", "subscribe", NodeKind::Ctl).is_err());
         // A scope-exempt method (empty scope) is treated as read — ctl still rejected.
         assert!(validate_node("ping", "", NodeKind::File).is_ok());
         assert!(validate_node("ping", "", NodeKind::Ctl).is_err());

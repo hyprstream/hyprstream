@@ -22,6 +22,8 @@ pub mod rocksdb_store;
 #[cfg(feature = "valkey")]
 pub mod valkey;
 
+pub use hyprstream_rpc::annotations_capnp::ScopeAction;
+
 pub use federation::FederationKeyResolver;
 pub use jwt::{Claims, JwtError};
 pub use key_rotation::{SigningKeyStore, Es256SigningKeyStore, Es256KeySlot, RotationStores};
@@ -33,6 +35,60 @@ pub use user_store::{DeviceRecord, DeviceStore, KeyAlgorithm, UserFilter, UserPr
 pub use rocksdb_store::RocksDbUserStore;
 #[cfg(feature = "valkey")]
 pub use valkey::ValkeyUserStore;
+
+/// Every schema-defined scope action, in its Cap'n Proto ordinal order.
+///
+/// This is the closed vocabulary used by wildcard UCAN-to-TE expansion. The
+/// values come from the generated schema enum rather than a hand-written MAC
+/// mirror, so adding or reordering a schema action cannot silently change the
+/// action understood by the policy compiler.
+pub const SCHEMA_SCOPE_ACTIONS: [ScopeAction; 14] = [
+    ScopeAction::Query,
+    ScopeAction::Subscribe,
+    ScopeAction::Write,
+    ScopeAction::Create,
+    ScopeAction::Publish,
+    ScopeAction::Infer,
+    ScopeAction::Train,
+    ScopeAction::Context,
+    ScopeAction::Serve,
+    ScopeAction::Spawn,
+    ScopeAction::Manage,
+    ScopeAction::MeshInvoke,
+    ScopeAction::MeshStage,
+    ScopeAction::MeshDelta,
+];
+
+/// Return the canonical capability token for a generated schema action.
+///
+/// This is the single string bridge shared by runtime [`Operation`] parsing
+/// and the MAC permission map.
+pub const fn scope_action_name(action: ScopeAction) -> &'static str {
+    match action {
+        ScopeAction::Query => "query",
+        ScopeAction::Subscribe => "subscribe",
+        ScopeAction::Write => "write",
+        ScopeAction::Create => "create",
+        ScopeAction::Publish => "publish",
+        ScopeAction::Infer => "infer",
+        ScopeAction::Train => "train",
+        ScopeAction::Context => "context",
+        ScopeAction::Serve => "serve",
+        ScopeAction::Spawn => "spawn",
+        ScopeAction::Manage => "manage",
+        ScopeAction::MeshInvoke => "meshInvoke",
+        ScopeAction::MeshStage => "meshStage",
+        ScopeAction::MeshDelta => "meshDelta",
+    }
+}
+
+/// Parse a canonical capability token into the generated schema action.
+/// Unknown tokens fail closed.
+pub fn scope_action_from_name(action: &str) -> Option<ScopeAction> {
+    SCHEMA_SCOPE_ACTIONS
+        .into_iter()
+        .find(|candidate| scope_action_name(*candidate) == action)
+}
 
 /// Operation types that can be controlled via policies
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -101,6 +157,53 @@ pub enum Operation {
 }
 
 impl Operation {
+    /// Convert a schema action to its runtime authorization operation.
+    ///
+    /// The exhaustive match is intentional: adding a `ScopeAction` in the
+    /// schema makes this crate fail to compile until runtime enforcement is
+    /// defined for it.
+    pub const fn from_scope_action(action: ScopeAction) -> Self {
+        match action {
+            ScopeAction::Query => Self::Query,
+            ScopeAction::Subscribe => Self::Subscribe,
+            ScopeAction::Write => Self::Write,
+            ScopeAction::Create => Self::Create,
+            ScopeAction::Publish => Self::Publish,
+            ScopeAction::Infer => Self::Infer,
+            ScopeAction::Train => Self::Train,
+            ScopeAction::Context => Self::Context,
+            ScopeAction::Serve => Self::Serve,
+            ScopeAction::Spawn => Self::Spawn,
+            ScopeAction::Manage => Self::Manage,
+            ScopeAction::MeshInvoke => Self::MeshInvoke,
+            ScopeAction::MeshStage => Self::MeshStage,
+            ScopeAction::MeshDelta => Self::MeshDelta,
+        }
+    }
+
+    /// Return the generated schema action represented by this operation.
+    /// `MeshStatus` is the sole runtime-only operation and reuses the `query`
+    /// capability token at authorization boundaries.
+    pub const fn scope_action(self) -> Option<ScopeAction> {
+        Some(match self {
+            Self::Query => ScopeAction::Query,
+            Self::Subscribe => ScopeAction::Subscribe,
+            Self::Write => ScopeAction::Write,
+            Self::Create => ScopeAction::Create,
+            Self::Publish => ScopeAction::Publish,
+            Self::Infer => ScopeAction::Infer,
+            Self::Train => ScopeAction::Train,
+            Self::Context => ScopeAction::Context,
+            Self::Serve => ScopeAction::Serve,
+            Self::Spawn => ScopeAction::Spawn,
+            Self::Manage => ScopeAction::Manage,
+            Self::MeshInvoke => ScopeAction::MeshInvoke,
+            Self::MeshStage => ScopeAction::MeshStage,
+            Self::MeshDelta => ScopeAction::MeshDelta,
+            Self::MeshStatus => return None,
+        })
+    }
+
     /// Get the short code for this operation
     pub fn code(&self) -> char {
         match self {
@@ -135,27 +238,9 @@ impl Operation {
     /// annotation) and runtime enforcement. `MeshStatus` shares `query` because the
     /// mesh read ability IS the canonical status read (#319), matching `as_str()`.
     pub fn as_capability(&self) -> &'static str {
-        // Arms follow the ScopeAction ordinal blocks (annotations.capnp):
-        // A read, B write/authority, C admin, D mesh-authority.
-        match self {
-            // Block A (@0..@1)
-            Operation::Query | Operation::MeshStatus => "query",
-            Operation::Subscribe => "subscribe",
-            // Block B (@2..@9)
-            Operation::Write => "write",
-            Operation::Create => "create",
-            Operation::Publish => "publish",
-            Operation::Infer => "infer",
-            Operation::Train => "train",
-            Operation::Context => "context",
-            Operation::Serve => "serve",
-            Operation::Spawn => "spawn",
-            // Block C (@10)
-            Operation::Manage => "manage",
-            // Block D (@11..@13)
-            Operation::MeshInvoke => "meshInvoke",
-            Operation::MeshStage => "meshStage",
-            Operation::MeshDelta => "meshDelta",
+        match self.scope_action() {
+            Some(action) => scope_action_name(action),
+            None => "query", // MeshStatus is the runtime specialization of query.
         }
     }
 
@@ -165,33 +250,7 @@ impl Operation {
     ///
     /// Returns `None` for an unknown token; callers MUST fail closed (no default-allow).
     pub fn from_capability(action: &str) -> Option<Self> {
-        // Exact inverse of `as_capability`, arms ordered by ScopeAction ordinal blocks.
-        // 1:1 with `ScopeAction` (#547/#569): `subscribe`/`publish` are distinct enforced
-        // abilities — NOT collapsed into `context`/`serve`. Collapsing them made
-        // `from_capability` non-invertible, so a granted `subscribe:notification:*` /
-        // `publish:notification:*` scope was enforced as `context`/`serve` (granted ≠
-        // enforced).
-        Some(match action {
-            // Block A (@0..@1)
-            "query" => Operation::Query,
-            "subscribe" => Operation::Subscribe,
-            // Block B (@2..@9)
-            "write" => Operation::Write,
-            "create" => Operation::Create,
-            "publish" => Operation::Publish,
-            "infer" => Operation::Infer,
-            "train" => Operation::Train,
-            "context" => Operation::Context,
-            "serve" => Operation::Serve,
-            "spawn" => Operation::Spawn,
-            // Block C (@10)
-            "manage" => Operation::Manage,
-            // Block D (@11..@13)
-            "meshInvoke" => Operation::MeshInvoke,
-            "meshStage" => Operation::MeshStage,
-            "meshDelta" => Operation::MeshDelta,
-            _ => return None,
-        })
+        scope_action_from_name(action).map(Self::from_scope_action)
     }
 
     /// Get the dot-namespaced operation name for policy matching.
@@ -488,6 +547,15 @@ mod tests {
                 "capability token round-trip is not 1:1 for {op:?}",
             );
         }
+        // The runtime bridge is over the generated capnp enum itself, so the
+        // compiler/PEP id and the authorization token cannot drift apart.
+        for (ordinal, action) in SCHEMA_SCOPE_ACTIONS.into_iter().enumerate() {
+            let op = Operation::from_scope_action(action);
+            assert_eq!(op.scope_action(), Some(action));
+            assert_eq!(op.as_capability(), scope_action_name(action));
+            assert_eq!(u16::from(action) as usize, ordinal);
+        }
+        assert_eq!(Operation::MeshStatus.scope_action(), None);
         // `subscribe`/`publish` are distinct enforced abilities — NOT context/serve.
         assert_eq!(Operation::from_capability("subscribe"), Some(Operation::Subscribe));
         assert_eq!(Operation::from_capability("publish"), Some(Operation::Publish));
