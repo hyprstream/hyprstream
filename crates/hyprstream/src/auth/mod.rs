@@ -218,8 +218,8 @@ impl Operation {
             Operation::Publish => 'l',
             Operation::Spawn => 'p',
             Operation::Create => 'r',
-            // Mesh ops (#319) — distinct codes; not part of the model-capability
-            // bitmask (`all()`), so these never collide in `check_all`.
+            // Mesh ops (#319) — distinct codes, so they share the `check_all`
+            // bitmask with the model-capability codes without colliding.
             Operation::MeshInvoke => 'e',
             Operation::MeshStage => 'g',
             Operation::MeshDelta => 'd',
@@ -353,7 +353,9 @@ impl Operation {
         }
     }
 
-    /// All operations
+    /// All operations — every enum variant, so `PolicyManager::check_all` can
+    /// report each one. Hand-maintained until #1091 R4a generates the
+    /// vocabulary from the schema; keep in sync with the enum above.
     pub fn all() -> &'static [Operation] {
         &[
             Operation::Infer,
@@ -363,6 +365,14 @@ impl Operation {
             Operation::Serve,
             Operation::Manage,
             Operation::Context,
+            Operation::Subscribe,
+            Operation::Create,
+            Operation::Publish,
+            Operation::Spawn,
+            Operation::MeshInvoke,
+            Operation::MeshStage,
+            Operation::MeshDelta,
+            Operation::MeshStatus,
         ]
     }
 }
@@ -480,11 +490,18 @@ mod tests {
         assert!(matches!("persist.save".parse::<Operation>(), Ok(Operation::Write)));
         assert!(matches!("serve.api".parse::<Operation>(), Ok(Operation::Serve)));
         assert!(matches!("context.augment".parse::<Operation>(), Ok(Operation::Context)));
-        // Verify format!("{}", op).parse() round-trip for every variant
+        // Verify format!("{}", op).parse() round-trip for every variant.
         for op in Operation::all() {
             let displayed = format!("{}", op);
             let parsed: Operation = displayed.parse().expect("round-trip parse failed");
-            assert_eq!(&parsed, op);
+            // `MeshStatus` shares the `query.status` wire action, which parses
+            // back to its canonical owner `Query` by design (see as_str()).
+            let expected = if *op == Operation::MeshStatus {
+                &Operation::Query
+            } else {
+                op
+            };
+            assert_eq!(&parsed, expected);
         }
         assert!(Operation::from_str("foo").is_err());
     }
@@ -511,9 +528,9 @@ mod tests {
         for op in [Operation::MeshInvoke, Operation::MeshStage, Operation::MeshDelta, Operation::MeshStatus] {
             assert_eq!(Operation::from_code(op.code()), Some(op));
         }
-        // Mesh ops are NOT part of the model-capability set.
+        // Mesh ops are part of `all()` so `check_all` can report them (#1096).
         for op in &[Operation::MeshInvoke, Operation::MeshStage, Operation::MeshDelta, Operation::MeshStatus] {
-            assert!(!Operation::all().contains(op));
+            assert!(Operation::all().contains(op));
         }
     }
 
@@ -568,8 +585,12 @@ mod tests {
     #[test]
     fn test_operation_all() {
         let all = Operation::all();
-        assert_eq!(all.len(), 7);
+        // All 15 variants: 11 core + 4 mesh (#319). Regression guard for #1096 —
+        // `all()` omitted 8 variants, so `check_all` could never report them.
+        assert_eq!(all.len(), 15);
         assert!(all.contains(&Operation::Context));
+        assert!(all.contains(&Operation::Subscribe));
+        assert!(all.contains(&Operation::MeshStatus));
     }
 
     #[test]
