@@ -264,6 +264,90 @@
       "expected_error": "receipt:public-reveals-holder"
     },
     {
+      "id": "public-receipt-raw-token",
+      "op": "add",
+      "path": [
+        "baseline",
+        "manifest",
+        "public_receipt"
+      ],
+      "value": {
+        "anonymous_token": "raw-token-bytes-deadbeef"
+      },
+      "expected_error": "receipt:public-reveals-token"
+    },
+    {
+      "id": "public-receipt-client-key",
+      "op": "add",
+      "path": [
+        "baseline",
+        "manifest",
+        "public_receipt"
+      ],
+      "value": {
+        "stable_client_key": "0123456789abcdef0123456789abcdef"
+      },
+      "expected_error": "receipt:public-reveals-client-key"
+    },
+    {
+      "id": "public-receipt-entitlement-id",
+      "op": "add",
+      "path": [
+        "baseline",
+        "manifest",
+        "public_receipt"
+      ],
+      "value": {
+        "linkable_entitlement_identifier": "ent-2026-0001"
+      },
+      "expected_error": "receipt:public-reveals-entitlement"
+    },
+    {
+      "id": "public-receipt-nested-value",
+      "op": "add",
+      "path": [
+        "baseline",
+        "manifest",
+        "public_receipt"
+      ],
+      "value": {
+        "envelope": {
+          "inner": {
+            "holder_did": "did:plc:holder-leak"
+          }
+        }
+      },
+      "expected_error": "receipt:public-reveals-nested"
+    },
+    {
+      "id": "checkpoint-reveals-holder",
+      "op": "add",
+      "path": [
+        "baseline",
+        "manifest",
+        "checkpoint"
+      ],
+      "value": {
+        "epoch": 7,
+        "holder_did": "did:plc:holder-leak"
+      },
+      "expected_error": "checkpoint:public-reveals-holder"
+    },
+    {
+      "id": "checkpoint-raw-token",
+      "op": "add",
+      "path": [
+        "baseline",
+        "manifest",
+        "checkpoint"
+      ],
+      "value": {
+        "epoch": 7,
+        "raw_token": "raw-token-bytes-deadbeef"
+      },
+      "expected_error": "checkpoint:public-reveals-token"
+    },
+    {
       "id": "crossed-profile-kind",
       "op": "replace",
       "path": [
@@ -438,7 +522,13 @@
     ],
     "privacy-leakage": [
       "anonymous-fabricates-did",
-      "public-receipt-reveals-holder"
+      "public-receipt-reveals-holder",
+      "public-receipt-raw-token",
+      "public-receipt-client-key",
+      "public-receipt-entitlement-id",
+      "public-receipt-nested-value",
+      "checkpoint-reveals-holder",
+      "checkpoint-raw-token"
     ],
     "crash-recovery": [
       "crash-repeats-finalized",

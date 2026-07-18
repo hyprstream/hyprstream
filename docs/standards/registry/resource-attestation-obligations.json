@@ -188,7 +188,8 @@
       "source": "receipt",
       "statement": "A public receipt or checkpoint MUST NOT reveal a raw anonymous token, a holder DID, a stable client key, or a linkable entitlement identifier.",
       "kind": "implemented-test",
-      "test": "python3 tools/check_resource_attestation.py (public-receipt-reveals-holder)"
+      "test": "python3 tools/check_resource_attestation.py (public-receipt-reveals-holder, public-receipt-raw-token, public-receipt-client-key, public-receipt-entitlement-id, public-receipt-nested-value, checkpoint-reveals-holder, checkpoint-raw-token)",
+      "coverage_note": "The boundary scanner walks public_receipt and checkpoint records recursively (not just top-level) and rejects every prohibited identifier class named in the statement: raw anonymous token, holder DID / ATProto handle, stable client key, and linkable entitlement identifier. Detection is structural over the closed receipt vocabulary (field-name classes plus did:/handle value prefixes); a production proof-plane implementation must preserve this recursive, all-class scan."
     },
     {
       "id": "RA-REQ-023",

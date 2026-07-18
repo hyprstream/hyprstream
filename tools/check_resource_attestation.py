@@ -291,6 +291,49 @@ KNOWN_PROFILES = {
 ANONYMOUS_PROFILES = {"anonymous-capability-controller", "anonymous-entitlement-payer"}
 INTENT_FIELD_MAX_VERSION = 1023  # predecessor_version ceiling per registry bounds
 
+# Public receipt / checkpoint identifier classes prohibited by RA-REQ-022:
+# raw anonymous token, holder DID, stable client key, linkable entitlement
+# identifier. The scan is recursive over the closed receipt vocabulary so a
+# prohibited value cannot escape by nesting. Field names are the canonical
+# receipt-vocabulary spellings; the value classes are detected structurally.
+PROHIBITED_RECEIPT_KEY_CLASSES = {
+    "holder_did": "holder", "holder": "holder", "did": "holder",
+    "atproto_handle": "holder", "handle": "holder",
+    "anonymous_token": "token", "raw_token": "token", "token": "token",
+    "client_key": "client-key", "stable_client_key": "client-key", "key": "client-key",
+    "entitlement_id": "entitlement",
+    "linkable_entitlement_identifier": "entitlement",
+    "entitlement_identifier": "entitlement",
+}
+HOLDER_VALUE_PREFIXES = ("did:",)  # holder DID / atproto handle as a bare value
+
+
+def scan_public_record(node, label: str, depth: int = 1) -> tuple[bool, str]:
+    """Recursively scan a public receipt/checkpoint for prohibited identifier
+    classes (RA-REQ-022). Returns (found, error). A match at depth >= 2 is
+    classified as 'nested' regardless of class, so a holder DID buried inside
+    an envelope cannot slip past the top-level screen."""
+    nested = depth >= 2
+    if isinstance(node, dict):
+        for key, value in node.items():
+            key_lc = str(key).lower()
+            cls = PROHIBITED_RECEIPT_KEY_CLASSES.get(key_lc)
+            if cls and isinstance(value, (str, int, float)) and not isinstance(value, bool) and str(value) != "":
+                return True, f"{label}:public-reveals-{'nested' if nested else cls}"
+            found, err = scan_public_record(value, label, depth + 1)
+            if found:
+                return found, err
+            if isinstance(value, str) and value.startswith(HOLDER_VALUE_PREFIXES):
+                return True, f"{label}:public-reveals-{'nested' if nested else 'holder'}"
+    elif isinstance(node, list):
+        for item in node:
+            found, err = scan_public_record(item, label, depth + 1)
+            if found:
+                return found, err
+    elif isinstance(node, str) and depth >= 2 and node.startswith(HOLDER_VALUE_PREFIXES):
+        return True, f"{label}:public-reveals-nested"
+    return False, ""
+
 
 def apply_mutation(obj, mutation: dict):
     """Return a deep copy of obj with mutation applied. op semantics:
@@ -426,10 +469,17 @@ def _run_checks(baseline: dict, resource_intent: dict, canonical: str, vector: d
     if manifest.get("predecessor_version") != resource_intent.get("predecessor_version"):
         return reject("manifest:stale-predecessor")
 
-    # --- receipt / privacy ---
-    receipt = manifest.get("public_receipt")
-    if isinstance(receipt, dict) and any(isinstance(v, str) and v.startswith("did:") for v in receipt.values()):
-        return reject("receipt:public-reveals-holder")
+    # --- receipt / checkpoint privacy (RA-REQ-022, recursive over all classes) ---
+    # A public receipt or checkpoint must not reveal a raw anonymous token, a
+    # holder DID, a stable client key, or a linkable entitlement identifier --
+    # at any nesting depth, not just top-level.
+    for field, label in (("public_receipt", "receipt"), ("receipt", "receipt"), ("checkpoint", "checkpoint")):
+        record = manifest.get(field)
+        if record is None:
+            continue
+        found, err = scan_public_record(record, label, depth=1)
+        if found:
+            return reject(err)
 
     # --- CAS / 9P / state ---
     if "provisional_namespace_path" in manifest:
