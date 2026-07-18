@@ -428,7 +428,7 @@ pub fn audited_evaluate_refresh<V: UcanVerifier + ?Sized>(
 /// [`audited_evaluate_refresh`]. Builds the [`AuditRecord`] from whatever
 /// context is available (subject may be `None` on an unlabeled-subject
 /// denial; the request's ability may not parse as a canonical
-/// [`crate::mac::te::ScopeAction`] — both are still recorded, using the
+/// [`crate::auth::ScopeAction`] — both are still recorded, using the
 /// sentinel ids documented on [`crate::mac::te::GRANT_PATH_SUBJECT`]).
 fn audit_grant_outcome(
     subject: Option<&SecurityContext>,
@@ -437,8 +437,11 @@ fn audit_grant_outcome(
     result: &Result<GrantDecision, GrantError>,
     sink: &dyn crate::mac::audit::AuditSink,
 ) -> Result<GrantDecision, GrantError> {
+    use crate::auth::scope_action_from_name;
     use crate::mac::audit::{AuditRecord, DecisionReason, DelegationPrincipal};
-    use crate::mac::te::{Action, ScopeAction, ACTION_UNRECOGNIZED, GRANT_PATH_OBJECT, GRANT_PATH_SUBJECT};
+    use crate::mac::te::{
+        ACTION_UNRECOGNIZED, Action, GRANT_PATH_OBJECT, GRANT_PATH_SUBJECT,
+    };
     use hyprstream_rpc::auth::mac::SecurityLabel;
 
     let (decision, reason) = match result {
@@ -457,7 +460,7 @@ fn audit_grant_outcome(
         Err(GrantError::AuditUnavailable) => (Decision::Deny, DecisionReason::GrantAuditFailClosed),
     };
 
-    let action = ScopeAction::parse(request.ability.as_str())
+    let action = scope_action_from_name(request.ability.as_str())
         .map(Action::from)
         .unwrap_or(ACTION_UNRECOGNIZED);
     let record = AuditRecord {

@@ -60,7 +60,7 @@ async fn networked_moq_subscribe_receives_mac_verified_frames() -> Result<()> {
     // Derive the stream's DH-bound topic + MAC key; the publisher and the client
     // verifier share them exactly (the client gets them via DH in production).
     let (_client_secret, client_pub) = hyprstream_rpc::crypto::generate_ephemeral_keypair();
-    let ctx = StreamContext::from_dh(&client_pub.to_bytes())?;
+    let ctx = StreamContext::from_third_party_interop_dh(&client_pub.to_bytes())?;
     let topic = ctx.topic().to_owned();
     let mac_key = *ctx.mac_key();
     // #321: the DH path is AEAD-on; the consumer shares the same enc_key.

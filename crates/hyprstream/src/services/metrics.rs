@@ -68,7 +68,8 @@ impl MetricsService {
         signing_key: SigningKey,
         policy_client: PolicyClient,
     ) -> Self {
-        let stream_channel = StreamChannel::new(signing_key.clone());
+        let stream_channel = StreamChannel::new(signing_key.clone())
+            .with_reach_config(hyprstream_rpc::moq_stream::ProducerReachConfig::default());
         Self {
             inner: Arc::new(MetricsInner {
                 orchestrator,
@@ -315,7 +316,7 @@ impl MetricsHandler for MetricsService {
         let stream_ctx = self
             .inner
             .stream_channel
-            .prepare_stream(&q.ephemeral_pubkey, 600)
+            .prepare_third_party_interop_stream(&q.ephemeral_pubkey, 600)
             .await?;
 
         let broadcast_path = hyprstream_rpc::moq_stream::global_moq_origin()
@@ -591,6 +592,14 @@ impl MetricsHandler for MetricsService {
 
 #[async_trait(?Send)]
 impl RequestService for MetricsService {
+    fn producer_reach_config_handle(&self) -> Option<hyprstream_rpc::moq_stream::ProducerReachConfigHandle> {
+        Some(self.inner.stream_channel.reach_config_handle())
+    }
+
+    fn moq_origin_handle(&self) -> Option<hyprstream_rpc::moq_stream::MoqStreamOriginHandle> {
+        Some(self.inner.stream_channel.moq_origin_handle())
+    }
+
     async fn handle_request(
         &self,
         ctx: &EnvelopeContext,

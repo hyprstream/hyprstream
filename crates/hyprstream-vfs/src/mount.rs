@@ -65,6 +65,12 @@ impl std::error::Error for MountError {}
 /// Opaque fid handle from a mount.
 pub struct Fid(Box<dyn std::any::Any + Send + Sync>);
 
+impl std::fmt::Debug for Fid {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("Fid").finish_non_exhaustive()
+    }
+}
+
 impl Fid {
     /// Create a new Fid wrapping an arbitrary Send+Sync value.
     pub fn new<T: std::any::Any + Send + Sync>(val: T) -> Self {
@@ -79,6 +85,18 @@ impl Fid {
     /// Downcast to a concrete type (mutable).
     pub fn downcast_mut<T: std::any::Any>(&mut self) -> Option<&mut T> {
         self.0.downcast_mut()
+    }
+
+    /// Downcast to a concrete type, consuming the fid. Returns the original fid
+    /// in the `Err` variant if the inner type differs, so the caller can fall
+    /// back (e.g. a no-op clunk). Used by `Mount::clunk` implementations that
+    /// need the owned typed state to release resources (e.g. the CAS staging
+    /// fid refcount, #814).
+    pub fn downcast_into<T: std::any::Any>(self) -> Result<T, Fid> {
+        match self.0.downcast::<T>() {
+            Ok(boxed) => Ok(*boxed),
+            Err(boxed) => Err(Fid(boxed)),
+        }
     }
 }
 
@@ -140,7 +158,14 @@ impl Stat {
     /// synthetic test mounts). The result carries qtype/size/name/mtime and
     /// signals via `path == 0` that the qid is not a usable identity.
     pub fn unknown_qid(qtype: u8, size: u64, name: String, mtime: u64) -> Self {
-        Self { qtype, version: 0, path: 0, size, name, mtime }
+        Self {
+            qtype,
+            version: 0,
+            path: 0,
+            size,
+            name,
+            mtime,
+        }
     }
 }
 
@@ -191,14 +216,28 @@ pub trait Mount: Send + Sync {
         _mode: u8,
         _caller: &Subject,
     ) -> Result<Stat, MountError> {
-        Err(MountError::NotSupported("create is not supported on this mount".into()))
+        Err(MountError::NotSupported(
+            "create is not supported on this mount".into(),
+        ))
     }
 
     /// Read bytes from an open fid at offset.
-    async fn read(&self, fid: &Fid, offset: u64, count: u32, caller: &Subject) -> Result<Vec<u8>, MountError>;
+    async fn read(
+        &self,
+        fid: &Fid,
+        offset: u64,
+        count: u32,
+        caller: &Subject,
+    ) -> Result<Vec<u8>, MountError>;
 
     /// Write bytes to an open fid at offset. Returns bytes written.
-    async fn write(&self, fid: &Fid, offset: u64, data: &[u8], caller: &Subject) -> Result<u32, MountError>;
+    async fn write(
+        &self,
+        fid: &Fid,
+        offset: u64,
+        data: &[u8],
+        caller: &Subject,
+    ) -> Result<u32, MountError>;
 
     /// Read directory entries from an open directory fid.
     async fn readdir(&self, fid: &Fid, caller: &Subject) -> Result<Vec<DirEntry>, MountError>;

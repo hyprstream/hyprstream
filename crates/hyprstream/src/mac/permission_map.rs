@@ -12,7 +12,8 @@
 //!
 //! - `mac://<class>/*` expands to one rule per **registered** object of that
 //!   class — never beyond the registry.
-//! - a `*` ability expands over exactly [`ScopeAction::ALL`] (a closed enum).
+//! - a `*` ability expands over exactly [`SCHEMA_SCOPE_ACTIONS`] (the generated,
+//!   closed schema enum).
 //! - anything unrecognized (class, name, verb) maps to **nothing**
 //!   (fail-closed; never a guessed rule).
 //!
@@ -34,13 +35,13 @@
 //! has no rule and is **denied by default**; the remedy is a re-compile at a
 //! new policy generation, not a silent wildcard.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use hyprstream_rpc::auth::ucan::capability::{Ability, Capability, Caveats, Resource};
 
+use crate::auth::{SCHEMA_SCOPE_ACTIONS, scope_action_from_name, scope_action_name};
 use crate::mac::compiler::{AccessRequest, PermissionMap};
-use crate::mac::te::{Action, ObjectType, ScopeAction, SubjectType, TeRule};
-use std::collections::BTreeSet;
+use crate::mac::te::{Action, ObjectType, SubjectType, TeRule};
 
 /// The production S3-scope permission map. See the module docs for the
 /// injective/exact contract and the registry-determinism rule.
@@ -131,13 +132,16 @@ impl PermissionMap for ScopePermissionMap {
     fn permissions_for(&self, cap: &Capability) -> BTreeSet<TeRule> {
         let mut out = BTreeSet::new();
 
-        // Verb(s): the closed ScopeAction vocabulary. `*` expands over ALL;
+        // Verb(s): the generated, closed ScopeAction vocabulary. `*` expands over ALL;
         // an unrecognized verb grants nothing.
         let ability = cap.ability.as_str();
         let actions: Vec<Action> = if ability == "*" {
-            ScopeAction::ALL.iter().map(|a| Action::from(*a)).collect()
+            SCHEMA_SCOPE_ACTIONS
+                .iter()
+                .map(|a| Action::from(*a))
+                .collect()
         } else {
-            match ScopeAction::parse(ability) {
+            match scope_action_from_name(ability) {
                 Some(a) => vec![Action::from(a)],
                 None => return out,
             }
@@ -178,7 +182,7 @@ impl PermissionMap for ScopePermissionMap {
             return None;
         }
         let (class, name) = self.by_id.get(&rule.object_type)?;
-        let verb = ScopeAction::from_action(rule.action)?.as_str();
+        let verb = scope_action_name(rule.action.scope_action()?);
         Some(AccessRequest {
             resource: Resource::new(format!("mac://{class}/{name}")),
             ability: Ability::new(verb),
@@ -300,7 +304,7 @@ mod tests {
     fn wildcard_ability_expands_to_exactly_the_closed_verb_set() {
         let m = map();
         let rules = m.permissions_for(&cap("mac://model/llama", "*"));
-        assert_eq!(rules.len(), ScopeAction::ALL.len());
+        assert_eq!(rules.len(), SCHEMA_SCOPE_ACTIONS.len());
     }
 
     // ── THE #676 obligation: granted_access upper-bounds the rule's grant ───
@@ -351,12 +355,15 @@ mod tests {
         fn granted_access_upper_bounds_every_request_projecting_to_the_rule(
             class_i in 0usize..4,      // model, adapter + 2 unregistered classes
             name_i in 0usize..5,       // registered + unregistered names
-            verb_i in 0usize..11,      // 9 canonical verbs + 2 junk
+            verb_i in 0usize..(SCHEMA_SCOPE_ACTIONS.len() + 2),
         ) {
             let m = map();
             let classes = ["model", "adapter", "widget", "tensor"];
             let names = ["llama", "qwen", "mistral", "lora-a", "ghost"];
-            let mut verbs: Vec<&str> = ScopeAction::ALL.iter().map(|a| a.as_str()).collect();
+            let mut verbs: Vec<&str> = SCHEMA_SCOPE_ACTIONS
+                .iter()
+                .map(|a| scope_action_name(*a))
+                .collect();
             verbs.push("fly");
             verbs.push("q");
 
@@ -367,7 +374,7 @@ mod tests {
             // The PEP-side projection of the concrete request: same interning
             // the compiler used (object_type via the shared registry, action
             // via the canonical ScopeAction ids).
-            let projected = m.object_type(class, name).zip(ScopeAction::parse(verb)).map(
+            let projected = m.object_type(class, name).zip(scope_action_from_name(verb)).map(
                 |(object_type, a)| TeRule {
                     subject_type: SubjectType(1),
                     object_type,
@@ -408,7 +415,8 @@ mod tests {
         #[test]
         fn distinct_accesses_project_to_distinct_rules(
             i in 0usize..5, j in 0usize..5,
-            vi in 0usize..9, vj in 0usize..9,
+            vi in 0usize..SCHEMA_SCOPE_ACTIONS.len(),
+            vj in 0usize..SCHEMA_SCOPE_ACTIONS.len(),
         ) {
             let m = map();
             let objects = [
@@ -417,8 +425,8 @@ mod tests {
             ];
             let (ci, ni) = objects[i];
             let (cj, nj) = objects[j];
-            let va = ScopeAction::ALL[vi];
-            let vb = ScopeAction::ALL[vj];
+            let va = SCHEMA_SCOPE_ACTIONS[vi];
+            let vb = SCHEMA_SCOPE_ACTIONS[vj];
             let ra = TeRule {
                 subject_type: SubjectType(1),
                 object_type: m.object_type(ci, ni).unwrap(),

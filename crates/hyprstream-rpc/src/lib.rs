@@ -209,6 +209,7 @@ pub mod web_transport;
 // native `dial()` (which is itself `#[cfg(not(target_arch = "wasm32"))]`).
 #[cfg(target_arch = "wasm32")]
 pub mod dial_wasm;
+pub mod browser_provisioning;
 // Iroh carrier reach + pkarr helpers for wasm32. NodeId is exposed only as an
 // endpoint address/diagnostic; no DID or application-identity conversion exists.
 #[cfg(target_arch = "wasm32")]
@@ -219,7 +220,7 @@ pub mod iroh_peer;
 // ============================================================================
 
 pub use capnp::{serialize_message, FromCapnp, ToCapnp};
-pub use rpc_client::{CallOptions, RequestBuilder, RpcClient, RpcClientImpl};
+pub use rpc_client::{CallOptions, PreSealGuard, RequestBuilder, RpcClient, RpcClientImpl};
 pub use transport_traits::{PublishSink, Signer, Transport};
 pub mod identity;
 pub mod node_identity;

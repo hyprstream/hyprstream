@@ -41,6 +41,7 @@
 //!   evaluator reads. Casbin's `Enforcer::enforce` is NEVER on this path.
 
 use crate::mac::lattice::{Compartment, Lattice, SecurityLabel};
+pub use hyprstream_rpc::annotations_capnp::ScopeAction;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
@@ -62,106 +63,22 @@ pub struct ObjectType(pub u32);
 #[serde(transparent)]
 pub struct Action(pub u32);
 
-/// S3's canonical action vocabulary (#569), mirrored from the Cap'n Proto `ScopeAction`
-/// enum in `hyprstream-rpc/schema/annotations.capnp` (`$mcpScope(...)`). Keeping the
-/// discriminants 1:1 with that schema enum is what lets S5's UCAN→TE compiler and the PEP
-/// intern the same `cmd`/`$scope` to the same [`Action`] id without a side table.
-///
-/// Note (minimal handling, per #570): `Subscribe`/`Publish` exist in the `ScopeAction`
-/// schema enum but have **no dedicated `auth::Operation` Rust variant** today. They are
-/// represented here so streaming ops are interned to a *stable* id; the
-/// control-plane `Operation` parity for them lands with the streaming-scope work. The
-/// remaining variants line up 1:1 with `auth::Operation` (`Query`/`Write`/`Manage`/
-/// `Infer`/`Train`/`Serve`/`Context`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[repr(u32)]
-pub enum ScopeAction {
-    /// `query @0` ⇄ `Operation::Query`.
-    Query = 0,
-    /// `write @1` ⇄ `Operation::Write`.
-    Write = 1,
-    /// `manage @2` ⇄ `Operation::Manage`.
-    Manage = 2,
-    /// `infer @3` ⇄ `Operation::Infer`.
-    Infer = 3,
-    /// `train @4` ⇄ `Operation::Train`.
-    Train = 4,
-    /// `serve @5` ⇄ `Operation::Serve`.
-    Serve = 5,
-    /// `context @6` ⇄ `Operation::Context`.
-    Context = 6,
-    /// `subscribe @7` — streaming read; no `Operation` parity yet (handled minimally).
-    Subscribe = 7,
-    /// `publish @8` — streaming write; no `Operation` parity yet (handled minimally).
-    Publish = 8,
-}
-
-impl ScopeAction {
-    /// Every canonical action, in schema-discriminant order. The closed action
-    /// vocabulary: a wildcard ability expands over exactly this set (#676).
-    pub const ALL: [ScopeAction; 9] = [
-        ScopeAction::Query,
-        ScopeAction::Write,
-        ScopeAction::Manage,
-        ScopeAction::Infer,
-        ScopeAction::Train,
-        ScopeAction::Serve,
-        ScopeAction::Context,
-        ScopeAction::Subscribe,
-        ScopeAction::Publish,
-    ];
-
-    /// The canonical verb string, exactly as named in the Cap'n Proto
-    /// `ScopeAction` schema enum (`annotations.capnp`). The single string↔id
-    /// assignment shared by the S3 scope parser, the S5 compiler's
-    /// `PermissionMap`, and the PEP — no side tables.
-    #[inline]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            ScopeAction::Query => "query",
-            ScopeAction::Write => "write",
-            ScopeAction::Manage => "manage",
-            ScopeAction::Infer => "infer",
-            ScopeAction::Train => "train",
-            ScopeAction::Serve => "serve",
-            ScopeAction::Context => "context",
-            ScopeAction::Subscribe => "subscribe",
-            ScopeAction::Publish => "publish",
-        }
-    }
-
-    /// Parse a canonical verb string. `None` for anything else — an
-    /// unrecognized verb grants nothing (fail-closed), never a guess.
-    pub fn parse(s: &str) -> Option<Self> {
-        Self::ALL.into_iter().find(|a| a.as_str() == s)
-    }
-
-    /// Recover the enum from an interned [`Action`] id. `None` for an id
-    /// outside the schema enum — such a rule has no recognized meaning and is
-    /// treated as an escalation by `check_no_escalation` (fail-closed).
-    pub const fn from_action(action: Action) -> Option<Self> {
-        match action.0 {
-            0 => Some(ScopeAction::Query),
-            1 => Some(ScopeAction::Write),
-            2 => Some(ScopeAction::Manage),
-            3 => Some(ScopeAction::Infer),
-            4 => Some(ScopeAction::Train),
-            5 => Some(ScopeAction::Serve),
-            6 => Some(ScopeAction::Context),
-            7 => Some(ScopeAction::Subscribe),
-            8 => Some(ScopeAction::Publish),
-            _ => None,
-        }
-    }
-}
-
 impl Action {
     /// Intern a canonical S3 [`ScopeAction`] to its stable [`Action`] id. The id IS the
     /// schema discriminant, so the assignment is fixed across the compiler and every PEP
     /// (no per-process numbering drift).
     #[inline]
     pub const fn from_scope_action(a: ScopeAction) -> Self {
-        Action(a as u32)
+        Action(a as u16 as u32)
+    }
+
+    /// Recover the generated schema action represented by this interned id.
+    /// Values outside the schema enum fail closed.
+    #[inline]
+    pub fn scope_action(self) -> Option<ScopeAction> {
+        u16::try_from(self.0)
+            .ok()
+            .and_then(|ordinal| ScopeAction::try_from(ordinal).ok())
     }
 }
 
@@ -535,11 +452,16 @@ mod tests {
 
     #[test]
     fn scope_action_interns_to_schema_discriminant() {
-        // Stable 1:1 with the capnp ScopeAction enum so compiler and PEP agree on ids.
-        assert_eq!(Action::from(ScopeAction::Query), Action(0));
-        assert_eq!(Action::from(ScopeAction::Context), Action(6));
-        assert_eq!(Action::from(ScopeAction::Subscribe), Action(7));
-        assert_eq!(Action::from(ScopeAction::Publish), Action(8));
+        // The generated capnp enum is the source of the ids used by compiler and PEP.
+        for scope_action in crate::auth::SCHEMA_SCOPE_ACTIONS {
+            let action = Action::from(scope_action);
+            assert_eq!(action.scope_action(), Some(scope_action));
+            assert_eq!(action.0, u16::from(scope_action) as u32);
+        }
+        assert_eq!(Action::from(ScopeAction::Subscribe), Action(1));
+        assert_eq!(Action::from(ScopeAction::Manage), Action(10));
+        assert_eq!(Action::from(ScopeAction::MeshDelta), Action(13));
+        assert_eq!(Action(u32::MAX).scope_action(), None);
     }
 
     #[test]

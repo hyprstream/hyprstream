@@ -1111,6 +1111,28 @@ pub fn global_pq_store() -> Option<std::sync::Arc<dyn PqTrustStore>> {
     VERIFY_CONFIG.get().and_then(|c| c.pq_store.clone())
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+static BROWSER_CURRENTNESS_VERIFIER: std::sync::OnceLock<
+    std::sync::Arc<dyn crate::browser_provisioning::BrowserCurrentnessVerifier>,
+> = std::sync::OnceLock::new();
+
+/// Install the checkpoint-backed authority used at WebTransport dispatch.
+/// First write wins; there is deliberately no test/global fallback.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn install_browser_currentness_verifier(
+    verifier: std::sync::Arc<dyn crate::browser_provisioning::BrowserCurrentnessVerifier>,
+) -> Result<()> {
+    BROWSER_CURRENTNESS_VERIFIER
+        .set(verifier)
+        .map_err(|_| anyhow!("browser currentness verifier already installed"))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn global_browser_currentness_verifier(
+) -> Option<std::sync::Arc<dyn crate::browser_provisioning::BrowserCurrentnessVerifier>> {
+    BROWSER_CURRENTNESS_VERIFIER.get().cloned()
+}
+
 /// Apply the mandatory process-global policy and trust store to an
 /// `UnwrapOptions`.
 #[cfg(not(target_arch = "wasm32"))]

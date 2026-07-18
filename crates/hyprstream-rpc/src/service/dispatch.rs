@@ -109,6 +109,21 @@ where
         }
         _ => {}
     }
+    let transcript_policy = if carrier.requires_browser_provisioning() {
+        crate::browser_provisioning::BrowserTranscriptPolicy::Required {
+            request_id,
+            service_name: actual_service_domain,
+            carrier_profile:
+                crate::browser_provisioning::BrowserCarrierProfile::OwnedHybridWebTransport,
+        }
+    } else {
+        crate::browser_provisioning::BrowserTranscriptPolicy::NotBrowserCarrier
+    };
+    let (browser_transcript, payload) =
+        crate::browser_provisioning::recover_request_payload(&payload, transcript_policy)?;
+    ctx.browser_method_discriminator = browser_transcript
+        .as_ref()
+        .map(|transcript| transcript.method_discriminator);
     if carrier.forbids_cleartext_envelope() && ctx.response_kem_recipient.is_none() {
         anyhow::bail!(
             "authenticated network request omitted responseKemRecipient; dropping without response"
@@ -122,6 +137,36 @@ where
     let response_pq_key = service.pq_signing_key().ok_or_else(|| {
         anyhow::anyhow!("service has no ML-DSA-65 response signing key (mandatory Hybrid suite)")
     })?;
+    if carrier.requires_browser_provisioning() {
+        let binding = &browser_transcript
+            .as_ref()
+            .ok_or_else(|| {
+                anyhow::anyhow!("authenticated WebTransport request omitted browser binding")
+            })?
+            .binding;
+        anyhow::ensure!(
+            binding.service_name == actual_service_domain,
+            "browser provisioning service '{}' does not match dispatcher '{}'",
+            binding.service_name,
+            actual_service_domain
+        );
+        anyhow::ensure!(
+            binding.capability == "hyprstream-rpc/1"
+                && binding.scope == actual_service_domain
+                && binding.carrier_profile
+                    == crate::browser_provisioning::BrowserCarrierProfile::OwnedHybridWebTransport,
+            "browser provisioning capability/scope/carrier misclassification"
+        );
+        let verifier = crate::envelope::global_browser_currentness_verifier().ok_or_else(|| {
+            anyhow::anyhow!(
+                "checkpoint-backed browser currentness verifier is not installed; dropping without response"
+            )
+        })?;
+        verifier
+            .ensure_current(binding)
+            .await
+            .context("browser accepted-current evidence rejected at dispatch")?;
+    }
     let response_recipient = ctx.response_kem_recipient.clone();
     let request_iat = ctx.request_iat;
     let request_nonce = ctx.request_nonce;

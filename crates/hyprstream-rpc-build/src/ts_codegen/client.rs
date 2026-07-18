@@ -46,21 +46,31 @@ fn has_streaming_in_scoped(sc: &ScopedClient) -> bool {
 
 /// Generate the main client class and scoped client classes.
 ///
-/// Clients take a `WasmRpcClient` (from wasm-bindgen) and call `client.call(bytes)`
-/// with Cap'n Proto request bytes. Responses are parsed by generated parsers.
+/// Clients take a `WasmRpcClient` (from wasm-bindgen) and call only its
+/// service-and-method-bound exports. The method metadata is generated
+/// independently from the canonical Cap'n Proto request union.
 pub fn generate_client(out: &mut String, service_name: &str, schema: &ParsedSchema) {
     let pascal = to_pascal_case(service_name);
 
     let has_streaming = has_streaming_methods(schema);
 
-    // Import WasmRpcClient type from wasm-bindgen output
+    // Import the exact method-bound WasmRpcClient surface.
     out.push_str(
-        "/** RPC client interface (matches RpcClient from wasm-bindgen). */\n\
+        "/** Per-call authentication overrides for generated RPC methods. */\n\
+         export interface RpcCallOptions {\n\
+         \x20 jwt?: string;\n\
+         \x20 delegatedBearer?: string;\n\
+         }\n\n\
+         /** RPC client interface (matches RpcClient from wasm-bindgen). */\n\
          export interface RpcTransport {\n\
-         \x20 call(bytes: Uint8Array): Promise<Uint8Array>;\n",
+         \x20 callForServiceWithMethod(service: string, method: number, bytes: Uint8Array): Promise<Uint8Array>;\n\
+         \x20 callWithOptionsForServiceWithMethod(service: string, method: number, bytes: Uint8Array, jwt?: string, delegatedBearer?: string): Promise<Uint8Array>;\n",
     );
     if has_streaming {
-        out.push_str("  openStream(bytes: Uint8Array): Promise<StreamHandle>;\n");
+        out.push_str(
+            "  openStreamForServiceWithMethod(service: string, method: number, bytes: Uint8Array): Promise<StreamHandle>;\n\
+             \x20 openStreamWithOptionsForServiceWithMethod(service: string, method: number, bytes: Uint8Array, jwt?: string, delegatedBearer?: string): Promise<StreamHandle>;\n",
+        );
     }
     out.push_str(
         "\x20 nextId(): bigint;\n\
@@ -85,6 +95,17 @@ pub fn generate_client(out: &mut String, service_name: &str, schema: &ParsedSche
         if scoped_names.contains(&variant.name.as_str()) {
             continue; // handled as factory method
         }
+
+        let method_discriminator = schema
+            .request_struct
+            .as_ref()
+            .and_then(|request| {
+                request.fields.iter().find(|field| {
+                    field.name == variant.name && field.discriminant_value != 0xFFFF
+                })
+            })
+            .map(|field| field.discriminant_value)
+            .expect("generated TypeScript method must have a root union discriminator");
 
         let is_void = variant.type_name == "Void";
         let is_prim = is_primitive(&variant.type_name) && !is_void;
@@ -118,6 +139,7 @@ pub fn generate_client(out: &mut String, service_name: &str, schema: &ParsedSche
             params.push(format!("p: {}", capnp_to_ts_type(&variant.type_name)));
         }
 
+        params.push("options?: RpcCallOptions".to_owned());
         out.push_str(&format!(
             "  async {}({}): Promise<{}> {{\n",
             to_camel_case(&variant.name),
@@ -139,10 +161,10 @@ pub fn generate_client(out: &mut String, service_name: &str, schema: &ParsedSche
 
         if is_streaming {
             // Streaming method: use callStreaming and return StreamSubscription
-            generate_streaming_body(out, &pascal, 0);
+            generate_streaming_body(out, service_name, method_discriminator);
         } else {
             // Call transport and parse response
-            out.push_str("    const resp = await this.client.call(bytes);\n");
+            emit_bound_unary_call(out, service_name, method_discriminator);
             out.push_str(&format!(
                 "    const parsed = parse{pascal}Response(resp);\n"
             ));
@@ -189,9 +211,27 @@ pub fn generate_client(out: &mut String, service_name: &str, schema: &ParsedSche
 
     out.push_str("}\n\n");
 
-    // Generate scoped client classes (with empty ancestor chain initially)
+    // Generate scoped client classes. The authenticated method commitment is
+    // the root request union arm that selects the scoped request schema.
     for sc in &schema.scoped_clients {
-        generate_scoped_client(out, service_name, sc, &[], schema);
+        let root_method_discriminator = schema
+            .request_struct
+            .as_ref()
+            .and_then(|request| {
+                request.fields.iter().find(|field| {
+                    field.name == sc.factory_name && field.discriminant_value != 0xFFFF
+                })
+            })
+            .map(|field| field.discriminant_value)
+            .expect("generated scoped TypeScript method must have a root union discriminator");
+        generate_scoped_client(
+            out,
+            service_name,
+            sc,
+            &[],
+            schema,
+            root_method_discriminator,
+        );
     }
 }
 
@@ -206,6 +246,7 @@ fn generate_scoped_client(
     sc: &ScopedClient,
     ancestors: &[&ScopedClient],
     schema: &ParsedSchema,
+    root_method_discriminator: u16,
 ) {
     let pascal = to_pascal_case(service_name);
 
@@ -290,6 +331,7 @@ fn generate_scoped_client(
             params.push(format!("p: {}", capnp_to_ts_type(&variant.type_name)));
         }
 
+        params.push("options?: RpcCallOptions".to_owned());
         out.push_str(&format!(
             "  async {}({}): Promise<{}> {{\n",
             to_camel_case(&variant.name),
@@ -317,10 +359,10 @@ fn generate_scoped_client(
 
         if is_streaming {
             // Streaming method: use callStreaming and unwrap through scope chain to get StreamInfo
-            generate_streaming_body(out, &pascal, chain_depth);
+            generate_streaming_body(out, service_name, root_method_discriminator);
         } else {
             // Call transport and parse outer response
-            out.push_str("    const resp = await this.client.call(bytes);\n");
+            emit_bound_unary_call(out, service_name, root_method_discriminator);
             out.push_str(&format!(
                 "    const parsed = parse{pascal}Response(resp);\n"
             ));
@@ -401,16 +443,118 @@ fn generate_scoped_client(
     let mut new_ancestors: Vec<&ScopedClient> = ancestors.to_vec();
     new_ancestors.push(sc);
     for nc in &sc.nested_clients {
-        generate_scoped_client(out, service_name, nc, &new_ancestors, schema);
+        generate_scoped_client(
+            out,
+            service_name,
+            nc,
+            &new_ancestors,
+            schema,
+            root_method_discriminator,
+        );
     }
 }
 
-/// Generate the body of a streaming method.
-///
-/// `chain_depth` is 0 for top-level methods (no scoped unwrapping needed),
-/// or N for scoped methods where N ancestor+scope layers must be unwrapped.
-fn generate_streaming_body(out: &mut String, _pascal: &str, _chain_depth: usize) {
+fn emit_bound_unary_call(out: &mut String, service_name: &str, method_discriminator: u16) {
+    out.push_str(&format!(
+        "    const resp = options\n\
+         \x20     ? await this.client.callWithOptionsForServiceWithMethod(\"{service_name}\", {method_discriminator}, bytes, options.jwt, options.delegatedBearer)\n\
+         \x20     : await this.client.callForServiceWithMethod(\"{service_name}\", {method_discriminator}, bytes);\n"
+    ));
+}
+
+fn generate_streaming_body(out: &mut String, service_name: &str, method_discriminator: u16) {
     // All crypto (ECDH, key derivation, HMAC verification) happens in Rust.
-    // JS just gets a StreamHandle back.
-    out.push_str("    return await this.client.openStream(bytes);\n");
+    // JS supplies independently generated service/method metadata and receives
+    // only the verified StreamHandle.
+    out.push_str(&format!(
+        "    return options\n\
+         \x20     ? await this.client.openStreamWithOptionsForServiceWithMethod(\"{service_name}\", {method_discriminator}, bytes, options.jwt, options.delegatedBearer)\n\
+         \x20     : await this.client.openStreamForServiceWithMethod(\"{service_name}\", {method_discriminator}, bytes);\n"
+    ));
+}
+
+#[cfg(test)]
+mod browser_binding_tests {
+    #![allow(clippy::expect_used)]
+
+    use super::*;
+    use hyprstream_rpc_build::schema::types::{FieldSection, StructDef, UnionVariant};
+
+    fn variant(name: &str, type_name: &str) -> UnionVariant {
+        UnionVariant {
+            name: name.to_owned(),
+            type_name: type_name.to_owned(),
+            description: String::new(),
+            scope: "invoke".to_owned(),
+            scope_exempt: false,
+            cli_hidden: false,
+            doc_example: String::new(),
+            vfs_path: String::new(),
+            vfs_kind: String::new(),
+            vfs_bulk: false,
+            vfs_hidden: false,
+        }
+    }
+
+    fn field(name: &str, discriminant_value: u16) -> FieldDef {
+        FieldDef {
+            name: name.to_owned(),
+            type_name: "Void".to_owned(),
+            description: String::new(),
+            fixed_size: None,
+            optional: false,
+            slot_offset: 0,
+            section: FieldSection::Data,
+            discriminant_value,
+            serde_rename: None,
+            domain_type: None,
+        }
+    }
+
+    #[test]
+    fn generated_browser_calls_bind_service_method_options_and_streaming() {
+        let schema = ParsedSchema {
+            request_variants: vec![variant("ping", "Void"), variant("watch", "Void")],
+            response_variants: vec![
+                variant("pingResult", "Void"),
+                variant("watchResult", "StreamInfo"),
+            ],
+            structs: vec![],
+            scoped_clients: vec![],
+            enums: vec![],
+            request_struct: Some(StructDef {
+                name: "Request".to_owned(),
+                fields: vec![field("ping", 3), field("watch", 7)],
+                has_union: true,
+                domain_type: None,
+                origin_file: None,
+                data_words: 2,
+                pointer_words: 0,
+                discriminant_count: 2,
+                discriminant_offset: 4,
+                union_arms: vec![],
+            }),
+            response_struct: None,
+        };
+        let mut out = String::new();
+        generate_client(&mut out, "model", &schema);
+        assert!(
+            out.contains("callForServiceWithMethod(\"model\", 3, bytes)"),
+            "{out}"
+        );
+        assert!(
+            out.contains("callWithOptionsForServiceWithMethod(\"model\", 3, bytes"),
+            "{out}"
+        );
+        assert!(
+            out.contains("openStreamForServiceWithMethod(\"model\", 7, bytes)"),
+            "{out}"
+        );
+        assert!(
+            out.contains("openStreamWithOptionsForServiceWithMethod(\"model\", 7, bytes"),
+            "{out}"
+        );
+        assert!(!out.contains("this.client.call(bytes)"), "{out}");
+        assert!(!out.contains("this.client.openStream(bytes)"), "{out}");
+    }
 }
