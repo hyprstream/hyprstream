@@ -11,7 +11,8 @@
 
 use hyprstream_k8s::{
     Adapter, AdapterSpec, InferenceService, InferenceServiceSpec, Model, ModelSpec, ModelStage,
-    Statefulness, TenantBinding, TenantBindingSpec, TrainingRun, TrainingRunSpec,
+    Statefulness, TenantBinding, TenantBindingSpec, TenantEntitlement, TenantGrantClass,
+    TrainingRun, TrainingRunSpec,
 };
 use kube::CustomResourceExt;
 
@@ -230,6 +231,7 @@ fn tenant_binding_cel_validates_namespace_and_tenant() {
         TenantBindingSpec {
             namespace: "Not_A_DNS_Label".into(),
             tenant: "did:web:acme".into(),
+            entitlement: None,
         },
     );
     assert!(
@@ -242,6 +244,7 @@ fn tenant_binding_cel_validates_namespace_and_tenant() {
         TenantBindingSpec {
             namespace: "a".repeat(64),
             tenant: "did:web:acme".into(),
+            entitlement: None,
         },
     );
     assert!(
@@ -254,6 +257,7 @@ fn tenant_binding_cel_validates_namespace_and_tenant() {
         TenantBindingSpec {
             namespace: "acme".into(),
             tenant: String::new(),
+            entitlement: None,
         },
     );
     assert!(
@@ -266,6 +270,7 @@ fn tenant_binding_cel_validates_namespace_and_tenant() {
         TenantBindingSpec {
             namespace: "acme".into(),
             tenant: "did:web:acme".into(),
+            entitlement: None,
         },
     );
     assert!(good.validate_cel().is_ok(), "valid binding must pass");
@@ -286,4 +291,73 @@ fn committed_yaml_matches_generated() {
             file.display()
         );
     }
+}
+
+#[test]
+fn tenant_binding_entitlement_round_trips_and_validates_cel() {
+    // A binding WITH an entitlement (the #929 authoring surface) must pass CEL
+    // and the entitlement must survive a JSON round-trip.
+    let with_grant = TenantBinding::new(
+        "tb",
+        TenantBindingSpec {
+            namespace: "acme".into(),
+            tenant: "did:web:acme".into(),
+            entitlement: Some(TenantEntitlement {
+                unit: "compute-second".into(),
+                amount: 3_600,
+                class: TenantGrantClass::Underwritten,
+                expiration: Some(4_000_000_000),
+            }),
+        },
+    );
+    assert!(
+        with_grant.validate_cel().is_ok(),
+        "a binding with a valid entitlement must pass CEL"
+    );
+
+    let json = serde_json::to_value(&with_grant.spec).unwrap();
+    assert_eq!(json["entitlement"]["unit"], "compute-second");
+    assert_eq!(json["entitlement"]["amount"], 3_600);
+    // The class serializes as the lowercase lexicon string.
+    assert_eq!(json["entitlement"]["class"], "underwritten");
+    let back: TenantBindingSpec = serde_json::from_value(json).unwrap();
+    assert_eq!(
+        back.entitlement.as_ref().unwrap().class,
+        TenantGrantClass::Underwritten
+    );
+
+    // An empty unit is rejected by CEL (the compiler is the authoritative
+    // checker, but the client-side CEL catches the obvious form early).
+    let empty_unit = TenantBinding::new(
+        "tb",
+        TenantBindingSpec {
+            namespace: "acme".into(),
+            tenant: "did:web:acme".into(),
+            entitlement: Some(TenantEntitlement {
+                unit: String::new(),
+                amount: 1,
+                class: TenantGrantClass::Prepaid,
+                expiration: None,
+            }),
+        },
+    );
+    assert!(
+        empty_unit.validate_cel().is_err(),
+        "an empty unit must be rejected by CEL"
+    );
+}
+
+#[test]
+fn tenant_binding_status_exposes_compiled_grant_fields() {
+    // The status subresource must carry the #929 compiled-grant fields an
+    // enforcer reads (grantCid / allocationCid / epoch).
+    let crd = serde_json::to_value(TenantBinding::crd()).unwrap();
+    let status_props = &crd["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]
+        ["status"]["properties"];
+    assert!(status_props["grantCid"].is_object(), "status.grantCid");
+    assert!(
+        status_props["allocationCid"].is_object(),
+        "status.allocationCid"
+    );
+    assert!(status_props["epoch"].is_object(), "status.epoch");
 }
