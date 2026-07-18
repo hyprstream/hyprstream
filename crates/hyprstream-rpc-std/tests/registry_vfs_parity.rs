@@ -100,7 +100,7 @@ fn repo_projects_as_a_subdirectory_with_children() {
 
     // The subdir table obeys the same scope→kind soundness as the top level.
     for n in sub {
-        let is_read = matches!(n.scope, "query" | "read" | "");
+        let is_read = matches!(n.scope, "query" | "subscribe" | "");
         if is_read {
             assert_ne!(n.kind, VfsNodeKind::Ctl, "repo `{}` read must not be a ctl", n.method);
         }
@@ -115,7 +115,7 @@ fn repo_projects_as_a_subdirectory_with_children() {
 #[test]
 fn scope_and_kind_are_consistent() {
     for n in nodes() {
-        let is_read = matches!(n.scope, "query" | "read" | "");
+        let is_read = matches!(n.scope, "query" | "subscribe" | "");
         if is_read {
             assert_ne!(
                 n.kind,
