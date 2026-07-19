@@ -434,7 +434,7 @@ pub(crate) async fn verify_token_claims(
             &published,
             published_composite.pairs(),
             Some(&state.resource_url),
-            !hyprstream_rpc::envelope::envelope_policy_from_env().uses_pq(),
+            false,
         )?;
         if !local_issuer_matches(&claims, &state.oauth_issuer_url) {
             return Err("JWT validation failed");

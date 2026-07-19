@@ -1900,10 +1900,6 @@ mod tests {
             false
         }
 
-        fn pq_signing_key(&self) -> Option<hyprstream_rpc::crypto::pq::MlDsaSigningKey> {
-            None
-        }
-
         fn jwt_verify_policy(&self) -> hyprstream_rpc::crypto::CryptoPolicy {
             hyprstream_rpc::crypto::CryptoPolicy::Hybrid
         }
@@ -2526,8 +2522,7 @@ mod tests {
         let mut command = std::process::Command::new(std::env::current_exe().unwrap());
         command
             .args(["--exact", test_name, "--nocapture"])
-            .env("HYPRSTREAM_COMPOSITE_PRODUCTION_TEST_DIR", dir)
-            .env("HYPRSTREAM_ENVELOPE_POLICY", "hybrid");
+            .env("HYPRSTREAM_COMPOSITE_PRODUCTION_TEST_DIR", dir);
         if test_name.ends_with("composite_crashing_writer_process") {
             command.env("HYPRSTREAM_COMPOSITE_CRASH_AFTER_STAGE", "1");
         }
@@ -2556,7 +2551,6 @@ mod tests {
                     "--nocapture",
                 ])
                 .env(ORCHESTRATOR_DIR, dir.path())
-                .env("HYPRSTREAM_ENVELOPE_POLICY", "hybrid")
                 .status()
                 .unwrap();
             assert!(status.success());

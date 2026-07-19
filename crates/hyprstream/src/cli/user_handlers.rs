@@ -191,11 +191,9 @@ pub async fn handle_user_create(
 
     let source = resolve_create_key_source(generate, key, ssh)?;
 
-    // Post-quantum policy is node policy: Hybrid by default (fail-closed), only
-    // an explicit HYPRSTREAM_ENVELOPE_POLICY=classical downgrades. Enrollment is
-    // a root-of-trust path, so it follows the same selector as envelope traffic
-    // rather than silently minting classical-only identity material.
-    let policy = hyprstream_rpc::envelope::envelope_policy_from_env();
+    // Enrollment is a root-of-trust path and uses the same mandatory hybrid
+    // suite as envelope traffic.
+    let policy = hyprstream_rpc::envelope::mandatory_envelope_policy();
 
     let outcome = enroll_user(&store, &secrets_dir, username, source, policy)
         .await

@@ -69,17 +69,6 @@ where
     //    process-global verify configuration installed at startup (Hybrid
     //    ENFORCED in the daemon). This closes the prior fail-open where the
     //    site hardcoded Classical / no PQ store.
-    // Response signing policy (#275): mirror the request side — sign the
-    // strongest composite the server has keys for. When the service exposes an
-    // ML-DSA-65 key, responses are Hybrid (EdDSA + ML-DSA-65); otherwise
-    // Classical. A Classical-only client still verifies via the inner EdDSA
-    // (skip-unknown interop), and a Hybrid-enforcing client requires the anchor.
-    let response_pq_key = service.pq_signing_key();
-    let response_policy = if response_pq_key.is_some() {
-        crate::crypto::CryptoPolicy::Hybrid
-    } else {
-        crate::crypto::CryptoPolicy::Classical
-    };
     let pq_store_holder = crate::envelope::global_pq_store();
     let base = match verification {
         EnvelopeVerification::FixedSigner(pubkey) => {
@@ -140,11 +129,14 @@ where
             "authenticated network request omitted responseKemRecipient; dropping without response"
         );
     }
-    if carrier.forbids_cleartext_envelope() && response_pq_key.is_none() {
-        anyhow::bail!(
-            "network response requires an ML-DSA-65 signing key; dropping without cleartext"
-        );
-    }
+    // Refuse before dispatch if the service cannot emit the mandatory pinned
+    // hybrid response suite. Missing key material is never a signal to
+    // construct a classical response. Deliberately checked only after envelope
+    // authentication: the default `pq_signing_key()` derives an ML-DSA key per
+    // call, and unauthenticated input must not be able to trigger that work.
+    let response_pq_key = service.pq_signing_key().ok_or_else(|| {
+        anyhow::anyhow!("service has no ML-DSA-65 response signing key (mandatory Hybrid suite)")
+    })?;
     if carrier.requires_browser_provisioning() {
         let binding = &browser_transcript
             .as_ref()
@@ -183,14 +175,11 @@ where
             let recipient = response_recipient
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("missing authenticated response recipient"))?;
-            let pq_key = response_pq_key
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("missing response ML-DSA-65 signing key"))?;
             ResponseEnvelope::new_signed_encrypted(
                 request_id,
                 payload,
                 signing_key,
-                pq_key,
+                &response_pq_key,
                 recipient,
                 request_iat,
                 &request_nonce,
@@ -198,13 +187,13 @@ where
             )
             .map_err(Into::into)
         } else {
-            Ok(ResponseEnvelope::new_signed_with_policy(
+            ResponseEnvelope::new_signed_with_policy(
                 request_id,
                 payload,
                 signing_key,
-                response_pq_key.as_ref(),
-                response_policy,
-            ))
+                Some(&response_pq_key),
+                crate::crypto::CryptoPolicy::Hybrid,
+            )
         }
     };
     debug!(

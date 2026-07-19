@@ -238,6 +238,7 @@ serde_json.workspace = true  # JSON output for metadata
 hyprstream-rpc-build.workspace = true  # Shared annotation extraction
 
 [dev-dependencies]
+hyprstream-rpc = { path = "../hyprstream-rpc", features = ["test-classical-policy"] }
 criterion.workspace = true
 proptest.workspace = true  # S5 #571 M2: differential faithfulness property tests
 tempfile.workspace = true
