@@ -145,35 +145,24 @@ pub fn create_app(state: Arc<OAuthState>, cors_config: &crate::config::CorsConfi
         .route(
             "/scim/v2/ServiceProviderConfig",
             get(scim::service_provider_config),
-        )
-        // ── com.atproto XRPC read slice (#1112) ────────────────────────────────
-        // Public atproto read endpoints + the session bridge. getSession does
-        // its own Bearer-session lookup inline (it's the atproto session-id
-        // mechanism, not the OAuth JWT validated by require_bearer_token).
-        .route(
-            "/xrpc/com.atproto.server.createSession",
-            post(xrpc::create_session),
-        )
-        .route(
-            "/xrpc/com.atproto.server.getSession",
-            get(xrpc::get_session),
-        )
-        .route(
-            "/xrpc/com.atproto.identity.resolveHandle",
-            get(xrpc::resolve_handle),
-        )
-        .route(
-            "/xrpc/com.atproto.repo.describeRepo",
-            get(xrpc::describe_repo),
-        )
-        .route(
-            "/xrpc/com.atproto.repo.getRecord",
-            get(xrpc::get_record),
-        )
-        .route(
-            "/xrpc/com.atproto.sync.getRepo",
-            get(xrpc::get_repo),
         );
+
+    // ── com.atproto XRPC read slice (#1112) ────────────────────────────────
+    // Four public read endpoints, conditionally mounted when the operator
+    // opts in via `OAuthConfig::xrpc_read_slice`. Session endpoints
+    // (createSession/getSession) are NOT here — they arrive with #1113/#948.
+    let public_router = if state.xrpc_read_slice {
+        public_router
+            .route(
+                "/xrpc/com.atproto.identity.resolveHandle",
+                get(xrpc::resolve_handle),
+            )
+            .route("/xrpc/com.atproto.repo.describeRepo", get(xrpc::describe_repo))
+            .route("/xrpc/com.atproto.repo.getRecord", get(xrpc::get_record))
+            .route("/xrpc/com.atproto.sync.getRepo", get(xrpc::get_repo))
+    } else {
+        public_router
+    };
 
     // ── Protected routes ───────────────────────────────────────────────────────
     // All require a valid Bearer token (validated by require_bearer_token).

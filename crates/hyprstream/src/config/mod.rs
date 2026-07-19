@@ -1184,6 +1184,14 @@ pub struct OAuthConfig {
     /// Defaults to `false` for compatibility.
     #[serde(default)]
     pub require_pushed_authorization_requests: bool,
+
+    /// Enable the `com.atproto.*` XRPC read slice (`/xrpc/…`) served from the
+    /// OAuth HTTP surface (#1112). Defaults to `false` — the data plane is
+    /// inert until the operator explicitly opts in and the write path (#910)
+    /// populates the in-process `XrpcRepoStore` with `public`-flagged snapshots.
+    /// When `false`, the XRPC routes are not mounted at all.
+    #[serde(default)]
+    pub xrpc_read_slice: bool,
 }
 
 fn default_oauth_cors() -> server::CorsConfig {
@@ -1217,6 +1225,7 @@ impl Default for OAuthConfig {
             jwt_key_drain_secs: None,
             jwt_key_rotation_check_secs: None,
             require_pushed_authorization_requests: false,
+            xrpc_read_slice: false,
         }
     }
 }

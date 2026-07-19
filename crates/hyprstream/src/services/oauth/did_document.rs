@@ -339,7 +339,7 @@ fn ed25519_verification_method_jwk(did: &str, key_id: &str, vk: &VerifyingKey) -
 /// `#mesh-kem` hybrid keyAgreement recipient (X25519 + ML-KEM-768) as
 /// `keyAgreement` entries — additive and, like `mesh_pq_vk`, ignored by
 /// atproto resolvers.
-fn build_did_document(
+pub(crate) fn build_did_document(
     did: &str,
     issuer_url: &str,
     keys: &[(String, VerifyingKey)],

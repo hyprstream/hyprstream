@@ -34,6 +34,40 @@ use crate::record::ModelRecord;
 
 /// Build a CARv1 byte blob containing the given root CIDs and `(cid → bytes)` blocks.
 ///
+/// Like [`build_car_v1`] but returns each length-framed section as its own
+/// `Vec<u8>` — the header section first, then one entry per block — so the
+/// caller can stream them incrementally over HTTP without materializing the
+/// entire CAR into a single contiguous buffer.
+///
+/// Each returned `Vec<u8>` is a complete framed CAR section
+/// (`varint(len) ++ body`), safe to flush independently.
+pub fn build_car_v1_sections(roots: &[Cid], blocks: &[(Cid, Vec<u8>)]) -> Vec<Vec<u8>> {
+    let mut sections = Vec::with_capacity(1 + blocks.len());
+    let header_value = DagCbor::str_map([
+        ("version", DagCbor::Unsigned(1)),
+        (
+            "roots",
+            DagCbor::List(roots.iter().copied().map(DagCbor::Link).collect()),
+        ),
+    ]);
+    let header_bytes = header_value.encode();
+    sections.push(frame_section(&header_bytes));
+    for (cid, bytes) in blocks {
+        let mut section = Vec::with_capacity(cid.as_bytes().len() + bytes.len());
+        section.extend_from_slice(cid.as_bytes());
+        section.extend_from_slice(bytes);
+        sections.push(frame_section(&section));
+    }
+    sections
+}
+
+fn frame_section(body: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(10 + body.len());
+    write_uvarint(body.len() as u64, &mut out);
+    out.extend_from_slice(body);
+    out
+}
+
 /// `blocks` need not be sorted; duplicates are harmless. The header's `roots`
 /// is taken verbatim from `roots`.
 pub fn build_car_v1(roots: &[Cid], blocks: &[(Cid, Vec<u8>)]) -> Vec<u8> {
