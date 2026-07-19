@@ -1148,7 +1148,9 @@ mod tests {
         assert_eq!(drain_vm["exp"].as_i64().unwrap(), 2_000);
 
         // Round-trip: the verifier's RotationKeySet parses exactly this shape.
-        let set = hyprstream_pds::commit::RotationKeySet::from_did_document(&doc)
+        // The authoritative active key is the document's #atproto (active_vk),
+        // which matches by construction.
+        let set = hyprstream_pds::commit::RotationKeySet::from_did_document(&doc, did, active_vk)
             .expect("published document must parse into a RotationKeySet");
         assert_eq!(set.len(), 2);
         // Within the drain window, both slots are live; past exp only the

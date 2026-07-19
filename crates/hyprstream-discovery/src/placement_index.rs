@@ -189,11 +189,28 @@ impl PlacementIndex {
         let verify_keys = match verify_keys {
             Some(set) => Some(set),
             None => match resolver.resolve_verifying_key(did).await {
-                // Single-key fallback: treat the resolved key as a one-slot
-                // unbounded active set (no rotation window). The active slot
-                // cannot exceed the cap, so construction is infallible.
+                // Legacy single-key seam: the resolver supplied one `#atproto`
+                // key with no rotation window. Construct the bounded set through
+                // the ONLY public constructor (`from_did_document`) — build a
+                // minimal `{did}#atproto` document fragment from the resolved
+                // key (which is authoritative for this DID by the resolver
+                // contract) and pass the key as both the document's active key
+                // and the authoritative-active freshness gate. This keeps the
+                // RotationKeySet API sealed: there is no bare-key constructor.
                 Ok(Some(vk)) => {
-                    Some(hyprstream_pds::commit::RotationKeySet::single_unbounded(vk))
+                    let mb = hyprstream_pds::commit::p256_public_key_multibase(&vk);
+                    let doc = serde_json::json!({
+                        "id": did,
+                        "verificationMethod": [{
+                            "id": format!("{did}#atproto"),
+                            "type": "Multikey",
+                            "controller": did,
+                            "publicKeyMultibase": mb,
+                        }],
+                    });
+                    Some(hyprstream_pds::commit::RotationKeySet::from_did_document(
+                        &doc, did, &vk,
+                    )?)
                 }
                 Ok(None) => None,
                 Err(e) => {
@@ -675,8 +692,8 @@ mod tests {
                 "exp": exp,
             }));
         }
-        let doc = serde_json::json!({ "verificationMethod": vms });
-        hyprstream_pds::commit::RotationKeySet::from_did_document(&doc)
+        let doc = serde_json::json!({ "id": did, "verificationMethod": vms });
+        hyprstream_pds::commit::RotationKeySet::from_did_document(&doc, did, active_vk)
             .expect("test DID-document fragment must parse into a RotationKeySet")
     }
 
@@ -1231,12 +1248,10 @@ mod tests {
             )],
         );
         let (roots, blocks) = parse_car_v1(&car).unwrap();
-        // The structural checks below fail before signature verification, so a
-        // single unbounded slot is sufficient (mirrors the single-key posture).
-        let keys = hyprstream_pds::commit::RotationKeySet::testing_from_slots(vec![
-            hyprstream_pds::commit::RotationKeySlot::unbounded(vk),
-        ])
-        .unwrap();
+        // The structural checks below fail before signature verification, so any
+        // authoritative slot set is sufficient — build it via the public
+        // `from_did_document` constructor (the only one available cross-crate).
+        let keys = rotation_key_set(NODE_DID, &vk, None);
 
         let duplicate = build_car_v1(&roots, &[blocks.clone(), blocks.clone()].concat());
         assert!(PlacementIndex::decode_repo_car(NODE_DID, &duplicate, Some(&keys), 0).is_err());
@@ -1357,6 +1372,7 @@ mod tests {
         // active slot honors explicit bounds when the DID document advertises
         // them, matching what an authoritative publisher can emit.)
         let doc = serde_json::json!({
+            "id": NODE_DID,
             "verificationMethod": [{
                 "id": format!("{NODE_DID}#atproto"),
                 "type": "Multikey",
@@ -1366,7 +1382,10 @@ mod tests {
                 "exp": now - 100,
             }]
         });
-        let keys = hyprstream_pds::commit::RotationKeySet::from_did_document(&doc)
+        // The active key equals the authoritative active key (vk), so the
+        // freshness gate passes; the explicit expired window is what makes no
+        // slot live at `now`.
+        let keys = hyprstream_pds::commit::RotationKeySet::from_did_document(&doc, NODE_DID, &vk)
             .expect("active slot with explicit bounds still parses");
         let resolver = RotationResolver {
             repos: HashMap::from([(NODE_DID.to_owned(), (car, keys))]),

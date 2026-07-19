@@ -1438,8 +1438,13 @@ impl RecordResolver for PdsRecordResolver {
             active_vk,
             drain_ref,
         );
-        let doc = serde_json::json!({ "verificationMethod": vms });
-        let set = hyprstream_pds::commit::RotationKeySet::from_did_document(&doc)?;
+        let doc = serde_json::json!({ "id": did, "verificationMethod": vms });
+        // The authoritative active key is the live store's active key (the same
+        // source the document was built from), so the freshness gate passes by
+        // construction. Passing it explicitly is what makes a stale/forged
+        // document fail closed at this boundary.
+        let set =
+            hyprstream_pds::commit::RotationKeySet::from_did_document(&doc, did, active_vk)?;
         Ok(Some(set))
     }
 }

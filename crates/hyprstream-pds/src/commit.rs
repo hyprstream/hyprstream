@@ -318,29 +318,33 @@ impl Commit {
 /// A single `#atproto` verification slot: a P-256 verifying key plus the unix-
 /// second `[nbf, exp]` validity window it is authoritative for.
 ///
-/// Constructed only inside [`RotationKeySet`]; the window is enforced at
-/// verify time by [`Commit::verify_against_keys`].
+/// **Opaque by construction** (#918 review r2): the fields are private and the
+/// only builder is the crate-internal [`RotationKeySet::from_did_document`].
+/// A public caller cannot mint an attacker-chosen `(key, window)` pair — the
+/// authority and bounds come solely from a resolved, freshness-attested DID
+/// document.
 #[derive(Clone, Debug)]
 pub struct RotationKeySlot {
-    pub vk: VerifyingKey,
-    pub nbf: i64,
-    pub exp: i64,
+    vk: VerifyingKey,
+    nbf: i64,
+    exp: i64,
 }
 
 impl RotationKeySlot {
     /// A slot authoritative for the whole of time (the default for the active
     /// `#atproto` key, whose window the DID document does not bound).
-    pub const UNBOUNDED_NBF: i64 = i64::MIN;
-    pub const UNBOUNDED_EXP: i64 = i64::MAX;
+    pub(crate) const UNBOUNDED_NBF: i64 = i64::MIN;
+    pub(crate) const UNBOUNDED_EXP: i64 = i64::MAX;
 
     /// Build a slot with an explicit `[nbf, exp]` window (unix seconds,
-    /// inclusive on both ends).
-    pub fn new(vk: VerifyingKey, nbf: i64, exp: i64) -> Self {
+    /// inclusive on both ends). Crate-internal: only `from_did_document`
+    /// constructs slots.
+    pub(crate) fn new(vk: VerifyingKey, nbf: i64, exp: i64) -> Self {
         Self { vk, nbf, exp }
     }
 
-    /// Build an (active-slot-style) unbounded slot.
-    pub fn unbounded(vk: VerifyingKey) -> Self {
+    /// Build an (active-slot-style) unbounded slot. Crate-internal.
+    pub(crate) fn unbounded(vk: VerifyingKey) -> Self {
         Self {
             vk,
             nbf: Self::UNBOUNDED_NBF,
@@ -351,6 +355,21 @@ impl RotationKeySlot {
     /// Whether this slot's window covers `now` (inclusive on both ends).
     pub fn is_live_at(&self, now: i64) -> bool {
         now >= self.nbf && now <= self.exp
+    }
+
+    /// The slot's verifying key.
+    pub fn verifying_key(&self) -> &VerifyingKey {
+        &self.vk
+    }
+
+    /// The slot's `nbf` bound (unix seconds).
+    pub fn nbf(&self) -> i64 {
+        self.nbf
+    }
+
+    /// The slot's `exp` bound (unix seconds).
+    pub fn exp(&self) -> i64 {
+        self.exp
     }
 }
 
@@ -366,10 +385,14 @@ pub const ROTATION_MAX_SLOTS: usize = 8;
 /// commits under at a given instant — the rotation-survivable trust root for
 /// #918.
 ///
-/// `RotationKeySet` is constructed **only** from an authoritative source:
-/// either a resolved DID document ([`RotationKeySet::from_did_document`]) or,
-/// for tests, an explicit slot list ([`RotationKeySet::testing_from_slots`]).
-/// It never accepts a bare, unbounded caller-supplied iterator of keys, and
+/// **Sealed API (#918 review r2):** the ONLY public constructor is
+/// [`RotationKeySet::from_did_document`], which is authority-validated and
+/// freshness-bound (it cross-checks the document's active key against the
+/// authoritative active key the resolver supplies, so a stale pre-rotation
+/// document cannot smuggle a rotated-out key in as an unbounded slot). The
+/// raw [`RotationKeySet::testing_from_slots`] constructor is gated
+/// `#[cfg(test)]`. A public caller cannot construct a set from bare keys.
+///
 /// [`Commit::verify_against_keys`] enforces each slot's `[nbf, exp]` window at
 /// verify time so a cached/stale drain key cannot accept commits forged after
 /// its expiry, nor a lead key before its `nbf`.
@@ -399,39 +422,88 @@ impl RotationKeySet {
     /// Maximum number of slots a set will carry (see [`ROTATION_MAX_SLOTS`]).
     pub const MAX_SLOTS: usize = ROTATION_MAX_SLOTS;
 
-    /// Construct the key set from a resolved DID document.
+    /// Construct the key set from a resolved DID document, validated against
+    /// the authoritative active key the resolver supplies (#918 review r2).
     ///
-    /// Picks the `#atproto` (active) and `#atproto-drain` (drain) verification
-    /// methods out of `doc.verificationMethod`, decodes each `publicKeyMultibase`
-    /// as a P-256 `Multikey` (multibase `z` + base58btc + multicodec `p256-pub`
-    /// `0x80 0x24` + compressed SEC1), and reads the drain slot's `nbf`/`exp`
-    /// unix-second bounds. The active `#atproto` slot is unbounded (its window
-    /// is not carried in the document); `#atproto-drain` MUST carry `nbf`/`exp`
-    /// — a drain slot without explicit bounds is rejected, because an unbounded
-    /// drain key is exactly the stale-key-forever failure this type prevents.
+    /// `doc` is the DID document resolved for `expected_did`. `authoritative_active`
+    /// is the key the resolver knows is the **current** `#atproto` active key
+    /// (from the live rotation store, or a freshness-attested fetch). The two
+    /// are cross-checked: the document's `#atproto` method MUST verify against
+    /// `authoritative_active`. A stale pre-rotation document — whose `#atproto`
+    /// is the now-rotated-out key — therefore fails closed rather than being
+    /// reconstructed as an unbounded slot for the rotated-out key.
     ///
-    /// Fails closed (returns `Err`) if the document shape is not a DID
-    /// document, the `#atproto` method is absent or malformed, the drain
-    /// method's Multikey/bounds are malformed, or the slot count would exceed
-    /// [`MAX_SLOTS`]. An empty result (no `#atproto` method) is also an error:
-    /// the verifier refuses to construct a set with no authoritative slot.
-    pub fn from_did_document(doc: &serde_json::Value) -> Result<Self> {
+    /// Authority validation (all fail closed):
+    /// - the document's `id` MUST equal `expected_did`;
+    /// - exactly one `#atproto` and at most one `#atproto-drain` method
+    ///   (duplicates are rejected, not silently first-matched);
+    /// - each method is `type: "Multikey"` and `controller: expected_did`;
+    /// - the `#atproto` key equals `authoritative_active` (the freshness gate);
+    /// - `#atproto-drain` carries explicit integer `nbf`/`exp`.
+    ///
+    /// The active `#atproto` slot is unbounded unless the document advertises
+    /// explicit `nbf`/`exp` on it (then those are honored); `#atproto-drain`
+    /// MUST carry `nbf`/`exp` — an unbounded drain key is exactly the
+    /// stale-key-forever failure this type prevents.
+    pub fn from_did_document(
+        doc: &serde_json::Value,
+        expected_did: &str,
+        authoritative_active: &VerifyingKey,
+    ) -> Result<Self> {
+        // Authority: the document must be for the DID being resolved.
+        let doc_id = doc
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| anyhow!("DID document has no `id`"))?;
+        ensure!(
+            doc_id == expected_did,
+            "DID document id {doc_id:?} does not match the DID being resolved {expected_did:?}"
+        );
         let vms = doc
             .get("verificationMethod")
             .and_then(serde_json::Value::as_array)
             .ok_or_else(|| anyhow!("DID document has no verificationMethod array"))?;
-        let mut slots: Vec<RotationKeySlot> = Vec::new();
-        // The active #atproto slot. First match wins (the producer emits it
-        // first; a duplicate is a malformed document).
-        let atproto = vms
-            .iter()
-            .find(|vm| vm.get("id").and_then(serde_json::Value::as_str) == Some("#atproto")
-                || vm
-                    .get("id")
-                    .and_then(serde_json::Value::as_str)
-                    .is_some_and(|s| s.ends_with("#atproto")))
-            .ok_or_else(|| anyhow!("DID document has no #atproto verification method"))?;
+
+        // Match methods by FULL id (`{did}#atproto` / `{did}#atproto-drain`),
+        // not bare suffix — a `#atproto` from a different controller/DID must
+        // not be picked up. Collect exactly one active and at most one drain;
+        // duplicates are a malformed/attacker document and fail closed.
+        let atproto_id = format!("{expected_did}#atproto");
+        let drain_id = format!("{expected_did}#atproto-drain");
+        let mut atproto_vm: Option<&serde_json::Value> = None;
+        let mut drain_vm: Option<&serde_json::Value> = None;
+        for vm in vms {
+            let Some(id) = vm.get("id").and_then(serde_json::Value::as_str) else {
+                continue;
+            };
+            if id == atproto_id {
+                if atproto_vm.is_some() {
+                    bail!("DID document has more than one `{atproto_id}` method");
+                }
+                atproto_vm = Some(vm);
+            } else if id == drain_id {
+                if drain_vm.is_some() {
+                    bail!("DID document has more than one `{drain_id}` method");
+                }
+                drain_vm = Some(vm);
+            }
+            // Other VMs are ignored (mesh keys, etc.) — they are not #atproto.
+        }
+
+        let atproto = atproto_vm.ok_or_else(|| {
+            anyhow!("DID document has no `{atproto_id}` verification method")
+        })?;
+        validate_vm_authority(atproto, &atproto_id, expected_did)?;
         let atproto_vk = decode_p256_multibase_vm(atproto, "#atproto")?;
+        // Freshness gate: the document's active key MUST equal the authoritative
+        // current active key. A stale pre-rotation document (active = the
+        // rotated-out key) fails here — it cannot be smuggled in as an
+        // unbounded slot.
+        ensure!(
+            atproto_vk == *authoritative_active,
+            "DID document's #atproto key does not match the authoritative current active key \
+             — refusing a stale/pre-rotation document"
+        );
         // The active `#atproto` slot defaults to unbounded (atproto does not
         // publish its window), BUT if the DID document advertises explicit
         // `nbf`/`exp` on it, honor them — the verifier enforces whatever the
@@ -452,21 +524,17 @@ impl RotationKeySet {
                 "#atproto slot must carry both `nbf` and `exp`, or neither (partial bounds rejected)"
             ),
         };
-        slots.push(atproto_slot);
+        let mut slots: Vec<RotationKeySlot> = vec![atproto_slot];
+
         // The optional #atproto-drain slot, bounded by explicit nbf/exp.
-        for vm in vms {
-            let Some(id) = vm.get("id").and_then(serde_json::Value::as_str) else {
-                continue;
-            };
-            if !(id == "#atproto-drain" || id.ends_with("#atproto-drain")) {
-                continue;
-            }
-            let vk = decode_p256_multibase_vm(vm, "#atproto-drain")?;
-            let nbf = vm
+        if let Some(drain) = drain_vm {
+            validate_vm_authority(drain, &drain_id, expected_did)?;
+            let vk = decode_p256_multibase_vm(drain, "#atproto-drain")?;
+            let nbf = drain
                 .get("nbf")
                 .and_then(serde_json::Value::as_i64)
                 .ok_or_else(|| anyhow!("#atproto-drain slot must carry integer `nbf` bounds"))?;
-            let exp = vm
+            let exp = drain
                 .get("exp")
                 .and_then(serde_json::Value::as_i64)
                 .ok_or_else(|| anyhow!("#atproto-drain slot must carry integer `exp` bounds"))?;
@@ -479,27 +547,11 @@ impl RotationKeySet {
         Self::from_slots_inner(slots)
     }
 
-    /// Infallible single-slot constructor for an unbounded active `#atproto`
-    /// key — the shape a caller wants when it has resolved a single pinned key
-    /// (e.g. the [`super::super`] consumer's `resolve_verifying_key` fallback)
-    /// and needs to feed the rotation-tolerant verifier. Equivalent to
-    /// `testing_from_slots(vec![RotationKeySlot::unbounded(vk)])` but cannot
-    /// fail (a single unbounded slot satisfies both the non-empty and cap
-    /// invariants).
-    pub fn single_unbounded(vk: VerifyingKey) -> Self {
-        Self {
-            slots: vec![RotationKeySlot::unbounded(vk)],
-        }
-    }
-
-    /// Test/trusted-only constructor from explicit slots.
-    ///
-    /// **Not for production use:** the caller vouches that `slots` came from a
-    /// resolved DID document or the authoritative rotation store. Production
-    /// code must construct the set via [`RotationKeySet::from_did_document`]
-    /// (or a rotation-store bridge that round-trips through the document) so
-    /// the producer-side publication and the verifier see the same authoritative
-    /// slot set. The `testing_` prefix is the gate.
+    /// Test-only constructor from explicit slots (`#[cfg(test)]`-gated so it
+    /// is absent from non-test builds). Production code MUST construct the set
+    /// via [`RotationKeySet::from_did_document`], the only authority-validated
+    /// path; this raw constructor exists purely for focused unit tests.
+    #[cfg(test)]
     pub fn testing_from_slots(slots: Vec<RotationKeySlot>) -> Result<Self> {
         Self::from_slots_inner(slots)
     }
@@ -516,6 +568,14 @@ impl RotationKeySet {
             Self::MAX_SLOTS
         );
         Ok(Self { slots })
+    }
+
+    /// The active `#atproto` slot (the first slot, always present). Exposed so
+    /// a resolver/freshness layer can read the document-advertised active key
+    /// and cross-check it against the authoritative rotation store.
+    pub fn active_slot(&self) -> &RotationKeySlot {
+        // The first slot is the active `#atproto` by construction.
+        &self.slots[0]
     }
 
     /// Number of slots in the set (regardless of whether they are live now).
@@ -575,6 +635,53 @@ fn decode_p256_multibase_vm(vm: &serde_json::Value, label: &str) -> Result<Verif
     );
     VerifyingKey::from_sec1_bytes(&payload[2..])
         .map_err(|e| anyhow!("{label} publicKeyMultibase SEC1 point invalid: {e}"))
+}
+
+/// Validate a `#atproto`-family verification method's authority: it MUST be
+/// `type: "Multikey"` and `controller: expected_did`. The id match (full
+/// `{did}#fragment`) is established by the caller; this checks the rest of the
+/// method so a method with the right id but a foreign controller/type is
+/// rejected (a document carrying an attacker VM with a spoofed id still fails
+/// closed on controller/type).
+fn validate_vm_authority(
+    vm: &serde_json::Value,
+    full_id: &str,
+    expected_did: &str,
+) -> Result<()> {
+    let vm_type = vm
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow!("`{full_id}` method has no `type`"))?;
+    ensure!(
+        vm_type == "Multikey",
+        "`{full_id}` method type is {vm_type:?}, expected \"Multikey\""
+    );
+    let controller = vm
+        .get("controller")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow!("`{full_id}` method has no `controller`"))?;
+    ensure!(
+        controller == expected_did,
+        "`{full_id}` method controller is {controller:?}, expected {expected_did:?}"
+    );
+    Ok(())
+}
+
+/// Encode a P-256 verifying key as the multibase `z` + base58btc + multicodec
+/// `p256-pub` (`0x80 0x24`) + compressed SEC1 string the DID-document producer
+/// publishes — the symmetric partner of `decode_p256_multibase_vm`.
+///
+/// Exposed so a resolver that has a single authoritative `#atproto` key (the
+/// legacy single-key seam) can build a minimal DID-document fragment and
+/// construct a [`RotationKeySet`] via the ONLY public constructor
+/// ([`RotationKeySet::from_did_document`]), keeping the API sealed: there is
+/// no public bare-key constructor.
+pub fn p256_public_key_multibase(vk: &VerifyingKey) -> String {
+    use p256::EncodedPoint;
+    let point: EncodedPoint = vk.to_encoded_point(true);
+    let mut payload = vec![0x80, 0x24];
+    payload.extend_from_slice(point.as_bytes());
+    format!("z{}", bs58::encode(payload).into_string())
 }
 
 #[cfg(test)]
@@ -833,7 +940,7 @@ mod tests {
                 },
             ],
         });
-        let set = RotationKeySet::from_did_document(&doc).expect("parse");
+        let set = RotationKeySet::from_did_document(&doc, did, &active_vk).expect("parse");
         // Within the drain window: drained-key commit verifies.
         commit
             .verify_against_keys(&set, 10_000)
@@ -872,13 +979,89 @@ mod tests {
                 },
             ],
         });
-        let err =
-            RotationKeySet::from_did_document(&doc).expect_err("unbounded drain must be rejected");
+        let err = RotationKeySet::from_did_document(&doc, did, &active_vk)
+            .expect_err("unbounded drain must be rejected");
         let _ = commit;
         let msg = format!("{err}");
         assert!(
             msg.contains("`nbf`") || msg.contains("`exp`"),
             "missing-bounds error should name nbf/exp, got: {msg}"
+        );
+    }
+
+    /// #918 review r2 (stale-document downgrade): a pre-rotation document whose
+    /// `#atproto` is the now-rotated-out key MUST fail closed — the resolver
+    /// supplies the authoritative CURRENT active key (K'), and the stale
+    /// document's `#atproto` (K) does not match, so `from_did_document`
+    /// refuses instead of reconstructing K as an unbounded slot.
+    #[test]
+    fn from_did_document_rejects_stale_pre_rotation_document() {
+        let (_commit_signed_by_old, old_vk) = make_signed_commit();
+        // The active key has since rotated to a brand-new key K'.
+        let current_active = VerifyingKey::from(&SigningKey::random(&mut rand::rngs::OsRng));
+        let did = "did:web:alice.example.com";
+        // Stale document: still advertises the OLD key as `#atproto`, no drain.
+        let stale_doc = serde_json::json!({
+            "id": did,
+            "verificationMethod": [{
+                "id": format!("{did}#atproto"),
+                "type": "Multikey",
+                "controller": did,
+                "publicKeyMultibase": p256_to_multibase(&old_vk),
+            }],
+        });
+        let err = RotationKeySet::from_did_document(&stale_doc, did, &current_active)
+            .expect_err("a stale pre-rotation document must fail closed");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("authoritative current active key")
+                || msg.contains("stale/pre-rotation"),
+            "stale-document error should name the freshness gate, got: {msg}"
+        );
+    }
+
+    /// #918 review r2 (authority validation): a document whose `id` is for a
+    /// different DID must fail closed (the set is DID-bound, not suffix-bound).
+    #[test]
+    fn from_did_document_rejects_wrong_did() {
+        let (_c, vk) = make_signed_commit();
+        let did = "did:web:alice.example.com";
+        let other_did = "did:web:mallory.example.com";
+        let doc = serde_json::json!({
+            "id": other_did,
+            "verificationMethod": [{
+                "id": format!("{other_did}#atproto"),
+                "type": "Multikey",
+                "controller": other_did,
+                "publicKeyMultibase": p256_to_multibase(&vk),
+            }],
+        });
+        assert!(
+            RotationKeySet::from_did_document(&doc, did, &vk).is_err(),
+            "a document for a different DID must fail closed"
+        );
+    }
+
+    /// #918 review r2 (duplicate methods): two `#atproto` methods must fail
+    /// closed rather than silently first-matching.
+    #[test]
+    fn from_did_document_rejects_duplicate_atproto() {
+        let (_c, vk) = make_signed_commit();
+        let did = "did:web:alice.example.com";
+        let doc = serde_json::json!({
+            "id": did,
+            "verificationMethod": [
+                { "id": format!("{did}#atproto"), "type": "Multikey",
+                  "controller": did, "publicKeyMultibase": p256_to_multibase(&vk) },
+                { "id": format!("{did}#atproto"), "type": "Multikey",
+                  "controller": did, "publicKeyMultibase": p256_to_multibase(&vk) },
+            ],
+        });
+        let err = RotationKeySet::from_did_document(&doc, did, &vk)
+            .expect_err("duplicate #atproto must fail closed");
+        assert!(
+            format!("{err}").contains("more than one"),
+            "duplicate-method error should be explicit, got: {err}"
         );
     }
 }
