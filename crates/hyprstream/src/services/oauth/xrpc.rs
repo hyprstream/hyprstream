@@ -877,10 +877,32 @@ mod tests {
         state
     }
 
-    /// Build a router using the PRODUCTION `xrpc_routes()` function — the same
-    /// route table `create_app` merges when the feature gate is enabled.
+    /// Build a router through the PRODUCTION `oauth::create_app` builder with
+    /// `xrpc_read_slice=true` — exercises the real feature-gate conditional.
     async fn build_xrpc_router() -> Router {
-        super::xrpc_routes().with_state(build_test_state(true).await)
+        build_production_app(true).await
+    }
+
+    /// Build the production `create_app` with the given feature-gate value.
+    async fn build_production_app(xrpc_enabled: bool) -> Router {
+        use crate::config::server::CorsConfig;
+        let state = build_test_state(xrpc_enabled).await;
+        let cors = CorsConfig {
+            enabled: false,
+            ..Default::default()
+        };
+        crate::services::oauth::create_app(state, &cors)
+    }
+
+    /// Wrap a pre-built state in the production `create_app` (for tests that
+    /// seed additional snapshots before constructing the router).
+    async fn build_production_app_from_state(state: Arc<OAuthState>) -> Router {
+        use crate::config::server::CorsConfig;
+        let cors = CorsConfig {
+            enabled: false,
+            ..Default::default()
+        };
+        crate::services::oauth::create_app(state, &cors)
     }
 
     /// Like `sample_snapshot` but with a fixed TID so the rkey/CID are deterministic.
@@ -1124,33 +1146,47 @@ mod tests {
         assert!(!bytes.is_empty());
     }
 
-    // ── Finding 1: feature-gate test through the production router ─────────────
+    // ── Finding 1: feature-gate matrix — all 4 routes, enabled AND disabled ────
 
     #[tokio::test]
-    async fn router_feature_gate_false_returns_404() {
-        // Build the production create_app with xrpc_read_slice = false.
-        // XRPC routes must not be mounted — requests return 404.
-        use crate::config::server::CorsConfig;
-        let state = build_test_state(false).await;
-        let cors = CorsConfig {
-            enabled: false,
-            ..Default::default()
-        };
-        let app = crate::services::oauth::create_app(state, &cors);
-        let resp = app
-            .clone()
-            .oneshot(req("/xrpc/com.atproto.sync.getRepo?did=did:web:pub.example.com"))
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    async fn router_feature_gate_disabled_all_four_routes_404() {
+        let app = build_production_app(false).await;
+        // All four XRPC routes must 404 when the gate is disabled.
+        let routes = [
+            "/xrpc/com.atproto.sync.getRepo?did=did:web:pub.example.com",
+            "/xrpc/com.atproto.repo.describeRepo?repo=did:web:pub.example.com",
+            "/xrpc/com.atproto.repo.getRecord?repo=did:web:pub.example.com&collection=ai.hyprstream.model&rkey=abc",
+            "/xrpc/com.atproto.identity.resolveHandle?handle=pub.example.com",
+        ];
+        for uri in &routes {
+            let resp = app.clone().oneshot(req(uri)).await.unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::NOT_FOUND,
+                "route {uri} should 404 when xrpc_read_slice is disabled"
+            );
+        }
+    }
 
-        // All four endpoints should 404.
-        let resp = app
-            .clone()
-            .oneshot(req("/xrpc/com.atproto.repo.describeRepo?repo=did:web:pub.example.com"))
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    #[tokio::test]
+    async fn router_feature_gate_enabled_all_four_routes_reachable() {
+        // Smoke-test: all four routes reach XRPC handlers (not 404) when enabled.
+        // Detailed assertions are in the individual endpoint tests above.
+        let app = build_production_app(true).await;
+        let routes = [
+            ("/xrpc/com.atproto.repo.describeRepo?repo=did:web:pub.example.com", StatusCode::OK),
+            ("/xrpc/com.atproto.identity.resolveHandle?handle=pub.example.com", StatusCode::OK),
+            ("/xrpc/com.atproto.repo.getRecord?repo=did:web:pub.example.com&collection=ai.hyprstream.model&rkey=abc", StatusCode::BAD_REQUEST), // RecordNotFound
+            ("/xrpc/com.atproto.sync.getRepo?did=did:web:pub.example.com", StatusCode::OK),
+        ];
+        for (uri, expected) in &routes {
+            let resp = app.clone().oneshot(req(uri)).await.unwrap();
+            assert_eq!(
+                resp.status(),
+                *expected,
+                "route {uri} status mismatch when xrpc_read_slice is enabled"
+            );
+        }
     }
 
     // ── Finding 2: routed CID match/mismatch + malformed query ─────────────────
@@ -1162,7 +1198,7 @@ mod tests {
         let rkey = snap.records.keys().next().unwrap().encode();
         let cid = snap.records.values().next().unwrap().cid().to_string();
         state.xrpc_repos.put(snap).await;
-        let app = super::xrpc_routes().with_state(state);
+        let app = build_production_app_from_state(state).await;
         let uri = format!(
             "/xrpc/com.atproto.repo.getRecord?repo=did:web:fixed.example.com\
              &collection={HOSTED_COLLECTION}&rkey={rkey}&cid={cid}"
@@ -1180,7 +1216,7 @@ mod tests {
         let snap = sample_snapshot_fixed_tid("did:web:fixed.example.com", "fixed.example.com", true);
         let rkey = snap.records.keys().next().unwrap().encode();
         state.xrpc_repos.put(snap).await;
-        let app = super::xrpc_routes().with_state(state);
+        let app = build_production_app_from_state(state).await;
         let uri = format!(
             "/xrpc/com.atproto.repo.getRecord?repo=did:web:fixed.example.com\
              &collection={HOSTED_COLLECTION}&rkey={rkey}\
