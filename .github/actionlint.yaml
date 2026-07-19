@@ -1,0 +1,13 @@
+# actionlint configuration.
+# Registers the org's custom self-hosted runner labels so actionlint does not
+# flag them as "unknown" [runner-label] errors. These labels are used by the
+# arm64/Graviton CI legs across rust.yml, graviton-build-validate.yml,
+# build-image.yml, and the arm64 job in docker-build.yml.
+# Schema: https://github.com/rhysd/actionlint/blob/main/docs/config.md
+self-hosted-runner:
+  labels:
+    - self-hosted
+    - linux
+    - arm64
+    - graviton
+    - hyprstream-merge-gate
