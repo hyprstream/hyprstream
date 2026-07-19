@@ -61,6 +61,29 @@ pub fn build_car_v1_sections(roots: &[Cid], blocks: &[(Cid, Vec<u8>)]) -> Vec<Ve
     sections
 }
 
+/// Build just the CARv1 header section (varint-framed CBOR `{version, roots}`).
+/// Useful for lazy/streaming CAR producers that emit the header first, then
+/// block sections one at a time.
+pub fn car_header_bytes(roots: &[Cid]) -> Vec<u8> {
+    let header_value = DagCbor::str_map([
+        ("version", DagCbor::Unsigned(1)),
+        (
+            "roots",
+            DagCbor::List(roots.iter().copied().map(DagCbor::Link).collect()),
+        ),
+    ]);
+    frame_section(&header_value.encode())
+}
+
+/// Build one length-framed CARv1 block section (`varint(len) ++ CID ++ raw`).
+/// Used by lazy/streaming CAR producers that encode blocks on demand.
+pub fn car_block_bytes(cid: Cid, raw: &[u8]) -> Vec<u8> {
+    let mut section = Vec::with_capacity(cid.as_bytes().len() + raw.len());
+    section.extend_from_slice(cid.as_bytes());
+    section.extend_from_slice(raw);
+    frame_section(&section)
+}
+
 fn frame_section(body: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(10 + body.len());
     write_uvarint(body.len() as u64, &mut out);

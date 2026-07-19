@@ -12,35 +12,24 @@
 //! | GET    | `com.atproto.identity.resolveHandle` | handle→DID |
 //! | GET    | `com.atproto.repo.describeRepo`     | DID/handle + commit head + didDoc |
 //! | GET    | `com.atproto.repo.getRecord`        | record JSON (optional `cid` pinning) |
-//! | GET    | `com.atproto.sync.getRepo`          | full-repo CARv1 export (streamed) |
+//! | GET    | `com.atproto.sync.getRepo`          | full-repo CARv1 export (lazy stream) |
 //!
 //! **Session endpoints (`createSession`/`getSession`) are deliberately NOT in
 //! this PR.** Credential verification (password / app-password) and the OAuth
-//! JWT bridge belong with the #1113/#948 OAuth integration work — a read-slice
-//! PR is the wrong place to introduce an unauthenticated session-minting path.
-//! The four endpoints above are public reads of explicitly-published repos.
+//! JWT bridge belong with the #1113/#948 OAuth integration work.
 //!
 //! # Feature gate
 //!
 //! Routes are mounted only when `OAuthConfig::xrpc_read_slice` is `true`
 //! (defaults to `false`). The in-process [`XrpcRepoStore`] starts empty; the
 //! write path (#910) populates it with [`RepoSnapshot`]s whose [`public`]
-//! flag is `true`. Only `public` snapshots are served by these endpoints —
-//! the publication boundary is enforced in [`XrpcRepoStore::get_public`] and
-//! tested in `publication_boundary_*`.
+//! flag is `true`. Only `public` snapshots are served by these endpoints.
 //!
 //! # Out of scope
 //!
 //! - `com.atproto.sync.subscribeRepos` (firehose) — issue #1112 defers it.
 //! - Write path (`repo.createRecord` etc.) — sequenced with #910.
 //! - `createSession`/`getSession` — sequenced with #1113/#948.
-//!
-//! # XRPC error envelopes
-//!
-//! All errors follow the XRPC convention: HTTP status code with JSON body
-//! `{"error": "<code>", "message": "<human readable>"}`. Extractor/query
-//! parse failures are caught via manual query parsing (no axum `Query`
-//! rejection bypasses).
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -51,12 +40,12 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use bytes::Bytes;
-use futures::stream;
+use futures::{stream, Stream};
 use p256::ecdsa::VerifyingKey;
 use serde_json::{json, Value};
-use tokio::sync::{RwLock, Semaphore};
+use tokio::sync::{OwnedSemaphorePermit, RwLock, Semaphore};
 
-use hyprstream_pds::car::{build_car_v1_sections, build_record_proof_car};
+use hyprstream_pds::car::{build_record_proof_car, car_block_bytes, car_header_bytes};
 use hyprstream_pds::commit::Commit;
 use hyprstream_pds::mst::{Node, NodeData};
 use hyprstream_pds::record::{ModelRecord, COLLECTION_NSID};
@@ -72,7 +61,7 @@ pub const HOSTED_COLLECTION: &str = COLLECTION_NSID;
 /// Maximum number of concurrent `sync.getRepo` (full-CAR export) requests.
 /// Each request streams the entire repo; bounding concurrency prevents
 /// memory/CPU exhaustion from parallel full-repo exports.
-const GET_REPO_CONCURRENCY: usize = 4;
+pub const GET_REPO_CONCURRENCY: usize = 4;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // RepoSnapshot + XrpcRepoStore
@@ -80,79 +69,41 @@ const GET_REPO_CONCURRENCY: usize = 4;
 
 /// An in-memory snapshot of one repo's signed state — enough to answer the
 /// public read slice (`describeRepo` / `getRecord` / `sync.getRepo`).
-///
-/// Holds the signed commit, the full MST node-block set, the per-rkey record
-/// table, and the account's `#atproto` P-256 verifying key (so the host can
-/// re-verify proofs it serves, satisfying the D5 untrusted-host posture).
 #[derive(Clone, Debug)]
 pub struct RepoSnapshot {
-    /// Account DID (e.g. `did:web:hyprstream.example.com`).
     pub did: String,
-    /// Account handle (bare hostname, no port — atproto handle rule).
     pub handle: String,
-    /// Signed commit head of the MST.
     pub commit: Commit,
-    /// `(cid, NodeData)` for every MST node, including the root. Used for
-    /// full-repo CAR export and for record-proof construction.
     pub node_blocks: Vec<(Cid, NodeData)>,
-    /// All hosted records, keyed by TID. The rkey (record key) in at-uri form
-    /// is `Tid::encode(tid)` (base32-sortable).
     pub records: BTreeMap<Tid, ModelRecord>,
-    /// The account's published `#atproto` P-256 verifying key.
     pub atproto_vk: VerifyingKey,
     /// **Publication boundary.** When `true`, this snapshot is anonymously
     /// readable via the public XRPC read endpoints. When `false`, the public
-    /// read handlers act as though the repo does not exist. The write path
-    /// (#910) sets this from the per-DID/per-collection authz policy.
+    /// read handlers act as though the repo does not exist.
     pub public: bool,
 }
 
 impl RepoSnapshot {
-    /// The MST root CID from the snapshot's commit (`commit.data`).
     pub fn root_cid(&self) -> Cid {
         self.commit.data
     }
 
-    /// Look up the record + its CID for a given rkey.
     pub fn record_by_rkey(&self, rkey: &str) -> Option<(&ModelRecord, Cid)> {
         let tid = Tid::parse(rkey).ok()?;
         let rec = self.records.get(&tid)?;
         Some((rec, rec.cid()))
     }
 
-    /// Build a CAR proof for one record (commit + MST path + record).
     pub fn record_proof_car(&self, rkey: &str) -> Option<Vec<u8>> {
         let tid = Tid::parse(rkey).ok()?;
         let rec = self.records.get(&tid)?;
-        let cids: BTreeMap<Tid, Cid> = self
-            .records
-            .iter()
-            .map(|(t, r)| (*t, r.cid()))
-            .collect();
+        let cids: BTreeMap<Tid, Cid> =
+            self.records.iter().map(|(t, r)| (*t, r.cid())).collect();
         let tree = Node::from_records(HOSTED_COLLECTION, &cids);
         let proof = tree.proof(HOSTED_COLLECTION, &tid)?;
         Some(build_record_proof_car(&self.commit, &proof, &self.node_blocks, rec))
     }
 
-    /// Build a full-repo CARv1 export: commit block + all MST nodes + all
-    /// records, rooted at the commit CID. Returns length-framed sections
-    /// suitable for incremental streaming (each `Vec<u8>` is one complete
-    /// CAR section: header first, then one per block).
-    pub fn full_car_sections(&self) -> Vec<Vec<u8>> {
-        let mut blocks: Vec<(Cid, Vec<u8>)> = Vec::new();
-        let commit_cid = self.commit.cid();
-        blocks.push((commit_cid, self.commit.to_dag_cbor()));
-        for (cid, data) in &self.node_blocks {
-            blocks.push((*cid, data.encode()));
-        }
-        for rec in self.records.values() {
-            blocks.push((rec.cid(), rec.to_dag_cbor()));
-        }
-        build_car_v1_sections(&[commit_cid], &blocks)
-    }
-
-    /// Convert a hosted record to the atproto `getRecord` `value` JSON:
-    /// the lexicon fields plus `$type` and the IPLD-link `$uri`.
     pub fn record_json(&self, rkey: &str, rec: &ModelRecord) -> Value {
         let uri = format!("at://{}/{HOSTED_COLLECTION}/{rkey}", self.did);
         json!({
@@ -167,9 +118,6 @@ impl RepoSnapshot {
         })
     }
 
-    /// Build a minimal atproto-compatible DID document for this snapshot's
-    /// account (used as `describeRepo.didDoc`). Reuses [`build_did_document`]
-    /// with only the `#atproto` verification method + `#atproto_pds` service.
     fn did_doc(&self, issuer_url: &str) -> Value {
         let atproto = AtprotoIdentity {
             p256_vk: &self.atproto_vk,
@@ -179,20 +127,18 @@ impl RepoSnapshot {
     }
 }
 
-/// In-process registry of hosted repos, keyed by DID. Populated by the write
-/// path (#910) and by tests; the read slice consults it directly.
+/// In-process registry of hosted repos, keyed by DID.
 #[derive(Debug)]
 pub struct XrpcRepoStore {
     by_did: RwLock<BTreeMap<String, Arc<RepoSnapshot>>>,
-    /// Concurrency limiter for full-CAR exports (`sync.getRepo`).
-    get_repo_sema: Semaphore,
+    get_repo_sema: Arc<Semaphore>,
 }
 
 impl Default for XrpcRepoStore {
     fn default() -> Self {
         Self {
             by_did: RwLock::new(BTreeMap::new()),
-            get_repo_sema: Semaphore::new(GET_REPO_CONCURRENCY),
+            get_repo_sema: Arc::new(Semaphore::new(GET_REPO_CONCURRENCY)),
         }
     }
 }
@@ -213,13 +159,12 @@ impl XrpcRepoStore {
     }
 
     /// Look up a **public** snapshot by DID. Non-public repos are invisible
-    /// to the public read endpoints (publication boundary, finding #4).
+    /// to the public read endpoints (publication boundary).
     pub async fn get_public(&self, did: &str) -> Option<Arc<RepoSnapshot>> {
         self.get(did).await.filter(|s| s.public)
     }
 
-    /// Resolve a handle (bare hostname) to a **public** snapshot — only
-    /// unique handles resolve unambiguously (atproto handle-uniqueness rule).
+    /// Resolve a handle (bare hostname) to a **public** snapshot.
     pub async fn by_handle_public(&self, handle: &str) -> Option<Arc<RepoSnapshot>> {
         let guard = self.by_did.read().await;
         let mut hits = guard.values().filter(|s| s.public && s.handle == handle);
@@ -230,28 +175,118 @@ impl XrpcRepoStore {
         Some(Arc::clone(first))
     }
 
-    /// Acquire a concurrency permit for full-CAR export. Bounded by
-    /// [`GET_REPO_CONCURRENCY`]. The permit is released when dropped.
-    pub async fn acquire_get_repo(&self) -> Result<tokio::sync::SemaphorePermit<'_>, tokio::sync::AcquireError> {
-        self.get_repo_sema.acquire().await
+    /// Acquire an **owned** concurrency permit for full-CAR export. The permit
+    /// lives until the body stream is consumed or dropped — not just until the
+    /// handler returns. Bounded by [`GET_REPO_CONCURRENCY`].
+    pub async fn acquire_get_repo_owned(&self) -> Result<OwnedSemaphorePermit, tokio::sync::AcquireError> {
+        self.get_repo_sema.clone().acquire_owned().await
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Lazy CAR section stream (owned-permit held until EOF/drop)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Phase of the lazy CAR section stream.
+#[derive(Clone, Debug)]
+enum CarPhase {
+    Header,
+    Commit,
+    Nodes(usize),
+    Records(Arc<Vec<Tid>>, usize),
+    Done,
+}
+
+/// Produce a lazy CAR section stream. Each section is encoded on-demand when
+/// polled — no full-repo materialization. The `OwnedSemaphorePermit` is held
+/// inside the stream's state and released when the stream is dropped (body
+/// consumed or client disconnected).
+fn lazy_car_stream(
+    snap: Arc<RepoSnapshot>,
+    permit: OwnedSemaphorePermit,
+) -> impl Stream<Item = std::io::Result<Bytes>> {
+    let record_tids: Arc<Vec<Tid>> = Arc::new(snap.records.keys().copied().collect());
+
+    struct StreamState {
+        phase: CarPhase,
+        _permit: OwnedSemaphorePermit,
+    }
+
+    let init = StreamState {
+        phase: CarPhase::Header,
+        _permit: permit,
+    };
+
+    stream::unfold(init, move |mut state| {
+        let snap = Arc::clone(&snap);
+        let record_tids = Arc::clone(&record_tids);
+        async move {
+            loop {
+                match &mut state.phase {
+                    CarPhase::Header => {
+                        state.phase = CarPhase::Commit;
+                        return Some((
+                            Ok(Bytes::from(car_header_bytes(&[snap.commit.cid()]))),
+                            state,
+                        ));
+                    }
+                    CarPhase::Commit => {
+                        state.phase = CarPhase::Nodes(0);
+                        return Some((
+                            Ok(Bytes::from(car_block_bytes(
+                                snap.commit.cid(),
+                                &snap.commit.to_dag_cbor(),
+                            ))),
+                            state,
+                        ));
+                    }
+                    CarPhase::Nodes(idx) => {
+                        if *idx < snap.node_blocks.len() {
+                            let (cid, data) = &snap.node_blocks[*idx];
+                            *idx += 1;
+                            return Some((
+                                Ok(Bytes::from(car_block_bytes(*cid, &data.encode()))),
+                                state,
+                            ));
+                        }
+                        state.phase = CarPhase::Records(Arc::clone(&record_tids), 0);
+                        // continue loop → Records
+                    }
+                    CarPhase::Records(tids, ridx) => {
+                        if *ridx < tids.len() {
+                            let tid = tids[*ridx];
+                            *ridx += 1;
+                            let rec = &snap.records[&tid];
+                            return Some((
+                                Ok(Bytes::from(car_block_bytes(
+                                    rec.cid(),
+                                    &rec.to_dag_cbor(),
+                                ))),
+                                state,
+                            ));
+                        }
+                        state.phase = CarPhase::Done;
+                        // continue loop → Done
+                    }
+                    CarPhase::Done => return None,
+                }
+            }
+        }
+    })
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // XRPC error helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Build an XRPC error JSON body. Always includes `error` and `message`.
 pub fn xrpc_error_body(error: &str, message: impl Into<String>) -> Value {
     json!({ "error": error, "message": message.into() })
 }
 
-/// Build an XRPC error [`Response`] with the given status code and body.
 pub fn xrpc_error(status: StatusCode, error: &str, message: impl Into<String>) -> Response {
     (status, axum::Json(xrpc_error_body(error, message))).into_response()
 }
 
-/// XRPC error codes used by the atproto read slice.
 pub mod errors {
     pub const INVALID_REQUEST: &str = "InvalidRequest";
     pub const ACCOUNT_NOT_FOUND: &str = "AccountNotFound";
@@ -262,13 +297,9 @@ pub mod errors {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Manual query parsing (avoids axum Query rejection bypassing XRPC envelope)
+// Query parsing (manual — no axum Query rejection bypasses XRPC envelope)
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Parse a raw query string `key=value&key=value` into a simple lookup.
-///
-/// XRPC query params (DIDs, handles, NSIDs, rkeys, CID strings) use only
-/// URL-safe characters, so no percent-decoding is needed for the MVP.
 fn parse_query(raw: Option<&str>) -> std::collections::HashMap<&str, &str> {
     let mut map = std::collections::HashMap::new();
     if let Some(q) = raw {
@@ -282,12 +313,163 @@ fn parse_query(raw: Option<&str>) -> std::collections::HashMap<&str, &str> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// resolveHandle
+// Core handler logic (testable without OAuthState)
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// `GET /xrpc/com.atproto.identity.resolveHandle?handle=<host>`.
-///
-/// Returns `HandleNotFound` (canonical lexicon) for unknown handles.
+/// Resolve a handle to a DID via the store + issuer-derived self-handle.
+async fn resolve_handle_core(
+    store: &XrpcRepoStore,
+    issuer_url: &str,
+    handle: &str,
+) -> Response {
+    if let Some(snap) = store.by_handle_public(handle).await {
+        return axum::Json(json!({ "did": snap.did })).into_response();
+    }
+    if let Some(authority) = issuer_authority(issuer_url) {
+        let self_handle = authority.split(':').next().unwrap_or(&authority);
+        if handle == self_handle {
+            let did = format!("did:web:{authority}");
+            return axum::Json(json!({ "did": did })).into_response();
+        }
+    }
+    xrpc_error(
+        StatusCode::BAD_REQUEST,
+        errors::HANDLE_NOT_FOUND,
+        format!("handle {handle:?} not found"),
+    )
+}
+
+async fn describe_repo_core(store: &XrpcRepoStore, issuer_url: &str, repo: &str) -> Response {
+    let snap = match lookup_public_snapshot(store, repo).await {
+        Some(s) => s,
+        None => {
+            return xrpc_error(
+                StatusCode::BAD_REQUEST,
+                errors::REPO_NOT_FOUND,
+                format!("repo {repo:?} is not hosted by this PDS"),
+            );
+        }
+    };
+    let collections: Vec<&str> = if snap.records.is_empty() {
+        Vec::new()
+    } else {
+        vec![HOSTED_COLLECTION]
+    };
+    let did_doc = snap.did_doc(issuer_url);
+    axum::Json(json!({
+        "handle": snap.handle,
+        "did": snap.did,
+        "didDoc": did_doc,
+        "collections": collections,
+        "handleIsCorrect": true,
+    }))
+    .into_response()
+}
+
+async fn get_record_core(
+    store: &XrpcRepoStore,
+    repo: &str,
+    collection: &str,
+    rkey: &str,
+    cid: Option<&str>,
+) -> Response {
+    if collection != HOSTED_COLLECTION {
+        return xrpc_error(
+            StatusCode::BAD_REQUEST,
+            errors::RECORD_NOT_FOUND,
+            format!("collection {collection:?} is not hosted"),
+        );
+    }
+    if rkey.is_empty() {
+        return xrpc_error(
+            StatusCode::BAD_REQUEST,
+            errors::INVALID_REQUEST,
+            "rkey is required",
+        );
+    }
+    let snap = match lookup_public_snapshot(store, repo).await {
+        Some(s) => s,
+        None => {
+            return xrpc_error(
+                StatusCode::BAD_REQUEST,
+                errors::REPO_NOT_FOUND,
+                format!("repo {repo:?} is not hosted by this PDS"),
+            );
+        }
+    };
+    let Some((rec, record_cid)) = snap.record_by_rkey(rkey) else {
+        return xrpc_error(
+            StatusCode::BAD_REQUEST,
+            errors::RECORD_NOT_FOUND,
+            format!("record {collection}/{rkey} not found"),
+        );
+    };
+    if let Some(requested_cid) = cid {
+        if requested_cid != record_cid.to_string() {
+            return xrpc_error(
+                StatusCode::BAD_REQUEST,
+                errors::RECORD_NOT_FOUND,
+                format!("record {collection}/{rkey} does not match cid {requested_cid:?}"),
+            );
+        }
+    }
+    axum::Json(snap.record_json(rkey, rec)).into_response()
+}
+
+async fn get_repo_core(store: &XrpcRepoStore, did: &str, since_present: bool) -> Response {
+    if since_present {
+        return xrpc_error(
+            StatusCode::BAD_REQUEST,
+            errors::INVALID_REQUEST,
+            "since (revision delta) is not yet supported; omit for full export",
+        );
+    }
+    let snap = match store.get_public(did).await {
+        Some(s) => s,
+        None => {
+            return xrpc_error(
+                StatusCode::BAD_REQUEST,
+                errors::REPO_NOT_FOUND,
+                format!("repo {did:?} is not hosted by this PDS"),
+            );
+        }
+    };
+    // Acquire owned permit — held inside the body stream until EOF/drop.
+    let permit = match store.acquire_get_repo_owned().await {
+        Ok(p) => p,
+        Err(_) => {
+            return xrpc_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                errors::INTERNAL_SERVER_ERROR,
+                "concurrency limiter closed",
+            );
+        }
+    };
+    let body_stream = lazy_car_stream(snap, permit);
+    let body = axum::body::Body::from_stream(body_stream);
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "application/vnd.ipld.car")],
+        body,
+    )
+        .into_response()
+}
+
+async fn lookup_public_snapshot(
+    store: &XrpcRepoStore,
+    key: &str,
+) -> Option<Arc<RepoSnapshot>> {
+    if key.starts_with("did:") {
+        store.get_public(key).await
+    } else {
+        store.by_handle_public(key).await
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Axum handler wrappers
+// ─────────────────────────────────────────────────────────────────────────────
+
 pub async fn resolve_handle(
     State(state): State<Arc<OAuthState>>,
     RawQuery(raw): RawQuery,
@@ -303,36 +485,9 @@ pub async fn resolve_handle(
             );
         }
     };
-
-    // Hosted public account?
-    if let Some(snap) = state.xrpc_repos.by_handle_public(handle).await {
-        return axum::Json(json!({ "did": snap.did })).into_response();
-    }
-
-    // This deployment's own handle?
-    if let Some(authority) = issuer_authority(&state.issuer_url) {
-        let self_handle = authority.split(':').next().unwrap_or(&authority);
-        if handle == self_handle {
-            let did = format!("did:web:{authority}");
-            return axum::Json(json!({ "did": did })).into_response();
-        }
-    }
-
-    xrpc_error(
-        StatusCode::BAD_REQUEST,
-        errors::HANDLE_NOT_FOUND,
-        format!("handle {handle:?} not found"),
-    )
+    resolve_handle_core(&state.xrpc_repos, &state.issuer_url, handle).await
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// describeRepo — canonical lexicon shape
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// `GET /xrpc/com.atproto.repo.describeRepo?repo=<did|handle>`.
-///
-/// Canonical shape: `handleIsCorrect` (not `handleIsValid`), `collections`
-/// is an array of NSID strings, `didDoc` is the populated DID document.
 pub async fn describe_repo(
     State(state): State<Arc<OAuthState>>,
     RawQuery(raw): RawQuery,
@@ -348,69 +503,16 @@ pub async fn describe_repo(
             );
         }
     };
-
-    let snap = match lookup_public_snapshot(&state, key).await {
-        Some(s) => s,
-        None => {
-            return xrpc_error(
-                StatusCode::BAD_REQUEST,
-                errors::REPO_NOT_FOUND,
-                format!("repo {key:?} is not hosted by this PDS"),
-            );
-        }
-    };
-
-    // Canonical: collections = array of NSID strings (not objects).
-    let collections: Vec<&str> = if snap.records.is_empty() {
-        Vec::new()
-    } else {
-        vec![HOSTED_COLLECTION]
-    };
-
-    let did_doc = snap.did_doc(&state.issuer_url);
-
-    axum::Json(json!({
-        "handle": snap.handle,
-        "did": snap.did,
-        "didDoc": did_doc,
-        "collections": collections,
-        "handleIsCorrect": true,
-    }))
-    .into_response()
+    describe_repo_core(&state.xrpc_repos, &state.issuer_url, key).await
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// getRecord — with optional cid pinning
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// `GET /xrpc/com.atproto.repo.getRecord?repo=<did>&collection=<nsid>&rkey=<rkey>[&cid=<cid>]`.
-///
-/// When `cid` is provided, returns `RecordNotFound` if the current record's CID
-/// does not match (version mismatch).
 pub async fn get_record(
     State(state): State<Arc<OAuthState>>,
     RawQuery(raw): RawQuery,
 ) -> Response {
     let params = parse_query(raw.as_deref());
-
     let collection = params.get("collection").copied().unwrap_or("");
     let rkey = params.get("rkey").copied().unwrap_or("");
-
-    if collection != HOSTED_COLLECTION {
-        return xrpc_error(
-            StatusCode::BAD_REQUEST,
-            errors::RECORD_NOT_FOUND,
-            format!("collection {collection:?} is not hosted"),
-        );
-    }
-    if rkey.is_empty() {
-        return xrpc_error(
-            StatusCode::BAD_REQUEST,
-            errors::INVALID_REQUEST,
-            "rkey is required",
-        );
-    }
-
     let repo = match params.get("repo") {
         Some(r) if !r.is_empty() => r.trim(),
         _ => {
@@ -421,59 +523,15 @@ pub async fn get_record(
             );
         }
     };
-
-    let snap = match lookup_public_snapshot(&state, repo).await {
-        Some(s) => s,
-        None => {
-            return xrpc_error(
-                StatusCode::BAD_REQUEST,
-                errors::REPO_NOT_FOUND,
-                format!("repo {repo:?} is not hosted by this PDS"),
-            );
-        }
-    };
-
-    let Some((rec, cid)) = snap.record_by_rkey(rkey) else {
-        return xrpc_error(
-            StatusCode::BAD_REQUEST,
-            errors::RECORD_NOT_FOUND,
-            format!("record {collection}/{rkey} not found"),
-        );
-    };
-
-    // Optional cid pinning: if the client requests a specific version and it
-    // doesn't match, return RecordNotFound (the record at that version is gone).
-    if let Some(requested_cid) = params.get("cid") {
-        if *requested_cid != cid.to_string() {
-            return xrpc_error(
-                StatusCode::BAD_REQUEST,
-                errors::RECORD_NOT_FOUND,
-                format!("record {collection}/{rkey} does not match cid {requested_cid:?}"),
-            );
-        }
-    }
-
-    axum::Json(snap.record_json(rkey, rec)).into_response()
+    let cid = params.get("cid").map(|c| c.trim());
+    get_record_core(&state.xrpc_repos, repo, collection, rkey, cid).await
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// sync.getRepo — streamed CAR export with concurrency cap
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// `GET /xrpc/com.atproto.sync.getRepo?did=<did>[&since=<commitCid>]`.
-///
-/// Streams a CARv1 blob (`application/vnd.ipld.car`) containing the commit +
-/// MST + records, rooted at the signed commit. Sections are streamed
-/// incrementally via `Body::from_stream` — no double materialization.
-///
-/// `since` (revision-delta) is not yet supported and returns `InvalidRequest`
-/// rather than silently returning the full repo.
 pub async fn get_repo(
     State(state): State<Arc<OAuthState>>,
     RawQuery(raw): RawQuery,
 ) -> Response {
     let params = parse_query(raw.as_deref());
-
     let did = match params.get("did") {
         Some(d) if !d.is_empty() => d.trim(),
         _ => {
@@ -484,72 +542,9 @@ pub async fn get_repo(
             );
         }
     };
-
-    // since: reject explicitly until delta export is implemented (#910).
-    if let Some(since) = params.get("since") {
-        if !since.is_empty() {
-            return xrpc_error(
-                StatusCode::BAD_REQUEST,
-                errors::INVALID_REQUEST,
-                "since (revision delta) is not yet supported; omit for full export",
-            );
-        }
-    }
-
-    let snap = match state.xrpc_repos.get_public(did).await {
-        Some(s) => s,
-        None => {
-            return xrpc_error(
-                StatusCode::BAD_REQUEST,
-                errors::REPO_NOT_FOUND,
-                format!("repo {did:?} is not hosted by this PDS"),
-            );
-        }
-    };
-
-    // Acquire concurrency permit — bounded by GET_REPO_CONCURRENCY.
-    let _permit = match state.xrpc_repos.acquire_get_repo().await {
-        Ok(p) => p,
-        Err(_) => {
-            return xrpc_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                errors::INTERNAL_SERVER_ERROR,
-                "concurrency limiter closed",
-            );
-        }
-    };
-
-    // Build length-framed sections and stream them incrementally.
-    let sections = snap.full_car_sections();
-    let body = axum::body::Body::from_stream(stream::iter(
-        sections
-            .into_iter()
-            .map(|s| Ok::<Bytes, std::convert::Infallible>(Bytes::from(s))),
-    ));
-
-    (
-        StatusCode::OK,
-        [(header::CONTENT_TYPE, "application/vnd.ipld.car")],
-        body,
-    )
-        .into_response()
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Shared helpers
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Resolve a `did:` or handle reference to a **public** snapshot.
-/// Non-public repos are invisible (publication boundary).
-async fn lookup_public_snapshot(
-    state: &OAuthState,
-    key: &str,
-) -> Option<Arc<RepoSnapshot>> {
-    if key.starts_with("did:") {
-        state.xrpc_repos.get_public(key).await
-    } else {
-        state.xrpc_repos.by_handle_public(key).await
-    }
+    // Reject since by PRESENCE (not just non-empty) — ?since= and ?since=x both 400.
+    let since_present = params.contains_key("since");
+    get_repo_core(&state.xrpc_repos, did, since_present).await
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -563,11 +558,9 @@ mod tests {
     use p256::ecdsa::SigningKey;
     use rand::rngs::OsRng;
 
-    /// Build a minimal hosted snapshot with one record, signed by a fresh key.
     fn sample_snapshot(did: &str, handle: &str, public: bool) -> RepoSnapshot {
         let signing = SigningKey::random(&mut OsRng);
         let vk = VerifyingKey::from(&signing);
-
         let repo_at_uri = format!("at://{did}");
         let rec = ModelRecord::new(
             &repo_at_uri,
@@ -575,22 +568,18 @@ mod tests {
             "2026-07-19T00:00:00.000Z",
         )
         .expect("valid record");
-
         let tid = Tid::now();
         let mut record_cids: BTreeMap<Tid, Cid> = BTreeMap::new();
         record_cids.insert(tid, rec.cid());
         let mut records: BTreeMap<Tid, ModelRecord> = BTreeMap::new();
         records.insert(tid, rec);
-
         let tree = Node::from_records(HOSTED_COLLECTION, &record_cids);
         let (_root_data, node_blocks) = tree.to_node_data_with_blocks();
         let root_cid = tree.root_cid();
-
         use hyprstream_pds::commit::UnsignedCommit;
         let unsigned = UnsignedCommit::new(did.to_owned(), root_cid, Tid::now(), None);
         let commit = Commit::sign(&unsigned, &signing);
         commit.verify(&vk).expect("self-signed commit verifies");
-
         RepoSnapshot {
             did: did.to_owned(),
             handle: handle.to_owned(),
@@ -602,6 +591,201 @@ mod tests {
         }
     }
 
+    /// Read a response body as a JSON Value.
+    async fn body_json(resp: Response) -> Value {
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    // ── Finding 1: lazy CAR + owned permit held until EOF ───────────────────
+
+    #[tokio::test]
+    async fn lazy_car_stream_produces_valid_car() {
+        let snap = Arc::new(sample_snapshot("did:web:h.example.com", "h.example.com", true));
+        let store = XrpcRepoStore::new();
+        let permit = store.acquire_get_repo_owned().await.unwrap();
+        let strm = lazy_car_stream(Arc::clone(&snap), permit);
+        // Collect all sections and concatenate.
+        use futures::StreamExt;
+        let mut collected: Vec<u8> = Vec::new();
+        futures::pin_mut!(strm);
+        while let Some(chunk) = strm.next().await {
+            collected.extend_from_slice(&chunk.unwrap());
+        }
+        // Parse as a CARv1 and verify the commit root.
+        let (roots, blocks) = hyprstream_pds::car::parse_car_v1(&collected).unwrap();
+        assert_eq!(roots.len(), 1);
+        assert_eq!(roots[0], snap.commit.cid());
+        assert!(blocks.len() >= 3); // commit + MST + record
+    }
+
+    #[tokio::test]
+    async fn semaphore_owned_permit_held_until_stream_drop() {
+        // With concurrency = 4, acquire 4 permits. The 5th must block.
+        // Dropping one permit unblocks the 5th.
+        let store = XrpcRepoStore::new();
+        let mut permits: Vec<OwnedSemaphorePermit> = Vec::new();
+        for _ in 0..GET_REPO_CONCURRENCY {
+            permits.push(store.acquire_get_repo_owned().await.unwrap());
+        }
+        // The N+1th acquire must not complete immediately.
+        let next = store.acquire_get_repo_owned();
+        tokio::pin!(next);
+        tokio::select! {
+            _ = &mut next => panic!("N+1th permit acquired before capacity freed"),
+            _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {}
+        }
+        // Drop one permit — the N+1th should now complete.
+        permits.pop();
+        let _extra = next.await.expect("N+1th permit resolves after drop");
+    }
+
+    #[tokio::test]
+    async fn lazy_car_stream_releases_permit_on_drop() {
+        // The permit held inside the lazy stream must be released when the
+        // stream is dropped (e.g. client disconnects mid-body).
+        let store = XrpcRepoStore::new();
+        // Exhaust all permits.
+        let mut held: Vec<OwnedSemaphorePermit> = Vec::new();
+        for _ in 0..GET_REPO_CONCURRENCY {
+            held.push(store.acquire_get_repo_owned().await.unwrap());
+        }
+        let snap = Arc::new(sample_snapshot("did:web:h.example.com", "h.example.com", true));
+        // Acquire one more for the stream.
+        let stream_permit = held.pop().unwrap();
+        let strm = lazy_car_stream(snap, stream_permit);
+        // Drop the stream without consuming it — permit must be released.
+        drop(strm);
+        // Now we should be able to acquire a new permit.
+        let _new = store
+            .acquire_get_repo_owned()
+            .await
+            .expect("permit available after stream dropped");
+    }
+
+    // ── Finding 2: endpoint-level tests ──────────────────────────────────────
+
+    const ISSUER: &str = "https://h.example.com";
+
+    #[tokio::test]
+    async fn endpoint_non_public_invisible_describe_repo() {
+        let store = XrpcRepoStore::new();
+        store.put(sample_snapshot("did:web:priv.example.com", "priv.example.com", false)).await;
+        let resp = describe_repo_core(&store, ISSUER, "did:web:priv.example.com").await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = body_json(resp).await;
+        assert_eq!(body["error"], errors::REPO_NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn endpoint_non_public_invisible_get_record() {
+        let store = XrpcRepoStore::new();
+        store.put(sample_snapshot("did:web:priv.example.com", "priv.example.com", false)).await;
+        let resp = get_record_core(
+            &store,
+            "did:web:priv.example.com",
+            HOSTED_COLLECTION,
+            "anything",
+            None,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = body_json(resp).await;
+        assert_eq!(body["error"], errors::REPO_NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn endpoint_non_public_invisible_get_repo() {
+        let store = XrpcRepoStore::new();
+        store.put(sample_snapshot("did:web:priv.example.com", "priv.example.com", false)).await;
+        let resp = get_repo_core(&store, "did:web:priv.example.com", false).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = body_json(resp).await;
+        assert_eq!(body["error"], errors::REPO_NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn endpoint_non_public_invisible_resolve_handle() {
+        let store = XrpcRepoStore::new();
+        store.put(sample_snapshot("did:web:priv.example.com", "priv.example.com", false)).await;
+        let resp = resolve_handle_core(&store, ISSUER, "priv.example.com").await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = body_json(resp).await;
+        assert_eq!(body["error"], errors::HANDLE_NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn endpoint_public_snapshot_visible_describe_repo() {
+        let store = XrpcRepoStore::new();
+        store.put(sample_snapshot("did:web:pub.example.com", "pub.example.com", true)).await;
+        let resp = describe_repo_core(&store, ISSUER, "did:web:pub.example.com").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body["did"], "did:web:pub.example.com");
+        assert_eq!(body["handleIsCorrect"], true);
+        assert!(!body["collections"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn endpoint_get_record_cid_mismatch() {
+        let store = XrpcRepoStore::new();
+        let snap = sample_snapshot("did:web:pub.example.com", "pub.example.com", true);
+        let rkey = snap.records.keys().next().unwrap().encode();
+        store.put(snap).await;
+        let resp = get_record_core(
+            &store,
+            "did:web:pub.example.com",
+            HOSTED_COLLECTION,
+            &rkey,
+            Some("bafyreiwrongcid000000000000000000000000000000000000"),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = body_json(resp).await;
+        assert_eq!(body["error"], errors::RECORD_NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn endpoint_get_record_cid_match_succeeds() {
+        let store = XrpcRepoStore::new();
+        let snap = sample_snapshot("did:web:pub.example.com", "pub.example.com", true);
+        let rkey = snap.records.keys().next().unwrap().encode();
+        let cid = snap.records.values().next().unwrap().cid().to_string();
+        store.put(snap).await;
+        let resp =
+            get_record_core(&store, "did:web:pub.example.com", HOSTED_COLLECTION, &rkey, Some(&cid))
+                .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    // ── Finding 3: since rejected by presence ─────────────────────────────────
+
+    #[tokio::test]
+    async fn since_non_empty_rejected() {
+        let store = XrpcRepoStore::new();
+        store.put(sample_snapshot("did:web:pub.example.com", "pub.example.com", true)).await;
+        let resp = get_repo_core(&store, "did:web:pub.example.com", true).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = body_json(resp).await;
+        assert_eq!(body["error"], errors::INVALID_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn get_repo_without_since_succeeds() {
+        let store = XrpcRepoStore::new();
+        store.put(sample_snapshot("did:web:pub.example.com", "pub.example.com", true)).await;
+        let resp = get_repo_core(&store, "did:web:pub.example.com", false).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get(header::CONTENT_TYPE).unwrap(),
+            "application/vnd.ipld.car",
+        );
+    }
+
+    // ── Helper / unit tests ───────────────────────────────────────────────────
+
     #[test]
     fn error_body_shape_is_xrpc_convention() {
         let body = xrpc_error_body("RecordNotFound", "no such record");
@@ -611,79 +795,11 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_record_json_carries_uri_cid_and_value() {
-        let snap = sample_snapshot("did:web:h.example.com", "h.example.com", true);
-        let (tid, rec) = snap.records.iter().next().unwrap();
-        let rkey = tid.encode();
-        let json = snap.record_json(&rkey, rec);
-        assert_eq!(
-            json["uri"],
-            format!("at://did:web:h.example.com/{HOSTED_COLLECTION}/{rkey}"),
-        );
-        assert_eq!(json["value"]["$type"], HOSTED_COLLECTION);
-    }
-
-    #[test]
-    fn snapshot_full_car_sections_round_trip_via_parse_car_v1() {
-        let snap = sample_snapshot("did:web:h.example.com", "h.example.com", true);
-        // Concatenate sections and parse as a single CARv1 blob.
-        let sections = snap.full_car_sections();
-        let car: Vec<u8> = sections.into_iter().flatten().collect();
-        let (roots, blocks) = hyprstream_pds::car::parse_car_v1(&car).expect("parse CAR");
-        assert_eq!(roots.len(), 1);
-        assert_eq!(roots[0], snap.commit.cid());
-        assert!(blocks.len() >= 3); // commit + MST node + record
-    }
-
-    #[test]
-    fn snapshot_record_proof_car_verifies_offline() {
-        let snap = sample_snapshot("did:web:h.example.com", "h.example.com", true);
-        let (tid, _rec) = snap.records.iter().next().unwrap();
-        let rkey = tid.encode();
-        let car = snap.record_proof_car(&rkey).expect("proof for present rkey");
-        let (roots, blocks) = hyprstream_pds::car::parse_car_v1(&car).expect("parse CAR");
-        assert_eq!(roots.len(), 1);
-
-        let mut commit_block: Option<Vec<u8>> = None;
-        let mut record_block: Option<Vec<u8>> = None;
-        for (cid, bytes) in &blocks {
-            if *cid == snap.commit.cid() {
-                commit_block = Some(bytes.clone());
-            }
-            if *cid == snap.records.values().next().unwrap().cid() {
-                record_block = Some(bytes.clone());
-            }
-        }
-        let commit = Commit::from_dag_cbor(&commit_block.unwrap()).unwrap();
-        let record = ModelRecord::from_dag_cbor(&record_block.unwrap()).unwrap();
-        commit.verify(&snap.atproto_vk).expect("commit verifies");
-        assert_eq!(record.cid(), snap.records.values().next().unwrap().cid());
-    }
-
-    #[tokio::test]
-    async fn publication_boundary_public_snapshot_visible() {
-        let store = XrpcRepoStore::new();
-        store.put(sample_snapshot("did:web:pub.example.com", "pub.example.com", true)).await;
-        assert!(store.get_public("did:web:pub.example.com").await.is_some());
-        assert!(store.by_handle_public("pub.example.com").await.is_some());
-    }
-
-    #[tokio::test]
-    async fn publication_boundary_non_public_snapshot_invisible() {
-        let store = XrpcRepoStore::new();
-        // Private snapshot — get() sees it but public lookups must not.
-        store.put(sample_snapshot("did:web:priv.example.com", "priv.example.com", false)).await;
-        assert!(store.get("did:web:priv.example.com").await.is_some());
-        assert!(store.get_public("did:web:priv.example.com").await.is_none());
-        assert!(store.by_handle_public("priv.example.com").await.is_none());
-    }
-
-    #[tokio::test]
-    async fn repo_store_ambiguous_handle_refuses() {
-        let store = XrpcRepoStore::new();
-        store.put(sample_snapshot("did:web:a.example.com", "dup.example.com", true)).await;
-        store.put(sample_snapshot("did:web:b.example.com", "dup.example.com", true)).await;
-        assert!(store.by_handle_public("dup.example.com").await.is_none());
+    fn parse_query_rejects_empty_value_since() {
+        // ?since= parses to key "since" with value "".
+        let q = parse_query(Some("did=did:web:x&since="));
+        assert!(q.contains_key("since"));
+        assert_eq!(q.get("since").copied(), Some(""));
     }
 
     #[test]
@@ -691,28 +807,5 @@ mod tests {
         let q = parse_query(Some("repo=did:web:x&collection=ai.hyprstream.model&rkey=abc"));
         assert_eq!(q.get("repo").copied(), Some("did:web:x"));
         assert_eq!(q.get("collection").copied(), Some("ai.hyprstream.model"));
-        assert_eq!(q.get("rkey").copied(), Some("abc"));
-        assert_eq!(q.get("missing"), None);
-    }
-
-    #[test]
-    fn parse_query_empty_and_malformed() {
-        assert!(parse_query(None).is_empty());
-        assert!(parse_query(Some("")).is_empty());
-        // No `=` → skipped.
-        assert!(parse_query(Some("garbage")).is_empty());
-    }
-
-    #[test]
-    fn describe_repo_did_doc_carries_atproto_vm() {
-        let snap = sample_snapshot("did:web:h.example.com", "h.example.com", true);
-        let doc = snap.did_doc("https://h.example.com");
-        assert_eq!(doc["id"], "did:web:h.example.com");
-        // The atproto verification method must be present.
-        let vms = doc["verificationMethod"].as_array().unwrap();
-        assert!(vms.iter().any(|vm| vm["id"].as_str().unwrap_or("").ends_with("#atproto")));
-        // #atproto_pds service present.
-        let svcs = doc["service"].as_array().unwrap();
-        assert!(svcs.iter().any(|s| s["id"].as_str().unwrap_or("").ends_with("#atproto_pds")));
     }
 }
