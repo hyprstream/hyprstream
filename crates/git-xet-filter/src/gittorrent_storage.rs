@@ -81,7 +81,16 @@ impl GittorrentStorage {
     /// Fetch reconstruction bytes for a Merkle hash without committing any
     /// CID binding. The returned flag is `true` when the bytes did not come
     /// from the already-validated local p2p store and should be persisted by
-    /// the caller only after end-to-end validation.
+    /// the caller only after end-to-end validation — i.e. when they arrived
+    /// via the HTTPS fallback OR via an uncommitted provider hit on a
+    /// non-self-verifying (XET Merkle) CID. The flag is `false` only when
+    /// the service reports the bytes as committed (local store hit or a
+    /// self-verifying fetch that the service committed itself).
+    ///
+    /// Provenance is taken structurally from
+    /// [`GitTorrentService::get_object_by_cid_with_provenance`]; it is never
+    /// assumed from the mere fact of a P2P hit, because the service returns
+    /// provider-fetched XET Merkle bytes without committing them.
     ///
     /// This is an internal helper rather than a [`StorageBackend`] method:
     /// the trait exposes only the `smudge_*` surface, and the extra
@@ -94,9 +103,13 @@ impl GittorrentStorage {
             )
         })?;
 
-        // Try P2P first
-        match self.service.get_object_by_cid(&cid).await {
-            Ok(Some(data)) => return Ok((data, false)),
+        // Try P2P first. Propagate commit provenance rather than assuming
+        // every P2P hit is already-validated: a non-self-verifying CID
+        // (XET Merkle addresses the reconstruction DAG, not the raw file)
+        // is returned uncommitted by the service, and only the caller's
+        // end-to-end size + SHA-256 check can license persisting it.
+        match self.service.get_object_by_cid_with_provenance(&cid).await {
+            Ok(Some(fetch)) => return Ok((fetch.data, !fetch.committed)),
             Ok(None) => {
                 tracing::debug!("Object {} not found in DHT, trying fallback", hash);
             }
@@ -289,5 +302,135 @@ mod tests {
         assert!(GittorrentPointer::parse("not a pointer").is_err());
         let legacy = r#"{"xet":"gittorrent","sha256":"abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789","size":1}"#;
         assert!(GittorrentPointer::parse(legacy).is_err());
+    }
+}
+
+/// Provider-side regression coverage (#1115). These tests drive a real
+/// `GitTorrentService` through its public `testing` mocks so the XET smudge
+/// path — provenance propagation, end-to-end validation, and the persist
+/// gate — flows through production code.
+#[cfg(all(test, feature = "gittorrent-transport"))]
+mod provider_fetch_tests {
+    use super::*;
+    use crate::storage::StorageBackend;
+    use hyprstream_p2p::locator::PeerContact;
+    use hyprstream_p2p::service::testing::{
+        new_service_with_mocks, test_config, MockBlobFetcher, MockObjectLocator,
+    };
+    use hyprstream_p2p::ContentCid;
+    use std::net::{Ipv4Addr, SocketAddrV4};
+    use std::sync::Arc;
+    use tempfile::TempDir;
+
+    fn p2p_err(e: hyprstream_p2p::Error) -> XetError {
+        XetError::new(XetErrorKind::DownloadFailed, e.to_string())
+    }
+
+    fn io_err(e: std::io::Error) -> XetError {
+        XetError::new(XetErrorKind::IoError, e.to_string())
+    }
+
+    /// Build a storage backed by a mock object plane that advertises `data`
+    /// under `merkle_bytes` from a single local provider.
+    async fn storage_with_provider(
+        temp: &TempDir,
+        merkle_bytes: [u8; 32],
+        data: Vec<u8>,
+    ) -> Result<(
+        GittorrentStorage,
+        Arc<MockObjectLocator>,
+        Arc<MockBlobFetcher>,
+    )> {
+        let locator = Arc::new(MockObjectLocator::default());
+        let fetcher = Arc::new(MockBlobFetcher::default());
+        let service =
+            new_service_with_mocks(test_config(temp.path()), locator.clone(), fetcher.clone())
+                .await
+                .map_err(p2p_err)?;
+        let cid = ContentCid::xet_merkle(&merkle_bytes).map_err(p2p_err)?;
+        locator
+            .add_provider_for_content(
+                &cid,
+                PeerContact::untrusted(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 6881)),
+            )
+            .await;
+        fetcher.insert_raw(cid, data).await;
+        Ok((
+            GittorrentStorage::new(Arc::new(service), None),
+            locator,
+            fetcher,
+        ))
+    }
+
+    fn pointer_json(merkle_hex: &str, sha256_hex: &str, size: u64) -> String {
+        serde_json::json!({
+            "xet": "gittorrent",
+            "xet-merkle": merkle_hex,
+            "sha256": sha256_hex,
+            "size": size,
+        })
+        .to_string()
+    }
+
+    /// Regression for #1115: provider-fetched XET Merkle bytes that pass the
+    /// pointer's end-to-end size + SHA-256 check MUST be persisted to the
+    /// p2p object plane. Before the provenance fix, `fetch_from_hash` mapped
+    /// every P2P hit to `uncommitted = false`, so `smudge_bytes` skipped the
+    /// persist and the next fetch re-hit the provider.
+    #[tokio::test]
+    async fn provider_fetched_xet_bytes_are_persisted_after_validation() -> Result<()> {
+        let temp = TempDir::new().map_err(io_err)?;
+        let data = b"xet payload from provider".to_vec();
+        let merkle_bytes = [0x7f_u8; 32];
+        let merkle_hex: String = merkle_bytes.iter().map(|b| format!("{b:02x}")).collect();
+        let sha256 = hyprstream_p2p::crypto::hash::sha256_git(&data).map_err(p2p_err)?;
+        let (storage, _locator, fetcher) =
+            storage_with_provider(&temp, merkle_bytes, data.clone()).await?;
+        let pointer = pointer_json(&merkle_hex, &sha256.to_string(), data.len() as u64);
+
+        // First smudge: provider fetch + end-to-end validation + persist.
+        let smudged = storage.smudge_bytes(&pointer).await?;
+        assert_eq!(smudged, data);
+        assert_eq!(fetcher.calls().await, 1, "first smudge hits the provider");
+
+        // Second smudge: bytes are now committed locally, so the provider is
+        // NOT consulted again. Before the fix this re-fetched (calls == 2)
+        // because the unvalidated provider bytes were never persisted.
+        let smudged_again = storage.smudge_bytes(&pointer).await?;
+        assert_eq!(smudged_again, data);
+        assert_eq!(
+            fetcher.calls().await,
+            1,
+            "validated provider bytes are served from the local store on retry"
+        );
+        Ok(())
+    }
+
+    /// The persistence gate must NOT fire when validation fails: a provider
+    /// returning the wrong bytes is rejected, not persisted.
+    #[tokio::test]
+    async fn provider_fetched_xet_bytes_with_wrong_sha256_are_rejected() -> Result<()> {
+        let temp = TempDir::new().map_err(io_err)?;
+        let bogus = b"definitely not the real payload".to_vec();
+        let real_sha =
+            hyprstream_p2p::crypto::hash::sha256_git(b"the real payload").map_err(p2p_err)?;
+        let merkle_bytes = [0x33_u8; 32];
+        let merkle_hex: String = merkle_bytes.iter().map(|b| format!("{b:02x}")).collect();
+        let (storage, _locator, _fetcher) =
+            storage_with_provider(&temp, merkle_bytes, bogus).await?;
+        // Pointer describes the real payload; provider serves something else.
+        let pointer = pointer_json(&merkle_hex, &real_sha.to_string(), 16);
+
+        match storage.smudge_bytes(&pointer).await {
+            Err(err) => assert!(
+                matches!(err.kind(), XetErrorKind::DownloadFailed),
+                "validation failure must surface as DownloadFailed, got {:?}",
+                err.kind()
+            ),
+            Ok(bytes) => {
+                panic!("validation must reject provider bytes with wrong SHA-256; got {bytes:?}")
+            }
+        }
+        Ok(())
     }
 }

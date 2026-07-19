@@ -98,6 +98,11 @@ quote = "1"
 default = []
 # Enable additional debug logging
 debug = []
+# Expose the `service::testing` module (in-memory mock object plane) so
+# downstream crates can write regression tests against a real
+# `GitTorrentService` with deterministic provider behavior. No production
+# impact; compiled under `cfg(test)` automatically.
+testing = []
 # F3 (#901) retired the libp2p Kademlia stack. iroh-blobs + the mainline
 # locator are now the unconditional object plane (non-optional deps above).
 # These names remain as no-op markers so existing `--features` flags (e.g. the
