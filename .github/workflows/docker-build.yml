@@ -127,3 +127,100 @@ jobs:
         sudo apt-get autoremove -y || true
         echo "=== Disk usage after cleanup ==="
         df -h
+
+  # ==========================================================================
+  # Native linux/arm64 CPU image (closes #1012)
+  # ==========================================================================
+  # Built on the self-hosted Graviton (arm64 / Rocky-10 / rootless-podman)
+  # runner — the SAME layer graviton-build-validate.yml, build-image.yml, and
+  # the rust.yml merge-gate use. Native arm64 is used INSTEAD of QEMU
+  # emulation because emulated Rust + libtorch builds time out at the link step.
+  #
+  # The golden AMI exposes rootless podman only (no /var/run/docker.sock — see
+  # the rust.yml header comment), so this leg drives `podman build`/`podman
+  # push` directly and CANNOT use docker/build-push-action like the amd64 leg.
+  #
+  # Tag scheme (GHCR; consumed by the AWS rocky10 arm64 quadlets):
+  #   v1.2.3-cpu-arm64   — immutable, on v*.*.* release tags
+  #   1.2-cpu-arm64      — rolling major.minor, on v*.*.* release tags
+  #   latest-cpu-arm64   — moving, on default-branch (main) builds
+  #   edge-cpu-arm64     — moving HEAD-of-main pointer
+  # The amd64 cpu/cuda/rocm variants stay on the github-hosted build-docker job
+  # above; only the CPU variant has an arm64 counterpart (CUDA/ROCm are
+  # x86_64-only today).
+  build-docker-arm64:
+    if: >-
+      github.event_name == 'push' ||
+      github.event.workflow_run.conclusion == 'success'
+    runs-on: [self-hosted, linux, arm64, graviton, hyprstream-merge-gate]
+    timeout-minutes: 150
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Log in to Container Registry
+      if: github.event_name != 'pull_request'
+      run: podman login ghcr.io -u "${{ github.actor }}" -p "${{ secrets.GITHUB_TOKEN }}"
+
+    # docker/metadata-action is a pure node action (no docker daemon needed) so
+    # it runs fine on the podman-only runner; it just emits the tag set.
+    - name: Extract metadata
+      id: meta
+      uses: docker/metadata-action@v5
+      with:
+        images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+        tags: |
+          # Tag builds (releases) — semver, arm64 CPU suffix
+          type=semver,pattern={{version}},suffix=-cpu-arm64
+          type=semver,pattern={{major}}.{{minor}},suffix=-cpu-arm64
+          # Default-branch (main) moving pointers
+          type=raw,value=edge,enable={{is_default_branch}},suffix=-cpu-arm64
+          type=raw,value=latest,enable={{is_default_branch}},suffix=-cpu-arm64
+
+    - name: Build arm64 CPU image (native podman, no QEMU)
+      env:
+        TAGS: ${{ steps.meta.outputs.tags }}
+      run: |
+        set -euo pipefail
+        # Turn the newline-separated tag list into repeated `-t` args.
+        tag_args=()
+        while IFS= read -r t; do
+          [ -n "$t" ] && tag_args+=( -t "$t" )
+        done <<< "$TAGS"
+        if [ "${#tag_args[@]}" -eq 0 ]; then
+          echo "::error::no image tags resolved; refusing to build an untagged image"
+          exit 1
+        fi
+        echo "### Building linux/arm64 CPU image with tags" >> "$GITHUB_STEP_SUMMARY"
+        echo '```' >> "$GITHUB_STEP_SUMMARY"
+        printf '  %s\n' "${tag_args[@]}" >> "$GITHUB_STEP_SUMMARY"
+        echo '```' >> "$GITHUB_STEP_SUMMARY"
+        podman build \
+          --target runtime \
+          --build-arg VARIANT=cpu-arm64 \
+          "${tag_args[@]}" \
+          -f Dockerfile \
+          .
+
+    - name: Push image tags
+      if: github.event_name != 'pull_request'
+      env:
+        TAGS: ${{ steps.meta.outputs.tags }}
+      run: |
+        set -euo pipefail
+        while IFS= read -r t; do
+          [ -n "$t" ] && podman push "$t"
+        done <<< "$TAGS"
+
+    - name: Clean up disk space after build
+      if: always()
+      run: |
+        echo "=== Cleaning up after arm64 CPU build ==="
+        podman system prune -af || true
+        rm -rf ~/.cargo/registry/cache ~/.cargo/git 2>/dev/null || true
+        echo "=== Disk usage after cleanup ==="
+        df -h
