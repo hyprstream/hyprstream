@@ -3276,9 +3276,12 @@ mod resolver_tests {
         )
         .with_cnf_jwk(service_signing.verifying_key().as_bytes());
         let jwt = hyprstream_rpc::auth::jwt::encode_service_jwt(&claims, &root);
-        let signed = hyprstream_rpc::SignedEnvelope::new_signed(
+        let service_pq_signing =
+            hyprstream_rpc::node_identity::derive_mesh_mldsa_key(&service_signing);
+        let signed = hyprstream_rpc::SignedEnvelope::new_signed_hybrid(
             hyprstream_rpc::RequestEnvelope::anonymous(Vec::new()),
             &service_signing,
+            &service_pq_signing,
         );
         let ctx = EnvelopeContext::from_verified_as_system(&signed);
         let kem = hyprstream_rpc::crypto::hybrid_kem::generate_recipient(
