@@ -23,6 +23,7 @@ use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
 use super::state::{DeviceCodeStatus, OAuthState, RefreshTokenEntry};
+use hyprstream_rpc::auth::{JwkThumbprintInput, jwk_thumbprint};
 use crate::services::generated::policy_client::IssueToken;
 
 /// Device code grant type URN (RFC 8628).
@@ -450,8 +451,6 @@ async fn exchange_refresh_token(
         None => return token_error(StatusCode::BAD_REQUEST, "invalid_request", Some("refresh_token is required")),
     };
 
-    // Look up and atomically consume the refresh token (single-use rotation).
-    // get_refresh_token handles lazy expiry; returns None if expired or missing.
     let entry = match state.get_refresh_token(&refresh_token).await {
         Ok(Some(e)) => e,
         Ok(None) => {
@@ -467,12 +466,6 @@ async fn exchange_refresh_token(
         }
     };
 
-    // Delete before issuing new token (rotation; prevents replay on store errors).
-    if let Err(e) = state.delete_refresh_token(&refresh_token).await {
-        tracing::error!(error = %e, "Refresh token store delete failed");
-        return token_error(StatusCode::INTERNAL_SERVER_ERROR, "server_error", None);
-    }
-
     if params.client_id != entry.client_id {
         return token_error(
             StatusCode::BAD_REQUEST,
@@ -484,30 +477,76 @@ async fn exchange_refresh_token(
     // MAC #547 / B1 (#673): a UCAN-grant refresh is re-evaluated through the S6
     // gate chain with a MANDATORY fresh DPoP proof — never this generic OAuth
     // rotation path (which treats DPoP as optional and does not re-check the
-    // ceiling). The refresh token has already been rotated (consumed) above, so
-    // the re-evaluation either mints a fresh pair or fails closed.
-    if let Some(ucan_grant) = &entry.ucan_grant {
+    // ceiling). Preserve its existing fail-closed, single-use behavior.
+    if entry.ucan_grant.is_some() {
+        let claimed = match state.take_refresh_token(&refresh_token).await {
+            Ok(Some(claimed)) => claimed,
+            Ok(None) => {
+                return token_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_grant",
+                    Some("Refresh token not found or already used"),
+                );
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "Refresh token store take failed");
+                return token_error(StatusCode::INTERNAL_SERVER_ERROR, "server_error", None);
+            }
+        };
+        let Some(claimed_grant) = claimed.ucan_grant.as_ref() else {
+            tracing::error!("UCAN refresh token changed before atomic claim");
+            return token_error(StatusCode::INTERNAL_SERVER_ERROR, "server_error", None);
+        };
         return super::token_exchange::exchange_ucan_grant_refresh(
             &state,
-            ucan_grant,
+            claimed_grant,
             dpop_header.as_deref(),
         )
         .await;
     }
 
-    // Verify DPoP if present.
+    // Verify DPoP before consuming the refresh token. A `use_dpop_nonce`
+    // response must leave the credential available for the RFC 9449 retry.
     let dpop_jkt = match verify_dpop_at_token_endpoint(&state, dpop_header.as_deref()).await {
         None => None,
         Some(Ok(jkt)) => Some(jkt),
         Some(Err(resp)) => return resp,
     };
 
-    // Reconstruct verifying key from stored bytes (cnf continuity across refreshes).
-    let stored_vk: Option<ed25519_dalek::VerifyingKey> = entry.verifying_key_bytes
+    // A sender-constrained token cannot be refreshed by another key or without
+    // a proof.
+    if !refresh_dpop_matches(entry.dpop_jkt.as_deref(), dpop_jkt.as_deref()) {
+        return token_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_dpop_proof",
+            Some("DPoP proof must use the key bound to this refresh token"),
+        );
+    }
+
+    // Atomically claim only after all retryable DPoP validation succeeds.
+    // A successful claim prevents every other OAuth replica from minting with
+    // this single-use refresh credential.
+    let claimed = match state.take_refresh_token(&refresh_token).await {
+        Ok(Some(claimed)) => claimed,
+        Ok(None) => {
+            return token_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_grant",
+                Some("Refresh token not found or already used"),
+            );
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "Refresh token store take failed");
+            return token_error(StatusCode::INTERNAL_SERVER_ERROR, "server_error", None);
+        }
+    };
+
+    // Reconstruct verifying key from the atomically claimed record (cnf continuity across refreshes).
+    let stored_vk: Option<ed25519_dalek::VerifyingKey> = claimed.verifying_key_bytes
         .and_then(|b| ed25519_dalek::VerifyingKey::from_bytes(&b).ok());
 
     // Issue new access token + rotated refresh token. No id_token on refresh (OIDC Core § 12.2).
-    issue_token_with_refresh(&state, &entry.client_id, entry.scopes, entry.resource, &entry.username, None, false, stored_vk.as_ref(), dpop_jkt, vault_device_cookie).await
+    issue_token_with_refresh(&state, &claimed.client_id, claimed.scopes, claimed.resource, &claimed.username, None, false, stored_vk.as_ref(), dpop_jkt, vault_device_cookie).await
 }
 
 /// Handle urn:ietf:params:oauth:grant-type:device_code grant type (RFC 8628 Section 3.4).
@@ -560,10 +599,9 @@ async fn exchange_device_code(
             return token_error(StatusCode::BAD_REQUEST, "slow_down", Some("Polling too frequently"));
         }
     }
-    pending.last_polled = Some(now);
-
     match pending.status {
         DeviceCodeStatus::Pending => {
+            pending.last_polled = Some(now);
             token_error(StatusCode::BAD_REQUEST, "authorization_pending", Some("The authorization request is still pending"))
         }
         DeviceCodeStatus::Denied => {
@@ -577,7 +615,6 @@ async fn exchange_device_code(
             let client_id = pending.client_id.clone();
             let scopes = pending.scopes.clone();
             let resource = pending.resource.clone();
-            let user_code = pending.user_code.clone();
             // Use the approving user's username as the JWT subject.
             // approved_by must be set when status is Approved; error defensively if missing.
             let approved_by = match pending.approved_by.clone() {
@@ -597,23 +634,94 @@ async fn exchange_device_code(
                 }
             };
             let device_vk = pending.verifying_key;
-            device_codes.remove(&device_code);
             drop(device_codes);
-            let mut user_code_map = state.device_code_by_user_code.write().await;
-            user_code_map.remove(&user_code);
-            drop(user_code_map);
 
-            // Verify DPoP if present.
+            // Verify DPoP before consuming the device code. A
+            // `use_dpop_nonce` response must leave it available for retry.
             let dpop_jkt = match verify_dpop_at_token_endpoint(&state, dpop_header.as_deref()).await {
                 None => None,
                 Some(Ok(jkt)) => Some(jkt),
                 Some(Err(resp)) => return resp,
             };
 
+            // A PDS attachment client records the host's iroh did:key at
+            // registration. Its token request must demonstrate possession of
+            // exactly that Ed25519 key via DPoP before a credential is minted.
+            let registered_node_did = {
+                let clients = state.clients.read().await;
+                clients
+                    .get(&client_id)
+                    .and_then(|client| client.hyprstream_node_did.clone())
+            };
+            if !registered_host_dpop_matches(
+                registered_node_did.as_deref(),
+                dpop_jkt.as_deref(),
+            ) {
+                tracing::warn!(%client_id, "PDS host DID and DPoP key do not match");
+                return token_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_dpop_proof",
+                    Some("DPoP proof must use the registered host key"),
+                );
+            }
+
+            // Atomically claim the approved code only after validation. A
+            // concurrent poller cannot mint a second token after this point.
+            let user_code = {
+                let mut device_codes = state.pending_device_codes.write().await;
+                let Some(current) = device_codes.get(&device_code) else {
+                    return token_error(
+                        StatusCode::BAD_REQUEST,
+                        "invalid_grant",
+                        Some("Device code not found or already used"),
+                    );
+                };
+                if current.is_expired() {
+                    let user_code = current.user_code.clone();
+                    device_codes.remove(&device_code);
+                    drop(device_codes);
+                    let mut user_code_map = state.device_code_by_user_code.write().await;
+                    user_code_map.remove(&user_code);
+                    return token_error(
+                        StatusCode::BAD_REQUEST,
+                        "expired_token",
+                        Some("The device code has expired"),
+                    );
+                }
+                if current.status != DeviceCodeStatus::Approved {
+                    return token_error(
+                        StatusCode::BAD_REQUEST,
+                        "invalid_grant",
+                        Some("Device code not found or already used"),
+                    );
+                }
+                let user_code = current.user_code.clone();
+                device_codes.remove(&device_code);
+                user_code
+            };
+            let mut user_code_map = state.device_code_by_user_code.write().await;
+            user_code_map.remove(&user_code);
+            drop(user_code_map);
+
             // Device flow: no OIDC nonce and not initial OIDC auth.
             issue_token_with_refresh(&state, &client_id, scopes, resource, &approved_by, None, false, device_vk.as_ref(), dpop_jkt, vault_device_cookie).await
         }
     }
+}
+
+fn registered_host_dpop_matches(registered_node_did: Option<&str>, dpop_jkt: Option<&str>) -> bool {
+    let Some(node_did) = registered_node_did else {
+        return true;
+    };
+    let Ok(node_key) = hyprstream_crypto::did_key::did_key_to_ed25519(node_did) else {
+        return false;
+    };
+    let expected_jkt = jwk_thumbprint(&JwkThumbprintInput::Ed25519 { x: &node_key });
+    dpop_jkt == Some(expected_jkt.as_str())
+}
+
+fn refresh_dpop_matches(expected_jkt: Option<&str>, presented_jkt: Option<&str>) -> bool {
+    expected_jkt.is_none() || expected_jkt == presented_jkt
 }
 
 /// Generate a cryptographically random refresh token string.
@@ -714,6 +822,7 @@ async fn issue_token_with_refresh(
                     resource,
                     expires_at_unix: now + state.refresh_token_ttl as i64,
                     verifying_key_bytes: user_verifying_key.map(|vk| *vk.as_bytes()),
+                    dpop_jkt: dpop_jkt.clone(),
                     ucan_grant: None, // generic OAuth refresh; not a UCAN grant (MAC #547 B1)
                 };
                 if let Err(e) = state.put_refresh_token(&refresh_token, &entry, state.refresh_token_ttl as u64).await {
@@ -765,7 +874,7 @@ async fn issue_token_with_refresh(
 
             let mut response_json = serde_json::json!({
                 "access_token": token_info.token,
-                "token_type": "Bearer",
+                "token_type": if dpop_jkt.is_some() { "DPoP" } else { "Bearer" },
                 "expires_in": expires_in,
                 "scope": scope_str,
                 "refresh_token": refresh_token,
@@ -865,6 +974,33 @@ mod tests {
         let body = token_error_body("invalid_request", Some("code is required"));
         let obj = body.as_object().unwrap();
         assert_eq!(obj.get("error_description").and_then(|v| v.as_str()), Some("code is required"));
+    }
+
+    #[test]
+    fn registered_pds_host_requires_its_dpop_key() {
+        let key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let did = hyprstream_crypto::did_key::ed25519_to_did_key(key.verifying_key().as_bytes());
+        let matching_jkt = jwk_thumbprint(&JwkThumbprintInput::Ed25519 {
+            x: key.verifying_key().as_bytes(),
+        });
+
+        assert!(registered_host_dpop_matches(
+            Some(&did),
+            Some(&matching_jkt),
+        ));
+        assert!(!registered_host_dpop_matches(Some(&did), None));
+        assert!(!registered_host_dpop_matches(Some(&did), Some("other-key")));
+        assert!(!registered_host_dpop_matches(Some("did:key:zinvalid"), Some(&matching_jkt)));
+        assert!(registered_host_dpop_matches(None, None));
+    }
+
+    #[test]
+    fn dpop_bound_refresh_requires_the_original_key() {
+        assert!(refresh_dpop_matches(None, None));
+        assert!(refresh_dpop_matches(None, Some("new-key")));
+        assert!(refresh_dpop_matches(Some("bound-key"), Some("bound-key")));
+        assert!(!refresh_dpop_matches(Some("bound-key"), None));
+        assert!(!refresh_dpop_matches(Some("bound-key"), Some("other-key")));
     }
 
     #[test]

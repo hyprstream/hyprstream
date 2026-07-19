@@ -11,6 +11,10 @@ use super::state::OAuthState;
 
 /// Base metadata fields shared between RFC 8414 and OIDC discovery.
 fn base_metadata(issuer: &str, scopes: &[String], require_par: bool) -> serde_json::Value {
+    let mut scopes_supported = scopes.to_vec();
+    if !scopes_supported.iter().any(|scope| scope == "pds:attach") {
+        scopes_supported.push("pds:attach".to_owned());
+    }
     serde_json::json!({
         "issuer": issuer,
         "authorization_endpoint": format!("{}/oauth/authorize", issuer),
@@ -24,7 +28,7 @@ fn base_metadata(issuer: &str, scopes: &[String], require_par: bool) -> serde_js
         "grant_types_supported": ["authorization_code", "refresh_token", "urn:ietf:params:oauth:grant-type:device_code"],
         "code_challenge_methods_supported": ["S256"],
         "token_endpoint_auth_methods_supported": ["none"],
-        "scopes_supported": scopes,
+        "scopes_supported": scopes_supported,
         "client_id_metadata_document_supported": true,
     })
 }

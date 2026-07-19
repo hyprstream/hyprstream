@@ -390,6 +390,7 @@ mod tests {
             token_endpoint_auth_method: Some(auth_method.to_owned()),
             jwks: Some(jwks),
             jwks_uri: None,
+            hyprstream_node_did: None,
             is_cimd: true,
             registered_at: Instant::now(),
         }

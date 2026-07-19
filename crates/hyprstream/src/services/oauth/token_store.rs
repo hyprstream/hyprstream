@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::path::Path;
 use anyhow::Result;
 use async_trait::async_trait;
+use parking_lot::Mutex;
 
 use super::state::RefreshTokenEntry;
 
@@ -15,11 +16,15 @@ use super::state::RefreshTokenEntry;
 pub trait TokenStore: Send + Sync {
     async fn put(&self, token: &str, entry: &RefreshTokenEntry, ttl_secs: u64) -> Result<()>;
     async fn get(&self, token: &str) -> Result<Option<RefreshTokenEntry>>;
+    /// Atomically remove and return a token entry, if it is still present.
+    /// Used for single-use refresh-token rotation across all OAuth replicas.
+    async fn take(&self, token: &str) -> Result<Option<RefreshTokenEntry>>;
     async fn delete(&self, token: &str) -> Result<()>;
 }
 
 pub struct RocksDbTokenStore {
     db: Arc<rocksdb::DB>,
+    take_lock: Mutex<()>,
 }
 
 impl RocksDbTokenStore {
@@ -27,7 +32,10 @@ impl RocksDbTokenStore {
         let mut opts = rocksdb::Options::default();
         opts.create_if_missing(true);
         let db = rocksdb::DB::open(&opts, path)?;
-        Ok(Self { db: Arc::new(db) })
+        Ok(Self {
+            db: Arc::new(db),
+            take_lock: Mutex::new(()),
+        })
     }
 }
 
@@ -46,6 +54,22 @@ impl TokenStore for RocksDbTokenStore {
                 let entry: RefreshTokenEntry = serde_json::from_slice(&bytes)?;
                 if entry.is_expired() {
                     let _ = self.db.delete(token.as_bytes());
+                    Ok(None)
+                } else {
+                    Ok(Some(entry))
+                }
+            }
+        }
+    }
+
+    async fn take(&self, token: &str) -> Result<Option<RefreshTokenEntry>> {
+        let _guard = self.take_lock.lock();
+        match self.db.get(token.as_bytes())? {
+            None => Ok(None),
+            Some(bytes) => {
+                let entry: RefreshTokenEntry = serde_json::from_slice(&bytes)?;
+                self.db.delete(token.as_bytes())?;
+                if entry.is_expired() {
                     Ok(None)
                 } else {
                     Ok(Some(entry))
@@ -104,9 +128,54 @@ impl TokenStore for ValkeyTokenStore {
         }
     }
 
+    async fn take(&self, token: &str) -> Result<Option<RefreshTokenEntry>> {
+        use fred::prelude::*;
+        let val: Option<String> = self.pool.getdel(self.key(token)).await?;
+        match val {
+            None => Ok(None),
+            Some(serialized) => {
+                let entry: RefreshTokenEntry = serde_json::from_str(&serialized)?;
+                if entry.is_expired() {
+                    Ok(None)
+                } else {
+                    Ok(Some(entry))
+                }
+            }
+        }
+    }
+
     async fn delete(&self, token: &str) -> Result<()> {
         use fred::prelude::*;
         self.pool.del::<i64, _>(self.key(token)).await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn rocksdb_take_allows_exactly_one_claim() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = RocksDbTokenStore::open(dir.path()).unwrap();
+        let entry = RefreshTokenEntry {
+            client_id: "client".to_owned(),
+            username: "user".to_owned(),
+            scopes: vec!["openid".to_owned()],
+            resource: None,
+            expires_at_unix: chrono::Utc::now().timestamp() + 60,
+            verifying_key_bytes: None,
+            dpop_jkt: None,
+            ucan_grant: None,
+        };
+        store.put("refresh", &entry, 60).await.unwrap();
+
+        let first = store.take("refresh").await.unwrap();
+        let second = store.take("refresh").await.unwrap();
+
+        assert_eq!(first.as_ref().map(|entry| entry.client_id.as_str()), Some("client"));
+        assert!(second.is_none());
     }
 }

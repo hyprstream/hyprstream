@@ -159,6 +159,29 @@ fn build_cli() -> ClapCommand {
         ),
     );
 
+    // PDS home attachment (RFC 8628 device authorization)
+    app = app.subcommand(
+        ClapCommand::new("pds")
+            .about("Attach this host to its home personal data server")
+            .subcommand(
+                ClapCommand::new("join")
+                    .visible_alias("attach")
+                    .about("Authorize and attach this host to one home PDS")
+                    .arg(
+                        Arg::new("url")
+                            .required(true)
+                            .value_name("PDS_URL")
+                            .help("HTTPS origin of the home PDS"),
+                    )
+                    .arg(
+                        Arg::new("scope")
+                            .long("scope")
+                            .value_name("SCOPE")
+                            .help("Space-delimited OAuth scopes requested from the PDS"),
+                    ),
+            ),
+    );
+
     // Interactive setup wizard
     app = app.subcommand(
         ClapCommand::new("wizard")
@@ -193,6 +216,14 @@ fn build_cli() -> ClapCommand {
                     .long("enable-federation")
                     .action(clap::ArgAction::SetTrue)
                     .help("Apply the federation-open policy template — accept third-party apps AND remote peer servers from any HTTPS origin (atproto-style federation). Default is disabled; under -y this flag is the only way to enable it."),
+            )
+            .arg(
+                Arg::new("pds_url")
+                    .long("pds-url")
+                    .value_name("PDS_URL")
+                    .help("Attach this host to a home PDS after wizard setup (same as `pds join`)")
+                    .conflicts_with("bootstrap_only")
+                    .conflicts_with("tui"),
             )
             .arg(
                 Arg::new("initial_user_role")
@@ -1764,11 +1795,13 @@ fn main() -> Result<()> {
                 let start_services = sub_m.get_flag("start");
                 let bootstrap_only = sub_m.get_flag("bootstrap_only");
                 let enable_federation = sub_m.get_flag("enable_federation");
+                let pds_url = sub_m.get_one::<String>("pds_url").cloned();
                 let initial_user_role = sub_m
                     .get_one::<String>("initial_user_role")
                     .cloned()
                     .unwrap_or_else(|| "admin".to_owned());
-                let use_tui = tui_mode || (!non_interactive && !bootstrap_only && supports_tui());
+                let use_tui = tui_mode || (pds_url.is_none() && !non_interactive && !bootstrap_only && supports_tui());
+                let config = config.clone();
                 return with_runtime(
                     RuntimeConfig { device: DeviceConfig::request_cpu(), multi_threaded: true },
                     || async move {
@@ -1778,7 +1811,13 @@ fn main() -> Result<()> {
                             hyprstream_core::cli::handle_wizard(
                                 &models_dir, &services, non_interactive, start_services,
                                 bootstrap_only, enable_federation, &initial_user_role,
-                            ).await
+                            ).await?;
+                            if let Some(pds_url) = pds_url {
+                                hyprstream_core::cli::pds_handlers::handle_pds_join(
+                                    &config, &pds_url, None,
+                                ).await?;
+                            }
+                            Ok(())
                         }
                     },
                 );
@@ -1819,6 +1858,25 @@ fn main() -> Result<()> {
             }
         }
         return Ok(());
+    }
+
+    // ── `pds` early dispatch ─────────────────────────────────────────────────
+    // PDS attachment is independent of the local registry: it must work on a
+    // newly provisioned host before local services are running.
+    if let Some(("pds", sub_m)) = matches.subcommand() {
+        match sub_m.subcommand() {
+            Some(("join", join_m)) => {
+                let pds_url = join_m
+                    .get_one::<String>("url")
+                    .ok_or_else(|| anyhow::anyhow!("PDS URL is required"))?;
+                let scope = join_m.get_one::<String>("scope").map(String::as_str);
+                return with_runtime(
+                    RuntimeConfig { device: DeviceConfig::request_cpu(), multi_threaded: true },
+                    || hyprstream_core::cli::pds_handlers::handle_pds_join(&config, pds_url, scope),
+                );
+            }
+            _ => anyhow::bail!("usage: hyprstream pds join <PDS_URL> [--scope <SCOPE>]"),
+        }
     }
 
     // Start registry service ONCE at CLI level
