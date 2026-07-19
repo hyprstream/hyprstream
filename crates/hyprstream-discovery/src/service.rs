@@ -4323,17 +4323,19 @@ impl DiscoveryHandler for DiscoveryService {
 
     /// #524 P1 — node liveness heartbeat. The auto-generated dispatch gate
     /// already ran a `discovery:ReportNodeLiveness`/`write` authz check before
-    /// this handler was invoked (mirrors `handle_announce`, which needs no
-    /// additional internal check for the same reason).
+    /// this handler was invoked. Before accepting a DID-specific heartbeat,
+    /// additionally require write admission for that candidate. This prevents
+    /// an authorized caller from using arbitrary heartbeat DIDs to grow the
+    /// durable placement directory or trigger unbounded resolver work.
     ///
-    /// Re-inserting (heartbeating) the same node refreshes its TTL entry. The
+    /// Re-inserting (heartbeating) an admitted node refreshes its TTL entry. The
     /// first heartbeat seen for a DID this directory hasn't ingested a
     /// `NodeRecord` for yet lazily triggers a one-shot poll of that DID's repo
     /// (day-1 ingestion cadence — see the `placement_index` module docs); a
-    /// failure there does not fail the heartbeat itself.
+    /// failure there does not fail the admitted heartbeat itself.
     async fn handle_report_node_liveness(
         &self,
-        _ctx: &EnvelopeContext,
+        ctx: &EnvelopeContext,
         _request_id: u64,
         data: &NodeLiveness,
     ) -> Result<DiscoveryResponseVariant> {
@@ -4342,6 +4344,19 @@ impl DiscoveryHandler for DiscoveryService {
             return Ok(DiscoveryResponseVariant::Error(ErrorInfo {
                 message: "node is required".to_owned(),
                 code: "INVALID_ARGUMENT".to_owned(),
+                details: String::new(),
+            }));
+        }
+
+        // The generic dispatch gate authorizes calling reportNodeLiveness; it
+        // does not authorize claiming liveness for a particular DID. Gate the
+        // DID before touching either the bounded volatile cache or the
+        // unbounded-by-heartbeat placement snapshot index.
+        let resource = format!("placement:candidate:{node_did}");
+        if let Err(e) = self.authorize(ctx, &resource, "write").await {
+            return Ok(DiscoveryResponseVariant::Error(ErrorInfo {
+                message: format!("unauthorized to report liveness for {resource}: {e}"),
+                code: "UNAUTHORIZED".to_owned(),
                 details: String::new(),
             }));
         }
@@ -4757,8 +4772,8 @@ mod query_candidates_tests {
         }
     }
 
-    /// Denies exactly the `placement:candidate:<did>` resource for one DID;
-    /// allows everything else (including the dispatch-level auto-gate checks).
+    /// Denies `query` access to exactly one `placement:candidate:<did>`
+    /// resource; allows write admission so that test setup can heartbeat it.
     struct DenyNode(String);
     #[async_trait(?Send)]
     impl AuthorizationProvider for DenyNode {
@@ -4767,9 +4782,49 @@ mod query_candidates_tests {
             _subject: &str,
             _domain: &str,
             resource: &str,
-            _operation: &str,
+            operation: &str,
         ) -> Result<bool> {
-            Ok(resource != format!("placement:candidate:{}", self.0))
+            Ok(resource != format!("placement:candidate:{}", self.0) || operation != "query")
+        }
+    }
+
+    /// Denies `write` admission for exactly one node DID.
+    struct DenyNodeLiveness(String);
+    #[async_trait(?Send)]
+    impl AuthorizationProvider for DenyNodeLiveness {
+        async fn check(
+            &self,
+            _subject: &str,
+            _domain: &str,
+            resource: &str,
+            operation: &str,
+        ) -> Result<bool> {
+            Ok(resource != format!("placement:candidate:{}", self.0) || operation != "write")
+        }
+    }
+
+    /// Records repository lookups so admission tests can prove a denied DID
+    /// never reaches `RecordResolver::resolve_repo`.
+    struct TrackingRepoResolver {
+        repos: HashMap<String, Vec<u8>>,
+        resolved: parking_lot::Mutex<Vec<String>>,
+    }
+    #[async_trait(?Send)]
+    impl RecordResolver for TrackingRepoResolver {
+        async fn resolve_record(
+            &self,
+            _did: &str,
+            _collection: &str,
+            _rkey: &str,
+        ) -> Result<Option<RecordCarData>> {
+            Ok(None)
+        }
+        async fn resolve_repo(&self, did: &str) -> Result<Option<RecordCarData>> {
+            self.resolved.lock().push(did.to_owned());
+            Ok(self.repos.get(did).map(|car| RecordCarData {
+                uri: format!("at://{did}"),
+                car: car.clone(),
+            }))
         }
     }
 
@@ -4878,6 +4933,54 @@ mod query_candidates_tests {
             resp,
             DiscoveryResponseVariant::ReportNodeLivenessResult
         ));
+    }
+
+    /// A denied heartbeat must not create a volatile liveness entry or trigger
+    /// a first-seen repository poll, even if the caller passed the generic
+    /// reportNodeLiveness dispatch gate.
+    #[tokio::test]
+    async fn liveness_admission_denial_skips_cache_and_repository_ingest() {
+        let did = "did:web:unadmitted-node.example.com";
+        let rec = sample_node_record(did, vec![]);
+        let resolver = Arc::new(TrackingRepoResolver {
+            repos: HashMap::from([(did.to_owned(), node_repo_car(did, &rec))]),
+            resolved: parking_lot::Mutex::new(Vec::new()),
+        });
+        let (sk, vk) = hyprstream_rpc::crypto::generate_signing_keypair();
+        let svc = DiscoveryService::new(
+            Arc::new(sk),
+            vk,
+            hyprstream_rpc::transport::TransportConfig::inproc("liveness-admission-test"),
+        )
+        .with_auth_provider(Box::new(DenyNodeLiveness(did.to_owned())))
+        .with_record_resolver(resolver.clone());
+        let req = NodeLiveness {
+            node: Did::new(did.to_owned()),
+            allocatable: vec![],
+            load_fraction: 0.1,
+            ts: 0,
+        };
+
+        let response = svc
+            .handle_report_node_liveness(&test_ctx(), 1, &req)
+            .await
+            .unwrap();
+        assert!(matches!(
+            response,
+            DiscoveryResponseVariant::Error(ErrorInfo { ref code, .. }) if code == "UNAUTHORIZED"
+        ));
+        assert!(
+            svc.liveness.get(&Did::new(did.to_owned())).is_none(),
+            "denied DID must not receive a liveness entry"
+        );
+        assert!(
+            svc.placement_index.record_uri(did).is_none(),
+            "denied DID must not receive placement facts"
+        );
+        assert!(
+            resolver.resolved.lock().is_empty(),
+            "denied DID must not reach RecordResolver::resolve_repo"
+        );
     }
 
     fn empty_query(max_candidates: u32) -> QueryCandidatesRequest {
