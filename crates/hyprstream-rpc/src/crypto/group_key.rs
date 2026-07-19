@@ -1,45 +1,14 @@
-//! Generic **keyable group** primitive for record-backed fan-out pub/sub.
+//! Controller-managed hybrid group epochs for record-backed fan-out.
 //!
-//! This is the general-purpose, lexicon-agnostic home for the "a group of
-//! members shares a symmetric group key (`K_group`), distributed to members via
-//! DH-wrap-on-join, with rekey-driven forward secrecy" pattern. Any feature that
-//! needs record-backed group fan-out — EventService (`ai.hyprstream.event.group`),
-//! the placement scheduler (`ai.hyprstream.placement.group`), or a future one —
-//! consumes this primitive instead of reimplementing the key state machine.
+//! Epoch secrets are fresh random values and are sealed independently to every
+//! admitted member's accepted-state-bound HyKEM recipient with COSE_Encrypt0.
+//! Relays receive only ordinary encrypted MOQT object bytes; epoch grants are
+//! control-plane objects and MUST NOT be published on a relay track.
 //!
-//! # Split with the identity layer
-//!
-//! The *identity* of a group (the list record + listitem + bidirectional consent)
-//! lives in `hyprstream-pds::list_record` — generic `ListRecord<E>` /
-//! `ListItemRecord`, modeled on `app.bsky.graph.list`/`listitem`. This module is
-//! the *key material* half: given a group's record reference ([`GroupRef`]), it
-//! owns the per-epoch `K_group`, the publisher ephemeral keypair, and the
-//! DH-wrap-on-join path that delivers `K_group` to each member.
-//!
-//! # What "K_group derivation" means here
-//!
-//! `K_group` bytes are **freshly random per rotation** (`OsRng`) — there is no
-//! KDF chain producing `K_group` itself. "Derivation" refers to the
-//! **identity/reference** `(group_uri, keyset_id, epoch)` being bound to the
-//! signed record, so a member can ask "give me `K_group` for keyset X epoch Y".
-//! A keyed-PRF *derivation* (e.g. EventService's
-//! `topic = KDF(K_group, subject‖epoch)`) is a downstream use of this `K_group`,
-//! out of scope here — see [`GroupKeyRegistry::k_group`].
-//!
-//! # Forward secrecy
-//!
-//! Each epoch uses a freshly-rotated **random** group key (not a static key with
-//! an epoch tweak), so compromise of an old key cannot derive later keys. The
-//! rekey **grace window** ([`GRACE_PERIOD`]) means two epochs' keys are briefly
-//! valid simultaneously during a rotation. Rekey timing is governed by
-//! [`RekeyPolicy`] (Scheduled / Jittered / Immediate) — the Immediate-vs-Scheduled
-//! tradeoff (prompt revocation forward secrecy vs bounded O(M)-per-rotation cost)
-//! is a per-consumer decision; see that type's docs.
-//!
-//! This module reuses — does not duplicate — the low-level crypto already in this
-//! crate: [`event_crypto::derive_wrap_key`] / [`event_crypto::wrap_group_key`] for
-//! the DH-wrap, and [`crate::crypto::ristretto_dh_raw`] /
-//! [`crate::crypto::generate_ephemeral_keypair`] for the Ristretto255 DH legs.
+//! Membership changes use an explicit prepare/commit transaction. Preparing a
+//! change creates and seals the next epoch but does not expose it as current.
+//! Committing swaps membership version, epoch, key, and member set atomically.
+//! A crash before commit therefore leaves the prior committed epoch intact.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -48,45 +17,28 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use parking_lot::RwLock;
 use zeroize::Zeroizing;
 
-use crate::crypto::backend::keyed_mac;
-use crate::crypto::event_crypto::{derive_wrap_key, unwrap_group_key, wrap_group_key};
-use crate::crypto::{blinded_dh_raw, rerandomize_pubkey, RistrettoPublic};
+use crate::crypto::cose_encrypt;
+use crate::crypto::hybrid_kem::{RecipientKeypair, RecipientPublic};
 
-// ────────────────────────────────────────────────────────────────────────────
-// Rekey policy + timing constants
-// ────────────────────────────────────────────────────────────────────────────
-
-/// Maximum key lifetime (24 hours). Keys MUST be rotated before this.
-pub const MAX_KEY_LIFETIME: Duration = Duration::from_secs(86400);
-
-/// Default rotation interval (1 hour).
-pub const DEFAULT_ROTATION_INTERVAL: Duration = Duration::from_secs(3600);
-
-/// Grace period for old key acceptance after rotation (120 seconds). During this
-/// window two epochs' keys are both valid; revocation that must be prompt should
-/// use a zero/short grace.
+pub const MAX_KEY_LIFETIME: Duration = Duration::from_secs(86_400);
+pub const DEFAULT_ROTATION_INTERVAL: Duration = Duration::from_secs(3_600);
 pub const GRACE_PERIOD: Duration = Duration::from_secs(120);
 
-/// Rekey policy configuration.
-///
-/// The choice between [`RekeyPolicy::Immediate`] (rotate on every revocation —
-/// prompt forward secrecy, but O(M) wrap cost per revocation, i.e. O(M²) over M
-/// departures) and [`RekeyPolicy::Scheduled`] (rotate on a fixed interval —
-/// bounded O(M) per rotation, but a revoked member retains access until the next
-/// rotation) is a per-consumer tradeoff between revocation latency and cost.
 #[derive(Clone, Debug)]
 pub enum RekeyPolicy {
-    /// Rotate on fixed schedule. Revocations deferred to next rotation.
-    Scheduled { interval: Duration },
-    /// Rotate immediately on revocation.
+    Scheduled {
+        interval: Duration,
+    },
     Immediate,
-    /// Scheduled with jitter for timing-attack resistance.
-    Jittered { interval: Duration, jitter: Duration },
+    Jittered {
+        interval: Duration,
+        jitter: Duration,
+    },
 }
 
 impl Default for RekeyPolicy {
     fn default() -> Self {
-        RekeyPolicy::Scheduled {
+        Self::Scheduled {
             interval: DEFAULT_ROTATION_INTERVAL,
         }
     }
@@ -98,27 +50,17 @@ impl RekeyPolicy {
             Self::Scheduled { interval } | Self::Jittered { interval, .. }
                 if *interval > MAX_KEY_LIFETIME =>
             {
-                return Err(format!(
-                    "interval {:?} exceeds MAX_KEY_LIFETIME ({:?})",
-                    interval, MAX_KEY_LIFETIME
-                ));
+                Err(format!(
+                    "interval {interval:?} exceeds MAX_KEY_LIFETIME ({MAX_KEY_LIFETIME:?})"
+                ))
             }
-            _ => {}
+            _ => Ok(()),
         }
-        Ok(())
     }
 }
 
-// ────────────────────────────────────────────────────────────────────────────
-// Result/data structs (shared by every consumer of the primitive)
-// ────────────────────────────────────────────────────────────────────────────
-
-/// Result of encrypting an event under a group key.
-///
-/// This is the higher-level envelope around [`crate::crypto::event_crypto::encrypt_event`]
-/// (which returns the raw `(tag, ciphertext, nonce, commitment)` tuple); it adds
-/// the routing/topic metadata, Ed25519 publisher signature, and timestamp a
-/// fan-out consumer needs to ship the event.
+/// Encrypted event payload. `publisher_pubkey` is an anchored Ed25519 key id;
+/// `signature` is a mandatory hybrid COSE composite (Ed25519 + ML-DSA-65).
 #[derive(Debug, Clone)]
 pub struct EncryptedEvent {
     pub topic: String,
@@ -126,50 +68,35 @@ pub struct EncryptedEvent {
     pub ciphertext: Vec<u8>,
     pub nonce: [u8; 12],
     pub key_commitment: [u8; 16],
-    /// Limited-knowledge routing tag (keyed HMAC of the routing prefix under the
-    /// group key). Empty in zero-knowledge mode. NOTE: a non-empty `lk_tag` is a
-    /// stable per-prefix selector and is linkable — consumers that require topic
-    /// opacity must not use the LK mode.
     pub lk_tag: Vec<u8>,
-    /// Ed25519 signature over the event.
     pub signature: Vec<u8>,
-    /// Publisher's Ed25519 verifying key.
     pub publisher_pubkey: [u8; 32],
-    /// Event timestamp (unix millis).
     pub timestamp: i64,
+    /// Controller-committed membership version and epoch are sender-authenticated.
+    pub membership_version: u64,
+    pub epoch: u64,
+    /// Monotonic per-sender/track sequence within the epoch.
+    pub sequence: u64,
 }
 
-/// Result of a key rotation.
-#[derive(Debug)]
-pub struct RotationResult {
-    pub new_ephemeral_pubkey: [u8; 32],
-    pub wrapped_keys: Vec<WrappedKeyEntry>,
-    pub effective_at_millis: i64,
-}
-
-/// A wrapped key entry for a single subscriber.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct WrappedKeyEntry {
-    /// Random 16-byte routing tag (unlinkable across rekeys).
+    /// Random recipient-local routing tag; regenerated every epoch.
     pub routing_tag: [u8; 16],
-    /// Opaque wrapped group-key blob.
+    /// Accepted `#mesh-kem` recipient key id.
+    pub recipient_key_id: Vec<u8>,
+    /// Canonical COSE_Encrypt0 carrying the epoch secret and HyKEM shares.
     pub wrapped_blob: Vec<u8>,
 }
 
-// ────────────────────────────────────────────────────────────────────────────
-// Group identity + membership
-// ────────────────────────────────────────────────────────────────────────────
+#[derive(Debug, Clone)]
+pub struct RotationResult {
+    pub wrapped_keys: Vec<WrappedKeyEntry>,
+    pub effective_at_millis: i64,
+    pub membership_version: u64,
+    pub epoch: u64,
+}
 
-/// A group's identity, lexicon-agnostic: an atproto record URI + a keyset id.
-///
-/// `group_uri` is the at-uri of the group *list* record (e.g.
-/// `at://did:web:node/ai.hyprstream.event.group/g1` or
-/// `at://did:web:node/ai.hyprstream.placement.group/g7`); `keyset_id` is the
-/// opaque key-material generation reference the list record carries (never key
-/// bytes — the actual `K_group` is delivered per-member via DH-wrap-on-join).
-///
-/// This is deliberately plain data (no `hyprstream-pds` type) so this crate stays
-/// lower-level than the record store and any list lexicon can back it.
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub struct GroupRef {
     pub group_uri: String,
@@ -185,167 +112,165 @@ impl GroupRef {
     }
 }
 
-/// A membership fact the caller has already resolved: `subject_did` is a verified
-/// member of `group_uri`. Carries the member's ephemeral Ristretto255 pubkey used
-/// for the DH-wrap.
+/// State that identifies the controller and the accepted CID512/did:at9p view.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ControllerBinding {
+    pub controller_did: String,
+    pub accepted_state: Vec<u8>,
+    /// Controller-authorized sender identity for this epoch profile.
+    pub sender_did: String,
+    pub sender_ed25519: [u8; 32],
+    pub sender_ml_dsa_65: Vec<u8>,
+    /// Canonical policy identifiers, authenticated into every member grant.
+    pub retention_policy: Vec<u8>,
+    pub opaque_routing_policy: Vec<u8>,
+    pub expires_at_millis: i64,
+}
+
+/// A member admission resolved from authenticated policy/record state.
 ///
-/// By the time a `GroupMembership` exists, the caller (a [`MembershipResolver`]
-/// impl) has already verified the list records (CAR proof / commit signature) and
-/// the bidirectional-consent check, and run any authz-prefilter. This struct is
-/// the *result* of that work, not a substitute for it.
+/// `blinded_routing_key` is a fresh subscriber-generated Ristretto presentation.
+/// It retains the old construction's unlinkability property, but is only an
+/// authenticated opaque binding: it is never used to derive key material. Epoch
+/// confidentiality comes solely from the separate HyKEM recipient.
 #[derive(Clone, Debug)]
 pub struct GroupMembership {
     pub group_uri: String,
     pub subject_did: String,
-    /// Member's ephemeral Ristretto255 pubkey (for the DH-wrap).
-    pub member_pubkey: [u8; 32],
+    pub accepted_state: Vec<u8>,
+    pub capability: Vec<u8>,
+    pub recipient_key_id: Vec<u8>,
+    pub recipient: RecipientPublic,
+    pub blinded_routing_key: [u8; 32],
+    pub expires_at_millis: i64,
 }
 
-/// Resolves group membership for a join request. A real implementation fetches
-/// the list/groupItem records (and the member's own consent record) via the
-/// DiscoveryService `getRecord` path, verifies the CAR proofs, runs
-/// bidirectional-consent + any authz-prefilter, and returns the verified
-/// [`GroupMembership`].
-///
-/// Implementations live in the consumer crate (they depend on the concrete
-/// lexicon + DiscoveryService); [`DenyAllResolver`] is the fail-closed default
-/// used until a real resolver is wired in.
+impl GroupMembership {
+    fn validate(&self, group_uri: &str) -> Result<(), String> {
+        if self.group_uri != group_uri {
+            return Err("membership group does not match requested group".to_owned());
+        }
+        if self.subject_did.is_empty()
+            || self.accepted_state.is_empty()
+            || self.capability.is_empty()
+            || self.recipient_key_id.is_empty()
+        {
+            return Err("membership binding is incomplete".to_owned());
+        }
+        if self.blinded_routing_key == [0; 32] {
+            return Err("blinded routing key must not be all zero".to_owned());
+        }
+        self.recipient.validate().map_err(|e| e.to_string())?;
+        let expected = recipient_key_id(&self.recipient);
+        if self.recipient_key_id != expected {
+            return Err("recipient key id does not match accepted HyKEM key".to_owned());
+        }
+        Ok(())
+    }
+}
+
+/// The TCB membership gate. Implementations validate accepted state, capability,
+/// expiry and the current `#mesh-kem` recipient before returning a binding.
 pub trait MembershipResolver: Send + Sync {
-    fn resolve(
-        &self,
-        group_uri: &str,
-        subject_did: &str,
-        member_pubkey: [u8; 32],
-    ) -> Result<GroupMembership, String>;
+    fn resolve(&self, requested: &GroupMembership) -> Result<GroupMembership, String>;
 }
 
-/// A resolver that always denies — the safe default until a real resolver is
-/// wired in. Prevents the registry from accidentally admitting unverified members.
 pub struct DenyAllResolver;
-
 impl MembershipResolver for DenyAllResolver {
-    fn resolve(
-        &self,
-        _group_uri: &str,
-        _subject_did: &str,
-        _member_pubkey: [u8; 32],
-    ) -> Result<GroupMembership, String> {
+    fn resolve(&self, _requested: &GroupMembership) -> Result<GroupMembership, String> {
         Err("MembershipResolver not wired — fail-closed".to_owned())
     }
 }
 
-// ────────────────────────────────────────────────────────────────────────────
-// Blinded join (EV4: participant anonymity vs the relay)
-// ────────────────────────────────────────────────────────────────────────────
-
-/// A subscriber's **blinded** presentation for join (EV4 participant anonymity).
-///
-/// The subscriber blinds their stable Ristretto255 public key with a fresh
-/// random scalar `r` (`blinded = P_member + r·G` via [`rerandomize_pubkey`])
-/// and presents `blinded_pubkey` to the publisher's [`GroupKeyRegistry::join`].
-/// The publisher DHs against the blinded pubkey — it never sees, and cannot
-/// recover, the subscriber's stable key. The subscriber retains `blinding` to
-/// unwrap via [`blinded_dh_raw`].
-///
-/// **The blinder is the subscriber (or a DiscoveryService-side step that the
-/// subscriber trusts), NEVER the relay.** A relay that chose `r` could link
-/// presentations; the subscriber choosing `r` keeps that unlinkability.
-///
-/// # Residual (honest)
-/// Anonymity is **vs the relay only**. The publisher still sees the (blinded)
-/// connection and its traffic pattern; a DiscoveryService that authenticates the
-/// join (to authorize it) necessarily de-anonymizes the subscriber at authz
-/// time. The relay observes the anonymous connection-set cardinality + the
-/// per-connection traffic pattern. This is participant *key*-anonymity — it is
-/// NOT per-publish edge-set hiding (the relay can still see who-publishes-to /
-/// who-subscribes-to which track within a group, at the connection level).
+/// Subscriber-side unlinkable presentation retained from the prior blinded-DH
+/// protocol. It is intentionally not a KEX key in the hybrid construction.
 pub struct BlindedMember {
-    /// The blinded pubkey the subscriber presents to `join`.
     pub blinded_pubkey: [u8; 32],
-    /// The blinding scalar, retained subscriber-side and NEVER sent. Required to
-    /// unwrap the wrapped group key via [`blinded_dh_raw`].
     pub blinding: [u8; 32],
 }
 
 impl BlindedMember {
-    /// Subscriber-side: blind a stable member public key. `member_pubkey` is the
-    /// subscriber's stable Ristretto255 public key (32 bytes). Returns the
-    /// blinded presentation to send to `join`, plus the blinding scalar to keep.
     pub fn new(member_pubkey: &[u8; 32]) -> Result<Self, String> {
-        let pub_obj = RistrettoPublic::from_bytes(member_pubkey)
+        let pub_obj = crate::crypto::RistrettoPublic::from_bytes(member_pubkey)
             .ok_or_else(|| "invalid Ristretto255 member public key".to_owned())?;
-        let (blinded, blinding) = rerandomize_pubkey(&pub_obj);
+        let (blinded, blinding) = crate::crypto::rerandomize_pubkey(&pub_obj);
         Ok(Self {
             blinded_pubkey: blinded.to_bytes(),
             blinding,
         })
     }
-
-    /// Subscriber-side: recover `K_group` from the wrapped blob returned by
-    /// [`GroupKeyRegistry::join`], using the blinded-DH. `member_secret` is the
-    /// subscriber's stable secret scalar; `publisher_pubkey` is the ephemeral
-    /// publisher pubkey `join` returned. By DH commutativity this yields the
-    /// same shared secret the publisher computed against the blinded pubkey.
-    pub fn unwrap(
-        &self,
-        member_secret: &[u8; 32],
-        publisher_pubkey: &[u8; 32],
-        wrapped: &[u8],
-        group_uri: &str,
-        subject_did: &str,
-    ) -> Result<Zeroizing<[u8; 32]>, String> {
-        // (s_member + r) · P_publisher  ==  s_publisher · (P_member + r·G)
-        let shared = blinded_dh_raw(member_secret, &self.blinding, publisher_pubkey)
-            .map_err(|e| format!("blinded DH failed: {e}"))?;
-        // Salt is XOR-symmetric over the two pubkeys; join derived with
-        // (blinded_pubkey, publisher_ephemeral) — same two pubs here.
-        let wrap_key = derive_wrap_key(&shared, &self.blinded_pubkey, publisher_pubkey);
-        unwrap_group_key(&wrap_key, wrapped, &keyed_subject_hash(subject_did), group_uri)
-    }
 }
 
-// ────────────────────────────────────────────────────────────────────────────
-// Per-group key state (private)
-// ────────────────────────────────────────────────────────────────────────────
+#[derive(Clone, Debug)]
+pub enum MembershipChange {
+    Join(GroupMembership),
+    Leave {
+        subject_did: String,
+    },
+    Revoke {
+        subject_did: String,
+    },
+    Expire {
+        subject_did: String,
+    },
+    RotateRecipient(GroupMembership),
+    ControllerChange(ControllerBinding),
+    AcceptedStateAdvance {
+        accepted_state: Vec<u8>,
+        members: Vec<GroupMembership>,
+    },
+}
 
-struct GroupKeyState {
+#[derive(Clone, Debug)]
+pub struct EpochGrant {
+    pub group_uri: String,
+    pub controller_did: String,
+    pub keyset_id: String,
+    pub subject_did: String,
+    pub accepted_state: Vec<u8>,
+    pub sender_did: String,
+    pub sender_ed25519: [u8; 32],
+    pub sender_ml_dsa_65: Vec<u8>,
+    pub retention_policy: Vec<u8>,
+    pub opaque_routing_policy: Vec<u8>,
+    pub capability: Vec<u8>,
+    pub recipient_key_id: Vec<u8>,
+    pub blinded_routing_key: [u8; 32],
+    pub membership_version: u64,
+    pub epoch: u64,
+    pub expires_at_millis: i64,
+    pub sealed_epoch_secret: Vec<u8>,
+}
+
+#[derive(Clone, Debug)]
+pub struct PreparedEpoch {
+    pub group_uri: String,
+    pub keyset_id: String,
+    pub membership_version: u64,
+    pub epoch: u64,
+    pub grants: Vec<EpochGrant>,
+}
+
+struct EpochState {
     keyset_id: String,
+    membership_version: u64,
     epoch: u64,
-    current: Zeroizing<[u8; 32]>,
-    pending: Option<PendingRekey>,
+    key: Zeroizing<[u8; 32]>,
+    controller: ControllerBinding,
+    members: HashMap<String, GroupMembership>,
     created_at: Instant,
 }
 
-struct PendingRekey {
-    new_keyset_id: String,
-    new_epoch: u64,
-    new_key: Zeroizing<[u8; 32]>,
-    effective_at: Instant,
+struct PendingEpoch {
+    state: EpochState,
+    public: PreparedEpoch,
 }
 
 struct GroupState {
-    key_state: GroupKeyState,
-    /// Publisher's ephemeral Ristretto255 keypair for this group (the DH-wrap
-    /// publisher side; members DH against the public half).
-    ephemeral_secret: Zeroizing<[u8; 32]>,
-    ephemeral_pubkey: [u8; 32],
-    /// Members who have successfully joined (subject_did -> pubkey).
-    members: HashMap<String, [u8; 32]>,
+    current: EpochState,
+    pending: Option<PendingEpoch>,
 }
 
-// ────────────────────────────────────────────────────────────────────────────
-// GroupKeyRegistry — the primitive
-// ────────────────────────────────────────────────────────────────────────────
-
-/// Record-backed `K_group` registry: the general-purpose keyable-group primitive.
-///
-/// One instance per publishing node; groups are identified by a lexicon-agnostic
-/// [`GroupRef`]. Members join through a [`MembershipResolver`] (fail-closed);
-/// the current `K_group` is delivered via DH-wrap-on-join. Rekey rotates to a
-/// fresh random key (forward secrecy) under a [`RekeyPolicy`].
-///
-/// Consumers retrieve the current `K_group` via [`Self::k_group`] for downstream
-/// keyed-PRF uses (e.g. EventService's topic derivation).
 pub struct GroupKeyRegistry<R: MembershipResolver> {
     groups: Arc<RwLock<HashMap<GroupRef, GroupState>>>,
     rekey_policy: RekeyPolicy,
@@ -362,169 +287,234 @@ impl<R: MembershipResolver> GroupKeyRegistry<R> {
         })
     }
 
-    /// Register a group, generating a fresh `K_group` for `keyset_id` epoch 0.
-    /// Returns the publisher's ephemeral pubkey for this group (members DH
-    /// against it to receive their wrapped key).
-    pub async fn register_group(&self, group: GroupRef) -> Result<[u8; 32], String> {
-        let mut group_key = Zeroizing::new([0u8; 32]);
-        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut *group_key);
-
-        let (eph_secret, eph_public) = crate::crypto::generate_ephemeral_keypair();
-        let ephemeral_secret = Zeroizing::new(eph_secret.scalar().to_bytes());
-        let ephemeral_pubkey = eph_public.to_bytes();
-
-        let state = GroupState {
-            key_state: GroupKeyState {
-                keyset_id: group.keyset_id.clone(),
-                epoch: 0,
-                current: group_key,
-                pending: None,
-                created_at: Instant::now(),
-            },
-            ephemeral_secret,
-            ephemeral_pubkey,
+    pub async fn register_group(
+        &self,
+        group: GroupRef,
+        controller: ControllerBinding,
+    ) -> Result<(), String> {
+        validate_controller(&controller)?;
+        let state = EpochState {
+            keyset_id: group.keyset_id.clone(),
+            membership_version: 0,
+            epoch: 0,
+            key: random_epoch_key(),
+            controller,
             members: HashMap::new(),
+            created_at: Instant::now(),
         };
-
         let mut groups = self.groups.write();
         if groups.contains_key(&group) {
             return Err(format!("group {group:?} already registered"));
         }
-        groups.insert(group, state);
-        Ok(ephemeral_pubkey)
-    }
-
-    /// Join a group: resolve membership (fail-closed via [`MembershipResolver`]),
-    /// then DH-wrap the current `K_group` for the member.
-    ///
-    /// `member_pubkey` is the key the publisher DHs against — for EV4 participant
-    /// anonymity this SHOULD be a **blinded** presentation ([`BlindedMember`]),
-    /// not the subscriber's stable key. The publisher side is blinding-agnostic:
-    /// `ristretto_dh_raw` is commutative with the subscriber's `blinded_dh_raw`,
-    /// so the same wrap/unwrap round-trips whether `member_pubkey` is raw or
-    /// blinded. Presenting a raw key here is correct but exposes the stable key
-    /// to the publisher/relay — use [`BlindedMember`] for the confidential path.
-    ///
-    /// Returns `(wrapped_key_blob, keyset_id, epoch, publisher_ephemeral_pubkey)`.
-    /// The member unwraps with `unwrap_group_key` (raw) or [`BlindedMember::unwrap`]
-    /// (blinded) using the same DH (their secret + the returned publisher pubkey).
-    pub async fn join(
-        &self,
-        group: &GroupRef,
-        subject_did: &str,
-        member_pubkey: [u8; 32],
-    ) -> Result<(Vec<u8>, String, u64, [u8; 32]), String> {
-        let membership = self
-            .resolver
-            .resolve(&group.group_uri, subject_did, member_pubkey)?;
-        if membership.group_uri != group.group_uri || membership.subject_did != subject_did {
-            return Err("resolver returned mismatched membership".to_owned());
-        }
-
-        let mut groups = self.groups.write();
-        let state = groups
-            .get_mut(group)
-            .ok_or_else(|| format!("group {group:?} not registered"))?;
-
-        // DH(publisher_secret, member_pubkey) -> shared secret, THEN derive the
-        // wrap key from it (derive_wrap_key's first arg is the shared secret, not
-        // a raw scalar).
-        let shared_secret = Zeroizing::new(
-            crate::crypto::ristretto_dh_raw(&state.ephemeral_secret, &member_pubkey)
-                .map_err(|e| format!("DH failed: {e}"))?,
+        groups.insert(
+            group,
+            GroupState {
+                current: state,
+                pending: None,
+            },
         );
-        let wrap_key = derive_wrap_key(&shared_secret, &member_pubkey, &state.ephemeral_pubkey);
-        let wrapped = wrap_group_key(
-            &wrap_key,
-            &state.key_state.current,
-            &keyed_subject_hash(subject_did),
-            &group.group_uri,
-        )?;
-
-        state
-            .members
-            .insert(subject_did.to_owned(), member_pubkey);
-        Ok((
-            wrapped,
-            state.key_state.keyset_id.clone(),
-            state.key_state.epoch,
-            state.ephemeral_pubkey,
-        ))
-    }
-
-    /// Begin a rekey: generates a fresh random key under a new keyset_id/epoch,
-    /// staged as pending. Promotion timing/grace follows the registry's
-    /// [`RekeyPolicy`]; call [`Self::maybe_promote_pending`] to advance it.
-    pub async fn begin_rekey(
-        &self,
-        group: &GroupRef,
-        new_keyset_id: &str,
-        effective_at: Instant,
-    ) -> Result<(), String> {
-        let mut new_key = Zeroizing::new([0u8; 32]);
-        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut *new_key);
-
-        let mut groups = self.groups.write();
-        let state = groups
-            .get_mut(group)
-            .ok_or_else(|| format!("group {group:?} not registered"))?;
-        state.key_state.pending = Some(PendingRekey {
-            new_keyset_id: new_keyset_id.to_owned(),
-            new_epoch: state.key_state.epoch + 1,
-            new_key,
-            effective_at,
-        });
         Ok(())
     }
 
-    /// Promote a pending rekey if its `effective_at` has passed (no-op otherwise).
-    /// Old `K_group` bytes are dropped (zeroized) on promotion — forward secrecy:
-    /// a member who only has the old key cannot derive the new one.
-    pub async fn maybe_promote_pending(
+    /// Prepare the next epoch and seal it independently to every resulting
+    /// member. Current state remains visible until [`Self::commit_prepared`].
+    pub async fn prepare_change(
         &self,
         group: &GroupRef,
-        now: Instant,
-    ) -> Result<bool, String> {
+        change: MembershipChange,
+        new_keyset_id: impl Into<String>,
+    ) -> Result<PreparedEpoch, String> {
         let mut groups = self.groups.write();
         let state = groups
             .get_mut(group)
             .ok_or_else(|| format!("group {group:?} not registered"))?;
-
-        let due = matches!(&state.key_state.pending, Some(p) if now >= p.effective_at);
-        if !due {
-            return Ok(false);
+        if state.pending.is_some() {
+            return Err("a membership/epoch transaction is already pending".to_owned());
         }
-        let Some(pending) = state.key_state.pending.take() else {
-            return Ok(false);
+
+        let mut controller = state.current.controller.clone();
+        let mut members = state.current.members.clone();
+        match change {
+            MembershipChange::Join(requested) | MembershipChange::RotateRecipient(requested) => {
+                let resolved = self.resolver.resolve(&requested)?;
+                resolved.validate(&group.group_uri)?;
+                if resolved.subject_did != requested.subject_did
+                    || resolved.accepted_state != controller.accepted_state
+                {
+                    return Err("resolver returned mismatched or stale membership".to_owned());
+                }
+                members.insert(resolved.subject_did.clone(), resolved);
+            }
+            MembershipChange::Leave { subject_did }
+            | MembershipChange::Revoke { subject_did }
+            | MembershipChange::Expire { subject_did } => {
+                if members.remove(&subject_did).is_none() {
+                    return Err("member is not in the committed group".to_owned());
+                }
+            }
+            MembershipChange::ControllerChange(next) => {
+                validate_controller(&next)?;
+                controller = next;
+                // Controller/accepted-state changes invalidate every old grant.
+                members.clear();
+            }
+            MembershipChange::AcceptedStateAdvance {
+                accepted_state,
+                members: requested_members,
+            } => {
+                if accepted_state.is_empty() || accepted_state == controller.accepted_state {
+                    return Err(
+                        "accepted-state advance must install a fresh non-empty state".to_owned(),
+                    );
+                }
+                controller.accepted_state = accepted_state;
+                members.clear();
+                for requested in requested_members {
+                    let resolved = self.resolver.resolve(&requested)?;
+                    resolved.validate(&group.group_uri)?;
+                    if resolved.accepted_state != controller.accepted_state {
+                        return Err("member is not bound to the advanced accepted state".to_owned());
+                    }
+                    members.insert(resolved.subject_did.clone(), resolved);
+                }
+            }
+        }
+
+        let membership_version = state.current.membership_version + 1;
+        let epoch = state.current.epoch + 1;
+        let keyset_id = new_keyset_id.into();
+        if keyset_id.is_empty() || keyset_id == state.current.keyset_id {
+            return Err("new epoch requires a fresh keyset id".to_owned());
+        }
+        let key = random_epoch_key();
+        let grants = members
+            .values()
+            .map(|member| {
+                seal_epoch_grant(
+                    group,
+                    &keyset_id,
+                    &controller,
+                    member,
+                    membership_version,
+                    epoch,
+                    &key,
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let public = PreparedEpoch {
+            group_uri: group.group_uri.clone(),
+            keyset_id: keyset_id.clone(),
+            membership_version,
+            epoch,
+            grants,
         };
-        state.key_state.keyset_id = pending.new_keyset_id;
-        state.key_state.epoch = pending.new_epoch;
-        state.key_state.current = pending.new_key;
-        state.key_state.created_at = now;
-        Ok(true)
+        state.pending = Some(PendingEpoch {
+            state: EpochState {
+                keyset_id,
+                membership_version,
+                epoch,
+                key,
+                controller,
+                members,
+                created_at: Instant::now(),
+            },
+            public: public.clone(),
+        });
+        Ok(public)
     }
 
-    /// The current `K_group` for a group, if registered. Consumers use this for
-    /// downstream keyed-PRF derivations (e.g. EventService's topic key).
-    pub async fn k_group(&self, group: &GroupRef) -> Option<[u8; 32]> {
-        let groups = self.groups.read();
-        groups.get(group).map(|s| *s.key_state.current)
+    /// Atomically make a prepared membership version and epoch visible.
+    pub async fn commit_prepared(
+        &self,
+        group: &GroupRef,
+        membership_version: u64,
+        epoch: u64,
+    ) -> Result<(), String> {
+        let mut groups = self.groups.write();
+        let state = groups
+            .get_mut(group)
+            .ok_or_else(|| format!("group {group:?} not registered"))?;
+        let pending = state
+            .pending
+            .as_ref()
+            .ok_or_else(|| "no pending epoch".to_owned())?;
+        if pending.public.membership_version != membership_version || pending.public.epoch != epoch
+        {
+            return Err("commit coordinates do not match the pending transaction".to_owned());
+        }
+        let pending = state
+            .pending
+            .take()
+            .ok_or_else(|| "no pending epoch".to_owned())?;
+        state.current = pending.state;
+        Ok(())
     }
 
-    /// `(keyset_id, epoch)` for a group, if registered.
-    pub async fn keyset(&self, group: &GroupRef) -> Option<(String, u64)> {
+    /// Discard an uncommitted transaction. The committed epoch is untouched.
+    pub async fn abort_prepared(&self, group: &GroupRef) -> Result<(), String> {
+        let mut groups = self.groups.write();
+        let state = groups
+            .get_mut(group)
+            .ok_or_else(|| format!("group {group:?} not registered"))?;
+        state.pending = None;
+        Ok(())
+    }
+
+    pub async fn committed_coordinates(&self, group: &GroupRef) -> Option<(String, u64, u64)> {
         let groups = self.groups.read();
-        groups
+        groups.get(group).map(|state| {
+            (
+                state.current.keyset_id.clone(),
+                state.current.membership_version,
+                state.current.epoch,
+            )
+        })
+    }
+
+    pub async fn pending_epoch(&self, group: &GroupRef) -> Option<PreparedEpoch> {
+        self.groups
+            .read()
             .get(group)
-            .map(|s| (s.key_state.keyset_id.clone(), s.key_state.epoch))
+            .and_then(|state| state.pending.as_ref().map(|pending| pending.public.clone()))
+    }
+
+    pub async fn k_group(&self, group: &GroupRef) -> Option<[u8; 32]> {
+        self.groups
+            .read()
+            .get(group)
+            .map(|state| *state.current.key)
+    }
+
+    pub async fn contains_member(&self, group: &GroupRef, subject_did: &str) -> bool {
+        self.groups
+            .read()
+            .get(group)
+            .is_some_and(|state| state.current.members.contains_key(subject_did))
+    }
+
+    pub async fn needs_rotation(&self, group: &GroupRef) -> bool {
+        let groups = self.groups.read();
+        let Some(state) = groups.get(group) else {
+            return false;
+        };
+        let age = state.current.created_at.elapsed();
+        match self.rekey_policy {
+            RekeyPolicy::Immediate => false,
+            RekeyPolicy::Scheduled { interval } => age >= interval,
+            RekeyPolicy::Jittered { interval, jitter } => {
+                let digest = blake3::hash(group.group_uri.as_bytes());
+                let fraction = u16::from_be_bytes([digest.as_bytes()[0], digest.as_bytes()[1]])
+                    as f64
+                    / u16::MAX as f64;
+                age >= interval + Duration::from_secs_f64(jitter.as_secs_f64() * fraction)
+            }
+        }
     }
 
     pub fn rekey_policy(&self) -> &RekeyPolicy {
         &self.rekey_policy
     }
 
-    /// Best-effort wall-clock timestamp helper (unix millis) for consumers
-    /// building [`RotationResult`]-style outputs.
     pub fn now_millis() -> i64 {
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -533,17 +523,117 @@ impl<R: MembershipResolver> GroupKeyRegistry<R> {
     }
 }
 
-/// Subject-identity hash bound into the wrap AAD — a DID's UTF-8 bytes hashed to
-/// 32 bytes. DIDs are the membership identity; pubkeys are per-session, so the
-/// wrap AAD binds to the stable identity, not the ephemeral key.
-fn keyed_subject_hash(subject_did: &str) -> [u8; 32] {
-    // Domain-separated, unkeyed-in-effect (zero key) hash — this is an AAD
-    // binding value, not a secret; keyed_mac is used here for consistency with
-    // the rest of the crypto module's primitives.
-    let zero_key = [0u8; 32];
-    let mac = keyed_mac(&zero_key, subject_did.as_bytes());
-    let mut out = [0u8; 32];
-    out.copy_from_slice(&mac[..32]);
+pub fn recipient_key_id(recipient: &RecipientPublic) -> Vec<u8> {
+    blake3::derive_key(
+        "hyprstream group HyKEM recipient key id v1",
+        &recipient.encode(),
+    )
+    .to_vec()
+}
+
+pub fn open_epoch_grant(
+    recipient: &RecipientKeypair,
+    grant: &EpochGrant,
+) -> Result<Zeroizing<[u8; 32]>, String> {
+    if recipient_key_id(&recipient.public()) != grant.recipient_key_id {
+        return Err("epoch grant is not addressed to this HyKEM recipient".to_owned());
+    }
+    let aad = epoch_grant_aad(grant);
+    let plaintext = cose_encrypt::open_from_recipient(
+        recipient,
+        &grant.sealed_epoch_secret,
+        &aad,
+        grant.epoch,
+        grant.membership_version,
+    )
+    .map_err(|e| format!("hybrid epoch unwrap failed: {e}"))?;
+    let key: [u8; 32] = plaintext
+        .try_into()
+        .map_err(|_| "epoch secret must be exactly 32 bytes".to_owned())?;
+    Ok(Zeroizing::new(key))
+}
+
+fn validate_controller(controller: &ControllerBinding) -> Result<(), String> {
+    if controller.controller_did.is_empty()
+        || controller.accepted_state.is_empty()
+        || controller.sender_did.is_empty()
+        || controller.sender_ed25519 == [0; 32]
+        || controller.sender_ml_dsa_65.is_empty()
+        || controller.retention_policy.is_empty()
+        || controller.opaque_routing_policy.is_empty()
+    {
+        return Err("controller binding is incomplete".to_owned());
+    }
+    ed25519_dalek::VerifyingKey::from_bytes(&controller.sender_ed25519)
+        .map_err(|_| "controller sender Ed25519 key is invalid".to_owned())?;
+    crate::crypto::pq::ml_dsa_vk_from_bytes(&controller.sender_ml_dsa_65)
+        .map_err(|_| "controller sender ML-DSA-65 key is invalid".to_owned())?;
+    Ok(())
+}
+
+fn random_epoch_key() -> Zeroizing<[u8; 32]> {
+    let mut key = Zeroizing::new([0; 32]);
+    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut *key);
+    key
+}
+
+fn seal_epoch_grant(
+    group: &GroupRef,
+    keyset_id: &str,
+    controller: &ControllerBinding,
+    member: &GroupMembership,
+    membership_version: u64,
+    epoch: u64,
+    key: &[u8; 32],
+) -> Result<EpochGrant, String> {
+    let mut grant = EpochGrant {
+        group_uri: group.group_uri.clone(),
+        controller_did: controller.controller_did.clone(),
+        keyset_id: keyset_id.to_owned(),
+        subject_did: member.subject_did.clone(),
+        accepted_state: member.accepted_state.clone(),
+        sender_did: controller.sender_did.clone(),
+        sender_ed25519: controller.sender_ed25519,
+        sender_ml_dsa_65: controller.sender_ml_dsa_65.clone(),
+        retention_policy: controller.retention_policy.clone(),
+        opaque_routing_policy: controller.opaque_routing_policy.clone(),
+        capability: member.capability.clone(),
+        recipient_key_id: member.recipient_key_id.clone(),
+        blinded_routing_key: member.blinded_routing_key,
+        membership_version,
+        epoch,
+        expires_at_millis: member.expires_at_millis.min(controller.expires_at_millis),
+        sealed_epoch_secret: Vec::new(),
+    };
+    let aad = epoch_grant_aad(&grant);
+    grant.sealed_epoch_secret =
+        cose_encrypt::seal_to_recipient(&member.recipient, key, &aad, epoch, membership_version)
+            .map_err(|e| format!("hybrid epoch seal failed: {e}"))?;
+    Ok(grant)
+}
+
+fn epoch_grant_aad(grant: &EpochGrant) -> Vec<u8> {
+    fn lp(out: &mut Vec<u8>, value: &[u8]) {
+        out.extend_from_slice(&(value.len() as u32).to_be_bytes());
+        out.extend_from_slice(value);
+    }
+    let mut out = b"hyprstream controller group epoch grant v1".to_vec();
+    lp(&mut out, grant.group_uri.as_bytes());
+    lp(&mut out, grant.controller_did.as_bytes());
+    lp(&mut out, grant.keyset_id.as_bytes());
+    lp(&mut out, grant.subject_did.as_bytes());
+    lp(&mut out, &grant.accepted_state);
+    lp(&mut out, grant.sender_did.as_bytes());
+    lp(&mut out, &grant.sender_ed25519);
+    lp(&mut out, &grant.sender_ml_dsa_65);
+    lp(&mut out, &grant.retention_policy);
+    lp(&mut out, &grant.opaque_routing_policy);
+    lp(&mut out, &grant.capability);
+    lp(&mut out, &grant.recipient_key_id);
+    lp(&mut out, &grant.blinded_routing_key);
+    out.extend_from_slice(&grant.membership_version.to_be_bytes());
+    out.extend_from_slice(&grant.epoch.to_be_bytes());
+    out.extend_from_slice(&grant.expires_at_millis.to_be_bytes());
     out
 }
 
@@ -551,187 +641,214 @@ fn keyed_subject_hash(subject_did: &str) -> [u8; 32] {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
-    use crate::crypto::event_crypto::{derive_wrap_key, unwrap_group_key};
+    use crate::crypto::hybrid_kem::{generate_recipient, SuiteId};
 
-    struct AllowResolver;
-    impl MembershipResolver for AllowResolver {
-        fn resolve(
-            &self,
-            group_uri: &str,
-            subject_did: &str,
-            member_pubkey: [u8; 32],
-        ) -> Result<GroupMembership, String> {
-            Ok(GroupMembership {
-                group_uri: group_uri.to_owned(),
-                subject_did: subject_did.to_owned(),
-                member_pubkey,
-            })
+    struct AllowExact;
+    impl MembershipResolver for AllowExact {
+        fn resolve(&self, requested: &GroupMembership) -> Result<GroupMembership, String> {
+            Ok(requested.clone())
         }
     }
 
-    fn grp(uri: &str) -> GroupRef {
-        GroupRef::new(uri, "ks-1")
+    fn group() -> GroupRef {
+        GroupRef::new("at://did:web:controller/events/g1", "ks-0")
+    }
+    fn controller(state: &[u8]) -> ControllerBinding {
+        let ed = ed25519_dalek::SigningKey::from_bytes(&[42; 32]);
+        let pq = crate::node_identity::derive_mesh_mldsa_key(&ed);
+        ControllerBinding {
+            controller_did: "did:web:controller".to_owned(),
+            accepted_state: state.to_vec(),
+            sender_did: "did:web:publisher".to_owned(),
+            sender_ed25519: ed.verifying_key().to_bytes(),
+            sender_ml_dsa_65: crate::crypto::pq::ml_dsa_sk_to_vk_bytes(&pq),
+            retention_policy: b"retention:bounded-v1".to_vec(),
+            opaque_routing_policy: b"routing:stock-moq-opaque-v1".to_vec(),
+            expires_at_millis: i64::MAX,
+        }
+    }
+    fn member(did: &str, recipient: &RecipientKeypair, blind: u8, state: &[u8]) -> GroupMembership {
+        let public = recipient.public();
+        GroupMembership {
+            group_uri: group().group_uri,
+            subject_did: did.to_owned(),
+            accepted_state: state.to_vec(),
+            capability: format!("cap:{did}:subscribe").into_bytes(),
+            recipient_key_id: recipient_key_id(&public),
+            recipient: public,
+            blinded_routing_key: [blind; 32],
+            expires_at_millis: i64::MAX,
+        }
     }
 
     #[tokio::test]
-    async fn deny_all_resolver_fails_closed() {
-        let registry =
-            GroupKeyRegistry::new(RekeyPolicy::Immediate, DenyAllResolver).unwrap();
-        registry.register_group(grp("at://did:web:a/g1")).await.unwrap();
-        let result = registry
-            .join(&grp("at://did:web:a/g1"), "did:web:member", [7u8; 32])
-            .await;
-        assert!(result.is_err(), "DenyAllResolver must fail-closed");
-    }
-
-    #[tokio::test]
-    async fn join_then_unwrap_round_trips() {
-        let registry =
-            GroupKeyRegistry::new(RekeyPolicy::Immediate, AllowResolver).unwrap();
-        let g = grp("at://did:web:a/g1");
-        registry.register_group(g.clone()).await.unwrap();
-
-        let (member_secret, member_public) = crate::crypto::generate_ephemeral_keypair();
-        let member_secret_bytes = member_secret.scalar().to_bytes();
-        let member_pubkey = member_public.to_bytes();
-
-        let (wrapped, keyset_id, epoch, publisher_pubkey) = registry
-            .join(&g, "did:web:member", member_pubkey)
-            .await
-            .unwrap();
-        assert_eq!(keyset_id, "ks-1");
-        assert_eq!(epoch, 0);
-
-        let shared =
-            crate::crypto::ristretto_dh_raw(&member_secret_bytes, &publisher_pubkey)
-                .expect("dh");
-        let member_wrap_key = derive_wrap_key(&shared, &publisher_pubkey, &member_pubkey);
-        let unwrapped = unwrap_group_key(
-            &member_wrap_key,
-            &wrapped,
-            &keyed_subject_hash("did:web:member"),
-            &g.group_uri,
-        );
-        assert!(
-            unwrapped.is_ok(),
-            "member must be able to unwrap K_group via DH: {:?}",
-            unwrapped.err()
-        );
-    }
-
-    #[tokio::test]
-    async fn blinded_join_then_unwrap_round_trips() {
-        // EV4: the subscriber presents a BLINDED pubkey to join; the publisher
-        // DHs against the blinded key (blinding-agnostic) and never sees the
-        // stable key. The subscriber unwraps via blinded_dh_raw.
-        let registry =
-            GroupKeyRegistry::new(RekeyPolicy::Immediate, AllowResolver).unwrap();
-        let g = grp("at://did:web:a/g1");
-        registry.register_group(g.clone()).await.unwrap();
-
-        let (member_secret, member_public) = crate::crypto::generate_ephemeral_keypair();
-        let member_secret_bytes = member_secret.scalar().to_bytes();
-        let member_pubkey = member_public.to_bytes();
-
-        // Subscriber blinds their stable key (subscriber-side; r never leaves).
-        let blinded = BlindedMember::new(&member_pubkey).expect("blind");
-        // The blinded pubkey is different from the stable key ( unlinkable).
-        assert_ne!(blinded.blinded_pubkey, member_pubkey);
-
-        // join receives the BLINDED pubkey; the publisher never sees `member_pubkey`.
-        let (wrapped, _keyset_id, _epoch, publisher_pubkey) = registry
-            .join(&g, "did:web:member", blinded.blinded_pubkey)
-            .await
-            .expect("join with blinded pubkey");
-
-        // Subscriber unwraps via the blinded-DH path.
-        let recovered = blinded
-            .unwrap(
-                &member_secret_bytes,
-                &publisher_pubkey,
-                &wrapped,
-                &g.group_uri,
-                "did:web:member",
-            )
-            .expect("blinded unwrap");
-        // And it equals the registry's authoritative K_group.
-        let authoritative = registry.k_group(&g).await.expect("k_group");
-        assert_eq!(*recovered, authoritative);
-    }
-
-    #[tokio::test]
-    async fn k_group_returns_current_key() {
-        let registry =
-            GroupKeyRegistry::new(RekeyPolicy::Immediate, AllowResolver).unwrap();
-        let g = grp("at://did:web:a/g1");
-        registry.register_group(g.clone()).await.unwrap();
-        assert!(registry.k_group(&g).await.is_some());
-        assert_eq!(registry.keyset(&g).await, Some(("ks-1".to_owned(), 0)));
-    }
-
-    #[tokio::test]
-    async fn rekey_rotates_to_fresh_random_key_and_old_key_unrecoverable() {
-        let registry =
-            GroupKeyRegistry::new(RekeyPolicy::Immediate, AllowResolver).unwrap();
-        let g = grp("at://did:web:a/g1");
-        registry.register_group(g.clone()).await.unwrap();
-
-        let now = Instant::now();
+    async fn deny_all_fails_before_epoch_release() {
+        let registry = GroupKeyRegistry::new(RekeyPolicy::Immediate, DenyAllResolver).unwrap();
         registry
-            .begin_rekey(&g, "ks-2", now)
+            .register_group(group(), controller(b"cid512:a"))
             .await
             .unwrap();
-        let promoted = registry.maybe_promote_pending(&g, now).await.unwrap();
-        assert!(promoted, "effective_at already passed -> should promote");
-
-        // Re-join after rotation must report the NEW keyset/epoch.
-        let (_, member2_pubkey) = crate::crypto::generate_ephemeral_keypair();
-        let (_wrapped, keyset_id, epoch, _pub) = registry
-            .join(&g, "did:web:member2", member2_pubkey.to_bytes())
-            .await
-            .unwrap();
-        assert_eq!(keyset_id, "ks-2");
-        assert_eq!(epoch, 1);
+        let recipient = generate_recipient(SuiteId::HyKemX25519MlKem768).unwrap();
+        let result = registry
+            .prepare_change(
+                &group(),
+                MembershipChange::Join(member("did:web:m", &recipient, 7, b"cid512:a")),
+                "ks-1",
+            )
+            .await;
+        assert!(result.is_err());
+        assert_eq!(registry.committed_coordinates(&group()).await.unwrap().1, 0);
     }
 
     #[tokio::test]
-    async fn rekey_not_yet_effective_does_not_promote() {
-        let registry =
-            GroupKeyRegistry::new(RekeyPolicy::Immediate, AllowResolver).unwrap();
-        let g = grp("at://did:web:a/g1");
-        registry.register_group(g.clone()).await.unwrap();
-
-        let future = Instant::now() + Duration::from_secs(3600);
-        registry.begin_rekey(&g, "ks-2", future).await.unwrap();
-        let promoted = registry.maybe_promote_pending(&g, Instant::now()).await.unwrap();
-        assert!(!promoted, "effective_at in the future -> must not promote yet");
-
-        let (_, member3_pubkey) = crate::crypto::generate_ephemeral_keypair();
-        let (_wrapped, keyset_id, epoch, _pub) = registry
-            .join(&g, "did:web:member3", member3_pubkey.to_bytes())
+    async fn hybrid_join_unwraps_and_wrong_recipient_cannot() {
+        let registry = GroupKeyRegistry::new(RekeyPolicy::Immediate, AllowExact).unwrap();
+        registry
+            .register_group(group(), controller(b"cid512:a"))
             .await
             .unwrap();
-        assert_eq!(keyset_id, "ks-1", "still on old keyset until promotion");
-        assert_eq!(epoch, 0);
+        let recipient = generate_recipient(SuiteId::HyKemX25519MlKem768).unwrap();
+        let wrong = generate_recipient(SuiteId::HyKemX25519MlKem768).unwrap();
+        let prepared = registry
+            .prepare_change(
+                &group(),
+                MembershipChange::Join(member("did:web:m", &recipient, 7, b"cid512:a")),
+                "ks-1",
+            )
+            .await
+            .unwrap();
+        assert_eq!(prepared.grants.len(), 1);
+        assert!(open_epoch_grant(&wrong, &prepared.grants[0]).is_err());
+        let opened = open_epoch_grant(&recipient, &prepared.grants[0]).unwrap();
+        registry.commit_prepared(&group(), 1, 1).await.unwrap();
+        assert_eq!(*opened, registry.k_group(&group()).await.unwrap());
     }
 
     #[tokio::test]
-    async fn duplicate_registration_rejected() {
-        let registry =
-            GroupKeyRegistry::new(RekeyPolicy::Immediate, AllowResolver).unwrap();
-        let g = grp("at://did:web:a/g1");
-        registry.register_group(g.clone()).await.unwrap();
-        let second = registry.register_group(g).await;
-        assert!(second.is_err());
+    async fn prepare_is_invisible_and_abort_preserves_committed_epoch() {
+        let registry = GroupKeyRegistry::new(RekeyPolicy::Immediate, AllowExact).unwrap();
+        registry
+            .register_group(group(), controller(b"cid512:a"))
+            .await
+            .unwrap();
+        let recipient = generate_recipient(SuiteId::HyKemX25519MlKem768).unwrap();
+        registry
+            .prepare_change(
+                &group(),
+                MembershipChange::Join(member("did:web:m", &recipient, 8, b"cid512:a")),
+                "ks-1",
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            registry.committed_coordinates(&group()).await.unwrap(),
+            ("ks-0".to_owned(), 0, 0)
+        );
+        assert!(!registry.contains_member(&group(), "did:web:m").await);
+        registry.abort_prepared(&group()).await.unwrap();
+        assert_eq!(registry.committed_coordinates(&group()).await.unwrap().2, 0);
+    }
+
+    #[tokio::test]
+    async fn revoke_rotates_and_excludes_revoked_member() {
+        let registry = GroupKeyRegistry::new(
+            RekeyPolicy::Scheduled {
+                interval: Duration::from_secs(3600),
+            },
+            AllowExact,
+        )
+        .unwrap();
+        registry
+            .register_group(group(), controller(b"cid512:a"))
+            .await
+            .unwrap();
+        let a = generate_recipient(SuiteId::HyKemX25519MlKem768).unwrap();
+        let b = generate_recipient(SuiteId::HyKemX25519MlKem768).unwrap();
+        let p = registry
+            .prepare_change(
+                &group(),
+                MembershipChange::Join(member("did:web:a", &a, 1, b"cid512:a")),
+                "ks-1",
+            )
+            .await
+            .unwrap();
+        registry
+            .commit_prepared(&group(), p.membership_version, p.epoch)
+            .await
+            .unwrap();
+        let p = registry
+            .prepare_change(
+                &group(),
+                MembershipChange::Join(member("did:web:b", &b, 2, b"cid512:a")),
+                "ks-2",
+            )
+            .await
+            .unwrap();
+        registry
+            .commit_prepared(&group(), p.membership_version, p.epoch)
+            .await
+            .unwrap();
+        let p = registry
+            .prepare_change(
+                &group(),
+                MembershipChange::Revoke {
+                    subject_did: "did:web:a".to_owned(),
+                },
+                "ks-3",
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            p.grants.len(),
+            1,
+            "revoked member receives no next-epoch material"
+        );
+        assert_eq!(p.grants[0].subject_did, "did:web:b");
+        assert!(open_epoch_grant(&a, &p.grants[0]).is_err());
+        assert!(open_epoch_grant(&b, &p.grants[0]).is_ok());
+        registry
+            .commit_prepared(&group(), p.membership_version, p.epoch)
+            .await
+            .unwrap();
+        assert!(!registry.contains_member(&group(), "did:web:a").await);
+    }
+
+    #[tokio::test]
+    async fn aad_mutation_and_classical_key_substitution_fail() {
+        let registry = GroupKeyRegistry::new(RekeyPolicy::Immediate, AllowExact).unwrap();
+        registry
+            .register_group(group(), controller(b"cid512:a"))
+            .await
+            .unwrap();
+        let recipient = generate_recipient(SuiteId::HyKemX25519MlKem768).unwrap();
+        let p = registry
+            .prepare_change(
+                &group(),
+                MembershipChange::Join(member("did:web:m", &recipient, 3, b"cid512:a")),
+                "ks-1",
+            )
+            .await
+            .unwrap();
+        let mut mutated = p.grants[0].clone();
+        mutated.controller_did = "did:web:attacker".to_owned();
+        assert!(
+            open_epoch_grant(&recipient, &mutated).is_err(),
+            "controller mutation must invalidate COSE AAD"
+        );
+        let mut substituted = p.grants[0].clone();
+        // Mutation-effective negative control for the removed signing-key-as-KEX bug:
+        // an arbitrary 32-byte classical signing public key cannot stand in for
+        // the separately accepted suite-identified HyKEM recipient.
+        substituted.recipient_key_id = vec![0xED; 32];
+        assert!(open_epoch_grant(&recipient, &substituted).is_err());
     }
 
     #[test]
-    fn rekey_policy_validation_rejects_overlong_interval() {
-        assert!(RekeyPolicy::Scheduled {
-            interval: Duration::from_secs(100_000)
-        }
-        .validate()
-        .is_err());
-        assert!(RekeyPolicy::Immediate.validate().is_ok());
+    fn blinded_presentations_remain_unlinkable_but_are_not_kex_keys() {
+        let (_, stable) = crate::crypto::generate_ephemeral_keypair();
+        let a = BlindedMember::new(&stable.to_bytes()).unwrap();
+        let b = BlindedMember::new(&stable.to_bytes()).unwrap();
+        assert_ne!(a.blinded_pubkey, stable.to_bytes());
+        assert_ne!(a.blinded_pubkey, b.blinded_pubkey);
     }
 }

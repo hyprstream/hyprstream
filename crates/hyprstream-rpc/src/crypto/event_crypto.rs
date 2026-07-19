@@ -1,24 +1,17 @@
-//! Cryptographic primitives for secure event transport (Phase 7).
+//! Cryptographic primitives for EventService transport.
 //!
-//! Provides:
-//! - Group key wrapping/unwrapping for per-subscriber key distribution
-//! - Event payload encryption/decryption with AES-256-GCM
-//! - Key commitment for fast rejection before AEAD decryption
-//! - Ed25519 event signing message construction
+//! The controller supplies a fresh random secret for every committed group
+//! epoch. Confidential event objects never use that secret directly as an AEAD
+//! key: they derive sender/track keys and nonce domains, bind publisher/track/
+//! membership-version/epoch/sequence into AAD, and derive each nonce from the
+//! domain plus epoch sequence. The module retains legacy low-level wrap helpers
+//! for compatibility, but the surviving EventService path distributes epochs
+//! exclusively through per-member HyKEM/COSE grants in `group_key`.
 //!
-//! # Design
-//!
-//! - Publisher generates a random group key per topic prefix
-//! - Each subscriber receives the group key wrapped with a DH-derived wrap key
-//! - Events are encrypted with the group key (shared across all subscribers)
-//! - Key commitment (truncated HMAC) allows fast rejection of wrong-key attempts
-//!
-//! # Security Properties
-//!
-//! - AAD binding prevents cross-prefix and cross-subscriber confusion
-//! - Length-prefixed AAD prevents concatenation ambiguity
-//! - Key commitment provides committing AEAD (prevents key-multi-collision attacks)
-//! - All nonces are random from OsRng (never derived)
+//! Key commitment provides fast wrong-key rejection before AES-256-GCM
+//! decryption. Publisher signature transcripts bind the plaintext and epoch
+//! coordinates and are consumed by the mandatory Ed25519 + ML-DSA-65 composite
+//! attestation in `events`.
 
 use aes_gcm::{
     aead::{Aead, AeadCore, KeyInit, Payload},
@@ -405,6 +398,142 @@ pub fn decrypt_event_full(
 }
 
 // ============================================================================
+// Controller-managed epoch object profile (#555)
+// ============================================================================
+
+const EPOCH_OBJECT_AAD_DOMAIN: &[u8] = b"hyprstream event epoch object aad v1";
+
+/// Derive an AEAD key unique to one `(epoch secret, sender, track)` domain.
+/// The shared epoch secret is never used directly as an AEAD key.
+pub fn derive_sender_track_key(
+    epoch_secret: &[u8; 32],
+    publisher_kid: &[u8; 32],
+    track: &str,
+) -> Zeroizing<[u8; 32]> {
+    let mut material = Vec::with_capacity(32 + 4 + track.len());
+    material.extend_from_slice(publisher_kid);
+    material.extend_from_slice(&(track.len() as u32).to_be_bytes());
+    material.extend_from_slice(track.as_bytes());
+    Zeroizing::new(blake3::derive_key(
+        "hyprstream event sender track key v1",
+        &[epoch_secret.as_slice(), material.as_slice()].concat(),
+    ))
+}
+
+/// Derive an independent nonce domain unique to one `(epoch secret, sender,
+/// track)` lifecycle. It is separate from the sender/track AEAD-key derivation.
+pub fn derive_sender_track_nonce_domain(
+    epoch_secret: &[u8; 32],
+    publisher_kid: &[u8; 32],
+    track: &str,
+) -> [u8; 32] {
+    let mut material = Vec::with_capacity(32 + 32 + 4 + track.len());
+    material.extend_from_slice(epoch_secret);
+    material.extend_from_slice(publisher_kid);
+    material.extend_from_slice(&(track.len() as u32).to_be_bytes());
+    material.extend_from_slice(track.as_bytes());
+    blake3::derive_key("hyprstream event sender track nonce domain v1", &material)
+}
+
+/// Derive the 96-bit nonce from an independent sender/track nonce domain,
+/// committed epoch, and monotonic object sequence.
+pub fn derive_event_nonce(nonce_domain: &[u8; 32], epoch: u64, sequence: u64) -> [u8; 12] {
+    let mut input = Vec::with_capacity(48);
+    input.extend_from_slice(nonce_domain);
+    input.extend_from_slice(&epoch.to_be_bytes());
+    input.extend_from_slice(&sequence.to_be_bytes());
+    let digest = blake3::derive_key("hyprstream event nonce v1", &input);
+    let mut nonce = [0; 12];
+    nonce.copy_from_slice(&digest[..12]);
+    nonce
+}
+
+/// Canonical authenticated coordinates kept inside the application payload/AAD;
+/// a stock relay need not understand any of them.
+pub fn build_epoch_object_aad(
+    track: &str,
+    publisher_kid: &[u8; 32],
+    membership_version: u64,
+    epoch: u64,
+    sequence: u64,
+) -> Vec<u8> {
+    let mut aad = Vec::with_capacity(EPOCH_OBJECT_AAD_DOMAIN.len() + 4 + track.len() + 56);
+    aad.extend_from_slice(EPOCH_OBJECT_AAD_DOMAIN);
+    aad.extend_from_slice(&(track.len() as u32).to_be_bytes());
+    aad.extend_from_slice(track.as_bytes());
+    aad.extend_from_slice(publisher_kid);
+    aad.extend_from_slice(&membership_version.to_be_bytes());
+    aad.extend_from_slice(&epoch.to_be_bytes());
+    aad.extend_from_slice(&sequence.to_be_bytes());
+    aad
+}
+
+pub fn encrypt_epoch_event(
+    epoch_secret: &[u8; 32],
+    nonce_domain: &[u8; 32],
+    track: &str,
+    publisher_kid: &[u8; 32],
+    membership_version: u64,
+    epoch: u64,
+    sequence: u64,
+    plaintext: &[u8],
+) -> Result<(Vec<u8>, Vec<u8>, [u8; 12], [u8; 16]), String> {
+    let key = derive_sender_track_key(epoch_secret, publisher_kid, track);
+    let nonce = derive_event_nonce(nonce_domain, epoch, sequence);
+    let aad = build_epoch_object_aad(track, publisher_kid, membership_version, epoch, sequence);
+    let commitment = key_commitment(&key, &nonce);
+    let output = aes_gcm_encrypt(&key, &nonce, plaintext, &aad)?;
+    if output.len() < 16 {
+        return Err("AEAD output too short".to_owned());
+    }
+    let split = output.len() - 16;
+    Ok((
+        output[split..].to_vec(),
+        output[..split].to_vec(),
+        nonce,
+        commitment,
+    ))
+}
+
+pub fn decrypt_epoch_event(
+    epoch_secret: &[u8; 32],
+    track: &str,
+    publisher_kid: &[u8; 32],
+    membership_version: u64,
+    epoch: u64,
+    sequence: u64,
+    nonce: &[u8; 12],
+    tag: &[u8],
+    ciphertext: &[u8],
+    commitment: &[u8; 16],
+) -> Result<Vec<u8>, String> {
+    let key = derive_sender_track_key(epoch_secret, publisher_kid, track);
+    if !check_key_commitment(&key, nonce, commitment) {
+        return Err("sender/track key commitment mismatch".to_owned());
+    }
+    let aad = build_epoch_object_aad(track, publisher_kid, membership_version, epoch, sequence);
+    let mut combined = Vec::with_capacity(ciphertext.len() + tag.len());
+    combined.extend_from_slice(ciphertext);
+    combined.extend_from_slice(tag);
+    aes_gcm_decrypt(&key, nonce, &combined, &aad)
+}
+
+/// Hybrid-attested event transcript. Epoch coordinates and sequence are signed,
+/// so possession of the symmetric epoch key is not publisher identity evidence.
+pub fn build_epoch_event_sig_message(
+    topic: &str,
+    payload: &[u8],
+    timestamp: i64,
+    membership_version: u64,
+    epoch: u64,
+    sequence: u64,
+) -> Vec<u8> {
+    let mut msg = build_event_sig_message(topic, payload, timestamp);
+    msg.extend_from_slice(&membership_version.to_be_bytes());
+    msg.extend_from_slice(&epoch.to_be_bytes());
+    msg.extend_from_slice(&sequence.to_be_bytes());
+    msg
+}
 // Ed25519 Event Signing
 // ============================================================================
 
