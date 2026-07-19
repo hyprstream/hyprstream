@@ -40,7 +40,7 @@ use hyprstream_rpc::streaming::StreamPayload;
 use hyprstream_rpc::transport::TransportConfig;
 use rmcp::{
     model::{
-        CallToolRequestParams, CallToolResult, Content, JsonObject,
+        CallToolRequestParams, CallToolResult, Content, ErrorCode, JsonObject,
         ListToolsResult, PaginatedRequestParams, ServerCapabilities, ServerInfo, Tool,
         ToolAnnotations,
     },
@@ -73,6 +73,12 @@ const REFRESH_TOOLS_UUID: Uuid = Uuid::from_bytes([
     0xb0, 0x76, 0x76, 0xdf, 0xbe, 0x7f, 0x56, 0xeb,
     0x9c, 0xd8, 0xe9, 0x1c, 0xfd, 0x68, 0x91, 0x58,
 ]);
+
+/// JSON-RPC error code returned when MCP authentication fails.
+///
+/// JSON-RPC 2.0 reserves -32099..=-32000 for implementation-defined server
+/// errors; -32001 signals an unauthenticated caller (#1095: fail closed).
+const MCP_AUTH_ERROR: ErrorCode = ErrorCode(-32001);
 
 /// Normalize MCP tool arguments for backend deserialization.
 ///
@@ -723,6 +729,33 @@ pub struct McpService {
     policy_client: PolicyClient,
 }
 
+/// Resolve the stdio caller identity from the `HYPRSTREAM_TOKEN` env token.
+///
+/// Fail closed (#1095): a token that is *present but fails to decode*
+/// (expired, malformed, wrong key or audience) is positive evidence of a bad
+/// credential and is hard-rejected — never silently downgraded to anonymous.
+/// Only a genuinely absent token routes to the anonymous principal, which
+/// remains an explicit deployment choice for local stdio use.
+fn stdio_user(
+    token: Option<&str>,
+    verifying_key: &VerifyingKey,
+    expected_audience: Option<&str>,
+) -> Result<String, ErrorData> {
+    match token {
+        Some(token) => jwt::decode(token, verifying_key, expected_audience)
+            .map(|claims| claims.sub)
+            .map_err(|e| {
+                warn!("MCP stdio auth: rejecting request, token decode failed ({})", e);
+                ErrorData::new(
+                    MCP_AUTH_ERROR,
+                    format!("MCP stdio authentication failed: {}", e),
+                    None,
+                )
+            }),
+        None => Ok("anonymous".to_owned()),
+    }
+}
+
 impl McpService {
     /// Create a new McpService with JWT authentication
     pub fn new(config: McpConfig) -> anyhow::Result<Self> {
@@ -814,11 +847,14 @@ impl McpService {
     /// Priority:
     /// 1. HTTP transport: use `AuthenticatedUser` from middleware (already validated)
     /// 2. Stdio/ZMQ transport (no HTTP Parts): use env var JWT claims or `"anonymous"`
-    fn extract_user(&self, context: &RequestContext<RoleServer>) -> String {
+    ///
+    /// Fails closed (#1095): an undecodable stdio token is a hard rejection,
+    /// never an anonymous downgrade.
+    fn extract_user(&self, context: &RequestContext<RoleServer>) -> Result<String, ErrorData> {
         if let Some(parts) = context.extensions.get::<http::request::Parts>() {
             if let Some(auth_user) = parts.extensions.get::<crate::server::middleware::AuthenticatedUser>() {
                 trace!("MCP HTTP auth: using validated identity for {}", auth_user.user);
-                return auth_user.user.clone();
+                return Ok(auth_user.user.clone());
             }
 
             if parts.headers.contains_key(AUTHORIZATION) {
@@ -826,21 +862,14 @@ impl McpService {
             } else {
                 trace!("MCP HTTP auth: no Authorization header, anonymous access");
             }
-            "anonymous".to_owned()
+            Ok("anonymous".to_owned())
         } else {
             trace!("MCP HTTP auth: no http::request::Parts in extensions (stdio/zmq transport)");
-            match &self.stdio_token {
-                Some(token) => {
-                    match jwt::decode(token, &self.verifying_key, self.expected_audience.as_deref()) {
-                        Ok(claims) => claims.sub.clone(),
-                        Err(e) => {
-                            warn!("MCP stdio auth: token decode failed ({}), downgrading to anonymous", e);
-                            "anonymous".to_owned()
-                        }
-                    }
-                }
-                None => "anonymous".to_owned(),
-            }
+            stdio_user(
+                self.stdio_token.as_deref(),
+                &self.verifying_key,
+                self.expected_audience.as_deref(),
+            )
         }
     }
 
@@ -948,6 +977,8 @@ impl ServerHandler for McpService {
     ) -> impl std::future::Future<Output = Result<CallToolResult, ErrorData>> + Send + '_ {
         let user = self.extract_user(&context);
         async move {
+            // Fail closed: reject before dispatch when authentication failed (#1095)
+            let user = user?;
             let uuid = Uuid::parse_str(&request.name)
                 .map_err(|e| ErrorData::invalid_request(format!("Invalid UUID: {}", e), None))?;
 
@@ -1157,5 +1188,86 @@ impl RequestService for McpService {
             details: String::new(),
         });
         serialize_response(request_id, &variant).unwrap_or_default()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Tests
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+    use hyprstream_rpc::auth::Claims;
+
+    fn signing_key(seed: u8) -> SigningKey {
+        SigningKey::from_bytes(&[seed; 32])
+    }
+
+    /// No token at all is the only path to the anonymous principal.
+    #[test]
+    fn stdio_absent_token_is_anonymous() {
+        let vk = signing_key(0x01).verifying_key();
+        assert_eq!(stdio_user(None, &vk, None).unwrap(), "anonymous");
+    }
+
+    /// A present, decodable token yields its subject.
+    #[test]
+    fn stdio_valid_token_yields_subject() {
+        let sk = signing_key(0x02);
+        let token = jwt::encode(&Claims::new("alice".to_owned(), 0, 9_999_999_999), &sk);
+        let user = stdio_user(Some(&token), &sk.verifying_key(), None).unwrap();
+        assert_eq!(user, "alice");
+    }
+
+    /// #1095: a present-but-undecodable token must hard-reject (fail closed),
+    /// never downgrade to anonymous.
+    #[test]
+    fn stdio_undecodable_token_is_rejected_not_anonymous() {
+        let service = signing_key(0x04);
+        let vk = service.verifying_key();
+        let expected_aud = Some("https://hyprstream.local");
+
+        // Expired (valid signature, past exp)
+        let expired = jwt::encode(&Claims::new("bob".to_owned(), 0, 1), &service);
+        // Signed by a foreign key
+        let wrong_key = jwt::encode(
+            &Claims::new("carol".to_owned(), 0, 9_999_999_999),
+            &signing_key(0x05),
+        );
+        // Malformed
+        let malformed = "not-a-jwt".to_owned();
+        // Wrong audience (valid signature, aud for a different resource)
+        let wrong_aud = jwt::encode(
+            &Claims::new("dave".to_owned(), 0, 9_999_999_999)
+                .with_audience(Some("https://other".to_owned())),
+            &service,
+        );
+
+        for token in [&expired, &wrong_key, &malformed, &wrong_aud] {
+            let err = stdio_user(Some(token), &vk, expected_aud)
+                .expect_err("present-but-undecodable token must be rejected");
+            assert_eq!(err.code, MCP_AUTH_ERROR, "token: {token}");
+        }
+    }
+
+    /// A token decodable under the service key and audience is accepted even
+    /// when another rejection case exists for different parameters.
+    #[test]
+    fn stdio_valid_token_with_audience_is_accepted() {
+        let sk = signing_key(0x06);
+        let token = jwt::encode(
+            &Claims::new("erin".to_owned(), 0, 9_999_999_999)
+                .with_audience(Some("https://hyprstream.local".to_owned())),
+            &sk,
+        );
+        let user = stdio_user(
+            Some(&token),
+            &sk.verifying_key(),
+            Some("https://hyprstream.local"),
+        )
+        .unwrap();
+        assert_eq!(user, "erin");
     }
 }
