@@ -340,6 +340,12 @@ async fn verify_dpop_at_token_endpoint(
 
 /// Build a `400 use_dpop_nonce` response with the current nonce in the
 /// `DPoP-Nonce` header (RFC 9449 §8).
+///
+/// atproto contract (#1113): `@atproto/oauth-client-browser` retries a token
+/// request on `400` + `{"error":"use_dpop_nonce"}` + a fresh `DPoP-Nonce`
+/// header — the client re-signs the DPoP proof carrying the new nonce and
+/// replays the request. This is the 400 form (not the resource-server 401
+/// form used in `auth.rs`); both carry the same `DPoP-Nonce` header.
 fn use_dpop_nonce_error(nonce: &str, description: &str) -> Response {
     // `description` here is always client-actionable ("nonce required",
     // "nonce expired") — that's the whole point of RFC 9449 §8: tell
@@ -734,7 +740,10 @@ fn generate_refresh_token() -> String {
 
 /// Issue a JWT access token via PolicyService, plus a rotated refresh token.
 ///
-/// `sub` is the JWT subject (username). Must be non-empty:
+/// `sub` is the internal account username used for server-side bookkeeping
+/// (refresh-token entry, profile lookup, device link). The emitted JWT's
+/// `sub` claim is the atproto-conformant DID derived from it via
+/// [`OAuthState::subject_did`] (#1113). Must be non-empty:
 /// - authorization_code flow: pass `pending.username` (the Ed25519-authenticated user from the consent page)
 /// - refresh_token flow: pass the original sub from the RefreshTokenEntry
 /// - device_code flow: pass the approving user's username (from challenge-response)
@@ -762,13 +771,35 @@ async fn issue_token_with_refresh(
         None
     };
 
+    // atproto OAuth AS conformance (#1113): the access token's `sub` MUST be
+    // the account's DID. `sub` arriving here is the internal username (auth
+    // code / refresh / device flows resolve it from the credential store);
+    // derive the DID-form subject for the emitted JWT. Internal bookkeeping
+    // (refresh-token entry, profile lookup, device link) keeps using the
+    // raw username so lookups remain keyed on the enrollment identity.
+    //
+    // #1113 correction: only `did:plc` / `did:web` (and synthesized
+    // `did:web`) are eligible atproto token subjects. `did:at9p` and other
+    // DID methods fail closed — no token is minted for an ineligible subject.
+    let jwt_sub = match state.subject_did(sub) {
+        Ok(did) => did,
+        Err(e) => {
+            tracing::warn!(local_subject = %sub, error = %e, "rejecting token issuance: subject not eligible for atproto OAuth");
+            return token_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                Some("account subject is not eligible for an atproto OAuth token"),
+            );
+        }
+    };
+
     let result = state
         .policy_client
         .issue_token(&IssueToken {
             requested_scopes: Some(scopes.clone()),
             ttl: Some(state.token_ttl),
             audience: resource.clone(),
-            subject: Some(sub.to_owned()),
+            subject: Some(jwt_sub),
             user_pub_key: user_pub_key_b64,
             dpop_jkt: dpop_jkt.clone(),
         })
@@ -1027,5 +1058,29 @@ mod tests {
                 "opaque response unexpectedly leaks `{forbidden}`: {serialized}"
             );
         }
+    }
+
+    /// #1113: the DPoP nonce-retry contract that
+    /// `@atproto/oauth-client-browser` relies on — HTTP 400 with
+    /// `error: use_dpop_nonce` AND a `DPoP-Nonce` response header so the
+    /// client can re-sign and replay the proof.
+    #[test]
+    fn use_dpop_nonce_error_carries_atproto_retry_contract() {
+        let resp = use_dpop_nonce_error("abc123", "DPoP proof must include a server-issued nonce");
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            resp.headers().get("DPoP-Nonce").and_then(|v| v.to_str().ok()),
+            Some("abc123"),
+            "DPoP-Nonce header MUST carry the fresh nonce for client retry"
+        );
+    }
+
+    /// #1113: a nonce value that is not a valid HTTP header token still
+    /// yields a 400 `use_dpop_nonce` body — the nonce header is omitted
+    /// (graceful) but the error contract the client keys on is preserved.
+    #[test]
+    fn use_dpop_nonce_error_keeps_400_on_unheaderable_nonce() {
+        let resp = use_dpop_nonce_error("not valid token", "expired");
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 }

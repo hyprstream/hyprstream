@@ -73,19 +73,29 @@ fn introspect_jwt(state: &Arc<OAuthState>, token: &str) -> Response {
 
 async fn introspect_refresh(state: &Arc<OAuthState>, token: &str) -> Response {
     match state.get_refresh_token(token).await {
-        Ok(Some(entry)) => (
-            StatusCode::OK,
-            [(header::CACHE_CONTROL, "no-store"), (header::PRAGMA, "no-cache")],
-            Json(serde_json::json!({
-                "active": true,
-                "token_type": "refresh_token",
-                "sub": entry.username,
-                "client_id": entry.client_id,
-                "scope": entry.scopes.join(" "),
-                "exp": entry.expires_at_unix,
-            })),
-        )
-            .into_response(),
+        Ok(Some(entry)) => {
+            // #1113: report the account DID as `sub` for atproto conformance,
+            // matching the access-token subject. The refresh-token entry is
+            // keyed on the internal username; fall back to it if DID
+            // derivation fails (introspection is informational — the token
+            // path itself fails closed at mint time).
+            let sub = state
+                .subject_did(&entry.username)
+                .unwrap_or_else(|_| entry.username.clone());
+            (
+                StatusCode::OK,
+                [(header::CACHE_CONTROL, "no-store"), (header::PRAGMA, "no-cache")],
+                Json(serde_json::json!({
+                    "active": true,
+                    "token_type": "refresh_token",
+                    "sub": sub,
+                    "client_id": entry.client_id,
+                    "scope": entry.scopes.join(" "),
+                    "exp": entry.expires_at_unix,
+                })),
+            )
+                .into_response()
+        }
         _ => inactive_response(),
     }
 }

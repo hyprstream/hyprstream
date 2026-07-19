@@ -71,3 +71,46 @@ pub async fn openid_configuration(
 
     Json(meta)
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    /// #1113: the atproto OAuth AS conformance scopes (`atproto`,
+    /// `transition:generic`) are advertised in `scopes_supported` so stock
+    /// atproto clients (e.g. `@atproto/oauth-client-browser`) discover them.
+    #[test]
+    fn authorization_server_metadata_advertises_atproto_scopes() {
+        let scopes = vec![
+            "read:*:*".to_owned(),
+            "write:*:*".to_owned(),
+            "atproto".to_owned(),
+            "transition:generic".to_owned(),
+        ];
+        let meta = base_metadata("https://pds.example.com", &scopes, true);
+        let advertised: Vec<&str> = meta["scopes_supported"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert!(advertised.contains(&"atproto"), "scopes_supported missing atproto: {advertised:?}");
+        assert!(
+            advertised.contains(&"transition:generic"),
+            "scopes_supported missing transition:generic: {advertised:?}"
+        );
+    }
+
+    /// #1113: PAR is mandatory for the atproto AS profile, and the AS metadata
+    /// must reflect `require_pushed_authorization_requests: true`.
+    #[test]
+    fn authorization_server_metadata_requires_par_when_configured() {
+        let meta = base_metadata("https://pds.example.com", &[], true);
+        assert_eq!(meta["require_pushed_authorization_requests"].as_bool(), Some(true));
+        assert_eq!(
+            meta["pushed_authorization_request_endpoint"].as_str(),
+            Some("https://pds.example.com/oauth/par")
+        );
+    }
+}

@@ -1325,6 +1325,11 @@ fn default_oauth_scopes() -> Vec<String> {
         "read:*:*".to_owned(),
         "infer:model:*".to_owned(),
         "write:*:*".to_owned(),
+        // atproto OAuth AS conformance (#1113): the PDS is its own AS, so the
+        // atproto transition scopes are advertised in scopes_supported and
+        // accepted when requested by stock atproto clients.
+        "atproto".to_owned(),
+        "transition:generic".to_owned(),
     ]
 }
 fn default_oauth_token_ttl() -> u32 { 3600 }

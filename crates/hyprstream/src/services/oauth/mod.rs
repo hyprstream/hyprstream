@@ -274,13 +274,7 @@ async fn oauth_self_protected_resource_metadata(
 
     let mut meta = protected_resource_metadata(&resource, &issuer_url);
     meta.resource_name = Some("HyprStream OAuth 2.1 Authorization Server".to_owned());
-    meta.scopes_supported = Some(vec![
-        "openid".into(),
-        "read:*:*".into(),
-        "write:*:*".into(),
-        "infer:model:*".into(),
-        "pds:attach".into(),
-    ]);
+    meta.scopes_supported = Some(self_resource_scopes());
 
     // Include the QUIC TLS cert hash so browsers can pin the self-signed certificate.
     if let Ok((cert_chain, _)) = config.quic.load_tls_materials() {
@@ -290,6 +284,21 @@ async fn oauth_self_protected_resource_metadata(
     }
 
     axum::Json(meta)
+}
+
+/// Scopes advertised by the OAuth service's own RFC 9728 protected-resource
+/// document. Includes the atproto transition scopes (#1113) so stock atproto
+/// clients can discover them at the resource (PDS = its own AS).
+fn self_resource_scopes() -> Vec<String> {
+    vec![
+        "openid".into(),
+        "read:*:*".into(),
+        "write:*:*".into(),
+        "infer:model:*".into(),
+        "pds:attach".into(),
+        "atproto".into(),
+        "transition:generic".into(),
+    ]
 }
 
 /// OAuth 2.1 Authorization Server service.
@@ -1042,6 +1051,26 @@ mod tests {
         assert_eq!(
             meta.bearer_methods_supported.as_deref(),
             Some(&["header".to_owned()][..])
+        );
+    }
+
+    /// #1113: the PDS is its own AS, so the self protected-resource document
+    /// must advertise the atproto transition scopes AND point
+    /// `authorization_servers` at itself (resource == issuer).
+    #[test]
+    fn test_self_protected_resource_advertises_atproto_profile() {
+        // PDS = its own AS: resource and authorization_servers[0] are the same.
+        let issuer = "https://pds.example.com";
+        let meta = protected_resource_metadata(issuer, issuer);
+        assert_eq!(meta.resource, issuer);
+        assert_eq!(meta.authorization_servers, vec![issuer.to_owned()]);
+
+        // atproto transition scopes are advertised.
+        let scopes = self_resource_scopes();
+        assert!(scopes.contains(&"atproto".to_owned()), "missing atproto: {scopes:?}");
+        assert!(
+            scopes.contains(&"transition:generic".to_owned()),
+            "missing transition:generic: {scopes:?}"
         );
     }
 

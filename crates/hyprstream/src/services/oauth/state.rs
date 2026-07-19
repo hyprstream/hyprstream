@@ -181,6 +181,47 @@ mod tests {
 
         assert!(public.is_none());
     }
+
+    /// #1113: a local username maps to a `did:web` subject so the access
+    /// token `sub` is the account DID — what atproto clients expect.
+    #[test]
+    fn subject_did_for_local_username_is_did_web() {
+        let did = subject_did_for("https://pds.example.com", "alice").unwrap();
+        assert_eq!(did, "did:web:pds.example.com:users:alice");
+    }
+
+    /// #1113: loopback/dev issuers preserve the port in the did:web authority.
+    #[test]
+    fn subject_did_for_loopback_preserves_port() {
+        let did = subject_did_for("http://127.0.0.1:6791", "alice").unwrap();
+        assert_eq!(did, "did:web:127.0.0.1:6791:users:alice");
+    }
+
+    /// #1113: supported atproto account DIDs (`did:plc`, `did:web`) from an
+    /// external mapper pass through unchanged — never double-wrapped.
+    #[test]
+    fn subject_did_for_supported_account_did_passthrough() {
+        for did in ["did:plc:xyz123", "did:web:foo.com:users:bob"] {
+            assert_eq!(subject_did_for("https://pds.example.com", did).unwrap(), did);
+        }
+    }
+
+    /// #1113 correction: `did:at9p` (and other non-plc/non-web DID methods)
+    /// are NOT eligible for atproto OAuth tokens — subject derivation fails
+    /// closed so the token path rejects issuance.
+    #[test]
+    fn subject_did_for_at9p_fails_closed() {
+        let err = subject_did_for("https://pds.example.com", "did:at9p:abc").unwrap_err();
+        assert!(matches!(err, SubjectDidError::UnsupportedMethod));
+    }
+
+    /// #1113: a username that would corrupt a did:web path is rejected rather
+    /// than producing a malformed DID.
+    #[test]
+    fn subject_did_for_path_corrupting_username_rejected() {
+        let err = subject_did_for("https://pds.example.com", "alice/bob").unwrap_err();
+        assert!(matches!(err, SubjectDidError::IncompatibleUsername));
+    }
 }
 
 /// A pending authorization code awaiting token exchange.
@@ -833,6 +874,21 @@ impl OAuthState {
         self.dpop_clients_seen.write().await.insert(jkt.to_owned(), expiry);
     }
 
+    /// Derive the JWT `sub` claim for an atproto-conformant access token.
+    ///
+    /// atproto OAuth requires the access token's `sub` to be the account's
+    /// DID. Locally enrolled users are addressed by username, so we synthesize
+    /// a `did:web:{authority}:users:{username}` subject — mirroring the
+    /// external-OIDC `DidWeb` mapping in [`super::user_mapping`]. Subjects
+    /// that already carry a supported atproto account DID (`did:plc`,
+    /// `did:web`) pass through unchanged. `did:at9p` and other DID methods
+    /// are NOT eligible for atproto OAuth tokens and return
+    /// [`SubjectDidError::UnsupportedMethod`] so the caller fails closed
+    /// (#1113 correction).
+    pub fn subject_did(&self, local_subject: &str) -> Result<String, SubjectDidError> {
+        subject_did_for(&self.issuer_url, local_subject)
+    }
+
     /// Attach an RSA key for RS256 id_token signing (OIDC interop).
     ///
     /// `rsa_der` is the PKCS#8 DER-encoded RSA private key.
@@ -916,4 +972,52 @@ impl OAuthState {
             }
         });
     }
+}
+
+/// Derive the atproto-conformant DID `sub` for a local subject (#1113).
+///
+/// Free-function form of [`OAuthState::subject_did`] so the mapping is
+/// unit-testable without constructing a full `OAuthState`.
+///
+/// **atproto account DID methods (#1113 correction):** only `did:plc` and
+/// `did:web` are eligible subjects for atproto OAuth tokens. `did:at9p` (and
+/// any other DID method) is rejected via [`SubjectDidError::UnsupportedMethod`]
+/// — the token path fails closed rather than minting a token for an
+/// ineligible subject.
+pub fn subject_did_for(
+    issuer_url: &str,
+    local_subject: &str,
+) -> Result<String, SubjectDidError> {
+    // did:plc and did:web are the supported atproto account DIDs — pass through.
+    if local_subject.starts_with("did:plc:") || local_subject.starts_with("did:web:") {
+        return Ok(local_subject.to_owned());
+    }
+    // Any other did: method (notably did:at9p) is NOT eligible for atproto
+    // OAuth tokens — fail closed (#1113 correction).
+    if local_subject.starts_with("did:") {
+        return Err(SubjectDidError::UnsupportedMethod);
+    }
+    let authority = super::user_mapping::extract_authority(issuer_url)
+        .map_err(|_| SubjectDidError::InvalidIssuer)?;
+    // did:web path segments are colon-separated; reject usernames that would
+    // corrupt the DID (mirrors user_mapping::DidWeb validation).
+    if local_subject.contains(['#', '?', '/']) {
+        return Err(SubjectDidError::IncompatibleUsername);
+    }
+    Ok(format!("did:web:{authority}:users:{local_subject}"))
+}
+
+/// Errors raised by [`subject_did_for`] / [`OAuthState::subject_did`].
+#[derive(Debug, thiserror::Error)]
+pub enum SubjectDidError {
+    /// The subject carries a DID method that is not eligible for atproto
+    /// OAuth tokens (e.g. `did:at9p`). The token path fails closed.
+    #[error("DID method not eligible for atproto OAuth tokens")]
+    UnsupportedMethod,
+    /// The issuer URL could not be parsed into a did:web authority.
+    #[error("invalid issuer URL for did:web subject")]
+    InvalidIssuer,
+    /// The local username contains characters that would corrupt a did:web path.
+    #[error("local username incompatible with did:web path")]
+    IncompatibleUsername,
 }
