@@ -55,8 +55,9 @@ mod substrate;
 pub use domain::{DedupDomain, InvalidDedupDomain, TrustBoundary};
 pub use manifest::{cid_from_merkle, merkle_from_address, BlobManifest, FILE_RECONSTRUCTION_CODEC};
 pub use mount::{
-    AllowAllCasAuthorizer, CasMount, CasMountAuthorizer, CasMountAuthzRequest, CasMountObjectKind,
-    DenyAllCasAuthorizer, StagingConfig, DEFAULT_STAGING_SLOT_QUOTA, DEFAULT_STAGING_SUBJECT_QUOTA,
+    AllowAllCasAuthorizer, BootstrapCasAuthorizer, CasGrantSubject, CasMount, CasMountAuthorizer,
+    CasMountAuthzRequest, CasMountGrant, CasMountObjectKind, DenyAllCasAuthorizer, StagingConfig,
+    AUTHENTICATED_XORB_READ, DEFAULT_STAGING_SLOT_QUOTA, DEFAULT_STAGING_SUBJECT_QUOTA,
 };
 pub use substrate::CasSubstrate;
 

@@ -45,6 +45,7 @@ use hyprstream_rpc::Subject;
 use hyprstream_vfs::{DirEntry, Fid, Mount, MountError, Stat, ORDWR, OREAD, OTRUNC, OWRITE};
 use parking_lot::Mutex;
 use tokio::sync::Notify;
+use tracing::{debug, warn};
 
 use super::{CasError, CasSubstrate, DedupDomain};
 use crate::mac::ifc_join;
@@ -86,10 +87,11 @@ pub struct CasMountAuthzRequest<'a> {
 
 /// Per-op authorization hook for [`CasMount`].
 ///
-/// The default constructor uses [`DenyAllCasAuthorizer`]. Production namespaces
-/// must inject a real authorizer from #699/#767 provenance and MAC plumbing;
-/// trusted local single-tenant tools can explicitly opt into
-/// [`AllowAllCasAuthorizer`].
+/// The default constructor uses [`DenyAllCasAuthorizer`]. The live XET read
+/// route uses [`BootstrapCasAuthorizer`] (#1094 plane #1: explicit, audited
+/// bootstrap grants, default-deny). As #699/#767 provenance and MAC plumbing
+/// lands, production namespaces move to a real MAC authorizer; trusted local
+/// single-tenant tools can explicitly opt into [`AllowAllCasAuthorizer`].
 pub trait CasMountAuthorizer: Send + Sync {
     fn authorize(
         &self,
@@ -126,6 +128,159 @@ impl CasMountAuthorizer for AllowAllCasAuthorizer {
         _request: CasMountAuthzRequest<'_>,
     ) -> Result<(), MountError> {
         Ok(())
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Bootstrap-grant authorizer (#1094)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Who a [`CasMountGrant`] applies to — the *subject breadth* axis the #1094
+/// ratchet narrows.
+///
+/// Today there is exactly one breadth: the authenticated floor. Per-compartment
+/// and per-subject variants arrive with #698 (authority-owned subject
+/// clearances) and #699 (object provenance labels); they are deliberately not
+/// modeled yet — see the ratchet path on [`BootstrapCasAuthorizer`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CasGrantSubject {
+    /// Any authenticated (non-anonymous) [`Subject`]. Anonymous callers never
+    /// match: the floor is *authenticated*, not bearerless.
+    AnyAuthenticated,
+}
+
+impl CasGrantSubject {
+    fn accepts(self, caller: &Subject) -> bool {
+        match self {
+            CasGrantSubject::AnyAuthenticated => !caller.is_anonymous(),
+        }
+    }
+}
+
+/// One explicit authorization grant — the unit of policy the
+/// [`BootstrapCasAuthorizer`] evaluates (#1094).
+///
+/// A request matches a grant when the caller is accepted by `subject`, the
+/// request's [`CasMountObjectKind`] is in `kinds`, and its operation string is
+/// in `operations`. A request matching **no** grant is denied (fail-closed).
+///
+/// The shape mirrors the MAC decision it will become — subject breadth ×
+/// object class × operation — so ratcheting toward the #698/#699 dominance
+/// check (`subject.ctx ⊒ object.label` per op) narrows fields of this struct
+/// instead of replacing an incompatible interim model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CasMountGrant {
+    /// Stable audit name emitted with every decision the grant allows.
+    pub name: &'static str,
+    /// Subject breadth.
+    pub subject: CasGrantSubject,
+    /// Object kinds covered.
+    pub kinds: &'static [CasMountObjectKind],
+    /// Operations covered (matched against [`CasMountAuthzRequest::operation`]).
+    pub operations: &'static [&'static str],
+}
+
+/// The day-one bootstrap grant: **"any authenticated subject may read xorb
+/// X"** (#1094). Covers `open` + `read` on [`CasMountObjectKind::Xorb`] only —
+/// `stat`, `obj/*` reads, and every `stage/*` operation stay denied.
+pub const AUTHENTICATED_XORB_READ: CasMountGrant = CasMountGrant {
+    name: "bootstrap:authenticated-xorb-read",
+    subject: CasGrantSubject::AnyAuthenticated,
+    kinds: &[CasMountObjectKind::Xorb],
+    operations: &["open", "read"],
+};
+
+/// Enforcing authorizer for the live `GET /get_xorb/{hash}/` surface (#1094):
+/// an explicit bootstrap grant list, default-deny, one audit event per decision.
+///
+/// This is plane #1 of #1091's R4b *compile-and-ratchet* MAC rollout: the route
+/// flips to enforcing on day one behind [`AUTHENTICATED_XORB_READ`], making
+/// today's implicit authenticated floor an explicit, auditable policy object
+/// instead of a silent [`AllowAllCasAuthorizer`].
+///
+/// ## Ratchet path (grant breadth → 0)
+///
+/// The day-one grant is maximally broad on two axes: every authenticated
+/// subject, every xorb address. Ratcheting is a deliberate, reviewable edit of
+/// the grant list, sequenced with the MAC-activation prerequisites:
+///
+/// 1. **#699 lands provenance labels** — repo/compartment `security_label`s on
+///    xorb-bearing manifests (carrier-(b)) give each request a real object
+///    label. Grants can then narrow per-domain, then per-compartment.
+/// 2. **#698 flows subject clearances** — authority-owned `Claims.clearance`
+///    gives the caller a real `SecurityContext`; [`CasGrantSubject`] gains
+///    clearance-bearing variants and the decision becomes dominance
+///    (`subject.ctx ⊒ object.label`) per op.
+/// 3. **Breadth 0** — with labels + clearances live, the grant list empties
+///    (== [`DenyAllCasAuthorizer`]) and this type is retired in favor of the
+///    MAC authorizer on the same [`CasMountAuthorizer`] seam.
+///
+/// That labeling/clearance work is **not** in scope here; only the seam and
+/// the day-one grant are.
+///
+/// Audit: allows log at `debug`, denies at `warn` (denials are
+/// security-relevant). Tamper-evident decision audit (#573,
+/// `crate::mac::audit`) takes over when the MAC authorizer lands.
+#[derive(Debug, Clone)]
+pub struct BootstrapCasAuthorizer {
+    grants: Vec<CasMountGrant>,
+}
+
+impl BootstrapCasAuthorizer {
+    /// The day-one policy (#1094): exactly [`AUTHENTICATED_XORB_READ`].
+    pub fn new() -> Self {
+        Self {
+            grants: vec![AUTHENTICATED_XORB_READ],
+        }
+    }
+
+    /// An explicit grant list — the ratchet knob. Narrow the list as #699
+    /// labels and #698 clearances land; an empty list denies everything
+    /// (equivalent to [`DenyAllCasAuthorizer`]).
+    pub fn with_grants(grants: Vec<CasMountGrant>) -> Self {
+        Self { grants }
+    }
+}
+
+impl Default for BootstrapCasAuthorizer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl CasMountAuthorizer for BootstrapCasAuthorizer {
+    fn authorize(
+        &self,
+        caller: &Subject,
+        request: CasMountAuthzRequest<'_>,
+    ) -> Result<(), MountError> {
+        for grant in &self.grants {
+            if grant.subject.accepts(caller)
+                && grant.kinds.contains(&request.kind)
+                && grant.operations.contains(&request.operation)
+            {
+                debug!(
+                    subject = %caller,
+                    grant = grant.name,
+                    kind = ?request.kind,
+                    address = request.address,
+                    operation = request.operation,
+                    "CAS bootstrap grant: allow"
+                );
+                return Ok(());
+            }
+        }
+        warn!(
+            subject = %caller,
+            kind = ?request.kind,
+            address = request.address,
+            operation = request.operation,
+            "CAS bootstrap grant: deny (no matching grant)"
+        );
+        Err(MountError::PermissionDenied(format!(
+            "CAS {} {:?} {} denied for {}: no matching bootstrap grant (#1094)",
+            request.operation, request.kind, request.address, caller
+        )))
     }
 }
 
@@ -1376,6 +1531,113 @@ mod tests {
         let entries = mount.readdir(&fid, &caller).await.unwrap();
         let names: Vec<_> = entries.into_iter().map(|e| e.name).collect();
         assert_eq!(names, vec!["obj", "xorb", "stage"]);
+    }
+
+    // ── bootstrap-grant authorizer (#1094) ─────────────────────────────────
+
+    /// Build a substrate holding one xorb and return it with the xorb hash.
+    async fn substrate_with_xorb(bytes: &[u8]) -> (tempfile::TempDir, CasSubstrate, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let substrate = CasSubstrate::new(dir.path());
+        let manifest = substrate
+            .put(&DedupDomain::local_default(), bytes, None)
+            .await
+            .unwrap();
+        let xorb = manifest.xorb_hashes.first().expect("xorb hash").clone();
+        (dir, substrate, xorb)
+    }
+
+    #[tokio::test]
+    async fn bootstrap_grant_allows_authenticated_xorb_read() {
+        let (_dir, substrate, xorb) = substrate_with_xorb(b"bootstrap-xorb").await;
+        let mount = CasMount::with_authorizer(
+            substrate,
+            DedupDomain::local_default(),
+            BootstrapCasAuthorizer::new(),
+        );
+        let caller = Subject::new("alice");
+
+        let mut fid = mount.walk(&["xorb", &xorb], &caller).await.unwrap();
+        mount.open(&mut fid, OREAD, &caller).await.unwrap();
+        let out = mount.read(&fid, 0, 1024, &caller).await.unwrap();
+
+        assert!(!out.is_empty());
+    }
+
+    #[tokio::test]
+    async fn bootstrap_grant_denies_anonymous_xorb_read() {
+        let (_dir, substrate, xorb) = substrate_with_xorb(b"bootstrap-xorb").await;
+        let mount = CasMount::with_authorizer(
+            substrate,
+            DedupDomain::local_default(),
+            BootstrapCasAuthorizer::new(),
+        );
+        let caller = Subject::anonymous();
+
+        let mut fid = mount.walk(&["xorb", &xorb], &caller).await.unwrap();
+        let err = mount.open(&mut fid, OREAD, &caller).await.unwrap_err();
+
+        assert!(matches!(err, MountError::PermissionDenied(_)));
+    }
+
+    #[tokio::test]
+    async fn bootstrap_grant_denies_obj_reads_and_stage_ops() {
+        let (_dir, substrate, xorb) = substrate_with_xorb(b"bootstrap-xorb").await;
+        let manifest = substrate
+            .put(&DedupDomain::local_default(), b"obj-bytes", None)
+            .await
+            .unwrap();
+        let mount = CasMount::with_authorizer(
+            substrate,
+            DedupDomain::local_default(),
+            BootstrapCasAuthorizer::new(),
+        );
+        let caller = Subject::new("alice");
+
+        // obj/* reads are outside the day-one grant.
+        let mut fid = mount
+            .walk(&["obj", &manifest.cid], &caller)
+            .await
+            .unwrap();
+        let err = mount.open(&mut fid, OREAD, &caller).await.unwrap_err();
+        assert!(matches!(err, MountError::PermissionDenied(_)));
+
+        // stat on a xorb is outside the grant (open + read only).
+        let fid = mount.walk(&["xorb", &xorb], &caller).await.unwrap();
+        let err = mount.stat(&fid, &caller).await.unwrap_err();
+        assert!(matches!(err, MountError::PermissionDenied(_)));
+
+        // stage/* ingest is outside the grant.
+        let mut root = mount.walk(&["stage"], &caller).await.unwrap();
+        let err = mount
+            .create(&mut root, "new", 0o600, OWRITE, &caller)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, MountError::PermissionDenied(_)));
+    }
+
+    #[test]
+    fn bootstrap_grant_list_ratchets_to_deny_all() {
+        // The ratchet terminus: an empty grant list denies even the day-one
+        // xorb read, equivalent to DenyAllCasAuthorizer.
+        let authz = BootstrapCasAuthorizer::with_grants(Vec::new());
+        let domain = DedupDomain::local_default();
+        let request = CasMountAuthzRequest {
+            kind: CasMountObjectKind::Xorb,
+            address: "aa00",
+            domain: &domain,
+            operation: "read",
+        };
+        let err = authz.authorize(&Subject::new("alice"), request).unwrap_err();
+        assert!(matches!(err, MountError::PermissionDenied(_)));
+    }
+
+    #[test]
+    fn bootstrap_day_one_grant_matches_exactly_xorb_open_read() {
+        let grant = AUTHENTICATED_XORB_READ;
+        assert_eq!(grant.subject, CasGrantSubject::AnyAuthenticated);
+        assert_eq!(grant.kinds, &[CasMountObjectKind::Xorb]);
+        assert_eq!(grant.operations, &["open", "read"]);
     }
 
     // ── write-then-seal (#814) ─────────────────────────────────────────────
