@@ -141,26 +141,59 @@ jobs:
   # push` directly and CANNOT use docker/build-push-action like the amd64 leg.
   #
   # Tag scheme (GHCR; consumed by the AWS rocky10 arm64 quadlets):
-  #   v1.2.3-cpu-arm64   — immutable, on v*.*.* release tags
-  #   1.2-cpu-arm64      — rolling major.minor, on v*.*.* release tags
-  #   latest-cpu-arm64   — moving, on default-branch (main) builds
-  #   edge-cpu-arm64     — moving HEAD-of-main pointer
+  #   1.2.3-cpu-arm64      — immutable, on v*.*.* release tags
+  #   1.2-cpu-arm64        — rolling major.minor, on v*.*.* release tags
+  #   latest-cpu-arm64     — moving, on default-branch (main) builds
+  #   edge-cpu-arm64       — moving HEAD-of-main pointer
+  # NOTE: docker/metadata-action `type=semver,pattern={{version}}` STRIPS the
+  # leading `v` (emits `1.2.3`, not `v1.2.3`) — the same {{version}} form the
+  # amd64 leg uses. Consumers pull the UNPREFIXED tag. {{raw}} would keep the
+  # `v`; we intentionally match the amd64 leg's unprefixed contract.
   # The amd64 cpu/cuda/rocm variants stay on the github-hosted build-docker job
   # above; only the CPU variant has an arm64 counterpart (CUDA/ROCm are
   # x86_64-only today).
+  #
+  # Security: this job holds `packages: write` on a privileged self-hosted
+  # Graviton runner, so the workflow_run leg is gated to SAME-REPOSITORY `push`
+  # runs only (head_repository.full_name == repository.full_name). A fork PR
+  # whose head branch is named `main` cannot schedule this job. See
+  # https://securitylab.github.com/resources/github-actions-preventing-pwn-requests/
   build-docker-arm64:
     if: >-
       github.event_name == 'push' ||
-      github.event.workflow_run.conclusion == 'success'
+      (
+        github.event.workflow_run.event == 'push' &&
+        github.event.workflow_run.head_repository.full_name == github.repository &&
+        github.event.workflow_run.conclusion == 'success'
+      )
     runs-on: [self-hosted, linux, arm64, graviton, hyprstream-merge-gate]
-    timeout-minutes: 150
+    # Fleet reaper hard-kills Graviton instances at 150 min from LAUNCH (not
+    # job start); rust.yml uses 140 for the same reason. Stay below the cap so
+    # the always() cleanup runs and the push isn't lost to a reaped host.
+    timeout-minutes: 140
     permissions:
       contents: read
       packages: write
+    # Serialize per ref so a superseded main build cannot finish AFTER a newer
+    # one and roll edge-cpu-arm64 / latest-cpu-arm64 backward. workflow_run
+    # carries github.ref = refs/heads/main (constant for main), so all main
+    # builds share one group and cancel-in-progress drops the older run; tag
+    # pushes are per-tag. Job-scoped (not workflow-scoped) so the amd64 leg,
+    # which has no concurrency guard, is byte-for-byte unchanged.
+    concurrency:
+      group: docker-arm64-${{ github.ref }}
+      cancel-in-progress: true
 
     steps:
+    # workflow_run sets GITHUB_SHA to the DEFAULT-branch tip, NOT the commit
+    # that triggered Rust. Check out the exact head_sha that passed Rust so we
+    # never build/publish a later commit that hasn't passed (or has since
+    # failed). For tag-push events workflow_run is empty and we fall back to
+    # github.sha (the tagged commit). Provenance is already gated in `if:`.
     - name: Checkout repository
       uses: actions/checkout@v4
+      with:
+        ref: ${{ github.event.workflow_run.head_sha || github.sha }}
 
     - name: Log in to Container Registry
       if: github.event_name != 'pull_request'
