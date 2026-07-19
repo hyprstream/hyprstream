@@ -139,6 +139,10 @@ pub struct TuiService {
     transport: TransportConfig,
     /// Signing key (required by RequestService).
     signing_key: SigningKey,
+    /// Bound reach for streams served by this TUI instance.
+    reach_config: hyprstream_rpc::moq_stream::ProducerReachConfigHandle,
+    /// Optional relay-scoped MoQ origin for this TUI instance.
+    moq_origin: hyprstream_rpc::moq_stream::MoqStreamOriginHandle,
     /// Per-session viewer registration channels + frame loop tokens.
     sessions: SessionRegistry,
     /// Per-viewer stdin queues (for pollStdin RPC).
@@ -170,6 +174,10 @@ impl TuiService {
             next_viewer_id: AtomicU32::new(1),
             transport,
             signing_key,
+            reach_config: Arc::new(parking_lot::RwLock::new(
+                hyprstream_rpc::moq_stream::ProducerReachConfig::default(),
+            )),
+            moq_origin: Arc::new(parking_lot::RwLock::new(None)),
             sessions: Arc::new(RwLock::new(HashMap::new())),
             stdin_queues: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             policy_client: None,
@@ -331,6 +339,7 @@ impl TuiService {
         // Create FD-indexed stream contexts: [0]=stdin (input relay), [1]=stdout (frames).
         // DH key exchange derives context from client's ephemeral pubkey.
         // If no pubkey (local/test connections), generate random standalone contexts.
+        let reach_config = self.reach_config.read().clone();
         let make_stream_ctx = |label: &str| -> Result<StreamContext> {
             // #321: the TUI PTY/shell viewer receives only `(mac_key, topic)` out of
             // band (see tui_handlers / shell_handlers) and never derives the DH
@@ -338,7 +347,9 @@ impl TuiService {
             // The blocks remain HMAC-chain authenticated. (AEAD stays mandatory + ON
             // for the DH-keyed mesh inference stream, whose consumer derives enc_key.)
             match ctx.ephemeral_pubkey() {
-                Some(pubkey) => Ok(StreamContext::from_dh(&pubkey)?.without_aead()),
+                Some(pubkey) => Ok(StreamContext::from_third_party_interop_dh(&pubkey)?
+                    .without_aead()
+                    .with_reach_config(reach_config.clone())),
                 None => {
                     use rand::RngCore;
                     let mut rng = rand::thread_rng();
@@ -351,7 +362,7 @@ impl TuiService {
                         hex::encode(topic_bytes),
                         mac_key,
                         [0u8; 32],
-                    ))
+                    ).with_reach_config(reach_config.clone()))
                 }
             }
         };
@@ -393,6 +404,8 @@ impl TuiService {
         let tui_state = Arc::clone(&self.state);
         let sk = self.signing_key.clone();
         let stdin_queues = Arc::clone(&self.stdin_queues);
+        let reach_config = self.reach_config.clone();
+        let moq_origin = self.moq_origin.clone();
         let continuation: Continuation = Box::pin(async move {
             let mut reg = sessions_reg.write().await;
             let (sender, _cancel) = reg.entry(sid).or_insert_with(|| {
@@ -402,7 +415,7 @@ impl TuiService {
                 let s = Arc::clone(&tui_state);
                 let c = cancel.clone();
                 let sq = Arc::clone(&stdin_queues);
-                tokio::task::spawn_local(run_frame_loop(s, sid, rx, sk, c, sq));
+                tokio::task::spawn_local(run_frame_loop(s, sid, rx, sk, c, sq, reach_config, moq_origin));
                 info!(session_id = sid, "Frame loop spawned");
                 (tx, cancel)
             });
@@ -1556,14 +1569,7 @@ impl TuiService {
             connect.set_viewer_id(viewer_id);
             connect.set_session_id(session_id);
 
-            // #356: the node's network-routable moq reach (the bound QUIC `/moq`
-            // endpoint, registered when the daemon's web_transport_quinn server
-            // binds). Shared across all FD streams — they all live on this node's
-            // one moq plane. A cross-process viewer dials this reach instead of its
-            // own local moq UDS plane (see StreamInfo.announcedAt docs / connect_moq_reach).
-            // #384: TUI FD streams are node-local infrastructure → server-global
-            // reach (ServerDefault); no per-stream RelayChoice posture applies.
-            let reach = hyprstream_rpc::moq_stream::global_reach_config().reach();
+            let reach = self.reach_config.read().reach();
 
             // FD-indexed streams: [0]=stdin (input relay), [1]=stdout (frames)
             let mut stream_list = connect.reborrow().init_streams(streams.len() as u32);
@@ -1692,6 +1698,14 @@ impl TuiService {
 
 #[async_trait(?Send)]
 impl RequestService for TuiService {
+    fn producer_reach_config_handle(&self) -> Option<hyprstream_rpc::moq_stream::ProducerReachConfigHandle> {
+        Some(self.reach_config.clone())
+    }
+
+    fn moq_origin_handle(&self) -> Option<hyprstream_rpc::moq_stream::MoqStreamOriginHandle> {
+        Some(self.moq_origin.clone())
+    }
+
     async fn handle_request(
         &self,
         _ctx: &EnvelopeContext,
@@ -1873,6 +1887,8 @@ pub(crate) async fn run_frame_loop(
     signing_key: SigningKey,
     cancel: CancellationToken,
     stdin_queues: StdinQueues,
+    reach_config: hyprstream_rpc::moq_stream::ProducerReachConfigHandle,
+    moq_origin: hyprstream_rpc::moq_stream::MoqStreamOriginHandle,
 ) {
     let mut interval = tokio::time::interval(std::time::Duration::from_millis(33));
     let mut event_rx = {
@@ -1895,7 +1911,10 @@ pub(crate) async fn run_frame_loop(
     let mut heartbeat_at = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
 
     // StreamChannel for creating publisher sockets (ZMQ or moq, auto-dispatched).
-    let stream_channel = StreamChannel::new(signing_key);
+    let stream_channel = StreamChannel::new(signing_key)
+        .with_reach_config(hyprstream_rpc::moq_stream::ProducerReachConfig::default())
+        .with_reach_config_handle(reach_config)
+        .with_moq_origin_handle(moq_origin);
 
     info!(session_id, "Frame loop started");
 
@@ -2418,7 +2437,7 @@ mod tests {
     /// #356: the PTY StreamInfo must carry the producer's networked reach so a
     /// cross-process viewer dials the TUI service's QUIC `/moq` endpoint instead
     /// of its own local moq UDS plane. This exercises the exact encode path
-    /// `build_connect_response` uses — `producer_reach()` → `Destination::write_to`
+    /// `build_connect_response` uses — `ProducerReachConfig::reach()` → `Destination::write_to`
     /// into the tui StreamInfo capnp `announcedAt` field — and reads it back through
     /// the generated `tui_client::StreamInfo` decoder, asserting the Quic dial params
     /// survive the round-trip intact (the chat-inference fix relied on the same
@@ -2426,20 +2445,21 @@ mod tests {
     #[test]
     fn pty_stream_info_carries_dialable_reach() {
         use hyprstream_rpc::capnp::FromCapnp;
-        use hyprstream_rpc::moq_stream::{init_global_producer_reach, producer_reach, NodeStreamReach};
+        use hyprstream_rpc::moq_stream::{NodeStreamReach, ProducerReachConfig};
 
-        // Register a networked reach exactly as the QUIC bind does (idempotent —
-        // first wins; ignore the result so concurrent tests don't fail this one).
         let addr: std::net::SocketAddr = "127.0.0.1:4433".parse().expect("addr");
-        let _ = init_global_producer_reach(NodeStreamReach {
-            addr,
-            server_name: "localhost".to_owned(),
-            cert_hashes: vec![[0x11u8; 32]],
-        });
-        let reach = producer_reach();
+        let reach = ProducerReachConfig {
+            iroh_node_id: None,
+            quic_reach: Some(NodeStreamReach {
+                addr,
+                server_name: "localhost".to_owned(),
+                cert_hashes: vec![[0x11u8; 32]],
+            }),
+            relay: None,
+        }.reach();
         assert!(
             !reach.is_empty(),
-            "producer_reach() must be non-empty after registering a NodeStreamReach"
+            "local ProducerReachConfig must produce a dialable reach"
         );
 
         // Build a tui StreamInfo capnp the same way build_connect_response does.
@@ -2473,11 +2493,7 @@ mod tests {
             reach.len(),
             "decoded StreamInfo.announcedAt must round-trip the producer reach"
         );
-        // The round-tripped reach must match the registered producer reach
-        // exactly. (Compare against the captured `producer_reach()` rather than a
-        // hardcoded cert hash: the process-global `NodeStreamReach` is first-wins,
-        // so a sibling test that registers first wins the OnceLock — what matters
-        // is that the encode/decode round-trip is lossless.)
+        // The round-tripped reach must match the service-local reach exactly.
         assert_eq!(
             decoded.announced_at, reach,
             "decoded StreamInfo.announcedAt must round-trip the producer reach exactly"

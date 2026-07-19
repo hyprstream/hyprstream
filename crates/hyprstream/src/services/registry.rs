@@ -325,6 +325,8 @@ pub struct RegistryService {
     // Infrastructure (for Spawnable)
     transport: TransportConfig,
     signing_key: SigningKey,
+    reach_config: hyprstream_rpc::moq_stream::ProducerReachConfigHandle,
+    moq_origin: hyprstream_rpc::moq_stream::MoqStreamOriginHandle,
     /// 9P fid table for filesystem operations.
     fid_table: Arc<FidTable>,
     /// Cached contained roots for worktrees: (repo_id, worktree_name) → ContainedFs.
@@ -415,6 +417,10 @@ impl RegistryService {
             policy_client,
             transport,
             signing_key,
+            reach_config: Arc::new(parking_lot::RwLock::new(
+                hyprstream_rpc::moq_stream::ProducerReachConfig::default(),
+            )),
+            moq_origin: Arc::new(parking_lot::RwLock::new(None)),
             fid_table,
             contained_roots: DashMap::new(),
             editing_table,
@@ -797,10 +803,15 @@ impl RegistryService {
             .ok_or_else(|| anyhow!("Streaming requires client ephemeral pubkey for E2E authentication"))?;
 
         // Create StreamChannel for DH key exchange and publishing
-        let stream_channel = StreamChannel::new(self.signing_key.clone());
+        let stream_channel = StreamChannel::new(self.signing_key.clone())
+            .with_reach_config(hyprstream_rpc::moq_stream::ProducerReachConfig::default())
+            .with_reach_config_handle(self.reach_config.clone())
+            .with_moq_origin_handle(self.moq_origin.clone());
 
         // 10 minutes expiry for clone operations
-        let stream_ctx = stream_channel.prepare_stream(client_pub_bytes, 600).await?;
+        let stream_ctx = stream_channel
+            .prepare_third_party_interop_stream(client_pub_bytes, 600)
+            .await?;
 
         debug!(
             stream_id = %stream_ctx.stream_id(),
@@ -1034,9 +1045,14 @@ impl RegistryService {
         let client_pub_bytes = client_ephemeral_pubkey
             .ok_or_else(|| anyhow!("Streaming requires client ephemeral pubkey for E2E authentication"))?;
 
-        let stream_channel = StreamChannel::new(self.signing_key.clone());
+        let stream_channel = StreamChannel::new(self.signing_key.clone())
+            .with_reach_config(hyprstream_rpc::moq_stream::ProducerReachConfig::default())
+            .with_reach_config_handle(self.reach_config.clone())
+            .with_moq_origin_handle(self.moq_origin.clone());
         // 10 minutes expiry — weights are GB-scale.
-        let stream_ctx = stream_channel.prepare_stream(client_pub_bytes, 600).await?;
+        let stream_ctx = stream_channel
+            .prepare_third_party_interop_stream(client_pub_bytes, 600)
+            .await?;
 
         debug!(
             stream_id = %stream_ctx.stream_id(),
@@ -1051,7 +1067,7 @@ impl RegistryService {
             stream_id: stream_ctx.stream_id().to_owned(),
             dh_public: *stream_ctx.server_pubkey(),
             broadcast_path,
-            announced_at: hyprstream_rpc::moq_stream::producer_reach(),
+            announced_at: stream_ctx.reach(),
             ..Default::default()
         };
 
@@ -3152,6 +3168,14 @@ impl WorktreeHandler for RegistryService {
 
 #[async_trait(?Send)]
 impl RequestService for RegistryService {
+    fn producer_reach_config_handle(&self) -> Option<hyprstream_rpc::moq_stream::ProducerReachConfigHandle> {
+        Some(self.reach_config.clone())
+    }
+
+    fn moq_origin_handle(&self) -> Option<hyprstream_rpc::moq_stream::MoqStreamOriginHandle> {
+        Some(self.moq_origin.clone())
+    }
+
     async fn handle_request(&self, ctx: &EnvelopeContext, payload: &[u8]) -> Result<(Vec<u8>, Option<crate::services::Continuation>)> {
         dispatch_registry(self, ctx, payload).await
     }
@@ -3435,9 +3459,16 @@ mod tests {
         use hyprstream_rpc::transport::TransportConfig;
 
         // Tests use Classical (EdDSA-only) keys — install Classical verify
-        // policy so the global fail-closed Hybrid default doesn't reject them.
+        // policy on both the request and response arms so the global
+        // fail-closed Hybrid defaults don't reject them.
         let _ = hyprstream_rpc::envelope::install_verify_config(
             hyprstream_rpc::envelope::EnvelopeVerifyConfig {
+                policy: hyprstream_rpc::crypto::CryptoPolicy::Classical,
+                pq_store: None,
+            },
+        );
+        let _ = hyprstream_rpc::envelope::install_response_verify_config(
+            hyprstream_rpc::envelope::ResponseVerifyConfig {
                 policy: hyprstream_rpc::crypto::CryptoPolicy::Classical,
                 pq_store: None,
             },
@@ -3505,6 +3536,11 @@ mod tests {
         let _ = hyprstream_rpc::envelope::install_verify_config(hyprstream_rpc::envelope::EnvelopeVerifyConfig {
             policy: hyprstream_rpc::crypto::CryptoPolicy::Classical, pq_store: None,
         });
+        let _ = hyprstream_rpc::envelope::install_response_verify_config(
+            hyprstream_rpc::envelope::ResponseVerifyConfig {
+                policy: hyprstream_rpc::crypto::CryptoPolicy::Classical, pq_store: None,
+            },
+        );
         let root = TempDir::new().unwrap();
         let models = root.path().join("models");
         let pds = root.path().join("pds");

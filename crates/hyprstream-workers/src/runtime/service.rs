@@ -147,7 +147,10 @@ impl WorkerService {
         // Create event publisher for worker lifecycle events
         let event_publisher = EventPublisher::new("worker")?;
 
-        let stream_channel = Arc::new(StreamChannel::new(signing_key.clone()));
+        let stream_channel = Arc::new(
+            StreamChannel::new(signing_key.clone())
+                .with_reach_config(hyprstream_rpc::moq_stream::ProducerReachConfig::default()),
+        );
         Ok(Self {
             sandbox_pool,
             image_store,
@@ -906,7 +909,7 @@ impl WorkerService {
 
         // DH + pre-authorization via StreamChannel — atomic, no pending state
         let stream_ctx = self.stream_channel
-            .prepare_stream_with_claims(&client_pubkey, 600, claims).await
+            .prepare_third_party_interop_stream_with_claims(&client_pubkey, 600, claims).await
             .map_err(|e| anyhow::anyhow!("Stream preparation failed: {}", e))?
             .with_qos_preset::<hyprstream_rpc::stream_info::Pipe>();
 
@@ -1417,6 +1420,14 @@ impl WorkerHandler for WorkerService {
 
 #[async_trait(?Send)]
 impl RequestService for WorkerService {
+    fn producer_reach_config_handle(&self) -> Option<hyprstream_rpc::moq_stream::ProducerReachConfigHandle> {
+        Some(self.stream_channel.reach_config_handle())
+    }
+
+    fn moq_origin_handle(&self) -> Option<hyprstream_rpc::moq_stream::MoqStreamOriginHandle> {
+        Some(self.stream_channel.moq_origin_handle())
+    }
+
     async fn handle_request(&self, ctx: &EnvelopeContext, payload: &[u8]) -> AnyhowResult<(Vec<u8>, Option<hyprstream_rpc::service::Continuation>)> {
         debug!(
             "Worker request from {} (request_id={})",

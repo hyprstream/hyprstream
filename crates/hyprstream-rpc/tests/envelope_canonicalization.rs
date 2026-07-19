@@ -1,12 +1,23 @@
 use ed25519_dalek::SigningKey;
-use hyprstream_rpc::envelope::{Authorization, RequestEnvelope, SignedEnvelope};
+use hyprstream_rpc::envelope::{
+    Authorization, KeyedPqTrustStore, RequestEnvelope, SignedEnvelope,
+};
+use hyprstream_rpc::node_identity::derive_mesh_mldsa_key;
 use rand::rngs::OsRng;
 
 fn make_signed(envelope: RequestEnvelope, signing_key: &SigningKey) -> SignedEnvelope {
-    // Classical so the raw Ed25519 `sig` field is deterministic (ML-DSA-65
-    // signatures are randomized/hedged). Composite behavior is tested in the
-    // envelope `cose::`/`crypto::` suites.
-    SignedEnvelope::new_signed(envelope, signing_key)
+    let pq = derive_mesh_mldsa_key(signing_key);
+    SignedEnvelope::new_signed_hybrid(envelope, signing_key, &pq)
+}
+
+fn pq_store(signing_key: &SigningKey) -> anyhow::Result<KeyedPqTrustStore> {
+    let pq = derive_mesh_mldsa_key(signing_key);
+    let vk = hyprstream_rpc::crypto::pq::ml_dsa_vk_from_bytes(
+        &hyprstream_rpc::crypto::pq::ml_dsa_sk_to_vk_bytes(&pq),
+    )?;
+    let mut store = KeyedPqTrustStore::new();
+    store.bind(signing_key.verifying_key().to_bytes(), &vk);
+    Ok(store)
 }
 
 #[test]
@@ -41,7 +52,7 @@ fn test_envelope_serialization_deterministic() {
 }
 
 #[test]
-fn test_envelope_signature_verification_stable() {
+fn test_envelope_signature_verification_stable() -> anyhow::Result<()> {
     let mut csprng = OsRng;
     let signing_key = SigningKey::generate(&mut csprng);
     let verifying_key = signing_key.verifying_key();
@@ -62,6 +73,7 @@ fn test_envelope_signature_verification_stable() {
 
     let signed1 = make_signed(envelope.clone(), &signing_key);
     let signed2 = make_signed(envelope.clone(), &signing_key);
+    let store = pq_store(&signing_key)?;
 
     // Ed25519 signatures MUST be identical (deterministic serialization)
     assert_eq!(
@@ -70,11 +82,23 @@ fn test_envelope_signature_verification_stable() {
     );
 
     assert!(
-        signed1.verify_signature_only(&verifying_key).is_ok(),
+        signed1
+            .verify_signature_only_with(
+                &verifying_key,
+                Some(&store),
+                hyprstream_rpc::crypto::CryptoPolicy::Hybrid,
+            )
+            .is_ok(),
         "First signature must verify"
     );
     assert!(
-        signed2.verify_signature_only(&verifying_key).is_ok(),
+        signed2
+            .verify_signature_only_with(
+                &verifying_key,
+                Some(&store),
+                hyprstream_rpc::crypto::CryptoPolicy::Hybrid,
+            )
+            .is_ok(),
         "Second signature must verify"
     );
 
@@ -99,9 +123,17 @@ fn test_envelope_signature_verification_stable() {
     };
 
     assert!(
-        mixed.verify_signature_only(&verifying_key).is_ok(),
+        mixed
+            .verify_signature_only_with(
+                &verifying_key,
+                Some(&store),
+                hyprstream_rpc::crypto::CryptoPolicy::Hybrid,
+            )
+            .is_ok(),
         "Cross-verification must work due to deterministic serialization"
     );
+
+    Ok(())
 }
 
 #[test]

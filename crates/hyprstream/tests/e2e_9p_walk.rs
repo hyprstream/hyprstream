@@ -114,6 +114,12 @@ fn install_classical_verify() {
         policy: CryptoPolicy::Classical,
         pq_store: None,
     });
+    let _ = hyprstream_rpc::envelope::install_response_verify_config(
+        hyprstream_rpc::envelope::ResponseVerifyConfig {
+            policy: CryptoPolicy::Classical,
+            pq_store: None,
+        },
+    );
 }
 
 /// Create a temp git repo at `dir/config-repo` with a `config.json`, commit

@@ -151,6 +151,10 @@ pub struct EnvelopeContext {
     pub(crate) response_kem_recipient: Option<crate::crypto::hybrid_kem::RecipientPublic>,
     pub(crate) service_domain: Option<String>,
 
+    /// Browser-only method commitment independently checked by generated
+    /// service dispatch after the sealed transcript is recovered.
+    pub(crate) browser_method_discriminator: Option<u16>,
+
     /// Whether this request originated from a genuine in-process / IPC caller
     /// (the `FixedSigner` mutual-auth plane), as opposed to a networked peer
     /// (the `AnySigner` plane used by ZMQ-QUIC / iroh / WebTransport).
@@ -186,6 +190,7 @@ impl EnvelopeContext {
             request_nonce: envelope.envelope.nonce,
             response_kem_recipient: envelope.envelope.response_kem_recipient.clone(),
             service_domain: envelope.envelope.service_domain.clone(),
+            browser_method_discriminator: None,
             // AnySigner / networked plane — NOT a local caller (#328).
             is_local_caller: false,
         }
@@ -211,6 +216,7 @@ impl EnvelopeContext {
             request_nonce: envelope.envelope.nonce,
             response_kem_recipient: envelope.envelope.response_kem_recipient.clone(),
             service_domain: envelope.envelope.service_domain.clone(),
+            browser_method_discriminator: None,
             // FixedSigner mutual-auth plane — genuine in-process / IPC caller (#328).
             is_local_caller: true,
         }
@@ -240,9 +246,23 @@ impl EnvelopeContext {
             request_nonce: [0; 16],
             response_kem_recipient: None,
             service_domain: None,
+            browser_method_discriminator: None,
             // Internal self-call that never crosses a network boundary (#328).
             is_local_caller: true,
         }
+    }
+
+    /// Compare the sealed client method commitment with the discriminator
+    /// independently decoded by generated service dispatch. Legacy carriers
+    /// have no commitment; browser dispatch always installs one.
+    pub fn ensure_browser_method(&self, actual_method_discriminator: u16) -> Result<()> {
+        if let Some(expected) = self.browser_method_discriminator {
+            anyhow::ensure!(
+                expected == actual_method_discriminator,
+                "browser method commitment {expected} does not match decoded service method {actual_method_discriminator}"
+            );
+        }
+        Ok(())
     }
 
     /// Get the cryptographically-verified authorization subject.
@@ -516,10 +536,21 @@ pub trait RequestService: 'static {
     /// Ed25519 signing key for signing responses.
     fn signing_key(&self) -> SigningKey;
 
+    /// Mutable reach source filled by the unified service spawner after the
+    /// service's QUIC and iroh listeners bind.
+    fn producer_reach_config_handle(&self) -> Option<crate::moq_stream::ProducerReachConfigHandle> {
+        None
+    }
+
+    /// Optional per-service MoQ origin source. The unified spawner installs a
+    /// scoped origin here when this service has a relay configured.
+    fn moq_origin_handle(&self) -> Option<crate::moq_stream::MoqStreamOriginHandle> {
+        None
+    }
+
     /// ML-DSA-65 signing key for the post-quantum half of the response COSE
-    /// composite (#275). When `Some`, `process_request` signs the
-    /// `ResponseEnvelope` under the Hybrid policy (EdDSA + ML-DSA-65); when
-    /// `None` it signs Classical (EdDSA-only). The matching ML-DSA-65 public key
+    /// composite (#275). Returning `None` makes `process_request` fail closed
+    /// before dispatch; it never selects an EdDSA-only response. The matching ML-DSA-65 public key
     /// must be anchored in the client's PQ trust store for Hybrid verification
     /// to succeed (peer attestation).
     ///
@@ -531,10 +562,7 @@ pub trait RequestService: 'static {
     /// stores — Ed25519 signer pubkey → ML-DSA vk — is self-consistent, and the
     /// published `#mesh-pq` DID verification method equals this signing key.
     ///
-    /// Mirrors the request-side signing policy: the server emits the strongest
-    /// composite it has keys for; a Classical verifier still accepts it via the
-    /// inner EdDSA (skip-unknown interop). Override to return `None` to force
-    /// Classical-only responses.
+    /// Mirrors the request-side mandatory pinned suite.
     fn pq_signing_key(&self) -> Option<crate::crypto::pq::MlDsaSigningKey> {
         Some(crate::node_identity::derive_mesh_mldsa_key(
             &self.signing_key(),
@@ -593,8 +621,7 @@ pub trait RequestService: 'static {
     /// outright, independent of JWKS `kid_algs` hygiene. The default reads the
     /// process-global envelope verify config (Hybrid in production), so the
     /// per-call policy is test-isolated from sibling tests that mutate the
-    /// shared global — a mock/test service that needs EdDSA acceptance overrides
-    /// this to [`CryptoPolicy::Classical`].
+    /// shared global.
     fn jwt_verify_policy(&self) -> crate::crypto::CryptoPolicy {
         #[cfg(not(target_arch = "wasm32"))]
         {
@@ -602,7 +629,7 @@ pub trait RequestService: 'static {
         }
         #[cfg(target_arch = "wasm32")]
         {
-            crate::crypto::CryptoPolicy::Classical
+            crate::crypto::CryptoPolicy::Hybrid
         }
     }
 
@@ -1025,8 +1052,8 @@ pub struct QuicLoopConfig {
     pub on_iroh_bound: Option<Box<dyn FnOnce(String, [u8; 32]) + Send>>,
     /// #358: the producer-chosen moq RELAY this node rendezvouses through, in
     /// wire-reach form ([`crate::stream_info::TransportConfig`]). When set, the
-    /// spawner registers it via [`crate::moq_stream::init_global_relay_reach`] (so
-    /// `producer_reach()` advertises a `Role::Relay` reach) and links this node's
+    /// spawner places it in the service's `ProducerReachConfig` (so published
+    /// streams advertise a `Role::Relay` reach) and links this node's
     /// streaming origin UP to the relay
     /// ([`crate::moq_stream::serve_origin_to_relay_background`]) — restoring the
     /// rendezvous property: neither publisher nor subscriber need be directly
@@ -1161,6 +1188,7 @@ mod empty_iss_gate_tests {
             request_nonce: [0; 16],
             response_kem_recipient: None,
             service_domain: None,
+            browser_method_discriminator: None,
             is_local_caller,
         }
     }
@@ -1536,6 +1564,7 @@ mod ipc_key_identity_tests {
             request_nonce: [0; 16],
             response_kem_recipient: None,
             service_domain: None,
+            browser_method_discriminator: None,
             // AnySigner / networked-or-UDS plane.
             is_local_caller: false,
         }
@@ -1763,6 +1792,7 @@ mod accounting_audit_tests {
             request_nonce: [0; 16],
             response_kem_recipient: None,
             service_domain: None,
+            browser_method_discriminator: None,
             is_local_caller: true,
         }
     }
@@ -1818,6 +1848,7 @@ mod accounting_audit_tests {
             request_nonce: [0; 16],
             response_kem_recipient: None,
             service_domain: None,
+            browser_method_discriminator: None,
             is_local_caller: false,
         };
         let records = capture(|| {
@@ -1883,6 +1914,7 @@ mod accounting_audit_tests {
             request_nonce: [0; 16],
             response_kem_recipient: None,
             service_domain: None,
+            browser_method_discriminator: None,
             is_local_caller: false,
         }
     }
@@ -2040,6 +2072,35 @@ mod accounting_audit_tests {
         assert!(
             ctx.security_context().is_none(),
             "unlabeled subject must have no security context (S1 deny)"
+        );
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod browser_method_commitment_tests {
+    use super::EnvelopeContext;
+
+    #[test]
+    fn browser_method_commitment_rejects_mismatch_and_accepts_match() {
+        let mut ctx = EnvelopeContext::from_callback_service(7, "model");
+        ctx.browser_method_discriminator = Some(3);
+
+        ctx.ensure_browser_method(3)
+            .expect("matching generated method discriminator must pass");
+        let error = ctx
+            .ensure_browser_method(4)
+            .expect_err("cross-method browser commitment must fail closed");
+        assert!(error
+            .to_string()
+            .contains("browser method commitment 3 does not match decoded service method 4"));
+    }
+
+    #[test]
+    fn non_browser_context_preserves_legacy_dispatch_compatibility() {
+        let ctx = EnvelopeContext::from_callback_service(7, "model");
+        ctx.ensure_browser_method(u16::MAX)
+            .expect("non-browser carriers have no method commitment to compare"
         );
     }
 }

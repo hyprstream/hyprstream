@@ -104,6 +104,7 @@ pub use hyprstream_rpc::resolver::Resolver;
 pub use service::{
     bootstrap_deployment_process, deployment_registry_verifier, AuthorizationProvider,
     DiscoveryService, RecordCarData, RecordResolver, RegistryDeploymentVerifier,
+    production_browser_currentness_verifier, production_browser_provisioning,
     production_rpc_client,
 };
 

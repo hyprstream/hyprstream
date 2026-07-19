@@ -1,0 +1,715 @@
+{
+  "vector_version": 1,
+  "status": "non-cryptographic-structural-fixture",
+  "profile_id": "hs-resource-attestation/resource-intent/v1",
+  "note": "No artifact in this file is a signature, a MAC attestation, a ledger attestation, a finalized manifest, or a production credential. The structurally valid baseline must still be refused because the canonical production ResourceIntent encoding, registrar, and reviewed attestations do not yet exist. Digests are SHA-256 over a deterministic JSON canonical form used only by the boundary checker; they are NOT the production DAG-CBOR encoding pending #1065.",
+  "canonicalization_rule": "sha256 over json.dumps(obj, sort_keys=True, separators=(',',':'), ensure_ascii=False). Structural fixture canonical form, not the production DAG-CBOR encoding.",
+  "evaluation": {
+    "now": 2000000000,
+    "current_accepted_state_epoch": 7,
+    "current_policy_generation": 11,
+    "accepted_state_digest": "1010101010101010101010101010101010101010101010101010101010101010",
+    "current_fencing_generation": "fence-gen-7",
+    "finalized_operation_ids": [
+      "op-previously-finalized"
+    ],
+    "consumed_fencing_tokens": [
+      "fence-gen-7-consumed-op"
+    ]
+  },
+  "baseline": {
+    "resource_intent": {
+      "resource_id": "res-7f4a2e8b1c6d3a094e2f",
+      "content_cid": "bafyri-resource-content-2026-07-17",
+      "operation_id": "op-9c3d5e7b8f0426",
+      "predecessor_version": 3,
+      "owner_ref": {
+        "kind": "identified",
+        "value": "did:at9p:owner-example"
+      },
+      "controller_ref": {
+        "kind": "identified",
+        "value": "did:at9p:controller-example"
+      },
+      "payer_ref": {
+        "kind": "identified",
+        "value": "did:at9p:payer-example"
+      },
+      "profile": "identified-owner",
+      "accepted_state_epoch": 7,
+      "accepted_state_digest": "1010101010101010101010101010101010101010101010101010101010101010",
+      "policy_generation": 11,
+      "expiry": 2000000600
+    },
+    "canonical_digest": "47d601a5cf682840a8d44bd7b10e5c6de4bb2485d3a35a1b4ea13b408aadd3f0",
+    "manifest": {
+      "resource_id": "res-7f4a2e8b1c6d3a094e2f",
+      "content_cid": "bafyri-resource-content-2026-07-17",
+      "operation_id": "op-9c3d5e7b8f0426",
+      "predecessor_version": 3,
+      "profile": "identified-owner",
+      "accepted_state_epoch": 7,
+      "accepted_state_digest": "1010101010101010101010101010101010101010101010101010101010101010",
+      "policy_generation": 11,
+      "expiry": 2000000600,
+      "fencing_token": "fence-gen-7-9c3d5e7b8f0426",
+      "mac_attestation": {
+        "role": "mac-title-control",
+        "covered_digest": "47d601a5cf682840a8d44bd7b10e5c6de4bb2485d3a35a1b4ea13b408aadd3f0",
+        "assurance": "pq-hybrid"
+      },
+      "ledger_attestation": {
+        "role": "ledger-economic",
+        "covered_digest": "47d601a5cf682840a8d44bd7b10e5c6de4bb2485d3a35a1b4ea13b408aadd3f0",
+        "assurance": "pq-hybrid"
+      },
+      "manifest_cid": "20959c8d1e4d274516310447b12602d66f647df3bd4201778629d8df384e42d4"
+    },
+    "production_disposition": "refuse-construction-incomplete"
+  },
+  "baseline_canonical_sha256": "47d601a5cf682840a8d44bd7b10e5c6de4bb2485d3a35a1b4ea13b408aadd3f0",
+  "expected_production_refusal": "construction-incomplete",
+  "mutations": [
+    {
+      "id": "cyclic-identifier",
+      "op": "replace",
+      "path": [
+        "baseline",
+        "resource_intent",
+        "resource_id"
+      ],
+      "value": "sha256:20959c8d1e4d274516310447b12602d6",
+      "expected_error": "resource-intent:cyclic-identifier"
+    },
+    {
+      "id": "mac-only-attestation",
+      "op": "delete",
+      "path": [
+        "baseline",
+        "manifest",
+        "ledger_attestation"
+      ],
+      "expected_error": "manifest:mac-only-not-final"
+    },
+    {
+      "id": "ledger-only-attestation",
+      "op": "delete",
+      "path": [
+        "baseline",
+        "manifest",
+        "mac_attestation"
+      ],
+      "expected_error": "manifest:ledger-only-not-final"
+    },
+    {
+      "id": "duplicated-mac-attestation",
+      "op": "duplicate",
+      "path": [
+        "baseline",
+        "manifest",
+        "mac_attestation"
+      ],
+      "expected_error": "manifest:duplicated-attestation"
+    },
+    {
+      "id": "crossed-resourceintent-digest",
+      "op": "replace",
+      "path": [
+        "baseline",
+        "manifest",
+        "ledger_attestation",
+        "covered_digest"
+      ],
+      "value": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "expected_error": "manifest:crossed-digest"
+    },
+    {
+      "id": "downgraded-assurance",
+      "op": "replace",
+      "path": [
+        "baseline",
+        "manifest",
+        "mac_attestation",
+        "assurance"
+      ],
+      "value": "classical-claims-pq-hybrid",
+      "expected_error": "manifest:downgraded-assurance"
+    },
+    {
+      "id": "non-canonical-encoding",
+      "op": "replace",
+      "path": [
+        "baseline",
+        "resource_intent"
+      ],
+      "value": "{not-a-canonical-object: pretty-printed}",
+      "expected_error": "resource-intent:non-canonical"
+    },
+    {
+      "id": "unknown-registry-field",
+      "op": "add",
+      "path": [
+        "baseline",
+        "resource_intent",
+        "holder_did"
+      ],
+      "value": "did:plc:holder-example",
+      "expected_error": "resource-intent:unknown-field"
+    },
+    {
+      "id": "out-of-bounds-field",
+      "op": "replace",
+      "path": [
+        "baseline",
+        "resource_intent",
+        "predecessor_version"
+      ],
+      "value": 5000,
+      "expected_error": "resource-intent:out-of-bounds"
+    },
+    {
+      "id": "replayed-operation-id",
+      "op": "replace",
+      "path": [
+        "baseline",
+        "manifest",
+        "operation_id"
+      ],
+      "value": "op-previously-finalized",
+      "expected_error": "manifest:replayed-operation-id"
+    },
+    {
+      "id": "stale-predecessor-version",
+      "op": "replace",
+      "path": [
+        "baseline",
+        "manifest",
+        "predecessor_version"
+      ],
+      "value": 2,
+      "expected_error": "manifest:stale-predecessor"
+    },
+    {
+      "id": "crossed-fencing-token",
+      "op": "replace",
+      "path": [
+        "baseline",
+        "manifest",
+        "fencing_token"
+      ],
+      "value": "fence-gen-6-stale",
+      "expected_error": "manifest:crossed-fencing-token"
+    },
+    {
+      "id": "missing-fencing-token",
+      "op": "delete",
+      "path": [
+        "baseline",
+        "manifest",
+        "fencing_token"
+      ],
+      "expected_error": "manifest:missing-fencing-token"
+    },
+    {
+      "id": "concurrent-successors",
+      "op": "add",
+      "path": [
+        "baseline",
+        "manifest",
+        "successor_set"
+      ],
+      "value": [
+        {
+          "version": 4
+        },
+        {
+          "version": 4
+        }
+      ],
+      "expected_error": "manifest:concurrent-successors"
+    },
+    {
+      "id": "crash-repeats-finalized",
+      "op": "add",
+      "path": [
+        "baseline",
+        "manifest",
+        "resubmit_after_crash"
+      ],
+      "value": true,
+      "expected_error": "manifest:crash-repeats-finalized"
+    },
+    {
+      "id": "anonymous-fabricates-did",
+      "op": "replace",
+      "path": [
+        "baseline",
+        "resource_intent",
+        "controller_ref"
+      ],
+      "value": {
+        "kind": "anonymous-capability",
+        "value": "did:plc:holder-leak"
+      },
+      "expected_error": "profile:anonymous-fabricates-did"
+    },
+    {
+      "id": "public-receipt-reveals-holder",
+      "op": "add",
+      "path": [
+        "baseline",
+        "manifest",
+        "public_receipt"
+      ],
+      "value": {
+        "holder_did": "did:plc:holder-leak"
+      },
+      "expected_error": "receipt:public-reveals-holder"
+    },
+    {
+      "id": "public-receipt-raw-token",
+      "op": "add",
+      "path": [
+        "baseline",
+        "manifest",
+        "public_receipt"
+      ],
+      "value": {
+        "anonymous_token": "raw-token-bytes-deadbeef"
+      },
+      "expected_error": "receipt:public-reveals-token"
+    },
+    {
+      "id": "public-receipt-client-key",
+      "op": "add",
+      "path": [
+        "baseline",
+        "manifest",
+        "public_receipt"
+      ],
+      "value": {
+        "stable_client_key": "0123456789abcdef0123456789abcdef"
+      },
+      "expected_error": "receipt:public-reveals-client-key"
+    },
+    {
+      "id": "public-receipt-entitlement-id",
+      "op": "add",
+      "path": [
+        "baseline",
+        "manifest",
+        "public_receipt"
+      ],
+      "value": {
+        "linkable_entitlement_identifier": "ent-2026-0001"
+      },
+      "expected_error": "receipt:public-reveals-entitlement"
+    },
+    {
+      "id": "public-receipt-nested-value",
+      "op": "add",
+      "path": [
+        "baseline",
+        "manifest",
+        "public_receipt"
+      ],
+      "value": {
+        "envelope": {
+          "inner": {
+            "holder_did": "did:plc:holder-leak"
+          }
+        }
+      },
+      "expected_error": "receipt:public-reveals-nested"
+    },
+    {
+      "id": "checkpoint-reveals-holder",
+      "op": "add",
+      "path": [
+        "baseline",
+        "manifest",
+        "checkpoint"
+      ],
+      "value": {
+        "epoch": 7,
+        "holder_did": "did:plc:holder-leak"
+      },
+      "expected_error": "checkpoint:public-reveals-holder"
+    },
+    {
+      "id": "checkpoint-raw-token",
+      "op": "add",
+      "path": [
+        "baseline",
+        "manifest",
+        "checkpoint"
+      ],
+      "value": {
+        "epoch": 7,
+        "raw_token": "raw-token-bytes-deadbeef"
+      },
+      "expected_error": "checkpoint:public-reveals-token"
+    },
+    {
+      "id": "crossed-profile-kind",
+      "op": "replace",
+      "path": [
+        "baseline",
+        "resource_intent",
+        "profile"
+      ],
+      "value": "identified-anonymous-merged",
+      "expected_error": "profile:unknown-or-crossed-kind"
+    },
+    {
+      "id": "unknown-profile-kind",
+      "op": "replace",
+      "path": [
+        "baseline",
+        "resource_intent",
+        "profile"
+      ],
+      "value": "secret-fifth-profile",
+      "expected_error": "profile:unknown-kind"
+    },
+    {
+      "id": "unknown-state",
+      "op": "add",
+      "path": [
+        "baseline",
+        "manifest",
+        "transition_from"
+      ],
+      "value": "frozen",
+      "expected_error": "state-machine:unknown-state"
+    },
+    {
+      "id": "cas-exposes-provisional",
+      "op": "add",
+      "path": [
+        "baseline",
+        "manifest",
+        "provisional_namespace_path"
+      ],
+      "value": "/provisional/leaked",
+      "expected_error": "cas:provisional-exposed-as-final"
+    },
+    {
+      "id": "content-cid-mismatch",
+      "op": "replace",
+      "path": [
+        "baseline",
+        "manifest",
+        "content_cid"
+      ],
+      "value": "bafyri-different-bytes",
+      "expected_error": "cas:content-cid-mismatch"
+    },
+    {
+      "id": "ninep-confers-unfinalized-title",
+      "op": "add",
+      "path": [
+        "baseline",
+        "manifest",
+        "ninep_title_granted"
+      ],
+      "value": "before-finalize",
+      "expected_error": "ninep:title-without-finalized"
+    },
+    {
+      "id": "expired-attestation",
+      "op": "replace",
+      "path": [
+        "baseline",
+        "resource_intent",
+        "expiry"
+      ],
+      "value": 1999999999,
+      "expected_error": "attestation:expired"
+    },
+    {
+      "id": "crossed-expiry",
+      "op": "replace",
+      "path": [
+        "baseline",
+        "manifest",
+        "expiry"
+      ],
+      "value": 2000000601,
+      "expected_error": "manifest:expiry-binding"
+    },
+    {
+      "id": "stale-accepted-state",
+      "op": "replace",
+      "path": [
+        "baseline",
+        "resource_intent",
+        "accepted_state_epoch"
+      ],
+      "value": 6,
+      "expected_error": "attestation:stale-state"
+    },
+    {
+      "id": "policy-rollback",
+      "op": "replace",
+      "path": [
+        "baseline",
+        "resource_intent",
+        "policy_generation"
+      ],
+      "value": 10,
+      "expected_error": "attestation:policy-rollback"
+    },
+    {
+      "id": "replay-across-resource",
+      "op": "replace",
+      "path": [
+        "baseline",
+        "manifest",
+        "resource_id"
+      ],
+      "value": "res-different-resource",
+      "expected_error": "manifest:crossed-resource"
+    },
+    {
+      "id": "boolean-version",
+      "op": "add",
+      "path": [
+        "baseline",
+        "manifest",
+        "version"
+      ],
+      "value": true,
+      "expected_error": "manifest:version-type"
+    },
+    {
+      "id": "unknown-attestation-role",
+      "op": "replace",
+      "path": [
+        "baseline",
+        "manifest",
+        "ledger_attestation",
+        "role"
+      ],
+      "value": "relay-routing",
+      "expected_error": "manifest:unknown-attestation-role"
+    },
+    {
+      "id": "missing-resource-id",
+      "op": "delete",
+      "path": [
+        "baseline",
+        "manifest",
+        "resource_id"
+      ],
+      "expected_error": "manifest:missing-identifier"
+    },
+    {
+      "id": "missing-content-cid",
+      "op": "delete",
+      "path": [
+        "baseline",
+        "manifest",
+        "content_cid"
+      ],
+      "expected_error": "manifest:missing-identifier"
+    },
+    {
+      "id": "missing-manifest-cid",
+      "op": "delete",
+      "path": [
+        "baseline",
+        "manifest",
+        "manifest_cid"
+      ],
+      "expected_error": "manifest:missing-identifier"
+    },
+    {
+      "id": "missing-operation-id",
+      "op": "delete",
+      "path": [
+        "baseline",
+        "manifest",
+        "operation_id"
+      ],
+      "expected_error": "manifest:missing-identifier"
+    },
+    {
+      "id": "missing-intent-identifier",
+      "op": "delete",
+      "path": [
+        "baseline",
+        "resource_intent",
+        "content_cid"
+      ],
+      "expected_error": "resource-intent:missing-identifier"
+    },
+    {
+      "id": "swapped-attestation-roles",
+      "op": "replace",
+      "path": [
+        "baseline",
+        "manifest",
+        "mac_attestation",
+        "role"
+      ],
+      "value": "ledger-economic",
+      "expected_error": "manifest:crossed-attestation-role"
+    },
+    {
+      "id": "duplicated-known-role",
+      "op": "replace",
+      "path": [
+        "baseline",
+        "manifest",
+        "ledger_attestation",
+        "role"
+      ],
+      "value": "mac-title-control",
+      "expected_error": "manifest:crossed-attestation-role"
+    },
+    {
+      "id": "fencing-future-generation",
+      "op": "replace",
+      "path": [
+        "baseline",
+        "manifest",
+        "fencing_token"
+      ],
+      "value": "fence-gen-70-future",
+      "expected_error": "manifest:crossed-fencing-token"
+    },
+    {
+      "id": "replayed-fencing-token",
+      "op": "replace",
+      "path": [
+        "baseline",
+        "manifest",
+        "fencing_token"
+      ],
+      "value": "fence-gen-7-consumed-op",
+      "expected_error": "manifest:replayed-fencing-token"
+    },
+    {
+      "id": "crossed-operation-id",
+      "op": "replace",
+      "path": [
+        "baseline",
+        "manifest",
+        "operation_id"
+      ],
+      "value": "op-fresh-bypass-000000",
+      "expected_error": "manifest:crossed-operation-id"
+    },
+    {
+      "id": "manifest-cid-mismatch",
+      "op": "replace",
+      "path": [
+        "baseline",
+        "manifest",
+        "manifest_cid"
+      ],
+      "value": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "expected_error": "manifest:manifest-cid-mismatch"
+    },
+    {
+      "id": "profile-ref-kind-mismatch",
+      "op": "replace",
+      "path": [
+        "baseline",
+        "resource_intent",
+        "profile"
+      ],
+      "value": "committed-owner",
+      "expected_error": "profile:ref-kind-mismatch"
+    },
+    {
+      "id": "crossed-ref-kind",
+      "op": "replace",
+      "path": [
+        "baseline",
+        "resource_intent",
+        "payer_ref"
+      ],
+      "value": {
+        "kind": "anonymous-capability",
+        "value": "c0mm17m3n7-payer-crossed-kind"
+      },
+      "expected_error": "profile:unknown-ref-kind"
+    }
+  ],
+  "mutation_categories": {
+    "canonicalization": [
+      "non-canonical-encoding",
+      "unknown-registry-field",
+      "out-of-bounds-field",
+      "boolean-version"
+    ],
+    "mutation": [
+      "cyclic-identifier",
+      "unknown-attestation-role",
+      "content-cid-mismatch",
+      "missing-resource-id",
+      "missing-content-cid",
+      "missing-manifest-cid",
+      "missing-operation-id",
+      "missing-intent-identifier",
+      "manifest-cid-mismatch"
+    ],
+    "replay": [
+      "replayed-operation-id",
+      "crash-repeats-finalized",
+      "replay-across-resource",
+      "replayed-fencing-token",
+      "crossed-operation-id"
+    ],
+    "crossing": [
+      "crossed-resourceintent-digest",
+      "crossed-fencing-token",
+      "crossed-profile-kind",
+      "crossed-expiry",
+      "swapped-attestation-roles",
+      "duplicated-known-role",
+      "fencing-future-generation",
+      "crossed-ref-kind",
+      "profile-ref-kind-mismatch"
+    ],
+    "downgrade": [
+      "downgraded-assurance",
+      "stale-accepted-state",
+      "policy-rollback"
+    ],
+    "privacy-leakage": [
+      "anonymous-fabricates-did",
+      "public-receipt-reveals-holder",
+      "public-receipt-raw-token",
+      "public-receipt-client-key",
+      "public-receipt-entitlement-id",
+      "public-receipt-nested-value",
+      "checkpoint-reveals-holder",
+      "checkpoint-raw-token"
+    ],
+    "crash-recovery": [
+      "crash-repeats-finalized",
+      "missing-fencing-token"
+    ],
+    "concurrency-fencing": [
+      "concurrent-successors",
+      "stale-predecessor-version",
+      "crossed-fencing-token",
+      "missing-fencing-token",
+      "fencing-future-generation",
+      "replayed-fencing-token"
+    ],
+    "provisional-visibility": [
+      "mac-only-attestation",
+      "ledger-only-attestation",
+      "cas-exposes-provisional"
+    ],
+    "state-and-profile": [
+      "unknown-state",
+      "unknown-profile-kind",
+      "expired-attestation"
+    ]
+  }
+}

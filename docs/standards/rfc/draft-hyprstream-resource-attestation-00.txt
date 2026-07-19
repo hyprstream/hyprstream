@@ -1,0 +1,448 @@
+
+
+
+
+Independent Submission                                     H. HyprStream
+Internet-Draft                                                HyprStream
+Intended status: Informational                              17 July 2026
+Expires: 18 January 2027
+
+
+    Pre-I-D Profile: Dual-Attested Resource Ownership for Hyprstream
+                               Resources
+                draft-hyprstream-resource-attestation-00
+
+Abstract
+
+   This document is a pre-Internet-Draft work-in-progress profile
+   skeleton for dual-attested resource ownership in Hyprstream.  It
+   records the separation between a MAC title/control attestation, a
+   ledger economic attestation, and a durable resource registrar that
+   finalizes exactly one canonical successor per transition.  It does
+   not define a Privacy Pass token type, request a 9P opcode or IANA
+   codepoint, or imply IETF endorsement or adoption.
+
+Pre-Submission Status
+
+   This RFCXML source has not been submitted.  Its generated artifacts
+   contain standard Internet-Draft boilerplate solely to exercise the
+   pre-submission toolchain; that boilerplate is not evidence of
+   submission, IETF endorsement, adoption, working-group status, or
+   codepoint allocation.  The profile is intentionally incomplete
+   pending the sibling implementation issues and independent
+   cryptographic, privacy, protocol, and security review.
+
+Status of This Memo
+
+   This Internet-Draft is submitted in full conformance with the
+   provisions of BCP 78 and BCP 79.
+
+   Internet-Drafts are working documents of the Internet Engineering
+   Task Force (IETF).  Note that other groups may also distribute
+   working documents as Internet-Drafts.  The list of current Internet-
+   Drafts is at https://datatracker.ietf.org/drafts/current/.
+
+   Internet-Drafts are draft documents valid for a maximum of six months
+   and may be updated, replaced, or obsoleted by other documents at any
+   time.  It is inappropriate to use Internet-Drafts as reference
+   material or to cite them other than as "work in progress."
+
+   This Internet-Draft will expire on 18 January 2027.
+
+
+
+
+
+HyprStream               Expires 18 January 2027                [Page 1]
+
+Internet-Draft            Resource Attestation                 July 2026
+
+
+Copyright Notice
+
+   Copyright (c) 2026 IETF Trust and the persons identified as the
+   document authors.  All rights reserved.
+
+   This document is subject to BCP 78 and the IETF Trust's Legal
+   Provisions Relating to IETF Documents (https://trustee.ietf.org/
+   license-info) in effect on the date of publication of this document.
+   Please review these documents carefully, as they describe your rights
+   and restrictions with respect to this document.
+
+Table of Contents
+
+   1.  Introduction  . . . . . . . . . . . . . . . . . . . . . . . .   2
+   2.  Requirements Language . . . . . . . . . . . . . . . . . . . .   3
+   3.  Bounded Vocabulary  . . . . . . . . . . . . . . . . . . . . .   3
+   4.  Authority Boundaries  . . . . . . . . . . . . . . . . . . . .   3
+   5.  Stable Resource Identity  . . . . . . . . . . . . . . . . . .   4
+   6.  Dual Attestation  . . . . . . . . . . . . . . . . . . . . . .   4
+   7.  Serialized Transition and Fencing . . . . . . . . . . . . . .   4
+   8.  Provisional Visibility  . . . . . . . . . . . . . . . . . . .   5
+   9.  Assurance Floor . . . . . . . . . . . . . . . . . . . . . . .   5
+   10. Privacy Profiles  . . . . . . . . . . . . . . . . . . . . . .   5
+   11. Encrypted Receipt and Selective Disclosure  . . . . . . . . .   5
+   12. State-Machine and Recovery Skeleton . . . . . . . . . . . . .   6
+   13. Immutable CAS and Blob Reference  . . . . . . . . . . . . . .   6
+   14. Mutable 9P Ownership Semantics  . . . . . . . . . . . . . . .   6
+   15. Construction Status and Experimental Refusal Boundary . . . .   6
+   16. Local Registry  . . . . . . . . . . . . . . . . . . . . . . .   7
+   17. Security Considerations . . . . . . . . . . . . . . . . . . .   7
+   18. Privacy Considerations  . . . . . . . . . . . . . . . . . . .   7
+   19. IANA Considerations . . . . . . . . . . . . . . . . . . . . .   7
+   20. References  . . . . . . . . . . . . . . . . . . . . . . . . .   7
+     20.1.  Normative References . . . . . . . . . . . . . . . . . .   8
+     20.2.  Informative References . . . . . . . . . . . . . . . . .   8
+   Author's Address  . . . . . . . . . . . . . . . . . . . . . . . .   8
+
+1.  Introduction
+
+   This skeleton records the authority boundaries, invariants, state
+   machine, and privacy profiles for dual-attested Hyprstream resource
+   ownership.  It is the conformance and documentation closure artifact
+   for the resource-ownership epic; it consumes the native MAC
+   architecture, the PQ-hybrid anonymous-capability profile, and the 9P/
+   CAS substrate without absorbing their scopes.
+
+
+
+
+
+
+HyprStream               Expires 18 January 2027                [Page 2]
+
+Internet-Draft            Resource Attestation                 July 2026
+
+
+   This profile references deterministic content addressing via
+   [RFC6920], CBOR canonicalization via [RFC8949], and DAG-CBOR
+   canonicalization as used by atproto.  It does not normatively depend
+   on Privacy Pass ([RFC9576], [RFC9578]) or Media over QUIC Transport
+   ([MOQT]); resource-intent application context proposed for those
+   drafts is owned by the #1058/#1059 draft family and supplied by this
+   profile only as reviewed requirements.
+
+2.  Requirements Language
+
+   The key words MUST and MUST NOT in this document are to be
+   interpreted as described in BCP 14 [RFC2119] [RFC8174] when, and only
+   when, they appear in all capitals, as shown here.
+
+3.  Bounded Vocabulary
+
+   Owner:  The principal holding title to a resource; identified,
+      pairwise, or committed.
+
+   Controller:  The principal holding control authority; identified or
+      anonymous-capability.
+
+   Payer:  The principal whose entitlement settles the resource
+      economically; identified or anonymous-entitlement.
+
+   Registrar:  The durable, serialized state machine that joins MAC and
+      ledger attestations and finalizes one canonical successor.
+
+   Resource store:  Bytes and namespace projection; it does not
+      independently invent title.
+
+   Proof plane:  Manifests, receipts, checkpoints, and selective-
+      disclosure material; it is not a synchronous filesystem lock
+      service.
+
+4.  Authority Boundaries
+
+   MAC authority decides whether a principal may create, control,
+   transfer, mutate, or delete a resource under the current policy and
+   content-bound label.  Ledger authority decides whether the identified
+   or anonymous payer has a valid resource entitlement and what was
+   reserved, consumed, released, or compensated.  The resource registrar
+   joins both attestations and selects the single canonical successor
+   manifest.  The resource store and proof plane hold bytes and
+   manifests; they do not independently invent title.
+
+
+
+
+
+
+HyprStream               Expires 18 January 2027                [Page 3]
+
+Internet-Draft            Resource Attestation                 July 2026
+
+
+   Payment does not confer title and MAC authorization does not prove
+   payment.  Owner, controller, payer, issuer, ledger operator, and
+   registrar are distinct typed roles.
+
+5.  Stable Resource Identity
+
+   Stable resource identity, content CID, manifest CID, and operation ID
+   are separate.  A construction MUST NOT define a resource identifier
+   as a hash or signature over another of these identifiers.  A
+   finalized manifest MUST cite the stable resource identifier, the
+   content CID it covers, its own manifest CID, and a deterministic
+   operation ID independently.
+
+   Every request and external effect MUST be idempotent by deterministic
+   operation ID.  A registrar MUST NOT finalize two successors for one
+   operation ID.
+
+6.  Dual Attestation
+
+   No final resource manifest exists without both a MAC title/control
+   attestation and a ledger economic attestation, each computed over the
+   identical canonical ResourceIntent digest.  A registrar MUST reject a
+   manifest whose MAC attestation and ledger attestation are not over
+   byte-identical canonical ResourceIntent digests.
+
+   A MAC-only or ledger-only attestation MUST NOT be accepted as a final
+   resource manifest.  Provisional material produced by either
+   attestation alone MUST remain unavailable through the normal
+   namespace.
+
+7.  Serialized Transition and Fencing
+
+   At most one finalized successor MAY advance a resource version.
+   Every transition MUST carry an expected predecessor and version, and
+   the registrar MUST finalize it by compare-and-swap guarded by a
+   fencing token.
+
+   Two concurrent transitions for one predecessor or version MUST NOT
+   both finalize.  A stale, replayed, or crossed fencing token MUST NOT
+   advance a resource version.
+
+   Every reservation MUST eventually post, void, or enter explicit
+   quarantine or manual review.  A crash or restart MUST NOT repeat a
+   finalized transition or mint a second successor.
+
+
+
+
+
+
+
+HyprStream               Expires 18 January 2027                [Page 4]
+
+Internet-Draft            Resource Attestation                 July 2026
+
+
+8.  Provisional Visibility
+
+   Provisional material MUST be unavailable through the normal
+   namespace.  Visibility of provisional material is a property of
+   registrar state, not merely of byte existence in the resource store
+   or proof plane.
+
+   Ordinary reads MUST remain MAC-only.  Ledger and proof-plane I/O MUST
+   NOT be placed on ordinary reads or on fine-grained 9P writes; bounded
+   local leases settle at defined commit points only.
+
+9.  Assurance Floor
+
+   The effective assurance of a resource operation is the minimum of
+   entitlement assurance, issuer token assurance, binding assurance, MAC
+   decision assurance, ledger attestation assurance, and key-release
+   assurance.  A classical outer admission result MUST NOT raise an
+   inner resource operation to a post-quantum-hybrid assurance level.
+   Hybrid terminology follows [RFC9794].
+
+   Effective assurance MUST NOT exceed the assurance of any attestation
+   it composes.  Anonymous authorization MUST NOT fabricate a DID or
+   stable holder identity.
+
+10.  Privacy Profiles
+
+   Identified, pairwise, and committed-owner profiles, identified and
+   anonymous-capability controller profiles, and identified and
+   anonymous-entitlement payer profiles MUST remain distinct.  A profile
+   that accepts an anonymous controller or anonymous payer MUST NOT emit
+   a stable holder DID, ATProto handle, or linkable entitlement
+   identifier into an origin audit record, a public receipt, or a trust
+   store.
+
+   The origin MAY learn an exact authorized operation without learning a
+   stable holder DID.  Issuance-side accounting MAY remain identified
+   while redemption-side accounting records commitments, nullifiers, and
+   aggregate issuer liabilities.  Public proof records MUST use
+   commitments; detailed receipts MUST be selectively disclosed or
+   encrypted to authorized parties.
+
+11.  Encrypted Receipt and Selective Disclosure
+
+   A public receipt or checkpoint MUST NOT reveal a raw anonymous token,
+   a holder DID, a stable client key, or a linkable entitlement
+   identifier.  An encrypted receipt MUST be addressed only to a party
+   authorized by the active profile and MUST be bound to the same
+   canonical ResourceIntent digest as the manifest it accompanies.
+
+
+
+HyprStream               Expires 18 January 2027                [Page 5]
+
+Internet-Draft            Resource Attestation                 July 2026
+
+
+   Key-release and key-rotation history verification MUST NOT depend on
+   a single classical signature over the resource history.
+
+12.  State-Machine and Recovery Skeleton
+
+   The reference happy-path lifecycle is Requested, then MacAuthorized,
+   then LedgerReserved, then Materialized, then LedgerPosted, then
+   Finalized.  The reference failure and recovery lifecycle is Voiding
+   to Voided, and Quarantined to Reconciled or ManualReview.
+
+   No transition to Finalized is defined from a state that lacks both
+   attestations.  No transition to ordinary namespace visibility is
+   defined from a provisional state.  Unknown states, versions, profile
+   kinds, or transition events MUST reject.
+
+13.  Immutable CAS and Blob Reference
+
+   The first vertical of resource ownership is immutable content-
+   addressed storage write-then-seal.  A CAS or blob integration MUST
+   NOT expose provisional bytes as a finalized resource.  A content CID
+   referenced by a manifest MUST match the bytes sealed by the content-
+   addressed store.
+
+   This section records the resource-specific evidence boundary.  The
+   stock-relay and stock-carrier evidence that is shared with the
+   #1058/#1059 draft family remains owned by those drafts.
+
+14.  Mutable 9P Ownership Semantics
+
+   Mutable 9P title, directory-entry, rename, hard-link, bind, mount,
+   and transfer semantics MUST follow only after the blob lifecycle and
+   the crash and reconciliation suites pass.  A 9P operation MUST NOT
+   confer title that the registrar has not finalized.
+
+   The logical application label carried inside registrar and proof-
+   plane records is not a registered or mandatory 9P opcode, MoQ track
+   namespace, Privacy Pass token type, or external allocation.
+
+15.  Construction Status and Experimental Refusal Boundary
+
+   The sibling implementation issues for canonical ResourceIntent,
+   registrar saga, MAC title attestation, ledger redemption, CAS
+   integration, and 9P ownership semantics are not complete as of this
+   draft.  A production registrar MUST NOT finalize a resource manifest
+   until both reviewed attestations exist over the identical canonical
+   ResourceIntent digest and the crash, concurrency, privacy, and
+   interoperability suites pass.
+
+
+
+
+HyprStream               Expires 18 January 2027                [Page 6]
+
+Internet-Draft            Resource Attestation                 July 2026
+
+
+   The repository-local experimental boundary is a deterministic non-
+   cryptographic fixture schema for ResourceIntent canonicalization, not
+   a token type, a 9P opcode, or a protocol encoding.  The experimental
+   boundary checker MUST require a MAC attestation and a ledger
+   attestation over byte-identical canonical ResourceIntent digests and
+   MUST reject a missing, duplicated, crossed, or downgraded
+   attestation.  The experimental boundary checker MUST terminate a
+   structurally valid fixture with the ConstructionIncomplete refusal,
+   because the canonical production ResourceIntent encoding, registrar,
+   and reviewed attestations do not yet exist.
+
+16.  Local Registry
+
+   The local registry in resource-intent.json and resource-
+   vocabulary.json names fields, roles, principal kinds, lifecycle
+   states, bounds, and canonicalization.  Implementations MUST reject an
+   unknown registry field or label, a non-canonical ResourceIntent
+   encoding, or an out-of-bounds field before attestation or registrar
+   processing.
+
+   The registry is local to this repository.  It is not an IANA registry
+   or a request to allocate a 9P, MoQ, Privacy Pass, or any other
+   codepoint.
+
+17.  Security Considerations
+
+   Implementation of the sibling issues and independent security,
+   privacy, cryptographic, protocol, and standards review are
+   prerequisites for any production resource-manifest claim.  This
+   profile requires exact binding to canonical ResourceIntent digest,
+   distinct typed roles, fencing-guarded compare-and-swap, and the
+   assurance floor, but deliberately leaves the concrete canonical
+   encoding, signature suite, and anonymous-construction selection to
+   those issues.
+
+18.  Privacy Considerations
+
+   This profile makes no unlinkability claim against issuer-origin-
+   ledger collusion, no traffic-analysis claim against a global
+   observer, and no protection against cross-cell correlation beyond the
+   data minimization stated here and in the companion privacy and
+   collusion analysis.
+
+19.  IANA Considerations
+
+   This document requests no IANA actions and allocates no codepoints.
+
+20.  References
+
+
+
+HyprStream               Expires 18 January 2027                [Page 7]
+
+Internet-Draft            Resource Attestation                 July 2026
+
+
+20.1.  Normative References
+
+   [RFC2119]  Bradner, S., "Key words for use in RFCs to Indicate
+              Requirement Levels", BCP 14, RFC 2119, March 1997,
+              <https://www.rfc-editor.org/info/rfc2119>.
+
+   [RFC8174]  Leiba, B., "Ambiguity of Uppercase vs Lowercase in RFC
+              2119 Key Words", BCP 14, RFC 8174, May 2017,
+              <https://www.rfc-editor.org/info/rfc8174>.
+
+   [RFC6920]  Farrell, S., Kutscher, D., Dannewitz, C., Ohlman, B.,
+              Keranen, A., and P. Hallam-Baker, "Naming Things with
+              Hashes", RFC 6920, April 2013,
+              <https://www.rfc-editor.org/info/rfc6920>.
+
+   [RFC8949]  Bormann, C. and P. Hoffman, "Concise Binary Object
+              Representation (CBOR)", RFC 8949, December 2020,
+              <https://www.rfc-editor.org/info/rfc8949>.
+
+20.2.  Informative References
+
+   [RFC9576]  Davidson, A., Iyengar, J., and C. A. Wood, "The Privacy
+              Pass Architecture", RFC 9576, June 2024,
+              <https://www.rfc-editor.org/info/rfc9576>.
+
+   [RFC9578]  Celi, S., Davidson, A., Valdez, S., and C. A. Wood,
+              "Privacy Pass Issuance Protocols", RFC 9578, June 2024,
+              <https://www.rfc-editor.org/info/rfc9578>.
+
+   [MOQT]     Nandakumar, S., Vasiliev, V., Swett, I., and A. Frindell,
+              "Media over QUIC Transport", Work in Progress, Internet-
+              Draft, draft-ietf-moq-transport-19, 6 July 2026,
+              <https://www.ietf.org/archive/id/draft-ietf-moq-transport-
+              19.txt>.
+
+   [RFC9794]  Driscoll, F., Parsons, M., and B. Hale, "Terminology for
+              Post-Quantum Traditional Hybrid Schemes", RFC 9794, June
+              2025, <https://www.rfc-editor.org/info/rfc9794>.
+
+Author's Address
+
+   HyprStream Contributors
+   HyprStream
+
+
+
+
+
+
+
+
+HyprStream               Expires 18 January 2027                [Page 8]

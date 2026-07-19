@@ -17,8 +17,9 @@ use ed25519_dalek::{SigningKey, VerifyingKey};
 use rand::RngCore;
 use tokio::sync::Mutex;
 
-use hyprstream_rpc::dial::{dial, register_inproc};
-use hyprstream_rpc::envelope::InMemoryNonceCache;
+use hyprstream_rpc::dial::{dial_with_crypto_stores, register_inproc};
+use hyprstream_rpc::envelope::{InMemoryNonceCache, KeyedPqTrustStore};
+use hyprstream_rpc::node_identity::derive_mesh_mldsa_key;
 use hyprstream_rpc::service::{Continuation, EnvelopeContext, RequestService};
 use hyprstream_rpc::signer::LocalSigner;
 use hyprstream_rpc::transport::iroh_rpc::LocalServiceBridge;
@@ -69,12 +70,17 @@ fn fresh_key() -> SigningKey {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn inproc_bridged_round_trip_and_continuation_spawned() -> Result<()> {
-    // Integration test → hyprstream-rpc in non-test mode → verify policy
-    // fail-closes to Hybrid (#160); opt into the Classical policy this exercises.
+    let client_key = fresh_key();
+    let client_pq = derive_mesh_mldsa_key(&client_key);
+    let client_pq_vk = hyprstream_rpc::crypto::pq::ml_dsa_vk_from_bytes(
+        &hyprstream_rpc::crypto::pq::ml_dsa_sk_to_vk_bytes(&client_pq),
+    )?;
+    let mut request_store = KeyedPqTrustStore::new();
+    request_store.bind(client_key.verifying_key().to_bytes(), &client_pq_vk);
     let _ = hyprstream_rpc::envelope::install_verify_config(
         hyprstream_rpc::envelope::EnvelopeVerifyConfig {
-            policy: hyprstream_rpc::crypto::CryptoPolicy::Classical,
-            pq_store: None,
+            policy: hyprstream_rpc::crypto::CryptoPolicy::Hybrid,
+            pq_store: Some(Arc::new(request_store)),
         },
     );
 
@@ -87,7 +93,7 @@ async fn inproc_bridged_round_trip_and_continuation_spawned() -> Result<()> {
     let svc = StreamingEcho {
         name: NAME.to_owned(),
         transport: TransportConfig::inproc(NAME),
-        signing_key: server_key,
+        signing_key: server_key.clone(),
         fired: Mutex::new(Some(fired_tx)),
     };
 
@@ -99,11 +105,19 @@ async fn inproc_bridged_round_trip_and_continuation_spawned() -> Result<()> {
     register_inproc(NAME, &processor);
 
     // Client side: dial inproc → InMemoryTransport → real SignedEnvelope.
-    let client = dial(
+    let server_pq = derive_mesh_mldsa_key(&server_key);
+    let server_pq_vk = hyprstream_rpc::crypto::pq::ml_dsa_vk_from_bytes(
+        &hyprstream_rpc::crypto::pq::ml_dsa_sk_to_vk_bytes(&server_pq),
+    )?;
+    let mut response_store = KeyedPqTrustStore::new();
+    response_store.bind(server_vk.to_bytes(), &server_pq_vk);
+    let client = dial_with_crypto_stores(
         &TransportConfig::inproc(NAME),
-        LocalSigner::new(fresh_key()),
+        LocalSigner::new(client_key),
         Some(server_vk),
         None,
+        None,
+        Some(Arc::new(response_store)),
     )?;
     let resp = client.call(b"hello-inproc".to_vec()).await?;
     assert_eq!(&resp[..], b"hello-inproc");
