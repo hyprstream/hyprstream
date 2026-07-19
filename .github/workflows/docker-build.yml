@@ -174,15 +174,20 @@ jobs:
     permissions:
       contents: read
       packages: write
-    # Serialize per ref so a superseded main build cannot finish AFTER a newer
-    # one and roll edge-cpu-arm64 / latest-cpu-arm64 backward. workflow_run
-    # carries github.ref = refs/heads/main (constant for main), so all main
-    # builds share one group and cancel-in-progress drops the older run; tag
-    # pushes are per-tag. Job-scoped (not workflow-scoped) so the amd64 leg,
-    # which has no concurrency guard, is byte-for-byte unchanged.
+    # Two concurrence regimes:
+    #  - main (workflow_run) builds contend only on the moving edge/latest
+    #    tags, so they share ONE per-branch group and the superseded run is
+    #    cancelled (cancel-in-progress true).
+    #  - release (tag) publishes contend on the mutable ROLLING tag
+    #    (e.g. 1.2-cpu-arm64) regardless of version, so ALL releases share a
+    #    single serialized group with cancel-in-progress FALSE — an in-flight
+    #    release publish is never cancelled mid-push, so the rolling tag can't
+    #    be rolled back or skipped by an out-of-order concurrent release.
+    # Job-scoped so the amd64 leg (no concurrency guard) stays byte-for-byte
+    # unchanged.
     concurrency:
-      group: docker-arm64-${{ github.ref }}
-      cancel-in-progress: true
+      group: arm64-publish-${{ github.event_name == 'workflow_run' && 'main' || 'release' }}
+      cancel-in-progress: ${{ github.event_name == 'workflow_run' }}
 
     steps:
     # workflow_run sets GITHUB_SHA to the DEFAULT-branch tip, NOT the commit
