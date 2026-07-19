@@ -45,19 +45,21 @@ Derived concepts are not peer nouns. A **Model** is a versioned Artifact reposit
 
 ## Canonical actions
 
-| Action family | Meaning | Discipline |
-|---|---|---|
-| **resolve / reach** | Resolve identity to verified facts and determine verifiable reachability. | Locators are untrusted; accepted facts and freshness evidence are verified. |
-| **grant / attenuate** | Author and narrow authority through UCAN. | Delegation only narrows; zero standing privilege is the posture. |
-| **attach / revoke** | Join a scoped resource; invalidate that relationship. | Verify credentials at attach, mediate through cached context, and revoke by generation/epoch. Grant revocation also relies on short TTLs. |
-| **move** | Transport bytes over an attached path. | Trust rides in the signed envelope or artifact, not in the carrier. |
-| **place** | Select eligible and preferred candidates. | Use the #523 filter, rank, select, and explain substrate; do not fork selection vocabularies. |
-| **partition** | Shape a workload across selected resources. | Use pure value types; a partitioner does not assert trust, reach, or placement facts. |
-| **admit** | Issue evidence-gated, ephemeral run clearance. | Run admission is `admit(plan)`; microbatch admission is `PipelineJobRecovery::admit`. Both expire with evidence and are never called promote. |
-| **run / recover** | Execute and recover with fenced failure semantics. | Use epochs/generations and fail closed. |
-| **promote** | Advance a durable artifact in the STEP loop. | Reserved for Stage, Train, Evaluate, Promote; human- or agent-API-gated and represented by durable filesystem/Git state. |
-| **audit** | Append a signed decision record. | If a required record cannot be durably audited, deny. |
-| **compile** | Lower authored authority into an enforceable policy. | This is an S5 transformation, not a lifecycle action or synonym for admit/promote. |
+| Action family | Status | Meaning | Discipline |
+|---|---|---|---|
+| **resolve / reach** | PARTIAL | Resolve identity to verified facts and determine verifiable reachability. | Locators are untrusted; accepted facts and freshness evidence are verified. Resolver-contract collapse is pending (atlas RESOLVE row). |
+| **grant / attenuate** | CURRENT | Author and narrow authority through UCAN. | Delegation only narrows; zero standing privilege is the posture. |
+| **attach / revoke** | PARTIAL | Join a scoped resource; invalidate that relationship. | Verify credentials at attach, mediate through cached context, and revoke by generation/epoch. Grant revocation also relies on short TTLs. Tracks the Attachment noun's PARTIAL status. |
+| **move** | CURRENT | Transport bytes over an attached path. | Trust rides in the signed envelope or artifact, not in the carrier. |
+| **place** | PARTIAL | Select eligible and preferred candidates. | Use the #523 filter, rank, select, and explain substrate; do not fork selection vocabularies. Substrate landed; selection-surface migrations (#629) remain. |
+| **partition** | PARTIAL | Shape a workload across selected resources. | Use pure value types; a partitioner does not assert trust, reach, or placement facts. Interhost shaping awaits the #1090 rescope. |
+| **admit** | PARTIAL | Issue evidence-gated, ephemeral run clearance. | Run admission is `admit(plan)` and is TARGET (#1090); microbatch admission is `PipelineJobRecovery::admit` and is CURRENT. Both expire with evidence and are never called promote. |
+| **run / recover** | CURRENT | Execute and recover with fenced failure semantics. | Use epochs/generations and fail closed. |
+| **promote** | CURRENT | Advance a durable artifact in the STEP loop. | Reserved for Stage, Train, Evaluate, Promote; human- or agent-API-gated and represented by durable filesystem/Git state. |
+| **audit** | PARTIAL | Append a signed decision record. | If a required record cannot be durably audited, deny. The store exists; production wiring tracks Label enforcement (epic #547 activation). |
+| **compile** | CURRENT | Lower authored authority into an enforceable policy. | This is an S5 transformation, not a lifecycle action or synonym for admit/promote. |
+
+Action statuses use the same CURRENT/PARTIAL/TARGET meanings as nouns: they describe whether the canonical form of the action exists and is what new work uses, not whether every call site has migrated.
 
 ## The eight laws
 
@@ -102,7 +104,9 @@ The MAC/RBAC spellings remain single-homed in `CLAUDE.md` under **Naming (don't 
 
 ## Machine-readable registry
 
-Consumers extract the strict JSON object between the markers. The marker names and `schema_version` are compatibility surfaces; changing them is an ontology change. JSON object ordering is not significant, but entry `id` and action `token` values are stable identifiers.
+Consumers extract the manifest by taking the lines strictly between the `BEGIN` and `END` markers, discarding the two Markdown fence lines that open (```` ```json ````) and close (```` ``` ````) the block, and parsing the remainder as strict JSON. The marker names, the fence convention, and `schema_version` are compatibility surfaces; changing them is an ontology change. JSON object ordering is not significant, but entry `id` and action `token` values are stable identifiers.
+
+When an entry lists multiple `rust_types`, they are role-distinct canonical forms named in `rust_type_roles`, never interchangeable substitutes. In particular, `Subject` is a verified runtime principal and is never acceptable where a durable identity (`Did`) is required; a generator that treats the members of `rust_types` as equivalent is nonconforming.
 
 <!-- BEGIN SYSTEM-ONTOLOGY-MANIFEST -->
 ```json
@@ -131,6 +135,10 @@ Consumers extract the strict JSON object between the markers. The marker names a
         "hyprstream_rpc::identity::Did",
         "hyprstream_rpc::envelope::Subject"
       ],
+      "rust_type_roles": {
+        "hyprstream_rpc::identity::Did": "durable_identity",
+        "hyprstream_rpc::envelope::Subject": "runtime_principal"
+      },
       "wire_form": "DID string"
     },
     {
@@ -140,7 +148,11 @@ Consumers extract the strict JSON object between the markers. The marker names a
       "rust_types": [
         "hyprstream_rpc::transport::TransportConfig",
         "hyprstream_rpc::stream_info::Destination"
-      ]
+      ],
+      "rust_type_roles": {
+        "hyprstream_rpc::transport::TransportConfig": "reach_descriptor",
+        "hyprstream_rpc::stream_info::Destination": "wire_destination"
+      }
     },
     {
       "id": "capability",
@@ -149,7 +161,11 @@ Consumers extract the strict JSON object between the markers. The marker names a
       "rust_types": [
         "hyprstream_rpc::auth::ucan::Capability",
         "hyprstream::mac::compiled::SignedPolicy"
-      ]
+      ],
+      "rust_type_roles": {
+        "hyprstream_rpc::auth::ucan::Capability": "authored_capability",
+        "hyprstream::mac::compiled::SignedPolicy": "compiled_policy"
+      }
     },
     {
       "id": "label",
@@ -202,31 +218,34 @@ Consumers extract the strict JSON object between the markers. The marker names a
     }
   ],
   "actions": [
-    {"token": "resolve", "family": "resolve_reach", "kind": "lifecycle"},
-    {"token": "reach", "family": "resolve_reach", "kind": "lifecycle"},
-    {"token": "grant", "family": "grant_attenuate", "kind": "lifecycle"},
-    {"token": "attenuate", "family": "grant_attenuate", "kind": "lifecycle"},
-    {"token": "attach", "family": "attach_revoke", "kind": "lifecycle"},
-    {"token": "revoke", "family": "attach_revoke", "kind": "lifecycle"},
-    {"token": "move", "family": "move", "kind": "lifecycle"},
-    {"token": "place", "family": "place", "kind": "lifecycle"},
-    {"token": "partition", "family": "partition", "kind": "lifecycle"},
+    {"token": "resolve", "family": "resolve_reach", "kind": "lifecycle", "status": "PARTIAL"},
+    {"token": "reach", "family": "resolve_reach", "kind": "lifecycle", "status": "PARTIAL"},
+    {"token": "grant", "family": "grant_attenuate", "kind": "lifecycle", "status": "CURRENT"},
+    {"token": "attenuate", "family": "grant_attenuate", "kind": "lifecycle", "status": "CURRENT"},
+    {"token": "attach", "family": "attach_revoke", "kind": "lifecycle", "status": "PARTIAL"},
+    {"token": "revoke", "family": "attach_revoke", "kind": "lifecycle", "status": "PARTIAL"},
+    {"token": "move", "family": "move", "kind": "lifecycle", "status": "CURRENT"},
+    {"token": "place", "family": "place", "kind": "lifecycle", "status": "PARTIAL"},
+    {"token": "partition", "family": "partition", "kind": "lifecycle", "status": "PARTIAL"},
     {
       "token": "admit",
       "family": "admit",
       "kind": "lifecycle",
-      "scopes": ["run", "microbatch"]
+      "status": "PARTIAL",
+      "scopes": ["run", "microbatch"],
+      "scope_status": {"run": "TARGET", "microbatch": "CURRENT"}
     },
-    {"token": "run", "family": "run_recover", "kind": "lifecycle"},
-    {"token": "recover", "family": "run_recover", "kind": "lifecycle"},
+    {"token": "run", "family": "run_recover", "kind": "lifecycle", "status": "CURRENT"},
+    {"token": "recover", "family": "run_recover", "kind": "lifecycle", "status": "CURRENT"},
     {
       "token": "promote",
       "family": "promote",
       "kind": "lifecycle",
+      "status": "CURRENT",
       "reserved_scope": "STEP"
     },
-    {"token": "audit", "family": "audit", "kind": "lifecycle"},
-    {"token": "compile", "family": "compile", "kind": "transformation"}
+    {"token": "audit", "family": "audit", "kind": "lifecycle", "status": "PARTIAL"},
+    {"token": "compile", "family": "compile", "kind": "transformation", "status": "CURRENT"}
   ]
 }
 ```
@@ -234,7 +253,7 @@ Consumers extract the strict JSON object between the markers. The marker names a
 
 ## Dialect atlas
 
-Atlas measurements are valid only when produced by the committed `tools/ontology-sweep.sh` at a pinned Git SHA. That script is not present in this change; issue [#1100](https://github.com/hyprstream/hyprstream/issues/1100) owns it, the observability row, and shrinkage metrics. The provisional observations below come from the coordination sweep associated with pinned snapshot `66b622cbd7a8e3c4d295279254f66c2bd57cabd7` (2026-07-18). **Every count is pending #1100** and must be replaced or confirmed by an in-repository run before an atlas-only number is treated as normative.
+Atlas measurements are valid only when produced by the committed `tools/ontology-sweep.sh` at a pinned Git SHA. That script is not present in this change; issue [#1100](https://github.com/hyprstream/hyprstream/issues/1100) owns it, the observability row, and shrinkage metrics. The provisional observations below come from the coordination sweep associated with pinned snapshot `66b622cbd7a8e3c4d295279254f66c2bd57cabd7` (2026-07-18); that sweep's tooling is not in-repository, so these counts are **not atlas measurements under the rule above** and carry no normative weight. **Every count is pending #1100** and must be replaced or confirmed by an in-repository run — recording the exact `ontology-sweep.sh` invocation per the provenance rule below — before an atlas-only number is treated as normative.
 
 | Family | Provisional observation at `66b622cbd7a8e3c4d295279254f66c2bd57cabd7` | Collapse target |
 |---|---|---|
