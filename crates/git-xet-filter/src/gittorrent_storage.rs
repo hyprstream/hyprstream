@@ -411,7 +411,9 @@ mod provider_fetch_tests {
     #[tokio::test]
     async fn provider_fetched_xet_bytes_with_wrong_sha256_are_rejected() -> Result<()> {
         let temp = TempDir::new().map_err(io_err)?;
-        let bogus = b"definitely not the real payload".to_vec();
+        // Same length as the declared real payload so the size check passes
+        // and the SHA-256 check is the gate actually exercised here.
+        let bogus = b"not real payload".to_vec();
         let real_sha =
             hyprstream_p2p::crypto::hash::sha256_git(b"the real payload").map_err(p2p_err)?;
         let merkle_bytes = [0x33_u8; 32];
