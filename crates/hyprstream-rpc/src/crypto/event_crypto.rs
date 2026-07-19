@@ -432,11 +432,16 @@ pub fn derive_event_nonce(sequence: u64) -> Result<[u8; 12], String> {
         return Err("event sequence zero is reserved".to_owned());
     }
     let sequence = sequence.to_be_bytes();
+    // b"EVN1" is a domain-separation label, not nonce entropy. Nonce uniqueness
+    // comes from the injective big-endian sequence under a key scoped to a fresh
+    // 128-bit OsRng session ID, so (key, nonce) cannot repeat across restart,
+    // re-registration, or failover. Reviewed by two independent security
+    // reviewers; see PR #1111 discussion.
     Ok([
-        b'E',
-        b'V',
-        b'N',
-        b'1',
+        b'E', // codeql[rust/hard-coded-cryptographic-value]
+        b'V', // codeql[rust/hard-coded-cryptographic-value]
+        b'N', // codeql[rust/hard-coded-cryptographic-value]
+        b'1', // codeql[rust/hard-coded-cryptographic-value]
         sequence[0],
         sequence[1],
         sequence[2],
