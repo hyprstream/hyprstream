@@ -399,6 +399,13 @@ pub struct OAuthState {
     pub oidc_discovery: super::oidc_discovery::SharedDiscoveryCache,
     /// Server-side session store for browser login flow.
     pub sessions: super::session::SessionStore,
+    /// In-memory `com.atproto.*` XRPC read slice repo store (#1112). Populated
+    /// by the write path (#910) and tests; the read endpoints consult it
+    /// directly. Default-empty so existing construction sites need no change.
+    pub xrpc_repos: Arc<super::xrpc::XrpcRepoStore>,
+    /// When `true`, the XRPC read-slice routes (`/xrpc/…`) are mounted on the
+    /// OAuth router (#1112). Copied from `OAuthConfig::xrpc_read_slice`.
+    pub xrpc_read_slice: bool,
     /// RSA encoding key for RS256 id_token signing (optional, loaded from secrets).
     pub rsa_encoding_key: Option<jsonwebtoken::EncodingKey>,
     /// RSA public key as JWK JSON (for the JWKS endpoint).
@@ -544,6 +551,8 @@ impl OAuthState {
             pending_external_auths: RwLock::new(HashMap::new()),
             oidc_discovery: std::sync::Arc::new(super::oidc_discovery::OidcDiscoveryCache::default()),
             sessions: super::session::SessionStore::default(),
+            xrpc_repos: Arc::new(super::xrpc::XrpcRepoStore::new()),
+            xrpc_read_slice: config.xrpc_read_slice,
             rsa_encoding_key: None,
             rsa_jwk: None,
             rsa_kid: None,

@@ -61,6 +61,7 @@ pub mod user_service;
 pub mod userinfo;
 pub mod device_enrollment;
 pub mod rpc_handler;
+pub mod xrpc;
 
 use std::sync::Arc;
 
@@ -145,6 +146,17 @@ pub fn create_app(state: Arc<OAuthState>, cors_config: &crate::config::CorsConfi
             "/scim/v2/ServiceProviderConfig",
             get(scim::service_provider_config),
         );
+
+    // ── com.atproto XRPC read slice (#1112) ────────────────────────────────
+    // Four public read endpoints, conditionally mounted when the operator
+    // opts in via `OAuthConfig::xrpc_read_slice`. Session endpoints
+    // (createSession/getSession) are NOT here — they arrive with #1113/#948.
+    // Route table lives in `xrpc::xrpc_routes()` — single source of truth.
+    let public_router = if state.xrpc_read_slice {
+        public_router.merge(xrpc::xrpc_routes())
+    } else {
+        public_router
+    };
 
     // ── Protected routes ───────────────────────────────────────────────────────
     // All require a valid Bearer token (validated by require_bearer_token).
