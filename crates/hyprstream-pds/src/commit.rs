@@ -227,6 +227,15 @@ impl Commit {
     /// This is the core of the D5 untrusted-host posture: a host can serve any
     /// commit it likes, but only commits signed by the account's `#atproto`
     /// key are accepted by verifiers.
+    ///
+    /// **Key-rotation caveat (#918):** this single-key form assumes the DID
+    /// document still advertises the exact key that signed the commit. The
+    /// ES256 `#atproto` store rotates on the order of days, and
+    /// `oauth::did_document` publishes only the *active* slot, so a historical
+    /// commit signed by a now-rotated-out key fails here even though it was
+    /// legitimately signed. Callers that must verify commits across a rotation
+    /// boundary should use [`Commit::verify_against_keys`] with the full set
+    /// of currently-published `#atproto` slots (active + drain).
     pub fn verify(&self, vk: &VerifyingKey) -> Result<()> {
         use p256::ecdsa::signature::Verifier;
         let unsigned = self.unsigned();
@@ -237,6 +246,79 @@ impl Commit {
             .map_err(|e| anyhow::anyhow!("invalid ES256 signature bytes: {e}"))?;
         vk.verify(&unsigned_bytes, &signature)
             .map_err(|e| anyhow::anyhow!("ES256 signature verification failed: {e}"))
+    }
+
+    /// Rotation-tolerant commit verification — the trust-chain fix for #918.
+    ///
+    /// Accepts the commit if its ES256 signature verifies under **any one** of
+    /// the supplied `#atproto` P-256 verifying keys. `keys` is the set of
+    /// currently-published verification methods for the account DID — under the
+    /// drain-slot design, that is the active slot plus any drain slot(s) the
+    /// DID document still advertises (and optionally the lead slot once it is
+    /// `nbf`-valid). Verification fails closed if the slice is empty or no key
+    /// verifies.
+    ///
+    /// # Why this design (drain-slot publication), and not the alternative
+    ///
+    /// Issue #918 lists two candidate fixes:
+    ///
+    /// 1. **Drain-slot publication** *(chosen)* — publish the drain (and lead)
+    ///    ES256 slots as additional `#atproto`-style verification methods in
+    ///    the DID document, and have the verifier accept any currently-
+    ///    published slot. This is exactly what this method implements on the
+    ///    verifier side. It keeps verification **fail-closed** (an empty slot
+    ///    set, or a signature under no published slot, is rejected — never a
+    ///    silent fallback), and it preserves commits byte-for-byte: history is
+    ///    not rewritten, and a historical commit keeps verifying as long as
+    ///    its signing key remains in the bounded drain window, then stops
+    ///    verifying loudly once the slot is dropped. The drain window is
+    ///    bounded by the ES256 store's `drain_secs` policy, so the accepted
+    ///    key set is small and time-limited.
+    /// 2. **Re-sign on rotation** *(rejected)* — when the active ES256 key
+    ///    rotates, walk every stored commit and re-sign it with the new active
+    ///    key. This rewrites persisted history invisibly: a commit CID a
+    ///    consumer recorded at time *T* no longer matches the served commit at
+    ///    *T+1*, and the rotation task becomes coupled to the PDS store. It
+    ///    also silently changes the trust root of historical commits rather
+    ///    than letting the drain window expire them. We reject it for the same
+    ///    reasons `PdsPublisher` rejects read-side re-signing: the signed
+    ///    mutable pointer is written once, at publish time, and serves verbatim.
+    ///
+    /// # Fail-closed contract
+    ///
+    /// - `keys` empty → `Err` (no authoritative key was supplied; the verifier
+    ///   refuses to accept a signature it cannot bind to a published slot).
+    /// - No supplied key verifies → `Err` (the last attempted key's error is
+    ///   surfaced; the commit is untrusted).
+    /// - At least one verifies → `Ok(())`.
+    ///
+    /// The caller is responsible for bounding `keys` to the published slots;
+    /// this method does not enforce a count or time window itself — the
+    /// authoritative bound is "what the resolved DID document advertises."
+    pub fn verify_against_keys<'a, I>(&self, keys: I) -> Result<()>
+    where
+        I: IntoIterator<Item = &'a VerifyingKey>,
+    {
+        let mut count = 0usize;
+        let mut last_err: Option<anyhow::Error> = None;
+        for vk in keys {
+            count += 1;
+            match self.verify(vk) {
+                Ok(()) => return Ok(()),
+                Err(e) => last_err = Some(e),
+            }
+        }
+        match last_err {
+            Some(e) => Err(e.context(format!(
+                "ES256 signature verified under none of the {count} published #atproto slot(s)"
+            ))),
+            // Empty key set: fail closed — never accept a signature we cannot
+            // bind to at least one currently-published verifying key.
+            None => anyhow::bail!(
+                "rotation-tolerant verify called with no #atproto verifying keys \
+                 — refusing to verify without an authoritative slot set"
+            ),
+        }
     }
 
     /// Compute the SHA-256 digest of the unsigned commit's DAG-CBOR bytes.
@@ -338,6 +420,75 @@ mod tests {
         assert!(
             v.get("sig").is_none(),
             "unsigned commit must not have a sig field"
+        );
+    }
+
+    // ── #918: rotation-survivable verification ───────────────────────────────
+
+    /// A commit signed by a since-rotated-out key must still verify against the
+    /// published slot set (active + drain) — the drain-slot design.
+    #[test]
+    fn commit_verify_survives_key_rotation() {
+        let (commit, original_vk) = make_signed_commit();
+        // The active key rotates: a brand-new key replaces it.
+        let new_signing = SigningKey::random(&mut rand::rngs::OsRng);
+        let new_vk = VerifyingKey::from(&new_signing);
+
+        // Single-key verify against the *new* (current DID document) key fails —
+        // this is the #918 regression: the historical commit looks untrusted.
+        assert!(
+            commit.verify(&new_vk).is_err(),
+            "historical commit must not verify under the rotated-in key alone"
+        );
+
+        // Rotation-tolerant verify against the published slot set {drain=old,
+        // active=new} succeeds — drain-slot publication.
+        let published_slots = [&new_vk, &original_vk];
+        commit
+            .verify_against_keys(published_slots.iter().copied())
+            .expect("commit signed by a published drain slot must verify");
+    }
+
+    /// A genuinely bad signature must still fail under rotation-tolerant verify.
+    #[test]
+    fn commit_verify_against_keys_rejects_bad_signature() {
+        let (commit, _original_vk) = make_signed_commit();
+        // Two unrelated keys the commit was never signed by.
+        let a = VerifyingKey::from(&SigningKey::random(&mut rand::rngs::OsRng));
+        let b = VerifyingKey::from(&SigningKey::random(&mut rand::rngs::OsRng));
+        assert!(
+            commit.verify_against_keys([&a, &b]).is_err(),
+            "a signature under no published slot must fail, not silently fall back"
+        );
+    }
+
+    /// An empty published-slot set fails closed — never accept a signature we
+    /// cannot bind to at least one authoritative key.
+    #[test]
+    fn commit_verify_against_keys_fails_closed_on_empty() {
+        let (commit, _vk) = make_signed_commit();
+        let err = commit
+            .verify_against_keys(std::iter::empty::<&VerifyingKey>())
+            .expect_err("empty key set must fail closed");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("no #atproto verifying keys"),
+            "empty-set error should explain fail-closed reason, got: {msg}"
+        );
+    }
+
+    /// Rotation-tolerant verify still detects a tampered commit across a slot set.
+    #[test]
+    fn commit_verify_against_keys_detects_tampered_data() {
+        let (mut commit, original_vk) = make_signed_commit();
+        let new_vk = VerifyingKey::from(&SigningKey::random(&mut rand::rngs::OsRng));
+        commit.data = Cid::from_dag_cbor(b"tampered");
+        let published_slots = [&new_vk, &original_vk];
+        assert!(
+            commit
+                .verify_against_keys(published_slots.iter().copied())
+                .is_err(),
+            "tampered commit must fail under every published slot"
         );
     }
 }
