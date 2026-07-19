@@ -102,11 +102,7 @@ pub async fn handle_pds_join(
     let secrets_dir = identity_store::credentials_dir_for_config(Some(config))?;
     ensure_no_home_pds(&secrets_dir)?;
 
-    let root_key = if let Some(key) = HyprConfig::node_signing_key_bypass()? {
-        key
-    } else {
-        identity_store::load_or_generate_node_signing_key(&secrets_dir)?
-    };
+    let root_key = identity_store::load_or_generate_node_signing_key(&secrets_dir)?;
     // This is the same domain-separated key whose verifying key iroh exposes
     // as the node_id.  Its did:key is both the registered host identity and
     // the key used for DPoP possession proofs below.

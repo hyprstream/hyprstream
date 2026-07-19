@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use anyhow::Context as _;
 use base64::Engine as _;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 
 use crate::auth::user_store::UserStore;
@@ -371,6 +371,9 @@ pub struct OAuthState {
     /// Persistent refresh token store. Keyed by opaque token string.
     /// None when no credentials path is configured (tokens silently lost on restart).
     pub token_db: Option<Arc<dyn TokenStore>>,
+    /// Serializes refresh-token read/validate/consume sequences so concurrent
+    /// requests cannot mint twice from the same single-use credential.
+    pub refresh_rotation_lock: Mutex<()>,
     /// PolicyClient for JWT token issuance via ZMQ
     pub policy_client: PolicyClient,
     /// DiscoveryClient for resolving service QUIC endpoints via ZMQ
@@ -533,6 +536,7 @@ impl OAuthState {
             pending_device_codes: RwLock::new(HashMap::new()),
             device_code_by_user_code: RwLock::new(HashMap::new()),
             token_db: None,
+            refresh_rotation_lock: Mutex::new(()),
             policy_client,
             discovery_client,
             issuer_url: config.issuer_url(),

@@ -222,7 +222,8 @@ fn build_cli() -> ClapCommand {
                     .long("pds-url")
                     .value_name("PDS_URL")
                     .help("Attach this host to a home PDS after wizard setup (same as `pds join`)")
-                    .conflicts_with("bootstrap_only"),
+                    .conflicts_with("bootstrap_only")
+                    .conflicts_with("tui"),
             )
             .arg(
                 Arg::new("initial_user_role")
@@ -1809,6 +1810,7 @@ fn main() -> Result<()> {
                     .cloned()
                     .unwrap_or_else(|| "admin".to_owned());
                 let use_tui = tui_mode || (pds_url.is_none() && !non_interactive && !bootstrap_only && supports_tui());
+                let config = config.clone();
                 return with_runtime(
                     RuntimeConfig { device: DeviceConfig::request_cpu(), multi_threaded: true },
                     || async move {
@@ -1820,7 +1822,6 @@ fn main() -> Result<()> {
                                 bootstrap_only, enable_federation, &initial_user_role,
                             ).await?;
                             if let Some(pds_url) = pds_url {
-                                let config = HyprConfig::load().unwrap_or_default();
                                 hyprstream_core::cli::pds_handlers::handle_pds_join(
                                     &config, &pds_url, None,
                                 ).await?;

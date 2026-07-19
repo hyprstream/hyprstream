@@ -295,6 +295,7 @@ pub async fn verify_post(
             }
             Some(pending) => {
                 pending.status = DeviceCodeStatus::Approved;
+                pending.last_polled = None;
                 pending.approved_by = Some(form.username.clone());
                 pending.verifying_key = Some(verifying_key);
                 Ok(())
