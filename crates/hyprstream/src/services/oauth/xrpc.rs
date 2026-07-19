@@ -316,16 +316,56 @@ pub mod errors {
 // Query parsing (manual — no axum Query rejection bypasses XRPC envelope)
 // ─────────────────────────────────────────────────────────────────────────────
 
-fn parse_query(raw: Option<&str>) -> std::collections::HashMap<&str, &str> {
+/// Parse a raw query string `key=value&key=value` into a map.
+///
+/// - **Bare keys** (no `=`) are inserted with an empty value — so `?since`
+///   is treated as present, matching form/urlencoded semantics.
+/// - **Percent-decoding**: `%XX` sequences are decoded and `+` becomes a
+///   space (form semantics), so encoded DIDs/handles/rkeys resolve.
+fn parse_query(raw: Option<&str>) -> std::collections::HashMap<String, String> {
     let mut map = std::collections::HashMap::new();
     if let Some(q) = raw {
         for pair in q.split('&') {
-            if let Some((k, v)) = pair.split_once('=') {
-                map.insert(k, v);
-            }
+            let (key, val) = match pair.split_once('=') {
+                Some((k, v)) => (k, v),
+                None => (pair, ""), // bare key → present with empty value
+            };
+            map.insert(percent_decode(key), percent_decode(val));
         }
     }
     map
+}
+
+/// Minimal percent-decoder: `%XX` → byte, `+` → space.
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'+' => out.push(b' '),
+            b'%' if i + 2 < bytes.len() => {
+                if let (Some(hi), Some(lo)) = (hex_val(bytes[i + 1]), hex_val(bytes[i + 2])) {
+                    out.push(hi * 16 + lo);
+                    i += 2;
+                } else {
+                    out.push(b'%');
+                }
+            }
+            b => out.push(b),
+        }
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn hex_val(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -527,8 +567,8 @@ pub async fn get_record(
     RawQuery(raw): RawQuery,
 ) -> Response {
     let params = parse_query(raw.as_deref());
-    let collection = params.get("collection").copied().unwrap_or("");
-    let rkey = params.get("rkey").copied().unwrap_or("");
+    let collection = params.get("collection").map(std::string::String::as_str).unwrap_or("");
+    let rkey = params.get("rkey").map(std::string::String::as_str).unwrap_or("");
     let repo = match params.get("repo") {
         Some(r) if !r.is_empty() => r.trim(),
         _ => {
@@ -811,18 +851,40 @@ mod tests {
     }
 
     #[test]
-    fn parse_query_rejects_empty_value_since() {
-        // ?since= parses to key "since" with value "".
+    fn parse_query_empty_value_since_is_present() {
+        // ?since= → key "since" present with value "".
         let q = parse_query(Some("did=did:web:x&since="));
         assert!(q.contains_key("since"));
-        assert_eq!(q.get("since").copied(), Some(""));
+        assert_eq!(q.get("since").map(std::string::String::as_str), Some(""));
+    }
+
+    #[test]
+    fn parse_query_bare_key_since_is_present() {
+        // ?since (no =) → key "since" present with value "".
+        let q = parse_query(Some("did=did:web:x&since"));
+        assert!(q.contains_key("since"));
+        assert_eq!(q.get("since").map(std::string::String::as_str), Some(""));
+    }
+
+    #[test]
+    fn parse_query_percent_decodes_values() {
+        // did%3Aweb%3Ax → did:web:x (colons percent-encoded).
+        let q = parse_query(Some("repo=did%3Aweb%3Ax&collection=ai.hyprstream.model"));
+        assert_eq!(q.get("repo").map(std::string::String::as_str), Some("did:web:x"));
+        assert_eq!(q.get("collection").map(std::string::String::as_str), Some("ai.hyprstream.model"));
+    }
+
+    #[test]
+    fn parse_query_plus_becomes_space() {
+        let q = parse_query(Some("handle=foo+bar"));
+        assert_eq!(q.get("handle").map(std::string::String::as_str), Some("foo bar"));
     }
 
     #[test]
     fn parse_query_extracts_key_value_pairs() {
         let q = parse_query(Some("repo=did:web:x&collection=ai.hyprstream.model&rkey=abc"));
-        assert_eq!(q.get("repo").copied(), Some("did:web:x"));
-        assert_eq!(q.get("collection").copied(), Some("ai.hyprstream.model"));
+        assert_eq!(q.get("repo").map(std::string::String::as_str), Some("did:web:x"));
+        assert_eq!(q.get("collection").map(std::string::String::as_str), Some("ai.hyprstream.model"));
     }
 
     // ── Router-mounted tests (findings 1 + 2) ─────────────────────────────────
@@ -1253,5 +1315,37 @@ mod tests {
             "message must mention repo: {}",
             body["message"]
         );
+    }
+
+    #[tokio::test]
+    async fn router_bare_since_rejected() {
+        // ?since (bare key, no =) must still be caught by since-rejection.
+        let app = build_xrpc_router().await;
+        let resp = app
+            .clone()
+            .oneshot(req(
+                "/xrpc/com.atproto.sync.getRepo?did=did:web:pub.example.com&since",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = resp_json(resp).await;
+        assert_eq!(body["error"], errors::INVALID_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn router_percent_encoded_did_resolves() {
+        // did%3Aweb%3Apub.example.com → did:web:pub.example.com (percent-decoded).
+        let app = build_xrpc_router().await;
+        let resp = app
+            .clone()
+            .oneshot(req(
+                "/xrpc/com.atproto.repo.describeRepo?repo=did%3Aweb%3Apub.example.com",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp_json(resp).await;
+        assert_eq!(body["did"], "did:web:pub.example.com");
     }
 }
