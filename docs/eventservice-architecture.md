@@ -173,10 +173,10 @@ grant and cannot decrypt the fresh epoch.
 The confidential body is versioned and length-prefixed:
 
 ```
-[1B version][8B membership_version][8B epoch][8B sequence]
-[12B nonce][16B key_commitment]
+[1B version][12B nonce][16B key_commitment]
 [4B tag_len][tag][4B ciphertext_len][ciphertext][4B lk_tag_len][lk_tag]
-[8B timestamp BE][32B publisher_pubkey][4B signature_len][hybrid signature]
+[8B timestamp BE][8B membership_version][8B epoch][8B sequence]
+[32B publisher_pubkey][4B signature_len][hybrid signature]
 ```
 
 The topic remains the MoQ frame topic and is authenticated by the hybrid
