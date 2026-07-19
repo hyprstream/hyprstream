@@ -451,10 +451,6 @@ async fn exchange_refresh_token(
         None => return token_error(StatusCode::BAD_REQUEST, "invalid_request", Some("refresh_token is required")),
     };
 
-    let _rotation_guard = state.refresh_rotation_lock.lock().await;
-
-    // Look up the refresh token. get_refresh_token handles lazy expiry and
-    // returns None if the credential is expired or absent.
     let entry = match state.get_refresh_token(&refresh_token).await {
         Ok(Some(e)) => e,
         Ok(None) => {
@@ -482,15 +478,28 @@ async fn exchange_refresh_token(
     // gate chain with a MANDATORY fresh DPoP proof — never this generic OAuth
     // rotation path (which treats DPoP as optional and does not re-check the
     // ceiling). Preserve its existing fail-closed, single-use behavior.
-    if let Some(ucan_grant) = &entry.ucan_grant {
-        if let Err(e) = state.delete_refresh_token(&refresh_token).await {
-            tracing::error!(error = %e, "Refresh token store delete failed");
+    if entry.ucan_grant.is_some() {
+        let claimed = match state.take_refresh_token(&refresh_token).await {
+            Ok(Some(claimed)) => claimed,
+            Ok(None) => {
+                return token_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_grant",
+                    Some("Refresh token not found or already used"),
+                );
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "Refresh token store take failed");
+                return token_error(StatusCode::INTERNAL_SERVER_ERROR, "server_error", None);
+            }
+        };
+        let Some(claimed_grant) = claimed.ucan_grant.as_ref() else {
+            tracing::error!("UCAN refresh token changed before atomic claim");
             return token_error(StatusCode::INTERNAL_SERVER_ERROR, "server_error", None);
-        }
-        drop(_rotation_guard);
+        };
         return super::token_exchange::exchange_ucan_grant_refresh(
             &state,
-            ucan_grant,
+            claimed_grant,
             dpop_header.as_deref(),
         )
         .await;
@@ -514,20 +523,30 @@ async fn exchange_refresh_token(
         );
     }
 
-    // Consume only after all retryable DPoP validation succeeds. Deleting
-    // before issuing a replacement preserves rotation safety on mint failures.
-    if let Err(e) = state.delete_refresh_token(&refresh_token).await {
-        tracing::error!(error = %e, "Refresh token store delete failed");
-        return token_error(StatusCode::INTERNAL_SERVER_ERROR, "server_error", None);
-    }
-    drop(_rotation_guard);
+    // Atomically claim only after all retryable DPoP validation succeeds.
+    // A successful claim prevents every other OAuth replica from minting with
+    // this single-use refresh credential.
+    let claimed = match state.take_refresh_token(&refresh_token).await {
+        Ok(Some(claimed)) => claimed,
+        Ok(None) => {
+            return token_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_grant",
+                Some("Refresh token not found or already used"),
+            );
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "Refresh token store take failed");
+            return token_error(StatusCode::INTERNAL_SERVER_ERROR, "server_error", None);
+        }
+    };
 
-    // Reconstruct verifying key from stored bytes (cnf continuity across refreshes).
-    let stored_vk: Option<ed25519_dalek::VerifyingKey> = entry.verifying_key_bytes
+    // Reconstruct verifying key from the atomically claimed record (cnf continuity across refreshes).
+    let stored_vk: Option<ed25519_dalek::VerifyingKey> = claimed.verifying_key_bytes
         .and_then(|b| ed25519_dalek::VerifyingKey::from_bytes(&b).ok());
 
     // Issue new access token + rotated refresh token. No id_token on refresh (OIDC Core § 12.2).
-    issue_token_with_refresh(&state, &entry.client_id, entry.scopes, entry.resource, &entry.username, None, false, stored_vk.as_ref(), dpop_jkt, vault_device_cookie).await
+    issue_token_with_refresh(&state, &claimed.client_id, claimed.scopes, claimed.resource, &claimed.username, None, false, stored_vk.as_ref(), dpop_jkt, vault_device_cookie).await
 }
 
 /// Handle urn:ietf:params:oauth:grant-type:device_code grant type (RFC 8628 Section 3.4).
