@@ -666,9 +666,16 @@ mod tests {
         tag: &str,
     ) -> (MetricsClient, InprocManager) {
         // Tests use Classical (EdDSA-only) keys — install Classical verify
-        // policy so the global fail-closed Hybrid default doesn't reject them.
+        // policy on both the request and response arms so the global
+        // fail-closed Hybrid defaults don't reject them.
         let _ = hyprstream_rpc::envelope::install_verify_config(
             hyprstream_rpc::envelope::EnvelopeVerifyConfig {
+                policy: hyprstream_rpc::crypto::CryptoPolicy::Classical,
+                pq_store: None,
+            },
+        );
+        let _ = hyprstream_rpc::envelope::install_response_verify_config(
+            hyprstream_rpc::envelope::ResponseVerifyConfig {
                 policy: hyprstream_rpc::crypto::CryptoPolicy::Classical,
                 pq_store: None,
             },

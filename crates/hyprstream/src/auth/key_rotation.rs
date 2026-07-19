@@ -1900,10 +1900,6 @@ mod tests {
             false
         }
 
-        fn pq_signing_key(&self) -> Option<hyprstream_rpc::crypto::pq::MlDsaSigningKey> {
-            None
-        }
-
         fn jwt_verify_policy(&self) -> hyprstream_rpc::crypto::CryptoPolicy {
             hyprstream_rpc::crypto::CryptoPolicy::Hybrid
         }
