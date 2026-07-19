@@ -199,10 +199,20 @@ jobs:
       uses: actions/checkout@v4
       with:
         ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+        # Do not persist the GITHUB_TOKEN into .git/config on the self-hosted
+        # runner (actions/checkout writes it there by default for later git
+        # pushes). This job only reads; the token must not outlive the step.
+        persist-credentials: false
 
     - name: Log in to Container Registry
       if: github.event_name != 'pull_request'
-      run: podman login ghcr.io -u "${{ github.actor }}" -p "${{ secrets.GITHUB_TOKEN }}"
+      env:
+        REGISTRY_USER: ${{ github.actor }}
+        REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # Never interpolate secrets into the command line (visible in /proc and
+      # ps). Pipe via --password-stdin so the token stays out of argv.
+      run: |
+        echo "$REGISTRY_TOKEN" | podman login ghcr.io -u "$REGISTRY_USER" --password-stdin
 
     # docker/metadata-action is a pure node action (no docker daemon needed) so
     # it runs fine on the podman-only runner; it just emits the tag set.
