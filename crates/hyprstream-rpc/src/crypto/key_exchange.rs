@@ -271,6 +271,56 @@ pub fn client_hybrid_stream_keys(
     derive_stream_keys(&secret, &client_salt, &server_salt)
 }
 
+/// Server side of the transcript-bound identified stream epoch bootstrap.
+///
+/// This is the production successor to [`server_hybrid_stream_keys`].  The
+/// pinned HyKEM combiner secret is mixed with the complete accepted-current
+/// stream binding before any direction/track/epoch traffic key is derived.
+pub fn server_identified_stream_epoch(
+    client_kem_public: &[u8],
+    binding: crate::stream_epoch::IdentifiedStreamBinding,
+) -> EnvelopeResult<(
+    crate::crypto::hybrid_kem::HybridKemMaterial,
+    crate::stream_epoch::StreamEpochRatchet,
+)> {
+    let client_pub = crate::crypto::hybrid_kem::RecipientPublic::decode(client_kem_public)
+        .map_err(|e| EnvelopeError::KeyExchange(format!("invalid client KEM public: {e}")))?;
+    if client_pub.suite_id != crate::stream_epoch::IDENTIFIED_STREAM_SUITE {
+        return Err(EnvelopeError::KeyExchange(
+            "identified stream requires the pinned X25519+ML-KEM-768 suite".into(),
+        ));
+    }
+    let (material, secret) = crate::crypto::hybrid_kem::encapsulate_to(&client_pub)
+        .map_err(|e| EnvelopeError::KeyExchange(format!("hybrid encapsulate failed: {e}")))?;
+    let ratchet = crate::stream_epoch::StreamEpochRatchet::from_hybrid_secret(&secret, binding)
+        .map_err(|e| EnvelopeError::KeyExchange(format!("stream transcript rejected: {e}")))?;
+    Ok((material, ratchet))
+}
+
+/// Client side of the transcript-bound identified stream epoch bootstrap.
+pub fn client_identified_stream_epoch(
+    keypair: &crate::crypto::hybrid_kem::RecipientKeypair,
+    kem_ciphertexts: &[u8],
+    binding: crate::stream_epoch::IdentifiedStreamBinding,
+) -> EnvelopeResult<crate::stream_epoch::StreamEpochRatchet> {
+    if keypair.suite_id != crate::stream_epoch::IDENTIFIED_STREAM_SUITE {
+        return Err(EnvelopeError::KeyExchange(
+            "identified stream requires the pinned X25519+ML-KEM-768 suite".into(),
+        ));
+    }
+    let material = crate::crypto::hybrid_kem::HybridKemMaterial::decode(kem_ciphertexts)
+        .map_err(|e| EnvelopeError::KeyExchange(format!("invalid KEM ciphertexts: {e}")))?;
+    if material.suite_id != crate::stream_epoch::IDENTIFIED_STREAM_SUITE {
+        return Err(EnvelopeError::KeyExchange(
+            "identified stream ciphertexts use the wrong suite".into(),
+        ));
+    }
+    let secret = crate::crypto::hybrid_kem::decapsulate(keypair, &material)
+        .map_err(|e| EnvelopeError::KeyExchange(format!("hybrid decapsulate failed: {e}")))?;
+    crate::stream_epoch::StreamEpochRatchet::from_hybrid_secret(&secret, binding)
+        .map_err(|e| EnvelopeError::KeyExchange(format!("stream transcript rejected: {e}")))
+}
+
 /// One-way epoch ratchet for long-lived streams (S3 #554 / #223).
 ///
 /// Derive the next epoch's key from the current one via a one-way KDF: a

@@ -348,6 +348,25 @@ fn generate_dispatch_fn(
         .iter()
         .map(|sc| sc.factory_name.as_str())
         .collect();
+    let method_discriminator_arms: Vec<TokenStream> = request_variants
+        .iter()
+        .enumerate()
+        .map(|(index, variant)| {
+            let variant_pascal = resolved.name(&variant.name).pascal_ident.clone();
+            let discriminator = resolved
+                .raw
+                .request_struct
+                .as_ref()
+                .and_then(|request| {
+                    request
+                        .union_fields()
+                        .find(|field| field.name == variant.name)
+                })
+                .map(|field| field.discriminant_value)
+                .unwrap_or_else(|| u16::try_from(index).unwrap_or(u16::MAX));
+            quote! { Which::#variant_pascal(_) => #discriminator, }
+        })
+        .collect();
 
     let match_arms: Vec<TokenStream> = request_variants
         .iter()
@@ -753,6 +772,12 @@ fn generate_dispatch_fn(
             )?;
             let req = reader.get_root::<crate::#capnp_mod::#req_snake::Reader>()?;
             let request_id = req.get_id();
+            let __decoded_method_discriminator = match req.which()? {
+                #(#method_discriminator_arms)*
+                #[allow(unreachable_patterns)]
+                _ => anyhow::bail!("Unknown request variant (not in schema)"),
+            };
+            ctx.ensure_browser_method(__decoded_method_discriminator)?;
             #dispatch_body
         }
     }
@@ -2366,5 +2391,71 @@ fn generate_nested_scope_dispatch_phase(
         };
 
         Ok((#serializer_fn(request_id, &result)?, None))
+    }
+}
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod browser_method_dispatch_tests {
+    use super::generate_dispatch_fn;
+    use crate::resolve::ResolvedSchema;
+    use crate::schema::types::{ParsedSchema, UnionVariant};
+
+    fn variant(name: &str) -> UnionVariant {
+        UnionVariant {
+            name: name.to_owned(),
+            type_name: "Void".to_owned(),
+            description: String::new(),
+            scope: "query".to_owned(),
+            scope_exempt: false,
+            cli_hidden: false,
+            doc_example: String::new(),
+            vfs_path: String::new(),
+            vfs_kind: String::new(),
+            vfs_bulk: false,
+            vfs_hidden: false,
+        }
+    }
+
+    #[test]
+    fn generated_dispatch_independently_checks_decoded_method_before_handler() {
+        let schema = ParsedSchema {
+            request_variants: vec![variant("status"), variant("load")],
+            response_variants: vec![],
+            structs: vec![],
+            scoped_clients: vec![],
+            enums: vec![],
+            request_struct: None,
+            response_struct: None,
+        };
+        let resolved = ResolvedSchema::from(&schema);
+        let generated = generate_dispatch_fn(
+            "Model",
+            &syn::parse_quote!(model_capnp),
+            &schema.request_variants,
+            &[],
+            &[],
+            &resolved,
+            false,
+        )
+        .to_string();
+
+        let decode = generated
+            .find("match req . which")
+            .expect("generated dispatch must independently decode the request union");
+        let compare = generated
+            .find("ctx . ensure_browser_method")
+            .expect("generated dispatch must compare the sealed browser commitment");
+        let handler = generated
+            .find("handler . handle_status")
+            .expect("fixture must contain an application handler call");
+        assert!(decode < compare, "method must be decoded before comparison");
+        assert!(
+            compare < handler,
+            "mismatch must reject before the application handler"
+        );
+        assert!(
+            generated.contains("Status (_) => 0u16") && generated.contains("Load (_) => 1u16"),
+            "generated comparison must use schema union discriminators: {generated}"
+        );
     }
 }

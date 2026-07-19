@@ -1,0 +1,126 @@
+{
+  "profile_version": 1,
+  "profile_id": "hs-pp-pqhybrid/experimental-boundary/v1",
+  "status": "blocked-no-selected-pq-anonymous-construction",
+  "scope": "Repository-local structural boundary and deterministic fixture schema. It is not a production wire schema, Privacy Pass token type, algorithm selection, IANA allocation, or authorization implementation.",
+  "production_enabled": false,
+  "production_refusal": "construction-unselected",
+  "token_type": null,
+  "pq_construction": null,
+  "fixture_canonicalization": {
+    "encoding": "UTF-8 JSON with object keys sorted lexicographically, no insignificant whitespace, and only the string, integer, boolean, null, array, and object values admitted by this registry",
+    "purpose": "deterministic repository-owned negative-control fixtures only; not a protocol encoding",
+    "message_version": "JSON integer 1 exactly; booleans and all other JSON types are rejected",
+    "challenge_digest": "lowercase SHA-256 hex of the canonical challenge fixture object under this fixture encoding only; not a production protocol digest"
+  },
+  "composition": {
+    "operator": "and",
+    "exact_leg_count": 2,
+    "ordered_roles": [
+      "classical-anonymous",
+      "pq-anonymous"
+    ],
+    "unknown_roles": "reject",
+    "duplicate_roles": "reject",
+    "reordered_roles": "reject",
+    "crossed_context": "reject"
+  },
+  "key_purposes": {
+    "classical-anonymous": "privacy-pass-classical-issuance",
+    "pq-anonymous": "privacy-pass-pq-anonymous-issuance",
+    "forbidden": [
+      "mesh-signing",
+      "mesh-kem",
+      "pds-signing",
+      "response-signing",
+      "controller-signing"
+    ],
+    "cross_role_reuse": "reject"
+  },
+  "forbidden_holder_fields": [
+    "holder",
+    "holder_did",
+    "holder_handle",
+    "atproto_did",
+    "atproto_handle",
+    "account_id",
+    "subject"
+  ],
+  "message_schemas": {
+    "challenge": [
+      "kind",
+      "version",
+      "profile_id",
+      "issuer_id",
+      "audience",
+      "suite_id",
+      "accepted_state_digest",
+      "accepted_state_epoch",
+      "policy_generation",
+      "expiry",
+      "challenge_nonce",
+      "redemption_context",
+      "resource_profile_commitment"
+    ],
+    "issuance-request": [
+      "kind",
+      "version",
+      "profile_id",
+      "composition",
+      "challenge_digest",
+      "legs"
+    ],
+    "issuance-response": [
+      "kind",
+      "version",
+      "profile_id",
+      "composition",
+      "challenge_digest",
+      "legs"
+    ],
+    "token": [
+      "kind",
+      "version",
+      "profile_id",
+      "composition",
+      "challenge_digest",
+      "issuer_id",
+      "audience",
+      "suite_id",
+      "accepted_state_digest",
+      "accepted_state_epoch",
+      "policy_generation",
+      "expiry",
+      "redemption_context",
+      "resource_profile_commitment",
+      "legs",
+      "production_disposition"
+    ],
+    "leg": [
+      "role",
+      "purpose",
+      "issuer_key_id",
+      "suite_id",
+      "challenge_digest",
+      "context_digest",
+      "artifact"
+    ]
+  },
+  "bounds": {
+    "identifier_max_bytes": 512,
+    "digest_hex_chars": 64,
+    "nonce_hex_min_chars": 32,
+    "nonce_hex_max_chars": 128,
+    "artifact_hex_max_chars": 131072,
+    "integer_minimum": 0,
+    "integer_maximum": 18446744073709551615
+  },
+  "construction_dependencies": [
+    "reviewed post-quantum blindness and one-more-unforgeability model",
+    "fixed algorithms and parameters",
+    "canonical production request, response, token, configuration, and error encodings",
+    "maintained constant-time implementation and deterministic cryptographic vectors",
+    "Privacy Pass and CFRG review of the token type and classical-plus-PQ AND composition",
+    "independent cryptographic, privacy, and implementation review"
+  ]
+}

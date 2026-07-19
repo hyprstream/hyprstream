@@ -263,6 +263,12 @@ fn build_cli() -> ClapCommand {
                     .long("server")
                     .required(false)
                     .help("OAuth server URL (default: from config or http://localhost:6791)"),
+            )
+            .arg(
+                Arg::new("insecure")
+                    .long("insecure")
+                    .action(clap::ArgAction::SetTrue)
+                    .help("Disable TLS certificate verification (use only against a trusted local dev server). By default the local self-signed dev cert is trusted automatically."),
             ),
     );
 
@@ -1450,7 +1456,10 @@ fn resolve_service_vk(service_name: &str) -> Option<VerifyingKey> {
 }
 
 fn install_process_production_resolver(signing_key: &SigningKey) -> Result<()> {
-    hyprstream_discovery::bootstrap_deployment_process(signing_key.clone())
+    hyprstream_discovery::bootstrap_deployment_process(signing_key.clone())?;
+    hyprstream_rpc::envelope::install_browser_currentness_verifier(
+        hyprstream_discovery::production_browser_currentness_verifier()?,
+    )
 }
 
 /// Install the process-global envelope verify configuration (#152, #160).
@@ -1462,10 +1471,8 @@ fn install_process_production_resolver(signing_key: &SigningKey) -> Result<()> {
 /// silently downgrading to EdDSA-only. `install_verify_config` is first-write-
 /// wins, so calling it from multiple stages within one process is harmless.
 ///
-/// Policy default is Hybrid (SNS nested COSE); operators mid-rollout, before
-/// peer ML-DSA bindings are provisioned, may set
-/// `HYPRSTREAM_ENVELOPE_POLICY=classical`. Under Hybrid with no anchored peer
-/// key the verifier fails closed (correct, by design).
+/// Policy is pinned to Hybrid (SNS nested COSE). With no anchored peer key the
+/// verifier fails closed (correct, by design).
 /// Install the process-global envelope verify configuration.
 ///
 /// When `oauth` is `Some`, the kid-anchored PQ trust store is populated eagerly
@@ -1473,16 +1480,14 @@ fn install_process_production_resolver(signing_key: &SigningKey) -> Result<()> {
 /// which has no config in scope), the store is empty — identical to the prior
 /// behavior. Either way the store is immutable after install.
 fn install_envelope_verify_config(oauth: Option<&hyprstream_core::config::OAuthConfig>) {
-    use hyprstream_rpc::crypto::CryptoPolicy;
     use hyprstream_rpc::envelope::{
-        envelope_policy_from_env, install_response_verify_config, install_verify_config,
+        install_response_verify_config, install_verify_config, mandatory_envelope_policy,
         EnvelopeVerifyConfig, KeyedPqTrustStore, PqTrustStore, ResponseVerifyConfig,
     };
 
-    // Single source of truth for the rollout escape hatch
-    // (`HYPRSTREAM_ENVELOPE_POLICY`), shared by the request AND response sides
-    // (#277): `classical` downgrades both directions in lock-step.
-    let policy = envelope_policy_from_env();
+    // The application suite is pinned: requests and responses both require
+    // Ed25519 + ML-DSA-65, with no runtime downgrade selector.
+    let policy = mandatory_envelope_policy();
 
     // Mesh kid-anchored PQ trust store (#157, Option A): populated eagerly from
     // admin-configured `mesh_peers`, immutable after install. An empty store
@@ -1542,24 +1547,10 @@ fn install_envelope_verify_config(oauth: Option<&hyprstream_core::config::OAuthC
     })
     .is_ok()
     {
-        match policy {
-            CryptoPolicy::Hybrid => tracing::info!(
-                "envelope verify policy: HYBRID enforced (SNS nested COSE); \
-                 peer ML-DSA bindings required for cross-node traffic"
-            ),
-            CryptoPolicy::Classical => {
-                tracing::error!(
-                    "⚠ SECURITY DOWNGRADE: envelope verify policy is CLASSICAL (EdDSA-only). \
-                     Post-quantum protection is DISABLED for ALL envelope traffic. \
-                     Unset HYPRSTREAM_ENVELOPE_POLICY or set it to 'hybrid' to re-enable PQ enforcement. \
-                     This setting must not be used in production."
-                );
-                eprintln!(
-                    "SECURITY WARNING: HYPRSTREAM_ENVELOPE_POLICY=classical disables post-quantum \
-                     protection. Set to 'hybrid' or unset for production use."
-                );
-            }
-        }
+        tracing::info!(
+            "envelope verify policy: HYBRID enforced (SNS nested COSE); \
+             peer ML-DSA bindings required for cross-node traffic"
+        );
     }
 }
 
@@ -2460,12 +2451,8 @@ fn main() -> Result<()> {
                                 // resolution). Empty `mesh_peers` => empty store =>
                                 // unchanged behavior.
                                 //
-                                // Policy: Hybrid is enforced by default. Operators
-                                // mid-rollout (before peer ML-DSA bindings are
-                                // provisioned) may set
-                                // HYPRSTREAM_ENVELOPE_POLICY=classical to keep the
-                                // legacy EdDSA-only verifier. Under Hybrid with no
-                                // anchored key the verifier FAILS CLOSED.
+                                // Policy: Hybrid is mandatory. With no anchored
+                                // peer key the verifier FAILS CLOSED.
                                 install_envelope_verify_config(Some(&config.oauth));
 
                                 let manager = InprocManager::new();
@@ -2764,13 +2751,28 @@ fn main() -> Result<()> {
             let nonce = sub_m.get_one::<String>("nonce").cloned();
             let code_challenge = sub_m.get_one::<String>("code_challenge").cloned();
             let server = sub_m.get_one::<String>("server").cloned();
+            let insecure = sub_m.get_flag("insecure");
+            // Pass the already-loaded config (honors `--config`) so the OAuth
+            // issuer URL and the local self-signed cert's secrets dir are
+            // resolved from the user's selected configuration, not re-derived
+            // from defaults (#450). `config_for_service` is the surviving
+            // clone (`config` itself is moved into AppContext above).
+            let sign_cfg = config_for_service.clone();
             with_runtime(
                 RuntimeConfig {
                     device: DeviceConfig::request_cpu(),
                     multi_threaded: false,
                 },
                 || async move {
-                    handle_sign_challenge(user_code, nonce, code_challenge, server).await
+                    handle_sign_challenge(
+                        user_code,
+                        nonce,
+                        code_challenge,
+                        server,
+                        insecure,
+                        Some(&sign_cfg),
+                    )
+                    .await
                 },
             )?;
         }

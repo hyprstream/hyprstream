@@ -1,5 +1,7 @@
 # Standards profile: PQ-hybrid anonymous authorization (pre-construction)
 
+> **Sibling profile:** [`resource-attestation.md`](resource-attestation.md) is the #1070 pre-construction profile for `draft-hyprstream-resource-attestation-00` (dual-attested resource ownership). It owns its own RFCXML, registries, vectors, and the `tools/check_resource_attestation.py` checker; it does not overlap this profile's Privacy Pass/MoQ sources.
+
 This directory is the reviewable #1059 documentation/tooling slice for #1058. It does **not** select a PQ anonymous primitive, define a Privacy Pass token type, allocate an IANA/MOQT/Privacy Pass codepoint, or claim IETF endorsement/adoption. Its RFCXML skeleton is a **pre-I-D work in progress** named `draft-hyprstream-privacypass-pqhybrid-00`.
 
 The generated text/HTML intentionally exercise xml2rfc's standard Internet-Draft boilerplate. The source has not been submitted, and the rendered boilerplate is not evidence of submission, adoption, endorsement, or an allocation.
@@ -10,9 +12,12 @@ The generated text/HTML intentionally exercise xml2rfc's standard Internet-Draft
 - `analysis/privacy-analysis.md` — data flows, metadata limits, and ledger/PDS/storage observability requirements.
 - `analysis/downgrade-matrix.md` — outer/inner assurance separation and negative-control matrix.
 - `analysis/standards-gap-matrix.md` — standards status, explicit non-allocations, construction questions.
+- `analysis/construction-selection-audit.md` — #1060 primary-source candidate audit and the precise reason no production construction is selected.
 - `registry/domain-separation.json` — local labels, transcript fields, canonicalization, bounds, and owning issues; it is not an external registry.
+- `registry/pq-anonymous-issuance.json` — canonical experimental message/AND-leg boundary with a fixture-only challenge hash, exact evaluator context, and an unconditional production refusal.
 - `registry/profile-vocabulary.json` — bounded roles, principal kinds, carrier profiles, inner control message kinds, state names, and safety ceilings shared by later drafts.
 - `registry/obligations.json` — machine-readable mapping for every RFCXML `MUST`/`MUST NOT` to a test or explicit specification-only owner/blocker.
+- `vectors/pq-anonymous-boundary-v1.json` — deterministic non-cryptographic baseline and mutation-effective negative controls; it contains no mintable token.
 - `.python-version` — the exact Python renderer version, which xml2rfc records in generated HTML.
 - `xml2rfc-requirements.txt` — the complete pinned renderer environment; xml2rfc records dependency versions in HTML, so pinning only the top-level package is not reproducible.
 - `rfc/draft-hyprstream-privacypass-pqhybrid-00.xml` and generated `.txt`/`.html` — reproducible RFCXML v3 scaffold.
@@ -29,6 +34,9 @@ The generated text/HTML intentionally exercise xml2rfc's standard Internet-Draft
 | `draft-ietf-moq-privacy-pass-auth-03` | <https://www.ietf.org/archive/id/draft-ietf-moq-privacy-pass-auth-03.html> | IETF Internet-Draft, work in progress |
 | `draft-guo-privacypass-token-binding-02` | <https://www.ietf.org/archive/id/draft-guo-privacypass-token-binding-02.html> | Individual Internet-Draft, not adopted |
 | RFC 9955, Hybrid Signature Spectrums | <https://www.rfc-editor.org/info/rfc9955> | Informational RFC |
+| `draft-ietf-privacypass-arc-crypto-01` | <https://datatracker.ietf.org/doc/html/draft-ietf-privacypass-arc-crypto-01> | Privacy Pass WG Internet-Draft; classical construction |
+| Post-Quantum Privacy Pass via Post-Quantum Anonymous Credentials | <https://eprint.iacr.org/2023/414> | Research preprint and unreviewed proof-of-concept implementation |
+| Improved Lattice Blind Signatures from Recycled Entropy | <https://doi.org/10.1007/978-3-032-01855-7_16> | CRYPTO 2025 peer-reviewed primitive research; no Privacy Pass profile |
 
 In particular, MOQT -19 Section 11.2 describes the Object payload as opaque to relays and Section 10.2.2 defines the `AUTHORIZATION TOKEN` message parameter. The MoQ Privacy Pass draft Section 3.5 profiles Privacy Pass on those authorization surfaces. Both MOQT documents remain works in progress; this profile does not treat their current text as an allocated Hyprstream extension.
 
@@ -65,6 +73,7 @@ Generated text and HTML are deterministic outputs of the fully pinned xml2rfc 3.
 ```bash
 python3 tools/generate_standards.py
 python3 tools/check_standards.py
+python3 tools/check_pq_anonymous_issuance.py
 python3 tools/check_standards.py --check-generated \
   --xml2rfc "$(uvx --isolated --from xml2rfc==3.34.0 \
     --python "$(cat docs/standards/.python-version)" \
@@ -78,11 +87,11 @@ xml2rfc --version                     # must report 3.34.0
 python3 tools/check_standards.py --check-generated --xml2rfc xml2rfc
 ```
 
-The `Standards artifacts` GitHub Actions workflow installs the complete pinned toolchain, validates all three JSON files using only Python stdlib, parses RFCXML, ensures every normative RFCXML sentence is manifested, and fails if regenerated text or HTML differs byte-for-byte.
+The `Standards artifacts` GitHub Actions workflow installs the complete pinned toolchain, validates the local registries and deterministic vector using only Python stdlib, executes all #1060 structural mutations, parses RFCXML, ensures every normative RFCXML sentence is manifested, and fails if regenerated text or HTML differs byte-for-byte.
 
 ## Construction-selection blockers
 
-1. #1060 must select a reviewable PQ anonymous/blind issuance construction with honest-case unlinkability and explicit collusion limits; an ordinary signature or classical-only wrapper is insufficient.
+1. #1060's 2026-07-17 construction audit found no candidate that supplies the complete reviewed Privacy Pass construction, parameters, implementation, encoding, and AND-composition package. The experimental boundary therefore refuses all production issuance/redemption. A future slice must select a reviewable PQ anonymous/blind issuance construction with honest-case unlinkability and explicit collusion limits; an ordinary signature or classical-only wrapper is insufficient.
 2. #1061 must specify one-use binding to fresh PoP and HyKEM recipient with canonical encoding and no issuer-visible stable holder key; the individual token-binding draft is input, not adopted authority.
 3. #1062 must derive an anonymous typed principal/MAC clearance from verified material and prevent `Public`/unlabeled objects from becoming bearer access.
 4. #726 must implement the ordinary Object control profile and standard outer authorization surface without turning a relay into a key-release authority.

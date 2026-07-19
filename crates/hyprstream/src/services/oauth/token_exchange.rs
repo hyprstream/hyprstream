@@ -900,31 +900,28 @@ async fn mint_grant_token(
         jkt: Some(dpop_jkt.to_owned()),
     });
 
-    // S8 (#574) + Fu3/#677: sign via the hybrid composite (EdDSA + ML-DSA-65)
-    // under a Hybrid policy; under Classical use the pinned classical Ed25519
-    // suite. **Hybrid fails closed:** if the node is Hybrid but no ML-DSA-65
-    // signing key is provisioned, refuse to mint rather than silently downgrade
-    // to a classical-only token — mirroring `PolicyService::sign_token` and
+    // S8 (#574) + Fu3/#677: sign via the mandatory hybrid composite (EdDSA +
+    // ML-DSA-65). If no ML-DSA-65 signing key is provisioned, refuse to mint
+    // rather than silently downgrade to a classical-only token — mirroring
+    // `PolicyService::sign_token` and
     // `CoseAuditSigner`. The UCAN grant and approval this token was minted from
     // are already hybrid-signed, so a classical-only minted token would break
     // that chain of hybrid authority.
-    let policy = hyprstream_rpc::envelope::envelope_policy_from_env();
-    let token = if policy.uses_pq() {
-        let snapshot = match hyprstream_rpc::auth::global_composite_key_set().mint_snapshot() {
-            Ok(snapshot) => snapshot,
-            Err(error) => {
-                tracing::error!("composite authority unavailable or stale; refusing to mint: {error}");
-                return tx_error(StatusCode::INTERNAL_SERVER_ERROR, "server_error", "hybrid token authority is not current");
-            }
-        };
-        let signing = snapshot
-            .active_signing_pair(hyprstream_rpc::auth::CompositePairRole::OAuth)
-            .and_then(hyprstream_rpc::auth::CompositeKeyPair::signing_keys);
-        match signing {
-            Some((pq, ed)) => crate::auth::jwt::encode_composite_ml_dsa_65_ed25519(
-                &claims, &pq, &ed,
-            ),
-            None => {
+    let snapshot = match hyprstream_rpc::auth::global_composite_key_set().mint_snapshot() {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            tracing::error!("composite authority unavailable or stale; refusing to mint: {error}");
+            return tx_error(StatusCode::INTERNAL_SERVER_ERROR, "server_error", "hybrid token authority is not current");
+        }
+    };
+    let signing = snapshot
+        .active_signing_pair(hyprstream_rpc::auth::CompositePairRole::OAuth)
+        .and_then(hyprstream_rpc::auth::CompositeKeyPair::signing_keys);
+    let token = match signing {
+        Some((pq, ed)) => crate::auth::jwt::encode_composite_ml_dsa_65_ed25519(
+            &claims, &pq, &ed,
+        ),
+        None => {
             tracing::error!(
                 "no authorized active OAuth composite pair; refusing to mint (fail-closed)"
             );
@@ -933,18 +930,7 @@ async fn mint_grant_token(
                 "server_error",
                 "hybrid token signing pair not provisioned",
             );
-            }
         }
-    } else {
-        let Some(ed_sk) = state.active_jwt_signing_key().await else {
-            tracing::error!("no active JWT signing key configured; cannot mint UCAN grant token");
-            return tx_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "server_error",
-                "token signing not configured",
-            );
-        };
-        crate::auth::jwt::encode(&claims, &ed_sk)
     };
 
     // Optional refresh token (ZSP: refresh re-runs evaluate_refresh, not a free

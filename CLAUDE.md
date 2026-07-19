@@ -8,6 +8,8 @@ HyprStream is the runtime for AI that gets smarter the more you use it: a Plan 9
 
 ## Core Philosophy
 
+**Normative ontology:** [`docs/system-ontology.md`](docs/system-ontology.md) is the source of truth for canonical nouns/actions, status, laws, and module-aware layer assignments, and takes precedence over descriptive summaries in this guide for those facts. It incorporates this guide's **Naming (don't relitigate)** block, ADR #651, and #1090 revision 7 by reference; those narrower ratified decisions remain authoritative in their scopes and are not silently superseded.
+
 - **Everything is a file** — models, streams, tools, and apps compose in one VFS namespace; capability-scoped by construction
 - **Models are Git repositories** — version-controlled via git2db; promotion = merge, rollback = checkout
 - **Adapters are files** — stored in `model/adapters/` as `.safetensors` (NOT branch-based)

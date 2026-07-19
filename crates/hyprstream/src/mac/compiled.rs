@@ -261,13 +261,14 @@ impl PolicyApproval {
     }
 }
 
-/// PEP side: verify signature + (optionally) match against an approval, then yield the
+/// PEP side: verify signature + match against an approval, then yield the
 /// [`CompiledPolicy`] ready to feed a [`crate::mac::te::LatticeTeEvaluator`]. Fail-closed:
 /// any failure returns an error and NO policy is loaded (the PEP keeps denying).
 pub struct PolicyLoader<V: PolicyVerifier> {
     verifier: V,
-    /// Approvals indexed by generation. If empty, approval-matching is skipped (sig-only);
-    /// production SHOULD populate this (S5).
+    /// Verified approvals indexed by generation. An empty set rejects every policy: a
+    /// signature proves who produced an artifact, while the approval is the independent
+    /// containment binding that authorizes its exact hash (S5).
     approvals: Vec<PolicyApproval>,
 }
 
@@ -289,7 +290,8 @@ impl<V: PolicyVerifier> PolicyLoader<V> {
     /// 1. Decode the canonical policy bytes.
     /// 2. Recompute the hash from the bytes (never trust a transmitted hash).
     /// 3. Verify the composite signature over `(generation, hash)`.
-    /// 4. If approvals are registered, require a matching `(generation, hash)` approval.
+    /// 4. Require a matching `(generation, hash)` approval. No approvals means no policy
+    ///    can load — there is deliberately no signature-only mode.
     pub fn load(&self, signed: &SignedPolicy) -> Result<CompiledPolicy, PolicyDistError> {
         // 1. Decode.
         let canonical: CanonicalPolicy = serde_json::from_slice(&signed.policy_bytes)
@@ -339,17 +341,17 @@ impl<V: PolicyVerifier> PolicyLoader<V> {
         // 3. Signature verify (ONCE, at load — never per op).
         self.verifier.verify(&input, &signed.signature)?;
 
-        // 4. Approval hash-match (containment backstop).
-        if !self.approvals.is_empty() {
-            let matched = self
-                .approvals
-                .iter()
-                .any(|a| a.generation == policy.generation && a.approved_hash == hash);
-            if !matched {
-                return Err(PolicyDistError::NoMatchingApproval {
-                    generation: policy.generation,
-                });
-            }
+        // 4. Approval hash-match (containment backstop). Empty approvals reject too:
+        //    accepting a signature alone would let the compiler/signing authority bypass
+        //    the independent approval that #570 requires.
+        let matched = self
+            .approvals
+            .iter()
+            .any(|a| a.generation == policy.generation && a.approved_hash == hash);
+        if !matched {
+            return Err(PolicyDistError::NoMatchingApproval {
+                generation: policy.generation,
+            });
         }
 
         Ok(policy)
@@ -538,11 +540,27 @@ mod tests {
     #[test]
     fn sign_then_load_roundtrips() {
         let key = [7u8; 32];
-        let signed = sign_policy(&policy(3), &StubSigner { key }).unwrap();
-        let loader = PolicyLoader::new(StubVerifier { key });
+        let policy = policy(3);
+        let approval = PolicyApproval {
+            generation: policy.generation,
+            approved_hash: policy.policy_hash().unwrap(),
+        };
+        let signed = sign_policy(&policy, &StubSigner { key }).unwrap();
+        let loader = PolicyLoader::new(StubVerifier { key }).with_approval(approval);
         let loaded = loader.load(&signed).unwrap();
         assert_eq!(loaded.generation, 3);
         assert_eq!(loaded.matrix.allow_len(), 2);
+    }
+
+    #[test]
+    fn loader_without_approval_rejects_valid_signature() {
+        let key = [7u8; 32];
+        let signed = sign_policy(&policy(3), &StubSigner { key }).unwrap();
+        let loader = PolicyLoader::new(StubVerifier { key });
+        assert!(matches!(
+            loader.load(&signed),
+            Err(PolicyDistError::NoMatchingApproval { generation: 3 })
+        ));
     }
 
     #[test]
@@ -646,12 +664,16 @@ mod tests {
             ("did:key:zAlice".to_owned(), label(Level::Secret)),
             ("did:key:zBob".to_owned(), label(Level::Confidential)),
         ]);
-        let signed = sign_policy(
-            &policy(2).with_enrollment(enrollment.clone()),
-            &StubSigner { key },
-        )
-        .unwrap();
-        let loaded = PolicyLoader::new(StubVerifier { key }).load(&signed).unwrap();
+        let policy = policy(2).with_enrollment(enrollment.clone());
+        let approval = PolicyApproval {
+            generation: policy.generation,
+            approved_hash: policy.policy_hash().unwrap(),
+        };
+        let signed = sign_policy(&policy, &StubSigner { key }).unwrap();
+        let loaded = PolicyLoader::new(StubVerifier { key })
+            .with_approval(approval)
+            .load(&signed)
+            .unwrap();
         assert_eq!(loaded.enrollment, enrollment);
         assert_eq!(loaded.clearance_for("did:key:zBob"), Some(label(Level::Confidential)));
     }

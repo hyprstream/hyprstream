@@ -31,6 +31,20 @@ k8s = [
     "dep:async-trait",
     "dep:parking_lot",
 ]
+# CRD → grant compilation (#929): a `TenantBinding`'s authorable entitlement
+# compiles into an issuer-signed UCAN grant + an `ai.hyprstream.ledger.allocation`
+# record. Pure logic — no cluster, no kube client — so it is a feature separate
+# from `k8s`. Pulls the UCAN/COSE primitives (`hyprstream-rpc`) and the
+# allocation lexicon (`hyprstream-pds`); the CRD *types* it lowers never require
+# them. `k8s` + `grant` together enable the operator reconcile wiring that
+# compiles a binding's entitlement into a grant on observe.
+grant = [
+    "dep:hyprstream-rpc",
+    "dep:hyprstream-pds",
+    "dep:ed25519-dalek",
+    "dep:anyhow",
+    "dep:rand",
+]
 
 [dependencies]
 # `derive` gives the CustomResource derive + CustomResourceExt (kube-core, no client).
@@ -52,6 +66,12 @@ hyprstream-vfs = { path = "../hyprstream-vfs", optional = true }
 hyprstream-rpc = { path = "../hyprstream-rpc", optional = true }
 async-trait = { version = "0.1", optional = true }
 parking_lot = { workspace = true, optional = true }
+
+# CRD → grant compilation (#929), gated behind the `grant` feature.
+hyprstream-pds = { path = "../hyprstream-pds", optional = true }
+ed25519-dalek = { workspace = true, optional = true }
+anyhow = { workspace = true, optional = true }
+rand = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "sync"] }

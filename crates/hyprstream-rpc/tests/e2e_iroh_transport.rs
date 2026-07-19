@@ -80,15 +80,25 @@ fn direct_addr(substrate: &IrohSubstrate) -> EndpointAddr {
     )
 }
 
-/// Install the Classical verify policy. Integration tests compile this crate in
-/// non-test mode, where the (uninstalled) global verify policy fail-closes to
-/// `Hybrid`; this test exercises the classical (EdDSA-only) wire+envelope path,
-/// so opt in to what it actually validates. Idempotent-by-first-write.
-fn install_classical_verify_policy() {
+fn test_client_signing_key() -> SigningKey {
+    SigningKey::from_bytes(&[0x42; 32])
+}
+
+/// Install the mandatory Hybrid verify policy with the stable test client
+/// identity anchored. Idempotent by first write across this integration binary.
+fn install_hybrid_verify_policy() {
+    let client = test_client_signing_key();
+    let pq_sk = derive_mesh_mldsa_key(&client);
+    let pq_vk = hyprstream_rpc::crypto::pq::ml_dsa_vk_from_bytes(
+        &hyprstream_rpc::crypto::pq::ml_dsa_sk_to_vk_bytes(&pq_sk),
+    )
+    .expect("derived test client ML-DSA key");
+    let mut store = KeyedPqTrustStore::new();
+    store.bind(client.verifying_key().to_bytes(), &pq_vk);
     let _ = hyprstream_rpc::envelope::install_verify_config(
         hyprstream_rpc::envelope::EnvelopeVerifyConfig {
-            policy: hyprstream_rpc::crypto::CryptoPolicy::Classical,
-            pq_store: None,
+            policy: hyprstream_rpc::crypto::CryptoPolicy::Hybrid,
+            pq_store: Some(Arc::new(store)),
         },
     );
 }
@@ -381,7 +391,7 @@ impl RequestService for RegistryService {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rpc_round_trip_model_status_and_registry_list_over_iroh() -> Result<()> {
-    install_classical_verify_policy();
+    install_hybrid_verify_policy();
 
     // ─── Server: bind Iroh substrate serving `hyprstream-rpc/1` ──────────────
     //
@@ -434,7 +444,7 @@ async fn rpc_round_trip_model_status_and_registry_list_over_iroh() -> Result<()>
     let request_kem = request_kem_store_for(&server_signing)?;
     let rpc: Arc<dyn hyprstream_rpc::rpc_client::RpcClient> = dial_with_crypto_stores(
         &target,
-        LocalSigner::new(fresh_signing_key()),
+        LocalSigner::new(test_client_signing_key()),
         Some(server_vk),
         None,
         Some(request_kem),
@@ -475,7 +485,7 @@ async fn rpc_round_trip_model_status_and_registry_list_over_iroh() -> Result<()>
             .connect(server_addr, ALPN_HYPRSTREAM_RPC)
             .await?;
         let explicit_rpc = RpcClientImpl::new(
-            LocalSigner::new(fresh_signing_key()),
+            LocalSigner::new(test_client_signing_key()),
             IrohTransport::new(conn),
             Some(server_vk),
         )
@@ -618,7 +628,7 @@ async fn anonymous_moq_handshake_over_iroh_is_rejected() -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn one_substrate_serves_rpc_and_rejects_anonymous_moq() -> Result<()> {
-    install_classical_verify_policy();
+    install_hybrid_verify_policy();
 
     // ─── Server: one substrate, two real handlers ───────────────────────────
     let shared = OriginShared::new();
@@ -650,7 +660,7 @@ async fn one_substrate_serves_rpc_and_rejects_anonymous_moq() -> Result<()> {
     let request_kem = request_kem_store_for(&server_signing)?;
     let rpc: Arc<dyn hyprstream_rpc::rpc_client::RpcClient> = dial_with_crypto_stores(
         &target,
-        LocalSigner::new(fresh_signing_key()),
+        LocalSigner::new(test_client_signing_key()),
         Some(server_vk),
         None,
         Some(request_kem),

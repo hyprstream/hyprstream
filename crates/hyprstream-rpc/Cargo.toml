@@ -72,6 +72,8 @@ wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
 js-sys = "0.3"
 web-sys = { version = "0.3.64", features = [
+  "Window", "Response", "Headers", "Request", "RequestInit", "RequestCache",
+  "RequestCredentials", "RequestRedirect",
   "WebTransport", "WebTransportOptions", "WebTransportHash",
   "WebTransportBidirectionalStream",
   "ReadableStream", "ReadableStreamDefaultReader",
@@ -155,9 +157,12 @@ systemd = { version = "0.10", optional = true }
 default = []
 fips = ["p256", "hmac", "hyprstream-crypto/fips"]  # FIPS mode uses P-256 + HMAC-SHA256 (hkdf is always enabled)
 # `pq-hybrid` is retained as a NO-OP alias for source/build compatibility.
-# Post-quantum primitives (ML-DSA-65 + ML-KEM-768) are now ALWAYS compiled;
-# Classical vs Hybrid is selected at runtime via `crypto::CryptoPolicy`. See M3.
+# Post-quantum primitives (ML-DSA-65 + ML-KEM-768) are always compiled and the
+# production policy is the pinned Hybrid suite.
 pq-hybrid = []
+# Enables EdDSA-only compatibility fixtures for downstream tests. Never enable
+# this feature in a production artifact.
+test-classical-policy = []
 systemd = ["dep:systemd"]
 
 [build-dependencies]

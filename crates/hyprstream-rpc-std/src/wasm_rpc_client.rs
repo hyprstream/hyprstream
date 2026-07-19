@@ -12,7 +12,14 @@
 
 #![cfg(target_arch = "wasm32")]
 
+use std::sync::Arc;
+
 use wasm_bindgen::prelude::*;
+
+use hyprstream_rpc::browser_provisioning::{
+    fetch_browser_provisioning, BrowserCarrierProfile, BrowserProvisioningGuard,
+    BrowserProvisioningRequest,
+};
 
 use hyprstream_rpc::crypto::VerifyingKey;
 use hyprstream_rpc::rpc_client::{CallOptions, RpcClientImpl};
@@ -57,11 +64,11 @@ impl WasmWtConnection {
     /// - `url`: WebTransport URL (e.g., `https://host:port/wt`)
     /// - `cert_hash`: Optional base64-encoded SHA-256 certificate hash for pinning
     #[wasm_bindgen(constructor)]
-    pub async fn connect(url: &str, cert_hash: Option<String>) -> Result<WasmWtConnection, JsError> {
-        let transport = WtConnection::connect(url, cert_hash.as_deref())
-            .await
-            .map_err(|e| JsError::new(&e.to_string()))?;
-        Ok(Self { inner: transport })
+    pub async fn connect(
+        _url: &str,
+        _cert_hash: Option<String>,) -> Result<WasmWtConnection, JsError> {
+        Err( JsError::new(
+            "unprovisioned browser WebTransport dial is disabled; use RpcClient.connectResolved",))
     }
 }
 
@@ -88,6 +95,24 @@ pub struct WasmRpcClient {
     inner: RpcClientImpl<JsSigner, WtConnection>,
 }
 
+fn call_options(jwt: Option<String>, delegated_bearer: Option<String>) -> CallOptions {
+    let options = CallOptions::new();
+    let options = match jwt {
+        Some(token) => options.jwt(token),
+        None => options,
+    };
+    match delegated_bearer {
+        Some(bearer) => options.delegated_bearer(bearer),
+        None => options,
+    }
+}
+
+fn fixed_ephemeral_pubkey(ephemeral_pubkey: &[u8]) -> Result<[u8; 32], JsError> {
+    ephemeral_pubkey
+        .try_into()
+        .map_err(|_| JsError::new("ephemeral_pubkey must be 32 bytes"))
+}
+
 #[wasm_bindgen(js_class = "RpcClient")]
 impl WasmRpcClient {
     /// Create a new RPC client with a pre-built transport connection.
@@ -112,7 +137,8 @@ impl WasmRpcClient {
                 let arr: [u8; 32] = bytes.try_into()
                     .map_err(|_| JsError::new("server_verifying_key must be 32 bytes"))?;
                 Some(VerifyingKey::from_bytes(&arr)
-                    .map_err(|e| JsError::new(&format!("invalid server verifying key: {}", e)))?)
+                    .map_err(|e| { JsError::new(&format!("invalid server verifying key: {}", e))
+                    })?)
             }
             None => None,
         };
@@ -136,6 +162,59 @@ impl WasmRpcClient {
         let conn = WasmWtConnection::connect(url, cert_hash).await?;
         // conn is moved into Self::new()
         Self::new(conn, signer_pubkey, sign_fn, server_verifying_key)
+    }
+
+    /// Resolve accepted-current authority, then dial and seal only to the
+    /// bound owned WebTransport reach. Every call re-fetches before sealing.
+    #[wasm_bindgen(js_name = "connectResolved")]
+    pub async fn connect_resolved(
+        provisioning_origin: &str,
+        service_name: &str,
+        signer_pubkey: &[u8],
+        sign_fn: js_sys::Function,
+        signer_ml_dsa65_pubkey: &[u8],
+        pq_sign_fn: js_sys::Function,
+        jwt: Option<String>,
+    ) -> Result<WasmRpcClient, JsError> {
+        let expected = BrowserProvisioningRequest::new(
+            service_name,
+            "hyprstream-rpc/1",
+            service_name,
+            BrowserCarrierProfile::OwnedHybridWebTransport,
+        )
+        .map_err(|error| JsError::new(&error.to_string()))?;
+        let provisioned = fetch_browser_provisioning(provisioning_origin, &expected)
+            .await
+            .map_err(|error| JsError::new(&error.to_string()))?;
+        let transport = WtConnection::connect_with_certificate_hashes(
+            provisioned.webtransport_url(),
+            provisioned.certificate_hashes(),
+        )
+        .await
+        .map_err(|error| JsError::new(&error.to_string()))?;
+        let signer =
+            JsSigner::new_hybrid(signer_pubkey, sign_fn, signer_ml_dsa65_pubkey, pq_sign_fn)
+                .map_err(|error| JsError::new(&error.to_string()))?;
+        let (kem, pq) = provisioned
+            .crypto_stores()
+            .map_err(|error| JsError::new(&error.to_string()))?;
+        let guard =
+            BrowserProvisioningGuard::new(provisioning_origin, expected, provisioned.clone());
+        let binding = provisioned
+            .request_binding()
+            .map_err(|error| JsError::new(&error.to_string()))?;
+        let client =
+            RpcClientImpl::new(signer, transport, Some(provisioned.server_verifying_key()))
+                .with_request_kem_store(kem)
+                .with_response_pq_store(pq)
+                .with_pre_seal_guard(Arc::new(guard))
+                .with_browser_provisioning_binding(binding)
+                .map_err(|error| JsError::new(&error.to_string()))?;
+        let client = match jwt {
+            Some(token) => client.with_default_jwt(token),
+            None => client,
+        };
+        Ok(Self { inner: client })
     }
 
     /// Builder: set a dynamic token provider called on every RPC request.
@@ -170,6 +249,24 @@ impl WasmRpcClient {
             .map_err(|e| JsError::new(&e.to_string()))
     }
 
+    /// Send a generated request with explicit canonical service and method metadata.
+    #[wasm_bindgen(js_name = "callForServiceWithMethod")]
+    pub async fn call_for_service_with_method(
+        &self,
+        service_name: &str,
+        method_discriminator: u16,
+        payload: &[u8],
+    ) -> Result<Vec<u8>, JsError> {
+        self.inner
+            .call_for_service_with_method(
+                service_name,
+                method_discriminator,
+                payload.to_vec(),
+            )
+            .await
+            .map_err(|error| JsError::new(&error.to_string()))
+    }
+
     /// Send a request with per-call authentication options.
     ///
     /// - `payload`: Cap'n Proto request bytes
@@ -182,18 +279,32 @@ impl WasmRpcClient {
         jwt: Option<String>,
         delegated_bearer: Option<String>,
     ) -> Result<Vec<u8>, JsError> {
-        let options = CallOptions::new();
-        let options = match jwt {
-            Some(t) => options.jwt(t),
-            None => options,
-        };
-        let options = match delegated_bearer {
-            Some(b) => options.delegated_bearer(b),
-            None => options,
-        };
+        let options = call_options(jwt, delegated_bearer);
         self.inner.call_with_options(payload.to_vec(), options)
             .await
             .map_err(|e| JsError::new(&e.to_string()))
+    }
+
+    /// Send an option-bearing generated request with explicit service and method metadata.
+    #[wasm_bindgen(js_name = "callWithOptionsForServiceWithMethod")]
+    pub async fn call_with_options_for_service_with_method(
+        &self,
+        service_name: &str,
+        method_discriminator: u16,
+        payload: &[u8],
+        jwt: Option<String>,
+        delegated_bearer: Option<String>,
+    ) -> Result<Vec<u8>, JsError> {
+        let options = call_options(jwt, delegated_bearer);
+        self.inner
+            .call_with_options_for_service_with_method(
+                service_name,
+                method_discriminator,
+                payload.to_vec(),
+                options,
+            )
+            .await
+            .map_err(|error| JsError::new(&error.to_string()))
     }
 
     /// Send a streaming request with ephemeral DH pubkey.
@@ -203,15 +314,31 @@ impl WasmRpcClient {
         payload: &[u8],
         ephemeral_pubkey: &[u8],
     ) -> Result<Vec<u8>, JsError> {
-        let mut epk = [0u8; 32];
-        if ephemeral_pubkey.len() != 32 {
-            return Err(JsError::new("ephemeral_pubkey must be 32 bytes"));
-        }
-        epk.copy_from_slice(ephemeral_pubkey);
-
+        let epk = fixed_ephemeral_pubkey(ephemeral_pubkey)?;
         self.inner.call_streaming(payload.to_vec(), epk)
             .await
             .map_err(|e| JsError::new(&e.to_string()))
+    }
+
+    /// Send a generated streaming request with explicit service and method metadata.
+    #[wasm_bindgen(js_name = "callStreamingForServiceWithMethod")]
+    pub async fn call_streaming_for_service_with_method(
+        &self,
+        service_name: &str,
+        method_discriminator: u16,
+        payload: &[u8],
+        ephemeral_pubkey: &[u8],
+    ) -> Result<Vec<u8>, JsError> {
+        let epk = fixed_ephemeral_pubkey(ephemeral_pubkey)?;
+        self.inner
+            .call_streaming_for_service_with_method(
+                service_name,
+                method_discriminator,
+                payload.to_vec(),
+                epk,
+            )
+            .await
+            .map_err(|error| JsError::new(&error.to_string()))
     }
 
     /// Get the next request ID.
@@ -223,6 +350,47 @@ impl WasmRpcClient {
     /// Close the WebTransport connection.
     pub fn close(&self) {
         self.inner.transport.close();
+    }
+
+    /// Open a generated verified stream with explicit service and method metadata.
+    #[wasm_bindgen(js_name = "openStreamForServiceWithMethod")]
+    pub async fn open_stream_for_service_with_method(
+        &self,
+        service_name: &str,
+        method_discriminator: u16,
+        payload: &[u8],
+    ) -> Result<WasmStreamHandle, JsError> {
+        let handle = self.inner
+            .open_stream_for_service_with_method(
+                service_name,
+                method_discriminator,
+                payload.to_vec(),
+            )
+            .await
+            .map_err(|error| JsError::new(&error.to_string()))?;
+        Ok(WasmStreamHandle { inner: handle })
+    }
+
+    /// Open an option-bearing generated stream with explicit service and method metadata.
+    #[wasm_bindgen(js_name = "openStreamWithOptionsForServiceWithMethod")]
+    pub async fn open_stream_with_options_for_service_with_method(
+        &self,
+        service_name: &str,
+        method_discriminator: u16,
+        payload: &[u8],
+        jwt: Option<String>,
+        delegated_bearer: Option<String>,
+    ) -> Result<WasmStreamHandle, JsError> {
+        let handle = self.inner
+            .open_stream_with_options_for_service_with_method(
+                service_name,
+                method_discriminator,
+                payload.to_vec(),
+                call_options(jwt, delegated_bearer),
+            )
+            .await
+            .map_err(|error| JsError::new(&error.to_string()))?;
+        Ok(WasmStreamHandle { inner: handle })
     }
 
     /// Open a verified streaming subscription.
@@ -257,15 +425,13 @@ impl WasmStreamHandle {
     #[wasm_bindgen(js_name = "nextPayload")]
     pub async fn next_payload(&mut self) -> Result<JsValue, JsError> {
         match self.inner.next_payload().await {
-            Ok(Some(StreamPayload::Data(data))) => {
-                Ok(js_sys::Uint8Array::from(&data[..]).into())
-            }
+            Ok(Some(StreamPayload::Data(data))) =>
+                Ok(js_sys::Uint8Array::from(&data[..]).into()),
             Ok(Some(StreamPayload::Complete(meta))) => {
                 Ok(js_sys::Uint8Array::from(&meta[..]).into())
             }
-            Ok(Some(StreamPayload::Error(msg))) => {
-                Err(JsError::new(&msg))
-            }
+            Ok(Some(StreamPayload::Error(msg))) =>
+                Err(JsError::new(&msg)),
             Ok(Some(StreamPayload::Tagged { payload, .. })) => {
                 Ok(js_sys::Uint8Array::from(&payload[..]).into())
             }

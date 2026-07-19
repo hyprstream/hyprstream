@@ -376,6 +376,27 @@ impl RpcClient for ResolvedRpcClient {
         })
         .await
     }
+    async fn call_for_service_with_method(
+        &self,
+        service: &str,
+        method_discriminator: u16,
+        payload: Vec<u8>,
+    ) -> anyhow::Result<Vec<u8>> {
+        anyhow::ensure!(
+            service == self.service_name,
+            "generated service authority mismatch"
+        );
+        let service = service.to_owned();
+        self.attempt(|c| {
+            let p = payload.clone();
+            let s = service.clone();
+            async move {
+                c.call_for_service_with_method(&s, method_discriminator, p)
+                    .await
+            }
+        })
+        .await
+    }
     async fn call_with_options(
         &self,
         payload: Vec<u8>,
@@ -433,6 +454,26 @@ impl RpcClient for ResolvedRpcClient {
             let p = payload.clone();
             let s = service.clone();
             async move { c.call_streaming_for_service(&s, p, ephemeral).await }
+        })
+        .await
+    }
+    async fn call_streaming_for_service_with_method(
+        &self,
+        service: &str,
+        method_discriminator: u16,
+        payload: Vec<u8>,
+        ephemeral: [u8; 32],
+    ) -> anyhow::Result<Vec<u8>> {
+        anyhow::ensure!(
+            service == self.service_name,
+            "generated service authority mismatch"
+        );
+        let service = service.to_owned();
+        self.attempt(|c| {
+            let p = payload.clone();
+            let s = service.clone();
+            async move {
+                c.call_streaming_for_service_with_method(&s, method_discriminator, p, ephemeral).await }
         })
         .await
     }

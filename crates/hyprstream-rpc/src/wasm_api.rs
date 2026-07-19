@@ -281,7 +281,7 @@ pub fn register_pq_trust(ed25519_pubkey: &[u8], ml_dsa_vk: &[u8]) -> Result<(), 
 }
 
 /// Remove a peer's ML-DSA-65 binding. After this call, envelopes from that
-/// signer are accepted under Classical (EdDSA-only) policy.
+/// signer fail verification until a new binding is registered.
 ///
 /// # Arguments
 ///
@@ -301,7 +301,8 @@ pub fn unregister_pq_trust(ed25519_pubkey: &[u8]) -> Result<(), JsError> {
 
 /// Clear all registered PQ trust bindings.
 ///
-/// After this call, all signers fall back to Classical (EdDSA-only) policy.
+/// After this call, all envelope verification fails closed until bindings are
+/// registered again.
 #[wasm_bindgen]
 pub fn clear_pq_trust() {
     WASM_PQ_BINDINGS.with(|bindings| bindings.borrow_mut().clear());
@@ -309,11 +310,9 @@ pub fn clear_pq_trust() {
 
 /// Verify a signed envelope (for browser-side services receiving requests from server).
 ///
-/// When the signer's ML-DSA-65 key has been registered via `register_pq_trust`,
-/// Hybrid policy is enforced: the outer ML-DSA-65 layer is required and an
-/// envelope that omits it is rejected. For signers without a registered ML-DSA
-/// key, Classical (EdDSA-only) policy applies — documented WNS until the
-/// browser trust store is provisioned with the peer's PQ key bundle.
+/// The signer's ML-DSA-65 key must be registered via `register_pq_trust` and
+/// the outer signature must verify. A missing binding or outer layer is a hard
+/// error; browser verification has no Ed25519-only fallback.
 ///
 /// # Arguments
 ///
@@ -342,11 +341,9 @@ pub fn verify_signed_envelope(
 
     let nonce_cache = WASM_NONCE_CACHE.with(|c| c.clone());
 
-    // Build a local PqTrustStore from WASM_PQ_BINDINGS. Track whether the
-    // specific signer has a registered ML-DSA binding; only in that case do we
-    // upgrade to Hybrid (enforcing the outer SNS layer). Signers without a
-    // registered key continue under Classical — documented WNS until their PQ
-    // key is provisioned in the browser trust store. (#158)
+    // Build a local PqTrustStore from WASM_PQ_BINDINGS. The expected signer
+    // must have an anchored ML-DSA binding; missing PQ material is a hard
+    // verification error, never an in-band downgrade to Ed25519-only.
     let mut pq_store = KeyedPqTrustStore::new();
     let signer_has_pq = WASM_PQ_BINDINGS.with(|bindings| {
         let b = bindings.borrow();
@@ -362,14 +359,13 @@ pub fn verify_signed_envelope(
         found
     });
 
-    let opts = UnwrapOptions::fixed_signer(&verifying_key, &*nonce_cache);
-    let opts = if signer_has_pq {
-        // Hybrid: outer ML-DSA-65 required for this signer (policy default is already Hybrid).
-        opts.with_pq_store(&pq_store)
-    } else {
-        // No PQ binding: classical fallback (documented WNS for unprovisioned signers).
-        opts.classical()
-    };
+    if !signer_has_pq {
+        return Err(JsError::new(
+            "expected signer has no anchored ML-DSA-65 verification key",
+        ));
+    }
+    let opts = UnwrapOptions::fixed_signer(&verifying_key, &*nonce_cache)
+        .with_pq_store(&pq_store);
 
     let (_signed, payload) = unwrap_and_verify(envelope_bytes, &opts)
         .map_err(|e| JsError::new(&format!("envelope verification failed: {}", e)))?;
@@ -907,4 +903,3 @@ pub fn generate_aes_nonce() -> Vec<u8> {
     rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut nonce);
     nonce.to_vec()
 }
-

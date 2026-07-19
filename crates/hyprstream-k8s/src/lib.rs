@@ -47,6 +47,18 @@ pub mod models;
 pub mod serving;
 pub mod training;
 
+/// CRD → grant compilation (#929): a [`mesh::TenantBinding`]'s authorable
+/// [`mesh::TenantEntitlement`] compiles into an issuer-signed UCAN grant + an
+/// `ai.hyprstream.ledger.allocation` record that lands in the tenant's
+/// inventory, plus the verification contract enforcers
+/// (#781/#787/#790/#793/#794/#527) will consume.
+///
+/// Gated behind `grant` because it needs the UCAN/COSE primitives
+/// (`hyprstream-rpc`) and the allocation lexicon (`hyprstream-pds`); the CRD
+/// *types* it lowers never require them.
+#[cfg(feature = "grant")]
+pub mod grant;
+
 #[cfg(feature = "k8s")]
 pub mod install;
 #[cfg(feature = "k8s")]
@@ -68,7 +80,9 @@ pub use ::kube;
 #[cfg(feature = "k8s")]
 pub mod vfs;
 
-pub use mesh::{TenantBinding, TenantBindingSpec, TenantBindingStatus};
+pub use mesh::{
+    TenantBinding, TenantBindingSpec, TenantBindingStatus, TenantEntitlement, TenantGrantClass,
+};
 pub use models::{Adapter, AdapterSpec, AdapterStatus, Model, ModelSpec, ModelStage, ModelStatus};
 pub use serving::{InferenceService, InferenceServiceSpec, InferenceServiceStatus, Statefulness};
 pub use training::{ResourceSpec, TrainingRun, TrainingRunSpec, TrainingRunStatus};

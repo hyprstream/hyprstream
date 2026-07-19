@@ -25,6 +25,14 @@ use crate::transport_traits::{Signer, Transport};
 
 type TokenProviderBox = Arc<dyn Fn() -> Option<String> + Send + Sync>;
 
+/// Revalidates external resolution authority immediately before envelope
+/// construction and sealing.
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+pub trait PreSealGuard: Send + Sync {
+    async fn ensure_current(&self) -> Result<()>;
+}
+
 /// Non-cloneable, non-serializable one-call response decapsulation material.
 /// The component secret bytes are `Zeroizing` inside `RecipientKeypair` and
 /// are dropped immediately after the sole response-open attempt.
@@ -239,6 +247,8 @@ pub struct RpcClientImpl<S: Signer, T: Transport + 'static> {
     /// envelopes for carriers that forbid cleartext. Bindings are established
     /// out-of-band by DID keyAgreement / peer attestation; absence fails closed.
     request_kem_store: Option<Arc<dyn KemTrustStore>>,
+    pre_seal_guard: Option<Arc<dyn PreSealGuard>>,
+    browser_provisioning_binding: Option<crate::browser_provisioning::BrowserRequestBinding>,
     #[cfg(test)]
     response_secret_drop_probe: Option<Arc<std::sync::atomic::AtomicUsize>>,
 }
@@ -258,6 +268,8 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
             response_verify_policy: None,
             response_pq_store: None,
             request_kem_store: None,
+            pre_seal_guard: None,
+            browser_provisioning_binding: None,
             #[cfg(test)]
             response_secret_drop_probe: None,
         }
@@ -282,6 +294,20 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
     pub fn with_request_kem_store(mut self, kem_store: Arc<dyn KemTrustStore>) -> Self {
         self.request_kem_store = Some(kem_store);
         self
+    }
+
+    pub fn with_pre_seal_guard(mut self, guard: Arc<dyn PreSealGuard>) -> Self {
+        self.pre_seal_guard = Some(guard);
+        self
+    }
+
+    pub fn with_browser_provisioning_binding(
+        mut self,
+        binding: crate::browser_provisioning::BrowserRequestBinding,
+    ) -> Result<Self> {
+        binding.validate_shape()?;
+        self.browser_provisioning_binding = Some(binding);
+        Ok(self)
     }
 
     #[cfg(test)]
@@ -328,7 +354,7 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
     /// Send a request and return the verified, unwrapped response payload.
     /// Uses the client's default JWT.
     pub async fn call(&self, payload: Vec<u8>) -> Result<Vec<u8>> {
-        self.call_bound(payload, None).await
+        self.call_bound(payload, None, None).await
     }
 
     /// Send a request bound to a canonical destination service. Generated
@@ -338,19 +364,33 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
         service_domain: &str,
         payload: Vec<u8>,
     ) -> Result<Vec<u8>> {
-        self.call_bound(payload, Some(service_domain)).await
+        self.call_bound(payload, Some(service_domain), None).await
     }
 
-    async fn call_bound(&self, payload: Vec<u8>, service_domain: Option<&str>) -> Result<Vec<u8>> {
+    /// Send a generated request with an explicit schema method commitment.
+    pub async fn call_for_service_with_method(
+        &self,
+        service_domain: &str,
+        method_discriminator: u16,
+        payload: Vec<u8>,
+    ) -> Result<Vec<u8>> {
+        self.call_bound(payload, Some(service_domain), Some(method_discriminator)).await
+    }
+
+    async fn call_bound(&self, payload: Vec<u8>, service_domain: Option<&str>,
+        method_discriminator: Option<u16>,) -> Result<Vec<u8>> {
+        self.ensure_pre_seal_current().await?;
         let request_id = self.next_id();
         let (signed_bytes, pending) = self
             .sign_envelope(
                 request_id,
                 payload,
                 None,
+                None,
                 self.effective_jwt(),
                 None,
                 service_domain,
+                method_discriminator,
             )
             .await?;
         let timeout = self.calculate_timeout();
@@ -367,7 +407,7 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
         payload: Vec<u8>,
         ephemeral_pubkey: [u8; 32],
     ) -> Result<Vec<u8>> {
-        self.call_streaming_bound(payload, ephemeral_pubkey, None)
+        self.call_streaming_bound(payload, ephemeral_pubkey, None, None)
             .await
     }
 
@@ -378,7 +418,23 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
         payload: Vec<u8>,
         ephemeral_pubkey: [u8; 32],
     ) -> Result<Vec<u8>> {
-        self.call_streaming_bound(payload, ephemeral_pubkey, Some(service_domain))
+        self.call_streaming_bound(payload, ephemeral_pubkey, Some(service_domain), None)
+            .await
+    }
+
+    /// Send a generated streaming request with an explicit schema method commitment.
+    pub async fn call_streaming_for_service_with_method(
+        &self,
+        service_domain: &str,
+        method_discriminator: u16,
+        payload: Vec<u8>,
+        ephemeral_pubkey: [u8; 32],
+    ) -> Result<Vec<u8>> {
+        self.call_streaming_bound(
+            payload,
+            ephemeral_pubkey,
+            Some(service_domain),
+            Some(method_discriminator),)
             .await
     }
 
@@ -387,16 +443,52 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
         payload: Vec<u8>,
         ephemeral_pubkey: [u8; 32],
         service_domain: Option<&str>,
+        method_discriminator: Option<u16>,
     ) -> Result<Vec<u8>> {
+        self.ensure_pre_seal_current().await?;
         let request_id = self.next_id();
         let (signed_bytes, pending) = self
             .sign_envelope(
                 request_id,
                 payload,
                 Some(ephemeral_pubkey),
+                None,
                 self.effective_jwt(),
                 None,
                 service_domain,
+                method_discriminator,
+            )
+            .await?;
+        let timeout = self.calculate_timeout();
+        let response_bytes = self.transport.send(signed_bytes, timeout).await?;
+        let (_req_id, inner) = self.unwrap_response(&response_bytes, request_id, pending)?;
+        Ok(inner)
+    }
+
+    /// Send an identified stream setup using the pinned classical+ML-KEM
+    /// recipient.  The caller retains the matching keypair and combines the
+    /// returned `StreamInfo.kemCiphertexts` with its accepted-current
+    /// [`IdentifiedStreamBinding`] before opening the stream.
+    pub async fn call_streaming_identified_for_service(
+        &self,
+        service_domain: &str,
+        payload: Vec<u8>,
+        recipient: crate::crypto::hybrid_kem::RecipientPublic,
+    ) -> Result<Vec<u8>> {
+        if recipient.suite_id != crate::stream_epoch::IDENTIFIED_STREAM_SUITE {
+            anyhow::bail!("identified stream recipient does not use the pinned HyKEM suite");
+        }
+        let request_id = self.next_id();
+        let (signed_bytes, pending) = self
+            .sign_envelope(
+                request_id,
+                payload,
+                None,
+                Some(recipient),
+                self.effective_jwt(),
+                None,
+                Some(service_domain),
+                None,
             )
             .await?;
         let timeout = self.calculate_timeout();
@@ -414,8 +506,28 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
         ephemeral_pubkey: [u8; 32],
         options: CallOptions,
     ) -> Result<Vec<u8>> {
-        self.call_streaming_with_options_bound(payload, ephemeral_pubkey, options, None)
+        self.call_streaming_with_options_bound(payload, ephemeral_pubkey, options, None, None)
             .await
+    }
+
+
+    /// Send an option-bearing generated streaming request bound to its service and method.
+    pub async fn call_streaming_with_options_for_service_with_method(
+        &self,
+        service_domain: &str,
+        method_discriminator: u16,
+        payload: Vec<u8>,
+        ephemeral_pubkey: [u8; 32],
+        options: CallOptions,
+    ) -> Result<Vec<u8>> {
+        self.call_streaming_with_options_bound(
+            payload,
+            ephemeral_pubkey,
+            options,
+            Some(service_domain),
+            Some(method_discriminator),
+        )
+        .await
     }
 
     async fn call_streaming_with_options_bound(
@@ -424,7 +536,9 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
         ephemeral_pubkey: [u8; 32],
         options: CallOptions,
         service_domain: Option<&str>,
+        method_discriminator: Option<u16>,
     ) -> Result<Vec<u8>> {
+        self.ensure_pre_seal_current().await?;
         let request_id = self.next_id();
         let jwt = options.jwt.or_else(|| self.effective_jwt());
         let (signed_bytes, pending) = self
@@ -432,9 +546,11 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
                 request_id,
                 payload,
                 Some(ephemeral_pubkey),
+                None,
                 jwt,
                 options.delegated_bearer,
                 service_domain,
+                method_discriminator,
             )
             .await?;
         let timeout = self.calculate_timeout();
@@ -452,7 +568,7 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
         payload: Vec<u8>,
         options: CallOptions,
     ) -> Result<Vec<u8>> {
-        self.call_with_options_bound(payload, options, None).await
+        self.call_with_options_bound(payload, options, None, None).await
     }
 
     /// Send an option-bearing request bound to a canonical destination.
@@ -462,8 +578,26 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
         payload: Vec<u8>,
         options: CallOptions,
     ) -> Result<Vec<u8>> {
-        self.call_with_options_bound(payload, options, Some(service_domain))
+        self.call_with_options_bound(payload, options, Some(service_domain), None)
             .await
+    }
+
+
+    /// Send an option-bearing generated request bound to its service and method.
+    pub async fn call_with_options_for_service_with_method(
+        &self,
+        service_domain: &str,
+        method_discriminator: u16,
+        payload: Vec<u8>,
+        options: CallOptions,
+    ) -> Result<Vec<u8>> {
+        self.call_with_options_bound(
+            payload,
+            options,
+            Some(service_domain),
+            Some(method_discriminator),
+        )
+        .await
     }
 
     async fn call_with_options_bound(
@@ -471,7 +605,9 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
         payload: Vec<u8>,
         options: CallOptions,
         service_domain: Option<&str>,
+        method_discriminator: Option<u16>,
     ) -> Result<Vec<u8>> {
+        self.ensure_pre_seal_current().await?;
         let request_id = self.next_id();
         let jwt = options.jwt.or_else(|| self.effective_jwt());
         let (signed_bytes, pending) = self
@@ -479,9 +615,11 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
                 request_id,
                 payload,
                 None,
+                None,
                 jwt,
                 options.delegated_bearer,
                 service_domain,
+                method_discriminator,
             )
             .await?;
         let timeout = self.calculate_timeout();
@@ -493,6 +631,13 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
     /// Get the next monotonically increasing request ID.
     pub fn next_id(&self) -> u64 {
         self.request_id.fetch_add(1, Ordering::Relaxed)
+    }
+
+    async fn ensure_pre_seal_current(&self) -> Result<()> {
+        if let Some(guard) = &self.pre_seal_guard {
+            guard.ensure_current().await?;
+        }
+        Ok(())
     }
 
     /// Unwrap + verify a `ResponseEnvelope` (#275/#277).
@@ -548,7 +693,7 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
             pending,
             self.response_pq_store.as_deref(),
             self.response_verify_policy
-                .unwrap_or(crate::crypto::CryptoPolicy::Classical),
+                .unwrap_or(crate::crypto::CryptoPolicy::Hybrid),
         )
     }
 
@@ -608,10 +753,27 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
         request_id: u64,
         payload: Vec<u8>,
         ephemeral_pubkey: Option<[u8; 32]>,
+        stream_kem_recipient: Option<crate::crypto::hybrid_kem::RecipientPublic>,
         jwt: Option<String>,
         delegated_bearer: Option<String>,
         service_domain: Option<&str>,
+        method_discriminator: Option<u16>,
     ) -> Result<(Vec<u8>, Option<PendingResponse>)> {
+        let inferred_method = if self.browser_provisioning_binding.is_some()
+            && method_discriminator.is_none()
+        {
+            Some(crate::browser_provisioning::canonical_method_discriminator(
+                &payload,
+            )?)
+        } else {
+            None
+        };
+        let service_domain = service_domain.or_else(|| {
+            self.browser_provisioning_binding
+                .as_ref()
+                .map(|binding| binding.service_name.as_str())
+        });
+        let method_discriminator = method_discriminator.or(inferred_method);
         let mut envelope = RequestEnvelope::new(payload);
         envelope.request_id = request_id;
         if let Some(token) = jwt {
@@ -623,8 +785,27 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
         if let Some(key) = ephemeral_pubkey {
             envelope = envelope.with_client_dh_public(key);
         }
+        if let Some(recipient) = stream_kem_recipient {
+            envelope = envelope.with_client_kem_public(recipient)?;
+        }
         if let Some(service_domain) = service_domain {
             envelope = envelope.with_service_domain(service_domain)?;
+        }
+        if let Some(binding) = &self.browser_provisioning_binding {
+            let service_domain = service_domain.ok_or_else(|| {
+                anyhow::anyhow!("browser request extension requires a canonical service domain")
+            })?;
+            let method_discriminator = method_discriminator.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "provisioned browser request requires an explicit generated method identifier"
+                )
+            })?;
+            envelope.payload = crate::browser_provisioning::bind_request_payload(
+                binding,
+                request_id,
+                service_domain,
+                method_discriminator,
+                &envelope.payload,)?;
         }
 
         let (pending, encrypted_envelope) = if self.transport.forbids_cleartext_envelope() {
@@ -682,12 +863,11 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
         let ed_pubkey = self.signer.pubkey();
         let signing_data: &[u8] = encrypted_envelope.as_deref().unwrap_or(&canonical);
 
-        if encrypted_envelope.is_some() && self.signer.pq_pubkey().is_none() {
-            anyhow::bail!(
-                "transport forbids cleartext envelopes but signer has no ML-DSA-65 \
-                 key; refusing to emit encrypted envelope without hybrid signature"
-            );
-        }
+        let pq_kid = self.signer.pq_pubkey().ok_or_else(|| {
+            anyhow::anyhow!(
+                "mandatory Hybrid suite requires an ML-DSA-65 signer key; refusing request"
+            )
+        })?;
 
         // Raw EdDSA signature (sig/cnf) retained for signer-pubkey advertisement
         // + the JWT cnf key-binding path.
@@ -703,42 +883,26 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
         // outer ML-DSA-65 layer over `canonical ‖ inner_eddsa_signature` so the
         // inner signature is bound into the outer (Strong-Non-Separable).
         //
-        // Hybrid iff the signer exposes an ML-DSA-65 key. In Hybrid mode the inner
-        // EdDSA layer binds the hybrid-composite alg-id into its AAD (#278), making
-        // it byte-distinct from a Classical inner layer.
-        let hybrid = self.signer.pq_pubkey().is_some();
+        // The inner EdDSA layer always binds the pinned hybrid-composite alg-id
+        // into its AAD (#278). There is no classical request construction path.
+        let hybrid = true;
         let ed_kid = ed_pubkey.to_vec();
         let ed_tbs =
             crate::crypto::cose_sign::inner_tbs(ed_kid.clone(), signing_data, &aad, hybrid);
         let ed_sig = self.signer.sign(&ed_tbs).await?.to_vec();
 
-        // Hybrid component when the signer exposes an ML-DSA-65 key.
-        let pq_entry = if let Some(pq_kid) = self.signer.pq_pubkey() {
-            let pq_tbs =
-                crate::crypto::cose_sign::outer_tbs(pq_kid.clone(), signing_data, &ed_sig, &aad);
-            // The inner EdDSA above was already bound to the hybrid-composite
-            // alg-id (`hybrid = pq_pubkey().is_some()`), so it cannot fall back to
-            // a classical inner. A signer that advertises a PQ key but declines to
-            // sign must therefore be a HARD ERROR, not a silent downgrade that
-            // would desync inner-AAD (hybrid) from outer-presence (none) and make
-            // the peer's inner verification fail (#278 review).
-            let pq_sig = self.signer.pq_sign(&pq_tbs).await?.ok_or_else(|| {
-                anyhow::anyhow!(
-                    "signer exposes a PQ public key but pq_sign() returned no \
-                         signature; refusing to emit a hybrid-bound inner without \
-                         its ML-DSA-65 outer (#278)"
-                )
-            })?;
-            Some((pq_kid, pq_sig))
-        } else {
-            None
-        };
-        let policy = if pq_entry.is_some() {
-            crate::crypto::CryptoPolicy::Hybrid
-        } else {
-            crate::crypto::CryptoPolicy::Classical
-        };
-        let cose = crate::crypto::cose_sign::assemble_composite_nested((ed_kid, ed_sig), pq_entry)?;
+        let pq_tbs =
+            crate::crypto::cose_sign::outer_tbs(pq_kid.clone(), signing_data, &ed_sig, &aad);
+        let pq_sig = self.signer.pq_sign(&pq_tbs).await?.ok_or_else(|| {
+            anyhow::anyhow!(
+                "signer exposes a PQ public key but pq_sign() returned no signature; \
+                 refusing to emit an incomplete mandatory Hybrid composite"
+            )
+        })?;
+        let cose = crate::crypto::cose_sign::assemble_composite_nested(
+            (ed_kid, ed_sig),
+            Some((pq_kid, pq_sig)),
+        )?;
 
         let signed = SignedEnvelope {
             envelope,
@@ -747,7 +911,7 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
             encrypted_envelope,
             client_ephemeral_public: None,
             cose,
-            policy,
+            policy: crate::crypto::CryptoPolicy::Hybrid,
             pq_kem_ciphertext: None,
         };
 
@@ -794,6 +958,31 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
         StreamHandleImpl::open(&self.transport, stream_info, &secret_bytes, &pub_bytes).await
     }
 
+    /// Open a generated verified stream bound to its canonical service and method.
+    #[cfg(not(feature = "fips"))]
+    pub async fn open_stream_for_service_with_method(
+        &self,
+        service_domain: &str,
+        method_discriminator: u16,
+        payload: Vec<u8>,
+    ) -> Result<StreamHandleImpl<T>> {
+        use crate::crypto::generate_ephemeral_keypair;
+
+        let (secret, public) = generate_ephemeral_keypair();
+        let pub_bytes = public.to_bytes();
+        let response = self
+            .call_streaming_for_service_with_method(
+                service_domain,
+                method_discriminator,
+                payload,
+                pub_bytes,
+            )
+            .await?;
+        let stream_info = parse_stream_info(&response)?;
+        let secret_bytes = secret.scalar().to_bytes();
+        StreamHandleImpl::open(&self.transport, stream_info, &secret_bytes, &pub_bytes).await
+    }
+
     /// Open a verified streaming subscription with per-call authentication options.
     ///
     /// Same as `open_stream` but passes per-call JWT through the streaming
@@ -817,6 +1006,33 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
         let secret_bytes = secret.scalar().to_bytes();
         StreamHandleImpl::open(&self.transport, stream_info, &secret_bytes, &pub_bytes).await
     }
+    /// Open an option-bearing generated stream bound to its canonical service and method.
+    #[cfg(not(feature = "fips"))]
+    pub async fn open_stream_with_options_for_service_with_method(
+        &self,
+        service_domain: &str,
+        method_discriminator: u16,
+        payload: Vec<u8>,
+        options: CallOptions,
+    ) -> Result<StreamHandleImpl<T>> {
+        use crate::crypto::generate_ephemeral_keypair;
+
+        let (secret, public) = generate_ephemeral_keypair();
+        let pub_bytes = public.to_bytes();
+        let response = self
+            .call_streaming_with_options_for_service_with_method(
+                service_domain,
+                method_discriminator,
+                payload,
+                pub_bytes,
+                options,
+            )
+            .await?;
+        let stream_info = parse_stream_info(&response)?;
+        let secret_bytes = secret.scalar().to_bytes();
+        StreamHandleImpl::open(&self.transport, stream_info, &secret_bytes, &pub_bytes).await
+    }
+
     /// Open a verified stream from pre-parsed StreamInfo + ephemeral keys.
     ///
     /// Use when the streaming RPC was already sent (e.g., via dispatch) and
@@ -863,6 +1079,14 @@ pub trait RpcClient: Send + Sync {
     /// Send a request bound to a canonical destination service.
     async fn call_for_service(&self, service_domain: &str, payload: Vec<u8>) -> Result<Vec<u8>>;
 
+    /// Send a generated request with an explicit canonical schema method id.
+    async fn call_for_service_with_method(
+        &self,
+        service_domain: &str,
+        method_discriminator: u16,
+        payload: Vec<u8>,
+    ) -> Result<Vec<u8>>;
+
     /// Send a request with per-call authentication options.
     ///
     /// Uses `options.jwt` if provided, otherwise falls back to the client's
@@ -885,6 +1109,15 @@ pub trait RpcClient: Send + Sync {
     async fn call_streaming_for_service(
         &self,
         service_domain: &str,
+        payload: Vec<u8>,
+        ephemeral_pubkey: [u8; 32],
+    ) -> Result<Vec<u8>>;
+
+    /// Send a generated streaming request with an explicit schema method id.
+    async fn call_streaming_for_service_with_method(
+        &self,
+        service_domain: &str,
+        method_discriminator: u16,
         payload: Vec<u8>,
         ephemeral_pubkey: [u8; 32],
     ) -> Result<Vec<u8>>;
@@ -916,6 +1149,21 @@ impl<S: Signer, T: Transport + 'static> RpcClient for RpcClientImpl<S, T> {
         RpcClientImpl::call_for_service(self, service_domain, payload).await
     }
 
+    async fn call_for_service_with_method(
+        &self,
+        service_domain: &str,
+        method_discriminator: u16,
+        payload: Vec<u8>,
+    ) -> Result<Vec<u8>> {
+        RpcClientImpl::call_for_service_with_method(
+            self,
+            service_domain,
+            method_discriminator,
+            payload,
+        )
+        .await
+    }
+
     async fn call_with_options(&self, payload: Vec<u8>, options: CallOptions) -> Result<Vec<u8>> {
         RpcClientImpl::call_with_options(self, payload, options).await
     }
@@ -945,6 +1193,23 @@ impl<S: Signer, T: Transport + 'static> RpcClient for RpcClientImpl<S, T> {
     ) -> Result<Vec<u8>> {
         RpcClientImpl::call_streaming_for_service(self, service_domain, payload, ephemeral_pubkey)
             .await
+    }
+
+    async fn call_streaming_for_service_with_method(
+        &self,
+        service_domain: &str,
+        method_discriminator: u16,
+        payload: Vec<u8>,
+        ephemeral_pubkey: [u8; 32],
+    ) -> Result<Vec<u8>> {
+        RpcClientImpl::call_streaming_for_service_with_method(
+            self,
+            service_domain,
+            method_discriminator,
+            payload,
+            ephemeral_pubkey,
+        )
+        .await
     }
 
     #[cfg(not(feature = "fips"))]
@@ -989,19 +1254,13 @@ impl<S: Signer, T: Transport + 'static> RpcClient for RpcClientImpl<S, T> {
 #[cfg(all(test, not(target_arch = "wasm32")))]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod request_kem_tests {
-    //! Coverage for the request KEM-store plumbing that `dial_wasm::dial` /
-    //! `dial_wasm::dial_with_kem_store` delegate to.
+    //! Coverage for request KEM-store plumbing and browser-dial defenses.
     //!
-    //! `dial_wasm` is `#![cfg(target_arch = "wasm32")]` and its bodies call
-    //! `WtConnection::connect()` (the browser WebTransport API), so they cannot
-    //! be exercised by native `cargo test`, and the workspace has no
-    //! `wasm-bindgen-test` browser runner. The security-relevant behavior those
-    //! functions delegate to, however — "a cleartext-forbidding carrier with a
-    //! forwarded `#mesh-kem` store encrypts, and with NO store fails closed" —
-    //! lives entirely in `RpcClientImpl::sign_envelope` and is fully testable
-    //! here over a mock forbidding transport. `dial_wasm`'s own logic is the
-    //! same `Some(store) => with_request_kem_store(store)` / `None => client`
-    //! match as native `dial` (already covered by the iroh e2e round-trip).
+    //! `dial_wasm` is `#![cfg(target_arch = "wasm32")]`, so native tests cannot
+    //! invoke its JS signer and WebTransport argument types. The public wasm
+    //! dial seams now return the provisioning-required error before transport
+    //! construction; the common-layer tests below retain defense-in-depth
+    //! coverage for cleartext refusal and encrypted request handling.
 
     use super::*;
     use crate::crypto::hybrid_kem::KeyedKemTrustStore;
@@ -1049,10 +1308,7 @@ mod request_kem_tests {
                 .service_domain
                 .as_deref()
                 .ok_or_else(|| anyhow::anyhow!("test request omitted service domain"))?;
-            self.state
-                .recipients
-                .lock()
-                .push(recipient.encode());
+            self.state.recipients.lock().push(recipient.encode());
             let pq_sk = crate::node_identity::derive_mesh_mldsa_key(&self.server_sk);
             let response = crate::envelope::ResponseEnvelope::new_signed_encrypted(
                 request.request_id,
@@ -1128,6 +1384,16 @@ mod request_kem_tests {
         Arc<LifecycleState>,
         Arc<AtomicUsize>,
     ) {
+        lifecycle_client_with_browser_binding(None)
+    }
+
+    fn lifecycle_client_with_browser_binding(
+        browser_binding: Option<crate::browser_provisioning::BrowserRequestBinding>,
+    ) -> (
+        Arc<RpcClientImpl<LocalSigner, LifecycleTransport>>,
+        Arc<LifecycleState>,
+        Arc<AtomicUsize>,
+    ) {
         let (server_sk, server_vk) = generate_signing_keypair();
         let (client_sk, _client_vk) = generate_signing_keypair();
         let mut kem_store = KeyedKemTrustStore::new();
@@ -1160,6 +1426,12 @@ mod request_kem_tests {
         .with_request_kem_store(Arc::new(kem_store))
         .with_response_pq_store(Arc::new(pq_store))
         .with_response_secret_drop_probe(Arc::clone(&drops));
+        let client = match browser_binding {
+            Some(binding) => client
+                .with_browser_provisioning_binding(binding)
+                .expect("valid browser binding"),
+            None => client,
+        };
         (Arc::new(client), state, drops)
     }
 
@@ -1264,8 +1536,9 @@ mod request_kem_tests {
         SignedEnvelope::read_from(sr).expect("decode signed envelope")
     }
 
-    /// `None` store (what `dial_wasm::dial` passes) MUST fail closed on a
-    /// cleartext-forbidding carrier — never a cleartext downgrade.
+    /// `None` store on a cleartext-forbidding carrier MUST fail closed — never
+    /// a cleartext downgrade. Public wasm dial seams now reject earlier, before
+    /// transport construction; this remains common-layer defense in depth.
     #[tokio::test]
     async fn cleartext_forbidding_carrier_without_kem_store_fails_closed() {
         let (_server_sk, server_vk) = generate_signing_keypair();
@@ -1285,7 +1558,9 @@ mod request_kem_tests {
                 None,
                 None,
                 None,
+                None,
                 Some("test-service"),
+                None,
             )
             .await
             .expect_err("must fail closed without a #mesh-kem store");
@@ -1295,9 +1570,9 @@ mod request_kem_tests {
         );
     }
 
-    /// `Some(store)` (what `dial_wasm::dial_with_kem_store` forwards) with an
-    /// anchored recipient MUST produce an encrypted envelope — proving the
-    /// forwarded store is actually used to seal.
+    /// An anchored KEM store on a cleartext-forbidding carrier MUST encrypt.
+    /// This is common-layer defense in depth; public wasm dial seams cannot
+    /// construct an unprovisioned client even when callers supply stores.
     #[tokio::test]
     async fn cleartext_forbidding_carrier_with_kem_store_encrypts() {
         let (server_sk, server_vk) = generate_signing_keypair();
@@ -1324,7 +1599,9 @@ mod request_kem_tests {
                 None,
                 None,
                 None,
+                None,
                 Some("test-service"),
+                None,
             )
             .await
             .expect("forwarded store must seal the envelope");
@@ -1342,6 +1619,124 @@ mod request_kem_tests {
             !bytes.windows(b"payload".len()).any(|w| w == b"payload"),
             "cleartext payload must not appear on the wire"
         );
+    }
+
+    fn browser_test_binding() -> crate::browser_provisioning::BrowserRequestBinding {
+        use base64::Engine as _;
+        let encode = |bytes: &[u8]| {
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+        };
+        crate::browser_provisioning::BrowserRequestBinding {
+            version: crate::browser_provisioning::BROWSER_PROVISIONING_VERSION.to_owned(),
+            service_name: "model".to_owned(),
+            service_did: "did:at9p:test-service".to_owned(),
+            service_origin: "https://model.example/".to_owned(),
+            webtransport_url: "https://model.example/wt".to_owned(),
+            certificate_hashes: vec![encode(&[0x44; 32])],
+            capability: "hyprstream-rpc/1".to_owned(),
+            scope: "model".to_owned(),
+            carrier_profile: crate::browser_provisioning::BrowserCarrierProfile::OwnedHybridWebTransport,
+            response_key_id: "did:at9p:test-service#response".to_owned(),
+            response_key_digest: encode(&[0x11; 32]),
+            request_kem_key_id: "did:at9p:test-service#mesh-kem".to_owned(),
+            request_kem_digest: encode(&[0x22; 32]),
+            accepted_state_digest: encode(&[0x33; 64]),
+            accepted_state_epoch: 9,
+            expires_at_unix_ms: i64::MAX,
+        }
+    }
+
+    fn browser_capnp_request(method_discriminator: u16) -> Vec<u8> {
+        let mut request = Vec::with_capacity(32);
+        request.extend_from_slice(&0u32.to_le_bytes());
+        request.extend_from_slice(&3u32.to_le_bytes());
+        request.extend_from_slice(&(2u64 << 32).to_le_bytes());
+        request.extend_from_slice(&91u64.to_le_bytes());
+        request.extend_from_slice(&(method_discriminator as u64).to_le_bytes());
+        request
+    }
+
+    #[tokio::test]
+    async fn legacy_exports_remain_additive_on_provisioned_clients() {
+        let binding = browser_test_binding();
+        let (client, state, _drops) = lifecycle_client_with_browser_binding(Some(binding));
+        let application = browser_capnp_request(7);
+
+        let unary = client
+            .call(application.clone())
+            .await
+            .expect("legacy unary export reaches transport");
+        let optioned = client
+            .call_with_options(
+                application.clone(),
+                CallOptions::new().jwt("test-jwt".to_owned()),
+            )
+            .await
+            .expect("legacy options export reaches transport");
+        let streaming = client
+            .call_streaming(application.clone(), [0x55; 32])
+            .await
+            .expect("legacy streaming export reaches transport");
+
+        for (request_id, framed) in [(1, unary), (2, optioned), (3, streaming)] {
+            let (transcript, recovered) = crate::browser_provisioning::recover_request_payload(
+                &framed,
+                crate::browser_provisioning::BrowserTranscriptPolicy::Required {
+                    request_id,
+                    service_name: "model",
+                    carrier_profile: crate::browser_provisioning::BrowserCarrierProfile::OwnedHybridWebTransport,
+                },
+            )
+            .expect("legacy export returned a sealed browser transcript");
+            assert_eq!(transcript.expect("browser transcript").method_discriminator, 7);
+            assert_eq!(recovered, application);
+        }
+        assert_eq!(state.recipients.lock().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn provisioned_generated_exports_reach_transport_after_bound_sealing() {
+        let binding = browser_test_binding();
+        let (client, state, _drops) = lifecycle_client_with_browser_binding(Some(binding));
+        let application = browser_capnp_request(7);
+
+        let unary = client
+            .call_for_service_with_method("model", 7, application.clone())
+            .await
+            .expect("bound generated unary reaches transport");
+        let optioned = client
+            .call_with_options_for_service_with_method(
+                "model",
+                7,
+                application.clone(),
+                CallOptions::new().jwt("test-jwt".to_owned()),
+            )
+            .await
+            .expect("bound generated options call reaches transport");
+        let streaming = client
+            .call_streaming_for_service_with_method(
+                "model",
+                7,
+                application.clone(),
+                [0x55; 32],
+            )
+            .await
+            .expect("bound generated streaming call reaches transport");
+
+        for (request_id, framed) in [(1, unary), (2, optioned), (3, streaming)] {
+            let (transcript, recovered) = crate::browser_provisioning::recover_request_payload(
+                &framed,
+                crate::browser_provisioning::BrowserTranscriptPolicy::Required {
+                    request_id,
+                    service_name: "model",
+                    carrier_profile: crate::browser_provisioning::BrowserCarrierProfile::OwnedHybridWebTransport,
+                },
+            )
+            .expect("transport returned sealed browser transcript");
+            assert_eq!(transcript.expect("browser transcript").method_discriminator, 7);
+            assert_eq!(recovered, application);
+        }
+        assert_eq!(state.recipients.lock().len(), 3, "all bound calls reached transport");
     }
 
     #[tokio::test]

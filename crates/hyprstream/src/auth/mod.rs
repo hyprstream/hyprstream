@@ -22,6 +22,8 @@ pub mod rocksdb_store;
 #[cfg(feature = "valkey")]
 pub mod valkey;
 
+pub use hyprstream_rpc::annotations_capnp::ScopeAction;
+
 pub use federation::FederationKeyResolver;
 pub use jwt::{Claims, JwtError};
 pub use key_rotation::{SigningKeyStore, Es256SigningKeyStore, Es256KeySlot, RotationStores};
@@ -33,6 +35,60 @@ pub use user_store::{DeviceRecord, DeviceStore, KeyAlgorithm, UserFilter, UserPr
 pub use rocksdb_store::RocksDbUserStore;
 #[cfg(feature = "valkey")]
 pub use valkey::ValkeyUserStore;
+
+/// Every schema-defined scope action, in its Cap'n Proto ordinal order.
+///
+/// This is the closed vocabulary used by wildcard UCAN-to-TE expansion. The
+/// values come from the generated schema enum rather than a hand-written MAC
+/// mirror, so adding or reordering a schema action cannot silently change the
+/// action understood by the policy compiler.
+pub const SCHEMA_SCOPE_ACTIONS: [ScopeAction; 14] = [
+    ScopeAction::Query,
+    ScopeAction::Subscribe,
+    ScopeAction::Write,
+    ScopeAction::Create,
+    ScopeAction::Publish,
+    ScopeAction::Infer,
+    ScopeAction::Train,
+    ScopeAction::Context,
+    ScopeAction::Serve,
+    ScopeAction::Spawn,
+    ScopeAction::Manage,
+    ScopeAction::MeshInvoke,
+    ScopeAction::MeshStage,
+    ScopeAction::MeshDelta,
+];
+
+/// Return the canonical capability token for a generated schema action.
+///
+/// This is the single string bridge shared by runtime [`Operation`] parsing
+/// and the MAC permission map.
+pub const fn scope_action_name(action: ScopeAction) -> &'static str {
+    match action {
+        ScopeAction::Query => "query",
+        ScopeAction::Subscribe => "subscribe",
+        ScopeAction::Write => "write",
+        ScopeAction::Create => "create",
+        ScopeAction::Publish => "publish",
+        ScopeAction::Infer => "infer",
+        ScopeAction::Train => "train",
+        ScopeAction::Context => "context",
+        ScopeAction::Serve => "serve",
+        ScopeAction::Spawn => "spawn",
+        ScopeAction::Manage => "manage",
+        ScopeAction::MeshInvoke => "meshInvoke",
+        ScopeAction::MeshStage => "meshStage",
+        ScopeAction::MeshDelta => "meshDelta",
+    }
+}
+
+/// Parse a canonical capability token into the generated schema action.
+/// Unknown tokens fail closed.
+pub fn scope_action_from_name(action: &str) -> Option<ScopeAction> {
+    SCHEMA_SCOPE_ACTIONS
+        .into_iter()
+        .find(|candidate| scope_action_name(*candidate) == action)
+}
 
 /// Operation types that can be controlled via policies
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -101,6 +157,53 @@ pub enum Operation {
 }
 
 impl Operation {
+    /// Convert a schema action to its runtime authorization operation.
+    ///
+    /// The exhaustive match is intentional: adding a `ScopeAction` in the
+    /// schema makes this crate fail to compile until runtime enforcement is
+    /// defined for it.
+    pub const fn from_scope_action(action: ScopeAction) -> Self {
+        match action {
+            ScopeAction::Query => Self::Query,
+            ScopeAction::Subscribe => Self::Subscribe,
+            ScopeAction::Write => Self::Write,
+            ScopeAction::Create => Self::Create,
+            ScopeAction::Publish => Self::Publish,
+            ScopeAction::Infer => Self::Infer,
+            ScopeAction::Train => Self::Train,
+            ScopeAction::Context => Self::Context,
+            ScopeAction::Serve => Self::Serve,
+            ScopeAction::Spawn => Self::Spawn,
+            ScopeAction::Manage => Self::Manage,
+            ScopeAction::MeshInvoke => Self::MeshInvoke,
+            ScopeAction::MeshStage => Self::MeshStage,
+            ScopeAction::MeshDelta => Self::MeshDelta,
+        }
+    }
+
+    /// Return the generated schema action represented by this operation.
+    /// `MeshStatus` is the sole runtime-only operation and reuses the `query`
+    /// capability token at authorization boundaries.
+    pub const fn scope_action(self) -> Option<ScopeAction> {
+        Some(match self {
+            Self::Query => ScopeAction::Query,
+            Self::Subscribe => ScopeAction::Subscribe,
+            Self::Write => ScopeAction::Write,
+            Self::Create => ScopeAction::Create,
+            Self::Publish => ScopeAction::Publish,
+            Self::Infer => ScopeAction::Infer,
+            Self::Train => ScopeAction::Train,
+            Self::Context => ScopeAction::Context,
+            Self::Serve => ScopeAction::Serve,
+            Self::Spawn => ScopeAction::Spawn,
+            Self::Manage => ScopeAction::Manage,
+            Self::MeshInvoke => ScopeAction::MeshInvoke,
+            Self::MeshStage => ScopeAction::MeshStage,
+            Self::MeshDelta => ScopeAction::MeshDelta,
+            Self::MeshStatus => return None,
+        })
+    }
+
     /// Get the short code for this operation
     pub fn code(&self) -> char {
         match self {
@@ -115,8 +218,8 @@ impl Operation {
             Operation::Publish => 'l',
             Operation::Spawn => 'p',
             Operation::Create => 'r',
-            // Mesh ops (#319) — distinct codes; not part of the model-capability
-            // bitmask (`all()`), so these never collide in `check_all`.
+            // Mesh ops (#319) — distinct codes, so they share the `check_all`
+            // bitmask with the model-capability codes without colliding.
             Operation::MeshInvoke => 'e',
             Operation::MeshStage => 'g',
             Operation::MeshDelta => 'd',
@@ -135,27 +238,9 @@ impl Operation {
     /// annotation) and runtime enforcement. `MeshStatus` shares `query` because the
     /// mesh read ability IS the canonical status read (#319), matching `as_str()`.
     pub fn as_capability(&self) -> &'static str {
-        // Arms follow the ScopeAction ordinal blocks (annotations.capnp):
-        // A read, B write/authority, C admin, D mesh-authority.
-        match self {
-            // Block A (@0..@1)
-            Operation::Query | Operation::MeshStatus => "query",
-            Operation::Subscribe => "subscribe",
-            // Block B (@2..@9)
-            Operation::Write => "write",
-            Operation::Create => "create",
-            Operation::Publish => "publish",
-            Operation::Infer => "infer",
-            Operation::Train => "train",
-            Operation::Context => "context",
-            Operation::Serve => "serve",
-            Operation::Spawn => "spawn",
-            // Block C (@10)
-            Operation::Manage => "manage",
-            // Block D (@11..@13)
-            Operation::MeshInvoke => "meshInvoke",
-            Operation::MeshStage => "meshStage",
-            Operation::MeshDelta => "meshDelta",
+        match self.scope_action() {
+            Some(action) => scope_action_name(action),
+            None => "query", // MeshStatus is the runtime specialization of query.
         }
     }
 
@@ -165,33 +250,7 @@ impl Operation {
     ///
     /// Returns `None` for an unknown token; callers MUST fail closed (no default-allow).
     pub fn from_capability(action: &str) -> Option<Self> {
-        // Exact inverse of `as_capability`, arms ordered by ScopeAction ordinal blocks.
-        // 1:1 with `ScopeAction` (#547/#569): `subscribe`/`publish` are distinct enforced
-        // abilities — NOT collapsed into `context`/`serve`. Collapsing them made
-        // `from_capability` non-invertible, so a granted `subscribe:notification:*` /
-        // `publish:notification:*` scope was enforced as `context`/`serve` (granted ≠
-        // enforced).
-        Some(match action {
-            // Block A (@0..@1)
-            "query" => Operation::Query,
-            "subscribe" => Operation::Subscribe,
-            // Block B (@2..@9)
-            "write" => Operation::Write,
-            "create" => Operation::Create,
-            "publish" => Operation::Publish,
-            "infer" => Operation::Infer,
-            "train" => Operation::Train,
-            "context" => Operation::Context,
-            "serve" => Operation::Serve,
-            "spawn" => Operation::Spawn,
-            // Block C (@10)
-            "manage" => Operation::Manage,
-            // Block D (@11..@13)
-            "meshInvoke" => Operation::MeshInvoke,
-            "meshStage" => Operation::MeshStage,
-            "meshDelta" => Operation::MeshDelta,
-            _ => return None,
-        })
+        scope_action_from_name(action).map(Self::from_scope_action)
     }
 
     /// Get the dot-namespaced operation name for policy matching.
@@ -294,7 +353,9 @@ impl Operation {
         }
     }
 
-    /// All operations
+    /// All operations — every enum variant, so `PolicyManager::check_all` can
+    /// report each one. Hand-maintained until #1091 R4a generates the
+    /// vocabulary from the schema; keep in sync with the enum above.
     pub fn all() -> &'static [Operation] {
         &[
             Operation::Infer,
@@ -304,6 +365,14 @@ impl Operation {
             Operation::Serve,
             Operation::Manage,
             Operation::Context,
+            Operation::Subscribe,
+            Operation::Create,
+            Operation::Publish,
+            Operation::Spawn,
+            Operation::MeshInvoke,
+            Operation::MeshStage,
+            Operation::MeshDelta,
+            Operation::MeshStatus,
         ]
     }
 }
@@ -421,11 +490,18 @@ mod tests {
         assert!(matches!("persist.save".parse::<Operation>(), Ok(Operation::Write)));
         assert!(matches!("serve.api".parse::<Operation>(), Ok(Operation::Serve)));
         assert!(matches!("context.augment".parse::<Operation>(), Ok(Operation::Context)));
-        // Verify format!("{}", op).parse() round-trip for every variant
+        // Verify format!("{}", op).parse() round-trip for every variant.
         for op in Operation::all() {
             let displayed = format!("{}", op);
             let parsed: Operation = displayed.parse().expect("round-trip parse failed");
-            assert_eq!(&parsed, op);
+            // `MeshStatus` shares the `query.status` wire action, which parses
+            // back to its canonical owner `Query` by design (see as_str()).
+            let expected = if *op == Operation::MeshStatus {
+                &Operation::Query
+            } else {
+                op
+            };
+            assert_eq!(&parsed, expected);
         }
         assert!(Operation::from_str("foo").is_err());
     }
@@ -452,9 +528,9 @@ mod tests {
         for op in [Operation::MeshInvoke, Operation::MeshStage, Operation::MeshDelta, Operation::MeshStatus] {
             assert_eq!(Operation::from_code(op.code()), Some(op));
         }
-        // Mesh ops are NOT part of the model-capability set.
+        // Mesh ops are part of `all()` so `check_all` can report them (#1096).
         for op in &[Operation::MeshInvoke, Operation::MeshStage, Operation::MeshDelta, Operation::MeshStatus] {
-            assert!(!Operation::all().contains(op));
+            assert!(Operation::all().contains(op));
         }
     }
 
@@ -488,6 +564,15 @@ mod tests {
                 "capability token round-trip is not 1:1 for {op:?}",
             );
         }
+        // The runtime bridge is over the generated capnp enum itself, so the
+        // compiler/PEP id and the authorization token cannot drift apart.
+        for (ordinal, action) in SCHEMA_SCOPE_ACTIONS.into_iter().enumerate() {
+            let op = Operation::from_scope_action(action);
+            assert_eq!(op.scope_action(), Some(action));
+            assert_eq!(op.as_capability(), scope_action_name(action));
+            assert_eq!(u16::from(action) as usize, ordinal);
+        }
+        assert_eq!(Operation::MeshStatus.scope_action(), None);
         // `subscribe`/`publish` are distinct enforced abilities — NOT context/serve.
         assert_eq!(Operation::from_capability("subscribe"), Some(Operation::Subscribe));
         assert_eq!(Operation::from_capability("publish"), Some(Operation::Publish));
@@ -500,8 +585,29 @@ mod tests {
     #[test]
     fn test_operation_all() {
         let all = Operation::all();
-        assert_eq!(all.len(), 7);
-        assert!(all.contains(&Operation::Context));
+        // All 15 variants: 11 core + 4 mesh (#319). Regression guard for #1096 —
+        // `all()` omitted 8 variants, so `check_all` could never report them.
+        let expected = [
+            Operation::Infer,
+            Operation::Train,
+            Operation::Query,
+            Operation::Write,
+            Operation::Serve,
+            Operation::Manage,
+            Operation::Context,
+            Operation::Subscribe,
+            Operation::Create,
+            Operation::Publish,
+            Operation::Spawn,
+            Operation::MeshInvoke,
+            Operation::MeshStage,
+            Operation::MeshDelta,
+            Operation::MeshStatus,
+        ];
+        assert_eq!(all.len(), expected.len());
+        for op in expected {
+            assert!(all.contains(&op), "Operation::all() is missing {op:?}");
+        }
     }
 
     #[test]

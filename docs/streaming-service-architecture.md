@@ -3,6 +3,13 @@
 moq-lite streaming plane with HMAC-chained end-to-end authentication and
 transport-level AEAD.
 
+> Migration status (#554): the identified hybrid epoch profile is implemented in
+> `stream_epoch.rs` and the authenticated request now carries `clientKemPublic`.
+> Individual service producers shown below still use the legacy Ristretto path
+> until they can consume accepted-current admission/#726 key-release evidence.
+> Do not treat this document's legacy flow as the network security target or as
+> #554 closure evidence.
+
 ## Overview
 
 ```

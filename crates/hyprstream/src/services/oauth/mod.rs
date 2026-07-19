@@ -514,7 +514,7 @@ impl Spawnable for OAuthService {
             );
             info!("ML-DSA-65 signing key rotation store loaded");
             crate::auth::key_rotation::refresh_ml_dsa_verifying_keys(&ml_dsa_store).await;
-            let crypto_policy = hyprstream_rpc::envelope::envelope_policy_from_env();
+            let crypto_policy = hyprstream_rpc::envelope::mandatory_envelope_policy();
 
             // MAC #547 / B2 (#674): construct the S6 grant-path audit sink. A
             // startup-time snapshot of the active ML-DSA-65 key (rotation

@@ -1,0 +1,167 @@
+{
+  "registry_version": 1,
+  "status": "local-pre-construction-registry",
+  "scope": "Canonical ResourceIntent fields, labels, bounds, and canonicalization owned by draft-hyprstream-resource-attestation-00. This file is not an IANA registry, a 9P opcode, a MoQ track namespace, a Privacy Pass token type, or a codepoint allocation, and it implies no such allocation.",
+  "canonicalization": {
+    "encoding": "DAG-CBOR: RFC 8949 deterministic CBOR with the atproto map-key length-prefixed lexicographic byte sort and tag-42 CID representation",
+    "digest": "SHA-256 over the canonical encoding, wrapped by the multihash 0x12 identifier",
+    "identifiers": "byte strings; resource_id, content_cid, manifest_cid, and operation_id are independent values (no cyclic hash or signature construction)",
+    "integers": "canonical minimum-width CBOR encoding; no leading zeros; nonnegative only",
+    "octets": "byte strings rendered as lowercase hex in this registry and vectors only for readability; the canonical on-the-wire form is a CBOR bstr",
+    "boundary": "reject an unknown field, an unknown label, a non-canonical encoding, or an out-of-bounds value before attestation or registrar processing"
+  },
+  "fields": {
+    "resource_id": {
+      "value_class": "identifier",
+      "min_bytes": 1,
+      "max_bytes": 128,
+      "selection_requirement": "Stable resource identity. MUST be independent of content_cid, manifest_cid, and operation_id. Concrete generation (random, UUID, or DID-derived) is pending #1065 and MUST NOT be defined as a hash or signature over another identifier."
+    },
+    "content_cid": {
+      "value_class": "identifier",
+      "min_bytes": 1,
+      "max_bytes": 128,
+      "selection_requirement": "Content-addressed digest of the sealed blob bytes. MUST match the bytes sealed by the content-addressed store (#1066)."
+    },
+    "manifest_cid": {
+      "value_class": "identifier",
+      "min_bytes": 1,
+      "max_bytes": 128,
+      "selection_requirement": "Self-addressed digest of the CID-free projection: the canonical manifest encoding with the manifest_cid field itself omitted, so the construction is non-cyclic. Distinct from content_cid and resource_id and never defined as a hash over another identifier value alone. The boundary checker recomputes the projection digest (manifest-cid-mismatch rejects). Pending #1065."
+    },
+    "operation_id": {
+      "value_class": "identifier",
+      "min_bytes": 16,
+      "max_bytes": 64,
+      "selection_requirement": "Deterministic operation identifier. Two transitions for one operation_id MUST NOT both finalize. Pending #1065/#1069."
+    },
+    "predecessor_version": {
+      "value_class": "nonnegative-integer",
+      "minimum": 0,
+      "maximum": 1023,
+      "selection_requirement": "Expected predecessor version for compare-and-swap. Pending #1069 registrar saga."
+    },
+    "owner_ref": {
+      "value_class": "opaque-octets",
+      "min_bytes": 1,
+      "max_bytes": 256,
+      "selection_requirement": "Encoded OwnershipRef: identified, pairwise, or committed. Anonymous authorization MUST NOT fabricate a DID. Pending #1065/#1068."
+    },
+    "controller_ref": {
+      "value_class": "opaque-octets",
+      "min_bytes": 1,
+      "max_bytes": 256,
+      "selection_requirement": "Encoded ControllerRef: identified or anonymous-capability. Pending #1068."
+    },
+    "payer_ref": {
+      "value_class": "opaque-octets",
+      "min_bytes": 1,
+      "max_bytes": 256,
+      "selection_requirement": "Encoded PayerRef: identified or anonymous-entitlement. Pending #1072."
+    },
+    "profile": {
+      "value_class": "identifier",
+      "min_bytes": 1,
+      "max_bytes": 64,
+      "selection_requirement": "One of the distinct per-role privacy kinds in resource-vocabulary.json. The three typed references (owner_ref, controller_ref, payer_ref) are the authoritative composite; the allowed combinations are exactly: identified-owner, pairwise-owner, committed-owner bind owner_ref kind identified/pairwise/committed; identified-controller and anonymous-capability-controller bind controller_ref kind identified/anonymous-capability; identified-payer and anonymous-entitlement-payer bind payer_ref kind identified/anonymous-entitlement. The declared profile MUST match the kind of the typed reference it governs, and each reference kind MUST come from its own per-role union; crossed combinations reject (profile-ref-kind-mismatch, crossed-ref-kind). Unknown profile kinds reject. Pending #1067/#1070."
+    },
+    "mac_attestation": {
+      "value_class": "opaque-octets",
+      "min_bytes": 32,
+      "max_bytes": 1024,
+      "selection_requirement": "MAC title/control attestation. Its role is fixed to mac-title-control; a swapped, duplicated, or unknown role rejects (swapped-attestation-roles, duplicated-known-role, unknown-attestation-role). Its covered_digest field MUST equal the canonical ResourceIntent digest. Pending #1068."
+    },
+    "ledger_attestation": {
+      "value_class": "opaque-octets",
+      "min_bytes": 32,
+      "max_bytes": 1024,
+      "selection_requirement": "Ledger economic attestation. Its role is fixed to ledger-economic; a swapped, duplicated, or unknown role rejects. Its covered_digest field MUST equal the same canonical ResourceIntent digest as mac_attestation. Pending #1072."
+    },
+    "accepted_state_epoch": {
+      "value_class": "nonnegative-integer",
+      "minimum": 0,
+      "maximum": 9223372036854775807,
+      "selection_requirement": "Accepted-current state epoch bound to the attestation. Stale or rolled-back values reject. Pending #1069."
+    },
+    "accepted_state_digest": {
+      "value_class": "opaque-octets",
+      "min_bytes": 32,
+      "max_bytes": 64,
+      "selection_requirement": "Digest of the accepted-current registrar state. Pending #1069."
+    },
+    "policy_generation": {
+      "value_class": "nonnegative-integer",
+      "minimum": 0,
+      "maximum": 9223372036854775807,
+      "selection_requirement": "MAC policy generation. Policy rollback reject. Pending #1068."
+    },
+    "expiry": {
+      "value_class": "nonnegative-integer",
+      "minimum": 0,
+      "maximum": 9223372036854775807,
+      "selection_requirement": "Unix-seconds expiry. Expired or crossed attestations reject. Pending #1065."
+    },
+    "fencing_token": {
+      "value_class": "opaque-octets",
+      "min_bytes": 8,
+      "max_bytes": 128,
+      "selection_requirement": "Registrar fencing token guarding compare-and-swap finalization. Bound to an unambiguous registrar generation boundary (generation, or generation plus a delimited suffix); a stale, crossed, same-prefix-future-generation, or already-consumed token rejects (crossed-fencing-token, fencing-future-generation, replayed-fencing-token, missing-fencing-token). Pending #1069."
+    }
+  },
+  "labels": [
+    {
+      "id": "hs-resource-attestation/resource-intent/v1",
+      "purpose": "Canonical ResourceIntent over which both the MAC and the ledger attestations are computed.",
+      "owner_issue": "#1065/#1070",
+      "status": "pre-construction",
+      "fields": [
+        "resource_id",
+        "content_cid",
+        "operation_id",
+        "predecessor_version",
+        "owner_ref",
+        "controller_ref",
+        "payer_ref",
+        "profile",
+        "accepted_state_epoch",
+        "accepted_state_digest",
+        "policy_generation",
+        "expiry"
+      ]
+    },
+    {
+      "id": "hs-resource-attestation/manifest/v1",
+      "purpose": "Finalized manifest joining both attestations over the identical canonical ResourceIntent digest.",
+      "owner_issue": "#1065/#1069/#1070",
+      "status": "pre-construction",
+      "fields": [
+        "resource_id",
+        "content_cid",
+        "manifest_cid",
+        "operation_id",
+        "predecessor_version",
+        "mac_attestation",
+        "ledger_attestation",
+        "profile",
+        "accepted_state_epoch",
+        "accepted_state_digest",
+        "policy_generation",
+        "expiry",
+        "fencing_token"
+      ]
+    }
+  ],
+  "bounds": {
+    "max_manifest_bytes": 65536,
+    "max_attestations_per_manifest": 2,
+    "max_concurrent_transitions_per_resource": 1,
+    "max_predecessor_chain_depth": 1024,
+    "note": "Repository-local application ceilings. Construction and profile review may lower them; any increase requires a profile revision."
+  },
+  "construction_status": {
+    "selected_suite": null,
+    "production_refusal": "construction-incomplete",
+    "reason": "The canonical production ResourceIntent encoding, durable registrar, reviewed MAC title attestation, and reviewed ledger redemption do not yet exist. A structurally valid fixture still terminates with the ConstructionIncomplete refusal.",
+    "blocking_issues": ["#1065", "#1066", "#1067", "#1068", "#1069", "#1071", "#1072"]
+  }
+}

@@ -31,6 +31,7 @@
 //! - FIPS mode: HMAC-SHA256 (FIPS 198-1)
 
 use std::future::Future;
+use std::sync::Arc;
 
 use anyhow::Result;
 use capnp::message::Builder;
@@ -45,7 +46,9 @@ use crate::crypto::derive_stream_keys;
 
 // DH key types - Ristretto255 (default) or P-256 (FIPS)
 #[cfg(not(feature = "fips"))]
-use crate::crypto::{ristretto_dh as dh_compute, RistrettoPublic as DhPublic, RistrettoSecret as DhSecret};
+use crate::crypto::{
+    ristretto_dh as dh_compute, RistrettoPublic as DhPublic, RistrettoSecret as DhSecret,
+};
 
 #[cfg(feature = "fips")]
 use crate::crypto::{p256_dh as dh_compute, P256PublicKey as DhPublic, P256SecretKey as DhSecret};
@@ -89,11 +92,21 @@ pub struct BatchingConfig {
     pub max_rate: f32,
 }
 
-fn default_min_batch_size() -> usize { 1 }
-fn default_max_batch_size() -> usize { 16 }
-fn default_max_block_bytes() -> usize { 65536 }
-fn default_min_rate() -> f32 { 1.0 }
-fn default_max_rate() -> f32 { 100.0 }
+fn default_min_batch_size() -> usize {
+    1
+}
+fn default_max_batch_size() -> usize {
+    16
+}
+fn default_max_block_bytes() -> usize {
+    65536
+}
+fn default_min_rate() -> f32 {
+    1.0
+}
+fn default_max_rate() -> f32 {
+    100.0
+}
 
 impl Default for BatchingConfig {
     fn default() -> Self {
@@ -122,6 +135,9 @@ pub enum StreamPayloadData {
     Error(String),
     /// Completion with app-specific metadata
     Complete(Vec<u8>),
+    /// Internal identified-profile control plaintext. This variant must be
+    /// sealed into `Tagged` before Cap'n Proto serialization.
+    EpochCommit(crate::stream_epoch::StreamEpochCommit),
     /// Encrypted tagged payload with key commitment
     Tagged {
         tag: Vec<u8>,
@@ -153,7 +169,9 @@ pub use crate::crypto::StreamHmacState;
 
 /// Encapsulates all state needed to produce a stream.
 ///
-/// Created by `StreamingService::prepare_stream()` after DH key exchange.
+/// Created by an identified stream preparation API after the pinned hybrid
+/// post-quantum handshake, or by the explicitly named third-party
+/// interoperability DH edge.
 /// Contains everything needed to:
 /// - Return stream info to client (stream_id, server_pubkey)
 /// - Create a `StreamPublisher` for sending data
@@ -162,7 +180,7 @@ pub use crate::crypto::StreamHmacState;
 ///
 /// ```ignore
 /// // In service handler:
-/// let ctx = self.prepare_stream(envelope_ctx)?;
+/// let ctx = self.prepare_identified_stream(envelope_ctx, accepted_binding, 600).await?;
 ///
 /// // Return to client:
 /// let response = Response::stream_started(ctx.stream_id(), ctx.server_pubkey());
@@ -176,21 +194,22 @@ pub use crate::crypto::StreamHmacState;
 pub struct StreamContext {
     /// Human-readable stream ID (for logging/display)
     stream_id: String,
-    /// DH-derived topic (64 hex chars) - used for ZMQ routing
+    /// Key-exchange-derived topic (64 hex chars) - used for stream routing
     topic: String,
-    /// DH-derived HMAC key for authenticated stream blocks
+    /// Key-exchange-derived HMAC key for authenticated stream blocks
     mac_key: [u8; 32],
-    /// DH-derived AES-256-GCM key for transport-level AEAD of payloads (#321).
-    /// `Some` only on the DH path (`from_dh`): the mesh/networked stream plane
+    /// Key-exchange-derived AES-256-GCM key for transport-level AEAD of payloads (#321).
+    /// `Some` on both keyed paths: identified hybrid streams and the explicitly
+    /// named third-party interoperability DH edge. The mesh/networked stream plane
     /// seals each Data/Complete payload under this key. `None` on the keyless
     /// `new()` path (e.g. NotificationService topics, whose payloads are already
     /// E2E-encrypted at the app layer), where transport AEAD is not applied.
     enc_key: Option<[u8; 32]>,
-    /// Server's ephemeral public key - client needs this for DH
+    /// Server's ephemeral public key for the third-party interoperability DH edge.
     server_pubkey: [u8; 32],
-    /// DH-derived control channel topic (64 hex chars)
+    /// Key-exchange-derived control channel topic (64 hex chars)
     ctrl_topic: String,
-    /// DH-derived control channel HMAC key
+    /// Key-exchange-derived control channel HMAC key
     ctrl_mac_key: [u8; 32],
     /// Cancellation token — fired by control listener or JWT expiry
     cancel_token: CancellationToken,
@@ -213,17 +232,25 @@ pub struct StreamContext {
     /// [`StreamChannel::with_reach_config`] populates this so the base (iroh/QUIC)
     /// reach is per-stream too, not just `relay_choice`.
     ///
-    /// When no explicit config is threaded, [`from_dh`](Self::from_dh) seeds it
-    /// from [`global_reach_config`](crate::moq_stream::global_reach_config) — a
+    /// When no explicit config is threaded, the third-party interoperability
+    /// constructor seeds it
+    /// from an empty [`ProducerReachConfig`](crate::moq_stream::ProducerReachConfig) — a
     /// one-time per-stream snapshot (the documented compat source), not a
     /// per-`reach()`-call global read.
     reach_config: crate::moq_stream::ProducerReachConfig,
 
     /// Hybrid KEM ciphertexts to emit in `StreamInfo.kemCiphertexts` (S3 #554).
-    /// `Some` on the hybrid post-quantum path ([`from_hybrid`](Self::from_hybrid));
-    /// `None` on the legacy classical [`from_dh`](Self::from_dh) and the keyless
+    /// `Some` on the hybrid post-quantum path
+    /// ([`from_hybrid_identified`](Self::from_hybrid_identified));
+    /// `None` on the legacy classical
+    /// [`from_third_party_interop_dh`](Self::from_third_party_interop_dh) and the keyless
     /// [`new`](Self::new) paths.
     kem_ciphertexts: Option<Vec<u8>>,
+    /// Shared one-shot identified producer state. The outer `Option` is a
+    /// persistent profile marker; the inner state is consumed exactly once
+    /// across every clone before an identified publisher creates MoQ resources.
+    /// Legacy/keyless contexts have no claim and cannot ratchet into this profile.
+    epoch_ratchet: Option<Arc<parking_lot::Mutex<Option<crate::stream_epoch::StreamEpochRatchet>>>>,
 }
 
 impl StreamContext {
@@ -252,10 +279,17 @@ impl StreamContext {
             reach_config: crate::moq_stream::ProducerReachConfig::default(),
             // Keyless path: no hybrid KEM material.
             kem_ciphertexts: None,
+            epoch_ratchet: None,
         }
     }
 
-    /// Create stream context by performing DH key exchange.
+    /// Create a stream context for the explicitly named third-party
+    /// interoperability edge by performing a classical DH key exchange.
+    ///
+    /// Same-cell and federated callers must use
+    /// [`Self::from_hybrid_identified`] instead.  Keeping this constructor
+    /// explicitly named prevents a verified HyKEM recipient from being
+    /// silently downgraded to classical AEAD.
     ///
     /// # Arguments
     /// * `client_ephemeral_pubkey` - Client's ephemeral public key from request
@@ -263,7 +297,7 @@ impl StreamContext {
     /// # Returns
     /// Stream context with DH-derived topic and mac_key
     #[cfg(not(feature = "fips"))]
-    pub fn from_dh(client_ephemeral_pubkey: &[u8]) -> Result<Self> {
+    pub fn from_third_party_interop_dh(client_ephemeral_pubkey: &[u8]) -> Result<Self> {
         use crate::crypto::generate_ephemeral_keypair;
 
         let (server_secret, server_pubkey) = generate_ephemeral_keypair();
@@ -291,17 +325,12 @@ impl StreamContext {
             cancel_token: CancellationToken::new(),
             qos: crate::stream_info::StreamOpt::default(),
             relay_choice: crate::moq_stream::RelayChoice::default(),
-            // Snapshot the node's reach inputs ONCE, per-stream, at construction
-            // (#384). `reach()` then reads this captured field instead of the
-            // process globals on every call. A `StreamChannel` with an explicit
-            // per-server `ProducerReachConfig` overrides this via
-            // `with_reach_config` (prepare_stream), making the base reach fully
-            // per-stream rather than global-sourced.
-            reach_config: crate::moq_stream::global_reach_config(),
+            reach_config: crate::moq_stream::ProducerReachConfig::default(),
             // Classical (legacy) path: no hybrid KEM material; the client keys
             // off the server ephemeral `dhPublic`. Removed at the S5 fail-closed
-            // flip (#556) once all call-sites use `from_hybrid`.
+            // flip (#556) once all call-sites use `from_hybrid_identified`.
             kem_ciphertexts: None,
+            epoch_ratchet: None,
         })
     }
 
@@ -315,36 +344,75 @@ impl StreamContext {
     /// client's ephemeral keypair (X25519 + ML-KEM legs).
     ///
     /// Fail-closed: a malformed / wrong-suite `client_kem_public` is rejected.
-    /// This is the post-quantum replacement for [`from_dh`](Self::from_dh).
-    pub fn from_hybrid(client_kem_public: &[u8]) -> Result<Self> {
-        let (material, keys) =
-            crate::crypto::key_exchange::server_hybrid_stream_keys(client_kem_public)
+    /// This is the required path for same-cell and federated callers with a
+    /// verified identified-stream recipient.
+    pub fn from_hybrid_identified(
+        client_kem_public: &[u8],
+        binding: crate::stream_epoch::IdentifiedStreamBinding,
+    ) -> Result<Self> {
+        let (material, ratchet) =
+            crate::crypto::key_exchange::server_identified_stream_epoch(client_kem_public, binding)
                 .map_err(|e| anyhow::anyhow!("hybrid stream handshake: {e}"))?;
+        let keys = ratchet.current_keys();
+        let outbound = &keys.producer_to_consumer;
+        let inbound = &keys.consumer_to_producer;
 
         let stream_id = format!("stream-{}", uuid::Uuid::new_v4());
 
         Ok(Self {
             stream_id,
-            topic: keys.topic,
-            mac_key: *keys.mac_key,
+            topic: ratchet.route_topic().to_owned(),
+            mac_key: *outbound.mac_key,
             // Hybrid path: AEAD ON for the mesh stream plane (#321), keyed by the
             // post-quantum combiner secret.
-            enc_key: Some(*keys.enc_key),
+            enc_key: Some(*outbound.enc_key),
             // No classical server ephemeral pubkey on the hybrid path; the client
             // keys off `kem_ciphertexts`, not `dhPublic`.
             server_pubkey: [0u8; 32],
-            ctrl_topic: keys.ctrl_topic,
-            ctrl_mac_key: *keys.ctrl_mac_key,
+            ctrl_topic: ratchet.control_topic().to_owned(),
+            ctrl_mac_key: *inbound.control_mac_key,
             cancel_token: CancellationToken::new(),
             qos: crate::stream_info::StreamOpt::default(),
             relay_choice: crate::moq_stream::RelayChoice::default(),
-            reach_config: crate::moq_stream::global_reach_config(),
+            reach_config: crate::moq_stream::ProducerReachConfig::default(),
             kem_ciphertexts: Some(material.encode()),
+            epoch_ratchet: Some(Arc::new(parking_lot::Mutex::new(Some(ratchet)))),
         })
     }
 
+    /// Whether this context was created for the identified epoch profile.
+    ///
+    /// This marker remains true after the producer claim is consumed so policy
+    /// checks such as the transport-AEAD requirement cannot be downgraded.
+    pub(crate) fn has_epoch_ratchet(&self) -> bool {
+        self.epoch_ratchet.is_some()
+    }
+
+    /// Build a publisher while holding the shared identified producer claim.
+    ///
+    /// The callback sees `Some` only once across every clone. It must consume
+    /// the state only after all fallible resource setup succeeds; if setup
+    /// fails first, the claim remains available for a retry. Legacy contexts
+    /// receive an unshared `None` slot.
+    pub(crate) fn with_publisher_epoch_ratchet<T>(
+        &self,
+        build: impl FnOnce(&mut Option<crate::stream_epoch::StreamEpochRatchet>) -> Result<T>,
+    ) -> Result<T> {
+        let Some(claim) = &self.epoch_ratchet else {
+            let mut legacy = None;
+            return build(&mut legacy);
+        };
+        let mut claim = claim.lock();
+        anyhow::ensure!(
+            claim.is_some(),
+            "identified stream publisher already claimed"
+        );
+        build(&mut claim)
+    }
+
     /// The hybrid KEM ciphertexts to emit in `StreamInfo.kemCiphertexts` (S3 #554):
-    /// `Some` on the hybrid path ([`from_hybrid`](Self::from_hybrid)), `None`
+    /// `Some` on the hybrid path
+    /// ([`from_hybrid_identified`](Self::from_hybrid_identified)), `None`
     /// otherwise.
     pub fn kem_ciphertexts(&self) -> Option<&[u8]> {
         self.kem_ciphertexts.as_deref()
@@ -355,7 +423,7 @@ impl StreamContext {
         &self.stream_id
     }
 
-    /// Get the DH-derived topic (for ZMQ routing).
+    /// Get the key-exchange-derived topic (for stream routing).
     pub fn topic(&self) -> &str {
         &self.topic
     }
@@ -365,27 +433,28 @@ impl StreamContext {
         &self.mac_key
     }
 
-    /// Get the transport AEAD key (#321), if this is a DH-keyed stream.
+    /// Get the transport AEAD key (#321), if this is a keyed stream.
     ///
-    /// `Some` on the DH path (mesh/networked stream — AEAD ON), `None` on the
-    /// keyless `new()` path (payloads already E2E-encrypted at the app layer).
+    /// `Some` on identified hybrid and third-party interoperability streams
+    /// (AEAD ON), `None` on the keyless `new()` path (payloads already
+    /// E2E-encrypted at the app layer).
     pub fn enc_key(&self) -> Option<&[u8; 32]> {
         self.enc_key.as_ref()
     }
 
     /// Disable transport-level AEAD for this stream (#321).
     ///
-    /// Clears the AEAD key so the publisher emits cleartext (HMAC-chained) blocks.
-    /// Used for streams whose consumer receives only `(mac_key, topic)` out of band
-    /// and never derives the DH `enc_key` (e.g. the TUI PTY/shell stdout viewer,
-    /// a same-host stream). AEAD remains mandatory and ON for the DH-keyed mesh
-    /// inference stream, whose consumer derives `enc_key` from the same DH.
+    /// Clears the AEAD key so a legacy publisher emits cleartext (HMAC-chained)
+    /// blocks. Identified epoch contexts retain an internal profile marker and
+    /// are rejected by `MoqStreamOrigin::publisher` if this escape hatch is used;
+    /// it exists only for legacy same-host streams whose consumer receives
+    /// `(mac_key, topic)` out of band and cannot derive the classical DH key.
     pub fn without_aead(mut self) -> Self {
         self.enc_key = None;
         self
     }
 
-    /// Get the server's ephemeral public key (client needs this for DH).
+    /// Get the server's ephemeral public key for the interoperability DH edge.
     pub fn server_pubkey(&self) -> &[u8; 32] {
         &self.server_pubkey
     }
@@ -439,13 +508,16 @@ impl StreamContext {
 
     /// Thread an explicit per-server reach config into this stream (#384).
     ///
-    /// Replaces the [`from_dh`](Self::from_dh) global snapshot with the supplied
-    /// per-server [`ProducerReachConfig`](crate::moq_stream::ProducerReachConfig),
+    /// Supplies the per-server [`ProducerReachConfig`](crate::moq_stream::ProducerReachConfig)
+    /// for this stream,
     /// so the base (iroh/QUIC) reach this stream advertises is the server's own —
-    /// not the process global. [`StreamChannel::prepare_stream_with_claims`]
-    /// calls this when the channel was built with
-    /// [`StreamChannel::with_reach_config`].
-    pub fn with_reach_config(mut self, reach_config: crate::moq_stream::ProducerReachConfig) -> Self {
+    /// [`StreamChannel::prepare_identified_stream_with_claims`] and
+    /// [`StreamChannel::prepare_third_party_interop_stream_with_claims`] apply their current service
+    /// config before it returns the context.
+    pub fn with_reach_config(
+        mut self,
+        reach_config: crate::moq_stream::ProducerReachConfig,
+    ) -> Self {
         self.reach_config = reach_config;
         self
     }
@@ -458,15 +530,15 @@ impl StreamContext {
     /// Build this stream's `StreamInfo.reach` from the node's per-server reach
     /// config and this stream's [`relay_choice`](Self::relay_choice) (#384).
     ///
-    /// This is the threaded replacement for the deprecated free-function
-    /// `producer_reach()`: a producer that holds a `StreamContext` calls this so
+    /// A producer that holds a `StreamContext` calls this so
     /// the stream's relay/anonymization posture **and** its base iroh/QUIC reach
     /// are honoured per-stream. Both come from the context's own
     /// [`reach_config`](Self::reach_config) field — captured at construction (and
     /// overridable via [`with_reach_config`](Self::with_reach_config)) — so this
     /// no longer reads the process-global `OnceLock`s on each call.
     pub fn reach(&self) -> Vec<crate::stream_info::Destination> {
-        self.reach_config.reach_with_relay(self.relay_choice.clone())
+        self.reach_config
+            .reach_with_relay(self.relay_choice.clone())
     }
 }
 
@@ -478,7 +550,11 @@ impl StreamContext {
 #[derive(Debug, Clone)]
 pub enum ProgressUpdate {
     /// Progress update: stage, current, total
-    Progress { stage: String, current: usize, total: usize },
+    Progress {
+        stage: String,
+        current: usize,
+        total: usize,
+    },
     /// Operation completed successfully
     Complete(Vec<u8>),
     /// Operation failed with error
@@ -543,13 +619,15 @@ impl ChannelProgressReporter {
 
     /// Signal successful completion with metadata.
     pub fn complete(&self, metadata: Vec<u8>) -> Result<()> {
-        self.sender.blocking_send(ProgressUpdate::Complete(metadata))
+        self.sender
+            .blocking_send(ProgressUpdate::Complete(metadata))
             .map_err(|_| anyhow::anyhow!("Progress channel closed"))
     }
 
     /// Signal an error occurred.
     pub fn error(&self, message: &str) -> Result<()> {
-        self.sender.blocking_send(ProgressUpdate::Error(message.to_owned()))
+        self.sender
+            .blocking_send(ProgressUpdate::Error(message.to_owned()))
             .map_err(|_| anyhow::anyhow!("Progress channel closed"))
     }
 }
@@ -559,7 +637,9 @@ impl ChannelProgressReporter {
 /// Returns (sender, receiver) where:
 /// - sender: Pass to `ChannelProgressReporter::new()` for use in blocking operations
 /// - receiver: Poll in async context to forward updates to `StreamPublisher`
-pub fn progress_channel(buffer_size: usize) -> (
+pub fn progress_channel(
+    buffer_size: usize,
+) -> (
     tokio::sync::mpsc::Sender<ProgressUpdate>,
     tokio::sync::mpsc::Receiver<ProgressUpdate>,
 ) {
@@ -586,7 +666,7 @@ pub use crate::stream_consumer::StreamVerifier;
 ///
 /// `StreamChannel` handles the complexity of:
 /// - Async PUSH socket creation and lazy initialization (via tmq)
-/// - DH key exchange via `StreamContext::from_dh()`
+/// - identified hybrid key exchange via `StreamContext::from_hybrid_identified()`
 /// - Stream pre-authorization with StreamService
 /// - Endpoint discovery via the registry
 ///
@@ -596,8 +676,10 @@ pub use crate::stream_consumer::StreamVerifier;
 /// // In service initialization
 /// let stream_channel = StreamChannel::new(signing_key.clone());
 ///
-/// // In request handler
-/// let stream_ctx = stream_channel.prepare_stream(&client_pubkey, 600).await?;
+/// // In a same-cell/federated request handler, after accepting the binding:
+/// let stream_ctx = stream_channel
+///     .prepare_identified_stream(&envelope_ctx, binding, 600)
+///     .await?;
 ///
 /// // In async context
 /// let mut publisher = stream_channel.publisher(&stream_ctx).await?;
@@ -615,13 +697,10 @@ pub struct StreamChannel {
     /// deterministically from the node's persistent Ed25519 signing key (#157)
     /// in [`Self::new`]; override with [`Self::with_pq_key`].
     pq_signing_key: Option<crate::crypto::pq::MlDsaSigningKey>,
-    /// Explicit per-server reach config threaded into every `StreamContext` this
-    /// channel prepares (#384). `None` → each context snapshots
-    /// [`global_reach_config`](crate::moq_stream::global_reach_config) in
-    /// `from_dh` (the compat default). `Some` → heterogeneous per-server reach:
-    /// the channel's own iroh/QUIC/relay inputs are used for the base reach,
-    /// independent of the process globals. Set via [`Self::with_reach_config`].
-    reach_config: Option<crate::moq_stream::ProducerReachConfig>,
+    /// Per-service reach source, updated by the service spawner after bind.
+    reach_config: crate::moq_stream::ProducerReachConfigHandle,
+    /// Optional service-scoped origin installed when this service links a relay.
+    moq_origin: crate::moq_stream::MoqStreamOriginHandle,
 }
 
 impl StreamChannel {
@@ -639,24 +718,39 @@ impl StreamChannel {
         Self {
             signing_key,
             pq_signing_key,
-            reach_config: None,
+            reach_config: std::sync::Arc::new(parking_lot::RwLock::new(
+                crate::moq_stream::ProducerReachConfig::default(),
+            )),
+            moq_origin: std::sync::Arc::new(parking_lot::RwLock::new(None)),
         }
     }
 
-    /// Thread an explicit per-server reach config (#384).
-    ///
-    /// Every `StreamContext` this channel prepares is populated with `cfg` (via
-    /// [`StreamContext::with_reach_config`]) so its base iroh/QUIC reach — not
-    /// just its relay choice — comes from this server's own config rather than
-    /// the process-global `OnceLock`s. This is the threading hook that makes
-    /// heterogeneous-per-server reach fully work; a server constructs its
-    /// [`ProducerReachConfig`](crate::moq_stream::ProducerReachConfig) at its
-    /// bind site and hands it here. When unset, contexts fall back to the
-    /// per-stream [`global_reach_config`](crate::moq_stream::global_reach_config)
-    /// snapshot.
+    /// Initialize this channel's reach configuration.
     pub fn with_reach_config(mut self, cfg: crate::moq_stream::ProducerReachConfig) -> Self {
-        self.reach_config = Some(cfg);
+        self.reach_config = std::sync::Arc::new(parking_lot::RwLock::new(cfg));
         self
+    }
+
+    /// Share a service-owned reach handle with this channel.
+    pub fn with_reach_config_handle(mut self, handle: crate::moq_stream::ProducerReachConfigHandle) -> Self {
+        self.reach_config = handle;
+        self
+    }
+
+    /// Return this channel's service-owned reach handle.
+    pub fn reach_config_handle(&self) -> crate::moq_stream::ProducerReachConfigHandle {
+        self.reach_config.clone()
+    }
+
+    /// Share a service-owned MoQ origin handle with this channel.
+    pub fn with_moq_origin_handle(mut self, handle: crate::moq_stream::MoqStreamOriginHandle) -> Self {
+        self.moq_origin = handle;
+        self
+    }
+
+    /// Return this channel's service-owned MoQ origin handle.
+    pub fn moq_origin_handle(&self) -> crate::moq_stream::MoqStreamOriginHandle {
+        self.moq_origin.clone()
     }
 
     /// Install the node's persistent ML-DSA-65 signing key, replacing the
@@ -668,61 +762,130 @@ impl StreamChannel {
         self
     }
 
-    /// Prepare a stream with DH key exchange and pre-authorization.
+    /// Prepare an identified stream with the pinned hybrid post-quantum
+    /// handshake and pre-authorization.
     ///
     /// This method:
-    /// 1. Performs DH key exchange to derive topic and MAC key
-    /// 2. Pre-authorizes the stream with StreamService
+    /// 1. Uses the authenticated recipient from the verified envelope
+    /// 2. Binds it to the accepted identified-stream state before deriving keys
+    /// 3. Pre-authorizes the stream with StreamService
     ///
     /// # Arguments
-    /// * `client_ephemeral_pubkey` - Client's ephemeral public key (32 bytes)
+    /// * `envelope_ctx` - Verified request context containing the HyKEM recipient
+    /// * `binding` - Accepted-current identity, capability, route, and epoch binding
     /// * `expiry_secs` - Stream expiration in seconds from now
     ///
     /// # Returns
     /// `StreamContext` ready for publishing
-    pub async fn prepare_stream(
+    pub async fn prepare_identified_stream(
         &self,
-        client_ephemeral_pubkey: &[u8],
+        envelope_ctx: &crate::service::EnvelopeContext,
+        binding: crate::stream_epoch::IdentifiedStreamBinding,
         expiry_secs: i64,
     ) -> Result<StreamContext> {
-        self.prepare_stream_with_claims(client_ephemeral_pubkey, expiry_secs, None).await
+        self.prepare_identified_stream_with_claims(envelope_ctx, binding, expiry_secs, None)
+            .await
     }
 
-    /// Prepare a stream with DH key exchange, pre-authorization, and claims.
+    /// Prepare an identified stream with claims.
     ///
-    /// Same as `prepare_stream()` but allows passing user claims for authorization.
-    /// Claims are forwarded to StreamService for subscription-time validation.
+    /// The recipient is read only from the verified [`crate::service::EnvelopeContext`];
+    /// callers must supply the accepted-current binding.  This API deliberately
+    /// has no classical fallback: a request with a verified HyKEM recipient is
+    /// never downgraded to a DH-derived stream.
     ///
     /// # Arguments
-    /// * `client_ephemeral_pubkey` - Client's ephemeral public key (32 bytes)
+    /// * `envelope_ctx` - Verified request context containing the HyKEM recipient
+    /// * `binding` - Accepted-current identity, capability, route, and epoch binding
     /// * `expiry_secs` - Stream expiration in seconds from now
     /// * `claims` - Optional user claims for authorization
     ///
     /// # Returns
     /// `StreamContext` ready for publishing
-    pub async fn prepare_stream_with_claims(
+    pub async fn prepare_identified_stream_with_claims(
+        &self,
+        envelope_ctx: &crate::service::EnvelopeContext,
+        binding: crate::stream_epoch::IdentifiedStreamBinding,
+        expiry_secs: i64,
+        claims: Option<Claims>,
+    ) -> Result<StreamContext> {
+        let recipient = envelope_ctx.stream_kem_recipient().ok_or_else(|| {
+            anyhow::anyhow!(
+                "identified stream preparation requires a verified HyKEM recipient in the request envelope"
+            )
+        })?;
+        self.prepare_identified_stream_for_verified_recipient_with_claims(
+            recipient,
+            binding,
+            expiry_secs,
+            claims,
+        )
+        .await
+    }
+
+    /// Perform identified setup after the envelope verification chokepoint has
+    /// yielded the recipient.  Keeping this seam private prevents arbitrary
+    /// request bytes from being treated as an authenticated recipient while
+    /// making the no-downgrade property directly testable.
+    async fn prepare_identified_stream_for_verified_recipient_with_claims(
+        &self,
+        recipient: &crate::crypto::hybrid_kem::RecipientPublic,
+        binding: crate::stream_epoch::IdentifiedStreamBinding,
+        expiry_secs: i64,
+        _claims: Option<Claims>,
+    ) -> Result<StreamContext> {
+        let stream_ctx = StreamContext::from_hybrid_identified(&recipient.encode(), binding)?
+            .with_reach_config(self.reach_config.read().clone());
+
+        self.arm_expiry(&stream_ctx, expiry_secs);
+
+        Ok(stream_ctx)
+    }
+
+    /// Prepare a legacy stream for an explicitly selected third-party
+    /// interoperability peer.
+    ///
+    /// This is the only `StreamChannel` entry point that uses classical DH.
+    /// Same-cell and federated callers must use
+    /// [`Self::prepare_identified_stream`] with their verified envelope and
+    /// accepted [`crate::stream_epoch::IdentifiedStreamBinding`].
+    pub async fn prepare_third_party_interop_stream(
+        &self,
+        client_ephemeral_pubkey: &[u8],
+        expiry_secs: i64,
+    ) -> Result<StreamContext> {
+        self.prepare_third_party_interop_stream_with_claims(
+            client_ephemeral_pubkey,
+            expiry_secs,
+            None,
+        )
+        .await
+    }
+
+    /// Same as [`Self::prepare_third_party_interop_stream`], with optional
+    /// authorization claims for the legacy third-party interoperability edge.
+    pub async fn prepare_third_party_interop_stream_with_claims(
         &self,
         client_ephemeral_pubkey: &[u8],
         expiry_secs: i64,
         _claims: Option<Claims>,
     ) -> Result<StreamContext> {
-        // 1. DH key exchange. Thread this channel's explicit per-server reach
-        // config when set (#384) so the stream's base iroh/QUIC reach is the
-        // server's own, not the process global; otherwise the context keeps the
-        // per-stream `global_reach_config()` snapshot `from_dh` captured.
-        let mut stream_ctx = StreamContext::from_dh(client_ephemeral_pubkey)?;
-        if let Some(cfg) = &self.reach_config {
-            stream_ctx = stream_ctx.with_reach_config(cfg.clone());
-        }
+        let stream_ctx = StreamContext::from_third_party_interop_dh(client_ephemeral_pubkey)?
+            .with_reach_config(self.reach_config.read().clone());
 
+        self.arm_expiry(&stream_ctx, expiry_secs);
+
+        Ok(stream_ctx)
+    }
+
+    /// Spawn the universal stream-expiry backstop after key setup succeeds.
+    fn arm_expiry(&self, stream_ctx: &StreamContext, expiry_secs: i64) {
         // Spawn JWT expiry timeout as universal backstop.
         let token = stream_ctx.cancel_token().clone();
         tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_secs(expiry_secs.max(0) as u64)).await;
             token.cancel();
         });
-
-        Ok(stream_ctx)
     }
 
     /// Register a topic with the stream plane.
@@ -730,7 +893,12 @@ impl StreamChannel {
     /// No-op on the moq path — topics are published lazily by
     /// `MoqStreamPublisher` on first frame; no pre-registration is needed.
     /// Kept for API compatibility with callers such as `NotificationService`.
-    pub async fn register_topic(&self, _topic: &str, _expiry: i64, _claims: Option<Claims>) -> Result<()> {
+    pub async fn register_topic(
+        &self,
+        _topic: &str,
+        _expiry: i64,
+        _claims: Option<Claims>,
+    ) -> Result<()> {
         Ok(())
     }
 
@@ -739,9 +907,16 @@ impl StreamChannel {
     /// Fails loudly if the process-global moq stream origin has not been
     /// initialized (server not started). In production the `streams` factory
     /// always calls `init_global_moq_origin` before any service handles requests.
-    pub async fn publisher(&self, ctx: &StreamContext) -> Result<crate::moq_stream::AnyStreamPublisher> {
-        let origin = crate::moq_stream::global_moq_origin()
-            .ok_or_else(|| anyhow::anyhow!("no moq stream origin — server not initialized"))?;
+    pub async fn publisher(
+        &self,
+        ctx: &StreamContext,
+    ) -> Result<crate::moq_stream::AnyStreamPublisher> {
+        let scoped_origin = self.moq_origin.read().clone();
+        let origin = match scoped_origin.as_ref() {
+            Some(origin) => origin,
+            None => crate::moq_stream::global_moq_origin()
+                .ok_or_else(|| anyhow::anyhow!("no moq stream origin — server not initialized"))?,
+        };
         // #321: on the DH (mesh) path, sign each StreamBlock with the node's per-host
         // hybrid identity (Ed25519 + the deterministically-derived mesh ML-DSA key)
         // so consumers can attribute blocks to this host (C-PROV / threat T3). The
@@ -805,7 +980,10 @@ impl StreamChannel {
     /// Used by NotificationService where topics are registered via `register_topic()`
     /// and don't use DH-based key exchange. The transport MAC key is randomly generated
     /// (separate from notification E2E MAC which is embedded in the payload).
-    pub async fn publisher_for_topic(&self, topic: &str) -> Result<crate::moq_stream::AnyStreamPublisher> {
+    pub async fn publisher_for_topic(
+        &self,
+        topic: &str,
+    ) -> Result<crate::moq_stream::AnyStreamPublisher> {
         // Generate a random transport-level MAC key for the HMAC chain.
         // (Not the notification's E2E MAC — that's embedded in the payload.)
         let mut mac_key = [0u8; 32];
@@ -819,7 +997,6 @@ impl StreamChannel {
         );
         self.publisher(&ctx).await
     }
-
 }
 
 // ============================================================================
@@ -840,7 +1017,10 @@ impl StreamChannel {
 ///
 /// ```ignore
 /// fn handle_clone_stream(&self, ...) -> Result<ResponseStream<CloneTask>> {
-///     let stream_ctx = self.stream_channel.prepare_stream(&pubkey, 600)?;
+///     let stream_ctx = self
+///         .stream_channel
+///         .prepare_third_party_interop_stream(&pubkey, 600)
+///         .await?;
 ///
 ///     let response = build_response(request_id, &stream_ctx);
 ///
@@ -949,8 +1129,9 @@ fn max_concurrent_streams_per_service() -> usize {
 fn stream_admission_semaphore(service_name: &str) -> std::sync::Arc<tokio::sync::Semaphore> {
     use parking_lot::RwLock;
     use std::collections::HashMap;
-    static MAP: std::sync::OnceLock<RwLock<HashMap<String, std::sync::Arc<tokio::sync::Semaphore>>>> =
-        std::sync::OnceLock::new();
+    static MAP: std::sync::OnceLock<
+        RwLock<HashMap<String, std::sync::Arc<tokio::sync::Semaphore>>>,
+    > = std::sync::OnceLock::new();
     let map = MAP.get_or_init(|| RwLock::new(HashMap::new()));
     if let Some(sem) = map.read().get(service_name) {
         return std::sync::Arc::clone(sem);
@@ -959,7 +1140,9 @@ fn stream_admission_semaphore(service_name: &str) -> std::sync::Arc<tokio::sync:
         map.write()
             .entry(service_name.to_owned())
             .or_insert_with(|| {
-                std::sync::Arc::new(tokio::sync::Semaphore::new(max_concurrent_streams_per_service()))
+                std::sync::Arc::new(tokio::sync::Semaphore::new(
+                    max_concurrent_streams_per_service(),
+                ))
             }),
     )
 }
@@ -1087,7 +1270,17 @@ pub fn encode_stream_block_with_provenance(
                 StreamPayloadData::Complete(data) => {
                     p.set_complete(data);
                 }
-                StreamPayloadData::Tagged { tag, payload, nonce, key_commitment } => {
+                StreamPayloadData::EpochCommit(_) => {
+                    anyhow::bail!(
+                        "identified stream epoch control reached cleartext serialization"
+                    );
+                }
+                StreamPayloadData::Tagged {
+                    tag,
+                    payload,
+                    nonce,
+                    key_commitment,
+                } => {
                     let mut tagged = p.init_tagged();
                     tagged.set_tag(tag);
                     tagged.set_payload(payload);
@@ -1120,7 +1313,8 @@ fn pubkey_to_32(pubkey: &[u8]) -> [u8; 32] {
 
 /// Derive the `(mac_key, enc_key, topic)` triple from a client-side DH exchange (#321).
 ///
-/// This is the consumer-side counterpart to `StreamContext::from_dh` (the server side).
+/// This is the consumer-side counterpart to
+/// `StreamContext::from_third_party_interop_dh` (the server side).
 /// Call this before constructing a `MoqStreamHandle` when you have the raw keys from
 /// `generate_ephemeral_keypair()` and the server pubkey from `StreamInfo`.
 pub fn derive_client_stream_keys(
@@ -1158,7 +1352,8 @@ mod tests {
 
         let mut inner_msg = Builder::new_default();
         {
-            let mut register = inner_msg.init_root::<crate::streaming_capnp::stream_register::Builder>();
+            let mut register =
+                inner_msg.init_root::<crate::streaming_capnp::stream_register::Builder>();
             register.set_topic(topic);
             register.set_exp(expiry);
         }
@@ -1173,8 +1368,18 @@ mod tests {
         } else {
             crate::crypto::CryptoPolicy::Classical
         };
-        let signed =
-            SignedEnvelope::new_signed_with_policy(envelope, signing_key, pq_signing_key, policy);
+        let signed = match SignedEnvelope::new_signed_with_policy(
+            envelope,
+            signing_key,
+            pq_signing_key,
+            policy,
+        ) {
+            Ok(signed) => signed,
+            Err(e) => {
+                tracing::error!("Failed to sign envelope: {e}");
+                return Vec::new();
+            }
+        };
         let mut msg = Builder::new_default();
         {
             let mut builder = msg.init_root::<common_capnp::signed_envelope::Builder>();
@@ -1196,12 +1401,10 @@ mod tests {
     /// which already verifies the self-asserted `cnf`'s EdDSA without a pin.
     #[test]
     fn stream_register_hybrid_verifies_only_when_pq_anchored() -> anyhow::Result<()> {
+        use crate::common_capnp;
         use crate::crypto::pq::{ml_dsa_generate_keypair, ml_dsa_vk_from_bytes};
         use crate::crypto::CryptoPolicy;
-        use crate::envelope::{
-            InMemoryNonceCache, KeyedPqTrustStore, SignedEnvelope,
-        };
-        use crate::common_capnp;
+        use crate::envelope::{InMemoryNonceCache, KeyedPqTrustStore, SignedEnvelope};
         use crate::FromCapnp;
 
         let signing_key = SigningKey::from_bytes(&[7u8; 32]);
@@ -1220,11 +1423,14 @@ mod tests {
             &mut std::io::Cursor::new(&bytes[..]),
             capnp::message::ReaderOptions::default(),
         )?;
-        let signed = SignedEnvelope::read_from(
-            reader.get_root::<common_capnp::signed_envelope::Reader>()?,
-        )?;
+        let signed =
+            SignedEnvelope::read_from(reader.get_root::<common_capnp::signed_envelope::Reader>()?)?;
 
-        assert_eq!(signed.policy, CryptoPolicy::Hybrid, "must sign Hybrid with PQ key");
+        assert_eq!(
+            signed.policy,
+            CryptoPolicy::Hybrid,
+            "must sign Hybrid with PQ key"
+        );
 
         // Anchored: the signer's ML-DSA vk is bound to its Ed25519 identity.
         let mut store = KeyedPqTrustStore::new();
@@ -1238,23 +1444,22 @@ mod tests {
             "anchored Hybrid register must verify"
         );
 
-        // Not anchored: empty store under Hybrid falls back to the inner EdDSA
-        // classical floor (WNS per-identity) rather than failing closed. PQ is
-        // never trusted from the self-asserted COSE entry, so this is no weaker
-        // than the pre-existing classical `verify_any_signer` path.
+        // Not anchored: the mandatory Hybrid policy rejects the register even
+        // though its self-asserted composite is cryptographically well formed.
         let empty = KeyedPqTrustStore::new();
         let nonce_empty = InMemoryNonceCache::new();
         assert!(
             signed
                 .verify_any_signer_with(&nonce_empty, Some(&empty), CryptoPolicy::Hybrid)
-                .is_ok(),
-            "unanchored Hybrid register must verify via classical inner-EdDSA fallback"
+                .is_err(),
+            "unanchored Hybrid register must fail closed"
         );
 
-        // But a tampered/forged inner EdDSA on an unanchored signer is still
-        // rejected — the classical floor is a real signature check, not a bypass.
+        // A tampered/forged inner EdDSA is also rejected.
         let mut forged = signed.clone();
-        forged.cnf = SigningKey::from_bytes(&[9u8; 32]).verifying_key().to_bytes();
+        forged.cnf = SigningKey::from_bytes(&[9u8; 32])
+            .verifying_key()
+            .to_bytes();
         let nonce_forged = InMemoryNonceCache::new();
         assert!(
             forged
@@ -1288,6 +1493,113 @@ mod tests {
 
         // Chain state should advance to mac2
         assert_eq!(state.prev_mac_bytes(), &mac2[..]);
+    }
+
+    #[tokio::test]
+    async fn stream_channels_keep_distinct_service_reach() -> Result<()> {
+        use crate::moq_stream::{NodeStreamReach, ProducerReachConfig};
+        use crate::stream_info::TransportConfig;
+
+        let config = |port| -> Result<ProducerReachConfig> {
+            Ok(ProducerReachConfig {
+                iroh_node_id: None,
+                quic_reach: Some(NodeStreamReach {
+                    addr: format!("127.0.0.1:{port}").parse()?,
+                    server_name: format!("server-{port}"),
+                    cert_hashes: vec![[port as u8; 32]],
+                }),
+                relay: None,
+            })
+        };
+        let channel_a = StreamChannel::new(SigningKey::from_bytes(&[1; 32]))
+            .with_reach_config(config(4101)?);
+        let channel_b = StreamChannel::new(SigningKey::from_bytes(&[2; 32]))
+            .with_reach_config(config(4102)?);
+        let (_, client_pub) = crate::crypto::generate_ephemeral_keypair();
+
+        let stream_a = channel_a
+            .prepare_third_party_interop_stream(&client_pub.to_bytes(), 60)
+            .await?;
+        let stream_b = channel_b
+            .prepare_third_party_interop_stream(&client_pub.to_bytes(), 60)
+            .await?;
+
+        let addr = |stream: &StreamContext| match &stream.reach()[0].transport {
+            TransportConfig::Quic(reach) => reach.addr.clone(),
+            other => panic!("expected QUIC reach, got {other:?}"),
+        };
+        assert_eq!(addr(&stream_a), "127.0.0.1:4101");
+        assert_eq!(addr(&stream_b), "127.0.0.1:4102");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn identified_preparation_uses_hybrid_material_not_interop_dh() -> Result<()> {
+        use crate::crypto::hybrid_kem::{generate_recipient, SuiteId};
+        use crate::stream_epoch::{
+            IdentifiedStreamBinding, StreamAcceptedState, StreamCarrierProfile, StreamRouteRole,
+        };
+
+        let binding = IdentifiedStreamBinding::new(
+            StreamCarrierProfile::OwnedHybridTransport,
+            StreamRouteRole::Direct,
+            "did:at9p:producer",
+            "did:at9p:consumer",
+            StreamAcceptedState {
+                identity_did: "did:at9p:producer".into(),
+                digest: [0x51; 64],
+                epoch: 7,
+            },
+            StreamAcceptedState {
+                identity_did: "did:at9p:consumer".into(),
+                digest: [0x61; 64],
+                epoch: 8,
+            },
+            "inference.generate",
+            "infer:model:qwen",
+            "local/streams/identified",
+            "did:at9p:producer#mesh-kem",
+            "urn:hyprstream:stream-client:one-shot",
+            64,
+        )?;
+        let recipient = generate_recipient(SuiteId::HyKemX25519MlKem768)?;
+        let channel = StreamChannel::new(SigningKey::from_bytes(&[4; 32]));
+
+        let stream = channel
+            .prepare_identified_stream_for_verified_recipient_with_claims(
+                &recipient.public(),
+                binding,
+                60,
+                None,
+            )
+            .await?;
+
+        assert!(stream.kem_ciphertexts().is_some());
+        assert!(stream.has_epoch_ratchet());
+        assert_eq!(stream.server_pubkey(), &[0; 32]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stream_channel_uses_service_scoped_moq_origin() -> Result<()> {
+        let scoped_origin = crate::moq_stream::MoqStreamOrigin::standalone().build();
+        let origin_handle = std::sync::Arc::new(parking_lot::RwLock::new(Some(scoped_origin.clone())));
+        let channel = StreamChannel::new(SigningKey::from_bytes(&[3; 32]))
+            .with_moq_origin_handle(origin_handle);
+        let (_, client_pub) = crate::crypto::generate_ephemeral_keypair();
+        let stream = channel
+            .prepare_third_party_interop_stream(&client_pub.to_bytes(), 60)
+            .await?;
+        let _publisher = channel.publisher(&stream).await?;
+
+        let path = scoped_origin.broadcast_path(stream.topic());
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            scoped_origin.consumer().announced_broadcast(&path),
+        )
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("scoped origin did not announce {path}"))?;
+        Ok(())
     }
 
     #[test]

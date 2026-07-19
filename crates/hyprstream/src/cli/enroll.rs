@@ -70,8 +70,8 @@ pub struct EnrollOutcome {
 /// [`CryptoPolicy::Hybrid`] (the node default) enrollment mints an Ed25519
 /// anchor **plus** a bound ML-DSA-65 key and writes a hybrid store record; a
 /// missing/unpersistable PQ component is a hard error (fail closed). Under
-/// [`CryptoPolicy::Classical`] a classical-only identity is written with a loud
-/// notice — never a silent downgrade.
+/// The test-only [`CryptoPolicy::Classical`] variant writes a classical-only
+/// identity with a loud notice — never a silent downgrade.
 pub async fn enroll_user(
     store: &RocksDbUserStore,
     secrets_dir: &Path,
@@ -123,12 +123,10 @@ struct ResolvedIdentity {
     notices: Vec<String>,
 }
 
-/// The classical-downgrade notice printed whenever a Classical-policy identity
-/// is enrolled (never silent — CLAUDE.md's fail-loud requirement).
+/// The downgrade notice used by Classical-policy test fixtures.
 fn classical_notice() -> String {
     "classical-only (policy=Classical): this identity is capped at Classical MAC \
-     assurance. Set CryptoPolicy to Hybrid (unset HYPRSTREAM_ENVELOPE_POLICY or \
-     set it to 'hybrid') to enroll a post-quantum identity."
+     assurance. Production enrollment is pinned to Hybrid."
         .to_owned()
 }
 

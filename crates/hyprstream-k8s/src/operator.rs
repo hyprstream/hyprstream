@@ -34,6 +34,7 @@ const MODEL_KIND: &str = "Model";
 const ADAPTER_KIND: &str = "Adapter";
 const TRAINING_RUN_KIND: &str = "TrainingRun";
 const INFERENCE_SERVICE_KIND: &str = "InferenceService";
+const TENANT_BINDING_KIND: &str = "TenantBinding";
 const TRAINING_RUN_FINALIZER: &str = "training.hyprstream.io/finalizer";
 const SERVING_APP_LABEL: &str = "hyprstream.io/serving-app";
 
@@ -245,6 +246,19 @@ pub struct OperatorState<R> {
     rpc: Arc<R>,
     config: OperatorConfig,
     tenant_bindings: TenantBindingCache,
+    /// The operator's tenant-grant issuer key (#929). `None` = the
+    /// `TenantBinding` controller compiles no grants (bindings stay the pure
+    /// namespace↔tenant map). Set by [`OperatorState::with_grant_issuer`] when
+    /// the `grant` feature is enabled and the operator was given issuer key
+    /// material at startup.
+    #[cfg(feature = "grant")]
+    tenant_grant_issuer: Option<Arc<crate::grant::TenantGrantIssuer>>,
+    /// Monotonic allocation-epoch counter for compiled grants (#929). Revocation
+    /// = stop renewing + bump the epoch; enforcers honor the epoch, never an
+    /// unbounded bearer token (#921). Seeded at startup; a future renewal layer
+    /// (S6 ZSP, #921 gap 2) owns *when* it bumps.
+    #[cfg(feature = "grant")]
+    grant_epoch: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl<R> OperatorState<R>
@@ -257,7 +271,24 @@ where
             rpc,
             config,
             tenant_bindings: TenantBindingCache::default(),
+            #[cfg(feature = "grant")]
+            tenant_grant_issuer: None,
+            #[cfg(feature = "grant")]
+            grant_epoch: Arc::new(std::sync::atomic::AtomicU64::new(1)),
         }
+    }
+
+    /// Set the operator's tenant-grant issuer (#929), enabling the
+    /// `TenantBinding` → grant compilation controller. `None` disables grant
+    /// compilation (the default); bindings reconcile to the no-grant `Bound`
+    /// status only. Only available with the `grant` feature.
+    #[cfg(feature = "grant")]
+    pub fn with_grant_issuer(
+        mut self,
+        issuer: Option<Arc<crate::grant::TenantGrantIssuer>>,
+    ) -> Self {
+        self.tenant_grant_issuer = issuer;
+        self
     }
 }
 
@@ -292,6 +323,12 @@ pub enum OperatorError {
 }
 
 /// Run Model, Adapter, TrainingRun, and InferenceService controllers until Ctrl-C.
+///
+/// With the `grant` feature, this runs the `TenantBinding` controller too, but
+/// with no issuer configured: bindings without an entitlement reconcile to the
+/// no-grant `Bound` status, and an authored entitlement is `Rejected` (no
+/// issuer to sign it). Use [`run_operator_with_grant_issuer`] to enable grant
+/// compilation (#929).
 pub async fn run_operator<R>(
     client: Client,
     rpc: Arc<R>,
@@ -301,6 +338,47 @@ where
     R: HyprstreamOperatorRpc,
 {
     let state = Arc::new(OperatorState::new(client.clone(), rpc, config));
+    run_operator_with_state(client, state).await
+}
+
+/// Run every controller with the operator's tenant-grant issuer configured
+/// (#929): the `TenantBinding` controller compiles authored entitlements into
+/// issuer-signed grants. `None` behaves exactly like [`run_operator`].
+#[cfg(feature = "grant")]
+pub async fn run_operator_with_grant_issuer<R>(
+    client: Client,
+    rpc: Arc<R>,
+    config: OperatorConfig,
+    issuer: Option<Arc<crate::grant::TenantGrantIssuer>>,
+) -> Result<(), OperatorError>
+where
+    R: HyprstreamOperatorRpc,
+{
+    let state = Arc::new(OperatorState::new(client.clone(), rpc, config).with_grant_issuer(issuer));
+    run_operator_with_state(client, state).await
+}
+
+async fn run_operator_with_state<R>(
+    client: Client,
+    state: Arc<OperatorState<R>>,
+) -> Result<(), OperatorError>
+where
+    R: HyprstreamOperatorRpc,
+{
+    // With the `grant` feature, the `TenantBinding` controller (#929) runs
+    // under the same supervision set as the other controllers: its exit —
+    // clean or not — ends `run_operator` rather than leaving the operator
+    // silently degraded. The `select!` macro cannot parse a `#[cfg]`-gated
+    // branch, so the branch is unconditional and the feature-off build
+    // substitutes a never-resolving future.
+    #[cfg(feature = "grant")]
+    let tenant_bindings: BoxFuture<'_, Result<(), OperatorError>> = Box::pin(
+        run_tenant_binding_controller(client.clone(), Arc::clone(&state)),
+    );
+    #[cfg(not(feature = "grant"))]
+    let tenant_bindings: BoxFuture<'_, Result<(), OperatorError>> =
+        Box::pin(futures::future::pending());
+
     let models = run_model_controller(client.clone(), Arc::clone(&state));
     let adapters = run_adapter_controller(client.clone(), Arc::clone(&state));
     let training_runs = run_training_run_controller(client.clone(), Arc::clone(&state));
@@ -310,6 +388,10 @@ where
         result = adapters => result,
         result = training_runs => result,
         result = inference_services => result,
+        result = tenant_bindings => {
+            tracing::warn!("tenantbinding controller exited; shutting down operator");
+            result
+        }
         _ = tokio::signal::ctrl_c() => Ok(()),
     }
 }
@@ -421,6 +503,172 @@ where
     })
     .await;
     Ok(())
+}
+
+// ── TenantBinding → grant compilation (#929) ─────────────────────────────────
+//
+// Only compiled when both `k8s` (controller runtime) and `grant` (the
+// compiler) features are on. The controller watches `TenantBinding` objects;
+// for each, it compiles the spec's `entitlement` into an issuer-signed grant
+// (the operator signs as issuer) and records the compiled grant/allocation CIDs
+// + epoch into `status`. The physical PDS publish of the allocation record into
+// the tenant's inventory is the deferred plumbing (#910); this controller mints
+// the grant and reflects the result as observed truth.
+
+#[cfg(feature = "grant")]
+pub async fn run_tenant_binding_controller<R>(
+    client: Client,
+    state: Arc<OperatorState<R>>,
+) -> Result<(), OperatorError>
+where
+    R: HyprstreamOperatorRpc,
+{
+    Controller::new(
+        Api::<TenantBinding>::all(client),
+        watcher::Config::default(),
+    )
+    .run(
+        reconcile_tenant_binding,
+        tenant_binding_error_policy::<R>,
+        state,
+    )
+    .for_each(|result| async move {
+        if let Err(error) = result {
+            tracing::warn!(%error, "tenantbinding reconcile failed");
+        }
+    })
+    .await;
+    Ok(())
+}
+
+#[cfg(feature = "grant")]
+async fn reconcile_tenant_binding<R>(
+    binding: Arc<TenantBinding>,
+    state: Arc<OperatorState<R>>,
+) -> Result<Action, OperatorError>
+where
+    R: HyprstreamOperatorRpc,
+{
+    use std::sync::atomic::Ordering;
+
+    // No issuer configured ⇒ grant compilation is disabled. Reflect a no-grant
+    // Bound status only when the status is stale, so the controller does not
+    // hot-loop an apiserver that has nothing to write.
+    let Some(issuer) = state.tenant_grant_issuer.clone() else {
+        if tenant_binding_status_observed_current(binding.as_ref()) {
+            return Ok(Action::requeue(state.config.requeue));
+        }
+        let status = crate::grant::compile_tenant_binding_status(
+            binding.as_ref(),
+            None,
+            0,
+            crate::grant::now_unix(),
+        );
+        patch_tenant_binding_status(&state.client, binding.as_ref(), status).await?;
+        return Ok(Action::requeue(state.config.requeue));
+    };
+
+    // Load the revocation epoch BEFORE the idempotency check. The epoch is the
+    // revocation handle (#921): bumping it (e.g. operator-wide reissue) must
+    // recompile the grant even when the CRD `generation` is unchanged. Skipping
+    // before reading the epoch would silently drop a revocation, so the epoch
+    // match is the load-bearing part of the short-circuit below.
+    let epoch = state.grant_epoch.load(Ordering::Relaxed);
+
+    // Idempotent: skip only when the recorded status already reflects this CRD
+    // generation AND a grant compiled at the *current* epoch is present (both
+    // CIDs). For a binding with no entitlement, "current" means a no-grant
+    // status (epoch is irrelevant — no grant exists to revoke).
+    if tenant_binding_status_up_to_date(binding.as_ref(), epoch) {
+        return Ok(Action::requeue(state.config.requeue));
+    }
+
+    let now = crate::grant::now_unix();
+    let status = crate::grant::compile_tenant_binding_status(
+        binding.as_ref(),
+        Some(issuer.as_ref()),
+        epoch,
+        now,
+    );
+    patch_tenant_binding_status(&state.client, binding.as_ref(), status).await?;
+    Ok(Action::requeue(state.config.requeue))
+}
+
+#[cfg(feature = "grant")]
+fn tenant_binding_error_policy<R>(
+    _binding: Arc<TenantBinding>,
+    _error: &OperatorError,
+    state: Arc<OperatorState<R>>,
+) -> Action
+where
+    R: HyprstreamOperatorRpc,
+{
+    Action::requeue(state.config.requeue)
+}
+
+#[cfg(feature = "grant")]
+fn tenant_binding_status_observed_current(binding: &TenantBinding) -> bool {
+    binding
+        .status
+        .as_ref()
+        .and_then(|status| status.observed_generation)
+        == binding.meta().generation
+}
+
+/// Whether a `TenantBinding`'s status is current enough to skip a reconcile at
+/// `epoch` (#929).
+///
+/// Two cases:
+/// - **Entitlement present** — the recorded grant must be compiled at the
+///   *current* epoch (`status.epoch == Some(epoch)`), with **both** compiled
+///   CIDs present, and the observed generation must match. A bumped epoch
+///   (revocation) or an edited entitlement (generation change) forces a
+///   recompile. The epoch match is load-bearing: it is what makes a
+///   revocation reissue the grant even when the CRD generation is unchanged.
+/// - **No entitlement** — "current" is a no-grant status (`grant_cid` is
+///   absent) at the observed generation; the epoch is irrelevant because no
+///   grant exists to revoke.
+///
+/// No status yet ⇒ not current (must reconcile).
+#[cfg(feature = "grant")]
+fn tenant_binding_status_up_to_date(binding: &TenantBinding, epoch: u64) -> bool {
+    let Some(status) = binding.status.as_ref() else {
+        return false;
+    };
+    if !tenant_binding_status_observed_current(binding) {
+        return false;
+    }
+    match binding.spec.entitlement.as_ref() {
+        Some(_) => {
+            status.epoch == Some(epoch)
+                && status.grant_cid.as_ref().is_some()
+                && status.allocation_cid.as_ref().is_some()
+        }
+        None => status.grant_cid.as_ref().is_none(),
+    }
+}
+
+#[cfg(feature = "grant")]
+async fn patch_tenant_binding_status(
+    client: &Client,
+    binding: &TenantBinding,
+    status: crate::mesh::TenantBindingStatus,
+) -> Result<TenantBinding, kube::Error> {
+    // TenantBinding is cluster-scoped, so the status patch goes to the
+    // all-namespaces Api rather than a namespaced one.
+    let api: Api<TenantBinding> = Api::all(client.clone());
+    let patch = json!({
+        "apiVersion": format!("mesh.hyprstream.io/{API_VERSION}"),
+        "kind": TENANT_BINDING_KIND,
+        "metadata": { "name": binding.name_any() },
+        "status": status,
+    });
+    api.patch_status(
+        &binding.name_any(),
+        &PatchParams::apply(OPERATOR_FIELD_MANAGER).force(),
+        &Patch::Apply(&patch),
+    )
+    .await
 }
 
 async fn reconcile_model<R>(
@@ -1592,7 +1840,7 @@ mod tests {
     use super::*;
     use crate::{
         AdapterSpec, InferenceServiceSpec, ModelSpec, ModelStage, TenantBindingSpec,
-        TrainingRunSpec,
+        TenantEntitlement, TenantGrantClass, TrainingRunSpec,
     };
 
     #[test]
@@ -1720,6 +1968,7 @@ mod tests {
             TenantBindingSpec {
                 namespace: "team-a".to_owned(),
                 tenant: "did:web:tenant-a".to_owned(),
+                entitlement: None,
             },
         );
         let second = TenantBinding::new(
@@ -1727,6 +1976,7 @@ mod tests {
             TenantBindingSpec {
                 namespace: "team-a".to_owned(),
                 tenant: "did:web:tenant-b".to_owned(),
+                entitlement: None,
             },
         );
 
@@ -1747,6 +1997,7 @@ mod tests {
             TenantBindingSpec {
                 namespace: "team-a".to_owned(),
                 tenant: "did:web:tenant-a".to_owned(),
+                entitlement: None,
             },
         );
 
@@ -2230,6 +2481,116 @@ mod tests {
                 &json!("HorizontalPodAutoscaler"),
                 &json!("ScaledObject"),
             ]
+        );
+    }
+
+    // ── TenantBinding → grant idempotency (#929, CodeRabbit revocation fix) ──
+
+    /// Build a TenantBinding whose status claims a grant compiled at `epoch`.
+    #[cfg(feature = "grant")]
+    fn bound_with_grant(observed_generation: Option<i64>, epoch: Option<u64>) -> TenantBinding {
+        let mut binding = TenantBinding::new(
+            "tb",
+            TenantBindingSpec {
+                namespace: "acme".to_owned(),
+                tenant: "did:web:acme".to_owned(),
+                entitlement: Some(TenantEntitlement {
+                    unit: "compute-second".to_owned(),
+                    amount: 100,
+                    class: TenantGrantClass::Underwritten,
+                    expiration: None,
+                }),
+            },
+        );
+        binding.status = Some(crate::mesh::TenantBindingStatus {
+            bound: Some(true),
+            phase: Some("Bound".to_owned()),
+            message: None,
+            observed_generation,
+            grant_cid: Some("bafyreibafyreibafyreibafyreibafyre".to_owned()),
+            allocation_cid: Some("bafyreibafyreibafyreibafyreibafyre".to_owned()),
+            epoch,
+        });
+        // meta().generation defaults to None on a ::new binding; align it with
+        // observed_generation so the observed-current check is exercisable.
+        binding.meta_mut().generation = observed_generation;
+        binding
+    }
+
+    /// A status compiled at the current epoch, with both CIDs present and the
+    /// generation observed, is up to date — no recompile needed.
+    #[cfg(feature = "grant")]
+    #[test]
+    fn grant_status_current_epoch_is_up_to_date() {
+        let binding = bound_with_grant(Some(3), Some(7));
+        assert!(
+            tenant_binding_status_up_to_date(&binding, 7),
+            "status at the current epoch with both CIDs must skip reconcile"
+        );
+    }
+
+    /// The load-bearing revocation case: bumping the epoch (revocation) MUST
+    /// invalidate the status even though the CRD generation is unchanged, so the
+    /// grant is recompiled at the new epoch. This is the exact regression
+    /// CodeRabbit flagged (the old short-circuit read the epoch too late).
+    #[cfg(feature = "grant")]
+    #[test]
+    fn grant_status_bumped_epoch_forces_recompile() {
+        let binding = bound_with_grant(Some(3), Some(7));
+        assert!(
+            !tenant_binding_status_up_to_date(&binding, 8),
+            "a bumped revocation epoch must force a recompile even when the \
+             generation is unchanged"
+        );
+    }
+
+    #[cfg(feature = "grant")]
+    #[test]
+    fn grant_status_stale_generation_forces_recompile() {
+        // observed_generation (2) lags the spec generation (5) → recompile.
+        let mut binding = bound_with_grant(Some(2), Some(7));
+        binding.meta_mut().generation = Some(5);
+        assert!(
+            !tenant_binding_status_up_to_date(&binding, 7),
+            "an edited spec (generation change) must force a recompile"
+        );
+    }
+
+    #[cfg(feature = "grant")]
+    #[test]
+    fn grant_status_missing_allocation_cid_forces_recompile() {
+        let mut binding = bound_with_grant(Some(3), Some(7));
+        // Wipe one CID — a partially-compiled grant is not current.
+        if let Some(status) = binding.status.as_mut() {
+            status.allocation_cid = None;
+        }
+        assert!(
+            !tenant_binding_status_up_to_date(&binding, 7),
+            "a missing allocation CID must force a recompile"
+        );
+    }
+
+    #[cfg(feature = "grant")]
+    #[test]
+    fn grant_status_no_entitlement_is_current_without_grant() {
+        // A binding with no entitlement is "current" once it carries a no-grant
+        // status at the observed generation; the epoch is irrelevant.
+        let mut binding = TenantBinding::new(
+            "tb",
+            TenantBindingSpec {
+                namespace: "acme".to_owned(),
+                tenant: "did:web:acme".to_owned(),
+                entitlement: None,
+            },
+        );
+        binding.meta_mut().generation = Some(1);
+        binding.status = Some(crate::mesh::TenantBindingStatus {
+            observed_generation: Some(1),
+            ..Default::default()
+        });
+        assert!(
+            tenant_binding_status_up_to_date(&binding, 99),
+            "a no-entitlement binding with a no-grant status is current at any epoch"
         );
     }
 }

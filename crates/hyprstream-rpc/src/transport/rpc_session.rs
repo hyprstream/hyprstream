@@ -347,6 +347,29 @@ where
     }
 }
 
+/// Strictly decode a browser RPC request: one ZMTP `STREAM_TYPE=REQ` command
+/// followed by exactly one multipart frame carrying the sealed envelope, with
+/// no trailing bytes.
+fn decode_browser_zmtp_request(request: &[u8]) -> Result<Bytes> {
+    let (command_frame, command_len) = crate::zmtp_framing::decode_frame(request)?;
+    anyhow::ensure!(command_frame.command, "browser request omitted STREAM_TYPE command");
+    let command = crate::zmtp_framing::ZmtpCommand::parse(&command_frame.data)?;
+    anyhow::ensure!(
+        command.name == "STREAM_TYPE" && command.body == b"REQ",
+        "browser RPC stream must declare STREAM_TYPE=REQ"
+    );
+    let (parts, consumed) = crate::zmtp_framing::decode_multipart(&request[command_len..])?;
+    anyhow::ensure!(
+        command_len + consumed == request.len(),
+        "browser RPC request has trailing bytes"
+    );
+    let mut parts = parts.into_iter();
+    match (parts.next(), parts.next()) {
+        (Some(envelope), None) => Ok(Bytes::from(envelope)),
+        _ => anyhow::bail!("browser RPC request must contain one frame"),
+    }
+}
+
 /// Handle one bidi stream end-to-end: read request, dispatch to the admitted
 /// processor, and write its response. Admission failures on untrusted carriers
 /// are silently dropped; trusted-local processor failures get a signed stub.
@@ -379,6 +402,17 @@ async fn handle_stream<S>(
                 return;
             }
         };
+    let request = if carrier.requires_browser_provisioning() {
+        match decode_browser_zmtp_request(&request) {
+            Ok(request) => request,
+            Err(error) => {
+                tracing::warn!(?error, "rpc-session: invalid browser ZMTP request");
+                return;
+            }
+        }
+    } else {
+        request
+    };
 
     // A raw/custom callback must never become the application boundary for a
     // network carrier. Only the sealed canonical bridge is allowed to receive
@@ -407,8 +441,19 @@ async fn handle_stream<S>(
         }
         Err(e) => {
             tracing::warn!(error = ?e, "rpc-session: trusted-carrier processor error, sending stub error envelope");
-            build_error_envelope(&signing_key, None, &format!("processor error: {e}"))
+            let pq_signing_key = crate::node_identity::derive_mesh_mldsa_key(&signing_key);
+            build_error_envelope(
+                &signing_key,
+                &pq_signing_key,
+                &format!("processor error: {e}"),
+            )
         }
+    };
+
+    let response = if carrier.requires_browser_provisioning() {
+        Bytes::from(crate::zmtp_framing::encode_multipart(&[response.as_ref()]))
+    } else {
+        response
     };
 
     // Zero-copy reply: `write_chunk` takes the `Bytes` by value; quinn/iroh write it
@@ -431,28 +476,30 @@ async fn handle_stream<S>(
 /// the payload. Used when the processor itself fails — guarantees the client
 /// sees a parseable envelope rather than EOF.
 ///
-/// #275: emits a COSE composite. When `pq_signing_key` is `Some` the error
-/// envelope is Hybrid (EdDSA + ML-DSA-65); otherwise Classical (EdDSA-only).
-/// A Classical-only client still verifies it via the inner EdDSA (skip-unknown).
+/// #275: emits the mandatory Hybrid COSE composite. Callers must supply both
+/// signing components; this constructor has no classical fallback.
 pub fn build_error_envelope(
     signing_key: &SigningKey,
-    pq_signing_key: Option<&crate::crypto::pq::MlDsaSigningKey>,
+    pq_signing_key: &crate::crypto::pq::MlDsaSigningKey,
     message: &str,
 ) -> Bytes {
     use crate::ToCapnp;
     use capnp::{message::Builder, serialize};
-    let policy = if pq_signing_key.is_some() {
-        crate::crypto::CryptoPolicy::Hybrid
-    } else {
-        crate::crypto::CryptoPolicy::Classical
-    };
-    let envelope = crate::envelope::ResponseEnvelope::new_signed_with_policy(
+    let envelope = match crate::envelope::ResponseEnvelope::new_signed_with_policy(
         0,
         message.as_bytes().to_vec(),
         signing_key,
-        pq_signing_key,
-        policy,
-    );
+        Some(pq_signing_key),
+        crate::crypto::CryptoPolicy::Hybrid,
+    ) {
+        Ok(envelope) => envelope,
+        Err(e) => {
+            // Fail closed: never substitute a weaker envelope. The client sees
+            // EOF instead of a signed error response.
+            tracing::error!(error = ?e, "rpc-session: failed signing error envelope");
+            return Bytes::new();
+        }
+    };
     let mut msg = Builder::new_default();
     {
         let mut builder = msg.init_root::<crate::common_capnp::response_envelope::Builder>();
@@ -546,5 +593,28 @@ impl<S: Session> Transport for SessionRpcTransport<S> {
 
     async fn publish(&self, _topic: &[u8]) -> Result<Self::Pub> {
         bail!("RPC plane does not support PUB — use moq-net on the streaming ALPN")
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod browser_zmtp_tests {
+    use super::*;
+
+    #[test]
+    fn browser_rpc_framing_is_strict_and_returns_only_the_envelope() {
+        let command = crate::zmtp_framing::encode_command("STREAM_TYPE", b"REQ");
+        let multipart = crate::zmtp_framing::encode_multipart(&[b"sealed-envelope"]);
+        let mut wire = command;
+        wire.extend_from_slice(&multipart);
+
+        assert_eq!(
+            decode_browser_zmtp_request(&wire).expect("valid browser framing"),
+            Bytes::from_static(b"sealed-envelope")
+        );
+        assert!(decode_browser_zmtp_request(&multipart).is_err());
+        let mut trailing = wire;
+        trailing.push(0);
+        assert!(decode_browser_zmtp_request(&trailing).is_err());
     }
 }

@@ -36,19 +36,37 @@ unsafe impl Sync for WtConnection {}
 impl WtConnection {
     /// Connect to a hyprstream WebTransport endpoint.
     pub async fn connect(url: &str, cert_hash: Option<&str>) -> Result<Self> {
-        let opts = web_sys::WebTransportOptions::new();
-
-        if let Some(hash) = cert_hash {
-            let hash_bytes = base64::Engine::decode(
+        let cert_hashes = match cert_hash { Some(hash) => {
+                vec![ base64::Engine::decode(
                 &base64::engine::general_purpose::STANDARD, hash
-            ).map_err(|e| anyhow!("invalid cert hash: {}", e))?;
+            ).map_err(|e| anyhow!("invalid cert hash: {}", e))?
+                        .try_into()
+                        .map_err(|_| anyhow!("certificate hash must be 32 bytes"))?,
+                ]
+            }
+            None => Vec::new(),
+        };
+        Self::connect_with_certificate_hashes(url, &cert_hashes).await
+    }
+
+    /// Connect using raw accepted-current certificate hashes.
+    pub async fn connect_with_certificate_hashes(
+        url: &str,
+        cert_hashes: &[[u8; 32]],
+    ) -> Result<Self> {
+        let opts = web_sys::WebTransportOptions::new();
+        if !cert_hashes.is_empty() {
+            let mut js_hashes = Vec::with_capacity(cert_hashes.len());
+            for hash_bytes in cert_hashes {
 
             let js_hash = web_sys::WebTransportHash::new();
             js_hash.set_algorithm("sha-256");
             let js_bytes = js_sys::Uint8Array::from(&hash_bytes[..]);
             js_hash.set_value(&js_bytes.buffer());
+                js_hashes.push(js_hash);
+            }
 
-            opts.set_server_certificate_hashes(&[js_hash]);
+            opts.set_server_certificate_hashes(&js_hashes);
         }
 
         let wt = web_sys::WebTransport::new_with_options(url, &opts)
@@ -148,7 +166,7 @@ impl WtConnection {
         let (tx, rx) = futures::channel::mpsc::unbounded();
 
         // Spawn a reader task that feeds frames into the channel
-        let inner = WtSubStreamInner { reader, buffer: Vec::new() };
+        let inner = WtSubStreamInner { reader, buffer: Vec::new(), };
         wasm_bindgen_futures::spawn_local(async move {
             let mut inner = inner;
             loop {
