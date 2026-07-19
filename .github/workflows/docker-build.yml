@@ -127,3 +127,148 @@ jobs:
         sudo apt-get autoremove -y || true
         echo "=== Disk usage after cleanup ==="
         df -h
+
+  # ==========================================================================
+  # Native linux/arm64 CPU image (closes #1012)
+  # ==========================================================================
+  # Built on the self-hosted Graviton (arm64 / Rocky-10 / rootless-podman)
+  # runner — the SAME layer graviton-build-validate.yml, build-image.yml, and
+  # the rust.yml merge-gate use. Native arm64 is used INSTEAD of QEMU
+  # emulation because emulated Rust + libtorch builds time out at the link step.
+  #
+  # The golden AMI exposes rootless podman only (no /var/run/docker.sock — see
+  # the rust.yml header comment), so this leg drives `podman build`/`podman
+  # push` directly and CANNOT use docker/build-push-action like the amd64 leg.
+  #
+  # Tag scheme (GHCR; consumed by the AWS rocky10 arm64 quadlets):
+  #   1.2.3-cpu-arm64      — immutable, on v*.*.* release tags
+  #   1.2-cpu-arm64        — rolling major.minor, on v*.*.* release tags
+  #   latest-cpu-arm64     — moving, on default-branch (main) builds
+  #   edge-cpu-arm64       — moving HEAD-of-main pointer
+  # NOTE: docker/metadata-action `type=semver,pattern={{version}}` STRIPS the
+  # leading `v` (emits `1.2.3`, not `v1.2.3`) — the same {{version}} form the
+  # amd64 leg uses. Consumers pull the UNPREFIXED tag. {{raw}} would keep the
+  # `v`; we intentionally match the amd64 leg's unprefixed contract.
+  # The amd64 cpu/cuda/rocm variants stay on the github-hosted build-docker job
+  # above; only the CPU variant has an arm64 counterpart (CUDA/ROCm are
+  # x86_64-only today).
+  #
+  # Security: this job holds `packages: write` on a privileged self-hosted
+  # Graviton runner, so the workflow_run leg is gated to SAME-REPOSITORY `push`
+  # runs only (head_repository.full_name == repository.full_name). A fork PR
+  # whose head branch is named `main` cannot schedule this job. See
+  # https://securitylab.github.com/resources/github-actions-preventing-pwn-requests/
+  build-docker-arm64:
+    if: >-
+      github.event_name == 'push' ||
+      (
+        github.event.workflow_run.event == 'push' &&
+        github.event.workflow_run.head_repository.full_name == github.repository &&
+        github.event.workflow_run.conclusion == 'success'
+      )
+    runs-on: [self-hosted, linux, arm64, graviton, hyprstream-merge-gate]
+    # Fleet reaper hard-kills Graviton instances at 150 min from LAUNCH (not
+    # job start); rust.yml uses 140 for the same reason. Stay below the cap so
+    # the always() cleanup runs and the push isn't lost to a reaped host.
+    timeout-minutes: 140
+    permissions:
+      contents: read
+      packages: write
+    # Two concurrence regimes:
+    #  - main (workflow_run) builds contend only on the moving edge/latest
+    #    tags, so they share ONE per-branch group and the superseded run is
+    #    cancelled (cancel-in-progress true).
+    #  - release (tag) publishes contend on the mutable ROLLING tag
+    #    (e.g. 1.2-cpu-arm64) regardless of version, so ALL releases share a
+    #    single serialized group with cancel-in-progress FALSE — an in-flight
+    #    release publish is never cancelled mid-push, so the rolling tag can't
+    #    be rolled back or skipped by an out-of-order concurrent release.
+    # Job-scoped so the amd64 leg (no concurrency guard) stays byte-for-byte
+    # unchanged.
+    concurrency:
+      group: arm64-publish-${{ github.event_name == 'workflow_run' && 'main' || 'release' }}
+      cancel-in-progress: ${{ github.event_name == 'workflow_run' }}
+
+    steps:
+    # workflow_run sets GITHUB_SHA to the DEFAULT-branch tip, NOT the commit
+    # that triggered Rust. Check out the exact head_sha that passed Rust so we
+    # never build/publish a later commit that hasn't passed (or has since
+    # failed). For tag-push events workflow_run is empty and we fall back to
+    # github.sha (the tagged commit). Provenance is already gated in `if:`.
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+        # Do not persist the GITHUB_TOKEN into .git/config on the self-hosted
+        # runner (actions/checkout writes it there by default for later git
+        # pushes). This job only reads; the token must not outlive the step.
+        persist-credentials: false
+
+    - name: Log in to Container Registry
+      if: github.event_name != 'pull_request'
+      env:
+        REGISTRY_USER: ${{ github.actor }}
+        REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # Never interpolate secrets into the command line (visible in /proc and
+      # ps). Pipe via --password-stdin so the token stays out of argv.
+      run: |
+        echo "$REGISTRY_TOKEN" | podman login ghcr.io -u "$REGISTRY_USER" --password-stdin
+
+    # docker/metadata-action is a pure node action (no docker daemon needed) so
+    # it runs fine on the podman-only runner; it just emits the tag set.
+    - name: Extract metadata
+      id: meta
+      uses: docker/metadata-action@v5
+      with:
+        images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+        tags: |
+          # Tag builds (releases) — semver, arm64 CPU suffix
+          type=semver,pattern={{version}},suffix=-cpu-arm64
+          type=semver,pattern={{major}}.{{minor}},suffix=-cpu-arm64
+          # Default-branch (main) moving pointers
+          type=raw,value=edge,enable={{is_default_branch}},suffix=-cpu-arm64
+          type=raw,value=latest,enable={{is_default_branch}},suffix=-cpu-arm64
+
+    - name: Build arm64 CPU image (native podman, no QEMU)
+      env:
+        TAGS: ${{ steps.meta.outputs.tags }}
+      run: |
+        set -euo pipefail
+        # Turn the newline-separated tag list into repeated `-t` args.
+        tag_args=()
+        while IFS= read -r t; do
+          [ -n "$t" ] && tag_args+=( -t "$t" )
+        done <<< "$TAGS"
+        if [ "${#tag_args[@]}" -eq 0 ]; then
+          echo "::error::no image tags resolved; refusing to build an untagged image"
+          exit 1
+        fi
+        echo "### Building linux/arm64 CPU image with tags" >> "$GITHUB_STEP_SUMMARY"
+        echo '```' >> "$GITHUB_STEP_SUMMARY"
+        printf '  %s\n' "${tag_args[@]}" >> "$GITHUB_STEP_SUMMARY"
+        echo '```' >> "$GITHUB_STEP_SUMMARY"
+        podman build \
+          --target runtime \
+          --build-arg VARIANT=cpu-arm64 \
+          "${tag_args[@]}" \
+          -f Dockerfile \
+          .
+
+    - name: Push image tags
+      if: github.event_name != 'pull_request'
+      env:
+        TAGS: ${{ steps.meta.outputs.tags }}
+      run: |
+        set -euo pipefail
+        while IFS= read -r t; do
+          [ -n "$t" ] && podman push "$t"
+        done <<< "$TAGS"
+
+    - name: Clean up disk space after build
+      if: always()
+      run: |
+        echo "=== Cleaning up after arm64 CPU build ==="
+        podman system prune -af || true
+        rm -rf ~/.cargo/registry/cache ~/.cargo/git 2>/dev/null || true
+        echo "=== Disk usage after cleanup ==="
+        df -h
