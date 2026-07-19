@@ -1063,7 +1063,7 @@ impl PdsPublisher {
     }
 
     /// Connect this publisher to the shared ES256 store's in-process
-    /// lead→active notification. A weak reference avoids a publisher→store→
+    /// lead→active transition. A weak reference avoids a publisher→store→
     /// publisher reference cycle. Cross-`--ipc` delivery is deferred to #1123.
     pub fn install_es256_promotion_hook(self: &Arc<Self>) -> AnyResult<()> {
         let publisher = Arc::downgrade(self);
@@ -1071,11 +1071,11 @@ impl PdsPublisher {
             .es256_store
             .as_ref()
             .ok_or_else(|| anyhow!("no process-local ES256 store for promotion hook"))?;
-        store.set_promotion_hook(Arc::new(move || {
+        store.set_promotion_hook(Arc::new(move |key| {
             let Some(publisher) = publisher.upgrade() else {
                 return Ok(());
             };
-            publisher.resign_head().map(|_| ())
+            publisher.resign_head_with_key(&key).map(|_| ())
         }));
         // Reconcile once at installation too: if promotion happened before the
         // registry factory installed the callback, an idle persisted head must
@@ -1299,10 +1299,9 @@ impl PdsPublisher {
     /// #918 re-sign-on-rotation: re-sign the EXISTING persisted repo head with
     /// the current live active `#atproto` key, leaving the MST root, `rev`, and
     /// `prev` unchanged — only the signature is refreshed. Called from the ES256
-    /// rotation hook after a lead→active promotion. An idle repo (no writes
-    /// since the rotation) whose head was signed by the now-rotated-out K gets
-    /// re-signed with K' so the verifier (which resolves K' from the live DID
-    /// document) accepts the head.
+    /// rotation hook before a lead→active promotion becomes visible. An idle
+    /// repo (no writes since the rotation) whose head was signed by K gets
+    /// re-signed with K' before the live DID document can publish K'.
     ///
     /// Holds the `publish_lock` to serialize with concurrent publishes. Returns
     /// `Ok(true)` if the head was re-signed and `Ok(false)` if there is no repo.
@@ -1310,7 +1309,6 @@ impl PdsPublisher {
     /// split the rotation event must reach whichever process runs the publisher;
     /// this single-process re-sign is the in-process piece.
     pub fn resign_head(&self) -> AnyResult<bool> {
-        let _guard = self.publish_lock.lock();
         let active_key = if let Some(store) = &self.es256_store {
             store.active_key().ok_or_else(|| {
                 anyhow!("no active ES256 #atproto signing key available for head re-sign")
@@ -1324,6 +1322,16 @@ impl PdsPublisher {
                     .signing_key,
             )
         };
+        self.resign_head_with_key(&active_key)
+    }
+
+    /// Re-sign the existing head with an explicit candidate key while the
+    /// rotation store's write guard keeps that key hidden from DID-document
+    /// readers. Only after this succeeds does rotation install the candidate
+    /// as live active, making publication and persisted-head re-sign one
+    /// externally atomic transition.
+    fn resign_head_with_key(&self, key: &p256::ecdsa::SigningKey) -> AnyResult<bool> {
+        let _guard = self.publish_lock.lock();
         let Some(repo) = self.store.load_repo(&self.did)? else {
             return Ok(false); // no repo yet — nothing to re-sign
         };
@@ -1331,7 +1339,7 @@ impl PdsPublisher {
         // changes. The commit CID changes because it includes `sig`; the next
         // normal publish will link `prev` to this re-signed head's CID.
         let unsigned = repo.commit.unsigned();
-        let re_signed = Commit::sign(&unsigned, &active_key);
+        let re_signed = Commit::sign(&unsigned, key);
         self.store.put_commit(&self.did, &re_signed)?;
         Ok(true)
     }
@@ -1519,18 +1527,24 @@ impl RecordResolver for PdsRecordResolver {
     /// Resolve the single current `#atproto` verifying key for `did` — the
     /// atproto-spec-aligned verification seam (#918 re-sign-on-rotation).
     ///
-    /// For this node's own repo DID, materialize a fresh local DID document
-    /// from the live ES256 store with the exact verification-method builder
-    /// used by the production HTTP DID document, then run it through
-    /// `atproto_verifying_key_from_did_document`. This proves the direct local
-    /// path is schema- and key-equivalent to the published document rather than
-    /// bypassing its authority-hygiene checks. For foreign DIDs, return
-    /// `Ok(None)` and let placement ingest fail closed. did:web HTTPS / did:plc
-    /// directory resolution is deferred with the cross-process work in #1123.
+    /// For this node's own repo DID, the current transitional path materializes
+    /// the `#atproto` verification method from the live ES256 store and runs it
+    /// through `atproto_verifying_key_from_did_document`. This is not yet
+    /// authority-equivalent to the served document: the repo subject remains a
+    /// node `did:key`, while peers receive an OAuth-issuer `did:web` document.
+    /// Aligning those identities and resolving the real served document is
+    /// blocked on the account/node DID provisioning model in #1124. Foreign
+    /// DIDs return `Ok(None)` so placement ingest fails closed.
     async fn resolve_verifying_key(
         &self,
         did: &str,
     ) -> anyhow::Result<Option<p256::ecdsa::VerifyingKey>> {
+        // TODO(#1124): `node_did` is currently an Ed25519-derived did:key,
+        // while the document actually served to peers is rooted at the OAuth
+        // issuer's did:web authority. Replacing this local materialization
+        // with resolution of that real document requires the account/node DID
+        // provisioning model from #1124; do not claim authority equivalence
+        // until the repo subject and served document share that identity.
         let Some((store, node_did)) = self.rotation.as_ref() else {
             return Ok(None);
         };
@@ -1805,6 +1819,101 @@ mod pds_store_tests {
         assert!(
             post_rotation_commit.verify(&old_vk).is_err(),
             "the re-signed head must fail under K (the old key)"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_rotation_keeps_published_key_and_head_consistent_then_retries() {
+        use crate::auth::key_rotation::{
+            rotate_es256_keys, Es256KeySlot, Es256KeySlots, Es256SigningKeyStore,
+        };
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pds_dir = dir.path().join("pds");
+        let secrets_dir = dir.path().join("secrets");
+        std::fs::create_dir_all(&secrets_dir).expect("create secrets dir");
+        let now = chrono::Utc::now().timestamp();
+        let old_sk = SigningKey::random(&mut rand::rngs::OsRng);
+        let old_vk: VerifyingKey = *old_sk.verifying_key();
+        let new_sk = SigningKey::random(&mut rand::rngs::OsRng);
+        let new_vk: VerifyingKey = *new_sk.verifying_key();
+
+        let store = Arc::new(PdsRecordStore::open(&pds_dir).expect("open rw"));
+        let es256_store = Arc::new(Es256SigningKeyStore::new(Es256KeySlots {
+            drain: None,
+            active: Some(Es256KeySlot::new(old_sk, now - 100, now + 1)),
+            lead: Some(Es256KeySlot::new(new_sk, now - 1, now + 30 * 86_400)),
+        }));
+        let publisher = Arc::new(PdsPublisher::new(
+            Arc::clone(&store),
+            DID.to_owned(),
+            Arc::clone(&es256_store),
+        ));
+        publisher
+            .install_es256_promotion_hook()
+            .expect("install promotion hook");
+        publisher.publish("repo-a", SAMPLE_OID).expect("publish");
+
+        let fail_once = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let injected_failure = Arc::clone(&fail_once);
+        let weak_publisher = Arc::downgrade(&publisher);
+        es256_store.set_promotion_hook(Arc::new(move |key| {
+            if injected_failure.swap(false, std::sync::atomic::Ordering::AcqRel) {
+                bail!("injected persisted-head re-sign failure");
+            }
+            let Some(publisher) = weak_publisher.upgrade() else {
+                return Ok(());
+            };
+            publisher.resign_head_with_key(&key).map(|_| ())
+        }));
+
+        assert!(
+            !rotate_es256_keys(
+                &crate::config::OAuthConfig::default(),
+                &secrets_dir,
+                &es256_store,
+                now,
+            )
+            .await,
+            "a failed head re-sign must leave promotion pending"
+        );
+        let failed_head = store
+            .load_repo(DID)
+            .expect("load")
+            .expect("repo present")
+            .commit;
+        failed_head
+            .verify(&old_vk)
+            .expect("head must remain signed by the still-published old key");
+        assert!(failed_head.verify(&new_vk).is_err());
+        assert_eq!(
+            es256_store.active_key().unwrap().verifying_key(),
+            &old_vk,
+            "candidate key must not become visible after re-sign failure"
+        );
+
+        assert!(
+            rotate_es256_keys(
+                &crate::config::OAuthConfig::default(),
+                &secrets_dir,
+                &es256_store,
+                now,
+            )
+            .await,
+            "the next tick must reconcile and finish promotion"
+        );
+        let reconciled_head = store
+            .load_repo(DID)
+            .expect("load")
+            .expect("repo present")
+            .commit;
+        reconciled_head
+            .verify(&new_vk)
+            .expect("retried head must match the newly published key");
+        assert!(reconciled_head.verify(&old_vk).is_err());
+        assert_eq!(
+            es256_store.active_key().unwrap().verifying_key(),
+            &new_vk
         );
     }
 

@@ -784,10 +784,11 @@ fn create_registry_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawn
     registry_service = registry_service.with_jwt_key_source(ctx.cluster_key_source());
     if let Some(publisher) = pds_publisher {
         // #918 re-sign-on-rotation: wire the ES256 promotion hook before the
-        // publisher moves into the registry. The hook fires from the rotation
-        // task when the active key is promoted, re-signing the persisted head
-        // with the new key. NOTE(#1123): cross-`--ipc` the rotation event must
-        // reach whichever process runs the publisher.
+        // publisher moves into the registry. The hook fires while the rotation
+        // task still holds the key-store write guard, re-signing the persisted
+        // head before the new active key becomes visible. NOTE(#1123): cross-
+        // `--ipc` the rotation event must reach whichever process runs the
+        // publisher.
         let publisher_arc = Arc::new(publisher);
         if let Err(error) = publisher_arc.install_es256_promotion_hook() {
             tracing::warn!("initial PDS head re-sign failed: {error}");
