@@ -1216,6 +1216,8 @@ mod tests {
         const REDIRECT_URI: &str = "https://client.example.test/callback";
         const MAPPED_DID: &str = "did:plc:abcdefghijklmnqrstuvwx2p";
         const PKCE_VERIFIER: &str = "r5-handler-pkce-verifier-abcdefghijklmnopqrstuvwxyz012345";
+        const GENERIC_PKCE_VERIFIER: &str =
+            "r7-generic-pkce-verifier-abcdefghijklmnopqrstuvwxyz012345";
 
         let _ = hyprstream_rpc::envelope::install_verify_config(
             hyprstream_rpc::envelope::EnvelopeVerifyConfig {
@@ -1519,6 +1521,87 @@ mod tests {
         assert!(state.get_refresh_token(&refresh_token).await?.is_none());
         let refreshed_claims = jwt_claims(refreshed_json["access_token"].as_str().unwrap());
         assert_eq!(refreshed_claims["sub"], MAPPED_DID);
+
+        // A real generic authorization-code flow retains the local username
+        // byte-for-byte and emits the legacy Bearer response shape.
+        let generic_code_challenge =
+            URL_SAFE_NO_PAD.encode(Sha256::digest(GENERIC_PKCE_VERIFIER.as_bytes()));
+        let generic_authorize_uri = format!(
+            "/oauth/authorize?{}",
+            encode_form(&[
+                ("client_id", CLIENT_ID),
+                ("redirect_uri", REDIRECT_URI),
+                ("code_challenge", &generic_code_challenge),
+                ("code_challenge_method", "S256"),
+                ("response_type", "code"),
+                ("state", "generic-client-state"),
+                ("scope", "read:*:*"),
+                ("resource", ISSUER),
+            ])
+        );
+        let generic_authorize = get(&app, &generic_authorize_uri).await;
+        assert_eq!(generic_authorize.status(), axum::http::StatusCode::OK);
+        let generic_authorize_html = response_text(generic_authorize).await;
+        let generic_authorize_nonce =
+            html_hidden_value(&generic_authorize_html, "nonce").to_owned();
+        let generic_challenge =
+            format!("{fingerprint}:{generic_authorize_nonce}:{generic_code_challenge}");
+        let generic_signature =
+            STANDARD.encode(user_key.sign(generic_challenge.as_bytes()).to_bytes());
+        let generic_callback = post_form(
+            &app,
+            "/oauth/authorize",
+            &[
+                ("client_id", CLIENT_ID),
+                ("redirect_uri", REDIRECT_URI),
+                ("code_challenge", &generic_code_challenge),
+                ("scope", "read:*:*"),
+                ("state", "generic-client-state"),
+                ("resource", ISSUER),
+                ("nonce", &generic_authorize_nonce),
+                ("fingerprint", &fingerprint),
+                ("signature", &generic_signature),
+            ],
+            None,
+            false,
+        )
+        .await;
+        assert_eq!(generic_callback.status(), axum::http::StatusCode::SEE_OTHER);
+        let generic_location = generic_callback
+            .headers()
+            .get(axum::http::header::LOCATION)
+            .and_then(|value| value.to_str().ok())
+            .unwrap();
+        let generic_location = url::Url::parse(generic_location)?;
+        let generic_callback_params: std::collections::HashMap<_, _> =
+            generic_location.query_pairs().into_owned().collect();
+        assert_eq!(
+            generic_callback_params.get("state").map(String::as_str),
+            Some("generic-client-state")
+        );
+        let generic_code = generic_callback_params.get("code").unwrap();
+        let generic_token = post_form(
+            &app,
+            "/oauth/token",
+            &[
+                ("grant_type", "authorization_code"),
+                ("client_id", CLIENT_ID),
+                ("code", generic_code),
+                ("redirect_uri", REDIRECT_URI),
+                ("code_verifier", GENERIC_PKCE_VERIFIER),
+            ],
+            None,
+            false,
+        )
+        .await;
+        assert_eq!(generic_token.status(), axum::http::StatusCode::OK);
+        let generic_token_json = response_json(generic_token).await;
+        assert_eq!(generic_token_json["token_type"], "Bearer");
+        assert!(generic_token_json.get("sub").is_none());
+        let generic_claims = jwt_claims(generic_token_json["access_token"].as_str().unwrap());
+        assert_eq!(generic_claims["sub"], "alice");
+        assert_eq!(generic_claims["iss"], ISSUER);
+        assert_eq!(generic_claims["aud"], ISSUER);
 
         // A real generic device flow retains the local username byte-for-byte
         // and the legacy Bearer response shape.

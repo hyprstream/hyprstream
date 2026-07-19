@@ -94,7 +94,7 @@ impl UserStore for ValkeyUserStore {
 
         // Merge: new fields overwrite existing; None in `new` keeps existing value.
         let merged = UserProfile {
-            sub: new.sub.or(existing.sub.clone()),
+            sub: new.sub.or_else(|| existing.sub.clone()),
             name: new.name.or(existing.name),
             email: new.email.or(existing.email),
             email_verified: new.email_verified.or(existing.email_verified),
@@ -216,7 +216,6 @@ impl UserStore for ValkeyUserStore {
             let descending = filter.sort_order.as_deref() == Some("descending");
             results.sort_by(|(a_name, a_prof), (b_name, b_prof)| {
                 let ord = match sort_by.as_str() {
-                    "userName" => a_name.cmp(b_name),
                     "id" | "sub" => a_prof.sub.cmp(&b_prof.sub),
                     _ => a_name.cmp(b_name),
                 };
@@ -242,8 +241,7 @@ impl UserStore for ValkeyUserStore {
     async fn list_pubkeys(&self, username: &str) -> Result<Vec<PubkeyEntry>> {
         let fps: Vec<String> = self.pool
             .smembers(format!("hs:user:{username}:keys"))
-            .await
-            .unwrap_or_default();
+            .await?;
         let mut entries = Vec::new();
         for fp in fps {
             let val: Option<String> = self.pool.get(format!("hs:key:{fp}")).await?;
@@ -381,6 +379,51 @@ impl UserStore for ValkeyUserStore {
             let json = serde_json::to_string(&stored)?;
             self.pool.set::<(), _, _>(format!("hs:key:{fingerprint}"), json, None, None, false).await?;
         }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn list_pubkeys_propagates_smembers_read_error() -> Result<()> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // A tiny RESP server accepts Fred's connection setup, then returns a
+        // synthetic Valkey error for SMEMBERS. This directly exercises the
+        // backend seam and would regress to Ok(empty) if list_pubkeys swallowed
+        // the read error again.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await?;
+            let mut buffer = [0_u8; 1024];
+            loop {
+                let read = socket.read(&mut buffer).await?;
+                if read == 0 {
+                    break;
+                }
+                let command = String::from_utf8_lossy(&buffer[..read]);
+                let response = if command.contains("SMEMBERS") {
+                    "-ERR synthetic SMEMBERS read failure\r\n"
+                } else {
+                    "+OK\r\n"
+                };
+                socket.write_all(response.as_bytes()).await?;
+            }
+            Ok::<(), std::io::Error>(())
+        });
+
+        let config = RedisConfig::from_url(&format!("redis://{address}"))?;
+        let pool = Builder::from_config(config).build_pool(1)?;
+        let _connection = pool.connect();
+        pool.wait_for_connect().await?;
+        let store = ValkeyUserStore { pool };
+
+        assert!(store.list_pubkeys("alice").await.is_err());
+        server.abort();
         Ok(())
     }
 }
