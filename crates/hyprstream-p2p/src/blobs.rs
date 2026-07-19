@@ -170,10 +170,14 @@ impl IrohBlobStore {
             }
             Some(_) => {}
             None => {
-                index.insert(cid.clone(), tag.hash);
+                // Persist the sidecar entry before publishing the in-memory
+                // binding: if the append fails after an insert, a retry would
+                // hit the `Some(_)` arm above and never re-attempt the append,
+                // losing the mapping across restarts.
                 if let Some(path) = &self.index_path {
                     append_index_entry(path, &cid, &tag.hash).await?;
                 }
+                index.insert(cid.clone(), tag.hash);
             }
         }
         drop(index);

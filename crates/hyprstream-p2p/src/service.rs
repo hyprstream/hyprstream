@@ -413,6 +413,23 @@ impl GitTorrentService {
         }
 
         if let Some(data) = self.object_plane.fetcher.fetch(cid, providers).await? {
+            // A raw Git CID self-verifies inside `put_object_by_cid`, so
+            // provider bytes can be committed here. A XET Merkle CID addresses
+            // the reconstruction DAG rather than the raw file, so this layer
+            // cannot verify the fetched bytes: return them uncommitted and
+            // leave persistence to the caller, which must validate them
+            // (pointer size + SHA-256) before calling `put_object_by_cid`.
+            let decoded = cid.decoded()?;
+            let self_verifying = matches!(
+                (decoded.codec, decoded.multihash.algo),
+                (
+                    hyprstream_rpc::cid::Codec::GitRaw,
+                    hyprstream_rpc::cid::HashAlgo::Sha2_256
+                )
+            );
+            if !self_verifying {
+                return Ok(Some(data));
+            }
             self.object_plane
                 .blobs
                 .put_object_by_cid(cid.clone(), data.clone())
@@ -1044,6 +1061,48 @@ mod tests {
             Some(data.as_slice())
         );
         assert_eq!(fetcher.calls().await, 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_get_object_returns_remote_xet_bytes_uncommitted() -> crate::error::Result<()> {
+        let temp_dir = TempDir::new()?;
+        let locator = Arc::new(MockObjectLocator::default());
+        let fetcher = Arc::new(MockBlobFetcher::default());
+        let service = GitTorrentService::new_with_object_plane(
+            test_config(temp_dir.path()),
+            locator.clone(),
+            fetcher.clone(),
+        )
+        .await?;
+
+        let data = b"xet reconstruction bytes".to_vec();
+        let cid = ContentCid::xet_merkle(&[0x7f; 32])?;
+        locator
+            .add_provider(
+                locator_cid_from_content(&cid),
+                PeerContact::untrusted(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 6881)),
+            )
+            .await;
+        fetcher.objects.lock().await.insert(cid.clone(), data.clone());
+
+        assert_eq!(
+            service.get_object_by_cid(&cid).await?.as_deref(),
+            Some(data.as_slice())
+        );
+        // A Merkle CID cannot verify raw bytes, so provider bytes must not be
+        // committed to the local store or cache before the caller validates.
+        assert!(service
+            .object_plane
+            .blobs
+            .get_object_by_cid(&cid)
+            .await?
+            .is_none());
+        assert_eq!(
+            service.get_object_by_cid(&cid).await?.as_deref(),
+            Some(data.as_slice())
+        );
+        assert_eq!(fetcher.calls().await, 2, "uncommitted bytes are re-fetched");
         Ok(())
     }
 

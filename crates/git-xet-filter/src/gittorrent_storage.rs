@@ -161,7 +161,7 @@ impl super::storage::StorageBackend for GittorrentStorage {
     async fn smudge_bytes(&self, pointer: &str) -> Result<Vec<u8>> {
         let pointer = GittorrentPointer::parse(pointer)?;
         let merkle = pointer.merkle_hash()?;
-        let data = self.smudge_from_hash(&merkle).await?;
+        let (data, uncommitted) = self.fetch_from_hash(&merkle).await?;
         if data.len() as u64 != pointer.size {
             return Err(XetError::new(
                 XetErrorKind::DownloadFailed,
@@ -186,10 +186,35 @@ impl super::storage::StorageBackend for GittorrentStorage {
                 "SHA-256 validation failed for gittorrent object",
             ));
         }
+        if uncommitted {
+            // The bytes passed the pointer's end-to-end size + SHA-256 checks;
+            // only now is it safe to bind them to the Merkle CID in the p2p
+            // object plane (a Merkle CID cannot verify raw bytes on its own).
+            let cid = hyprstream_p2p::ContentCid::xet_merkle(merkle.as_bytes()).map_err(|e| {
+                XetError::new(
+                    XetErrorKind::DownloadFailed,
+                    format!("CID encoding failed: {e}"),
+                )
+            })?;
+            if let Err(e) = self.service.put_object_by_cid(cid, data.clone()).await {
+                tracing::warn!("Failed to cache XET object in gittorrent: {e}");
+            }
+        }
         Ok(data)
     }
 
     async fn smudge_from_hash(&self, hash: &merklehash::MerkleHash) -> Result<Vec<u8>> {
+        // Hash-only callers carry no pointer metadata (size, SHA-256) to
+        // validate against, so fetched bytes are never committed to the p2p
+        // plane on this path — only `smudge_bytes` caches, after validation.
+        Ok(self.fetch_from_hash(hash).await?.0)
+    }
+
+    /// Fetch reconstruction bytes for a Merkle hash without committing any
+    /// CID binding. The returned flag is `true` when the bytes did not come
+    /// from the already-validated local p2p store and should be persisted by
+    /// the caller only after end-to-end validation.
+    async fn fetch_from_hash(&self, hash: &merklehash::MerkleHash) -> Result<(Vec<u8>, bool)> {
         let cid = hyprstream_p2p::ContentCid::xet_merkle(hash.as_bytes()).map_err(|e| {
             XetError::new(
                 XetErrorKind::DownloadFailed,
@@ -199,7 +224,7 @@ impl super::storage::StorageBackend for GittorrentStorage {
 
         // Try P2P first
         match self.service.get_object_by_cid(&cid).await {
-            Ok(Some(data)) => return Ok(data),
+            Ok(Some(data)) => return Ok((data, false)),
             Ok(None) => {
                 tracing::debug!("Object {} not found in DHT, trying fallback", hash);
             }
@@ -208,13 +233,11 @@ impl super::storage::StorageBackend for GittorrentStorage {
             }
         }
 
-        // Fallback to HTTPS origin
+        // Fallback to HTTPS origin; caching is deferred to the caller until
+        // the pointer's size and SHA-256 checks pass.
         if let Some(ref fb) = self.fallback {
             let data = fb.smudge_from_hash(hash).await?;
-            if let Err(e) = self.service.put_object_by_cid(cid, data.clone()).await {
-                tracing::warn!("Failed to cache XET object in gittorrent: {e}");
-            }
-            return Ok(data);
+            return Ok((data, true));
         }
 
         Err(XetError::new(

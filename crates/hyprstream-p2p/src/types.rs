@@ -9,17 +9,28 @@ use sha2::{Digest, Sha256};
 /// (multihash). Keeping the complete envelope at crate boundaries prevents
 /// equal-width digests such as an XET MerkleHash and SHA-256 from being
 /// silently reinterpreted as one another.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 #[serde(transparent)]
 pub struct ContentCid(String);
 
 impl ContentCid {
     /// Parse and validate a canonical CID understood by hyprstream.
+    ///
+    /// The input is re-encoded to the canonical lowercase base32 text before
+    /// being stored: base32 decoding is case-insensitive, so equivalent
+    /// spellings must collapse to one representation — `Eq`/`Hash` and the
+    /// rendezvous derivation all operate on the string form.
     pub fn new(cid: impl Into<String>) -> crate::Result<Self> {
         let cid = cid.into();
-        hyprstream_rpc::cid::decode_cid(&cid)
+        let decoded = hyprstream_rpc::cid::decode_cid(&cid)
             .map_err(|e| crate::Error::other(format!("invalid content CID: {e}")))?;
-        Ok(Self(cid))
+        let canonical = hyprstream_rpc::cid::encode_cid(
+            decoded.codec,
+            decoded.multihash.algo,
+            &decoded.multihash.digest,
+        )
+        .map_err(|e| crate::Error::other(format!("failed to canonicalize content CID: {e}")))?;
+        Ok(Self(canonical))
     }
 
     /// Address a raw Git object by its SHA-256 digest.
@@ -59,6 +70,19 @@ impl ContentCid {
 impl std::fmt::Display for ContentCid {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.0)
+    }
+}
+
+/// Route deserialization through [`ContentCid::new`] so every ingress path
+/// validates and canonicalizes — a transparent derive would accept arbitrary
+/// strings verbatim.
+impl<'de> Deserialize<'de> for ContentCid {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        ContentCid::new(s).map_err(serde::de::Error::custom)
     }
 }
 
@@ -419,6 +443,32 @@ mod tests {
             merkle, git,
             "equal-width digest bytes in different domains must not alias"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn test_content_cid_canonicalizes_spelling_on_new() -> crate::Result<()> {
+        let canonical = ContentCid::xet_merkle(&[0x42; 32])?;
+        // base32 is case-insensitive on decode: an uppercase spelling of the
+        // same CID must collapse to the identical canonical value.
+        let shouted = format!("b{}", canonical.as_str()[1..].to_ascii_uppercase());
+        let reparsed = ContentCid::new(shouted)?;
+        assert_eq!(reparsed, canonical);
+        assert_eq!(reparsed.as_str(), canonical.as_str());
+        Ok(())
+    }
+
+    #[test]
+    fn test_content_cid_deserialize_validates_and_canonicalizes() -> crate::Result<()> {
+        let canonical = ContentCid::git_sha256(&Sha256Hash::new(
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        )?)?;
+        let shouted = format!("b{}", canonical.as_str()[1..].to_ascii_uppercase());
+        let parsed: ContentCid = serde_json::from_str(&format!("\"{shouted}\""))
+            .map_err(|e| crate::Error::other(e.to_string()))?;
+        assert_eq!(parsed, canonical);
+
+        assert!(serde_json::from_str::<ContentCid>("\"not-a-cid\"").is_err());
         Ok(())
     }
 
