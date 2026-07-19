@@ -65,6 +65,7 @@ tempfile = "3.0"
 
 # XET integration dependencies
 async-trait = "0.1"
+hyprstream-rpc = { path = "../hyprstream-rpc" }
 
 # Mainline (BEP5) DHT locator for did:at9p (#889, epic #880 Track C) — the
 # untrusted rendezvous plane for the iroh-blobs object facade (F3, #901).

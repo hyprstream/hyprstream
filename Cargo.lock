@@ -7121,6 +7121,7 @@ dependencies = [
  "git2",
  "glob",
  "hex",
+ "hyprstream-rpc",
  "iroh-blobs",
  "mainline",
  "multihash",

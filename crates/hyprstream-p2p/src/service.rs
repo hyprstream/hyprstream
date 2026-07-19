@@ -4,11 +4,10 @@
 //! - Git repository operations using git2
 //! - Content-addressed object storage/transfer via iroh-blobs + the mainline
 //!   locator (the libp2p Kademlia DHT was retired in F3, #901)
-//! - SHA256-based content addressing and distribution
+//! - CID-based content addressing and distribution
 
-#[cfg(test)]
 use crate::crypto::hash::sha256_git;
-use crate::{Error, GitTorrentUrl, Result, Sha256Hash};
+use crate::{ContentCid, Error, GitTorrentUrl, Result, Sha256Hash};
 
 use crate::blobs::IrohBlobStore;
 use crate::locator::{Cid512, MainlineLocator, PeerContact, CID512_LEN};
@@ -217,8 +216,8 @@ pub struct GitTorrentService {
     object_plane: ObjectPlane,
     /// Local repository metadata
     repositories: Arc<RwLock<HashMap<String, RepositoryMetadata>>>,
-    /// Git object cache
-    object_cache: Arc<RwLock<HashMap<Sha256Hash, Vec<u8>>>>,
+    /// Object cache keyed by the complete content CID.
+    object_cache: Arc<RwLock<HashMap<ContentCid, Vec<u8>>>>,
 }
 
 struct ObjectPlane {
@@ -247,11 +246,8 @@ impl ObjectLocator for MainlineLocator {
 
 #[async_trait]
 trait RemoteBlobFetcher: Send + Sync {
-    async fn fetch(
-        &self,
-        hash: &Sha256Hash,
-        providers: Vec<PeerContact>,
-    ) -> Result<Option<Vec<u8>>>;
+    async fn fetch(&self, cid: &ContentCid, providers: Vec<PeerContact>)
+        -> Result<Option<Vec<u8>>>;
 }
 
 #[derive(Debug, Default)]
@@ -277,7 +273,7 @@ impl ObjectLocator for NoopObjectLocator {
 impl RemoteBlobFetcher for IrohMainlineBlobFetcher {
     async fn fetch(
         &self,
-        hash: &Sha256Hash,
+        cid: &ContentCid,
         providers: Vec<PeerContact>,
     ) -> Result<Option<Vec<u8>>> {
         // C2 currently exposes BEP5 socket contacts. The iroh-blobs downloader
@@ -285,7 +281,7 @@ impl RemoteBlobFetcher for IrohMainlineBlobFetcher {
         // point until the locator carries endpoint identity metadata.
         if !providers.is_empty() {
             tracing::debug!(
-                "found {} mainline providers for sha256 {hash}, but endpoint-id fetch is not wired yet",
+                "found {} mainline providers for content CID {cid}, but endpoint-id fetch is not wired yet",
                 providers.len(),
             );
         }
@@ -303,10 +299,12 @@ fn locator_cid_from_blake3(hash: Blake3Hash) -> Cid512 {
     Cid512::from_bytes(cid)
 }
 
-fn locator_cid_from_sha256(hash: &Sha256Hash) -> Cid512 {
+fn locator_cid_from_content(cid: &ContentCid) -> Cid512 {
     let mut hasher = blake3::Hasher::new();
-    hasher.update(b"hyprstream.gittorrent.sha256-facade.locator.v1");
-    hasher.update(&hash.to_bytes());
+    hasher.update(b"hyprstream.gittorrent.content-cid.locator.v1");
+    // Hash the complete canonical CID, including its codec and multihash
+    // algorithm. Equal-width digests from different domains cannot alias.
+    hasher.update(cid.as_str().as_bytes());
 
     let mut cid = [0u8; CID512_LEN];
     hasher.finalize_xof().fill(&mut cid);
@@ -388,33 +386,56 @@ impl GitTorrentService {
 
     /// Get a Git object by SHA256 hash
     pub async fn get_object(&self, hash: &Sha256Hash) -> Result<Option<Vec<u8>>> {
+        let cid = ContentCid::git_sha256(hash)?;
+        self.get_object_by_cid(&cid).await
+    }
+
+    /// Get an object by its canonical content CID.
+    pub async fn get_object_by_cid(&self, cid: &ContentCid) -> Result<Option<Vec<u8>>> {
         // Check local cache first
         {
             let cache = self.object_cache.read().await;
-            if let Some(data) = cache.get(hash) {
+            if let Some(data) = cache.get(cid) {
                 return Ok(Some(data.clone()));
             }
         }
 
-        if let Some(data) = self.object_plane.blobs.get_object(hash).await? {
+        if let Some(data) = self.object_plane.blobs.get_object_by_cid(cid).await? {
             let mut cache = self.object_cache.write().await;
-            cache.insert(hash.clone(), data.clone());
+            cache.insert(cid.clone(), data.clone());
             return Ok(Some(data));
         }
 
-        let cid = locator_cid_from_sha256(hash);
-        let providers = self.object_plane.locator.providers(&cid).await?;
+        let rendezvous = locator_cid_from_content(cid);
+        let providers = self.object_plane.locator.providers(&rendezvous).await?;
         if providers.is_empty() {
             return Ok(None);
         }
 
-        if let Some(data) = self.object_plane.fetcher.fetch(hash, providers).await? {
+        if let Some(data) = self.object_plane.fetcher.fetch(cid, providers).await? {
+            // A raw Git CID self-verifies inside `put_object_by_cid`, so
+            // provider bytes can be committed here. A XET Merkle CID addresses
+            // the reconstruction DAG rather than the raw file, so this layer
+            // cannot verify the fetched bytes: return them uncommitted and
+            // leave persistence to the caller, which must validate them
+            // (pointer size + SHA-256) before calling `put_object_by_cid`.
+            let decoded = cid.decoded()?;
+            let self_verifying = matches!(
+                (decoded.codec, decoded.multihash.algo),
+                (
+                    hyprstream_rpc::cid::Codec::GitRaw,
+                    hyprstream_rpc::cid::HashAlgo::Sha2_256
+                )
+            );
+            if !self_verifying {
+                return Ok(Some(data));
+            }
             self.object_plane
                 .blobs
-                .put_verified_object(hash.clone(), data.clone())
+                .put_object_by_cid(cid.clone(), data.clone())
                 .await?;
             let mut cache = self.object_cache.write().await;
-            cache.insert(hash.clone(), data.clone());
+            cache.insert(cid.clone(), data.clone());
             return Ok(Some(data));
         }
 
@@ -423,29 +444,43 @@ impl GitTorrentService {
 
     /// Store a Git object, returning its SHA256 hash (the consumer-facing key).
     pub async fn put_object(&self, data: Vec<u8>) -> Result<Sha256Hash> {
-        let hash = self.object_plane.blobs.put_object(data.clone()).await?;
+        let hash = sha256_git(&data)?;
+        let cid = ContentCid::git_sha256(&hash)?;
+        self.put_object_by_cid(cid, data).await?;
+        Ok(hash)
+    }
+
+    /// Store an object under a canonical content CID.
+    pub async fn put_object_by_cid(&self, cid: ContentCid, data: Vec<u8>) -> Result<()> {
+        self.object_plane
+            .blobs
+            .put_object_by_cid(cid.clone(), data.clone())
+            .await?;
         let blake3 = self
             .object_plane
             .blobs
-            .blake3_of(&hash)
+            .blake3_of_cid(&cid)
             .await
-            .ok_or_else(|| Error::not_found(format!("missing blake3 index for {hash}")))?;
-        let cid = locator_cid_from_blake3(blake3);
+            .ok_or_else(|| Error::not_found(format!("missing blake3 index for {cid}")))?;
+        let blob_rendezvous = locator_cid_from_blake3(blake3);
 
         if let Some(port) = self.object_plane.announce_port {
-            let facade_cid = locator_cid_from_sha256(&hash);
-            self.object_plane.locator.announce(&cid, Some(port)).await?;
+            let content_rendezvous = locator_cid_from_content(&cid);
             self.object_plane
                 .locator
-                .announce(&facade_cid, Some(port))
+                .announce(&blob_rendezvous, Some(port))
+                .await?;
+            self.object_plane
+                .locator
+                .announce(&content_rendezvous, Some(port))
                 .await?;
         }
 
         let mut cache = self.object_cache.write().await;
-        cache.insert(hash.clone(), data);
+        cache.insert(cid.clone(), data);
 
-        tracing::debug!("Stored object with hash: {}", hash);
-        Ok(hash)
+        tracing::debug!("Stored object with CID: {cid}");
+        Ok(())
     }
 
     /// Store all objects from a repository individually through the object
@@ -876,13 +911,15 @@ mod tests {
 
     #[derive(Default)]
     struct MockBlobFetcher {
-        objects: Mutex<StdHashMap<Sha256Hash, Vec<u8>>>,
+        objects: Mutex<StdHashMap<ContentCid, Vec<u8>>>,
         calls: Mutex<usize>,
     }
 
     impl MockBlobFetcher {
-        async fn insert(&self, hash: Sha256Hash, data: Vec<u8>) {
-            self.objects.lock().await.insert(hash, data);
+        async fn insert(&self, hash: Sha256Hash, data: Vec<u8>) -> Result<()> {
+            let cid = ContentCid::git_sha256(&hash)?;
+            self.objects.lock().await.insert(cid, data);
+            Ok(())
         }
 
         async fn calls(&self) -> usize {
@@ -894,11 +931,11 @@ mod tests {
     impl RemoteBlobFetcher for MockBlobFetcher {
         async fn fetch(
             &self,
-            hash: &Sha256Hash,
+            cid: &ContentCid,
             _providers: Vec<PeerContact>,
         ) -> Result<Option<Vec<u8>>> {
             *self.calls.lock().await += 1;
-            Ok(self.objects.lock().await.get(hash).cloned())
+            Ok(self.objects.lock().await.get(cid).cloned())
         }
     }
 
@@ -940,8 +977,23 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn test_content_rendezvous_preserves_cid_domain() -> crate::error::Result<()> {
+        let digest = [0x5a; 32];
+        let git = ContentCid::git_sha256(&Sha256Hash::from_bytes(&digest)?)?;
+        let xet = ContentCid::xet_merkle(&digest)?;
+
+        assert_ne!(git, xet);
+        assert_ne!(
+            locator_cid_from_content(&git),
+            locator_cid_from_content(&xet),
+            "rendezvous derivation must include CID codec and hash algorithm"
+        );
+        Ok(())
+    }
+
     #[tokio::test]
-    async fn test_object_storage_announces_blake3_and_facade_cids() -> crate::error::Result<()> {
+    async fn test_object_storage_announces_blake3_and_content_cids() -> crate::error::Result<()> {
         let temp_dir = TempDir::new()?;
         let locator = Arc::new(MockObjectLocator::default());
         let fetcher = Arc::new(MockBlobFetcher::default());
@@ -956,6 +1008,7 @@ mod tests {
 
         let data = b"announced object".to_vec();
         let hash = service.put_object(data.clone()).await?;
+        let content_cid = ContentCid::git_sha256(&hash)?;
         let blake3 = service
             .object_plane
             .blobs
@@ -965,7 +1018,7 @@ mod tests {
         let announcements = locator.announcements().await;
 
         assert!(announcements.contains(&(locator_cid_from_blake3(blake3), Some(4242))));
-        assert!(announcements.contains(&(locator_cid_from_sha256(&hash), Some(4242))));
+        assert!(announcements.contains(&(locator_cid_from_content(&content_cid), Some(4242))));
         assert_eq!(
             service.get_object(&hash).await?.as_deref(),
             Some(data.as_slice())
@@ -988,13 +1041,14 @@ mod tests {
 
         let data = b"remote object".to_vec();
         let hash = sha256_git(&data)?;
+        let content_cid = ContentCid::git_sha256(&hash)?;
         locator
             .add_provider(
-                locator_cid_from_sha256(&hash),
+                locator_cid_from_content(&content_cid),
                 PeerContact::untrusted(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 6881)),
             )
             .await;
-        fetcher.insert(hash.clone(), data.clone()).await;
+        fetcher.insert(hash.clone(), data.clone()).await?;
 
         assert_eq!(
             service.get_object(&hash).await?.as_deref(),
@@ -1007,6 +1061,48 @@ mod tests {
             Some(data.as_slice())
         );
         assert_eq!(fetcher.calls().await, 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_get_object_returns_remote_xet_bytes_uncommitted() -> crate::error::Result<()> {
+        let temp_dir = TempDir::new()?;
+        let locator = Arc::new(MockObjectLocator::default());
+        let fetcher = Arc::new(MockBlobFetcher::default());
+        let service = GitTorrentService::new_with_object_plane(
+            test_config(temp_dir.path()),
+            locator.clone(),
+            fetcher.clone(),
+        )
+        .await?;
+
+        let data = b"xet reconstruction bytes".to_vec();
+        let cid = ContentCid::xet_merkle(&[0x7f; 32])?;
+        locator
+            .add_provider(
+                locator_cid_from_content(&cid),
+                PeerContact::untrusted(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 6881)),
+            )
+            .await;
+        fetcher.objects.lock().await.insert(cid.clone(), data.clone());
+
+        assert_eq!(
+            service.get_object_by_cid(&cid).await?.as_deref(),
+            Some(data.as_slice())
+        );
+        // A Merkle CID cannot verify raw bytes, so provider bytes must not be
+        // committed to the local store or cache before the caller validates.
+        assert!(service
+            .object_plane
+            .blobs
+            .get_object_by_cid(&cid)
+            .await?
+            .is_none());
+        assert_eq!(
+            service.get_object_by_cid(&cid).await?.as_deref(),
+            Some(data.as_slice())
+        );
+        assert_eq!(fetcher.calls().await, 2, "uncommitted bytes are re-fetched");
         Ok(())
     }
 
@@ -1024,15 +1120,16 @@ mod tests {
         .await?;
 
         let requested_hash = sha256_git(b"wanted")?;
+        let content_cid = ContentCid::git_sha256(&requested_hash)?;
         locator
             .add_provider(
-                locator_cid_from_sha256(&requested_hash),
+                locator_cid_from_content(&content_cid),
                 PeerContact::untrusted(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 6881)),
             )
             .await;
         fetcher
             .insert(requested_hash.clone(), b"poisoned".to_vec())
-            .await;
+            .await?;
 
         assert!(service.get_object(&requested_hash).await.is_err());
         assert!(service
