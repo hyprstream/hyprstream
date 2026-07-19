@@ -5542,8 +5542,9 @@ mod query_candidates_tests {
     async fn liveness_admission_denial_skips_cache_and_repository_ingest() {
         let did = "did:web:unadmitted-node.example.com";
         let rec = sample_node_record(did, vec![]);
+        let (car, _verifying_key) = node_repo_car(did, &rec);
         let resolver = Arc::new(TrackingRepoResolver {
-            repos: HashMap::from([(did.to_owned(), node_repo_car(did, &rec))]),
+            repos: HashMap::from([(did.to_owned(), car)]),
             resolved: parking_lot::Mutex::new(Vec::new()),
         });
         let (sk, vk) = hyprstream_rpc::crypto::generate_signing_keypair();
