@@ -47,7 +47,7 @@ use super::state::OAuthState;
 /// Used as the method-specific identifier in did:web — `did:web:{authority}:...`.
 /// Mirrors the helper in `user_mapping.rs` but kept inline here to avoid
 /// pulling in the user-mapping module from a different concern.
-fn issuer_authority(issuer_url: &str) -> Option<String> {
+pub(crate) fn issuer_authority(issuer_url: &str) -> Option<String> {
     let after_scheme = issuer_url.split_once("://").map(|(_, rest)| rest)?;
     let authority = after_scheme.split('/').next().unwrap_or(after_scheme);
     if authority.is_empty() { None } else { Some(authority.to_owned()) }
