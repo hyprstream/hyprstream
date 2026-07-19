@@ -244,8 +244,8 @@ workspace_members=$(
                     print substr(line, RSTART + 1, RLENGTH - 2)
                     line = substr(line, RSTART + RLENGTH)
                 }
+                if (line ~ /\]/) members = 0
             }
-            members && /^\]/ { members = 0 }
         '
 )
 workspace_crates=$(awk 'NF { count++ } END { print count + 0 }' <<<"$workspace_members")
@@ -275,11 +275,12 @@ while IFS= read -r member; do
                 /^\[/ {
                     section = $0
                     gsub(/[[:space:]]/, "", section)
-                    flat = (section ~ /(^|\.)(dev-|build-)?dependencies\]$/)
-                    if (section ~ /(^|\.)(dev-|build-)?dependencies\.[A-Za-z0-9_-]+\]$/) {
+                    sub(/^\[/, "", section)
+                    sub(/\]$/, "", section)
+                    flat = (section ~ /(^|\.)(dev-|build-)?dependencies$/)
+                    if (section ~ /(^|\.)(dev-|build-)?dependencies\.[A-Za-z0-9_-]+$/) {
                         dependency = section
                         sub(/^.*(dev-|build-)?dependencies\./, "", dependency)
-                        sub(/\]$/, "", dependency)
                         print dependency
                     }
                     next
