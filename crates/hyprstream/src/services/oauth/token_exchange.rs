@@ -997,6 +997,7 @@ async fn issue_grant_refresh_token(
         verifying_key_bytes: None,
         dpop_jkt: None,
         ucan_grant: grant_refresh,
+        dpop_jkt: None,
     };
 
     if let Some(db) = &state.token_db {
@@ -1158,6 +1159,7 @@ mod tests {
                 requested_scope: Some("read:model:llama".to_owned()),
                 audience: Some("https://api.example".to_owned()),
             }),
+            dpop_jkt: None,
         };
         let json = serde_json::to_string(&entry).unwrap();
         let back: super::super::state::RefreshTokenEntry = serde_json::from_str(&json).unwrap();

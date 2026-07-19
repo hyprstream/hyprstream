@@ -57,6 +57,7 @@ pub struct VerifyForm {
 }
 
 /// POST /oauth/device — Device Authorization Endpoint (RFC 8628 Section 3.1)
+#[allow(clippy::redundant_closure_for_method_calls)] // owned vs borrowed RegisteredClient
 pub async fn device_authorize(
     State(state): State<Arc<OAuthState>>,
     Form(params): Form<DeviceAuthRequest>,
@@ -95,13 +96,47 @@ pub async fn device_authorize(
     rand::rngs::OsRng.fill_bytes(&mut nonce_bytes);
     let nonce = URL_SAFE_NO_PAD.encode(nonce_bytes);
 
-    let scopes: Vec<String> = params
-        .scope
-        .as_deref()
-        .unwrap_or(&state.default_scopes.join(" "))
-        .split_whitespace()
-        .map(std::borrow::ToOwned::to_owned)
-        .collect();
+    let scopes: Vec<String> = {
+        // #1113 rev2 F4: validate requested scopes against server-supported
+        // ∩ client-declared (no arbitrary scope text reaching issuance).
+        let requested: Vec<String> = params
+            .scope
+            .as_deref()
+            .unwrap_or(&state.default_scopes.join(" "))
+            .split_whitespace()
+            .map(std::borrow::ToOwned::to_owned)
+            .collect();
+        let client_declared = if params.client_id.starts_with("https://") {
+            super::registration::resolve_cimd_client(&state, &params.client_id)
+                .await
+                .map(|c| c.declared_scopes())
+                .unwrap_or_default()
+        } else {
+            state
+                .clients
+                .read()
+                .await
+                .get(&params.client_id)
+                .map(|c| c.declared_scopes())
+                .unwrap_or_default()
+        };
+        let require_atproto = super::state::atproto_profile_active(&requested);
+        match super::state::validate_requested_scopes(
+            &requested,
+            &state.server_supported_scopes(),
+            if client_declared.is_empty() { None } else { Some(&client_declared) },
+            require_atproto,
+        ) {
+            Ok(g) => g,
+            Err(_) => {
+                return device_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_scope",
+                    "Requested scope is not supported or not declared by the client",
+                );
+            }
+        }
+    };
 
     let resource = params.resource.filter(|s| !s.is_empty());
 

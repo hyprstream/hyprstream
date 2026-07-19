@@ -207,45 +207,58 @@ mod tests {
         assert!(public.is_none());
     }
 
-    /// #1113: a local username maps to a `did:web` subject so the access
-    /// token `sub` is the account DID — what atproto clients expect.
+    /// #1113 rev2 / #1124: a local username has NO atproto identity →
+    /// rejected (fail closed). Synthesizing a path-form did:web is
+    /// spec-invalid and was removed; provisioning is tracked in #1124.
     #[test]
-    fn subject_did_for_local_username_is_did_web() {
-        let did = subject_did_for("https://pds.example.com", "alice").unwrap();
-        assert_eq!(did, "did:web:pds.example.com:users:alice");
+    fn subject_did_for_local_username_rejected() {
+        let err = subject_did_for("https://pds.example.com", "alice").unwrap_err();
+        assert_eq!(err, SubjectDidError::NoAtprotoIdentity);
     }
 
-    /// #1113: loopback/dev issuers preserve the port in the did:web authority.
+    /// #1113 rev2: a valid `did:plc` is accepted (real atproto account DID).
     #[test]
-    fn subject_did_for_loopback_preserves_port() {
-        let did = subject_did_for("http://127.0.0.1:6791", "alice").unwrap();
-        assert_eq!(did, "did:web:127.0.0.1:6791:users:alice");
+    fn subject_did_for_did_plc_accepted() {
+        assert_eq!(
+            subject_did_for("https://x", "did:plc:abc123xyz").unwrap(),
+            "did:plc:abc123xyz"
+        );
     }
 
-    /// #1113: supported atproto account DIDs (`did:plc`, `did:web`) from an
-    /// external mapper pass through unchanged — never double-wrapped.
+    /// #1113 rev2: a host-form `did:web:host[:port]` (NO path) is accepted.
     #[test]
-    fn subject_did_for_supported_account_did_passthrough() {
-        for did in ["did:plc:xyz123", "did:web:foo.com:users:bob"] {
-            assert_eq!(subject_did_for("https://pds.example.com", did).unwrap(), did);
-        }
+    fn subject_did_for_host_form_did_web_accepted() {
+        assert_eq!(
+            subject_did_for("https://x", "did:web:pds.example.com").unwrap(),
+            "did:web:pds.example.com"
+        );
+        assert_eq!(
+            subject_did_for("https://x", "did:web:127.0.0.1:6791").unwrap(),
+            "did:web:127.0.0.1:6791"
+        );
     }
 
-    /// #1113 correction: `did:at9p` (and other non-plc/non-web DID methods)
-    /// are NOT eligible for atproto OAuth tokens — subject derivation fails
-    /// closed so the token path rejects issuance.
+    /// #1113 rev2: a path-form did:web (rejected by the atproto DID profile)
+    /// is rejected — the atproto DID profile forbids path components.
+    #[test]
+    fn subject_did_for_path_form_did_web_rejected() {
+        let err = subject_did_for("https://x", "did:web:pds.example.com:users:alice").unwrap_err();
+        assert_eq!(err, SubjectDidError::PathFormDidWeb);
+    }
+
+    /// #1113 correction: `did:at9p` and other non-plc/non-web DID methods
+    /// are NOT eligible for atproto OAuth tokens.
     #[test]
     fn subject_did_for_at9p_fails_closed() {
         let err = subject_did_for("https://pds.example.com", "did:at9p:abc").unwrap_err();
-        assert!(matches!(err, SubjectDidError::UnsupportedMethod));
+        assert_eq!(err, SubjectDidError::UnsupportedMethod);
     }
 
-    /// #1113: a username that would corrupt a did:web path is rejected rather
-    /// than producing a malformed DID.
+    /// #1113 rev2: a malformed did:plc (empty body) is rejected.
     #[test]
-    fn subject_did_for_path_corrupting_username_rejected() {
-        let err = subject_did_for("https://pds.example.com", "alice/bob").unwrap_err();
-        assert!(matches!(err, SubjectDidError::IncompatibleUsername));
+    fn subject_did_for_malformed_plc_rejected() {
+        let err = subject_did_for("https://x", "did:plc:").unwrap_err();
+        assert_eq!(err, SubjectDidError::MalformedDid);
     }
 
     /// #1113 rev2 finding 7: atproto profile activates only when `atproto` is
@@ -328,6 +341,34 @@ mod tests {
             Some("http://127.0.0.1:6791")
         );
         assert!(canonical_issuer_origin("pds.example.com").is_none());
+    }
+
+    /// #1113 rev2 F4/F6: the default grant set (omitted-scope fallback) must
+    /// NOT include `atproto` — those scopes are supported-but-explicit. A
+    /// client that omits `scope` must NOT silently activate the strict profile.
+    #[test]
+    fn default_scopes_do_not_include_atproto() {
+        let cfg = crate::config::OAuthConfig::default();
+        assert!(
+            !cfg.default_scopes.iter().any(|s| s == "atproto"),
+            "default_scopes must NOT include atproto (supported-but-explicit): {:?}",
+            cfg.default_scopes
+        );
+        // But server_supported_scopes DOES include it.
+        let supported = advertised_scopes_for_test(&cfg.default_scopes);
+        assert!(supported.iter().any(|s| s == "atproto"));
+        assert!(supported.iter().any(|s| s == "transition:generic"));
+    }
+
+    /// Helper mirroring the advertised_scopes logic for test assertions.
+    fn advertised_scopes_for_test(default_scopes: &[String]) -> Vec<String> {
+        let mut scopes = default_scopes.to_vec();
+        for s in &["atproto", "transition:generic"] {
+            if !scopes.iter().any(|x| x == *s) {
+                scopes.push((*s).to_owned());
+            }
+        }
+        scopes
     }
 }
 
@@ -460,6 +501,10 @@ pub struct RefreshTokenEntry {
     /// keeps the generic OAuth 2.1 rotation path unchanged.
     #[serde(default)]
     pub ucan_grant: Option<UcanGrantRefresh>,
+    /// DPoP key thumbprint bound at issuance (#1113 rev2 F3). The refresh
+    /// path requires a proof from the SAME key for atproto-scoped tokens.
+    #[serde(default)]
+    pub dpop_jkt: Option<String>,
 }
 
 /// Re-evaluation context persisted alongside a UCAN-grant refresh token so the
@@ -701,7 +746,12 @@ impl OAuthState {
             token_db: None,
             policy_client,
             discovery_client,
-            issuer_url: config.issuer_url(),
+            // #1113 rev2 F5: canonicalize to exact origin (scheme://host[:port])
+            // so ALL emissions — token claims, metadata, redirect iss, userinfo
+            // endpoint — use the normalized origin, not raw external_url which
+            // may carry a trailing slash or path.
+            issuer_url: canonical_issuer_origin(&config.issuer_url())
+                .unwrap_or_else(|| config.issuer_url()),
             default_scopes: config.default_scopes.clone(),
             token_ttl: config.token_ttl_seconds,
             refresh_token_ttl: config.refresh_token_ttl_seconds,
@@ -992,19 +1042,33 @@ impl OAuthState {
         self.dpop_clients_seen.write().await.insert(jkt.to_owned(), expiry);
     }
 
-    /// Derive the JWT `sub` claim for an atproto-conformant access token.
+    /// Validate the JWT `sub` claim for an atproto-conformant access token
+    /// (#1113 rev2 / #1124 split).
     ///
-    /// atproto OAuth requires the access token's `sub` to be the account's
-    /// DID. Locally enrolled users are addressed by username, so we synthesize
-    /// a `did:web:{authority}:users:{username}` subject — mirroring the
-    /// external-OIDC `DidWeb` mapping in [`super::user_mapping`]. Subjects
-    /// that already carry a supported atproto account DID (`did:plc`,
-    /// `did:web`) pass through unchanged. `did:at9p` and other DID methods
-    /// are NOT eligible for atproto OAuth tokens and return
-    /// [`SubjectDidError::UnsupportedMethod`] so the caller fails closed
-    /// (#1113 correction).
-    pub fn subject_did(&self, local_subject: &str) -> Result<String, SubjectDidError> {
-        subject_did_for(&self.issuer_url, local_subject)
+    /// atproto OAuth requires the access token's `sub` to be a real,
+    /// resolvable atproto account DID: `did:plc:<opaque>` or host-form
+    /// `did:web:<host>[:port]` (NO path component — the atproto DID profile
+    /// rejects `did:web:host:users:alice`). A hyprstream-local account
+    /// (enrolled by Ed25519 username) has no atproto DID yet; provisioning
+    /// is tracked in #1124. Such accounts are REJECTED from the atproto
+    /// profile (fail closed), never minted a spec-invalid path-form alias.
+    pub fn subject_did(&self, subject: &str) -> Result<String, SubjectDidError> {
+        subject_did_for(&self.issuer_url, subject)
+    }
+
+    /// The full set of scopes this AS supports (#1113 rev2 F4).
+    /// Extends `default_scopes` (the omitted-scope grant set) with the
+    /// atproto transition scopes, which are supported-but-explicit: a client
+    /// must request them to activate the strict profile; omitting `scope`
+    /// grants only `default_scopes`.
+    pub fn server_supported_scopes(&self) -> Vec<String> {
+        let mut scopes = self.default_scopes.clone();
+        for atproto_scope in &["atproto", "transition:generic"] {
+            if !scopes.iter().any(|s| s == *atproto_scope) {
+                scopes.push((*atproto_scope).to_owned());
+            }
+        }
+        scopes
     }
 
     /// Attach an RSA key for RS256 id_token signing (OIDC interop).
@@ -1092,52 +1156,84 @@ impl OAuthState {
     }
 }
 
-/// Derive the atproto-conformant DID `sub` for a local subject (#1113).
+/// Validate that a subject is a real, resolvable atproto account DID (#1113
+/// rev2 → #1124 split).
 ///
-/// Free-function form of [`OAuthState::subject_did`] so the mapping is
-/// unit-testable without constructing a full `OAuthState`.
+/// The atproto DID profile (`@atproto/did`) accepts only:
+/// - `did:plc:<opaque>` — the registered PLC-directory form.
+/// - `did:web:<host>[:port]` — the **host-form only** (NO path component);
+///   `did:web:host:users:alice` is explicitly rejected by the atproto DID
+///   profile.
 ///
-/// **atproto account DID methods (#1113 correction):** only `did:plc` and
-/// `did:web` are eligible subjects for atproto OAuth tokens. `did:at9p` (and
-/// any other DID method) is rejected via [`SubjectDidError::UnsupportedMethod`]
-/// — the token path fails closed rather than minting a token for an
-/// ineligible subject.
+/// Hyprstream-local accounts (enrolled by Ed25519 username) do NOT yet carry
+/// a real atproto DID — provisioning one is tracked in #1124. Such accounts
+/// are REJECTED from the atproto profile (fail closed with
+/// [`SubjectDidError::NoAtprotoIdentity`]) rather than being minted a
+/// spec-invalid path-form did:web. This function performs DID-form
+/// validation, not a string-prefix match — an at9p-backed account whose
+/// enrolled identifier is a plain username is rejected just like any other
+/// non-DID subject.
 pub fn subject_did_for(
-    issuer_url: &str,
-    local_subject: &str,
+    _issuer_url: &str,
+    subject: &str,
 ) -> Result<String, SubjectDidError> {
-    // did:plc and did:web are the supported atproto account DIDs — pass through.
-    if local_subject.starts_with("did:plc:") || local_subject.starts_with("did:web:") {
-        return Ok(local_subject.to_owned());
+    // did:plc — the only non-`did:web` atproto method. Pass through a
+    // well-formed `did:plc:` identifier unchanged.
+    if let Some(rest) = subject.strip_prefix("did:plc:") {
+        if !rest.is_empty() && rest.chars().all(|c| c.is_ascii_alphanumeric()) {
+            return Ok(subject.to_owned());
+        }
+        return Err(SubjectDidError::MalformedDid);
     }
-    // Any other did: method (notably did:at9p) is NOT eligible for atproto
-    // OAuth tokens — fail closed (#1113 correction).
-    if local_subject.starts_with("did:") {
+    // did:web — host-form only. The atproto DID profile rejects path
+    // components (`/`-segments encoded as extra colon groups are allowed by
+    // the base did:web spec, but atproto's narrower profile does not). A
+    // host-form did:web has exactly one path segment after the method:
+    // `did:web:<host>[:port]`. Reject `did:web:<host>:users:...` (path form).
+    if let Some(rest) = subject.strip_prefix("did:web:") {
+        if rest.is_empty() {
+            return Err(SubjectDidError::MalformedDid);
+        }
+        // atproto host-form: no `/`, no `:`-delimited path beyond host[:port].
+        // A path-form did:web (e.g. `did:web:host:users:alice`) carries
+        // additional colon segments; reject it.
+        if rest.contains('/') {
+            return Err(SubjectDidError::PathFormDidWeb);
+        }
+        let segment_count = rest.split(':').count();
+        // host[:port] → 1 or 2 segments. ≥3 implies a path form.
+        if segment_count > 2 {
+            return Err(SubjectDidError::PathFormDidWeb);
+        }
+        return Ok(subject.to_owned());
+    }
+    // Any other did: method (did:at9p, did:key, ...) is NOT eligible.
+    if subject.starts_with("did:") {
         return Err(SubjectDidError::UnsupportedMethod);
     }
-    let authority = super::user_mapping::extract_authority(issuer_url)
-        .map_err(|_| SubjectDidError::InvalidIssuer)?;
-    // did:web path segments are colon-separated; reject usernames that would
-    // corrupt the DID (mirrors user_mapping::DidWeb validation).
-    if local_subject.contains(['#', '?', '/']) {
-        return Err(SubjectDidError::IncompatibleUsername);
-    }
-    Ok(format!("did:web:{authority}:users:{local_subject}"))
+    // A non-DID subject (local username) has no atproto identity — fail
+    // closed. Provisioning real DIDs for hosted accounts is tracked in #1124.
+    Err(SubjectDidError::NoAtprotoIdentity)
 }
 
 /// Errors raised by [`subject_did_for`] / [`OAuthState::subject_did`].
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum SubjectDidError {
     /// The subject carries a DID method that is not eligible for atproto
-    /// OAuth tokens (e.g. `did:at9p`). The token path fails closed.
+    /// OAuth tokens (e.g. `did:at9p`, `did:key`). The token path fails closed.
     #[error("DID method not eligible for atproto OAuth tokens")]
     UnsupportedMethod,
-    /// The issuer URL could not be parsed into a did:web authority.
-    #[error("invalid issuer URL for did:web subject")]
-    InvalidIssuer,
-    /// The local username contains characters that would corrupt a did:web path.
-    #[error("local username incompatible with did:web path")]
-    IncompatibleUsername,
+    /// A did:plc/did:web identifier is malformed (empty or illegal body).
+    #[error("malformed atproto DID")]
+    MalformedDid,
+    /// A path-form did:web (e.g. `did:web:host:users:alice`) is rejected by
+    /// the atproto DID profile — only host-form did:web is accepted.
+    #[error("path-form did:web rejected by atproto DID profile")]
+    PathFormDidWeb,
+    /// A non-DID subject (local username) has no atproto identity. Real
+    /// atproto DID provisioning for hosted accounts is tracked in #1124.
+    #[error("account has no atproto identity; provisioning tracked in #1124")]
+    NoAtprotoIdentity,
 }
 
 /// The atproto transition scope name. Its presence in a granted scope set

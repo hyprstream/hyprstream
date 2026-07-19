@@ -497,6 +497,9 @@ async fn exchange_refresh_token(
         }
     };
 
+    // #1113 rev2 F3: validate client_id and DPoP BEFORE consuming the
+    // single-use refresh token. Consuming first and failing second strands
+    // the legitimate session on a missing/invalid proof.
     if params.client_id != entry.client_id {
         return token_error(
             StatusCode::BAD_REQUEST,
@@ -536,7 +539,7 @@ async fn exchange_refresh_token(
         .await;
     }
 
-    // Verify DPoP before consuming the refresh token. A `use_dpop_nonce`
+    // Verify DPoP before consuming the refresh token. A use_dpop_nonce
     // response must leave the credential available for the RFC 9449 retry.
     let dpop_jkt = match verify_dpop_at_token_endpoint(&state, dpop_header.as_deref()).await {
         None => None,
@@ -552,6 +555,21 @@ async fn exchange_refresh_token(
             "invalid_dpop_proof",
             Some("DPoP proof must use the key bound to this refresh token"),
         );
+    }
+
+    // The atproto profile is always DPoP-mandatory and sender-bound, even if
+    // a malformed legacy refresh entry somehow lacks a stored thumbprint.
+    if super::state::atproto_profile_active(&entry.scopes) {
+        match (&dpop_jkt, &entry.dpop_jkt) {
+            (Some(proof_jkt), Some(bound_jkt)) if proof_jkt == bound_jkt => {}
+            _ => {
+                return token_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_dpop_proof",
+                    Some("atproto profile requires a DPoP proof from the key bound at issuance"),
+                );
+            }
+        }
     }
 
     // Atomically claim only after all retryable DPoP validation succeeds.
@@ -814,7 +832,7 @@ async fn issue_token_with_refresh(
                 return token_error(
                     StatusCode::BAD_REQUEST,
                     "invalid_request",
-                    Some("account subject is not eligible for an atproto OAuth token"),
+                    Some("account has no atproto identity; provisioning tracked in #1124"),
                 );
             }
         }
@@ -884,6 +902,7 @@ async fn issue_token_with_refresh(
                     verifying_key_bytes: user_verifying_key.map(|vk| *vk.as_bytes()),
                     dpop_jkt: dpop_jkt.clone(),
                     ucan_grant: None, // generic OAuth refresh; not a UCAN grant (MAC #547 B1)
+                    dpop_jkt: dpop_jkt.clone(), // #1113 rev2 F3: sender-bind the refresh token
                 };
                 if let Err(e) = state.put_refresh_token(&refresh_token, &entry, state.refresh_token_ttl as u64).await {
                     tracing::error!(error = %e, "Failed to persist refresh token");
@@ -1151,22 +1170,31 @@ mod tests {
 
     /// #1113 rev2 finding 1: the atproto token response matches
     /// atprotoOAuthTokenResponseSchema — `token_type: "DPoP"`, a top-level
-    /// `sub` that is a did:plc/did:web, and a scope containing `atproto`.
+    /// `sub` that is a valid atproto DID (did:plc or host-form did:web), and
+    /// a scope containing `atproto`. Uses a valid `did:plc` subject (the
+    /// spec-valid form; path-form did:web is rejected by @atproto/did — #1124).
     #[test]
     fn atproto_token_response_matches_schema_shape() {
         let json = build_token_response_json(
             true,
             "access-jwt",
-            "did:web:pds.example.com:users:alice",
+            "did:plc:abc123xyz",
             "atproto transition:generic",
             3600,
             "rt",
         );
         assert_eq!(json["token_type"].as_str(), Some("DPoP"));
         let sub = json["sub"].as_str().expect("top-level sub required");
+        // Valid atproto DID: did:plc (or host-form did:web with NO path).
         assert!(
-            sub.starts_with("did:plc:") || sub.starts_with("did:web:"),
-            "atproto sub must be an account DID, got {sub}"
+            sub.starts_with("did:plc:") || {
+                if let Some(rest) = sub.strip_prefix("did:web:") {
+                    rest.split(':').count() <= 2 && !rest.contains('/')
+                } else {
+                    false
+                }
+            },
+            "atproto sub must be did:plc or host-form did:web (no path), got {sub}"
         );
         let scope = json["scope"].as_str().expect("scope required");
         assert!(scope.split_whitespace().any(|s| s == "atproto"), "scope missing atproto");

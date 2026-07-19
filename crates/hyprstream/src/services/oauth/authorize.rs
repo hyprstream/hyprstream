@@ -290,6 +290,15 @@ pub async fn authorize_post(
             )).into_response();
         };
         let fresh_nonce = issue_nonce(&state).await;
+        // #1113 rev2 F3: re-stash the binding on error-retry so the PAR
+        // key binding survives a nonce-expired re-render.
+        if let Some(ref binding) = authorize_binding {
+            state
+                .pending_authorize_bindings
+                .write()
+                .await
+                .insert(fresh_nonce.clone(), binding.clone());
+        }
         let html = render_challenge_page(
             &client_name,
             &form.scope,
@@ -350,6 +359,16 @@ pub async fn authorize_post(
             };
             // Issue a fresh nonce so re-render shows a signable challenge.
             let fresh_nonce = issue_nonce(&state).await;
+            // #1113 rev2 F3: re-stash the PAR-bound DPoP jkt under the fresh
+            // nonce so one failed consent signature doesn't lose the PAR key
+            // binding (which would break the later token exchange).
+            if let Some(ref binding) = authorize_binding {
+                state
+                    .pending_authorize_bindings
+                    .write()
+                    .await
+                    .insert(fresh_nonce.clone(), binding.clone());
+            }
             let html = render_challenge_page(
                 &client_name,
                 &form.scope,
@@ -386,7 +405,7 @@ pub async fn authorize_post(
     let require_atproto = super::state::atproto_profile_active(&requested_scopes);
     let granted_scopes = match super::state::validate_requested_scopes(
         &requested_scopes,
-        &state.default_scopes,
+        &state.server_supported_scopes(),
         if client_declared.is_empty() { None } else { Some(&client_declared) },
         require_atproto,
     ) {
@@ -428,19 +447,20 @@ pub async fn authorize_post(
     );
 
     // Build redirect URL using url::Url to ensure proper percent-encoding of `state`.
-    let redirect_url = match url::Url::parse(&form.redirect_uri) {
-        Ok(mut u) => {
-            {
-                let mut q = u.query_pairs_mut();
-                q.append_pair("code", &code);
-                if let Some(ref s) = form.state {
-                    q.append_pair("state", s);
-                }
-            }
-            u.to_string()
-        }
+    // #1113 rev2 F5: append `iss` (the issuer) to the redirect per RFC 9207
+    // / OAuth 2.1 authorization-response-iss-parameter. The AS advertises
+    // `authorization_response_iss_parameter_supported: true` — the stock
+    // atproto client throws "iss missing" if it's absent.
+    let redirect_iss = super::state::canonical_issuer_origin(&state.issuer_url)
+        .unwrap_or_else(|| state.issuer_url.clone());
+    let redirect_url = match build_authorize_redirect_url(
+        &form.redirect_uri,
+        &code,
+        form.state.as_deref(),
+        &redirect_iss,
+    ) {
+        Ok(u) => u,
         Err(_) => {
-            // redirect_uri was validated on GET; this should not happen
             return error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "server_error",
@@ -506,6 +526,21 @@ async fn resolve_authorize_query(
             "This server requires a Pushed Authorization Request (RFC 9126). \
              Submit your authorization parameters to /oauth/par first and use the returned request_uri.",
         ));
+    }
+    // #1113 rev2 F6: the atproto profile mandates PAR — an inline (non-PAR)
+    // authorization request that includes the `atproto` scope is rejected.
+    // This keeps inline non-atproto auth working while enforcing the atproto
+    // strict profile (DPoP binding at PAR).
+    if let Some(ref scope_str) = query.scope {
+        if super::state::atproto_profile_active(
+            &scope_str.split_whitespace().map(str::to_owned).collect::<Vec<_>>(),
+        ) {
+            return Err(error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                "The atproto profile requires a Pushed Authorization Request (RFC 9126) with a DPoP proof.",
+            ));
+        }
     }
 
     // Inline path: enforce the originally-required fields.
@@ -608,6 +643,28 @@ async fn resolve_client_declared_scopes(state: &OAuthState, client_id: &str) -> 
         }
     };
     client.declared_scopes()
+}
+
+/// Build the authorization redirect URL (#1113 rev2 F5).
+/// Pure function so the `iss` query parameter is unit-testable without
+/// constructing an OAuthState. RFC 9207 / OAuth 2.1 iss-parameter support
+/// requires `iss` on every authorization-code redirect.
+pub(crate) fn build_authorize_redirect_url(
+    redirect_uri: &str,
+    code: &str,
+    state: Option<&str>,
+    iss: &str,
+) -> Result<String, ()> {
+    let mut u = url::Url::parse(redirect_uri).map_err(|_| ())?;
+    {
+        let mut q = u.query_pairs_mut();
+        q.append_pair("code", code);
+        q.append_pair("iss", iss);
+        if let Some(s) = state {
+            q.append_pair("state", s);
+        }
+    }
+    Ok(u.to_string())
 }
 
 /// Build the consent-screen localhost warning when every registered
@@ -828,5 +885,49 @@ mod tests {
     #[test]
     fn localhost_warning_empty_returns_none() {
         assert!(compute_localhost_warning(&[]).is_none());
+    }
+
+    /// #1113 rev2 F5: the authorization redirect URL MUST include `iss`
+    /// (RFC 9207). The stock atproto client throws "iss missing" when
+    /// `authorization_response_iss_parameter_supported: true` is advertised.
+    #[test]
+    fn authorize_redirect_includes_iss_parameter() {
+        let url = build_authorize_redirect_url(
+            "https://client.example/cb",
+            "authcode123",
+            Some("xyz"),
+            "https://pds.example.com",
+        )
+        .unwrap();
+        let parsed = url::Url::parse(&url).unwrap();
+        assert_eq!(
+            parsed.query_pairs().find(|(k, _)| k == "iss"),
+            Some(("iss".into(), "https://pds.example.com".into())),
+            "redirect MUST include iss: {url}"
+        );
+        assert_eq!(
+            parsed.query_pairs().find(|(k, _)| k == "code"),
+            Some(("code".into(), "authcode123".into()))
+        );
+    }
+
+    /// #1113 rev2 F5: iss is canonicalized to exact origin (no trailing slash).
+    #[test]
+    fn authorize_redirect_iss_is_canonical_origin() {
+        let url = build_authorize_redirect_url(
+            "https://client.example/cb",
+            "code",
+            None,
+            "https://pds.example.com",
+        )
+        .unwrap();
+        let parsed = url::Url::parse(&url).unwrap();
+        let iss = parsed
+            .query_pairs()
+            .find(|(k, _)| k == "iss")
+            .map(|(_, v)| v.to_string())
+            .unwrap();
+        assert_eq!(iss, "https://pds.example.com");
+        assert!(!iss.ends_with('/'), "iss must be origin (no trailing slash)");
     }
 }

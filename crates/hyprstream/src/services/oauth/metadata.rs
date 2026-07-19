@@ -9,6 +9,19 @@ use axum::{extract::State, response::IntoResponse, Json};
 
 use super::state::OAuthState;
 
+/// The full set of scopes the AS advertises in `scopes_supported` (#1113 rev2 F4).
+/// Extends the operator's default grant set with the atproto transition scopes,
+/// which are supported-but-explicit (NOT silently granted on omitted scope).
+fn advertised_scopes(default_scopes: &[String]) -> Vec<String> {
+    let mut scopes = default_scopes.to_vec();
+    for atproto_scope in &["atproto", "transition:generic"] {
+        if !scopes.iter().any(|s| s == *atproto_scope) {
+            scopes.push((*atproto_scope).to_owned());
+        }
+    }
+    scopes
+}
+
 /// Base metadata fields shared between RFC 8414 and OIDC discovery.
 fn base_metadata(issuer: &str, scopes: &[String], require_par: bool) -> serde_json::Value {
     let mut scopes_supported = scopes.to_vec();
@@ -20,6 +33,7 @@ fn base_metadata(issuer: &str, scopes: &[String], require_par: bool) -> serde_js
     // produce double-slash endpoint URLs and a non-origin issuer the stock
     // resolver rejects against the discovery origin.
     let issuer = super::state::canonical_issuer_origin(issuer).unwrap_or_else(|| issuer.to_owned());
+    let scopes = advertised_scopes(scopes);
     serde_json::json!({
         "issuer": issuer,
         "authorization_endpoint": format!("{}/oauth/authorize", issuer),

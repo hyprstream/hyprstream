@@ -192,7 +192,7 @@ pub async fn push_authorization_request(
     let require_atproto = super::state::atproto_profile_active(&requested_scopes);
     let granted_scopes = match super::state::validate_requested_scopes(
         &requested_scopes,
-        &state.default_scopes,
+        &state.server_supported_scopes(),
         if client_declared.is_empty() { None } else { Some(&client_declared) },
         require_atproto,
     ) {
