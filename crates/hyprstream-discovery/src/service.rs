@@ -28,7 +28,7 @@ use crate::generated::discovery_client::{
 use crate::placement_index::PlacementIndex;
 use crate::scheduling;
 
-use anyhow::{Context,Result};
+use anyhow::{Context, Result};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use hyprstream_rpc::identity::Did;
 use hyprstream_util::ttl_cache::TtlCache;
@@ -52,6 +52,10 @@ const LIVENESS_TTL: Duration = Duration::from_secs(45);
 /// large bound doesn't cost anything until it's actually full.
 const LIVENESS_CACHE_MAX_ENTRIES: usize = 16_384;
 const LIVENESS_CACHE_REAP_BUDGET: usize = 32;
+/// Bound retry work for an admitted DID whose repo is absent, invalid, or does
+/// not yet contain a node record. This prevents heartbeat-rate resolver polls
+/// while allowing eventual recovery when a placement record is later published.
+const PLACEMENT_INGEST_RETRY_TTL: Duration = Duration::from_secs(300);
 const ANNOUNCED_ENDPOINT_TTL: Duration = Duration::from_secs(90);
 
 /// Default bound applied to `queryCandidates` when the caller passes
@@ -778,10 +782,13 @@ pub struct DiscoveryService {
     /// Domain the TLS endorsement covers (empty when no endorsement).
     tls_domain: String,
     /// #524 P1 — durable placement directory (labels/declared-resources/group
-    /// consents), refreshed by polling `record_resolver` lazily: the first
-    /// `reportNodeLiveness` heartbeat seen for a DID with no ingested
-    /// `NodeRecord` yet triggers a poll of its repo.
+    /// consents), refreshed by polling `record_resolver` lazily for an admitted
+    /// heartbeat DID with no ingested `NodeRecord` yet.
     placement_index: PlacementIndex,
+    /// Bounded retry gate for first-seen placement repository polls. A DID is
+    /// marked before resolver access, so absent/invalid/non-node repos cannot
+    /// turn heartbeat frequency into unbounded work.
+    placement_ingest_attempts: TtlCache<Did, ()>,
     /// #524 P1 — live allocatable capacity + load per node, TTL'd
     /// (`LIVENESS_TTL`). Backs the hard-exclusion-on-staleness rule in
     /// `queryCandidates`.
@@ -817,6 +824,10 @@ impl DiscoveryService {
             tls_endorsement: Vec::new(),
             tls_domain: String::new(),
             placement_index: PlacementIndex::new(),
+            placement_ingest_attempts: TtlCache::new(
+                LIVENESS_CACHE_MAX_ENTRIES,
+                LIVENESS_CACHE_REAP_BUDGET,
+            ),
             liveness: TtlCache::new(LIVENESS_CACHE_MAX_ENTRIES, LIVENESS_CACHE_REAP_BUDGET),
             transport,
         }
@@ -2293,7 +2304,9 @@ impl RpcClient for ProductionRpcClient {
                 let p = payload.clone();
                 let s = service.clone();
                 async move {
-                    c.call_streaming_for_service_with_method(&s, method_discriminator, p, ephemeral).await }
+                    c.call_streaming_for_service_with_method(&s, method_discriminator, p, ephemeral)
+                        .await
+                }
             })
             .await?
             .0)
@@ -2365,9 +2378,9 @@ fn parse_announced_quic(endpoint: &str) -> anyhow::Result<TransportConfig> {
     let rest = endpoint
         .strip_prefix("quic://")
         .ok_or_else(|| anyhow::anyhow!("announced QUIC endpoint must start with quic://"))?;
-    let (reach, encoded_hashes) = rest.split_once('#').map_or((rest, None), |(reach, hashes)| {
-        (reach, Some(hashes))
-    });
+    let (reach, encoded_hashes) = rest
+        .split_once('#')
+        .map_or((rest, None), |(reach, hashes)| (reach, Some(hashes)));
     let (server_name, addr) = reach.split_once(':').ok_or_else(|| {
         anyhow::anyhow!("announced QUIC endpoint must be quic://<server-name>:<socket-addr>")
     })?;
@@ -2389,7 +2402,9 @@ fn parse_announced_quic(endpoint: &str) -> anyhow::Result<TransportConfig> {
                     .decode(value)
                     .context("invalid announced QUIC certificate hash")?
                     .try_into()
-                    .map_err(|_| anyhow::anyhow!("announced QUIC certificate hash must be 32 bytes"))
+                    .map_err(|_| {
+                        anyhow::anyhow!("announced QUIC certificate hash must be 32 bytes")
+                    })
             })
             .collect::<Result<Vec<[u8; 32]>>>()?;
         anyhow::ensure!(!hashes.is_empty(), "announced QUIC pin set is empty");
@@ -2962,7 +2977,7 @@ mod resolver_tests {
 
     fn accepted_state(tag: u8) -> (AcceptedAt9pState, SigningKey) {
         let signing = SigningKey::from_bytes(&[tag; 32]);
-        let pq_signing = hyprstream_rpc::node_identity::derive_mesh_mldsa_key (&signing);
+        let pq_signing = hyprstream_rpc::node_identity::derive_mesh_mldsa_key(&signing);
         let keys = HybridKeyPair::new(
             signing.verifying_key().to_bytes().to_vec(),
             ml_dsa_sk_to_vk_bytes(&pq_signing),
@@ -3025,7 +3040,9 @@ mod resolver_tests {
                 endpoint,
                 service_jwt: "verified-by-handler".to_owned(),
                 service_did: Did::from(state.did.clone()),
-                capabilities: ["hyprstream-rpc/1".to_owned(), "hyprstream-moq/1".to_owned()].into_iter().collect(),
+                capabilities: ["hyprstream-rpc/1".to_owned(), "hyprstream-moq/1".to_owned()]
+                    .into_iter()
+                    .collect(),
                 accepted_state_digest: state.head_digest.to_vec(),
                 accepted_state_epoch: state.epoch,
                 response_key_id: format!("{}#response-current", state.did),
@@ -3229,7 +3246,10 @@ mod resolver_tests {
             .and_then(|entries| entries.first_mut())
             .expect("fixture route")
             .endpoint = "quic://localhost:127.0.0.1:10".to_owned();
-        assert!(resolver.verify_browser_binding(&route_binding).await.is_err());
+        assert!(resolver
+            .verify_browser_binding(&route_binding)
+            .await
+            .is_err());
 
         let (resolver, _) = production_fixture(false);
         resolver
@@ -3239,9 +3259,9 @@ mod resolver_tests {
             .and_then(|entries| entries.first_mut())
             .expect("fixture pin")
             .endpoint = format!(
-                "quic://localhost:127.0.0.1:9#{}",
-                URL_SAFE_NO_PAD.encode([0x51; 32])
-            );
+            "quic://localhost:127.0.0.1:9#{}",
+            URL_SAFE_NO_PAD.encode([0x51; 32])
+        );
         let pin_binding = binding_for(&resolver).await;
         resolver
             .announced_endpoints
@@ -3250,9 +3270,9 @@ mod resolver_tests {
             .and_then(|entries| entries.first_mut())
             .expect("fixture pin rotation")
             .endpoint = format!(
-                "quic://localhost:127.0.0.1:9#{}",
-                URL_SAFE_NO_PAD.encode([0x52; 32])
-            );
+            "quic://localhost:127.0.0.1:9#{}",
+            URL_SAFE_NO_PAD.encode([0x52; 32])
+        );
         assert!(resolver.verify_browser_binding(&pin_binding).await.is_err());
     }
 
@@ -4839,8 +4859,9 @@ impl DiscoveryHandler for DiscoveryService {
     ///
     /// Re-inserting (heartbeating) an admitted node refreshes its TTL entry. The
     /// first heartbeat seen for a DID this directory hasn't ingested a
-    /// `NodeRecord` for yet lazily triggers a one-shot poll of that DID's repo
-    /// (day-1 ingestion cadence — see the `placement_index` module docs); a
+    /// `NodeRecord` for yet may lazily trigger a repo poll. The bounded retry
+    /// gate records an attempt before resolver access, so absent/invalid/non-
+    /// node repos are retried only after [`PLACEMENT_INGEST_RETRY_TTL`]; a
     /// failure there does not fail the admitted heartbeat itself.
     async fn handle_report_node_liveness(
         &self,
@@ -4885,7 +4906,13 @@ impl DiscoveryHandler for DiscoveryService {
         };
         self.liveness.insert(data.node.clone(), live, LIVENESS_TTL);
 
-        if self.placement_index.record_uri(&node_did).is_none() {
+        if self.placement_index.record_uri(&node_did).is_none()
+            && self.placement_ingest_attempts.insert_if_absent(
+                data.node.clone(),
+                (),
+                PLACEMENT_INGEST_RETRY_TTL,
+            )
+        {
             if let Some(resolver) = &self.record_resolver {
                 if let Err(e) = self
                     .placement_index
@@ -5490,6 +5517,40 @@ mod query_candidates_tests {
             resolver.resolved.lock().is_empty(),
             "denied DID must not reach RecordResolver::resolve_repo"
         );
+    }
+
+    /// An admitted DID with no repo is polled once per bounded retry window,
+    /// not once per heartbeat. Its liveness report still refreshes normally.
+    #[tokio::test]
+    async fn absent_node_repo_does_not_poll_again_before_retry_window() {
+        let did = "did:web:node-without-repo.example.com";
+        let resolver = Arc::new(TrackingRepoResolver {
+            repos: HashMap::new(),
+            resolved: parking_lot::Mutex::new(Vec::new()),
+        });
+        let (sk, vk) = hyprstream_rpc::crypto::generate_signing_keypair();
+        let svc = DiscoveryService::new(
+            Arc::new(sk),
+            vk,
+            hyprstream_rpc::transport::TransportConfig::inproc("placement-retry-test"),
+        )
+        .with_auth_provider(Box::new(AllowAll))
+        .with_record_resolver(resolver.clone());
+
+        heartbeat(&svc, did, vec![], 0.9).await;
+        heartbeat(&svc, did, vec![("cpu", "8")], 0.1).await;
+
+        assert_eq!(
+            resolver.resolved.lock().as_slice(),
+            [did],
+            "two heartbeats before retry expiry must produce one repo poll"
+        );
+        let live = svc
+            .liveness
+            .get(&Did::new(did.to_owned()))
+            .expect("admitted heartbeat must still refresh liveness");
+        assert!((live.load_fraction - 0.1).abs() < f32::EPSILON);
+        assert_eq!(live.allocatable, vec![("cpu".to_owned(), "8".to_owned())]);
     }
 
     fn empty_query(max_candidates: u32) -> QueryCandidatesRequest {
