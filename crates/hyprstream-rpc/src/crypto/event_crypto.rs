@@ -2,11 +2,12 @@
 //!
 //! The controller supplies a fresh random secret for every committed group
 //! epoch. Confidential event objects never use that secret directly as an AEAD
-//! key: they derive sender/track keys and nonce domains, bind publisher/track/
-//! membership-version/epoch/sequence into AAD, and derive each nonce from the
-//! domain plus epoch sequence. The module retains legacy low-level wrap helpers
-//! for compatibility, but the surviving EventService path distributes epochs
-//! exclusively through per-member HyKEM/COSE grants in `group_key`.
+//! key: they derive session-scoped sender/track keys, bind publisher/track/
+//! session/membership-version/epoch/sequence into AAD, and use an injective
+//! counter nonce within each CSPRNG-generated session key domain. The module
+//! retains legacy low-level wrap helpers for compatibility, but the surviving
+//! EventService path distributes epochs exclusively through per-member HyKEM/COSE
+//! grants in `group_key`.
 //!
 //! Key commitment provides fast wrong-key rejection before AES-256-GCM
 //! decryption. Publisher signature transcripts bind the plaintext and epoch
@@ -401,51 +402,50 @@ pub fn decrypt_event_full(
 // Controller-managed epoch object profile (#555)
 // ============================================================================
 
-const EPOCH_OBJECT_AAD_DOMAIN: &[u8] = b"hyprstream event epoch object aad v1";
+const EPOCH_OBJECT_AAD_DOMAIN: &[u8] = b"hyprstream event epoch object aad v2";
 
-/// Derive an AEAD key unique to one `(epoch secret, sender, track)` domain.
-/// The shared epoch secret is never used directly as an AEAD key.
+/// Derive an AEAD key unique to one `(epoch secret, sender, track, session)`
+/// domain. The CSPRNG session prevents a restarted or concurrent publisher from
+/// reusing a key when its in-memory sequence restarts.
 pub fn derive_sender_track_key(
     epoch_secret: &[u8; 32],
     publisher_kid: &[u8; 32],
     track: &str,
+    session_id: &[u8; 16],
 ) -> Zeroizing<[u8; 32]> {
-    let mut material = Vec::with_capacity(32 + 4 + track.len());
-    material.extend_from_slice(publisher_kid);
-    material.extend_from_slice(&(track.len() as u32).to_be_bytes());
-    material.extend_from_slice(track.as_bytes());
-    Zeroizing::new(blake3::derive_key(
-        "hyprstream event sender track key v1",
-        &[epoch_secret.as_slice(), material.as_slice()].concat(),
-    ))
-}
-
-/// Derive an independent nonce domain unique to one `(epoch secret, sender,
-/// track)` lifecycle. It is separate from the sender/track AEAD-key derivation.
-pub fn derive_sender_track_nonce_domain(
-    epoch_secret: &[u8; 32],
-    publisher_kid: &[u8; 32],
-    track: &str,
-) -> [u8; 32] {
-    let mut material = Vec::with_capacity(32 + 32 + 4 + track.len());
+    let mut material = Vec::with_capacity(32 + 32 + 4 + track.len() + 16);
     material.extend_from_slice(epoch_secret);
     material.extend_from_slice(publisher_kid);
     material.extend_from_slice(&(track.len() as u32).to_be_bytes());
     material.extend_from_slice(track.as_bytes());
-    blake3::derive_key("hyprstream event sender track nonce domain v1", &material)
+    material.extend_from_slice(session_id);
+    Zeroizing::new(blake3::derive_key(
+        "hyprstream event sender track session key v2",
+        &material,
+    ))
 }
 
-/// Derive the 96-bit nonce from an independent sender/track nonce domain,
-/// committed epoch, and monotonic object sequence.
-pub fn derive_event_nonce(nonce_domain: &[u8; 32], epoch: u64, sequence: u64) -> [u8; 12] {
-    let mut input = Vec::with_capacity(48);
-    input.extend_from_slice(nonce_domain);
-    input.extend_from_slice(&epoch.to_be_bytes());
-    input.extend_from_slice(&sequence.to_be_bytes());
-    let digest = blake3::derive_key("hyprstream event nonce v1", &input);
-    let mut nonce = [0; 12];
-    nonce.copy_from_slice(&digest[..12]);
-    nonce
+/// Return the injective 96-bit nonce for one sequence in a session-scoped key
+/// domain. Sequence zero is reserved as the pre-publication state.
+pub fn derive_event_nonce(sequence: u64) -> Result<[u8; 12], String> {
+    if sequence == 0 {
+        return Err("event sequence zero is reserved".to_owned());
+    }
+    let sequence = sequence.to_be_bytes();
+    Ok([
+        b'E',
+        b'V',
+        b'N',
+        b'1',
+        sequence[0],
+        sequence[1],
+        sequence[2],
+        sequence[3],
+        sequence[4],
+        sequence[5],
+        sequence[6],
+        sequence[7],
+    ])
 }
 
 /// Canonical authenticated coordinates kept inside the application payload/AAD;
@@ -453,15 +453,17 @@ pub fn derive_event_nonce(nonce_domain: &[u8; 32], epoch: u64, sequence: u64) ->
 pub fn build_epoch_object_aad(
     track: &str,
     publisher_kid: &[u8; 32],
+    session_id: &[u8; 16],
     membership_version: u64,
     epoch: u64,
     sequence: u64,
 ) -> Vec<u8> {
-    let mut aad = Vec::with_capacity(EPOCH_OBJECT_AAD_DOMAIN.len() + 4 + track.len() + 56);
+    let mut aad = Vec::with_capacity(EPOCH_OBJECT_AAD_DOMAIN.len() + 4 + track.len() + 72);
     aad.extend_from_slice(EPOCH_OBJECT_AAD_DOMAIN);
     aad.extend_from_slice(&(track.len() as u32).to_be_bytes());
     aad.extend_from_slice(track.as_bytes());
     aad.extend_from_slice(publisher_kid);
+    aad.extend_from_slice(session_id);
     aad.extend_from_slice(&membership_version.to_be_bytes());
     aad.extend_from_slice(&epoch.to_be_bytes());
     aad.extend_from_slice(&sequence.to_be_bytes());
@@ -470,17 +472,24 @@ pub fn build_epoch_object_aad(
 
 pub fn encrypt_epoch_event(
     epoch_secret: &[u8; 32],
-    nonce_domain: &[u8; 32],
     track: &str,
     publisher_kid: &[u8; 32],
+    session_id: &[u8; 16],
     membership_version: u64,
     epoch: u64,
     sequence: u64,
     plaintext: &[u8],
 ) -> Result<(Vec<u8>, Vec<u8>, [u8; 12], [u8; 16]), String> {
-    let key = derive_sender_track_key(epoch_secret, publisher_kid, track);
-    let nonce = derive_event_nonce(nonce_domain, epoch, sequence);
-    let aad = build_epoch_object_aad(track, publisher_kid, membership_version, epoch, sequence);
+    let key = derive_sender_track_key(epoch_secret, publisher_kid, track, session_id);
+    let nonce = derive_event_nonce(sequence)?;
+    let aad = build_epoch_object_aad(
+        track,
+        publisher_kid,
+        session_id,
+        membership_version,
+        epoch,
+        sequence,
+    );
     let commitment = key_commitment(&key, &nonce);
     let output = aes_gcm_encrypt(&key, &nonce, plaintext, &aad)?;
     if output.len() < 16 {
@@ -499,6 +508,7 @@ pub fn decrypt_epoch_event(
     epoch_secret: &[u8; 32],
     track: &str,
     publisher_kid: &[u8; 32],
+    session_id: &[u8; 16],
     membership_version: u64,
     epoch: u64,
     sequence: u64,
@@ -507,28 +517,38 @@ pub fn decrypt_epoch_event(
     ciphertext: &[u8],
     commitment: &[u8; 16],
 ) -> Result<Vec<u8>, String> {
-    let key = derive_sender_track_key(epoch_secret, publisher_kid, track);
+    let key = derive_sender_track_key(epoch_secret, publisher_kid, track, session_id);
     if !check_key_commitment(&key, nonce, commitment) {
-        return Err("sender/track key commitment mismatch".to_owned());
+        return Err("sender/track/session key commitment mismatch".to_owned());
     }
-    let aad = build_epoch_object_aad(track, publisher_kid, membership_version, epoch, sequence);
+    let aad = build_epoch_object_aad(
+        track,
+        publisher_kid,
+        session_id,
+        membership_version,
+        epoch,
+        sequence,
+    );
     let mut combined = Vec::with_capacity(ciphertext.len() + tag.len());
     combined.extend_from_slice(ciphertext);
     combined.extend_from_slice(tag);
     aes_gcm_decrypt(&key, nonce, &combined, &aad)
 }
 
-/// Hybrid-attested event transcript. Epoch coordinates and sequence are signed,
-/// so possession of the symmetric epoch key is not publisher identity evidence.
+/// Hybrid-attested event transcript. Session, epoch coordinates, and sequence
+/// are signed, so possession of the symmetric epoch key is not publisher
+/// identity evidence.
 pub fn build_epoch_event_sig_message(
     topic: &str,
     payload: &[u8],
     timestamp: i64,
+    session_id: &[u8; 16],
     membership_version: u64,
     epoch: u64,
     sequence: u64,
 ) -> Vec<u8> {
     let mut msg = build_event_sig_message(topic, payload, timestamp);
+    msg.extend_from_slice(session_id);
     msg.extend_from_slice(&membership_version.to_be_bytes());
     msg.extend_from_slice(&epoch.to_be_bytes());
     msg.extend_from_slice(&sequence.to_be_bytes());
@@ -890,6 +910,106 @@ mod tests {
         assert!(decrypt_event_keyed(&group_key, &nonce, &tag, &ct, &other_leaf, epoch).is_err());
         // Wrong group key -> fails.
         assert!(decrypt_event_keyed(&[0x22u8; 32], &nonce, &tag, &ct, &leaf, epoch).is_err());
+    }
+
+    #[test]
+    fn session_scoped_keys_and_injective_nonces_prevent_pair_reuse() {
+        let epoch_secret = [0x11u8; 32];
+        let publisher_kid = [0x22u8; 32];
+        let session_a = [0x33u8; 16];
+        let session_b = [0x44u8; 16];
+        let key_a = derive_sender_track_key(&epoch_secret, &publisher_kid, "worker", &session_a);
+        let key_b = derive_sender_track_key(&epoch_secret, &publisher_kid, "worker", &session_b);
+        let nonce_1 = derive_event_nonce(1).unwrap();
+        let nonce_2 = derive_event_nonce(2).unwrap();
+
+        assert_ne!(&*key_a, &*key_b);
+        assert_eq!(&nonce_1[..4], b"EVN1");
+        assert_eq!(&nonce_1[4..], &1u64.to_be_bytes());
+        assert_eq!(&nonce_2[4..], &2u64.to_be_bytes());
+        assert_ne!(nonce_1, nonce_2);
+        assert!(derive_event_nonce(0).is_err());
+    }
+
+    #[test]
+    fn session_epoch_and_sequence_mutation_fail_aead_authentication() {
+        let epoch_secret = [0x51u8; 32];
+        let publisher_kid = [0x52u8; 32];
+        let session_id = [0x53u8; 16];
+        let (tag, ciphertext, nonce, commitment) = encrypt_epoch_event(
+            &epoch_secret,
+            "worker",
+            &publisher_kid,
+            &session_id,
+            7,
+            9,
+            11,
+            b"session-bound payload",
+        )
+        .unwrap();
+
+        assert_eq!(
+            decrypt_epoch_event(
+                &epoch_secret,
+                "worker",
+                &publisher_kid,
+                &session_id,
+                7,
+                9,
+                11,
+                &nonce,
+                &tag,
+                &ciphertext,
+                &commitment,
+            )
+            .unwrap(),
+            b"session-bound payload"
+        );
+
+        let mut wrong_session = session_id;
+        wrong_session[0] ^= 1;
+        assert!(decrypt_epoch_event(
+            &epoch_secret,
+            "worker",
+            &publisher_kid,
+            &wrong_session,
+            7,
+            9,
+            11,
+            &nonce,
+            &tag,
+            &ciphertext,
+            &commitment,
+        )
+        .is_err());
+        assert!(decrypt_epoch_event(
+            &epoch_secret,
+            "worker",
+            &publisher_kid,
+            &session_id,
+            7,
+            10,
+            11,
+            &nonce,
+            &tag,
+            &ciphertext,
+            &commitment,
+        )
+        .is_err());
+        assert!(decrypt_epoch_event(
+            &epoch_secret,
+            "worker",
+            &publisher_kid,
+            &session_id,
+            7,
+            9,
+            12,
+            &nonce,
+            &tag,
+            &ciphertext,
+            &commitment,
+        )
+        .is_err());
     }
 
     #[test]

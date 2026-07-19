@@ -156,14 +156,16 @@ ML-DSA-65 anchors, retention/opaque-routing policies, membership version,
 epoch, and expiry. Signing keys and blinded Ristretto presentations are never
 used as KEX inputs. A stock MoQ relay receives neither grants nor epoch secrets.
 
-For each event object, the publisher derives a distinct sender/track AEAD key
-and nonce domain from the epoch secret. AES-256-GCM AAD binds track, publisher
-key ID, membership version, epoch, and sequence; the nonce is deterministically
-derived from that domain plus epoch/sequence. The plaintext signature transcript
-also binds topic, timestamp, membership version, epoch, and sequence and requires
-a hybrid Ed25519 + ML-DSA-65 composite signature anchored by the controller
-grant. Subscribers reject replay, nonce reuse, unknown/future epochs, retired
-objects, and events outside a bounded prior-epoch last-issued cutoff.
+For each publisher/track epoch installation, the publisher generates a fresh
+128-bit CSPRNG session ID and derives a session-scoped sender/track AEAD key from
+the epoch secret. AES-256-GCM AAD binds track, publisher key ID, session ID,
+membership version, epoch, and sequence. Within that fresh key domain the nonce
+is the injective `EVN1 || sequence_be` encoding, so restart/failover counter
+resets cannot reuse a key/nonce pair. The plaintext signature transcript binds
+topic, timestamp, session ID, membership version, epoch, and sequence and
+requires a hybrid Ed25519 + ML-DSA-65 composite signature anchored by the
+controller grant. Subscribers reject replay, nonce reuse, unknown/future epochs,
+retired objects, and events outside a bounded prior-epoch last-issued cutoff.
 
 One opaque ciphertext is published once and forwarded/cacheable byte-identically
 by a stock relay. Membership transitions distribute O(M) per-member grants but
@@ -173,7 +175,7 @@ grant and cannot decrypt the fresh epoch.
 The confidential body is versioned and length-prefixed:
 
 ```
-[1B version][12B nonce][16B key_commitment]
+[1B version][16B session_id][12B nonce][16B key_commitment]
 [4B tag_len][tag][4B ciphertext_len][ciphertext][4B lk_tag_len][lk_tag]
 [8B timestamp BE][8B membership_version][8B epoch][8B sequence]
 [32B publisher_pubkey][4B signature_len][hybrid signature]

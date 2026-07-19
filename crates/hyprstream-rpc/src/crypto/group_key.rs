@@ -72,10 +72,12 @@ pub struct EncryptedEvent {
     pub signature: Vec<u8>,
     pub publisher_pubkey: [u8; 32],
     pub timestamp: i64,
+    /// CSPRNG lifecycle identifier that scopes one publisher/track epoch key.
+    pub session_id: [u8; 16],
     /// Controller-committed membership version and epoch are sender-authenticated.
     pub membership_version: u64,
     pub epoch: u64,
-    /// Monotonic per-sender/track sequence within the epoch.
+    /// Monotonic per-sender/track sequence within the session-scoped key.
     pub sequence: u64,
 }
 

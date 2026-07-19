@@ -21,7 +21,7 @@
 //! an [`EncryptedEvent`] as a versioned, length-prefixed MoQ payload:
 //!
 //! ```text
-//! [1B version][12B nonce][16B key_commitment]
+//! [1B version][16B session_id][12B nonce][16B key_commitment]
 //! [4B tag_len][tag][4B ciphertext_len][ciphertext][4B lk_tag_len][lk_tag]
 //! [8B timestamp BE][8B membership_version][8B epoch][8B sequence]
 //! [32B publisher_pubkey][4B signature_len][hybrid signature]
@@ -37,14 +37,15 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Result};
 use ed25519_dalek::SigningKey;
+use rand::RngCore;
 use tokio::sync::RwLock;
 use tracing::debug;
 use zeroize::Zeroizing;
 
 use crate::crypto::cose_sign::{sign_composite, verify_composite};
 use crate::crypto::event_crypto::{
-    build_epoch_event_sig_message, decrypt_epoch_event, derive_sender_track_nonce_domain,
-    encrypt_epoch_event, EventPrivacy,
+    build_epoch_event_sig_message, decrypt_epoch_event, derive_event_nonce, encrypt_epoch_event,
+    EventPrivacy,
 };
 use crate::crypto::group_key::{open_epoch_grant, EpochGrant};
 use crate::crypto::hybrid_kem::RecipientKeypair;
@@ -91,9 +92,9 @@ pub const DEFAULT_SUBSCRIBER_GRACE_PERIOD: Duration = Duration::from_secs(30);
 // EncryptedEvent — wire-encodable result of encrypting an event
 // ============================================================================
 
-const WIRE_VERSION: u8 = 2;
+const WIRE_VERSION: u8 = 3;
 const EVENT_ATTESTATION_SCHEMA_ID: u64 = 0x86fe_5f45_a782_3a11;
-const EVENT_ATTESTATION_TYPE_ID: u64 = 0x4576_7448_7942_3031; // "EvtHyB01"
+const EVENT_ATTESTATION_TYPE_ID: u64 = 0x4576_7448_7942_3032; // "EvtHyB02"
 
 fn event_attestation_aad() -> Vec<u8> {
     crate::crypto::cose_sign1::build_external_aad(
@@ -108,7 +109,8 @@ impl EncryptedEvent {
     /// topic field and is reattached by [`Self::decode_body`].
     fn encode_body(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(
-            1 + 12
+            1 + 16
+                + 12
                 + 16
                 + 4
                 + self.tag.len()
@@ -125,6 +127,7 @@ impl EncryptedEvent {
                 + self.signature.len(),
         );
         buf.push(WIRE_VERSION);
+        buf.extend_from_slice(&self.session_id);
         buf.extend_from_slice(&self.nonce);
         buf.extend_from_slice(&self.key_commitment);
         push_lenprefixed(&mut buf, &self.tag);
@@ -147,6 +150,7 @@ impl EncryptedEvent {
         if version != WIRE_VERSION {
             return Err(anyhow!("unsupported event wire version {version}"));
         }
+        let session_id: [u8; 16] = read_array(buf, &mut off)?;
         let nonce: [u8; 12] = read_array(buf, &mut off)?;
         let key_commitment: [u8; 16] = read_array(buf, &mut off)?;
         let tag = read_lenprefixed(buf, &mut off)?;
@@ -172,6 +176,7 @@ impl EncryptedEvent {
             signature,
             publisher_pubkey,
             timestamp,
+            session_id,
             membership_version,
             epoch,
             sequence,
@@ -239,7 +244,7 @@ struct PrefixCrypto {
     epoch: u64,
     current: Zeroizing<[u8; 32]>,
     sequence: u64,
-    nonce_domain: [u8; 32],
+    session_id: [u8; 16],
     created_at: Instant,
 }
 
@@ -485,11 +490,17 @@ impl EventPublisher {
         if self.privacy_mode == EventPrivacy::Public {
             return Err("register_prefix is only valid on encrypted (ZK/LK) publishers".to_owned());
         }
+        let mut prefixes = self.prefixes.write().await;
+        if prefixes.contains_key(prefix) {
+            return Err(format!(
+                "prefix '{prefix}' is already registered; replacement could reset a live crypto domain"
+            ));
+        }
         let origin = global_moq_event_origin().ok_or_else(|| {
             "moq event bus not initialized; start the event service first".to_owned()
         })?;
         let moq = origin.publisher(prefix).map_err(|e| e.to_string())?;
-        self.prefixes.write().await.insert(
+        prefixes.insert(
             prefix.to_owned(),
             PrefixState {
                 moq,
@@ -514,9 +525,9 @@ impl EventPublisher {
                 "confidential EventService epochs start at committed version/epoch 1".to_owned(),
             );
         }
-        let publisher_kid = self
-            .verifying_key()
-            .ok_or_else(|| "encrypted publisher has no hybrid identity".to_owned())?;
+        if self.verifying_key().is_none() {
+            return Err("encrypted publisher has no hybrid identity".to_owned());
+        }
         let mut prefixes = self.prefixes.write().await;
         let state = prefixes
             .get_mut(prefix)
@@ -531,13 +542,15 @@ impl EventPublisher {
                 );
             }
         }
-        let nonce_domain = derive_sender_track_nonce_domain(&epoch_secret, &publisher_kid, prefix);
+        let mut rng = rand::rngs::OsRng;
+        let session_id =
+            ((u128::from(rng.next_u64()) << 64) | u128::from(rng.next_u64())).to_be_bytes();
         state.crypto = Some(PrefixCrypto {
             membership_version,
             epoch,
             current: epoch_secret,
             sequence: 0,
-            nonce_domain,
+            session_id,
             created_at: Instant::now(),
         });
         Ok(())
@@ -627,9 +640,9 @@ impl EventPublisher {
             .ok_or_else(|| anyhow!("event sequence exhausted; rotate epoch"))?;
         let (tag, ciphertext, nonce, commitment) = encrypt_epoch_event(
             &crypto.current,
-            &crypto.nonce_domain,
             &prefix,
             &publisher_pubkey,
+            &crypto.session_id,
             crypto.membership_version,
             crypto.epoch,
             sequence,
@@ -640,6 +653,7 @@ impl EventPublisher {
             topic,
             payload,
             timestamp,
+            &crypto.session_id,
             crypto.membership_version,
             crypto.epoch,
             sequence,
@@ -667,6 +681,7 @@ impl EventPublisher {
             signature,
             publisher_pubkey,
             timestamp,
+            session_id: crypto.session_id,
             membership_version: crypto.membership_version,
             epoch: crypto.epoch,
             sequence,
@@ -770,8 +785,8 @@ struct SubscriberPrefixState {
     current: InstalledEpoch,
     previous: Option<PriorEpoch>,
     publisher: EventPublisherAnchor,
-    seen_objects: HashSet<(u64, u64)>,
-    seen_nonces: HashSet<[u8; 12]>,
+    seen_objects: HashSet<(u64, [u8; 16], u64)>,
+    seen_nonces: HashSet<([u8; 16], [u8; 12])>,
 }
 
 /// A pending controller epoch notification.
@@ -922,7 +937,7 @@ impl EventSubscriber {
                     grace_until: Instant::now() + grace,
                     last_issued_sequence,
                 });
-                state.seen_objects.retain(|(epoch, _)| {
+                state.seen_objects.retain(|(epoch, _, _)| {
                     *epoch == state.current.epoch || *epoch + 1 == state.current.epoch
                 });
                 state.seen_nonces.clear();
@@ -973,7 +988,7 @@ impl EventSubscriber {
                 let current_epoch = state.current.epoch;
                 state
                     .seen_objects
-                    .retain(|(epoch, _)| *epoch == current_epoch);
+                    .retain(|(epoch, _, _)| *epoch == current_epoch);
             }
         }
     }
@@ -1057,11 +1072,14 @@ impl EventSubscriber {
         }
         if state
             .seen_objects
-            .contains(&(encrypted.epoch, encrypted.sequence))
+            .contains(&(encrypted.epoch, encrypted.session_id, encrypted.sequence))
         {
             return FrameOutcome::Drop("replayed event object".to_owned());
         }
-        if state.seen_nonces.contains(&encrypted.nonce) {
+        if state
+            .seen_nonces
+            .contains(&(encrypted.session_id, encrypted.nonce))
+        {
             return FrameOutcome::Drop("reused event nonce".to_owned());
         }
 
@@ -1087,13 +1105,10 @@ impl EventSubscriber {
                 "unknown, future-before-install, or retired epoch object".to_owned(),
             );
         };
-        let nonce_domain =
-            derive_sender_track_nonce_domain(epoch_key, &encrypted.publisher_pubkey, prefix);
-        let expected_nonce = crate::crypto::event_crypto::derive_event_nonce(
-            &nonce_domain,
-            encrypted.epoch,
-            encrypted.sequence,
-        );
+        let expected_nonce = match derive_event_nonce(encrypted.sequence) {
+            Ok(nonce) => nonce,
+            Err(error) => return FrameOutcome::Drop(error),
+        };
         if encrypted.nonce != expected_nonce {
             return FrameOutcome::Drop("event nonce is outside the sender/track domain".to_owned());
         }
@@ -1101,6 +1116,7 @@ impl EventSubscriber {
             epoch_key,
             prefix,
             &encrypted.publisher_pubkey,
+            &encrypted.session_id,
             encrypted.membership_version,
             encrypted.epoch,
             encrypted.sequence,
@@ -1116,6 +1132,7 @@ impl EventSubscriber {
             topic,
             &plaintext,
             encrypted.timestamp,
+            &encrypted.session_id,
             encrypted.membership_version,
             encrypted.epoch,
             encrypted.sequence,
@@ -1132,8 +1149,10 @@ impl EventSubscriber {
         }
         state
             .seen_objects
-            .insert((encrypted.epoch, encrypted.sequence));
-        state.seen_nonces.insert(encrypted.nonce);
+            .insert((encrypted.epoch, encrypted.session_id, encrypted.sequence));
+        state
+            .seen_nonces
+            .insert((encrypted.session_id, encrypted.nonce));
         FrameOutcome::Decoded(plaintext)
     }
 }
@@ -1257,12 +1276,15 @@ mod tests {
         let topic = "worker.sandbox1.started";
         let prefix = "worker";
         let kid = ed_sk.verifying_key().to_bytes();
-        let nonce_domain = derive_sender_track_nonce_domain(epoch_key, &kid, prefix);
+        let session_digest = blake3::hash(&epoch.to_be_bytes());
+        let session_id: [u8; 16] = session_digest.as_bytes()[..16]
+            .try_into()
+            .expect("BLAKE3 output contains a 16-byte test session ID");
         let (tag, ciphertext, nonce, key_commitment) = encrypt_epoch_event(
             epoch_key,
-            &nonce_domain,
             prefix,
             &kid,
+            &session_id,
             membership_version,
             epoch,
             sequence,
@@ -1274,6 +1296,7 @@ mod tests {
             topic,
             payload,
             timestamp,
+            &session_id,
             membership_version,
             epoch,
             sequence,
@@ -1290,6 +1313,7 @@ mod tests {
             signature,
             publisher_pubkey: kid,
             timestamp,
+            session_id,
             membership_version,
             epoch,
             sequence,
@@ -1514,13 +1538,130 @@ mod tests {
         ));
 
         let mut stripped = event(&key, &ed, &pq, b"three", 3);
-        let signed =
-            build_epoch_event_sig_message(&stripped.topic, b"three", stripped.timestamp, 1, 1, 3);
+        let signed = build_epoch_event_sig_message(
+            &stripped.topic,
+            b"three",
+            stripped.timestamp,
+            &stripped.session_id,
+            1,
+            1,
+            3,
+        );
         stripped.signature = sign_composite(&ed, None, &signed, &event_attestation_aad()).unwrap();
         assert!(matches!(
             subscriber.decode_frame(&stripped.topic, &stripped.encode_body()).await,
             FrameOutcome::Drop(reason) if reason.contains("attestation")
         ));
+    }
+
+    #[tokio::test]
+    async fn duplicate_registration_preserves_live_crypto_domain() {
+        let _ =
+            crate::moq_event::init_global_moq_event_origin(crate::moq_event::MoqEventOrigin::new());
+        let prefix = format!("hardening-duplicate-{}", rand::random::<u64>());
+        let publisher = EventPublisher::new_encrypted(
+            signing_key(),
+            EventPrivacy::ZeroKnowledge,
+            RekeyPolicy::Immediate,
+        )
+        .unwrap();
+        publisher.register_prefix(&prefix).await.unwrap();
+        publisher
+            .install_committed_epoch(&prefix, 1, 1, Zeroizing::new([0x61; 32]))
+            .await
+            .unwrap();
+        {
+            let mut prefixes = publisher.prefixes.write().await;
+            prefixes
+                .get_mut(&prefix)
+                .unwrap()
+                .crypto
+                .as_mut()
+                .unwrap()
+                .sequence = 7;
+        }
+        let (session_before, sequence_before) = {
+            let prefixes = publisher.prefixes.read().await;
+            let crypto = prefixes.get(&prefix).unwrap().crypto.as_ref().unwrap();
+            (crypto.session_id, crypto.sequence)
+        };
+
+        let error = publisher.register_prefix(&prefix).await.unwrap_err();
+        assert!(error.contains("already registered"));
+        let prefixes = publisher.prefixes.read().await;
+        let crypto = prefixes.get(&prefix).unwrap().crypto.as_ref().unwrap();
+        assert_eq!(crypto.session_id, session_before);
+        assert_eq!(crypto.sequence, sequence_before);
+    }
+
+    #[tokio::test]
+    async fn independent_installations_cannot_reuse_key_nonce_pair() {
+        let _ =
+            crate::moq_event::init_global_moq_event_origin(crate::moq_event::MoqEventOrigin::new());
+        let prefix = format!("hardening-failover-{}", rand::random::<u64>());
+        let signing = signing_key();
+        let secret = signing.to_bytes();
+        let publisher_a = EventPublisher::new_encrypted(
+            SigningKey::from_bytes(&secret),
+            EventPrivacy::ZeroKnowledge,
+            RekeyPolicy::Immediate,
+        )
+        .unwrap();
+        let publisher_b = EventPublisher::new_encrypted(
+            SigningKey::from_bytes(&secret),
+            EventPrivacy::ZeroKnowledge,
+            RekeyPolicy::Immediate,
+        )
+        .unwrap();
+        publisher_a.register_prefix(&prefix).await.unwrap();
+        publisher_b.register_prefix(&prefix).await.unwrap();
+        let epoch_secret = [0x71u8; 32];
+        publisher_a
+            .install_committed_epoch(&prefix, 1, 1, Zeroizing::new(epoch_secret))
+            .await
+            .unwrap();
+        publisher_b
+            .install_committed_epoch(&prefix, 1, 1, Zeroizing::new(epoch_secret))
+            .await
+            .unwrap();
+
+        let session_a = publisher_a
+            .prefixes
+            .read()
+            .await
+            .get(&prefix)
+            .unwrap()
+            .crypto
+            .as_ref()
+            .unwrap()
+            .session_id;
+        let session_b = publisher_b
+            .prefixes
+            .read()
+            .await
+            .get(&prefix)
+            .unwrap()
+            .crypto
+            .as_ref()
+            .unwrap()
+            .session_id;
+        let kid = publisher_a.verifying_key().unwrap();
+        let key_a = crate::crypto::event_crypto::derive_sender_track_key(
+            &epoch_secret,
+            &kid,
+            &prefix,
+            &session_a,
+        );
+        let key_b = crate::crypto::event_crypto::derive_sender_track_key(
+            &epoch_secret,
+            &kid,
+            &prefix,
+            &session_b,
+        );
+        let nonce = derive_event_nonce(1).unwrap();
+
+        assert_ne!(session_a, session_b);
+        assert_ne!((&*key_a, nonce), (&*key_b, nonce));
     }
 
     #[tokio::test]
