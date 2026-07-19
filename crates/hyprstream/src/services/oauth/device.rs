@@ -62,26 +62,33 @@ pub async fn device_authorize(
     State(state): State<Arc<OAuthState>>,
     Form(params): Form<DeviceAuthRequest>,
 ) -> Response {
-    // Validate client exists. CIMD URLs live in cimd_cache; DCR UUIDs
-    // live in state.clients. The device flow doesn't need full client
-    // metadata here — just existence — so a cheap presence check suffices.
-    let known = if params.client_id.starts_with("https://") {
-        // For CIMD, an absent cache entry doesn't necessarily mean an
-        // unknown client — it may just be a cold cache. Resolve through
-        // the cache-aside path which will fetch on miss.
-        super::registration::resolve_cimd_client(&state, &params.client_id)
-            .await
-            .is_ok()
+    // #1113 r4 F2: resolve the client ONCE and reject on failure
+    // (invalid_client). Previously, CIMD errors and unknown registered
+    // clients collapsed to empty scope via unwrap_or_default.
+    let client = if params.client_id.starts_with("https://") {
+        match super::registration::resolve_cimd_client(&state, &params.client_id).await {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(client_id = %params.client_id, error = %e, "device: CIMD resolution failed");
+                return device_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_client",
+                    "Unknown client_id. Register first via POST /oauth/register",
+                );
+            }
+        }
     } else {
-        state.clients.read().await.contains_key(&params.client_id)
+        match state.clients.read().await.get(&params.client_id) {
+            Some(c) => c.clone(),
+            None => {
+                return device_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_client",
+                    "Unknown client_id. Register first via POST /oauth/register",
+                );
+            }
+        }
     };
-    if !known {
-        return device_error(
-            StatusCode::BAD_REQUEST,
-            "invalid_client",
-            "Unknown client_id. Register first via POST /oauth/register",
-        );
-    }
 
     // Generate device_code (32 bytes, URL-safe base64)
     let mut device_code_bytes = [0u8; 32];
@@ -97,8 +104,9 @@ pub async fn device_authorize(
     let nonce = URL_SAFE_NO_PAD.encode(nonce_bytes);
 
     let scopes: Vec<String> = {
-        // #1113 rev2 F4: validate requested scopes against server-supported
-        // ∩ client-declared (no arbitrary scope text reaching issuance).
+        // #1113 rev2 F4 / r4 F2: validate requested scopes against
+        // server-supported ∩ client-declared. Client is already resolved
+        // above; use its declared scopes directly (no unwrap_or_default).
         let requested: Vec<String> = params
             .scope
             .as_deref()
@@ -106,20 +114,7 @@ pub async fn device_authorize(
             .split_whitespace()
             .map(std::borrow::ToOwned::to_owned)
             .collect();
-        let client_declared = if params.client_id.starts_with("https://") {
-            super::registration::resolve_cimd_client(&state, &params.client_id)
-                .await
-                .map(|c| c.declared_scopes())
-                .unwrap_or_default()
-        } else {
-            state
-                .clients
-                .read()
-                .await
-                .get(&params.client_id)
-                .map(|c| c.declared_scopes())
-                .unwrap_or_default()
-        };
+        let client_declared = client.declared_scopes();
         let require_atproto = super::state::atproto_profile_active(&requested);
         match super::state::validate_requested_scopes(
             &requested,

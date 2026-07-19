@@ -264,12 +264,14 @@ async fn handle_logout(
 /// browsers can bootstrap a WebTransport connection via DiscoveryService,
 /// then resolve all other service endpoints from there.
 async fn oauth_self_protected_resource_metadata(
-    State(_state): State<Arc<OAuthState>>,
+    State(state): State<Arc<OAuthState>>,
 ) -> axum::Json<ProtectedResourceMetadata> {
-    let config = crate::config::HyprConfig::load().unwrap_or_default();
-    let issuer_url = config.oauth.issuer_url();
+    // #1113 r4 F5: use the CANONICAL issuer from OAuthState (same
+    // normalization as token claims/redirect), NOT raw config.issuer_url().
+    // A configured trailing-slash/path must be consistent everywhere.
+    let issuer_url = state.issuer_url.clone();
 
-    // Use issuer URL as the resource
+    // Use issuer URL as the resource (PDS = its own AS).
     let resource = issuer_url.clone();
 
     let mut meta = protected_resource_metadata(&resource, &issuer_url);
@@ -277,6 +279,7 @@ async fn oauth_self_protected_resource_metadata(
     meta.scopes_supported = Some(self_resource_scopes());
 
     // Include the QUIC TLS cert hash so browsers can pin the self-signed certificate.
+    let config = crate::config::HyprConfig::load().unwrap_or_default();
     if let Ok((cert_chain, _)) = config.quic.load_tls_materials() {
         meta.x_cert_hash = Some(hyprstream_rpc::transport::zmtp_quic::cert_hash(
             &cert_chain[0],

@@ -220,8 +220,8 @@ mod tests {
     #[test]
     fn subject_did_for_did_plc_accepted() {
         assert_eq!(
-            subject_did_for("https://x", "did:plc:abc123xyz").unwrap(),
-            "did:plc:abc123xyz"
+            subject_did_for("https://x", "did:plc:abcdefghijklmnqrstuvwx2p").unwrap(),
+            "did:plc:abcdefghijklmnqrstuvwx2p"
         );
     }
 
@@ -258,6 +258,15 @@ mod tests {
     #[test]
     fn subject_did_for_malformed_plc_rejected() {
         let err = subject_did_for("https://x", "did:plc:").unwrap_err();
+        assert_eq!(err, SubjectDidError::MalformedDid);
+    }
+
+    /// #1113 r4: a SHORT did:plc (e.g. 9 chars) is rejected — @atproto/did
+    /// requires exactly 24 base32 chars. The old fixture `did:plc:abc123xyz`
+    /// passed validation but failed the real schema.
+    #[test]
+    fn subject_did_for_short_plc_rejected() {
+        let err = subject_did_for("https://x", "did:plc:abc123xyz").unwrap_err();
         assert_eq!(err, SubjectDidError::MalformedDid);
     }
 
@@ -1056,6 +1065,35 @@ impl OAuthState {
         subject_did_for(&self.issuer_url, subject)
     }
 
+    /// Check whether an account is eligible for the atproto OAuth profile
+    /// (#1113 rev2 → #1124 split).
+    ///
+    /// This inspects the ACCOUNT/KEY MAPPING, not the subject string:
+    /// 1. Rejects at9p-backed accounts (any key with
+    ///    [`KeyAlgorithm::HybridEd25519MlDsa65`] → [`SubjectDidError::At9pBackedAccount`]).
+    /// 2. Since hyprstream does not yet provision real atproto DIDs for its
+    ///    own accounts (#1124), an account without a mapped DID fails closed
+    ///    ([`SubjectDidError::NoAtprotoIdentity`]).
+    ///
+    /// When #1124 provisions DIDs, this method will be updated to check the
+    /// durable DID mapping and validate it via [`subject_did_for`].
+    pub async fn check_atproto_account_eligibility(
+        &self,
+        username: &str,
+    ) -> Result<String, SubjectDidError> {
+        // 1. Inspect the account's enrolled keys for at9p-backed enrollment.
+        if let Some(user_store) = self.user_store_reader() {
+            if let Ok(pubkeys) = user_store.list_pubkeys(username).await {
+                if pubkeys.iter().any(|pk| pk.algorithm.is_hybrid()) {
+                    return Err(SubjectDidError::At9pBackedAccount);
+                }
+            }
+        }
+        // 2. No mapped atproto DID exists for this account yet (#1124).
+        //    Fail closed — do not accept an arbitrary did:plc string as sub.
+        Err(SubjectDidError::NoAtprotoIdentity)
+    }
+
     /// The full set of scopes this AS supports (#1113 rev2 F4).
     /// Extends `default_scopes` (the omitted-scope grant set) with the
     /// atproto transition scopes, which are supported-but-explicit: a client
@@ -1177,10 +1215,13 @@ pub fn subject_did_for(
     _issuer_url: &str,
     subject: &str,
 ) -> Result<String, SubjectDidError> {
-    // did:plc — the only non-`did:web` atproto method. Pass through a
-    // well-formed `did:plc:` identifier unchanged.
+    // did:plc — the only non-`did:web` atproto method. A valid did:plc
+    // identifier has exactly 24 chars of base32-lowercase (a-z, 2-7), per
+    // the atproto PLC spec. The vendored @atproto/did schema rejects shorter
+    // suffixes like `did:plc:abc123xyz` (9 chars; @atproto/did rejects
+    // anything shorter than 24 base32 chars).
     if let Some(rest) = subject.strip_prefix("did:plc:") {
-        if !rest.is_empty() && rest.chars().all(|c| c.is_ascii_alphanumeric()) {
+        if rest.len() == 24 && rest.chars().all(|c| matches!(c, 'a'..='z' | '2'..='7')) {
             return Ok(subject.to_owned());
         }
         return Err(SubjectDidError::MalformedDid);
@@ -1234,6 +1275,11 @@ pub enum SubjectDidError {
     /// atproto DID provisioning for hosted accounts is tracked in #1124.
     #[error("account has no atproto identity; provisioning tracked in #1124")]
     NoAtprotoIdentity,
+    /// The account is at9p-backed (enrolled with a hybrid PQ key) —
+    /// inspected via the account/key mapping, not the subject string.
+    /// at9p accounts are not eligible for atproto OAuth tokens.
+    #[error("at9p-backed account not eligible for atproto OAuth")]
+    At9pBackedAccount,
 }
 
 /// The atproto transition scope name. Its presence in a granted scope set

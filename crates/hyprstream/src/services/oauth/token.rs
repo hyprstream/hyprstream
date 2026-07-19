@@ -815,20 +815,37 @@ async fn issue_token_with_refresh(
         None
     };
 
-    // #1113 rev2 finding 6: the DID subject / did:at9p fail-closed rule is
-    // CONDITIONAL on the atproto profile. Non-atproto flows (device, WIT,
-    // generic authorization-code) keep their existing username subject
-    // byte-for-byte — the atproto strict path only activates when the granted
-    // scope set includes `atproto`.
+    // #1113 rev2 finding 6 / r4 finding 1: the DID subject / account-
+    // eligibility check is CONDITIONAL on the atproto profile. Non-atproto
+    // flows (device, WIT, generic authorization-code) keep their existing
+    // username subject byte-for-byte — the atproto strict path only activates
+    // when the granted scope set includes `atproto`.
     //
-    // atproto profile: the access token's `sub` MUST be the account's DID
-    // (`did:plc` / `did:web`). `did:at9p` and other DID methods are NOT
-    // eligible and fail closed (no token minted).
+    // atproto profile: the access token's `sub` MUST be the account's real
+    // atproto DID. The eligibility check inspects the ACCOUNT/KEY MAPPING
+    // (not the subject string): at9p-backed accounts are rejected, and an
+    // account without a mapped atproto DID fails closed (#1124).
     let jwt_sub = if atproto_profile {
-        match state.subject_did(sub) {
-            Ok(did) => did,
+        match state.check_atproto_account_eligibility(sub).await {
+            Ok(mapped_did) => {
+                // Future (#1124): the mapped DID is validated by subject_did_for
+                // to ensure it parses as a real atproto DID. Currently this path
+                // is unreachable — check_atproto_account_eligibility always
+                // returns Err(NoAtprotoIdentity) until provisioning lands.
+                match super::state::subject_did_for(&state.issuer_url, &mapped_did) {
+                    Ok(validated) => validated,
+                    Err(e) => {
+                        tracing::warn!(mapped_did = %mapped_did, error = %e, "mapped DID failed form validation");
+                        return token_error(
+                            StatusCode::BAD_REQUEST,
+                            "invalid_request",
+                            Some("account atproto DID failed validation"),
+                        );
+                    }
+                }
+            }
             Err(e) => {
-                tracing::warn!(local_subject = %sub, error = %e, "rejecting atproto token issuance: subject not eligible");
+                tracing::warn!(local_subject = %sub, error = %e, "rejecting atproto token issuance: account not eligible");
                 return token_error(
                     StatusCode::BAD_REQUEST,
                     "invalid_request",
@@ -1178,7 +1195,7 @@ mod tests {
         let json = build_token_response_json(
             true,
             "access-jwt",
-            "did:plc:abc123xyz",
+            "did:plc:abcdefghijklmnqrstuvwx2p",
             "atproto transition:generic",
             3600,
             "rt",
