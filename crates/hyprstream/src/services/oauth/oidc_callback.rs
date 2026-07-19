@@ -490,6 +490,7 @@ pub async fn external_callback(
         expires_at: Instant::now() + Duration::from_secs(60),
         username: mapped_subject,
         verifying_key: None, // external OIDC — no local Ed25519 key binding
+        dpop_jkt: None, // external OIDC flow — no PAR DPoP binding
     };
     state.pending_codes.write().await.insert(code.clone(), auth_code);
 

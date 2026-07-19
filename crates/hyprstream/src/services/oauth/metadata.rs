@@ -15,6 +15,11 @@ fn base_metadata(issuer: &str, scopes: &[String], require_par: bool) -> serde_js
     if !scopes_supported.iter().any(|scope| scope == "pds:attach") {
         scopes_supported.push("pds:attach".to_owned());
     }
+    // #1113 rev2 finding 5: canonicalize the issuer to an exact origin before
+    // emitting it anywhere — a trailing slash or path in external_url would
+    // produce double-slash endpoint URLs and a non-origin issuer the stock
+    // resolver rejects against the discovery origin.
+    let issuer = super::state::canonical_issuer_origin(issuer).unwrap_or_else(|| issuer.to_owned());
     serde_json::json!({
         "issuer": issuer,
         "authorization_endpoint": format!("{}/oauth/authorize", issuer),
@@ -27,7 +32,14 @@ fn base_metadata(issuer: &str, scopes: &[String], require_par: bool) -> serde_js
         "response_types_supported": ["code"],
         "grant_types_supported": ["authorization_code", "refresh_token", "urn:ietf:params:oauth:grant-type:device_code"],
         "code_challenge_methods_supported": ["S256"],
-        "token_endpoint_auth_methods_supported": ["none"],
+        // #1113 rev2 finding 5: atproto profile metadata. The AS accepts both
+        // public clients (PKCE) and `private_key_jwt` (RFC 7523), signs token
+        // endpoint assertions with ES256, signals DPoP-ES256 support, and
+        // emits `authorization_endpoint` `iss` query parameter on redirects.
+        "token_endpoint_auth_methods_supported": ["none", "private_key_jwt"],
+        "token_endpoint_auth_signing_alg_values_supported": ["ES256"],
+        "dpop_signing_alg_values_supported": ["ES256"],
+        "authorization_response_iss_parameter_supported": true,
         "scopes_supported": scopes_supported,
         "client_id_metadata_document_supported": true,
     })
@@ -111,6 +123,56 @@ mod tests {
         assert_eq!(
             meta["pushed_authorization_request_endpoint"].as_str(),
             Some("https://pds.example.com/oauth/par")
+        );
+    }
+
+    /// #1113 rev2 finding 5: the RFC 8414 document carries the full atproto
+    /// profile metadata surface — private_key_jwt client auth, ES256 token
+    /// signing alg, DPoP ES256, iss-parameter support, and a canonical
+    /// origin issuer (no trailing slash/path).
+    #[test]
+    fn authorization_server_metadata_has_atproto_profile_fields() {
+        let meta = base_metadata("https://pds.example.com/", &["atproto".to_owned()], true);
+
+        // Issuer canonicalized to exact origin (trailing slash stripped).
+        assert_eq!(meta["issuer"].as_str(), Some("https://pds.example.com"));
+        assert_eq!(
+            meta["token_endpoint"].as_str(),
+            Some("https://pds.example.com/oauth/token"),
+            "no double-slash from a trailing-slash issuer"
+        );
+
+        let auth_methods: Vec<&str> = meta["token_endpoint_auth_methods_supported"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert!(auth_methods.contains(&"none"), "public clients (PKCE) must be accepted");
+        assert!(
+            auth_methods.contains(&"private_key_jwt"),
+            "private_key_jwt must be advertised"
+        );
+
+        let token_algs: Vec<&str> = meta["token_endpoint_auth_signing_alg_values_supported"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert!(token_algs.contains(&"ES256"));
+
+        let dpop_algs: Vec<&str> = meta["dpop_signing_alg_values_supported"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert!(dpop_algs.contains(&"ES256"));
+
+        assert_eq!(
+            meta["authorization_response_iss_parameter_supported"].as_bool(),
+            Some(true)
         );
     }
 }

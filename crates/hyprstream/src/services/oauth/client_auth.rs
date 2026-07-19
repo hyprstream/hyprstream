@@ -391,6 +391,7 @@ mod tests {
             jwks: Some(jwks),
             jwks_uri: None,
             hyprstream_node_did: None,
+            scope: None,
             is_cimd: true,
             registered_at: Instant::now(),
         }

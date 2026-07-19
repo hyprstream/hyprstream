@@ -62,6 +62,11 @@ pub struct RegistrationRequest {
     /// deployments use it to associate the OAuth device grant with the host.
     #[serde(default)]
     pub hyprstream_node_did: Option<String>,
+    /// Space-separated scope tokens this client intends to request (RFC 7591 /
+    /// RFC 6749 §3.3). Stored verbatim and enforced as the upper bound on
+    /// requested scopes at PAR/authorize (#1113 rev2 finding 4).
+    #[serde(default)]
+    pub scope: Option<String>,
 }
 
 /// Dynamic client registration response (RFC 7591 §3.2.1).
@@ -85,6 +90,8 @@ pub struct RegistrationResponse {
     pub jwks: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub jwks_uri: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
 }
 
 /// POST /oauth/register — Dynamic Client Registration (RFC 7591)
@@ -201,6 +208,7 @@ pub async fn register_client(
         jwks: req.jwks.clone(),
         jwks_uri: req.jwks_uri.clone(),
         hyprstream_node_did: req.hyprstream_node_did.clone(),
+        scope: req.scope.clone(),
         is_cimd: false,
         registered_at: Instant::now(),
     };
@@ -236,6 +244,7 @@ pub async fn register_client(
         token_endpoint_auth_method: req.token_endpoint_auth_method,
         jwks: req.jwks,
         jwks_uri: req.jwks_uri,
+        scope: req.scope,
     }).into_response()
 }
 
@@ -482,6 +491,7 @@ pub async fn fetch_client_metadata(
             jwks: doc.jwks,
             jwks_uri: doc.jwks_uri,
             hyprstream_node_did: None,
+            scope: None,
             is_cimd: true,
             registered_at: Instant::now(),
         },
@@ -669,6 +679,7 @@ mod tests {
             token_endpoint_auth_method: None,
             jwks: None,
             jwks_uri: None,
+            scope: None,
         };
         let json = serde_json::to_value(&resp).unwrap();
         let obj = json.as_object().unwrap();

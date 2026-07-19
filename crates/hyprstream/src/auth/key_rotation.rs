@@ -2135,6 +2135,7 @@ mod tests {
                         expires_at: std::time::Instant::now() + std::time::Duration::from_secs(60),
                         username: "multiprocess-oauth".to_owned(),
                         verifying_key: None,
+                        dpop_jkt: None,
                         },
                     );
                 }

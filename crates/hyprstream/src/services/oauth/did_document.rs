@@ -606,7 +606,25 @@ pub async fn user_did_document(
         None => Vec::new(),
     };
 
-    let doc = build_did_document(&did, &state.issuer_url, &keys, None, &[], None, None);
+    // #1113 rev2 finding 2: serve a COMPLETE atproto account DID document so
+    // that resolving the token `sub` (a did:web:{authority}:users:{username})
+    // yields a PDS whose `AtprotoPersonalDataServer` service points at THIS
+    // host — the round-trip the stock @atproto/oauth-client-browser requires
+    // (PDS metadata issuer == this AS). The hosted-account `#atproto` VM is
+    // the node's active ES256 key (the PDS signs atproto ops on the account's
+    // behalf), and `alsoKnownAs` carries an `at://{handle}` alias.
+    let atproto_signing = match state.es256_key_store.as_ref() {
+        Some(store) => store.active_key().await,
+        None => None,
+    };
+    let handle_host = authority.split(':').next().unwrap_or(authority.as_str());
+    let handle = format!("{username}.{handle_host}");
+    let atproto = atproto_signing.as_ref().map(|sk| AtprotoIdentity {
+        p256_vk: sk.verifying_key(),
+        handle: handle.as_str(),
+    });
+
+    let doc = build_did_document(&did, &state.issuer_url, &keys, atproto.as_ref(), &[], None, None);
     (
         StatusCode::OK,
         [(header::CONTENT_TYPE, "application/did+json")],
@@ -840,6 +858,44 @@ mod tests {
 
         // alsoKnownAs handle.
         assert_eq!(doc["alsoKnownAs"][0].as_str().unwrap(), "at://hyprstream.example.com");
+    }
+
+    /// #1113 rev2 finding 2/7: the per-user atproto DID document (served at
+    /// `/users/:u/did.json` for a `did:web:{authority}:users:{u}` token `sub`)
+    /// carries an `AtprotoPersonalDataServer` service whose `serviceEndpoint`
+    /// is THIS AS's origin — the round-trip the stock atproto client performs
+    /// (resolve `sub` → PDS service → PDS metadata issuer == AS). Mirrors the
+    /// `user_did_document` handler's construction exactly.
+    #[test]
+    fn per_user_atproto_doc_pds_service_points_at_issuer() {
+        let p256_sk = p256::ecdsa::SigningKey::random(&mut OsRng);
+        let p256_vk = p256_sk.verifying_key();
+        let issuer = "https://pds.example.com";
+        let did = "did:web:pds.example.com:users:alice";
+        let handle = "alice.pds.example.com";
+        let atproto = AtprotoIdentity { p256_vk, handle };
+        let doc = build_did_document(did, issuer, &[], Some(&atproto), &[], None, None);
+
+        // The atproto PDS service is present and points at the issuer origin.
+        let pds = doc["service"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["type"] == "AtprotoPersonalDataServer")
+            .expect("AtprotoPersonalDataServer service required for the sub→PDS round-trip");
+        assert_eq!(
+            pds["serviceEndpoint"].as_str().unwrap(),
+            issuer,
+            "PDS serviceEndpoint MUST equal the AS issuer (PDS = its own AS)"
+        );
+        // The account handle alias is present.
+        assert_eq!(doc["alsoKnownAs"][0].as_str().unwrap(), "at://alice.pds.example.com");
+        // The hosted-account #atproto VM (P-256 Multikey) is present.
+        assert!(doc["verificationMethod"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|vm| vm["id"].as_str() == Some(&format!("{did}#atproto"))));
     }
 
     #[test]

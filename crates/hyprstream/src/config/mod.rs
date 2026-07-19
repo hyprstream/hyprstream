@@ -1224,7 +1224,10 @@ impl Default for OAuthConfig {
             jwt_key_lead_secs: None,
             jwt_key_drain_secs: None,
             jwt_key_rotation_check_secs: None,
-            require_pushed_authorization_requests: false,
+            // #1113 rev2 finding 5: the atproto profile requires PAR, and PAR
+            // is supported unconditionally — default true so the AS advertises
+            // `require_pushed_authorization_requests: true` out of the box.
+            require_pushed_authorization_requests: true,
             xrpc_read_slice: false,
         }
     }

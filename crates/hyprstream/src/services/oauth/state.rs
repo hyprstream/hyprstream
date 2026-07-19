@@ -129,9 +129,25 @@ pub struct RegisteredClient {
     /// Optional host `did:key` supplied by a PDS attachment client. Validated
     /// during registration and retained for PDS identity association.
     pub hyprstream_node_did: Option<String>,
+    /// Space-separated scope tokens the client declared at registration
+    /// (RFC 7591 / RFC 6749 §3.3). Requested scopes at PAR/authorize are
+    /// validated as a subset of this (#1113 rev2). `None` for legacy/CIMD
+    /// clients → treated as "no client-side restriction".
+    pub scope: Option<String>,
     /// True if this client was registered via Client ID Metadata Document (HTTPS URL client_id)
     pub is_cimd: bool,
     pub registered_at: Instant,
+}
+
+impl RegisteredClient {
+    /// The client's declared scope tokens, parsed from [`Self::scope`].
+    /// Empty when the client declared no scopes (no client-side restriction).
+    pub fn declared_scopes(&self) -> Vec<String> {
+        self.scope
+            .as_deref()
+            .map(|s| s.split_whitespace().map(str::to_owned).collect())
+            .unwrap_or_default()
+    }
 }
 
 /// A Pushed Authorization Request (RFC 9126) awaiting consumption.
@@ -148,6 +164,15 @@ impl PushedAuthRequest {
     pub fn is_expired(&self) -> bool {
         Instant::now() > self.expires_at
     }
+}
+
+/// Server-side state stashed between `authorize_get` and `authorize_post`,
+/// keyed by the consent nonce (#1113 rev2). Carries the PAR-bound DPoP key
+/// thumbprint so it reaches the token endpoint without crossing the browser.
+#[derive(Debug, Clone, Default)]
+pub struct AuthorizeBinding {
+    /// DPoP `jkt` verified at PAR. `None` for non-PAR / non-DPoP requests.
+    pub dpop_jkt: Option<String>,
 }
 
 #[cfg(test)]
@@ -222,6 +247,88 @@ mod tests {
         let err = subject_did_for("https://pds.example.com", "alice/bob").unwrap_err();
         assert!(matches!(err, SubjectDidError::IncompatibleUsername));
     }
+
+    /// #1113 rev2 finding 7: atproto profile activates only when `atproto` is
+    /// in the granted set — device/generic flows without it stay non-atproto.
+    #[test]
+    fn atproto_profile_detection() {
+        assert!(atproto_profile_active(&["atproto".to_owned()]));
+        assert!(atproto_profile_active(&["atproto".to_owned(), "read:*:*".to_owned()]));
+        assert!(!atproto_profile_active(&["read:*:*".to_owned()]));
+        assert!(!atproto_profile_active(&[]));
+    }
+
+    /// #1113 rev2 finding 4: requested scopes are validated against the
+    /// server-supported ∩ client-declared sets; garbage/undeclared tokens
+    /// yield invalid_scope and the actual granted set is returned.
+    #[test]
+    fn validate_requested_scopes_rejects_garbage() {
+        let server = ["atproto".to_owned(), "transition:generic".to_owned(), "read:*:*".to_owned()];
+        let res = validate_requested_scopes(
+            &["atproto".to_owned(), "bogus".to_owned()],
+            &server,
+            None,
+            true,
+        );
+        assert_eq!(res.unwrap_err(), ScopeError::InvalidScope);
+    }
+
+    /// #1113 rev2 finding 4: the granted set is the intersection of requested
+    /// with server-supported, intersected with the client's declared scopes.
+    #[test]
+    fn validate_requested_scopes_intersects_client_declared() {
+        let server = ["atproto".to_owned(), "transition:generic".to_owned(), "read:*:*".to_owned()];
+        let declared = ["atproto".to_owned(), "read:*:*".to_owned()];
+        let granted = validate_requested_scopes(
+            &["atproto".to_owned(), "read:*:*".to_owned()],
+            &server,
+            Some(&declared),
+            true,
+        )
+        .unwrap();
+        assert_eq!(granted, vec!["atproto".to_owned(), "read:*:*".to_owned()]);
+        // Client did NOT declare transition:generic → requesting it is invalid.
+        let res = validate_requested_scopes(
+            &["atproto".to_owned(), "transition:generic".to_owned()],
+            &server,
+            Some(&declared),
+            true,
+        );
+        assert_eq!(res.unwrap_err(), ScopeError::InvalidScope);
+    }
+
+    /// #1113 rev2 finding 4: when the atproto profile is requested, `atproto`
+    /// MUST survive into the granted set, else AtprotoRequired.
+    #[test]
+    fn validate_requested_scopes_requires_atproto_when_profile_active() {
+        let server = ["atproto".to_owned(), "read:*:*".to_owned()];
+        let res = validate_requested_scopes(&["read:*:*".to_owned()], &server, None, true);
+        assert_eq!(res.unwrap_err(), ScopeError::AtprotoRequired);
+        // Non-atproto request (require_atproto=false) does not require it.
+        let granted =
+            validate_requested_scopes(&["read:*:*".to_owned()], &server, None, false).unwrap();
+        assert_eq!(granted, vec!["read:*:*".to_owned()]);
+    }
+
+    /// #1113 rev2 finding 5: the issuer is canonicalized to an exact origin
+    /// (scheme://host[:port]) — trailing slash and path are stripped so
+    /// endpoint URLs and the token `iss` are well-formed.
+    #[test]
+    fn canonical_issuer_origin_strips_path_and_slash() {
+        assert_eq!(
+            canonical_issuer_origin("https://pds.example.com/").as_deref(),
+            Some("https://pds.example.com")
+        );
+        assert_eq!(
+            canonical_issuer_origin("https://pds.example.com/oauth/par").as_deref(),
+            Some("https://pds.example.com")
+        );
+        assert_eq!(
+            canonical_issuer_origin("http://127.0.0.1:6791").as_deref(),
+            Some("http://127.0.0.1:6791")
+        );
+        assert!(canonical_issuer_origin("pds.example.com").is_none());
+    }
 }
 
 /// A pending authorization code awaiting token exchange.
@@ -244,6 +351,10 @@ pub struct PendingAuthCode {
     /// Ed25519 verifying key verified during challenge-response.
     /// Included in the JWT `pub_key` claim to bind the user's key identity.
     pub verifying_key: Option<ed25519_dalek::VerifyingKey>,
+    /// DPoP key thumbprint bound at PAR (#1113 rev2 finding 3). When the
+    /// atproto profile is active, the token endpoint must receive a DPoP
+    /// proof from the same key.
+    pub dpop_jkt: Option<String>,
 }
 
 impl PendingAuthCode {
@@ -402,6 +513,12 @@ pub struct OAuthState {
     /// Pending authorize nonces (single-use, 5-min TTL).
     /// Proves a nonce was issued by this server and hasn't been replayed.
     pub pending_nonces: RwLock<HashMap<String, Instant>>,
+    /// Server-side authorize-session bindings keyed by the consent nonce:
+    /// carries the PAR-bound `dpop_jkt` (#1113 rev2 finding 3) so the
+    /// DPoP key bound at PAR reaches `authorize_post` without crossing the
+    /// browser (a hidden form field would be client-controlled). Consumed
+    /// single-use alongside the nonce.
+    pub pending_authorize_bindings: RwLock<HashMap<String, AuthorizeBinding>>,
     /// Pending Pushed Authorization Requests (RFC 9126), keyed by `request_uri`.
     /// Single-use, 60s TTL. In-memory is correct here — no value to persistence.
     pub pending_par_requests: RwLock<HashMap<String, super::state::PushedAuthRequest>>,
@@ -570,6 +687,7 @@ impl OAuthState {
     pub fn new(config: &OAuthConfig, policy_client: PolicyClient, discovery_client: DiscoveryClient, verifying_key_bytes: [u8; 32]) -> Self {
         Self {
             clients: RwLock::new(HashMap::new()),
+            pending_authorize_bindings: RwLock::new(HashMap::new()),
             cimd_cache: Arc::new(super::cimd_cache::CimdCache::new(
                 super::cimd_cache::CimdCacheConfig::default(),
             )),
@@ -1020,4 +1138,99 @@ pub enum SubjectDidError {
     /// The local username contains characters that would corrupt a did:web path.
     #[error("local username incompatible with did:web path")]
     IncompatibleUsername,
+}
+
+/// The atproto transition scope name. Its presence in a granted scope set
+/// activates the strict atproto OAuth profile (#1113 rev2): DPoP-mandatory,
+/// DID subject, `token_type: DPoP` response, scope enforcement.
+pub const ATPROTO_SCOPE: &str = "atproto";
+
+/// True when the granted scope set activates the atproto strict profile.
+pub fn atproto_profile_active(scopes: &[String]) -> bool {
+    scopes.iter().any(|s| s == ATPROTO_SCOPE)
+}
+
+/// Normalize a single scope token. RFC 6749 §3.3 scope tokens are `1*(%x21 /
+/// %x23-5B / %x5D-7E)` — no space, no `"`, no control chars. Returns `None`
+/// for tokens that are empty or contain characters outside the allowed set.
+pub fn normalize_scope_token(tok: &str) -> Option<&str> {
+    if tok.is_empty() {
+        return None;
+    }
+    if tok.bytes().all(|b| b >= 0x21 && b != b'"' && b != 0x7f) {
+        Some(tok)
+    } else {
+        None
+    }
+}
+
+/// Validate a requested scope set against the server-supported and (optionally)
+/// client-declared scopes (#1113 rev2 finding 4).
+///
+/// Returns the **actual granted set** (the intersection of requested with the
+/// server-supported set, intersected with `client_declared` when provided),
+/// preserving the server's canonical ordering of the supported scopes.
+///
+/// - Unknown / undeclared / malformed requested tokens yield
+///   [`ScopeError::InvalidScope`] (RFC 6749 §4.1.2.1 / §3.3) so the caller
+///   rejects with `invalid_scope`.
+/// - When `require_atproto` is true (the atproto profile), the granted set
+///   MUST contain [`ATPROTO_SCOPE`]; otherwise [`ScopeError::AtprotoRequired`].
+pub fn validate_requested_scopes(
+    requested: &[String],
+    server_supported: &[String],
+    client_declared: Option<&[String]>,
+    require_atproto: bool,
+) -> Result<Vec<String>, ScopeError> {
+    // The set the client is permitted to ask for.
+    let allowed: Vec<&str> = match client_declared {
+        Some(declared) if !declared.is_empty() => server_supported
+            .iter()
+            .filter(|s| declared.iter().any(|d| d == *s))
+            .map(String::as_str)
+            .collect(),
+        _ => server_supported.iter().map(String::as_str).collect(),
+    };
+
+    let mut granted: Vec<String> = Vec::new();
+    for tok in requested {
+        let tok = normalize_scope_token(tok).ok_or(ScopeError::InvalidScope)?;
+        if !allowed.contains(&tok) {
+            return Err(ScopeError::InvalidScope);
+        }
+        if !granted.iter().any(|g| g == tok) {
+            granted.push(tok.to_owned());
+        }
+    }
+    if require_atproto && !granted.iter().any(|s| s == ATPROTO_SCOPE) {
+        return Err(ScopeError::AtprotoRequired);
+    }
+    Ok(granted)
+}
+
+/// Errors raised by [`validate_requested_scopes`].
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum ScopeError {
+    /// A requested scope token is unknown, undeclared by the client, or
+    /// malformed → reject with OAuth `invalid_scope` (RFC 6749 §3.3).
+    #[error("invalid or unsupported scope")]
+    InvalidScope,
+    /// The atproto profile is active but `atproto` is not in the granted set.
+    #[error("atproto scope required for this profile")]
+    AtprotoRequired,
+}
+
+/// Canonicalize an issuer/external URL to an exact origin (scheme://host[:port])
+/// with no trailing slash and no path (#1113 rev2 finding 5). Returns `None`
+/// when the URL has no scheme or authority.
+pub fn canonical_issuer_origin(issuer_url: &str) -> Option<String> {
+    let (scheme, rest) = issuer_url.split_once("://")?;
+    if scheme.is_empty() {
+        return None;
+    }
+    let authority = rest.split('/').next()?;
+    if authority.is_empty() {
+        return None;
+    }
+    Some(format!("{scheme}://{authority}"))
 }

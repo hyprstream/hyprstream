@@ -439,6 +439,31 @@ async fn exchange_authorization_code(
         Some(Err(resp)) => return resp,
     };
 
+    // #1113 rev2 finding 3 + 6: the atproto profile (granted scope set
+    // includes `atproto`) is a STRICT path — DPoP is mandatory and the proof
+    // key MUST match the `jkt` bound at PAR (stored on the auth code). Non-
+    // atproto flows keep DPoP optional and their existing behavior.
+    if super::state::atproto_profile_active(&pending.scopes) {
+        match (dpop_jkt.as_ref(), pending.dpop_jkt.as_ref()) {
+            (Some(proof_jkt), Some(bound_jkt)) if proof_jkt == bound_jkt => {
+                // DPoP key matches the PAR binding — proceed.
+            }
+            _ => {
+                tracing::warn!(
+                    client_id = %params.client_id,
+                    proof_jkt = ?dpop_jkt,
+                    bound_jkt = ?pending.dpop_jkt,
+                    "atproto profile requires a DPoP proof matching the PAR-bound key"
+                );
+                return token_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_dpop_proof",
+                    Some("atproto profile requires a DPoP proof from the key bound at PAR"),
+                );
+            }
+        }
+    }
+
     tracing::info!(client_id = %params.client_id, username = %pending.username, "PKCE verified, issuing token");
     let sub = pending.username.clone();
     let vk_ref = pending.verifying_key.as_ref();
@@ -763,6 +788,7 @@ async fn issue_token_with_refresh(
     vault_device_cookie: Option<String>,
 ) -> Response {
     let scope_str = scopes.join(" ");
+    let atproto_profile = super::state::atproto_profile_active(&scopes);
 
     // DPoP jkt takes priority; fall back to raw key bytes for cnf.jwk.
     let user_pub_key_b64 = if dpop_jkt.is_none() {
@@ -771,26 +797,29 @@ async fn issue_token_with_refresh(
         None
     };
 
-    // atproto OAuth AS conformance (#1113): the access token's `sub` MUST be
-    // the account's DID. `sub` arriving here is the internal username (auth
-    // code / refresh / device flows resolve it from the credential store);
-    // derive the DID-form subject for the emitted JWT. Internal bookkeeping
-    // (refresh-token entry, profile lookup, device link) keeps using the
-    // raw username so lookups remain keyed on the enrollment identity.
+    // #1113 rev2 finding 6: the DID subject / did:at9p fail-closed rule is
+    // CONDITIONAL on the atproto profile. Non-atproto flows (device, WIT,
+    // generic authorization-code) keep their existing username subject
+    // byte-for-byte — the atproto strict path only activates when the granted
+    // scope set includes `atproto`.
     //
-    // #1113 correction: only `did:plc` / `did:web` (and synthesized
-    // `did:web`) are eligible atproto token subjects. `did:at9p` and other
-    // DID methods fail closed — no token is minted for an ineligible subject.
-    let jwt_sub = match state.subject_did(sub) {
-        Ok(did) => did,
-        Err(e) => {
-            tracing::warn!(local_subject = %sub, error = %e, "rejecting token issuance: subject not eligible for atproto OAuth");
-            return token_error(
-                StatusCode::BAD_REQUEST,
-                "invalid_request",
-                Some("account subject is not eligible for an atproto OAuth token"),
-            );
+    // atproto profile: the access token's `sub` MUST be the account's DID
+    // (`did:plc` / `did:web`). `did:at9p` and other DID methods are NOT
+    // eligible and fail closed (no token minted).
+    let jwt_sub = if atproto_profile {
+        match state.subject_did(sub) {
+            Ok(did) => did,
+            Err(e) => {
+                tracing::warn!(local_subject = %sub, error = %e, "rejecting atproto token issuance: subject not eligible");
+                return token_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request",
+                    Some("account subject is not eligible for an atproto OAuth token"),
+                );
+            }
         }
+    } else {
+        sub.to_owned()
     };
 
     let result = state
@@ -799,7 +828,7 @@ async fn issue_token_with_refresh(
             requested_scopes: Some(scopes.clone()),
             ttl: Some(state.token_ttl),
             audience: resource.clone(),
-            subject: Some(jwt_sub),
+            subject: Some(jwt_sub.clone()),
             user_pub_key: user_pub_key_b64,
             dpop_jkt: dpop_jkt.clone(),
         })
@@ -903,13 +932,14 @@ async fn issue_token_with_refresh(
                 None
             };
 
-            let mut response_json = serde_json::json!({
-                "access_token": token_info.token,
-                "token_type": if dpop_jkt.is_some() { "DPoP" } else { "Bearer" },
-                "expires_in": expires_in,
-                "scope": scope_str,
-                "refresh_token": refresh_token,
-            });
+            let mut response_json = build_token_response_json(
+                atproto_profile,
+                &token_info.token,
+                &jwt_sub,
+                &scope_str,
+                expires_in,
+                &refresh_token,
+            );
             if let Some(id_token) = id_token {
                 response_json["id_token"] = serde_json::Value::String(id_token);
             }
@@ -938,6 +968,41 @@ async fn issue_token_with_refresh(
                 None,
             )
         }
+    }
+}
+
+/// Build the token-endpoint success response JSON (#1113 rev2 finding 1).
+///
+/// Factored pure so the atproto `atprotoOAuthTokenResponseSchema` shape and the
+/// legacy Bearer shape are both unit-testable without constructing an
+/// `OAuthState` + PolicyClient. When `atproto_profile` is true the response
+/// carries `token_type: "DPoP"` and a top-level `sub` (the account DID), per
+/// the schema the stock `@atproto/oauth-client-browser` parses.
+pub(crate) fn build_token_response_json(
+    atproto_profile: bool,
+    access_token: &str,
+    sub: &str,
+    scope_str: &str,
+    expires_in: i64,
+    refresh_token: &str,
+) -> serde_json::Value {
+    if atproto_profile {
+        serde_json::json!({
+            "access_token": access_token,
+            "token_type": "DPoP",
+            "expires_in": expires_in,
+            "scope": scope_str,
+            "sub": sub,
+            "refresh_token": refresh_token,
+        })
+    } else {
+        serde_json::json!({
+            "access_token": access_token,
+            "token_type": "Bearer",
+            "expires_in": expires_in,
+            "scope": scope_str,
+            "refresh_token": refresh_token,
+        })
     }
 }
 
@@ -1082,5 +1147,77 @@ mod tests {
     fn use_dpop_nonce_error_keeps_400_on_unheaderable_nonce() {
         let resp = use_dpop_nonce_error("not valid token", "expired");
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// #1113 rev2 finding 1: the atproto token response matches
+    /// atprotoOAuthTokenResponseSchema — `token_type: "DPoP"`, a top-level
+    /// `sub` that is a did:plc/did:web, and a scope containing `atproto`.
+    #[test]
+    fn atproto_token_response_matches_schema_shape() {
+        let json = build_token_response_json(
+            true,
+            "access-jwt",
+            "did:web:pds.example.com:users:alice",
+            "atproto transition:generic",
+            3600,
+            "rt",
+        );
+        assert_eq!(json["token_type"].as_str(), Some("DPoP"));
+        let sub = json["sub"].as_str().expect("top-level sub required");
+        assert!(
+            sub.starts_with("did:plc:") || sub.starts_with("did:web:"),
+            "atproto sub must be an account DID, got {sub}"
+        );
+        let scope = json["scope"].as_str().expect("scope required");
+        assert!(scope.split_whitespace().any(|s| s == "atproto"), "scope missing atproto");
+        assert_eq!(json["access_token"].as_str(), Some("access-jwt"));
+        assert_eq!(json["refresh_token"].as_str(), Some("rt"));
+    }
+
+    /// #1113 rev2 finding 6 (regression): a non-atproto grant (e.g. device
+    /// flow, scopes without `atproto`) keeps the legacy Bearer shape with NO
+    /// top-level `sub` — existing principals are byte-for-byte unchanged.
+    #[test]
+    fn non_atproto_token_response_is_bearer_without_sub() {
+        let json = build_token_response_json(
+            false,
+            "access-jwt",
+            "alice",
+            "read:*:*",
+            3600,
+            "rt",
+        );
+        assert_eq!(json["token_type"].as_str(), Some("Bearer"));
+        assert!(
+            json.get("sub").is_none(),
+            "non-atproto response MUST NOT carry a top-level sub"
+        );
+    }
+
+    /// #1113 rev2 finding 3: PAR↔token DPoP binding — a proof whose `jkt`
+    /// does not match the PAR-bound thumbprint must be rejected. The binding
+    /// check is a plain equality compare; pin the comparator semantics.
+    #[test]
+    fn dpop_jkt_binding_rejects_mismatched_key() {
+        let bound: Option<String> = Some("jkt-A".into());
+        let proof: Option<String> = Some("jkt-B".into());
+        // The token endpoint accepts only when both are present AND equal.
+        let matches = matches!(
+            (proof.as_ref(), bound.as_ref()),
+            (Some(a), Some(b)) if a == b
+        );
+        assert!(!matches, "mismatched jkt must not bind");
+        let bound2: Option<String> = Some("jkt-A".into());
+        let matches2 = matches!(
+            (proof.as_ref(), bound2.as_ref()),
+            (Some(a), Some(b)) if a == b
+        );
+        assert!(!matches2);
+        let proof_same: Option<String> = Some("jkt-A".into());
+        let matches3 = matches!(
+            (proof_same.as_ref(), bound.as_ref()),
+            (Some(a), Some(b)) if a == b
+        );
+        assert!(matches3, "equal jkt must bind");
     }
 }

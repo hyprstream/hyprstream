@@ -50,6 +50,11 @@ pub struct AuthorizeParams {
     /// OIDC nonce — echoed into id_token (OpenID Connect Core 1.0, Section 3.1.2.1)
     #[serde(default)]
     pub nonce: Option<String>,
+    /// DPoP key thumbprint (`jkt`) bound at PAR (#1113 rev2 finding 3). When
+    /// the atproto profile is active this is REQUIRED and the token endpoint
+    /// must receive a DPoP proof from the same key.
+    #[serde(default)]
+    pub dpop_jkt: Option<String>,
 }
 
 /// Loosely-typed authorize query.
@@ -219,6 +224,15 @@ pub async fn authorize_get(
 
     // Generate a nonce, store it server-side (5-min TTL, single-use on POST).
     let nonce = issue_nonce(&state).await;
+    // Stash the PAR-bound DPoP key thumbprint alongside the nonce so it
+    // reaches authorize_post without crossing the browser (#1113 rev2).
+    state
+        .pending_authorize_bindings
+        .write()
+        .await
+        .insert(nonce.clone(), super::state::AuthorizeBinding {
+            dpop_jkt: params.dpop_jkt.clone(),
+        });
 
     // Render challenge form
     let html = render_challenge_page(
@@ -246,11 +260,20 @@ pub async fn authorize_post(
 ) -> Response {
     // Validate and consume the nonce. Rejects forged nonces and enforces the 5-min TTL.
     // Single-use: remove from pending_nonces whether valid or expired.
-    let nonce_valid = {
+    let (nonce_valid, authorize_binding) = {
         let mut nonces = state.pending_nonces.write().await;
         match nonces.remove(&form.nonce) {
-            Some(expiry) => Instant::now() < expiry,
-            None => false,
+            Some(expiry) => {
+                let valid = Instant::now() < expiry;
+                // Consume the PAR-bound DPoP jkt alongside the nonce (#1113 rev2).
+                let binding = state
+                    .pending_authorize_bindings
+                    .write()
+                    .await
+                    .remove(&form.nonce);
+                (valid, binding)
+            }
+            None => (false, None),
         }
     };
     if !nonce_valid {
@@ -350,7 +373,32 @@ pub async fn authorize_post(
     rand::rngs::OsRng.fill_bytes(&mut code_bytes);
     let code = URL_SAFE_NO_PAD.encode(code_bytes);
 
-    let scopes: Vec<String> = form.scope.split_whitespace().map(std::borrow::ToOwned::to_owned).collect();
+    // #1113 rev2 finding 4: validate the requested scope set against the
+    // server-supported and client-declared scopes BEFORE minting an auth
+    // code. Garbage / undeclared tokens → invalid_scope. The granted set
+    // (intersection) is what the token response will echo (RFC 6749 §3.3).
+    let requested_scopes: Vec<String> = form
+        .scope
+        .split_whitespace()
+        .map(std::borrow::ToOwned::to_owned)
+        .collect();
+    let client_declared = resolve_client_declared_scopes(&state, &form.client_id).await;
+    let require_atproto = super::state::atproto_profile_active(&requested_scopes);
+    let granted_scopes = match super::state::validate_requested_scopes(
+        &requested_scopes,
+        &state.default_scopes,
+        if client_declared.is_empty() { None } else { Some(&client_declared) },
+        require_atproto,
+    ) {
+        Ok(g) => g,
+        Err(_) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_scope",
+                "Requested scope is not supported or not declared by the client",
+            );
+        }
+    };
     let resource = form.resource.as_ref().filter(|s| !s.is_empty()).cloned();
 
     let pending = PendingAuthCode {
@@ -358,13 +406,15 @@ pub async fn authorize_post(
         client_id: form.client_id.clone(),
         redirect_uri: form.redirect_uri.clone(),
         code_challenge: form.code_challenge.clone(),
-        scopes,
+        scopes: granted_scopes,
         oidc_nonce: form.oidc_nonce.clone(),
         resource,
         created_at: Instant::now(),
         expires_at: Instant::now() + Duration::from_secs(60),
         username: resolved_username.clone(),
         verifying_key: Some(verifying_key),
+        // PAR-bound DPoP key thumbprint (#1113 rev2 finding 3).
+        dpop_jkt: authorize_binding.as_ref().and_then(|b| b.dpop_jkt.clone()),
     };
 
     state.pending_codes.write().await.insert(code.clone(), pending);
@@ -489,6 +539,7 @@ async fn resolve_authorize_query(
         scope,
         resource,
         nonce,
+        dpop_jkt: None,
     })
 }
 
@@ -538,6 +589,25 @@ async fn derive_display_info(
         .unwrap_or_else(|| redirect_uri.to_owned());
     let localhost_warning = compute_localhost_warning(&client.redirect_uris);
     Some((client_name, redirect_host, localhost_warning))
+}
+
+/// Resolve a client's declared scope tokens for `invalid_scope` validation
+/// (#1113 rev2 finding 4). CIMD-shaped client_ids (HTTPS URLs) resolve via
+/// the CIMD cache; DCR UUIDs via the registry. Returns an empty vec when the
+/// client is unknown or declared no scopes (→ no client-side restriction).
+async fn resolve_client_declared_scopes(state: &OAuthState, client_id: &str) -> Vec<String> {
+    let client = if client_id.starts_with("https://") {
+        match state.cimd_cache.get(client_id).await {
+            Some(c) => c,
+            None => return Vec::new(),
+        }
+    } else {
+        match state.clients.read().await.get(client_id) {
+            Some(c) => c.clone(),
+            None => return Vec::new(),
+        }
+    };
+    client.declared_scopes()
 }
 
 /// Build the consent-screen localhost warning when every registered
