@@ -1460,12 +1460,19 @@ impl Es256SigningKeyStore {
         *self.1.write() = Some(hook);
     }
 
+    fn has_promotion_hook(&self) -> bool {
+        self.1.read().is_some()
+    }
+
     fn notify_promotion(&self, key: Arc<Es256SigningKey>) -> anyhow::Result<()> {
-        let hook = self.1.read().clone();
-        if let Some(hook) = hook {
-            hook(key)?;
-        }
-        Ok(())
+        let hook = self
+            .1
+            .read()
+            .clone()
+            .ok_or_else(|| {
+                anyhow::anyhow!("ES256 promotion requires a PDS head re-sign hook")
+            })?;
+        hook(key)
     }
 
     /// The current active ES256 signing key — the single `#atproto` key the
@@ -1634,14 +1641,11 @@ pub async fn rotate_es256_keys(
     let mut promoted = false;
 
     // Phase 1: promote lead → active if lead.nbf <= now
-    if let Some(new_active) = slots
-        .lead
-        .as_ref()
-        .filter(|lead| lead.nbf <= now)
-        .cloned()
-    {
+    if let Some(new_active) = slots.lead.as_ref().filter(|lead| lead.nbf <= now).cloned() {
         let old_active = slots.active.clone();
-        if let Err(error) = persist_es256_slot(secrets_dir, "active", &new_active) {
+        if !store.has_promotion_hook() {
+            warn!("ES256: promotion remains pending because no PDS head re-sign hook is installed");
+        } else if let Err(error) = persist_es256_slot(secrets_dir, "active", &new_active) {
             if let Some(ref old_active) = old_active {
                 if let Err(rollback_error) = persist_es256_slot(secrets_dir, "active", old_active) {
                     warn!(
@@ -1691,6 +1695,12 @@ pub async fn rotate_es256_keys(
             info!("ES256: promoted lead → active");
         }
     }
+
+    // The filesystem active slot and RocksDB repo head are separate durable
+    // stores. This write-guard protocol closes all in-process observation
+    // windows, but crash-atomic pending state + startup publication gating is
+    // tracked by #1126. Until that lands, startup reconciliation remains the
+    // recovery mechanism for a crash between those durable writes.
 
     // Phase 2: remove expired drain
     if let Some(ref drain) = slots.drain {
@@ -3345,6 +3355,7 @@ mod tests {
             active: Some(active),
             lead: Some(lead),
         });
+        store.set_promotion_hook(Arc::new(|_| Ok(())));
 
         rotate_es256_keys(&config, dir.path(), &store, now).await;
 
@@ -3352,6 +3363,38 @@ mod tests {
         assert_eq!(slots.active.as_ref().unwrap().kid(), lead_kid);
         assert!(slots.drain.is_some());
         assert!(slots.lead.is_none());
+    }
+
+    #[tokio::test]
+    async fn es256_rotate_without_hook_stays_pending() {
+        let dir = TempDir::new().unwrap();
+        let config = test_config();
+        let now = chrono::Utc::now().timestamp();
+
+        let active = generate_es256_slot(now - 14 * 86400, now + 1);
+        let active_kid = active.kid();
+        let lead = generate_es256_slot(now - 1, now + 14 * 86400);
+        let lead_kid = lead.kid();
+        persist_es256_slot(dir.path(), "active", &active).unwrap();
+        persist_es256_slot(dir.path(), "lead", &lead).unwrap();
+        let store = Es256SigningKeyStore::new(Es256KeySlots {
+            drain: None,
+            active: Some(active),
+            lead: Some(lead),
+        });
+
+        assert!(
+            !rotate_es256_keys(&config, dir.path(), &store, now).await,
+            "rotation without a head re-sign hook must remain pending"
+        );
+        let slots = store.0.read();
+        assert_eq!(slots.active.as_ref().unwrap().kid(), active_kid);
+        assert_eq!(slots.lead.as_ref().unwrap().kid(), lead_kid);
+        assert!(slots.drain.is_none());
+        assert_eq!(
+            load_es256_slot(dir.path(), "active").unwrap().kid(),
+            active_kid
+        );
     }
 
     #[tokio::test]

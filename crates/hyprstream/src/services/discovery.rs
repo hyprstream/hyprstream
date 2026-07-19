@@ -1389,11 +1389,11 @@ fn atproto_datetime_now() -> String {
 /// commit served in the proof is the one the writer signed at publish time.
 pub struct PdsRecordResolver {
     store: Arc<PdsRecordStore>,
-    /// The shared ES256 rotation store + this node's repo DID, so the resolver
-    /// can return the current `#atproto` verifying key for the local DID from
-    /// the same live store the writer signs with (#918 re-sign-on-rotation).
-    /// `None` when the resolver was constructed without rotation visibility
-    /// (e.g. isolated tests); ingest then fails closed for that DID.
+    /// The shared ES256 rotation store + this node's repo DID. Local repo reads
+    /// take its generation read guard, so the re-sign hook cannot expose a
+    /// K'-signed head before K' becomes the live key. This does NOT authorize
+    /// the local repo's transitional `did:key`; verification remains fail
+    /// closed until #1124 supplies a real atproto repo authority.
     rotation: Option<(Arc<crate::auth::key_rotation::Es256SigningKeyStore>, String)>,
 }
 
@@ -1405,11 +1405,9 @@ impl PdsRecordResolver {
         }
     }
 
-    /// Install the ES256 rotation store + this node's repo DID, enabling
-    /// the resolver to return the current `#atproto` verifying key for the
-    /// local DID (#918 re-sign-on-rotation). For foreign DIDs the resolver
-    /// returns None (no DID-document fetch wired yet) — the verifier fails
-    /// closed for those.
+    /// Install the ES256 rotation store + this node's repo DID, enabling local
+    /// repo reads to share the rotation generation guard. Key resolution still
+    /// fails closed for this transitional `did:key` and for foreign DIDs.
     pub fn with_es256_rotation(
         mut self,
         store: Arc<crate::auth::key_rotation::Es256SigningKeyStore>,
@@ -1417,6 +1415,14 @@ impl PdsRecordResolver {
     ) -> Self {
         self.rotation = Some((store, node_did));
         self
+    }
+
+    fn local_generation_guard(
+        &self,
+        did: &str,
+    ) -> Option<parking_lot::RwLockReadGuard<'_, crate::auth::key_rotation::Es256KeySlots>> {
+        let (store, node_did) = self.rotation.as_ref()?;
+        (did == node_did).then(|| store.0.read())
     }
 
     pub fn accepted_at9p_state(
@@ -1481,6 +1487,10 @@ impl RecordResolver for PdsRecordResolver {
             Err(_) => return Ok(None),
         };
 
+        // Pair with promotion's write guard through the complete head snapshot
+        // and proof assembly. A reader therefore sees either generation K or
+        // generation K', never the K'-signed head during the hidden transition.
+        let _generation_guard = self.local_generation_guard(did);
         let Some(repo) = self.store.load_repo(did)? else {
             return Ok(None);
         };
@@ -1499,6 +1509,7 @@ impl RecordResolver for PdsRecordResolver {
     }
 
     async fn resolve_repo(&self, did: &str) -> anyhow::Result<Option<RecordCarData>> {
+        let _generation_guard = self.local_generation_guard(did);
         let Some(repo) = self.store.load_repo(did)? else {
             return Ok(None);
         };
@@ -1527,45 +1538,18 @@ impl RecordResolver for PdsRecordResolver {
     /// Resolve the single current `#atproto` verifying key for `did` — the
     /// atproto-spec-aligned verification seam (#918 re-sign-on-rotation).
     ///
-    /// For this node's own repo DID, the current transitional path materializes
-    /// the `#atproto` verification method from the live ES256 store and runs it
-    /// through `atproto_verifying_key_from_did_document`. This is not yet
-    /// authority-equivalent to the served document: the repo subject remains a
-    /// node `did:key`, while peers receive an OAuth-issuer `did:web` document.
-    /// Aligning those identities and resolving the real served document is
-    /// blocked on the account/node DID provisioning model in #1124. Foreign
-    /// DIDs return `Ok(None)` so placement ingest fails closed.
+    /// The local repo subject is currently an Ed25519-derived node `did:key`,
+    /// while peers receive an OAuth-issuer `did:web` document carrying the
+    /// independent P-256 `#atproto` key. No resolvable document for that
+    /// `did:key` authorizes the P-256 key, so the only safe interim behavior is
+    /// `Ok(None)`: placement ingest rejects the local repo. #1124 owns aligning
+    /// the repo subject with a real atproto authority. Foreign resolution is
+    /// also unavailable and fails closed.
     async fn resolve_verifying_key(
         &self,
-        did: &str,
+        _did: &str,
     ) -> anyhow::Result<Option<p256::ecdsa::VerifyingKey>> {
-        // TODO(#1124): `node_did` is currently an Ed25519-derived did:key,
-        // while the document actually served to peers is rooted at the OAuth
-        // issuer's did:web authority. Replacing this local materialization
-        // with resolution of that real document requires the account/node DID
-        // provisioning model from #1124; do not claim authority equivalence
-        // until the repo subject and served document share that identity.
-        let Some((store, node_did)) = self.rotation.as_ref() else {
-            return Ok(None);
-        };
-        if did != node_did.as_str() {
-            return Ok(None);
-        }
-        let active_key = store.active_key().ok_or_else(|| {
-            anyhow!("local DID {did} has no active ES256 #atproto verification key")
-        })?;
-        let document = serde_json::json!({
-            "id": did,
-            "verificationMethod": [
-                crate::services::oauth::did_document::atproto_verification_method(
-                    did,
-                    active_key.verifying_key(),
-                )
-            ],
-        });
-        hyprstream_pds::commit::atproto_verifying_key_from_did_document(&document, did)
-            .map(Some)
-            .context("locally materialized #atproto DID document failed validation")
+        Ok(None)
     }
 }
 
@@ -1918,24 +1902,142 @@ mod pds_store_tests {
     }
 
     #[test]
-    fn local_verifier_round_trips_through_published_did_document_shape() {
+    fn repo_reader_waits_for_complete_rotation_generation() {
+        use crate::auth::key_rotation::{
+            rotate_es256_keys, Es256KeySlot, Es256KeySlots, Es256SigningKeyStore,
+        };
+        use std::sync::{mpsc, Barrier};
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pds_dir = dir.path().join("pds");
+        let secrets_dir = dir.path().join("secrets");
+        std::fs::create_dir_all(&secrets_dir).expect("create secrets dir");
+        let now = chrono::Utc::now().timestamp();
+        let old_sk = SigningKey::random(&mut rand::rngs::OsRng);
+        let new_sk = SigningKey::random(&mut rand::rngs::OsRng);
+        let new_vk: VerifyingKey = *new_sk.verifying_key();
+
+        let store = Arc::new(PdsRecordStore::open(&pds_dir).expect("open rw"));
+        let es256_store = Arc::new(Es256SigningKeyStore::new(Es256KeySlots {
+            drain: None,
+            active: Some(Es256KeySlot::new(old_sk, now - 100, now + 1)),
+            lead: Some(Es256KeySlot::new(new_sk, now - 1, now + 30 * 86_400)),
+        }));
+        let publisher = Arc::new(PdsPublisher::new(
+            Arc::clone(&store),
+            DID.to_owned(),
+            Arc::clone(&es256_store),
+        ));
+        publisher.publish("repo-a", SAMPLE_OID).expect("publish");
+        let resolver = Arc::new(
+            PdsRecordResolver::new(Arc::clone(&store))
+                .with_es256_rotation(Arc::clone(&es256_store), DID.to_owned()),
+        );
+
+        // Pause after K' has been persisted as the repo head but before the
+        // rotation write guard installs K' as the live/published key.
+        let transition_barrier = Arc::new(Barrier::new(2));
+        let hook_barrier = Arc::clone(&transition_barrier);
+        let (head_written_tx, head_written_rx) = mpsc::channel();
+        let weak_publisher = Arc::downgrade(&publisher);
+        es256_store.set_promotion_hook(Arc::new(move |key| {
+            let publisher = weak_publisher
+                .upgrade()
+                .ok_or_else(|| anyhow!("publisher dropped during rotation test"))?;
+            publisher.resign_head_with_key(&key)?;
+            head_written_tx
+                .send(())
+                .map_err(|_| anyhow!("test observer dropped"))?;
+            hook_barrier.wait();
+            Ok(())
+        }));
+
+        let rotation_store = Arc::clone(&es256_store);
+        let rotation_secrets = secrets_dir.clone();
+        let rotation = std::thread::spawn(move || {
+            block_on(rotate_es256_keys(
+                &crate::config::OAuthConfig::default(),
+                &rotation_secrets,
+                &rotation_store,
+                now,
+            ))
+        });
+        head_written_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("hook wrote candidate head");
+
+        let observer_store = Arc::clone(&es256_store);
+        let (observed_tx, observed_rx) = mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let repo = block_on(resolver.resolve_repo(DID))
+                .expect("resolve repo")
+                .expect("repo present");
+            let key = observer_store.active_key().expect("active key");
+            observed_tx
+                .send((commit_from_car(&repo.car), key))
+                .expect("send observation");
+        });
+        let early_observation = observed_rx.recv_timeout(Duration::from_millis(100));
+        let reader_was_blocked = matches!(
+            &early_observation,
+            Err(mpsc::RecvTimeoutError::Timeout)
+        );
+        transition_barrier.wait();
+        assert!(rotation.join().expect("rotation thread"));
+        reader.join().expect("reader thread");
+        assert!(
+            reader_was_blocked,
+            "repo reader must block while candidate head and live key generations differ"
+        );
+        let (commit, observed_key) = match early_observation {
+            Ok(observation) => observation,
+            Err(mpsc::RecvTimeoutError::Timeout) => observed_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("post-transition observation"),
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                panic!("reader disconnected before observation")
+            }
+        };
+        assert_eq!(observed_key.verifying_key(), &new_vk);
+        commit
+            .verify(&new_vk)
+            .expect("reader must observe the K'-signed generation");
+    }
+
+    #[test]
+    fn local_verifier_rejects_mismatched_did_key_authority() {
         let dir = tempfile::tempdir().expect("tempdir");
         let sk = SigningKey::random(&mut rand::rngs::OsRng);
-        let expected = *sk.verifying_key();
         let es256_store = test_es256_store(sk);
-        let resolver =
-            PdsRecordResolver::new(Arc::new(PdsRecordStore::open(dir.path()).expect("open rw")))
-                .with_es256_rotation(es256_store, DID.to_owned());
+        let store = Arc::new(PdsRecordStore::open(dir.path()).expect("open rw"));
+        let publisher = PdsPublisher::new(
+            Arc::clone(&store),
+            DID.to_owned(),
+            Arc::clone(&es256_store),
+        );
+        publisher.publish("repo-a", SAMPLE_OID).expect("publish");
+        let resolver = PdsRecordResolver::new(store)
+            .with_es256_rotation(es256_store, DID.to_owned());
 
-        let resolved = block_on(resolver.resolve_verifying_key(DID))
-            .expect("local DID document validates")
-            .expect("local key resolves");
-        assert_eq!(resolved, expected);
+        assert!(
+            block_on(resolver.resolve_verifying_key(DID))
+                .expect("local mismatch is handled")
+                .is_none(),
+            "the Ed25519 did:key must not authorize the unrelated local P-256 key"
+        );
         assert!(
             block_on(resolver.resolve_verifying_key("did:web:foreign.example"))
                 .expect("foreign resolution is unsupported")
                 .is_none(),
             "foreign DID resolution stays unsupported so ingest can fail closed"
+        );
+        let index = hyprstream_discovery::placement_index::PlacementIndex::new();
+        let error = block_on(index.ingest_did(&resolver, DID))
+            .expect_err("mismatched local authority must be rejected by placement ingest");
+        assert!(
+            error.to_string().contains("no #atproto verifying key"),
+            "unexpected ingest error: {error:#}"
         );
     }
 

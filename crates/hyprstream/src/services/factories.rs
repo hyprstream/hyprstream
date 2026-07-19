@@ -1884,10 +1884,10 @@ fn create_discovery_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spaw
             .with_at9p_deployment_verifier(at9p_acceptance_identity),
     );
     // #918 — wire the ES256 rotation store + node repo DID into the resolver
-    // so it can return the current `#atproto` verifying key for the local DID
-    // (the same live store the writer resolves at sign time). Uses the same
-    // global store the rotation task and the writer share, so producer and
-    // consumer are pinned to one authoritative source.
+    // so local repo reads share the same generation guard as the writer and
+    // rotation task. This does not mint verification authority: the node repo
+    // is still a did:key while the served #atproto document is did:web, so key
+    // resolution intentionally fails closed until #1124 aligns the identity.
     let secrets_dir = crate::config::HyprConfig::resolve_secrets_dir()?;
     let es256_store =
         crate::auth::key_rotation::global_es256_key_store(&secrets_dir, &config.oauth);

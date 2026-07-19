@@ -156,12 +156,10 @@ impl PlacementIndex {
     /// caller — `handle_report_node_liveness` — logs and continues; liveness is
     /// still recorded).
     ///
-    /// For the local node DID, the production resolver materializes a fresh
-    /// document from the live ES256 store with the same builder as the published
-    /// DID document, then runs the authority-hygiene parser. For foreign DIDs it
-    /// returns `None` (no DID-document fetch is wired yet); the repo is rejected
-    /// rather than silently ingested unverified. Foreign resolution (did:web
-    /// HTTPS / did:plc directory) is tracked with #1123.
+    /// The production resolver currently returns `None` for both the local
+    /// node's mismatched `did:key` authority (#1124) and foreign DIDs (no DID-
+    /// document fetch is wired yet). Those repos are rejected rather than
+    /// silently ingested unverified. Foreign resolution is tracked with #1123.
     pub async fn ingest_did(&self, resolver: &dyn RecordResolver, did: &str) -> Result<()> {
         let repo = match resolver.resolve_repo(did).await {
             Ok(repo) => repo,
@@ -186,8 +184,8 @@ impl PlacementIndex {
                 self.clear_did(did);
                 return Err(anyhow!(
                     "no #atproto verifying key resolved for {did} — refusing to ingest \
-                     unverified (fail closed). Foreign-DID resolution is not yet wired; \
-                     the local node DID resolves from the live ES256 store."
+                     unverified (fail closed). Foreign-DID resolution is not yet wired, \
+                     and the local did:key/did:web authority mismatch is tracked by #1124."
                 ));
             }
             Err(e) => {
