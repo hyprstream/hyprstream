@@ -32,9 +32,10 @@ pub mod challenge;
 pub mod cimd_cache;
 pub mod client_auth;
 pub mod device;
+pub mod device_enrollment;
 pub mod did_document;
-pub mod federation_entity;
 pub mod dpop;
+pub mod federation_entity;
 pub mod introspection;
 pub mod jwks;
 pub mod jwt_bearer;
@@ -47,6 +48,7 @@ pub mod oidc_discovery;
 pub mod par;
 pub mod registration;
 pub mod revocation;
+pub mod rpc_handler;
 pub mod scim;
 pub mod scim_types;
 pub mod session;
@@ -56,11 +58,9 @@ pub mod token;
 pub mod token_exchange;
 pub mod token_store;
 pub mod user_mapping;
-pub mod wit_bootstrap;
 pub mod user_service;
 pub mod userinfo;
-pub mod device_enrollment;
-pub mod rpc_handler;
+pub mod wit_bootstrap;
 pub mod xrpc;
 
 use std::sync::Arc;
@@ -127,8 +127,14 @@ pub fn create_app(state: Arc<OAuthState>, cors_config: &crate::config::CorsConfi
             get(device::verify_get).post(device::verify_post),
         )
         .route("/oauth/device/nonce", get(device::device_nonce))
-        .route("/api/device/challenge", post(device_enrollment::device_challenge_handler))
-        .route("/api/device/enroll", post(device_enrollment::device_enroll_handler))
+        .route(
+            "/api/device/challenge",
+            post(device_enrollment::device_challenge_handler),
+        )
+        .route(
+            "/api/device/enroll",
+            post(device_enrollment::device_enroll_handler),
+        )
         .route("/oauth/revoke", post(revocation::revoke_token))
         .route("/oauth/logout", post(handle_logout))
         .route(
@@ -209,11 +215,20 @@ pub fn create_app(state: Arc<OAuthState>, cors_config: &crate::config::CorsConfi
     // endpoints like /oauth/token (closes #472).
     let mut did_router = Router::new()
         // Phase 0c — did:web document endpoints
-        .route("/.well-known/did.json", get(did_document::root_did_document))
+        .route(
+            "/.well-known/did.json",
+            get(did_document::root_did_document),
+        )
         // atproto handle→DID HTTP resolution (#500) — plaintext bare DID
         .route("/.well-known/atproto-did", get(did_document::atproto_did))
-        .route("/users/:username/did.json", get(did_document::user_did_document))
-        .route("/clients/:client_id/did.json", get(did_document::client_did_document));
+        .route(
+            "/users/:username/did.json",
+            get(did_document::user_did_document),
+        )
+        .route(
+            "/clients/:client_id/did.json",
+            get(did_document::client_did_document),
+        );
 
     let mut api_router = public_router.merge(protected_router);
 
@@ -227,14 +242,16 @@ pub fn create_app(state: Arc<OAuthState>, cors_config: &crate::config::CorsConfi
         ));
     }
 
-    let router = api_router.merge(did_router).layer(axum::middleware::from_fn(
-        |req: axum::extract::Request, next: axum::middleware::Next| async move {
-            let method = req.method().clone();
-            let uri = req.uri().clone();
-            tracing::info!(%method, %uri, "OAuth request");
-            next.run(req).await
-        },
-    ));
+    let router = api_router
+        .merge(did_router)
+        .layer(axum::middleware::from_fn(
+            |req: axum::extract::Request, next: axum::middleware::Next| async move {
+                let method = req.method().clone();
+                let uri = req.uri().clone();
+                tracing::info!(%method, %uri, "OAuth request");
+                next.run(req).await
+            },
+        ));
 
     router.with_state(state)
 }
@@ -382,7 +399,10 @@ impl OAuthService {
     }
 
     /// Attach the shared JTI blocklist (same Arc as PolicyService).
-    pub fn with_jti_blocklist(mut self, bl: Arc<hyprstream_rpc::auth::InMemoryJtiBlocklist>) -> Self {
+    pub fn with_jti_blocklist(
+        mut self,
+        bl: Arc<hyprstream_rpc::auth::InMemoryJtiBlocklist>,
+    ) -> Self {
         self.jti_blocklist = Some(bl);
         self
     }
@@ -964,17 +984,617 @@ pub fn protected_resource_metadata(
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::get_unwrap)]
 mod tests {
     use super::registration::validate_redirect_uri;
     use super::*;
 
+    fn encode_form(fields: &[(&str, &str)]) -> String {
+        let mut serializer = url::form_urlencoded::Serializer::new(String::new());
+        serializer.extend_pairs(fields.iter().copied());
+        serializer.finish()
+    }
+
+    async fn post_form(
+        app: &Router,
+        uri: &str,
+        fields: &[(&str, &str)],
+        dpop: Option<&str>,
+        accept_json: bool,
+    ) -> axum::response::Response {
+        use tower::ServiceExt as _;
+
+        let mut builder = axum::http::Request::post(uri).header(
+            axum::http::header::CONTENT_TYPE,
+            "application/x-www-form-urlencoded",
+        );
+        if let Some(proof) = dpop {
+            builder = builder.header("DPoP", proof);
+        }
+        if accept_json {
+            builder = builder.header(axum::http::header::ACCEPT, "application/json");
+        }
+        app.clone()
+            .oneshot(
+                builder
+                    .body(axum::body::Body::from(encode_form(fields)))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    async fn get(app: &Router, uri: &str) -> axum::response::Response {
+        use tower::ServiceExt as _;
+
+        app.clone()
+            .oneshot(
+                axum::http::Request::get(uri)
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    async fn response_json(response: axum::response::Response) -> serde_json::Value {
+        let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    async fn response_text(response: axum::response::Response) -> String {
+        let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        String::from_utf8(bytes.to_vec()).unwrap()
+    }
+
+    fn html_hidden_value<'a>(html: &'a str, name: &str) -> &'a str {
+        let prefix = format!(r#"name="{name}" value=""#);
+        let rest = html.split_once(&prefix).unwrap().1;
+        rest.split_once('"').unwrap().0
+    }
+
+    fn dpop_proof(
+        signing_key: &p256::ecdsa::SigningKey,
+        htu: &str,
+        jti: &str,
+        nonce: Option<&str>,
+    ) -> String {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+        use p256::ecdsa::signature::Signer as _;
+
+        let point = signing_key.verifying_key().to_encoded_point(false);
+        let header = serde_json::json!({
+            "typ": "dpop+jwt",
+            "alg": "ES256",
+            "jwk": {
+                "kty": "EC",
+                "crv": "P-256",
+                "x": URL_SAFE_NO_PAD.encode(point.x().unwrap()),
+                "y": URL_SAFE_NO_PAD.encode(point.y().unwrap()),
+            }
+        });
+        let mut payload = serde_json::json!({
+            "jti": jti,
+            "htm": "POST",
+            "htu": htu,
+            "iat": chrono::Utc::now().timestamp(),
+        });
+        if let Some(value) = nonce {
+            payload["nonce"] = serde_json::Value::String(value.to_owned());
+        }
+        let header = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&header).unwrap());
+        let payload = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&payload).unwrap());
+        let signing_input = format!("{header}.{payload}");
+        let signature: p256::ecdsa::Signature = signing_key.sign(signing_input.as_bytes());
+        format!(
+            "{signing_input}.{}",
+            URL_SAFE_NO_PAD.encode(signature.to_bytes())
+        )
+    }
+
+    fn jwt_claims(token: &str) -> serde_json::Value {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+
+        let payload = token.split('.').nth(1).expect("JWT payload");
+        serde_json::from_slice(&URL_SAFE_NO_PAD.decode(payload).expect("JWT payload base64"))
+            .expect("JWT payload JSON")
+    }
+
+    // Rust mirror of @atproto/oauth-types 0.7.5
+    // atprotoOAuthTokenResponseSchema. The upstream schema extends the base
+    // OAuth response with literal DPoP, required atproto DID sub, required
+    // atproto-containing scope, and an absent id_token.
+    #[derive(serde::Deserialize)]
+    struct AtprotoOAuthTokenResponse075 {
+        access_token: String,
+        token_type: String,
+        scope: String,
+        refresh_token: Option<String>,
+        expires_in: Option<f64>,
+        sub: String,
+    }
+
+    fn parse_atproto_token_response_075(
+        value: serde_json::Value,
+    ) -> anyhow::Result<AtprotoOAuthTokenResponse075> {
+        anyhow::ensure!(
+            value.get("id_token").is_none(),
+            "atproto OAuth token response must not contain id_token"
+        );
+        let parsed: AtprotoOAuthTokenResponse075 = serde_json::from_value(value)?;
+        anyhow::ensure!(parsed.token_type == "DPoP", "token_type must be DPoP");
+        anyhow::ensure!(
+            parsed.scope.bytes().all(|byte| {
+                byte == b' '
+                    || byte == b'!'
+                    || (b'#'..=b'[').contains(&byte)
+                    || (b']'..=b'~').contains(&byte)
+            }),
+            "scope is not an OAuth scope value"
+        );
+        anyhow::ensure!(
+            parsed.scope.split(' ').any(|scope| scope == "atproto"),
+            "scope must contain atproto"
+        );
+        super::state::subject_did_for("https://schema.invalid", &parsed.sub)?;
+        Ok(parsed)
+    }
+
+    // Publish a disk-backed composite Policy signing pair so this test uses
+    // the real PolicyService JWT issuance path. The tiny authority directory
+    // remains because the process-global mint barrier checks disk each time.
+    fn configure_test_policy_signing_authority() -> anyhow::Result<()> {
+        use hyprstream_rpc::auth::{CompositeKeyPair, CompositePairRole, CompositePairState};
+
+        let authority_dir = tempfile::TempDir::new()?.keep();
+        let ledger = authority_dir.join("ledger.json");
+        let committed = authority_dir.join("committed");
+        let prefix = authority_dir.join("committed-ledger");
+        let lock = authority_dir.join("ledger.lock");
+        let key_set = hyprstream_rpc::auth::global_composite_key_set();
+        let version = key_set.snapshot().version() + 1;
+        let digest = format!("oauth-handler-r5-{version}");
+        let generation = serde_json::to_vec(&serde_json::json!({
+            "version": version,
+            "component_digest": digest,
+        }))?;
+        std::fs::write(&ledger, &generation)?;
+        std::fs::write(&committed, &generation)?;
+        std::fs::write(
+            authority_dir.join(format!("committed-ledger-{version}-{digest}.json")),
+            &generation,
+        )?;
+
+        let (ml_signing, ml_verifying) = hyprstream_rpc::crypto::pq::ml_dsa_generate_keypair();
+        let ed_signing = Arc::new(ed25519_dalek::SigningKey::from_bytes(&[0x61; 32]));
+        let kid = hyprstream_rpc::auth::composite_kid(&ml_verifying, &ed_signing.verifying_key());
+        let now = chrono::Utc::now().timestamp();
+        let pair = CompositeKeyPair::signing(
+            kid,
+            Arc::new(ml_signing),
+            ed_signing,
+            CompositePairRole::Policy,
+            CompositePairState::Active,
+            now - 60,
+            now + 86_400,
+        );
+        key_set.configure_authority(ledger, committed, prefix, lock);
+        key_set.publish(version, digest, vec![pair])?;
+        Ok(())
+    }
+
+    /// #1113 r5 handler-level conformance suite. Every HTTP exchange goes
+    /// through the production create_app router and token issuance traverses
+    /// a real in-process PolicyService.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn oauth_handler_atproto_and_legacy_conformance() -> anyhow::Result<()> {
+        use base64::{
+            engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
+            Engine as _,
+        };
+        use ed25519_dalek::Signer as _;
+        use hyprstream_rpc::crypto::CryptoPolicy;
+        use hyprstream_rpc::rpc_client::RpcClientImpl;
+        use hyprstream_rpc::signer::LocalSigner;
+        use hyprstream_rpc::transport::lazy_uds::LazyUdsTransport;
+        use hyprstream_rpc::transport::TransportConfig;
+        use hyprstream_service::{InprocManager, ServiceManager as _};
+        use sha2::{Digest as _, Sha256};
+
+        use super::state::RegisteredClient;
+        use super::token_store::RocksDbTokenStore;
+        use crate::auth::rocksdb_store::RocksDbUserStore;
+        use crate::auth::{PolicyManager, UserProfile, UserStore};
+        use crate::services::{DiscoveryClient, PolicyClient, PolicyService};
+
+        const ISSUER: &str = "https://pds.example.test";
+        const CLIENT_ID: &str = "handler-client";
+        const REDIRECT_URI: &str = "https://client.example.test/callback";
+        const MAPPED_DID: &str = "did:plc:abcdefghijklmnqrstuvwx2p";
+        const PKCE_VERIFIER: &str = "r5-handler-pkce-verifier-abcdefghijklmnopqrstuvwxyz012345";
+
+        let _ = hyprstream_rpc::envelope::install_verify_config(
+            hyprstream_rpc::envelope::EnvelopeVerifyConfig {
+                policy: CryptoPolicy::Classical,
+                pq_store: None,
+            },
+        );
+        let _ = hyprstream_rpc::envelope::install_response_verify_config(
+            hyprstream_rpc::envelope::ResponseVerifyConfig {
+                policy: CryptoPolicy::Classical,
+                pq_store: None,
+            },
+        );
+        configure_test_policy_signing_authority()?;
+
+        let service_key = ed25519_dalek::SigningKey::from_bytes(&[0x62; 32]);
+        let policy_tag = format!("oauth-handler-r5-{}", uuid::Uuid::new_v4());
+        let git_dir = tempfile::TempDir::new()?;
+        let git2db = Arc::new(tokio::sync::RwLock::new(
+            git2db::Git2DB::open(git_dir.path()).await?,
+        ));
+        let policy_service = PolicyService::new(
+            Arc::new(PolicyManager::permissive().await?),
+            Arc::new(service_key.clone()),
+            crate::config::TokenConfig::default(),
+            git2db,
+            TransportConfig::inproc(&policy_tag),
+        )
+        .with_default_audience(ISSUER.to_owned());
+        let manager = InprocManager::new();
+        let mut policy_handle = manager.spawn(Box::new(policy_service)).await?;
+        let policy_client = PolicyClient::for_local_endpoint_bootstrap(
+            &format!("inproc://{policy_tag}"),
+            service_key.clone(),
+            service_key.verifying_key(),
+            None,
+        )?;
+
+        let user_dir = tempfile::TempDir::new()?;
+        let user_store = Arc::new(RocksDbUserStore::open(user_dir.path())?);
+        let user_key = ed25519_dalek::SigningKey::from_bytes(&[0x63; 32]);
+        user_store.register("alice").await?;
+        let fingerprint = user_store
+            .add_pubkey(
+                "alice",
+                user_key.verifying_key(),
+                Some("handler-test".to_owned()),
+            )
+            .await?;
+        user_store
+            .set_profile(
+                "alice",
+                UserProfile {
+                    atproto_did: Some(MAPPED_DID.to_owned()),
+                    ..Default::default()
+                },
+            )
+            .await?;
+        assert_eq!(
+            user_store
+                .get_profile("alice")
+                .await?
+                .and_then(|profile| profile.atproto_did),
+            Some(MAPPED_DID.to_owned())
+        );
+
+        let dummy_key = ed25519_dalek::SigningKey::from_bytes(&[0x64; 32]);
+        let dummy_remote = ed25519_dalek::SigningKey::from_bytes(&[0x65; 32]).verifying_key();
+        let dummy_rpc = Arc::new(
+            RpcClientImpl::new(
+                LocalSigner::new(dummy_key),
+                LazyUdsTransport::new("/dev/null/oauth-handler-discovery.sock".into()),
+                Some(dummy_remote),
+            )
+            .with_response_verify_policy(CryptoPolicy::Classical),
+        );
+        let mut config = crate::config::OAuthConfig::default();
+        // A configured path and trailing slash must normalize everywhere.
+        config.external_url = Some(format!("{ISSUER}/configured/path/"));
+        let mut oauth_state = OAuthState::new(
+            &config,
+            policy_client,
+            DiscoveryClient::new(dummy_rpc),
+            service_key.verifying_key().to_bytes(),
+        )
+        .with_user_store(user_store);
+        let token_dir = tempfile::TempDir::new()?;
+        oauth_state.with_token_store_impl(Arc::new(RocksDbTokenStore::open(
+            token_dir.path().join("refresh.db"),
+        )?));
+        let state = Arc::new(oauth_state);
+        state.clients.write().await.insert(
+            CLIENT_ID.to_owned(),
+            RegisteredClient {
+                client_id: CLIENT_ID.to_owned(),
+                redirect_uris: vec![REDIRECT_URI.to_owned()],
+                client_name: Some("Handler Conformance Client".to_owned()),
+                client_uri: None,
+                logo_uri: None,
+                grant_types: vec![
+                    "authorization_code".to_owned(),
+                    "refresh_token".to_owned(),
+                    "urn:ietf:params:oauth:grant-type:device_code".to_owned(),
+                ],
+                response_types: vec!["code".to_owned()],
+                token_endpoint_auth_method: Some("none".to_owned()),
+                jwks: None,
+                jwks_uri: None,
+                hyprstream_node_did: None,
+                scope: Some("atproto read:*:*".to_owned()),
+                is_cimd: false,
+                registered_at: std::time::Instant::now(),
+            },
+        );
+        let cors = crate::config::server::CorsConfig {
+            enabled: false,
+            ..Default::default()
+        };
+        let app = create_app(Arc::clone(&state), &cors);
+
+        // Device authorization rejects unknown clients at the real endpoint.
+        let unknown_device = post_form(
+            &app,
+            "/oauth/device",
+            &[("client_id", "unknown-client"), ("scope", "read:*:*")],
+            None,
+            false,
+        )
+        .await;
+        assert_eq!(unknown_device.status(), axum::http::StatusCode::BAD_REQUEST);
+        assert_eq!(
+            response_json(unknown_device).await["error"],
+            "invalid_client"
+        );
+
+        // PAR binds the atproto request to a real ES256 DPoP key.
+        let dpop_key = p256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
+        let code_challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(PKCE_VERIFIER.as_bytes()));
+        let par_proof = dpop_proof(
+            &dpop_key,
+            &format!("{ISSUER}/oauth/par"),
+            "handler-par-jti",
+            None,
+        );
+        let par = post_form(
+            &app,
+            "/oauth/par",
+            &[
+                ("client_id", CLIENT_ID),
+                ("redirect_uri", REDIRECT_URI),
+                ("code_challenge", &code_challenge),
+                ("code_challenge_method", "S256"),
+                ("response_type", "code"),
+                ("state", "client-state"),
+                ("scope", "atproto"),
+                ("resource", ISSUER),
+            ],
+            Some(&par_proof),
+            false,
+        )
+        .await;
+        assert_eq!(par.status(), axum::http::StatusCode::CREATED);
+        let par_nonce = par
+            .headers()
+            .get("DPoP-Nonce")
+            .and_then(|value| value.to_str().ok())
+            .unwrap()
+            .to_owned();
+        let par_json = response_json(par).await;
+        let request_uri = par_json["request_uri"].as_str().unwrap();
+
+        // GET authorize consumes the PAR and renders the real consent callback.
+        let authorize_uri = format!(
+            "/oauth/authorize?{}",
+            encode_form(&[("request_uri", request_uri), ("client_id", CLIENT_ID)])
+        );
+        let authorize = get(&app, &authorize_uri).await;
+        assert_eq!(authorize.status(), axum::http::StatusCode::OK);
+        let authorize_html = response_text(authorize).await;
+        let authorize_nonce = html_hidden_value(&authorize_html, "nonce").to_owned();
+        let challenge = format!("{fingerprint}:{authorize_nonce}:{code_challenge}");
+        let signature = STANDARD.encode(user_key.sign(challenge.as_bytes()).to_bytes());
+        let callback = post_form(
+            &app,
+            "/oauth/authorize",
+            &[
+                ("client_id", CLIENT_ID),
+                ("redirect_uri", REDIRECT_URI),
+                ("code_challenge", &code_challenge),
+                ("scope", "atproto"),
+                ("state", "client-state"),
+                ("resource", ISSUER),
+                ("nonce", &authorize_nonce),
+                ("fingerprint", &fingerprint),
+                ("signature", &signature),
+            ],
+            None,
+            false,
+        )
+        .await;
+        assert_eq!(callback.status(), axum::http::StatusCode::SEE_OTHER);
+        let location = callback
+            .headers()
+            .get(axum::http::header::LOCATION)
+            .and_then(|value| value.to_str().ok())
+            .unwrap();
+        let location = url::Url::parse(location)?;
+        let callback_params: std::collections::HashMap<_, _> =
+            location.query_pairs().into_owned().collect();
+        assert_eq!(callback_params.get("iss").map(String::as_str), Some(ISSUER));
+        assert_eq!(
+            callback_params.get("state").map(String::as_str),
+            Some("client-state")
+        );
+        let code = callback_params.get("code").unwrap();
+
+        // Exchange the code and parse the emitted response against the exact
+        // @atproto/oauth-types 0.7.5 token-response constraints.
+        let token_proof = dpop_proof(
+            &dpop_key,
+            &format!("{ISSUER}/oauth/token"),
+            "handler-token-jti",
+            Some(&par_nonce),
+        );
+        let token = post_form(
+            &app,
+            "/oauth/token",
+            &[
+                ("grant_type", "authorization_code"),
+                ("client_id", CLIENT_ID),
+                ("code", code),
+                ("redirect_uri", REDIRECT_URI),
+                ("code_verifier", PKCE_VERIFIER),
+            ],
+            Some(&token_proof),
+            false,
+        )
+        .await;
+        assert_eq!(token.status(), axum::http::StatusCode::OK);
+        let token_nonce = token
+            .headers()
+            .get("DPoP-Nonce")
+            .and_then(|value| value.to_str().ok())
+            .unwrap()
+            .to_owned();
+        let token_response = parse_atproto_token_response_075(response_json(token).await)?;
+        assert_eq!(token_response.sub, MAPPED_DID);
+        assert!(token_response.expires_in.is_some());
+        let refresh_token = token_response.refresh_token.unwrap();
+        let claims = jwt_claims(&token_response.access_token);
+        assert_eq!(claims["iss"], ISSUER);
+        assert_eq!(claims["sub"], MAPPED_DID);
+        assert_eq!(claims["aud"], ISSUER);
+
+        // A missing refresh proof is rejected before consumption. Retrying
+        // the same refresh token with the bound key and nonce must succeed.
+        let stranded_attempt = post_form(
+            &app,
+            "/oauth/token",
+            &[
+                ("grant_type", "refresh_token"),
+                ("client_id", CLIENT_ID),
+                ("refresh_token", &refresh_token),
+            ],
+            None,
+            false,
+        )
+        .await;
+        assert_eq!(
+            stranded_attempt.status(),
+            axum::http::StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            response_json(stranded_attempt).await["error"],
+            "invalid_dpop_proof"
+        );
+        assert!(state.get_refresh_token(&refresh_token).await?.is_some());
+        let refresh_proof = dpop_proof(
+            &dpop_key,
+            &format!("{ISSUER}/oauth/token"),
+            "handler-refresh-jti",
+            Some(&token_nonce),
+        );
+        let refreshed = post_form(
+            &app,
+            "/oauth/token",
+            &[
+                ("grant_type", "refresh_token"),
+                ("client_id", CLIENT_ID),
+                ("refresh_token", &refresh_token),
+            ],
+            Some(&refresh_proof),
+            false,
+        )
+        .await;
+        assert_eq!(refreshed.status(), axum::http::StatusCode::OK);
+        let refreshed_json = response_json(refreshed).await;
+        assert_eq!(refreshed_json["token_type"], "DPoP");
+        assert_eq!(refreshed_json["sub"], MAPPED_DID);
+        assert_ne!(refreshed_json["refresh_token"], refresh_token);
+        assert!(state.get_refresh_token(&refresh_token).await?.is_none());
+        let refreshed_claims = jwt_claims(refreshed_json["access_token"].as_str().unwrap());
+        assert_eq!(refreshed_claims["sub"], MAPPED_DID);
+
+        // A real generic device flow retains the local username byte-for-byte
+        // and the legacy Bearer response shape.
+        let device = post_form(
+            &app,
+            "/oauth/device",
+            &[
+                ("client_id", CLIENT_ID),
+                ("scope", "read:*:*"),
+                ("resource", ISSUER),
+            ],
+            None,
+            false,
+        )
+        .await;
+        assert_eq!(device.status(), axum::http::StatusCode::OK);
+        let device_json = response_json(device).await;
+        let device_code = device_json["device_code"].as_str().unwrap();
+        let user_code = device_json["user_code"].as_str().unwrap();
+        let nonce_uri = format!(
+            "/oauth/device/nonce?{}",
+            encode_form(&[("user_code", user_code)])
+        );
+        let device_nonce = response_json(get(&app, &nonce_uri).await).await;
+        let normalized_code = user_code.replace('-', "");
+        let device_challenge = format!(
+            "alice:{normalized_code}:{}",
+            device_nonce["nonce"].as_str().unwrap()
+        );
+        let device_signature =
+            STANDARD.encode(user_key.sign(device_challenge.as_bytes()).to_bytes());
+        let approved = post_form(
+            &app,
+            "/oauth/device/verify",
+            &[
+                ("user_code", user_code),
+                ("username", "alice"),
+                ("signature", &device_signature),
+            ],
+            None,
+            true,
+        )
+        .await;
+        assert_eq!(approved.status(), axum::http::StatusCode::OK);
+        let device_token = post_form(
+            &app,
+            "/oauth/token",
+            &[
+                ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
+                ("client_id", CLIENT_ID),
+                ("device_code", device_code),
+            ],
+            None,
+            false,
+        )
+        .await;
+        assert_eq!(device_token.status(), axum::http::StatusCode::OK);
+        let device_token_json = response_json(device_token).await;
+        assert_eq!(device_token_json["token_type"], "Bearer");
+        assert!(device_token_json.get("sub").is_none());
+        let device_claims = jwt_claims(device_token_json["access_token"].as_str().unwrap());
+        assert_eq!(device_claims["sub"], "alice");
+        assert_eq!(device_claims["iss"], ISSUER);
+        assert_eq!(device_claims["aud"], ISSUER);
+
+        policy_handle.stop().await?;
+        Ok(())
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn oauth_iroh_refuses_arbitrary_rpc_and_anonymous_moq_before_dispatch(
     ) -> anyhow::Result<()> {
-        use hyprstream_rpc::transport::iroh_substrate::{
-            ALPN_HYPRSTREAM_RPC, ALPN_MOQ_LITE, IrohSubstrate, NoopHandler,
-        };
         use hyprstream_rpc::envelope::{RequestEnvelope, SignedEnvelope};
+        use hyprstream_rpc::transport::iroh_substrate::{
+            IrohSubstrate, NoopHandler, ALPN_HYPRSTREAM_RPC, ALPN_MOQ_LITE,
+        };
         use hyprstream_rpc::ToCapnp as _;
         use iroh::{EndpointAddr, TransportAddr};
         use moq_net::Client;
@@ -1023,11 +1643,9 @@ mod tests {
         if let Ok((mut send, mut recv)) = rpc.open_bi().await {
             let _ = send.write_all(&signed_crud_bytes).await;
             let _ = send.finish();
-            let response = tokio::time::timeout(
-                std::time::Duration::from_secs(2),
-                recv.read_to_end(1024),
-            )
-            .await;
+            let response =
+                tokio::time::timeout(std::time::Duration::from_secs(2), recv.read_to_end(1024))
+                    .await;
             assert!(
                 !matches!(response, Ok(Ok(ref bytes)) if !bytes.is_empty()),
                 "refused OAuth RPC ALPN must not produce a user-CRUD response"
@@ -1070,7 +1688,10 @@ mod tests {
 
         // atproto transition scopes are advertised.
         let scopes = self_resource_scopes();
-        assert!(scopes.contains(&"atproto".to_owned()), "missing atproto: {scopes:?}");
+        assert!(
+            scopes.contains(&"atproto".to_owned()),
+            "missing atproto: {scopes:?}"
+        );
         assert!(
             scopes.contains(&"transition:generic".to_owned()),
             "missing transition:generic: {scopes:?}"

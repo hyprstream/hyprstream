@@ -905,7 +905,6 @@ async fn issue_token_with_refresh(
                     verifying_key_bytes: user_verifying_key.map(|vk| *vk.as_bytes()),
                     dpop_jkt: dpop_jkt.clone(),
                     ucan_grant: None, // generic OAuth refresh; not a UCAN grant (MAC #547 B1)
-                    dpop_jkt: dpop_jkt.clone(), // #1113 rev2 F3: sender-bind the refresh token
                 };
                 if let Err(e) = state.put_refresh_token(&refresh_token, &entry, state.refresh_token_ttl as u64).await {
                     tracing::error!(error = %e, "Failed to persist refresh token");

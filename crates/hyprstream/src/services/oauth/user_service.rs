@@ -21,6 +21,7 @@ pub struct UserInfo {
     pub email_verified: bool,
     pub active: bool,
     pub external_id: Option<String>,
+    pub atproto_did: Option<String>,
     pub pubkeys: Vec<PubkeyInfo>,
 }
 
@@ -115,6 +116,7 @@ impl UserService {
                     email_verified: profile.email_verified.unwrap_or(false),
                     active: profile.active.unwrap_or(true),
                     external_id: profile.external_id,
+                    atproto_did: profile.atproto_did,
                     pubkeys: pubkeys.iter().map(PubkeyInfo::from).collect(),
                 }))
             }
@@ -148,6 +150,7 @@ impl UserService {
                     email_verified: profile.email_verified.unwrap_or(false),
                     active: profile.active.unwrap_or(true),
                     external_id: profile.external_id,
+                    atproto_did: profile.atproto_did,
                     pubkeys: vec![], // Omitted in list
                 }
             })

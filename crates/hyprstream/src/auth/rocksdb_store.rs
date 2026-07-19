@@ -130,6 +130,9 @@ impl RocksDbUserStore {
             if let Some(ref eid) = profile.external_id {
                 ui.set_external_id(eid);
             }
+            if let Some(ref did) = profile.atproto_did {
+                ui.set_atproto_did(did);
+            }
 
             // Serialize pubkeys list
             let mut pk_list = ui.init_pubkeys(pubkeys.len() as u32);
@@ -190,7 +193,7 @@ impl RocksDbUserStore {
                 None
             },
             external_id: text_or_none(ui.get_external_id()),
-            atproto_did: None,
+            atproto_did: text_or_none(ui.get_atproto_did()),
         };
 
         // Deserialize pubkeys list
@@ -334,6 +337,9 @@ impl UserStore for RocksDbUserStore {
         }
         if update.external_id.is_some() {
             profile.external_id = update.external_id;
+        }
+        if update.atproto_did.is_some() {
+            profile.atproto_did = update.atproto_did;
         }
 
         self.put_user(username, &sub, &profile, &pubkeys)?;
@@ -877,7 +883,7 @@ mod tests {
                 email_verified: Some(true),
                 active: Some(true),
                 external_id: Some("ext-123".to_owned()),
-                atproto_did: None,
+                atproto_did: Some("did:plc:abcdefghijklmnqrstuvwx2p".to_owned()),
             }).await?;
         }
         // Open a fresh store instance to verify persistence
@@ -887,6 +893,10 @@ mod tests {
         assert_eq!(profile.external_id.as_deref(), Some("ext-123"));
         assert_eq!(profile.active, Some(true));
         assert_eq!(profile.email_verified, Some(true));
+        assert_eq!(
+            profile.atproto_did.as_deref(),
+            Some("did:plc:abcdefghijklmnqrstuvwx2p")
+        );
         Ok(())
     }
 

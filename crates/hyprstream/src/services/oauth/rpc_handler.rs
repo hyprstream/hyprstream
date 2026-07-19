@@ -63,6 +63,7 @@ impl OAuthRpcHandler {
             email_verified: info.email_verified,
             active: info.active,
             external_id: info.external_id.clone().unwrap_or_default(),
+            atproto_did: info.atproto_did.clone(),
             pubkeys: info.pubkeys.iter().map(|pk| crate::services::generated::oauth_client::PubkeyEntry {
                 fingerprint: pk.fingerprint.clone(),
                 pubkey_base64: pk.pubkey_base64.clone(),

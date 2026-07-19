@@ -24,7 +24,7 @@ fn advertised_scopes(default_scopes: &[String]) -> Vec<String> {
 
 /// Base metadata fields shared between RFC 8414 and OIDC discovery.
 fn base_metadata(issuer: &str, scopes: &[String], require_par: bool) -> serde_json::Value {
-    let mut scopes_supported = scopes.to_vec();
+    let mut scopes_supported = advertised_scopes(scopes);
     if !scopes_supported.iter().any(|scope| scope == "pds:attach") {
         scopes_supported.push("pds:attach".to_owned());
     }
@@ -33,7 +33,6 @@ fn base_metadata(issuer: &str, scopes: &[String], require_par: bool) -> serde_js
     // produce double-slash endpoint URLs and a non-origin issuer the stock
     // resolver rejects against the discovery origin.
     let issuer = super::state::canonical_issuer_origin(issuer).unwrap_or_else(|| issuer.to_owned());
-    let scopes = advertised_scopes(scopes);
     serde_json::json!({
         "issuer": issuer,
         "authorization_endpoint": format!("{}/oauth/authorize", issuer),

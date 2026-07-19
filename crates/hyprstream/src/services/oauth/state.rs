@@ -3,20 +3,20 @@
 //! Manages registered clients, pending authorization codes, refresh tokens,
 //! and delegates token issuance to PolicyService via ZMQ.
 
+use anyhow::Context as _;
+use base64::Engine as _;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use anyhow::Context as _;
-use base64::Engine as _;
 use tokio::sync::RwLock;
-use serde::{Deserialize, Serialize};
 
+use super::token_store::TokenStore;
+use super::user_service::UserService;
 use crate::auth::user_store::UserStore;
 use crate::config::OAuthConfig;
 use crate::services::{DiscoveryClient, PolicyClient};
 use hyprstream_util::TtlCache;
-use super::token_store::TokenStore;
-use super::user_service::UserService;
 
 /// Extract RSA public key components (n, e) from PKCS#8 DER and build a JWK.
 ///
@@ -34,9 +34,13 @@ fn extract_rsa_jwk_from_der(pkcs8_der: &[u8], kid: &str) -> Option<serde_json::V
 
     let output = std::process::Command::new("openssl")
         .args([
-            "pkey", "-inform", "DER", "-in",
+            "pkey",
+            "-inform",
+            "DER",
+            "-in",
             temp.path().to_str()?,
-            "-noout", "-text",
+            "-noout",
+            "-text",
         ])
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
@@ -63,9 +67,7 @@ fn extract_rsa_jwk_from_der(pkcs8_der: &[u8], kid: &str) -> Option<serde_json::V
         }
         if in_modulus {
             // Lines like "    00:ab:cd:..."
-            let hex_part: String = trimmed.chars()
-                .filter(char::is_ascii_hexdigit)
-                .collect();
+            let hex_part: String = trimmed.chars().filter(char::is_ascii_hexdigit).collect();
             n_hex.push_str(&hex_part);
         }
     }
@@ -179,8 +181,114 @@ pub struct AuthorizeBinding {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use crate::auth::user_store::UserProfile;
+    use async_trait::async_trait;
     use hyprstream_rpc::crypto::CryptoPolicy;
     use rand::rngs::OsRng;
+
+    fn state_with_user_store(store: Arc<dyn UserStore>) -> OAuthState {
+        use hyprstream_rpc::rpc_client::RpcClientImpl;
+        use hyprstream_rpc::signer::LocalSigner;
+        use hyprstream_rpc::transport::lazy_uds::LazyUdsTransport;
+
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[0x41; 32]);
+        let remote_key = ed25519_dalek::SigningKey::from_bytes(&[0x42; 32]).verifying_key();
+        let make_client = || {
+            Arc::new(
+                RpcClientImpl::new(
+                    LocalSigner::new(signing_key.clone()),
+                    LazyUdsTransport::new("/dev/null/oauth-eligibility-test.sock".into()),
+                    Some(remote_key),
+                )
+                .with_response_verify_policy(CryptoPolicy::Classical),
+            )
+        };
+        let mut config = OAuthConfig::default();
+        config.external_url = Some("https://pds.example.test".to_owned());
+        OAuthState::new(
+            &config,
+            PolicyClient::new(make_client()),
+            DiscoveryClient::new(make_client()),
+            signing_key.verifying_key().to_bytes(),
+        )
+        .with_user_store(store)
+    }
+
+    struct KeyReadErrorStore {
+        profile: UserProfile,
+    }
+
+    #[async_trait]
+    impl UserStore for KeyReadErrorStore {
+        async fn get_profile(&self, _username: &str) -> anyhow::Result<Option<UserProfile>> {
+            Ok(Some(self.profile.clone()))
+        }
+
+        async fn register(&self, _username: &str) -> anyhow::Result<String> {
+            anyhow::bail!("not used")
+        }
+
+        async fn set_profile(&self, _username: &str, _profile: UserProfile) -> anyhow::Result<()> {
+            anyhow::bail!("not used")
+        }
+
+        async fn remove(&self, _username: &str) -> anyhow::Result<bool> {
+            anyhow::bail!("not used")
+        }
+
+        async fn list_users(&self) -> Vec<String> {
+            Vec::new()
+        }
+
+        async fn search(
+            &self,
+            _filter: &crate::auth::user_store::UserFilter,
+        ) -> anyhow::Result<Vec<(String, UserProfile)>> {
+            anyhow::bail!("not used")
+        }
+
+        async fn set_active(&self, _username: &str, _active: bool) -> anyhow::Result<()> {
+            anyhow::bail!("not used")
+        }
+
+        async fn list_pubkeys(
+            &self,
+            _username: &str,
+        ) -> anyhow::Result<Vec<crate::auth::user_store::PubkeyEntry>> {
+            anyhow::bail!("synthetic key read failure")
+        }
+
+        async fn add_pubkey(
+            &self,
+            _username: &str,
+            _pubkey: ed25519_dalek::VerifyingKey,
+            _label: Option<String>,
+        ) -> anyhow::Result<String> {
+            anyhow::bail!("not used")
+        }
+
+        async fn add_pubkey_hybrid(
+            &self,
+            _username: &str,
+            _pubkey: ed25519_dalek::VerifyingKey,
+            _ml_dsa_vk: Vec<u8>,
+            _label: Option<String>,
+        ) -> anyhow::Result<String> {
+            anyhow::bail!("not used")
+        }
+
+        async fn remove_pubkey(&self, _username: &str, _fingerprint: &str) -> anyhow::Result<bool> {
+            anyhow::bail!("not used")
+        }
+
+        async fn get_pubkey_user(&self, _fingerprint: &str) -> anyhow::Result<Option<String>> {
+            anyhow::bail!("not used")
+        }
+
+        async fn touch_pubkey(&self, _username: &str, _fingerprint: &str) -> anyhow::Result<()> {
+            anyhow::bail!("not used")
+        }
+    }
 
     #[test]
     fn mesh_kem_derivation_failure_fails_closed_under_hybrid() {
@@ -329,12 +437,91 @@ mod tests {
         assert_eq!(err, SubjectDidError::At9pBackedAccount);
     }
 
+    /// #1113 r5: the default production backend must retain the mapped DID,
+    /// and the real account lookup (keys + profile) must reach the success
+    /// path after closing and reopening RocksDB.
+    #[tokio::test]
+    async fn atproto_eligibility_succeeds_after_rocksdb_roundtrip() {
+        use crate::auth::rocksdb_store::RocksDbUserStore;
+        use crate::auth::user_store::UserProfile;
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[0x33; 32]);
+        {
+            let store = RocksDbUserStore::open(dir.path()).unwrap();
+            store.register("alice").await.unwrap();
+            store
+                .add_pubkey(
+                    "alice",
+                    signing_key.verifying_key(),
+                    Some("login".to_owned()),
+                )
+                .await
+                .unwrap();
+            store
+                .set_profile(
+                    "alice",
+                    UserProfile {
+                        atproto_did: Some("did:plc:abcdefghijklmnqrstuvwx2p".to_owned()),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+        }
+
+        let reopened: Arc<dyn UserStore> = Arc::new(RocksDbUserStore::open(dir.path()).unwrap());
+        assert_eq!(
+            reopened
+                .get_profile("alice")
+                .await
+                .unwrap()
+                .unwrap()
+                .atproto_did
+                .as_deref(),
+            Some("did:plc:abcdefghijklmnqrstuvwx2p")
+        );
+        let state = state_with_user_store(reopened);
+        assert_eq!(
+            state
+                .check_atproto_account_eligibility("alice")
+                .await
+                .unwrap(),
+            "did:plc:abcdefghijklmnqrstuvwx2p"
+        );
+    }
+
+    /// #1113 r5: a profile read that would otherwise succeed cannot mask a
+    /// key-store failure. The account is rejected rather than downgraded to
+    /// an apparently keyless identity.
+    #[tokio::test]
+    async fn atproto_eligibility_key_read_error_fails_closed() {
+        let store = Arc::new(KeyReadErrorStore {
+            profile: UserProfile {
+                atproto_did: Some("did:plc:abcdefghijklmnqrstuvwx2p".to_owned()),
+                ..Default::default()
+            },
+        });
+        let state = state_with_user_store(store);
+        assert_eq!(
+            state
+                .check_atproto_account_eligibility("alice")
+                .await
+                .unwrap_err(),
+            SubjectDidError::NoAtprotoIdentity
+        );
+    }
+
     /// #1113 rev2 finding 7: atproto profile activates only when `atproto` is
     /// in the granted set — device/generic flows without it stay non-atproto.
     #[test]
     fn atproto_profile_detection() {
         assert!(atproto_profile_active(&["atproto".to_owned()]));
-        assert!(atproto_profile_active(&["atproto".to_owned(), "read:*:*".to_owned()]));
+        assert!(atproto_profile_active(&[
+            "atproto".to_owned(),
+            "read:*:*".to_owned()
+        ]));
         assert!(!atproto_profile_active(&["read:*:*".to_owned()]));
         assert!(!atproto_profile_active(&[]));
     }
@@ -344,7 +531,11 @@ mod tests {
     /// yield invalid_scope and the actual granted set is returned.
     #[test]
     fn validate_requested_scopes_rejects_garbage() {
-        let server = ["atproto".to_owned(), "transition:generic".to_owned(), "read:*:*".to_owned()];
+        let server = [
+            "atproto".to_owned(),
+            "transition:generic".to_owned(),
+            "read:*:*".to_owned(),
+        ];
         let res = validate_requested_scopes(
             &["atproto".to_owned(), "bogus".to_owned()],
             &server,
@@ -358,7 +549,11 @@ mod tests {
     /// with server-supported, intersected with the client's declared scopes.
     #[test]
     fn validate_requested_scopes_intersects_client_declared() {
-        let server = ["atproto".to_owned(), "transition:generic".to_owned(), "read:*:*".to_owned()];
+        let server = [
+            "atproto".to_owned(),
+            "transition:generic".to_owned(),
+            "read:*:*".to_owned(),
+        ];
         let declared = ["atproto".to_owned(), "read:*:*".to_owned()];
         let granted = validate_requested_scopes(
             &["atproto".to_owned(), "read:*:*".to_owned()],
@@ -569,10 +764,6 @@ pub struct RefreshTokenEntry {
     /// keeps the generic OAuth 2.1 rotation path unchanged.
     #[serde(default)]
     pub ucan_grant: Option<UcanGrantRefresh>,
-    /// DPoP key thumbprint bound at issuance (#1113 rev2 F3). The refresh
-    /// path requires a proof from the SAME key for atproto-scoped tokens.
-    #[serde(default)]
-    pub dpop_jkt: Option<String>,
 }
 
 /// Re-evaluation context persisted alongside a UCAN-grant refresh token so the
@@ -776,9 +967,8 @@ fn mesh_kem_public_for_policy(
 ) -> anyhow::Result<Option<hyprstream_rpc::crypto::hybrid_kem::RecipientPublic>> {
     match derive(key) {
         Ok(kem_kp) => Ok(Some(kem_kp.public())),
-        Err(e) if policy.uses_pq() => Err(e).context(
-            "failed to derive #mesh-kem hybrid keyAgreement identity under Hybrid policy",
-        ),
+        Err(e) if policy.uses_pq() => Err(e)
+            .context("failed to derive #mesh-kem hybrid keyAgreement identity under Hybrid policy"),
         Err(e) => {
             tracing::warn!(
                 error = %e,
@@ -797,7 +987,12 @@ impl OAuthState {
     /// Inline reap budget per access (heap pops). Bounds tail latency.
     const DPOP_JTI_REAP_BUDGET: usize = 64;
 
-    pub fn new(config: &OAuthConfig, policy_client: PolicyClient, discovery_client: DiscoveryClient, verifying_key_bytes: [u8; 32]) -> Self {
+    pub fn new(
+        config: &OAuthConfig,
+        policy_client: PolicyClient,
+        discovery_client: DiscoveryClient,
+        verifying_key_bytes: [u8; 32],
+    ) -> Self {
         Self {
             clients: RwLock::new(HashMap::new()),
             pending_authorize_bindings: RwLock::new(HashMap::new()),
@@ -833,7 +1028,9 @@ impl OAuthState {
             signing_key: None,
             authority_hints: config.authority_hints.clone(),
             pending_external_auths: RwLock::new(HashMap::new()),
-            oidc_discovery: std::sync::Arc::new(super::oidc_discovery::OidcDiscoveryCache::default()),
+            oidc_discovery: std::sync::Arc::new(
+                super::oidc_discovery::OidcDiscoveryCache::default(),
+            ),
             sessions: super::session::SessionStore::default(),
             xrpc_repos: Arc::new(super::xrpc::XrpcRepoStore::new()),
             xrpc_read_slice: config.xrpc_read_slice,
@@ -938,7 +1135,10 @@ impl OAuthState {
     /// When set, `POST /oauth/revoke` on access tokens writes the JTI into
     /// this blocklist so the PolicyService RPC enforcement path also rejects
     /// revoked tokens — closing the gap between HTTP revocation and RPC auth.
-    pub fn with_jti_blocklist(mut self, bl: Arc<hyprstream_rpc::auth::InMemoryJtiBlocklist>) -> Self {
+    pub fn with_jti_blocklist(
+        mut self,
+        bl: Arc<hyprstream_rpc::auth::InMemoryJtiBlocklist>,
+    ) -> Self {
         self.jti_blocklist = Some(bl);
         self
     }
@@ -1011,7 +1211,8 @@ impl OAuthState {
         policy: hyprstream_rpc::crypto::CryptoPolicy,
     ) -> anyhow::Result<Self> {
         let pq_sk = hyprstream_rpc::node_identity::derive_mesh_mldsa_key(&key);
-        self.mesh_pq_verifying_key = Some(hyprstream_rpc::crypto::pq::ml_dsa_sk_to_vk_bytes(&pq_sk));
+        self.mesh_pq_verifying_key =
+            Some(hyprstream_rpc::crypto::pq::ml_dsa_sk_to_vk_bytes(&pq_sk));
         self.mesh_kem_public = mesh_kem_public_for_policy(&key, policy, |key| {
             hyprstream_rpc::node_identity::derive_mesh_kem_recipient(key)
         })?;
@@ -1025,7 +1226,12 @@ impl OAuthState {
     }
 
     /// Persist a refresh token entry to the store.
-    pub async fn put_refresh_token(&self, token: &str, entry: &RefreshTokenEntry, ttl_secs: u64) -> anyhow::Result<()> {
+    pub async fn put_refresh_token(
+        &self,
+        token: &str,
+        entry: &RefreshTokenEntry,
+        ttl_secs: u64,
+    ) -> anyhow::Result<()> {
         let Some(ref store) = self.token_db else {
             tracing::warn!("Refresh token store not configured — token will not survive restart");
             return Ok(());
@@ -1034,7 +1240,10 @@ impl OAuthState {
     }
 
     /// Look up a refresh token. Returns `None` if not found or expired (lazy expiry).
-    pub async fn get_refresh_token(&self, token: &str) -> anyhow::Result<Option<RefreshTokenEntry>> {
+    pub async fn get_refresh_token(
+        &self,
+        token: &str,
+    ) -> anyhow::Result<Option<RefreshTokenEntry>> {
         let Some(ref store) = self.token_db else {
             return Ok(None);
         };
@@ -1107,7 +1316,10 @@ impl OAuthState {
     /// window per nonce TTL).
     pub async fn mark_dpop_client_nonced(&self, jkt: &str) {
         let expiry = chrono::Utc::now().timestamp() + 300;
-        self.dpop_clients_seen.write().await.insert(jkt.to_owned(), expiry);
+        self.dpop_clients_seen
+            .write()
+            .await
+            .insert(jkt.to_owned(), expiry);
     }
 
     /// Validate the JWT `sub` claim for an atproto-conformant access token
@@ -1142,17 +1354,19 @@ impl OAuthState {
         &self,
         username: &str,
     ) -> Result<String, SubjectDidError> {
-        let user_store = self.user_store_reader().ok_or(SubjectDidError::NoAtprotoIdentity)?;
+        let user_store = self
+            .user_store_reader()
+            .ok_or(SubjectDidError::NoAtprotoIdentity)?;
 
-        let pubkeys = user_store
-            .list_pubkeys(username)
-            .await
-            .unwrap_or_default();
-        let profile = user_store
-            .get_profile(username)
-            .await
-            .ok()
-            .flatten();
+        // Fail closed: a malformed/transient key-store read must never be
+        // reinterpreted as "this account has no keys". Doing so can hide a
+        // HybridEd25519MlDsa65 (at9p) binding and incorrectly admit a mapped
+        // profile to the atproto OAuth profile.
+        let pubkeys = user_store.list_pubkeys(username).await.map_err(|error| {
+            tracing::warn!(%username, %error, "atproto eligibility key lookup failed closed");
+            SubjectDidError::NoAtprotoIdentity
+        })?;
+        let profile = user_store.get_profile(username).await.ok().flatten();
 
         evaluate_atproto_eligibility(&pubkeys, profile.as_ref(), &self.issuer_url)
     }
@@ -1240,7 +1454,11 @@ impl OAuthState {
                     // dpop_jti_seen is a TtlCache (self-evicting); sweep the
                     // nonce + client-dedup maps only.
                     state.dpop_nonces.write().await.retain(|_, exp| *exp > now);
-                    state.dpop_clients_seen.write().await.retain(|_, exp| *exp > now);
+                    state
+                        .dpop_clients_seen
+                        .write()
+                        .await
+                        .retain(|_, exp| *exp > now);
                 }
 
                 // Sweep expired external auth flows
@@ -1272,7 +1490,10 @@ pub fn evaluate_atproto_eligibility(
     use crate::auth::user_store::KeyAlgorithm;
 
     // 1. Reject at9p-backed accounts by inspecting the key algorithm.
-    if pubkeys.iter().any(|pk| pk.algorithm == KeyAlgorithm::HybridEd25519MlDsa65) {
+    if pubkeys
+        .iter()
+        .any(|pk| pk.algorithm == KeyAlgorithm::HybridEd25519MlDsa65)
+    {
         return Err(SubjectDidError::At9pBackedAccount);
     }
 
@@ -1302,10 +1523,7 @@ pub fn evaluate_atproto_eligibility(
 /// validation, not a string-prefix match — an at9p-backed account whose
 /// enrolled identifier is a plain username is rejected just like any other
 /// non-DID subject.
-pub fn subject_did_for(
-    _issuer_url: &str,
-    subject: &str,
-) -> Result<String, SubjectDidError> {
+pub fn subject_did_for(_issuer_url: &str, subject: &str) -> Result<String, SubjectDidError> {
     // did:plc — the only non-`did:web` atproto method. A valid did:plc
     // identifier has exactly 24 chars of base32-lowercase (a-z, 2-7), per
     // the atproto PLC spec. The vendored @atproto/did schema rejects shorter
