@@ -323,6 +323,27 @@ COPY --from=builder /usr/lib/x86_64-linux-gnu/libcrypto.so* /usr/lib/x86_64-linu
 COPY --from=builder /opt/libtorch/lib/ /opt/libtorch/lib/
 
 #############################################
+# CPU Runtime (aarch64 / arm64)
+#############################################
+#
+# Variant of runtime-cpu for the builder-cpu-arm64 toolchain (PyTorch aarch64
+# pip wheel's libtorch). Debian multilib lives under /usr/lib/aarch64-linux-gnu
+# on arm64, so the system-library COPYs cannot share the x86_64 runtime stage.
+# Selected via `FROM runtime-${VARIANT}` when VARIANT=cpu-arm64. gcr.io/distroless
+# cc-debian12 is multi-arch, so the base resolves to its arm64 variant natively.
+
+FROM gcr.io/distroless/cc-debian12 AS runtime-cpu-arm64
+
+# Copy required system libraries (arm64 multilib path)
+COPY --from=builder /usr/lib/aarch64-linux-gnu/libgomp.so.1 /usr/lib/aarch64-linux-gnu/
+COPY --from=builder /usr/lib/aarch64-linux-gnu/libz.so.1 /usr/lib/aarch64-linux-gnu/
+COPY --from=builder /usr/lib/aarch64-linux-gnu/libssl.so* /usr/lib/aarch64-linux-gnu/
+COPY --from=builder /usr/lib/aarch64-linux-gnu/libcrypto.so* /usr/lib/aarch64-linux-gnu/
+
+# Copy entire LibTorch lib directory
+COPY --from=builder /opt/libtorch/lib/ /opt/libtorch/lib/
+
+#############################################
 # Final Runtime
 #############################################
 
