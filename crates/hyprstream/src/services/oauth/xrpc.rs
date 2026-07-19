@@ -808,4 +808,282 @@ mod tests {
         assert_eq!(q.get("repo").copied(), Some("did:web:x"));
         assert_eq!(q.get("collection").copied(), Some("ai.hyprstream.model"));
     }
+
+    // ── Router-mounted tests (findings 1 + 2) ─────────────────────────────────
+
+    use crate::config::OAuthConfig;
+    use crate::services::{DiscoveryClient, PolicyClient};
+    use axum::body::Body;
+    use axum::http::Request as HttpRequest;
+    use axum::routing::get;
+    use axum::Router;
+    use tower::ServiceExt; // oneshot
+
+    /// Build a real XRPC router backed by a real OAuthState. PolicyClient and
+    /// DiscoveryClient point at nonexistent sockets — XRPC handlers never call
+    /// them. Both a public and a private snapshot are seeded.
+    async fn build_xrpc_router() -> Router {
+        use hyprstream_rpc::rpc_client::RpcClientImpl;
+        use hyprstream_rpc::signer::LocalSigner;
+        use hyprstream_rpc::transport::lazy_uds::LazyUdsTransport;
+
+        let key = ed25519_dalek::SigningKey::from_bytes(&[0x76; 32]);
+        let vk = ed25519_dalek::SigningKey::from_bytes(&[0x73; 32]).verifying_key();
+        // Dummy socket paths — never opened (XRPC handlers never call policy/discovery).
+        let dummy = std::path::PathBuf::from("/dev/null/xrpc-test.sock");
+
+        let mk_client = || {
+            let rpc = RpcClientImpl::new(
+                LocalSigner::new(key.clone()),
+                LazyUdsTransport::new(dummy.clone()),
+                Some(vk),
+            )
+            .with_response_verify_policy(hyprstream_rpc::crypto::CryptoPolicy::Classical);
+            Arc::new(rpc)
+        };
+        let policy_client = PolicyClient::new(mk_client());
+        let discovery_client = DiscoveryClient::new(mk_client());
+
+        let mut config = OAuthConfig::default();
+        config.xrpc_read_slice = true;
+        // external_url so issuer_url() produces a usable authority.
+        config.external_url = Some("https://h.example.com".to_owned());
+
+        let state = Arc::new(OAuthState::new(
+            &config,
+            policy_client,
+            discovery_client,
+            [0x76; 32],
+        ));
+
+        // Seed snapshots.
+        state
+            .xrpc_repos
+            .put(sample_snapshot("did:web:pub.example.com", "pub.example.com", true))
+            .await;
+        state
+            .xrpc_repos
+            .put(sample_snapshot("did:web:priv.example.com", "priv.example.com", false))
+            .await;
+
+        Router::new()
+            .route(
+                "/xrpc/com.atproto.identity.resolveHandle",
+                get(resolve_handle),
+            )
+            .route("/xrpc/com.atproto.repo.describeRepo", get(describe_repo))
+            .route("/xrpc/com.atproto.repo.getRecord", get(get_record))
+            .route("/xrpc/com.atproto.sync.getRepo", get(get_repo))
+            .with_state(state)
+    }
+
+    async fn resp_json(resp: axum::response::Response) -> Value {
+        body_json(resp).await
+    }
+
+    fn req(uri: &str) -> HttpRequest<Body> {
+        HttpRequest::builder()
+            .uri(uri)
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    // ── Finding 1: real capacity test through the mounted router ──────────────
+
+    #[tokio::test]
+    async fn router_capacity_n_plus_1_blocked_until_body_dropped() {
+        let app = build_xrpc_router().await;
+        let uri = "/xrpc/com.atproto.sync.getRepo?did=did:web:pub.example.com";
+
+        // Issue N requests, RETAIN response bodies unconsumed.
+        let mut held: Vec<axum::response::Response> = Vec::new();
+        for _ in 0..GET_REPO_CONCURRENCY {
+            let resp = app.clone().oneshot(req(uri)).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            held.push(resp);
+        }
+
+        // N+1th request must NOT complete while all permits are held in bodies.
+        let n1 = app.clone().oneshot(req(uri));
+        let mut n1 = Box::pin(n1);
+        tokio::select! {
+            _ = &mut n1 => panic!("N+1th getRepo completed before capacity freed"),
+            _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {}
+        }
+
+        // Drop ONE held Response → its Body + embedded OwnedSemaphorePermit released.
+        held.pop();
+
+        // N+1th should now complete.
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            n1.as_mut(),
+        )
+        .await;
+        assert!(result.is_ok(), "N+1th getRepo did not complete after dropping a body");
+        assert_eq!(result.unwrap().unwrap().status(), StatusCode::OK);
+    }
+
+    // ── Finding 2: router-mounted endpoint tests ──────────────────────────────
+
+    #[tokio::test]
+    async fn router_private_repo_invisible_describe_repo() {
+        let app = build_xrpc_router().await;
+        let resp = app
+            .oneshot(req("/xrpc/com.atproto.repo.describeRepo?repo=did:web:priv.example.com"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = resp_json(resp).await;
+        assert_eq!(body["error"], errors::REPO_NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn router_private_repo_invisible_get_record() {
+        let app = build_xrpc_router().await;
+        let resp = app
+            .oneshot(req(
+                "/xrpc/com.atproto.repo.getRecord?repo=did:web:priv.example.com\
+                 &collection=ai.hyprstream.model&rkey=abc",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = resp_json(resp).await;
+        assert_eq!(body["error"], errors::REPO_NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn router_private_repo_invisible_get_repo() {
+        let app = build_xrpc_router().await;
+        let resp = app
+            .oneshot(req("/xrpc/com.atproto.sync.getRepo?did=did:web:priv.example.com"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = resp_json(resp).await;
+        assert_eq!(body["error"], errors::REPO_NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn router_private_repo_invisible_resolve_handle() {
+        let app = build_xrpc_router().await;
+        let resp = app
+            .oneshot(req("/xrpc/com.atproto.identity.resolveHandle?handle=priv.example.com"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = resp_json(resp).await;
+        assert_eq!(body["error"], errors::HANDLE_NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn router_public_describe_repo_ok() {
+        let app = build_xrpc_router().await;
+        let resp = app
+            .oneshot(req("/xrpc/com.atproto.repo.describeRepo?repo=did:web:pub.example.com"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp_json(resp).await;
+        assert_eq!(body["did"], "did:web:pub.example.com");
+        assert_eq!(body["handleIsCorrect"], true);
+    }
+
+    #[tokio::test]
+    async fn router_get_record_nonexistent_rkey() {
+        let app = build_xrpc_router().await;
+        let resp = app
+            .clone()
+            .oneshot(req(
+                "/xrpc/com.atproto.repo.getRecord?repo=did:web:pub.example.com\
+                 &collection=ai.hyprstream.model&rkey=zzzzzzzzzzzz",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = resp_json(resp).await;
+        assert_eq!(body["error"], errors::RECORD_NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn router_missing_params_invalid_request() {
+        let app = build_xrpc_router().await;
+        // Missing repo param.
+        let resp = app
+            .clone()
+            .oneshot(req("/xrpc/com.atproto.repo.getRecord?collection=ai.hyprstream.model"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = resp_json(resp).await;
+        assert_eq!(body["error"], errors::INVALID_REQUEST);
+
+        // Missing handle param.
+        let resp = app
+            .oneshot(req("/xrpc/com.atproto.identity.resolveHandle"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = resp_json(resp).await;
+        assert_eq!(body["error"], errors::INVALID_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn router_unknown_handle_handle_not_found() {
+        let app = build_xrpc_router().await;
+        let resp = app
+            .oneshot(req("/xrpc/com.atproto.identity.resolveHandle?handle=does-not-exist.com"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = resp_json(resp).await;
+        assert_eq!(body["error"], errors::HANDLE_NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn router_since_empty_rejected() {
+        let app = build_xrpc_router().await;
+        let resp = app
+            .oneshot(req("/xrpc/com.atproto.sync.getRepo?did=did:web:pub.example.com&since="))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = resp_json(resp).await;
+        assert_eq!(body["error"], errors::INVALID_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn router_since_non_empty_rejected() {
+        let app = build_xrpc_router().await;
+        let resp = app
+            .oneshot(req(
+                "/xrpc/com.atproto.sync.getRepo?did=did:web:pub.example.com\
+                 &since=3whysti2w4mq2",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = resp_json(resp).await;
+        assert_eq!(body["error"], errors::INVALID_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn router_get_repo_ok_streams_car() {
+        let app = build_xrpc_router().await;
+        let resp = app
+            .oneshot(req("/xrpc/com.atproto.sync.getRepo?did=did:web:pub.example.com"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get(header::CONTENT_TYPE).unwrap(),
+            "application/vnd.ipld.car",
+        );
+        // Consume the body fully so the permit is released.
+        let bytes = axum::body::to_bytes(resp.into_body(), 4 * 1024 * 1024)
+            .await
+            .unwrap();
+        assert!(!bytes.is_empty());
+    }
 }
