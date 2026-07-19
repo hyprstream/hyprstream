@@ -151,28 +151,17 @@ fn mldsa65_to_multibase(vk_bytes: &[u8]) -> String {
 }
 
 /// The node's atproto-native identity to embed in the root DID document:
-/// the P-256 signing key (published as the `#atproto` Multikey) plus the
-/// account handle (published in `alsoKnownAs` as `at://{handle}`).
+/// the P-256 signing key (published as the single `#atproto` Multikey —
+/// atproto DID documents carry exactly one `#atproto` verification method,
+/// with no `nbf`/`exp`) plus the account handle (published in `alsoKnownAs`
+/// as `at://{handle}`).
 ///
-/// `drain` (when `Some`) publishes the previous active `#atproto` key as a
-/// second `#atproto-drain` verification method with its bounded `[nbf, exp]`
-/// window, so verifiers can still accept commits signed by the now-rotated-out
-/// key during the drain window (#918). The active `#atproto` key stays FIRST
-/// (atproto takes the first matching entry); `#atproto-drain` is a hyprstream
-/// extension consulted only by `RotationKeySet::from_did_document`.
+/// On a `#atproto` key rotation the producer re-signs the repo head commit
+/// with the new active key (#918 re-sign-on-rotation); the DID document
+/// always advertises exactly the current key.
 pub struct AtprotoIdentity<'a> {
     pub p256_vk: &'a p256::ecdsa::VerifyingKey,
     pub handle: &'a str,
-    pub drain: Option<DrainKey<'a>>,
-}
-
-/// The bounded drain slot published as `#atproto-drain` during a key rotation
-/// (#918): the outgoing `#atproto` P-256 key plus the unix-second window
-/// `[nbf, exp]` during which commits it signed remain verifiable.
-pub struct DrainKey<'a> {
-    pub vk: &'a p256::ecdsa::VerifyingKey,
-    pub nbf: i64,
-    pub exp: i64,
 }
 
 /// An optional, additive transport endpoint advertised as a typed `service`
@@ -195,50 +184,6 @@ fn atproto_verification_method(did: &str, vk: &p256::ecdsa::VerifyingKey) -> Val
         "controller": did,
         "publicKeyMultibase": p256_to_multibase(vk),
     })
-}
-
-/// Build the bounded `#atproto-drain` verification method — the outgoing
-/// `#atproto` P-256 key still accepted for commit verification during its
-/// `[nbf, exp]` drain window (#918). Carries explicit unix-second `nbf`/`exp`
-/// fields so `RotationKeySet::from_did_document` can bound-check it; a drain
-/// slot without bounds would be rejected by the verifier (an unbounded drain
-/// key is exactly the stale-key-forever failure the bounded set prevents).
-fn atproto_drain_verification_method(
-    did: &str,
-    vk: &p256::ecdsa::VerifyingKey,
-    nbf: i64,
-    exp: i64,
-) -> Value {
-    json!({
-        "id": format!("{did}#atproto-drain"),
-        "type": "Multikey",
-        "controller": did,
-        "publicKeyMultibase": p256_to_multibase(vk),
-        "nbf": nbf,
-        "exp": exp,
-    })
-}
-
-/// Build the `#atproto` (+ optional `#atproto-drain`) verification-method
-/// entries the producer publishes for `did`, given the active `#atproto` key
-/// and an optional bounded drain slot `(vk, nbf, exp)`.
-///
-/// This is the authoritative slot set used by the DID-document producer
-/// (`build_did_document`) and, via
-/// [`hyprstream_pds::commit::RotationKeySet::from_did_document`], by the
-/// verifier (#918). Exposed so the in-process record resolver can round-trip
-/// the *same* slot set it publishes, keeping producer and consumer pinned to
-/// one source of truth.
-pub fn atproto_verification_methods(
-    did: &str,
-    active_vk: &p256::ecdsa::VerifyingKey,
-    drain: Option<(&p256::ecdsa::VerifyingKey, i64, i64)>,
-) -> Vec<Value> {
-    let mut vms = vec![atproto_verification_method(did, active_vk)];
-    if let Some((vk, nbf, exp)) = drain {
-        vms.push(atproto_drain_verification_method(did, vk, nbf, exp));
-    }
-    vms
 }
 
 /// Build the verification-method JSON for a single Ed25519 key under a
@@ -442,24 +387,15 @@ pub(crate) fn build_did_document(
     let mut authentication_refs = Vec::with_capacity(keys.len() * 2 + 2);
     let mut assertion_refs = Vec::with_capacity(keys.len() * 2 + 2);
 
-    // atproto signing key FIRST (atproto takes the first matching entry).
+    // atproto signing key FIRST (atproto takes the first matching entry). The
+    // DID document carries exactly ONE `#atproto` method — the current active
+    // key (#918 re-sign-on-rotation: the repo head is re-signed on rotation,
+    // so the verifier only ever needs the single current key).
     if let Some(at) = atproto {
         verification_methods.push(atproto_verification_method(did, at.p256_vk));
         let atproto_vm_id = format!("{did}#atproto");
         authentication_refs.push(Value::String(atproto_vm_id.clone()));
         assertion_refs.push(Value::String(atproto_vm_id));
-        // Bounded drain slot (#918): the previous active #atproto key, still
-        // accepted for commit verification during its [nbf, exp] window.
-        // Published after the active VM (atproto resolvers take the first
-        // match); consulted only by `RotationKeySet::from_did_document`.
-        if let Some(drain) = &at.drain {
-            verification_methods.push(atproto_drain_verification_method(
-                did, drain.vk, drain.nbf, drain.exp,
-            ));
-            let drain_vm_id = format!("{did}#atproto-drain");
-            authentication_refs.push(Value::String(drain_vm_id.clone()));
-            assertion_refs.push(Value::String(drain_vm_id));
-        }
     }
 
     // Ed25519 mesh / OAuth verification methods (multibase + JWK).
@@ -562,26 +498,21 @@ pub async fn root_did_document(
     };
     let vk = sk.verifying_key();
 
-    // atproto-native identity: the active P-256 key from the ES256 rotation
-    // store becomes the `#atproto` Multikey; the issuer authority is the handle.
-    // During a drain window the store's drain slot is also published as
-    // `#atproto-drain` (#918) so verifiers accept commits signed by the
-    // previous active key until its exp passes.
-    let (atproto_sk, drain_slot) = match state.es256_key_store.as_ref() {
-        Some(store) => (store.active_key().await, store.drain_slot().await),
-        None => (None, None),
+    // atproto-native identity: the single active P-256 key from the ES256
+    // rotation store becomes the `#atproto` Multikey; the issuer authority is
+    // the handle. atproto DID documents carry exactly one `#atproto` method
+    // (no drain slot, no nbf/exp); on rotation the repo head is re-signed with
+    // the new active key (#918 re-sign-on-rotation), so the document always
+    // advertises the key the current head verifies against.
+    let atproto_sk = match state.es256_key_store.as_ref() {
+        Some(store) => store.active_key(),
+        None => None,
     };
     let handle = configured_handle_host(&state.issuer_url);
     let atproto_vk = atproto_sk.as_ref().map(|sk| sk.verifying_key());
-    let atproto = atproto_vk.zip(handle.as_deref()).map(|(vk, handle)| AtprotoIdentity {
-        p256_vk: vk,
-        handle,
-        drain: drain_slot.as_ref().map(|d| DrainKey {
-            vk: d.key.verifying_key(),
-            nbf: d.nbf,
-            exp: d.exp,
-        }),
-    });
+    let atproto = atproto_vk
+        .zip(handle.as_deref())
+        .map(|(vk, handle)| AtprotoIdentity { p256_vk: vk, handle });
 
     // Transport `service` entries: populate QUIC entry when cert hash is available (#185).
     // The cert hash was set at OAuthService startup from the node's QUIC TLS cert,
@@ -1019,7 +950,7 @@ mod tests {
         let p256_sk = p256::ecdsa::SigningKey::random(&mut OsRng);
         let p256_vk = p256_sk.verifying_key();
         let did = "did:web:hyprstream.example.com";
-        let atproto = AtprotoIdentity { p256_vk, handle: "hyprstream.example.com", drain: None };
+        let atproto = AtprotoIdentity { p256_vk, handle: "hyprstream.example.com" };
         let transports = [TransportEndpoint {
             fragment: "iroh".to_owned(),
             vm_type: "IrohTransport".to_owned(),
@@ -1082,7 +1013,6 @@ mod tests {
         let atproto = AtprotoIdentity {
             p256_vk,
             handle,
-            drain: None,
         };
         let doc = build_did_document(did, issuer, &[], Some(&atproto), &[], None, None);
 
@@ -1106,28 +1036,19 @@ mod tests {
             .unwrap()
             .iter()
             .any(|vm| vm["id"].as_str() == Some(&format!("{did}#atproto"))));
+    }
 
-    /// #918 producer side: a drain slot is published as `#atproto-drain` with
-    /// explicit `nbf`/`exp`, the active `#atproto` stays FIRST, and the
-    /// resulting document round-trips through
-    /// `hyprstream_pds::commit::RotationKeySet::from_did_document` so the
-    /// verifier sees exactly the slot set the producer published.
+    /// #918 producer side: the DID document publishes exactly ONE `#atproto`
+    /// method (the current active key) — no `#atproto-drain`, no `nbf`/`exp`
+    /// (atproto-spec-aligned). The verifier resolves that single key via
+    /// `atproto_verifying_key_from_did_document` and checks the head commit
+    /// against it.
     #[test]
-    fn build_did_doc_publishes_atproto_drain_slot() {
+    fn build_did_doc_publishes_single_atproto_method() {
         let active_sk = p256::ecdsa::SigningKey::random(&mut OsRng);
         let active_vk = active_sk.verifying_key();
-        let drain_sk = p256::ecdsa::SigningKey::random(&mut OsRng);
-        let drain_vk = drain_sk.verifying_key();
         let did = "did:web:hyprstream.example.com";
-        let atproto = AtprotoIdentity {
-            p256_vk: active_vk,
-            handle: "hyprstream.example.com",
-            drain: Some(DrainKey {
-                vk: drain_vk,
-                nbf: 1_000,
-                exp: 2_000,
-            }),
-        };
+        let atproto = AtprotoIdentity { p256_vk: active_vk, handle: "hyprstream.example.com" };
         let doc = build_did_document(
             did,
             "https://hyprstream.example.com",
@@ -1138,32 +1059,25 @@ mod tests {
             None,
         );
         let vms = doc["verificationMethod"].as_array().unwrap();
-        // Active #atproto is FIRST; drain is the second VM, with nbf/exp.
         assert_eq!(vms[0]["id"].as_str().unwrap(), format!("{did}#atproto"));
-        let drain_vm = vms
-            .iter()
-            .find(|v| v["id"].as_str() == Some(format!("{did}#atproto-drain").as_str()))
-            .expect("document must publish #atproto-drain");
-        assert_eq!(drain_vm["nbf"].as_i64().unwrap(), 1_000);
-        assert_eq!(drain_vm["exp"].as_i64().unwrap(), 2_000);
+        // Exactly one #atproto, no #atproto-drain, no nbf/exp on the VM.
+        assert_eq!(
+            vms.iter()
+                .filter(|v| v["id"].as_str().map(|s| s.ends_with("#atproto")).unwrap_or(false))
+                .count(),
+            1,
+            "exactly one #atproto method"
+        );
+        assert!(
+            vms.iter().all(|v| v.get("nbf").is_none() && v.get("exp").is_none()),
+            "atproto VMs carry no nbf/exp"
+        );
 
-        // Round-trip: the verifier's RotationKeySet parses exactly this shape.
-        // The authoritative active key is the document's #atproto (active_vk),
-        // which matches by construction.
-        let set = hyprstream_pds::commit::RotationKeySet::from_did_document(&doc, did, active_vk)
-            .expect("published document must parse into a RotationKeySet");
-        assert_eq!(set.len(), 2);
-        // Within the drain window, both slots are live; past exp only the
-        // active (unbounded) slot is live.
-        {
-            let mut live: Vec<_> = set.live_slots(1_500).collect();
-            live.sort_by_key(|vk| vk.to_sec1_bytes().to_vec());
-            assert_eq!(live.len(), 2, "both slots live within the drain window");
-            let mut live_after: Vec<_> = set.live_slots(3_000).collect();
-            live_after.sort_by_key(|vk| vk.to_sec1_bytes().to_vec());
-            assert_eq!(live_after.len(), 1, "drain slot filtered out after exp");
-            assert_eq!(live_after[0].to_sec1_bytes(), active_vk.to_sec1_bytes());
-        }
+        // Round-trip: the verifier resolves the single current #atproto key.
+        let resolved =
+            hyprstream_pds::commit::atproto_verifying_key_from_did_document(&doc, did)
+                .expect("published document must yield its #atproto key");
+        assert_eq!(resolved.to_sec1_bytes(), active_vk.to_sec1_bytes());
     }
 
     #[test]

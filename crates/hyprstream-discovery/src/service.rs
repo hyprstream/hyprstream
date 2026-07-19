@@ -564,29 +564,6 @@ pub trait RecordResolver: Send + Sync {
     async fn resolve_verifying_key(&self, _did: &str) -> Result<Option<p256::ecdsa::VerifyingKey>> {
         Ok(None)
     }
-
-    /// Resolve the bounded set of `#atproto` verification slots currently
-    /// advertised for `did` (active + any unexpired drain), or `Ok(None)` when
-    /// this resolver cannot provide one.
-    ///
-    /// This is the **rotation-survivable signature-verification seam** (#918).
-    /// When a set is returned, [`PlacementIndex::ingest_did`] verifies the
-    /// ingested repo CAR's commit signature against it via
-    /// [`hyprstream_pds::commit::Commit::verify_against_keys`], accepting the
-    /// commit under any slot whose `[nbf, exp]` window covers the verification
-    /// instant — so a commit signed by a since-rotated-out key still verifies
-    /// during the drain window, and an expired/pre-`nbf` slot is never
-    /// consulted. `Ok(None)` falls back to the single-key
-    /// [`RecordResolver::resolve_verifying_key`] seam (which treats the single
-    /// key as an unbounded active slot), and then to the trusted-resolver
-    /// posture. A default of `Ok(None)` keeps resolvers that do not
-    /// participate unchanged.
-    async fn resolve_verifying_keys(
-        &self,
-        _did: &str,
-    ) -> Result<Option<hyprstream_pds::commit::RotationKeySet>> {
-        Ok(None)
-    }
 }
 
 // ============================================================================

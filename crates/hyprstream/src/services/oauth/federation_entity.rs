@@ -109,7 +109,7 @@ pub async fn build_entity_configuration_jwt(state: &OAuthState) -> Result<String
 
     // ES256 keys from rotation store.
     if let Some(ref store) = state.es256_key_store {
-        for slot in store.all_slots_snapshot().await {
+        for slot in store.all_slots_snapshot() {
             jwks_keys.push(crate::auth::jwt::es256_jwk(&slot.key));
         }
     }

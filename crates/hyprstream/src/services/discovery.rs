@@ -941,14 +941,6 @@ pub struct PdsPublisher {
     /// rotation. See [`crate::auth::ActiveGenerationSource`].
     generation_source: Arc<dyn crate::auth::ActiveGenerationSource>,
     /// Serializes the load→rebuild→sign→persist critical section (#910b).
-    ///
-    /// A publish is a read-modify-write over the WHOLE repo (one MST, one
-    /// signed root across all collections): two concurrent publishes that both
-    /// load the same prior state would each sign a commit covering only their
-    /// own record, and whichever lands last silently drops the other's from
-    /// the signed root — the store would then fail the read-side
-    /// root-consistency check. Holding this lock across the full critical
-    /// section makes each commit cover every prior write.
     publish_lock: parking_lot::Mutex<()>,
 }
 
@@ -959,7 +951,7 @@ impl PdsPublisher {
     pub fn new(
         store: Arc<PdsRecordStore>,
         did: String,
-        signing_key: p256::ecdsa::SigningKey,
+        es256_store: Arc<crate::auth::key_rotation::Es256SigningKeyStore>,
     ) -> Self {
         Self {
             store,
@@ -1402,50 +1394,26 @@ impl RecordResolver for PdsRecordResolver {
     ///
     /// The set is built by encoding the active (+ optional drain) slot's
     /// *public* verifying keys + bounds into the same `verificationMethod`
-    /// shape the DID document advertises, then parsing it back via
-    /// `RotationKeySet::from_did_document` — the producer/consumer round-trip
-    /// that pins both sides to one source of truth.
-    async fn resolve_verifying_keys(
+    /// Resolve the single current `#atproto` verifying key for `did` — the
+    /// atproto-spec-aligned verification seam (#918 re-sign-on-rotation).
+    ///
+    /// For this node's own repo DID, the resolver returns the live active key
+    /// from the shared ES256 rotation store (the same key the DID document
+    /// publishes and the publisher signs with — one source of truth). For
+    /// foreign DIDs, returns `Ok(None)` (trusted-resolver posture; real DID-doc
+    /// fetch is the future federation follow-up). Synchronous because the ES256
+    /// store now uses a parking_lot lock (#918 re-sign-on-rotation).
+    async fn resolve_verifying_key(
         &self,
         did: &str,
-    ) -> anyhow::Result<Option<hyprstream_pds::commit::RotationKeySet>> {
-        use p256::ecdsa::VerifyingKey;
-
+    ) -> anyhow::Result<Option<p256::ecdsa::VerifyingKey>> {
         let Some((store, node_did)) = self.rotation.as_ref() else {
             return Ok(None);
         };
         if did != node_did.as_str() {
-            // Not our repo — let the caller fall back to the trusted-resolver
-            // posture (this resolver only serves our own DIDs today).
             return Ok(None);
         }
-        let active = store.active_slot().await;
-        let drain = store.drain_slot().await;
-        let Some(active_slot) = active else {
-            // No #atproto key material available — decline rather than
-            // construct an empty set (which would fail-closed at verify time).
-            return Ok(None);
-        };
-        let active_vk = active_slot.key.verifying_key();
-        // p256 `SigningKey::verifying_key()` returns `&VerifyingKey` (it is
-        // stored in the signing key), so the drain tuple is built from borrowed
-        // verifying keys into the helper that takes `Option<(&VerifyingKey, ..)>`.
-        let drain_ref: Option<(&VerifyingKey, i64, i64)> = drain
-            .as_ref()
-            .map(|d| (d.key.verifying_key(), d.nbf, d.exp));
-        let vms = crate::services::oauth::did_document::atproto_verification_methods(
-            did,
-            active_vk,
-            drain_ref,
-        );
-        let doc = serde_json::json!({ "id": did, "verificationMethod": vms });
-        // The authoritative active key is the live store's active key (the same
-        // source the document was built from), so the freshness gate passes by
-        // construction. Passing it explicitly is what makes a stale/forged
-        // document fail closed at this boundary.
-        let set =
-            hyprstream_pds::commit::RotationKeySet::from_did_document(&doc, did, active_vk)?;
-        Ok(Some(set))
+        Ok(store.active_key().map(|sk| *sk.verifying_key()))
     }
 }
 
@@ -1460,6 +1428,18 @@ mod pds_store_tests {
     use super::*;
     use hyprstream_pds::car::{parse_car_v1, verify_record_proof};
     use p256::ecdsa::{SigningKey, VerifyingKey};
+
+    /// Build a test `Es256SigningKeyStore` holding `sk` as the single active
+    /// slot, so `PdsPublisher::new` can resolve it at sign time (#918
+    /// re-sign-on-rotation: the publisher holds the store, not a frozen key).
+    fn test_es256_store(sk: SigningKey) -> Arc<crate::auth::key_rotation::Es256SigningKeyStore> {
+        use crate::auth::key_rotation::{Es256KeySlot, Es256KeySlots, Es256SigningKeyStore};
+        Arc::new(Es256SigningKeyStore::new(Es256KeySlots {
+            drain: None,
+            active: Some(Es256KeySlot::new(sk, 0, i64::MAX)),
+            lead: None,
+        }))
+    }
 
     /// A 40-hex-char (SHA-1-shaped) git OID for the publish path.
     const SAMPLE_OID: &str = "1111111111111111111111111111111111111111";
@@ -1582,7 +1562,7 @@ mod pds_store_tests {
         let vk: VerifyingKey = *sk.verifying_key();
 
         let store = Arc::new(PdsRecordStore::open(dir.path()).expect("open rw"));
-        let publisher = PdsPublisher::new(Arc::clone(&store), DID.to_owned(), sk);
+        let publisher = PdsPublisher::new(Arc::clone(&store), DID.to_owned(), test_es256_store(sk));
         publisher.publish("repo-a", SAMPLE_OID).expect("publish");
 
         // Resolver holds no key at all.
@@ -1607,7 +1587,7 @@ mod pds_store_tests {
         let vk: VerifyingKey = *sk.verifying_key();
 
         let store = Arc::new(PdsRecordStore::open(dir.path()).expect("open rw"));
-        let publisher = PdsPublisher::new(Arc::clone(&store), DID.to_owned(), sk);
+        let publisher = PdsPublisher::new(Arc::clone(&store), DID.to_owned(), test_es256_store(sk));
         publisher.publish("repo-a", SAMPLE_OID).expect("publish");
 
         // Reconstruct the proof the same way the resolver does (store holds no
@@ -1635,7 +1615,7 @@ mod pds_store_tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let sk = SigningKey::random(&mut rand::rngs::OsRng);
         let store = Arc::new(PdsRecordStore::open(dir.path()).expect("open rw"));
-        let publisher = PdsPublisher::new(Arc::clone(&store), DID.to_owned(), sk);
+        let publisher = PdsPublisher::new(Arc::clone(&store), DID.to_owned(), test_es256_store(sk));
 
         publisher.publish("repo-a", SAMPLE_OID).expect("publish 1");
         let first = store.load_repo(DID).expect("load").expect("repo").commit;
@@ -1661,7 +1641,7 @@ mod pds_store_tests {
 
         {
             let store = Arc::new(PdsRecordStore::open(dir.path()).expect("open rw"));
-            let publisher = PdsPublisher::new(Arc::clone(&store), DID.to_owned(), sk);
+            let publisher = PdsPublisher::new(Arc::clone(&store), DID.to_owned(), test_es256_store(sk));
             publisher.publish("repo-b", SAMPLE_OID).expect("publish");
             // Writer handle dropped here — simulates a process restart.
         }
@@ -1754,7 +1734,7 @@ mod pds_store_tests {
         let vk: VerifyingKey = *sk.verifying_key();
 
         let store = Arc::new(PdsRecordStore::open(dir.path()).expect("open rw"));
-        let publisher = PdsPublisher::new(Arc::clone(&store), DID.to_owned(), sk);
+        let publisher = PdsPublisher::new(Arc::clone(&store), DID.to_owned(), test_es256_store(sk));
         publisher
             .publish("repo-a", SAMPLE_OID)
             .expect("publish model");
@@ -1786,7 +1766,7 @@ mod pds_store_tests {
         let vk: VerifyingKey = *sk.verifying_key();
 
         let store = Arc::new(PdsRecordStore::open(dir.path()).expect("open rw"));
-        let publisher = PdsPublisher::new(Arc::clone(&store), DID.to_owned(), sk);
+        let publisher = PdsPublisher::new(Arc::clone(&store), DID.to_owned(), test_es256_store(sk));
 
         let alloc = AllocationRecord::new(
             "bafyreiexamplegrantcid1234567890abcdef",
@@ -1855,7 +1835,7 @@ mod pds_store_tests {
         let vk: VerifyingKey = *sk.verifying_key();
 
         let store = Arc::new(PdsRecordStore::open(dir.path()).expect("open rw"));
-        let publisher = PdsPublisher::new(Arc::clone(&store), DID.to_owned(), sk);
+        let publisher = PdsPublisher::new(Arc::clone(&store), DID.to_owned(), test_es256_store(sk));
         publisher
             .publish("repo-a", SAMPLE_OID)
             .expect("publish model");
@@ -1911,7 +1891,7 @@ mod pds_store_tests {
         let vk: VerifyingKey = *sk.verifying_key();
 
         let store = Arc::new(PdsRecordStore::open(dir.path()).expect("open rw"));
-        let publisher = Arc::new(PdsPublisher::new(Arc::clone(&store), DID.to_owned(), sk));
+        let publisher = Arc::new(PdsPublisher::new(Arc::clone(&store), DID.to_owned(), test_es256_store(sk)));
 
         const WRITERS_PER_COLLECTION: usize = 4;
         let mut handles = Vec::new();
@@ -1958,7 +1938,7 @@ mod pds_store_tests {
         let sk = SigningKey::random(&mut rand::rngs::OsRng);
 
         let store = Arc::new(PdsRecordStore::open(dir.path()).expect("open rw"));
-        let publisher = PdsPublisher::new(Arc::clone(&store), DID.to_owned(), sk);
+        let publisher = PdsPublisher::new(Arc::clone(&store), DID.to_owned(), test_es256_store(sk));
         publisher.publish("repo-a", SAMPLE_OID).expect("publish");
 
         // Corrupt the store: write a second record while re-persisting the
@@ -1997,7 +1977,7 @@ mod pds_store_tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let sk = SigningKey::random(&mut rand::rngs::OsRng);
         let store = Arc::new(PdsRecordStore::open(dir.path()).expect("open rw"));
-        let publisher = PdsPublisher::new(Arc::clone(&store), DID.to_owned(), sk);
+        let publisher = PdsPublisher::new(Arc::clone(&store), DID.to_owned(), test_es256_store(sk));
         for bad in ["", "with/slash", "with\0nul"] {
             assert!(
                 publisher.publish_record(bad, "repo-a", SAMPLE_OID).is_err(),
@@ -2081,7 +2061,7 @@ mod pds_store_tests {
         PdsPublisher::new(
             store,
             DID.to_owned(),
-            SigningKey::random(&mut rand::rngs::OsRng),
+            test_es256_store(SigningKey::random(&mut rand::rngs::OsRng)),
         )
         .with_at9p_state_ingest(ingest)
     }

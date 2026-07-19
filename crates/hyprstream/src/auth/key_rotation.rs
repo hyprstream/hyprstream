@@ -1436,44 +1436,32 @@ impl Es256KeySlots {
 }
 
 #[derive(Clone)]
-pub struct Es256SigningKeyStore(pub Arc<RwLock<Es256KeySlots>>);
+pub struct Es256SigningKeyStore(pub Arc<parking_lot::RwLock<Es256KeySlots>>);
 
 impl Es256SigningKeyStore {
     pub fn new(slots: Es256KeySlots) -> Self {
-        Self(Arc::new(RwLock::new(slots)))
+        Self(Arc::new(parking_lot::RwLock::new(slots)))
     }
 
-    pub async fn active_key(&self) -> Option<Arc<Es256SigningKey>> {
+    /// The current active ES256 signing key — the single `#atproto` key the
+    /// DID document publishes and the repo head is signed with (#918
+    /// re-sign-on-rotation). Synchronous (parking_lot lock) so the publisher
+    /// can resolve the LIVE key at sign time without an async runtime.
+    pub fn active_key(&self) -> Option<Arc<Es256SigningKey>> {
         self.0
             .read()
-            .await
             .active
             .as_ref()
             .map(|s| Arc::clone(&s.key))
     }
 
     /// The active slot (key + `nbf`/`exp` bounds), if present.
-    ///
-    /// The active key's bounds are the issuance window; commit verifiers treat
-    /// the active `#atproto` slot as unbounded (the DID document does not
-    /// publish its window). See [`Self::drain_slot`] for the bounded slot.
-    pub async fn active_slot(&self) -> Option<Es256KeySlot> {
-        self.0.read().await.active.clone()
+    pub fn active_slot(&self) -> Option<Es256KeySlot> {
+        self.0.read().active.clone()
     }
 
-    /// The drain slot (key + `nbf`/`exp` bounds) — the previous active key,
-    /// still accepted for verification of commits signed before the rotation
-    /// until its `exp` passes (#918).
-    ///
-    /// Published as `#atproto-drain` in the DID document with explicit
-    /// `nbf`/`exp`; commit verifiers bound-check it inside
-    /// `Commit::verify_against_keys`. `None` outside a drain window.
-    pub async fn drain_slot(&self) -> Option<Es256KeySlot> {
-        self.0.read().await.drain.clone()
-    }
-
-    pub async fn all_slots_snapshot(&self) -> Vec<Es256KeySlot> {
-        self.0.read().await.all().into_iter().cloned().collect()
+    pub fn all_slots_snapshot(&self) -> Vec<Es256KeySlot> {
+        self.0.read().all().into_iter().cloned().collect()
     }
 }
 
@@ -1605,7 +1593,7 @@ pub async fn rotate_es256_keys(
     store: &Es256SigningKeyStore,
     now: i64,
 ) {
-    let mut slots = store.0.write().await;
+    let mut slots = store.0.write();
     let active_secs = config.active_secs();
     let lead_secs = config.lead_secs();
     let drain_secs = config.drain_secs();
@@ -3245,8 +3233,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let config = test_config();
         let store = load_or_init_es256_key_store(dir.path(), &config);
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let key = rt.block_on(store.active_key());
+        let key = store.active_key();
         assert!(key.is_some());
     }
 
@@ -3255,14 +3242,13 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let config = test_config();
         let store1 = load_or_init_es256_key_store(dir.path(), &config);
-        let rt = tokio::runtime::Runtime::new().unwrap();
         let kid1 = {
-            let slots = rt.block_on(store1.all_slots_snapshot());
+            let slots = store1.all_slots_snapshot();
             slots[0].kid()
         };
         let store2 = load_or_init_es256_key_store(dir.path(), &config);
         let kid2 = {
-            let slots = rt.block_on(store2.all_slots_snapshot());
+            let slots = store2.all_slots_snapshot();
             slots[0].kid()
         };
         assert_eq!(kid1, kid2, "ES256 key must survive reload from disk");
@@ -3288,7 +3274,7 @@ mod tests {
 
         rotate_es256_keys(&config, dir.path(), &store, now).await;
 
-        let slots = store.0.read().await;
+        let slots = store.0.read();
         assert_eq!(slots.active.as_ref().unwrap().kid(), lead_kid);
         assert!(slots.drain.is_some());
         assert!(slots.lead.is_none());

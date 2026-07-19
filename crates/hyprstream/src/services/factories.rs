@@ -737,10 +737,6 @@ fn create_registry_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawn
                 .matches(&acceptance_identity.verifying_key()),
             "registry signing credential does not match authenticated deployment identity"
         );
-        // The alarm WAL must remain verifiable across OAuth key rotations and
-        // process restarts. Derive a dedicated, stable audit identity from the
-        // node/service root available in this deployment mode; the second
-        // derivation keeps the ML-DSA material separate from the Ed25519 key.
         let audit_ed = hyprstream_rpc::node_identity::derive_purpose_key(
             &acceptance_identity,
             "hyprstream-at9p-audit-ed25519-v1",

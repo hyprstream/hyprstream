@@ -76,9 +76,6 @@ hyprstream-crypto = { path = "../hyprstream-crypto" }
 proptest = { workspace = true }
 serde_yaml = { workspace = true }
 tempfile = { workspace = true }
-# #918 rotation tests build a RotationKeySet via a DID-document encode/decode
-# round-trip (p256 multibase encoding of #atproto / #atproto-drain VMs).
-bs58 = "0.5"
 
 [build-dependencies]
 capnpc = { workspace = true }
