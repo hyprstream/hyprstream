@@ -177,7 +177,7 @@ pub struct TransportEndpoint {
 }
 
 /// Build the atproto `#atproto` verification method (P-256 `Multikey`).
-fn atproto_verification_method(did: &str, vk: &p256::ecdsa::VerifyingKey) -> Value {
+pub(crate) fn atproto_verification_method(did: &str, vk: &p256::ecdsa::VerifyingKey) -> Value {
     json!({
         "id": format!("{did}#atproto"),
         "type": "Multikey",

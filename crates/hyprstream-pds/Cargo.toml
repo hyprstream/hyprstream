@@ -28,10 +28,9 @@ parking_lot = { workspace = true }
 # Operator-visible duplicity alarms; the structured event is also exported by
 # the process tracing/OTel subscriber when configured.
 tracing = { workspace = true }
-# DID-document parsing for the bounded #atproto rotation key set (#918): a
-# `RotationKeySet` is constructed from the resolved DID document's
-# `verificationMethod` entries, so the trust-chain primitive decodes the
-# `#atproto` / `#atproto-drain` Multikeys (multibase z + base58btc) itself.
+# DID-document parsing for #918: `atproto_verifying_key_from_did_document`
+# decodes the single `#atproto` Multikey (multibase z + base58btc) from a
+# resolved DID document, so the trust-chain primitive is self-contained.
 serde_json = { workspace = true }
 bs58 = "0.5"
 # Note: DAG-CBOR + CIDv1 + varints are hand-rolled in src/dag_cbor.rs and

@@ -1435,12 +1435,36 @@ impl Es256KeySlots {
     }
 }
 
+type Es256PromotionHook = dyn Fn() -> anyhow::Result<()> + Send + Sync;
+
 #[derive(Clone)]
-pub struct Es256SigningKeyStore(pub Arc<parking_lot::RwLock<Es256KeySlots>>);
+pub struct Es256SigningKeyStore(
+    pub Arc<parking_lot::RwLock<Es256KeySlots>>,
+    Arc<parking_lot::RwLock<Option<Arc<Es256PromotionHook>>>>,
+);
 
 impl Es256SigningKeyStore {
     pub fn new(slots: Es256KeySlots) -> Self {
-        Self(Arc::new(parking_lot::RwLock::new(slots)))
+        Self(
+            Arc::new(parking_lot::RwLock::new(slots)),
+            Arc::new(parking_lot::RwLock::new(None)),
+        )
+    }
+
+    /// Install the in-process action run immediately after lead → active
+    /// promotion. The publisher stores a weak self-reference in this hook, so
+    /// the shared key store does not keep the service alive. Cross-`--ipc`
+    /// promotion delivery remains tracked by #1123.
+    pub(crate) fn set_promotion_hook(&self, hook: Arc<Es256PromotionHook>) {
+        *self.1.write() = Some(hook);
+    }
+
+    fn notify_promotion(&self) -> anyhow::Result<()> {
+        let hook = self.1.read().clone();
+        if let Some(hook) = hook {
+            hook()?;
+        }
+        Ok(())
     }
 
     /// The current active ES256 signing key — the single `#atproto` key the
@@ -1587,16 +1611,19 @@ pub fn load_or_init_es256_key_store(
     })
 }
 
+/// Returns `true` if the active key was promoted (lead → active). A promotion
+/// also invokes the store's in-process re-sign hook (#918).
 pub async fn rotate_es256_keys(
     config: &OAuthConfig,
     secrets_dir: &Path,
     store: &Es256SigningKeyStore,
     now: i64,
-) {
+) -> bool {
     let mut slots = store.0.write();
     let active_secs = config.active_secs();
     let lead_secs = config.lead_secs();
     let drain_secs = config.drain_secs();
+    let mut promoted = false;
 
     // Phase 1: promote lead → active if lead.nbf <= now
     if let Some(ref lead) = slots.lead {
@@ -1614,6 +1641,7 @@ pub async fn rotate_es256_keys(
                 }
                 delete_es256_slot(secrets_dir, "lead");
                 slots.active = Some(new_active);
+                promoted = true;
                 info!("ES256: promoted lead → active");
             }
         }
@@ -1642,6 +1670,17 @@ pub async fn rotate_es256_keys(
             slots.lead = Some(new_lead);
         }
     }
+    drop(slots);
+    if promoted {
+        // #918: promotion and publication share the slot lock. Once the write
+        // guard above is released, the in-process publisher re-signs the
+        // existing head under the newly active key. Cross-process delivery is
+        // intentionally deferred to #1123.
+        if let Err(error) = store.notify_promotion() {
+            warn!("ES256: failed to re-sign PDS head after promotion: {error}");
+        }
+    }
+    promoted
 }
 
 // ════════════════════════════════════════════════════════════════════════════════

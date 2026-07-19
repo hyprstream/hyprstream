@@ -731,6 +731,8 @@ fn create_registry_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawn
         let generation_source: Arc<dyn crate::auth::ActiveGenerationSource> = Arc::new(
             crate::auth::SealedHeadEs256Source::new(&oplog_state_dir, &secrets_dir),
         );
+        let es256_store =
+            crate::auth::key_rotation::global_es256_key_store(&secrets_dir, &config.oauth);
         let acceptance_identity = ctx.service_signing_key("registry");
         anyhow::ensure!(
             hyprstream_discovery::deployment_registry_verifier()?
@@ -760,7 +762,8 @@ fn create_registry_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawn
             node_did,
             generation_source,
         )
-        .with_at9p_state_ingest(at9p_state))
+        .with_at9p_state_ingest(at9p_state)
+        .with_es256_store(es256_store))
     })()
     .map_err(|e| tracing::warn!("PDS publish disabled: {e}"))
     .ok();
@@ -780,7 +783,16 @@ fn create_registry_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawn
     }
     registry_service = registry_service.with_jwt_key_source(ctx.cluster_key_source());
     if let Some(publisher) = pds_publisher {
-        registry_service = registry_service.with_pds_publisher(publisher);
+        // #918 re-sign-on-rotation: wire the ES256 promotion hook before the
+        // publisher moves into the registry. The hook fires from the rotation
+        // task when the active key is promoted, re-signing the persisted head
+        // with the new key. NOTE(#1123): cross-`--ipc` the rotation event must
+        // reach whichever process runs the publisher.
+        let publisher_arc = Arc::new(publisher);
+        if let Err(error) = publisher_arc.install_es256_promotion_hook() {
+            tracing::warn!("initial PDS head re-sign failed: {error}");
+        }
+        registry_service = registry_service.with_pds_publisher_arc(publisher_arc);
     }
 
     Ok(ctx.into_spawnable_quic(registry_service, config.registry.quic_port))
@@ -1870,12 +1882,11 @@ fn create_discovery_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spaw
             .context("failed to open PDS record store (read-only)")?
             .with_at9p_deployment_verifier(at9p_acceptance_identity),
     );
-    // #918 — wire the ES256 rotation store + node repo DID into the resolver so
-    // verified ingest survives a `#atproto` key rotation: it resolves the
-    // bounded slot set (active + unexpired drain) the writer signs with and the
-    // DID document publishes, instead of a single key that goes stale on
-    // rotation. Uses the same global store the rotation task and the writer
-    // share, so producer and consumer are pinned to one authoritative source.
+    // #918 — wire the ES256 rotation store + node repo DID into the resolver
+    // so it can return the current `#atproto` verifying key for the local DID
+    // (the same live store the writer resolves at sign time). Uses the same
+    // global store the rotation task and the writer share, so producer and
+    // consumer are pinned to one authoritative source.
     let secrets_dir = crate::config::HyprConfig::resolve_secrets_dir()?;
     let es256_store =
         crate::auth::key_rotation::global_es256_key_store(&secrets_dir, &config.oauth);

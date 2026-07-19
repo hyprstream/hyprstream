@@ -228,14 +228,12 @@ impl Commit {
     /// commit it likes, but only commits signed by the account's `#atproto`
     /// key are accepted by verifiers.
     ///
-    /// **Key-rotation caveat (#918):** this single-key form assumes the DID
-    /// document still advertises the exact key that signed the commit. The
-    /// ES256 `#atproto` store rotates on the order of days, and
-    /// `oauth::did_document` publishes only the *active* slot, so a historical
-    /// commit signed by a now-rotated-out key fails here even though it was
-    /// legitimately signed. Callers that must verify commits across a rotation
-    /// boundary should use [`Commit::verify_against_keys`] with the full set
-    /// of currently-published `#atproto` slots (active + drain).
+    /// **Key-rotation posture (#918, atproto-spec-aligned):** the producer
+    /// re-signs the repo head commit on `#atproto` rotation, so this single-key
+    /// verify against the current `#atproto` key (resolved from the DID
+    /// document) is sufficient for current-head verification. There is no
+    /// drain-slot / multi-slot window on the atproto-compat key. Historical
+    /// commit verification via did:plc audit log (`/log/audit`) is deferred.
     pub fn verify(&self, vk: &VerifyingKey) -> Result<()> {
         use p256::ecdsa::signature::Verifier;
         let unsigned = self.unsigned();
@@ -248,17 +246,6 @@ impl Commit {
             .map_err(|e| anyhow::anyhow!("ES256 signature verification failed: {e}"))
     }
 
-    /// Rotation-tolerant commit verification — the trust-chain fix for #918.
-    ///
-    /// **Key-rotation posture (#918, atproto-spec-aligned):** the producer
-    /// re-signs the repo head commit on `#atproto` rotation, so the verifier
-    /// checks the current head against the SINGLE current `#atproto` key
-    /// resolved from the DID document ([`atproto_verifying_key_from_did_document`]).
-    /// There is no drain-slot / multi-slot window on the atproto-compat key.
-    /// Historical-commit verification, if ever needed, comes from the did:plc
-    /// audit log (`/log/audit`), not from the live document — deferred until a
-    /// caller needs it (current-head verification is the norm).
-    ///
     /// Compute the SHA-256 digest of the unsigned commit's DAG-CBOR bytes.
     ///
     /// Exposed for callers that compose their own signing/verification flow
@@ -275,7 +262,7 @@ impl Commit {
 /// `p256-pub` `0x80 0x24` + 33-byte compressed SEC1) into a P-256 verifying
 /// key, with the multicodec prefix checked.
 ///
-/// `label` is the verification-method id suffix (`#atproto` / `#atproto-drain`)
+/// `label` is the verification-method id suffix (`#atproto`)
 /// used in error messages; the caller already matched it.
 fn decode_p256_multibase_vm(vm: &serde_json::Value, label: &str) -> Result<VerifyingKey> {
     const P256_PUB_MULTICODEC: [u8; 2] = [0x80, 0x24];
@@ -581,6 +568,26 @@ mod tests {
         assert!(
             format!("{err}").contains("more than one"),
             "duplicate-method error should be explicit, got: {err}"
+        );
+    }
+
+    /// Authority hygiene: a wrong `type` (not "Multikey") is rejected.
+    #[test]
+    fn atproto_key_rejects_wrong_type() {
+        let (_c, vk) = make_signed_commit();
+        let did = "did:web:alice.example.com";
+        let doc = serde_json::json!({
+            "id": did,
+            "verificationMethod": [{
+                "id": format!("{did}#atproto"),
+                "type": "JsonWebKey2020",
+                "controller": did,
+                "publicKeyMultibase": p256_to_multibase(&vk),
+            }],
+        });
+        assert!(
+            atproto_verifying_key_from_did_document(&doc, did).is_err(),
+            "a #atproto method with the wrong type must fail closed"
         );
     }
 }

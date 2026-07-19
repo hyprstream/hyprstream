@@ -447,6 +447,16 @@ impl RegistryService {
         self
     }
 
+    /// Like [`Self::with_pds_publisher`] but takes an already-`Arc`'d publisher,
+    /// so the caller can retain a weak clone for the ES256 promotion hook (#918).
+    pub fn with_pds_publisher_arc(
+        mut self,
+        publisher: Arc<crate::services::discovery::PdsPublisher>,
+    ) -> Self {
+        self.pds_publisher = Some(publisher);
+        self
+    }
+
     /// Best-effort publish/advance of `repo_id`'s PDS record (#910a).
     ///
     /// Failures are logged and swallowed, never surfaced to the RPC caller:

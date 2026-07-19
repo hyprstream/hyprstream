@@ -288,6 +288,19 @@ impl PdsRecordStore {
         Ok(())
     }
 
+    /// Write ONLY the commit block (no record) — used by the #918 head re-sign
+    /// path to replace the persisted head's signature without changing any
+    /// record data. The MST root / `rev` / `prev` are unchanged; only `sig`
+    /// is refreshed.
+    fn put_commit(&self, did: &str, commit: &Commit) -> AnyResult<()> {
+        let RecordBacking::ReadWrite(db) = &self.backing else {
+            bail!("PdsRecordStore::put_commit called on a read-only store");
+        };
+        db.put(commit_key(did), commit.to_dag_cbor())
+            .context("PDS commit-only write failed")?;
+        Ok(())
+    }
+
     fn load_at9p_state(
         &self,
         subject_cid512: &str,
@@ -926,6 +939,54 @@ fn harden_store_dir(path: &Path) {
 /// This is the **only** holder of the `#atproto` P-256 private key: it signs
 /// the repo's commit once, here, at write time, and persists the signed bytes.
 /// The resolver never sees the key.
+struct StoreGenerationSource(Arc<crate::auth::key_rotation::Es256SigningKeyStore>);
+
+impl crate::auth::ActiveGenerationSource for StoreGenerationSource {
+    fn active_generation(&self) -> AnyResult<Option<crate::auth::ActiveGeneration>> {
+        Ok(self.0.active_slot().map(|slot| crate::auth::ActiveGeneration {
+            seq: 0,
+            kid: slot.kid(),
+            verifying_key: *slot.key.verifying_key(),
+            signing_key: slot.key.as_ref().clone(),
+            head_at_op: None,
+        }))
+    }
+}
+
+pub trait IntoPdsGenerationSource {
+    fn into_pds_generation_source(
+        self,
+    ) -> (
+        Arc<dyn crate::auth::ActiveGenerationSource>,
+        Option<Arc<crate::auth::key_rotation::Es256SigningKeyStore>>,
+    );
+}
+
+impl IntoPdsGenerationSource for p256::ecdsa::SigningKey {
+    fn into_pds_generation_source(
+        self,
+    ) -> (
+        Arc<dyn crate::auth::ActiveGenerationSource>,
+        Option<Arc<crate::auth::key_rotation::Es256SigningKeyStore>>,
+    ) {
+        (
+            Arc::new(crate::auth::FixedGenerationSource::new(self)),
+            None,
+        )
+    }
+}
+
+impl IntoPdsGenerationSource for Arc<crate::auth::key_rotation::Es256SigningKeyStore> {
+    fn into_pds_generation_source(
+        self,
+    ) -> (
+        Arc<dyn crate::auth::ActiveGenerationSource>,
+        Option<Arc<crate::auth::key_rotation::Es256SigningKeyStore>>,
+    ) {
+        (Arc::new(StoreGenerationSource(Arc::clone(&self))), Some(self))
+    }
+}
+
 pub struct PdsPublisher {
     store: Arc<PdsRecordStore>,
     at9p_state: Option<At9pStateIngest>,
@@ -940,6 +1001,9 @@ pub struct PdsPublisher {
     /// construction-time copy would keep signing with a retired key after a
     /// rotation. See [`crate::auth::ActiveGenerationSource`].
     generation_source: Arc<dyn crate::auth::ActiveGenerationSource>,
+    /// Optional process-local store used only to install the promotion hook.
+    /// Production signing still resolves the sealed generation source.
+    es256_store: Option<Arc<crate::auth::key_rotation::Es256SigningKeyStore>>,
     /// Serializes the load→rebuild→sign→persist critical section (#910b).
     publish_lock: parking_lot::Mutex<()>,
 }
@@ -948,16 +1012,18 @@ impl PdsPublisher {
     /// Construct with a fixed signing key. Preserved for tests and simple
     /// embedders; production wiring uses [`Self::with_generation_source`] so
     /// the publisher observes rotations.
-    pub fn new(
+    pub fn new<S: IntoPdsGenerationSource>(
         store: Arc<PdsRecordStore>,
         did: String,
-        es256_store: Arc<crate::auth::key_rotation::Es256SigningKeyStore>,
+        source: S,
     ) -> Self {
+        let (generation_source, es256_store) = source.into_pds_generation_source();
         Self {
             store,
             at9p_state: None,
             did,
-            generation_source: Arc::new(crate::auth::FixedGenerationSource::new(signing_key)),
+            generation_source,
+            es256_store,
             publish_lock: parking_lot::Mutex::new(()),
         }
     }
@@ -975,8 +1041,17 @@ impl PdsPublisher {
             at9p_state: None,
             did,
             generation_source: source,
+            es256_store: None,
             publish_lock: parking_lot::Mutex::new(()),
         }
+    }
+
+    pub fn with_es256_store(
+        mut self,
+        store: Arc<crate::auth::key_rotation::Es256SigningKeyStore>,
+    ) -> Self {
+        self.es256_store = Some(store);
+        self
     }
 
     /// Install the daemon-owned accepted-state ingest boundary. Production
@@ -985,6 +1060,27 @@ impl PdsPublisher {
     pub fn with_at9p_state_ingest(mut self, ingest: At9pStateIngest) -> Self {
         self.at9p_state = Some(ingest);
         self
+    }
+
+    /// Connect this publisher to the shared ES256 store's in-process
+    /// lead→active notification. A weak reference avoids a publisher→store→
+    /// publisher reference cycle. Cross-`--ipc` delivery is deferred to #1123.
+    pub fn install_es256_promotion_hook(self: &Arc<Self>) -> AnyResult<()> {
+        let publisher = Arc::downgrade(self);
+        let store = self
+            .es256_store
+            .as_ref()
+            .ok_or_else(|| anyhow!("no process-local ES256 store for promotion hook"))?;
+        store.set_promotion_hook(Arc::new(move || {
+            let Some(publisher) = publisher.upgrade() else {
+                return Ok(());
+            };
+            publisher.resign_head().map(|_| ())
+        }));
+        // Reconcile once at installation too: if promotion happened before the
+        // registry factory installed the callback, an idle persisted head must
+        // still be brought under the current active key.
+        self.resign_head().map(|_| ())
     }
 
     pub fn ingest_at9p_genesis(
@@ -1199,6 +1295,46 @@ impl PdsPublisher {
         self.store
             .put_record_and_commit(&self.did, collection, tid, &record, &commit)
     }
+
+    /// #918 re-sign-on-rotation: re-sign the EXISTING persisted repo head with
+    /// the current live active `#atproto` key, leaving the MST root, `rev`, and
+    /// `prev` unchanged — only the signature is refreshed. Called from the ES256
+    /// rotation hook after a lead→active promotion. An idle repo (no writes
+    /// since the rotation) whose head was signed by the now-rotated-out K gets
+    /// re-signed with K' so the verifier (which resolves K' from the live DID
+    /// document) accepts the head.
+    ///
+    /// Holds the `publish_lock` to serialize with concurrent publishes. Returns
+    /// `Ok(true)` if the head was re-signed and `Ok(false)` if there is no repo.
+    /// A missing active key is an error. NOTE(#1123): in the cross-`--ipc`
+    /// split the rotation event must reach whichever process runs the publisher;
+    /// this single-process re-sign is the in-process piece.
+    pub fn resign_head(&self) -> AnyResult<bool> {
+        let _guard = self.publish_lock.lock();
+        let active_key = if let Some(store) = &self.es256_store {
+            store.active_key().ok_or_else(|| {
+                anyhow!("no active ES256 #atproto signing key available for head re-sign")
+            })?
+        } else {
+            Arc::new(
+                self.generation_source
+                    .active_generation()
+                    .context("resolving active #atproto generation for head re-sign")?
+                    .ok_or_else(|| anyhow!("no active #atproto generation for head re-sign"))?
+                    .signing_key,
+            )
+        };
+        let Some(repo) = self.store.load_repo(&self.did)? else {
+            return Ok(false); // no repo yet — nothing to re-sign
+        };
+        // Re-sign over the same canonical unsigned bytes — only the `sig`
+        // changes. The commit CID changes because it includes `sig`; the next
+        // normal publish will link `prev` to this re-signed head's CID.
+        let unsigned = repo.commit.unsigned();
+        let re_signed = Commit::sign(&unsigned, &active_key);
+        self.store.put_commit(&self.did, &re_signed)?;
+        Ok(true)
+    }
 }
 
 /// The next commit `rev`: the current wall-clock TID, or one past the previous
@@ -1246,11 +1382,10 @@ fn atproto_datetime_now() -> String {
 pub struct PdsRecordResolver {
     store: Arc<PdsRecordStore>,
     /// The shared ES256 rotation store + this node's repo DID, so the resolver
-    /// can publish the bounded `#atproto` slot set (active + drain) it shares
-    /// with the writer and let verified ingest survive key rotation (#918).
+    /// can return the current `#atproto` verifying key for the local DID from
+    /// the same live store the writer signs with (#918 re-sign-on-rotation).
     /// `None` when the resolver was constructed without rotation visibility
-    /// (e.g. isolated tests); ingest then falls back to the trusted-resolver
-    /// posture.
+    /// (e.g. isolated tests); ingest then fails closed for that DID.
     rotation: Option<(Arc<crate::auth::key_rotation::Es256SigningKeyStore>, String)>,
 }
 
@@ -1263,11 +1398,10 @@ impl PdsRecordResolver {
     }
 
     /// Install the ES256 rotation store + this node's repo DID, enabling
-    /// rotation-survivable signature verification (#918): the resolver answers
-    /// `resolve_verifying_keys` with the bounded `#atproto` slot set the writer
-    /// signs with, so a commit signed by a since-rotated-out key still verifies
-    /// during the drain window. The store is the authoritative source; the
-    /// resolver reads only the slots' public verifying keys + bounds.
+    /// the resolver to return the current `#atproto` verifying key for the
+    /// local DID (#918 re-sign-on-rotation). For foreign DIDs the resolver
+    /// returns None (no DID-document fetch wired yet) — the verifier fails
+    /// closed for those.
     pub fn with_es256_rotation(
         mut self,
         store: Arc<crate::auth::key_rotation::Es256SigningKeyStore>,
@@ -1382,27 +1516,17 @@ impl RecordResolver for PdsRecordResolver {
         Ok(Some(RecordCarData { uri, car }))
     }
 
-    /// Resolve the bounded `#atproto` slot set for `did` from the shared ES256
-    /// rotation store — the authoritative source the writer signs with and the
-    /// DID-document producer publishes (#918).
-    ///
-    /// Only resolves for this node's own repo DID (single-node, self-hosted
-    /// PDS). Foreign-DID resolution over a real DID document fetch is the
-    /// future federation-hardening follow-up; until then foreign DIDs return
-    /// `Ok(None)` (trusted-resolver posture for the in-process resolver, which
-    /// only serves our own DIDs anyway).
-    ///
-    /// The set is built by encoding the active (+ optional drain) slot's
-    /// *public* verifying keys + bounds into the same `verificationMethod`
     /// Resolve the single current `#atproto` verifying key for `did` — the
     /// atproto-spec-aligned verification seam (#918 re-sign-on-rotation).
     ///
-    /// For this node's own repo DID, the resolver returns the live active key
-    /// from the shared ES256 rotation store (the same key the DID document
-    /// publishes and the publisher signs with — one source of truth). For
-    /// foreign DIDs, returns `Ok(None)` (trusted-resolver posture; real DID-doc
-    /// fetch is the future federation follow-up). Synchronous because the ES256
-    /// store now uses a parking_lot lock (#918 re-sign-on-rotation).
+    /// For this node's own repo DID, materialize a fresh local DID document
+    /// from the live ES256 store with the exact verification-method builder
+    /// used by the production HTTP DID document, then run it through
+    /// `atproto_verifying_key_from_did_document`. This proves the direct local
+    /// path is schema- and key-equivalent to the published document rather than
+    /// bypassing its authority-hygiene checks. For foreign DIDs, return
+    /// `Ok(None)` and let placement ingest fail closed. did:web HTTPS / did:plc
+    /// directory resolution is deferred with the cross-process work in #1123.
     async fn resolve_verifying_key(
         &self,
         did: &str,
@@ -1413,7 +1537,21 @@ impl RecordResolver for PdsRecordResolver {
         if did != node_did.as_str() {
             return Ok(None);
         }
-        Ok(store.active_key().map(|sk| *sk.verifying_key()))
+        let active_key = store.active_key().ok_or_else(|| {
+            anyhow!("local DID {did} has no active ES256 #atproto verification key")
+        })?;
+        let document = serde_json::json!({
+            "id": did,
+            "verificationMethod": [
+                crate::services::oauth::did_document::atproto_verification_method(
+                    did,
+                    active_key.verifying_key(),
+                )
+            ],
+        });
+        hyprstream_pds::commit::atproto_verifying_key_from_did_document(&document, did)
+            .map(Some)
+            .context("locally materialized #atproto DID document failed validation")
     }
 }
 
@@ -1576,6 +1714,120 @@ mod pds_store_tests {
         commit
             .verify(&vk)
             .expect("writer-signed commit must verify against the published #atproto key");
+    }
+
+    /// #918 production-path rotation re-sign: publish with K, run the real
+    /// lead→active promotion (which invokes the installed publisher hook),
+    /// then assert the STORED head verifies under K' while the un-re-signed
+    /// control does not.
+    #[tokio::test]
+    async fn rotation_resigns_stored_head_with_new_key() {
+        use crate::auth::key_rotation::{
+            rotate_es256_keys, Es256KeySlot, Es256KeySlots, Es256SigningKeyStore,
+        };
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pds_dir = dir.path().join("pds");
+        let secrets_dir = dir.path().join("secrets");
+        std::fs::create_dir_all(&secrets_dir).expect("create secrets dir");
+        let now = chrono::Utc::now().timestamp();
+        let old_sk = SigningKey::random(&mut rand::rngs::OsRng);
+        let old_vk: VerifyingKey = *old_sk.verifying_key();
+        let new_sk = SigningKey::random(&mut rand::rngs::OsRng);
+        let new_vk: VerifyingKey = *new_sk.verifying_key();
+
+        let store = Arc::new(PdsRecordStore::open(&pds_dir).expect("open rw"));
+        // Capture the pre-rotation commit for the control assertion.
+        let es256_store = Arc::new(Es256SigningKeyStore::new(Es256KeySlots {
+            drain: None,
+            active: Some(Es256KeySlot::new(old_sk, now - 100, now + 1)),
+            lead: Some(Es256KeySlot::new(new_sk, now - 1, now + 30 * 86_400)),
+        }));
+        let publisher = Arc::new(PdsPublisher::new(
+            Arc::clone(&store),
+            DID.to_owned(),
+            Arc::clone(&es256_store),
+        ));
+        publisher
+            .install_es256_promotion_hook()
+            .expect("install promotion hook");
+        publisher.publish("repo-a", SAMPLE_OID).expect("publish");
+        let pre_rotation_commit = store
+            .load_repo(DID)
+            .expect("load")
+            .expect("repo present")
+            .commit;
+
+        // Run the production promotion function. Its in-store notification
+        // invokes PdsPublisher::resign_head; the test does not call it directly.
+        let promoted = rotate_es256_keys(
+            &crate::config::OAuthConfig::default(),
+            &secrets_dir,
+            &es256_store,
+            now,
+        )
+        .await;
+        assert!(promoted, "the prepared lead key must be promoted");
+
+        // The STORED head now verifies under K' (the current active key).
+        let post_rotation_commit = store
+            .load_repo(DID)
+            .expect("load")
+            .expect("repo present")
+            .commit;
+        assert_eq!(
+            post_rotation_commit.rev, pre_rotation_commit.rev,
+            "rev unchanged"
+        );
+        assert_eq!(
+            post_rotation_commit.data, pre_rotation_commit.data,
+            "MST root unchanged"
+        );
+        assert_eq!(
+            post_rotation_commit.unsigned().to_dag_cbor(),
+            pre_rotation_commit.unsigned().to_dag_cbor(),
+            "rotation must re-sign the exact same canonical unsigned DAG-CBOR bytes"
+        );
+        assert_ne!(
+            post_rotation_commit.sig, pre_rotation_commit.sig,
+            "signature must differ (re-signed with K')"
+        );
+        post_rotation_commit
+            .verify(&new_vk)
+            .expect("re-signed head must verify under K' (the new active key)");
+
+        // Control: the pre-rotation head (signed by K) does NOT verify under K'.
+        assert!(
+            pre_rotation_commit.verify(&new_vk).is_err(),
+            "the un-re-signed head must fail under K'"
+        );
+        // And the re-signed head does NOT verify under K (the old key).
+        assert!(
+            post_rotation_commit.verify(&old_vk).is_err(),
+            "the re-signed head must fail under K (the old key)"
+        );
+    }
+
+    #[test]
+    fn local_verifier_round_trips_through_published_did_document_shape() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sk = SigningKey::random(&mut rand::rngs::OsRng);
+        let expected = *sk.verifying_key();
+        let es256_store = test_es256_store(sk);
+        let resolver =
+            PdsRecordResolver::new(Arc::new(PdsRecordStore::open(dir.path()).expect("open rw")))
+                .with_es256_rotation(es256_store, DID.to_owned());
+
+        let resolved = block_on(resolver.resolve_verifying_key(DID))
+            .expect("local DID document validates")
+            .expect("local key resolves");
+        assert_eq!(resolved, expected);
+        assert!(
+            block_on(resolver.resolve_verifying_key("did:web:foreign.example"))
+                .expect("foreign resolution is unsupported")
+                .is_none(),
+            "foreign DID resolution stays unsupported so ingest can fail closed"
+        );
     }
 
     #[test]
