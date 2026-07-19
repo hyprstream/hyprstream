@@ -67,6 +67,22 @@ pub const GET_REPO_CONCURRENCY: usize = 4;
 // RepoSnapshot + XrpcRepoStore
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// The four XRPC read-slice route declarations, as a sub-`Router` parameterised
+/// over `Arc<OAuthState>`. This is the single source of truth for the XRPC route
+/// table — `oauth::create_app` merges it conditionally on `xrpc_read_slice`,
+/// and tests mount it directly. Changing the URI or handler here changes both.
+pub fn xrpc_routes() -> axum::Router<Arc<OAuthState>> {
+    use axum::routing::get;
+    axum::Router::new()
+        .route(
+            "/xrpc/com.atproto.identity.resolveHandle",
+            get(resolve_handle),
+        )
+        .route("/xrpc/com.atproto.repo.describeRepo", get(describe_repo))
+        .route("/xrpc/com.atproto.repo.getRecord", get(get_record))
+        .route("/xrpc/com.atproto.sync.getRepo", get(get_repo))
+}
+
 /// An in-memory snapshot of one repo's signed state — enough to answer the
 /// public read slice (`describeRepo` / `getRecord` / `sync.getRepo`).
 #[derive(Clone, Debug)]
@@ -815,21 +831,18 @@ mod tests {
     use crate::services::{DiscoveryClient, PolicyClient};
     use axum::body::Body;
     use axum::http::Request as HttpRequest;
-    use axum::routing::get;
     use axum::Router;
     use tower::ServiceExt; // oneshot
 
-    /// Build a real XRPC router backed by a real OAuthState. PolicyClient and
-    /// DiscoveryClient point at nonexistent sockets — XRPC handlers never call
-    /// them. Both a public and a private snapshot are seeded.
-    async fn build_xrpc_router() -> Router {
+    /// Build a real OAuthState with dummy PolicyClient/DiscoveryClient (LazyUdsTransport
+    /// pointing at /dev/null — never opened). Seeds a public + private snapshot.
+    async fn build_test_state(xrpc_enabled: bool) -> Arc<OAuthState> {
         use hyprstream_rpc::rpc_client::RpcClientImpl;
         use hyprstream_rpc::signer::LocalSigner;
         use hyprstream_rpc::transport::lazy_uds::LazyUdsTransport;
 
         let key = ed25519_dalek::SigningKey::from_bytes(&[0x76; 32]);
         let vk = ed25519_dalek::SigningKey::from_bytes(&[0x73; 32]).verifying_key();
-        // Dummy socket paths — never opened (XRPC handlers never call policy/discovery).
         let dummy = std::path::PathBuf::from("/dev/null/xrpc-test.sock");
 
         let mk_client = || {
@@ -841,22 +854,18 @@ mod tests {
             .with_response_verify_policy(hyprstream_rpc::crypto::CryptoPolicy::Classical);
             Arc::new(rpc)
         };
-        let policy_client = PolicyClient::new(mk_client());
-        let discovery_client = DiscoveryClient::new(mk_client());
 
         let mut config = OAuthConfig::default();
-        config.xrpc_read_slice = true;
-        // external_url so issuer_url() produces a usable authority.
+        config.xrpc_read_slice = xrpc_enabled;
         config.external_url = Some("https://h.example.com".to_owned());
 
         let state = Arc::new(OAuthState::new(
             &config,
-            policy_client,
-            discovery_client,
+            PolicyClient::new(mk_client()),
+            DiscoveryClient::new(mk_client()),
             [0x76; 32],
         ));
 
-        // Seed snapshots.
         state
             .xrpc_repos
             .put(sample_snapshot("did:web:pub.example.com", "pub.example.com", true))
@@ -865,16 +874,44 @@ mod tests {
             .xrpc_repos
             .put(sample_snapshot("did:web:priv.example.com", "priv.example.com", false))
             .await;
+        state
+    }
 
-        Router::new()
-            .route(
-                "/xrpc/com.atproto.identity.resolveHandle",
-                get(resolve_handle),
-            )
-            .route("/xrpc/com.atproto.repo.describeRepo", get(describe_repo))
-            .route("/xrpc/com.atproto.repo.getRecord", get(get_record))
-            .route("/xrpc/com.atproto.sync.getRepo", get(get_repo))
-            .with_state(state)
+    /// Build a router using the PRODUCTION `xrpc_routes()` function — the same
+    /// route table `create_app` merges when the feature gate is enabled.
+    async fn build_xrpc_router() -> Router {
+        super::xrpc_routes().with_state(build_test_state(true).await)
+    }
+
+    /// Like `sample_snapshot` but with a fixed TID so the rkey/CID are deterministic.
+    fn sample_snapshot_fixed_tid(did: &str, handle: &str, public: bool) -> RepoSnapshot {
+        let mut snap = sample_snapshot(did, handle, public);
+        // Rebuild with a fixed TID for deterministic rkey.
+        let signing = p256::ecdsa::SigningKey::random(&mut OsRng);
+        let vk = VerifyingKey::from(&signing);
+        let repo_at_uri = format!("at://{did}");
+        let rec = ModelRecord::new(
+            &repo_at_uri,
+            "bafyreiexamplecurrentoid000000000000000000000000000a",
+            "2026-07-19T00:00:00.000Z",
+        )
+        .expect("valid record");
+        let fixed_tid = Tid::from_micros(1_700_000_000_000_000, 1);
+        let mut record_cids: BTreeMap<Tid, Cid> = BTreeMap::new();
+        record_cids.insert(fixed_tid, rec.cid());
+        let mut records: BTreeMap<Tid, ModelRecord> = BTreeMap::new();
+        records.insert(fixed_tid, rec);
+        let tree = Node::from_records(HOSTED_COLLECTION, &record_cids);
+        let (_root_data, node_blocks) = tree.to_node_data_with_blocks();
+        let root_cid = tree.root_cid();
+        use hyprstream_pds::commit::UnsignedCommit;
+        let unsigned = UnsignedCommit::new(did.to_owned(), root_cid, Tid::now(), None);
+        let commit = Commit::sign(&unsigned, &signing);
+        snap.commit = commit;
+        snap.node_blocks = node_blocks;
+        snap.records = records;
+        snap.atproto_vk = vk;
+        snap
     }
 
     async fn resp_json(resp: axum::response::Response) -> Value {
@@ -1085,5 +1122,100 @@ mod tests {
             .await
             .unwrap();
         assert!(!bytes.is_empty());
+    }
+
+    // ── Finding 1: feature-gate test through the production router ─────────────
+
+    #[tokio::test]
+    async fn router_feature_gate_false_returns_404() {
+        // Build the production create_app with xrpc_read_slice = false.
+        // XRPC routes must not be mounted — requests return 404.
+        use crate::config::server::CorsConfig;
+        let state = build_test_state(false).await;
+        let cors = CorsConfig {
+            enabled: false,
+            ..Default::default()
+        };
+        let app = crate::services::oauth::create_app(state, &cors);
+        let resp = app
+            .clone()
+            .oneshot(req("/xrpc/com.atproto.sync.getRepo?did=did:web:pub.example.com"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+        // All four endpoints should 404.
+        let resp = app
+            .clone()
+            .oneshot(req("/xrpc/com.atproto.repo.describeRepo?repo=did:web:pub.example.com"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    // ── Finding 2: routed CID match/mismatch + malformed query ─────────────────
+
+    #[tokio::test]
+    async fn router_get_record_cid_match_returns_record() {
+        let state = build_test_state(true).await;
+        let snap = sample_snapshot_fixed_tid("did:web:fixed.example.com", "fixed.example.com", true);
+        let rkey = snap.records.keys().next().unwrap().encode();
+        let cid = snap.records.values().next().unwrap().cid().to_string();
+        state.xrpc_repos.put(snap).await;
+        let app = super::xrpc_routes().with_state(state);
+        let uri = format!(
+            "/xrpc/com.atproto.repo.getRecord?repo=did:web:fixed.example.com\
+             &collection={HOSTED_COLLECTION}&rkey={rkey}&cid={cid}"
+        );
+        let resp = app.oneshot(req(&uri)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp_json(resp).await;
+        assert_eq!(body["cid"], cid);
+        assert_eq!(body["value"]["$type"], HOSTED_COLLECTION);
+    }
+
+    #[tokio::test]
+    async fn router_get_record_cid_mismatch_returns_record_not_found() {
+        let state = build_test_state(true).await;
+        let snap = sample_snapshot_fixed_tid("did:web:fixed.example.com", "fixed.example.com", true);
+        let rkey = snap.records.keys().next().unwrap().encode();
+        state.xrpc_repos.put(snap).await;
+        let app = super::xrpc_routes().with_state(state);
+        let uri = format!(
+            "/xrpc/com.atproto.repo.getRecord?repo=did:web:fixed.example.com\
+             &collection={HOSTED_COLLECTION}&rkey={rkey}\
+             &cid=bafyreiwrongcid000000000000000000000000000000000000"
+        );
+        let resp = app.oneshot(req(&uri)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = resp_json(resp).await;
+        assert_eq!(body["error"], errors::RECORD_NOT_FOUND);
+        assert!(
+            body["message"].as_str().unwrap().contains("does not match cid"),
+            "message must explain the cid mismatch: {}",
+            body["message"]
+        );
+    }
+
+    #[tokio::test]
+    async fn router_malformed_query_empty_repo() {
+        let app = build_xrpc_router().await;
+        // ?repo= — empty value at the wrapper boundary.
+        let resp = app
+            .clone()
+            .oneshot(req(
+                "/xrpc/com.atproto.repo.getRecord?repo=\
+                 &collection=ai.hyprstream.model&rkey=abc",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = resp_json(resp).await;
+        assert_eq!(body["error"], errors::INVALID_REQUEST);
+        assert!(
+            body["message"].as_str().unwrap().contains("repo"),
+            "message must mention repo: {}",
+            body["message"]
+        );
     }
 }
