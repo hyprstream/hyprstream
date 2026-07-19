@@ -25,7 +25,7 @@
 //! present-and-empty). The verifier re-encodes the unsigned form and checks the
 //! signature against the DID's published `#atproto` P-256 verifying key.
 
-use anyhow::{ensure, Result};
+use anyhow::{anyhow, bail, ensure, Result};
 use p256::ecdsa::{signature::Signer, Signature, SigningKey, VerifyingKey};
 use sha2::{Digest, Sha256};
 
@@ -251,57 +251,35 @@ impl Commit {
     /// Rotation-tolerant commit verification — the trust-chain fix for #918.
     ///
     /// Accepts the commit if its ES256 signature verifies under **any one** of
-    /// the supplied `#atproto` P-256 verifying keys. `keys` is the set of
-    /// currently-published verification methods for the account DID — under the
-    /// drain-slot design, that is the active slot plus any drain slot(s) the
-    /// DID document still advertises (and optionally the lead slot once it is
-    /// `nbf`-valid). Verification fails closed if the slice is empty or no key
-    /// verifies.
+    /// the `#atproto` slots in `keys` whose `[nbf, exp]` validity window covers
+    /// `now`. `keys` is the bounded, typed [`RotationKeySet`] constructed from
+    /// the resolved DID document (or the authoritative rotation store that
+    /// produced it) — never an arbitrary caller-supplied list of bare keys.
     ///
-    /// # Why this design (drain-slot publication), and not the alternative
+    /// # Why a typed bounded set, not bare keys
     ///
-    /// Issue #918 lists two candidate fixes:
-    ///
-    /// 1. **Drain-slot publication** *(chosen)* — publish the drain (and lead)
-    ///    ES256 slots as additional `#atproto`-style verification methods in
-    ///    the DID document, and have the verifier accept any currently-
-    ///    published slot. This is exactly what this method implements on the
-    ///    verifier side. It keeps verification **fail-closed** (an empty slot
-    ///    set, or a signature under no published slot, is rejected — never a
-    ///    silent fallback), and it preserves commits byte-for-byte: history is
-    ///    not rewritten, and a historical commit keeps verifying as long as
-    ///    its signing key remains in the bounded drain window, then stops
-    ///    verifying loudly once the slot is dropped. The drain window is
-    ///    bounded by the ES256 store's `drain_secs` policy, so the accepted
-    ///    key set is small and time-limited.
-    /// 2. **Re-sign on rotation** *(rejected)* — when the active ES256 key
-    ///    rotates, walk every stored commit and re-sign it with the new active
-    ///    key. This rewrites persisted history invisibly: a commit CID a
-    ///    consumer recorded at time *T* no longer matches the served commit at
-    ///    *T+1*, and the rotation task becomes coupled to the PDS store. It
-    ///    also silently changes the trust root of historical commits rather
-    ///    than letting the drain window expire them. We reject it for the same
-    ///    reasons `PdsPublisher` rejects read-side re-signing: the signed
-    ///    mutable pointer is written once, at publish time, and serves verbatim.
+    /// A bare-`VerifyingKey` iterator would let a caller pass a cached or stale
+    /// drain key and accept commits forged by a long-compromised
+    /// rotated-out private key forever, or a lead key before its `nbf`. The
+    /// validity window is therefore carried *on the slot* and enforced **inside
+    /// this call**: only slots whose window covers `now` are even tried, and a
+    /// slot whose `exp` has passed (or whose `nbf` is still in the future) is
+    /// rejected by construction. The set is also capped at
+    /// [`RotationKeySet::MAX_SLOTS`] so a malicious/buggy DID document cannot
+    /// flood the verifier. See [`RotationKeySet`] for the construction contract.
     ///
     /// # Fail-closed contract
     ///
-    /// - `keys` empty → `Err` (no authoritative key was supplied; the verifier
-    ///   refuses to accept a signature it cannot bind to a published slot).
-    /// - No supplied key verifies → `Err` (the last attempted key's error is
-    ///   surfaced; the commit is untrusted).
-    /// - At least one verifies → `Ok(())`.
-    ///
-    /// The caller is responsible for bounding `keys` to the published slots;
-    /// this method does not enforce a count or time window itself — the
-    /// authoritative bound is "what the resolved DID document advertises."
-    pub fn verify_against_keys<'a, I>(&self, keys: I) -> Result<()>
-    where
-        I: IntoIterator<Item = &'a VerifyingKey>,
-    {
+    /// - `keys` has no slot whose window covers `now` (empty set, all expired,
+    ///   or all pre-`nbf`) → `Err`. The verifier refuses to accept a signature
+    ///   it cannot bind to at least one currently-live authoritative slot.
+    /// - At least one live slot verifies → `Ok(())`.
+    /// - Live slot(s) but none verify → `Err` (the last attempted slot's
+    ///   signature error is surfaced; the commit is untrusted).
+    pub fn verify_against_keys(&self, keys: &RotationKeySet, now: i64) -> Result<()> {
         let mut count = 0usize;
         let mut last_err: Option<anyhow::Error> = None;
-        for vk in keys {
+        for vk in keys.live_slots(now) {
             count += 1;
             match self.verify(vk) {
                 Ok(()) => return Ok(()),
@@ -310,13 +288,14 @@ impl Commit {
         }
         match last_err {
             Some(e) => Err(e.context(format!(
-                "ES256 signature verified under none of the {count} published #atproto slot(s)"
+                "ES256 signature verified under none of the {count} live #atproto slot(s) at now={now}"
             ))),
-            // Empty key set: fail closed — never accept a signature we cannot
-            // bind to at least one currently-published verifying key.
-            None => anyhow::bail!(
-                "rotation-tolerant verify called with no #atproto verifying keys \
-                 — refusing to verify without an authoritative slot set"
+            // No slot was live at `now` (empty set, all expired, or all
+            // pre-nbf): fail closed — never accept a signature we cannot bind
+            // to at least one currently-live authoritative slot.
+            None => bail!(
+                "no #atproto slot in the published set is live at now={now} \
+                 — refusing to verify without a currently-valid authoritative slot"
             ),
         }
     }
@@ -330,6 +309,272 @@ impl Commit {
     pub fn unsigned_digest(unsigned: &UnsignedCommit) -> [u8; 32] {
         Sha256::digest(unsigned.to_dag_cbor()).into()
     }
+}
+
+// ============================================================================
+// RotationKeySet — the bounded, typed #atproto slot set (#918)
+// ============================================================================
+
+/// A single `#atproto` verification slot: a P-256 verifying key plus the unix-
+/// second `[nbf, exp]` validity window it is authoritative for.
+///
+/// Constructed only inside [`RotationKeySet`]; the window is enforced at
+/// verify time by [`Commit::verify_against_keys`].
+#[derive(Clone, Debug)]
+pub struct RotationKeySlot {
+    pub vk: VerifyingKey,
+    pub nbf: i64,
+    pub exp: i64,
+}
+
+impl RotationKeySlot {
+    /// A slot authoritative for the whole of time (the default for the active
+    /// `#atproto` key, whose window the DID document does not bound).
+    pub const UNBOUNDED_NBF: i64 = i64::MIN;
+    pub const UNBOUNDED_EXP: i64 = i64::MAX;
+
+    /// Build a slot with an explicit `[nbf, exp]` window (unix seconds,
+    /// inclusive on both ends).
+    pub fn new(vk: VerifyingKey, nbf: i64, exp: i64) -> Self {
+        Self { vk, nbf, exp }
+    }
+
+    /// Build an (active-slot-style) unbounded slot.
+    pub fn unbounded(vk: VerifyingKey) -> Self {
+        Self {
+            vk,
+            nbf: Self::UNBOUNDED_NBF,
+            exp: Self::UNBOUNDED_EXP,
+        }
+    }
+
+    /// Whether this slot's window covers `now` (inclusive on both ends).
+    pub fn is_live_at(&self, now: i64) -> bool {
+        now >= self.nbf && now <= self.exp
+    }
+}
+
+/// Absolute ceiling on the number of slots a [`RotationKeySet`] will carry.
+///
+/// A resolved DID document advertising more `#atproto`-family verification
+/// methods than this is treated as malformed (the producer publishes at most
+/// two: `#atproto` + `#atproto-drain`); the cap exists so a malicious or
+/// buggy document cannot flood the verifier.
+pub const ROTATION_MAX_SLOTS: usize = 8;
+
+/// The bounded, typed set of `#atproto` verification slots a verifier accepts
+/// commits under at a given instant — the rotation-survivable trust root for
+/// #918.
+///
+/// `RotationKeySet` is constructed **only** from an authoritative source:
+/// either a resolved DID document ([`RotationKeySet::from_did_document`]) or,
+/// for tests, an explicit slot list ([`RotationKeySet::testing_from_slots`]).
+/// It never accepts a bare, unbounded caller-supplied iterator of keys, and
+/// [`Commit::verify_against_keys`] enforces each slot's `[nbf, exp]` window at
+/// verify time so a cached/stale drain key cannot accept commits forged after
+/// its expiry, nor a lead key before its `nbf`.
+///
+/// # Design: drain-slot publication (chosen), not re-sign-on-rotation
+///
+/// Issue #918 lists two candidate fixes:
+///
+/// 1. **Drain-slot publication** *(chosen)* — publish the drain (and lead)
+///    ES256 slots as additional `#atproto`-style verification methods in the
+///    DID document, and have the verifier accept any currently-published slot
+///    whose window is live. This keeps verification fail-closed, preserves
+///    commits byte-for-byte (history is not rewritten), and bounds the
+///    accepted key set by the ES256 store's `drain_secs` window.
+/// 2. **Re-sign on rotation** *(rejected)* — when the active ES256 key
+///    rotates, walk every stored commit and re-sign it with the new active
+///    key. This rewrites persisted history invisibly (a commit CID recorded at
+///    *T* no longer matches the served commit at *T+1*) and couples the
+///    rotation task to the PDS store. The signed mutable pointer stays
+///    write-once at publish time; the drain window expires old slots loudly.
+#[derive(Clone, Debug)]
+pub struct RotationKeySet {
+    slots: Vec<RotationKeySlot>,
+}
+
+impl RotationKeySet {
+    /// Maximum number of slots a set will carry (see [`ROTATION_MAX_SLOTS`]).
+    pub const MAX_SLOTS: usize = ROTATION_MAX_SLOTS;
+
+    /// Construct the key set from a resolved DID document.
+    ///
+    /// Picks the `#atproto` (active) and `#atproto-drain` (drain) verification
+    /// methods out of `doc.verificationMethod`, decodes each `publicKeyMultibase`
+    /// as a P-256 `Multikey` (multibase `z` + base58btc + multicodec `p256-pub`
+    /// `0x80 0x24` + compressed SEC1), and reads the drain slot's `nbf`/`exp`
+    /// unix-second bounds. The active `#atproto` slot is unbounded (its window
+    /// is not carried in the document); `#atproto-drain` MUST carry `nbf`/`exp`
+    /// — a drain slot without explicit bounds is rejected, because an unbounded
+    /// drain key is exactly the stale-key-forever failure this type prevents.
+    ///
+    /// Fails closed (returns `Err`) if the document shape is not a DID
+    /// document, the `#atproto` method is absent or malformed, the drain
+    /// method's Multikey/bounds are malformed, or the slot count would exceed
+    /// [`MAX_SLOTS`]. An empty result (no `#atproto` method) is also an error:
+    /// the verifier refuses to construct a set with no authoritative slot.
+    pub fn from_did_document(doc: &serde_json::Value) -> Result<Self> {
+        let vms = doc
+            .get("verificationMethod")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| anyhow!("DID document has no verificationMethod array"))?;
+        let mut slots: Vec<RotationKeySlot> = Vec::new();
+        // The active #atproto slot. First match wins (the producer emits it
+        // first; a duplicate is a malformed document).
+        let atproto = vms
+            .iter()
+            .find(|vm| vm.get("id").and_then(serde_json::Value::as_str) == Some("#atproto")
+                || vm
+                    .get("id")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|s| s.ends_with("#atproto")))
+            .ok_or_else(|| anyhow!("DID document has no #atproto verification method"))?;
+        let atproto_vk = decode_p256_multibase_vm(atproto, "#atproto")?;
+        // The active `#atproto` slot defaults to unbounded (atproto does not
+        // publish its window), BUT if the DID document advertises explicit
+        // `nbf`/`exp` on it, honor them — the verifier enforces whatever the
+        // authoritative document publishes.
+        let atproto_slot = match (
+            atproto.get("nbf").and_then(serde_json::Value::as_i64),
+            atproto.get("exp").and_then(serde_json::Value::as_i64),
+        ) {
+            (Some(nbf), Some(exp)) => {
+                ensure!(
+                    exp >= nbf,
+                    "#atproto slot has inverted window: nbf={nbf} exp={exp}"
+                );
+                RotationKeySlot::new(atproto_vk, nbf, exp)
+            }
+            (None, None) => RotationKeySlot::unbounded(atproto_vk),
+            _ => bail!(
+                "#atproto slot must carry both `nbf` and `exp`, or neither (partial bounds rejected)"
+            ),
+        };
+        slots.push(atproto_slot);
+        // The optional #atproto-drain slot, bounded by explicit nbf/exp.
+        for vm in vms {
+            let Some(id) = vm.get("id").and_then(serde_json::Value::as_str) else {
+                continue;
+            };
+            if !(id == "#atproto-drain" || id.ends_with("#atproto-drain")) {
+                continue;
+            }
+            let vk = decode_p256_multibase_vm(vm, "#atproto-drain")?;
+            let nbf = vm
+                .get("nbf")
+                .and_then(serde_json::Value::as_i64)
+                .ok_or_else(|| anyhow!("#atproto-drain slot must carry integer `nbf` bounds"))?;
+            let exp = vm
+                .get("exp")
+                .and_then(serde_json::Value::as_i64)
+                .ok_or_else(|| anyhow!("#atproto-drain slot must carry integer `exp` bounds"))?;
+            ensure!(
+                exp >= nbf,
+                "#atproto-drain slot has inverted window: nbf={nbf} exp={exp}"
+            );
+            slots.push(RotationKeySlot::new(vk, nbf, exp));
+        }
+        Self::from_slots_inner(slots)
+    }
+
+    /// Infallible single-slot constructor for an unbounded active `#atproto`
+    /// key — the shape a caller wants when it has resolved a single pinned key
+    /// (e.g. the [`super::super`] consumer's `resolve_verifying_key` fallback)
+    /// and needs to feed the rotation-tolerant verifier. Equivalent to
+    /// `testing_from_slots(vec![RotationKeySlot::unbounded(vk)])` but cannot
+    /// fail (a single unbounded slot satisfies both the non-empty and cap
+    /// invariants).
+    pub fn single_unbounded(vk: VerifyingKey) -> Self {
+        Self {
+            slots: vec![RotationKeySlot::unbounded(vk)],
+        }
+    }
+
+    /// Test/trusted-only constructor from explicit slots.
+    ///
+    /// **Not for production use:** the caller vouches that `slots` came from a
+    /// resolved DID document or the authoritative rotation store. Production
+    /// code must construct the set via [`RotationKeySet::from_did_document`]
+    /// (or a rotation-store bridge that round-trips through the document) so
+    /// the producer-side publication and the verifier see the same authoritative
+    /// slot set. The `testing_` prefix is the gate.
+    pub fn testing_from_slots(slots: Vec<RotationKeySlot>) -> Result<Self> {
+        Self::from_slots_inner(slots)
+    }
+
+    fn from_slots_inner(slots: Vec<RotationKeySlot>) -> Result<Self> {
+        ensure!(
+            !slots.is_empty(),
+            "a RotationKeySet must carry at least one #atproto slot"
+        );
+        ensure!(
+            slots.len() <= Self::MAX_SLOTS,
+            "rotation key set has {} slots, exceeding the cap of {}",
+            slots.len(),
+            Self::MAX_SLOTS
+        );
+        Ok(Self { slots })
+    }
+
+    /// Number of slots in the set (regardless of whether they are live now).
+    pub fn len(&self) -> usize {
+        self.slots.len()
+    }
+
+    /// Whether the set carries zero slots. (Construction forbids empty, but
+    /// callers may want a defensive check after resolution.)
+    pub fn is_empty(&self) -> bool {
+        self.slots.is_empty()
+    }
+
+    /// Iterate the verifying keys whose `[nbf, exp]` window covers `now`.
+    ///
+    /// This is the live-at-`now` filter [`Commit::verify_against_keys`] applies
+    /// before attempting any signature, so an expired drain key or a pre-`nbf`
+    /// lead key is never consulted.
+    pub fn live_slots(&self, now: i64) -> impl Iterator<Item = &VerifyingKey> {
+        self.slots.iter().filter_map(move |s| {
+            if s.is_live_at(now) {
+                Some(&s.vk)
+            } else {
+                None
+            }
+        })
+    }
+}
+
+/// Decode a `publicKeyMultibase` (multibase `z` + base58btc + multicodec
+/// `p256-pub` `0x80 0x24` + 33-byte compressed SEC1) into a P-256 verifying
+/// key, with the multicodec prefix checked.
+///
+/// `label` is the verification-method id suffix (`#atproto` / `#atproto-drain`)
+/// used in error messages; the caller already matched it.
+fn decode_p256_multibase_vm(vm: &serde_json::Value, label: &str) -> Result<VerifyingKey> {
+    const P256_PUB_MULTICODEC: [u8; 2] = [0x80, 0x24];
+    let mb = vm
+        .get("publicKeyMultibase")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow!("{label} verification method has no publicKeyMultibase string"))?;
+    ensure!(
+        mb.starts_with('z'),
+        "{label} publicKeyMultibase must be multibase 'z' (base58btc)"
+    );
+    let payload = bs58::decode(&mb[1..])
+        .into_vec()
+        .map_err(|e| anyhow!("{label} publicKeyMultibase is not valid base58btc: {e}"))?;
+    ensure!(
+        payload.len() == 2 + 33,
+        "{label} publicKeyMultibase payload is {} bytes, expected 35 (multicodec + compressed SEC1)",
+        payload.len()
+    );
+    ensure!(
+        payload[0] == P256_PUB_MULTICODEC[0] && payload[1] == P256_PUB_MULTICODEC[1],
+        "{label} publicKeyMultibase has wrong multicodec prefix (not p256-pub 0x1200)"
+    );
+    VerifyingKey::from_sec1_bytes(&payload[2..])
+        .map_err(|e| anyhow!("{label} publicKeyMultibase SEC1 point invalid: {e}"))
 }
 
 #[cfg(test)]
@@ -426,13 +671,15 @@ mod tests {
     // ── #918: rotation-survivable verification ───────────────────────────────
 
     /// A commit signed by a since-rotated-out key must still verify against the
-    /// published slot set (active + drain) — the drain-slot design.
+    /// published slot set (active + drain) while the drain window is live —
+    /// the drain-slot design.
     #[test]
-    fn commit_verify_survives_key_rotation() {
+    fn commit_verify_survives_key_rotation_within_drain_window() {
         let (commit, original_vk) = make_signed_commit();
         // The active key rotates: a brand-new key replaces it.
         let new_signing = SigningKey::random(&mut rand::rngs::OsRng);
         let new_vk = VerifyingKey::from(&new_signing);
+        let now = 10_000;
 
         // Single-key verify against the *new* (current DID document) key fails —
         // this is the #918 regression: the historical commit looks untrusted.
@@ -441,38 +688,89 @@ mod tests {
             "historical commit must not verify under the rotated-in key alone"
         );
 
-        // Rotation-tolerant verify against the published slot set {drain=old,
-        // active=new} succeeds — drain-slot publication.
-        let published_slots = [&new_vk, &original_vk];
+        // Drain window covers `now`: active=new (unbounded), drain=old [0, 20000].
+        let set = RotationKeySet::testing_from_slots(vec![
+            RotationKeySlot::unbounded(new_vk),
+            RotationKeySlot::new(original_vk, 0, 20_000),
+        ])
+        .unwrap();
         commit
-            .verify_against_keys(published_slots.iter().copied())
-            .expect("commit signed by a published drain slot must verify");
+            .verify_against_keys(&set, now)
+            .expect("commit signed by a live drain slot must verify");
+    }
+
+    /// Same commit AFTER the drain window has expired must fail: the expired
+    /// drain key is filtered out by `live_slots(now)` and only the rotated-in
+    /// active key remains live, under which the historical commit does not
+    /// verify.
+    #[test]
+    fn commit_verify_fails_after_drain_expiry() {
+        let (commit, original_vk) = make_signed_commit();
+        let new_vk = VerifyingKey::from(&SigningKey::random(&mut rand::rngs::OsRng));
+        // Drain window [0, 20000]; `now` is past expiry.
+        let set = RotationKeySet::testing_from_slots(vec![
+            RotationKeySlot::unbounded(new_vk),
+            RotationKeySlot::new(original_vk, 0, 20_000),
+        ])
+        .unwrap();
+        let err = commit
+            .verify_against_keys(&set, 30_000)
+            .expect_err("expired drain key must not be consulted");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("none of the") || msg.contains("live"),
+            "expiry error should name the live-slot filter, got: {msg}"
+        );
+    }
+
+    /// A drain slot whose `nbf` is still in the future must not be consulted
+    /// either (the lead-key-before-nbf case).
+    #[test]
+    fn commit_verify_fails_before_nbf() {
+        let (commit, original_vk) = make_signed_commit();
+        let set = RotationKeySet::testing_from_slots(vec![
+            // The only live slot is the pre-nbf drain key; active is a random
+            // (non-signing) key whose window is also pre-nbf, so no slot is
+            // live at `now`.
+            RotationKeySlot::new(original_vk, 100_000, 200_000),
+        ])
+        .unwrap();
+        let err = commit
+            .verify_against_keys(&set, 50_000)
+            .expect_err("pre-nbf slot must not be consulted");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("no #atproto slot"),
+            "pre-nbf error should explain no live slot, got: {msg}"
+        );
     }
 
     /// A genuinely bad signature must still fail under rotation-tolerant verify.
     #[test]
     fn commit_verify_against_keys_rejects_bad_signature() {
         let (commit, _original_vk) = make_signed_commit();
-        // Two unrelated keys the commit was never signed by.
+        // Two unrelated keys the commit was never signed by, both live.
         let a = VerifyingKey::from(&SigningKey::random(&mut rand::rngs::OsRng));
         let b = VerifyingKey::from(&SigningKey::random(&mut rand::rngs::OsRng));
+        let set = RotationKeySet::testing_from_slots(vec![
+            RotationKeySlot::unbounded(a),
+            RotationKeySlot::unbounded(b),
+        ])
+        .unwrap();
         assert!(
-            commit.verify_against_keys([&a, &b]).is_err(),
+            commit.verify_against_keys(&set, 0).is_err(),
             "a signature under no published slot must fail, not silently fall back"
         );
     }
 
-    /// An empty published-slot set fails closed — never accept a signature we
-    /// cannot bind to at least one authoritative key.
+    /// Construction with zero slots is refused — the set can never be empty.
     #[test]
-    fn commit_verify_against_keys_fails_closed_on_empty() {
-        let (commit, _vk) = make_signed_commit();
-        let err = commit
-            .verify_against_keys(std::iter::empty::<&VerifyingKey>())
-            .expect_err("empty key set must fail closed");
+    fn rotation_key_set_rejects_empty() {
+        let err = RotationKeySet::testing_from_slots(vec![])
+            .expect_err("empty slot set must fail construction");
         let msg = format!("{err}");
         assert!(
-            msg.contains("no #atproto verifying keys"),
+            msg.contains("at least one #atproto slot"),
             "empty-set error should explain fail-closed reason, got: {msg}"
         );
     }
@@ -483,12 +781,104 @@ mod tests {
         let (mut commit, original_vk) = make_signed_commit();
         let new_vk = VerifyingKey::from(&SigningKey::random(&mut rand::rngs::OsRng));
         commit.data = Cid::from_dag_cbor(b"tampered");
-        let published_slots = [&new_vk, &original_vk];
+        let set = RotationKeySet::testing_from_slots(vec![
+            RotationKeySlot::unbounded(new_vk),
+            RotationKeySlot::unbounded(original_vk),
+        ])
+        .unwrap();
         assert!(
-            commit
-                .verify_against_keys(published_slots.iter().copied())
-                .is_err(),
+            commit.verify_against_keys(&set, 0).is_err(),
             "tampered commit must fail under every published slot"
+        );
+    }
+
+    /// Helper: encode a P-256 verifying key as the multibase `z` + base58btc +
+    /// multicodec `p256-pub` (`0x80 0x24`) + compressed SEC1 string the DID
+    /// document producer emits — mirrors `did_document::p256_to_multibase`.
+    fn p256_to_multibase(vk: &VerifyingKey) -> String {
+        use p256::EncodedPoint;
+        let point: EncodedPoint = vk.to_encoded_point(true);
+        let mut payload = vec![0x80, 0x24];
+        payload.extend_from_slice(point.as_bytes());
+        format!("z{}", bs58::encode(payload).into_string())
+    }
+
+    /// `RotationKeySet::from_did_document` parses the producer's DID-document
+    /// shape (active `#atproto` + bounded `#atproto-drain`) and the resulting
+    /// set verifies a drained-key commit within the window. This is the
+    /// parser-level round-trip; the producer/consumer round-trip lives in the
+    /// `hyprstream` / `hyprstream-discovery` integration tests.
+    #[test]
+    fn rotation_key_set_from_did_document_round_trip() {
+        let (commit, drain_vk) = make_signed_commit();
+        let active_vk = VerifyingKey::from(&SigningKey::random(&mut rand::rngs::OsRng));
+        let did = "did:web:alice.example.com";
+        let doc = serde_json::json!({
+            "@context": ["https://www.w3.org/ns/did/v1"],
+            "id": did,
+            "verificationMethod": [
+                {
+                    "id": format!("{did}#atproto"),
+                    "type": "Multikey",
+                    "controller": did,
+                    "publicKeyMultibase": p256_to_multibase(&active_vk),
+                },
+                {
+                    "id": format!("{did}#atproto-drain"),
+                    "type": "Multikey",
+                    "controller": did,
+                    "publicKeyMultibase": p256_to_multibase(&drain_vk),
+                    "nbf": 0,
+                    "exp": 20_000,
+                },
+            ],
+        });
+        let set = RotationKeySet::from_did_document(&doc).expect("parse");
+        // Within the drain window: drained-key commit verifies.
+        commit
+            .verify_against_keys(&set, 10_000)
+            .expect("drained-key commit verifies within the drain window");
+        // After expiry: drain slot filtered out, only active (non-signing) key
+        // live → historical commit fails.
+        assert!(
+            commit.verify_against_keys(&set, 30_000).is_err(),
+            "after drain expiry the historical commit must fail"
+        );
+    }
+
+    /// A `#atproto-drain` slot without explicit `nbf`/`exp` is rejected — an
+    /// unbounded drain key is exactly the stale-key-forever failure this type
+    /// exists to prevent.
+    #[test]
+    fn rotation_key_set_rejects_unbounded_drain() {
+        let (commit, drain_vk) = make_signed_commit();
+        let active_vk = VerifyingKey::from(&SigningKey::random(&mut rand::rngs::OsRng));
+        let did = "did:web:alice.example.com";
+        let doc = serde_json::json!({
+            "id": did,
+            "verificationMethod": [
+                {
+                    "id": format!("{did}#atproto"),
+                    "type": "Multikey",
+                    "controller": did,
+                    "publicKeyMultibase": p256_to_multibase(&active_vk),
+                },
+                {
+                    "id": format!("{did}#atproto-drain"),
+                    "type": "Multikey",
+                    "controller": did,
+                    "publicKeyMultibase": p256_to_multibase(&drain_vk),
+                    // No nbf/exp — must be rejected.
+                },
+            ],
+        });
+        let err =
+            RotationKeySet::from_did_document(&doc).expect_err("unbounded drain must be rejected");
+        let _ = commit;
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("`nbf`") || msg.contains("`exp`"),
+            "missing-bounds error should name nbf/exp, got: {msg}"
         );
     }
 }

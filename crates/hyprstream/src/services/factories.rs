@@ -1874,9 +1874,21 @@ fn create_discovery_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spaw
             .context("failed to open PDS record store (read-only)")?
             .with_at9p_deployment_verifier(at9p_acceptance_identity),
     );
-    let record_resolver = std::sync::Arc::new(crate::services::discovery::PdsRecordResolver::new(
-        pds_store,
-    ));
+    // #918 — wire the ES256 rotation store + node repo DID into the resolver so
+    // verified ingest survives a `#atproto` key rotation: it resolves the
+    // bounded slot set (active + unexpired drain) the writer signs with and the
+    // DID document publishes, instead of a single key that goes stale on
+    // rotation. Uses the same global store the rotation task and the writer
+    // share, so producer and consumer are pinned to one authoritative source.
+    let secrets_dir = crate::config::HyprConfig::resolve_secrets_dir()?;
+    let es256_store =
+        crate::auth::key_rotation::global_es256_key_store(&secrets_dir, &config.oauth);
+    let node_did =
+        hyprstream_rpc::did_key::ed25519_to_did_key(&ctx.verifying_key().to_bytes());
+    let record_resolver = std::sync::Arc::new(
+        crate::services::discovery::PdsRecordResolver::new(pds_store)
+            .with_es256_rotation(es256_store, node_did),
+    );
 
     let mut discovery_service = DiscoveryService::new(
         Arc::new(sk),

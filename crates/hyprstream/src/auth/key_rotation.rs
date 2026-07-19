@@ -1452,6 +1452,26 @@ impl Es256SigningKeyStore {
             .map(|s| Arc::clone(&s.key))
     }
 
+    /// The active slot (key + `nbf`/`exp` bounds), if present.
+    ///
+    /// The active key's bounds are the issuance window; commit verifiers treat
+    /// the active `#atproto` slot as unbounded (the DID document does not
+    /// publish its window). See [`Self::drain_slot`] for the bounded slot.
+    pub async fn active_slot(&self) -> Option<Es256KeySlot> {
+        self.0.read().await.active.clone()
+    }
+
+    /// The drain slot (key + `nbf`/`exp` bounds) — the previous active key,
+    /// still accepted for verification of commits signed before the rotation
+    /// until its `exp` passes (#918).
+    ///
+    /// Published as `#atproto-drain` in the DID document with explicit
+    /// `nbf`/`exp`; commit verifiers bound-check it inside
+    /// `Commit::verify_against_keys`. `None` outside a drain window.
+    pub async fn drain_slot(&self) -> Option<Es256KeySlot> {
+        self.0.read().await.drain.clone()
+    }
+
     pub async fn all_slots_snapshot(&self) -> Vec<Es256KeySlot> {
         self.0.read().await.all().into_iter().cloned().collect()
     }

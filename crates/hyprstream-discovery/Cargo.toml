@@ -67,12 +67,18 @@ rocksdb = "0.23"
 p256 = { workspace = true }
 rand = { workspace = true }
 tokio = { workspace = true }
+# Enable hyprstream-rpc's classical-policy test helpers (e.g. `SignedEnvelope::new_signed`,
+# `CryptoPolicy::Classical`) consumed by the discovery service announcement tests.
+hyprstream-rpc = { path = "../hyprstream-rpc", features = ["test-classical-policy"] }
 # #893 (at9p D1) — mint real hybrid-signed capsules for the resolver tests.
 hyprstream-crypto = { path = "../hyprstream-crypto" }
 # K4c (#787) — property tests for the placement→PodSpec map's no-widening invariant.
 proptest = { workspace = true }
 serde_yaml = { workspace = true }
 tempfile = { workspace = true }
+# #918 rotation tests build a RotationKeySet via a DID-document encode/decode
+# round-trip (p256 multibase encoding of #atproto / #atproto-drain VMs).
+bs58 = "0.5"
 
 [build-dependencies]
 capnpc = { workspace = true }

@@ -267,30 +267,28 @@ pub fn verify_record_proof(
     Ok(())
 }
 
-/// `verifyRecordProof` against the **full set** of currently-published
-/// `#atproto` P-256 verifying keys — the rotation-survivable form (#918).
+/// `verifyRecordProof` against the **bounded set** of currently-published
+/// `#atproto` P-256 verifying slots — the rotation-survivable form (#918).
 ///
 /// Identical to [`verify_record_proof`] except the commit signature is checked
 /// by [`Commit::verify_against_keys`]: the proof is accepted if the commit
-/// verifies under *any* of the supplied slot keys (active + drain, as
-/// advertised by the DID document), and fails closed if the set is empty or no
-/// key verifies. The MST path and record-CID checks are unchanged.
+/// verifies under *any* slot in `keys` whose `[nbf, exp]` window covers `now`,
+/// and fails closed if no slot is live or none verifies. The MST path and
+/// record-CID checks are unchanged.
 ///
 /// Use this whenever the verifier resolves keys from a DID document that
 /// rotates its `#atproto` ES256 slot; reserve the single-key
 /// [`verify_record_proof`] for callers that have already pinned one slot.
-pub fn verify_record_proof_against_keys<'a, I>(
+pub fn verify_record_proof_against_keys(
     commit: &Commit,
-    signing_keys: I,
+    keys: &crate::commit::RotationKeySet,
+    now: i64,
     path: &Proof,
     record: &ModelRecord,
-) -> Result<()>
-where
-    I: IntoIterator<Item = &'a VerifyingKey>,
-{
+) -> Result<()> {
     // (1) Commit signature — rotation-tolerant, fail-closed on empty/no-match.
     commit
-        .verify_against_keys(signing_keys)
+        .verify_against_keys(keys, now)
         .map_err(|e| anyhow!("commit signature: {e}"))?;
     // (2) + (3) MST path + record CID.
     let record_cid = record.cid();
@@ -432,10 +430,12 @@ mod tests {
     // ── #918: rotation-survivable verifyRecordProof ──────────────────────────
 
     /// A proof whose commit was signed by a since-rotated-out key must still
-    /// verify against the published slot set (active + drain) — the drain-slot
-    /// design applied to the full D5 untrusted-host check.
+    /// verify against the published slot set (active + drain) while the drain
+    /// window is live — the drain-slot design applied to the full D5
+    /// untrusted-host check.
     #[test]
     fn verify_record_proof_against_keys_survives_rotation() {
+        use crate::commit::{RotationKeySet, RotationKeySlot};
         let (original_vk, commit, tree, tid, record, _node_blocks) = fixture();
         let proof = tree.proof(record::COLLECTION_NSID, &tid).expect("proof");
 
@@ -449,39 +449,52 @@ mod tests {
             "historical proof must not verify under the rotated-in key alone"
         );
 
-        // Rotation-tolerant verify against {active=new, drain=old} succeeds.
-        let published_slots = [&new_vk, &original_vk];
-        verify_record_proof_against_keys(&commit, published_slots.iter().copied(), &proof, &record)
-            .expect("proof signed by a published drain slot must verify");
+        // Rotation-tolerant verify against {active=new, drain=old} within the
+        // drain window succeeds.
+        let set = RotationKeySet::testing_from_slots(vec![
+            RotationKeySlot::unbounded(new_vk),
+            RotationKeySlot::new(original_vk, 0, 20_000),
+        ])
+        .unwrap();
+        verify_record_proof_against_keys(&commit, &set, 10_000, &proof, &record)
+            .expect("proof signed by a live drain slot must verify");
     }
 
     /// A bad signature must still fail rotation-tolerant verifyRecordProof.
     #[test]
     fn verify_record_proof_against_keys_rejects_bad_signature() {
+        use crate::commit::{RotationKeySet, RotationKeySlot};
         let (_vk, commit, tree, tid, record, _node_blocks) = fixture();
         let proof = tree.proof(record::COLLECTION_NSID, &tid).expect("proof");
         let a = VerifyingKey::from(&SigningKey::random(&mut rand::rngs::OsRng));
         let b = VerifyingKey::from(&SigningKey::random(&mut rand::rngs::OsRng));
+        let set = RotationKeySet::testing_from_slots(vec![
+            RotationKeySlot::unbounded(a),
+            RotationKeySlot::unbounded(b),
+        ])
+        .unwrap();
         assert!(
-            verify_record_proof_against_keys(&commit, [&a, &b], &proof, &record).is_err(),
+            verify_record_proof_against_keys(&commit, &set, 0, &proof, &record).is_err(),
             "a proof whose commit signs under no published slot must fail"
         );
     }
 
-    /// Empty published-slot set fails closed for the full proof check too.
+    /// A proof whose only live drain slot has expired must fail the full proof
+    /// check (the drain window is enforced inside `verify_against_keys`).
     #[test]
-    fn verify_record_proof_against_keys_fails_closed_on_empty() {
-        let (_vk, commit, tree, tid, record, _node_blocks) = fixture();
+    fn verify_record_proof_against_keys_fails_after_drain_expiry() {
+        use crate::commit::{RotationKeySet, RotationKeySlot};
+        let (original_vk, commit, tree, tid, record, _node_blocks) = fixture();
         let proof = tree.proof(record::COLLECTION_NSID, &tid).expect("proof");
+        let new_vk = VerifyingKey::from(&SigningKey::random(&mut rand::rngs::OsRng));
+        let set = RotationKeySet::testing_from_slots(vec![
+            RotationKeySlot::unbounded(new_vk),
+            RotationKeySlot::new(original_vk, 0, 20_000),
+        ])
+        .unwrap();
         assert!(
-            verify_record_proof_against_keys(
-                &commit,
-                std::iter::empty::<&VerifyingKey>(),
-                &proof,
-                &record
-            )
-            .is_err(),
-            "empty slot set must fail closed, not silently accept"
+            verify_record_proof_against_keys(&commit, &set, 30_000, &proof, &record).is_err(),
+            "expired drain slot must not be consulted by the proof check"
         );
     }
 

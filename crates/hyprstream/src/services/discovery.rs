@@ -1253,11 +1253,36 @@ fn atproto_datetime_now() -> String {
 /// commit served in the proof is the one the writer signed at publish time.
 pub struct PdsRecordResolver {
     store: Arc<PdsRecordStore>,
+    /// The shared ES256 rotation store + this node's repo DID, so the resolver
+    /// can publish the bounded `#atproto` slot set (active + drain) it shares
+    /// with the writer and let verified ingest survive key rotation (#918).
+    /// `None` when the resolver was constructed without rotation visibility
+    /// (e.g. isolated tests); ingest then falls back to the trusted-resolver
+    /// posture.
+    rotation: Option<(Arc<crate::auth::key_rotation::Es256SigningKeyStore>, String)>,
 }
 
 impl PdsRecordResolver {
     pub fn new(store: Arc<PdsRecordStore>) -> Self {
-        Self { store }
+        Self {
+            store,
+            rotation: None,
+        }
+    }
+
+    /// Install the ES256 rotation store + this node's repo DID, enabling
+    /// rotation-survivable signature verification (#918): the resolver answers
+    /// `resolve_verifying_keys` with the bounded `#atproto` slot set the writer
+    /// signs with, so a commit signed by a since-rotated-out key still verifies
+    /// during the drain window. The store is the authoritative source; the
+    /// resolver reads only the slots' public verifying keys + bounds.
+    pub fn with_es256_rotation(
+        mut self,
+        store: Arc<crate::auth::key_rotation::Es256SigningKeyStore>,
+        node_did: String,
+    ) -> Self {
+        self.rotation = Some((store, node_did));
+        self
     }
 
     pub fn accepted_at9p_state(
@@ -1363,6 +1388,59 @@ impl RecordResolver for PdsRecordResolver {
 
         let uri = format!("at://{did}/{collection}/{}", tid.encode());
         Ok(Some(RecordCarData { uri, car }))
+    }
+
+    /// Resolve the bounded `#atproto` slot set for `did` from the shared ES256
+    /// rotation store — the authoritative source the writer signs with and the
+    /// DID-document producer publishes (#918).
+    ///
+    /// Only resolves for this node's own repo DID (single-node, self-hosted
+    /// PDS). Foreign-DID resolution over a real DID document fetch is the
+    /// future federation-hardening follow-up; until then foreign DIDs return
+    /// `Ok(None)` (trusted-resolver posture for the in-process resolver, which
+    /// only serves our own DIDs anyway).
+    ///
+    /// The set is built by encoding the active (+ optional drain) slot's
+    /// *public* verifying keys + bounds into the same `verificationMethod`
+    /// shape the DID document advertises, then parsing it back via
+    /// `RotationKeySet::from_did_document` — the producer/consumer round-trip
+    /// that pins both sides to one source of truth.
+    async fn resolve_verifying_keys(
+        &self,
+        did: &str,
+    ) -> anyhow::Result<Option<hyprstream_pds::commit::RotationKeySet>> {
+        use p256::ecdsa::VerifyingKey;
+
+        let Some((store, node_did)) = self.rotation.as_ref() else {
+            return Ok(None);
+        };
+        if did != node_did.as_str() {
+            // Not our repo — let the caller fall back to the trusted-resolver
+            // posture (this resolver only serves our own DIDs today).
+            return Ok(None);
+        }
+        let active = store.active_slot().await;
+        let drain = store.drain_slot().await;
+        let Some(active_slot) = active else {
+            // No #atproto key material available — decline rather than
+            // construct an empty set (which would fail-closed at verify time).
+            return Ok(None);
+        };
+        let active_vk = active_slot.key.verifying_key();
+        // p256 `SigningKey::verifying_key()` returns `&VerifyingKey` (it is
+        // stored in the signing key), so the drain tuple is built from borrowed
+        // verifying keys into the helper that takes `Option<(&VerifyingKey, ..)>`.
+        let drain_ref: Option<(&VerifyingKey, i64, i64)> = drain
+            .as_ref()
+            .map(|d| (d.key.verifying_key(), d.nbf, d.exp));
+        let vms = crate::services::oauth::did_document::atproto_verification_methods(
+            did,
+            active_vk,
+            drain_ref,
+        );
+        let doc = serde_json::json!({ "verificationMethod": vms });
+        let set = hyprstream_pds::commit::RotationKeySet::from_did_document(&doc)?;
+        Ok(Some(set))
     }
 }
 

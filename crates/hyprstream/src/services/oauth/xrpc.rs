@@ -139,6 +139,7 @@ impl RepoSnapshot {
         let atproto = AtprotoIdentity {
             p256_vk: &self.atproto_vk,
             handle: &self.handle,
+            drain: None,
         };
         build_did_document(&self.did, issuer_url, &[], Some(&atproto), &[], None, None)
     }

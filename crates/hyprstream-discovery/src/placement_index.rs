@@ -65,7 +65,6 @@
 use std::collections::{HashMap, HashSet};
 
 use anyhow::{anyhow, ensure, Result};
-use p256::ecdsa::VerifyingKey;
 use parking_lot::RwLock;
 
 use hyprstream_pds::car::parse_car_v1;
@@ -176,19 +175,40 @@ impl PlacementIndex {
             self.clear_did(did);
             return Ok(());
         };
-        let verify_key = match resolver.resolve_verifying_key(did).await {
-            Ok(key) => key,
+        // Resolve the authoritative #atproto slot set, preferring the
+        // rotation-survivable bounded seam (#918). Fall back to the single-key
+        // seam (treated as an unbounded active slot) for resolvers that have
+        // not upgraded; `None` keeps the trusted-resolver posture.
+        let verify_keys = match resolver.resolve_verifying_keys(did).await {
+            Ok(keys) => keys,
             Err(e) => {
                 self.clear_did(did);
-                return Err(anyhow!("resolve_verifying_key({did}) failed: {e}"));
+                return Err(anyhow!("resolve_verifying_keys({did}) failed: {e}"));
             }
         };
-        // Decode (and, when a key is available, signature-verify) the CAR
+        let verify_keys = match verify_keys {
+            Some(set) => Some(set),
+            None => match resolver.resolve_verifying_key(did).await {
+                // Single-key fallback: treat the resolved key as a one-slot
+                // unbounded active set (no rotation window). The active slot
+                // cannot exceed the cap, so construction is infallible.
+                Ok(Some(vk)) => {
+                    Some(hyprstream_pds::commit::RotationKeySet::single_unbounded(vk))
+                }
+                Ok(None) => None,
+                Err(e) => {
+                    self.clear_did(did);
+                    return Err(anyhow!("resolve_verifying_key({did}) failed: {e}"));
+                }
+            },
+        };
+        // Decode (and, when a key set is available, signature-verify) the CAR
         // *before* touching the index. A verification failure leaves the index
         // untouched for this DID and surfaces as an error — the previous
         // contribution, if any, is cleared so stale facts can't survive a poll
         // that now fails to verify.
-        let snapshot = match Self::decode_repo_car(did, &repo.car, verify_key.as_ref()) {
+        let now = chrono::Utc::now().timestamp();
+        let snapshot = match Self::decode_repo_car(did, &repo.car, verify_keys.as_ref(), now) {
             Ok(snap) => snap,
             Err(e) => {
                 self.clear_did(did);
@@ -210,9 +230,11 @@ impl PlacementIndex {
     /// Parse a repo CARv1 blob and decode every `ai.hyprstream.placement.*`
     /// record reachable from the commit's MST root into a [`DidSnapshot`].
     ///
-    /// Every CAR block is content-bound to its declared CID. When `verify_key`
+    /// Every CAR block is content-bound to its declared CID. When `verify_keys`
     /// is `Some`, the CAR's commit signature is additionally verified against
-    /// it (the verified-by-construction gate of #932). The commit
+    /// it via `Commit::verify_against_keys` (the verified-by-construction gate
+    /// of #932, made rotation-survivable by #918): the commit is accepted under
+    /// any `#atproto` slot whose `[nbf, exp]` window covers `now`. The commit
     /// block, each MST node, and each record block have their CID recomputed
     /// from their bytes and checked against the CID the CAR/parent declared for
     /// them before they are trusted (mirrors `hyprstream_pds::mst::Proof::verify`,
@@ -226,7 +248,8 @@ impl PlacementIndex {
     fn decode_repo_car(
         did: &str,
         car: &[u8],
-        verify_key: Option<&VerifyingKey>,
+        verify_keys: Option<&hyprstream_pds::commit::RotationKeySet>,
+        now: i64,
     ) -> Result<DidSnapshot> {
         let (roots, blocks) = parse_car_v1(car)?;
         ensure!(
@@ -250,15 +273,17 @@ impl PlacementIndex {
             .ok_or_else(|| anyhow!("repo CAR for {did} missing its commit block"))?;
         let commit = Commit::from_dag_cbor(commit_bytes)?;
         // A validly-signed repo for DID A must not be replayable under DID B:
-        // even a commit whose signature verifies under the presented key is
+        // even a commit whose signature verifies under the presented key set is
         // refused if its `did` is not the one we were asked to ingest.
         ensure!(
             commit.did == did,
             "repo CAR for {did} carries a commit for a different DID {}",
             commit.did
         );
-        if let Some(vk) = verify_key {
-            commit.verify(vk).map_err(|e| {
+        if let Some(keys) = verify_keys {
+            // Rotation-survivable verification (#918): accept the commit under
+            // any #atproto slot whose [nbf, exp] window covers `now`.
+            commit.verify_against_keys(keys, now).map_err(|e| {
                 anyhow!("repo CAR for {did} failed commit-signature verification: {e}")
             })?;
         }
@@ -579,6 +604,16 @@ mod tests {
     /// resolver can hand it to the verified-by-construction ingest gate).
     fn repo_car(did: &str, records: &[(String, Vec<u8>)]) -> (Vec<u8>, P256VerifyingKey) {
         let signing_key = P256SigningKey::random(&mut rand::rngs::OsRng);
+        repo_car_with_key(did, records, signing_key)
+    }
+
+    /// Like [`repo_car`] but signs the commit with a caller-supplied key — used
+    /// by the #918 rotation tests to sign with a now-drained key.
+    fn repo_car_with_key(
+        did: &str,
+        records: &[(String, Vec<u8>)],
+        signing_key: P256SigningKey,
+    ) -> (Vec<u8>, P256VerifyingKey) {
         let verifying_key = P256VerifyingKey::from(&signing_key);
         let mut keyed: BTreeMap<String, Cid> = BTreeMap::new();
         let mut record_blocks: Vec<(Cid, Vec<u8>)> = Vec::new();
@@ -599,6 +634,81 @@ mod tests {
         }
         blocks.extend(record_blocks);
         (build_car_v1(&[commit.cid()], &blocks), verifying_key)
+    }
+
+    /// Encode a P-256 verifying key as multibase `z` + base58btc + multicodec
+    /// `p256-pub` (`0x80 0x24`) + compressed SEC1 — mirrors the DID-document
+    /// producer's `p256_to_multibase`, so the #918 tests can build a real
+    /// `RotationKeySet` via `from_did_document` (the producer/consumer
+    /// round-trip) instead of hand-built slot arrays.
+    fn p256_to_multibase(vk: &P256VerifyingKey) -> String {
+        use p256::EncodedPoint;
+        let point: EncodedPoint = vk.to_encoded_point(true);
+        let mut payload = vec![0x80, 0x24];
+        payload.extend_from_slice(point.as_bytes());
+        format!("z{}", bs58::encode(payload).into_string())
+    }
+
+    /// Build a `RotationKeySet` the way the producer publishes it: encode the
+    /// active (+ optional bounded drain) `#atproto` verification methods into a
+    /// DID-document fragment and parse it back with `from_did_document`. The
+    /// drain slot carries explicit `nbf`/`exp` (unix seconds); `None` drain
+    /// publishes the active key alone.
+    fn rotation_key_set(
+        did: &str,
+        active_vk: &P256VerifyingKey,
+        drain: Option<(&P256VerifyingKey, i64, i64)>,
+    ) -> hyprstream_pds::commit::RotationKeySet {
+        let mut vms = vec![serde_json::json!({
+            "id": format!("{did}#atproto"),
+            "type": "Multikey",
+            "controller": did,
+            "publicKeyMultibase": p256_to_multibase(active_vk),
+        })];
+        if let Some((vk, nbf, exp)) = drain {
+            vms.push(serde_json::json!({
+                "id": format!("{did}#atproto-drain"),
+                "type": "Multikey",
+                "controller": did,
+                "publicKeyMultibase": p256_to_multibase(vk),
+                "nbf": nbf,
+                "exp": exp,
+            }));
+        }
+        let doc = serde_json::json!({ "verificationMethod": vms });
+        hyprstream_pds::commit::RotationKeySet::from_did_document(&doc)
+            .expect("test DID-document fragment must parse into a RotationKeySet")
+    }
+
+    /// A resolver that serves fixed per-DID repo CARs and a `RotationKeySet`
+    /// built via [`rotation_key_set`] — the wired, rotation-survivable
+    /// signature-verification seam (#918).
+    struct RotationResolver {
+        repos: HashMap<String, (Vec<u8>, hyprstream_pds::commit::RotationKeySet)>,
+    }
+
+    #[async_trait(?Send)]
+    impl RecordResolver for RotationResolver {
+        async fn resolve_record(
+            &self,
+            _did: &str,
+            _collection: &str,
+            _rkey: &str,
+        ) -> Result<Option<RecordCarData>> {
+            Ok(None)
+        }
+        async fn resolve_repo(&self, did: &str) -> Result<Option<RecordCarData>> {
+            Ok(self.repos.get(did).map(|(car, _)| RecordCarData {
+                uri: format!("at://{did}"),
+                car: car.clone(),
+            }))
+        }
+        async fn resolve_verifying_keys(
+            &self,
+            did: &str,
+        ) -> Result<Option<hyprstream_pds::commit::RotationKeySet>> {
+            Ok(self.repos.get(did).map(|(_, keys)| keys.clone()))
+        }
     }
 
     fn node_record_key(rkey: &str) -> String {
@@ -634,7 +744,7 @@ mod tests {
                 car: car.clone(),
             }))
         }
-        async fn resolve_verifying_key(&self, did: &str) -> Result<Option<VerifyingKey>> {
+        async fn resolve_verifying_key(&self, did: &str) -> Result<Option<P256VerifyingKey>> {
             Ok(self.repos.get(did).map(|(_car, vk)| *vk))
         }
     }
@@ -1121,15 +1231,180 @@ mod tests {
             )],
         );
         let (roots, blocks) = parse_car_v1(&car).unwrap();
+        // The structural checks below fail before signature verification, so a
+        // single unbounded slot is sufficient (mirrors the single-key posture).
+        let keys = hyprstream_pds::commit::RotationKeySet::testing_from_slots(vec![
+            hyprstream_pds::commit::RotationKeySlot::unbounded(vk),
+        ])
+        .unwrap();
 
         let duplicate = build_car_v1(&roots, &[blocks.clone(), blocks.clone()].concat());
-        assert!(PlacementIndex::decode_repo_car(NODE_DID, &duplicate, Some(&vk)).is_err());
+        assert!(PlacementIndex::decode_repo_car(NODE_DID, &duplicate, Some(&keys), 0).is_err());
 
         let multiple_roots = build_car_v1(&[roots[0], roots[0]], &blocks);
-        assert!(PlacementIndex::decode_repo_car(NODE_DID, &multiple_roots, Some(&vk)).is_err());
+        assert!(PlacementIndex::decode_repo_car(NODE_DID, &multiple_roots, Some(&keys), 0).is_err());
 
         let missing_record = build_car_v1(&roots, &blocks[..blocks.len() - 1]);
-        assert!(PlacementIndex::decode_repo_car(NODE_DID, &missing_record, Some(&vk)).is_err());
+        assert!(PlacementIndex::decode_repo_car(NODE_DID, &missing_record, Some(&keys), 0).is_err());
+    }
+
+    // ── #918: rotation-survivable ingest through the wired production path ────
+    //
+    // These exercise the real `PlacementIndex::ingest_did` → `decode_repo_car`
+    // → `Commit::verify_against_keys` boundary, with a resolver that returns a
+    // `RotationKeySet` built via a DID-document encode/decode round-trip (not a
+    // hand-built slot array). They are the end-to-end proof that a historical
+    // commit signed by a since-rotated-out `#atproto` key still verifies during
+    // the drain window, and that the window is actually enforced.
+
+    /// (a) A commit signed by the now-drained key verifies when the drain slot
+    /// is within its `[nbf, exp]` window — the core #918 fix.
+    #[tokio::test]
+    async fn drained_key_commit_verifies_within_drain_window() {
+        let now = chrono::Utc::now().timestamp();
+        let drain_signing = P256SigningKey::random(&mut rand::rngs::OsRng);
+        let drain_vk = P256VerifyingKey::from(&drain_signing);
+        let active_vk =
+            P256VerifyingKey::from(&P256SigningKey::random(&mut rand::rngs::OsRng));
+        let (car, _) = repo_car_with_key(
+            NODE_DID,
+            &[(node_record_key("r1"), sample_node_record(vec![]).to_dag_cbor())],
+            drain_signing,
+        );
+        let keys = rotation_key_set(NODE_DID, &active_vk, Some((&drain_vk, now - 100, now + 100)));
+        let resolver = RotationResolver {
+            repos: HashMap::from([(NODE_DID.to_owned(), (car, keys))]),
+        };
+        let index = PlacementIndex::new();
+        index
+            .ingest_did(&resolver, NODE_DID)
+            .await
+            .expect("a commit signed by a live drain key must ingest");
+        assert!(index.known_node_dids().contains(&NODE_DID.to_owned()));
+    }
+
+    /// (b) The same drained-key commit fails AFTER the drain window has
+    /// expired: the drain slot is filtered out by `live_slots(now)` and only
+    /// the (non-signing) active key remains live.
+    #[tokio::test]
+    async fn drained_key_commit_fails_after_drain_expiry() {
+        let now = chrono::Utc::now().timestamp();
+        let drain_signing = P256SigningKey::random(&mut rand::rngs::OsRng);
+        let drain_vk = P256VerifyingKey::from(&drain_signing);
+        let active_vk =
+            P256VerifyingKey::from(&P256SigningKey::random(&mut rand::rngs::OsRng));
+        let (car, _) = repo_car_with_key(
+            NODE_DID,
+            &[(node_record_key("r1"), sample_node_record(vec![]).to_dag_cbor())],
+            drain_signing,
+        );
+        // Drain window entirely in the past.
+        let keys = rotation_key_set(NODE_DID, &active_vk, Some((&drain_vk, now - 200, now - 100)));
+        let resolver = RotationResolver {
+            repos: HashMap::from([(NODE_DID.to_owned(), (car, keys))]),
+        };
+        let index = PlacementIndex::new();
+        assert!(
+            index.ingest_did(&resolver, NODE_DID).await.is_err(),
+            "after drain expiry the historical commit must fail verification"
+        );
+        assert!(index.known_node_dids().is_empty());
+    }
+
+    /// (c) A drain slot whose `nbf` is still in the future must not be
+    /// consulted either (the lead-key-before-nbf case).
+    #[tokio::test]
+    async fn drained_key_commit_fails_before_drain_nbf() {
+        let now = chrono::Utc::now().timestamp();
+        let drain_signing = P256SigningKey::random(&mut rand::rngs::OsRng);
+        let drain_vk = P256VerifyingKey::from(&drain_signing);
+        let active_vk =
+            P256VerifyingKey::from(&P256SigningKey::random(&mut rand::rngs::OsRng));
+        let (car, _) = repo_car_with_key(
+            NODE_DID,
+            &[(node_record_key("r1"), sample_node_record(vec![]).to_dag_cbor())],
+            drain_signing,
+        );
+        // Drain window entirely in the future.
+        let keys = rotation_key_set(NODE_DID, &active_vk, Some((&drain_vk, now + 100, now + 200)));
+        let resolver = RotationResolver {
+            repos: HashMap::from([(NODE_DID.to_owned(), (car, keys))]),
+        };
+        let index = PlacementIndex::new();
+        assert!(
+            index.ingest_did(&resolver, NODE_DID).await.is_err(),
+            "a pre-nbf drain slot must not be consulted"
+        );
+        assert!(index.known_node_dids().is_empty());
+    }
+
+    /// (d) When no published slot is live at `now` (active deliberately given a
+    /// past-expiry window so even it is filtered out), ingest fails closed —
+    /// never silently accepts.
+    #[tokio::test]
+    async fn ingest_fails_closed_when_no_slot_is_live() {
+        let now = chrono::Utc::now().timestamp();
+        let signing = P256SigningKey::random(&mut rand::rngs::OsRng);
+        let vk = P256VerifyingKey::from(&signing);
+        let (car, _) = repo_car_with_key(
+            NODE_DID,
+            &[(node_record_key("r1"), sample_node_record(vec![]).to_dag_cbor())],
+            signing,
+        );
+        // Active slot bounds set entirely in the past → no live slot at `now`.
+        // (Construction requires a #atproto entry; we publish the signing key as
+        // #atproto but with an expired window, then verify fails closed. The
+        // active slot honors explicit bounds when the DID document advertises
+        // them, matching what an authoritative publisher can emit.)
+        let doc = serde_json::json!({
+            "verificationMethod": [{
+                "id": format!("{NODE_DID}#atproto"),
+                "type": "Multikey",
+                "controller": NODE_DID,
+                "publicKeyMultibase": p256_to_multibase(&vk),
+                "nbf": now - 200,
+                "exp": now - 100,
+            }]
+        });
+        let keys = hyprstream_pds::commit::RotationKeySet::from_did_document(&doc)
+            .expect("active slot with explicit bounds still parses");
+        let resolver = RotationResolver {
+            repos: HashMap::from([(NODE_DID.to_owned(), (car, keys))]),
+        };
+        let index = PlacementIndex::new();
+        assert!(
+            index.ingest_did(&resolver, NODE_DID).await.is_err(),
+            "ingest must fail closed when no published slot is live"
+        );
+        assert!(index.known_node_dids().is_empty());
+    }
+
+    /// (e) A genuinely forged signature (commit signed by a key that is neither
+    /// the active nor the drain slot) must fail verification.
+    #[tokio::test]
+    async fn forged_signature_fails() {
+        let now = chrono::Utc::now().timestamp();
+        let forged_signing = P256SigningKey::random(&mut rand::rngs::OsRng);
+        let active_vk =
+            P256VerifyingKey::from(&P256SigningKey::random(&mut rand::rngs::OsRng));
+        let drain_vk =
+            P256VerifyingKey::from(&P256SigningKey::random(&mut rand::rngs::OsRng));
+        let (car, _) = repo_car_with_key(
+            NODE_DID,
+            &[(node_record_key("r1"), sample_node_record(vec![]).to_dag_cbor())],
+            forged_signing,
+        );
+        // Published set is {active, drain} — neither is the forged signer.
+        let keys = rotation_key_set(NODE_DID, &active_vk, Some((&drain_vk, now - 100, now + 100)));
+        let resolver = RotationResolver {
+            repos: HashMap::from([(NODE_DID.to_owned(), (car, keys))]),
+        };
+        let index = PlacementIndex::new();
+        assert!(
+            index.ingest_did(&resolver, NODE_DID).await.is_err(),
+            "a commit signed by no published slot must fail verification"
+        );
+        assert!(index.known_node_dids().is_empty());
     }
 
     #[test]

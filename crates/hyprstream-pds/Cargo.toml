@@ -28,6 +28,12 @@ parking_lot = { workspace = true }
 # Operator-visible duplicity alarms; the structured event is also exported by
 # the process tracing/OTel subscriber when configured.
 tracing = { workspace = true }
+# DID-document parsing for the bounded #atproto rotation key set (#918): a
+# `RotationKeySet` is constructed from the resolved DID document's
+# `verificationMethod` entries, so the trust-chain primitive decodes the
+# `#atproto` / `#atproto-drain` Multikeys (multibase z + base58btc) itself.
+serde_json = { workspace = true }
+bs58 = "0.5"
 # Note: DAG-CBOR + CIDv1 + varints are hand-rolled in src/dag_cbor.rs and
 # src/cid.rs to enforce the determinism invariants (sorted keys, minimal ints,
 # tag-42 links) that serde-driven CBOR cannot guarantee. No CBOR/CID crate dep.
@@ -39,7 +45,6 @@ proptest = { workspace = true }
 # at9p_resolver tests exercise the admission arm (admit_key_against_did) which is
 # generic over DidDocResolve — an async trait — against a never-call test double.
 async-trait = { workspace = true }
-serde_json = { workspace = true }
 
 # E1 (#421) end-to-end content-addressing + identity test. The dev-deps are the
 # three crates whose composition the test validates: git2db (repo → commit OID),
