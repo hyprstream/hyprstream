@@ -80,6 +80,45 @@ impl GittorrentStorage {
 }
 
 #[cfg(feature = "xet-storage")]
+impl GittorrentStorage {
+    /// Fetch reconstruction bytes for a Merkle hash without committing any
+    /// CID binding. The returned flag is `true` when the bytes did not come
+    /// from the already-validated local p2p store and should be persisted by
+    /// the caller only after end-to-end validation.
+    async fn fetch_from_hash(&self, hash: &merklehash::MerkleHash) -> Result<(Vec<u8>, bool)> {
+        let cid = hyprstream_p2p::ContentCid::xet_merkle(hash.as_bytes()).map_err(|e| {
+            XetError::new(
+                XetErrorKind::DownloadFailed,
+                format!("CID encoding failed: {e}"),
+            )
+        })?;
+
+        // Try P2P first
+        match self.service.get_object_by_cid(&cid).await {
+            Ok(Some(data)) => return Ok((data, false)),
+            Ok(None) => {
+                tracing::debug!("Object {} not found in DHT, trying fallback", hash);
+            }
+            Err(e) => {
+                tracing::warn!("DHT fetch failed for {}: {e}", hash);
+            }
+        }
+
+        // Fallback to HTTPS origin; caching is deferred to the caller until
+        // the pointer's size and SHA-256 checks pass.
+        if let Some(ref fb) = self.fallback {
+            let data = fb.smudge_from_hash(hash).await?;
+            return Ok((data, true));
+        }
+
+        Err(XetError::new(
+            XetErrorKind::DownloadFailed,
+            format!("Object {hash} not found in DHT or fallback"),
+        ))
+    }
+}
+
+#[cfg(feature = "xet-storage")]
 #[async_trait]
 impl super::storage::StorageBackend for GittorrentStorage {
     async fn clean_file(&self, path: &Path) -> Result<String> {
@@ -208,42 +247,6 @@ impl super::storage::StorageBackend for GittorrentStorage {
         // validate against, so fetched bytes are never committed to the p2p
         // plane on this path — only `smudge_bytes` caches, after validation.
         Ok(self.fetch_from_hash(hash).await?.0)
-    }
-
-    /// Fetch reconstruction bytes for a Merkle hash without committing any
-    /// CID binding. The returned flag is `true` when the bytes did not come
-    /// from the already-validated local p2p store and should be persisted by
-    /// the caller only after end-to-end validation.
-    async fn fetch_from_hash(&self, hash: &merklehash::MerkleHash) -> Result<(Vec<u8>, bool)> {
-        let cid = hyprstream_p2p::ContentCid::xet_merkle(hash.as_bytes()).map_err(|e| {
-            XetError::new(
-                XetErrorKind::DownloadFailed,
-                format!("CID encoding failed: {e}"),
-            )
-        })?;
-
-        // Try P2P first
-        match self.service.get_object_by_cid(&cid).await {
-            Ok(Some(data)) => return Ok((data, false)),
-            Ok(None) => {
-                tracing::debug!("Object {} not found in DHT, trying fallback", hash);
-            }
-            Err(e) => {
-                tracing::warn!("DHT fetch failed for {}: {e}", hash);
-            }
-        }
-
-        // Fallback to HTTPS origin; caching is deferred to the caller until
-        // the pointer's size and SHA-256 checks pass.
-        if let Some(ref fb) = self.fallback {
-            let data = fb.smudge_from_hash(hash).await?;
-            return Ok((data, true));
-        }
-
-        Err(XetError::new(
-            XetErrorKind::DownloadFailed,
-            format!("Object {hash} not found in DHT or fallback"),
-        ))
     }
 
     async fn smudge_from_hash_to_file(
