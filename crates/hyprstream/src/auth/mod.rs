@@ -587,10 +587,27 @@ mod tests {
         let all = Operation::all();
         // All 15 variants: 11 core + 4 mesh (#319). Regression guard for #1096 —
         // `all()` omitted 8 variants, so `check_all` could never report them.
-        assert_eq!(all.len(), 15);
-        assert!(all.contains(&Operation::Context));
-        assert!(all.contains(&Operation::Subscribe));
-        assert!(all.contains(&Operation::MeshStatus));
+        let expected = [
+            Operation::Infer,
+            Operation::Train,
+            Operation::Query,
+            Operation::Write,
+            Operation::Serve,
+            Operation::Manage,
+            Operation::Context,
+            Operation::Subscribe,
+            Operation::Create,
+            Operation::Publish,
+            Operation::Spawn,
+            Operation::MeshInvoke,
+            Operation::MeshStage,
+            Operation::MeshDelta,
+            Operation::MeshStatus,
+        ];
+        assert_eq!(all.len(), expected.len());
+        for op in expected {
+            assert!(all.contains(&op), "Operation::all() is missing {op:?}");
+        }
     }
 
     #[test]
