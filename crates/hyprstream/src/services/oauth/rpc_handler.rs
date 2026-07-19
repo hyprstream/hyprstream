@@ -173,6 +173,7 @@ impl OauthHandler for OAuthRpcHandler {
             email: data.email.as_ref().filter(|s| !s.is_empty()).map(|s| Some(s.clone())),
             external_id: data.external_id.as_ref().filter(|s| !s.is_empty()).map(|s| Some(s.clone())),
             email_verified: None,
+            atproto_did: None,
         };
         match svc.update(&data.username, update).await {
             Ok(info) => Ok(OauthResponseVariant::UpdateUserResult(Self::user_info_to_rpc(&info))),

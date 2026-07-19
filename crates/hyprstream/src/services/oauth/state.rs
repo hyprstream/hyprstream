@@ -270,6 +270,65 @@ mod tests {
         assert_eq!(err, SubjectDidError::MalformedDid);
     }
 
+    /// #1113 r5: a classical account WITH a mapped did:plc succeeds —
+    /// the mapped DID is returned (the positive success path).
+    #[test]
+    fn atproto_eligibility_mapped_did_plc_succeeds() {
+        use crate::auth::user_store::{KeyAlgorithm, PubkeyEntry, UserProfile};
+        let pubkeys = vec![PubkeyEntry {
+            fingerprint: "key1".into(),
+            pubkey: ed25519_dalek::VerifyingKey::from_bytes(&[1u8; 32]).unwrap(),
+            label: None,
+            created_at: 0,
+            last_used_at: None,
+            algorithm: KeyAlgorithm::Ed25519,
+            pq_pubkey: None,
+        }];
+        let mut profile = UserProfile::default();
+        profile.atproto_did = Some("did:plc:abcdefghijklmnqrstuvwx2p".into());
+        let did = evaluate_atproto_eligibility(&pubkeys, Some(&profile), "https://x").unwrap();
+        assert_eq!(did, "did:plc:abcdefghijklmnqrstuvwx2p");
+    }
+
+    /// #1113 r5: a classical account WITHOUT a mapping fails closed.
+    #[test]
+    fn atproto_eligibility_no_mapping_fails_closed() {
+        use crate::auth::user_store::{KeyAlgorithm, PubkeyEntry, UserProfile};
+        let pubkeys = vec![PubkeyEntry {
+            fingerprint: "key1".into(),
+            pubkey: ed25519_dalek::VerifyingKey::from_bytes(&[1u8; 32]).unwrap(),
+            label: None,
+            created_at: 0,
+            last_used_at: None,
+            algorithm: KeyAlgorithm::Ed25519,
+            pq_pubkey: None,
+        }];
+        let profile = UserProfile::default();
+        let err = evaluate_atproto_eligibility(&pubkeys, Some(&profile), "https://x").unwrap_err();
+        assert_eq!(err, SubjectDidError::NoAtprotoIdentity);
+    }
+
+    /// #1113 r5: an at9p-backed account is rejected from the atproto profile
+    /// — inspected via the key mapping, not the subject string.
+    #[test]
+    fn atproto_eligibility_at9p_account_rejected() {
+        use crate::auth::user_store::{KeyAlgorithm, PubkeyEntry, UserProfile};
+        let pubkeys = vec![PubkeyEntry {
+            fingerprint: "pq-key".into(),
+            pubkey: ed25519_dalek::VerifyingKey::from_bytes(&[1u8; 32]).unwrap(),
+            label: None,
+            created_at: 0,
+            last_used_at: None,
+            algorithm: KeyAlgorithm::HybridEd25519MlDsa65,
+            pq_pubkey: Some(vec![0u8; 1952]), // ML-DSA-65 public key bytes
+        }];
+        let mut profile = UserProfile::default();
+        // Even with a mapped DID, the at9p key algorithm rejects first.
+        profile.atproto_did = Some("did:plc:abcdefghijklmnqrstuvwx2p".into());
+        let err = evaluate_atproto_eligibility(&pubkeys, Some(&profile), "https://x").unwrap_err();
+        assert_eq!(err, SubjectDidError::At9pBackedAccount);
+    }
+
     /// #1113 rev2 finding 7: atproto profile activates only when `atproto` is
     /// in the granted set — device/generic flows without it stay non-atproto.
     #[test]
@@ -1066,32 +1125,36 @@ impl OAuthState {
     }
 
     /// Check whether an account is eligible for the atproto OAuth profile
-    /// (#1113 rev2 → #1124 split).
+    /// and return the account's mapped atproto DID (#1113 r5 / #1124 split).
     ///
     /// This inspects the ACCOUNT/KEY MAPPING, not the subject string:
     /// 1. Rejects at9p-backed accounts (any key with
     ///    [`KeyAlgorithm::HybridEd25519MlDsa65`] → [`SubjectDidError::At9pBackedAccount`]).
-    /// 2. Since hyprstream does not yet provision real atproto DIDs for its
-    ///    own accounts (#1124), an account without a mapped DID fails closed
+    /// 2. Looks up the account's MAPPED atproto DID from the profile's
+    ///    `atproto_did` field. If present and valid → returns it (success).
+    /// 3. An account without a mapped DID fails closed
     ///    ([`SubjectDidError::NoAtprotoIdentity`]).
     ///
-    /// When #1124 provisions DIDs, this method will be updated to check the
-    /// durable DID mapping and validate it via [`subject_did_for`].
+    /// PROVISIONING mappings (creating did:plc, etc.) is #1124 — out of scope.
+    /// The LOOKUP + success path exists here so the atproto OAuth profile can
+    /// emit the mapped DID as `sub` when an account has one.
     pub async fn check_atproto_account_eligibility(
         &self,
         username: &str,
     ) -> Result<String, SubjectDidError> {
-        // 1. Inspect the account's enrolled keys for at9p-backed enrollment.
-        if let Some(user_store) = self.user_store_reader() {
-            if let Ok(pubkeys) = user_store.list_pubkeys(username).await {
-                if pubkeys.iter().any(|pk| pk.algorithm.is_hybrid()) {
-                    return Err(SubjectDidError::At9pBackedAccount);
-                }
-            }
-        }
-        // 2. No mapped atproto DID exists for this account yet (#1124).
-        //    Fail closed — do not accept an arbitrary did:plc string as sub.
-        Err(SubjectDidError::NoAtprotoIdentity)
+        let user_store = self.user_store_reader().ok_or(SubjectDidError::NoAtprotoIdentity)?;
+
+        let pubkeys = user_store
+            .list_pubkeys(username)
+            .await
+            .unwrap_or_default();
+        let profile = user_store
+            .get_profile(username)
+            .await
+            .ok()
+            .flatten();
+
+        evaluate_atproto_eligibility(&pubkeys, profile.as_ref(), &self.issuer_url)
     }
 
     /// The full set of scopes this AS supports (#1113 rev2 F4).
@@ -1192,6 +1255,34 @@ impl OAuthState {
             }
         });
     }
+}
+
+/// Evaluate atproto account eligibility from the account's stored keys and
+/// profile (#1113 r5 / #1124 split). Free-function form so it is unit-testable
+/// without constructing an OAuthState or UserStore.
+///
+/// - at9p-backed account (any key with `HybridEd25519MlDsa65`) → reject.
+/// - account with a mapped `atproto_did` on its profile → validate and return.
+/// - account without a mapping → `NoAtprotoIdentity` (fail closed, #1124).
+pub fn evaluate_atproto_eligibility(
+    pubkeys: &[crate::auth::user_store::PubkeyEntry],
+    profile: Option<&crate::auth::user_store::UserProfile>,
+    issuer_url: &str,
+) -> Result<String, SubjectDidError> {
+    use crate::auth::user_store::KeyAlgorithm;
+
+    // 1. Reject at9p-backed accounts by inspecting the key algorithm.
+    if pubkeys.iter().any(|pk| pk.algorithm == KeyAlgorithm::HybridEd25519MlDsa65) {
+        return Err(SubjectDidError::At9pBackedAccount);
+    }
+
+    // 2. Look up the account's MAPPED atproto DID from the profile.
+    if let Some(did) = profile.and_then(|p| p.atproto_did.as_deref()) {
+        return subject_did_for(issuer_url, did);
+    }
+
+    // 3. No mapped atproto DID — fail closed.
+    Err(SubjectDidError::NoAtprotoIdentity)
 }
 
 /// Validate that a subject is a real, resolvable atproto account DID (#1113

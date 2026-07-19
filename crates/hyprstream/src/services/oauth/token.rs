@@ -823,27 +823,13 @@ async fn issue_token_with_refresh(
     //
     // atproto profile: the access token's `sub` MUST be the account's real
     // atproto DID. The eligibility check inspects the ACCOUNT/KEY MAPPING
-    // (not the subject string): at9p-backed accounts are rejected, and an
-    // account without a mapped atproto DID fails closed (#1124).
+    // (not the subject string): at9p-backed accounts are rejected; an account
+    // with a mapped atproto DID gets that DID as `sub`; an account without a
+    // mapped DID fails closed (#1124). The returned DID is already form-
+    // validated by evaluate_atproto_eligibility → subject_did_for.
     let jwt_sub = if atproto_profile {
         match state.check_atproto_account_eligibility(sub).await {
-            Ok(mapped_did) => {
-                // Future (#1124): the mapped DID is validated by subject_did_for
-                // to ensure it parses as a real atproto DID. Currently this path
-                // is unreachable — check_atproto_account_eligibility always
-                // returns Err(NoAtprotoIdentity) until provisioning lands.
-                match super::state::subject_did_for(&state.issuer_url, &mapped_did) {
-                    Ok(validated) => validated,
-                    Err(e) => {
-                        tracing::warn!(mapped_did = %mapped_did, error = %e, "mapped DID failed form validation");
-                        return token_error(
-                            StatusCode::BAD_REQUEST,
-                            "invalid_request",
-                            Some("account atproto DID failed validation"),
-                        );
-                    }
-                }
-            }
+            Ok(mapped_did) => mapped_did,
             Err(e) => {
                 tracing::warn!(local_subject = %sub, error = %e, "rejecting atproto token issuance: account not eligible");
                 return token_error(

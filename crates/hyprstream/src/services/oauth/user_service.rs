@@ -66,6 +66,8 @@ pub struct UserUpdate {
     pub email: Option<Option<String>>,
     pub email_verified: Option<bool>,
     pub external_id: Option<Option<String>>,
+    /// The account's mapped atproto DID (#1113 r5 / #1124 seam).
+    pub atproto_did: Option<Option<String>>,
 }
 
 /// Shared user CRUD service used by both SCIM HTTP and ZMQ RPC transports.
@@ -170,6 +172,7 @@ impl UserService {
             email_verified: Some(update.email_verified.unwrap_or_else(|| existing.email_verified.unwrap_or(false))),
             active: existing.active,
             external_id: update.external_id.unwrap_or(existing.external_id),
+            atproto_did: update.atproto_did.unwrap_or(existing.atproto_did),
         };
         self.store.set_profile(username, merged).await?;
 

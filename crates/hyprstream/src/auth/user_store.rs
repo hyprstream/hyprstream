@@ -29,6 +29,11 @@ pub struct UserProfile {
     /// External identity ID from upstream IdP (SCIM: externalId).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub external_id: Option<String>,
+    /// The account's mapped atproto DID (did:plc or host-form did:web), if
+    /// provisioned. PROVISIONING is tracked in #1124; the LOOKUP seam exists
+    /// here so the atproto OAuth profile can emit the mapped DID as `sub` (#1113 r5).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub atproto_did: Option<String>,
 }
 
 /// The public-key algorithm of a stored [`PubkeyEntry`].

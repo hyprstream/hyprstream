@@ -547,6 +547,7 @@ async fn provision_federated_user(
         email_verified: external_claims["email_verified"].as_bool(),
         active: Some(true),
         external_id: external_claims["sub"].as_str().map(str::to_owned),
+        atproto_did: None,
     };
     if let Err(e) = store.set_profile(subject, profile).await {
         tracing::warn!(subject = %subject, error = %e, "Failed to set profile for federated user");

@@ -100,6 +100,7 @@ impl UserStore for ValkeyUserStore {
             email_verified: new.email_verified.or(existing.email_verified),
             active: new.active.or(existing.active),
             external_id: new.external_id.or(existing.external_id),
+            atproto_did: new.atproto_did.or(existing.atproto_did),
         };
 
         // Write new externalId index.

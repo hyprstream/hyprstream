@@ -190,6 +190,7 @@ impl RocksDbUserStore {
                 None
             },
             external_id: text_or_none(ui.get_external_id()),
+            atproto_did: None,
         };
 
         // Deserialize pubkeys list
@@ -876,6 +877,7 @@ mod tests {
                 email_verified: Some(true),
                 active: Some(true),
                 external_id: Some("ext-123".to_owned()),
+                atproto_did: None,
             }).await?;
         }
         // Open a fresh store instance to verify persistence
