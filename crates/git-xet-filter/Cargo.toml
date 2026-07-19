@@ -55,6 +55,10 @@ tokio-test.workspace = true
 tracing-subscriber.workspace = true
 tempfile.workspace = true
 parking_lot.workspace = true
+# `testing` brings the in-memory mock object plane so the gittorrent
+# backend's regression tests can drive a real GitTorrentService with
+# deterministic provider behavior (no network).
+hyprstream-p2p = { path = "../hyprstream-p2p", features = ["testing"] }
 
 [features]
 default = ["xet-storage"]

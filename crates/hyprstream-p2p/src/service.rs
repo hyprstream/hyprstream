@@ -200,6 +200,30 @@ pub struct RepositoryMetadata {
     pub lfs_chunks: Vec<String>,
 }
 
+/// The bytes of an object fetched by CID, paired with their commit
+/// provenance so callers can decide whether persistence is safe.
+///
+/// `committed == true` means the bytes are already durable in the local
+/// validated store (the in-memory cache or the blob plane) or were
+/// self-verified against the CID and committed during this fetch — safe
+/// for the caller to treat as validated.
+///
+/// `committed == false` means the bytes were returned by a remote
+/// provider under a CID that cannot self-verify them (e.g. an XET Merkle
+/// CID, which addresses the reconstruction DAG rather than the raw file).
+/// The service deliberately does NOT commit such bytes (it cannot prove
+/// they match the CID); the caller MUST validate them end-to-end (e.g.
+/// pointer size + SHA-256) before persisting or treating them as
+/// committed. Conflating this case with `committed == true` lets
+/// unvalidated provider bytes leak past a caller's persistence gate.
+#[derive(Debug, Clone)]
+pub struct ObjectFetch {
+    /// The fetched object bytes.
+    pub data: Vec<u8>,
+    /// Whether the bytes are committed to the local validated store.
+    pub committed: bool,
+}
+
 /// Statistics about objects in a repository
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ObjectStats {
@@ -350,7 +374,7 @@ impl GitTorrentService {
         })
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "testing"))]
     async fn new_with_object_plane(
         config: GitTorrentConfig,
         locator: Arc<dyn ObjectLocator>,
@@ -391,19 +415,51 @@ impl GitTorrentService {
     }
 
     /// Get an object by its canonical content CID.
+    ///
+    /// Discards commit provenance. Callers that persist fetched bytes
+    /// (e.g. the XET smudge path, which must validate before persisting)
+    /// must use [`get_object_by_cid_with_provenance`] instead; treating a
+    /// provider-fetched, non-self-verifying result as already-validated
+    /// bypasses the caller's persistence gate.
     pub async fn get_object_by_cid(&self, cid: &ContentCid) -> Result<Option<Vec<u8>>> {
-        // Check local cache first
+        Ok(self
+            .get_object_by_cid_with_provenance(cid)
+            .await?
+            .map(|fetch| fetch.data))
+    }
+
+    /// Get an object by its canonical content CID, along with its commit
+    /// provenance.
+    ///
+    /// See [`ObjectFetch`] for the meaning of `committed`. The provenance
+    /// is structural: it is derived from which store produced the bytes
+    /// and whether the CID can self-verify them, never from a caller
+    /// assertion. A non-`committed` result must not be persisted without
+    /// end-to-end validation.
+    pub async fn get_object_by_cid_with_provenance(
+        &self,
+        cid: &ContentCid,
+    ) -> Result<Option<ObjectFetch>> {
+        // Check local cache first. The cache only ever holds committed
+        // bytes (see `put_object_by_cid` and the self-verifying provider
+        // path below), so a hit is committed by construction.
         {
             let cache = self.object_cache.read().await;
             if let Some(data) = cache.get(cid) {
-                return Ok(Some(data.clone()));
+                return Ok(Some(ObjectFetch {
+                    data: data.clone(),
+                    committed: true,
+                }));
             }
         }
 
         if let Some(data) = self.object_plane.blobs.get_object_by_cid(cid).await? {
             let mut cache = self.object_cache.write().await;
             cache.insert(cid.clone(), data.clone());
-            return Ok(Some(data));
+            return Ok(Some(ObjectFetch {
+                data,
+                committed: true,
+            }));
         }
 
         let rendezvous = locator_cid_from_content(cid);
@@ -428,7 +484,10 @@ impl GitTorrentService {
                 )
             );
             if !self_verifying {
-                return Ok(Some(data));
+                return Ok(Some(ObjectFetch {
+                    data,
+                    committed: false,
+                }));
             }
             self.object_plane
                 .blobs
@@ -436,7 +495,10 @@ impl GitTorrentService {
                 .await?;
             let mut cache = self.object_cache.write().await;
             cache.insert(cid.clone(), data.clone());
-            return Ok(Some(data));
+            return Ok(Some(ObjectFetch {
+                data,
+                committed: true,
+            }));
         }
 
         Ok(None)
@@ -862,22 +924,31 @@ impl GitTorrentService {
     }
 }
 
-#[cfg(test)]
-mod tests {
+/// Test infrastructure for downstream crates that need to exercise
+/// `GitTorrentService` against an in-memory, deterministic object plane.
+///
+/// Compiled under `cfg(test)` and the `testing` cargo feature. The mock
+/// store and fetcher simulate a remote provider advertising bytes; the
+/// service is the real production type, so provenance and persistence
+/// flow through the same code paths as in deployment.
+#[cfg(any(test, feature = "testing"))]
+pub mod testing {
     use super::*;
     use std::collections::HashMap as StdHashMap;
-    use std::net::{Ipv4Addr, SocketAddrV4};
-    use tempfile::TempDir;
     use tokio::sync::Mutex;
 
+    /// In-memory `ObjectLocator` that hands back whatever providers were
+    /// registered for a rendezvous CID. Never touches the network.
     #[derive(Default)]
-    struct MockObjectLocator {
+    pub struct MockObjectLocator {
         announcements: Mutex<Vec<(Cid512, Option<u16>)>>,
         providers: Mutex<StdHashMap<Cid512, Vec<PeerContact>>>,
     }
 
     impl MockObjectLocator {
-        async fn add_provider(&self, cid: Cid512, provider: PeerContact) {
+        /// Register a provider for a rendezvous CID, mirroring a BEP5
+        /// `get_peers` hit.
+        pub async fn add_provider(&self, cid: Cid512, provider: PeerContact) {
             self.providers
                 .lock()
                 .await
@@ -886,7 +957,21 @@ mod tests {
                 .push(provider);
         }
 
-        async fn announcements(&self) -> Vec<(Cid512, Option<u16>)> {
+        /// Convenience wrapper: register a provider for a content CID,
+        /// mapping it to its rendezvous CID the way the real mainline
+        /// locator would. Hides the private content→rendezvous mapping
+        /// from downstream test code.
+        pub async fn add_provider_for_content(
+            &self,
+            content_cid: &ContentCid,
+            provider: PeerContact,
+        ) {
+            self.add_provider(locator_cid_from_content(content_cid), provider)
+                .await;
+        }
+
+        /// Announcements recorded by `announce`, in insertion order.
+        pub async fn announcements(&self) -> Vec<(Cid512, Option<u16>)> {
             self.announcements.lock().await.clone()
         }
     }
@@ -909,20 +994,33 @@ mod tests {
         }
     }
 
+    /// In-memory `RemoteBlobFetcher` keyed by content CID. Simulates a
+    /// remote provider returning bytes (which may or may not match the
+    /// CID — the service cannot tell for non-self-verifying CIDs).
     #[derive(Default)]
-    struct MockBlobFetcher {
+    pub struct MockBlobFetcher {
         objects: Mutex<StdHashMap<ContentCid, Vec<u8>>>,
         calls: Mutex<usize>,
     }
 
     impl MockBlobFetcher {
-        async fn insert(&self, hash: Sha256Hash, data: Vec<u8>) -> Result<()> {
+        /// Insert a Git object keyed by its SHA-256 hash (self-verifying).
+        pub async fn insert(&self, hash: Sha256Hash, data: Vec<u8>) -> Result<()> {
             let cid = ContentCid::git_sha256(&hash)?;
             self.objects.lock().await.insert(cid, data);
             Ok(())
         }
 
-        async fn calls(&self) -> usize {
+        /// Insert raw bytes keyed by an arbitrary CID. Used to simulate a
+        /// provider returning bytes under a non-self-verifying CID (e.g.
+        /// an XET Merkle CID), which is the case the service must NOT
+        /// commit before caller validation.
+        pub async fn insert_raw(&self, cid: ContentCid, data: Vec<u8>) {
+            self.objects.lock().await.insert(cid, data);
+        }
+
+        /// Number of `fetch` invocations observed.
+        pub async fn calls(&self) -> usize {
             *self.calls.lock().await
         }
     }
@@ -939,7 +1037,9 @@ mod tests {
         }
     }
 
-    fn test_config(path: &Path) -> GitTorrentConfig {
+    /// Build a `GitTorrentConfig` whose storage lives under `path` and
+    /// whose auto-discovery is off, so tests never reach the network.
+    pub fn test_config(path: &std::path::Path) -> GitTorrentConfig {
         GitTorrentConfig {
             storage_dir: path.to_path_buf(),
             bootstrap_nodes: vec![],
@@ -947,6 +1047,29 @@ mod tests {
             ..Default::default()
         }
     }
+
+    /// Construct a real `GitTorrentService` backed by the supplied mocks.
+    ///
+    /// The private locator/fetcher trait bounds stay internal to this
+    /// module so downstream callers configure the service purely through
+    /// the public mock methods.
+    pub async fn new_service_with_mocks(
+        config: GitTorrentConfig,
+        locator: Arc<MockObjectLocator>,
+        fetcher: Arc<MockBlobFetcher>,
+    ) -> Result<GitTorrentService> {
+        GitTorrentService::new_with_object_plane(config, locator, fetcher).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::service::testing::{
+        new_service_with_mocks, test_config, MockBlobFetcher, MockObjectLocator,
+    };
+    use std::net::{Ipv4Addr, SocketAddrV4};
+    use tempfile::TempDir;
 
     #[tokio::test]
     async fn test_service_creation() -> crate::error::Result<()> {
@@ -1069,7 +1192,7 @@ mod tests {
         let temp_dir = TempDir::new()?;
         let locator = Arc::new(MockObjectLocator::default());
         let fetcher = Arc::new(MockBlobFetcher::default());
-        let service = GitTorrentService::new_with_object_plane(
+        let service = new_service_with_mocks(
             test_config(temp_dir.path()),
             locator.clone(),
             fetcher.clone(),
@@ -1084,7 +1207,7 @@ mod tests {
                 PeerContact::untrusted(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 6881)),
             )
             .await;
-        fetcher.objects.lock().await.insert(cid.clone(), data.clone());
+        fetcher.insert_raw(cid.clone(), data.clone()).await;
 
         assert_eq!(
             service.get_object_by_cid(&cid).await?.as_deref(),
@@ -1103,6 +1226,76 @@ mod tests {
             Some(data.as_slice())
         );
         assert_eq!(fetcher.calls().await, 2, "uncommitted bytes are re-fetched");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_get_object_by_cid_provenance_distinguishes_committed_from_provider_xet_bytes(
+    ) -> crate::error::Result<()> {
+        // Regression for #1115: provider-fetched XET (non-self-verifying)
+        // bytes must surface as `committed == false` so the caller's
+        // persistence gate fires. A cache/blob hit and a self-verifying
+        // provider fetch must surface as `committed == true`.
+        let temp_dir = TempDir::new()?;
+
+        // --- Provider-fetched XET Merkle bytes: NOT committed. ---
+        let locator = Arc::new(MockObjectLocator::default());
+        let fetcher = Arc::new(MockBlobFetcher::default());
+        let service = new_service_with_mocks(
+            test_config(temp_dir.path()),
+            locator.clone(),
+            fetcher.clone(),
+        )
+        .await?;
+        let xet_data = b"xet reconstruction bytes".to_vec();
+        let xet_cid = ContentCid::xet_merkle(&[0x7f; 32])?;
+        locator
+            .add_provider(
+                locator_cid_from_content(&xet_cid),
+                PeerContact::untrusted(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 6881)),
+            )
+            .await;
+        fetcher.insert_raw(xet_cid.clone(), xet_data.clone()).await;
+
+        let fetch = service
+            .get_object_by_cid_with_provenance(&xet_cid)
+            .await?
+            .ok_or_else(|| crate::Error::not_found("provider did not return the XET object"))?;
+        assert_eq!(fetch.data, xet_data);
+        assert!(
+            !fetch.committed,
+            "provider-fetched XET bytes must not be reported committed"
+        );
+
+        // --- Self-verifying Git CID provider fetch: committed. ---
+        let git_data = b"self-verifying git object".to_vec();
+        let git_hash = sha256_git(&git_data)?;
+        let git_cid = ContentCid::git_sha256(&git_hash)?;
+        locator
+            .add_provider(
+                locator_cid_from_content(&git_cid),
+                PeerContact::untrusted(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 6882)),
+            )
+            .await;
+        fetcher.insert(git_hash, git_data.clone()).await?;
+        let fetch = service
+            .get_object_by_cid_with_provenance(&git_cid)
+            .await?
+            .ok_or_else(|| crate::Error::not_found("provider did not return the Git object"))?;
+        assert_eq!(fetch.data, git_data);
+        assert!(
+            fetch.committed,
+            "self-verifying provider bytes are committed during fetch"
+        );
+
+        // --- Local cache hit (the prior line cached it): committed. ---
+        let fetch = service
+            .get_object_by_cid_with_provenance(&git_cid)
+            .await?
+            .ok_or_else(|| crate::Error::not_found("object was not cached"))?;
+        assert!(fetch.committed, "cache hits are committed");
+        // No additional provider fetch for the cached path.
+        assert_eq!(fetcher.calls().await, 2);
         Ok(())
     }
 
