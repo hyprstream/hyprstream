@@ -2211,6 +2211,7 @@ mod tests {
                         subject: Some("multiprocess-policy".to_owned()),
                         user_pub_key: None,
                         dpop_jkt: None,
+                        issuer: None,
                     })
                     .await?
                     .token;
@@ -2338,6 +2339,7 @@ mod tests {
                         subject: Some("stale-policy".to_owned()),
                         user_pub_key: None,
                         dpop_jkt: None,
+                        issuer: None,
                     })
                     .await;
                 anyhow::ensure!(result.is_err(), "stale PolicyService minted a token");
@@ -2508,6 +2510,7 @@ mod tests {
                         subject: Some("restart-policy".to_owned()),
                         user_pub_key: None,
                         dpop_jkt: None,
+                        issuer: None,
                     })
                     .await?
                     .token;
@@ -2643,6 +2646,7 @@ mod tests {
                     subject: Some("pre-rotation-policy".to_owned()),
                     user_pub_key: None,
                     dpop_jkt: None,
+                    issuer: None,
                 })
                 .await?;
             let client = reqwest::Client::new();
@@ -2871,6 +2875,7 @@ mod tests {
                         subject: Some("timeout-policy".to_owned()),
                         user_pub_key: None,
                         dpop_jkt: None,
+                        issuer: None,
                     })
                     .await?
                     .token;

@@ -384,9 +384,13 @@ impl PolicyHandler for PolicyService {
             })
         };
 
-        // Populate iss with the OAuth issuer URL so federation peers can fetch JWKS.
-        // default_audience is the OAuth issuer URL (set via with_default_audience).
-        let issuer = self.default_audience.clone().unwrap_or_default();
+        // OAuth may override the issuer for a profile-specific token (atproto
+        // requires an origin). Other callers retain the configured default.
+        let issuer = data.issuer.as_ref()
+            .filter(|issuer| !issuer.is_empty())
+            .cloned()
+            .or_else(|| self.default_audience.clone())
+            .unwrap_or_default();
         let mut claims = hyprstream_rpc::auth::Claims::new(
             subject,
             now,

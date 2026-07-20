@@ -81,6 +81,34 @@ fn issuer_origin(issuer_url: &str) -> Option<String> {
     }
 }
 
+fn normalize_atproto_handle(handle: &str) -> Option<String> {
+    let handle = handle.trim_end_matches('.').to_ascii_lowercase();
+    if handle.len() > 253 || handle.split('.').count() < 2 {
+        return None;
+    }
+    let valid = handle.split('.').all(|label| {
+        !label.is_empty()
+            && label.len() <= 63
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+            && label.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    });
+    valid.then_some(handle)
+}
+
+fn configured_handle_host(issuer_url: &str) -> Option<String> {
+    let url = url::Url::parse(issuer_url).ok()?;
+    match url.host()? {
+        url::Host::Domain(host) => normalize_atproto_handle(host),
+        url::Host::Ipv4(_) | url::Host::Ipv6(_) => None,
+    }
+}
+
+fn account_handle(username: &str, issuer_url: &str) -> Option<String> {
+    let host = configured_handle_host(issuer_url)?;
+    normalize_atproto_handle(&format!("{username}.{host}"))
+}
+
 /// Build the multibase z-encoded P-256 public key per the `Multikey` /
 /// did:key conventions used by atproto.
 ///
@@ -466,14 +494,10 @@ pub async fn root_did_document(
         Some(store) => store.active_key().await,
         None => None,
     };
-    // The atproto handle is a bare hostname (no port); strip any port the
-    // authority carries (the DID identifier keeps the port, the handle does not).
-    let handle = authority.split(':').next().unwrap_or(authority.as_str());
+    let handle = configured_handle_host(&state.issuer_url);
     let atproto_vk = atproto_sk.as_ref().map(|sk| sk.verifying_key());
-    let atproto = atproto_vk.map(|vk| AtprotoIdentity {
-        p256_vk: vk,
-        handle,
-    });
+    let atproto = atproto_vk.zip(handle.as_deref())
+        .map(|(vk, handle)| AtprotoIdentity { p256_vk: vk, handle });
 
     // Transport `service` entries: populate QUIC entry when cert hash is available (#185).
     // The cert hash was set at OAuthService startup from the node's QUIC TLS cert,
@@ -617,12 +641,9 @@ pub async fn user_did_document(
         Some(store) => store.active_key().await,
         None => None,
     };
-    let handle_host = authority.split(':').next().unwrap_or(authority.as_str());
-    let handle = format!("{username}.{handle_host}");
-    let atproto = atproto_signing.as_ref().map(|sk| AtprotoIdentity {
-        p256_vk: sk.verifying_key(),
-        handle: handle.as_str(),
-    });
+    let handle = account_handle(&username, &state.issuer_url);
+    let atproto = atproto_signing.as_ref().zip(handle.as_deref())
+        .map(|(sk, handle)| AtprotoIdentity { p256_vk: sk.verifying_key(), handle });
 
     let doc = build_did_document(&did, &state.issuer_url, &keys, atproto.as_ref(), &[], None, None);
     (
@@ -741,6 +762,21 @@ mod tests {
     #[test]
     fn issuer_authority_rejects_no_scheme() {
         assert_eq!(issuer_authority("example.com"), None);
+    }
+
+    #[test]
+    fn ipv6_issuer_does_not_synthesize_atproto_handle() {
+        assert_eq!(configured_handle_host("https://[::1]:6791"), None);
+        assert_eq!(account_handle("alice", "https://[::1]:6791"), None);
+    }
+
+    #[test]
+    fn invalid_username_label_does_not_synthesize_atproto_handle() {
+        assert_eq!(account_handle("alice_bad", "https://pds.example.com"), None);
+        assert_eq!(
+            account_handle("Alice", "https://PDS.Example.COM").as_deref(),
+            Some("alice.pds.example.com")
+        );
     }
 
     #[test]

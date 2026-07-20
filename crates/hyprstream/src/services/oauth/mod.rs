@@ -286,7 +286,7 @@ async fn oauth_self_protected_resource_metadata(
     // #1113 r4 F5: use the CANONICAL issuer from OAuthState (same
     // normalization as token claims/redirect), NOT raw config.issuer_url().
     // A configured trailing-slash/path must be consistent everywhere.
-    let issuer_url = state.issuer_url.clone();
+    let issuer_url = state.atproto_issuer_url();
 
     // Use issuer URL as the resource (PDS = its own AS).
     let resource = issuer_url.clone();
@@ -1024,6 +1024,26 @@ mod tests {
             .unwrap()
     }
 
+    async fn post_form_bearer(
+        app: &Router,
+        uri: &str,
+        fields: &[(&str, &str)],
+        bearer: &str,
+    ) -> axum::response::Response {
+        use tower::ServiceExt as _;
+
+        app.clone()
+            .oneshot(
+                axum::http::Request::post(uri)
+                    .header(axum::http::header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .header(axum::http::header::AUTHORIZATION, format!("Bearer {bearer}"))
+                    .body(axum::body::Body::from(encode_form(fields)))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
     async fn get(app: &Router, uri: &str) -> axum::response::Response {
         use tower::ServiceExt as _;
 
@@ -1212,6 +1232,7 @@ mod tests {
         use crate::services::{DiscoveryClient, PolicyClient, PolicyService};
 
         const ISSUER: &str = "https://pds.example.test";
+        const GENERIC_ISSUER: &str = "https://pds.example.test/configured/path";
         const CLIENT_ID: &str = "handler-client";
         const REDIRECT_URI: &str = "https://client.example.test/callback";
         const MAPPED_DID: &str = "did:plc:abcdefghijklmnqrstuvwx2p";
@@ -1246,7 +1267,7 @@ mod tests {
             git2db,
             TransportConfig::inproc(&policy_tag),
         )
-        .with_default_audience(ISSUER.to_owned());
+        .with_default_audience(GENERIC_ISSUER.to_owned());
         let manager = InprocManager::new();
         let mut policy_handle = manager.spawn(Box::new(policy_service)).await?;
         let policy_client = PolicyClient::for_local_endpoint_bootstrap(
@@ -1273,7 +1294,7 @@ mod tests {
                 UserProfile {
                     atproto_did: Some(MAPPED_DID.to_owned()),
                     ..Default::default()
-                },
+                }.into(),
             )
             .await?;
         assert_eq!(
@@ -1295,8 +1316,8 @@ mod tests {
             .with_response_verify_policy(CryptoPolicy::Classical),
         );
         let mut config = crate::config::OAuthConfig::default();
-        // A configured path and trailing slash must normalize everywhere.
-        config.external_url = Some(format!("{ISSUER}/configured/path/"));
+        // Generic OAuth preserves this path; atproto emissions use its origin.
+        config.external_url = Some(GENERIC_ISSUER.to_owned());
         let mut oauth_state = OAuthState::new(
             &config,
             policy_client,
@@ -1522,6 +1543,39 @@ mod tests {
         let refreshed_claims = jwt_claims(refreshed_json["access_token"].as_str().unwrap());
         assert_eq!(refreshed_claims["sub"], MAPPED_DID);
 
+        // A non-atproto PAR consent cannot be upgraded to the atproto profile
+        // by mutating hidden fields on the callback POST.
+        let downgrade_challenge =
+            URL_SAFE_NO_PAD.encode(Sha256::digest(GENERIC_PKCE_VERIFIER.as_bytes()));
+        let downgrade_par = post_form(&app, "/oauth/par", &[
+            ("client_id", CLIENT_ID), ("redirect_uri", REDIRECT_URI),
+            ("code_challenge", &downgrade_challenge), ("code_challenge_method", "S256"),
+            ("response_type", "code"), ("state", "scope-binding-state"),
+            ("scope", "read:*:*"), ("resource", ISSUER),
+        ], None, false).await;
+        assert_eq!(downgrade_par.status(), axum::http::StatusCode::CREATED);
+        let downgrade_par_json = response_json(downgrade_par).await;
+        let downgrade_request_uri = downgrade_par_json["request_uri"].as_str().unwrap();
+        let downgrade_authorize_uri = format!(
+            "/oauth/authorize?{}",
+            encode_form(&[("request_uri", downgrade_request_uri), ("client_id", CLIENT_ID)])
+        );
+        let downgrade_authorize = get(&app, &downgrade_authorize_uri).await;
+        assert_eq!(downgrade_authorize.status(), axum::http::StatusCode::OK);
+        let downgrade_html = response_text(downgrade_authorize).await;
+        let downgrade_nonce = html_hidden_value(&downgrade_html, "nonce").to_owned();
+        let downgrade_signed = format!("{fingerprint}:{downgrade_nonce}:{downgrade_challenge}");
+        let downgrade_signature = STANDARD.encode(user_key.sign(downgrade_signed.as_bytes()).to_bytes());
+        let upgraded_callback = post_form(&app, "/oauth/authorize", &[
+            ("client_id", CLIENT_ID), ("redirect_uri", REDIRECT_URI),
+            ("code_challenge", &downgrade_challenge), ("scope", "atproto"),
+            ("state", "scope-binding-state"), ("resource", ISSUER),
+            ("nonce", &downgrade_nonce), ("fingerprint", &fingerprint),
+            ("signature", &downgrade_signature),
+        ], None, false).await;
+        assert_eq!(upgraded_callback.status(), axum::http::StatusCode::BAD_REQUEST);
+        assert_eq!(response_json(upgraded_callback).await["error"], "invalid_request");
+
         // A real generic authorization-code flow retains the local username
         // byte-for-byte and emits the legacy Bearer response shape.
         let generic_code_challenge =
@@ -1579,6 +1633,10 @@ mod tests {
             generic_callback_params.get("state").map(String::as_str),
             Some("generic-client-state")
         );
+        assert_eq!(
+            generic_callback_params.get("iss").map(String::as_str),
+            Some(GENERIC_ISSUER)
+        );
         let generic_code = generic_callback_params.get("code").unwrap();
         let generic_token = post_form(
             &app,
@@ -1598,10 +1656,28 @@ mod tests {
         let generic_token_json = response_json(generic_token).await;
         assert_eq!(generic_token_json["token_type"], "Bearer");
         assert!(generic_token_json.get("sub").is_none());
-        let generic_claims = jwt_claims(generic_token_json["access_token"].as_str().unwrap());
+        let generic_access_token = generic_token_json["access_token"].as_str().unwrap().to_owned();
+        let generic_refresh_token = generic_token_json["refresh_token"].as_str().unwrap().to_owned();
+        let generic_claims = jwt_claims(&generic_access_token);
         assert_eq!(generic_claims["sub"], "alice");
-        assert_eq!(generic_claims["iss"], ISSUER);
+        assert_eq!(generic_claims["iss"], GENERIC_ISSUER);
         assert_eq!(generic_claims["aud"], ISSUER);
+        let now = chrono::Utc::now().timestamp();
+        let introspection_caller = hyprstream_rpc::auth::jwt::encode(
+            &hyprstream_rpc::auth::Claims::new("introspection-test".to_owned(), now, now + 300),
+            &service_key,
+        );
+        let generic_introspection = post_form_bearer(
+            &app,
+            "/oauth/introspect",
+            &[("token", &generic_refresh_token)],
+            &introspection_caller,
+        ).await;
+        let generic_introspection_status = generic_introspection.status();
+        let generic_introspection_json = response_json(generic_introspection).await;
+        assert_eq!(generic_introspection_status, axum::http::StatusCode::OK, "{generic_introspection_json}");
+        assert_eq!(generic_introspection_json["active"], true);
+        assert_eq!(generic_introspection_json["sub"], "alice");
 
         // A real generic device flow retains the local username byte-for-byte
         // and the legacy Bearer response shape.
@@ -1664,7 +1740,7 @@ mod tests {
         assert!(device_token_json.get("sub").is_none());
         let device_claims = jwt_claims(device_token_json["access_token"].as_str().unwrap());
         assert_eq!(device_claims["sub"], "alice");
-        assert_eq!(device_claims["iss"], ISSUER);
+        assert_eq!(device_claims["iss"], GENERIC_ISSUER);
         assert_eq!(device_claims["aud"], ISSUER);
 
         policy_handle.stop().await?;

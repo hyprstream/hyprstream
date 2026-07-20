@@ -208,6 +208,16 @@ pub async fn authorize_get(
     let scopes = params.scope.as_deref().unwrap_or(
         &state.default_scopes.join(" ")
     ).to_owned();
+    let mut effective_request = params.clone();
+    effective_request.scope = Some(scopes.clone());
+    let effective_scopes: Vec<String> = scopes.split_whitespace().map(str::to_owned).collect();
+    if super::state::atproto_profile_active(&effective_scopes) && effective_request.dpop_jkt.is_none() {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "The atproto profile requires a Pushed Authorization Request with a DPoP proof.",
+        );
+    }
 
     // Extract redirect hostname for display
     let redirect_host = url::Url::parse(&params.redirect_uri)
@@ -224,14 +234,14 @@ pub async fn authorize_get(
 
     // Generate a nonce, store it server-side (5-min TTL, single-use on POST).
     let nonce = issue_nonce(&state).await;
-    // Stash the PAR-bound DPoP key thumbprint alongside the nonce so it
-    // reaches authorize_post without crossing the browser (#1113 rev2).
+    // Bind the complete resolved request to the consent nonce. Hidden form
+    // fields are transport echoes only and cannot change authority on POST.
     state
         .pending_authorize_bindings
         .write()
         .await
         .insert(nonce.clone(), super::state::AuthorizeBinding {
-            dpop_jkt: params.dpop_jkt.clone(),
+            request: effective_request.clone(),
         });
 
     // Render challenge form
@@ -239,18 +249,32 @@ pub async fn authorize_get(
         &client_name,
         &scopes,
         &redirect_host,
-        &params.client_id,
-        &params.redirect_uri,
-        &params.code_challenge,
-        params.state.as_deref().unwrap_or(""),
-        params.resource.as_deref().unwrap_or(""),
+        &effective_request.client_id,
+        &effective_request.redirect_uri,
+        &effective_request.code_challenge,
+        effective_request.state.as_deref().unwrap_or(""),
+        effective_request.resource.as_deref().unwrap_or(""),
         &nonce,
-        params.nonce.as_deref().unwrap_or(""),
+        effective_request.nonce.as_deref().unwrap_or(""),
         None,
         localhost_warning.as_deref(),
     );
 
     Html(html).into_response()
+}
+
+fn nonempty(value: Option<&str>) -> Option<&str> {
+    value.filter(|value| !value.is_empty())
+}
+
+fn consent_form_matches_request(form: &ConsentForm, request: &AuthorizeParams) -> bool {
+    form.client_id == request.client_id
+        && form.redirect_uri == request.redirect_uri
+        && form.code_challenge == request.code_challenge
+        && form.scope == request.scope.as_deref().unwrap_or("")
+        && nonempty(form.state.as_deref()) == nonempty(request.state.as_deref())
+        && nonempty(form.resource.as_deref()) == nonempty(request.resource.as_deref())
+        && nonempty(form.oidc_nonce.as_deref()) == nonempty(request.nonce.as_deref())
 }
 
 /// POST /oauth/authorize — verify Ed25519 signature, issue auth code
@@ -276,13 +300,19 @@ pub async fn authorize_post(
             None => (false, None),
         }
     };
+    let Some(authorize_binding) = authorize_binding else {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "Authorization request is missing or already consumed",
+        );
+    };
+    let effective = &authorize_binding.request;
+
     if !nonce_valid {
-        // Nonce was not issued by this server, already consumed, or expired.
-        // Validate redirect_uri and re-derive client info from the registry.
-        // If either fails, return an error page rather than re-rendering with
-        // attacker-controlled values.
+        // Re-render only from the server-side snapshot; the submitted form is untrusted.
         let Some((client_name, redirect_host, localhost_warning)) =
-            derive_display_info(&state, &form.client_id, &form.redirect_uri).await
+            derive_display_info(&state, &effective.client_id, &effective.redirect_uri).await
         else {
             return Html(render_error_page(
                 "Invalid Request",
@@ -292,35 +322,41 @@ pub async fn authorize_post(
         let fresh_nonce = issue_nonce(&state).await;
         // #1113 rev2 F3: re-stash the binding on error-retry so the PAR
         // key binding survives a nonce-expired re-render.
-        if let Some(ref binding) = authorize_binding {
-            state
-                .pending_authorize_bindings
-                .write()
-                .await
-                .insert(fresh_nonce.clone(), binding.clone());
-        }
+        state
+            .pending_authorize_bindings
+            .write()
+            .await
+            .insert(fresh_nonce.clone(), authorize_binding.clone());
         let html = render_challenge_page(
             &client_name,
-            &form.scope,
+            effective.scope.as_deref().unwrap_or(""),
             &redirect_host,
-            &form.client_id,
-            &form.redirect_uri,
-            &form.code_challenge,
-            form.state.as_deref().unwrap_or(""),
-            form.resource.as_deref().unwrap_or(""),
+            &effective.client_id,
+            &effective.redirect_uri,
+            &effective.code_challenge,
+            effective.state.as_deref().unwrap_or(""),
+            effective.resource.as_deref().unwrap_or(""),
             &fresh_nonce,
-            form.oidc_nonce.as_deref().unwrap_or(""),
+            effective.nonce.as_deref().unwrap_or(""),
             Some("Authorization request expired. Please try again."),
             localhost_warning.as_deref(),
         );
         return Html(html).into_response();
     }
 
+    if !consent_form_matches_request(&form, effective) {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "Authorization request parameters changed after consent was displayed",
+        );
+    }
+
     // Reconstruct challenge: "{fingerprint}:{nonce}:{code_challenge}"
     // Binds signature to the key identity and the PKCE session. The server
     // does not trust client-declared usernames — it resolves the username
     // from the pubkey reverse index keyed by `form.fingerprint`.
-    let challenge_str = format!("{}:{}:{}", form.fingerprint, form.nonce, form.code_challenge);
+    let challenge_str = format!("{}:{}:{}", form.fingerprint, form.nonce, effective.code_challenge);
 
     // Get user store
     let user_store = match state.user_store_reader() {
@@ -350,7 +386,7 @@ pub async fn authorize_post(
             // Never trust the POST body for display values; return an error page if
             // the client or redirect_uri is no longer valid.
             let Some((client_name, redirect_host, localhost_warning)) =
-                derive_display_info(&state, &form.client_id, &form.redirect_uri).await
+                derive_display_info(&state, &effective.client_id, &effective.redirect_uri).await
             else {
                 return Html(render_error_page(
                     "Invalid Request",
@@ -362,24 +398,22 @@ pub async fn authorize_post(
             // #1113 rev2 F3: re-stash the PAR-bound DPoP jkt under the fresh
             // nonce so one failed consent signature doesn't lose the PAR key
             // binding (which would break the later token exchange).
-            if let Some(ref binding) = authorize_binding {
-                state
-                    .pending_authorize_bindings
-                    .write()
-                    .await
-                    .insert(fresh_nonce.clone(), binding.clone());
-            }
+            state
+                .pending_authorize_bindings
+                .write()
+                .await
+                .insert(fresh_nonce.clone(), authorize_binding.clone());
             let html = render_challenge_page(
                 &client_name,
-                &form.scope,
+                effective.scope.as_deref().unwrap_or(""),
                 &redirect_host,
-                &form.client_id,
-                &form.redirect_uri,
-                &form.code_challenge,
-                form.state.as_deref().unwrap_or(""),
-                form.resource.as_deref().unwrap_or(""),
+                &effective.client_id,
+                &effective.redirect_uri,
+                &effective.code_challenge,
+                effective.state.as_deref().unwrap_or(""),
+                effective.resource.as_deref().unwrap_or(""),
                 &fresh_nonce,
-                form.oidc_nonce.as_deref().unwrap_or(""),
+                effective.nonce.as_deref().unwrap_or(""),
                 Some(e.message()),
                 localhost_warning.as_deref(),
             );
@@ -396,12 +430,14 @@ pub async fn authorize_post(
     // server-supported and client-declared scopes BEFORE minting an auth
     // code. Garbage / undeclared tokens → invalid_scope. The granted set
     // (intersection) is what the token response will echo (RFC 6749 §3.3).
-    let requested_scopes: Vec<String> = form
+    let requested_scopes: Vec<String> = effective
         .scope
+        .as_deref()
+        .unwrap_or("")
         .split_whitespace()
         .map(std::borrow::ToOwned::to_owned)
         .collect();
-    let client_declared = resolve_client_declared_scopes(&state, &form.client_id).await;
+    let client_declared = resolve_client_declared_scopes(&state, &effective.client_id).await;
     let require_atproto = super::state::atproto_profile_active(&requested_scopes);
     let granted_scopes = match super::state::validate_requested_scopes(
         &requested_scopes,
@@ -418,31 +454,31 @@ pub async fn authorize_post(
             );
         }
     };
-    let resource = form.resource.as_ref().filter(|s| !s.is_empty()).cloned();
+    let resource = effective.resource.as_ref().filter(|s| !s.is_empty()).cloned();
 
     let pending = PendingAuthCode {
         code: code.clone(),
-        client_id: form.client_id.clone(),
-        redirect_uri: form.redirect_uri.clone(),
-        code_challenge: form.code_challenge.clone(),
+        client_id: effective.client_id.clone(),
+        redirect_uri: effective.redirect_uri.clone(),
+        code_challenge: effective.code_challenge.clone(),
         scopes: granted_scopes,
-        oidc_nonce: form.oidc_nonce.clone(),
+        oidc_nonce: effective.nonce.clone(),
         resource,
         created_at: Instant::now(),
         expires_at: Instant::now() + Duration::from_secs(60),
         username: resolved_username.clone(),
         verifying_key: Some(verifying_key),
         // PAR-bound DPoP key thumbprint (#1113 rev2 finding 3).
-        dpop_jkt: authorize_binding.as_ref().and_then(|b| b.dpop_jkt.clone()),
+        dpop_jkt: effective.dpop_jkt.clone(),
     };
 
     state.pending_codes.write().await.insert(code.clone(), pending);
 
     tracing::info!(
-        client_id = %form.client_id,
+        client_id = %effective.client_id,
         username = %resolved_username,
         fingerprint = %form.fingerprint,
-        redirect_uri = %form.redirect_uri,
+        redirect_uri = %effective.redirect_uri,
         "Authorization code issued, redirecting"
     );
 
@@ -451,12 +487,15 @@ pub async fn authorize_post(
     // / OAuth 2.1 authorization-response-iss-parameter. The AS advertises
     // `authorization_response_iss_parameter_supported: true` — the stock
     // atproto client throws "iss missing" if it's absent.
-    let redirect_iss = super::state::canonical_issuer_origin(&state.issuer_url)
-        .unwrap_or_else(|| state.issuer_url.clone());
+    let redirect_iss = if require_atproto {
+        state.atproto_issuer_url()
+    } else {
+        state.issuer_url.clone()
+    };
     let redirect_url = match build_authorize_redirect_url(
-        &form.redirect_uri,
+        &effective.redirect_uri,
         &code,
-        form.state.as_deref(),
+        effective.state.as_deref(),
         &redirect_iss,
     ) {
         Ok(u) => u,

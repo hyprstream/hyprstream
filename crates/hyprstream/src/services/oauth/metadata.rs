@@ -28,20 +28,16 @@ fn base_metadata(issuer: &str, scopes: &[String], require_par: bool) -> serde_js
     if !scopes_supported.iter().any(|scope| scope == "pds:attach") {
         scopes_supported.push("pds:attach".to_owned());
     }
-    // #1113 rev2 finding 5: canonicalize the issuer to an exact origin before
-    // emitting it anywhere — a trailing slash or path in external_url would
-    // produce double-slash endpoint URLs and a non-origin issuer the stock
-    // resolver rejects against the discovery origin.
-    let issuer = super::state::canonical_issuer_origin(issuer).unwrap_or_else(|| issuer.to_owned());
+    let endpoint_base = issuer.trim_end_matches('/');
     serde_json::json!({
         "issuer": issuer,
-        "authorization_endpoint": format!("{}/oauth/authorize", issuer),
-        "token_endpoint": format!("{}/oauth/token", issuer),
-        "registration_endpoint": format!("{}/oauth/register", issuer),
-        "device_authorization_endpoint": format!("{}/oauth/device", issuer),
-        "pushed_authorization_request_endpoint": format!("{}/oauth/par", issuer),
+        "authorization_endpoint": format!("{endpoint_base}/oauth/authorize"),
+        "token_endpoint": format!("{endpoint_base}/oauth/token"),
+        "registration_endpoint": format!("{endpoint_base}/oauth/register"),
+        "device_authorization_endpoint": format!("{endpoint_base}/oauth/device"),
+        "pushed_authorization_request_endpoint": format!("{endpoint_base}/oauth/par"),
         "require_pushed_authorization_requests": require_par,
-        "jwks_uri": format!("{}/oauth/jwks", issuer),
+        "jwks_uri": format!("{endpoint_base}/oauth/jwks"),
         "response_types_supported": ["code"],
         "grant_types_supported": ["authorization_code", "refresh_token", "urn:ietf:params:oauth:grant-type:device_code"],
         "code_challenge_methods_supported": ["S256"],
@@ -58,11 +54,16 @@ fn base_metadata(issuer: &str, scopes: &[String], require_par: bool) -> serde_js
     })
 }
 
+fn atproto_metadata(issuer: &str, scopes: &[String], require_par: bool) -> serde_json::Value {
+    let issuer = super::state::canonical_issuer_origin(issuer).unwrap_or_else(|| issuer.to_owned());
+    base_metadata(&issuer, scopes, require_par)
+}
+
 /// GET /.well-known/oauth-authorization-server (RFC 8414)
 pub async fn authorization_server_metadata(
     State(state): State<Arc<OAuthState>>,
 ) -> impl IntoResponse {
-    Json(base_metadata(
+    Json(atproto_metadata(
         &state.issuer_url,
         &state.default_scopes,
         state.require_pushed_authorization_requests,
@@ -83,7 +84,7 @@ pub async fn openid_configuration(
     // OIDC-specific fields
     let obj = meta.as_object_mut().unwrap_or_else(|| unreachable!());
     obj.insert("userinfo_endpoint".into(),
-        serde_json::Value::String(format!("{}/oauth/userinfo", issuer)));
+        serde_json::Value::String(format!("{}/oauth/userinfo", issuer.trim_end_matches('/'))));
     obj.insert("id_token_signing_alg_values_supported".into(),
         serde_json::json!(["EdDSA", "RS256"]));
     obj.insert("subject_types_supported".into(),
@@ -145,7 +146,7 @@ mod tests {
     /// origin issuer (no trailing slash/path).
     #[test]
     fn authorization_server_metadata_has_atproto_profile_fields() {
-        let meta = base_metadata("https://pds.example.com/", &["atproto".to_owned()], true);
+        let meta = atproto_metadata("https://pds.example.com/", &["atproto".to_owned()], true);
 
         // Issuer canonicalized to exact origin (trailing slash stripped).
         assert_eq!(meta["issuer"].as_str(), Some("https://pds.example.com"));
@@ -187,5 +188,17 @@ mod tests {
             meta["authorization_response_iss_parameter_supported"].as_bool(),
             Some(true)
         );
+    }
+
+    #[test]
+    fn issuer_paths_are_profile_specific() {
+        let configured = "https://as.example/tenant";
+        let generic = base_metadata(configured, &["read:*:*".to_owned()], false);
+        assert_eq!(generic["issuer"], configured);
+        assert_eq!(generic["token_endpoint"], "https://as.example/tenant/oauth/token");
+
+        let atproto = atproto_metadata(configured, &["atproto".to_owned()], true);
+        assert_eq!(atproto["issuer"], "https://as.example");
+        assert_eq!(atproto["token_endpoint"], "https://as.example/oauth/token");
     }
 }

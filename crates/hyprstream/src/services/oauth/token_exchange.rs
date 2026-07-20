@@ -103,6 +103,7 @@ pub async fn exchange_token_exchange(
             subject: Some(verified.sub.clone()),
             user_pub_key,
             dpop_jkt: None,
+            issuer: None,
         })
         .await;
 

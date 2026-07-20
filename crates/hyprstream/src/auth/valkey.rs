@@ -20,7 +20,8 @@ use fred::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use super::user_store::{
-    matches_filter, pubkey_fingerprint, PubkeyEntry, ScimFilter, UserFilter, UserProfile, UserStore,
+    matches_filter, pubkey_fingerprint, PubkeyEntry, ScimFilter, UserFilter, UserProfile,
+    UserProfilePatch, UserStore,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -82,25 +83,25 @@ impl UserStore for ValkeyUserStore {
         Ok(sub)
     }
 
-    async fn set_profile(&self, username: &str, new: UserProfile) -> Result<()> {
+    async fn set_profile(&self, username: &str, new: UserProfilePatch) -> Result<()> {
         let existing = self.get_profile_raw(username).await?.unwrap_or_default();
 
         // Remove stale externalId index if it changed.
         if let Some(ref old_extid) = existing.external_id {
-            if new.external_id.as_deref() != Some(old_extid.as_str()) {
+            if new.external_id.as_ref().is_some_and(|value| value.as_deref() != Some(old_extid)) {
                 let _: i64 = self.pool.del(format!("hs:idx:extid:{old_extid}")).await.unwrap_or(0);
             }
         }
 
-        // Merge: new fields overwrite existing; None in `new` keeps existing value.
+        // Apply tri-state patch fields: omitted keeps existing, explicit None clears.
         let merged = UserProfile {
-            sub: new.sub.or_else(|| existing.sub.clone()),
-            name: new.name.or(existing.name),
-            email: new.email.or(existing.email),
-            email_verified: new.email_verified.or(existing.email_verified),
-            active: new.active.or(existing.active),
-            external_id: new.external_id.or(existing.external_id),
-            atproto_did: new.atproto_did.or(existing.atproto_did),
+            sub: new.sub.unwrap_or(existing.sub),
+            name: new.name.unwrap_or(existing.name),
+            email: new.email.unwrap_or(existing.email),
+            email_verified: new.email_verified.unwrap_or(existing.email_verified),
+            active: new.active.unwrap_or(existing.active),
+            external_id: new.external_id.unwrap_or(existing.external_id),
+            atproto_did: new.atproto_did.unwrap_or(existing.atproto_did),
         };
 
         // Write new externalId index.

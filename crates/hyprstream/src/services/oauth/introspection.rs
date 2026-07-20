@@ -74,14 +74,14 @@ fn introspect_jwt(state: &Arc<OAuthState>, token: &str) -> Response {
 async fn introspect_refresh(state: &Arc<OAuthState>, token: &str) -> Response {
     match state.get_refresh_token(token).await {
         Ok(Some(entry)) => {
-            // #1113: report the account DID as `sub` for atproto conformance,
-            // matching the access-token subject. The refresh-token entry is
-            // keyed on the internal username; fall back to it if DID
-            // derivation fails (introspection is informational — the token
-            // path itself fails closed at mint time).
-            let sub = state
-                .subject_did(&entry.username)
-                .unwrap_or_else(|_| entry.username.clone());
+            // Match the mint boundary: generic tokens retain the username,
+            // while active atproto-profile tokens report the mapped DID.
+            let sub = if super::state::atproto_profile_active(&entry.scopes) {
+                state.check_atproto_account_eligibility(&entry.username).await
+                    .unwrap_or_else(|_| entry.username.clone())
+            } else {
+                entry.username.clone()
+            };
             (
                 StatusCode::OK,
                 [(header::CACHE_CONTROL, "no-store"), (header::PRAGMA, "no-cache")],

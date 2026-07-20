@@ -8,7 +8,7 @@ use anyhow::{anyhow, Result};
 use base64::{engine::general_purpose::STANDARD, Engine};
 use ed25519_dalek::VerifyingKey;
 
-use crate::auth::{UserFilter, UserProfile, UserStore, PubkeyEntry, decode_pubkey_base64};
+use crate::auth::{UserFilter, UserProfilePatch, UserStore, PubkeyEntry, decode_pubkey_base64};
 
 /// Shared user information type (SCIM-informed).
 #[derive(Debug, Clone)]
@@ -164,20 +164,19 @@ impl UserService {
 
     /// Update a user's profile fields.
     pub async fn update(&self, username: &str, update: UserUpdate) -> Result<UserInfo> {
-        let existing = self.store
+        self.store
             .get_profile(username).await?
             .ok_or_else(|| anyhow!("User '{}' not found", username))?;
 
-        let merged = UserProfile {
-            sub: existing.sub,
-            name: update.name.unwrap_or(existing.name),
-            email: update.email.unwrap_or(existing.email),
-            email_verified: Some(update.email_verified.unwrap_or_else(|| existing.email_verified.unwrap_or(false))),
-            active: existing.active,
-            external_id: update.external_id.unwrap_or(existing.external_id),
-            atproto_did: update.atproto_did.unwrap_or(existing.atproto_did),
+        let patch = UserProfilePatch {
+            name: update.name,
+            email: update.email,
+            email_verified: update.email_verified.map(Some),
+            external_id: update.external_id,
+            atproto_did: update.atproto_did,
+            ..Default::default()
         };
-        self.store.set_profile(username, merged).await?;
+        self.store.set_profile(username, patch).await?;
 
         self.get(username)
             .await?

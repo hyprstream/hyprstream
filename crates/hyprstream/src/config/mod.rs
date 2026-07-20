@@ -1263,16 +1263,11 @@ impl OAuthConfig {
         std::time::Duration::from_secs(self.jwt_key_rotation_check_secs.unwrap_or(6 * 3600))
     }
 
-    /// Get the issuer URL as a canonical exact origin (scheme://host[:port]),
-    /// using external_url if set, otherwise deriving from host:port.
+    /// Get the configured issuer URL, preserving an explicit path when set,
+    /// otherwise deriving it from host:port.
     /// Auto-derives `https://` when global TLS is enabled.
-    ///
-    /// #1113 rev2 F5: canonicalize at the SOURCE so EVERY consumer — access-
-    /// token `iss` (via PolicyService), metadata, userinfo, protected-resource,
-    /// redirect — gets the normalized value. A configured trailing slash or
-    /// path in `external_url` is stripped here, not in each consumer.
     pub fn issuer_url(&self) -> String {
-        let raw = if let Some(ref url) = self.external_url {
+        if let Some(ref url) = self.external_url {
             url.clone()
         } else {
             let scheme = if HyprConfig::load().map(|c| c.tls.enabled).unwrap_or(false) {
@@ -1282,19 +1277,6 @@ impl OAuthConfig {
             };
             let host = if self.host == "0.0.0.0" { "localhost" } else { &self.host };
             format!("{scheme}://{host}:{}", self.port)
-        };
-        // Canonicalize to exact origin — strip trailing slash/path.
-        if let Some(origin) = raw.split_once("://").and_then(|(scheme, rest)| {
-            let authority = rest.split('/').next()?;
-            if authority.is_empty() || scheme.is_empty() {
-                None
-            } else {
-                Some(format!("{scheme}://{authority}"))
-            }
-        }) {
-            origin
-        } else {
-            raw
         }
     }
 }

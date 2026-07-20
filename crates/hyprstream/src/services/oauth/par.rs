@@ -228,7 +228,8 @@ pub async fn push_authorization_request(
                 );
             }
         };
-        let par_endpoint = format!("{}/oauth/par", state.issuer_url.trim_end_matches('/'));
+        let atproto_issuer = state.atproto_issuer_url();
+        let par_endpoint = format!("{}/oauth/par", atproto_issuer.trim_end_matches('/'));
         match super::dpop::verify_dpop_proof(&dpop_header, "POST", &par_endpoint, None) {
             Ok(proof) => {
                 // Record the jkt so future token-endpoint proofs from this

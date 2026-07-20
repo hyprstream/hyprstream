@@ -136,6 +136,10 @@ struct IssueToken {
   # When present, the issued token carries cnf.jkt instead of cnf.jwk.
   # Takes precedence over userPubKey.
   dpopJkt @5 :Text $optional;
+
+  # Optional issuer override for profile-specific OAuth tokens.
+  # Empty uses PolicyService's configured default issuer.
+  issuer @6 :Text $optional;
 }
 
 # Apply a built-in policy template

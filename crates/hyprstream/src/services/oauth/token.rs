@@ -289,9 +289,10 @@ async fn enforce_client_authentication(
 async fn verify_dpop_at_token_endpoint(
     state: &OAuthState,
     dpop_header: Option<&str>,
+    issuer: &str,
 ) -> Option<Result<String, Response>> {
     let proof_str = dpop_header?;
-    let token_endpoint = format!("{}/oauth/token", state.issuer_url.trim_end_matches('/'));
+    let token_endpoint = format!("{}/oauth/token", issuer.trim_end_matches('/'));
     let proof = match super::dpop::verify_dpop_proof(proof_str, "POST", &token_endpoint, None) {
         Ok(p) => p,
         Err(e) => {
@@ -433,7 +434,8 @@ async fn exchange_authorization_code(
     }
 
     // Verify DPoP if present.
-    let dpop_jkt = match verify_dpop_at_token_endpoint(&state, dpop_header.as_deref()).await {
+    let token_issuer = state.issuer_for_scopes(&pending.scopes);
+    let dpop_jkt = match verify_dpop_at_token_endpoint(&state, dpop_header.as_deref(), &token_issuer).await {
         None => None,
         Some(Ok(jkt)) => Some(jkt),
         Some(Err(resp)) => return resp,
@@ -541,7 +543,8 @@ async fn exchange_refresh_token(
 
     // Verify DPoP before consuming the refresh token. A use_dpop_nonce
     // response must leave the credential available for the RFC 9449 retry.
-    let dpop_jkt = match verify_dpop_at_token_endpoint(&state, dpop_header.as_deref()).await {
+    let token_issuer = state.issuer_for_scopes(&entry.scopes);
+    let dpop_jkt = match verify_dpop_at_token_endpoint(&state, dpop_header.as_deref(), &token_issuer).await {
         None => None,
         Some(Ok(jkt)) => Some(jkt),
         Some(Err(resp)) => return resp,
@@ -687,7 +690,8 @@ async fn exchange_device_code(
 
             // Verify DPoP before consuming the device code. A
             // `use_dpop_nonce` response must leave it available for retry.
-            let dpop_jkt = match verify_dpop_at_token_endpoint(&state, dpop_header.as_deref()).await {
+            let token_issuer = state.issuer_for_scopes(&scopes);
+            let dpop_jkt = match verify_dpop_at_token_endpoint(&state, dpop_header.as_deref(), &token_issuer).await {
                 None => None,
                 Some(Ok(jkt)) => Some(jkt),
                 Some(Err(resp)) => return resp,
@@ -842,6 +846,7 @@ async fn issue_token_with_refresh(
     } else {
         sub.to_owned()
     };
+    let token_issuer = state.issuer_for_scopes(&scopes);
 
     let result = state
         .policy_client
@@ -852,6 +857,7 @@ async fn issue_token_with_refresh(
             subject: Some(jwt_sub.clone()),
             user_pub_key: user_pub_key_b64,
             dpop_jkt: dpop_jkt.clone(),
+            issuer: Some(token_issuer.clone()),
         })
         .await;
 
@@ -917,7 +923,7 @@ async fn issue_token_with_refresh(
             let id_token = if has_openid && initial_auth && state.signing_key.is_some() {
                 let id_exp = now + 300; // 5-minute id_token lifetime
                 let mut id_claims = hyprstream_rpc::auth::IdTokenClaims::new(
-                    state.issuer_url.clone(),
+                    token_issuer,
                     sub.to_owned(),
                     client_id.to_owned(),
                     now,

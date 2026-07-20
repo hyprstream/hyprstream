@@ -169,12 +169,11 @@ impl PushedAuthRequest {
 }
 
 /// Server-side state stashed between `authorize_get` and `authorize_post`,
-/// keyed by the consent nonce (#1113 rev2). Carries the PAR-bound DPoP key
-/// thumbprint so it reaches the token endpoint without crossing the browser.
-#[derive(Debug, Clone, Default)]
+/// keyed by the consent nonce. Carries the complete resolved authorization
+/// request so hidden form fields never become mutable authority on POST.
+#[derive(Debug, Clone)]
 pub struct AuthorizeBinding {
-    /// DPoP `jkt` verified at PAR. `None` for non-PAR / non-DPoP requests.
-    pub dpop_jkt: Option<String>,
+    pub request: super::authorize::AuthorizeParams,
 }
 
 #[cfg(test)]
@@ -228,7 +227,7 @@ mod tests {
             anyhow::bail!("not used")
         }
 
-        async fn set_profile(&self, _username: &str, _profile: UserProfile) -> anyhow::Result<()> {
+        async fn set_profile(&self, _username: &str, _profile: crate::auth::UserProfilePatch) -> anyhow::Result<()> {
             anyhow::bail!("not used")
         }
 
@@ -465,7 +464,7 @@ mod tests {
                     UserProfile {
                         atproto_did: Some("did:plc:abcdefghijklmnqrstuvwx2p".to_owned()),
                         ..Default::default()
-                    },
+                    }.into(),
                 )
                 .await
                 .unwrap();
@@ -524,6 +523,40 @@ mod tests {
         ]));
         assert!(!atproto_profile_active(&["read:*:*".to_owned()]));
         assert!(!atproto_profile_active(&[]));
+    }
+
+    #[tokio::test]
+    async fn authorize_binding_sweep_tracks_live_nonces() {
+        let store = Arc::new(KeyReadErrorStore { profile: UserProfile::default() });
+        let state = state_with_user_store(store);
+        let binding = AuthorizeBinding {
+            request: crate::services::oauth::authorize::AuthorizeParams {
+                client_id: "client".to_owned(),
+                redirect_uri: "https://client.example/callback".to_owned(),
+                code_challenge: "challenge".to_owned(),
+                code_challenge_method: "S256".to_owned(),
+                response_type: "code".to_owned(),
+                state: None,
+                scope: Some("read:*:*".to_owned()),
+                resource: None,
+                nonce: None,
+                dpop_jkt: None,
+            },
+        };
+        let now = Instant::now();
+        state.pending_nonces.write().await.insert("live".to_owned(), now + Duration::from_secs(60));
+        state.pending_nonces.write().await.insert("expired".to_owned(), now - Duration::from_secs(1));
+        let mut bindings = state.pending_authorize_bindings.write().await;
+        bindings.insert("live".to_owned(), binding.clone());
+        bindings.insert("expired".to_owned(), binding.clone());
+        bindings.insert("orphan".to_owned(), binding);
+        drop(bindings);
+
+        state.sweep_authorize_sessions(now).await;
+
+        let bindings = state.pending_authorize_bindings.read().await;
+        assert_eq!(bindings.len(), 1);
+        assert!(bindings.contains_key("live"));
     }
 
     /// #1113 rev2 finding 4: requested scopes are validated against the
@@ -817,11 +850,8 @@ pub struct OAuthState {
     /// Pending authorize nonces (single-use, 5-min TTL).
     /// Proves a nonce was issued by this server and hasn't been replayed.
     pub pending_nonces: RwLock<HashMap<String, Instant>>,
-    /// Server-side authorize-session bindings keyed by the consent nonce:
-    /// carries the PAR-bound `dpop_jkt` (#1113 rev2 finding 3) so the
-    /// DPoP key bound at PAR reaches `authorize_post` without crossing the
-    /// browser (a hidden form field would be client-controlled). Consumed
-    /// single-use alongside the nonce.
+    /// Complete resolved authorization requests, keyed and consumed alongside
+    /// the consent nonce so browser-carried fields are never authority.
     pub pending_authorize_bindings: RwLock<HashMap<String, AuthorizeBinding>>,
     /// Pending Pushed Authorization Requests (RFC 9126), keyed by `request_uri`.
     /// Single-use, 60s TTL. In-memory is correct here — no value to persistence.
@@ -1009,12 +1039,7 @@ impl OAuthState {
             token_db: None,
             policy_client,
             discovery_client,
-            // #1113 rev2 F5: canonicalize to exact origin (scheme://host[:port])
-            // so ALL emissions — token claims, metadata, redirect iss, userinfo
-            // endpoint — use the normalized origin, not raw external_url which
-            // may carry a trailing slash or path.
-            issuer_url: canonical_issuer_origin(&config.issuer_url())
-                .unwrap_or_else(|| config.issuer_url()),
+            issuer_url: config.issuer_url(),
             default_scopes: config.default_scopes.clone(),
             token_ttl: config.token_ttl_seconds,
             refresh_token_ttl: config.refresh_token_ttl_seconds,
@@ -1336,6 +1361,20 @@ impl OAuthState {
         subject_did_for(&self.issuer_url, subject)
     }
 
+    /// Origin-only issuer required by the atproto OAuth profile.
+    pub fn atproto_issuer_url(&self) -> String {
+        canonical_issuer_origin(&self.issuer_url).unwrap_or_else(|| self.issuer_url.clone())
+    }
+
+    /// Select the issuer used at a profile-sensitive mint/redirect boundary.
+    pub fn issuer_for_scopes(&self, scopes: &[String]) -> String {
+        if atproto_profile_active(scopes) {
+            self.atproto_issuer_url()
+        } else {
+            self.issuer_url.clone()
+        }
+    }
+
     /// Check whether an account is eligible for the atproto OAuth profile
     /// and return the account's mapped atproto DID (#1113 r5 / #1124 split).
     ///
@@ -1421,12 +1460,8 @@ impl OAuthState {
                     codes.retain(|_, code| !code.is_expired());
                 }
 
-                // Sweep expired authorize nonces (5-min TTL)
-                {
-                    let now = Instant::now();
-                    let mut nonces = state.pending_nonces.write().await;
-                    nonces.retain(|_, expiry| *expiry > now);
-                }
+                // Sweep expired authorize nonces and their request snapshots.
+                state.sweep_authorize_sessions(Instant::now()).await;
 
                 // Sweep expired PAR requests (60s TTL)
                 {
@@ -1472,6 +1507,13 @@ impl OAuthState {
                 state.sessions.sweep().await;
             }
         });
+    }
+
+    async fn sweep_authorize_sessions(&self, now: Instant) {
+        let mut nonces = self.pending_nonces.write().await;
+        nonces.retain(|_, expiry| *expiry > now);
+        let mut bindings = self.pending_authorize_bindings.write().await;
+        bindings.retain(|nonce, _| nonces.contains_key(nonce));
     }
 }
 
