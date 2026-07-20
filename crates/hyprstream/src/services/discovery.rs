@@ -1064,7 +1064,9 @@ impl PdsPublisher {
 
     /// Connect this publisher to the shared ES256 store's in-process
     /// lead→active transition. A weak reference avoids a publisher→store→
-    /// publisher reference cycle. Cross-`--ipc` delivery is deferred to #1123.
+    /// publisher reference cycle; if its target has been dropped, the hook
+    /// errors so rotation remains pending. Cross-`--ipc` delivery is deferred
+    /// to #1123.
     pub fn install_es256_promotion_hook(self: &Arc<Self>) -> AnyResult<()> {
         let publisher = Arc::downgrade(self);
         let store = self
@@ -1072,9 +1074,9 @@ impl PdsPublisher {
             .as_ref()
             .ok_or_else(|| anyhow!("no process-local ES256 store for promotion hook"))?;
         store.set_promotion_hook(Arc::new(move |key| {
-            let Some(publisher) = publisher.upgrade() else {
-                return Ok(());
-            };
+            let publisher = publisher
+                .upgrade()
+                .ok_or_else(|| anyhow!("PDS publisher dropped before ES256 promotion re-sign"))?;
             publisher.resign_head_with_key(&key).map(|_| ())
         }));
         // Reconcile once at installation too: if promotion happened before the
@@ -1845,9 +1847,9 @@ mod pds_store_tests {
             if injected_failure.swap(false, std::sync::atomic::Ordering::AcqRel) {
                 bail!("injected persisted-head re-sign failure");
             }
-            let Some(publisher) = weak_publisher.upgrade() else {
-                return Ok(());
-            };
+            let publisher = weak_publisher
+                .upgrade()
+                .ok_or_else(|| anyhow!("publisher dropped during retry test"))?;
             publisher.resign_head_with_key(&key).map(|_| ())
         }));
 
@@ -1898,6 +1900,69 @@ mod pds_store_tests {
         assert_eq!(
             es256_store.active_key().unwrap().verifying_key(),
             &new_vk
+        );
+    }
+
+    #[tokio::test]
+    async fn dropped_publisher_hook_keeps_rotation_pending_and_head_consistent() {
+        use crate::auth::key_rotation::{
+            rotate_es256_keys, Es256KeySlot, Es256KeySlots, Es256SigningKeyStore,
+        };
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pds_dir = dir.path().join("pds");
+        let secrets_dir = dir.path().join("secrets");
+        std::fs::create_dir_all(&secrets_dir).expect("create secrets dir");
+        let now = chrono::Utc::now().timestamp();
+        let old_sk = SigningKey::random(&mut rand::rngs::OsRng);
+        let old_vk: VerifyingKey = *old_sk.verifying_key();
+        let new_sk = SigningKey::random(&mut rand::rngs::OsRng);
+        let new_vk: VerifyingKey = *new_sk.verifying_key();
+
+        let store = Arc::new(PdsRecordStore::open(&pds_dir).expect("open rw"));
+        let es256_store = Arc::new(Es256SigningKeyStore::new(Es256KeySlots {
+            drain: None,
+            active: Some(Es256KeySlot::new(old_sk, now - 100, now + 1)),
+            lead: Some(Es256KeySlot::new(new_sk, now - 1, now + 30 * 86_400)),
+        }));
+        let publisher = Arc::new(PdsPublisher::new(
+            Arc::clone(&store),
+            DID.to_owned(),
+            Arc::clone(&es256_store),
+        ));
+        publisher.publish("repo-a", SAMPLE_OID).expect("publish");
+        publisher
+            .install_es256_promotion_hook()
+            .expect("install promotion hook");
+        drop(publisher);
+
+        assert!(
+            !rotate_es256_keys(
+                &crate::config::OAuthConfig::default(),
+                &secrets_dir,
+                &es256_store,
+                now,
+            )
+            .await,
+            "a stale weak hook must leave promotion pending"
+        );
+
+        let slots = es256_store.0.read();
+        assert_eq!(slots.active.as_ref().unwrap().key.verifying_key(), &old_vk);
+        assert_eq!(slots.lead.as_ref().unwrap().key.verifying_key(), &new_vk);
+        assert!(slots.drain.is_none());
+        drop(slots);
+
+        let head = store
+            .load_repo(DID)
+            .expect("load")
+            .expect("repo present")
+            .commit;
+        head.verify(&old_vk)
+            .expect("head must remain signed by the still-live old key");
+        assert!(
+            head.verify(&new_vk).is_err(),
+            "candidate key must not sign or become live after publisher drop"
         );
     }
 
