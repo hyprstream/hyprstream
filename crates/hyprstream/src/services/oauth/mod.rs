@@ -1116,6 +1116,33 @@ mod tests {
         )
     }
 
+    fn private_key_jwt_assertion(
+        signing_key: &p256::ecdsa::SigningKey,
+        client_id: &str,
+        audience: &str,
+        jti: &str,
+    ) -> String {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+        use p256::ecdsa::signature::Signer as _;
+
+        let header = serde_json::json!({"alg": "ES256", "typ": "JWT", "kid": "private-k1"});
+        let claims = serde_json::json!({
+            "iss": client_id,
+            "sub": client_id,
+            "aud": audience,
+            "exp": chrono::Utc::now().timestamp() + 60,
+            "jti": jti,
+        });
+        let header = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&header).unwrap());
+        let claims = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).unwrap());
+        let signing_input = format!("{header}.{claims}");
+        let signature: p256::ecdsa::Signature = signing_key.sign(signing_input.as_bytes());
+        format!(
+            "{signing_input}.{}",
+            URL_SAFE_NO_PAD.encode(signature.to_bytes())
+        )
+    }
+
     fn jwt_claims(token: &str) -> serde_json::Value {
         use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 
@@ -1234,6 +1261,7 @@ mod tests {
         const ISSUER: &str = "https://pds.example.test";
         const GENERIC_ISSUER: &str = "https://pds.example.test/configured/path";
         const CLIENT_ID: &str = "handler-client";
+        const PRIVATE_CLIENT_ID: &str = "handler-private-client";
         const REDIRECT_URI: &str = "https://client.example.test/callback";
         const MAPPED_DID: &str = "did:plc:abcdefghijklmnqrstuvwx2p";
         const PKCE_VERIFIER: &str = "r5-handler-pkce-verifier-abcdefghijklmnopqrstuvwxyz012345";
@@ -1349,6 +1377,33 @@ mod tests {
                 jwks_uri: None,
                 hyprstream_node_did: None,
                 scope: Some("atproto read:*:*".to_owned()),
+                is_cimd: false,
+                registered_at: std::time::Instant::now(),
+            },
+        );
+        let private_client_key = p256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
+        let private_client_point = private_client_key.verifying_key().to_encoded_point(false);
+        state.clients.write().await.insert(
+            PRIVATE_CLIENT_ID.to_owned(),
+            RegisteredClient {
+                client_id: PRIVATE_CLIENT_ID.to_owned(),
+                redirect_uris: vec![REDIRECT_URI.to_owned()],
+                client_name: Some("Handler Private Client".to_owned()),
+                client_uri: None,
+                logo_uri: None,
+                grant_types: vec!["authorization_code".to_owned()],
+                response_types: vec!["code".to_owned()],
+                token_endpoint_auth_method: Some("private_key_jwt".to_owned()),
+                jwks: Some(serde_json::json!({"keys": [{
+                    "kty": "EC",
+                    "crv": "P-256",
+                    "x": URL_SAFE_NO_PAD.encode(private_client_point.x().unwrap()),
+                    "y": URL_SAFE_NO_PAD.encode(private_client_point.y().unwrap()),
+                    "kid": "private-k1",
+                }]})),
+                jwks_uri: None,
+                hyprstream_node_did: None,
+                scope: Some("atproto".to_owned()),
                 is_cimd: false,
                 registered_at: std::time::Instant::now(),
             },
@@ -1492,6 +1547,147 @@ mod tests {
         assert_eq!(claims["iss"], ISSUER);
         assert_eq!(claims["sub"], MAPPED_DID);
         assert_eq!(claims["aud"], ISSUER);
+
+        // A confidential atproto client signs private_key_jwt for the
+        // canonical token endpoint advertised by the atproto metadata, even
+        // though the configured generic issuer carries a path.
+        let advertised_metadata = response_json(
+            get(&app, "/.well-known/oauth-authorization-server").await,
+        ).await;
+        let advertised_token_endpoint = advertised_metadata["token_endpoint"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert_eq!(advertised_token_endpoint, format!("{ISSUER}/oauth/token"));
+
+        let private_dpop_key = p256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
+        let private_verifier = "private-client-pkce-verifier-abcdefghijklmnopqrstuvwxyz012345";
+        let private_challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(private_verifier.as_bytes()));
+        let private_par_proof = dpop_proof(
+            &private_dpop_key,
+            &format!("{ISSUER}/oauth/par"),
+            "private-client-par-jti",
+            None,
+        );
+        let private_par = post_form(
+            &app,
+            "/oauth/par",
+            &[
+                ("client_id", PRIVATE_CLIENT_ID),
+                ("redirect_uri", REDIRECT_URI),
+                ("code_challenge", &private_challenge),
+                ("code_challenge_method", "S256"),
+                ("response_type", "code"),
+                ("state", "private-client-state"),
+                ("scope", "atproto"),
+                ("resource", ISSUER),
+            ],
+            Some(&private_par_proof),
+            false,
+        ).await;
+        assert_eq!(private_par.status(), axum::http::StatusCode::CREATED);
+        let private_dpop_nonce = private_par.headers()
+            .get("DPoP-Nonce")
+            .and_then(|value| value.to_str().ok())
+            .unwrap()
+            .to_owned();
+        let private_par_json = response_json(private_par).await;
+        let private_request_uri = private_par_json["request_uri"].as_str().unwrap();
+        let private_authorize_uri = format!(
+            "/oauth/authorize?{}",
+            encode_form(&[
+                ("request_uri", private_request_uri),
+                ("client_id", PRIVATE_CLIENT_ID),
+            ])
+        );
+        let private_authorize = get(&app, &private_authorize_uri).await;
+        assert_eq!(private_authorize.status(), axum::http::StatusCode::OK);
+        let private_authorize_html = response_text(private_authorize).await;
+        let private_nonce = html_hidden_value(&private_authorize_html, "nonce").to_owned();
+        let private_signed = format!("{fingerprint}:{private_nonce}:{private_challenge}");
+        let private_signature = STANDARD.encode(user_key.sign(private_signed.as_bytes()).to_bytes());
+        let private_callback = post_form(
+            &app,
+            "/oauth/authorize",
+            &[
+                ("client_id", PRIVATE_CLIENT_ID),
+                ("redirect_uri", REDIRECT_URI),
+                ("code_challenge", &private_challenge),
+                ("scope", "atproto"),
+                ("state", "private-client-state"),
+                ("resource", ISSUER),
+                ("nonce", &private_nonce),
+                ("fingerprint", &fingerprint),
+                ("signature", &private_signature),
+            ],
+            None,
+            false,
+        ).await;
+        assert_eq!(private_callback.status(), axum::http::StatusCode::SEE_OTHER);
+        let private_location = private_callback.headers()
+            .get(axum::http::header::LOCATION)
+            .and_then(|value| value.to_str().ok())
+            .unwrap();
+        let private_location = url::Url::parse(private_location)?;
+        let private_callback_params: std::collections::HashMap<_, _> =
+            private_location.query_pairs().into_owned().collect();
+        let private_code = private_callback_params["code"].clone();
+        let private_token_proof = dpop_proof(
+            &private_dpop_key,
+            &advertised_token_endpoint,
+            "private-client-token-jti",
+            Some(&private_dpop_nonce),
+        );
+        let assertion_type = super::client_auth::JWT_BEARER_ASSERTION_TYPE;
+        let wrong_assertion = private_key_jwt_assertion(
+            &private_client_key,
+            PRIVATE_CLIENT_ID,
+            "https://attacker.example/oauth/token",
+            "private-client-wrong-aud",
+        );
+        let wrong_audience = post_form(
+            &app,
+            "/oauth/token",
+            &[
+                ("grant_type", "authorization_code"),
+                ("client_id", PRIVATE_CLIENT_ID),
+                ("code", &private_code),
+                ("redirect_uri", REDIRECT_URI),
+                ("code_verifier", private_verifier),
+                ("client_assertion_type", assertion_type),
+                ("client_assertion", &wrong_assertion),
+            ],
+            Some(&private_token_proof),
+            false,
+        ).await;
+        assert_eq!(wrong_audience.status(), axum::http::StatusCode::UNAUTHORIZED);
+        assert_eq!(response_json(wrong_audience).await["error"], "invalid_client");
+
+        let canonical_assertion = private_key_jwt_assertion(
+            &private_client_key,
+            PRIVATE_CLIENT_ID,
+            &advertised_token_endpoint,
+            "private-client-canonical-aud",
+        );
+        let private_token = post_form(
+            &app,
+            "/oauth/token",
+            &[
+                ("grant_type", "authorization_code"),
+                ("client_id", PRIVATE_CLIENT_ID),
+                ("code", &private_code),
+                ("redirect_uri", REDIRECT_URI),
+                ("code_verifier", private_verifier),
+                ("client_assertion_type", assertion_type),
+                ("client_assertion", &canonical_assertion),
+            ],
+            Some(&private_token_proof),
+            false,
+        ).await;
+        assert_eq!(private_token.status(), axum::http::StatusCode::OK);
+        let private_token_json = response_json(private_token).await;
+        assert_eq!(private_token_json["token_type"], "DPoP");
+        assert_eq!(jwt_claims(private_token_json["access_token"].as_str().unwrap())["iss"], ISSUER);
 
         // A missing refresh proof is rejected before consumption. Retrying
         // the same refresh token with the bound key and nonce must succeed.

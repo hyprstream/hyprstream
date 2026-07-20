@@ -185,6 +185,32 @@ pub async fn exchange_token(
 ///
 /// Returns Ok on success; the caller proceeds with the grant. Returns
 /// Err(Response) with the appropriate token error response on failure.
+async fn bound_grant_scopes(
+    state: &OAuthState,
+    params: &TokenRequest,
+) -> Option<Vec<String>> {
+    match params.grant_type.as_str() {
+        "authorization_code" => {
+            let code = params.code.as_deref()?;
+            let pending = state.pending_codes.read().await;
+            let entry = pending.get(code)?;
+            (entry.client_id == params.client_id).then(|| entry.scopes.clone())
+        }
+        "refresh_token" => {
+            let refresh_token = params.refresh_token.as_deref()?;
+            let entry = state.get_refresh_token(refresh_token).await.ok().flatten()?;
+            (entry.client_id == params.client_id).then_some(entry.scopes)
+        }
+        gt if gt == DEVICE_CODE_GRANT_TYPE => {
+            let device_code = params.device_code.as_deref()?;
+            let pending = state.pending_device_codes.read().await;
+            let entry = pending.get(device_code)?;
+            (entry.client_id == params.client_id).then(|| entry.scopes.clone())
+        }
+        _ => None,
+    }
+}
+
 async fn enforce_client_authentication(
     state: &OAuthState,
     params: &TokenRequest,
@@ -244,10 +270,15 @@ async fn enforce_client_authentication(
     if has_assertion {
         let assertion = params.client_assertion.as_deref().unwrap_or_else(|| unreachable!());
         let atype = params.client_assertion_type.as_deref().unwrap_or_else(|| unreachable!());
-        let token_endpoint = format!(
-            "{}/oauth/token",
-            state.issuer_url.trim_end_matches('/')
-        );
+        // Derive the assertion audience from the immutable grant, not from
+        // caller-supplied scopes. atproto grants use the origin-only endpoint
+        // advertised in RFC 8414 metadata; generic grants preserve the
+        // configured path-bearing issuer.
+        let issuer = match bound_grant_scopes(state, params).await {
+            Some(scopes) => state.issuer_for_scopes(&scopes),
+            None => state.issuer_url.clone(),
+        };
+        let token_endpoint = format!("{}/oauth/token", issuer.trim_end_matches('/'));
         if let Err(e) = super::client_auth::verify_client_assertion(
             state, &client, atype, assertion, &token_endpoint,
         ).await {
