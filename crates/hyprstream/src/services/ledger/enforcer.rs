@@ -225,10 +225,15 @@ impl LocalEnforcer {
         //    Minting is a pure hash of (grant_cid, nonce) — no side effects.
         let transfer_id = mint_transfer_id(&req.grant_cid, req.nonce);
 
-        // 6. Spend-authorization verification (§5.3). Required by default; a
-        //    Classical-only client passes no PQ key and is verified under the
-        //    Classical policy (labeled, not rejected).
-        if req.amount > 0 {
+        // 6. Spend-authorization verification (§5.3). Required for EVERY
+        //    admission, including zero-amount metered-rate jobs: `Admitted` is
+        //    the decision that permits work to start, and a zero reservation
+        //    cannot be converted into a nonzero post later — so an unsigned
+        //    zero admission would be unauthenticated work, not harmless
+        //    accounting (PR #1129 review, finding 1). A Classical-only client
+        //    passes no PQ key and is verified under the Classical policy
+        //    (labeled, not rejected).
+        {
             match &req.spend_authz {
                 Some(authz) => {
                     let ed_vk = match &req.subject_ed_vk {
@@ -246,6 +251,17 @@ impl LocalEnforcer {
                         return AdmissionResult::Rejected(Rejection::hard(
                             DenyReason::InvalidSpendAuthorization(
                                 "authz not bound to this grant/host".to_owned(),
+                            ),
+                        ));
+                    }
+                    // The signed expiry bounds the authorization itself: `exp`
+                    // is in the signed digest but was never compared to `now`,
+                    // leaving a bound authz valid forever (PR #1129 review,
+                    // finding 2). Fail closed at the boundary, like grant.exp.
+                    if now >= authz.exp {
+                        return AdmissionResult::Rejected(Rejection::hard(
+                            DenyReason::InvalidSpendAuthorization(
+                                "spend authorization expired".to_owned(),
                             ),
                         ));
                     }
@@ -562,6 +578,7 @@ mod tests {
         host: &Did,
         transfer_nonce: u128,
         max_amount: u128,
+        exp: u64,
         ed_sk: &ed25519_dalek::SigningKey,
         pq_sk: &hyprstream_crypto::pq::MlDsaSigningKey,
     ) -> (
@@ -576,7 +593,7 @@ mod tests {
             host: host.clone(),
             transfer_id,
             max_amount,
-            exp: u64::MAX,
+            exp,
             signature: Vec::new(),
         };
         let digest = authz.digest();
@@ -616,7 +633,7 @@ mod tests {
     async fn authz_for_different_transfer_denied_hard() {
         let (enf, holder, grant_cid, _debit, _credit, ed_sk, pq_sk) = fixture(1000).await;
         let (authz, ed_vk, pq_vk, _tid) =
-            signed_authz(&grant_cid, enf.cell_identity(), 7, 100, &ed_sk, &pq_sk);
+            signed_authz(&grant_cid, enf.cell_identity(), 7, 100, u64::MAX, &ed_sk, &pq_sk);
         let req = AdmissionRequest {
             subject: Some(holder),
             grant_cid,
@@ -640,11 +657,73 @@ mod tests {
         }
     }
 
+    /// PR #1129 review finding 1: `Admitted` permits work to start, so a
+    /// zero-amount (metered-rate) admission without a spend authorization is
+    /// unauthenticated work, not harmless accounting. Must hard-reject.
+    #[tokio::test]
+    async fn zero_amount_without_authz_denied_hard() {
+        let (enf, holder, grant_cid, _debit, _credit, _ed_sk, _pq_sk) = fixture(1000).await;
+        let req = AdmissionRequest {
+            subject: Some(holder),
+            grant_cid,
+            unit: unit(),
+            amount: 0,
+            nonce: 9,
+            spend_authz: None,
+            subject_ed_vk: None,
+            subject_pq_vk: None,
+        };
+        match enf.admit(&req, 0).await {
+            AdmissionResult::Rejected(r) => {
+                assert!(
+                    matches!(r.reason, DenyReason::InvalidSpendAuthorization(_)),
+                    "expected InvalidSpendAuthorization, got {:?}",
+                    r.reason
+                );
+                assert!(r.retry_after_secs.is_none(), "must be a hard reject");
+            }
+            other => panic!("zero-amount admission without authz must be denied, got {other:?}"),
+        }
+    }
+
+    /// PR #1129 review finding 2: `authz.exp` is in the signed digest but was
+    /// never compared to `now` — a correctly bound authorization stayed valid
+    /// forever. A valid, correctly bound, expired authz must hard-reject.
+    #[tokio::test]
+    async fn expired_authz_denied_hard() {
+        let (enf, holder, grant_cid, _debit, _credit, ed_sk, pq_sk) = fixture(1000).await;
+        // Valid signature, right grant/host/nonce/transfer id — but exp = 5.
+        let (authz, ed_vk, pq_vk, _tid) =
+            signed_authz(&grant_cid, enf.cell_identity(), 7, 100, 5, &ed_sk, &pq_sk);
+        let req = AdmissionRequest {
+            subject: Some(holder),
+            grant_cid,
+            unit: unit(),
+            amount: 100,
+            nonce: 7,
+            spend_authz: Some(authz),
+            subject_ed_vk: Some(ed_vk),
+            subject_pq_vk: Some(pq_vk),
+        };
+        // now == exp is already expired (>=, mirroring the grant-expiry check).
+        match enf.admit(&req, 5).await {
+            AdmissionResult::Rejected(r) => {
+                assert!(
+                    matches!(r.reason, DenyReason::InvalidSpendAuthorization(_)),
+                    "expected InvalidSpendAuthorization, got {:?}",
+                    r.reason
+                );
+                assert!(r.retry_after_secs.is_none(), "must be a hard reject");
+            }
+            other => panic!("expired authz must be denied, got {other:?}"),
+        }
+    }
+
     #[tokio::test]
     async fn admitted_then_post_and_void_roundtrip() {
         let (enf, holder, grant_cid, debit, credit, ed_sk, pq_sk) = fixture(1000).await;
         let (authz, ed_vk, pq_vk, _tid) =
-            signed_authz(&grant_cid, enf.cell_identity(), 7, 100, &ed_sk, &pq_sk);
+            signed_authz(&grant_cid, enf.cell_identity(), 7, 100, u64::MAX, &ed_sk, &pq_sk);
         let req = AdmissionRequest {
             subject: Some(holder.clone()),
             grant_cid: grant_cid.clone(),
@@ -747,7 +826,7 @@ mod tests {
     async fn insufficient_credit_rejects_retryable_not_queues() {
         let (enf, holder, grant_cid, _debit, _credit, ed_sk, pq_sk) = fixture(100).await;
         let (authz, ed_vk, pq_vk, _) =
-            signed_authz(&grant_cid, enf.cell_identity(), 1, 500, &ed_sk, &pq_sk);
+            signed_authz(&grant_cid, enf.cell_identity(), 1, 500, u64::MAX, &ed_sk, &pq_sk);
         let req = AdmissionRequest {
             subject: Some(holder),
             grant_cid,
