@@ -218,6 +218,13 @@ impl LocalEnforcer {
             return AdmissionResult::Rejected(Rejection::hard(DenyReason::UnknownUnit));
         }
 
+        // 6. Mint the deterministic transfer id (idempotency key) BEFORE authz
+        //    verification: the signed authorization must bind to exactly this
+        //    id, or one signed authz replays across arbitrarily many distinct
+        //    nonces up to `max_amount` each for its whole `exp` window (#985).
+        //    Minting is a pure hash of (grant_cid, nonce) — no side effects.
+        let transfer_id = mint_transfer_id(&req.grant_cid, req.nonce);
+
         // 6. Spend-authorization verification (§5.3). Required by default; a
         //    Classical-only client passes no PQ key and is verified under the
         //    Classical policy (labeled, not rejected).
@@ -239,6 +246,18 @@ impl LocalEnforcer {
                         return AdmissionResult::Rejected(Rejection::hard(
                             DenyReason::InvalidSpendAuthorization(
                                 "authz not bound to this grant/host".to_owned(),
+                            ),
+                        ));
+                    }
+                    // #985 pre-activation gate: the signed transfer id must be
+                    // THE transfer id this admission mints. `transfer_id` is in
+                    // the signed digest, so without this equality a single
+                    // authorization authenticates unlimited distinct transfers
+                    // (replay-amplification within the subject's own credit).
+                    if authz.transfer_id != transfer_id {
+                        return AdmissionResult::Rejected(Rejection::hard(
+                            DenyReason::InvalidSpendAuthorization(
+                                "authz transfer id does not match this transfer".to_owned(),
                             ),
                         ));
                     }
@@ -269,10 +288,7 @@ impl LocalEnforcer {
             }
         }
 
-        // 7. Mint the deterministic transfer id (idempotency key).
-        let transfer_id = mint_transfer_id(&req.grant_cid, req.nonce);
-
-        // 8. Balance gate: sync CAS on the materialized cell. Cold gate /
+        // 7. Balance gate: sync CAS on the materialized cell. Cold gate /
         //    insufficient credit ⇒ retryable reject, never queue.
         let hold = match self.gate.try_hold(&req.grant_cid, req.amount) {
             Ok(h) => h,
@@ -589,6 +605,38 @@ mod tests {
                 assert!(r.retry_after_secs.is_none());
             }
             _ => panic!("anonymous must be denied"),
+        }
+    }
+
+    /// #985: an authorization signed for one transfer must not admit another.
+    /// The happy-path test reuses the signing nonce as the request nonce, which
+    /// masked the missing equality check — this signs for nonce 7 and submits
+    /// nonce 8, so the signature verifies but the minted transfer id differs.
+    #[tokio::test]
+    async fn authz_for_different_transfer_denied_hard() {
+        let (enf, holder, grant_cid, _debit, _credit, ed_sk, pq_sk) = fixture(1000).await;
+        let (authz, ed_vk, pq_vk, _tid) =
+            signed_authz(&grant_cid, enf.cell_identity(), 7, 100, &ed_sk, &pq_sk);
+        let req = AdmissionRequest {
+            subject: Some(holder),
+            grant_cid,
+            unit: unit(),
+            amount: 100,
+            nonce: 8, // ≠ the nonce the authz was minted/signed for
+            spend_authz: Some(authz),
+            subject_ed_vk: Some(ed_vk),
+            subject_pq_vk: Some(pq_vk),
+        };
+        match enf.admit(&req, 0).await {
+            AdmissionResult::Rejected(r) => {
+                assert!(
+                    matches!(r.reason, DenyReason::InvalidSpendAuthorization(_)),
+                    "expected InvalidSpendAuthorization, got {:?}",
+                    r.reason
+                );
+                assert!(r.retry_after_secs.is_none(), "must be a hard reject");
+            }
+            other => panic!("authz for a different transfer must be denied, got {other:?}"),
         }
     }
 
