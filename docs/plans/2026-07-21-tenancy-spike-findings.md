@@ -10,6 +10,29 @@ inverted when the gap is fixed.
 unauthenticated relay publish are demonstrated end-to-end on loopback. Per the issue,
 this blocks second-customer onboarding on shared hosting until follow-ups land.
 
+## Verification basis (drift note)
+
+All tests and line citations were verified against local base `c47e0200` (branch point).
+After an orchestrator drift note, every cited production site was re-checked against
+`origin/main` (94 commits ahead) on 2026-07-21:
+
+- Upstream changes to `crates/hyprstream/src/mac/` (compiled.rs, te.rs,
+  permission_map.rs, exchange.rs, bootload.rs) are the S5 approval-binding work for
+  compiled-policy distribution — orthogonal to every finding here; no finding cites the
+  MAC tree, and none of the event-prefix/wrapped-key code paths (policy.rs handlers,
+  policy_manager matcher, group_key.rs, event_crypto.rs) changed upstream.
+- `quinn_transport.rs` upstream adds browser-RPC carrier plumbing only; the gap sites
+  are unchanged in substance at origin/main (anonymous peer now at :437, fail-open
+  `None => consumer` at :459, unguarded relay at :415).
+- `services/policy.rs` upstream changes token minting (hybrid mandatory) only;
+  hardcoded `r.dom="*"` now at :261, unguarded `prefixes.insert` now at :1114.
+- `services/registry.rs` upstream adds moq reach-config plumbing only;
+  `domain: "*"` authorize now at :1717, fail-open list filter `unwrap_or(true)` at
+  :1747-1749.
+
+All findings stand at origin/main; the gap tests were executed at `c47e0200` (they are
+committed on this branch and will re-run wherever the branch lands).
+
 ## Verdict summary
 
 | Plane | Verdict | Evidence |
