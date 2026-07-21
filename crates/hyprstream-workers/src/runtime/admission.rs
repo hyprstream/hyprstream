@@ -1248,6 +1248,161 @@ mod tests {
         assert_eq!(derive_group_selector(&config), None);
     }
 
+    // ── #1128 Plane 1: concurrent two-subject stress — no cross-credit ─────
+
+    /// Tenancy isolation (#1128, Plane 1): two subjects hammering one tracker
+    /// concurrently never share quota credit. Each subject is independently
+    /// bounded by `max_per_subject`; quota excess rejects (`AdmissionDenied`)
+    /// rather than succeeding or queueing; and counters drain fully on release
+    /// so each subject can again acquire exactly N afterwards.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_two_subjects_no_cross_credit() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        const N: usize = 4;
+        const TASKS_PER_SUBJECT: usize = 32;
+        const ITERS_PER_TASK: usize = 8;
+
+        let cfg = AdmissionConfig {
+            max_per_subject: Some(N),
+            ..Default::default()
+        };
+        let tracker = Arc::new(AdmissionTracker::new(cfg, 64));
+
+        struct SubjectStats {
+            in_flight: AtomicUsize,
+            max_seen: AtomicUsize,
+            denials: AtomicUsize,
+        }
+        let stats_a = Arc::new(SubjectStats {
+            in_flight: AtomicUsize::new(0),
+            max_seen: AtomicUsize::new(0),
+            denials: AtomicUsize::new(0),
+        });
+        let stats_b = Arc::new(SubjectStats {
+            in_flight: AtomicUsize::new(0),
+            max_seen: AtomicUsize::new(0),
+            denials: AtomicUsize::new(0),
+        });
+
+        async fn hammer(
+            tracker: Arc<AdmissionTracker>,
+            subject: Subject,
+            stats: Arc<SubjectStats>,
+        ) {
+            for _ in 0..ITERS_PER_TASK {
+                match tracker.reserve(&subject, None, demand(0, 0, 0)).await {
+                    Ok(record) => {
+                        let now = stats.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                        stats.max_seen.fetch_max(now, Ordering::SeqCst);
+                        assert!(
+                            now <= N,
+                            "subject '{}' exceeded per-subject quota ({now}/{N})",
+                            subject.name().unwrap_or("")
+                        );
+                        tracker.release(&record).await;
+                        stats.in_flight.fetch_sub(1, Ordering::SeqCst);
+                    }
+                    // Quota excess must reject, never succeed or queue.
+                    Err(WorkerError::AdmissionDenied { .. }) => {
+                        stats.denials.fetch_add(1, Ordering::SeqCst);
+                    }
+                    Err(e) => panic!("unexpected admission error: {e:?}"),
+                }
+                tokio::task::yield_now().await;
+            }
+        }
+
+        let mut set = tokio::task::JoinSet::new();
+        for _ in 0..TASKS_PER_SUBJECT {
+            set.spawn(hammer(
+                tracker.clone(),
+                Subject::new("tenant-a"),
+                stats_a.clone(),
+            ));
+            set.spawn(hammer(
+                tracker.clone(),
+                Subject::new("tenant-b"),
+                stats_b.clone(),
+            ));
+        }
+        while let Some(res) = set.join_next().await {
+            res.expect("hammer task panicked");
+        }
+
+        // (a) Each subject hit — but never exceeded — its own ceiling of N,
+        //     and quota excess rejected rather than succeeding.
+        for (name, stats) in [("tenant-a", &stats_a), ("tenant-b", &stats_b)] {
+            assert_eq!(
+                stats.max_seen.load(Ordering::SeqCst),
+                N,
+                "{name}: quota ceiling should have been reached under contention"
+            );
+            assert!(
+                stats.denials.load(Ordering::SeqCst) > 0,
+                "{name}: excess reserves must reject with AdmissionDenied"
+            );
+            // (b) All reservations were released; nothing leaked.
+            assert_eq!(stats.in_flight.load(Ordering::SeqCst), 0);
+        }
+
+        // (c) Independent per-subject accounting: consume A's whole quota and
+        //     confirm B is entirely unaffected (no group partition here).
+        let subj_a = Subject::new("tenant-a");
+        let subj_b = Subject::new("tenant-b");
+        let mut held_a = Vec::new();
+        for _ in 0..N {
+            held_a.push(
+                tracker
+                    .reserve(&subj_a, None, demand(0, 0, 0))
+                    .await
+                    .expect("tenant-a re-acquire after drain"),
+            );
+        }
+        let a_excess = tracker.reserve(&subj_a, None, demand(0, 0, 0)).await;
+        assert!(
+            matches!(a_excess, Err(WorkerError::AdmissionDenied { .. })),
+            "tenant-a at quota must reject: {a_excess:?}"
+        );
+        let mut held_b = Vec::new();
+        for _ in 0..N {
+            held_b.push(
+                tracker
+                    .reserve(&subj_b, None, demand(0, 0, 0))
+                    .await
+                    .expect("tenant-b unaffected by tenant-a's exhausted quota"),
+            );
+        }
+        let b_excess = tracker.reserve(&subj_b, None, demand(0, 0, 0)).await;
+        assert!(
+            matches!(b_excess, Err(WorkerError::AdmissionDenied { .. })),
+            "tenant-b has its own independent ceiling: {b_excess:?}"
+        );
+
+        // Drain both: each can again acquire exactly N.
+        for r in held_a.iter().chain(held_b.iter()) {
+            tracker.release(r).await;
+        }
+        for subject in [&subj_a, &subj_b] {
+            let mut held = Vec::new();
+            for _ in 0..N {
+                held.push(
+                    tracker
+                        .reserve(subject, None, demand(0, 0, 0))
+                        .await
+                        .expect("counter drained: exactly N re-acquirable"),
+                );
+            }
+            assert!(matches!(
+                tracker.reserve(subject, None, demand(0, 0, 0)).await,
+                Err(WorkerError::AdmissionDenied { .. })
+            ));
+            for r in &held {
+                tracker.release(r).await;
+            }
+        }
+    }
+
     #[tokio::test]
     async fn derive_demand_reads_cpu_memory_and_gpu_annotation() {
         let mut config = PodSandboxConfig::default();

@@ -610,6 +610,35 @@ mod tests {
         assert!(fs_b.namespace().cat("/etc/written-by-a", &subj_b).await.is_err());
     }
 
+    /// #1128 Plane-2 caveat: `Subject` is **attribution-only, NOT an
+    /// enforcement token**. Passing tenant-B's `Subject` as the caller on
+    /// tenant-A's namespace still reads tenant-A's files — the production
+    /// `Mount` impls ignore the caller (`_caller: &Subject`, e.g.
+    /// `crates/hyprstream-vfs/src/injected.rs`). Tenant isolation therefore
+    /// holds purely by per-sandbox namespace privacy (proven by
+    /// `two_sandboxes_are_isolated` above), not by per-op subject
+    /// authorization. Recorded as a known gap under issue #1128.
+    #[tokio::test]
+    async fn subject_is_attribution_only_not_guard_gap1128() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = store_with_image(tmp.path(), "img:a", &[("etc/secret", b"SECRET-A\n")]);
+        let fs_a = SandboxFs::compose(
+            &store,
+            "img:a",
+            &tmp.path().join("sandbox-a"),
+            Subject::new("tenant-a"),
+            SyntheticNode::dir(),
+            SyntheticNode::dir(),
+        )
+        .unwrap();
+
+        // tenant-B's Subject on tenant-A's namespace: the read SUCCEEDS. The
+        // caller is carried for attribution only; nothing authorizes it.
+        let subj_b = Subject::new("tenant-b");
+        let got = fs_a.namespace().cat("/etc/secret", &subj_b).await.unwrap();
+        assert_eq!(got, b"SECRET-A\n");
+    }
+
     /// Fail-closed: composing with a missing image bootstrap hard-errors rather
     /// than serving an empty / partial namespace.
     #[test]
