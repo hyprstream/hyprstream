@@ -243,6 +243,9 @@ impl ToCapnp for Claims {
                 builder.set_pub_key(&jwk.x);
             }
         }
+        if let Some(ref scope) = self.scope {
+            builder.set_oauth_scope(scope);
+        }
         // Write empty scopes list for wire compatibility
         builder.reborrow().init_scopes(0);
     }
@@ -252,9 +255,15 @@ impl FromCapnp for Claims {
     type Reader<'a> = common_capnp::claims::Reader<'a>;
 
     fn read_from(reader: Self::Reader<'_>) -> Result<Self> {
-        // Scopes on the wire are ignored - authorization is via Casbin
         let aud = reader
             .get_aud()
+            .ok()
+            .and_then(|s| s.to_str().ok())
+            .map(std::borrow::ToOwned::to_owned)
+            .filter(|s| !s.is_empty());
+
+        let scope = reader
+            .get_oauth_scope()
             .ok()
             .and_then(|s| s.to_str().ok())
             .map(std::borrow::ToOwned::to_owned)
@@ -295,9 +304,9 @@ impl FromCapnp for Claims {
             iat: reader.get_iat(),
             jti: None,
             aud,
-            // OAuth scopes are JWT-carried authority and deliberately are not
-            // reconstructed from the legacy Cap'n Proto scope list.
-            scope: None,
+            // The dedicated OAuth field preserves the signed grant ceiling;
+            // the legacy structured scope list remains unused by Claims.
+            scope,
             cnf,
             token,
             // MAC clearance (S8/#574) is not carried on the Cap'n Proto envelope
@@ -558,6 +567,21 @@ mod tests {
             scoped.granted_scopes().collect::<Vec<_>>(),
             vec!["atproto", "transition:generic"]
         );
+    }
+
+    #[test]
+    fn oauth_scope_survives_capnp_envelope_roundtrip() -> anyhow::Result<()> {
+        let claims = Claims::new("alice".to_owned(), 1000, 2000)
+            .with_scope(Some("atproto transition:generic".to_owned()));
+        let mut message = capnp::message::Builder::new_default();
+        let mut builder = message.init_root::<common_capnp::claims::Builder>();
+        claims.write_to(&mut builder);
+
+        let decoded = Claims::read_from(builder.into_reader())?;
+        assert_eq!(decoded.scope, claims.scope);
+        assert!(decoded.has_scope("atproto"));
+        assert!(decoded.has_scope("transition:generic"));
+        Ok(())
     }
 
     #[test]

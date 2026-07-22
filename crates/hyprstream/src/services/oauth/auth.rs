@@ -194,10 +194,10 @@ pub async fn require_bearer_token(
 /// surface. PolicyService mints composite tokens, while classical EdDSA remains
 /// accepted for explicitly classical deployments and legacy rotation slots.
 ///
-/// Audience and issuer are mandatory here: the OAuth server is its own RFC 9728
-/// protected resource, whose canonical resource identifier is the origin-only
-/// atproto issuer. A configured issuer carrying a path remains a valid issuer
-/// for generic-profile tokens minted by this same server, but never an audience.
+/// Audience and issuer are mandatory here. The canonical origin is the OAuth
+/// server's RFC 9728 resource identifier, while the configured issuer remains
+/// an accepted local audience alias for default-audience tokens minted before
+/// the resource indicator is known. No other audience is accepted.
 pub(super) async fn validate_oauth_access_token(
     state: &OAuthState,
     token: &str,
@@ -208,7 +208,17 @@ pub(super) async fn validate_oauth_access_token(
         return Err("JWT type invalid");
     }
 
-    let expected_audience = state.atproto_issuer_url();
+    let canonical_audience = state.atproto_issuer_url();
+    let unverified = hyprstream_rpc::auth::decode_unverified(token)
+        .map_err(|_| "JWT claims invalid")?;
+    let expected_audience = match unverified.aud.as_deref() {
+        Some(audience)
+            if audience == canonical_audience || audience == state.issuer_url.as_str() =>
+        {
+            audience.to_owned()
+        }
+        _ => return Err("JWT audience invalid"),
+    };
     let claims = match header.alg.as_str() {
         "ML-DSA-65-Ed25519" => {
             let dispatch = hyprstream_rpc::auth::parse_composite_dispatch(
@@ -240,7 +250,7 @@ pub(super) async fn validate_oauth_access_token(
         _ => return Err("JWT algorithm unsupported"),
     };
 
-    let issuer_is_local = claims.iss == expected_audience || claims.iss == state.issuer_url;
+    let issuer_is_local = claims.iss == canonical_audience || claims.iss == state.issuer_url;
     if !issuer_is_local {
         return Err("JWT issuer invalid");
     }

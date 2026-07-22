@@ -29,6 +29,9 @@ struct VerifiedSubject {
     sub: String,
     cnf_key_bytes: Option<[u8; 32]>,
     iat: i64,
+    /// Authority from a locally validated OAuth access-token grant. Identity
+    /// tokens and generic JWTs do not carry a server-authorized OAuth grant.
+    granted_scopes: Option<Vec<String>>,
 }
 
 /// POST /oauth/token — token-exchange grant (RFC 8693).
@@ -63,7 +66,7 @@ pub async fn exchange_token_exchange(
 
     let verified = match subject_token_type {
         TOKEN_TYPE_ID_TOKEN => verify_id_token(state, subject_token).await,
-        TOKEN_TYPE_ACCESS_TOKEN => verify_access_token(state, subject_token),
+        TOKEN_TYPE_ACCESS_TOKEN => verify_access_token(state, subject_token).await,
         TOKEN_TYPE_JWT => verify_jwt(state, subject_token).await,
         _ => return tx_error(
             StatusCode::BAD_REQUEST,
@@ -77,6 +80,17 @@ pub async fn exchange_token_exchange(
         Err(e) => return tx_error(StatusCode::UNAUTHORIZED, "invalid_grant", &e),
     };
 
+    let requested_scopes = match attenuate_exchange_scopes(&verified, scope) {
+        Ok(scopes) => scopes,
+        Err(description) => {
+            return tx_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_scope",
+                description,
+            );
+        }
+    };
+
     // Replay prevention: SHA-256 of the subject token as the replay key.
     // Covers all token types, regardless of whether they carry a jti claim.
     let token_hash = URL_SAFE_NO_PAD.encode(Sha256::digest(subject_token.as_bytes()));
@@ -87,9 +101,6 @@ pub async fn exchange_token_exchange(
             "subject_token already used (replay)",
         );
     }
-
-    let requested_scopes: Option<Vec<String>> =
-        scope.map(|s| s.split_whitespace().map(str::to_owned).collect());
 
     // Encode cnf key bytes for PolicyService (same path as user_pub_key in other flows).
     let user_pub_key = verified.cnf_key_bytes.map(|b| URL_SAFE_NO_PAD.encode(b));
@@ -176,22 +187,27 @@ async fn verify_id_token(state: &Arc<OAuthState>, token: &str) -> Result<Verifie
         sub: claims.sub,
         cnf_key_bytes: None, // ID tokens carry no key binding
         iat: claims.iat,
+        granted_scopes: None,
     })
 }
 
-/// Verify an existing hyprstream at+jwt (downscoping / audience narrowing).
-fn verify_access_token(state: &OAuthState, token: &str) -> Result<VerifiedSubject, String> {
-    let vk = ed25519_dalek::VerifyingKey::from_bytes(&state.verifying_key_bytes)
-        .map_err(|_| "server configuration error: invalid verifying key".to_owned())?;
-
-    let claims = hyprstream_rpc::auth::jwt::decode(token, &vk, None)
+/// Verify an existing hyprstream at+jwt through the same algorithm, audience,
+/// issuer, and revocation checks used by protected OAuth routes.
+async fn verify_access_token(state: &OAuthState, token: &str) -> Result<VerifiedSubject, String> {
+    let claims = super::auth::validate_oauth_access_token(state, token)
+        .await
         .map_err(|e| format!("access_token verification failed: {e}"))?;
 
+    let granted_scopes = claims
+        .scope
+        .as_ref()
+        .map(|_| claims.granted_scopes().map(str::to_owned).collect());
     let cnf_key_bytes = claims.cnf_key_bytes();
     Ok(VerifiedSubject {
         sub: claims.sub,
         cnf_key_bytes,
         iat: claims.iat,
+        granted_scopes,
     })
 }
 
@@ -240,7 +256,53 @@ async fn verify_jwt(state: &Arc<OAuthState>, token: &str) -> Result<VerifiedSubj
         sub: claims.sub,
         cnf_key_bytes,
         iat: claims.iat,
+        granted_scopes: None,
     })
+}
+
+/// Bound an RFC 8693 scope request to authority already present on the verified
+/// subject access token. The signed subject-token grant is the ceiling: callers
+/// may retain or narrow it, never add authority. Subject types without a local
+/// OAuth grant cannot mint a scope claim through token exchange.
+fn attenuate_exchange_scopes(
+    subject: &VerifiedSubject,
+    requested: Option<&str>,
+) -> Result<Option<Vec<String>>, &'static str> {
+    let Some(granted) = subject.granted_scopes.as_ref() else {
+        return if requested.is_some() {
+            Err("subject token carries no OAuth grant to authorize requested scope")
+        } else {
+            Ok(None)
+        };
+    };
+
+    let Some(requested) = requested else {
+        return Ok(Some(granted.clone()));
+    };
+    let requested: Vec<&str> = requested
+        .split_whitespace()
+        .map(|scope| {
+            super::state::normalize_scope_token(scope)
+                .ok_or("requested scope contains an invalid token")
+        })
+        .collect::<Result<_, _>>()?;
+    if requested.is_empty() {
+        return Err("requested scope must not be empty");
+    }
+    if requested
+        .iter()
+        .any(|scope| !granted.iter().any(|allowed| allowed == scope))
+    {
+        return Err("requested scope exceeds the subject token grant");
+    }
+
+    Ok(Some(
+        granted
+            .iter()
+            .filter(|allowed| requested.contains(&allowed.as_str()))
+            .cloned()
+            .collect(),
+    ))
 }
 
 /// Decode `nbf` from JWT payload and reject if in the future (±5s clock skew).

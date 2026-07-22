@@ -1256,6 +1256,7 @@ mod tests {
         use super::token_store::RocksDbTokenStore;
         use crate::auth::rocksdb_store::RocksDbUserStore;
         use crate::auth::{PolicyManager, UserProfile, UserStore};
+        use crate::services::generated::policy_client::IssueToken;
         use crate::services::{DiscoveryClient, PolicyClient, PolicyService};
 
         const ISSUER: &str = "https://pds.example.test";
@@ -1370,6 +1371,7 @@ mod tests {
                     "authorization_code".to_owned(),
                     "refresh_token".to_owned(),
                     "urn:ietf:params:oauth:grant-type:device_code".to_owned(),
+                    "urn:ietf:params:oauth:grant-type:token-exchange".to_owned(),
                 ],
                 response_types: vec!["code".to_owned()],
                 token_endpoint_auth_method: Some("none".to_owned()),
@@ -1861,6 +1863,126 @@ mod tests {
         assert_eq!(generic_claims["iss"], GENERIC_ISSUER);
         assert_eq!(generic_claims["aud"], ISSUER);
         assert_eq!(generic_claims["scope"], "read:*:*");
+
+        // A token minted without an explicit resource uses PolicyService's
+        // configured path-bearing default audience. The AS must accept that
+        // exact local alias on its own protected routes.
+        let default_audience_token = state
+            .policy_client
+            .issue_token(&IssueToken {
+                requested_scopes: Some(vec!["read:*:*".to_owned()]),
+                ttl: Some(300),
+                audience: None,
+                subject: Some("default-audience-user".to_owned()),
+                user_pub_key: None,
+                dpop_jkt: None,
+                issuer: None,
+            })
+            .await?
+            .token;
+        assert_eq!(jwt_claims(&default_audience_token)["aud"], GENERIC_ISSUER);
+        let default_audience_auth = post_form_bearer(
+            &app,
+            "/oauth/introspect",
+            &[("token", &generic_access_token)],
+            &default_audience_token,
+        )
+        .await;
+        assert_eq!(
+            default_audience_auth.status(),
+            axum::http::StatusCode::OK,
+            "the AS must accept its path-bearing default audience alias"
+        );
+
+        // Token exchange may only attenuate the verified subject token's signed
+        // grant. A caller holding read:*:* cannot write transition:generic into
+        // a newly signed scope claim.
+        let inflation_subject = state
+            .policy_client
+            .issue_token(&IssueToken {
+                requested_scopes: Some(vec!["read:*:*".to_owned()]),
+                ttl: Some(300),
+                audience: Some(ISSUER.to_owned()),
+                subject: Some("scope-inflation-user".to_owned()),
+                user_pub_key: None,
+                dpop_jkt: None,
+                issuer: None,
+            })
+            .await?
+            .token;
+        let inflated_exchange = post_form(
+            &app,
+            "/oauth/token",
+            &[
+                (
+                    "grant_type",
+                    "urn:ietf:params:oauth:grant-type:token-exchange",
+                ),
+                ("client_id", CLIENT_ID),
+                ("subject_token", &inflation_subject),
+                (
+                    "subject_token_type",
+                    "urn:ietf:params:oauth:token-type:access_token",
+                ),
+                ("scope", "transition:generic"),
+                ("audience", ISSUER),
+            ],
+            None,
+            false,
+        )
+        .await;
+        assert_eq!(
+            inflated_exchange.status(),
+            axum::http::StatusCode::BAD_REQUEST
+        );
+        assert_eq!(response_json(inflated_exchange).await["error"], "invalid_scope");
+
+        // The same endpoint accepts a production composite access token and
+        // preserves a requested subset of its signed grant. This exercises the
+        // shared algorithm/audience/issuer validator on the subject-token path.
+        let valid_exchange_subject = state
+            .policy_client
+            .issue_token(&IssueToken {
+                requested_scopes: Some(vec![
+                    "read:*:*".to_owned(),
+                    "transition:generic".to_owned(),
+                ]),
+                ttl: Some(300),
+                audience: Some(ISSUER.to_owned()),
+                subject: Some("scope-valid-user".to_owned()),
+                user_pub_key: None,
+                dpop_jkt: None,
+                issuer: None,
+            })
+            .await?
+            .token;
+        let valid_exchange = post_form(
+            &app,
+            "/oauth/token",
+            &[
+                (
+                    "grant_type",
+                    "urn:ietf:params:oauth:grant-type:token-exchange",
+                ),
+                ("client_id", CLIENT_ID),
+                ("subject_token", &valid_exchange_subject),
+                (
+                    "subject_token_type",
+                    "urn:ietf:params:oauth:token-type:access_token",
+                ),
+                ("scope", "read:*:*"),
+                ("audience", ISSUER),
+            ],
+            None,
+            false,
+        )
+        .await;
+        assert_eq!(valid_exchange.status(), axum::http::StatusCode::OK);
+        let valid_exchange_json = response_json(valid_exchange).await;
+        let valid_exchange_claims =
+            jwt_claims(valid_exchange_json["access_token"].as_str().unwrap());
+        assert_eq!(valid_exchange_claims["sub"], "scope-valid-user");
+        assert_eq!(valid_exchange_claims["scope"], "read:*:*");
 
         // The real composite token minted above authenticates to a protected
         // OAuth route. This failed when middleware routed every JWT through

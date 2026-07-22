@@ -164,6 +164,7 @@ struct Claims {
   token @6 :Text;        # Original JWT for e2e verification by downstream services
   iss @7 :Text;          # Issuer URL (RFC 7519); hyprstream node that minted this token
   pubKey @8 :Text;       # Ed25519 public key (base64url) for service identity tokens
+  oauthScope @9 :Text;   # Signed OAuth grant ceiling (space-delimited scope claim)
 }
 
 # UTC timestamp with nanosecond precision
