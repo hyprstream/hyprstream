@@ -195,9 +195,7 @@ fn read_composite_ledger_selected_by_commit(
         Ok(bytes) => serde_json::from_slice(&bytes)?,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             match std::fs::symlink_metadata(&immutable) {
-                Err(metadata_error)
-                    if metadata_error.kind() == std::io::ErrorKind::NotFound =>
-                {
+                Err(metadata_error) if metadata_error.kind() == std::io::ErrorKind::NotFound => {
                     serde_json::from_slice(&std::fs::read(composite_ledger_path(dir))?)?
                 }
                 Ok(_) => return Err(error.into()),
@@ -228,9 +226,7 @@ fn load_or_migrate_committed_composite_ledger(
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             match std::fs::symlink_metadata(&marker_path) {
-                Err(metadata_error)
-                    if metadata_error.kind() == std::io::ErrorKind::NotFound =>
-                {
+                Err(metadata_error) if metadata_error.kind() == std::io::ErrorKind::NotFound => {
                     return Ok(None);
                 }
                 Ok(_) => return Err(error.into()),
@@ -453,8 +449,7 @@ fn start_composite_authority_subscription(
                         pending.component_digest == local_digest,
                         "pending composite ledger does not match local component authority"
                     );
-                    let _staged =
-                        ledger_pairs_from_local_keys(&pending, &ed, &pq, ca_key, true)?;
+                    let _staged = ledger_pairs_from_local_keys(&pending, &ed, &pq, ca_key, true)?;
                     super::identity_store::write_secret(
                         &subscribers,
                         &name,
@@ -772,17 +767,10 @@ async fn publish_composite_key_set(
             let digest = persisted_digest.ok_or_else(|| {
                 anyhow::anyhow!("committed composite digest disappeared during restore")
             })?;
-            key_set.publish(
-                persisted_version,
-                digest,
-                pairs,
-            )?;
+            key_set.publish(persisted_version, digest, pairs)?;
         }
         #[cfg(not(test))]
-        start_composite_authority_subscription(
-            secrets_dir.to_path_buf(),
-            ca_key.verifying_key(),
-        )?;
+        start_composite_authority_subscription(secrets_dir.to_path_buf(), ca_key.verifying_key())?;
         return Ok(());
     }
 
@@ -1465,11 +1453,8 @@ impl Es256SigningKeyStore {
     }
 
     fn notify_promotion(&self, key: Arc<Es256SigningKey>) -> anyhow::Result<()> {
-        let hook = self
-            .1
-            .read()
-            .clone()
-            .ok_or_else(|| {
+        let hook =
+            self.1.read().clone().ok_or_else(|| {
                 anyhow::anyhow!("ES256 promotion requires a PDS head re-sign hook")
             })?;
         hook(key)
@@ -1480,16 +1465,23 @@ impl Es256SigningKeyStore {
     /// re-sign-on-rotation). Synchronous (parking_lot lock) so the publisher
     /// can resolve the LIVE key at sign time without an async runtime.
     pub fn active_key(&self) -> Option<Arc<Es256SigningKey>> {
-        self.0
-            .read()
-            .active
-            .as_ref()
-            .map(|s| Arc::clone(&s.key))
+        self.0.read().active.as_ref().map(|s| Arc::clone(&s.key))
     }
 
     /// The active slot (key + `nbf`/`exp` bounds), if present.
     pub fn active_slot(&self) -> Option<Es256KeySlot> {
         self.0.read().active.clone()
+    }
+
+    /// Snapshot the bounded verification-only drain slot, if any.
+    pub fn drain_slot(&self) -> Option<Es256KeySlot> {
+        self.0.read().drain.clone()
+    }
+
+    /// Snapshot the bounded verification-only lead slot, if any. New commits
+    /// are always signed by [`Es256SigningKeyStore::active_key`].
+    pub fn lead_slot(&self) -> Option<Es256KeySlot> {
+        self.0.read().lead.clone()
     }
 
     pub fn all_slots_snapshot(&self) -> Vec<Es256KeySlot> {
@@ -1682,11 +1674,19 @@ pub async fn rotate_es256_keys(
             );
         } else {
             if let Some(old_active) = old_active {
+                // The old active key becomes verification-only for one bounded
+                // drain interval. Store the actual publication expiry in the
+                // slot itself so the DID document and cleanup use one boundary.
+                let drain = Es256KeySlot::new(
+                    Arc::unwrap_or_clone(old_active.key),
+                    old_active.nbf,
+                    old_active.exp.saturating_add(drain_secs),
+                );
                 delete_es256_slot(secrets_dir, "drain");
-                if let Err(error) = persist_es256_slot(secrets_dir, "drain", &old_active) {
+                if let Err(error) = persist_es256_slot(secrets_dir, "drain", &drain) {
                     warn!("ES256: failed to persist drain slot: {error}");
                 }
-                slots.drain = Some(old_active);
+                slots.drain = Some(drain);
             }
             delete_es256_slot(secrets_dir, "lead");
             slots.active = Some(new_active);
@@ -1704,7 +1704,7 @@ pub async fn rotate_es256_keys(
 
     // Phase 2: remove expired drain
     if let Some(ref drain) = slots.drain {
-        if now >= drain.exp + drain_secs {
+        if now >= drain.exp {
             delete_es256_slot(secrets_dir, "drain");
             slots.drain = None;
             info!("ES256: removed expired drain slot");
@@ -2109,7 +2109,10 @@ mod tests {
         configure_composite_authority(dir);
         initialize_composite_key_set(dir, &ed, &pq, ca, 300).await?;
         if subscribe {
-            start_composite_authority_subscription(dir.to_path_buf(), authority_ca_key().verifying_key())?;
+            start_composite_authority_subscription(
+                dir.to_path_buf(),
+                authority_ca_key().verifying_key(),
+            )?;
         }
         Ok((ed, pq))
     }
@@ -2251,19 +2254,20 @@ mod tests {
                     state.pending_codes.write().await.insert(
                         code.to_owned(),
                         crate::services::oauth::state::PendingAuthCode {
-                        code: code.to_owned(),
-                        client_id: "multiprocess-client".to_owned(),
-                        redirect_uri: "https://client.test/callback".to_owned(),
-                        code_challenge: challenge.clone(),
-                        scopes: vec!["read".to_owned()],
-                        resource: Some("multiprocess".to_owned()),
-                        oidc_nonce: None,
-                        created_at: std::time::Instant::now(),
-                        expires_at: std::time::Instant::now() + std::time::Duration::from_secs(60),
-                        username: "multiprocess-oauth".to_owned(),
-                        verifying_key: None,
-                        dpop_jkt: None,
-                        client_assertion_jkt: None,
+                            code: code.to_owned(),
+                            client_id: "multiprocess-client".to_owned(),
+                            redirect_uri: "https://client.test/callback".to_owned(),
+                            code_challenge: challenge.clone(),
+                            scopes: vec!["read".to_owned()],
+                            resource: Some("multiprocess".to_owned()),
+                            oidc_nonce: None,
+                            created_at: std::time::Instant::now(),
+                            expires_at: std::time::Instant::now()
+                                + std::time::Duration::from_secs(60),
+                            username: "multiprocess-oauth".to_owned(),
+                            verifying_key: None,
+                            dpop_jkt: None,
+                            client_assertion_jkt: None,
                         },
                     );
                 }
@@ -2447,9 +2451,7 @@ mod tests {
                     Arc::new(SigningKey::from_bytes(&[0x73; 32])),
                     crate::config::TokenConfig::default(),
                     git2db,
-                    hyprstream_rpc::transport::TransportConfig::ipc(
-                        dir.join("stale-policy.sock"),
-                    ),
+                    hyprstream_rpc::transport::TransportConfig::ipc(dir.join("stale-policy.sock")),
                 )
                 .with_default_audience("multiprocess".to_owned());
                 let shutdown = Arc::new(tokio::sync::Notify::new());
@@ -2515,22 +2517,16 @@ mod tests {
             return;
         };
         let runtime = tokio::runtime::Runtime::new().unwrap();
-        runtime.block_on(async {
-            let config = test_config();
-            let ed = load_or_init_key_store(&dir, &config);
-            let pq = load_or_init_ml_dsa_key_store(&dir, &config);
-            mutate_authority_for_failure(&ed, &pq, Some(&dir)).await;
-            let expected = std::fs::read_to_string(dir.join("crash-expected-digest"))?;
-            refresh_composite_key_set(
-                &dir,
-                &ed,
-                &pq,
-                authority_ca_key(),
-                300,
-                &expected,
-            )
-            .await
-        }).unwrap();
+        runtime
+            .block_on(async {
+                let config = test_config();
+                let ed = load_or_init_key_store(&dir, &config);
+                let pq = load_or_init_ml_dsa_key_store(&dir, &config);
+                mutate_authority_for_failure(&ed, &pq, Some(&dir)).await;
+                let expected = std::fs::read_to_string(dir.join("crash-expected-digest"))?;
+                refresh_composite_key_set(&dir, &ed, &pq, authority_ca_key(), 300, &expected).await
+            })
+            .unwrap();
         panic!("crash mutation returned instead of exiting after stage");
     }
 
@@ -2547,16 +2543,10 @@ mod tests {
                 let pq = load_or_init_ml_dsa_key_store(&dir, &config);
                 mutate_authority_for_failure(&ed, &pq, None).await;
                 let expected = std::fs::read_to_string(dir.join("timeout-expected-digest"))?;
-                let error = refresh_composite_key_set(
-                    &dir,
-                    &ed,
-                    &pq,
-                    authority_ca_key(),
-                    300,
-                    &expected,
-                )
-                .await
-                .expect_err("unacknowledged composite generation committed");
+                let error =
+                    refresh_composite_key_set(&dir, &ed, &pq, authority_ca_key(), 300, &expected)
+                        .await
+                        .expect_err("unacknowledged composite generation committed");
                 anyhow::ensure!(
                     error.to_string().contains("was not acknowledged"),
                     "unexpected acknowledgement-timeout error: {error:#}"
@@ -3028,10 +3018,9 @@ mod tests {
         );
         wait_path(&dir.path().join("timeout-writer-refused"));
         assert!(timing_out_writer.wait().unwrap().success());
-        let committed_after_timeout: CompositeCommit = serde_json::from_slice(
-            &std::fs::read(composite_committed_path(dir.path())).unwrap(),
-        )
-        .unwrap();
+        let committed_after_timeout: CompositeCommit =
+            serde_json::from_slice(&std::fs::read(composite_committed_path(dir.path())).unwrap())
+                .unwrap();
         assert_eq!(committed_after_timeout.version, committed.version);
         assert_eq!(
             committed_after_timeout.component_digest,
@@ -3054,7 +3043,10 @@ mod tests {
         let pending_after_crash: CompositeLedger =
             serde_json::from_slice(&std::fs::read(composite_ledger_path(dir.path())).unwrap())
                 .unwrap();
-        assert_ne!(pending_after_crash.component_digest, committed.component_digest);
+        assert_ne!(
+            pending_after_crash.component_digest,
+            committed.component_digest
+        );
         let (post_crash_token, post_crash_jwks) = runtime
             .block_on(async {
                 let client = reqwest::Client::new();
@@ -3366,6 +3358,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn es256_drain_is_removed_at_its_published_expiry() {
+        let dir = TempDir::new().unwrap();
+        let config = test_config();
+        let now = chrono::Utc::now().timestamp();
+        let active = generate_es256_slot(now - 14 * 86400, now + 1);
+        let lead = generate_es256_slot(now - 1, now + 14 * 86400);
+        let store = Es256SigningKeyStore::new(Es256KeySlots {
+            drain: None,
+            active: Some(active),
+            lead: Some(lead),
+        });
+        store.set_promotion_hook(Arc::new(|_| Ok(())));
+
+        assert!(rotate_es256_keys(&config, dir.path(), &store, now).await);
+        let published_expiry = store.drain_slot().expect("drain after promotion").exp;
+        assert!(
+            rotate_es256_keys(&config, dir.path(), &store, published_expiry).await
+                || store.active_slot().is_some(),
+            "cleanup tick remains operational"
+        );
+        assert!(
+            store.drain_slot().is_none(),
+            "the drain slot must leave the publication source at its expiry"
+        );
+    }
+
+    #[tokio::test]
     async fn es256_rotate_without_hook_stays_pending() {
         let dir = TempDir::new().unwrap();
         let config = test_config();
@@ -3599,23 +3618,16 @@ mod tests {
             let ca = Arc::new(SigningKey::from_bytes(&[0x6a; 32]));
             let ed = load_or_init_key_store(dir.path(), &config);
             let pq = load_or_init_ml_dsa_key_store(dir.path(), &config);
-            initialize_composite_key_set(
-                dir.path(),
-                &ed,
-                &pq,
-                Arc::clone(&ca),
-                300,
-            )
-            .await
-            .unwrap();
+            initialize_composite_key_set(dir.path(), &ed, &pq, Arc::clone(&ca), 300)
+                .await
+                .unwrap();
 
             let marker_bytes = std::fs::read(composite_committed_path(dir.path())).unwrap();
             let commit: CompositeCommit = serde_json::from_slice(&marker_bytes).unwrap();
             let immutable = composite_committed_ledger_path(dir.path(), &commit);
-            let mut pending: CompositeLedger = serde_json::from_slice(
-                &std::fs::read(composite_ledger_path(dir.path())).unwrap(),
-            )
-            .unwrap();
+            let mut pending: CompositeLedger =
+                serde_json::from_slice(&std::fs::read(composite_ledger_path(dir.path())).unwrap())
+                    .unwrap();
             pending.version = pending.version.saturating_add(1);
             pending.component_digest = "staged-component-C".to_owned();
             let pending_bytes = serde_json::to_vec(&pending).unwrap();
@@ -3633,15 +3645,9 @@ mod tests {
                 }
             }
 
-            let error = initialize_composite_key_set(
-                dir.path(),
-                &ed,
-                &pq,
-                Arc::clone(&ca),
-                300,
-            )
-            .await
-            .expect_err("marker-selected authority failure must fail closed");
+            let error = initialize_composite_key_set(dir.path(), &ed, &pq, Arc::clone(&ca), 300)
+                .await
+                .expect_err("marker-selected authority failure must fail closed");
             assert!(!error.to_string().is_empty());
             assert_eq!(
                 std::fs::read(composite_committed_path(dir.path())).unwrap(),
@@ -3694,10 +3700,9 @@ mod tests {
         initialize_composite_key_set(dir.path(), &ed, &pq, Arc::clone(&ca), 300)
             .await
             .unwrap();
-        let commit: CompositeCommit = serde_json::from_slice(
-            &std::fs::read(composite_committed_path(dir.path())).unwrap(),
-        )
-        .unwrap();
+        let commit: CompositeCommit =
+            serde_json::from_slice(&std::fs::read(composite_committed_path(dir.path())).unwrap())
+                .unwrap();
         let immutable = composite_committed_ledger_path(dir.path(), &commit);
         let committed_bytes = std::fs::read(&immutable).unwrap();
 
@@ -3709,8 +3714,7 @@ mod tests {
             .unwrap();
         assert_eq!(std::fs::read(&immutable).unwrap(), committed_bytes);
 
-        let mut pending: CompositeLedger =
-            serde_json::from_slice(&committed_bytes).unwrap();
+        let mut pending: CompositeLedger = serde_json::from_slice(&committed_bytes).unwrap();
         pending.version = pending.version.saturating_add(1);
         pending.component_digest = "staged-component-C".to_owned();
         std::fs::write(

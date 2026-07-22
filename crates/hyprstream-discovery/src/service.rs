@@ -561,6 +561,19 @@ pub trait RecordResolver: Send + Sync {
     async fn resolve_verifying_key(&self, _did: &str) -> Result<Option<p256::ecdsa::VerifyingKey>> {
         Ok(None)
     }
+
+    /// Resolve every bounded `#atproto` verification slot currently published
+    /// for `did`. Implementations that only know one trusted active key retain
+    /// the fail-closed default through [`RecordResolver::resolve_verifying_key`].
+    async fn resolve_verifying_keys(
+        &self,
+        did: &str,
+    ) -> Result<Option<hyprstream_pds::commit::PublishedAtprotoKeys>> {
+        Ok(self
+            .resolve_verifying_key(did)
+            .await?
+            .map(hyprstream_pds::commit::PublishedAtprotoKeys::single))
+    }
 }
 
 // ============================================================================

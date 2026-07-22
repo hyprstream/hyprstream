@@ -13,9 +13,9 @@
 //! today; group ledger / spend authorization tomorrow — #924/#925), so the
 //! index no longer trusts an ingested record graph merely because a resolver
 //! handed it over. Ingest is **verified by construction**: the resolver must
-//! provide the DID's `#atproto` verifying key
-//! ([`RecordResolver::resolve_verifying_key`]), [`PlacementIndex::ingest_did`]
-//! verifies the repo CAR's commit signature against it, and missing key material
+//! provide the DID's currently-published `#atproto` verification slots
+//! ([`RecordResolver::resolve_verifying_keys`]), [`PlacementIndex::ingest_did`]
+//! verifies the repo CAR's commit signature against the bounded live set, and missing key material
 //! fails closed. Ingest also **content-binds every CAR block to its declared CID**.
 //! The commit block, each MST node, and each record block have their CID recomputed from their bytes and
 //! checked against the CID the CAR / parent declared for them (mirroring
@@ -59,7 +59,6 @@
 use std::collections::{HashMap, HashSet};
 
 use anyhow::{anyhow, ensure, Result};
-use p256::ecdsa::VerifyingKey;
 use parking_lot::RwLock;
 
 use hyprstream_pds::car::parse_car_v1;
@@ -148,7 +147,7 @@ impl PlacementIndex {
     /// error, just an empty directory entry.
     ///
     /// **Verified by construction (#932, #918):** the resolver MUST supply a
-    /// verifying key for `did` ([`RecordResolver::resolve_verifying_key`]); if it
+    /// verification slots for `did` ([`RecordResolver::resolve_verifying_keys`]); if it
     /// cannot, the repo is **rejected** (fail closed) — its records never reach
     /// the derived indices. Every CAR block is always content-bound to its
     /// declared CID. A repo that fails signature verification — or whose
@@ -173,13 +172,11 @@ impl PlacementIndex {
             self.clear_did(did);
             return Ok(());
         };
-        // Resolve the single current `#atproto` verifying key for `did` (#918
-        // re-sign-on-rotation: the producer re-signs the head on rotation, so
-        // the verifier checks the current head against the one current key).
+        // Resolve the bounded `#atproto` slots currently published for `did`.
         // FAIL CLOSED when no key can be established — a foreign/stale/bad DID
         // document must not silently ingest unverified records.
-        let verify_key = match resolver.resolve_verifying_key(did).await {
-            Ok(Some(key)) => key,
+        let verify_keys = match resolver.resolve_verifying_keys(did).await {
+            Ok(Some(keys)) => keys,
             Ok(None) => {
                 self.clear_did(did);
                 return Err(anyhow!(
@@ -190,11 +187,11 @@ impl PlacementIndex {
             }
             Err(e) => {
                 self.clear_did(did);
-                return Err(anyhow!("resolve_verifying_key({did}) failed: {e}"));
+                return Err(anyhow!("resolve_verifying_keys({did}) failed: {e}"));
             }
         };
         // Decode and signature-verify the CAR *before* touching the index.
-        let snapshot = match Self::decode_repo_car(did, &repo.car, &verify_key) {
+        let snapshot = match Self::decode_repo_car(did, &repo.car, &verify_keys) {
             Ok(snap) => snap,
             Err(e) => {
                 self.clear_did(did);
@@ -217,11 +214,11 @@ impl PlacementIndex {
     /// record reachable from the commit's MST root into a [`DidSnapshot`].
     ///
     /// Every CAR block is content-bound to its declared CID. The CAR's commit
-    /// signature is verified against `verify_key` via `Commit::verify` (the
+    /// signature is verified against the currently-live `verify_keys` via
+    /// [`Commit::verify_against_published_keys`] (the
     /// verified-by-construction gate of #932): the
-    /// head commit must be signed by the single current `#atproto` key (#918
-    /// re-sign-on-rotation — the producer re-signs the head on rotation, so the
-    /// verifier checks the current head against the one current key). The commit
+    /// head commit may be signed by the active key or an explicitly bounded
+    /// drain/lead overlap key. The commit
     /// block, each MST node, and each record block have their CID recomputed
     /// from their bytes and checked against the CID the CAR/parent declared for
     /// them before they are trusted (mirrors `hyprstream_pds::mst::Proof::verify`,
@@ -231,7 +228,11 @@ impl PlacementIndex {
     /// genuine signed commit with substituted MST-node/record blocks and forge
     /// membership. A recomputed-CID ≠ declared-CID mismatch returns `Err` (the
     /// caller refuses to ingest). There is no unauthenticated decode path.
-    fn decode_repo_car(did: &str, car: &[u8], verify_key: &VerifyingKey) -> Result<DidSnapshot> {
+    fn decode_repo_car(
+        did: &str,
+        car: &[u8],
+        verify_keys: &hyprstream_pds::commit::PublishedAtprotoKeys,
+    ) -> Result<DidSnapshot> {
         let (roots, blocks) = parse_car_v1(car)?;
         ensure!(
             roots.len() == 1,
@@ -262,7 +263,7 @@ impl PlacementIndex {
             commit.did
         );
         commit
-            .verify(verify_key)
+            .verify_against_published_keys(verify_keys, chrono::Utc::now().timestamp())
             .map_err(|e| anyhow!("repo CAR for {did} failed commit-signature verification: {e}"))?;
 
         let mut entries = Vec::new();
@@ -1115,16 +1116,20 @@ mod tests {
     fn car_structure_bypasses_are_rejected() {
         let (car, vk) = repo_car(
             NODE_DID,
-            &[(node_record_key("3a"), sample_node_record(vec![]).to_dag_cbor())],
+            &[(
+                node_record_key("3a"),
+                sample_node_record(vec![]).to_dag_cbor(),
+            )],
         );
+        let keys = hyprstream_pds::commit::PublishedAtprotoKeys::single(vk);
         let (roots, blocks) = parse_car_v1(&car).unwrap();
         // Structural checks fail before signature verification; single key suffices.
         let duplicate = build_car_v1(&roots, &[blocks.clone(), blocks.clone()].concat());
-        assert!(PlacementIndex::decode_repo_car(NODE_DID, &duplicate, &vk).is_err());
+        assert!(PlacementIndex::decode_repo_car(NODE_DID, &duplicate, &keys).is_err());
         let multiple_roots = build_car_v1(&[roots[0], roots[0]], &blocks);
-        assert!(PlacementIndex::decode_repo_car(NODE_DID, &multiple_roots, &vk).is_err());
+        assert!(PlacementIndex::decode_repo_car(NODE_DID, &multiple_roots, &keys).is_err());
         let missing_record = build_car_v1(&roots, &blocks[..blocks.len() - 1]);
-        assert!(PlacementIndex::decode_repo_car(NODE_DID, &missing_record, &vk).is_err());
+        assert!(PlacementIndex::decode_repo_car(NODE_DID, &missing_record, &keys).is_err());
     }
 
     // ── #918: re-sign-on-rotation + single-key verification ──────────────────
@@ -1140,14 +1145,20 @@ mod tests {
         // Head re-signed with the NEW key.
         let (car, _) = repo_car_with_key(
             NODE_DID,
-            &[(node_record_key("r1"), sample_node_record(vec![]).to_dag_cbor())],
+            &[(
+                node_record_key("r1"),
+                sample_node_record(vec![]).to_dag_cbor(),
+            )],
             new_key,
         );
         let resolver = FixedResolver {
             repos: HashMap::from([(NODE_DID.to_owned(), (car, new_vk))]),
         };
         let index = PlacementIndex::new();
-        index.ingest_did(&resolver, NODE_DID).await.expect("re-signed head verifies against current key");
+        index
+            .ingest_did(&resolver, NODE_DID)
+            .await
+            .expect("re-signed head verifies against current key");
         assert!(index.known_node_dids().contains(&NODE_DID.to_owned()));
         let _ = old_key;
     }
@@ -1163,7 +1174,10 @@ mod tests {
         // Head still signed by the OLD key.
         let (car, _) = repo_car_with_key(
             NODE_DID,
-            &[(node_record_key("r1"), sample_node_record(vec![]).to_dag_cbor())],
+            &[(
+                node_record_key("r1"),
+                sample_node_record(vec![]).to_dag_cbor(),
+            )],
             old_key,
         );
         // Resolver returns the NEW (current) key.
@@ -1182,11 +1196,13 @@ mod tests {
     #[tokio::test]
     async fn forged_signature_fails() {
         let signing = P256SigningKey::random(&mut rand::rngs::OsRng);
-        let forged_vk =
-            P256VerifyingKey::from(&P256SigningKey::random(&mut rand::rngs::OsRng));
+        let forged_vk = P256VerifyingKey::from(&P256SigningKey::random(&mut rand::rngs::OsRng));
         let (car, _) = repo_car_with_key(
             NODE_DID,
-            &[(node_record_key("r1"), sample_node_record(vec![]).to_dag_cbor())],
+            &[(
+                node_record_key("r1"),
+                sample_node_record(vec![]).to_dag_cbor(),
+            )],
             signing,
         );
         // Resolver returns a DIFFERENT key than the one that signed.

@@ -193,14 +193,12 @@ enum At9pAcceptanceVerifier {
 }
 
 impl At9pAcceptanceVerifier {
-    fn verify_strict(
-        &self,
-        message: &[u8],
-        signature: &ed25519_dalek::Signature,
-    ) -> AnyResult<()> {
+    fn verify_strict(&self, message: &[u8], signature: &ed25519_dalek::Signature) -> AnyResult<()> {
         match self {
             Self::Deployment(identity) => identity.verify_strict(message, signature),
-            Self::Local(identity) => identity.verify_strict(message, signature).map_err(Into::into),
+            Self::Local(identity) => identity
+                .verify_strict(message, signature)
+                .map_err(Into::into),
         }
     }
 }
@@ -400,11 +398,7 @@ impl PdsRecordStore {
         };
         let _advance = self.at9p_advance_lock.lock();
         let local_verifier = At9pAcceptanceVerifier::Local(acceptance_identity.verifying_key());
-        let current = load_at9p_state_from_db(
-            db,
-            &state.subject_cid512,
-            &local_verifier,
-        )?;
+        let current = load_at9p_state_from_db(db, &state.subject_cid512, &local_verifier)?;
         if current.as_ref().map(AcceptedAt9pState::watermark) != expected {
             return current.map_or_else(
                 || bail!("conditional accepted-state advance expected a durable head, but none exists"),
@@ -1716,6 +1710,42 @@ mod pds_store_tests {
             .expect("writer-signed commit must verify against the published #atproto key");
     }
 
+    #[test]
+    fn publisher_signs_new_commits_with_active_not_lead_key() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let active = SigningKey::random(&mut rand::rngs::OsRng);
+        let active_vk = VerifyingKey::from(&active);
+        let lead = SigningKey::random(&mut rand::rngs::OsRng);
+        let lead_vk = VerifyingKey::from(&lead);
+        let now = chrono::Utc::now().timestamp();
+        let keys = Arc::new(crate::auth::key_rotation::Es256SigningKeyStore::new(
+            crate::auth::key_rotation::Es256KeySlots {
+                drain: None,
+                active: Some(crate::auth::key_rotation::Es256KeySlot::new(
+                    active,
+                    now - 60,
+                    now + 60,
+                )),
+                lead: Some(crate::auth::key_rotation::Es256KeySlot::new(
+                    lead,
+                    now - 30,
+                    now + 120,
+                )),
+            },
+        ));
+        let store = Arc::new(PdsRecordStore::open(dir.path()).expect("open store"));
+        let publisher = PdsPublisher::new(Arc::clone(&store), DID.to_owned(), keys);
+        publisher.publish("repo-a", SAMPLE_OID).expect("publish");
+        let repo = store.load_repo(DID).expect("load").expect("repo");
+        repo.commit
+            .verify(&active_vk)
+            .expect("new commit must use the active key");
+        assert!(
+            repo.commit.verify(&lead_vk).is_err(),
+            "a published lead key must never sign a new commit"
+        );
+    }
+
     /// #918 production-path rotation re-sign: publish with K, run the real
     /// lead→active promotion (which invokes the installed publisher hook),
     /// then assert the STORED head verifies under K' while the un-re-signed
@@ -1897,10 +1927,7 @@ mod pds_store_tests {
             .verify(&new_vk)
             .expect("retried head must match the newly published key");
         assert!(reconciled_head.verify(&old_vk).is_err());
-        assert_eq!(
-            es256_store.active_key().unwrap().verifying_key(),
-            &new_vk
-        );
+        assert_eq!(es256_store.active_key().unwrap().verifying_key(), &new_vk);
     }
 
     #[tokio::test]
@@ -2044,10 +2071,7 @@ mod pds_store_tests {
                 .expect("send observation");
         });
         let early_observation = observed_rx.recv_timeout(Duration::from_millis(100));
-        let reader_was_blocked = matches!(
-            &early_observation,
-            Err(mpsc::RecvTimeoutError::Timeout)
-        );
+        let reader_was_blocked = matches!(&early_observation, Err(mpsc::RecvTimeoutError::Timeout));
         transition_barrier.wait();
         assert!(rotation.join().expect("rotation thread"));
         reader.join().expect("reader thread");
@@ -2076,14 +2100,11 @@ mod pds_store_tests {
         let sk = SigningKey::random(&mut rand::rngs::OsRng);
         let es256_store = test_es256_store(sk);
         let store = Arc::new(PdsRecordStore::open(dir.path()).expect("open rw"));
-        let publisher = PdsPublisher::new(
-            Arc::clone(&store),
-            DID.to_owned(),
-            Arc::clone(&es256_store),
-        );
+        let publisher =
+            PdsPublisher::new(Arc::clone(&store), DID.to_owned(), Arc::clone(&es256_store));
         publisher.publish("repo-a", SAMPLE_OID).expect("publish");
-        let resolver = PdsRecordResolver::new(store)
-            .with_es256_rotation(es256_store, DID.to_owned());
+        let resolver =
+            PdsRecordResolver::new(store).with_es256_rotation(es256_store, DID.to_owned());
 
         assert!(
             block_on(resolver.resolve_verifying_key(DID))
@@ -2169,7 +2190,8 @@ mod pds_store_tests {
 
         {
             let store = Arc::new(PdsRecordStore::open(dir.path()).expect("open rw"));
-            let publisher = PdsPublisher::new(Arc::clone(&store), DID.to_owned(), test_es256_store(sk));
+            let publisher =
+                PdsPublisher::new(Arc::clone(&store), DID.to_owned(), test_es256_store(sk));
             publisher.publish("repo-b", SAMPLE_OID).expect("publish");
             // Writer handle dropped here — simulates a process restart.
         }
@@ -2419,7 +2441,11 @@ mod pds_store_tests {
         let vk: VerifyingKey = *sk.verifying_key();
 
         let store = Arc::new(PdsRecordStore::open(dir.path()).expect("open rw"));
-        let publisher = Arc::new(PdsPublisher::new(Arc::clone(&store), DID.to_owned(), test_es256_store(sk)));
+        let publisher = Arc::new(PdsPublisher::new(
+            Arc::clone(&store),
+            DID.to_owned(),
+            test_es256_store(sk),
+        ));
 
         const WRITERS_PER_COLLECTION: usize = 4;
         let mut handles = Vec::new();

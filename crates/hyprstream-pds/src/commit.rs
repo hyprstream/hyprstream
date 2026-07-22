@@ -228,12 +228,9 @@ impl Commit {
     /// commit it likes, but only commits signed by the account's `#atproto`
     /// key are accepted by verifiers.
     ///
-    /// **Key-rotation posture (#918, atproto-spec-aligned):** the producer
-    /// re-signs the repo head commit on `#atproto` rotation, so this single-key
-    /// verify against the current `#atproto` key (resolved from the DID
-    /// document) is sufficient for current-head verification. There is no
-    /// drain-slot / multi-slot window on the atproto-compat key. Historical
-    /// commit verification via did:plc audit log (`/log/audit`) is deferred.
+    /// For a rotated key set, use [`Commit::verify_against_published_keys`].
+    /// That path accepts only the active key and bounded, currently-live
+    /// `#atproto_drain` / `#atproto_lead` keys published in the DID document.
     pub fn verify(&self, vk: &VerifyingKey) -> Result<()> {
         use p256::ecdsa::signature::Verifier;
         let unsigned = self.unsigned();
@@ -244,6 +241,32 @@ impl Commit {
             .map_err(|e| anyhow::anyhow!("invalid ES256 signature bytes: {e}"))?;
         vk.verify(&unsigned_bytes, &signature)
             .map_err(|e| anyhow::anyhow!("ES256 signature verification failed: {e}"))
+    }
+
+    /// Verify against the bounded `#atproto` slot set currently published by a
+    /// DID document.  This is an overlap-availability mechanism: it accepts a
+    /// pre-rotation commit under the bounded drain key, but does not establish
+    /// that a key was valid at the commit's causal position (that is #1169).
+    pub fn verify_against_published_keys(
+        &self,
+        keys: &PublishedAtprotoKeys,
+        now: i64,
+    ) -> Result<()> {
+        let mut tried = 0usize;
+        let mut last_error = None;
+        for key in keys.live_keys(now) {
+            tried += 1;
+            match self.verify(key) {
+                Ok(()) => return Ok(()),
+                Err(error) => last_error = Some(error),
+            }
+        }
+        match last_error {
+            Some(error) => Err(error.context(format!(
+                "ES256 signature verified under none of the {tried} live published #atproto slot(s)"
+            ))),
+            None => bail!("no published #atproto verification slot is live at {now}"),
+        }
     }
 
     /// Compute the SHA-256 digest of the unsigned commit's DAG-CBOR bytes.
@@ -257,6 +280,137 @@ impl Commit {
     }
 }
 
+/// The only auxiliary verification-method fragments understood by Hyprstream.
+/// Stock atproto implementations select the exact `#atproto` fragment, so the
+/// overlap keys deliberately use distinct fragments.
+const DRAIN_FRAGMENT: &str = "atproto_drain";
+const LEAD_FRAGMENT: &str = "atproto_lead";
+
+/// A P-256 key published for commit verification, with an inclusive validity
+/// interval. The active slot is unbounded; drain and lead slots must carry
+/// explicit document bounds.
+#[derive(Clone, Debug)]
+pub struct PublishedAtprotoKey {
+    key: VerifyingKey,
+    nbf: i64,
+    exp: i64,
+}
+
+impl PublishedAtprotoKey {
+    fn active(key: VerifyingKey) -> Self {
+        Self {
+            key,
+            nbf: i64::MIN,
+            exp: i64::MAX,
+        }
+    }
+
+    fn bounded(key: VerifyingKey, nbf: i64, exp: i64) -> Result<Self> {
+        ensure!(nbf <= exp, "published #atproto slot has nbf after exp");
+        Ok(Self { key, nbf, exp })
+    }
+
+    fn is_live_at(&self, now: i64) -> bool {
+        self.nbf <= now && now <= self.exp
+    }
+}
+
+/// A small, authority-checked set of verification keys from a DID document:
+/// exactly one active `#atproto` slot and at most one bounded drain and lead
+/// slot. Unknown DID verification methods are intentionally ignored.
+#[derive(Clone, Debug)]
+pub struct PublishedAtprotoKeys {
+    slots: Vec<PublishedAtprotoKey>,
+}
+
+impl PublishedAtprotoKeys {
+    pub const MAX_SLOTS: usize = 3;
+
+    /// Wrap a trusted single current key for existing resolver implementations.
+    pub fn single(key: VerifyingKey) -> Self {
+        Self {
+            slots: vec![PublishedAtprotoKey::active(key)],
+        }
+    }
+
+    pub fn live_keys(&self, now: i64) -> impl Iterator<Item = &VerifyingKey> {
+        self.slots
+            .iter()
+            .filter(move |slot| slot.is_live_at(now))
+            .map(|slot| &slot.key)
+    }
+
+    pub fn len(&self) -> usize {
+        self.slots.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.slots.is_empty()
+    }
+
+    /// Parse the active and bounded overlap slots from a resolved DID document.
+    /// Every recognised slot must have the expected full id, controller and
+    /// `Multikey` type; duplicates and malformed bounds fail closed.
+    pub fn from_did_document(doc: &serde_json::Value, expected_did: &str) -> Result<Self> {
+        let doc_id = doc
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| anyhow!("DID document has no `id`"))?;
+        ensure!(
+            doc_id == expected_did,
+            "DID document id {doc_id:?} does not match {expected_did:?}"
+        );
+        let vms = doc
+            .get("verificationMethod")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| anyhow!("DID document has no verificationMethod array"))?;
+
+        let mut active = None;
+        let mut drain = None;
+        let mut lead = None;
+        for (fragment, destination, bounded) in [
+            ("atproto", &mut active, false),
+            (DRAIN_FRAGMENT, &mut drain, true),
+            (LEAD_FRAGMENT, &mut lead, true),
+        ] {
+            let full_id = format!("{expected_did}#{fragment}");
+            for vm in vms.iter().filter(|vm| {
+                vm.get("id").and_then(serde_json::Value::as_str) == Some(full_id.as_str())
+            }) {
+                ensure!(
+                    destination.is_none(),
+                    "DID document has more than one `{full_id}` method"
+                );
+                validate_vm_authority(vm, &full_id, expected_did)?;
+                let key = decode_p256_multibase_vm(vm, &format!("#{fragment}"))?;
+                *destination = Some(if bounded {
+                    let nbf = vm
+                        .get("nbf")
+                        .and_then(serde_json::Value::as_i64)
+                        .ok_or_else(|| anyhow!("`{full_id}` must carry integer `nbf`"))?;
+                    let exp = vm
+                        .get("exp")
+                        .and_then(serde_json::Value::as_i64)
+                        .ok_or_else(|| anyhow!("`{full_id}` must carry integer `exp`"))?;
+                    PublishedAtprotoKey::bounded(key, nbf, exp)?
+                } else {
+                    ensure!(
+                        vm.get("nbf").is_none() && vm.get("exp").is_none(),
+                        "`{full_id}` active slot must not carry `nbf`/`exp`"
+                    );
+                    PublishedAtprotoKey::active(key)
+                });
+            }
+        }
+        let active = active.ok_or_else(|| {
+            anyhow!("DID document has no `{expected_did}#atproto` verification method")
+        })?;
+        let mut slots = vec![active];
+        slots.extend(drain);
+        slots.extend(lead);
+        Ok(Self { slots })
+    }
+}
 
 /// Decode a `publicKeyMultibase` (multibase `z` + base58btc + multicodec
 /// `p256-pub` `0x80 0x24` + 33-byte compressed SEC1) into a P-256 verifying
@@ -296,11 +450,7 @@ fn decode_p256_multibase_vm(vm: &serde_json::Value, label: &str) -> Result<Verif
 /// method so a method with the right id but a foreign controller/type is
 /// rejected (a document carrying an attacker VM with a spoofed id still fails
 /// closed on controller/type).
-fn validate_vm_authority(
-    vm: &serde_json::Value,
-    full_id: &str,
-    expected_did: &str,
-) -> Result<()> {
+fn validate_vm_authority(vm: &serde_json::Value, full_id: &str, expected_did: &str) -> Result<()> {
     let vm_type = vm
         .get("type")
         .and_then(serde_json::Value::as_str)
@@ -320,52 +470,19 @@ fn validate_vm_authority(
     Ok(())
 }
 
-/// Resolve the SINGLE current `#atproto` P-256 verifying key for `expected_did`
-/// from a resolved DID document — the atproto-spec-aligned verification entry
-/// point (#918 re-sign-on-rotation).
+/// Resolve the active `#atproto` P-256 verifying key for `expected_did`.
 ///
-/// atproto DID documents carry exactly one `#atproto` verification method
-/// (no `#atproto-drain`, no `nbf`/`exp`). On a `#atproto` rotation the producer
-/// re-signs the repo head commit with the new active key, so the verifier only
-/// ever needs this one current key to check the current head
-/// ([`Commit::verify`]). Historical-commit verification, if a caller ever needs
-/// it, comes from the did:plc audit log (`/log/audit`), not the live document.
-///
-/// Authority hygiene (kept from the earlier review — good regardless of the
-/// single-vs-multi question): the document's `id` MUST equal `expected_did`;
-/// the `#atproto` method is matched by FULL id (`{did}#atproto`), must be
-/// unique (duplicates rejected), and must be `type: "Multikey"` with
-/// `controller: expected_did`. Any mismatch fails closed.
+/// This compatibility helper intentionally ignores bounded overlap slots. Use
+/// [`PublishedAtprotoKeys::from_did_document`] for commit verification.
 pub fn atproto_verifying_key_from_did_document(
     doc: &serde_json::Value,
     expected_did: &str,
 ) -> Result<VerifyingKey> {
-    let doc_id = doc
-        .get("id")
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| anyhow!("DID document has no `id`"))?;
-    ensure!(
-        doc_id == expected_did,
-        "DID document id {doc_id:?} does not match the DID being resolved {expected_did:?}"
-    );
-    let vms = doc
-        .get("verificationMethod")
-        .and_then(serde_json::Value::as_array)
-        .ok_or_else(|| anyhow!("DID document has no verificationMethod array"))?;
-    let atproto_id = format!("{expected_did}#atproto");
-    let mut atproto_vm: Option<&serde_json::Value> = None;
-    for vm in vms {
-        if vm.get("id").and_then(serde_json::Value::as_str) == Some(&atproto_id) {
-            if atproto_vm.is_some() {
-                bail!("DID document has more than one `{atproto_id}` method");
-            }
-            atproto_vm = Some(vm);
-        }
-    }
-    let atproto = atproto_vm
-        .ok_or_else(|| anyhow!("DID document has no `{atproto_id}` verification method"))?;
-    validate_vm_authority(atproto, &atproto_id, expected_did)?;
-    decode_p256_multibase_vm(atproto, "#atproto")
+    PublishedAtprotoKeys::from_did_document(doc, expected_did)?
+        .slots
+        .first()
+        .map(|slot| slot.key)
+        .ok_or_else(|| anyhow!("DID document has no active #atproto verification key"))
 }
 
 #[cfg(test)]
@@ -483,17 +600,121 @@ mod tests {
         })
     }
 
+    fn did_doc_with_overlap(
+        did: &str,
+        active: &VerifyingKey,
+        drain: Option<(&VerifyingKey, i64, i64)>,
+        lead: Option<(&VerifyingKey, i64, i64)>,
+    ) -> serde_json::Value {
+        let mut methods = vec![serde_json::json!({
+            "id": format!("{did}#atproto"),
+            "type": "Multikey",
+            "controller": did,
+            "publicKeyMultibase": p256_to_multibase(active),
+        })];
+        for (fragment, slot) in [(DRAIN_FRAGMENT, drain), (LEAD_FRAGMENT, lead)] {
+            if let Some((key, nbf, exp)) = slot {
+                methods.push(serde_json::json!({
+                    "id": format!("{did}#{fragment}"),
+                    "type": "Multikey",
+                    "controller": did,
+                    "publicKeyMultibase": p256_to_multibase(key),
+                    "nbf": nbf,
+                    "exp": exp,
+                }));
+            }
+        }
+        serde_json::json!({ "id": did, "verificationMethod": methods })
+    }
+
+    #[test]
+    fn pre_rotation_commit_verifies_during_bounded_drain_overlap() {
+        let (commit, old_key) = make_signed_commit();
+        let active = VerifyingKey::from(SigningKey::random(&mut rand::rngs::OsRng));
+        let doc = did_doc_with_overlap(
+            "did:web:alice.example.com",
+            &active,
+            Some((&old_key, 10, 20)),
+            None,
+        );
+        let keys = PublishedAtprotoKeys::from_did_document(&doc, "did:web:alice.example.com")
+            .expect("bounded drain document parses");
+        commit
+            .verify_against_published_keys(&keys, 15)
+            .expect("commit signed before rotation verifies during drain overlap");
+    }
+
+    #[test]
+    fn key_that_left_document_cannot_verify() {
+        let (commit, old_key) = make_signed_commit();
+        let active = VerifyingKey::from(SigningKey::random(&mut rand::rngs::OsRng));
+        let doc = did_doc_with_overlap("did:web:alice.example.com", &active, None, None);
+        let keys = PublishedAtprotoKeys::from_did_document(&doc, "did:web:alice.example.com")
+            .expect("active-only document parses");
+        assert!(
+            commit.verify_against_published_keys(&keys, 15).is_err(),
+            "a key absent from the published document must not verify"
+        );
+        let _ = old_key;
+    }
+
+    #[test]
+    fn overlap_slot_expires_and_is_not_consulted() {
+        let (commit, old_key) = make_signed_commit();
+        let active = VerifyingKey::from(SigningKey::random(&mut rand::rngs::OsRng));
+        let doc = did_doc_with_overlap(
+            "did:web:alice.example.com",
+            &active,
+            Some((&old_key, 10, 20)),
+            None,
+        );
+        let keys = PublishedAtprotoKeys::from_did_document(&doc, "did:web:alice.example.com")
+            .expect("bounded drain document parses");
+        assert!(
+            commit.verify_against_published_keys(&keys, 21).is_err(),
+            "expired drain key must not be consulted"
+        );
+    }
+
+    #[test]
+    fn currently_published_lead_key_is_accepted_for_verification_only() {
+        let lead_signing_key = SigningKey::random(&mut rand::rngs::OsRng);
+        let lead = VerifyingKey::from(&lead_signing_key);
+        let unsigned = UnsignedCommit::new(
+            "did:web:alice.example.com",
+            Cid::from_dag_cbor(b"lead-window"),
+            Tid::from_raw(42),
+            None,
+        );
+        let commit = Commit::sign(&unsigned, &lead_signing_key);
+        let active = VerifyingKey::from(SigningKey::random(&mut rand::rngs::OsRng));
+        let doc = did_doc_with_overlap(
+            "did:web:alice.example.com",
+            &active,
+            None,
+            Some((&lead, 10, 20)),
+        );
+        let keys = PublishedAtprotoKeys::from_did_document(&doc, "did:web:alice.example.com")
+            .expect("bounded lead document parses");
+        commit
+            .verify_against_published_keys(&keys, 15)
+            .expect("a currently-published lead key is a verification slot");
+    }
+
     /// Resolve the single `#atproto` key from a document, then verify a commit
     /// signed by that key passes and a forged (different-key) commit fails.
     #[test]
     fn atproto_key_from_did_document_verifies_head() {
         let (commit, vk) = make_signed_commit();
         let did = "did:web:alice.example.com";
-        let resolved = atproto_verifying_key_from_did_document(&did_doc_with_atproto(did, &vk), did)
-            .expect("resolve #atproto key");
+        let resolved =
+            atproto_verifying_key_from_did_document(&did_doc_with_atproto(did, &vk), did)
+                .expect("resolve #atproto key");
         assert_eq!(resolved.to_sec1_bytes(), vk.to_sec1_bytes());
         // Head signed by the resolved key verifies.
-        commit.verify(&resolved).expect("head verifies under current #atproto");
+        commit
+            .verify(&resolved)
+            .expect("head verifies under current #atproto");
         // A head signed by a DIFFERENT key does not verify against this doc's key.
         let (other_commit, _other_vk) = make_signed_commit();
         assert!(
@@ -511,8 +732,9 @@ mod tests {
         let new_vk = VerifyingKey::from(&SigningKey::random(&mut rand::rngs::OsRng));
         let did = "did:web:alice.example.com";
         // Current document publishes the NEW key (post-rotation).
-        let resolved = atproto_verifying_key_from_did_document(&did_doc_with_atproto(did, &new_vk), did)
-            .expect("resolve");
+        let resolved =
+            atproto_verifying_key_from_did_document(&did_doc_with_atproto(did, &new_vk), did)
+                .expect("resolve");
         // The head (still signed by the old key) fails — the producer's re-sign
         // is what would make it pass; without re-sign, verification correctly fails.
         assert!(
