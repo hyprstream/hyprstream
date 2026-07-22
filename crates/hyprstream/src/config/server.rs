@@ -46,12 +46,29 @@ pub struct CorsConfig {
 fn default_cors_enabled() -> bool {
     true
 }
+/// Default allowed origins for the credentialed router.
+///
+/// These are baked in so a stock deployment can serve both local dev tooling
+/// and the production website out of the box. The list stays fully overridable
+/// at runtime — set `HYPRSTREAM_CORS_ORIGINS` (comma-separated) or the
+/// `server.cors.allowed_origins` config key to replace it without a rebuild.
+///
+/// Production origins (`https://hyprstream.com`, `https://www.hyprstream.com`)
+/// are required so a signed-in user on the website can reach the credentialed
+/// data plane (`/oai/v1`, `/models`, `/.well-known/export9p`,
+/// `/.well-known/planes`). Credentials remain enabled here, so this list must
+/// never contain `"*"` (wildcard + credentials is invalid per the CORS spec);
+/// the wildcard, credentials-off surface lives on `CorsConfig::public`.
 fn default_cors_origins() -> Vec<String> {
     vec![
+        // Local development origins
         "http://localhost:3000".to_owned(),
         "http://localhost:3001".to_owned(),
         "http://127.0.0.1:3000".to_owned(),
         "http://127.0.0.1:3001".to_owned(),
+        // Production website origins
+        "https://hyprstream.com".to_owned(),
+        "https://www.hyprstream.com".to_owned(),
     ]
 }
 fn default_cors_credentials() -> bool {
@@ -601,5 +618,120 @@ impl ServerConfig {
     /// Create a builder from existing config
     pub fn to_builder(self) -> ServerConfigBuilder {
         ServerConfigBuilder::from_config(self)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_cors_allows_production_website_origins() {
+        let cors = CorsConfig::default();
+
+        // Production website origins must be allowed so a signed-in user on the
+        // website can reach the credentialed data plane.
+        assert!(
+            cors.allowed_origins
+                .contains(&"https://hyprstream.com".to_owned()),
+            "default CORS must allow https://hyprstream.com"
+        );
+        assert!(
+            cors.allowed_origins
+                .contains(&"https://www.hyprstream.com".to_owned()),
+            "default CORS must allow https://www.hyprstream.com"
+        );
+    }
+
+    #[test]
+    fn default_cors_keeps_local_dev_origins() {
+        let cors = CorsConfig::default();
+
+        for origin in [
+            "http://localhost:3000",
+            "http://localhost:3001",
+            "http://127.0.0.1:3000",
+            "http://127.0.0.1:3001",
+        ] {
+            assert!(
+                cors.allowed_origins.contains(&origin.to_owned()),
+                "default CORS must keep dev origin {origin}"
+            );
+        }
+    }
+
+    #[test]
+    fn default_cors_rejects_unrelated_origin() {
+        let cors = CorsConfig::default();
+
+        assert!(
+            !cors
+                .allowed_origins
+                .contains(&"https://evil.example.com".to_owned()),
+            "default CORS must not allow an unrelated origin"
+        );
+    }
+
+    #[test]
+    fn credentialed_router_has_credentials_enabled_and_no_wildcard() {
+        let cors = CorsConfig::default();
+
+        assert!(
+            cors.allow_credentials,
+            "the non-public (credentialed) router must keep credentials enabled"
+        );
+        // Wildcard + credentials is invalid per the CORS spec; the credentialed
+        // default must never contain "*".
+        assert!(
+            !cors.allowed_origins.contains(&"*".to_owned()),
+            "the credentialed router must not use a wildcard origin"
+        );
+    }
+
+    #[test]
+    fn public_router_is_wildcard_without_credentials() {
+        // The OAuth/public router must stay wildcard with credentials OFF.
+        let public = CorsConfig::public();
+        assert_eq!(public.allowed_origins, vec!["*".to_owned()]);
+        assert!(
+            !public.allow_credentials,
+            "wildcard public router must not allow credentials"
+        );
+        assert!(!public.permissive_headers);
+    }
+
+    #[test]
+    fn with_port_extends_defaults_and_preserves_prod_origins() {
+        let cors = CorsConfig::with_port(8080);
+
+        // Port-aware origins are added ...
+        assert!(cors
+            .allowed_origins
+            .contains(&"http://localhost:8080".to_owned()));
+        assert!(cors
+            .allowed_origins
+            .contains(&"http://127.0.0.1:8080".to_owned()));
+        // ... without dropping the production website origins.
+        assert!(cors
+            .allowed_origins
+            .contains(&"https://hyprstream.com".to_owned()));
+        assert!(cors
+            .allowed_origins
+            .contains(&"https://www.hyprstream.com".to_owned()));
+        assert!(cors.allow_credentials);
+    }
+
+    #[test]
+    fn cors_origins_remain_overridable_via_builder() {
+        // Operators can replace the default list entirely without a rebuild.
+        let cors = ServerConfig::builder()
+            .cors_origins(vec!["https://custom.example.com".to_owned()])
+            .build()
+            .cors;
+
+        assert_eq!(
+            cors.allowed_origins,
+            vec!["https://custom.example.com".to_owned()]
+        );
     }
 }
