@@ -424,6 +424,23 @@ pub fn load_or_generate_node_signing_key(secrets_dir: &std::path::Path) -> Resul
     Ok(key)
 }
 
+/// Describes how a service's credentials directory is scoped.
+///
+/// This is deliberately about directory layout rather than a particular
+/// process manager. Both systemd `LoadCredential` directories and projected
+/// Kubernetes Secret/CSI volumes can present a directory already scoped to a
+/// single service, while standalone multi-process deployments share one
+/// writable directory among services.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SecretsProfile {
+    /// One base directory is shared by all services; non-policy credentials
+    /// live under a `{service_name}/` subdirectory.
+    SharedDirectory,
+    /// The provider has already scoped the directory to one service, so its
+    /// credentials use flat names such as `signing-key`.
+    PerServiceScoped,
+}
+
 /// Resolve the Ed25519 signing key a service process should use to sign its
 /// own RPC responses in `--ipc` (multi-process) deployment.
 ///
@@ -445,22 +462,25 @@ pub fn load_or_generate_node_signing_key(secrets_dir: &std::path::Path) -> Resul
 /// by unexpected key" (#759) — a sibling gap to the CA-derivation fallback
 /// #441 already removed from `resolve_service_key`.
 ///
-/// - `systemd_mode`: each service's per-unit `LoadCredential` directory
-///   already scopes `secrets_dir` to that one service, so the flat top-level
-///   file is correct for every service, policy included.
-/// - Standalone (non-systemd) `--ipc`: `secrets_dir` is shared across every
+/// - [`SecretsProfile::PerServiceScoped`]: the credential provider already
+///   scopes `secrets_dir` to that one service, so the flat top-level file is
+///   correct for every service, policy included.
+/// - [`SecretsProfile::SharedDirectory`]: `secrets_dir` is shared across every
 ///   spawned service process, so non-policy services use a `{service_name}/`
 ///   subdirectory to avoid collisions — but policy must still resolve to the
 ///   flat root/CA key, matching what bootstrap registered.
 pub fn resolve_service_signing_key(
     secrets_dir: &std::path::Path,
     service_name: &str,
-    systemd_mode: bool,
+    profile: SecretsProfile,
 ) -> Result<SigningKey> {
-    if systemd_mode || service_name == "policy" {
-        load_or_generate_node_signing_key(secrets_dir)
-    } else {
-        load_or_generate_service_signing_key(secrets_dir, service_name)
+    match (profile, service_name) {
+        (_, "policy") | (SecretsProfile::PerServiceScoped, _) => {
+            load_or_generate_node_signing_key(secrets_dir)
+        }
+        (SecretsProfile::SharedDirectory, _) => {
+            load_or_generate_service_signing_key(secrets_dir, service_name)
+        }
     }
 }
 
@@ -1321,7 +1341,9 @@ mod tests {
         // Standalone (non-systemd) `--ipc` startup, resolving policy's own key —
         // this must equal the root key bootstrap registered, not a freshly
         // minted independent key.
-        let resolved = resolve_service_signing_key(dir.path(), "policy", false).unwrap();
+        let resolved =
+            resolve_service_signing_key(dir.path(), "policy", SecretsProfile::SharedDirectory)
+                .unwrap();
         assert_eq!(
             resolved.to_bytes(), root_key.to_bytes(),
             "policy must resolve to the flat root/CA key, matching bootstrap_pubkeys[\"policy\"]"
@@ -1335,11 +1357,25 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_service_signing_key_policy_matches_root_key_in_systemd_mode() {
+    fn test_resolve_service_signing_key_policy_matches_root_key_when_scoped() {
         let dir = TempDir::new().unwrap();
         let root_key = load_or_generate_node_signing_key(dir.path()).unwrap();
-        let resolved = resolve_service_signing_key(dir.path(), "policy", true).unwrap();
+        let resolved =
+            resolve_service_signing_key(dir.path(), "policy", SecretsProfile::PerServiceScoped)
+                .unwrap();
         assert_eq!(resolved.to_bytes(), root_key.to_bytes());
+    }
+
+    #[test]
+    fn test_resolve_service_signing_key_non_policy_uses_flat_key_when_scoped() {
+        let dir = TempDir::new().unwrap();
+        let flat_key = load_or_generate_node_signing_key(dir.path()).unwrap();
+        let resolved =
+            resolve_service_signing_key(dir.path(), "model", SecretsProfile::PerServiceScoped)
+                .unwrap();
+
+        assert_eq!(resolved.to_bytes(), flat_key.to_bytes());
+        assert!(!dir.path().join("model").exists());
     }
 
     #[test]
@@ -1347,7 +1383,9 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let root_key = load_or_generate_node_signing_key(dir.path()).unwrap();
 
-        let model_key = resolve_service_signing_key(dir.path(), "model", false).unwrap();
+        let model_key =
+            resolve_service_signing_key(dir.path(), "model", SecretsProfile::SharedDirectory)
+                .unwrap();
         assert_ne!(
             model_key.to_bytes(), root_key.to_bytes(),
             "non-policy services must keep their own independent key, distinct from the root/CA key"
@@ -1365,12 +1403,20 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let _root_key = load_or_generate_node_signing_key(dir.path()).unwrap();
 
-        let policy_1 = resolve_service_signing_key(dir.path(), "policy", false).unwrap();
-        let policy_2 = resolve_service_signing_key(dir.path(), "policy", false).unwrap();
+        let policy_1 =
+            resolve_service_signing_key(dir.path(), "policy", SecretsProfile::SharedDirectory)
+                .unwrap();
+        let policy_2 =
+            resolve_service_signing_key(dir.path(), "policy", SecretsProfile::SharedDirectory)
+                .unwrap();
         assert_eq!(policy_1.to_bytes(), policy_2.to_bytes());
 
-        let model_1 = resolve_service_signing_key(dir.path(), "model", false).unwrap();
-        let model_2 = resolve_service_signing_key(dir.path(), "model", false).unwrap();
+        let model_1 =
+            resolve_service_signing_key(dir.path(), "model", SecretsProfile::SharedDirectory)
+                .unwrap();
+        let model_2 =
+            resolve_service_signing_key(dir.path(), "model", SecretsProfile::SharedDirectory)
+                .unwrap();
         assert_eq!(model_1.to_bytes(), model_2.to_bytes());
     }
 }

@@ -91,6 +91,56 @@ pub const ALL_CREDENTIAL_NAMES: &[&str] = &[
     "service-jwt",
 ];
 
+/// Build credential directives for a user service unit.
+///
+/// A non-policy service must have its own plaintext signing key available for
+/// `LoadCredential=`. Falling through to `ImportCredential=signing-key` would
+/// import the node/CA root key from the flat credstore into that service.
+fn credential_directives(
+    service: &str,
+    names: &[&str],
+    credstore: &std::path::Path,
+    plain_creds: &std::path::Path,
+) -> Result<String> {
+    let mut import_lines = String::new();
+
+    for name in names {
+        // Per-service credentials (signing-key, service-jwt): each service
+        // has its own independent Ed25519 key stored in a subdirectory.
+        //
+        // ImportCredential requires the credstore file name to match the
+        // runtime name, but per-service creds are encrypted with prefixed
+        // names (e.g. model-signing-key). Use LoadCredential to load from
+        // the plaintext file directly, making it available as the unprefixed
+        // name the runtime expects.
+        //
+        // Policy is special: its "signing-key" IS the CA key, stored flat
+        // in the encrypted credstore, so ImportCredential works for it.
+        if SERVICE_CREDENTIAL_NAMES.contains(name) && service != "policy" {
+            let plain_path = plain_creds.join(service).join(name);
+            if plain_path.is_file() {
+                import_lines.push_str(&format!(
+                    "LoadCredential={name}:{}\n",
+                    plain_path.display()
+                ));
+                continue;
+            }
+            if *name == "signing-key" {
+                anyhow::bail!(
+                    "per-service signing key '{}' is missing; refusing to import the node/CA root key as service '{}'. Re-run 'hyprstream service install' after provisioning service credentials",
+                    plain_path.display(),
+                    service
+                );
+            }
+        }
+        if credstore.join(name).exists() {
+            import_lines.push_str(&format!("ImportCredential={name}\n"));
+        }
+    }
+
+    Ok(import_lines)
+}
+
 /// Generate a systemd service unit for a service.
 ///
 /// # Arguments
@@ -184,37 +234,7 @@ pub fn service_unit(service: &str, use_systemd_creds: bool, depends_on: &[&str])
             .map(|d| d.join("hyprstream").join("credentials"))
             .unwrap_or_default();
 
-        let mut import_lines = String::new();
-
-        for name in &names {
-            // Per-service credentials (signing-key, service-jwt): each service
-            // has its own independent Ed25519 key stored in a subdirectory.
-            //
-            // ImportCredential requires the credstore file name to match the
-            // runtime name, but per-service creds are encrypted with prefixed
-            // names (e.g. model-signing-key).  Use LoadCredential to load from
-            // the plaintext file directly, making it available as the unprefixed
-            // name the runtime expects.
-            //
-            // Policy is special: its "signing-key" IS the CA key, stored flat
-            // in the encrypted credstore, so ImportCredential works for it.
-            if SERVICE_CREDENTIAL_NAMES.contains(name) && service != "policy" {
-                let plain_path = plain_creds.join(service).join(name);
-                if plain_path.exists() {
-                    import_lines.push_str(&format!(
-                        "LoadCredential={name}:{}\n",
-                        plain_path.display()
-                    ));
-                    continue;
-                }
-                // Fall through: no per-service plaintext file, try encrypted credstore
-            }
-            if credstore.join(name).exists() {
-                import_lines.push_str(&format!("ImportCredential={name}\n"));
-            }
-        }
-
-        let all_cred_lines = import_lines;
+        let all_cred_lines = credential_directives(service, &names, &credstore, &plain_creds)?;
 
         if all_cred_lines.is_empty() {
             String::new()
@@ -373,4 +393,36 @@ WantedBy=multi-user.target
 "#,
         exec = exec.display(),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn missing_service_signing_key_never_falls_back_to_node_key() -> Result<()> {
+        let temp = tempfile::TempDir::new()?;
+        let credstore = temp.path().join("credstore.encrypted");
+        let plain_creds = temp.path().join("credentials");
+        std::fs::create_dir_all(&credstore)?;
+        std::fs::create_dir_all(plain_creds.join("model"))?;
+
+        // This is the dangerous fallback credential: the node/CA root key is
+        // present under the runtime name expected by the service.
+        std::fs::write(credstore.join("signing-key"), b"encrypted-root-key")?;
+
+        let error = match credential_directives(
+            "model",
+            SERVICE_CREDENTIAL_NAMES,
+            &credstore,
+            &plain_creds,
+        ) {
+            Err(error) => error,
+            Ok(lines) => anyhow::bail!("dangerous signing-key fallback returned: {lines}"),
+        };
+        let message = error.to_string();
+        assert!(message.contains("per-service signing key"));
+        assert!(message.contains("refusing to import the node/CA root key"));
+        Ok(())
+    }
 }
