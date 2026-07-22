@@ -123,7 +123,7 @@ jobs:
             -e CARGO_INCREMENTAL=0 \
             hyprstream-cuda130-arm64-spike:ci \
             bash -euo pipefail -c '
-              file /opt/libtorch/lib/libtorch_cuda.so
+              test -s /opt/libtorch/lib/libtorch_cuda.so
               python3 -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available())"
               cargo build -p hyprstream --release --features otel
               ldd target/release/hyprstream | grep -E "libtorch|not found" || true
