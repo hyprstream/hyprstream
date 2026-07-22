@@ -481,7 +481,11 @@ impl Translator {
             return Ok(());
         }
         match self.attach_session.get() {
-            Some(existing) if existing == session => Ok(()),
+            // Compare by *attach identity*, not value equality: a real
+            // authenticator re-stamps the token deadline on every verification
+            // of the same ticket, so a value comparison would reject a
+            // legitimate re-attach of an identical, still-valid session (F2).
+            Some(existing) if existing.same_attach_identity(session) => Ok(()),
             Some(_) => Err(anyhow::Error::new(hyprstream_vfs::MountError::PermissionDenied(
                 "conflicting attach session context".to_owned(),
             ))),
@@ -496,28 +500,48 @@ impl Translator {
         wnames: Vec<String>,
     ) -> Result<Response> {
         // The session is inherited from the fid being walked (#568 — the
-        // credential is verified once at attach, never re-verified per op),
-        // and the destination path extends the source fid's walked path.
+        // credential is verified once at attach, never re-verified per op).
+        // The destination path extends the source fid's already-walked path.
         let session = self.fids.session(fid);
-        let mut path = self.fids.path(fid).unwrap_or_default();
-        path.extend(wnames.iter().cloned());
+        let base = self.fids.path(fid).unwrap_or_default();
 
         if let Some(monitor) = &self.monitor {
-            // A walk is checked against its destination, not merely its
-            // source; otherwise a subject could traverse into a high-labeled
-            // object and rely on a later operation to discover the denial.
-            // A fid outside a verified session denies outright.
+            // Complete mediation: authorize *every* hop of the walk, not only
+            // the final destination. Content-truth labels need not be monotone
+            // with depth, so a parent directory can be more classified than a
+            // leaf — a subject must not traverse *through* a high-labeled
+            // directory to reach a lower-labeled object with the intermediate
+            // hops unmediated (F1). A fid outside a verified session denies
+            // outright.
             let Some(session) = session.as_ref() else {
                 return Ok(Response::Error { ecode: libc_eperm() });
             };
-            if !monitor.authorize(session, &path, Action::Walk) {
-                return Ok(Response::Error { ecode: libc_eperm() });
+            let mut prefix = base.clone();
+            for component in &wnames {
+                prefix.push(component.clone());
+                if !monitor.authorize(session, &prefix, Action::Walk) {
+                    return Ok(Response::Error { ecode: libc_eperm() });
+                }
             }
         }
 
         // Mirror of RemoteModelMount::walk: call backend.walk with the source
         // fid, the new fid, and the path components.
         let result = self.backend.walk(fid, newfid, &wnames).await?;
+
+        // Derive the cached path from the backend's *returned qid count*, not
+        // the requested `wnames`. 9P permits `nwqid < nwname` (a partial walk):
+        // the fid then points at the object the backend actually reached, which
+        // may be shallower than the requested path. Caching the unreached
+        // suffix would tag the fid with a name deeper than the served object,
+        // so every later op would resolve the label of a name the backend never
+        // opened — a name↔object TOCTOU (F1/F3). The real MountBackend walks
+        // one hop at a time, so partial returns are a live protocol reality,
+        // not hypothetical.
+        let nwqid = result.qids.len();
+        let mut reached = base;
+        reached.extend(wnames.iter().take(nwqid).cloned());
+
         if wnames.is_empty() {
             // nwname=0 is a fid *clone*: newfid aliases fid (same file), and
             // the backend returns no qids. newfid must still inherit the source
@@ -525,9 +549,10 @@ impl Translator {
             // cached session and a live monitor wrongly denies it for an
             // already-authenticated client (#568).
             let qtype = self.fids.qtype(fid).unwrap_or(0);
-            self.fids.insert(newfid, qtype, session, path);
-        } else if let Some(q) = result.qids.last() {
-            self.fids.insert(newfid, q.qtype, session, path);
+            self.fids.insert(newfid, qtype, session, reached);
+        } else if nwqid > 0 {
+            let qtype = result.qids.last().map(|q| q.qtype).unwrap_or(0);
+            self.fids.insert(newfid, qtype, session, reached);
         }
         Ok(Response::Walk { qids: result.qids })
     }
@@ -1516,6 +1541,162 @@ mod tests {
             errno_from_error(&err),
             EACCES,
             "conflicting attach session must be EACCES",
+        );
+    }
+
+    /// F2: a real `AttachAuthenticator` re-stamps `Instant::now() + ttl` on
+    /// every verification of the *same* ticket. Re-attaching that identical,
+    /// still-valid ticket on a second fid of the same connection must be
+    /// accepted — not rejected as a "conflicting" session. Equality for re-attach
+    /// detection is over identity (subject + token scope), never the timestamp.
+    #[tokio::test]
+    async fn same_valid_ticket_reattach_is_accepted() {
+        struct FreshDeadlineAuth;
+        #[async_trait]
+        impl AttachAuthenticator for FreshDeadlineAuth {
+            async fn authenticate(&self, _uname: &str, _aname: &str) -> SessionContext {
+                // `permit_session` stamps `Instant::now()` into the token, so
+                // each call yields a distinct deadline — exactly what a real
+                // verifier does when re-checking the same ticket.
+                permit_session(Level::Secret, ALL_OPS)
+            }
+        }
+
+        let t = Translator::new(Arc::new(MemoryBackend::default())).with_reference_monitor(
+            Arc::new(ReferenceMonitor::new(
+                Arc::new(FreshDeadlineAuth),
+                Arc::new(StaticLabels(Some(label(Level::Public)))),
+                Arc::new(AllowAll),
+            )),
+        );
+
+        let (_, resp) = t
+            .handle_message(&msg::tattach(1, 1, u32::MAX, "alice-ticket", "/"))
+            .await
+            .unwrap();
+        assert!(matches!(resp, Response::Attach { .. }), "first attach: {resp:?}");
+
+        // Same ticket, freshly-stamped deadline, new fid on the same connection.
+        let (_, resp) = t
+            .handle_message(&msg::tattach(2, 2, u32::MAX, "alice-ticket", "/"))
+            .await
+            .unwrap();
+        assert!(
+            matches!(resp, Response::Attach { .. }),
+            "same valid ticket re-attach must be accepted, got {resp:?}",
+        );
+    }
+
+    /// F1 (defect 1 — intermediate-hop mediation): content-truth labels need
+    /// not be monotone with depth. Here the `secret` directory hop is
+    /// Secret-labeled while its `public` leaf is Public. The walk must mediate
+    /// *every* hop, so a Public subject traversing through the Secret directory
+    /// is refused at the first hop — not cleared against only the (Public)
+    /// final destination.
+    #[tokio::test]
+    async fn walk_mediates_every_hop_not_just_destination() {
+        struct ByDepth;
+        impl ObjectLabelResolver for ByDepth {
+            fn resolve(&self, object: ObjectRef<'_>) -> Option<SecurityLabel> {
+                match object {
+                    // The single directory hop is Secret; anything deeper is Public
+                    // (a non-monotone lattice — the leaf is *less* classified than
+                    // the directory that contains it).
+                    ObjectRef::Path([]) => Some(label(Level::Public)),
+                    ObjectRef::Path([_]) => Some(label(Level::Secret)),
+                    ObjectRef::Path([_, ..]) => Some(label(Level::Public)),
+                    ObjectRef::Cid(_) => None,
+                }
+            }
+        }
+        let backend = MemoryBackend::default();
+        backend.add_file("/secret", b"classified");
+        let t = Translator::new(Arc::new(backend)).with_reference_monitor(Arc::new(
+            ReferenceMonitor::new(
+                Arc::new(StaticAuth(permit_session(Level::Public, ALL_OPS))),
+                Arc::new(ByDepth),
+                Arc::new(AllowAll),
+            ),
+        ));
+
+        t.handle_message(&msg::tattach(1, 0, u32::MAX, "user", "/")).await.unwrap();
+        // Walk through the Secret directory toward the Public leaf. The Public
+        // subject cannot clear the Secret hop, so the walk must deny — even
+        // though the *destination* label is Public.
+        let (_, resp) = t
+            .handle_message(&msg::twalk(2, 0, 1, &["secret", "public"]))
+            .await
+            .unwrap();
+        match resp {
+            Response::Error { ecode } => assert_eq!(ecode, libc_eperm()),
+            other => panic!("expected EPERM at the Secret intermediate hop, got {other:?}"),
+        }
+    }
+
+    /// F1 (defect 2 — partial-walk path poisoning): 9P permits `nwqid < nwname`.
+    /// The fid must be tagged with the path the backend *reached* (the
+    /// returned-qid prefix), never the full requested suffix — otherwise later
+    /// ops resolve the label of a name the backend never opened (a name↔object
+    /// TOCTOU). `PartialWalkBackend` reaches only the first component no matter
+    /// how many are requested.
+    #[tokio::test]
+    async fn partial_walk_caches_reached_path_not_requested_suffix() {
+        use crate::backend::{Backend, OpenResult, StatResult, WalkResult};
+        struct PartialWalkBackend;
+        #[async_trait]
+        impl Backend for PartialWalkBackend {
+            async fn attach(&self, _uname: &str) -> anyhow::Result<()> {
+                Ok(())
+            }
+            async fn walk(
+                &self,
+                _fid: u32,
+                _newfid: u32,
+                _components: &[String],
+            ) -> anyhow::Result<WalkResult> {
+                // Reaches exactly one component, regardless of how many walked.
+                Ok(WalkResult { qids: vec![sample_qid(0, 1)] })
+            }
+            async fn open(&self, _fid: u32, _flags: u32) -> anyhow::Result<OpenResult> {
+                unimplemented!("not reached")
+            }
+            async fn read(&self, _fid: u32, _offset: u64, _count: u32) -> anyhow::Result<Vec<u8>> {
+                unimplemented!("not reached")
+            }
+            async fn write(
+                &self,
+                _fid: u32,
+                _offset: u64,
+                _data: &[u8],
+            ) -> anyhow::Result<u32> {
+                unimplemented!("not reached")
+            }
+            async fn stat(&self, _fid: u32) -> anyhow::Result<StatResult> {
+                unimplemented!("not reached")
+            }
+            async fn readdir(
+                &self,
+                _fid: u32,
+                _offset: u64,
+                _count: u32,
+            ) -> anyhow::Result<Vec<u8>> {
+                unimplemented!("not reached")
+            }
+            async fn clunk(&self, _fid: u32) -> anyhow::Result<()> {
+                Ok(())
+            }
+        }
+
+        // No monitor: this isolates the path-caching fix from mediation.
+        let t = Translator::new(Arc::new(PartialWalkBackend));
+        t.handle_message(&msg::tattach(1, 0, u32::MAX, "user", "/")).await.unwrap();
+        t.handle_message(&msg::twalk(2, 0, 1, &["a", "b"])).await.unwrap();
+
+        let cached = t.fids.path(1).expect("newfid must be tracked");
+        assert_eq!(
+            cached,
+            vec!["a".to_string()],
+            "cached path must be the reached prefix, not the unreached suffix",
         );
     }
 

@@ -35,6 +35,47 @@
 //!
 //! Do not wire a monitor into the production serve paths from this crate; that
 //! wiring lands with the activation change, after #698.
+//!
+//! ## Mediation is over the *name*, not the *object* (read before relying on it)
+//!
+//! The monitor is authoritative over the **path** a fid is tagged with, not
+//! over the **object** the backend resolves that fid to. [`ReferenceMonitor::
+//! authorize`] resolves the label from `ObjectRef::Path(components)` (the
+//! cached walked path), while the backend independently resolves the fid to an
+//! actual object/handle. Nothing in this contract *binds* the labeled name to
+//! the served object: the invariant "the label checked is the label of the
+//! object served" holds **only if the label resolver and the backend resolve
+//! names identically**. That is a convention, not an enforced invariant — so
+//! the honest statement of #568's "complete mediation" claim is:
+//!
+//! > Every dispatched op is routed through the monitor, **and** the monitor's
+//! > label resolver agrees with the backend's name resolution for the served
+//! > namespace. The first half is by construction; the second is a precondition.
+//!
+//! Concretely, this name↔object gap is **not** covered today:
+//!
+//! - **Partial walks** — handled (the cached path is derived from the backend's
+//!   *returned qid count*, never the requested suffix; see `handle_walk`), but
+//!   only because the translator narrows the name to match the reached object.
+//! - **Path traversal / `..`** — `hyprstream-9p` performs **no** `..`
+//!   canonicalization; `wnames` are concatenated verbatim into the cached path.
+//!   Not exploitable against `MemoryBackend`/`MountBackend` (they resolve
+//!   component-wise from a root), but a future resolver that does not
+//!   canonicalize identically to the backend reopens this gap. Any resolver
+//!   wired at activation **must** canonicalize or reject `..`, or the label
+//!   lookup and the backend resolution can diverge.
+//! - **Bind / symlink / mount indirection** — the VFS supports bind mounts and
+//!   per-process bind namespaces. If a path component resolves through an
+//!   indirection the string-keyed resolver does not model, the label checked is
+//!   for the *name* and the bytes served are for the *target*. `ObjectRef::Cid`
+//!   exists precisely to close this (content-addressed refs bind the label to
+//!   the object, not the name); the 9P seam feeds `ObjectRef::Path`.
+//!
+//! Closing the name↔object TOCTOU by making the monitor authoritative over the
+//! **fid/object** (e.g. resolving labels from the backend's reached object, or
+//! via `ObjectRef::Cid`) is **activation-blocking** alongside #698 and tracked
+//! with #699. Until then, treat "complete mediation by construction" as the
+//! *two-independent-resolutions-agree* claim above, not as object authority.
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -159,6 +200,34 @@ impl SessionContext {
         self.token
             .as_ref()
             .is_some_and(|token| token.authorizes(object_label, action))
+    }
+
+    /// Identity comparison for re-attach detection, deliberately distinct from
+    /// the derived [`PartialEq`].
+    ///
+    /// Two attaches are the *same* session when their verified subject context
+    /// and verified-token scope (label ceiling + permitted operations) match.
+    /// The token's `valid_until` deadline is excluded on purpose: a real
+    /// [`AttachAuthenticator`] re-stamps `Instant::now() + ttl` on every
+    /// verification of the *same* ticket, so including it would make an
+    /// identical, still-valid ticket compare unequal and wrongly reject a
+    /// legitimate re-attach/reconnect (F2). The derived `PartialEq` is plain
+    /// value equality (useful for diagnostics/tests); *attach identity* — what
+    /// `bind_attach_session` checks — is this method.
+    pub fn same_attach_identity(&self, other: &SessionContext) -> bool {
+        if self.security_context != other.security_context {
+            return false;
+        }
+        match (&self.token, &other.token) {
+            // The token's `valid_until` is deliberately ignored: a real
+            // authenticator re-stamps it on every verification of the same
+            // ticket, so it is not part of attach identity.
+            (None, None) => true,
+            (Some(a), Some(b)) => {
+                a.label_ceiling == b.label_ceiling && a.operations == b.operations
+            }
+            _ => false,
+        }
     }
 }
 
