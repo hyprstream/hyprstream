@@ -281,8 +281,11 @@ fn decode_jwt_exp(jwt: &str) -> Option<i64> {
 
 /// Spawn a background task that renews this service's JWT when it approaches expiry.
 ///
-/// Checks hourly; renews when ≤7 days remain. Writes the renewed JWT to disk and
-/// updates the global trust store so in-flight RPC calls stay authenticated.
+/// Checks hourly; renews when ≤7 days remain. Updates the global trust store so
+/// in-flight RPC calls stay authenticated, and best-effort persists the renewed
+/// JWT to disk so it survives restart. On a read-only credentials dir (systemd
+/// `$CREDENTIALS_DIRECTORY`) the persist fails with an error-level log — the
+/// service re-registers and obtains a fresh JWT on next startup regardless.
 fn spawn_jwt_renewal_task(
     service_name: &str,
     signing_key: SigningKey,
@@ -369,6 +372,19 @@ fn spawn_jwt_renewal_task(
                             att.expires_at = info.expires_at;
                             trust.insert(vk, att);
                         }
+                    }
+                    // Persist so the renewed JWT survives restart (#803).
+                    if let Err(e) = crate::auth::identity_store::write_service_jwt(
+                        &credentials_dir,
+                        &service_name,
+                        &info.token,
+                    ) {
+                        tracing::error!(
+                            service = service_name,
+                            error = %e,
+                            "renewed service JWT could not be persisted; it is \
+                             process-ephemeral until the next restart re-registers"
+                        );
                     }
                     tracing::info!(
                         service = service_name,

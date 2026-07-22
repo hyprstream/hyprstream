@@ -56,15 +56,6 @@ pub const SERVICE_CREDENTIAL_NAMES: &[&str] = &[
     "service-jwt",
 ];
 
-/// Application-level credentials — only the oauth service needs these.
-///
-/// The credential-store key encrypts the user database (users.toml.age).
-/// The user-signing key is used for Ed25519 challenge-response auth.
-pub const OAUTH_CREDENTIAL_NAMES: &[&str] = &[
-    "credential-store-key",
-    "user-signing-key",
-];
-
 /// Policy-service-only credentials.
 ///
 /// The CA private key is only available to PolicyService (the CA).
@@ -72,15 +63,18 @@ pub const POLICY_CREDENTIAL_NAMES: &[&str] = &[
     "ca-key",
 ];
 
-/// All managed credential names (node + service + application).
+/// All managed credential names (node + service).
 ///
 /// Used by `encrypt_credentials_if_available` to encrypt all secrets
 /// from the secrets directory into the systemd credstore.
+///
+/// `user-signing-key` is deliberately absent: it is a CLI-side client
+/// credential (challenge-response enrollment) with no service-side consumer,
+/// so no unit imports it. The `credential-store-key` name was removed — it had
+/// no producer or consumer anywhere in the tree (#808).
 pub const ALL_CREDENTIAL_NAMES: &[&str] = &[
     "signing-key",
     "rsa-key",
-    "credential-store-key",
-    "user-signing-key",
     "tls-key",
     "tls-cert",
     "quic-key",
@@ -157,9 +151,6 @@ fn system_creds_section(
 ) -> Result<String> {
     let mut names: Vec<&'static str> = NODE_CREDENTIAL_NAMES.to_vec();
     names.extend(SERVICE_CREDENTIAL_NAMES.iter().copied());
-    if service == "oauth" {
-        names.extend(OAUTH_CREDENTIAL_NAMES.iter().copied());
-    }
     if service == "policy" {
         names.extend(POLICY_CREDENTIAL_NAMES.iter().copied());
     }
@@ -178,6 +169,23 @@ fn system_creds_section(
     })
 }
 
+/// Instance-namespaced hyprstream config directory.
+///
+/// Mirrors the `StoragePaths` prefixing used by the bootstrap/config writers
+/// (`$XDG_CONFIG_HOME/hyprstream/instances/{inst}` when `HYPRSTREAM_INSTANCE`
+/// is set) so generated units reference the same credential paths that were
+/// actually provisioned (#808).
+///
+/// Note: the systemd *credstore* itself (`$XDG_CONFIG_HOME/credstore.encrypted`)
+/// is a fixed, systemd-owned location and is intentionally NOT namespaced.
+pub(crate) fn hyprstream_config_dir() -> Option<std::path::PathBuf> {
+    let base = dirs::config_dir()?.join("hyprstream");
+    Some(match std::env::var("HYPRSTREAM_INSTANCE") {
+        Ok(inst) if !inst.is_empty() => base.join("instances").join(inst),
+        _ => base,
+    })
+}
+
 /// Generate a systemd service unit for a service.
 ///
 /// # Arguments
@@ -189,8 +197,8 @@ fn system_creds_section(
 /// # Credential scoping
 ///
 /// All services receive node-level credentials (signing key, TLS/QUIC
-/// materials). Only the `oauth` service additionally receives application-
-/// level secrets (credential-store key, user-signing key).
+/// materials) plus their per-service credentials; only `policy` additionally
+/// receives the CA private key.
 ///
 /// # Startup ordering
 ///
@@ -254,21 +262,18 @@ pub fn service_unit(service: &str, use_systemd_creds: bool, depends_on: &[&str])
             .unwrap_or_default();
 
         // Node-level credentials for all services; add per-service credentials
-        // from the service's subdirectory; add application-level credentials
-        // for oauth; add CA private key for policy.
+        // from the service's subdirectory; add CA private key for policy.
         let mut names: Vec<&'static str> = NODE_CREDENTIAL_NAMES.to_vec();
         names.extend(SERVICE_CREDENTIAL_NAMES.iter().copied());
-        if service == "oauth" {
-            names.extend(OAUTH_CREDENTIAL_NAMES.iter().copied());
-        }
         if service == "policy" {
             names.extend(POLICY_CREDENTIAL_NAMES.iter().copied());
         }
 
-        // Plaintext credential directory (wizard-written files):
-        //   ~/.config/hyprstream/credentials/{service}/signing-key
-        let plain_creds = dirs::config_dir()
-            .map(|d| d.join("hyprstream").join("credentials"))
+        // Plaintext credential directory (wizard-written files), instance-
+        // namespaced to match StoragePaths (#808):
+        //   ~/.config/hyprstream[/instances/{inst}]/credentials/{service}/signing-key
+        let plain_creds = hyprstream_config_dir()
+            .map(|d| d.join("credentials"))
             .unwrap_or_default();
 
         let all_cred_lines = credential_directives(service, &names, &credstore, &plain_creds)?;
@@ -313,6 +318,9 @@ Description=Hyprstream {service} Service{dep_section}
 
 [Service]
 Type=notify
+# Writable state home ($STATE_DIRECTORY) for JWT rotation state — the
+# credentials ramfs ($CREDENTIALS_DIRECTORY) is read-only (#803).
+StateDirectory=hyprstream
 ExecStart={exec} service start {service} --foreground{env_section}{creds_section}{hardening}
 Restart=on-failure
 RestartSec=2s
@@ -396,9 +404,11 @@ pub fn system_service_unit(service: &str, depends_on: &[&str]) -> Result<String>
         format!("\n{env_directives}")
     };
 
-    // System-wide credential plumbing uses FHS system paths. PID 1 reads the
-    // sources as root and exposes them to the service through systemd's
-    // access-restricted credentials ramfs.
+    // System-wide credential plumbing (#808): mirrors the user-unit logic with
+    // FHS system paths. `LoadCredential=`/`ImportCredential=` sources are read
+    // by PID 1 (root) and passed to the service through the private, access-
+    // restricted credentials ramfs ($CREDENTIALS_DIRECTORY), so the
+    // `hyprstream` user never needs read access to the on-disk originals.
     let creds_section = {
         let credstore = std::path::PathBuf::from("/etc/credstore.encrypted");
         let plain_creds = match std::env::var("HYPRSTREAM_INSTANCE") {
@@ -437,6 +447,9 @@ Type=notify
 User=hyprstream
 RuntimeDirectory=hyprstream
 RuntimeDirectoryMode=0750
+# Writable state home ($STATE_DIRECTORY) for JWT rotation state — the
+# credentials ramfs ($CREDENTIALS_DIRECTORY) is read-only (#803).
+StateDirectory=hyprstream
 ExecStart={exec} service start {service} --foreground{env_section}{creds_section}{hardening}
 Restart=on-failure
 RestartSec=2s

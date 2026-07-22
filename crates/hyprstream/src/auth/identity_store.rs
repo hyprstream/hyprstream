@@ -881,6 +881,20 @@ pub fn load_or_generate_tls_materials_named(
                 });
             }
 
+            if needs_renewal {
+                // Read-only credentials dir (e.g. systemd $CREDENTIALS_DIRECTORY):
+                // the imported cert ages past validity with no on-disk remedy from
+                // inside the service. Fail loud so operators re-provision (#808).
+                tracing::error!(
+                    "TLS cert '{}' in '{}' is past its renewal threshold but the \
+                     credentials directory is read-only; renewal was SKIPPED and the \
+                     cert will expire. Re-run 'hyprstream service install' to \
+                     re-provision a fresh certificate.",
+                    cert_name,
+                    secrets_dir.display()
+                );
+            }
+
             tracing::info!("Loaded persisted TLS materials from '{}'", secrets_dir.display());
             Ok(TlsMaterials {
                 cert_der,
