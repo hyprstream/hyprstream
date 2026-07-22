@@ -1978,10 +1978,22 @@ static PROCESS_BOOTSTRAP_AUTHORITY: parking_lot::Mutex<ProcessBootstrapAuthority
 /// Atomically consume the explicitly selected deployment witness and install
 /// the process Discovery resolver. Selection never falls back between the
 /// OS-owned and DID-anchored providers.
+///
+/// `remote_node` selects how the DID-anchored provider reaches Discovery:
+/// - `false` (same-node fabric, e.g. the metal stack's `service start --ipc`
+///   containers sharing the IPC volume): a lazy local discovery client —
+///   identical posture to the OS-owned path, which also never pings. This is
+///   required on nodes that HOST Discovery (possibly as an in-process
+///   dependency started after this install), where a pre-install network
+///   liveness check would self-deadlock.
+/// - `true` (remote worker): dial the DID-advertised network transport and
+///   REQUIRE a successful signed liveness ping before installing — a dead or
+///   wrong-key endpoint refuses the boot.
 #[cfg(not(target_arch = "wasm32"))]
 pub async fn bootstrap_deployment_process(
     signing_key: SigningKey,
     trust_source: crate::DeploymentTrustSource,
+    remote_node: bool,
 ) -> Result<()> {
     let discovery_vk = hyprstream_service::global_trust_store()
         .resolve_one("discovery")
@@ -1994,20 +2006,74 @@ pub async fn bootstrap_deployment_process(
             (authority, client)
         }
         crate::DeploymentTrustSource::DidAnchored(anchors) => {
-            let (authority, transport) = authenticate_did_anchored_bootstrap(&anchors).await?;
+            let (authority, discovery_transport, mesh_kem_recipient, ml_dsa_65_keys) =
+                authenticate_did_anchored_bootstrap(&anchors).await?;
             let signer = hyprstream_rpc::signer::LocalSigner::new(signing_key);
-            let rpc = hyprstream_rpc::dial::dial(&transport, signer, Some(discovery_vk), None)?;
-            let client = crate::DiscoveryClient::new(rpc);
-            let health = client
-                .ping()
-                .await
-                .context("DID-anchored Discovery reach failed liveness check")?;
-            anyhow::ensure!(
-                health.status == "ok",
-                "DID-anchored Discovery liveness returned status {:?}",
-                health.status
-            );
-            (authority, client)
+            if remote_node {
+                // Remote worker: the DID-advertised transport is the only
+                // reach. QUIC forbids cleartext envelopes, so the document's
+                // #mesh-kem recipient (anchored by the mutual-alias + CA-bound
+                // trust decision above) is REQUIRED — no recipient, no boot.
+                let recipient = mesh_kem_recipient.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "did:web deployment document publishes no #mesh-kem keyAgreement; \
+                         refusing cleartext downgrade for the remote-node bootstrap"
+                    )
+                })?;
+                // Response authentication likewise requires the document's
+                // single #mesh-pq (ML-DSA-65) anchor for the discovery key.
+                let pq_key = match ml_dsa_65_keys.as_slice() {
+                    [key] => key.clone(),
+                    keys => anyhow::bail!(
+                        "did:web deployment document must publish exactly one ML-DSA-65 \
+                         verification method for the remote-node bootstrap (found {})",
+                        keys.len()
+                    ),
+                };
+                let mut kem_store =
+                    hyprstream_rpc::crypto::hybrid_kem::KeyedKemTrustStore::new();
+                kem_store.bind(discovery_vk.to_bytes(), recipient);
+                let mut pq_store = hyprstream_rpc::envelope::KeyedPqTrustStore::new();
+                pq_store.bind(discovery_vk.to_bytes(), &pq_key);
+                // Dial it and require liveness — a reachable-but-wrong
+                // endpoint (no discovery key) or a dead one fails closed here.
+                let rpc = hyprstream_rpc::dial::dial_with_crypto_stores(
+                    &discovery_transport,
+                    signer,
+                    Some(discovery_vk),
+                    None,
+                    Some(Arc::new(kem_store)),
+                    Some(Arc::new(pq_store)),
+                )?;
+                let client = crate::DiscoveryClient::new(rpc);
+                let health = client
+                    .ping()
+                    .await
+                    .context("DID-anchored Discovery reach failed liveness check")?;
+                anyhow::ensure!(
+                    health.status == "ok",
+                    "DID-anchored Discovery liveness returned status {:?}",
+                    health.status
+                );
+                (authority, client)
+            } else {
+                // Same-node fabric: the local default discovery endpoint is a
+                // lazy client (connects on first use), so Discovery may start
+                // after this install inside the same process. Trust decisions
+                // were already made above (GATE + mutual alias + CA-bound
+                // credential) — no liveness check is meaningful or required
+                // for a lazy local client, matching the OS-owned path.
+                let transport = hyprstream_rpc::registry::try_global()
+                    .ok_or_else(|| anyhow::anyhow!(
+                        "EndpointRegistry not initialized — same-node discovery fabric unavailable"
+                    ))?
+                    .try_endpoint(
+                        "discovery",
+                        hyprstream_rpc::registry::SocketKind::Rep,
+                    )?;
+                let rpc = hyprstream_rpc::dial::dial(&transport, signer, Some(discovery_vk), None)?;
+                (authority, crate::DiscoveryClient::new(rpc))
+            }
         }
     };
     DiscoveryService::bootstrap_authenticated_process(authority, discovery_client)
@@ -2040,19 +2106,51 @@ fn authenticate_deployment_bootstrap() -> Result<ProcessBootstrapAuthority> {
 #[cfg(not(target_arch = "wasm32"))]
 async fn authenticate_did_anchored_bootstrap(
     anchors: &crate::DidAnchors,
-) -> Result<(ProcessBootstrapAuthority, TransportConfig)> {
+) -> Result<(
+    ProcessBootstrapAuthority,
+    TransportConfig,
+    Option<hyprstream_rpc::crypto::hybrid_kem::RecipientPublic>,
+    Vec<hyprstream_rpc::crypto::pq::MlDsaVerifyingKey>,
+)> {
     seal_process_bootstrap_authority()?;
     let trust = crate::did_anchored::resolve_did_anchored_trust(anchors).await?;
     let witness =
         authenticate_registry_deployment_credentials(TrustedRegistryDeploymentCredentials {
             ca_verifying_key: trust.ca_verifying_key,
-            registry_credential: load_registry_deployment_credential()?,
+            registry_credential: trust.registry_credential,
         })?;
     let authority = ProcessBootstrapAuthority {
         store_path: hyprstream_service::deployment_data_dir()?.join("pds-store"),
         acceptance_identity: ProcessAcceptanceIdentity::Deployment(witness.verifier),
     };
-    Ok((authority, trust.discovery_transport))
+    Ok((
+        authority,
+        trust.discovery_transport,
+        trust.mesh_kem_recipient,
+        trust.ml_dsa_65_keys,
+    ))
+}
+
+/// Resolve the configured DID anchors and authenticate the fetched registry
+/// deployment credential against the DID-derived deployment CA. This is the
+/// full DID-anchored trust decision — GATE (canon → hash → sig), mutual
+/// alsoKnownAs attestation, credential fetch, and the exact credential profile
+/// (CA-bound kid/iss/domain, one-hour freshness) — WITHOUT the process-global
+/// one-shot seal and resolver install performed by
+/// [`bootstrap_deployment_process`]. Exposed so integration tests can exercise
+/// the trust decision (and its failure modes) more than once per process.
+/// Any failure is terminal for the caller; nothing here retries or downgrades.
+#[cfg(not(target_arch = "wasm32"))]
+pub async fn resolve_and_authenticate_did_anchors(
+    anchors: &crate::DidAnchors,
+) -> Result<(RegistryDeploymentVerifier, TransportConfig)> {
+    let trust = crate::did_anchored::resolve_did_anchored_trust(anchors).await?;
+    let witness =
+        authenticate_registry_deployment_credentials(TrustedRegistryDeploymentCredentials {
+            ca_verifying_key: trust.ca_verifying_key,
+            registry_credential: trust.registry_credential,
+        })?;
+    Ok((witness.verifier, trust.discovery_transport))
 }
 
 #[cfg(test)]

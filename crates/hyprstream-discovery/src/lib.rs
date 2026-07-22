@@ -109,8 +109,8 @@ pub use hyprstream_rpc::resolver::Resolver;
 #[cfg(not(target_arch = "wasm32"))]
 pub use did_anchored::{DeploymentTrustSource, DidAnchors};
 pub use service::{
-    bootstrap_deployment_process, deployment_registry_verifier, AuthorizationProvider,
-    DiscoveryService, RecordCarData, RecordResolver, RegistryDeploymentVerifier,
+    bootstrap_deployment_process, deployment_registry_verifier, resolve_and_authenticate_did_anchors,
+    AuthorizationProvider, DiscoveryService, RecordCarData, RecordResolver, RegistryDeploymentVerifier,
     production_browser_currentness_verifier, production_browser_provisioning,
     production_rpc_client,
 };

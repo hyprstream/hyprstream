@@ -361,6 +361,53 @@ pub fn verification_method_ed25519_keys(doc: &Value) -> Vec<[u8; 32]> {
     keys
 }
 
+/// multicodec `x25519-pub` unsigned-varint prefix (matches the publisher in
+/// `hyprstream::services::oauth::did_document`).
+const MULTICODEC_X25519_PUB: [u8; 2] = [0xec, 0x01];
+/// multicodec `mlkem-768-pub` unsigned-varint prefix.
+const MULTICODEC_ML_KEM_768_PUB: [u8; 2] = [0x8c, 0x24];
+
+/// Extract the `#mesh-kem` hybrid-KEM recipient public from a DID document's
+/// `keyAgreement` relationship (#1137 remote-node bootstrap).
+///
+/// The publisher emits one `Multikey` VM per suite leg (X25519, then
+/// ML-KEM-768, multicodec-prefixed base58btc). The extractor requires EXACTLY
+/// one of each, reassembles them in the pinned suite's component order, and
+/// runs [`RecipientPublic::validate`] — a partial, duplicated, reordered, or
+/// malformed relationship is `None` (caller fails closed), never a partial
+/// recipient.
+pub fn mesh_kem_recipient(
+    doc: &Value,
+) -> Option<crate::crypto::hybrid_kem::RecipientPublic> {
+    let kas = doc.get("keyAgreement")?.as_array()?;
+    let mut x25519: Option<Vec<u8>> = None;
+    let mut mlkem768: Option<Vec<u8>> = None;
+    for vm in kas {
+        let mb = vm.get("publicKeyMultibase").and_then(Value::as_str)?;
+        let payload = bs58::decode(mb.strip_prefix('z')?).into_vec().ok()?;
+        let (codec, key) = payload.split_at_checked(2)?;
+        match codec {
+            c if c == MULTICODEC_X25519_PUB => {
+                if x25519.replace(key.to_vec()).is_some() {
+                    return None; // duplicated leg — ambiguous, fail closed
+                }
+            }
+            c if c == MULTICODEC_ML_KEM_768_PUB => {
+                if mlkem768.replace(key.to_vec()).is_some() {
+                    return None;
+                }
+            }
+            _ => return None, // unexpected keyAgreement leg — fail closed
+        }
+    }
+    let recipient = crate::crypto::hybrid_kem::RecipientPublic {
+        suite_id: crate::crypto::hybrid_kem::SuiteId::HyKemX25519MlKem768,
+        eks: vec![x25519?, mlkem768?],
+    };
+    recipient.validate().ok()?;
+    Some(recipient)
+}
+
 /// Extract every ML-DSA-65 verifying key published in a DID document's
 /// `verificationMethod` array (#579 multi-alg VM extraction).
 ///
@@ -623,13 +670,33 @@ impl HttpDidDocFetcher {
     /// than swallowed (a `unwrap_or_default()` would yield a client WITHOUT the
     /// configured timeout/redirect policy, defeating the SSRF/DoS hardening).
     pub fn new(ttl: std::time::Duration) -> Result<Self> {
-        let http = reqwest::Client::builder()
+        Self::build(ttl, None)
+    }
+
+    /// Construct a fetcher that additionally trusts an extra root certificate
+    /// (PEM), for private-PKI deployments whose did:web host terminates TLS
+    /// with an internal CA. This ADDS a trust anchor — the public WebPKI roots
+    /// remain enabled, and all other hardening (https-only, no redirects,
+    /// timeouts, size cap) is unchanged. Returns `Err` on an unreadable or
+    /// malformed PEM rather than silently degrading.
+    pub fn with_extra_root(ttl: std::time::Duration, extra_root_pem: &[u8]) -> Result<Self> {
+        Self::build(ttl, Some(extra_root_pem))
+    }
+
+    fn build(ttl: std::time::Duration, extra_root_pem: Option<&[u8]>) -> Result<Self> {
+        let mut builder = reqwest::Client::builder()
             // SSRF: do NOT follow redirects. did:web is a direct HTTPS GET; a
             // redirect to http://127.0.0.1 / link-local would bypass https-only.
             .redirect(reqwest::redirect::Policy::none())
             // Bound how long a connect/request can hang.
             .connect_timeout(std::time::Duration::from_secs(10))
-            .timeout(std::time::Duration::from_secs(10))
+            .timeout(std::time::Duration::from_secs(10));
+        if let Some(pem) = extra_root_pem {
+            let cert = reqwest::Certificate::from_pem(pem)
+                .map_err(|e| anyhow!("extra did:web TLS root is not a valid PEM certificate: {e}"))?;
+            builder = builder.add_root_certificate(cert);
+        }
+        let http = builder
             .build()
             .map_err(|e| anyhow!("failed to build did:web HTTPS client: {e}"))?;
         Ok(Self {

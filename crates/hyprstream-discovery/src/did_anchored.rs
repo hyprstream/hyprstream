@@ -33,6 +33,18 @@ const DEPLOYMENT_REACH_SERVICE: &str = "#ns";
 pub struct DidAnchors {
     pub cluster_at9p_did: String,
     pub cluster_did_web: String,
+    /// Optional extra TLS root (PEM) for private-PKI deployments whose
+    /// did:web host terminates with an internal CA. ADDITIVE — the public
+    /// WebPKI roots remain enabled; this never disables verification.
+    pub extra_root_cert_pem: Option<Vec<u8>>,
+}
+
+impl DidAnchors {
+    /// Attach an extra TLS root for private-PKI did:web termination.
+    pub fn with_root_cert_pem(mut self, pem: Vec<u8>) -> Self {
+        self.extra_root_cert_pem = Some(pem);
+        self
+    }
 }
 
 /// Explicit startup trust-source selection.
@@ -74,6 +86,7 @@ impl DeploymentTrustSource {
                 Ok(Self::DidAnchored(DidAnchors {
                     cluster_at9p_did: at9p.to_owned(),
                     cluster_did_web: web.to_owned(),
+                    extra_root_cert_pem: None,
                 }))
             }
             _ => bail!(
@@ -88,6 +101,20 @@ pub(crate) struct DidAnchoredTrust {
     pub ca_verifying_key: VerifyingKey,
     pub discovery_transport: TransportConfig,
     pub authoritative_identity: AuthoritativeIdentity,
+    /// The current CA-signed registry deployment credential, fetched from the
+    /// same well-known endpoint family as the capsule. Like the capsule, it
+    /// is integrity-protected by design (CA signature + one-hour freshness
+    /// profile, enforced by `validate_registry_deployment_credential_profile`),
+    /// so the byte channel needs no trust of its own.
+    pub registry_credential: String,
+    /// The document's `#mesh-kem` hybrid-KEM recipient public, when published.
+    /// Required by the REMOTE-node bootstrap arm (QUIC forbids cleartext
+    /// envelopes); the same-node arm never encrypts over the local fabric.
+    pub mesh_kem_recipient: Option<hyprstream_rpc::crypto::hybrid_kem::RecipientPublic>,
+    /// The document's ML-DSA-65 verification methods (`#mesh-pq`). The
+    /// remote-node arm requires exactly one — the discovery service's mesh
+    /// PQ verifying key — to anchor response authentication.
+    pub ml_dsa_65_keys: Vec<hyprstream_rpc::crypto::pq::MlDsaVerifyingKey>,
 }
 
 /// Fetch capsules from the deployment's static well-known content endpoint.
@@ -101,16 +128,62 @@ struct HttpWellKnownCapsuleSource {
     document_url: String,
 }
 
+/// Maximum accepted size of the registry deployment credential response.
+/// A compact EdDSA JWT is well under 4 KiB; 64 KiB is generous headroom.
+const MAX_CREDENTIAL_BYTES: usize = 64 * 1024;
+
 impl HttpWellKnownCapsuleSource {
-    fn new(did_web: &str) -> Result<Self> {
+    fn new(did_web: &str, extra_root_pem: Option<&[u8]>) -> Result<Self> {
         let document_url = did_web_to_url(did_web)?;
-        let http = reqwest::Client::builder()
+        let mut builder = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(10));
+        if let Some(pem) = extra_root_pem {
+            let cert = reqwest::Certificate::from_pem(pem)
+                .context("extra well-known TLS root is not a valid PEM certificate")?;
+            builder = builder.add_root_certificate(cert);
+        }
+        let http = builder
             .build()
             .context("failed to build at9p capsule HTTPS client")?;
         Ok(Self { http, document_url })
+    }
+
+    /// Fetch the current registry deployment credential from beside the
+    /// capsule (`{prefix}deployment/registry-service.jwt`). The bytes are an
+    /// untrusted transport only: `validate_registry_deployment_credential_profile`
+    /// decides whether they are accepted (CA signature + freshness window).
+    async fn fetch_registry_credential(&self) -> Result<String> {
+        let prefix = self
+            .document_url
+            .strip_suffix("did.json")
+            .ok_or_else(|| anyhow::anyhow!("derived did:web URL does not end in did.json"))?;
+        let url = format!("{prefix}deployment/registry-service.jwt");
+        let response = self
+            .http
+            .get(&url)
+            .send()
+            .await
+            .with_context(|| format!("failed to fetch registry deployment credential from {url}"))?
+            .error_for_status()
+            .with_context(|| format!("registry deployment credential endpoint rejected {url}"))?;
+        if let Some(length) = response.content_length() {
+            anyhow::ensure!(
+                length <= MAX_CREDENTIAL_BYTES as u64,
+                "registry deployment credential exceeds {MAX_CREDENTIAL_BYTES}-byte limit"
+            );
+        }
+        let bytes = response
+            .bytes()
+            .await
+            .context("failed to read registry deployment credential body")?;
+        anyhow::ensure!(
+            bytes.len() <= MAX_CREDENTIAL_BYTES,
+            "registry deployment credential exceeds {MAX_CREDENTIAL_BYTES}-byte limit"
+        );
+        String::from_utf8(bytes.to_vec())
+            .context("registry deployment credential is not UTF-8")
     }
 
     fn capsule_url(&self, did: &str) -> Result<String> {
@@ -245,6 +318,7 @@ pub(crate) async fn verify_did_anchored_document(
     anchors: &DidAnchors,
     document: &Value,
     capsule_source: Arc<dyn CapsuleSource>,
+    registry_credential: String,
 ) -> Result<DidAnchoredTrust> {
     anyhow::ensure!(
         document.get("id").and_then(Value::as_str) == Some(anchors.cluster_did_web.as_str()),
@@ -282,17 +356,37 @@ pub(crate) async fn verify_did_anchored_document(
         ca_verifying_key,
         discovery_transport,
         authoritative_identity,
+        registry_credential,
+        mesh_kem_recipient: hyprstream_rpc::did_web::mesh_kem_recipient(document),
+        ml_dsa_65_keys: hyprstream_rpc::did_web::verification_method_ml_dsa_65_keys(document),
     })
 }
 
 pub(crate) async fn resolve_did_anchored_trust(anchors: &DidAnchors) -> Result<DidAnchoredTrust> {
-    let document = DidWebResolver::new(HttpDidDocFetcher::new(Duration::from_secs(3600))?)
-        .resolve_document(&anchors.cluster_did_web)
+    let extra_root = anchors.extra_root_cert_pem.as_deref();
+    let document = DidWebResolver::new(match extra_root {
+        Some(pem) => HttpDidDocFetcher::with_extra_root(Duration::from_secs(3600), pem)?,
+        None => HttpDidDocFetcher::new(Duration::from_secs(3600))?,
+    })
+    .resolve_document(&anchors.cluster_did_web)
+    .await
+    .context("failed to fetch configured cluster did:web document")?;
+    let capsule_source =
+        Arc::new(HttpWellKnownCapsuleSource::new(&anchors.cluster_did_web, extra_root)?);
+    // Fetch the registry credential from the same well-known family BEFORE
+    // trusting anything: a missing/refusing endpoint must fail the bootstrap
+    // even when the document and capsule are otherwise valid.
+    let registry_credential = capsule_source
+        .fetch_registry_credential()
         .await
-        .context("failed to fetch configured cluster did:web document")?;
-    let capsule_source: Arc<dyn CapsuleSource> =
-        Arc::new(HttpWellKnownCapsuleSource::new(&anchors.cluster_did_web)?);
-    let trust = verify_did_anchored_document(anchors, &document, capsule_source).await?;
+        .context("failed to fetch registry deployment credential")?;
+    let trust = verify_did_anchored_document(
+        anchors,
+        &document,
+        capsule_source,
+        registry_credential,
+    )
+    .await?;
     tracing::info!(
         at9p = %trust.authoritative_identity.at9p_did,
         did_web = %trust.authoritative_identity.classical_did,
@@ -430,11 +524,13 @@ mod tests {
         let anchors = DidAnchors {
             cluster_at9p_did: configured_did.clone(),
             cluster_did_web: web.to_owned(),
+            extra_root_cert_pem: None,
         };
         let error = verify_did_anchored_document(
             &anchors,
             &document(web, Some(&configured_did)),
             Arc::new(FixedCapsuleSource(served_bytes)),
+            "unused-test-credential".to_owned(),
         )
         .await
         .err()
@@ -450,11 +546,13 @@ mod tests {
         let anchors = DidAnchors {
             cluster_at9p_did: at9p.clone(),
             cluster_did_web: web.to_owned(),
+            extra_root_cert_pem: None,
         };
         let error = verify_did_anchored_document(
             &anchors,
             &document(web, Some(&at9p)),
             Arc::new(FixedCapsuleSource(bytes)),
+            "unused-test-credential".to_owned(),
         )
         .await
         .err()
@@ -469,11 +567,13 @@ mod tests {
         let anchors = DidAnchors {
             cluster_at9p_did: at9p.clone(),
             cluster_did_web: web.to_owned(),
+            extra_root_cert_pem: None,
         };
         let trust = verify_did_anchored_document(
             &anchors,
             &document(web, Some(&at9p)),
             Arc::new(FixedCapsuleSource(bytes)),
+            "unused-test-credential".to_owned(),
         )
         .await
         .unwrap();

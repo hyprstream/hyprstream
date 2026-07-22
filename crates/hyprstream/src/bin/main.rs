@@ -1468,11 +1468,41 @@ async fn install_process_production_resolver(
     signing_key: &SigningKey,
     config: &HyprConfig,
 ) -> Result<()> {
+    // The bootstrap pins the discovery service key from the process trust
+    // store; in CLI/service-start mode nothing has seeded it yet. Seed from
+    // the node's own bootstrap-pubkeys (the same source resolve_service_vk
+    // uses on first use) — a no-op when already populated or unprovisioned.
+    let _ = resolve_service_vk("discovery");
     let trust_source = hyprstream_discovery::DeploymentTrustSource::from_anchors(
         config.cluster_at9p_did.as_deref(),
         config.cluster_did_web.as_deref(),
     )?;
-    hyprstream_discovery::bootstrap_deployment_process(signing_key.clone(), trust_source).await?;
+    // Private-PKI deployments may terminate the did:web host with an internal
+    // CA; the extra root is additive (never disables verification), and an
+    // unreadable file is a hard configuration error, not a silent skip.
+    let trust_source = match (&trust_source, &config.cluster_anchor_root_cert) {
+        (hyprstream_discovery::DeploymentTrustSource::DidAnchored(anchors), Some(path)) => {
+            let pem = std::fs::read(path).with_context(|| {
+                format!("cluster_anchor_root_cert is not readable: {}", path.display())
+            })?;
+            hyprstream_discovery::DeploymentTrustSource::DidAnchored(
+                anchors.clone().with_root_cert_pem(pem),
+            )
+        }
+        (hyprstream_discovery::DeploymentTrustSource::OsOwnedFiles, Some(path)) => {
+            anyhow::bail!(
+                "cluster_anchor_root_cert ({}) is set but no DID anchors are configured",
+                path.display()
+            )
+        }
+        _ => trust_source,
+    };
+    hyprstream_discovery::bootstrap_deployment_process(
+        signing_key.clone(),
+        trust_source,
+        config.cluster_remote_node,
+    )
+    .await?;
     hyprstream_rpc::envelope::install_browser_currentness_verifier(
         hyprstream_discovery::production_browser_currentness_verifier()?,
     )

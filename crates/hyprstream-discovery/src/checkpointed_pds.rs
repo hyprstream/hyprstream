@@ -50,6 +50,31 @@ impl CheckpointedPdsAcceptedStateSource {
         path: &Path,
         acceptance_identity: crate::service::RegistryDeploymentVerifier,
     ) -> Result<Self> {
+        if !path.exists() {
+            // Fresh node (first boot — e.g. the #1137 metal stack): the
+            // registry service is the sole writer and would create this store
+            // on its first start, but the production resolver installs BEFORE
+            // any service starts, so a missing store must not deadlock the
+            // boot. An empty store IS the genesis state (no accepted at9p
+            // state yet). Create it and drop the write handle immediately so
+            // the later read-only probe and the writer's own open are
+            // uncontended. NOTE: on a node that previously held state this
+            // branch means the duplicity history was LOST (deleted volume) —
+            // log loudly; the boot proceeds at genesis posture exactly as a
+            // first boot would.
+            tracing::warn!(
+                path = %path.display(),
+                "checkpointed PDS store absent — initializing an empty (genesis) store; \
+                 if this node previously held at9p state, duplicity history was lost"
+            );
+            let mut opts = rocksdb::Options::default();
+            opts.create_if_missing(true);
+            drop(
+                rocksdb::DB::open(&opts, path).with_context(|| {
+                    format!("failed to initialize checkpointed PDS store at {path:?}")
+                })?,
+            );
+        }
         let _probe = rocksdb::DB::open_for_read_only(&readonly_opts(), path, false)
             .with_context(|| format!("failed to open checkpointed PDS store at {path:?}"))?;
         Ok(Self {

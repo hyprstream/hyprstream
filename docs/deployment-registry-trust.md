@@ -74,12 +74,65 @@ not become trust decisions: identity remains pinned by the configured at9p
 hash and mutual alias rule, while application responses remain pinned to the
 separately authenticated Discovery service key.
 
-This first increment changes server trust and reach only. The existing
-OS-owned `registry-service.jwt` is still required to bind the deployment CA to
-the registry verification key. Enrollment (including operator-approved device
-flow and unattended machine attestation) and final `SecretsProfile` integration
-remain separate work; no client-authentication authority is inferred from the
-two public anchors.
+The registry deployment credential is fetched from beside the capsule —
+`/.well-known/deployment/registry-service.jwt` — and validated with the exact
+same profile as the OS-owned file (CA-bound `kid`/`iss`/`deployment_domain`,
+one-hour freshness). The credential is CA-signed and short-lived, so the
+channel is untrusted by design; the OS-owned JWT file is required only when
+the OS-owned source is selected. Enrollment (operator-approved device flow,
+unattended machine attestation) and final `SecretsProfile` integration remain
+separate work; no client-authentication authority is inferred from the two
+public anchors.
+
+### Serving the deployment well-known documents
+
+The OAuth service terminates the deployment's did:web host when configured
+with a static well-known directory (it is the only dual-stack HTTP+RPC
+service, and it already owns `/.well-known/did.json`):
+
+```toml
+[oauth]
+deployment_well_known_dir = "/var/lib/hyprstream/deployment-well-known"
+```
+
+The operator provisions three public, integrity-anchored documents, re-read
+on every request (so the hourly credential refresh needs no restart):
+
+```text
+<dir>/did.json                              the deployment DID document
+<dir>/at9p/<cid512>.cbor                    the cluster at9p genesis capsule
+<dir>/deployment/registry-service.jwt       the current CA-signed credential
+```
+
+When the directory is configured, `/.well-known/did.json` serves the static
+deployment document IN PLACE OF the dynamic node document; a missing file is
+a 404, never a silent fall-through.
+
+### Same-node vs remote-node discovery reach
+
+A DID-anchored node that hosts Discovery on its local IPC fabric (the metal
+stack's `service start … --ipc` containers; the default) uses a lazy local
+discovery client — identical posture to the OS-owned path, which also never
+pings. A node REMOTE from the cluster's Discovery sets
+`cluster_remote_node = true`: startup then dials the document-advertised
+transport and requires a successful signed liveness `ping` before installing
+the resolver. The remote arm additionally requires the document's `#mesh-kem`
+`keyAgreement` (request confidentiality — QUIC forbids cleartext envelopes)
+and exactly one ML-DSA-65 `#mesh-pq` verification method (response
+authentication); either absent fails the boot.
+
+Private-PKI deployments whose did:web host terminates TLS with an internal CA
+may add `cluster_anchor_root_cert = "/path/to/root.pem"` — an ADDITIVE trust
+anchor (public roots remain enabled); an unreadable or malformed file fails
+startup.
+
+### Fresh nodes
+
+A first boot has no checkpointed PDS store. The bootstrap initializes an
+empty (genesis) store rather than deadlock — the registry service is the
+sole writer and would otherwise be unstartable. If a node that previously
+held at9p state boots with a missing store, that means the duplicity history
+was lost; startup logs a loud warning and proceeds at genesis posture.
 
 ## Registry credential profile
 
