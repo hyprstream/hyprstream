@@ -158,6 +158,16 @@ impl<F: DidDocFetcher> DidDocResolve for DidWebResolver<F> {
     }
 }
 
+/// A configured `did:plc` resolver can serve the existing federation admission
+/// boundary. Its URL derivation, egress allowlist, cache, and `doc.id` binding
+/// are all enforced before this gate inspects verification methods.
+#[async_trait]
+impl<F: DidDocFetcher> DidDocResolve for crate::did_plc::DidPlcResolver<F> {
+    async fn resolve_doc(&self, did: &str) -> Result<Value> {
+        self.resolve_document(did).await
+    }
+}
+
 /// The result of a successful two-stage admission: the peer's normalized origin
 /// bound to the authenticated key that matched its published DID-doc VM / JWKS.
 #[derive(Clone, Debug, PartialEq, Eq)]
