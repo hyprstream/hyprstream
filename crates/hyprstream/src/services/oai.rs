@@ -60,6 +60,10 @@ pub struct OAIService {
     /// Global TLS configuration (passed from factory, avoids re-loading config)
     tls_config: TlsConfig,
 
+    /// Account-zone configuration (epic #1158, A3) — used for DNS-01 wildcard
+    /// TLS provisioning. Passed from the factory to avoid re-loading config.
+    account_config: crate::account::AccountZoneConfig,
+
     /// Shared server state containing clients and metrics
     server_state: ServerState,
 
@@ -84,6 +88,7 @@ impl OAIService {
     pub fn new(
         config: OAIConfig,
         tls_config: TlsConfig,
+        account_config: crate::account::AccountZoneConfig,
         server_state: ServerState,
         control_transport: TransportConfig,
         verifying_key: VerifyingKey,
@@ -91,6 +96,7 @@ impl OAIService {
         Self {
             config,
             tls_config,
+            account_config,
             server_state,
             control_transport,
             verifying_key,
@@ -134,6 +140,7 @@ impl Spawnable for OAIService {
             // Resolve TLS configuration (tls_config passed from factory, not re-loaded)
             let rustls_config = resolve_rustls_config(
                 &self.tls_config,
+                &self.account_config,
                 self.config.tls_cert.as_ref(),
                 self.config.tls_key.as_ref(),
             )

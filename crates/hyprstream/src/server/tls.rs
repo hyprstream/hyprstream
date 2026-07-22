@@ -11,6 +11,7 @@
 //!  - `acme` — automatic via RFC 8555 (Let's Encrypt or self-hosted step-ca / Pebble)
 //!  - `files` — operator-supplied PEM paths
 
+use crate::account::AccountZoneConfig;
 use crate::config::{TlsConfig, TlsMode};
 use hyprstream_rpc::error::RpcError;
 use std::net::SocketAddr;
@@ -98,6 +99,7 @@ pub fn get_or_init_tls_materials(config: &TlsConfig) -> anyhow::Result<Arc<TlsMa
 /// 4. Otherwise → shared self-signed / `files` mode materials
 pub async fn resolve_rustls_config(
     tls_config: &TlsConfig,
+    account_cfg: &AccountZoneConfig,
     service_cert: Option<&PathBuf>,
     service_key: Option<&PathBuf>,
 ) -> anyhow::Result<Option<axum_server::tls_rustls::RustlsConfig>> {
@@ -130,6 +132,56 @@ pub async fn resolve_rustls_config(
         TlsMode::Acme => {
             let config = init_acme_rustls_config(tls_config).await?;
             Ok(Some(config))
+        }
+        TlsMode::AcmeDns01 => {
+            // Account-zone DNS-01 wildcard issuance (epic #1158, A3 / #1162).
+            // The concrete ACME-DNS-01 client and DNS backend are product-layer
+            // seams (`hyprstream::account::{WildcardCertIssuer, DnsProvider}`);
+            // here we only sanity-check provisioning. When the deployment
+            // configured no account zone or DNS-01 credential, this mode
+            // **degrades sanely** to the existing shared self-signed materials
+            // — no panic, no synthesized zone name (one-way door #1).
+            match crate::account::tls::require_provisioned(account_cfg) {
+                Ok(zone) => {
+                    tracing::info!(
+                        apex = %zone.apex(),
+                        wildcard = %zone.wildcard_domain(),
+                        "TLS mode acme-dns01 provisioned for account zone; concrete DNS-01 \
+                         issuance is wired by the product-layer WildcardCertIssuer + DnsProvider",
+                    );
+                    // Fall through to shared materials until the product layer's
+                    // issuer pushes a cert into the account CertHandle; the
+                    // serving face (B3, #1165) is where the issued cert is bound
+                    // to a listener. This keeps the process serving during the
+                    // first issuance window rather than failing to boot.
+                    let materials = get_or_init_tls_materials(tls_config)?;
+                    let rustls_config = axum_server::tls_rustls::RustlsConfig::from_der(
+                        vec![materials.cert_der.clone()],
+                        (*materials.key_der).clone(),
+                    )
+                    .await
+                    .map_err(|e| anyhow::anyhow!("failed to build RustlsConfig from DER: {}", e))?;
+                    Ok(Some(rustls_config))
+                }
+                Err(e) => {
+                    // Sane-degrade: clear error in the log, fall back to shared
+                    // self-signed materials. We do NOT bail: account minting is
+                    // disabled, but the rest of the deployment (OAI/OAuth/MCP
+                    // faces) must still boot.
+                    tracing::warn!(
+                        "TLS mode acme-dns01 requested but account zone is not provisioned \
+                         — did:web minting disabled, serving with shared self-signed TLS: {e}"
+                    );
+                    let materials = get_or_init_tls_materials(tls_config)?;
+                    let rustls_config = axum_server::tls_rustls::RustlsConfig::from_der(
+                        vec![materials.cert_der.clone()],
+                        (*materials.key_der).clone(),
+                    )
+                    .await
+                    .map_err(|e| anyhow::anyhow!("failed to build RustlsConfig from DER: {}", e))?;
+                    Ok(Some(rustls_config))
+                }
+            }
         }
         _ => {
             // Shared materials (self-signed or Files mode)

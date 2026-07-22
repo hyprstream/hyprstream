@@ -361,6 +361,9 @@ pub struct OAuthService {
     config: OAuthConfig,
     /// Global TLS configuration (passed from factory, avoids re-loading config)
     tls_config: crate::config::TlsConfig,
+    /// Account-zone configuration (epic #1158, A3) — used for DNS-01 wildcard
+    /// TLS provisioning.
+    account_config: crate::account::AccountZoneConfig,
     /// Global QUIC configuration for cert-hash publication in DID doc (#185).
     quic_config: Option<crate::config::QuicConfig>,
     /// Signing key for creating the PolicyClient inside `run()`.
@@ -379,6 +382,7 @@ impl OAuthService {
     pub fn new(
         config: OAuthConfig,
         tls_config: crate::config::TlsConfig,
+        account_config: crate::account::AccountZoneConfig,
         signing_key: hyprstream_rpc::prelude::SigningKey,
         control_transport: TransportConfig,
         verifying_key: ed25519_dalek::VerifyingKey,
@@ -387,6 +391,7 @@ impl OAuthService {
         Self {
             config,
             tls_config,
+            account_config,
             quic_config: None,
             signing_key,
             control_transport,
@@ -443,6 +448,7 @@ impl Spawnable for OAuthService {
             // Resolve TLS configuration (tls_config passed from factory, not re-loaded)
             let rustls_config = crate::server::tls::resolve_rustls_config(
                 &self.tls_config,
+                &self.account_config,
                 self.config.tls_cert.as_ref(),
                 self.config.tls_key.as_ref(),
             )

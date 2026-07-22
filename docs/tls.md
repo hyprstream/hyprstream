@@ -120,6 +120,54 @@ key_path = "/etc/hyprstream/tls/key.pem"
 
 Files mode is also activated when `cert_path`/`key_path` are set without an explicit `mode`.
 
+### `acme-dns01` (account-zone wildcard)
+
+DNS-01 wildcard issuance for the deployment's account zone (epic [#1158], A3 /
+[#1162]). Obtains a `*.<apex>` certificate — e.g. `*.acct.example.com` — so
+every host-form `did:web` account under the zone
+(`alice.acct.example.com`, `bob.acct.example.com`, …) is authenticated by a
+single cert.
+
+Wildcards **cannot** use HTTP-01; DNS-01 is the only validation method public
+CAs accept for `*.<apex>`. hyprstream defines the issuance and DNS-management
+**interfaces**; the concrete ACME-DNS-01 client and DNS backend are a product
+layer above hyprstream (if hyprstream required a specific DNS server,
+self-hosters could not run it).
+
+```toml
+[tls]
+mode = "acme-dns01"
+
+[account]
+# The delegated account-zone apex — chosen by the operator at deploy time in the
+# metal repo. hyprstream NEVER bakes a zone name in; it takes one.
+zone = "acct.example.com"
+# Zone-scoped DNS-01 credential — the deployment's DNS provider accepts this
+# and only this when writing records under the apex. Opaque to hyprstream.
+dns01_credential = "ref:secretstore/account-zone-token"
+acme_directory = "https://acme-v02.api.letsencrypt.org/directory"
+acme_contact = "mailto:ops@example.com"
+# Optional wildcard address targets for the delegated zone:
+wildcard_ipv4 = "203.0.113.10"
+wildcard_ipv6 = "2001:db8::10"
+```
+
+**Sane-degrade:** a deployment that configures no `[account] zone` (or no
+`dns01_credential`) disables did:web minting and DNS-01 wildcard issuance with a
+clear error in the log — it does **not** panic and does **not** synthesize a
+default zone name (a default would silently mint permanent DIDs under a domain
+the operator never chose). The process keeps serving on its existing self-signed
+or `files` materials.
+
+**Total-outage surface:** one wildcard cert authenticates *every* account host,
+so one cert failing to renew breaks all account resolution for the deployment.
+Renewal and an expiry alarm (`CertHealth`: `ok` / `expiring_soon` / `critical` /
+`expired` / `unissued` / `unprovisioned`) therefore ship with the feature.
+
+[#1158]: https://github.com/hyprstream/hyprstream/issues/1158
+[#1162]: https://github.com/hyprstream/hyprstream/issues/1162
+
+
 ## JWT Signing Key Rotation
 
 Independent of TLS, hyprstream rotates the JWT signing key automatically.
