@@ -1712,9 +1712,10 @@ impl RegistryHandler for RegistryService {
         // Pass the operation string as-is to the policy check rather than
         // round-tripping through Operation enum (which maps "query" → "query.status").
         let subject = ctx.subject();
+        let domain = ctx.domain()?;
         let allowed = self.policy_client.check(&PolicyCheck {
             subject: subject.to_string(),
-            domain: "*".to_owned(),
+            domain,
             resource: resource.to_owned(),
             operation: operation.to_owned(),
         }).await.unwrap_or_else(|e| {
@@ -1735,6 +1736,7 @@ impl RegistryHandler for RegistryService {
         };
 
         let subject = ctx.subject().to_string();
+        let domain = ctx.domain()?;
         let mut result = Vec::with_capacity(repos.len());
 
         for repo in &repos {
@@ -1744,9 +1746,12 @@ impl RegistryHandler for RegistryService {
             // Policy gate: only include repos the caller has at least query access to
             let resource = format!("model:{}", name);
             let permitted = self.policy_client
-                .check(&PolicyCheck { subject: subject.clone(), domain: "*".to_owned(), resource: resource.clone(), operation: "query".to_owned() })
+                .check(&PolicyCheck { subject: subject.clone(), domain: domain.clone(), resource: resource.clone(), operation: "query".to_owned() })
                 .await
-                .unwrap_or(true); // default allow if policy service unavailable
+                .unwrap_or_else(|e| {
+                    warn!("Policy check RPC error while filtering {}: {} - denying access", resource, e);
+                    false
+                });
             if !permitted { continue; }
 
             // Collect worktrees with capabilities (holds registry read lock internally)
