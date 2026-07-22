@@ -710,15 +710,21 @@ fn create_registry_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawn
     let pds_publisher = (|| -> anyhow::Result<crate::services::discovery::PdsPublisher> {
         let store_dir = pds_store_dir(ctx)?;
         let secrets_dir = crate::config::HyprConfig::resolve_secrets_dir()?;
-        let es256_store =
-            crate::auth::key_rotation::global_es256_key_store(&secrets_dir, &config.oauth);
-        // `active_key` is async (tokio RwLock); resolve it once here on the
-        // current runtime. `block_in_place` avoids stalling a worker reactor.
-        let active = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(es256_store.active_key())
-        })
-        .ok_or_else(|| anyhow::anyhow!("no active ES256 #atproto key for PDS publish"))?;
-        let atproto_key: p256::ecdsa::SigningKey = (*active).clone();
+        // C4 (#1170, closes #1123): the publisher resolves the active
+        // `#atproto` generation from the **sealed op-log head** at sign time,
+        // not a key frozen here at construction. The head is written by the
+        // OAuth rotation task (and at OAuth boot) to this shared secrets dir,
+        // so under `--ipc` a rotation performed by the OAuth process is
+        // observed here with no event-delivery mechanism. The head is signed
+        // by a purpose-key derived from the node CA root; load the root so the
+        // reader can derive the matching verifying key. If the head is absent
+        // (e.g. C2 not yet wired, or OAuth not booted in this deployment),
+        // `active_generation()` returns `None` and the publisher declines to
+        // sign — fail-closed, never a stale frozen key.
+        let node_root = crate::auth::identity_store::load_ca_signing_key(&secrets_dir)?;
+        let generation_source: Arc<dyn crate::auth::ActiveGenerationSource> = Arc::new(
+            crate::auth::SealedHeadEs256Source::from_root(&secrets_dir, &node_root),
+        );
         let acceptance_identity = ctx.service_signing_key("registry");
         anyhow::ensure!(
             hyprstream_discovery::deployment_registry_verifier()?
@@ -747,10 +753,12 @@ fn create_registry_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawn
             audit_pq,
         )?;
         let node_did = hyprstream_rpc::did_key::ed25519_to_did_key(&ctx.verifying_key().to_bytes());
-        Ok(
-            crate::services::discovery::PdsPublisher::new(store, node_did, atproto_key)
-                .with_at9p_state_ingest(at9p_state),
+        Ok(crate::services::discovery::PdsPublisher::with_generation_source(
+            store,
+            node_did,
+            generation_source,
         )
+        .with_at9p_state_ingest(at9p_state))
     })()
     .map_err(|e| tracing::warn!("PDS publish disabled: {e}"))
     .ok();

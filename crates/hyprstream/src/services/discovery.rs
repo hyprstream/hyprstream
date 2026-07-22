@@ -932,11 +932,13 @@ pub struct PdsPublisher {
     /// every record this node publishes (single-node, self-hosted PDS; a
     /// per-account DID scheme is out of scope for #910a).
     did: String,
-    /// This node's `#atproto` commit-signing key (P-256/ES256), sourced from
-    /// the shared `Es256SigningKeyStore` — the *same* key `did_document.rs`
-    /// publishes as the `#atproto` verification method. Held only here (the
-    /// writer); resolvers hold no key. Used to sign each commit exactly once.
-    signing_key: p256::ecdsa::SigningKey,
+    /// Source of truth for the active `#atproto` ES256 generation. Resolved
+    /// **at sign time**, not at construction (#1123/C4): under `--ipc` this
+    /// reads the sealed op-log head so a rotation performed by the OAuth
+    /// process is observed here without any event-delivery mechanism. A frozen
+    /// construction-time copy would keep signing with a retired key after a
+    /// rotation. See [`crate::auth::ActiveGenerationSource`].
+    generation_source: Arc<dyn crate::auth::ActiveGenerationSource>,
     /// Serializes the load→rebuild→sign→persist critical section (#910b).
     ///
     /// A publish is a read-modify-write over the WHOLE repo (one MST, one
@@ -950,6 +952,9 @@ pub struct PdsPublisher {
 }
 
 impl PdsPublisher {
+    /// Construct with a fixed signing key. Preserved for tests and simple
+    /// embedders; production wiring uses [`Self::with_generation_source`] so
+    /// the publisher observes rotations.
     pub fn new(
         store: Arc<PdsRecordStore>,
         did: String,
@@ -959,7 +964,24 @@ impl PdsPublisher {
             store,
             at9p_state: None,
             did,
-            signing_key,
+            generation_source: Arc::new(crate::auth::FixedGenerationSource::new(signing_key)),
+            publish_lock: parking_lot::Mutex::new(()),
+        }
+    }
+
+    /// Construct with a live generation source — the production shape (#1123).
+    /// The publisher resolves the active `#atproto` key from `source` at every
+    /// sign, so it never freezes a retired key.
+    pub fn with_generation_source(
+        store: Arc<PdsRecordStore>,
+        did: String,
+        source: Arc<dyn crate::auth::ActiveGenerationSource>,
+    ) -> Self {
+        Self {
+            store,
+            at9p_state: None,
+            did,
+            generation_source: source,
             publish_lock: parking_lot::Mutex::new(()),
         }
     }
@@ -1144,7 +1166,22 @@ impl PdsPublisher {
             None => (Tid::now(), None),
         };
         let unsigned = UnsignedCommit::new(self.did.clone(), root, rev, prev);
-        let commit = Commit::sign(&unsigned, &self.signing_key);
+        // Resolve the active `#atproto` generation at sign time (#1123/C4).
+        // Under `--ipc` this reads the sealed op-log head written by the OAuth
+        // rotation task, so a rotation on the other side is observed here with
+        // no propagation mechanism. Fail-closed: if no verified generation is
+        // observable, decline to sign rather than fall back to a stale key.
+        let generation = self
+            .generation_source
+            .active_generation()
+            .context("resolving active #atproto generation")?
+            .ok_or_else(|| {
+                anyhow!(
+                    "no active #atproto generation observable; declining to sign \
+                     (sealed op-log head not present or unverifiable)"
+                )
+            })?;
+        let commit = Commit::sign(&unsigned, &generation.signing_key);
 
         self.store
             .put_record_and_commit(&self.did, collection, tid, &record, &commit)
@@ -1343,6 +1380,88 @@ mod pds_store_tests {
             .build()
             .expect("build current-thread runtime")
             .block_on(fut)
+    }
+
+    /// #1123/#1170 acceptance test at the publisher level: the publisher
+    /// resolves the active `#atproto` generation from the sealed op-log head at
+    /// **sign time**, so a rotation performed by the (separate) OAuth process
+    /// is observed here with no event delivery. A frozen construction-time key
+    /// — the pre-C4 shape — would sign the second commit with the retired K1
+    /// and this test would fail on the final assertion.
+    #[test]
+    fn publisher_resolves_live_generation_across_rotation() {
+        use crate::auth::identity_store::write_ca_signing_key;
+        use crate::auth::key_rotation::{
+            persist_es256_slot, Es256KeySlot, Es256KeySlots, Es256SigningKeyStore,
+        };
+        use crate::auth::op_log::{seal_op_log_head, SealedHeadEs256Source};
+        use ed25519_dalek::SigningKey as Ed25519SigningKey;
+
+        let pds_dir = tempfile::tempdir().expect("pds tempdir");
+        let secrets_dir = tempfile::tempdir().expect("secrets tempdir");
+        let secrets = secrets_dir.path();
+        let root = Ed25519SigningKey::from_bytes(&[0x5a; 32]);
+        write_ca_signing_key(secrets, &root).unwrap();
+        let ca = hyprstream_rpc::node_identity::derive_purpose_key(&root, "hyprstream-jwt-v1");
+
+        // Process A (the rotator): K1 active, persisted, head sealed.
+        let k1 = SigningKey::random(&mut rand::rngs::OsRng);
+        let k1_vk: VerifyingKey = *k1.verifying_key();
+        let k1_slot = Es256KeySlot::new(k1, 0, 0);
+        let es256_store = Es256SigningKeyStore::new(Es256KeySlots {
+            active: Some(k1_slot.clone()),
+            drain: None,
+            lead: None,
+        });
+        persist_es256_slot(secrets, "active", &k1_slot).unwrap();
+        seal_op_log_head(secrets, &ca, &es256_store).unwrap();
+
+        // Process B (the registry/publisher): resolves the generation from the
+        // sealed head — the `--ipc` cross-process read path.
+        let pds_store = Arc::new(PdsRecordStore::open(pds_dir.path()).expect("open rw"));
+        let source: Arc<dyn crate::auth::ActiveGenerationSource> =
+            Arc::new(SealedHeadEs256Source::from_root(secrets, &root));
+        let publisher = PdsPublisher::with_generation_source(
+            Arc::clone(&pds_store),
+            DID.to_owned(),
+            source,
+        );
+
+        publisher.publish("repo-a", SAMPLE_OID).expect("publish K1");
+        let commit1 = pds_store
+            .load_repo(DID)
+            .expect("load")
+            .expect("repo exists")
+            .commit;
+        assert!(commit1.verify(&k1_vk).is_ok(), "first commit signed by K1");
+
+        // Process A rotates: K1 → drain, K2 → active. Persist + re-seal.
+        let k2 = SigningKey::random(&mut rand::rngs::OsRng);
+        let k2_vk: VerifyingKey = *k2.verifying_key();
+        let k2_slot = Es256KeySlot::new(k2, 0, 0);
+        persist_es256_slot(secrets, "drain", &k1_slot).unwrap();
+        persist_es256_slot(secrets, "active", &k2_slot).unwrap();
+        es256_store.0.blocking_write().active = Some(k2_slot);
+        seal_op_log_head(secrets, &ca, &es256_store).unwrap();
+
+        // Same publisher instance, new commit. It MUST be signed by K2 — the
+        // publisher observed the rotation through the re-sealed head.
+        publisher.publish("repo-a", SAMPLE_OID_2).expect("publish K2");
+        let commit2 = pds_store
+            .load_repo(DID)
+            .expect("load")
+            .expect("repo exists")
+            .commit;
+        assert!(
+            commit2.verify(&k2_vk).is_ok(),
+            "post-rotation commit must be signed by K2"
+        );
+        // Negative case: the post-rotation commit MUST NOT verify under the
+        // retired pre-rotation key K1.
+        assert!(
+            commit2.verify(&k1_vk).is_err(),
+            "publisher must not sign with the retired pre-rotation key K1"
+        );
     }
 
     #[test]
