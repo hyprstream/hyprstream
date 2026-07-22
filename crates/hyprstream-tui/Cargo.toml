@@ -20,6 +20,14 @@ hyprstream-workers-tcl = { path = "../hyprstream-workers-tcl" }
 hyprstream-workers-python = { path = "../hyprstream-workers-python" }
 hyprstream-vfs = { path = "../hyprstream-vfs" }
 ratatui = { version = "0.30", default-features = false, features = ["layout-cache"] }
+# Provide a critical-section implementation for this binary. Under the release
+# image build (`--no-default-features --features otel,gittorrent,xet`) the
+# transitive `once_cell`/`ahash 0.7` chain (config -> rust-ini -> ahash) enables
+# the `critical-section` API but no crate selects an *implementation*, so linking
+# fails with `undefined symbol: _critical_section_1_0_acquire`. Our targets are
+# all std platforms, so link the std-backed impl. Per critical-section docs, the
+# final binary must choose the implementation.
+critical-section = { version = "1", features = ["std"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 waxterm = { path = "../waxterm", features = ["avt"] }

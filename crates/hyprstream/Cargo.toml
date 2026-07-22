@@ -153,6 +153,11 @@ hyprstream-tui = { path = "../hyprstream-tui" }  # Setup wizard TUI (WizardBacke
 hyprstream-compositor = { path = "../hyprstream-compositor" }  # Pure TUI compositor (chrome state machine)
 waxterm = { path = "../waxterm", features = ["avt"] }  # Terminal abstraction for TUI rendering
 ratatui = { version = "0.30", default-features = false }  # TUI framework for pane buffers
+# Link a critical-section implementation for this binary. Under the release image
+# build (`--no-default-features`) the transitive once_cell/ahash-0.7 chain enables
+# the critical-section API with no impl selected, breaking the link with
+# `undefined symbol: _critical_section_1_0_acquire`. All our targets are std.
+critical-section = { version = "1", features = ["std"] }
 vte = "0.13"  # VT100/ANSI escape sequence parser for TUI pane ingestion
 
 [target.'cfg(target_os = "linux")'.dependencies]
