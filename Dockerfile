@@ -242,8 +242,8 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     && TORCH_DIR="$(python3 -c 'import torch, os; print(os.path.dirname(torch.__file__))')" \
     && ln -s "$TORCH_DIR" /opt/libtorch \
     && python3 -c 'import torch; assert torch.version.cuda == "13.0"; print(torch.__version__, torch.version.cuda)' \
-    && file /opt/libtorch/lib/libtorch_cuda.so \
-    && ls /opt/libtorch/include/torch >/dev/null
+    && test -s /opt/libtorch/lib/libtorch_cuda.so \
+    && test -d /opt/libtorch/include/torch
 
 ENV LIBTORCH=/opt/libtorch
 ENV LD_LIBRARY_PATH=/opt/libtorch/lib
