@@ -491,6 +491,7 @@ pub async fn external_callback(
         username: mapped_subject,
         verifying_key: None, // external OIDC — no local Ed25519 key binding
         dpop_jkt: None, // external OIDC flow — no PAR DPoP binding
+        client_assertion_jkt: None, // external OIDC flow — no PAR client-auth binding
     };
     state.pending_codes.write().await.insert(code.clone(), auth_code);
 

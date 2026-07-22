@@ -6,11 +6,16 @@
 //!
 //! The client assertion is a JWT signed by one of the keys in the
 //! registered client's `jwks` field (inline) or via `jwks_uri`
-//! (deferred). Claim requirements per RFC 7523 §3:
+//! (deferred). Claim requirements per RFC 7523 §3 + the atproto OAuth
+//! profile (#1146 T1.2/T3.3):
 //!   iss == sub == client_id
-//!   aud == token endpoint URL (canonical)
+//!   aud == the AS issuer (atproto mandates this form; RFC 7523 §3 also
+//!          permits the token endpoint URL, so the token endpoint accepts
+//!          both. PAR accepts the issuer only.)
 //!   exp > now
-//!   jti SHOULD be present; we treat absence as a soft warning
+//!   iat present and not in the future (beyond 60s clock skew)
+//!   jti present and unique per client until exp (replay registry in
+//!       `OAuthState::assertion_jti_seen`)
 //!   alg per the JWKS key kty/crv (RS256, ES256, EdDSA)
 //!
 //! Spec reference: MCP 2025-11-25 § Client ID Metadata Documents lists
@@ -23,7 +28,9 @@ use std::time::{Duration, Instant};
 
 use super::state::{OAuthState, RegisteredClient};
 use crate::auth::id_token_verify::{algorithm_for_key_pub, build_decoding_key};
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use jsonwebtoken::{decode, DecodingKey, Validation};
+use sha2::{Digest as _, Sha256};
 
 /// HTTP fetch timeout for jwks_uri. Same as CIMD document fetch.
 const JWKS_URI_FETCH_TIMEOUT: Duration = Duration::from_secs(10);
@@ -76,6 +83,17 @@ impl std::error::Error for ClientAuthError {}
 pub const JWT_BEARER_ASSERTION_TYPE: &str =
     "urn:ietf:params:oauth:client-assertion-type:jwt-bearer";
 
+/// A successfully verified client assertion.
+#[derive(Debug, Clone)]
+pub struct VerifiedAssertion {
+    /// The verified JWT claims (caller-side use: logging, `jti` audits).
+    pub claims: Value,
+    /// RFC 7638 thumbprint (SHA-256, base64url) of the JWKS key that
+    /// verified the signature. Callers bind sessions to this so a later
+    /// request cannot switch to another registered key (#1146 T3.3).
+    pub key_jkt: String,
+}
+
 /// Decide whether a registered client requires `private_key_jwt`. Default
 /// is "no" — i.e. public client / PKCE-only — unless the registration
 /// explicitly set `token_endpoint_auth_method=private_key_jwt`.
@@ -88,23 +106,47 @@ pub fn requires_private_key_jwt(client: &RegisteredClient) -> bool {
 
 /// Verify an RFC 7523 client_assertion against the registered client's
 /// JWKS — inline `jwks` if present, otherwise fetched from `jwks_uri`
-/// (cached for `state.client_jwks_uri_cache_ttl`). `expected_audience` is the canonical
-/// token endpoint URL.
+/// (cached for `state.client_jwks_uri_cache_ttl`). `expected_audiences`
+/// is the accepted `aud` set: the AS issuer (mandated by the atproto
+/// OAuth profile) plus, at the token endpoint only, the token endpoint
+/// URL (permitted by RFC 7523 §3 for legacy clients).
 ///
-/// On success, returns the verified JWT's claims for caller-side use
-/// (typically just to log the `jti` for replay-cache decisions).
+/// On success, records the assertion's `jti` in the replay registry
+/// (single-use per client until `exp`) and returns the verified claims
+/// plus the verifying key's thumbprint for session binding.
 pub async fn verify_client_assertion(
     state: &OAuthState,
     client: &RegisteredClient,
     assertion_type: &str,
     assertion: &str,
-    expected_audience: &str,
-) -> Result<Value, ClientAuthError> {
+    expected_audiences: &[String],
+) -> Result<VerifiedAssertion, ClientAuthError> {
     if assertion_type != JWT_BEARER_ASSERTION_TYPE {
         return Err(ClientAuthError::UnsupportedAssertionType(assertion_type.to_owned()));
     }
     let keys = resolve_keys(state, client).await?;
-    verify_assertion_with_keys(&keys, &client.client_id, assertion, expected_audience)
+    let verified =
+        verify_assertion_with_keys(&keys, &client.client_id, assertion, expected_audiences)?;
+
+    // Replay registry (RFC 7523 §3: the AS MUST NOT accept the same jti
+    // more than once). check_claims already required jti/exp, so the
+    // lookups below are defensive-only.
+    let jti = verified
+        .claims
+        .get("jti")
+        .and_then(Value::as_str)
+        .ok_or_else(|| ClientAuthError::InvalidClaim("missing jti".to_owned()))?;
+    let exp = verified
+        .claims
+        .get("exp")
+        .and_then(Value::as_i64)
+        .ok_or_else(|| ClientAuthError::InvalidClaim("missing exp".to_owned()))?;
+    if !state.check_and_record_assertion_jti(&client.client_id, jti, exp) {
+        return Err(ClientAuthError::InvalidClaim(
+            "jti already used (assertion replay)".to_owned(),
+        ));
+    }
+    Ok(verified)
 }
 
 /// Pure-sync core verification: given a set of candidate keys, verify
@@ -114,8 +156,8 @@ pub fn verify_assertion_with_keys(
     keys: &[Value],
     client_id: &str,
     assertion: &str,
-    expected_audience: &str,
-) -> Result<Value, ClientAuthError> {
+    expected_audiences: &[String],
+) -> Result<VerifiedAssertion, ClientAuthError> {
     let keys = keys.to_vec();
 
     // Parse the header to learn alg + (optional) kid before iterating keys.
@@ -184,8 +226,13 @@ pub fn verify_assertion_with_keys(
         match decode::<Value>(assertion, &decoding_key, &validation) {
             Ok(data) => {
                 let claims = data.claims;
-                check_claims(&claims, client_id, expected_audience)?;
-                return Ok(claims);
+                check_claims(&claims, client_id, expected_audiences)?;
+                let key_jkt = jwk_thumbprint_sha256(jwk).ok_or_else(|| {
+                    ClientAuthError::InvalidClaim(
+                        "cannot compute thumbprint of verifying JWK".to_owned(),
+                    )
+                })?;
+                return Ok(VerifiedAssertion { claims, key_jkt });
             }
             Err(e) => {
                 tracing::debug!(
@@ -324,10 +371,43 @@ async fn fetch_jwks_uri(state: &OAuthState, url: &str) -> Result<Value, ClientAu
     Ok(jwks)
 }
 
+/// RFC 7638 JWK thumbprint (SHA-256, base64url) over the required
+/// members of an OKP/EC/RSA key. Used to bind a session to the exact
+/// assertion key that verified — switching to another registered key
+/// changes the thumbprint (#1146 T3.3).
+///
+/// The member lists are already in lexicographic order as required by
+/// RFC 7638 §3.2. JWK key material is base64url by construction, so the
+/// canonical JSON needs no string escaping.
+fn jwk_thumbprint_sha256(jwk: &Value) -> Option<String> {
+    let get = |name: &str| jwk.get(name).and_then(Value::as_str);
+    let kty = get("kty")?;
+    let members: Vec<(&str, &str)> = match kty {
+        "OKP" => vec![("crv", get("crv")?), ("kty", kty), ("x", get("x")?)],
+        "EC" => vec![
+            ("crv", get("crv")?),
+            ("kty", kty),
+            ("x", get("x")?),
+            ("y", get("y")?),
+        ],
+        "RSA" => vec![("e", get("e")?), ("kty", kty), ("n", get("n")?)],
+        _ => return None,
+    };
+    let canonical = format!(
+        "{{{}}}",
+        members
+            .iter()
+            .map(|(k, v)| format!("\"{k}\":\"{v}\""))
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    Some(URL_SAFE_NO_PAD.encode(Sha256::digest(canonical.as_bytes())))
+}
+
 fn check_claims(
     claims: &Value,
     client_id: &str,
-    expected_audience: &str,
+    expected_audiences: &[String],
 ) -> Result<(), ClientAuthError> {
     let iss = claims.get("iss").and_then(Value::as_str)
         .ok_or_else(|| ClientAuthError::InvalidClaim("missing iss".to_owned()))?;
@@ -344,26 +424,50 @@ fn check_claims(
         )));
     }
 
+    let now = chrono::Utc::now().timestamp();
+
+    // iat is REQUIRED (#1146 T3.3): together with the mandatory jti it
+    // bounds the replay window and gives operators an issuance-time
+    // audit anchor. Reject assertions dated beyond a 60s clock skew.
+    let iat = claims.get("iat").and_then(Value::as_i64)
+        .ok_or_else(|| ClientAuthError::InvalidClaim("missing iat".to_owned()))?;
+    if iat > now + 60 {
+        return Err(ClientAuthError::InvalidClaim(format!(
+            "iat {iat} is in the future (now={now})"
+        )));
+    }
+
+    // jti is REQUIRED (#1146 T3.3): it keys the replay registry. RFC 7523
+    // §3 makes it optional, but this AS mandates it — without a unique
+    // jti there is no replay protection for a bearer assertion.
+    match claims.get("jti").and_then(Value::as_str) {
+        Some(jti) if !jti.is_empty() => {}
+        _ => return Err(ClientAuthError::InvalidClaim("missing jti".to_owned())),
+    }
+
     // Explicit exp check — defend against jsonwebtoken's
     // Validation::validate_exp behaviour quirks across versions.
     let exp = claims.get("exp").and_then(Value::as_i64)
         .ok_or_else(|| ClientAuthError::InvalidClaim("missing exp".to_owned()))?;
-    let now = chrono::Utc::now().timestamp();
     if exp <= now {
         return Err(ClientAuthError::InvalidClaim(format!(
             "exp {exp} is not in the future (now={now})"
         )));
     }
 
-    // aud may be a string or an array of strings (RFC 7519 §4.1.3).
+    // aud may be a string or an array of strings (RFC 7519 §4.1.3). It
+    // must include one of the accepted audiences: the AS issuer (atproto
+    // mandate) and, where the caller allows it, the token endpoint URL
+    // (RFC 7523 §3).
+    let aud_matches = |candidate: &str| expected_audiences.iter().any(|e| e == candidate);
     let aud_ok = match claims.get("aud") {
-        Some(Value::String(s)) => s == expected_audience,
-        Some(Value::Array(a)) => a.iter().any(|v| v.as_str() == Some(expected_audience)),
+        Some(Value::String(s)) => aud_matches(s),
+        Some(Value::Array(a)) => a.iter().filter_map(Value::as_str).any(aud_matches),
         _ => false,
     };
     if !aud_ok {
         return Err(ClientAuthError::InvalidClaim(format!(
-            "aud does not include '{expected_audience}'"
+            "aud does not include any of {expected_audiences:?}"
         )));
     }
 
@@ -392,6 +496,7 @@ mod tests {
             jwks_uri: None,
             hyprstream_node_did: None,
             scope: None,
+            dpop_bound_access_tokens: None,
             is_cimd: true,
             registered_at: Instant::now(),
         }
@@ -427,41 +532,141 @@ mod tests {
         vec![jwk]
     }
 
-    #[test]
-    fn valid_assertion_round_trip() {
-        let (sk, jwk) = ed25519_keypair_and_jwk();
-        let claims = serde_json::json!({
+    /// The accepted audience set used by the token endpoint: the AS
+    /// issuer (atproto-mandated form) plus the token endpoint URL
+    /// (RFC 7523 §3 form).
+    fn token_endpoint_audiences() -> Vec<String> {
+        vec![
+            "https://hs.test".to_owned(),
+            "https://hs.test/oauth/token".to_owned(),
+        ]
+    }
+
+    /// Baseline valid claims: iss/sub, issuer-form aud, iat, jti, exp.
+    fn valid_claims() -> serde_json::Value {
+        serde_json::json!({
             "iss": "https://app.test/c",
             "sub": "https://app.test/c",
-            "aud": "https://hs.test/oauth/token",
+            "aud": "https://hs.test",
+            "iat": chrono::Utc::now().timestamp(),
             "exp": chrono::Utc::now().timestamp() + 60,
             "jti": "j1",
-        });
-        let assertion = make_ed_assertion(&sk, claims);
+        })
+    }
+
+    #[test]
+    fn valid_assertion_round_trip() {
+        // #1146 T1.2: the atproto-mandated audience is the AS ISSUER.
+        let (sk, jwk) = ed25519_keypair_and_jwk();
+        let assertion = make_ed_assertion(&sk, valid_claims());
         let got = verify_assertion_with_keys(
             &keys_array(jwk),
             "https://app.test/c",
             &assertion,
-            "https://hs.test/oauth/token",
+            &token_endpoint_audiences(),
         );
         assert!(got.is_ok(), "verify failed: {:?}", got.err());
     }
 
     #[test]
-    fn rejects_wrong_audience() {
+    fn accepts_token_endpoint_audience_rfc7523() {
+        // RFC 7523 §3 permits the token endpoint URL as aud; the token
+        // endpoint accepts both forms for legacy clients.
         let (sk, jwk) = ed25519_keypair_and_jwk();
-        let claims = serde_json::json!({
-            "iss": "https://app.test/c",
-            "sub": "https://app.test/c",
-            "aud": "https://attacker.test/oauth/token",
-            "exp": chrono::Utc::now().timestamp() + 60,
-        });
+        let mut claims = valid_claims();
+        claims["aud"] = serde_json::json!("https://hs.test/oauth/token");
         let assertion = make_ed_assertion(&sk, claims);
         let got = verify_assertion_with_keys(
             &keys_array(jwk),
             "https://app.test/c",
             &assertion,
-            "https://hs.test/oauth/token",
+            &token_endpoint_audiences(),
+        );
+        assert!(got.is_ok(), "token-endpoint aud must verify: {:?}", got.err());
+    }
+
+    #[test]
+    fn rejects_issuer_audience_when_not_accepted() {
+        // PAR accepts ONLY the issuer form (#1146 T1.2/T3.3): an
+        // assertion audience of the token endpoint must fail there.
+        let (sk, jwk) = ed25519_keypair_and_jwk();
+        let mut claims = valid_claims();
+        claims["aud"] = serde_json::json!("https://hs.test/oauth/token");
+        let assertion = make_ed_assertion(&sk, claims);
+        let got = verify_assertion_with_keys(
+            &keys_array(jwk),
+            "https://app.test/c",
+            &assertion,
+            &["https://hs.test".to_owned()],
+        );
+        assert!(matches!(got, Err(ClientAuthError::InvalidClaim(_))));
+    }
+
+    #[test]
+    fn rejects_missing_iat() {
+        let (sk, jwk) = ed25519_keypair_and_jwk();
+        let mut claims = valid_claims();
+        claims.as_object_mut().unwrap().remove("iat");
+        let assertion = make_ed_assertion(&sk, claims);
+        let got = verify_assertion_with_keys(
+            &keys_array(jwk),
+            "https://app.test/c",
+            &assertion,
+            &token_endpoint_audiences(),
+        );
+        assert!(
+            matches!(&got, Err(ClientAuthError::InvalidClaim(c)) if c.contains("iat")),
+            "missing iat must be rejected: {got:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_future_iat() {
+        let (sk, jwk) = ed25519_keypair_and_jwk();
+        let mut claims = valid_claims();
+        claims["iat"] = serde_json::json!(chrono::Utc::now().timestamp() + 3600);
+        let assertion = make_ed_assertion(&sk, claims);
+        let got = verify_assertion_with_keys(
+            &keys_array(jwk),
+            "https://app.test/c",
+            &assertion,
+            &token_endpoint_audiences(),
+        );
+        assert!(
+            matches!(&got, Err(ClientAuthError::InvalidClaim(c)) if c.contains("iat")),
+            "future iat must be rejected: {got:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_missing_jti() {
+        let (sk, jwk) = ed25519_keypair_and_jwk();
+        let mut claims = valid_claims();
+        claims.as_object_mut().unwrap().remove("jti");
+        let assertion = make_ed_assertion(&sk, claims);
+        let got = verify_assertion_with_keys(
+            &keys_array(jwk),
+            "https://app.test/c",
+            &assertion,
+            &token_endpoint_audiences(),
+        );
+        assert!(
+            matches!(&got, Err(ClientAuthError::InvalidClaim(c)) if c.contains("jti")),
+            "missing jti must be rejected: {got:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_wrong_audience() {
+        let (sk, jwk) = ed25519_keypair_and_jwk();
+        let mut claims = valid_claims();
+        claims["aud"] = serde_json::json!("https://attacker.test/oauth/token");
+        let assertion = make_ed_assertion(&sk, claims);
+        let got = verify_assertion_with_keys(
+            &keys_array(jwk),
+            "https://app.test/c",
+            &assertion,
+            &token_endpoint_audiences(),
         );
         assert!(matches!(got, Err(ClientAuthError::InvalidClaim(_))));
     }
@@ -469,18 +674,15 @@ mod tests {
     #[test]
     fn rejects_wrong_iss() {
         let (sk, jwk) = ed25519_keypair_and_jwk();
-        let claims = serde_json::json!({
-            "iss": "https://impostor.test/c",
-            "sub": "https://impostor.test/c",
-            "aud": "https://hs.test/oauth/token",
-            "exp": chrono::Utc::now().timestamp() + 60,
-        });
+        let mut claims = valid_claims();
+        claims["iss"] = serde_json::json!("https://impostor.test/c");
+        claims["sub"] = serde_json::json!("https://impostor.test/c");
         let assertion = make_ed_assertion(&sk, claims);
         let got = verify_assertion_with_keys(
             &keys_array(jwk),
             "https://app.test/c",
             &assertion,
-            "https://hs.test/oauth/token",
+            &token_endpoint_audiences(),
         );
         assert!(matches!(got, Err(ClientAuthError::InvalidClaim(_))));
     }
@@ -488,18 +690,14 @@ mod tests {
     #[test]
     fn rejects_expired_assertion() {
         let (sk, jwk) = ed25519_keypair_and_jwk();
-        let claims = serde_json::json!({
-            "iss": "https://app.test/c",
-            "sub": "https://app.test/c",
-            "aud": "https://hs.test/oauth/token",
-            "exp": chrono::Utc::now().timestamp() - 60,
-        });
+        let mut claims = valid_claims();
+        claims["exp"] = serde_json::json!(chrono::Utc::now().timestamp() - 60);
         let assertion = make_ed_assertion(&sk, claims);
         let got = verify_assertion_with_keys(
             &keys_array(jwk),
             "https://app.test/c",
             &assertion,
-            "https://hs.test/oauth/token",
+            &token_endpoint_audiences(),
         );
         assert!(got.is_err(), "expired assertion should not verify: {got:?}");
     }
@@ -510,7 +708,7 @@ mod tests {
             &[],
             "https://app.test/c",
             "irrelevant",
-            "https://hs.test/oauth/token",
+            &token_endpoint_audiences(),
         );
         assert!(got.is_err(), "empty key set must not verify");
     }
@@ -582,7 +780,7 @@ mod tests {
             &[rsa_jwk],
             "https://app.test/c",
             &bogus_assertion,
-            "https://hs.test/oauth/token",
+            &token_endpoint_audiences(),
         );
         assert!(
             matches!(got, Err(ClientAuthError::InvalidSignature)),

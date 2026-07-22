@@ -2136,6 +2136,7 @@ mod tests {
                         username: "multiprocess-oauth".to_owned(),
                         verifying_key: None,
                         dpop_jkt: None,
+                        client_assertion_jkt: None,
                         },
                     );
                 }

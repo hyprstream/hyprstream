@@ -57,6 +57,14 @@ pub struct ParForm {
     pub resource: Option<String>,
     #[serde(default)]
     pub nonce: Option<String>,
+    /// RFC 7523 client assertion — REQUIRED at PAR for confidential
+    /// (`private_key_jwt`) clients: the atproto OAuth profile authenticates
+    /// confidential clients during the authorization request, which for a
+    /// PAR-mandatory profile is here (#1146 T3.3).
+    #[serde(default)]
+    pub client_assertion: Option<String>,
+    #[serde(default)]
+    pub client_assertion_type: Option<String>,
 }
 
 /// PAR success response body (RFC 9126 §2.2).
@@ -209,6 +217,61 @@ pub async fn push_authorization_request(
     // string into the stored snapshot so authorize/token see the exact set.
     let granted_scope_str = granted_scopes.join(" ");
 
+    // #1146 T3.3 (+T1.2): authenticate confidential clients at PAR. The
+    // atproto OAuth profile authenticates confidential clients during the
+    // authorization request — which, for a PAR-mandatory profile, is here.
+    // The assertion audience is the AS ISSUER (atproto mandate; the token
+    // endpoint additionally accepts the RFC 7523 endpoint-URL form, PAR
+    // does not). The verified key's RFC 7638 thumbprint is bound into the
+    // snapshot so token redemption and refresh must use the SAME key.
+    let client_assertion_jkt = {
+        let needs_auth = super::client_auth::requires_private_key_jwt(&registered_client);
+        let has_assertion =
+            form.client_assertion.is_some() && form.client_assertion_type.is_some();
+        if needs_auth && !has_assertion {
+            return par_error(
+                StatusCode::UNAUTHORIZED,
+                "invalid_client",
+                Some("client_assertion required"),
+            );
+        }
+        if has_assertion {
+            let assertion = form.client_assertion.as_deref().unwrap_or_else(|| unreachable!());
+            let atype = form
+                .client_assertion_type
+                .as_deref()
+                .unwrap_or_else(|| unreachable!());
+            let issuer = state.issuer_for_scopes(&granted_scopes);
+            match super::client_auth::verify_client_assertion(
+                &state,
+                &registered_client,
+                atype,
+                assertion,
+                std::slice::from_ref(&issuer),
+            )
+            .await
+            {
+                Ok(verified) => Some(verified.key_jkt),
+                Err(e) => {
+                    // Opaque response, detailed log — same rationale as
+                    // the token endpoint's invalid_client handling.
+                    tracing::warn!(
+                        client_id = %form.client_id,
+                        error = %e,
+                        "client_assertion verification failed at PAR"
+                    );
+                    return par_error(
+                        StatusCode::UNAUTHORIZED,
+                        "invalid_client",
+                        None,
+                    );
+                }
+            }
+        } else {
+            None
+        }
+    };
+
     // #1113 rev2 finding 3: atproto profile requires DPoP. Capture and verify
     // the DPoP proof at PAR, bind its `jkt` into the authorization request so
     // the token endpoint can require a proof from the SAME key. Non-atproto
@@ -269,6 +332,7 @@ pub async fn push_authorization_request(
         resource: form.resource,
         nonce: form.nonce,
         dpop_jkt: dpop_jkt.clone(),
+        client_assertion_jkt,
     };
 
     // Generate a random URN. RFC 9126 §2.2 / atproto OAuth use the standard

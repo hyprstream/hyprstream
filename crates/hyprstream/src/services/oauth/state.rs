@@ -133,9 +133,14 @@ pub struct RegisteredClient {
     pub hyprstream_node_did: Option<String>,
     /// Space-separated scope tokens the client declared at registration
     /// (RFC 7591 / RFC 6749 §3.3). Requested scopes at PAR/authorize are
-    /// validated as a subset of this (#1113 rev2). `None` for legacy/CIMD
-    /// clients → treated as "no client-side restriction".
+    /// validated as a subset of this (#1113 rev2). `None` → treated as
+    /// "no client-side restriction" (the client declared no ceiling).
     pub scope: Option<String>,
+    /// atproto OAuth: confidential clients set `dpop_bound_access_tokens:
+    /// true` in their metadata document. Parsed and retained here (#1146);
+    /// enforcement (rejecting confidential clients that omit it on the
+    /// atproto profile) is follow-up work.
+    pub dpop_bound_access_tokens: Option<bool>,
     /// True if this client was registered via Client ID Metadata Document (HTTPS URL client_id)
     pub is_cimd: bool,
     pub registered_at: Instant,
@@ -541,6 +546,7 @@ mod tests {
                 resource: None,
                 nonce: None,
                 dpop_jkt: None,
+                client_assertion_jkt: None,
             },
         };
         let now = Instant::now();
@@ -692,6 +698,11 @@ pub struct PendingAuthCode {
     /// atproto profile is active, the token endpoint must receive a DPoP
     /// proof from the same key.
     pub dpop_jkt: Option<String>,
+    /// RFC 7638 thumbprint of the client-assertion key verified at PAR
+    /// (#1146 T3.3). When set, the token endpoint must receive a
+    /// `client_assertion` signed by the same key, and the binding is
+    /// carried into the issued refresh token.
+    pub client_assertion_jkt: Option<String>,
 }
 
 impl PendingAuthCode {
@@ -786,6 +797,13 @@ pub struct RefreshTokenEntry {
     /// this exact key; it is carried forward during refresh-token rotation.
     #[serde(default)]
     pub dpop_jkt: Option<String>,
+    /// RFC 7638 thumbprint of the client-assertion key this session was
+    /// issued under (#1146 T3.3). When set, refresh requires a
+    /// `client_assertion` verified by the same key — refresh cannot switch
+    /// to another registered key, and removing the key from the client's
+    /// JWKS revokes the session. Carried forward during rotation.
+    #[serde(default)]
+    pub client_assertion_jkt: Option<String>,
     /// Present only for UCAN-grant refresh tokens (`client_id` `ucan-grant:{sub}`).
     ///
     /// MAC #547 / B1 (#673): refresh of a UCAN grant is NOT a free re-mint — the
@@ -915,6 +933,11 @@ pub struct OAuthState {
     /// the shared `TtlCache` with atomic check-and-record — see
     /// `check_and_record_dpop_jti`. TTL = iat + 120s per entry.
     pub dpop_jti_seen: TtlCache<String, ()>,
+    /// Seen client-assertion JTIs for replay prevention (RFC 7523 §3 /
+    /// atproto OAuth; #1146 T3.3). Keyed `{client_id}\u{1f}{jti}`; TTL =
+    /// the assertion's remaining `exp` lifetime. See
+    /// `check_and_record_assertion_jti`.
+    pub assertion_jti_seen: TtlCache<String, ()>,
     /// Server-issued DPoP nonces. Value = expiry unix timestamp.
     pub dpop_nonces: RwLock<HashMap<String, i64>>,
     /// Per-client (keyed by DPoP `jkt` thumbprint) nonce-issuance state.
@@ -1016,6 +1039,11 @@ impl OAuthState {
     const DPOP_JTI_MAX_ENTRIES: usize = 10_000;
     /// Inline reap budget per access (heap pops). Bounds tail latency.
     const DPOP_JTI_REAP_BUDGET: usize = 64;
+    /// Client-assertion jti replay-dedup cache: same bounds as the DPoP
+    /// registry; per-entry TTL is the assertion's remaining lifetime.
+    const ASSERTION_JTI_MAX_ENTRIES: usize = 10_000;
+    /// Inline reap budget per access (heap pops). Bounds tail latency.
+    const ASSERTION_JTI_REAP_BUDGET: usize = 64;
 
     pub fn new(
         config: &OAuthConfig,
@@ -1063,6 +1091,10 @@ impl OAuthState {
             rsa_jwk: None,
             rsa_kid: None,
             dpop_jti_seen: TtlCache::new(Self::DPOP_JTI_MAX_ENTRIES, Self::DPOP_JTI_REAP_BUDGET),
+            assertion_jti_seen: TtlCache::new(
+                Self::ASSERTION_JTI_MAX_ENTRIES,
+                Self::ASSERTION_JTI_REAP_BUDGET,
+            ),
             dpop_nonces: RwLock::new(HashMap::new()),
             dpop_clients_seen: RwLock::new(HashMap::new()),
             trusted_issuers: config.trusted_issuers.clone(),
@@ -1303,6 +1335,27 @@ impl OAuthState {
         let ttl_secs = ((iat + 120) - now).max(0) as u64;
         self.dpop_jti_seen
             .insert_if_absent(jti.to_owned(), (), Duration::from_secs(ttl_secs))
+    }
+
+    /// Check a client-assertion JTI for replay and record it if new
+    /// (#1146 T3.3; RFC 7523 §3 — an AS MUST NOT accept the same `jti`
+    /// more than once).
+    ///
+    /// Keyed by `{client_id}\u{1f}{jti}` so distinct clients cannot
+    /// collide on the same identifier. The entry lives until the
+    /// assertion's own `exp`, after which a replayed assertion would be
+    /// rejected as expired anyway.
+    ///
+    /// Returns `true` when the JTI is fresh (caller should proceed);
+    /// `false` when it was seen within its validity window (replay).
+    pub fn check_and_record_assertion_jti(&self, client_id: &str, jti: &str, exp: i64) -> bool {
+        let now = chrono::Utc::now().timestamp();
+        let ttl_secs = (exp - now).max(0) as u64;
+        self.assertion_jti_seen.insert_if_absent(
+            format!("{client_id}\u{1f}{jti}"),
+            (),
+            Duration::from_secs(ttl_secs),
+        )
     }
 
     /// Issue a fresh server-side DPoP nonce (RFC 9449 §8).
