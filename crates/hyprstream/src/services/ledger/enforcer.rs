@@ -454,10 +454,19 @@ mod tests {
         Cid(vec![b])
     }
 
-    fn random_nonce() -> u128 {
-        let mut bytes = [0u8; 16];
-        rand::rngs::OsRng.fill_bytes(&mut bytes);
-        u128::from_be_bytes(bytes)
+    /// A client-nonce test value drawn from `OsRng`, exactly as a real client
+    /// would generate its idempotency-key entropy — rather than a hard-coded
+    /// literal. `req.nonce` / `transfer_nonce` are public inputs to a
+    /// deterministic hash ([`mint_transfer_id`]), not secret cryptographic
+    /// material, so a literal here is a test-only false positive for CodeQL's
+    /// `rust/hard-coded-cryptographic-value` query (precedent: #1121). Drawing
+    /// from `OsRng` clears the alert at the root and is at least as faithful a
+    /// test of the real shape.
+    fn rand_nonce() -> u128 {
+        use rand::RngCore;
+        let mut buf = [0u8; 16];
+        rand::rngs::OsRng.fill_bytes(&mut buf);
+        u128::from_be_bytes(buf)
     }
 
     /// Build a fully-wired enforcer over a fresh MemLedger, with `grant_cap`
@@ -611,7 +620,7 @@ mod tests {
             grant_cid: cid(1),
             unit: unit(),
             amount: 10,
-            nonce: 1,
+            nonce: rand_nonce(),
             spend_authz: None,
             subject_ed_vk: None,
             subject_pq_vk: None,
@@ -627,19 +636,33 @@ mod tests {
 
     /// #985: an authorization signed for one transfer must not admit another.
     /// The happy-path test reuses the signing nonce as the request nonce, which
-    /// masked the missing equality check — this signs for nonce 7 and submits
-    /// nonce 8, so the signature verifies but the minted transfer id differs.
+    /// masked the missing equality check — this signs for one nonce and
+    /// submits a different one, so the signature verifies but the minted
+    /// transfer id differs.
     #[tokio::test]
     async fn authz_for_different_transfer_denied_hard() {
         let (enf, holder, grant_cid, _debit, _credit, ed_sk, pq_sk) = fixture(1000).await;
-        let (authz, ed_vk, pq_vk, _tid) =
-            signed_authz(&grant_cid, enf.cell_identity(), 7, 100, u64::MAX, &ed_sk, &pq_sk);
+        let signing_nonce = rand_nonce();
+        let request_nonce = rand_nonce(); // ≠ the nonce the authz was minted/signed for
+        assert_ne!(
+            signing_nonce, request_nonce,
+            "test requires two distinct 128-bit nonces"
+        );
+        let (authz, ed_vk, pq_vk, _tid) = signed_authz(
+            &grant_cid,
+            enf.cell_identity(),
+            signing_nonce,
+            100,
+            u64::MAX,
+            &ed_sk,
+            &pq_sk,
+        );
         let req = AdmissionRequest {
             subject: Some(holder),
             grant_cid,
             unit: unit(),
             amount: 100,
-            nonce: 8, // ≠ the nonce the authz was minted/signed for
+            nonce: request_nonce,
             spend_authz: Some(authz),
             subject_ed_vk: Some(ed_vk),
             subject_pq_vk: Some(pq_vk),
@@ -668,7 +691,7 @@ mod tests {
             grant_cid,
             unit: unit(),
             amount: 0,
-            nonce: 9,
+            nonce: rand_nonce(),
             spend_authz: None,
             subject_ed_vk: None,
             subject_pq_vk: None,
@@ -693,14 +716,15 @@ mod tests {
     async fn expired_authz_denied_hard() {
         let (enf, holder, grant_cid, _debit, _credit, ed_sk, pq_sk) = fixture(1000).await;
         // Valid signature, right grant/host/nonce/transfer id — but exp = 5.
+        let nonce = rand_nonce();
         let (authz, ed_vk, pq_vk, _tid) =
-            signed_authz(&grant_cid, enf.cell_identity(), 7, 100, 5, &ed_sk, &pq_sk);
+            signed_authz(&grant_cid, enf.cell_identity(), nonce, 100, 5, &ed_sk, &pq_sk);
         let req = AdmissionRequest {
             subject: Some(holder),
             grant_cid,
             unit: unit(),
             amount: 100,
-            nonce: 7,
+            nonce,
             spend_authz: Some(authz),
             subject_ed_vk: Some(ed_vk),
             subject_pq_vk: Some(pq_vk),
@@ -722,14 +746,22 @@ mod tests {
     #[tokio::test]
     async fn admitted_then_post_and_void_roundtrip() {
         let (enf, holder, grant_cid, debit, credit, ed_sk, pq_sk) = fixture(1000).await;
-        let (authz, ed_vk, pq_vk, _tid) =
-            signed_authz(&grant_cid, enf.cell_identity(), 7, 100, u64::MAX, &ed_sk, &pq_sk);
+        let nonce = rand_nonce();
+        let (authz, ed_vk, pq_vk, _tid) = signed_authz(
+            &grant_cid,
+            enf.cell_identity(),
+            nonce,
+            100,
+            u64::MAX,
+            &ed_sk,
+            &pq_sk,
+        );
         let req = AdmissionRequest {
             subject: Some(holder.clone()),
             grant_cid: grant_cid.clone(),
             unit: unit(),
             amount: 100,
-            nonce: 7,
+            nonce,
             spend_authz: Some(authz),
             subject_ed_vk: Some(ed_vk),
             subject_pq_vk: Some(pq_vk),
@@ -825,14 +857,22 @@ mod tests {
     #[tokio::test]
     async fn insufficient_credit_rejects_retryable_not_queues() {
         let (enf, holder, grant_cid, _debit, _credit, ed_sk, pq_sk) = fixture(100).await;
-        let (authz, ed_vk, pq_vk, _) =
-            signed_authz(&grant_cid, enf.cell_identity(), 1, 500, u64::MAX, &ed_sk, &pq_sk);
+        let nonce = rand_nonce();
+        let (authz, ed_vk, pq_vk, _) = signed_authz(
+            &grant_cid,
+            enf.cell_identity(),
+            nonce,
+            500,
+            u64::MAX,
+            &ed_sk,
+            &pq_sk,
+        );
         let req = AdmissionRequest {
             subject: Some(holder),
             grant_cid,
             unit: unit(),
             amount: 500, // > available 100
-            nonce: 1,
+            nonce,
             spend_authz: Some(authz),
             subject_ed_vk: Some(ed_vk),
             subject_pq_vk: Some(pq_vk),
