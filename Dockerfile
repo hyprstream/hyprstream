@@ -228,8 +228,13 @@ FROM builder-${VARIANT} AS builder
 # Set working directory
 WORKDIR /build
 
-# Copy project files
+# Copy project files. Cargo.lock is REQUIRED: without it `cargo build` regenerates
+# the lock from the registry and the `duckdb`/`datafusion` caret requirements can
+# float across an arrow major boundary (duckdb 1.4.3 -> 1.10504.x pulls arrow 58,
+# while datafusion 50 stays on arrow 56), producing E0308 at the MemTable/DFSchema
+# boundaries. See crates/hyprstream-metrics/Cargo.toml and PR fixing #release-image.
 COPY Cargo.toml ./
+COPY Cargo.lock ./
 COPY crates ./crates
 
 ENV LIBTORCH=/opt/libtorch
@@ -246,7 +251,7 @@ ENV LD_LIBRARY_PATH=/opt/libtorch/lib
 RUN --mount=type=cache,target=/root/.cargo/registry \
     --mount=type=cache,target=/root/.cargo/git \
     --mount=type=cache,target=/sccache \
-    OPENSSL_NO_VENDOR=1 cargo build --release --no-default-features --features otel,gittorrent,xet
+    OPENSSL_NO_VENDOR=1 cargo build --locked --release --no-default-features --features otel,gittorrent,xet
 
 #############################################
 # Runtime Stage Selection (Distroless)
