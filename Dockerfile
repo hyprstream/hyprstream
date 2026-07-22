@@ -237,7 +237,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip3 install --break-system-packages \
-        --index-url https://download.pytorch.org/whl/cu130 \
+        --extra-index-url https://download.pytorch.org/whl/cu130 \
         'torch==2.9.1+cu130' \
     && TORCH_DIR="$(python3 -c 'import torch, os; print(os.path.dirname(torch.__file__))')" \
     && ln -s "$TORCH_DIR" /opt/libtorch \
