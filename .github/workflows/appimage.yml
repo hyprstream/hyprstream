@@ -1,8 +1,11 @@
 name: Build AppImage
 
 on:
+  schedule:
+    # Full distributable builds are deliberately off the merge path.
+    - cron: '30 3 * * *'
+  workflow_dispatch:
   push:
-    branches: [ "main" ]
     tags:
       - 'v*'
 
@@ -24,10 +27,10 @@ env:
   CARGO_INCREMENTAL: 0
 
 jobs:
-  # Build all backend variants sequentially on a single runner
-  # This maximizes sccache hits and minimizes disk usage
-  build-all-variants:
-    name: Build all variants (sequential)
+  # Build all supported x86_64 variants sequentially on a single runner. This
+  # keeps the large libtorch payloads and Cargo target on one disk.
+  build-x86_64:
+    name: Build x86_64 AppImages (sequential)
     runs-on: ubuntu-latest
 
     steps:
@@ -97,18 +100,13 @@ jobs:
           path: appimage/output/*-cpu-*.AppImage
           retention-days: 5
 
-      # Heavy GPU variants + universal build only on release tags. On push-to-main
-      # we ship just the CPU AppImage — building all 5 every push cost ~70min and
-      # produced ~11GB of artifacts that only matter at release.
       - name: Build CUDA 12.8 AppImage
-        if: startsWith(github.ref, 'refs/tags/')
         run: |
           ./appimage/build-appimage.sh build cuda128 --version ${{ steps.version.outputs.version }}
           ./appimage/build-appimage.sh stage cuda128
           ./appimage/build-appimage.sh clean cuda128
 
       - name: Upload CUDA 12.8 AppImage
-        if: startsWith(github.ref, 'refs/tags/')
         uses: actions/upload-artifact@v4
         with:
           name: appimage-cuda128
@@ -116,14 +114,12 @@ jobs:
           retention-days: 5
 
       - name: Build CUDA 13.0 AppImage
-        if: startsWith(github.ref, 'refs/tags/')
         run: |
           ./appimage/build-appimage.sh build cuda130 --version ${{ steps.version.outputs.version }}
           ./appimage/build-appimage.sh stage cuda130
           ./appimage/build-appimage.sh clean cuda130
 
       - name: Upload CUDA 13.0 AppImage
-        if: startsWith(github.ref, 'refs/tags/')
         uses: actions/upload-artifact@v4
         with:
           name: appimage-cuda130
@@ -131,14 +127,12 @@ jobs:
           retention-days: 5
 
       - name: Build ROCm 7.1 AppImage
-        if: startsWith(github.ref, 'refs/tags/')
         run: |
           ./appimage/build-appimage.sh build rocm71 --version ${{ steps.version.outputs.version }}
           ./appimage/build-appimage.sh stage rocm71
           ./appimage/build-appimage.sh clean rocm71
 
       - name: Upload ROCm 7.1 AppImage
-        if: startsWith(github.ref, 'refs/tags/')
         uses: actions/upload-artifact@v4
         with:
           name: appimage-rocm71
@@ -146,12 +140,10 @@ jobs:
           retention-days: 5
 
       - name: Build Universal AppImage
-        if: startsWith(github.ref, 'refs/tags/')
         run: |
           ./appimage/build-appimage.sh build universal --version ${{ steps.version.outputs.version }}
 
       - name: Upload Universal AppImage
-        if: startsWith(github.ref, 'refs/tags/')
         uses: actions/upload-artifact@v4
         with:
           name: appimage-universal
@@ -161,11 +153,57 @@ jobs:
       - name: Show sccache stats
         run: sccache --show-stats
 
+  # Native arm64 packaging. Upstream publishes arm64 CPU libtorch through the
+  # PyTorch wheel, but not CUDA/ROCm archives; build the supported CPU image in
+  # the prebuilt Graviton builder so Rust and libtorch stay architecture-native.
+  build-arm64-cpu:
+    name: Build arm64 CPU AppImage
+    runs-on: [self-hosted, linux, arm64, graviton, hyprstream-merge-gate]
+    timeout-minutes: 150
+    env:
+      BUILDER_IMAGE: ghcr.io/hyprstream/rust-builder-arm64@sha256:aa9feb1c8432ebf4583fcfc9c8236c371cb050f489c4d0882a7f2d8c8589120e
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Pull arm64 builder image
+        run: podman pull "$BUILDER_IMAGE"
+
+      - name: Build arm64 CPU AppImage in the native builder
+        run: |
+          podman run --rm \
+            -v "$PWD":/build:Z -w /build \
+            -e HYPRSTREAM_APPIMAGE_ARCH=aarch64 \
+            -e HYPRSTREAM_LIBTORCH_DIR=/opt/libtorch \
+            -e GITHUB_REF_NAME \
+            -e APPIMAGE_EXTRACT_AND_RUN=1 \
+            -e OPENSSL_NO_VENDOR=1 \
+            -e LIBTORCH=/opt/libtorch -e LD_LIBRARY_PATH=/opt/libtorch/lib \
+            -e LIBTORCH_BYPASS_VERSION_CHECK=1 \
+            -e CARGO_INCREMENTAL=0 -e CARGO_TERM_COLOR=always \
+            "$BUILDER_IMAGE" \
+            bash -euo pipefail -c '
+              apt-get update
+              apt-get install -y --no-install-recommends squashfs-tools
+              version="${GITHUB_REF_NAME#v}"
+              [[ "$version" == "$GITHUB_REF_NAME" ]] && version=dev
+              ./appimage/build-appimage.sh build cpu --version "$version"
+            '
+
+      - name: Upload arm64 CPU AppImage
+        uses: actions/upload-artifact@v4
+        with:
+          name: appimage-arm64-cpu
+          path: appimage/output/*-cpu-aarch64.AppImage
+          retention-days: 5
+
   # Create GitHub Release with all AppImages (tags only)
   release:
     name: Create Release
     if: startsWith(github.ref, 'refs/tags/')
-    needs: build-all-variants
+    needs: [build-x86_64, build-arm64-cpu]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -230,6 +268,7 @@ jobs:
             | `hyprstream-${{ steps.version.outputs.version }}-cuda128-x86_64.AppImage` | NVIDIA CUDA 12.8 |
             | `hyprstream-${{ steps.version.outputs.version }}-cuda130-x86_64.AppImage` | NVIDIA CUDA 13.0 |
             | `hyprstream-${{ steps.version.outputs.version }}-rocm71-x86_64.AppImage` | AMD ROCm 7.1 |
+            | `hyprstream-${{ steps.version.outputs.version }}-cpu-aarch64.AppImage` | ARM64 CPU only |
 
             ### Manual Install
 
