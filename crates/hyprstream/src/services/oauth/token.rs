@@ -1189,11 +1189,18 @@ mod tests {
     /// client can re-sign and replay the proof.
     #[test]
     fn use_dpop_nonce_error_carries_atproto_retry_contract() {
-        let resp = use_dpop_nonce_error("abc123", "DPoP proof must include a server-issued nonce");
+        // Draw the test nonce from OsRng exactly as production
+        // (`OAuthState::issue_dpop_nonce`) does. A hard-coded literal here
+        // tripped CodeQL `rust/hard-coded-cryptographic-value` (#1121) — a
+        // false positive (test-only value, never a crypto sink), but the
+        // literal-free form is also a more faithful test of the real shape.
+        use rand::Rng;
+        let nonce = URL_SAFE_NO_PAD.encode(rand::rngs::OsRng.gen::<[u8; 16]>());
+        let resp = use_dpop_nonce_error(&nonce, "DPoP proof must include a server-issued nonce");
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         assert_eq!(
             resp.headers().get("DPoP-Nonce").and_then(|v| v.to_str().ok()),
-            Some("abc123"),
+            Some(nonce.as_str()),
             "DPoP-Nonce header MUST carry the fresh nonce for client retry"
         );
     }
@@ -1203,8 +1210,26 @@ mod tests {
     /// (graceful) but the error contract the client keys on is preserved.
     #[test]
     fn use_dpop_nonce_error_keeps_400_on_unheaderable_nonce() {
-        let resp = use_dpop_nonce_error("not valid token", "expired");
+        // Map OsRng bytes into the C0 control range (0x00–0x1F): every byte
+        // is then invalid in an HTTP header value, so
+        // `HeaderValue::from_str` MUST reject it and the header is omitted.
+        // (The previous "not valid token" literal contained only spaces,
+        // which ARE valid header bytes — the header was silently inserted
+        // and the graceful-omission branch went untested. The literal also
+        // tripped CodeQL `rust/hard-coded-cryptographic-value`, #1121.)
+        use rand::Rng;
+        let bytes: Vec<u8> = rand::rngs::OsRng
+            .gen::<[u8; 8]>()
+            .into_iter()
+            .map(|b| b % 0x20)
+            .collect();
+        let nonce = String::from_utf8(bytes).expect("C0 control bytes are valid UTF-8");
+        let resp = use_dpop_nonce_error(&nonce, "expired");
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert!(
+            resp.headers().get("DPoP-Nonce").is_none(),
+            "unheaderable nonce MUST be omitted from the response"
+        );
     }
 
     /// #1113 rev2 finding 1: the atproto token response matches
