@@ -188,10 +188,11 @@ fn build_sql(q: &MetricQuery) -> Result<String> {
 impl MetricsHandler for MetricsService {
     async fn authorize(&self, ctx: &EnvelopeContext, resource: &str, operation: &str) -> Result<()> {
         let subject = ctx.subject().to_string();
+        let domain = ctx.domain()?;
         let allowed = self.policy_client
             .check(&PolicyCheck {
                 subject: subject.clone(),
-                domain: "*".to_owned(),
+                domain,
                 resource: resource.to_owned(),
                 operation: operation.to_owned(),
             })
