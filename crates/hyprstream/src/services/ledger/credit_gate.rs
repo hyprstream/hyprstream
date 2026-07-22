@@ -62,8 +62,9 @@ pub enum DenyReason {
 /// keyed by its [`Cid`] so the hot path never re-verifies (plan §5.2).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerifiedGrant {
-    /// The holder (the identity whose inventory this is).
-    pub holder: Did,
+    /// The holder (the identity whose inventory this is). A verifier that
+    /// cannot establish a holder returns `None`; admission must reject it.
+    pub holder: Option<Did>,
     /// The unit (names its issuer — INV-1).
     pub unit: UnitId,
     /// The total cap authorized by this grant (minor units).
@@ -393,7 +394,7 @@ mod tests {
     }
     fn grant(cap: u128) -> VerifiedGrant {
         VerifiedGrant {
-            holder: Did("did:web:alice".to_owned()),
+            holder: Some(Did("did:web:alice".to_owned())),
             unit: unit(),
             cap_amount: cap,
             exp: u64::MAX,
