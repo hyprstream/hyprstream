@@ -1397,7 +1397,8 @@ impl WorkerHandler for WorkerService {
     async fn authorize(&self, ctx: &EnvelopeContext, resource: &str, operation: &str) -> AnyhowResult<()> {
         if let Some(ref auth_fn) = self.authorize_fn {
             let subject = ctx.subject().to_string();
-            let allowed = auth_fn(subject.clone(), resource.to_owned(), operation.to_owned()).await
+            let domain = ctx.domain()?;
+            let allowed = auth_fn(subject.clone(), domain, resource.to_owned(), operation.to_owned()).await
                 .unwrap_or_else(|e| {
                     warn!("Policy check failed for {} on {}: {} - denying access", subject, resource, e);
                     false

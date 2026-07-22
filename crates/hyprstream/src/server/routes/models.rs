@@ -81,7 +81,7 @@ async fn list_models(
     let user = server::extract_user(auth_user.as_ref());
     if !state.policy_client.check(&crate::services::generated::policy_client::PolicyCheck {
         subject: user.clone(),
-        domain: "*".to_owned(),
+        domain: user.clone(),
         resource: "registry:*".to_owned(),
         operation: Operation::Query.as_str().to_owned(),
     }).await.unwrap_or(false) {
@@ -146,7 +146,7 @@ async fn get_model_info(
     let resource = format!("model:{id}");
     if !state.policy_client.check(&crate::services::generated::policy_client::PolicyCheck {
         subject: user.clone(),
-        domain: "*".to_owned(),
+        domain: user.clone(),
         resource: resource.clone(),
         operation: Operation::Query.as_str().to_owned(),
     }).await.unwrap_or(false) {
@@ -198,7 +198,7 @@ async fn download_model(
     let user = server::extract_user(auth_user.as_ref());
     if !state.policy_client.check(&crate::services::generated::policy_client::PolicyCheck {
         subject: user.clone(),
-        domain: "*".to_owned(),
+        domain: user.clone(),
         resource: "registry:*".to_owned(),
         operation: Operation::Write.as_str().to_owned(),
     }).await.unwrap_or(false) {
@@ -320,7 +320,7 @@ async fn load_model(
     let resource = format!("model:{id}");
     if !state.policy_client.check(&crate::services::generated::policy_client::PolicyCheck {
         subject: user.clone(),
-        domain: "*".to_owned(),
+        domain: user.clone(),
         resource: resource.clone(),
         operation: Operation::Manage.as_str().to_owned(),
     }).await.unwrap_or(false) {
@@ -379,7 +379,7 @@ async fn unload_model(
     let resource = format!("model:{id}");
     if !state.policy_client.check(&crate::services::generated::policy_client::PolicyCheck {
         subject: user.clone(),
-        domain: "*".to_owned(),
+        domain: user.clone(),
         resource: resource.clone(),
         operation: Operation::Manage.as_str().to_owned(),
     }).await.unwrap_or(false) {
@@ -406,7 +406,7 @@ async fn refresh_cache(
     let user = server::extract_user(auth_user.as_ref());
     if !state.policy_client.check(&crate::services::generated::policy_client::PolicyCheck {
         subject: user.clone(),
-        domain: "*".to_owned(),
+        domain: user.clone(),
         resource: "registry:*".to_owned(),
         operation: Operation::Manage.as_str().to_owned(),
     }).await.unwrap_or(false) {

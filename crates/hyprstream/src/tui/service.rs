@@ -244,13 +244,14 @@ impl TuiService {
     /// external callers require explicit policy grants.
     async fn authorize(&self, ctx: &EnvelopeContext, resource: &str, operation: &str) -> Result<()> {
         let subject = ctx.subject().to_string();
+        let domain = ctx.domain()?;
         let policy_client = self.policy_client.as_ref().ok_or_else(|| {
             anyhow::anyhow!("Authorization denied: no policy client configured")
         })?;
         let allowed = policy_client
             .check(&crate::services::generated::policy_client::PolicyCheck {
                 subject: subject.clone(),
-                domain: "*".to_owned(),
+                domain,
                 resource: resource.to_owned(),
                 operation: operation.to_owned(),
             })

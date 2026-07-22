@@ -21,13 +21,14 @@ use tracing::warn;
 
 /// Authorization callback for policy checks.
 ///
-/// Parameters: (subject, resource, operation) -> allowed.
+/// Parameters: (subject, domain, resource, operation) -> allowed.
 /// Services store this and call it from their `authorize()` handler method.
 /// The concrete implementation typically wraps `PolicyClient::check_policy()`.
 ///
 /// Returns a boxed future to support async policy checks on single-threaded runtimes.
 pub type AuthorizeFn = Arc<
     dyn Fn(
+            String,
             String,
             String,
             String,
@@ -288,6 +289,28 @@ impl EnvelopeContext {
             return s.clone();
         }
         Subject::anonymous()
+    }
+
+    /// Derive the Casbin request domain from the verified RPC identity.
+    ///
+    /// This is deliberately the same stable identifier as the verified
+    /// subject. It is never read from a request payload: `subject()` only
+    /// exposes a trust-store binding or a JWT that `verify_claims()` verified.
+    /// Until a separately verified tenant binding exists, this provides
+    /// identity partitioning rather than a many-subject tenant boundary.
+    ///
+    /// Anonymous callers and an identity named `"*"` have no usable domain.
+    /// Callers must deny this error rather than falling back to a wildcard.
+    pub fn domain(&self) -> Result<String> {
+        let subject = self.subject();
+        let name = subject
+            .name()
+            .ok_or_else(|| anyhow::anyhow!("authorization denied: no verified identity domain"))?;
+        anyhow::ensure!(
+            name != "*",
+            "authorization denied: wildcard is not a valid verified identity domain"
+        );
+        Ok(name.to_owned())
     }
 
     /// Get the bare username string.

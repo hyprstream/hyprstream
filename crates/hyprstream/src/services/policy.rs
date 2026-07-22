@@ -257,9 +257,10 @@ fn validate_event_prefix(prefix: &str) -> Result<(), String> {
 impl PolicyHandler for PolicyService {
     async fn authorize(&self, ctx: &EnvelopeContext, resource: &str, operation: &str) -> Result<()> {
         let subject = ctx.subject();
+        let domain = ctx.domain()?;
         let allowed = self.policy_manager.check_with_domain(
             &subject.to_string(),
-            "*",
+            &domain,
             resource,
             operation,
         ).await;
@@ -312,9 +313,10 @@ impl PolicyHandler for PolicyService {
             // Explicit subject requires `manage` permission on `policy:IssueToken`
             // (matches the capnp type name used by the transport-level Casbin check).
             let caller = ctx.subject().to_string();
+            let domain = ctx.domain()?;
             let allowed = self.policy_manager.check_with_domain(
                 &caller,
-                "*",
+                &domain,
                 "policy:IssueToken",
                 "manage",
             ).await;
@@ -500,8 +502,9 @@ impl PolicyHandler for PolicyService {
         data: &ApplyTemplate,
     ) -> Result<PolicyResponseVariant> {
         let caller = ctx.subject().to_string();
+        let domain = ctx.domain()?;
         let allowed = self.policy_manager.check_with_domain(
-            &caller, "*", "policy:*", "ttt.writeback",
+            &caller, &domain, "policy:*", "ttt.writeback",
         ).await;
         if !allowed {
             return Ok(PolicyResponseVariant::Error(ErrorInfo {
@@ -569,8 +572,9 @@ impl PolicyHandler for PolicyService {
         data: &ApplyDraft,
     ) -> Result<PolicyResponseVariant> {
         let caller = ctx.subject().to_string();
+        let domain = ctx.domain()?;
         let allowed = self.policy_manager.check_with_domain(
-            &caller, "*", "policy:*", "ttt.writeback",
+            &caller, &domain, "policy:*", "ttt.writeback",
         ).await;
         if !allowed {
             return Ok(PolicyResponseVariant::Error(ErrorInfo {
@@ -620,8 +624,9 @@ impl PolicyHandler for PolicyService {
         data: &RollbackPolicy,
     ) -> Result<PolicyResponseVariant> {
         let caller = ctx.subject().to_string();
+        let domain = ctx.domain()?;
         let allowed = self.policy_manager.check_with_domain(
-            &caller, "*", "policy:*", "ttt.writeback",
+            &caller, &domain, "policy:*", "ttt.writeback",
         ).await;
         if !allowed {
             return Ok(PolicyResponseVariant::Error(ErrorInfo {
@@ -715,8 +720,9 @@ impl PolicyHandler for PolicyService {
         data: &GetHistory,
     ) -> Result<PolicyResponseVariant> {
         let caller = ctx.subject().to_string();
+        let domain = ctx.domain()?;
         let allowed = self.policy_manager.check_with_domain(
-            &caller, "*", "policy:*", "ttt.writeback",
+            &caller, &domain, "policy:*", "ttt.writeback",
         ).await;
         if !allowed {
             return Ok(PolicyResponseVariant::Error(ErrorInfo {
@@ -802,8 +808,9 @@ impl PolicyHandler for PolicyService {
         data: &GetDiff,
     ) -> Result<PolicyResponseVariant> {
         let caller = ctx.subject().to_string();
+        let domain = ctx.domain()?;
         let allowed = self.policy_manager.check_with_domain(
-            &caller, "*", "policy:*", "ttt.writeback",
+            &caller, &domain, "policy:*", "ttt.writeback",
         ).await;
         if !allowed {
             return Ok(PolicyResponseVariant::Error(ErrorInfo {
@@ -859,8 +866,9 @@ impl PolicyHandler for PolicyService {
         _request_id: u64,
     ) -> Result<PolicyResponseVariant> {
         let caller = ctx.subject().to_string();
+        let domain = ctx.domain()?;
         let allowed = self.policy_manager.check_with_domain(
-            &caller, "*", "policy:*", "ttt.writeback",
+            &caller, &domain, "policy:*", "ttt.writeback",
         ).await;
         if !allowed {
             return Ok(PolicyResponseVariant::Error(ErrorInfo {
@@ -907,11 +915,12 @@ impl PolicyHandler for PolicyService {
         data: &AddGrouping,
     ) -> Result<PolicyResponseVariant> {
         let caller = ctx.subject().to_string();
+        let domain = ctx.domain()?;
 
         // Fine-grained permission check: caller must have ttt.writeback on policy:roles
         let allowed = self.policy_manager.check_with_domain(
             &caller,
-            "*",
+            &domain,
             "policy:roles",
             "ttt.writeback",
         ).await;
@@ -992,11 +1001,12 @@ impl PolicyHandler for PolicyService {
         data: &RemoveGrouping,
     ) -> Result<PolicyResponseVariant> {
         let caller = ctx.subject().to_string();
+        let domain = ctx.domain()?;
 
         // Fine-grained permission check: caller must have ttt.writeback on policy:roles
         let allowed = self.policy_manager.check_with_domain(
             &caller,
-            "*",
+            &domain,
             "policy:roles",
             "ttt.writeback",
         ).await;
@@ -1052,12 +1062,13 @@ impl PolicyHandler for PolicyService {
         data: &SetBranchVisibility,
     ) -> Result<PolicyResponseVariant> {
         let caller = ctx.subject().to_string();
+        let domain = ctx.domain()?;
         let resource = format!("model:{}:{}", data.model_name, data.branch_name);
 
         // Require manage (ttt.writeback) on the model resource
         let allowed = self.policy_manager.check_with_domain(
             &caller,
-            "*",
+            &domain,
             &resource,
             "ttt.writeback",
         ).await;
@@ -1468,6 +1479,7 @@ impl PolicyHandler for PolicyService {
                 }));
             }
         };
+        let domain = ctx.domain()?;
 
         // ExchangeWit signs directly rather than through `handle_issue_token`.
         // Keep its authenticated-envelope subject under the same account-DID
@@ -1493,7 +1505,7 @@ impl PolicyHandler for PolicyService {
         // Casbin: caller must have 'exchange' on 'policy:exchange-wit'.
         let allowed = self.policy_manager.check_with_domain(
             &sub,
-            "*",
+            &domain,
             "policy:exchange-wit",
             "exchange",
         ).await;
