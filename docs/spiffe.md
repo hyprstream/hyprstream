@@ -87,7 +87,7 @@ Under this design, hyprstream services would receive SPIFFE IDs structured as:
 spiffe://<trust_domain>/service/<service-name>
 ```
 
-with the trust domain defaulting to the host portion of `oauth.issuer_url`. Per-user or per-workload SPIFFE IDs would not be issued — SPIFFE is workload identity; *user* identity lives in did:web (`did:web:hyprstream.acme.com:users:alice`). The two systems address different layers.
+with the trust domain defaulting to the host portion of `oauth.issuer_url`. Per-user or per-workload SPIFFE IDs would not be issued — SPIFFE is workload identity; account identity will use host-form did:web once the replacement mint path lands (#1163). The two systems address different layers.
 
 > [!warning] Trust-domain choice would be sticky
 > Once SVIDs have been issued under a trust domain, changing it breaks every existing SVID. Pick deliberately at setup.
@@ -114,7 +114,7 @@ Apply the `federation-open` template (or run `hyprstream wizard --enable-federat
 
 | Layer | Identifier | Protocol | Status |
 |---|---|---|---|
-| User identity | `did:web:hyprstream.acme.com:users:alice` | did:web + OAuth/OIDC | shipped |
+| User identity | Host-form did:web (replacement mint path #1163) | did:web + OAuth/OIDC | pending |
 | OAuth client (with FQDN) | `https://app.example.com/client.json` | CIMD | shipped |
 | OAuth client (no FQDN) | UUID issued by hyprstream | DCR (RFC 7591) | shipped |
 | hyprstream workload | WIMSE WIT (`wit+jwt`) | EdDSA JWT + COSE envelopes | shipped |

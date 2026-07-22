@@ -3,8 +3,8 @@
 //! Serves DID documents at:
 //!   - `GET /.well-known/did.json` — root deployment DID (controller for all keys
 //!     under this issuer's authority)
-//!   - `GET /users/:username/did.json` — per-user DID document with that user's
-//!     registered Ed25519 verification methods
+//!   - `GET /users/:username/did.json` — hard error while path-form account DID
+//!     minting is frozen (#1159)
 //!   - `GET /clients/:client_id/did.json` — per-client DID document (for Tier 3
 //!     confidential clients with registered keys)
 //!
@@ -586,71 +586,25 @@ pub async fn atproto_did(
     ).into_response()
 }
 
-/// `GET /users/:username/did.json` — per-user DID document.
+/// `GET /users/:username/did.json` — frozen path-form account DID endpoint.
 ///
-/// `id = did:web:{authority}:users:{username}`. Verification methods:
-/// every Ed25519 pubkey the user has registered via SCIM
-/// (`list_pubkeys`). Empty `verificationMethod` array if the user has no
-/// registered keys — that's a valid DID document; it just means no
-/// authentication keys are bound.
+/// This route previously synthesized `did:web:{authority}:users:{username}`.
+/// That shape is outside the atproto did:web profile, so serving it would mint
+/// another permanent invalid account identifier. Keep the route as an explicit
+/// hard error until the separately designed host-form mint path lands (#1163).
 pub async fn user_did_document(
-    State(state): State<Arc<OAuthState>>,
-    Path(username): Path<String>,
+    State(_state): State<Arc<OAuthState>>,
+    Path(_username): Path<String>,
 ) -> Response {
-    let authority = match issuer_authority(&state.issuer_url) {
-        Some(a) => a,
-        None => return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "issuer URL has no authority",
-        ).into_response(),
-    };
+    path_form_account_did_disabled_response()
+}
 
-    // Reject usernames containing characters that would break the did:web
-    // path component or imply arbitrary path traversal.
-    if username.contains(['/', '#', '?', ':']) || username.is_empty() {
-        return (StatusCode::BAD_REQUEST, "invalid username").into_response();
-    }
-    let did = format!("did:web:{authority}:users:{username}");
-
-    // Resolve user keys via UserStore.list_pubkeys. If the user store is
-    // unavailable or the user has no profile, serve an empty DID document
-    // (404 would be more strictly correct, but did:web consumers tend to
-    // tolerate empty verificationMethod better than HTTP errors and we
-    // want this endpoint to be usable as a presence check).
-    let keys: Vec<(String, VerifyingKey)> = match state.user_service.as_ref() {
-        Some(user_svc) => {
-            match user_svc.store().list_pubkeys(&username).await {
-                Ok(pubkeys) => pubkeys
-                    .into_iter()
-                    .map(|pk| (format!("key-{}", &pk.fingerprint[..8.min(pk.fingerprint.len())]), pk.pubkey))
-                    .collect(),
-                Err(_) => Vec::new(),
-            }
-        }
-        None => Vec::new(),
-    };
-
-    // #1113 rev2 finding 2: serve a COMPLETE atproto account DID document so
-    // that resolving the token `sub` (a did:web:{authority}:users:{username})
-    // yields a PDS whose `AtprotoPersonalDataServer` service points at THIS
-    // host — the round-trip the stock @atproto/oauth-client-browser requires
-    // (PDS metadata issuer == this AS). The hosted-account `#atproto` VM is
-    // the node's active ES256 key (the PDS signs atproto ops on the account's
-    // behalf), and `alsoKnownAs` carries an `at://{handle}` alias.
-    let atproto_signing = match state.es256_key_store.as_ref() {
-        Some(store) => store.active_key().await,
-        None => None,
-    };
-    let handle = account_handle(&username, &state.issuer_url);
-    let atproto = atproto_signing.as_ref().zip(handle.as_deref())
-        .map(|(sk, handle)| AtprotoIdentity { p256_vk: sk.verifying_key(), handle });
-
-    let doc = build_did_document(&did, &state.issuer_url, &keys, atproto.as_ref(), &[], None, None);
+fn path_form_account_did_disabled_response() -> Response {
     (
-        StatusCode::OK,
-        [(header::CONTENT_TYPE, "application/did+json")],
-        Json(doc),
-    ).into_response()
+        StatusCode::GONE,
+        "did:web path-form account minting is disabled; host-form account minting is not available yet (#1159)",
+    )
+        .into_response()
 }
 
 /// `GET /clients/:client_id/did.json` — per-client DID document.
@@ -764,6 +718,16 @@ mod tests {
         assert_eq!(issuer_authority("example.com"), None);
     }
 
+    #[tokio::test]
+    async fn path_form_account_document_endpoint_is_a_hard_error() {
+        let response = path_form_account_did_disabled_response();
+        assert_eq!(response.status(), StatusCode::GONE);
+        let body = axum::body::to_bytes(response.into_body(), 4096).await.unwrap();
+        assert!(std::str::from_utf8(&body)
+            .unwrap()
+            .contains("path-form account minting is disabled"));
+    }
+
     #[test]
     fn ipv6_issuer_does_not_synthesize_atproto_handle() {
         assert_eq!(configured_handle_host("https://[::1]:6791"), None);
@@ -794,7 +758,7 @@ mod tests {
     #[test]
     fn build_did_doc_minimum_structure() {
         let sk = SigningKey::generate(&mut OsRng);
-        let did = "did:web:hyprstream.example.com:users:alice";
+        let did = "did:web:alice.hyprstream.example.com";
         let doc = build_did_document(
             did,
             "https://hyprstream.example.com",
@@ -822,7 +786,7 @@ mod tests {
 
     #[test]
     fn build_did_doc_empty_keys_is_valid() {
-        let did = "did:web:example.com:users:alice";
+        let did = "did:web:alice.example.com";
         let doc = build_did_document(did, "https://example.com", &[], None, &[], None, None);
         assert_eq!(doc["id"].as_str().unwrap(), did);
         assert_eq!(doc["verificationMethod"].as_array().unwrap().len(), 0);
