@@ -37,6 +37,9 @@ permissions:
 
 jobs:
   build-arm64:
+    # A CUDA-spike dispatch runs its dedicated job below; avoid consuming a
+    # second Graviton runner with the normal CPU validation at the same time.
+    if: ${{ !inputs.cuda_spike }}
     runs-on: [self-hosted, linux, arm64, graviton, hyprstream-merge-gate]
     timeout-minutes: 150
     steps:
