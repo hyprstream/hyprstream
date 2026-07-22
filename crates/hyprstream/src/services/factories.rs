@@ -1238,6 +1238,7 @@ fn create_oai_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
     let oai_service = OAIService::new(
         config.oai.clone(),
         config.tls.clone(),
+        config.account.clone(),
         server_state,
         ctx.transport("oai", SocketKind::Rep),
         ctx.verifying_key(),
@@ -1305,7 +1306,12 @@ fn create_xet_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
         auth,
     };
 
-    let xet_service = XetService::new(config.xet.clone(), config.tls.clone(), state);
+    let xet_service = XetService::new(
+        config.xet.clone(),
+        config.tls.clone(),
+        config.account.clone(),
+        state,
+    );
 
     Ok(Box::new(xet_service))
 }
@@ -1401,6 +1407,7 @@ fn create_oauth_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnabl
     let mut oauth_service = OAuthService::new(
         config.oauth.clone(),
         config.tls.clone(),
+        config.account.clone(),
         sk,
         ctx.transport("oauth", SocketKind::Rep),
         ctx.verifying_key(),
@@ -1773,6 +1780,7 @@ fn create_mcp_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
 
             let rustls_config = match crate::server::tls::resolve_rustls_config(
                 &mcp_tls_config,
+                &config.account,
                 mcp_tls_cert.as_ref(),
                 mcp_tls_key.as_ref(),
             ).await {
