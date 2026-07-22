@@ -187,6 +187,20 @@ pub struct SecretsConfig {
     /// first run).  `None` → resolved at runtime to `<config_dir>/credentials`.
     #[serde(default)]
     pub path: Option<PathBuf>,
+
+    /// Explicitly declare the secrets profile (layout × posture), one of
+    /// `"shared"` or `"scoped"`. Used only when `CREDENTIALS_DIRECTORY` is
+    /// absent (systemd units get the profile from that env var automatically).
+    ///
+    /// This is the non-spoofable, single-purpose declaration that retires the
+    /// `HYPRSTREAM__SECRETS__PATH` heuristic (#805, #1148): unlike `path`,
+    /// this field's only job is to name the profile, so setting it is a
+    /// deliberate act rather than a side effect of relocating the secrets dir.
+    /// The `HYPRSTREAM__SECRETS__PROFILE` env var overrides this field at
+    /// runtime; either way the value is forwarded to
+    /// [`crate::auth::identity_store::resolve_runtime_secrets_profile`].
+    #[serde(default)]
+    pub profile: Option<String>,
 }
 
 impl SecretsConfig {

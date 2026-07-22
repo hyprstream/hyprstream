@@ -2097,37 +2097,56 @@ fn main() -> Result<()> {
                                         )?,
                                     );
 
-                                    // Load bootstrap pubkeys (all service pubkeys) into trust store
-                                    if let Ok(pubkeys) = hyprstream_core::auth::identity_store::load_bootstrap_pubkeys(&secrets_dir) {
-                                        for (svc_name, vk) in &pubkeys {
-                                            hyprstream_service::global_trust_store().insert(
-                                                *vk,
-                                                hyprstream_service::Attestation {
-                                                    scopes: std::iter::once(svc_name.clone()).collect(),
-                                                    subject: None,
-                                                    jwt: None,
-                                                    expires_at: 0,
-                                                    attested_by: None,
-                                                },
-                                            );
-                                        }
+                                    // Load bootstrap pubkeys (all service pubkeys) into trust store.
+                                    // Hold onto the map for the F3 startup key-consistency
+                                    // interlock below (`assert_key_matches_bootstrap`).
+                                    let bootstrap_pubkeys = hyprstream_core::auth::identity_store::load_bootstrap_pubkeys(&secrets_dir)
+                                        .unwrap_or_default();
+                                    for (svc_name, vk) in &bootstrap_pubkeys {
+                                        hyprstream_service::global_trust_store().insert(
+                                            *vk,
+                                            hyprstream_service::Attestation {
+                                                scopes: std::iter::once(svc_name.clone()).collect(),
+                                                subject: None,
+                                                jwt: None,
+                                                expires_at: 0,
+                                                attested_by: None,
+                                            },
+                                        );
                                     }
 
-                                    // C3 fix: scoped credential providers use flat
-                                    // %d/signing-key, while standalone uses a subdirectory.
-                                    // #759: "policy" always resolves to the flat root/CA key regardless of
-                                    // secrets profile — see `resolve_service_signing_key` for why.
-                                    let secrets_profile = if std::env::var(
-                                        "HYPRSTREAM__SECRETS__PATH",
-                                    )
-                                    .is_ok()
-                                    {
-                                        hyprstream_core::auth::identity_store::SecretsProfile::PerServiceScoped
-                                    } else {
-                                        hyprstream_core::auth::identity_store::SecretsProfile::SharedDirectory
-                                    };
+                                    // #805/#1148 (F2): select the secrets profile from
+                                    // NON-spoofable signals only. The retired heuristic read
+                                    // `HYPRSTREAM__SECRETS__PATH`, which is *also* the general
+                                    // "relocate secrets dir" knob — so an operator or k8s chart
+                                    // pointing it at a shared dir silently flipped every
+                                    // non-policy service onto the flat node/CA root key at
+                                    // runtime. Now: systemd `CREDENTIALS_DIRECTORY` is the
+                                    // honest signal; otherwise an explicit
+                                    // `HYPRSTREAM__SECRETS__PROFILE` / `[secrets] profile`
+                                    // declaration is required; absent either we fail closed.
+                                    let secrets_profile = hyprstream_core::auth::identity_store::resolve_runtime_secrets_profile(
+                                        std::env::var("CREDENTIALS_DIRECTORY").ok().as_deref(),
+                                        std::env::var("HYPRSTREAM__SECRETS__PROFILE")
+                                            .ok()
+                                            .or_else(|| config.secrets.profile.clone())
+                                            .as_deref(),
+                                    )?;
+                                    // #759: "policy" always resolves to the flat root/CA key
+                                    // regardless of secrets profile — see
+                                    // `resolve_service_signing_key` for why.
                                     let own_key = hyprstream_core::auth::identity_store::resolve_service_signing_key(
                                         &secrets_dir, &name, secrets_profile,
+                                    )?;
+
+                                    // #1148 (F3): startup key-consistency interlock — refuse to
+                                    // start if the resolved key is not the key registered for
+                                    // this service's own name (or clashes with a different
+                                    // service's registered key, i.e. the node/CA root key).
+                                    hyprstream_core::auth::identity_store::assert_key_matches_bootstrap(
+                                        &name,
+                                        &own_key,
+                                        &bootstrap_pubkeys,
                                     )?;
 
                                     if name == "policy" {
@@ -2210,9 +2229,21 @@ fn main() -> Result<()> {
                                         let svc_key = hyprstream_core::auth::identity_store::resolve_service_signing_key(
                                             &secrets_dir,
                                             svc_name,
-                                            hyprstream_core::auth::identity_store::SecretsProfile::SharedDirectory,
+                                            // Single-process mode is the standalone default: one
+                                            // shared writable secrets dir, generate-on-missing OK.
+                                            // This is an explicit declaration, NOT the retired
+                                            // HYPRSTREAM__SECRETS__PATH heuristic (#805/#1148).
+                                            hyprstream_core::auth::identity_store::SecretsProfile::standalone(),
                                         )
                                             .with_context(|| format!("Failed to load signing key for service '{}'", svc_name))?;
+                                        // #1148 (F3): runtime key-consistency interlock — refuse
+                                        // to start a service holding a key that is not registered
+                                        // for its own name.
+                                        hyprstream_core::auth::identity_store::assert_key_matches_bootstrap(
+                                            svc_name,
+                                            &svc_key,
+                                            &pubkeys,
+                                        )?;
                                         ctx = ctx.with_service_key(svc_name, svc_key.clone());
 
                                         if svc_name != "policy" {

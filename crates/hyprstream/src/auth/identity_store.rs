@@ -424,7 +424,8 @@ pub fn load_or_generate_node_signing_key(secrets_dir: &std::path::Path) -> Resul
     Ok(key)
 }
 
-/// Describes how a service's credentials directory is scoped.
+/// Directory layout for a file-backed credential provider — where on disk a
+/// service's signing key lives relative to the secrets directory.
 ///
 /// This is deliberately about directory layout rather than a particular
 /// process manager. Both systemd `LoadCredential` directories and projected
@@ -432,13 +433,89 @@ pub fn load_or_generate_node_signing_key(secrets_dir: &std::path::Path) -> Resul
 /// single service, while standalone multi-process deployments share one
 /// writable directory among services.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SecretsProfile {
+pub enum CredentialLayout {
     /// One base directory is shared by all services; non-policy credentials
     /// live under a `{service_name}/` subdirectory.
     SharedDirectory,
     /// The provider has already scoped the directory to one service, so its
     /// credentials use flat names such as `signing-key`.
     PerServiceScoped,
+}
+
+/// Provisioning posture — what happens when a signing-key file is missing.
+///
+/// This is the second, orthogonal axis to [`CredentialLayout`].
+/// `load_or_generate_*` historically conflated "the directory is writable"
+/// with "it is acceptable to mint a key here", which made fail-closed behavior
+/// for read-only provisioned mounts (systemd `%d`, k8s Secret/CSI) an
+/// incidental side effect of `is_writable()` returning false rather than a
+/// declared contract. The posture makes that contract explicit (#805, #1148).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProvisioningPosture {
+    /// The backing directory is writable by this process; a missing key may be
+    /// generated in place. Correct for standalone deployments with a shared
+    /// writable secrets directory.
+    MayGenerate,
+    /// The key must already exist. The mount is read-only and pre-populated by
+    /// a provisioning Job / bootstrap (systemd `%d`, k8s Secret/CSI); a missing
+    /// key is a hard error and we never generate onto a provisioned mount.
+    MustExist,
+}
+
+/// How a service sources its signing identity.
+///
+/// `File` covers every deployment where the signing key is a file on disk;
+/// its two axes ([`CredentialLayout`] × [`ProvisioningPosture`]) are kept
+/// separate so e.g. a k8s projected Secret/CSI mount (#790) can declare
+/// `PerServiceScoped` layout with `MustExist` posture without implying the
+/// writable-directory generate-on-missing behavior of standalone mode.
+///
+/// The remaining variants express identity sources that are *not* a file
+/// lookup and therefore cannot be resolved by [`resolve_service_signing_key`]
+/// — they exist now so the exhaustive match guides callers, and will be wired
+/// by #780/#785 (TokenExchange) and #1136 (DidAnchored, PR #1143).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SecretsProfile {
+    /// File-backed credentials. `layout` says where the key lives and `posture`
+    /// says what happens when it is missing.
+    File {
+        layout: CredentialLayout,
+        posture: ProvisioningPosture,
+    },
+    /// Identity comes from a projected SA-token → WIT exchange (#780/#785);
+    /// there is no signing-key file to resolve.
+    TokenExchange,
+    /// Identity is anchored to a GATE-verified capsule (#1136 / PR #1143); the
+    /// CA and reach come from the capsule, not a file lookup.
+    DidAnchored,
+}
+
+impl SecretsProfile {
+    /// The standalone default: one shared writable directory, may generate.
+    pub const fn standalone() -> Self {
+        SecretsProfile::File {
+            layout: CredentialLayout::SharedDirectory,
+            posture: ProvisioningPosture::MayGenerate,
+        }
+    }
+}
+
+/// Read and decode a 32-byte Ed25519 signing-key seed from `dir/name`, without
+/// ever writing. Returns `Ok(None)` when the file is absent.
+fn read_signing_key_file(dir: &std::path::Path, name: &str) -> Result<Option<SigningKey>> {
+    match read_secret(dir, name)? {
+        Some(mut bytes) => {
+            let mut arr: [u8; 32] = bytes
+                .as_slice()
+                .try_into()
+                .map_err(|_| anyhow!("secret '{name}' must be 32 bytes (Ed25519 seed)"))?;
+            let sk = SigningKey::from_bytes(&arr);
+            bytes.zeroize();
+            arr.zeroize();
+            Ok(Some(sk))
+        }
+        None => Ok(None),
+    }
 }
 
 /// Resolve the Ed25519 signing key a service process should use to sign its
@@ -462,26 +539,222 @@ pub enum SecretsProfile {
 /// by unexpected key" (#759) — a sibling gap to the CA-derivation fallback
 /// #441 already removed from `resolve_service_key`.
 ///
-/// - [`SecretsProfile::PerServiceScoped`]: the credential provider already
+/// # Layout × posture
+///
+/// - [`CredentialLayout::PerServiceScoped`]: the credential provider already
 ///   scopes `secrets_dir` to that one service, so the flat top-level file is
 ///   correct for every service, policy included.
-/// - [`SecretsProfile::SharedDirectory`]: `secrets_dir` is shared across every
-///   spawned service process, so non-policy services use a `{service_name}/`
-///   subdirectory to avoid collisions — but policy must still resolve to the
-///   flat root/CA key, matching what bootstrap registered.
+/// - [`CredentialLayout::SharedDirectory`]: `secrets_dir` is shared across
+///   every spawned service process, so non-policy services use a
+///   `{service_name}/` subdirectory to avoid collisions — but policy must
+///   still resolve to the flat root/CA key, matching what bootstrap registered.
+///
+/// `posture` governs only the missing-file case: `MayGenerate` preserves the
+/// historical standalone generate-on-missing behavior; `MustExist` fails
+/// closed (systemd `%d`, k8s Secret/CSI). It never changes which file is
+/// consulted.
+///
+/// [`SecretsProfile::TokenExchange`] / [`SecretsProfile::DidAnchored`] have no
+/// file to resolve and fail closed until their resolvers are wired (#780,
+/// #1136).
 pub fn resolve_service_signing_key(
     secrets_dir: &std::path::Path,
     service_name: &str,
     profile: SecretsProfile,
 ) -> Result<SigningKey> {
-    match (profile, service_name) {
-        (_, "policy") | (SecretsProfile::PerServiceScoped, _) => {
-            load_or_generate_node_signing_key(secrets_dir)
-        }
-        (SecretsProfile::SharedDirectory, _) => {
+    match profile {
+        SecretsProfile::File { layout, posture } => match layout {
+            CredentialLayout::PerServiceScoped => {
+                // The provider scoped the dir to this one service, so the flat
+                // top-level file is correct for every service, policy included.
+                load_flat_signing_key(secrets_dir, posture)
+            }
+            CredentialLayout::SharedDirectory => {
+                if service_name == "policy" {
+                    // #759: PolicyService's identity IS the flat root/CA key.
+                    load_flat_signing_key(secrets_dir, posture)
+                } else {
+                    load_per_service_signing_key(secrets_dir, service_name, posture)
+                }
+            }
+        },
+        SecretsProfile::TokenExchange => Err(anyhow!(
+            "TokenExchange secrets profile does not resolve a signing key from disk; \
+             identity is established via a projected SA-token → WIT exchange \
+             (#780/#785) whose resolver is not yet wired"
+        )),
+        SecretsProfile::DidAnchored => Err(anyhow!(
+            "DidAnchored secrets profile derives identity from a GATE-verified capsule \
+             (#1136 / PR #1143); no file-based key resolver is wired yet"
+        )),
+    }
+}
+
+/// Flat `{secrets_dir}/signing-key` (the node/CA root-key path), honoring posture.
+fn load_flat_signing_key(
+    secrets_dir: &std::path::Path,
+    posture: ProvisioningPosture,
+) -> Result<SigningKey> {
+    match posture {
+        ProvisioningPosture::MayGenerate => load_or_generate_node_signing_key(secrets_dir),
+        ProvisioningPosture::MustExist => read_signing_key_file(secrets_dir, "signing-key")?
+            .ok_or_else(|| missing_in_readonly(secrets_dir, "signing-key")),
+    }
+}
+
+/// Per-service `{secrets_dir}/{service}/signing-key`, honoring posture.
+fn load_per_service_signing_key(
+    secrets_dir: &std::path::Path,
+    service_name: &str,
+    posture: ProvisioningPosture,
+) -> Result<SigningKey> {
+    match posture {
+        ProvisioningPosture::MayGenerate => {
             load_or_generate_service_signing_key(secrets_dir, service_name)
         }
+        ProvisioningPosture::MustExist => {
+            validate_service_name(service_name)?;
+            let service_dir = secrets_dir.join(service_name);
+            read_signing_key_file(&service_dir, "signing-key")?
+                .ok_or_else(|| missing_in_readonly(&service_dir, "signing-key"))
+        }
     }
+}
+
+/// Startup key-consistency interlock — the runtime backstop for #805/#1148
+/// (also called for by the #774 review and #805).
+///
+/// A service that boots holding a signing key that is not the key registered
+/// for its own name in `bootstrap_pubkeys` must refuse to start. This catches
+/// a wrong-key load **regardless of how the [`SecretsProfile`] was selected**
+/// — including the #805 vector where a non-policy service accidentally loads
+/// the flat node/CA root key, whose pubkey is registered for `"policy"` and
+/// not for the service's own name. It turns the cryptic downstream "Response
+/// signed by unexpected key" (#759) into a loud, immediate failure before the
+/// key is ever used to sign.
+///
+/// Two checks, both fail-closed:
+/// (a) if a key is registered for `service_name`, `own_key` must match it;
+/// (b) otherwise `own_key` must not clash with a key registered for a
+///     *different* name (the root/CA-key escalation signature).
+///
+/// A name with no entry at all is allowed (not every service is in
+/// bootstrap-pubkeys); the interlock's job is to catch *mismatches*, which
+/// requires a registered expected key to compare against.
+pub fn assert_key_matches_bootstrap(
+    service_name: &str,
+    own_key: &SigningKey,
+    bootstrap_pubkeys: &std::collections::HashMap<String, VerifyingKey>,
+) -> Result<()> {
+    let own_vk = own_key.verifying_key();
+    let own_b64 = URL_SAFE_NO_PAD.encode(own_vk.as_bytes());
+
+    // (a) Our own name has a registered pubkey — our key must equal it.
+    if let Some(expected) = bootstrap_pubkeys.get(service_name) {
+        if expected != &own_vk {
+            let expected_b64 = URL_SAFE_NO_PAD.encode(expected.as_bytes());
+            return Err(anyhow!(
+                "service '{service_name}' booted with a signing key whose pubkey ({own_b64}) \
+                 does not match the pubkey ({expected_b64}) registered for its own name in \
+                 bootstrap-pubkeys. Refusing to start — startup key-consistency interlock \
+                 (#1148, #805, #759); a mismatched key would make this service's RPC responses \
+                 fail verification and may indicate it loaded the wrong (e.g. node/CA root) key"
+            ));
+        }
+        return Ok(());
+    }
+
+    // (b) Our name is not registered. Our key must not match a key registered
+    // for a different name — that is the root/CA-key escalation signature
+    // (a non-policy service holding policy's root key).
+    let clashes: Vec<&str> = bootstrap_pubkeys
+        .iter()
+        .filter(|(_, vk)| **vk == own_vk)
+        .map(|(name, _)| name.as_str())
+        .collect();
+    if !clashes.is_empty() {
+        return Err(anyhow!(
+            "service '{service_name}' booted holding a signing key whose pubkey ({own_b64}) is \
+             registered in bootstrap-pubkeys for a different service {clashes:?}. A non-policy \
+             service must never hold another service's (e.g. the node/CA root) key. Refusing to \
+             start (#805, #1148)"
+        ));
+    }
+    Ok(())
+}
+
+/// Decide the runtime [`SecretsProfile`] from non-spoofable signals only.
+///
+/// This replaces the retired `HYPRSTREAM__SECRETS__PATH` heuristic (#805,
+/// #1148/F2). That env var is *also* the general "relocate the secrets dir"
+/// knob, so an operator (or a k8s chart, which would naturally set it)
+/// pointing it at a shared directory used to flip every non-policy service
+/// onto the flat node/CA root key at runtime — an escalation the install-time
+/// guard in #1142 cannot see for standalone, manual, or k8s deployments.
+///
+/// Precedence (highest first):
+/// 1. `credentials_directory` — the value of systemd's `CREDENTIALS_DIRECTORY`
+///    export. It has no other meaning, so its presence is the honest signal
+///    that the dir is already scoped to one service and is the read-only
+///    product of `LoadCredential=`. Cannot be "set by accident".
+/// 2. `configured_profile` — a single-purpose declaration sourced from the
+///    `[secrets] profile` config field or the dedicated
+///    `HYPRSTREAM__SECRETS__PROFILE` env var. The only job of either is to
+///    name the profile, so setting one is a deliberate act — unlike the
+///    dual-purpose `HYPRSTREAM__SECRETS__PATH`. Accepted values: `shared`,
+///    `scoped`.
+/// 3. Otherwise: fail closed. Never infer the profile from an inherited,
+///    dual-purpose environment.
+///
+/// The caller is expected to pass already-resolved strings (env + config
+/// decoded at the binary boundary) so this function is pure and unit-testable.
+pub fn resolve_runtime_secrets_profile(
+    credentials_directory: Option<&str>,
+    configured_profile: Option<&str>,
+) -> Result<SecretsProfile> {
+    // (1) systemd CREDENTIALS_DIRECTORY — the honest, non-spoofable signal.
+    if credentials_directory
+        .map(|s| !s.is_empty())
+        .unwrap_or(false)
+    {
+        return Ok(SecretsProfile::File {
+            layout: CredentialLayout::PerServiceScoped,
+            posture: ProvisioningPosture::MustExist,
+        });
+    }
+
+    // (2) Explicit single-purpose declaration.
+    if let Some(raw) = configured_profile {
+        let normalized = raw.trim().to_ascii_lowercase();
+        return match normalized.as_str() {
+            "scoped" => Ok(SecretsProfile::File {
+                layout: CredentialLayout::PerServiceScoped,
+                posture: ProvisioningPosture::MustExist,
+            }),
+            "shared" => Ok(SecretsProfile::File {
+                layout: CredentialLayout::SharedDirectory,
+                posture: ProvisioningPosture::MayGenerate,
+            }),
+            other => Err(anyhow!(
+                "HYPRSTREAM__SECRETS__PROFILE='{}' is not one of: shared, scoped. \
+                 Set 'scoped' for systemd LoadCredential= / k8s projected Secret/CSI mounts, \
+                 or 'shared' for a standalone writable secrets directory (#805, #1148).",
+                other
+            )),
+        };
+    }
+
+    // (3) Neither signal present — fail closed. Do NOT consult
+    //     HYPRSTREAM__SECRETS__PATH: it is also the secrets-dir relocate
+    //     knob, so guessing from it is the #805 spoofable heuristic.
+    Err(anyhow!(
+        "secrets profile is not declared. systemd units get it automatically from \
+         CREDENTIALS_DIRECTORY; standalone and k8s deployments must set either \
+         HYPRSTREAM__SECRETS__PROFILE=shared|scoped or [secrets] profile in config. \
+         (Refusing to guess from HYPRSTREAM__SECRETS__PATH — that var is also the \
+         secrets-dir relocate knob, so inferring the profile from it is the #805 \
+         spoofable-by-accident heuristic.) See #1148."
+    ))
 }
 
 // The `#atproto` commit-signing key is NOT loaded here. It is the *active* key
@@ -1342,7 +1615,7 @@ mod tests {
         // this must equal the root key bootstrap registered, not a freshly
         // minted independent key.
         let resolved =
-            resolve_service_signing_key(dir.path(), "policy", SecretsProfile::SharedDirectory)
+            resolve_service_signing_key(dir.path(), "policy", SecretsProfile::standalone())
                 .unwrap();
         assert_eq!(
             resolved.to_bytes(), root_key.to_bytes(),
@@ -1360,9 +1633,15 @@ mod tests {
     fn test_resolve_service_signing_key_policy_matches_root_key_when_scoped() {
         let dir = TempDir::new().unwrap();
         let root_key = load_or_generate_node_signing_key(dir.path()).unwrap();
-        let resolved =
-            resolve_service_signing_key(dir.path(), "policy", SecretsProfile::PerServiceScoped)
-                .unwrap();
+        let resolved = resolve_service_signing_key(
+            dir.path(),
+            "policy",
+            SecretsProfile::File {
+                layout: CredentialLayout::PerServiceScoped,
+                posture: ProvisioningPosture::MustExist,
+            },
+        )
+        .unwrap();
         assert_eq!(resolved.to_bytes(), root_key.to_bytes());
     }
 
@@ -1370,9 +1649,15 @@ mod tests {
     fn test_resolve_service_signing_key_non_policy_uses_flat_key_when_scoped() {
         let dir = TempDir::new().unwrap();
         let flat_key = load_or_generate_node_signing_key(dir.path()).unwrap();
-        let resolved =
-            resolve_service_signing_key(dir.path(), "model", SecretsProfile::PerServiceScoped)
-                .unwrap();
+        let resolved = resolve_service_signing_key(
+            dir.path(),
+            "model",
+            SecretsProfile::File {
+                layout: CredentialLayout::PerServiceScoped,
+                posture: ProvisioningPosture::MustExist,
+            },
+        )
+        .unwrap();
 
         assert_eq!(resolved.to_bytes(), flat_key.to_bytes());
         assert!(!dir.path().join("model").exists());
@@ -1384,7 +1669,7 @@ mod tests {
         let root_key = load_or_generate_node_signing_key(dir.path()).unwrap();
 
         let model_key =
-            resolve_service_signing_key(dir.path(), "model", SecretsProfile::SharedDirectory)
+            resolve_service_signing_key(dir.path(), "model", SecretsProfile::standalone())
                 .unwrap();
         assert_ne!(
             model_key.to_bytes(), root_key.to_bytes(),
@@ -1404,19 +1689,270 @@ mod tests {
         let _root_key = load_or_generate_node_signing_key(dir.path()).unwrap();
 
         let policy_1 =
-            resolve_service_signing_key(dir.path(), "policy", SecretsProfile::SharedDirectory)
+            resolve_service_signing_key(dir.path(), "policy", SecretsProfile::standalone())
                 .unwrap();
         let policy_2 =
-            resolve_service_signing_key(dir.path(), "policy", SecretsProfile::SharedDirectory)
+            resolve_service_signing_key(dir.path(), "policy", SecretsProfile::standalone())
                 .unwrap();
         assert_eq!(policy_1.to_bytes(), policy_2.to_bytes());
 
         let model_1 =
-            resolve_service_signing_key(dir.path(), "model", SecretsProfile::SharedDirectory)
+            resolve_service_signing_key(dir.path(), "model", SecretsProfile::standalone())
                 .unwrap();
         let model_2 =
-            resolve_service_signing_key(dir.path(), "model", SecretsProfile::SharedDirectory)
+            resolve_service_signing_key(dir.path(), "model", SecretsProfile::standalone())
                 .unwrap();
         assert_eq!(model_1.to_bytes(), model_2.to_bytes());
+    }
+
+    // ── #1148: provisioning posture is honored, not inferred from writability ──
+
+    #[test]
+    fn test_must_exist_posture_refuses_to_generate_flat_key() {
+        // Read-only provisioned mount (systemd %d / k8s Secret/CSI): a missing
+        // flat key must be a hard error, never a silent generation that mints a
+        // fresh node/CA root key the rest of the fleet does not know.
+        let dir = TempDir::new().unwrap();
+        let err = resolve_service_signing_key(
+            dir.path(),
+            "policy",
+            SecretsProfile::File {
+                layout: CredentialLayout::PerServiceScoped,
+                posture: ProvisioningPosture::MustExist,
+            },
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("signing-key"),
+            "MustExist error should name the missing file: {msg}"
+        );
+        assert!(
+            !dir.path().join("signing-key").exists(),
+            "MustExist must not write a key"
+        );
+    }
+
+    #[test]
+    fn test_must_exist_posture_refuses_to_generate_per_service_key() {
+        let dir = TempDir::new().unwrap();
+        let err = resolve_service_signing_key(
+            dir.path(),
+            "model",
+            SecretsProfile::File {
+                layout: CredentialLayout::SharedDirectory,
+                posture: ProvisioningPosture::MustExist,
+            },
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("signing-key"),
+            "MustExist error should name the missing file"
+        );
+        assert!(
+            !dir.path().join("model").exists(),
+            "MustExist must not create the service subdir"
+        );
+    }
+
+    #[test]
+    fn test_must_exist_posture_reads_existing_flat_key() {
+        let dir = TempDir::new().unwrap();
+        let root_key = load_or_generate_node_signing_key(dir.path()).unwrap();
+        let resolved = resolve_service_signing_key(
+            dir.path(),
+            "policy",
+            SecretsProfile::File {
+                layout: CredentialLayout::PerServiceScoped,
+                posture: ProvisioningPosture::MustExist,
+            },
+        )
+        .unwrap();
+        assert_eq!(resolved.to_bytes(), root_key.to_bytes());
+    }
+
+    // ── #1148 F4: TokenExchange / DidAnchored fail closed (not yet wired) ──
+
+    #[test]
+    fn test_token_exchange_profile_fails_closed() {
+        let dir = TempDir::new().unwrap();
+        // Even with a key on disk, TokenExchange must not resolve it as a file
+        // — its resolver (#780/#785) is not wired.
+        load_or_generate_node_signing_key(dir.path()).unwrap();
+        let err = resolve_service_signing_key(dir.path(), "model", SecretsProfile::TokenExchange)
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("TokenExchange"), "{msg}");
+        assert!(msg.contains("#780"), "{msg}");
+    }
+
+    #[test]
+    fn test_did_anchored_profile_fails_closed() {
+        let dir = TempDir::new().unwrap();
+        load_or_generate_node_signing_key(dir.path()).unwrap();
+        let err = resolve_service_signing_key(dir.path(), "model", SecretsProfile::DidAnchored)
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("DidAnchored"), "{msg}");
+        assert!(msg.contains("#1136"), "{msg}");
+    }
+
+    // ── #1148 F2: the spoofable HYPRSTREAM__SECRETS__PATH heuristic is gone ──
+
+    #[test]
+    fn test_resolve_runtime_secrets_profile_systemd_credentials_directory() {
+        // systemd's CREDENTIALS_DIRECTORY is the honest, non-spoofable signal —
+        // it has no other meaning, so its presence declares "scoped + read-only".
+        let creds_dir = "/run/credentials/hyprstream.service";
+        let profile = resolve_runtime_secrets_profile(Some(creds_dir), None).unwrap();
+        assert_eq!(
+            profile,
+            SecretsProfile::File {
+                layout: CredentialLayout::PerServiceScoped,
+                posture: ProvisioningPosture::MustExist,
+            }
+        );
+    }
+
+    #[test]
+    fn test_resolve_runtime_secrets_profile_explicit_shared_declaration() {
+        // A single-purpose declaration: the only job of HYPRSTREAM__SECRETS__PROFILE
+        // (or [secrets] profile) is to name the profile, so setting it is deliberate.
+        let profile = resolve_runtime_secrets_profile(None, Some("shared")).unwrap();
+        assert_eq!(profile, SecretsProfile::standalone());
+    }
+
+    #[test]
+    fn test_resolve_runtime_secrets_profile_explicit_scoped_declaration() {
+        let profile = resolve_runtime_secrets_profile(None, Some("scoped")).unwrap();
+        assert_eq!(
+            profile,
+            SecretsProfile::File {
+                layout: CredentialLayout::PerServiceScoped,
+                posture: ProvisioningPosture::MustExist,
+            }
+        );
+    }
+
+    #[test]
+    fn test_resolve_runtime_secrets_profile_rejects_unknown_declaration() {
+        let err = resolve_runtime_secrets_profile(None, Some("heap")).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("heap"), "{msg}");
+        assert!(msg.contains("shared") && msg.contains("scoped"), "{msg}");
+    }
+
+    #[test]
+    fn test_resolve_runtime_secrets_profile_fails_closed_with_no_signal() {
+        // F2 core guarantee: with no honest signal and no explicit declaration,
+        // we fail closed — we do NOT infer from HYPRSTREAM__SECRETS__PATH. This
+        // is the regression for the retired spoofable heuristic.
+        let err = resolve_runtime_secrets_profile(None, None).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("not declared"), "{msg}");
+        assert!(
+            msg.contains("HYPRSTREAM__SECRETS__PATH"),
+            "error should explain why PATH is no longer consulted: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_resolve_runtime_secrets_profile_ignores_empty_credentials_directory() {
+        // An empty CREDENTIALS_DIRECTORY is not an honest signal — fall through
+        // to the explicit declaration rather than silently treating empty as set.
+        let profile = resolve_runtime_secrets_profile(Some(""), Some("shared")).unwrap();
+        assert_eq!(profile, SecretsProfile::standalone());
+    }
+
+    /// The end-to-end F2 guarantee: a non-policy service can no longer be
+    /// flipped onto the flat node/CA root key by the legacy heuristic.
+    ///
+    /// Before #1148, `HYPRSTREAM__SECRETS__PATH` being set selected the
+    /// `PerServiceScoped` layout, which resolved every service (policy and
+    /// non-policy alike) to the flat `signing-key` — i.e. the node/CA root
+    /// key. This test proves that path is gone: the heuristic env var is not
+    /// consulted at all, and without an honest signal the profile resolution
+    /// fails closed. (Verified by reverting: under the old code, this setup
+    /// returned the root key for "model".)
+    #[test]
+    fn test_spoofed_secrets_path_can_no_longer_flip_non_policy_to_root_key() {
+        let dir = TempDir::new().unwrap();
+        let root_key = load_or_generate_node_signing_key(dir.path()).unwrap();
+
+        // Simulate the binary boundary: HYPRSTREAM__SECRETS__PATH is set (the
+        // spoofable knob), but neither CREDENTIALS_DIRECTORY nor an explicit
+        // profile declaration is present. main.rs forwards only the honest
+        // signals to resolve_runtime_secrets_profile — PATH is NOT among them.
+        let profile = resolve_runtime_secrets_profile(None, None);
+        assert!(
+            profile.is_err(),
+            "no honest signal ⇒ must fail closed, not infer from HYPRSTREAM__SECRETS__PATH"
+        );
+
+        // And even if an operator explicitly opts into the scoped layout, the
+        // F3 interlock (below) catches the resulting root-key load for a
+        // non-policy service. Demonstrate the clash the interlock would catch:
+        let mut bootstrap = std::collections::HashMap::new();
+        bootstrap.insert("policy".to_owned(), root_key.verifying_key());
+        let err = assert_key_matches_bootstrap("model", &root_key, &bootstrap).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("different service"),
+            "interlock must flag a non-policy service holding policy's root key: {msg}"
+        );
+        assert!(msg.contains("policy"), "{msg}");
+    }
+
+    // ── #1148 F3: startup key-consistency interlock ──
+
+    #[test]
+    fn test_assert_key_matches_bootstrap_accepts_matching_key() {
+        let key = SigningKey::generate(&mut rand::rngs::OsRng);
+        let mut bootstrap = std::collections::HashMap::new();
+        bootstrap.insert("model".to_owned(), key.verifying_key());
+        // The registered key for "model" matches ⇒ ok.
+        assert_key_matches_bootstrap("model", &key, &bootstrap).unwrap();
+    }
+
+    #[test]
+    fn test_assert_key_matches_bootstrap_rejects_mismatched_key() {
+        let registered = SigningKey::generate(&mut rand::rngs::OsRng);
+        let booted = SigningKey::generate(&mut rand::rngs::OsRng);
+        let mut bootstrap = std::collections::HashMap::new();
+        bootstrap.insert("model".to_owned(), registered.verifying_key());
+        let err = assert_key_matches_bootstrap("model", &booted, &bootstrap).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("model"), "{msg}");
+        assert!(msg.contains("does not match"), "{msg}");
+        assert!(msg.contains("interlock"), "{msg}");
+    }
+
+    #[test]
+    fn test_assert_key_matches_bootstrap_rejects_root_key_clash() {
+        // The #805 vector: a non-policy service ("model") boots holding the
+        // node/CA root key, whose pubkey is registered for "policy". The
+        // interlock must refuse even though "model" itself has no entry.
+        let root_key = SigningKey::generate(&mut rand::rngs::OsRng);
+        let mut bootstrap = std::collections::HashMap::new();
+        bootstrap.insert("policy".to_owned(), root_key.verifying_key());
+        let err = assert_key_matches_bootstrap("model", &root_key, &bootstrap).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("different service"),
+            "must flag cross-name clash: {msg}"
+        );
+        assert!(msg.contains("policy"), "{msg}");
+    }
+
+    #[test]
+    fn test_assert_key_matches_bootstrap_allows_unregistered_name_with_fresh_key() {
+        // A service whose name is not in bootstrap-pubkeys and whose key does
+        // not clash with any registered name is allowed — the interlock catches
+        // *mismatches*, and there is nothing to mismatch against here.
+        let fresh = SigningKey::generate(&mut rand::rngs::OsRng);
+        let other = SigningKey::generate(&mut rand::rngs::OsRng);
+        let mut bootstrap = std::collections::HashMap::new();
+        bootstrap.insert("policy".to_owned(), other.verifying_key());
+        assert_key_matches_bootstrap("discovery", &fresh, &bootstrap).unwrap();
     }
 }
