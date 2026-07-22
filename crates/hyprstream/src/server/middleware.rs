@@ -1,7 +1,7 @@
 //! Middleware for authentication, logging, and request processing
 
 use crate::auth::jwt;
-use crate::server::state::ServerState;
+use crate::server::state::{ResourceAuthState, ServerState};
 use axum::{
     extract::{Request, State},
     http::{header, HeaderValue, StatusCode},
@@ -51,7 +51,7 @@ impl std::fmt::Debug for AuthenticatedUser {
 ///
 /// On success, inserts `AuthenticatedUser` into request extensions.
 pub async fn auth_middleware(
-    State(state): State<ServerState>,
+    State(state): State<ResourceAuthState>,
     mut request: Request,
     next: Next,
 ) -> Response {
@@ -91,7 +91,7 @@ pub async fn auth_middleware(
     // ticket validator (H1a / #764). DPoP sender-binding is enforced below,
     // after we hold the claims, because it is header/scheme-specific.
     let local_issuers: &[&str] = &[&*state.oauth_issuer_url];
-    let claims = match verify_token_claims(&state, &token).await {
+    let claims = match verify_resource_token_claims(&state, &token).await {
         Ok(c) => c,
         Err(reason) => {
             warn!(client_ip = %client_ip, method = %method, path = %path, reason, "Auth failure");
@@ -251,7 +251,7 @@ impl RateLimiter {
 /// Defaults: 300 requests per 60-second window (~5 req/s sustained).
 /// Returns 429 when the window quota is exceeded.
 pub async fn rate_limit_middleware(
-    State(state): State<ServerState>,
+    State(state): State<ResourceAuthState>,
     request: Request,
     next: Next,
 ) -> Response {
@@ -398,8 +398,8 @@ fn local_issuer_matches(claims: &jwt::Claims, expected: &str) -> bool {
     claims.iss == expected
 }
 
-pub(crate) async fn verify_token_claims(
-    state: &ServerState,
+async fn verify_resource_token_claims(
+    state: &ResourceAuthState,
     token: &str,
 ) -> Result<jwt::Claims, &'static str> {
     if !token.contains('.') {
@@ -427,7 +427,7 @@ pub(crate) async fn verify_token_claims(
         // MAC/key-rotation path populates at boot and after each ML-DSA rotation.
         // Empty under Classical policy or before the OAuth store is provisioned —
         // in which case a composite token simply fails closed here.
-        let published_composite = { hyprstream_rpc::auth::global_composite_key_set().snapshot() };
+        let published_composite = state.composite_key_set.snapshot();
         let claims = decode_local_multi_key(
             token,
             &state.verifying_key,
@@ -462,8 +462,15 @@ pub(crate) async fn verify_token_claims(
     Ok(claims)
 }
 
+pub(crate) async fn verify_token_claims(
+    state: &ServerState,
+    token: &str,
+) -> Result<jwt::Claims, &'static str> {
+    verify_resource_token_claims(&state.resource_auth_state(), token).await
+}
+
 /// Build WWW-Authenticate header value with resource_metadata URL (RFC 9728).
-fn build_www_authenticate(state: &ServerState) -> String {
+fn build_www_authenticate(state: &ResourceAuthState) -> String {
     let resource_metadata_url = format!(
         "{}/.well-known/oauth-protected-resource",
         state.resource_url

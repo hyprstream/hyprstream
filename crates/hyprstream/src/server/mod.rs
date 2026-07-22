@@ -44,6 +44,7 @@ pub fn create_app(state: ServerState) -> Router {
     // Clone config for middleware
     let cors_config = state.config.cors.clone();
     let timeout_duration = Duration::from_secs(state.config.request_timeout_secs);
+    let resource_auth_state = state.resource_auth_state();
 
     // Public browser provisioning is independently rate-limited before the
     // handler can resolve accepted state or perform hybrid signing.
@@ -92,11 +93,11 @@ pub fn create_app(state: ServerState) -> Router {
         .nest("/models", routes::models::create_router())
         // rate_limit added first (inner) → runs after auth sees the authenticated subject
         .layer(axum_middleware::from_fn_with_state(
-            state.clone(),
+            resource_auth_state.clone(),
             middleware::rate_limit_middleware,
         ))
         .layer(axum_middleware::from_fn_with_state(
-            state.clone(),
+            resource_auth_state,
             middleware::auth_middleware,
         ));
 
