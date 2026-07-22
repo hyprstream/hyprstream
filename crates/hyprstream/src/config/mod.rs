@@ -161,6 +161,16 @@ pub struct HyprConfig {
     #[serde(default)]
     pub secrets: SecretsConfig,
 
+    /// Public self-certifying cluster identity pin used by the explicit
+    /// DID-anchored deployment trust source (#1136).
+    /// Must be configured together with `cluster_did_web`.
+    #[serde(default)]
+    pub cluster_at9p_did: Option<String>,
+
+    /// Public did:web alias/discovery anchor paired with `cluster_at9p_did`.
+    #[serde(default)]
+    pub cluster_did_web: Option<String>,
+
     /// Phase-1 cellular-ledger local-enforcer configuration (epic #922, #925).
     ///
     /// Only present when the `ledger` cargo feature is enabled; `enabled`
@@ -2016,6 +2026,8 @@ pub struct HyprConfigBuilder {
     discovery: DiscoveryServiceConfig,
     tui: TuiServiceConfig,
     metrics: MetricsConfig,
+    cluster_at9p_did: Option<String>,
+    cluster_did_web: Option<String>,
 }
 
 impl HyprConfigBuilder {
@@ -2045,6 +2057,8 @@ impl HyprConfigBuilder {
             discovery: DiscoveryServiceConfig::default(),
             tui: TuiServiceConfig::default(),
             metrics: MetricsConfig::default(),
+            cluster_at9p_did: None,
+            cluster_did_web: None,
         }
     }
 
@@ -2074,6 +2088,8 @@ impl HyprConfigBuilder {
             discovery: config.discovery,
             tui: config.tui,
             metrics: config.metrics,
+            cluster_at9p_did: config.cluster_at9p_did,
+            cluster_did_web: config.cluster_did_web,
         }
     }
 
@@ -2120,6 +2136,8 @@ impl HyprConfigBuilder {
             metrics: self.metrics,
             signing_key: None,
             secrets: Default::default(),
+            cluster_at9p_did: self.cluster_at9p_did,
+            cluster_did_web: self.cluster_did_web,
             #[cfg(feature = "ledger")]
             ledger: Default::default(),
         }
@@ -2632,6 +2650,26 @@ mod tests {
 
     /// Serialize process-env mutations for secrets-dir resolver tests.
     static SECRETS_DIR_ENV_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn public_cluster_did_anchors_deserialize_from_root_config() {
+        let config: HyprConfig = toml::from_str(
+            r#"
+cluster_at9p_did = "did:at9p:bafyclusterpin"
+cluster_did_web = "did:web:discovery.hyprstream.com"
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            config.cluster_at9p_did.as_deref(),
+            Some("did:at9p:bafyclusterpin")
+        );
+        assert_eq!(
+            config.cluster_did_web.as_deref(),
+            Some("did:web:discovery.hyprstream.com")
+        );
+    }
 
     #[test]
     #[allow(clippy::unwrap_used)]

@@ -1455,8 +1455,15 @@ fn resolve_service_vk(service_name: &str) -> Option<VerifyingKey> {
     trust.resolve_one(service_name)
 }
 
-fn install_process_production_resolver(signing_key: &SigningKey) -> Result<()> {
-    hyprstream_discovery::bootstrap_deployment_process(signing_key.clone())?;
+async fn install_process_production_resolver(
+    signing_key: &SigningKey,
+    config: &HyprConfig,
+) -> Result<()> {
+    let trust_source = hyprstream_discovery::DeploymentTrustSource::from_anchors(
+        config.cluster_at9p_did.as_deref(),
+        config.cluster_did_web.as_deref(),
+    )?;
+    hyprstream_discovery::bootstrap_deployment_process(signing_key.clone(), trust_source).await?;
     hyprstream_rpc::envelope::install_browser_currentness_verifier(
         hyprstream_discovery::production_browser_currentness_verifier()?,
     )
@@ -1896,7 +1903,7 @@ fn main() -> Result<()> {
             let signing_key = load_or_generate_signing_key(&keys_dir).await?;
             let verifying_key = signing_key.verifying_key();
 
-            install_process_production_resolver(&signing_key)
+            install_process_production_resolver(&signing_key, &config).await
                 .context("Failed to install checkpoint-backed production resolver")?;
             let client = hyprstream_core::services::RegistryClient::from_resolver(
                 signing_key.clone(),
@@ -2865,10 +2872,10 @@ mod resolver_startup_controls {
             .next()
             .expect("production binary source");
         let startup = production
-            .find("install_process_production_resolver(&signing_key)")
+            .find("install_process_production_resolver(&signing_key, &config).await")
             .expect("trusted startup boundary");
         let install = production[startup..]
-            .find("install_process_production_resolver(&signing_key)")
+            .find("install_process_production_resolver(&signing_key, &config).await")
             .expect("process resolver install");
         let first_generated = production[startup..]
             .find("RegistryClient::from_resolver(")
@@ -2880,7 +2887,7 @@ mod resolver_startup_controls {
         assert!(first_generated < command_dispatch);
         assert_eq!(
             production
-                .matches("install_process_production_resolver(&signing_key)")
+                .matches("install_process_production_resolver(&signing_key, &config).await")
                 .count(),
             1
         );
