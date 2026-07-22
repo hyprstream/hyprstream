@@ -37,8 +37,22 @@ LIBTORCH_CACHE_DIR="${LIBTORCH_CACHE_DIR:-$SCRIPT_DIR/libtorch-cache}"
 BUILD_DIR="$SCRIPT_DIR/build"
 OUTPUT_DIR="$SCRIPT_DIR/output"
 
-# All variants
-ALL_VARIANTS=(cpu cuda128 cuda130 rocm71)
+# AppImage tooling and the upstream GPU libtorch archives are architecture
+# specific. aarch64 currently has a CPU libtorch only (from the PyTorch wheel).
+case "${HYPRSTREAM_APPIMAGE_ARCH:-$(uname -m)}" in
+    x86_64|amd64) APPIMAGE_ARCH=x86_64 ;;
+    aarch64|arm64) APPIMAGE_ARCH=aarch64 ;;
+    *) echo "[ERROR] Unsupported AppImage architecture: $(uname -m)" >&2; exit 1 ;;
+esac
+
+# GPU AppImages are currently x86_64-only because upstream does not publish
+# aarch64 CUDA/ROCm libtorch archives. The arm64 CI job supplies the CPU
+# libtorch directory from the official PyTorch aarch64 wheel.
+if [[ "$APPIMAGE_ARCH" == "aarch64" ]]; then
+    ALL_VARIANTS=(cpu)
+else
+    ALL_VARIANTS=(cpu cuda128 cuda130 rocm71)
+fi
 
 # libtorch download URLs
 declare -A LIBTORCH_URLS=(
@@ -71,6 +85,10 @@ validate_variant() {
     if [[ "$variant" == "all" ]] || [[ "$variant" == "universal" ]]; then
         return 0
     fi
+    if [[ "$APPIMAGE_ARCH" == "aarch64" && "$variant" != "cpu" ]]; then
+        log_error "AppImage variant $variant is unavailable on aarch64 (CPU only)"
+        exit 1
+    fi
     if [[ ! "${LIBTORCH_URLS[$variant]+isset}" ]]; then
         log_error "Invalid variant: $variant"
         log_error "Valid variants: ${ALL_VARIANTS[*]} universal all"
@@ -92,13 +110,16 @@ ensure_appimagetool() {
 
     log_info "Downloading appimagetool..."
     curl -sSL -o "$APPIMAGETOOL" \
-        "https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage"
+        "https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-${APPIMAGE_ARCH}.AppImage"
     chmod +x "$APPIMAGETOOL"
 }
 
 # Download libtorch for a variant
 download_libtorch() {
     local variant="$1"
+    # The aarch64 PyTorch wheel is already installed by the arm64 builder image.
+    # It supplies both headers and shared libraries at HYPRSTREAM_LIBTORCH_DIR.
+    [[ -n "${HYPRSTREAM_LIBTORCH_DIR:-}" ]] && return 0
     local url="${LIBTORCH_URLS[$variant]}"
     local cache_file="$LIBTORCH_CACHE_DIR/libtorch-${LIBTORCH_VERSION}-${variant}.zip"
     local extract_dir="$LIBTORCH_CACHE_DIR/$variant"
@@ -120,7 +141,7 @@ download_libtorch() {
 # Build hyprstream binary for a variant
 build_binary() {
     local variant="$1"
-    local libtorch_dir="$LIBTORCH_CACHE_DIR/$variant/libtorch"
+    local libtorch_dir="${HYPRSTREAM_LIBTORCH_DIR:-$LIBTORCH_CACHE_DIR/$variant/libtorch}"
 
     log_info "Building hyprstream for $variant..."
 
@@ -159,7 +180,8 @@ strip_libtorch_libs() {
 create_appimage() {
     local variant="$1"
     local appdir="$BUILD_DIR/hyprstream-$variant.AppDir"
-    local output="$OUTPUT_DIR/hyprstream-${VERSION}-${variant}-x86_64.AppImage"
+    local output="$OUTPUT_DIR/hyprstream-${VERSION}-${variant}-${APPIMAGE_ARCH}.AppImage"
+    local libtorch_dir="${HYPRSTREAM_LIBTORCH_DIR:-$LIBTORCH_CACHE_DIR/$variant/libtorch}"
 
     log_info "Creating AppImage for $variant..."
 
@@ -168,7 +190,7 @@ create_appimage() {
 
     cp "$BUILD_DIR/bin/hyprstream-$variant" "$appdir/usr/bin/hyprstream"
     # Copy entire lib directory (includes subdirs with Tensile libraries for ROCm)
-    cp -r "$LIBTORCH_CACHE_DIR/$variant/libtorch/lib/"* "$appdir/usr/lib/libtorch/lib/"
+    cp -r "$libtorch_dir/lib/"* "$appdir/usr/lib/libtorch/lib/"
     strip_libtorch_libs "$appdir/usr/lib/libtorch/lib"
 
     sed "s/HYPRSTREAM_VARIANT:-cpu/HYPRSTREAM_VARIANT:-$variant/" \
@@ -179,14 +201,14 @@ create_appimage() {
     cp "$SCRIPT_DIR/hyprstream.svg" "$appdir/"
 
     mkdir -p "$OUTPUT_DIR"
-    ARCH=x86_64 "$APPIMAGETOOL" "$appdir" "$output"
+    ARCH="$APPIMAGE_ARCH" "$APPIMAGETOOL" "$appdir" "$output"
     log_success "Created: $output"
 }
 
 # Create universal AppImage with all backends
 create_universal_appimage() {
     local appdir="$BUILD_DIR/hyprstream-universal.AppDir"
-    local output="$OUTPUT_DIR/hyprstream-${VERSION}-x86_64.AppImage"
+    local output="$OUTPUT_DIR/hyprstream-${VERSION}-${APPIMAGE_ARCH}.AppImage"
     local staging="$BUILD_DIR/universal-staging"
 
     log_info "Creating universal AppImage..."
@@ -203,7 +225,8 @@ create_universal_appimage() {
         else
             cp "$BUILD_DIR/bin/hyprstream-$variant" "$appdir/usr/bin/"
             mkdir -p "$appdir/usr/lib/$variant/libtorch/lib"
-            cp -r "$LIBTORCH_CACHE_DIR/$variant/libtorch/lib/"* "$appdir/usr/lib/$variant/libtorch/lib/"
+            local libtorch_dir="${HYPRSTREAM_LIBTORCH_DIR:-$LIBTORCH_CACHE_DIR/$variant/libtorch}"
+            cp -r "$libtorch_dir/lib/"* "$appdir/usr/lib/$variant/libtorch/lib/"
         fi
     done
 
@@ -215,7 +238,7 @@ create_universal_appimage() {
     cp "$SCRIPT_DIR/hyprstream.svg" "$appdir/"
 
     mkdir -p "$OUTPUT_DIR"
-    ARCH=x86_64 "$APPIMAGETOOL" "$appdir" "$output"
+    ARCH="$APPIMAGE_ARCH" "$APPIMAGETOOL" "$appdir" "$output"
     log_success "Created: $output"
 }
 
