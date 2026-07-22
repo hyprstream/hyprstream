@@ -108,14 +108,15 @@ pub fn classify(
         return CertHealth::Expired;
     }
     let dur = Duration::try_from(remaining).unwrap_or(Duration::ZERO);
-    if dur < thresholds.critical_lead {
+    // A failed renewal attempt is always at least Critical, regardless of how
+    // much validity remains (the doc promises "within critical_lead OR last
+    // issuance failed" → Critical). Checking `last_failed` first honors the
+    // OR-semantics and avoids silently downgrading to ExpiringSoon when a
+    // renewal has already failed inside the warn band.
+    if last_failed || dur < thresholds.critical_lead {
         CertHealth::Critical
     } else if dur < thresholds.warn_lead {
         CertHealth::ExpiringSoon
-    } else if last_failed {
-        // Cert still valid but the most recent renewal attempt failed — the
-        // deployment is on a clock, surface it.
-        CertHealth::Critical
     } else {
         CertHealth::Ok
     }
@@ -347,6 +348,17 @@ mod tests {
         let h = handle_with_cert(now + time::Duration::days(60));
         let err: Result<IssuedCert, IssuanceError> = Err(IssuanceError::Unprovisioned("x".into()));
         assert_eq!(classify(&h, Some(&err), now, &t, false), CertHealth::Critical);
+
+        // Regression (#1182 review): a failed renewal inside the warn band must
+        // NOT be downgraded to ExpiringSoon — the documented OR-semantics say a
+        // failed issuance is always at least Critical.
+        let h = handle_with_cert(now + time::Duration::days(20)); // ExpiringSoon band
+        assert_eq!(classify(&h, None, now, &t, false), CertHealth::ExpiringSoon);
+        assert_eq!(
+            classify(&h, Some(&err), now, &t, false),
+            CertHealth::Critical,
+            "failed renewal in the warn band must escalate to Critical, not ExpiringSoon"
+        );
     }
 
     #[tokio::test]

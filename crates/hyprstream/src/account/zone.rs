@@ -152,6 +152,12 @@ impl<'de> Deserialize<'de> for AccountZone {
     }
 }
 
+/// Maximum DNS name length in text form (no trailing dot). The wire-format
+/// limit is 255 octets (RFC 1035 §3.1); a name with N labels encodes as the
+/// sum of (label-len + label) octets plus a terminating zero, so the text
+/// form is at most 253 characters.
+const MAX_DNS_NAME_LEN: usize = 253;
+
 /// Validate a zone apex. See [`AccountZone::new`] for the rules.
 fn validate_zone_apex(apex: &str) -> Result<(), AccountZoneError> {
     let bad = |reason: &str| AccountZoneError::Invalid {
@@ -171,8 +177,22 @@ fn validate_zone_apex(apex: &str) -> Result<(), AccountZoneError> {
     if apex.to_ascii_lowercase() != apex {
         return Err(bad("zone name must be lowercase (use the NFKC/ASCII-normalized form)"));
     }
-    if apex.len() > 253 {
-        return Err(bad("zone name exceeds 253 octets"));
+    if apex.len() > MAX_DNS_NAME_LEN {
+        return Err(bad("zone name exceeds the 253-octet DNS text limit"));
+    }
+    // Reserve room for derived names. `host_for_label` produces
+    // `<account-label>.<apex>` and account labels are up to 63 octets (A2's
+    // grammar). The wire-format DNS name limit is 255 octets (RFC 1035),
+    // represented as up to 253 text chars. Reject an apex so long that a
+    // maximum-length label would overflow the limit, instead of producing an
+    // oversized host name later.
+    const MAX_ACCOUNT_LABEL_LEN: usize = 63;
+    let max_apex_for_hosts = MAX_DNS_NAME_LEN - 1 - MAX_ACCOUNT_LABEL_LEN; // 189
+    if apex.len() > max_apex_for_hosts {
+        return Err(bad(
+            "zone name leaves no room for a maximum-length (63-octet) account label \
+             under the 253-octet DNS text limit",
+        ));
     }
     if apex.starts_with('.') || apex.ends_with('.') {
         return Err(bad("zone name has an empty label"));
@@ -245,6 +265,27 @@ mod tests {
             let err = AccountZone::new(bad);
             assert!(err.is_err(), "expected {bad:?} to be rejected, got {err:?}");
         }
+    }
+
+    #[test]
+    fn rejects_apex_that_overflows_derived_host_names() {
+        // `host_for_label` prepends a `<label>.` (label up to 63) to the apex;
+        // RFC 1035 caps wire-format names at 255 octets (≤253 text chars). The
+        // cap leaves room: 253 - 1 - 63 = 189. Build apexes of valid (≤63-char)
+        // labels at exact total lengths.
+        let apex_190 = format!("{}.{}.{}", "a".repeat(63), "b".repeat(63), "c".repeat(62));
+        assert_eq!(apex_190.len(), 190); // 63+1+63+1+62
+        assert!(AccountZone::new(&apex_190).is_err(), "190-char apex must be rejected");
+
+        // An apex at the 189-char limit is accepted, and a max-length label
+        // still fits: 63 + '.' + 189 = 253.
+        let apex_189 = format!("{}.{}.{}", "a".repeat(63), "b".repeat(63), "c".repeat(61));
+        assert_eq!(apex_189.len(), 189);
+        let z = AccountZone::new(&apex_189).unwrap();
+        let label = "x".repeat(63);
+        let host = z.host_for_label(&label).unwrap();
+        assert_eq!(host.len(), 253);
+        assert_eq!(host, format!("{label}.{apex_189}"));
     }
 
     #[test]

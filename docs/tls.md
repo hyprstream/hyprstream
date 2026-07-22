@@ -164,6 +164,16 @@ so one cert failing to renew breaks all account resolution for the deployment.
 Renewal and an expiry alarm (`CertHealth`: `ok` / `expiring_soon` / `critical` /
 `expired` / `unissued` / `unprovisioned`) therefore ship with the feature.
 
+**What A3 ships vs. what the product layer / B3 completes:** this mode defines
+the issuance and DNS-management **contracts** (`WildcardCertIssuer`,
+`DnsProvider`) and validates provisioning. The concrete ACME-DNS-01 client and
+DNS backend are a product layer above hyprstream; binding an issued wildcard
+certificate to a serving listener is B3 (the account HTTP face, [#1165]). Until
+that integration lands, `acme-dns01` does **not** serve the wildcard certificate
+itself — a provisioned deployment falls back to the shared self-signed/`files`
+materials so the rest of the process keeps booting. The mode exists now so
+deployments can be configured against the contract before the issuer is wired.
+
 [#1158]: https://github.com/hyprstream/hyprstream/issues/1158
 [#1162]: https://github.com/hyprstream/hyprstream/issues/1162
 

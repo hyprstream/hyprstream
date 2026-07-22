@@ -100,7 +100,12 @@ impl AccountZoneConfig {
     /// skipped with a clear log message (the process keeps running on its
     /// existing/self-signed cert; account minting surfaces the missing zone).
     pub fn dns01_ready(&self) -> bool {
-        self.is_configured() && self.dns01_credential.is_some()
+        self.is_configured()
+            && self
+                .dns01_credential
+                .as_deref()
+                .map(|c| !c.trim().is_empty())
+                .unwrap_or(false)
     }
 }
 
@@ -145,6 +150,20 @@ mod tests {
             ..Default::default()
         };
         assert!(!cfg.dns01_ready()); // zone set but no credential
+    }
+
+    #[test]
+    fn dns01_ready_rejects_blank_credential() {
+        // A blank/whitespace credential is not usable; treat as unconfigured so
+        // `require_provisioned` fails closed rather than proceeding (#1182 review).
+        for blank in ["", "   ", "\t"] {
+            let cfg = AccountZoneConfig {
+                zone: Some("acct.example.com".to_owned()),
+                dns01_credential: Some(blank.to_owned()),
+                ..Default::default()
+            };
+            assert!(!cfg.dns01_ready(), "blank credential {blank:?} must not be ready");
+        }
     }
 
     #[test]

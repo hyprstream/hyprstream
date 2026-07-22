@@ -143,17 +143,24 @@ pub async fn resolve_rustls_config(
             // — no panic, no synthesized zone name (one-way door #1).
             match crate::account::tls::require_provisioned(account_cfg) {
                 Ok(zone) => {
+                    // NOTE (#1182 review): this branch validates that an account
+                    // zone + zone-scoped DNS-01 credential are *configured*. It
+                    // does NOT yet invoke `WildcardCertIssuer` or bind a
+                    // `CertHandle` to this listener — those are product-layer /
+                    // B3 (#1165) seams. Until that integration lands, the
+                    // account zone's wildcard cert is NOT what this service
+                    // serves; we fall through to shared self-signed materials so
+                    // the deployment keeps booting. Do not read the log below as
+                    // "the wildcard cert is live"; it means "config is
+                    // well-formed and provisioning is detectable".
                     tracing::info!(
                         apex = %zone.apex(),
                         wildcard = %zone.wildcard_domain(),
-                        "TLS mode acme-dns01 provisioned for account zone; concrete DNS-01 \
-                         issuance is wired by the product-layer WildcardCertIssuer + DnsProvider",
+                        "TLS mode acme-dns01: account-zone config is provisioned (zone + \
+                         zone-scoped DNS-01 credential present). Wildcard issuance + rustls \
+                         binding are product-layer/B3 (#1165) seams not yet wired here — \
+                         serving shared self-signed TLS until then.",
                     );
-                    // Fall through to shared materials until the product layer's
-                    // issuer pushes a cert into the account CertHandle; the
-                    // serving face (B3, #1165) is where the issued cert is bound
-                    // to a listener. This keeps the process serving during the
-                    // first issuance window rather than failing to boot.
                     let materials = get_or_init_tls_materials(tls_config)?;
                     let rustls_config = axum_server::tls_rustls::RustlsConfig::from_der(
                         vec![materials.cert_der.clone()],
