@@ -1547,6 +1547,7 @@ mod tests {
         assert_eq!(claims["iss"], ISSUER);
         assert_eq!(claims["sub"], MAPPED_DID);
         assert_eq!(claims["aud"], ISSUER);
+        assert_eq!(claims["scope"], "atproto");
 
         // A confidential atproto client signs private_key_jwt for the
         // canonical token endpoint advertised by the atproto metadata, even
@@ -1738,6 +1739,7 @@ mod tests {
         assert!(state.get_refresh_token(&refresh_token).await?.is_none());
         let refreshed_claims = jwt_claims(refreshed_json["access_token"].as_str().unwrap());
         assert_eq!(refreshed_claims["sub"], MAPPED_DID);
+        assert_eq!(refreshed_claims["scope"], "atproto");
 
         // A non-atproto PAR consent cannot be upgraded to the atproto profile
         // by mutating hidden fields on the callback POST.
@@ -1858,22 +1860,74 @@ mod tests {
         assert_eq!(generic_claims["sub"], "alice");
         assert_eq!(generic_claims["iss"], GENERIC_ISSUER);
         assert_eq!(generic_claims["aud"], ISSUER);
-        let now = chrono::Utc::now().timestamp();
-        let introspection_caller = hyprstream_rpc::auth::jwt::encode(
-            &hyprstream_rpc::auth::Claims::new("introspection-test".to_owned(), now, now + 300),
-            &service_key,
-        );
+        assert_eq!(generic_claims["scope"], "read:*:*");
+
+        // The real composite token minted above authenticates to a protected
+        // OAuth route. This failed when middleware routed every JWT through
+        // the fixed EdDSA key.
         let generic_introspection = post_form_bearer(
             &app,
             "/oauth/introspect",
             &[("token", &generic_refresh_token)],
-            &introspection_caller,
+            &generic_access_token,
         ).await;
         let generic_introspection_status = generic_introspection.status();
         let generic_introspection_json = response_json(generic_introspection).await;
         assert_eq!(generic_introspection_status, axum::http::StatusCode::OK, "{generic_introspection_json}");
         assert_eq!(generic_introspection_json["active"], true);
         assert_eq!(generic_introspection_json["sub"], "alice");
+
+        // JWT introspection uses the same composite/audience/issuer validator
+        // and returns the signed grant scope rather than subject-wide policy.
+        let access_introspection = post_form_bearer(
+            &app,
+            "/oauth/introspect",
+            &[("token", &generic_access_token)],
+            &generic_access_token,
+        ).await;
+        assert_eq!(access_introspection.status(), axum::http::StatusCode::OK);
+        let access_introspection_json = response_json(access_introspection).await;
+        assert_eq!(access_introspection_json["active"], true);
+        assert_eq!(access_introspection_json["scope"], "read:*:*");
+
+        let snapshot = hyprstream_rpc::auth::global_composite_key_set().snapshot();
+        let signing_pair = snapshot
+            .active_signing_pair(hyprstream_rpc::auth::CompositePairRole::Policy)
+            .unwrap();
+        let (ml_signing, ed_signing) = signing_pair.signing_keys().unwrap();
+        let now = chrono::Utc::now().timestamp();
+        let wrong_audience = crate::auth::jwt::encode_composite_ml_dsa_65_ed25519(
+            &hyprstream_rpc::auth::Claims::new("alice".to_owned(), now, now + 300)
+                .with_issuer(GENERIC_ISSUER.to_owned())
+                .with_audience(Some("https://other-resource.example.test".to_owned()))
+                .with_scope(Some("read:*:*".to_owned())),
+            &ml_signing,
+            &ed_signing,
+        );
+        let rejected_audience = post_form_bearer(
+            &app,
+            "/oauth/introspect",
+            &[("token", &generic_refresh_token)],
+            &wrong_audience,
+        ).await;
+        assert_eq!(rejected_audience.status(), axum::http::StatusCode::UNAUTHORIZED);
+
+        let wrong_issuer = crate::auth::jwt::encode_composite_ml_dsa_65_ed25519(
+            &hyprstream_rpc::auth::Claims::new("alice".to_owned(), now, now + 300)
+                .with_issuer("https://other-issuer.example.test".to_owned())
+                .with_audience(Some(ISSUER.to_owned()))
+                .with_scope(Some("read:*:*".to_owned())),
+            &ml_signing,
+            &ed_signing,
+        );
+        let rejected_issuer = post_form_bearer(
+            &app,
+            "/oauth/introspect",
+            &[("token", &wrong_issuer)],
+            &generic_access_token,
+        ).await;
+        assert_eq!(rejected_issuer.status(), axum::http::StatusCode::OK);
+        assert_eq!(response_json(rejected_issuer).await["active"], false);
 
         // A real generic device flow retains the local username byte-for-byte
         // and the legacy Bearer response shape.
@@ -1938,6 +1992,7 @@ mod tests {
         assert_eq!(device_claims["sub"], "alice");
         assert_eq!(device_claims["iss"], GENERIC_ISSUER);
         assert_eq!(device_claims["aud"], ISSUER);
+        assert_eq!(device_claims["scope"], "read:*:*");
 
         policy_handle.stop().await?;
         Ok(())

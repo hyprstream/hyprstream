@@ -3,7 +3,8 @@
 //! `POST /oauth/introspect` — validates a token and returns its metadata.
 //! Caller must authenticate with a Bearer token.
 //!
-//! - JWT access tokens: verified against the server's Ed25519 key.
+//! - JWT access tokens: routed by algorithm and verified against the server's
+//!   exact published composite pair or Ed25519 key.
 //! - Opaque refresh tokens: looked up from RocksDB with lazy expiry.
 //! - Any failure → `{"active": false}` per RFC 7662 § 2.2.
 
@@ -33,19 +34,14 @@ pub async fn introspect_token(
 ) -> Response {
     // JWT tokens contain dots; opaque tokens do not.
     if params.token.contains('.') {
-        introspect_jwt(&state, &params.token)
+        introspect_jwt(&state, &params.token).await
     } else {
         introspect_refresh(&state, &params.token).await
     }
 }
 
-fn introspect_jwt(state: &Arc<OAuthState>, token: &str) -> Response {
-    let vk = match ed25519_dalek::VerifyingKey::from_bytes(&state.verifying_key_bytes) {
-        Ok(k) => k,
-        Err(_) => return inactive_response(),
-    };
-
-    let claims = match hyprstream_rpc::auth::jwt::decode(token, &vk, None) {
+async fn introspect_jwt(state: &Arc<OAuthState>, token: &str) -> Response {
+    let claims = match super::auth::validate_oauth_access_token(state, token).await {
         Ok(c) => c,
         Err(_) => return inactive_response(),
     };
@@ -66,6 +62,7 @@ fn introspect_jwt(state: &Arc<OAuthState>, token: &str) -> Response {
             "exp": claims.exp,
             "iat": claims.iat,
             "aud": claims.aud,
+            "scope": claims.scope,
         })),
     )
         .into_response()
