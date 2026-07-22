@@ -55,7 +55,10 @@ node_modules/
 .cache/
 
 # Rust specific
-Cargo.lock
+# NOTE: do NOT ignore Cargo.lock here. The release image build runs
+# `cargo build --release --no-default-features --features otel,gittorrent,xet`
+# and must honor the committed lock so duckdb/datafusion stay on one arrow major.
+# (Historically this entry stripped the lock, letting duckdb float to arrow 58.)
 *.profraw
 
 # Config directories

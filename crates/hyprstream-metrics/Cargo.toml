@@ -11,13 +11,18 @@ name = "hyprstream_metrics"
 path = "src/lib.rs"
 
 [dependencies]
-# Data processing - use DuckDB's arrow version for consistency
-duckdb = { version = "1.4.3", features = ["bundled"] }
+# Data processing. Pinned EXACTLY (=1.4.3) so the caret requirement can't float
+# duckdb up to a newer 1.x (e.g. 1.10504.x) that pulls arrow-schema 58, which
+# skews against datafusion 50's arrow-schema 56 and breaks the MemTable/DFSchema
+# boundaries in query/planner.rs, storage/datafusion_provider.rs and query/rules/view.rs.
+# Keep duckdb and datafusion on the SAME arrow major; when bumping either, verify
+# `cargo tree -p hyprstream-metrics -i arrow-schema` shows a single version.
+duckdb = { version = "=1.4.3", features = ["bundled"] }
 
 # Re-export arrow from duckdb to avoid version conflicts
 # arrow = { version = "54", package = "arrow" }  # via duckdb
 
-# DataFusion for query planning - try 50 for Arrow 56
+# DataFusion for query planning — 50.x tracks arrow 56, matching duckdb 1.4.3.
 datafusion = "50.0.0"
 datafusion-common = "50.0.0"
 
