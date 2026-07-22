@@ -54,6 +54,10 @@ env:
 jobs:
   clippy:
     name: Clippy
+    # PRs are linted before entering the queue; repeating this on the synthetic
+    # merge-group ref only delays the required integration build. `build` below
+    # is the sole required merge-queue check and validates the combined result.
+    if: github.event_name != 'merge_group'
     runs-on: [self-hosted, linux, arm64, graviton, hyprstream-merge-gate]
     # The last successful run took ~6 minutes including image pull. Keep a
     # bounded backstop for the shared runner without giving a stalled lint job
@@ -109,6 +113,9 @@ jobs:
 
   wasm:
     name: WASM (browser client)
+    # The PR check has already validated this target. Keep the merge queue's
+    # critical path to the full integration build rather than recompiling it.
+    if: github.event_name != 'merge_group'
     runs-on: [self-hosted, linux, arm64, graviton, hyprstream-merge-gate]
     timeout-minutes: 30
     steps:
@@ -165,7 +172,8 @@ jobs:
     #      over the network at runtime (cargo still fetches workspace/crate deps,
     #      served by sccache-S3 + crates.io). It only sets up the non-root ci user.
     runs-on: [self-hosted, linux, arm64, graviton, hyprstream-merge-gate]
-    needs: clippy  # Only build if clippy passes
+    # Do not wait for a duplicate lint pass on merge_group. PR lint/WASM checks
+    # run before enqueueing; this required job validates the merged candidate.
     # Backstop below the fleet's 150-min reaper cap (metal reaper_max_lifetime_
     # minutes) so a genuine hang fails definitively rather than being reaped
     # mid-run. A COLD-cache build+test can approach this; once sccache (S3) is
