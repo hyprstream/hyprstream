@@ -1070,11 +1070,7 @@ mod tests {
         // No silent clamp: an amount that cannot be a signed caveat is a
         // compile error, never a grant that fails its own verification.
         let issuer = TenantGrantIssuer::generate_for_test();
-        let binding = binding(
-            "compute-second",
-            u64::MAX,
-            TenantGrantClass::Underwritten,
-        );
+        let binding = binding("compute-second", u64::MAX, TenantGrantClass::Underwritten);
         let err = issuer.compile(&binding, 1, 1_700_000_000).unwrap_err();
         assert!(err.to_string().contains("amount"), "{err}");
     }

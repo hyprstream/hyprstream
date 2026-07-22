@@ -55,6 +55,27 @@ Values are documented inline in `values.yaml`. Highlights:
 - `config.tls.enabled` — false by default so in-cluster HTTP probes and the
   port-forward quick start use plain HTTP on the oai Service port.
 
+## Custom Resource Definitions (K5a, #788)
+
+The chart's `crds/` directory ships the five hyprstream CRDs, which Helm
+installs before any template:
+
+| Group | Kind | Scope |
+|-------|------|-------|
+| `models.hyprstream.io/v1alpha1` | `Model`, `Adapter` | Namespaced |
+| `training.hyprstream.io/v1alpha1` | `TrainingRun` | Namespaced |
+| `serving.hyprstream.io/v1alpha1` | `InferenceService` | Namespaced |
+| `mesh.hyprstream.io/v1alpha1` | `TenantBinding` | **Cluster** |
+
+The YAML is generated from the Rust types in `crates/hyprstream-k8s` (single
+source of truth) — regenerate both committed copies with
+`cargo run -p hyprstream-k8s --bin gen-crds`; never edit the chart copies by
+hand. `TenantBinding` is deliberately cluster-scoped: it is the explicit,
+admin-created namespace↔tenant mapping (the #778 confused-deputy fix), so a
+tenant confined to its own namespace cannot forge one. All CRDs follow the
+single-writer rule — `spec` is desired STEP intent, `status` is observed
+git/runtime truth; git owns the weights.
+
 ## Key/trust bootstrap
 
 Set `keyBootstrap.enabled=true` to mount the flat credential directory expected
