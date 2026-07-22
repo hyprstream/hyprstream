@@ -1,0 +1,66 @@
+name: ARM GPU packaging spike
+
+# Dispatch-only reconnaissance. This is intentionally not a PR or merge gate:
+# it downloads a large aarch64 CUDA wheel and exercises an experimental ABI.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  cuda130-aarch64:
+    name: CUDA 13.0 aarch64 libtorch compatibility
+    runs-on: [self-hosted, linux, arm64, graviton, hyprstream-merge-gate]
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build the arm64 CUDA libtorch spike image
+        run: |
+          podman build \
+            --target builder-cuda130-arm64-spike \
+            -t hyprstream-cuda130-arm64-spike:ci \
+            -f Dockerfile \
+            .
+
+      - name: Verify native CUDA wheel and compile Hyprstream
+        run: |
+          podman run --rm \
+            -v "$PWD":/build:Z -w /build \
+            -e OPENSSL_NO_VENDOR=1 \
+            -e LIBTORCH=/opt/libtorch \
+            -e LD_LIBRARY_PATH=/opt/libtorch/lib \
+            -e LIBTORCH_BYPASS_VERSION_CHECK=1 \
+            -e CARGO_INCREMENTAL=0 \
+            hyprstream-cuda130-arm64-spike:ci \
+            bash -euo pipefail -c '
+              file /opt/libtorch/lib/libtorch_cuda.so
+              python3 -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available())"
+              cargo build -p hyprstream --release --features otel
+              ldd target/release/hyprstream | grep -E "libtorch|not found" || true
+            '
+
+      - name: Record GPU availability
+        run: |
+          if command -v nvidia-smi >/dev/null; then
+            nvidia-smi
+          else
+            echo '::notice::No NVIDIA device is attached to this Graviton build runner; this spike validates packaging and linking only.'
+          fi
+
+  rocm-aarch64-inventory:
+    name: ROCm aarch64 wheel inventory
+    runs-on: ubuntu-latest
+    steps:
+      - name: Record current ROCm aarch64 availability
+        run: |
+          set -euo pipefail
+          curl -fsSL https://download.pytorch.org/whl/rocm7.1/torch/ > /tmp/rocm71-torch-index.html
+          matches=$(grep -oE 'torch-[^" ]+aarch64\.whl' /tmp/rocm71-torch-index.html | sort -u || true)
+          printf '%s\n' "$matches"
+          if printf '%s\n' "$matches" | grep -Eq 'torch-(2\.[89]|[3-9]\.)'; then
+            echo '::notice::Modern ROCm aarch64 wheels detected; reassess the ROCm packaging path.'
+          else
+            echo '::notice::No modern ROCm aarch64 wheel is currently available; keep ROCm AppImages x86_64-only.'
+          fi
