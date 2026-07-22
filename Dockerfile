@@ -251,7 +251,7 @@ ENV LD_LIBRARY_PATH=/opt/libtorch/lib
 RUN --mount=type=cache,target=/root/.cargo/registry \
     --mount=type=cache,target=/root/.cargo/git \
     --mount=type=cache,target=/sccache \
-    OPENSSL_NO_VENDOR=1 cargo build --release --no-default-features --features otel,gittorrent,xet
+    OPENSSL_NO_VENDOR=1 cargo build --locked --release --no-default-features --features otel,gittorrent,xet
 
 #############################################
 # Runtime Stage Selection (Distroless)
