@@ -9,9 +9,10 @@
 //! (deferred). Claim requirements per RFC 7523 §3 + the atproto OAuth
 //! profile (#1146 T1.2/T3.3):
 //!   iss == sub == client_id
-//!   aud == the AS issuer (atproto mandates this form; RFC 7523 §3 also
-//!          permits the token endpoint URL, so the token endpoint accepts
-//!          both. PAR accepts the issuer only.)
+//!   aud == the AS issuer. The atproto OAuth profile mandates this form;
+//!          RFC 7523 §3 permits the token endpoint URL too, but this AS
+//!          accepts the issuer ALONE at every endpoint (PAR and token) —
+//!          see #1146 T1.2.
 //!   exp > now
 //!   iat present and not in the future (beyond 60s clock skew)
 //!   jti present and unique per client until exp (replay registry in
@@ -107,9 +108,8 @@ pub fn requires_private_key_jwt(client: &RegisteredClient) -> bool {
 /// Verify an RFC 7523 client_assertion against the registered client's
 /// JWKS — inline `jwks` if present, otherwise fetched from `jwks_uri`
 /// (cached for `state.client_jwks_uri_cache_ttl`). `expected_audiences`
-/// is the accepted `aud` set: the AS issuer (mandated by the atproto
-/// OAuth profile) plus, at the token endpoint only, the token endpoint
-/// URL (permitted by RFC 7523 §3 for legacy clients).
+/// is the accepted `aud` set — on every profile path this is the AS
+/// issuer alone (atproto mandate, #1146 T1.2).
 ///
 /// On success, records the assertion's `jti` in the replay registry
 /// (single-use per client until `exp`) and returns the verified claims
@@ -378,7 +378,9 @@ async fn fetch_jwks_uri(state: &OAuthState, url: &str) -> Result<Value, ClientAu
 ///
 /// The member lists are already in lexicographic order as required by
 /// RFC 7638 §3.2. JWK key material is base64url by construction, so the
-/// canonical JSON needs no string escaping.
+/// canonical JSON needs no string escaping. Any other `kty` returns
+/// `None`, which the caller treats as an authentication failure — unknown
+/// key types fail closed rather than falling back to a weaker binding.
 fn jwk_thumbprint_sha256(jwk: &Value) -> Option<String> {
     let get = |name: &str| jwk.get(name).and_then(Value::as_str);
     let kty = get("kty")?;
@@ -456,9 +458,8 @@ fn check_claims(
     }
 
     // aud may be a string or an array of strings (RFC 7519 §4.1.3). It
-    // must include one of the accepted audiences: the AS issuer (atproto
-    // mandate) and, where the caller allows it, the token endpoint URL
-    // (RFC 7523 §3).
+    // must include one of the accepted audiences — on all profile paths
+    // that is the AS issuer alone (#1146 T1.2).
     let aud_matches = |candidate: &str| expected_audiences.iter().any(|e| e == candidate);
     let aud_ok = match claims.get("aud") {
         Some(Value::String(s)) => aud_matches(s),
@@ -532,14 +533,10 @@ mod tests {
         vec![jwk]
     }
 
-    /// The accepted audience set used by the token endpoint: the AS
-    /// issuer (atproto-mandated form) plus the token endpoint URL
-    /// (RFC 7523 §3 form).
-    fn token_endpoint_audiences() -> Vec<String> {
-        vec![
-            "https://hs.test".to_owned(),
-            "https://hs.test/oauth/token".to_owned(),
-        ]
+    /// The accepted audience set used by BOTH the PAR and token endpoints
+    /// (#1146 T1.2 rev): the AS issuer alone.
+    fn issuer_audiences() -> Vec<String> {
+        vec!["https://hs.test".to_owned()]
     }
 
     /// Baseline valid claims: iss/sub, issuer-form aud, iat, jti, exp.
@@ -563,15 +560,17 @@ mod tests {
             &keys_array(jwk),
             "https://app.test/c",
             &assertion,
-            &token_endpoint_audiences(),
+            &issuer_audiences(),
         );
         assert!(got.is_ok(), "verify failed: {:?}", got.err());
     }
 
     #[test]
-    fn accepts_token_endpoint_audience_rfc7523() {
-        // RFC 7523 §3 permits the token endpoint URL as aud; the token
-        // endpoint accepts both forms for legacy clients.
+    fn rejects_token_endpoint_audience() {
+        // #1146 T1.2 (rev): RFC 7523 §3 permits the token endpoint URL as
+        // aud, but the atproto OAuth profile mandates the issuer ALONE.
+        // Accepting the endpoint form would leave it valid as an assertion
+        // target — it must be rejected at the token endpoint too.
         let (sk, jwk) = ed25519_keypair_and_jwk();
         let mut claims = valid_claims();
         claims["aud"] = serde_json::json!("https://hs.test/oauth/token");
@@ -580,26 +579,12 @@ mod tests {
             &keys_array(jwk),
             "https://app.test/c",
             &assertion,
-            &token_endpoint_audiences(),
+            &issuer_audiences(),
         );
-        assert!(got.is_ok(), "token-endpoint aud must verify: {:?}", got.err());
-    }
-
-    #[test]
-    fn rejects_issuer_audience_when_not_accepted() {
-        // PAR accepts ONLY the issuer form (#1146 T1.2/T3.3): an
-        // assertion audience of the token endpoint must fail there.
-        let (sk, jwk) = ed25519_keypair_and_jwk();
-        let mut claims = valid_claims();
-        claims["aud"] = serde_json::json!("https://hs.test/oauth/token");
-        let assertion = make_ed_assertion(&sk, claims);
-        let got = verify_assertion_with_keys(
-            &keys_array(jwk),
-            "https://app.test/c",
-            &assertion,
-            &["https://hs.test".to_owned()],
+        assert!(
+            matches!(got, Err(ClientAuthError::InvalidClaim(_))),
+            "token-endpoint aud must be rejected (issuer-only): {got:?}"
         );
-        assert!(matches!(got, Err(ClientAuthError::InvalidClaim(_))));
     }
 
     #[test]
@@ -612,7 +597,7 @@ mod tests {
             &keys_array(jwk),
             "https://app.test/c",
             &assertion,
-            &token_endpoint_audiences(),
+            &issuer_audiences(),
         );
         assert!(
             matches!(&got, Err(ClientAuthError::InvalidClaim(c)) if c.contains("iat")),
@@ -630,7 +615,7 @@ mod tests {
             &keys_array(jwk),
             "https://app.test/c",
             &assertion,
-            &token_endpoint_audiences(),
+            &issuer_audiences(),
         );
         assert!(
             matches!(&got, Err(ClientAuthError::InvalidClaim(c)) if c.contains("iat")),
@@ -648,7 +633,7 @@ mod tests {
             &keys_array(jwk),
             "https://app.test/c",
             &assertion,
-            &token_endpoint_audiences(),
+            &issuer_audiences(),
         );
         assert!(
             matches!(&got, Err(ClientAuthError::InvalidClaim(c)) if c.contains("jti")),
@@ -666,7 +651,7 @@ mod tests {
             &keys_array(jwk),
             "https://app.test/c",
             &assertion,
-            &token_endpoint_audiences(),
+            &issuer_audiences(),
         );
         assert!(matches!(got, Err(ClientAuthError::InvalidClaim(_))));
     }
@@ -682,7 +667,7 @@ mod tests {
             &keys_array(jwk),
             "https://app.test/c",
             &assertion,
-            &token_endpoint_audiences(),
+            &issuer_audiences(),
         );
         assert!(matches!(got, Err(ClientAuthError::InvalidClaim(_))));
     }
@@ -697,7 +682,7 @@ mod tests {
             &keys_array(jwk),
             "https://app.test/c",
             &assertion,
-            &token_endpoint_audiences(),
+            &issuer_audiences(),
         );
         assert!(got.is_err(), "expired assertion should not verify: {got:?}");
     }
@@ -708,7 +693,7 @@ mod tests {
             &[],
             "https://app.test/c",
             "irrelevant",
-            &token_endpoint_audiences(),
+            &issuer_audiences(),
         );
         assert!(got.is_err(), "empty key set must not verify");
     }
@@ -780,7 +765,7 @@ mod tests {
             &[rsa_jwk],
             "https://app.test/c",
             &bogus_assertion,
-            &token_endpoint_audiences(),
+            &issuer_audiences(),
         );
         assert!(
             matches!(got, Err(ClientAuthError::InvalidSignature)),

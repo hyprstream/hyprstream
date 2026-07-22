@@ -1888,9 +1888,42 @@ mod tests {
         assert_eq!(wrong_audience.status(), axum::http::StatusCode::UNAUTHORIZED);
         assert_eq!(response_json(wrong_audience).await["error"], "invalid_client");
 
+        // #1146 T1.2 (rev): the RFC 7523 token-endpoint audience form is NOT
+        // accepted at the token endpoint either — atproto mandates the AS
+        // issuer alone at every endpoint. This pins the narrowing: accepting
+        // both forms was the review-flagged deviation.
+        let endpoint_aud_assertion = private_key_jwt_assertion(
+            &private_client_key,
+            "private-k1",
+            PRIVATE_CLIENT_ID,
+            &advertised_token_endpoint,
+            "private-client-endpoint-aud",
+        );
+        let endpoint_audience = post_form(
+            &app,
+            "/oauth/token",
+            &[
+                ("grant_type", "authorization_code"),
+                ("client_id", PRIVATE_CLIENT_ID),
+                ("code", &private_code),
+                ("redirect_uri", REDIRECT_URI),
+                ("code_verifier", private_verifier),
+                ("client_assertion_type", assertion_type),
+                ("client_assertion", &endpoint_aud_assertion),
+            ],
+            Some(&private_token_proof),
+            false,
+        ).await;
+        assert_eq!(
+            endpoint_audience.status(),
+            axum::http::StatusCode::UNAUTHORIZED,
+            "the token-endpoint audience form must be rejected (issuer-only)"
+        );
+        assert_eq!(response_json(endpoint_audience).await["error"], "invalid_client");
+
         // #1146 T1.2: the reference confidential client sends the AS ISSUER
-        // as the assertion audience — previously rejected, now the
-        // canonical accepted form.
+        // as the assertion audience — previously rejected, now the ONLY
+        // accepted form (issuer-only at PAR and token).
         let canonical_assertion = private_key_jwt_assertion(
             &private_client_key,
             "private-k1",

@@ -311,16 +311,19 @@ async fn enforce_client_authentication(
         // advertised in RFC 8414 metadata; generic grants preserve the
         // configured path-bearing issuer.
         //
-        // #1146 T1.2: the atproto OAuth profile mandates `aud` == the AS
-        // ISSUER (the reference confidential client sends exactly that);
-        // RFC 7523 §3 also permits the token endpoint URL. The token
-        // endpoint accepts both forms — the issuer first.
+        // #1146 T1.2: the accepted audience is the AS ISSUER — alone. The
+        // atproto OAuth profile mandates the issuer; RFC 7523 §3 also
+        // permits the token endpoint URL, but atproto does not, and
+        // `private_key_jwt` client auth ships with this conformance chain,
+        // so no deployed legacy client needs the endpoint form. Accepting
+        // both would leave the endpoint URL valid as an assertion target
+        // (replayable at any endpoint applying the same broadened rule).
+        // PAR accepts the issuer only as well (`par.rs`).
         let issuer = match bound_grant_scopes(state, params).await {
             Some(scopes) => state.issuer_for_scopes(&scopes),
             None => state.issuer_url.clone(),
         };
-        let token_endpoint = format!("{}/oauth/token", issuer.trim_end_matches('/'));
-        let expected_audiences = [issuer, token_endpoint];
+        let expected_audiences = [issuer];
         match super::client_auth::verify_client_assertion(
             state, &client, atype, assertion, &expected_audiences,
         ).await {
