@@ -234,6 +234,15 @@ fn hash_prefix_bytes(data: &[u8]) -> [u8; 32] {
     *blake3::hash(data).as_bytes()
 }
 
+fn tenant_prefix_key(tenant: &str, prefix: &str) -> String {
+    format!("{}:{tenant}{prefix}", tenant.len())
+}
+
+fn tenant_prefix_source(tenant: &str, prefix: &str) -> String {
+    let key = tenant_prefix_key(tenant, prefix);
+    format!("secure-{}", blake3::hash(key.as_bytes()).to_hex())
+}
+
 // ============================================================================
 // EventPublisher — the canonical broadcast publisher
 // ============================================================================
@@ -364,6 +373,8 @@ pub struct EventPublisher {
     /// `new_encrypted` publishers, which must use `publish_raw`.
     primary_source: String,
     prefixes: Arc<RwLock<HashMap<String, PrefixState>>>,
+    /// One verified tenant/domain per confidential publisher instance.
+    tenant: Arc<RwLock<Option<String>>>,
     /// Dedicated hybrid publisher attestation keys. Both are absent for Public.
     signing_key: Option<SigningKey>,
     pq_signing_key: Option<MlDsaSigningKey>,
@@ -427,6 +438,7 @@ impl EventPublisher {
         Ok(Self {
             primary_source: source.to_owned(),
             prefixes: Arc::new(RwLock::new(map)),
+            tenant: Arc::new(RwLock::new(None)),
             signing_key: None,
             pq_signing_key: None,
             privacy_mode: EventPrivacy::Public,
@@ -460,6 +472,7 @@ impl EventPublisher {
         Ok(Self {
             primary_source: String::new(),
             prefixes: Arc::new(RwLock::new(HashMap::new())),
+            tenant: Arc::new(RwLock::new(None)),
             signing_key: Some(signing_key),
             pq_signing_key: Some(pq_signing_key),
             privacy_mode,
@@ -490,12 +503,30 @@ impl EventPublisher {
 
     /// Register a confidential MOQT prefix. No key is generated here: publish
     /// remains fail-closed until the controller installs a committed epoch.
-    pub async fn register_prefix(&self, prefix: &str) -> Result<(), String> {
+    pub async fn register_prefix(&self, tenant: &str, prefix: &str) -> Result<(), String> {
         if self.privacy_mode == EventPrivacy::Public {
             return Err("register_prefix is only valid on encrypted (ZK/LK) publishers".to_owned());
         }
+        if tenant.is_empty() || tenant == "*" {
+            return Err(
+                "encrypted event prefixes require a verified non-wildcard tenant".to_owned(),
+            );
+        }
+        {
+            let mut registered_tenant = self.tenant.write().await;
+            match registered_tenant.as_deref() {
+                Some(existing) if existing != tenant => {
+                    return Err(format!(
+                        "encrypted publisher is already bound to tenant '{existing}'"
+                    ));
+                }
+                Some(_) => {}
+                None => *registered_tenant = Some(tenant.to_owned()),
+            }
+        }
+        let key = tenant_prefix_key(tenant, prefix);
         let mut prefixes = self.prefixes.write().await;
-        if prefixes.contains_key(prefix) {
+        if prefixes.contains_key(&key) {
             return Err(format!(
                 "prefix '{prefix}' is already registered; replacement could reset a live crypto domain"
             ));
@@ -503,9 +534,10 @@ impl EventPublisher {
         let origin = global_moq_event_origin().ok_or_else(|| {
             "moq event bus not initialized; start the event service first".to_owned()
         })?;
-        let moq = origin.publisher(prefix).map_err(|e| e.to_string())?;
+        let source = tenant_prefix_source(tenant, prefix);
+        let moq = origin.publisher(&source).map_err(|e| e.to_string())?;
         prefixes.insert(
-            prefix.to_owned(),
+            key,
             PrefixState {
                 moq,
                 confidential: true,
@@ -532,9 +564,10 @@ impl EventPublisher {
         if self.verifying_key().is_none() {
             return Err("encrypted publisher has no hybrid identity".to_owned());
         }
+        let key = self.encrypted_prefix_key(prefix).await?;
         let mut prefixes = self.prefixes.write().await;
         let state = prefixes
-            .get_mut(prefix)
+            .get_mut(&key)
             .ok_or_else(|| format!("prefix '{prefix}' not registered"))?;
         if !state.confidential {
             return Err("cannot install an epoch on a public prefix".to_owned());
@@ -608,9 +641,16 @@ impl EventPublisher {
     /// the topic's prefix (`topic.split('.').next()`).
     pub async fn publish_raw(&self, topic: &str, payload: &[u8]) -> Result<()> {
         let prefix = topic.split('.').next().unwrap_or(topic).to_owned();
+        let key = if self.privacy_mode == EventPrivacy::Public {
+            prefix.clone()
+        } else {
+            self.encrypted_prefix_key(&prefix)
+                .await
+                .map_err(anyhow::Error::msg)?
+        };
         let mut prefixes = self.prefixes.write().await;
         let state = prefixes
-            .get_mut(&prefix)
+            .get_mut(&key)
             .ok_or_else(|| anyhow!("prefix '{prefix}' not registered"))?;
 
         if !state.confidential {
@@ -696,8 +736,11 @@ impl EventPublisher {
     /// True if a key rotation is due for `prefix` per this publisher's
     /// [`RekeyPolicy`].
     pub async fn needs_rotation(&self, prefix: &str) -> bool {
+        let Ok(key) = self.encrypted_prefix_key(prefix).await else {
+            return false;
+        };
         let prefixes = self.prefixes.read().await;
-        let Some(state) = prefixes.get(prefix) else {
+        let Some(state) = prefixes.get(&key) else {
             return false;
         };
         let Some(crypto) = state.crypto.as_ref() else {
@@ -739,6 +782,16 @@ impl EventPublisher {
         self.signing_key
             .as_ref()
             .map(|k| k.verifying_key().to_bytes())
+    }
+
+    async fn encrypted_prefix_key(&self, prefix: &str) -> Result<String, String> {
+        let tenant = self
+            .tenant
+            .read()
+            .await
+            .clone()
+            .ok_or_else(|| "encrypted publisher has no verified tenant binding".to_owned())?;
+        Ok(tenant_prefix_key(&tenant, prefix))
     }
 
     /// The bound primary source (single-prefix publishers only; empty for
@@ -821,6 +874,8 @@ pub struct RekeyEvent {
 pub struct EventSubscriber {
     inner: MoqEventSubscriber,
     prefixes: Arc<RwLock<HashMap<String, SubscriberPrefixState>>>,
+    /// One verified tenant/domain per confidential subscriber instance.
+    tenant: Arc<RwLock<Option<String>>>,
 }
 
 impl EventSubscriber {
@@ -828,6 +883,7 @@ impl EventSubscriber {
         Ok(Self {
             inner: MoqEventSubscriber::new(),
             prefixes: Arc::new(RwLock::new(HashMap::new())),
+            tenant: Arc::new(RwLock::new(None)),
         })
     }
 
@@ -875,13 +931,32 @@ impl EventSubscriber {
     /// is installed.
     pub async fn expect_confidential_prefix(
         &self,
+        tenant: &str,
         prefix: &str,
         controller_did: impl Into<String>,
         publisher: EventPublisherAnchor,
     ) -> Result<(), String> {
+        if tenant.is_empty() || tenant == "*" {
+            return Err(
+                "confidential event prefixes require a verified non-wildcard tenant".to_owned(),
+            );
+        }
         if prefix.is_empty() {
             return Err("confidential prefix must not be empty".to_owned());
         }
+        {
+            let mut expected_tenant = self.tenant.write().await;
+            match expected_tenant.as_deref() {
+                Some(existing) if existing != tenant => {
+                    return Err(format!(
+                        "confidential subscriber is already bound to tenant '{existing}'"
+                    ));
+                }
+                Some(_) => {}
+                None => *expected_tenant = Some(tenant.to_owned()),
+            }
+        }
+        let key = tenant_prefix_key(tenant, prefix);
         let expectation = ConfidentialPrefixExpectation {
             controller_did: controller_did.into(),
             publisher,
@@ -890,10 +965,10 @@ impl EventSubscriber {
             return Err("expected controller DID must not be empty".to_owned());
         }
         let mut prefixes = self.prefixes.write().await;
-        match prefixes.get(prefix) {
+        match prefixes.get(&key) {
             None => {
                 prefixes.insert(
-                    prefix.to_owned(),
+                    key,
                     SubscriberPrefixState::Expected(Box::new(expectation)),
                 );
                 Ok(())
@@ -941,8 +1016,9 @@ impl EventSubscriber {
             );
         }
         let key = open_epoch_grant(recipient, grant)?;
+        let prefix_key = self.encrypted_prefix_key(prefix).await?;
         let mut prefixes = self.prefixes.write().await;
-        match prefixes.get_mut(prefix) {
+        match prefixes.get_mut(&prefix_key) {
             None => Err(
                 "confidential prefix has no independently configured controller expectation"
                     .to_owned(),
@@ -1127,18 +1203,30 @@ impl EventSubscriber {
     }
 
     fn prefix_is_confidential(&self, prefix: &str) -> Result<bool> {
+        let tenant = self.tenant.try_read().map_err(|_| {
+            anyhow!(
+                "cannot determine tenant binding for prefix '{prefix}' while state is locked; refusing passthrough"
+            )
+        })?;
+        let Some(tenant) = tenant.as_deref() else {
+            return Ok(false);
+        };
+        let key = tenant_prefix_key(tenant, prefix);
         let prefixes = self.prefixes.try_read().map_err(|_| {
             anyhow!(
                 "cannot determine whether prefix '{prefix}' is confidential while state is locked; refusing passthrough"
             )
         })?;
-        Ok(prefixes.contains_key(prefix))
+        Ok(prefixes.contains_key(&key))
     }
 
     async fn decode_frame(&self, topic: &str, raw: &[u8]) -> FrameOutcome {
         let prefix = topic.split('.').next().unwrap_or(topic);
+        let Ok(key) = self.encrypted_prefix_key(prefix).await else {
+            return FrameOutcome::Passthrough;
+        };
         let mut prefixes = self.prefixes.write().await;
-        let state = match prefixes.get_mut(prefix) {
+        let state = match prefixes.get_mut(&key) {
             None => return FrameOutcome::Passthrough,
             Some(SubscriberPrefixState::Expected(_)) => {
                 return FrameOutcome::Drop(
@@ -1242,6 +1330,16 @@ impl EventSubscriber {
         );
         FrameOutcome::Decoded(plaintext)
     }
+
+    async fn encrypted_prefix_key(&self, prefix: &str) -> Result<String, String> {
+        let tenant = self
+            .tenant
+            .read()
+            .await
+            .clone()
+            .ok_or_else(|| "confidential subscriber has no verified tenant binding".to_owned())?;
+        Ok(tenant_prefix_key(&tenant, prefix))
+    }
 }
 
 fn record_replay(
@@ -1284,6 +1382,8 @@ mod tests {
     };
     use crate::crypto::hybrid_kem::{generate_recipient, RecipientKeypair, SuiteId};
     use ml_dsa::Keypair;
+
+    const TEST_TENANT: &str = "tenant-test";
 
     struct AllowExact;
     impl MembershipResolver for AllowExact {
@@ -1437,7 +1537,12 @@ mod tests {
         pq_sk: &MlDsaSigningKey,
     ) {
         subscriber
-            .expect_confidential_prefix(prefix, "did:web:controller", anchor(ed_sk, pq_sk))
+            .expect_confidential_prefix(
+                TEST_TENANT,
+                prefix,
+                "did:web:controller",
+                anchor(ed_sk, pq_sk),
+            )
             .await
             .unwrap();
     }
@@ -1711,7 +1816,8 @@ mod tests {
             .unwrap();
 
         let mut prefixes = subscriber.prefixes.write().await;
-        let Some(SubscriberPrefixState::Installed(state)) = prefixes.get_mut("worker") else {
+        let key = tenant_prefix_key(TEST_TENANT, "worker");
+        let Some(SubscriberPrefixState::Installed(state)) = prefixes.get_mut(&key) else {
             panic!("installed state must exist");
         };
         for sequence in 1..=MAX_REPLAY_WINDOW as u64 + 1 {
@@ -1741,7 +1847,8 @@ mod tests {
             .unwrap();
         {
             let mut prefixes = subscriber.prefixes.write().await;
-            let Some(SubscriberPrefixState::Installed(state)) = prefixes.get_mut("worker") else {
+            let key = tenant_prefix_key(TEST_TENANT, "worker");
+            let Some(SubscriberPrefixState::Installed(state)) = prefixes.get_mut(&key) else {
                 panic!("installed state must exist");
             };
             state.current.expires_at_millis = now_millis() - 1;
@@ -1764,15 +1871,19 @@ mod tests {
             RekeyPolicy::Immediate,
         )
         .unwrap();
-        publisher.register_prefix(&prefix).await.unwrap();
+        publisher
+            .register_prefix(TEST_TENANT, &prefix)
+            .await
+            .unwrap();
         publisher
             .install_committed_epoch(&prefix, 1, 1, Zeroizing::new([0x61; 32]))
             .await
             .unwrap();
         {
             let mut prefixes = publisher.prefixes.write().await;
+            let key = tenant_prefix_key(TEST_TENANT, &prefix);
             prefixes
-                .get_mut(&prefix)
+                .get_mut(&key)
                 .unwrap()
                 .crypto
                 .as_mut()
@@ -1781,14 +1892,19 @@ mod tests {
         }
         let (session_before, sequence_before) = {
             let prefixes = publisher.prefixes.read().await;
-            let crypto = prefixes.get(&prefix).unwrap().crypto.as_ref().unwrap();
+            let key = tenant_prefix_key(TEST_TENANT, &prefix);
+            let crypto = prefixes.get(&key).unwrap().crypto.as_ref().unwrap();
             (crypto.session_id, crypto.sequence)
         };
 
-        let error = publisher.register_prefix(&prefix).await.unwrap_err();
+        let error = publisher
+            .register_prefix(TEST_TENANT, &prefix)
+            .await
+            .unwrap_err();
         assert!(error.contains("already registered"));
         let prefixes = publisher.prefixes.read().await;
-        let crypto = prefixes.get(&prefix).unwrap().crypto.as_ref().unwrap();
+        let key = tenant_prefix_key(TEST_TENANT, &prefix);
+        let crypto = prefixes.get(&key).unwrap().crypto.as_ref().unwrap();
         assert_eq!(crypto.session_id, session_before);
         assert_eq!(crypto.sequence, sequence_before);
     }
@@ -1812,8 +1928,14 @@ mod tests {
             RekeyPolicy::Immediate,
         )
         .unwrap();
-        publisher_a.register_prefix(&prefix).await.unwrap();
-        publisher_b.register_prefix(&prefix).await.unwrap();
+        publisher_a
+            .register_prefix(TEST_TENANT, &prefix)
+            .await
+            .unwrap();
+        publisher_b
+            .register_prefix(TEST_TENANT, &prefix)
+            .await
+            .unwrap();
         let epoch_secret = [0x71u8; 32];
         publisher_a
             .install_committed_epoch(&prefix, 1, 1, Zeroizing::new(epoch_secret))
@@ -1828,7 +1950,7 @@ mod tests {
             .prefixes
             .read()
             .await
-            .get(&prefix)
+            .get(&tenant_prefix_key(TEST_TENANT, &prefix))
             .unwrap()
             .crypto
             .as_ref()
@@ -1838,7 +1960,7 @@ mod tests {
             .prefixes
             .read()
             .await
-            .get(&prefix)
+            .get(&tenant_prefix_key(TEST_TENANT, &prefix))
             .unwrap()
             .crypto
             .as_ref()
@@ -1884,6 +2006,17 @@ mod tests {
             )
             .await
             .is_err());
+    }
+
+    #[test]
+    fn tenant_qualified_event_transport_keys_do_not_collide() {
+        let a_key = tenant_prefix_key("tenant-a", "orders");
+        let b_key = tenant_prefix_key("tenant-b", "orders");
+        assert_ne!(a_key, b_key);
+        assert_ne!(
+            tenant_prefix_source("tenant-a", "orders"),
+            tenant_prefix_source("tenant-b", "orders")
+        );
     }
 
     #[test]
