@@ -718,14 +718,135 @@ mod tests {
         assert_eq!(issuer_authority("example.com"), None);
     }
 
+    /// `GET /users/:username/did.json` must be a deliberate 410 hard error,
+    /// driven through the **production** OAuth router (`create_app`) — NOT by
+    /// calling the `path_form_account_did_disabled_response()` helper directly.
+    ///
+    /// This is the regression guard for the #1159 path-form account freeze.
+    /// The handler must return 410 *before* consulting any user store: a
+    /// user-store spy whose `list_pubkeys` panics is wired into the state so
+    /// that restoring the pre-PR document-serving body (which resolved user
+    /// keys via `list_pubkeys`) fails this test loudly, instead of passing on
+    /// a coincidental "no keys found → 200 with an empty document". Asserting
+    /// only on the helper would pass either way — that tautology is what this
+    /// test replaces.
     #[tokio::test]
     async fn path_form_account_document_endpoint_is_a_hard_error() {
-        let response = path_form_account_did_disabled_response();
+        use crate::auth::user_store::{PubkeyEntry, UserFilter, UserProfile, UserStore};
+        use crate::config::server::CorsConfig;
+        use crate::config::OAuthConfig;
+        use crate::services::oauth::create_app;
+        use crate::services::{DiscoveryClient, PolicyClient};
+        use async_trait::async_trait;
+        use axum::body::Body;
+        use axum::http::Request as HttpRequest;
+        use hyprstream_rpc::rpc_client::RpcClientImpl;
+        use hyprstream_rpc::signer::LocalSigner;
+        use hyprstream_rpc::transport::lazy_uds::LazyUdsTransport;
+        use tower::ServiceExt; // oneshot
+
+        /// User-store spy whose every method panics. The frozen account-DID
+        /// handler must return 410 without ever consulting the store; if the
+        /// old key-lookup/serving code path is reintroduced it touches
+        /// `list_pubkeys` and this test aborts instead of passing.
+        struct UntouchedUserStore;
+        #[async_trait]
+        impl UserStore for UntouchedUserStore {
+            async fn get_profile(&self, _: &str) -> anyhow::Result<Option<UserProfile>> {
+                unreachable!("frozen account-DID handler must not read profiles")
+            }
+            async fn register(&self, _: &str) -> anyhow::Result<String> {
+                unreachable!()
+            }
+            async fn set_profile(&self, _: &str, _: UserProfile) -> anyhow::Result<()> {
+                unreachable!()
+            }
+            async fn remove(&self, _: &str) -> anyhow::Result<bool> { unreachable!() }
+            async fn list_users(&self) -> Vec<String> { unreachable!() }
+            async fn search(&self, _: &UserFilter)
+                -> anyhow::Result<Vec<(String, UserProfile)>> {
+                unreachable!()
+            }
+            async fn set_active(&self, _: &str, _: bool) -> anyhow::Result<()> {
+                unreachable!()
+            }
+            async fn list_pubkeys(&self, _: &str) -> anyhow::Result<Vec<PubkeyEntry>> {
+                // This is the method the pre-PR `user_did_document` called to
+                // resolve keys before minting the path-form DID. Reaching it
+                // means the freeze was bypassed.
+                unreachable!(
+                    "frozen account-DID handler must not call list_pubkeys (#1159)"
+                )
+            }
+            async fn add_pubkey(
+                &self, _: &str, _: VerifyingKey, _: Option<String>,
+            ) -> anyhow::Result<String> {
+                unreachable!()
+            }
+            async fn add_pubkey_hybrid(
+                &self, _: &str, _: VerifyingKey, _: Vec<u8>, _: Option<String>,
+            ) -> anyhow::Result<String> {
+                unreachable!()
+            }
+            async fn remove_pubkey(&self, _: &str, _: &str) -> anyhow::Result<bool> {
+                unreachable!()
+            }
+            async fn get_pubkey_user(&self, _: &str) -> anyhow::Result<Option<String>> {
+                unreachable!()
+            }
+            async fn touch_pubkey(&self, _: &str, _: &str) -> anyhow::Result<()> {
+                unreachable!()
+            }
+        }
+
+        // Minimal OAuthState over a LazyUdsTransport pointed at /dev/null.
+        // The frozen handler returns before opening it, so this keeps the test
+        // hermetic while still exercising the real router + handler wiring.
+        let key = SigningKey::from_bytes(&[0x76; 32]);
+        let vk = SigningKey::from_bytes(&[0x73; 32]).verifying_key();
+        let dummy = std::path::PathBuf::from("/dev/null/did-doc-test.sock");
+        let mk_client = || {
+            let rpc = RpcClientImpl::new(
+                LocalSigner::new(key.clone()),
+                LazyUdsTransport::new(dummy.clone()),
+                Some(vk),
+            )
+            .with_response_verify_policy(hyprstream_rpc::crypto::CryptoPolicy::Classical);
+            Arc::new(rpc)
+        };
+        let state = Arc::new(
+            OAuthState::new(
+                &OAuthConfig::default(),
+                PolicyClient::new(mk_client()),
+                DiscoveryClient::new(mk_client()),
+                [0x76; 32],
+            )
+            .with_user_service(Arc::new(crate::services::oauth::user_service::UserService::new(
+                Arc::new(UntouchedUserStore),
+            ))),
+        );
+
+        let cors = CorsConfig { enabled: false, ..Default::default() };
+        let app = create_app(state, &cors);
+
+        let response = app
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/users/alice/did.json")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(response.status(), StatusCode::GONE);
         let body = axum::body::to_bytes(response.into_body(), 4096).await.unwrap();
-        assert!(std::str::from_utf8(&body)
-            .unwrap()
-            .contains("path-form account minting is disabled"));
+        assert!(
+            std::str::from_utf8(&body)
+                .unwrap()
+                .contains("path-form account minting is disabled"),
+            "body was: {}",
+            std::str::from_utf8(&body).unwrap(),
+        );
     }
 
     #[test]

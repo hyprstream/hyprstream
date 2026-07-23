@@ -42,7 +42,7 @@ These fields apply to both provider kinds:
 | `"namespaced"` | `provider-slug:external-sub` (e.g. `github:12345678`). Default. |
 | `"email"` | Email address from external claims (requires `email_verified = true`) |
 | `{ claim = { name = "..." } }` | The value of a specific claim (e.g. `preferred_username`) |
-| `"didweb"` | **Disabled.** Configuration and login both fail closed because the former path-form account DID was outside the atproto profile (#1159). Host-form account minting is tracked separately in #1163. |
+| `"didweb"` | **Disabled.** Configuration and login both fail closed because the former path-form account DID was outside the atproto profile (#1159). A node with this setting refuses to start until it is changed; existing path-form profiles remain unusable under a replacement strategy until E4 (#1176) migrates them. Host-form account minting is tracked separately in #1163. |
 
 `"namespaced"` is the default and recommended for most deployments — it is stable,
 collision-free, and works for providers (like GitHub) whose `sub` is a numeric ID.
