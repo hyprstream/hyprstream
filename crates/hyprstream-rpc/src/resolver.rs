@@ -30,15 +30,11 @@ use std::sync::Arc;
 use anyhow::anyhow;
 use parking_lot::RwLock;
 
-#[cfg(test)]
 use crate::identity::Did;
 use crate::registry::SocketKind;
-#[cfg(test)]
 use crate::rpc_client::{CallOptions, RpcClient};
-#[cfg(test)]
 use crate::stream_consumer::StreamHandle;
 use crate::transport::{EndpointType, TransportConfig};
-#[cfg(test)]
 use crate::VerifyingKey;
 
 /// Canonical service-resolution request.
@@ -82,7 +78,6 @@ impl ServiceQuery {
 /// It contains only owned public material. Its producer is responsible for
 /// obtaining it through the PDS checkpoint-verifying typed read.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg(test)]
 pub struct AcceptedStateEvidence {
     pub service_did: Did,
     pub digest: [u8; 64],
@@ -94,7 +89,6 @@ pub struct AcceptedStateEvidence {
 
 /// An anchored, suite-complete request recipient and its current key id.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg(test)]
 pub struct AnchoredKemRecipient {
     pub key_id: String,
     pub recipient: crate::crypto::hybrid_kem::RecipientPublic,
@@ -103,7 +97,6 @@ pub struct AnchoredKemRecipient {
 
 /// One owned candidate acquired from Discovery/PDS.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg(test)]
 pub struct ServiceCandidate {
     pub service_name: String,
     pub service_did: Did,
@@ -120,7 +113,6 @@ pub struct ServiceCandidate {
 
 /// Non-secret deterministic audit record for filter/rank/select.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg(test)]
 pub struct CandidateDecision {
     pub candidate_fingerprint: String,
     pub accepted: bool,
@@ -129,7 +121,6 @@ pub struct CandidateDecision {
 
 /// Evidence carried with the selected atomic result.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg(test)]
 pub struct ResolutionEvidence {
     pub accepted_state_digest: [u8; 64],
     pub accepted_state_epoch: u64,
@@ -139,7 +130,6 @@ pub struct ResolutionEvidence {
 
 /// One identity-bound, owned service resolution result.
 #[derive(Debug, Clone)]
-#[cfg(test)]
 pub struct SelectedService {
     service_name: String,
     service_did: Did,
@@ -153,7 +143,6 @@ pub struct SelectedService {
     evidence: ResolutionEvidence,
 }
 
-#[cfg(test)]
 impl SelectedService {
     pub fn same_authority(&self, other: &Self) -> bool {
         self.service_name == other.service_name
@@ -201,6 +190,12 @@ impl SelectedService {
         &self.evidence
     }
 
+    /// The latest time at which this resolution may be used.
+    #[must_use]
+    pub fn expires_at_unix_ms(&self) -> i64 {
+        self.expires_at_unix_ms
+    }
+
     /// Re-check the snapshot clock boundary immediately before dialing/sealing.
     pub fn ensure_fresh(&self, now_unix_ms: i64) -> anyhow::Result<()> {
         anyhow::ensure!(
@@ -235,7 +230,6 @@ impl SelectedService {
 
 /// Identity-bound service resolver used by generated clients.
 #[async_trait::async_trait]
-#[cfg(test)]
 pub trait ServiceResolver: Send + Sync {
     async fn resolve_service(&self, query: ServiceQuery) -> anyhow::Result<SelectedService>;
 
@@ -258,7 +252,6 @@ pub trait ServiceResolver: Send + Sync {
 /// before sealing, and constructs the transport and crypto stores from the
 /// same snapshot.  A transport failure may advance only through the bounded,
 /// deterministic same-authority alternatives returned by that resolver.
-#[cfg(test)]
 pub struct ResolvedRpcClient {
     service_name: String,
     signing_key: crate::crypto::SigningKey,
@@ -267,7 +260,6 @@ pub struct ResolvedRpcClient {
     request_id: std::sync::atomic::AtomicU64,
 }
 
-#[cfg(test)]
 impl ResolvedRpcClient {
     pub fn new(
         service_name: impl Into<String>,
@@ -354,7 +346,6 @@ impl ResolvedRpcClient {
 }
 
 #[async_trait::async_trait]
-#[cfg(test)]
 impl RpcClient for ResolvedRpcClient {
     async fn call(&self, payload: Vec<u8>) -> anyhow::Result<Vec<u8>> {
         self.attempt(|c| {
@@ -474,7 +465,6 @@ fn canonical_service_name(name: &str) -> anyhow::Result<String> {
     Ok(canonical)
 }
 
-#[cfg(test)]
 fn network_reach(transport: &TransportConfig) -> bool {
     matches!(
         transport.endpoint,
@@ -482,19 +472,16 @@ fn network_reach(transport: &TransportConfig) -> bool {
     )
 }
 
-#[cfg(test)]
 fn transport_fingerprint(transport: &TransportConfig) -> String {
     let bytes = format!("{transport:?}");
     blake3::hash(bytes.as_bytes()).to_hex().to_string()
 }
 
-#[cfg(test)]
 fn hash_framed(hasher: &mut blake3::Hasher, bytes: &[u8]) {
     hasher.update(&(bytes.len() as u64).to_be_bytes());
     hasher.update(bytes);
 }
 
-#[cfg(test)]
 fn candidate_fingerprint(candidate: &ServiceCandidate) -> String {
     let mut h = blake3::Hasher::new();
     hash_framed(&mut h, candidate.service_name.as_bytes());
@@ -530,7 +517,6 @@ fn candidate_fingerprint(candidate: &ServiceCandidate) -> String {
     h.finalize().to_hex().to_string()
 }
 
-#[cfg(test)]
 fn rejection_reason(
     query: &ServiceQuery,
     candidate: &ServiceCandidate,
@@ -611,7 +597,6 @@ fn rejection_reason(
 
 /// Run a bounded retry over an already validated deterministic order.
 /// The callback cannot request or substitute any out-of-plan candidate.
-#[cfg(test)]
 pub async fn retry_validated_candidates<T, F, Fut>(
     mut ordered: Vec<SelectedService>,
     max_attempts: usize,
@@ -663,7 +648,6 @@ where
 }
 
 /// Filter, canonicalize, rank, and select without insertion-order dependence.
-#[cfg(test)]
 pub fn select_service_candidate(
     query: &ServiceQuery,
     candidates: Vec<ServiceCandidate>,
@@ -750,7 +734,6 @@ pub fn select_service_candidate(
 /// selection. Invalid candidates are discarded independently. Each iteration
 /// reuses the authority-ambiguity gate, so the returned set cannot cross a DID,
 /// accepted head, response key, or KEM recipient.
-#[cfg(test)]
 pub fn select_service_candidates(
     query: &ServiceQuery,
     mut candidates: Vec<ServiceCandidate>,
@@ -844,19 +827,16 @@ impl Resolver for NetworkDiscoveryResolver {
 // ============================================================================
 
 static GLOBAL_RESOLVER: RwLock<Option<Arc<dyn Resolver>>> = RwLock::new(None);
-#[cfg(test)]
 static GLOBAL_SERVICE_RESOLVER: RwLock<Option<Arc<dyn ServiceResolver>>> = RwLock::new(None);
 
 /// Install the identity-bound production resolver after explicit Discovery
 /// bootstrap. This is intentionally separate from the legacy endpoint-only
 /// resolver so `TransportConfig` never becomes an authority object.
-#[cfg(test)]
 pub fn set_global_service(resolver: Arc<dyn ServiceResolver>) {
     *GLOBAL_SERVICE_RESOLVER.write() = Some(resolver);
 }
 
 /// Clone the installed identity-bound resolver without retaining a lock guard.
-#[cfg(test)]
 pub fn try_global_service() -> Option<Arc<dyn ServiceResolver>> {
     GLOBAL_SERVICE_RESOLVER.read().clone()
 }

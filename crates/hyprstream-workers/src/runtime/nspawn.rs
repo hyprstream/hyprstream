@@ -45,7 +45,8 @@ pub struct NspawnConfig {
     pub ld_library_path: String,
     /// Run in rootless / user mode (default: true).
     pub user_mode: bool,
-    /// Enable `--network-veth` for network isolation.
+    /// Opt in to a veth-backed network. The default is a loopback-only private
+    /// network namespace until a capability-scoped attachment exists.
     pub network_veth: bool,
     /// GPU device paths to bind-mount (auto-detected from `/dev/dri`).
     pub gpu_devices: Vec<PathBuf>,
@@ -68,7 +69,7 @@ impl Default for NspawnConfig {
             libtorch_path,
             ld_library_path,
             user_mode: !nix::unistd::geteuid().is_root(),
-            network_veth: true,
+            network_veth: false,
             gpu_devices: detect_gpu_devices(),
             ready_timeout: Duration::from_secs(10),
             ready_interval: Duration::from_millis(100),
@@ -207,9 +208,12 @@ impl NspawnBackend {
             ));
         }
 
-        // Network isolation
+        // Fence ambient host networking by default. A veth is explicit opt-in
+        // until the capability-scoped segment attachment is available.
         if self.config.network_veth {
             args.push("--network-veth".into());
+        } else {
+            args.push("--private-network".into());
         }
 
         // GPU pass-through when requested via annotation
@@ -778,7 +782,7 @@ mod tests {
     #[test]
     fn test_nspawn_config_default() {
         let config = NspawnConfig::default();
-        assert!(config.network_veth);
+        assert!(!config.network_veth);
         assert_eq!(config.ready_timeout, Duration::from_secs(10));
         assert_eq!(config.ready_interval, Duration::from_millis(100));
     }
