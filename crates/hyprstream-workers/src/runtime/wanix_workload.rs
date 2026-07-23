@@ -552,8 +552,27 @@ pub async fn prepare_wanix_workload(
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use hyprstream_rpc::auth::mac::{ObjectRef, SecurityContext};
     use hyprstream_vfs::injected::{SyntheticMount, SyntheticNode};
     use std::os::unix::net::UnixStream as StdUnixStream;
+
+    /// Explicitly test-only policy for the loopback guest-export fixture.
+    ///
+    /// Production worker-hosted translators remain fail-closed until the
+    /// concrete resolver-backed decider can be injected across this crate
+    /// boundary.
+    struct FixtureAccessDecider;
+
+    impl hyprstream_9p::AccessDecider for FixtureAccessDecider {
+        fn check(
+            &self,
+            _ctx: &SecurityContext,
+            _object: ObjectRef<'_>,
+            _action: hyprstream_9p::Action,
+        ) -> bool {
+            true
+        }
+    }
 
     fn tenant_mount() -> Arc<dyn Mount> {
         // A trivial Subject-scoped tree stands in for a composed tenant namespace.
@@ -666,7 +685,7 @@ mod tests {
             let _ = hyprstream_9p::Translator::from_mount(
                 tenant_mount(),
                 Subject::anonymous(),
-                Arc::new(hyprstream_9p::DenyAllDecider),
+                Arc::new(FixtureAccessDecider),
             )
             .serve_uds(listener)
             .await;
