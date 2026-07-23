@@ -31,8 +31,14 @@ expected-value verifier:
 | `RegistryService::handle_list` policy check | Live fail-open | Fixed here: a policy RPC error now denies listing instead of exposing every repository. |
 | `RequestService::expected_audience()` and MCP stdio configuration | Latent fail-open | Fixed here: a missing audience now reaches the decoder as `Missing` and rejects. |
 | `services/oauth/auth.rs` and `services/oauth/introspection.rs` | Live once OAuth algorithm routing accepts production tokens | Owned by #1146 Lane B / PR #1147; deliberately not modified here. |
-| `services/oauth/token_exchange.rs` | Mixed: ID-token verification intentionally uses the OIDC client audience; access-token downscoping was fail-open | Owned by #1146 Lane B / PR #1147; deliberately not modified here. |
-| `services/policy.rs` service-JWT registration | Latent fail-open | Owned by #1146 Lane B / PR #1147; the compatibility path now fails closed until its exact audience is supplied. |
+| `services/oauth/token_exchange.rs` OIDC ID tokens | Protocol exception | Explicitly unchecked with a reviewable reason because this boundary does not receive the external OIDC client ID; #1147 owns the access-token exchange migration. |
+| `services/policy.rs` service-key registration | Live missing-audience and missing-cnf bypass | Fixed: service WITs mint a dedicated registration audience and registration requires exact cnf.jwk key equality. |
+
+The remaining optional verification APIs are explicitly tracked in #1201:
+DPoP access-token binding, response-envelope signer pinning, conditional
+registered-host/refresh DPoP bindings, and SPIFFE WIT issuance. They are
+intentional protocol modes today but their APIs are not yet structurally typed;
+they are not silently treated as fixed by this audit.
 
 The broad `unwrap_or(true)`, `is_none()`, optional-config, and skipped-branch
 search also found runtime tuning defaults, account-profile presentation defaults,

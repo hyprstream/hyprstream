@@ -273,6 +273,15 @@ pub enum AudienceExpectation<'a> {
     /// Deliberately bypass audience verification for a protocol-specific
     /// reason. This variant is intentionally noisy in call sites.
     ExplicitlyUnchecked { reason: &'static str },
+    /// Require an exact audience when present, but permit an absent claim for
+    /// a documented federated protocol exception.
+    ///
+    /// This is never the default for an exact expectation. Callers must name
+    /// the compatibility reason at the verification boundary.
+    ExactOrMissing {
+        expected: &'a str,
+        reason: &'static str,
+    },
     /// No expected audience was configured. Verification rejects this state.
     ///
     /// This exists solely so pre-existing `Option<&str>` callers fail closed
@@ -420,10 +429,9 @@ pub fn decode_with_expectation(
 
 /// Decode a JWT using a caller-supplied verifying key (for multi-issuer support).
 ///
-/// Uses lenient audience validation: [`AudienceExpectation::Exact`] rejects a
-/// wrong `aud` but accepts an absent `aud` for federated issuers. An absent
-/// expectation is still rejected; an intentional bypass must use
-/// [`AudienceExpectation::ExplicitlyUnchecked`].
+/// [`AudienceExpectation::Exact`] requires a present matching audience,
+/// including for federated issuers. A protocol that intentionally permits an
+/// absent claim must use [`AudienceExpectation::ExactOrMissing`].
 pub fn decode_with_key(
     token: &str,
     verifying_key: &VerifyingKey,
@@ -523,8 +531,8 @@ pub fn decode_with_federation_candidates(
 
 /// Internal decode implementation shared by `decode` and `decode_with_key`.
 ///
-/// `lenient_aud`: when true, accepts tokens with no `aud` claim even with an
-/// exact expectation. Wrong audiences are always rejected.
+/// `lenient_aud` is retained only for the explicit
+/// [`AudienceExpectation::ExactOrMissing`] posture.
 fn decode_inner(
     token: &str,
     verifying_key: &VerifyingKey,
@@ -601,6 +609,14 @@ fn validate_audience(
 ) -> Result<(), JwtError> {
     match expectation {
         AudienceExpectation::Exact(expected) => {
+            let expected_norm = expected.trim_end_matches('/');
+            match &claims.aud {
+                Some(aud) if aud.trim_end_matches('/') == expected_norm => Ok(()),
+                Some(_) | None => Err(JwtError::InvalidAudience),
+            }
+        }
+        AudienceExpectation::ExactOrMissing { expected, reason } => {
+            debug_assert!(!reason.is_empty(), "missing-audience exception requires a reason");
             let expected_norm = expected.trim_end_matches('/');
             match &claims.aud {
                 Some(aud) if aud.trim_end_matches('/') == expected_norm => Ok(()),
@@ -1095,21 +1111,19 @@ mod tests {
     }
 
     #[test]
-    fn test_decode_with_key_lenient_accepts_absent_audience() {
-        // Federated tokens (via decode_with_key) accept absent aud
+    fn exact_federated_audience_rejects_absent_claim() {
         let key = make_key(0x20);
         let vk = key.verifying_key();
         let claims = Claims::new("eve".to_owned(), 0, 9_999_999_999)
             .with_issuer("https://remote-node".to_owned());
         let token = encode(&claims, &key);
 
-        // Lenient mode: absent aud is accepted
-        decode_with_key_expectation(
+        let result = decode_with_key_expectation(
             &token,
             &vk,
             AudienceExpectation::Exact("http://localhost:6789"),
-        )
-        .expect("lenient mode must accept absent aud");
+        );
+        assert!(matches!(result, Err(JwtError::InvalidAudience)));
     }
 
     #[test]

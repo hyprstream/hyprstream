@@ -469,17 +469,28 @@ mod tests {
     }
 
     #[test]
-    fn ml_dsa_65_lenient_audience() {
+    fn ml_dsa_65_exact_audience_rejects_absent_claim() {
         let (sk, vk) = hyprstream_rpc::crypto::pq::ml_dsa_generate_keypair();
         let claims = Claims::new("alice".to_owned(), 0, 9_999_999_999);
-        // Token without aud should be accepted even when expected_aud is set
         let token = encode_ml_dsa_65(&claims, &sk);
-        assert!(hyprstream_rpc::auth::jwt::decode_ml_dsa_65(
+        assert!(matches!(
+            hyprstream_rpc::auth::jwt::decode_ml_dsa_65(
+                &token,
+                &vk,
+                AudienceExpectation::Exact("https://example.com"),
+            ),
+            Err(hyprstream_rpc::auth::JwtError::InvalidAudience)
+        ));
+
+        hyprstream_rpc::auth::jwt::decode_ml_dsa_65(
             &token,
             &vk,
-            AudienceExpectation::Exact("https://example.com"),
+            AudienceExpectation::ExactOrMissing {
+                expected: "https://example.com",
+                reason: "federated ML-DSA compatibility test",
+            },
         )
-        .is_ok());
+        .expect("named compatibility posture permits an absent audience");
     }
 
     #[test]

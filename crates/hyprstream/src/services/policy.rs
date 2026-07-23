@@ -1339,10 +1339,12 @@ impl PolicyHandler for PolicyService {
         // Verify the caller is who they claim to be.
         // The service JWT must be signed by the CA (our jwt_signing_key) and
         // its subject must match "service:{serviceName}".
-        let claims = hyprstream_rpc::auth::jwt::decode_with_key(
+        let claims = hyprstream_rpc::auth::jwt::decode_with_key_expectation(
             &data.service_jwt,
             &self.jwt_signing_key.verifying_key(),
-            None,
+            hyprstream_rpc::auth::AudienceExpectation::Exact(
+                crate::auth::service_jwt::SERVICE_KEY_REGISTRATION_AUDIENCE,
+            ),
         ).map_err(|e| anyhow!("Invalid service JWT: {e}"))?;
 
         let expected_sub = format!("service:{}", data.service_name);
@@ -1359,10 +1361,11 @@ impl PolicyHandler for PolicyService {
         let vk = VerifyingKey::from_bytes(&vk_bytes)
             .map_err(|e| anyhow!("Invalid Ed25519 verifying key: {e}"))?;
 
-        if let Some(cnf_bytes) = claims.cnf_key_bytes() {
-            if cnf_bytes != vk_bytes {
-                anyhow::bail!("JWT cnf.jwk does not match provided verifying key");
-            }
+        let cnf_bytes = claims
+            .cnf_key_bytes()
+            .ok_or_else(|| anyhow!("service JWT missing required cnf.jwk"))?;
+        if cnf_bytes != vk_bytes {
+            anyhow::bail!("JWT cnf.jwk does not match provided verifying key");
         }
 
         // Store in trust store (key-centric: the key IS the identity)
@@ -1426,7 +1429,10 @@ impl PolicyHandler for PolicyService {
         let issuer = self.default_audience.clone().unwrap_or_default();
         let claims = hyprstream_rpc::auth::Claims::new(subject.clone(), now, expires_at)
             .with_issuer(issuer)
-            .with_cnf_jwk(vk.as_bytes());
+            .with_cnf_jwk(vk.as_bytes())
+            .with_audience(Some(
+                crate::auth::service_jwt::SERVICE_KEY_REGISTRATION_AUDIENCE.to_owned(),
+            ));
 
         let token = match self.sign_token(&claims, true).await {
             Ok(t) => t,

@@ -187,8 +187,17 @@ async fn verify_id_token(state: &Arc<OAuthState>, token: &str) -> Result<Verifie
         .await
         .map_err(|e| format!("JWKS key resolution failed for {iss}: {e}"))?;
 
-    // No audience check: ID token aud = OIDC client_id, not our token endpoint.
-    let claims = hyprstream_rpc::auth::decode_with_key(token, &vk, None)
+    // CrossAppAccessProvider does not supply the OIDC client_id at this
+    // boundary, so it cannot enforce an exact client audience here. Keep this
+    // protocol exception explicit rather than letting a missing Option disable
+    // verification implicitly.
+    let claims = hyprstream_rpc::auth::decode_with_key_expectation(
+        token,
+        &vk,
+        hyprstream_rpc::auth::AudienceExpectation::ExplicitlyUnchecked {
+            reason: "trusted OIDC ID tokens are addressed to the external OIDC client",
+        },
+    )
         .map_err(|e| format!("id_token signature verification failed: {e}"))?;
 
     if claims.sub.is_empty() {
