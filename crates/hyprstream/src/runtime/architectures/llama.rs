@@ -2292,11 +2292,29 @@ impl LlamaModel {
                 (tch::Kind::Int64, hidden_states.device()),
             )
         };
+        let mut position_ids = position_ids;
 
         // PERF: Lock KV cache ONCE before the layer loop (not 28 times inside!)
         let cache_guard = self.kv_cache.as_ref().map(|cache_ref| cache_ref.lock());
 
         for (idx, layer) in self.layers.iter().enumerate() {
+            // Production cached forwards own the full mapped layer range, so
+            // carry both device-bound inputs across each real layer boundary.
+            // This mirrors `forward_layers_inner`; the unsplit fast path never
+            // enters this branch.
+            let global_idx = self.layer_offset + idx;
+            let target = self.device_map.device_for(global_idx);
+            if hidden_states.device() != target {
+                tracing::debug!(
+                    layer = global_idx,
+                    from = ?hidden_states.device(),
+                    to = ?target,
+                    "Llama cached forward crossing device boundary"
+                );
+                hidden_states = hidden_states.to_device(target);
+                position_ids = position_ids.to_device(target);
+            }
+
             let residual = hidden_states.shallow_clone();
 
             // Self-attention block with optional KV cache and delta injection
@@ -2336,6 +2354,19 @@ impl LlamaModel {
             hidden_states = layer.post_attention_layernorm.forward(&hidden_states)?;
             let ffn_output = layer.mlp.forward(&hidden_states, delta)?;
             hidden_states = residual + ffn_output;
+        }
+
+        // Non-layer weights live on the engine's primary device. A split model
+        // finishes its decoder stack on the final layer's device, so return the
+        // activation once before final norm / lm_head. This is also a no-op for
+        // the single-device path.
+        if hidden_states.device() != self.device {
+            tracing::debug!(
+                from = ?hidden_states.device(),
+                to = ?self.device,
+                "Llama cached forward returning activation to output device"
+            );
+            hidden_states = hidden_states.to_device(self.device);
         }
 
         // Final layer norm
@@ -2537,9 +2568,29 @@ impl LlamaModel {
         // each, mirroring the single-sequence path's lock-once strategy).
         let guards: Vec<_> = sequences.iter().map(|(_, _, c)| c.lock()).collect();
 
-        let position_refs: Vec<Tensor> = position_ids; // already per-row [q]
+        let mut position_refs: Vec<Tensor> = position_ids; // already per-row [q]
+        let mut mask = mask;
 
         for (idx, layer) in self.layers.iter().enumerate() {
+            // Continuous batching traverses the same mapped layer range as the
+            // single-sequence cached path. Move every attention input exactly
+            // once at a real device change.
+            let global_idx = self.layer_offset + idx;
+            let target = self.device_map.device_for(global_idx);
+            if hidden_states.device() != target {
+                tracing::debug!(
+                    layer = global_idx,
+                    from = ?hidden_states.device(),
+                    to = ?target,
+                    "Llama batched forward crossing device boundary"
+                );
+                hidden_states = hidden_states.to_device(target);
+                for positions in &mut position_refs {
+                    *positions = positions.to_device(target);
+                }
+                mask = mask.to_device(target);
+            }
+
             let residual = hidden_states.shallow_clone();
             hidden_states = layer.input_layernorm.forward(&hidden_states)?;
 
@@ -2575,6 +2626,15 @@ impl LlamaModel {
             hidden_states = residual + ffn_output;
         }
         drop(guards);
+
+        if hidden_states.device() != self.device {
+            tracing::debug!(
+                from = ?hidden_states.device(),
+                to = ?self.device,
+                "Llama batched forward returning activation to output device"
+            );
+            hidden_states = hidden_states.to_device(self.device);
+        }
 
         hidden_states = self.apply_final_norm(&hidden_states)?;
         let logits = self.lm_head(&hidden_states)?;
