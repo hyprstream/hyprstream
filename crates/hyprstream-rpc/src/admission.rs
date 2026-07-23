@@ -417,21 +417,27 @@ pub async fn admit_key_against_did<R: DidDocResolve>(
                 &format!("did:at9p {did} capsule GATE rejected: {e}"),
             )
         })?;
-        // The capsule's Ed25519 subject key is genesis identity material; the
-        // separately verified application signer must equal it. This comparison
-        // says nothing about carrier reach or liveness.
-        if !key_eq(verified.ed25519(), application_signer_key.as_bytes()) {
-            return Err(admission_reject(
-                origin,
-                application_signer_key,
-                &format!(
-                    "application signer key does not match the did:at9p capsule Ed25519 subject key {did}"
-                ),
-            ));
-        }
-        // Atomic hybrid binding from the verified capsule — replaces the
-        // out-of-band `mesh_peers` config path for did:at9p peers (#894).
-        ctx.pq_store.bind(*verified.ed25519(), verified.ml_dsa_65());
+        // `subjectKeys` is a published SET, not a positional singleton (#1188 /
+        // #1183): the separately verified application signer must equal *some*
+        // published subject key — its position in the set is irrelevant. An
+        // overlap-rotating or hybrid-rolling out identity publishes several
+        // usable keys at once; a peer that presents any of them is the same
+        // identity. This comparison says nothing about carrier reach or liveness.
+        let matched = verified
+            .for_ed25519(application_signer_key.as_bytes())
+            .ok_or_else(|| {
+                admission_reject(
+                    origin,
+                    application_signer_key,
+                    &format!(
+                        "application signer key does not match any did:at9p capsule Ed25519 subject key {did}"
+                    ),
+                )
+            })?;
+        // Atomic hybrid binding from the verified capsule — the ML-DSA-65 half
+        // bound to *this* matched Ed25519 key, never a positional one. Replaces
+        // the out-of-band `mesh_peers` config path for did:at9p peers (#894).
+        ctx.pq_store.bind(*matched.ed25519(), matched.ml_dsa_65());
         return Ok(AdmittedIdentity {
             origin: origin.to_owned(),
             did: Some(did.to_owned()),
@@ -1021,8 +1027,10 @@ mod tests {
         // The binding is exactly the capsule's verified keys — comes from the
         // capsule, not config.
         assert_eq!(store.len(), 1, "exactly one hybrid binding installed");
-        let bound = store.ml_dsa_key_for(&ed).expect("ed25519→ml_dsa_65 bound");
-        assert_eq!(ml_dsa_vk_bytes(&bound), ml_dsa_vk_bytes(keys.ml_dsa_65()));
+        let bound = store
+            .ml_dsa_key_for(&ed)
+            .expect("ed25519→ml_dsa_65 bound");
+        assert_eq!(ml_dsa_vk_bytes(&bound), ml_dsa_vk_bytes(keys.keys()[0].ml_dsa_65()));
     }
 
     #[tokio::test]

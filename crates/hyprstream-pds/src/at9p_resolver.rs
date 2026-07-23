@@ -52,22 +52,29 @@ impl At9pCapsuleResolver for At9pGateResolver {
             .map_err(|e| anyhow!("did:at9p {did} GATE rejected: {e}"))?;
         let capsule = verified.capsule();
 
-        // The primary subject key is the hybrid genesis identity. Its Ed25519
-        // half is not a NodeId/channel key, and GATE is not live possession.
-        let subject = capsule
+        // Project the WHOLE published subject key SET (#1188 / #1183), not a
+        // positional "primary". `subjectKeys` is a set of currently-usable
+        // identity keys — an overlap-rotating or hybrid-rolling out identity
+        // publishes several at once — and the consumer (admission #894) selects
+        // its member by Ed25519 identity, never by index. Each entry's ML-DSA-65
+        // half stays atomically bound to the Ed25519 half it was published with.
+        // The schema guarantees a non-empty set with unique Ed25519 halves.
+        let keys = capsule
             .body
             .subject_keys
-            .first()
-            .ok_or_else(|| anyhow!("did:at9p {did} capsule carries no subject key"))?;
+            .iter()
+            .map(|subject| {
+                let ed25519: [u8; 32] = subject
+                    .ed25519_pub
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| anyhow!("ed25519 subject key is not {ED25519_PUBLIC_KEY_LEN} bytes"))?;
+                let ml_dsa_65 = ml_dsa_vk_from_bytes(&subject.mldsa65_pub)?;
+                Ok(VerifiedAt9pKeys::key(ed25519, ml_dsa_65))
+            })
+            .collect::<Result<Vec<_>>>()?;
 
-        let ed25519: [u8; 32] =
-            subject.ed25519_pub.as_slice().try_into().map_err(|_| {
-                anyhow!("ed25519 subject key is not {ED25519_PUBLIC_KEY_LEN} bytes")
-            })?;
-
-        let ml_dsa_65 = ml_dsa_vk_from_bytes(&subject.mldsa65_pub)?;
-
-        Ok(VerifiedAt9pKeys::new_gate_verified(ed25519, ml_dsa_65))
+        VerifiedAt9pKeys::new_gate_verified_set(keys)
     }
 
     fn resolve(&self, did: &str) -> Result<VerifiedAt9pKeys> {
@@ -160,11 +167,13 @@ mod tests {
     fn gate_resolver_returns_verified_subject_keys() {
         let (capsule, bytes, did) = signed(1);
         let primary = capsule.body.subject_keys[0].clone();
-        let verified = At9pGateResolver::new()
-            .verify_bytes(&did, &bytes)
-            .expect("GATE passes");
-        assert_eq!(verified.ed25519().as_slice(), primary.ed25519_pub);
-        assert_eq!(ml_dsa_vk_bytes(verified.ml_dsa_65()), primary.mldsa65_pub);
+        let verified = At9pGateResolver::new().verify_bytes(&did, &bytes).expect("GATE passes");
+        let ed_arr: [u8; 32] = primary.ed25519_pub.as_slice().try_into().unwrap();
+        let selected = verified
+            .for_ed25519(&ed_arr)
+            .expect("published subject key selectable by its Ed25519 identity");
+        assert_eq!(selected.ed25519().as_slice(), primary.ed25519_pub);
+        assert_eq!(ml_dsa_vk_bytes(selected.ml_dsa_65()), primary.mldsa65_pub);
     }
 
     #[test]
@@ -230,6 +239,103 @@ mod tests {
             .ml_dsa_key_for(&ed_arr)
             .expect("hybrid binding installed");
         assert_eq!(ml_dsa_vk_bytes(&bound), primary_pq);
+    }
+
+    /// A capsule that publishes TWO subject keys (`s1` signs, `s2` also
+    /// published — overlap rotation / hybrid rollout) and whose *first* published
+    /// key does the self-certification. A peer presenting the SECOND published
+    /// key as its application signer must be admitted, and the binding installed
+    /// must be `s2`'s atomically-bound ML-DSA-65 half — never `s1`'s. The pre-fix
+    /// admission arm compared only `subject_keys.first()` and would reject the
+    /// second key (and, had it matched, bound the wrong PQ half). This is the #1188
+    /// end-to-end two-key overlap admission test.
+    #[tokio::test]
+    async fn admission_admits_second_published_subject_key_and_binds_its_pair() {
+        // signer 8 self-certifies; signer 9 is also published in the same set.
+        let s1 = signer(8);
+        let s2 = signer(9);
+        let endpoint = ServiceEndpoint::new(Transport::Iroh, "iroh://node8").unwrap();
+        let service = ServiceEntry::new("#ns", ServiceType::NinePExport, endpoint).unwrap();
+        // s1 listed FIRST, s2 second.
+        let body = CapsuleBody::new(
+            vec![s1.keypair.clone(), s2.keypair.clone()],
+            vec![service],
+        )
+        .unwrap();
+        // Self-certify with s1 (the first key).
+        let capsule = sign_capsule(body, &s1.ed_sk, &s1.pq_sk).unwrap();
+        let bytes = capsule.to_dag_cbor().unwrap();
+        let did = format!("{DID_AT9P_PREFIX}{}", capsule.cid512().unwrap());
+
+        // The peer's application signer is the SECOND published key.
+        let ed2: [u8; 32] = s2.keypair.ed25519_pub.as_slice().try_into().unwrap();
+        let ed1: [u8; 32] = s1.keypair.ed25519_pub.as_slice().try_into().unwrap();
+        assert_ne!(ed1, ed2);
+
+        let gate = At9pGateResolver::new();
+        let mut store = KeyedPqTrustStore::new();
+        let admitted = admit_key_against_did(
+            &NeverResolve,
+            "https://peer.example",
+            VerifiedApplicationSigner::pq_hybrid(ed2),
+            AdmissionTrustSurface::Native,
+            &did,
+            None,
+            Some(At9pAdmission {
+                capsule_bytes: &bytes,
+                gate: &gate,
+                pq_store: &mut store,
+            }),
+        )
+        .await
+        .expect("a peer presenting the second published subject key must be admitted");
+        assert_eq!(admitted.key, ed2);
+
+        // The binding is s2's ATOMIC pair — bound under ed2, equal to s2's PQ half.
+        assert_eq!(store.len(), 1);
+        let bound = store.ml_dsa_key_for(&ed2).expect("s2 hybrid binding installed");
+        assert_eq!(ml_dsa_vk_bytes(&bound), s2.keypair.mldsa65_pub);
+        // And nothing was bound under s1 (no positional collapse).
+        assert!(store.ml_dsa_key_for(&ed1).is_none());
+    }
+
+    /// A peer whose application signer matches NONE of the published subject keys
+    /// is rejected and binds nothing — set membership is required.
+    #[tokio::test]
+    async fn admission_rejects_signer_absent_from_subject_key_set() {
+        let s1 = signer(10);
+        let s2 = signer(11);
+        let outsider = signer(12);
+        let endpoint = ServiceEndpoint::new(Transport::Iroh, "iroh://node10").unwrap();
+        let service = ServiceEntry::new("#ns", ServiceType::NinePExport, endpoint).unwrap();
+        let body = CapsuleBody::new(
+            vec![s1.keypair.clone(), s2.keypair.clone()],
+            vec![service],
+        )
+        .unwrap();
+        let capsule = sign_capsule(body, &s1.ed_sk, &s1.pq_sk).unwrap();
+        let bytes = capsule.to_dag_cbor().unwrap();
+        let did = format!("{DID_AT9P_PREFIX}{}", capsule.cid512().unwrap());
+        let ed_out: [u8; 32] = outsider.keypair.ed25519_pub.as_slice().try_into().unwrap();
+
+        let gate = At9pGateResolver::new();
+        let mut store = KeyedPqTrustStore::new();
+        let res = admit_key_against_did(
+            &NeverResolve,
+            "https://peer.example",
+            VerifiedApplicationSigner::pq_hybrid(ed_out),
+            AdmissionTrustSurface::Native,
+            &did,
+            None,
+            Some(At9pAdmission {
+                capsule_bytes: &bytes,
+                gate: &gate,
+                pq_store: &mut store,
+            }),
+        )
+        .await;
+        assert!(res.is_err(), "a non-member signer must be rejected");
+        assert!(store.is_empty(), "a rejected peer must bind nothing");
     }
 
     #[tokio::test]

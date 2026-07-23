@@ -638,16 +638,17 @@ impl ResolvedService {
         let current_key = state
             .current
             .subject_keys
-            .first()
-            .ok_or_else(|| anyhow::anyhow!("accepted state has no current response key"))?;
-        anyhow::ensure!(
-            selected.response_verifying_key().to_bytes().as_slice()
-                == current_key.ed25519_pub.as_slice(),
-            "selected response key is not accepted current key"
-        );
+            .iter()
+            .find(|key| {
+                key.ed25519_pub.as_slice()
+                    == selected.response_verifying_key().to_bytes().as_slice()
+            })
+            .ok_or_else(|| {
+                anyhow::anyhow!("selected response key is not one of the accepted current keys")
+            })?;
         anyhow::ensure!(
             selected.response_ml_dsa65() == current_key.mldsa65_pub.as_slice(),
-            "selected PQ response key is not accepted current key"
+            "selected PQ response key is not the atomically-bound accepted current key"
         );
         anyhow::ensure!(
             state

@@ -113,9 +113,11 @@ pub fn with_checkpointed_native_announcements(
                 .services
                 .iter()
                 .any(|entry| entry.id == *service_name)
-                && state.current.subject_keys.first().is_some_and(|key| {
-                    key.ed25519_pub.as_slice() == signer.verifying_key().as_bytes()
-                })
+                && state
+                    .current
+                    .subject_keys
+                    .iter()
+                    .any(|key| key.ed25519_pub.as_slice() == signer.verifying_key().as_bytes())
         });
         let state = matching.next().ok_or_else(|| {
             anyhow::anyhow!(
