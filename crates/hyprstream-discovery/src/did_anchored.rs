@@ -182,8 +182,7 @@ impl HttpWellKnownCapsuleSource {
             bytes.len() <= MAX_CREDENTIAL_BYTES,
             "registry deployment credential exceeds {MAX_CREDENTIAL_BYTES}-byte limit"
         );
-        String::from_utf8(bytes.to_vec())
-            .context("registry deployment credential is not UTF-8")
+        String::from_utf8(bytes.to_vec()).context("registry deployment credential is not UTF-8")
     }
 
     fn capsule_url(&self, did: &str) -> Result<String> {
@@ -371,8 +370,10 @@ pub(crate) async fn resolve_did_anchored_trust(anchors: &DidAnchors) -> Result<D
     .resolve_document(&anchors.cluster_did_web)
     .await
     .context("failed to fetch configured cluster did:web document")?;
-    let capsule_source =
-        Arc::new(HttpWellKnownCapsuleSource::new(&anchors.cluster_did_web, extra_root)?);
+    let capsule_source = Arc::new(HttpWellKnownCapsuleSource::new(
+        &anchors.cluster_did_web,
+        extra_root,
+    )?);
     // Fetch the registry credential from the same well-known family BEFORE
     // trusting anything: a missing/refusing endpoint must fail the bootstrap
     // even when the document and capsule are otherwise valid.
@@ -380,13 +381,9 @@ pub(crate) async fn resolve_did_anchored_trust(anchors: &DidAnchors) -> Result<D
         .fetch_registry_credential()
         .await
         .context("failed to fetch registry deployment credential")?;
-    let trust = verify_did_anchored_document(
-        anchors,
-        &document,
-        capsule_source,
-        registry_credential,
-    )
-    .await?;
+    let trust =
+        verify_did_anchored_document(anchors, &document, capsule_source, registry_credential)
+            .await?;
     tracing::info!(
         at9p = %trust.authoritative_identity.at9p_did,
         did_web = %trust.authoritative_identity.classical_did,

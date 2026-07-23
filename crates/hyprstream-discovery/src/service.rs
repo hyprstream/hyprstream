@@ -2030,8 +2030,7 @@ pub async fn bootstrap_deployment_process(
                         keys.len()
                     ),
                 };
-                let mut kem_store =
-                    hyprstream_rpc::crypto::hybrid_kem::KeyedKemTrustStore::new();
+                let mut kem_store = hyprstream_rpc::crypto::hybrid_kem::KeyedKemTrustStore::new();
                 kem_store.bind(discovery_vk.to_bytes(), recipient);
                 let mut pq_store = hyprstream_rpc::envelope::KeyedPqTrustStore::new();
                 pq_store.bind(discovery_vk.to_bytes(), &pq_key);
@@ -2064,13 +2063,12 @@ pub async fn bootstrap_deployment_process(
                 // credential) — no liveness check is meaningful or required
                 // for a lazy local client, matching the OS-owned path.
                 let transport = hyprstream_rpc::registry::try_global()
-                    .ok_or_else(|| anyhow::anyhow!(
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
                         "EndpointRegistry not initialized — same-node discovery fabric unavailable"
-                    ))?
-                    .try_endpoint(
-                        "discovery",
-                        hyprstream_rpc::registry::SocketKind::Rep,
-                    )?;
+                    )
+                    })?
+                    .try_endpoint("discovery", hyprstream_rpc::registry::SocketKind::Rep)?;
                 let rpc = hyprstream_rpc::dial::dial(&transport, signer, Some(discovery_vk), None)?;
                 (authority, crate::DiscoveryClient::new(rpc))
             }

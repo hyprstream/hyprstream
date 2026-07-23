@@ -31,7 +31,10 @@ pub struct Resource {
 
 impl Resource {
     pub fn new(name: impl Into<String>, quantity: impl Into<String>) -> Self {
-        Self { name: name.into(), quantity: quantity.into() }
+        Self {
+            name: name.into(),
+            quantity: quantity.into(),
+        }
     }
 }
 
@@ -45,13 +48,19 @@ pub struct ResourceRequest {
 
 impl ResourceRequest {
     pub fn new(name: impl Into<String>, min_quantity: impl Into<String>) -> Self {
-        Self { name: name.into(), min_quantity: min_quantity.into() }
+        Self {
+            name: name.into(),
+            min_quantity: min_quantity.into(),
+        }
     }
 
     /// Satisfied iff `available` parses and is `>= min_quantity`. A missing/
     /// unparseable available value is *not* satisfiable (fail-closed).
     pub fn satisfied_by(&self, available: &str) -> bool {
-        match (parse_k8s_quantity(available), parse_k8s_quantity(&self.min_quantity)) {
+        match (
+            parse_k8s_quantity(available),
+            parse_k8s_quantity(&self.min_quantity),
+        ) {
             (Some(have), Some(need)) => have >= need,
             _ => false,
         }
@@ -80,7 +89,11 @@ pub struct LabelSelector {
 
 impl LabelSelector {
     pub fn new(key: impl Into<String>, op: SelectorOp, values: Vec<String>) -> Self {
-        Self { key: key.into(), op, values }
+        Self {
+            key: key.into(),
+            op,
+            values,
+        }
     }
 
     /// Evaluate this selector against a label set `(key, value)`.
@@ -93,8 +106,12 @@ impl LabelSelector {
             SelectorOp::NotIn => entry.is_none_or(|(_, v)| !self.values.iter().any(|w| w == v)),
             // Gt/Lt compare numerically over the k8s-quantity value (k8s restricts
             // these to integer resources; we extend to any parseable quantity).
-            SelectorOp::Gt => self.cmp_numeric(entry.map(|(_, v)| v.as_str()), |o| o == Ordering::Greater),
-            SelectorOp::Lt => self.cmp_numeric(entry.map(|(_, v)| v.as_str()), |o| o == Ordering::Less),
+            SelectorOp::Gt => {
+                self.cmp_numeric(entry.map(|(_, v)| v.as_str()), |o| o == Ordering::Greater)
+            }
+            SelectorOp::Lt => {
+                self.cmp_numeric(entry.map(|(_, v)| v.as_str()), |o| o == Ordering::Less)
+            }
         }
     }
 
@@ -160,8 +177,8 @@ pub fn parse_k8s_quantity(s: &str) -> Option<i128> {
     // Sub-unit suffixes (`m`, `u`) divide instead of multiply.
     let milli: i128 = match suffix {
         "" => (v * 1_000.0) as i128,
-        "m" => v as i128,                       // already milli
-        "u" | "µ" => (v / 1_000.0) as i128,     // micro → milli
+        "m" => v as i128,                   // already milli
+        "u" | "µ" => (v / 1_000.0) as i128, // micro → milli
         "k" => (v * 1_000.0 * 1_000.0) as i128,
         "M" => (v * 1_000_000.0 * 1_000.0) as i128,
         "G" => (v * 1_000_000_000.0 * 1_000.0) as i128,
@@ -211,7 +228,10 @@ pub fn filter<'c, C>(candidates: &'c [C], predicates: &[Predicate<C>]) -> Vec<Ou
         .iter()
         .map(|c| {
             let rejected = predicates.iter().find_map(|p| p(c));
-            Outcome { candidate: c, rejected }
+            Outcome {
+                candidate: c,
+                rejected,
+            }
         })
         .collect()
 }
@@ -257,7 +277,11 @@ where
     C: Clone,
 {
     let outcomes = filter(candidates, predicates);
-    let mut survivors: Vec<&C> = outcomes.iter().filter(|o| o.passed()).map(|o| o.candidate).collect();
+    let mut survivors: Vec<&C> = outcomes
+        .iter()
+        .filter(|o| o.passed())
+        .map(|o| o.candidate)
+        .collect();
     survivors = rank(survivors, rank_by);
     let bound: Vec<&C> = survivors.into_iter().take(max).collect();
     let chosen: Vec<&C> = bound.clone();
@@ -275,13 +299,24 @@ where
                 .iter()
                 .find(|o| std::ptr::eq(o.candidate, c))
                 .and_then(|o| o.rejected.as_ref().map(|r| r.0.clone()));
-            CandidateOutcome { candidate: c.clone(), selected: is_selected, rejection_reason: rejection }
+            CandidateOutcome {
+                candidate: c.clone(),
+                selected: is_selected,
+                rejection_reason: rejection,
+            }
         })
         .collect();
     let selected_idx = bound.first().and_then(|b| {
-        candidates.iter().position(|c| std::ptr::eq(c as *const _, *b as *const _))
+        candidates
+            .iter()
+            .position(|c| std::ptr::eq(c as *const _, *b as *const _))
     });
-    SelectionReport { requested: String::new(), candidates: candidate_reports, selected: selected_idx, summary }
+    SelectionReport {
+        requested: String::new(),
+        candidates: candidate_reports,
+        selected: selected_idx,
+        summary,
+    }
 }
 
 // ─── Capability-source contract ────────────────────────────────────────────
@@ -366,15 +401,24 @@ mod tests {
     #[test]
     fn filter_rank_select_pipeline() {
         // candidates: (name, priority). predicate: keep priority >= 2.
-        let cands = vec![("a".to_owned(), 1), ("b".to_owned(), 3), ("c".to_owned(), 2), ("d".to_owned(), 2)];
+        let cands = vec![
+            ("a".to_owned(), 1),
+            ("b".to_owned(), 3),
+            ("c".to_owned(), 2),
+            ("d".to_owned(), 2),
+        ];
         let preds: Vec<Predicate<(String, i32)>> = vec![Box::new(|c| {
-            if c.1 >= 2 { None } else { Some(RejectionReason("priority < 2".into())) }
+            if c.1 >= 2 {
+                None
+            } else {
+                Some(RejectionReason("priority < 2".into()))
+            }
         })];
         let report = select(
             &cands,
             &preds,
             |a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)), // priority desc, name asc
-            2, // bound
+            2,                                        // bound
         );
         // survivors after filter: b(3), c(2), d(2) → ranked b, c, d → bound 2 → [b, c]
         let selected: Vec<&String> = report
@@ -385,7 +429,11 @@ mod tests {
             .collect();
         assert_eq!(selected, vec![&"b".to_owned(), &"c".to_owned()]);
         // rejected candidate carries its reason
-        let a = report.candidates.iter().find(|o| o.candidate.0 == "a").unwrap();
+        let a = report
+            .candidates
+            .iter()
+            .find(|o| o.candidate.0 == "a")
+            .unwrap();
         assert_eq!(a.rejection_reason.as_deref(), Some("priority < 2"));
         assert!(report.summary.contains("4 considered") && report.summary.contains("3 survived"));
     }
@@ -394,8 +442,20 @@ mod tests {
     fn filter_records_first_rejection_only() {
         let cands = vec![1, 2, 3];
         let preds: Vec<Predicate<i32>> = vec![
-            Box::new(|c| if c % 2 == 0 { Some(RejectionReason("even".into())) } else { None }),
-            Box::new(|c| if *c == 1 { Some(RejectionReason("is-one".into())) } else { None }),
+            Box::new(|c| {
+                if c % 2 == 0 {
+                    Some(RejectionReason("even".into()))
+                } else {
+                    None
+                }
+            }),
+            Box::new(|c| {
+                if *c == 1 {
+                    Some(RejectionReason("is-one".into()))
+                } else {
+                    None
+                }
+            }),
         ];
         let out = filter(&cands, &preds);
         // 1 rejected by FIRST predicate? no — 1 is odd, passes pred 0, rejected by pred 1 ("is-one")
@@ -418,7 +478,10 @@ mod tests {
             }
         }
         let g = Gpu;
-        assert_eq!(g.capability_labels(), vec![("gpu.arch".into(), "hopper".into())]);
+        assert_eq!(
+            g.capability_labels(),
+            vec![("gpu.arch".into(), "hopper".into())]
+        );
         assert_eq!(g.capability_resources().len(), 1);
     }
 }
