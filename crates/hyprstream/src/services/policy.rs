@@ -22,6 +22,7 @@ use crate::services::generated::policy_client::{
 };
 use anyhow::{anyhow, Result};
 use git2db::{Git2DB, RepoId};
+use hyprstream_pds::repo_authority::is_path_form_did_web;
 use hyprstream_rpc::prelude::*;
 use hyprstream_rpc::transport::TransportConfig;
 use std::collections::HashMap;
@@ -332,6 +333,19 @@ impl PolicyHandler for PolicyService {
             // Use bare username from the envelope identity.
             ctx.user().to_owned()
         };
+
+        // #1159 freeze: this is the shared signing boundary for every caller
+        // using PolicyClient::issue_token, including RFC 8693 token exchange
+        // and RFC 7523 JWT bearer. Check the resolved concrete subject, not
+        // merely an optional request field, so an envelope-derived subject
+        // cannot bypass the freeze either.
+        if is_path_form_did_web(&subject) {
+            return Ok(PolicyResponseVariant::Error(ErrorInfo {
+                message: "path-form did:web account subjects are frozen; host-form account minting is not available yet (#1159)".to_owned(),
+                code: "FROZEN_PATH_FORM_SUBJECT".to_owned(),
+                details: String::new(),
+            }));
+        }
 
         // Validate TTL — service tokens get a longer default (7 days)
         let default_ttl = if is_service_token {
@@ -1455,6 +1469,17 @@ impl PolicyHandler for PolicyService {
             }
         };
 
+        // ExchangeWit signs directly rather than through `handle_issue_token`.
+        // Keep its authenticated-envelope subject under the same account-DID
+        // freeze before it can reach the direct signing boundary.
+        if is_path_form_did_web(&sub) {
+            return Ok(PolicyResponseVariant::Error(ErrorInfo {
+                message: "path-form did:web account subjects are frozen; host-form account minting is not available yet (#1159)".to_owned(),
+                code: "FROZEN_PATH_FORM_SUBJECT".to_owned(),
+                details: String::new(),
+            }));
+        }
+
         // cnf.jwk from the verified WIT — carried through into the issued at+jwt.
         let cnf_key_bytes = ctx.claims().and_then(hyprstream_rpc::auth::Claims::cnf_key_bytes);
         if cnf_key_bytes.is_none() {
@@ -1651,6 +1676,82 @@ pub(crate) async fn watch_policy_file(
         match policy_manager.reload().await {
             Ok(()) => info!("Policy reloaded from disk"),
             Err(e) => warn!("Failed to reload policy: {}", e),
+        }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    async fn test_service() -> (PolicyService, tempfile::TempDir) {
+        let root = tempfile::tempdir().expect("test: create policy git directory");
+        let manager = Arc::new(PolicyManager::permissive().await.expect("test: policy manager"));
+        let git2db = Arc::new(RwLock::new(
+            Git2DB::open(root.path()).await.expect("test: open policy git database"),
+        ));
+        let service = PolicyService::new(
+            manager,
+            Arc::new(SigningKey::from_bytes(&[0x51; 32])),
+            crate::config::TokenConfig::default(),
+            git2db,
+            TransportConfig::inproc("policy-path-form-subject-test"),
+        );
+        (service, root)
+    }
+
+    fn issue(subject: &str) -> IssueToken {
+        IssueToken {
+            requested_scopes: Some(vec!["read".to_owned()]),
+            ttl: Some(60),
+            audience: None,
+            subject: Some(subject.to_owned()),
+            user_pub_key: None,
+            dpop_jkt: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn issue_token_rejects_path_form_subject_at_shared_signing_boundary() {
+        let (service, _root) = test_service().await;
+        let ctx = EnvelopeContext::from_callback_service(1, "test-caller");
+
+        let response = service
+            .handle_issue_token(&ctx, 1, &issue("did:web:accounts.example:users:alice"))
+            .await
+            .expect("path-form rejection is a policy response");
+
+        match response {
+            PolicyResponseVariant::Error(error) => {
+                assert_eq!(error.code, "FROZEN_PATH_FORM_SUBJECT");
+                assert!(error.message.contains("path-form did:web"));
+            }
+            other => panic!("path-form subject reached token signing: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn issue_token_path_form_guard_allows_legitimate_subject_families() {
+        let (service, _root) = test_service().await;
+        let ctx = EnvelopeContext::from_callback_service(1, "test-caller");
+
+        for subject in [
+            "alice",
+            "did:web:alice.example",
+            "did:web:localhost%3A6791",
+            "did:key:z6MkpTHR8VNsBxYAAHWutMGeQ4hz2FV6B14xd9CZpkmS5i5o",
+            "service:model",
+        ] {
+            let response = service.handle_issue_token(&ctx, 1, &issue(subject)).await;
+            assert!(
+                !matches!(
+                    response,
+                    Ok(PolicyResponseVariant::Error(ErrorInfo { ref code, .. }))
+                        if code == "FROZEN_PATH_FORM_SUBJECT"
+                ),
+                "legitimate subject {subject:?} was rejected by the path-form guard",
+            );
         }
     }
 }

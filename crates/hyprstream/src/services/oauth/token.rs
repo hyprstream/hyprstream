@@ -632,6 +632,20 @@ async fn exchange_refresh_token(
                 return token_error(StatusCode::INTERNAL_SERVER_ERROR, "server_error", None);
             }
         };
+        // UCAN refresh bypasses `issue_token_with_refresh` after this atomic
+        // claim, so apply the freeze before handing the grant to the direct
+        // UCAN re-mint path. The credential remains single-use and cannot
+        // produce another access or refresh token for a path-form subject.
+        if is_path_form_did_web(&claimed.username) {
+            return token_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_grant",
+                Some(
+                    "token subject is a frozen path-form did:web account identifier; \
+                     host-form account minting is not available yet (#1159)",
+                ),
+            );
+        }
         let Some(claimed_grant) = claimed.ucan_grant.as_ref() else {
             tracing::error!("UCAN refresh token changed before atomic claim");
             return token_error(StatusCode::INTERNAL_SERVER_ERROR, "server_error", None);
@@ -921,7 +935,7 @@ async fn issue_token_with_refresh(
     vault_device_cookie: Option<String>,
 ) -> Response {
     // ── #1159 freeze: path-form account subject guard ───────────────────────
-    // This is the CENTRAL mint boundary: the authorization_code, refresh_token,
+    // This is the OAuth helper boundary: the authorization_code, refresh_token,
     // and device_code flows all funnel through here for both the access-token
     // `subject` and the persisted rotated `RefreshTokenEntry.username`. Blocking
     // `UserMappingStrategy::DidWeb` at config time stops NEW OIDC callbacks from
@@ -932,7 +946,8 @@ async fn issue_token_with_refresh(
     // that subject AND persist a newly rotated ~30-day refresh token carrying it,
     // keeping the path-form chain alive indefinitely.
     //
-    // Fail-closed here bounds the hole: a stored path-form subject can no longer
+    // Fail-closed here bounds the OAuth refresh hole before it reaches the
+    // PolicyService signing boundary: a stored path-form subject can no longer
     // be minted or rotated, so each pre-upgrade refresh token dies at its next
     // refresh attempt or at natural expiry — it cannot extend the lifetime. The
     // accounts themselves are reminted to host-form by E4 (#1176), not by this
@@ -1605,6 +1620,62 @@ mod tests {
         assert!(
             state.get_refresh_token("legacy-refresh").await.unwrap().is_none(),
             "the path-form refresh token must be consumed (taken), not left reusable",
+        );
+    }
+
+    #[tokio::test]
+    async fn pre_upgrade_path_form_ucan_refresh_is_consumed_not_reminted() {
+        let store = RecordingTokenStore::new();
+        let state = freeze_test_state(Arc::clone(&store)).await;
+        let path_form_entry = RefreshTokenEntry {
+            client_id: "ucan-grant:did:web:accounts.example:users:alice".to_owned(),
+            username: "did:web:accounts.example:users:alice".to_owned(),
+            scopes: vec!["urn:hyprstream:grant-type:ucan".to_owned()],
+            resource: None,
+            expires_at_unix: chrono::Utc::now().timestamp() + 3600,
+            verifying_key_bytes: None,
+            dpop_jkt: None,
+            ucan_grant: Some(crate::services::oauth::state::UcanGrantRefresh {
+                grant_cbor_b64: "not-reached".to_owned(),
+                grant_cid: "not-reached".to_owned(),
+                requested_scope: Some("read:model:demo".to_owned()),
+                audience: None,
+            }),
+        };
+        state
+            .put_refresh_token("legacy-ucan-refresh", &path_form_entry, 3600)
+            .await
+            .unwrap();
+
+        let params = TokenRequest {
+            grant_type: "refresh_token".to_owned(),
+            refresh_token: Some("legacy-ucan-refresh".to_owned()),
+            client_id: path_form_entry.client_id.clone(),
+            code: None,
+            redirect_uri: None,
+            code_verifier: None,
+            device_code: None,
+            assertion: None,
+            client_assertion: None,
+            client_assertion_type: None,
+            subject_token: None,
+            subject_token_type: None,
+            requested_token_type: None,
+            actor_token: None,
+            scope: None,
+            audience: None,
+        };
+        let resp = exchange_refresh_token(state.clone(), params, None, None).await;
+
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["error"].as_str(), Some("invalid_grant"));
+        assert!(value["error_description"].as_str().unwrap().contains("frozen"));
+        assert_eq!(store.put_count(), 1, "UCAN refresh must not persist a replacement");
+        assert!(
+            state.get_refresh_token("legacy-ucan-refresh").await.unwrap().is_none(),
+            "the legacy UCAN refresh must be consumed, not left reusable",
         );
     }
 }
