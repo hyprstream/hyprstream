@@ -1390,21 +1390,25 @@ mod pds_store_tests {
     /// and this test would fail on the final assertion.
     #[test]
     fn publisher_resolves_live_generation_across_rotation() {
-        use crate::auth::identity_store::write_ca_signing_key;
         use crate::auth::key_rotation::{
             persist_es256_slot, Es256KeySlot, Es256KeySlots, Es256SigningKeyStore,
         };
-        use crate::auth::op_log::{seal_op_log_head, SealedHeadEs256Source};
+        use crate::auth::op_log::{
+            publish_head_verifying_key, seal_op_log_head, SealedHeadEs256Source,
+        };
         use ed25519_dalek::SigningKey as Ed25519SigningKey;
 
         let pds_dir = tempfile::tempdir().expect("pds tempdir");
         let secrets_dir = tempfile::tempdir().expect("secrets tempdir");
+        let state_dir = tempfile::tempdir().expect("oplog state tempdir");
         let secrets = secrets_dir.path();
-        let root = Ed25519SigningKey::from_bytes(&[0x5a; 32]);
-        write_ca_signing_key(secrets, &root).unwrap();
-        let ca = hyprstream_rpc::node_identity::derive_purpose_key(&root, "hyprstream-jwt-v1");
+        let state = state_dir.path();
+        // Dedicated head key; the public verifying key is published to the
+        // shared state dir (the registry loads only this public key).
+        let head_sk = Ed25519SigningKey::generate(&mut rand::rngs::OsRng);
+        publish_head_verifying_key(state, &head_sk).unwrap();
 
-        // Process A (the rotator): K1 active, persisted, head sealed.
+        // Process A (the rotator): K1 active, persisted, head sealed (async).
         let k1 = SigningKey::random(&mut rand::rngs::OsRng);
         let k1_vk: VerifyingKey = *k1.verifying_key();
         let k1_slot = Es256KeySlot::new(k1, 0, 0);
@@ -1414,13 +1418,14 @@ mod pds_store_tests {
             lead: None,
         });
         persist_es256_slot(secrets, "active", &k1_slot).unwrap();
-        seal_op_log_head(secrets, &ca, &es256_store).unwrap();
+        block_on(seal_op_log_head(state, &head_sk, &es256_store)).expect("seal");
 
         // Process B (the registry/publisher): resolves the generation from the
-        // sealed head — the `--ipc` cross-process read path.
+        // sealed head — the `--ipc` cross-process read path. Holds no private
+        // head material.
         let pds_store = Arc::new(PdsRecordStore::open(pds_dir.path()).expect("open rw"));
         let source: Arc<dyn crate::auth::ActiveGenerationSource> =
-            Arc::new(SealedHeadEs256Source::from_root(secrets, &root));
+            Arc::new(SealedHeadEs256Source::new(state, secrets));
         let publisher = PdsPublisher::with_generation_source(
             Arc::clone(&pds_store),
             DID.to_owned(),
@@ -1442,7 +1447,7 @@ mod pds_store_tests {
         persist_es256_slot(secrets, "drain", &k1_slot).unwrap();
         persist_es256_slot(secrets, "active", &k2_slot).unwrap();
         es256_store.0.blocking_write().active = Some(k2_slot);
-        seal_op_log_head(secrets, &ca, &es256_store).unwrap();
+        block_on(seal_op_log_head(state, &head_sk, &es256_store)).expect("seal");
 
         // Same publisher instance, new commit. It MUST be signed by K2 — the
         // publisher observed the rotation through the re-sealed head.

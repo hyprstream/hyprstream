@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tokio::time::MissedTickBehavior;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use crate::config::OAuthConfig;
 
@@ -1356,13 +1356,16 @@ pub fn spawn_rotation_task(
                 // C4 (#1170): re-seal the op-log head after the ES256
                 // promotion so cross-process readers (the registry's
                 // `PdsPublisher` under `--ipc`) observe the new active
-                // `#atproto` generation. C2 (#1168) seam — see `auth::op_log`.
-                if let Err(error) = super::op_log::seal_op_log_head(
-                    &secrets_dir,
-                    extra.composite_ca_key.as_ref(),
-                    es256,
-                ) {
-                    warn!("failed to re-seal op-log head after ES256 rotation: {error}");
+                // `#atproto` generation. Dedicated head-signing key + shared
+                // state dir; async because the ES256 store is a tokio RwLock
+                // (F1). C2 (#1168) seam — see `auth::op_log`.
+                if let Err(error) =
+                    super::op_log::advance_sealed_head(&secrets_dir, es256).await
+                {
+                    error!(
+                        "failed to re-seal op-log head after ES256 rotation; \
+                         cross-process readers will retain the prior generation: {error}"
+                    );
                 }
             }
             if let (Some(ref ml_dsa), Some(expected_component_digest)) =

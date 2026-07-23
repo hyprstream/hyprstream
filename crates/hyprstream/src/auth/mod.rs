@@ -29,9 +29,9 @@ pub use federation::FederationKeyResolver;
 pub use jwt::{Claims, JwtError};
 pub use key_rotation::{SigningKeyStore, Es256SigningKeyStore, Es256KeySlot, RotationStores};
 pub use op_log::{
-    head_signing_key_from_root, seal_op_log_head, sealed_head_path, ActiveGeneration,
-    ActiveGenerationSource, FixedGenerationSource, SealedHeadEs256Source, SealedOpLogHead,
-    SEALED_HEAD_FILENAME,
+    load_head_verifying_key, load_or_init_head_signing_key, publish_head_verifying_key,
+    resolve_oplog_state_dir, seal_op_log_head, ActiveGeneration, ActiveGenerationSource,
+    FixedGenerationSource, SealedHeadEs256Source, SealedOpLogHead,
 };
 pub use key_rotation::{MlDsaSigningKeyStore, MlDsaKeySlot};
 pub use policy_manager::{PolicyManager, PolicyError, write_policy_file, global_policy_manager, set_global_policy_manager};

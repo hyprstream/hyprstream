@@ -713,17 +713,17 @@ fn create_registry_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawn
         // C4 (#1170, closes #1123): the publisher resolves the active
         // `#atproto` generation from the **sealed op-log head** at sign time,
         // not a key frozen here at construction. The head is written by the
-        // OAuth rotation task (and at OAuth boot) to this shared secrets dir,
-        // so under `--ipc` a rotation performed by the OAuth process is
-        // observed here with no event-delivery mechanism. The head is signed
-        // by a purpose-key derived from the node CA root; load the root so the
-        // reader can derive the matching verifying key. If the head is absent
-        // (e.g. C2 not yet wired, or OAuth not booted in this deployment),
-        // `active_generation()` returns `None` and the publisher declines to
-        // sign — fail-closed, never a stale frozen key.
-        let node_root = crate::auth::identity_store::load_ca_signing_key(&secrets_dir)?;
+        // OAuth rotation task to a dedicated shared state dir (NOT the
+        // read-only credentials dir), and is signed by a dedicated head key
+        // whose *public* verifying key the registry loads here — the registry
+        // holds NO CA private key. Under `--ipc` a rotation by the OAuth
+        // process is observed with no event-delivery mechanism. If the head is
+        // absent (OAuth not booted, or the shared state dir not provisioned —
+        // #808 under systemd), `active_generation()` returns `None` and the
+        // publisher declines to sign: fail-closed, never a stale frozen key.
+        let oplog_state_dir = crate::auth::resolve_oplog_state_dir(&secrets_dir)?;
         let generation_source: Arc<dyn crate::auth::ActiveGenerationSource> = Arc::new(
-            crate::auth::SealedHeadEs256Source::from_root(&secrets_dir, &node_root),
+            crate::auth::SealedHeadEs256Source::new(&oplog_state_dir, &secrets_dir),
         );
         let acceptance_identity = ctx.service_signing_key("registry");
         anyhow::ensure!(
