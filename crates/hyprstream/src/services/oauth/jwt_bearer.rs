@@ -165,41 +165,6 @@ fn decode_with_any_service_key_at(
     })
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use ed25519_dalek::SigningKey;
-
-    fn attestation(expires_at: i64) -> hyprstream_service::Attestation {
-        hyprstream_service::Attestation { scopes: std::iter::once("model".to_owned()).collect(), subject: None, jwt: None, expires_at, attested_by: None }
-    }
-
-    #[test]
-    fn overlap_accepts_both_keys_then_rejects_retired_key_at_deadline() {
-        let trust = hyprstream_service::TrustStore::new();
-        let retired = SigningKey::generate(&mut rand::rngs::OsRng);
-        let lead = SigningKey::generate(&mut rand::rngs::OsRng);
-        let now = chrono::Utc::now().timestamp();
-        let retirement = now + 60;
-        trust.insert(retired.verifying_key(), attestation(retirement));
-        trust.insert(lead.verifying_key(), attestation(now + 600));
-        for signer in [&retired, &lead] {
-            let assertion = hyprstream_rpc::auth::jwt::encode(
-                &hyprstream_rpc::auth::Claims::new("service:model".to_owned(), now, now + 300)
-                    .with_issuer("https://issuer.example".to_owned())
-                    .with_audience(Some("https://issuer.example/oauth/token".to_owned())), signer);
-            let (_, verified) = decode_with_any_service_key_at(&trust, &assertion, "model", "https://issuer.example/oauth/token", now)
-                .expect("each overlap key must verify its own assertion");
-            assert_eq!(verified, signer.verifying_key());
-        }
-        let retired_assertion = hyprstream_rpc::auth::jwt::encode(
-            &hyprstream_rpc::auth::Claims::new("service:model".to_owned(), now, now + 300)
-                .with_issuer("https://issuer.example".to_owned())
-                .with_audience(Some("https://issuer.example/oauth/token".to_owned())), &retired);
-        assert!(decode_with_any_service_key_at(&trust, &retired_assertion, "model", "https://issuer.example/oauth/token", retirement).is_none());
-    }
-}
-
 /// Fetch a verifying key for a federated issuer by resolving JWKS.
 /// Matches the `kid` JWT header against keys in the JWKS endpoint.
 /// Falls back to the first Ed25519 (OKP/Ed25519) key when no `kid` matches.
@@ -278,4 +243,40 @@ fn jwt_bearer_error(status: StatusCode, error: &str, description: &str) -> Respo
         })),
     )
         .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ed25519_dalek::SigningKey;
+
+    fn attestation(expires_at: i64) -> hyprstream_service::Attestation {
+        hyprstream_service::Attestation { scopes: std::iter::once("model".to_owned()).collect(), subject: None, jwt: None, expires_at, attested_by: None }
+    }
+
+    #[test]
+    fn overlap_accepts_both_keys_then_rejects_retired_key_at_deadline() {
+        let trust = hyprstream_service::TrustStore::new();
+        let retired = SigningKey::generate(&mut rand::rngs::OsRng);
+        let lead = SigningKey::generate(&mut rand::rngs::OsRng);
+        let now = chrono::Utc::now().timestamp();
+        let retirement = now + 60;
+        trust.insert(retired.verifying_key(), attestation(retirement));
+        trust.insert(lead.verifying_key(), attestation(now + 600));
+        for signer in [&retired, &lead] {
+            let assertion = hyprstream_rpc::auth::jwt::encode(
+                &hyprstream_rpc::auth::Claims::new("service:model".to_owned(), now, now + 300)
+                    .with_issuer("https://issuer.example".to_owned())
+                    .with_audience(Some("https://issuer.example/oauth/token".to_owned())), signer);
+            let Some((_, verified)) = decode_with_any_service_key_at(&trust, &assertion, "model", "https://issuer.example/oauth/token", now) else {
+                panic!("each overlap key must verify its own assertion");
+            };
+            assert_eq!(verified, signer.verifying_key());
+        }
+        let retired_assertion = hyprstream_rpc::auth::jwt::encode(
+            &hyprstream_rpc::auth::Claims::new("service:model".to_owned(), now, now + 300)
+                .with_issuer("https://issuer.example".to_owned())
+                .with_audience(Some("https://issuer.example/oauth/token".to_owned())), &retired);
+        assert!(decode_with_any_service_key_at(&trust, &retired_assertion, "model", "https://issuer.example/oauth/token", retirement).is_none());
+    }
 }

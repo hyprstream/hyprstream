@@ -1846,7 +1846,10 @@ mod tests {
         let key = SigningKey::generate(&mut rand::rngs::OsRng).verifying_key();
         trust.insert(key, attestation(chrono::Utc::now().timestamp() + 60, "certificate"));
 
-        let response = published_service_key_response(&trust, "model").unwrap();
+        let response = match published_service_key_response(&trust, "model") {
+            Ok(response) => response,
+            Err(error) => panic!("one-key response: {error}"),
+        };
         assert_eq!(response.keys.len(), 1);
         assert_eq!(response.verifying_key, key.to_bytes());
         assert_eq!(response.service_jwt.as_deref(), Some("certificate"));
