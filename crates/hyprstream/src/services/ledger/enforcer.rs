@@ -66,11 +66,10 @@ impl Rejection {
 
 /// Identity produced by the authenticated transport boundary.
 ///
-/// This is deliberately opaque and has no production constructor yet. The
-/// #761 PEP must create it beside envelope verification, from the exact
-/// pairwise DID and the verified key material from that same envelope. Until
-/// that wiring exists, request data cannot manufacture an authenticated
-/// identity for ledger admission.
+/// This is deliberately opaque. Production callers can only create it from
+/// [`hyprstream_rpc::EnvelopeContext`], after the RPC layer has verified the
+/// envelope and bound its subject to the same signer key. Request fields cannot
+/// manufacture an authenticated identity for ledger admission.
 #[derive(Debug, Clone)]
 pub struct AuthenticatedSubject {
     did: Did,
@@ -78,14 +77,39 @@ pub struct AuthenticatedSubject {
     pq_vk: Option<MlDsaVerifyingKey>,
 }
 
+/// Why an authenticated transport context could not be converted for ledger
+/// admission. The caller must fail closed rather than substitute request data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthenticatedSubjectError {
+    /// The transport did not establish a non-anonymous subject.
+    Anonymous,
+    /// The verified transport signer was not a valid Ed25519 public key.
+    InvalidSignerKey,
+}
+
 impl AuthenticatedSubject {
-    #[cfg(test)]
-    fn for_test(
-        did: Did,
-        ed_vk: ed25519_dalek::VerifyingKey,
-        pq_vk: Option<MlDsaVerifyingKey>,
-    ) -> Self {
-        Self { did, ed_vk, pq_vk }
+    /// Convert the current RPC authentication result into a ledger subject.
+    ///
+    /// `EnvelopeContext` is produced after signature verification. Its subject
+    /// is either resolved from that signer key or, for a JWT, confirmation-bound
+    /// to it by `verify_claims()`. Both the DID and authorization keys below
+    /// therefore originate at the authenticated transport boundary.
+    pub fn from_verified_envelope(
+        ctx: &hyprstream_rpc::EnvelopeContext,
+    ) -> Result<Self, AuthenticatedSubjectError> {
+        let did = ctx
+            .subject()
+            .name()
+            .map(|name| Did(name.to_owned()))
+            .ok_or(AuthenticatedSubjectError::Anonymous)?;
+        let ed_vk = ctx
+            .authenticated_signer_key()
+            .ok_or(AuthenticatedSubjectError::InvalidSignerKey)?;
+        Ok(Self {
+            did,
+            ed_vk,
+            pq_vk: ctx.authenticated_pq_signer_key(),
+        })
     }
 }
 
@@ -471,16 +495,16 @@ mod tests {
         u128::from_be_bytes(buf)
     }
 
-    fn authenticated_subject(
+    fn authenticated_transport_subject(
         did: Did,
         ed_sk: &ed25519_dalek::SigningKey,
-        pq_sk: &hyprstream_crypto::pq::MlDsaSigningKey,
     ) -> AuthenticatedSubject {
-        AuthenticatedSubject::for_test(
-            did,
+        let ctx = hyprstream_rpc::EnvelopeContext::for_test_authenticated_subject(
+            hyprstream_rpc::Subject::new(did.as_str()),
             ed_sk.verifying_key(),
-            Some(ml_dsa_vk_from_bytes(&ml_dsa_sk_to_vk_bytes(pq_sk)).unwrap()),
-        )
+        );
+        AuthenticatedSubject::from_verified_envelope(&ctx)
+            .expect("authenticated transport context must convert")
     }
 
     /// Build a fully-wired enforcer over a fresh MemLedger, with `grant_cap`
@@ -670,7 +694,7 @@ mod tests {
             &pq_sk,
         );
         let req = AdmissionRequest {
-            authenticated_subject: Some(authenticated_subject(holder, &ed_sk, &pq_sk)),
+            authenticated_subject: Some(authenticated_transport_subject(holder, &ed_sk)),
             grant_cid,
             unit: unit(),
             amount: 100,
@@ -695,9 +719,9 @@ mod tests {
     /// unauthenticated work, not harmless accounting. Must hard-reject.
     #[tokio::test]
     async fn zero_amount_without_authz_denied_hard() {
-        let (enf, holder, grant_cid, _debit, _credit, ed_sk, pq_sk) = fixture(1000).await;
+        let (enf, holder, grant_cid, _debit, _credit, ed_sk, _pq_sk) = fixture(1000).await;
         let req = AdmissionRequest {
-            authenticated_subject: Some(authenticated_subject(holder, &ed_sk, &pq_sk)),
+            authenticated_subject: Some(authenticated_transport_subject(holder, &ed_sk)),
             grant_cid,
             unit: unit(),
             amount: 0,
@@ -735,7 +759,7 @@ mod tests {
             &pq_sk,
         );
         let req = AdmissionRequest {
-            authenticated_subject: Some(authenticated_subject(holder, &ed_sk, &pq_sk)),
+            authenticated_subject: Some(authenticated_transport_subject(holder, &ed_sk)),
             grant_cid,
             unit: unit(),
             amount: 100,
@@ -770,7 +794,7 @@ mod tests {
             &pq_sk,
         );
         let req = AdmissionRequest {
-            authenticated_subject: Some(authenticated_subject(holder.clone(), &ed_sk, &pq_sk)),
+            authenticated_subject: Some(authenticated_transport_subject(holder.clone(), &ed_sk)),
             grant_cid: grant_cid.clone(),
             unit: unit(),
             amount: 100,
@@ -815,10 +839,9 @@ mod tests {
             // Alice's grant is presented with Bob's *authenticated* transport
             // identity and Bob's matching verified keys. There is no
             // caller-controlled subject field to assert Alice instead.
-            authenticated_subject: Some(authenticated_subject(
+            authenticated_subject: Some(authenticated_transport_subject(
                 Did("did:web:bob".to_owned()),
                 &attacker_ed_sk,
-                &attacker_pq_sk,
             )),
             grant_cid,
             unit: unit(),
@@ -870,7 +893,7 @@ mod tests {
             &pq_sk,
         );
         let req = AdmissionRequest {
-            authenticated_subject: Some(authenticated_subject(holder, &ed_sk, &pq_sk)),
+            authenticated_subject: Some(authenticated_transport_subject(holder, &ed_sk)),
             grant_cid,
             unit: unit(),
             amount: 500, // > available 100

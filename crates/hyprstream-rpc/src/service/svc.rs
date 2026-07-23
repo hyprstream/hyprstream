@@ -307,6 +307,68 @@ impl EnvelopeContext {
         !self.subject().is_anonymous()
     }
 
+    /// Return the verified Ed25519 signer key for this authenticated request.
+    ///
+    /// This is the authentication-bound key material for the subject returned
+    /// by [`Self::subject`].  For JWT callers, `verify_claims()` requires the
+    /// JWT confirmation key to match `cnf` before the context reaches a
+    /// handler.  For key-resolved callers, the subject is resolved from this
+    /// same verified key.  Callback contexts have no envelope signer and are
+    /// deliberately refused.
+    #[must_use]
+    pub fn authenticated_signer_key(&self) -> Option<ed25519_dalek::VerifyingKey> {
+        if !self.is_authenticated() || self.cnf == [0u8; 32] {
+            return None;
+        }
+        ed25519_dalek::VerifyingKey::from_bytes(&self.cnf).ok()
+    }
+
+    /// Return the trusted PQ key anchored to this request's verified signer.
+    ///
+    /// A missing binding is represented as `None` because Classical transport
+    /// authentication is a valid, lower-assurance state; the returned key is
+    /// never taken from request data.
+    #[must_use]
+    pub fn authenticated_pq_signer_key(&self) -> Option<crate::crypto::pq::MlDsaVerifyingKey> {
+        self.authenticated_signer_key()?;
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            crate::envelope::global_pq_store().and_then(|store| store.ml_dsa_key_for(&self.cnf))
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            None
+        }
+    }
+
+    /// Build an authenticated context fixture for downstream integration tests.
+    ///
+    /// This is intentionally absent from production builds: production contexts
+    /// are created only after envelope verification.
+    #[cfg(any(test, feature = "test-classical-policy"))]
+    pub fn for_test_authenticated_subject(
+        subject: Subject,
+        signer: ed25519_dalek::VerifyingKey,
+    ) -> Self {
+        Self {
+            request_id: 0,
+            claims: None,
+            jwt_token: None,
+            key_derived_subject: subject,
+            jwt_subject: None,
+            cnf: signer.to_bytes(),
+            envelope_wit_hash: None,
+            client_dh_public: None,
+            client_kem_public: None,
+            request_iat: 0,
+            request_nonce: [0; 16],
+            response_kem_recipient: None,
+            service_domain: None,
+            browser_method_discriminator: None,
+            is_local_caller: false,
+        }
+    }
+
     /// Get user claims (if present, after verify_claims has run).
     pub fn claims(&self) -> Option<&crate::auth::Claims> {
         self.claims.as_ref()

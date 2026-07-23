@@ -45,7 +45,8 @@ pub use credit_gate::{
     VerifiedGrant,
 };
 pub use enforcer::{
-    AdmissionRequest, AdmissionResult, AuthenticatedSubject, LocalEnforcer, Rejection,
+    AdmissionRequest, AdmissionResult, AuthenticatedSubject, AuthenticatedSubjectError,
+    LocalEnforcer, Rejection,
 };
 pub use handle::LedgerHandle;
 pub use service::LedgerService;
