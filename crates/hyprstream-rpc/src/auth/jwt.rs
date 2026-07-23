@@ -714,7 +714,7 @@ pub fn decode_composite(
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-    use crate::auth::Claims;
+    use crate::auth::{Claims, IssuerResolver, JwksFetcher, JwksKeySource, JwksMode, JwtKeySource};
     use ed25519_dalek::SigningKey;
 
     fn make_key(seed: u8) -> SigningKey {
@@ -820,6 +820,146 @@ mod tests {
             matches!(result, Err(JwtError::InvalidSignature)),
             "wrong key must yield InvalidSignature"
         );
+    }
+
+    /// I2b / #1234: every JWKS-derived lookup is issuer-scoped. In
+    /// particular, preloading issuer A must not make an issuer-B token signed
+    /// by A acceptable merely because both JWKS documents reuse a `kid`.
+    #[tokio::test]
+    async fn cross_issuer_shared_kid_rejects_issuer_a_signature() -> anyhow::Result<()> {
+        use std::sync::{
+            atomic::{AtomicU32, Ordering},
+            Arc,
+        };
+
+        const ISSUER_A: &str = "https://issuer-a.example";
+        const ISSUER_B: &str = "https://issuer-b.example";
+        const SHARED_KID: &str = "shared-kid";
+        const METADATA_KID: &str = "shared-metadata-kid";
+
+        struct TestResolver;
+
+        #[async_trait::async_trait]
+        impl IssuerResolver for TestResolver {
+            async fn resolve(&self, issuer: &str) -> anyhow::Result<String> {
+                Ok(format!("{issuer}/jwks"))
+            }
+        }
+
+        fn ed25519_jwk(signing_key: &SigningKey, kid: &str) -> serde_json::Value {
+            serde_json::json!({
+                "kty": "OKP",
+                "crv": "Ed25519",
+                "use": "sig",
+                "alg": "EdDSA",
+                "kid": kid,
+                "x": URL_SAFE_NO_PAD.encode(signing_key.verifying_key().as_bytes()),
+            })
+        }
+
+        let issuer_a_key = make_key(0xA1);
+        let issuer_b_key = make_key(0xB2);
+        let issuer_a_jwks = serde_json::json!({
+            "keys": [
+                ed25519_jwk(&issuer_a_key, SHARED_KID),
+                {
+                    "kty": "AKP",
+                    "use": "sig",
+                    "alg": "ML-DSA-65-Ed25519",
+                    "kid": METADATA_KID,
+                    "pub": URL_SAFE_NO_PAD.encode([0u8; 16]),
+                },
+            ]
+        });
+        let issuer_b_jwks = serde_json::json!({
+            "keys": [
+                ed25519_jwk(&issuer_b_key, SHARED_KID),
+                {
+                    "kty": "AKP",
+                    "use": "sig",
+                    "alg": "ML-DSA-65",
+                    "kid": METADATA_KID,
+                    "pub": URL_SAFE_NO_PAD.encode([1u8; 16]),
+                },
+            ]
+        });
+
+        let issuer_a_fetches = Arc::new(AtomicU32::new(0));
+        let issuer_b_fetches = Arc::new(AtomicU32::new(0));
+        let fetcher: JwksFetcher = {
+            let issuer_a_fetches = issuer_a_fetches.clone();
+            let issuer_b_fetches = issuer_b_fetches.clone();
+            Arc::new(move |url| {
+                let jwks = if url == format!("{ISSUER_A}/jwks") {
+                    issuer_a_fetches.fetch_add(1, Ordering::Relaxed);
+                    issuer_a_jwks.clone()
+                } else if url == format!("{ISSUER_B}/jwks") {
+                    issuer_b_fetches.fetch_add(1, Ordering::Relaxed);
+                    issuer_b_jwks.clone()
+                } else {
+                    return Box::pin(async move { anyhow::bail!("unexpected JWKS URL: {url}") });
+                };
+                Box::pin(async move { Ok(jwks) })
+            })
+        };
+
+        let key_source = JwksKeySource::new(
+            JwksMode::Federated {
+                local_jwks_url: "https://local.example/jwks".to_owned(),
+                resolver: Arc::new(TestResolver),
+            },
+            "https://local.example".to_owned(),
+            fetcher,
+        );
+
+        // Prime issuer A's positive cache under the deliberately shared kid.
+        let selected_a = key_source.get_key(ISSUER_A, Some(SHARED_KID)).await?;
+        assert_eq!(selected_a, issuer_a_key.verifying_key());
+
+        let claims = Claims::new("issuer-b-subject".to_owned(), 0, 9_999_999_999)
+            .with_issuer(ISSUER_B.to_owned());
+        let header = format!(r#"{{"alg":"EdDSA","typ":"JWT","kid":"{SHARED_KID}"}}"#);
+        let forged = encode_with_header(&claims, &issuer_a_key, &header);
+
+        // Issuer B must resolve only B's key, so A's signature is rejected.
+        let selected_b = key_source.get_key(ISSUER_B, Some(SHARED_KID)).await?;
+        assert_eq!(selected_b, issuer_b_key.verifying_key());
+        assert!(matches!(
+            decode_with_key(&forged, &selected_b, None),
+            Err(JwtError::InvalidSignature)
+        ));
+
+        // Kid-less candidates and kid→alg metadata are issuer-scoped too.
+        assert_eq!(
+            key_source.get_keys(ISSUER_B, None).await?,
+            vec![issuer_b_key.verifying_key()]
+        );
+        assert_eq!(
+            key_source.kid_algs(ISSUER_A, METADATA_KID),
+            vec!["ML-DSA-65-Ed25519".to_owned()]
+        );
+        assert_eq!(
+            key_source.kid_algs(ISSUER_B, METADATA_KID),
+            vec!["ML-DSA-65".to_owned()]
+        );
+
+        // A negative hit for issuer A must not suppress issuer B's fetch.
+        assert!(key_source
+            .get_key(ISSUER_A, Some("missing-kid"))
+            .await
+            .is_err());
+        assert!(key_source
+            .get_key(ISSUER_A, Some("missing-kid"))
+            .await
+            .is_err());
+        assert_eq!(issuer_a_fetches.load(Ordering::Relaxed), 2);
+        assert!(key_source
+            .get_key(ISSUER_B, Some("missing-kid"))
+            .await
+            .is_err());
+        assert_eq!(issuer_b_fetches.load(Ordering::Relaxed), 2);
+
+        Ok(())
     }
 
     #[test]

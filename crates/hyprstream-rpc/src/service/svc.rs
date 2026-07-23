@@ -764,7 +764,7 @@ pub trait RequestService: 'static {
         // post-quantum half of a composite signature and presenting only the
         // classical EdDSA half under the composite kid.
         if let Some(ref kid_str) = kid {
-            let listed_algs = key_source.kid_algs(kid_str);
+            let listed_algs = key_source.kid_algs(&unverified.iss, kid_str);
             if !listed_algs.is_empty() {
                 if !listed_algs.iter().any(|a| a == &alg) {
                     tracing::warn!(

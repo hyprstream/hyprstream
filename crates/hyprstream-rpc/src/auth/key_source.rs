@@ -32,7 +32,7 @@
 use anyhow::Result;
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use ed25519_dalek::VerifyingKey;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::{RwLock, Semaphore};
 
@@ -108,7 +108,7 @@ pub trait JwtKeySource: Send + Sync + 'static {
     /// Default implementation returns an empty vec, which means "no policy
     /// constraint" (legacy behavior). Implementations backed by JWKS should
     /// override to surface the algs they observed.
-    fn kid_algs(&self, _kid: &str) -> Vec<String> {
+    fn kid_algs(&self, _issuer: &str, _kid: &str) -> Vec<String> {
         Vec::new()
     }
 }
@@ -315,8 +315,8 @@ impl JwtKeySource for FederatedKeySource {
         self.local.composite_key_set()
     }
 
-    fn kid_algs(&self, kid: &str) -> Vec<String> {
-        self.local.kid_algs(kid)
+    fn kid_algs(&self, issuer: &str, kid: &str) -> Vec<String> {
+        self.local.kid_algs(issuer, kid)
     }
 }
 
@@ -370,25 +370,24 @@ struct CachedKey {
     fetched_at: std::time::Instant,
 }
 
-/// JWKS-backed key source with kid-based resolution.
+/// JWKS-backed key source with issuer-and-kid-based resolution.
 ///
 /// Replaces `ClusterKeySource` with standards-aligned JWKS key lookup:
-/// - Caches keys by kid after fetching from the JWKS endpoint
+/// - Caches keys by `(issuer, kid)` after fetching from the JWKS endpoint
 /// - On cache miss, refetches JWKS (primary invalidation mechanism)
-/// - Negative cache prevents DoS from random kid spam (5s TTL)
+/// - Issuer-scoped negative cache prevents DoS from random kid spam (5s TTL)
 /// - Semaphore bounds concurrent JWKS fetches
 pub struct JwksKeySource {
     mode: JwksMode,
     local_issuer_url: String,
     local_issuers_vec: Vec<String>,
     fetcher: JwksFetcher,
-    cache: RwLock<HashMap<String, CachedKey>>,
-    negative_cache: RwLock<HashMap<String, std::time::Instant>>,
-    /// Multi-alg map: kid → all `alg` values present in the JWKS for that kid.
-    /// Populated alongside `cache` during `fetch_and_cache`. Used by `kid_algs`
-    /// to implement the stripping-defense policy (verifier must require all
-    /// listed algs for a composite-signed kid).
-    kid_alg_map: parking_lot::RwLock<HashMap<String, Vec<String>>>,
+    cache: RwLock<HashMap<String, HashMap<String, CachedKey>>>,
+    negative_cache: RwLock<HashMap<String, HashMap<String, std::time::Instant>>>,
+    /// Multi-alg map: issuer → kid → all `alg` values in that issuer's JWKS.
+    /// Populated alongside `cache` during `fetch_and_cache`. Both dimensions
+    /// are security boundaries: two issuers may legitimately reuse a kid.
+    kid_alg_map: parking_lot::RwLock<HashMap<String, HashMap<String, Vec<String>>>>,
     fetch_semaphore: Semaphore,
     /// Soft TTL for cache refresh (keys older than this trigger background refresh)
     #[allow(dead_code)]
@@ -506,10 +505,8 @@ impl JwksKeySource {
             .ok_or_else(|| anyhow::anyhow!("JWKS response missing 'keys' array"))?;
 
         let now = std::time::Instant::now();
-        let mut cache = self.cache.write().await;
-
-        // Rebuild kid → algs map from this JWKS snapshot.
-        let mut new_kid_algs: HashMap<String, Vec<String>> = HashMap::new();
+        let mut issuer_cache: HashMap<String, CachedKey> = HashMap::new();
+        let mut issuer_kid_algs: HashMap<String, Vec<String>> = HashMap::new();
 
         for key in keys {
             let kty = key.get("kty").and_then(|v| v.as_str()).unwrap_or_default();
@@ -522,7 +519,7 @@ impl JwksKeySource {
             // need to record those algs even though we can't verify-decode them
             // here.
             if let (Some(kid_str), Some(alg)) = (kid.as_ref(), alg) {
-                let entry = new_kid_algs.entry(kid_str.clone()).or_default();
+                let entry = issuer_kid_algs.entry(kid_str.clone()).or_default();
                 if !entry.contains(&alg) {
                     entry.push(alg);
                 }
@@ -536,7 +533,7 @@ impl JwksKeySource {
                                 let mut arr = [0u8; 32];
                                 arr.copy_from_slice(&x_bytes);
                                 if let Ok(vk) = VerifyingKey::from_bytes(&arr) {
-                                    cache.insert(
+                                    issuer_cache.insert(
                                         kid,
                                         CachedKey {
                                             verifying_key: vk,
@@ -551,12 +548,24 @@ impl JwksKeySource {
             }
         }
 
-        // Publish the new kid→algs view atomically.
-        *self.kid_alg_map.write() = new_kid_algs;
+        let cached_kids: HashSet<String> = issuer_cache.keys().cloned().collect();
 
-        // Clear negative cache entries for keys we now have
+        // Replace only this issuer's snapshot. A kid is not globally unique:
+        // publishing issuer B must neither overwrite nor expose issuer A's
+        // keys or algorithm metadata.
+        self.cache
+            .write()
+            .await
+            .insert(issuer.to_owned(), issuer_cache);
+        self.kid_alg_map
+            .write()
+            .insert(issuer.to_owned(), issuer_kid_algs);
+
+        // Clear negative-cache entries only for keys this issuer now has.
         let mut neg = self.negative_cache.write().await;
-        neg.retain(|kid, _| !cache.contains_key(kid));
+        if let Some(issuer_neg) = neg.get_mut(issuer) {
+            issuer_neg.retain(|kid, _| !cached_kids.contains(kid));
+        }
 
         Ok(())
     }
@@ -583,7 +592,10 @@ impl JwksKeySource {
         }
         {
             let cache = self.cache.read().await;
-            if let Some(entry) = cache.get(kid_str) {
+            if let Some(entry) = cache
+                .get(issuer)
+                .and_then(|issuer_cache| issuer_cache.get(kid_str))
+            {
                 return Ok(entry.verifying_key);
             }
         }
@@ -591,7 +603,10 @@ impl JwksKeySource {
         // Check negative cache
         {
             let neg = self.negative_cache.read().await;
-            if let Some(&ts) = neg.get(kid_str) {
+            if let Some(&ts) = neg
+                .get(issuer)
+                .and_then(|issuer_cache| issuer_cache.get(kid_str))
+            {
                 if ts.elapsed() < self.negative_ttl {
                     anyhow::bail!("Key not found for kid={} (negative cached)", kid_str);
                 }
@@ -605,14 +620,20 @@ impl JwksKeySource {
 
         // Retry from cache
         let cache = self.cache.read().await;
-        if let Some(entry) = cache.get(kid_str) {
+        if let Some(entry) = cache
+            .get(issuer)
+            .and_then(|issuer_cache| issuer_cache.get(kid_str))
+        {
             return Ok(entry.verifying_key);
         }
+        drop(cache);
 
         // Add to negative cache
         {
             let mut neg = self.negative_cache.write().await;
-            neg.insert(kid_str.to_owned(), std::time::Instant::now());
+            neg.entry(issuer.to_owned())
+                .or_default()
+                .insert(kid_str.to_owned(), std::time::Instant::now());
         }
 
         anyhow::bail!("Key not found in JWKS for kid={}", kid_str)
@@ -622,7 +643,7 @@ impl JwksKeySource {
     /// empty). Used by the kid-less resolution paths before they read every
     /// candidate out of the cache.
     async fn ensure_cached(&self, issuer: &str) {
-        if self.cache.read().await.is_empty() {
+        if !self.cache.read().await.contains_key(issuer) {
             if let Err(e) = self.fetch_and_cache(issuer).await {
                 tracing::warn!("JWKS fetch failed for issuer={}: {}", issuer, e);
             }
@@ -651,7 +672,10 @@ impl JwtKeySource for JwksKeySource {
         // one" (#1183 / #1184).
         self.ensure_cached(issuer).await;
         let cache = self.cache.read().await;
-        let mut iter = cache.values();
+        let mut iter = cache
+            .get(issuer)
+            .into_iter()
+            .flat_map(|issuer_cache| issuer_cache.values());
         match (iter.next(), iter.next()) {
             (Some(first), None) => Ok(first.verifying_key),
             (None, _) => anyhow::bail!("No Ed25519 keys in JWKS for issuer {}", issuer),
@@ -678,7 +702,12 @@ impl JwtKeySource for JwksKeySource {
         // until one verifies. Never positional selection (#1183 / #1184).
         self.ensure_cached(issuer).await;
         let cache = self.cache.read().await;
-        let v: Vec<VerifyingKey> = cache.values().map(|e| e.verifying_key).collect();
+        let v: Vec<VerifyingKey> = cache
+            .get(issuer)
+            .into_iter()
+            .flat_map(|issuer_cache| issuer_cache.values())
+            .map(|e| e.verifying_key)
+            .collect();
         if v.is_empty() {
             anyhow::bail!("No Ed25519 keys in JWKS for issuer {}", issuer);
         }
@@ -708,10 +737,11 @@ impl JwtKeySource for JwksKeySource {
             .clone()
     }
 
-    fn kid_algs(&self, kid: &str) -> Vec<String> {
+    fn kid_algs(&self, issuer: &str, kid: &str) -> Vec<String> {
         self.kid_alg_map
             .read()
-            .get(kid)
+            .get(issuer)
+            .and_then(|issuer_algs| issuer_algs.get(kid))
             .cloned()
             .unwrap_or_default()
     }
@@ -1020,7 +1050,8 @@ mod tests {
     /// (the wrong candidate is returned roughly half the time).
     #[tokio::test]
     async fn jwks_key_source_overlap_non_first_signer_verifies() -> anyhow::Result<()> {
-        use crate::auth::jwt::{decode_with_any_key_lenient, encode};
+        use crate::auth::jwt::decode_with_any_key_lenient;
+        use ed25519_dalek::Signer as _;
 
         let sk_a = SigningKey::from_bytes(&[0x11; 32]);
         let sk_b = SigningKey::from_bytes(&[0x22; 32]);
@@ -1036,7 +1067,13 @@ mod tests {
         // must try both candidates.
         let now = chrono::Utc::now().timestamp();
         let claims = crate::auth::Claims::new("user-1".to_owned(), now, now + 300);
-        let token = encode(&claims, &sk_b);
+        let header = URL_SAFE_NO_PAD.encode(r#"{"alg":"EdDSA","typ":"at+jwt"}"#);
+        let payload = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims)?);
+        let signing_input = format!("{header}.{payload}");
+        let token = format!(
+            "{signing_input}.{}",
+            URL_SAFE_NO_PAD.encode(sk_b.sign(signing_input.as_bytes()).to_bytes())
+        );
         let candidates = ks.get_keys("http://localhost", None).await?;
         let verified = decode_with_any_key_lenient(&token, &candidates, None)?;
         assert_eq!(verified.sub, "user-1");
@@ -1122,7 +1159,7 @@ mod tests {
         );
         // Trigger cache fill (looking up an unknown Ed25519 kid still pulls JWKS).
         let _ = ks.get_key("http://localhost", Some("unknown")).await;
-        let algs = ks.kid_algs(kid);
+        let algs = ks.kid_algs("http://localhost", kid);
         assert_eq!(algs, vec!["ML-DSA-65-Ed25519".to_owned()]);
         Ok(())
     }
@@ -1153,7 +1190,7 @@ mod tests {
             mock_fetcher(jwks),
         );
         let _ = ks.get_key("http://localhost", Some(&kid)).await?;
-        let mut algs = ks.kid_algs(&kid);
+        let mut algs = ks.kid_algs("http://localhost", &kid);
         algs.sort();
         assert_eq!(algs, vec!["EdDSA".to_owned(), "ML-DSA-65".to_owned()]);
         Ok(())
@@ -1165,7 +1202,7 @@ mod tests {
     #[test]
     fn dpop_stripping_default_impl_empty() {
         let ks = ClusterKeySource::new(test_ca_key(), "http://localhost:9080".to_owned());
-        assert!(ks.kid_algs("anything").is_empty());
+        assert!(ks.kid_algs("http://localhost:9080", "anything").is_empty());
     }
 
     #[test]
