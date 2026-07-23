@@ -1491,6 +1491,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn review_empty_walk_clone_must_not_rebind_memory_fid_to_root() {
+        struct ByPath;
+        impl ObjectLabelResolver for ByPath {
+            fn resolve(&self, object: ObjectRef<'_>) -> Option<SecurityLabel> {
+                match object {
+                    ObjectRef::Path([]) => Some(label(Level::Secret)),
+                    ObjectRef::Path(["public.txt"]) => Some(label(Level::Public)),
+                    ObjectRef::Path(_) | ObjectRef::Cid(_) => None,
+                }
+            }
+        }
+        struct DenySecretReads;
+        impl AccessDecider for DenySecretReads {
+            fn check(
+                &self,
+                _ctx: &SecurityContext,
+                object_label: &SecurityLabel,
+                action: Action,
+            ) -> bool {
+                !(action == Action::Read && object_label.level == Level::Secret)
+            }
+        }
+
+        let backend = MemoryBackend::default();
+        backend.add_file("/public.txt", b"public");
+        let t = Translator::new(Arc::new(backend)).with_reference_monitor(Arc::new(
+            ReferenceMonitor::new(
+                Arc::new(StaticAuth(permit_session(Level::Secret, ALL_OPS))),
+                Arc::new(ByPath),
+                Arc::new(DenySecretReads),
+            ),
+        ));
+
+        t.handle_message(&msg::tattach(1, 0, u32::MAX, "ticket", "/")).await.unwrap();
+        t.handle_message(&msg::twalk(2, 0, 1, &["public.txt"])).await.unwrap();
+        t.handle_message(&msg::twalk(3, 1, 2, &[])).await.unwrap();
+        let (_, read) = t.handle_message(&msg::tread(4, 2, 0, 4096)).await.unwrap();
+        match read {
+            Response::Read { data } => assert_eq!(&data, b"public"),
+            other => panic!(
+                "clone must still point at public.txt; MemoryBackend rebound it to the Secret root: {other:?}"
+            ),
+        }
+    }
+
+    #[tokio::test]
     async fn connection_scoped_translators_do_not_share_fid_context() {
         let root = Translator::new(Arc::new(MemoryBackend::default())).with_reference_monitor(
             monitor(
