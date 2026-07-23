@@ -175,6 +175,32 @@ impl<S: RequestService + Send + Sync + 'static> Spawnable for UnifiedServiceConf
                     // `with_authz` is already honoured.
                     let _moq_authz_default =
                         hyprstream_rpc::transport::iroh_moq::MoqAuthzConfig::default();
+
+                    // #1153: authenticate the `/moq` WebTransport CONNECT and
+                    // bind the session to a tenant on a *shared* multi-tenant
+                    // endpoint. The boundary is opt-in: the `hyprstream` crate
+                    // builds a `MoqConnectAuthz` over the authoritative
+                    // subject→tenant provisioning map (PolicyManager) and
+                    // registers it via
+                    // `QuinnRpcServer::set_global_moq_connect_authz` at startup;
+                    // `QuinnRpcServer::with_capacity` picks it up here
+                    // automatically (same global-seam pattern as the 9P
+                    // handler). When registered, an unauthenticated or
+                    // tenant-less CONNECT is refused before the handshake
+                    // completes (fail-closed) and each authenticated peer sees
+                    // only its own tenant's broadcasts. When NOT registered the
+                    // `/moq` plane stays single-tenant/open — a deployment
+                    // choice, not a hidden wildcard. NOTE: this does not
+                    // enumerate the registered resolver here; it is consumed
+                    // implicitly via the global inside `QuinnRpcServer`. The
+                    // explicit pickup below documents that we expect it.
+                    if hyprstream_rpc::transport::quinn_transport::global_moq_connect_authz()
+                        .is_some()
+                    {
+                        tracing::info!(
+                            "/moq CONNECT authentication is enabled (shared-endpoint tenant boundary #1153)"
+                        );
+                    }
                 }
 
                 // Register this endpoint for RPC resolution and, once, as the

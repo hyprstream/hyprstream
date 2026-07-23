@@ -190,11 +190,14 @@ impl PeerIdentity {
 ///   `remote_id()` is carrier metadata, so the hook receives anonymous until
 ///   #1027 supplies fresh proof.
 /// - **quinn `/moq` path** ([`crate::transport::quinn_transport::QuinnRpcServer`]):
-///   the WebTransport CONNECT is *not* mutually authenticated, so no peer
-///   identity is available at accept time. The hook is still invoked with
-///   [`PeerIdentity::anonymous`]; a policy-gated authorizer will therefore deny
-///   *private* subscribes from anonymous quinn peers (fail-closed) while public
-///   broadcasts remain open. See the wiring TODO in `quinn_transport.rs`.
+///   as of #1153 the CONNECT is authenticated by
+///   [`crate::transport::moq_connect_auth::MoqConnectAuthz`] (bearer JWT,
+///   verified before the handshake completes); the tenant is resolved from the
+///   *verified* subject and a `tenant_scoped_consumer` is served. With no
+///   `MoqConnectAuthz` installed, the peer is anonymous and the hook receives
+///   [`PeerIdentity::anonymous`] (single-tenant/open model); a policy-gated
+///   authorizer will deny *private* subscribes from anonymous quinn peers
+///   (fail-closed) while public broadcasts remain open.
 pub trait SubscribeAuthorizer: Send + Sync {
     /// Decide whether `peer` may subscribe to `track_name`.
     fn authorize(&self, peer: &PeerIdentity, track_name: &str) -> SubscribeDecision;
