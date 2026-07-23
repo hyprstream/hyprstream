@@ -387,6 +387,32 @@ pub fn decode_with_key(
     decode_inner(token, verifying_key, expected_aud, true)
 }
 
+/// Decode a JWT by trying each candidate key in order, accepting the first
+/// that verifies. This is the rotation-aware federation verifier: a caller
+/// passes the candidate set returned by a key-set resolver (e.g.
+/// `FederationKeySource::get_keys`) and the token verifies if ANY published
+/// key validates it — the overlap-rotation and PQ-hybrid publication model
+/// (#1183/#1185). `candidates` SHOULD be ordered kid-first by the resolver
+/// so the preferred key is tried before overlap fallbacks.
+///
+/// Returns the last error if no candidate verifies (so a caller can surface
+/// a representative failure); `InvalidFormat` when the candidate set is empty
+/// (the resolver is contractually non-empty, so this is a fail-closed guard).
+pub fn decode_with_candidates(
+    token: &str,
+    candidates: &[VerifyingKey],
+    expected_aud: Option<&str>,
+) -> Result<Claims, JwtError> {
+    let mut last_err = JwtError::InvalidFormat;
+    for key in candidates {
+        match decode_with_key(token, key, expected_aud) {
+            Ok(claims) => return Ok(claims),
+            Err(e) => last_err = e,
+        }
+    }
+    Err(last_err)
+}
+
 /// Internal decode implementation shared by `decode` and `decode_with_key`.
 ///
 /// `lenient_aud`: when true, accepts tokens with no `aud` claim even when
@@ -879,5 +905,41 @@ mod tests {
 
         let kid = header_kid(&token).unwrap();
         assert!(kid.is_none());
+    }
+
+    // #1185 — decode_with_candidates is the rotation-aware federation
+    // verifier: it MUST accept a token signed by ANY published candidate,
+    // including a non-first key, and reject when none verify.
+    #[test]
+    fn decode_with_candidates_accepts_non_first_published_key() {
+        let key_a = make_key(0xA1);
+        let key_b = make_key(0xB2); // the "second" / rotated key
+        let claims = Claims::new("overlap-test".to_owned(), 0, 9_999_999_999);
+        let token = encode(&claims, &key_b); // signed by the second key
+
+        // Candidate set published kid-first as [old, new]; the token is
+        // signed by `new` (the second entry). The old code resolved only
+        // the first key and this token would have failed.
+        let candidates = vec![key_a.verifying_key(), key_b.verifying_key()];
+        let decoded = decode_with_candidates(&token, &candidates, None).expect("second key verifies");
+        assert_eq!(decoded.sub, "overlap-test");
+    }
+
+    #[test]
+    fn decode_with_candidates_rejects_when_no_candidate_verifies() {
+        let key_unrelated = make_key(0x99);
+        let claims = Claims::new("no-match".to_owned(), 0, 9_999_999_999);
+        let token = encode(&claims, &make_key(0x11));
+        let candidates = vec![key_unrelated.verifying_key()];
+        assert!(decode_with_candidates(&token, &candidates, None).is_err());
+    }
+
+    #[test]
+    fn decode_with_candidates_empty_set_fails_closed() {
+        // An empty candidate set is a fail-closed guard (the resolver is
+        // contractually non-empty); never silently accept.
+        let claims = Claims::new("empty".to_owned(), 0, 9_999_999_999);
+        let token = encode(&claims, &make_key(0x22));
+        assert!(decode_with_candidates(&token, &[], None).is_err());
     }
 }

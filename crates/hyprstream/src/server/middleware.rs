@@ -455,19 +455,8 @@ pub(crate) async fn verify_token_claims(
         let kid = extract_kid_from_token(token);
         match state.federation_resolver.get_keys(&iss, kid.as_deref()).await {
             Ok(candidates) if !candidates.is_empty() => {
-                let mut verified: Option<jwt::Claims> = None;
-                for key in &candidates {
-                    if let Ok(claims) =
-                        jwt::decode_with_key(token, key, Some(&state.resource_url))
-                    {
-                        verified = Some(claims);
-                        break;
-                    }
-                }
-                match verified {
-                    Some(claims) => claims,
-                    None => return Err("JWT validation failed"),
-                }
+                jwt::decode_with_candidates(token, &candidates, Some(&state.resource_url))
+                    .map_err(|_| "JWT validation failed")?
             }
             // Empty candidate set or fetch failure: fail closed either way.
             Ok(_) | Err(_) => return Err("federation key resolution failed"),

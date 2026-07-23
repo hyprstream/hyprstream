@@ -1495,26 +1495,11 @@ fn create_mcp_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
                                 // verifies during overlap rotation.
                                 match federation_resolver.get_keys(&iss, kid.as_deref()).await {
                                     Ok(candidates) if !candidates.is_empty() => {
-                                        let mut decoded: Option<crate::auth::jwt::Claims> = None;
-                                        let mut last_err: Option<crate::auth::jwt::JwtError> = None;
-                                        for key in &candidates {
-                                            match crate::auth::jwt::decode_with_key(
-                                                &t,
-                                                key,
-                                                Some(mcp_resource_url.as_str()),
-                                            ) {
-                                                Ok(c) => {
-                                                    decoded = Some(c);
-                                                    break;
-                                                }
-                                                Err(e) => last_err = Some(e),
-                                            }
-                                        }
-                                        match (decoded, last_err) {
-                                            (Some(c), _) => Ok(c),
-                                            (None, Some(e)) => Err(e),
-                                            (None, None) => Err(crate::auth::jwt::JwtError::InvalidFormat),
-                                        }
+                                        crate::auth::jwt::decode_with_candidates(
+                                            &t,
+                                            &candidates,
+                                            Some(mcp_resource_url.as_str()),
+                                        )
                                     }
                                     Ok(_) => Err(crate::auth::jwt::JwtError::InvalidFormat),
                                     Err(e) => {
