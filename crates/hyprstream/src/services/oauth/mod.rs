@@ -32,9 +32,10 @@ pub mod challenge;
 pub mod cimd_cache;
 pub mod client_auth;
 pub mod device;
+pub mod device_enrollment;
 pub mod did_document;
-pub mod federation_entity;
 pub mod dpop;
+pub mod federation_entity;
 pub mod introspection;
 pub mod jwks;
 pub mod jwt_bearer;
@@ -47,6 +48,7 @@ pub mod oidc_discovery;
 pub mod par;
 pub mod registration;
 pub mod revocation;
+pub mod rpc_handler;
 pub mod scim;
 pub mod scim_types;
 pub mod session;
@@ -56,11 +58,9 @@ pub mod token;
 pub mod token_exchange;
 pub mod token_store;
 pub mod user_mapping;
-pub mod wit_bootstrap;
 pub mod user_service;
 pub mod userinfo;
-pub mod device_enrollment;
-pub mod rpc_handler;
+pub mod wit_bootstrap;
 pub mod xrpc;
 
 use std::sync::Arc;
@@ -127,8 +127,14 @@ pub fn create_app(state: Arc<OAuthState>, cors_config: &crate::config::CorsConfi
             get(device::verify_get).post(device::verify_post),
         )
         .route("/oauth/device/nonce", get(device::device_nonce))
-        .route("/api/device/challenge", post(device_enrollment::device_challenge_handler))
-        .route("/api/device/enroll", post(device_enrollment::device_enroll_handler))
+        .route(
+            "/api/device/challenge",
+            post(device_enrollment::device_challenge_handler),
+        )
+        .route(
+            "/api/device/enroll",
+            post(device_enrollment::device_enroll_handler),
+        )
         .route("/oauth/revoke", post(revocation::revoke_token))
         .route("/oauth/logout", post(handle_logout))
         .route(
@@ -209,11 +215,20 @@ pub fn create_app(state: Arc<OAuthState>, cors_config: &crate::config::CorsConfi
     // endpoints like /oauth/token (closes #472).
     let mut did_router = Router::new()
         // Phase 0c — did:web document endpoints
-        .route("/.well-known/did.json", get(did_document::root_did_document))
+        .route(
+            "/.well-known/did.json",
+            get(did_document::root_did_document),
+        )
         // atproto handle→DID HTTP resolution (#500) — plaintext bare DID
         .route("/.well-known/atproto-did", get(did_document::atproto_did))
-        .route("/users/:username/did.json", get(did_document::user_did_document))
-        .route("/clients/:client_id/did.json", get(did_document::client_did_document));
+        .route(
+            "/users/:username/did.json",
+            get(did_document::user_did_document),
+        )
+        .route(
+            "/clients/:client_id/did.json",
+            get(did_document::client_did_document),
+        );
 
     let mut api_router = public_router.merge(protected_router);
 
@@ -227,14 +242,16 @@ pub fn create_app(state: Arc<OAuthState>, cors_config: &crate::config::CorsConfi
         ));
     }
 
-    let router = api_router.merge(did_router).layer(axum::middleware::from_fn(
-        |req: axum::extract::Request, next: axum::middleware::Next| async move {
-            let method = req.method().clone();
-            let uri = req.uri().clone();
-            tracing::info!(%method, %uri, "OAuth request");
-            next.run(req).await
-        },
-    ));
+    let router = api_router
+        .merge(did_router)
+        .layer(axum::middleware::from_fn(
+            |req: axum::extract::Request, next: axum::middleware::Next| async move {
+                let method = req.method().clone();
+                let uri = req.uri().clone();
+                tracing::info!(%method, %uri, "OAuth request");
+                next.run(req).await
+            },
+        ));
 
     router.with_state(state)
 }
@@ -264,25 +281,22 @@ async fn handle_logout(
 /// browsers can bootstrap a WebTransport connection via DiscoveryService,
 /// then resolve all other service endpoints from there.
 async fn oauth_self_protected_resource_metadata(
-    State(_state): State<Arc<OAuthState>>,
+    State(state): State<Arc<OAuthState>>,
 ) -> axum::Json<ProtectedResourceMetadata> {
-    let config = crate::config::HyprConfig::load().unwrap_or_default();
-    let issuer_url = config.oauth.issuer_url();
+    // #1113 r4 F5: use the CANONICAL issuer from OAuthState (same
+    // normalization as token claims/redirect), NOT raw config.issuer_url().
+    // A configured trailing-slash/path must be consistent everywhere.
+    let issuer_url = state.atproto_issuer_url();
 
-    // Use issuer URL as the resource
+    // Use issuer URL as the resource (PDS = its own AS).
     let resource = issuer_url.clone();
 
     let mut meta = protected_resource_metadata(&resource, &issuer_url);
     meta.resource_name = Some("HyprStream OAuth 2.1 Authorization Server".to_owned());
-    meta.scopes_supported = Some(vec![
-        "openid".into(),
-        "read:*:*".into(),
-        "write:*:*".into(),
-        "infer:model:*".into(),
-        "pds:attach".into(),
-    ]);
+    meta.scopes_supported = Some(self_resource_scopes());
 
     // Include the QUIC TLS cert hash so browsers can pin the self-signed certificate.
+    let config = crate::config::HyprConfig::load().unwrap_or_default();
     if let Ok((cert_chain, _)) = config.quic.load_tls_materials() {
         meta.x_cert_hash = Some(hyprstream_rpc::transport::zmtp_quic::cert_hash(
             &cert_chain[0],
@@ -290,6 +304,21 @@ async fn oauth_self_protected_resource_metadata(
     }
 
     axum::Json(meta)
+}
+
+/// Scopes advertised by the OAuth service's own RFC 9728 protected-resource
+/// document. Includes the atproto transition scopes (#1113) so stock atproto
+/// clients can discover them at the resource (PDS = its own AS).
+fn self_resource_scopes() -> Vec<String> {
+    vec![
+        "openid".into(),
+        "read:*:*".into(),
+        "write:*:*".into(),
+        "infer:model:*".into(),
+        "pds:attach".into(),
+        "atproto".into(),
+        "transition:generic".into(),
+    ]
 }
 
 /// OAuth 2.1 Authorization Server service.
@@ -370,7 +399,10 @@ impl OAuthService {
     }
 
     /// Attach the shared JTI blocklist (same Arc as PolicyService).
-    pub fn with_jti_blocklist(mut self, bl: Arc<hyprstream_rpc::auth::InMemoryJtiBlocklist>) -> Self {
+    pub fn with_jti_blocklist(
+        mut self,
+        bl: Arc<hyprstream_rpc::auth::InMemoryJtiBlocklist>,
+    ) -> Self {
         self.jti_blocklist = Some(bl);
         self
     }
@@ -952,17 +984,1556 @@ pub fn protected_resource_metadata(
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::get_unwrap)]
 mod tests {
     use super::registration::validate_redirect_uri;
     use super::*;
 
+    fn encode_form(fields: &[(&str, &str)]) -> String {
+        let mut serializer = url::form_urlencoded::Serializer::new(String::new());
+        serializer.extend_pairs(fields.iter().copied());
+        serializer.finish()
+    }
+
+    async fn post_form(
+        app: &Router,
+        uri: &str,
+        fields: &[(&str, &str)],
+        dpop: Option<&str>,
+        accept_json: bool,
+    ) -> axum::response::Response {
+        use tower::ServiceExt as _;
+
+        let mut builder = axum::http::Request::post(uri).header(
+            axum::http::header::CONTENT_TYPE,
+            "application/x-www-form-urlencoded",
+        );
+        if let Some(proof) = dpop {
+            builder = builder.header("DPoP", proof);
+        }
+        if accept_json {
+            builder = builder.header(axum::http::header::ACCEPT, "application/json");
+        }
+        app.clone()
+            .oneshot(
+                builder
+                    .body(axum::body::Body::from(encode_form(fields)))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    async fn post_form_bearer(
+        app: &Router,
+        uri: &str,
+        fields: &[(&str, &str)],
+        bearer: &str,
+    ) -> axum::response::Response {
+        use tower::ServiceExt as _;
+
+        app.clone()
+            .oneshot(
+                axum::http::Request::post(uri)
+                    .header(axum::http::header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .header(axum::http::header::AUTHORIZATION, format!("Bearer {bearer}"))
+                    .body(axum::body::Body::from(encode_form(fields)))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    async fn get(app: &Router, uri: &str) -> axum::response::Response {
+        use tower::ServiceExt as _;
+
+        app.clone()
+            .oneshot(
+                axum::http::Request::get(uri)
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    async fn response_json(response: axum::response::Response) -> serde_json::Value {
+        let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    async fn response_text(response: axum::response::Response) -> String {
+        let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        String::from_utf8(bytes.to_vec()).unwrap()
+    }
+
+    fn html_hidden_value<'a>(html: &'a str, name: &str) -> &'a str {
+        let prefix = format!(r#"name="{name}" value=""#);
+        let rest = html.split_once(&prefix).unwrap().1;
+        rest.split_once('"').unwrap().0
+    }
+
+    fn dpop_proof(
+        signing_key: &p256::ecdsa::SigningKey,
+        htu: &str,
+        jti: &str,
+        nonce: Option<&str>,
+    ) -> String {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+        use p256::ecdsa::signature::Signer as _;
+
+        let point = signing_key.verifying_key().to_encoded_point(false);
+        let header = serde_json::json!({
+            "typ": "dpop+jwt",
+            "alg": "ES256",
+            "jwk": {
+                "kty": "EC",
+                "crv": "P-256",
+                "x": URL_SAFE_NO_PAD.encode(point.x().unwrap()),
+                "y": URL_SAFE_NO_PAD.encode(point.y().unwrap()),
+            }
+        });
+        let mut payload = serde_json::json!({
+            "jti": jti,
+            "htm": "POST",
+            "htu": htu,
+            "iat": chrono::Utc::now().timestamp(),
+        });
+        if let Some(value) = nonce {
+            payload["nonce"] = serde_json::Value::String(value.to_owned());
+        }
+        let header = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&header).unwrap());
+        let payload = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&payload).unwrap());
+        let signing_input = format!("{header}.{payload}");
+        let signature: p256::ecdsa::Signature = signing_key.sign(signing_input.as_bytes());
+        format!(
+            "{signing_input}.{}",
+            URL_SAFE_NO_PAD.encode(signature.to_bytes())
+        )
+    }
+
+    fn private_key_jwt_assertion(
+        signing_key: &p256::ecdsa::SigningKey,
+        kid: &str,
+        client_id: &str,
+        audience: &str,
+        jti: &str,
+    ) -> String {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+        use p256::ecdsa::signature::Signer as _;
+
+        let header = serde_json::json!({"alg": "ES256", "typ": "JWT", "kid": kid});
+        let claims = serde_json::json!({
+            "iss": client_id,
+            "sub": client_id,
+            "aud": audience,
+            "iat": chrono::Utc::now().timestamp(),
+            "exp": chrono::Utc::now().timestamp() + 60,
+            "jti": jti,
+        });
+        let header = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&header).unwrap());
+        let claims = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).unwrap());
+        let signing_input = format!("{header}.{claims}");
+        let signature: p256::ecdsa::Signature = signing_key.sign(signing_input.as_bytes());
+        format!(
+            "{signing_input}.{}",
+            URL_SAFE_NO_PAD.encode(signature.to_bytes())
+        )
+    }
+
+    fn jwt_claims(token: &str) -> serde_json::Value {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+
+        let payload = token.split('.').nth(1).expect("JWT payload");
+        serde_json::from_slice(&URL_SAFE_NO_PAD.decode(payload).expect("JWT payload base64"))
+            .expect("JWT payload JSON")
+    }
+
+    // Rust mirror of @atproto/oauth-types 0.7.5
+    // atprotoOAuthTokenResponseSchema. The upstream schema extends the base
+    // OAuth response with literal DPoP, required atproto DID sub, required
+    // atproto-containing scope, and an absent id_token.
+    #[derive(serde::Deserialize)]
+    struct AtprotoOAuthTokenResponse075 {
+        access_token: String,
+        token_type: String,
+        scope: String,
+        refresh_token: Option<String>,
+        expires_in: Option<f64>,
+        sub: String,
+    }
+
+    fn parse_atproto_token_response_075(
+        value: serde_json::Value,
+    ) -> anyhow::Result<AtprotoOAuthTokenResponse075> {
+        anyhow::ensure!(
+            value.get("id_token").is_none(),
+            "atproto OAuth token response must not contain id_token"
+        );
+        let parsed: AtprotoOAuthTokenResponse075 = serde_json::from_value(value)?;
+        anyhow::ensure!(parsed.token_type == "DPoP", "token_type must be DPoP");
+        anyhow::ensure!(
+            parsed.scope.bytes().all(|byte| {
+                byte == b' '
+                    || byte == b'!'
+                    || (b'#'..=b'[').contains(&byte)
+                    || (b']'..=b'~').contains(&byte)
+            }),
+            "scope is not an OAuth scope value"
+        );
+        anyhow::ensure!(
+            parsed.scope.split(' ').any(|scope| scope == "atproto"),
+            "scope must contain atproto"
+        );
+        super::state::subject_did_for("https://schema.invalid", &parsed.sub)?;
+        Ok(parsed)
+    }
+
+    // Publish a disk-backed composite Policy signing pair so this test uses
+    // the real PolicyService JWT issuance path. The tiny authority directory
+    // remains because the process-global mint barrier checks disk each time.
+    fn configure_test_policy_signing_authority() -> anyhow::Result<()> {
+        use hyprstream_rpc::auth::{CompositeKeyPair, CompositePairRole, CompositePairState};
+
+        let authority_dir = tempfile::TempDir::new()?.keep();
+        let ledger = authority_dir.join("ledger.json");
+        let committed = authority_dir.join("committed");
+        let prefix = authority_dir.join("committed-ledger");
+        let lock = authority_dir.join("ledger.lock");
+        let key_set = hyprstream_rpc::auth::global_composite_key_set();
+        let version = key_set.snapshot().version() + 1;
+        let digest = format!("oauth-handler-r5-{version}");
+        let generation = serde_json::to_vec(&serde_json::json!({
+            "version": version,
+            "component_digest": digest,
+        }))?;
+        std::fs::write(&ledger, &generation)?;
+        std::fs::write(&committed, &generation)?;
+        std::fs::write(
+            authority_dir.join(format!("committed-ledger-{version}-{digest}.json")),
+            &generation,
+        )?;
+
+        let (ml_signing, ml_verifying) = hyprstream_rpc::crypto::pq::ml_dsa_generate_keypair();
+        let ed_signing = Arc::new(ed25519_dalek::SigningKey::from_bytes(&[0x61; 32]));
+        let kid = hyprstream_rpc::auth::composite_kid(&ml_verifying, &ed_signing.verifying_key());
+        let now = chrono::Utc::now().timestamp();
+        let pair = CompositeKeyPair::signing(
+            kid,
+            Arc::new(ml_signing),
+            ed_signing,
+            CompositePairRole::Policy,
+            CompositePairState::Active,
+            now - 60,
+            now + 86_400,
+        );
+        key_set.configure_authority(ledger, committed, prefix, lock);
+        key_set.publish(version, digest, vec![pair])?;
+        Ok(())
+    }
+
+    /// #1113 r5 handler-level conformance suite. Every HTTP exchange goes
+    /// through the production create_app router and token issuance traverses
+    /// a real in-process PolicyService.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn oauth_handler_atproto_and_legacy_conformance() -> anyhow::Result<()> {
+        use base64::{
+            engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
+            Engine as _,
+        };
+        use ed25519_dalek::Signer as _;
+        use hyprstream_rpc::crypto::CryptoPolicy;
+        use hyprstream_rpc::rpc_client::RpcClientImpl;
+        use hyprstream_rpc::signer::LocalSigner;
+        use hyprstream_rpc::transport::lazy_uds::LazyUdsTransport;
+        use hyprstream_rpc::transport::TransportConfig;
+        use hyprstream_service::{InprocManager, ServiceManager as _};
+        use sha2::{Digest as _, Sha256};
+
+        use super::state::RegisteredClient;
+        use super::token_store::RocksDbTokenStore;
+        use crate::auth::rocksdb_store::RocksDbUserStore;
+        use crate::auth::{PolicyManager, UserProfile, UserStore};
+        use crate::services::generated::policy_client::IssueToken;
+        use crate::services::{DiscoveryClient, PolicyClient, PolicyService};
+
+        const ISSUER: &str = "https://pds.example.test";
+        const GENERIC_ISSUER: &str = "https://pds.example.test/configured/path";
+        const CLIENT_ID: &str = "handler-client";
+        const PRIVATE_CLIENT_ID: &str = "handler-private-client";
+        const REDIRECT_URI: &str = "https://client.example.test/callback";
+        const MAPPED_DID: &str = "did:plc:abcdefghijklmnqrstuvwx2p";
+        const PKCE_VERIFIER: &str = "r5-handler-pkce-verifier-abcdefghijklmnopqrstuvwxyz012345";
+        const GENERIC_PKCE_VERIFIER: &str =
+            "r7-generic-pkce-verifier-abcdefghijklmnopqrstuvwxyz012345";
+
+        let _ = hyprstream_rpc::envelope::install_verify_config(
+            hyprstream_rpc::envelope::EnvelopeVerifyConfig {
+                policy: CryptoPolicy::Classical,
+                pq_store: None,
+            },
+        );
+        let _ = hyprstream_rpc::envelope::install_response_verify_config(
+            hyprstream_rpc::envelope::ResponseVerifyConfig {
+                policy: CryptoPolicy::Classical,
+                pq_store: None,
+            },
+        );
+        configure_test_policy_signing_authority()?;
+
+        let service_key = ed25519_dalek::SigningKey::from_bytes(&[0x62; 32]);
+        let policy_tag = format!("oauth-handler-r5-{}", uuid::Uuid::new_v4());
+        let git_dir = tempfile::TempDir::new()?;
+        let git2db = Arc::new(tokio::sync::RwLock::new(
+            git2db::Git2DB::open(git_dir.path()).await?,
+        ));
+        let policy_service = PolicyService::new(
+            Arc::new(PolicyManager::permissive().await?),
+            Arc::new(service_key.clone()),
+            crate::config::TokenConfig::default(),
+            git2db,
+            TransportConfig::inproc(&policy_tag),
+        )
+        .with_default_audience(GENERIC_ISSUER.to_owned());
+        let manager = InprocManager::new();
+        let mut policy_handle = manager.spawn(Box::new(policy_service)).await?;
+        let policy_client = PolicyClient::for_local_endpoint_bootstrap(
+            &format!("inproc://{policy_tag}"),
+            service_key.clone(),
+            service_key.verifying_key(),
+            None,
+        )?;
+
+        let user_dir = tempfile::TempDir::new()?;
+        let user_store = Arc::new(RocksDbUserStore::open(user_dir.path())?);
+        let user_key = ed25519_dalek::SigningKey::from_bytes(&[0x63; 32]);
+        user_store.register("alice").await?;
+        let fingerprint = user_store
+            .add_pubkey(
+                "alice",
+                user_key.verifying_key(),
+                Some("handler-test".to_owned()),
+            )
+            .await?;
+        user_store
+            .set_profile(
+                "alice",
+                UserProfile {
+                    atproto_did: Some(MAPPED_DID.to_owned()),
+                    ..Default::default()
+                }.into(),
+            )
+            .await?;
+        assert_eq!(
+            user_store
+                .get_profile("alice")
+                .await?
+                .and_then(|profile| profile.atproto_did),
+            Some(MAPPED_DID.to_owned())
+        );
+
+        let dummy_key = ed25519_dalek::SigningKey::from_bytes(&[0x64; 32]);
+        let dummy_remote = ed25519_dalek::SigningKey::from_bytes(&[0x65; 32]).verifying_key();
+        let dummy_rpc = Arc::new(
+            RpcClientImpl::new(
+                LocalSigner::new(dummy_key),
+                LazyUdsTransport::new("/dev/null/oauth-handler-discovery.sock".into()),
+                Some(dummy_remote),
+            )
+            .with_response_verify_policy(CryptoPolicy::Classical),
+        );
+        let mut config = crate::config::OAuthConfig::default();
+        // Generic OAuth preserves this path; atproto emissions use its origin.
+        config.external_url = Some(GENERIC_ISSUER.to_owned());
+        let mut oauth_state = OAuthState::new(
+            &config,
+            policy_client,
+            DiscoveryClient::new(dummy_rpc),
+            service_key.verifying_key().to_bytes(),
+        )
+        .with_user_store(user_store);
+        let token_dir = tempfile::TempDir::new()?;
+        oauth_state.with_token_store_impl(Arc::new(RocksDbTokenStore::open(
+            token_dir.path().join("refresh.db"),
+        )?));
+        let state = Arc::new(oauth_state);
+        state.clients.write().await.insert(
+            CLIENT_ID.to_owned(),
+            RegisteredClient {
+                client_id: CLIENT_ID.to_owned(),
+                redirect_uris: vec![REDIRECT_URI.to_owned()],
+                client_name: Some("Handler Conformance Client".to_owned()),
+                client_uri: None,
+                logo_uri: None,
+                grant_types: vec![
+                    "authorization_code".to_owned(),
+                    "refresh_token".to_owned(),
+                    "urn:ietf:params:oauth:grant-type:device_code".to_owned(),
+                    "urn:ietf:params:oauth:grant-type:token-exchange".to_owned(),
+                ],
+                response_types: vec!["code".to_owned()],
+                token_endpoint_auth_method: Some("none".to_owned()),
+                jwks: None,
+                jwks_uri: None,
+                hyprstream_node_did: None,
+                scope: Some("atproto read:*:*".to_owned()),
+                dpop_bound_access_tokens: None,
+                is_cimd: false,
+                registered_at: std::time::Instant::now(),
+            },
+        );
+        let private_client_key = p256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
+        let private_client_point = private_client_key.verifying_key().to_encoded_point(false);
+        // A second registered key for the same client: proves refresh cannot
+        // switch assertion keys mid-session (#1146 T3.3).
+        let private_client_key_2 = p256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
+        let private_client_point_2 = private_client_key_2.verifying_key().to_encoded_point(false);
+        state.clients.write().await.insert(
+            PRIVATE_CLIENT_ID.to_owned(),
+            RegisteredClient {
+                client_id: PRIVATE_CLIENT_ID.to_owned(),
+                redirect_uris: vec![REDIRECT_URI.to_owned()],
+                client_name: Some("Handler Private Client".to_owned()),
+                client_uri: None,
+                logo_uri: None,
+                grant_types: vec!["authorization_code".to_owned()],
+                response_types: vec!["code".to_owned()],
+                token_endpoint_auth_method: Some("private_key_jwt".to_owned()),
+                jwks: Some(serde_json::json!({"keys": [{
+                    "kty": "EC",
+                    "crv": "P-256",
+                    "x": URL_SAFE_NO_PAD.encode(private_client_point.x().unwrap()),
+                    "y": URL_SAFE_NO_PAD.encode(private_client_point.y().unwrap()),
+                    "kid": "private-k1",
+                }, {
+                    "kty": "EC",
+                    "crv": "P-256",
+                    "x": URL_SAFE_NO_PAD.encode(private_client_point_2.x().unwrap()),
+                    "y": URL_SAFE_NO_PAD.encode(private_client_point_2.y().unwrap()),
+                    "kid": "private-k2",
+                }]})),
+                jwks_uri: None,
+                hyprstream_node_did: None,
+                scope: Some("atproto".to_owned()),
+                dpop_bound_access_tokens: Some(true),
+                is_cimd: false,
+                registered_at: std::time::Instant::now(),
+            },
+        );
+        let cors = crate::config::server::CorsConfig {
+            enabled: false,
+            ..Default::default()
+        };
+        let app = create_app(Arc::clone(&state), &cors);
+
+        // Device authorization rejects unknown clients at the real endpoint.
+        let unknown_device = post_form(
+            &app,
+            "/oauth/device",
+            &[("client_id", "unknown-client"), ("scope", "read:*:*")],
+            None,
+            false,
+        )
+        .await;
+        assert_eq!(unknown_device.status(), axum::http::StatusCode::BAD_REQUEST);
+        assert_eq!(
+            response_json(unknown_device).await["error"],
+            "invalid_client"
+        );
+
+        // #1146 T1.3: the atproto profile has no device authorization grant —
+        // `scope=atproto` is rejected at the device endpoint (it previously
+        // minted malformed DPoP tokens cnf-bound to the user's login key).
+        let atproto_device = post_form(
+            &app,
+            "/oauth/device",
+            &[("client_id", CLIENT_ID), ("scope", "atproto")],
+            None,
+            false,
+        )
+        .await;
+        assert_eq!(atproto_device.status(), axum::http::StatusCode::BAD_REQUEST);
+        assert_eq!(
+            response_json(atproto_device).await["error"],
+            "invalid_scope"
+        );
+
+        // #1146 T1.1: a fetched CIMD client's declared scope ceiling is
+        // enforced at PAR. This client declares only `atproto`; requesting
+        // `transition:generic` must be rejected (the fetched-metadata path
+        // previously dropped the ceiling entirely).
+        const CIMD_CLIENT_ID: &str = "https://client.example.test/cimd.json";
+        state
+            .cimd_cache
+            .insert(
+                RegisteredClient {
+                    client_id: CIMD_CLIENT_ID.to_owned(),
+                    redirect_uris: vec![REDIRECT_URI.to_owned()],
+                    client_name: Some("Handler CIMD Client".to_owned()),
+                    client_uri: None,
+                    logo_uri: None,
+                    grant_types: vec!["authorization_code".to_owned()],
+                    response_types: vec!["code".to_owned()],
+                    token_endpoint_auth_method: Some("none".to_owned()),
+                    jwks: None,
+                    jwks_uri: None,
+                    hyprstream_node_did: None,
+                    scope: Some("atproto".to_owned()),
+                    dpop_bound_access_tokens: Some(true),
+                    is_cimd: true,
+                    registered_at: std::time::Instant::now(),
+                },
+                std::time::Duration::from_secs(300),
+            )
+            .await;
+        let cimd_par_challenge =
+            URL_SAFE_NO_PAD.encode(Sha256::digest(b"cimd-ceiling-pkce-verifier-abcdefghijklmnopqrstuvwxyz"));
+        let cimd_over_scope_par = post_form(
+            &app,
+            "/oauth/par",
+            &[
+                ("client_id", CIMD_CLIENT_ID),
+                ("redirect_uri", REDIRECT_URI),
+                ("code_challenge", &cimd_par_challenge),
+                ("code_challenge_method", "S256"),
+                ("response_type", "code"),
+                ("scope", "atproto transition:generic"),
+                ("resource", ISSUER),
+            ],
+            None,
+            false,
+        )
+        .await;
+        assert_eq!(
+            cimd_over_scope_par.status(),
+            axum::http::StatusCode::BAD_REQUEST,
+            "CIMD client must not exceed its declared scope ceiling"
+        );
+        assert_eq!(
+            response_json(cimd_over_scope_par).await["error"],
+            "invalid_scope"
+        );
+        // Positive control: the declared scope itself is still granted.
+        let cimd_dpop_key = p256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
+        let cimd_par_proof = dpop_proof(
+            &cimd_dpop_key,
+            &format!("{ISSUER}/oauth/par"),
+            "cimd-ceiling-par-jti",
+            None,
+        );
+        let cimd_in_scope_par = post_form(
+            &app,
+            "/oauth/par",
+            &[
+                ("client_id", CIMD_CLIENT_ID),
+                ("redirect_uri", REDIRECT_URI),
+                ("code_challenge", &cimd_par_challenge),
+                ("code_challenge_method", "S256"),
+                ("response_type", "code"),
+                ("scope", "atproto"),
+                ("resource", ISSUER),
+            ],
+            Some(&cimd_par_proof),
+            false,
+        )
+        .await;
+        assert_eq!(
+            cimd_in_scope_par.status(),
+            axum::http::StatusCode::CREATED,
+            "declared scope must remain grantable"
+        );
+
+        // PAR binds the atproto request to a real ES256 DPoP key.
+        let dpop_key = p256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
+        let code_challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(PKCE_VERIFIER.as_bytes()));
+        let par_proof = dpop_proof(
+            &dpop_key,
+            &format!("{ISSUER}/oauth/par"),
+            "handler-par-jti",
+            None,
+        );
+        let par = post_form(
+            &app,
+            "/oauth/par",
+            &[
+                ("client_id", CLIENT_ID),
+                ("redirect_uri", REDIRECT_URI),
+                ("code_challenge", &code_challenge),
+                ("code_challenge_method", "S256"),
+                ("response_type", "code"),
+                ("state", "client-state"),
+                ("scope", "atproto"),
+                ("resource", ISSUER),
+            ],
+            Some(&par_proof),
+            false,
+        )
+        .await;
+        assert_eq!(par.status(), axum::http::StatusCode::CREATED);
+        let par_nonce = par
+            .headers()
+            .get("DPoP-Nonce")
+            .and_then(|value| value.to_str().ok())
+            .unwrap()
+            .to_owned();
+        let par_json = response_json(par).await;
+        let request_uri = par_json["request_uri"].as_str().unwrap();
+
+        // GET authorize consumes the PAR and renders the real consent callback.
+        let authorize_uri = format!(
+            "/oauth/authorize?{}",
+            encode_form(&[("request_uri", request_uri), ("client_id", CLIENT_ID)])
+        );
+        let authorize = get(&app, &authorize_uri).await;
+        assert_eq!(authorize.status(), axum::http::StatusCode::OK);
+        let authorize_html = response_text(authorize).await;
+        let authorize_nonce = html_hidden_value(&authorize_html, "nonce").to_owned();
+        let challenge = format!("{fingerprint}:{authorize_nonce}:{code_challenge}");
+        let signature = STANDARD.encode(user_key.sign(challenge.as_bytes()).to_bytes());
+        let callback = post_form(
+            &app,
+            "/oauth/authorize",
+            &[
+                ("client_id", CLIENT_ID),
+                ("redirect_uri", REDIRECT_URI),
+                ("code_challenge", &code_challenge),
+                ("scope", "atproto"),
+                ("state", "client-state"),
+                ("resource", ISSUER),
+                ("nonce", &authorize_nonce),
+                ("fingerprint", &fingerprint),
+                ("signature", &signature),
+            ],
+            None,
+            false,
+        )
+        .await;
+        assert_eq!(callback.status(), axum::http::StatusCode::SEE_OTHER);
+        let location = callback
+            .headers()
+            .get(axum::http::header::LOCATION)
+            .and_then(|value| value.to_str().ok())
+            .unwrap();
+        let location = url::Url::parse(location)?;
+        let callback_params: std::collections::HashMap<_, _> =
+            location.query_pairs().into_owned().collect();
+        assert_eq!(callback_params.get("iss").map(String::as_str), Some(ISSUER));
+        assert_eq!(
+            callback_params.get("state").map(String::as_str),
+            Some("client-state")
+        );
+        let code = callback_params.get("code").unwrap();
+
+        // Exchange the code and parse the emitted response against the exact
+        // @atproto/oauth-types 0.7.5 token-response constraints.
+        let token_proof = dpop_proof(
+            &dpop_key,
+            &format!("{ISSUER}/oauth/token"),
+            "handler-token-jti",
+            Some(&par_nonce),
+        );
+        let token = post_form(
+            &app,
+            "/oauth/token",
+            &[
+                ("grant_type", "authorization_code"),
+                ("client_id", CLIENT_ID),
+                ("code", code),
+                ("redirect_uri", REDIRECT_URI),
+                ("code_verifier", PKCE_VERIFIER),
+            ],
+            Some(&token_proof),
+            false,
+        )
+        .await;
+        assert_eq!(token.status(), axum::http::StatusCode::OK);
+        let token_nonce = token
+            .headers()
+            .get("DPoP-Nonce")
+            .and_then(|value| value.to_str().ok())
+            .unwrap()
+            .to_owned();
+        let token_response = parse_atproto_token_response_075(response_json(token).await)?;
+        assert_eq!(token_response.sub, MAPPED_DID);
+        assert!(token_response.expires_in.is_some());
+        let refresh_token = token_response.refresh_token.unwrap();
+        let claims = jwt_claims(&token_response.access_token);
+        assert_eq!(claims["iss"], ISSUER);
+        assert_eq!(claims["sub"], MAPPED_DID);
+        assert_eq!(claims["aud"], ISSUER);
+        assert_eq!(claims["scope"], "atproto");
+
+        // A confidential atproto client signs private_key_jwt with the AS
+        // issuer as the assertion audience (atproto mandate, #1146 T1.2),
+        // even though the configured generic issuer carries a path.
+        let advertised_metadata = response_json(
+            get(&app, "/.well-known/oauth-authorization-server").await,
+        ).await;
+        let advertised_token_endpoint = advertised_metadata["token_endpoint"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert_eq!(advertised_token_endpoint, format!("{ISSUER}/oauth/token"));
+
+        let assertion_type = super::client_auth::JWT_BEARER_ASSERTION_TYPE;
+        let private_dpop_key = p256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
+        let private_verifier = "private-client-pkce-verifier-abcdefghijklmnopqrstuvwxyz012345";
+        let private_challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(private_verifier.as_bytes()));
+
+        // #1146 T3.3: confidential clients MUST authenticate at PAR — a
+        // pushed request without a client_assertion is rejected.
+        let no_auth_par_proof = dpop_proof(
+            &private_dpop_key,
+            &format!("{ISSUER}/oauth/par"),
+            "private-client-par-jti-noauth",
+            None,
+        );
+        let no_auth_par = post_form(
+            &app,
+            "/oauth/par",
+            &[
+                ("client_id", PRIVATE_CLIENT_ID),
+                ("redirect_uri", REDIRECT_URI),
+                ("code_challenge", &private_challenge),
+                ("code_challenge_method", "S256"),
+                ("response_type", "code"),
+                ("state", "private-client-state"),
+                ("scope", "atproto"),
+                ("resource", ISSUER),
+            ],
+            Some(&no_auth_par_proof),
+            false,
+        )
+        .await;
+        assert_eq!(no_auth_par.status(), axum::http::StatusCode::UNAUTHORIZED);
+        assert_eq!(response_json(no_auth_par).await["error"], "invalid_client");
+
+        // #1146 T1.2: at PAR the assertion audience MUST be the AS issuer —
+        // the RFC 7523 token-endpoint form accepted at /oauth/token is not
+        // sufficient here.
+        let par_endpoint_aud_assertion = private_key_jwt_assertion(
+            &private_client_key,
+            "private-k1",
+            PRIVATE_CLIENT_ID,
+            &format!("{ISSUER}/oauth/token"),
+            "private-par-endpoint-aud-jti",
+        );
+        let wrong_aud_par_proof = dpop_proof(
+            &private_dpop_key,
+            &format!("{ISSUER}/oauth/par"),
+            "private-client-par-jti-wrongaod",
+            None,
+        );
+        let wrong_aud_par = post_form(
+            &app,
+            "/oauth/par",
+            &[
+                ("client_id", PRIVATE_CLIENT_ID),
+                ("redirect_uri", REDIRECT_URI),
+                ("code_challenge", &private_challenge),
+                ("code_challenge_method", "S256"),
+                ("response_type", "code"),
+                ("state", "private-client-state"),
+                ("scope", "atproto"),
+                ("resource", ISSUER),
+                ("client_assertion_type", assertion_type),
+                ("client_assertion", &par_endpoint_aud_assertion),
+            ],
+            Some(&wrong_aud_par_proof),
+            false,
+        )
+        .await;
+        assert_eq!(wrong_aud_par.status(), axum::http::StatusCode::UNAUTHORIZED);
+        assert_eq!(response_json(wrong_aud_par).await["error"], "invalid_client");
+
+        let private_par_proof = dpop_proof(
+            &private_dpop_key,
+            &format!("{ISSUER}/oauth/par"),
+            "private-client-par-jti",
+            None,
+        );
+        let private_par_assertion = private_key_jwt_assertion(
+            &private_client_key,
+            "private-k1",
+            PRIVATE_CLIENT_ID,
+            ISSUER,
+            "private-par-assertion-jti",
+        );
+        let private_par = post_form(
+            &app,
+            "/oauth/par",
+            &[
+                ("client_id", PRIVATE_CLIENT_ID),
+                ("redirect_uri", REDIRECT_URI),
+                ("code_challenge", &private_challenge),
+                ("code_challenge_method", "S256"),
+                ("response_type", "code"),
+                ("state", "private-client-state"),
+                ("scope", "atproto"),
+                ("resource", ISSUER),
+                ("client_assertion_type", assertion_type),
+                ("client_assertion", &private_par_assertion),
+            ],
+            Some(&private_par_proof),
+            false,
+        ).await;
+        assert_eq!(private_par.status(), axum::http::StatusCode::CREATED);
+        let private_dpop_nonce = private_par.headers()
+            .get("DPoP-Nonce")
+            .and_then(|value| value.to_str().ok())
+            .unwrap()
+            .to_owned();
+        let private_par_json = response_json(private_par).await;
+        let private_request_uri = private_par_json["request_uri"].as_str().unwrap();
+        let private_authorize_uri = format!(
+            "/oauth/authorize?{}",
+            encode_form(&[
+                ("request_uri", private_request_uri),
+                ("client_id", PRIVATE_CLIENT_ID),
+            ])
+        );
+        let private_authorize = get(&app, &private_authorize_uri).await;
+        assert_eq!(private_authorize.status(), axum::http::StatusCode::OK);
+        let private_authorize_html = response_text(private_authorize).await;
+        let private_nonce = html_hidden_value(&private_authorize_html, "nonce").to_owned();
+        let private_signed = format!("{fingerprint}:{private_nonce}:{private_challenge}");
+        let private_signature = STANDARD.encode(user_key.sign(private_signed.as_bytes()).to_bytes());
+        let private_callback = post_form(
+            &app,
+            "/oauth/authorize",
+            &[
+                ("client_id", PRIVATE_CLIENT_ID),
+                ("redirect_uri", REDIRECT_URI),
+                ("code_challenge", &private_challenge),
+                ("scope", "atproto"),
+                ("state", "private-client-state"),
+                ("resource", ISSUER),
+                ("nonce", &private_nonce),
+                ("fingerprint", &fingerprint),
+                ("signature", &private_signature),
+            ],
+            None,
+            false,
+        ).await;
+        assert_eq!(private_callback.status(), axum::http::StatusCode::SEE_OTHER);
+        let private_location = private_callback.headers()
+            .get(axum::http::header::LOCATION)
+            .and_then(|value| value.to_str().ok())
+            .unwrap();
+        let private_location = url::Url::parse(private_location)?;
+        let private_callback_params: std::collections::HashMap<_, _> =
+            private_location.query_pairs().into_owned().collect();
+        let private_code = private_callback_params["code"].clone();
+
+        // #1146 T3.3: a client_assertion is single-use — re-presenting the
+        // exact assertion accepted at PAR above (same jti) is replay and
+        // must be rejected, even at a different endpoint.
+        let replay_assertion_proof = dpop_proof(
+            &private_dpop_key,
+            &advertised_token_endpoint,
+            "private-client-token-jti-replay",
+            Some(&private_dpop_nonce),
+        );
+        let replayed_assertion = post_form(
+            &app,
+            "/oauth/token",
+            &[
+                ("grant_type", "authorization_code"),
+                ("client_id", PRIVATE_CLIENT_ID),
+                ("code", &private_code),
+                ("redirect_uri", REDIRECT_URI),
+                ("code_verifier", private_verifier),
+                ("client_assertion_type", assertion_type),
+                ("client_assertion", &private_par_assertion),
+            ],
+            Some(&replay_assertion_proof),
+            false,
+        ).await;
+        assert_eq!(
+            replayed_assertion.status(),
+            axum::http::StatusCode::UNAUTHORIZED,
+            "a replayed client_assertion jti must be rejected"
+        );
+        assert_eq!(response_json(replayed_assertion).await["error"], "invalid_client");
+
+        let private_token_proof = dpop_proof(
+            &private_dpop_key,
+            &advertised_token_endpoint,
+            "private-client-token-jti",
+            Some(&private_dpop_nonce),
+        );
+        let wrong_assertion = private_key_jwt_assertion(
+            &private_client_key,
+            "private-k1",
+            PRIVATE_CLIENT_ID,
+            "https://attacker.example/oauth/token",
+            "private-client-wrong-aud",
+        );
+        let wrong_audience = post_form(
+            &app,
+            "/oauth/token",
+            &[
+                ("grant_type", "authorization_code"),
+                ("client_id", PRIVATE_CLIENT_ID),
+                ("code", &private_code),
+                ("redirect_uri", REDIRECT_URI),
+                ("code_verifier", private_verifier),
+                ("client_assertion_type", assertion_type),
+                ("client_assertion", &wrong_assertion),
+            ],
+            Some(&private_token_proof),
+            false,
+        ).await;
+        assert_eq!(wrong_audience.status(), axum::http::StatusCode::UNAUTHORIZED);
+        assert_eq!(response_json(wrong_audience).await["error"], "invalid_client");
+
+        // #1146 T1.2 (rev): the RFC 7523 token-endpoint audience form is NOT
+        // accepted at the token endpoint either — atproto mandates the AS
+        // issuer alone at every endpoint. This pins the narrowing: accepting
+        // both forms was the review-flagged deviation.
+        let endpoint_aud_assertion = private_key_jwt_assertion(
+            &private_client_key,
+            "private-k1",
+            PRIVATE_CLIENT_ID,
+            &advertised_token_endpoint,
+            "private-client-endpoint-aud",
+        );
+        let endpoint_audience = post_form(
+            &app,
+            "/oauth/token",
+            &[
+                ("grant_type", "authorization_code"),
+                ("client_id", PRIVATE_CLIENT_ID),
+                ("code", &private_code),
+                ("redirect_uri", REDIRECT_URI),
+                ("code_verifier", private_verifier),
+                ("client_assertion_type", assertion_type),
+                ("client_assertion", &endpoint_aud_assertion),
+            ],
+            Some(&private_token_proof),
+            false,
+        ).await;
+        assert_eq!(
+            endpoint_audience.status(),
+            axum::http::StatusCode::UNAUTHORIZED,
+            "the token-endpoint audience form must be rejected (issuer-only)"
+        );
+        assert_eq!(response_json(endpoint_audience).await["error"], "invalid_client");
+
+        // #1146 T1.2: the reference confidential client sends the AS ISSUER
+        // as the assertion audience — previously rejected, now the ONLY
+        // accepted form (issuer-only at PAR and token).
+        let canonical_assertion = private_key_jwt_assertion(
+            &private_client_key,
+            "private-k1",
+            PRIVATE_CLIENT_ID,
+            ISSUER,
+            "private-client-canonical-aud",
+        );
+        let private_token = post_form(
+            &app,
+            "/oauth/token",
+            &[
+                ("grant_type", "authorization_code"),
+                ("client_id", PRIVATE_CLIENT_ID),
+                ("code", &private_code),
+                ("redirect_uri", REDIRECT_URI),
+                ("code_verifier", private_verifier),
+                ("client_assertion_type", assertion_type),
+                ("client_assertion", &canonical_assertion),
+            ],
+            Some(&private_token_proof),
+            false,
+        ).await;
+        assert_eq!(private_token.status(), axum::http::StatusCode::OK);
+        let private_token_nonce = private_token
+            .headers()
+            .get("DPoP-Nonce")
+            .and_then(|value| value.to_str().ok())
+            .unwrap()
+            .to_owned();
+        let private_token_json = response_json(private_token).await;
+        assert_eq!(private_token_json["token_type"], "DPoP");
+        assert_eq!(jwt_claims(private_token_json["access_token"].as_str().unwrap())["iss"], ISSUER);
+        let private_refresh_token = private_token_json["refresh_token"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        // #1146 T3.3: the session is bound to the assertion key verified at
+        // PAR/issuance. Refresh presenting an assertion from ANOTHER
+        // currently-registered key (private-k2) must be rejected — and must
+        // not consume the single-use refresh token.
+        let switch_assertion = private_key_jwt_assertion(
+            &private_client_key_2,
+            "private-k2",
+            PRIVATE_CLIENT_ID,
+            ISSUER,
+            "private-refresh-switch-jti",
+        );
+        let switch_proof = dpop_proof(
+            &private_dpop_key,
+            &advertised_token_endpoint,
+            "private-refresh-switch-dpop-jti",
+            Some(&private_token_nonce),
+        );
+        let switch_refresh = post_form(
+            &app,
+            "/oauth/token",
+            &[
+                ("grant_type", "refresh_token"),
+                ("client_id", PRIVATE_CLIENT_ID),
+                ("refresh_token", &private_refresh_token),
+                ("client_assertion_type", assertion_type),
+                ("client_assertion", &switch_assertion),
+            ],
+            Some(&switch_proof),
+            false,
+        )
+        .await;
+        assert_eq!(
+            switch_refresh.status(),
+            axum::http::StatusCode::UNAUTHORIZED,
+            "refresh must not switch to another registered assertion key"
+        );
+        assert_eq!(response_json(switch_refresh).await["error"], "invalid_client");
+        assert!(
+            state.get_refresh_token(&private_refresh_token).await?.is_some(),
+            "a rejected client authentication must not consume the refresh token"
+        );
+
+        // Refresh with the BOUND key succeeds and rotates.
+        let bound_assertion = private_key_jwt_assertion(
+            &private_client_key,
+            "private-k1",
+            PRIVATE_CLIENT_ID,
+            ISSUER,
+            "private-refresh-bound-jti",
+        );
+        let bound_proof = dpop_proof(
+            &private_dpop_key,
+            &advertised_token_endpoint,
+            "private-refresh-bound-dpop-jti",
+            Some(&private_token_nonce),
+        );
+        let bound_refresh = post_form(
+            &app,
+            "/oauth/token",
+            &[
+                ("grant_type", "refresh_token"),
+                ("client_id", PRIVATE_CLIENT_ID),
+                ("refresh_token", &private_refresh_token),
+                ("client_assertion_type", assertion_type),
+                ("client_assertion", &bound_assertion),
+            ],
+            Some(&bound_proof),
+            false,
+        )
+        .await;
+        assert_eq!(bound_refresh.status(), axum::http::StatusCode::OK);
+        let bound_refresh_nonce = bound_refresh
+            .headers()
+            .get("DPoP-Nonce")
+            .and_then(|value| value.to_str().ok())
+            .unwrap()
+            .to_owned();
+        let bound_refresh_json = response_json(bound_refresh).await;
+        let rotated_refresh_token = bound_refresh_json["refresh_token"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert_ne!(rotated_refresh_token, private_refresh_token);
+
+        // #1146 T3.3: removing the bound key from the client's JWKS revokes
+        // the session — the rotated refresh can no longer authenticate.
+        {
+            let mut clients = state.clients.write().await;
+            let entry = clients.get_mut(PRIVATE_CLIENT_ID).unwrap();
+            let keys = entry.jwks.as_ref().unwrap()["keys"].as_array().unwrap();
+            let remaining: Vec<serde_json::Value> = keys
+                .iter()
+                .filter(|k| k["kid"].as_str() != Some("private-k1"))
+                .cloned()
+                .collect();
+            entry.jwks = Some(serde_json::json!({"keys": remaining}));
+        }
+        let removed_key_assertion = private_key_jwt_assertion(
+            &private_client_key,
+            "private-k1",
+            PRIVATE_CLIENT_ID,
+            ISSUER,
+            "private-refresh-removed-jti",
+        );
+        let removed_key_proof = dpop_proof(
+            &private_dpop_key,
+            &advertised_token_endpoint,
+            "private-refresh-removed-dpop-jti",
+            Some(&bound_refresh_nonce),
+        );
+        let removed_key_refresh = post_form(
+            &app,
+            "/oauth/token",
+            &[
+                ("grant_type", "refresh_token"),
+                ("client_id", PRIVATE_CLIENT_ID),
+                ("refresh_token", &rotated_refresh_token),
+                ("client_assertion_type", assertion_type),
+                ("client_assertion", &removed_key_assertion),
+            ],
+            Some(&removed_key_proof),
+            false,
+        )
+        .await;
+        assert_eq!(
+            removed_key_refresh.status(),
+            axum::http::StatusCode::UNAUTHORIZED,
+            "key removal from the client JWKS must revoke the session"
+        );
+        assert_eq!(response_json(removed_key_refresh).await["error"], "invalid_client");
+        assert!(
+            state.get_refresh_token(&rotated_refresh_token).await?.is_some(),
+            "a rejected client authentication must not consume the refresh token"
+        );
+
+        // A missing refresh proof is rejected before consumption. Retrying
+        // the same refresh token with the bound key and nonce must succeed.
+        let stranded_attempt = post_form(
+            &app,
+            "/oauth/token",
+            &[
+                ("grant_type", "refresh_token"),
+                ("client_id", CLIENT_ID),
+                ("refresh_token", &refresh_token),
+            ],
+            None,
+            false,
+        )
+        .await;
+        assert_eq!(
+            stranded_attempt.status(),
+            axum::http::StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            response_json(stranded_attempt).await["error"],
+            "invalid_dpop_proof"
+        );
+        assert!(state.get_refresh_token(&refresh_token).await?.is_some());
+        let refresh_proof = dpop_proof(
+            &dpop_key,
+            &format!("{ISSUER}/oauth/token"),
+            "handler-refresh-jti",
+            Some(&token_nonce),
+        );
+        let refreshed = post_form(
+            &app,
+            "/oauth/token",
+            &[
+                ("grant_type", "refresh_token"),
+                ("client_id", CLIENT_ID),
+                ("refresh_token", &refresh_token),
+            ],
+            Some(&refresh_proof),
+            false,
+        )
+        .await;
+        assert_eq!(refreshed.status(), axum::http::StatusCode::OK);
+        let refreshed_json = response_json(refreshed).await;
+        assert_eq!(refreshed_json["token_type"], "DPoP");
+        assert_eq!(refreshed_json["sub"], MAPPED_DID);
+        assert_ne!(refreshed_json["refresh_token"], refresh_token);
+        assert!(state.get_refresh_token(&refresh_token).await?.is_none());
+        let refreshed_claims = jwt_claims(refreshed_json["access_token"].as_str().unwrap());
+        assert_eq!(refreshed_claims["sub"], MAPPED_DID);
+        assert_eq!(refreshed_claims["scope"], "atproto");
+
+        // A non-atproto PAR consent cannot be upgraded to the atproto profile
+        // by mutating hidden fields on the callback POST.
+        let downgrade_challenge =
+            URL_SAFE_NO_PAD.encode(Sha256::digest(GENERIC_PKCE_VERIFIER.as_bytes()));
+        let downgrade_par = post_form(&app, "/oauth/par", &[
+            ("client_id", CLIENT_ID), ("redirect_uri", REDIRECT_URI),
+            ("code_challenge", &downgrade_challenge), ("code_challenge_method", "S256"),
+            ("response_type", "code"), ("state", "scope-binding-state"),
+            ("scope", "read:*:*"), ("resource", ISSUER),
+        ], None, false).await;
+        assert_eq!(downgrade_par.status(), axum::http::StatusCode::CREATED);
+        let downgrade_par_json = response_json(downgrade_par).await;
+        let downgrade_request_uri = downgrade_par_json["request_uri"].as_str().unwrap();
+        let downgrade_authorize_uri = format!(
+            "/oauth/authorize?{}",
+            encode_form(&[("request_uri", downgrade_request_uri), ("client_id", CLIENT_ID)])
+        );
+        let downgrade_authorize = get(&app, &downgrade_authorize_uri).await;
+        assert_eq!(downgrade_authorize.status(), axum::http::StatusCode::OK);
+        let downgrade_html = response_text(downgrade_authorize).await;
+        let downgrade_nonce = html_hidden_value(&downgrade_html, "nonce").to_owned();
+        let downgrade_signed = format!("{fingerprint}:{downgrade_nonce}:{downgrade_challenge}");
+        let downgrade_signature = STANDARD.encode(user_key.sign(downgrade_signed.as_bytes()).to_bytes());
+        let upgraded_callback = post_form(&app, "/oauth/authorize", &[
+            ("client_id", CLIENT_ID), ("redirect_uri", REDIRECT_URI),
+            ("code_challenge", &downgrade_challenge), ("scope", "atproto"),
+            ("state", "scope-binding-state"), ("resource", ISSUER),
+            ("nonce", &downgrade_nonce), ("fingerprint", &fingerprint),
+            ("signature", &downgrade_signature),
+        ], None, false).await;
+        assert_eq!(upgraded_callback.status(), axum::http::StatusCode::BAD_REQUEST);
+        assert_eq!(response_json(upgraded_callback).await["error"], "invalid_request");
+
+        // A real generic authorization-code flow retains the local username
+        // byte-for-byte and emits the legacy Bearer response shape.
+        let generic_code_challenge =
+            URL_SAFE_NO_PAD.encode(Sha256::digest(GENERIC_PKCE_VERIFIER.as_bytes()));
+        let generic_authorize_uri = format!(
+            "/oauth/authorize?{}",
+            encode_form(&[
+                ("client_id", CLIENT_ID),
+                ("redirect_uri", REDIRECT_URI),
+                ("code_challenge", &generic_code_challenge),
+                ("code_challenge_method", "S256"),
+                ("response_type", "code"),
+                ("state", "generic-client-state"),
+                ("scope", "read:*:*"),
+                ("resource", ISSUER),
+            ])
+        );
+        let generic_authorize = get(&app, &generic_authorize_uri).await;
+        assert_eq!(generic_authorize.status(), axum::http::StatusCode::OK);
+        let generic_authorize_html = response_text(generic_authorize).await;
+        let generic_authorize_nonce =
+            html_hidden_value(&generic_authorize_html, "nonce").to_owned();
+        let generic_challenge =
+            format!("{fingerprint}:{generic_authorize_nonce}:{generic_code_challenge}");
+        let generic_signature =
+            STANDARD.encode(user_key.sign(generic_challenge.as_bytes()).to_bytes());
+        let generic_callback = post_form(
+            &app,
+            "/oauth/authorize",
+            &[
+                ("client_id", CLIENT_ID),
+                ("redirect_uri", REDIRECT_URI),
+                ("code_challenge", &generic_code_challenge),
+                ("scope", "read:*:*"),
+                ("state", "generic-client-state"),
+                ("resource", ISSUER),
+                ("nonce", &generic_authorize_nonce),
+                ("fingerprint", &fingerprint),
+                ("signature", &generic_signature),
+            ],
+            None,
+            false,
+        )
+        .await;
+        assert_eq!(generic_callback.status(), axum::http::StatusCode::SEE_OTHER);
+        let generic_location = generic_callback
+            .headers()
+            .get(axum::http::header::LOCATION)
+            .and_then(|value| value.to_str().ok())
+            .unwrap();
+        let generic_location = url::Url::parse(generic_location)?;
+        let generic_callback_params: std::collections::HashMap<_, _> =
+            generic_location.query_pairs().into_owned().collect();
+        assert_eq!(
+            generic_callback_params.get("state").map(String::as_str),
+            Some("generic-client-state")
+        );
+        assert_eq!(
+            generic_callback_params.get("iss").map(String::as_str),
+            Some(GENERIC_ISSUER)
+        );
+        let generic_code = generic_callback_params.get("code").unwrap();
+        let generic_token = post_form(
+            &app,
+            "/oauth/token",
+            &[
+                ("grant_type", "authorization_code"),
+                ("client_id", CLIENT_ID),
+                ("code", generic_code),
+                ("redirect_uri", REDIRECT_URI),
+                ("code_verifier", GENERIC_PKCE_VERIFIER),
+            ],
+            None,
+            false,
+        )
+        .await;
+        assert_eq!(generic_token.status(), axum::http::StatusCode::OK);
+        let generic_token_json = response_json(generic_token).await;
+        assert_eq!(generic_token_json["token_type"], "Bearer");
+        assert!(generic_token_json.get("sub").is_none());
+        let generic_access_token = generic_token_json["access_token"].as_str().unwrap().to_owned();
+        let generic_refresh_token = generic_token_json["refresh_token"].as_str().unwrap().to_owned();
+        let generic_claims = jwt_claims(&generic_access_token);
+        assert_eq!(generic_claims["sub"], "alice");
+        assert_eq!(generic_claims["iss"], GENERIC_ISSUER);
+        assert_eq!(generic_claims["aud"], ISSUER);
+        assert_eq!(generic_claims["scope"], "read:*:*");
+
+        // A token minted without an explicit resource uses PolicyService's
+        // configured path-bearing default audience. The AS must accept that
+        // exact local alias on its own protected routes.
+        let default_audience_token = state
+            .policy_client
+            .issue_token(&IssueToken {
+                requested_scopes: Some(vec!["read:*:*".to_owned()]),
+                ttl: Some(300),
+                audience: None,
+                subject: Some("default-audience-user".to_owned()),
+                user_pub_key: None,
+                dpop_jkt: None,
+                issuer: None,
+            })
+            .await?
+            .token;
+        assert_eq!(jwt_claims(&default_audience_token)["aud"], GENERIC_ISSUER);
+        let default_audience_auth = post_form_bearer(
+            &app,
+            "/oauth/introspect",
+            &[("token", &generic_access_token)],
+            &default_audience_token,
+        )
+        .await;
+        assert_eq!(
+            default_audience_auth.status(),
+            axum::http::StatusCode::OK,
+            "the AS must accept its path-bearing default audience alias"
+        );
+
+        // Token exchange may only attenuate the verified subject token's signed
+        // grant. A caller holding read:*:* cannot write transition:generic into
+        // a newly signed scope claim.
+        let inflation_subject = state
+            .policy_client
+            .issue_token(&IssueToken {
+                requested_scopes: Some(vec!["read:*:*".to_owned()]),
+                ttl: Some(300),
+                audience: Some(ISSUER.to_owned()),
+                subject: Some("scope-inflation-user".to_owned()),
+                user_pub_key: None,
+                dpop_jkt: None,
+                issuer: None,
+            })
+            .await?
+            .token;
+        let inflated_exchange = post_form(
+            &app,
+            "/oauth/token",
+            &[
+                (
+                    "grant_type",
+                    "urn:ietf:params:oauth:grant-type:token-exchange",
+                ),
+                ("client_id", CLIENT_ID),
+                ("subject_token", &inflation_subject),
+                (
+                    "subject_token_type",
+                    "urn:ietf:params:oauth:token-type:access_token",
+                ),
+                ("scope", "transition:generic"),
+                ("audience", ISSUER),
+            ],
+            None,
+            false,
+        )
+        .await;
+        assert_eq!(
+            inflated_exchange.status(),
+            axum::http::StatusCode::BAD_REQUEST
+        );
+        assert_eq!(response_json(inflated_exchange).await["error"], "invalid_scope");
+
+        // The same endpoint accepts a production composite access token and
+        // preserves a requested subset of its signed grant. This exercises the
+        // shared algorithm/audience/issuer validator on the subject-token path.
+        let valid_exchange_subject = state
+            .policy_client
+            .issue_token(&IssueToken {
+                requested_scopes: Some(vec![
+                    "read:*:*".to_owned(),
+                    "transition:generic".to_owned(),
+                ]),
+                ttl: Some(300),
+                audience: Some(ISSUER.to_owned()),
+                subject: Some("scope-valid-user".to_owned()),
+                user_pub_key: None,
+                dpop_jkt: None,
+                issuer: None,
+            })
+            .await?
+            .token;
+        let valid_exchange = post_form(
+            &app,
+            "/oauth/token",
+            &[
+                (
+                    "grant_type",
+                    "urn:ietf:params:oauth:grant-type:token-exchange",
+                ),
+                ("client_id", CLIENT_ID),
+                ("subject_token", &valid_exchange_subject),
+                (
+                    "subject_token_type",
+                    "urn:ietf:params:oauth:token-type:access_token",
+                ),
+                ("scope", "read:*:*"),
+                ("audience", ISSUER),
+            ],
+            None,
+            false,
+        )
+        .await;
+        assert_eq!(valid_exchange.status(), axum::http::StatusCode::OK);
+        let valid_exchange_json = response_json(valid_exchange).await;
+        let valid_exchange_claims =
+            jwt_claims(valid_exchange_json["access_token"].as_str().unwrap());
+        assert_eq!(valid_exchange_claims["sub"], "scope-valid-user");
+        assert_eq!(valid_exchange_claims["scope"], "read:*:*");
+
+        // The real composite token minted above authenticates to a protected
+        // OAuth route. This failed when middleware routed every JWT through
+        // the fixed EdDSA key.
+        let generic_introspection = post_form_bearer(
+            &app,
+            "/oauth/introspect",
+            &[("token", &generic_refresh_token)],
+            &generic_access_token,
+        ).await;
+        let generic_introspection_status = generic_introspection.status();
+        let generic_introspection_json = response_json(generic_introspection).await;
+        assert_eq!(generic_introspection_status, axum::http::StatusCode::OK, "{generic_introspection_json}");
+        assert_eq!(generic_introspection_json["active"], true);
+        assert_eq!(generic_introspection_json["sub"], "alice");
+
+        // JWT introspection uses the same composite/audience/issuer validator
+        // and returns the signed grant scope rather than subject-wide policy.
+        let access_introspection = post_form_bearer(
+            &app,
+            "/oauth/introspect",
+            &[("token", &generic_access_token)],
+            &generic_access_token,
+        ).await;
+        assert_eq!(access_introspection.status(), axum::http::StatusCode::OK);
+        let access_introspection_json = response_json(access_introspection).await;
+        assert_eq!(access_introspection_json["active"], true);
+        assert_eq!(access_introspection_json["scope"], "read:*:*");
+
+        let snapshot = hyprstream_rpc::auth::global_composite_key_set().snapshot();
+        let signing_pair = snapshot
+            .active_signing_pair(hyprstream_rpc::auth::CompositePairRole::Policy)
+            .unwrap();
+        let (ml_signing, ed_signing) = signing_pair.signing_keys().unwrap();
+        let now = chrono::Utc::now().timestamp();
+        let wrong_audience = crate::auth::jwt::encode_composite_ml_dsa_65_ed25519(
+            &hyprstream_rpc::auth::Claims::new("alice".to_owned(), now, now + 300)
+                .with_issuer(GENERIC_ISSUER.to_owned())
+                .with_audience(Some("https://other-resource.example.test".to_owned()))
+                .with_scope(Some("read:*:*".to_owned())),
+            &ml_signing,
+            &ed_signing,
+        );
+        let rejected_audience = post_form_bearer(
+            &app,
+            "/oauth/introspect",
+            &[("token", &generic_refresh_token)],
+            &wrong_audience,
+        ).await;
+        assert_eq!(rejected_audience.status(), axum::http::StatusCode::UNAUTHORIZED);
+
+        let wrong_issuer = crate::auth::jwt::encode_composite_ml_dsa_65_ed25519(
+            &hyprstream_rpc::auth::Claims::new("alice".to_owned(), now, now + 300)
+                .with_issuer("https://other-issuer.example.test".to_owned())
+                .with_audience(Some(ISSUER.to_owned()))
+                .with_scope(Some("read:*:*".to_owned())),
+            &ml_signing,
+            &ed_signing,
+        );
+        let rejected_issuer = post_form_bearer(
+            &app,
+            "/oauth/introspect",
+            &[("token", &wrong_issuer)],
+            &generic_access_token,
+        ).await;
+        assert_eq!(rejected_issuer.status(), axum::http::StatusCode::OK);
+        assert_eq!(response_json(rejected_issuer).await["active"], false);
+
+        // A real generic device flow retains the local username byte-for-byte
+        // and the legacy Bearer response shape.
+        let device = post_form(
+            &app,
+            "/oauth/device",
+            &[
+                ("client_id", CLIENT_ID),
+                ("scope", "read:*:*"),
+                ("resource", ISSUER),
+            ],
+            None,
+            false,
+        )
+        .await;
+        assert_eq!(device.status(), axum::http::StatusCode::OK);
+        let device_json = response_json(device).await;
+        let device_code = device_json["device_code"].as_str().unwrap();
+        let user_code = device_json["user_code"].as_str().unwrap();
+        let nonce_uri = format!(
+            "/oauth/device/nonce?{}",
+            encode_form(&[("user_code", user_code)])
+        );
+        let device_nonce = response_json(get(&app, &nonce_uri).await).await;
+        let normalized_code = user_code.replace('-', "");
+        let device_challenge = format!(
+            "alice:{normalized_code}:{}",
+            device_nonce["nonce"].as_str().unwrap()
+        );
+        let device_signature =
+            STANDARD.encode(user_key.sign(device_challenge.as_bytes()).to_bytes());
+        let approved = post_form(
+            &app,
+            "/oauth/device/verify",
+            &[
+                ("user_code", user_code),
+                ("username", "alice"),
+                ("signature", &device_signature),
+            ],
+            None,
+            true,
+        )
+        .await;
+        assert_eq!(approved.status(), axum::http::StatusCode::OK);
+        let device_token = post_form(
+            &app,
+            "/oauth/token",
+            &[
+                ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
+                ("client_id", CLIENT_ID),
+                ("device_code", device_code),
+            ],
+            None,
+            false,
+        )
+        .await;
+        assert_eq!(device_token.status(), axum::http::StatusCode::OK);
+        let device_token_json = response_json(device_token).await;
+        assert_eq!(device_token_json["token_type"], "Bearer");
+        assert!(device_token_json.get("sub").is_none());
+        let device_claims = jwt_claims(device_token_json["access_token"].as_str().unwrap());
+        assert_eq!(device_claims["sub"], "alice");
+        assert_eq!(device_claims["iss"], GENERIC_ISSUER);
+        assert_eq!(device_claims["aud"], ISSUER);
+        assert_eq!(device_claims["scope"], "read:*:*");
+
+        policy_handle.stop().await?;
+        Ok(())
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn oauth_iroh_refuses_arbitrary_rpc_and_anonymous_moq_before_dispatch(
     ) -> anyhow::Result<()> {
-        use hyprstream_rpc::transport::iroh_substrate::{
-            ALPN_HYPRSTREAM_RPC, ALPN_MOQ_LITE, IrohSubstrate, NoopHandler,
-        };
         use hyprstream_rpc::envelope::{RequestEnvelope, SignedEnvelope};
+        use hyprstream_rpc::transport::iroh_substrate::{
+            IrohSubstrate, NoopHandler, ALPN_HYPRSTREAM_RPC, ALPN_MOQ_LITE,
+        };
         use hyprstream_rpc::ToCapnp as _;
         use iroh::{EndpointAddr, TransportAddr};
         use moq_net::Client;
@@ -1011,11 +2582,9 @@ mod tests {
         if let Ok((mut send, mut recv)) = rpc.open_bi().await {
             let _ = send.write_all(&signed_crud_bytes).await;
             let _ = send.finish();
-            let response = tokio::time::timeout(
-                std::time::Duration::from_secs(2),
-                recv.read_to_end(1024),
-            )
-            .await;
+            let response =
+                tokio::time::timeout(std::time::Duration::from_secs(2), recv.read_to_end(1024))
+                    .await;
             assert!(
                 !matches!(response, Ok(Ok(ref bytes)) if !bytes.is_empty()),
                 "refused OAuth RPC ALPN must not produce a user-CRUD response"
@@ -1042,6 +2611,29 @@ mod tests {
         assert_eq!(
             meta.bearer_methods_supported.as_deref(),
             Some(&["header".to_owned()][..])
+        );
+    }
+
+    /// #1113: the PDS is its own AS, so the self protected-resource document
+    /// must advertise the atproto transition scopes AND point
+    /// `authorization_servers` at itself (resource == issuer).
+    #[test]
+    fn test_self_protected_resource_advertises_atproto_profile() {
+        // PDS = its own AS: resource and authorization_servers[0] are the same.
+        let issuer = "https://pds.example.com";
+        let meta = protected_resource_metadata(issuer, issuer);
+        assert_eq!(meta.resource, issuer);
+        assert_eq!(meta.authorization_servers, vec![issuer.to_owned()]);
+
+        // atproto transition scopes are advertised.
+        let scopes = self_resource_scopes();
+        assert!(
+            scopes.contains(&"atproto".to_owned()),
+            "missing atproto: {scopes:?}"
+        );
+        assert!(
+            scopes.contains(&"transition:generic".to_owned()),
+            "missing transition:generic: {scopes:?}"
         );
     }
 

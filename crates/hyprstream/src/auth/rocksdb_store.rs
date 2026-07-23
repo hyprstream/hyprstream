@@ -16,7 +16,7 @@ use ed25519_dalek::VerifyingKey;
 use std::io::Cursor;
 use std::path::Path;
 
-use super::user_store::{pubkey_fingerprint, matches_filter, DeviceRecord, DeviceStore, KeyAlgorithm, PubkeyEntry, UserFilter, UserProfile, UserStore};
+use super::user_store::{pubkey_fingerprint, matches_filter, DeviceRecord, DeviceStore, KeyAlgorithm, PubkeyEntry, UserFilter, UserProfile, UserProfilePatch, UserStore};
 
 const USER_PREFIX: &[u8] = b"user:";
 const PUBKEY_PREFIX: &[u8] = b"pubkey:";
@@ -130,6 +130,9 @@ impl RocksDbUserStore {
             if let Some(ref eid) = profile.external_id {
                 ui.set_external_id(eid);
             }
+            if let Some(ref did) = profile.atproto_did {
+                ui.set_atproto_did(did);
+            }
 
             // Serialize pubkeys list
             let mut pk_list = ui.init_pubkeys(pubkeys.len() as u32);
@@ -190,6 +193,7 @@ impl RocksDbUserStore {
                 None
             },
             external_id: text_or_none(ui.get_external_id()),
+            atproto_did: text_or_none(ui.get_atproto_did()),
         };
 
         // Deserialize pubkeys list
@@ -311,28 +315,31 @@ impl UserStore for RocksDbUserStore {
         Ok(sub)
     }
 
-    async fn set_profile(&self, username: &str, update: UserProfile) -> Result<()> {
+    async fn set_profile(&self, username: &str, update: UserProfilePatch) -> Result<()> {
         let (mut sub, mut profile, pubkeys) = self.get_raw(username)
             .with_context(|| format!("User '{}' not found", username))?
             .ok_or_else(|| anyhow!("User '{}' not found", username))?;
 
-        if let Some(s) = update.sub {
+        if let Some(Some(s)) = update.sub {
             sub = s;
         }
-        if update.name.is_some() {
-            profile.name = update.name;
+        if let Some(value) = update.name {
+            profile.name = value;
         }
-        if update.email.is_some() {
-            profile.email = update.email;
+        if let Some(value) = update.email {
+            profile.email = value;
         }
-        if update.email_verified.is_some() {
-            profile.email_verified = update.email_verified;
+        if let Some(value) = update.email_verified {
+            profile.email_verified = value;
         }
-        if update.active.is_some() {
-            profile.active = update.active;
+        if let Some(value) = update.active {
+            profile.active = value;
         }
-        if update.external_id.is_some() {
-            profile.external_id = update.external_id;
+        if let Some(value) = update.external_id {
+            profile.external_id = value;
+        }
+        if let Some(value) = update.atproto_did {
+            profile.atproto_did = value;
         }
 
         self.put_user(username, &sub, &profile, &pubkeys)?;
@@ -876,7 +883,8 @@ mod tests {
                 email_verified: Some(true),
                 active: Some(true),
                 external_id: Some("ext-123".to_owned()),
-            }).await?;
+                atproto_did: Some("did:plc:abcdefghijklmnqrstuvwx2p".to_owned()),
+            }.into()).await?;
         }
         // Open a fresh store instance to verify persistence
         let store2 = RocksDbUserStore::open(dir.path())?;
@@ -885,6 +893,31 @@ mod tests {
         assert_eq!(profile.external_id.as_deref(), Some("ext-123"));
         assert_eq!(profile.active, Some(true));
         assert_eq!(profile.email_verified, Some(true));
+        assert_eq!(
+            profile.atproto_did.as_deref(),
+            Some("did:plc:abcdefghijklmnqrstuvwx2p")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_atproto_did_can_be_explicitly_cleared() -> Result<()> {
+        let dir = TempDir::new()?;
+        let store = std::sync::Arc::new(make_store(dir.path()));
+        store.register("alice").await?;
+        store.set_profile("alice", UserProfilePatch {
+            atproto_did: Some(Some("did:plc:abcdefghijklmnqrstuvwx2p".to_owned())),
+            ..Default::default()
+        }).await?;
+
+        let service = crate::services::oauth::user_service::UserService::new(store.clone());
+        service.update("alice", crate::services::oauth::user_service::UserUpdate {
+            atproto_did: Some(None),
+            ..Default::default()
+        }).await?;
+
+        let profile = store.get_profile("alice").await?.unwrap();
+        assert_eq!(profile.atproto_did, None);
         Ok(())
     }
 

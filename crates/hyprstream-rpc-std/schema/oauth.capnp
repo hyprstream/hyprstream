@@ -101,6 +101,7 @@ struct UserInfo {
   active @6 :Bool;
   externalId @7 :Text;
   pubkeys @8 :List(PubkeyEntry);  # Multiple pubkeys per user
+  atprotoDid @9 :Text $optional;  # Mapped did:plc / host-form did:web (#1113/#1124)
 }
 
 struct PubkeyEntry {

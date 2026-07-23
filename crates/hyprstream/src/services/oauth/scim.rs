@@ -318,6 +318,7 @@ pub async fn create_user(
             email: email.map(Some),
             external_id: external_id.map(Some),
             email_verified: None,
+            atproto_did: None,
         };
         if let Err(e) = svc.update(&user_name, update).await {
             return scim_error_simple(500, &e.to_string());
@@ -412,6 +413,7 @@ pub async fn replace_user(
         email: email.map(Some),
         external_id: external_id.map(Some),
         email_verified: None,
+            atproto_did: None,
     };
 
     match svc.update(&info.username, update).await {

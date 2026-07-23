@@ -63,6 +63,7 @@ impl OAuthRpcHandler {
             email_verified: info.email_verified,
             active: info.active,
             external_id: info.external_id.clone().unwrap_or_default(),
+            atproto_did: info.atproto_did.clone(),
             pubkeys: info.pubkeys.iter().map(|pk| crate::services::generated::oauth_client::PubkeyEntry {
                 fingerprint: pk.fingerprint.clone(),
                 pubkey_base64: pk.pubkey_base64.clone(),
@@ -173,6 +174,7 @@ impl OauthHandler for OAuthRpcHandler {
             email: data.email.as_ref().filter(|s| !s.is_empty()).map(|s| Some(s.clone())),
             external_id: data.external_id.as_ref().filter(|s| !s.is_empty()).map(|s| Some(s.clone())),
             email_verified: None,
+            atproto_did: None,
         };
         match svc.update(&data.username, update).await {
             Ok(info) => Ok(OauthResponseVariant::UpdateUserResult(Self::user_info_to_rpc(&info))),

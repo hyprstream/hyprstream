@@ -490,6 +490,8 @@ pub async fn external_callback(
         expires_at: Instant::now() + Duration::from_secs(60),
         username: mapped_subject,
         verifying_key: None, // external OIDC — no local Ed25519 key binding
+        dpop_jkt: None, // external OIDC flow — no PAR DPoP binding
+        client_assertion_jkt: None, // external OIDC flow — no PAR client-auth binding
     };
     state.pending_codes.write().await.insert(code.clone(), auth_code);
 
@@ -546,8 +548,9 @@ async fn provision_federated_user(
         email_verified: external_claims["email_verified"].as_bool(),
         active: Some(true),
         external_id: external_claims["sub"].as_str().map(str::to_owned),
+        atproto_did: None,
     };
-    if let Err(e) = store.set_profile(subject, profile).await {
+    if let Err(e) = store.set_profile(subject, profile.into()).await {
         tracing::warn!(subject = %subject, error = %e, "Failed to set profile for federated user");
     }
 

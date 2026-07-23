@@ -127,6 +127,8 @@ mod tests {
             jwks: None,
             jwks_uri: None,
             hyprstream_node_did: None,
+            scope: None,
+            dpop_bound_access_tokens: None,
             is_cimd: true,
             registered_at: Instant::now(),
         }

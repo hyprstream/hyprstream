@@ -358,11 +358,19 @@ impl PolicyHandler for PolicyService {
             }));
         }
 
-        // Create and sign JWT with audience binding (RFC 8707)
-        // Scopes are not embedded in JWT - Casbin enforces authorization server-side
+        // Create and sign JWT with audience (RFC 8707) and the OAuth grant's
+        // scope ceiling. Casbin still supplies subject policy; verifiers must
+        // intersect it with this signed per-grant authority (#1146 T2.1).
         let now = chrono::Utc::now().timestamp();
         let audience = data.audience.as_ref().filter(|s| !s.is_empty()).cloned()
             .or_else(|| self.default_audience.clone());
+        let granted_scope = data.requested_scopes.as_ref().map(|scopes| {
+            scopes.iter()
+                .map(String::as_str)
+                .filter(|scope| !scope.is_empty())
+                .collect::<Vec<_>>()
+                .join(" ")
+        });
 
         // Service tokens: cnf.jwk must be the service's REGISTERED key, never a
         // CA-derived guess (#441/#806) — bootstrap generates independent random
@@ -384,15 +392,20 @@ impl PolicyHandler for PolicyService {
             })
         };
 
-        // Populate iss with the OAuth issuer URL so federation peers can fetch JWKS.
-        // default_audience is the OAuth issuer URL (set via with_default_audience).
-        let issuer = self.default_audience.clone().unwrap_or_default();
+        // OAuth may override the issuer for a profile-specific token (atproto
+        // requires an origin). Other callers retain the configured default.
+        let issuer = data.issuer.as_ref()
+            .filter(|issuer| !issuer.is_empty())
+            .cloned()
+            .or_else(|| self.default_audience.clone())
+            .unwrap_or_default();
         let mut claims = hyprstream_rpc::auth::Claims::new(
             subject,
             now,
             now + requested_ttl as i64,
         ).with_issuer(issuer)
-         .with_audience(audience);
+         .with_audience(audience)
+         .with_scope(granted_scope);
 
         // DPoP jkt takes priority over userPubKey (RFC 9449 § 6).
         if let Some(ref jkt) = data.dpop_jkt {

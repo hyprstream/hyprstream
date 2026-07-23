@@ -168,6 +168,7 @@ mod tests {
             expires_at_unix: chrono::Utc::now().timestamp() + 60,
             verifying_key_bytes: None,
             dpop_jkt: None,
+            client_assertion_jkt: None,
             ucan_grant: None,
         };
         store.put("refresh", &entry, 60).await.unwrap();

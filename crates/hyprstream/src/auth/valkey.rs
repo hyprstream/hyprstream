@@ -20,7 +20,8 @@ use fred::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use super::user_store::{
-    matches_filter, pubkey_fingerprint, PubkeyEntry, ScimFilter, UserFilter, UserProfile, UserStore,
+    matches_filter, pubkey_fingerprint, PubkeyEntry, ScimFilter, UserFilter, UserProfile,
+    UserProfilePatch, UserStore,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -82,24 +83,25 @@ impl UserStore for ValkeyUserStore {
         Ok(sub)
     }
 
-    async fn set_profile(&self, username: &str, new: UserProfile) -> Result<()> {
+    async fn set_profile(&self, username: &str, new: UserProfilePatch) -> Result<()> {
         let existing = self.get_profile_raw(username).await?.unwrap_or_default();
 
         // Remove stale externalId index if it changed.
         if let Some(ref old_extid) = existing.external_id {
-            if new.external_id.as_deref() != Some(old_extid.as_str()) {
+            if new.external_id.as_ref().is_some_and(|value| value.as_deref() != Some(old_extid)) {
                 let _: i64 = self.pool.del(format!("hs:idx:extid:{old_extid}")).await.unwrap_or(0);
             }
         }
 
-        // Merge: new fields overwrite existing; None in `new` keeps existing value.
+        // Apply tri-state patch fields: omitted keeps existing, explicit None clears.
         let merged = UserProfile {
-            sub: new.sub.or(existing.sub.clone()),
-            name: new.name.or(existing.name),
-            email: new.email.or(existing.email),
-            email_verified: new.email_verified.or(existing.email_verified),
-            active: new.active.or(existing.active),
-            external_id: new.external_id.or(existing.external_id),
+            sub: new.sub.unwrap_or(existing.sub),
+            name: new.name.unwrap_or(existing.name),
+            email: new.email.unwrap_or(existing.email),
+            email_verified: new.email_verified.unwrap_or(existing.email_verified),
+            active: new.active.unwrap_or(existing.active),
+            external_id: new.external_id.unwrap_or(existing.external_id),
+            atproto_did: new.atproto_did.unwrap_or(existing.atproto_did),
         };
 
         // Write new externalId index.
@@ -215,7 +217,6 @@ impl UserStore for ValkeyUserStore {
             let descending = filter.sort_order.as_deref() == Some("descending");
             results.sort_by(|(a_name, a_prof), (b_name, b_prof)| {
                 let ord = match sort_by.as_str() {
-                    "userName" => a_name.cmp(b_name),
                     "id" | "sub" => a_prof.sub.cmp(&b_prof.sub),
                     _ => a_name.cmp(b_name),
                 };
@@ -241,8 +242,7 @@ impl UserStore for ValkeyUserStore {
     async fn list_pubkeys(&self, username: &str) -> Result<Vec<PubkeyEntry>> {
         let fps: Vec<String> = self.pool
             .smembers(format!("hs:user:{username}:keys"))
-            .await
-            .unwrap_or_default();
+            .await?;
         let mut entries = Vec::new();
         for fp in fps {
             let val: Option<String> = self.pool.get(format!("hs:key:{fp}")).await?;
@@ -380,6 +380,51 @@ impl UserStore for ValkeyUserStore {
             let json = serde_json::to_string(&stored)?;
             self.pool.set::<(), _, _>(format!("hs:key:{fingerprint}"), json, None, None, false).await?;
         }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn list_pubkeys_propagates_smembers_read_error() -> Result<()> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // A tiny RESP server accepts Fred's connection setup, then returns a
+        // synthetic Valkey error for SMEMBERS. This directly exercises the
+        // backend seam and would regress to Ok(empty) if list_pubkeys swallowed
+        // the read error again.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await?;
+            let mut buffer = [0_u8; 1024];
+            loop {
+                let read = socket.read(&mut buffer).await?;
+                if read == 0 {
+                    break;
+                }
+                let command = String::from_utf8_lossy(&buffer[..read]);
+                let response = if command.contains("SMEMBERS") {
+                    "-ERR synthetic SMEMBERS read failure\r\n"
+                } else {
+                    "+OK\r\n"
+                };
+                socket.write_all(response.as_bytes()).await?;
+            }
+            Ok::<(), std::io::Error>(())
+        });
+
+        let config = RedisConfig::from_url(&format!("redis://{address}"))?;
+        let pool = Builder::from_config(config).build_pool(1)?;
+        let _connection = pool.connect();
+        pool.wait_for_connect().await?;
+        let store = ValkeyUserStore { pool };
+
+        assert!(store.list_pubkeys("alice").await.is_err());
+        server.abort();
         Ok(())
     }
 }

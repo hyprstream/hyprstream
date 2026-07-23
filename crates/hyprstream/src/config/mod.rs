@@ -1218,6 +1218,9 @@ impl Default for OAuthConfig {
             jwt_key_lead_secs: None,
             jwt_key_drain_secs: None,
             jwt_key_rotation_check_secs: None,
+            // #1113 rev2 F6: do NOT default true globally — that breaks
+            // existing inline non-atproto auth. PAR is enforced on the
+            // atproto profile at the authorize handler level.
             require_pushed_authorization_requests: false,
             xrpc_read_slice: false,
         }
@@ -1254,7 +1257,8 @@ impl OAuthConfig {
         std::time::Duration::from_secs(self.jwt_key_rotation_check_secs.unwrap_or(6 * 3600))
     }
 
-    /// Get the issuer URL, using external_url if set, otherwise deriving from host:port.
+    /// Get the configured issuer URL, preserving an explicit path when set,
+    /// otherwise deriving it from host:port.
     /// Auto-derives `https://` when global TLS is enabled.
     pub fn issuer_url(&self) -> String {
         if let Some(ref url) = self.external_url {
@@ -1315,6 +1319,12 @@ pub struct CredentialsConfig {
     pub valkey: ValkeyCredentialsConfig,
 }
 fn default_oauth_scopes() -> Vec<String> {
+    // The DEFAULT GRANT set when a client omits `scope`. atproto transition
+    // scopes are deliberately ABSENT — they are supported-but-explicit opt-in
+    // scopes that activate the strict atproto profile; including them here
+    // would silently activate the strict profile for omitted-scope requests
+    // (#1113 rev2 F4/F6). They ARE advertised in scopes_supported (see
+    // metadata.rs `advertised_scopes`).
     vec![
         "read:*:*".to_owned(),
         "infer:model:*".to_owned(),

@@ -3,7 +3,8 @@
 //! `POST /oauth/introspect` — validates a token and returns its metadata.
 //! Caller must authenticate with a Bearer token.
 //!
-//! - JWT access tokens: verified against the server's Ed25519 key.
+//! - JWT access tokens: routed by algorithm and verified against the server's
+//!   exact published composite pair or Ed25519 key.
 //! - Opaque refresh tokens: looked up from RocksDB with lazy expiry.
 //! - Any failure → `{"active": false}` per RFC 7662 § 2.2.
 
@@ -33,19 +34,14 @@ pub async fn introspect_token(
 ) -> Response {
     // JWT tokens contain dots; opaque tokens do not.
     if params.token.contains('.') {
-        introspect_jwt(&state, &params.token)
+        introspect_jwt(&state, &params.token).await
     } else {
         introspect_refresh(&state, &params.token).await
     }
 }
 
-fn introspect_jwt(state: &Arc<OAuthState>, token: &str) -> Response {
-    let vk = match ed25519_dalek::VerifyingKey::from_bytes(&state.verifying_key_bytes) {
-        Ok(k) => k,
-        Err(_) => return inactive_response(),
-    };
-
-    let claims = match hyprstream_rpc::auth::jwt::decode(token, &vk, None) {
+async fn introspect_jwt(state: &Arc<OAuthState>, token: &str) -> Response {
+    let claims = match super::auth::validate_oauth_access_token(state, token).await {
         Ok(c) => c,
         Err(_) => return inactive_response(),
     };
@@ -66,6 +62,7 @@ fn introspect_jwt(state: &Arc<OAuthState>, token: &str) -> Response {
             "exp": claims.exp,
             "iat": claims.iat,
             "aud": claims.aud,
+            "scope": claims.scope,
         })),
     )
         .into_response()
@@ -73,19 +70,29 @@ fn introspect_jwt(state: &Arc<OAuthState>, token: &str) -> Response {
 
 async fn introspect_refresh(state: &Arc<OAuthState>, token: &str) -> Response {
     match state.get_refresh_token(token).await {
-        Ok(Some(entry)) => (
-            StatusCode::OK,
-            [(header::CACHE_CONTROL, "no-store"), (header::PRAGMA, "no-cache")],
-            Json(serde_json::json!({
-                "active": true,
-                "token_type": "refresh_token",
-                "sub": entry.username,
-                "client_id": entry.client_id,
-                "scope": entry.scopes.join(" "),
-                "exp": entry.expires_at_unix,
-            })),
-        )
-            .into_response(),
+        Ok(Some(entry)) => {
+            // Match the mint boundary: generic tokens retain the username,
+            // while active atproto-profile tokens report the mapped DID.
+            let sub = if super::state::atproto_profile_active(&entry.scopes) {
+                state.check_atproto_account_eligibility(&entry.username).await
+                    .unwrap_or_else(|_| entry.username.clone())
+            } else {
+                entry.username.clone()
+            };
+            (
+                StatusCode::OK,
+                [(header::CACHE_CONTROL, "no-store"), (header::PRAGMA, "no-cache")],
+                Json(serde_json::json!({
+                    "active": true,
+                    "token_type": "refresh_token",
+                    "sub": sub,
+                    "client_id": entry.client_id,
+                    "scope": entry.scopes.join(" "),
+                    "exp": entry.expires_at_unix,
+                })),
+            )
+                .into_response()
+        }
         _ => inactive_response(),
     }
 }

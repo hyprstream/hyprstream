@@ -8,7 +8,7 @@ use anyhow::{anyhow, Result};
 use base64::{engine::general_purpose::STANDARD, Engine};
 use ed25519_dalek::VerifyingKey;
 
-use crate::auth::{UserFilter, UserProfile, UserStore, PubkeyEntry, decode_pubkey_base64};
+use crate::auth::{UserFilter, UserProfilePatch, UserStore, PubkeyEntry, decode_pubkey_base64};
 
 /// Shared user information type (SCIM-informed).
 #[derive(Debug, Clone)]
@@ -21,6 +21,7 @@ pub struct UserInfo {
     pub email_verified: bool,
     pub active: bool,
     pub external_id: Option<String>,
+    pub atproto_did: Option<String>,
     pub pubkeys: Vec<PubkeyInfo>,
 }
 
@@ -66,6 +67,8 @@ pub struct UserUpdate {
     pub email: Option<Option<String>>,
     pub email_verified: Option<bool>,
     pub external_id: Option<Option<String>>,
+    /// The account's mapped atproto DID (#1113 r5 / #1124 seam).
+    pub atproto_did: Option<Option<String>>,
 }
 
 /// Shared user CRUD service used by both SCIM HTTP and ZMQ RPC transports.
@@ -113,6 +116,7 @@ impl UserService {
                     email_verified: profile.email_verified.unwrap_or(false),
                     active: profile.active.unwrap_or(true),
                     external_id: profile.external_id,
+                    atproto_did: profile.atproto_did,
                     pubkeys: pubkeys.iter().map(PubkeyInfo::from).collect(),
                 }))
             }
@@ -146,6 +150,7 @@ impl UserService {
                     email_verified: profile.email_verified.unwrap_or(false),
                     active: profile.active.unwrap_or(true),
                     external_id: profile.external_id,
+                    atproto_did: profile.atproto_did,
                     pubkeys: vec![], // Omitted in list
                 }
             })
@@ -159,19 +164,19 @@ impl UserService {
 
     /// Update a user's profile fields.
     pub async fn update(&self, username: &str, update: UserUpdate) -> Result<UserInfo> {
-        let existing = self.store
+        self.store
             .get_profile(username).await?
             .ok_or_else(|| anyhow!("User '{}' not found", username))?;
 
-        let merged = UserProfile {
-            sub: existing.sub,
-            name: update.name.unwrap_or(existing.name),
-            email: update.email.unwrap_or(existing.email),
-            email_verified: Some(update.email_verified.unwrap_or_else(|| existing.email_verified.unwrap_or(false))),
-            active: existing.active,
-            external_id: update.external_id.unwrap_or(existing.external_id),
+        let patch = UserProfilePatch {
+            name: update.name,
+            email: update.email,
+            email_verified: update.email_verified.map(Some),
+            external_id: update.external_id,
+            atproto_did: update.atproto_did,
+            ..Default::default()
         };
-        self.store.set_profile(username, merged).await?;
+        self.store.set_profile(username, patch).await?;
 
         self.get(username)
             .await?

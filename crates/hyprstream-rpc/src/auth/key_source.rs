@@ -117,10 +117,27 @@ pub trait JwtKeySource: Send + Sync + 'static {
 #[derive(Clone)]
 pub struct ClusterKeySource {
     ca_verifying_key: VerifyingKey,
-    local_issuer_url: String,
     local_issuers_vec: Vec<String>,
     ml_dsa_vks: Arc<std::sync::RwLock<Vec<crate::crypto::pq::MlDsaVerifyingKey>>>,
     composite_keys: Arc<super::CompositeKeySet>,
+}
+
+fn local_issuer_aliases(local_issuer_url: &str) -> Vec<String> {
+    if local_issuer_url.is_empty() {
+        return Vec::new();
+    }
+    let mut issuers = vec![local_issuer_url.to_owned()];
+    // Keep this byte-for-byte aligned with OAuthState::canonical_issuer_origin:
+    // the atproto issuer is the configured scheme + authority with its path
+    // removed, without URL-library normalization of ports or casing.
+    if let Some((scheme, rest)) = local_issuer_url.split_once("://") {
+        let authority = rest.split('/').next().unwrap_or_default();
+        let origin = format!("{scheme}://{authority}");
+        if !scheme.is_empty() && !authority.is_empty() && origin != local_issuer_url {
+            issuers.push(origin);
+        }
+    }
+    issuers
 }
 
 impl ClusterKeySource {
@@ -131,14 +148,9 @@ impl ClusterKeySource {
     /// * `ca_verifying_key` - The cluster's CA verifying key (from PolicyService)
     /// * `local_issuer_url` - The OAuth issuer URL (e.g., "http://127.0.0.1:9080")
     pub fn new(ca_verifying_key: VerifyingKey, local_issuer_url: String) -> Self {
-        let local_issuers_vec = if local_issuer_url.is_empty() {
-            vec![]
-        } else {
-            vec![local_issuer_url.clone()]
-        };
+        let local_issuers_vec = local_issuer_aliases(&local_issuer_url);
         Self {
             ca_verifying_key,
-            local_issuer_url,
             local_issuers_vec,
             ml_dsa_vks: Arc::new(std::sync::RwLock::new(Vec::new())),
             composite_keys: super::global_composite_key_set(),
@@ -184,8 +196,10 @@ impl JwtKeySource for ClusterKeySource {
         if issuer.is_empty() {
             return true;
         }
-        // Match against local issuer URL
-        issuer == self.local_issuer_url
+        // The atproto profile emits the canonical origin while generic OAuth
+        // retains the configured issuer (which may carry a path). Both are
+        // exact local aliases; sibling paths and foreign origins remain denied.
+        self.local_issuers_vec.iter().any(|local| local == issuer)
     }
 
     fn local_issuers(&self) -> &[String] {
@@ -306,7 +320,6 @@ struct CachedKey {
 /// - Semaphore bounds concurrent JWKS fetches
 pub struct JwksKeySource {
     mode: JwksMode,
-    local_issuer_url: String,
     local_issuers_vec: Vec<String>,
     fetcher: JwksFetcher,
     cache: RwLock<HashMap<String, CachedKey>>,
@@ -339,14 +352,9 @@ pub struct JwksKeySource {
 
 impl JwksKeySource {
     pub fn new(mode: JwksMode, local_issuer_url: String, fetcher: JwksFetcher) -> Self {
-        let local_issuers_vec = if local_issuer_url.is_empty() {
-            vec![]
-        } else {
-            vec![local_issuer_url.clone()]
-        };
+        let local_issuers_vec = local_issuer_aliases(&local_issuer_url);
         Self {
             mode,
-            local_issuer_url,
             local_issuers_vec,
             fetcher,
             cache: RwLock::new(HashMap::new()),
@@ -397,7 +405,7 @@ impl JwksKeySource {
     }
 
     fn is_local(&self, issuer: &str) -> bool {
-        issuer.is_empty() || issuer == self.local_issuer_url
+        issuer.is_empty() || self.local_issuers_vec.iter().any(|local| local == issuer)
     }
 
     async fn resolve_jwks_url(&self, issuer: &str) -> Result<String> {
@@ -594,6 +602,31 @@ mod tests {
 
         let key = ks.get_key("http://localhost:9080", None).await?;
         assert_eq!(key, test_ca_key());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn local_key_sources_trust_canonical_origin_for_path_issuer() -> anyhow::Result<()> {
+        let configured = "https://pds.example.test/configured/path";
+        let origin = "https://pds.example.test";
+        let ks = ClusterKeySource::new(test_ca_key(), configured.to_owned());
+        assert!(ks.is_trusted(configured));
+        assert!(ks.is_trusted(origin));
+        assert!(!ks.is_trusted("https://pds.example.test/other"));
+        assert_eq!(ks.get_key(origin, None).await?, test_ca_key());
+        assert_eq!(ks.local_issuers(), &[configured, origin]);
+
+        let fetcher: JwksFetcher = std::sync::Arc::new(|_url: String| {
+            Box::pin(async move { anyhow::bail!("network must not be used") })
+        });
+        let jwks = JwksKeySource::new(
+            JwksMode::Isolated { jwks_url: "https://pds.example.test/oauth/jwks".to_owned() },
+            configured.to_owned(),
+            fetcher,
+        )
+        .with_local_ca_key(test_ca_key());
+        assert!(jwks.is_trusted(origin));
+        assert_eq!(jwks.local_issuers(), &[configured, origin]);
         Ok(())
     }
 

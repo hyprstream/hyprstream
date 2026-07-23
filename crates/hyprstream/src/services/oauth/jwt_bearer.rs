@@ -109,6 +109,7 @@ pub async fn exchange_jwt_bearer(
             subject: Some(sub.clone()),
             user_pub_key: None,
             dpop_jkt: None,
+            issuer: None,
         })
         .await;
 

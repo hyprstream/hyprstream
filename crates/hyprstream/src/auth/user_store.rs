@@ -29,6 +29,37 @@ pub struct UserProfile {
     /// External identity ID from upstream IdP (SCIM: externalId).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub external_id: Option<String>,
+    /// The account's mapped atproto DID (did:plc or host-form did:web), if
+    /// provisioned. PROVISIONING is tracked in #1124; the LOOKUP seam exists
+    /// here so the atproto OAuth profile can emit the mapped DID as `sub` (#1113 r5).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub atproto_did: Option<String>,
+}
+
+/// Tri-state patch for profile fields: omitted, explicitly cleared, or replaced.
+#[derive(Debug, Clone, Default)]
+pub struct UserProfilePatch {
+    pub sub: Option<Option<String>>,
+    pub name: Option<Option<String>>,
+    pub email: Option<Option<String>>,
+    pub email_verified: Option<Option<bool>>,
+    pub active: Option<Option<bool>>,
+    pub external_id: Option<Option<String>>,
+    pub atproto_did: Option<Option<String>>,
+}
+
+impl From<UserProfile> for UserProfilePatch {
+    fn from(profile: UserProfile) -> Self {
+        Self {
+            sub: profile.sub.map(Some),
+            name: profile.name.map(Some),
+            email: profile.email.map(Some),
+            email_verified: profile.email_verified.map(Some),
+            active: profile.active.map(Some),
+            external_id: profile.external_id.map(Some),
+            atproto_did: profile.atproto_did.map(Some),
+        }
+    }
 }
 
 /// The public-key algorithm of a stored [`PubkeyEntry`].
@@ -147,8 +178,8 @@ pub trait UserStore: Send + Sync {
     /// Register a new user. Returns the generated subject UUID.
     async fn register(&self, username: &str) -> Result<String>;
 
-    /// Update a user's profile fields (merge semantics).
-    async fn set_profile(&self, username: &str, profile: UserProfile) -> Result<()>;
+    /// Update a user's profile fields with tri-state patch semantics.
+    async fn set_profile(&self, username: &str, patch: UserProfilePatch) -> Result<()>;
 
     /// Remove a user and all their pubkeys.
     async fn remove(&self, username: &str) -> Result<bool>;

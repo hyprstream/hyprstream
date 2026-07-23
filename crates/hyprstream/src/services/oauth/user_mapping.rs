@@ -66,7 +66,7 @@ pub fn map_external_identity(
 
 /// Extract the authority component (host[:port]) from a URL, preserving
 /// the port if present. Used for did:web construction per the did:web spec.
-fn extract_authority(url: &str) -> Result<String> {
+pub(crate) fn extract_authority(url: &str) -> Result<String> {
     let after_scheme = url
         .split_once("://")
         .map(|(_, rest)| rest)

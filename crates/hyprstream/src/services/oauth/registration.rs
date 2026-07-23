@@ -62,6 +62,11 @@ pub struct RegistrationRequest {
     /// deployments use it to associate the OAuth device grant with the host.
     #[serde(default)]
     pub hyprstream_node_did: Option<String>,
+    /// Space-separated scope tokens this client intends to request (RFC 7591 /
+    /// RFC 6749 §3.3). Stored verbatim and enforced as the upper bound on
+    /// requested scopes at PAR/authorize (#1113 rev2 finding 4).
+    #[serde(default)]
+    pub scope: Option<String>,
 }
 
 /// Dynamic client registration response (RFC 7591 §3.2.1).
@@ -85,6 +90,8 @@ pub struct RegistrationResponse {
     pub jwks: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub jwks_uri: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
 }
 
 /// POST /oauth/register — Dynamic Client Registration (RFC 7591)
@@ -201,6 +208,9 @@ pub async fn register_client(
         jwks: req.jwks.clone(),
         jwks_uri: req.jwks_uri.clone(),
         hyprstream_node_did: req.hyprstream_node_did.clone(),
+        scope: req.scope.clone(),
+        // DCR (RFC 7591) requests do not carry this atproto CIMD field.
+        dpop_bound_access_tokens: None,
         is_cimd: false,
         registered_at: Instant::now(),
     };
@@ -236,6 +246,7 @@ pub async fn register_client(
         token_endpoint_auth_method: req.token_endpoint_auth_method,
         jwks: req.jwks,
         jwks_uri: req.jwks_uri,
+        scope: req.scope,
     }).into_response()
 }
 
@@ -260,6 +271,46 @@ pub struct ClientIdMetadataDocument {
     pub jwks: Option<serde_json::Value>,
     #[serde(default)]
     pub jwks_uri: Option<String>,
+    /// Space-separated scope tokens the client declares (RFC 7591 §2 /
+    /// CIMD §4). Enforced as the ceiling on requested scopes at
+    /// PAR/authorize — without this a fetched CIMD client could request
+    /// any server-supported scope (#1146 T1.1).
+    #[serde(default)]
+    pub scope: Option<String>,
+    /// atproto OAuth: confidential clients declare
+    /// `dpop_bound_access_tokens: true`. Parsed and retained; enforcement
+    /// is follow-up work (#1146 T1.1).
+    #[serde(default)]
+    pub dpop_bound_access_tokens: Option<bool>,
+}
+
+/// Convert a validated Client ID Metadata Document into a
+/// [`RegisteredClient`]. Carries the declared `scope` ceiling and
+/// `dpop_bound_access_tokens` flag — dropping them here is what silently
+/// disabled the client-declared scope ceiling for fetched clients
+/// (#1146 T1.1). Factored out of [`fetch_client_metadata`] so the
+/// mapping is unit-testable without a live HTTP fetch.
+pub(crate) fn registered_client_from_cimd_doc(
+    client_id_url: &str,
+    doc: ClientIdMetadataDocument,
+) -> RegisteredClient {
+    RegisteredClient {
+        client_id: client_id_url.to_owned(),
+        redirect_uris: doc.redirect_uris,
+        client_name: doc.client_name,
+        client_uri: doc.client_uri,
+        logo_uri: doc.logo_uri,
+        grant_types: doc.grant_types,
+        response_types: doc.response_types,
+        token_endpoint_auth_method: doc.token_endpoint_auth_method,
+        jwks: doc.jwks,
+        jwks_uri: doc.jwks_uri,
+        hyprstream_node_did: None,
+        scope: doc.scope,
+        dpop_bound_access_tokens: doc.dpop_bound_access_tokens,
+        is_cimd: true,
+        registered_at: Instant::now(),
+    }
 }
 
 /// Resolve a CIMD client: cache-aside lookup, fetch on miss.
@@ -470,21 +521,7 @@ pub async fn fetch_client_metadata(
     }
 
     Ok((
-        RegisteredClient {
-            client_id: client_id_url.to_owned(),
-            redirect_uris: doc.redirect_uris,
-            client_name: doc.client_name,
-            client_uri: doc.client_uri,
-            logo_uri: doc.logo_uri,
-            grant_types: doc.grant_types,
-            response_types: doc.response_types,
-            token_endpoint_auth_method: doc.token_endpoint_auth_method,
-            jwks: doc.jwks,
-            jwks_uri: doc.jwks_uri,
-            hyprstream_node_did: None,
-            is_cimd: true,
-            registered_at: Instant::now(),
-        },
+        registered_client_from_cimd_doc(client_id_url, doc),
         max_age,
     ))
 }
@@ -645,6 +682,44 @@ mod tests {
         assert!(doc.client_name.is_none());
     }
 
+    /// #1146 T1.1: a fetched CIMD document's declared `scope` MUST survive
+    /// into the `RegisteredClient` — dropping it silently disabled the
+    /// client-declared scope ceiling for the fetched-metadata path.
+    #[test]
+    fn cimd_scope_ceiling_carried_into_registered_client() {
+        let json = serde_json::json!({
+            "client_id": "https://app.example.com/client.json",
+            "redirect_uris": ["https://app.example.com/cb"],
+            "scope": "atproto",
+            "dpop_bound_access_tokens": true,
+        });
+        let doc: ClientIdMetadataDocument = serde_json::from_value(json).unwrap();
+        let client =
+            registered_client_from_cimd_doc("https://app.example.com/client.json", doc);
+        assert!(client.is_cimd);
+        assert_eq!(client.scope.as_deref(), Some("atproto"));
+        assert_eq!(client.declared_scopes(), vec!["atproto".to_owned()]);
+        assert_eq!(client.dpop_bound_access_tokens, Some(true));
+    }
+
+    /// #1146 T1.1: a CIMD document with no `scope` field declares no
+    /// client-side ceiling (`None` → unrestricted), distinct from an
+    /// explicit declaration.
+    #[test]
+    fn cimd_without_scope_declares_no_ceiling() {
+        let json = serde_json::json!({
+            "client_id": "https://app.example.com/client.json",
+            "redirect_uris": ["https://app.example.com/cb"],
+        });
+        let doc: ClientIdMetadataDocument = serde_json::from_value(json).unwrap();
+        assert!(doc.scope.is_none());
+        assert!(doc.dpop_bound_access_tokens.is_none());
+        let client =
+            registered_client_from_cimd_doc("https://app.example.com/client.json", doc);
+        assert!(client.scope.is_none());
+        assert!(client.declared_scopes().is_empty());
+    }
+
     #[test]
     fn registration_request_jwks_and_jwks_uri_default_empty() {
         let json = serde_json::json!({
@@ -669,6 +744,7 @@ mod tests {
             token_endpoint_auth_method: None,
             jwks: None,
             jwks_uri: None,
+            scope: None,
         };
         let json = serde_json::to_value(&resp).unwrap();
         let obj = json.as_object().unwrap();
