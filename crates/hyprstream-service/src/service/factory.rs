@@ -810,11 +810,13 @@ impl ServiceContext {
                 if service.name() == "discovery" {
                     Some(shared.for_service(service.name(), port))
                 } else {
-                    // Read JWT from trust store attestation
+                    // Bind the announcement JWT to the exact signer. A
+                    // singleton lookup can select a sibling during overlap.
                     let trust = crate::service::trust_store::global_trust_store();
+                    let signing_key = self.service_signing_key(service.name());
                     let service_jwt = trust
-                        .resolve_one(service.name())
-                        .and_then(|vk| trust.get(&vk).and_then(|att| att.jwt.clone()));
+                        .get(&signing_key.verifying_key())
+                        .and_then(|att| att.jwt);
                     let policy_vk = trust
                         .resolve_one("policy")
                         .unwrap_or_else(|| panic!("trust store has no policy key"));
@@ -824,7 +826,7 @@ impl ServiceContext {
                     Some(shared.for_service_with_announce(
                         service.name(),
                         port,
-                        self.service_signing_key(service.name()),
+                        signing_key,
                         service_jwt,
                         policy_vk,
                         discovery_vk,

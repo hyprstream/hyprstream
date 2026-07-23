@@ -255,8 +255,8 @@ fn validate_event_prefix(prefix: &str) -> Result<(), String> {
 
 /// Build the rotation-safe wire projection of a service's published key set.
 ///
-/// The scalar fields remain only for wire compatibility and are intentionally
-/// empty: consumers which cannot handle `keys` must fail closed.
+/// The scalar fields are a transition projection for one-key deployments.
+/// They are empty during overlap, where a positional singleton is unsafe.
 fn published_service_key_response(
     trust: &hyprstream_service::TrustStore,
     service_name: &str,
@@ -265,9 +265,10 @@ fn published_service_key_response(
     if keys.is_empty() {
         anyhow::bail!("service key '{service_name}' not registered");
     }
+    let singleton = (keys.len() == 1).then(|| &keys[0]);
     Ok(ServiceKeyResponse {
-        verifying_key: Vec::new(),
-        service_jwt: None,
+        verifying_key: singleton.map(|entry| entry.verifying_key.to_bytes().to_vec()).unwrap_or_default(),
+        service_jwt: singleton.and_then(|entry| entry.attestation.jwt.clone()),
         keys: keys.into_iter().map(|entry| ServiceKeyCandidate {
             key_id: entry.key_id,
             verifying_key: entry.verifying_key.to_bytes().to_vec(),
@@ -275,6 +276,25 @@ fn published_service_key_response(
             not_after: entry.attestation.expires_at,
         }).collect(),
     })
+}
+
+/// Confirmation material is mandatory: an absent or malformed `cnf.jwk` must
+/// never turn a valid CA token into authority for arbitrary key material.
+fn validate_service_key_registration(
+    claims: &hyprstream_rpc::auth::Claims,
+    service_name: &str,
+    verifying_key: &[u8; 32],
+) -> Result<()> {
+    let expected_sub = format!("service:{service_name}");
+    if claims.sub != expected_sub {
+        anyhow::bail!("JWT subject '{}' does not match service name '{}'", claims.sub, service_name);
+    }
+    let cnf_bytes = claims.cnf_key_bytes()
+        .ok_or_else(|| anyhow!("service JWT must contain a well-formed cnf.jwk"))?;
+    if cnf_bytes != *verifying_key {
+        anyhow::bail!("JWT cnf.jwk does not match provided verifying key");
+    }
+    Ok(())
 }
 
 #[async_trait::async_trait(?Send)]
@@ -410,21 +430,31 @@ impl PolicyHandler for PolicyService {
                 .join(" ")
         });
 
-        // Service tokens: cnf.jwk must be the service's REGISTERED key, never a
-        // CA-derived guess (#441/#806) — bootstrap generates independent random
-        // per-service keys (`load_or_generate_service_signing_key`), so a derived
-        // pubkey here would not match the key the service actually holds. If no
-        // registered key exists yet, error rather than sign a wrong key binding.
-        // User tokens: decode the caller-provided pubkey (from OAuth consent page).
+        // OAuth delegates for a service, so its envelope signer is OAuth's key,
+        // not the service assertion signer. Bind `cnf` to the explicitly passed
+        // assertion key. A registered service may attest a new sibling key.
         let service_key_bytes: Option<[u8; 32]> = if is_service_token {
             let svc_name = &subject["service:".len()..];
             let trust = hyprstream_service::global_trust_store();
-            let vk = VerifyingKey::from_bytes(&ctx.cnf)
-                .map_err(|_| anyhow!("service token caller has an invalid Ed25519 verifying key"))?;
-            if !trust.is_authorized(&vk, svc_name) {
-                anyhow::bail!("service key '{svc_name}' is not registered for the issuing caller; refusing to fabricate cnf.jwk");
+            use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+            let requested_bytes: [u8; 32] = data.user_pub_key.as_deref()
+                .ok_or_else(|| anyhow!("service token issuance requires the assertion-verified Ed25519 public key"))
+                .and_then(|encoded| URL_SAFE_NO_PAD.decode(encoded)
+                    .map_err(|_| anyhow!("service token assertion key is not base64url"))?
+                    .try_into().map_err(|_| anyhow!("service token assertion key must be 32 bytes")))?;
+            let requested = VerifyingKey::from_bytes(&requested_bytes)
+                .map_err(|_| anyhow!("service token assertion key is not a valid Ed25519 verifying key"))?;
+            if trust.is_authorized(&requested, svc_name) {
+                Some(requested_bytes)
+            } else {
+                let caller = VerifyingKey::from_bytes(&ctx.cnf)
+                    .map_err(|_| anyhow!("service key rotation caller has an invalid Ed25519 verifying key"))?;
+                let expected_subject = format!("service:{svc_name}");
+                if ctx.subject().name() != Some(expected_subject.as_str()) || !trust.is_authorized(&caller, svc_name) {
+                    anyhow::bail!("unregistered service key for '{svc_name}' may only be attested by a registered sibling");
+                }
+                Some(requested_bytes)
             }
-            Some(*vk.as_bytes())
         } else {
             use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
             data.user_pub_key.as_deref().and_then(|s| {
@@ -1365,25 +1395,13 @@ impl PolicyHandler for PolicyService {
             None,
         ).map_err(|e| anyhow!("Invalid service JWT: {e}"))?;
 
-        let expected_sub = format!("service:{}", data.service_name);
-        if claims.sub != expected_sub {
-            anyhow::bail!(
-                "JWT subject '{}' does not match service name '{}'",
-                claims.sub, data.service_name
-            );
-        }
-
         // Verify the provided verifying key matches the JWT's cnf.jwk claim.
         let vk_bytes: [u8; 32] = data.verifying_key.as_slice().try_into()
             .map_err(|_| anyhow!("verifying_key must be 32 bytes"))?;
         let vk = VerifyingKey::from_bytes(&vk_bytes)
             .map_err(|e| anyhow!("Invalid Ed25519 verifying key: {e}"))?;
 
-        if let Some(cnf_bytes) = claims.cnf_key_bytes() {
-            if cnf_bytes != vk_bytes {
-                anyhow::bail!("JWT cnf.jwk does not match provided verifying key");
-            }
-        }
+        validate_service_key_registration(&claims, &data.service_name, &vk_bytes)?;
 
         // Store in trust store (key-centric: the key IS the identity)
         {
@@ -1806,5 +1824,31 @@ mod tests {
         assert!(response.keys.iter().any(|entry| entry.verifying_key == retired.to_bytes()));
         assert!(response.keys.iter().any(|entry| entry.verifying_key == lead.to_bytes()));
         assert!(response.keys.iter().all(|entry| entry.key_id.starts_with("ed25519:")));
+    }
+
+    #[test]
+    fn registration_requires_matching_present_confirmation_key() {
+        let key = SigningKey::generate(&mut rand::rngs::OsRng).verifying_key();
+        let now = chrono::Utc::now().timestamp();
+        let claims = hyprstream_rpc::auth::Claims::new("service:model".to_owned(), now, now + 60);
+        assert!(validate_service_key_registration(&claims, "model", key.as_bytes()).is_err());
+
+        let bound = claims.with_cnf_jwk(key.as_bytes());
+        assert!(validate_service_key_registration(&bound, "model", key.as_bytes()).is_ok());
+
+        let sibling = SigningKey::generate(&mut rand::rngs::OsRng).verifying_key();
+        assert!(validate_service_key_registration(&bound, "model", sibling.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn one_key_response_keeps_legacy_projection_during_rollout() {
+        let trust = hyprstream_service::TrustStore::new();
+        let key = SigningKey::generate(&mut rand::rngs::OsRng).verifying_key();
+        trust.insert(key, attestation(chrono::Utc::now().timestamp() + 60, "certificate"));
+
+        let response = published_service_key_response(&trust, "model").unwrap();
+        assert_eq!(response.keys.len(), 1);
+        assert_eq!(response.verifying_key, key.to_bytes());
+        assert_eq!(response.service_jwt.as_deref(), Some("certificate"));
     }
 }
