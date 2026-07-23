@@ -143,8 +143,12 @@ annotation vfsHidden(field) :Void;
 
 # MAC security label this generated node carries — carrier (a) of #699: the label
 # is a property of the node's TYPE, derived from the schema annotation at
-# generation (T2 emits it onto VfsNode). Format: "<level>" or
-# "<level>:<assurance>" or "<level>:<assurance>:<compBit,compBit>". Absent ⇒ the
-# generated node is unlabeled ⇒ deny ⇒ a genesis-coverage finding (there is no
-# permissive default). Usage: getStatus @0 :Status $vfsMac("internal");
+# generation (T2 emits it onto VfsNode). Format:
+#   "<level>:pq-hybrid" or "<level>:pq-hybrid:<compBit,compBit>"
+# The assurance is MANDATORY and must be exactly `pq-hybrid`: the generated
+# 9P/VFS surface is internal/non-interop, and #556 requires PQ-hybrid on all
+# deployments — `unverified`/`classical`/omitted are rejected (⇒ unlabeled ⇒
+# deny), never silently downgraded. Absent ⇒ unlabeled ⇒ deny ⇒ a genesis-
+# coverage finding (there is no permissive default).
+# Usage: getStatus @0 :Status $vfsMac("internal:pq-hybrid");
 annotation vfsMac(field) :Text;

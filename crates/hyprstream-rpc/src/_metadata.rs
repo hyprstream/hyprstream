@@ -95,16 +95,18 @@ pub struct VfsNode {
 impl VfsNode {
     /// Decode this node's `$vfsMac` annotation into a [`SecurityLabel`].
     ///
-    /// Returns `None` when the annotation is empty or malformed — the node is
-    /// then **unlabeled**, which the MAC model treats as **deny** (there is no
-    /// permissive default; absence is denial). Such nodes surface as gaps in the
-    /// genesis coverage report rather than being silently defaulted.
+    /// Returns `None` when the annotation is empty, malformed, or carries a
+    /// non-`pq-hybrid` assurance — the node is then **unlabeled**, which the MAC
+    /// model treats as **deny** (there is no permissive default; absence is
+    /// denial). Such nodes surface as gaps in the genesis coverage report rather
+    /// than being silently defaulted.
     ///
-    /// Format: `"<level>"` | `"<level>:<assurance>"` |
-    /// `"<level>:<assurance>:<compBit>[,<compBit>...]"` where `level` is one of
-    /// `public`/`internal`/`confidential`/`secret`, `assurance` is one of
-    /// `unverified`/`classical`/`pq-hybrid`, and each `compBit` is a `u32`
-    /// compartment bit index (the lattice vocabulary is S3's job, #569).
+    /// Format: `"<level>:<assurance>[:<compBit>[,<compBit>...]]"` where `level`
+    /// is one of `public`/`internal`/`confidential`/`secret`, `assurance` is
+    /// **required** and must be exactly `pq-hybrid` (the internal non-interop
+    /// carrier rejects `unverified`/`classical`/omitted — #556), and each
+    /// `compBit` is a `u32` compartment bit index (the lattice vocabulary is S3's
+    /// job, #569).
     pub fn mac_label(&self) -> Option<crate::auth::mac::SecurityLabel> {
         parse_mac_annotation(self.mac)
     }
@@ -112,7 +114,16 @@ impl VfsNode {
 
 /// Parse a `$vfsMac` annotation string into a [`SecurityLabel`].
 ///
-/// `""` / unparseable ⇒ `None` (unlabeled ⇒ deny). See [`VfsNode::mac_label`].
+/// `""` / unparseable / non-`pq-hybrid` ⇒ `None` (unlabeled ⇒ deny). See
+/// [`VfsNode::mac_label`].
+///
+/// **Assurance is mandatory and MUST be `pq-hybrid`** (#556, #1228): the
+/// generated 9P/VFS surface is an *internal, non-interop* carrier, and the
+/// operator ruling is PQ-hybrid required on all deployments. A level-only
+/// annotation, `unverified`, or `classical` would produce a label a classical
+/// subject dominates — the non-PQ path #556 was enacted to remove, reappearing
+/// as a silent default. Those forms are therefore **rejected** (⇒ unlabeled ⇒
+/// deny ⇒ a genesis-coverage finding), never silently downgraded.
 fn parse_mac_annotation(s: &str) -> Option<crate::auth::mac::SecurityLabel> {
     use crate::auth::mac::{Assurance, CompartmentSet, Level, SecurityLabel};
 
@@ -128,11 +139,14 @@ fn parse_mac_annotation(s: &str) -> Option<crate::auth::mac::SecurityLabel> {
         "secret" => Level::Secret,
         _ => return None,
     };
+    // Assurance is MANDATORY and must be exactly `pq-hybrid`. Omitted,
+    // `unverified`, and `classical` are all rejected ⇒ None ⇒ unlabeled ⇒ deny
+    // (this is the internal non-interop surface; #556 removes the classical
+    // floor, and this carrier must not silently reintroduce it).
     let assurance = match parts.next().map(str::trim) {
-        None | Some("") | Some("unverified") => Assurance::Unverified,
-        Some("classical") => Assurance::Classical,
         Some("pq-hybrid") => Assurance::PqHybrid,
-        Some(_) => return None,
+        // Omitted, empty, unverified, classical, or unknown ⇒ reject.
+        None | Some("") | Some("unverified") | Some("classical") | Some(_) => return None,
     };
     let compartments = match parts.next().map(str::trim) {
         None | Some("") => CompartmentSet::EMPTY,
@@ -160,6 +174,28 @@ fn parse_mac_annotation(s: &str) -> Option<crate::auth::mac::SecurityLabel> {
 ///
 /// Returns `(service_name, nodes)`.
 pub type VfsNodesFn = fn() -> (&'static str, &'static [VfsNode]);
+
+/// Inventory-registered generated VFS node table (#699 carrier (a) inventory).
+///
+/// Submitted by `generate_rpc_service!` for every schema that has request
+/// variants (i.e. every service that projects a `/srv/{name}` mount with
+/// generated nodes). The genesis coverage gate collects the union of these
+/// tables via [`inventory::iter::<VfsNodeTable>()`] so the startup gate covers
+/// every reachable generated object class — not just the ones a hand-built
+/// fixture happened to include.
+///
+/// The `nodes_fn` indirection keeps the table lazy (zero-cost until the gate
+/// walks it) and lets this crate stay free of a `hyprstream-service`
+/// dependency: the macro emits the `inventory::submit!` in whatever crate owns
+/// the generated client module, and the gate (in the daemon crate) iterates it.
+pub struct VfsNodeTable {
+    /// The `/srv/{name}` service this table belongs to.
+    pub name: &'static str,
+    /// `fn() -> (service_name, &[VfsNode])` — the generated `vfs_nodes()`.
+    pub nodes_fn: VfsNodesFn,
+}
+
+inventory::collect!(VfsNodeTable);
 
 /// Function type for service schema metadata.
 ///
@@ -199,10 +235,11 @@ mod tests {
     }
 
     #[test]
-    fn mac_label_decodes_level_only() {
-        let l = node("confidential").mac_label().unwrap();
+    fn mac_label_decodes_level_and_pq_hybrid_assurance() {
+        // The only accepted form: <level>:pq-hybrid. Assurance is mandatory.
+        let l = node("confidential:pq-hybrid").mac_label().unwrap();
         assert_eq!(l.level, Level::Confidential);
-        assert_eq!(l.assurance, Assurance::Unverified);
+        assert_eq!(l.assurance, Assurance::PqHybrid);
         assert!(l.compartments.is_empty());
     }
 
@@ -215,9 +252,11 @@ mod tests {
 
     #[test]
     fn mac_label_decodes_compartments() {
-        let l = node("internal:classical:0,3").mac_label().unwrap();
+        // Compartments are the optional third field, after the mandatory
+        // `pq-hybrid` assurance.
+        let l = node("internal:pq-hybrid:0,3").mac_label().unwrap();
         assert_eq!(l.level, Level::Internal);
-        assert_eq!(l.assurance, Assurance::Classical);
+        assert_eq!(l.assurance, Assurance::PqHybrid);
         assert!(l.compartments.contains(0));
         assert!(l.compartments.contains(3));
         assert!(!l.compartments.contains(1));
@@ -228,6 +267,36 @@ mod tests {
         // No $vfsMac ⇒ unlabeled ⇒ None ⇒ deny. No permissive default.
         assert!(node("").mac_label().is_none());
         assert!(node("   ").mac_label().is_none());
+    }
+
+    #[test]
+    fn mac_label_level_only_is_denied_assurance_is_mandatory() {
+        // A level-only annotation (no assurance) is rejected ⇒ None ⇒ deny.
+        // Assurance is mandatory on this internal non-interop carrier; a
+        // level-only form would default to Unverified, the non-PQ path #556
+        // removed. Each level is rejected without an assurance.
+        for level in ["public", "internal", "confidential", "secret"] {
+            assert!(
+                node(level).mac_label().is_none(),
+                "level-only `{level}` must deny: assurance is mandatory"
+            );
+        }
+    }
+
+    #[test]
+    fn mac_label_unverified_assurance_is_denied() {
+        // `unverified` is the non-PQ floor ⇒ rejected on this internal carrier.
+        // Each form an operator might reach for that silently drops PQ is denied.
+        assert!(node("internal:unverified").mac_label().is_none());
+        assert!(node("public:unverified").mac_label().is_none());
+    }
+
+    #[test]
+    fn mac_label_classical_assurance_is_denied() {
+        // `classical` is the explicit non-PQ path #556 removes from internal VFS
+        // — a classical subject would dominate it. Rejected ⇒ None ⇒ deny.
+        assert!(node("internal:classical").mac_label().is_none());
+        assert!(node("secret:classical:0").mac_label().is_none());
     }
 
     #[test]

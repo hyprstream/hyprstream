@@ -403,6 +403,21 @@ pub fn generate_mount(service_name: &str, resolved: &ResolvedSchema) -> TokenStr
             (#service_name, NODES)
         }
 
+        // #699 carrier (a) inventory: register this table so the genesis
+        // coverage gate can walk every reachable generated node (annotated or
+        // not) at startup. Submitted at module scope via the `inventory`
+        // re-export on `hyprstream_rpc::metadata` (wasm-safe; same pattern as
+        // `ScopeDefinition`), so consumer crates need not declare an `inventory`
+        // dep directly. The gate iterates this to build the startup activation
+        // gate; a node missing a `$vfsMac` surfaces as a finding (unlabeled ⇒
+        // deny) rather than being silently absent.
+        hyprstream_rpc::metadata::inventory::submit! {
+            hyprstream_rpc::metadata::VfsNodeTable {
+                name: #service_name,
+                nodes_fn: vfs_nodes,
+            }
+        }
+
         #(#scoped_tables)*
     }
 }
@@ -634,7 +649,7 @@ mod tests {
         // `mac` field carries the annotation text verbatim — the label is a
         // property of the node's type, derived at generation.
         let mut health = variant("healthCheck", "Void", "query");
-        health.vfs_mac = "internal".into();
+        health.vfs_mac = "internal:pq-hybrid".into();
         let mut clone = variant("clone", "CloneRequest", "write");
         clone.vfs_mac = "secret:pq-hybrid:0".into();
         // A node with NO `$vfsMac` carries the empty string (→ unlabeled → deny).
@@ -648,7 +663,7 @@ mod tests {
 
         // Annotated labels land verbatim on their nodes.
         assert!(
-            out.contains("mac : \"internal\""),
+            out.contains("mac : \"internal:pq-hybrid\""),
             "health node carries its $vfsMac label: {out}"
         );
         assert!(
