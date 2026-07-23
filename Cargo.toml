@@ -30,6 +30,7 @@ members = [
     "crates/hyprstream-workers-python",
     "crates/hyprstream-k8s",
     "crates/hyprstream-ledger",
+    "crates/hyprstream-resource",
 ]
 # bitsandbytes-sys is standalone - only built when bnb feature is enabled.
 # The wasm guests (hyprstream-workers-python-guest = wasm32-unknown-unknown cdylib; the
