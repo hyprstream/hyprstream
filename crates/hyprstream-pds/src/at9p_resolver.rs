@@ -60,11 +60,10 @@ impl At9pCapsuleResolver for At9pGateResolver {
             .first()
             .ok_or_else(|| anyhow!("did:at9p {did} capsule carries no subject key"))?;
 
-        let ed25519: [u8; 32] = subject
-            .ed25519_pub
-            .as_slice()
-            .try_into()
-            .map_err(|_| anyhow!("ed25519 subject key is not {ED25519_PUBLIC_KEY_LEN} bytes"))?;
+        let ed25519: [u8; 32] =
+            subject.ed25519_pub.as_slice().try_into().map_err(|_| {
+                anyhow!("ed25519 subject key is not {ED25519_PUBLIC_KEY_LEN} bytes")
+            })?;
 
         let ml_dsa_65 = ml_dsa_vk_from_bytes(&subject.mldsa65_pub)?;
 
@@ -82,7 +81,12 @@ impl At9pCapsuleResolver for At9pGateResolver {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 mod tests {
     use super::*;
     use crate::at9p::{
@@ -94,7 +98,9 @@ mod tests {
 
     use ed25519_dalek::SigningKey;
     use hyprstream_crypto::pq::{ml_dsa_generate_keypair, ml_dsa_vk_bytes, MlDsaSigningKey};
-    use hyprstream_rpc::admission::{admit_key_against_did, At9pAdmission, ApplicationSignerKey};
+    use hyprstream_rpc::admission::{
+        admit_key_against_did, AdmissionTrustSurface, At9pAdmission, VerifiedApplicationSigner,
+    };
     use hyprstream_rpc::envelope::{KeyedPqTrustStore, PqTrustStore};
 
     use anyhow::Result as AnyResult;
@@ -113,10 +119,16 @@ mod tests {
         seed[31] = tag.wrapping_add(7);
         let ed_sk = SigningKey::from_bytes(&seed);
         let (pq_sk, pq_vk) = ml_dsa_generate_keypair();
-        let keypair =
-            HybridKeyPair::new(ed_sk.verifying_key().to_bytes().to_vec(), ml_dsa_vk_bytes(&pq_vk))
-                .unwrap();
-        Signer { ed_sk, pq_sk, keypair }
+        let keypair = HybridKeyPair::new(
+            ed_sk.verifying_key().to_bytes().to_vec(),
+            ml_dsa_vk_bytes(&pq_vk),
+        )
+        .unwrap();
+        Signer {
+            ed_sk,
+            pq_sk,
+            keypair,
+        }
     }
 
     fn body_for(s: &Signer, tag: u8) -> CapsuleBody {
@@ -148,7 +160,9 @@ mod tests {
     fn gate_resolver_returns_verified_subject_keys() {
         let (capsule, bytes, did) = signed(1);
         let primary = capsule.body.subject_keys[0].clone();
-        let verified = At9pGateResolver::new().verify_bytes(&did, &bytes).expect("GATE passes");
+        let verified = At9pGateResolver::new()
+            .verify_bytes(&did, &bytes)
+            .expect("GATE passes");
         assert_eq!(verified.ed25519().as_slice(), primary.ed25519_pub);
         assert_eq!(ml_dsa_vk_bytes(verified.ml_dsa_65()), primary.mldsa65_pub);
     }
@@ -173,7 +187,9 @@ mod tests {
         let (_c1, bytes1, did1) = signed(3);
         let did_other = signed(4).2;
         assert_ne!(did1, did_other);
-        assert!(At9pGateResolver::new().verify_bytes(&did_other, &bytes1).is_err());
+        assert!(At9pGateResolver::new()
+            .verify_bytes(&did_other, &bytes1)
+            .is_err());
     }
 
     #[tokio::test]
@@ -194,10 +210,15 @@ mod tests {
         let admitted = admit_key_against_did(
             &NeverResolve,
             "https://peer.example",
-            ApplicationSignerKey(ed_arr),
+            VerifiedApplicationSigner::pq_hybrid(ed_arr),
+            AdmissionTrustSurface::Native,
             &did,
             None,
-            Some(At9pAdmission { capsule_bytes: &bytes, gate: &gate, pq_store: &mut store }),
+            Some(At9pAdmission {
+                capsule_bytes: &bytes,
+                gate: &gate,
+                pq_store: &mut store,
+            }),
         )
         .await
         .expect("verified capsule admits and binds");
@@ -205,7 +226,9 @@ mod tests {
         assert_eq!(admitted.did.as_deref(), Some(did.as_str()));
         assert_eq!(admitted.key, ed_arr);
         assert_eq!(store.len(), 1);
-        let bound = store.ml_dsa_key_for(&ed_arr).expect("hybrid binding installed");
+        let bound = store
+            .ml_dsa_key_for(&ed_arr)
+            .expect("hybrid binding installed");
         assert_eq!(ml_dsa_vk_bytes(&bound), primary_pq);
     }
 
@@ -218,17 +241,26 @@ mod tests {
         let bytes = capsule.to_dag_cbor().unwrap();
         let cid = Capsule::from_dag_cbor(&bytes).unwrap().cid512().unwrap();
         let did = format!("{DID_AT9P_PREFIX}{cid}");
-        let ed: [u8; 32] = capsule.body.subject_keys[0].ed25519_pub.as_slice().try_into().unwrap();
+        let ed: [u8; 32] = capsule.body.subject_keys[0]
+            .ed25519_pub
+            .as_slice()
+            .try_into()
+            .unwrap();
 
         let gate = At9pGateResolver::new();
         let mut store = KeyedPqTrustStore::new();
         let res = admit_key_against_did(
             &NeverResolve,
             "https://peer.example",
-            ApplicationSignerKey(ed),
+            VerifiedApplicationSigner::pq_hybrid(ed),
+            AdmissionTrustSurface::Native,
             &did,
             None,
-            Some(At9pAdmission { capsule_bytes: &bytes, gate: &gate, pq_store: &mut store }),
+            Some(At9pAdmission {
+                capsule_bytes: &bytes,
+                gate: &gate,
+                pq_store: &mut store,
+            }),
         )
         .await;
         assert!(res.is_err(), "GATE failure must reject");

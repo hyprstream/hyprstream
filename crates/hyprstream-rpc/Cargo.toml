@@ -133,6 +133,8 @@ url = { workspace = true }
 # HTTPS did:web DID-document fetch (#279). Native-only; mirrors the JWKS
 # fetch+cache posture used by FederationKeyResolver in the hyprstream crate.
 reqwest = { workspace = true }
+k256 = { workspace = true }
+plc-p256 = { package = "p256", version = "0.13", features = ["ecdsa"] }
 
 # Async runtime
 tokio = { workspace = true, features = ["io-util", "net", "sync"] }
