@@ -113,16 +113,6 @@ impl CorsConfig {
             permissive_headers: true,
         }
     }
-
-    /// Create CORS config with dynamic port-based origins
-    pub fn with_port(port: u16) -> Self {
-        let mut config = Self::default();
-        config.allowed_origins.extend(vec![
-            format!("http://localhost:{}", port),
-            format!("http://127.0.0.1:{}", port),
-        ]);
-        config
-    }
 }
 
 /// Default sampling parameters for generation
@@ -233,18 +223,6 @@ pub struct ServerConfig {
     #[serde(default)]
     pub tls_key: Option<PathBuf>,
 
-    #[serde(default)]
-    pub tls_client_ca: Option<PathBuf>,
-
-    #[serde(default = "default_tls_min_version")]
-    pub tls_min_version: String,
-
-    #[serde(default)]
-    pub tls_cipher_list: Option<String>,
-
-    #[serde(default = "default_true")]
-    pub tls_prefer_server_ciphers: bool,
-
     // Process management
     #[serde(default)]
     pub working_dir: Option<PathBuf>,
@@ -281,9 +259,6 @@ fn default_cancellation_check_interval() -> u64 {
 fn default_max_concurrent_streams_per_service() -> usize {
     hyprstream_rpc::streaming::DEFAULT_MAX_CONCURRENT_STREAMS_PER_SERVICE
 }
-fn default_tls_min_version() -> String {
-    "1.2".to_owned()
-}
 
 impl Default for ServerConfig {
     fn default() -> Self {
@@ -305,10 +280,6 @@ impl Default for ServerConfig {
             sampling_defaults: SamplingParamDefaults::default(),
             tls_cert: None,
             tls_key: None,
-            tls_client_ca: None,
-            tls_min_version: default_tls_min_version(),
-            tls_cipher_list: None,
-            tls_prefer_server_ciphers: true,
             working_dir: None,
             pid_file: None,
         }
@@ -453,26 +424,6 @@ impl ServerConfigBuilder {
         self
     }
 
-    pub fn tls_client_ca(mut self, ca: PathBuf) -> Self {
-        self.config.tls_client_ca = Some(ca);
-        self
-    }
-
-    pub fn tls_min_version(mut self, version: impl Into<String>) -> Self {
-        self.config.tls_min_version = version.into();
-        self
-    }
-
-    pub fn tls_cipher_list(mut self, ciphers: impl Into<String>) -> Self {
-        self.config.tls_cipher_list = Some(ciphers.into());
-        self
-    }
-
-    pub fn tls_prefer_server_ciphers(mut self, prefer: bool) -> Self {
-        self.config.tls_prefer_server_ciphers = prefer;
-        self
-    }
-
     // Process management
     pub fn working_dir(mut self, dir: PathBuf) -> Self {
         self.config.working_dir = Some(dir);
@@ -559,12 +510,6 @@ impl ServerConfigBuilder {
         if let Ok(key) = std::env::var("HYPRSTREAM_TLS_KEY") {
             self.config.tls_key = Some(PathBuf::from(key));
         }
-        if let Ok(ca) = std::env::var("HYPRSTREAM_TLS_CLIENT_CA") {
-            self.config.tls_client_ca = Some(PathBuf::from(ca));
-        }
-        if let Ok(version) = std::env::var("HYPRSTREAM_TLS_MIN_VERSION") {
-            self.config.tls_min_version = version;
-        }
 
         // Process management
         if let Ok(dir) = std::env::var("HYPRSTREAM_WORKING_DIR") {
@@ -574,15 +519,6 @@ impl ServerConfigBuilder {
             self.config.pid_file = Some(PathBuf::from(file));
         }
 
-        self
-    }
-
-    /// Finalize CORS configuration based on the server port
-    pub fn finalize_cors(mut self) -> Self {
-        // Update CORS to use port-aware defaults if still using defaults
-        if self.config.cors.allowed_origins == default_cors_origins() {
-            self.config.cors = CorsConfig::with_port(self.config.port);
-        }
         self
     }
 
@@ -601,5 +537,92 @@ impl ServerConfig {
     /// Create a builder from existing config
     pub fn to_builder(self) -> ServerConfigBuilder {
         ServerConfigBuilder::from_config(self)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Regression guards for #1152 (W6): these fields/helpers advertised
+    //! security capabilities (mTLS, TLS-hardening knobs, port-derived CORS)
+    //! that the server never wired up. Config that promises a capability we
+    //! lack is worse than absent config, because reviewers credit it. These
+    //! tests fail if any of the dead surface is reintroduced.
+
+    use std::path::PathBuf;
+
+    /// Read a source file from this crate's `src/` tree.
+    fn read_src(rel: &str) -> String {
+        let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        p.push("src");
+        for seg in rel.split('/') {
+            p.push(seg);
+        }
+        std::fs::read_to_string(&p)
+            .unwrap_or_else(|e| panic!("could not read src/{rel}: {e}"))
+    }
+
+    /// The four TLS knobs + mTLS CA + the two CORS helpers must not reappear in
+    /// `config/server.rs`. Tokens are assembled by concatenation so this test's
+    /// own source does not contain the forbidden identifiers and therefore
+    /// cannot match itself.
+    #[test]
+    fn dead_security_config_stays_deleted() {
+        let src = read_src("config/server.rs");
+        // Field-name fragments (kept split so the test source scans clean).
+        let forbidden_field_defs = [
+            concat!("pub tls_client", "_ca"),
+            concat!("pub tls_min", "_version"),
+            concat!("pub tls_cipher", "_list"),
+            concat!("pub tls_prefer", "_server_ciphers"),
+        ];
+        for needle in forbidden_field_defs {
+            assert!(
+                !src.contains(needle),
+                "config/server.rs re-introduced dead TLS field `{needle}` (see #1152 W6): \
+                 this advertises a security capability the server does not wire up",
+            );
+        }
+        // Builder setters + env reads + default fns for the same quartet.
+        for needle in [
+            concat!("fn tls_client", "_ca"),
+            concat!("fn tls_min", "_version"),
+            concat!("fn tls_cipher", "_list"),
+            concat!("fn tls_prefer", "_server_ciphers"),
+            concat!("default_tls", "_min_version"),
+            concat!("HYPRSTREAM_TLS_CLIENT", "_CA"),
+            concat!("HYPRSTREAM_TLS_MIN", "_VERSION"),
+        ] {
+            assert!(
+                !src.contains(needle),
+                "config/server.rs re-introduced dead TLS surface `{needle}` (see #1152 W6)",
+            );
+        }
+        // `finalize_cors` had no callers; `CorsConfig::with_port` was called
+        // only from inside `finalize_cors`. Both must stay gone together.
+        for needle in [concat!("fn finalize", "_cors"), concat!("fn with", "_port")] {
+            assert!(
+                !src.contains(needle),
+                "config/server.rs re-introduced dead CORS helper `{needle}` (see #1152 W6): \
+                 it has no callers",
+            );
+        }
+    }
+
+    /// `server/tls.rs` must not install a client-certificate verifier: mTLS is
+    /// not implemented, so advertising it (via config knobs that flow into a
+    /// verifier) would be a phantom security control. This catches a future
+    /// change that wires `tls_client_ca`-style config into a real verifier
+    /// without first deciding the mTLS authz model.
+    #[test]
+    fn mtls_client_verifier_is_not_wired() {
+        let src = read_src("server/tls.rs");
+        for needle in ["client_auth", "ClientCert", "client_ca"] {
+            assert!(
+                !src.contains(needle),
+                "server/tls.rs now references `{needle}`: mTLS client-cert verification is being \
+                 wired. mTLS is deliberately not implemented (#1152 W6); either land the full \
+                 authz model or remove the reference.",
+            );
+        }
     }
 }

@@ -111,6 +111,25 @@ jobs:
         unset RUSTC_WRAPPER
         cargo deny check bans licenses
 
+  loopback-burndown:
+    name: Loopback-literal burn-down (#1152 W4)
+    # Hardcoded 127.0.0.1 / localhost / ::1 are single-host-era residue that
+    # silently breaks multi-host reach (#1135). We are not fixing the existing
+    # occurrences in one pass; this gate freezes the surface so it can only
+    # shrink. Plain text scan, no build — stays on the free runner. Must be
+    # able to fail — do NOT add `|| true`. See
+    # scripts/check_loopback_burndown.py for the stated methodology.
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+      # This checkout immediately runs repo-controlled Python (the gate
+      # script). Do NOT persist the GITHUB_TOKEN in .git/config — closes
+      # the artipacked vector (zizmor, CodeRabbit).
+      with:
+        persist-credentials: false
+    - name: Enforce loopback burn-down
+      run: python3 scripts/check_loopback_burndown.py
+
   wasm:
     name: WASM (browser client)
     # The PR check has already validated this target. Keep the merge queue's
