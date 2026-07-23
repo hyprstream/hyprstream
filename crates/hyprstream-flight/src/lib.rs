@@ -189,3 +189,50 @@ pub async fn start_flight_server(
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    //! Regression guard for #1152 (W6). The CLI `ServerConfig` in
+    //! `cli/commands/server.rs` advertised an mTLS knob (`--tls-client-ca`,
+    //! help text "enables mTLS") plus three TLS-hardening knobs that the
+    //! Flight server never consumed — `handlers.rs` sources TLS from a
+    //! different config namespace (`tls.cert_path` / `tls.ca_data`).
+    //! Advertising mTLS we do not implement misleads operators and reviewers.
+    //!
+    //! `cli/commands/` is not currently wired into the compiled module tree,
+    //! so the guard lives here (the compiled crate root) and scans the source
+    //! directly. The test fails if any of the dead surface returns.
+    use std::path::PathBuf;
+
+    fn commands_server_src() -> String {
+        let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        p.push("src/cli/commands/server.rs");
+        std::fs::read_to_string(&p)
+            .unwrap_or_else(|e| panic!("could not read cli/commands/server.rs: {e}"))
+    }
+
+    #[test]
+    fn dead_mtls_and_tls_knobs_stay_deleted() {
+        let s = commands_server_src();
+        // `concat!` yields the joined identifier at compile time, while the
+        // source text holds the two halves separately — so scanning the file
+        // for the joined form cannot match this test's own source.
+        for needle in [
+            concat!("tls_client", "_ca"),
+            concat!("tls_min", "_version"),
+            concat!("tls_cipher", "_list"),
+            concat!("tls_prefer", "_server_ciphers"),
+            concat!("HYPRSTREAM_TLS_CLIENT", "_CA"),
+            concat!("HYPRSTREAM_TLS_MIN", "_VERSION"),
+            concat!("HYPRSTREAM_TLS_CIPHER", "_LIST"),
+            concat!("HYPRSTREAM_TLS_PREFER", "_SERVER_CIPHERS"),
+        ] {
+            assert!(
+                !s.contains(needle),
+                "hyprstream-flight CLI re-introduced dead TLS config `{needle}` (see #1152 W6): \
+                 the Flight server never consumes it; advertising mTLS/knobs we lack is worse \
+                 than absent config",
+            );
+        }
+    }
+}
