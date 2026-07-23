@@ -54,7 +54,8 @@ pub use mac::{
 #[cfg(not(target_arch = "wasm32"))]
 pub use federation::FederationKeySource;
 pub use jwt::{
-    composite_kid, decode, decode_unverified, decode_with_key, encode, encode_service_jwt,
+    composite_kid, decode, decode_unverified, decode_with_any_key, decode_with_any_key_lenient,
+    decode_with_key, encode, encode_service_jwt,
     header_alg, header_kid, is_rfc9068_access_token_type, jwk_thumbprint,
     parse_composite_dispatch, parse_protected_header, CompositeJwtDispatch, JwkThumbprintInput,
     JwtError, ProtectedHeader, RFC9068_ACCESS_TOKEN_TYPES,

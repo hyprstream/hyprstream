@@ -1477,8 +1477,12 @@ fn create_mcp_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
                             let iss = crate::server::middleware::extract_iss_from_token(&t);
                             let kid = crate::server::middleware::extract_kid_from_token(&t);
                             let result = if let Some(ref key_source) = jwt_key_source {
-                                match key_source.get_key(&iss, kid.as_deref()).await {
-                                    Ok(key) => crate::auth::jwt::decode(&t, &key, Some(mcp_resource_url.as_str())),
+                                match key_source.get_keys(&iss, kid.as_deref()).await {
+                                    Ok(candidates) => crate::auth::jwt::decode_with_any_key(
+                                        &t,
+                                        &candidates,
+                                        Some(mcp_resource_url.as_str()),
+                                    ),
                                     Err(e) => {
                                         tracing::debug!(%method, %uri, issuer = %iss, error = %e, "MCP JWT key resolution failed");
                                         let mut res = (StatusCode::UNAUTHORIZED, "Authentication failed").into_response();

@@ -55,6 +55,24 @@ pub trait JwtKeySource: Send + Sync + 'static {
     /// Returns error if the issuer is untrusted or key resolution fails.
     async fn get_key(&self, issuer: &str, kid: Option<&str>) -> Result<VerifyingKey>;
 
+    /// Resolve **all** algorithm-compatible candidates for an issuer/kid pair.
+    ///
+    /// This is the safe default for verifying a kid-less JWT: when no `kid`
+    /// selector is present the verifier cannot know which published key signed
+    /// the token, so it MUST retain every compatible candidate and try each
+    /// until one verifies — never collapse the published set to a positional
+    /// singleton (`first`/`next`/`values().next()`). See #1183 / #1184.
+    ///
+    /// Single-key sources return a one-element vec. JWKS-backed sources
+    /// override this to return every Ed25519 entry when `kid` is `None`.
+    ///
+    /// Callers pair this with [`crate::auth::jwt::decode_with_any_key`] to
+    /// try each candidate against the JWT signature.
+    async fn get_keys(&self, issuer: &str, kid: Option<&str>) -> Result<Vec<VerifyingKey>> {
+        let key = self.get_key(issuer, kid).await?;
+        Ok(vec![key])
+    }
+
     /// Check if an issuer is trusted (before attempting key fetch).
     ///
     /// Returns `true` for local issuers and configured federated issuers.
@@ -473,6 +491,74 @@ impl JwksKeySource {
 
         Ok(())
     }
+
+    /// Resolve a single key by `kid`, consulting the offline local-CA path,
+    /// the JWKS cache, the negative cache, and (on miss) a refetch. The
+    /// `kid` selector makes the choice unambiguous — contrast with the
+    /// kid-less path in [`JwtKeySource::get_keys`] which must return every
+    /// candidate.
+    async fn resolve_by_kid(&self, issuer: &str, kid_str: &str) -> Result<VerifyingKey> {
+        // Authoritative local CA key (offline): for a LOCAL issuer whose
+        // `kid` matches the on-disk CA key thumbprint, resolve without any
+        // network fetch. This is the service-to-service WIT JWT path; the
+        // HTTP /oauth/jwks endpoint may not be up yet during startup, and
+        // #441 makes service-key registration a hard precondition, so this
+        // resolution must not depend on it. Never overrides a JWKS-published
+        // (rotated) key because it's keyed on the exact CA thumbprint.
+        if self.is_local(issuer) {
+            if let (Some(ca_kid), Some(ca_key)) = (self.local_ca_kid.as_deref(), self.local_ca_key) {
+                if ca_kid == kid_str {
+                    return Ok(ca_key);
+                }
+            }
+        }
+        {
+            let cache = self.cache.read().await;
+            if let Some(entry) = cache.get(kid_str) {
+                return Ok(entry.verifying_key);
+            }
+        }
+
+        // Check negative cache
+        {
+            let neg = self.negative_cache.read().await;
+            if let Some(&ts) = neg.get(kid_str) {
+                if ts.elapsed() < self.negative_ttl {
+                    anyhow::bail!("Key not found for kid={} (negative cached)", kid_str);
+                }
+            }
+        }
+
+        // On-miss refetch
+        if let Err(e) = self.fetch_and_cache(issuer).await {
+            tracing::warn!("JWKS fetch failed for issuer={}: {}", issuer, e);
+        }
+
+        // Retry from cache
+        let cache = self.cache.read().await;
+        if let Some(entry) = cache.get(kid_str) {
+            return Ok(entry.verifying_key);
+        }
+
+        // Add to negative cache
+        {
+            let mut neg = self.negative_cache.write().await;
+            neg.insert(kid_str.to_owned(), std::time::Instant::now());
+        }
+
+        anyhow::bail!("Key not found in JWKS for kid={}", kid_str)
+    }
+
+    /// Ensure the JWKS cache has been populated for `issuer` (refetch on
+    /// empty). Used by the kid-less resolution paths before they read every
+    /// candidate out of the cache.
+    async fn ensure_cached(&self, issuer: &str) {
+        if self.cache.read().await.is_empty() {
+            if let Err(e) = self.fetch_and_cache(issuer).await {
+                tracing::warn!("JWKS fetch failed for issuer={}: {}", issuer, e);
+            }
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -482,71 +568,52 @@ impl JwtKeySource for JwksKeySource {
             anyhow::bail!("Untrusted issuer: {}", issuer);
         }
 
-        // Try cache first
+        // A presented `kid` is unambiguous: resolve that exact slot.
         if let Some(kid_str) = kid {
-            // Authoritative local CA key (offline): for a LOCAL issuer whose
-            // `kid` matches the on-disk CA key thumbprint, resolve without any
-            // network fetch. This is the service-to-service WIT JWT path; the
-            // HTTP /oauth/jwks endpoint may not be up yet during startup, and
-            // #441 makes service-key registration a hard precondition, so this
-            // resolution must not depend on it. Never overrides a JWKS-published
-            // (rotated) key because it's keyed on the exact CA thumbprint.
-            if self.is_local(issuer) {
-                if let (Some(ca_kid), Some(ca_key)) = (self.local_ca_kid.as_deref(), self.local_ca_key) {
-                    if ca_kid == kid_str {
-                        return Ok(ca_key);
-                    }
-                }
-            }
-            {
-                let cache = self.cache.read().await;
-                if let Some(entry) = cache.get(kid_str) {
-                    return Ok(entry.verifying_key);
-                }
-            }
-
-            // Check negative cache
-            {
-                let neg = self.negative_cache.read().await;
-                if let Some(&ts) = neg.get(kid_str) {
-                    if ts.elapsed() < self.negative_ttl {
-                        anyhow::bail!("Key not found for kid={} (negative cached)", kid_str);
-                    }
-                }
-            }
-
-            // On-miss refetch
-            if let Err(e) = self.fetch_and_cache(issuer).await {
-                tracing::warn!("JWKS fetch failed for issuer={}: {}", issuer, e);
-            }
-
-            // Retry from cache
-            let cache = self.cache.read().await;
-            if let Some(entry) = cache.get(kid_str) {
-                return Ok(entry.verifying_key);
-            }
-
-            // Add to negative cache
-            {
-                let mut neg = self.negative_cache.write().await;
-                neg.insert(kid_str.to_owned(), std::time::Instant::now());
-            }
-
-            anyhow::bail!("Key not found in JWKS for kid={}", kid_str)
-        } else {
-            // No kid: fetch JWKS and return the first Ed25519 key (fallback)
-            if self.cache.read().await.is_empty() {
-                if let Err(e) = self.fetch_and_cache(issuer).await {
-                    tracing::warn!("JWKS fetch failed for issuer={}: {}", issuer, e);
-                }
-            }
-
-            let cache = self.cache.read().await;
-            cache.values()
-                .next()
-                .map(|e| e.verifying_key)
-                .ok_or_else(|| anyhow::anyhow!("No Ed25519 keys in JWKS"))
+            return self.resolve_by_kid(issuer, kid_str).await;
         }
+
+        // No kid: refuse to collapse a multi-key published set to a positional
+        // singleton. `get_keys` is the safe API for kid-less tokens — it
+        // returns every Ed25519 candidate so the caller can try each. Here we
+        // only succeed when the JWKS publishes exactly one key, which is the
+        // unambiguous case. Two or more published keys is overlap rotation /
+        // PQ-hybrid rollout territory and MUST NOT be resolved to "the first
+        // one" (#1183 / #1184).
+        self.ensure_cached(issuer).await;
+        let cache = self.cache.read().await;
+        let mut iter = cache.values();
+        match (iter.next(), iter.next()) {
+            (Some(first), None) => Ok(first.verifying_key),
+            (None, _) => anyhow::bail!("No Ed25519 keys in JWKS for issuer {}", issuer),
+            (Some(_), Some(_)) => anyhow::bail!(
+                "Issuer {} publishes multiple Ed25519 keys and the JWT carries no kid; \
+                 use get_keys() and try each candidate (overlap rotation / hybrid rollout)",
+                issuer
+            ),
+        }
+    }
+
+    async fn get_keys(&self, issuer: &str, kid: Option<&str>) -> Result<Vec<VerifyingKey>> {
+        if !self.is_trusted(issuer) {
+            anyhow::bail!("Untrusted issuer: {}", issuer);
+        }
+
+        // A presented `kid` selects one slot.
+        if let Some(kid_str) = kid {
+            let vk = self.resolve_by_kid(issuer, kid_str).await?;
+            return Ok(vec![vk]);
+        }
+
+        // No kid: return EVERY Ed25519 candidate so the caller can try each
+        // until one verifies. Never positional selection (#1183 / #1184).
+        self.ensure_cached(issuer).await;
+        let cache = self.cache.read().await;
+        let v: Vec<VerifyingKey> = cache.values().map(|e| e.verifying_key).collect();
+        if v.is_empty() {
+            anyhow::bail!("No Ed25519 keys in JWKS for issuer {}", issuer);
+        }
+        Ok(v)
     }
 
     fn is_trusted(&self, issuer: &str) -> bool {
@@ -738,8 +805,11 @@ mod tests {
         assert!(result.is_err());
     }
 
+    /// #1184: with exactly one published key, `get_key(None)` is unambiguous
+    /// and resolves to that key. (Two or more published keys is the overlap
+    /// case, covered by `jwks_key_source_no_kid_multi_key_get_keys_tries_all`.)
     #[tokio::test]
-    async fn jwks_key_source_no_kid_returns_first() -> anyhow::Result<()> {
+    async fn jwks_key_source_no_kid_single_key_resolves() -> anyhow::Result<()> {
         let sk = SigningKey::from_bytes(&[0xDD; 32]);
         let jwks = mock_jwks_json(&[&sk]);
         let ks = JwksKeySource::new(
@@ -750,6 +820,85 @@ mod tests {
 
         let key = ks.get_key("http://localhost", None).await?;
         assert_eq!(key, sk.verifying_key());
+        Ok(())
+    }
+
+    /// #1184: `get_key(None)` MUST refuse to collapse a multi-key published
+    /// set to a positional singleton — that forecloses overlap rotation and
+    /// PQ-hybrid rollout. The previous implementation returned
+    /// `HashMap::values().next()` (nondeterministic); reverting this hunk to
+    /// "return the first candidate" makes the assertion below fail.
+    #[tokio::test]
+    async fn jwks_key_source_no_kid_multi_key_get_key_refuses_arbitrary() {
+        let sk_a = SigningKey::from_bytes(&[0x11; 32]);
+        let sk_b = SigningKey::from_bytes(&[0x22; 32]);
+        let jwks = mock_jwks_json(&[&sk_a, &sk_b]);
+        let ks = JwksKeySource::new(
+            JwksMode::Isolated { jwks_url: "http://localhost/oauth/jwks".to_owned() },
+            "http://localhost".to_owned(),
+            mock_fetcher(jwks),
+        );
+
+        let result = ks.get_key("http://localhost", None).await;
+        assert!(result.is_err(), "multi-key no-kid get_key must refuse arbitrary selection");
+        let msg = result.err().map(|e| e.to_string()).unwrap_or_default();
+        assert!(
+            msg.contains("multiple Ed25519 keys") && msg.contains("no kid"),
+            "expected a refusal to pick arbitrarily, got: {msg}"
+        );
+    }
+
+    /// #1184 overlap: two Ed25519 keys published simultaneously. `get_keys`
+    /// MUST return BOTH so a kid-less verifier can try each — overlap
+    /// rotation and PQ-hybrid rollout depend on this. A token signed by the
+    /// non-first key still verifies because both candidates are tried.
+    #[tokio::test]
+    async fn jwks_key_source_no_kid_multi_key_get_keys_tries_all() -> anyhow::Result<()> {
+        let sk_a = SigningKey::from_bytes(&[0x11; 32]); // "first" in JWKS order
+        let sk_b = SigningKey::from_bytes(&[0x22; 32]); // "second"
+        let vk_a = sk_a.verifying_key();
+        let vk_b = sk_b.verifying_key();
+
+        let jwks = mock_jwks_json(&[&sk_a, &sk_b]);
+        let ks = JwksKeySource::new(
+            JwksMode::Isolated { jwks_url: "http://localhost/oauth/jwks".to_owned() },
+            "http://localhost".to_owned(),
+            mock_fetcher(jwks),
+        );
+
+        let candidates = ks.get_keys("http://localhost", None).await?;
+        assert_eq!(candidates.len(), 2, "both published keys must be returned");
+        assert!(candidates.contains(&vk_a));
+        assert!(candidates.contains(&vk_b));
+        Ok(())
+    }
+
+    /// #1184 overlap: a token signed by the non-first published key verifies
+    /// when the caller uses `get_keys` + `decode_with_any_key`. Reverting
+    /// `JwksKeySource` to return a single arbitrary candidate makes this fail
+    /// (the wrong candidate is returned roughly half the time).
+    #[tokio::test]
+    async fn jwks_key_source_overlap_non_first_signer_verifies() -> anyhow::Result<()> {
+        use crate::auth::jwt::{decode_with_any_key_lenient, encode};
+
+        let sk_a = SigningKey::from_bytes(&[0x11; 32]);
+        let sk_b = SigningKey::from_bytes(&[0x22; 32]);
+
+        let jwks = mock_jwks_json(&[&sk_a, &sk_b]);
+        let ks = JwksKeySource::new(
+            JwksMode::Isolated { jwks_url: "http://localhost/oauth/jwks".to_owned() },
+            "http://localhost".to_owned(),
+            mock_fetcher(jwks),
+        );
+
+        // Sign with the SECOND key — no kid in the header, so the verifier
+        // must try both candidates.
+        let now = chrono::Utc::now().timestamp();
+        let claims = crate::auth::Claims::new("user-1".to_owned(), now, now + 300);
+        let token = encode(&claims, &sk_b);
+        let candidates = ks.get_keys("http://localhost", None).await?;
+        let verified = decode_with_any_key_lenient(&token, &candidates, None)?;
+        assert_eq!(verified.sub, "user-1");
         Ok(())
     }
 

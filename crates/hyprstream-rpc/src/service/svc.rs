@@ -872,8 +872,13 @@ pub trait RequestService: 'static {
                 })?
             }
             "EdDSA" => {
-                let verifying_key = key_source
-                    .get_key(&unverified.iss, kid.as_deref())
+                // A kid-less JWT may have been signed by any of the issuer's
+                // simultaneously-published keys (overlap rotation / PQ-hybrid
+                // rollout). Resolve every candidate and try each rather than
+                // collapsing the published set to a positional singleton
+                // (#1183 / #1184).
+                let candidates = key_source
+                    .get_keys(&unverified.iss, kid.as_deref())
                     .await
                     .map_err(|e| {
                         tracing::warn!(
@@ -883,11 +888,15 @@ pub trait RequestService: 'static {
                         );
                         anyhow::anyhow!("JWT key resolution failed")
                     })?;
-                crate::auth::decode_with_key(&token, &verifying_key, self.expected_audience())
-                    .map_err(|e| {
-                        tracing::warn!("JWT verification failed: {}", e);
-                        anyhow::anyhow!("JWT verification failed")
-                    })?
+                crate::auth::decode_with_any_key_lenient(
+                    &token,
+                    &candidates,
+                    self.expected_audience(),
+                )
+                .map_err(|e| {
+                    tracing::warn!("JWT verification failed: {}", e);
+                    anyhow::anyhow!("JWT verification failed")
+                })?
             }
             _ => anyhow::bail!("unsupported JWT algorithm"),
         };

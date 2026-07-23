@@ -387,6 +387,62 @@ pub fn decode_with_key(
     decode_inner(token, verifying_key, expected_aud, true)
 }
 
+/// Try verifying a JWT against each candidate key, returning the first
+/// successful decode. Mirrors [`decode`] (strict audience: an absent `aud`
+/// is rejected when `expected_aud` is `Some`).
+///
+/// This is the safe verifier shape for a kid-less JWT: when the JOSE header
+/// carries no `kid`, the verifier cannot know which published key signed the
+/// token, so it MUST try every algorithm-compatible candidate rather than
+/// collapse the published set to a positional singleton (#1183 / #1184).
+/// Per-candidate failures are expected in the happy path (a JWKS with several
+/// keys has exactly one real verifier), so they are logged at `debug!`; the
+/// final failure surfaces `InvalidSignature`.
+///
+/// `candidates` MUST be non-empty; an empty slice is an `InvalidSignature`
+/// error rather than a panic.
+pub fn decode_with_any_key(
+    token: &str,
+    candidates: &[VerifyingKey],
+    expected_aud: Option<&str>,
+) -> Result<Claims, JwtError> {
+    decode_with_any_key_inner(token, candidates, expected_aud, false)
+}
+
+/// Lenient-audience twin of [`decode_with_any_key`], mirroring
+/// [`decode_with_key`]: a wrong `aud` is still rejected, but an absent `aud`
+/// is accepted when `expected_aud` is `Some`. Use this for federated tokens
+/// from issuers that do not set `aud`.
+pub fn decode_with_any_key_lenient(
+    token: &str,
+    candidates: &[VerifyingKey],
+    expected_aud: Option<&str>,
+) -> Result<Claims, JwtError> {
+    decode_with_any_key_inner(token, candidates, expected_aud, true)
+}
+
+fn decode_with_any_key_inner(
+    token: &str,
+    candidates: &[VerifyingKey],
+    expected_aud: Option<&str>,
+    lenient_aud: bool,
+) -> Result<Claims, JwtError> {
+    if candidates.is_empty() {
+        return Err(JwtError::InvalidSignature);
+    }
+    let mut last_err = JwtError::InvalidSignature;
+    for vk in candidates {
+        match decode_inner(token, vk, expected_aud, lenient_aud) {
+            Ok(claims) => return Ok(claims),
+            Err(e) => {
+                tracing::debug!(error = %e, "JWT candidate key did not verify; trying next");
+                last_err = e;
+            }
+        }
+    }
+    Err(last_err)
+}
+
 /// Internal decode implementation shared by `decode` and `decode_with_key`.
 ///
 /// `lenient_aud`: when true, accepts tokens with no `aud` claim even when
