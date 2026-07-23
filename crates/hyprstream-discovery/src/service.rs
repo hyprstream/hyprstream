@@ -2043,6 +2043,15 @@ async fn authenticate_did_anchored_bootstrap(
 ) -> Result<(ProcessBootstrapAuthority, TransportConfig)> {
     seal_process_bootstrap_authority()?;
     let trust = crate::did_anchored::resolve_did_anchored_trust(anchors).await?;
+    // #556 / F5: the deployment CA anchors the registry key, which certifies the
+    // audit key and accepted-state checkpoints. It must never land classical.
+    // Option C sources the CA from the capsule's hybrid subject key, so this is
+    // PqHybrid by construction; enforce it as a fail-closed floor regardless.
+    anyhow::ensure!(
+        trust.assurance == hyprstream_rpc::auth::mac::Assurance::PqHybrid,
+        "DID-anchored deployment CA did not land PqHybrid (got {:?}); refusing a classical trust root (#556)",
+        trust.assurance
+    );
     let witness =
         authenticate_registry_deployment_credentials(TrustedRegistryDeploymentCredentials {
             ca_verifying_key: trust.ca_verifying_key,

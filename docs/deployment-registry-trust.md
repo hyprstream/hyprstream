@@ -64,7 +64,14 @@ subject key's Ed25519 half (`body.subject_keys[0]`), and reach is the capsule's
 `#ns` `NinePExport` service, dialed by its independent iroh `nodeId` or signed
 QUIC socket carrier. The document contributes only the reciprocal identifier
 vouch; any keys or services it publishes are advisory and are never installed
-as trust material.
+as trust material. Consequently:
+
+- Control of the `did:web` origin cannot substitute the CA or reach because
+  both remain content-bound to the hash-pinned capsule.
+- Overlapping document keys during rotation do not break bootstrap; accepted
+  keys rotate through the at9p state chain rather than document edits.
+- The installed authority carries `PqHybrid` assurance from the capsule's
+  hybrid subject key, and startup fails closed if it lands below that floor.
 
 Capsule content only proves a content-bound reach claim, not that the endpoint
 is currently live. Startup therefore dials the capsule-derived Discovery
@@ -86,7 +93,8 @@ two public anchors.
 `registry-service.jwt` is a closed, one-hour-maximum deployment credential, not
 a generic JWT or access token. Let `D` be the RFC 7638 Ed25519 JWK thumbprint of
 the exact public key selected as the deployment CA (from
-`deployment-ca.ed25519` or the GATE-verified capsule). Provisioning
+`deployment-ca.ed25519` or the GATE-verified capsule's primary subject key).
+Provisioning
 must use the following profile exactly:
 
 - The protected header contains only `alg`, `typ`, and `kid`, with values

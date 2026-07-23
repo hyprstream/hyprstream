@@ -17,6 +17,7 @@ use ed25519_dalek::VerifyingKey;
 use hyprstream_pds::at9p::{ServiceType, Transport as At9pTransport};
 use hyprstream_pds::at9p_alias::AuthoritativeIdentity;
 use hyprstream_pds::at9p_gate::VerifiedCapsule;
+use hyprstream_rpc::auth::mac::Assurance;
 use hyprstream_rpc::did_web::{did_web_to_url, DidWebResolver, HttpDidDocFetcher};
 use hyprstream_rpc::identity::Did;
 use hyprstream_rpc::transport::{EndpointType, TransportConfig};
@@ -84,10 +85,15 @@ impl DeploymentTrustSource {
 }
 
 /// Verified public material extracted from a mutually-attested identity pair.
+///
+/// The CA and transport are sourced from the GATE-verified capsule, never the
+/// `did:web` document.
 pub(crate) struct DidAnchoredTrust {
     pub ca_verifying_key: VerifyingKey,
     pub discovery_transport: TransportConfig,
     pub authoritative_identity: AuthoritativeIdentity,
+    /// Assurance carried by the capsule's hybrid subject key.
+    pub assurance: Assurance,
 }
 
 /// Fetch capsules from the deployment's static well-known content endpoint.
@@ -281,6 +287,7 @@ pub(crate) async fn verify_did_anchored_document(
     Ok(DidAnchoredTrust {
         ca_verifying_key,
         discovery_transport,
+        assurance: authoritative_identity.assurance,
         authoritative_identity,
     })
 }
@@ -296,6 +303,7 @@ pub(crate) async fn resolve_did_anchored_trust(anchors: &DidAnchors) -> Result<D
     tracing::info!(
         at9p = %trust.authoritative_identity.at9p_did,
         did_web = %trust.authoritative_identity.classical_did,
+        assurance = ?trust.assurance,
         "verified mutually-attested DID deployment trust anchors from GATE-verified capsule"
     );
     Ok(trust)
@@ -487,6 +495,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn installed_authority_is_pqhybrid_not_classical() {
+        let web = "did:web:cluster.example";
+        let (bytes, at9p) = capsule(web, 4);
+        let anchors = DidAnchors {
+            cluster_at9p_did: at9p.clone(),
+            cluster_did_web: web.to_owned(),
+        };
+        let trust = verify_did_anchored_document(
+            &anchors,
+            &document(web, Some(&at9p)),
+            Arc::new(FixedCapsuleSource(bytes)),
+        )
+        .await
+        .unwrap();
+        assert_ne!(trust.assurance, Assurance::Classical);
+        assert_eq!(trust.assurance, Assurance::PqHybrid);
+    }
+
+    #[tokio::test]
+    async fn rotation_with_overlapping_document_cas_still_bootstraps() {
+        let web = "did:web:cluster.example";
+        let (bytes, at9p) = capsule(web, 4);
+        let anchors = DidAnchors {
+            cluster_at9p_did: at9p.clone(),
+            cluster_did_web: web.to_owned(),
+        };
+        let mut doc = document(web, Some(&at9p));
+        doc["verificationMethod"] = json!([
+            {
+                "id": format!("{web}#deployment-ca-old"),
+                "type": "Multikey",
+                "controller": web,
+                "publicKeyMultibase": multikey(&[0x11; 32]),
+            },
+            {
+                "id": format!("{web}#deployment-ca-new"),
+                "type": "Multikey",
+                "controller": web,
+                "publicKeyMultibase": multikey(&[0x22; 32]),
+            },
+        ]);
+        let trust =
+            verify_did_anchored_document(&anchors, &doc, Arc::new(FixedCapsuleSource(bytes)))
+                .await
+                .expect("overlapping document CAs must not break bootstrap");
+        assert_eq!(trust.ca_verifying_key.to_bytes(), capsule_ca(4));
+    }
+
+    #[tokio::test]
     async fn substituted_document_ca_and_reach_are_ignored() {
         let web = "did:web:cluster.example";
         let (bytes, at9p) = capsule(web, 4);
@@ -520,6 +577,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ca_is_bound_to_verified_capsule_not_document() {
+        let web = "did:web:cluster.example";
+        let (bytes, at9p) = capsule(web, 4);
+        let anchors = DidAnchors {
+            cluster_at9p_did: at9p.clone(),
+            cluster_did_web: web.to_owned(),
+        };
+        let document_ca = [0x07; 32];
+        assert_ne!(capsule_ca(4), document_ca);
+        let trust = verify_did_anchored_document(
+            &anchors,
+            &document_with_ca_and_reach(web, Some(&at9p), document_ca, [0x45; 32]),
+            Arc::new(FixedCapsuleSource(bytes)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(trust.ca_verifying_key.to_bytes(), capsule_ca(4));
+    }
+
+    #[tokio::test]
     async fn reach_without_carrier_node_id_fails_closed() {
         let web = "did:web:cluster.example";
         let (bytes, at9p) = capsule_with_carrier(web, 4, None);
@@ -536,6 +613,16 @@ mod tests {
         .err()
         .expect("carrier-less reach unexpectedly accepted");
         assert!(format!("{error:#}").contains("no independent iroh nodeId"));
+    }
+
+    #[tokio::test]
+    async fn capsule_carries_authoritative_keys_and_services() {
+        let web = "did:web:cluster.example";
+        let (bytes, at9p) = capsule(web, 4);
+        let verified = hyprstream_pds::at9p_gate::verify_did_at9p(&at9p, &bytes)
+            .expect("capsule GATE-verifies");
+        assert!(!verified.capsule().body.subject_keys.is_empty());
+        assert!(!verified.capsule().body.services.is_empty());
     }
 
     #[tokio::test]
