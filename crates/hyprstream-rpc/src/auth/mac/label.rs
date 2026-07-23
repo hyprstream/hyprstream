@@ -52,9 +52,7 @@ pub const MAX_COMPARTMENTS: u32 = 64;
 ///
 /// Adding a level is a deliberate policy change (a new lattice version), not a
 /// runtime/config knob.
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 #[repr(u8)]
 pub enum Level {
@@ -105,9 +103,7 @@ impl fmt::Display for Level {
 /// - `PqHybrid`  — has a verified hybrid-PQC anchor (Ed25519 ↔ ML-DSA-65 bound
 ///   via `register_pq_trust`), i.e. the [`crate::crypto::CryptoPolicy::Hybrid`]
 ///   composite verified.
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 #[repr(u8)]
 pub enum Assurance {
@@ -122,9 +118,9 @@ pub enum Assurance {
 }
 
 impl Assurance {
-    /// Floor / join identity of the assurance axis.
+    /// Floor of the assurance axis (fail-closed for unknown provenance).
     pub const BOTTOM: Assurance = Assurance::Unverified;
-    /// Top of the assurance axis.
+    /// Top of the assurance axis and identity for its `min` join.
     pub const TOP: Assurance = Assurance::PqHybrid;
 }
 
@@ -178,9 +174,7 @@ impl fmt::Display for Compartment {
 /// policy. Subset/union are bitwise `AND`/`OR`. The empty set (`0`) is the
 /// compartment-axis bottom. This is the representation that lets S4's AVC (#570)
 /// key on a label with no interning indirection.
-#[derive(
-    Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Serialize, Deserialize,
-)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct CompartmentSet(pub u64);
 
@@ -339,15 +333,25 @@ impl SecurityLabel {
         }
     }
 
-    /// The lattice **bottom** ⊥ = `(Public, Unverified, {})`.
+    /// The fail-closed label `(Public, Unverified, {})`.
     ///
-    /// This is the *join identity*, NOT a default object label. An object is
-    /// only at ⊥ if policy explicitly labels it so. It is mainly useful as the
-    /// seed for folding a join over provenance inputs (IFC).
+    /// This is deliberately distinct from the identity for provenance joins:
+    /// the Biba assurance axis joins with `min`, whose identity is `PqHybrid`.
+    /// In particular, an empty provenance set must remain unverified rather
+    /// than acquire the join identity's top assurance.
     pub const fn bottom() -> Self {
         SecurityLabel {
             level: Level::BOTTOM,
             assurance: Assurance::BOTTOM,
+            compartments: CompartmentSet::EMPTY,
+        }
+    }
+
+    /// Per-axis identity for a non-empty provenance join.
+    const fn join_identity() -> Self {
+        SecurityLabel {
+            level: Level::BOTTOM,
+            assurance: Assurance::TOP,
             compartments: CompartmentSet::EMPTY,
         }
     }
@@ -368,6 +372,10 @@ impl SecurityLabel {
     /// - `self.assurance >= object.assurance`        (#548 crypto-assurance axis)
     /// - `object.compartments ⊆ self.compartments`   (cleared into all categories)
     ///
+    /// The assurance field is currently overloaded: here it is an authentication-
+    /// strength gate, while provenance joining treats it as Biba integrity. Keep
+    /// this gate unchanged pending the field-separation/proof follow-up in #1232.
+    ///
     /// The per-op MAC floor (design §3, §10): the *fixed* product-lattice order,
     /// content truth, never overridable by a token/UCAN/grant.
     #[inline]
@@ -378,13 +386,11 @@ impl SecurityLabel {
             && object.compartments.is_subset(self.compartments)
     }
 
-    /// **Join** (least upper bound) — the IFC combinator (design §3).
+    /// IFC provenance join over confidentiality, integrity, and compartments.
     ///
-    /// `a ⊔ b` = `(max(level), max(assurance), union(compartments))`. A derived
-    /// object's label is the join of its inputs' labels, so a rollup of secret
-    /// inputs is automatically secret and aggregation cannot launder
-    /// classification. Associative, commutative, idempotent; `⊥` is the
-    /// identity — hence [`SecurityLabel::join_all`] can fold from `bottom()`.
+    /// `a ⊔ b` = `(max(level), min(assurance), union(compartments))`: secrecy
+    /// rises to the most restrictive input, while provenance integrity degrades
+    /// to its weakest link. Associative, commutative, and idempotent.
     #[inline]
     #[must_use]
     pub fn join(&self, other: &SecurityLabel) -> SecurityLabel {
@@ -394,7 +400,7 @@ impl SecurityLabel {
             } else {
                 other.level
             },
-            assurance: if self.assurance >= other.assurance {
+            assurance: if self.assurance <= other.assurance {
                 self.assurance
             } else {
                 other.assurance
@@ -405,16 +411,19 @@ impl SecurityLabel {
 
     /// Fold the IFC join over a set of input labels (provenance-DAG join).
     ///
-    /// Returns `⊥` for an empty input set (the identity), which the caller
-    /// MUST treat carefully: a derived object with *no* recorded inputs is
-    /// suspicious and should generally be rejected rather than labeled ⊥. This
-    /// helper computes the algebra only; the seal/rollup policy (when an empty
-    /// provenance is allowed) is S2's (#568).
+    /// Non-empty inputs fold from the per-axis identity `(Public, PqHybrid, {})`.
+    /// Empty provenance instead returns the fail-closed `bottom()` label, never
+    /// the top-assurance identity.
     #[must_use]
     pub fn join_all<'a>(labels: impl IntoIterator<Item = &'a SecurityLabel>) -> SecurityLabel {
-        labels
-            .into_iter()
-            .fold(SecurityLabel::bottom(), |acc, l| acc.join(l))
+        let mut labels = labels.into_iter();
+        let Some(first) = labels.next() else {
+            return SecurityLabel::bottom();
+        };
+
+        labels.fold(SecurityLabel::join_identity().join(first), |acc, label| {
+            acc.join(label)
+        })
     }
 }
 
@@ -509,23 +518,25 @@ mod tests {
     }
 
     #[test]
-    fn join_takes_max_and_union() {
+    fn join_takes_confidentiality_max_integrity_min_and_union() {
         let a = label(Level::Internal, Assurance::Classical, &[0]); // pii
         let b = label(Level::Secret, Assurance::PqHybrid, &[5]); // finance
         let j = a.join(&b);
         assert_eq!(j.level, Level::Secret);
-        assert_eq!(j.assurance, Assurance::PqHybrid);
+        assert_eq!(j.assurance, Assurance::Classical);
         assert!(j.compartments.contains(0));
         assert!(j.compartments.contains(5));
     }
 
     #[test]
-    fn join_is_least_upper_bound() {
+    fn join_preserves_each_axis_bound() {
         let a = label(Level::Internal, Assurance::Classical, &[0]);
         let b = label(Level::Confidential, Assurance::Unverified, &[5]);
         let j = a.join(&b);
-        assert!(j.can_access(&a));
-        assert!(j.can_access(&b));
+        assert!(j.level >= a.level && j.level >= b.level);
+        assert!(j.assurance <= a.assurance && j.assurance <= b.assurance);
+        assert!(a.compartments.is_subset(j.compartments));
+        assert!(b.compartments.is_subset(j.compartments));
     }
 
     #[test]
@@ -539,13 +550,13 @@ mod tests {
         assert_eq!(a.join(&b).join(&c), a.join(&b.join(&c)));
         // idempotent
         assert_eq!(a.join(&a), a);
-        // bottom identity
-        assert_eq!(a.join(&SecurityLabel::bottom()), a);
+        // per-axis identity
+        assert_eq!(a.join(&SecurityLabel::join_identity()), a);
     }
 
     #[test]
     fn join_all_secret_input_propagates() {
-        // IFC: aggregating a secret input yields a secret result.
+        // Confidentiality rises, integrity falls, and compartments accumulate.
         let inputs = vec![
             label(Level::Public, Assurance::Classical, &[0]),
             label(Level::Secret, Assurance::PqHybrid, &[1]),
@@ -553,14 +564,30 @@ mod tests {
         ];
         let j = SecurityLabel::join_all(&inputs);
         assert_eq!(j.level, Level::Secret);
-        assert_eq!(j.assurance, Assurance::PqHybrid);
+        assert_eq!(j.assurance, Assurance::Classical);
         assert_eq!(j.compartments.len(), 3);
     }
 
     #[test]
-    fn join_all_empty_is_bottom() {
+    fn join_all_mixed_classical_and_pq_hybrid_yields_classical() {
+        let inputs = vec![
+            label(Level::Public, Assurance::PqHybrid, &[]),
+            label(Level::Public, Assurance::Classical, &[]),
+        ];
+
+        assert_eq!(
+            SecurityLabel::join_all(&inputs).assurance,
+            Assurance::Classical
+        );
+    }
+
+    #[test]
+    fn join_all_empty_is_fail_closed_unverified() {
         let none: Vec<&SecurityLabel> = vec![];
-        assert!(SecurityLabel::join_all(none).is_bottom());
+        let joined = SecurityLabel::join_all(none);
+        assert_eq!(joined.assurance, Assurance::Unverified);
+        assert!(joined.is_bottom());
+        assert_ne!(joined, SecurityLabel::join_identity());
     }
 
     #[test]
