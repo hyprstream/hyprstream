@@ -220,6 +220,35 @@ RUN cd /tmp/tc \
     && rm -rf /tmp/tc
 
 #############################################
+# CUDA 13.0 Builder (aarch64 / arm64) — reconnaissance only
+#############################################
+#
+# NVIDIA CUDA supports arm64-sbsa, and PyTorch publishes aarch64 CUDA wheels.
+# This uses the project's pinned 2.10.0 libtorch release with the CUDA 13.0
+# aarch64 wheel. It remains dispatch-only until a GPU-equipped ARM runner
+# validates runtime execution.
+FROM builder-base AS builder-cuda130-arm64-spike
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        python3 python3-pip \
+    && rm -rf /var/lib/apt/lists/* \
+    && apt-get clean
+
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip3 install --break-system-packages \
+        --extra-index-url https://download.pytorch.org/whl/cu130 \
+        'torch==2.10.0+cu130' \
+    && TORCH_DIR="$(python3 -c 'import torch, os; print(os.path.dirname(torch.__file__))')" \
+    && ln -s "$TORCH_DIR" /opt/libtorch \
+    && python3 -c 'import torch; assert torch.version.cuda == "13.0"; print(torch.__version__, torch.version.cuda)' \
+    && test -s /opt/libtorch/lib/libtorch_cuda.so \
+    && test -d /opt/libtorch/include/torch
+
+ENV LIBTORCH=/opt/libtorch
+ENV LD_LIBRARY_PATH=/opt/libtorch/lib
+ENV LIBTORCH_BYPASS_VERSION_CHECK=1
+
+#############################################
 # Select Builder Based on Variant
 #############################################
 
