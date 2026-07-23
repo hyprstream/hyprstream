@@ -140,3 +140,11 @@ annotation vfsBulk(field) :Void;
 
 # Exclude a method from the generated mount.
 annotation vfsHidden(field) :Void;
+
+# MAC security label this generated node carries — carrier (a) of #699: the label
+# is a property of the node's TYPE, derived from the schema annotation at
+# generation (T2 emits it onto VfsNode). Format: "<level>" or
+# "<level>:<assurance>" or "<level>:<assurance>:<compBit,compBit>". Absent ⇒ the
+# generated node is unlabeled ⇒ deny ⇒ a genesis-coverage finding (there is no
+# permissive default). Usage: getStatus @0 :Status $vfsMac("internal");
+annotation vfsMac(field) :Text;

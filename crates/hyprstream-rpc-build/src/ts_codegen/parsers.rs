@@ -1686,6 +1686,7 @@ struct EmbedImagesResponse {
                 vfs_kind: String::new(),
                 vfs_bulk: false,
                 vfs_hidden: false,
+                vfs_mac: String::new(),
             }],
             structs: vec![],
             scoped_clients: vec![],

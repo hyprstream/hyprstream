@@ -601,6 +601,69 @@ impl GenesisGate {
     }
 }
 
+// ────────────────────────────────────────────────────────────────────────────
+// 5. Carrier (a) — schema-derived labels on generated mount nodes (#699)
+// ────────────────────────────────────────────────────────────────────────────
+
+/// Per-node label coverage of a service's generated `vfs_nodes()` table
+/// (#699 carrier (a)): each generated `/srv/{service}/*` node carries its MAC
+/// label as a property of its type, derived from the `$vfsMac` schema annotation
+/// at codegen (see [`hyprstream_rpc::metadata::VfsNode::mac_label`]).
+///
+/// A node whose schema declared no `$vfsMac` decodes to `None` ⇒ **unlabeled** ⇒
+/// deny ⇒ a **finding** the operator must close (by annotating the schema) before
+/// enforcement is enabled. There is no permissive default and no catch-all: this
+/// type only partitions what the schemas declared.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GeneratedNodeCoverage {
+    /// `(mount-relative path, label)` for every node that resolves to a label.
+    pub labeled: Vec<(String, SecurityLabel)>,
+    /// Mount-relative paths of nodes whose schema declared no `$vfsMac`
+    /// (unlabeled ⇒ deny ⇒ finding).
+    pub unlabeled: Vec<String>,
+}
+
+impl GeneratedNodeCoverage {
+    /// Coverage is complete iff every generated node resolves to a label.
+    pub fn is_complete(&self) -> bool {
+        self.unlabeled.is_empty()
+    }
+
+    /// Classify a service's generated node table by carrier (a).
+    ///
+    /// `service` is the `/srv/{service}` mount name (for reporting); `nodes` is
+    /// the table the codegen macro emitted (from `vfs_nodes()`).
+    pub fn for_service(service: &str, nodes: &[hyprstream_rpc::metadata::VfsNode]) -> Self {
+        let mut labeled = Vec::new();
+        let mut unlabeled = Vec::new();
+        for n in nodes {
+            let path = format!("/srv/{}{}", service, normalize_relative(n.path));
+            match n.mac_label() {
+                Some(label) => labeled.push((path, label)),
+                None => unlabeled.push(path),
+            }
+        }
+        // Deterministic order (tests + stable reports).
+        labeled.sort_by(|a, b| a.0.cmp(&b.0));
+        unlabeled.sort();
+        GeneratedNodeCoverage { labeled, unlabeled }
+    }
+}
+
+/// Normalize a mount-relative node path into an absolute `/srv/{service}/...`
+/// segment suffix: prepend `/` if the node path is non-empty, else "" (the
+/// service root itself). `{brace}` arg-segments are kept verbatim — they are
+/// part of the node's path identity, not resolved here.
+fn normalize_relative(path: &str) -> String {
+    if path.is_empty() {
+        String::new()
+    } else if path.starts_with('/') {
+        path.to_owned()
+    } else {
+        format!("/{path}")
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -858,5 +921,60 @@ mod tests {
             );
             assert_eq!(expected.assurance, Assurance::Unverified);
         }
+    }
+
+    // ── Carrier (a): generated-node label coverage (#699) ─────────────────────
+
+    use hyprstream_rpc::metadata::{VfsNode, VfsNodeKind};
+
+    fn vnode(path: &'static str, mac: &'static str) -> VfsNode {
+        VfsNode {
+            method: "m",
+            path,
+            kind: VfsNodeKind::File,
+            scope: "query",
+            bulk: false,
+            mac,
+        }
+    }
+
+    #[test]
+    fn every_annotated_generated_node_resolves_to_a_label() {
+        // Carrier (a): a fully-`$vfsMac`-annotated service's generated table has
+        // NO unlabeled nodes — every node resolves to a label.
+        let nodes = [
+            vnode("status", "internal"),
+            vnode("{name}", "confidential"),
+            vnode("ctl", "secret:pq-hybrid:0"),
+        ];
+        let cov = GeneratedNodeCoverage::for_service("model", &nodes);
+        assert!(cov.is_complete(), "unlabeled findings: {:?}", cov.unlabeled);
+        assert_eq!(cov.labeled.len(), 3);
+        assert_eq!(cov.unlabeled, Vec::<String>::new());
+        // Paths are /srv/{service}/{node}.
+        let paths: Vec<&str> = cov.labeled.iter().map(|(p, _)| p.as_str()).collect();
+        assert!(paths.contains(&"/srv/model/status"));
+        assert!(paths.contains(&"/srv/model/{name}"));
+        assert!(paths.contains(&"/srv/model/ctl"));
+    }
+
+    #[test]
+    fn unannotated_generated_node_is_a_finding_not_a_default() {
+        // A node whose schema declared no `$vfsMac` is unlabeled ⇒ deny ⇒ a
+        // finding. It is NOT defaulted to a permissive label.
+        let nodes = [vnode("status", "internal"), vnode("secret", "")];
+        let cov = GeneratedNodeCoverage::for_service("model", &nodes);
+        assert!(!cov.is_complete());
+        assert_eq!(cov.unlabeled, vec!["/srv/model/secret"]);
+        assert_eq!(cov.labeled.len(), 1);
+    }
+
+    #[test]
+    fn malformed_vfs_mac_is_a_finding() {
+        // A garbled `$vfsMac` decodes to None ⇒ finding (fail-closed).
+        let nodes = [vnode("status", "internal"), vnode("x", "not-a-level")];
+        let cov = GeneratedNodeCoverage::for_service("model", &nodes);
+        assert!(!cov.is_complete());
+        assert!(cov.unlabeled.contains(&"/srv/model/x".to_owned()));
     }
 }

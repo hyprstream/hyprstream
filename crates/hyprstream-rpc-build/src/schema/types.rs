@@ -53,6 +53,12 @@ pub struct UnionVariant {
     /// `$vfsHidden`: exclude this method from the generated mount.
     #[serde(default)]
     pub vfs_hidden: bool,
+    /// `$vfsMac` annotation text — the MAC security label this generated node
+    /// carries (#699 carrier (a); a property of the node's type, derived at
+    /// generation). Empty = unset ⇒ the node is unlabeled ⇒ deny ⇒ a
+    /// genesis-coverage finding (no permissive default).
+    #[serde(default)]
+    pub vfs_mac: String,
 }
 
 /// Payload carried by a tagged-union arm.
@@ -292,6 +298,7 @@ mod vfs_metadata_tests {
             vfs_kind: "file".into(),
             vfs_bulk: false,
             vfs_hidden: false,
+            vfs_mac: String::new(),
         };
         let json = serde_json::to_string(&v).expect("serialize");
         let back: UnionVariant = serde_json::from_str(&json).expect("deserialize");
