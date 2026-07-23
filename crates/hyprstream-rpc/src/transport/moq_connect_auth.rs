@@ -114,9 +114,13 @@ impl MoqConnectAuthz {
     }
 
     /// Require the JWT `aud` to equal `aud` (trailing-slash tolerant, matches
-    /// [`jwt::decode_with_key`]). A token with a different `aud` is rejected;
-    /// a token with no `aud` is still accepted (lenient on absence, strict on
-    /// mismatch) to interoperate with issuers that omit `aud`.
+    /// [`jwt::decode_with_key`]). A token with a different `aud` is rejected,
+    /// and — unlike the codebase-wide lenient [`jwt::decode_with_key`] — a
+    /// token with **no** `aud` is also rejected when this is set. On a
+    /// dedicated `/moq` boundary that closes the token-substitution vector
+    /// (a token minted for another service, which carries no `aud`, must not
+    /// be admitted here) per BCP 225 / RFC 8725bis. If the operator does not
+    /// set this, audience checking is off entirely (their choice).
     pub fn with_expected_aud(mut self, aud: impl Into<String>) -> Self {
         self.expected_aud = Some(aud.into());
         self
@@ -128,13 +132,23 @@ impl MoqConnectAuthz {
     /// Returns `None` — meaning the CONNECT MUST be refused — if:
     /// - no `Authorization: Bearer <jwt>` header is present,
     /// - the JWT signature, `alg`, `exp`, or `iat` check fails,
-    /// - the `aud` check fails,
+    /// - the `aud` check fails — including a **missing** `aud` when
+    ///   [`Self::with_expected_aud`] is set (token substitution is not
+    ///   admitted on a boundary that specified an audience),
     /// - or `tenant_resolver` returns `None` for the verified subject.
     ///
     /// Every branch is fail-closed; none falls back to an unscoped identity.
     pub fn verify(&self, headers: &http::HeaderMap) -> Option<VerifiedConnect> {
         let token = bearer_token(headers)?;
         let claims = jwt::decode_with_key(&token, &self.verify_key, self.expected_aud.as_deref()).ok()?;
+        // [`jwt::decode_with_key`] is lenient on a *missing* `aud` (accepts
+        // absent, rejects mismatch) to tolerate legacy federated issuers across
+        // the codebase. This dedicated `/moq` boundary is stricter: when an
+        // audience is configured, a token with no `aud` is a substitution
+        // attempt from another service and must fail closed (#1153, BCP 225).
+        if self.expected_aud.is_some() && claims.aud.is_none() {
+            return None;
+        }
         let tenant = (self.tenant_resolver)(&claims.sub)?;
         Some(VerifiedConnect {
             peer: PeerIdentity::authenticated(&claims.sub),
@@ -297,5 +311,40 @@ mod tests {
         let mut h = http::HeaderMap::new();
         h.insert("authorization", format!("Bearer {tok}").parse().unwrap());
         assert!(authz.verify(&h).is_none(), "wrong aud must fail closed");
+    }
+
+    #[test]
+    fn verify_rejects_missing_aud_when_audience_is_configured() {
+        // BCP 225 / RFC 8725bis: on a boundary that specified an audience, a
+        // token with NO aud is a substitution attempt from another service
+        // and must fail closed — not be admitted by the lenient-on-absence
+        // decode_with_key default. (`jwt::decode_with_key` accepts a missing
+        // aud; `MoqConnectAuthz` must override that here.)
+        let key = SigningKey::from_bytes(&[8u8; 32]);
+        let vk = key.verifying_key();
+        let authz =
+            MoqConnectAuthz::new(vk, resolver(&[("s", "t")])).with_expected_aud("moq.example");
+        // Token with no aud (the default from Claims::new).
+        let tok = mint(&key, "s", 60);
+        let mut h = http::HeaderMap::new();
+        h.insert("authorization", format!("Bearer {tok}").parse().unwrap());
+        assert!(
+            authz.verify(&h).is_none(),
+            "missing aud must fail closed when an audience is configured"
+        );
+    }
+
+    #[test]
+    fn verify_accepts_missing_aud_when_no_audience_configured() {
+        // If the operator did not set expected_aud, audience checking is off
+        // entirely — a token with no aud is admitted (subject to the other
+        // checks). This is the operator's explicit choice.
+        let key = SigningKey::from_bytes(&[9u8; 32]);
+        let vk = key.verifying_key();
+        let authz = MoqConnectAuthz::new(vk, resolver(&[("s", "t")]));
+        let tok = mint(&key, "s", 60); // no aud
+        let mut h = http::HeaderMap::new();
+        h.insert("authorization", format!("Bearer {tok}").parse().unwrap());
+        assert!(authz.verify(&h).is_some(), "no-aud token admitted when no audience configured");
     }
 }
