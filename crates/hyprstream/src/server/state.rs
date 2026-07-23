@@ -80,6 +80,46 @@ pub struct ServerState {
     pub browser_provisioning_rate_limiter: Arc<crate::server::middleware::RateLimiter>,
 }
 
+/// Security state shared by every authenticated HTTP resource face.
+///
+/// Keeping this separate from [`ServerState`] lets thin faces such as Xet use
+/// the exact OAI authentication and rate-limit chain without constructing
+/// inference clients they never call.
+#[derive(Clone)]
+pub struct ResourceAuthState {
+    pub verifying_key: Arc<VerifyingKey>,
+    pub published_jwt_verifying_keys: crate::auth::key_rotation::PublishedEd25519Keys,
+    pub composite_key_set: Arc<hyprstream_rpc::auth::CompositeKeySet>,
+    pub resource_url: String,
+    pub oauth_issuer_url: String,
+    pub federation_resolver: Arc<crate::auth::FederationKeyResolver>,
+    pub jti_blocklist: Arc<hyprstream_rpc::auth::InMemoryJtiBlocklist>,
+    pub dpop_jti_seen: Arc<TtlCache<String, ()>>,
+    pub rate_limiter: Arc<crate::server::middleware::RateLimiter>,
+}
+
+impl ResourceAuthState {
+    pub fn new(
+        verifying_key: VerifyingKey,
+        resource_url: String,
+        oauth_issuer_url: String,
+        federation_resolver: Arc<crate::auth::FederationKeyResolver>,
+        jti_blocklist: Arc<hyprstream_rpc::auth::InMemoryJtiBlocklist>,
+    ) -> Self {
+        Self {
+            verifying_key: Arc::new(verifying_key),
+            published_jwt_verifying_keys: crate::auth::key_rotation::global_ed25519_verifying_keys(),
+            composite_key_set: hyprstream_rpc::auth::global_composite_key_set(),
+            resource_url,
+            oauth_issuer_url,
+            federation_resolver,
+            jti_blocklist,
+            dpop_jti_seen: Arc::new(TtlCache::new(10_000, 64)),
+            rate_limiter: Arc::new(crate::server::middleware::RateLimiter::new(300, 60)),
+        }
+    }
+}
+
 /// Metrics collector
 pub struct Metrics {
     /// Total requests processed
@@ -107,6 +147,21 @@ impl Default for Metrics {
 }
 
 impl ServerState {
+    /// Return the narrow state consumed by the shared HTTP authentication core.
+    pub fn resource_auth_state(&self) -> ResourceAuthState {
+        ResourceAuthState {
+            verifying_key: Arc::clone(&self.verifying_key),
+            published_jwt_verifying_keys: Arc::clone(&self.published_jwt_verifying_keys),
+            composite_key_set: hyprstream_rpc::auth::global_composite_key_set(),
+            resource_url: self.resource_url.clone(),
+            oauth_issuer_url: self.oauth_issuer_url.clone(),
+            federation_resolver: Arc::clone(&self.federation_resolver),
+            jti_blocklist: Arc::clone(&self.jti_blocklist),
+            dpop_jti_seen: Arc::clone(&self.dpop_jti_seen),
+            rate_limiter: Arc::clone(&self.rate_limiter),
+        }
+    }
+
     /// Create a new server state with ZMQ clients
     ///
     /// This is the primary method for creating server state with ZMQ-based services.

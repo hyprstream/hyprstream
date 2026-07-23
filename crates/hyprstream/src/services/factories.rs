@@ -1174,7 +1174,7 @@ fn create_oai_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
 
 /// Factory for XetService (HuggingFace-XET CAS HTTP face, epic #654).
 ///
-/// Dual-stack HTTP service that speaks the HF-XET CAS wire protocol so a standard
+/// HTTP service that speaks the HF-XET CAS wire protocol so a standard
 /// xet-enabled git repo can point its CAS endpoint at hyprstream. It dials the
 /// `registry` service (reusing the authenticated `putBlob`/`getBlob` core) and
 /// holds no standing CAS write authority of its own. Reads come from the shared
@@ -1183,6 +1183,7 @@ fn create_oai_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
 fn create_xet_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>> {
     info!("Creating XetService");
 
+    use crate::server::state::ResourceAuthState;
     use crate::services::{XetService, XetState};
 
     let config = load_config();
@@ -1195,21 +1196,38 @@ fn create_xet_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
     let registry_client: RegistryClient =
         RegistryClient::from_resolver(sk.clone(), service_token("xet"))?;
 
+    // Reuse the same narrow authentication core as OAI without constructing an
+    // inference-oriented ServerState. The policy client is used by federated
+    // issuer admission and key resolution.
+    let policy_vk = hyprstream_service::global_trust_store()
+        .resolve_one("policy")
+        .ok_or_else(|| anyhow::anyhow!("trust store has no policy key"))?;
+    let policy_client =
+        PolicyClient::for_local_bootstrap(sk.clone(), policy_vk, service_token("xet"))?;
+    let federation_resolver = Arc::new(
+        crate::auth::FederationKeyResolver::new(&config.oauth.trusted_issuers)
+            .with_policy_client(Arc::new(policy_client)),
+    );
+    let jti_blocklist = SHARED_JTI_BLOCKLIST
+        .get()
+        .map(Arc::clone)
+        .context("PolicyService did not publish the shared JTI blocklist before Xet startup")?;
+    let auth = ResourceAuthState::new(
+        ctx.jwt_verifying_key(),
+        config.xet.resource_url(),
+        config.oauth.issuer_url(),
+        federation_resolver,
+        jti_blocklist,
+    );
+
     let state = XetState {
         // Reads share the same L1 CAS substrate the registry's getBlob uses (#812).
         store: crate::storage::CasSubstrate::from_env(),
         registry: Some(registry_client),
-        jwt_verifying_key: ctx.jwt_verifying_key(),
-        audience: config.xet.resource_url(),
+        auth,
     };
 
-    let xet_service = XetService::new(
-        config.xet.clone(),
-        config.tls.clone(),
-        state,
-        ctx.transport("xet", SocketKind::Rep),
-        ctx.verifying_key(),
-    );
+    let xet_service = XetService::new(config.xet.clone(), config.tls.clone(), state);
 
     Ok(Box::new(xet_service))
 }

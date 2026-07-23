@@ -620,19 +620,14 @@ fn default_oai_host() -> String { "0.0.0.0".to_owned() }
 fn default_oai_port() -> u16 { 6789 }
 fn default_oai_timeout() -> u64 { 300 }
 
-/// XetService configuration — dual-stack HuggingFace-XET CAS HTTP face.
+/// XetService configuration — HuggingFace-XET CAS HTTP face.
 ///
-/// When enabled, exposes the HF-XET CAS wire routes (`/get_xorb/{hash}/`,
+/// When listed in `[services] startup`, exposes the HF-XET CAS wire routes (`/get_xorb/{hash}/`,
 /// `/v1/reconstructions/{hash}`, `/v1/chunks/{key}`, `/v1/xorbs/{key}`,
 /// `/v1/shards`) so a standard xet-enabled git repo can point its CAS endpoint
 /// at hyprstream as an alternative XET backend to HuggingFace. See epic #654.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct XetConfig {
-    /// Whether the XetService is served. Disabled by default: this is a
-    /// foundation surface (most routes 501 pending interop verification).
-    #[serde(default)]
-    pub enabled: bool,
-
     /// Host address for the HTTP server.
     #[serde(default = "default_xet_host")]
     pub host: String,
@@ -658,7 +653,6 @@ pub struct XetConfig {
 impl Default for XetConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
             host: default_xet_host(),
             port: default_xet_port(),
             external_url: None,
