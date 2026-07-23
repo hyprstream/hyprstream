@@ -56,11 +56,18 @@ canonical-encoding, BLAKE3-512 hash-to-configured-DID, and hybrid-signature
 GATE. The DID document must have the configured `id` and name that exact
 `did:at9p` in `alsoKnownAs`; the verified capsule must reciprocally name the
 configured `did:web`. Only after both directions verify does startup accept the
-at9p identity as authoritative and extract the document's single Ed25519
-Multikey as the deployment CA plus its preferred typed Iroh/QUIC transport.
+at9p identity as authoritative.
+
+The deployment CA and Discovery reach are taken from the GATE-verified capsule,
+never from the `did:web` document. The CA is the capsule's primary hybrid
+subject key's Ed25519 half (`body.subject_keys[0]`), and reach is the capsule's
+`#ns` `NinePExport` service, dialed by its independent iroh `nodeId` or signed
+QUIC socket carrier. The document contributes only the reciprocal identifier
+vouch; any keys or services it publishes are advisory and are never installed
+as trust material.
 
 Capsule content only proves a content-bound reach claim, not that the endpoint
-is currently live. Startup therefore dials the document-derived Discovery
+is currently live. Startup therefore dials the capsule-derived Discovery
 transport and requires a successful signed `ping` before installing the
 process resolver. Fetched bytes, DNS, TLS, relays, and transport endpoints do
 not become trust decisions: identity remains pinned by the configured at9p
@@ -79,7 +86,7 @@ two public anchors.
 `registry-service.jwt` is a closed, one-hour-maximum deployment credential, not
 a generic JWT or access token. Let `D` be the RFC 7638 Ed25519 JWK thumbprint of
 the exact public key selected as the deployment CA (from
-`deployment-ca.ed25519` or the mutually verified DID document). Provisioning
+`deployment-ca.ed25519` or the GATE-verified capsule). Provisioning
 must use the following profile exactly:
 
 - The protected header contains only `alg`, `typ`, and `kid`, with values
