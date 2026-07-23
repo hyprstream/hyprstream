@@ -164,6 +164,10 @@ fn build_cli() -> ClapCommand {
         ClapCommand::new("pds")
             .about("Attach this host to its home personal data server")
             .subcommand(
+                ClapCommand::new("init-deployment-store")
+                    .about("Initialize the checkpoint store for an explicitly provisioned fresh deployment"),
+            )
+            .subcommand(
                 ClapCommand::new("join")
                     .visible_alias("attach")
                     .about("Authorize and attach this host to one home PDS")
@@ -1911,6 +1915,11 @@ fn main() -> Result<()> {
     // newly provisioned host before local services are running.
     if let Some(("pds", sub_m)) = matches.subcommand() {
         match sub_m.subcommand() {
+            Some(("init-deployment-store", _)) => {
+                hyprstream_discovery::initialize_deployment_checkpoint_store()?;
+                println!("initialized empty deployment checkpoint store");
+                return Ok(());
+            }
             Some(("join", join_m)) => {
                 let pds_url = join_m
                     .get_one::<String>("url")
@@ -1921,7 +1930,7 @@ fn main() -> Result<()> {
                     || hyprstream_core::cli::pds_handlers::handle_pds_join(&config, pds_url, scope),
                 );
             }
-            _ => anyhow::bail!("usage: hyprstream pds join <PDS_URL> [--scope <SCOPE>]"),
+            _ => anyhow::bail!("usage: hyprstream pds init-deployment-store | pds join <PDS_URL> [--scope <SCOPE>]"),
         }
     }
 
