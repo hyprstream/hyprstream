@@ -584,6 +584,21 @@ pub fn build_event_sig_message(topic: &str, payload: &[u8], timestamp: i64) -> V
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use rand::RngCore;
+
+    fn random_bytes<const N: usize>() -> [u8; N] {
+        let mut bytes = [0; N];
+        rand::rngs::OsRng.fill_bytes(&mut bytes);
+        bytes
+    }
+
+    fn distinct_random_bytes<const N: usize>(other: &[u8; N]) -> [u8; N] {
+        let mut bytes = random_bytes();
+        if &bytes == other {
+            bytes[0] ^= 1;
+        }
+        bytes
+    }
 
     #[test]
     fn test_wrap_unwrap_group_key_roundtrip() {
@@ -917,13 +932,13 @@ mod tests {
 
     #[test]
     fn session_scoped_keys_and_injective_nonces_prevent_pair_reuse() {
-        let epoch_secret = [0x11u8; 32];
-        let publisher_kid = [0x22u8; 32];
-        let session_a = [0x33u8; 16];
-        let session_b = [0x44u8; 16];
+        let epoch_secret = random_bytes();
+        let publisher_kid = random_bytes();
+        let session_a = random_bytes();
+        let session_b = distinct_random_bytes(&session_a);
         let key_a = derive_sender_track_key(&epoch_secret, &publisher_kid, "worker", &session_a);
         let key_b = derive_sender_track_key(&epoch_secret, &publisher_kid, "worker", &session_b);
-        let session = [7; 16];
+        let session = random_bytes();
         let nonce_1 = derive_event_nonce(&session, 1).unwrap();
         let nonce_2 = derive_event_nonce(&session, 2).unwrap();
 
@@ -937,9 +952,9 @@ mod tests {
 
     #[test]
     fn session_epoch_and_sequence_mutation_fail_aead_authentication() {
-        let epoch_secret = [0x51u8; 32];
-        let publisher_kid = [0x52u8; 32];
-        let session_id = [0x53u8; 16];
+        let epoch_secret = random_bytes();
+        let publisher_kid = random_bytes();
+        let session_id = random_bytes();
         let (tag, ciphertext, nonce, commitment) = encrypt_epoch_event(
             &epoch_secret,
             "worker",
