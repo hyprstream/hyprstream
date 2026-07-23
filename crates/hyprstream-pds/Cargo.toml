@@ -24,6 +24,7 @@ hyprstream-rpc = { path = "../hyprstream-rpc" }
 hyprstream-crypto = { path = "../hyprstream-crypto" }
 # Ed25519 signing/verifying keys for the at9p composite signature path.
 ed25519-dalek = { workspace = true }
+rustix = { version = "1.1.4", features = ["fs"] }
 blake3 = { workspace = true }
 # Non-poisoning Mutex for the in-memory duplicity watermark store (#886).
 parking_lot = { workspace = true }

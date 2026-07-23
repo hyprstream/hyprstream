@@ -1013,6 +1013,26 @@ mod tests {
     }
 
     #[test]
+    fn tampered_mldsa_component_cannot_downgrade_genesis_to_classical_only() {
+        let user = signer();
+        let unsigned = unsigned(
+            &user,
+            RecoveryKeyEnrollment::Declined,
+            HostKeyEnrollment::Absent,
+        );
+        let signature = sign_genesis(&unsigned, &user.ed, &user.pq).unwrap();
+        let mut tampered_pq = signature.mldsa65().to_vec();
+        tampered_pq[0] ^= 1;
+        let tampered =
+            DidOpSignature::from_components(signature.ed25519().to_vec(), tampered_pq).unwrap();
+
+        assert!(
+            GenesisDidOp::seal(unsigned, tampered).is_err(),
+            "genesis sealing must require a valid ML-DSA-65 signature as well as Ed25519"
+        );
+    }
+
+    #[test]
     fn duplicate_custody_keys_are_rejected() {
         let user = signer();
         let error = GenesisRotationKeys::new(

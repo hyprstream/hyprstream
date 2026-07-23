@@ -395,30 +395,36 @@ impl SealedHostedAccount {
 
     /// Persist this mint generation and return its public account record.
     ///
-    /// The bundle is consumed so callers cannot accidentally try to publish
-    /// the same secret-bearing generation to two account locations.
-    pub fn write_to(self, store: &DirectoryHostedAccountStore) -> Result<AccountRecord> {
-        store.write_new(&self)?;
-        Ok(self.record)
+    /// Retaining the bundle permits a retry after a crash or I/O error. The
+    /// sealed record fixes its label, so it cannot be redirected to another
+    /// account location.
+    pub fn write_to(&self, store: &DirectoryHostedAccountStore) -> Result<AccountRecord> {
+        store.write_new(self)?;
+        Ok(self.record.clone())
     }
 }
 
 /// Fail-closed filesystem persistence for newly minted hosted accounts.
 ///
-/// Each allocated label gets one directory beneath `root`. The directory is
-/// created exclusively and is never reused. Files are written in this order:
+/// Each allocated label gets one directory beneath `root`. Files are first
+/// written and synced in an unpublished private staging directory, then that
+/// complete directory is atomically published without replacement. Files are
+/// written in this order:
 ///
 /// 1. the generated `#atproto` private key;
 /// 2. the sealed genesis operation;
 /// 3. the public account record, **last**, as the publication marker.
 ///
-/// A crash before step 3 leaves no visible account record and the label
-/// directory remains reserved. A retry or duplicate mint cannot overwrite it.
+/// A crash before publication leaves no label directory. A crash after
+/// publication leaves the complete account. A retry removes only an invalid or
+/// incomplete legacy residue; it never replaces a complete account.
 /// C2 (#1168) owns later crash-atomic *rotation*; this writer only establishes
 /// the immutable first generation.
 #[derive(Clone, Debug)]
 pub struct DirectoryHostedAccountStore {
     root: PathBuf,
+    #[cfg(test)]
+    fault: Option<WriteFault>,
 }
 
 impl DirectoryHostedAccountStore {
@@ -426,7 +432,11 @@ impl DirectoryHostedAccountStore {
     ///
     /// There is intentionally no default path.
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
+        Self {
+            root: root.into(),
+            #[cfg(test)]
+            fault: None,
+        }
     }
 
     pub fn root(&self) -> &Path {
@@ -442,31 +452,272 @@ impl DirectoryHostedAccountStore {
         validate_sealed_bundle(account)?;
         ensure_private_directory(&self.root)?;
         let account_dir = self.root.join(account.record.name().label());
-        std::fs::create_dir(&account_dir).with_context(|| {
-            format!(
-                "failed to reserve hosted-account label directory {:?}",
-                account_dir
-            )
-        })?;
-        set_private_directory_permissions(&account_dir)?;
+        if complete_account_matches(&account_dir, account)? {
+            return Ok(());
+        }
+        remove_incomplete_account_directory(&account_dir)?;
 
-        write_new_file(
-            &account_dir.join(ATPROTO_SIGNING_KEY_FILE),
+        let staging_dir = self.new_staging_directory(account.record.name().label())?;
+        self.inject_fault(WriteFault::StagingDirectoryCreate)?;
+
+        self.write_new_file(
+            &staging_dir.join(ATPROTO_SIGNING_KEY_FILE),
             account.atproto_signing_key.to_bytes().as_slice(),
+            WriteFault::AtprotoFileCreate,
+            WriteFault::AtprotoFileWrite,
+            WriteFault::AtprotoFileSync,
         )?;
-        write_new_file(
-            &account_dir.join(GENESIS_DID_OP_FILE),
+        self.write_new_file(
+            &staging_dir.join(GENESIS_DID_OP_FILE),
             &account.genesis_bytes,
+            WriteFault::GenesisFileCreate,
+            WriteFault::GenesisFileWrite,
+            WriteFault::GenesisFileSync,
         )?;
-        // Publication marker: always last.
-        write_new_file(
-            &account_dir.join(ACCOUNT_RECORD_FILE),
+        self.write_new_file(
+            &staging_dir.join(ACCOUNT_RECORD_FILE),
             &account.record_bytes,
+            WriteFault::RecordFileCreate,
+            WriteFault::RecordFileWrite,
+            WriteFault::RecordFileSync,
         )?;
-        sync_directory(&account_dir)?;
+        sync_directory(&staging_dir)?;
+        self.inject_fault(WriteFault::StagingDirectorySync)?;
+
+        match rename_no_replace(&staging_dir, &account_dir) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                if complete_account_matches(&account_dir, account)? {
+                    return Ok(());
+                }
+                bail!(
+                    "hosted-account label directory {:?} was concurrently claimed by an incomplete account",
+                    account_dir
+                );
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "failed to atomically publish hosted-account label directory {:?}",
+                        account_dir
+                    )
+                });
+            }
+        }
+        self.inject_fault(WriteFault::Publish)?;
         sync_directory(&self.root)?;
+        self.inject_fault(WriteFault::RootDirectorySync)?;
         Ok(())
     }
+
+    fn new_staging_directory(&self, label: &str) -> Result<PathBuf> {
+        for attempt in 0_u32..128 {
+            let staging = self.root.join(format!(
+                ".{label}.mint-{}-{attempt}",
+                rand::random::<u128>()
+            ));
+            match std::fs::create_dir(&staging) {
+                Ok(()) => {
+                    set_private_directory_permissions(&staging)?;
+                    return Ok(staging);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!("failed to create hosted-account staging directory {staging:?}")
+                    });
+                }
+            }
+        }
+        bail!("could not allocate a unique hosted-account staging directory")
+    }
+
+    fn write_new_file(
+        &self,
+        path: &Path,
+        bytes: &[u8],
+        create_fault: WriteFault,
+        write_fault: WriteFault,
+        sync_fault: WriteFault,
+    ) -> Result<()> {
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        let mut file = options
+            .open(path)
+            .with_context(|| format!("failed to create hosted-account file {path:?}"))?;
+        self.inject_fault(create_fault)?;
+        file.write_all(bytes)
+            .with_context(|| format!("failed to write hosted-account file {path:?}"))?;
+        self.inject_fault(write_fault)?;
+        file.sync_all()
+            .with_context(|| format!("failed to sync hosted-account file {path:?}"))?;
+        self.inject_fault(sync_fault)
+    }
+
+    #[cfg(test)]
+    fn with_fault(root: impl Into<PathBuf>, fault: WriteFault) -> Self {
+        Self {
+            root: root.into(),
+            fault: Some(fault),
+        }
+    }
+
+    #[cfg(test)]
+    fn inject_fault(&self, point: WriteFault) -> Result<()> {
+        if self.fault == Some(point) {
+            bail!("injected crash after {point:?}")
+        }
+        Ok(())
+    }
+
+    #[cfg(not(test))]
+    fn inject_fault(&self, _point: WriteFault) -> Result<()> {
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WriteFault {
+    StagingDirectoryCreate,
+    AtprotoFileCreate,
+    AtprotoFileWrite,
+    AtprotoFileSync,
+    GenesisFileCreate,
+    GenesisFileWrite,
+    GenesisFileSync,
+    RecordFileCreate,
+    RecordFileWrite,
+    RecordFileSync,
+    StagingDirectorySync,
+    Publish,
+    RootDirectorySync,
+}
+
+#[cfg(test)]
+const WRITE_FAULTS: [WriteFault; 13] = [
+    WriteFault::StagingDirectoryCreate,
+    WriteFault::AtprotoFileCreate,
+    WriteFault::AtprotoFileWrite,
+    WriteFault::AtprotoFileSync,
+    WriteFault::GenesisFileCreate,
+    WriteFault::GenesisFileWrite,
+    WriteFault::GenesisFileSync,
+    WriteFault::RecordFileCreate,
+    WriteFault::RecordFileWrite,
+    WriteFault::RecordFileSync,
+    WriteFault::StagingDirectorySync,
+    WriteFault::Publish,
+    WriteFault::RootDirectorySync,
+];
+
+/// Return `true` only for a fully valid, byte-identical already-published
+/// account. Invalid or partial legacy directories are deliberately reported as
+/// incomplete so a mint retry can replace them through the no-replace publish
+/// transition; a valid different account is never removed or overwritten.
+fn complete_account_matches(path: &Path, expected: &SealedHostedAccount) -> Result<bool> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("failed to inspect hosted-account directory {path:?}"));
+        }
+    };
+    ensure!(
+        metadata.file_type().is_dir(),
+        "hosted-account label path {path:?} is not a directory"
+    );
+
+    let read = |name: &str| -> Result<Option<Vec<u8>>> {
+        let file = path.join(name);
+        match std::fs::read(&file) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => {
+                Err(error).with_context(|| format!("failed to read hosted-account file {file:?}"))
+            }
+        }
+    };
+    let (Some(record_bytes), Some(genesis_bytes), Some(secret_bytes)) = (
+        read(ACCOUNT_RECORD_FILE)?,
+        read(GENESIS_DID_OP_FILE)?,
+        read(ATPROTO_SIGNING_KEY_FILE)?,
+    ) else {
+        return Ok(false);
+    };
+
+    let Ok(record) = AccountRecord::from_dag_cbor(&record_bytes) else {
+        return Ok(false);
+    };
+    let Ok(genesis) = GenesisDidOp::from_dag_cbor(&genesis_bytes) else {
+        return Ok(false);
+    };
+    let Ok(secret) = AtprotoSigningKey::from_slice(&secret_bytes) else {
+        return Ok(false);
+    };
+    if record.genesis_op() != genesis.cid()?
+        || record.current_op() != record.genesis_op()
+        || record.doc_cid() != genesis.unsigned().doc_cid()
+        || record.atproto_verifying_key()?.to_encoded_point(true)
+            != secret.verifying_key().to_encoded_point(true)
+    {
+        return Ok(false);
+    }
+
+    ensure!(
+        record_bytes == expected.record_bytes
+            && genesis_bytes == expected.genesis_bytes
+            && secret_bytes == expected.atproto_signing_key.to_bytes().as_slice(),
+        "hosted-account label directory {path:?} already contains a different complete account"
+    );
+    Ok(true)
+}
+
+fn remove_incomplete_account_directory(path: &Path) -> Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            ensure!(
+                metadata.file_type().is_dir(),
+                "hosted-account label path {path:?} is not a directory"
+            );
+            std::fs::remove_dir_all(path).with_context(|| {
+                format!("failed to remove incomplete hosted-account directory {path:?}")
+            })?;
+            sync_directory(
+                path.parent()
+                    .ok_or_else(|| anyhow::anyhow!("hosted-account directory has no parent"))?,
+            )?;
+            Ok(())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error)
+            .with_context(|| format!("failed to inspect hosted-account directory {path:?}")),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn rename_no_replace(from: &Path, to: &Path) -> std::io::Result<()> {
+    rustix::fs::renameat_with(
+        rustix::fs::CWD,
+        from,
+        rustix::fs::CWD,
+        to,
+        rustix::fs::RenameFlags::NOREPLACE,
+    )?;
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn rename_no_replace(_from: &Path, _to: &Path) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "atomic no-replace directory publication requires Linux renameat2",
+    ))
 }
 
 fn validate_sealed_bundle(account: &SealedHostedAccount) -> Result<()> {
@@ -520,23 +771,6 @@ fn set_private_directory_permissions(path: &Path) -> Result<()> {
 #[cfg(not(unix))]
 fn set_private_directory_permissions(_path: &Path) -> Result<()> {
     Ok(())
-}
-
-fn write_new_file(path: &Path, bytes: &[u8]) -> Result<()> {
-    let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        options.mode(0o600);
-    }
-    let mut file = options
-        .open(path)
-        .with_context(|| format!("failed to create hosted-account file {path:?}"))?;
-    file.write_all(bytes)
-        .with_context(|| format!("failed to write hosted-account file {path:?}"))?;
-    file.sync_all()
-        .with_context(|| format!("failed to sync hosted-account file {path:?}"))
 }
 
 fn sync_directory(path: &Path) -> Result<()> {
@@ -756,6 +990,38 @@ mod tests {
                     & 0o777,
                 0o600
             );
+        }
+    }
+
+    #[test]
+    fn durable_writer_recovers_from_every_interrupted_boundary() {
+        let user = user_signer();
+        let pending = begin(&user)
+            .prepare_genesis(Cid::from_raw(b"did document"), GenesisRepoHead::EmptyRepo)
+            .unwrap();
+        let signature = sign_genesis(pending.unsigned_genesis(), &user.ed, &user.pq).unwrap();
+        let sealed = pending.seal(signature).unwrap();
+
+        for fault in WRITE_FAULTS {
+            let temporary = tempfile::tempdir().unwrap();
+            let root = temporary.path().join("accounts");
+            let interrupted = DirectoryHostedAccountStore::with_fault(&root, fault);
+            assert!(
+                interrupted.write_new(&sealed).is_err(),
+                "fault injection at {fault:?} must interrupt mint publication"
+            );
+
+            let final_directory = root.join(sealed.record().name().label());
+            if final_directory.exists() {
+                assert!(
+                    complete_account_matches(&final_directory, &sealed).unwrap(),
+                    "a crash at {fault:?} may publish only a complete account"
+                );
+            }
+
+            let recovery = DirectoryHostedAccountStore::new(&root);
+            recovery.write_new(&sealed).unwrap();
+            assert!(complete_account_matches(&final_directory, &sealed).unwrap());
         }
     }
 }
