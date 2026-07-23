@@ -49,6 +49,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use async_trait::async_trait;
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
@@ -58,7 +59,6 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
-use async_trait::async_trait;
 use futures::{SinkExt, StreamExt};
 use hyprstream_9p::{AttachAuthorizer, Translator};
 use hyprstream_rpc::transport::quinn_transport::{NinePWtHandler, NinePWtStream};
@@ -285,7 +285,11 @@ pub async fn ninep_ws(
     let mount = build_export_mount(&state, &subject);
     // `from_mount` wraps the Subject-scoped mount in a `MountBackend` and threads
     // `subject` onto every backend op — the same seam UDS/vsock use.
-    let translator = Arc::new(Translator::from_mount(mount, subject));
+    let translator = Arc::new(Translator::from_mount(
+        mount,
+        subject,
+        Arc::clone(&state.ninep_decider),
+    ));
 
     // No subprotocol negotiation: stock wanix connects with none.
     ws.on_upgrade(move |socket| serve_9p_websocket(socket, translator, PING_INTERVAL))
@@ -329,7 +333,9 @@ async fn verify_mount_ticket(
     }
     let local_issuers: &[&str] = &[&*state.oauth_issuer_url];
     let subject = claims.subject(local_issuers);
-    subject.validate().map_err(|_| "subject validation failed")?;
+    subject
+        .validate()
+        .map_err(|_| "subject validation failed")?;
     match subject.name() {
         Some(n) if !n.is_empty() => {}
         _ => return Err("empty subject"),
@@ -514,7 +520,9 @@ struct TicketAttachAuthorizer {
 impl AttachAuthorizer for TicketAttachAuthorizer {
     async fn authorize(&self, uname: &str) -> Result<Subject, MountError> {
         if uname.is_empty() {
-            return Err(MountError::PermissionDenied("missing mount ticket".to_owned()));
+            return Err(MountError::PermissionDenied(
+                "missing mount ticket".to_owned(),
+            ));
         }
         match verify_mount_ticket(&self.state, uname, PLANE_WEBTRANSPORT, ROOT_NAMESPACE_PATH).await
         {
@@ -557,9 +565,14 @@ impl NinePWtHandler for NinePWtExport {
         // current placeholder root — see its docs; the real #730 namespace is
         // scoped by the bound Subject once it lands).
         let mount = build_export_mount(&self.state, &Subject::anonymous());
-        let authorizer: Arc<dyn AttachAuthorizer> =
-            Arc::new(TicketAttachAuthorizer { state: self.state.clone() });
-        let translator = Arc::new(Translator::from_mount_authorized(mount, authorizer));
+        let authorizer: Arc<dyn AttachAuthorizer> = Arc::new(TicketAttachAuthorizer {
+            state: self.state.clone(),
+        });
+        let translator = Arc::new(Translator::from_mount_authorized(
+            mount,
+            authorizer,
+            Arc::clone(&self.state.ninep_decider),
+        ));
         if let Err(e) = translator.serve_connection(stream).await {
             debug!(error = %e, "9P WT serve loop ended with error");
         }
@@ -571,9 +584,9 @@ impl NinePWtHandler for NinePWtExport {
 /// call once at server startup where [`ServerState`] exists (see
 /// [`crate::server::create_app`]).
 pub fn register_ninep_wt_handler(state: ServerState) {
-    let installed = hyprstream_rpc::transport::quinn_transport::set_global_ninep_handler(
-        Arc::new(NinePWtExport::new(state)),
-    );
+    let installed = hyprstream_rpc::transport::quinn_transport::set_global_ninep_handler(Arc::new(
+        NinePWtExport::new(state),
+    ));
     if installed {
         info!("registered 9P-over-WebTransport handler (/9p QUIC path-mux, H1b)");
     }
@@ -586,6 +599,19 @@ mod tests {
     use axum::{routing::get, Router};
     use hyprstream_9p::msg::{self, Response as P9Response};
     use tokio_tungstenite::tungstenite::Message as WsMessage;
+
+    struct TransportTestDecider;
+
+    impl hyprstream_9p::AccessDecider for TransportTestDecider {
+        fn check(
+            &self,
+            _ctx: &hyprstream_rpc::auth::mac::SecurityContext,
+            _object: hyprstream_rpc::auth::mac::ObjectRef<'_>,
+            _action: hyprstream_9p::Action,
+        ) -> bool {
+            true
+        }
+    }
 
     /// Discovery doc round-trips and advertises the H1a contract.
     #[test]
@@ -614,14 +640,20 @@ mod tests {
         assert_eq!(ninep.protocol.as_deref(), Some("9P2000.L"));
 
         // The moq plane is advertised at its existing selector.
-        let moq = table.planes.get("moq").expect("moq plane must be advertised");
+        let moq = table
+            .planes
+            .get("moq")
+            .expect("moq plane must be advertised");
         assert_eq!(moq.path, hyprstream_rpc::dial::MOQ_PATH);
         assert_eq!(moq.transports, vec!["webtransport"]);
 
         // The document is valid JSON with the expected `planes` shape and
         // round-trips losslessly.
         let json = serde_json::to_value(&table).expect("table serializes to JSON");
-        assert!(json.get("planes").is_some(), "top-level `planes` key present");
+        assert!(
+            json.get("planes").is_some(),
+            "top-level `planes` key present"
+        );
         assert_eq!(json["planes"]["9p"]["path"], "/9p");
         assert_eq!(json["planes"]["9p"]["transports"][0], "ws");
         let round: WirePlaneTable =
@@ -632,7 +664,10 @@ mod tests {
         // export9p document's fields — deriving the entry guarantees no drift.
         let export9p = Export9pDiscovery::default();
         assert_eq!(ninep.path, export9p.endpoint);
-        assert_eq!(ninep.ticket_param.as_deref(), Some(export9p.ticket_param.as_str()));
+        assert_eq!(
+            ninep.ticket_param.as_deref(),
+            Some(export9p.ticket_param.as_str())
+        );
         assert_eq!(ninep.protocol.as_deref(), Some(export9p.protocol.as_str()));
 
         // The export9p contract itself is unchanged (still serializes with its
@@ -661,7 +696,11 @@ mod tests {
             let root = SyntheticNode::dir()
                 .with_child("hello.txt", SyntheticNode::file(b"hello ws".to_vec()));
             let mount: Arc<dyn Mount> = Arc::new(SyntheticMount::new(root));
-            let translator = Arc::new(Translator::from_mount(mount, Subject::new("test")));
+            let translator = Arc::new(Translator::from_mount(
+                mount,
+                Subject::new("test"),
+                Arc::new(TransportTestDecider),
+            ));
             ws.on_upgrade(move |s| serve_9p_websocket(s, translator, Duration::from_secs(10)))
         }
 

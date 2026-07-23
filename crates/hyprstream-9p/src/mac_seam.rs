@@ -101,6 +101,7 @@ pub use hyprstream_rpc::auth::mac::{ObjectLabelResolver, ObjectRef};
 /// deliberately not mediated.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Action {
+    Attach,
     Walk,
     Open,
     Read,
@@ -304,28 +305,31 @@ impl ObjectLabelResolver for DenyUnlabeledResolver {
     }
 }
 
-/// The policy decision point behind the mandatory token and IFC gates.
+/// Authorizes one operation against a subject's cached [`SecurityContext`] and
+/// exact walked object reference.
 ///
-/// `check` is called only after the monitor has resolved a non-optional
-/// object label, checked the attached token's operation/ceiling/TTL, and
-/// enforced `subject.ctx ⊒ object.label`. The concrete application
-/// implementation is a local AVC lookup (with a PDP miss); it must not perform
-/// UCAN chain validation or Casbin matching per operation.
+/// Resolution belongs to the concrete implementation in `hyprstream`, which
+/// owns the production content-truth label resolver and tamper-evident audit
+/// sink. Passing the object reference—not an optional caller-supplied
+/// label—keeps label resolution and auditing inside the authoritative PEP.
 pub trait AccessDecider: Send + Sync {
-    fn check(&self, ctx: &SecurityContext, object_label: &SecurityLabel, action: Action) -> bool;
+    fn check(&self, ctx: &SecurityContext, object: ObjectRef<'_>, action: Action) -> bool;
 }
 
-/// The fail-closed default policy monitor. It permits nothing.
+/// Fail-closed fallback for layers that cannot construct the production
+/// resolver-backed, audited decider.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct DenyAllDecider;
 
 impl AccessDecider for DenyAllDecider {
-    fn check(
-        &self,
-        _ctx: &SecurityContext,
-        _object_label: &SecurityLabel,
-        _action: Action,
-    ) -> bool {
+    fn check(&self, ctx: &SecurityContext, object: ObjectRef<'_>, action: Action) -> bool {
+        tracing::warn!(
+            target: "hyprstream.mac.audit",
+            ?object,
+            ?action,
+            clearance = ?ctx.clearance(),
+            "9P access denied: production MAC decider unavailable"
+        );
         false
     }
 }
@@ -389,8 +393,11 @@ impl ReferenceMonitor {
             return false;
         }
 
-        self.decider
-            .check(session.security_context(), &object_label, action)
+        self.decider.check(
+            session.security_context(),
+            ObjectRef::Path(&components),
+            action,
+        )
     }
 }
 
@@ -430,7 +437,7 @@ mod tests {
         fn check(
             &self,
             _ctx: &SecurityContext,
-            _object_label: &SecurityLabel,
+            _object: ObjectRef<'_>,
             _action: Action,
         ) -> bool {
             true

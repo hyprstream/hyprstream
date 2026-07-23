@@ -57,7 +57,7 @@
 pub mod audit;
 pub mod avc;
 // S4 (#570): the daemon-boot compile → sign → verify-load → install path that
-// finally populates `COMPILED_POLICY`. Dormant (no enforcement flip).
+// finally populates `COMPILED_POLICY`.
 pub mod bootload;
 pub mod compiled;
 pub mod compiler;
@@ -66,12 +66,12 @@ pub mod compiler;
 // sender-binding, consuming S1/S5/the compiler rather than re-implementing.
 pub mod exchange;
 // S1 activation (#567): production genesis CONTENT + enumerator + composite
-// ObjectLabelResolver + boot-time coverage gate. Dormant (Stage 0): builds the
-// coverage-gate evidence, flips no decider to enforcing.
+// ObjectLabelResolver + boot-time coverage gate consumed by the active 9P PEP.
 pub mod genesis;
 pub mod lattice;
 // #676: the production S3-scope ↔ S5-TE-rule vocabulary (injective + exact;
 // wildcards expand at compile time over a closed registry).
+pub mod pep;
 pub mod permission_map;
 pub mod te;
 
@@ -110,6 +110,7 @@ pub use genesis::{
     floor_label, genesis_lattice, CompositeObjectLabelResolver, GenesisGate, ManifestLabelSource,
     NamespaceEnumerator, NoManifests, SitePolicy,
 };
+pub use pep::NinePAccessDecider;
 // S4 (#570): the boot path that installs the verified `CompiledPolicy` at daemon
 // startup (dormant — makes the PDP inputs real without enabling enforcement).
 pub use bootload::{compile_sign_load_install, install_baseline_boot_policy, BootPolicyError};
@@ -305,7 +306,8 @@ mod enrollment_resolver_tests {
         // Enrollment table asserts PqHybrid for this DID; the resolver must
         // still floor the resulting SecurityContext at Classical (#698 Decision
         // D) — the table's own assurance component is not authoritative here.
-        let clearance = SecurityLabel::new(Level::Secret, Assurance::PqHybrid, CompartmentSet::EMPTY);
+        let clearance =
+            SecurityLabel::new(Level::Secret, Assurance::PqHybrid, CompartmentSet::EMPTY);
         let resolver =
             EnrollmentSubjectContextResolver::new(policy_with("did:key:actor", clearance));
 

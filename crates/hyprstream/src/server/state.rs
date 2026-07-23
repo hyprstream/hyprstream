@@ -1,7 +1,7 @@
 //! Server state management
 
-use crate::services::{RegistryClient, PolicyClient};
-use crate::services::generated::model_client::{ModelClient, LoadModelRequest};
+use crate::services::generated::model_client::{LoadModelRequest, ModelClient};
+use crate::services::{PolicyClient, RegistryClient};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use hyprstream_util::TtlCache;
 use std::collections::HashMap;
@@ -51,7 +51,8 @@ pub struct ServerState {
     pub published_jwt_verifying_keys: crate::auth::key_rotation::PublishedEd25519Keys,
 
     /// Context store for RAG/CAG (optional)
-    pub context_store: Option<Arc<ContextStore<hyprstream_metrics::storage::duckdb::DuckDbBackend>>>,
+    pub context_store:
+        Option<Arc<ContextStore<hyprstream_metrics::storage::duckdb::DuckDbBackend>>>,
 
     /// Cached resource URL for WWW-Authenticate headers (avoids per-request config reload)
     pub resource_url: String,
@@ -78,6 +79,9 @@ pub struct ServerState {
     /// Dedicated global limiter for public browser provisioning. This executes
     /// before checkpoint resolution and hybrid projection signing.
     pub browser_provisioning_rate_limiter: Arc<crate::server::middleware::RateLimiter>,
+
+    /// Mandatory resolver-backed, audited PEP shared by every 9P transport.
+    pub ninep_decider: Arc<dyn hyprstream_9p::AccessDecider>,
 }
 
 /// Security state shared by every authenticated HTTP resource face.
@@ -108,7 +112,8 @@ impl ResourceAuthState {
     ) -> Self {
         Self {
             verifying_key: Arc::new(verifying_key),
-            published_jwt_verifying_keys: crate::auth::key_rotation::global_ed25519_verifying_keys(),
+            published_jwt_verifying_keys: crate::auth::key_rotation::global_ed25519_verifying_keys(
+            ),
             composite_key_set: hyprstream_rpc::auth::global_composite_key_set(),
             resource_url,
             oauth_issuer_url,
@@ -178,6 +183,7 @@ impl ServerState {
         oauth_issuer_url: String,
         trusted_issuers: &HashMap<String, crate::config::TrustedIssuerConfig>,
         jti_blocklist: Arc<hyprstream_rpc::auth::InMemoryJtiBlocklist>,
+        ninep_decider: Arc<dyn hyprstream_9p::AccessDecider>,
     ) -> Result<Self, anyhow::Error> {
         let signing_key = Arc::new(signing_key);
         // Use the CA JWT verifying key (not the service's own key) so HTTP Bearer tokens
@@ -195,11 +201,14 @@ impl ServerState {
             tracing::info!("Preloading {} models", config.preload_models.len());
             for model_name in &config.preload_models {
                 tracing::info!("Preloading model: {}", model_name);
-                match model_client.load(&LoadModelRequest {
-                    model_ref: model_name.to_owned(),
-                    max_context: None,
-                    kv_quant: None,
-                }).await {
+                match model_client
+                    .load(&LoadModelRequest {
+                        model_ref: model_name.to_owned(),
+                        max_context: None,
+                        kv_quant: None,
+                    })
+                    .await
+                {
                     Ok(_) => tracing::info!("Preloaded: {}", model_name),
                     Err(e) => tracing::warn!("Failed to preload model '{}': {}", model_name, e),
                 }
@@ -214,7 +223,7 @@ impl ServerState {
         // trust decision applies to both clients and peers.
         let federation_resolver = Arc::new(
             crate::auth::FederationKeyResolver::new(trusted_issuers)
-                .with_policy_client(Arc::new(policy_client.clone()))
+                .with_policy_client(Arc::new(policy_client.clone())),
         );
 
         Ok(Self {
@@ -236,6 +245,7 @@ impl ServerState {
             browser_provisioning_rate_limiter: Arc::new(
                 crate::server::middleware::RateLimiter::new(60, 60),
             ),
+            ninep_decider,
         })
     }
 
@@ -269,9 +279,18 @@ impl ServerState {
         use hyprstream_metrics::storage::duckdb::DuckDbBackend;
         use hyprstream_metrics::StorageBackend;
 
-        let backend = Arc::new(DuckDbBackend::new(db_path.to_owned(), std::collections::HashMap::new(), None)?);
-        backend.init().await.map_err(|e| anyhow::anyhow!("Failed to init DuckDB: {}", e))?;
-        backend.create_table("context", &context_schema(embedding_dim)).await
+        let backend = Arc::new(DuckDbBackend::new(
+            db_path.to_owned(),
+            std::collections::HashMap::new(),
+            None,
+        )?);
+        backend
+            .init()
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to init DuckDB: {}", e))?;
+        backend
+            .create_table("context", &context_schema(embedding_dim))
+            .await
             .map_err(|e| anyhow::anyhow!("Failed to create context table: {}", e))?;
 
         let store = ContextStore::new(backend, "context", embedding_dim);
@@ -287,7 +306,9 @@ impl ServerState {
     }
 
     /// Get the context store if initialized
-    pub fn get_context_store(&self) -> Option<&Arc<ContextStore<hyprstream_metrics::storage::duckdb::DuckDbBackend>>> {
+    pub fn get_context_store(
+        &self,
+    ) -> Option<&Arc<ContextStore<hyprstream_metrics::storage::duckdb::DuckDbBackend>>> {
         self.context_store.as_ref()
     }
 }

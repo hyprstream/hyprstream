@@ -1152,23 +1152,49 @@ fn create_oai_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
     let oauth_issuer_url = config.oauth.issuer_url();
     let server_state = tokio::task::block_in_place(|| {
         let rt = tokio::runtime::Handle::current();
-        rt.block_on(ServerState::new(
-            config.server.clone(),
-            model_client,
-            policy_client,
-            registry_client,
-            sk.clone(),
-            ctx.jwt_verifying_key(),
-            resource_url,
-            oauth_issuer_url,
-            &config.oauth.trusted_issuers,
-            // Share the PolicyService-owned JTI blocklist so POST /oauth/revoke
-            // immediately invalidates tokens at the OAI resource server.
-            SHARED_JTI_BLOCKLIST
-                .get()
-                .map(Arc::clone)
-                .unwrap_or_else(|| Arc::new(hyprstream_rpc::auth::InMemoryJtiBlocklist::new())),
-        ))
+        rt.block_on(async {
+            let secrets_dir = crate::config::HyprConfig::resolve_secrets_dir()?;
+            let ml_dsa_store =
+                crate::auth::key_rotation::global_ml_dsa_key_store(&secrets_dir, &config.oauth);
+            let signer = crate::mac::audit::cose::OwnedCoseAuditSigner::new(
+                Arc::new(sk.clone()),
+                ml_dsa_store.active_key().await,
+                hyprstream_rpc::envelope::mandatory_envelope_policy(),
+            );
+            anyhow::ensure!(
+                signer.can_sign(),
+                "9P MAC PEP audit signer unavailable under mandatory Hybrid policy"
+            );
+            let audit_store = crate::mac::audit::WalAuditStore::open(
+                secrets_dir.join("mac-audit").join("ninep"),
+                signer,
+            )
+            .map_err(|error| anyhow::anyhow!("open 9P MAC audit store: {error}"))?;
+            let resolver = crate::mac::GenesisGate::production().into_resolver();
+            let ninep_decider: Arc<dyn hyprstream_9p::AccessDecider> = Arc::new(
+                crate::mac::NinePAccessDecider::new(Arc::new(resolver), Arc::new(audit_store)),
+            );
+
+            ServerState::new(
+                config.server.clone(),
+                model_client,
+                policy_client,
+                registry_client,
+                sk.clone(),
+                ctx.jwt_verifying_key(),
+                resource_url,
+                oauth_issuer_url,
+                &config.oauth.trusted_issuers,
+                // Share the PolicyService-owned JTI blocklist so POST /oauth/revoke
+                // immediately invalidates tokens at the OAI resource server.
+                SHARED_JTI_BLOCKLIST
+                    .get()
+                    .map(Arc::clone)
+                    .unwrap_or_else(|| Arc::new(hyprstream_rpc::auth::InMemoryJtiBlocklist::new())),
+                ninep_decider,
+            )
+            .await
+        })
     })
     .context("Failed to create server state")?;
 

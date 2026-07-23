@@ -98,11 +98,11 @@
 use crate::mac::avc::{Avc, TokenScope};
 use crate::mac::lattice::SecurityLabel;
 use crate::mac::te::{Action, Decision, ObjectCtx, ObjectType, SubjectCtx, SubjectType};
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use parking_lot::Mutex;
 use std::sync::Arc;
 use thiserror::Error;
 
@@ -218,6 +218,11 @@ pub enum DecisionReason {
     Permit,
     /// The MAC lattice floor denied (clearance does not dominate label).
     FloorDeny,
+    /// The PEP could not resolve a content-bound label for the object.
+    UnlabeledObject,
+    /// A write was denied because the system's IFC write direction is not yet
+    /// ratified. Writes fail closed until that policy decision is made.
+    WriteDirectionUndecided,
     /// The TE matrix had no allow (and no escalate) entry for the triple.
     TeMiss,
     /// The decision was `Escalate` (floor held, TE escalate-band hit).
@@ -261,6 +266,8 @@ impl DecisionReason {
         match self {
             DecisionReason::Permit => "permit",
             DecisionReason::FloorDeny => "floor_deny",
+            DecisionReason::UnlabeledObject => "unlabeled_object",
+            DecisionReason::WriteDirectionUndecided => "write_direction_undecided",
             DecisionReason::TeMiss => "te_miss",
             DecisionReason::Escalate => "escalate",
             DecisionReason::TokenGate => "token_gate",
@@ -335,7 +342,9 @@ pub enum AuditError {
     /// The signed checkpoint is ahead of the journal head: the journal tail was
     /// truncated since the last durable write. `journal_seq` is the journal's
     /// current head seq (`None` if the journal is empty/absent).
-    #[error("audit journal truncated: checkpoint at seq {checkpoint_seq}, journal head {journal_seq:?}")]
+    #[error(
+        "audit journal truncated: checkpoint at seq {checkpoint_seq}, journal head {journal_seq:?}"
+    )]
     Truncation {
         checkpoint_seq: u64,
         journal_seq: Option<u64>,
@@ -1552,8 +1561,7 @@ mod tests {
         let hash = rec.content_hash().expect("canonical encode + hash");
         let hex = hex::encode(hash);
         assert_eq!(
-            hex,
-            "e3ca6519bde2ebb9a60273bd30a8acfa13a299280aafeca6c438ea21f8282b30",
+            hex, "e3ca6519bde2ebb9a60273bd30a8acfa13a299280aafeca6c438ea21f8282b30",
             "Fu6 golden hash drifted — was the canonical CBOR encoding changed intentionally?"
         );
     }
@@ -1670,7 +1678,11 @@ mod tests {
         let met = subj(1, high());
         let delegator = subj(2, low());
         let d = audited.decide_delegated(met, Some(delegator), obj(1, low()), Action(1));
-        assert_eq!(d, Decision::Permit, "decision rests on the met subject alone");
+        assert_eq!(
+            d,
+            Decision::Permit,
+            "decision rests on the met subject alone"
+        );
 
         // A non-delegated decision on the same triple records no delegator.
         let d2 = audited.decide(subj(1, high()), obj(1, low()), Action(1));
@@ -1842,7 +1854,10 @@ mod tests {
                 }
             }
         }
-        assert!(cbor_start < last_line.len(), "journal line has a cbor field");
+        assert!(
+            cbor_start < last_line.len(),
+            "journal line has a cbor field"
+        );
         let orig = last_line[cbor_start];
         last_line[cbor_start] = if orig == b'A' { b'B' } else { b'A' };
         let tampered: Vec<u8> = lines
@@ -1871,7 +1886,7 @@ mod tests {
         let dir = tmp_dir("gap");
         let store = WalAuditStore::open(&dir, StubSigner { key: [4; 32] }).unwrap();
         let base = AuditRecord {
-            seq: 0, // ignored — the store assigns seq.
+            seq: 0,               // ignored — the store assigns seq.
             prev_hash: [0u8; 32], // ignored — the store assigns the chain link.
             ts_unix_nanos: 1,
             decision: Decision::Permit,
@@ -1990,7 +2005,13 @@ mod tests {
             .verify_journal(&StubVerifier { key: [8; 32] })
             .unwrap_err();
         assert!(
-            matches!(err, AuditError::Truncation { checkpoint_seq: 2, .. }),
+            matches!(
+                err,
+                AuditError::Truncation {
+                    checkpoint_seq: 2,
+                    ..
+                }
+            ),
             "verify_journal must detect the truncated tail, got {err:?}"
         );
     }

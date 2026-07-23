@@ -309,18 +309,19 @@ pub async fn inject_9p_socket(
     // (b) Bind the listener *now* (socket file exists on return), then spawn the
     // 9P serve loop in the background over that tenant's Subject-scoped Mount.
     let listener = UnixListener::bind(&socket_path).map_err(|e| {
-        WorkerError::SandboxCreationFailed(format!(
-            "bind 9P UDS at {}: {e}",
-            socket_path.display()
-        ))
+        WorkerError::SandboxCreationFailed(format!("bind 9P UDS at {}: {e}", socket_path.display()))
     })?;
     let sock_for_log = socket_path.clone();
     let task = tokio::spawn(async move {
         // `serve_uds` is PR-A's wire-faithful 9P2000.L server; it runs until the
         // socket errors/closes (or the task is aborted on teardown).
-        if let Err(e) = hyprstream_9p::Translator::from_mount(mount, subject)
-            .serve_uds(listener)
-            .await
+        if let Err(e) = hyprstream_9p::Translator::from_mount(
+            mount,
+            subject,
+            Arc::new(hyprstream_9p::DenyAllDecider),
+        )
+        .serve_uds(listener)
+        .await
         {
             warn!(socket = %sock_for_log.display(), error = %e, "9P workload server exited with error");
         }
@@ -358,12 +359,14 @@ pub async fn inject_9p_socket(
     // container, that socket appears on the host at `export_socket_path`, which
     // the host later dials via [`import_guest_namespace`].
     let host_export_dir = workload_dir.join(GUEST_EXPORT_DIR_NAME);
-    tokio::fs::create_dir_all(&host_export_dir).await.map_err(|e| {
-        WorkerError::SandboxCreationFailed(format!(
-            "create guest export dir {}: {e}",
-            host_export_dir.display()
-        ))
-    })?;
+    tokio::fs::create_dir_all(&host_export_dir)
+        .await
+        .map_err(|e| {
+            WorkerError::SandboxCreationFailed(format!(
+                "create guest export dir {}: {e}",
+                host_export_dir.display()
+            ))
+        })?;
     let export_socket_path = host_export_dir.join(GUEST_EXPORT_SOCKET_NAME);
     // Remove any stale export socket left by a crashed predecessor guest.
     if let Err(e) = tokio::fs::remove_file(&export_socket_path).await {
@@ -566,7 +569,10 @@ mod tests {
         std::env::remove_var(ENV_GUEST_BIN);
         let cfg = WanixGuestConfig::default();
         assert_eq!(cfg.guest_bin, PathBuf::from(DEFAULT_GUEST_BIN));
-        assert!(cfg.guest_bin.is_relative(), "default must not be an absolute hardcode");
+        assert!(
+            cfg.guest_bin.is_relative(),
+            "default must not be an absolute hardcode"
+        );
 
         std::env::set_var(ENV_GUEST_BIN, "/opt/custom/wanix-guest");
         let cfg = WanixGuestConfig::default();
@@ -580,24 +586,24 @@ mod tests {
         let cfg = WanixGuestConfig {
             guest_bin: PathBuf::from("/host/build/wanix-guest"),
         };
-        let inj = inject_9p_socket(
-            tenant_mount(),
-            Subject::anonymous(),
-            dir.path(),
-            &cfg,
-        )
-        .await
-        .unwrap();
+        let inj = inject_9p_socket(tenant_mount(), Subject::anonymous(), dir.path(), &cfg)
+            .await
+            .unwrap();
 
         // (a) socket exists on return (bound synchronously) — the bind-mount
         // source is ready before any sandbox start.
         let sock = dir.path().join(NINEP_SOCKET_NAME);
-        assert!(sock.exists(), "9P socket must exist immediately after inject");
+        assert!(
+            sock.exists(),
+            "9P socket must exist immediately after inject"
+        );
         assert_eq!(inj.server.socket_path(), sock.as_path());
 
         // (c) env points the guest at the in-container socket.
         assert_eq!(
-            inj.annotations.get(&format!("{ANN_ENV_PREFIX}{ENV_9P_SOCK}")).map(String::as_str),
+            inj.annotations
+                .get(&format!("{ANN_ENV_PREFIX}{ENV_9P_SOCK}"))
+                .map(String::as_str),
             Some(CTR_SOCK_PATH)
         );
         // socket bind: host abs path → container path, rw.
@@ -611,7 +617,9 @@ mod tests {
         );
         // guest binary bind uses the CONFIGURED host path (read-only).
         assert_eq!(
-            inj.annotations.get(&format!("{ANN_MOUNT_PREFIX}wanix-guest")).map(String::as_str),
+            inj.annotations
+                .get(&format!("{ANN_MOUNT_PREFIX}wanix-guest"))
+                .map(String::as_str),
             Some(format!("/host/build/wanix-guest:{CTR_GUEST_BIN_PATH}:ro").as_str())
         );
         // command runs the guest.
@@ -623,9 +631,13 @@ mod tests {
         // Direction B (#708 phase 2): shared export dir bound rw, export env set,
         // and the host-side export socket path exposed under the shared dir.
         let export_dir = dir.path().join(GUEST_EXPORT_DIR_NAME);
-        assert!(export_dir.is_dir(), "shared export dir must be created on inject");
+        assert!(
+            export_dir.is_dir(),
+            "shared export dir must be created on inject"
+        );
         assert_eq!(
-            inj.annotations.get(&format!("{ANN_MOUNT_PREFIX}wanix-export-dir")),
+            inj.annotations
+                .get(&format!("{ANN_MOUNT_PREFIX}wanix-export-dir")),
             Some(&format!("{}:{CTR_EXPORT_DIR}:rw", export_dir.display()))
         );
         assert_eq!(
@@ -651,9 +663,13 @@ mod tests {
         let sock = dir.path().join("guest-export.sock");
         let listener = UnixListener::bind(&sock).unwrap();
         let server = tokio::spawn(async move {
-            let _ = hyprstream_9p::Translator::from_mount(tenant_mount(), Subject::anonymous())
-                .serve_uds(listener)
-                .await;
+            let _ = hyprstream_9p::Translator::from_mount(
+                tenant_mount(),
+                Subject::anonymous(),
+                Arc::new(hyprstream_9p::DenyAllDecider),
+            )
+            .serve_uds(listener)
+            .await;
         });
 
         let mut host_ns = Namespace::new();
@@ -666,7 +682,10 @@ mod tests {
             .cat("/workers/t1/wanix/hello", &Subject::anonymous())
             .await
             .unwrap();
-        assert_eq!(data, b"hi\n", "host must read the guest's file over the imported 9P mount");
+        assert_eq!(
+            data, b"hi\n",
+            "host must read the guest's file over the imported 9P mount"
+        );
 
         imported.unmount(&mut host_ns);
         assert!(
@@ -692,8 +711,14 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(err.to_string().contains("could not import guest namespace"), "got: {err}");
-        assert!(host_ns.mount_prefixes().is_empty(), "nothing must be bound on failure");
+        assert!(
+            err.to_string().contains("could not import guest namespace"),
+            "got: {err}"
+        );
+        assert!(
+            host_ns.mount_prefixes().is_empty(),
+            "nothing must be bound on failure"
+        );
     }
 
     #[tokio::test]
@@ -753,7 +778,10 @@ mod tests {
         let sock = inj.server.socket_path().to_path_buf();
         assert!(sock.exists());
         drop(inj);
-        assert!(!sock.exists(), "socket must be removed when the server is dropped");
+        assert!(
+            !sock.exists(),
+            "socket must be removed when the server is dropped"
+        );
     }
 
     #[tokio::test]
@@ -769,7 +797,10 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(err.to_string().contains("cannot inject a 9P socket"), "got: {err}");
+        assert!(
+            err.to_string().contains("cannot inject a 9P socket"),
+            "got: {err}"
+        );
         // And no socket was created (fail-closed BEFORE any side effect).
         assert!(!dir.path().join(NINEP_SOCKET_NAME).exists());
     }

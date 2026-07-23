@@ -1993,9 +1993,8 @@ fn main() -> Result<()> {
                     // foreground (the mode that actually hosts services, incl.
                     // systemd ExecStart and standalone-spawned children),
                     // standalone, and the systemd/spawner dispatch below.
-                    // DORMANT — this only emits the activation coverage-gate
-                    // evidence (which nodes are labeled / would deny); it flips
-                    // no decider to enforcing (see `mac::genesis`).
+                    // Emit the coverage-gate evidence consumed by the active
+                    // 9P translator PEP (see `mac::genesis`).
                     hyprstream_core::mac::GenesisGate::production().log_report();
 
                     if foreground || standalone {
@@ -2406,10 +2405,8 @@ fn main() -> Result<()> {
                                     // `DenyUnlabeledResolver` to the real (#698)
                                     // `EnrollmentSubjectContextResolver`.
                                     //
-                                    // DORMANT: installing a compiled policy does NOT
-                                    // enable enforcement — the per-op deciders stay
-                                    // AllowAll (no PEP consults this PDP yet). It only
-                                    // makes the PDP inputs real.
+                                    // The 9P PEP is active and records the
+                                    // bootloaded policy as audit provenance.
                                     //
                                     // Fail-closed: the baseline is hybrid-signed
                                     // (EdDSA + ML-DSA-65) and verified with
@@ -2428,7 +2425,7 @@ fn main() -> Result<()> {
                                         ) {
                                             Ok((policy, true)) => tracing::info!(
                                                 "MAC S4: baseline compiled policy installed \
-                                                 (generation {}, DORMANT — enforcement not enabled)",
+                                                 (generation {}, 9P enforcement active)",
                                                 policy.generation
                                             ),
                                             // The seam is write-once: a policy was
