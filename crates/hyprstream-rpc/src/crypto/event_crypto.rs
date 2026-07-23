@@ -101,12 +101,16 @@ fn random_nonce() -> [u8; 12] {
 
 /// Build length-prefixed AAD for group key wrapping.
 ///
-/// Format: `u32_le(len(sub_hash)) || sub_hash || u32_le(len(prefix)) || prefix`
+/// Format: `u32_le(len(tenant)) || tenant || u32_le(len(sub_hash)) || sub_hash ||
+/// u32_le(len(prefix)) || prefix`
 ///
-/// Length prefixing prevents ambiguity where different sub_hash/prefix splits
-/// produce the same concatenated bytes.
-pub fn build_wrap_aad(sub_hash: &[u8; 32], prefix: &str) -> Vec<u8> {
-    let mut aad = Vec::with_capacity(8 + 32 + prefix.len());
+/// Length prefixing prevents ambiguity where different tenant/sub_hash/prefix
+/// splits produce the same concatenated bytes. Binding the tenant prevents a
+/// wrapped key for one tenant's event prefix from being replayed in another.
+pub fn build_wrap_aad(tenant: &str, sub_hash: &[u8; 32], prefix: &str) -> Vec<u8> {
+    let mut aad = Vec::with_capacity(12 + tenant.len() + 32 + prefix.len());
+    aad.extend_from_slice(&(tenant.len() as u32).to_le_bytes());
+    aad.extend_from_slice(tenant.as_bytes());
     aad.extend_from_slice(&(sub_hash.len() as u32).to_le_bytes());
     aad.extend_from_slice(sub_hash);
     aad.extend_from_slice(&(prefix.len() as u32).to_le_bytes());
@@ -224,16 +228,18 @@ pub fn derive_wrap_key(
 ///
 /// * `wrap_key` - 32-byte key derived from `derive_wrap_key()`
 /// * `group_key` - 32-byte group key to wrap
+/// * `tenant` - verified tenant/domain (bound via AAD)
 /// * `sub_hash` - 32-byte subscriber identity hash (bound via AAD)
 /// * `prefix` - Topic prefix string (bound via AAD)
 pub fn wrap_group_key(
     wrap_key: &[u8; 32],
     group_key: &[u8; 32],
+    tenant: &str,
     sub_hash: &[u8; 32],
     prefix: &str,
 ) -> Result<Vec<u8>, String> {
     let nonce = random_nonce();
-    let aad = build_wrap_aad(sub_hash, prefix);
+    let aad = build_wrap_aad(tenant, sub_hash, prefix);
     let ciphertext = aes_gcm_encrypt(wrap_key, &nonce, group_key, &aad)?;
 
     // Prepend nonce to ciphertext
@@ -252,11 +258,13 @@ pub fn wrap_group_key(
 ///
 /// * `wrap_key` - 32-byte key derived from `derive_wrap_key()`
 /// * `wrapped_blob` - Opaque blob from `wrap_group_key()`
+/// * `tenant` - verified tenant/domain (must match wrapping AAD)
 /// * `sub_hash` - 32-byte subscriber identity hash (must match wrapping AAD)
 /// * `prefix` - Topic prefix string (must match wrapping AAD)
 pub fn unwrap_group_key(
     wrap_key: &[u8; 32],
     wrapped_blob: &[u8],
+    tenant: &str,
     sub_hash: &[u8; 32],
     prefix: &str,
 ) -> Result<Zeroizing<[u8; 32]>, String> {
@@ -269,7 +277,7 @@ pub fn unwrap_group_key(
         .map_err(|_| "nonce extraction failed")?;
     let ciphertext = &wrapped_blob[12..];
 
-    let aad = build_wrap_aad(sub_hash, prefix);
+    let aad = build_wrap_aad(tenant, sub_hash, prefix);
     let plaintext = aes_gcm_decrypt(wrap_key, &nonce, ciphertext, &aad)?;
 
     if plaintext.len() != 32 {
@@ -438,10 +446,11 @@ mod tests {
         let wrap_key = [0x42u8; 32];
         let group_key = [0xABu8; 32];
         let sub_hash = [0x01u8; 32];
+        let tenant = "tenant-a";
         let prefix = "serve:model:qwen3";
 
-        let wrapped = wrap_group_key(&wrap_key, &group_key, &sub_hash, prefix).unwrap();
-        let unwrapped = unwrap_group_key(&wrap_key, &wrapped, &sub_hash, prefix).unwrap();
+        let wrapped = wrap_group_key(&wrap_key, &group_key, tenant, &sub_hash, prefix).unwrap();
+        let unwrapped = unwrap_group_key(&wrap_key, &wrapped, tenant, &sub_hash, prefix).unwrap();
 
         assert_eq!(&*unwrapped, &group_key);
     }
@@ -452,10 +461,11 @@ mod tests {
         let wrong_key = [0x99u8; 32];
         let group_key = [0xABu8; 32];
         let sub_hash = [0x01u8; 32];
+        let tenant = "tenant-a";
         let prefix = "serve:model:qwen3";
 
-        let wrapped = wrap_group_key(&wrap_key, &group_key, &sub_hash, prefix).unwrap();
-        let result = unwrap_group_key(&wrong_key, &wrapped, &sub_hash, prefix);
+        let wrapped = wrap_group_key(&wrap_key, &group_key, tenant, &sub_hash, prefix).unwrap();
+        let result = unwrap_group_key(&wrong_key, &wrapped, tenant, &sub_hash, prefix);
 
         assert!(result.is_err());
     }
@@ -466,8 +476,9 @@ mod tests {
         let group_key = [0xABu8; 32];
         let sub_hash = [0x01u8; 32];
 
-        let wrapped = wrap_group_key(&wrap_key, &group_key, &sub_hash, "prefix-a").unwrap();
-        let result = unwrap_group_key(&wrap_key, &wrapped, &sub_hash, "prefix-b");
+        let wrapped =
+            wrap_group_key(&wrap_key, &group_key, "tenant-a", &sub_hash, "prefix-a").unwrap();
+        let result = unwrap_group_key(&wrap_key, &wrapped, "tenant-a", &sub_hash, "prefix-b");
 
         assert!(
             result.is_err(),
@@ -481,10 +492,11 @@ mod tests {
         let group_key = [0xABu8; 32];
         let sub_hash_a = [0x01u8; 32];
         let sub_hash_b = [0x02u8; 32];
+        let tenant = "tenant-a";
         let prefix = "serve:model:qwen3";
 
-        let wrapped = wrap_group_key(&wrap_key, &group_key, &sub_hash_a, prefix).unwrap();
-        let result = unwrap_group_key(&wrap_key, &wrapped, &sub_hash_b, prefix);
+        let wrapped = wrap_group_key(&wrap_key, &group_key, tenant, &sub_hash_a, prefix).unwrap();
+        let result = unwrap_group_key(&wrap_key, &wrapped, tenant, &sub_hash_b, prefix);
 
         assert!(
             result.is_err(),
@@ -497,8 +509,24 @@ mod tests {
         let wrap_key = [0x42u8; 32];
         let sub_hash = [0x01u8; 32];
 
-        let result = unwrap_group_key(&wrap_key, &[0u8; 5], &sub_hash, "prefix");
+        let result = unwrap_group_key(&wrap_key, &[0u8; 5], "tenant-a", &sub_hash, "prefix");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_wrap_cross_tenant_fails() {
+        let wrap_key = [0x42u8; 32];
+        let group_key = [0xABu8; 32];
+        let sub_hash = [0x01u8; 32];
+        let prefix = "orders";
+
+        let wrapped = wrap_group_key(&wrap_key, &group_key, "tenant-a", &sub_hash, prefix).unwrap();
+        let result = unwrap_group_key(&wrap_key, &wrapped, "tenant-b", &sub_hash, prefix);
+
+        assert!(
+            result.is_err(),
+            "cross-tenant unwrap must fail due to AAD mismatch"
+        );
     }
 
     #[test]
@@ -661,14 +689,20 @@ mod tests {
         let hash_a = [0x01u8; 32];
         let hash_b = [0x02u8; 32];
 
-        let aad1 = build_wrap_aad(&hash_a, "prefix");
-        let aad2 = build_wrap_aad(&hash_b, "prefix");
+        let aad1 = build_wrap_aad("tenant-a", &hash_a, "prefix");
+        let aad2 = build_wrap_aad("tenant-a", &hash_b, "prefix");
 
         assert_ne!(aad1, aad2, "different sub_hash must produce different AAD");
 
         // Same inputs produce same AAD
-        let aad3 = build_wrap_aad(&hash_a, "prefix");
+        let aad3 = build_wrap_aad("tenant-a", &hash_a, "prefix");
         assert_eq!(aad1, aad3);
+
+        let tenant_b = build_wrap_aad("tenant-b", &hash_a, "prefix");
+        assert_ne!(
+            aad1, tenant_b,
+            "different tenants must produce different AAD"
+        );
     }
 
     #[test]

@@ -81,7 +81,10 @@ pub enum RekeyPolicy {
     /// Rotate immediately on revocation.
     Immediate,
     /// Scheduled with jitter for timing-attack resistance.
-    Jittered { interval: Duration, jitter: Duration },
+    Jittered {
+        interval: Duration,
+        jitter: Duration,
+    },
 }
 
 impl Default for RekeyPolicy {
@@ -291,6 +294,7 @@ impl BlindedMember {
         member_secret: &[u8; 32],
         publisher_pubkey: &[u8; 32],
         wrapped: &[u8],
+        tenant: &str,
         group_uri: &str,
         subject_did: &str,
     ) -> Result<Zeroizing<[u8; 32]>, String> {
@@ -300,7 +304,13 @@ impl BlindedMember {
         // Salt is XOR-symmetric over the two pubkeys; join derived with
         // (blinded_pubkey, publisher_ephemeral) — same two pubs here.
         let wrap_key = derive_wrap_key(&shared, &self.blinded_pubkey, publisher_pubkey);
-        unwrap_group_key(&wrap_key, wrapped, &keyed_subject_hash(subject_did), group_uri)
+        unwrap_group_key(
+            &wrap_key,
+            wrapped,
+            tenant,
+            &keyed_subject_hash(subject_did),
+            group_uri,
+        )
     }
 }
 
@@ -437,13 +447,12 @@ impl<R: MembershipResolver> GroupKeyRegistry<R> {
         let wrapped = wrap_group_key(
             &wrap_key,
             &state.key_state.current,
+            &group.group_uri,
             &keyed_subject_hash(subject_did),
             &group.group_uri,
         )?;
 
-        state
-            .members
-            .insert(subject_did.to_owned(), member_pubkey);
+        state.members.insert(subject_did.to_owned(), member_pubkey);
         Ok((
             wrapped,
             state.key_state.keyset_id.clone(),
@@ -575,9 +584,11 @@ mod tests {
 
     #[tokio::test]
     async fn deny_all_resolver_fails_closed() {
-        let registry =
-            GroupKeyRegistry::new(RekeyPolicy::Immediate, DenyAllResolver).unwrap();
-        registry.register_group(grp("at://did:web:a/g1")).await.unwrap();
+        let registry = GroupKeyRegistry::new(RekeyPolicy::Immediate, DenyAllResolver).unwrap();
+        registry
+            .register_group(grp("at://did:web:a/g1"))
+            .await
+            .unwrap();
         let result = registry
             .join(&grp("at://did:web:a/g1"), "did:web:member", [7u8; 32])
             .await;
@@ -586,8 +597,7 @@ mod tests {
 
     #[tokio::test]
     async fn join_then_unwrap_round_trips() {
-        let registry =
-            GroupKeyRegistry::new(RekeyPolicy::Immediate, AllowResolver).unwrap();
+        let registry = GroupKeyRegistry::new(RekeyPolicy::Immediate, AllowResolver).unwrap();
         let g = grp("at://did:web:a/g1");
         registry.register_group(g.clone()).await.unwrap();
 
@@ -603,12 +613,12 @@ mod tests {
         assert_eq!(epoch, 0);
 
         let shared =
-            crate::crypto::ristretto_dh_raw(&member_secret_bytes, &publisher_pubkey)
-                .expect("dh");
+            crate::crypto::ristretto_dh_raw(&member_secret_bytes, &publisher_pubkey).expect("dh");
         let member_wrap_key = derive_wrap_key(&shared, &publisher_pubkey, &member_pubkey);
         let unwrapped = unwrap_group_key(
             &member_wrap_key,
             &wrapped,
+            &g.group_uri,
             &keyed_subject_hash("did:web:member"),
             &g.group_uri,
         );
@@ -624,8 +634,7 @@ mod tests {
         // EV4: the subscriber presents a BLINDED pubkey to join; the publisher
         // DHs against the blinded key (blinding-agnostic) and never sees the
         // stable key. The subscriber unwraps via blinded_dh_raw.
-        let registry =
-            GroupKeyRegistry::new(RekeyPolicy::Immediate, AllowResolver).unwrap();
+        let registry = GroupKeyRegistry::new(RekeyPolicy::Immediate, AllowResolver).unwrap();
         let g = grp("at://did:web:a/g1");
         registry.register_group(g.clone()).await.unwrap();
 
@@ -651,6 +660,7 @@ mod tests {
                 &publisher_pubkey,
                 &wrapped,
                 &g.group_uri,
+                &g.group_uri,
                 "did:web:member",
             )
             .expect("blinded unwrap");
@@ -661,8 +671,7 @@ mod tests {
 
     #[tokio::test]
     async fn k_group_returns_current_key() {
-        let registry =
-            GroupKeyRegistry::new(RekeyPolicy::Immediate, AllowResolver).unwrap();
+        let registry = GroupKeyRegistry::new(RekeyPolicy::Immediate, AllowResolver).unwrap();
         let g = grp("at://did:web:a/g1");
         registry.register_group(g.clone()).await.unwrap();
         assert!(registry.k_group(&g).await.is_some());
@@ -671,16 +680,12 @@ mod tests {
 
     #[tokio::test]
     async fn rekey_rotates_to_fresh_random_key_and_old_key_unrecoverable() {
-        let registry =
-            GroupKeyRegistry::new(RekeyPolicy::Immediate, AllowResolver).unwrap();
+        let registry = GroupKeyRegistry::new(RekeyPolicy::Immediate, AllowResolver).unwrap();
         let g = grp("at://did:web:a/g1");
         registry.register_group(g.clone()).await.unwrap();
 
         let now = Instant::now();
-        registry
-            .begin_rekey(&g, "ks-2", now)
-            .await
-            .unwrap();
+        registry.begin_rekey(&g, "ks-2", now).await.unwrap();
         let promoted = registry.maybe_promote_pending(&g, now).await.unwrap();
         assert!(promoted, "effective_at already passed -> should promote");
 
@@ -696,15 +701,20 @@ mod tests {
 
     #[tokio::test]
     async fn rekey_not_yet_effective_does_not_promote() {
-        let registry =
-            GroupKeyRegistry::new(RekeyPolicy::Immediate, AllowResolver).unwrap();
+        let registry = GroupKeyRegistry::new(RekeyPolicy::Immediate, AllowResolver).unwrap();
         let g = grp("at://did:web:a/g1");
         registry.register_group(g.clone()).await.unwrap();
 
         let future = Instant::now() + Duration::from_secs(3600);
         registry.begin_rekey(&g, "ks-2", future).await.unwrap();
-        let promoted = registry.maybe_promote_pending(&g, Instant::now()).await.unwrap();
-        assert!(!promoted, "effective_at in the future -> must not promote yet");
+        let promoted = registry
+            .maybe_promote_pending(&g, Instant::now())
+            .await
+            .unwrap();
+        assert!(
+            !promoted,
+            "effective_at in the future -> must not promote yet"
+        );
 
         let (_, member3_pubkey) = crate::crypto::generate_ephemeral_keypair();
         let (_wrapped, keyset_id, epoch, _pub) = registry
@@ -717,8 +727,7 @@ mod tests {
 
     #[tokio::test]
     async fn duplicate_registration_rejected() {
-        let registry =
-            GroupKeyRegistry::new(RekeyPolicy::Immediate, AllowResolver).unwrap();
+        let registry = GroupKeyRegistry::new(RekeyPolicy::Immediate, AllowResolver).unwrap();
         let g = grp("at://did:web:a/g1");
         registry.register_group(g.clone()).await.unwrap();
         let second = registry.register_group(g).await;

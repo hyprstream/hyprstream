@@ -99,8 +99,8 @@ use crate::envelope::Subject;
 // stable. (Only the EventService-specific `EncryptedEvent` wire codec + the
 // `EventPublisher`/`EventSubscriber`/`KeyRing` types are defined in this module.)
 pub use crate::crypto::group_key::{
-    EncryptedEvent, MAX_KEY_LIFETIME, DEFAULT_ROTATION_INTERVAL, GRACE_PERIOD, RekeyPolicy,
-    RotationResult, WrappedKeyEntry,
+    EncryptedEvent, RekeyPolicy, RotationResult, WrappedKeyEntry, DEFAULT_ROTATION_INTERVAL,
+    GRACE_PERIOD, MAX_KEY_LIFETIME,
 };
 use crate::moq_event::{
     global_moq_event_origin, BackfillMode, MoqEventPublisher, MoqEventSubscriber,
@@ -287,6 +287,9 @@ struct PendingRekey {
 /// privacy mode is ZeroKnowledge/LimitedKnowledge; `Public`-mode prefixes
 /// carry no crypto state at all.
 struct PrefixCrypto {
+    /// Verified tenant/domain that owns this encrypted prefix. It is bound
+    /// into every wrapped group-key AAD so a blob cannot cross tenants.
+    tenant: String,
     key_state: GroupKeyState,
     /// Publisher's ephemeral Ristretto255 secret scalar bytes.
     ephemeral_secret: Zeroizing<[u8; 32]>,
@@ -378,7 +381,9 @@ impl PublisherIdentity {
     }
     /// A publisher with a verified DID (post-#446, or non-IPC paths).
     pub fn verified(did: impl Into<String>) -> Self {
-        Self { did: Some(did.into()) }
+        Self {
+            did: Some(did.into()),
+        }
     }
     /// Is a verified DID bound? (Confidential publish requires this.)
     pub fn is_verified(&self) -> bool {
@@ -523,9 +528,14 @@ impl EventPublisher {
     ///
     /// Returns the publisher's ephemeral pubkey for this prefix (used by
     /// subscribers' [`EventSubscriber::join_prefix`]).
-    pub async fn register_prefix(&self, prefix: &str) -> Result<[u8; 32], String> {
+    pub async fn register_prefix(&self, tenant: &str, prefix: &str) -> Result<[u8; 32], String> {
         if self.privacy_mode == EventPrivacy::Public {
             return Err("register_prefix is only valid on encrypted (ZK/LK) publishers".to_owned());
+        }
+        if tenant.is_empty() || tenant == "*" {
+            return Err(
+                "encrypted event prefixes require a verified non-wildcard tenant".to_owned(),
+            );
         }
         let origin = global_moq_event_origin().ok_or_else(|| {
             "moq event bus not initialized; start the event service first".to_owned()
@@ -539,6 +549,7 @@ impl EventPublisher {
         let ephemeral_pubkey = eph_public.to_bytes();
 
         let crypto = PrefixCrypto {
+            tenant: tenant.to_owned(),
             key_state: GroupKeyState {
                 current: group_key,
                 pending: None,
@@ -584,7 +595,7 @@ impl EventPublisher {
                 .map_err(|e| format!("DH failed: {e}"))?,
         );
         let wrap_key = derive_wrap_key(&shared_secret, subscriber_pubkey, &crypto.ephemeral_pubkey);
-        wrap_group_key(&wrap_key, group_key, &sub_hash, prefix)
+        wrap_group_key(&wrap_key, group_key, &crypto.tenant, &sub_hash, prefix)
     }
 
     /// Wrap the group key for multiple new subscribers. Returns
@@ -613,7 +624,13 @@ impl EventPublisher {
                     .map_err(|e| format!("DH failed: {e}"))?,
             );
             let wrap_key = derive_wrap_key(&shared_secret, sub_pubkey, &crypto.ephemeral_pubkey);
-            let wrapped = wrap_group_key(&wrap_key, &crypto.key_state.current, &sub_hash, prefix)?;
+            let wrapped = wrap_group_key(
+                &wrap_key,
+                &crypto.key_state.current,
+                &crypto.tenant,
+                &sub_hash,
+                prefix,
+            )?;
             crypto.subscribers.insert(sub_hash, *sub_pubkey);
             results.push((sub_hash, wrapped));
         }
@@ -771,7 +788,8 @@ impl EventPublisher {
                     .map_err(|e| format!("DH failed: {e}"))?,
             );
             let wrap_key = derive_wrap_key(&shared_secret, sub_pubkey, &new_ephemeral_pubkey);
-            let wrapped = wrap_group_key(&wrap_key, &new_group_key, sub_hash, prefix)?;
+            let wrapped =
+                wrap_group_key(&wrap_key, &new_group_key, &crypto.tenant, sub_hash, prefix)?;
             let mut routing_tag = [0u8; 16];
             rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut routing_tag);
             wrapped_keys.push(WrappedKeyEntry {
@@ -877,6 +895,9 @@ impl KeyRing {
 
 /// Per-joined-prefix subscriber state: ephemeral DH keypair + key ring.
 struct SubscriberPrefixState {
+    /// Verified tenant/domain used when the initial and rekey blobs were
+    /// wrapped. It must match the publisher-side AAD input.
+    tenant: String,
     ephemeral_secret: Zeroizing<[u8; 32]>,
     ephemeral_pubkey: [u8; 32],
     /// Publisher's Ristretto255 DH pubkey (for wrap-key re-derivation during
@@ -985,6 +1006,7 @@ impl EventSubscriber {
     /// `Public` mode.
     pub async fn join_prefix(
         &self,
+        tenant: &str,
         prefix: &str,
         publisher_dh_pubkey: &[u8; 32],
         wrapped_key_blob: &[u8],
@@ -999,9 +1021,15 @@ impl EventSubscriber {
         );
         let wrap_key = derive_wrap_key(&shared_secret, publisher_dh_pubkey, &eph_pubkey_bytes);
         let sub_hash: [u8; 32] = *blake3::hash(&eph_pubkey_bytes).as_bytes();
-        let group_key = unwrap_group_key(&wrap_key, wrapped_key_blob, &sub_hash, prefix)?;
+        if tenant.is_empty() || tenant == "*" {
+            return Err(
+                "encrypted event prefixes require a verified non-wildcard tenant".to_owned(),
+            );
+        }
+        let group_key = unwrap_group_key(&wrap_key, wrapped_key_blob, tenant, &sub_hash, prefix)?;
 
         let state = SubscriberPrefixState {
+            tenant: tenant.to_owned(),
             ephemeral_secret: Zeroizing::new(eph_secret_bytes),
             ephemeral_pubkey: eph_pubkey_bytes,
             publisher_dh_pubkey: *publisher_dh_pubkey,
@@ -1073,12 +1101,16 @@ impl EventSubscriber {
         new_publisher_dh_pubkey: &[u8; 32],
         effective_at: Instant,
     ) -> Result<(), String> {
-        let (eph_secret, eph_pubkey) = {
+        let (tenant, eph_secret, eph_pubkey) = {
             let prefixes = self.prefixes.read().await;
             let state = prefixes
                 .get(prefix)
                 .ok_or_else(|| format!("not joined to prefix: {prefix}"))?;
-            (state.ephemeral_secret.clone(), state.ephemeral_pubkey)
+            (
+                state.tenant.clone(),
+                state.ephemeral_secret.clone(),
+                state.ephemeral_pubkey,
+            )
         };
 
         let sub_hash: [u8; 32] = *blake3::hash(&eph_pubkey).as_bytes();
@@ -1089,7 +1121,9 @@ impl EventSubscriber {
         let wrap_key = derive_wrap_key(&shared_secret, new_publisher_dh_pubkey, &eph_pubkey);
 
         for wrapped_blob in wrapped_blobs {
-            if let Ok(new_key) = unwrap_group_key(&wrap_key, wrapped_blob, &sub_hash, prefix) {
+            if let Ok(new_key) =
+                unwrap_group_key(&wrap_key, wrapped_blob, &tenant, &sub_hash, prefix)
+            {
                 {
                     let mut prefixes = self.prefixes.write().await;
                     if let Some(state) = prefixes.get_mut(prefix) {
@@ -1349,7 +1383,9 @@ mod tests {
         // Either errors cleanly (no global origin) or succeeds (origin was
         // initialized by another test in this binary) — both are acceptable;
         // the assertion is just "no panic".
-        let _ = publisher.register_prefix("test-prefix").await;
+        let _ = publisher
+            .register_prefix("tenant-test", "test-prefix")
+            .await;
     }
 
     #[test]
@@ -1422,6 +1458,7 @@ mod tests {
         // which needs a global moq origin). The moq field is never reached —
         // the authz gate fires first — so a panicking placeholder is fine.
         let crypto = PrefixCrypto {
+            tenant: "tenant-test".to_owned(),
             key_state: GroupKeyState {
                 current: Zeroizing::new([0u8; 32]),
                 pending: None,
@@ -1448,8 +1485,7 @@ mod tests {
                 );
                 drop(prefixes);
                 let result = publisher.publish_raw("deny-test.e.e", b"p").await;
-                let err =
-                    result.expect_err("DenyAll must block encrypted publish");
+                let err = result.expect_err("DenyAll must block encrypted publish");
                 assert!(
                     err.to_string().contains("denied by event-plane authz"),
                     "expected authz denial, got: {err}"

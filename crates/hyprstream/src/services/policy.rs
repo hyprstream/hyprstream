@@ -42,12 +42,36 @@ use tracing::{debug, info, trace, warn};
 /// group keys or wrap keys. The publisher wraps directly against subscriber
 /// pubkeys via DH.
 struct EventPrefixState {
+    owner: String,
     publisher_pubkey: [u8; 32],
     schema: String,
     /// Subscriber ephemeral pubkeys, keyed by Blake3 hash of pubkey.
     subscriber_pubkeys: HashMap<[u8; 32], [u8; 32]>,
     /// Opaque wrapped key blobs deposited by the publisher, keyed by subscriber pubkey hash.
     wrapped_keys: HashMap<[u8; 32], Vec<u8>>,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct EventPrefixKey { tenant: String, prefix: String }
+impl EventPrefixKey {
+    fn new(tenant: String, prefix: &str) -> Self { Self { tenant, prefix: prefix.to_owned() } }
+}
+fn cross_tenant_prefix_shadow(a: &EventPrefixKey, b: &EventPrefixKey) -> bool {
+    a.tenant != b.tenant && a.prefix != b.prefix
+        && (a.prefix.starts_with(&b.prefix) || b.prefix.starts_with(&a.prefix))
+}
+#[derive(Debug, Eq, PartialEq)]
+enum EventPrefixRegistrationError { OwnedByAnotherSubject, CrossTenantShadow }
+fn validate_event_prefix_registration(
+    prefixes: &HashMap<EventPrefixKey, EventPrefixState>, key: &EventPrefixKey, owner: &str,
+) -> Result<(), EventPrefixRegistrationError> {
+    if prefixes.get(key).is_some_and(|state| state.owner != owner) {
+        return Err(EventPrefixRegistrationError::OwnedByAnotherSubject);
+    }
+    if prefixes.keys().any(|existing| cross_tenant_prefix_shadow(existing, key)) {
+        return Err(EventPrefixRegistrationError::CrossTenantShadow);
+    }
+    Ok(())
 }
 
 pub struct PolicyService {
@@ -72,7 +96,7 @@ pub struct PolicyService {
     transport: TransportConfig,
     /// Event prefix state for secure event transport (Phase 7).
     /// PolicyService is a blind relay — stores opaque wrapped blobs, never plaintext keys.
-    event_prefixes: RwLock<HashMap<String, EventPrefixState>>,
+    event_prefixes: RwLock<HashMap<EventPrefixKey, EventPrefixState>>,
     /// Shared JWT ID blocklist for access token revocation.
     jti_blocklist: Arc<hyprstream_rpc::auth::InMemoryJtiBlocklist>,
     /// ES256 (P-256) key rotation store for DPoP/atproto interop.
@@ -1137,6 +1161,8 @@ impl PolicyHandler for PolicyService {
         // Authorization: publish:events:{prefix}.*
         let scope = format!("publish:events:{}.*", data.prefix);
         self.authorize(ctx, &scope, "register").await?;
+        let key = EventPrefixKey::new(ctx.domain()?, &data.prefix);
+        let owner = ctx.subject().to_string();
 
         let mut pubkey = [0u8; 32];
         if data.publisher_ephemeral_pubkey.len() != 32 {
@@ -1149,7 +1175,13 @@ impl PolicyHandler for PolicyService {
         pubkey.copy_from_slice(&data.publisher_ephemeral_pubkey);
 
         let mut prefixes = self.event_prefixes.write().await;
-        prefixes.insert(data.prefix.clone(), EventPrefixState {
+        match validate_event_prefix_registration(&prefixes, &key, &owner) {
+            Ok(()) => {}
+            Err(EventPrefixRegistrationError::OwnedByAnotherSubject) => return Ok(PolicyResponseVariant::Error(ErrorInfo { message: format!("prefix '{}' is already registered by another subject in this tenant", data.prefix), code: "ALREADY_EXISTS".to_owned(), details: String::new() })),
+            Err(EventPrefixRegistrationError::CrossTenantShadow) => return Ok(PolicyResponseVariant::Error(ErrorInfo { message: format!("prefix '{}' conflicts with a cross-tenant prefix", data.prefix), code: "CONFLICT".to_owned(), details: String::new() })),
+        }
+        prefixes.insert(key, EventPrefixState {
+            owner,
             publisher_pubkey: pubkey,
             schema: data.schema.clone(),
             subscriber_pubkeys: HashMap::new(),
@@ -1180,6 +1212,7 @@ impl PolicyHandler for PolicyService {
         // Authorization: subscribe:events:{prefix}.*
         let scope = format!("subscribe:events:{}.*", data.prefix);
         self.authorize(ctx, &scope, "subscribe").await?;
+        let key = EventPrefixKey::new(ctx.domain()?, &data.prefix);
 
         let mut sub_pubkey = [0u8; 32];
         if data.subscriber_ephemeral_pubkey.len() != 32 {
@@ -1196,7 +1229,7 @@ impl PolicyHandler for PolicyService {
         hash_bytes.copy_from_slice(sub_hash.as_bytes());
 
         let mut prefixes = self.event_prefixes.write().await;
-        let state = match prefixes.get_mut(&data.prefix) {
+        let state = match prefixes.get_mut(&key) {
             Some(s) => s,
             None => return Ok(PolicyResponseVariant::Error(ErrorInfo {
                 message: format!("prefix '{}' not registered", data.prefix),
@@ -1236,9 +1269,10 @@ impl PolicyHandler for PolicyService {
         // Authorization: publish:events:{prefix}.*
         let scope = format!("publish:events:{}.*", data.prefix);
         self.authorize(ctx, &scope, "get_subscribers").await?;
+        let key = EventPrefixKey::new(ctx.domain()?, &data.prefix);
 
         let prefixes = self.event_prefixes.read().await;
-        let state = match prefixes.get(&data.prefix) {
+        let state = match prefixes.get(&key) {
             Some(s) => s,
             None => return Ok(PolicyResponseVariant::Error(ErrorInfo {
                 message: format!("prefix '{}' not registered", data.prefix),
@@ -1277,9 +1311,10 @@ impl PolicyHandler for PolicyService {
         // Authorization: publish:events:{prefix}.*
         let scope = format!("publish:events:{}.*", data.prefix);
         self.authorize(ctx, &scope, "deposit_keys").await?;
+        let key = EventPrefixKey::new(ctx.domain()?, &data.prefix);
 
         let mut prefixes = self.event_prefixes.write().await;
-        let state = match prefixes.get_mut(&data.prefix) {
+        let state = match prefixes.get_mut(&key) {
             Some(s) => s,
             None => return Ok(PolicyResponseVariant::Error(ErrorInfo {
                 message: format!("prefix '{}' not registered", data.prefix),
@@ -1620,7 +1655,6 @@ impl RequestService for PolicyService {
     }
 }
 
-
 // ============================================================================
 // Policy file watcher (hot-reload)
 // ============================================================================
@@ -1766,5 +1800,31 @@ mod tests {
                 "legitimate subject {subject:?} was rejected by the path-form guard",
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod event_prefix_registry_tests {
+    #![allow(clippy::unwrap_used)]
+    use super::*;
+
+    fn state(owner: &str, key: u8) -> EventPrefixState {
+        EventPrefixState { owner: owner.to_owned(), publisher_pubkey: [key; 32], schema: String::new(), subscriber_pubkeys: HashMap::new(), wrapped_keys: HashMap::new() }
+    }
+
+    #[test]
+    fn tenant_scoping_refuses_shadowing_and_takeover() {
+        let a = EventPrefixKey::new("tenant-a".to_owned(), "orders");
+        let b = EventPrefixKey::new("tenant-b".to_owned(), "orders");
+        let shadow = EventPrefixKey::new("tenant-b".to_owned(), "orders.created");
+        let mut prefixes = HashMap::new();
+        validate_event_prefix_registration(&prefixes, &a, "subject-a").unwrap();
+        prefixes.insert(a.clone(), state("subject-a", 0x0A));
+        validate_event_prefix_registration(&prefixes, &b, "subject-b").unwrap();
+        prefixes.insert(b.clone(), state("subject-b", 0x0B));
+        assert_eq!(prefixes[&a].publisher_pubkey, [0x0A; 32]);
+        assert_eq!(prefixes[&b].publisher_pubkey, [0x0B; 32]);
+        assert_eq!(validate_event_prefix_registration(&prefixes, &shadow, "subject-b"), Err(EventPrefixRegistrationError::CrossTenantShadow));
+        assert_eq!(validate_event_prefix_registration(&prefixes, &a, "subject-b"), Err(EventPrefixRegistrationError::OwnedByAnotherSubject));
     }
 }
