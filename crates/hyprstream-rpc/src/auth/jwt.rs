@@ -257,6 +257,36 @@ pub fn header_kid(token: &str) -> Result<Option<String>, JwtError> {
     Ok(header.get("kid").and_then(|v| v.as_str()).map(String::from))
 }
 
+/// The audience constraint applied while verifying a JWT.
+///
+/// A verifier must make its audience posture explicit. In particular, an
+/// absent configuration is not equivalent to an unchecked audience: legacy
+/// `Option<&str>` inputs are converted to [`Self::Missing`] and rejected.
+/// Callers that intentionally verify a token whose audience belongs to a
+/// different protocol (for example, an OIDC ID token) must state that choice
+/// with [`Self::ExplicitlyUnchecked`] and a reviewable reason.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AudienceExpectation<'a> {
+    /// Require an exact audience match (trailing slashes are normalized where
+    /// the JWT profile historically permits it).
+    Exact(&'a str),
+    /// Deliberately bypass audience verification for a protocol-specific
+    /// reason. This variant is intentionally noisy in call sites.
+    ExplicitlyUnchecked { reason: &'static str },
+    /// No expected audience was configured. Verification rejects this state.
+    ///
+    /// This exists solely so pre-existing `Option<&str>` callers fail closed
+    /// during migration; new callers should use [`Self::Exact`] or
+    /// [`Self::ExplicitlyUnchecked`].
+    Missing,
+}
+
+impl<'a> From<Option<&'a str>> for AudienceExpectation<'a> {
+    fn from(expected: Option<&'a str>) -> Self {
+        expected.map_or(Self::Missing, Self::Exact)
+    }
+}
+
 /// Errors from JWT operations
 #[derive(Error, Debug)]
 pub enum JwtError {
@@ -283,6 +313,9 @@ pub enum JwtError {
 
     #[error("Invalid audience")]
     InvalidAudience,
+
+    #[error("Expected audience is not configured")]
+    MissingExpectedAudience,
 
     #[error("Unsupported algorithm: {0}")]
     UnsupportedAlgorithm(String),
@@ -363,26 +396,47 @@ pub fn encode_id_token(claims: &super::IdTokenClaims, signing_key: &SigningKey) 
 /// For tokens from foreign issuers (federation), use [`decode_with_key`]
 /// with the key obtained from `FederationKeyResolver::get_key`.
 ///
-/// Uses strict audience validation: if `expected_aud` is `Some`, the token
-/// must have a matching `aud` claim (absent `aud` is rejected).
+/// Uses strict audience validation: [`AudienceExpectation::Exact`] requires a
+/// matching `aud` claim, while an absent configuration is rejected.
 pub fn decode(
     token: &str,
     verifying_key: &VerifyingKey,
     expected_aud: Option<&str>,
+) -> Result<Claims, JwtError> {
+    decode_with_expectation(token, verifying_key, expected_aud.into())
+}
+
+/// Decode a JWT with an explicit audience-validation posture.
+///
+/// New verification code should prefer this function over the legacy
+/// compatibility entry point above.
+pub fn decode_with_expectation(
+    token: &str,
+    verifying_key: &VerifyingKey,
+    expected_aud: AudienceExpectation<'_>,
 ) -> Result<Claims, JwtError> {
     decode_inner(token, verifying_key, expected_aud, false)
 }
 
 /// Decode a JWT using a caller-supplied verifying key (for multi-issuer support).
 ///
-/// Uses lenient audience validation: if `expected_aud` is `Some`, a wrong `aud`
-/// is rejected but an absent `aud` is accepted. This allows federated tokens
-/// from issuers that don't set `aud` while still rejecting cross-node replay
-/// attacks from issuers that do.
+/// Uses lenient audience validation: [`AudienceExpectation::Exact`] rejects a
+/// wrong `aud` but accepts an absent `aud` for federated issuers. An absent
+/// expectation is still rejected; an intentional bypass must use
+/// [`AudienceExpectation::ExplicitlyUnchecked`].
 pub fn decode_with_key(
     token: &str,
     verifying_key: &VerifyingKey,
     expected_aud: Option<&str>,
+) -> Result<Claims, JwtError> {
+    decode_with_key_expectation(token, verifying_key, expected_aud.into())
+}
+
+/// Decode a federated JWT with an explicit audience-validation posture.
+pub fn decode_with_key_expectation(
+    token: &str,
+    verifying_key: &VerifyingKey,
+    expected_aud: AudienceExpectation<'_>,
 ) -> Result<Claims, JwtError> {
     decode_inner(token, verifying_key, expected_aud, true)
 }
@@ -469,12 +523,12 @@ pub fn decode_with_federation_candidates(
 
 /// Internal decode implementation shared by `decode` and `decode_with_key`.
 ///
-/// `lenient_aud`: when true, accepts tokens with no `aud` claim even when
-/// `expected_aud` is `Some`. Wrong `aud` is always rejected.
+/// `lenient_aud`: when true, accepts tokens with no `aud` claim even with an
+/// exact expectation. Wrong audiences are always rejected.
 fn decode_inner(
     token: &str,
     verifying_key: &VerifyingKey,
-    expected_aud: Option<&str>,
+    expected_aud: AudienceExpectation<'_>,
     lenient_aud: bool,
 ) -> Result<Claims, JwtError> {
     // Split into parts
@@ -535,17 +589,31 @@ fn decode_inner(
         return Err(JwtError::NotYetValid);
     }
 
-    // Validate audience if expected (trailing-slash tolerant)
-    if let Some(expected) = expected_aud {
-        let expected_norm = expected.trim_end_matches('/');
-        match &claims.aud {
-            Some(aud) if aud.trim_end_matches('/') == expected_norm => {}
-            None if lenient_aud => {}
-            Some(_) | None => return Err(JwtError::InvalidAudience),
-        }
-    }
+    validate_audience(&claims, expected_aud, lenient_aud)?;
 
     Ok(claims)
+}
+
+fn validate_audience(
+    claims: &Claims,
+    expectation: AudienceExpectation<'_>,
+    lenient_absence: bool,
+) -> Result<(), JwtError> {
+    match expectation {
+        AudienceExpectation::Exact(expected) => {
+            let expected_norm = expected.trim_end_matches('/');
+            match &claims.aud {
+                Some(aud) if aud.trim_end_matches('/') == expected_norm => Ok(()),
+                None if lenient_absence => Ok(()),
+                Some(_) | None => Err(JwtError::InvalidAudience),
+            }
+        }
+        AudienceExpectation::ExplicitlyUnchecked { reason } => {
+            debug_assert!(!reason.is_empty(), "unchecked audience requires a reason");
+            Ok(())
+        }
+        AudienceExpectation::Missing => Err(JwtError::MissingExpectedAudience),
+    }
 }
 
 /// Decode a JWT without verifying the signature.
@@ -570,14 +638,13 @@ pub fn decode_unverified(token: &str) -> Result<Claims, JwtError> {
 
 /// Decode and verify a JWT signed with ML-DSA-65 (`alg: "ML-DSA-65"`).
 ///
-/// Uses lenient audience validation (same as `decode_with_key`): if
-/// `expected_aud` is `Some`, a wrong `aud` is rejected but an absent
-/// `aud` is accepted.
-pub fn decode_ml_dsa_65(
+/// Uses the same audience posture as [`decode_with_key`].
+pub fn decode_ml_dsa_65<'a>(
     token: &str,
     vk: &crate::crypto::pq::MlDsaVerifyingKey,
-    expected_aud: Option<&str>,
+    expected_aud: impl Into<AudienceExpectation<'a>>,
 ) -> Result<Claims, JwtError> {
+    let expected_aud = expected_aud.into();
     let parts: Vec<&str> = token.split('.').collect();
     if parts.len() != 3 {
         return Err(JwtError::InvalidFormat);
@@ -620,13 +687,7 @@ pub fn decode_ml_dsa_65(
         return Err(JwtError::NotYetValid);
     }
 
-    if let Some(expected) = expected_aud {
-        match &claims.aud {
-            Some(aud) if aud == expected => {}
-            None => {} // lenient: absent aud accepted
-            Some(_) => return Err(JwtError::InvalidAudience), // wrong aud rejected
-        }
-    }
+    validate_audience(&claims, expected_aud, true)?;
 
     Ok(claims)
 }
@@ -635,13 +696,14 @@ pub fn decode_ml_dsa_65(
 ///
 /// Per draft-ietf-jose-pq-composite-sigs, the signature is
 /// `ml_dsa_sig (3309 bytes) ∥ ed25519_sig (64 bytes)`.
-pub fn decode_composite(
+pub fn decode_composite<'a>(
     token: &str,
     ml_dsa_vk: &crate::crypto::pq::MlDsaVerifyingKey,
     ed25519_vk: &VerifyingKey,
-    expected_aud: Option<&str>,
+    expected_aud: impl Into<AudienceExpectation<'a>>,
     dispatch: &CompositeJwtDispatch,
 ) -> Result<Claims, JwtError> {
+    let expected_aud = expected_aud.into();
     let header = &dispatch.header;
     if header.alg != "ML-DSA-65-Ed25519" {
         return Err(JwtError::UnsupportedAlgorithm(header.alg.clone()));
@@ -702,12 +764,7 @@ pub fn decode_composite(
         return Err(JwtError::NotYetValid);
     }
 
-    if let Some(expected) = expected_aud {
-        match claims.aud.as_deref() {
-            Some(aud) if aud.trim_end_matches('/') == expected.trim_end_matches('/') => {}
-            _ => return Err(JwtError::InvalidAudience),
-        }
-    }
+    validate_audience(&claims, expected_aud, false)?;
 
     Ok(claims)
 }
@@ -767,7 +824,15 @@ mod tests {
         let dispatch = parse_composite_dispatch(&token, &["at+jwt"]).unwrap();
         let separately_valid = composite_token_with_keys("wit+jwt", &pq_sk, &pq, &ed_sk);
         assert!(matches!(
-            decode_composite(&separately_valid, &pq, &ed, None, &dispatch),
+            decode_composite(
+                &separately_valid,
+                &pq,
+                &ed,
+                AudienceExpectation::ExplicitlyUnchecked {
+                    reason: "the test exercises signature/header binding, not audience",
+                },
+                &dispatch,
+            ),
             Err(JwtError::InvalidSignature)
         ));
     }
@@ -810,14 +875,26 @@ mod tests {
         let token = encode(&claims, &key_a);
 
         // decode_with_key should accept the correct key
-        let decoded = decode_with_key(&token, &vk_a, None)
-            .expect("decode_with_key with correct key must succeed");
+        let decoded = decode_with_key_expectation(
+            &token,
+            &vk_a,
+            AudienceExpectation::ExplicitlyUnchecked {
+                reason: "the test exercises multi-issuer key selection, not audience",
+            },
+        )
+        .expect("decode_with_key with correct key must succeed");
         assert_eq!(decoded.iss, "https://node-a");
         assert_eq!(decoded.sub, "alice");
 
         // decode_with_key must reject the wrong key
         let vk_b = key_b.verifying_key();
-        let result = decode_with_key(&token, &vk_b, None);
+        let result = decode_with_key_expectation(
+            &token,
+            &vk_b,
+            AudienceExpectation::ExplicitlyUnchecked {
+                reason: "the test exercises wrong-key rejection, not audience",
+            },
+        );
         assert!(
             matches!(result, Err(JwtError::InvalidSignature)),
             "wrong key must yield InvalidSignature"
@@ -989,8 +1066,11 @@ mod tests {
         let claims = Claims::new("carol".to_owned(), 0, 9_999_999_999);
         let token = encode(&claims, &key);
 
-        let via_decode = decode(&token, &vk, None).unwrap();
-        let via_decode_with_key = decode_with_key(&token, &vk, None).unwrap();
+        let expectation = AudienceExpectation::ExplicitlyUnchecked {
+            reason: "the test compares decoder signature and lifetime behavior",
+        };
+        let via_decode = decode_with_expectation(&token, &vk, expectation).unwrap();
+        let via_decode_with_key = decode_with_key_expectation(&token, &vk, expectation).unwrap();
         assert_eq!(via_decode.sub, via_decode_with_key.sub);
         assert_eq!(via_decode.exp, via_decode_with_key.exp);
     }
@@ -1003,7 +1083,11 @@ mod tests {
         let claims = Claims::new("dave".to_owned(), 0, 9_999_999_999);
         let token = encode(&claims, &key);
 
-        let result = decode(&token, &vk, Some("http://localhost:6789"));
+        let result = decode_with_expectation(
+            &token,
+            &vk,
+            AudienceExpectation::Exact("http://localhost:6789"),
+        );
         assert!(
             matches!(result, Err(JwtError::InvalidAudience)),
             "strict mode must reject absent aud"
@@ -1020,8 +1104,12 @@ mod tests {
         let token = encode(&claims, &key);
 
         // Lenient mode: absent aud is accepted
-        decode_with_key(&token, &vk, Some("http://localhost:6789"))
-            .expect("lenient mode must accept absent aud");
+        decode_with_key_expectation(
+            &token,
+            &vk,
+            AudienceExpectation::Exact("http://localhost:6789"),
+        )
+        .expect("lenient mode must accept absent aud");
     }
 
     #[test]
@@ -1034,11 +1122,24 @@ mod tests {
             .with_audience(Some("https://node-b".to_owned()));
         let token = encode(&claims, &key);
 
-        let result = decode_with_key(&token, &vk, Some("https://node-c"));
+        let result = decode_with_key_expectation(
+            &token,
+            &vk,
+            AudienceExpectation::Exact("https://node-c"),
+        );
         assert!(
             matches!(result, Err(JwtError::InvalidAudience)),
             "lenient mode must reject wrong aud"
         );
+    }
+
+    #[test]
+    fn absent_expected_audience_fails_closed() {
+        let key = make_key(0x33);
+        let token = encode(&Claims::new("alice".to_owned(), 0, 9_999_999_999), &key);
+
+        let result = decode(&token, &key.verifying_key(), None);
+        assert!(matches!(result, Err(JwtError::MissingExpectedAudience)));
     }
 
     #[test]

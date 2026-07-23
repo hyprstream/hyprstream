@@ -169,6 +169,29 @@ fn now_epoch_secs() -> u64 {
         .as_secs()
 }
 
+/// Collapse a policy decision transport failure to denial.
+///
+/// Authorization is a security expectation: an unavailable policy service
+/// cannot be interpreted as an affirmative grant.
+fn policy_result_or_deny<
+    E: std::fmt::Display,
+    S: std::fmt::Display,
+    R: std::fmt::Display,
+>(
+    result: std::result::Result<bool, E>,
+    subject: S,
+    resource: R,
+    operation: &str,
+) -> bool {
+    result.unwrap_or_else(|error| {
+        warn!(
+            "Policy check RPC error: sub={} obj={} act={} err={} - denying access",
+            subject, resource, operation, error
+        );
+        false
+    })
+}
+
 /// Build a Qid from filesystem metadata.
 ///
 /// Advisory identity hint only — see the qid-soundness invariant on
@@ -1722,15 +1745,19 @@ impl RegistryHandler for RegistryService {
         // Pass the operation string as-is to the policy check rather than
         // round-tripping through Operation enum (which maps "query" → "query.status").
         let subject = ctx.subject();
-        let allowed = self.policy_client.check(&PolicyCheck {
-            subject: subject.to_string(),
-            domain: "*".to_owned(),
-            resource: resource.to_owned(),
-            operation: operation.to_owned(),
-        }).await.unwrap_or_else(|e| {
-            warn!("Policy check RPC error: sub={} obj={} act={} err={} - denying access", subject, resource, operation, e);
-            false
-        });
+        let allowed = policy_result_or_deny(
+            self.policy_client
+                .check(&PolicyCheck {
+                    subject: subject.to_string(),
+                    domain: "*".to_owned(),
+                    resource: resource.to_owned(),
+                    operation: operation.to_owned(),
+                })
+                .await,
+            &subject,
+            resource,
+            operation,
+        );
         if allowed {
             Ok(())
         } else {
@@ -1753,10 +1780,19 @@ impl RegistryHandler for RegistryService {
 
             // Policy gate: only include repos the caller has at least query access to
             let resource = format!("model:{}", name);
-            let permitted = self.policy_client
-                .check(&PolicyCheck { subject: subject.clone(), domain: "*".to_owned(), resource: resource.clone(), operation: "query".to_owned() })
-                .await
-                .unwrap_or(true); // default allow if policy service unavailable
+            let permitted = policy_result_or_deny(
+                self.policy_client
+                    .check(&PolicyCheck {
+                        subject: subject.clone(),
+                        domain: "*".to_owned(),
+                        resource: resource.clone(),
+                        operation: "query".to_owned(),
+                    })
+                    .await,
+                &subject,
+                &resource,
+                "query",
+            );
             if !permitted { continue; }
 
             // Collect worktrees with capabilities (holds registry read lock internally)
@@ -3439,6 +3475,17 @@ mod tests {
     use hyprstream_rpc::crypto::generate_signing_keypair;
     use hyprstream_service::ServiceManager;
     use tempfile::TempDir;
+
+    #[test]
+    fn policy_rpc_failure_denies_repository_listing() {
+        let allowed = policy_result_or_deny(
+            Err(anyhow::anyhow!("policy service unavailable")),
+            "alice",
+            "model:private-repo",
+            "query",
+        );
+        assert!(!allowed, "policy transport failure must not disclose a repository");
+    }
 
     struct At9pTestSigner {
         ed: ed25519_dalek::SigningKey,

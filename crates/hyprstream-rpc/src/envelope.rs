@@ -3126,8 +3126,14 @@ mod tests {
             .with_issuer("https://node-a".to_owned());
         let token = jwt::encode(&claims, &key_a);
 
-        let decoded = jwt::decode_with_key(&token, &vk_a, None)
-            .expect("federated token must verify with issuer key");
+        let decoded = jwt::decode_with_key_expectation(
+            &token,
+            &vk_a,
+            crate::auth::AudienceExpectation::ExplicitlyUnchecked {
+                reason: "the subject test exercises issuer namespacing, not audience",
+            },
+        )
+        .expect("federated token must verify with issuer key");
         assert_eq!(decoded.iss, "https://node-a");
         assert_eq!(decoded.sub, "alice");
 

@@ -665,8 +665,9 @@ pub trait RequestService: 'static {
 
     /// Expected audience (resource URL) for JWT validation.
     ///
-    /// When `Some`, `verify_claims()` rejects tokens whose `aud` claim doesn't match.
-    /// Override this on services that should bind tokens to a specific resource.
+    /// `verify_claims()` rejects a presented JWT when this is `None`; absence
+    /// is a missing security expectation, never an unchecked audience. Override
+    /// this on every service that enables [`Self::jwt_key_source`].
     fn expected_audience(&self) -> Option<&str> {
         None
     }
@@ -1257,6 +1258,9 @@ mod empty_iss_gate_tests {
         fn jwt_key_source(&self) -> Option<std::sync::Arc<dyn crate::auth::JwtKeySource>> {
             Some(self.key_source.clone())
         }
+        fn expected_audience(&self) -> Option<&str> {
+            Some("https://mock")
+        }
         fn require_cnf_binding(&self) -> bool {
             false
         }
@@ -1312,7 +1316,8 @@ mod empty_iss_gate_tests {
     fn empty_iss_token(ca: &SigningKey) -> String {
         // iss defaults to empty in Claims::new — the local bare-sub token.
         let now = chrono::Utc::now().timestamp();
-        let claims = Claims::new("alice".to_owned(), now, now + 3600);
+        let claims = Claims::new("alice".to_owned(), now, now + 3600)
+            .with_audience(Some("https://mock".to_owned()));
         assert!(claims.iss.is_empty(), "test token must have empty iss");
         crate::auth::jwt::encode(&claims, ca)
     }
