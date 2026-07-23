@@ -9,6 +9,7 @@
 
 use std::sync::Arc;
 
+use hyprstream_rpc::auth::JtiBlocklist as _;
 use subtle::ConstantTimeEq;
 use axum::{
     extract::{Request, State},
@@ -22,7 +23,8 @@ pub use crate::server::middleware::AuthenticatedUser;
 
 /// Require a valid Bearer or DPoP token on the request.
 ///
-/// Validates the Ed25519-signed JWT against the server's verifying key.
+/// Routes JWT verification by the protected `alg` header, then validates the
+/// exact OAuth-self audience and one of this node's exact profile issuers.
 /// When `Authorization: DPoP` is used, also verifies the `DPoP` proof header and
 /// checks that `cnf.jkt` in the token matches the proof key's thumbprint.
 /// Inserts `AuthenticatedUser` into request extensions on success.
@@ -71,15 +73,7 @@ pub async fn require_bearer_token(
         None
     };
 
-    let vk = match ed25519_dalek::VerifyingKey::from_bytes(&state.verifying_key_bytes) {
-        Ok(k) => k,
-        Err(_) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, "server configuration error")
-                .into_response();
-        }
-    };
-
-    let claims = match hyprstream_rpc::auth::jwt::decode(&token, &vk, None) {
+    let claims = match validate_oauth_access_token(&state, &token).await {
         Ok(c) => c,
         Err(_) => {
             return (
@@ -194,4 +188,78 @@ pub async fn require_bearer_token(
     });
 
     next.run(request).await
+}
+
+/// Verify a JWT access token against the OAuth server's complete local signing
+/// surface. PolicyService mints composite tokens, while classical EdDSA remains
+/// accepted for explicitly classical deployments and legacy rotation slots.
+///
+/// Audience and issuer are mandatory here. The canonical origin is the OAuth
+/// server's RFC 9728 resource identifier, while the configured issuer remains
+/// an accepted local audience alias for default-audience tokens minted before
+/// the resource indicator is known. No other audience is accepted.
+pub(super) async fn validate_oauth_access_token(
+    state: &OAuthState,
+    token: &str,
+) -> Result<hyprstream_rpc::auth::Claims, &'static str> {
+    let header = hyprstream_rpc::auth::parse_protected_header(token)
+        .map_err(|_| "JWT header invalid")?;
+    if !hyprstream_rpc::auth::is_rfc9068_access_token_type(&header.typ) {
+        return Err("JWT type invalid");
+    }
+
+    let canonical_audience = state.atproto_issuer_url();
+    let unverified = hyprstream_rpc::auth::decode_unverified(token)
+        .map_err(|_| "JWT claims invalid")?;
+    let expected_audience = match unverified.aud.as_deref() {
+        Some(audience)
+            if audience == canonical_audience || audience == state.issuer_url.as_str() =>
+        {
+            audience.to_owned()
+        }
+        _ => return Err("JWT audience invalid"),
+    };
+    let claims = match header.alg.as_str() {
+        "ML-DSA-65-Ed25519" => {
+            let dispatch = hyprstream_rpc::auth::parse_composite_dispatch(
+                token,
+                hyprstream_rpc::auth::RFC9068_ACCESS_TOKEN_TYPES,
+            )
+            .map_err(|_| "composite JWT dispatch invalid")?;
+            let snapshot = hyprstream_rpc::auth::global_composite_key_set().snapshot();
+            let pair = snapshot
+                .pair(dispatch.kid())
+                .ok_or("composite JWT kid unknown")?;
+            hyprstream_rpc::auth::jwt::decode_composite(
+                token,
+                pair.ml_dsa(),
+                pair.ed25519(),
+                Some(&expected_audience),
+                &dispatch,
+            )
+            .map_err(|_| "composite JWT validation failed")?
+        }
+        "EdDSA" => {
+            let key = state
+                .jwt_bearer_verifying_key()
+                .await
+                .ok_or("EdDSA verification key unavailable")?;
+            hyprstream_rpc::auth::jwt::decode(token, &key, Some(&expected_audience))
+                .map_err(|_| "EdDSA JWT validation failed")?
+        }
+        _ => return Err("JWT algorithm unsupported"),
+    };
+
+    let issuer_is_local = claims.iss == canonical_audience || claims.iss == state.issuer_url;
+    if !issuer_is_local {
+        return Err("JWT issuer invalid");
+    }
+    if claims
+        .jti
+        .as_deref()
+        .is_some_and(|jti| state.jti_blocklist.as_ref().is_some_and(|list| list.is_revoked(jti)))
+    {
+        return Err("JWT revoked");
+    }
+    Ok(claims)
 }

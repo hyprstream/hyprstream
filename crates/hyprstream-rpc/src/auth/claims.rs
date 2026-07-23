@@ -2,7 +2,8 @@
 //!
 //! Two claim types:
 //! - [`Claims`] — access token claims used throughout the RPC layer.
-//!   Authorization is enforced server-side via Casbin policies, not JWT scopes.
+//!   OAuth grants carry their granted scope set in the signed JWT so consumers
+//!   can attenuate authority without falling back to subject-wide policy.
 //! - [`IdTokenClaims`] — OIDC ID Token claims (Section 2 of OpenID Connect
 //!   Core 1.0). Only used by the OAuth token endpoint when `scope=openid`.
 
@@ -109,8 +110,9 @@ pub struct ActClaim {
 
 /// JWT claims for authentication.
 ///
-/// Note: Authorization is enforced via Casbin policies server-side.
-/// Scopes are NOT embedded in JWTs.
+/// Casbin remains the server-side policy authority. OAuth access tokens also
+/// carry the grant's scope ceiling so a verifier can enforce the intersection
+/// of subject policy and the authority delegated by that specific grant.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Claims {
     /// Issuer URL — the hyprstream node that minted this token.
@@ -128,6 +130,13 @@ pub struct Claims {
     /// RFC 8707 audience claim for resource indicator binding.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub aud: Option<String>,
+    /// OAuth 2.0 granted scope set, serialized as a space-delimited string.
+    ///
+    /// This is optional because non-OAuth service tokens do not originate from
+    /// an OAuth grant. Consumers that derive authority from OAuth scopes MUST
+    /// use [`Self::has_scope`] and fail closed when this claim is absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
     /// RFC 8705 / WIMSE proof-of-possession confirmation claim.
     ///
     /// Binds the Ed25519 signing key to the JWT-attested identity via a standard
@@ -202,6 +211,7 @@ impl std::fmt::Debug for Claims {
             .field("iat", &self.iat)
             .field("jti", &self.jti)
             .field("aud", &self.aud)
+            .field("scope", &self.scope)
             .field("cnf", &self.cnf)
             .field("token", &self.token.as_ref().map(|_| "[REDACTED]"))
             .field("clearance", &self.clearance)
@@ -233,6 +243,9 @@ impl ToCapnp for Claims {
                 builder.set_pub_key(&jwk.x);
             }
         }
+        if let Some(ref scope) = self.scope {
+            builder.set_oauth_scope(scope);
+        }
         // Write empty scopes list for wire compatibility
         builder.reborrow().init_scopes(0);
     }
@@ -242,9 +255,15 @@ impl FromCapnp for Claims {
     type Reader<'a> = common_capnp::claims::Reader<'a>;
 
     fn read_from(reader: Self::Reader<'_>) -> Result<Self> {
-        // Scopes on the wire are ignored - authorization is via Casbin
         let aud = reader
             .get_aud()
+            .ok()
+            .and_then(|s| s.to_str().ok())
+            .map(std::borrow::ToOwned::to_owned)
+            .filter(|s| !s.is_empty());
+
+        let scope = reader
+            .get_oauth_scope()
             .ok()
             .and_then(|s| s.to_str().ok())
             .map(std::borrow::ToOwned::to_owned)
@@ -285,6 +304,9 @@ impl FromCapnp for Claims {
             iat: reader.get_iat(),
             jti: None,
             aud,
+            // The dedicated OAuth field preserves the signed grant ceiling;
+            // the legacy structured scope list remains unused by Claims.
+            scope,
             cnf,
             token,
             // MAC clearance (S8/#574) is not carried on the Cap'n Proto envelope
@@ -311,6 +333,7 @@ impl Claims {
             iat,
             jti: None,
             aud: None,
+            scope: None,
             cnf: None,
             token: None,
             clearance: None,
@@ -340,6 +363,25 @@ impl Claims {
     pub fn with_audience(mut self, audience: Option<String>) -> Self {
         self.aud = audience;
         self
+    }
+
+    /// Set the OAuth 2.0 granted scope claim.
+    pub fn with_scope(mut self, scope: Option<String>) -> Self {
+        self.scope = scope.filter(|value| !value.trim().is_empty());
+        self
+    }
+
+    /// Iterate over the exact scopes granted to this token.
+    ///
+    /// An absent claim yields an empty iterator, keeping scope-based consumers
+    /// fail closed for legacy and non-OAuth tokens.
+    pub fn granted_scopes(&self) -> impl Iterator<Item = &str> {
+        self.scope.as_deref().into_iter().flat_map(str::split_whitespace)
+    }
+
+    /// Return whether this token's signed grant contains `required` exactly.
+    pub fn has_scope(&self, required: &str) -> bool {
+        self.granted_scopes().any(|granted| granted == required)
     }
 
     /// Attach original JWT token for e2e verification by downstream services.
@@ -510,6 +552,37 @@ impl crate::auth::mac::SubjectContextClaims for Claims {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn oauth_scope_claim_is_exact_and_absence_fails_closed() {
+        let plain = Claims::new("alice".to_owned(), 1000, 2000);
+        assert!(!plain.has_scope("atproto"));
+        assert!(!serde_json::to_string(&plain).unwrap().contains("\"scope\""));
+
+        let scoped = plain.with_scope(Some("atproto transition:generic".to_owned()));
+        assert!(scoped.has_scope("atproto"));
+        assert!(scoped.has_scope("transition:generic"));
+        assert!(!scoped.has_scope("transition"));
+        assert_eq!(
+            scoped.granted_scopes().collect::<Vec<_>>(),
+            vec!["atproto", "transition:generic"]
+        );
+    }
+
+    #[test]
+    fn oauth_scope_survives_capnp_envelope_roundtrip() -> anyhow::Result<()> {
+        let claims = Claims::new("alice".to_owned(), 1000, 2000)
+            .with_scope(Some("atproto transition:generic".to_owned()));
+        let mut message = capnp::message::Builder::new_default();
+        let mut builder = message.init_root::<common_capnp::claims::Builder>();
+        claims.write_to(&mut builder);
+
+        let decoded = Claims::read_from(builder.into_reader())?;
+        assert_eq!(decoded.scope, claims.scope);
+        assert!(decoded.has_scope("atproto"));
+        assert!(decoded.has_scope("transition:generic"));
+        Ok(())
+    }
 
     #[test]
     fn test_act_claim_serde_roundtrip_and_default_none() {
