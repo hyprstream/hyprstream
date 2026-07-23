@@ -132,7 +132,7 @@ jobs:
       - name: Record GPU availability
         run: |
           if command -v nvidia-smi >/dev/null; then
-            nvidia-smi
+            nvidia-smi || echo "::notice::nvidia-smi is installed but no usable NVIDIA driver/device is attached"
           else
             echo '::notice::No NVIDIA device is attached to this Graviton build runner; this spike validates packaging and linking only.'
           fi
