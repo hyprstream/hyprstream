@@ -17,8 +17,8 @@
 //!
 //! The translator allocates 9P fids on its side; we forward them unchanged as
 //! the model service's remote fids (same one-to-one scheme `RemoteModelMount`
-//! uses). The first walk component is the model reference; the rest is the
-//! path within the model's synthetic tree.
+//! uses). The first walk component establishes the model reference; later
+//! single-name walks traverse the path within that model's synthetic tree.
 
 use std::sync::atomic::AtomicU32;
 
@@ -91,6 +91,9 @@ impl Backend for ModelBackend {
         newfid: u32,
         components: &[String],
     ) -> anyhow::Result<WalkResult> {
+        if components.len() > 1 {
+            anyhow::bail!("ModelBackend only supports single-name walks; refusing an ambiguous multi-name binding");
+        }
         // Resolve model_ref: prefer a previously-walked parent fid, else take
         // the first walk component as the model_ref.
         let (model_ref, wnames): (String, Vec<String>) = if components.is_empty() {
@@ -101,7 +104,12 @@ impl Backend for ModelBackend {
                 .map(|s| s.model_ref.clone())
                 .ok_or_else(|| anyhow::anyhow!("walk: source fid {fid} has no model_ref"))?;
             (mr, Vec::new())
+        } else if let Some(state) = self.fids.get(&fid) {
+            // Once the model reference is established, subsequent one-name
+            // walks stay in that model's fs scope.
+            (state.model_ref.clone(), components.to_vec())
         } else {
+            // The first component establishes the model reference.
             let model_ref = components[0].clone();
             let rest = components[1..].to_vec();
             (model_ref, rest)
@@ -113,7 +121,7 @@ impl Backend for ModelBackend {
         let RWalk { qid } = self.rt.block_on(fs.walk(&req))?;
         self.fids.insert(newfid, ModelFidState { model_ref });
 
-        Ok(WalkResult { qids: vec![qid_from_rpc(&qid)] })
+        Ok(WalkResult { qids: vec![qid_from_rpc(&qid)], reached: components.to_vec() })
     }
 
     async fn open(&self, fid: u32, flags: u32) -> anyhow::Result<OpenResult> {

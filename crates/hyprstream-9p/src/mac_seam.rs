@@ -54,9 +54,12 @@
 //!
 //! Concretely, this name↔object gap is **not** covered today:
 //!
-//! - **Partial walks** — handled (the cached path is derived from the backend's
-//!   *returned qid count*, never the requested suffix; see `handle_walk`), but
-//!   only because the translator narrows the name to match the reached object.
+//! - **Partial walks** — the backend reports its exact reached request prefix,
+//!   and the translator rejects a result whose QID count disagrees with that
+//!   prefix. `MountBackend` emits one QID per bound component; `ModelBackend`
+//!   rejects multi-name walks until it can provide that same contract. This
+//!   prevents the former one-leaf-QID/deep-fid mismatch, but still relies on
+//!   the label resolver and backend agreeing on what a reported path names.
 //! - **Path traversal / `..`** — `hyprstream-9p` performs **no** `..`
 //!   canonicalization; `wnames` are concatenated verbatim into the cached path.
 //!   Not exploitable against `MemoryBackend`/`MountBackend` (they resolve
@@ -162,18 +165,38 @@ impl VerifiedTokenScope {
 /// constructor from raw `uname`, `Subject`, claims, paths, or labels.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SessionContext {
+    attach_identity: VerifiedAttachIdentity,
     security_context: SecurityContext,
     token: Option<VerifiedTokenScope>,
+}
+
+/// Stable principal or credential identity returned by an
+/// [`AttachAuthenticator`] after verification.
+///
+/// This is deliberately separate from [`SecurityContext`]: clearance and key
+/// assurance are authorization attributes, not a principal identity. The
+/// verifier must derive this from the verified subject or stable credential
+/// fingerprint, never from an unverified `Tattach.uname` string.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VerifiedAttachIdentity(Arc<str>);
+
+impl VerifiedAttachIdentity {
+    /// Construct an identity obtained from verified credential material.
+    pub fn from_verified_identity(identity: impl Into<Arc<str>>) -> Self {
+        Self(identity.into())
+    }
 }
 
 impl SessionContext {
     /// Combine a verified subject context with the scope of the same verified,
     /// sender-bound token.
     pub fn from_verified_token(
+        attach_identity: VerifiedAttachIdentity,
         security_context: SecurityContext,
         token: VerifiedTokenScope,
     ) -> Self {
         Self {
+            attach_identity,
             security_context,
             token: Some(token),
         }
@@ -184,6 +207,7 @@ impl SessionContext {
     /// makes every operation deny before the AVC/PDP is reached.
     pub fn deny() -> Self {
         Self {
+            attach_identity: VerifiedAttachIdentity::from_verified_identity("denied"),
             security_context: anonymous_floor(),
             token: None,
         }
@@ -205,8 +229,9 @@ impl SessionContext {
     /// Identity comparison for re-attach detection, deliberately distinct from
     /// the derived [`PartialEq`].
     ///
-    /// Two attaches are the *same* session when their verified subject context
-    /// and verified-token scope (label ceiling + permitted operations) match.
+    /// Two attaches are the *same* session when their verified identity,
+    /// verified subject context, and verified-token scope (label ceiling +
+    /// permitted operations) match.
     /// The token's `valid_until` deadline is excluded on purpose: a real
     /// [`AttachAuthenticator`] re-stamps `Instant::now() + ttl` on every
     /// verification of the *same* ticket, so including it would make an
@@ -215,6 +240,9 @@ impl SessionContext {
     /// value equality (useful for diagnostics/tests); *attach identity* — what
     /// `bind_attach_session` checks — is this method.
     pub fn same_attach_identity(&self, other: &SessionContext) -> bool {
+        if self.attach_identity != other.attach_identity {
+            return false;
+        }
         if self.security_context != other.security_context {
             return false;
         }
@@ -448,7 +476,7 @@ mod tests {
     fn authorize_allows_when_all_gates_pass() {
         let monitor = monitor(Some(label(Level::Public)), Arc::new(AllowAll));
         let session =
-            SessionContext::from_verified_token(ctx(Level::Secret), permit_token(&[Action::Read]));
+            SessionContext::from_verified_token(VerifiedAttachIdentity::from_verified_identity("test-subject"), ctx(Level::Secret), permit_token(&[Action::Read]));
         assert!(monitor.authorize(&session, &path(&["a.txt"]), Action::Read));
     }
 
@@ -457,7 +485,7 @@ mod tests {
         // Even a permit-everything decider cannot rescue an unlabeled object.
         let monitor = monitor(None, Arc::new(AllowAll));
         let session =
-            SessionContext::from_verified_token(ctx(Level::Secret), permit_token(&[Action::Read]));
+            SessionContext::from_verified_token(VerifiedAttachIdentity::from_verified_identity("test-subject"), ctx(Level::Secret), permit_token(&[Action::Read]));
         assert!(!monitor.authorize(&session, &path(&["a.txt"]), Action::Read));
     }
 
@@ -466,7 +494,7 @@ mod tests {
         let monitor = monitor(Some(label(Level::Public)), Arc::new(AllowAll));
         assert!(!monitor.authorize(&SessionContext::deny(), &path(&["a.txt"]), Action::Read));
         let read_only =
-            SessionContext::from_verified_token(ctx(Level::Secret), permit_token(&[Action::Read]));
+            SessionContext::from_verified_token(VerifiedAttachIdentity::from_verified_identity("test-subject"), ctx(Level::Secret), permit_token(&[Action::Read]));
         assert!(!monitor.authorize(&read_only, &path(&["a.txt"]), Action::Write));
     }
 
@@ -477,7 +505,7 @@ mod tests {
         // decider and a token whose ceiling covers it.
         let monitor = monitor(Some(label(Level::Secret)), Arc::new(AllowAll));
         let session =
-            SessionContext::from_verified_token(ctx(Level::Public), permit_token(&[Action::Read]));
+            SessionContext::from_verified_token(VerifiedAttachIdentity::from_verified_identity("test-subject"), ctx(Level::Public), permit_token(&[Action::Read]));
         assert!(!monitor.authorize(&session, &path(&["secret.txt"]), Action::Read));
     }
 

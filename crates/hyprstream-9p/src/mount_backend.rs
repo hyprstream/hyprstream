@@ -186,24 +186,43 @@ impl Backend for MountBackend {
         // path as parent_path + components. An empty-components walk (attach /
         // clone) re-resolves the source fid's own path.
         let parent_path = self.fids.get(&fid).map(|e| e.path.clone()).unwrap_or_default();
+        let parent_len = parent_path.len();
         let mut new_path = parent_path;
         new_path.extend(components.iter().cloned());
 
-        let refs: Vec<&str> = new_path.iter().map(String::as_str).collect();
-        let handle = self
-            .mount
-            .walk(&refs, self.caller()?)
-            .await
-            .context("mount walk failed")?;
+        // Resolve each component independently so the 9P result carries one
+        // QID for every object the new fid actually traversed. Returning only a
+        // leaf QID while binding `newfid` to the complete path would let the
+        // translator cache a shallower, incorrectly authorized name.
+        let mut qids = Vec::with_capacity(components.len().max(1));
+        let mut handle = None;
+        let mut reached = Vec::with_capacity(components.len());
+        for component_count in 1..=components.len() {
+            let refs: Vec<&str> = new_path[..parent_len + component_count]
+                .iter()
+                .map(String::as_str)
+                .collect();
+            let next = self.mount.walk(&refs, self.caller()?).await.context("mount walk failed")?;
+            let qid = self.qid_of(&next).await?;
+            if let Some(previous) = handle.replace(next) {
+                self.mount.clunk(previous, self.caller()?).await;
+            }
+            qids.push(qid);
+            reached.push(components[component_count - 1].clone());
+        }
 
-        // Mirror `ModelBackend::walk`: return the single leaf qid (the translator
-        // records its qtype for the new fid; clients here walk one hop at a time).
-        let qid = self.qid_of(&handle).await?;
+        if components.is_empty() {
+            let refs: Vec<&str> = new_path.iter().map(String::as_str).collect();
+            let next = self.mount.walk(&refs, self.caller()?).await.context("mount walk failed")?;
+            qids.push(self.qid_of(&next).await?);
+            handle = Some(next);
+        }
+        let handle = handle.ok_or_else(|| anyhow!("mount walk returned no handle"))?;
         self.fids.insert(
             newfid,
             Arc::new(MountFidEntry { path: new_path, handle: Mutex::new(Some(handle)) }),
         );
-        Ok(WalkResult { qids: vec![qid] })
+        Ok(WalkResult { qids, reached })
     }
 
     async fn open(&self, fid: u32, flags: u32) -> Result<OpenResult> {
