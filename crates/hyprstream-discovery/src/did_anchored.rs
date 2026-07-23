@@ -22,15 +22,16 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use ed25519_dalek::VerifyingKey;
-use hyprstream_crypto::pq::{MlDsaVerifyingKey, ml_dsa_vk_from_bytes};
+use hyprstream_crypto::pq::{ml_dsa_vk_from_bytes, MlDsaVerifyingKey};
 use hyprstream_pds::at9p::{ServiceType, Transport as At9pTransport};
 use hyprstream_pds::at9p_alias::AuthoritativeIdentity;
+use hyprstream_pds::at9p_duplicity::AcceptedAt9pState;
 use hyprstream_pds::at9p_gate::VerifiedCapsule;
 use hyprstream_rpc::auth::mac::Assurance;
-use hyprstream_rpc::did_web::{DidWebResolver, HttpDidDocFetcher, did_web_to_url};
+use hyprstream_rpc::did_web::{did_web_to_url, DidWebResolver, HttpDidDocFetcher};
 use hyprstream_rpc::identity::Did;
 use hyprstream_rpc::transport::{EndpointType, TransportConfig};
 use serde_json::Value;
@@ -111,6 +112,15 @@ pub(crate) struct HybridDeploymentCa {
     pub ml_dsa_65: MlDsaVerifyingKey,
 }
 
+impl HybridDeploymentCa {
+    /// Stable identity for one complete Hybrid authority pair.  This must not
+    /// be derived from only Ed25519: a bounded overlap may rotate ML-DSA-65
+    /// while intentionally retaining the classical component.
+    pub(crate) fn key_id(&self) -> String {
+        hyprstream_rpc::auth::composite_kid(&self.ml_dsa_65, &self.ed25519)
+    }
+}
+
 /// Verified public material extracted from a mutually-attested identity pair.
 ///
 /// Both `ca_verifying_key` and `discovery_transport` are sourced from the
@@ -126,6 +136,26 @@ pub(crate) struct DidAnchoredTrust {
     /// carried, not reconstructed (#556 / F5). A capsule GATE-verifies only under
     /// pinned Hybrid, so this is never `Classical`.
     pub assurance: Assurance,
+}
+
+impl DidAnchoredTrust {
+    /// Replace the genesis seed projection with the daemon-authenticated live
+    /// accepted state.  Genesis establishes the identity only; current CA keys
+    /// and reach are always projected from the checkpointed state that follows.
+    pub(crate) fn from_accepted_state(seed: Self, state: &AcceptedAt9pState) -> Result<Self> {
+        anyhow::ensure!(
+            state.did == seed.authoritative_identity.at9p_did.as_str(),
+            "accepted did:at9p state does not match the configured deployment anchor"
+        );
+        let ca_keys = ca_keys_from_body(&state.current)?;
+        let discovery_transport = reach_from_body(&state.current)?;
+        Ok(Self {
+            ca_keys,
+            discovery_transport,
+            authoritative_identity: seed.authoritative_identity,
+            assurance: seed.assurance,
+        })
+    }
 }
 
 /// Fetch capsules from the deployment's static well-known content endpoint.
@@ -215,36 +245,37 @@ fn document_names_at9p(document: &Value, at9p_did: &str) -> bool {
 /// `subject_keys` has set semantics for consumers: multiple live keys are
 /// allowed during overlap and the credential's authenticated `kid` selects the
 /// exact pair.  Neither this function nor its callers use `.first()`.
-fn ca_keys_from_capsule(verified: &VerifiedCapsule) -> Result<Vec<HybridDeploymentCa>> {
-    let keys = verified
-        .capsule()
-        .body
-        .subject_keys
-        .iter()
-        .map(|pair| {
-            let ed: [u8; 32] = pair
-                .ed25519_pub
-                .as_slice()
-                .try_into()
-                .map_err(|_| anyhow::anyhow!("capsule subject Ed25519 key is not 32 bytes"))?;
-            Ok(HybridDeploymentCa {
-                ed25519: VerifyingKey::from_bytes(&ed)
-                    .context("capsule subject Ed25519 key is malformed")?,
-                ml_dsa_65: ml_dsa_vk_from_bytes(&pair.mldsa65_pub)
-                    .context("capsule subject ML-DSA-65 key is malformed")?,
+fn ca_keys_from_body(body: &hyprstream_pds::at9p::CapsuleBody) -> Result<Vec<HybridDeploymentCa>> {
+    let keys =
+        body.subject_keys
+            .iter()
+            .map(|pair| {
+                let ed: [u8; 32] =
+                    pair.ed25519_pub.as_slice().try_into().map_err(|_| {
+                        anyhow::anyhow!("capsule subject Ed25519 key is not 32 bytes")
+                    })?;
+                Ok(HybridDeploymentCa {
+                    ed25519: VerifyingKey::from_bytes(&ed)
+                        .context("capsule subject Ed25519 key is malformed")?,
+                    ml_dsa_65: ml_dsa_vk_from_bytes(&pair.mldsa65_pub)
+                        .context("capsule subject ML-DSA-65 key is malformed")?,
+                })
             })
-        })
-        .collect::<Result<Vec<_>>>()?;
+            .collect::<Result<Vec<_>>>()?;
     anyhow::ensure!(!keys.is_empty(), "GATE-verified capsule has no subject key");
     for (index, key) in keys.iter().enumerate() {
         anyhow::ensure!(
             !keys[..index]
                 .iter()
-                .any(|prior| prior.ed25519 == key.ed25519),
-            "GATE-verified capsule repeats a deployment CA Ed25519 key"
+                .any(|prior| prior.key_id() == key.key_id()),
+            "GATE-verified capsule repeats a deployment CA Hybrid key pair"
         );
     }
     Ok(keys)
+}
+
+fn ca_keys_from_capsule(verified: &VerifiedCapsule) -> Result<Vec<HybridDeploymentCa>> {
+    ca_keys_from_body(&verified.capsule().body)
 }
 
 /// The discovery reach is the `#ns` `NinePExport` service entry's typed iroh
@@ -261,10 +292,8 @@ fn ca_keys_from_capsule(verified: &VerifiedCapsule) -> Result<Vec<HybridDeployme
 /// `bootstrap_deployment_process` pins the response to the separately resolved
 /// Discovery key and requires a signed liveness `ping` before the resolver is
 /// installed. A missing/non-iroh/carrier-less entry fails closed.
-fn reach_from_capsule(verified: &VerifiedCapsule) -> Result<TransportConfig> {
-    let entry = verified
-        .capsule()
-        .body
+fn reach_from_body(body: &hyprstream_pds::at9p::CapsuleBody) -> Result<TransportConfig> {
+    let entry = body
         .services
         .iter()
         .find(|s| s.id == DEPLOYMENT_REACH_SERVICE && s.service_type == ServiceType::NinePExport)
@@ -311,6 +340,10 @@ fn reach_from_capsule(verified: &VerifiedCapsule) -> Result<TransportConfig> {
             "capsule deployment reach {DEPLOYMENT_REACH_SERVICE:?} is not an iroh or QUIC endpoint (got {other:?})"
         ),
     }
+}
+
+fn reach_from_capsule(verified: &VerifiedCapsule) -> Result<TransportConfig> {
+    reach_from_body(&verified.capsule().body)
 }
 
 pub(crate) async fn verify_did_anchored_document(
@@ -385,11 +418,14 @@ pub(crate) async fn resolve_did_anchored_trust(anchors: &DidAnchors) -> Result<D
 mod tests {
     use super::*;
     use ed25519_dalek::SigningKey;
-    use hyprstream_crypto::pq::{MlDsaSigningKey, ml_dsa_generate_keypair, ml_dsa_vk_bytes};
+    use hyprstream_crypto::pq::{ml_dsa_generate_keypair, ml_dsa_vk_bytes, MlDsaSigningKey};
+    use hyprstream_pds::at9p::h512;
     use hyprstream_pds::at9p::{
         CapsuleBody, HybridKeyPair, ServiceEndpoint, ServiceEntry, ServiceType, Transport,
     };
-    use hyprstream_pds::at9p_sign::sign_capsule;
+    use hyprstream_pds::at9p_duplicity::{DuplicityGuard, InMemoryWatermarkStore};
+    use hyprstream_pds::at9p_gate::verify_did_at9p;
+    use hyprstream_pds::at9p_sign::{sign_capsule, sign_update_record};
     use serde_json::json;
 
     struct FixedCapsuleSource(Vec<u8>);
@@ -699,18 +735,86 @@ mod tests {
         .await
         .expect("two published capsule CAs must remain a usable key set");
         assert_eq!(trust.ca_keys.len(), 2);
-        assert!(
-            trust
-                .ca_keys
-                .iter()
-                .any(|key| key.ed25519 == old.ed.verifying_key())
-        );
-        assert!(
-            trust
-                .ca_keys
-                .iter()
-                .any(|key| key.ed25519 == new.ed.verifying_key())
-        );
+        assert!(trust
+            .ca_keys
+            .iter()
+            .any(|key| key.ed25519 == old.ed.verifying_key()));
+        assert!(trust
+            .ca_keys
+            .iter()
+            .any(|key| key.ed25519 == new.ed.verifying_key()));
+    }
+
+    #[tokio::test]
+    async fn accepted_current_state_retires_genesis_ca_and_updates_reach() {
+        let web = "did:web:cluster.example";
+        let old = capsule_signer(0x51);
+        let new = capsule_signer(0x52);
+        let service = |address: &str| {
+            let endpoint = ServiceEndpoint::new(Transport::Quic, address).unwrap();
+            ServiceEntry::new("#ns", ServiceType::NinePExport, endpoint).unwrap()
+        };
+        let mut genesis_body = CapsuleBody::new(
+            vec![old.pair.clone()],
+            vec![service("quic://127.0.0.1:4433")],
+        )
+        .unwrap();
+        genesis_body.also_known_as = Some(vec![web.to_owned()]);
+        genesis_body.next_key_commitments = vec![new.pair.commitment_digest()];
+        let genesis = sign_capsule(genesis_body, &old.ed, &old.pq).unwrap();
+        let genesis_bytes = genesis.to_dag_cbor().unwrap();
+        let did = format!("did:at9p:{}", genesis.cid512().unwrap());
+        let anchors = DidAnchors {
+            cluster_at9p_did: did.clone(),
+            cluster_did_web: web.to_owned(),
+        };
+        let seed = verify_did_anchored_document(
+            &anchors,
+            &document(web, Some(&did)),
+            Arc::new(FixedCapsuleSource(genesis_bytes.clone())),
+        )
+        .await
+        .expect("GATE-verified genesis seed");
+
+        let mut current = CapsuleBody::new(
+            vec![new.pair.clone()],
+            vec![service("quic://127.0.0.2:4434")],
+        )
+        .unwrap();
+        current.also_known_as = Some(vec![web.to_owned()]);
+        let update = sign_update_record(
+            genesis.cid512().unwrap(),
+            1,
+            h512(&genesis_bytes),
+            current,
+            "2099-01-01T00:00:00Z".to_owned(),
+            &new.ed,
+            &new.pq,
+        )
+        .expect("signed successor");
+        let guard = DuplicityGuard::new(InMemoryWatermarkStore::new());
+        let verified = verify_did_at9p(&did, &genesis_bytes).expect("GATE genesis");
+        guard.seed_genesis(&verified).expect("seed genesis");
+        guard
+            .admit_successor(&update, "2026-07-23T00:00:00Z")
+            .expect("advance accepted state");
+        let state = guard
+            .accepted_state(
+                did.strip_prefix(hyprstream_pds::at9p_gate::DID_AT9P_PREFIX)
+                    .expect("at9p DID"),
+            )
+            .expect("read accepted state")
+            .expect("state present after advance");
+        let live =
+            DidAnchoredTrust::from_accepted_state(seed, &state).expect("live state projection");
+
+        assert_eq!(live.ca_keys.len(), 1);
+        assert_eq!(live.ca_keys[0].ed25519, new.ed.verifying_key());
+        assert_ne!(live.ca_keys[0].ed25519, old.ed.verifying_key());
+        assert!(matches!(
+            live.discovery_transport.endpoint,
+            EndpointType::Quic { ref addr, .. } if addr.port() == 4434
+        ));
     }
 
     #[tokio::test]

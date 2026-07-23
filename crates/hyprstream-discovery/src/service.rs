@@ -4,6 +4,8 @@
 //! socket kinds, and schemas via the standard REQ/REP transport.
 
 use async_trait::async_trait;
+#[cfg(all(test, not(target_arch = "wasm32")))]
+use hyprstream_pds::at9p_duplicity::AcceptedAt9pState;
 use hyprstream_rpc::browser_provisioning::{
     BrowserCarrierProfile, BrowserCurrentnessVerifier, BrowserProvisioningDocument,
     BrowserProvisioningMaterial, BrowserProvisioningRequest, BrowserRequestBinding,
@@ -18,17 +20,18 @@ use hyprstream_rpc::transport::{EndpointType, TransportConfig};
 use hyprstream_rpc::{SigningKey, VerifyingKey};
 
 use crate::generated::discovery_client::{
-    AuthMetadata, AuthMetadataList, DiscoveryHandler, DiscoveryResponseVariant, EndpointInfo,
-    EntityStatement, EnvelopeKeyset, ErrorInfo, GetRecordRequest, IssuerList, NodeLiveness,
-    PingInfo, PlacementCandidate, PlacementCandidateSet, QueryCandidatesRequest, RecordCar,
-    RegisterEntityStatementRequest, RegisterEnvelopeKeysetRequest, Resource, ServiceAnnouncement,
-    ServiceEndpoints, ServiceList, ServiceSummary, dispatch_discovery, serialize_response,
+    dispatch_discovery, serialize_response, AuthMetadata, AuthMetadataList, DiscoveryHandler,
+    DiscoveryResponseVariant, EndpointInfo, EntityStatement, EnvelopeKeyset, ErrorInfo,
+    GetRecordRequest, IssuerList, NodeLiveness, PingInfo, PlacementCandidate,
+    PlacementCandidateSet, QueryCandidatesRequest, RecordCar, RegisterEntityStatementRequest,
+    RegisterEnvelopeKeysetRequest, Resource, ServiceAnnouncement, ServiceEndpoints, ServiceList,
+    ServiceSummary,
 };
 use crate::placement_index::PlacementIndex;
 use crate::scheduling;
 
 use anyhow::{Context, Result};
-use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use hyprstream_rpc::identity::Did;
 use hyprstream_util::ttl_cache::TtlCache;
 use parking_lot::RwLock;
@@ -1515,6 +1518,21 @@ const REGISTRY_DEPLOYMENT_CREDENTIAL_CLOCK_SKEW_SECONDS: i64 = 60;
 /// CA key.  The detached payload is the exact compact-JWS signing input.
 const REGISTRY_DEPLOYMENT_HYBRID_AAD: &[u8] = b"hyprstream.registry-deployment.v1/hybrid";
 
+// Test fixtures emit the stable, daemon-owned accepted-state envelope format.
+// Production reads it through the private checkpointed PDS reader.
+#[cfg(all(test, not(target_arch = "wasm32")))]
+const AT9P_STATE_MAGIC: &[u8; 8] = b"AT9PST02";
+#[cfg(all(test, not(target_arch = "wasm32")))]
+const AT9P_ACCEPTANCE_MAGIC: &[u8; 8] = b"AT9PAC01";
+#[cfg(all(test, not(target_arch = "wasm32")))]
+const AT9P_ACCEPTANCE_KEY_AAD: &[u8] = b"hyprstream-at9p-acceptance-key/1";
+#[cfg(all(test, not(target_arch = "wasm32")))]
+const AT9P_ACCEPTANCE_STATE_AAD: &[u8] = b"hyprstream-at9p-accepted-state/1";
+#[cfg(all(test, not(target_arch = "wasm32")))]
+const AT9P_CHECKPOINT_MAGIC: &[u8; 8] = b"AT9PCK01";
+#[cfg(all(test, not(target_arch = "wasm32")))]
+const AT9P_CHECKPOINT_AAD: &[u8] = b"hyprstream-at9p-monotonic-checkpoint/1";
+
 /// Opaque verification-only view of the authenticated deployment registry.
 /// It exposes neither the raw key nor an authority replacement operation.
 #[derive(Clone)]
@@ -1536,6 +1554,36 @@ impl RegistryDeploymentVerifier {
     pub fn matches(&self, key: &VerifyingKey) -> bool {
         self.verifying_key == *key
     }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+fn accepted_state_key(subject: &str) -> Vec<u8> {
+    format!("at9p-state\0{subject}").into_bytes()
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+fn accepted_checkpoint_key(subject: &str) -> Vec<u8> {
+    format!("at9p-checkpoint\0{subject}").into_bytes()
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+fn acceptance_message(domain: &[u8], payload: &[u8]) -> Vec<u8> {
+    let mut message = Vec::with_capacity(domain.len() + payload.len());
+    message.extend_from_slice(domain);
+    message.extend_from_slice(payload);
+    message
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+fn checkpoint_message(subject: &str, payload: &[u8]) -> Result<Vec<u8>> {
+    let len = u32::try_from(subject.len()).context("at9p subject exceeds u32")?;
+    let mut message =
+        Vec::with_capacity(AT9P_CHECKPOINT_AAD.len() + 4 + subject.len() + payload.len());
+    message.extend_from_slice(AT9P_CHECKPOINT_AAD);
+    message.extend_from_slice(&len.to_be_bytes());
+    message.extend_from_slice(subject.as_bytes());
+    message.extend_from_slice(payload);
+    Ok(message)
 }
 
 /// Read the verification-only identity installed by trusted startup.
@@ -1745,6 +1793,11 @@ fn deployment_domain(ca_verifying_key: &VerifyingKey) -> String {
     })
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+fn hybrid_deployment_domain(ca: &crate::did_anchored::HybridDeploymentCa) -> String {
+    ca.key_id()
+}
+
 fn validate_registry_credential_numeric_dates(
     exp: i64,
     nbf: i64,
@@ -1783,6 +1836,7 @@ fn validate_registry_credential_numeric_dates(
 fn validate_registry_deployment_credential_profile(
     token: &str,
     ca_verifying_key: &VerifyingKey,
+    domain: &str,
 ) -> Result<[u8; 32]> {
     let mut segments = token.split('.');
     let protected_segment = segments.next().unwrap_or_default();
@@ -1804,7 +1858,6 @@ fn validate_registry_deployment_credential_profile(
         exact_string_member(protected, "typ", "protected header")? == "wit+jwt",
         "protected header typ must be exactly wit+jwt"
     );
-    let domain = deployment_domain(ca_verifying_key);
     anyhow::ensure!(
         exact_string_member(protected, "kid", "protected header")? == domain,
         "protected header kid does not bind the pinned deployment CA"
@@ -1905,7 +1958,7 @@ fn select_hybrid_deployment_ca<'a>(
     let kid = exact_string_member(protected, "kid", "protected header")?;
     let mut matches = candidates
         .iter()
-        .filter(|candidate| deployment_domain(&candidate.ed25519) == kid);
+        .filter(|candidate| hybrid_deployment_domain(candidate) == kid);
     let selected = matches
         .next()
         .ok_or_else(|| anyhow::anyhow!("credential kid does not name a current DID-anchored CA"))?;
@@ -1932,7 +1985,11 @@ fn validate_hybrid_registry_deployment_credential(
         "DID-anchored credential must contain exactly one non-empty Hybrid proof"
     );
     let candidate = select_hybrid_deployment_ca(jwt, candidates)?;
-    let key = validate_registry_deployment_credential_profile(jwt, &candidate.ed25519)?;
+    let key = validate_registry_deployment_credential_profile(
+        jwt,
+        &candidate.ed25519,
+        &hybrid_deployment_domain(candidate),
+    )?;
     let proof = decode_canonical_jwt_segment(encoded_proof, "credential Hybrid proof", 8_192)?;
     let verified = hyprstream_crypto::cose_sign::verify_composite(
         &proof,
@@ -2019,9 +2076,11 @@ fn authenticate_registry_deployment_credentials(
 ) -> Result<AuthenticatedRegistryDeploymentIdentity> {
     let key_bytes = match credentials.authority {
         DeploymentCredentialAuthority::Classical(ca_verifying_key) => {
+            let domain = deployment_domain(&ca_verifying_key);
             validate_registry_deployment_credential_profile(
                 &credentials.registry_credential,
                 &ca_verifying_key,
+                &domain,
             )
         }
         #[cfg(not(target_arch = "wasm32"))]
@@ -2127,7 +2186,32 @@ async fn authenticate_did_anchored_bootstrap(
     anchors: &crate::DidAnchors,
 ) -> Result<(ProcessBootstrapAuthority, TransportConfig)> {
     seal_process_bootstrap_authority()?;
-    let trust = crate::did_anchored::resolve_did_anchored_trust(anchors).await?;
+    // The immutable GATE capsule is a seed only.  It authenticates the durable
+    // checkpoint reader; authority installed for this process is then derived
+    // from the authenticated accepted-current body, so a retired CA cannot be
+    // resurrected by re-fetching genesis at a later restart.
+    let seed = crate::did_anchored::resolve_did_anchored_trust(anchors).await?;
+    let registry_credential = load_registry_deployment_credential()?;
+    let seed_identity =
+        authenticate_registry_deployment_credentials(TrustedRegistryDeploymentCredentials {
+            authority: DeploymentCredentialAuthority::PqHybrid(seed.ca_keys.clone()),
+            registry_credential: registry_credential.clone(),
+        })?;
+    let store_path = hyprstream_service::deployment_data_dir()?.join("pds-store");
+    let state = crate::checkpointed_pds::CheckpointedPdsAcceptedStateSource::open(
+        &store_path,
+        seed_identity.verifier,
+    )?
+    .accepted_state(&anchors.cluster_at9p_did)?
+    .ok_or_else(|| {
+        anyhow::anyhow!(
+            "no checkpointed accepted state for {}",
+            anchors.cluster_at9p_did
+        )
+    })?;
+    let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    state.ensure_fresh(&now)?;
+    let trust = crate::did_anchored::DidAnchoredTrust::from_accepted_state(seed, &state)?;
     // #556 / F5: the deployment CA anchors the registry key, which certifies the
     // audit key and accepted-state checkpoints. It must never land classical.
     // Option C sources the CA from the capsule's hybrid subject key, so this is
@@ -2140,10 +2224,10 @@ async fn authenticate_did_anchored_bootstrap(
     let witness =
         authenticate_registry_deployment_credentials(TrustedRegistryDeploymentCredentials {
             authority: DeploymentCredentialAuthority::PqHybrid(trust.ca_keys),
-            registry_credential: load_registry_deployment_credential()?,
+            registry_credential,
         })?;
     let authority = ProcessBootstrapAuthority {
-        store_path: hyprstream_service::deployment_data_dir()?.join("pds-store"),
+        store_path,
         acceptance_identity: ProcessAcceptanceIdentity::Deployment(witness.verifier),
     };
     Ok((authority, trust.discovery_transport))
@@ -2597,12 +2681,13 @@ fn parse_announced_iroh(endpoint: &str) -> anyhow::Result<TransportConfig> {
 mod resolver_tests {
     use super::*;
     use ed25519_dalek::Signer as _;
-    use hyprstream_crypto::pq::{MlDsaSigningKey, ml_dsa_generate_keypair, ml_dsa_sk_to_vk_bytes};
+    use hyprstream_crypto::pq::{ml_dsa_generate_keypair, ml_dsa_sk_to_vk_bytes, MlDsaSigningKey};
     use hyprstream_pds::at9p::{
         CapsuleBody, HybridKeyPair, ServiceEndpoint, ServiceEntry, ServiceType,
         Transport as At9pTransport,
     };
-    use hyprstream_pds::at9p_duplicity::AcceptedAt9pState;
+    use hyprstream_pds::at9p_duplicity::{DuplicityGuard, InMemoryWatermarkStore};
+    use hyprstream_pds::at9p_gate::verify_did_at9p;
     use hyprstream_pds::at9p_sign::{sign_capsule, sign_update_record};
     use hyprstream_rpc::transport::{BindMode, EndpointType};
 
@@ -2617,6 +2702,10 @@ mod resolver_tests {
 
     fn hybrid_ca(tag: u8) -> HybridCaSigner {
         let ed = SigningKey::from_bytes(&[tag; 32]);
+        hybrid_ca_with_ed(ed)
+    }
+
+    fn hybrid_ca_with_ed(ed: SigningKey) -> HybridCaSigner {
         let (pq, _) = ml_dsa_generate_keypair();
         HybridCaSigner { ed, pq }
     }
@@ -2655,6 +2744,14 @@ mod resolver_tests {
         registry: &SigningKey,
     ) -> (serde_json::Value, serde_json::Value) {
         let domain = deployment_domain(&ca.verifying_key());
+        exact_registry_credential_values_for_domain(ca, registry, &domain)
+    }
+
+    fn exact_registry_credential_values_for_domain(
+        _ca: &SigningKey,
+        registry: &SigningKey,
+        domain: &str,
+    ) -> (serde_json::Value, serde_json::Value) {
         let now = chrono::Utc::now().timestamp();
         (
             serde_json::json!({"alg":"EdDSA", "typ":"wit+jwt", "kid":domain}),
@@ -2682,7 +2779,15 @@ mod resolver_tests {
     }
 
     fn exact_hybrid_registry_credential(ca: &HybridCaSigner, registry: &SigningKey) -> String {
-        let jwt = exact_registry_credential(&ca.ed, registry);
+        let authority = hybrid_authority(&[ca]);
+        let DeploymentCredentialAuthority::PqHybrid(cas) = authority else {
+            unreachable!("test helper constructs a Hybrid authority")
+        };
+        let domain = hybrid_deployment_domain(&cas[0]);
+        let (protected, claims) =
+            exact_registry_credential_values_for_domain(&ca.ed, registry, &domain);
+        let jwt =
+            sign_registry_credential_json(&ca.ed, &protected.to_string(), &claims.to_string());
         let proof = hyprstream_crypto::cose_sign::sign_composite(
             &ca.ed,
             Some(&ca.pq),
@@ -2798,6 +2903,152 @@ mod resolver_tests {
             authenticate_test_hybrid_registry_credential(&[&new], new_credential).is_ok(),
             "current CA must remain usable after retirement"
         );
+    }
+
+    #[test]
+    fn did_anchored_hybrid_ca_overlap_allows_pq_only_rotation() {
+        let old = hybrid_ca(0x45);
+        let new = hybrid_ca_with_ed(SigningKey::from_bytes(&old.ed.to_bytes()));
+        let old_registry = SigningKey::from_bytes(&[0x55; 32]);
+        let new_registry = SigningKey::from_bytes(&[0x56; 32]);
+        let old_credential = exact_hybrid_registry_credential(&old, &old_registry);
+        let new_credential = exact_hybrid_registry_credential(&new, &new_registry);
+
+        let old_witness =
+            authenticate_test_hybrid_registry_credential(&[&old, &new], old_credential.clone())
+                .expect("old pair must remain usable during a PQ-only overlap");
+        assert!(old_witness.verifier.matches(&old_registry.verifying_key()));
+        let new_witness =
+            authenticate_test_hybrid_registry_credential(&[&old, &new], new_credential.clone())
+                .expect("new PQ half must select its exact Hybrid pair");
+        assert!(new_witness.verifier.matches(&new_registry.verifying_key()));
+
+        assert!(
+            authenticate_test_hybrid_registry_credential(&[&new], old_credential).is_err(),
+            "the retired complete pair must not authenticate after currentness advances"
+        );
+        assert!(
+            authenticate_test_hybrid_registry_credential(&[&new], new_credential).is_ok(),
+            "the retained complete pair must remain usable after retirement"
+        );
+    }
+
+    #[test]
+    fn checkpointed_current_state_retires_a_ca_on_the_production_read_path() {
+        use hyprstream_pds::at9p::{
+            h512, CapsuleBody, HybridKeyPair, ServiceEndpoint, ServiceEntry, ServiceType, Transport,
+        };
+        use hyprstream_pds::at9p_sign::{sign_capsule, sign_update_record};
+
+        let old = hybrid_ca(0x57);
+        let new = hybrid_ca(0x58);
+        let pair = |ca: &HybridCaSigner| {
+            HybridKeyPair::new(
+                ca.ed.verifying_key().to_bytes().to_vec(),
+                ml_dsa_sk_to_vk_bytes(&ca.pq),
+            )
+            .expect("test Hybrid pair")
+        };
+        let service = |address: &str| {
+            ServiceEntry::new(
+                "#ns",
+                ServiceType::NinePExport,
+                ServiceEndpoint::new(Transport::Quic, address).expect("QUIC reach"),
+            )
+            .expect("service")
+        };
+        let mut genesis_body =
+            CapsuleBody::new(vec![pair(&old)], vec![service("quic://127.0.0.1:4433")])
+                .expect("genesis body");
+        genesis_body.next_key_commitments = vec![pair(&new).commitment_digest()];
+        let genesis = sign_capsule(genesis_body, &old.ed, &old.pq).expect("genesis");
+        let genesis_bytes = genesis.to_dag_cbor().expect("genesis bytes");
+        let did = format!("did:at9p:{}", genesis.cid512().expect("CID"));
+        let update = sign_update_record(
+            genesis.cid512().expect("CID"),
+            1,
+            h512(&genesis_bytes),
+            CapsuleBody::new(vec![pair(&new)], vec![service("quic://127.0.0.2:4434")])
+                .expect("current body"),
+            "2099-01-01T00:00:00Z".to_owned(),
+            &new.ed,
+            &new.pq,
+        )
+        .expect("successor");
+        let guard = DuplicityGuard::new(InMemoryWatermarkStore::new());
+        let verified = verify_did_at9p(&did, &genesis_bytes).expect("GATE genesis");
+        guard.seed_genesis(&verified).expect("seed genesis");
+        guard
+            .admit_successor(&update, "2026-07-23T00:00:00Z")
+            .expect("advance accepted state");
+        let state = guard
+            .accepted_state(
+                did.strip_prefix(hyprstream_pds::at9p_gate::DID_AT9P_PREFIX)
+                    .expect("at9p DID"),
+            )
+            .expect("read accepted state")
+            .expect("state present after advance");
+
+        let registry = SigningKey::from_bytes(&[0x61; 32]);
+        let audit = SigningKey::from_bytes(&[0x62; 32]);
+        let (kind, head) = match state.head() {
+            hyprstream_pds::at9p_duplicity::AcceptedAt9pHead::Update(record) => {
+                (1u8, record.to_dag_cbor().expect("head bytes"))
+            }
+            hyprstream_pds::at9p_duplicity::AcceptedAt9pHead::Genesis(_) => {
+                panic!("successor state must retain an update head")
+            }
+        };
+        let mut body = Vec::new();
+        body.extend_from_slice(AT9P_STATE_MAGIC);
+        body.push(kind);
+        body.extend_from_slice(&state.epoch.to_be_bytes());
+        body.extend_from_slice(&state.head_digest);
+        body.push(u8::from(state.terminal));
+        body.extend_from_slice(&(head.len() as u32).to_be_bytes());
+        body.extend_from_slice(&head);
+        let audit_key = audit.verifying_key().to_bytes();
+        let key_certificate =
+            registry.sign(&acceptance_message(AT9P_ACCEPTANCE_KEY_AAD, &audit_key));
+        let body_signature = audit.sign(&acceptance_message(AT9P_ACCEPTANCE_STATE_AAD, &body));
+        let mut envelope = Vec::new();
+        envelope.extend_from_slice(AT9P_ACCEPTANCE_MAGIC);
+        envelope.extend_from_slice(&audit_key);
+        envelope.extend_from_slice(&key_certificate.to_bytes());
+        envelope.extend_from_slice(&body);
+        envelope.extend_from_slice(&body_signature.to_bytes());
+        let mut checkpoint_payload = Vec::new();
+        checkpoint_payload.extend_from_slice(AT9P_CHECKPOINT_MAGIC);
+        checkpoint_payload.extend_from_slice(&state.epoch.to_be_bytes());
+        checkpoint_payload.extend_from_slice(&state.head_digest);
+        checkpoint_payload.push(u8::from(state.terminal));
+        checkpoint_payload.extend_from_slice(&h512(&envelope));
+        let checkpoint_signature = registry.sign(
+            &checkpoint_message(&state.subject_cid512, &checkpoint_payload)
+                .expect("checkpoint message"),
+        );
+        let mut checkpoint = checkpoint_payload;
+        checkpoint.extend_from_slice(&checkpoint_signature.to_bytes());
+
+        let dir = tempfile::tempdir().expect("state store");
+        let db = rocksdb::DB::open_default(dir.path()).expect("open state store");
+        db.put(accepted_state_key(&state.subject_cid512), envelope)
+            .expect("write state");
+        db.put(accepted_checkpoint_key(&state.subject_cid512), checkpoint)
+            .expect("write checkpoint");
+        drop(db);
+        let identity = RegistryDeploymentVerifier {
+            verifying_key: registry.verifying_key(),
+        };
+        let loaded =
+            crate::checkpointed_pds::CheckpointedPdsAcceptedStateSource::open(dir.path(), identity)
+                .expect("open production reader")
+                .accepted_state(&did)
+                .expect("production reader must load the accepted current state")
+                .expect("accepted current state must be present");
+        assert_eq!(loaded.epoch, 1);
+        assert_eq!(loaded.current.subject_keys, vec![pair(&new)]);
+        assert_ne!(loaded.current.subject_keys, vec![pair(&old)]);
     }
 
     #[test]
@@ -3454,12 +3705,10 @@ mod resolver_tests {
     async fn browser_projection_rejects_state_advance_revocation_and_cross_service() {
         let (resolver, source) = production_fixture(false);
         source.0.lock().as_mut().expect("fixture state").epoch += 1;
-        assert!(
-            resolver
-                .browser_provisioning(owned_browser_request())
-                .await
-                .is_err()
-        );
+        assert!(resolver
+            .browser_provisioning(owned_browser_request())
+            .await
+            .is_err());
 
         let (resolver, _) = production_fixture(false);
         resolver
@@ -3469,12 +3718,10 @@ mod resolver_tests {
             .and_then(|entries| entries.first_mut())
             .expect("fixture announcement")
             .request_kem_recipient = vec![0x01];
-        assert!(
-            resolver
-                .browser_provisioning(owned_browser_request())
-                .await
-                .is_err()
-        );
+        assert!(resolver
+            .browser_provisioning(owned_browser_request())
+            .await
+            .is_err());
 
         let (resolver, source) = production_fixture(false);
         source
@@ -3485,12 +3732,10 @@ mod resolver_tests {
             .current
             .services[0]
             .id = "#policy".to_owned();
-        assert!(
-            resolver
-                .browser_provisioning(owned_browser_request())
-                .await
-                .is_err()
-        );
+        assert!(resolver
+            .browser_provisioning(owned_browser_request())
+            .await
+            .is_err());
     }
 
     #[tokio::test]
@@ -3503,12 +3748,10 @@ mod resolver_tests {
             BrowserCarrierProfile::StandardPublicRelay,
         )
         .expect("relay request");
-        assert!(
-            resolver
-                .browser_provisioning(request.clone())
-                .await
-                .is_err()
-        );
+        assert!(resolver
+            .browser_provisioning(request.clone())
+            .await
+            .is_err());
 
         {
             let mut state = source.0.lock();
@@ -3592,12 +3835,10 @@ mod resolver_tests {
             .and_then(|entries| entries.first_mut())
             .expect("fixture route")
             .endpoint = "quic://localhost:127.0.0.1:10".to_owned();
-        assert!(
-            resolver
-                .verify_browser_binding(&route_binding)
-                .await
-                .is_err()
-        );
+        assert!(resolver
+            .verify_browser_binding(&route_binding)
+            .await
+            .is_err());
 
         let (resolver, _) = production_fixture(false);
         resolver
@@ -3762,12 +4003,10 @@ mod resolver_tests {
     #[tokio::test]
     async fn production_network_resolver_never_falls_back_to_local_reach() {
         let (resolver, _) = production_fixture(true);
-        assert!(
-            resolver
-                .resolve_service(ServiceQuery::network("model").expect("query"))
-                .await
-                .is_err()
-        );
+        assert!(resolver
+            .resolve_service(ServiceQuery::network("model").expect("query"))
+            .await
+            .is_err());
     }
 
     #[tokio::test]
@@ -4152,22 +4391,18 @@ mod resolver_tests {
             .and_then(|entries| entries.first_mut())
             .expect("fixture service")
             .last_heartbeat = Instant::now() - ANNOUNCED_ENDPOINT_TTL - Duration::from_secs(1);
-        assert!(
-            resolver
-                .resolve_service(ServiceQuery::network("model").expect("query"))
-                .await
-                .is_err()
-        );
+        assert!(resolver
+            .resolve_service(ServiceQuery::network("model").expect("query"))
+            .await
+            .is_err());
 
         let (resolver, source) = production_fixture(false);
         source.0.lock().as_mut().expect("fixture state").expires_at =
             Some("2000-01-01T00:00:00Z".to_owned());
-        assert!(
-            resolver
-                .resolve_service(ServiceQuery::network("model").expect("query"))
-                .await
-                .is_err()
-        );
+        assert!(resolver
+            .resolve_service(ServiceQuery::network("model").expect("query"))
+            .await
+            .is_err());
     }
 
     #[tokio::test]
@@ -4194,12 +4429,10 @@ mod resolver_tests {
     async fn rejected_or_forked_current_state_never_produces_candidate() {
         let (resolver, source) = production_fixture(false);
         *source.0.lock() = None;
-        assert!(
-            resolver
-                .resolve_service(ServiceQuery::network("model").expect("query"))
-                .await
-                .is_err()
-        );
+        assert!(resolver
+            .resolve_service(ServiceQuery::network("model").expect("query"))
+            .await
+            .is_err());
 
         let (resolver, _) = production_fixture(false);
         resolver
@@ -4209,12 +4442,10 @@ mod resolver_tests {
             .and_then(|entries| entries.first_mut())
             .expect("fixture service")
             .accepted_state_digest = vec![0x77; 64];
-        assert!(
-            resolver
-                .resolve_service(ServiceQuery::network("model").expect("query"))
-                .await
-                .is_err()
-        );
+        assert!(resolver
+            .resolve_service(ServiceQuery::network("model").expect("query"))
+            .await
+            .is_err());
     }
 
     #[tokio::test]
@@ -5354,7 +5585,7 @@ mod get_record_tests {
     use hyprstream_pds::cid::Cid as PdsCid;
     use hyprstream_pds::commit::{Commit, UnsignedCommit};
     use hyprstream_pds::mst::{Node, Proof};
-    use hyprstream_pds::record::{COLLECTION_NSID, ModelRecord};
+    use hyprstream_pds::record::{ModelRecord, COLLECTION_NSID};
     use hyprstream_pds::tid::Tid;
     use p256::ecdsa::{SigningKey as P256SigningKey, VerifyingKey as P256VerifyingKey};
 
