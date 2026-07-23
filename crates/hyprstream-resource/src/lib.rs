@@ -272,6 +272,22 @@ impl From<Assurance> for u8 {
     }
 }
 
+/// The minimum assurance a canonical intent is permitted to require. Unlike
+/// [`Assurance`], this type intentionally has no `Unverified` variant: an
+/// intent cannot make unverified evidence sufficient by selecting a zero floor.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[repr(u8)]
+pub enum RequiredAssurance {
+    Classical = 1,
+    PqHybrid = 2,
+}
+
+impl RequiredAssurance {
+    const fn is_met_by(self, effective: Assurance) -> bool {
+        (effective as u8) >= (self as u8)
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum OwnershipRef {
     Identified(Did),
@@ -311,12 +327,31 @@ pub enum ResourceKind {
     Directory,
 }
 
-/// The canonical intent says whether sealing must yield a content CID. This
-/// makes an absent `content_cid` a checked state, rather than an off switch.
+/// Content-CID presence is derived from the closed resource-kind/operation
+/// matrix, never selected by an untrusted canonical claim.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub enum ContentRequirement {
+enum ContentCidRequirement {
     Required,
-    NotApplicable,
+    Forbidden,
+}
+
+const fn content_cid_requirement(
+    resource_kind: &ResourceKind,
+    operation: ResourceOperation,
+) -> Result<ContentCidRequirement, ContractError> {
+    match (resource_kind, operation) {
+        (ResourceKind::ImmutableBlob, ResourceOperation::Create)
+        | (ResourceKind::MutableFile, ResourceOperation::Create | ResourceOperation::Mutate) => {
+            Ok(ContentCidRequirement::Required)
+        }
+        (ResourceKind::Directory, ResourceOperation::Create | ResourceOperation::Mutate)
+        | (_, ResourceOperation::TransferTitle | ResourceOperation::Delete) => {
+            Ok(ContentCidRequirement::Forbidden)
+        }
+        (ResourceKind::ImmutableBlob, ResourceOperation::Mutate) => {
+            Err(ContractError::InvalidResourceOperation)
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -336,7 +371,7 @@ pub struct IntentClaims {
     pub owner: OwnershipRef,
     pub controller: ControllerRef,
     pub payer: PayerRef,
-    pub content_requirement: ContentRequirement,
+    pub required_assurance: RequiredAssurance,
     pub unit: String,
     pub max_charge: u128,
 }
@@ -386,6 +421,7 @@ impl CanonicalResourceIntent {
         if !predecessor_is_valid {
             return Err(ContractError::InvalidPredecessor);
         }
+        content_cid_requirement(&claims.resource_kind, claims.operation)?;
         let digest = IntentDigest::compute(candidate.digest_suite, &candidate.canonical_bytes);
         if digest != candidate.claimed_digest {
             return Err(ContractError::DigestMismatch);
@@ -458,7 +494,6 @@ pub struct MacAttestationCandidate {
     pub controller: ControllerRef,
     pub capability_binding: CapabilityBinding,
     pub content_label_commitment: ContentLabelCommitment,
-    pub assurance: Assurance,
     /// Unix seconds on the registrar's monotonic-clamped time basis.
     pub expires_at: u64,
     pub envelope: SignatureEnvelope,
@@ -486,7 +521,6 @@ pub struct LedgerAttestationCandidate {
     pub amount: u128,
     pub transfer_id: TransferId,
     pub phase: LedgerPhase,
-    pub assurance: Assurance,
     pub envelope: SignatureEnvelope,
 }
 
@@ -507,6 +541,9 @@ pub struct AcceptedAuthority {
 pub struct VerifiedEvidence {
     pub attestation_cid: Cid,
     pub authority: AcceptedAuthority,
+    /// Assurance derived while verifying this leg's accepted-current evidence,
+    /// rather than copied from the untrusted candidate.
+    pub assurance: Assurance,
 }
 
 pub trait MacAttestationVerifier {
@@ -528,7 +565,7 @@ pub trait LedgerAttestationVerifier {
 }
 
 /// Deployment policy for the separation of the two signing authorities.
-/// Default deployments reject a shared accepted root, signer, or key. Service
+/// Default deployments reject a shared accepted root or signer. Service
 /// or host co-location is not itself evidence of independence: if it lets one
 /// compromise control both roots/keys, this policy must reject the deployment
 /// or the deployment has explicitly accepted that residual risk outside this
@@ -541,8 +578,13 @@ pub trait AttestationIndependencePolicy {
     ) -> Result<(), ContractError>;
 }
 
-/// The baseline policy used by the canonical profile: no shared authority
-/// root, signer DID, or signing key may satisfy both roles.
+/// The baseline policy used by the canonical profile rejects a shared
+/// authority root or signer DID. It deliberately does not compare `key_id`:
+/// that value can be a local fragment (for example, `#resource-v1`) scoped by
+/// its authority namespace, and equal fragments do not prove shared key
+/// material. A deployment that needs cross-namespace key-material detection
+/// must supply an independence policy with a globally scoped verifier-derived
+/// key identity or fingerprint.
 pub struct RejectSharedAttester;
 
 impl AttestationIndependencePolicy for RejectSharedAttester {
@@ -551,10 +593,7 @@ impl AttestationIndependencePolicy for RejectSharedAttester {
         mac: &AcceptedAuthority,
         ledger: &AcceptedAuthority,
     ) -> Result<(), ContractError> {
-        if mac.root == ledger.root
-            || mac.signer == ledger.signer
-            || (mac.key_id == ledger.key_id && mac.key_epoch == ledger.key_epoch)
-        {
+        if mac.root == ledger.root || mac.signer == ledger.signer {
             return Err(ContractError::SharedAttester);
         }
         Ok(())
@@ -671,7 +710,15 @@ impl DualAttestation {
             return Err(ContractError::InvalidAttestationEvidence);
         }
         independence.require_independence(&mac_evidence.authority, &ledger_evidence.authority)?;
-        let effective_assurance = Assurance::minimum_all([mac.assurance, ledger.assurance]);
+        let effective_assurance =
+            Assurance::minimum_all([mac_evidence.assurance, ledger_evidence.assurance]);
+        if !intent
+            .claims()
+            .required_assurance
+            .is_met_by(effective_assurance)
+        {
+            return Err(ContractError::AssuranceRequirementNotMet);
+        }
         Ok(Self {
             mac: VerifiedMacAttestation {
                 attestation: mac,
@@ -772,7 +819,6 @@ impl FinalizedResource {
             return Err(ContractError::WrongKeyPurpose);
         }
         if statement.intent_digest != intent.digest()
-            || dual.mac().attestation().intent_digest != statement.intent_digest
             || statement.operation_id != intent.claims().operation_id
             || statement.resource_id != intent.claims().resource_id
             || statement.fence.resource_id != statement.resource_id
@@ -784,12 +830,14 @@ impl FinalizedResource {
         {
             return Err(ContractError::AttestationProvenanceMismatch);
         }
-        if matches!(
-            intent.claims().content_requirement,
-            ContentRequirement::Required
-        ) && statement.content_cid.is_none()
-        {
-            return Err(ContractError::ContentRequired);
+        match content_cid_requirement(&intent.claims().resource_kind, intent.claims().operation)? {
+            ContentCidRequirement::Required if statement.content_cid.is_none() => {
+                return Err(ContractError::ContentRequired);
+            }
+            ContentCidRequirement::Forbidden if statement.content_cid.is_some() => {
+                return Err(ContractError::ContentForbidden);
+            }
+            ContentCidRequirement::Required | ContentCidRequirement::Forbidden => {}
         }
         Ok(Self {
             operation_id: statement.operation_id,
@@ -1205,6 +1253,7 @@ impl std::error::Error for AuthorityError {}
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ContractError {
     UnsupportedAssurance,
+    AssuranceRequirementNotMet,
     IntentBounds,
     NonCanonicalIntent,
     DigestMismatch,
@@ -1216,7 +1265,9 @@ pub enum ContractError {
     SharedAttester,
     AttestationProvenanceMismatch,
     InvalidPredecessor,
+    InvalidResourceOperation,
     ContentRequired,
+    ContentForbidden,
     InvalidProjection,
     InvalidFinalizationProof,
     StaleProjection,
