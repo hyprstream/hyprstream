@@ -39,6 +39,8 @@ pub enum DenyReason {
     UnverifiableGrant(String),
     /// The unit is not one this enforcer recognizes (no account materialized).
     UnknownUnit,
+    /// The authenticated transport subject is not the holder named by the grant.
+    HolderMismatch,
     /// The spend-authorization signature was absent or invalid.
     InvalidSpendAuthorization(String),
     /// The locally-materialized balance cannot cover the requested amount.
@@ -62,9 +64,10 @@ pub enum DenyReason {
 /// keyed by its [`Cid`] so the hot path never re-verifies (plan §5.2).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerifiedGrant {
-    /// The holder (the identity whose inventory this is). A verifier that
-    /// cannot establish a holder returns `None`; admission must reject it.
-    pub holder: Option<Did>,
+    /// The verified, exact pairwise identity whose inventory this grant names.
+    /// A verifier that cannot establish this value must return
+    /// [`DenyReason::UnverifiableGrant`] rather than construct a grant.
+    pub holder: Did,
     /// The unit (names its issuer — INV-1).
     pub unit: UnitId,
     /// The total cap authorized by this grant (minor units).
@@ -394,7 +397,7 @@ mod tests {
     }
     fn grant(cap: u128) -> VerifiedGrant {
         VerifiedGrant {
-            holder: Some(Did("did:web:alice".to_owned())),
+            holder: Did("did:web:alice".to_owned()),
             unit: unit(),
             cap_amount: cap,
             exp: u64::MAX,

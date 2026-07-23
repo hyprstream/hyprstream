@@ -64,11 +64,37 @@ impl Rejection {
     }
 }
 
+/// Identity produced by the authenticated transport boundary.
+///
+/// This is deliberately opaque and has no production constructor yet. The
+/// #761 PEP must create it beside envelope verification, from the exact
+/// pairwise DID and the verified key material from that same envelope. Until
+/// that wiring exists, request data cannot manufacture an authenticated
+/// identity for ledger admission.
+#[derive(Debug, Clone)]
+pub struct AuthenticatedSubject {
+    did: Did,
+    ed_vk: ed25519_dalek::VerifyingKey,
+    pq_vk: Option<MlDsaVerifyingKey>,
+}
+
+impl AuthenticatedSubject {
+    #[cfg(test)]
+    fn for_test(
+        did: Did,
+        ed_vk: ed25519_dalek::VerifyingKey,
+        pq_vk: Option<MlDsaVerifyingKey>,
+    ) -> Self {
+        Self { did, ed_vk, pq_vk }
+    }
+}
+
 /// A spend admission request presented at the PEP.
 #[derive(Debug, Clone)]
 pub struct AdmissionRequest {
-    /// The verified holder identity. `None` ⇒ anonymous ⇒ deny (plan §5.4).
-    pub subject: Option<Did>,
+    /// The caller identity and key material authenticated by the transport.
+    /// `None` ⇒ anonymous ⇒ deny (plan §5.4). This is not request-supplied.
+    pub authenticated_subject: Option<AuthenticatedSubject>,
     /// The presented allocation grant.
     pub grant_cid: Cid,
     /// The unit being spent (must match the grant's unit).
@@ -82,10 +108,6 @@ pub struct AdmissionRequest {
     /// The subject's spend authorization (§5.3). Required when
     /// [`LedgerConfig`] demands it.
     pub spend_authz: Option<SpendAuthorization>,
-    /// The subject's verified Ed25519 key (same material the envelope verified).
-    pub subject_ed_vk: Option<ed25519_dalek::VerifyingKey>,
-    /// The subject's verified ML-DSA-65 key, if presented (Hybrid).
-    pub subject_pq_vk: Option<MlDsaVerifyingKey>,
 }
 
 /// The result of admission.
@@ -164,14 +186,15 @@ impl LocalEnforcer {
     }
 
     /// The Phase-1 admission contract (plan §5.1). `now` is the unix-second
-    /// clock used only for grant-expiry (the balance CAS uses no clock).
+    /// clock used for grant and spend-authorization expiry (the balance CAS
+    /// uses no clock).
     ///
     /// This is `async` only because grant verification is an async trait (the
     /// production UCAN path); on a cache hit it performs no I/O. The balance
     /// gate ([`CreditGate::try_hold`]) is a sync atomic CAS — INV-2(a).
     pub async fn admit(&self, req: &AdmissionRequest, now: u64) -> AdmissionResult {
         // 1. Fail-closed identity: anonymous holds no inventory ⇒ deny.
-        let subject = match req.subject.as_ref() {
+        let subject = match req.authenticated_subject.as_ref() {
             Some(subject) => subject,
             None => return AdmissionResult::Rejected(Rejection::hard(DenyReason::Anonymous)),
         };
@@ -196,21 +219,11 @@ impl LocalEnforcer {
             )));
         }
 
-        // 4. Bind the verified caller to the verified grant holder. Neither an
-        //    absent holder nor a different (including root-equivalent) DID can
-        //    authorize this spend: grants bind the exact pairwise subject.
-        let holder = match &grant.holder {
-            Some(holder) => holder,
-            None => {
-                return AdmissionResult::Rejected(Rejection::hard(DenyReason::UnverifiableGrant(
-                    "grant has no holder".to_owned(),
-                )));
-            }
-        };
-        if subject != holder {
-            return AdmissionResult::Rejected(Rejection::hard(DenyReason::UnverifiableGrant(
-                "authenticated subject does not match grant holder".to_owned(),
-            )));
+        // 4. Bind the authenticated transport subject to the verified grant
+        //    holder. Both DID and key material originate in the same opaque
+        //    authentication result; request fields cannot assert either.
+        if subject.did != grant.holder {
+            return AdmissionResult::Rejected(Rejection::hard(DenyReason::HolderMismatch));
         }
 
         // 5. Unknown unit ⇒ deny. The requested unit must match the grant's.
@@ -225,7 +238,7 @@ impl LocalEnforcer {
         //    Minting is a pure hash of (grant_cid, nonce) — no side effects.
         let transfer_id = mint_transfer_id(&req.grant_cid, req.nonce);
 
-        // 6. Spend-authorization verification (§5.3). Required for EVERY
+        // 7. Spend-authorization verification (§5.3). Required for EVERY
         //    admission, including zero-amount metered-rate jobs: `Admitted` is
         //    the decision that permits work to start, and a zero reservation
         //    cannot be converted into a nonzero post later — so an unsigned
@@ -236,16 +249,6 @@ impl LocalEnforcer {
         {
             match &req.spend_authz {
                 Some(authz) => {
-                    let ed_vk = match &req.subject_ed_vk {
-                        Some(k) => k,
-                        None => {
-                            return AdmissionResult::Rejected(Rejection::hard(
-                                DenyReason::InvalidSpendAuthorization(
-                                    "no subject verifying key presented".to_owned(),
-                                ),
-                            ));
-                        }
-                    };
                     // The authz must bind to this grant and (if known) this cell.
                     if authz.grant_cid != req.grant_cid || authz.host != self.cell_identity {
                         return AdmissionResult::Rejected(Rejection::hard(
@@ -284,11 +287,11 @@ impl LocalEnforcer {
                             ),
                         ));
                     }
-                    let require_pq = self.require_pq && req.subject_pq_vk.is_some();
+                    let require_pq = self.require_pq && subject.pq_vk.is_some();
                     if let Err(reason) = CreditGate::verify_spend_authz(
                         authz,
-                        ed_vk,
-                        req.subject_pq_vk.as_ref(),
+                        &subject.ed_vk,
+                        subject.pq_vk.as_ref(),
                         require_pq,
                     ) {
                         return AdmissionResult::Rejected(Rejection::hard(reason));
@@ -304,7 +307,7 @@ impl LocalEnforcer {
             }
         }
 
-        // 7. Balance gate: sync CAS on the materialized cell. Cold gate /
+        // 8. Balance gate: sync CAS on the materialized cell. Cold gate /
         //    insufficient credit ⇒ retryable reject, never queue.
         let hold = match self.gate.try_hold(&req.grant_cid, req.amount) {
             Ok(h) => h,
@@ -436,12 +439,11 @@ fn derived_id(domain: &[u8], reserve: TransferId) -> TransferId {
 mod tests {
     use super::*;
     use crate::services::ledger::{
-        CoseCheckpointSigner, CreditGate, DebtBreaker, StaticGrantVerifier,
+        CoseCheckpointSigner, CreditGate, DebtBreaker, GrantVerifier, StaticGrantVerifier,
     };
     use hyprstream_crypto::cose_sign::sign_composite;
     use hyprstream_crypto::pq::{ml_dsa_sk_from_seed, ml_dsa_sk_to_vk_bytes, ml_dsa_vk_from_bytes};
     use hyprstream_ledger::{LedgerBackend, MemLedger, Purpose};
-    use rand::RngCore;
 
     fn unit() -> UnitId {
         UnitId {
@@ -469,6 +471,18 @@ mod tests {
         u128::from_be_bytes(buf)
     }
 
+    fn authenticated_subject(
+        did: Did,
+        ed_sk: &ed25519_dalek::SigningKey,
+        pq_sk: &hyprstream_crypto::pq::MlDsaSigningKey,
+    ) -> AuthenticatedSubject {
+        AuthenticatedSubject::for_test(
+            did,
+            ed_sk.verifying_key(),
+            Some(ml_dsa_vk_from_bytes(&ml_dsa_sk_to_vk_bytes(pq_sk)).unwrap()),
+        )
+    }
+
     /// Build a fully-wired enforcer over a fresh MemLedger, with `grant_cap`
     /// issued to `holder`'s Available account and materialized on the gate.
     /// Also opens a cell-owned usage account (the credit target for spends)
@@ -484,12 +498,12 @@ mod tests {
         ed25519_dalek::SigningKey,
         hyprstream_crypto::pq::MlDsaSigningKey,
     ) {
-        fixture_with_grant_holder(grant_cap, Some(Did("did:web:alice".to_owned()))).await
+        fixture_with_grant_holder(grant_cap, Did("did:web:alice".to_owned())).await
     }
 
     async fn fixture_with_grant_holder(
         grant_cap: u128,
-        grant_holder: Option<Did>,
+        grant_holder: Did,
     ) -> (
         LocalEnforcer,
         Did,
@@ -616,14 +630,12 @@ mod tests {
     async fn anonymous_subject_denied_hard() {
         let (enf, _holder, _cid, _debit, _credit, _, _) = fixture(1000).await;
         let req = AdmissionRequest {
-            subject: None,
+            authenticated_subject: None,
             grant_cid: cid(1),
             unit: unit(),
             amount: 10,
             nonce: rand_nonce(),
             spend_authz: None,
-            subject_ed_vk: None,
-            subject_pq_vk: None,
         };
         match enf.admit(&req, 0).await {
             AdmissionResult::Rejected(r) => {
@@ -648,7 +660,7 @@ mod tests {
             signing_nonce, request_nonce,
             "test requires two distinct 128-bit nonces"
         );
-        let (authz, ed_vk, pq_vk, _tid) = signed_authz(
+        let (authz, _ed_vk, _pq_vk, _tid) = signed_authz(
             &grant_cid,
             enf.cell_identity(),
             signing_nonce,
@@ -658,14 +670,12 @@ mod tests {
             &pq_sk,
         );
         let req = AdmissionRequest {
-            subject: Some(holder),
+            authenticated_subject: Some(authenticated_subject(holder, &ed_sk, &pq_sk)),
             grant_cid,
             unit: unit(),
             amount: 100,
             nonce: request_nonce,
             spend_authz: Some(authz),
-            subject_ed_vk: Some(ed_vk),
-            subject_pq_vk: Some(pq_vk),
         };
         match enf.admit(&req, 0).await {
             AdmissionResult::Rejected(r) => {
@@ -685,16 +695,14 @@ mod tests {
     /// unauthenticated work, not harmless accounting. Must hard-reject.
     #[tokio::test]
     async fn zero_amount_without_authz_denied_hard() {
-        let (enf, holder, grant_cid, _debit, _credit, _ed_sk, _pq_sk) = fixture(1000).await;
+        let (enf, holder, grant_cid, _debit, _credit, ed_sk, pq_sk) = fixture(1000).await;
         let req = AdmissionRequest {
-            subject: Some(holder),
+            authenticated_subject: Some(authenticated_subject(holder, &ed_sk, &pq_sk)),
             grant_cid,
             unit: unit(),
             amount: 0,
             nonce: rand_nonce(),
             spend_authz: None,
-            subject_ed_vk: None,
-            subject_pq_vk: None,
         };
         match enf.admit(&req, 0).await {
             AdmissionResult::Rejected(r) => {
@@ -717,17 +725,22 @@ mod tests {
         let (enf, holder, grant_cid, _debit, _credit, ed_sk, pq_sk) = fixture(1000).await;
         // Valid signature, right grant/host/nonce/transfer id — but exp = 5.
         let nonce = rand_nonce();
-        let (authz, ed_vk, pq_vk, _tid) =
-            signed_authz(&grant_cid, enf.cell_identity(), nonce, 100, 5, &ed_sk, &pq_sk);
+        let (authz, _ed_vk, _pq_vk, _tid) = signed_authz(
+            &grant_cid,
+            enf.cell_identity(),
+            nonce,
+            100,
+            5,
+            &ed_sk,
+            &pq_sk,
+        );
         let req = AdmissionRequest {
-            subject: Some(holder),
+            authenticated_subject: Some(authenticated_subject(holder, &ed_sk, &pq_sk)),
             grant_cid,
             unit: unit(),
             amount: 100,
             nonce,
             spend_authz: Some(authz),
-            subject_ed_vk: Some(ed_vk),
-            subject_pq_vk: Some(pq_vk),
         };
         // now == exp is already expired (>=, mirroring the grant-expiry check).
         match enf.admit(&req, 5).await {
@@ -747,7 +760,7 @@ mod tests {
     async fn admitted_then_post_and_void_roundtrip() {
         let (enf, holder, grant_cid, debit, credit, ed_sk, pq_sk) = fixture(1000).await;
         let nonce = rand_nonce();
-        let (authz, ed_vk, pq_vk, _tid) = signed_authz(
+        let (authz, _ed_vk, _pq_vk, _tid) = signed_authz(
             &grant_cid,
             enf.cell_identity(),
             nonce,
@@ -757,14 +770,12 @@ mod tests {
             &pq_sk,
         );
         let req = AdmissionRequest {
-            subject: Some(holder.clone()),
+            authenticated_subject: Some(authenticated_subject(holder.clone(), &ed_sk, &pq_sk)),
             grant_cid: grant_cid.clone(),
             unit: unit(),
             amount: 100,
             nonce,
             spend_authz: Some(authz),
-            subject_ed_vk: Some(ed_vk),
-            subject_pq_vk: Some(pq_vk),
         };
         let (transfer_id, hold, grant) = match enf.admit(&req, 0).await {
             AdmissionResult::Admitted {
@@ -786,79 +797,70 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn different_subject_than_grant_holder_denied_hard() {
+    async fn different_authenticated_subject_presenting_valid_grant_denied_hard() {
         let (enf, _holder, grant_cid, _debit, _credit, _ed_sk, _pq_sk) = fixture(1000).await;
         let attacker_ed_sk = ed25519_dalek::SigningKey::from_bytes(&[3u8; 32]);
         let attacker_pq_sk = ml_dsa_sk_from_seed(&[4u8; 32]);
-        let nonce = random_nonce();
-        let (authz, ed_vk, pq_vk, _) = signed_authz(
+        let nonce = rand_nonce();
+        let (authz, _ed_vk, _pq_vk, _) = signed_authz(
             &grant_cid,
             enf.cell_identity(),
             nonce,
             100,
+            u64::MAX,
             &attacker_ed_sk,
             &attacker_pq_sk,
         );
         let req = AdmissionRequest {
-            subject: Some(Did("did:web:bob".to_owned())),
+            // Alice's grant is presented with Bob's *authenticated* transport
+            // identity and Bob's matching verified keys. There is no
+            // caller-controlled subject field to assert Alice instead.
+            authenticated_subject: Some(authenticated_subject(
+                Did("did:web:bob".to_owned()),
+                &attacker_ed_sk,
+                &attacker_pq_sk,
+            )),
             grant_cid,
             unit: unit(),
             amount: 100,
             nonce,
             spend_authz: Some(authz),
-            subject_ed_vk: Some(ed_vk),
-            subject_pq_vk: Some(pq_vk),
         };
 
         match enf.admit(&req, 0).await {
             AdmissionResult::Rejected(r) => {
-                assert_eq!(
-                    r.reason,
-                    DenyReason::UnverifiableGrant(
-                        "authenticated subject does not match grant holder".to_owned()
-                    )
-                );
+                assert_eq!(r.reason, DenyReason::HolderMismatch);
                 assert!(r.retry_after_secs.is_none());
             }
-            other => panic!("different subject must be denied, got {other:?}"),
+            other => panic!("different authenticated subject must be denied, got {other:?}"),
         }
     }
 
     #[tokio::test]
-    async fn grant_without_holder_denied_hard() {
-        let (enf, holder, grant_cid, _debit, _credit, ed_sk, pq_sk) =
-            fixture_with_grant_holder(1000, None).await;
-        let nonce = random_nonce();
-        let (authz, ed_vk, pq_vk, _) =
-            signed_authz(&grant_cid, enf.cell_identity(), nonce, 100, &ed_sk, &pq_sk);
-        let req = AdmissionRequest {
-            subject: Some(holder),
-            grant_cid,
-            unit: unit(),
-            amount: 100,
-            nonce,
-            spend_authz: Some(authz),
-            subject_ed_vk: Some(ed_vk),
-            subject_pq_vk: Some(pq_vk),
-        };
+    async fn absent_holder_refuses_at_verification_boundary() {
+        struct HolderlessVerifier;
 
-        match enf.admit(&req, 0).await {
-            AdmissionResult::Rejected(r) => {
-                assert_eq!(
-                    r.reason,
-                    DenyReason::UnverifiableGrant("grant has no holder".to_owned())
-                );
-                assert!(r.retry_after_secs.is_none());
+        #[async_trait::async_trait]
+        impl GrantVerifier for HolderlessVerifier {
+            async fn verify(&self, _grant_cid: &Cid) -> Result<VerifiedGrant, DenyReason> {
+                Err(DenyReason::UnverifiableGrant(
+                    "grant has no holder".to_owned(),
+                ))
             }
-            other => panic!("grant without holder must be denied, got {other:?}"),
         }
+
+        let gate = CreditGate::new(Arc::new(HolderlessVerifier));
+        assert_eq!(
+            gate.verify_grant(&cid(1)).await.unwrap_err(),
+            DenyReason::UnverifiableGrant("grant has no holder".to_owned())
+        );
     }
 
     #[tokio::test]
     async fn insufficient_credit_rejects_retryable_not_queues() {
         let (enf, holder, grant_cid, _debit, _credit, ed_sk, pq_sk) = fixture(100).await;
         let nonce = rand_nonce();
-        let (authz, ed_vk, pq_vk, _) = signed_authz(
+        let (authz, _ed_vk, _pq_vk, _) = signed_authz(
             &grant_cid,
             enf.cell_identity(),
             nonce,
@@ -868,14 +870,12 @@ mod tests {
             &pq_sk,
         );
         let req = AdmissionRequest {
-            subject: Some(holder),
+            authenticated_subject: Some(authenticated_subject(holder, &ed_sk, &pq_sk)),
             grant_cid,
             unit: unit(),
             amount: 500, // > available 100
             nonce,
             spend_authz: Some(authz),
-            subject_ed_vk: Some(ed_vk),
-            subject_pq_vk: Some(pq_vk),
         };
         match enf.admit(&req, 0).await {
             AdmissionResult::Rejected(r) => {
@@ -894,7 +894,7 @@ mod tests {
         // Asserts the cold-gate contract at the gate level: an unmaterialized
         // grant denies ColdGate, then admits once materialized.
         let g = VerifiedGrant {
-            holder: Some(Did("did:web:bob".to_owned())),
+            holder: Did("did:web:bob".to_owned()),
             unit: unit(),
             cap_amount: 100,
             exp: u64::MAX,
