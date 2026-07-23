@@ -366,6 +366,116 @@ async fn relay_mode_refuses_anonymous_connect() -> Result<()> {
     Ok(())
 }
 
+/// #1153 CRITICAL 3 (relay authorization): an authenticated publisher may
+/// publish into its OWN tenant's namespace through the relay, but NOT into
+/// another tenant's namespace. Authentication without authorization was the
+/// gap (Alice could publish `bob/...`); the relay now scopes ingest to the
+/// verified tenant prefix.
+#[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+async fn relay_authenticated_cross_tenant_publish_refused() -> Result<()> {
+    hyprstream_rpc::transport::install_pq_crypto_provider().expect("install PQ provider");
+
+    let relay_producer = moq_net::Origin::random().produce();
+    let relay_consumer = relay_producer.consume();
+
+    let issuer = fresh_signing_key();
+    // Mallory is provisioned as tenant "alice" but will attempt to publish
+    // into bob's namespace.
+    let authz = authz_for(issuer.verifying_key(), &[("did:key:mallory", "alice")]);
+
+    let (server, addr, cert_der) = build_server()?;
+    let rpc_server = QuinnRpcServer::with_capacity(
+        server,
+        trivial_processor(),
+        fresh_signing_key(),
+        hyprstream_rpc::transport::rpc_session::DEFAULT_STREAM_LIMIT,
+    )
+    .with_moq_relay(relay_producer.clone())
+    .with_moq_connect_authz(authz);
+    let shutdown = rpc_server.shutdown_token();
+    let server_task = tokio::spawn(rpc_server.run());
+    let pin = cert_sha256(&cert_der);
+
+    // Authenticated as alice, attempt to publish BOB_BROADCAST into the shared
+    // relay origin. The scoped ingest producer must reject the cross-tenant
+    // publish — the relay origin never announces bob/...
+    let tok = mint_aud(&issuer, "did:key:mallory");
+    let attacker_producer = moq_net::Origin::random().produce();
+    let _injected = attacker_producer
+        .create_broadcast(BOB_BROADCAST)
+        .ok_or_else(|| anyhow!("create bob broadcast"))?;
+    let moq_client = moq_net::Client::new().with_origin(attacker_producer);
+    let session =
+        connect_pinned_hashes_path_with_headers(addr, &[pin], MOQ_PATH, bearer_headers(&tok))
+            .await?;
+    let _moq_session = moq_client.connect(session).await?;
+    tokio::spawn(async move {
+        let _ = _moq_session.closed().await;
+    });
+
+    assert!(
+        !announces(&relay_consumer, BOB_BROADCAST).await,
+        "relay must NOT ingest a cross-tenant publish (Alice publishing bob/) — \
+         CRITICAL 3: authentication without authorization"
+    );
+
+    shutdown.cancel();
+    let _ = server_task.await;
+    Ok(())
+}
+
+/// #1153 CRITICAL 3 positive case: an authenticated publisher CAN publish into
+/// its OWN tenant's namespace through the relay (the scope does not over-restrict
+/// legitimate same-tenant traffic).
+#[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+async fn relay_authenticated_own_tenant_publish_succeeds() -> Result<()> {
+    hyprstream_rpc::transport::install_pq_crypto_provider().expect("install PQ provider");
+
+    let relay_producer = moq_net::Origin::random().produce();
+    let relay_consumer = relay_producer.consume();
+
+    let issuer = fresh_signing_key();
+    let authz = authz_for(issuer.verifying_key(), &[("did:key:alice", "alice")]);
+
+    let (server, addr, cert_der) = build_server()?;
+    let rpc_server = QuinnRpcServer::with_capacity(
+        server,
+        trivial_processor(),
+        fresh_signing_key(),
+        hyprstream_rpc::transport::rpc_session::DEFAULT_STREAM_LIMIT,
+    )
+    .with_moq_relay(relay_producer.clone())
+    .with_moq_connect_authz(authz);
+    let shutdown = rpc_server.shutdown_token();
+    let server_task = tokio::spawn(rpc_server.run());
+    let pin = cert_sha256(&cert_der);
+
+    // Authenticated as alice, publish ALICE_BROADCAST — own-tenant, must be
+    // ingested and re-served by the relay.
+    let tok = mint_aud(&issuer, "did:key:alice");
+    let alice_producer = moq_net::Origin::random().produce();
+    let _a = alice_producer
+        .create_broadcast(ALICE_BROADCAST)
+        .ok_or_else(|| anyhow!("create alice broadcast"))?;
+    let moq_client = moq_net::Client::new().with_origin(alice_producer);
+    let session =
+        connect_pinned_hashes_path_with_headers(addr, &[pin], MOQ_PATH, bearer_headers(&tok))
+            .await?;
+    let _moq_session = moq_client.connect(session).await?;
+    tokio::spawn(async move {
+        let _ = _moq_session.closed().await;
+    });
+
+    assert!(
+        announces(&relay_consumer, ALICE_BROADCAST).await,
+        "relay must ingest an authenticated own-tenant publish"
+    );
+
+    shutdown.cancel();
+    let _ = server_task.await;
+    Ok(())
+}
+
 /// Compile-time check that the documented public API surface is wired.
 #[test]
 fn authz_surface_is_public() {

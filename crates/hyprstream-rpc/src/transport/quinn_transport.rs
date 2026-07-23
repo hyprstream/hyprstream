@@ -108,6 +108,10 @@ pub fn global_moq_connect_authz() -> Option<crate::transport::moq_connect_auth::
     GLOBAL_MOQ_CONNECT_AUTHZ.get().cloned()
 }
 
+/// One-shot guard so the "no authenticator on a served `/moq` plane" warning
+/// (#1153/F1) fires once per process rather than per-CONNECT.
+static MOQ_NO_AUTHZ_WARNED: std::sync::Once = std::sync::Once::new();
+
 /// A quinn-backed WebTransport server for the RPC plane.
 ///
 /// Accepts WebTransport sessions and spawns [`serve_rpc_connection`] for each.
@@ -202,10 +206,14 @@ impl QuinnRpcServer {
             moq_consumer: None,
             moq_relay_origin: None,
             moq_authz: crate::transport::iroh_moq::MoqAuthzConfig::default(),
-            // Pick up the process-global `/moq` CONNECT authenticator if the
-            // `hyprstream` crate registered one (shared-endpoint boundary);
-            // a builder call can still override it.
-            moq_connect_authz: global_moq_connect_authz(),
+            // #1153/F3: do NOT snapshot `global_moq_connect_authz()` here.
+            // Reading the OnceLock once at construction makes startup ordering
+            // a silent security property: a server built before the `hyprstream`
+            // crate registers the authenticator runs open forever with no error.
+            // The accept loop resolves the effective authenticator per-CONNECT
+            // (`builder override OR global`), so registration order is no longer
+            // load-bearing.
+            moq_connect_authz: None,
             // Pick up the process-global 9P handler if the `hyprstream` crate
             // registered one; a builder call can still override it.
             ninep_handler: global_ninep_handler(),
@@ -443,9 +451,35 @@ impl QuinnRpcServer {
                         let is_ninep = request.url.path() == crate::dial::NINEP_PATH;
                         let is_browser_rpc = request.url.path()
                             == crate::browser_provisioning::BROWSER_RPC_PATH;
+                        // #1153/F3: resolve the effective authenticator
+                        // per-CONNECT (builder override OR process-global),
+                        // NOT once at construction. This removes the
+                        // ordering-dependent silent downgrade where a server
+                        // built before `set_global_moq_connect_authz` ran open
+                        // forever.
+                        let moq_connect_authz = moq_connect_authz
+                            .clone()
+                            .or_else(global_moq_connect_authz);
+                        // #1153/F1: if this endpoint serves `/moq` but no
+                        // authenticator is configured (override or global), warn
+                        // loudly ONCE per process — the unset state is exactly
+                        // the #1145 shape (an absent expected value silently
+                        // disabling the boundary) and must be detectable.
+                        if is_moq
+                            && (moq_consumer.is_some() || moq_relay_origin.is_some())
+                            && moq_connect_authz.is_none()
+                        {
+                            MOQ_NO_AUTHZ_WARNED.call_once(|| {
+                                tracing::warn!(
+                                    "quinn-moq: /moq plane is served with NO CONNECT authenticator (#1153) — \
+                                     anonymous/unscoped admission is LIVE. This is the #1145 fail-open shape; \
+                                     install MoqConnectAuthz via set_global_moq_connect_authz for a shared endpoint."
+                                );
+                            });
+                        }
                         // #1153: authenticate the `/moq` CONNECT BEFORE the
                         // WebTransport session is established. When a
-                        // `MoqConnectAuthz` is installed, a `/moq` CONNECT must
+                        // `MoqConnectAuthz` is resolved, a `/moq` CONNECT must
                         // present a verifiable bearer JWT (Authorization header)
                         // whose subject the server resolves to a tenant; any
                         // failure refuses the CONNECT — we `return` here,
@@ -510,15 +544,41 @@ impl QuinnRpcServer {
                             // so announce-name visibility through a relay is
                             // inherent to relay mode; frame content is already
                             // AEAD-sealed + chained-HMAC'd at the source.
+                            //
+                            // #1153 CRITICAL 3 (relay authorization): bind the
+                            // publisher's INGEST to its verified tenant prefix by
+                            // handing `Server::with_origin` a *scoped* producer.
+                            // Authentication alone let Alice publish into Bob's
+                            // namespace; `OriginProducer::scope` restricts this
+                            // session's publishes to `{tenant}/`, so a publish
+                            // of another tenant's prefix is rejected at ingest.
                             if let Some(relay_origin) = moq_relay_origin {
-                                if let Some(verified) = &moq_connect_verified {
-                                    tracing::debug!(
-                                        subject = ?verified.peer.subject,
-                                        tenant = %verified.tenant,
-                                        "quinn-moq-relay: admitting authenticated publisher"
-                                    );
-                                }
-                                let server = moq_net::Server::new().with_origin(relay_origin);
+                                let scoped_origin = match &moq_connect_verified {
+                                    Some(verified) => {
+                                        let prefix =
+                                            crate::moq_authz::tenant_prefix(&verified.tenant);
+                                        let path = moq_net::Path::new(&prefix);
+                                        match relay_origin.scope(&[path]) {
+                                            Some(scoped) => {
+                                                tracing::debug!(
+                                                    subject = ?verified.peer.subject,
+                                                    tenant = %verified.tenant,
+                                                    "quinn-moq-relay: admitting authenticated publisher scoped to tenant prefix"
+                                                );
+                                                scoped
+                                            }
+                                            None => {
+                                                tracing::warn!(
+                                                    tenant = %verified.tenant,
+                                                    "quinn-moq-relay: tenant prefix out of relay scope; refusing publisher"
+                                                );
+                                                return;
+                                            }
+                                        }
+                                    }
+                                    None => relay_origin,
+                                };
+                                let server = moq_net::Server::new().with_origin(scoped_origin);
                                 match server.accept(session).await {
                                     Ok(moq_session) => {
                                         tokio::select! {
