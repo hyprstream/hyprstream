@@ -127,38 +127,15 @@ impl<R: IdentityResolver> AtprotoPerimeterGateway<R> {
             .resolve_identity_keys(&did)
             .map_err(|e| anyhow!("perimeter enroll: DID {did} did not resolve: {e}"))?;
 
-        // Fail-closed on missing verifying key material for the asserted assurance:
-        // a `Classical`/`PqHybrid` assurance with no Ed25519 key, or a `PqHybrid`
-        // assurance with no ML-DSA-65 anchor, is an inconsistent resolution we will
-        // not enroll.
-        match keys.assurance {
-            Assurance::Unverified => {
-                return Err(anyhow!(
-                    "perimeter enroll: DID {did} resolved Unverified (no verifiable key) — fail-closed"
-                ));
-            }
-            Assurance::Classical => {
-                if keys.ed25519.is_none() {
-                    return Err(anyhow!(
-                        "perimeter enroll: DID {did} asserts Classical but published no Ed25519 key — fail-closed"
-                    ));
-                }
-            }
-            Assurance::PqHybrid => {
-                if keys.ed25519.is_none() {
-                    return Err(anyhow!(
-                        "perimeter enroll: DID {did} asserts PqHybrid but published no Ed25519 key — fail-closed"
-                    ));
-                }
-                if keys.ml_dsa_65.is_none() {
-                    return Err(anyhow!(
-                        "perimeter enroll: DID {did} asserts PqHybrid but published no ML-DSA-65 anchor — fail-closed"
-                    ));
-                }
-            }
-        }
-
-        let key_material = assurance_to_key_material(keys.assurance);
+        // Admission already verified `admitted.key` against the DID document.
+        // Select that exact candidate from the named set rather than granting
+        // document-order authority to another overlap/rotation slot.
+        let candidate = keys.candidate_for_ed25519(&admitted.key).ok_or_else(|| {
+            anyhow!(
+                "perimeter enroll: DID {did} no longer publishes the admitted Ed25519 signer — fail-closed"
+            )
+        })?;
+        let key_material = assurance_to_key_material(candidate.assurance());
         let derived = key_material.assurance();
 
         // Edge ceiling × clamp-DOWN to crypto-derived assurance (#548).
@@ -441,7 +418,7 @@ pub struct TranslatedAtprotoAuthorization {
 mod tests {
     use super::*;
     use crate::crypto::pq::ml_dsa_generate_keypair;
-    use crate::identity::{IdentityKeys, MlDsaVk};
+    use crate::identity::{IdentityKeyCandidate, IdentityKeys, MlDsaVk};
 
     const DID_WEB: &str = "did:web:peer.example";
 
@@ -455,6 +432,20 @@ mod tests {
 
     fn an_ml_dsa_vk() -> MlDsaVk {
         ml_dsa_generate_keypair().1
+    }
+
+    fn classical_keys(ed25519: [u8; 32]) -> IdentityKeys {
+        IdentityKeys::single_ed25519("did:web:peer.example#mesh", ed25519)
+    }
+
+    fn hybrid_keys(ed25519: [u8; 32]) -> IdentityKeys {
+        IdentityKeys {
+            candidates: vec![IdentityKeyCandidate {
+                id: "did:web:peer.example#mesh".to_owned(),
+                ed25519,
+                ml_dsa_65: Some(an_ml_dsa_vk()),
+            }],
+        }
     }
 
     /// Fixture resolver returning fixed key material — the #549 stand-in for #579,
@@ -476,11 +467,7 @@ mod tests {
 
     #[test]
     fn classical_peer_enrolls_at_classical_assurance() {
-        let keys = IdentityKeys {
-            ed25519: Some([7u8; 32]),
-            ml_dsa_65: None,
-            assurance: Assurance::Classical,
-        };
+        let keys = classical_keys([7u8; 32]);
         let gw = AtprotoPerimeterGateway::new(FixtureResolver(keys));
         let peer = gw
             .enroll(&admitted(Some(DID_WEB), [7u8; 32]))
@@ -497,11 +484,7 @@ mod tests {
 
     #[test]
     fn pqhybrid_peer_enrolls_at_pqhybrid_assurance() {
-        let keys = IdentityKeys {
-            ed25519: Some([9u8; 32]),
-            ml_dsa_65: Some(an_ml_dsa_vk()),
-            assurance: Assurance::PqHybrid,
-        };
+        let keys = hybrid_keys([9u8; 32]);
         let gw = AtprotoPerimeterGateway::new(FixtureResolver(keys));
         let peer = gw
             .enroll(&admitted(Some(DID_WEB), [9u8; 32]))
@@ -513,11 +496,7 @@ mod tests {
 
     #[test]
     fn unverified_resolution_fails_closed() {
-        let keys = IdentityKeys {
-            ed25519: None,
-            ml_dsa_65: None,
-            assurance: Assurance::Unverified,
-        };
+        let keys = IdentityKeys::default();
         let gw = AtprotoPerimeterGateway::new(FixtureResolver(keys));
         assert!(gw.enroll(&admitted(Some(DID_WEB), [0u8; 32])).is_err());
     }
@@ -531,36 +510,55 @@ mod tests {
     #[test]
     fn missing_did_fails_closed() {
         // Admission matched via JWKS fallback only — no DID to resolve.
-        let keys = IdentityKeys {
-            ed25519: Some([2u8; 32]),
-            ml_dsa_65: None,
-            assurance: Assurance::Classical,
-        };
+        let keys = classical_keys([2u8; 32]);
         let gw = AtprotoPerimeterGateway::new(FixtureResolver(keys));
         assert!(gw.enroll(&admitted(None, [2u8; 32])).is_err());
     }
 
     #[test]
-    fn pqhybrid_assertion_without_ml_dsa_fails_closed() {
-        // Inconsistent resolution: claims PqHybrid but published no PQ anchor.
-        let keys = IdentityKeys {
-            ed25519: Some([3u8; 32]),
-            ml_dsa_65: None,
-            assurance: Assurance::PqHybrid,
-        };
+    fn candidate_set_without_admitted_signer_fails_closed() {
+        let keys = classical_keys([4u8; 32]);
         let gw = AtprotoPerimeterGateway::new(FixtureResolver(keys));
         assert!(gw.enroll(&admitted(Some(DID_WEB), [3u8; 32])).is_err());
+    }
+
+    #[test]
+    fn overlap_selects_each_admitted_signer_then_rejects_the_retired_candidate() {
+        let old = [30u8; 32];
+        let new = [31u8; 32];
+        let overlap = IdentityKeys {
+            candidates: vec![
+                IdentityKeyCandidate {
+                    id: "did:web:peer.example#mesh-old".to_owned(),
+                    ed25519: old,
+                    ml_dsa_65: None,
+                },
+                IdentityKeyCandidate {
+                    id: "did:web:peer.example#mesh-new".to_owned(),
+                    ed25519: new,
+                    ml_dsa_65: Some(an_ml_dsa_vk()),
+                },
+            ],
+        };
+        let old_peer = AtprotoPerimeterGateway::new(FixtureResolver(overlap.clone()))
+            .enroll(&admitted(Some(DID_WEB), old))
+            .expect("draining key remains accepted during overlap");
+        let new_peer = AtprotoPerimeterGateway::new(FixtureResolver(overlap))
+            .enroll(&admitted(Some(DID_WEB), new))
+            .expect("new key is accepted during overlap");
+        assert_eq!(old_peer.assurance, Assurance::Classical);
+        assert_eq!(new_peer.assurance, Assurance::PqHybrid);
+
+        let retired = IdentityKeys::single_ed25519("did:web:peer.example#mesh-new", new);
+        let gateway = AtprotoPerimeterGateway::new(FixtureResolver(retired));
+        assert!(gateway.enroll(&admitted(Some(DID_WEB), old)).is_err());
     }
 
     #[test]
     fn classical_peer_cannot_obtain_pqhybrid_context() {
         // A classical-key peer, even resolved at the PqHybrid-capable edge, must
         // clamp to Classical and fail to dominate a PqHybrid object.
-        let keys = IdentityKeys {
-            ed25519: Some([4u8; 32]),
-            ml_dsa_65: None,
-            assurance: Assurance::Classical,
-        };
+        let keys = classical_keys([4u8; 32]);
         let gw = AtprotoPerimeterGateway::new(FixtureResolver(keys));
         let peer = gw.enroll(&admitted(Some(DID_WEB), [4u8; 32])).unwrap();
 
@@ -572,11 +570,7 @@ mod tests {
 
     #[test]
     fn enrollment_store_insert_get_roundtrip() {
-        let keys = IdentityKeys {
-            ed25519: Some([5u8; 32]),
-            ml_dsa_65: None,
-            assurance: Assurance::Classical,
-        };
+        let keys = classical_keys([5u8; 32]);
         let gw = AtprotoPerimeterGateway::new(FixtureResolver(keys));
         let peer = gw.enroll(&admitted(Some(DID_WEB), [5u8; 32])).unwrap();
 
@@ -601,11 +595,7 @@ mod tests {
         let native = crate::envelope::KeyedPqTrustStore::new();
         assert!(native.is_empty());
 
-        let keys = IdentityKeys {
-            ed25519: Some([6u8; 32]),
-            ml_dsa_65: Some(an_ml_dsa_vk()),
-            assurance: Assurance::PqHybrid,
-        };
+        let keys = hybrid_keys([6u8; 32]);
         let gw = AtprotoPerimeterGateway::new(FixtureResolver(keys));
         let peer = gw.enroll(&admitted(Some(DID_WEB), [6u8; 32])).unwrap();
 
@@ -618,11 +608,7 @@ mod tests {
     }
 
     fn classical_peer() -> EnrolledPeer {
-        let keys = IdentityKeys {
-            ed25519: Some([11u8; 32]),
-            ml_dsa_65: None,
-            assurance: Assurance::Classical,
-        };
+        let keys = classical_keys([11u8; 32]);
         AtprotoPerimeterGateway::new(FixtureResolver(keys))
             .enroll(&admitted(Some(DID_WEB), [11u8; 32]))
             .unwrap()

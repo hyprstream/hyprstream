@@ -628,7 +628,10 @@ pub async fn root_did_document(State(state): State<Arc<OAuthState>>) -> Response
         });
     }
 
-    let keys: Vec<(String, VerifyingKey)> = vec![("key-1".to_owned(), vk)];
+    // `#mesh` is the classical half of the explicitly named `#mesh-pq`
+    // hybrid candidate. Keeping the pair's stable shared name lets consumers
+    // bind it without relying on verification-method array order.
+    let keys: Vec<(String, VerifyingKey)> = vec![("mesh".to_owned(), vk)];
 
     let doc = build_did_document(
         &did,

@@ -213,7 +213,10 @@ mod did_tests {
         // A fixed 32-byte key → did:key → back to the same bytes.
         let key = [7u8; 32];
         let did = Did::from_ed25519(&key);
-        assert!(did.is_did_key(), "from_ed25519 must produce a did:key: {did}");
+        assert!(
+            did.is_did_key(),
+            "from_ed25519 must produce a did:key: {did}"
+        );
         assert_eq!(did.to_ed25519().expect("decode"), key);
     }
 
@@ -263,19 +266,67 @@ pub type Ed25519Vk = [u8; 32];
 /// primitive ([`crate::crypto::pq::MlDsaVerifyingKey`]).
 pub type MlDsaVk = MlDsaVerifyingKey;
 
-/// The key material a resolver returns for an identity.
+/// One named verification-key candidate published by an identity.
 ///
-/// `ml_dsa_65 == None` ⇒ classical-only edge; `Some` ⇒ a hybrid-PQC anchor is
-/// present. `assurance` is **crypto-derived by the resolver**, never
-/// self-asserted — consumers map it 1:1 into their MAC key material.
+/// A DID document is a key *set*, not a positional one-key container. `id` is
+/// the verification-method identifier that names this candidate. A hybrid
+/// candidate carries the ML-DSA key explicitly paired with this Ed25519 key;
+/// it is never formed by pairing unrelated entries based on document order.
 #[derive(Clone)]
-pub struct IdentityKeys {
-    /// The classical Ed25519 verifying key, if the identity published one.
-    pub ed25519: Option<Ed25519Vk>,
-    /// The bound ML-DSA-65 verifying key, if the identity published a PQ anchor.
+pub struct IdentityKeyCandidate {
+    /// Stable DID verification-method identifier.
+    pub id: String,
+    /// The candidate's classical Ed25519 verifying key.
+    pub ed25519: Ed25519Vk,
+    /// The ML-DSA-65 key explicitly bound to this candidate, when published.
     pub ml_dsa_65: Option<MlDsaVk>,
-    /// The assurance the resolver established for this identity (crypto-derived).
-    pub assurance: Assurance,
+}
+
+impl IdentityKeyCandidate {
+    /// Crypto-derived assurance for this one candidate.
+    pub fn assurance(&self) -> Assurance {
+        if self.ml_dsa_65.is_some() {
+            Assurance::PqHybrid
+        } else {
+            Assurance::Classical
+        }
+    }
+}
+
+/// The named verification-key candidates a resolver returns for an identity.
+///
+/// Consumers must select a candidate using a protocol-provided key identifier
+/// or verified signer, and must never use document order to choose authority.
+/// `did:key` is represented as a one-candidate set because its one-key wire
+/// format is intentional and self-certifying.
+#[derive(Clone, Default)]
+pub struct IdentityKeys {
+    pub candidates: Vec<IdentityKeyCandidate>,
+}
+
+impl IdentityKeys {
+    /// Return the named candidate whose Ed25519 key authenticated the peer.
+    pub fn candidate_for_ed25519(&self, key: &Ed25519Vk) -> Option<&IdentityKeyCandidate> {
+        let mut matches = self
+            .candidates
+            .iter()
+            .filter(|candidate| &candidate.ed25519 == key);
+        let candidate = matches.next()?;
+        // Duplicate named candidates for one signer are ambiguous: accepting an
+        // arbitrary one could attach a different hybrid binding.
+        matches.next().is_none().then_some(candidate)
+    }
+
+    /// Construct the intentional single-key `did:key` representation.
+    pub fn single_ed25519(id: impl Into<String>, ed25519: Ed25519Vk) -> Self {
+        Self {
+            candidates: vec![IdentityKeyCandidate {
+                id: id.into(),
+                ed25519,
+                ml_dsa_65: None,
+            }],
+        }
+    }
 }
 
 /// Resolves a `Did` to its verified key material.
