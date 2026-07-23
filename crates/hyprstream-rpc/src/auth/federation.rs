@@ -7,6 +7,17 @@
 use anyhow::Result;
 use ed25519_dalek::VerifyingKey;
 
+/// One named Ed25519 key published in a federation JWKS.
+///
+/// `kid` stays attached to its key until verification.  Collapsing this to a
+/// bare `VerifyingKey` would let a token that names one key verify with a
+/// different, merely co-published key.
+#[derive(Clone, Debug)]
+pub struct FederationKey {
+    pub kid: Option<String>,
+    pub verifying_key: VerifyingKey,
+}
+
 /// Resolves external JWT issuer URLs to Ed25519 verifying keys.
 ///
 /// Implemented by `hyprstream::auth::FederationKeyResolver`. Services that
@@ -17,12 +28,10 @@ use ed25519_dalek::VerifyingKey;
 /// # Key-set semantics (rotation-aware, #1185)
 ///
 /// A published JWKS is a **named set**, never an ordered singleton. `get_keys`
-/// returns every usable Ed25519 entry from the issuer's current JWKS so the
-/// caller can try each candidate — this is what makes overlap rotation (old +
-/// new keys published simultaneously) and future PQ-hybrid publication
-/// possible. When the JWT carries a `kid`, the matching candidate is ordered
-/// first; the rest follow so a verifier that prefers the kid still benefits
-/// from overlap fallback if the named key has been retired mid-window.
+/// returns every usable named Ed25519 entry from the issuer's current JWKS so
+/// a token without a `kid` can try each candidate. When the JWT carries a
+/// `kid`, it returns only entries with that exact `kid`; a named token must
+/// never verify with another co-published key.
 ///
 /// The resolver MUST NOT collapse the set to a positional singleton: returning
 /// the "first" Ed25519 key forecloses rotation (#1183). An empty result is an
@@ -50,11 +59,9 @@ pub trait FederationKeySource: Send + Sync + 'static {
     /// Fetch (or return from cache) the Ed25519 candidate verifying keys for
     /// `issuer`.
     ///
-    /// Returns every usable Ed25519 key from the issuer's JWKS, ordered so
-    /// that when `kid` is `Some` the matching candidate comes first and the
-    /// remaining overlap candidates follow. The caller SHOULD try each
-    /// candidate against the JWT and accept the first that verifies — this is
-    /// the rotation/pQ-hybrid publication model (#1183).
+    /// Returns every usable named Ed25519 key from the issuer's JWKS. When
+    /// `kid` is `Some`, every returned entry has that exact `kid`; when it is
+    /// `None`, the caller may try each candidate against the JWT.
     ///
     /// On a cache miss for the requested `kid`, the resolver refetches the
     /// JWKS once and re-checks. A `kid` that is still absent after a fresh
@@ -67,7 +74,7 @@ pub trait FederationKeySource: Send + Sync + 'static {
     /// - the issuer is not in the trusted list (`is_trusted` returns `false`), or
     /// - the JWKS endpoint is unreachable or returns no usable Ed25519 key, or
     /// - `kid` is `Some` and no candidate with that `kid` exists after refetch.
-    async fn get_keys(&self, issuer: &str, kid: Option<&str>) -> Result<Vec<VerifyingKey>>;
+    async fn get_keys(&self, issuer: &str, kid: Option<&str>) -> Result<Vec<FederationKey>>;
 }
 
 #[cfg(test)]
@@ -85,11 +92,7 @@ mod tests {
             false
         }
 
-        async fn get_keys(
-            &self,
-            issuer: &str,
-            _kid: Option<&str>,
-        ) -> Result<Vec<VerifyingKey>> {
+        async fn get_keys(&self, issuer: &str, _kid: Option<&str>) -> Result<Vec<FederationKey>> {
             let _ = issuer;
             anyhow::bail!("Issuer not trusted: {}", issuer)
         }
@@ -99,6 +102,10 @@ mod tests {
     async fn trait_object_compiles_and_rejects() {
         let src: Arc<dyn FederationKeySource> = Arc::new(AlwaysReject);
         assert!(!src.is_trusted("https://evil.example.com"));
-        assert!(src.get_keys("https://evil.example.com", None).await.is_err());
+        assert!(
+            src.get_keys("https://evil.example.com", None)
+                .await
+                .is_err()
+        );
     }
 }

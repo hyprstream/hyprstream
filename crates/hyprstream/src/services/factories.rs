@@ -32,8 +32,8 @@ use hyprstream_service::{ServiceContext, Spawnable};
 use tokio::sync::RwLock;
 use tracing::info;
 
-use crate::auth::identity_store::credentials_dir;
 use crate::auth::PolicyManager;
+use crate::auth::identity_store::credentials_dir;
 use crate::config::{HyprConfig, TokenConfig};
 use crate::services::generated::policy_client::{RefreshServiceTokenRequest, RegisterServiceKey};
 use crate::services::{
@@ -269,8 +269,8 @@ fn register_service_key(
 /// Used for local-disk JWTs that we issued ourselves — signature is verified
 /// by PolicyService; here we only need the expiry to decide whether to renew.
 fn decode_jwt_exp(jwt: &str) -> Option<i64> {
-    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use base64::Engine as _;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     let payload_b64 = jwt.split('.').nth(1)?;
     let payload = URL_SAFE_NO_PAD.decode(payload_b64).ok()?;
     let value: serde_json::Value = serde_json::from_slice(&payload).ok()?;
@@ -494,7 +494,9 @@ fn create_ledger_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
     let config = load_config();
     let lcfg = config.ledger.clone();
     if !lcfg.is_enabled() {
-        anyhow::bail!("ledger service requested but [ledger] enabled = false (the Phase-1 enforcer is opt-in)");
+        anyhow::bail!(
+            "ledger service requested but [ledger] enabled = false (the Phase-1 enforcer is opt-in)"
+        );
     }
 
     // Cell identity = did:key over the service Ed25519 key.
@@ -517,7 +519,11 @@ fn create_ledger_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
             tokio::runtime::Handle::current().block_on(async { store.active_key().await })
         });
         match pq_key {
-            Some(k) => Arc::new(CoseCheckpointSigner::hybrid(cell_identity.clone(), ed_sk, (*k).clone())),
+            Some(k) => Arc::new(CoseCheckpointSigner::hybrid(
+                cell_identity.clone(),
+                ed_sk,
+                (*k).clone(),
+            )),
             None => anyhow::bail!(
                 "ledger: require_pq_signatures is set but no ML-DSA-65 key is available (fail-closed)"
             ),
@@ -994,7 +1000,7 @@ fn create_worker_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
     use hyprstream_workers::config::PoolConfig;
     #[cfg(feature = "oci-image")]
     use hyprstream_workers::image::RafsStore;
-    use hyprstream_workers::{resolve_backend, BackendCtx, SandboxBackend, WorkerService};
+    use hyprstream_workers::{BackendCtx, SandboxBackend, WorkerService, resolve_backend};
 
     let config = load_config();
     let worker_quic_port = config.worker.as_ref().and_then(|w| w.quic_port);
@@ -1110,8 +1116,8 @@ fn create_oai_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
     info!("Creating OAIService");
 
     use crate::server::state::ServerState;
-    use crate::services::generated::model_client::ModelClient;
     use crate::services::OAIService;
+    use crate::services::generated::model_client::ModelClient;
 
     // Load full config for OAI settings
     let config = load_config();
@@ -1291,7 +1297,9 @@ fn create_oauth_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnabl
     if let Some(bl) = SHARED_JTI_BLOCKLIST.get() {
         oauth_service = oauth_service.with_jti_blocklist(Arc::clone(bl));
     } else {
-        tracing::warn!("JTI blocklist not set by PolicyService factory — revoked access tokens will not be blocked at RPC layer");
+        tracing::warn!(
+            "JTI blocklist not set by PolicyService factory — revoked access tokens will not be blocked at RPC layer"
+        );
     }
 
     Ok(Box::new(oauth_service))
@@ -1495,7 +1503,7 @@ fn create_mcp_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
                                 // verifies during overlap rotation.
                                 match federation_resolver.get_keys(&iss, kid.as_deref()).await {
                                     Ok(candidates) if !candidates.is_empty() => {
-                                        crate::auth::jwt::decode_with_candidates(
+                                        crate::auth::jwt::decode_with_federation_candidates(
                                             &t,
                                             &candidates,
                                             Some(mcp_resource_url.as_str()),
@@ -1701,7 +1709,7 @@ fn create_mcp_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
 fn create_tui_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>> {
     info!("Creating TuiService");
 
-    use crate::tui::{service::TuiService, TuiState};
+    use crate::tui::{TuiState, service::TuiService};
 
     // TUI publishes terminal frames (stdin/stdout) over moq via
     // StreamChannel::publisher(), and returns its per-PID moq UDS path to the
@@ -1892,9 +1900,9 @@ fn create_metrics_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawna
     init_local_moq_stream_plane("metrics");
 
     use crate::services::MetricsService;
+    use hyprstream_metrics::StorageBackend as _;
     use hyprstream_metrics::query::QueryOrchestrator;
     use hyprstream_metrics::storage::duckdb::DuckDbBackend;
-    use hyprstream_metrics::StorageBackend as _;
 
     let config = load_config();
     let mc = &config.metrics;

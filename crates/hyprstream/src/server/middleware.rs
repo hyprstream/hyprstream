@@ -4,7 +4,7 @@ use crate::auth::jwt;
 use crate::server::state::ServerState;
 use axum::{
     extract::{Request, State},
-    http::{header, HeaderValue, StatusCode},
+    http::{HeaderValue, StatusCode, header},
     middleware::Next,
     response::{IntoResponse, Response},
 };
@@ -379,7 +379,9 @@ fn decode_composite_multi(
         hyprstream_rpc::auth::RFC9068_ACCESS_TOKEN_TYPES,
     )
     .map_err(|_| "JWT validation failed")?;
-    if dispatch.kid() != header.kid { return Err("JWT validation failed"); }
+    if dispatch.kid() != header.kid {
+        return Err("JWT validation failed");
+    }
     let pair = published_composite
         .iter()
         .find(|pair| pair.kid() == header.kid)
@@ -453,11 +455,17 @@ pub(crate) async fn verify_token_claims(
         // issuers. The token's own `kid`, when present, is passed to
         // the resolver so it can refetch on an unknown kid.
         let kid = extract_kid_from_token(token);
-        match state.federation_resolver.get_keys(&iss, kid.as_deref()).await {
-            Ok(candidates) if !candidates.is_empty() => {
-                jwt::decode_with_candidates(token, &candidates, Some(&state.resource_url))
-                    .map_err(|_| "JWT validation failed")?
-            }
+        match state
+            .federation_resolver
+            .get_keys(&iss, kid.as_deref())
+            .await
+        {
+            Ok(candidates) if !candidates.is_empty() => jwt::decode_with_federation_candidates(
+                token,
+                &candidates,
+                Some(&state.resource_url),
+            )
+            .map_err(|_| "JWT validation failed")?,
             // Empty candidate set or fetch failure: fail closed either way.
             Ok(_) | Err(_) => return Err("federation key resolution failed"),
         }
@@ -496,7 +504,7 @@ fn unauthorized_response(message: &str, www_authenticate: &str) -> Response {
 /// Exported for use in other middleware-like contexts (e.g. MCP inline auth).
 /// Returns an empty string on any parse failure.
 pub fn extract_iss_from_token(token: &str) -> String {
-    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+    use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
     let parts: Vec<&str> = token.splitn(3, '.').collect();
     if parts.len() < 2 {
         return String::new();
@@ -522,7 +530,7 @@ pub fn extract_iss_from_token(token: &str) -> String {
 
 /// Extract `kid` from a JWT header without full validation.
 pub fn extract_kid_from_token(token: &str) -> Option<String> {
-    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+    use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
     let header_b64 = token.split('.').next()?;
     if header_b64.len() > 4096 {
         return None;
@@ -655,7 +663,7 @@ mod tests {
 
     #[test]
     fn test_extract_iss_from_token() {
-        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+        use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 
         // Craft a JWT with iss in payload: header.payload.sig
         // payload = base64url({"iss":"https://node-a","sub":"alice","exp":9999999999,"iat":0})
@@ -684,7 +692,7 @@ mod tests {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod rotation_aware_tests {
     use super::*;
-    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
     use ed25519_dalek::{Signer as _, SigningKey};
 
     const AUD: &str = "https://node-a/resource";
@@ -703,12 +711,7 @@ mod rotation_aware_tests {
         signed_token_with_type(key, aud, jti, "at+jwt")
     }
 
-    fn signed_token_with_type(
-        key: &SigningKey,
-        aud: &str,
-        jti: Option<&str>,
-        typ: &str,
-    ) -> String {
+    fn signed_token_with_type(key: &SigningKey, aud: &str, jti: Option<&str>, typ: &str) -> String {
         let n = now();
         let mut claims =
             jwt::Claims::new("alice".to_owned(), n, n + 3600).with_audience(Some(aud.to_owned()));
@@ -829,7 +832,7 @@ mod rotation_aware_tests {
             Some(AUD),
             true,
         )
-            .unwrap_err();
+        .unwrap_err();
         assert_eq!(err, "JWT validation failed");
     }
 
@@ -850,7 +853,7 @@ mod rotation_aware_tests {
             Some(AUD),
             true,
         )
-            .unwrap_err();
+        .unwrap_err();
         assert_eq!(err, "JWT validation failed");
     }
 
@@ -921,7 +924,7 @@ mod rotation_aware_tests {
 mod composite_aware_tests {
     use super::*;
     use crate::auth::jwt::encode_composite_ml_dsa_65_ed25519;
-    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+    use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
     use ed25519_dalek::SigningKey;
 
     const AUD: &str = "https://node-a/resource";
@@ -1098,15 +1101,17 @@ mod composite_aware_tests {
             published_pair(pq_b_vk, ed_b.verifying_key()),
         ];
 
-        assert!(decode_local_multi_key(
-            &cross_token,
-            &ca.verifying_key(),
-            &[ed_a.verifying_key(), ed_b.verifying_key()],
-            &published,
-            Some(AUD),
-            false,
-        )
-        .is_err());
+        assert!(
+            decode_local_multi_key(
+                &cross_token,
+                &ca.verifying_key(),
+                &[ed_a.verifying_key(), ed_b.verifying_key()],
+                &published,
+                Some(AUD),
+                false,
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -1159,7 +1164,7 @@ mod composite_aware_tests {
             (
                 "future",
                 jwt::Claims::new("future".to_owned(), now() + 120, now() + 3600)
-                .with_audience(Some(AUD.to_owned())),
+                    .with_audience(Some(AUD.to_owned())),
             ),
             (
                 "no-aud",
@@ -1177,13 +1182,13 @@ mod composite_aware_tests {
             );
             assert!(
                 decode_local_multi_key(
-                &token,
-                &ca.verifying_key(),
-                &[ed.verifying_key()],
-                std::slice::from_ref(&pair),
-                Some(AUD),
-                false,
-            )
+                    &token,
+                    &ca.verifying_key(),
+                    &[ed.verifying_key()],
+                    std::slice::from_ref(&pair),
+                    Some(AUD),
+                    false,
+                )
                 .is_err(),
                 "accepted invalid {case} claims"
             );
@@ -1244,15 +1249,17 @@ mod composite_aware_tests {
         let sig_bytes = URL_SAFE_NO_PAD.decode(sig_b64).unwrap();
         for stripped in [&sig_bytes[..3309], &sig_bytes[3309..]] {
             let tampered = format!("{}.{}", &token[..dot2], URL_SAFE_NO_PAD.encode(stripped));
-            assert!(decode_local_multi_key(
-                &tampered,
-                &ca.verifying_key(),
-                &published_ed,
-                &pairs,
-                Some(AUD),
-                false,
-            )
-            .is_err());
+            assert!(
+                decode_local_multi_key(
+                    &tampered,
+                    &ca.verifying_key(),
+                    &published_ed,
+                    &pairs,
+                    Some(AUD),
+                    false,
+                )
+                .is_err()
+            );
         }
     }
 
@@ -1281,15 +1288,17 @@ mod composite_aware_tests {
         .unwrap();
         assert_eq!(claims.sub, "alice");
 
-        assert!(decode_local_multi_key(
-            &token,
-            &ca.verifying_key(),
-            &published_ed,
-            &pairs,
-            Some(AUD),
-            false,
-        )
-        .is_err());
+        assert!(
+            decode_local_multi_key(
+                &token,
+                &ca.verifying_key(),
+                &published_ed,
+                &pairs,
+                Some(AUD),
+                false,
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -1380,7 +1389,7 @@ mod composite_aware_tests {
 #[allow(clippy::expect_used)]
 mod browser_provisioning_rate_limit_tests {
     use super::*;
-    use axum::{body::Body, http::Request as HttpRequest, middleware, routing::get, Router};
+    use axum::{Router, body::Body, http::Request as HttpRequest, middleware, routing::get};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tower::ServiceExt;
 
@@ -1407,11 +1416,19 @@ mod browser_provisioning_rate_limit_tests {
 
         let first = app
             .clone()
-            .oneshot(HttpRequest::get("/provision").body(Body::empty()).expect("request"))
+            .oneshot(
+                HttpRequest::get("/provision")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
             .await
             .expect("first response");
         let rejected = app
-            .oneshot(HttpRequest::get("/provision").body(Body::empty()).expect("request"))
+            .oneshot(
+                HttpRequest::get("/provision")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
             .await
             .expect("limited response");
 

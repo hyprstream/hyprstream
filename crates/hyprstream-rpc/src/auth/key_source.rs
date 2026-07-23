@@ -30,7 +30,7 @@
 #![allow(clippy::disallowed_types)]
 
 use anyhow::Result;
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use ed25519_dalek::VerifyingKey;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -148,7 +148,10 @@ impl ClusterKeySource {
     /// Set the shared ML-DSA-65 verifying key list for PQ-hybrid JWT verification.
     ///
     /// The Arc is shared with the rotation task so keys stay current.
-    pub fn with_ml_dsa_verifying_keys(mut self, vks: Arc<std::sync::RwLock<Vec<crate::crypto::pq::MlDsaVerifyingKey>>>) -> Self {
+    pub fn with_ml_dsa_verifying_keys(
+        mut self,
+        vks: Arc<std::sync::RwLock<Vec<crate::crypto::pq::MlDsaVerifyingKey>>>,
+    ) -> Self {
         self.ml_dsa_vks = vks;
         self
     }
@@ -193,7 +196,10 @@ impl JwtKeySource for ClusterKeySource {
     }
 
     fn ml_dsa_verifying_keys(&self) -> Vec<crate::crypto::pq::MlDsaVerifyingKey> {
-        self.ml_dsa_vks.read().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
+        self.ml_dsa_vks
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     fn composite_key_set(&self) -> Arc<super::CompositeKeySet> {
@@ -235,16 +241,18 @@ impl JwtKeySource for FederatedKeySource {
         if self.local.is_trusted(issuer) {
             return self.local.get_key(issuer, kid).await;
         }
-        // Fall back to federation. The resolver returns the full candidate
-        // set ordered kid-first; we return the preferred (kid-matching, or
-        // first published) key for the single-key JwtKeySource contract.
-        // Rotation overlap is preserved because the resolver surfaces every
-        // published key and orders the requested kid first (#1185).
+        // Fall back to federation. A named token may use only the exact named
+        // key; a kid-less legacy caller retains the single-key fallback this
+        // trait requires.
         if self.federation.is_trusted(issuer) {
             let candidates = self.federation.get_keys(issuer, kid).await?;
             return candidates
-                .first()
-                .copied()
+                .iter()
+                .find(|candidate| match kid {
+                    Some(named_kid) => candidate.kid.as_deref() == Some(named_kid),
+                    None => true,
+                })
+                .map(|candidate| candidate.verifying_key)
                 .ok_or_else(|| anyhow::anyhow!("No Ed25519 key for issuer {}", issuer));
         }
         anyhow::bail!("Untrusted issuer: {}", issuer)
@@ -272,7 +280,14 @@ impl JwtKeySource for FederatedKeySource {
 }
 
 /// Async function that fetches raw JWKS JSON from a URL.
-pub type JwksFetcher = Arc<dyn Fn(String) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value>> + Send>> + Send + Sync>;
+pub type JwksFetcher = Arc<
+    dyn Fn(
+            String,
+        )
+            -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value>> + Send>>
+        + Send
+        + Sync,
+>;
 
 /// Deployment mode for JWKS-backed key resolution.
 #[derive(Clone)]
@@ -280,14 +295,23 @@ pub enum JwksMode {
     /// Single-node: fetches JWKS from local `/oauth/jwks` endpoint.
     Isolated { jwks_url: String },
     /// Multi-node / cross-org: resolves issuer → JWKS URL via `IssuerResolver`.
-    Federated { local_jwks_url: String, resolver: Arc<dyn IssuerResolver> },
+    Federated {
+        local_jwks_url: String,
+        resolver: Arc<dyn IssuerResolver>,
+    },
 }
 
 impl std::fmt::Debug for JwksMode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Isolated { jwks_url } => f.debug_struct("Isolated").field("jwks_url", jwks_url).finish(),
-            Self::Federated { local_jwks_url, .. } => f.debug_struct("Federated").field("local_jwks_url", local_jwks_url).finish(),
+            Self::Isolated { jwks_url } => f
+                .debug_struct("Isolated")
+                .field("jwks_url", jwks_url)
+                .finish(),
+            Self::Federated { local_jwks_url, .. } => f
+                .debug_struct("Federated")
+                .field("local_jwks_url", local_jwks_url)
+                .finish(),
         }
     }
 }
@@ -370,7 +394,10 @@ impl JwksKeySource {
     }
 
     /// Set the shared ML-DSA-65 verifying key list for PQ-hybrid JWT verification.
-    pub fn with_ml_dsa_verifying_keys(mut self, vks: Arc<std::sync::RwLock<Vec<crate::crypto::pq::MlDsaVerifyingKey>>>) -> Self {
+    pub fn with_ml_dsa_verifying_keys(
+        mut self,
+        vks: Arc<std::sync::RwLock<Vec<crate::crypto::pq::MlDsaVerifyingKey>>>,
+    ) -> Self {
         self.ml_dsa_vks = vks;
         self
     }
@@ -379,7 +406,9 @@ impl JwksKeySource {
     /// of local-issuer (service) JWTs. See the `local_ca_key` field docs.
     pub fn with_local_ca_key(mut self, ca_vk: VerifyingKey) -> Self {
         self.local_ca_kid = Some(crate::auth::jwt::jwk_thumbprint(
-            &crate::auth::jwt::JwkThumbprintInput::Ed25519 { x: ca_vk.as_bytes() },
+            &crate::auth::jwt::JwkThumbprintInput::Ed25519 {
+                x: ca_vk.as_bytes(),
+            },
         ));
         self.local_ca_key = Some(ca_vk);
         self
@@ -414,18 +443,24 @@ impl JwksKeySource {
         }
         match &self.mode {
             JwksMode::Federated { resolver, .. } => resolver.resolve(issuer).await,
-            JwksMode::Isolated { .. } => anyhow::bail!("Untrusted issuer in isolated mode: {}", issuer),
+            JwksMode::Isolated { .. } => {
+                anyhow::bail!("Untrusted issuer in isolated mode: {}", issuer)
+            }
         }
     }
 
     async fn fetch_and_cache(&self, issuer: &str) -> Result<()> {
-        let _permit = self.fetch_semaphore.acquire().await
+        let _permit = self
+            .fetch_semaphore
+            .acquire()
+            .await
             .map_err(|_| anyhow::anyhow!("JWKS fetch semaphore closed"))?;
 
         let url = self.resolve_jwks_url(issuer).await?;
         let jwks = (self.fetcher)(url).await?;
 
-        let keys = jwks.get("keys")
+        let keys = jwks
+            .get("keys")
             .and_then(|v| v.as_array())
             .ok_or_else(|| anyhow::anyhow!("JWKS response missing 'keys' array"))?;
 
@@ -460,10 +495,13 @@ impl JwksKeySource {
                                 let mut arr = [0u8; 32];
                                 arr.copy_from_slice(&x_bytes);
                                 if let Ok(vk) = VerifyingKey::from_bytes(&arr) {
-                                    cache.insert(kid, CachedKey {
-                                        verifying_key: vk,
-                                        fetched_at: now,
-                                    });
+                                    cache.insert(
+                                        kid,
+                                        CachedKey {
+                                            verifying_key: vk,
+                                            fetched_at: now,
+                                        },
+                                    );
                                 }
                             }
                         }
@@ -500,7 +538,9 @@ impl JwtKeySource for JwksKeySource {
             // resolution must not depend on it. Never overrides a JWKS-published
             // (rotated) key because it's keyed on the exact CA thumbprint.
             if self.is_local(issuer) {
-                if let (Some(ca_kid), Some(ca_key)) = (self.local_ca_kid.as_deref(), self.local_ca_key) {
+                if let (Some(ca_kid), Some(ca_key)) =
+                    (self.local_ca_kid.as_deref(), self.local_ca_key)
+                {
                     if ca_kid == kid_str {
                         return Ok(ca_key);
                     }
@@ -550,7 +590,8 @@ impl JwtKeySource for JwksKeySource {
             }
 
             let cache = self.cache.read().await;
-            cache.values()
+            cache
+                .values()
                 .next()
                 .map(|e| e.verifying_key)
                 .ok_or_else(|| anyhow::anyhow!("No Ed25519 keys in JWKS"))
@@ -574,11 +615,18 @@ impl JwtKeySource for JwksKeySource {
     }
 
     fn ml_dsa_verifying_keys(&self) -> Vec<crate::crypto::pq::MlDsaVerifyingKey> {
-        self.ml_dsa_vks.read().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
+        self.ml_dsa_vks
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     fn kid_algs(&self, kid: &str) -> Vec<String> {
-        self.kid_alg_map.read().get(kid).cloned().unwrap_or_default()
+        self.kid_alg_map
+            .read()
+            .get(kid)
+            .cloned()
+            .unwrap_or_default()
     }
 }
 
@@ -613,14 +661,18 @@ mod tests {
     async fn jwks_source_resolves_local_ca_key_offline() -> anyhow::Result<()> {
         // A fetcher that always fails — proves resolution does NOT touch it.
         let fetcher: JwksFetcher = std::sync::Arc::new(|_url: String| {
-            Box::pin(async move { anyhow::bail!("network must not be used for local CA resolution") })
+            Box::pin(
+                async move { anyhow::bail!("network must not be used for local CA resolution") },
+            )
         });
         let ca_sk = SigningKey::from_bytes(&[7u8; 32]);
         let ca_vk = ca_sk.verifying_key();
         let ca_kid = crate::auth::jwt::kid_for_key(&ca_sk);
 
         let ks = JwksKeySource::new(
-            JwksMode::Isolated { jwks_url: "http://127.0.0.1:1/oauth/jwks".to_owned() },
+            JwksMode::Isolated {
+                jwks_url: "http://127.0.0.1:1/oauth/jwks".to_owned(),
+            },
             "http://localhost:9080".to_owned(),
             fetcher,
         )
@@ -647,7 +699,9 @@ mod tests {
         });
         let ca_vk = SigningKey::from_bytes(&[7u8; 32]).verifying_key();
         let ks = JwksKeySource::new(
-            JwksMode::Isolated { jwks_url: "http://127.0.0.1:1/oauth/jwks".to_owned() },
+            JwksMode::Isolated {
+                jwks_url: "http://127.0.0.1:1/oauth/jwks".to_owned(),
+            },
             "http://localhost:9080".to_owned(),
             fetcher,
         )
@@ -655,10 +709,18 @@ mod tests {
 
         // Local issuer but a different kid -> CA fallback does NOT fire; the
         // JWKS fetch is attempted and fails -> error (not the CA key).
-        assert!(ks.get_key("http://localhost:9080", Some("some-other-kid")).await.is_err());
+        assert!(
+            ks.get_key("http://localhost:9080", Some("some-other-kid"))
+                .await
+                .is_err()
+        );
 
         // Non-local issuer is untrusted in isolated mode regardless of kid.
-        assert!(ks.get_key("https://evil.example.com", Some("some-other-kid")).await.is_err());
+        assert!(
+            ks.get_key("https://evil.example.com", Some("some-other-kid"))
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
@@ -687,19 +749,22 @@ mod tests {
     }
 
     fn mock_jwks_json(keys: &[&SigningKey]) -> serde_json::Value {
-        let jwk_entries: Vec<serde_json::Value> = keys.iter().map(|sk| {
-            let vk = sk.verifying_key();
-            let x = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(vk.as_bytes());
-            let kid = crate::auth::jwt::kid_for_key(sk);
-            serde_json::json!({
-                "kty": "OKP",
-                "crv": "Ed25519",
-                "use": "sig",
-                "alg": "EdDSA",
-                "kid": kid,
-                "x": x,
+        let jwk_entries: Vec<serde_json::Value> = keys
+            .iter()
+            .map(|sk| {
+                let vk = sk.verifying_key();
+                let x = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(vk.as_bytes());
+                let kid = crate::auth::jwt::kid_for_key(sk);
+                serde_json::json!({
+                    "kty": "OKP",
+                    "crv": "Ed25519",
+                    "use": "sig",
+                    "alg": "EdDSA",
+                    "kid": kid,
+                    "x": x,
+                })
             })
-        }).collect();
+            .collect();
         serde_json::json!({ "keys": jwk_entries })
     }
 
@@ -719,7 +784,9 @@ mod tests {
 
         let jwks = mock_jwks_json(&[&sk_a, &sk_b]);
         let ks = JwksKeySource::new(
-            JwksMode::Isolated { jwks_url: "http://localhost/oauth/jwks".to_owned() },
+            JwksMode::Isolated {
+                jwks_url: "http://localhost/oauth/jwks".to_owned(),
+            },
             "http://localhost".to_owned(),
             mock_fetcher(jwks),
         );
@@ -737,12 +804,16 @@ mod tests {
         let sk = SigningKey::from_bytes(&[0xCC; 32]);
         let jwks = mock_jwks_json(&[&sk]);
         let ks = JwksKeySource::new(
-            JwksMode::Isolated { jwks_url: "http://localhost/oauth/jwks".to_owned() },
+            JwksMode::Isolated {
+                jwks_url: "http://localhost/oauth/jwks".to_owned(),
+            },
             "http://localhost".to_owned(),
             mock_fetcher(jwks),
         );
 
-        let result = ks.get_key("http://localhost", Some("nonexistent-kid")).await;
+        let result = ks
+            .get_key("http://localhost", Some("nonexistent-kid"))
+            .await;
         assert!(result.is_err());
     }
 
@@ -751,7 +822,9 @@ mod tests {
         let sk = SigningKey::from_bytes(&[0xDD; 32]);
         let jwks = mock_jwks_json(&[&sk]);
         let ks = JwksKeySource::new(
-            JwksMode::Isolated { jwks_url: "http://localhost/oauth/jwks".to_owned() },
+            JwksMode::Isolated {
+                jwks_url: "http://localhost/oauth/jwks".to_owned(),
+            },
             "http://localhost".to_owned(),
             mock_fetcher(jwks),
         );
@@ -777,7 +850,9 @@ mod tests {
         });
 
         let ks = JwksKeySource::new(
-            JwksMode::Isolated { jwks_url: "http://localhost/oauth/jwks".to_owned() },
+            JwksMode::Isolated {
+                jwks_url: "http://localhost/oauth/jwks".to_owned(),
+            },
             "http://localhost".to_owned(),
             fetcher,
         );
@@ -800,7 +875,9 @@ mod tests {
         let sk = SigningKey::from_bytes(&[0xFF; 32]);
         let jwks = mock_jwks_json(&[&sk]);
         let ks = JwksKeySource::new(
-            JwksMode::Isolated { jwks_url: "http://localhost/oauth/jwks".to_owned() },
+            JwksMode::Isolated {
+                jwks_url: "http://localhost/oauth/jwks".to_owned(),
+            },
             "http://localhost".to_owned(),
             mock_fetcher(jwks),
         );
@@ -828,7 +905,9 @@ mod tests {
             ]
         });
         let ks = JwksKeySource::new(
-            JwksMode::Isolated { jwks_url: "http://localhost/oauth/jwks".to_owned() },
+            JwksMode::Isolated {
+                jwks_url: "http://localhost/oauth/jwks".to_owned(),
+            },
             "http://localhost".to_owned(),
             mock_fetcher(jwks),
         );
@@ -848,7 +927,8 @@ mod tests {
     async fn dpop_stripping_jwks_multi_alg_per_kid() -> anyhow::Result<()> {
         let sk = SigningKey::from_bytes(&[0x77; 32]);
         let kid = crate::auth::jwt::kid_for_key(&sk);
-        let x = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(sk.verifying_key().as_bytes());
+        let x =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(sk.verifying_key().as_bytes());
         let jwks = serde_json::json!({
             "keys": [
                 {"kty": "OKP", "crv": "Ed25519", "use": "sig", "alg": "EdDSA", "kid": kid.clone(), "x": x},
@@ -857,7 +937,9 @@ mod tests {
             ]
         });
         let ks = JwksKeySource::new(
-            JwksMode::Isolated { jwks_url: "http://localhost/oauth/jwks".to_owned() },
+            JwksMode::Isolated {
+                jwks_url: "http://localhost/oauth/jwks".to_owned(),
+            },
             "http://localhost".to_owned(),
             mock_fetcher(jwks),
         );
@@ -882,7 +964,9 @@ mod tests {
         let sk = SigningKey::from_bytes(&[0x11; 32]);
         let jwks = mock_jwks_json(&[&sk]);
         let ks = JwksKeySource::new(
-            JwksMode::Isolated { jwks_url: "http://localhost/oauth/jwks".to_owned() },
+            JwksMode::Isolated {
+                jwks_url: "http://localhost/oauth/jwks".to_owned(),
+            },
             "http://localhost".to_owned(),
             mock_fetcher(jwks),
         );

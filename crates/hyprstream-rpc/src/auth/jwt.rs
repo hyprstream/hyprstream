@@ -10,7 +10,7 @@
 //! - Payload: Claims (sub, exp, iat)
 //! - Signature: Ed25519 over `base64url(header).base64url(payload)`
 
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::Utc;
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use thiserror::Error;
@@ -109,7 +109,7 @@ impl<'de> serde::Deserialize<'de> for ProtectedHeader {
                             return Err(A::Error::unknown_field(
                                 &key,
                                 &["alg", "typ", "kid", "crit"],
-                            ))
+                            ));
                         }
                     }
                 }
@@ -411,6 +411,28 @@ pub fn decode_with_candidates(
         }
     }
     Err(last_err)
+}
+
+/// Decode a federation JWT while retaining the JWKS `kid` binding.
+///
+/// A token that names a key may only be verified by entries carrying that
+/// exact name. A token without a selector may try every compatible published
+/// key, which is the overlap-rotation case.
+pub fn decode_with_federation_candidates(
+    token: &str,
+    candidates: &[super::FederationKey],
+    expected_aud: Option<&str>,
+) -> Result<Claims, JwtError> {
+    let kid = header_kid(token)?;
+    let keys: Vec<VerifyingKey> = candidates
+        .iter()
+        .filter(|candidate| match kid.as_deref() {
+            Some(named_kid) => candidate.kid.as_deref() == Some(named_kid),
+            None => true,
+        })
+        .map(|candidate| candidate.verifying_key)
+        .collect();
+    decode_with_candidates(token, &keys, expected_aud)
 }
 
 /// Internal decode implementation shared by `decode` and `decode_with_key`.
@@ -736,7 +758,10 @@ mod tests {
             "JWT",
             "wit+jwt",
         ] {
-            assert!(!is_rfc9068_access_token_type(rejected), "accepted {rejected:?}");
+            assert!(
+                !is_rfc9068_access_token_type(rejected),
+                "accepted {rejected:?}"
+            );
         }
     }
 
@@ -917,11 +942,12 @@ mod tests {
         let claims = Claims::new("overlap-test".to_owned(), 0, 9_999_999_999);
         let token = encode(&claims, &key_b); // signed by the second key
 
-        // Candidate set published kid-first as [old, new]; the token is
+        // Candidate set published in overlap order as [old, new]; the token is
         // signed by `new` (the second entry). The old code resolved only
         // the first key and this token would have failed.
         let candidates = vec![key_a.verifying_key(), key_b.verifying_key()];
-        let decoded = decode_with_candidates(&token, &candidates, None).expect("second key verifies");
+        let decoded =
+            decode_with_candidates(&token, &candidates, None).expect("second key verifies");
         assert_eq!(decoded.sub, "overlap-test");
     }
 
@@ -941,5 +967,31 @@ mod tests {
         let claims = Claims::new("empty".to_owned(), 0, 9_999_999_999);
         let token = encode(&claims, &make_key(0x22));
         assert!(decode_with_candidates(&token, &[], None).is_err());
+    }
+
+    #[test]
+    fn federation_candidates_reject_mismatched_named_key() {
+        use crate::auth::FederationKey;
+
+        let old = make_key(0xA1);
+        let new = make_key(0xB2);
+        let claims = Claims::new("kid-binding".to_owned(), 0, 9_999_999_999);
+        let token = encode(&claims, &old);
+        let old_kid = kid_for_key(&old);
+
+        // The token names `old_kid`, but only a different co-published key is
+        // attached to that name. The bare-key candidate loop would accept the
+        // `old` entry below; the federation path must reject it.
+        let candidates = vec![
+            FederationKey {
+                kid: Some(old_kid),
+                verifying_key: new.verifying_key(),
+            },
+            FederationKey {
+                kid: Some(kid_for_key(&new)),
+                verifying_key: old.verifying_key(),
+            },
+        ];
+        assert!(decode_with_federation_candidates(&token, &candidates, None).is_err());
     }
 }

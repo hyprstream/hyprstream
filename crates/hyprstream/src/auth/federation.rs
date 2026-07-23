@@ -12,16 +12,16 @@
 //! positional singleton — that anti-pattern forecloses both overlap rotation
 //! and PQ-hybrid publication (#1183).
 
+use anyhow::{Result, anyhow};
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+use ed25519_dalek::VerifyingKey;
+use hyprstream_discovery::DiscoveryClient;
+use hyprstream_rpc::auth::{FederationKey, FederationKeySource};
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::Mutex;
-use anyhow::{anyhow, Result};
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
-use ed25519_dalek::VerifyingKey;
-use hyprstream_rpc::auth::FederationKeySource;
-use hyprstream_discovery::DiscoveryClient;
+use tokio::sync::{Mutex, RwLock};
 
 /// Async function that fetches raw JWKS JSON from a URL. Defaults to a
 /// reqwest GET; injectable for tests.
@@ -63,11 +63,13 @@ impl CachedJwks {
 pub struct FederationKeyResolver {
     /// issuer_url → cached JWKS key set.
     ///
-    /// A single `Mutex` (not `RwLock`) serialises both reads and writes so
-    /// that concurrent cache-miss events for the same issuer do not race:
-    /// the first waiter fetches, writes the result, and the second waiter
-    /// then finds a valid entry on re-check.
-    cache: Mutex<HashMap<String, CachedJwks>>,
+    cache: RwLock<HashMap<String, CachedJwks>>,
+    /// Short-lived cache of named keys that were absent after a refresh.
+    /// This bounds attacker-controlled repeated unknown-`kid` requests.
+    negative_cache: Mutex<HashMap<(String, String), Instant>>,
+    /// Per-issuer single-flight guards. Different trusted issuers never block
+    /// each other while one issuer refreshes its JWKS.
+    fetch_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     /// issuer_url → (optional jwks_uri_override, ttl, allow_http)
     config: HashMap<String, (Option<String>, Duration, bool)>,
     http: reqwest::Client,
@@ -97,9 +99,7 @@ pub struct FederationKeyResolver {
 }
 
 impl FederationKeyResolver {
-    pub fn new(
-        trusted_issuers: &HashMap<String, crate::config::TrustedIssuerConfig>,
-    ) -> Self {
+    pub fn new(trusted_issuers: &HashMap<String, crate::config::TrustedIssuerConfig>) -> Self {
         let config = trusted_issuers
             .iter()
             .map(|(iss, cfg)| {
@@ -113,15 +113,18 @@ impl FederationKeyResolver {
                 )
             })
             .collect();
+        let http = reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .unwrap_or_default();
         Self {
-            cache: Mutex::new(HashMap::new()),
+            cache: RwLock::new(HashMap::new()),
+            negative_cache: Mutex::new(HashMap::new()),
+            fetch_locks: Mutex::new(HashMap::new()),
             config,
             // TLS certificate verification is enabled by default (reqwest default).
-            http: reqwest::Client::builder()
-                .timeout(Duration::from_secs(10))
-                .build()
-                .unwrap_or_default(),
-            jwks_fetcher: default_jwks_fetcher(),
+            jwks_fetcher: default_jwks_fetcher(http.clone()),
+            http,
             discovery_client: None,
             policy_client: None,
         }
@@ -174,11 +177,7 @@ impl FederationKeyResolver {
     /// requests for the same issuer serialise: the second waiter re-checks the
     /// cache after the first finishes, finding a fresh entry rather than issuing
     /// a redundant JWKS fetch.
-    pub async fn get_keys(
-        &self,
-        issuer: &str,
-        kid: Option<&str>,
-    ) -> Result<Vec<VerifyingKey>> {
+    pub async fn get_keys(&self, issuer: &str, kid: Option<&str>) -> Result<Vec<FederationKey>> {
         // Look up config before acquiring cache lock (config is immutable after new())
         let (jwks_uri_override, ttl, allow_http) = self
             .config
@@ -231,27 +230,30 @@ impl FederationKeyResolver {
             }
         }
 
-        // Acquire the cache lock once. Check first; fetch only if
-        // expired/absent OR if the requested kid is not present in a
-        // fresh entry (rotation: a newly-published kid must trigger one
-        // refetch before we fail closed).
-        let mut cache = self.cache.lock().await;
-
-        // Helper: does a fresh cached entry satisfy `kid`?
-        fn has_fresh_kid(entry: &CachedJwks, kid: Option<&str>) -> bool {
-            match kid {
-                None => {
-                    // No selector: any non-empty fresh set suffices.
-                    !entry.entries.is_empty()
-                }
-                Some(k) => entry.entries.iter().any(|e| e.kid.as_deref() == Some(k)),
-            }
+        if let Some(candidates) = self.fresh_candidates(issuer, kid).await {
+            return Ok(candidates);
+        }
+        if self.is_negative_cached(issuer, kid).await {
+            anyhow::bail!("JWKS has no Ed25519 key with requested kid (negative cached)");
         }
 
-        if let Some(entry) = cache.get(issuer) {
-            if !entry.is_expired() && has_fresh_kid(entry, kid) {
-                return Ok(order_candidates(&entry.entries, kid));
-            }
+        // Recheck cache and the negative cache after acquiring this issuer's
+        // single-flight guard. This makes one refresh serve all same-issuer
+        // waiters without globally head-of-line blocking unrelated issuers.
+        let fetch_lock = {
+            let mut locks = self.fetch_locks.lock().await;
+            Arc::clone(
+                locks
+                    .entry(issuer.to_owned())
+                    .or_insert_with(|| Arc::new(Mutex::new(()))),
+            )
+        };
+        let _fetch_guard = fetch_lock.lock().await;
+        if let Some(candidates) = self.fresh_candidates(issuer, kid).await {
+            return Ok(candidates);
+        }
+        if self.is_negative_cached(issuer, kid).await {
+            anyhow::bail!("JWKS has no Ed25519 key with requested kid (negative cached)");
         }
 
         // Phase 0.5 Stage D — try DiscoveryService first if configured.
@@ -262,16 +264,19 @@ impl FederationKeyResolver {
         if let Some(ref dc) = self.discovery_client {
             match self.try_get_keys_from_discovery(dc, issuer).await {
                 Ok(entries) if !entries.is_empty() => {
-                    let ordered = order_candidates(&entries, kid);
-                    cache.insert(
-                        issuer.to_owned(),
-                        CachedJwks {
-                            entries,
-                            fetched_at: Instant::now(),
-                            ttl,
-                        },
-                    );
-                    return Ok(ordered);
+                    if has_requested_kid(&entries, kid) {
+                        self.cache_entries(issuer, entries, ttl).await;
+                        self.clear_negative_cache(issuer, kid).await;
+                        // A selector exists only to select: do not return
+                        // unrelated co-published keys as signature fallbacks.
+                        return self.fresh_candidates(issuer, kid).await.ok_or_else(|| {
+                            anyhow!("fresh Discovery JWKS unexpectedly missing requested key")
+                        });
+                    }
+                    // A stale Discovery statement cannot hide an HTTPS JWKS
+                    // rotation. Preserve it for kid-less callers only if the
+                    // authoritative HTTPS lookup below fails.
+                    self.cache_entries(issuer, entries, ttl).await;
                 }
                 Ok(_) => {
                     tracing::debug!(
@@ -305,32 +310,37 @@ impl FederationKeyResolver {
             anyhow::bail!("No Ed25519 key found in JWKS at {}", jwks_uri);
         }
 
-        // If a kid was requested, a fresh fetch that does not carry it
-        // fails closed — never substitute another key for a named kid
-        // (anti-pattern: positional singleton, #1183).
-        if let Some(k) = kid {
-            let found = entries.iter().any(|e| e.kid.as_deref() == Some(k));
-            if !found {
-                // Cache the fresh set anyway so a concurrent request for
-                // a kid that *is* present benefits, then fail closed.
-                cache.insert(
-                    issuer.to_owned(),
-                    CachedJwks {
-                        entries,
-                        fetched_at: Instant::now(),
-                        ttl,
-                    },
-                );
-                anyhow::bail!(
-                    "JWKS at {} has no Ed25519 key with kid={}",
-                    jwks_uri,
-                    k
-                );
-            }
+        let found = has_requested_kid(&entries, kid);
+        self.cache_entries(issuer, entries, ttl).await;
+        if !found {
+            self.record_negative_cache(issuer, kid).await;
+            let Some(requested_kid) = kid else {
+                anyhow::bail!("JWKS unexpectedly contained no usable Ed25519 key");
+            };
+            anyhow::bail!(
+                "JWKS at {} has no Ed25519 key with kid={}",
+                jwks_uri,
+                requested_kid
+            );
         }
+        self.clear_negative_cache(issuer, kid).await;
+        let cache = self.cache.read().await;
+        Ok(select_candidates(&cache[issuer].entries, kid))
+    }
 
-        let ordered = order_candidates(&entries, kid);
-        cache.insert(
+    async fn fresh_candidates(
+        &self,
+        issuer: &str,
+        kid: Option<&str>,
+    ) -> Option<Vec<FederationKey>> {
+        let cache = self.cache.read().await;
+        let entry = cache.get(issuer)?;
+        (!entry.is_expired() && has_requested_kid(&entry.entries, kid))
+            .then(|| select_candidates(&entry.entries, kid))
+    }
+
+    async fn cache_entries(&self, issuer: &str, entries: Vec<JwksEntry>, ttl: Duration) {
+        self.cache.write().await.insert(
             issuer.to_owned(),
             CachedJwks {
                 entries,
@@ -338,8 +348,48 @@ impl FederationKeyResolver {
                 ttl,
             },
         );
+    }
 
-        Ok(ordered)
+    async fn is_negative_cached(&self, issuer: &str, kid: Option<&str>) -> bool {
+        const NEGATIVE_TTL: Duration = Duration::from_secs(5);
+        let Some(kid) = kid else {
+            return false;
+        };
+        let key = (issuer.to_owned(), kid.to_owned());
+        let mut misses = self.negative_cache.lock().await;
+        match misses.get(&key) {
+            Some(seen) if seen.elapsed() < NEGATIVE_TTL => true,
+            Some(_) => {
+                misses.remove(&key);
+                false
+            }
+            None => false,
+        }
+    }
+
+    async fn record_negative_cache(&self, issuer: &str, kid: Option<&str>) {
+        const NEGATIVE_TTL: Duration = Duration::from_secs(5);
+        const MAX_NEGATIVE_ENTRIES: usize = 1024;
+        let Some(kid) = kid else {
+            return;
+        };
+        let mut misses = self.negative_cache.lock().await;
+        misses.retain(|_, seen| seen.elapsed() < NEGATIVE_TTL);
+        if misses.len() >= MAX_NEGATIVE_ENTRIES {
+            if let Some(key) = misses.keys().next().cloned() {
+                misses.remove(&key);
+            }
+        }
+        misses.insert((issuer.to_owned(), kid.to_owned()), Instant::now());
+    }
+
+    async fn clear_negative_cache(&self, issuer: &str, kid: Option<&str>) {
+        if let Some(kid) = kid {
+            self.negative_cache
+                .lock()
+                .await
+                .remove(&(issuer.to_owned(), kid.to_owned()));
+        }
     }
 
     /// Try fetching the Ed25519 verifying keys for `issuer` via DiscoveryService.
@@ -415,10 +465,7 @@ impl FederationKeyResolver {
             )
         } else {
             // Non-HTTP(S) scheme (ftp://, file://, javascript:, etc.)
-            anyhow::bail!(
-                "JWKS URI must use HTTPS or HTTP scheme (got '{}').",
-                url
-            )
+            anyhow::bail!("JWKS URI must use HTTPS or HTTP scheme (got '{}').", url)
         }
     }
 
@@ -426,13 +473,7 @@ impl FederationKeyResolver {
         // Validate the issuer URL scheme before fetching AS metadata
         self.check_scheme(issuer, allow_http)?;
         let meta_url = format!("{}/.well-known/oauth-authorization-server", issuer);
-        let meta: serde_json::Value = self
-            .http
-            .get(&meta_url)
-            .send()
-            .await?
-            .json()
-            .await?;
+        let meta: serde_json::Value = self.http.get(&meta_url).send().await?.json().await?;
         let jwks_uri = meta["jwks_uri"]
             .as_str()
             .map(str::to_owned)
@@ -454,19 +495,12 @@ impl FederationKeyResolver {
 /// The default JWKS fetcher: a reqwest GET returning the parsed JSON body.
 /// Captured as a `JwksFetcher` so the production path and the test seam
 /// share one shape (#1185).
-fn default_jwks_fetcher() -> JwksFetcher {
-    // The client is rebuilt per-call here only as a closure capture; the
-    // resolver also holds `http` for AS-metadata discovery, so this is a
-    // thin wrapper. A dedicated client is used so a future reqwest tuning
-    // (timeouts, TLS) applies uniformly.
-    Arc::new(|url: &str| {
+fn default_jwks_fetcher(http: reqwest::Client) -> JwksFetcher {
+    Arc::new(move |url: &str| {
         let url = url.to_owned();
+        let http = http.clone();
         Box::pin(async move {
-            let client = reqwest::Client::builder()
-                .timeout(Duration::from_secs(10))
-                .build()
-                .unwrap_or_default();
-            let jwks: serde_json::Value = client.get(&url).send().await?.json().await?;
+            let jwks: serde_json::Value = http.get(&url).send().await?.json().await?;
             Ok(jwks)
         })
     })
@@ -510,23 +544,29 @@ fn parse_jwks_ed25519(jwks: &serde_json::Value, jwks_uri: &str) -> Vec<JwksEntry
     out
 }
 
-/// Order `entries` so the `kid`-matching entry (if any) comes first, followed
-/// by every remaining usable key. A verifier that prefers the named kid thus
-/// still gets overlap candidates as a fallback, and a kid-less caller simply
-/// receives the full published set in JWKS order. This is the
-/// select-by-id-or-try-each rule from the #1183 key-set audit.
-fn order_candidates(entries: &[JwksEntry], kid: Option<&str>) -> Vec<VerifyingKey> {
-    let mut ordered: Vec<VerifyingKey> = Vec::with_capacity(entries.len());
-    if let Some(k) = kid {
-        ordered.extend(entries.iter().filter(|e| e.kid.as_deref() == Some(k)).map(|e| e.key));
+/// A named token selects only its exact entry. A kid-less token can try every
+/// compatible published key, preserving the overlap-rotation case.
+fn select_candidates(entries: &[JwksEntry], kid: Option<&str>) -> Vec<FederationKey> {
+    entries
+        .iter()
+        .filter(|entry| match kid {
+            Some(requested_kid) => entry.kid.as_deref() == Some(requested_kid),
+            None => true,
+        })
+        .map(|entry| FederationKey {
+            kid: entry.kid.clone(),
+            verifying_key: entry.key,
+        })
+        .collect()
+}
+
+fn has_requested_kid(entries: &[JwksEntry], kid: Option<&str>) -> bool {
+    match kid {
+        Some(requested_kid) => entries
+            .iter()
+            .any(|entry| entry.kid.as_deref() == Some(requested_kid)),
+        None => !entries.is_empty(),
     }
-    for e in entries {
-        if kid.is_some() && e.kid.as_deref() == kid {
-            continue;
-        }
-        ordered.push(e.key);
-    }
-    ordered
 }
 
 /// Phase 0.5 Stage D — self-validating signature verification of an
@@ -571,10 +611,7 @@ pub(crate) fn verify_self_issued_entity_statement(
 /// set is retained — not collapsed to the signer — so overlap rotation and
 /// PQ-hybrid publication work through the Discovery path as they do through
 /// HTTPS JWKS (#1185).
-fn extract_self_issued_jwks(
-    jwt: &str,
-    expected_issuer: &str,
-) -> Result<Vec<JwksEntry>> {
+fn extract_self_issued_jwks(jwt: &str, expected_issuer: &str) -> Result<Vec<JwksEntry>> {
     let (entries, _signer) = parse_self_issued_entity_statement(jwt, expected_issuer)?;
     Ok(entries)
 }
@@ -604,7 +641,10 @@ fn parse_self_issued_entity_statement(
         .map_err(|e| anyhow!("entity statement JWT header not JSON: {}", e))?;
     let alg = header.get("alg").and_then(|v| v.as_str()).unwrap_or("");
     if alg != "EdDSA" {
-        anyhow::bail!("entity statement JWT alg is '{}', only EdDSA supported", alg);
+        anyhow::bail!(
+            "entity statement JWT alg is '{}', only EdDSA supported",
+            alg
+        );
     }
 
     // Payload — iss/sub bind to expected issuer; exp not expired.
@@ -617,10 +657,17 @@ fn parse_self_issued_entity_statement(
     let iss = claims.get("iss").and_then(|v| v.as_str()).unwrap_or("");
     let sub = claims.get("sub").and_then(|v| v.as_str()).unwrap_or("");
     if iss != expected_issuer {
-        anyhow::bail!("entity statement iss '{}' != expected issuer '{}'", iss, expected_issuer);
+        anyhow::bail!(
+            "entity statement iss '{}' != expected issuer '{}'",
+            iss,
+            expected_issuer
+        );
     }
     if sub != expected_issuer {
-        anyhow::bail!("entity statement sub '{}' != iss (must be self-issued)", sub);
+        anyhow::bail!(
+            "entity statement sub '{}' != iss (must be self-issued)",
+            sub
+        );
     }
 
     if let Some(exp) = claims.get("exp").and_then(serde_json::Value::as_i64) {
@@ -647,7 +694,10 @@ fn parse_self_issued_entity_statement(
         .decode(parts[2])
         .map_err(|e| anyhow!("entity statement signature not base64url: {}", e))?;
     if sig_bytes.len() != 64 {
-        anyhow::bail!("Ed25519 signature must be 64 bytes, got {}", sig_bytes.len());
+        anyhow::bail!(
+            "Ed25519 signature must be 64 bytes, got {}",
+            sig_bytes.len()
+        );
     }
     let mut sig_arr = [0u8; 64];
     sig_arr.copy_from_slice(&sig_bytes);
@@ -682,7 +732,11 @@ fn parse_self_issued_entity_statement(
             .and_then(|v| v.as_str())
             .filter(|s| !s.is_empty())
             .map(str::to_owned);
-        if signer.is_none() && vk.verify_strict(signing_input.as_bytes(), &signature).is_ok() {
+        if signer.is_none()
+            && vk
+                .verify_strict(signing_input.as_bytes(), &signature)
+                .is_ok()
+        {
             signer = Some(vk);
         }
         entries.push(JwksEntry { kid, key: vk });
@@ -709,7 +763,7 @@ impl FederationKeySource for FederationKeyResolver {
         &self,
         issuer: &str,
         kid: Option<&str>,
-    ) -> anyhow::Result<Vec<ed25519_dalek::VerifyingKey>> {
+    ) -> anyhow::Result<Vec<FederationKey>> {
         FederationKeyResolver::get_keys(self, issuer, kid).await
     }
 }
@@ -747,6 +801,7 @@ mod tests {
     // ──────────────────────────────────────────────────────────────────
 
     use ed25519_dalek::{Signer, SigningKey};
+    use hyprstream_rpc::auth::{Claims, jwt};
     use rand::rngs::OsRng;
 
     fn b64u(bytes: &[u8]) -> String {
@@ -1011,6 +1066,20 @@ mod tests {
         })
     }
 
+    fn federation_token(signing_key: &SigningKey, kid: &str, sub: &str) -> String {
+        let exp = future_exp();
+        let claims = Claims::new(sub.to_owned(), exp - 3600, exp)
+            .with_issuer("https://fed.example".to_owned());
+        let header = serde_json::json!({"alg": "EdDSA", "typ": "at+jwt", "kid": kid});
+        let signing_input = format!(
+            "{}.{}",
+            b64u_json(&header),
+            b64u(&serde_json::to_vec(&claims).expect("claims json"))
+        );
+        let signature = signing_key.sign(signing_input.as_bytes());
+        format!("{}.{}", signing_input, b64u(&signature.to_bytes()))
+    }
+
     fn trusted_issuer(jwks_uri: &str) -> HashMap<String, crate::config::TrustedIssuerConfig> {
         let mut issuers = HashMap::new();
         issuers.insert(
@@ -1043,10 +1112,9 @@ mod tests {
         assert!(kids.contains(&Some("kid-new")));
     }
 
-    /// The anti-pattern this ticket fixes: with two keys published and the
-    /// token signed by the SECOND key, `get_keys` must surface that key. The
-    /// old `fetch_ed25519_key` returned only the first key, so a verifier
-    /// had no candidate that could verify a second-key signature.
+    /// Production-boundary overlap acceptance: two published keys each verify
+    /// their own named token. A named token is never allowed to fall back to a
+    /// different co-published key.
     #[tokio::test]
     async fn get_keys_overlap_returns_both_and_resolves_second_by_kid() {
         let sk_old = SigningKey::generate(&mut OsRng);
@@ -1063,28 +1131,44 @@ mod tests {
             let jwks = jwks.clone();
             Box::pin(async move { Ok(jwks) })
         });
-        let resolver =
-            FederationKeyResolver::new(&trusted_issuer("https://fed.example/jwks"))
-                .with_jwks_fetcher(fetcher);
+        let resolver = FederationKeyResolver::new(&trusted_issuer("https://fed.example/jwks"))
+            .with_jwks_fetcher(fetcher);
 
-        // No kid → ALL candidates returned so the verifier can try each.
-        let all = resolver.get_keys("https://fed.example", None).await.expect("both keys");
+        let old_token = federation_token(&sk_old, "kid-old", "old-subject");
+        let new_token = federation_token(&sk_new, "kid-new", "new-subject");
+
+        // No kid → all candidates are available to a genuinely kid-less token.
+        let all = resolver
+            .get_keys("https://fed.example", None)
+            .await
+            .expect("both keys");
         assert_eq!(all.len(), 2, "overlap: both keys must be returned");
 
-        // kid-new must resolve to the new (second-published) key, ordered first.
-        let ordered = resolver
+        let new_candidates = resolver
             .get_keys("https://fed.example", Some("kid-new"))
             .await
             .expect("kid-new resolves");
-        assert_eq!(ordered.first().copied(), Some(vk_new), "kid-new is first");
-        assert!(ordered.contains(&vk_old), "old key retained as overlap candidate");
+        assert_eq!(new_candidates.len(), 1, "named lookup must not fall back");
+        assert_eq!(new_candidates[0].verifying_key, vk_new);
+        assert_eq!(
+            jwt::decode_with_federation_candidates(&new_token, &new_candidates, None)
+                .expect("new overlap token verifies")
+                .sub,
+            "new-subject"
+        );
 
-        // kid-old still resolves during the overlap window.
-        let ordered_old = resolver
+        let old_candidates = resolver
             .get_keys("https://fed.example", Some("kid-old"))
             .await
             .expect("kid-old resolves");
-        assert_eq!(ordered_old.first().copied(), Some(vk_old));
+        assert_eq!(old_candidates.len(), 1, "named lookup must not fall back");
+        assert_eq!(old_candidates[0].verifying_key, vk_old);
+        assert_eq!(
+            jwt::decode_with_federation_candidates(&old_token, &old_candidates, None)
+                .expect("old overlap token verifies")
+                .sub,
+            "old-subject"
+        );
     }
 
     /// A named `kid` that is not in the published set after a fresh fetch
@@ -1093,15 +1177,13 @@ mod tests {
     #[tokio::test]
     async fn get_keys_unknown_kid_fails_closed_without_substitution() {
         let sk = SigningKey::generate(&mut OsRng);
-        let jwks =
-            serde_json::json!({"keys": [jwk_with_kid(&sk.verifying_key(), "kid-real")]});
+        let jwks = serde_json::json!({"keys": [jwk_with_kid(&sk.verifying_key(), "kid-real")]});
         let fetcher: JwksFetcher = Arc::new(move |_url| {
             let jwks = jwks.clone();
             Box::pin(async move { Ok(jwks) })
         });
-        let resolver =
-            FederationKeyResolver::new(&trusted_issuer("https://fed.example/jwks"))
-                .with_jwks_fetcher(fetcher);
+        let resolver = FederationKeyResolver::new(&trusted_issuer("https://fed.example/jwks"))
+            .with_jwks_fetcher(fetcher);
 
         let err = resolver
             .get_keys("https://fed.example", Some("kid-ghost"))
@@ -1110,6 +1192,38 @@ mod tests {
         assert!(
             format!("{err}").contains("kid-ghost"),
             "error must name the missing kid: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn repeated_unknown_kid_uses_one_refresh_within_negative_ttl() {
+        let sk = SigningKey::generate(&mut OsRng);
+        let jwks = serde_json::json!({"keys": [jwk_with_kid(&sk.verifying_key(), "kid-real")]});
+        let fetch_count = Arc::new(AtomicU32::new(0));
+        let count = Arc::clone(&fetch_count);
+        let fetcher: JwksFetcher = Arc::new(move |_url| {
+            let jwks = jwks.clone();
+            let count = Arc::clone(&count);
+            Box::pin(async move {
+                count.fetch_add(1, Ordering::SeqCst);
+                Ok(jwks)
+            })
+        });
+        let resolver = FederationKeyResolver::new(&trusted_issuer("https://fed.example/jwks"))
+            .with_jwks_fetcher(fetcher);
+
+        for _ in 0..3 {
+            assert!(
+                resolver
+                    .get_keys("https://fed.example", Some("kid-ghost"))
+                    .await
+                    .is_err()
+            );
+        }
+        assert_eq!(
+            fetch_count.load(Ordering::SeqCst),
+            1,
+            "one miss → one refresh per negative TTL"
         );
     }
 
@@ -1146,11 +1260,7 @@ mod tests {
             let rotated = rotated.clone();
             Box::pin(async move {
                 let n = cc.fetch_add(1, Ordering::SeqCst);
-                if n == 0 {
-                    Ok(overlap)
-                } else {
-                    Ok(rotated)
-                }
+                if n == 0 { Ok(overlap) } else { Ok(rotated) }
             })
         });
 
@@ -1164,15 +1274,25 @@ mod tests {
                 allow_http: true,
             },
         );
-        let resolver =
-            FederationKeyResolver::new(&issuers).with_jwks_fetcher(fetcher);
+        let resolver = FederationKeyResolver::new(&issuers).with_jwks_fetcher(fetcher);
 
-        // Overlap: old key still honoured.
+        let old_token = federation_token(&sk_old, "kid-old", "old-subject");
+        let new_token = federation_token(&sk_new, "kid-new", "new-subject");
+
+        // During overlap both signed tokens verify at the resolver/verifier
+        // boundary, not merely by inspecting returned vectors.
         let during_overlap = resolver
             .get_keys("https://fed.example", Some("kid-old"))
             .await
             .expect("old key honoured during overlap");
-        assert!(during_overlap.contains(&vk_old));
+        assert!(jwt::decode_with_federation_candidates(&old_token, &during_overlap, None).is_ok());
+        let new_during_overlap = resolver
+            .get_keys("https://fed.example", Some("kid-new"))
+            .await
+            .expect("new key honoured during overlap");
+        assert!(
+            jwt::decode_with_federation_candidates(&new_token, &new_during_overlap, None).is_ok()
+        );
 
         // After rotation drains, the old kid is gone — refetch, fail closed.
         let err = resolver
@@ -1189,6 +1309,6 @@ mod tests {
             .get_keys("https://fed.example", Some("kid-new"))
             .await
             .expect("new key still resolves");
-        assert!(after.contains(&vk_new));
+        assert!(jwt::decode_with_federation_candidates(&new_token, &after, None).is_ok());
     }
 }
