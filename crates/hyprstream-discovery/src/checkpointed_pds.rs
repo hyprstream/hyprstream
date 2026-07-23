@@ -4,8 +4,9 @@
 
 use anyhow::{bail, Context as _, Result};
 use hyprstream_pds::at9p::h512;
+use hyprstream_pds::at9p_chain::{validate_successor, ChainState};
 use hyprstream_pds::at9p_duplicity::{AcceptedAt9pState, Watermark};
-use hyprstream_pds::at9p_gate::DID_AT9P_PREFIX;
+use hyprstream_pds::at9p_gate::{VerifiedCapsule, DID_AT9P_PREFIX};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -65,7 +66,10 @@ impl CheckpointedPdsAcceptedStateSource {
     ) -> Result<Self> {
         let _probe = rocksdb::DB::open_for_read_only(&readonly_opts(), path, false)
             .with_context(|| format!("failed to open checkpointed PDS store at {path:?}"))?;
-        Ok(Self { path: path.to_path_buf(), acceptance_identity: Arc::new(acceptance_identity) })
+        Ok(Self {
+            path: path.to_path_buf(),
+            acceptance_identity: Arc::new(acceptance_identity),
+        })
     }
 
     pub(super) fn accepted_state(&self, did: &str) -> Result<Option<AcceptedAt9pState>> {
@@ -105,6 +109,74 @@ fn state_key(subject: &str) -> Vec<u8> {
 
 fn checkpoint_key(subject: &str) -> Vec<u8> {
     format!("at9p-checkpoint\0{subject}").into_bytes()
+}
+
+fn history_prefix(subject: &str) -> Vec<u8> {
+    format!("at9p-history\0{subject}\0").into_bytes()
+}
+
+/// Rebuild the live accepted state from the immutable GATE witness and every
+/// durable accepted update.  This intentionally happens before a registry
+/// credential is authenticated: using that credential to open the checkpoint
+/// first would strand a deployment as soon as its genesis CA retires.
+pub(super) fn state_from_genesis_history(
+    path: &Path,
+    did: &str,
+    genesis: &VerifiedCapsule,
+    now: &str,
+) -> Result<AcceptedAt9pState> {
+    anyhow::ensure!(
+        genesis.did() == did,
+        "GATE genesis DID does not match bootstrap anchor"
+    );
+    let subject = did
+        .strip_prefix(DID_AT9P_PREFIX)
+        .ok_or_else(|| anyhow::anyhow!("identifier is not did:at9p: {did:?}"))?;
+    anyhow::ensure!(
+        genesis.cid512() == subject,
+        "GATE genesis CID does not match bootstrap subject"
+    );
+
+    let db = rocksdb::DB::open_for_read_only(&readonly_opts(), path, false)
+        .with_context(|| format!("failed to open checkpointed PDS store at {path:?}"))?;
+    let snapshot = db.snapshot();
+    let prefix = history_prefix(subject);
+    let mut records = Vec::new();
+    for entry in snapshot.iterator(rocksdb::IteratorMode::From(
+        &prefix,
+        rocksdb::Direction::Forward,
+    )) {
+        let (key, value) = entry?;
+        if !key.starts_with(&prefix) {
+            break;
+        }
+        let epoch = std::str::from_utf8(&key[prefix.len()..])
+            .context("accepted at9p history epoch is not UTF-8")?
+            .parse::<u64>()
+            .context("accepted at9p history epoch is not an integer")?;
+        records.push((epoch, value));
+    }
+
+    let mut chain = ChainState::genesis(genesis.capsule())?;
+    let mut state = AcceptedAt9pState::from_verified_genesis(genesis)?;
+    for (epoch, bytes) in records {
+        let record = hyprstream_pds::at9p::UpdateRecord::from_dag_cbor(&bytes)
+            .context("accepted at9p history update is malformed")?;
+        anyhow::ensure!(
+            record.epoch == epoch,
+            "accepted at9p history key/record epoch mismatch"
+        );
+        chain = validate_successor(&chain, &record, now).map_err(|error| {
+            anyhow::anyhow!("accepted at9p history successor rejected: {error}")
+        })?;
+        state = AcceptedAt9pState::from_persisted_update(&bytes)
+            .context("accepted at9p history update did not reconstruct")?;
+    }
+    anyhow::ensure!(
+        state.subject_cid512 == subject,
+        "accepted at9p history subject mismatch"
+    );
+    Ok(state)
 }
 
 fn acceptance_message(domain: &[u8], payload: &[u8]) -> Vec<u8> {
@@ -331,6 +403,7 @@ mod tests {
         CapsuleBody, HybridKeyPair, ServiceEndpoint, ServiceEntry, ServiceType,
         Transport as At9pTransport,
     };
+    use hyprstream_pds::at9p_gate::verify_did_at9p;
     use hyprstream_pds::at9p_sign::{sign_capsule, sign_update_record};
 
     fn accepted_state() -> AcceptedAt9pState {
@@ -418,6 +491,76 @@ mod tests {
             decoded.head(),
             hyprstream_pds::at9p_duplicity::AcceptedAt9pHead::Update(_)
         ));
+    }
+
+    /// The startup proof must walk the accepted rotation chain from the pinned
+    /// genesis, before any current-CA credential can be considered.  The old
+    /// CA is absent from the replayed state and the new pair is the only live
+    /// authority, which is the post-retirement bootstrap shape.
+    #[test]
+    fn genesis_anchored_history_replays_post_retirement_current_state() {
+        let old_ed = ed25519_dalek::SigningKey::from_bytes(&[0x51; 32]);
+        let (old_pq, old_pq_vk) = ml_dsa_generate_keypair();
+        let new_ed = ed25519_dalek::SigningKey::from_bytes(&[0x52; 32]);
+        let (new_pq, new_pq_vk) = ml_dsa_generate_keypair();
+        let old = HybridKeyPair::new(
+            old_ed.verifying_key().to_bytes().to_vec(),
+            ml_dsa_vk_bytes(&old_pq_vk),
+        )
+        .expect("old hybrid pair");
+        let new = HybridKeyPair::new(
+            new_ed.verifying_key().to_bytes().to_vec(),
+            ml_dsa_vk_bytes(&new_pq_vk),
+        )
+        .expect("new hybrid pair");
+        let service = |address| {
+            ServiceEntry::new(
+                "#ns",
+                ServiceType::NinePExport,
+                ServiceEndpoint::new(At9pTransport::Quic, address).expect("QUIC service"),
+            )
+            .expect("service")
+        };
+        let mut genesis_body = CapsuleBody::new(vec![old], vec![service("quic://127.0.0.1:4444")])
+            .expect("genesis body");
+        genesis_body.next_key_commitments = vec![new.commitment_digest()];
+        let genesis = sign_capsule(genesis_body, &old_ed, &old_pq).expect("signed genesis");
+        let genesis_bytes = genesis.to_dag_cbor().expect("genesis bytes");
+        let did = format!(
+            "{DID_AT9P_PREFIX}{}",
+            genesis.cid512().expect("genesis CID")
+        );
+        let verified = verify_did_at9p(&did, &genesis_bytes).expect("GATE genesis");
+        let update = sign_update_record(
+            genesis.cid512().expect("genesis CID"),
+            1,
+            h512(&genesis_bytes),
+            CapsuleBody::new(vec![new.clone()], vec![service("quic://127.0.0.1:5555")])
+                .expect("retired current body"),
+            "2099-01-01T00:00:00Z".to_owned(),
+            &new_ed,
+            &new_pq,
+        )
+        .expect("signed retirement update");
+        let dir = tempfile::tempdir().expect("state store");
+        let mut options = rocksdb::Options::default();
+        options.create_if_missing(true);
+        let db = rocksdb::DB::open(&options, dir.path()).expect("open state store");
+        let mut history_key = history_prefix(did.strip_prefix(DID_AT9P_PREFIX).expect("at9p DID"));
+        history_key.extend_from_slice(format!("{:020}", 1).as_bytes());
+        db.put(history_key, update.to_dag_cbor().expect("update bytes"))
+            .expect("write accepted history");
+        drop(db);
+
+        let replayed =
+            state_from_genesis_history(dir.path(), &did, &verified, "2026-07-23T00:00:00Z")
+                .expect("post-retirement state must replay from the immutable genesis");
+        assert_eq!(replayed.epoch, 1);
+        assert_eq!(replayed.current.subject_keys, vec![new]);
+        assert_ne!(
+            replayed.current.subject_keys[0].ed25519_pub,
+            old_ed.verifying_key().to_bytes()
+        );
     }
 
     fn encode_fixture(

@@ -2187,20 +2187,36 @@ async fn authenticate_did_anchored_bootstrap(
 ) -> Result<(ProcessBootstrapAuthority, TransportConfig)> {
     seal_process_bootstrap_authority()?;
     // The immutable GATE capsule is a seed only.  It authenticates the durable
-    // checkpoint reader; authority installed for this process is then derived
-    // from the authenticated accepted-current body, so a retired CA cannot be
+    // accepted-history replay; authority installed for this process is then
+    // derived from that replayed current body, so a retired CA cannot be
     // resurrected by re-fetching genesis at a later restart.
     let seed = crate::did_anchored::resolve_did_anchored_trust(anchors).await?;
-    let registry_credential = load_registry_deployment_credential()?;
-    let seed_identity =
-        authenticate_registry_deployment_credentials(TrustedRegistryDeploymentCredentials {
-            authority: DeploymentCredentialAuthority::PqHybrid(seed.ca_keys.clone()),
-            registry_credential: registry_credential.clone(),
-        })?;
     let store_path = hyprstream_service::deployment_data_dir()?.join("pds-store");
+    let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let replayed_state = crate::checkpointed_pds::state_from_genesis_history(
+        &store_path,
+        &anchors.cluster_at9p_did,
+        &seed.genesis,
+        &now,
+    )?;
+    replayed_state.ensure_fresh(&now)?;
+    let trust = crate::did_anchored::DidAnchoredTrust::from_accepted_state(seed, &replayed_state)?;
+    // #556 / F5: the deployment CA anchors the registry key, which certifies the
+    // audit key and accepted-state checkpoints. It must never land classical.
+    anyhow::ensure!(
+        trust.assurance == hyprstream_rpc::auth::mac::Assurance::PqHybrid,
+        "DID-anchored deployment CA did not land PqHybrid (got {:?}); refusing a classical trust root (#556)",
+        trust.assurance
+    );
+    let registry_credential = load_registry_deployment_credential()?;
+    let witness =
+        authenticate_registry_deployment_credentials(TrustedRegistryDeploymentCredentials {
+            authority: DeploymentCredentialAuthority::PqHybrid(trust.ca_keys),
+            registry_credential,
+        })?;
     let state = crate::checkpointed_pds::CheckpointedPdsAcceptedStateSource::open(
         &store_path,
-        seed_identity.verifier,
+        witness.verifier.clone(),
     )?
     .accepted_state(&anchors.cluster_at9p_did)?
     .ok_or_else(|| {
@@ -2209,23 +2225,11 @@ async fn authenticate_did_anchored_bootstrap(
             anchors.cluster_at9p_did
         )
     })?;
-    let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
     state.ensure_fresh(&now)?;
-    let trust = crate::did_anchored::DidAnchoredTrust::from_accepted_state(seed, &state)?;
-    // #556 / F5: the deployment CA anchors the registry key, which certifies the
-    // audit key and accepted-state checkpoints. It must never land classical.
-    // Option C sources the CA from the capsule's hybrid subject key, so this is
-    // PqHybrid by construction; enforce it as a fail-closed floor regardless.
     anyhow::ensure!(
-        trust.assurance == hyprstream_rpc::auth::mac::Assurance::PqHybrid,
-        "DID-anchored deployment CA did not land PqHybrid (got {:?}); refusing a classical trust root (#556)",
-        trust.assurance
+        state == replayed_state,
+        "checkpointed accepted state does not match GATE-anchored accepted history"
     );
-    let witness =
-        authenticate_registry_deployment_credentials(TrustedRegistryDeploymentCredentials {
-            authority: DeploymentCredentialAuthority::PqHybrid(trust.ca_keys),
-            registry_credential,
-        })?;
     let authority = ProcessBootstrapAuthority {
         store_path,
         acceptance_identity: ProcessAcceptanceIdentity::Deployment(witness.verifier),

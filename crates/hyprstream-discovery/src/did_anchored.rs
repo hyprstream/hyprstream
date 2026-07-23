@@ -136,6 +136,9 @@ pub(crate) struct DidAnchoredTrust {
     /// carried, not reconstructed (#556 / F5). A capsule GATE-verifies only under
     /// pinned Hybrid, so this is never `Classical`.
     pub assurance: Assurance,
+    /// The GATE witness for the immutable genesis. Bootstrap replays the
+    /// daemon-owned accepted history from this anchor before choosing a live CA.
+    pub genesis: VerifiedCapsule,
 }
 
 impl DidAnchoredTrust {
@@ -154,6 +157,7 @@ impl DidAnchoredTrust {
             discovery_transport,
             authoritative_identity: seed.authoritative_identity,
             assurance: seed.assurance,
+            genesis: seed.genesis,
         })
     }
 }
@@ -393,6 +397,7 @@ pub(crate) async fn verify_did_anchored_document(
         // capsule's hybrid subject key ⇒ PqHybrid, carried not reconstructed.
         assurance: authoritative_identity.assurance,
         authoritative_identity,
+        genesis: verified,
     })
 }
 

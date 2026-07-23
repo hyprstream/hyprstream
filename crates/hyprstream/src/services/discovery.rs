@@ -128,6 +128,13 @@ fn at9p_checkpoint_key(subject_cid512: &str) -> Vec<u8> {
     format!("at9p-checkpoint\0{subject_cid512}").into_bytes()
 }
 
+/// Append-only, canonical accepted heads.  Startup replays this history from
+/// the GATE-pinned genesis before it accepts a current registry credential, so
+/// CA retirement cannot create a credential-ordering cycle.
+fn at9p_history_key(subject_cid512: &str, epoch: u64) -> Vec<u8> {
+    format!("at9p-history\0{subject_cid512}\0{epoch:020}").into_bytes()
+}
+
 const AT9P_STATE_MAGIC: &[u8; 8] = b"AT9PST02";
 const AT9P_STATE_HEADER_LEN: usize = 8 + 1 + 8 + 64 + 1 + 4;
 const AT9P_ACCEPTANCE_MAGIC: &[u8; 8] = b"AT9PAC01";
@@ -410,6 +417,15 @@ impl PdsRecordStore {
         let mut batch = rocksdb::WriteBatch::default();
         batch.put(at9p_state_key(&state.subject_cid512), encoded);
         batch.put(at9p_checkpoint_key(&state.subject_cid512), checkpoint);
+        if state.epoch > 0 {
+            let AcceptedAt9pHead::Update(update) = state.head() else {
+                bail!("accepted at9p genesis carried a nonzero epoch")
+            };
+            batch.put(
+                at9p_history_key(&state.subject_cid512, state.epoch),
+                update.to_dag_cbor()?,
+            );
+        }
         let mut options = rocksdb::WriteOptions::default();
         options.set_sync(true);
         db.write_opt(batch, &options)
@@ -2969,6 +2985,10 @@ mod pds_store_tests {
         let checkpoint_key = at9p_checkpoint_key(&cid);
         let old_state = db.get(&state_key).unwrap().unwrap();
         let old_checkpoint = db.get(&checkpoint_key).unwrap().unwrap();
+        assert!(
+            db.get(at9p_history_key(&cid, 0)).unwrap().is_none(),
+            "the pinned genesis is replayed from GATE, never copied into mutable history"
+        );
         let update = sign_update_record(
             cid.clone(),
             1,
@@ -2984,6 +3004,10 @@ mod pds_store_tests {
             .expect("advance");
         let new_state = db.get(&state_key).unwrap().unwrap();
         let new_checkpoint = db.get(&checkpoint_key).unwrap().unwrap();
+        assert!(
+            db.get(at9p_history_key(&cid, 1)).unwrap().is_some(),
+            "a production accepted-state advance must atomically retain its replayable update"
+        );
         db.delete(&state_key).expect("simulate state-half missing");
         assert!(publisher.accepted_at9p_state(&did, None).is_err());
         db.put(&state_key, &new_state).expect("restore state");
