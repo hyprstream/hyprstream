@@ -286,7 +286,7 @@ impl Commit {
 const DRAIN_FRAGMENT: &str = "atproto_drain";
 const LEAD_FRAGMENT: &str = "atproto_lead";
 
-/// A P-256 key published for commit verification, with an inclusive validity
+/// A P-256 key published for commit verification, with a half-open validity
 /// interval. The active slot is unbounded; drain and lead slots must carry
 /// explicit document bounds.
 #[derive(Clone, Debug)]
@@ -306,12 +306,15 @@ impl PublishedAtprotoKey {
     }
 
     fn bounded(key: VerifyingKey, nbf: i64, exp: i64) -> Result<Self> {
-        ensure!(nbf <= exp, "published #atproto slot has nbf after exp");
+        ensure!(
+            nbf < exp,
+            "published #atproto slot has an empty validity interval"
+        );
         Ok(Self { key, nbf, exp })
     }
 
     fn is_live_at(&self, now: i64) -> bool {
-        self.nbf <= now && now <= self.exp
+        self.nbf <= now && now < self.exp
     }
 }
 
@@ -331,6 +334,25 @@ impl PublishedAtprotoKeys {
         Self {
             slots: vec![PublishedAtprotoKey::active(key)],
         }
+    }
+
+    /// Construct the same bounded authority that a root DID document publishes.
+    /// This is for local resolvers whose trusted publication source is the
+    /// rotation store that feeds that document; remote resolvers must parse the
+    /// resolved DID document with [`Self::from_did_document`].
+    pub fn from_published_slots(
+        active: VerifyingKey,
+        drain: Option<(VerifyingKey, i64, i64)>,
+        lead: Option<(VerifyingKey, i64, i64)>,
+    ) -> Result<Self> {
+        let mut slots = vec![PublishedAtprotoKey::active(active)];
+        if let Some((key, nbf, exp)) = drain {
+            slots.push(PublishedAtprotoKey::bounded(key, nbf, exp)?);
+        }
+        if let Some((key, nbf, exp)) = lead {
+            slots.push(PublishedAtprotoKey::bounded(key, nbf, exp)?);
+        }
+        Ok(Self { slots })
     }
 
     pub fn live_keys(&self, now: i64) -> impl Iterator<Item = &VerifyingKey> {
@@ -671,8 +693,8 @@ mod tests {
         let keys = PublishedAtprotoKeys::from_did_document(&doc, "did:web:alice.example.com")
             .expect("bounded drain document parses");
         assert!(
-            commit.verify_against_published_keys(&keys, 21).is_err(),
-            "expired drain key must not be consulted"
+            commit.verify_against_published_keys(&keys, 20).is_err(),
+            "drain key must not be consulted at its exclusive expiry boundary"
         );
     }
 

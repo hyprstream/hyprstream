@@ -1021,9 +1021,11 @@ pub fn global_es256_key_store(
     secrets_dir: &Path,
     config: &OAuthConfig,
 ) -> Arc<Es256SigningKeyStore> {
-    ES256_SIGNING_STORE
+    let store = ES256_SIGNING_STORE
         .get_or_init(|| Arc::new(load_or_init_es256_key_store(secrets_dir, config)))
-        .clone()
+        .clone();
+    store.bind_secrets_dir(secrets_dir.to_path_buf());
+    store
 }
 
 // ── Key slot ────────────────────────────────────────────────────────────────
@@ -1320,7 +1322,14 @@ pub fn spawn_rotation_task(
     extra: RotationStores,
 ) {
     tokio::task::spawn_local(async move {
-        let mut interval = tokio::time::interval(config.rotation_check_interval());
+        // Bounded overlap is an expiry contract, not merely six-hour
+        // housekeeping. Do not leave an expired method served for a full
+        // default rotation interval.
+        let mut interval = tokio::time::interval(
+            config
+                .rotation_check_interval()
+                .min(std::time::Duration::from_secs(60)),
+        );
         interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
         // Skip the first tick (fires immediately on creation)
         interval.tick().await;
@@ -1407,7 +1416,7 @@ impl Es256KeySlot {
     }
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct Es256KeySlots {
     pub drain: Option<Es256KeySlot>,
     pub active: Option<Es256KeySlot>,
@@ -1429,6 +1438,7 @@ type Es256PromotionHook = dyn Fn(Arc<Es256SigningKey>) -> anyhow::Result<()> + S
 pub struct Es256SigningKeyStore(
     pub Arc<parking_lot::RwLock<Es256KeySlots>>,
     Arc<parking_lot::RwLock<Option<Arc<Es256PromotionHook>>>>,
+    Arc<parking_lot::RwLock<Option<PathBuf>>>,
 );
 
 impl Es256SigningKeyStore {
@@ -1436,7 +1446,33 @@ impl Es256SigningKeyStore {
         Self(
             Arc::new(parking_lot::RwLock::new(slots)),
             Arc::new(parking_lot::RwLock::new(None)),
+            Arc::new(parking_lot::RwLock::new(None)),
         )
+    }
+
+    /// Bind this process-local cache to the durable slot directory.  Each
+    /// process refreshes before it signs or resolves, so `--ipc` workers see a
+    /// promotion made by the OAuth process rather than retaining a stale key.
+    pub fn bind_secrets_dir(&self, secrets_dir: PathBuf) {
+        *self.2.write() = Some(secrets_dir);
+    }
+
+    pub fn refresh_from_disk(&self) {
+        let Some(secrets_dir) = self.2.read().clone() else {
+            return;
+        };
+        let active = load_es256_slot(&secrets_dir, "active");
+        // Never replace a usable in-memory authority with a partially written
+        // or unavailable filesystem snapshot.
+        let Some(active) = active else {
+            warn!("ES256: durable active slot unavailable; retaining cached authority");
+            return;
+        };
+        *self.0.write() = Es256KeySlots {
+            drain: load_es256_slot(&secrets_dir, "drain"),
+            active: Some(active),
+            lead: load_es256_slot(&secrets_dir, "lead"),
+        };
     }
 
     /// Install the in-process action run while a lead → active transition is
@@ -1448,24 +1484,20 @@ impl Es256SigningKeyStore {
         *self.1.write() = Some(hook);
     }
 
-    fn has_promotion_hook(&self) -> bool {
-        self.1.read().is_some()
-    }
-
-    fn notify_promotion(&self, key: Arc<Es256SigningKey>) -> anyhow::Result<()> {
-        let hook =
-            self.1.read().clone().ok_or_else(|| {
-                anyhow::anyhow!("ES256 promotion requires a PDS head re-sign hook")
-            })?;
-        hook(key)
-    }
-
     /// The current active ES256 signing key — the single `#atproto` key the
     /// DID document publishes and the repo head is signed with (#918
     /// re-sign-on-rotation). Synchronous (parking_lot lock) so the publisher
     /// can resolve the LIVE key at sign time without an async runtime.
     pub fn active_key(&self) -> Option<Arc<Es256SigningKey>> {
+        self.refresh_from_disk();
         self.0.read().active.as_ref().map(|s| Arc::clone(&s.key))
+    }
+
+    /// Take active, drain and lead from one read guard so a DID document never
+    /// mixes two rotation generations.
+    pub fn slots_snapshot(&self) -> Es256KeySlots {
+        self.refresh_from_disk();
+        self.0.read().clone()
     }
 
     /// The active slot (key + `nbf`/`exp` bounds), if present.
@@ -1573,9 +1605,20 @@ pub fn load_or_init_es256_key_store(
     let active_secs = config.active_secs();
     let lead_secs = config.lead_secs();
 
-    let drain = load_es256_slot(secrets_dir, "drain");
+    let mut drain = load_es256_slot(secrets_dir, "drain");
     let mut active = load_es256_slot(secrets_dir, "active");
-    let lead = load_es256_slot(secrets_dir, "lead");
+    let mut lead = load_es256_slot(secrets_dir, "lead");
+
+    // Do not serve an already-expired bounded method after restart. This is
+    // the same exclusive boundary the verifier and runtime cleanup use.
+    if drain.as_ref().is_some_and(|slot| now >= slot.exp) {
+        delete_es256_slot(secrets_dir, "drain");
+        drain = None;
+    }
+    if lead.as_ref().is_some_and(|slot| now >= slot.exp) {
+        delete_es256_slot(secrets_dir, "lead");
+        lead = None;
+    }
 
     if active.is_none() {
         info!("No active ES256 signing key found — generating on first boot");
@@ -1611,15 +1654,13 @@ pub fn load_or_init_es256_key_store(
     })
 }
 
-/// Returns `true` if the active key was promoted (lead → active). A promotion
-/// also invokes the store's in-process re-sign hook (#918).
+/// Returns `true` if the active key was promoted (lead → active).
 ///
-/// Promotion is a recoverable transaction with respect to the live key: the
-/// store write guard prevents readers from observing the candidate key until
-/// its active-slot persistence and the persisted repo-head re-sign both
-/// succeed. On either failure the old active key stays live and the lead stays
-/// queued, so the next rotation tick retries instead of silently committing a
-/// mismatched published key.
+/// Existing commits remain verifiable through the bounded drain slot.  That
+/// is deliberately independent of any PDS writer: in `--ipc` the OAuth
+/// process and the writer are different processes, so requiring a callback to
+/// re-sign an old commit would make rotation impossible in the supported
+/// deployment.
 pub async fn rotate_es256_keys(
     config: &OAuthConfig,
     secrets_dir: &Path,
@@ -1635,44 +1676,7 @@ pub async fn rotate_es256_keys(
     // Phase 1: promote lead → active if lead.nbf <= now
     if let Some(new_active) = slots.lead.as_ref().filter(|lead| lead.nbf <= now).cloned() {
         let old_active = slots.active.clone();
-        if !store.has_promotion_hook() {
-            warn!("ES256: promotion remains pending because no PDS head re-sign hook is installed");
-        } else if let Err(error) = persist_es256_slot(secrets_dir, "active", &new_active) {
-            if let Some(ref old_active) = old_active {
-                if let Err(rollback_error) = persist_es256_slot(secrets_dir, "active", old_active) {
-                    warn!(
-                        "ES256: failed to restore persisted active after persistence failure; startup reconciliation is required: {rollback_error}"
-                    );
-                }
-            } else {
-                delete_es256_slot(secrets_dir, "active");
-            }
-            warn!(
-                "ES256: failed to persist promoted active; retaining old active and retrying next tick: {error}"
-            );
-        } else if let Err(error) = store.notify_promotion(Arc::clone(&new_active.key)) {
-            // The hook's RocksDB commit is atomic, but re-sign defensively with
-            // the old key in case a storage backend reported an uncertain
-            // outcome. Restore the durable active slot too; the in-memory lead
-            // remains queued regardless, so a later tick reconciles again.
-            if let Some(ref old_active) = old_active {
-                if let Err(rollback_error) = store.notify_promotion(Arc::clone(&old_active.key)) {
-                    warn!(
-                        "ES256: failed to restore PDS head after promotion failure: {rollback_error}"
-                    );
-                }
-                if let Err(rollback_error) = persist_es256_slot(secrets_dir, "active", old_active) {
-                    warn!(
-                        "ES256: failed to restore persisted active after promotion failure; startup reconciliation is required: {rollback_error}"
-                    );
-                }
-            } else {
-                delete_es256_slot(secrets_dir, "active");
-            }
-            warn!(
-                "ES256: failed to re-sign PDS head; retaining old active and retrying next tick: {error}"
-            );
-        } else {
+        {
             if let Some(old_active) = old_active {
                 // The old active key becomes verification-only for one bounded
                 // drain interval. Store the actual publication expiry in the
@@ -1680,13 +1684,20 @@ pub async fn rotate_es256_keys(
                 let drain = Es256KeySlot::new(
                     Arc::unwrap_or_clone(old_active.key),
                     old_active.nbf,
-                    old_active.exp.saturating_add(drain_secs),
+                    now.saturating_add(drain_secs),
                 );
+                // Persist drain before active. A process that reloads between
+                // the two writes can therefore still verify K-signed commits.
                 delete_es256_slot(secrets_dir, "drain");
                 if let Err(error) = persist_es256_slot(secrets_dir, "drain", &drain) {
-                    warn!("ES256: failed to persist drain slot: {error}");
+                    warn!("ES256: failed to persist drain slot; retaining old active: {error}");
+                    return false;
                 }
                 slots.drain = Some(drain);
+            }
+            if let Err(error) = persist_es256_slot(secrets_dir, "active", &new_active) {
+                warn!("ES256: failed to persist promoted active; retaining old active: {error}");
+                return false;
             }
             delete_es256_slot(secrets_dir, "lead");
             slots.active = Some(new_active);
@@ -1696,12 +1707,6 @@ pub async fn rotate_es256_keys(
         }
     }
 
-    // The filesystem active slot and RocksDB repo head are separate durable
-    // stores. This write-guard protocol closes all in-process observation
-    // windows, but crash-atomic pending state + startup publication gating is
-    // tracked by #1126. Until that lands, startup reconciliation remains the
-    // recovery mechanism for a crash between those durable writes.
-
     // Phase 2: remove expired drain
     if let Some(ref drain) = slots.drain {
         if now >= drain.exp {
@@ -1709,6 +1714,14 @@ pub async fn rotate_es256_keys(
             slots.drain = None;
             info!("ES256: removed expired drain slot");
         }
+    }
+
+    // A lead is publication-only and must not survive its own bounded window
+    // if an administrator supplied inconsistent slot files.
+    if slots.lead.as_ref().is_some_and(|lead| now >= lead.exp) {
+        delete_es256_slot(secrets_dir, "lead");
+        slots.lead = None;
+        info!("ES256: removed expired lead slot");
     }
 
     // Phase 3: generate lead if active is near expiry
@@ -3330,6 +3343,21 @@ mod tests {
         assert_eq!(kid1, kid2, "ES256 key must survive reload from disk");
     }
 
+    #[test]
+    fn es256_startup_removes_expired_bounded_slots() {
+        let dir = TempDir::new().unwrap();
+        let config = test_config();
+        let now = chrono::Utc::now().timestamp();
+        let active = generate_es256_slot(now - 60, now + 86_400);
+        let expired_drain = generate_es256_slot(now - 120, now);
+        persist_es256_slot(dir.path(), "active", &active).unwrap();
+        persist_es256_slot(dir.path(), "drain", &expired_drain).unwrap();
+
+        let store = load_or_init_es256_key_store(dir.path(), &config);
+        assert!(store.drain_slot().is_none());
+        assert!(load_es256_slot(dir.path(), "drain").is_none());
+    }
+
     #[tokio::test]
     async fn es256_rotate_promotes_lead() {
         let dir = TempDir::new().unwrap();
@@ -3385,7 +3413,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn es256_rotate_without_hook_stays_pending() {
+    async fn es256_rotate_without_hook_publishes_drain_for_ipc_workers() {
         let dir = TempDir::new().unwrap();
         let config = test_config();
         let now = chrono::Utc::now().timestamp();
@@ -3402,28 +3430,24 @@ mod tests {
             lead: Some(lead),
         });
 
-        assert!(
-            !rotate_es256_keys(&config, dir.path(), &store, now).await,
-            "rotation without a head re-sign hook must remain pending"
-        );
+        assert!(rotate_es256_keys(&config, dir.path(), &store, now).await);
         let slots = store.0.read();
-        assert_eq!(slots.active.as_ref().unwrap().kid(), active_kid);
-        assert_eq!(slots.lead.as_ref().unwrap().kid(), lead_kid);
-        assert!(slots.drain.is_none());
+        assert_eq!(slots.active.as_ref().unwrap().kid(), lead_kid);
+        assert!(slots.lead.is_none());
+        assert_eq!(slots.drain.as_ref().unwrap().kid(), active_kid);
         assert_eq!(
             load_es256_slot(dir.path(), "active").unwrap().kid(),
-            active_kid
+            lead_kid
         );
     }
 
     #[tokio::test]
-    async fn es256_rotate_retries_after_promotion_hook_failure() {
+    async fn es256_rotation_does_not_depend_on_a_promotion_hook() {
         let dir = TempDir::new().unwrap();
         let config = test_config();
         let now = chrono::Utc::now().timestamp();
 
         let active = generate_es256_slot(now - 14 * 86400, now + 1);
-        let active_kid = active.kid();
         let lead = generate_es256_slot(now - 1, now + 14 * 86400);
         let lead_kid = lead.kid();
         persist_es256_slot(dir.path(), "active", &active).unwrap();
@@ -3434,37 +3458,8 @@ mod tests {
             active: Some(active),
             lead: Some(lead),
         });
-        let fail_candidate_once = Arc::new(std::sync::atomic::AtomicBool::new(true));
-        let fail_candidate = Arc::clone(&fail_candidate_once);
-        let candidate_kid = lead_kid.clone();
-        store.set_promotion_hook(Arc::new(move |key| {
-            if crate::auth::jwt::es256_kid(&key) == candidate_kid
-                && fail_candidate.swap(false, Ordering::AcqRel)
-            {
-                anyhow::bail!("injected head re-sign failure");
-            }
-            Ok(())
-        }));
-
-        assert!(
-            !rotate_es256_keys(&config, dir.path(), &store, now).await,
-            "failed re-sign must not report promotion"
-        );
-        {
-            let slots = store.0.read();
-            assert_eq!(slots.active.as_ref().unwrap().kid(), active_kid);
-            assert_eq!(slots.lead.as_ref().unwrap().kid(), lead_kid);
-        }
-        assert_eq!(
-            load_es256_slot(dir.path(), "active").unwrap().kid(),
-            active_kid,
-            "failed re-sign must restore the durable active slot"
-        );
-
-        assert!(
-            rotate_es256_keys(&config, dir.path(), &store, now).await,
-            "queued lead must be retried on the next tick"
-        );
+        store.set_promotion_hook(Arc::new(|_| anyhow::bail!("must not be called")));
+        assert!(rotate_es256_keys(&config, dir.path(), &store, now).await);
         let slots = store.0.read();
         assert_eq!(slots.active.as_ref().unwrap().kid(), lead_kid);
         assert!(slots.lead.is_none());
@@ -3488,13 +3483,6 @@ mod tests {
             active: Some(active),
             lead: Some(lead),
         });
-        let hook_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let calls = Arc::clone(&hook_calls);
-        store.set_promotion_hook(Arc::new(move |_| {
-            calls.fetch_add(1, Ordering::AcqRel);
-            Ok(())
-        }));
-
         assert!(
             !rotate_es256_keys(&config, &invalid_secrets_dir, &store, now).await,
             "failed active persistence must not report promotion"
@@ -3504,14 +3492,11 @@ mod tests {
             assert_eq!(slots.active.as_ref().unwrap().kid(), active_kid);
             assert_eq!(slots.lead.as_ref().unwrap().kid(), lead_kid);
         }
-        assert_eq!(hook_calls.load(Ordering::Acquire), 0);
-
         assert!(
             rotate_es256_keys(&config, &valid_secrets_dir, &store, now).await,
             "queued lead must be retried after persistence recovers"
         );
         assert_eq!(store.active_slot().unwrap().kid(), lead_kid);
-        assert_eq!(hook_calls.load(Ordering::Acquire), 1);
     }
 
     // ── ML-DSA store tests ─────────────────────────────────────────────────

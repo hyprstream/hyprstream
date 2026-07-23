@@ -1385,11 +1385,8 @@ fn atproto_datetime_now() -> String {
 /// commit served in the proof is the one the writer signed at publish time.
 pub struct PdsRecordResolver {
     store: Arc<PdsRecordStore>,
-    /// The shared ES256 rotation store + this node's repo DID. Local repo reads
-    /// take its generation read guard, so the re-sign hook cannot expose a
-    /// K'-signed head before K' becomes the live key. This does NOT authorize
-    /// the local repo's transitional `did:key`; verification remains fail
-    /// closed until #1124 supplies a real atproto repo authority.
+    /// The rotation store feeding the root did:web document and that document's
+    /// repo DID. Local reads resolve exactly its bounded publication authority.
     rotation: Option<(Arc<crate::auth::key_rotation::Es256SigningKeyStore>, String)>,
 }
 
@@ -1401,9 +1398,7 @@ impl PdsRecordResolver {
         }
     }
 
-    /// Install the ES256 rotation store + this node's repo DID, enabling local
-    /// repo reads to share the rotation generation guard. Key resolution still
-    /// fails closed for this transitional `did:key` and for foreign DIDs.
+    /// Install the ES256 rotation store + the root did:web repo DID.
     pub fn with_es256_rotation(
         mut self,
         store: Arc<crate::auth::key_rotation::Es256SigningKeyStore>,
@@ -1486,6 +1481,13 @@ impl RecordResolver for PdsRecordResolver {
         // Pair with promotion's write guard through the complete head snapshot
         // and proof assembly. A reader therefore sees either generation K or
         // generation K', never the K'-signed head during the hidden transition.
+        if let Some((store, _)) = self
+            .rotation
+            .as_ref()
+            .filter(|(_, local_did)| did == local_did)
+        {
+            store.refresh_from_disk();
+        }
         let _generation_guard = self.local_generation_guard(did);
         let Some(repo) = self.store.load_repo(did)? else {
             return Ok(None);
@@ -1505,6 +1507,13 @@ impl RecordResolver for PdsRecordResolver {
     }
 
     async fn resolve_repo(&self, did: &str) -> anyhow::Result<Option<RecordCarData>> {
+        if let Some((store, _)) = self
+            .rotation
+            .as_ref()
+            .filter(|(_, local_did)| did == local_did)
+        {
+            store.refresh_from_disk();
+        }
         let _generation_guard = self.local_generation_guard(did);
         let Some(repo) = self.store.load_repo(did)? else {
             return Ok(None);
@@ -1531,21 +1540,36 @@ impl RecordResolver for PdsRecordResolver {
         Ok(Some(RecordCarData { uri, car }))
     }
 
-    /// Resolve the single current `#atproto` verifying key for `did` — the
-    /// atproto-spec-aligned verification seam (#918 re-sign-on-rotation).
-    ///
-    /// The local repo subject is currently an Ed25519-derived node `did:key`,
-    /// while peers receive an OAuth-issuer `did:web` document carrying the
-    /// independent P-256 `#atproto` key. No resolvable document for that
-    /// `did:key` authorizes the P-256 key, so the only safe interim behavior is
-    /// `Ok(None)`: placement ingest rejects the local repo. #1124 owns aligning
-    /// the repo subject with a real atproto authority. Foreign resolution is
-    /// also unavailable and fails closed.
-    async fn resolve_verifying_key(
+    async fn resolve_verifying_keys(
         &self,
-        _did: &str,
-    ) -> anyhow::Result<Option<p256::ecdsa::VerifyingKey>> {
-        Ok(None)
+        did: &str,
+    ) -> anyhow::Result<Option<hyprstream_pds::commit::PublishedAtprotoKeys>> {
+        let Some((store, local_did)) = self.rotation.as_ref() else {
+            return Ok(None);
+        };
+        if did != local_did {
+            return Ok(None);
+        }
+        // `slots_snapshot` is a single rotation generation and is the exact
+        // source used by root_did_document. No absent value loosens this check:
+        // an authority without an active slot cannot be resolved.
+        let slots = store.slots_snapshot();
+        let Some(active) = slots.active else {
+            return Ok(None);
+        };
+        let drain = slots
+            .drain
+            .map(|slot| (*slot.key.verifying_key(), slot.nbf, slot.exp));
+        let lead = slots
+            .lead
+            .map(|slot| (*slot.key.verifying_key(), slot.nbf, slot.exp));
+        Ok(Some(
+            hyprstream_pds::commit::PublishedAtprotoKeys::from_published_slots(
+                *active.key.verifying_key(),
+                drain,
+                lead,
+            )?,
+        ))
     }
 }
 
@@ -2095,10 +2119,28 @@ mod pds_store_tests {
     }
 
     #[test]
-    fn local_verifier_rejects_mismatched_did_key_authority() {
+    fn local_did_web_authority_admits_pre_rotation_commit_through_drain() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let sk = SigningKey::random(&mut rand::rngs::OsRng);
-        let es256_store = test_es256_store(sk);
+        let secrets_dir = dir.path().join("secrets");
+        std::fs::create_dir_all(&secrets_dir).expect("create secrets");
+        let now = chrono::Utc::now().timestamp();
+        let old = SigningKey::random(&mut rand::rngs::OsRng);
+        let new = SigningKey::random(&mut rand::rngs::OsRng);
+        let es256_store = Arc::new(crate::auth::key_rotation::Es256SigningKeyStore::new(
+            crate::auth::key_rotation::Es256KeySlots {
+                drain: None,
+                active: Some(crate::auth::key_rotation::Es256KeySlot::new(
+                    old,
+                    now - 60,
+                    now + 1,
+                )),
+                lead: Some(crate::auth::key_rotation::Es256KeySlot::new(
+                    new,
+                    now - 1,
+                    now + 86_400,
+                )),
+            },
+        ));
         let store = Arc::new(PdsRecordStore::open(dir.path()).expect("open rw"));
         let publisher =
             PdsPublisher::new(Arc::clone(&store), DID.to_owned(), Arc::clone(&es256_store));
@@ -2106,25 +2148,31 @@ mod pds_store_tests {
         let resolver =
             PdsRecordResolver::new(store).with_es256_rotation(es256_store, DID.to_owned());
 
+        assert!(block_on(crate::auth::key_rotation::rotate_es256_keys(
+            &crate::config::OAuthConfig::default(),
+            &secrets_dir,
+            resolver.rotation.as_ref().expect("rotation").0.as_ref(),
+            now,
+        )));
+        let keys = block_on(resolver.resolve_verifying_keys(DID))
+            .expect("resolve root authority")
+            .expect("matching did:web authority");
+        let repo = block_on(resolver.resolve_repo(DID))
+            .expect("resolve repo")
+            .expect("repo");
+        let commit = commit_from_car(&repo.car);
+        commit
+            .verify_against_published_keys(&keys, now)
+            .expect("K-signed commit must verify under published drain slot");
         assert!(
-            block_on(resolver.resolve_verifying_key(DID))
-                .expect("local mismatch is handled")
-                .is_none(),
-            "the Ed25519 did:key must not authorize the unrelated local P-256 key"
-        );
-        assert!(
-            block_on(resolver.resolve_verifying_key("did:web:foreign.example"))
+            block_on(resolver.resolve_verifying_keys("did:web:foreign.example"))
                 .expect("foreign resolution is unsupported")
                 .is_none(),
             "foreign DID resolution stays unsupported so ingest can fail closed"
         );
         let index = hyprstream_discovery::placement_index::PlacementIndex::new();
-        let error = block_on(index.ingest_did(&resolver, DID))
-            .expect_err("mismatched local authority must be rejected by placement ingest");
-        assert!(
-            error.to_string().contains("no #atproto verifying key"),
-            "unexpected ingest error: {error:#}"
-        );
+        block_on(index.ingest_did(&resolver, DID))
+            .expect("production placement ingest must accept the drain-authorized commit");
     }
 
     #[test]

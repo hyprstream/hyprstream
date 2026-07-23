@@ -563,10 +563,12 @@ pub async fn root_did_document(State(state): State<Arc<OAuthState>>) -> Response
 
     // The active key signs new commits. Bounded drain/lead slots are published
     // only for verification overlap; they are never signing candidates.
-    let (active_slot, drain_slot, lead_slot) = match state.es256_key_store.as_ref() {
-        Some(store) => (store.active_slot(), store.drain_slot(), store.lead_slot()),
-        None => (None, None, None),
-    };
+    let slots = state
+        .es256_key_store
+        .as_ref()
+        .map(|store| store.slots_snapshot())
+        .unwrap_or_default();
+    let (active_slot, drain_slot, lead_slot) = (slots.active, slots.drain, slots.lead);
     let handle = configured_handle_host(&state.issuer_url);
     let atproto = active_slot
         .as_ref()

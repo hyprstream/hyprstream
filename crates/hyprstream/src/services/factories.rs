@@ -702,10 +702,8 @@ fn create_registry_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawn
     // holder of the `#atproto` private key: it opens the durable store
     // read-write and, on register/commit, signs the repo's commit ONCE and
     // persists the signed bytes. Reads (the discovery service) are keyless.
-    // This node's `did:key` identity (the record `repo` at-uri authority) is
-    // derived from the node's own root Ed25519 key — the same identity TLS
-    // endorsement uses ("a node-level trust assertion, not specific to any
-    // per-service key"). The `#atproto` commit-signing key is the *active* key
+    // The record `repo` authority is the root `did:web` document that publishes
+    // the `#atproto` commit-verification key. The `#atproto` signing key is the *active* key
     // from the shared `Es256SigningKeyStore` — the same P-256 key
     // `oauth::did_document` publishes as the `#atproto` verification method, so
     // the writer and the published key are one source of truth (classical —
@@ -783,16 +781,10 @@ fn create_registry_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawn
     }
     registry_service = registry_service.with_jwt_key_source(ctx.cluster_key_source());
     if let Some(publisher) = pds_publisher {
-        // #918 re-sign-on-rotation: wire the ES256 promotion hook before the
-        // publisher moves into the registry. The hook fires while the rotation
-        // task still holds the key-store write guard, re-signing the persisted
-        // head before the new active key becomes visible. NOTE(#1123): cross-
-        // `--ipc` the rotation event must reach whichever process runs the
-        // publisher.
+        // A promotion publishes the former active key as a bounded drain slot;
+        // no writer-local re-sign callback is needed, which keeps `--ipc`
+        // rotation viable when OAuth and registry run in different processes.
         let publisher_arc = Arc::new(publisher);
-        if let Err(error) = publisher_arc.install_es256_promotion_hook() {
-            tracing::warn!("initial PDS head re-sign failed: {error}");
-        }
         registry_service = registry_service.with_pds_publisher_arc(publisher_arc);
     }
 
@@ -1883,16 +1875,19 @@ fn create_discovery_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spaw
             .context("failed to open PDS record store (read-only)")?
             .with_at9p_deployment_verifier(at9p_acceptance_identity),
     );
-    // #918 — wire the ES256 rotation store + node repo DID into the resolver
-    // so local repo reads share the same generation guard as the writer and
-    // rotation task. This does not mint verification authority: the node repo
-    // is still a did:key while the served #atproto document is did:web, so key
-    // resolution intentionally fails closed until #1124 aligns the identity.
+    // #918 — the local repo subject is the root did:web authority whose
+    // document is fed by this ES256 store. The resolver uses the same bounded
+    // publication snapshot, including drain, before placement ingest.
     let secrets_dir = crate::config::HyprConfig::resolve_secrets_dir()?;
     let es256_store =
         crate::auth::key_rotation::global_es256_key_store(&secrets_dir, &config.oauth);
-    let node_did =
-        hyprstream_rpc::did_key::ed25519_to_did_key(&ctx.verifying_key().to_bytes());
+    let issuer = ctx
+        .oauth_issuer_url()
+        .map(str::to_owned)
+        .unwrap_or_else(|| config.oauth.issuer_url());
+    let authority = crate::services::oauth::did_document::issuer_authority(&issuer)
+        .context("OAuth issuer has no did:web authority")?;
+    let node_did = format!("did:web:{authority}");
     let record_resolver = std::sync::Arc::new(
         crate::services::discovery::PdsRecordResolver::new(pds_store)
             .with_es256_rotation(es256_store, node_did),
