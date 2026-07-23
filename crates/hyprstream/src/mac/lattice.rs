@@ -123,9 +123,10 @@ mod tests {
             SecurityLabel::new(Level::Public, Assurance::PqHybrid, CompartmentSet::EMPTY);
         assert_eq!(ifc_join(&[algebraic_identity, secret]), secret);
         let empty = ifc_join(&[]);
+        assert_eq!(empty.level, Level::Public);
         assert_eq!(empty.assurance, Assurance::Unverified);
+        assert!(empty.compartments.is_empty());
         assert_ne!(empty, algebraic_identity);
-        assert!(empty.is_bottom());
     }
 
     #[test]
