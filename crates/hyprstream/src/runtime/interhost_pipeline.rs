@@ -30,6 +30,7 @@ use hyprstream_rpc::identity::Did;
 use hyprstream_rpc::resolver::{ResolutionEvidence, ServiceQuery, ServiceResolver};
 use hyprstream_rpc::transport::TransportConfig;
 use hyprstream_rpc::VerifyingKey;
+use rand::RngCore;
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha512};
 
@@ -562,22 +563,28 @@ pub trait HostResolver: Send + Sync {
 
 /// Production [`HostResolver`] backed by the rpc crate's identity-bound resolver.
 ///
-/// The service name is a deployment-selected discovery record. Its resolved DID
-/// is checked against the requested [`HostId`] before a descriptor is returned.
+/// Each host is queried through its own deployment-selected discovery record.
+/// The resolved DID is checked against the requested [`HostId`] before a
+/// descriptor is returned.
 pub struct RpcHostResolver {
-    service_name: String,
+    host_services: BTreeMap<HostId, String>,
     resolver: Arc<dyn ServiceResolver>,
 }
 
 impl RpcHostResolver {
     pub fn new(
-        service_name: impl Into<String>,
+        host_services: BTreeMap<HostId, String>,
         resolver: Arc<dyn ServiceResolver>,
     ) -> Result<Self> {
-        let service_name = service_name.into();
-        ServiceQuery::network(service_name.clone())?;
+        anyhow::ensure!(
+            !host_services.is_empty(),
+            "RPC host resolver requires at least one host-specific service record"
+        );
+        for service_name in host_services.values() {
+            ServiceQuery::network(service_name.clone())?;
+        }
         Ok(Self {
-            service_name,
+            host_services,
             resolver,
         })
     }
@@ -590,8 +597,14 @@ impl HostResolver for RpcHostResolver {
         host: &HostId,
         required_capabilities: &BTreeSet<String>,
     ) -> Result<HostDescriptor> {
+        let service_name = self.host_services.get(host).ok_or_else(|| {
+            anyhow!(
+                "no discovery service record configured for pipeline host {}",
+                host.0
+            )
+        })?;
         let query = ServiceQuery::new(
-            self.service_name.clone(),
+            service_name.clone(),
             required_capabilities.iter().cloned(),
             hyprstream_rpc::resolver::ResolverProfile::NetworkDiscovery,
             1,
@@ -634,6 +647,18 @@ pub struct ReachAttestation {
     pub rtt_estimate_micros: u64,
     pub expires_at_unix_ms: i64,
     signature: Vec<u8>,
+}
+
+/// Per-boundary values admission requires the target host to sign.
+///
+/// The epoch is the accepted discovery snapshot currently authorizing the
+/// target, and the nonce is generated for this one admission attempt. Neither
+/// value is optional, so an attestation cannot be replayed across a snapshot
+/// advance or a later launch attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReachChallenge {
+    pub accepted_state_epoch: u64,
+    pub nonce: [u8; 32],
 }
 
 impl ReachAttestation {
@@ -696,7 +721,13 @@ impl ReachAttestation {
         bytes
     }
 
-    fn verify_for(&self, from: &HostId, to: &HostDescriptor, now_unix_ms: i64) -> Result<()> {
+    fn verify_for(
+        &self,
+        from: &HostId,
+        to: &HostDescriptor,
+        challenge: ReachChallenge,
+        now_unix_ms: i64,
+    ) -> Result<()> {
         anyhow::ensure!(
             self.from == *from,
             "reach attestation source does not match boundary"
@@ -704,6 +735,14 @@ impl ReachAttestation {
         anyhow::ensure!(
             self.to == to.host_id,
             "reach attestation target does not match boundary"
+        );
+        anyhow::ensure!(
+            self.epoch == challenge.accepted_state_epoch,
+            "reach attestation epoch does not match the accepted discovery snapshot"
+        );
+        anyhow::ensure!(
+            self.nonce == challenge.nonce,
+            "reach attestation nonce does not match the admission challenge"
         );
         anyhow::ensure!(
             !self.established_via.trim().is_empty(),
@@ -738,11 +777,17 @@ pub trait NetworkView: Send + Sync {
     /// Authorize this host-process boundary through the installed MAC PEP.
     async fn authorize_boundary(&self, from: &HostId, to: &HostId) -> Result<()>;
 
-    /// Return a fresh, target-signed reach proof for this boundary.
+    /// Return a fresh, target-signed reach proof for this exact boundary and
+    /// admission challenge.
     ///
     /// There is deliberately no `Option` result: absent evidence is an error and
     /// therefore refuses admission.
-    async fn reachable(&self, from: &HostId, to: &HostId) -> Result<ReachAttestation>;
+    async fn reachable(
+        &self,
+        from: &HostId,
+        to: &HostId,
+        challenge: ReachChallenge,
+    ) -> Result<ReachAttestation>;
 }
 
 /// Evidence bound to an exact pure plan and expiring with its shortest proof.
@@ -819,11 +864,17 @@ async fn admit_resolved(
         let from = &pair[0].host_id;
         let to = &pair[1].host_id;
         network.authorize_boundary(from, to).await?;
-        let attestation = network.reachable(from, to).await?;
         let descriptor = descriptors
             .get(to)
             .ok_or_else(|| anyhow!("planned target host was not resolved"))?;
-        attestation.verify_for(from, descriptor, now)?;
+        let mut nonce = [0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut nonce);
+        let challenge = ReachChallenge {
+            accepted_state_epoch: descriptor.evidence.accepted_state_epoch,
+            nonce,
+        };
+        let attestation = network.reachable(from, to, challenge).await?;
+        attestation.verify_for(from, descriptor, challenge, now)?;
         expires_at_unix_ms = expires_at_unix_ms.min(attestation.expires_at_unix_ms);
         attestations.push(attestation);
     }
@@ -1417,10 +1468,139 @@ mod tests {
         }
     }
 
+    struct RecordingServiceResolver {
+        snapshots: BTreeMap<String, hyprstream_rpc::resolver::SelectedService>,
+        requests: parking_lot::Mutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl ServiceResolver for RecordingServiceResolver {
+        async fn resolve_service(
+            &self,
+            query: ServiceQuery,
+        ) -> anyhow::Result<hyprstream_rpc::resolver::SelectedService> {
+            self.requests.lock().push(query.service_name.clone());
+            self.snapshots
+                .get(&query.service_name)
+                .cloned()
+                .ok_or_else(|| anyhow!("unexpected discovery query {}", query.service_name))
+        }
+
+        async fn ensure_current(
+            &self,
+            _resolved: &hyprstream_rpc::resolver::SelectedService,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn selected_host_service(
+        host: &HostId,
+        service_name: &str,
+        tag: u8,
+    ) -> hyprstream_rpc::resolver::SelectedService {
+        use hyprstream_rpc::crypto::hybrid_kem::{generate_recipient, SuiteId};
+        use hyprstream_rpc::resolver::{
+            select_service_candidate, AcceptedStateEvidence, AnchoredKemRecipient, ResolverProfile,
+            ServiceCandidate,
+        };
+
+        let signing_key = hyprstream_rpc::SigningKey::from_bytes(&[tag; 32]);
+        let (_pq_signing_key, pq_verifying_key) =
+            hyprstream_rpc::crypto::pq::ml_dsa_generate_keypair();
+        let pq = hyprstream_rpc::crypto::pq::ml_dsa_vk_bytes(&pq_verifying_key);
+        let recipient = generate_recipient(SuiteId::HyKemX25519MlKem768)
+            .unwrap()
+            .public();
+        let now = unix_millis_now().unwrap();
+        let candidate = ServiceCandidate {
+            service_name: service_name.to_owned(),
+            service_did: host.0.clone(),
+            response_verifying_key: signing_key.verifying_key().to_bytes(),
+            response_ml_dsa65: pq.clone(),
+            response_key_id: format!("{}#response", host.0),
+            request_kem_recipient: Some(AnchoredKemRecipient {
+                key_id: format!("{}#kem", host.0),
+                recipient,
+                not_after_unix_ms: now + 120_000,
+            }),
+            transport: TransportConfig::iroh([tag; 32], Vec::new(), None),
+            capabilities: ["hyprstream-moq/1".to_owned()].into_iter().collect(),
+            accepted_state: AcceptedStateEvidence {
+                service_did: host.0.clone(),
+                digest: [tag; 64],
+                epoch: u64::from(tag),
+                expires_at_unix_ms: now + 120_000,
+                response_ed25519: signing_key.verifying_key().to_bytes(),
+                response_ml_dsa65: pq,
+            },
+            source_signer: signing_key.verifying_key().to_bytes(),
+            expires_at_unix_ms: now + 120_000,
+        };
+        let query = ServiceQuery::new(
+            service_name,
+            ["hyprstream-moq/1".to_owned()],
+            ResolverProfile::NetworkDiscovery,
+            1,
+        )
+        .unwrap();
+        select_service_candidate(&query, vec![candidate], now).unwrap()
+    }
+
+    #[tokio::test]
+    async fn rpc_host_resolver_resolves_each_host_through_its_own_service_record() {
+        let alpha = host("alpha", 80).host_id;
+        let beta = host("beta", 80).host_id;
+        let alpha_service = "inference-alpha".to_owned();
+        let beta_service = "inference-beta".to_owned();
+        let resolver = Arc::new(RecordingServiceResolver {
+            snapshots: BTreeMap::from([
+                (
+                    alpha_service.clone(),
+                    selected_host_service(&alpha, &alpha_service, 1),
+                ),
+                (
+                    beta_service.clone(),
+                    selected_host_service(&beta, &beta_service, 2),
+                ),
+            ]),
+            requests: parking_lot::Mutex::new(Vec::new()),
+        });
+        let host_resolver = RpcHostResolver::new(
+            BTreeMap::from([
+                (alpha.clone(), alpha_service.clone()),
+                (beta.clone(), beta_service.clone()),
+            ]),
+            resolver.clone(),
+        )
+        .unwrap();
+        let required = BTreeSet::from(["hyprstream-moq/1".to_owned()]);
+
+        assert_eq!(
+            host_resolver
+                .resolve_host(&alpha, &required)
+                .await
+                .unwrap()
+                .host_id,
+            alpha
+        );
+        assert_eq!(
+            host_resolver
+                .resolve_host(&beta, &required)
+                .await
+                .unwrap()
+                .host_id,
+            beta
+        );
+        assert_eq!(*resolver.requests.lock(), vec![alpha_service, beta_service]);
+    }
+
     enum TestReachResponse {
         Attested,
         Missing,
         Expired,
+        StaleEpoch,
+        ReplayedNonce,
     }
 
     struct MockNetworkView {
@@ -1442,7 +1622,12 @@ mod tests {
             Ok(())
         }
 
-        async fn reachable(&self, from: &HostId, to: &HostId) -> Result<ReachAttestation> {
+        async fn reachable(
+            &self,
+            from: &HostId,
+            to: &HostId,
+            challenge: ReachChallenge,
+        ) -> Result<ReachAttestation> {
             if matches!(self.response, TestReachResponse::Missing) {
                 bail!("missing reach attestation");
             }
@@ -1456,11 +1641,21 @@ mod tests {
             } else {
                 now + 60_000
             };
+            let epoch = if matches!(self.response, TestReachResponse::StaleEpoch) {
+                challenge.accepted_state_epoch - 1
+            } else {
+                challenge.accepted_state_epoch
+            };
+            let nonce = if matches!(self.response, TestReachResponse::ReplayedNonce) {
+                [0xA5; 32]
+            } else {
+                challenge.nonce
+            };
             ReachAttestation::sign(
                 from.clone(),
                 to.clone(),
-                7,
-                [7; 32],
+                epoch,
+                nonce,
                 ReachPathClass::Direct,
                 "iroh".to_owned(),
                 100,
@@ -1538,7 +1733,12 @@ mod tests {
 
     #[tokio::test]
     async fn missing_or_invalid_reach_attestation_refuses_admission() {
-        for response in [TestReachResponse::Missing, TestReachResponse::Expired] {
+        for response in [
+            TestReachResponse::Missing,
+            TestReachResponse::Expired,
+            TestReachResponse::StaleEpoch,
+            TestReachResponse::ReplayedNonce,
+        ] {
             let (candidates, resolver, network) = admission_fixture(response, false);
             assert!(plan_and_admit(
                 &synthetic_model(12, 10),
@@ -1549,6 +1749,34 @@ mod tests {
             )
             .await
             .is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn stale_epoch_and_replayed_nonce_refuse_admission() {
+        for response in [
+            TestReachResponse::StaleEpoch,
+            TestReachResponse::ReplayedNonce,
+        ] {
+            let (candidates, resolver, network) = admission_fixture(response, false);
+            let result = plan_and_admit(
+                &synthetic_model(12, 10),
+                &candidates,
+                no_reserve(),
+                &resolver,
+                &network,
+            )
+            .await;
+            assert!(
+                result.is_err(),
+                "stale reach evidence must not admit a pipeline"
+            );
+            let error = result.unwrap_err();
+            assert!(
+                error.to_string().contains("accepted discovery snapshot")
+                    || error.to_string().contains("admission challenge"),
+                "unexpected refusal: {error:#}"
+            );
         }
     }
 
