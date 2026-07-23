@@ -90,17 +90,17 @@ pub enum AuthenticatedSubjectError {
 impl AuthenticatedSubject {
     /// Convert the current RPC authentication result into a ledger subject.
     ///
-    /// `EnvelopeContext` is produced after signature verification. Its subject
-    /// is either resolved from that signer key or, for a JWT, confirmation-bound
-    /// to it by `verify_claims()`. Both the DID and authorization keys below
-    /// therefore originate at the authenticated transport boundary.
+    /// `EnvelopeContext` is produced after signature verification. The pairwise
+    /// DID is self-certifying: it is derived from the exact signer key verified
+    /// for this envelope, never from the Casbin-facing authorization subject.
+    /// JWT confirmation binding ensures a JWT's user label is bound to that same
+    /// signer, but that label is not itself a ledger identity.
     pub fn from_verified_envelope(
         ctx: &hyprstream_rpc::EnvelopeContext,
     ) -> Result<Self, AuthenticatedSubjectError> {
         let did = ctx
-            .subject()
-            .name()
-            .map(|name| Did(name.to_owned()))
+            .authenticated_pairwise_did()
+            .map(|did| Did(did.to_string()))
             .ok_or(AuthenticatedSubjectError::Anonymous)?;
         let ed_vk = ctx
             .authenticated_signer_key()
@@ -267,9 +267,9 @@ impl LocalEnforcer {
         //    the decision that permits work to start, and a zero reservation
         //    cannot be converted into a nonzero post later — so an unsigned
         //    zero admission would be unauthenticated work, not harmless
-        //    accounting (PR #1129 review, finding 1). A Classical-only client
-        //    passes no PQ key and is verified under the Classical policy
-        //    (labeled, not rejected).
+        //    accounting (PR #1129 review, finding 1). Classical-only clients
+        //    are accepted only when the operator explicitly disabled the PQ
+        //    requirement; a configured requirement refuses absent evidence.
         {
             match &req.spend_authz {
                 Some(authz) => {
@@ -311,12 +311,19 @@ impl LocalEnforcer {
                             ),
                         ));
                     }
-                    let require_pq = self.require_pq && subject.pq_vk.is_some();
+                    if self.require_pq && subject.pq_vk.is_none() {
+                        return AdmissionResult::Rejected(Rejection::hard(
+                            DenyReason::InvalidSpendAuthorization(
+                                "configured PQ signature requirement has no authenticated PQ key"
+                                    .to_owned(),
+                            ),
+                        ));
+                    }
                     if let Err(reason) = CreditGate::verify_spend_authz(
                         authz,
                         &subject.ed_vk,
                         subject.pq_vk.as_ref(),
-                        require_pq,
+                        self.require_pq,
                     ) {
                         return AdmissionResult::Rejected(Rejection::hard(reason));
                     }
@@ -468,6 +475,7 @@ mod tests {
     use hyprstream_crypto::cose_sign::sign_composite;
     use hyprstream_crypto::pq::{ml_dsa_sk_from_seed, ml_dsa_sk_to_vk_bytes, ml_dsa_vk_from_bytes};
     use hyprstream_ledger::{LedgerBackend, MemLedger, Purpose};
+    use parking_lot::Mutex;
 
     fn unit() -> UnitId {
         UnitId {
@@ -495,12 +503,11 @@ mod tests {
         u128::from_be_bytes(buf)
     }
 
-    fn authenticated_transport_subject(
-        did: Did,
-        ed_sk: &ed25519_dalek::SigningKey,
-    ) -> AuthenticatedSubject {
+    fn authenticated_transport_subject(ed_sk: &ed25519_dalek::SigningKey) -> AuthenticatedSubject {
         let ctx = hyprstream_rpc::EnvelopeContext::for_test_authenticated_subject(
-            hyprstream_rpc::Subject::new(did.as_str()),
+            // Casbin's subject is intentionally unrelated to the ledger DID.
+            // The conversion must use the authenticated signer instead.
+            hyprstream_rpc::Subject::new("alice"),
             ed_sk.verifying_key(),
         );
         AuthenticatedSubject::from_verified_envelope(&ctx)
@@ -522,25 +529,12 @@ mod tests {
         ed25519_dalek::SigningKey,
         hyprstream_crypto::pq::MlDsaSigningKey,
     ) {
-        fixture_with_grant_holder(grant_cap, Did("did:web:alice".to_owned())).await
-    }
-
-    async fn fixture_with_grant_holder(
-        grant_cap: u128,
-        grant_holder: Did,
-    ) -> (
-        LocalEnforcer,
-        Did,
-        Cid,
-        AccountId,
-        AccountId,
-        ed25519_dalek::SigningKey,
-        hyprstream_crypto::pq::MlDsaSigningKey,
-    ) {
         let cell = Did("did:web:cell.test".to_owned());
-        let holder = Did("did:web:alice".to_owned());
         let ed_sk = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
         let pq_sk = ml_dsa_sk_from_seed(&[2u8; 32]);
+        let holder = Did(hyprstream_crypto::did_key::ed25519_to_did_key(
+            &ed_sk.verifying_key().to_bytes(),
+        ));
 
         // Backend + handle.
         let mut backend = MemLedger::new(cell.clone());
@@ -591,7 +585,7 @@ mod tests {
 
         // Gate + breaker.
         let g = VerifiedGrant {
-            holder: grant_holder,
+            holder: holder.clone(),
             unit: unit(),
             cap_amount: grant_cap,
             exp: u64::MAX,
@@ -677,7 +671,7 @@ mod tests {
     /// transfer id differs.
     #[tokio::test]
     async fn authz_for_different_transfer_denied_hard() {
-        let (enf, holder, grant_cid, _debit, _credit, ed_sk, pq_sk) = fixture(1000).await;
+        let (enf, _holder, grant_cid, _debit, _credit, ed_sk, pq_sk) = fixture(1000).await;
         let signing_nonce = rand_nonce();
         let request_nonce = rand_nonce(); // ≠ the nonce the authz was minted/signed for
         assert_ne!(
@@ -694,7 +688,7 @@ mod tests {
             &pq_sk,
         );
         let req = AdmissionRequest {
-            authenticated_subject: Some(authenticated_transport_subject(holder, &ed_sk)),
+            authenticated_subject: Some(authenticated_transport_subject(&ed_sk)),
             grant_cid,
             unit: unit(),
             amount: 100,
@@ -719,9 +713,9 @@ mod tests {
     /// unauthenticated work, not harmless accounting. Must hard-reject.
     #[tokio::test]
     async fn zero_amount_without_authz_denied_hard() {
-        let (enf, holder, grant_cid, _debit, _credit, ed_sk, _pq_sk) = fixture(1000).await;
+        let (enf, _holder, grant_cid, _debit, _credit, ed_sk, _pq_sk) = fixture(1000).await;
         let req = AdmissionRequest {
-            authenticated_subject: Some(authenticated_transport_subject(holder, &ed_sk)),
+            authenticated_subject: Some(authenticated_transport_subject(&ed_sk)),
             grant_cid,
             unit: unit(),
             amount: 0,
@@ -746,7 +740,7 @@ mod tests {
     /// forever. A valid, correctly bound, expired authz must hard-reject.
     #[tokio::test]
     async fn expired_authz_denied_hard() {
-        let (enf, holder, grant_cid, _debit, _credit, ed_sk, pq_sk) = fixture(1000).await;
+        let (enf, _holder, grant_cid, _debit, _credit, ed_sk, pq_sk) = fixture(1000).await;
         // Valid signature, right grant/host/nonce/transfer id — but exp = 5.
         let nonce = rand_nonce();
         let (authz, _ed_vk, _pq_vk, _tid) = signed_authz(
@@ -759,7 +753,7 @@ mod tests {
             &pq_sk,
         );
         let req = AdmissionRequest {
-            authenticated_subject: Some(authenticated_transport_subject(holder, &ed_sk)),
+            authenticated_subject: Some(authenticated_transport_subject(&ed_sk)),
             grant_cid,
             unit: unit(),
             amount: 100,
@@ -782,7 +776,7 @@ mod tests {
 
     #[tokio::test]
     async fn admitted_then_post_and_void_roundtrip() {
-        let (enf, holder, grant_cid, debit, credit, ed_sk, pq_sk) = fixture(1000).await;
+        let (enf, _holder, grant_cid, debit, credit, ed_sk, pq_sk) = fixture(1000).await;
         let nonce = rand_nonce();
         let (authz, _ed_vk, _pq_vk, _tid) = signed_authz(
             &grant_cid,
@@ -794,7 +788,7 @@ mod tests {
             &pq_sk,
         );
         let req = AdmissionRequest {
-            authenticated_subject: Some(authenticated_transport_subject(holder.clone(), &ed_sk)),
+            authenticated_subject: Some(authenticated_transport_subject(&ed_sk)),
             grant_cid: grant_cid.clone(),
             unit: unit(),
             amount: 100,
@@ -820,6 +814,255 @@ mod tests {
         assert!(post.is_ok(), "post should succeed: {post:?}");
     }
 
+    /// A configured PQ requirement is not conditional on whether transport
+    /// happened to expose a PQ key. Missing authenticated material must refuse,
+    /// never turn the policy off (#1145).
+    #[tokio::test]
+    async fn configured_pq_requirement_without_authenticated_key_denied_hard() {
+        let (mut enf, holder, grant_cid, _debit, _credit, ed_sk, _pq_sk) = fixture(1000).await;
+        enf.require_pq = true;
+        let nonce = rand_nonce();
+        let mut authz = SpendAuthorization {
+            grant_cid: grant_cid.clone(),
+            host: enf.cell_identity().clone(),
+            transfer_id: mint_transfer_id(&grant_cid, nonce),
+            max_amount: 100,
+            exp: u64::MAX,
+            signature: Vec::new(),
+        };
+        // A Classical signature is valid only when the configured PQ policy is
+        // not silently weakened by missing authenticated key material.
+        authz.signature = sign_composite(&ed_sk, None, &authz.digest(), &[]).unwrap();
+        let req = AdmissionRequest {
+            // Deliberately model the only admissible representation of a
+            // Classical transport identity at this boundary: authenticated
+            // Ed25519 holder, but no trusted PQ binding.
+            authenticated_subject: Some(AuthenticatedSubject {
+                did: holder,
+                ed_vk: ed_sk.verifying_key(),
+                pq_vk: None,
+            }),
+            grant_cid,
+            unit: unit(),
+            amount: 100,
+            nonce,
+            spend_authz: Some(authz),
+        };
+
+        match enf.admit(&req, 0).await {
+            AdmissionResult::Rejected(r) => {
+                assert!(
+                    matches!(r.reason, DenyReason::InvalidSpendAuthorization(_)),
+                    "expected InvalidSpendAuthorization, got {:?}",
+                    r.reason
+                );
+                assert!(r.retry_after_secs.is_none(), "must be a hard reject");
+            }
+            other => panic!("missing authenticated PQ key must be denied, got {other:?}"),
+        }
+    }
+
+    /// Exercise the production envelope → JWT → handler path, rather than
+    /// placing a DID-shaped string into a Casbin `Subject` fixture. The
+    /// authenticated ledger holder is the `did:key` derived from the envelope
+    /// signer; the JWT's Casbin user remains the unrelated label `alice`.
+    #[tokio::test]
+    async fn verified_user_transport_did_admits_its_grant_and_refuses_another_signer() {
+        struct AdmissionProbe {
+            enforcer: Arc<LocalEnforcer>,
+            grant_cid: Cid,
+            nonce: u128,
+            authz: SpendAuthorization,
+            signing_key: ed25519_dalek::SigningKey,
+            key_source: Arc<dyn hyprstream_rpc::auth::JwtKeySource>,
+            observed: Arc<Mutex<Vec<(String, Did, Option<DenyReason>)>>>,
+        }
+
+        #[async_trait::async_trait(?Send)]
+        impl hyprstream_rpc::RequestService for AdmissionProbe {
+            async fn handle_request(
+                &self,
+                ctx: &hyprstream_rpc::EnvelopeContext,
+                _payload: &[u8],
+            ) -> anyhow::Result<(Vec<u8>, Option<hyprstream_rpc::Continuation>)> {
+                let subject =
+                    AuthenticatedSubject::from_verified_envelope(ctx).map_err(|error| {
+                        anyhow::anyhow!("ledger identity conversion refused: {error:?}")
+                    })?;
+                let result = self
+                    .enforcer
+                    .admit(
+                        &AdmissionRequest {
+                            authenticated_subject: Some(subject.clone()),
+                            grant_cid: self.grant_cid.clone(),
+                            unit: unit(),
+                            amount: 100,
+                            nonce: self.nonce,
+                            spend_authz: Some(self.authz.clone()),
+                        },
+                        0,
+                    )
+                    .await;
+                let reason = match &result {
+                    AdmissionResult::Admitted { .. } => None,
+                    AdmissionResult::Rejected(rejection) => Some(rejection.reason.clone()),
+                };
+                self.observed
+                    .lock()
+                    .push((ctx.subject().to_string(), subject.did, reason));
+                Ok((Vec::new(), None))
+            }
+
+            fn name(&self) -> &str {
+                "ledger-admission-probe"
+            }
+
+            fn transport(&self) -> &hyprstream_rpc::transport::TransportConfig {
+                static TRANSPORT: std::sync::OnceLock<hyprstream_rpc::transport::TransportConfig> =
+                    std::sync::OnceLock::new();
+                TRANSPORT.get_or_init(|| {
+                    hyprstream_rpc::transport::TransportConfig::inproc("ledger-admission-probe")
+                })
+            }
+
+            fn signing_key(&self) -> ed25519_dalek::SigningKey {
+                self.signing_key.clone()
+            }
+
+            fn jwt_key_source(&self) -> Option<Arc<dyn hyprstream_rpc::auth::JwtKeySource>> {
+                Some(Arc::clone(&self.key_source))
+            }
+
+            fn jwt_verify_policy(&self) -> hyprstream_rpc::crypto::CryptoPolicy {
+                // The regression's JWT is an existing EdDSA CA token. The
+                // envelope and ledger spend authorization are both Hybrid.
+                hyprstream_rpc::crypto::CryptoPolicy::Classical
+            }
+        }
+
+        fn signed_wire(
+            client: &ed25519_dalek::SigningKey,
+            client_pq: &hyprstream_crypto::pq::MlDsaSigningKey,
+            jwt: String,
+            server_kem: &hyprstream_rpc::crypto::hybrid_kem::RecipientPublic,
+        ) -> Vec<u8> {
+            use hyprstream_rpc::ToCapnp as _;
+
+            let response_recipient = hyprstream_rpc::crypto::hybrid_kem::generate_recipient(
+                hyprstream_rpc::crypto::hybrid_kem::SuiteId::HyKemX25519MlKem768,
+            )
+            .expect("response recipient");
+            let request = hyprstream_rpc::envelope::RequestEnvelope::new(Vec::new())
+                .with_jwt_token(jwt)
+                .with_service_domain("ledger-admission-probe")
+                .expect("valid service domain")
+                .with_response_kem_recipient(response_recipient.public());
+            let signed = hyprstream_rpc::envelope::SignedEnvelope::new_signed_encrypted_mesh_kem(
+                request, client, client_pq, server_kem,
+            )
+            .expect("hybrid request envelope");
+            let mut message = capnp::message::Builder::new_default();
+            signed.write_to(
+                &mut message.init_root::<hyprstream_rpc::common_capnp::signed_envelope::Builder>(),
+            );
+            let mut wire = Vec::new();
+            capnp::serialize::write_message(&mut wire, &message).expect("serialize request");
+            wire
+        }
+
+        let (mut enforcer, holder, grant_cid, _debit, _credit, alice_ed, alice_pq) =
+            fixture(1_000).await;
+        enforcer.require_pq = true;
+        let enforcer = Arc::new(enforcer);
+        let nonce = rand_nonce();
+        let (authz, _ed_vk, _pq_vk, _) = signed_authz(
+            &grant_cid,
+            enforcer.cell_identity(),
+            nonce,
+            100,
+            u64::MAX,
+            &alice_ed,
+            &alice_pq,
+        );
+        let bob_ed = ed25519_dalek::SigningKey::from_bytes(&[3u8; 32]);
+        let bob_pq = ml_dsa_sk_from_seed(&[4u8; 32]);
+
+        // This is the same kid-anchored PQ trust shape the dispatcher uses in
+        // production. Both authenticated user keys are bound before any input
+        // is accepted; no request supplies its own PQ verifier.
+        let alice_pq_vk = ml_dsa_vk_from_bytes(&ml_dsa_sk_to_vk_bytes(&alice_pq)).unwrap();
+        let bob_pq_vk = ml_dsa_vk_from_bytes(&ml_dsa_sk_to_vk_bytes(&bob_pq)).unwrap();
+        let mut store = hyprstream_rpc::envelope::KeyedPqTrustStore::new();
+        store.bind(alice_ed.verifying_key().to_bytes(), &alice_pq_vk);
+        store.bind(bob_ed.verifying_key().to_bytes(), &bob_pq_vk);
+        hyprstream_rpc::envelope::install_verify_config(
+            hyprstream_rpc::envelope::EnvelopeVerifyConfig {
+                policy: hyprstream_rpc::crypto::CryptoPolicy::Hybrid,
+                pq_store: Some(Arc::new(store)),
+            },
+        )
+        .expect("install isolated test verification config");
+
+        let ca = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let issuer = "https://ledger-user.test".to_owned();
+        let key_source: Arc<dyn hyprstream_rpc::auth::JwtKeySource> = Arc::new(
+            hyprstream_rpc::auth::ClusterKeySource::new(ca.verifying_key(), issuer.clone()),
+        );
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let probe = AdmissionProbe {
+            enforcer,
+            grant_cid,
+            nonce,
+            authz,
+            signing_key: ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]),
+            key_source,
+            observed: Arc::clone(&observed),
+        };
+        let server_kem =
+            hyprstream_rpc::node_identity::derive_mesh_kem_recipient(&probe.signing_key)
+                .expect("server KEM recipient");
+        let jwt_for = |user: &str, key: &ed25519_dalek::SigningKey| {
+            let now = chrono::Utc::now().timestamp();
+            hyprstream_rpc::auth::jwt::encode(
+                &hyprstream_rpc::auth::Claims::new(user.to_owned(), now, now + 3_600)
+                    .with_issuer(issuer.clone())
+                    .with_cnf_jwk(&key.verifying_key().to_bytes()),
+                &ca,
+            )
+        };
+
+        for (user, ed, pq) in [("alice", &alice_ed, &alice_pq), ("bob", &bob_ed, &bob_pq)] {
+            hyprstream_rpc::service::dispatch::process_request(
+                &signed_wire(ed, pq, jwt_for(user, ed), &server_kem.public()),
+                &probe,
+                hyprstream_rpc::envelope::EnvelopeVerification::AnySigner,
+                &probe.signing_key,
+                &hyprstream_rpc::envelope::InMemoryNonceCache::new(),
+                hyprstream_rpc::transport::carrier::CarrierContext::iroh(),
+            )
+            .await
+            .expect("verified user request reaches the ledger PEP");
+        }
+
+        let observed = observed.lock();
+        assert_eq!(observed.len(), 2);
+        assert_eq!(
+            observed[0].0, "alice",
+            "JWT/Casbin user still reaches the handler"
+        );
+        assert_eq!(
+            observed[0].1, holder,
+            "holder is the envelope signer's did:key"
+        );
+        assert_eq!(observed[0].2, None, "holder's authenticated grant admits");
+        assert_eq!(observed[1].0, "bob");
+        assert_ne!(
+            observed[1].1, holder,
+            "different signer derives a different DID"
+        );
+        assert_eq!(observed[1].2, Some(DenyReason::HolderMismatch));
+    }
+
     #[tokio::test]
     async fn different_authenticated_subject_presenting_valid_grant_denied_hard() {
         let (enf, _holder, grant_cid, _debit, _credit, _ed_sk, _pq_sk) = fixture(1000).await;
@@ -839,10 +1082,7 @@ mod tests {
             // Alice's grant is presented with Bob's *authenticated* transport
             // identity and Bob's matching verified keys. There is no
             // caller-controlled subject field to assert Alice instead.
-            authenticated_subject: Some(authenticated_transport_subject(
-                Did("did:web:bob".to_owned()),
-                &attacker_ed_sk,
-            )),
+            authenticated_subject: Some(authenticated_transport_subject(&attacker_ed_sk)),
             grant_cid,
             unit: unit(),
             amount: 100,
@@ -881,7 +1121,7 @@ mod tests {
 
     #[tokio::test]
     async fn insufficient_credit_rejects_retryable_not_queues() {
-        let (enf, holder, grant_cid, _debit, _credit, ed_sk, pq_sk) = fixture(100).await;
+        let (enf, _holder, grant_cid, _debit, _credit, ed_sk, pq_sk) = fixture(100).await;
         let nonce = rand_nonce();
         let (authz, _ed_vk, _pq_vk, _) = signed_authz(
             &grant_cid,
@@ -893,7 +1133,7 @@ mod tests {
             &pq_sk,
         );
         let req = AdmissionRequest {
-            authenticated_subject: Some(authenticated_transport_subject(holder, &ed_sk)),
+            authenticated_subject: Some(authenticated_transport_subject(&ed_sk)),
             grant_cid,
             unit: unit(),
             amount: 500, // > available 100

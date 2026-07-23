@@ -323,6 +323,20 @@ impl EnvelopeContext {
         ed25519_dalek::VerifyingKey::from_bytes(&self.cnf).ok()
     }
 
+    /// Return this request's self-certifying pairwise DID.
+    ///
+    /// This is deliberately distinct from [`Self::subject`]. The latter is a
+    /// Casbin-facing authorization label (for example `"alice"` or
+    /// `"https://issuer:alice"`); it is not a decentralized identifier and
+    /// must never be relabelled as one. The pairwise DID is derived only from
+    /// the Ed25519 key whose possession the verified envelope established.
+    /// Callback contexts and anonymous requests have no such identity.
+    #[must_use]
+    pub fn authenticated_pairwise_did(&self) -> Option<crate::identity::Did> {
+        let signer = self.authenticated_signer_key()?;
+        Some(crate::identity::Did::from_ed25519(&signer.to_bytes()))
+    }
+
     /// Return the trusted PQ key anchored to this request's verified signer.
     ///
     /// A missing binding is represented as `None` because Classical transport
@@ -2162,7 +2176,6 @@ mod browser_method_commitment_tests {
     fn non_browser_context_preserves_legacy_dispatch_compatibility() {
         let ctx = EnvelopeContext::from_callback_service(7, "model");
         ctx.ensure_browser_method(u16::MAX)
-            .expect("non-browser carriers have no method commitment to compare"
-        );
+            .expect("non-browser carriers have no method commitment to compare");
     }
 }
