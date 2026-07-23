@@ -221,20 +221,18 @@ pub fn did_plc_url(did: &str, base_url: &Url) -> Result<String> {
     plc_msi(did)?;
     let did = did.split(['#', '?']).next().unwrap_or(did);
 
-    // Join beneath the base path: normalize it to a directory first, or
-    // `Url::join` would replace the last path segment.
-    let mut base = base_url.clone();
-    if !base.path().ends_with('/') {
-        let dir = format!("{}/", base.path());
-        base.set_path(&dir);
-    }
-    let configured_base = base.to_string();
-    base.path_segments_mut()
-        .map_err(|()| {
-            anyhow!("configured PLC base URL cannot accept path segments: {configured_base}")
-        })?
-        .push(did);
-    let url = base;
+    // Join the DID beneath the base path with exactly one separator. The base
+    // path is normalized by trimming any trailing `/` and appending a single
+    // `/` + the DID: using `Url::path_segments_mut().push()` here would *keep*
+    // the trailing empty segment and derive a double-slash target
+    // (`https://plc.example/mirror//did:plc:`), which a PLC mirror mounted
+    // below an origin path will commonly 404 on — exactly the configurable-base
+    // case this resolver exists to support. (`set_path` does not percent-encode
+    // the DID's `:` — verified by `url_derivation_configured_base` — and the
+    // `plc_msi` charset check above makes an embedded `/` impossible.)
+    let mut url = base_url.clone();
+    let trimmed = url.path().trim_end_matches('/');
+    url.set_path(&format!("{trimmed}/{did}"));
 
     // Defense in depth: the msi charset check above already makes an
     // origin-shift impossible, but a resolution URL must provably stay on the
@@ -301,11 +299,224 @@ fn validate_string_collection(did: &str, member: &str, value: &Value) -> Result<
             .ok_or_else(|| {
                 anyhow!("did:plc document for {did} has invalid `{member}` member (fail-closed)")
             })?;
+        // Each member MUST be an absolute URI per DID Core (e.g. an `at://`
+        // handle or an https URL) — non-emptiness alone admits arbitrary
+        // strings, which is not the contract here.
+        if !is_absolute_uri(value) {
+            bail!("did:plc document for {did} has `{member}` member that is not a valid URI: `{value}` (fail-closed)");
+        }
         if !seen.insert(value) {
             bail!("did:plc document for {did} has duplicate `{member}` member `{value}` (fail-closed)");
         }
     }
     Ok(())
+}
+
+// ── DID / URI reference handling ──────────────────────────────────────────────
+//
+// DID Core verification-method and service `id`s may be either absolute DID
+// URLs (`did:plc:…#key`) or relative references resolved against the subject
+// DID (`#key`, `?query`). The two forms name the **same** resource, so
+// deduplicating them as raw strings admits a semantically-duplicate pair — the
+// validator resolves every reference against the subject before the uniqueness
+// check. This is an interop surface, so classical DID Core shapes are accepted
+// and unknown algorithms ignored rather than rejected (see the material
+// validator).
+
+/// Whether `s` is a syntactically valid DID per DID Core
+/// (`did:method-name:method-specific-id`). `method-name` is lowercase ASCII
+/// alpha/digit; `method-specific-id` allows `a-zA-Z0-9._:%` (idchar plus the
+/// `:` separator and pct-encoded triples).
+fn is_did(s: &str) -> bool {
+    let Some(rest) = s.strip_prefix("did:") else {
+        return false;
+    };
+    let Some((method, msi)) = rest.split_once(':') else {
+        return false;
+    };
+    !method.is_empty()
+        && method
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+        && !msi.is_empty()
+        && msi
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_' | b':' | b'%'))
+}
+
+/// Whether `s` is a DID URL — a DID followed by optional path, query, and/or
+/// fragment per DID Core (`did:m:m[/path][?query][#fragment]`). The authority
+/// (method + method-specific-id) must be a valid DID; the suffix is unchecked
+/// beyond its separator-led structure.
+fn is_did_url(s: &str) -> bool {
+    let Some(rest) = s.strip_prefix("did:") else {
+        return false;
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+    let Some((method, msi)) = authority.split_once(':') else {
+        return false;
+    };
+    !method.is_empty()
+        && method
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+        && !msi.is_empty()
+        && msi
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_' | b':' | b'%'))
+}
+
+/// Whether `s` is an absolute URI per RFC 3986 — a scheme
+/// (`ALPHA *( ALPHA / DIGIT / "+" / "-" / "." )`) precedes the first path,
+/// query, or fragment separator. Used to tell absolute DID URLs / URIs from
+/// relative references (`#key`, `?query`, `./path`).
+fn is_absolute_uri(s: &str) -> bool {
+    let Some(colon) = s.find(':') else {
+        return false;
+    };
+    let first_separator = s.find(['/', '?', '#']).unwrap_or(usize::MAX);
+    if colon >= first_separator {
+        return false;
+    }
+    let scheme = &s[..colon];
+    !scheme.is_empty()
+        && scheme
+            .bytes()
+            .next()
+            .is_some_and(|b| b.is_ascii_alphabetic())
+        && scheme
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.'))
+}
+
+/// Resolve a (possibly relative) DID-URL reference against the document subject
+/// DID, returning the canonical absolute DID URL used for uniqueness checks.
+fn resolve_did_url(subject: &str, reference: &str) -> Result<String> {
+    if is_absolute_uri(reference) {
+        return Ok(reference.to_owned());
+    }
+    if reference.is_empty() {
+        bail!("empty DID-URL reference");
+    }
+    let base = subject.split(['#', '?']).next().unwrap_or(subject);
+    if reference.starts_with('#') || reference.starts_with('?') || reference.starts_with('/') {
+        Ok(format!("{base}{reference}"))
+    } else {
+        // A bare-segment relative reference; append after a path separator.
+        Ok(format!("{base}/{reference}"))
+    }
+}
+
+/// Canonicalize a verification-method or service `id`: absolute DID URLs are
+/// validated as such and used as-is; relative references are resolved against
+/// the subject DID.
+fn canonical_member_id(did: &str, id: &str, member: &str) -> Result<String> {
+    if is_absolute_uri(id) {
+        if !is_did_url(id) {
+            bail!("did:plc document for {did} has `{member}` with non-DID-URL id `{id}` (fail-closed)");
+        }
+        Ok(id.to_owned())
+    } else {
+        resolve_did_url(did, id)
+    }
+}
+
+// ── verification material ─────────────────────────────────────────────────────
+
+/// Known `publicKey*` verification-material property names recognized by DID
+/// Core / the Linked Data Security vocabularies. Exactly one must be present
+/// per verification method (DID Core §5.1); multiple known material properties
+/// is ambiguous and fail-closed.
+const KNOWN_MATERIAL_FIELDS: &[&str] = &[
+    "publicKeyJwk",
+    "publicKeyMultibase",
+    "publicKeyBase58",
+    "publicKeyHex",
+    "publicKeyPem",
+    "publicKeyPgp",
+];
+
+/// Decode the leading unsigned-varint multicodec, returning the codec value and
+/// the remaining key payload.
+fn read_multicodec(bytes: &[u8]) -> Option<(u64, &[u8])> {
+    let mut value = 0u64;
+    let mut shift = 0u32;
+    for (i, &b) in bytes.iter().enumerate() {
+        value |= ((b & 0x7f) as u64) << shift;
+        if b & 0x80 == 0 {
+            return Some((value, &bytes[i + 1..]));
+        }
+        shift = shift.checked_add(7)?;
+        if shift >= 64 {
+            return None;
+        }
+    }
+    None
+}
+
+/// Multicodec unsigned-varint values for the public-key codecs we recognize.
+mod multicodec {
+    /// `ed25519-pub`.
+    pub const ED25519_PUB: u64 = 0xed;
+    /// `secp256k1-pub`.
+    pub const SECP256K1_PUB: u64 = 0xe7;
+    /// `p256-pub`.
+    pub const P256_PUB: u64 = 0x1200;
+    /// `ml-dsa-65-pub`.
+    pub const ML_DSA_65_PUB: u64 = 0x1211;
+}
+
+/// ML-DSA-65 public-key length in bytes.
+const ML_DSA_65_PUB_KEY_LEN: usize = 1952;
+
+/// Floor for a Multikey payload whose multicodec we do not recognize. Every
+/// real public key is far larger; this only rejects obvious non-keys (`zKey`)
+/// while **accepting unknown algorithms** per the interop rule (this is a
+/// classical, read-only resolver — an unrecognized multicodec is not an attack,
+/// it is an algorithm we do not happen to admit yet).
+const MIN_UNKNOWN_MULTIKEY_PAYLOAD: usize = 16;
+
+/// Whether `s` is a structurally valid Multikey `publicKeyMultibase`: base58btc
+/// multibase (`z` prefix), a leading multicodec varint, and a key payload of
+/// the right length for the codec (exact for known codecs, floored for unknown
+/// codecs so `zKey` is rejected but an unknown algorithm with a real key is
+/// preserved).
+fn is_valid_multikey(s: &str) -> bool {
+    let Some(body) = s.strip_prefix('z') else {
+        return false;
+    };
+    let Ok(decoded) = bs58::decode(body).into_vec() else {
+        return false;
+    };
+    let Some((codec, payload)) = read_multicodec(&decoded) else {
+        return false;
+    };
+    match codec {
+        multicodec::ED25519_PUB => payload.len() == 32,
+        multicodec::SECP256K1_PUB | multicodec::P256_PUB => payload.len() == 33,
+        multicodec::ML_DSA_65_PUB => payload.len() == ML_DSA_65_PUB_KEY_LEN,
+        _ => payload.len() >= MIN_UNKNOWN_MULTIKEY_PAYLOAD,
+    }
+}
+
+/// Whether `jwk` is a syntactically valid JSON Web Key (RFC 7517/7518): a known
+/// `kty` plus its required coordinate members. `{ "garbage": true }` (no
+/// `kty`) is rejected.
+fn is_valid_jwk(jwk: &serde_json::Map<String, Value>) -> bool {
+    let Some(kty) = jwk.get("kty").and_then(Value::as_str) else {
+        return false;
+    };
+    let has_str = |k: &str| {
+        jwk.get(k)
+            .and_then(Value::as_str)
+            .is_some_and(|v| !v.is_empty())
+    };
+    match kty {
+        "EC" | "OKP" => has_str("crv") && has_str("x"),
+        "RSA" => has_str("n") && has_str("e"),
+        "oct" => has_str("k"),
+        _ => false,
+    }
 }
 
 fn required_nonempty_string<'a>(
@@ -325,43 +536,86 @@ fn required_nonempty_string<'a>(
         })
 }
 
-fn verification_method_has_key_material(object: &serde_json::Map<String, Value>) -> bool {
-    object
-        .get("publicKeyJwk")
-        .and_then(Value::as_object)
-        .is_some_and(|jwk| !jwk.is_empty())
-        || [
-            "publicKeyMultibase",
-            "publicKeyBase58",
-            "publicKeyHex",
-            "publicKeyPem",
-            "publicKeyPgp",
-        ]
-        .iter()
-        .any(|field| {
-            object
-                .get(*field)
+/// Validate the single declared verification-material property of a
+/// verification method by its own syntax (the property name fixes the encoding,
+/// independent of the method `type`).
+fn validate_verification_material(
+    did: &str,
+    id: &str,
+    method: &serde_json::Map<String, Value>,
+    field: &str,
+) -> Result<()> {
+    match field {
+        "publicKeyMultibase" => {
+            let v = method
+                .get(field)
                 .and_then(Value::as_str)
-                .is_some_and(|value| !value.is_empty())
-        })
+                .filter(|s| !s.is_empty());
+            if !v.is_some_and(is_valid_multikey) {
+                bail!("did:plc document for {did} has malformed Multikey `publicKeyMultibase` in `{id}` (fail-closed)");
+            }
+        }
+        "publicKeyJwk" => {
+            let Some(v) = method.get(field).and_then(Value::as_object) else {
+                bail!("did:plc document for {did} has non-object `publicKeyJwk` in `{id}` (fail-closed)");
+            };
+            if !is_valid_jwk(v) {
+                bail!("did:plc document for {did} has malformed `publicKeyJwk` in `{id}` (fail-closed)");
+            }
+        }
+        "publicKeyBase58" | "publicKeyHex" | "publicKeyPem" | "publicKeyPgp" => {
+            if method
+                .get(field)
+                .and_then(Value::as_str)
+                .is_some_and(|v| !v.is_empty())
+            {
+                return Ok(());
+            }
+            bail!("did:plc document for {did} has empty `{field}` in `{id}` (fail-closed)");
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 fn validate_verification_methods(did: &str, value: &Value) -> Result<()> {
     let methods = value.as_array().ok_or_else(|| {
         anyhow!("did:plc document for {did} has non-array `verificationMethod` (fail-closed)")
     })?;
-    let mut ids = std::collections::HashSet::new();
+    let mut ids: std::collections::HashSet<String> = std::collections::HashSet::new();
     for value in methods {
         let method = value.as_object().ok_or_else(|| {
             anyhow!("did:plc document for {did} has non-object `verificationMethod` member (fail-closed)")
         })?;
         let id = required_nonempty_string(did, "verificationMethod", method, "id")?;
         required_nonempty_string(did, "verificationMethod", method, "type")?;
-        required_nonempty_string(did, "verificationMethod", method, "controller")?;
-        if !verification_method_has_key_material(method) {
-            bail!("did:plc document for {did} has `verificationMethod` member without key material (fail-closed)");
+        let controller = required_nonempty_string(did, "verificationMethod", method, "controller")?;
+        if !is_did(controller) {
+            bail!("did:plc document for {did} has `verificationMethod` `{id}` with non-DID controller `{controller}` (fail-closed)");
         }
-        if !ids.insert(id) {
+
+        // Exactly one known verification-material property (DID Core §5.1).
+        // Multiple known properties is ambiguous → fail closed. Zero known
+        // properties is a material-less method → fail closed (a conforming
+        // extension still carries a standard material property).
+        let present: Vec<&str> = KNOWN_MATERIAL_FIELDS
+            .iter()
+            .copied()
+            .filter(|f| method.contains_key(*f))
+            .collect();
+        if present.len() > 1 {
+            bail!("did:plc document for {did} has `verificationMethod` `{id}` with multiple verification-material properties (fail-closed)");
+        }
+        let Some(field) = present.into_iter().next() else {
+            bail!("did:plc document for {did} has `verificationMethod` `{id}` without a recognized verification-material property (fail-closed)");
+        };
+        validate_verification_material(did, id, method, field)?;
+
+        // Canonicalize the id (relative refs resolve against the subject DID)
+        // so a relative `#key` and the absolute `did:…#key` cannot both
+        // appear — they name the same resource.
+        let canonical = canonical_member_id(did, id, "verificationMethod")?;
+        if !ids.insert(canonical) {
             bail!("did:plc document for {did} has duplicate `verificationMethod` id `{id}` (fail-closed)");
         }
     }
@@ -370,7 +624,8 @@ fn validate_verification_methods(did: &str, value: &Value) -> Result<()> {
 
 fn is_valid_service_endpoint(value: &Value) -> bool {
     match value {
-        Value::String(value) => !value.is_empty(),
+        // A string endpoint MUST be an absolute URI (DID Core).
+        Value::String(value) => !value.is_empty() && is_absolute_uri(value),
         Value::Object(value) => !value.is_empty(),
         Value::Array(values) => !values.is_empty() && values.iter().all(is_valid_service_endpoint),
         _ => false,
@@ -381,7 +636,7 @@ fn validate_services(did: &str, value: &Value) -> Result<()> {
     let services = value.as_array().ok_or_else(|| {
         anyhow!("did:plc document for {did} has non-array `service` (fail-closed)")
     })?;
-    let mut ids = std::collections::HashSet::new();
+    let mut ids: std::collections::HashSet<String> = std::collections::HashSet::new();
     for value in services {
         let service = value.as_object().ok_or_else(|| {
             anyhow!("did:plc document for {did} has non-object `service` member (fail-closed)")
@@ -394,7 +649,8 @@ fn validate_services(did: &str, value: &Value) -> Result<()> {
         {
             bail!("did:plc document for {did} has `service` member without valid `serviceEndpoint` (fail-closed)");
         }
-        if !ids.insert(id) {
+        let canonical = canonical_member_id(did, id, "service")?;
+        if !ids.insert(canonical) {
             bail!("did:plc document for {did} has duplicate `service` id `{id}` (fail-closed)");
         }
     }
@@ -795,6 +1051,188 @@ mod tests {
         assert!(parse_did_document_no_duplicates(
             br#"{"id":"did:plc:ewvi7nxzyoun6zhxrhs64oiz","service":[{"type":"a","type":"b"}] }"#,
             "https://plc.example/doc"
+        )
+        .is_err());
+    }
+
+    // ── Finding 2: typed verification-material / member validation ───────
+    //
+    // Each case below was wrongly ACCEPTED by the prior ad-hoc presence check.
+    // The validator must fail closed on malformed material, ambiguous members,
+    // and semantically-duplicate identifiers, while preserving conforming
+    // extensions (an unknown algorithm with a real key still resolves).
+
+    /// A `publicKeyMultibase` that is not a valid Multikey public key
+    /// (`zKey` — too short to carry any multicodec + key) and a `publicKeyJwk`
+    /// that is not a JWK (`{ "garbage": true }`, no `kty`) must be rejected.
+    #[test]
+    fn validate_rejects_malformed_verification_material() {
+        // Multikey with a structurally-invalid `publicKeyMultibase`.
+        assert!(validate_plc_document(
+            DID,
+            &json!({
+                "id": DID,
+                "verificationMethod": [{
+                    "id": "#bad-multikey", "type": "Multikey", "controller": DID,
+                    "publicKeyMultibase": "zKey"
+                }]
+            })
+        )
+        .is_err());
+        // A `publicKeyMultibase` that is not even multibase base58btc.
+        assert!(validate_plc_document(
+            DID,
+            &json!({
+                "id": DID,
+                "verificationMethod": [{
+                    "id": "#bad-multikey2", "type": "Multikey", "controller": DID,
+                    "publicKeyMultibase": "not-multibase"
+                }]
+            })
+        )
+        .is_err());
+        // `publicKeyJwk` missing `kty` is not a JWK.
+        assert!(validate_plc_document(
+            DID,
+            &json!({
+                "id": DID,
+                "verificationMethod": [{
+                    "id": "#bad-jwk", "type": "JsonWebKey", "controller": DID,
+                    "publicKeyJwk": { "garbage": true }
+                }]
+            })
+        )
+        .is_err());
+        // A JWK with an unknown `kty` is not a recognized JWK either.
+        assert!(validate_plc_document(
+            DID,
+            &json!({
+                "id": DID,
+                "verificationMethod": [{
+                    "id": "#bad-jwk2", "type": "JsonWebKey", "controller": DID,
+                    "publicKeyJwk": { "kty": "NotARealKty" }
+                }]
+            })
+        )
+        .is_err());
+        // A verification method with NO recognized material property is
+        // non-conforming (DID Core §5.1 requires material).
+        assert!(validate_plc_document(
+            DID,
+            &json!({
+                "id": DID,
+                "verificationMethod": [{
+                    "id": "#no-material", "type": "Multikey", "controller": DID
+                }]
+            })
+        )
+        .is_err());
+    }
+
+    /// A conforming extension — an unknown algorithm that still carries a
+    /// valid Multikey payload — must be preserved (interop: ignore unknown
+    /// algs rather than failing).
+    #[test]
+    fn validate_preserves_unknown_algorithm_with_valid_material() {
+        // A synthetic unknown multicodec (0x0bad) with a 32-byte payload is
+        // structurally a real Multikey; the resolver must not reject it.
+        let unknown_key = {
+            let payload = [0x0bu8, 0xad, 0x01]; // varint codec 0x0bad01-ish + ...
+            let mut bytes = vec![0xfd, 0x01]; // some unknown 2-byte codec
+            bytes.extend_from_slice(&payload);
+            bytes.extend_from_slice(&[0u8; 30]); // bring payload ≥ floor
+            format!("z{}", bs58::encode(&bytes).into_string())
+        };
+        let doc = json!({
+            "id": DID,
+            "verificationMethod": [{
+                "id": "#unknown", "type": "UnknownVerificationMethod2026",
+                "controller": DID, "publicKeyMultibase": unknown_key
+            }]
+        });
+        assert!(validate_plc_document(DID, &doc).is_ok());
+    }
+
+    /// Multiple verification-material properties on one method is ambiguous
+    /// and must fail closed (DID Core requires exactly one).
+    #[test]
+    fn validate_rejects_multiple_material_properties() {
+        // A valid Ed25519 Multikey present alongside a JWK: ambiguous.
+        let mk = "zQ3shunBKsXixLxKtC5qeSG9E4J5RkGN57im31pcTzbNQnm5w";
+        assert!(validate_plc_document(
+            DID,
+            &json!({
+                "id": DID,
+                "verificationMethod": [{
+                    "id": "#both", "type": "Multikey", "controller": DID,
+                    "publicKeyMultibase": mk,
+                    "publicKeyJwk": { "kty": "OKP", "crv": "Ed25519", "x": "11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlnw_vyHashME" }
+                }]
+            })
+        )
+        .is_err());
+    }
+
+    /// A relative reference `#key` and the absolute DID URL
+    /// `did:plc:…#key` name the SAME resource (DID Core relative-URL
+    /// resolution); both must not be accepted together.
+    #[test]
+    fn validate_rejects_semantically_duplicate_ids() {
+        let mk = "zQ3shunBKsXixLxKtC5qeSG9E4J5RkGN57im31pcTzbNQnm5w";
+        assert!(validate_plc_document(
+            DID,
+            &json!({
+                "id": DID,
+                "verificationMethod": [
+                    { "id": "#key", "type": "Multikey", "controller": DID, "publicKeyMultibase": mk },
+                    { "id": format!("{DID}#key"), "type": "Multikey", "controller": DID, "publicKeyMultibase": mk }
+                ]
+            })
+        )
+        .is_err());
+    }
+
+    /// DID/URI fields are checked for their required syntax, not merely
+    /// non-emptiness: `alsoKnownAs` entries, string `serviceEndpoint`s, VM
+    /// `id`s, and `controller`s must be URIs / DID URLs / DIDs respectively.
+    #[test]
+    fn validate_rejects_non_did_or_non_uri_fields() {
+        // alsoKnownAs must be URIs.
+        assert!(
+            validate_plc_document(DID, &json!({ "id": DID, "alsoKnownAs": ["not-a-uri"] }))
+                .is_err()
+        );
+        // controller must be a DID.
+        assert!(validate_plc_document(
+            DID,
+            &json!({
+                "id": DID,
+                "verificationMethod": [{
+                    "id": "#k", "type": "Multikey", "controller": "not-a-did",
+                    "publicKeyMultibase": "zQ3shunBKsXixLxKtC5qeSG9E4J5RkGN57im31pcTzbNQnm5w"
+                }]
+            })
+        )
+        .is_err());
+        // An absolute VM id that is not a DID URL (https URL) is rejected.
+        assert!(validate_plc_document(
+            DID,
+            &json!({
+                "id": DID,
+                "verificationMethod": [{
+                    "id": "https://evil.example/key", "type": "Multikey", "controller": DID,
+                    "publicKeyMultibase": "zQ3shunBKsXixLxKtC5qeSG9E4J5RkGN57im31pcTzbNQnm5w"
+                }]
+            })
+        )
+        .is_err());
+        // A string serviceEndpoint must be a URI.
+        assert!(validate_plc_document(
+            DID,
+            &json!({
+                "id": DID,
+                "service": [{ "id": "#pds", "type": "T", "serviceEndpoint": "no-scheme-here" }]
+            })
         )
         .is_err());
     }
