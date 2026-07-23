@@ -122,6 +122,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v4
+      # This checkout immediately runs repo-controlled Python (the gate
+      # script). Do NOT persist the GITHUB_TOKEN in .git/config — closes
+      # the artipacked vector (zizmor, CodeRabbit).
+      with:
+        persist-credentials: false
     - name: Enforce loopback burn-down
       run: python3 scripts/check_loopback_burndown.py
 

@@ -14,7 +14,8 @@ design decisions. Instead we freeze the surface and make it shrink over time:
 METHODOLOGY (stated, mechanical, reproducible — the first #1152 W4 attempt
 shipped a wrong count (211) because "non-test" was undefined; both reviewers
 flagged it. This section is the contract.)
-  SCOPE    : every `.rs` file under `crates/*/src/` (production source trees).
+  SCOPE    : every `.rs` file under `crates/<crate>/src/` (each crate's direct
+             source tree, *not* nested src dirs like `crates/foo/vendor/src`).
   EXCLUDED : files whose path contains a `/tests/`, `/examples/`, or
              `/benches/` segment. We do **not** attempt to exclude
              `#[cfg(test)]` blocks *inside* src files — that needs a real
@@ -157,9 +158,12 @@ def scan(root: str) -> tuple[dict[str, int], int]:
     totals: dict[str, int] = {}
     src_files = 0
     for dirpath, _dirs, files in os.walk(crates):
-        norm = dirpath.replace("\\", "/")
-        # Only walk source trees: path must contain a /src/ segment.
-        if "/src/" not in norm + "/":
+        # Only each crate's DIRECT source tree: crates/<crate>/src/... — a
+        # bare `/src/` substring match would also enter nested dirs like
+        # `crates/foo/vendor/src`, inventing baseline entries (CodeRabbit).
+        rel = os.path.relpath(dirpath, crates).replace("\\", "/")
+        parts = [] if rel == "." else rel.split("/")
+        if not (len(parts) >= 2 and parts[1] == "src"):
             continue
         if is_excluded(dirpath):
             continue
