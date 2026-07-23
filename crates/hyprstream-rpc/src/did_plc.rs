@@ -17,8 +17,9 @@
 //! - **`doc.id` validation.** The returned document must claim the DID that was
 //!   asked for ([`validate_plc_document`]). A resolver that accepts a document
 //!   for a different subject is a substitution oracle.
-//! - **TTL cache.** [`HttpPlcFetcher`] caches resolved documents for the
-//!   configured TTL and bounded to a fixed number of entries.
+//! - **TTL cache.** The native resolver constructs [`HttpPlcFetcher`] from its
+//!   one [`PlcResolverConfig`], so validated documents are cached for exactly
+//!   the configured TTL and the cache is bounded to a fixed number of entries.
 //! - **Fail-closed.** Resolution failure, a malformed document, an ambiguous or
 //!   invalid DID, or a failed validation all return `Err`. The cache never
 //!   serves an expired entry and failures are never cached — there is no
@@ -45,17 +46,16 @@
 //! - **Fetch + cache** — the injected [`DidDocFetcher`] trait (shared with
 //!   `did:web`) keeps the parse/validate path testable without a live network;
 //!   [`HttpPlcFetcher`] is the native allowlisted implementation.
-//! - **Validate** ([`validate_plc_document`]) — `doc.id` subject binding,
-//!   applied by [`DidPlcResolver::resolve_document`] before the document is
-//!   returned to its consumer.
+//! - **Validate** ([`validate_plc_document`]) — `doc.id` subject binding and
+//!   recognized-member validation, applied before a native document enters the
+//!   cache or any document is returned to its consumer.
 
 use anyhow::{anyhow, bail, Result};
 use async_trait::async_trait;
-use serde::de::{self, Deserialize, Deserializer, MapAccess, SeqAccess, Visitor};
 use serde_json::Value;
 use url::Url;
 
-use crate::did_web::DidDocFetcher;
+use crate::did_web::{parse_did_document_no_duplicates, DidDocFetcher};
 
 /// Maximum DID-document body we will buffer (1 MiB). A DID document is small;
 /// this ceiling bounds memory against a hostile or buggy directory streaming an
@@ -110,102 +110,6 @@ fn evict_for_insert(
         };
         cache.remove(&oldest);
     }
-}
-
-/// JSON decoded while rejecting duplicate object keys at every depth.
-///
-/// `serde_json::Value` otherwise retains only the last duplicate key. That is
-/// unsafe at an identity boundary: another consumer could retain the first
-/// value and observe a different DID document. Reject the ambiguous response
-/// before it enters the cache or reaches any caller.
-struct NoDuplicateJson(Value);
-
-impl<'de> Deserialize<'de> for NoDuplicateJson {
-    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        struct NoDuplicateVisitor;
-
-        impl<'de> Visitor<'de> for NoDuplicateVisitor {
-            type Value = Value;
-
-            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                formatter.write_str("valid JSON without duplicate object keys")
-            }
-
-            fn visit_bool<E: de::Error>(self, value: bool) -> std::result::Result<Value, E> {
-                Ok(Value::Bool(value))
-            }
-
-            fn visit_i64<E: de::Error>(self, value: i64) -> std::result::Result<Value, E> {
-                Ok(Value::Number(value.into()))
-            }
-
-            fn visit_u64<E: de::Error>(self, value: u64) -> std::result::Result<Value, E> {
-                Ok(Value::Number(value.into()))
-            }
-
-            fn visit_f64<E: de::Error>(self, value: f64) -> std::result::Result<Value, E> {
-                serde_json::Number::from_f64(value)
-                    .map(Value::Number)
-                    .ok_or_else(|| E::custom("JSON number is not finite"))
-            }
-
-            fn visit_str<E: de::Error>(self, value: &str) -> std::result::Result<Value, E> {
-                Ok(Value::String(value.to_owned()))
-            }
-
-            fn visit_string<E: de::Error>(self, value: String) -> std::result::Result<Value, E> {
-                Ok(Value::String(value))
-            }
-
-            fn visit_none<E: de::Error>(self) -> std::result::Result<Value, E> {
-                Ok(Value::Null)
-            }
-
-            fn visit_unit<E: de::Error>(self) -> std::result::Result<Value, E> {
-                Ok(Value::Null)
-            }
-
-            fn visit_seq<A: SeqAccess<'de>>(
-                self,
-                mut seq: A,
-            ) -> std::result::Result<Value, A::Error> {
-                let mut values = Vec::new();
-                while let Some(value) = seq.next_element::<NoDuplicateJson>()? {
-                    values.push(value.0);
-                }
-                Ok(Value::Array(values))
-            }
-
-            fn visit_map<A: MapAccess<'de>>(
-                self,
-                mut map: A,
-            ) -> std::result::Result<Value, A::Error> {
-                let mut keys = std::collections::HashSet::new();
-                let mut values = serde_json::Map::new();
-                while let Some(key) = map.next_key::<String>()? {
-                    if !keys.insert(key.clone()) {
-                        return Err(de::Error::custom(format!(
-                            "duplicate JSON object key `{key}`"
-                        )));
-                    }
-                    let value = map.next_value::<NoDuplicateJson>()?;
-                    values.insert(key, value.0);
-                }
-                Ok(Value::Object(values))
-            }
-        }
-
-        deserializer.deserialize_any(NoDuplicateVisitor).map(Self)
-    }
-}
-
-fn parse_plc_document(body: &[u8], url: &str) -> Result<Value> {
-    serde_json::from_slice::<NoDuplicateJson>(body)
-        .map(|document| document.0)
-        .map_err(|e| anyhow!("did:plc document at {url} is invalid or ambiguous JSON: {e}"))
 }
 
 // ── did:plc identifier validation ─────────────────────────────────────────────
@@ -303,18 +207,19 @@ fn validate_plc_base_url(base_url: &Url) -> Result<()> {
 // ── did:plc → URL derivation ──────────────────────────────────────────────────
 
 /// Derive the DID-document URL for a `did:plc` identifier beneath `base_url`:
-/// `{base_url}/{msi}`.
+/// `{base_url}/{full-did}`.
 ///
 /// The base URL's path is treated as a directory (a trailing `/` is added if
 /// absent), so a base of `https://plc.example/mirror` resolves
-/// `did:plc:{msi}` to `https://plc.example/mirror/{msi}`.
+/// `did:plc:{msi}` to `https://plc.example/mirror/did:plc:{msi}`.
 ///
 /// Fail-closed: returns `Err` for a non-`did:plc` or non-conformant identifier
 /// ([`plc_msi`]), and refuses — as defense in depth — any derived URL whose
 /// origin is not exactly the configured base URL's origin.
 pub fn did_plc_url(did: &str, base_url: &Url) -> Result<String> {
     validate_plc_base_url(base_url)?;
-    let msi = plc_msi(did)?;
+    plc_msi(did)?;
+    let did = did.split(['#', '?']).next().unwrap_or(did);
 
     // Join beneath the base path: normalize it to a directory first, or
     // `Url::join` would replace the last path segment.
@@ -323,9 +228,13 @@ pub fn did_plc_url(did: &str, base_url: &Url) -> Result<String> {
         let dir = format!("{}/", base.path());
         base.set_path(&dir);
     }
-    let url = base
-        .join(msi)
-        .map_err(|e| anyhow!("failed to derive did:plc document URL for {did}: {e}"))?;
+    let configured_base = base.to_string();
+    base.path_segments_mut()
+        .map_err(|()| {
+            anyhow!("configured PLC base URL cannot accept path segments: {configured_base}")
+        })?
+        .push(did);
+    let url = base;
 
     // Defense in depth: the msi charset check above already makes an
     // origin-shift impossible, but a resolution URL must provably stay on the
@@ -347,18 +256,18 @@ pub fn did_plc_url(did: &str, base_url: &Url) -> Result<String> {
 /// 2. It carries a string `id`.
 /// 3. `id` is exactly the DID that was asked for (a fragment/query on the
 ///    asked DID is ignored — resolution fetches the base document).
-/// 4. Recognized collection members, when present, have their required array
-///    shape rather than an ambiguous scalar/object form.
+/// 4. Recognized collection members, when present, have valid member shapes
+///    and no duplicate semantic identifiers.
 ///
 /// Exact string equality is deliberate: a did:plc has no equivalent forms
 /// (lowercase base32, no path, no port), so any difference — case, padding,
 /// a different subject — is a mismatch.
 pub fn validate_plc_document(did: &str, doc: &Value) -> Result<()> {
-    if !doc.is_object() {
-        bail!("did:plc document for {did} is not a JSON object (fail-closed)");
-    }
     let asked = did.split(['#', '?']).next().unwrap_or(did);
-    let id = doc
+    let object = doc.as_object().ok_or_else(|| {
+        anyhow!("did:plc document for {asked} is not a JSON object (fail-closed)")
+    })?;
+    let id = object
         .get("id")
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow!("did:plc document for {asked} has no string `id` (fail-closed)"))?;
@@ -368,9 +277,125 @@ pub fn validate_plc_document(did: &str, doc: &Value) -> Result<()> {
         );
     }
 
-    for member in ["alsoKnownAs", "verificationMethod", "service"] {
-        if doc.get(member).is_some_and(|value| !value.is_array()) {
-            bail!("did:plc document for {asked} has non-array `{member}` (fail-closed)");
+    if let Some(also_known_as) = object.get("alsoKnownAs") {
+        validate_string_collection(asked, "alsoKnownAs", also_known_as)?;
+    }
+    if let Some(verification_methods) = object.get("verificationMethod") {
+        validate_verification_methods(asked, verification_methods)?;
+    }
+    if let Some(services) = object.get("service") {
+        validate_services(asked, services)?;
+    }
+    Ok(())
+}
+
+fn validate_string_collection(did: &str, member: &str, value: &Value) -> Result<()> {
+    let values = value.as_array().ok_or_else(|| {
+        anyhow!("did:plc document for {did} has non-array `{member}` (fail-closed)")
+    })?;
+    let mut seen = std::collections::HashSet::new();
+    for value in values {
+        let value = value
+            .as_str()
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                anyhow!("did:plc document for {did} has invalid `{member}` member (fail-closed)")
+            })?;
+        if !seen.insert(value) {
+            bail!("did:plc document for {did} has duplicate `{member}` member `{value}` (fail-closed)");
+        }
+    }
+    Ok(())
+}
+
+fn required_nonempty_string<'a>(
+    did: &str,
+    member: &str,
+    object: &'a serde_json::Map<String, Value>,
+    field: &str,
+) -> Result<&'a str> {
+    object
+        .get(field)
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            anyhow!(
+                "did:plc document for {did} has `{member}` member without non-empty string `{field}` (fail-closed)"
+            )
+        })
+}
+
+fn verification_method_has_key_material(object: &serde_json::Map<String, Value>) -> bool {
+    object
+        .get("publicKeyJwk")
+        .and_then(Value::as_object)
+        .is_some_and(|jwk| !jwk.is_empty())
+        || [
+            "publicKeyMultibase",
+            "publicKeyBase58",
+            "publicKeyHex",
+            "publicKeyPem",
+            "publicKeyPgp",
+        ]
+        .iter()
+        .any(|field| {
+            object
+                .get(*field)
+                .and_then(Value::as_str)
+                .is_some_and(|value| !value.is_empty())
+        })
+}
+
+fn validate_verification_methods(did: &str, value: &Value) -> Result<()> {
+    let methods = value.as_array().ok_or_else(|| {
+        anyhow!("did:plc document for {did} has non-array `verificationMethod` (fail-closed)")
+    })?;
+    let mut ids = std::collections::HashSet::new();
+    for value in methods {
+        let method = value.as_object().ok_or_else(|| {
+            anyhow!("did:plc document for {did} has non-object `verificationMethod` member (fail-closed)")
+        })?;
+        let id = required_nonempty_string(did, "verificationMethod", method, "id")?;
+        required_nonempty_string(did, "verificationMethod", method, "type")?;
+        required_nonempty_string(did, "verificationMethod", method, "controller")?;
+        if !verification_method_has_key_material(method) {
+            bail!("did:plc document for {did} has `verificationMethod` member without key material (fail-closed)");
+        }
+        if !ids.insert(id) {
+            bail!("did:plc document for {did} has duplicate `verificationMethod` id `{id}` (fail-closed)");
+        }
+    }
+    Ok(())
+}
+
+fn is_valid_service_endpoint(value: &Value) -> bool {
+    match value {
+        Value::String(value) => !value.is_empty(),
+        Value::Object(value) => !value.is_empty(),
+        Value::Array(values) => !values.is_empty() && values.iter().all(is_valid_service_endpoint),
+        _ => false,
+    }
+}
+
+fn validate_services(did: &str, value: &Value) -> Result<()> {
+    let services = value.as_array().ok_or_else(|| {
+        anyhow!("did:plc document for {did} has non-array `service` (fail-closed)")
+    })?;
+    let mut ids = std::collections::HashSet::new();
+    for value in services {
+        let service = value.as_object().ok_or_else(|| {
+            anyhow!("did:plc document for {did} has non-object `service` member (fail-closed)")
+        })?;
+        let id = required_nonempty_string(did, "service", service, "id")?;
+        required_nonempty_string(did, "service", service, "type")?;
+        if !service
+            .get("serviceEndpoint")
+            .is_some_and(is_valid_service_endpoint)
+        {
+            bail!("did:plc document for {did} has `service` member without valid `serviceEndpoint` (fail-closed)");
+        }
+        if !ids.insert(id) {
+            bail!("did:plc document for {did} has duplicate `service` id `{id}` (fail-closed)");
         }
     }
     Ok(())
@@ -392,8 +417,11 @@ pub struct DidPlcResolver<F: DidDocFetcher> {
 }
 
 impl<F: DidDocFetcher> DidPlcResolver<F> {
-    /// Construct a resolver over a document fetcher and a directory config.
-    pub fn new(fetcher: F, config: PlcResolverConfig) -> Self {
+    /// Construct a resolver over an injected document fetcher. This is for
+    /// fixtures and alternate transports; native callers should use
+    /// [`DidPlcResolver::<HttpPlcFetcher>::new`], which couples its cache TTL
+    /// to this resolver's one configuration object.
+    pub fn with_fetcher(fetcher: F, config: PlcResolverConfig) -> Self {
         Self { fetcher, config }
     }
 
@@ -413,6 +441,17 @@ impl<F: DidDocFetcher> DidPlcResolver<F> {
         let doc = self.fetcher.fetch(&url).await?;
         validate_plc_document(did, &doc)?;
         Ok(doc)
+    }
+}
+
+impl DidPlcResolver<HttpPlcFetcher> {
+    /// Construct the native HTTPS resolver from one configuration object.
+    ///
+    /// The fetcher is created here rather than accepted from the caller, so the
+    /// cache enforcing the TTL and the resolver advertising it cannot diverge.
+    pub fn new(config: PlcResolverConfig) -> Result<Self> {
+        let fetcher = HttpPlcFetcher::new(&config)?;
+        Ok(Self { fetcher, config })
     }
 }
 
@@ -447,7 +486,7 @@ impl HttpPlcFetcher {
     /// Returns `Err` if the reqwest client fails to build — propagated rather
     /// than swallowed (a `unwrap_or_default()` would yield a client WITHOUT
     /// the configured timeout/redirect policy, defeating the hardening).
-    pub fn new(config: &PlcResolverConfig) -> Result<Self> {
+    fn new(config: &PlcResolverConfig) -> Result<Self> {
         let http = reqwest::Client::builder()
             // SSRF: do NOT follow redirects. did:plc resolution is a direct
             // HTTPS GET; a redirect to http://127.0.0.1 / link-local would
@@ -489,6 +528,11 @@ impl DidDocFetcher for HttpPlcFetcher {
                 "did:plc fetch refused: origin of {url} is not in the egress allowlist (fail-closed)"
             );
         }
+        let asked = parsed
+            .path_segments()
+            .and_then(|mut segments| segments.next_back())
+            .ok_or_else(|| anyhow!("did:plc document URL has no DID path segment: {url}"))?;
+        plc_msi(asked)?;
 
         // Cache hit (not expired)? An expired entry is NEVER served — no
         // cached-but-stale fallback (#1161 fail-closed).
@@ -496,15 +540,23 @@ impl DidDocFetcher for HttpPlcFetcher {
             let cache = self.cache.lock();
             if let Some(entry) = cache.get(url) {
                 if entry.fetched_at.elapsed() < self.ttl {
+                    validate_plc_document(asked, &entry.doc)?;
                     return Ok(entry.doc.clone());
                 }
             }
         }
 
         // Miss / expired — fetch over HTTPS (lock not held across await).
-        let resp = self.http.get(url).send().await?.error_for_status()?;
+        let resp = self.http.get(url).send().await?;
+        if !resp.status().is_success() {
+            bail!(
+                "did:plc directory returned non-success status {} for {url}",
+                resp.status()
+            );
+        }
         let body = read_capped(resp, MAX_DID_DOC_BYTES).await?;
-        let doc = parse_plc_document(&body, url)?;
+        let doc = parse_did_document_no_duplicates(&body, url)?;
+        validate_plc_document(asked, &doc)?;
 
         {
             let mut cache = self.cache.lock();
@@ -611,30 +663,30 @@ mod tests {
     fn url_derivation_configured_base() {
         assert_eq!(
             did_plc_url(DID, &configured_base()).unwrap(),
-            format!("https://plc.example/ewvi7nxzyoun6zhxrhs64oiz")
+            format!("https://plc.example/{DID}")
         );
     }
 
     #[test]
     fn url_derivation_custom_base_with_path() {
-        // Base path is treated as a directory: the msi is appended, not
+        // Base path is treated as a directory: the full DID is appended, not
         // substituted for the last segment.
         let base = Url::parse("https://plc.example/mirror").unwrap();
         assert_eq!(
             did_plc_url(DID, &base).unwrap(),
-            "https://plc.example/mirror/ewvi7nxzyoun6zhxrhs64oiz"
+            "https://plc.example/mirror/did:plc:ewvi7nxzyoun6zhxrhs64oiz"
         );
         // Idempotent with an existing trailing slash.
         let base = Url::parse("https://plc.example/mirror/").unwrap();
         assert_eq!(
             did_plc_url(DID, &base).unwrap(),
-            "https://plc.example/mirror/ewvi7nxzyoun6zhxrhs64oiz"
+            "https://plc.example/mirror/did:plc:ewvi7nxzyoun6zhxrhs64oiz"
         );
         // A port survives on the origin.
         let base = Url::parse("https://localhost:8443").unwrap();
         assert_eq!(
             did_plc_url(DID, &base).unwrap(),
-            "https://localhost:8443/ewvi7nxzyoun6zhxrhs64oiz"
+            "https://localhost:8443/did:plc:ewvi7nxzyoun6zhxrhs64oiz"
         );
     }
 
@@ -680,10 +732,67 @@ mod tests {
     }
 
     #[test]
+    fn validate_rejects_malformed_or_ambiguous_collection_members() {
+        assert!(validate_plc_document(DID, &json!({ "id": DID, "alsoKnownAs": [null] })).is_err());
+        assert!(validate_plc_document(
+            DID,
+            &json!({
+                "id": DID,
+                "verificationMethod": [{ "id": "#key", "type": "Multikey" }]
+            })
+        )
+        .is_err());
+        assert!(validate_plc_document(
+            DID,
+            &json!({
+                "id": DID,
+                "verificationMethod": [
+                    {
+                        "id": "#key",
+                        "type": "Multikey",
+                        "controller": DID,
+                        "publicKeyMultibase": "zKey"
+                    },
+                    {
+                        "id": "#key",
+                        "type": "Multikey",
+                        "controller": DID,
+                        "publicKeyMultibase": "zOtherKey"
+                    }
+                ]
+            })
+        )
+        .is_err());
+        assert!(validate_plc_document(
+            DID,
+            &json!({
+                "id": DID,
+                "service": [{ "id": "#pds", "type": "AtprotoPersonalDataServer" }]
+            })
+        )
+        .is_err());
+        assert!(validate_plc_document(
+            DID,
+            &json!({
+                "id": DID,
+                "service": [
+                    { "id": "#pds", "type": "AtprotoPersonalDataServer", "serviceEndpoint": "https://pds.example" },
+                    { "id": "#pds", "type": "AtprotoPersonalDataServer", "serviceEndpoint": "https://other.example" }
+                ]
+            })
+        )
+        .is_err());
+    }
+
+    #[test]
     fn parser_rejects_ambiguous_duplicate_keys() {
         let duplicate_id = format!(r#"{{"id":"{DID}","id":"did:plc:zxcvbnmasdfghjklqwertyu"}}"#);
-        assert!(parse_plc_document(duplicate_id.as_bytes(), "https://plc.example/doc").is_err());
-        assert!(parse_plc_document(
+        assert!(parse_did_document_no_duplicates(
+            duplicate_id.as_bytes(),
+            "https://plc.example/doc"
+        )
+        .is_err());
+        assert!(parse_did_document_no_duplicates(
             br#"{"id":"did:plc:ewvi7nxzyoun6zhxrhs64oiz","service":[{"type":"a","type":"b"}] }"#,
             "https://plc.example/doc"
         )
@@ -699,7 +808,7 @@ mod tests {
     #[async_trait]
     impl DidDocFetcher for FixtureFetcher {
         async fn fetch(&self, url: &str) -> Result<Value> {
-            assert_eq!(url, "https://plc.example/ewvi7nxzyoun6zhxrhs64oiz");
+            assert_eq!(url, "https://plc.example/did:plc:ewvi7nxzyoun6zhxrhs64oiz");
             Ok(self.doc.clone())
         }
     }
@@ -716,7 +825,7 @@ mod tests {
     }
 
     fn fixture_resolver(doc: Value) -> DidPlcResolver<FixtureFetcher> {
-        DidPlcResolver::new(
+        DidPlcResolver::with_fetcher(
             FixtureFetcher { doc },
             PlcResolverConfig::new(configured_base(), std::time::Duration::from_secs(60)).unwrap(),
         )
@@ -733,6 +842,20 @@ mod tests {
         let resolver = fixture_resolver(doc.clone());
         let got = resolver.resolve_document(DID).await.unwrap();
         assert_eq!(got, doc);
+    }
+
+    #[tokio::test]
+    async fn resolve_document_accepts_captured_reference_directory_document() {
+        // Captured unchanged from https://plc.directory/did:plc:ewvi7nxzyoun6zhxrhs64oiz
+        // on 2026-07-22. This guards the actual reference-directory shape and
+        // the full-DID request target, rather than a hand-written approximation.
+        let doc = parse_did_document_no_duplicates(
+            include_bytes!("fixtures/plc_directory_ewvi7nxzyoun6zhxrhs64oiz.json"),
+            "https://plc.directory/did:plc:ewvi7nxzyoun6zhxrhs64oiz",
+        )
+        .unwrap();
+        let resolver = fixture_resolver(doc.clone());
+        assert_eq!(resolver.resolve_document(DID).await.unwrap(), doc);
     }
 
     #[tokio::test]
@@ -758,7 +881,7 @@ mod tests {
                 bail!("simulated directory failure for {url}");
             }
         }
-        let resolver = DidPlcResolver::new(
+        let resolver = DidPlcResolver::with_fetcher(
             FailingFetcher,
             PlcResolverConfig::new(configured_base(), std::time::Duration::from_secs(60)).unwrap(),
         );
@@ -767,7 +890,7 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_document_malformed_did_never_fetches() {
-        let resolver = DidPlcResolver::new(
+        let resolver = DidPlcResolver::with_fetcher(
             NeverFetcher,
             PlcResolverConfig::new(configured_base(), std::time::Duration::from_secs(60)).unwrap(),
         );
@@ -791,6 +914,18 @@ mod tests {
         assert_eq!(
             f.allowed_origins(),
             &[Url::parse("https://plc.example").unwrap().origin()]
+        );
+    }
+
+    #[test]
+    fn native_resolver_uses_its_single_cache_configuration() {
+        let config =
+            PlcResolverConfig::new(configured_base(), std::time::Duration::from_secs(37)).unwrap();
+        let resolver = DidPlcResolver::new(config).unwrap();
+        assert_eq!(resolver.fetcher.ttl, resolver.config.ttl());
+        assert_eq!(
+            resolver.fetcher.allowed_origins,
+            vec![resolver.config.base_url().origin()]
         );
     }
 
