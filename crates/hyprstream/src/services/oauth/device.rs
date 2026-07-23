@@ -116,6 +116,19 @@ pub async fn device_authorize(
             .collect();
         let client_declared = client.declared_scopes();
         let require_atproto = super::state::atproto_profile_active(&requested);
+        // #1146 T1.3: the atproto OAuth profile has no device authorization
+        // grant — rejecting here is what keeps the "atproto ⇒ DPoP
+        // sender-bound" invariant intact. Without this guard the device
+        // flow minted malformed `token_type: "DPoP"` tokens with `cnf`
+        // bound to the user's login key, which no client can ever prove
+        // possession of.
+        if require_atproto {
+            return device_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_scope",
+                "The atproto profile has no device authorization grant; use PAR + authorization code",
+            );
+        }
         match super::state::validate_requested_scopes(
             &requested,
             &state.server_supported_scopes(),

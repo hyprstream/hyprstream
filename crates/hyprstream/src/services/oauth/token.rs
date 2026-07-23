@@ -113,14 +113,19 @@ pub async fn exchange_token(
     // client's JWKS BEFORE dispatching the grant. Public clients
     // (auth_method=none or unset) skip this — PKCE substitutes for
     // client auth per OAuth 2.1.
-    if let Err(resp) = enforce_client_authentication(&state, &params).await {
-        return resp;
-    }
+    //
+    // On success this yields the RFC 7638 thumbprint of the assertion
+    // key (#1146 T3.3) — the grant handlers persist it into the refresh
+    // entry so the session stays bound to that exact key.
+    let client_assertion_jkt = match enforce_client_authentication(&state, &params).await {
+        Ok(jkt) => jkt,
+        Err(resp) => return resp,
+    };
 
     match params.grant_type.as_str() {
-        "authorization_code" => exchange_authorization_code(state, params, dpop_header, vault_device_cookie).await,
-        "refresh_token" => exchange_refresh_token(state, params, dpop_header, vault_device_cookie).await,
-        gt if gt == DEVICE_CODE_GRANT_TYPE => exchange_device_code(state, params, dpop_header, vault_device_cookie).await,
+        "authorization_code" => exchange_authorization_code(state, params, dpop_header, vault_device_cookie, client_assertion_jkt).await,
+        "refresh_token" => exchange_refresh_token(state, params, dpop_header, vault_device_cookie, client_assertion_jkt).await,
+        gt if gt == DEVICE_CODE_GRANT_TYPE => exchange_device_code(state, params, dpop_header, vault_device_cookie, client_assertion_jkt).await,
         gt if gt == JWT_BEARER_GRANT_TYPE => {
             let assertion = match params.assertion {
                 Some(a) => a,
@@ -174,17 +179,8 @@ pub async fn exchange_token(
     }
 }
 
-/// Enforce token endpoint client authentication.
-///
-/// Resolves the registered client (DCR or CIMD-cached), then:
-///   - If the client requires `private_key_jwt`: `client_assertion` and
-///     `client_assertion_type` MUST be present and verify successfully.
-///   - If the client does NOT require it but an assertion was sent
-///     anyway: we still verify it (best-effort, defense in depth).
-///   - Unknown client_ids return invalid_client.
-///
-/// Returns Ok on success; the caller proceeds with the grant. Returns
-/// Err(Response) with the appropriate token error response on failure.
+/// The immutable scope set of the grant being redeemed, used to derive
+/// the profile-correct issuer for assertion-audience checking.
 async fn bound_grant_scopes(
     state: &OAuthState,
     params: &TokenRequest,
@@ -211,10 +207,50 @@ async fn bound_grant_scopes(
     }
 }
 
+/// The client-assertion key thumbprint bound to the grant being redeemed
+/// (#1146 T3.3): PAR-bound for `authorization_code`, issuance-bound for
+/// `refresh_token`. `None` when the grant carries no binding.
+async fn bound_assertion_jkt(
+    state: &OAuthState,
+    params: &TokenRequest,
+) -> Option<String> {
+    match params.grant_type.as_str() {
+        "authorization_code" => {
+            let code = params.code.as_deref()?;
+            let pending = state.pending_codes.read().await;
+            let entry = pending.get(code)?;
+            (entry.client_id == params.client_id)
+                .then(|| entry.client_assertion_jkt.clone())
+                .flatten()
+        }
+        "refresh_token" => {
+            let refresh_token = params.refresh_token.as_deref()?;
+            let entry = state.get_refresh_token(refresh_token).await.ok().flatten()?;
+            (entry.client_id == params.client_id)
+                .then_some(entry.client_assertion_jkt)
+                .flatten()
+        }
+        _ => None,
+    }
+}
+
+/// Enforce token endpoint client authentication.
+///
+/// Resolves the registered client (DCR or CIMD-cached), then:
+///   - If the client requires `private_key_jwt`: `client_assertion` and
+///     `client_assertion_type` MUST be present and verify successfully.
+///   - If the client does NOT require it but an assertion was sent
+///     anyway: we still verify it (best-effort, defense in depth).
+///   - Unknown client_ids return invalid_client.
+///
+/// Returns the assertion key's RFC 7638 thumbprint when an assertion was
+/// verified (`Ok(Some(jkt))`), `Ok(None)` when no assertion was presented;
+/// the caller proceeds with the grant. Returns Err(Response) with the
+/// appropriate token error response on failure.
 async fn enforce_client_authentication(
     state: &OAuthState,
     params: &TokenRequest,
-) -> Result<(), Response> {
+) -> Result<Option<String>, Response> {
     // CIMD client_ids are HTTPS URLs; DCR client_ids are UUIDs.
     //
     // For CIMD: on cache miss (entry expired between PAR/authorize
@@ -250,7 +286,7 @@ async fn enforce_client_authentication(
         //     CIMD client_id has had two chances to be found.
         //   - DCR clients with UUID IDs are only "absent" if they were
         //     never registered, in which case no pending entry exists.
-        return Ok(());
+        return Ok(None);
     };
 
     let needs_auth = super::client_auth::requires_private_key_jwt(&client);
@@ -271,34 +307,67 @@ async fn enforce_client_authentication(
         let assertion = params.client_assertion.as_deref().unwrap_or_else(|| unreachable!());
         let atype = params.client_assertion_type.as_deref().unwrap_or_else(|| unreachable!());
         // Derive the assertion audience from the immutable grant, not from
-        // caller-supplied scopes. atproto grants use the origin-only endpoint
+        // caller-supplied scopes. atproto grants use the origin-only issuer
         // advertised in RFC 8414 metadata; generic grants preserve the
         // configured path-bearing issuer.
+        //
+        // #1146 T1.2: the accepted audience is the AS ISSUER — alone. The
+        // atproto OAuth profile mandates the issuer; RFC 7523 §3 also
+        // permits the token endpoint URL, but atproto does not, and
+        // `private_key_jwt` client auth ships with this conformance chain,
+        // so no deployed legacy client needs the endpoint form. Accepting
+        // both would leave the endpoint URL valid as an assertion target
+        // (replayable at any endpoint applying the same broadened rule).
+        // PAR accepts the issuer only as well (`par.rs`).
         let issuer = match bound_grant_scopes(state, params).await {
             Some(scopes) => state.issuer_for_scopes(&scopes),
             None => state.issuer_url.clone(),
         };
-        let token_endpoint = format!("{}/oauth/token", issuer.trim_end_matches('/'));
-        if let Err(e) = super::client_auth::verify_client_assertion(
-            state, &client, atype, assertion, &token_endpoint,
+        let expected_audiences = [issuer];
+        match super::client_auth::verify_client_assertion(
+            state, &client, atype, assertion, &expected_audiences,
         ).await {
-            // Full reason goes to logs; the public response stays
-            // opaque so we don't leak the validation logic / order
-            // (iss/sub/aud/exp/signature) to probing attackers.
-            tracing::warn!(
-                client_id = %params.client_id,
-                error = %e,
-                "client_assertion verification failed"
-            );
-            return Err(token_error(
-                StatusCode::UNAUTHORIZED,
-                "invalid_client",
-                None,
-            ));
+            Ok(verified) => {
+                // #1146 T3.3: when the grant was bound to a specific
+                // assertion key (at PAR for authorization_code, at
+                // issuance for refresh_token), the presented assertion
+                // MUST verify under the same key — refresh cannot switch
+                // to another registered key, and removing the bound key
+                // from the client's JWKS revokes the session.
+                if let Some(bound_jkt) = bound_assertion_jkt(state, params).await {
+                    if bound_jkt != verified.key_jkt {
+                        tracing::warn!(
+                            client_id = %params.client_id,
+                            "client_assertion key does not match the grant-bound key"
+                        );
+                        return Err(token_error(
+                            StatusCode::UNAUTHORIZED,
+                            "invalid_client",
+                            None,
+                        ));
+                    }
+                }
+                return Ok(Some(verified.key_jkt));
+            }
+            Err(e) => {
+                // Full reason goes to logs; the public response stays
+                // opaque so we don't leak the validation logic / order
+                // (iss/sub/aud/exp/signature) to probing attackers.
+                tracing::warn!(
+                    client_id = %params.client_id,
+                    error = %e,
+                    "client_assertion verification failed"
+                );
+                return Err(token_error(
+                    StatusCode::UNAUTHORIZED,
+                    "invalid_client",
+                    None,
+                ));
+            }
         }
     }
 
-    Ok(())
+    Ok(None)
 }
 
 /// Verify a DPoP proof for the token endpoint, check JTI replay, enforce
@@ -395,6 +464,7 @@ async fn exchange_authorization_code(
     params: TokenRequest,
     dpop_header: Option<String>,
     vault_device_cookie: Option<String>,
+    client_assertion_jkt: Option<String>,
 ) -> Response {
     let code = match params.code {
         Some(c) => c,
@@ -500,7 +570,7 @@ async fn exchange_authorization_code(
     tracing::info!(client_id = %params.client_id, username = %pending.username, "PKCE verified, issuing token");
     let sub = pending.username.clone();
     let vk_ref = pending.verifying_key.as_ref();
-    issue_token_with_refresh(&state, &params.client_id, pending.scopes, pending.resource, &sub, pending.oidc_nonce, true, vk_ref, dpop_jkt, vault_device_cookie).await
+    issue_token_with_refresh(&state, &params.client_id, pending.scopes, pending.resource, &sub, pending.oidc_nonce, true, vk_ref, dpop_jkt, client_assertion_jkt, vault_device_cookie).await
 }
 
 /// Handle refresh_token grant type (OAuth 2.1 with rotation).
@@ -509,6 +579,7 @@ async fn exchange_refresh_token(
     params: TokenRequest,
     dpop_header: Option<String>,
     vault_device_cookie: Option<String>,
+    client_assertion_jkt: Option<String>,
 ) -> Response {
     let refresh_token = match params.refresh_token {
         Some(rt) => rt,
@@ -628,8 +699,14 @@ async fn exchange_refresh_token(
     let stored_vk: Option<ed25519_dalek::VerifyingKey> = claimed.verifying_key_bytes
         .and_then(|b| ed25519_dalek::VerifyingKey::from_bytes(&b).ok());
 
+    // #1146 T3.3: carry the assertion-key binding forward across rotation.
+    // enforce_client_authentication already verified the presented
+    // assertion against this binding; for a legacy entry without one,
+    // ratchet onto the key that just verified.
+    let carried_assertion_jkt = claimed.client_assertion_jkt.clone().or(client_assertion_jkt);
+
     // Issue new access token + rotated refresh token. No id_token on refresh (OIDC Core § 12.2).
-    issue_token_with_refresh(&state, &claimed.client_id, claimed.scopes, claimed.resource, &claimed.username, None, false, stored_vk.as_ref(), dpop_jkt, vault_device_cookie).await
+    issue_token_with_refresh(&state, &claimed.client_id, claimed.scopes, claimed.resource, &claimed.username, None, false, stored_vk.as_ref(), dpop_jkt, carried_assertion_jkt, vault_device_cookie).await
 }
 
 /// Handle urn:ietf:params:oauth:grant-type:device_code grant type (RFC 8628 Section 3.4).
@@ -638,6 +715,7 @@ async fn exchange_device_code(
     params: TokenRequest,
     dpop_header: Option<String>,
     vault_device_cookie: Option<String>,
+    client_assertion_jkt: Option<String>,
 ) -> Response {
     let device_code = match params.device_code {
         Some(dc) => dc,
@@ -788,7 +866,7 @@ async fn exchange_device_code(
             drop(user_code_map);
 
             // Device flow: no OIDC nonce and not initial OIDC auth.
-            issue_token_with_refresh(&state, &client_id, scopes, resource, &approved_by, None, false, device_vk.as_ref(), dpop_jkt, vault_device_cookie).await
+            issue_token_with_refresh(&state, &client_id, scopes, resource, &approved_by, None, false, device_vk.as_ref(), dpop_jkt, client_assertion_jkt, vault_device_cookie).await
         }
     }
 }
@@ -838,6 +916,7 @@ async fn issue_token_with_refresh(
     initial_auth: bool,
     user_verifying_key: Option<&ed25519_dalek::VerifyingKey>,
     dpop_jkt: Option<String>,
+    client_assertion_jkt: Option<String>,
     vault_device_cookie: Option<String>,
 ) -> Response {
     let scope_str = scopes.join(" ");
@@ -941,6 +1020,7 @@ async fn issue_token_with_refresh(
                     expires_at_unix: now + state.refresh_token_ttl as i64,
                     verifying_key_bytes: user_verifying_key.map(|vk| *vk.as_bytes()),
                     dpop_jkt: dpop_jkt.clone(),
+                    client_assertion_jkt: client_assertion_jkt.clone(),
                     ucan_grant: None, // generic OAuth refresh; not a UCAN grant (MAC #547 B1)
                 };
                 if let Err(e) = state.put_refresh_token(&refresh_token, &entry, state.refresh_token_ttl as u64).await {

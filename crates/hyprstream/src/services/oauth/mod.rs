@@ -1118,6 +1118,7 @@ mod tests {
 
     fn private_key_jwt_assertion(
         signing_key: &p256::ecdsa::SigningKey,
+        kid: &str,
         client_id: &str,
         audience: &str,
         jti: &str,
@@ -1125,11 +1126,12 @@ mod tests {
         use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
         use p256::ecdsa::signature::Signer as _;
 
-        let header = serde_json::json!({"alg": "ES256", "typ": "JWT", "kid": "private-k1"});
+        let header = serde_json::json!({"alg": "ES256", "typ": "JWT", "kid": kid});
         let claims = serde_json::json!({
             "iss": client_id,
             "sub": client_id,
             "aud": audience,
+            "iat": chrono::Utc::now().timestamp(),
             "exp": chrono::Utc::now().timestamp() + 60,
             "jti": jti,
         });
@@ -1377,12 +1379,17 @@ mod tests {
                 jwks_uri: None,
                 hyprstream_node_did: None,
                 scope: Some("atproto read:*:*".to_owned()),
+                dpop_bound_access_tokens: None,
                 is_cimd: false,
                 registered_at: std::time::Instant::now(),
             },
         );
         let private_client_key = p256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
         let private_client_point = private_client_key.verifying_key().to_encoded_point(false);
+        // A second registered key for the same client: proves refresh cannot
+        // switch assertion keys mid-session (#1146 T3.3).
+        let private_client_key_2 = p256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
+        let private_client_point_2 = private_client_key_2.verifying_key().to_encoded_point(false);
         state.clients.write().await.insert(
             PRIVATE_CLIENT_ID.to_owned(),
             RegisteredClient {
@@ -1400,10 +1407,17 @@ mod tests {
                     "x": URL_SAFE_NO_PAD.encode(private_client_point.x().unwrap()),
                     "y": URL_SAFE_NO_PAD.encode(private_client_point.y().unwrap()),
                     "kid": "private-k1",
+                }, {
+                    "kty": "EC",
+                    "crv": "P-256",
+                    "x": URL_SAFE_NO_PAD.encode(private_client_point_2.x().unwrap()),
+                    "y": URL_SAFE_NO_PAD.encode(private_client_point_2.y().unwrap()),
+                    "kid": "private-k2",
                 }]})),
                 jwks_uri: None,
                 hyprstream_node_did: None,
                 scope: Some("atproto".to_owned()),
+                dpop_bound_access_tokens: Some(true),
                 is_cimd: false,
                 registered_at: std::time::Instant::now(),
             },
@@ -1427,6 +1441,108 @@ mod tests {
         assert_eq!(
             response_json(unknown_device).await["error"],
             "invalid_client"
+        );
+
+        // #1146 T1.3: the atproto profile has no device authorization grant —
+        // `scope=atproto` is rejected at the device endpoint (it previously
+        // minted malformed DPoP tokens cnf-bound to the user's login key).
+        let atproto_device = post_form(
+            &app,
+            "/oauth/device",
+            &[("client_id", CLIENT_ID), ("scope", "atproto")],
+            None,
+            false,
+        )
+        .await;
+        assert_eq!(atproto_device.status(), axum::http::StatusCode::BAD_REQUEST);
+        assert_eq!(
+            response_json(atproto_device).await["error"],
+            "invalid_scope"
+        );
+
+        // #1146 T1.1: a fetched CIMD client's declared scope ceiling is
+        // enforced at PAR. This client declares only `atproto`; requesting
+        // `transition:generic` must be rejected (the fetched-metadata path
+        // previously dropped the ceiling entirely).
+        const CIMD_CLIENT_ID: &str = "https://client.example.test/cimd.json";
+        state
+            .cimd_cache
+            .insert(
+                RegisteredClient {
+                    client_id: CIMD_CLIENT_ID.to_owned(),
+                    redirect_uris: vec![REDIRECT_URI.to_owned()],
+                    client_name: Some("Handler CIMD Client".to_owned()),
+                    client_uri: None,
+                    logo_uri: None,
+                    grant_types: vec!["authorization_code".to_owned()],
+                    response_types: vec!["code".to_owned()],
+                    token_endpoint_auth_method: Some("none".to_owned()),
+                    jwks: None,
+                    jwks_uri: None,
+                    hyprstream_node_did: None,
+                    scope: Some("atproto".to_owned()),
+                    dpop_bound_access_tokens: Some(true),
+                    is_cimd: true,
+                    registered_at: std::time::Instant::now(),
+                },
+                std::time::Duration::from_secs(300),
+            )
+            .await;
+        let cimd_par_challenge =
+            URL_SAFE_NO_PAD.encode(Sha256::digest(b"cimd-ceiling-pkce-verifier-abcdefghijklmnopqrstuvwxyz"));
+        let cimd_over_scope_par = post_form(
+            &app,
+            "/oauth/par",
+            &[
+                ("client_id", CIMD_CLIENT_ID),
+                ("redirect_uri", REDIRECT_URI),
+                ("code_challenge", &cimd_par_challenge),
+                ("code_challenge_method", "S256"),
+                ("response_type", "code"),
+                ("scope", "atproto transition:generic"),
+                ("resource", ISSUER),
+            ],
+            None,
+            false,
+        )
+        .await;
+        assert_eq!(
+            cimd_over_scope_par.status(),
+            axum::http::StatusCode::BAD_REQUEST,
+            "CIMD client must not exceed its declared scope ceiling"
+        );
+        assert_eq!(
+            response_json(cimd_over_scope_par).await["error"],
+            "invalid_scope"
+        );
+        // Positive control: the declared scope itself is still granted.
+        let cimd_dpop_key = p256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
+        let cimd_par_proof = dpop_proof(
+            &cimd_dpop_key,
+            &format!("{ISSUER}/oauth/par"),
+            "cimd-ceiling-par-jti",
+            None,
+        );
+        let cimd_in_scope_par = post_form(
+            &app,
+            "/oauth/par",
+            &[
+                ("client_id", CIMD_CLIENT_ID),
+                ("redirect_uri", REDIRECT_URI),
+                ("code_challenge", &cimd_par_challenge),
+                ("code_challenge_method", "S256"),
+                ("response_type", "code"),
+                ("scope", "atproto"),
+                ("resource", ISSUER),
+            ],
+            Some(&cimd_par_proof),
+            false,
+        )
+        .await;
+        assert_eq!(
+            cimd_in_scope_par.status(),
+            axum::http::StatusCode::CREATED,
+            "declared scope must remain grantable"
         );
 
         // PAR binds the atproto request to a real ES256 DPoP key.
@@ -1548,9 +1664,9 @@ mod tests {
         assert_eq!(claims["sub"], MAPPED_DID);
         assert_eq!(claims["aud"], ISSUER);
 
-        // A confidential atproto client signs private_key_jwt for the
-        // canonical token endpoint advertised by the atproto metadata, even
-        // though the configured generic issuer carries a path.
+        // A confidential atproto client signs private_key_jwt with the AS
+        // issuer as the assertion audience (atproto mandate, #1146 T1.2),
+        // even though the configured generic issuer carries a path.
         let advertised_metadata = response_json(
             get(&app, "/.well-known/oauth-authorization-server").await,
         ).await;
@@ -1560,14 +1676,89 @@ mod tests {
             .to_owned();
         assert_eq!(advertised_token_endpoint, format!("{ISSUER}/oauth/token"));
 
+        let assertion_type = super::client_auth::JWT_BEARER_ASSERTION_TYPE;
         let private_dpop_key = p256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
         let private_verifier = "private-client-pkce-verifier-abcdefghijklmnopqrstuvwxyz012345";
         let private_challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(private_verifier.as_bytes()));
+
+        // #1146 T3.3: confidential clients MUST authenticate at PAR — a
+        // pushed request without a client_assertion is rejected.
+        let no_auth_par_proof = dpop_proof(
+            &private_dpop_key,
+            &format!("{ISSUER}/oauth/par"),
+            "private-client-par-jti-noauth",
+            None,
+        );
+        let no_auth_par = post_form(
+            &app,
+            "/oauth/par",
+            &[
+                ("client_id", PRIVATE_CLIENT_ID),
+                ("redirect_uri", REDIRECT_URI),
+                ("code_challenge", &private_challenge),
+                ("code_challenge_method", "S256"),
+                ("response_type", "code"),
+                ("state", "private-client-state"),
+                ("scope", "atproto"),
+                ("resource", ISSUER),
+            ],
+            Some(&no_auth_par_proof),
+            false,
+        )
+        .await;
+        assert_eq!(no_auth_par.status(), axum::http::StatusCode::UNAUTHORIZED);
+        assert_eq!(response_json(no_auth_par).await["error"], "invalid_client");
+
+        // #1146 T1.2: at PAR the assertion audience MUST be the AS issuer —
+        // the RFC 7523 token-endpoint form accepted at /oauth/token is not
+        // sufficient here.
+        let par_endpoint_aud_assertion = private_key_jwt_assertion(
+            &private_client_key,
+            "private-k1",
+            PRIVATE_CLIENT_ID,
+            &format!("{ISSUER}/oauth/token"),
+            "private-par-endpoint-aud-jti",
+        );
+        let wrong_aud_par_proof = dpop_proof(
+            &private_dpop_key,
+            &format!("{ISSUER}/oauth/par"),
+            "private-client-par-jti-wrongaod",
+            None,
+        );
+        let wrong_aud_par = post_form(
+            &app,
+            "/oauth/par",
+            &[
+                ("client_id", PRIVATE_CLIENT_ID),
+                ("redirect_uri", REDIRECT_URI),
+                ("code_challenge", &private_challenge),
+                ("code_challenge_method", "S256"),
+                ("response_type", "code"),
+                ("state", "private-client-state"),
+                ("scope", "atproto"),
+                ("resource", ISSUER),
+                ("client_assertion_type", assertion_type),
+                ("client_assertion", &par_endpoint_aud_assertion),
+            ],
+            Some(&wrong_aud_par_proof),
+            false,
+        )
+        .await;
+        assert_eq!(wrong_aud_par.status(), axum::http::StatusCode::UNAUTHORIZED);
+        assert_eq!(response_json(wrong_aud_par).await["error"], "invalid_client");
+
         let private_par_proof = dpop_proof(
             &private_dpop_key,
             &format!("{ISSUER}/oauth/par"),
             "private-client-par-jti",
             None,
+        );
+        let private_par_assertion = private_key_jwt_assertion(
+            &private_client_key,
+            "private-k1",
+            PRIVATE_CLIENT_ID,
+            ISSUER,
+            "private-par-assertion-jti",
         );
         let private_par = post_form(
             &app,
@@ -1581,6 +1772,8 @@ mod tests {
                 ("state", "private-client-state"),
                 ("scope", "atproto"),
                 ("resource", ISSUER),
+                ("client_assertion_type", assertion_type),
+                ("client_assertion", &private_par_assertion),
             ],
             Some(&private_par_proof),
             false,
@@ -1632,15 +1825,47 @@ mod tests {
         let private_callback_params: std::collections::HashMap<_, _> =
             private_location.query_pairs().into_owned().collect();
         let private_code = private_callback_params["code"].clone();
+
+        // #1146 T3.3: a client_assertion is single-use — re-presenting the
+        // exact assertion accepted at PAR above (same jti) is replay and
+        // must be rejected, even at a different endpoint.
+        let replay_assertion_proof = dpop_proof(
+            &private_dpop_key,
+            &advertised_token_endpoint,
+            "private-client-token-jti-replay",
+            Some(&private_dpop_nonce),
+        );
+        let replayed_assertion = post_form(
+            &app,
+            "/oauth/token",
+            &[
+                ("grant_type", "authorization_code"),
+                ("client_id", PRIVATE_CLIENT_ID),
+                ("code", &private_code),
+                ("redirect_uri", REDIRECT_URI),
+                ("code_verifier", private_verifier),
+                ("client_assertion_type", assertion_type),
+                ("client_assertion", &private_par_assertion),
+            ],
+            Some(&replay_assertion_proof),
+            false,
+        ).await;
+        assert_eq!(
+            replayed_assertion.status(),
+            axum::http::StatusCode::UNAUTHORIZED,
+            "a replayed client_assertion jti must be rejected"
+        );
+        assert_eq!(response_json(replayed_assertion).await["error"], "invalid_client");
+
         let private_token_proof = dpop_proof(
             &private_dpop_key,
             &advertised_token_endpoint,
             "private-client-token-jti",
             Some(&private_dpop_nonce),
         );
-        let assertion_type = super::client_auth::JWT_BEARER_ASSERTION_TYPE;
         let wrong_assertion = private_key_jwt_assertion(
             &private_client_key,
+            "private-k1",
             PRIVATE_CLIENT_ID,
             "https://attacker.example/oauth/token",
             "private-client-wrong-aud",
@@ -1663,10 +1888,47 @@ mod tests {
         assert_eq!(wrong_audience.status(), axum::http::StatusCode::UNAUTHORIZED);
         assert_eq!(response_json(wrong_audience).await["error"], "invalid_client");
 
-        let canonical_assertion = private_key_jwt_assertion(
+        // #1146 T1.2 (rev): the RFC 7523 token-endpoint audience form is NOT
+        // accepted at the token endpoint either — atproto mandates the AS
+        // issuer alone at every endpoint. This pins the narrowing: accepting
+        // both forms was the review-flagged deviation.
+        let endpoint_aud_assertion = private_key_jwt_assertion(
             &private_client_key,
+            "private-k1",
             PRIVATE_CLIENT_ID,
             &advertised_token_endpoint,
+            "private-client-endpoint-aud",
+        );
+        let endpoint_audience = post_form(
+            &app,
+            "/oauth/token",
+            &[
+                ("grant_type", "authorization_code"),
+                ("client_id", PRIVATE_CLIENT_ID),
+                ("code", &private_code),
+                ("redirect_uri", REDIRECT_URI),
+                ("code_verifier", private_verifier),
+                ("client_assertion_type", assertion_type),
+                ("client_assertion", &endpoint_aud_assertion),
+            ],
+            Some(&private_token_proof),
+            false,
+        ).await;
+        assert_eq!(
+            endpoint_audience.status(),
+            axum::http::StatusCode::UNAUTHORIZED,
+            "the token-endpoint audience form must be rejected (issuer-only)"
+        );
+        assert_eq!(response_json(endpoint_audience).await["error"], "invalid_client");
+
+        // #1146 T1.2: the reference confidential client sends the AS ISSUER
+        // as the assertion audience — previously rejected, now the ONLY
+        // accepted form (issuer-only at PAR and token).
+        let canonical_assertion = private_key_jwt_assertion(
+            &private_client_key,
+            "private-k1",
+            PRIVATE_CLIENT_ID,
+            ISSUER,
             "private-client-canonical-aud",
         );
         let private_token = post_form(
@@ -1685,9 +1947,154 @@ mod tests {
             false,
         ).await;
         assert_eq!(private_token.status(), axum::http::StatusCode::OK);
+        let private_token_nonce = private_token
+            .headers()
+            .get("DPoP-Nonce")
+            .and_then(|value| value.to_str().ok())
+            .unwrap()
+            .to_owned();
         let private_token_json = response_json(private_token).await;
         assert_eq!(private_token_json["token_type"], "DPoP");
         assert_eq!(jwt_claims(private_token_json["access_token"].as_str().unwrap())["iss"], ISSUER);
+        let private_refresh_token = private_token_json["refresh_token"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        // #1146 T3.3: the session is bound to the assertion key verified at
+        // PAR/issuance. Refresh presenting an assertion from ANOTHER
+        // currently-registered key (private-k2) must be rejected — and must
+        // not consume the single-use refresh token.
+        let switch_assertion = private_key_jwt_assertion(
+            &private_client_key_2,
+            "private-k2",
+            PRIVATE_CLIENT_ID,
+            ISSUER,
+            "private-refresh-switch-jti",
+        );
+        let switch_proof = dpop_proof(
+            &private_dpop_key,
+            &advertised_token_endpoint,
+            "private-refresh-switch-dpop-jti",
+            Some(&private_token_nonce),
+        );
+        let switch_refresh = post_form(
+            &app,
+            "/oauth/token",
+            &[
+                ("grant_type", "refresh_token"),
+                ("client_id", PRIVATE_CLIENT_ID),
+                ("refresh_token", &private_refresh_token),
+                ("client_assertion_type", assertion_type),
+                ("client_assertion", &switch_assertion),
+            ],
+            Some(&switch_proof),
+            false,
+        )
+        .await;
+        assert_eq!(
+            switch_refresh.status(),
+            axum::http::StatusCode::UNAUTHORIZED,
+            "refresh must not switch to another registered assertion key"
+        );
+        assert_eq!(response_json(switch_refresh).await["error"], "invalid_client");
+        assert!(
+            state.get_refresh_token(&private_refresh_token).await?.is_some(),
+            "a rejected client authentication must not consume the refresh token"
+        );
+
+        // Refresh with the BOUND key succeeds and rotates.
+        let bound_assertion = private_key_jwt_assertion(
+            &private_client_key,
+            "private-k1",
+            PRIVATE_CLIENT_ID,
+            ISSUER,
+            "private-refresh-bound-jti",
+        );
+        let bound_proof = dpop_proof(
+            &private_dpop_key,
+            &advertised_token_endpoint,
+            "private-refresh-bound-dpop-jti",
+            Some(&private_token_nonce),
+        );
+        let bound_refresh = post_form(
+            &app,
+            "/oauth/token",
+            &[
+                ("grant_type", "refresh_token"),
+                ("client_id", PRIVATE_CLIENT_ID),
+                ("refresh_token", &private_refresh_token),
+                ("client_assertion_type", assertion_type),
+                ("client_assertion", &bound_assertion),
+            ],
+            Some(&bound_proof),
+            false,
+        )
+        .await;
+        assert_eq!(bound_refresh.status(), axum::http::StatusCode::OK);
+        let bound_refresh_nonce = bound_refresh
+            .headers()
+            .get("DPoP-Nonce")
+            .and_then(|value| value.to_str().ok())
+            .unwrap()
+            .to_owned();
+        let bound_refresh_json = response_json(bound_refresh).await;
+        let rotated_refresh_token = bound_refresh_json["refresh_token"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert_ne!(rotated_refresh_token, private_refresh_token);
+
+        // #1146 T3.3: removing the bound key from the client's JWKS revokes
+        // the session — the rotated refresh can no longer authenticate.
+        {
+            let mut clients = state.clients.write().await;
+            let entry = clients.get_mut(PRIVATE_CLIENT_ID).unwrap();
+            let keys = entry.jwks.as_ref().unwrap()["keys"].as_array().unwrap();
+            let remaining: Vec<serde_json::Value> = keys
+                .iter()
+                .filter(|k| k["kid"].as_str() != Some("private-k1"))
+                .cloned()
+                .collect();
+            entry.jwks = Some(serde_json::json!({"keys": remaining}));
+        }
+        let removed_key_assertion = private_key_jwt_assertion(
+            &private_client_key,
+            "private-k1",
+            PRIVATE_CLIENT_ID,
+            ISSUER,
+            "private-refresh-removed-jti",
+        );
+        let removed_key_proof = dpop_proof(
+            &private_dpop_key,
+            &advertised_token_endpoint,
+            "private-refresh-removed-dpop-jti",
+            Some(&bound_refresh_nonce),
+        );
+        let removed_key_refresh = post_form(
+            &app,
+            "/oauth/token",
+            &[
+                ("grant_type", "refresh_token"),
+                ("client_id", PRIVATE_CLIENT_ID),
+                ("refresh_token", &rotated_refresh_token),
+                ("client_assertion_type", assertion_type),
+                ("client_assertion", &removed_key_assertion),
+            ],
+            Some(&removed_key_proof),
+            false,
+        )
+        .await;
+        assert_eq!(
+            removed_key_refresh.status(),
+            axum::http::StatusCode::UNAUTHORIZED,
+            "key removal from the client JWKS must revoke the session"
+        );
+        assert_eq!(response_json(removed_key_refresh).await["error"], "invalid_client");
+        assert!(
+            state.get_refresh_token(&rotated_refresh_token).await?.is_some(),
+            "a rejected client authentication must not consume the refresh token"
+        );
 
         // A missing refresh proof is rejected before consumption. Retrying
         // the same refresh token with the bound key and nonce must succeed.

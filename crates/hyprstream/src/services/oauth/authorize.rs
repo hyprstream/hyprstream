@@ -55,6 +55,11 @@ pub struct AuthorizeParams {
     /// must receive a DPoP proof from the same key.
     #[serde(default)]
     pub dpop_jkt: Option<String>,
+    /// RFC 7638 thumbprint of the client-assertion key verified at PAR
+    /// (#1146 T3.3). When set, token redemption must present a
+    /// `client_assertion` signed by the same key.
+    #[serde(default)]
+    pub client_assertion_jkt: Option<String>,
 }
 
 /// Loosely-typed authorize query.
@@ -437,7 +442,23 @@ pub async fn authorize_post(
         .split_whitespace()
         .map(std::borrow::ToOwned::to_owned)
         .collect();
-    let client_declared = resolve_client_declared_scopes(&state, &effective.client_id).await;
+    let client_declared = match resolve_client_declared_scopes(&state, &effective.client_id).await {
+        Some(declared) => declared,
+        None => {
+            // #1146 T1.1: the client (and therefore its scope ceiling)
+            // could not be resolved — fail closed rather than silently
+            // validating against the full server-supported set.
+            tracing::warn!(
+                client_id = %effective.client_id,
+                "authorize: client unresolvable at scope validation — failing closed"
+            );
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_scope",
+                "Requested scope is not supported or not declared by the client",
+            );
+        }
+    };
     let require_atproto = super::state::atproto_profile_active(&requested_scopes);
     let granted_scopes = match super::state::validate_requested_scopes(
         &requested_scopes,
@@ -470,6 +491,8 @@ pub async fn authorize_post(
         verifying_key: Some(verifying_key),
         // PAR-bound DPoP key thumbprint (#1113 rev2 finding 3).
         dpop_jkt: effective.dpop_jkt.clone(),
+        // PAR-bound client-assertion key thumbprint (#1146 T3.3).
+        client_assertion_jkt: effective.client_assertion_jkt.clone(),
     };
 
     state.pending_codes.write().await.insert(code.clone(), pending);
@@ -614,6 +637,7 @@ async fn resolve_authorize_query(
         resource,
         nonce,
         dpop_jkt: None,
+        client_assertion_jkt: None,
     })
 }
 
@@ -667,21 +691,27 @@ async fn derive_display_info(
 
 /// Resolve a client's declared scope tokens for `invalid_scope` validation
 /// (#1113 rev2 finding 4). CIMD-shaped client_ids (HTTPS URLs) resolve via
-/// the CIMD cache; DCR UUIDs via the registry. Returns an empty vec when the
-/// client is unknown or declared no scopes (→ no client-side restriction).
-async fn resolve_client_declared_scopes(state: &OAuthState, client_id: &str) -> Vec<String> {
+/// the CIMD cache; DCR UUIDs via the registry.
+///
+/// #1146 T1.1: a CIMD cache miss RE-RESOLVES the client (policy check +
+/// metadata re-fetch) instead of silently dropping the declared scope
+/// ceiling — an aged-out cache entry must never degrade to "no
+/// restriction". Returns `None` (fail closed) when the client cannot be
+/// resolved at all; `Some(vec![])` only when a resolved client declared
+/// no scope ceiling.
+async fn resolve_client_declared_scopes(state: &OAuthState, client_id: &str) -> Option<Vec<String>> {
     let client = if client_id.starts_with("https://") {
         match state.cimd_cache.get(client_id).await {
             Some(c) => c,
-            None => return Vec::new(),
+            // Cache miss: re-resolve rather than dropping the ceiling.
+            // resolve_cimd_client re-runs the federation:register policy
+            // check and re-fetches metadata; any failure fails closed.
+            None => resolve_cimd_client(state, client_id).await.ok()?,
         }
     } else {
-        match state.clients.read().await.get(client_id) {
-            Some(c) => c.clone(),
-            None => return Vec::new(),
-        }
+        state.clients.read().await.get(client_id)?.clone()
     };
-    client.declared_scopes()
+    Some(client.declared_scopes())
 }
 
 /// Build the authorization redirect URL (#1113 rev2 F5).
@@ -968,5 +998,98 @@ mod tests {
             .unwrap();
         assert_eq!(iss, "https://pds.example.com");
         assert!(!iss.ends_with('/'), "iss must be origin (no trailing slash)");
+    }
+
+    /// #1146 T1.1: `resolve_client_declared_scopes` must re-resolve a CIMD
+    /// client on cache miss and fail closed (`None`) when the client cannot
+    /// be resolved — never silently degrade to "no scope restriction".
+    #[tokio::test]
+    async fn resolve_client_declared_scopes_fail_closed_on_miss() {
+        use hyprstream_rpc::crypto::CryptoPolicy;
+        use hyprstream_rpc::rpc_client::RpcClientImpl;
+        use hyprstream_rpc::signer::LocalSigner;
+        use hyprstream_rpc::transport::lazy_uds::LazyUdsTransport;
+
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[0x41; 32]);
+        let remote_key = ed25519_dalek::SigningKey::from_bytes(&[0x42; 32]).verifying_key();
+        let make_client = || {
+            Arc::new(
+                RpcClientImpl::new(
+                    LocalSigner::new(signing_key.clone()),
+                    LazyUdsTransport::new("/dev/null/oauth-scope-resolve-test.sock".into()),
+                    Some(remote_key),
+                )
+                .with_response_verify_policy(CryptoPolicy::Classical),
+            )
+        };
+        let config = crate::config::OAuthConfig::default();
+        let state = OAuthState::new(
+            &config,
+            crate::services::PolicyClient::new(make_client()),
+            crate::services::DiscoveryClient::new(make_client()),
+            signing_key.verifying_key().to_bytes(),
+        );
+
+        let make_registered = |client_id: &str, scope: Option<&str>, is_cimd: bool| {
+            crate::services::oauth::state::RegisteredClient {
+                client_id: client_id.to_owned(),
+                redirect_uris: vec!["https://app.example.com/cb".to_owned()],
+                client_name: None,
+                client_uri: None,
+                logo_uri: None,
+                grant_types: vec![],
+                response_types: vec![],
+                token_endpoint_auth_method: None,
+                jwks: None,
+                jwks_uri: None,
+                hyprstream_node_did: None,
+                scope: scope.map(str::to_owned),
+                dpop_bound_access_tokens: None,
+                is_cimd,
+                registered_at: Instant::now(),
+            }
+        };
+
+        // Unknown DCR client → fail closed (was: empty vec = no restriction).
+        assert!(
+            resolve_client_declared_scopes(&state, "no-such-client")
+                .await
+                .is_none(),
+            "unknown DCR client must fail closed"
+        );
+
+        // CIMD cache miss on an unresolvable client_id → re-resolve attempt
+        // fails (policy RPC unreachable / fetch fails) → fail closed.
+        assert!(
+            resolve_client_declared_scopes(&state, "https://unresolvable.example.test/cimd.json")
+                .await
+                .is_none(),
+            "unresolvable CIMD client must fail closed, not drop the ceiling"
+        );
+
+        // DCR registry hit → declared scopes (empty vec = declared no ceiling).
+        state
+            .clients
+            .write()
+            .await
+            .insert("dcr-client".to_owned(), make_registered("dcr-client", Some("atproto"), false));
+        assert_eq!(
+            resolve_client_declared_scopes(&state, "dcr-client").await,
+            Some(vec!["atproto".to_owned()])
+        );
+
+        // CIMD cache hit → declared scopes.
+        let cimd_id = "https://app.example.com/client.json";
+        state
+            .cimd_cache
+            .insert(
+                make_registered(cimd_id, Some("atproto"), true),
+                Duration::from_secs(300),
+            )
+            .await;
+        assert_eq!(
+            resolve_client_declared_scopes(&state, cimd_id).await,
+            Some(vec!["atproto".to_owned()])
+        );
     }
 }
