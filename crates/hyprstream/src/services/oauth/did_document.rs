@@ -104,6 +104,7 @@ fn configured_handle_host(issuer_url: &str) -> Option<String> {
     }
 }
 
+#[cfg(test)]
 fn account_handle(username: &str, issuer_url: &str) -> Option<String> {
     let host = configured_handle_host(issuer_url)?;
     normalize_atproto_handle(&format!("{username}.{host}"))
@@ -594,8 +595,9 @@ pub async fn atproto_did(
 /// hard error until the separately designed host-form mint path lands (#1163).
 pub async fn user_did_document(
     State(_state): State<Arc<OAuthState>>,
-    Path(_username): Path<String>,
+    Path(username): Path<String>,
 ) -> Response {
+    tracing::debug!(%username, "deprecated path-form account DID route requested");
     path_form_account_did_disabled_response()
 }
 
@@ -732,7 +734,7 @@ mod tests {
     /// test replaces.
     #[tokio::test]
     async fn path_form_account_document_endpoint_is_a_hard_error() {
-        use crate::auth::user_store::{PubkeyEntry, UserFilter, UserProfile, UserStore};
+        use crate::auth::user_store::{PubkeyEntry, UserFilter, UserProfile, UserProfilePatch, UserStore};
         use crate::config::server::CorsConfig;
         use crate::config::OAuthConfig;
         use crate::services::oauth::create_app;
@@ -758,7 +760,7 @@ mod tests {
             async fn register(&self, _: &str) -> anyhow::Result<String> {
                 unreachable!()
             }
-            async fn set_profile(&self, _: &str, _: UserProfile) -> anyhow::Result<()> {
+            async fn set_profile(&self, _: &str, _: UserProfilePatch) -> anyhow::Result<()> {
                 unreachable!()
             }
             async fn remove(&self, _: &str) -> anyhow::Result<bool> { unreachable!() }

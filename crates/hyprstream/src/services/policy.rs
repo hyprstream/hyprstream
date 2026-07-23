@@ -1709,6 +1709,7 @@ mod tests {
             subject: Some(subject.to_owned()),
             user_pub_key: None,
             dpop_jkt: None,
+            issuer: None,
         }
     }
 

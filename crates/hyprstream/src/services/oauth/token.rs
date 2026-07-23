@@ -1635,6 +1635,7 @@ mod tests {
             expires_at_unix: chrono::Utc::now().timestamp() + 3600,
             verifying_key_bytes: None,
             dpop_jkt: None,
+            client_assertion_jkt: None,
             ucan_grant: Some(crate::services::oauth::state::UcanGrantRefresh {
                 grant_cbor_b64: "not-reached".to_owned(),
                 grant_cid: "not-reached".to_owned(),
@@ -1665,7 +1666,7 @@ mod tests {
             scope: None,
             audience: None,
         };
-        let resp = exchange_refresh_token(state.clone(), params, None, None).await;
+        let resp = exchange_refresh_token(state.clone(), params, None, None, None).await;
 
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();

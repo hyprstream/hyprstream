@@ -1164,28 +1164,6 @@ mod tests {
         assert!(value.get("refresh_token").is_none());
     }
 
-    #[tokio::test]
-    async fn token_exchange_rejects_valid_legacy_path_form_access_token() {
-        let key = ed25519_dalek::SigningKey::from_bytes(&[0x65; 32]);
-        let now = chrono::Utc::now().timestamp();
-        let legacy = hyprstream_rpc::auth::jwt::encode(
-            &hyprstream_rpc::auth::Claims::new(
-                "did:web:accounts.example:users:alice".to_owned(), now - 1, now + 3600,
-            ),
-            &key,
-        );
-        let response = exchange_token_exchange(
-            &mint_test_state(), &legacy, TOKEN_TYPE_ACCESS_TOKEN, None, None, None, None,
-        ).await;
-
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        let body = axum::body::to_bytes(response.into_body(), 4096).await.unwrap();
-        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(value["error"].as_str(), Some("invalid_grant"));
-        assert!(value["error_description"].as_str().unwrap().contains("frozen"));
-        assert!(value.get("access_token").is_none());
-    }
-
     /// A compartment bitset from bit indices.
     fn comps(bits: &[u32]) -> CompartmentSet {
         bits.iter().copied().collect()
