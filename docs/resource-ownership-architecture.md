@@ -25,8 +25,8 @@ The dependency-light Rust mirror is `hyprstream-resource`. It freezes names and 
 
 | Authoritative statement | Sole owner | Evidence / interface | Explicit non-owners |
 |---|---|---|---|
-| Principal may create, control, mutate, transfer, or delete this resource under the pinned label/policy/capability state | Native MAC reference monitor | `MacAttestation` over `ResourceIntent` digest | Ledger, registrar, storage, namespace, PDS |
-| Payer has a valid entitlement and amount is reserved, posted, voided, or compensated in this issuer unit | Cell ledger | `LedgerAttestation`; immutable journal and receipt | MAC, registrar, PDS, storage |
+| Principal may create, control, mutate, transfer, or delete this resource under the pinned label/policy/capability state | Native MAC reference monitor | accepted-current `VerifiedMacAttestation` over `ResourceIntent` digest | Ledger, registrar, storage, namespace, PDS |
+| Payer has a valid entitlement and amount is reserved, posted, voided, or compensated in this issuer unit | Cell ledger | accepted-current `VerifiedLedgerAttestation`; immutable journal and receipt | MAC, registrar, PDS, storage |
 | Operation is in lifecycle state S | Resource registrar | durable saga row and immutable resolution record | MAC, ledger, namespace, PDS |
 | Resource/version V has canonical successor M | Resource registrar | predecessor/version CAS and fencing token | MAC, ledger, namespace, PDS |
 | Bytes reconstruct to content CID C | Resource store/CAS | seal result and content verification | registrar, ledger, PDS |
@@ -97,15 +97,16 @@ The ledger owns economics only. It binds the same intent digest, payer profile, 
 The registrar MUST verify:
 
 1. exact intent equality, not only caller-supplied digest equality;
-2. valid attester signatures and accepted-current signer authority;
+2. valid attester signatures and accepted-current signer authority under their respective MAC and ledger roots; raw candidates never reach finalization;
 3. MAC revalidation immediately before CAS;
 4. ledger phase `Posted` (or a resource/profile-specific zero-cost attestation explicitly represented by #1065), unit and amount bounds;
 5. content/manifest binding and label resolution;
 6. effective assurance = minimum of all verified legs and not below intent requirement;
 7. expected predecessor/version and per-resource fence;
-8. no terminal outcome already recorded for a different claim under this operation ID.
+8. no terminal outcome already recorded for a different claim under this operation ID;
+9. the verified MAC/ledger CIDs exactly equal the provenance CIDs named by the finalization statement.
 
-The Rust mirror makes the load-bearing equalities unrepresentable-to-violate rather than re-checkable: a canonical intent exists only after canonical decoding and digest verification, both attestations embed the digest only and join through a validating constructor that rejects crossed digests, unposted phase, and unit/amount mismatch, and `FinalizedResource` is constructible only by verifying a registrar-signed finalization statement against accepted-current registrar authority.
+The Rust mirror makes the load-bearing boundaries explicit: a canonical intent exists only after canonical decoding, predecessor-shape, and digest verification. `DualAttestation::verify_and_join` verifies each raw candidate under its own accepted-current authority, seals the CIDs and resolved roots into private verified evidence, rejects crossed claims/unposted or over-limit accounting, and calls an independence policy. The baseline policy rejects any shared root, signer, or signing key. Service or host co-location is not cryptographic independence: a shared compromise domain must be rejected by deployment policy or recorded as an accepted residual risk, never inferred safe from role labels. `FinalizedResource` compares and retains both verified CIDs, and only it can mint publication effects.
 
 ## 6. Registrar state and visibility
 
@@ -130,7 +131,7 @@ Terminal outcomes are explicit, never a generic "reconciled". A terminal outcome
 | `Compensated` | hidden; any provisional projection withdrawn | eligible for GC after evidence | posted charge corrected by an immutable compensating transfer |
 | `RejectedConflict` | hidden; never projected for the losing claim | losing provisional bytes eligible for GC | losing side's disposition recorded as a typed void/compensation transfer reference (`ConflictAccountingResolution`); winner named in the record |
 
-A `Resolution` that references an accounting effect — `Voided`, `Compensated`, or the losing side's disposition inside `RejectedConflict` — MUST be committed only after the referenced transfer is durably confirmed by the ledger; until then the operation remains nonterminal. The registration snapshot's state and resolution reference form one checked value: a terminal state requires exactly one matching resolution, and a nonterminal state forbids one — any other pair is rejected at construction (`RegistrationSnapshot::new`).
+A `Resolution` that references an accounting effect — `Voided`, `Compensated`, or the losing side's disposition inside `RejectedConflict` — MUST be committed only after the referenced transfer is durably confirmed by the ledger; until then the operation remains nonterminal. Every resolution carries the target operation, resource, and fence. The registration snapshot checks those equalities, requires exactly one matching resolution for terminal states, forbids one for nonterminal states, and requires a quarantine reason exactly for `Quarantined`/`ManualReview`.
 
 `Quarantined` and `ManualReview` are **nonterminal**: they permit investigation and authority-approved recovery, but commit no externally visible consequence until exactly one `Resolution` is committed. An identical retry or recovery query reads the snapshot's resolution reference and returns the recorded outcome; it never re-derives one.
 
@@ -158,8 +159,8 @@ The namespace projects finalized registrar state through a durable outbox, and p
 
 Finalization produces two distinct artifacts, and the boundary is normative:
 
-- The **private finalized record** (registrar output, `FinalizedResource` plus the stored attestation CIDs and recovery record) is authorized-party evidence only. It is constructible solely from a registrar-signed finalization statement verified against accepted-current registrar authority; namespace, storage, PDS, and recovery callers cannot fabricate it. Attestation CIDs resolve only inside access-gated evidence domains — a public or storage observer resolving one MUST NOT obtain attestation detail.
-- The **public namespace projection** (`PublicResourceProjection`) is the only input to publication. It carries exactly the stable resource ID, resource version, manifest CID, optional content CID, and an opaque public evidence commitment — commitments and minimum routing/verifiability data only. It never carries attestation CIDs or content, payer, issuer, unit, exact amount, transfer ID, capability root/binding, or signer-key coordinates.
+- The **private finalized record** (`FinalizedResource`, both verified attestation CIDs, and recovery record) is authorized-party evidence only. It is constructible solely from a registrar statement verified against accepted-current registrar authority *and* the supplied verified attestation CIDs; namespace, storage, PDS, and recovery callers cannot fabricate it.
+- The **public namespace projection** is minted only by `FinalizedResource` from a public-evidence commitment bound to that intent digest. Its fields and `ProjectionEffect` are private; `ResourcePublisher` accepts only registrar-minted effects. An effect carries optional typed entry identity, and a withdrawal names the exact resource/version/fence it withdraws. It never carries attestation CIDs, payer, issuer, unit, amount, transfer ID, capability root/binding, or signer-key coordinates.
 
 This separation is what makes the per-observer leakage model in `docs/security/resource-ownership-privacy-analysis.md` enforceable: exact amount/issuer/unit remain scoped to origin, issuer, and ledger, and a passive namespace/PDS/storage observer sees only the minimized projection.
 
@@ -206,7 +207,7 @@ Public manifests and namespace projections contain commitments and minimum routi
 
 Pairwise identities prevent trivial cross-cell joins, not traffic analysis. Fixed/coarse denominations, batching, delayed/fixed-cadence publication, aggregate reconciliation, encrypted details, and pseudonymous transport reduce linkage. V1 does not claim resistance to issuer-origin-ledger collusion or a global passive adversary.
 
-Commitment bytes are deliberately opaque here. Hash/Pedersen/BBS+/Privacy-Pass/nullifier constructions are not interchangeable and are not selected by this issue. Production anonymous finalization remains blocked on #1059–#1062 and independent cryptographic/privacy review; there is no classical or identified fallback.
+Commitment primitives remain selectable by #1065/#1059–#1062, but semantic uses are not interchangeable: owner, operation-capability, operation-entitlement, content-label, private-evidence, and public-evidence commitments are distinct types. Anonymous capability, entitlement, and public evidence are bound to the exact intent digest. Stable public `resource_id` still links versions/activity of one resource by design; this profile hides holders, not object-level activity. Production anonymous or committed finalization remains blocked on #1059–#1062 **and #1065**, plus independent cryptographic/privacy review; there is no classical or identified fallback.
 
 ## 10. Mutable 9P decisions
 

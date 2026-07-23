@@ -135,17 +135,94 @@ impl Did {
     }
 }
 
+/// A stable, private ownership commitment. It is deliberately not assignable
+/// to anonymous capability, entitlement, label, or public-evidence fields.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub struct Commitment(Vec<u8>);
+pub struct OwnerCommitment(Vec<u8>);
 
-impl Commitment {
-    /// The owning profile validates construction and bounds before conversion.
+impl OwnerCommitment {
+    /// #1065 validates the selected ownership-commitment construction.
     pub fn from_verified_bytes(bytes: Vec<u8>) -> Self {
         Self(bytes)
     }
+}
 
-    pub fn as_bytes(&self) -> &[u8] {
-        &self.0
+/// A blinded anonymous capability value bound to exactly one intent digest.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct OperationCapabilityCommitment {
+    intent_digest: IntentDigest,
+    bytes: Vec<u8>,
+}
+
+impl OperationCapabilityCommitment {
+    pub fn from_verified_bytes(intent_digest: IntentDigest, bytes: Vec<u8>) -> Self {
+        Self {
+            intent_digest,
+            bytes,
+        }
+    }
+
+    pub const fn intent_digest(&self) -> IntentDigest {
+        self.intent_digest
+    }
+}
+
+/// A one-use anonymous entitlement/nullifier bound to exactly one intent.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct OperationEntitlementCommitment {
+    intent_digest: IntentDigest,
+    bytes: Vec<u8>,
+}
+
+impl OperationEntitlementCommitment {
+    pub fn from_verified_bytes(intent_digest: IntentDigest, bytes: Vec<u8>) -> Self {
+        Self {
+            intent_digest,
+            bytes,
+        }
+    }
+
+    pub const fn intent_digest(&self) -> IntentDigest {
+        self.intent_digest
+    }
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct ContentLabelCommitment(Vec<u8>);
+
+impl ContentLabelCommitment {
+    pub fn from_verified_bytes(bytes: Vec<u8>) -> Self {
+        Self(bytes)
+    }
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct PrivateEvidenceCommitment(Vec<u8>);
+
+impl PrivateEvidenceCommitment {
+    pub fn from_verified_bytes(bytes: Vec<u8>) -> Self {
+        Self(bytes)
+    }
+}
+
+/// The only evidence commitment permitted in a public projection. Its digest
+/// binding prevents copying a holder/entitlement value across redemptions.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct PublicEvidenceCommitment {
+    intent_digest: IntentDigest,
+    bytes: Vec<u8>,
+}
+
+impl PublicEvidenceCommitment {
+    pub fn from_verified_bytes(intent_digest: IntentDigest, bytes: Vec<u8>) -> Self {
+        Self {
+            intent_digest,
+            bytes,
+        }
+    }
+
+    pub const fn intent_digest(&self) -> IntentDigest {
+        self.intent_digest
     }
 }
 
@@ -199,21 +276,21 @@ impl From<Assurance> for u8 {
 pub enum OwnershipRef {
     Identified(Did),
     Pairwise(Did),
-    Committed(Commitment),
+    Committed(OwnerCommitment),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ControllerRef {
     Identified(Did),
     Pairwise(Did),
-    AnonymousCapability(Commitment),
+    AnonymousCapability(OperationCapabilityCommitment),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PayerRef {
     Identified(Did),
     Pairwise(Did),
-    AnonymousEntitlement(Commitment),
+    AnonymousEntitlement(OperationEntitlementCommitment),
 }
 
 /// Closed operation vocabulary. Namespace link/rename/bind operations use
@@ -234,6 +311,14 @@ pub enum ResourceKind {
     Directory,
 }
 
+/// The canonical intent says whether sealing must yield a content CID. This
+/// makes an absent `content_cid` a checked state, rather than an off switch.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum ContentRequirement {
+    Required,
+    NotApplicable,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PredecessorRef {
     pub manifest_cid: Cid,
@@ -248,6 +333,10 @@ pub struct IntentClaims {
     pub operation: ResourceOperation,
     pub resource_kind: ResourceKind,
     pub expected_predecessor: Option<PredecessorRef>,
+    pub owner: OwnershipRef,
+    pub controller: ControllerRef,
+    pub payer: PayerRef,
+    pub content_requirement: ContentRequirement,
     pub unit: String,
     pub max_charge: u128,
 }
@@ -292,6 +381,11 @@ impl CanonicalResourceIntent {
         }
         let claims =
             validator.validate_and_decode(candidate.format_version, &candidate.canonical_bytes)?;
+        let predecessor_is_valid = matches!(claims.operation, ResourceOperation::Create)
+            == claims.expected_predecessor.is_none();
+        if !predecessor_is_valid {
+            return Err(ContractError::InvalidPredecessor);
+        }
         let digest = IntentDigest::compute(candidate.digest_suite, &candidate.canonical_bytes);
         if digest != candidate.claimed_digest {
             return Err(ContractError::DigestMismatch);
@@ -346,24 +440,24 @@ pub struct SignatureEnvelope {
     pub signature: Signature,
 }
 
-/// Anonymous profiles MUST use `AnonymousOperationCommitment`: a blinded,
-/// operation-scoped value that is not holder-stable or cross-operation-linkable.
+/// Anonymous profiles use a blinded, operation-scoped value that is not
+/// holder-stable or cross-operation-linkable.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CapabilityBinding {
     IdentifiedRoot(Cid),
-    AnonymousOperationCommitment(Commitment),
+    AnonymousOperationCommitment(OperationCapabilityCommitment),
 }
 
 /// Digest-only MAC statement; richer claim data is re-derived from canonical bytes.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct MacAttestation {
+pub struct MacAttestationCandidate {
     pub contract_version: ContractVersion,
     pub intent_digest: IntentDigest,
     pub policy_epoch: u64,
     pub state_epoch: u64,
     pub controller: ControllerRef,
     pub capability_binding: CapabilityBinding,
-    pub content_label_commitment: Commitment,
+    pub content_label_commitment: ContentLabelCommitment,
     pub assurance: Assurance,
     /// Unix seconds on the registrar's monotonic-clamped time basis.
     pub expires_at: u64,
@@ -382,7 +476,7 @@ pub enum LedgerPhase {
 /// Digest-only economic statement. This is private registrar/evidence material,
 /// never the ordinary namespace/public-PDS projection.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct LedgerAttestation {
+pub struct LedgerAttestationCandidate {
     pub contract_version: ContractVersion,
     pub intent_digest: IntentDigest,
     pub ledger_id: Did,
@@ -396,24 +490,143 @@ pub struct LedgerAttestation {
     pub envelope: SignatureEnvelope,
 }
 
-/// Joined attestations can only be constructed after all cross-authority claim
-/// and accounting-bound checks pass.
+/// An accepted-current authority root supplied by the authority-specific
+/// verifier. A DID or a `KeyPurpose` label is not an authority root.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AcceptedAuthority {
+    pub root: Cid,
+    pub signer: Did,
+    pub key_id: String,
+    pub key_epoch: u64,
+}
+
+/// Result material returned by a trusted attestation verifier. The verifier is
+/// the cryptographic/accepted-current boundary; this crate then seals it into
+/// a non-public verified evidence value.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VerifiedEvidence {
+    pub attestation_cid: Cid,
+    pub authority: AcceptedAuthority,
+}
+
+pub trait MacAttestationVerifier {
+    /// Verify the envelope and resolve it under the MAC accepted-current root.
+    fn verify_accepted_current(
+        &self,
+        intent: &CanonicalResourceIntent,
+        candidate: &MacAttestationCandidate,
+    ) -> Result<VerifiedEvidence, ContractError>;
+}
+
+pub trait LedgerAttestationVerifier {
+    /// Verify the envelope and resolve it under the ledger accepted-current root.
+    fn verify_accepted_current(
+        &self,
+        intent: &CanonicalResourceIntent,
+        candidate: &LedgerAttestationCandidate,
+    ) -> Result<VerifiedEvidence, ContractError>;
+}
+
+/// Deployment policy for the separation of the two signing authorities.
+/// Default deployments reject a shared accepted root, signer, or key. Service
+/// or host co-location is not itself evidence of independence: if it lets one
+/// compromise control both roots/keys, this policy must reject the deployment
+/// or the deployment has explicitly accepted that residual risk outside this
+/// contract.
+pub trait AttestationIndependencePolicy {
+    fn require_independence(
+        &self,
+        mac: &AcceptedAuthority,
+        ledger: &AcceptedAuthority,
+    ) -> Result<(), ContractError>;
+}
+
+/// The baseline policy used by the canonical profile: no shared authority
+/// root, signer DID, or signing key may satisfy both roles.
+pub struct RejectSharedAttester;
+
+impl AttestationIndependencePolicy for RejectSharedAttester {
+    fn require_independence(
+        &self,
+        mac: &AcceptedAuthority,
+        ledger: &AcceptedAuthority,
+    ) -> Result<(), ContractError> {
+        if mac.root == ledger.root
+            || mac.signer == ledger.signer
+            || (mac.key_id == ledger.key_id && mac.key_epoch == ledger.key_epoch)
+        {
+            return Err(ContractError::SharedAttester);
+        }
+        Ok(())
+    }
+}
+
+/// Verified evidence is minted only by `verify_and_join`; raw candidates do
+/// not satisfy the registrar interface.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VerifiedMacAttestation {
+    attestation: MacAttestationCandidate,
+    evidence: VerifiedEvidence,
+}
+
+impl VerifiedMacAttestation {
+    pub fn attestation(&self) -> &MacAttestationCandidate {
+        &self.attestation
+    }
+
+    pub fn attestation_cid(&self) -> &Cid {
+        &self.evidence.attestation_cid
+    }
+
+    pub fn authority(&self) -> &AcceptedAuthority {
+        &self.evidence.authority
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VerifiedLedgerAttestation {
+    attestation: LedgerAttestationCandidate,
+    evidence: VerifiedEvidence,
+}
+
+impl VerifiedLedgerAttestation {
+    pub fn attestation(&self) -> &LedgerAttestationCandidate {
+        &self.attestation
+    }
+
+    pub fn attestation_cid(&self) -> &Cid {
+        &self.evidence.attestation_cid
+    }
+
+    pub fn authority(&self) -> &AcceptedAuthority {
+        &self.evidence.authority
+    }
+}
+
+/// Joined attestations can only be constructed after both signatures have been
+/// verified under their own accepted-current roots, the roots pass deployment
+/// separation policy, and all cross-claim/accounting checks pass.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DualAttestation {
-    mac: MacAttestation,
-    ledger: LedgerAttestation,
+    mac: VerifiedMacAttestation,
+    ledger: VerifiedLedgerAttestation,
     effective_assurance: Assurance,
 }
 
 impl DualAttestation {
-    pub fn join(
+    pub fn verify_and_join(
         intent: &CanonicalResourceIntent,
-        mac: MacAttestation,
-        ledger: LedgerAttestation,
+        mac: MacAttestationCandidate,
+        ledger: LedgerAttestationCandidate,
+        mac_verifier: &dyn MacAttestationVerifier,
+        ledger_verifier: &dyn LedgerAttestationVerifier,
+        independence: &dyn AttestationIndependencePolicy,
     ) -> Result<Self, ContractError> {
         if mac.intent_digest != intent.digest()
             || ledger.intent_digest != intent.digest()
             || mac.intent_digest != ledger.intent_digest
+            || mac.controller != intent.claims().controller
+            || ledger.payer != intent.claims().payer
         {
             return Err(ContractError::IntentMismatch);
         }
@@ -431,10 +644,43 @@ impl DualAttestation {
         {
             return Err(ContractError::WrongKeyPurpose);
         }
+        if let ControllerRef::AnonymousCapability(binding) = &mac.controller {
+            if binding.intent_digest() != intent.digest() {
+                return Err(ContractError::IntentMismatch);
+            }
+        }
+        if let CapabilityBinding::AnonymousOperationCommitment(binding) = &mac.capability_binding {
+            if binding.intent_digest() != intent.digest() {
+                return Err(ContractError::IntentMismatch);
+            }
+        }
+        if let PayerRef::AnonymousEntitlement(binding) = &ledger.payer {
+            if binding.intent_digest() != intent.digest() {
+                return Err(ContractError::IntentMismatch);
+            }
+        }
+        let mac_evidence = mac_verifier.verify_accepted_current(intent, &mac)?;
+        let ledger_evidence = ledger_verifier.verify_accepted_current(intent, &ledger)?;
+        if mac_evidence.authority.signer != mac.envelope.signer
+            || mac_evidence.authority.key_id != mac.envelope.key_id
+            || mac_evidence.authority.key_epoch != mac.envelope.key_epoch
+            || ledger_evidence.authority.signer != ledger.envelope.signer
+            || ledger_evidence.authority.key_id != ledger.envelope.key_id
+            || ledger_evidence.authority.key_epoch != ledger.envelope.key_epoch
+        {
+            return Err(ContractError::InvalidAttestationEvidence);
+        }
+        independence.require_independence(&mac_evidence.authority, &ledger_evidence.authority)?;
         let effective_assurance = Assurance::minimum_all([mac.assurance, ledger.assurance]);
         Ok(Self {
-            mac,
-            ledger,
+            mac: VerifiedMacAttestation {
+                attestation: mac,
+                evidence: mac_evidence,
+            },
+            ledger: VerifiedLedgerAttestation {
+                attestation: ledger,
+                evidence: ledger_evidence,
+            },
             effective_assurance,
         })
     }
@@ -443,11 +689,11 @@ impl DualAttestation {
         self.effective_assurance
     }
 
-    pub fn mac(&self) -> &MacAttestation {
+    pub fn mac(&self) -> &VerifiedMacAttestation {
         &self.mac
     }
 
-    pub fn ledger(&self) -> &LedgerAttestation {
+    pub fn ledger(&self) -> &VerifiedLedgerAttestation {
         &self.ledger
     }
 }
@@ -478,12 +724,18 @@ pub struct FinalizationStatement {
     pub content_cid: Option<Cid>,
     pub mac_attestation_cid: Cid,
     pub ledger_attestation_cid: Cid,
-    pub private_evidence_commitment: Commitment,
+    pub private_evidence_commitment: PrivateEvidenceCommitment,
     pub envelope: SignatureEnvelope,
 }
 
 pub trait FinalizationProofVerifier {
-    fn verify(&self, statement: &FinalizationStatement) -> Result<(), ContractError>;
+    /// Verify the registrar statement under accepted-current registrar
+    /// authority, with the verified attestation provenance it names.
+    fn verify(
+        &self,
+        statement: &FinalizationStatement,
+        dual: &DualAttestation,
+    ) -> Result<(), ContractError>;
 }
 
 /// Verified registrar output. Private fields prevent fabrication by namespace,
@@ -502,7 +754,10 @@ pub struct FinalizedResource {
     fence: FencingToken,
     manifest_cid: Cid,
     content_cid: Option<Cid>,
-    private_evidence_commitment: Commitment,
+    intent_digest: IntentDigest,
+    mac_attestation_cid: Cid,
+    ledger_attestation_cid: Cid,
+    private_evidence_commitment: PrivateEvidenceCommitment,
 }
 
 impl FinalizedResource {
@@ -512,17 +767,29 @@ impl FinalizedResource {
         statement: &FinalizationStatement,
         verifier: &dyn FinalizationProofVerifier,
     ) -> Result<Self, ContractError> {
-        verifier.verify(statement)?;
+        verifier.verify(statement, dual)?;
         if statement.envelope.purpose != KeyPurpose::RegistrarFinalization {
             return Err(ContractError::WrongKeyPurpose);
         }
         if statement.intent_digest != intent.digest()
-            || dual.mac().intent_digest != statement.intent_digest
+            || dual.mac().attestation().intent_digest != statement.intent_digest
             || statement.operation_id != intent.claims().operation_id
             || statement.resource_id != intent.claims().resource_id
             || statement.fence.resource_id != statement.resource_id
         {
             return Err(ContractError::IntentMismatch);
+        }
+        if statement.mac_attestation_cid != *dual.mac().attestation_cid()
+            || statement.ledger_attestation_cid != *dual.ledger().attestation_cid()
+        {
+            return Err(ContractError::AttestationProvenanceMismatch);
+        }
+        if matches!(
+            intent.claims().content_requirement,
+            ContentRequirement::Required
+        ) && statement.content_cid.is_none()
+        {
+            return Err(ContractError::ContentRequired);
         }
         Ok(Self {
             operation_id: statement.operation_id,
@@ -531,6 +798,9 @@ impl FinalizedResource {
             fence: statement.fence,
             manifest_cid: statement.manifest_cid.clone(),
             content_cid: statement.content_cid.clone(),
+            intent_digest: statement.intent_digest,
+            mac_attestation_cid: statement.mac_attestation_cid.clone(),
+            ledger_attestation_cid: statement.ledger_attestation_cid.clone(),
             private_evidence_commitment: statement.private_evidence_commitment.clone(),
         })
     }
@@ -559,8 +829,73 @@ impl FinalizedResource {
         self.content_cid.as_ref()
     }
 
-    pub fn private_evidence_commitment(&self) -> &Commitment {
+    pub fn mac_attestation_cid(&self) -> &Cid {
+        &self.mac_attestation_cid
+    }
+
+    pub fn ledger_attestation_cid(&self) -> &Cid {
+        &self.ledger_attestation_cid
+    }
+
+    pub fn private_evidence_commitment(&self) -> &PrivateEvidenceCommitment {
         &self.private_evidence_commitment
+    }
+
+    /// Registrar-minted publication material. Callers cannot assemble a
+    /// projection directly, and the public evidence must belong to this exact
+    /// finalized intent.
+    pub fn public_projection(
+        &self,
+        public_evidence_commitment: PublicEvidenceCommitment,
+    ) -> Result<PublicResourceProjection, ContractError> {
+        if public_evidence_commitment.intent_digest() != self.intent_digest {
+            return Err(ContractError::IntentMismatch);
+        }
+        Ok(PublicResourceProjection {
+            resource_id: self.resource_id,
+            resource_version: self.resource_version,
+            manifest_cid: self.manifest_cid.clone(),
+            content_cid: self.content_cid.clone(),
+            public_evidence_commitment,
+        })
+    }
+
+    pub fn publish_effect(
+        &self,
+        entry: Option<ProjectionEntryId>,
+        projection: PublicResourceProjection,
+    ) -> Result<ProjectionEffect, ContractError> {
+        if projection.resource_id != self.resource_id
+            || projection.resource_version != self.resource_version
+        {
+            return Err(ContractError::InvalidProjection);
+        }
+        Ok(ProjectionEffect {
+            operation_id: self.operation_id,
+            resource_id: self.resource_id,
+            resource_version: self.resource_version,
+            fence: self.fence,
+            entry,
+            action: ProjectionAction::Publish(projection),
+        })
+    }
+
+    pub fn withdraw_effect(
+        &self,
+        entry: Option<ProjectionEntryId>,
+        target: WithdrawalTarget,
+    ) -> Result<ProjectionEffect, ContractError> {
+        if target.resource_id != self.resource_id || target.fence.resource_id != self.resource_id {
+            return Err(ContractError::InvalidProjection);
+        }
+        Ok(ProjectionEffect {
+            operation_id: self.operation_id,
+            resource_id: self.resource_id,
+            resource_version: self.resource_version,
+            fence: self.fence,
+            entry,
+            action: ProjectionAction::Withdraw(target),
+        })
     }
 }
 
@@ -569,28 +904,88 @@ impl FinalizedResource {
 /// or signing-key coordinates.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PublicResourceProjection {
+    resource_id: ResourceId,
+    resource_version: u64,
+    manifest_cid: Cid,
+    content_cid: Option<Cid>,
+    public_evidence_commitment: PublicEvidenceCommitment,
+}
+
+impl PublicResourceProjection {
+    pub const fn resource_id(&self) -> ResourceId {
+        self.resource_id
+    }
+
+    pub const fn resource_version(&self) -> u64 {
+        self.resource_version
+    }
+
+    pub fn manifest_cid(&self) -> &Cid {
+        &self.manifest_cid
+    }
+
+    pub fn content_cid(&self) -> Option<&Cid> {
+        self.content_cid.as_ref()
+    }
+
+    pub fn public_evidence_commitment(&self) -> &PublicEvidenceCommitment {
+        &self.public_evidence_commitment
+    }
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct ProjectionEntryId(Vec<u8>);
+
+impl ProjectionEntryId {
+    pub fn from_validated_bytes(bytes: Vec<u8>) -> Self {
+        Self(bytes)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WithdrawalTarget {
     pub resource_id: ResourceId,
     pub resource_version: u64,
-    pub manifest_cid: Cid,
-    pub content_cid: Option<Cid>,
-    pub public_evidence_commitment: Commitment,
+    pub fence: FencingToken,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ProjectionAction {
     Publish(PublicResourceProjection),
-    Withdraw,
+    Withdraw(WithdrawalTarget),
 }
 
 /// Ordered desired-state effect. Publishers compare `(registrar_term,
 /// generation, resource_version)` and reject stale or conflicting effects.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProjectionEffect {
-    pub operation_id: OperationId,
-    pub resource_id: ResourceId,
-    pub resource_version: u64,
-    pub fence: FencingToken,
-    pub action: ProjectionAction,
+    operation_id: OperationId,
+    resource_id: ResourceId,
+    resource_version: u64,
+    fence: FencingToken,
+    entry: Option<ProjectionEntryId>,
+    action: ProjectionAction,
+}
+
+impl ProjectionEffect {
+    pub const fn operation_id(&self) -> OperationId {
+        self.operation_id
+    }
+    pub const fn resource_id(&self) -> ResourceId {
+        self.resource_id
+    }
+    pub const fn resource_version(&self) -> u64 {
+        self.resource_version
+    }
+    pub const fn fence(&self) -> FencingToken {
+        self.fence
+    }
+    pub fn entry(&self) -> Option<&ProjectionEntryId> {
+        self.entry.as_ref()
+    }
+    pub const fn action(&self) -> &ProjectionAction {
+        &self.action
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -660,21 +1055,45 @@ pub enum ConflictAccountingResolution {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Resolution {
     Finalized {
-        operation_id: OperationId,
+        target: ResolutionTarget,
         resource_version: u64,
         manifest_cid: Cid,
     },
     Voided {
+        target: ResolutionTarget,
         void_transfer_id: TransferId,
     },
     Compensated {
+        target: ResolutionTarget,
         compensation_transfer_id: TransferId,
     },
     RejectedConflict {
+        target: ResolutionTarget,
         winning_operation_id: OperationId,
         winning_version: u64,
         losing_accounting: ConflictAccountingResolution,
     },
+}
+
+/// Immutable identity of the operation whose terminal outcome is recorded.
+/// Every resolution variant carries it; no terminal accounting outcome can be
+/// attached to a different operation/resource/fence.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct ResolutionTarget {
+    pub operation_id: OperationId,
+    pub resource_id: ResourceId,
+    pub fence: FencingToken,
+}
+
+impl Resolution {
+    pub const fn target(&self) -> ResolutionTarget {
+        match self {
+            Self::Finalized { target, .. }
+            | Self::Voided { target, .. }
+            | Self::Compensated { target, .. }
+            | Self::RejectedConflict { target, .. } => *target,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -713,10 +1132,20 @@ impl RegistrationSnapshot {
         resolution: Option<ResolutionRef>,
     ) -> Result<Self, ContractError> {
         let consistent = match &resolution {
-            Some(reference) => state.is_terminal() && state.matches_resolution(&reference.outcome),
+            Some(reference) => {
+                state.is_terminal()
+                    && state.matches_resolution(&reference.outcome)
+                    && reference.outcome.target().operation_id == operation_id
+                    && reference.outcome.target().resource_id == fencing_token.resource_id
+                    && reference.outcome.target().fence == fencing_token
+            }
             None => !state.is_terminal(),
         };
-        if !consistent {
+        let quarantine_is_consistent = matches!(
+            state,
+            RegistrarState::Quarantined | RegistrarState::ManualReview
+        ) == quarantine_reason.is_some();
+        if !consistent || !quarantine_is_consistent {
             return Err(ContractError::InconsistentResolution);
         }
         Ok(Self {
@@ -783,6 +1212,12 @@ pub enum ContractError {
     LedgerNotPosted,
     ChargeMismatch,
     WrongKeyPurpose,
+    InvalidAttestationEvidence,
+    SharedAttester,
+    AttestationProvenanceMismatch,
+    InvalidPredecessor,
+    ContentRequired,
+    InvalidProjection,
     InvalidFinalizationProof,
     StaleProjection,
     InconsistentResolution,
@@ -797,11 +1232,14 @@ impl fmt::Display for ContractError {
 impl std::error::Error for ContractError {}
 
 pub trait MacAuthority {
-    fn attest(&self, intent: &CanonicalResourceIntent) -> Result<MacAttestation, AuthorityError>;
+    fn attest(
+        &self,
+        intent: &CanonicalResourceIntent,
+    ) -> Result<MacAttestationCandidate, AuthorityError>;
     fn revalidate(
         &self,
         intent: &CanonicalResourceIntent,
-        attestation: &MacAttestation,
+        attestation: &MacAttestationCandidate,
     ) -> Result<(), AuthorityError>;
 }
 
@@ -809,29 +1247,29 @@ pub trait EconomicAuthority {
     fn reserve(
         &self,
         intent: &CanonicalResourceIntent,
-    ) -> Result<LedgerAttestation, AuthorityError>;
+    ) -> Result<LedgerAttestationCandidate, AuthorityError>;
 
     /// MUST require a `Reserved` input, enforce `actual_amount <= reserved`,
     /// and preserve the deterministic transfer lineage from operation ID.
     fn post(
         &self,
         intent: &CanonicalResourceIntent,
-        reservation: &LedgerAttestation,
+        reservation: &LedgerAttestationCandidate,
         actual_amount: u128,
-    ) -> Result<LedgerAttestation, AuthorityError>;
+    ) -> Result<LedgerAttestationCandidate, AuthorityError>;
 
     fn void(
         &self,
         intent: &CanonicalResourceIntent,
-        reservation: &LedgerAttestation,
-    ) -> Result<LedgerAttestation, AuthorityError>;
+        reservation: &LedgerAttestationCandidate,
+    ) -> Result<LedgerAttestationCandidate, AuthorityError>;
 
     /// MUST require a `Posted` input and create a new immutable correction.
     fn compensate(
         &self,
         intent: &CanonicalResourceIntent,
-        posted: &LedgerAttestation,
-    ) -> Result<LedgerAttestation, AuthorityError>;
+        posted: &LedgerAttestationCandidate,
+    ) -> Result<LedgerAttestationCandidate, AuthorityError>;
 }
 
 pub trait ResourceMaterializer {

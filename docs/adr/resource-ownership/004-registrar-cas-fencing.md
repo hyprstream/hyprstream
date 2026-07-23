@@ -4,7 +4,7 @@
 
 ## Decision
 
-The registrar is the only lifecycle writer. Every transition supplies the expected predecessor manifest/version. Finalization performs compare-and-swap and increments a registrar-allocated, per-resource monotonic fencing generation within a registrar term; the term is itself monotonically increasing, allocated anew on each leadership/authority epoch, so a deposed primary's fence is distinguishable from — and strictly older than — the current primary's. A stale fence or predecessor loses even if both attestations are otherwise valid. The fence is threaded to the effectors: materialization staging/sealing and namespace publish/withdraw carry the fencing token, and effectors MUST reject effects whose `(term, generation)` is stale relative to the newest durably applied state.
+The registrar is the only lifecycle writer. Every transition supplies the expected predecessor manifest/version. Finalization performs compare-and-swap and increments a registrar-allocated, per-resource monotonic fencing generation within a registrar term; the term is itself monotonically increasing, allocated anew on each leadership/authority epoch, so a deposed primary's fence is distinguishable from — and strictly older than — the current primary's. A stale fence or predecessor loses even if both attestations are otherwise valid. The fence is threaded to the effectors: materialization staging/sealing and namespace publish/withdraw carry the fencing token, resource version, and optional entry identity. Effectors durably compare the full `(term, generation, resource_version)` tuple, return an exact duplicate's recorded outcome, and reject every non-strictly-newer or equal-fence/different-version effect.
 
 ## Consequences
 

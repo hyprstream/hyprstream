@@ -1,15 +1,17 @@
-//! Contract tests: validating constructors and negative controls.
-//! Panics are idiomatic in test bodies.
+//! Contract tests: every load-bearing validating constructor has a negative
+//! control. These fixtures deliberately use distinct MAC and ledger roots.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use hyprstream_resource::{
-    Assurance, CanonicalResourceIntent, Cid, Commitment, ConflictAccountingResolution,
-    ContractError, ContractVersion, ControllerRef, Did, DigestSuite, DualAttestation,
-    FinalizationProofVerifier, FinalizationStatement, IntentCandidate, IntentClaims, IntentDigest,
-    IntentFormatVersion, IntentValidator, KeyPurpose, LedgerAttestation, LedgerPhase,
-    MacAttestation, OperationId, PayerRef, RegistrarState, RegistrationSnapshot, Resolution,
-    ResolutionRef, ResourceId, ResourceKind, ResourceOperation, Signature, SignatureEnvelope,
-    SignatureSuite, TransferId,
+    AcceptedAuthority, Assurance, CanonicalResourceIntent, Cid, ContentLabelCommitment,
+    ContentRequirement, ContractError, ContractVersion, ControllerRef, Did, DigestSuite,
+    DualAttestation, FinalizationProofVerifier, FinalizationStatement, IntentCandidate,
+    IntentClaims, IntentDigest, IntentFormatVersion, IntentValidator, KeyPurpose,
+    LedgerAttestationCandidate, LedgerAttestationVerifier, LedgerPhase, MacAttestationCandidate,
+    MacAttestationVerifier, OperationId, OwnerCommitment, PayerRef, PrivateEvidenceCommitment,
+    PublicEvidenceCommitment, RegistrarState, RegistrationSnapshot, RejectSharedAttester,
+    Resolution, ResolutionRef, ResolutionTarget, ResourceId, ResourceKind, ResourceOperation,
+    Signature, SignatureEnvelope, SignatureSuite, TransferId, VerifiedEvidence,
 };
 
 struct TestCodec;
@@ -29,6 +31,12 @@ impl IntentValidator for TestCodec {
             operation: ResourceOperation::Create,
             resource_kind: ResourceKind::ImmutableBlob,
             expected_predecessor: None,
+            owner: hyprstream_resource::OwnershipRef::Committed(
+                OwnerCommitment::from_verified_bytes(vec![1]),
+            ),
+            controller: ControllerRef::Identified(did("did:key:controller")),
+            payer: PayerRef::Identified(did("did:key:payer")),
+            content_requirement: ContentRequirement::Required,
             unit: "storage.bytes".into(),
             max_charge: 100,
         })
@@ -54,12 +62,12 @@ fn did(value: &str) -> Did {
     Did::from_validated_string(value.into())
 }
 
-fn envelope(purpose: KeyPurpose) -> SignatureEnvelope {
+fn envelope(purpose: KeyPurpose, signer: &str, key_id: &str) -> SignatureEnvelope {
     SignatureEnvelope {
         contract_version: ContractVersion::V1,
         suite: SignatureSuite::CompositeEd25519MlDsa65V1,
-        signer: did("did:key:signer"),
-        key_id: "#resource-v1".into(),
+        signer: did(signer),
+        key_id: key_id.into(),
         key_epoch: 3,
         purpose,
         signed_domain: "hs-test-v1".into(),
@@ -67,9 +75,9 @@ fn envelope(purpose: KeyPurpose) -> SignatureEnvelope {
     }
 }
 
-fn attestations(digest: IntentDigest) -> (MacAttestation, LedgerAttestation) {
+fn attestations(digest: IntentDigest) -> (MacAttestationCandidate, LedgerAttestationCandidate) {
     (
-        MacAttestation {
+        MacAttestationCandidate {
             contract_version: ContractVersion::V1,
             intent_digest: digest,
             policy_epoch: 7,
@@ -78,12 +86,12 @@ fn attestations(digest: IntentDigest) -> (MacAttestation, LedgerAttestation) {
             capability_binding: hyprstream_resource::CapabilityBinding::IdentifiedRoot(
                 Cid::from_validated_bytes(vec![4]),
             ),
-            content_label_commitment: Commitment::from_verified_bytes(vec![5]),
+            content_label_commitment: ContentLabelCommitment::from_verified_bytes(vec![5]),
             assurance: Assurance::PqHybrid,
             expires_at: 100,
-            envelope: envelope(KeyPurpose::MacResourceAttestation),
+            envelope: envelope(KeyPurpose::MacResourceAttestation, "did:key:mac", "#mac-v1"),
         },
-        LedgerAttestation {
+        LedgerAttestationCandidate {
             contract_version: ContractVersion::V1,
             intent_digest: digest,
             ledger_id: did("did:key:ledger"),
@@ -94,26 +102,87 @@ fn attestations(digest: IntentDigest) -> (MacAttestation, LedgerAttestation) {
             transfer_id: TransferId::from_bytes([6; 16]),
             phase: LedgerPhase::Posted,
             assurance: Assurance::Classical,
-            envelope: envelope(KeyPurpose::LedgerResourceAttestation),
+            envelope: envelope(
+                KeyPurpose::LedgerResourceAttestation,
+                "did:key:ledger-signer",
+                "#ledger-v1",
+            ),
         },
     )
+}
+
+struct TestMacVerifier;
+struct TestLedgerVerifier;
+struct MismatchedMacVerifier;
+
+fn verified(candidate: &SignatureEnvelope, cid: u8, root: u8) -> VerifiedEvidence {
+    VerifiedEvidence {
+        attestation_cid: Cid::from_validated_bytes(vec![cid]),
+        authority: AcceptedAuthority {
+            root: Cid::from_validated_bytes(vec![root]),
+            signer: candidate.signer.clone(),
+            key_id: candidate.key_id.clone(),
+            key_epoch: candidate.key_epoch,
+        },
+    }
+}
+
+impl MacAttestationVerifier for TestMacVerifier {
+    fn verify_accepted_current(
+        &self,
+        _intent: &CanonicalResourceIntent,
+        candidate: &MacAttestationCandidate,
+    ) -> Result<VerifiedEvidence, ContractError> {
+        Ok(verified(&candidate.envelope, 30, 31))
+    }
+}
+
+impl MacAttestationVerifier for MismatchedMacVerifier {
+    fn verify_accepted_current(
+        &self,
+        _intent: &CanonicalResourceIntent,
+        candidate: &MacAttestationCandidate,
+    ) -> Result<VerifiedEvidence, ContractError> {
+        let mut evidence = verified(&candidate.envelope, 30, 31);
+        evidence.authority.signer = did("did:key:not-the-envelope-signer");
+        Ok(evidence)
+    }
+}
+
+impl LedgerAttestationVerifier for TestLedgerVerifier {
+    fn verify_accepted_current(
+        &self,
+        _intent: &CanonicalResourceIntent,
+        candidate: &LedgerAttestationCandidate,
+    ) -> Result<VerifiedEvidence, ContractError> {
+        Ok(verified(&candidate.envelope, 40, 41))
+    }
+}
+
+fn dual(intent: &CanonicalResourceIntent) -> DualAttestation {
+    let (mac, ledger) = attestations(intent.digest());
+    DualAttestation::verify_and_join(
+        intent,
+        mac,
+        ledger,
+        &TestMacVerifier,
+        &TestLedgerVerifier,
+        &RejectSharedAttester,
+    )
+    .unwrap()
 }
 
 #[test]
 fn assurance_is_clamped_to_the_weakest_leg() {
     assert_eq!(
-        Assurance::minimum_all([
-            Assurance::PqHybrid,
-            Assurance::Classical,
-            Assurance::PqHybrid,
-        ]),
+        Assurance::minimum_all([Assurance::PqHybrid, Assurance::Classical]),
         Assurance::Classical
     );
     assert_eq!(Assurance::minimum_all([]), Assurance::Unverified);
 }
 
 #[test]
-fn mismatched_digest_and_bytes_are_rejected() {
+fn canonical_intent_rejects_mismatched_digest_and_missing_predecessor() {
     let err = CanonicalResourceIntent::validate(
         IntentCandidate {
             contract_version: ContractVersion::V1,
@@ -126,40 +195,140 @@ fn mismatched_digest_and_bytes_are_rejected() {
     )
     .unwrap_err();
     assert_eq!(err, ContractError::DigestMismatch);
+
+    struct MissingPredecessor;
+    impl IntentValidator for MissingPredecessor {
+        fn validate_and_decode(
+            &self,
+            _: IntentFormatVersion,
+            _: &[u8],
+        ) -> Result<IntentClaims, ContractError> {
+            let mut claims =
+                TestCodec.validate_and_decode(IntentFormatVersion::V1, b"canonical-intent-v1")?;
+            claims.operation = ResourceOperation::Mutate;
+            Ok(claims)
+        }
+    }
+    let bytes = b"canonical-intent-v1".to_vec();
+    assert_eq!(
+        CanonicalResourceIntent::validate(
+            IntentCandidate {
+                contract_version: ContractVersion::V1,
+                format_version: IntentFormatVersion::V1,
+                digest_suite: DigestSuite::Blake3_256,
+                claimed_digest: IntentDigest::compute(DigestSuite::Blake3_256, &bytes),
+                canonical_bytes: bytes
+            },
+            &MissingPredecessor,
+        )
+        .unwrap_err(),
+        ContractError::InvalidPredecessor,
+    );
 }
 
 #[test]
-fn dual_attestation_rejects_crossed_claim_and_unposted_ledger() {
+fn verified_dual_rejects_unposted_overcharge_wrong_purpose_and_shared_attester() {
     let intent = intent();
-    let (mac, mut ledger) = attestations(intent.digest());
-    ledger.intent_digest = IntentDigest::from_bytes([9; 32]);
-    assert_eq!(
-        DualAttestation::join(&intent, mac, ledger).unwrap_err(),
-        ContractError::IntentMismatch
-    );
-
     let (mac, mut ledger) = attestations(intent.digest());
     ledger.phase = LedgerPhase::Reserved;
     assert_eq!(
-        DualAttestation::join(&intent, mac, ledger).unwrap_err(),
+        DualAttestation::verify_and_join(
+            &intent,
+            mac,
+            ledger,
+            &TestMacVerifier,
+            &TestLedgerVerifier,
+            &RejectSharedAttester
+        )
+        .unwrap_err(),
         ContractError::LedgerNotPosted
+    );
+
+    let (mac, mut ledger) = attestations(intent.digest());
+    ledger.amount = 101;
+    assert_eq!(
+        DualAttestation::verify_and_join(
+            &intent,
+            mac,
+            ledger,
+            &TestMacVerifier,
+            &TestLedgerVerifier,
+            &RejectSharedAttester
+        )
+        .unwrap_err(),
+        ContractError::ChargeMismatch
+    );
+
+    let (mut mac, ledger) = attestations(intent.digest());
+    mac.controller = ControllerRef::Identified(did("did:key:substituted-controller"));
+    assert_eq!(
+        DualAttestation::verify_and_join(
+            &intent,
+            mac,
+            ledger,
+            &TestMacVerifier,
+            &TestLedgerVerifier,
+            &RejectSharedAttester,
+        )
+        .unwrap_err(),
+        ContractError::IntentMismatch
+    );
+
+    let (mut mac, ledger) = attestations(intent.digest());
+    mac.envelope.purpose = KeyPurpose::RegistrarFinalization;
+    assert_eq!(
+        DualAttestation::verify_and_join(
+            &intent,
+            mac,
+            ledger,
+            &TestMacVerifier,
+            &TestLedgerVerifier,
+            &RejectSharedAttester
+        )
+        .unwrap_err(),
+        ContractError::WrongKeyPurpose
+    );
+
+    let (mac, mut ledger) = attestations(intent.digest());
+    ledger.envelope.signer = mac.envelope.signer.clone();
+    ledger.envelope.key_id = mac.envelope.key_id.clone();
+    assert_eq!(
+        DualAttestation::verify_and_join(
+            &intent,
+            mac,
+            ledger,
+            &TestMacVerifier,
+            &TestLedgerVerifier,
+            &RejectSharedAttester
+        )
+        .unwrap_err(),
+        ContractError::SharedAttester
+    );
+
+    let (mac, ledger) = attestations(intent.digest());
+    assert_eq!(
+        DualAttestation::verify_and_join(
+            &intent,
+            mac,
+            ledger,
+            &MismatchedMacVerifier,
+            &TestLedgerVerifier,
+            &RejectSharedAttester,
+        )
+        .unwrap_err(),
+        ContractError::InvalidAttestationEvidence
     );
 }
 
-struct RejectProof;
-
-impl FinalizationProofVerifier for RejectProof {
-    fn verify(&self, _statement: &FinalizationStatement) -> Result<(), ContractError> {
-        Err(ContractError::InvalidFinalizationProof)
+struct AcceptProof;
+impl FinalizationProofVerifier for AcceptProof {
+    fn verify(&self, _: &FinalizationStatement, _: &DualAttestation) -> Result<(), ContractError> {
+        Ok(())
     }
 }
 
-#[test]
-fn forged_finalization_proof_is_rejected() {
-    let intent = intent();
-    let (mac, ledger) = attestations(intent.digest());
-    let dual = DualAttestation::join(&intent, mac, ledger).unwrap();
-    let statement = FinalizationStatement {
+fn statement(intent: &CanonicalResourceIntent, dual: &DualAttestation) -> FinalizationStatement {
+    FinalizationStatement {
         contract_version: ContractVersion::V1,
         operation_id: intent.claims().operation_id,
         resource_id: intent.claims().resource_id,
@@ -172,105 +341,149 @@ fn forged_finalization_proof_is_rejected() {
         },
         manifest_cid: Cid::from_validated_bytes(vec![1]),
         content_cid: Some(Cid::from_validated_bytes(vec![2])),
-        mac_attestation_cid: Cid::from_validated_bytes(vec![3]),
-        ledger_attestation_cid: Cid::from_validated_bytes(vec![4]),
-        private_evidence_commitment: Commitment::from_verified_bytes(vec![5]),
-        envelope: envelope(KeyPurpose::RegistrarFinalization),
-    };
+        mac_attestation_cid: dual.mac().attestation_cid().clone(),
+        ledger_attestation_cid: dual.ledger().attestation_cid().clone(),
+        private_evidence_commitment: PrivateEvidenceCommitment::from_verified_bytes(vec![5]),
+        envelope: envelope(
+            KeyPurpose::RegistrarFinalization,
+            "did:key:registrar",
+            "#registrar-v1",
+        ),
+    }
+}
 
+#[test]
+fn finalization_binds_verified_evidence_claims_and_required_content() {
+    let intent = intent();
+    let dual = dual(&intent);
+    let statement = statement(&intent, &dual);
+    let finalized =
+        hyprstream_resource::FinalizedResource::verify(&intent, &dual, &statement, &AcceptProof)
+            .unwrap();
     assert_eq!(
-        hyprstream_resource::FinalizedResource::verify(&intent, &dual, &statement, &RejectProof)
+        finalized.mac_attestation_cid(),
+        dual.mac().attestation_cid()
+    );
+
+    let mut provenance = statement.clone();
+    provenance.mac_attestation_cid = Cid::from_validated_bytes(vec![99]);
+    assert_eq!(
+        hyprstream_resource::FinalizedResource::verify(&intent, &dual, &provenance, &AcceptProof)
             .unwrap_err(),
-        ContractError::InvalidFinalizationProof
+        ContractError::AttestationProvenanceMismatch
+    );
+
+    let mut wrong_purpose = statement.clone();
+    wrong_purpose.envelope.purpose = KeyPurpose::MacResourceAttestation;
+    assert_eq!(
+        hyprstream_resource::FinalizedResource::verify(
+            &intent,
+            &dual,
+            &wrong_purpose,
+            &AcceptProof
+        )
+        .unwrap_err(),
+        ContractError::WrongKeyPurpose
+    );
+
+    let mut no_content = statement;
+    no_content.content_cid = None;
+    assert_eq!(
+        hyprstream_resource::FinalizedResource::verify(&intent, &dual, &no_content, &AcceptProof)
+            .unwrap_err(),
+        ContractError::ContentRequired
     );
 }
 
 #[test]
-fn registration_snapshot_enforces_state_resolution_invariant() {
+fn public_projection_is_minted_from_finalization_and_intent_scoped() {
+    let intent = intent();
+    let dual = dual(&intent);
+    let finalized = hyprstream_resource::FinalizedResource::verify(
+        &intent,
+        &dual,
+        &statement(&intent, &dual),
+        &AcceptProof,
+    )
+    .unwrap();
+    let projection = finalized
+        .public_projection(PublicEvidenceCommitment::from_verified_bytes(
+            intent.digest(),
+            vec![7],
+        ))
+        .unwrap();
+    finalized.publish_effect(None, projection).unwrap();
+    assert_eq!(
+        finalized
+            .public_projection(PublicEvidenceCommitment::from_verified_bytes(
+                IntentDigest::from_bytes([8; 32]),
+                vec![7]
+            ))
+            .unwrap_err(),
+        ContractError::IntentMismatch
+    );
+}
+
+#[test]
+fn registration_snapshot_binds_every_resolution_to_its_operation_and_requires_quarantine_reason() {
     let operation_id = OperationId::from_bytes([2; 16]);
-    let intent_digest = IntentDigest::from_bytes([7; 32]);
     let fence = hyprstream_resource::FencingToken {
         resource_id: ResourceId::from_bytes([1; 16]),
         registrar_term: 1,
         generation: 1,
     };
-    let resolution = |outcome: Resolution| {
-        Some(ResolutionRef {
-            record_cid: Cid::from_validated_bytes(vec![8]),
-            outcome,
-        })
-    };
-    let conflict = Resolution::RejectedConflict {
-        winning_operation_id: OperationId::from_bytes([3; 16]),
-        winning_version: 2,
-        losing_accounting: ConflictAccountingResolution::Compensated {
-            compensation_transfer_id: TransferId::from_bytes([9; 16]),
-        },
-    };
-
-    // Terminal state with exactly one matching resolution: accepted.
-    let snapshot = RegistrationSnapshot::new(
+    let target = ResolutionTarget {
         operation_id,
-        intent_digest,
-        RegistrarState::RejectedConflict,
+        resource_id: fence.resource_id,
         fence,
-        None,
-        resolution(conflict.clone()),
-    )
-    .unwrap();
-    assert_eq!(snapshot.state(), RegistrarState::RejectedConflict);
-    assert_eq!(snapshot.resolution().map(|r| &r.outcome), Some(&conflict));
-
-    // Nonterminal state without a resolution: accepted.
+    };
+    let resolution = Some(ResolutionRef {
+        record_cid: Cid::from_validated_bytes(vec![8]),
+        outcome: Resolution::Voided {
+            target,
+            void_transfer_id: TransferId::from_bytes([9; 16]),
+        },
+    });
     RegistrationSnapshot::new(
         operation_id,
-        intent_digest,
-        RegistrarState::Quarantined,
+        IntentDigest::from_bytes([7; 32]),
+        RegistrarState::Voided,
         fence,
-        Some(hyprstream_resource::QuarantineReason::FinalizationConflict),
         None,
+        resolution,
     )
     .unwrap();
 
-    // Terminal state without a resolution: rejected.
+    let wrong = ResolutionTarget {
+        operation_id: OperationId::from_bytes([3; 16]),
+        ..target
+    };
     assert_eq!(
         RegistrationSnapshot::new(
             operation_id,
-            intent_digest,
-            RegistrarState::Finalized,
+            IntentDigest::from_bytes([7; 32]),
+            RegistrarState::Voided,
             fence,
             None,
-            None,
+            Some(ResolutionRef {
+                record_cid: Cid::from_validated_bytes(vec![8]),
+                outcome: Resolution::Voided {
+                    target: wrong,
+                    void_transfer_id: TransferId::from_bytes([9; 16])
+                }
+            })
         )
         .unwrap_err(),
         ContractError::InconsistentResolution
     );
-
-    // Nonterminal state carrying a resolution: rejected.
     assert_eq!(
         RegistrationSnapshot::new(
             operation_id,
-            intent_digest,
-            RegistrarState::ManualReview,
+            IntentDigest::from_bytes([7; 32]),
+            RegistrarState::Quarantined,
             fence,
             None,
-            resolution(conflict),
-        )
-        .unwrap_err(),
-        ContractError::InconsistentResolution
-    );
-
-    // Terminal state with a mismatched resolution variant: rejected.
-    assert_eq!(
-        RegistrationSnapshot::new(
-            operation_id,
-            intent_digest,
-            RegistrarState::RejectedConflict,
-            fence,
-            None,
-            resolution(Resolution::Voided {
-                void_transfer_id: TransferId::from_bytes([9; 16]),
-            }),
+            None
         )
         .unwrap_err(),
         ContractError::InconsistentResolution
