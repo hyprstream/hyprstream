@@ -4,21 +4,33 @@
 //! deployment material. Network responses are never authority by themselves:
 //! the fetched capsule must pass the canon -> hash -> signature GATE for the
 //! configured `did:at9p`, and the fetched `did:web` document must reciprocally
-//! name that exact identity before the pair is trusted. The deployment CA and
-//! Discovery reach come exclusively from the GATE-verified capsule; document
-//! keys and services remain advisory.
+//! name that exact identity before the pair is trusted.
+//!
+//! # Trust material comes from the GATE-verified capsule, not the document (#1157 / option C)
+//!
+//! The deployment CA key and the discovery reach are taken from the
+//! **GATE-verified `did:at9p` capsule** (`body.subject_keys` / `body.services`),
+//! never from the classical `did:web` document. This is what ratified #905 §8
+//! requires — *"everything authoritative is created at the GATE (capsule
+//! content) ... addresses select; verification asserts"*. The `did:web`
+//! document is used **only** for the #905 §2 leg-2 reciprocal identifier vouch
+//! (its `alsoKnownAs` must name the configured `did:at9p`) and, otherwise, as an
+//! advisory discovery/rotation hint. An adversary who controls the `did:web`
+//! origin can no longer substitute the CA or reach: both are content-bound to
+//! the hash-pinned capsule (Erica's decision, issue #1157, 2026-07-22).
 
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use ed25519_dalek::VerifyingKey;
+use hyprstream_crypto::pq::{MlDsaVerifyingKey, ml_dsa_vk_from_bytes};
 use hyprstream_pds::at9p::{ServiceType, Transport as At9pTransport};
 use hyprstream_pds::at9p_alias::AuthoritativeIdentity;
 use hyprstream_pds::at9p_gate::VerifiedCapsule;
 use hyprstream_rpc::auth::mac::Assurance;
-use hyprstream_rpc::did_web::{did_web_to_url, DidWebResolver, HttpDidDocFetcher};
+use hyprstream_rpc::did_web::{DidWebResolver, HttpDidDocFetcher, did_web_to_url};
 use hyprstream_rpc::identity::Did;
 use hyprstream_rpc::transport::{EndpointType, TransportConfig};
 use serde_json::Value;
@@ -27,6 +39,10 @@ use crate::at9p_alias::At9pAliasResolver;
 use crate::at9p_resolver::CapsuleSource;
 
 const MAX_CAPSULE_BYTES: usize = 4 * 1024 * 1024;
+
+/// The at9p service selector whose typed reach is installed as the deployment
+/// Discovery transport. `#ns` is the canonical `NinePExport` entry (mirrors
+/// [`crate::at9p_resolver::DEFAULT_AT9P_SERVICE`]).
 const DEPLOYMENT_REACH_SERVICE: &str = "#ns";
 
 /// The two public, non-secret anchors for DID-backed deployment trust.
@@ -84,15 +100,31 @@ impl DeploymentTrustSource {
     }
 }
 
+/// An atomic Ed25519 + ML-DSA-65 deployment-credential authority.
+///
+/// The pair is intentionally indivisible at the consumer boundary.  Carrying
+/// only `ed25519` would let a later EdDSA-only credential erase the GATE's PQ
+/// half while retaining a misleading `PqHybrid` label.
+#[derive(Clone)]
+pub(crate) struct HybridDeploymentCa {
+    pub ed25519: VerifyingKey,
+    pub ml_dsa_65: MlDsaVerifyingKey,
+}
+
 /// Verified public material extracted from a mutually-attested identity pair.
 ///
-/// The CA and transport are sourced from the GATE-verified capsule, never the
-/// `did:web` document.
+/// Both `ca_verifying_key` and `discovery_transport` are sourced from the
+/// GATE-verified capsule, never the `did:web` document (#1157 / option C).
 pub(crate) struct DidAnchoredTrust {
-    pub ca_verifying_key: VerifyingKey,
+    /// Every currently published capsule CA pair.  Credential `kid` selects a
+    /// member; this is deliberately a key set, never a positional singleton.
+    pub ca_keys: Vec<HybridDeploymentCa>,
     pub discovery_transport: TransportConfig,
     pub authoritative_identity: AuthoritativeIdentity,
-    /// Assurance carried by the capsule's hybrid subject key.
+    /// The assurance of the trust material actually installed. Because the CA is
+    /// selected from the capsule's hybrid `subject_keys`, this is `PqHybrid` —
+    /// carried, not reconstructed (#556 / F5). A capsule GATE-verifies only under
+    /// pinned Hybrid, so this is never `Classical`.
     pub assurance: Assurance,
 }
 
@@ -178,36 +210,64 @@ fn document_names_at9p(document: &Value, at9p_did: &str) -> bool {
         .is_some_and(|aliases| aliases.iter().any(|alias| alias.as_str() == Some(at9p_did)))
 }
 
-/// Extract the deployment CA from the primary hybrid subject key that signed
-/// the GATE-verified capsule.
-fn ca_key_from_capsule(verified: &VerifiedCapsule) -> Result<VerifyingKey> {
-    let primary = verified
+/// Decode every GATE-authenticated deployment CA pair from the capsule.
+///
+/// `subject_keys` has set semantics for consumers: multiple live keys are
+/// allowed during overlap and the credential's authenticated `kid` selects the
+/// exact pair.  Neither this function nor its callers use `.first()`.
+fn ca_keys_from_capsule(verified: &VerifiedCapsule) -> Result<Vec<HybridDeploymentCa>> {
+    let keys = verified
         .capsule()
         .body
         .subject_keys
-        .first()
-        .ok_or_else(|| anyhow::anyhow!("GATE-verified capsule has no subject key"))?;
-    let ed: [u8; 32] = primary
-        .ed25519_pub
-        .as_slice()
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("capsule subject Ed25519 key is not 32 bytes"))?;
-    VerifyingKey::from_bytes(&ed).context("capsule subject Ed25519 key is malformed")
+        .iter()
+        .map(|pair| {
+            let ed: [u8; 32] = pair
+                .ed25519_pub
+                .as_slice()
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("capsule subject Ed25519 key is not 32 bytes"))?;
+            Ok(HybridDeploymentCa {
+                ed25519: VerifyingKey::from_bytes(&ed)
+                    .context("capsule subject Ed25519 key is malformed")?,
+                ml_dsa_65: ml_dsa_vk_from_bytes(&pair.mldsa65_pub)
+                    .context("capsule subject ML-DSA-65 key is malformed")?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    anyhow::ensure!(!keys.is_empty(), "GATE-verified capsule has no subject key");
+    for (index, key) in keys.iter().enumerate() {
+        anyhow::ensure!(
+            !keys[..index]
+                .iter()
+                .any(|prior| prior.ed25519 == key.ed25519),
+            "GATE-verified capsule repeats a deployment CA Ed25519 key"
+        );
+    }
+    Ok(keys)
 }
 
-/// Extract Discovery reach from the capsule's typed `#ns` service. The
-/// independent nodeId is transport reach only; the signed ping remains pinned
-/// to the separately authenticated Discovery application key.
+/// The discovery reach is the `#ns` `NinePExport` service entry's typed iroh
+/// endpoint, taken from the GATE-verified capsule.  Iroh requires an
+/// independent `nodeId`; QUIC uses its signed socket carrier directly.
+///
+/// # Reach vs identity (#1031)
+///
+/// Reach is an **explicit carrier address** (`ServiceEndpoint.node_id`), never
+/// derived from the subject identity key — the invariant #1031 protects and the
+/// reason the D1 `capsule_to_iroh_reach` fails closed when only a relay claim is
+/// present. A capsule that publishes an independent `nodeId` carrier supplies a
+/// dialable address; the installed reach is still an untrusted carrier, so
+/// `bootstrap_deployment_process` pins the response to the separately resolved
+/// Discovery key and requires a signed liveness `ping` before the resolver is
+/// installed. A missing/non-iroh/carrier-less entry fails closed.
 fn reach_from_capsule(verified: &VerifiedCapsule) -> Result<TransportConfig> {
     let entry = verified
         .capsule()
         .body
         .services
         .iter()
-        .find(|service| {
-            service.id == DEPLOYMENT_REACH_SERVICE
-                && service.service_type == ServiceType::NinePExport
-        })
+        .find(|s| s.id == DEPLOYMENT_REACH_SERVICE && s.service_type == ServiceType::NinePExport)
         .ok_or_else(|| {
             anyhow::anyhow!(
                 "capsule has no NinePExport service entry {DEPLOYMENT_REACH_SERVICE:?} for deployment reach"
@@ -215,9 +275,12 @@ fn reach_from_capsule(verified: &VerifiedCapsule) -> Result<TransportConfig> {
         })?;
     match entry.endpoint.transport {
         At9pTransport::Iroh => {
+            // The independent carrier EndpointId — an explicit transport
+            // address, not the subject identity key (#1031).
             let node_id_multibase = entry.endpoint.node_id.as_deref().ok_or_else(|| {
                 anyhow::anyhow!(
-                    "capsule deployment reach {DEPLOYMENT_REACH_SERVICE:?} carries no independent iroh nodeId"
+                    "capsule deployment reach {DEPLOYMENT_REACH_SERVICE:?} carries no independent iroh \
+                     nodeId carrier; refusing to derive reach from the subject identity key (#1031)"
                 )
             })?;
             let node_id = hyprstream_rpc::did_key::decode_ed25519_multikey(node_id_multibase)
@@ -239,6 +302,9 @@ fn reach_from_capsule(verified: &VerifiedCapsule) -> Result<TransportConfig> {
             let address = carrier
                 .parse()
                 .context("capsule QUIC reach is not an IP socket address")?;
+            // The schema has one signed carrier string.  Requiring an IP socket
+            // avoids a second unauthenticated DNS resolution surface; the TLS
+            // certificate must therefore contain that IP as a SAN.
             Ok(TransportConfig::quic(address, address.ip().to_string()).with_connect_mode())
         }
         ref other => bail!(
@@ -263,6 +329,9 @@ pub(crate) async fn verify_did_anchored_document(
 
     let classical = Did::new(anchors.cluster_did_web.clone());
     let at9p = Did::new(anchors.cluster_at9p_did.clone());
+    // The mutual-alias rule returns the authoritative identity AND the
+    // GATE-verified capsule the attestation was proven against. All trust
+    // material below comes from that capsule — never the did:web document.
     let (authoritative_identity, verified) = At9pAliasResolver::new(capsule_source)
         .resolve_authoritative_with_capsule(&classical, &at9p)
         .await
@@ -272,9 +341,9 @@ pub(crate) async fn verify_did_anchored_document(
         "mutual-alias resolver did not preserve configured at9p authority"
     );
 
-    // The document contributes only the reciprocal identifier vouch above.
-    // Everything installed is content-bound to the configured did:at9p pin.
-    let ca_verifying_key = ca_key_from_capsule(&verified)?;
+    // CA + reach from the GATE-verified capsule (option C). The did:web document
+    // is used only for the reciprocal identifier vouch checked above.
+    let ca_keys = ca_keys_from_capsule(&verified)?;
     let discovery_transport = reach_from_capsule(&verified)?;
     anyhow::ensure!(
         matches!(
@@ -285,8 +354,10 @@ pub(crate) async fn verify_did_anchored_document(
     );
 
     Ok(DidAnchoredTrust {
-        ca_verifying_key,
+        ca_keys,
         discovery_transport,
+        // The capsule leg was walked (GATE = pinned Hybrid) and the CA is the
+        // capsule's hybrid subject key ⇒ PqHybrid, carried not reconstructed.
         assurance: authoritative_identity.assurance,
         authoritative_identity,
     })
@@ -304,7 +375,7 @@ pub(crate) async fn resolve_did_anchored_trust(anchors: &DidAnchors) -> Result<D
         at9p = %trust.authoritative_identity.at9p_did,
         did_web = %trust.authoritative_identity.classical_did,
         assurance = ?trust.assurance,
-        "verified mutually-attested DID deployment trust anchors from GATE-verified capsule"
+        "verified mutually-attested DID deployment trust anchors (CA + reach from GATE-verified capsule)"
     );
     Ok(trust)
 }
@@ -314,7 +385,7 @@ pub(crate) async fn resolve_did_anchored_trust(anchors: &DidAnchors) -> Result<D
 mod tests {
     use super::*;
     use ed25519_dalek::SigningKey;
-    use hyprstream_crypto::pq::{ml_dsa_generate_keypair, ml_dsa_vk_bytes, MlDsaSigningKey};
+    use hyprstream_crypto::pq::{MlDsaSigningKey, ml_dsa_generate_keypair, ml_dsa_vk_bytes};
     use hyprstream_pds::at9p::{
         CapsuleBody, HybridKeyPair, ServiceEndpoint, ServiceEntry, ServiceType, Transport,
     };
@@ -347,6 +418,8 @@ mod tests {
         CapsuleSigner { ed, pq, pair }
     }
 
+    /// Encode a raw Ed25519 key as a `Multikey` `publicKeyMultibase` string (the
+    /// carrier `nodeId` form the capsule schema stores).
     fn multikey(key: &[u8; 32]) -> String {
         hyprstream_rpc::did_key::ed25519_to_did_key(key)
             .strip_prefix("did:key:")
@@ -354,12 +427,18 @@ mod tests {
             .to_owned()
     }
 
+    /// The Ed25519 verifying key of the capsule signer for `tag` — i.e. the
+    /// capsule's primary `subject_keys[0]`, which option C installs as the CA.
     fn capsule_ca(tag: u8) -> [u8; 32] {
         SigningKey::from_bytes(&[tag; 32])
             .verifying_key()
             .to_bytes()
     }
 
+    /// A signed capsule that names `classical_alias` (leg 2) and publishes an
+    /// `#ns` NinePExport iroh service. `carrier` sets the independent iroh
+    /// `nodeId` on that service (the #1031 explicit reach carrier); `None`
+    /// leaves it absent so reach derivation must fail closed.
     fn capsule_with_carrier(
         classical_alias: &str,
         tag: u8,
@@ -368,7 +447,7 @@ mod tests {
         let signer = capsule_signer(tag);
         let mut endpoint =
             ServiceEndpoint::new(Transport::Iroh, format!("iroh://node{tag}")).unwrap();
-        endpoint.node_id = carrier.map(|key| multikey(&key));
+        endpoint.node_id = carrier.map(|c| multikey(&c));
         let service = ServiceEntry::new("#ns", ServiceType::NinePExport, endpoint).unwrap();
         let mut body = CapsuleBody::new(vec![signer.pair], vec![service]).unwrap();
         body.also_known_as = Some(vec![classical_alias.to_owned()]);
@@ -378,10 +457,41 @@ mod tests {
         (bytes, did)
     }
 
+    /// The mainline fixture: capsule with a valid reach carrier (tag `0xC0`).
     fn capsule(classical_alias: &str, tag: u8) -> (Vec<u8>, String) {
         capsule_with_carrier(classical_alias, tag, Some([0xC0; 32]))
     }
 
+    fn capsule_with_ca_overlap(
+        classical_alias: &str,
+        old: &CapsuleSigner,
+        new: &CapsuleSigner,
+    ) -> (Vec<u8>, String) {
+        let mut endpoint = ServiceEndpoint::new(Transport::Iroh, "iroh://overlap").unwrap();
+        endpoint.node_id = Some(multikey(&[0xC0; 32]));
+        let service = ServiceEntry::new("#ns", ServiceType::NinePExport, endpoint).unwrap();
+        let mut body =
+            CapsuleBody::new(vec![old.pair.clone(), new.pair.clone()], vec![service]).unwrap();
+        body.also_known_as = Some(vec![classical_alias.to_owned()]);
+        let capsule = sign_capsule(body, &old.ed, &old.pq).unwrap();
+        let bytes = capsule.to_dag_cbor().unwrap();
+        let did = format!("did:at9p:{}", capsule.cid512().unwrap());
+        (bytes, did)
+    }
+
+    fn capsule_with_quic_reach(classical_alias: &str, signer: &CapsuleSigner) -> (Vec<u8>, String) {
+        let endpoint = ServiceEndpoint::new(Transport::Quic, "quic://127.0.0.1:4433").unwrap();
+        let service = ServiceEntry::new("#ns", ServiceType::NinePExport, endpoint).unwrap();
+        let mut body = CapsuleBody::new(vec![signer.pair.clone()], vec![service]).unwrap();
+        body.also_known_as = Some(vec![classical_alias.to_owned()]);
+        let capsule = sign_capsule(body, &signer.ed, &signer.pq).unwrap();
+        let bytes = capsule.to_dag_cbor().unwrap();
+        let did = format!("did:at9p:{}", capsule.cid512().unwrap());
+        (bytes, did)
+    }
+
+    /// A minimal did:web document: only the fields option C still reads — the
+    /// `id` and the reciprocal `alsoKnownAs` identifier vouch. No key material.
     fn document(web: &str, at9p: Option<&str>) -> Value {
         let mut document = json!({ "id": web });
         if let Some(at9p) = at9p {
@@ -390,6 +500,9 @@ mod tests {
         document
     }
 
+    /// A did:web document that ALSO carries CA key material and reach — the
+    /// shape the pre-option-C code read from. Used to prove those fields are now
+    /// ignored (the F1 substitution regression test).
     fn document_with_ca_and_reach(
         web: &str,
         at9p: Option<&str>,
@@ -487,13 +600,23 @@ mod tests {
         .unwrap();
         assert_eq!(trust.authoritative_identity.at9p_did.as_str(), at9p);
         assert_eq!(trust.authoritative_identity.classical_did.as_str(), web);
-        assert_eq!(trust.ca_verifying_key.to_bytes(), capsule_ca(4));
+        // The singleton fixture publishes the capsule's one complete hybrid CA
+        // pair, never a document key.
+        assert_eq!(trust.ca_keys.len(), 1);
+        assert_eq!(trust.ca_keys[0].ed25519.to_bytes(), capsule_ca(4));
+        // Reach is the capsule's carrier nodeId.
         match trust.discovery_transport.endpoint {
             EndpointType::Iroh { node_id, .. } => assert_eq!(node_id, [0xC0; 32]),
             other => panic!("expected iroh reach from capsule, got {other:?}"),
         }
     }
 
+    // ── option C properties (issue #1157) ────────────────────────────────────
+
+    /// F5 regression guard (#556): the installed authority carries the capsule's
+    /// hybrid assurance and is NEVER `Classical`. A capsule GATE-verifies only
+    /// under pinned Hybrid, so its subject key carries a bound ML-DSA-65 half;
+    /// selecting the CA from it means `PqHybrid` is carried, not reconstructed.
     #[tokio::test]
     async fn installed_authority_is_pqhybrid_not_classical() {
         let web = "did:web:cluster.example";
@@ -509,10 +632,19 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_ne!(trust.assurance, Assurance::Classical);
+        assert_ne!(
+            trust.assurance,
+            Assurance::Classical,
+            "deployment CA must not land classical — it anchors the registry/audit/checkpoint chain (#556)"
+        );
         assert_eq!(trust.assurance, Assurance::PqHybrid);
     }
 
+    /// F4 subsumed: the `did:web` document may publish two Ed25519 verification
+    /// methods (new CA alongside old — the normal overlap rotation) and bootstrap
+    /// still succeeds. Under the old `ca_keys.len() == 1` rule this made
+    /// `len() == 2` and broke bootstrap for every node at once. Option C never
+    /// reads document keys, so overlap is a non-event.
     #[tokio::test]
     async fn rotation_with_overlapping_document_cas_still_bootstraps() {
         let web = "did:web:cluster.example";
@@ -521,6 +653,7 @@ mod tests {
             cluster_at9p_did: at9p.clone(),
             cluster_did_web: web.to_owned(),
         };
+        // Document publishes TWO Ed25519 VMs (old + new CA overlapping).
         let mut doc = document(web, Some(&at9p));
         doc["verificationMethod"] = json!([
             {
@@ -539,10 +672,71 @@ mod tests {
         let trust =
             verify_did_anchored_document(&anchors, &doc, Arc::new(FixedCapsuleSource(bytes)))
                 .await
-                .expect("overlapping document CAs must not break bootstrap");
-        assert_eq!(trust.ca_verifying_key.to_bytes(), capsule_ca(4));
+                .expect("overlapping document CAs must not break bootstrap (F4 subsumed)");
+        // The installed CA is still the capsule key, unaffected by the document.
+        assert_eq!(trust.ca_keys.len(), 1);
+        assert_eq!(trust.ca_keys[0].ed25519.to_bytes(), capsule_ca(4));
     }
 
+    /// The capsule key set itself, rather than document noise, is the live
+    /// authority set consumed by credential verification.  The companion
+    /// service test authenticates under both pairs and then rejects the
+    /// retired pair after the set is advanced.
+    #[tokio::test]
+    async fn capsule_ca_overlap_preserves_both_atomic_hybrid_pairs() {
+        let web = "did:web:cluster.example";
+        let old = capsule_signer(0x41);
+        let new = capsule_signer(0x42);
+        let (bytes, at9p) = capsule_with_ca_overlap(web, &old, &new);
+        let trust = verify_did_anchored_document(
+            &DidAnchors {
+                cluster_at9p_did: at9p.clone(),
+                cluster_did_web: web.to_owned(),
+            },
+            &document(web, Some(&at9p)),
+            Arc::new(FixedCapsuleSource(bytes)),
+        )
+        .await
+        .expect("two published capsule CAs must remain a usable key set");
+        assert_eq!(trust.ca_keys.len(), 2);
+        assert!(
+            trust
+                .ca_keys
+                .iter()
+                .any(|key| key.ed25519 == old.ed.verifying_key())
+        );
+        assert!(
+            trust
+                .ca_keys
+                .iter()
+                .any(|key| key.ed25519 == new.ed.verifying_key())
+        );
+    }
+
+    #[tokio::test]
+    async fn signed_capsule_quic_reach_remains_accepted() {
+        let web = "did:web:cluster.example";
+        let signer = capsule_signer(0x43);
+        let (bytes, at9p) = capsule_with_quic_reach(web, &signer);
+        let trust = verify_did_anchored_document(
+            &DidAnchors {
+                cluster_at9p_did: at9p.clone(),
+                cluster_did_web: web.to_owned(),
+            },
+            &document(web, Some(&at9p)),
+            Arc::new(FixedCapsuleSource(bytes)),
+        )
+        .await
+        .expect("signed QUIC deployment reach must retain the previous transport contract");
+        assert!(matches!(
+            trust.discovery_transport.endpoint,
+            EndpointType::Quic { .. }
+        ));
+    }
+
+    /// F1 fix regression: substituting the `did:web` document's CA key AND reach
+    /// no longer changes the installed trust material, because neither is read
+    /// from the document. This is the opus-verdict attack, now neutralized.
     #[tokio::test]
     async fn substituted_document_ca_and_reach_are_ignored() {
         let web = "did:web:cluster.example";
@@ -552,30 +746,35 @@ mod tests {
             cluster_did_web: web.to_owned(),
         };
 
+        // Honest document carries one CA + reach; attacker document carries
+        // entirely different ones. Same capsule bytes (the public pin) both times.
         let honest = verify_did_anchored_document(
             &anchors,
-            &document_with_ca_and_reach(web, Some(&at9p), [0x07; 32], [0x45; 32]),
+            &document_with_ca_and_reach(web, Some(&at9p), [0x7; 32], [0x45; 32]),
             Arc::new(FixedCapsuleSource(bytes.clone())),
         )
         .await
         .unwrap();
-        let substituted = verify_did_anchored_document(
+        let evil = verify_did_anchored_document(
             &anchors,
             &document_with_ca_and_reach(web, Some(&at9p), [0x66; 32], [0xEE; 32]),
             Arc::new(FixedCapsuleSource(bytes)),
         )
         .await
-        .unwrap();
+        .expect("document contents are advisory; verification still succeeds");
 
-        assert_eq!(honest.ca_verifying_key, substituted.ca_verifying_key);
-        assert_eq!(honest.discovery_transport, substituted.discovery_transport);
-        assert_eq!(honest.ca_verifying_key.to_bytes(), capsule_ca(4));
-        match honest.discovery_transport.endpoint {
-            EndpointType::Iroh { node_id, .. } => assert_eq!(node_id, [0xC0; 32]),
-            other => panic!("expected capsule-bound iroh reach, got {other:?}"),
-        }
+        // Identical installed trust despite different document CA + reach.
+        assert_eq!(honest.ca_keys.len(), 1);
+        assert_eq!(honest.ca_keys[0].ed25519, evil.ca_keys[0].ed25519);
+        assert_eq!(honest.discovery_transport, evil.discovery_transport);
+        // And it is the capsule's material, not either document's.
+        assert_eq!(honest.ca_keys[0].ed25519.to_bytes(), capsule_ca(4));
+        assert_ne!(honest.ca_keys[0].ed25519.to_bytes(), [0x7; 32]);
     }
 
+    /// F1 target (was #[ignore]'d expected-fail on #1143; now passes): the
+    /// installed CA is bound to the GATE-verified capsule, even when the document
+    /// publishes a different key.
     #[tokio::test]
     async fn ca_is_bound_to_verified_capsule_not_document() {
         let web = "did:web:cluster.example";
@@ -584,18 +783,26 @@ mod tests {
             cluster_at9p_did: at9p.clone(),
             cluster_did_web: web.to_owned(),
         };
-        let document_ca = [0x07; 32];
-        assert_ne!(capsule_ca(4), document_ca);
+        // Document publishes an unrelated CA; it must be ignored.
+        let doc_ca = [0x7; 32];
+        assert_ne!(capsule_ca(4), doc_ca, "fixture sanity");
         let trust = verify_did_anchored_document(
             &anchors,
-            &document_with_ca_and_reach(web, Some(&at9p), document_ca, [0x45; 32]),
+            &document_with_ca_and_reach(web, Some(&at9p), doc_ca, [0x45; 32]),
             Arc::new(FixedCapsuleSource(bytes)),
         )
         .await
         .unwrap();
-        assert_eq!(trust.ca_verifying_key.to_bytes(), capsule_ca(4));
+        assert_eq!(
+            trust.ca_keys[0].ed25519.to_bytes(),
+            capsule_ca(4),
+            "installed CA must derive from the GATE-verified capsule, not the did:web document"
+        );
     }
 
+    /// Reach is an explicit carrier address, never the subject identity key
+    /// (#1031). A capsule whose `#ns` service has no independent `nodeId` carrier
+    /// fails closed rather than deriving reach from the genesis subject key.
     #[tokio::test]
     async fn reach_without_carrier_node_id_fails_closed() {
         let web = "did:web:cluster.example";
@@ -604,55 +811,36 @@ mod tests {
             cluster_at9p_did: at9p.clone(),
             cluster_did_web: web.to_owned(),
         };
-        let error = verify_did_anchored_document(
+        let err = verify_did_anchored_document(
             &anchors,
             &document(web, Some(&at9p)),
             Arc::new(FixedCapsuleSource(bytes)),
         )
         .await
         .err()
-        .expect("carrier-less reach unexpectedly accepted");
-        assert!(format!("{error:#}").contains("no independent iroh nodeId"));
+        .expect("carrier-less reach must fail closed (#1031)");
+        assert!(
+            format!("{err:#}").contains("no independent iroh"),
+            "{err:#}"
+        );
     }
 
+    /// Evidence retained from the #1143 analysis: the capsule carries the
+    /// material the document should not own (subject_keys + services). This is
+    /// why option C is wiring, not new crypto.
     #[tokio::test]
-    async fn capsule_carries_authoritative_keys_and_services() {
+    async fn f1_capsule_carries_the_material_the_document_should_not_own() {
         let web = "did:web:cluster.example";
         let (bytes, at9p) = capsule(web, 4);
         let verified = hyprstream_pds::at9p_gate::verify_did_at9p(&at9p, &bytes)
             .expect("capsule GATE-verifies");
-        assert!(!verified.capsule().body.subject_keys.is_empty());
-        assert!(!verified.capsule().body.services.is_empty());
-    }
-
-    #[tokio::test]
-    async fn capsule_bound_quic_reach_is_accepted() {
-        let web = "did:web:cluster.example";
-        let signer = capsule_signer(5);
-        let endpoint = ServiceEndpoint::new(Transport::Quic, "quic://127.0.0.1:7443").unwrap();
-        let service = ServiceEntry::new("#ns", ServiceType::NinePExport, endpoint).unwrap();
-        let mut body = CapsuleBody::new(vec![signer.pair], vec![service]).unwrap();
-        body.also_known_as = Some(vec![web.to_owned()]);
-        let capsule = sign_capsule(body, &signer.ed, &signer.pq).unwrap();
-        let bytes = capsule.to_dag_cbor().unwrap();
-        let at9p = format!("did:at9p:{}", capsule.cid512().unwrap());
-        let anchors = DidAnchors {
-            cluster_at9p_did: at9p.clone(),
-            cluster_did_web: web.to_owned(),
-        };
-
-        let trust = verify_did_anchored_document(
-            &anchors,
-            &document(web, Some(&at9p)),
-            Arc::new(FixedCapsuleSource(bytes)),
-        )
-        .await
-        .unwrap();
-        match trust.discovery_transport.endpoint {
-            EndpointType::Quic { addr, .. } => {
-                assert_eq!(addr, "127.0.0.1:7443".parse().unwrap());
-            }
-            other => panic!("expected capsule-bound QUIC reach, got {other:?}"),
-        }
+        assert!(
+            !verified.capsule().body.subject_keys.is_empty(),
+            "capsule carries hybrid subject keys — an in-band CA source"
+        );
+        assert!(
+            !verified.capsule().body.services.is_empty(),
+            "capsule carries typed services — an in-band reach source"
+        );
     }
 }
