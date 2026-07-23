@@ -819,6 +819,11 @@ impl FinalizedResource {
             return Err(ContractError::WrongKeyPurpose);
         }
         if statement.intent_digest != intent.digest()
+            // Ties the JOINED attestation to the intent being finalized. Without this the
+            // statement can name the right intent while the dual evidence attests another
+            // one — the statement's own digest proves nothing about what was attested.
+            // Deleted in 26b0bce5f while closing the authority-floor findings; restored.
+            || dual.mac().attestation().intent_digest != statement.intent_digest
             || statement.operation_id != intent.claims().operation_id
             || statement.resource_id != intent.claims().resource_id
             || statement.fence.resource_id != statement.resource_id

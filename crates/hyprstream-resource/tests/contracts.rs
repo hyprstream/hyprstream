@@ -22,7 +22,12 @@ impl IntentValidator for TestCodec {
         _version: IntentFormatVersion,
         canonical_bytes: &[u8],
     ) -> Result<IntentClaims, ContractError> {
-        if canonical_bytes != b"canonical-intent-v1" {
+        // Two accepted encodings that decode to IDENTICAL claims. Only the canonical bytes —
+        // and therefore the intent digest — differ, which is what isolates digest-binding
+        // failures from claim-mismatch failures.
+        if canonical_bytes != b"canonical-intent-v1"
+            && canonical_bytes != b"canonical-intent-v1-other"
+        {
             return Err(ContractError::NonCanonicalIntent);
         }
         Ok(IntentClaims {
@@ -488,6 +493,55 @@ fn statement(intent: &CanonicalResourceIntent, dual: &DualAttestation) -> Finali
             "#registrar-v1",
         ),
     }
+}
+
+/// A second intent whose canonical bytes — and therefore digest — differ from `intent()`.
+fn other_intent() -> CanonicalResourceIntent {
+    let bytes = b"canonical-intent-v1-other".to_vec();
+    CanonicalResourceIntent::validate(
+        IntentCandidate {
+            contract_version: ContractVersion::V1,
+            format_version: IntentFormatVersion::V1,
+            digest_suite: DigestSuite::Blake3_256,
+            claimed_digest: IntentDigest::compute(DigestSuite::Blake3_256, &bytes),
+            canonical_bytes: bytes,
+        },
+        &TestCodec,
+    )
+    .unwrap()
+}
+
+/// The statement can be internally consistent with the intent while the JOINED evidence
+/// attests a different one. Mutating the statement cannot catch this — every
+/// `wrong_statement_*` mutation trips an earlier clause — so the binding from the dual's
+/// MAC attestation back to the statement digest is the only thing that rejects it.
+///
+/// This is a regression test for a real deletion: `26b0bce5f` removed
+/// `dual.mac().attestation().intent_digest != statement.intent_digest` from
+/// `FinalizedResource::verify` while closing the authority-floor findings, and the existing
+/// mutation suite stayed green throughout.
+#[test]
+fn finalization_rejects_dual_evidence_for_a_different_intent() {
+    let intent = intent();
+    let foreign = other_intent();
+    assert_ne!(intent.digest(), foreign.digest());
+
+    // Evidence attesting `foreign`, paired with a statement that describes `intent`
+    // correctly in every field of its own.
+    let foreign_dual = dual(&foreign);
+    let mut statement = statement(&intent, &foreign_dual);
+    statement.intent_digest = intent.digest();
+
+    assert_eq!(
+        hyprstream_resource::FinalizedResource::verify(
+            &intent,
+            &foreign_dual,
+            &statement,
+            &AcceptProof
+        )
+        .unwrap_err(),
+        ContractError::IntentMismatch,
+    );
 }
 
 fn wrong_statement_digest(statement: &mut FinalizationStatement) {
