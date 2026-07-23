@@ -112,8 +112,8 @@ pub struct OciConfig {
     pub default_image: String,
     /// Run the runtime rootless (podman's default for a non-root user).
     pub rootless: bool,
-    /// Container network mode passed to `--network` (empty = runtime default,
-    /// which for rootless podman is an isolated slirp4netns/pasta network).
+    /// Container network mode passed to `--network`. Defaults to `none`; pasta
+    /// or another ambient runtime network requires an explicit opt-in.
     pub network_mode: String,
     /// GPU device nodes to pass through (auto-detected from `/dev/dri`) when a
     /// sandbox requests `hyprstream.io/gpu=true`.
@@ -137,7 +137,7 @@ impl Default for OciConfig {
             runtime_bin,
             default_image,
             rootless: !nix::unistd::geteuid().is_root(),
-            network_mode: String::new(),
+            network_mode: "none".to_owned(),
             gpu_devices: detect_gpu_devices(),
             ready_timeout: Duration::from_secs(30),
             ready_interval: Duration::from_millis(200),
@@ -458,10 +458,8 @@ impl OciBackend {
             }
         }
 
-        // Network isolation mode (runtime default when unset).
-        if !self.config.network_mode.is_empty() {
-            args.push(format!("--network={}", self.config.network_mode));
-        }
+        // Never inherit podman's ambient slirp4netns/pasta default.
+        args.push(format!("--network={}", self.config.network_mode));
 
         // Resource limits → cgroup flags from `linux.resources`.
         apply_resource_args(&config.linux.resources, &mut args);

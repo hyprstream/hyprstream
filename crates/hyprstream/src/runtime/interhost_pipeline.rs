@@ -18,12 +18,20 @@
 //! This module supplies the cross-stage depth calculation; the live streaming
 //! scheduler remains tracked by #329 and is not duplicated here.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
 use std::path::Path;
+use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Context, Result};
+use async_trait::async_trait;
+use hyprstream_rpc::identity::Did;
+use hyprstream_rpc::resolver::{ResolutionEvidence, ServiceQuery, ServiceResolver};
+use hyprstream_rpc::transport::TransportConfig;
+use hyprstream_rpc::VerifyingKey;
 use serde_json::{Map, Value};
+use sha2::{Digest, Sha512};
 
 const BASIS_POINTS: u64 = 10_000;
 
@@ -54,9 +62,17 @@ impl ModelFootprint {
                 .with_context(|| format!("failed to read {}", manifest_path.display()))?;
             let value: Value = serde_json::from_str(&raw)
                 .with_context(|| format!("failed to parse {}", manifest_path.display()))?;
-            value
+            let total = value
                 .pointer("/metadata/total_size")
                 .and_then(Value::as_u64)
+                .filter(|total| *total > 0)
+                .ok_or_else(|| {
+                    anyhow!(
+                        "{} has no positive metadata.total_size; refusing to discard its authoritative capacity bound",
+                        manifest_path.display()
+                    )
+                })?;
+            Some(total)
         } else {
             None
         };
@@ -257,13 +273,36 @@ impl ModelFootprint {
     }
 }
 
+/// Cryptographic identity of a pipeline host.
+///
+/// The planner never accepts an arbitrary string as a host identity.  A host is
+/// its `did:at9p` capsule identity; discovery binds its current reach and keys.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct HostId(pub Did);
+
+impl HostId {
+    /// Construct a host identity only from the self-certifying host DID method.
+    pub fn new(did: Did) -> Result<Self> {
+        anyhow::ensure!(did.is_did_at9p(), "host identity must be a did:at9p DID");
+        Ok(Self(did))
+    }
+}
+
+/// Static, non-authoritative placement facts discovered for a host.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostAttributes {
+    pub available_vram_bytes: u64,
+    /// A local placement-cost hint. It is never used as proof of reachability.
+    pub affinity: Option<String>,
+    /// A host-declared cost hint for future mover selection, never authority.
+    pub declared_bandwidth_bytes_per_second: Option<u64>,
+}
+
 /// Available capacity for one pipeline host.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostCapacity {
-    pub host_id: String,
-    /// Hosts in a plan must share this operator-defined LAN identifier.
-    pub lan_id: String,
-    pub available_vram_bytes: u64,
+    pub host_id: HostId,
+    pub attributes: HostAttributes,
 }
 
 /// Planner safety reserves applied independently on every selected host.
@@ -288,16 +327,15 @@ impl Default for PlannerOptions {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PipelineStageAssignment {
     pub stage_index: usize,
-    pub host_id: String,
+    pub host_id: HostId,
     pub layer_range: Range<usize>,
     pub estimated_weight_bytes: u64,
     pub usable_vram_bytes: u64,
 }
 
-/// Capacity-aware plan. `stages.len() - 1` is the number of LAN boundaries.
+/// Capacity-aware, pure-value plan. Reach is proved separately by [`admit`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InterhostPipelinePlan {
-    pub lan_id: String,
     pub stages: Vec<PipelineStageAssignment>,
 }
 
@@ -324,20 +362,16 @@ impl InterhostPipelinePlanner {
         if options.reserve_basis_points as u64 >= BASIS_POINTS {
             bail!("reserve_basis_points must be less than {BASIS_POINTS}");
         }
-        let lan_id = hosts[0].lan_id.clone();
-        if lan_id.trim().is_empty() || hosts.iter().any(|host| host.lan_id != lan_id) {
-            bail!("inter-host pipeline candidates must belong to one non-empty LAN");
-        }
         let mut seen = BTreeSet::new();
         for host in hosts {
-            if host.host_id.trim().is_empty() || !seen.insert(host.host_id.as_str()) {
-                bail!("pipeline host identifiers must be non-empty and unique");
+            if !host.host_id.0.is_did_at9p() || !seen.insert(&host.host_id) {
+                bail!("pipeline host identities must be unique did:at9p identifiers");
             }
         }
 
         let mut candidates = Vec::with_capacity(hosts.len());
         for host in hosts {
-            let usable = usable_bytes(host.available_vram_bytes, options)?;
+            let usable = usable_bytes(host.attributes.available_vram_bytes, options)?;
             if usable > 0 {
                 candidates.push((host, usable));
             }
@@ -351,7 +385,7 @@ impl InterhostPipelinePlanner {
         for host_count in 1..=candidates.len().min(model.num_layers) {
             let selected = &candidates[..host_count];
             if let Some(stages) = try_plan_selected(model, selected)? {
-                return Ok(InterhostPipelinePlan { lan_id, stages });
+                return Ok(InterhostPipelinePlan { stages });
             }
         }
 
@@ -360,7 +394,7 @@ impl InterhostPipelinePlanner {
                 .ok_or_else(|| anyhow!("aggregate host capacity overflow"))
         })?;
         bail!(
-            "model does not fit the LAN candidates: {} layers at ~{} bytes/layer, {} usable bytes total",
+            "model does not fit the resolved host candidates: {} layers at ~{} bytes/layer, {} usable bytes total",
             model.num_layers,
             model.layer_bytes,
             total_usable
@@ -503,6 +537,327 @@ fn usable_bytes(available: u64, options: PlannerOptions) -> Result<u64> {
     Ok(after_fraction.saturating_sub(options.runtime_reserve_bytes))
 }
 
+const REACH_ATTESTATION_AAD: &[u8] = b"hyprstream/reach-attestation/v0";
+
+/// Verified, dialable discovery result for a pipeline host.
+#[derive(Debug, Clone)]
+pub struct HostDescriptor {
+    pub host_id: HostId,
+    pub response_verifying_key: VerifyingKey,
+    pub response_ml_dsa65: Vec<u8>,
+    pub transport: TransportConfig,
+    pub evidence: ResolutionEvidence,
+    pub expires_at_unix_ms: i64,
+}
+
+/// Resolves a host identity to the discovery engine's validated current snapshot.
+#[async_trait]
+pub trait HostResolver: Send + Sync {
+    async fn resolve_host(
+        &self,
+        host: &HostId,
+        required_capabilities: &BTreeSet<String>,
+    ) -> Result<HostDescriptor>;
+}
+
+/// Production [`HostResolver`] backed by the rpc crate's identity-bound resolver.
+///
+/// The service name is a deployment-selected discovery record. Its resolved DID
+/// is checked against the requested [`HostId`] before a descriptor is returned.
+pub struct RpcHostResolver {
+    service_name: String,
+    resolver: Arc<dyn ServiceResolver>,
+}
+
+impl RpcHostResolver {
+    pub fn new(
+        service_name: impl Into<String>,
+        resolver: Arc<dyn ServiceResolver>,
+    ) -> Result<Self> {
+        let service_name = service_name.into();
+        ServiceQuery::network(service_name.clone())?;
+        Ok(Self {
+            service_name,
+            resolver,
+        })
+    }
+}
+
+#[async_trait]
+impl HostResolver for RpcHostResolver {
+    async fn resolve_host(
+        &self,
+        host: &HostId,
+        required_capabilities: &BTreeSet<String>,
+    ) -> Result<HostDescriptor> {
+        let query = ServiceQuery::new(
+            self.service_name.clone(),
+            required_capabilities.iter().cloned(),
+            hyprstream_rpc::resolver::ResolverProfile::NetworkDiscovery,
+            1,
+        )?;
+        let resolved = self.resolver.resolve_service(query).await?;
+        self.resolver.ensure_current(&resolved).await?;
+        resolved.ensure_fresh(unix_millis_now()?)?;
+        let resolved_host = HostId::new(resolved.service_did().clone())?;
+        anyhow::ensure!(
+            &resolved_host == host,
+            "resolved service DID does not match requested host identity"
+        );
+        Ok(HostDescriptor {
+            host_id: resolved_host,
+            response_verifying_key: resolved.response_verifying_key(),
+            response_ml_dsa65: resolved.response_ml_dsa65().to_vec(),
+            transport: resolved.transport().clone(),
+            evidence: resolved.evidence().clone(),
+            expires_at_unix_ms: resolved.expires_at_unix_ms(),
+        })
+    }
+}
+
+/// Route class carried by a signed reach proof.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReachPathClass {
+    Direct,
+    Relay,
+}
+
+/// Fresh hybrid-signed reach proof for one adjacent pipeline boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReachAttestation {
+    pub from: HostId,
+    pub to: HostId,
+    pub epoch: u64,
+    pub nonce: [u8; 32],
+    pub path_class: ReachPathClass,
+    pub established_via: String,
+    pub rtt_estimate_micros: u64,
+    pub expires_at_unix_ms: i64,
+    signature: Vec<u8>,
+}
+
+impl ReachAttestation {
+    /// Sign a fresh attestation with the target host's hybrid identity keys.
+    pub fn sign(
+        from: HostId,
+        to: HostId,
+        epoch: u64,
+        nonce: [u8; 32],
+        path_class: ReachPathClass,
+        established_via: String,
+        rtt_estimate_micros: u64,
+        expires_at_unix_ms: i64,
+        signing_key: &hyprstream_rpc::SigningKey,
+        pq_signing_key: &hyprstream_rpc::crypto::pq::MlDsaSigningKey,
+    ) -> Result<Self> {
+        let mut attestation = Self {
+            from,
+            to,
+            epoch,
+            nonce,
+            path_class,
+            established_via,
+            rtt_estimate_micros,
+            expires_at_unix_ms,
+            signature: Vec::new(),
+        };
+        anyhow::ensure!(
+            !attestation.established_via.trim().is_empty(),
+            "reach attestation has no established transport"
+        );
+        attestation.signature = hyprstream_crypto::cose_sign::sign_composite(
+            signing_key,
+            Some(pq_signing_key),
+            &attestation.signing_bytes(),
+            REACH_ATTESTATION_AAD,
+        )?;
+        Ok(attestation)
+    }
+
+    fn signing_bytes(&self) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        for field in [
+            self.from.0.as_str().as_bytes(),
+            self.to.0.as_str().as_bytes(),
+        ] {
+            bytes.extend_from_slice(&(field.len() as u64).to_be_bytes());
+            bytes.extend_from_slice(field);
+        }
+        bytes.extend_from_slice(&self.epoch.to_be_bytes());
+        bytes.extend_from_slice(&self.nonce);
+        bytes.push(match self.path_class {
+            ReachPathClass::Direct => 0,
+            ReachPathClass::Relay => 1,
+        });
+        bytes.extend_from_slice(&(self.established_via.len() as u64).to_be_bytes());
+        bytes.extend_from_slice(self.established_via.as_bytes());
+        bytes.extend_from_slice(&self.rtt_estimate_micros.to_be_bytes());
+        bytes.extend_from_slice(&self.expires_at_unix_ms.to_be_bytes());
+        bytes
+    }
+
+    fn verify_for(&self, from: &HostId, to: &HostDescriptor, now_unix_ms: i64) -> Result<()> {
+        anyhow::ensure!(
+            self.from == *from,
+            "reach attestation source does not match boundary"
+        );
+        anyhow::ensure!(
+            self.to == to.host_id,
+            "reach attestation target does not match boundary"
+        );
+        anyhow::ensure!(
+            !self.established_via.trim().is_empty(),
+            "reach attestation has no established transport"
+        );
+        anyhow::ensure!(
+            self.expires_at_unix_ms > now_unix_ms,
+            "reach attestation expired"
+        );
+        anyhow::ensure!(
+            self.expires_at_unix_ms <= to.expires_at_unix_ms,
+            "reach attestation outlives its resolved host descriptor"
+        );
+        let pq_key = hyprstream_rpc::crypto::pq::ml_dsa_vk_from_bytes(&to.response_ml_dsa65)
+            .context("host descriptor has invalid ML-DSA-65 key")?;
+        hyprstream_crypto::cose_sign::verify_composite(
+            &self.signature,
+            &to.response_verifying_key,
+            Some(&pq_key),
+            &self.signing_bytes(),
+            REACH_ATTESTATION_AAD,
+            true,
+        )
+        .context("reach attestation signature is invalid")
+        .map(|_| ())
+    }
+}
+
+/// Network and MAC-PEP view used only by admission, never by the pure planner.
+#[async_trait]
+pub trait NetworkView: Send + Sync {
+    /// Authorize this host-process boundary through the installed MAC PEP.
+    async fn authorize_boundary(&self, from: &HostId, to: &HostId) -> Result<()>;
+
+    /// Return a fresh, target-signed reach proof for this boundary.
+    ///
+    /// There is deliberately no `Option` result: absent evidence is an error and
+    /// therefore refuses admission.
+    async fn reachable(&self, from: &HostId, to: &HostId) -> Result<ReachAttestation>;
+}
+
+/// Evidence bound to an exact pure plan and expiring with its shortest proof.
+#[derive(Debug, Clone)]
+pub struct AdmissionRecord {
+    pub plan_digest: [u8; 64],
+    pub attestations: Vec<ReachAttestation>,
+    pub expires_at_unix_ms: i64,
+}
+
+/// Resolve every planned host, authorize each adjacent boundary, and fail closed
+/// unless each boundary supplies a fresh valid [`ReachAttestation`].
+pub async fn admit(
+    plan: &InterhostPipelinePlan,
+    resolver: &dyn HostResolver,
+    network: &dyn NetworkView,
+) -> Result<AdmissionRecord> {
+    let required_capabilities = BTreeSet::from(["hyprstream-moq/1".to_owned()]);
+    let mut descriptors = BTreeMap::new();
+    for stage in &plan.stages {
+        let descriptor = resolver
+            .resolve_host(&stage.host_id, &required_capabilities)
+            .await
+            .with_context(|| format!("failed to resolve pipeline host {}", stage.host_id.0))?;
+        anyhow::ensure!(
+            descriptor.host_id == stage.host_id,
+            "resolver returned a descriptor for a different host"
+        );
+        descriptors.insert(stage.host_id.clone(), descriptor);
+    }
+    admit_resolved(plan, &descriptors, network).await
+}
+
+/// Production path: discovery validates each host identity before the pure
+/// planner runs, then the exact resulting plan is admitted against those snapshots.
+pub async fn plan_and_admit(
+    model: &ModelFootprint,
+    candidates: &[HostCapacity],
+    options: PlannerOptions,
+    resolver: &dyn HostResolver,
+    network: &dyn NetworkView,
+) -> Result<(InterhostPipelinePlan, AdmissionRecord)> {
+    let required_capabilities = BTreeSet::from(["hyprstream-moq/1".to_owned()]);
+    let mut descriptors = BTreeMap::new();
+    for candidate in candidates {
+        let descriptor = resolver
+            .resolve_host(&candidate.host_id, &required_capabilities)
+            .await
+            .with_context(|| format!("failed to resolve pipeline host {}", candidate.host_id.0))?;
+        anyhow::ensure!(
+            descriptor.host_id == candidate.host_id,
+            "resolver returned a different host"
+        );
+        descriptors.insert(candidate.host_id.clone(), descriptor);
+    }
+    let plan = InterhostPipelinePlanner::plan(model, candidates, options)?;
+    let record = admit_resolved(&plan, &descriptors, network).await?;
+    Ok((plan, record))
+}
+
+async fn admit_resolved(
+    plan: &InterhostPipelinePlan,
+    descriptors: &BTreeMap<HostId, HostDescriptor>,
+    network: &dyn NetworkView,
+) -> Result<AdmissionRecord> {
+    anyhow::ensure!(
+        !plan.stages.is_empty(),
+        "cannot admit an empty pipeline plan"
+    );
+    let now = unix_millis_now()?;
+    let mut attestations = Vec::with_capacity(plan.boundary_count());
+    let mut expires_at_unix_ms = i64::MAX;
+    for pair in plan.stages.windows(2) {
+        let from = &pair[0].host_id;
+        let to = &pair[1].host_id;
+        network.authorize_boundary(from, to).await?;
+        let attestation = network.reachable(from, to).await?;
+        let descriptor = descriptors
+            .get(to)
+            .ok_or_else(|| anyhow!("planned target host was not resolved"))?;
+        attestation.verify_for(from, descriptor, now)?;
+        expires_at_unix_ms = expires_at_unix_ms.min(attestation.expires_at_unix_ms);
+        attestations.push(attestation);
+    }
+    if attestations.is_empty() {
+        expires_at_unix_ms = now;
+    }
+    Ok(AdmissionRecord {
+        plan_digest: plan_digest(plan),
+        attestations,
+        expires_at_unix_ms,
+    })
+}
+
+fn plan_digest(plan: &InterhostPipelinePlan) -> [u8; 64] {
+    let mut digest = Sha512::new();
+    for stage in &plan.stages {
+        digest.update((stage.host_id.0.as_str().len() as u64).to_be_bytes());
+        digest.update(stage.host_id.0.as_str().as_bytes());
+        digest.update((stage.stage_index as u64).to_be_bytes());
+        digest.update((stage.layer_range.start as u64).to_be_bytes());
+        digest.update((stage.layer_range.end as u64).to_be_bytes());
+        digest.update(stage.estimated_weight_bytes.to_be_bytes());
+        digest.update(stage.usable_vram_bytes.to_be_bytes());
+    }
+    digest.finalize().into()
+}
+
+fn unix_millis_now() -> Result<i64> {
+    let elapsed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock is before the Unix epoch")?;
+    i64::try_from(elapsed.as_millis()).map_err(|_| anyhow!("Unix timestamp does not fit i64"))
+}
+
 /// Exact pipeline bubble/utilization sizing for `S` stages and `m`
 /// microbatches in flight.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -595,6 +950,7 @@ pub struct PipelineJobRecovery {
     epoch: u64,
     state: PipelineJobState,
     in_flight: BTreeSet<u64>,
+    completed: BTreeSet<u64>,
     pending_replay: BTreeSet<u64>,
     resume_draining: bool,
 }
@@ -609,6 +965,7 @@ impl PipelineJobRecovery {
             epoch: 0,
             state: PipelineJobState::Running,
             in_flight: BTreeSet::new(),
+            completed: BTreeSet::new(),
             pending_replay: BTreeSet::new(),
             resume_draining: false,
         })
@@ -628,9 +985,9 @@ impl PipelineJobRecovery {
         if self.state != PipelineJobState::Running {
             bail!("pipeline job is not accepting work while {:?}", self.state);
         }
-        if !self.in_flight.insert(microbatch_id) {
+        if self.completed.contains(&microbatch_id) || !self.in_flight.insert(microbatch_id) {
             bail!(
-                "microbatch {microbatch_id} is already in flight in epoch {}",
+                "microbatch {microbatch_id} was already admitted in epoch {}",
                 self.epoch
             );
         }
@@ -651,6 +1008,7 @@ impl PipelineJobRecovery {
         if !self.in_flight.remove(&microbatch_id) {
             bail!("microbatch {microbatch_id} is not in flight in epoch {epoch}");
         }
+        self.completed.insert(microbatch_id);
         Ok(CompletionDisposition::Accepted)
     }
 
@@ -671,7 +1029,16 @@ impl PipelineJobRecovery {
     }
 
     /// Abort the current epoch immediately after a stage failure.
-    pub fn stage_failed(&mut self, failed_stage: usize) -> Result<RestartDirective> {
+    pub fn stage_failed(
+        &mut self,
+        expected_epoch: u64,
+        failed_stage: usize,
+    ) -> Result<RestartDirective> {
+        anyhow::ensure!(
+            expected_epoch == self.epoch,
+            "stage failure epoch {expected_epoch} does not match current epoch {}",
+            self.epoch
+        );
         if failed_stage >= self.stage_count {
             bail!(
                 "failed stage {failed_stage} is outside a {}-stage pipeline",
@@ -695,6 +1062,7 @@ impl PipelineJobRecovery {
         let aborted_microbatches = aborted.iter().copied().collect();
         self.pending_replay = aborted;
         self.epoch = new_epoch;
+        self.completed.clear();
         self.resume_draining = resume_draining;
         self.state = PipelineJobState::AwaitingReplacement;
         Ok(RestartDirective {
@@ -707,10 +1075,15 @@ impl PipelineJobRecovery {
     }
 
     /// Install a healthy replacement chain and resume at the already-advanced epoch.
-    pub fn replacement_ready(&mut self, stage_count: usize) -> Result<()> {
+    pub fn replacement_ready(&mut self, expected_epoch: u64, stage_count: usize) -> Result<()> {
         if self.state != PipelineJobState::AwaitingReplacement {
             bail!("replacement is only valid after a stage failure");
         }
+        anyhow::ensure!(
+            expected_epoch == self.epoch,
+            "replacement epoch {expected_epoch} does not match current epoch {}",
+            self.epoch
+        );
         if stage_count == 0 {
             bail!("a replacement pipeline requires at least one stage");
         }
@@ -832,9 +1205,12 @@ mod tests {
 
     fn host(id: &str, capacity: u64) -> HostCapacity {
         HostCapacity {
-            host_id: id.to_owned(),
-            lan_id: "rack-a".to_owned(),
-            available_vram_bytes: capacity,
+            host_id: HostId::new(Did::new(format!("did:at9p:{id}"))).unwrap(),
+            attributes: HostAttributes {
+                available_vram_bytes: capacity,
+                affinity: Some("rack-a".to_owned()),
+                declared_bandwidth_bytes_per_second: None,
+            },
         }
     }
 
@@ -856,9 +1232,9 @@ mod tests {
         .unwrap();
 
         assert_eq!(plan.boundary_count(), 1);
-        assert_eq!(plan.stages[0].host_id, "mi210");
+        assert_eq!(plan.stages[0].host_id.0.as_str(), "did:at9p:mi210");
         assert_eq!(plan.stages[0].layer_range, 0..8);
-        assert_eq!(plan.stages[1].host_id, "rtx5090");
+        assert_eq!(plan.stages[1].host_id.0.as_str(), "did:at9p:rtx5090");
         assert_eq!(plan.stages[1].layer_range, 8..12);
     }
 
@@ -872,23 +1248,21 @@ mod tests {
         )
         .unwrap();
         assert_eq!(plan.stages.len(), 1);
-        assert_eq!(plan.stages[0].host_id, "big");
+        assert_eq!(plan.stages[0].host_id.0.as_str(), "did:at9p:big");
         assert_eq!(plan.stages[0].layer_range, 0..12);
     }
 
     #[test]
-    fn planner_rejects_cross_lan_and_insufficient_capacity() {
+    fn planner_uses_affinity_only_as_a_cost_hint_and_rejects_insufficient_capacity() {
         let model = synthetic_model(12, 10);
         let mut remote = host("remote", 200);
-        remote.lan_id = "wan".to_owned();
+        remote.attributes.affinity = Some("wan".to_owned());
         assert!(InterhostPipelinePlanner::plan(
             &model,
             &[host("local", 100), remote],
             no_reserve()
         )
-        .unwrap_err()
-        .to_string()
-        .contains("one non-empty LAN"));
+        .is_ok());
         assert!(InterhostPipelinePlanner::plan(
             &model,
             &[host("a", 50), host("b", 50)],
@@ -911,7 +1285,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(plan.stages.len(), 1);
-        assert_eq!(plan.stages[0].host_id, "fits");
+        assert_eq!(plan.stages[0].host_id.0.as_str(), "did:at9p:fits");
         assert_eq!(plan.stages[0].usable_vram_bytes, 150);
     }
 
@@ -968,6 +1342,33 @@ mod tests {
     }
 
     #[test]
+    fn manifest_without_authoritative_total_size_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.json"),
+            r#"{
+                "num_hidden_layers": 2,
+                "hidden_size": 8,
+                "intermediate_size": 16,
+                "vocab_size": 32,
+                "num_attention_heads": 2,
+                "torch_dtype": "float32"
+            }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("model.safetensors.index.json"),
+            r#"{"metadata":{},"weight_map":{}}"#,
+        )
+        .unwrap();
+
+        assert!(ModelFootprint::from_model_dir(dir.path())
+            .unwrap_err()
+            .to_string()
+            .contains("authoritative capacity bound"));
+    }
+
+    #[test]
     fn moe_footprint_counts_all_resident_experts() {
         let dense_dir = tempfile::tempdir().unwrap();
         let moe_dir = tempfile::tempdir().unwrap();
@@ -994,6 +1395,177 @@ mod tests {
         assert!(moe.layer_bytes() > dense.layer_bytes() * 4);
     }
 
+    struct MockHostResolver {
+        descriptors: BTreeMap<HostId, HostDescriptor>,
+        refuse: bool,
+    }
+
+    #[async_trait]
+    impl HostResolver for MockHostResolver {
+        async fn resolve_host(
+            &self,
+            host: &HostId,
+            _required_capabilities: &BTreeSet<String>,
+        ) -> Result<HostDescriptor> {
+            if self.refuse {
+                bail!("host is unresolvable");
+            }
+            self.descriptors
+                .get(host)
+                .cloned()
+                .ok_or_else(|| anyhow!("host is unresolvable"))
+        }
+    }
+
+    enum TestReachResponse {
+        Attested,
+        Missing,
+        Expired,
+    }
+
+    struct MockNetworkView {
+        signing_keys: BTreeMap<
+            HostId,
+            (
+                hyprstream_rpc::SigningKey,
+                hyprstream_rpc::crypto::pq::MlDsaSigningKey,
+            ),
+        >,
+        response: TestReachResponse,
+        deny_mac: bool,
+    }
+
+    #[async_trait]
+    impl NetworkView for MockNetworkView {
+        async fn authorize_boundary(&self, _from: &HostId, _to: &HostId) -> Result<()> {
+            anyhow::ensure!(!self.deny_mac, "MAC PEP denied pipeline boundary");
+            Ok(())
+        }
+
+        async fn reachable(&self, from: &HostId, to: &HostId) -> Result<ReachAttestation> {
+            if matches!(self.response, TestReachResponse::Missing) {
+                bail!("missing reach attestation");
+            }
+            let (signing_key, pq_signing_key) = self
+                .signing_keys
+                .get(to)
+                .ok_or_else(|| anyhow!("no target attestation key"))?;
+            let now = unix_millis_now()?;
+            let expiry = if matches!(self.response, TestReachResponse::Expired) {
+                now - 1
+            } else {
+                now + 60_000
+            };
+            ReachAttestation::sign(
+                from.clone(),
+                to.clone(),
+                7,
+                [7; 32],
+                ReachPathClass::Direct,
+                "iroh".to_owned(),
+                100,
+                expiry,
+                signing_key,
+                pq_signing_key,
+            )
+        }
+    }
+
+    fn admission_fixture(
+        response: TestReachResponse,
+        refuse: bool,
+    ) -> (Vec<HostCapacity>, MockHostResolver, MockNetworkView) {
+        let candidates = vec![host("alpha", 80), host("beta", 80)];
+        let now = unix_millis_now().unwrap();
+        let mut descriptors = BTreeMap::new();
+        let mut signing_keys = BTreeMap::new();
+        for (index, candidate) in candidates.iter().enumerate() {
+            let tag = u8::try_from(index + 1).unwrap();
+            let signing_key = hyprstream_rpc::SigningKey::from_bytes(&[tag; 32]);
+            let (pq_signing_key, pq_verifying_key) =
+                hyprstream_rpc::crypto::pq::ml_dsa_generate_keypair();
+            descriptors.insert(
+                candidate.host_id.clone(),
+                HostDescriptor {
+                    host_id: candidate.host_id.clone(),
+                    response_verifying_key: signing_key.verifying_key(),
+                    response_ml_dsa65: hyprstream_rpc::crypto::pq::ml_dsa_vk_bytes(
+                        &pq_verifying_key,
+                    ),
+                    transport: TransportConfig::iroh([tag; 32], Vec::new(), None),
+                    evidence: ResolutionEvidence {
+                        accepted_state_digest: [tag; 64],
+                        accepted_state_epoch: 1,
+                        selected_fingerprint: format!("host-{tag}"),
+                        ordered_decisions: Vec::new(),
+                    },
+                    expires_at_unix_ms: now + 120_000,
+                },
+            );
+            signing_keys.insert(candidate.host_id.clone(), (signing_key, pq_signing_key));
+        }
+        (
+            candidates,
+            MockHostResolver {
+                descriptors,
+                refuse,
+            },
+            MockNetworkView {
+                signing_keys,
+                response,
+                deny_mac: false,
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn real_admission_path_invokes_planner_and_records_verified_reach() {
+        let (candidates, resolver, network) = admission_fixture(TestReachResponse::Attested, false);
+        let (plan, record) = plan_and_admit(
+            &synthetic_model(12, 10),
+            &candidates,
+            no_reserve(),
+            &resolver,
+            &network,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(plan.boundary_count(), 1);
+        assert_eq!(record.attestations.len(), 1);
+        assert!(record.expires_at_unix_ms > unix_millis_now().unwrap());
+    }
+
+    #[tokio::test]
+    async fn missing_or_invalid_reach_attestation_refuses_admission() {
+        for response in [TestReachResponse::Missing, TestReachResponse::Expired] {
+            let (candidates, resolver, network) = admission_fixture(response, false);
+            assert!(plan_and_admit(
+                &synthetic_model(12, 10),
+                &candidates,
+                no_reserve(),
+                &resolver,
+                &network,
+            )
+            .await
+            .is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn unresolvable_host_refuses_admission() {
+        let (candidates, resolver, network) = admission_fixture(TestReachResponse::Attested, true);
+        assert!(plan_and_admit(
+            &synthetic_model(12, 10),
+            &candidates,
+            no_reserve(),
+            &resolver,
+            &network,
+        )
+        .await
+        .is_err());
+    }
+
     #[test]
     fn bubble_fraction_and_required_depth_are_exact() {
         let single = MicrobatchSizing::for_depth(4, 1).unwrap();
@@ -1012,7 +1584,7 @@ mod tests {
         let mut recovery = PipelineJobRecovery::new(4).unwrap();
         let old_epoch = recovery.admit(10).unwrap();
         recovery.admit(11).unwrap();
-        let restart = recovery.stage_failed(2).unwrap();
+        let restart = recovery.stage_failed(old_epoch, 2).unwrap();
 
         assert_eq!(restart.old_epoch, old_epoch);
         assert_eq!(restart.new_epoch, old_epoch + 1);
@@ -1024,7 +1596,7 @@ mod tests {
             CompletionDisposition::StaleEpochDiscarded
         );
 
-        recovery.replacement_ready(3).unwrap();
+        recovery.replacement_ready(restart.new_epoch, 3).unwrap();
         assert_eq!(recovery.admit(10).unwrap(), restart.new_epoch);
     }
 
@@ -1039,6 +1611,27 @@ mod tests {
             recovery.complete(epoch, 10).unwrap(),
             CompletionDisposition::Accepted
         );
+    }
+
+    #[test]
+    fn same_epoch_microbatch_id_reuse_is_refused_to_prevent_aba_completion() {
+        let mut recovery = PipelineJobRecovery::new(2).unwrap();
+        let epoch = recovery.admit(10).unwrap();
+        assert_eq!(
+            recovery.complete(epoch, 10).unwrap(),
+            CompletionDisposition::Accepted
+        );
+        assert!(recovery.admit(10).is_err());
+    }
+
+    #[test]
+    fn delayed_recovery_control_messages_are_epoch_fenced() {
+        let mut recovery = PipelineJobRecovery::new(2).unwrap();
+        let epoch = recovery.epoch();
+        let restart = recovery.stage_failed(epoch, 0).unwrap();
+        assert!(recovery.replacement_ready(epoch, 2).is_err());
+        assert!(recovery.stage_failed(epoch, 0).is_err());
+        recovery.replacement_ready(restart.new_epoch, 2).unwrap();
     }
 
     #[test]
@@ -1063,9 +1656,9 @@ mod tests {
         let old_epoch = recovery.admit(7).unwrap();
         recovery.begin_drain().unwrap();
 
-        let restart = recovery.stage_failed(1).unwrap();
+        let restart = recovery.stage_failed(old_epoch, 1).unwrap();
         assert_eq!(restart.aborted_microbatches, vec![7]);
-        recovery.replacement_ready(2).unwrap();
+        recovery.replacement_ready(restart.new_epoch, 2).unwrap();
 
         assert_eq!(recovery.state(), PipelineJobState::Draining);
         assert!(recovery.admit(8).is_err());
@@ -1093,7 +1686,7 @@ mod tests {
         let mut failed = PipelineJobRecovery::new(2).unwrap();
         let mut healthy = PipelineJobRecovery::new(2).unwrap();
         failed.admit(1).unwrap();
-        failed.stage_failed(0).unwrap();
+        failed.stage_failed(0, 0).unwrap();
         assert_eq!(healthy.admit(1).unwrap(), 0);
         assert_eq!(healthy.state(), PipelineJobState::Running);
     }
