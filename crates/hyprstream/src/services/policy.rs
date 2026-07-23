@@ -16,7 +16,7 @@ use crate::services::generated::policy_client::{
     AddGrouping, RemoveGrouping, SetBranchVisibility,
     RegisterEventPrefix, SubscribeEventPrefix, GetPendingSubscribers, DepositWrappedKeys,
     EventPrefixAccess, PendingSubscribers,
-    ResolveServiceKey, RegisterServiceKey, ServiceKeyResponse,
+    ResolveServiceKey, RegisterServiceKey, ServiceKeyCandidate, ServiceKeyResponse,
     RefreshServiceTokenRequest, ExchangeWit,
     dispatch_policy, serialize_response,
 };
@@ -253,6 +253,30 @@ fn validate_event_prefix(prefix: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Build the rotation-safe wire projection of a service's published key set.
+///
+/// The scalar fields remain only for wire compatibility and are intentionally
+/// empty: consumers which cannot handle `keys` must fail closed.
+fn published_service_key_response(
+    trust: &hyprstream_service::TrustStore,
+    service_name: &str,
+) -> Result<ServiceKeyResponse> {
+    let keys = trust.published_keys_for_scope(service_name);
+    if keys.is_empty() {
+        anyhow::bail!("service key '{service_name}' not registered");
+    }
+    Ok(ServiceKeyResponse {
+        verifying_key: Vec::new(),
+        service_jwt: None,
+        keys: keys.into_iter().map(|entry| ServiceKeyCandidate {
+            key_id: entry.key_id,
+            verifying_key: entry.verifying_key.to_bytes().to_vec(),
+            service_jwt: entry.attestation.jwt,
+            not_after: entry.attestation.expires_at,
+        }).collect(),
+    })
+}
+
 #[async_trait::async_trait(?Send)]
 impl PolicyHandler for PolicyService {
     async fn authorize(&self, ctx: &EnvelopeContext, resource: &str, operation: &str) -> Result<()> {
@@ -395,9 +419,11 @@ impl PolicyHandler for PolicyService {
         let service_key_bytes: Option<[u8; 32]> = if is_service_token {
             let svc_name = &subject["service:".len()..];
             let trust = hyprstream_service::global_trust_store();
-            let vk = trust.resolve_one(svc_name).ok_or_else(|| {
-                anyhow!("service key '{svc_name}' not registered; refusing to issue a service token with a fabricated cnf.jwk")
-            })?;
+            let vk = VerifyingKey::from_bytes(&ctx.cnf)
+                .map_err(|_| anyhow!("service token caller has an invalid Ed25519 verifying key"))?;
+            if !trust.is_authorized(&vk, svc_name) {
+                anyhow::bail!("service key '{svc_name}' is not registered for the issuing caller; refusing to fabricate cnf.jwk");
+            }
             Some(*vk.as_bytes())
         } else {
             use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
@@ -1314,18 +1340,12 @@ impl PolicyHandler for PolicyService {
         // because a guessed key produces a silent mis-verify ("Response signed by
         // unexpected key") three layers away at the envelope check. Registered-or-
         // error converts that into a clear, early failure.
-        let trust = hyprstream_service::global_trust_store();
-        let vk = trust.resolve_one(&data.service_name)
-            .ok_or_else(|| anyhow!("service key '{}' not registered", data.service_name))?;
-        let att = trust.get(&vk)
-            .ok_or_else(|| anyhow!("service key '{}' not registered (no attestation)", data.service_name))?;
-        debug!("Resolved service key for '{}'", data.service_name);
-        Ok(PolicyResponseVariant::ResolveServiceKeyResult(
-            ServiceKeyResponse {
-                verifying_key: vk.to_bytes().to_vec(),
-                service_jwt: att.jwt.clone(),
-            }
-        ))
+        let response = published_service_key_response(
+            hyprstream_service::global_trust_store(),
+            &data.service_name,
+        )?;
+        debug!(key_count = response.keys.len(), "Resolved service key set for '{}'", data.service_name);
+        Ok(PolicyResponseVariant::ResolveServiceKeyResult(response))
     }
 
     async fn handle_register_service_key(
@@ -1415,13 +1435,14 @@ impl PolicyHandler for PolicyService {
         let now = chrono::Utc::now().timestamp();
         let expires_at = now + ttl;
 
-        // cnf.jwk must be the service's REGISTERED key, never a CA-derived guess
-        // (#441/#806) — see handle_issue_token for the rationale. Registered-or-
-        // error: refuse to refresh a service token we can't bind to a real key.
+        // Bind the renewed JWT to the verified caller key, not an arbitrary
+        // sibling which happens to be published during overlap.
         let trust = hyprstream_service::global_trust_store();
-        let vk = trust.resolve_one(svc_name).ok_or_else(|| {
-            anyhow!("service key '{svc_name}' not registered; refusing to refresh a service token with a fabricated cnf.jwk")
-        })?;
+        let vk = VerifyingKey::from_bytes(&ctx.cnf)
+            .map_err(|_| anyhow!("refresh caller has an invalid Ed25519 verifying key"))?;
+        if !trust.is_authorized(&vk, svc_name) {
+            anyhow::bail!("service key '{svc_name}' is not registered for the renewing caller; refusing to fabricate cnf.jwk");
+        }
 
         let issuer = self.default_audience.clone().unwrap_or_default();
         let claims = hyprstream_rpc::auth::Claims::new(subject.clone(), now, expires_at)
@@ -1713,6 +1734,16 @@ mod tests {
         }
     }
 
+    fn attestation(expires_at: i64, jwt: &str) -> hyprstream_service::Attestation {
+        hyprstream_service::Attestation {
+            scopes: std::iter::once("model".to_owned()).collect(),
+            subject: None,
+            jwt: Some(jwt.to_owned()),
+            expires_at,
+            attested_by: None,
+        }
+    }
+
     #[tokio::test]
     async fn issue_token_rejects_path_form_subject_at_shared_signing_boundary() {
         let (service, _root) = test_service().await;
@@ -1754,5 +1785,26 @@ mod tests {
                 "legitimate subject {subject:?} was rejected by the path-form guard",
             );
         }
+    }
+
+    #[test]
+    fn resolve_service_key_publishes_every_overlap_candidate() {
+        let trust = hyprstream_service::TrustStore::new();
+        let retired = SigningKey::generate(&mut rand::rngs::OsRng).verifying_key();
+        let lead = SigningKey::generate(&mut rand::rngs::OsRng).verifying_key();
+        let now = chrono::Utc::now().timestamp();
+        trust.insert(retired, attestation(now + 60, "retired-attestation"));
+        trust.insert(lead, attestation(0, "lead-attestation"));
+
+        let response = match published_service_key_response(&trust, "model") {
+            Ok(response) => response,
+            Err(error) => panic!("key set: {error}"),
+        };
+        assert!(response.verifying_key.is_empty(), "no singleton fallback");
+        assert!(response.service_jwt.is_none(), "no singleton attestation fallback");
+        assert_eq!(response.keys.len(), 2, "overlap keys must both be published");
+        assert!(response.keys.iter().any(|entry| entry.verifying_key == retired.to_bytes()));
+        assert!(response.keys.iter().any(|entry| entry.verifying_key == lead.to_bytes()));
+        assert!(response.keys.iter().all(|entry| entry.key_id.starts_with("ed25519:")));
     }
 }

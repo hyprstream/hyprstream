@@ -360,17 +360,32 @@ struct PendingSubscribers {
   pubkeys @0 :List(Data);
 }
 
-# Resolve a service name to its Ed25519 verifying key
+# Resolve a service name to its published Ed25519 verification-key set
 struct ResolveServiceKey {
   serviceName @0 :Text;
 }
 
-# Response containing a service's verifying key and optional CA-signed attestation
+# One named, CA-attested service verification key.
+struct ServiceKeyCandidate {
+  # Stable identifier derived from the Ed25519 public key.
+  keyId @0 :Text;
+  # Ed25519 verifying key (32 bytes).
+  verifyingKey @1 :Data;
+  # CA-signed JWT attesting this key (optional for bootstrap entries).
+  serviceJwt @2 :Text $optional;
+  # Unix timestamp at which this candidate stops being accepted (0 = no expiry).
+  notAfter @3 :Int64;
+}
+
+# Response containing every currently valid, named service verification key.
 struct ServiceKeyResponse {
-  # Ed25519 verifying key (32 bytes)
+  # Deprecated singleton projection. New producers leave this empty so old
+  # consumers fail closed instead of silently selecting an arbitrary key.
   verifyingKey @0 :Data;
-  # CA-signed JWT attesting this key (optional, for verification)
+  # Deprecated singleton projection; see `keys`.
   serviceJwt @1 :Text $optional;
+  # All compatible candidates; order conveys no authority.
+  keys @2 :List(ServiceKeyCandidate);
 }
 
 # Register a service's verifying key with the CA (PolicyService)

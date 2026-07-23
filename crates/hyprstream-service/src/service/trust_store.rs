@@ -27,6 +27,18 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use tracing;
 
+/// A named, currently published service verification key.
+///
+/// `key_id` is derived from the public key, so it is stable across processes
+/// and cannot be chosen independently of the material it identifies.  The
+/// attestation carries the signed validity interval and proof of authorization.
+#[derive(Clone, Debug)]
+pub struct PublishedServiceKey {
+    pub key_id: String,
+    pub verifying_key: VerifyingKey,
+    pub attestation: Attestation,
+}
+
 /// An attestation binding a key to authorization scopes.
 #[derive(Clone, Debug)]
 pub struct Attestation {
@@ -124,16 +136,41 @@ impl TrustStore {
     /// Returns an empty Vec if no keys match. Useful for finding
     /// candidate endpoints when multiple instances exist.
     pub fn keys_for_scope(&self, scope: &str) -> Vec<VerifyingKey> {
-        let now = chrono::Utc::now().timestamp();
-        self.inner
+        self.published_keys_for_scope(scope)
+            .into_iter()
+            .map(|entry| entry.verifying_key)
+            .collect()
+    }
+
+    /// Get every named, unexpired verification key published for a service scope.
+    ///
+    /// Consumers must select an entry by `key_id`, or try every compatible
+    /// candidate.  This intentionally exposes no authority-bearing positional
+    /// selection: a service may publish a drain and lead key simultaneously.
+    pub fn published_keys_for_scope(&self, scope: &str) -> Vec<PublishedServiceKey> {
+        self.published_keys_for_scope_at(scope, chrono::Utc::now().timestamp())
+    }
+
+    /// Resolve the published key set at a supplied Unix timestamp.
+    ///
+    /// This is useful to consumers which evaluate a signed assertion at its
+    /// issuance time and to deterministic rotation tests.
+    pub fn published_keys_for_scope_at(&self, scope: &str, now: i64) -> Vec<PublishedServiceKey> {
+        let mut keys = self
+            .inner
             .iter()
             .filter(|entry| {
                 let att = entry.value();
-                (att.expires_at == 0 || att.expires_at > now)
-                    && att.scopes.contains(scope)
+                (att.expires_at == 0 || att.expires_at > now) && att.scopes.contains(scope)
             })
-            .map(|entry| *entry.key())
-            .collect()
+            .map(|entry| PublishedServiceKey {
+                key_id: service_key_id(entry.key()),
+                verifying_key: *entry.key(),
+                attestation: entry.value().clone(),
+            })
+            .collect::<Vec<_>>();
+        keys.sort_by(|left, right| left.key_id.cmp(&right.key_id));
+        keys
     }
 
     /// Get the attestation for a specific key, if present and not expired.
@@ -211,6 +248,13 @@ impl TrustStore {
     }
 }
 
+/// Canonical public identifier for an Ed25519 service verification key.
+pub fn service_key_id(key: &VerifyingKey) -> String {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+
+    format!("ed25519:{}", URL_SAFE_NO_PAD.encode(key.to_bytes()))
+}
+
 impl Default for TrustStore {
     fn default() -> Self {
         Self::new()
@@ -261,8 +305,6 @@ static TRUST_STORE: once_cell::sync::Lazy<TrustStore> = once_cell::sync::Lazy::n
 pub fn global_trust_store() -> &'static TrustStore {
     &TRUST_STORE
 }
-
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -352,6 +394,40 @@ mod tests {
         assert_eq!(keys.len(), 2);
         assert!(keys.contains(&key_a));
         assert!(keys.contains(&key_b));
+    }
+
+    #[test]
+    fn published_key_set_keeps_overlap_until_retirement_window_ends() {
+        let store = TrustStore::new();
+        let (_, retired) = random_key();
+        let (_, lead) = random_key();
+        let now = chrono::Utc::now().timestamp();
+        let retirement = now + 60;
+
+        store.insert(retired, make_attestation(&["model"], retirement));
+        store.insert(lead, make_attestation(&["model"], 0));
+
+        let overlap = store.published_keys_for_scope_at("model", now);
+        assert_eq!(
+            overlap.len(),
+            2,
+            "drain and lead keys must publish together"
+        );
+        assert!(overlap.iter().any(|entry| entry.verifying_key == retired));
+        assert!(overlap.iter().any(|entry| entry.verifying_key == lead));
+        assert!(store.is_authorized(&retired, "model"));
+        assert!(store.is_authorized(&lead, "model"));
+        assert!(overlap
+            .iter()
+            .all(|entry| entry.key_id.starts_with("ed25519:")));
+
+        let after_retirement = store.published_keys_for_scope_at("model", retirement);
+        assert_eq!(
+            after_retirement.len(),
+            1,
+            "retired key must leave the set at its bounded expiry"
+        );
+        assert_eq!(after_retirement[0].verifying_key, lead);
     }
 
     #[test]
