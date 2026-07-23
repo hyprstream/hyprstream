@@ -219,6 +219,10 @@ pub fn create_app(state: Arc<OAuthState>, cors_config: &crate::config::CorsConfi
             "/.well-known/did.json",
             get(did_document::root_did_document),
         )
+        .route(
+            "/.well-known/at9p/:cid.cbor",
+            get(did_document::at9p_capsule),
+        )
         // atproto handle→DID HTTP resolution (#500) — plaintext bare DID
         .route("/.well-known/atproto-did", get(did_document::atproto_did))
         .route(
