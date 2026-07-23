@@ -1300,11 +1300,17 @@ impl OAuthState {
         let pq_sk = hyprstream_rpc::node_identity::derive_mesh_mldsa_key(&key);
         self.mesh_pq_verifying_key =
             Some(hyprstream_rpc::crypto::pq::ml_dsa_sk_to_vk_bytes(&pq_sk));
-        self.at9p_identity = Some(super::did_document::render_at9p_identity(
-            &self.issuer_url,
-            &key,
-            &pq_sk,
-        )?);
+        match super::did_document::render_at9p_identity(&self.issuer_url, &key, &pq_sk) {
+            Ok(identity) => self.at9p_identity = Some(identity),
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    issuer = %self.issuer_url,
+                    "skipping at9p identity publication"
+                );
+                self.at9p_identity = None;
+            }
+        }
         self.mesh_kem_public = mesh_kem_public_for_policy(&key, policy, |key| {
             hyprstream_rpc::node_identity::derive_mesh_kem_recipient(key)
         })?;

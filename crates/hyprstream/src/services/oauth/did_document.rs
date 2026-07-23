@@ -1049,7 +1049,34 @@ mod tests {
         assert!(error.to_string().contains("requires an HTTPS OAuth issuer"));
     }
 
-    fn state_with_live_identity() -> Arc<OAuthState> {
+    #[tokio::test]
+    async fn non_https_issuer_degrades_only_at9p_identity() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt as _;
+
+        let state = Arc::new(state_with_issuer("http://discovery.example"));
+        assert!(state.signing_key.is_some());
+        assert!(state.mesh_pq_verifying_key.is_some());
+        assert!(state.mesh_kem_public.is_some());
+        assert!(state.at9p_identity.is_none());
+
+        let cors = crate::config::server::CorsConfig {
+            enabled: false,
+            ..Default::default()
+        };
+        let response = super::super::create_app(state, &cors)
+            .oneshot(
+                Request::get("/.well-known/at9p/unavailable.cbor")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    fn state_with_issuer(issuer_url: &str) -> OAuthState {
         use hyprstream_rpc::rpc_client::RpcClientImpl;
         use hyprstream_rpc::signer::LocalSigner;
         use hyprstream_rpc::transport::lazy_uds::LazyUdsTransport;
@@ -1067,16 +1094,19 @@ mod tests {
             )
         };
         let mut config = crate::config::OAuthConfig::default();
-        config.external_url = Some("https://discovery.hyprstream.com".to_owned());
-        let state = OAuthState::new(
+        config.external_url = Some(issuer_url.to_owned());
+        OAuthState::new(
             &config,
             crate::services::PolicyClient::new(make_client()),
             crate::services::DiscoveryClient::new(make_client()),
             local.verifying_key().to_bytes(),
         )
         .with_signing_key(local, CryptoPolicy::Hybrid)
-        .unwrap();
-        Arc::new(state)
+        .unwrap()
+    }
+
+    fn state_with_live_identity() -> Arc<OAuthState> {
+        Arc::new(state_with_issuer("https://discovery.hyprstream.com"))
     }
 
     #[tokio::test]
