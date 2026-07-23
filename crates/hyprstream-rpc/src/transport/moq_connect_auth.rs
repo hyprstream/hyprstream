@@ -150,6 +150,12 @@ impl MoqConnectAuthz {
             return None;
         }
         let tenant = (self.tenant_resolver)(&claims.sub)?;
+        // `moq_net::Path::new` normalizes "/" to its empty wildcard path.
+        // Reject empty and multi-segment resolver output here, before it can
+        // become either a root consumer scope or unrestricted relay ingest.
+        if !crate::moq_authz::is_valid_tenant_segment(&tenant) {
+            return None;
+        }
         Some(VerifiedConnect {
             peer: PeerIdentity::authenticated(&claims.sub),
             tenant,
@@ -295,6 +301,24 @@ mod tests {
         let mut h = http::HeaderMap::new();
         h.insert("authorization", format!("Bearer {tok}").parse().unwrap());
         assert!(authz.verify(&h).is_none());
+    }
+
+    #[test]
+    fn verify_fails_when_resolver_returns_invalid_tenant_segment() {
+        let key = SigningKey::from_bytes(&[10u8; 32]);
+        let token = mint(&key, "s", 60);
+        let mut headers = http::HeaderMap::new();
+        headers.insert("authorization", format!("Bearer {token}").parse().unwrap());
+
+        for tenant in ["", "/", "///", "/alice", "alice/", "alice/bob"] {
+            let tenant = tenant.to_owned();
+            let authz =
+                MoqConnectAuthz::new(key.verifying_key(), Arc::new(move |_| Some(tenant.clone())));
+            assert!(
+                authz.verify(&headers).is_none(),
+                "invalid tenant must fail CONNECT closed"
+            );
+        }
     }
 
     #[test]

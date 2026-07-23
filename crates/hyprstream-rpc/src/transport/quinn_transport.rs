@@ -555,6 +555,15 @@ impl QuinnRpcServer {
                             if let Some(relay_origin) = moq_relay_origin {
                                 let scoped_origin = match &moq_connect_verified {
                                     Some(verified) => {
+                                        if !crate::moq_authz::is_valid_tenant_segment(
+                                            &verified.tenant,
+                                        ) {
+                                            tracing::warn!(
+                                                tenant = %verified.tenant,
+                                                "quinn-moq-relay: invalid tenant segment; refusing publisher"
+                                            );
+                                            return;
+                                        }
                                         let prefix =
                                             crate::moq_authz::tenant_prefix(&verified.tenant);
                                         let path = moq_net::Path::new(&prefix);

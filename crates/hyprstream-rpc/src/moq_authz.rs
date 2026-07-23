@@ -48,6 +48,16 @@ use moq_net::{OriginConsumer, Path};
 /// The hierarchical track-name separator (`{tenant}/{service}/{topic}/{instance}`).
 pub const TRACK_NAME_SEP: char = '/';
 
+/// Return whether `tenant` is one non-empty MoQ path segment.
+///
+/// This validation is security-sensitive: `moq_net::Path::new` normalizes an
+/// empty or slash-only string to the empty path, and an empty prefix is a
+/// wildcard matching every broadcast. Tenant-derived scopes must therefore
+/// reject empty and multi-segment values before constructing a [`Path`].
+pub fn is_valid_tenant_segment(tenant: &str) -> bool {
+    !tenant.is_empty() && !tenant.contains(TRACK_NAME_SEP)
+}
+
 /// Extract the `{tenant}` segment from a hierarchical track / broadcast name.
 ///
 /// Names are `{tenant}/{service}/{topic}/{instance}`; the tenant is the first
@@ -111,6 +121,9 @@ where
 /// than falling back to the unscoped consumer.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn tenant_scoped_consumer(consumer: &OriginConsumer, tenant: &str) -> Option<OriginConsumer> {
+    if !is_valid_tenant_segment(tenant) {
+        return None;
+    }
     let prefix = tenant_prefix(tenant);
     consumer.scope(&[Path::new(&prefix)])
 }
@@ -301,6 +314,30 @@ mod tests {
     #[test]
     fn tenant_prefix_is_segment_significant() {
         assert_eq!(tenant_prefix("alice"), "alice/");
+    }
+
+    #[test]
+    fn tenant_segment_validation_rejects_root_wildcards_and_nested_scopes() {
+        assert!(is_valid_tenant_segment("alice"));
+        assert!(!is_valid_tenant_segment(""));
+        assert!(!is_valid_tenant_segment("/"));
+        assert!(!is_valid_tenant_segment("///"));
+        assert!(!is_valid_tenant_segment("/alice"));
+        assert!(!is_valid_tenant_segment("alice/"));
+        assert!(!is_valid_tenant_segment("alice/bob"));
+    }
+
+    #[test]
+    fn tenant_scoped_consumer_rejects_invalid_tenant_before_path_normalization() {
+        let producer = moq_net::Origin::random().produce();
+        let consumer = producer.consume();
+
+        for tenant in ["", "/", "///", "/alice", "alice/", "alice/bob"] {
+            assert!(
+                tenant_scoped_consumer(&consumer, tenant).is_none(),
+                "invalid tenant {tenant:?} must not become a root or nested scope"
+            );
+        }
     }
 
     #[test]
