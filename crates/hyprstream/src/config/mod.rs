@@ -2260,6 +2260,28 @@ impl HyprConfig {
             );
         }
 
+        // #1136 DID-anchored trust: the two anchors are a PAIR, not two
+        // independent settings. #905 §2/§6 is bidirectional-or-not-believed —
+        // a did:web claim is credited only when the at9p side names it back —
+        // so a one-sided anchor configuration can never establish trust. It
+        // must be rejected here rather than loading cleanly and failing later
+        // in `install_process_production_resolver()`: a config that parses and
+        // then dies at resolver install is an outage discovered at startup
+        // instead of at validation.
+        match (&self.cluster_at9p_did, &self.cluster_did_web) {
+            (Some(_), None) => anyhow::bail!(
+                "cluster_at9p_did is set without cluster_did_web; the DID-anchored trust \
+                 source requires BOTH anchors (#1136, #905 §2/§6 mutual aliasing)"
+            ),
+            (None, Some(_)) => anyhow::bail!(
+                "cluster_did_web is set without cluster_at9p_did; the DID-anchored trust \
+                 source requires BOTH anchors (#1136, #905 §2/§6 mutual aliasing)"
+            ),
+            // Both absent = anchors not configured, the OS-owned path applies.
+            // Both present = the pairing the resolver expects.
+            (None, None) | (Some(_), Some(_)) => {}
+        }
+
         Ok(())
     }
 
@@ -2646,6 +2668,32 @@ impl From<&crate::config::server::SamplingParamDefaults> for SamplingParams {
 
 #[cfg(test)]
 mod tests {
+    /// #1136 anchors are a PAIR. #905 §2/§6 is bidirectional-or-not-believed, so a
+    /// one-sided anchor config can never establish trust and must fail at validation
+    /// rather than at `install_process_production_resolver()`.
+    #[test]
+    fn validate_rejects_one_sided_did_anchor_config() {
+        let mut c = HyprConfig::default();
+        c.model.path = std::path::PathBuf::new();
+
+        c.cluster_at9p_did = Some("did:at9p:example".to_owned());
+        c.cluster_did_web = None;
+        assert!(c.validate().is_err(), "at9p without did:web must be rejected");
+
+        c.cluster_at9p_did = None;
+        c.cluster_did_web = Some("did:web:example.com".to_owned());
+        assert!(c.validate().is_err(), "did:web without at9p must be rejected");
+
+        // Both absent: anchors simply not configured — the OS-owned path applies.
+        c.cluster_did_web = None;
+        assert!(c.validate().is_ok(), "no anchors configured must remain valid");
+
+        // Both present: the pairing the resolver expects.
+        c.cluster_at9p_did = Some("did:at9p:example".to_owned());
+        c.cluster_did_web = Some("did:web:example.com".to_owned());
+        assert!(c.validate().is_ok(), "paired anchors must be accepted");
+    }
+
     use super::*;
 
     /// Serialize process-env mutations for secrets-dir resolver tests.
