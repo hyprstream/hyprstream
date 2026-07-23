@@ -374,7 +374,9 @@ impl<R: MembershipResolver> GroupKeyRegistry<R> {
                 for requested in requested_members {
                     let resolved = self.resolver.resolve(&requested)?;
                     resolved.validate(&group.group_uri)?;
-                    if resolved.accepted_state != controller.accepted_state {
+                    if resolved.subject_did != requested.subject_did
+                        || resolved.accepted_state != controller.accepted_state
+                    {
                         return Err("member is not bound to the advanced accepted state".to_owned());
                     }
                     members.insert(resolved.subject_did.clone(), resolved);
@@ -382,8 +384,19 @@ impl<R: MembershipResolver> GroupKeyRegistry<R> {
             }
         }
 
-        let membership_version = state.current.membership_version + 1;
-        let epoch = state.current.epoch + 1;
+        let membership_version =
+            state
+                .current
+                .membership_version
+                .checked_add(1)
+                .ok_or_else(|| {
+                    "membership version is exhausted; create a new group generation".to_owned()
+                })?;
+        let epoch = state
+            .current
+            .epoch
+            .checked_add(1)
+            .ok_or_else(|| "epoch is exhausted; create a new group generation".to_owned())?;
         let keyset_id = new_keyset_id.into();
         if keyset_id.is_empty() || keyset_id == state.current.keyset_id {
             return Err("new epoch requires a fresh keyset id".to_owned());
@@ -453,11 +466,27 @@ impl<R: MembershipResolver> GroupKeyRegistry<R> {
     }
 
     /// Discard an uncommitted transaction. The committed epoch is untouched.
-    pub async fn abort_prepared(&self, group: &GroupRef) -> Result<(), String> {
+    pub async fn abort_prepared(
+        &self,
+        group: &GroupRef,
+        keyset_id: &str,
+        membership_version: u64,
+        epoch: u64,
+    ) -> Result<(), String> {
         let mut groups = self.groups.write();
         let state = groups
             .get_mut(group)
             .ok_or_else(|| format!("group {group:?} not registered"))?;
+        let pending = state
+            .pending
+            .as_ref()
+            .ok_or_else(|| "no pending epoch".to_owned())?;
+        if pending.public.keyset_id != keyset_id
+            || pending.public.membership_version != membership_version
+            || pending.public.epoch != epoch
+        {
+            return Err("abort coordinates do not match the pending transaction".to_owned());
+        }
         state.pending = None;
         Ok(())
     }
@@ -652,6 +681,15 @@ mod tests {
         }
     }
 
+    struct SwapsSubject;
+    impl MembershipResolver for SwapsSubject {
+        fn resolve(&self, requested: &GroupMembership) -> Result<GroupMembership, String> {
+            let mut resolved = requested.clone();
+            resolved.subject_did = "did:web:attacker".to_owned();
+            Ok(resolved)
+        }
+    }
+
     fn group() -> GroupRef {
         GroupRef::new("at://did:web:controller/events/g1", "ks-0")
     }
@@ -747,8 +785,78 @@ mod tests {
             ("ks-0".to_owned(), 0, 0)
         );
         assert!(!registry.contains_member(&group(), "did:web:m").await);
-        registry.abort_prepared(&group()).await.unwrap();
+        registry
+            .abort_prepared(&group(), "ks-1", 1, 1)
+            .await
+            .unwrap();
         assert_eq!(registry.committed_coordinates(&group()).await.unwrap().2, 0);
+    }
+
+    #[tokio::test]
+    async fn stale_abort_cannot_discard_a_newer_pending_epoch() {
+        let registry = GroupKeyRegistry::new(RekeyPolicy::Immediate, AllowExact).unwrap();
+        registry
+            .register_group(group(), controller(b"cid512:a"))
+            .await
+            .unwrap();
+        let recipient = generate_recipient(SuiteId::HyKemX25519MlKem768).unwrap();
+        let first = registry
+            .prepare_change(
+                &group(),
+                MembershipChange::Join(member("did:web:m", &recipient, 8, b"cid512:a")),
+                "ks-1",
+            )
+            .await
+            .unwrap();
+        registry
+            .abort_prepared(
+                &group(),
+                &first.keyset_id,
+                first.membership_version,
+                first.epoch,
+            )
+            .await
+            .unwrap();
+        let second = registry
+            .prepare_change(
+                &group(),
+                MembershipChange::Join(member("did:web:m", &recipient, 8, b"cid512:a")),
+                "ks-2",
+            )
+            .await
+            .unwrap();
+        assert!(registry
+            .abort_prepared(
+                &group(),
+                &first.keyset_id,
+                first.membership_version,
+                first.epoch,
+            )
+            .await
+            .is_err());
+        assert_eq!(
+            registry.pending_epoch(&group()).await.unwrap().keyset_id,
+            second.keyset_id
+        );
+    }
+
+    #[tokio::test]
+    async fn accepted_state_advance_rejects_a_resolver_subject_swap() {
+        let registry = GroupKeyRegistry::new(RekeyPolicy::Immediate, SwapsSubject).unwrap();
+        registry
+            .register_group(group(), controller(b"cid512:a"))
+            .await
+            .unwrap();
+        let recipient = generate_recipient(SuiteId::HyKemX25519MlKem768).unwrap();
+        let change = MembershipChange::AcceptedStateAdvance {
+            accepted_state: b"cid512:b".to_vec(),
+            members: vec![member("did:web:member", &recipient, 9, b"cid512:b")],
+        };
+        assert!(registry
+            .prepare_change(&group(), change, "ks-1")
+            .await
+            .is_err());
+        assert!(registry.pending_epoch(&group()).await.is_none());
     }
 
     #[tokio::test]

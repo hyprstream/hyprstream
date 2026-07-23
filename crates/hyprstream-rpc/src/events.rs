@@ -31,7 +31,7 @@
 //! signature; deployments requiring routing opacity bind the controller's opaque
 //! routing policy into each member grant.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -75,6 +75,10 @@ use crate::moq_event::{
 /// from the prior epoch, bounded by the controller-supplied last-issued
 /// sequence. Security-triggered transitions install zero grace.
 pub const DEFAULT_SUBSCRIBER_GRACE_PERIOD: Duration = Duration::from_secs(30);
+/// Maximum accepted event identities retained for one subscriber prefix. Older
+/// identities age out of this replay window rather than growing memory for the
+/// entire lifetime of a long-running epoch.
+pub const MAX_REPLAY_WINDOW: usize = 4_096;
 
 // Rekey policy configuration remains an API-level scheduling hint. Every
 // controller membership/security transition nevertheless prepares a fresh
@@ -757,6 +761,7 @@ impl EventPublisher {
 struct InstalledEpoch {
     membership_version: u64,
     epoch: u64,
+    expires_at_millis: i64,
     key: Zeroizing<[u8; 32]>,
 }
 
@@ -769,6 +774,7 @@ struct PriorEpoch {
 }
 
 /// Externally anchored controller-authorized hybrid publisher identity.
+#[derive(Clone)]
 pub struct EventPublisherAnchor {
     pub ed25519: ed25519_dalek::VerifyingKey,
     pub ml_dsa_65: crate::crypto::pq::MlDsaVerifyingKey,
@@ -781,12 +787,24 @@ impl EventPublisherAnchor {
     }
 }
 
-struct SubscriberPrefixState {
+#[derive(Clone)]
+struct ConfidentialPrefixExpectation {
+    controller_did: String,
+    publisher: EventPublisherAnchor,
+}
+
+struct InstalledPrefixState {
     current: InstalledEpoch,
     previous: Option<PriorEpoch>,
     publisher: EventPublisherAnchor,
     seen_objects: HashSet<(u64, [u8; 16], u64)>,
     seen_nonces: HashSet<([u8; 16], [u8; 12])>,
+    replay_order: VecDeque<((u64, [u8; 16], u64), ([u8; 16], [u8; 12]))>,
+}
+
+enum SubscriberPrefixState {
+    Expected(Box<ConfidentialPrefixExpectation>),
+    Installed(Box<InstalledPrefixState>),
 }
 
 /// A pending controller epoch notification.
@@ -849,6 +867,47 @@ impl EventSubscriber {
         self.inner.dropped_count()
     }
 
+    /// Mark a subscribed prefix as confidential before any grant is delivered.
+    ///
+    /// The controller and publisher anchor come from the caller's authenticated
+    /// control-plane configuration, rather than from a subsequently received
+    /// grant. Frames for an expected prefix fail closed until a matching grant
+    /// is installed.
+    pub async fn expect_confidential_prefix(
+        &self,
+        prefix: &str,
+        controller_did: impl Into<String>,
+        publisher: EventPublisherAnchor,
+    ) -> Result<(), String> {
+        if prefix.is_empty() {
+            return Err("confidential prefix must not be empty".to_owned());
+        }
+        let expectation = ConfidentialPrefixExpectation {
+            controller_did: controller_did.into(),
+            publisher,
+        };
+        if expectation.controller_did.is_empty() {
+            return Err("expected controller DID must not be empty".to_owned());
+        }
+        let mut prefixes = self.prefixes.write().await;
+        match prefixes.get(prefix) {
+            None => {
+                prefixes.insert(
+                    prefix.to_owned(),
+                    SubscriberPrefixState::Expected(Box::new(expectation)),
+                );
+                Ok(())
+            }
+            Some(SubscriberPrefixState::Expected(existing))
+                if existing.controller_did == expectation.controller_did
+                    && existing.publisher.matches(&expectation.publisher) =>
+            {
+                Ok(())
+            }
+            Some(_) => Err("confidential prefix is already configured".to_owned()),
+        }
+    }
+
     /// Install a per-member epoch grant after policy/accepted-state admission.
     ///
     /// `prior_last_issued_sequence` is mandatory for an advance and bounds old
@@ -884,26 +943,41 @@ impl EventSubscriber {
         let key = open_epoch_grant(recipient, grant)?;
         let mut prefixes = self.prefixes.write().await;
         match prefixes.get_mut(prefix) {
-            None => {
-                if prior_last_issued_sequence.is_some() {
-                    return Err("initial epoch install must not claim a prior cutoff".to_owned());
+            None => Err(
+                "confidential prefix has no independently configured controller expectation"
+                    .to_owned(),
+            ),
+            Some(prefix_state) => {
+                if let SubscriberPrefixState::Expected(expectation) = prefix_state {
+                    let expected_controller = expectation.controller_did.clone();
+                    let expected_publisher = expectation.publisher.clone();
+                    if grant.controller_did != expected_controller
+                        || !expected_publisher.matches(&publisher)
+                    {
+                        return Err(
+                            "epoch grant does not match the configured controller expectation"
+                                .to_owned(),
+                        );
+                    }
+                    *prefix_state =
+                        SubscriberPrefixState::Installed(Box::new(InstalledPrefixState {
+                            current: InstalledEpoch {
+                                membership_version: grant.membership_version,
+                                epoch: grant.epoch,
+                                expires_at_millis: grant.expires_at_millis,
+                                key,
+                            },
+                            previous: None,
+                            publisher: expected_publisher,
+                            seen_objects: HashSet::new(),
+                            seen_nonces: HashSet::new(),
+                            replay_order: VecDeque::new(),
+                        }));
+                    return Ok(());
                 }
-                prefixes.insert(
-                    prefix.to_owned(),
-                    SubscriberPrefixState {
-                        current: InstalledEpoch {
-                            membership_version: grant.membership_version,
-                            epoch: grant.epoch,
-                            key,
-                        },
-                        previous: None,
-                        publisher,
-                        seen_objects: HashSet::new(),
-                        seen_nonces: HashSet::new(),
-                    },
-                );
-            }
-            Some(state) => {
+                let SubscriberPrefixState::Installed(state) = prefix_state else {
+                    unreachable!("expected state is handled above")
+                };
                 if !state.publisher.matches(&publisher) {
                     return Err(
                         "publisher anchor changed without a controller-authorized rotation"
@@ -929,6 +1003,7 @@ impl EventSubscriber {
                     InstalledEpoch {
                         membership_version: grant.membership_version,
                         epoch: grant.epoch,
+                        expires_at_millis: grant.expires_at_millis,
                         key,
                     },
                 );
@@ -941,9 +1016,10 @@ impl EventSubscriber {
                     *epoch == state.current.epoch || *epoch + 1 == state.current.epoch
                 });
                 state.seen_nonces.clear();
+                state.replay_order.clear();
+                Ok(())
             }
         }
-        Ok(())
     }
 
     /// Removed classical admission API: an Ed25519/Ristretto key can never be
@@ -978,7 +1054,10 @@ impl EventSubscriber {
 
     pub async fn gc_expired_keys(&self) {
         let mut prefixes = self.prefixes.write().await;
-        for state in prefixes.values_mut() {
+        for prefix_state in prefixes.values_mut() {
+            let SubscriberPrefixState::Installed(state) = prefix_state else {
+                continue;
+            };
             if state
                 .previous
                 .as_ref()
@@ -995,8 +1074,9 @@ impl EventSubscriber {
 
     /// Receive the next event.
     ///
-    /// Prefixes without an installed grant remain byte-identical `Public`
-    /// passthrough. For an installed confidential prefix, the wire frame must
+    /// Unconfigured prefixes remain byte-identical `Public` passthrough;
+    /// explicitly expected confidential prefixes fail closed until their grant
+    /// is installed. For an installed confidential prefix, the wire frame must
     /// match a current or bounded prior epoch, use the required nonce domain,
     /// decrypt under the sender/track key, and verify against the externally
     /// anchored Ed25519 + ML-DSA-65 publisher identity. Invalid frames are
@@ -1034,17 +1114,8 @@ impl EventSubscriber {
         let Some((topic, raw)) = self.inner.try_recv()? else {
             return Ok(None);
         };
-        // `decode_frame` is async (it takes the prefixes read lock); but the
-        // lock is uncontended in the common case and this method already
-        // requires being called from an async context to exist at all, so a
-        // blocking `block_in_place`-free best-effort: prefixes not joined
-        // (the overwhelmingly common Public-mode case) never touch the lock.
-        if topic
-            .split('.')
-            .next()
-            .map(|prefix| matches!(self.prefixes.try_read(), Ok(p) if p.contains_key(prefix)))
-            .unwrap_or(false)
-        {
+        let prefix = topic.split('.').next().unwrap_or(&topic);
+        if self.prefix_is_confidential(prefix)? {
             // An encrypted prefix; decoding requires the async path. Callers
             // needing non-blocking receive on encrypted prefixes should use
             // `recv_timeout(Duration::ZERO)` instead.
@@ -1055,11 +1126,26 @@ impl EventSubscriber {
         Ok(Some((topic, raw)))
     }
 
+    fn prefix_is_confidential(&self, prefix: &str) -> Result<bool> {
+        let prefixes = self.prefixes.try_read().map_err(|_| {
+            anyhow!(
+                "cannot determine whether prefix '{prefix}' is confidential while state is locked; refusing passthrough"
+            )
+        })?;
+        Ok(prefixes.contains_key(prefix))
+    }
+
     async fn decode_frame(&self, topic: &str, raw: &[u8]) -> FrameOutcome {
         let prefix = topic.split('.').next().unwrap_or(topic);
         let mut prefixes = self.prefixes.write().await;
-        let Some(state) = prefixes.get_mut(prefix) else {
-            return FrameOutcome::Passthrough;
+        let state = match prefixes.get_mut(prefix) {
+            None => return FrameOutcome::Passthrough,
+            Some(SubscriberPrefixState::Expected(_)) => {
+                return FrameOutcome::Drop(
+                    "confidential prefix is awaiting a controller epoch grant".to_owned(),
+                );
+            }
+            Some(SubscriberPrefixState::Installed(state)) => state,
         };
         let encrypted = match EncryptedEvent::decode_body(topic, raw) {
             Ok(event) => event,
@@ -1085,12 +1171,14 @@ impl EventSubscriber {
 
         let epoch_key = if encrypted.membership_version == state.current.membership_version
             && encrypted.epoch == state.current.epoch
+            && now_millis() < state.current.expires_at_millis
         {
             &state.current.key
         } else if let Some(previous) = &state.previous {
             if encrypted.membership_version == previous.installed.membership_version
                 && encrypted.epoch == previous.installed.epoch
                 && Instant::now() < previous.grace_until
+                && now_millis() < previous.installed.expires_at_millis
                 && encrypted.sequence <= previous.last_issued_sequence
             {
                 &previous.installed.key
@@ -1105,7 +1193,7 @@ impl EventSubscriber {
                 "unknown, future-before-install, or retired epoch object".to_owned(),
             );
         };
-        let expected_nonce = match derive_event_nonce(encrypted.sequence) {
+        let expected_nonce = match derive_event_nonce(&encrypted.session_id, encrypted.sequence) {
             Ok(nonce) => nonce,
             Err(error) => return FrameOutcome::Drop(error),
         };
@@ -1147,13 +1235,28 @@ impl EventSubscriber {
         ) {
             return FrameOutcome::Drop(format!("hybrid publisher attestation failed: {error}"));
         }
-        state
-            .seen_objects
-            .insert((encrypted.epoch, encrypted.session_id, encrypted.sequence));
-        state
-            .seen_nonces
-            .insert((encrypted.session_id, encrypted.nonce));
+        record_replay(
+            state,
+            (encrypted.epoch, encrypted.session_id, encrypted.sequence),
+            (encrypted.session_id, encrypted.nonce),
+        );
         FrameOutcome::Decoded(plaintext)
+    }
+}
+
+fn record_replay(
+    state: &mut InstalledPrefixState,
+    object: (u64, [u8; 16], u64),
+    nonce: ([u8; 16], [u8; 12]),
+) {
+    state.seen_objects.insert(object);
+    state.seen_nonces.insert(nonce);
+    state.replay_order.push_back((object, nonce));
+    if state.replay_order.len() > MAX_REPLAY_WINDOW {
+        if let Some((expired_object, expired_nonce)) = state.replay_order.pop_front() {
+            state.seen_objects.remove(&expired_object);
+            state.seen_nonces.remove(&expired_nonce);
+        }
     }
 }
 
@@ -1327,6 +1430,18 @@ mod tests {
         }
     }
 
+    async fn expect_confidential(
+        subscriber: &EventSubscriber,
+        prefix: &str,
+        ed_sk: &SigningKey,
+        pq_sk: &MlDsaSigningKey,
+    ) {
+        subscriber
+            .expect_confidential_prefix(prefix, "did:web:controller", anchor(ed_sk, pq_sk))
+            .await
+            .unwrap();
+    }
+
     #[test]
     fn encrypted_event_wire_roundtrip_and_trailing_bytes_rejected() {
         let ed = signing_key();
@@ -1350,6 +1465,7 @@ mod tests {
         let pq = crate::node_identity::derive_mesh_mldsa_key(&ed);
         let (grant, key) = grant_for(&recipient, &ed, &pq).await;
         let subscriber = EventSubscriber::new().unwrap();
+        expect_confidential(&subscriber, "worker", &ed, &pq).await;
         subscriber
             .install_epoch_grant("worker", &recipient, &grant, anchor(&ed, &pq), None, None)
             .await
@@ -1367,6 +1483,30 @@ mod tests {
             FrameOutcome::Decoded(payload) => assert_eq!(payload, b"relay cannot read this"),
             other => panic!("expected decoded object, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn expected_confidential_prefix_without_grant_drops_plaintext() {
+        let ed = signing_key();
+        let pq = crate::node_identity::derive_mesh_mldsa_key(&ed);
+        let subscriber = EventSubscriber::new().unwrap();
+        expect_confidential(&subscriber, "worker", &ed, &pq).await;
+
+        assert!(matches!(
+            subscriber.decode_frame("worker.sandbox1.started", b"attacker plaintext").await,
+            FrameOutcome::Drop(reason) if reason.contains("awaiting a controller epoch grant")
+        ));
+    }
+
+    #[tokio::test]
+    async fn contended_confidential_state_never_allows_passthrough() {
+        let ed = signing_key();
+        let pq = crate::node_identity::derive_mesh_mldsa_key(&ed);
+        let subscriber = EventSubscriber::new().unwrap();
+        expect_confidential(&subscriber, "worker", &ed, &pq).await;
+
+        let _held = subscriber.prefixes.write().await;
+        assert!(subscriber.prefix_is_confidential("worker").is_err());
     }
 
     #[tokio::test]
@@ -1438,6 +1578,8 @@ mod tests {
         assert!(crate::crypto::group_key::open_epoch_grant(&relay_recipient, grant_a_2).is_err());
         let subscriber_a = EventSubscriber::new().unwrap();
         let subscriber_b = EventSubscriber::new().unwrap();
+        expect_confidential(&subscriber_a, "worker", &ed, &pq).await;
+        expect_confidential(&subscriber_b, "worker", &ed, &pq).await;
         subscriber_a
             .install_epoch_grant("worker", &member_a, grant_a_2, anchor(&ed, &pq), None, None)
             .await
@@ -1513,6 +1655,7 @@ mod tests {
         let pq = crate::node_identity::derive_mesh_mldsa_key(&ed);
         let (grant, key) = grant_for(&recipient, &ed, &pq).await;
         let subscriber = EventSubscriber::new().unwrap();
+        expect_confidential(&subscriber, "worker", &ed, &pq).await;
         subscriber
             .install_epoch_grant("worker", &recipient, &grant, anchor(&ed, &pq), None, None)
             .await
@@ -1551,6 +1694,62 @@ mod tests {
         assert!(matches!(
             subscriber.decode_frame(&stripped.topic, &stripped.encode_body()).await,
             FrameOutcome::Drop(reason) if reason.contains("attestation")
+        ));
+    }
+
+    #[tokio::test]
+    async fn replay_tracking_is_bounded_to_its_window() {
+        let recipient = generate_recipient(SuiteId::HyKemX25519MlKem768).unwrap();
+        let ed = signing_key();
+        let pq = crate::node_identity::derive_mesh_mldsa_key(&ed);
+        let (grant, _) = grant_for(&recipient, &ed, &pq).await;
+        let subscriber = EventSubscriber::new().unwrap();
+        expect_confidential(&subscriber, "worker", &ed, &pq).await;
+        subscriber
+            .install_epoch_grant("worker", &recipient, &grant, anchor(&ed, &pq), None, None)
+            .await
+            .unwrap();
+
+        let mut prefixes = subscriber.prefixes.write().await;
+        let Some(SubscriberPrefixState::Installed(state)) = prefixes.get_mut("worker") else {
+            panic!("installed state must exist");
+        };
+        for sequence in 1..=MAX_REPLAY_WINDOW as u64 + 1 {
+            let mut session_id = [0; 16];
+            session_id[..8].copy_from_slice(&sequence.to_be_bytes());
+            let nonce = derive_event_nonce(&session_id, sequence).unwrap();
+            record_replay(state, (1, session_id, sequence), (session_id, nonce));
+        }
+        assert_eq!(state.replay_order.len(), MAX_REPLAY_WINDOW);
+        assert_eq!(state.seen_objects.len(), MAX_REPLAY_WINDOW);
+        let mut first_session = [0; 16];
+        first_session[..8].copy_from_slice(&1u64.to_be_bytes());
+        assert!(!state.seen_objects.contains(&(1, first_session, 1)));
+    }
+
+    #[tokio::test]
+    async fn installed_epoch_expiry_is_enforced_while_receiving() {
+        let recipient = generate_recipient(SuiteId::HyKemX25519MlKem768).unwrap();
+        let ed = signing_key();
+        let pq = crate::node_identity::derive_mesh_mldsa_key(&ed);
+        let (grant, key) = grant_for(&recipient, &ed, &pq).await;
+        let subscriber = EventSubscriber::new().unwrap();
+        expect_confidential(&subscriber, "worker", &ed, &pq).await;
+        subscriber
+            .install_epoch_grant("worker", &recipient, &grant, anchor(&ed, &pq), None, None)
+            .await
+            .unwrap();
+        {
+            let mut prefixes = subscriber.prefixes.write().await;
+            let Some(SubscriberPrefixState::Installed(state)) = prefixes.get_mut("worker") else {
+                panic!("installed state must exist");
+            };
+            state.current.expires_at_millis = now_millis() - 1;
+        }
+        let frame = event(&key, &ed, &pq, b"expired", 1);
+        assert!(matches!(
+            subscriber.decode_frame(&frame.topic, &frame.encode_body()).await,
+            FrameOutcome::Drop(reason) if reason.contains("unknown")
         ));
     }
 
@@ -1658,7 +1857,7 @@ mod tests {
             &prefix,
             &session_b,
         );
-        let nonce = derive_event_nonce(1).unwrap();
+        let nonce = derive_event_nonce(&session_a, 1).unwrap();
 
         assert_ne!(session_a, session_b);
         assert_ne!((&*key_a, nonce), (&*key_b, nonce));
@@ -1672,6 +1871,7 @@ mod tests {
         let pq = crate::node_identity::derive_mesh_mldsa_key(&ed);
         let (grant, _) = grant_for(&recipient, &ed, &pq).await;
         let subscriber = EventSubscriber::new().unwrap();
+        expect_confidential(&subscriber, "worker", &ed, &pq).await;
         assert!(subscriber
             .install_epoch_grant("worker", &wrong, &grant, anchor(&ed, &pq), None, None)
             .await

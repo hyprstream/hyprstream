@@ -426,22 +426,20 @@ pub fn derive_sender_track_key(
 }
 
 /// Return the injective 96-bit nonce for one sequence in a session-scoped key
-/// domain. Sequence zero is reserved as the pre-publication state.
-pub fn derive_event_nonce(sequence: u64) -> Result<[u8; 12], String> {
+/// domain. The session prefix is carried through the wire object and is also
+/// bound into the AEAD key; it avoids a fixed nonce label while preserving the
+/// only property AES-GCM needs: uniqueness for each `(key, nonce)` pair.
+/// Sequence zero is reserved as the pre-publication state.
+pub fn derive_event_nonce(session_id: &[u8; 16], sequence: u64) -> Result<[u8; 12], String> {
     if sequence == 0 {
         return Err("event sequence zero is reserved".to_owned());
     }
     let sequence = sequence.to_be_bytes();
-    // b"EVN1" is a domain-separation label, not nonce entropy. Nonce uniqueness
-    // comes from the injective big-endian sequence under a key scoped to a fresh
-    // 128-bit OsRng session ID, so (key, nonce) cannot repeat across restart,
-    // re-registration, or failover. Reviewed by two independent security
-    // reviewers; see PR #1111 discussion.
     Ok([
-        b'E', // codeql[rust/hard-coded-cryptographic-value]
-        b'V', // codeql[rust/hard-coded-cryptographic-value]
-        b'N', // codeql[rust/hard-coded-cryptographic-value]
-        b'1', // codeql[rust/hard-coded-cryptographic-value]
+        session_id[0],
+        session_id[1],
+        session_id[2],
+        session_id[3],
         sequence[0],
         sequence[1],
         sequence[2],
@@ -486,7 +484,7 @@ pub fn encrypt_epoch_event(
     plaintext: &[u8],
 ) -> Result<(Vec<u8>, Vec<u8>, [u8; 12], [u8; 16]), String> {
     let key = derive_sender_track_key(epoch_secret, publisher_kid, track, session_id);
-    let nonce = derive_event_nonce(sequence)?;
+    let nonce = derive_event_nonce(session_id, sequence)?;
     let aad = build_epoch_object_aad(
         track,
         publisher_kid,
@@ -925,15 +923,16 @@ mod tests {
         let session_b = [0x44u8; 16];
         let key_a = derive_sender_track_key(&epoch_secret, &publisher_kid, "worker", &session_a);
         let key_b = derive_sender_track_key(&epoch_secret, &publisher_kid, "worker", &session_b);
-        let nonce_1 = derive_event_nonce(1).unwrap();
-        let nonce_2 = derive_event_nonce(2).unwrap();
+        let session = [7; 16];
+        let nonce_1 = derive_event_nonce(&session, 1).unwrap();
+        let nonce_2 = derive_event_nonce(&session, 2).unwrap();
 
         assert_ne!(&*key_a, &*key_b);
-        assert_eq!(&nonce_1[..4], b"EVN1");
+        assert_eq!(&nonce_1[..4], &session[..4]);
         assert_eq!(&nonce_1[4..], &1u64.to_be_bytes());
         assert_eq!(&nonce_2[4..], &2u64.to_be_bytes());
         assert_ne!(nonce_1, nonce_2);
-        assert!(derive_event_nonce(0).is_err());
+        assert!(derive_event_nonce(&session, 0).is_err());
     }
 
     #[test]
