@@ -387,52 +387,82 @@ pub fn decode_with_key(
     decode_inner(token, verifying_key, expected_aud, true)
 }
 
-/// Decode a JWT by trying each candidate key in order, accepting the first
-/// that verifies. This is the rotation-aware federation verifier: a caller
-/// passes the candidate set returned by a key-set resolver (e.g.
-/// `FederationKeySource::get_keys`) and the token verifies if ANY published
-/// key validates it — the overlap-rotation and PQ-hybrid publication model
-/// (#1183/#1185). `candidates` SHOULD be ordered kid-first by the resolver
-/// so the preferred key is tried before overlap fallbacks.
+/// Try every supplied Ed25519 key for a JWT that has no `kid`.
 ///
-/// Returns the last error if no candidate verifies (so a caller can surface
-/// a representative failure); `InvalidFormat` when the candidate set is empty
-/// (the resolver is contractually non-empty, so this is a fail-closed guard).
-pub fn decode_with_candidates(
+/// Candidate verification is intentionally unavailable to named tokens: under
+/// invariant I2, a token declaring `kid=X` must be resolved and verified only
+/// with key X. Each kid-less candidate receives a complete verification,
+/// including the pinned `EdDSA` algorithm and all claim checks.
+pub fn decode_with_any_key(
     token: &str,
     candidates: &[VerifyingKey],
     expected_aud: Option<&str>,
 ) -> Result<Claims, JwtError> {
-    let mut last_err = JwtError::InvalidFormat;
+    decode_with_any_key_inner(token, candidates, expected_aud, false)
+}
+
+/// Lenient-audience twin of [`decode_with_any_key`]. This remains restricted
+/// to kid-less JWTs; only the absent-audience behavior differs.
+pub fn decode_with_any_key_lenient(
+    token: &str,
+    candidates: &[VerifyingKey],
+    expected_aud: Option<&str>,
+) -> Result<Claims, JwtError> {
+    decode_with_any_key_inner(token, candidates, expected_aud, true)
+}
+
+fn decode_with_any_key_inner(
+    token: &str,
+    candidates: &[VerifyingKey],
+    expected_aud: Option<&str>,
+    lenient_aud: bool,
+) -> Result<Claims, JwtError> {
+    if header_kid(token)?.is_some() || candidates.is_empty() {
+        return Err(JwtError::InvalidSignature);
+    }
+
+    let mut last_err = JwtError::InvalidSignature;
     for key in candidates {
-        match decode_with_key(token, key, expected_aud) {
+        match decode_inner(token, key, expected_aud, lenient_aud) {
             Ok(claims) => return Ok(claims),
-            Err(e) => last_err = e,
+            Err(error) => {
+                tracing::debug!(%error, "kid-less JWT candidate did not verify");
+                last_err = error;
+            }
         }
     }
     Err(last_err)
 }
 
-/// Decode a federation JWT while retaining the JWKS `kid` binding.
+/// Verify a federation JWT without losing its JWKS `kid` binding.
 ///
-/// A token that names a key may only be verified by entries carrying that
-/// exact name. A token without a selector may try every compatible published
-/// key, which is the overlap-rotation case.
+/// A named token must have exactly one candidate carrying that name and is
+/// verified only with that key. A kid-less token may try every published
+/// Ed25519 candidate, each through full pinned-algorithm verification.
 pub fn decode_with_federation_candidates(
     token: &str,
     candidates: &[super::FederationKey],
     expected_aud: Option<&str>,
 ) -> Result<Claims, JwtError> {
-    let kid = header_kid(token)?;
-    let keys: Vec<VerifyingKey> = candidates
-        .iter()
-        .filter(|candidate| match kid.as_deref() {
-            Some(named_kid) => candidate.kid.as_deref() == Some(named_kid),
-            None => true,
-        })
-        .map(|candidate| candidate.verifying_key)
-        .collect();
-    decode_with_candidates(token, &keys, expected_aud)
+    match header_kid(token)? {
+        Some(kid) => {
+            let mut named = candidates
+                .iter()
+                .filter(|candidate| candidate.kid.as_deref() == Some(kid.as_str()));
+            let key = named.next().ok_or(JwtError::InvalidSignature)?;
+            if named.next().is_some() {
+                return Err(JwtError::InvalidSignature);
+            }
+            decode_with_key(token, &key.verifying_key, expected_aud)
+        }
+        None => {
+            let keys: Vec<VerifyingKey> = candidates
+                .iter()
+                .map(|candidate| candidate.verifying_key)
+                .collect();
+            decode_with_any_key_lenient(token, &keys, expected_aud)
+        }
+    }
 }
 
 /// Internal decode implementation shared by `decode` and `decode_with_key`.
@@ -932,41 +962,65 @@ mod tests {
         assert!(kid.is_none());
     }
 
-    // #1185 — decode_with_candidates is the rotation-aware federation
-    // verifier: it MUST accept a token signed by ANY published candidate,
-    // including a non-first key, and reject when none verify.
+    // #1184/I2 — candidate verification is permitted only when the JWT has no
+    // kid. Each candidate gets a complete EdDSA + claims verification.
     #[test]
-    fn decode_with_candidates_accepts_non_first_published_key() {
+    fn decode_with_any_key_accepts_kid_less_non_first_published_key() {
         let key_a = make_key(0xA1);
-        let key_b = make_key(0xB2); // the "second" / rotated key
+        let key_b = make_key(0xB2);
         let claims = Claims::new("overlap-test".to_owned(), 0, 9_999_999_999);
-        let token = encode(&claims, &key_b); // signed by the second key
-
-        // Candidate set published in overlap order as [old, new]; the token is
-        // signed by `new` (the second entry). The old code resolved only
-        // the first key and this token would have failed.
+        let header = r#"{"alg":"EdDSA","typ":"at+jwt"}"#;
+        let token = encode_with_header(&claims, &key_b, header);
         let candidates = vec![key_a.verifying_key(), key_b.verifying_key()];
-        let decoded =
-            decode_with_candidates(&token, &candidates, None).expect("second key verifies");
+
+        let decoded = decode_with_any_key_lenient(&token, &candidates, None)
+            .expect("kid-less second key verifies");
         assert_eq!(decoded.sub, "overlap-test");
     }
 
     #[test]
-    fn decode_with_candidates_rejects_when_no_candidate_verifies() {
-        let key_unrelated = make_key(0x99);
-        let claims = Claims::new("no-match".to_owned(), 0, 9_999_999_999);
-        let token = encode(&claims, &make_key(0x11));
-        let candidates = vec![key_unrelated.verifying_key()];
-        assert!(decode_with_candidates(&token, &candidates, None).is_err());
+    fn decode_with_any_key_rejects_named_token_even_if_another_candidate_verifies() {
+        let old = make_key(0xA1);
+        let new = make_key(0xB2);
+        let claims = Claims::new("kid-substitution".to_owned(), 0, 9_999_999_999);
+        let header = format!(
+            r#"{{"alg":"EdDSA","typ":"at+jwt","kid":"{}"}}"#,
+            kid_for_key(&new)
+        );
+        let token = encode_with_header(&claims, &old, &header);
+        let candidates = vec![new.verifying_key(), old.verifying_key()];
+
+        assert!(decode_with_any_key_lenient(&token, &candidates, None).is_err());
     }
 
     #[test]
-    fn decode_with_candidates_empty_set_fails_closed() {
-        // An empty candidate set is a fail-closed guard (the resolver is
-        // contractually non-empty); never silently accept.
+    fn decode_with_any_key_rejects_when_no_candidate_verifies() {
+        let signer = make_key(0x11);
+        let unrelated = make_key(0x99);
+        let claims = Claims::new("no-match".to_owned(), 0, 9_999_999_999);
+        let token = encode_with_header(
+            &claims,
+            &signer,
+            r#"{"alg":"EdDSA","typ":"at+jwt"}"#,
+        );
+        assert!(decode_with_any_key_lenient(
+            &token,
+            &[unrelated.verifying_key()],
+            None
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn decode_with_any_key_empty_set_fails_closed() {
+        let signer = make_key(0x22);
         let claims = Claims::new("empty".to_owned(), 0, 9_999_999_999);
-        let token = encode(&claims, &make_key(0x22));
-        assert!(decode_with_candidates(&token, &[], None).is_err());
+        let token = encode_with_header(
+            &claims,
+            &signer,
+            r#"{"alg":"EdDSA","typ":"at+jwt"}"#,
+        );
+        assert!(decode_with_any_key_lenient(&token, &[], None).is_err());
     }
 
     #[test]

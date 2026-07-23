@@ -67,32 +67,91 @@ pub async fn verify_id_token(
         .as_array()
         .ok_or_else(|| anyhow!("JWKS missing 'keys' array at {}", jwks_uri))?;
 
+    verify_id_token_with_keys(token, keys, expected_issuer, expected_audience)
+}
+
+/// Pure (HTTP-free) verification core: given the parsed JWKS `keys` array,
+/// verify an id_token's signature and claims. Exposed for tests so the
+/// overlap-rotation behaviour can be exercised without a mock server.
+///
+/// Selects every algorithm-compatible candidate and tries each until one
+/// verifies — never collapsing the published set to a positional singleton
+/// (#1183 / #1184).
+pub(crate) fn verify_id_token_with_keys(
+    token: &str,
+    keys: &[Value],
+    expected_issuer: &str,
+    expected_audience: &str,
+) -> Result<VerifiedIdToken> {
     // Extract the JWT header to get the `kid` for key selection
     let header = decode_jwt_header(token)?;
 
     let kid = header.get("kid").and_then(|v| v.as_str());
 
-    // Find the matching key from JWKS
-    let matching_key = find_matching_key(keys, kid, &header)?;
+    // Collect every algorithm-compatible candidate. When the JWT carries a
+    // `kid` the set is the kid-matched entries; when it does not, the set is
+    // every key whose `kty`/`crv` matches the header `alg`. The verifier then
+    // tries each until one verifies — never collapsing a published key SET to
+    // a positional singleton, which would foreclose overlap rotation and
+    // PQ-hybrid rollout (#1183 / #1184).
+    let candidates = candidate_keys(keys, kid, &header);
+    if candidates.is_empty() {
+        return Err(anyhow!(
+            "No JWKS key matches {} (kid={:?})",
+            header.get("alg").and_then(|v| v.as_str()).unwrap_or(""),
+            kid,
+        ));
+    }
+    if kid.is_some() && candidates.len() != 1 {
+        return Err(anyhow!(
+            "JWKS kid {:?} is ambiguous for the token algorithm",
+            kid
+        ));
+    }
 
-    // Build a jsonwebtoken::Validation with the correct algorithm
-    let alg = determine_algorithm(matching_key, &header)?;
+    // Build a jsonwebtoken::Validation. Algorithm is taken from the JWT header
+    // (each candidate shares the header `alg` because candidate_keys filtered
+    // on kty/crv consistency).
+    let alg = algorithm_from_header(&header)?;
     let mut validation = Validation::new(alg);
     validation.set_issuer(&[expected_issuer]);
     validation.set_audience(&[expected_audience]);
     // Allow 60 seconds of clock skew (same as provider.clock_skew_seconds default)
     validation.leeway = 60;
 
-    // Build the DecodingKey from the JWKS key
-    let decoding_key = build_decoding_key(matching_key)?;
+    // Try each candidate until one verifies. A JWKS may publish several keys
+    // simultaneously (overlap rotation / PQ-hybrid); only one is the real
+    // verifier and the rest are expected misses, logged at `debug`. An unknown
+    // or unsupported entry is skipped rather than failing the whole set.
+    let mut last_err: Option<anyhow::Error> = None;
+    for jwk in &candidates {
+        let decoding_key = match build_decoding_key(jwk) {
+            Ok(k) => k,
+            Err(e) => {
+                tracing::debug!(error = %e, "id_token: skipping JWKS key (invalid key material)");
+                last_err = Some(e);
+                continue;
+            }
+        };
+        match jsonwebtoken::decode::<Value>(token, &decoding_key, &validation) {
+            Ok(decoded) => {
+                return Ok(VerifiedIdToken {
+                    claims: decoded.claims,
+                });
+            }
+            Err(e) => {
+                tracing::debug!(error = %e, "id_token: candidate key did not verify; trying next");
+                last_err = Some(anyhow!("id_token signature verification failed: {}", e));
+            }
+        }
+    }
 
-    // Decode and verify
-    let decoded = jsonwebtoken::decode::<Value>(token, &decoding_key, &validation)
-        .map_err(|e| anyhow!("id_token signature verification failed: {}", e))?;
-
-    Ok(VerifiedIdToken {
-        claims: decoded.claims,
-    })
+    Err(last_err.unwrap_or_else(|| {
+        anyhow!(
+            "id_token verification failed: no candidate verified ({} candidates)",
+            candidates.len()
+        )
+    }))
 }
 
 /// Decode only the JWT header (without verification) for key selection.
@@ -108,71 +167,63 @@ fn decode_jwt_header(token: &str) -> Result<Value> {
         .map_err(|e| anyhow!("Invalid JSON in JWT header: {e}"))
 }
 
-/// Find the matching JWKS key by `kid` (if present) or by algorithm.
-fn find_matching_key<'a>(keys: &'a [Value], kid: Option<&str>, header: &Value) -> Result<&'a Value> {
-    // If kid is present, match by kid first
-    if let Some(kid) = kid {
-        for key in keys {
-            if key.get("kid").and_then(|v| v.as_str()) == Some(kid) {
-                return Ok(key);
-            }
-        }
-        return Err(anyhow!("No JWKS key found with kid='{}'", kid));
-    }
-
-    // No kid — try to match by algorithm from the header
+/// Collect every algorithm-compatible JWKS candidate for a JWT header.
+///
+/// When the JWT carries a `kid`, only entries with that exact `kid` are
+/// returned (there may be several — e.g. an Ed25519 entry and a composite
+/// entry published side-by-side under the same kid). When it carries no
+/// `kid`, every entry whose `kty`/`crv` matches the header `alg` is
+/// returned. Unknown / unsupported algorithms are skipped: the caller tries
+/// each candidate and a published set is never collapsed to a positional
+/// singleton (#1183 / #1184).
+fn candidate_keys<'a>(keys: &'a [Value], kid: Option<&str>, header: &Value) -> Vec<&'a Value> {
     let header_alg = header.get("alg").and_then(|v| v.as_str()).unwrap_or("");
-    for key in keys {
-        let key_kty = key.get("kty").and_then(|v| v.as_str()).unwrap_or("");
-        let matches = match header_alg {
-            "RS256" => key_kty == "RSA",
-            "ES256" => key_kty == "EC",
-            "EdDSA" => key_kty == "OKP",
-            _ => false,
-        };
-        if matches {
-            return Ok(key);
-        }
-    }
 
-    // Fallback: return first key
-    keys.first()
-        .ok_or_else(|| anyhow!("JWKS keys array is empty"))
+    keys.iter()
+        .filter(|key| {
+            let kid_matches = match kid {
+                Some(want) => key.get("kid").and_then(|v| v.as_str()) == Some(want),
+                None => true,
+            };
+            kid_matches && key_matches_algorithm(key, header_alg)
+        })
+        .collect()
 }
 
-/// Determine the Algorithm from the JWKS key and JWT header.
-fn determine_algorithm(jwks_key: &Value, header: &Value) -> Result<Algorithm> {
-    let header_alg = header.get("alg").and_then(|v| v.as_str());
-
-    // Trust the JWT header's alg if it's one we support
-    if let Some(alg_str) = header_alg {
-        let alg = match alg_str {
-            "RS256" => Algorithm::RS256,
-            "ES256" => Algorithm::ES256,
-            "EdDSA" => Algorithm::EdDSA,
-            other => return Err(anyhow!("Unsupported JWT algorithm: {}", other)),
-        };
-        // Verify the JWKS key type is consistent
-        let kty = jwks_key.get("kty").and_then(|v| v.as_str()).unwrap_or("");
-        let expected_kty = match alg {
-            Algorithm::RS256 => "RSA",
-            Algorithm::ES256 => "EC",
-            Algorithm::EdDSA => "OKP",
-            _ => unreachable!(),
-        };
-        if kty != expected_kty {
-            return Err(anyhow!(
-                "JWT algorithm {} expects kty='{}' but JWKS key has kty='{}'",
-                alg_str,
-                expected_kty,
-                kty
-            ));
+/// Pin a JWK candidate to the JWT's declared algorithm. Key type, curve, and
+/// an explicit JWK `alg` (when present) must all agree; candidate iteration is
+/// never allowed to create an algorithm downgrade.
+fn key_matches_algorithm(key: &Value, header_alg: &str) -> bool {
+    if let Some(key_alg) = key.get("alg").and_then(|v| v.as_str()) {
+        if key_alg != header_alg {
+            return false;
         }
-        return Ok(alg);
     }
 
-    // Infer from JWKS key type
-    algorithm_for_key_pub(jwks_key)
+    let kty = key.get("kty").and_then(|v| v.as_str()).unwrap_or("");
+    let crv = key.get("crv").and_then(|v| v.as_str());
+    match header_alg {
+        "RS256" => kty == "RSA",
+        "ES256" => kty == "EC" && crv == Some("P-256"),
+        "EdDSA" => kty == "OKP" && crv == Some("Ed25519"),
+        _ => false,
+    }
+}
+
+/// Resolve the jsonwebtoken `Algorithm` from the JWT header `alg`, after
+/// [`candidate_keys`] has already filtered the JWKS to kty/crv-consistent
+/// entries.
+fn algorithm_from_header(header: &Value) -> Result<Algorithm> {
+    let alg_str = header
+        .get("alg")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("JWT header missing 'alg'"))?;
+    match alg_str {
+        "RS256" => Ok(Algorithm::RS256),
+        "ES256" => Ok(Algorithm::ES256),
+        "EdDSA" => Ok(Algorithm::EdDSA),
+        other => Err(anyhow!("Unsupported JWT algorithm: {}", other)),
+    }
 }
 
 /// Public alias for the algorithm-from-JWK helper. Used by client_auth.
@@ -287,48 +338,214 @@ mod tests {
     }
 
     #[test]
-    fn test_determine_algorithm_from_header() {
-        let key = serde_json::json!({"kty": "RSA", "n": "abc", "e": "AQAB"});
+    fn test_algorithm_from_header_rs256() {
         let header = serde_json::json!({"alg": "RS256"});
-        assert_eq!(determine_algorithm(&key, &header).unwrap(), Algorithm::RS256);
+        assert_eq!(algorithm_from_header(&header).unwrap(), Algorithm::RS256);
     }
 
     #[test]
-    fn test_determine_algorithm_kty_mismatch() {
-        let key = serde_json::json!({"kty": "EC", "x": "abc", "y": "def"});
-        let header = serde_json::json!({"alg": "RS256"});
-        assert!(determine_algorithm(&key, &header).is_err());
+    fn test_algorithm_from_header_missing() {
+        let header = serde_json::json!({});
+        assert!(algorithm_from_header(&header).is_err());
     }
 
     #[test]
-    fn test_determine_algorithm_infer_from_kty() {
-        let rsa_key = serde_json::json!({"kty": "RSA"});
-        let empty_header = serde_json::json!({});
-        assert_eq!(
-            determine_algorithm(&rsa_key, &empty_header).unwrap(),
-            Algorithm::RS256
-        );
+    fn test_algorithm_from_header_unsupported() {
+        let header = serde_json::json!({"alg": "RS512"});
+        assert!(algorithm_from_header(&header).is_err());
     }
 
     #[test]
-    fn test_find_matching_key_by_kid() {
+    fn test_candidate_keys_by_kid() {
         let keys = vec![
             serde_json::json!({"kty": "RSA", "kid": "key-1", "n": "abc", "e": "AQAB"}),
             serde_json::json!({"kty": "RSA", "kid": "key-2", "n": "def", "e": "AQAB"}),
         ];
         let header = serde_json::json!({"alg": "RS256", "kid": "key-2"});
-        let found = find_matching_key(&keys, Some("key-2"), &header).unwrap();
-        assert_eq!(found["kid"], "key-2");
+        let found = candidate_keys(&keys, Some("key-2"), &header);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0]["kid"], "key-2");
     }
 
     #[test]
-    fn test_find_matching_key_no_kid_matches_alg() {
+    fn test_candidate_keys_no_kid_returns_all_alg_compatible() {
+        // Two simultaneously published RSA keys (overlap rotation). Without a
+        // `kid`, the verifier MUST retain BOTH candidates so it can try each —
+        // collapsing to "the first one" forecloses overlap rotation and
+        // PQ-hybrid rollout (#1183 / #1184).
         let keys = vec![
-            serde_json::json!({"kty": "RSA", "n": "abc", "e": "AQAB"}),
+            serde_json::json!({"kty": "RSA", "kid": "key-1", "n": "abc", "e": "AQAB"}),
+            serde_json::json!({"kty": "RSA", "kid": "key-2", "n": "def", "e": "AQAB"}),
         ];
         let header = serde_json::json!({"alg": "RS256"});
-        let found = find_matching_key(&keys, None, &header).unwrap();
-        assert_eq!(found["kty"], "RSA");
+        let found = candidate_keys(&keys, None, &header);
+        assert_eq!(found.len(), 2);
+    }
+
+    #[test]
+    fn test_candidate_keys_skips_unknown_alg() {
+        // An unsupported/unknown algorithm entry MUST be skipped rather than
+        // fail the whole set — a PQ-capable verifier ignores what it does not
+        // recognize while a classical verifier keeps working against the
+        // classical entry.
+        let keys = vec![
+            serde_json::json!({"kty": "AKP", "alg": "ML-DSA-65-Ed25519", "kid": "pq"}),
+            serde_json::json!({"kty": "RSA", "kid": "classic", "n": "abc", "e": "AQAB"}),
+        ];
+        let header = serde_json::json!({"alg": "RS256"});
+        let found = candidate_keys(&keys, None, &header);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0]["kid"], "classic");
+    }
+
+    #[test]
+    fn test_candidate_keys_no_kid_no_match() {
+        let keys = vec![
+            serde_json::json!({"kty": "EC", "kid": "ec-1", "x": "a", "y": "b"}),
+        ];
+        let header = serde_json::json!({"alg": "RS256"});
+        let found = candidate_keys(&keys, None, &header);
+        assert!(found.is_empty());
+    }
+
+    /// Build an EdDSA JWT signed with `signing_key`. The header carries the
+    /// given optional `kid`. Used by the overlap-rotation tests so they can
+    /// sign with arbitrary Ed25519 keys without a PEM/DER round-trip.
+    fn sign_eddsa_jwt(
+        signing_key: &ed25519_dalek::SigningKey,
+        claims: &serde_json::Value,
+        kid: Option<&str>,
+    ) -> String {
+        use ed25519_dalek::Signer;
+        let mut header = serde_json::json!({"alg": "EdDSA", "typ": "JWT"});
+        if let Some(k) = kid {
+            header["kid"] = serde_json::Value::String(k.to_owned());
+        }
+        let header_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&header).unwrap());
+        let payload_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(claims).unwrap());
+        let signing_input = format!("{header_b64}.{payload_b64}");
+        let sig = signing_key.sign(signing_input.as_bytes());
+        let sig_b64 = URL_SAFE_NO_PAD.encode(sig.to_bytes());
+        format!("{signing_input}.{sig_b64}")
+    }
+
+    fn jwks_ed25519(entries: &[(&str, &ed25519_dalek::VerifyingKey)]) -> Vec<Value> {
+        entries
+            .iter()
+            .map(|(kid, vk)| {
+                serde_json::json!({
+                    "kty": "OKP", "crv": "Ed25519", "alg": "EdDSA",
+                    "kid": kid,
+                    "x": URL_SAFE_NO_PAD.encode(vk.as_bytes()),
+                })
+            })
+            .collect()
+    }
+
+    /// #1184: a kid-less id_token signed by the SECOND of two simultaneously
+    /// published Ed25519 keys must verify against the JWKS set. The previous
+    /// implementation returned `keys.first()` and would fail for the non-first
+    /// signer; reverting this hunk to "try only the first candidate" makes
+    /// this test fail.
+    #[test]
+    fn id_token_kid_less_signer_is_non_first_published_key() -> anyhow::Result<()> {
+        let sk_a = ed25519_dalek::SigningKey::from_bytes(&[0xA0; 32]);
+        let sk_b = ed25519_dalek::SigningKey::from_bytes(&[0xB0; 32]);
+
+        // Publish BOTH keys (overlap window): lead first, drain second.
+        let keys = jwks_ed25519(&[("lead", &sk_a.verifying_key()), ("drain", &sk_b.verifying_key())]);
+
+        // Sign with the SECOND (drain) key — no `kid` in the header.
+        let claims = serde_json::json!({
+            "iss": "https://idp.example.com",
+            "aud": "client-42",
+            "sub": "user-1",
+            "exp": (jsonwebtoken::get_current_timestamp() + 300),
+        });
+        let token = sign_eddsa_jwt(&sk_b, &claims, None);
+
+        let verified = verify_id_token_with_keys(
+            &token,
+            &keys,
+            "https://idp.example.com",
+            "client-42",
+        )?;
+        assert_eq!(verified.claims["sub"], "user-1");
+        Ok(())
+    }
+
+    /// #1184 overlap: while both keys are published, a token signed by either
+    /// verifies (first AND non-first), and a token signed by an UNKNOWN key
+    /// that is not in the set is rejected.
+    #[test]
+    fn id_token_overlap_both_signers_accepted_unknown_rejected() -> anyhow::Result<()> {
+        let sk_lead = ed25519_dalek::SigningKey::from_bytes(&[0x11; 32]);
+        let sk_drain = ed25519_dalek::SigningKey::from_bytes(&[0x22; 32]);
+        let sk_unknown = ed25519_dalek::SigningKey::from_bytes(&[0x99; 32]);
+
+        let keys = jwks_ed25519(&[
+            ("lead", &sk_lead.verifying_key()),
+            ("drain", &sk_drain.verifying_key()),
+        ]);
+
+        let claims = serde_json::json!({
+            "iss": "https://idp.example.com",
+            "aud": "client-42",
+            "sub": "user-1",
+            "exp": (jsonwebtoken::get_current_timestamp() + 300),
+        });
+
+        // First (lead) signer — accepted.
+        let token_lead = sign_eddsa_jwt(&sk_lead, &claims, None);
+        let v = verify_id_token_with_keys(&token_lead, &keys, "https://idp.example.com", "client-42")?;
+        assert_eq!(v.claims["sub"], "user-1");
+
+        // Non-first (drain) signer — accepted.
+        let token_drain = sign_eddsa_jwt(&sk_drain, &claims, None);
+        let v = verify_id_token_with_keys(&token_drain, &keys, "https://idp.example.com", "client-42")?;
+        assert_eq!(v.claims["sub"], "user-1");
+
+        // Unknown signer (not in the published set) — rejected.
+        let token_bad = sign_eddsa_jwt(&sk_unknown, &claims, None);
+        let err = verify_id_token_with_keys(&token_bad, &keys, "https://idp.example.com", "client-42")
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("signature verification failed")
+                || err.to_string().contains("no candidate verified"),
+            "unexpected error: {err}"
+        );
+        Ok(())
+    }
+
+    /// #1184: an unsupported/unknown algorithm entry in the JWKS MUST be
+    /// skipped rather than fail the whole set — a PQ-capable verifier ignores
+    /// what it does not recognize while a classical verifier keeps working
+    /// against the classical entry.
+    #[test]
+    fn id_token_skips_unsupported_alg_and_accepts_classical() -> anyhow::Result<()> {
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[0x33; 32]);
+        let vk = sk.verifying_key();
+
+        let keys = vec![
+            // Unknown composite_alg entry — must be skipped, not fatal.
+            serde_json::json!({"kty": "AKP", "alg": "ML-DSA-65-Ed25519", "kid": "pq"}),
+            // Classical Ed25519 entry — the real verifier.
+            serde_json::json!({
+                "kty": "OKP", "crv": "Ed25519", "alg": "EdDSA", "kid": "classic",
+                "x": URL_SAFE_NO_PAD.encode(vk.as_bytes()),
+            }),
+        ];
+
+        let claims = serde_json::json!({
+            "iss": "https://idp.example.com",
+            "aud": "client-42",
+            "sub": "user-1",
+            "exp": (jsonwebtoken::get_current_timestamp() + 300),
+        });
+        let token = sign_eddsa_jwt(&sk, &claims, None);
+        let v = verify_id_token_with_keys(&token, &keys, "https://idp.example.com", "client-42")?;
+        assert_eq!(v.claims["sub"], "user-1");
+        Ok(())
     }
 
     #[test]
