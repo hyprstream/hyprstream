@@ -235,9 +235,17 @@ impl JwtKeySource for FederatedKeySource {
         if self.local.is_trusted(issuer) {
             return self.local.get_key(issuer, kid).await;
         }
-        // Fall back to federation
+        // Fall back to federation. The resolver returns the full candidate
+        // set ordered kid-first; we return the preferred (kid-matching, or
+        // first published) key for the single-key JwtKeySource contract.
+        // Rotation overlap is preserved because the resolver surfaces every
+        // published key and orders the requested kid first (#1185).
         if self.federation.is_trusted(issuer) {
-            return self.federation.get_key(issuer).await;
+            let candidates = self.federation.get_keys(issuer, kid).await?;
+            return candidates
+                .first()
+                .copied()
+                .ok_or_else(|| anyhow::anyhow!("No Ed25519 key for issuer {}", issuer));
         }
         anyhow::bail!("Untrusted issuer: {}", issuer)
     }

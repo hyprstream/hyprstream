@@ -1489,8 +1489,34 @@ fn create_mcp_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
                                     }
                                 }
                             } else {
-                                match federation_resolver.get_key(&iss).await {
-                                    Ok(key) => crate::auth::jwt::decode_with_key(&t, &key, Some(mcp_resource_url.as_str())),
+                                // Rotation-aware federation verification (#1185):
+                                // try each published candidate (kid-first) so a
+                                // token signed by a non-first published key
+                                // verifies during overlap rotation.
+                                match federation_resolver.get_keys(&iss, kid.as_deref()).await {
+                                    Ok(candidates) if !candidates.is_empty() => {
+                                        let mut decoded: Option<crate::auth::jwt::Claims> = None;
+                                        let mut last_err: Option<crate::auth::jwt::JwtError> = None;
+                                        for key in &candidates {
+                                            match crate::auth::jwt::decode_with_key(
+                                                &t,
+                                                key,
+                                                Some(mcp_resource_url.as_str()),
+                                            ) {
+                                                Ok(c) => {
+                                                    decoded = Some(c);
+                                                    break;
+                                                }
+                                                Err(e) => last_err = Some(e),
+                                            }
+                                        }
+                                        match (decoded, last_err) {
+                                            (Some(c), _) => Ok(c),
+                                            (None, Some(e)) => Err(e),
+                                            (None, None) => Err(crate::auth::jwt::JwtError::InvalidFormat),
+                                        }
+                                    }
+                                    Ok(_) => Err(crate::auth::jwt::JwtError::InvalidFormat),
                                     Err(e) => {
                                         tracing::debug!(%method, %uri, issuer = %iss, error = %e, "MCP federation key resolution failed");
                                         let mut res = (StatusCode::UNAUTHORIZED, "Authentication failed").into_response();

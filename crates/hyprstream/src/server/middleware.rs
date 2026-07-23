@@ -444,10 +444,33 @@ pub(crate) async fn verify_token_claims(
         if !state.federation_resolver.is_trusted(&iss) {
             return Err("untrusted federation issuer");
         }
-        match state.federation_resolver.get_key(&iss).await {
-            Ok(key) => jwt::decode_with_key(token, &key, Some(&state.resource_url))
-                .map_err(|_| "JWT validation failed")?,
-            Err(_) => return Err("federation key resolution failed"),
+        // Rotation-aware federation verification (#1185): the resolver
+        // returns every Ed25519 key the issuer currently publishes
+        // (ordered kid-first), and we accept the token if ANY candidate
+        // verifies it. This is what makes overlap rotation safe — a
+        // token signed by a non-first key succeeds when its kid is
+        // published — and mirrors `decode_local_multi_key` for external
+        // issuers. The token's own `kid`, when present, is passed to
+        // the resolver so it can refetch on an unknown kid.
+        let kid = extract_kid_from_token(token);
+        match state.federation_resolver.get_keys(&iss, kid.as_deref()).await {
+            Ok(candidates) if !candidates.is_empty() => {
+                let mut verified: Option<jwt::Claims> = None;
+                for key in &candidates {
+                    if let Ok(claims) =
+                        jwt::decode_with_key(token, key, Some(&state.resource_url))
+                    {
+                        verified = Some(claims);
+                        break;
+                    }
+                }
+                match verified {
+                    Some(claims) => claims,
+                    None => return Err("JWT validation failed"),
+                }
+            }
+            // Empty candidate set or fetch failure: fail closed either way.
+            Ok(_) | Err(_) => return Err("federation key resolution failed"),
         }
     };
 

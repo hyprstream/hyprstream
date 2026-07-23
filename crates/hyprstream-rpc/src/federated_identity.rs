@@ -72,7 +72,11 @@ mod tests {
         fn is_trusted(&self, _issuer: &str) -> bool {
             true
         }
-        async fn get_key(&self, _issuer: &str) -> Result<ed25519_dalek::VerifyingKey> {
+        async fn get_keys(
+            &self,
+            _issuer: &str,
+            _kid: Option<&str>,
+        ) -> Result<Vec<ed25519_dalek::VerifyingKey>> {
             anyhow::bail!("mock: no key")
         }
     }
