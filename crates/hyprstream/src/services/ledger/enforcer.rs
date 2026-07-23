@@ -166,7 +166,6 @@ pub struct LocalEnforcer {
     breaker: Arc<DebtBreaker>,
     cell_identity: Did,
     reserve_timeout_s: u32,
-    require_pq: bool,
 }
 
 impl std::fmt::Debug for LocalEnforcer {
@@ -174,7 +173,6 @@ impl std::fmt::Debug for LocalEnforcer {
         f.debug_struct("LocalEnforcer")
             .field("cell_identity", &self.cell_identity)
             .field("reserve_timeout_s", &self.reserve_timeout_s)
-            .field("require_pq", &self.require_pq)
             .finish()
     }
 }
@@ -195,7 +193,6 @@ impl LocalEnforcer {
             breaker,
             cell_identity,
             reserve_timeout_s: config.reserve_timeout_secs,
-            require_pq: config.require_pq_signatures,
         }
     }
 
@@ -267,9 +264,10 @@ impl LocalEnforcer {
         //    the decision that permits work to start, and a zero reservation
         //    cannot be converted into a nonzero post later — so an unsigned
         //    zero admission would be unauthenticated work, not harmless
-        //    accounting (PR #1129 review, finding 1). Classical-only clients
-        //    are accepted only when the operator explicitly disabled the PQ
-        //    requirement; a configured requirement refuses absent evidence.
+        //    accounting (PR #1129 review, finding 1). Ledger admission is an
+        //    internal hyprstream-to-hyprstream surface: PQ-hybrid is mandatory
+        //    and absent PQ key material is a hard rejection, never a request
+        //    to select Classical verification.
         {
             match &req.spend_authz {
                 Some(authz) => {
@@ -311,19 +309,10 @@ impl LocalEnforcer {
                             ),
                         ));
                     }
-                    if self.require_pq && subject.pq_vk.is_none() {
-                        return AdmissionResult::Rejected(Rejection::hard(
-                            DenyReason::InvalidSpendAuthorization(
-                                "configured PQ signature requirement has no authenticated PQ key"
-                                    .to_owned(),
-                            ),
-                        ));
-                    }
                     if let Err(reason) = CreditGate::verify_spend_authz(
                         authz,
                         &subject.ed_vk,
                         subject.pq_vk.as_ref(),
-                        self.require_pq,
                     ) {
                         return AdmissionResult::Rejected(Rejection::hard(reason));
                     }
@@ -597,7 +586,6 @@ mod tests {
         gate.materialize(&cid(1), bal.available);
         let cfg = LedgerConfig {
             enabled: true,
-            require_pq_signatures: false,
             ..LedgerConfig::default()
         };
         let breaker = Arc::new(DebtBreaker::new(&cfg, gate.generation_handle()));
@@ -773,6 +761,46 @@ mod tests {
         }
     }
 
+    /// Ledger admission is an internal surface, so a caller cannot select
+    /// Classical verification by omitting the required ML-DSA-65 key.
+    #[tokio::test]
+    async fn missing_pq_key_denied_hard() {
+        let (enf, holder, grant_cid, _debit, _credit, ed_sk, pq_sk) = fixture(1000).await;
+        let nonce = rand_nonce();
+        let (authz, _ed_vk, _pq_vk, _tid) = signed_authz(
+            &grant_cid,
+            enf.cell_identity(),
+            nonce,
+            100,
+            u64::MAX,
+            &ed_sk,
+            &pq_sk,
+        );
+        let req = AdmissionRequest {
+            authenticated_subject: Some(AuthenticatedSubject {
+                did: holder,
+                ed_vk: ed_sk.verifying_key(),
+                pq_vk: None,
+            }),
+            grant_cid,
+            unit: unit(),
+            amount: 100,
+            nonce,
+            spend_authz: Some(authz),
+        };
+        match enf.admit(&req, 0).await {
+            AdmissionResult::Rejected(r) => {
+                assert!(
+                    matches!(r.reason, DenyReason::InvalidSpendAuthorization(_)),
+                    "expected InvalidSpendAuthorization, got {:?}",
+                    r.reason
+                );
+                assert!(r.retry_after_secs.is_none(), "must be a hard reject");
+            }
+            other => panic!("admission without a PQ key must be denied, got {other:?}"),
+        }
+    }
+
     #[tokio::test]
     async fn admitted_then_post_and_void_roundtrip() {
         let (enf, _holder, grant_cid, debit, credit, ed_sk, pq_sk) = fixture(1000).await;
@@ -813,13 +841,11 @@ mod tests {
         assert!(post.is_ok(), "post should succeed: {post:?}");
     }
 
-    /// A configured PQ requirement is not conditional on whether transport
-    /// happened to expose a PQ key. Missing authenticated material must refuse,
-    /// never turn the policy off (#1145).
+    /// Ledger admission cannot select Classical verification by presenting a
+    /// Classical-only authorization.
     #[tokio::test]
-    async fn configured_pq_requirement_without_authenticated_key_denied_hard() {
-        let (mut enf, holder, grant_cid, _debit, _credit, ed_sk, _pq_sk) = fixture(1000).await;
-        enf.require_pq = true;
+    async fn classical_only_authz_denied_hard() {
+        let (enf, holder, grant_cid, _debit, _credit, ed_sk, _pq_sk) = fixture(1000).await;
         let nonce = rand_nonce();
         let mut authz = SpendAuthorization {
             grant_cid: grant_cid.clone(),
