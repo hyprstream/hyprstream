@@ -1012,6 +1012,7 @@ fn create_worker_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
     use hyprstream_workers::{BackendCtx, SandboxBackend, WorkerService, resolve_backend};
 
     let config = load_config();
+    let sk = ctx.service_signing_key("worker");
     let worker_quic_port = config.worker.as_ref().and_then(|w| w.quic_port);
     // Operator-selected backend name ("auto" or a registered backend); resolved
     // fail-closed against the inventory registry below.
@@ -1060,6 +1061,15 @@ fn create_worker_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
     #[cfg(feature = "oci-image")]
     let rafs_store = Arc::new(RafsStore::new(image_config.clone())?);
 
+    let ninep_decider = tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current().block_on(crate::mac::production_ninep_decider(
+            sk.clone(),
+            &config.oauth,
+            "ninep-worker",
+        ))
+    })
+    .context("construct worker 9P MAC PEP")?;
+
     // Resolve + construct the backend fail-closed against the inventory registry
     // (config-driven by name; explicit requests are authoritative, missing
     // prerequisites error out rather than silently downgrading isolation; "auto"
@@ -1067,14 +1077,13 @@ fn create_worker_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
     // `_ => nspawn` fallback (#507 / #518).
     let backend_ctx = BackendCtx {
         pool_config: pool_config.clone(),
+        ninep_decider,
         #[cfg(feature = "oci-image")]
         image_config,
         #[cfg(feature = "oci-image")]
         rafs_store: Arc::clone(&rafs_store),
     };
     let backend: Arc<dyn SandboxBackend> = resolve_backend(&backend_name, &backend_ctx)?;
-
-    let sk = ctx.service_signing_key("worker");
 
     // Register this service's verifying key with PolicyService
     register_service_key(ctx, "worker", &sk)?;

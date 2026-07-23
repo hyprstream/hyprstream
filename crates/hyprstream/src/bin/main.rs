@@ -1166,8 +1166,17 @@ fn handle_quick_command(
                             .as_ref()
                             .map(|w| w.backend.clone())
                             .unwrap_or_else(|| "auto".to_owned());
+                        let ninep_decider =
+                            hyprstream_core::mac::production_ninep_decider(
+                                signing_key.clone(),
+                                &ctx.config().oauth,
+                                "ninep-worker",
+                            )
+                            .await
+                            .context("construct worker 9P MAC PEP")?;
                         let backend_ctx = BackendCtx {
                             pool_config: pool_config.clone(),
+                            ninep_decider,
                             #[cfg(feature = "oci-image")]
                             image_config,
                             #[cfg(feature = "oci-image")]

@@ -9,8 +9,10 @@
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use anyhow::Context;
 use hyprstream_9p::{AccessDecider, Action as NinePAction};
 use hyprstream_rpc::auth::mac::{ObjectLabelResolver, ObjectRef, SecurityContext, SecurityLabel};
+use hyprstream_rpc::SigningKey;
 
 use crate::mac::audit::{AuditRecord, AuditSink, DecisionReason};
 use crate::mac::te::{Action, Decision, ObjectType, ScopeAction, SubjectType};
@@ -86,6 +88,51 @@ impl NinePAccessDecider {
             }
         }
     }
+}
+
+/// Build the production resolver-backed 9P PEP and its tamper-evident WAL.
+///
+/// The audit signer is mandatory under the active crypto policy. Callers must
+/// propagate an error from this function and refuse to construct a 9P-serving
+/// component; substituting [`hyprstream_9p::DenyAllDecider`] would both outage
+/// legitimate attaches and bypass the hash-chained MAC audit trail.
+pub async fn production_ninep_decider(
+    signing_key: SigningKey,
+    oauth: &crate::config::OAuthConfig,
+    audit_stream: &str,
+) -> anyhow::Result<Arc<dyn AccessDecider>> {
+    anyhow::ensure!(
+        !audit_stream.is_empty()
+            && audit_stream
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_'),
+        "invalid 9P MAC audit stream name"
+    );
+
+    let secrets_dir = crate::config::HyprConfig::resolve_secrets_dir()?;
+    let ml_dsa_store =
+        crate::auth::key_rotation::global_ml_dsa_key_store(&secrets_dir, oauth);
+    let signer = crate::mac::audit::cose::OwnedCoseAuditSigner::new(
+        Arc::new(signing_key),
+        ml_dsa_store.active_key().await,
+        hyprstream_rpc::envelope::mandatory_envelope_policy(),
+    );
+    anyhow::ensure!(
+        signer.can_sign(),
+        "9P MAC PEP audit signer unavailable under mandatory Hybrid policy"
+    );
+
+    let audit_store = crate::mac::audit::WalAuditStore::open(
+        secrets_dir.join("mac-audit").join(audit_stream),
+        signer,
+    )
+    .context("open 9P MAC audit store")?;
+    let resolver = crate::mac::GenesisGate::production().into_resolver();
+
+    Ok(Arc::new(NinePAccessDecider::new(
+        Arc::new(resolver),
+        Arc::new(audit_store),
+    )))
 }
 
 impl AccessDecider for NinePAccessDecider {

@@ -110,7 +110,7 @@ pub use genesis::{
     floor_label, genesis_lattice, CompositeObjectLabelResolver, GenesisGate, ManifestLabelSource,
     NamespaceEnumerator, NoManifests, SitePolicy,
 };
-pub use pep::NinePAccessDecider;
+pub use pep::{production_ninep_decider, NinePAccessDecider};
 // S4 (#570): the boot path that installs the verified `CompiledPolicy` at daemon
 // startup (dormant — makes the PDP inputs real without enabling enforcement).
 pub use bootload::{compile_sign_load_install, install_baseline_boot_policy, BootPolicyError};

@@ -288,6 +288,7 @@ impl WanixInjection {
 pub async fn inject_9p_socket(
     mount: Arc<dyn Mount>,
     subject: Subject,
+    decider: Arc<dyn hyprstream_9p::AccessDecider>,
     workload_dir: &Path,
     guest_cfg: &WanixGuestConfig,
 ) -> Result<WanixInjection> {
@@ -315,13 +316,9 @@ pub async fn inject_9p_socket(
     let task = tokio::spawn(async move {
         // `serve_uds` is PR-A's wire-faithful 9P2000.L server; it runs until the
         // socket errors/closes (or the task is aborted on teardown).
-        if let Err(e) = hyprstream_9p::Translator::from_mount(
-            mount,
-            subject,
-            Arc::new(hyprstream_9p::DenyAllDecider),
-        )
-        .serve_uds(listener)
-        .await
+        if let Err(e) = hyprstream_9p::Translator::from_mount(mount, subject, decider)
+            .serve_uds(listener)
+            .await
         {
             warn!(socket = %sock_for_log.display(), error = %e, "9P workload server exited with error");
         }
@@ -537,11 +534,12 @@ pub async fn prepare_wanix_workload(
     backend_type: &str,
     mount: Arc<dyn Mount>,
     subject: Subject,
+    decider: Arc<dyn hyprstream_9p::AccessDecider>,
     workload_dir: &Path,
     guest_cfg: &WanixGuestConfig,
 ) -> Result<WanixInjection> {
     super::require_9p_socket_capability(backend_type)?;
-    inject_9p_socket(mount, subject, workload_dir, guest_cfg).await
+    inject_9p_socket(mount, subject, decider, workload_dir, guest_cfg).await
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -558,9 +556,8 @@ mod tests {
 
     /// Explicitly test-only policy for the loopback guest-export fixture.
     ///
-    /// Production worker-hosted translators remain fail-closed until the
-    /// concrete resolver-backed decider can be injected across this crate
-    /// boundary.
+    /// Production callers must inject the resolver-backed, audited decider;
+    /// this permit policy exists only to exercise the transport fixture.
     struct FixtureAccessDecider;
 
     impl hyprstream_9p::AccessDecider for FixtureAccessDecider {
@@ -605,9 +602,15 @@ mod tests {
         let cfg = WanixGuestConfig {
             guest_bin: PathBuf::from("/host/build/wanix-guest"),
         };
-        let inj = inject_9p_socket(tenant_mount(), Subject::anonymous(), dir.path(), &cfg)
-            .await
-            .unwrap();
+        let inj = inject_9p_socket(
+            tenant_mount(),
+            Subject::anonymous(),
+            Arc::new(FixtureAccessDecider),
+            dir.path(),
+            &cfg,
+        )
+        .await
+        .unwrap();
 
         // (a) socket exists on return (bound synchronously) — the bind-mount
         // source is ready before any sandbox start.
@@ -742,13 +745,15 @@ mod tests {
 
     #[tokio::test]
     async fn injected_socket_is_a_live_9p_server() {
-        // The spawned task actually serves 9P: a client that connects and sends
-        // a Tversion gets a well-formed Rversion back. Proves (b) wired the real
-        // PR-A server to the tenant Mount, not just created an empty socket.
+        // The spawned task actually serves 9P through attach, the first
+        // policy-controlled operation. Stopping at Rversion would miss a
+        // deny-all policy outage because negotiation is intentionally
+        // unauthenticated.
         let dir = tempfile::tempdir().unwrap();
         let inj = inject_9p_socket(
             tenant_mount(),
             Subject::anonymous(),
+            Arc::new(FixtureAccessDecider),
             dir.path(),
             &WanixGuestConfig::default(),
         )
@@ -756,31 +761,48 @@ mod tests {
         .unwrap();
 
         let sock = inj.server.socket_path().to_path_buf();
-        // Connect + do a minimal 9P2000.L version handshake.
+        // Connect, negotiate 9P2000.L, then attach to the exported root.
         let reply = tokio::task::spawn_blocking(move || {
             use std::io::{Read, Write};
-            let mut c = StdUnixStream::connect(&sock).unwrap();
-            // Tversion: size[4] type[1]=100 tag[2]=0xFFFF msize[4] version[s]
-            let version = b"9P2000.L";
-            let mut msg = Vec::new();
-            let body_len = 4 + 1 + 2 + 4 + 2 + version.len();
-            msg.extend_from_slice(&(body_len as u32).to_le_bytes());
-            msg.push(100); // Tversion
-            msg.extend_from_slice(&0xFFFFu16.to_le_bytes());
-            msg.extend_from_slice(&8192u32.to_le_bytes());
-            msg.extend_from_slice(&(version.len() as u16).to_le_bytes());
-            msg.extend_from_slice(version);
-            c.write_all(&msg).unwrap();
 
-            let mut hdr = [0u8; 5];
-            c.read_exact(&mut hdr).unwrap();
-            hdr[4] // message type byte
+            fn read_frame(stream: &mut StdUnixStream) -> Vec<u8> {
+                let mut len = [0u8; 4];
+                stream.read_exact(&mut len).unwrap();
+                let total = u32::from_le_bytes(len) as usize;
+                let mut frame = vec![0u8; total];
+                frame[..4].copy_from_slice(&len);
+                stream.read_exact(&mut frame[4..]).unwrap();
+                frame
+            }
+
+            let mut c = StdUnixStream::connect(&sock).unwrap();
+            c.write_all(&hyprstream_9p::msg::tversion(1, 8192, "9P2000.L"))
+                .unwrap();
+            let version = read_frame(&mut c);
+            assert_eq!(
+                version[4],
+                hyprstream_9p::msg::RVERSION,
+                "expected Rversion from the injected 9P server"
+            );
+
+            c.write_all(&hyprstream_9p::msg::tattach(
+                2,
+                0,
+                u32::MAX,
+                "wanix",
+                "",
+            ))
+            .unwrap();
+            read_frame(&mut c)[4]
         })
         .await
         .unwrap();
 
-        // Rversion == 101 (Tversion 100 + 1).
-        assert_eq!(reply, 101, "expected Rversion from the injected 9P server");
+        assert_eq!(
+            reply,
+            hyprstream_9p::msg::RATTACH,
+            "expected Rattach from the injected 9P server"
+        );
     }
 
     #[tokio::test]
@@ -789,6 +811,7 @@ mod tests {
         let inj = inject_9p_socket(
             tenant_mount(),
             Subject::anonymous(),
+            Arc::new(FixtureAccessDecider),
             dir.path(),
             &WanixGuestConfig::default(),
         )
@@ -811,6 +834,7 @@ mod tests {
             "kata",
             tenant_mount(),
             Subject::anonymous(),
+            Arc::new(FixtureAccessDecider),
             dir.path(),
             &WanixGuestConfig::default(),
         )
@@ -833,6 +857,7 @@ mod tests {
             "nspawn",
             tenant_mount(),
             Subject::anonymous(),
+            Arc::new(FixtureAccessDecider),
             dir.path(),
             &WanixGuestConfig::default(),
         )

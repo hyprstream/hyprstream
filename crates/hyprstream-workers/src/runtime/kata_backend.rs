@@ -269,13 +269,19 @@ impl std::fmt::Debug for Vfs9pVsockServer {
 pub struct KataBackend {
     image_config: ImageConfig,
     rafs_store: Arc<RafsStore>,
+    ninep_decider: Arc<dyn hyprstream_9p::AccessDecider>,
 }
 
 impl KataBackend {
-    pub fn new(image_config: ImageConfig, rafs_store: Arc<RafsStore>) -> Self {
+    pub fn new(
+        image_config: ImageConfig,
+        rafs_store: Arc<RafsStore>,
+        ninep_decider: Arc<dyn hyprstream_9p::AccessDecider>,
+    ) -> Self {
         Self {
             image_config,
             rafs_store,
+            ninep_decider,
         }
     }
 
@@ -699,7 +705,15 @@ impl SandboxBackend for KataBackend {
         // boots from is unaffected).
         let mut vfs_9p: Option<Vfs9pVsockServer> = None;
         if let Some((tenant_mount, subject)) = tenant_vfs {
-            match Self::serve_tenant_vfs_9p(&hypervisor, &sandbox.id, tenant_mount, subject).await {
+            match Self::serve_tenant_vfs_9p(
+                &hypervisor,
+                &sandbox.id,
+                tenant_mount,
+                subject,
+                Arc::clone(&self.ninep_decider),
+            )
+            .await
+            {
                 Ok(server) => vfs_9p = Some(server),
                 Err(e) => tracing::warn!(
                     sandbox_id = %sandbox.id,
@@ -1210,6 +1224,7 @@ impl KataBackend {
         sandbox_id: &str,
         mount: Arc<dyn Mount>,
         subject: Subject,
+        decider: Arc<dyn hyprstream_9p::AccessDecider>,
     ) -> Result<Vfs9pVsockServer> {
         // The CH hybrid-vsock base UDS (`hvsock://<base>`), same source the
         // kata-agent client uses — keeps CH/Dragonball working without a branch.
@@ -1262,7 +1277,7 @@ impl KataBackend {
             if let Err(e) = hyprstream_9p::serve_mount_vsock_raw(
                 mount,
                 subject,
-                Arc::new(hyprstream_9p::DenyAllDecider),
+                decider,
                 &sock_for_task,
             )
             .await
@@ -1317,6 +1332,7 @@ inventory::submit! {
             Ok(Arc::new(KataBackend::new(
                 ctx.image_config.clone(),
                 Arc::clone(&ctx.rafs_store),
+                Arc::clone(&ctx.ninep_decider),
             )) as Arc<dyn crate::runtime::SandboxBackend>)
         },
     }
@@ -1329,7 +1345,21 @@ mod tests {
     use crate::config::{ImageConfig, PoolConfig};
     use crate::error::WorkerError;
     use crate::image::RafsStore;
+    use hyprstream_rpc::auth::mac::{ObjectRef, SecurityContext};
     use tempfile::TempDir;
+
+    struct FixtureAccessDecider;
+
+    impl hyprstream_9p::AccessDecider for FixtureAccessDecider {
+        fn check(
+            &self,
+            _ctx: &SecurityContext,
+            _object: ObjectRef<'_>,
+            _action: hyprstream_9p::Action,
+        ) -> bool {
+            true
+        }
+    }
 
     #[test]
     fn vfs_9p_vsock_port_distinct_from_agent() {
@@ -1379,7 +1409,11 @@ mod tests {
         std::fs::create_dir_all(&image_config.cache_dir).unwrap();
 
         let rafs_store = Arc::new(RafsStore::new(image_config.clone()).unwrap());
-        let backend = KataBackend::new(image_config, Arc::clone(&rafs_store));
+        let backend = KataBackend::new(
+            image_config,
+            Arc::clone(&rafs_store),
+            Arc::new(FixtureAccessDecider),
+        );
         (backend, rafs_store, temp_dir)
     }
 
