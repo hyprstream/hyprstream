@@ -7,15 +7,36 @@
 
 use std::path::PathBuf;
 
+use anyhow::{bail, Result};
+
+fn validate_instance_name(instance: &str) -> Result<()> {
+    if matches!(instance, "." | "..")
+        || !instance
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    {
+        bail!(
+            "HYPRSTREAM_INSTANCE must contain only ASCII letters, digits, '.', '_', or '-' and must not be '.' or '..'"
+        );
+    }
+    Ok(())
+}
+
 /// Apply HYPRSTREAM_INSTANCE namespacing to a base path.
 ///
 /// When `HYPRSTREAM_INSTANCE` is set and non-empty, appends `instances/{value}`
 /// to the base path.  This allows multiple hyprstream instances to coexist on
 /// the same host without IPC socket or data directory collisions.
-fn apply_instance_namespace(base: PathBuf) -> PathBuf {
+fn apply_instance_namespace(base: PathBuf) -> Result<PathBuf> {
     match std::env::var("HYPRSTREAM_INSTANCE") {
-        Ok(inst) if !inst.is_empty() => base.join("instances").join(inst),
-        _ => base,
+        Ok(inst) if !inst.is_empty() => {
+            validate_instance_name(&inst)?;
+            Ok(base.join("instances").join(inst))
+        }
+        Ok(_) | Err(std::env::VarError::NotPresent) => Ok(base),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            bail!("HYPRSTREAM_INSTANCE must be valid Unicode")
+        }
     }
 }
 
@@ -43,6 +64,7 @@ pub fn runtime_dir() -> PathBuf {
         }
     };
     apply_instance_namespace(base)
+        .unwrap_or_else(|error| panic!("invalid HYPRSTREAM_INSTANCE: {error}"))
 }
 
 /// Socket directory for EventService
@@ -194,7 +216,17 @@ pub fn bin_dir() -> Option<PathBuf> {
 /// When `HYPRSTREAM_INSTANCE` is set, returns
 /// `~/.local/share/hyprstream/instances/{instance}`.
 pub fn data_dir() -> Option<PathBuf> {
-    dirs::data_local_dir().map(|d| apply_instance_namespace(d.join("hyprstream")))
+    try_data_dir().ok().flatten()
+}
+
+/// Resolve the data directory while reporting an invalid instance namespace.
+///
+/// Deployment-owned storage must use this checked variant so a malformed
+/// `HYPRSTREAM_INSTANCE` cannot be mistaken for an unavailable data directory.
+pub fn try_data_dir() -> Result<Option<PathBuf>> {
+    dirs::data_local_dir()
+        .map(|dir| apply_instance_namespace(dir.join("hyprstream")))
+        .transpose()
 }
 
 /// Versions directory (`~/.local/share/hyprstream/versions`)
@@ -272,7 +304,8 @@ mod tests {
         // When HYPRSTREAM_INSTANCE is unset, paths should not contain "instances"
         std::env::remove_var("HYPRSTREAM_INSTANCE");
         let base = PathBuf::from("/tmp/test-hyprstream");
-        let result = apply_instance_namespace(base.clone());
+        let result = apply_instance_namespace(base.clone())
+            .unwrap_or_else(|error| panic!("unset instance must be accepted: {error}"));
         assert_eq!(result, base);
     }
 
@@ -280,7 +313,8 @@ mod tests {
     fn test_instance_namespace_set() {
         std::env::set_var("HYPRSTREAM_INSTANCE", "foo");
         let base = PathBuf::from("/tmp/test-hyprstream");
-        let result = apply_instance_namespace(base);
+        let result = apply_instance_namespace(base)
+            .unwrap_or_else(|error| panic!("safe instance must be accepted: {error}"));
         assert_eq!(result, PathBuf::from("/tmp/test-hyprstream/instances/foo"));
         std::env::remove_var("HYPRSTREAM_INSTANCE");
     }
@@ -289,8 +323,37 @@ mod tests {
     fn test_instance_namespace_empty_string() {
         std::env::set_var("HYPRSTREAM_INSTANCE", "");
         let base = PathBuf::from("/tmp/test-hyprstream");
-        let result = apply_instance_namespace(base.clone());
-        assert_eq!(result, base, "empty HYPRSTREAM_INSTANCE should be treated as unset");
+        let result = apply_instance_namespace(base.clone())
+            .unwrap_or_else(|error| panic!("empty instance must be accepted: {error}"));
+        assert_eq!(
+            result, base,
+            "empty HYPRSTREAM_INSTANCE should be treated as unset"
+        );
         std::env::remove_var("HYPRSTREAM_INSTANCE");
+    }
+
+    #[test]
+    fn test_instance_namespace_rejects_non_names() {
+        for instance in [
+            ".",
+            "..",
+            "../escape",
+            "nested/path",
+            r"nested\path",
+            "bad name",
+        ] {
+            assert!(
+                validate_instance_name(instance).is_err(),
+                "{instance:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn test_instance_namespace_accepts_safe_names() {
+        for instance in ["foo", "did-trust-123", "node_1", "node.example"] {
+            validate_instance_name(instance)
+                .unwrap_or_else(|error| panic!("{instance:?} must be accepted: {error}"));
+        }
     }
 }

@@ -56,6 +56,13 @@ mod service;
 #[cfg(not(target_arch = "wasm32"))]
 mod checkpointed_pds;
 
+/// Create the empty checkpoint store for an explicitly provisioned fresh node.
+/// Ordinary resolver startup never calls this, so missing history fails closed.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn initialize_deployment_checkpoint_store() -> anyhow::Result<()> {
+    checkpointed_pds::initialize_deployment_store()
+}
+
 /// #893 (at9p D1) — `did:at9p` capsule resolver: turns a GATE-verified capsule
 /// into a dialable `TransportConfig::iroh` (sibling to
 /// `hyprstream_rpc::service_entry::decode_iroh`). Injectable at the
@@ -109,8 +116,8 @@ pub use hyprstream_rpc::resolver::Resolver;
 #[cfg(not(target_arch = "wasm32"))]
 pub use did_anchored::{DeploymentTrustSource, DidAnchors};
 pub use service::{
-    bootstrap_deployment_process, deployment_registry_verifier, AuthorizationProvider,
-    DiscoveryService, RecordCarData, RecordResolver, RegistryDeploymentVerifier,
+    bootstrap_deployment_process, deployment_registry_verifier, resolve_and_authenticate_did_anchors,
+    AuthorizationProvider, DiscoveryService, RecordCarData, RecordResolver, RegistryDeploymentVerifier,
     production_browser_currentness_verifier, production_browser_provisioning,
     production_rpc_client,
 };
