@@ -74,6 +74,7 @@ pub mod image_substrate;
 pub mod inference;
 pub mod mcp_service;
 pub mod metrics;
+pub mod at9p_verify;
 pub mod ninep_bridge;
 pub mod model;
 pub mod oauth;
@@ -138,6 +139,7 @@ pub use hyprstream_workers::runtime::WorkerClient;
 pub use oauth::OAuthService;
 pub use oai::OAIService;
 pub use xet::{XetService, XetState};
+pub use at9p_verify::{At9pVerifyService, VerifyFaceState, credential_free_router};
 #[cfg(feature = "oci-image")]
 pub use image_substrate::{
     create_image_substrate_router, ImageSubstratePolicy, ImageSubstrateState,

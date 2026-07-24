@@ -77,6 +77,10 @@ pub struct HyprConfig {
     #[serde(default)]
     pub xet: XetConfig,
 
+    /// Credential-free `did:at9p` login-assertion verification HTTPS face (#1114).
+    #[serde(default)]
+    pub at9p_verify: At9pVerifyConfig,
+
     /// Arrow Flight SQL server configuration
     #[serde(default)]
     pub flight: FlightConfig,
@@ -693,6 +697,65 @@ impl XetConfig {
 
 fn default_xet_host() -> String { "0.0.0.0".to_owned() }
 fn default_xet_port() -> u16 { 6792 }
+
+/// Credential-free HTTPS verification face for `did:at9p` login assertions
+/// (#1114). A distinct listener with no cookies, no `Authorization`, and no
+/// session middleware — the whole security argument for a separate face. See
+/// `services::at9p_verify` for the trust boundary and where/why it is mounted.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct At9pVerifyConfig {
+    /// Whether the face is served. Disabled by default: opt in where needed
+    /// (the www-cyberdione-ai login page is the first consumer).
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Host address for the HTTP listener.
+    #[serde(default = "default_at9p_verify_host")]
+    pub host: String,
+
+    /// Port for the HTTP listener. Default 6793 (oai=6789, mcp=6790,
+    /// oauth=6791, xet=6792).
+    #[serde(default = "default_at9p_verify_port")]
+    pub port: u16,
+
+    /// TLS certificate path (optional; falls back to the global `[tls]` config).
+    #[serde(default)]
+    pub tls_cert: Option<PathBuf>,
+
+    /// TLS private key path (optional; falls back to the global `[tls]` config).
+    #[serde(default)]
+    pub tls_key: Option<PathBuf>,
+
+    /// Symmetric freshness window for a liveness `issued_at`, in seconds. The
+    /// holder's claimed signing instant must be within this many seconds of
+    /// the verifier's clock (in either direction).
+    #[serde(default = "default_at9p_verify_skew")]
+    pub max_skew_seconds: u64,
+
+    /// Maximum accepted challenge length, in bytes. Caps preimage-amplification
+    /// before any cryptographic work.
+    #[serde(default = "default_at9p_verify_challenge_bytes")]
+    pub max_challenge_bytes: usize,
+}
+
+impl Default for At9pVerifyConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            host: default_at9p_verify_host(),
+            port: default_at9p_verify_port(),
+            tls_cert: None,
+            tls_key: None,
+            max_skew_seconds: default_at9p_verify_skew(),
+            max_challenge_bytes: default_at9p_verify_challenge_bytes(),
+        }
+    }
+}
+
+fn default_at9p_verify_host() -> String { "0.0.0.0".to_owned() }
+fn default_at9p_verify_port() -> u16 { 6793 }
+fn default_at9p_verify_skew() -> u64 { 300 }
+fn default_at9p_verify_challenge_bytes() -> usize { 256 }
 
 /// Arrow Flight SQL server configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2120,6 +2183,7 @@ impl HyprConfigBuilder {
             token: self.token,
             oai: self.oai,
             xet: Default::default(),
+            at9p_verify: Default::default(),
             flight: self.flight,
             mcp: self.mcp,
             oauth: self.oauth,
