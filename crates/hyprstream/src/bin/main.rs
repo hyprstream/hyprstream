@@ -2101,7 +2101,10 @@ fn main() -> Result<()> {
                                     // Hold onto the map for the F3 startup key-consistency
                                     // interlock below (`assert_key_matches_bootstrap`).
                                     let bootstrap_pubkeys = hyprstream_core::auth::identity_store::load_bootstrap_pubkeys(&secrets_dir)
-                                        .unwrap_or_default();
+                                        .context("Bootstrap pubkeys not found — run 'hyprstream wizard' first")?;
+                                    if bootstrap_pubkeys.is_empty() {
+                                        anyhow::bail!("Bootstrap pubkeys file is empty — run 'hyprstream wizard' first");
+                                    }
                                     for (svc_name, vk) in &bootstrap_pubkeys {
                                         hyprstream_service::global_trust_store().insert(
                                             *vk,
