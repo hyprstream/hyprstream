@@ -268,7 +268,7 @@ fn ca_key_from_capsule(verified: &VerifiedCapsule) -> Result<VerifyingKey> {
 /// Extract Discovery reach from the capsule's typed `#ns` service. The
 /// independent nodeId is transport reach only; the signed ping remains pinned
 /// to the separately authenticated Discovery application key.
-fn reach_from_capsule(verified: &VerifiedCapsule) -> Result<TransportConfig> {
+fn reach_from_capsule(verified: &VerifiedCapsule, document: &Value) -> Result<TransportConfig> {
     let entry = verified
         .capsule()
         .body
@@ -309,7 +309,23 @@ fn reach_from_capsule(verified: &VerifiedCapsule) -> Result<TransportConfig> {
             let address = carrier
                 .parse()
                 .context("capsule QUIC reach is not an IP socket address")?;
-            Ok(TransportConfig::quic(address, address.ip().to_string()).with_connect_mode())
+            // The capsule remains authoritative for WHERE to dial. The
+            // did:web service may only contribute channel mechanics (SNI,
+            // WebPKI policy, and certificate hashes) for that exact
+            // capsule-bound socket. Those mechanics cannot select application
+            // identity: the signed ping is still pinned independently.
+            let document_transport = hyprstream_rpc::did_web::transport_entries(document)
+                .into_iter()
+                .map(|decoded| decoded.config)
+                .find(|config| {
+                    matches!(
+                        &config.endpoint,
+                        EndpointType::Quic { addr, .. } if *addr == address
+                    )
+                });
+            Ok(document_transport.unwrap_or_else(|| {
+                TransportConfig::quic(address, address.ip().to_string()).with_connect_mode()
+            }))
         }
         ref other => bail!(
             "capsule deployment reach {DEPLOYMENT_REACH_SERVICE:?} is not an iroh or QUIC endpoint (got {other:?})"
@@ -346,7 +362,7 @@ pub(crate) async fn verify_did_anchored_document(
     // The document contributes only the reciprocal identifier vouch above.
     // Everything installed is content-bound to the configured did:at9p pin.
     let ca_verifying_key = ca_key_from_capsule(&verified)?;
-    let discovery_transport = reach_from_capsule(&verified)?;
+    let discovery_transport = reach_from_capsule(&verified, document)?;
     anyhow::ensure!(
         matches!(
             discovery_transport.endpoint,
@@ -660,18 +676,32 @@ mod tests {
             cluster_did_web: web.to_owned(),
             extra_root_cert_pem: None,
         };
+        let channel_auth =
+            hyprstream_rpc::transport::QuicServerAuth::pinned(vec![[0xA5; 32]]).unwrap();
+        let mut document = document(web, Some(&at9p));
+        document["service"] = json!([{
+            "id": format!("{web}#quic"),
+            "type": "QuicTransport",
+            "serviceEndpoint": hyprstream_rpc::service_entry::encode_quic(
+                "https://127.0.0.1:7443",
+                &channel_auth,
+                &["hyprstream-rpc/1"],
+            ),
+        }]);
 
         let trust = verify_did_anchored_document(
             &anchors,
-            &document(web, Some(&at9p)),
+            &document,
             Arc::new(FixedCapsuleSource(bytes)),
             "unused-test-credential".to_owned(),
         )
         .await
         .unwrap();
         match trust.discovery_transport.endpoint {
-            EndpointType::Quic { addr, .. } => {
+            EndpointType::Quic { addr, auth, .. } => {
                 assert_eq!(addr, "127.0.0.1:7443".parse().unwrap());
+                assert!(!auth.require_web_pki());
+                assert_eq!(auth.accept_cert_hashes(), &[[0xA5; 32]]);
             }
             other => panic!("expected capsule-bound QUIC reach, got {other:?}"),
         }

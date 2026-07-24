@@ -165,8 +165,6 @@ async fn build_fixture() -> Fixture {
     let https_addr = https_listener.local_addr().unwrap();
     let https_port = https_addr.port();
     let did_web = format!("did:web:localhost%3A{https_port}");
-    let capsule = make_capsule(&did_web, 0x51);
-
     // Real DiscoveryService over real QUIC (WebTransport, h3 — the same
     // service loop production uses; self-signed cert, SHA-256 pinned).
     let discovery_sk = SigningKey::from_bytes(&[0x52; 32]);
@@ -203,6 +201,7 @@ async fn build_fixture() -> Fixture {
         .await
         .expect("discovery QUIC loop must bind");
     let quic_addr = addr_rx.await.expect("QUIC loop must report its bound addr");
+    let capsule = make_quic_capsule(&did_web, 0x51, quic_addr);
 
     let dir = TempDir::new().unwrap();
     let well_known = dir.path().join("well-known");
@@ -213,7 +212,9 @@ async fn build_fixture() -> Fixture {
         _discovery: spawned,
         did_web,
         capsule,
-        ca: SigningKey::from_bytes(&[0x54; 32]),
+        // The GATE-verified capsule's primary subject key is the deployment
+        // CA; credentials and the document projection must use that same key.
+        ca: SigningKey::from_bytes(&[0x51; 32]),
         registry: SigningKey::from_bytes(&[0x55; 32]),
         tls: make_tls(),
         discovery_sk,
@@ -248,6 +249,8 @@ async fn build_fixture() -> Fixture {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn did_anchored_bootstrap_boots_end_to_end() {
     let fixture = build_fixture().await;
+    hyprstream_discovery::initialize_deployment_checkpoint_store()
+        .expect("fresh test deployment must provision its checkpoint store");
     let node_key = SigningKey::from_bytes(&[0x56; 32]);
     hyprstream_discovery::bootstrap_deployment_process(node_key, fixture.trust_source(), true)
         .await

@@ -115,7 +115,11 @@ pub struct CapsuleMaterial {
     pub at9p_did: String,
 }
 
-pub fn make_capsule(did_web: &str, tag: u8) -> CapsuleMaterial {
+fn make_capsule_with_endpoint(
+    did_web: &str,
+    tag: u8,
+    endpoint: ServiceEndpoint,
+) -> CapsuleMaterial {
     let ed = SigningKey::from_bytes(&[tag; 32]);
     let (pq, pq_vk) = hyprstream_crypto::pq::ml_dsa_generate_keypair();
     let pair = HybridKeyPair::new(
@@ -123,7 +127,6 @@ pub fn make_capsule(did_web: &str, tag: u8) -> CapsuleMaterial {
         hyprstream_crypto::pq::ml_dsa_vk_bytes(&pq_vk),
     )
     .unwrap();
-    let endpoint = ServiceEndpoint::new(Transport::Iroh, format!("iroh://node{tag}")).unwrap();
     let service = ServiceEntry::new("#ns", ServiceType::NinePExport, endpoint).unwrap();
     let mut body = CapsuleBody::new(vec![pair], vec![service]).unwrap();
     body.also_known_as = Some(vec![did_web.to_owned()]);
@@ -134,6 +137,23 @@ pub fn make_capsule(did_web: &str, tag: u8) -> CapsuleMaterial {
         bytes,
         at9p_did: did,
     }
+}
+
+pub fn make_capsule(did_web: &str, tag: u8) -> CapsuleMaterial {
+    let mut endpoint = ServiceEndpoint::new(Transport::Iroh, format!("iroh://node{tag}")).unwrap();
+    let carrier = SigningKey::from_bytes(&[tag.wrapping_add(1); 32]);
+    endpoint.node_id = Some(
+        ed25519_to_did_key(carrier.verifying_key().as_bytes())
+            .strip_prefix("did:key:")
+            .unwrap()
+            .to_owned(),
+    );
+    make_capsule_with_endpoint(did_web, tag, endpoint)
+}
+
+pub fn make_quic_capsule(did_web: &str, tag: u8, address: SocketAddr) -> CapsuleMaterial {
+    let endpoint = ServiceEndpoint::new(Transport::Quic, format!("quic://{address}")).unwrap();
+    make_capsule_with_endpoint(did_web, tag, endpoint)
 }
 
 pub struct TlsMaterial {

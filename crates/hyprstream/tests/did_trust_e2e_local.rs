@@ -78,6 +78,8 @@ impl LocalFixture {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn did_anchored_bootstrap_boots_same_node() {
     ensure_process_globals();
+    hyprstream_discovery::initialize_deployment_checkpoint_store()
+        .expect("fresh test deployment must provision its checkpoint store");
 
     // Bind before publishing the DID so the first bootstrap fetch cannot race
     // the spawned HTTPS task for an otherwise-free port.
@@ -95,7 +97,9 @@ async fn did_anchored_bootstrap_boots_same_node() {
         well_known,
         did_web,
         capsule,
-        ca: SigningKey::from_bytes(&[0x62; 32]),
+        // The GATE-verified capsule's primary subject key is the deployment
+        // CA; credentials and the document projection must use that same key.
+        ca: SigningKey::from_bytes(&[0x61; 32]),
         registry: SigningKey::from_bytes(&[0x63; 32]),
         tls: make_tls(),
         _dir: dir,
