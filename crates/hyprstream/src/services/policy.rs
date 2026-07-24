@@ -1515,8 +1515,17 @@ impl PolicyHandler for PolicyService {
 
         // Persist renewed JWT to disk so it survives a server restart
         let credentials_dir = crate::auth::identity_store::credentials_dir()?;
-        if let Err(e) = crate::auth::identity_store::write_service_jwt(&credentials_dir, svc_name, &token) {
-            warn!(service = svc_name, "Failed to persist renewed JWT to disk: {e}");
+        let secrets_profile = crate::auth::identity_store::SecretsProfile::from_env()?;
+        if let Err(e) = crate::auth::identity_store::write_service_jwt_for_profile(
+            &credentials_dir,
+            svc_name,
+            secrets_profile,
+            &token,
+        ) {
+            warn!(
+                service = svc_name,
+                "Failed to persist renewed JWT to disk: {e}"
+            );
         }
 
         info!(service = svc_name, expires_at, "Renewed service JWT");

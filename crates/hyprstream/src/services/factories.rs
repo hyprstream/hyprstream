@@ -146,12 +146,17 @@ pub fn with_checkpointed_native_announcements(
 fn resolve_registration_jwt(
     service_name: &str,
     creds_dir: &std::path::Path,
+    secrets_profile: crate::auth::identity_store::SecretsProfile,
     from_trust: Option<String>,
 ) -> anyhow::Result<String> {
     if let Some(jwt) = from_trust {
         return Ok(jwt);
     }
-    match crate::auth::identity_store::load_service_jwt(creds_dir, service_name) {
+    match crate::auth::identity_store::load_service_jwt_for_profile(
+        creds_dir,
+        service_name,
+        secrets_profile,
+    ) {
         Ok(Some(jwt)) => Ok(jwt),
         Ok(None) => anyhow::bail!(
             "service '{service_name}' cannot register its signing key: \
@@ -200,6 +205,7 @@ fn register_service_key(
     }
 
     let creds_dir = credentials_dir()?;
+    let secrets_profile = crate::auth::identity_store::SecretsProfile::from_env()?;
 
     // The JWT may already be in the trust store (e.g. seeded by an earlier
     // registration in this process); otherwise load it from disk — the
@@ -210,7 +216,8 @@ fn register_service_key(
             .get(&signing_key.verifying_key())
             .and_then(|att| att.jwt.clone())
     };
-    let jwt = resolve_registration_jwt(service_name, &creds_dir, from_trust)?;
+    let jwt =
+        resolve_registration_jwt(service_name, &creds_dir, secrets_profile, from_trust)?;
 
     // Seed the loaded JWT into the trust store so that peer-client construction
     // (`service_token`) and the background renewal task can read it. Bind it to
@@ -259,7 +266,12 @@ fn register_service_key(
     );
 
     // Spawn background JWT renewal for this service
-    spawn_jwt_renewal_task(service_name, signing_key.clone(), creds_dir);
+    spawn_jwt_renewal_task(
+        service_name,
+        signing_key.clone(),
+        creds_dir,
+        secrets_profile,
+    );
 
     Ok(())
 }
@@ -279,12 +291,15 @@ fn decode_jwt_exp(jwt: &str) -> Option<i64> {
 
 /// Spawn a background task that renews this service's JWT when it approaches expiry.
 ///
-/// Checks hourly; renews when ≤7 days remain. Writes the renewed JWT to disk and
-/// updates the global trust store so in-flight RPC calls stay authenticated.
+/// Checks hourly; renews when ≤7 days remain. Updates the global trust store so
+/// in-flight RPC calls stay authenticated, and best-effort persists the renewed
+/// JWT to disk so it survives restart. When credentials are read-only (systemd
+/// `$CREDENTIALS_DIRECTORY`), persistence uses the unit's writable state home.
 fn spawn_jwt_renewal_task(
     service_name: &str,
     signing_key: SigningKey,
     credentials_dir: std::path::PathBuf,
+    secrets_profile: crate::auth::identity_store::SecretsProfile,
 ) {
     let service_name = service_name.to_owned();
     tokio::spawn(async move {
@@ -294,9 +309,10 @@ fn spawn_jwt_renewal_task(
         loop {
             tokio::time::sleep(CHECK_INTERVAL).await;
 
-            let jwt = match crate::auth::identity_store::load_service_jwt(
+            let jwt = match crate::auth::identity_store::load_service_jwt_for_profile(
                 &credentials_dir,
                 &service_name,
+                secrets_profile,
             ) {
                 Ok(Some(j)) => j,
                 _ => continue,
@@ -365,6 +381,20 @@ fn spawn_jwt_renewal_task(
                         att.jwt = Some(info.token.clone());
                         att.expires_at = info.expires_at;
                         trust.insert(vk, att);
+                    }
+                    // Persist so the renewed JWT survives restart (#803).
+                    if let Err(e) = crate::auth::identity_store::write_service_jwt_for_profile(
+                        &credentials_dir,
+                        &service_name,
+                        secrets_profile,
+                        &info.token,
+                    ) {
+                        tracing::error!(
+                            service = service_name,
+                            error = %e,
+                            "renewed service JWT could not be persisted; it is \
+                             process-ephemeral until the next restart re-registers"
+                        );
                     }
                     tracing::info!(
                         service = service_name,
@@ -2157,8 +2187,13 @@ mod tests {
     #[test]
     fn resolve_registration_jwt_fails_closed_when_missing() {
         let dir = tempfile::tempdir().unwrap();
-        let err = resolve_registration_jwt("model", dir.path(), None)
-            .expect_err("missing JWT must fail closed, not skip");
+        let err = resolve_registration_jwt(
+            "model",
+            dir.path(),
+            crate::auth::identity_store::SecretsProfile::SharedDirectory,
+            None,
+        )
+        .expect_err("missing JWT must fail closed, not skip");
         let msg = err.to_string();
         assert!(msg.contains("model"), "error names the service: {msg}");
         assert!(
@@ -2171,8 +2206,13 @@ mod tests {
     #[test]
     fn resolve_registration_jwt_prefers_trust_store() {
         let dir = tempfile::tempdir().unwrap();
-        let jwt = resolve_registration_jwt("model", dir.path(), Some("trust.jwt.token".to_owned()))
-            .unwrap();
+        let jwt = resolve_registration_jwt(
+            "model",
+            dir.path(),
+            crate::auth::identity_store::SecretsProfile::SharedDirectory,
+            Some("trust.jwt.token".to_owned()),
+        )
+        .unwrap();
         assert_eq!(jwt, "trust.jwt.token");
     }
 
@@ -2182,7 +2222,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         crate::auth::identity_store::write_service_jwt(dir.path(), "model", "disk.jwt.token")
             .unwrap();
-        let jwt = resolve_registration_jwt("model", dir.path(), None).unwrap();
+        let jwt = resolve_registration_jwt(
+            "model",
+            dir.path(),
+            crate::auth::identity_store::SecretsProfile::SharedDirectory,
+            None,
+        )
+        .unwrap();
         assert_eq!(jwt, "disk.jwt.token");
     }
 
