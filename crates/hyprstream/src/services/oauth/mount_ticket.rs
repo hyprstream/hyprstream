@@ -12,6 +12,7 @@ use axum::{
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
 };
+use hyprstream_pds::repo_authority::is_path_form_did_web;
 use serde::{Deserialize, Serialize};
 
 use super::state::OAuthState;
@@ -85,6 +86,16 @@ pub async fn issue_mount_ticket(
         );
     }
 
+    if is_path_form_did_web(&user.user) {
+        return oauth_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_grant",
+            Some(
+                "path-form did:web account subjects are frozen; host-form account minting is not available yet (#1159)",
+            ),
+        );
+    }
+
     let key = match state.active_jwt_signing_key().await {
         Some(k) => k,
         None => {
@@ -128,6 +139,82 @@ pub async fn issue_mount_ticket(
         }),
     )
         .into_response()
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod freeze_tests {
+    use super::*;
+    use crate::config::OAuthConfig;
+    use crate::services::{DiscoveryClient, PolicyClient};
+    use axum::extract::Extension;
+    use hyprstream_rpc::rpc_client::RpcClientImpl;
+    use hyprstream_rpc::signer::LocalSigner;
+    use hyprstream_rpc::transport::lazy_uds::LazyUdsTransport;
+
+    fn test_state() -> Arc<OAuthState> {
+        let key = ed25519_dalek::SigningKey::from_bytes(&[0x75; 32]);
+        let dummy = std::path::PathBuf::from("/dev/null/mount-ticket-freeze-test.sock");
+        let make_client = || Arc::new(
+            RpcClientImpl::new(
+                LocalSigner::new(key.clone()),
+                LazyUdsTransport::new(dummy.clone()),
+                Some(key.verifying_key()),
+            )
+            .with_response_verify_policy(hyprstream_rpc::crypto::CryptoPolicy::Classical),
+        );
+        Arc::new(
+            OAuthState::new(
+                &OAuthConfig::default(),
+                PolicyClient::new(make_client()),
+                DiscoveryClient::new(make_client()),
+                key.verifying_key().to_bytes(),
+            )
+            .with_ca_jwt_key(key),
+        )
+    }
+
+    fn request() -> MountTicketRequest {
+        MountTicketRequest {
+            plane: "webtransport".to_owned(),
+            namespace_path: "/".to_owned(),
+            pubkey: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn mount_ticket_rejects_path_form_authenticated_user_before_signing() {
+        let response = issue_mount_ticket(
+            State(test_state()),
+            Extension(AuthenticatedUser {
+                user: "did:web:accounts.example:users:alice".to_owned(),
+                token: None,
+                exp: None,
+            }),
+            HeaderMap::new(),
+            Json(request()),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn mount_ticket_allows_ordinary_authenticated_user() {
+        let response = issue_mount_ticket(
+            State(test_state()),
+            Extension(AuthenticatedUser {
+                user: "alice".to_owned(),
+                token: None,
+                exp: None,
+            }),
+            HeaderMap::new(),
+            Json(request()),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
 }
 
 pub fn ticket_capability(plane: &str, namespace_path: &str) -> String {

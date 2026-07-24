@@ -1011,17 +1011,9 @@ pub enum UserMappingStrategy {
         /// The claim name to use as the local subject.
         name: String,
     },
-    /// `did:web:{issuer_authority}:users:{external_sub}` per Phase 0.5
-    /// architecture-doc Subject Identity Format.
-    ///
-    /// Uses the OAuth issuer URL's authority (host[:port]) as the DID
-    /// method-specific identifier and the external `sub` claim as the
-    /// user path component. Example: `did:web:hyprstream.example.com:users:12345`.
-    ///
-    /// **Opt-in**: existing deployments continue to use [`Namespaced`] by
-    /// default so Casbin policies don't break. Operators migrating to
-    /// did:web should land Phase 0e (Casbin policy migration) before
-    /// switching this strategy.
+    /// Disabled legacy setting that attempted to mint path-form account DIDs.
+    /// Configuration validation and the runtime mapping path both reject it.
+    /// Host-form account minting is a separate design (#1163).
     DidWeb,
 }
 
@@ -2233,6 +2225,23 @@ impl HyprConfig {
             );
         }
 
+        let mut disabled_did_web_providers: Vec<&str> = self
+            .oauth
+            .oidc_providers
+            .iter()
+            .filter_map(|(name, provider)| {
+                matches!(&provider.user_mapping, UserMappingStrategy::DidWeb)
+                    .then_some(name.as_str())
+            })
+            .collect();
+        disabled_did_web_providers.sort_unstable();
+        if !disabled_did_web_providers.is_empty() {
+            anyhow::bail!(
+                "OIDC provider(s) {} configure disabled user_mapping = \"didweb\"; path-form did:web account minting is forbidden (#1159)",
+                disabled_did_web_providers.join(", ")
+            );
+        }
+
         Ok(())
     }
 
@@ -2827,6 +2836,24 @@ mod tests {
         assert_eq!(config.lead_secs(), 25);
         assert_eq!(config.drain_secs(), 20);
         assert_eq!(config.rotation_check_interval(), std::time::Duration::from_secs(3));
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn validation_rejects_didweb_user_mapping() {
+        let provider: OidcProviderConfig = serde_json::from_value(serde_json::json!({
+            "client_id": "legacy-client",
+            "user_mapping": "didweb"
+        }))
+        .unwrap();
+        let mut config = HyprConfig::default();
+        config
+            .oauth
+            .oidc_providers
+            .insert("legacy".to_owned(), provider);
+
+        let err = config.validate().unwrap_err();
+        assert!(err.to_string().contains("disabled user_mapping = \"didweb\""));
     }
 
     #[test]

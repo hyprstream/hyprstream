@@ -26,6 +26,7 @@ use hyprstream_pds::commit::{Commit, UnsignedCommit};
 use hyprstream_pds::ledger::{AllocationRecord, CheckpointRecord, ReceiptRecord};
 use hyprstream_pds::mst::Node;
 use hyprstream_pds::record::{ModelRecord, COLLECTION_NSID};
+use hyprstream_pds::repo_authority::is_path_form_did_web;
 use hyprstream_pds::tid::Tid;
 use sha2::Digest as _;
 
@@ -1106,6 +1107,26 @@ impl PdsPublisher {
         record_id: &str,
         current_oid_cid: String,
     ) -> AnyResult<()> {
+        // ── #1159 freeze: durable store-boundary guard ─────────────────────
+        // This is the single chokepoint every `PdsPublisher` durable write
+        // funnels through, and it persists `self.did` as the repo authority
+        // (`commit\0{did}` / `record\0{did}...` RocksDB keys). Production
+        // construction supplies a node `did:key` (factories.rs), but
+        // `PdsPublisher::new` accepts an arbitrary `String` DID, so a caller
+        // handing it a path-form `did:web:{authority}:users:{name}` would
+        // otherwise anchor a permanent, spec-invalid repo identifier in durable
+        // storage — exactly the shape #1159 freezes. Reject it here, at the
+        // durable-write boundary, WITHOUT applying the full repo-authority
+        // allowlist (which would reject the legitimate node `did:key` design).
+        if is_path_form_did_web(&self.did) {
+            bail!(
+                "PdsPublisher authority {} is a path-form did:web identifier; \
+                 the atproto profile requires host-form did:web, and path-form \
+                 account minting is frozen (#1159)",
+                self.did,
+            );
+        }
+
         // The collection NSID becomes both a `\0`-delimited RocksDB key field
         // and the `<collection>/<rkey>` MST key prefix — reject anything that
         // would be ambiguous in either encoding.
@@ -2265,5 +2286,56 @@ mod pds_store_tests {
             publisher.accepted_at9p_state(&did, None).is_err(),
             "an identity-valid fork without daemon acceptance must fail closed"
         );
+    }
+
+    // ── #1159 freeze: durable publisher rejects path-form authorities ───────
+
+    /// A `PdsPublisher` whose authority is a path-form `did:web` must refuse to
+    /// publish — the durable write would anchor a permanent, spec-invalid repo
+    /// identifier (`commit\0{did}` / `record\0{did}` keys). Production supplies
+    /// a node `did:key`; this guards the public `PdsPublisher::new(did)` surface.
+    #[test]
+    fn publish_rejects_path_form_did_web_authority() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sk = SigningKey::random(&mut rand::rngs::OsRng);
+        let store = Arc::new(PdsRecordStore::open(dir.path()).expect("open rw"));
+        let path_form_did = "did:web:accounts.example:users:alice".to_owned();
+        let publisher = PdsPublisher::new(Arc::clone(&store), path_form_did.clone(), sk);
+
+        let err = publisher.publish("repo-a", SAMPLE_OID).unwrap_err();
+        assert!(
+            err.to_string().contains("path-form did:web"),
+            "expected path-form rejection, got: {err}",
+        );
+
+        // No durable anchor was written: the store holds no commit for this DID.
+        let RecordBacking::ReadWrite(db) = &store.backing else { panic!("read-write store") };
+        assert!(
+            db.get(commit_key(&path_form_did)).unwrap().is_none(),
+            "no commit key must be persisted for a path-form authority",
+        );
+        let tid = PdsRecordStore::tid_for_repo("repo-a");
+        assert!(
+            db.get(record_key(&path_form_did, COLLECTION_NSID, tid))
+                .unwrap()
+                .is_none(),
+            "no record key must be persisted for a path-form authority",
+        );
+    }
+
+    /// Host-form `did:web` and node `did:key` authorities still publish
+    /// normally — the guard rejects ONLY path-form did:web.
+    #[test]
+    fn publish_accepts_host_form_did_web_and_did_key() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sk = SigningKey::random(&mut rand::rngs::OsRng);
+
+        for accepted in ["did:web:alice.example.com", DID] {
+            let store = Arc::new(PdsRecordStore::open(dir.path()).expect("open rw"));
+            let publisher = PdsPublisher::new(store, accepted.to_owned(), sk.clone());
+            publisher
+                .publish("repo-a", SAMPLE_OID)
+                .unwrap_or_else(|e| panic!("host-form/key authority {accepted} must publish: {e}"));
+        }
     }
 }

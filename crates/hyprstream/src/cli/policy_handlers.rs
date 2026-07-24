@@ -17,6 +17,7 @@ use crate::services::generated::policy_client::{
     PolicyClient, GetHistory, GetDiff, ApplyDraft, RollbackPolicy, PolicyCheck, ApplyTemplate,
     AddGrouping, RemoveGrouping,
 };
+use hyprstream_pds::repo_authority::is_path_form_did_web;
 use anyhow::{Context, Result};
 use chrono::Duration;
 use ed25519_dalek::SigningKey;
@@ -360,7 +361,7 @@ pub async fn handle_token_create(
     });
 
     // Mint JWT with proper iss/aud claims for OAI middleware compatibility
-    let (token, exp) = mint_local_token(signing_key, user, duration);
+    let (token, exp) = mint_local_token(signing_key, user, duration)?;
 
     // Display the token (only shown once)
     println!();
@@ -424,7 +425,13 @@ pub(crate) fn mint_local_token(
     signing_key: &SigningKey,
     subject: &str,
     duration: Duration,
-) -> (String, i64) {
+) -> Result<(String, i64)> {
+    if is_path_form_did_web(subject) {
+        anyhow::bail!(
+            "path-form did:web account subjects are frozen; host-form account minting is not available yet (#1159)"
+        );
+    }
+
     let now = chrono::Utc::now().timestamp();
     let exp = now + duration.num_seconds();
 
@@ -443,7 +450,7 @@ pub(crate) fn mint_local_token(
 
     let jwt_key = hyprstream_rpc::node_identity::derive_purpose_key(signing_key, "hyprstream-jwt-v1");
     let token = jwt::encode(&claims, &jwt_key);
-    (token, exp)
+    Ok((token, exp))
 }
 
 /// Ensure the local user has an Ed25519 signing keypair.
@@ -655,4 +662,34 @@ pub async fn handle_policy_apply_template(
     println!("  {result_msg}");
 
     Ok(())
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn local_token_mint_rejects_path_form_account_subject() {
+        let signing_key = SigningKey::from_bytes(&[0x71; 32]);
+        let error = mint_local_token(
+            &signing_key,
+            "did:web:accounts.example:users:alice",
+            Duration::hours(1),
+        )
+        .expect_err("path-form account subject must not reach the direct CLI signer");
+
+        assert!(error.to_string().contains("path-form did:web account subjects are frozen"));
+    }
+
+    #[test]
+    fn local_token_mint_allows_ordinary_subject() {
+        let signing_key = SigningKey::from_bytes(&[0x72; 32]);
+        let (token, _) = mint_local_token(&signing_key, "alice", Duration::hours(1))
+            .expect("ordinary CLI subject must still mint");
+
+        let claims = hyprstream_rpc::auth::decode_unverified(&token)
+            .expect("minted token must decode");
+        assert_eq!(claims.sub, "alice");
+    }
 }

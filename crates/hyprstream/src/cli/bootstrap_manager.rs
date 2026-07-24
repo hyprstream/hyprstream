@@ -439,7 +439,15 @@ impl WizardBackend for BootstrapManager {
             .unwrap_or_else(|_| Some(chrono::Duration::days(90)))
             .unwrap_or_else(|| chrono::Duration::days(90));
 
-        let (token, exp) = mint_local_token(signing_key, username, dur);
+        let (token, exp) = match mint_local_token(signing_key, username, dur) {
+            Ok(token) => token,
+            Err(error) => {
+                return TokenResult {
+                    token: format!("ERROR: {error}"),
+                    expires: "N/A".to_owned(),
+                };
+            }
+        };
 
         let expires = if duration == "never" {
             "never".to_owned()

@@ -3,8 +3,8 @@
 //! Serves DID documents at:
 //!   - `GET /.well-known/did.json` — root deployment DID (controller for all keys
 //!     under this issuer's authority)
-//!   - `GET /users/:username/did.json` — per-user DID document with that user's
-//!     registered Ed25519 verification methods
+//!   - `GET /users/:username/did.json` — hard error while path-form account DID
+//!     minting is frozen (#1159)
 //!   - `GET /clients/:client_id/did.json` — per-client DID document (for Tier 3
 //!     confidential clients with registered keys)
 //!
@@ -104,6 +104,7 @@ fn configured_handle_host(issuer_url: &str) -> Option<String> {
     }
 }
 
+#[cfg(test)]
 fn account_handle(username: &str, issuer_url: &str) -> Option<String> {
     let host = configured_handle_host(issuer_url)?;
     normalize_atproto_handle(&format!("{username}.{host}"))
@@ -586,71 +587,26 @@ pub async fn atproto_did(
     ).into_response()
 }
 
-/// `GET /users/:username/did.json` — per-user DID document.
+/// `GET /users/:username/did.json` — frozen path-form account DID endpoint.
 ///
-/// `id = did:web:{authority}:users:{username}`. Verification methods:
-/// every Ed25519 pubkey the user has registered via SCIM
-/// (`list_pubkeys`). Empty `verificationMethod` array if the user has no
-/// registered keys — that's a valid DID document; it just means no
-/// authentication keys are bound.
+/// This route previously synthesized `did:web:{authority}:users:{username}`.
+/// That shape is outside the atproto did:web profile, so serving it would mint
+/// another permanent invalid account identifier. Keep the route as an explicit
+/// hard error until the separately designed host-form mint path lands (#1163).
 pub async fn user_did_document(
-    State(state): State<Arc<OAuthState>>,
+    State(_state): State<Arc<OAuthState>>,
     Path(username): Path<String>,
 ) -> Response {
-    let authority = match issuer_authority(&state.issuer_url) {
-        Some(a) => a,
-        None => return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "issuer URL has no authority",
-        ).into_response(),
-    };
+    tracing::debug!(%username, "deprecated path-form account DID route requested");
+    path_form_account_did_disabled_response()
+}
 
-    // Reject usernames containing characters that would break the did:web
-    // path component or imply arbitrary path traversal.
-    if username.contains(['/', '#', '?', ':']) || username.is_empty() {
-        return (StatusCode::BAD_REQUEST, "invalid username").into_response();
-    }
-    let did = format!("did:web:{authority}:users:{username}");
-
-    // Resolve user keys via UserStore.list_pubkeys. If the user store is
-    // unavailable or the user has no profile, serve an empty DID document
-    // (404 would be more strictly correct, but did:web consumers tend to
-    // tolerate empty verificationMethod better than HTTP errors and we
-    // want this endpoint to be usable as a presence check).
-    let keys: Vec<(String, VerifyingKey)> = match state.user_service.as_ref() {
-        Some(user_svc) => {
-            match user_svc.store().list_pubkeys(&username).await {
-                Ok(pubkeys) => pubkeys
-                    .into_iter()
-                    .map(|pk| (format!("key-{}", &pk.fingerprint[..8.min(pk.fingerprint.len())]), pk.pubkey))
-                    .collect(),
-                Err(_) => Vec::new(),
-            }
-        }
-        None => Vec::new(),
-    };
-
-    // #1113 rev2 finding 2: serve a COMPLETE atproto account DID document so
-    // that resolving the token `sub` (a did:web:{authority}:users:{username})
-    // yields a PDS whose `AtprotoPersonalDataServer` service points at THIS
-    // host — the round-trip the stock @atproto/oauth-client-browser requires
-    // (PDS metadata issuer == this AS). The hosted-account `#atproto` VM is
-    // the node's active ES256 key (the PDS signs atproto ops on the account's
-    // behalf), and `alsoKnownAs` carries an `at://{handle}` alias.
-    let atproto_signing = match state.es256_key_store.as_ref() {
-        Some(store) => store.active_key().await,
-        None => None,
-    };
-    let handle = account_handle(&username, &state.issuer_url);
-    let atproto = atproto_signing.as_ref().zip(handle.as_deref())
-        .map(|(sk, handle)| AtprotoIdentity { p256_vk: sk.verifying_key(), handle });
-
-    let doc = build_did_document(&did, &state.issuer_url, &keys, atproto.as_ref(), &[], None, None);
+fn path_form_account_did_disabled_response() -> Response {
     (
-        StatusCode::OK,
-        [(header::CONTENT_TYPE, "application/did+json")],
-        Json(doc),
-    ).into_response()
+        StatusCode::GONE,
+        "did:web path-form account minting is disabled; host-form account minting is not available yet (#1159)",
+    )
+        .into_response()
 }
 
 /// `GET /clients/:client_id/did.json` — per-client DID document.
@@ -764,6 +720,137 @@ mod tests {
         assert_eq!(issuer_authority("example.com"), None);
     }
 
+    /// `GET /users/:username/did.json` must be a deliberate 410 hard error,
+    /// driven through the **production** OAuth router (`create_app`) — NOT by
+    /// calling the `path_form_account_did_disabled_response()` helper directly.
+    ///
+    /// This is the regression guard for the #1159 path-form account freeze.
+    /// The handler must return 410 *before* consulting any user store: a
+    /// user-store spy whose `list_pubkeys` panics is wired into the state so
+    /// that restoring the pre-PR document-serving body (which resolved user
+    /// keys via `list_pubkeys`) fails this test loudly, instead of passing on
+    /// a coincidental "no keys found → 200 with an empty document". Asserting
+    /// only on the helper would pass either way — that tautology is what this
+    /// test replaces.
+    #[tokio::test]
+    async fn path_form_account_document_endpoint_is_a_hard_error() {
+        use crate::auth::user_store::{PubkeyEntry, UserFilter, UserProfile, UserProfilePatch, UserStore};
+        use crate::config::server::CorsConfig;
+        use crate::config::OAuthConfig;
+        use crate::services::oauth::create_app;
+        use crate::services::{DiscoveryClient, PolicyClient};
+        use async_trait::async_trait;
+        use axum::body::Body;
+        use axum::http::Request as HttpRequest;
+        use hyprstream_rpc::rpc_client::RpcClientImpl;
+        use hyprstream_rpc::signer::LocalSigner;
+        use hyprstream_rpc::transport::lazy_uds::LazyUdsTransport;
+        use tower::ServiceExt; // oneshot
+
+        /// User-store spy whose every method panics. The frozen account-DID
+        /// handler must return 410 without ever consulting the store; if the
+        /// old key-lookup/serving code path is reintroduced it touches
+        /// `list_pubkeys` and this test aborts instead of passing.
+        struct UntouchedUserStore;
+        #[async_trait]
+        impl UserStore for UntouchedUserStore {
+            async fn get_profile(&self, _: &str) -> anyhow::Result<Option<UserProfile>> {
+                unreachable!("frozen account-DID handler must not read profiles")
+            }
+            async fn register(&self, _: &str) -> anyhow::Result<String> {
+                unreachable!()
+            }
+            async fn set_profile(&self, _: &str, _: UserProfilePatch) -> anyhow::Result<()> {
+                unreachable!()
+            }
+            async fn remove(&self, _: &str) -> anyhow::Result<bool> { unreachable!() }
+            async fn list_users(&self) -> Vec<String> { unreachable!() }
+            async fn search(&self, _: &UserFilter)
+                -> anyhow::Result<Vec<(String, UserProfile)>> {
+                unreachable!()
+            }
+            async fn set_active(&self, _: &str, _: bool) -> anyhow::Result<()> {
+                unreachable!()
+            }
+            async fn list_pubkeys(&self, _: &str) -> anyhow::Result<Vec<PubkeyEntry>> {
+                // This is the method the pre-PR `user_did_document` called to
+                // resolve keys before minting the path-form DID. Reaching it
+                // means the freeze was bypassed.
+                unreachable!(
+                    "frozen account-DID handler must not call list_pubkeys (#1159)"
+                )
+            }
+            async fn add_pubkey(
+                &self, _: &str, _: VerifyingKey, _: Option<String>,
+            ) -> anyhow::Result<String> {
+                unreachable!()
+            }
+            async fn add_pubkey_hybrid(
+                &self, _: &str, _: VerifyingKey, _: Vec<u8>, _: Option<String>,
+            ) -> anyhow::Result<String> {
+                unreachable!()
+            }
+            async fn remove_pubkey(&self, _: &str, _: &str) -> anyhow::Result<bool> {
+                unreachable!()
+            }
+            async fn get_pubkey_user(&self, _: &str) -> anyhow::Result<Option<String>> {
+                unreachable!()
+            }
+            async fn touch_pubkey(&self, _: &str, _: &str) -> anyhow::Result<()> {
+                unreachable!()
+            }
+        }
+
+        // Minimal OAuthState over a LazyUdsTransport pointed at /dev/null.
+        // The frozen handler returns before opening it, so this keeps the test
+        // hermetic while still exercising the real router + handler wiring.
+        let key = SigningKey::from_bytes(&[0x76; 32]);
+        let vk = SigningKey::from_bytes(&[0x73; 32]).verifying_key();
+        let dummy = std::path::PathBuf::from("/dev/null/did-doc-test.sock");
+        let mk_client = || {
+            let rpc = RpcClientImpl::new(
+                LocalSigner::new(key.clone()),
+                LazyUdsTransport::new(dummy.clone()),
+                Some(vk),
+            )
+            .with_response_verify_policy(hyprstream_rpc::crypto::CryptoPolicy::Classical);
+            Arc::new(rpc)
+        };
+        let state = Arc::new(
+            OAuthState::new(
+                &OAuthConfig::default(),
+                PolicyClient::new(mk_client()),
+                DiscoveryClient::new(mk_client()),
+                [0x76; 32],
+            )
+            .with_user_service(Arc::new(crate::services::oauth::user_service::UserService::new(
+                Arc::new(UntouchedUserStore),
+            ))),
+        );
+
+        let cors = CorsConfig { enabled: false, ..Default::default() };
+        let app = create_app(state, &cors);
+
+        let response = app
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/users/alice/did.json")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::GONE);
+        let body = axum::body::to_bytes(response.into_body(), 4096).await.unwrap();
+        assert!(
+            std::str::from_utf8(&body)
+                .unwrap()
+                .contains("path-form account minting is disabled"),
+            "body was: {}",
+            std::str::from_utf8(&body).unwrap(),
+        );
+    }
+
     #[test]
     fn ipv6_issuer_does_not_synthesize_atproto_handle() {
         assert_eq!(configured_handle_host("https://[::1]:6791"), None);
@@ -794,7 +881,7 @@ mod tests {
     #[test]
     fn build_did_doc_minimum_structure() {
         let sk = SigningKey::generate(&mut OsRng);
-        let did = "did:web:hyprstream.example.com:users:alice";
+        let did = "did:web:alice.hyprstream.example.com";
         let doc = build_did_document(
             did,
             "https://hyprstream.example.com",
@@ -822,7 +909,7 @@ mod tests {
 
     #[test]
     fn build_did_doc_empty_keys_is_valid() {
-        let did = "did:web:example.com:users:alice";
+        let did = "did:web:alice.example.com";
         let doc = build_did_document(did, "https://example.com", &[], None, &[], None, None);
         assert_eq!(doc["id"].as_str().unwrap(), did);
         assert_eq!(doc["verificationMethod"].as_array().unwrap().len(), 0);
