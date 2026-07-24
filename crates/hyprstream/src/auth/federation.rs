@@ -204,7 +204,7 @@ impl FederationKeyResolver {
             match pc
                 .check(&PolicyCheck {
                     subject: origin.clone(),
-                    domain: "*".to_owned(),
+                    domain: origin.clone(),
                     resource: "federation:register".to_owned(),
                     operation: "check".to_owned(),
                 })

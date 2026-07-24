@@ -59,7 +59,7 @@ impl OriginAdmission for PolicyOriginAdmission {
             .policy_client
             .check(&PolicyCheck {
                 subject: origin.to_owned(),
-                domain: "*".to_owned(),
+                domain: origin.to_owned(),
                 resource: "federation:register".to_owned(),
                 operation: "check".to_owned(),
             })

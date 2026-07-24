@@ -110,6 +110,7 @@ pub async fn exchange_jwt_bearer(
             user_pub_key: verified_service_key.map(|key| URL_SAFE_NO_PAD.encode(key.to_bytes())),
             dpop_jkt: None,
             issuer: None,
+            tenant: claims.tenant.clone(),
         })
         .await;
 

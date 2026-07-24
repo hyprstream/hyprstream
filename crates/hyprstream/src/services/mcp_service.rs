@@ -1018,9 +1018,10 @@ impl ServerHandler for McpService {
 impl McpHandler for McpService {
     async fn authorize(&self, ctx: &crate::services::EnvelopeContext, resource: &str, operation: &str) -> anyhow::Result<()> {
         let subject = ctx.subject().to_string();
+        let domain = ctx.domain()?;
         let result = self.policy_client.check(&PolicyCheck {
             subject: subject.clone(),
-            domain: "*".to_owned(),
+            domain,
             resource: resource.to_owned(),
             operation: operation.to_owned(),
         }).await;

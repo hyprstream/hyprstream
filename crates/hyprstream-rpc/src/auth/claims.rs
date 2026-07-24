@@ -122,6 +122,12 @@ pub struct Claims {
     #[serde(default)]
     pub iss: String,
     pub sub: String,
+    /// Verified tenant/Casbin domain assigned by the token authority.
+    ///
+    /// This value is consumed only after JWT signature verification. Missing,
+    /// empty, or wildcard tenants cannot be used as authorization domains.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tenant: Option<String>,
     pub exp: i64,
     pub iat: i64,
     /// RFC 7519 JWT ID — unique token identifier for revocation.
@@ -207,6 +213,7 @@ impl std::fmt::Debug for Claims {
         f.debug_struct("Claims")
             .field("iss", &self.iss)
             .field("sub", &self.sub)
+            .field("tenant", &self.tenant)
             .field("exp", &self.exp)
             .field("iat", &self.iat)
             .field("jti", &self.jti)
@@ -300,6 +307,9 @@ impl FromCapnp for Claims {
         Ok(Self {
             iss,
             sub: reader.get_sub()?.to_str()?.to_owned(),
+            // Tenant authorization is JWT-only so the verifier can establish
+            // its authority; legacy envelope claims cannot assert it.
+            tenant: None,
             exp: reader.get_exp(),
             iat: reader.get_iat(),
             jti: None,
@@ -329,6 +339,7 @@ impl Claims {
         Self {
             iss: String::new(),
             sub,
+            tenant: None,
             exp,
             iat,
             jti: None,
@@ -356,6 +367,12 @@ impl Claims {
     /// Should be the OAuth issuer URL of the hyprstream node that issued this token.
     pub fn with_issuer(mut self, issuer: String) -> Self {
         self.iss = issuer;
+        self
+    }
+
+    /// Set the authority-asserted tenant used as the Casbin request domain.
+    pub fn with_tenant(mut self, tenant: String) -> Self {
+        self.tenant = Some(tenant);
         self
     }
 

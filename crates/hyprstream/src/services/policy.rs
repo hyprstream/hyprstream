@@ -42,12 +42,36 @@ use tracing::{debug, info, trace, warn};
 /// group keys or wrap keys. The publisher wraps directly against subscriber
 /// pubkeys via DH.
 struct EventPrefixState {
+    owner: String,
     publisher_pubkey: [u8; 32],
     schema: String,
     /// Subscriber ephemeral pubkeys, keyed by Blake3 hash of pubkey.
     subscriber_pubkeys: HashMap<[u8; 32], [u8; 32]>,
     /// Opaque wrapped key blobs deposited by the publisher, keyed by subscriber pubkey hash.
     wrapped_keys: HashMap<[u8; 32], Vec<u8>>,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct EventPrefixKey { tenant: String, prefix: String }
+impl EventPrefixKey {
+    fn new(tenant: String, prefix: &str) -> Self { Self { tenant, prefix: prefix.to_owned() } }
+}
+fn cross_tenant_prefix_shadow(a: &EventPrefixKey, b: &EventPrefixKey) -> bool {
+    a.tenant != b.tenant && a.prefix != b.prefix
+        && (a.prefix.starts_with(&b.prefix) || b.prefix.starts_with(&a.prefix))
+}
+#[derive(Debug, Eq, PartialEq)]
+enum EventPrefixRegistrationError { OwnedByAnotherSubject, CrossTenantShadow }
+fn validate_event_prefix_registration(
+    prefixes: &HashMap<EventPrefixKey, EventPrefixState>, key: &EventPrefixKey, owner: &str,
+) -> Result<(), EventPrefixRegistrationError> {
+    if prefixes.get(key).is_some_and(|state| state.owner != owner) {
+        return Err(EventPrefixRegistrationError::OwnedByAnotherSubject);
+    }
+    if prefixes.keys().any(|existing| cross_tenant_prefix_shadow(existing, key)) {
+        return Err(EventPrefixRegistrationError::CrossTenantShadow);
+    }
+    Ok(())
 }
 
 pub struct PolicyService {
@@ -72,7 +96,7 @@ pub struct PolicyService {
     transport: TransportConfig,
     /// Event prefix state for secure event transport (Phase 7).
     /// PolicyService is a blind relay — stores opaque wrapped blobs, never plaintext keys.
-    event_prefixes: RwLock<HashMap<String, EventPrefixState>>,
+    event_prefixes: RwLock<HashMap<EventPrefixKey, EventPrefixState>>,
     /// Shared JWT ID blocklist for access token revocation.
     jti_blocklist: Arc<hyprstream_rpc::auth::InMemoryJtiBlocklist>,
     /// ES256 (P-256) key rotation store for DPoP/atproto interop.
@@ -301,9 +325,10 @@ fn validate_service_key_registration(
 impl PolicyHandler for PolicyService {
     async fn authorize(&self, ctx: &EnvelopeContext, resource: &str, operation: &str) -> Result<()> {
         let subject = ctx.subject();
+        let domain = ctx.domain()?;
         let allowed = self.policy_manager.check_with_domain(
             &subject.to_string(),
-            "*",
+            &domain,
             resource,
             operation,
         ).await;
@@ -352,27 +377,48 @@ impl PolicyHandler for PolicyService {
         // JWT sub must contain a bare username (e.g. "randy", "birdetta") — the identity
         // system adds the namespace prefix ("token:randy") when the JWT is decoded.
         // For service tokens: sub = "service:{name}", e.g. "service:model".
-        let subject = if let Some(ref subj) = data.subject.as_ref().filter(|s| !s.is_empty()) {
-            // Explicit subject requires `manage` permission on `policy:IssueToken`
-            // (matches the capnp type name used by the transport-level Casbin check).
+        let caller_domain = ctx.domain()?;
+        let target_domain = data
+            .tenant
+            .as_ref()
+            .filter(|tenant| !tenant.is_empty())
+            .cloned()
+            .unwrap_or_else(|| caller_domain.clone());
+        if target_domain == "*" {
+            return Ok(PolicyResponseVariant::Error(ErrorInfo {
+                message: "Wildcard is not a valid token tenant".to_owned(),
+                code: "INVALID_TENANT".to_owned(),
+                details: String::new(),
+            }));
+        }
+
+        let requested_subject = data.subject.as_ref().filter(|subject| !subject.is_empty());
+        if requested_subject.is_some() || target_domain != caller_domain {
+            // Explicit-subject and cross-tenant issuance are authorized in the
+            // TARGET tenant. This permits deliberate delegation only when the
+            // caller has policy:IssueToken/manage there.
             let caller = ctx.subject().to_string();
             let allowed = self.policy_manager.check_with_domain(
                 &caller,
-                "*",
+                &target_domain,
                 "policy:IssueToken",
                 "manage",
             ).await;
             if !allowed {
+                let target_subject = requested_subject
+                    .map_or_else(|| ctx.user().to_owned(), Clone::clone);
                 return Ok(PolicyResponseVariant::Error(ErrorInfo {
                     message: format!(
-                        "Subject '{}' is not authorized to issue tokens on behalf of '{}'",
-                        caller, subj
+                        "Subject '{}' is not authorized to issue tokens on behalf of '{}' in tenant '{}'",
+                        caller, target_subject, target_domain
                     ),
                     code: "UNAUTHORIZED_SUBJECT".to_owned(),
-                    details: "Requires 'manage' permission on 'policy:IssueToken'".to_owned(),
+                    details: "Requires 'manage' permission on 'policy:IssueToken' in the target tenant".to_owned(),
                 }));
             }
-            (*subj).clone()
+        }
+        let subject = if let Some(subj) = requested_subject {
+            subj.clone()
         } else {
             // Use bare username from the envelope identity.
             ctx.user().to_owned()
@@ -509,6 +555,7 @@ impl PolicyHandler for PolicyService {
             now,
             now + requested_ttl as i64,
         ).with_issuer(issuer)
+         .with_tenant(target_domain)
          .with_audience(audience)
          .with_scope(granted_scope);
 
@@ -591,8 +638,9 @@ impl PolicyHandler for PolicyService {
         data: &ApplyTemplate,
     ) -> Result<PolicyResponseVariant> {
         let caller = ctx.subject().to_string();
+        let domain = ctx.domain()?;
         let allowed = self.policy_manager.check_with_domain(
-            &caller, "*", "policy:*", "ttt.writeback",
+            &caller, &domain, "policy:*", "ttt.writeback",
         ).await;
         if !allowed {
             return Ok(PolicyResponseVariant::Error(ErrorInfo {
@@ -660,8 +708,9 @@ impl PolicyHandler for PolicyService {
         data: &ApplyDraft,
     ) -> Result<PolicyResponseVariant> {
         let caller = ctx.subject().to_string();
+        let domain = ctx.domain()?;
         let allowed = self.policy_manager.check_with_domain(
-            &caller, "*", "policy:*", "ttt.writeback",
+            &caller, &domain, "policy:*", "ttt.writeback",
         ).await;
         if !allowed {
             return Ok(PolicyResponseVariant::Error(ErrorInfo {
@@ -711,8 +760,9 @@ impl PolicyHandler for PolicyService {
         data: &RollbackPolicy,
     ) -> Result<PolicyResponseVariant> {
         let caller = ctx.subject().to_string();
+        let domain = ctx.domain()?;
         let allowed = self.policy_manager.check_with_domain(
-            &caller, "*", "policy:*", "ttt.writeback",
+            &caller, &domain, "policy:*", "ttt.writeback",
         ).await;
         if !allowed {
             return Ok(PolicyResponseVariant::Error(ErrorInfo {
@@ -806,8 +856,9 @@ impl PolicyHandler for PolicyService {
         data: &GetHistory,
     ) -> Result<PolicyResponseVariant> {
         let caller = ctx.subject().to_string();
+        let domain = ctx.domain()?;
         let allowed = self.policy_manager.check_with_domain(
-            &caller, "*", "policy:*", "ttt.writeback",
+            &caller, &domain, "policy:*", "ttt.writeback",
         ).await;
         if !allowed {
             return Ok(PolicyResponseVariant::Error(ErrorInfo {
@@ -893,8 +944,9 @@ impl PolicyHandler for PolicyService {
         data: &GetDiff,
     ) -> Result<PolicyResponseVariant> {
         let caller = ctx.subject().to_string();
+        let domain = ctx.domain()?;
         let allowed = self.policy_manager.check_with_domain(
-            &caller, "*", "policy:*", "ttt.writeback",
+            &caller, &domain, "policy:*", "ttt.writeback",
         ).await;
         if !allowed {
             return Ok(PolicyResponseVariant::Error(ErrorInfo {
@@ -950,8 +1002,9 @@ impl PolicyHandler for PolicyService {
         _request_id: u64,
     ) -> Result<PolicyResponseVariant> {
         let caller = ctx.subject().to_string();
+        let domain = ctx.domain()?;
         let allowed = self.policy_manager.check_with_domain(
-            &caller, "*", "policy:*", "ttt.writeback",
+            &caller, &domain, "policy:*", "ttt.writeback",
         ).await;
         if !allowed {
             return Ok(PolicyResponseVariant::Error(ErrorInfo {
@@ -998,11 +1051,12 @@ impl PolicyHandler for PolicyService {
         data: &AddGrouping,
     ) -> Result<PolicyResponseVariant> {
         let caller = ctx.subject().to_string();
+        let domain = ctx.domain()?;
 
         // Fine-grained permission check: caller must have ttt.writeback on policy:roles
         let allowed = self.policy_manager.check_with_domain(
             &caller,
-            "*",
+            &domain,
             "policy:roles",
             "ttt.writeback",
         ).await;
@@ -1052,7 +1106,9 @@ impl PolicyHandler for PolicyService {
         }
 
         // Apply the role assignment
-        self.policy_manager.add_role_for_user(&data.user, &data.role).await
+        self.policy_manager
+            .add_role_for_user_in_domain(&data.user, &data.role, &domain)
+            .await
             .map_err(|e| anyhow!("Failed to add role: {}", e))?;
 
         // Persist in-memory Casbin state to disk before staging
@@ -1061,8 +1117,8 @@ impl PolicyHandler for PolicyService {
 
         // Commit to git
         let commit_msg = format!(
-            "policy: grant role {} to {} [by {}]",
-            data.role, data.user, caller
+            "policy: grant role {} to {} in {} [by {}]",
+            data.role, data.user, domain, caller
         );
         let sha = match self.stage_and_commit_policies(&commit_msg).await {
             Ok(sha) => sha,
@@ -1072,7 +1128,10 @@ impl PolicyHandler for PolicyService {
             }
         };
 
-        info!("Granted role '{}' to '{}' (caller={})", data.role, data.user, caller);
+        info!(
+            "Granted role '{}' to '{}' in domain '{}' (caller={})",
+            data.role, data.user, domain, caller
+        );
         Ok(PolicyResponseVariant::AddGroupingResult(sha))
     }
 
@@ -1083,11 +1142,12 @@ impl PolicyHandler for PolicyService {
         data: &RemoveGrouping,
     ) -> Result<PolicyResponseVariant> {
         let caller = ctx.subject().to_string();
+        let domain = ctx.domain()?;
 
         // Fine-grained permission check: caller must have ttt.writeback on policy:roles
         let allowed = self.policy_manager.check_with_domain(
             &caller,
-            "*",
+            &domain,
             "policy:roles",
             "ttt.writeback",
         ).await;
@@ -1112,7 +1172,9 @@ impl PolicyHandler for PolicyService {
         }
 
         // Remove the role assignment
-        self.policy_manager.remove_role_for_user(&data.user, &data.role).await
+        self.policy_manager
+            .remove_role_for_user_in_domain(&data.user, &data.role, &domain)
+            .await
             .map_err(|e| anyhow!("Failed to remove role: {}", e))?;
 
         // Persist in-memory Casbin state to disk before staging
@@ -1121,8 +1183,8 @@ impl PolicyHandler for PolicyService {
 
         // Commit to git
         let commit_msg = format!(
-            "policy: revoke role {} from {} [by {}]",
-            data.role, data.user, caller
+            "policy: revoke role {} from {} in {} [by {}]",
+            data.role, data.user, domain, caller
         );
         let sha = match self.stage_and_commit_policies(&commit_msg).await {
             Ok(sha) => sha,
@@ -1132,7 +1194,10 @@ impl PolicyHandler for PolicyService {
             }
         };
 
-        info!("Revoked role '{}' from '{}' (caller={})", data.role, data.user, caller);
+        info!(
+            "Revoked role '{}' from '{}' in domain '{}' (caller={})",
+            data.role, data.user, domain, caller
+        );
         Ok(PolicyResponseVariant::RemoveGroupingResult(sha))
     }
 
@@ -1143,12 +1208,13 @@ impl PolicyHandler for PolicyService {
         data: &SetBranchVisibility,
     ) -> Result<PolicyResponseVariant> {
         let caller = ctx.subject().to_string();
+        let domain = ctx.domain()?;
         let resource = format!("model:{}:{}", data.model_name, data.branch_name);
 
         // Require manage (ttt.writeback) on the model resource
         let allowed = self.policy_manager.check_with_domain(
             &caller,
-            "*",
+            &domain,
             &resource,
             "ttt.writeback",
         ).await;
@@ -1217,6 +1283,8 @@ impl PolicyHandler for PolicyService {
         // Authorization: publish:events:{prefix}.*
         let scope = format!("publish:events:{}.*", data.prefix);
         self.authorize(ctx, &scope, "register").await?;
+        let key = EventPrefixKey::new(ctx.domain()?, &data.prefix);
+        let owner = ctx.subject().to_string();
 
         let mut pubkey = [0u8; 32];
         if data.publisher_ephemeral_pubkey.len() != 32 {
@@ -1229,7 +1297,13 @@ impl PolicyHandler for PolicyService {
         pubkey.copy_from_slice(&data.publisher_ephemeral_pubkey);
 
         let mut prefixes = self.event_prefixes.write().await;
-        prefixes.insert(data.prefix.clone(), EventPrefixState {
+        match validate_event_prefix_registration(&prefixes, &key, &owner) {
+            Ok(()) => {}
+            Err(EventPrefixRegistrationError::OwnedByAnotherSubject) => return Ok(PolicyResponseVariant::Error(ErrorInfo { message: format!("prefix '{}' is already registered by another subject in this tenant", data.prefix), code: "ALREADY_EXISTS".to_owned(), details: String::new() })),
+            Err(EventPrefixRegistrationError::CrossTenantShadow) => return Ok(PolicyResponseVariant::Error(ErrorInfo { message: format!("prefix '{}' conflicts with a cross-tenant prefix", data.prefix), code: "CONFLICT".to_owned(), details: String::new() })),
+        }
+        prefixes.insert(key, EventPrefixState {
+            owner,
             publisher_pubkey: pubkey,
             schema: data.schema.clone(),
             subscriber_pubkeys: HashMap::new(),
@@ -1260,6 +1334,7 @@ impl PolicyHandler for PolicyService {
         // Authorization: subscribe:events:{prefix}.*
         let scope = format!("subscribe:events:{}.*", data.prefix);
         self.authorize(ctx, &scope, "subscribe").await?;
+        let key = EventPrefixKey::new(ctx.domain()?, &data.prefix);
 
         let mut sub_pubkey = [0u8; 32];
         if data.subscriber_ephemeral_pubkey.len() != 32 {
@@ -1276,7 +1351,7 @@ impl PolicyHandler for PolicyService {
         hash_bytes.copy_from_slice(sub_hash.as_bytes());
 
         let mut prefixes = self.event_prefixes.write().await;
-        let state = match prefixes.get_mut(&data.prefix) {
+        let state = match prefixes.get_mut(&key) {
             Some(s) => s,
             None => return Ok(PolicyResponseVariant::Error(ErrorInfo {
                 message: format!("prefix '{}' not registered", data.prefix),
@@ -1316,9 +1391,10 @@ impl PolicyHandler for PolicyService {
         // Authorization: publish:events:{prefix}.*
         let scope = format!("publish:events:{}.*", data.prefix);
         self.authorize(ctx, &scope, "get_subscribers").await?;
+        let key = EventPrefixKey::new(ctx.domain()?, &data.prefix);
 
         let prefixes = self.event_prefixes.read().await;
-        let state = match prefixes.get(&data.prefix) {
+        let state = match prefixes.get(&key) {
             Some(s) => s,
             None => return Ok(PolicyResponseVariant::Error(ErrorInfo {
                 message: format!("prefix '{}' not registered", data.prefix),
@@ -1357,9 +1433,10 @@ impl PolicyHandler for PolicyService {
         // Authorization: publish:events:{prefix}.*
         let scope = format!("publish:events:{}.*", data.prefix);
         self.authorize(ctx, &scope, "deposit_keys").await?;
+        let key = EventPrefixKey::new(ctx.domain()?, &data.prefix);
 
         let mut prefixes = self.event_prefixes.write().await;
-        let state = match prefixes.get_mut(&data.prefix) {
+        let state = match prefixes.get_mut(&key) {
             Some(s) => s,
             None => return Ok(PolicyResponseVariant::Error(ErrorInfo {
                 message: format!("prefix '{}' not registered", data.prefix),
@@ -1498,8 +1575,10 @@ impl PolicyHandler for PolicyService {
         }
 
         let issuer = self.default_audience.clone().unwrap_or_default();
+        let tenant = ctx.domain()?;
         let claims = hyprstream_rpc::auth::Claims::new(subject.clone(), now, expires_at)
             .with_issuer(issuer)
+            .with_tenant(tenant)
             .with_cnf_jwk(vk.as_bytes());
 
         let token = match self.sign_token(&claims, true).await {
@@ -1542,6 +1621,7 @@ impl PolicyHandler for PolicyService {
                 }));
             }
         };
+        let domain = ctx.domain()?;
 
         // ExchangeWit signs directly rather than through `handle_issue_token`.
         // Keep its authenticated-envelope subject under the same account-DID
@@ -1567,7 +1647,7 @@ impl PolicyHandler for PolicyService {
         // Casbin: caller must have 'exchange' on 'policy:exchange-wit'.
         let allowed = self.policy_manager.check_with_domain(
             &sub,
-            "*",
+            &domain,
             "policy:exchange-wit",
             "exchange",
         ).await;
@@ -1591,6 +1671,7 @@ impl PolicyHandler for PolicyService {
         let issuer = self.default_audience.clone().unwrap_or_default();
         let mut claims = hyprstream_rpc::auth::Claims::new(sub.clone(), now, expires_at)
             .with_issuer(issuer)
+            .with_tenant(domain)
             .with_audience(audience);
 
         // Key binding: carry cnf.jwk from WIT into the at+jwt.
@@ -1682,7 +1763,6 @@ impl RequestService for PolicyService {
     }
 }
 
-
 // ============================================================================
 // Policy file watcher (hot-reload)
 // ============================================================================
@@ -1760,9 +1840,10 @@ mod tests {
     use super::*;
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 
-    async fn test_service() -> (PolicyService, tempfile::TempDir) {
+    async fn test_service_with_manager(
+        manager: Arc<PolicyManager>,
+    ) -> (PolicyService, tempfile::TempDir) {
         let root = tempfile::tempdir().expect("test: create policy git directory");
-        let manager = Arc::new(PolicyManager::permissive().await.expect("test: policy manager"));
         let git2db = Arc::new(RwLock::new(
             Git2DB::open(root.path()).await.expect("test: open policy git database"),
         ));
@@ -1776,6 +1857,11 @@ mod tests {
         (service, root)
     }
 
+    async fn test_service() -> (PolicyService, tempfile::TempDir) {
+        let manager = Arc::new(PolicyManager::permissive().await.expect("test: policy manager"));
+        test_service_with_manager(manager).await
+    }
+
     fn issue(subject: &str) -> IssueToken {
         IssueToken {
             requested_scopes: Some(vec!["read".to_owned()]),
@@ -1785,6 +1871,48 @@ mod tests {
             user_pub_key: None,
             dpop_jkt: None,
             issuer: None,
+            tenant: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn cross_domain_token_mint_is_denied_without_target_tenant_grant() {
+        let manager = Arc::new(
+            PolicyManager::new_in_memory()
+                .await
+                .expect("test: policy manager"),
+        );
+        manager
+            .add_policy_with_domain(
+                "service:test-caller",
+                "tenant-a",
+                "policy:IssueToken",
+                "manage",
+                "allow",
+            )
+            .await
+            .expect("test: caller-domain mint grant");
+        let (service, _root) = test_service_with_manager(manager).await;
+        let signer = SigningKey::from_bytes(&[0x52; 32]).verifying_key();
+        let ctx = EnvelopeContext::for_test_authenticated_subject_in_tenant(
+            Subject::new("service:test-caller"),
+            "tenant-a",
+            signer,
+        );
+        let mut request = issue("victim");
+        request.tenant = Some("tenant-b".to_owned());
+
+        let response = service
+            .handle_issue_token(&ctx, 1, &request)
+            .await
+            .expect("cross-domain denial is a policy response");
+
+        match response {
+            PolicyResponseVariant::Error(error) => {
+                assert_eq!(error.code, "UNAUTHORIZED_SUBJECT");
+                assert!(error.message.contains("tenant-b"));
+            }
+            other => panic!("cross-domain token mint unexpectedly proceeded: {other:?}"),
         }
     }
 
@@ -1955,5 +2083,31 @@ mod tests {
                 if code == "SIGNING_NOT_CONFIGURED" => {}
             other => panic!("registered sibling was rejected before signing: {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod event_prefix_registry_tests {
+    #![allow(clippy::unwrap_used)]
+    use super::*;
+
+    fn state(owner: &str, key: u8) -> EventPrefixState {
+        EventPrefixState { owner: owner.to_owned(), publisher_pubkey: [key; 32], schema: String::new(), subscriber_pubkeys: HashMap::new(), wrapped_keys: HashMap::new() }
+    }
+
+    #[test]
+    fn tenant_scoping_refuses_shadowing_and_takeover() {
+        let a = EventPrefixKey::new("tenant-a".to_owned(), "orders");
+        let b = EventPrefixKey::new("tenant-b".to_owned(), "orders");
+        let shadow = EventPrefixKey::new("tenant-b".to_owned(), "orders.created");
+        let mut prefixes = HashMap::new();
+        validate_event_prefix_registration(&prefixes, &a, "subject-a").unwrap();
+        prefixes.insert(a.clone(), state("subject-a", 0x0A));
+        validate_event_prefix_registration(&prefixes, &b, "subject-b").unwrap();
+        prefixes.insert(b.clone(), state("subject-b", 0x0B));
+        assert_eq!(prefixes[&a].publisher_pubkey, [0x0A; 32]);
+        assert_eq!(prefixes[&b].publisher_pubkey, [0x0B; 32]);
+        assert_eq!(validate_event_prefix_registration(&prefixes, &shadow, "subject-b"), Err(EventPrefixRegistrationError::CrossTenantShadow));
+        assert_eq!(validate_event_prefix_registration(&prefixes, &a, "subject-b"), Err(EventPrefixRegistrationError::OwnedByAnotherSubject));
     }
 }

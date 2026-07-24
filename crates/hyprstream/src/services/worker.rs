@@ -47,10 +47,10 @@ use crate::services::PolicyClient;
 /// The returned closure is async-compatible (returns a boxed future) so it
 /// works on single-threaded runtimes used by RequestService.
 pub fn build_authorize_fn(policy_client: PolicyClient) -> AuthorizeFn {
-    Arc::new(move |subject: String, resource: String, operation: String| {
+    Arc::new(move |subject: String, domain: String, resource: String, operation: String| {
         let client = policy_client.clone();
         Box::pin(async move {
-            client.check(&PolicyCheck { subject: subject.clone(), domain: "*".to_owned(), resource: resource.clone(), operation: operation.clone() }).await
+            client.check(&PolicyCheck { subject, domain, resource, operation }).await
         })
     })
 }

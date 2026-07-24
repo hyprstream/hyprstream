@@ -140,6 +140,11 @@ struct IssueToken {
   # Optional issuer override for profile-specific OAuth tokens.
   # Empty uses PolicyService's configured default issuer.
   issuer @6 :Text $optional;
+
+  # Target tenant/Casbin domain for the issued token.
+  # Empty inherits the caller's verified tenant. Cross-tenant issuance requires
+  # policy:IssueToken/manage in this target tenant.
+  tenant @7 :Text $optional;
 }
 
 # Apply a built-in policy template
