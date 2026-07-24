@@ -39,13 +39,11 @@
 //! - **trust_boundary** — node-local content is never deduplicated against
 //!   shared-remote content (an existence/content oracle across the boundary, U5).
 //!
-//! ## MAC boundary (deliberate)
+//! ## MAC boundary
 //!
-//! [`BlobManifest`] carries a `security_label` **carrier field** (unblocks #699
-//! carrier-(b)). This is *plumb-through only*: the substrate never populates it
-//! with real policy, never derives clearance, and never enforces access. Object
-//! labeling and enforcement are #699/#767's job. A `None` label is an *unlabeled
-//! carrier*, NOT "public".
+//! A [`BlobManifest`] is a sealed, labeled object: its required
+//! `security_label` is part of the bytes hashed into its CID. Staging may be
+//! unlabeled, but it cannot seal until a label has been supplied.
 
 mod domain;
 mod manifest;
@@ -53,11 +51,11 @@ mod mount;
 mod substrate;
 
 pub use domain::{DedupDomain, InvalidDedupDomain, TrustBoundary};
-pub use manifest::{cid_from_merkle, merkle_from_address, BlobManifest, FILE_RECONSTRUCTION_CODEC};
+pub use manifest::{BlobManifest, FILE_RECONSTRUCTION_CODEC, cid_from_merkle, merkle_from_address};
 pub use mount::{
-    AllowAllCasAuthorizer, BootstrapCasAuthorizer, CasGrantSubject, CasMount, CasMountAuthorizer,
-    CasMountAuthzRequest, CasMountGrant, CasMountObjectKind, DenyAllCasAuthorizer, StagingConfig,
-    AUTHENTICATED_XORB_READ, DEFAULT_STAGING_SLOT_QUOTA, DEFAULT_STAGING_SUBJECT_QUOTA,
+    AUTHENTICATED_XORB_READ, AllowAllCasAuthorizer, BootstrapCasAuthorizer, CasGrantSubject,
+    CasMount, CasMountAuthorizer, CasMountAuthzRequest, CasMountGrant, CasMountObjectKind,
+    DEFAULT_STAGING_SLOT_QUOTA, DEFAULT_STAGING_SUBJECT_QUOTA, DenyAllCasAuthorizer, StagingConfig,
 };
 pub use substrate::CasSubstrate;
 
@@ -75,6 +73,10 @@ pub enum CasError {
     /// A hex digest was malformed.
     #[error("invalid hex digest: {0}")]
     Hex(String),
+
+    /// A persisted sealed manifest could not be read, decoded, or verified.
+    #[error("CAS manifest: {0}")]
+    Manifest(String),
 
     /// Ingest was requested for an algorithm the substrate cannot currently
     /// *produce*. The domain vocabulary supports every algorithm for keying, but

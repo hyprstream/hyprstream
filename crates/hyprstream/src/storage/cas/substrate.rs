@@ -6,15 +6,16 @@
 //! trust_boundary)` domain. Addressing is multihash: ingest returns a canonical
 //! CID, and reads accept either a CID or a legacy hex merkle.
 
+use std::fs;
 use std::path::{Path, PathBuf};
 
 use cas_serve::CasStore;
 use hyprstream_rpc::auth::mac::SecurityLabel;
-use hyprstream_rpc::cid::HashAlgo;
+use hyprstream_rpc::cid::{Codec, HashAlgo, decode_cid, encode_cid};
 
-use super::domain::DedupDomain;
-use super::manifest::{cid_from_merkle, merkle_from_address, BlobManifest};
 use super::CasError;
+use super::domain::DedupDomain;
+use super::manifest::{BlobManifest, looks_like_legacy_hex, merkle_from_address};
 
 /// Hex-character length of a `digest_length`-byte digest (2 hex chars per byte).
 const fn hex_digest_len(digest_length: u16) -> usize {
@@ -50,12 +51,68 @@ impl CasSubstrate {
         CasStore::new(self.root.join(domain.relative_path()))
     }
 
+    fn manifest_dir(&self, domain: &DedupDomain) -> PathBuf {
+        self.root.join(domain.relative_path()).join("manifests")
+    }
+
+    fn manifest_path(&self, domain: &DedupDomain, cid: &str) -> PathBuf {
+        self.manifest_dir(domain).join(format!("{cid}.json"))
+    }
+
+    fn canonical_cid(address: &str) -> Result<String, CasError> {
+        let decoded = decode_cid(address).map_err(|e| CasError::Cid(e.to_string()))?;
+        encode_cid(
+            decoded.codec,
+            decoded.multihash.algo,
+            &decoded.multihash.digest,
+        )
+        .map_err(|e| CasError::Cid(e.to_string()))
+    }
+
+    fn persist_manifest(
+        &self,
+        domain: &DedupDomain,
+        manifest: &BlobManifest,
+    ) -> Result<(), CasError> {
+        let dir = self.manifest_dir(domain);
+        fs::create_dir_all(&dir)
+            .map_err(|e| CasError::Manifest(format!("create {}: {e}", dir.display())))?;
+        let bytes = serde_json::to_vec(manifest)
+            .map_err(|e| CasError::Manifest(format!("serialize manifest: {e}")))?;
+        let path = self.manifest_path(domain, &manifest.cid);
+        fs::write(&path, bytes)
+            .map_err(|e| CasError::Manifest(format!("write {}: {e}", path.display())))
+    }
+
+    fn load_manifest(&self, domain: &DedupDomain, address: &str) -> Result<BlobManifest, CasError> {
+        let cid = Self::canonical_cid(address)?;
+        let decoded = decode_cid(&cid).map_err(|e| CasError::Cid(e.to_string()))?;
+        if decoded.codec != Codec::XetManifest {
+            return Err(CasError::Cid(
+                "CID does not address a labeled CAS manifest".into(),
+            ));
+        }
+        let path = self.manifest_path(domain, &cid);
+        let bytes = fs::read(&path)
+            .map_err(|e| CasError::Manifest(format!("read {}: {e}", path.display())))?;
+        let manifest: BlobManifest = serde_json::from_slice(&bytes)
+            .map_err(|e| CasError::Manifest(format!("decode {}: {e}", path.display())))?;
+        if manifest.cid != cid
+            || !hyprstream_rpc::auth::mac::ContentBoundLabel::verify_binding(&manifest)
+        {
+            return Err(CasError::Manifest(format!(
+                "CID binding verification failed for {cid}"
+            )));
+        }
+        Ok(manifest)
+    }
+
     /// Ingest bytes into a dedup domain.
     ///
     /// Chunking (gearhash CDC), xorb aggregation, content-addressed dedup, and the
     /// server-computed merkle all happen inside the underlying `CasStore` — byte
     /// boundaries stay identical to xet-core. The substrate adds the canonical
-    /// multihash CID and attaches the `security_label` carrier (plumb-through only).
+    /// manifest CID with a required, content-bound `security_label`.
     ///
     /// Only **BLAKE3-256** ingest is implemented today: the merkle the store
     /// computes is the 32-byte BLAKE3 reconstruction hash, so the domain must
@@ -69,7 +126,7 @@ impl CasSubstrate {
         &self,
         domain: &DedupDomain,
         data: &[u8],
-        security_label: Option<SecurityLabel>,
+        security_label: SecurityLabel,
     ) -> Result<BlobManifest, CasError> {
         if domain.algorithm != HashAlgo::Blake3 || domain.digest_length != 32 {
             return Err(CasError::UnsupportedIngestAlgorithm(domain.algorithm));
@@ -84,15 +141,15 @@ impl CasSubstrate {
             "store merkle must be the declared {}-byte digest",
             domain.digest_length
         );
-        let cid = cid_from_merkle(domain.algorithm, &put.merkle)?;
-        Ok(BlobManifest {
-            cid,
-            merkle: put.merkle,
-            xorb_hashes: put.xorb_hashes,
-            bytes_stored: put.bytes_stored,
-            byte_len: data.len() as u64,
+        let manifest = BlobManifest::new(
+            put.merkle,
+            put.xorb_hashes,
+            put.bytes_stored,
+            data.len() as u64,
             security_label,
-        })
+        )?;
+        self.persist_manifest(domain, &manifest)?;
+        Ok(manifest)
     }
 
     /// Reconstruct a blob's bytes by content address within a domain.
@@ -100,9 +157,18 @@ impl CasSubstrate {
     /// `address` may be a canonical CID or a legacy hex merkle (see
     /// [`merkle_from_address`]).
     pub async fn get(&self, domain: &DedupDomain, address: &str) -> Result<Vec<u8>, CasError> {
-        let merkle = merkle_from_address(address)?;
+        let merkle = if looks_like_legacy_hex(address) {
+            merkle_from_address(address)?
+        } else {
+            self.load_manifest(domain, address)?.merkle
+        };
         let store = self.store_for(domain);
         Ok(store.get_file_bytes(&merkle).await?)
+    }
+
+    /// Load and verify the sealed manifest named by a manifest CID.
+    pub fn manifest(&self, domain: &DedupDomain, cid: &str) -> Result<BlobManifest, CasError> {
+        self.load_manifest(domain, cid)
     }
 
     /// Read the raw bytes of a single stored xorb, keyed by its hex xorb hash,
@@ -118,10 +184,13 @@ impl CasSubstrate {
 
     /// True if the substrate can serve this content address within the domain.
     pub fn exists(&self, domain: &DedupDomain, address: &str) -> bool {
-        match merkle_from_address(address) {
-            Ok(merkle) => self.store_for(domain).exists(&merkle),
-            Err(_) => false,
-        }
+        let merkle = if looks_like_legacy_hex(address) {
+            merkle_from_address(address)
+        } else {
+            self.load_manifest(domain, address)
+                .map(|manifest| manifest.merkle)
+        };
+        merkle.is_ok_and(|merkle| self.store_for(domain).exists(&merkle))
     }
 }
 
@@ -129,7 +198,11 @@ impl CasSubstrate {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-    use hyprstream_rpc::auth::mac::Compartment;
+    use hyprstream_rpc::auth::mac::{Assurance, Compartment, CompartmentSet, Level};
+
+    fn label() -> SecurityLabel {
+        SecurityLabel::new(Level::Internal, Assurance::Classical, CompartmentSet::EMPTY)
+    }
 
     fn payload(seed: u8, len: usize) -> Vec<u8> {
         (0..len)
@@ -144,7 +217,7 @@ mod tests {
         let domain = DedupDomain::local_default();
         let original = payload(7, 256 * 1024);
 
-        let m = sub.put(&domain, &original, None).await.unwrap();
+        let m = sub.put(&domain, &original, label()).await.unwrap();
         assert!(m.cid.starts_with('b'));
         assert_eq!(m.byte_len, original.len() as u64);
         assert!(m.bytes_stored > 0);
@@ -165,7 +238,7 @@ mod tests {
         let original = payload(3, 200 * 1024);
 
         let m = sub
-            .put(&DedupDomain::local_default(), &original, None)
+            .put(&DedupDomain::local_default(), &original, label())
             .await
             .unwrap();
 
@@ -184,8 +257,8 @@ mod tests {
         let default_domain = DedupDomain::local_default();
         let tenant_domain = DedupDomain::local_tenant(Compartment::new("tenant:acme"));
 
-        let a = sub.put(&default_domain, &original, None).await.unwrap();
-        let b = sub.put(&tenant_domain, &original, None).await.unwrap();
+        let a = sub.put(&default_domain, &original, label()).await.unwrap();
+        let b = sub.put(&tenant_domain, &original, label()).await.unwrap();
 
         // Content-addressed ⇒ identical merkle regardless of domain.
         assert_eq!(a.merkle, b.merkle);
@@ -207,8 +280,8 @@ mod tests {
         let domain = DedupDomain::local_default();
         let original = payload(11, 200 * 1024);
 
-        let first = sub.put(&domain, &original, None).await.unwrap();
-        let second = sub.put(&domain, &original, None).await.unwrap();
+        let first = sub.put(&domain, &original, label()).await.unwrap();
+        let second = sub.put(&domain, &original, label()).await.unwrap();
         assert_eq!(first.merkle, second.merkle);
         assert_eq!(second.bytes_stored, 0, "same-domain re-upload fully dedups");
     }
@@ -222,7 +295,7 @@ mod tests {
             digest_length: 32,
             ..DedupDomain::local_default()
         };
-        let err = sub.put(&domain, b"hello", None).await.unwrap_err();
+        let err = sub.put(&domain, b"hello", label()).await.unwrap_err();
         assert!(matches!(err, CasError::UnsupportedIngestAlgorithm(_)));
     }
 
@@ -238,7 +311,7 @@ mod tests {
             digest_length: 64,
             ..DedupDomain::local_default()
         };
-        let err = sub.put(&domain, b"hello", None).await.unwrap_err();
+        let err = sub.put(&domain, b"hello", label()).await.unwrap_err();
         assert!(
             matches!(err, CasError::UnsupportedIngestAlgorithm(_)),
             "BLAKE3-512 ingest must be rejected until #881 lands"
@@ -250,11 +323,30 @@ mod tests {
         use hyprstream_rpc::auth::mac::{Assurance, CompartmentSet, Level};
         let dir = tempfile::tempdir().unwrap();
         let sub = CasSubstrate::new(dir.path());
-        let label = SecurityLabel::new(Level::Internal, Assurance::Classical, CompartmentSet::EMPTY);
+        let label =
+            SecurityLabel::new(Level::Internal, Assurance::Classical, CompartmentSet::EMPTY);
         let m = sub
-            .put(&DedupDomain::local_default(), b"payload-bytes", Some(label))
+            .put(&DedupDomain::local_default(), b"payload-bytes", label)
             .await
             .unwrap();
-        assert_eq!(m.security_label, Some(label), "carrier field plumbs through unchanged");
+        assert_eq!(
+            m.security_label, label,
+            "required label plumbs through unchanged"
+        );
+    }
+
+    #[tokio::test]
+    async fn manifest_cid_remains_resolvable_after_reopening_the_substrate() {
+        let dir = tempfile::tempdir().unwrap();
+        let domain = DedupDomain::local_default();
+        let manifest = CasSubstrate::new(dir.path())
+            .put(&domain, b"durable-manifest", label())
+            .await
+            .unwrap();
+        let reopened = CasSubstrate::new(dir.path());
+        assert_eq!(
+            reopened.get(&domain, &manifest.cid).await.unwrap(),
+            b"durable-manifest"
+        );
     }
 }

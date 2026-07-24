@@ -55,7 +55,7 @@
 //! yields the same CID string (no randomness, no timestamps, no canonicalization
 //! ambiguity). Round-tripping `decode(encode(x)) == x` holds for all valid CIDs.
 
-use anyhow::{bail, ensure, Context, Result};
+use anyhow::{Context, Result, bail, ensure};
 use data_encoding::BASE32_NOPAD;
 
 // ---------------------------------------------------------------------------
@@ -140,6 +140,8 @@ pub enum Codec {
     XetShard = 0x72,
     /// at9p-capsule (LOCAL_CONVENTION, 0x73): an at9p capsule commitment.
     At9pCapsule = 0x73,
+    /// xet-manifest (LOCAL_CONVENTION, 0x74): a labeled CAS blob manifest.
+    XetManifest = 0x74,
 }
 
 impl Codec {
@@ -150,6 +152,7 @@ impl Codec {
             0x71 => Ok(Codec::XetXorb),
             0x72 => Ok(Codec::XetShard),
             0x73 => Ok(Codec::At9pCapsule),
+            0x74 => Ok(Codec::XetManifest),
             other => bail!("unsupported CID multicodec: 0x{other:x}"),
         }
     }
