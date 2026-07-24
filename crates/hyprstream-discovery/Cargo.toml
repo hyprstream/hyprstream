@@ -46,6 +46,7 @@ parking_lot = { workspace = true }
 # Logging
 tracing = { workspace = true }
 chrono = { workspace = true }
+reqwest = { workspace = true }
 
 # Crypto (for signing keys)
 ed25519-dalek = { workspace = true }

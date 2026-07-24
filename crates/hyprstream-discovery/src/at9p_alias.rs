@@ -28,7 +28,7 @@ use std::sync::Arc;
 use anyhow::Result;
 
 use hyprstream_pds::at9p_alias::{resolve_authoritative_alias, AuthoritativeIdentity};
-use hyprstream_pds::at9p_gate::verify_did_at9p;
+use hyprstream_pds::at9p_gate::{verify_did_at9p, VerifiedCapsule};
 use hyprstream_rpc::identity::Did;
 
 use crate::at9p_resolver::CapsuleSource;
@@ -64,6 +64,22 @@ impl At9pAliasResolver {
         classical_did: &Did,
         classical_aka_at9p: &Did,
     ) -> Result<AuthoritativeIdentity> {
+        Ok(self
+            .resolve_authoritative_with_capsule(classical_did, classical_aka_at9p)
+            .await?
+            .0)
+    }
+
+    /// Resolve a mutually-attested identity and retain the exact GATE witness.
+    ///
+    /// Consumers that install trust material must source it from this verified
+    /// capsule, not from the classical DID document that only supplies the
+    /// reciprocal identifier vouch.
+    pub async fn resolve_authoritative_with_capsule(
+        &self,
+        classical_did: &Did,
+        classical_aka_at9p: &Did,
+    ) -> Result<(AuthoritativeIdentity, VerifiedCapsule)> {
         let did_str = classical_aka_at9p.as_str();
         // The locator derives zero authority — GATE is what makes the bytes
         // trustworthy, not the source.
@@ -71,7 +87,8 @@ impl At9pAliasResolver {
         // GATE — canon → hash → sig. The only place capsule authority is granted.
         let verified = verify_did_at9p(did_str, &bytes)?;
         // Authoritative-direction rule — mutual attestation or fail closed.
-        resolve_authoritative_alias(classical_did, classical_aka_at9p, &verified)
+        let identity = resolve_authoritative_alias(classical_did, classical_aka_at9p, &verified)?;
+        Ok((identity, verified))
     }
 }
 

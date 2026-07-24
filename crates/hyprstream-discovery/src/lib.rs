@@ -67,6 +67,11 @@ pub mod at9p_resolver;
 /// `alsoKnownAs` attestation + the GATE pipeline. Sibling to `at9p_resolver`.
 pub mod at9p_alias;
 
+/// #1136 — explicit DID-anchored deployment trust source. Resolves the public
+/// `(did:at9p, did:web)` pin pair without weakening the OS-owned-file source.
+#[cfg(not(target_arch = "wasm32"))]
+pub mod did_anchored;
+
 /// #524 P1 — placement directory record ingestion + in-process index.
 ///
 /// Polls `RecordResolver::resolve_repo` for a bootstrap set of node DIDs,
@@ -101,6 +106,8 @@ pub mod podspec;
 // Re-export key types
 pub use hyprstream_rpc::registry::SocketKind;
 pub use hyprstream_rpc::resolver::Resolver;
+#[cfg(not(target_arch = "wasm32"))]
+pub use did_anchored::{DeploymentTrustSource, DidAnchors};
 pub use service::{
     bootstrap_deployment_process, deployment_registry_verifier, AuthorizationProvider,
     DiscoveryService, RecordCarData, RecordResolver, RegistryDeploymentVerifier,

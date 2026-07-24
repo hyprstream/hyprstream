@@ -1903,6 +1903,14 @@ fn read_os_owned_file(_path: &std::path::Path, description: &str) -> Result<Vec<
     anyhow::bail!("{description} requires the OS-owned Unix deployment seam")
 }
 
+fn load_registry_deployment_credential() -> Result<String> {
+    String::from_utf8(read_os_owned_file(
+        std::path::Path::new(REGISTRY_DEPLOYMENT_CREDENTIAL_PATH),
+        "registry deployment credential",
+    )?)
+    .map_err(|error| anyhow::anyhow!("registry deployment credential is not UTF-8: {error}"))
+}
+
 fn load_trusted_registry_deployment_credentials() -> Result<TrustedRegistryDeploymentCredentials> {
     let ca_bytes = read_os_owned_file(
         std::path::Path::new(DEPLOYMENT_CA_ROOT_PATH),
@@ -1914,11 +1922,7 @@ fn load_trusted_registry_deployment_credentials() -> Result<TrustedRegistryDeplo
         .map_err(|_| anyhow::anyhow!("deployment CA root must be 32 bytes"))?;
     let ca_verifying_key = VerifyingKey::from_bytes(&ca_bytes)
         .map_err(|error| anyhow::anyhow!("deployment CA root is malformed: {error}"))?;
-    let registry_credential = String::from_utf8(read_os_owned_file(
-        std::path::Path::new(REGISTRY_DEPLOYMENT_CREDENTIAL_PATH),
-        "registry deployment credential",
-    )?)
-    .map_err(|error| anyhow::anyhow!("registry deployment credential is not UTF-8: {error}"))?;
+    let registry_credential = load_registry_deployment_credential()?;
     Ok(TrustedRegistryDeploymentCredentials {
         ca_verifying_key,
         registry_credential,
@@ -1960,29 +1964,58 @@ enum ProcessBootstrapAuthorityState {
 static PROCESS_BOOTSTRAP_AUTHORITY: parking_lot::Mutex<ProcessBootstrapAuthorityState> =
     parking_lot::Mutex::new(ProcessBootstrapAuthorityState::Unsealed);
 
-/// Atomically consume the fixed OS-owned deployment witness and install the
-/// process Discovery resolver. No credential path, CA, JWT, key, witness, or
-/// extraction callback crosses this boundary.
+/// Atomically consume the explicitly selected deployment witness and install
+/// the process Discovery resolver. Selection never falls back between the
+/// OS-owned and DID-anchored providers.
 #[cfg(not(target_arch = "wasm32"))]
-pub fn bootstrap_deployment_process(signing_key: SigningKey) -> Result<()> {
-    let authority = authenticate_deployment_bootstrap()?;
+pub async fn bootstrap_deployment_process(
+    signing_key: SigningKey,
+    trust_source: crate::DeploymentTrustSource,
+) -> Result<()> {
     let discovery_vk = hyprstream_service::global_trust_store()
         .resolve_one("discovery")
         .ok_or_else(|| anyhow::anyhow!("trust store has no authenticated discovery key"))?;
-    let discovery_client =
-        crate::DiscoveryClient::for_local_bootstrap(signing_key, discovery_vk, None)?;
+    let (authority, discovery_client) = match trust_source {
+        crate::DeploymentTrustSource::OsOwnedFiles => {
+            let authority = authenticate_deployment_bootstrap()?;
+            let client =
+                crate::DiscoveryClient::for_local_bootstrap(signing_key, discovery_vk, None)?;
+            (authority, client)
+        }
+        crate::DeploymentTrustSource::DidAnchored(anchors) => {
+            let (authority, transport) = authenticate_did_anchored_bootstrap(&anchors).await?;
+            let signer = hyprstream_rpc::signer::LocalSigner::new(signing_key);
+            let rpc = hyprstream_rpc::dial::dial(&transport, signer, Some(discovery_vk), None)?;
+            let client = crate::DiscoveryClient::new(rpc);
+            let health = client
+                .ping()
+                .await
+                .context("DID-anchored Discovery reach failed liveness check")?;
+            anyhow::ensure!(
+                health.status == "ok",
+                "DID-anchored Discovery liveness returned status {:?}",
+                health.status
+            );
+            (authority, client)
+        }
+    };
     DiscoveryService::bootstrap_authenticated_process(authority, discovery_client)
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn authenticate_deployment_bootstrap() -> Result<ProcessBootstrapAuthority> {
+fn seal_process_bootstrap_authority() -> Result<()> {
     let mut state = PROCESS_BOOTSTRAP_AUTHORITY.lock();
     anyhow::ensure!(
         matches!(*state, ProcessBootstrapAuthorityState::Unsealed),
         "Discovery bootstrap authority is already sealed or consumed"
     );
     *state = ProcessBootstrapAuthorityState::Sealed;
-    drop(state);
+    Ok(())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn authenticate_deployment_bootstrap() -> Result<ProcessBootstrapAuthority> {
+    seal_process_bootstrap_authority()?;
     let witness = authenticate_registry_deployment_credentials(
         load_trusted_registry_deployment_credentials()?,
     )?;
@@ -1991,6 +2024,24 @@ fn authenticate_deployment_bootstrap() -> Result<ProcessBootstrapAuthority> {
         store_path,
         acceptance_identity: ProcessAcceptanceIdentity::Deployment(witness.verifier),
     })
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+async fn authenticate_did_anchored_bootstrap(
+    anchors: &crate::DidAnchors,
+) -> Result<(ProcessBootstrapAuthority, TransportConfig)> {
+    seal_process_bootstrap_authority()?;
+    let trust = crate::did_anchored::resolve_did_anchored_trust(anchors).await?;
+    let witness =
+        authenticate_registry_deployment_credentials(TrustedRegistryDeploymentCredentials {
+            ca_verifying_key: trust.ca_verifying_key,
+            registry_credential: load_registry_deployment_credential()?,
+        })?;
+    let authority = ProcessBootstrapAuthority {
+        store_path: hyprstream_service::deployment_data_dir()?.join("pds-store"),
+        acceptance_identity: ProcessAcceptanceIdentity::Deployment(witness.verifier),
+    };
+    Ok((authority, trust.discovery_transport))
 }
 
 #[cfg(test)]
