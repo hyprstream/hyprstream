@@ -100,8 +100,10 @@ impl std::fmt::Debug for MoqConnectAuthz {
 
 impl MoqConnectAuthz {
     /// Build with the verifying key for the JWT issuer this `/moq` endpoint
-    /// trusts and the authoritative subject→tenant resolver. The endpoint
-    /// accepts any `aud` unless [`Self::with_expected_aud`] is set.
+    /// trusts and the authoritative subject→tenant resolver.
+    ///
+    /// Authentication remains fail-closed until [`Self::with_expected_aud`]
+    /// supplies the exact resource audience.
     pub fn new(
         verify_key: VerifyingKey,
         tenant_resolver: VerifiedSubjectTenantResolver,
@@ -140,15 +142,12 @@ impl MoqConnectAuthz {
     /// Every branch is fail-closed; none falls back to an unscoped identity.
     pub fn verify(&self, headers: &http::HeaderMap) -> Option<VerifiedConnect> {
         let token = bearer_token(headers)?;
-        let claims = jwt::decode_with_key(&token, &self.verify_key, self.expected_aud.as_deref()).ok()?;
-        // [`jwt::decode_with_key`] is lenient on a *missing* `aud` (accepts
-        // absent, rejects mismatch) to tolerate legacy federated issuers across
-        // the codebase. This dedicated `/moq` boundary is stricter: when an
-        // audience is configured, a token with no `aud` is a substitution
-        // attempt from another service and must fail closed (#1153, BCP 225).
-        if self.expected_aud.is_some() && claims.aud.is_none() {
-            return None;
-        }
+        let audience = self
+            .expected_aud
+            .as_deref()
+            .map_or(jwt::AudienceExpectation::Missing, jwt::AudienceExpectation::Exact);
+        let claims =
+            jwt::decode_with_key_expectation(&token, &self.verify_key, audience).ok()?;
         let tenant = (self.tenant_resolver)(&claims.sub)?;
         // `moq_net::Path::new` normalizes "/" to its empty wildcard path.
         // Reject empty and multi-segment resolver output here, before it can
@@ -204,7 +203,8 @@ mod tests {
 
     fn mint(signing: &SigningKey, sub: &str, exp_delta_secs: i64) -> String {
         let now = chrono::Utc::now().timestamp();
-        let claims = Claims::new(sub.to_owned(), now, now + exp_delta_secs);
+        let claims = Claims::new(sub.to_owned(), now, now + exp_delta_secs)
+            .with_audience(Some("moq.example".to_owned()));
         crate::auth::jwt::encode(&claims, signing)
     }
 
@@ -246,7 +246,8 @@ mod tests {
     fn verify_succeeds_for_known_subject_and_resolves_tenant() {
         let key = SigningKey::from_bytes(&[1u8; 32]);
         let vk = key.verifying_key();
-        let authz = MoqConnectAuthz::new(vk, resolver(&[("did:key:alice", "alice")]));
+        let authz = MoqConnectAuthz::new(vk, resolver(&[("did:key:alice", "alice")]))
+            .with_expected_aud("moq.example");
         let tok = mint(&key, "did:key:alice", 60);
         let mut h = http::HeaderMap::new();
         h.insert("authorization", format!("Bearer {tok}").parse().unwrap());
@@ -269,7 +270,8 @@ mod tests {
         // Signed by a different key than the verifier expects.
         let issuer_key = SigningKey::from_bytes(&[3u8; 32]);
         let rogue_key = SigningKey::from_bytes(&[4u8; 32]);
-        let authz = MoqConnectAuthz::new(issuer_key.verifying_key(), resolver(&[("s", "t")]));
+        let authz = MoqConnectAuthz::new(issuer_key.verifying_key(), resolver(&[("s", "t")]))
+            .with_expected_aud("moq.example");
         let tok = mint(&rogue_key, "s", 60); // signed by rogue
         let mut h = http::HeaderMap::new();
         h.insert("authorization", format!("Bearer {tok}").parse().unwrap());
@@ -280,10 +282,12 @@ mod tests {
     fn verify_fails_for_expired_token() {
         let key = SigningKey::from_bytes(&[5u8; 32]);
         let vk = key.verifying_key();
-        let authz = MoqConnectAuthz::new(vk, resolver(&[("s", "t")]));
+        let authz =
+            MoqConnectAuthz::new(vk, resolver(&[("s", "t")])).with_expected_aud("moq.example");
         // exp in the past.
         let now = chrono::Utc::now().timestamp();
-        let claims = Claims::new("s".to_owned(), now - 120, now - 60);
+        let claims = Claims::new("s".to_owned(), now - 120, now - 60)
+            .with_audience(Some("moq.example".to_owned()));
         let tok = crate::auth::jwt::encode(&claims, &key);
         let mut h = http::HeaderMap::new();
         h.insert("authorization", format!("Bearer {tok}").parse().unwrap());
@@ -296,7 +300,8 @@ mod tests {
         // fail closed (no wildcard tenant, no unscoped fallthrough).
         let key = SigningKey::from_bytes(&[6u8; 32]);
         let vk = key.verifying_key();
-        let authz = MoqConnectAuthz::new(vk, resolver(&[("did:key:alice", "alice")]));
+        let authz = MoqConnectAuthz::new(vk, resolver(&[("did:key:alice", "alice")]))
+            .with_expected_aud("moq.example");
         let tok = mint(&key, "did:key:stranger", 60);
         let mut h = http::HeaderMap::new();
         h.insert("authorization", format!("Bearer {tok}").parse().unwrap());
@@ -312,8 +317,11 @@ mod tests {
 
         for tenant in ["", "/", "///", "/alice", "alice/", "alice/bob"] {
             let tenant = tenant.to_owned();
-            let authz =
-                MoqConnectAuthz::new(key.verifying_key(), Arc::new(move |_| Some(tenant.clone())));
+            let authz = MoqConnectAuthz::new(
+                key.verifying_key(),
+                Arc::new(move |_| Some(tenant.clone())),
+            )
+            .with_expected_aud("moq.example");
             assert!(
                 authz.verify(&headers).is_none(),
                 "invalid tenant must fail CONNECT closed"
@@ -341,15 +349,17 @@ mod tests {
     fn verify_rejects_missing_aud_when_audience_is_configured() {
         // BCP 225 / RFC 8725bis: on a boundary that specified an audience, a
         // token with NO aud is a substitution attempt from another service
-        // and must fail closed — not be admitted by the lenient-on-absence
-        // decode_with_key default. (`jwt::decode_with_key` accepts a missing
-        // aud; `MoqConnectAuthz` must override that here.)
+        // and must fail closed.
         let key = SigningKey::from_bytes(&[8u8; 32]);
         let vk = key.verifying_key();
         let authz =
             MoqConnectAuthz::new(vk, resolver(&[("s", "t")])).with_expected_aud("moq.example");
         // Token with no aud (the default from Claims::new).
-        let tok = mint(&key, "s", 60);
+        let now = chrono::Utc::now().timestamp();
+        let tok = crate::auth::jwt::encode(
+            &Claims::new("s".to_owned(), now, now + 60),
+            &key,
+        );
         let mut h = http::HeaderMap::new();
         h.insert("authorization", format!("Bearer {tok}").parse().unwrap());
         assert!(
@@ -359,16 +369,19 @@ mod tests {
     }
 
     #[test]
-    fn verify_accepts_missing_aud_when_no_audience_configured() {
-        // If the operator did not set expected_aud, audience checking is off
-        // entirely — a token with no aud is admitted (subject to the other
-        // checks). This is the operator's explicit choice.
+    fn verify_rejects_when_no_audience_configured() {
+        // Missing security configuration is not an unchecked posture. Even a
+        // correctly signed token carrying an audience must be rejected until
+        // the endpoint configures which exact audience it accepts.
         let key = SigningKey::from_bytes(&[9u8; 32]);
         let vk = key.verifying_key();
         let authz = MoqConnectAuthz::new(vk, resolver(&[("s", "t")]));
-        let tok = mint(&key, "s", 60); // no aud
+        let tok = mint(&key, "s", 60);
         let mut h = http::HeaderMap::new();
         h.insert("authorization", format!("Bearer {tok}").parse().unwrap());
-        assert!(authz.verify(&h).is_some(), "no-aud token admitted when no audience configured");
+        assert!(
+            authz.verify(&h).is_none(),
+            "missing expected audience must fail closed"
+        );
     }
 }

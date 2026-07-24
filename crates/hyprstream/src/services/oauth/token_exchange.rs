@@ -163,10 +163,10 @@ pub async fn exchange_token_exchange(
 
 /// Verify an OIDC ID token from a trusted issuer (CrossAppAccessProvider path).
 ///
-/// `aud` is not strictly enforced — ID tokens target the OIDC client_id, not our
-/// token endpoint. Trust is established by the `iss` being in `trusted_issuers`.
+/// The issuer's configured `oidc_client_id` must be present in `aud`. For
+/// multi-audience tokens, `azp` must also equal that client ID.
 async fn verify_id_token(state: &Arc<OAuthState>, token: &str) -> Result<VerifiedSubject, String> {
-    let unverified = hyprstream_rpc::auth::decode_unverified(token)
+    let unverified = hyprstream_rpc::auth::decode_id_token_unverified(token)
         .map_err(|e| format!("Cannot parse id_token: {e}"))?;
 
     let iss = if unverified.iss.is_empty() {
@@ -180,6 +180,17 @@ async fn verify_id_token(state: &Arc<OAuthState>, token: &str) -> Result<Verifie
         .get(&iss)
         .ok_or_else(|| format!("Issuer not in trusted_issuers allow-list: {iss}"))?
         .clone();
+    let oidc_client_id = issuer_cfg
+        .oidc_client_id
+        .as_deref()
+        .filter(|client_id| !client_id.is_empty())
+        .ok_or_else(|| {
+            format!(
+                "OIDC ID-token exchange is not configured for issuer {iss}: \
+                 set trusted_issuers[issuer].oidc_client_id"
+            )
+        })?
+        .to_owned();
 
     check_nbf(token)?;
 
@@ -187,18 +198,13 @@ async fn verify_id_token(state: &Arc<OAuthState>, token: &str) -> Result<Verifie
         .await
         .map_err(|e| format!("JWKS key resolution failed for {iss}: {e}"))?;
 
-    // CrossAppAccessProvider does not supply the OIDC client_id at this
-    // boundary, so it cannot enforce an exact client audience here. Keep this
-    // protocol exception explicit rather than letting a missing Option disable
-    // verification implicitly.
-    let claims = hyprstream_rpc::auth::decode_with_key_expectation(
+    let claims = hyprstream_rpc::auth::decode_id_token_with_key(
         token,
         &vk,
-        hyprstream_rpc::auth::AudienceExpectation::ExplicitlyUnchecked {
-            reason: "trusted OIDC ID tokens are addressed to the external OIDC client",
-        },
+        &iss,
+        &oidc_client_id,
     )
-        .map_err(|e| format!("id_token signature verification failed: {e}"))?;
+    .map_err(|e| format!("id_token verification failed: {e}"))?;
 
     if claims.sub.is_empty() {
         return Err("id_token missing 'sub' claim".to_owned());

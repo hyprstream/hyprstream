@@ -1433,8 +1433,9 @@ mod empty_iss_gate_tests {
             policy: crate::crypto::CryptoPolicy::Hybrid,
         };
         let now = chrono::Utc::now().timestamp();
-        let claims =
-            Claims::new("alice".to_owned(), now, now + 60).with_issuer("https://local".to_owned());
+        let claims = Claims::new("alice".to_owned(), now, now + 60)
+            .with_issuer("https://local".to_owned())
+            .with_audience(Some("https://mock".to_owned()));
         for typ in crate::auth::RFC9068_ACCESS_TOKEN_TYPES {
             let header = format!(r#"{{"alg":"ML-DSA-65-Ed25519","typ":"{typ}","kid":"{kid_a}"}}"#);
             let valid = composite_token(&header, &claims, &pq_a, &ed_a, false);

@@ -31,8 +31,8 @@ expected-value verifier:
 | `RegistryService::handle_list` policy check | Live fail-open | Fixed here: a policy RPC error now denies listing instead of exposing every repository. |
 | `RequestService::expected_audience()` and MCP stdio configuration | Latent fail-open | Fixed here: a missing audience now reaches the decoder as `Missing` and rejects. |
 | `services/oauth/auth.rs` and `services/oauth/introspection.rs` | Live once OAuth algorithm routing accepts production tokens | Owned by #1146 Lane B / PR #1147; deliberately not modified here. |
-| `services/oauth/token_exchange.rs` OIDC ID tokens | Protocol exception | Explicitly unchecked with a reviewable reason because this boundary does not receive the external OIDC client ID; #1147 owns the access-token exchange migration. |
-| `services/policy.rs` service-key registration | Live missing-audience and missing-cnf bypass | Fixed: service WITs mint a dedicated registration audience and registration requires exact cnf.jwk key equality. |
+| `services/oauth/token_exchange.rs` OIDC ID tokens | Live cross-client replay | Fixed: each trusted issuer must configure `oidc_client_id`; ID-token exchange requires that client in `aud` and requires the same `azp` for multi-audience tokens. |
+| `services/policy.rs` service-key registration | Live missing-audience and missing-cnf bypass | Fixed: service WITs mint a dedicated registration audience, remain an inner assertion rather than an outer bearer, and registration binds the request signer, presented key, and required `cnf.jwk` exactly. |
 
 The remaining optional verification APIs are explicitly tracked in #1201:
 DPoP access-token binding, response-envelope signer pinning, conditional

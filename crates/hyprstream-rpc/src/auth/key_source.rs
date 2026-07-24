@@ -1006,7 +1006,8 @@ mod tests {
         );
 
         let now = chrono::Utc::now().timestamp();
-        let claims = crate::auth::Claims::new("user-1".to_owned(), now, now + 300);
+        let claims = crate::auth::Claims::new("user-1".to_owned(), now, now + 300)
+            .with_audience(Some("http://localhost".to_owned()));
         let header = serde_json::json!({"alg": "EdDSA", "typ": "at+jwt", "kid": new_kid});
         let signing_input = format!(
             "{}.{}",
@@ -1023,7 +1024,14 @@ mod tests {
             .get_key("http://localhost", header["kid"].as_str())
             .await?;
         assert_eq!(selected, new.verifying_key());
-        assert!(crate::auth::jwt::decode_with_key(&token, &selected, None).is_err());
+        assert!(
+            crate::auth::jwt::decode_with_key(
+                &token,
+                &selected,
+                Some("http://localhost"),
+            )
+            .is_err()
+        );
         Ok(())
     }
 
@@ -1099,7 +1107,8 @@ mod tests {
         // Sign with the SECOND key — no kid in the header, so the verifier
         // must try both candidates.
         let now = chrono::Utc::now().timestamp();
-        let claims = crate::auth::Claims::new("user-1".to_owned(), now, now + 300);
+        let claims = crate::auth::Claims::new("user-1".to_owned(), now, now + 300)
+            .with_audience(Some("http://localhost".to_owned()));
         let header = URL_SAFE_NO_PAD.encode(r#"{"alg":"EdDSA","typ":"at+jwt"}"#);
         let payload = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims)?);
         let signing_input = format!("{header}.{payload}");
@@ -1108,7 +1117,8 @@ mod tests {
             URL_SAFE_NO_PAD.encode(sk_b.sign(signing_input.as_bytes()).to_bytes())
         );
         let candidates = ks.get_keys("http://localhost", None).await?;
-        let verified = decode_with_any_key_lenient(&token, &candidates, None)?;
+        let verified =
+            decode_with_any_key_lenient(&token, &candidates, Some("http://localhost"))?;
         assert_eq!(verified.sub, "user-1");
         Ok(())
     }

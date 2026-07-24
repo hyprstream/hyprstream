@@ -52,10 +52,10 @@ pub use jti_blocklist::{InMemoryJtiBlocklist, JtiBlocklist};
 pub use jwt::{
     AudienceExpectation, CompositeJwtDispatch, JwkThumbprintInput, JwtError, ProtectedHeader,
     RFC9068_ACCESS_TOKEN_TYPES, composite_kid, decode, decode_unverified, decode_with_any_key,
-    decode_with_any_key_lenient, decode_with_expectation, decode_with_key,
-    decode_with_key_expectation, encode, encode_service_jwt, header_alg, header_kid,
-    is_rfc9068_access_token_type, jwk_thumbprint, parse_composite_dispatch,
-    parse_protected_header,
+    decode_with_any_key_lenient, decode_with_expectation, decode_id_token_unverified,
+    decode_id_token_with_key, decode_with_key, decode_with_key_expectation, encode,
+    encode_service_jwt, header_alg, header_kid, is_rfc9068_access_token_type, jwk_thumbprint,
+    parse_composite_dispatch, parse_protected_header,
 };
 #[cfg(not(target_arch = "wasm32"))]
 pub use jwt::decode_with_federation_candidates;

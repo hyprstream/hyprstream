@@ -816,6 +816,13 @@ pub struct TrustedIssuerConfig {
     /// If absent, JWKS URI is auto-discovered from `{issuer}/.well-known/oauth-authorization-server`.
     #[serde(default)]
     pub jwks_uri: Option<String>,
+    /// OIDC client ID allowed to exchange this issuer's ID tokens.
+    ///
+    /// ID-token exchange is disabled for this issuer when absent. This is
+    /// deliberately separate from issuer trust: a valid token issued to some
+    /// other client at the same issuer must never be accepted here.
+    #[serde(default)]
+    pub oidc_client_id: Option<String>,
     /// How long to cache the JWKS before re-fetching (default: 300 seconds).
     #[serde(default = "default_jwks_cache_ttl")]
     pub jwks_cache_ttl_secs: u64,

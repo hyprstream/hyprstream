@@ -3,9 +3,10 @@
 //! Re-exports EdDSA signing from hyprstream-rpc and adds ES256 (P-256) signing.
 
 pub use hyprstream_rpc::auth::{
-    decode, decode_with_any_key, decode_with_any_key_lenient,
-    decode_with_expectation, decode_with_federation_candidates, decode_with_key,
-    decode_with_key_expectation, encode, encode_service_jwt, AudienceExpectation, Claims, JwtError,
+    decode, decode_id_token_unverified, decode_id_token_with_key, decode_with_any_key,
+    decode_with_any_key_lenient, decode_with_expectation, decode_with_federation_candidates,
+    decode_with_key, decode_with_key_expectation, encode, encode_service_jwt,
+    AudienceExpectation, Claims, JwtError,
 };
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};

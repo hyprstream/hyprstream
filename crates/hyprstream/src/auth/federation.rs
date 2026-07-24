@@ -787,6 +787,7 @@ mod tests {
             "https://trusted.example.com".to_owned(),
             crate::config::TrustedIssuerConfig {
                 jwks_uri: Some("https://trusted.example.com/jwks".to_owned()),
+                oidc_client_id: None,
                 jwks_cache_ttl_secs: 300,
                 allow_http: false,
             },
@@ -1069,7 +1070,8 @@ mod tests {
     fn federation_token(signing_key: &SigningKey, kid: &str, sub: &str) -> String {
         let exp = future_exp();
         let claims = Claims::new(sub.to_owned(), exp - 3600, exp)
-            .with_issuer("https://fed.example".to_owned());
+            .with_issuer("https://fed.example".to_owned())
+            .with_audience(Some("https://resource.example".to_owned()));
         let header = serde_json::json!({"alg": "EdDSA", "typ": "at+jwt", "kid": kid});
         let signing_input = format!(
             "{}.{}",
@@ -1086,6 +1088,7 @@ mod tests {
             "https://fed.example".to_owned(),
             crate::config::TrustedIssuerConfig {
                 jwks_uri: Some(jwks_uri.to_owned()),
+                oidc_client_id: None,
                 jwks_cache_ttl_secs: 300,
                 allow_http: true,
             },
@@ -1151,7 +1154,11 @@ mod tests {
         assert_eq!(new_candidates.len(), 1, "named lookup must not fall back");
         assert_eq!(new_candidates[0].verifying_key, vk_new);
         assert_eq!(
-            jwt::decode_with_federation_candidates(&new_token, &new_candidates, None)
+            jwt::decode_with_federation_candidates(
+                &new_token,
+                &new_candidates,
+                Some("https://resource.example"),
+            )
                 .expect("new overlap token verifies")
                 .sub,
             "new-subject"
@@ -1164,7 +1171,11 @@ mod tests {
         assert_eq!(old_candidates.len(), 1, "named lookup must not fall back");
         assert_eq!(old_candidates[0].verifying_key, vk_old);
         assert_eq!(
-            jwt::decode_with_federation_candidates(&old_token, &old_candidates, None)
+            jwt::decode_with_federation_candidates(
+                &old_token,
+                &old_candidates,
+                Some("https://resource.example"),
+            )
                 .expect("old overlap token verifies")
                 .sub,
             "old-subject"
@@ -1270,6 +1281,7 @@ mod tests {
             "https://fed.example".to_owned(),
             crate::config::TrustedIssuerConfig {
                 jwks_uri: Some("https://fed.example/jwks".to_owned()),
+                oidc_client_id: None,
                 jwks_cache_ttl_secs: 0,
                 allow_http: true,
             },
@@ -1285,13 +1297,25 @@ mod tests {
             .get_keys("https://fed.example", Some("kid-old"))
             .await
             .expect("old key honoured during overlap");
-        assert!(jwt::decode_with_federation_candidates(&old_token, &during_overlap, None).is_ok());
+        assert!(
+            jwt::decode_with_federation_candidates(
+                &old_token,
+                &during_overlap,
+                Some("https://resource.example"),
+            )
+            .is_ok()
+        );
         let new_during_overlap = resolver
             .get_keys("https://fed.example", Some("kid-new"))
             .await
             .expect("new key honoured during overlap");
         assert!(
-            jwt::decode_with_federation_candidates(&new_token, &new_during_overlap, None).is_ok()
+            jwt::decode_with_federation_candidates(
+                &new_token,
+                &new_during_overlap,
+                Some("https://resource.example"),
+            )
+            .is_ok()
         );
 
         // After rotation drains, the old kid is gone — refetch, fail closed.
@@ -1309,6 +1333,13 @@ mod tests {
             .get_keys("https://fed.example", Some("kid-new"))
             .await
             .expect("new key still resolves");
-        assert!(jwt::decode_with_federation_candidates(&new_token, &after, None).is_ok());
+        assert!(
+            jwt::decode_with_federation_candidates(
+                &new_token,
+                &after,
+                Some("https://resource.example"),
+            )
+            .is_ok()
+        );
     }
 }

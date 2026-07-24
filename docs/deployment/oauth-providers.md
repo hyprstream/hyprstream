@@ -237,12 +237,17 @@ endpoint), use `oauth.trusted_issuers` instead of `oidc_providers`:
 ```toml
 [oauth.trusted_issuers."https://keycloak.example.com/realms/my-realm"]
 jwks_uri = "https://keycloak.example.com/realms/my-realm/protocol/openid-connect/certs"
+# Required only when accepting this issuer's ID tokens via RFC 8693.
+oidc_client_id = "hyprstream-cross-app"
 jwks_cache_ttl_secs = 300
 ```
 
 `trusted_issuers` is a TOML table keyed by the exact issuer URL (matching the token's
 `iss` claim). Per-issuer fields: `jwks_uri` (optional — auto-discovered when omitted),
-`jwks_cache_ttl_secs` (default 300), and `allow_http` (dev only). This allows Bearer
-authentication with externally issued JWTs, plus RFC 8693 token exchange and RFC 7523
-JWT bearer grants, without requiring a browser login flow. See the
+`oidc_client_id` (required for ID-token exchange), `jwks_cache_ttl_secs` (default
+300), and `allow_http` (dev only). ID-token exchange requires the configured client
+ID in `aud` and, for multi-audience tokens, in `azp`; omitting `oidc_client_id`
+disables ID-token exchange for that issuer. This allows Bearer authentication with
+externally issued JWTs, plus RFC 8693 token exchange and RFC 7523 JWT bearer grants,
+without requiring a browser login flow. See the
 [Keycloak guide](keycloak.md) for a worked example.
