@@ -142,9 +142,7 @@ pub fn cid_from_merkle(algorithm: HashAlgo, merkle_hex: &str) -> Result<String, 
 /// A labeled manifest CID deliberately cannot be reduced to a merkle: it must be
 /// resolved through its persisted manifest so the label binding is verified.
 pub fn merkle_from_address(address: &str) -> Result<String, CasError> {
-    let looks_like_legacy_hex =
-        matches!(address.len(), 40 | 64) && address.bytes().all(|b| b.is_ascii_hexdigit());
-    if looks_like_legacy_hex {
+    if looks_like_legacy_hex(address) {
         return Ok(address.to_ascii_lowercase());
     }
     let cid = decode_cid(address).map_err(|e| CasError::Cid(e.to_string()))?;
@@ -154,6 +152,14 @@ pub fn merkle_from_address(address: &str) -> Result<String, CasError> {
         ));
     }
     Ok(hex::encode(cid.multihash.digest))
+}
+
+/// Whether `address` is a legacy bare SHA-1 or BLAKE3 merkle digest.
+///
+/// This predicate selects the compatibility path that bypasses sealed-manifest
+/// resolution, so all CAS callers must share this single definition.
+pub(crate) fn looks_like_legacy_hex(address: &str) -> bool {
+    matches!(address.len(), 40 | 64) && address.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 #[cfg(test)]

@@ -69,7 +69,7 @@ pub enum CasMountObjectKind {
     Stage,
 }
 
-/// Authorization request made before a CAS object is opened/read/stat'ed.
+/// Authorization request made before a CAS operation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CasMountAuthzRequest<'a> {
     /// Which CAS object namespace is being accessed.
@@ -79,8 +79,15 @@ pub struct CasMountAuthzRequest<'a> {
     /// Dedup domain the mount is serving.
     pub domain: &'a DedupDomain,
     /// Operation name for policy/audit (e.g. `open`, `read`, `stat`,
-    /// `stage:create`, `stage:commit`).
+    /// `stage:create`, `stage:label`, `stage:commit`).
     pub operation: &'static str,
+    /// Parsed object label proposed by a `stage:label` operation. `None` for
+    /// every other operation.
+    ///
+    /// A clearance-aware authorizer must resolve the caller's verified
+    /// [`hyprstream_rpc::auth::mac::SecurityContext`] and reject labels it does
+    /// not authorize. The raw ctl input is never authoritative by itself.
+    pub requested_label: Option<&'a SecurityLabel>,
 }
 
 /// Per-op authorization hook for [`CasMount`].
@@ -252,6 +259,23 @@ impl CasMountAuthorizer for BootstrapCasAuthorizer {
         caller: &Subject,
         request: CasMountAuthzRequest<'_>,
     ) -> Result<(), MountError> {
+        // Bootstrap grants do not carry verified subject clearances, so they
+        // can never authorize caller-selected object labels. A clearance-aware
+        // authorizer must replace this bootstrap seam before staging is enabled.
+        if request.requested_label.is_some() {
+            warn!(
+                subject = %caller,
+                kind = ?request.kind,
+                address = request.address,
+                operation = request.operation,
+                "CAS bootstrap grant: deny label declaration (no verified clearance)"
+            );
+            return Err(MountError::PermissionDenied(format!(
+                "CAS {} {:?} {} denied for {}: bootstrap authorizer has no verified clearance",
+                request.operation, request.kind, request.address, caller
+            )));
+        }
+
         for grant in &self.grants {
             if grant.subject.accepts(caller)
                 && grant.kinds.contains(&request.kind)
@@ -658,6 +682,25 @@ impl CasMount {
                 address,
                 domain: &self.domain,
                 operation,
+                requested_label: None,
+            },
+        )
+    }
+
+    fn authorize_label(
+        &self,
+        caller: &Subject,
+        address: &str,
+        requested_label: &SecurityLabel,
+    ) -> Result<(), MountError> {
+        self.authorizer.authorize(
+            caller,
+            CasMountAuthzRequest {
+                kind: CasMountObjectKind::Stage,
+                address,
+                domain: &self.domain,
+                operation: "stage:label",
+                requested_label: Some(requested_label),
             },
         )
     }
@@ -699,7 +742,7 @@ impl CasMount {
     async fn seal_slot(&self, slot: &Arc<StagingSlot>) -> Result<String, MountError> {
         // An unlabeled slot is a staging-only state. Reject before taking bytes
         // or transitioning to Sealing so the caller may label it and retry.
-        if slot.joined_label().is_none() {
+        if slot.state() == SlotState::Open && slot.joined_label().is_none() {
             return Err(MountError::PermissionDenied(
                 "cannot seal an unlabeled staging slot; declare a label first".into(),
             ));
@@ -844,7 +887,7 @@ impl CasMount {
                     },
                 }
             }
-            Some("label") => self.declare_label_cmd(slot, tokens.collect()),
+            Some("label") => self.declare_label_cmd(id, slot, tokens.collect(), caller),
             Some(cmd) => Err(MountError::InvalidArgument(format!(
                 "unknown ctl command: {cmd}"
             ))),
@@ -853,8 +896,10 @@ impl CasMount {
 
     fn declare_label_cmd(
         &self,
+        id: &str,
         slot: &Arc<StagingSlot>,
         args: Vec<&str>,
+        caller: &Subject,
     ) -> Result<(), MountError> {
         // label <level> <assurance> [compartment...]
         let mut it = args.into_iter();
@@ -886,6 +931,10 @@ impl CasMount {
                 .label(level, assurance, comps)
                 .map_err(|e| MountError::InvalidArgument(format!("label: {e}")))?
         };
+        // Authorization sees the fully parsed label and runs before slot
+        // mutation. A rejection therefore cannot transition or persist label
+        // state, and a clearance-aware authorizer can enforce dominance.
+        self.authorize_label(caller, id, &label)?;
         slot.declare_label(label)
     }
 
@@ -1444,12 +1493,18 @@ mod tests {
     #[derive(Default)]
     struct RecordingAuthorizer {
         deny: bool,
+        deny_labels: bool,
         calls: Mutex<Vec<(String, CasMountObjectKind, String, &'static str)>>,
+        label_calls: Mutex<Vec<(String, String, SecurityLabel)>>,
     }
 
     impl RecordingAuthorizer {
         fn calls(&self) -> Vec<(String, CasMountObjectKind, String, &'static str)> {
             self.calls.lock().clone()
+        }
+
+        fn label_calls(&self) -> Vec<(String, String, SecurityLabel)> {
+            self.label_calls.lock().clone()
         }
     }
 
@@ -1465,7 +1520,14 @@ mod tests {
                 request.address.to_owned(),
                 request.operation,
             ));
-            if self.deny {
+            if let Some(label) = request.requested_label {
+                self.label_calls.lock().push((
+                    caller.to_string(),
+                    request.address.to_owned(),
+                    *label,
+                ));
+            }
+            if self.deny || (self.deny_labels && request.requested_label.is_some()) {
                 Err(MountError::PermissionDenied("denied by test".into()))
             } else {
                 Ok(())
@@ -1660,6 +1722,7 @@ mod tests {
             address: "aa00",
             domain: &domain,
             operation: "read",
+            requested_label: None,
         };
         let err = authz
             .authorize(&Subject::new("alice"), request)
@@ -1673,6 +1736,30 @@ mod tests {
         assert_eq!(grant.subject, CasGrantSubject::AnyAuthenticated);
         assert_eq!(grant.kinds, &[CasMountObjectKind::Xorb]);
         assert_eq!(grant.operations, &["open", "read"]);
+    }
+
+    #[test]
+    fn bootstrap_cannot_grant_labels_without_verified_clearance() {
+        let authz = BootstrapCasAuthorizer::with_grants(vec![CasMountGrant {
+            name: "test:stage-label",
+            subject: CasGrantSubject::AnyAuthenticated,
+            kinds: &[CasMountObjectKind::Stage],
+            operations: &["stage:label"],
+        }]);
+        let domain = DedupDomain::local_default();
+        let requested_label = label();
+        let request = CasMountAuthzRequest {
+            kind: CasMountObjectKind::Stage,
+            address: "1",
+            domain: &domain,
+            operation: "stage:label",
+            requested_label: Some(&requested_label),
+        };
+
+        let err = authz
+            .authorize(&Subject::new("alice"), request)
+            .unwrap_err();
+        assert!(matches!(err, MountError::PermissionDenied(_)));
     }
 
     // ── write-then-seal (#814) ─────────────────────────────────────────────
@@ -2225,6 +2312,38 @@ mod tests {
             .collect();
         assert_eq!(commit_calls.len(), 1);
         assert_eq!(commit_calls[0].2, id);
+        mount.clunk(data, &caller).await;
+        mount.clunk(ctl, &caller).await;
+    }
+
+    #[tokio::test]
+    async fn label_authorization_sees_requested_label_and_rejection_does_not_mutate_slot() {
+        let dir = tempfile::tempdir().unwrap();
+        let authz = std::sync::Arc::new(RecordingAuthorizer {
+            deny_labels: true,
+            ..RecordingAuthorizer::default()
+        });
+        let mount = CasMount::with_authorizer_and_staging(
+            CasSubstrate::new(dir.path()),
+            DedupDomain::local_default(),
+            authz.clone(),
+            StagingConfig::default(),
+        );
+        let caller = Subject::new("alice");
+        let (id, _root) = create_stage(&mount, &caller).await;
+        let (data, ctl) = open_data_ctl(&mount, &id, &caller).await;
+
+        let err = mount
+            .write(&ctl, 0, b"label internal classical\n", &caller)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, MountError::PermissionDenied(_)));
+        assert_eq!(authz.label_calls(), vec![("alice".to_owned(), id, label())]);
+        let status = ctl_str(&mount, &ctl, &caller).await;
+        assert!(
+            status.contains("labels=0"),
+            "rejected label must not mutate slot: {status}"
+        );
         mount.clunk(data, &caller).await;
         mount.clunk(ctl, &caller).await;
     }
