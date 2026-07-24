@@ -868,10 +868,10 @@ fn verify_operation_signature(operation: &Value, rotation_keys: &[&str]) -> Resu
                 if !decoded.starts_with(&[0x80, 0x24]) {
                     continue;
                 }
-                let Ok(key) = plc_p256::ecdsa::VerifyingKey::from_sec1_bytes(key_bytes) else {
+                let Ok(key) = p256::ecdsa::VerifyingKey::from_sec1_bytes(key_bytes) else {
                     continue;
                 };
-                let Ok(signature) = plc_p256::ecdsa::Signature::from_slice(&signature_bytes) else {
+                let Ok(signature) = p256::ecdsa::Signature::from_slice(&signature_bytes) else {
                     continue;
                 };
                 if signature.normalize_s().is_some() {
