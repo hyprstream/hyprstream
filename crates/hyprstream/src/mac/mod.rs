@@ -118,15 +118,16 @@ pub use genesis::{
     floor_label, genesis_lattice, CompositeObjectLabelResolver, GeneratedNodeCoverage,
     GenesisGate, ManifestLabelSource, NamespaceEnumerator, NoManifests, SitePolicy,
 };
-pub use pep::{
-    enrollment_ninep_reference_monitor, production_ninep_decider,
-    production_ninep_reference_monitor, EnrollmentClearanceSource, NinePAccessDecider,
-    NinePClearanceSource, VerifiedClearanceSessionFactory,
-};
 // #1270: CAS-native MAC PEP — the shared CAS enforcement contract.
 pub use cas_pep::{
     domain_label, seal_label, CasClearanceSource, CasObjectLabelResolver, CasPep,
     DenyAllClearanceSource, MacCasAuthorizer,
+};
+pub use pep::{
+    enrollment_ninep_reference_monitor, production_ninep_decider,
+    production_ninep_reference_monitor, production_vfs_pep, DenyUnenrolledSubjects,
+    EnrollmentClearanceSource, NinePAccessDecider, NinePClearanceSource,
+    VerifiedClearanceSessionFactory, VfsAccessDecider,
 };
 // S4 (#570): the boot path that installs the verified `CompiledPolicy` at daemon
 // startup (dormant — makes the PDP inputs real without enabling enforcement).

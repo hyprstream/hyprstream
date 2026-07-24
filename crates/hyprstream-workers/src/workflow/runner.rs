@@ -385,9 +385,9 @@ async fn run_job_steps(
 
         // Fork namespace for script isolation: remove /config, /private, /srv.
         let mut forked = ns.fork();
-        forked.unmount("/config");
-        forked.unmount("/private");
-        forked.unmount("/srv");
+        let _ = forked.unmount("/config");
+        let _ = forked.unmount("/private");
+        let _ = forked.unmount("/srv");
 
         // Write env vars to /env/* in forked namespace.
         // We use an in-memory mount for env vars.

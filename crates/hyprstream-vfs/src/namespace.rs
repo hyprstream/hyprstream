@@ -6,6 +6,7 @@
 use std::sync::Arc;
 
 use hyprstream_rpc::Subject;
+use crate::mac_pep::{NamespaceAction, NamespacePep};
 use crate::mount::{DirEntry, Mount, MountError, Stat, OWRITE};
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -17,6 +18,13 @@ use crate::mount::{DirEntry, Mount, MountError, Stat, OWRITE};
 pub enum NamespaceError {
     Mount(MountError),
     ReservedPath(String),
+    /// A mandatory MAC reference-monitor decision denied the op (#1272).
+    ///
+    /// Carries the [`NamespaceAction`] that was denied and a human-readable
+    /// detail string. This is the fail-closed surface: the PEP returns this
+    /// variant whenever the caller's clearance is unprovable, the object is
+    /// unlabeled, or `can_access` fails. There is no permissive fallback.
+    Denied(NamespaceAction, String),
 }
 
 impl std::fmt::Display for NamespaceError {
@@ -24,6 +32,9 @@ impl std::fmt::Display for NamespaceError {
         match self {
             Self::Mount(e) => write!(f, "{e}"),
             Self::ReservedPath(p) => write!(f, "reserved path: {p}"),
+            Self::Denied(action, detail) => {
+                write!(f, "MAC denied {action:?}: {detail}")
+            }
         }
     }
 }
@@ -77,21 +88,90 @@ const MAX_READ_SIZE: usize = 16 * 1024 * 1024;
 ///
 /// Populated from service discovery at startup (`/srv/{name}`).
 /// Forkable for per-task sandboxing via `fork()` + `unmount()`.
+///
+/// # MAC enforcement (#1272)
+///
+/// The namespace carries an optional [`NamespacePep`] — the mandatory
+/// reference monitor over the direct API. A namespace built with [`Self::new`]
+/// is **unenforced** (the dormant status quo, matching the rest of MAC
+/// enforcement today); installing a PEP with [`Self::with_pep`] arms the
+/// fail-closed monitor so every read/write/create and every
+/// `mount`/`bind_mount`/`unmount` then requires a proven subject. Flipping the
+/// default to enforced at construction sites is the separately-gated activation
+/// B-lane (#1267), not this field's existence.
 pub struct Namespace {
     mounts: Vec<MountEntry>,
+    /// Mandatory MAC reference monitor over the direct API. `None` ⇒ the
+    /// un-enforced status quo; `Some` ⇒ every mediated op must pass it.
+    pep: Option<Arc<NamespacePep>>,
 }
 
 impl Namespace {
-    /// Create an empty namespace.
+    /// Create an empty, **unenforced** namespace.
+    ///
+    /// No MAC PEP is installed: direct-API ops behave as before (the
+    /// documented dormant posture — CLAUDE.md "MAC current status"). To arm
+    /// fail-closed enforcement, call [`Self::with_pep`] after construction.
     pub fn new() -> Self {
-        Self { mounts: Vec::new() }
+        Self {
+            mounts: Vec::new(),
+            pep: None,
+        }
+    }
+
+    /// Install (or replace) the mandatory MAC reference monitor.
+    ///
+    /// Once armed, every mediated direct-API op (`cat`/`read_one`/`echo`/
+    /// `create`/`ctl`) requires a subject whose clearance the PEP can prove,
+    /// and the subject-less `mount`/`bind_mount`/`unmount` **deny** — runtime
+    /// callers must use the `_as` variants with a proven [`Subject`]. The PEP
+    /// itself is fail-closed by construction (see [`NamespacePep`]).
+    ///
+    /// Returns the previous PEP, if any (enables atomic re-arm in tests).
+    pub fn set_pep(&mut self, pep: Arc<NamespacePep>) -> Option<Arc<NamespacePep>> {
+        self.pep.replace(pep)
+    }
+
+    /// Whether a MAC PEP is currently armed on this namespace.
+    pub fn pep_armed(&self) -> bool {
+        self.pep.is_some()
+    }
+
+    /// Enforce `action` by `subject` against the object at `path` when a PEP is
+    /// armed. No-op (permit) when no PEP is installed — the dormant status quo.
+    /// Fail-closed when armed: any unresolvable clearance/label or failed
+    /// `can_access` yields [`NamespaceError::Denied`].
+    fn enforce(&self, subject: &Subject, path: &str, action: NamespaceAction) -> Result<(), NamespaceError> {
+        let Some(pep) = &self.pep else {
+            return Ok(());
+        };
+        // Pass the canonical normalized path through the shared resolver
+        // contract. The authoritative resolver (in the `hyprstream` crate)
+        // performs prefix matching against genesis/bind-label carriers; the
+        // namespace supplies only the path, never a caller-authored label.
+        let normalized = normalize_path(path);
+        pep.authorize(subject, &normalized, action)
     }
 
     /// Mount a target at a path prefix (replaces any existing mount).
     ///
-    /// This is shorthand for `bind_mount(prefix, target, BindFlag::Replace)`.
+    /// This is the **namespace-construction** path: it carries no [`Subject`]
+    /// and is therefore usable only while no MAC PEP is armed (the build/fork
+    /// phase before [`Self::set_pep`]). Once a PEP is armed, this denies —
+    /// runtime callers must prove a subject via [`Self::mount_as`].
     pub fn mount(&mut self, prefix: &str, target: MountTarget) -> Result<(), NamespaceError> {
         self.bind_mount(prefix, target, BindFlag::Replace)
+    }
+
+    /// Subject-mediated `mount` — the runtime path under an armed PEP (#1272).
+    pub fn mount_as(
+        &mut self,
+        prefix: &str,
+        target: MountTarget,
+        subject: &Subject,
+    ) -> Result<(), NamespaceError> {
+        self.enforce(subject, prefix, NamespaceAction::Mount)?;
+        self.bind_mount_inner(prefix, target, BindFlag::Replace)
     }
 
     /// Mount a target at a path prefix with union semantics.
@@ -102,7 +182,37 @@ impl Namespace {
     /// - `After`: appends the target — existing mounts are tried first.
     /// - `Upper`: appends the target *and* records it as the union's writable
     ///   copy-up upper (#370). See [`BindFlag::Upper`].
+    ///
+    /// Like [`Self::mount`], this is the **construction** path (no subject):
+    /// when a PEP is armed it denies — use [`Self::bind_mount_as`].
     pub fn bind_mount(&mut self, prefix: &str, target: MountTarget, flag: BindFlag) -> Result<(), NamespaceError> {
+        if let Some(pep) = &self.pep {
+            // An armed namespace cannot mutate without a proven subject — the
+            // subject-less construction path is intentionally closed once the
+            // reference monitor is in place (#1272). Route the forced denial
+            // through the PEP so it is recorded in the audit WAL.
+            let normalized = normalize_path(prefix);
+            return Err(pep.deny_uncredentialed(&normalized, NamespaceAction::BindMount));
+        }
+        self.bind_mount_inner(prefix, target, flag)
+    }
+
+    /// Subject-mediated `bind_mount` — the runtime path under an armed PEP.
+    pub fn bind_mount_as(
+        &mut self,
+        prefix: &str,
+        target: MountTarget,
+        flag: BindFlag,
+        subject: &Subject,
+    ) -> Result<(), NamespaceError> {
+        self.enforce(subject, prefix, NamespaceAction::BindMount)?;
+        self.bind_mount_inner(prefix, target, flag)
+    }
+
+    // Core bind logic shared by the construction and mediated paths. Assumes
+    // the caller has already passed any armed PEP (or is the construction path
+    // on an un-armed namespace).
+    fn bind_mount_inner(&mut self, prefix: &str, target: MountTarget, flag: BindFlag) -> Result<(), NamespaceError> {
         let prefix = normalize_prefix(prefix);
 
         match flag {
@@ -149,17 +259,36 @@ impl Namespace {
     }
 
     /// Remove a mount point. In forked namespaces, this is irreversible.
-    pub fn unmount(&mut self, prefix: &str) {
+    ///
+    /// Construction path (no subject): denies when a PEP is armed — use
+    /// [`Self::unmount_as`].
+    pub fn unmount(&mut self, prefix: &str) -> Result<(), NamespaceError> {
+        if let Some(pep) = &self.pep {
+            let normalized = normalize_path(prefix);
+            return Err(pep.deny_uncredentialed(&normalized, NamespaceAction::Unmount));
+        }
         let prefix = normalize_prefix(prefix);
         self.mounts.retain(|m| m.prefix != prefix);
+        Ok(())
+    }
+
+    /// Subject-mediated `unmount` — the runtime path under an armed PEP.
+    pub fn unmount_as(&mut self, prefix: &str, subject: &Subject) -> Result<(), NamespaceError> {
+        self.enforce(subject, prefix, NamespaceAction::Unmount)?;
+        let prefix = normalize_prefix(prefix);
+        self.mounts.retain(|m| m.prefix != prefix);
+        Ok(())
     }
 
     /// Create a child namespace (Plan 9 `rfork(RFNAMEG)`).
     ///
-    /// The child gets a snapshot of the parent's mounts.
-    /// Modifications to the child do not affect the parent.
+    /// The child gets a snapshot of the parent's mounts **and** the parent's
+    /// armed PEP (enforcement is inherited — a sandboxed child must not be
+    /// able to escape the reference monitor by forking). Modifications to the
+    /// child do not affect the parent.
     pub fn fork(&self) -> Namespace {
         Namespace {
+            pep: self.pep.clone(),
             mounts: self.mounts.iter().map(|m| MountEntry {
                 prefix: m.prefix.clone(),
                 targets: m.targets.iter().map(Arc::clone).collect(),
@@ -196,6 +325,7 @@ impl Namespace {
     /// Loops reads until an empty Vec is returned, up to 16MB cap.
     /// With union mounts, tries each target in bind order until one succeeds.
     pub async fn cat(&self, path: &str, caller: &Subject) -> Result<Vec<u8>, NamespaceError> {
+        self.enforce(caller, path, NamespaceAction::Read)?;
         let (targets, remainder) = self.resolve(path)?;
         let components: Vec<&str> = split_path(&remainder);
         let mut last_err = None;
@@ -233,6 +363,7 @@ impl Namespace {
     /// Unlike `cat()` which loops to EOF, this returns after one read call.
     /// For streams, this returns the next available block. Empty bytes = EOF.
     pub async fn read_one(&self, path: &str, caller: &Subject) -> Result<Vec<u8>, NamespaceError> {
+        self.enforce(caller, path, NamespaceAction::Read)?;
         let (targets, remainder) = self.resolve(path)?;
         let components: Vec<&str> = split_path(&remainder);
         let mut last_err = None;
@@ -272,6 +403,7 @@ impl Namespace {
     /// write to a path that resolves through the union dirty-over-committed
     /// tree lands in the upper layer, leaving the committed floor untouched.
     pub async fn echo(&self, path: &str, data: &[u8], caller: &Subject) -> Result<(), NamespaceError> {
+        self.enforce(caller, path, NamespaceAction::Write)?;
         let (entry, remainder) = self.resolve_entry(path)?;
         let targets = &entry.targets[..];
         let components: Vec<&str> = split_path(&remainder);
@@ -327,6 +459,7 @@ impl Namespace {
         perm: u32,
         caller: &Subject,
     ) -> Result<Stat, NamespaceError> {
+        self.enforce(caller, path, NamespaceAction::Create)?;
         let (targets, remainder) = self.resolve(path)?;
         let components: Vec<&str> = split_path(&remainder);
         if components.is_empty() {
@@ -501,6 +634,7 @@ impl Namespace {
     /// Loops reads until an empty Vec is returned, up to 16MB cap.
     /// With union mounts, tries each target in bind order until one succeeds.
     pub async fn ctl(&self, path: &str, data: &[u8], caller: &Subject) -> Result<Vec<u8>, NamespaceError> {
+        self.enforce(caller, path, NamespaceAction::Write)?;
         let (targets, remainder) = self.resolve(path)?;
         let components: Vec<&str> = split_path(&remainder);
         let mut last_err = None;
@@ -542,6 +676,7 @@ impl Namespace {
     /// With union mounts, merges readdir results from all targets at the prefix,
     /// deduplicating by name (first occurrence wins, preserving bind order).
     pub async fn ls(&self, path: &str, caller: &Subject) -> Result<Vec<DirEntry>, NamespaceError> {
+        self.enforce(caller, path, NamespaceAction::Read)?;
         // Special case: ls "/" shows all mount prefixes as directories.
         if path == "/" || path.is_empty() {
             return Ok(self.root_dir_entries());
@@ -614,9 +749,21 @@ impl Namespace {
     /// order (`Before` first, `After` last) so the caller can apply the same
     /// union/fallthrough policy the convenience helpers do.
     ///
+    /// Because a raw [`MountTarget`] exposes the complete mount capability,
+    /// including writes, an armed namespace authorizes the dedicated
+    /// [`NamespaceAction::ResolveHandle`] action before returning any target.
+    /// Missing clearance, a missing object label, or policy denial therefore
+    /// fails closed at the capability boundary. A dormant namespace remains a
+    /// pass-through.
+    ///
     /// `path` is normalised (`.`/`..` resolved, leading `/` enforced) before the
     /// longest-prefix match, identical to the convenience helpers.
-    pub fn resolve_targets(&self, path: &str) -> Result<(Vec<MountTarget>, Vec<String>), NamespaceError> {
+    pub fn resolve_targets(
+        &self,
+        path: &str,
+        caller: &Subject,
+    ) -> Result<(Vec<MountTarget>, Vec<String>), NamespaceError> {
+        self.enforce(caller, path, NamespaceAction::ResolveHandle)?;
         let (targets, remainder) = self.resolve(path)?;
         let components = split_path(&remainder).into_iter().map(str::to_owned).collect();
         Ok((targets.to_vec(), components))
@@ -884,7 +1031,7 @@ mod tests {
         ns.mount("/srv/worker", Arc::new(MemMount::new(vec![])) as MountTarget).unwrap();
 
         let mut child = ns.fork();
-        child.unmount("/srv/worker");
+        let _ = child.unmount("/srv/worker");
 
         assert_eq!(ns.mount_prefixes().len(), 2);
         assert_eq!(child.mount_prefixes().len(), 1);
@@ -909,7 +1056,7 @@ mod tests {
         // A longer prefix still wins over the root catch-all.
         assert_eq!(ns.cat("/stream/job/data", &test_subject()).await.unwrap(), b"chunk");
         // The rootfs itself is reachable at "/".
-        assert!(ns.resolve_targets("/").is_ok());
+        assert!(ns.resolve_targets("/", &test_subject()).is_ok());
     }
 
     #[tokio::test]
@@ -1730,5 +1877,229 @@ mod tests {
         let stream: MountTarget = Arc::new(MemMount::new(vec![("job", b"chunk")]));
         ns.mount("/stream", stream).unwrap();
         assert_eq!(ns.cat("/stream/job", &caller).await.unwrap(), b"chunk");
+    }
+
+    // ── MAC PEP integration (#1272) ──────────────────────────────────────────
+
+    use crate::mac_pep::{
+        DenyAllNamespace, DenyAllSubjects, NamespaceAccessDecider, NamespaceAction, NamespacePep,
+        SubjectContextResolver,
+    };
+    use hyprstream_rpc::auth::mac::{
+        Assurance, CompartmentSet, Level, MacDecision, MacDenyReason, RpcObjectLabelResolver,
+        SecurityContext, SecurityLabel, VerifiedKeyMaterial,
+    };
+
+    fn sec_label(level: Level) -> SecurityLabel {
+        SecurityLabel::new(level, Assurance::Classical, CompartmentSet::EMPTY)
+    }
+    fn sec_ctx(level: Level) -> SecurityContext {
+        SecurityContext::from_clearance(sec_label(level), VerifiedKeyMaterial::Classical)
+    }
+
+    /// A resolver that admits one named subject at a fixed clearance.
+    struct OneSubject {
+        name: &'static str,
+        ctx: SecurityContext,
+    }
+    impl SubjectContextResolver for OneSubject {
+        fn resolve(&self, s: &Subject) -> Option<SecurityContext> {
+            (s.name() == Some(self.name)).then(|| self.ctx.clone())
+        }
+    }
+
+    /// Labels `/public/**` Public and everything else `None` (deny).
+    struct PublicOnlyResolver;
+    impl RpcObjectLabelResolver for PublicOnlyResolver {
+        fn resolve(&self, service_domain: &str, _method: Option<u16>) -> Option<SecurityLabel> {
+            service_domain
+                .strip_prefix("/public")
+                .filter(|suffix| suffix.is_empty() || suffix.starts_with('/'))
+                .map(|_| sec_label(Level::Public))
+        }
+    }
+
+    /// Read-floor decider: reads permitted when clearance dominates the label;
+    /// all write/create/mount-class ops denied (write-direction pause).
+    struct ReadFloorDecider;
+    impl NamespaceAccessDecider for ReadFloorDecider {
+        fn check(
+            &self,
+            ctx: Option<&SecurityContext>,
+            object_label: Option<SecurityLabel>,
+            action: NamespaceAction,
+        ) -> MacDecision {
+            let Some(ctx) = ctx else {
+                return MacDecision::Deny(MacDenyReason::NoClearance);
+            };
+            let Some(object_label) = object_label else {
+                return MacDecision::Deny(MacDenyReason::UnlabeledObject);
+            };
+            if action != NamespaceAction::Read {
+                return MacDecision::Deny(MacDenyReason::FloorDeny);
+            }
+            if ctx.clearance().can_access(&object_label) {
+                MacDecision::Permit
+            } else {
+                MacDecision::Deny(MacDenyReason::FloorDeny)
+            }
+        }
+    }
+
+    fn deny_all_pep() -> Arc<NamespacePep> {
+        Arc::new(NamespacePep::new(
+            Arc::new(DenyAllSubjects),
+            Arc::new(crate::mac_pep::DenyUnlabeledResolver),
+            Arc::new(DenyAllNamespace),
+        ))
+    }
+
+    /// An un-armed namespace is the dormant status quo — all ops behave as
+    /// before. This is the non-regression guard for the activation gate.
+    #[tokio::test]
+    async fn un_unarmed_namespace_is_unenforced() {
+        let mut ns = Namespace::new();
+        ns.mount("/public", Arc::new(MemMount::new(vec![("f", b"data")])) as MountTarget)
+            .unwrap();
+        assert!(!ns.pep_armed());
+        assert_eq!(
+            ns.cat("/public/f", &Subject::new("anyone")).await.unwrap(),
+            b"data"
+        );
+    }
+
+    /// Arming the fail-closed PEP denies every op for every subject — there is
+    /// no permissive default once the monitor is installed (#547).
+    #[tokio::test]
+    async fn armed_deny_all_pep_denies_reads() {
+        let mut ns = Namespace::new();
+        ns.mount("/public", Arc::new(MemMount::new(vec![("f", b"data")])) as MountTarget)
+            .unwrap();
+        ns.set_pep(deny_all_pep());
+        assert!(ns.pep_armed());
+        let err = ns.cat("/public/f", &Subject::new("anyone")).await.unwrap_err();
+        assert!(matches!(err, NamespaceError::Denied(NamespaceAction::Read, _)));
+    }
+
+    /// A caller cannot bypass an armed PEP by extracting the raw mount target.
+    /// The capability boundary must deny before returning a handle when the
+    /// caller has no verified clearance.
+    #[test]
+    fn resolve_targets_denies_without_clearance() {
+        let mut ns = Namespace::new();
+        ns.mount(
+            "/public",
+            Arc::new(MemMount::new(vec![("f", b"data")])) as MountTarget,
+        )
+        .unwrap();
+        ns.set_pep(deny_all_pep());
+
+        assert!(matches!(
+            ns.resolve_targets("/public/f", &Subject::new("unverified")),
+            Err(NamespaceError::Denied(
+                NamespaceAction::ResolveHandle,
+                _
+            ))
+        ));
+    }
+
+    /// A subject whose clearance dominates the object label is permitted a
+    /// read; an unenrolled subject is denied (fail-closed clearance, #698).
+    #[tokio::test]
+    async fn armed_pep_permits_cleared_read_denies_uncleared() {
+        let mut ns = Namespace::new();
+        ns.mount("/public", Arc::new(MemMount::new(vec![("f", b"data")])) as MountTarget)
+            .unwrap();
+        let pep = Arc::new(NamespacePep::new(
+            Arc::new(OneSubject { name: "alice", ctx: sec_ctx(Level::Public) }),
+            Arc::new(PublicOnlyResolver),
+            Arc::new(ReadFloorDecider),
+        ));
+        ns.set_pep(pep);
+
+        // alice (Public clearance) reading /public/f ⇒ permit.
+        assert_eq!(
+            ns.cat("/public/f", &Subject::new("alice")).await.unwrap(),
+            b"data"
+        );
+        // mallory is unenrolled ⇒ clearance unprovable ⇒ deny.
+        let err = ns.cat("/public/f", &Subject::new("mallory")).await.unwrap_err();
+        assert!(matches!(err, NamespaceError::Denied(NamespaceAction::Read, _)));
+    }
+
+    /// Write-class ops deny under the read-floor decider (write-direction
+    /// pause) even for a cleared subject — the PEP mediates writes too.
+    #[tokio::test]
+    async fn armed_pep_denies_writes_under_read_floor_decider() {
+        let mut ns = Namespace::new();
+        ns.mount("/public", Arc::new(MemMount::new(vec![("ctl", b"")])) as MountTarget)
+            .unwrap();
+        let pep = Arc::new(NamespacePep::new(
+            Arc::new(OneSubject { name: "alice", ctx: sec_ctx(Level::Secret) }),
+            Arc::new(PublicOnlyResolver),
+            Arc::new(ReadFloorDecider),
+        ));
+        ns.set_pep(pep);
+
+        let err = ns.echo("/public/ctl", b"x", &Subject::new("alice")).await.unwrap_err();
+        assert!(matches!(err, NamespaceError::Denied(NamespaceAction::Write, _)));
+    }
+
+    /// An unlabeled object (no carrier resolves it) denies even for a cleared
+    /// subject — the "no unlabeled-default-allow" invariant (design §1.2).
+    #[tokio::test]
+    async fn armed_pep_denies_unlabeled_object() {
+        let mut ns = Namespace::new();
+        // /secret has no label carrier ⇒ PublicOnlyResolver returns None.
+        ns.mount("/secret", Arc::new(MemMount::new(vec![("f", b"x")])) as MountTarget)
+            .unwrap();
+        let pep = Arc::new(NamespacePep::new(
+            Arc::new(OneSubject { name: "alice", ctx: sec_ctx(Level::Secret) }),
+            Arc::new(PublicOnlyResolver),
+            Arc::new(ReadFloorDecider),
+        ));
+        ns.set_pep(pep);
+
+        let err = ns.cat("/secret/f", &Subject::new("alice")).await.unwrap_err();
+        assert!(matches!(err, NamespaceError::Denied(NamespaceAction::Read, _)));
+    }
+
+    /// Subject-less mount/unmount deny once the PEP is armed; the `_as`
+    /// variants mediate. (Read-floor decider denies mount-class, so even `_as`
+    /// denies here — the point is the mediation runs, not the policy outcome.)
+    #[tokio::test]
+    async fn armed_pep_blocks_subjectless_mutation() {
+        let mut ns = Namespace::new();
+        ns.set_pep(deny_all_pep());
+
+        // Subject-less construction path denies on an armed namespace.
+        let err = ns
+            .mount("/x", Arc::new(MemMount::new(vec![])) as MountTarget)
+            .unwrap_err();
+        assert!(matches!(err, NamespaceError::Denied(NamespaceAction::BindMount, _)));
+
+        let err = ns.unmount("/x").unwrap_err();
+        assert!(matches!(err, NamespaceError::Denied(NamespaceAction::Unmount, _)));
+
+        // The mediated `_as` path consults the PEP (deny-all ⇒ denied).
+        let err = ns
+            .mount_as("/x", Arc::new(MemMount::new(vec![])) as MountTarget, &Subject::new("a"))
+            .unwrap_err();
+        assert!(matches!(err, NamespaceError::Denied(NamespaceAction::Mount, _)));
+    }
+
+    /// `fork` inherits the armed PEP — a sandboxed child cannot escape the
+    /// reference monitor by forking.
+    #[tokio::test]
+    async fn fork_inherits_pep() {
+        let mut ns = Namespace::new();
+        ns.mount("/public", Arc::new(MemMount::new(vec![("f", b"data")])) as MountTarget)
+            .unwrap();
+        ns.set_pep(deny_all_pep());
+
+        let child = ns.fork();
+        assert!(child.pep_armed());
+        let err = child.cat("/public/f", &Subject::new("anyone")).await.unwrap_err();
+        assert!(matches!(err, NamespaceError::Denied(NamespaceAction::Read, _)));
     }
 }
