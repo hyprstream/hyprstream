@@ -160,7 +160,7 @@ impl HttpWellKnownCapsuleSource {
             .strip_suffix("did.json")
             .ok_or_else(|| anyhow::anyhow!("derived did:web URL does not end in did.json"))?;
         let url = format!("{prefix}deployment/registry-service.jwt");
-        let response = self
+        let mut response = self
             .http
             .get(&url)
             .send()
@@ -174,15 +174,19 @@ impl HttpWellKnownCapsuleSource {
                 "registry deployment credential exceeds {MAX_CREDENTIAL_BYTES}-byte limit"
             );
         }
-        let bytes = response
-            .bytes()
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
             .await
-            .context("failed to read registry deployment credential body")?;
-        anyhow::ensure!(
-            bytes.len() <= MAX_CREDENTIAL_BYTES,
-            "registry deployment credential exceeds {MAX_CREDENTIAL_BYTES}-byte limit"
-        );
-        String::from_utf8(bytes.to_vec()).context("registry deployment credential is not UTF-8")
+            .context("failed to read registry deployment credential body")?
+        {
+            anyhow::ensure!(
+                bytes.len().saturating_add(chunk.len()) <= MAX_CREDENTIAL_BYTES,
+                "registry deployment credential exceeds {MAX_CREDENTIAL_BYTES}-byte limit"
+            );
+            bytes.extend_from_slice(&chunk);
+        }
+        String::from_utf8(bytes).context("registry deployment credential is not UTF-8")
     }
 
     fn capsule_url(&self, did: &str) -> Result<String> {
@@ -590,12 +594,14 @@ mod tests {
         let anchors = DidAnchors {
             cluster_at9p_did: at9p.clone(),
             cluster_did_web: web.to_owned(),
+            extra_root_cert_pem: None,
         };
 
         let honest = verify_did_anchored_document(
             &anchors,
             &document_with_ca_and_reach(web, Some(&at9p), [0x07; 32], [0x45; 32]),
             Arc::new(FixedCapsuleSource(bytes.clone())),
+            "unused-test-credential".to_owned(),
         )
         .await
         .unwrap();
@@ -603,6 +609,7 @@ mod tests {
             &anchors,
             &document_with_ca_and_reach(web, Some(&at9p), [0x66; 32], [0xEE; 32]),
             Arc::new(FixedCapsuleSource(bytes)),
+            "unused-test-credential".to_owned(),
         )
         .await
         .unwrap();
@@ -623,11 +630,13 @@ mod tests {
         let anchors = DidAnchors {
             cluster_at9p_did: at9p.clone(),
             cluster_did_web: web.to_owned(),
+            extra_root_cert_pem: None,
         };
         let error = verify_did_anchored_document(
             &anchors,
             &document(web, Some(&at9p)),
             Arc::new(FixedCapsuleSource(bytes)),
+            "unused-test-credential".to_owned(),
         )
         .await
         .err()
@@ -649,12 +658,14 @@ mod tests {
         let anchors = DidAnchors {
             cluster_at9p_did: at9p.clone(),
             cluster_did_web: web.to_owned(),
+            extra_root_cert_pem: None,
         };
 
         let trust = verify_did_anchored_document(
             &anchors,
             &document(web, Some(&at9p)),
             Arc::new(FixedCapsuleSource(bytes)),
+            "unused-test-credential".to_owned(),
         )
         .await
         .unwrap();
