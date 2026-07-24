@@ -48,6 +48,7 @@ async fn main() -> anyhow::Result<()> {
         mount,
         subject,
         Arc::new(hyprstream_9p::DenyAllDecider),
+        None,
         &path,
     )
     .await

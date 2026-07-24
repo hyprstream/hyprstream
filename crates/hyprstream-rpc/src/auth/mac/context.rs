@@ -132,6 +132,14 @@ impl SecurityContext {
         self.clearance.can_access(object_label)
     }
 
+    /// `object ⊒ self` — Bell–LaPadula *-property (no-write-down): may this
+    /// subject **write** to the object? Write-direction IFC floor (#1269).
+    /// Forward to [`SecurityLabel::can_write_to`].
+    #[must_use]
+    pub fn can_write_to(&self, object_label: &SecurityLabel) -> bool {
+        self.clearance.can_write_to(object_label)
+    }
+
     pub fn level(&self) -> Level {
         self.clearance.level
     }

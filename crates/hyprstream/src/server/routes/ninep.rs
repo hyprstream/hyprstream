@@ -283,13 +283,18 @@ pub async fn ninep_ws(
         };
 
     let mount = build_export_mount(&state, &subject);
+    // #1269: install the full ReferenceMonitor — the anonymous_floor() fallback
+    // is unreachable from this production constructor. Fail-closed until #698
+    // wires clearance issuance and the S6 token path mints a sender-bound token.
+    let monitor = crate::mac::enrollment_ninep_reference_monitor(Arc::clone(
+        &state.ninep_decider,
+    ));
     // `from_mount` wraps the Subject-scoped mount in a `MountBackend` and threads
     // `subject` onto every backend op — the same seam UDS/vsock use.
-    let translator = Arc::new(Translator::from_mount(
-        mount,
-        subject,
-        Arc::clone(&state.ninep_decider),
-    ));
+    let translator = Arc::new(
+        Translator::from_mount(mount, subject, Arc::clone(&state.ninep_decider))
+            .with_reference_monitor(monitor),
+    );
 
     // No subprotocol negotiation: stock wanix connects with none.
     ws.on_upgrade(move |socket| serve_9p_websocket(socket, translator, PING_INTERVAL))
@@ -568,11 +573,21 @@ impl NinePWtHandler for NinePWtExport {
         let authorizer: Arc<dyn AttachAuthorizer> = Arc::new(TicketAttachAuthorizer {
             state: self.state.clone(),
         });
-        let translator = Arc::new(Translator::from_mount_authorized(
-            mount,
-            authorizer,
-            Arc::clone(&self.state.ninep_decider),
+        // #1269: install the full ReferenceMonitor (fail-closed until #698 +
+        // S6). The `from_mount_authorized` seam binds the Subject at Tattach
+        // from the ticket; the MAC monitor independently derives the session
+        // context for the token/IFC gates.
+        let monitor = crate::mac::enrollment_ninep_reference_monitor(Arc::clone(
+            &self.state.ninep_decider,
         ));
+        let translator = Arc::new(
+            Translator::from_mount_authorized(
+                mount,
+                authorizer,
+                Arc::clone(&self.state.ninep_decider),
+            )
+            .with_reference_monitor(monitor),
+        );
         if let Err(e) = translator.serve_connection(stream).await {
             debug!(error = %e, "9P WT serve loop ended with error");
         }

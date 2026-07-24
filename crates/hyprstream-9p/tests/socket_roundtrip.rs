@@ -48,7 +48,7 @@ async fn socket_client_mount_round_trips_against_translator() {
         let sock = sock.clone();
         async move {
             // Returns only on listener error / shutdown; we abort it at the end.
-            let _ = serve_mount_uds(mount, subject, Arc::new(TestDecider), sock).await;
+            let _ = serve_mount_uds(mount, subject, Arc::new(TestDecider), None, sock).await;
         }
     });
 

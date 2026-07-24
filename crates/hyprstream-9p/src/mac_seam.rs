@@ -21,20 +21,22 @@
 //!
 //! ## Not active by default
 //!
-//! This is the S2 machinery, not S2 activation. [`Translator`](crate::Translator)
-//! runs **without** a [`ReferenceMonitor`] unless the application installs one
-//! via `with_reference_monitor`, and no production construction installs one
-//! today — per-op behavior is then exactly what it was before this module
-//! existed. Activation is blocked on:
+//! This is the S2 machinery. [`Translator`](crate::Translator) runs **without**
+//! a [`ReferenceMonitor`] unless the application installs one via
+//! `with_reference_monitor`. Production constructors install the monitor
+//! structurally (the PEP is wired at every 9P constructor), but **clearance
+//! issuance and the S6 sender-bound token are not yet wired** — so every
+//! session resolves to fail-closed denial at the token gate until:
 //!
-//! - **#698** — no production token-issuance path attaches `Claims.clearance`
-//!   yet, so a live monitor would resolve every subject to deny; and
-//! - **object labels for the served mount** — the genesis/manifest resolver
-//!   (`hyprstream::mac::genesis::CompositeObjectLabelResolver`) exists but is
-//!   not yet wired to the 9P export.
+//! - **#698** — the production token-issuance path attaches `Claims.clearance`,
+//!   letting the monitor resolve a permitting subject context; and
+//! - **the S6 grant path** mints a sender-bound token at `Tattach` so the token
+//!   gate passes for authorized operations.
 //!
-//! Do not wire a monitor into the production serve paths from this crate; that
-//! wiring lands with the activation change, after #698.
+//! Until both land, the installed monitor is the correct fail-closed shape:
+//! every operation denies. There is no permissive default. The
+//! `anonymous_floor()` fallback is **not reachable from production
+//! constructors** — only tests construct a monitor-less translator.
 //!
 //! ## Mediation is over the *name*, not the *object* (read before relying on it)
 //!
@@ -200,6 +202,30 @@ impl SessionContext {
             attach_identity,
             security_context,
             token: Some(token),
+        }
+    }
+
+    /// A session with a verified clearance but **no sender-bound token**.
+    ///
+    /// Every op denies at the token gate ([`Self::token_authorizes`] returns
+    /// `false` when `token` is `None`). This is the **fail-closed structural**
+    /// constructor for the #698 / S6 token path that is not yet wired: the
+    /// monitor is installed, clearance derivation is real (or fail-closed via
+    /// the clearance source), but no capability token has been minted yet, so
+    /// the session cannot authorize any operation. There is no permissive
+    /// default.
+    ///
+    /// Once the S6 grant path issues a sender-bound token at `Tattach`, the
+    /// production authenticator will construct via
+    /// [`from_verified_token`](Self::from_verified_token) instead.
+    pub fn from_verified_clearance(
+        attach_identity: VerifiedAttachIdentity,
+        security_context: SecurityContext,
+    ) -> Self {
+        Self {
+            attach_identity,
+            security_context,
+            token: None,
         }
     }
 
@@ -389,7 +415,15 @@ impl ReferenceMonitor {
         }
 
         // IFC dominance is independent of the token and the policy matrix.
-        if !session.security_context().can_access(&object_label) {
+        // Write operations use the *-property (no-write-down); reads use the
+        // simple-security rule (no-read-up). The assurance axis is a crypto
+        // floor in both directions and does not flip.
+        let ifc_ok = if action == Action::Write {
+            session.security_context().can_write_to(&object_label)
+        } else {
+            session.security_context().can_access(&object_label)
+        };
+        if !ifc_ok {
             return false;
         }
 
@@ -520,5 +554,43 @@ mod tests {
     fn deny_unlabeled_resolver_resolves_nothing() {
         let resolver = DenyUnlabeledResolver;
         assert!(resolver.resolve(ObjectRef::Path(&["anything"])).is_none());
+    }
+
+    #[test]
+    fn authorize_write_uses_no_write_down_ifc() {
+        // A Secret subject with a write-capable token may write to a Secret
+        // object but NOT to a Public one (no-write-down / *-property).
+        let secret_obj = label(Level::Secret);
+        let public_obj = label(Level::Public);
+        let mon = monitor(Some(secret_obj), Arc::new(AllowAll));
+        let session = SessionContext::from_verified_token(
+            VerifiedAttachIdentity::from_verified_identity("writer"),
+            ctx(Level::Secret),
+            VerifiedTokenScope::from_verified_token(
+                label(Level::Secret),
+                Arc::from([Action::Read, Action::Write]),
+                Instant::now() + Duration::from_secs(3600),
+            ),
+        );
+        // Write to Secret object: allowed (same level, all gates pass).
+        assert!(mon.authorize(&session, &path(&["secret"]), Action::Write));
+
+        // Now test write-down: relabel to Public. A Secret writer must not write
+        // to a Public object.
+        let mon_down = monitor(Some(public_obj), Arc::new(AllowAll));
+        assert!(!mon_down.authorize(&session, &path(&["public"]), Action::Write));
+    }
+
+    #[test]
+    fn from_verified_clearance_session_denies_at_token_gate() {
+        // A clearance-only session (no S6 token) denies every op, even with a
+        // permissive decider and a Public object. Fail-closed structural shape.
+        let mon = monitor(Some(label(Level::Public)), Arc::new(AllowAll));
+        let session = SessionContext::from_verified_clearance(
+            VerifiedAttachIdentity::from_verified_identity("stub"),
+            ctx(Level::Secret),
+        );
+        assert!(!mon.authorize(&session, &path(&["public"]), Action::Read));
+        assert!(!mon.authorize(&session, &path(&["public"]), Action::Write));
     }
 }

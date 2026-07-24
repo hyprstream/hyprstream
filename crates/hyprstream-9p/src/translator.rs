@@ -669,13 +669,16 @@ pub async fn serve_mount_uds(
     mount: Arc<dyn Mount>,
     subject: Subject,
     decider: Arc<dyn AccessDecider>,
+    monitor: Option<Arc<crate::mac_seam::ReferenceMonitor>>,
     path: impl AsRef<Path>,
 ) -> Result<()> {
     let listener = UnixListener::bind(path.as_ref())
         .with_context(|| format!("bind 9P UDS listener at {:?}", path.as_ref()))?;
-    Translator::from_mount(mount, subject, decider)
-        .serve_uds(listener)
-        .await
+    let mut t = Translator::from_mount(mount, subject, decider);
+    if let Some(monitor) = monitor {
+        t = t.with_reference_monitor(monitor);
+    }
+    t.serve_uds(listener).await
 }
 
 /// Bind a Cloud-Hypervisor **hybrid-vsock** host socket at `path` and serve
@@ -692,13 +695,16 @@ pub async fn serve_mount_vsock(
     mount: Arc<dyn Mount>,
     subject: Subject,
     decider: Arc<dyn AccessDecider>,
+    monitor: Option<Arc<crate::mac_seam::ReferenceMonitor>>,
     path: impl AsRef<Path>,
 ) -> Result<()> {
     let listener = UnixListener::bind(path.as_ref())
         .with_context(|| format!("bind 9P hybrid-vsock listener at {:?}", path.as_ref()))?;
-    Translator::from_mount(mount, subject, decider)
-        .serve_vsock(listener)
-        .await
+    let mut t = Translator::from_mount(mount, subject, decider);
+    if let Some(monitor) = monitor {
+        t = t.with_reference_monitor(monitor);
+    }
+    t.serve_vsock(listener).await
 }
 
 /// Bind a **raw** (no-handshake) hybrid-vsock **per-port** host socket at `path`
@@ -718,14 +724,17 @@ pub async fn serve_mount_vsock_raw(
     mount: Arc<dyn Mount>,
     subject: Subject,
     decider: Arc<dyn AccessDecider>,
+    monitor: Option<Arc<crate::mac_seam::ReferenceMonitor>>,
     path: impl AsRef<Path>,
 ) -> Result<()> {
     let listener = UnixListener::bind(path.as_ref()).with_context(|| {
         format!("bind 9P raw hybrid-vsock per-port listener at {:?}", path.as_ref())
     })?;
-    Translator::from_mount(mount, subject, decider)
-        .serve_vsock_raw(listener)
-        .await
+    let mut t = Translator::from_mount(mount, subject, decider);
+    if let Some(monitor) = monitor {
+        t = t.with_reference_monitor(monitor);
+    }
+    t.serve_vsock_raw(listener).await
 }
 
 /// Transport-agnostic accept surface, implemented for [`TcpListener`] and

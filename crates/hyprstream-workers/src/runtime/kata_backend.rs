@@ -270,6 +270,7 @@ pub struct KataBackend {
     image_config: ImageConfig,
     rafs_store: Arc<RafsStore>,
     ninep_decider: Arc<dyn hyprstream_9p::AccessDecider>,
+    ninep_monitor: Option<Arc<hyprstream_9p::ReferenceMonitor>>,
 }
 
 impl KataBackend {
@@ -277,11 +278,13 @@ impl KataBackend {
         image_config: ImageConfig,
         rafs_store: Arc<RafsStore>,
         ninep_decider: Arc<dyn hyprstream_9p::AccessDecider>,
+        ninep_monitor: Option<Arc<hyprstream_9p::ReferenceMonitor>>,
     ) -> Self {
         Self {
             image_config,
             rafs_store,
             ninep_decider,
+            ninep_monitor,
         }
     }
 
@@ -711,6 +714,7 @@ impl SandboxBackend for KataBackend {
                 tenant_mount,
                 subject,
                 Arc::clone(&self.ninep_decider),
+                self.ninep_monitor.clone(),
             )
             .await
             {
@@ -1225,6 +1229,7 @@ impl KataBackend {
         mount: Arc<dyn Mount>,
         subject: Subject,
         decider: Arc<dyn hyprstream_9p::AccessDecider>,
+        monitor: Option<Arc<hyprstream_9p::ReferenceMonitor>>,
     ) -> Result<Vfs9pVsockServer> {
         // The CH hybrid-vsock base UDS (`hvsock://<base>`), same source the
         // kata-agent client uses — keeps CH/Dragonball working without a branch.
@@ -1278,6 +1283,7 @@ impl KataBackend {
                 mount,
                 subject,
                 decider,
+                monitor,
                 &sock_for_task,
             )
             .await
@@ -1333,6 +1339,7 @@ inventory::submit! {
                 ctx.image_config.clone(),
                 Arc::clone(&ctx.rafs_store),
                 Arc::clone(&ctx.ninep_decider),
+                ctx.ninep_monitor.clone(),
             )) as Arc<dyn crate::runtime::SandboxBackend>)
         },
     }
@@ -1413,6 +1420,7 @@ mod tests {
             image_config,
             Arc::clone(&rafs_store),
             Arc::new(FixtureAccessDecider),
+            None,
         );
         (backend, rafs_store, temp_dir)
     }
