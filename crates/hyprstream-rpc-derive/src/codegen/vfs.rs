@@ -293,6 +293,10 @@ fn build_node_entries(
         let method_snake = r.method_snake.as_str();
         let scope = v.scope.as_str();
         let bulk = v.vfs_bulk;
+        // $vfsMac (#699 carrier (a)): schema-derived MAC label for this generated
+        // node. Empty string when the annotation is absent (→ unlabeled → deny →
+        // a genesis finding); decoded at runtime by `VfsNode::mac_label`.
+        let mac = v.vfs_mac.as_str();
 
         node_entries.push(quote! {
             hyprstream_rpc::metadata::VfsNode {
@@ -301,6 +305,7 @@ fn build_node_entries(
                 kind: #kind_tokens,
                 scope: #scope,
                 bulk: #bulk,
+                mac: #mac,
             }
         });
     }
@@ -396,6 +401,21 @@ pub fn generate_mount(service_name: &str, resolved: &ResolvedSchema) -> TokenStr
                 #(#node_entries,)*
             ];
             (#service_name, NODES)
+        }
+
+        // #699 carrier (a) inventory: register this table so the genesis
+        // coverage gate can walk every reachable generated node (annotated or
+        // not) at startup. Submitted at module scope via the `inventory`
+        // re-export on `hyprstream_rpc::metadata` (wasm-safe; same pattern as
+        // `ScopeDefinition`), so consumer crates need not declare an `inventory`
+        // dep directly. The gate iterates this to build the startup activation
+        // gate; a node missing a `$vfsMac` surfaces as a finding (unlabeled ⇒
+        // deny) rather than being silently absent.
+        hyprstream_rpc::metadata::inventory::submit! {
+            hyprstream_rpc::metadata::VfsNodeTable {
+                name: #service_name,
+                nodes_fn: vfs_nodes,
+            }
         }
 
         #(#scoped_tables)*
@@ -504,6 +524,7 @@ mod tests {
             vfs_kind: "bogus".into(),
             vfs_bulk: false,
             vfs_hidden: false,
+            vfs_mac: String::new(),
         };
         let err = resolve_kind(&v, &CapnpType::Struct("CloneRequest".into()), false).unwrap_err();
         assert!(err.contains("bogus"));
@@ -525,6 +546,7 @@ mod tests {
             vfs_kind: "query".into(),
             vfs_bulk: false,
             vfs_hidden: false,
+            vfs_mac: String::new(),
         };
         let k = resolve_kind(&v, &CapnpType::Text, false).expect("valid kind");
         assert_eq!(k, NodeKind::Query);
@@ -547,6 +569,7 @@ mod tests {
             vfs_kind: String::new(),
             vfs_bulk: false,
             vfs_hidden: false,
+            vfs_mac: String::new(),
         }
     }
 
@@ -618,6 +641,40 @@ mod tests {
 
         assert!(out.contains("compile_error"), "emits compile_error: {out}");
         assert!(out.contains("clone"), "names the offending method: {out}");
+    }
+
+    #[test]
+    fn vfs_mac_annotation_flows_onto_emitted_node() {
+        // Carrier (a) (#699): a `$vfsMac`-annotated method projects a node whose
+        // `mac` field carries the annotation text verbatim — the label is a
+        // property of the node's type, derived at generation.
+        let mut health = variant("healthCheck", "Void", "query");
+        health.vfs_mac = "internal:pq-hybrid".into();
+        let mut clone = variant("clone", "CloneRequest", "write");
+        clone.vfs_mac = "secret:pq-hybrid:0".into();
+        // A node with NO `$vfsMac` carries the empty string (→ unlabeled → deny).
+        let list = variant("list", "Void", "query");
+        let schema = schema_with(
+            vec![health, clone, list],
+            vec![empty_struct("CloneRequest")],
+        );
+        let resolved = ResolvedSchema::from(&schema);
+        let out = generate_mount("registry", &resolved).to_string();
+
+        // Annotated labels land verbatim on their nodes.
+        assert!(
+            out.contains("mac : \"internal:pq-hybrid\""),
+            "health node carries its $vfsMac label: {out}"
+        );
+        assert!(
+            out.contains("mac : \"secret:pq-hybrid:0\""),
+            "clone node carries its $vfsMac label: {out}"
+        );
+        // An unannotated node carries the empty string — never a guessed label.
+        assert!(
+            out.contains("mac : \"\""),
+            "an unannotated node is emitted unlabeled (empty mac): {out}"
+        );
     }
 
     #[test]

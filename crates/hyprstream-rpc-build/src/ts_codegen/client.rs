@@ -493,6 +493,7 @@ mod browser_binding_tests {
             vfs_kind: String::new(),
             vfs_bulk: false,
             vfs_hidden: false,
+            vfs_mac: String::new(),
         }
     }
 

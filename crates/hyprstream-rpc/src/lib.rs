@@ -130,6 +130,13 @@ pub mod zmtp_framing;
 
 /// Schema introspection metadata types — used by proc macro codegen on all targets.
 pub mod metadata {
+    /// Re-export of the `inventory` crate so generated code (`generate_rpc_service!`)
+    /// can submit `VfsNodeTable` entries without forcing every consumer crate to
+    /// declare an `inventory` dependency — `hyprstream_rpc::metadata::inventory`
+    /// resolves wherever `hyprstream-rpc` is a dependency (same pattern the crate
+    /// already uses internally for `ScopeDefinition`).
+    pub use inventory;
+
     pub use crate::_metadata::*;
 }
 mod _metadata;

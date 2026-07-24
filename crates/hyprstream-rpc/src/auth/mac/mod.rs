@@ -102,12 +102,14 @@
 //!    fail-closed, which is correct. No type change needed when #153 lands —
 //!    it's a new compartment/level value, not a new axis.
 
+pub mod bind;
 pub mod context;
 pub mod genesis;
 pub mod label;
 pub mod lattice;
 pub mod manifest;
 
+pub use bind::{clamp_descendant, BindLabel, BindLabelMap};
 pub use context::{SecurityContext, SubjectContextClaims, VerifiedKeyMaterial};
 pub use genesis::{GenesisMap, GenesisReport};
 pub use label::{

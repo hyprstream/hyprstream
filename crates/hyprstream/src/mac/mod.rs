@@ -107,8 +107,8 @@ pub use compiler::{
 };
 // S1 activation (#567): production genesis content/enumerator/resolver/gate.
 pub use genesis::{
-    floor_label, genesis_lattice, CompositeObjectLabelResolver, GenesisGate, ManifestLabelSource,
-    NamespaceEnumerator, NoManifests, SitePolicy,
+    floor_label, genesis_lattice, CompositeObjectLabelResolver, GeneratedNodeCoverage,
+    GenesisGate, ManifestLabelSource, NamespaceEnumerator, NoManifests, SitePolicy,
 };
 pub use pep::{production_ninep_decider, NinePAccessDecider};
 // S4 (#570): the boot path that installs the verified `CompiledPolicy` at daemon
