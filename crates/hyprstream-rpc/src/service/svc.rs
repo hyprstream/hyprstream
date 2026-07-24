@@ -275,6 +275,37 @@ impl EnvelopeContext {
         Ok(())
     }
 
+    /// Construct a test context with specific `cnf` and optional clearance
+    /// claims. **Test-only** — production code uses `from_verified` /
+    /// `from_verified_as_system`.
+    #[cfg(test)]
+    pub(crate) fn for_mac_test(
+        cnf: [u8; 32],
+        clearance: Option<crate::auth::mac::SecurityLabel>,
+    ) -> Self {
+        let claims = clearance.map(|c| {
+            crate::auth::Claims::new("test".to_owned(), 0, 1_000_000_000).with_clearance(c)
+        });
+        Self {
+            request_id: 1,
+            claims,
+            verified_tenant: Some("local".to_owned()),
+            jwt_token: None,
+            key_derived_subject: crate::envelope::Subject::anonymous(),
+            jwt_subject: None,
+            cnf,
+            envelope_wit_hash: None,
+            client_dh_public: None,
+            client_kem_public: None,
+            request_iat: 0,
+            request_nonce: [0; 16],
+            response_kem_recipient: None,
+            service_domain: None,
+            browser_method_discriminator: None,
+            is_local_caller: false,
+        }
+    }
+
     /// Get the cryptographically-verified authorization subject.
     ///
     /// Resolution order:
