@@ -713,7 +713,12 @@ pub async fn exchange_ucan_grant(
         requested_scope: requested_scope.map(str::to_owned),
         audience: audience.map(str::to_owned),
     };
-    mint_grant_token(state, &granted, &dpop_jkt, Some(grant_refresh), principals).await
+    // #698 issuer path: thread the resolved clearance into the mint so the
+    // token carries it for downstream PEP enforcement. `subject_ctx` is the
+    // met context from resolve_grant_subject — its clearance is the
+    // authority-assigned label the enrollment table holds for this subject.
+    let subject_clearance = subject_ctx.map(|c| *c.clearance());
+    mint_grant_token(state, &granted, &dpop_jkt, Some(grant_refresh), principals, subject_clearance).await
 }
 
 /// Re-evaluate a UCAN grant on refresh and re-mint (MAC #547 / B1 #673).
@@ -849,7 +854,10 @@ pub(crate) async fn exchange_ucan_grant_refresh(
     };
 
     // Re-mint + rotate, re-persisting the grant context for the next refresh.
-    mint_grant_token(state, &granted, &dpop_jkt, Some(ucan_grant.clone()), principals).await
+    // #698: same clearance threading as mint — refresh must not be more
+    // permissive (B1/#673).
+    let subject_clearance = subject_ctx.map(|c| *c.clearance());
+    mint_grant_token(state, &granted, &dpop_jkt, Some(ucan_grant.clone()), principals, subject_clearance).await
 }
 
 /// Map an S6 [`GrantError`] to a concrete OAuth 2.1 error response. Every variant
@@ -933,6 +941,12 @@ async fn mint_grant_token(
     dpop_jkt: &str,
     grant_refresh: Option<super::state::UcanGrantRefresh>,
     principals: TokenPrincipals,
+    // #698 issuer path: the clearance the enrollment resolver derived for
+    // this subject, stamped on the minted token so downstream PEP lanes
+    // (#1268/#1269) can enforce MAC without re-resolving from the enrollment
+    // table. `None` (unenrolled/unverified) ⇒ no clearance claim ⇒ the
+    // downstream `ClaimsSubjectContextResolver` denies (fail-closed).
+    subject_clearance: Option<hyprstream_rpc::auth::mac::SecurityLabel>,
 ) -> Response {
     let now = chrono::Utc::now().timestamp();
     let ttl = state
@@ -980,6 +994,17 @@ async fn mint_grant_token(
     if let Some(actor) = principals.act {
         claims = claims.with_act(actor);
     }
+    // #698 issuer path: stamp the authority-resolved clearance on the minted
+    // token. This is the wire that was missing — the enrollment resolver
+    // resolved DID→clearance for the S6 gate, then threw it away. Now the
+    // minted JWT carries it under the hybrid signature, so a downstream PEP
+    // (ClaimsSubjectContextResolver, #1268/#1269) reads it from verified
+    // Claims without re-resolving from the enrollment table. `None`
+    // (unenrolled) ⇒ no claim ⇒ downstream deny (fail-closed).
+    if let Some(clearance) = subject_clearance {
+        claims = claims.with_clearance(clearance);
+    }
+
     // DPoP sender-binding via cnf.jkt (RFC 9449 §6). ZSP: no cnf ⇒ bearer ⇒
     // rejected. We set jkt directly from the verified proof.
     claims.cnf = Some(hyprstream_rpc::auth::Cnf {
@@ -1152,6 +1177,8 @@ mod tests {
                 sub: "did:web:accounts.example:users:alice".to_owned(),
                 act: None,
             },
+            // No clearance — this test checks the path-form freeze, not MAC.
+            None,
         ).await;
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
@@ -1255,6 +1282,155 @@ mod tests {
     fn deny_unlabeled_resolver_always_denies() {
         let r = DenyUnlabeledResolver;
         assert!(r.resolve("did:key:anything").is_none());
+    }
+
+    // ── #698: issuer path — enrollment → Claims.clearance → PEP resolver ────
+    //
+    // These tests prove the issuer path contract: the clearance the
+    // enrollment resolver derives gets stamped on Claims (via
+    // `with_clearance`, as `mint_grant_token` now does) and is readable by
+    // the downstream `ClaimsSubjectContextResolver` the #1268/#1269 PEP lanes
+    // consume. They exercise the real types end-to-end without the JWT signing
+    // infrastructure (which is orthogonal — the Claims construction is what
+    // carries the clearance, and it happens before signing).
+
+    use crate::mac::{
+        CompiledPolicy, EnrollmentSubjectContextResolver, TeMatrix,
+    };
+    use hyprstream_rpc::auth::mac::{Lattice as LatticeType, LatticeVersion};
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+
+    /// Build a compiled policy with one enrolled DID at the given clearance.
+    fn policy_with_enrollment(
+        did: &str,
+        clearance: SecurityLabel,
+    ) -> Arc<CompiledPolicy> {
+        let lattice = LatticeType::new(LatticeVersion(1), []);
+        let policy = CompiledPolicy::new(TeMatrix::default(), &lattice)
+            .with_enrollment(BTreeMap::from([(did.to_owned(), clearance)]));
+        Arc::new(policy)
+    }
+
+    /// **Issuer path round-trip (happy path):** an enrolled DID resolves to a
+    /// clearance via `EnrollmentSubjectContextResolver`, the issuer stamps it
+    /// on Claims (exactly as `mint_grant_token` now does via `with_clearance`),
+    /// and the downstream `ClaimsSubjectContextResolver` reads it back with the
+    /// correct level and compartments. This is the full provenance chain the PEP
+    /// lanes depend on.
+    #[test]
+    fn issuer_path_stamps_clearance_readable_by_pep_resolver() {
+        let did = "did:key:z6MkpTHR8VNsBxYAAHWutMGeQ4hz2FV6B14xd9CZpkmS5i5o";
+        let enrolled =
+            SecurityLabel::new(Level::Secret, Assurance::PqHybrid, comps(&[0, 1]));
+
+        // Step 1: enrollment resolver derives the clearance (what the grant
+        // path does via `exchange_enrollment_resolver()`).
+        let resolver = EnrollmentSubjectContextResolver::new(policy_with_enrollment(did, enrolled));
+        let ctx = resolver
+            .resolve(did)
+            .expect("enrolled DID must resolve to a SecurityContext");
+        let clearance = *ctx.clearance();
+
+        // Step 2: issuer stamps it on Claims (what `mint_grant_token` now does
+        // via `claims.with_clearance(clearance)`).
+        let claims =
+            hyprstream_rpc::auth::Claims::new(did.to_owned(), 1, 9999).with_clearance(clearance);
+
+        // Step 3: downstream PEP resolver reads it back from verified Claims.
+        let pep_resolver =
+            ClaimsSubjectContextResolver::new(did, claims, VerifiedKeyMaterial::Classical);
+        let pep_ctx = pep_resolver
+            .resolve(did)
+            .expect("PEP resolver must read the stamped clearance");
+
+        // The level + compartments survive the round-trip.
+        assert_eq!(pep_ctx.level(), Level::Secret);
+        assert_eq!(pep_ctx.compartments(), comps(&[0, 1]));
+        // Decision D: assurance is Classical (the resolver floored it).
+        assert_eq!(pep_ctx.assurance(), Assurance::Classical);
+    }
+
+    /// **Issuer path fail-closed:** an unenrolled DID resolves to `None` at the
+    /// enrollment resolver, so the issuer passes `None` to `mint_grant_token`,
+    /// so no clearance is stamped on Claims, so the downstream PEP resolver
+    /// returns `None` → deny. This is the fail-closed chain the whole MAC model
+    /// depends on.
+    #[test]
+    fn issuer_path_unenrolled_did_produces_no_clearance_pep_denies() {
+        let enrolled_did = "did:key:z6MkpTHR8VNsBxYAAHWutMGeQ4hz2FV6B14xd9CZpkmS5i5o";
+        let stranger = "did:key:z6MkmFpYUWaBjIA4ZJarQtz5FaGGCLpJ4xjXQqRuV4Dx4q6P";
+        let clearance =
+            SecurityLabel::new(Level::Secret, Assurance::Classical, CompartmentSet::EMPTY);
+
+        // The enrollment table only knows `enrolled_did`.
+        let resolver =
+            EnrollmentSubjectContextResolver::new(policy_with_enrollment(enrolled_did, clearance));
+
+        // The stranger is NOT enrolled → None (fail-closed at the resolver).
+        assert!(
+            resolver.resolve(stranger).is_none(),
+            "unenrolled DID must not resolve to a clearance"
+        );
+
+        // The issuer has no clearance to stamp (None) → Claims carry no clearance.
+        let claims = hyprstream_rpc::auth::Claims::new(stranger.to_owned(), 1, 9999);
+        assert!(
+            claims.clearance.is_none(),
+            "no clearance stamped for an unenrolled subject"
+        );
+
+        // The downstream PEP resolver denies.
+        let pep_resolver =
+            ClaimsSubjectContextResolver::new(stranger, claims, VerifiedKeyMaterial::PqHybrid);
+        assert!(
+            pep_resolver.resolve(stranger).is_none(),
+            "PEP resolver MUST deny a subject with no stamped clearance"
+        );
+    }
+
+    /// **Delegated grant — met clearance is what gets stamped:** for a delegated
+    /// grant, `resolve_grant_subject` takes `meet(delegator, actor)`. The
+    /// clearance stamped on the minted token is the MET clearance (the
+    /// effective one), not the delegator's higher one — so the downstream PEP
+    /// sees the least-privilege label.
+    #[test]
+    fn issuer_path_stamps_met_clearance_not_delegator_higher() {
+        let mcp_did = "did:key:zMcp".to_owned();
+
+        // Delegator: Secret / {0,1}. Actor: Confidential / {1}.
+        // meet = Confidential / {1}.
+        let user_clearance =
+            SecurityLabel::new(Level::Secret, Assurance::Classical, comps(&[0, 1]));
+        let mcp_clearance =
+            SecurityLabel::new(Level::Confidential, Assurance::Classical, comps(&[1]));
+
+        // Both enrolled in their own resolver (simulating two enrollment entries).
+        let user_ctx = SecurityContext::from_clearance(user_clearance, VerifiedKeyMaterial::Classical);
+        let mcp_ctx = SecurityContext::from_clearance(mcp_clearance, VerifiedKeyMaterial::Classical);
+        let met = SecurityContext::delegated(Some(&user_ctx), Some(&mcp_ctx))
+            .expect("both principals resolved");
+
+        // The issuer stamps the MET clearance (what `exchange_ucan_grant`
+        // passes as `subject_ctx.clearance()` to `mint_grant_token`).
+        let stamped = *met.clearance();
+        let claims =
+            hyprstream_rpc::auth::Claims::new(mcp_did.clone(), 1, 9999).with_clearance(stamped);
+
+        // The PEP resolver reads it back.
+        let pep_resolver =
+            ClaimsSubjectContextResolver::new(&mcp_did, claims, VerifiedKeyMaterial::Classical);
+        let pep_ctx = pep_resolver
+            .resolve(&mcp_did)
+            .expect("met clearance resolves");
+
+        // It's the meet (Confidential / {1}), NOT the delegator's Secret / {0,1}.
+        assert_eq!(pep_ctx.level(), Level::Confidential, "met level, not delegator's");
+        assert_eq!(
+            pep_ctx.compartments(),
+            comps(&[1]),
+            "met compartments, not delegator's"
+        );
     }
 
     /// B1 (#673): a persisted refresh token from BEFORE this field existed (no
