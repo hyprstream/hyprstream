@@ -17,13 +17,19 @@ flagged it. This section is the contract.)
   SCOPE    : every `.rs` file under `crates/<crate>/src/` (each crate's direct
              source tree, *not* nested src dirs like `crates/foo/vendor/src`).
   EXCLUDED : files whose path contains a `/tests/`, `/examples/`, or
-             `/benches/` segment. We do **not** attempt to exclude
-             `#[cfg(test)]` blocks *inside* src files — that needs a real
-             parser and is not a quick CI grep (fable review, #1152). This is
-             a **file-level** lint, so cfg(test) mentions count toward a file's
-             total. The honest denominator is therefore "loopback mentions in
-             production source files", not "loopback mentions in non-test
-             code". That keeps the gate a plain text scan anyone can reproduce.
+             `/benches/` segment, AND `#[cfg(test)]`-gated items/blocks *inside*
+             src files. A lightweight, string/comment-aware brace-matching
+             skipper strips those regions before counting (see `strip_cfg_test`)
+             so a `{` inside a test string cannot desync the depth count, and
+             `#[cfg(not(test))]` is NOT stripped (it gates production code). The
+             denominator is therefore "loopback mentions in production (non-test)
+             source" — test-only literals no longer count.
+             HISTORY: this was originally a pure file-level scan that counted
+             cfg(test) mentions too (deliberately, to stay a trivial grep). That
+             produced perpetual false-positive "growth" every time a test using
+             `127.0.0.1:0`/`localhost` was added, and the gate went permanently
+             red on non-test noise. The skipper below fixes that while keeping
+             the production-loopback guard intact (#1152 follow-up).
   COUNTS   : one (1) per **line** matching the pattern, however many matches
              are on that line. Line-based (not occurrence-based) keeps the
              burn-down monotone under line reflow — splitting one match across
@@ -128,6 +134,94 @@ BASELINE_NAME = "loopback-baseline.txt"
 DRAMATIC_SHRINK_FRACTION = 0.5
 
 
+# --- cfg(test) exclusion -----------------------------------------------------
+# The gate counts loopback literals in PRODUCTION source only. Test code
+# legitimately uses `127.0.0.1:0` / `localhost` (ephemeral test listeners, URL
+# parsing assertions), and counting those made the gate grow a false positive
+# on every test addition. We strip `#[cfg(test)]`-gated items and blocks before
+# counting. This is a deliberately small brace-matching skipper, not a full
+# Rust parser: it is string/comment aware so a brace inside a test string cannot
+# desync the depth count, and it never strips `#[cfg(not(test))]` (production).
+
+_CFG_ATTR = re.compile(r"#\[\s*cfg\s*\((?P<pred>.*)\)\s*\]")
+
+
+def _is_cfg_test_attr(line: str) -> bool:
+    m = _CFG_ATTR.search(line)
+    if not m:
+        return False
+    pred = m.group("pred")
+    if re.search(r"\bnot\s*\(\s*test\b", pred):
+        return False  # #[cfg(not(test))] gates production code — keep it
+    return re.search(r"\btest\b", pred) is not None
+
+
+def _strip_strings_and_comments(line: str) -> str:
+    """Blank string/char literal contents and // comments so brace counting is
+    not fooled by braces inside them. Not a full lexer; adequate for depth
+    tracking within a test region."""
+    out: list[str] = []
+    i, n = 0, len(line)
+    in_str = False
+    quote = ""
+    while i < n:
+        c = line[i]
+        if in_str:
+            if c == "\\":
+                i += 2
+                continue
+            if c == quote:
+                in_str = False
+            i += 1
+            continue
+        if c == "/" and i + 1 < n and line[i + 1] == "/":
+            break
+        if c in ('"', "'"):
+            in_str = True
+            quote = c
+            i += 1
+            continue
+        out.append(c)
+        i += 1
+    return "".join(out)
+
+
+def strip_cfg_test(lines: list[str]) -> list[str]:
+    """Return `lines` with `#[cfg(test)]`-gated items/blocks removed.
+
+    Handles the common forms: `#[cfg(test)] mod tests { ... }`, `#[cfg(test)]
+    fn ... { ... }`, and non-block statements (`#[cfg(test)] use ...;`). Stacked
+    attributes above the gated item are skipped with it.
+    """
+    out: list[str] = []
+    i, n = 0, len(lines)
+    while i < n:
+        if _is_cfg_test_attr(lines[i]):
+            j = i + 1
+            while j < n and lines[j].lstrip().startswith("#["):
+                j += 1  # skip stacked attributes on the same item
+            if j >= n:
+                break
+            depth = 0
+            opened = False
+            k = j
+            while k < n:
+                code = _strip_strings_and_comments(lines[k])
+                depth += code.count("{") - code.count("}")
+                if "{" in code:
+                    opened = True
+                if opened and depth <= 0:
+                    break
+                if not opened and code.rstrip().endswith(";"):
+                    break  # non-block item (use/const/type) — single statement
+                k += 1
+            i = k + 1
+            continue
+        out.append(lines[i])
+        i += 1
+    return out
+
+
 def repo_root() -> str:
     here = os.path.dirname(os.path.abspath(__file__))
     return os.path.dirname(here)  # scripts/ -> repo root
@@ -183,7 +277,7 @@ def scan(root: str) -> tuple[dict[str, int], int]:
                     f"{exc}. A file dropping out of the count reads as "
                     f"shrinkage (#1145); failing closed instead of skipping."
                 ) from exc
-            n = sum(1 for ln in lines if PATTERN.search(ln))
+            n = sum(1 for ln in strip_cfg_test(lines) if PATTERN.search(ln))
             if n > 0:
                 totals[os.path.relpath(full, root)] = n
     return dict(sorted(totals.items())), src_files
