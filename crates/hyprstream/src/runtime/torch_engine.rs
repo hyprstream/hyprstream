@@ -342,7 +342,14 @@ impl TorchEngine {
     /// retrieves (or creates) the session's cache from the registry and
     /// installs it in the model via `set_kv_cache()`. Returns true if
     /// a session cache was swapped in.
-    pub fn swap_session_cache(&self) -> bool {
+    ///
+    /// `tenant_id` is the effective tenant whose delta contributed to this
+    /// request's weights (`None` when no tenant delta contributes). It is
+    /// registered against the owner cache *before* the cache is installed in the
+    /// model, so the cache is tracked for invalidation (and cleared if its
+    /// previously-computed KV is stale w.r.t. a different tenant) before
+    /// generation can read a single token from it.
+    pub fn swap_session_cache(&self, tenant_id: Option<String>) -> bool {
         let owner = match self.active_cache_owner.lock().clone() {
             Some(o) => o,
             None => return false,
@@ -356,10 +363,20 @@ impl TorchEngine {
             None => return false,
         };
 
-        let session_cache = registry.get_or_create(owner);
+        let session_cache = registry.get_or_create(owner.clone());
+        // Register the delta dependency BEFORE installing the cache. This both
+        // records the owner for tenant-delta invalidation and, if the effective
+        // tenant changed since this cache was last computed, clears the stale KV
+        // in place. Ordering matters: registration/staleness-clear precede
+        // set_kv_cache, so the model can never publish output from an untracked
+        // or weight-stale cache.
+        let cleared_stale = registry.register_delta_dependency(&owner, tenant_id);
         let mut model = model_arc.lock();
         model.set_kv_cache(session_cache);
-        tracing::debug!("Swapped session KV cache into model");
+        tracing::debug!(
+            "Swapped session KV cache into model (stale_cleared={})",
+            cleared_stale
+        );
         true
     }
 
@@ -1646,10 +1663,18 @@ impl TorchEngine {
     /// When `delta` is Some, LoRA corrections are injected at each attention layer
     /// during generation. The delta is locked per-token (not held across the entire
     /// generation) to allow concurrent training updates.
+    ///
+    /// `tenant_id` is the effective tenant whose delta contributed to the weights
+    /// (`Some` only when a per-tenant delta is in play, `None` otherwise). It is
+    /// threaded to the session-cache swap so the resulting KV is registered for
+    /// tenant-delta invalidation and cleared if the weights changed under a
+    /// different tenant. The caller must derive it from the verified request
+    /// subject, not invent a new identity source.
     pub fn generate_with_delta(
         &self,
         mut request: GenerationRequest,
         delta: Option<std::sync::Arc<parking_lot::Mutex<crate::training::TenantDelta>>>,
+        tenant_id: Option<String>,
     ) -> Result<TextStream<'_>> {
         if let Some(seed) = request.seed {
             self.set_seed(seed as u64);
@@ -1659,7 +1684,7 @@ impl TorchEngine {
             request.timeout_ms = Some(self.config.default_generation_timeout_ms);
         }
 
-        TextStream::new_with_delta(self, request, delta)
+        TextStream::new_with_delta(self, request, delta, tenant_id)
     }
 
     /// Non-streaming generation with optional delta (convenience wrapper)
@@ -1667,6 +1692,7 @@ impl TorchEngine {
         &self,
         request: GenerationRequest,
         delta: Option<std::sync::Arc<parking_lot::Mutex<crate::training::TenantDelta>>>,
+        tenant_id: Option<String>,
     ) -> Result<crate::config::GenerationResult> {
         use futures::StreamExt;
 
@@ -1676,7 +1702,7 @@ impl TorchEngine {
             ));
         }
 
-        let mut stream = self.generate_with_delta(request, delta)?;
+        let mut stream = self.generate_with_delta(request, delta, tenant_id)?;
         let mut accumulated_text = String::new();
 
         while let Some(text_chunk) = stream.next().await {
@@ -2478,13 +2504,14 @@ pub struct TextStream<'a> {
 
 impl<'a> TextStream<'a> {
     fn new(engine: &'a TorchEngine, request: GenerationRequest) -> Result<Self> {
-        Self::new_with_delta(engine, request, None)
+        Self::new_with_delta(engine, request, None, None)
     }
 
     fn new_with_delta(
         engine: &'a TorchEngine,
         request: GenerationRequest,
         delta: Option<std::sync::Arc<parking_lot::Mutex<crate::training::TenantDelta>>>,
+        tenant_id: Option<String>,
     ) -> Result<Self> {
         let prompt_tokens = engine.tokenize(&request.prompt)?;
         let prompt_len = prompt_tokens.len();
@@ -2515,7 +2542,7 @@ impl<'a> TextStream<'a> {
         // If an active session exists, swap its KV cache into the model and check
         // if the new prompt shares a prefix with the cached tokens. This avoids
         // re-computing attention for unchanged conversation history.
-        let prefill_start_pos = if engine.swap_session_cache() {
+        let prefill_start_pos = if engine.swap_session_cache(tenant_id) {
             // Session cache swapped in — check for prefix match
             let prefix_len = if let Some(model_arc) = &engine.persistent_model {
                 let model = model_arc.lock();

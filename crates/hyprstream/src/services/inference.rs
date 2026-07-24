@@ -409,14 +409,28 @@ impl InferenceService {
     ///
     /// Returns None if no deltas exist (base model only), which is the common case
     /// and incurs zero overhead.
+    ///
+    /// Returns `(delta, tenant_id)` where `tenant_id` is `Some(subject)` only when
+    /// a per-tenant delta contributed to the effective weights. The engine
+    /// registers that id against the session KV cache so a later tenant-delta
+    /// eviction/reset/removal invalidates it; base-delta-only and bare-base
+    /// requests carry no tenant dependency (`None`) and are never cleared by a
+    /// tenant eviction.
     fn resolve_delta(
         &self,
         subject: &hyprstream_rpc::Subject,
-    ) -> Option<Arc<Mutex<crate::training::TenantDelta>>> {
+    ) -> (
+        Option<Arc<Mutex<crate::training::TenantDelta>>>,
+        Option<String>,
+    ) {
         let base = self.base_delta.lock().clone();
         let tenant = self.delta_pool.as_ref().and_then(|pool| pool.get(subject));
 
-        match (base, tenant) {
+        // The id is the verified request subject — the existing RPC tenant
+        // identity — not a new identity source.
+        let tenant_id = tenant.as_ref().map(|_| subject.to_string());
+
+        let delta = match (base, tenant) {
             (Some(base), Some(tenant)) => {
                 // Compose: base + tenant corrections
                 Some(crate::training::TenantDelta::compose(&base, &tenant))
@@ -424,7 +438,9 @@ impl InferenceService {
             (Some(base), None) => Some(base),
             (None, Some(tenant)) => Some(tenant),
             (None, None) => None,
-        }
+        };
+
+        (delta, tenant_id)
     }
 
     /// Apply TTT adaptation if enabled (adapts model to input BEFORE generation)
@@ -731,7 +747,7 @@ impl InferenceService {
         };
 
         // Re-resolve delta after TTT (may have been updated by adaptation)
-        let delta = self.resolve_delta(&subject);
+        let (delta, tenant_id) = self.resolve_delta(&subject);
 
         trace!(
             stream_id = %stream_ctx.stream_id(),
@@ -761,7 +777,7 @@ impl InferenceService {
         // Run the stream with StreamChannel's async publisher callback.
         // Engine read-lock held across await: generate_with_delta returns a stream borrowing engine.
         let engine = self.engine.read();
-        let stream_result = engine.generate_with_delta(request, delta);
+        let stream_result = engine.generate_with_delta(request, delta, tenant_id);
 
         let result = stream_channel.run_stream(stream_ctx, |mut publisher| async move {
             let result = match stream_result {
