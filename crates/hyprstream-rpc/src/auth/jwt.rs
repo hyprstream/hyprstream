@@ -426,6 +426,7 @@ fn decode_with_any_key_inner(
         match decode_inner(token, key, expected_aud, lenient_aud) {
             Ok(claims) => return Ok(claims),
             Err(error) => {
+                #[cfg(not(target_arch = "wasm32"))]
                 tracing::debug!(%error, "kid-less JWT candidate did not verify");
                 last_err = error;
             }
@@ -439,6 +440,7 @@ fn decode_with_any_key_inner(
 /// A named token must have exactly one candidate carrying that name and is
 /// verified only with that key. A kid-less token may try every published
 /// Ed25519 candidate, each through full pinned-algorithm verification.
+#[cfg(not(target_arch = "wasm32"))]
 pub fn decode_with_federation_candidates(
     token: &str,
     candidates: &[super::FederationKey],
