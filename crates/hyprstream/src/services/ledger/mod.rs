@@ -36,6 +36,7 @@ pub mod actor;
 pub mod credit_gate;
 pub mod enforcer;
 pub mod handle;
+pub mod inference_spend;
 pub mod service;
 pub mod signer;
 pub mod sink;
@@ -49,6 +50,10 @@ pub use enforcer::{
     LocalEnforcer, Rejection,
 };
 pub use handle::LedgerHandle;
+pub use inference_spend::{
+    observe_spend_result, InferenceSpendEmitter, SpendDecline, SpendFailure, SpendInput,
+    SpendResult,
+};
 pub use service::LedgerService;
 pub use signer::CoseCheckpointSigner;
 pub use sink::{DebtBreaker, LoggingReceiptSink, ReceiptPayload, ReceiptSink};

@@ -57,6 +57,10 @@ use tokio::runtime::Handle;
 use tokenizers::Tokenizer;
 use tracing::{debug, error, info, trace, warn};
 
+// #1264: completion-time ledger spend (behind the `ledger` feature, default off).
+#[cfg(feature = "ledger")]
+use crate::services::ledger::{observe_spend_result, InferenceSpendEmitter, SpendInput};
+
 
 /// Pending work to be executed after REP response is sent.
 ///
@@ -76,6 +80,13 @@ enum PendingWork {
         subject: Subject,
         /// Per-request TTT overrides (deferred to execute_stream)
         ttt_overrides: crate::training::ttt::TTTOverrides,
+        /// The verified caller's self-certifying pairwise DID — the ledger
+        /// account owner for the #1264 completion spend. `None` ⇒ anonymous ⇒
+        /// fail closed (no spend, no leak). Captured at admission from the
+        /// verified envelope and spent at completion. Read only under the
+        /// `ledger` feature.
+        #[cfg_attr(not(feature = "ledger"), allow(dead_code))]
+        owner_did: Option<String>,
     },
     /// Streaming training step (avoids REQ/REP timeout on backward pass compilation)
     Training {
@@ -167,6 +178,13 @@ pub struct InferenceServiceInner {
     /// LoRA generation counter — incremented on create/load/unload.
     /// Checked before generation to detect LoRA reconfiguration mid-stream.
     lora_generation: Arc<AtomicU64>,
+    /// Optional #1264 completion-spend emitter. `None` (default) ⇒ inert: the
+    /// completion path posts no spend. Behind a `RwLock` so an operator can
+    /// attach it after the service thread constructs the inner (the emitter's
+    /// `LedgerHandle` comes from a sibling ledger service whose startup ordering
+    /// is itself a follow-up). Gated behind the `ledger` feature.
+    #[cfg(feature = "ledger")]
+    ledger: parking_lot::RwLock<Option<Arc<InferenceSpendEmitter>>>,
 }
 
 /// ZMQ-based inference service
@@ -222,6 +240,19 @@ impl InferenceService {
             exported.len()
         );
         Ok(persisted)
+    }
+
+    /// Attach the #1264 completion-spend emitter. Once attached, every completed
+    /// generation posts a single-phase token spend to the cell ledger for the
+    /// verified caller's account (best-effort, fail-safe). When the emitter is
+    /// absent (`None`, the default), the completion path posts no spend — the
+    /// accounting subsystem is inert until an operator opts in.
+    ///
+    /// Behind the `ledger` feature. The emitter's [`LedgerHandle`] is cheap to
+    /// clone; attaching shares it with the service thread.
+    #[cfg(feature = "ledger")]
+    pub fn attach_ledger_spend(&self, emitter: Arc<InferenceSpendEmitter>) {
+        *self.ledger.write() = Some(emitter);
     }
 
     /// Run invariant checks before any TTT-scoped operation.
@@ -401,6 +432,8 @@ impl InferenceService {
                 fs,
                 transport: hyprstream_rpc::transport::TransportConfig::inproc("inference-unset"),
                 lora_generation: Arc::new(AtomicU64::new(0)),
+                #[cfg(feature = "ledger")]
+                ledger: parking_lot::RwLock::new(None),
             }),
         })
     }
@@ -590,6 +623,7 @@ impl InferenceService {
         expiry_secs: i64,
         subject: &Subject,
         ttt_overrides: crate::training::ttt::TTTOverrides,
+        owner_did: Option<String>,
     ) -> Result<(
         String,
         [u8; 32],
@@ -634,6 +668,7 @@ impl InferenceService {
             request,
             subject: subject.clone(),
             ttt_overrides,
+            owner_did,
         };
 
         Ok((stream_id, server_pubkey, broadcast_path, reach, pending))
@@ -670,11 +705,13 @@ impl InferenceService {
             "InferenceService must run on current_thread runtime for parking_lot safety"
         );
 
-        let PendingWork::Generation { stream_ctx, request, subject, ttt_overrides } = pending else {
+        let PendingWork::Generation { stream_ctx, request, subject, ttt_overrides, owner_did } = pending else {
             error!("execute_stream called with non-Generation PendingWork");
             return;
         };
         let stream_ctx = &stream_ctx;
+        // #1264: the spend's correlation entropy + the completion log key.
+        let stream_id_str = stream_ctx.stream_id().to_owned();
 
         // Get StreamChannel
         let stream_channel = match &self.stream_channel {
@@ -763,51 +800,65 @@ impl InferenceService {
         let engine = self.engine.read();
         let stream_result = engine.generate_with_delta(request, delta);
 
-        let result = stream_channel.run_stream(stream_ctx, |mut publisher| async move {
-            let result = match stream_result {
-                Ok(mut stream) => {
-                    let cancel = stream_ctx.cancel_token();
-                    loop {
-                        let chunk_result = tokio::select! {
-                            biased;
-                            _ = cancel.cancelled() => {
-                                let _ = publisher.publish_error("cancelled").await;
-                                return (publisher, Ok(()));
-                            }
-                            next = stream.next() => match next {
-                                Some(r) => r,
-                                None => break,
-                            },
-                        };
-                        match chunk_result {
-                            Ok(text) => {
-                                let rate = stream.stats().inference_tokens_per_sec_ema;
-                                if let Err(e) = publisher.publish_data_with_rate(text.as_bytes(), rate).await {
-                                    return (publisher, Err(e));
+        // #1264: capture the completion stats out of the stream closure so the
+        // token-spend can be posted after the client-visible completion frame.
+        #[cfg(feature = "ledger")]
+        let completion_stats: Arc<parking_lot::Mutex<Option<crate::runtime::GenerationStats>>> =
+            Arc::new(parking_lot::Mutex::new(None));
+
+        let result = stream_channel.run_stream(stream_ctx, |mut publisher| {
+            #[cfg(feature = "ledger")]
+            let completion_stats = completion_stats.clone();
+            async move {
+                let result = match stream_result {
+                    Ok(mut stream) => {
+                        let cancel = stream_ctx.cancel_token();
+                        loop {
+                            let chunk_result = tokio::select! {
+                                biased;
+                                _ = cancel.cancelled() => {
+                                    let _ = publisher.publish_error("cancelled").await;
+                                    return (publisher, Ok(()));
+                                }
+                                next = stream.next() => match next {
+                                    Some(r) => r,
+                                    None => break,
+                                },
+                            };
+                            match chunk_result {
+                                Ok(text) => {
+                                    let rate = stream.stats().inference_tokens_per_sec_ema;
+                                    if let Err(e) = publisher.publish_data_with_rate(text.as_bytes(), rate).await {
+                                        return (publisher, Err(e));
+                                    }
+                                }
+                                Err(e) => {
+                                    let _ = publisher.publish_error(&e.to_string()).await;
+                                    return (publisher, Ok(()));
                                 }
                             }
-                            Err(e) => {
-                                let _ = publisher.publish_error(&e.to_string()).await;
-                                return (publisher, Ok(()));
-                            }
+                        }
+
+                        // Normal completion with stats
+                        let stats = stream.stats();
+                        #[cfg(feature = "ledger")]
+                        {
+                            *completion_stats.lock() = Some(stats.clone());
+                        }
+                        let mut complete = crate::services::rpc_types::InferenceComplete::from(&stats);
+
+                        // Attach TTT metrics to completion (from deferred TTT in execute_stream)
+                        complete.ttt_metrics = ttt_result.map(std::convert::Into::into);
+
+                        match publisher.complete_ref(&complete.to_bytes()).await {
+                            Ok(()) => Ok(()),
+                            Err(e) => Err(e),
                         }
                     }
-
-                    // Normal completion with stats
-                    let stats = stream.stats();
-                    let mut complete = crate::services::rpc_types::InferenceComplete::from(&stats);
-
-                    // Attach TTT metrics to completion (from deferred TTT in execute_stream)
-                    complete.ttt_metrics = ttt_result.map(std::convert::Into::into);
-
-                    match publisher.complete_ref(&complete.to_bytes()).await {
-                        Ok(()) => Ok(()),
-                        Err(e) => Err(e),
-                    }
-                }
-                Err(e) => Err(e),  // framework sends Error frame automatically
-            };
-            (publisher, result)
+                    Err(e) => Err(e),  // framework sends Error frame automatically
+                };
+                (publisher, result)
+            }
         }).await;
 
         if let Err(e) = result {
@@ -817,6 +868,49 @@ impl InferenceService {
                 "Stream execution failed"
             );
         }
+
+        // #1264: post the token-spend to the cell ledger on generation completion
+        // (quota burn). Fail-safe: a ledger/accounting failure MUST NOT break a
+        // generation that already produced output — the spend is best-effort and
+        // every non-posted outcome is a content-free signal, never a silent drop.
+        // Anonymous caller ⇒ fail closed (no spend, no leak). Posted *after* the
+        // client-visible completion frame. (The engine read-lock is held across
+        // this best-effort await; covered by the `await_holding_lock` allow above
+        // and consistent with the stream itself.)
+        #[cfg(feature = "ledger")]
+        {
+            let emitter_opt = self.ledger.read().clone();
+            if let Some(emitter) = emitter_opt {
+                let stats_opt = completion_stats.lock().clone();
+                match (stats_opt, owner_did.as_ref()) {
+                    (Some(stats), Some(owner)) => {
+                        let res = emitter
+                            .post_generation_spend(SpendInput {
+                                owner_did: owner,
+                                stream_id: &stream_id_str,
+                                prompt_tokens: stats.prefill_tokens as u64,
+                                generated_tokens: stats.tokens_generated as u64,
+                            })
+                            .await;
+                        observe_spend_result(&res, &stream_id_str, emitter.unit());
+                    }
+                    (Some(_), None) => {
+                        // Verified anonymous caller (no self-certifying DID) ⇒
+                        // fail closed: no spend, but signal it (#1264).
+                        warn!(
+                            stream_id = %stream_id_str,
+                            "ledger: anonymous caller — completion spend skipped (fail-closed)"
+                        );
+                    }
+                    (None, _) => {
+                        // No completion stats (errored/cancelled before the stats
+                        // frame) — nothing to account for; no signal needed.
+                    }
+                }
+            }
+        }
+        #[cfg(not(feature = "ledger"))]
+        drop(stream_id_str);
     }
 
     /// Execute streaming training step - called AFTER REP response is sent.
@@ -1927,8 +2021,17 @@ impl InferenceHandler for InferenceService {
 
         let client_ephemeral_pubkey = ctx.ephemeral_pubkey();
         let claims = ctx.claims().cloned();
+        // #1264: the verified caller's self-certifying pairwise DID — the ledger
+        // account owner spent at completion. `ctx.subject()` is the Casbin-facing
+        // authorization label (e.g. "alice"), not a DID and never a ledger
+        // principal; the self-certifying DID is derived from the same verified
+        // envelope (svc.rs / the enforcer's S1 model). Anonymous ⇒ `None`.
+        #[cfg(feature = "ledger")]
+        let owner_did = ctx.authenticated_pairwise_did().map(|d| d.as_str().to_owned());
+        #[cfg(not(feature = "ledger"))]
+        let owner_did: Option<String> = None;
         let (stream_id, server_pubkey, broadcast_path, reach, pending) =
-            self.prepare_stream(request, client_ephemeral_pubkey.as_ref().map(<[u8; 32]>::as_slice), claims, expiry_secs, &subject, ttt_overrides).await?;
+            self.prepare_stream(request, client_ephemeral_pubkey.as_ref().map(<[u8; 32]>::as_slice), claims, expiry_secs, &subject, ttt_overrides, owner_did).await?;
 
         let stream_info = crate::services::generated::inference_client::StreamInfo {
             stream_id,
