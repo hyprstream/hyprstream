@@ -840,7 +840,7 @@ pub trait RequestService: 'static {
         // post-quantum half of a composite signature and presenting only the
         // classical EdDSA half under the composite kid.
         if let Some(ref kid_str) = kid {
-            let listed_algs = key_source.kid_algs(kid_str);
+            let listed_algs = key_source.kid_algs(&unverified.iss, kid_str);
             if !listed_algs.is_empty() {
                 if !listed_algs.iter().any(|a| a == &alg) {
                     tracing::warn!(
@@ -948,22 +948,46 @@ pub trait RequestService: 'static {
                 })?
             }
             "EdDSA" => {
-                let verifying_key = key_source
-                    .get_key(&unverified.iss, kid.as_deref())
-                    .await
-                    .map_err(|e| {
-                        tracing::warn!(
-                            "JWT key resolution failed for iss={}: {}",
-                            unverified.iss,
-                            e
-                        );
-                        anyhow::anyhow!("JWT key resolution failed")
-                    })?;
-                crate::auth::decode_with_key(&token, &verifying_key, self.expected_audience())
-                    .map_err(|e| {
-                        tracing::warn!("JWT verification failed: {}", e);
-                        anyhow::anyhow!("JWT verification failed")
-                    })?
+                let verified = if let Some(kid) = kid.as_deref() {
+                    let verifying_key = key_source
+                        .get_key(&unverified.iss, Some(kid))
+                        .await
+                        .map_err(|e| {
+                            tracing::warn!(
+                                "JWT key resolution failed for iss={} kid={}: {}",
+                                unverified.iss,
+                                kid,
+                                e
+                            );
+                            anyhow::anyhow!("JWT key resolution failed")
+                        })?;
+                    crate::auth::decode_with_key(
+                        &token,
+                        &verifying_key,
+                        self.expected_audience(),
+                    )
+                } else {
+                    let candidates = key_source
+                        .get_keys(&unverified.iss, None)
+                        .await
+                        .map_err(|e| {
+                            tracing::warn!(
+                                "JWT key resolution failed for kid-less iss={}: {}",
+                                unverified.iss,
+                                e
+                            );
+                            anyhow::anyhow!("JWT key resolution failed")
+                        })?;
+                    crate::auth::decode_with_any_key_lenient(
+                        &token,
+                        &candidates,
+                        self.expected_audience(),
+                    )
+                };
+                verified.map_err(|e| {
+                    tracing::warn!("JWT verification failed: {}", e);
+                    anyhow::anyhow!("JWT verification failed")
+                })?
             }
             _ => anyhow::bail!("unsupported JWT algorithm"),
         };

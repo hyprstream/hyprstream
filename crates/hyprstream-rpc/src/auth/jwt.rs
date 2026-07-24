@@ -10,7 +10,7 @@
 //! - Payload: Claims (sub, exp, iat)
 //! - Signature: Ed25519 over `base64url(header).base64url(payload)`
 
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::Utc;
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use thiserror::Error;
@@ -109,7 +109,7 @@ impl<'de> serde::Deserialize<'de> for ProtectedHeader {
                             return Err(A::Error::unknown_field(
                                 &key,
                                 &["alg", "typ", "kid", "crit"],
-                            ))
+                            ));
                         }
                     }
                 }
@@ -387,6 +387,84 @@ pub fn decode_with_key(
     decode_inner(token, verifying_key, expected_aud, true)
 }
 
+/// Try every supplied Ed25519 key for a JWT that has no `kid`.
+///
+/// Candidate verification is intentionally unavailable to named tokens: under
+/// invariant I2, a token declaring `kid=X` must be resolved and verified only
+/// with key X. Each kid-less candidate receives a complete verification,
+/// including the pinned `EdDSA` algorithm and all claim checks.
+pub fn decode_with_any_key(
+    token: &str,
+    candidates: &[VerifyingKey],
+    expected_aud: Option<&str>,
+) -> Result<Claims, JwtError> {
+    decode_with_any_key_inner(token, candidates, expected_aud, false)
+}
+
+/// Lenient-audience twin of [`decode_with_any_key`]. This remains restricted
+/// to kid-less JWTs; only the absent-audience behavior differs.
+pub fn decode_with_any_key_lenient(
+    token: &str,
+    candidates: &[VerifyingKey],
+    expected_aud: Option<&str>,
+) -> Result<Claims, JwtError> {
+    decode_with_any_key_inner(token, candidates, expected_aud, true)
+}
+
+fn decode_with_any_key_inner(
+    token: &str,
+    candidates: &[VerifyingKey],
+    expected_aud: Option<&str>,
+    lenient_aud: bool,
+) -> Result<Claims, JwtError> {
+    if header_kid(token)?.is_some() || candidates.is_empty() {
+        return Err(JwtError::InvalidSignature);
+    }
+
+    let mut last_err = JwtError::InvalidSignature;
+    for key in candidates {
+        match decode_inner(token, key, expected_aud, lenient_aud) {
+            Ok(claims) => return Ok(claims),
+            Err(error) => {
+                tracing::debug!(%error, "kid-less JWT candidate did not verify");
+                last_err = error;
+            }
+        }
+    }
+    Err(last_err)
+}
+
+/// Verify a federation JWT without losing its JWKS `kid` binding.
+///
+/// A named token must have exactly one candidate carrying that name and is
+/// verified only with that key. A kid-less token may try every published
+/// Ed25519 candidate, each through full pinned-algorithm verification.
+pub fn decode_with_federation_candidates(
+    token: &str,
+    candidates: &[super::FederationKey],
+    expected_aud: Option<&str>,
+) -> Result<Claims, JwtError> {
+    match header_kid(token)? {
+        Some(kid) => {
+            let mut named = candidates
+                .iter()
+                .filter(|candidate| candidate.kid.as_deref() == Some(kid.as_str()));
+            let key = named.next().ok_or(JwtError::InvalidSignature)?;
+            if named.next().is_some() {
+                return Err(JwtError::InvalidSignature);
+            }
+            decode_with_key(token, &key.verifying_key, expected_aud)
+        }
+        None => {
+            let keys: Vec<VerifyingKey> = candidates
+                .iter()
+                .map(|candidate| candidate.verifying_key)
+                .collect();
+            decode_with_any_key_lenient(token, &keys, expected_aud)
+        }
+    }
+}
+
 /// Internal decode implementation shared by `decode` and `decode_with_key`.
 ///
 /// `lenient_aud`: when true, accepts tokens with no `aud` claim even when
@@ -636,7 +714,7 @@ pub fn decode_composite(
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-    use crate::auth::Claims;
+    use crate::auth::{Claims, IssuerResolver, JwksFetcher, JwksKeySource, JwksMode, JwtKeySource};
     use ed25519_dalek::SigningKey;
 
     fn make_key(seed: u8) -> SigningKey {
@@ -710,7 +788,10 @@ mod tests {
             "JWT",
             "wit+jwt",
         ] {
-            assert!(!is_rfc9068_access_token_type(rejected), "accepted {rejected:?}");
+            assert!(
+                !is_rfc9068_access_token_type(rejected),
+                "accepted {rejected:?}"
+            );
         }
     }
 
@@ -739,6 +820,146 @@ mod tests {
             matches!(result, Err(JwtError::InvalidSignature)),
             "wrong key must yield InvalidSignature"
         );
+    }
+
+    /// I2b / #1234: every JWKS-derived lookup is issuer-scoped. In
+    /// particular, preloading issuer A must not make an issuer-B token signed
+    /// by A acceptable merely because both JWKS documents reuse a `kid`.
+    #[tokio::test]
+    async fn cross_issuer_shared_kid_rejects_issuer_a_signature() -> anyhow::Result<()> {
+        use std::sync::{
+            atomic::{AtomicU32, Ordering},
+            Arc,
+        };
+
+        const ISSUER_A: &str = "https://issuer-a.example";
+        const ISSUER_B: &str = "https://issuer-b.example";
+        const SHARED_KID: &str = "shared-kid";
+        const METADATA_KID: &str = "shared-metadata-kid";
+
+        struct TestResolver;
+
+        #[async_trait::async_trait]
+        impl IssuerResolver for TestResolver {
+            async fn resolve(&self, issuer: &str) -> anyhow::Result<String> {
+                Ok(format!("{issuer}/jwks"))
+            }
+        }
+
+        fn ed25519_jwk(signing_key: &SigningKey, kid: &str) -> serde_json::Value {
+            serde_json::json!({
+                "kty": "OKP",
+                "crv": "Ed25519",
+                "use": "sig",
+                "alg": "EdDSA",
+                "kid": kid,
+                "x": URL_SAFE_NO_PAD.encode(signing_key.verifying_key().as_bytes()),
+            })
+        }
+
+        let issuer_a_key = make_key(0xA1);
+        let issuer_b_key = make_key(0xB2);
+        let issuer_a_jwks = serde_json::json!({
+            "keys": [
+                ed25519_jwk(&issuer_a_key, SHARED_KID),
+                {
+                    "kty": "AKP",
+                    "use": "sig",
+                    "alg": "ML-DSA-65-Ed25519",
+                    "kid": METADATA_KID,
+                    "pub": URL_SAFE_NO_PAD.encode([0u8; 16]),
+                },
+            ]
+        });
+        let issuer_b_jwks = serde_json::json!({
+            "keys": [
+                ed25519_jwk(&issuer_b_key, SHARED_KID),
+                {
+                    "kty": "AKP",
+                    "use": "sig",
+                    "alg": "ML-DSA-65",
+                    "kid": METADATA_KID,
+                    "pub": URL_SAFE_NO_PAD.encode([1u8; 16]),
+                },
+            ]
+        });
+
+        let issuer_a_fetches = Arc::new(AtomicU32::new(0));
+        let issuer_b_fetches = Arc::new(AtomicU32::new(0));
+        let fetcher: JwksFetcher = {
+            let issuer_a_fetches = issuer_a_fetches.clone();
+            let issuer_b_fetches = issuer_b_fetches.clone();
+            Arc::new(move |url| {
+                let jwks = if url == format!("{ISSUER_A}/jwks") {
+                    issuer_a_fetches.fetch_add(1, Ordering::Relaxed);
+                    issuer_a_jwks.clone()
+                } else if url == format!("{ISSUER_B}/jwks") {
+                    issuer_b_fetches.fetch_add(1, Ordering::Relaxed);
+                    issuer_b_jwks.clone()
+                } else {
+                    return Box::pin(async move { anyhow::bail!("unexpected JWKS URL: {url}") });
+                };
+                Box::pin(async move { Ok(jwks) })
+            })
+        };
+
+        let key_source = JwksKeySource::new(
+            JwksMode::Federated {
+                local_jwks_url: "https://local.example/jwks".to_owned(),
+                resolver: Arc::new(TestResolver),
+            },
+            "https://local.example".to_owned(),
+            fetcher,
+        );
+
+        // Prime issuer A's positive cache under the deliberately shared kid.
+        let selected_a = key_source.get_key(ISSUER_A, Some(SHARED_KID)).await?;
+        assert_eq!(selected_a, issuer_a_key.verifying_key());
+
+        let claims = Claims::new("issuer-b-subject".to_owned(), 0, 9_999_999_999)
+            .with_issuer(ISSUER_B.to_owned());
+        let header = format!(r#"{{"alg":"EdDSA","typ":"JWT","kid":"{SHARED_KID}"}}"#);
+        let forged = encode_with_header(&claims, &issuer_a_key, &header);
+
+        // Issuer B must resolve only B's key, so A's signature is rejected.
+        let selected_b = key_source.get_key(ISSUER_B, Some(SHARED_KID)).await?;
+        assert_eq!(selected_b, issuer_b_key.verifying_key());
+        assert!(matches!(
+            decode_with_key(&forged, &selected_b, None),
+            Err(JwtError::InvalidSignature)
+        ));
+
+        // Kid-less candidates and kid→alg metadata are issuer-scoped too.
+        assert_eq!(
+            key_source.get_keys(ISSUER_B, None).await?,
+            vec![issuer_b_key.verifying_key()]
+        );
+        assert_eq!(
+            key_source.kid_algs(ISSUER_A, METADATA_KID),
+            vec!["ML-DSA-65-Ed25519".to_owned()]
+        );
+        assert_eq!(
+            key_source.kid_algs(ISSUER_B, METADATA_KID),
+            vec!["ML-DSA-65".to_owned()]
+        );
+
+        // A negative hit for issuer A must not suppress issuer B's fetch.
+        assert!(key_source
+            .get_key(ISSUER_A, Some("missing-kid"))
+            .await
+            .is_err());
+        assert!(key_source
+            .get_key(ISSUER_A, Some("missing-kid"))
+            .await
+            .is_err());
+        assert_eq!(issuer_a_fetches.load(Ordering::Relaxed), 2);
+        assert!(key_source
+            .get_key(ISSUER_B, Some("missing-kid"))
+            .await
+            .is_err());
+        assert_eq!(issuer_b_fetches.load(Ordering::Relaxed), 2);
+
+        Ok(())
     }
 
     #[test]
@@ -879,5 +1100,92 @@ mod tests {
 
         let kid = header_kid(&token).unwrap();
         assert!(kid.is_none());
+    }
+
+    // #1184/I2 — candidate verification is permitted only when the JWT has no
+    // kid. Each candidate gets a complete EdDSA + claims verification.
+    #[test]
+    fn decode_with_any_key_accepts_kid_less_non_first_published_key() {
+        let key_a = make_key(0xA1);
+        let key_b = make_key(0xB2);
+        let claims = Claims::new("overlap-test".to_owned(), 0, 9_999_999_999);
+        let header = r#"{"alg":"EdDSA","typ":"at+jwt"}"#;
+        let token = encode_with_header(&claims, &key_b, header);
+        let candidates = vec![key_a.verifying_key(), key_b.verifying_key()];
+
+        let decoded = decode_with_any_key_lenient(&token, &candidates, None)
+            .expect("kid-less second key verifies");
+        assert_eq!(decoded.sub, "overlap-test");
+    }
+
+    #[test]
+    fn decode_with_any_key_rejects_named_token_even_if_another_candidate_verifies() {
+        let old = make_key(0xA1);
+        let new = make_key(0xB2);
+        let claims = Claims::new("kid-substitution".to_owned(), 0, 9_999_999_999);
+        let header = format!(
+            r#"{{"alg":"EdDSA","typ":"at+jwt","kid":"{}"}}"#,
+            kid_for_key(&new)
+        );
+        let token = encode_with_header(&claims, &old, &header);
+        let candidates = vec![new.verifying_key(), old.verifying_key()];
+
+        assert!(decode_with_any_key_lenient(&token, &candidates, None).is_err());
+    }
+
+    #[test]
+    fn decode_with_any_key_rejects_when_no_candidate_verifies() {
+        let signer = make_key(0x11);
+        let unrelated = make_key(0x99);
+        let claims = Claims::new("no-match".to_owned(), 0, 9_999_999_999);
+        let token = encode_with_header(
+            &claims,
+            &signer,
+            r#"{"alg":"EdDSA","typ":"at+jwt"}"#,
+        );
+        assert!(decode_with_any_key_lenient(
+            &token,
+            &[unrelated.verifying_key()],
+            None
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn decode_with_any_key_empty_set_fails_closed() {
+        let signer = make_key(0x22);
+        let claims = Claims::new("empty".to_owned(), 0, 9_999_999_999);
+        let token = encode_with_header(
+            &claims,
+            &signer,
+            r#"{"alg":"EdDSA","typ":"at+jwt"}"#,
+        );
+        assert!(decode_with_any_key_lenient(&token, &[], None).is_err());
+    }
+
+    #[test]
+    fn federation_candidates_reject_mismatched_named_key() {
+        use crate::auth::FederationKey;
+
+        let old = make_key(0xA1);
+        let new = make_key(0xB2);
+        let claims = Claims::new("kid-binding".to_owned(), 0, 9_999_999_999);
+        let token = encode(&claims, &old);
+        let old_kid = kid_for_key(&old);
+
+        // The token names `old_kid`, but only a different co-published key is
+        // attached to that name. The bare-key candidate loop would accept the
+        // `old` entry below; the federation path must reject it.
+        let candidates = vec![
+            FederationKey {
+                kid: Some(old_kid),
+                verifying_key: new.verifying_key(),
+            },
+            FederationKey {
+                kid: Some(kid_for_key(&new)),
+                verifying_key: old.verifying_key(),
+            },
+        ];
+        assert!(decode_with_federation_candidates(&token, &candidates, None).is_err());
     }
 }

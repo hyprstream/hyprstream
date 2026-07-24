@@ -9,10 +9,10 @@ use anyhow::Result;
 use async_trait::async_trait;
 use std::sync::Arc;
 
+use crate::Subject;
 use crate::auth::FederationKeySource;
 use crate::identity::{IdentityProvider, SigningIdentity};
 use crate::node_identity::NodeIdentityProvider;
-use crate::Subject;
 
 /// Identity provider with cross-node trust via federation.
 ///
@@ -72,7 +72,11 @@ mod tests {
         fn is_trusted(&self, _issuer: &str) -> bool {
             true
         }
-        async fn get_key(&self, _issuer: &str) -> Result<ed25519_dalek::VerifyingKey> {
+        async fn get_keys(
+            &self,
+            _issuer: &str,
+            _kid: Option<&str>,
+        ) -> Result<Vec<crate::auth::FederationKey>> {
             anyhow::bail!("mock: no key")
         }
     }
