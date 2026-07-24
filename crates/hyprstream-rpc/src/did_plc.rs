@@ -1242,7 +1242,7 @@ impl HttpPlcFetcher {
     fn new(config: &PlcResolverConfig) -> Result<Self> {
         let http = reqwest::Client::builder()
             // SSRF: do NOT follow redirects. did:plc resolution is a direct
-            // HTTPS GET; a redirect to http://127.0.0.1 / link-local would
+            // HTTPS GET; a redirect to a loopback / link-local address would
             // bypass both the https-only check and the egress allowlist.
             .redirect(reqwest::redirect::Policy::none())
             // Bound how long a connect/request can hang.
