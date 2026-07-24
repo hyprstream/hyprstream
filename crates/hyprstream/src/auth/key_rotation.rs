@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tokio::time::MissedTickBehavior;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use crate::config::OAuthConfig;
 
@@ -1353,6 +1353,20 @@ pub fn spawn_rotation_task(
             refresh_ed25519_verifying_keys(&store).await;
             if let Some(ref es256) = extra.es256 {
                 rotate_es256_keys(&config, &secrets_dir, es256, now).await;
+                // C4 (#1170): re-seal the op-log head after the ES256
+                // promotion so cross-process readers (the registry's
+                // `PdsPublisher` under `--ipc`) observe the new active
+                // `#atproto` generation. Dedicated head-signing key + shared
+                // state dir; async because the ES256 store is a tokio RwLock
+                // (F1). C2 (#1168) seam — see `auth::op_log`.
+                if let Err(error) =
+                    super::op_log::advance_sealed_head(&secrets_dir, es256).await
+                {
+                    error!(
+                        "failed to re-seal op-log head after ES256 rotation; \
+                         cross-process readers will retain the prior generation: {error}"
+                    );
+                }
             }
             if let (Some(ref ml_dsa), Some(expected_component_digest)) =
                 (&extra.ml_dsa, expected_component_digest.as_deref())
@@ -1443,6 +1457,23 @@ impl Es256SigningKeyStore {
     }
 }
 
+/// Resolve an ES256 signing key by kid from the persisted slot files in
+/// `secrets_dir` (scans drain/active/lead). Used by the sealed op-log head
+/// reader ([`super::op_log`]) to materialize the active generation's signing
+/// key once the head has authenticated *which* kid is active. Reading from
+/// disk — not the in-memory `OnceLock` — is what makes a cross-process reader
+/// observe a slot promoted by another process.
+pub(crate) fn es256_signing_key_for_kid(secrets_dir: &Path, kid: &str) -> Option<Es256SigningKey> {
+    for name in ["active", "drain", "lead"] {
+        if let Some(slot) = load_es256_slot(secrets_dir, name) {
+            if slot.kid() == kid {
+                return Some((*slot.key).clone());
+            }
+        }
+    }
+    None
+}
+
 // ── ES256 persistence ──────────────────────────────────────────────────────
 
 fn es256_slot_paths(secrets_dir: &Path, name: &str) -> (PathBuf, PathBuf) {
@@ -1468,7 +1499,11 @@ fn load_es256_slot(secrets_dir: &Path, name: &str) -> Option<Es256KeySlot> {
     Some(Es256KeySlot::new(key, meta.nbf, meta.exp))
 }
 
-fn persist_es256_slot(secrets_dir: &Path, name: &str, slot: &Es256KeySlot) -> anyhow::Result<()> {
+pub(crate) fn persist_es256_slot(
+    secrets_dir: &Path,
+    name: &str,
+    slot: &Es256KeySlot,
+) -> anyhow::Result<()> {
     // Atomic write + 0600 perms (#179).
     super::identity_store::write_secret(
         secrets_dir,
