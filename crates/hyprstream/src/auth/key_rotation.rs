@@ -1484,6 +1484,14 @@ impl Es256SigningKeyStore {
         *self.1.write() = Some(hook);
     }
 
+    fn notify_promotion(&self, key: Arc<Es256SigningKey>) -> anyhow::Result<()> {
+        let hook = self.1.read().clone();
+        if let Some(hook) = hook {
+            hook(key)?;
+        }
+        Ok(())
+    }
+
     /// The current active ES256 signing key — the single `#atproto` key the
     /// DID document publishes and the repo head is signed with (#918
     /// re-sign-on-rotation). Synchronous (parking_lot lock) so the publisher
@@ -1654,13 +1662,14 @@ pub fn load_or_init_es256_key_store(
     })
 }
 
-/// Returns `true` if the active key was promoted (lead → active).
+/// Returns `true` if the active key was promoted (lead → active). An installed
+/// in-process promotion hook is invoked before the candidate becomes visible.
 ///
-/// Existing commits remain verifiable through the bounded drain slot.  That
-/// is deliberately independent of any PDS writer: in `--ipc` the OAuth
-/// process and the writer are different processes, so requiring a callback to
-/// re-sign an old commit would make rotation impossible in the supported
-/// deployment.
+/// Promotion is recoverable with respect to the live key: the store write
+/// guard prevents readers from observing the candidate key until persistence
+/// and the persisted repo-head re-sign both succeed. Deployments without an
+/// in-process publisher may omit the hook and rely on the bounded overlap
+/// slots used by `--ipc` workers.
 pub async fn rotate_es256_keys(
     config: &OAuthConfig,
     secrets_dir: &Path,
@@ -1676,35 +1685,86 @@ pub async fn rotate_es256_keys(
     // Phase 1: promote lead → active if lead.nbf <= now
     if let Some(new_active) = slots.lead.as_ref().filter(|lead| lead.nbf <= now).cloned() {
         let old_active = slots.active.clone();
-        {
-            if let Some(old_active) = old_active {
-                // The old active key becomes verification-only for one bounded
-                // drain interval. Store the actual publication expiry in the
-                // slot itself so the DID document and cleanup use one boundary.
-                let drain = Es256KeySlot::new(
-                    Arc::unwrap_or_clone(old_active.key),
-                    old_active.nbf,
-                    now.saturating_add(drain_secs),
-                );
-                // Persist drain before active. A process that reloads between
-                // the two writes can therefore still verify K-signed commits.
-                delete_es256_slot(secrets_dir, "drain");
-                if let Err(error) = persist_es256_slot(secrets_dir, "drain", &drain) {
-                    warn!("ES256: failed to persist drain slot; retaining old active: {error}");
-                    return false;
+        let old_drain = slots.drain.clone();
+        let new_drain = old_active.as_ref().map(|old_active| {
+            // The old active key becomes verification-only for one bounded
+            // drain interval. Store the actual publication expiry in the slot
+            // itself so the DID document and cleanup use one boundary.
+            Es256KeySlot::new(
+                old_active.key.as_ref().clone(),
+                old_active.nbf,
+                now.saturating_add(drain_secs),
+            )
+        });
+
+        // Persist drain before active. A process that reloads between the two
+        // writes can therefore still verify K-signed commits.
+        if let Some(ref drain) = new_drain {
+            if let Err(error) = persist_es256_slot(secrets_dir, "drain", drain) {
+                if let Some(ref old_drain) = old_drain {
+                    let _ = persist_es256_slot(secrets_dir, "drain", old_drain);
+                } else {
+                    delete_es256_slot(secrets_dir, "drain");
                 }
-                slots.drain = Some(drain);
-            }
-            if let Err(error) = persist_es256_slot(secrets_dir, "active", &new_active) {
-                warn!("ES256: failed to persist promoted active; retaining old active: {error}");
+                warn!("ES256: failed to persist drain slot; retaining old active: {error}");
                 return false;
             }
-            delete_es256_slot(secrets_dir, "lead");
-            slots.active = Some(new_active);
-            slots.lead = None;
-            promoted = true;
-            info!("ES256: promoted lead → active");
         }
+
+        if let Err(error) = persist_es256_slot(secrets_dir, "active", &new_active) {
+            if let Some(ref old_active) = old_active {
+                let _ = persist_es256_slot(secrets_dir, "active", old_active);
+            } else {
+                delete_es256_slot(secrets_dir, "active");
+            }
+            if let Some(ref old_drain) = old_drain {
+                let _ = persist_es256_slot(secrets_dir, "drain", old_drain);
+            } else {
+                delete_es256_slot(secrets_dir, "drain");
+            }
+            warn!("ES256: failed to persist promoted active; retaining old active: {error}");
+            return false;
+        }
+
+        if let Err(error) = store.notify_promotion(Arc::clone(&new_active.key)) {
+            // A hook may have committed the candidate head before returning an
+            // error. Re-sign with the old key defensively, then restore the
+            // durable slot generation so the queued lead can be retried.
+            if let Some(ref old_active) = old_active {
+                if let Err(rollback_error) = store.notify_promotion(Arc::clone(&old_active.key)) {
+                    warn!(
+                        "ES256: failed to restore PDS head after promotion failure: {rollback_error}"
+                    );
+                }
+                if let Err(rollback_error) = persist_es256_slot(secrets_dir, "active", old_active) {
+                    warn!(
+                        "ES256: failed to restore persisted active after promotion failure: {rollback_error}"
+                    );
+                }
+            } else {
+                delete_es256_slot(secrets_dir, "active");
+            }
+            if let Some(ref old_drain) = old_drain {
+                if let Err(rollback_error) = persist_es256_slot(secrets_dir, "drain", old_drain) {
+                    warn!(
+                        "ES256: failed to restore persisted drain after promotion failure: {rollback_error}"
+                    );
+                }
+            } else {
+                delete_es256_slot(secrets_dir, "drain");
+            }
+            warn!(
+                "ES256: failed to re-sign PDS head; retaining old active and retrying next tick: {error}"
+            );
+            return false;
+        }
+
+        delete_es256_slot(secrets_dir, "lead");
+        slots.drain = new_drain.or(old_drain);
+        slots.active = Some(new_active);
+        slots.lead = None;
+        promoted = true;
+        info!("ES256: promoted lead → active");
     }
 
     // Phase 2: remove expired drain
@@ -3442,12 +3502,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn es256_rotation_does_not_depend_on_a_promotion_hook() {
+    async fn es256_rotation_retries_after_promotion_hook_failure() {
         let dir = TempDir::new().unwrap();
         let config = test_config();
         let now = chrono::Utc::now().timestamp();
 
         let active = generate_es256_slot(now - 14 * 86400, now + 1);
+        let active_kid = active.kid();
         let lead = generate_es256_slot(now - 1, now + 14 * 86400);
         let lead_kid = lead.kid();
         persist_es256_slot(dir.path(), "active", &active).unwrap();
@@ -3458,7 +3519,31 @@ mod tests {
             active: Some(active),
             lead: Some(lead),
         });
-        store.set_promotion_hook(Arc::new(|_| anyhow::bail!("must not be called")));
+        let fail_once = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let injected_failure = Arc::clone(&fail_once);
+        store.set_promotion_hook(Arc::new(move |_| {
+            if injected_failure.swap(false, Ordering::AcqRel) {
+                anyhow::bail!("injected head re-sign failure");
+            }
+            Ok(())
+        }));
+
+        assert!(
+            !rotate_es256_keys(&config, dir.path(), &store, now).await,
+            "a failed promotion hook must leave the candidate queued"
+        );
+        {
+            let slots = store.0.read();
+            assert_eq!(slots.active.as_ref().unwrap().kid(), active_kid);
+            assert_eq!(slots.lead.as_ref().unwrap().kid(), lead_kid);
+            assert!(slots.drain.is_none());
+        }
+        assert_eq!(
+            load_es256_slot(dir.path(), "active").unwrap().kid(),
+            active_kid,
+            "failed promotion must restore the durable active key"
+        );
+
         assert!(rotate_es256_keys(&config, dir.path(), &store, now).await);
         let slots = store.0.read();
         assert_eq!(slots.active.as_ref().unwrap().kid(), lead_kid);

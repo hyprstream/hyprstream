@@ -1686,7 +1686,7 @@ mod pds_store_tests {
         let k2_slot = Es256KeySlot::new(k2, 0, 0);
         persist_es256_slot(secrets, "drain", &k1_slot).unwrap();
         persist_es256_slot(secrets, "active", &k2_slot).unwrap();
-        es256_store.0.blocking_write().active = Some(k2_slot);
+        es256_store.0.write().active = Some(k2_slot);
         block_on(seal_op_log_head(state, &head_sk, &es256_store)).expect("seal");
 
         // Same publisher instance, new commit. It MUST be signed by K2 — the

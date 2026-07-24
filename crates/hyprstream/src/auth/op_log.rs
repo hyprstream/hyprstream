@@ -382,11 +382,11 @@ pub async fn advance_sealed_head(
     seal_op_log_head(&state_dir, &head_sk, es256_store).await
 }
 
-/// Write the sealed op-log head after a promotion (or at boot). **Async** — it
-/// reads the ES256 store via `.read().await` (the store is a tokio RwLock);
-/// the rotator calls it from its async context (F1). This is the **C2 (#1168)
-/// seam**: rename-atomic at the file level; the full crash-atomic rotation
-/// ordering is C2's guarantee (see module docs).
+/// Write the sealed op-log head after a promotion (or at boot). The public
+/// operation remains async for its rotator call sites, while the ES256 store
+/// snapshot uses its synchronous `parking_lot` read guard. This is the **C2
+/// (#1168) seam**: rename-atomic at the file level; the full crash-atomic
+/// rotation ordering is C2's guarantee (see module docs).
 ///
 /// Prior state is carried forward only from a *signature-verified* prior head
 /// (F5): an unverified/tampered prior does not inject `seq`/`prev`.
@@ -398,7 +398,6 @@ pub async fn seal_op_log_head(
     let active = es256_store
         .0
         .read()
-        .await
         .active
         .clone()
         .ok_or_else(|| anyhow!("cannot seal op-log head: ES256 store has no active slot"))?;
@@ -543,7 +542,7 @@ mod tests {
         }
 
         fn set_active(&self, sk: Es256SigningKey) {
-            *self.store.0.blocking_write() = super::super::key_rotation::Es256KeySlots {
+            *self.store.0.write() = super::super::key_rotation::Es256KeySlots {
                 active: Some(super::super::key_rotation::Es256KeySlot::new(sk, 0, 0)),
                 drain: None,
                 lead: None,
@@ -584,8 +583,8 @@ mod tests {
 
     #[test]
     fn seal_runs_inside_async_runtime() {
-        // seal_op_log_head calls es256_store.0.read().await; pre-fix it used
-        // blocking_read() which panics inside a runtime. Drive it under one.
+        // Keep exercising the async public seam even though the ES256 snapshot
+        // now uses a synchronous parking_lot guard internally.
         let r = Rotator::new();
         let k1 = Es256SigningKey::random(&mut rand::rngs::OsRng);
         r.set_active(k1.clone());
