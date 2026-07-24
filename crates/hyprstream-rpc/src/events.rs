@@ -1,97 +1,56 @@
-//! Unified event publisher/subscriber (EV1, EventService consolidation epic #600).
+//! Unified EventService publisher/subscriber (epic #600).
 //!
-//! Before this module, the project had two separate types for event-bus
-//! broadcast:
+//! Public publishers preserve the existing plaintext MoQ event path. Confidential
+//! publishers use controller-managed group epochs: the controller atomically
+//! prepares and commits each membership-version/epoch transition, then distributes
+//! the fresh epoch secret separately to each accepted member with HyKEM
+//! (X25519 + ML-KEM-768) and COSE_Encrypt0. The stock relay only forwards opaque
+//! event bytes and never receives an epoch grant.
 //!
-//! - a **plaintext** publisher/subscriber in `hyprstream-workers` (a thin
-//!   wrapper over [`crate::moq_event::MoqEventPublisher`] /
-//!   [`crate::moq_event::MoqEventSubscriber`]), used by every production
-//!   call site (worker/system lifecycle events, workflow triggers); and
-//! - a **crypto-only** `SecureEventPublisher` / `SecureEventSubscriber`
-//!   (also in `hyprstream-workers`), implementing group-key AES-256-GCM
-//!   encryption + Ed25519 event signing + Ristretto255 DH key wrapping, but
-//!   with **no MoQ transport wiring at all** — `SecureEventPublisher::publish`
-//!   returned an [`EncryptedEvent`] struct and left it to the (nonexistent)
-//!   caller to actually put it on the wire. It was exercised only by its own
-//!   unit tests.
-//!
-//! This module **unifies both into one canonical [`EventPublisher`] /
-//! [`EventSubscriber`] pair**, living in `hyprstream-rpc` alongside
-//! [`crate::moq_event`] (the transport it wires to) and
-//! [`crate::crypto::event_crypto`] (the crypto it wires to) — both already
-//! lived in this crate, so the publisher/subscriber types that glue them
-//! together belong here too, not in `hyprstream-workers`.
-//!
-//! The privacy mode is selected per `EventPublisher` instance via
-//! [`EventPrivacy`]:
-//!
-//! - [`EventPrivacy::Public`] — no encryption; the payload is written to the
-//!   moq track unmodified. This is **wire-identical** to the pre-EV1
-//!   plaintext path, so existing production callers
-//!   (`EventPublisher::new("worker")`, `EventPublisher::new("system")`, …)
-//!   keep working unchanged with no behavior change. This is the default for
-//!   [`EventPublisher::new`] / [`EventPublisher::new_with_oid`] /
-//!   [`EventPublisher::new_oid_only`] — flipping any production publisher to
-//!   an encrypted-by-default mode is explicitly OUT OF SCOPE for this ticket
-//!   (deferred to the EventService consolidation epic's later phases, which
-//!   also need group-membership records (#602) and authenticated join (#604)
-//!   before an encrypted default is safe).
-//! - [`EventPrivacy::ZeroKnowledge`] / [`EventPrivacy::LimitedKnowledge`] —
-//!   group-key encrypted, Ed25519-signed events, now actually wired to a
-//!   shared `moq_event` broadcast track per registered prefix: one
-//!   ciphertext is written once per publish and fans out natively to every
-//!   subscriber of that track (previously this crypto path had no transport
-//!   at all).
+//! Event objects derive distinct sender/track AEAD keys and deterministic nonce
+//! domains from the epoch secret. Their AAD binds publisher, track, membership
+//! version, epoch, and sequence; subscribers reject nonce misuse, replay, unknown
+//! epochs, and retired objects. Publisher identity is anchored by the controller
+//! grant and attested with mandatory Ed25519 + ML-DSA-65 composite signatures.
+//! Ed25519 keys and subscriber-generated blinded Ristretto presentations are never
+//! used as KEX keys.
 //!
 //! # Wire format
 //!
-//! `EventPrivacy::Public` publishes the payload unmodified via
-//! [`crate::moq_event::MoqEventPublisher::publish_raw`] — same
-//! `[topic_len][topic][payload]` framing as before this module existed.
-//!
-//! `EventPrivacy::ZeroKnowledge` / `LimitedKnowledge` publish an
-//! [`EncryptedEvent`] encoded by [`EncryptedEvent::encode_body`] as the moq
-//! frame's payload (the topic itself still travels as the moq frame's topic
-//! field, unencrypted — topic *secrecy* is out of scope here; see epic #600's
-//! EV3 (#603) for keyed/opaque topic routing). The encoded body is a simple
-//! versioned, length-prefixed binary layout (mirroring the project's existing
-//! `[len][bytes]` framing style rather than introducing a capnp schema for an
-//! internal-only, single-crate wire format):
+//! `EventPrivacy::Public` publishes payloads unmodified. Confidential modes encode
+//! an [`EncryptedEvent`] as a versioned, length-prefixed MoQ payload:
 //!
 //! ```text
-//! [1B version][12B nonce][16B key_commitment]
+//! [1B version][16B session_id][12B nonce][16B key_commitment]
 //! [4B tag_len][tag][4B ciphertext_len][ciphertext][4B lk_tag_len][lk_tag]
-//! [8B timestamp BE][32B publisher_pubkey][4B signature_len][signature]
+//! [8B timestamp BE][8B membership_version][8B epoch][8B sequence]
+//! [32B publisher_pubkey][4B signature_len][hybrid signature]
 //! ```
 //!
-//! # Signature verification (new in this module)
-//!
-//! The original crypto-only `SecureEventPublisher` populated
-//! `EncryptedEvent::signature` / `publisher_pubkey`, but no subscriber-side
-//! code ever verified them. Since this module builds the receive path from
-//! scratch, [`EventSubscriber::recv`] now verifies the embedded Ed25519
-//! signature against the decrypted payload before returning it, rejecting
-//! tampered frames. The embedded pubkey is **self-asserted** by the wire
-//! frame, not yet bound to a verified service/DID identity — that binding
-//! (publisher↔DID authentication on the publish path) is epic #600's EV4
-//! (#604), gated on #446. This verification only proves the signature is
-//! internally consistent with the payload: tamper-evidence, not identity.
+//! The topic remains the MoQ frame topic. It is authenticated by the hybrid
+//! signature; deployments requiring routing opacity bind the controller's opaque
+//! routing policy into each member grant.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Result};
-use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
-use tokio::sync::{mpsc, RwLock};
+use ed25519_dalek::SigningKey;
+use rand::RngCore;
+use tokio::sync::RwLock;
 use tracing::debug;
 use zeroize::Zeroizing;
 
+use crate::crypto::cose_sign::{sign_composite, verify_composite};
 use crate::crypto::event_crypto::{
-    build_event_sig_message, check_key_commitment, decrypt_event_full, derive_wrap_key,
-    encrypt_event, unwrap_group_key, wrap_group_key, EventPrivacy,
+    build_epoch_event_sig_message, decrypt_epoch_event, derive_event_nonce, encrypt_epoch_event,
+    EventPrivacy,
 };
-use crate::crypto::{generate_ephemeral_keypair, keyed_mac, ristretto_dh_raw};
+use crate::crypto::group_key::{open_epoch_grant, EpochGrant};
+use crate::crypto::hybrid_kem::RecipientKeypair;
+use crate::crypto::keyed_mac;
+use crate::crypto::pq::{ml_dsa_vk_bytes, MlDsaSigningKey};
 use crate::envelope::Subject;
 // The four shared event types + the rotation constants are canonical in the
 // keyable-group primitive (`crypto::group_key`); re-export them here so the
@@ -99,8 +58,8 @@ use crate::envelope::Subject;
 // stable. (Only the EventService-specific `EncryptedEvent` wire codec + the
 // `EventPublisher`/`EventSubscriber`/`KeyRing` types are defined in this module.)
 pub use crate::crypto::group_key::{
-    EncryptedEvent, MAX_KEY_LIFETIME, DEFAULT_ROTATION_INTERVAL, GRACE_PERIOD, RekeyPolicy,
-    RotationResult, WrappedKeyEntry,
+    EncryptedEvent, RekeyPolicy, RotationResult, WrappedKeyEntry, DEFAULT_ROTATION_INTERVAL,
+    GRACE_PERIOD, MAX_KEY_LIFETIME,
 };
 use crate::moq_event::{
     global_moq_event_origin, BackfillMode, MoqEventPublisher, MoqEventSubscriber,
@@ -112,33 +71,19 @@ use crate::moq_event::{
 // subscriber-side grace constant below is specific to this module.
 // ============================================================================
 
-/// Default grace period a subscriber accepts the previous group key after a
-/// rekey (separate from the publisher-side [`GRACE_PERIOD`] above — this one
-/// bounds how long [`EventSubscriber::try_decrypt`] still trial-decrypts with
-/// `previous` after [`EventSubscriber::promote_key`]).
+/// Maximum grace period in which a subscriber accepts authenticated objects
+/// from the prior epoch, bounded by the controller-supplied last-issued
+/// sequence. Security-triggered transitions install zero grace.
 pub const DEFAULT_SUBSCRIBER_GRACE_PERIOD: Duration = Duration::from_secs(30);
+/// Maximum accepted event identities retained for one subscriber prefix. Older
+/// identities age out of this replay window rather than growing memory for the
+/// entire lifetime of a long-running epoch.
+pub const MAX_REPLAY_WINDOW: usize = 4_096;
 
-// Rekey policy configuration.
-//
-// # Cost / forward-secrecy tradeoff (#606)
-//
-// Rotation re-wraps the group key for every known subscriber: O(M) DH +
-// AEAD-wrap operations per rotation, M = group size (see
-// [`EventPublisher::rotate_key`]).
-//
-// - [`RekeyPolicy::Immediate`] rotates on EVERY revocation — prompt
-//   forward-secrecy (a revoked member loses access immediately), but O(M)
-//   PER revocation. M sequential departures cost O(M²) total. Use only for
-//   an explicit revocation / suspected-compromise event on a specific
-//   prefix, not as a blanket policy for routine membership churn.
-// - [`RekeyPolicy::Scheduled`] bounds the cost to O(M) per `interval` regardless
-//   of churn, but DEFERS revocation: a removed member can still decrypt
-//   until the next scheduled rotation (up to `interval`, capped by
-//   [`MAX_KEY_LIFETIME`]). This is the default — routine join/leave should
-//   not pay an O(M) rewrap per event.
-// - [`RekeyPolicy::Jittered`] is `Scheduled` plus timing-attack resistance on
-//   exactly when the rotation fires; same cost/latency tradeoff as
-//   `Scheduled`.
+// Rekey policy configuration remains an API-level scheduling hint. Every
+// controller membership/security transition nevertheless prepares a fresh
+// epoch and O(M) per-member HyKEM/COSE grants; EventPublisher cannot rotate or
+// distribute epochs itself.
 //
 // Recommended use: `Scheduled`/`Jittered` for the steady state; switch a
 // specific prefix to `Immediate` only around an explicit revocation, then
@@ -151,7 +96,16 @@ pub const DEFAULT_SUBSCRIBER_GRACE_PERIOD: Duration = Duration::from_secs(30);
 // EncryptedEvent — wire-encodable result of encrypting an event
 // ============================================================================
 
-const WIRE_VERSION: u8 = 1;
+const WIRE_VERSION: u8 = 3;
+const EVENT_ATTESTATION_SCHEMA_ID: u64 = 0x86fe_5f45_a782_3a11;
+const EVENT_ATTESTATION_TYPE_ID: u64 = 0x4576_7448_7942_3032; // "EvtHyB02"
+
+fn event_attestation_aad() -> Vec<u8> {
+    crate::crypto::cose_sign1::build_external_aad(
+        EVENT_ATTESTATION_SCHEMA_ID,
+        EVENT_ATTESTATION_TYPE_ID,
+    )
+}
 
 impl EncryptedEvent {
     /// Encode the non-topic fields into a wire frame body (see module docs
@@ -159,7 +113,8 @@ impl EncryptedEvent {
     /// topic field and is reattached by [`Self::decode_body`].
     fn encode_body(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(
-            1 + 12
+            1 + 16
+                + 12
                 + 16
                 + 4
                 + self.tag.len()
@@ -168,17 +123,24 @@ impl EncryptedEvent {
                 + 4
                 + self.lk_tag.len()
                 + 8
+                + 8
+                + 8
+                + 8
                 + 32
                 + 4
                 + self.signature.len(),
         );
         buf.push(WIRE_VERSION);
+        buf.extend_from_slice(&self.session_id);
         buf.extend_from_slice(&self.nonce);
         buf.extend_from_slice(&self.key_commitment);
         push_lenprefixed(&mut buf, &self.tag);
         push_lenprefixed(&mut buf, &self.ciphertext);
         push_lenprefixed(&mut buf, &self.lk_tag);
         buf.extend_from_slice(&self.timestamp.to_be_bytes());
+        buf.extend_from_slice(&self.membership_version.to_be_bytes());
+        buf.extend_from_slice(&self.epoch.to_be_bytes());
+        buf.extend_from_slice(&self.sequence.to_be_bytes());
         buf.extend_from_slice(&self.publisher_pubkey);
         push_lenprefixed(&mut buf, &self.signature);
         buf
@@ -192,6 +154,7 @@ impl EncryptedEvent {
         if version != WIRE_VERSION {
             return Err(anyhow!("unsupported event wire version {version}"));
         }
+        let session_id: [u8; 16] = read_array(buf, &mut off)?;
         let nonce: [u8; 12] = read_array(buf, &mut off)?;
         let key_commitment: [u8; 16] = read_array(buf, &mut off)?;
         let tag = read_lenprefixed(buf, &mut off)?;
@@ -199,8 +162,14 @@ impl EncryptedEvent {
         let lk_tag = read_lenprefixed(buf, &mut off)?;
         let timestamp_bytes: [u8; 8] = read_array(buf, &mut off)?;
         let timestamp = i64::from_be_bytes(timestamp_bytes);
+        let membership_version = u64::from_be_bytes(read_array(buf, &mut off)?);
+        let epoch = u64::from_be_bytes(read_array(buf, &mut off)?);
+        let sequence = u64::from_be_bytes(read_array(buf, &mut off)?);
         let publisher_pubkey: [u8; 32] = read_array(buf, &mut off)?;
         let signature = read_lenprefixed(buf, &mut off)?;
+        if off != buf.len() {
+            return Err(anyhow!("event wire: trailing bytes"));
+        }
         Ok(Self {
             topic: topic.to_owned(),
             tag,
@@ -211,6 +180,10 @@ impl EncryptedEvent {
             signature,
             publisher_pubkey,
             timestamp,
+            session_id,
+            membership_version,
+            epoch,
+            sequence,
         })
     }
 }
@@ -257,10 +230,6 @@ fn now_millis() -> i64 {
         .as_millis() as i64
 }
 
-fn hash_pubkey(pubkey: &[u8; 32]) -> [u8; 32] {
-    *blake3::hash(pubkey).as_bytes()
-}
-
 fn hash_prefix_bytes(data: &[u8]) -> [u8; 32] {
     *blake3::hash(data).as_bytes()
 }
@@ -269,37 +238,25 @@ fn hash_prefix_bytes(data: &[u8]) -> [u8; 32] {
 // EventPublisher — the canonical broadcast publisher
 // ============================================================================
 
-/// Group-key state for one registered prefix (ZK/LK modes only).
-struct GroupKeyState {
-    current: Zeroizing<[u8; 32]>,
-    pending: Option<PendingRekey>,
-    created_at: Instant,
-}
-
-struct PendingRekey {
-    new_key: Zeroizing<[u8; 32]>,
-    effective_at: Instant,
-    new_ephemeral_secret: Zeroizing<[u8; 32]>,
-    new_ephemeral_pubkey: [u8; 32],
-}
-
-/// Crypto state for one registered prefix. Present only when the publisher's
-/// privacy mode is ZeroKnowledge/LimitedKnowledge; `Public`-mode prefixes
-/// carry no crypto state at all.
+/// Controller-installed crypto state for one encrypted prefix.
+///
+/// EventService never invents or distributes this key. The controller creates
+/// the epoch through `GroupKeyRegistry`, commits membership+epoch atomically,
+/// and installs the resulting secret here on an authorized publisher.
 struct PrefixCrypto {
-    key_state: GroupKeyState,
-    /// Publisher's ephemeral Ristretto255 secret scalar bytes.
-    ephemeral_secret: Zeroizing<[u8; 32]>,
-    /// Publisher's ephemeral Ristretto255 public key bytes.
-    ephemeral_pubkey: [u8; 32],
-    /// Known subscriber pubkeys (hash -> pubkey).
-    subscribers: HashMap<[u8; 32], [u8; 32]>,
+    membership_version: u64,
+    epoch: u64,
+    current: Zeroizing<[u8; 32]>,
+    sequence: u64,
+    session_id: [u8; 16],
+    created_at: Instant,
 }
 
 /// Per-prefix state: the moq transport for `local/events/{prefix}`, plus
 /// optional encryption state.
 struct PrefixState {
     moq: MoqEventPublisher,
+    confidential: bool,
     crypto: Option<PrefixCrypto>,
 }
 
@@ -308,8 +265,8 @@ struct PrefixState {
 //
 // This is the EventService PEP (Policy Enforcement Point) for the
 // `publish`/`subscribe` ScopeActions. The load-bearing membership gate for
-// obtaining `K_group` lives in `GroupKeyRegistry::join`'s `MembershipResolver`
-// (fail-closed); these checks guard the publish/subscribe paths themselves.
+// obtaining `K_group` is the fail-closed `MembershipResolver` used by
+// `GroupKeyRegistry::prepare_change`; these checks guard the event paths.
 //
 // The reference-monitor enforcement at the *generated 9P mount* is S2 (#568,
 // blocked on #539) — that is a separate PEP. EV4 wires the event-plane PEP;
@@ -378,7 +335,9 @@ impl PublisherIdentity {
     }
     /// A publisher with a verified DID (post-#446, or non-IPC paths).
     pub fn verified(did: impl Into<String>) -> Self {
-        Self { did: Some(did.into()) }
+        Self {
+            did: Some(did.into()),
+        }
     }
     /// Is a verified DID bound? (Confidential publish requires this.)
     pub fn is_verified(&self) -> bool {
@@ -405,8 +364,9 @@ pub struct EventPublisher {
     /// `new_encrypted` publishers, which must use `publish_raw`.
     primary_source: String,
     prefixes: Arc<RwLock<HashMap<String, PrefixState>>>,
-    /// Ed25519 signing key. `None` for `Public`-only publishers.
+    /// Dedicated hybrid publisher attestation keys. Both are absent for Public.
     signing_key: Option<SigningKey>,
+    pq_signing_key: Option<MlDsaSigningKey>,
     privacy_mode: EventPrivacy,
     rekey_policy: RekeyPolicy,
     /// Event-plane authz (EV4). `AllowAll` for the `Public` profile (open
@@ -456,11 +416,19 @@ impl EventPublisher {
 
     fn from_public_prefix(source: &str, moq: MoqEventPublisher) -> Result<Self> {
         let mut map = HashMap::new();
-        map.insert(source.to_owned(), PrefixState { moq, crypto: None });
+        map.insert(
+            source.to_owned(),
+            PrefixState {
+                moq,
+                confidential: false,
+                crypto: None,
+            },
+        );
         Ok(Self {
             primary_source: source.to_owned(),
             prefixes: Arc::new(RwLock::new(map)),
             signing_key: None,
+            pq_signing_key: None,
             privacy_mode: EventPrivacy::Public,
             rekey_policy: RekeyPolicy::default(),
             // Public firehose profile: no authz by design; identity N/A.
@@ -488,10 +456,12 @@ impl EventPublisher {
             );
         }
         rekey_policy.validate()?;
+        let pq_signing_key = crate::node_identity::derive_mesh_mldsa_key(&signing_key);
         Ok(Self {
             primary_source: String::new(),
             prefixes: Arc::new(RwLock::new(HashMap::new())),
             signing_key: Some(signing_key),
+            pq_signing_key: Some(pq_signing_key),
             privacy_mode,
             rekey_policy,
             // Confidential profile: deny-by-default (MAC) until a real authz is
@@ -518,106 +488,94 @@ impl EventPublisher {
         self
     }
 
-    /// Register a new encrypted prefix: opens its moq transport, generates a
-    /// fresh group key and Ristretto255 ephemeral keypair.
-    ///
-    /// Returns the publisher's ephemeral pubkey for this prefix (used by
-    /// subscribers' [`EventSubscriber::join_prefix`]).
-    pub async fn register_prefix(&self, prefix: &str) -> Result<[u8; 32], String> {
+    /// Register a confidential MOQT prefix. No key is generated here: publish
+    /// remains fail-closed until the controller installs a committed epoch.
+    pub async fn register_prefix(&self, prefix: &str) -> Result<(), String> {
         if self.privacy_mode == EventPrivacy::Public {
             return Err("register_prefix is only valid on encrypted (ZK/LK) publishers".to_owned());
+        }
+        let mut prefixes = self.prefixes.write().await;
+        if prefixes.contains_key(prefix) {
+            return Err(format!(
+                "prefix '{prefix}' is already registered; replacement could reset a live crypto domain"
+            ));
         }
         let origin = global_moq_event_origin().ok_or_else(|| {
             "moq event bus not initialized; start the event service first".to_owned()
         })?;
         let moq = origin.publisher(prefix).map_err(|e| e.to_string())?;
-
-        let mut group_key = Zeroizing::new([0u8; 32]);
-        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut *group_key);
-        let (eph_secret, eph_public) = generate_ephemeral_keypair();
-        let ephemeral_secret = Zeroizing::new(eph_secret.scalar().to_bytes());
-        let ephemeral_pubkey = eph_public.to_bytes();
-
-        let crypto = PrefixCrypto {
-            key_state: GroupKeyState {
-                current: group_key,
-                pending: None,
-                created_at: Instant::now(),
-            },
-            ephemeral_secret,
-            ephemeral_pubkey,
-            subscribers: HashMap::new(),
-        };
-
-        self.prefixes.write().await.insert(
+        prefixes.insert(
             prefix.to_owned(),
             PrefixState {
                 moq,
-                crypto: Some(crypto),
+                confidential: true,
+                crypto: None,
             },
         );
-        Ok(ephemeral_pubkey)
+        Ok(())
     }
 
-    /// Wrap the current group key for a new subscriber (DH + key-wrap).
-    /// Returns the wrapped key blob, suitable for deposit to PolicyService.
+    /// Install an epoch only after the controller atomically committed the same
+    /// membership-version/epoch coordinates.
+    pub async fn install_committed_epoch(
+        &self,
+        prefix: &str,
+        membership_version: u64,
+        epoch: u64,
+        epoch_secret: Zeroizing<[u8; 32]>,
+    ) -> Result<(), String> {
+        if membership_version == 0 || epoch == 0 {
+            return Err(
+                "confidential EventService epochs start at committed version/epoch 1".to_owned(),
+            );
+        }
+        if self.verifying_key().is_none() {
+            return Err("encrypted publisher has no hybrid identity".to_owned());
+        }
+        let mut prefixes = self.prefixes.write().await;
+        let state = prefixes
+            .get_mut(prefix)
+            .ok_or_else(|| format!("prefix '{prefix}' not registered"))?;
+        if !state.confidential {
+            return Err("cannot install an epoch on a public prefix".to_owned());
+        }
+        if let Some(current) = &state.crypto {
+            if membership_version <= current.membership_version || epoch <= current.epoch {
+                return Err(
+                    "epoch installation must advance membership version and epoch".to_owned(),
+                );
+            }
+        }
+        let mut rng = rand::rngs::OsRng;
+        let session_id =
+            ((u128::from(rng.next_u64()) << 64) | u128::from(rng.next_u64())).to_be_bytes();
+        state.crypto = Some(PrefixCrypto {
+            membership_version,
+            epoch,
+            current: epoch_secret,
+            sequence: 0,
+            session_id,
+            created_at: Instant::now(),
+        });
+        Ok(())
+    }
+
+    /// Classical Ristretto wrapping was removed. Epoch release is exclusively
+    /// per-member HyKEM/COSE via `GroupKeyRegistry::prepare_change`.
     pub async fn wrap_for_subscriber(
         &self,
-        prefix: &str,
-        subscriber_pubkey: &[u8; 32],
+        _prefix: &str,
+        _subscriber_pubkey: &[u8; 32],
     ) -> Result<Vec<u8>, String> {
-        let mut prefixes = self.prefixes.write().await;
-        let state = prefixes
-            .get_mut(prefix)
-            .ok_or_else(|| format!("prefix '{prefix}' not registered"))?;
-        let crypto = state
-            .crypto
-            .as_mut()
-            .ok_or_else(|| format!("prefix '{prefix}' is not an encrypted prefix"))?;
-
-        maybe_promote_pending(crypto);
-
-        let sub_hash = hash_pubkey(subscriber_pubkey);
-        let group_key = &crypto.key_state.current;
-        let shared_secret = Zeroizing::new(
-            ristretto_dh_raw(&crypto.ephemeral_secret, subscriber_pubkey)
-                .map_err(|e| format!("DH failed: {e}"))?,
-        );
-        let wrap_key = derive_wrap_key(&shared_secret, subscriber_pubkey, &crypto.ephemeral_pubkey);
-        wrap_group_key(&wrap_key, group_key, &sub_hash, prefix)
+        Err("classical event key wrapping removed; use controller HyKEM epoch grants".to_owned())
     }
 
-    /// Wrap the group key for multiple new subscribers. Returns
-    /// `(sub_pubkey_hash, wrapped_blob)` pairs ready for PolicyService deposit.
     pub async fn wrap_for_new_subscribers(
         &self,
-        prefix: &str,
-        subscriber_pubkeys: &[[u8; 32]],
+        _prefix: &str,
+        _subscriber_pubkeys: &[[u8; 32]],
     ) -> Result<Vec<([u8; 32], Vec<u8>)>, String> {
-        let mut prefixes = self.prefixes.write().await;
-        let state = prefixes
-            .get_mut(prefix)
-            .ok_or_else(|| format!("prefix '{prefix}' not registered"))?;
-        let crypto = state
-            .crypto
-            .as_mut()
-            .ok_or_else(|| format!("prefix '{prefix}' is not an encrypted prefix"))?;
-
-        maybe_promote_pending(crypto);
-
-        let mut results = Vec::with_capacity(subscriber_pubkeys.len());
-        for sub_pubkey in subscriber_pubkeys {
-            let sub_hash = hash_pubkey(sub_pubkey);
-            let shared_secret = Zeroizing::new(
-                ristretto_dh_raw(&crypto.ephemeral_secret, sub_pubkey)
-                    .map_err(|e| format!("DH failed: {e}"))?,
-            );
-            let wrap_key = derive_wrap_key(&shared_secret, sub_pubkey, &crypto.ephemeral_pubkey);
-            let wrapped = wrap_group_key(&wrap_key, &crypto.key_state.current, &sub_hash, prefix)?;
-            crypto.subscribers.insert(sub_hash, *sub_pubkey);
-            results.push((sub_hash, wrapped));
-        }
-        Ok(results)
+        Err("classical event key wrapping removed; use controller HyKEM epoch grants".to_owned())
     }
 
     /// Publish `{primary_source}.{entity}.{event}` (matches the pre-EV1
@@ -655,64 +613,84 @@ impl EventPublisher {
             .get_mut(&prefix)
             .ok_or_else(|| anyhow!("prefix '{prefix}' not registered"))?;
 
-        match state.crypto.as_mut() {
-            None => state.moq.publish_raw(topic, payload),
-            Some(crypto) => {
-                // EV4 event-plane PEP (publish ScopeAction). The caller is this
-                // publisher; its subject comes from `publisher_identity`
-                // (`Subject::anonymous()` until #446 wires verified IPC
-                // identity — a real authz impl denies anonymous for the
-                // confidential profile). DenyAll (the default) denies every
-                // publish until a real authz is injected via `with_authz`.
-                let caller = match &self.publisher_identity.did {
-                    // TODO(#446): IPC callers currently resolve as anonymous
-                    // (key-derived identity lost over UDS); the verified DID
-                    // binding is the #446 fast-follow. Do NOT fake a DID.
-                    Some(did) => Subject::new(did.clone()),
-                    None => Subject::anonymous(),
-                };
-                if !self.authz.can_publish(&caller, &prefix) {
-                    return Err(anyhow!(
-                        "publish denied by event-plane authz for prefix '{prefix}'"
-                    ));
-                }
-                maybe_promote_pending(crypto);
-                let signing_key = self
-                    .signing_key
-                    .as_ref()
-                    .ok_or_else(|| anyhow!("encrypted privacy mode requires a signing key"))?;
-
-                let group_key: &[u8; 32] = &crypto.key_state.current;
-                let timestamp = now_millis();
-                let sig_message = build_event_sig_message(topic, payload, timestamp);
-                let signature = signing_key.sign(&sig_message);
-
-                let (tag, ciphertext, nonce, commitment) =
-                    encrypt_event(group_key, &prefix, payload, self.privacy_mode)
-                        .map_err(|e| anyhow!(e))?;
-
-                let lk_tag = match self.privacy_mode {
-                    EventPrivacy::LimitedKnowledge => {
-                        keyed_mac(group_key, prefix.as_bytes())[..16].to_vec()
-                    }
-                    EventPrivacy::ZeroKnowledge | EventPrivacy::Public => vec![],
-                };
-
-                let encrypted = EncryptedEvent {
-                    topic: topic.to_owned(),
-                    tag,
-                    ciphertext,
-                    nonce,
-                    key_commitment: commitment,
-                    lk_tag,
-                    signature: signature.to_bytes().to_vec(),
-                    publisher_pubkey: signing_key.verifying_key().to_bytes(),
-                    timestamp,
-                };
-
-                state.moq.publish_raw(topic, &encrypted.encode_body())
-            }
+        if !state.confidential {
+            return state.moq.publish_raw(topic, payload);
         }
+        let crypto = state.crypto.as_mut().ok_or_else(|| {
+            anyhow!("confidential prefix '{prefix}' has no committed controller epoch installed")
+        })?;
+        let caller = match &self.publisher_identity.did {
+            Some(did) => Subject::new(did.clone()),
+            None => Subject::anonymous(),
+        };
+        if !self.authz.can_publish(&caller, &prefix) {
+            return Err(anyhow!(
+                "publish denied by event-plane authz for prefix '{prefix}'"
+            ));
+        }
+        let signing_key = self
+            .signing_key
+            .as_ref()
+            .ok_or_else(|| anyhow!("encrypted privacy mode requires an Ed25519 signing key"))?;
+        let pq_signing_key = self
+            .pq_signing_key
+            .as_ref()
+            .ok_or_else(|| anyhow!("encrypted privacy mode requires an ML-DSA-65 signing key"))?;
+        let publisher_pubkey = signing_key.verifying_key().to_bytes();
+        let timestamp = now_millis();
+        let sequence = crypto
+            .sequence
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("event sequence exhausted; rotate epoch"))?;
+        let (tag, ciphertext, nonce, commitment) = encrypt_epoch_event(
+            &crypto.current,
+            &prefix,
+            &publisher_pubkey,
+            &crypto.session_id,
+            crypto.membership_version,
+            crypto.epoch,
+            sequence,
+            payload,
+        )
+        .map_err(|e| anyhow!(e))?;
+        let sig_message = build_epoch_event_sig_message(
+            topic,
+            payload,
+            timestamp,
+            &crypto.session_id,
+            crypto.membership_version,
+            crypto.epoch,
+            sequence,
+        );
+        let signature = sign_composite(
+            signing_key,
+            Some(pq_signing_key),
+            &sig_message,
+            &event_attestation_aad(),
+        )?;
+        crypto.sequence = sequence;
+        let lk_tag = match self.privacy_mode {
+            EventPrivacy::LimitedKnowledge => {
+                keyed_mac(&crypto.current, prefix.as_bytes())[..16].to_vec()
+            }
+            EventPrivacy::ZeroKnowledge | EventPrivacy::Public => vec![],
+        };
+        let encrypted = EncryptedEvent {
+            topic: topic.to_owned(),
+            tag,
+            ciphertext,
+            nonce,
+            key_commitment: commitment,
+            lk_tag,
+            signature,
+            publisher_pubkey,
+            timestamp,
+            session_id: crypto.session_id,
+            membership_version: crypto.membership_version,
+            epoch: crypto.epoch,
+            sequence,
+        };
+        state.moq.publish_raw(topic, &encrypted.encode_body())
     }
 
     /// True if a key rotation is due for `prefix` per this publisher's
@@ -725,7 +703,7 @@ impl EventPublisher {
         let Some(crypto) = state.crypto.as_ref() else {
             return false;
         };
-        let age = crypto.key_state.created_at.elapsed();
+        let age = crypto.created_at.elapsed();
         match &self.rekey_policy {
             RekeyPolicy::Scheduled { interval } => age >= *interval,
             RekeyPolicy::Immediate => false,
@@ -740,65 +718,15 @@ impl EventPublisher {
         }
     }
 
-    /// Rotate the group key for `prefix`: generates a new group key +
-    /// ephemeral keypair, wraps the new key for all known subscribers. The
-    /// caller is responsible for broadcasting a rekey announcement and
-    /// depositing the wrapped keys.
+    /// EventService cannot rotate or distribute epochs by itself. The
+    /// controller must prepare+commit through `GroupKeyRegistry`, deliver each
+    /// HyKEM grant out of band, then call [`Self::install_committed_epoch`].
     pub async fn rotate_key(
         &self,
-        prefix: &str,
-        effective_delay: Duration,
+        _prefix: &str,
+        _effective_delay: Duration,
     ) -> Result<RotationResult, String> {
-        let mut prefixes = self.prefixes.write().await;
-        let state = prefixes
-            .get_mut(prefix)
-            .ok_or_else(|| format!("prefix '{prefix}' not registered"))?;
-        let crypto = state
-            .crypto
-            .as_mut()
-            .ok_or_else(|| format!("prefix '{prefix}' is not an encrypted prefix"))?;
-
-        let mut new_group_key = Zeroizing::new([0u8; 32]);
-        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut *new_group_key);
-        let (new_eph_secret, new_eph_public) = generate_ephemeral_keypair();
-        let new_ephemeral_secret = Zeroizing::new(new_eph_secret.scalar().to_bytes());
-        let new_ephemeral_pubkey = new_eph_public.to_bytes();
-
-        let mut wrapped_keys = Vec::with_capacity(crypto.subscribers.len());
-        for (sub_hash, sub_pubkey) in &crypto.subscribers {
-            let shared_secret = Zeroizing::new(
-                ristretto_dh_raw(&new_ephemeral_secret, sub_pubkey)
-                    .map_err(|e| format!("DH failed: {e}"))?,
-            );
-            let wrap_key = derive_wrap_key(&shared_secret, sub_pubkey, &new_ephemeral_pubkey);
-            let wrapped = wrap_group_key(&wrap_key, &new_group_key, sub_hash, prefix)?;
-            let mut routing_tag = [0u8; 16];
-            rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut routing_tag);
-            wrapped_keys.push(WrappedKeyEntry {
-                routing_tag,
-                wrapped_blob: wrapped,
-            });
-        }
-
-        let effective_at = Instant::now() + effective_delay;
-        // During the pending window, wrap_for_subscriber uses the CURRENT
-        // (old) ephemeral keypair and group key — new subscribers get a
-        // working key that will be rekeyed at effective_at via the rekey
-        // announcement, atomically promoted by maybe_promote_pending().
-        crypto.key_state.pending = Some(PendingRekey {
-            new_key: new_group_key,
-            effective_at,
-            new_ephemeral_secret,
-            new_ephemeral_pubkey,
-        });
-
-        let effective_at_millis = now_millis() + effective_delay.as_millis() as i64;
-
-        Ok(RotationResult {
-            new_ephemeral_pubkey,
-            wrapped_keys,
-            effective_at_millis,
-        })
+        Err("controller-managed epochs cannot be rotated by EventPublisher".to_owned())
     }
 
     /// The privacy mode this publisher was constructed with.
@@ -820,21 +748,6 @@ impl EventPublisher {
     }
 }
 
-/// Promote a pending key + ephemeral keypair to current if past
-/// `effective_at`. Must be called under the prefixes write lock.
-fn maybe_promote_pending(crypto: &mut PrefixCrypto) {
-    if let Some(pending) = crypto.key_state.pending.take() {
-        if Instant::now() >= pending.effective_at {
-            crypto.key_state.current = pending.new_key;
-            crypto.key_state.created_at = Instant::now();
-            crypto.ephemeral_secret = pending.new_ephemeral_secret;
-            crypto.ephemeral_pubkey = pending.new_ephemeral_pubkey;
-        } else {
-            crypto.key_state.pending = Some(pending);
-        }
-    }
-}
-
 // ============================================================================
 // KeyRing + RekeyEvent — publisher-side state (EventService-specific; the
 // reusable keyable-group primitive is `crypto::group_key::GroupKeyRegistry`).
@@ -844,316 +757,330 @@ fn maybe_promote_pending(crypto: &mut PrefixCrypto) {
 // EventSubscriber — the canonical broadcast subscriber
 // ============================================================================
 
-/// Holds the current and previous group key for a joined prefix.
-struct KeyRing {
-    current: Zeroizing<[u8; 32]>,
-    previous: Option<Zeroizing<[u8; 32]>>,
-    grace_until: Option<Instant>,
+/// One installed controller epoch.
+struct InstalledEpoch {
+    membership_version: u64,
+    epoch: u64,
+    expires_at_millis: i64,
+    key: Zeroizing<[u8; 32]>,
 }
 
-impl KeyRing {
-    fn new(key: Zeroizing<[u8; 32]>) -> Self {
-        Self {
-            current: key,
-            previous: None,
-            grace_until: None,
-        }
-    }
+struct PriorEpoch {
+    installed: InstalledEpoch,
+    grace_until: Instant,
+    /// Only objects the publisher had already issued before the transition are
+    /// eligible for grace. The controller supplies this authenticated cutoff.
+    last_issued_sequence: u64,
+}
 
-    fn is_grace_expired(&self) -> bool {
-        match self.grace_until {
-            Some(deadline) => Instant::now() >= deadline,
-            None => true,
-        }
-    }
+/// Externally anchored controller-authorized hybrid publisher identity.
+#[derive(Clone)]
+pub struct EventPublisherAnchor {
+    pub ed25519: ed25519_dalek::VerifyingKey,
+    pub ml_dsa_65: crate::crypto::pq::MlDsaVerifyingKey,
+}
 
-    fn gc_previous(&mut self) {
-        if self.is_grace_expired() {
-            self.previous = None;
-            self.grace_until = None;
-        }
+impl EventPublisherAnchor {
+    fn matches(&self, other: &Self) -> bool {
+        self.ed25519 == other.ed25519
+            && ml_dsa_vk_bytes(&self.ml_dsa_65) == ml_dsa_vk_bytes(&other.ml_dsa_65)
     }
 }
 
-/// Per-joined-prefix subscriber state: ephemeral DH keypair + key ring.
-struct SubscriberPrefixState {
-    ephemeral_secret: Zeroizing<[u8; 32]>,
-    ephemeral_pubkey: [u8; 32],
-    /// Publisher's Ristretto255 DH pubkey (for wrap-key re-derivation during
-    /// rekey) — distinct from the Ed25519 signing pubkey embedded per-event
-    /// in [`EncryptedEvent::publisher_pubkey`].
-    publisher_dh_pubkey: [u8; 32],
-    ring: KeyRing,
+#[derive(Clone)]
+struct ConfidentialPrefixExpectation {
+    controller_did: String,
+    publisher: EventPublisherAnchor,
 }
 
-/// A pending rekey notification.
+struct InstalledPrefixState {
+    current: InstalledEpoch,
+    previous: Option<PriorEpoch>,
+    publisher: EventPublisherAnchor,
+    seen_objects: HashSet<(u64, [u8; 16], u64)>,
+    seen_nonces: HashSet<([u8; 16], [u8; 12])>,
+    replay_order: VecDeque<((u64, [u8; 16], u64), ([u8; 16], [u8; 12]))>,
+}
+
+enum SubscriberPrefixState {
+    Expected(Box<ConfidentialPrefixExpectation>),
+    Installed(Box<InstalledPrefixState>),
+}
+
+/// A pending controller epoch notification.
 #[derive(Debug)]
 pub struct RekeyEvent {
     pub prefix: String,
-    pub new_key: Zeroizing<[u8; 32]>,
+    pub membership_version: u64,
+    pub epoch: u64,
     pub effective_at: Instant,
 }
 
-/// The canonical broadcast event subscriber (EV1, epic #600).
-///
-/// Wraps [`MoqEventSubscriber`] for transport. Prefixes NOT joined via
-/// [`Self::join_prefix`] are treated as `Public` mode: [`Self::recv`] returns
-/// their frames unmodified (byte-identical to the pre-EV1 plaintext
-/// subscriber). Joined prefixes are decoded, signature-checked, and
-/// decrypted automatically.
+/// Canonical EventService subscriber. Public tracks pass through. Confidential
+/// tracks are installed only from per-member HyKEM/COSE controller grants.
 pub struct EventSubscriber {
     inner: MoqEventSubscriber,
     prefixes: Arc<RwLock<HashMap<String, SubscriberPrefixState>>>,
-    rekey_tx: mpsc::Sender<RekeyEvent>,
-    rekey_rx: Option<mpsc::Receiver<RekeyEvent>>,
 }
 
 impl EventSubscriber {
-    /// Create a new subscriber. No background task is started until the
-    /// first `recv()` call.
     pub fn new() -> Result<Self> {
-        let (tx, rx) = mpsc::channel(32);
         Ok(Self {
             inner: MoqEventSubscriber::new(),
             prefixes: Arc::new(RwLock::new(HashMap::new())),
-            rekey_tx: tx,
-            rekey_rx: Some(rx),
         })
     }
 
-    /// Take the rekey-notification receiver. Returns `None` if already taken.
-    pub fn take_rekey_receiver(&mut self) -> Option<mpsc::Receiver<RekeyEvent>> {
-        self.rekey_rx.take()
-    }
-
-    /// Subscribe to a topic pattern (prefix match). See
-    /// [`MoqEventSubscriber::subscribe`] for pattern semantics.
     pub fn subscribe(&mut self, pattern: &str) -> Result<()> {
         self.inner.subscribe(pattern)
     }
 
-    /// Subscribe to all events.
     pub fn subscribe_all(&mut self) -> Result<()> {
         self.inner.subscribe_all()
     }
 
-    /// Unsubscribe from a topic pattern. Must be called before `recv()`.
     pub fn unsubscribe(&mut self, pattern: &str) -> Result<()> {
         self.inner.unsubscribe(pattern)
     }
 
-    /// Subscribe to a single model OID's per-OID publication track (#393).
     pub fn subscribe_oid(&mut self, oid: &str) -> Result<()> {
         self.inner.subscribe_oid(oid)
     }
 
-    /// Set the late-join retention mode (#393 decision A: firehose-backfill).
     pub fn with_backfill(&mut self, mode: BackfillMode) -> Result<()> {
         self.inner.with_backfill(mode)
     }
 
-    /// Select the delivery QoS (#606). Pass
-    /// `hyprstream_rpc::stream_info::EventReliable::stream_opt()` for
-    /// at-least-once delivery (events that must not be silently dropped).
-    /// Defaults to `EventLive` (at-most-once, drop-oldest) if never called.
-    /// Must be called before the first `recv()`.
     pub fn with_qos(&mut self, qos: crate::stream_info::StreamOpt) -> Result<()> {
         self.inner.with_qos(qos)
     }
 
-    /// Skip live events already delivered in a prior session (offset-resume,
-    /// #606). See [`crate::moq_event::MoqEventSubscriber::with_resume_from`]
-    /// for the multi-source caveat. Must be called before the first `recv()`.
     pub fn with_resume_from(&mut self, sequence: u64) -> Result<()> {
         self.inner.with_resume_from(sequence)
     }
 
-    /// Highest live-group sequence delivered so far (resume hint, #606).
     pub fn last_sequence(&self) -> u64 {
         self.inner.last_sequence()
     }
 
-    /// Count of items evicted under drop-oldest backpressure (#606).
     pub fn dropped_count(&self) -> u64 {
         self.inner.dropped_count()
     }
 
-    /// Join an encrypted prefix: generate an ephemeral keypair, unwrap the
-    /// initial group key from `wrapped_key_blob` (obtained out-of-band, e.g.
-    /// via PolicyService deposit). Required before [`Self::recv`] will
-    /// decrypt events for `prefix`; un-joined prefixes pass through as
-    /// `Public` mode.
-    pub async fn join_prefix(
+    /// Mark a subscribed prefix as confidential before any grant is delivered.
+    ///
+    /// The controller and publisher anchor come from the caller's authenticated
+    /// control-plane configuration, rather than from a subsequently received
+    /// grant. Frames for an expected prefix fail closed until a matching grant
+    /// is installed.
+    pub async fn expect_confidential_prefix(
         &self,
         prefix: &str,
-        publisher_dh_pubkey: &[u8; 32],
-        wrapped_key_blob: &[u8],
-    ) -> Result<[u8; 32], String> {
-        let (eph_secret, eph_public) = generate_ephemeral_keypair();
-        let eph_pubkey_bytes = eph_public.to_bytes();
-        let eph_secret_bytes: [u8; 32] = eph_secret.scalar().to_bytes();
-
-        let shared_secret = Zeroizing::new(
-            ristretto_dh_raw(&eph_secret_bytes, publisher_dh_pubkey)
-                .map_err(|e| format!("DH failed: {e}"))?,
-        );
-        let wrap_key = derive_wrap_key(&shared_secret, publisher_dh_pubkey, &eph_pubkey_bytes);
-        let sub_hash: [u8; 32] = *blake3::hash(&eph_pubkey_bytes).as_bytes();
-        let group_key = unwrap_group_key(&wrap_key, wrapped_key_blob, &sub_hash, prefix)?;
-
-        let state = SubscriberPrefixState {
-            ephemeral_secret: Zeroizing::new(eph_secret_bytes),
-            ephemeral_pubkey: eph_pubkey_bytes,
-            publisher_dh_pubkey: *publisher_dh_pubkey,
-            ring: KeyRing::new(group_key),
-        };
-
-        self.prefixes.write().await.insert(prefix.to_owned(), state);
-        Ok(eph_pubkey_bytes)
-    }
-
-    /// Try to decrypt an already-decoded ciphertext for `prefix`, trialing
-    /// the current key then the previous key (if within grace period).
-    pub async fn try_decrypt(
-        &self,
-        prefix: &str,
-        tag: &[u8],
-        ciphertext: &[u8],
-        nonce: &[u8; 12],
-        key_commitment: &[u8; 16],
-    ) -> Result<Vec<u8>, String> {
-        let (current_key, previous_key) = {
-            let prefixes = self.prefixes.read().await;
-            let state = prefixes
-                .get(prefix)
-                .ok_or_else(|| format!("not joined to prefix: {prefix}"))?;
-            let current = state.ring.current.clone();
-            let previous = if !state.ring.is_grace_expired() {
-                state.ring.previous.clone()
-            } else {
-                None
-            };
-            (current, previous)
-        };
-
-        if check_key_commitment(&current_key, nonce, key_commitment) {
-            match decrypt_event_full(&current_key, nonce, tag, ciphertext, prefix) {
-                Ok(plaintext) => return Ok(plaintext),
-                Err(e) => debug!(
-                    prefix,
-                    "current key commitment matched but decrypt failed: {e}"
-                ),
-            }
-        }
-
-        if let Some(ref prev_key) = previous_key {
-            if check_key_commitment(prev_key, nonce, key_commitment) {
-                match decrypt_event_full(prev_key, nonce, tag, ciphertext, prefix) {
-                    Ok(plaintext) => {
-                        debug!(prefix, "decrypted with previous key (grace period)");
-                        return Ok(plaintext);
-                    }
-                    Err(e) => debug!(
-                        prefix,
-                        "previous key commitment matched but decrypt failed: {e}"
-                    ),
-                }
-            }
-        }
-
-        Err("decryption failed: no matching key".to_owned())
-    }
-
-    /// Handle a rekey: trial-decrypt the wrapped key entries and send the new
-    /// key to the rekey channel.
-    pub async fn handle_rekey(
-        &self,
-        prefix: &str,
-        wrapped_blobs: &[Vec<u8>],
-        new_publisher_dh_pubkey: &[u8; 32],
-        effective_at: Instant,
+        controller_did: impl Into<String>,
+        publisher: EventPublisherAnchor,
     ) -> Result<(), String> {
-        let (eph_secret, eph_pubkey) = {
-            let prefixes = self.prefixes.read().await;
-            let state = prefixes
-                .get(prefix)
-                .ok_or_else(|| format!("not joined to prefix: {prefix}"))?;
-            (state.ephemeral_secret.clone(), state.ephemeral_pubkey)
-        };
-
-        let sub_hash: [u8; 32] = *blake3::hash(&eph_pubkey).as_bytes();
-        let shared_secret = Zeroizing::new(
-            ristretto_dh_raw(&eph_secret, new_publisher_dh_pubkey)
-                .map_err(|e| format!("DH failed during rekey: {e}"))?,
-        );
-        let wrap_key = derive_wrap_key(&shared_secret, new_publisher_dh_pubkey, &eph_pubkey);
-
-        for wrapped_blob in wrapped_blobs {
-            if let Ok(new_key) = unwrap_group_key(&wrap_key, wrapped_blob, &sub_hash, prefix) {
-                {
-                    let mut prefixes = self.prefixes.write().await;
-                    if let Some(state) = prefixes.get_mut(prefix) {
-                        state.publisher_dh_pubkey = *new_publisher_dh_pubkey;
-                    }
-                }
-                self.rekey_tx
-                    .send(RekeyEvent {
-                        prefix: prefix.to_owned(),
-                        new_key,
-                        effective_at,
-                    })
-                    .await
-                    .map_err(|_| "rekey channel closed".to_owned())?;
-                return Ok(());
-            }
+        if prefix.is_empty() {
+            return Err("confidential prefix must not be empty".to_owned());
         }
-
-        Err("no wrapped entry found for our key".to_owned())
+        let expectation = ConfidentialPrefixExpectation {
+            controller_did: controller_did.into(),
+            publisher,
+        };
+        if expectation.controller_did.is_empty() {
+            return Err("expected controller DID must not be empty".to_owned());
+        }
+        let mut prefixes = self.prefixes.write().await;
+        match prefixes.get(prefix) {
+            None => {
+                prefixes.insert(
+                    prefix.to_owned(),
+                    SubscriberPrefixState::Expected(Box::new(expectation)),
+                );
+                Ok(())
+            }
+            Some(SubscriberPrefixState::Expected(existing))
+                if existing.controller_did == expectation.controller_did
+                    && existing.publisher.matches(&expectation.publisher) =>
+            {
+                Ok(())
+            }
+            Some(_) => Err("confidential prefix is already configured".to_owned()),
+        }
     }
 
-    /// Promote a pending key to current, demoting current to previous with a
-    /// grace period. Should be called at (or after) `effective_at` from a
-    /// [`RekeyEvent`].
-    pub async fn promote_key(
+    /// Install a per-member epoch grant after policy/accepted-state admission.
+    ///
+    /// `prior_last_issued_sequence` is mandatory for an advance and bounds old
+    /// epoch grace to objects issued before the transition. Grace is clamped to
+    /// [`DEFAULT_SUBSCRIBER_GRACE_PERIOD`]; security-triggered transitions pass
+    /// `Some(Duration::ZERO)`.
+    pub async fn install_epoch_grant(
         &self,
         prefix: &str,
-        new_key: Zeroizing<[u8; 32]>,
+        recipient: &RecipientKeypair,
+        grant: &EpochGrant,
+        publisher: EventPublisherAnchor,
+        prior_last_issued_sequence: Option<u64>,
         grace_period: Option<Duration>,
     ) -> Result<(), String> {
+        if prefix.is_empty() || grant.membership_version == 0 || grant.epoch == 0 {
+            return Err("invalid confidential event epoch coordinates".to_owned());
+        }
+        if grant.expires_at_millis <= now_millis() {
+            return Err("epoch grant is expired".to_owned());
+        }
+        if grant.sender_ed25519 != publisher.ed25519.to_bytes()
+            || grant.sender_ml_dsa_65 != ml_dsa_vk_bytes(&publisher.ml_dsa_65)
+            || grant.sender_did.is_empty()
+            || grant.retention_policy.is_empty()
+            || grant.opaque_routing_policy.is_empty()
+        {
+            return Err(
+                "publisher anchor or relay profile does not match the authenticated epoch grant"
+                    .to_owned(),
+            );
+        }
+        let key = open_epoch_grant(recipient, grant)?;
         let mut prefixes = self.prefixes.write().await;
-        let state = prefixes
-            .get_mut(prefix)
-            .ok_or_else(|| format!("not joined to prefix: {prefix}"))?;
-
-        let grace = grace_period.unwrap_or(DEFAULT_SUBSCRIBER_GRACE_PERIOD);
-        let old_current = std::mem::replace(&mut state.ring.current, new_key);
-        state.ring.previous = Some(old_current);
-        state.ring.grace_until = Some(Instant::now() + grace);
-        debug!(prefix, ?grace, "promoted new key, old key in grace period");
-        Ok(())
+        match prefixes.get_mut(prefix) {
+            None => Err(
+                "confidential prefix has no independently configured controller expectation"
+                    .to_owned(),
+            ),
+            Some(prefix_state) => {
+                if let SubscriberPrefixState::Expected(expectation) = prefix_state {
+                    let expected_controller = expectation.controller_did.clone();
+                    let expected_publisher = expectation.publisher.clone();
+                    if grant.controller_did != expected_controller
+                        || !expected_publisher.matches(&publisher)
+                    {
+                        return Err(
+                            "epoch grant does not match the configured controller expectation"
+                                .to_owned(),
+                        );
+                    }
+                    *prefix_state =
+                        SubscriberPrefixState::Installed(Box::new(InstalledPrefixState {
+                            current: InstalledEpoch {
+                                membership_version: grant.membership_version,
+                                epoch: grant.epoch,
+                                expires_at_millis: grant.expires_at_millis,
+                                key,
+                            },
+                            previous: None,
+                            publisher: expected_publisher,
+                            seen_objects: HashSet::new(),
+                            seen_nonces: HashSet::new(),
+                            replay_order: VecDeque::new(),
+                        }));
+                    return Ok(());
+                }
+                let SubscriberPrefixState::Installed(state) = prefix_state else {
+                    unreachable!("expected state is handled above")
+                };
+                if !state.publisher.matches(&publisher) {
+                    return Err(
+                        "publisher anchor changed without a controller-authorized rotation"
+                            .to_owned(),
+                    );
+                }
+                if grant.membership_version != state.current.membership_version + 1
+                    || grant.epoch != state.current.epoch + 1
+                {
+                    return Err(
+                        "epoch grant is unknown, stale, skipped, or future-before-install"
+                            .to_owned(),
+                    );
+                }
+                let last_issued_sequence = prior_last_issued_sequence.ok_or_else(|| {
+                    "epoch advance requires a prior last-issued cutoff".to_owned()
+                })?;
+                let grace = grace_period
+                    .unwrap_or(DEFAULT_SUBSCRIBER_GRACE_PERIOD)
+                    .min(DEFAULT_SUBSCRIBER_GRACE_PERIOD);
+                let old = std::mem::replace(
+                    &mut state.current,
+                    InstalledEpoch {
+                        membership_version: grant.membership_version,
+                        epoch: grant.epoch,
+                        expires_at_millis: grant.expires_at_millis,
+                        key,
+                    },
+                );
+                state.previous = Some(PriorEpoch {
+                    installed: old,
+                    grace_until: Instant::now() + grace,
+                    last_issued_sequence,
+                });
+                state.seen_objects.retain(|(epoch, _, _)| {
+                    *epoch == state.current.epoch || *epoch + 1 == state.current.epoch
+                });
+                state.seen_nonces.clear();
+                state.replay_order.clear();
+                Ok(())
+            }
+        }
     }
 
-    /// Garbage-collect expired previous keys across all joined prefixes.
+    /// Removed classical admission API: an Ed25519/Ristretto key can never be
+    /// substituted for an accepted `#mesh-kem` recipient.
+    pub async fn join_prefix(
+        &self,
+        _prefix: &str,
+        _publisher_dh_pubkey: &[u8; 32],
+        _wrapped_key_blob: &[u8],
+    ) -> Result<[u8; 32], String> {
+        Err("classical event join removed; install a controller HyKEM epoch grant".to_owned())
+    }
+
+    pub async fn handle_rekey(
+        &self,
+        _prefix: &str,
+        _wrapped_blobs: &[Vec<u8>],
+        _new_publisher_dh_pubkey: &[u8; 32],
+        _effective_at: Instant,
+    ) -> Result<(), String> {
+        Err("classical event rekey removed; install a controller HyKEM epoch grant".to_owned())
+    }
+
+    pub async fn promote_key(
+        &self,
+        _prefix: &str,
+        _new_key: Zeroizing<[u8; 32]>,
+        _grace_period: Option<Duration>,
+    ) -> Result<(), String> {
+        Err("raw symmetric epoch promotion removed; install an authenticated grant".to_owned())
+    }
+
     pub async fn gc_expired_keys(&self) {
         let mut prefixes = self.prefixes.write().await;
-        for (prefix, state) in prefixes.iter_mut() {
-            if state.ring.previous.is_some() && state.ring.is_grace_expired() {
-                state.ring.gc_previous();
-                debug!(prefix, "expired previous key removed");
+        for prefix_state in prefixes.values_mut() {
+            let SubscriberPrefixState::Installed(state) = prefix_state else {
+                continue;
+            };
+            if state
+                .previous
+                .as_ref()
+                .is_some_and(|previous| Instant::now() >= previous.grace_until)
+            {
+                state.previous = None;
+                let current_epoch = state.current.epoch;
+                state
+                    .seen_objects
+                    .retain(|(epoch, _, _)| *epoch == current_epoch);
             }
         }
     }
 
     /// Receive the next event.
     ///
-    /// For prefixes NOT joined via [`Self::join_prefix`], the raw payload is
-    /// returned unmodified (`Public` mode passthrough). For joined prefixes,
-    /// the wire frame is decoded, the embedded Ed25519 signature is checked
-    /// (tamper-evidence; see module docs on identity binding), and the
-    /// payload is decrypted via the current/previous-key trial logic in
-    /// [`Self::try_decrypt`]. Frames that fail to decode, verify, or decrypt
-    /// are dropped (logged at debug) and the loop continues — matching the
-    /// event bus's best-effort, at-most-once delivery semantics.
+    /// Unconfigured prefixes remain byte-identical `Public` passthrough;
+    /// explicitly expected confidential prefixes fail closed until their grant
+    /// is installed. For an installed confidential prefix, the wire frame must
+    /// match a current or bounded prior epoch, use the required nonce domain,
+    /// decrypt under the sender/track key, and verify against the externally
+    /// anchored Ed25519 + ML-DSA-65 publisher identity. Invalid frames are
+    /// dropped and the loop continues, matching best-effort event delivery.
     pub async fn recv(&mut self) -> Result<(String, Vec<u8>)> {
         loop {
             let (topic, raw) = self.inner.recv().await?;
@@ -1187,17 +1114,8 @@ impl EventSubscriber {
         let Some((topic, raw)) = self.inner.try_recv()? else {
             return Ok(None);
         };
-        // `decode_frame` is async (it takes the prefixes read lock); but the
-        // lock is uncontended in the common case and this method already
-        // requires being called from an async context to exist at all, so a
-        // blocking `block_in_place`-free best-effort: prefixes not joined
-        // (the overwhelmingly common Public-mode case) never touch the lock.
-        if topic
-            .split('.')
-            .next()
-            .map(|prefix| matches!(self.prefixes.try_read(), Ok(p) if p.contains_key(prefix)))
-            .unwrap_or(false)
-        {
+        let prefix = topic.split('.').next().unwrap_or(&topic);
+        if self.prefix_is_confidential(prefix)? {
             // An encrypted prefix; decoding requires the async path. Callers
             // needing non-blocking receive on encrypted prefixes should use
             // `recv_timeout(Duration::ZERO)` instead.
@@ -1208,51 +1126,141 @@ impl EventSubscriber {
         Ok(Some((topic, raw)))
     }
 
+    fn prefix_is_confidential(&self, prefix: &str) -> Result<bool> {
+        let prefixes = self.prefixes.try_read().map_err(|_| {
+            anyhow!(
+                "cannot determine whether prefix '{prefix}' is confidential while state is locked; refusing passthrough"
+            )
+        })?;
+        Ok(prefixes.contains_key(prefix))
+    }
+
     async fn decode_frame(&self, topic: &str, raw: &[u8]) -> FrameOutcome {
         let prefix = topic.split('.').next().unwrap_or(topic);
-        let joined = self.prefixes.read().await.contains_key(prefix);
-        if !joined {
-            return FrameOutcome::Passthrough;
-        }
-
+        let mut prefixes = self.prefixes.write().await;
+        let state = match prefixes.get_mut(prefix) {
+            None => return FrameOutcome::Passthrough,
+            Some(SubscriberPrefixState::Expected(_)) => {
+                return FrameOutcome::Drop(
+                    "confidential prefix is awaiting a controller epoch grant".to_owned(),
+                );
+            }
+            Some(SubscriberPrefixState::Installed(state)) => state,
+        };
         let encrypted = match EncryptedEvent::decode_body(topic, raw) {
-            Ok(e) => e,
-            Err(e) => return FrameOutcome::Drop(format!("decode: {e}")),
+            Ok(event) => event,
+            Err(error) => return FrameOutcome::Drop(format!("decode: {error}")),
         };
-
-        // Tamper-evidence check (see module docs: self-asserted pubkey, not
-        // yet identity-bound — that is epic #600 EV4 #604).
-        let Ok(verifying_key) = VerifyingKey::from_bytes(&encrypted.publisher_pubkey) else {
-            return FrameOutcome::Drop("invalid embedded publisher pubkey".to_owned());
-        };
-        let signature = Signature::from_bytes(match encrypted.signature.as_slice().try_into() {
-            Ok(s) => s,
-            Err(_) => return FrameOutcome::Drop("signature is not 64 bytes".to_owned()),
-        });
-
-        let plaintext = match self
-            .try_decrypt(
-                prefix,
-                &encrypted.tag,
-                &encrypted.ciphertext,
-                &encrypted.nonce,
-                &encrypted.key_commitment,
-            )
-            .await
+        if encrypted.publisher_pubkey != state.publisher.ed25519.to_bytes() {
+            return FrameOutcome::Drop(
+                "publisher key is not the controller-authorized anchor".to_owned(),
+            );
+        }
+        if state
+            .seen_objects
+            .contains(&(encrypted.epoch, encrypted.session_id, encrypted.sequence))
         {
-            Ok(p) => p,
-            Err(e) => return FrameOutcome::Drop(format!("decrypt: {e}")),
-        };
-
-        let sig_message = build_event_sig_message(topic, &plaintext, encrypted.timestamp);
-        if verifying_key.verify(&sig_message, &signature).is_err() {
-            return FrameOutcome::Drop("signature verification failed".to_owned());
+            return FrameOutcome::Drop("replayed event object".to_owned());
+        }
+        if state
+            .seen_nonces
+            .contains(&(encrypted.session_id, encrypted.nonce))
+        {
+            return FrameOutcome::Drop("reused event nonce".to_owned());
         }
 
+        let epoch_key = if encrypted.membership_version == state.current.membership_version
+            && encrypted.epoch == state.current.epoch
+            && now_millis() < state.current.expires_at_millis
+        {
+            &state.current.key
+        } else if let Some(previous) = &state.previous {
+            if encrypted.membership_version == previous.installed.membership_version
+                && encrypted.epoch == previous.installed.epoch
+                && Instant::now() < previous.grace_until
+                && now_millis() < previous.installed.expires_at_millis
+                && encrypted.sequence <= previous.last_issued_sequence
+            {
+                &previous.installed.key
+            } else {
+                return FrameOutcome::Drop(
+                    "unknown, future-before-install, retired, or non-in-flight epoch object"
+                        .to_owned(),
+                );
+            }
+        } else {
+            return FrameOutcome::Drop(
+                "unknown, future-before-install, or retired epoch object".to_owned(),
+            );
+        };
+        let expected_nonce = match derive_event_nonce(&encrypted.session_id, encrypted.sequence) {
+            Ok(nonce) => nonce,
+            Err(error) => return FrameOutcome::Drop(error),
+        };
+        if encrypted.nonce != expected_nonce {
+            return FrameOutcome::Drop("event nonce is outside the sender/track domain".to_owned());
+        }
+        let plaintext = match decrypt_epoch_event(
+            epoch_key,
+            prefix,
+            &encrypted.publisher_pubkey,
+            &encrypted.session_id,
+            encrypted.membership_version,
+            encrypted.epoch,
+            encrypted.sequence,
+            &encrypted.nonce,
+            &encrypted.tag,
+            &encrypted.ciphertext,
+            &encrypted.key_commitment,
+        ) {
+            Ok(plaintext) => plaintext,
+            Err(error) => return FrameOutcome::Drop(format!("decrypt: {error}")),
+        };
+        let signed = build_epoch_event_sig_message(
+            topic,
+            &plaintext,
+            encrypted.timestamp,
+            &encrypted.session_id,
+            encrypted.membership_version,
+            encrypted.epoch,
+            encrypted.sequence,
+        );
+        if let Err(error) = verify_composite(
+            &encrypted.signature,
+            &state.publisher.ed25519,
+            Some(&state.publisher.ml_dsa_65),
+            &signed,
+            &event_attestation_aad(),
+            true,
+        ) {
+            return FrameOutcome::Drop(format!("hybrid publisher attestation failed: {error}"));
+        }
+        record_replay(
+            state,
+            (encrypted.epoch, encrypted.session_id, encrypted.sequence),
+            (encrypted.session_id, encrypted.nonce),
+        );
         FrameOutcome::Decoded(plaintext)
     }
 }
 
+fn record_replay(
+    state: &mut InstalledPrefixState,
+    object: (u64, [u8; 16], u64),
+    nonce: ([u8; 16], [u8; 12]),
+) {
+    state.seen_objects.insert(object);
+    state.seen_nonces.insert(nonce);
+    state.replay_order.push_back((object, nonce));
+    if state.replay_order.len() > MAX_REPLAY_WINDOW {
+        if let Some((expired_object, expired_nonce)) = state.replay_order.pop_front() {
+            state.seen_objects.remove(&expired_object);
+            state.seen_nonces.remove(&expired_nonce);
+        }
+    }
+}
+
+#[derive(Debug)]
 enum FrameOutcome {
     /// Prefix not joined — Public-mode passthrough, raw bytes already correct.
     Passthrough,
@@ -1270,194 +1278,629 @@ enum FrameOutcome {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use crate::crypto::group_key::{
+        recipient_key_id, ControllerBinding, GroupKeyRegistry, GroupMembership, GroupRef,
+        MembershipChange, MembershipResolver,
+    };
+    use crate::crypto::hybrid_kem::{generate_recipient, RecipientKeypair, SuiteId};
+    use ml_dsa::Keypair;
 
-    fn test_signing_key() -> SigningKey {
+    struct AllowExact;
+    impl MembershipResolver for AllowExact {
+        fn resolve(&self, requested: &GroupMembership) -> Result<GroupMembership, String> {
+            Ok(requested.clone())
+        }
+    }
+
+    fn signing_key() -> SigningKey {
         let mut secret = [0u8; 32];
         rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut secret);
         SigningKey::from_bytes(&secret)
     }
 
-    #[test]
-    fn rekey_policy_validation() {
-        let result = RekeyPolicy::Scheduled {
-            interval: Duration::from_secs(100_000),
+    fn member(recipient: &RecipientKeypair, did: &str, blind: u8) -> GroupMembership {
+        let public = recipient.public();
+        GroupMembership {
+            group_uri: "at://did:web:controller/ai.hyprstream.event.group/g1".to_owned(),
+            subject_did: did.to_owned(),
+            accepted_state: b"cid512:accepted-a".to_vec(),
+            capability: format!("event:g1:subscribe:{did}").into_bytes(),
+            recipient_key_id: recipient_key_id(&public),
+            recipient: public,
+            blinded_routing_key: [blind; 32],
+            expires_at_millis: i64::MAX,
         }
-        .validate();
-        assert!(result.is_err());
+    }
 
-        let result = RekeyPolicy::Scheduled {
-            interval: Duration::from_secs(3600),
+    async fn grant_for(
+        recipient: &RecipientKeypair,
+        ed: &SigningKey,
+        pq: &MlDsaSigningKey,
+    ) -> (EpochGrant, Zeroizing<[u8; 32]>) {
+        let group = GroupRef::new(
+            "at://did:web:controller/ai.hyprstream.event.group/g1",
+            "ks-0",
+        );
+        let registry = GroupKeyRegistry::new(RekeyPolicy::Immediate, AllowExact).unwrap();
+        registry
+            .register_group(
+                group.clone(),
+                ControllerBinding {
+                    controller_did: "did:web:controller".to_owned(),
+                    accepted_state: b"cid512:accepted-a".to_vec(),
+                    sender_did: "did:web:publisher".to_owned(),
+                    sender_ed25519: ed.verifying_key().to_bytes(),
+                    sender_ml_dsa_65: crate::crypto::pq::ml_dsa_sk_to_vk_bytes(pq),
+                    retention_policy: b"retention:bounded-v1".to_vec(),
+                    opaque_routing_policy: b"routing:stock-moq-opaque-v1".to_vec(),
+                    expires_at_millis: i64::MAX,
+                },
+            )
+            .await
+            .unwrap();
+        let prepared = registry
+            .prepare_change(
+                &group,
+                MembershipChange::Join(member(recipient, "did:web:member", 7)),
+                "ks-1",
+            )
+            .await
+            .unwrap();
+        let grant = prepared.grants[0].clone();
+        registry
+            .commit_prepared(&group, prepared.membership_version, prepared.epoch)
+            .await
+            .unwrap();
+        (
+            grant,
+            Zeroizing::new(registry.k_group(&group).await.unwrap()),
+        )
+    }
+
+    fn event(
+        epoch_key: &[u8; 32],
+        ed_sk: &SigningKey,
+        pq_sk: &MlDsaSigningKey,
+        payload: &[u8],
+        sequence: u64,
+    ) -> EncryptedEvent {
+        event_at(epoch_key, ed_sk, pq_sk, payload, 1, 1, sequence)
+    }
+
+    fn event_at(
+        epoch_key: &[u8; 32],
+        ed_sk: &SigningKey,
+        pq_sk: &MlDsaSigningKey,
+        payload: &[u8],
+        membership_version: u64,
+        epoch: u64,
+        sequence: u64,
+    ) -> EncryptedEvent {
+        let topic = "worker.sandbox1.started";
+        let prefix = "worker";
+        let kid = ed_sk.verifying_key().to_bytes();
+        let session_digest = blake3::hash(&epoch.to_be_bytes());
+        let session_id: [u8; 16] = session_digest.as_bytes()[..16]
+            .try_into()
+            .expect("BLAKE3 output contains a 16-byte test session ID");
+        let (tag, ciphertext, nonce, key_commitment) = encrypt_epoch_event(
+            epoch_key,
+            prefix,
+            &kid,
+            &session_id,
+            membership_version,
+            epoch,
+            sequence,
+            payload,
+        )
+        .unwrap();
+        let timestamp = 1_700_000_000_000;
+        let signed = build_epoch_event_sig_message(
+            topic,
+            payload,
+            timestamp,
+            &session_id,
+            membership_version,
+            epoch,
+            sequence,
+        );
+        let signature =
+            sign_composite(ed_sk, Some(pq_sk), &signed, &event_attestation_aad()).unwrap();
+        EncryptedEvent {
+            topic: topic.to_owned(),
+            tag,
+            ciphertext,
+            nonce,
+            key_commitment,
+            lk_tag: Vec::new(),
+            signature,
+            publisher_pubkey: kid,
+            timestamp,
+            session_id,
+            membership_version,
+            epoch,
+            sequence,
         }
-        .validate();
-        assert!(result.is_ok());
+    }
+
+    fn anchor(ed_sk: &SigningKey, pq_sk: &MlDsaSigningKey) -> EventPublisherAnchor {
+        EventPublisherAnchor {
+            ed25519: ed_sk.verifying_key(),
+            ml_dsa_65: pq_sk.verifying_key().clone(),
+        }
+    }
+
+    async fn expect_confidential(
+        subscriber: &EventSubscriber,
+        prefix: &str,
+        ed_sk: &SigningKey,
+        pq_sk: &MlDsaSigningKey,
+    ) {
+        subscriber
+            .expect_confidential_prefix(prefix, "did:web:controller", anchor(ed_sk, pq_sk))
+            .await
+            .unwrap();
     }
 
     #[test]
-    fn encrypted_event_wire_roundtrip() {
-        let event = EncryptedEvent {
-            topic: "worker.sandbox1.started".to_owned(),
-            tag: vec![1, 2, 3, 4],
-            ciphertext: vec![5, 6, 7, 8, 9],
-            nonce: [9u8; 12],
-            key_commitment: [7u8; 16],
-            lk_tag: vec![],
-            signature: vec![1u8; 64],
-            publisher_pubkey: [3u8; 32],
-            timestamp: 1_700_000_000_000,
-        };
-
+    fn encrypted_event_wire_roundtrip_and_trailing_bytes_rejected() {
+        let ed = signing_key();
+        let pq = crate::node_identity::derive_mesh_mldsa_key(&ed);
+        let event = event(&[9; 32], &ed, &pq, b"payload", 4);
         let encoded = event.encode_body();
         let decoded = EncryptedEvent::decode_body(&event.topic, &encoded).unwrap();
-
-        assert_eq!(decoded.topic, event.topic);
-        assert_eq!(decoded.tag, event.tag);
-        assert_eq!(decoded.ciphertext, event.ciphertext);
-        assert_eq!(decoded.nonce, event.nonce);
-        assert_eq!(decoded.key_commitment, event.key_commitment);
-        assert_eq!(decoded.lk_tag, event.lk_tag);
+        assert_eq!(decoded.membership_version, 1);
+        assert_eq!(decoded.epoch, 1);
+        assert_eq!(decoded.sequence, 4);
         assert_eq!(decoded.signature, event.signature);
-        assert_eq!(decoded.publisher_pubkey, event.publisher_pubkey);
-        assert_eq!(decoded.timestamp, event.timestamp);
-    }
-
-    #[test]
-    fn encrypted_event_wire_rejects_truncated_input() {
-        let buf = vec![WIRE_VERSION, 1, 2, 3]; // far too short
-        assert!(EncryptedEvent::decode_body("topic", &buf).is_err());
-    }
-
-    #[test]
-    fn encrypted_event_wire_rejects_bad_version() {
-        let mut buf = vec![99u8]; // bad version
-        buf.extend_from_slice(&[0u8; 200]);
-        assert!(EncryptedEvent::decode_body("topic", &buf).is_err());
+        let mut trailing = encoded;
+        trailing.push(0);
+        assert!(EncryptedEvent::decode_body(&event.topic, &trailing).is_err());
     }
 
     #[tokio::test]
-    async fn register_prefix_requires_global_origin() {
-        // No global origin initialized in this test process (or a stale one
-        // from another test) — either way, register_prefix must not panic and
-        // must surface a clean error rather than wiring to nothing.
+    async fn grant_install_relay_forward_and_hybrid_verify() {
+        let recipient = generate_recipient(SuiteId::HyKemX25519MlKem768).unwrap();
+        let ed = signing_key();
+        let pq = crate::node_identity::derive_mesh_mldsa_key(&ed);
+        let (grant, key) = grant_for(&recipient, &ed, &pq).await;
+        let subscriber = EventSubscriber::new().unwrap();
+        expect_confidential(&subscriber, "worker", &ed, &pq).await;
+        subscriber
+            .install_epoch_grant("worker", &recipient, &grant, anchor(&ed, &pq), None, None)
+            .await
+            .unwrap();
+
+        let object = event(&key, &ed, &pq, b"relay cannot read this", 1);
+        let wire = object.encode_body();
+        // A stock relay performs only byte-identical forward/cache operations.
+        let relayed = wire.clone();
+        assert_eq!(relayed, wire);
+        assert!(!relayed
+            .windows(b"relay cannot read this".len())
+            .any(|window| window == b"relay cannot read this"));
+        match subscriber.decode_frame(&object.topic, &relayed).await {
+            FrameOutcome::Decoded(payload) => assert_eq!(payload, b"relay cannot read this"),
+            other => panic!("expected decoded object, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn expected_confidential_prefix_without_grant_drops_plaintext() {
+        let ed = signing_key();
+        let pq = crate::node_identity::derive_mesh_mldsa_key(&ed);
+        let subscriber = EventSubscriber::new().unwrap();
+        expect_confidential(&subscriber, "worker", &ed, &pq).await;
+
+        assert!(matches!(
+            subscriber.decode_frame("worker.sandbox1.started", b"attacker plaintext").await,
+            FrameOutcome::Drop(reason) if reason.contains("awaiting a controller epoch grant")
+        ));
+    }
+
+    #[tokio::test]
+    async fn contended_confidential_state_never_allows_passthrough() {
+        let ed = signing_key();
+        let pq = crate::node_identity::derive_mesh_mldsa_key(&ed);
+        let subscriber = EventSubscriber::new().unwrap();
+        expect_confidential(&subscriber, "worker", &ed, &pq).await;
+
+        let _held = subscriber.prefixes.write().await;
+        assert!(subscriber.prefix_is_confidential("worker").is_err());
+    }
+
+    #[tokio::test]
+    async fn stock_relay_multi_member_revocation_conformance() {
+        let member_a = generate_recipient(SuiteId::HyKemX25519MlKem768).unwrap();
+        let member_b = generate_recipient(SuiteId::HyKemX25519MlKem768).unwrap();
+        let relay_recipient = generate_recipient(SuiteId::HyKemX25519MlKem768).unwrap();
+        let ed = signing_key();
+        let pq = crate::node_identity::derive_mesh_mldsa_key(&ed);
+        let group = GroupRef::new(
+            "at://did:web:controller/ai.hyprstream.event.group/g1",
+            "ks-0",
+        );
+        let registry = GroupKeyRegistry::new(RekeyPolicy::Immediate, AllowExact).unwrap();
+        registry
+            .register_group(
+                group.clone(),
+                ControllerBinding {
+                    controller_did: "did:web:controller".to_owned(),
+                    accepted_state: b"cid512:accepted-a".to_vec(),
+                    sender_did: "did:web:publisher".to_owned(),
+                    sender_ed25519: ed.verifying_key().to_bytes(),
+                    sender_ml_dsa_65: crate::crypto::pq::ml_dsa_sk_to_vk_bytes(&pq),
+                    retention_policy: b"retention:bounded-v1".to_vec(),
+                    opaque_routing_policy: b"routing:stock-moq-opaque-v1".to_vec(),
+                    expires_at_millis: i64::MAX,
+                },
+            )
+            .await
+            .unwrap();
+
+        let joined_a = registry
+            .prepare_change(
+                &group,
+                MembershipChange::Join(member(&member_a, "did:web:member-a", 7)),
+                "ks-1",
+            )
+            .await
+            .unwrap();
+        registry
+            .commit_prepared(&group, joined_a.membership_version, joined_a.epoch)
+            .await
+            .unwrap();
+        let joined_b = registry
+            .prepare_change(
+                &group,
+                MembershipChange::Join(member(&member_b, "did:web:member-b", 8)),
+                "ks-2",
+            )
+            .await
+            .unwrap();
+        assert_eq!(joined_b.grants.len(), 2);
+        registry
+            .commit_prepared(&group, joined_b.membership_version, joined_b.epoch)
+            .await
+            .unwrap();
+        let key_epoch_2 = Zeroizing::new(registry.k_group(&group).await.unwrap());
+
+        let grant_a_2 = joined_b
+            .grants
+            .iter()
+            .find(|grant| grant.subject_did == "did:web:member-a")
+            .unwrap();
+        let grant_b_2 = joined_b
+            .grants
+            .iter()
+            .find(|grant| grant.subject_did == "did:web:member-b")
+            .unwrap();
+        assert!(crate::crypto::group_key::open_epoch_grant(&relay_recipient, grant_a_2).is_err());
+        let subscriber_a = EventSubscriber::new().unwrap();
+        let subscriber_b = EventSubscriber::new().unwrap();
+        expect_confidential(&subscriber_a, "worker", &ed, &pq).await;
+        expect_confidential(&subscriber_b, "worker", &ed, &pq).await;
+        subscriber_a
+            .install_epoch_grant("worker", &member_a, grant_a_2, anchor(&ed, &pq), None, None)
+            .await
+            .unwrap();
+        subscriber_b
+            .install_epoch_grant("worker", &member_b, grant_b_2, anchor(&ed, &pq), None, None)
+            .await
+            .unwrap();
+
+        let before = event_at(&key_epoch_2, &ed, &pq, b"members only", 2, 2, 1);
+        let wire = before.encode_body();
+        let relayed = wire.clone();
+        assert_eq!(relayed, wire);
+        assert!(!relayed
+            .windows(b"members only".len())
+            .any(|window| window == b"members only"));
+        for subscriber in [&subscriber_a, &subscriber_b] {
+            assert!(matches!(
+                subscriber.decode_frame(&before.topic, &relayed).await,
+                FrameOutcome::Decoded(ref payload) if payload == b"members only"
+            ));
+        }
+
+        let revoked = registry
+            .prepare_change(
+                &group,
+                MembershipChange::Revoke {
+                    subject_did: "did:web:member-b".to_owned(),
+                },
+                "ks-3",
+            )
+            .await
+            .unwrap();
+        assert_eq!(revoked.grants.len(), 1);
+        assert_eq!(revoked.grants[0].subject_did, "did:web:member-a");
+        registry
+            .commit_prepared(&group, revoked.membership_version, revoked.epoch)
+            .await
+            .unwrap();
+        assert!(!registry.contains_member(&group, "did:web:member-b").await);
+        let key_epoch_3 = Zeroizing::new(registry.k_group(&group).await.unwrap());
+        subscriber_a
+            .install_epoch_grant(
+                "worker",
+                &member_a,
+                &revoked.grants[0],
+                anchor(&ed, &pq),
+                Some(1),
+                Some(Duration::ZERO),
+            )
+            .await
+            .unwrap();
+
+        let after = event_at(&key_epoch_3, &ed, &pq, b"after revoke", 3, 3, 1);
+        let relayed_after = after.encode_body();
+        assert!(!relayed_after
+            .windows(b"after revoke".len())
+            .any(|window| window == b"after revoke"));
+        assert!(matches!(
+            subscriber_a.decode_frame(&after.topic, &relayed_after).await,
+            FrameOutcome::Decoded(ref payload) if payload == b"after revoke"
+        ));
+        assert!(matches!(
+            subscriber_b.decode_frame(&after.topic, &relayed_after).await,
+            FrameOutcome::Drop(ref reason) if reason.contains("future-before-install")
+        ));
+    }
+
+    #[tokio::test]
+    async fn replay_nonce_mutation_and_stripped_pq_fail_closed() {
+        let recipient = generate_recipient(SuiteId::HyKemX25519MlKem768).unwrap();
+        let ed = signing_key();
+        let pq = crate::node_identity::derive_mesh_mldsa_key(&ed);
+        let (grant, key) = grant_for(&recipient, &ed, &pq).await;
+        let subscriber = EventSubscriber::new().unwrap();
+        expect_confidential(&subscriber, "worker", &ed, &pq).await;
+        subscriber
+            .install_epoch_grant("worker", &recipient, &grant, anchor(&ed, &pq), None, None)
+            .await
+            .unwrap();
+
+        let first = event(&key, &ed, &pq, b"one", 1);
+        assert!(matches!(
+            subscriber
+                .decode_frame(&first.topic, &first.encode_body())
+                .await,
+            FrameOutcome::Decoded(_)
+        ));
+        assert!(matches!(
+            subscriber.decode_frame(&first.topic, &first.encode_body()).await,
+            FrameOutcome::Drop(reason) if reason.contains("replayed")
+        ));
+
+        let mut bad_nonce = event(&key, &ed, &pq, b"two", 2);
+        bad_nonce.nonce[0] ^= 1;
+        assert!(matches!(
+            subscriber.decode_frame(&bad_nonce.topic, &bad_nonce.encode_body()).await,
+            FrameOutcome::Drop(reason) if reason.contains("nonce")
+        ));
+
+        let mut stripped = event(&key, &ed, &pq, b"three", 3);
+        let signed = build_epoch_event_sig_message(
+            &stripped.topic,
+            b"three",
+            stripped.timestamp,
+            &stripped.session_id,
+            1,
+            1,
+            3,
+        );
+        stripped.signature = sign_composite(&ed, None, &signed, &event_attestation_aad()).unwrap();
+        assert!(matches!(
+            subscriber.decode_frame(&stripped.topic, &stripped.encode_body()).await,
+            FrameOutcome::Drop(reason) if reason.contains("attestation")
+        ));
+    }
+
+    #[tokio::test]
+    async fn replay_tracking_is_bounded_to_its_window() {
+        let recipient = generate_recipient(SuiteId::HyKemX25519MlKem768).unwrap();
+        let ed = signing_key();
+        let pq = crate::node_identity::derive_mesh_mldsa_key(&ed);
+        let (grant, _) = grant_for(&recipient, &ed, &pq).await;
+        let subscriber = EventSubscriber::new().unwrap();
+        expect_confidential(&subscriber, "worker", &ed, &pq).await;
+        subscriber
+            .install_epoch_grant("worker", &recipient, &grant, anchor(&ed, &pq), None, None)
+            .await
+            .unwrap();
+
+        let mut prefixes = subscriber.prefixes.write().await;
+        let Some(SubscriberPrefixState::Installed(state)) = prefixes.get_mut("worker") else {
+            panic!("installed state must exist");
+        };
+        for sequence in 1..=MAX_REPLAY_WINDOW as u64 + 1 {
+            let mut session_id = [0; 16];
+            session_id[..8].copy_from_slice(&sequence.to_be_bytes());
+            let nonce = derive_event_nonce(&session_id, sequence).unwrap();
+            record_replay(state, (1, session_id, sequence), (session_id, nonce));
+        }
+        assert_eq!(state.replay_order.len(), MAX_REPLAY_WINDOW);
+        assert_eq!(state.seen_objects.len(), MAX_REPLAY_WINDOW);
+        let mut first_session = [0; 16];
+        first_session[..8].copy_from_slice(&1u64.to_be_bytes());
+        assert!(!state.seen_objects.contains(&(1, first_session, 1)));
+    }
+
+    #[tokio::test]
+    async fn installed_epoch_expiry_is_enforced_while_receiving() {
+        let recipient = generate_recipient(SuiteId::HyKemX25519MlKem768).unwrap();
+        let ed = signing_key();
+        let pq = crate::node_identity::derive_mesh_mldsa_key(&ed);
+        let (grant, key) = grant_for(&recipient, &ed, &pq).await;
+        let subscriber = EventSubscriber::new().unwrap();
+        expect_confidential(&subscriber, "worker", &ed, &pq).await;
+        subscriber
+            .install_epoch_grant("worker", &recipient, &grant, anchor(&ed, &pq), None, None)
+            .await
+            .unwrap();
+        {
+            let mut prefixes = subscriber.prefixes.write().await;
+            let Some(SubscriberPrefixState::Installed(state)) = prefixes.get_mut("worker") else {
+                panic!("installed state must exist");
+            };
+            state.current.expires_at_millis = now_millis() - 1;
+        }
+        let frame = event(&key, &ed, &pq, b"expired", 1);
+        assert!(matches!(
+            subscriber.decode_frame(&frame.topic, &frame.encode_body()).await,
+            FrameOutcome::Drop(reason) if reason.contains("unknown")
+        ));
+    }
+
+    #[tokio::test]
+    async fn duplicate_registration_preserves_live_crypto_domain() {
+        let _ =
+            crate::moq_event::init_global_moq_event_origin(crate::moq_event::MoqEventOrigin::new());
+        let prefix = format!("hardening-duplicate-{}", rand::random::<u64>());
         let publisher = EventPublisher::new_encrypted(
-            test_signing_key(),
+            signing_key(),
             EventPrivacy::ZeroKnowledge,
-            RekeyPolicy::Scheduled {
-                interval: Duration::from_secs(3600),
-            },
+            RekeyPolicy::Immediate,
         )
         .unwrap();
-        // Either errors cleanly (no global origin) or succeeds (origin was
-        // initialized by another test in this binary) — both are acceptable;
-        // the assertion is just "no panic".
-        let _ = publisher.register_prefix("test-prefix").await;
+        publisher.register_prefix(&prefix).await.unwrap();
+        publisher
+            .install_committed_epoch(&prefix, 1, 1, Zeroizing::new([0x61; 32]))
+            .await
+            .unwrap();
+        {
+            let mut prefixes = publisher.prefixes.write().await;
+            prefixes
+                .get_mut(&prefix)
+                .unwrap()
+                .crypto
+                .as_mut()
+                .unwrap()
+                .sequence = 7;
+        }
+        let (session_before, sequence_before) = {
+            let prefixes = publisher.prefixes.read().await;
+            let crypto = prefixes.get(&prefix).unwrap().crypto.as_ref().unwrap();
+            (crypto.session_id, crypto.sequence)
+        };
+
+        let error = publisher.register_prefix(&prefix).await.unwrap_err();
+        assert!(error.contains("already registered"));
+        let prefixes = publisher.prefixes.read().await;
+        let crypto = prefixes.get(&prefix).unwrap().crypto.as_ref().unwrap();
+        assert_eq!(crypto.session_id, session_before);
+        assert_eq!(crypto.sequence, sequence_before);
+    }
+
+    #[tokio::test]
+    async fn independent_installations_cannot_reuse_key_nonce_pair() {
+        let _ =
+            crate::moq_event::init_global_moq_event_origin(crate::moq_event::MoqEventOrigin::new());
+        let prefix = format!("hardening-failover-{}", rand::random::<u64>());
+        let signing = signing_key();
+        let secret = signing.to_bytes();
+        let publisher_a = EventPublisher::new_encrypted(
+            SigningKey::from_bytes(&secret),
+            EventPrivacy::ZeroKnowledge,
+            RekeyPolicy::Immediate,
+        )
+        .unwrap();
+        let publisher_b = EventPublisher::new_encrypted(
+            SigningKey::from_bytes(&secret),
+            EventPrivacy::ZeroKnowledge,
+            RekeyPolicy::Immediate,
+        )
+        .unwrap();
+        publisher_a.register_prefix(&prefix).await.unwrap();
+        publisher_b.register_prefix(&prefix).await.unwrap();
+        let epoch_secret = [0x71u8; 32];
+        publisher_a
+            .install_committed_epoch(&prefix, 1, 1, Zeroizing::new(epoch_secret))
+            .await
+            .unwrap();
+        publisher_b
+            .install_committed_epoch(&prefix, 1, 1, Zeroizing::new(epoch_secret))
+            .await
+            .unwrap();
+
+        let session_a = publisher_a
+            .prefixes
+            .read()
+            .await
+            .get(&prefix)
+            .unwrap()
+            .crypto
+            .as_ref()
+            .unwrap()
+            .session_id;
+        let session_b = publisher_b
+            .prefixes
+            .read()
+            .await
+            .get(&prefix)
+            .unwrap()
+            .crypto
+            .as_ref()
+            .unwrap()
+            .session_id;
+        let kid = publisher_a.verifying_key().unwrap();
+        let key_a = crate::crypto::event_crypto::derive_sender_track_key(
+            &epoch_secret,
+            &kid,
+            &prefix,
+            &session_a,
+        );
+        let key_b = crate::crypto::event_crypto::derive_sender_track_key(
+            &epoch_secret,
+            &kid,
+            &prefix,
+            &session_b,
+        );
+        let nonce = derive_event_nonce(&session_a, 1).unwrap();
+
+        assert_ne!(session_a, session_b);
+        assert_ne!((&*key_a, nonce), (&*key_b, nonce));
+    }
+
+    #[tokio::test]
+    async fn signing_key_cannot_substitute_for_mesh_kem_recipient() {
+        let recipient = generate_recipient(SuiteId::HyKemX25519MlKem768).unwrap();
+        let wrong = generate_recipient(SuiteId::HyKemX25519MlKem768).unwrap();
+        let ed = signing_key();
+        let pq = crate::node_identity::derive_mesh_mldsa_key(&ed);
+        let (grant, _) = grant_for(&recipient, &ed, &pq).await;
+        let subscriber = EventSubscriber::new().unwrap();
+        expect_confidential(&subscriber, "worker", &ed, &pq).await;
+        assert!(subscriber
+            .install_epoch_grant("worker", &wrong, &grant, anchor(&ed, &pq), None, None)
+            .await
+            .is_err());
+        assert!(subscriber
+            .join_prefix(
+                "worker",
+                &ed.verifying_key().to_bytes(),
+                &grant.sealed_epoch_secret
+            )
+            .await
+            .is_err());
     }
 
     #[test]
-    fn new_encrypted_rejects_public_mode() {
-        let result = EventPublisher::new_encrypted(
-            test_signing_key(),
+    fn rekey_policy_and_authz_are_fail_closed() {
+        assert!(RekeyPolicy::Scheduled {
+            interval: Duration::from_secs(100_000),
+        }
+        .validate()
+        .is_err());
+        let deny = DenyAllEventAuthz;
+        assert!(!deny.can_publish(&Subject::anonymous(), "worker"));
+        assert!(!deny.can_subscribe(&Subject::anonymous(), "worker"));
+        assert!(EventPublisher::new_encrypted(
+            signing_key(),
             EventPrivacy::Public,
             RekeyPolicy::default(),
-        );
-        assert!(result.is_err());
-    }
-
-    #[tokio::test]
-    async fn publish_raw_errors_on_unregistered_prefix() {
-        let publisher = EventPublisher::new_encrypted(
-            test_signing_key(),
-            EventPrivacy::ZeroKnowledge,
-            RekeyPolicy::default(),
         )
-        .unwrap();
-        let result = publisher
-            .publish_raw("unregistered.entity.event", b"payload")
-            .await;
-        assert!(result.is_err());
-    }
-
-    // ── EV4: event-plane authz + publisher identity ─────────────────────────
-
-    #[test]
-    fn event_authz_impls() {
-        // DenyAll (the encrypted-profile default) denies everything.
-        let deny = DenyAllEventAuthz;
-        assert!(!deny.can_publish(&Subject::anonymous(), "p"));
-        assert!(!deny.can_subscribe(&Subject::anonymous(), "p"));
-        // AllowAll (the public-profile / test default) permits everything.
-        let allow = AllowAllEventAuthz;
-        assert!(allow.can_publish(&Subject::anonymous(), "p"));
-        assert!(allow.can_subscribe(&Subject::anonymous(), "p"));
-    }
-
-    #[test]
-    fn publisher_identity_anonymous_vs_verified() {
-        // #446-gated: the default is anonymous (no verified DID).
-        let anon = PublisherIdentity::anonymous();
-        assert!(!anon.is_verified());
-        assert!(anon.did.is_none());
-        // A verified DID (post-#446 / non-IPC path).
-        let verified = PublisherIdentity::verified("did:web:node.example.com");
-        assert!(verified.is_verified());
-        assert_eq!(verified.did.as_deref(), Some("did:web:node.example.com"));
-        // Default == anonymous.
-        assert!(!PublisherIdentity::default().is_verified());
-    }
-
-    #[tokio::test]
-    async fn encrypted_publish_blocked_by_default_denyall_authz() {
-        // The encrypted profile defaults to DenyAllEventAuthz (MAC
-        // deny-by-default). With a registered encrypted prefix, publish_raw
-        // MUST be denied by the event-plane PEP — even before reaching the
-        // signing/encryption step. (No real moq origin needed: the authz gate
-        // is the first check in the encrypted arm.)
-        let publisher = EventPublisher::new_encrypted(
-            test_signing_key(),
-            EventPrivacy::ZeroKnowledge,
-            RekeyPolicy::default(),
-        )
-        .unwrap()
-        .with_publisher_identity(PublisherIdentity::verified("did:web:pub"));
-        // Inject a prefix with crypto state directly (bypasses register_prefix,
-        // which needs a global moq origin). The moq field is never reached —
-        // the authz gate fires first — so a panicking placeholder is fine.
-        let crypto = PrefixCrypto {
-            key_state: GroupKeyState {
-                current: Zeroizing::new([0u8; 32]),
-                pending: None,
-                created_at: std::time::Instant::now(),
-            },
-            ephemeral_secret: Zeroizing::new([0u8; 32]),
-            ephemeral_pubkey: [0u8; 32],
-            subscribers: HashMap::new(),
-        };
-        // SAFETY-of-test: we never publish to `moq` because DenyAll fires first.
-        // We cannot construct a real MoqEventPublisher without the global origin,
-        // so we register the prefix into the map with crypto and rely on the
-        // authz gate short-circuiting. Use the publisher's own map: register an
-        // entry whose `moq` is sourced from a real origin when available.
-        if let Some(origin) = global_moq_event_origin() {
-            if let Ok(moq) = origin.publisher("deny-test") {
-                let mut prefixes = publisher.prefixes.write().await;
-                prefixes.insert(
-                    "deny-test".to_owned(),
-                    PrefixState {
-                        moq,
-                        crypto: Some(crypto),
-                    },
-                );
-                drop(prefixes);
-                let result = publisher.publish_raw("deny-test.e.e", b"p").await;
-                let err =
-                    result.expect_err("DenyAll must block encrypted publish");
-                assert!(
-                    err.to_string().contains("denied by event-plane authz"),
-                    "expected authz denial, got: {err}"
-                );
-            }
-        }
-        // If no global origin is available in this test binary, the
-        // inject-then-deny path is not exercisable here; the unit tests above
-        // cover the authz surface directly.
+        .is_err());
     }
 }
