@@ -2113,12 +2113,21 @@ fn main() -> Result<()> {
                                         }
                                     }
 
-                                    // C3 fix: systemd uses flat %d/signing-key, standalone uses subdirectory.
+                                    // C3 fix: scoped credential providers use flat
+                                    // %d/signing-key, while standalone uses a subdirectory.
                                     // #759: "policy" always resolves to the flat root/CA key regardless of
-                                    // deployment mode — see `resolve_service_signing_key` for why.
-                                    let systemd_mode = std::env::var("HYPRSTREAM__SECRETS__PATH").is_ok();
+                                    // secrets profile — see `resolve_service_signing_key` for why.
+                                    let secrets_profile = if std::env::var(
+                                        "HYPRSTREAM__SECRETS__PATH",
+                                    )
+                                    .is_ok()
+                                    {
+                                        hyprstream_core::auth::identity_store::SecretsProfile::PerServiceScoped
+                                    } else {
+                                        hyprstream_core::auth::identity_store::SecretsProfile::SharedDirectory
+                                    };
                                     let own_key = hyprstream_core::auth::identity_store::resolve_service_signing_key(
-                                        &secrets_dir, &name, systemd_mode,
+                                        &secrets_dir, &name, secrets_profile,
                                     )?;
 
                                     if name == "policy" {
@@ -2198,7 +2207,11 @@ fn main() -> Result<()> {
                                     // key — see `resolve_service_signing_key` for why. This mirrors the
                                     // same fix applied to the `--ipc` branch above.
                                     for svc_name in &service_names {
-                                        let svc_key = hyprstream_core::auth::identity_store::resolve_service_signing_key(&secrets_dir, svc_name, false)
+                                        let svc_key = hyprstream_core::auth::identity_store::resolve_service_signing_key(
+                                            &secrets_dir,
+                                            svc_name,
+                                            hyprstream_core::auth::identity_store::SecretsProfile::SharedDirectory,
+                                        )
                                             .with_context(|| format!("Failed to load signing key for service '{}'", svc_name))?;
                                         ctx = ctx.with_service_key(svc_name, svc_key.clone());
 
