@@ -526,8 +526,16 @@ impl Translator {
         let base = self.fids.path(fid).unwrap_or_default();
 
         // Complete mediation: authorize every hop, not only the final
-        // destination. Labels need not be monotone with path depth.
+        // destination. Labels need not be monotone with path depth. An empty
+        // walk is a fid clone and still mediates the object bound to the source
+        // fid; otherwise an unattached connection could clone another
+        // connection's fid without passing the monitor.
         let mut prefix = base.clone();
+        if wnames.is_empty()
+            && !self.authorize_path(session.as_ref(), &prefix, Action::Walk)
+        {
+            return Ok(Response::Error { ecode: libc_eperm() });
+        }
         for component in &wnames {
             prefix.push(component.clone());
             if !self.authorize_path(session.as_ref(), &prefix, Action::Walk) {
@@ -1044,7 +1052,7 @@ mod tests {
         }
 
         let backend = MountBackend::new(Arc::new(StubMount), Subject::new("tenant"));
-        let t = Arc::new(Translator::new(Arc::new(backend)));
+        let t = Arc::new(Translator::new(Arc::new(backend), test_decider()));
 
         // Attach fid 0 as root (empty walk succeeds).
         t.handle_message(&msg::tattach(1, 0, u32::MAX, "u", "")).await.unwrap();
@@ -1063,7 +1071,7 @@ mod tests {
 
     #[tokio::test]
     async fn version_round_trips() {
-        let t = Translator::new(Arc::new(MemoryBackend::default()));
+        let t = Translator::new(Arc::new(MemoryBackend::default()), test_decider());
         // Build a Tversion by hand via the codec and decode the response.
         let req = msg::tversion(1, 4096, "9P2000.L");
         let (tag, resp) = t.handle_message(&req).await.unwrap();
@@ -1081,7 +1089,7 @@ mod tests {
     async fn attach_then_walk_open_read_clunk() {
         let backend = MemoryBackend::default();
         backend.add_file("/hello.txt", b"hello world");
-        let t = Translator::new(Arc::new(backend));
+        let t = Translator::new(Arc::new(backend), test_decider());
 
         // Attach: fid 0 becomes the root.
         let req = msg::tattach(1, 0, u32::MAX, "user", "/");
@@ -1161,6 +1169,7 @@ mod tests {
     }
 
     const ALL_OPS: &[Action] = &[
+        Action::Attach,
         Action::Walk,
         Action::Open,
         Action::Read,
@@ -1192,11 +1201,15 @@ mod tests {
         fn check(
             &self,
             _ctx: &SecurityContext,
-            _object_label: &SecurityLabel,
+            _object: ObjectRef<'_>,
             _action: Action,
         ) -> bool {
             true
         }
+    }
+
+    fn test_decider() -> Arc<dyn AccessDecider> {
+        Arc::new(AllowAll)
     }
 
     fn monitor(
@@ -1215,7 +1228,7 @@ mod tests {
     /// the root fid is a mediated object with no synthetic exemption.
     #[tokio::test]
     async fn monitor_denies_unlabeled_root_at_attach() {
-        let t = Translator::new(Arc::new(MemoryBackend::default())).with_reference_monitor(
+        let t = Translator::new(Arc::new(MemoryBackend::default()), test_decider()).with_reference_monitor(
             monitor(permit_session(Level::Secret, ALL_OPS), None, Arc::new(AllowAll)),
         );
         let (_, resp) = t.handle_message(&msg::tattach(1, 0, u32::MAX, "user", "/")).await.unwrap();
@@ -1229,7 +1242,7 @@ mod tests {
     /// backend object handle exists.
     #[tokio::test]
     async fn monitor_denies_missing_token_at_attach() {
-        let t = Translator::new(Arc::new(MemoryBackend::default())).with_reference_monitor(
+        let t = Translator::new(Arc::new(MemoryBackend::default()), test_decider()).with_reference_monitor(
             monitor(SessionContext::deny(), Some(label(Level::Public)), Arc::new(AllowAll)),
         );
         let (_, resp) = t.handle_message(&msg::tattach(1, 0, u32::MAX, "user", "/")).await.unwrap();
@@ -1250,7 +1263,7 @@ mod tests {
                 Instant::now() - Duration::from_secs(1),
             ),
         );
-        let t = Translator::new(Arc::new(MemoryBackend::default())).with_reference_monitor(
+        let t = Translator::new(Arc::new(MemoryBackend::default()), test_decider()).with_reference_monitor(
             monitor(expired, Some(label(Level::Public)), Arc::new(AllowAll)),
         );
         let (_, resp) = t.handle_message(&msg::tattach(1, 0, u32::MAX, "user", "/")).await.unwrap();
@@ -1267,7 +1280,7 @@ mod tests {
     async fn monitor_allows_when_all_gates_pass() {
         let backend = MemoryBackend::default();
         backend.add_file("/hello.txt", b"hello world");
-        let t = Translator::new(Arc::new(backend)).with_reference_monitor(monitor(
+        let t = Translator::new(Arc::new(backend), test_decider()).with_reference_monitor(monitor(
             permit_session(Level::Secret, ALL_OPS),
             Some(label(Level::Public)),
             Arc::new(AllowAll),
@@ -1297,7 +1310,7 @@ mod tests {
             fn check(
                 &self,
                 _ctx: &SecurityContext,
-                _object_label: &SecurityLabel,
+                _object: ObjectRef<'_>,
                 action: Action,
             ) -> bool {
                 !matches!(action, Action::Read)
@@ -1306,7 +1319,7 @@ mod tests {
 
         let backend = MemoryBackend::default();
         backend.add_file("/hello.txt", b"hello world");
-        let t = Translator::new(Arc::new(backend)).with_reference_monitor(monitor(
+        let t = Translator::new(Arc::new(backend), test_decider()).with_reference_monitor(monitor(
             permit_session(Level::Secret, ALL_OPS),
             Some(label(Level::Public)),
             Arc::new(DenyReads),
@@ -1332,8 +1345,11 @@ mod tests {
     async fn monitor_denies_op_outside_token_scope() {
         let backend = MemoryBackend::default();
         backend.add_file("/hello.txt", b"hello world");
-        let t = Translator::new(Arc::new(backend)).with_reference_monitor(monitor(
-            permit_session(Level::Secret, &[Action::Walk, Action::Open, Action::Read]),
+        let t = Translator::new(Arc::new(backend), test_decider()).with_reference_monitor(monitor(
+            permit_session(
+                Level::Secret,
+                &[Action::Attach, Action::Walk, Action::Open, Action::Read],
+            ),
             Some(label(Level::Public)),
             Arc::new(AllowAll),
         ));
@@ -1379,7 +1395,7 @@ mod tests {
         let backend = MemoryBackend::default();
         backend.add_file("/hello.txt", b"hi");
         backend.add_file("/secret.txt", b"classified");
-        let t = Translator::new(Arc::new(backend)).with_reference_monitor(Arc::new(
+        let t = Translator::new(Arc::new(backend), test_decider()).with_reference_monitor(Arc::new(
             ReferenceMonitor::new(
                 Arc::new(StaticAuth(session)),
                 Arc::new(ByName),
@@ -1414,7 +1430,7 @@ mod tests {
         }
         let backend = MemoryBackend::default();
         backend.add_file("/secret.txt", b"classified");
-        let t = Translator::new(Arc::new(backend)).with_reference_monitor(Arc::new(
+        let t = Translator::new(Arc::new(backend), test_decider()).with_reference_monitor(Arc::new(
             ReferenceMonitor::new(
                 Arc::new(StaticAuth(permit_session(Level::Public, ALL_OPS))),
                 Arc::new(AllSecret),
@@ -1437,8 +1453,8 @@ mod tests {
     async fn clunk_is_not_mediated() {
         let backend = MemoryBackend::default();
         backend.add_file("/hello.txt", b"hi");
-        let t = Translator::new(Arc::new(backend)).with_reference_monitor(monitor(
-            permit_session(Level::Secret, &[Action::Walk]),
+        let t = Translator::new(Arc::new(backend), test_decider()).with_reference_monitor(monitor(
+            permit_session(Level::Secret, &[Action::Attach, Action::Walk]),
             Some(label(Level::Public)),
             Arc::new(AllowAll),
         ));
@@ -1458,7 +1474,7 @@ mod tests {
             fn check(
                 &self,
                 _ctx: &SecurityContext,
-                _object_label: &SecurityLabel,
+                _object: ObjectRef<'_>,
                 action: Action,
             ) -> bool {
                 !matches!(action, Action::Getattr)
@@ -1467,7 +1483,7 @@ mod tests {
 
         let backend = MemoryBackend::default();
         backend.add_file("/hello.txt", b"hi");
-        let t = Translator::new(Arc::new(backend)).with_reference_monitor(monitor(
+        let t = Translator::new(Arc::new(backend), test_decider()).with_reference_monitor(monitor(
             permit_session(Level::Secret, ALL_OPS),
             Some(label(Level::Public)),
             Arc::new(DenyGetattr),
@@ -1490,7 +1506,7 @@ mod tests {
     /// deny an already-authenticated client).
     #[tokio::test]
     async fn walk_clone_inherits_source_context() {
-        let t = Translator::new(Arc::new(MemoryBackend::default())).with_reference_monitor(
+        let t = Translator::new(Arc::new(MemoryBackend::default()), test_decider()).with_reference_monitor(
             monitor(
                 permit_session(Level::Secret, ALL_OPS),
                 Some(label(Level::Public)),
@@ -1533,16 +1549,16 @@ mod tests {
             fn check(
                 &self,
                 _ctx: &SecurityContext,
-                object_label: &SecurityLabel,
+                object: ObjectRef<'_>,
                 action: Action,
             ) -> bool {
-                !(action == Action::Read && object_label.level == Level::Secret)
+                !(action == Action::Read && matches!(object, ObjectRef::Path([])))
             }
         }
 
         let backend = MemoryBackend::default();
         backend.add_file("/public.txt", b"public");
-        let t = Translator::new(Arc::new(backend)).with_reference_monitor(Arc::new(
+        let t = Translator::new(Arc::new(backend), test_decider()).with_reference_monitor(Arc::new(
             ReferenceMonitor::new(
                 Arc::new(StaticAuth(permit_session(Level::Secret, ALL_OPS))),
                 Arc::new(ByPath),
@@ -1564,7 +1580,7 @@ mod tests {
 
     #[tokio::test]
     async fn connection_scoped_translators_do_not_share_fid_context() {
-        let root = Translator::new(Arc::new(MemoryBackend::default())).with_reference_monitor(
+        let root = Translator::new(Arc::new(MemoryBackend::default()), test_decider()).with_reference_monitor(
             monitor(
                 permit_session(Level::Secret, ALL_OPS),
                 Some(label(Level::Public)),
@@ -1605,7 +1621,7 @@ mod tests {
             }
         }
 
-        let t = Translator::new(Arc::new(MemoryBackend::default())).with_reference_monitor(
+        let t = Translator::new(Arc::new(MemoryBackend::default()), test_decider()).with_reference_monitor(
             Arc::new(ReferenceMonitor::new(
                 Arc::new(TicketAuth),
                 Arc::new(StaticLabels(Some(label(Level::Public)))),
@@ -1647,7 +1663,7 @@ mod tests {
             }
         }
 
-        let t = Translator::new(Arc::new(MemoryBackend::default())).with_reference_monitor(
+        let t = Translator::new(Arc::new(MemoryBackend::default()), test_decider()).with_reference_monitor(
             Arc::new(ReferenceMonitor::new(
                 Arc::new(FreshDeadlineAuth),
                 Arc::new(StaticLabels(Some(label(Level::Public)))),
@@ -1685,7 +1701,7 @@ mod tests {
                 }
             }
         }
-        let t = Translator::new(Arc::new(MemoryBackend::default())).with_reference_monitor(
+        let t = Translator::new(Arc::new(MemoryBackend::default()), test_decider()).with_reference_monitor(
             Arc::new(ReferenceMonitor::new(
                 Arc::new(TicketAuth),
                 Arc::new(StaticLabels(Some(label(Level::Public)))),
@@ -1720,8 +1736,8 @@ mod tests {
         }
         struct DenySecretReads;
         impl AccessDecider for DenySecretReads {
-            fn check(&self, _ctx: &SecurityContext, object_label: &SecurityLabel, action: Action) -> bool {
-                !(action == Action::Read && object_label.level == Level::Secret)
+            fn check(&self, _ctx: &SecurityContext, object: ObjectRef<'_>, action: Action) -> bool {
+                !(action == Action::Read && matches!(object, ObjectRef::Path(["a", "b"])))
             }
         }
         let root = SyntheticNode::dir().with_child(
@@ -1732,7 +1748,7 @@ mod tests {
             Arc::new(SyntheticMount::new(root)),
             hyprstream_rpc::Subject::new("tenant"),
         );
-        let t = Translator::new(Arc::new(backend)).with_reference_monitor(Arc::new(
+        let t = Translator::new(Arc::new(backend), test_decider()).with_reference_monitor(Arc::new(
             ReferenceMonitor::new(
                 Arc::new(StaticAuth(permit_session(Level::Secret, ALL_OPS))),
                 Arc::new(ByPath),
@@ -1774,7 +1790,7 @@ mod tests {
         }
         let backend = MemoryBackend::default();
         backend.add_file("/secret", b"classified");
-        let t = Translator::new(Arc::new(backend)).with_reference_monitor(Arc::new(
+        let t = Translator::new(Arc::new(backend), test_decider()).with_reference_monitor(Arc::new(
             ReferenceMonitor::new(
                 Arc::new(StaticAuth(permit_session(Level::Public, ALL_OPS))),
                 Arc::new(ByDepth),
@@ -1851,7 +1867,7 @@ mod tests {
         }
 
         // No monitor: this isolates the path-caching fix from mediation.
-        let t = Translator::new(Arc::new(PartialWalkBackend));
+        let t = Translator::new(Arc::new(PartialWalkBackend), test_decider());
         t.handle_message(&msg::tattach(1, 0, u32::MAX, "user", "/")).await.unwrap();
         t.handle_message(&msg::twalk(2, 0, 1, &["a", "b"])).await.unwrap();
 
@@ -1888,7 +1904,7 @@ mod tests {
         let backend = MemoryBackend::default();
         backend.add_file("/one.txt", b"111");
         backend.add_file("/two.txt", b"22");
-        let t = Arc::new(Translator::new(Arc::new(backend)));
+        let t = Arc::new(Translator::new(Arc::new(backend), test_decider()));
 
         // Attach fid 0 as the (directory) root, then open + readdir it.
         t.handle_message(&msg::tattach(1, 0, u32::MAX, "u", "/")).await.unwrap();
@@ -1934,7 +1950,7 @@ mod tests {
         let backend = MemoryBackend::default();
         backend.add_file("/hello.txt", b"hello vsock");
         let listener = UnixListener::bind(&sock).expect("bind hybrid-vsock host UDS");
-        let translator = Translator::new(Arc::new(backend));
+        let translator = Translator::new(Arc::new(backend), test_decider());
         let server = tokio::spawn(translator.serve_vsock(listener));
 
         // ── Client side ─────────────────────────────────────────────────
@@ -2018,7 +2034,7 @@ mod tests {
         let backend = MemoryBackend::default();
         backend.add_file("/hello.txt", b"hello raw");
         let listener = UnixListener::bind(&sock).expect("bind raw vsock per-port host UDS");
-        let translator = Translator::new(Arc::new(backend));
+        let translator = Translator::new(Arc::new(backend), test_decider());
         let server = tokio::spawn(translator.serve_vsock_raw(listener));
 
         // ── Client (guest) side ─────────────────────────────────────────
@@ -2084,7 +2100,7 @@ mod tests {
         let _ = std::fs::remove_file(&sock);
 
         let listener = UnixListener::bind(&sock).unwrap();
-        let translator = Translator::new(Arc::new(MemoryBackend::default()));
+        let translator = Translator::new(Arc::new(MemoryBackend::default()), test_decider());
         let server = tokio::spawn(translator.serve_vsock(listener));
 
         // First client sends garbage; server should drop it and keep listening.
@@ -2142,7 +2158,11 @@ mod tests {
         let root = SyntheticNode::dir()
             .with_child("hello.txt", SyntheticNode::file(b"hi alice".to_vec()));
         let mount: Arc<dyn hyprstream_vfs::Mount> = Arc::new(SyntheticMount::new(root));
-        Arc::new(Translator::from_mount_authorized(mount, Arc::new(FakeTicketAuth)))
+        Arc::new(Translator::from_mount_authorized(
+            mount,
+            Arc::new(FakeTicketAuth),
+            test_decider(),
+        ))
     }
 
     /// A valid ticket in `Tattach.uname` binds the session Subject and the
