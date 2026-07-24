@@ -846,7 +846,10 @@ mod tests {
         let gate = GenesisGate::production();
         let policy = SitePolicy::conservative();
         for node in &gate.report().labeled {
-            let components: Vec<&str> = node.trim_start_matches('/').split('/').collect();
+            let components: Vec<&str> = node
+                .split('/')
+                .filter(|component| !component.is_empty())
+                .collect();
             let expected = policy.label_for(node);
             assert_eq!(
                 gate.resolver().resolve(ObjectRef::Path(&components)),
