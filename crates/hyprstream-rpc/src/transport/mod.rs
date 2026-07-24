@@ -27,6 +27,9 @@ pub mod iroh_transport;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod iroh_moq;
 #[cfg(not(target_arch = "wasm32"))]
+/// CONNECT-time authentication + tenant binding for the `/moq` WebTransport
+/// plane (#1153).
+pub mod moq_connect_auth;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod in_memory;
 #[cfg(not(target_arch = "wasm32"))]
