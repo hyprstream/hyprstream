@@ -453,7 +453,15 @@ pub fn encrypt_credentials_if_available(secrets_dir: Option<&std::path::Path>) -
     let dir: &std::path::Path = match secrets_dir {
         Some(d) => d,
         None => {
-            default_dir = units::hyprstream_config_dir().map(|d| d.join("credentials"));
+            default_dir = match units::hyprstream_config_dir() {
+                Ok(dir) => dir.map(|d| d.join("credentials")),
+                Err(error) => {
+                    tracing::error!(
+                        "Invalid instance name while resolving credentials directory: {error}"
+                    );
+                    return false;
+                }
+            };
             match default_dir.as_deref() {
                 Some(d) => d,
                 None => {

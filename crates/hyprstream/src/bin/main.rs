@@ -2132,15 +2132,8 @@ fn main() -> Result<()> {
                                     // %d/signing-key, while standalone uses a subdirectory.
                                     // #759: "policy" always resolves to the flat root/CA key regardless of
                                     // secrets profile — see `resolve_service_signing_key` for why.
-                                    let secrets_profile = if std::env::var(
-                                        "HYPRSTREAM__SECRETS__PATH",
-                                    )
-                                    .is_ok()
-                                    {
-                                        hyprstream_core::auth::identity_store::SecretsProfile::PerServiceScoped
-                                    } else {
-                                        hyprstream_core::auth::identity_store::SecretsProfile::SharedDirectory
-                                    };
+                                    let secrets_profile =
+                                        hyprstream_core::auth::identity_store::SecretsProfile::from_env()?;
                                     let own_key = hyprstream_core::auth::identity_store::resolve_service_signing_key(
                                         &secrets_dir, &name, secrets_profile,
                                     )?;
@@ -2159,21 +2152,23 @@ fn main() -> Result<()> {
                                         // that register_service_key() finds it on first call — otherwise
                                         // the trust store only has pubkeys (jwt: None) from bootstrap-pubkeys
                                         // and registration is silently skipped.
-                                        if let Ok(Some(jwt_bytes)) = hyprstream_core::auth::identity_store::read_secret(&secrets_dir, "service-jwt") {
-                                            if let Ok(jwt_str) = String::from_utf8(jwt_bytes) {
-                                                let exp = hyprstream_core::auth::identity_store::decode_jwt_exp_raw(&jwt_str).unwrap_or(0);
-                                                hyprstream_service::global_trust_store().insert(
-                                                    own_key.verifying_key(),
-                                                    hyprstream_service::Attestation {
-                                                        scopes: std::iter::once(name.clone()).collect(),
-                                                        subject: None,
-                                                        jwt: Some(jwt_str),
-                                                        expires_at: exp,
-                                                        attested_by: None,
-                                                    },
-                                                );
-                                                tracing::info!(service = %name, "Seeded trust store with own service-jwt from credential dir");
-                                            }
+                                        if let Ok(Some(jwt_str)) = hyprstream_core::auth::identity_store::load_service_jwt_for_profile(
+                                            &secrets_dir,
+                                            &name,
+                                            secrets_profile,
+                                        ) {
+                                            let exp = hyprstream_core::auth::identity_store::decode_jwt_exp_raw(&jwt_str).unwrap_or(0);
+                                            hyprstream_service::global_trust_store().insert(
+                                                own_key.verifying_key(),
+                                                hyprstream_service::Attestation {
+                                                    scopes: std::iter::once(name.clone()).collect(),
+                                                    subject: None,
+                                                    jwt: Some(jwt_str),
+                                                    expires_at: exp,
+                                                    attested_by: None,
+                                                },
+                                            );
+                                            tracing::info!(service = %name, "Seeded trust store with own service-jwt from credential dir");
                                         }
                                     }
                                 } else {

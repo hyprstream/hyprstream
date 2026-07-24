@@ -313,28 +313,97 @@ pub fn write_ca_verifying_key(credentials_dir: &std::path::Path, key: &Verifying
     write_secret(credentials_dir, "ca-pubkey", key.as_bytes())
 }
 
-/// Load a service JWT (CA-signed certificate binding service name → pubkey).
-pub fn load_service_jwt(credentials_dir: &std::path::Path, service_name: &str) -> Result<Option<String>> {
-    let service_dir = credentials_dir.join(service_name);
-    match read_secret(&service_dir, "service-jwt") {
-        Ok(Some(bytes)) => {
+fn provisioned_service_jwt_dir(
+    credentials_dir: &std::path::Path,
+    service_name: &str,
+    profile: SecretsProfile,
+) -> std::path::PathBuf {
+    match profile {
+        SecretsProfile::SharedDirectory => credentials_dir.join(service_name),
+        SecretsProfile::PerServiceScoped => credentials_dir.to_path_buf(),
+    }
+}
+
+fn writable_service_jwt_dir(
+    credentials_dir: &std::path::Path,
+    service_name: &str,
+    profile: SecretsProfile,
+) -> std::path::PathBuf {
+    let state_dir = super::key_rotation::rotation_state_dir(credentials_dir);
+    if profile == SecretsProfile::PerServiceScoped && state_dir == credentials_dir {
+        state_dir
+    } else {
+        // `$STATE_DIRECTORY` is shared by the generated service units, so the
+        // writable fallback must retain a service-name component even when the
+        // read-only systemd credential directory was already service-scoped.
+        state_dir.join(service_name)
+    }
+}
+
+/// Load a service JWT using the active credential layout.
+///
+/// Renewed state is preferred. When a read-only credential provider caused
+/// writes to fall back to `$STATE_DIRECTORY`/XDG state, the originally
+/// provisioned credential remains the first-boot fallback.
+pub fn load_service_jwt_for_profile(
+    credentials_dir: &std::path::Path,
+    service_name: &str,
+    profile: SecretsProfile,
+) -> Result<Option<String>> {
+    validate_service_name(service_name)?;
+    let state_dir = writable_service_jwt_dir(credentials_dir, service_name, profile);
+    let provisioned_dir = provisioned_service_jwt_dir(credentials_dir, service_name, profile);
+    let bytes = match read_secret(&state_dir, "service-jwt")? {
+        Some(bytes) => Some(bytes),
+        None if state_dir != provisioned_dir => read_secret(&provisioned_dir, "service-jwt")?,
+        None => None,
+    };
+    match bytes {
+        Some(bytes) => {
             let jwt = String::from_utf8(bytes)
                 .context("service-jwt is not valid UTF-8")?;
             Ok(Some(jwt))
         }
-        Ok(None) => Ok(None),
-        Err(e) => Err(e),
+        None => Ok(None),
     }
 }
 
-/// Write a service JWT to the service's credential directory.
+/// Persist a service JWT using the same profile-aware path startup reads.
+pub fn write_service_jwt_for_profile(
+    credentials_dir: &std::path::Path,
+    service_name: &str,
+    profile: SecretsProfile,
+    jwt: &str,
+) -> Result<()> {
+    validate_service_name(service_name)?;
+    let state_dir = writable_service_jwt_dir(credentials_dir, service_name, profile);
+    write_secret(&state_dir, "service-jwt", jwt.as_bytes())
+}
+
+/// Load a service JWT from the shared-directory credential layout.
+pub fn load_service_jwt(
+    credentials_dir: &std::path::Path,
+    service_name: &str,
+) -> Result<Option<String>> {
+    load_service_jwt_for_profile(
+        credentials_dir,
+        service_name,
+        SecretsProfile::SharedDirectory,
+    )
+}
+
+/// Write a service JWT to the shared-directory credential layout.
 pub fn write_service_jwt(
     credentials_dir: &std::path::Path,
     service_name: &str,
     jwt: &str,
 ) -> Result<()> {
-    let service_dir = credentials_dir.join(service_name);
-    write_secret(&service_dir, "service-jwt", jwt.as_bytes())
+    write_service_jwt_for_profile(
+        credentials_dir,
+        service_name,
+        SecretsProfile::SharedDirectory,
+        jwt,
+    )
 }
 
 /// Bootstrap pubkeys — the pubkeys of services needed before discovery is available.
@@ -439,6 +508,30 @@ pub enum SecretsProfile {
     /// The provider has already scoped the directory to one service, so its
     /// credentials use flat names such as `signing-key`.
     PerServiceScoped,
+}
+
+/// Explicit deployment signal for credential-directory layout.
+///
+/// The path override is deliberately separate: setting
+/// `HYPRSTREAM__SECRETS__PATH` alone does not prove that a provider has already
+/// scoped the directory to one service.
+pub const SECRETS_PROFILE_ENV: &str = "HYPRSTREAM_SECRETS_PROFILE";
+
+impl SecretsProfile {
+    pub fn from_env() -> Result<Self> {
+        match std::env::var(SECRETS_PROFILE_ENV) {
+            Err(std::env::VarError::NotPresent) => Ok(Self::SharedDirectory),
+            Ok(value) if value == "shared-directory" => Ok(Self::SharedDirectory),
+            Ok(value) if value == "per-service-scoped" => Ok(Self::PerServiceScoped),
+            Ok(value) => Err(anyhow!(
+                "{SECRETS_PROFILE_ENV} must be 'shared-directory' or \
+                 'per-service-scoped', got {value:?}"
+            )),
+            Err(error) => Err(anyhow!(
+                "{SECRETS_PROFILE_ENV} is not valid Unicode: {error}"
+            )),
+        }
+    }
 }
 
 /// Resolve the Ed25519 signing key a service process should use to sign its
@@ -1006,6 +1099,8 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    static SECRETS_ENV_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
     // ── Helpers ──────────────────────────────────────────────────────────────
 
     /// Back-date a file's mtime by `days` days using nix utimes.
@@ -1054,6 +1149,7 @@ mod tests {
     /// parallel, so splitting them would race.
     #[test]
     fn test_credentials_dir_precedence() {
+        let _serial = SECRETS_ENV_LOCK.lock();
         const VAR: &str = "HYPRSTREAM__SECRETS__PATH";
 
         // (a) env var set → returns exactly that path.
@@ -1075,6 +1171,106 @@ mod tests {
                 dir.display()
             );
         }
+    }
+
+    #[test]
+    fn test_path_override_alone_keeps_shared_profile_and_service_key_isolation() {
+        let _serial = SECRETS_ENV_LOCK.lock();
+        let dir = TempDir::new().unwrap();
+        let _path = EnvVarGuard::set("HYPRSTREAM__SECRETS__PATH", dir.path().to_str().unwrap());
+        let _profile = EnvVarGuard::unset(SECRETS_PROFILE_ENV);
+
+        let profile = SecretsProfile::from_env().unwrap();
+        assert_eq!(
+            profile,
+            SecretsProfile::SharedDirectory,
+            "a general path override is not proof of per-service scoping"
+        );
+        let model = resolve_service_signing_key(dir.path(), "model", profile).unwrap();
+        let worker = resolve_service_signing_key(dir.path(), "worker", profile).unwrap();
+        assert_ne!(
+            model.to_bytes(),
+            worker.to_bytes(),
+            "services sharing an overridden directory must retain independent keys"
+        );
+        assert!(dir.path().join("model").join("signing-key").exists());
+        assert!(dir.path().join("worker").join("signing-key").exists());
+        assert!(!dir.path().join("signing-key").exists());
+    }
+
+    #[test]
+    fn test_service_jwt_write_round_trips_through_startup_read_layouts() {
+        let dir = TempDir::new().unwrap();
+
+        write_service_jwt_for_profile(
+            dir.path(),
+            "model",
+            SecretsProfile::SharedDirectory,
+            "shared.jwt",
+        )
+        .unwrap();
+        assert_eq!(
+            load_service_jwt_for_profile(dir.path(), "model", SecretsProfile::SharedDirectory,)
+                .unwrap()
+                .as_deref(),
+            Some("shared.jwt")
+        );
+        assert!(dir.path().join("model").join("service-jwt").exists());
+
+        let scoped = dir.path().join("scoped");
+        write_service_jwt_for_profile(
+            &scoped,
+            "model",
+            SecretsProfile::PerServiceScoped,
+            "scoped.jwt",
+        )
+        .unwrap();
+        assert_eq!(
+            load_service_jwt_for_profile(&scoped, "model", SecretsProfile::PerServiceScoped,)
+                .unwrap()
+                .as_deref(),
+            Some("scoped.jwt")
+        );
+        assert!(scoped.join("service-jwt").exists());
+        assert!(!scoped.join("model").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_scoped_service_jwt_renewal_survives_read_only_credentials_restart() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let _serial = SECRETS_ENV_LOCK.lock();
+        let dir = TempDir::new().unwrap();
+        let credentials = dir.path().join("credentials");
+        let state = dir.path().join("state");
+        std::fs::create_dir_all(&credentials).unwrap();
+        std::fs::create_dir_all(&state).unwrap();
+        write_secret(&credentials, "service-jwt", b"provisioned.jwt").unwrap();
+
+        std::fs::set_permissions(&credentials, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let _state = EnvVarGuard::set("STATE_DIRECTORY", state.to_str().unwrap());
+        let _instance = EnvVarGuard::unset("HYPRSTREAM_INSTANCE");
+
+        write_service_jwt_for_profile(
+            &credentials,
+            "model",
+            SecretsProfile::PerServiceScoped,
+            "renewed.jwt",
+        )
+        .unwrap();
+        assert_eq!(
+            load_service_jwt_for_profile(&credentials, "model", SecretsProfile::PerServiceScoped,)
+                .unwrap()
+                .as_deref(),
+            Some("renewed.jwt"),
+            "startup must prefer the renewed JWT written to writable state"
+        );
+        assert_eq!(
+            std::fs::read_to_string(state.join("credentials").join("model").join("service-jwt"))
+                .unwrap(),
+            "renewed.jwt"
+        );
     }
 
     #[test]
