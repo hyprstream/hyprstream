@@ -15,7 +15,7 @@ use hyprstream_rpc::cid::{Codec, HashAlgo, decode_cid, encode_cid};
 
 use super::CasError;
 use super::domain::DedupDomain;
-use super::manifest::{BlobManifest, merkle_from_address};
+use super::manifest::{BlobManifest, looks_like_legacy_hex, merkle_from_address};
 
 /// Hex-character length of a `digest_length`-byte digest (2 hex chars per byte).
 const fn hex_digest_len(digest_length: u16) -> usize {
@@ -192,10 +192,6 @@ impl CasSubstrate {
         };
         merkle.is_ok_and(|merkle| self.store_for(domain).exists(&merkle))
     }
-}
-
-fn looks_like_legacy_hex(address: &str) -> bool {
-    matches!(address.len(), 40 | 64) && address.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 #[cfg(test)]
