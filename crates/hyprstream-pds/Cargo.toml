@@ -9,6 +9,8 @@ description = "atproto PDS record store — DAG-CBOR records, MST, signed commit
 [dependencies]
 # P-256 ES256 signing for atproto commits (#atproto verification method).
 p256 = { workspace = true }
+# OS-backed entropy for per-account #atproto key generation.
+rand = { workspace = true }
 # SHA-256 — signing digest + CIDv1 dag-cbor multihash for all repo blocks.
 sha2 = { workspace = true }
 # Error handling.
@@ -22,6 +24,7 @@ hyprstream-rpc = { path = "../hyprstream-rpc" }
 hyprstream-crypto = { path = "../hyprstream-crypto" }
 # Ed25519 signing/verifying keys for the at9p composite signature path.
 ed25519-dalek = { workspace = true }
+rustix = { version = "1.1.4", features = ["fs"] }
 blake3 = { workspace = true }
 # Non-poisoning Mutex for the in-memory duplicity watermark store (#886).
 parking_lot = { workspace = true }
@@ -38,8 +41,7 @@ bs58 = "0.5"
 # tag-42 links) that serde-driven CBOR cannot guarantee. No CBOR/CID crate dep.
 
 [dev-dependencies]
-# Random signing keys for round-trip / tamper tests.
-rand = { workspace = true }
+# Property tests for deterministic codecs.
 proptest = { workspace = true }
 # at9p_resolver tests exercise the admission arm (admit_key_against_did) which is
 # generic over DidDocResolve — an async trait — against a never-call test double.
