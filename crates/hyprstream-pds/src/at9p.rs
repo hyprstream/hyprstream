@@ -436,6 +436,28 @@ impl CapsuleBody {
         Ok(body)
     }
 
+    /// Select the published subject key whose Ed25519 half equals `ed25519_pub`,
+    /// if any — the **set-semantics** accessor (#1188 / #1183).
+    ///
+    /// `subjectKeys` is a set of currently-usable identity keys, not an ordered
+    /// list with a positional "primary". A consumer that holds an Ed25519
+    /// application-signer key (admission #894, native announcements #1004) finds
+    /// *its* hybrid pair by identity, and takes the atomically-bound ML-DSA-65
+    /// half from the same entry. The schema guarantees at most one match
+    /// ([`validate_unique_subject_keys`] forbids a repeated Ed25519 half), so
+    /// this is unambiguous. Returns `None` when no published key matches — the
+    /// caller then rejects fail-closed, never falling back to a positional key.
+    pub fn subject_key_for_ed25519(&self, ed25519_pub: &[u8]) -> Option<&HybridKeyPair> {
+        self.subject_keys
+            .iter()
+            .find(|key| key.ed25519_pub.as_slice() == ed25519_pub)
+    }
+
+    /// Whether `ed25519_pub` is one of the published subject keys.
+    pub fn publishes_ed25519(&self, ed25519_pub: &[u8]) -> bool {
+        self.subject_key_for_ed25519(ed25519_pub).is_some()
+    }
+
     /// Canonical DAG-CBOR bytes of the capsule body.
     ///
     /// This is the signed payload for an at9p capsule: the composite signature
@@ -461,6 +483,19 @@ impl CapsuleBody {
         for key in &self.subject_keys {
             key.validate()?;
         }
+        // subjectKeys is a *set*, not an ordered list with a positional
+        // "primary" (#1188 / #1183): consumers select a member by its atomic
+        // hybrid identity (Ed25519↔ML-DSA-65 pairing), never by index. Two
+        // identical pairs would be a meaningless repeat, and — worse — an
+        // ambiguous key-selection input. Reject duplicates by their
+        // commitment digest (the same BLAKE3-512 binding both halves that
+        // `next_key_commitments` uses), so overlap/rotation publishes *distinct*
+        // usable keys. A member sharing one half with another but differing on
+        // the other half is a distinct pair and is allowed (each is atomically
+        // bound), but an Ed25519 half MUST NOT repeat across pairs: selection by
+        // application signer key (admission, native announcements) keys on the
+        // Ed25519 half, so a repeated Ed25519 would reintroduce ambiguity.
+        validate_unique_subject_keys(&self.subject_keys)?;
         // next_key_commitments MAY be empty (#879 §5.3: a declared-immutable
         // identity with rotation frozen forever), but two identical commitments
         // are meaningless (the same next key pre-committed twice) and would
@@ -1292,6 +1327,37 @@ fn validate_unique_digests(digests: &[[u8; H512_LEN]], field: &str) -> Result<()
     let mut seen = BTreeSet::new();
     for digest in digests {
         ensure!(seen.insert(digest.as_slice()), "duplicate {field} entry");
+    }
+    Ok(())
+}
+
+/// Reject an ambiguous `subjectKeys` *set* (#1188 / #1183).
+///
+/// `subjectKeys` publishes every currently-usable identity key so overlap
+/// rotation and PQ-hybrid rollout work by publishing the new key alongside the
+/// old and letting each verifier select the member it understands (the JWKS
+/// `kid` discipline, applied to hybrid pairs). For that selection to be
+/// unambiguous:
+///
+/// - no two entries may be the *same* atomic pair (identical commitment
+///   digest) — a meaningless repeat; and
+/// - no Ed25519 half may repeat across entries — application-signer selection
+///   (admission #894, native announcements #1004) keys on the Ed25519 half, so
+///   a repeated Ed25519 would make "which hybrid pair authorizes this signer?"
+///   ambiguous, exactly the positional-authority failure #1188 removes.
+fn validate_unique_subject_keys(keys: &[HybridKeyPair]) -> Result<()> {
+    let mut seen_pairs = BTreeSet::new();
+    let mut seen_ed25519 = BTreeSet::new();
+    for key in keys {
+        ensure!(
+            seen_pairs.insert(key.commitment_digest()),
+            "duplicate subjectKeys entry (identical hybrid pair)"
+        );
+        ensure!(
+            seen_ed25519.insert(key.ed25519_pub.clone()),
+            "duplicate subjectKeys Ed25519 half across hybrid pairs — \
+             ambiguous key selection"
+        );
     }
     Ok(())
 }

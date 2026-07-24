@@ -73,58 +73,132 @@ pub trait DidDocumentProvider: Send + Sync {
     fn document(&self, did: &str) -> Result<Value>;
 }
 
-/// The content-verified subject keys of a `did:at9p` capsule, re-expressed in the
-/// rpc-local key types so this crate need not depend on `hyprstream-pds` (pds
-/// depends on rpc; the dependency does not reverse).
+/// One content-verified atomic hybrid subject key: an Ed25519 identity key and
+/// the ML-DSA-65 key **bound to it in the same capsule entry** (#1188 / #1183).
 ///
-/// `ed25519` is the capsule's primary genesis identity key, not carrier metadata
-/// or live possession proof. `ml_dsa_65` is the PQ half of the
-/// hybrid pair. A [`VerifiedAt9pKeys`]
-/// is only constructable via [`VerifiedAt9pKeys::new_gate_verified`] — the GATE
-/// mint — which only an [`At9pCapsuleResolver`] that ran the A4 GATE pipeline
-/// (canon→hash→sig, #884) to completion reaches. The private fields make the
-/// "only constructable after the GATE ran" provenance a type-level invariant
-/// rather than a bare rustdoc claim: arbitrary code cannot build one with an
-/// unverified `ed25519`↔`ml_dsa_65` pair, so holding one is proof the binding came
-/// from **content-verified capsule material**, not a config file or a caller
-/// assertion (the D2/#894 provenance boundary, hardened in #964).
+/// The pairing is atomic: the ML-DSA-65 half is never recombined with a
+/// different Ed25519 half. Selecting a subject key by its Ed25519 identity
+/// therefore yields exactly the PQ key the capsule author bound to it, which is
+/// what overlap rotation and PQ-hybrid rollout require — publish several keys,
+/// let each verifier take the whole pair it recognizes.
 #[derive(Clone)]
-pub struct VerifiedAt9pKeys {
-    /// The content-verified Ed25519 genesis identity key.
+pub struct VerifiedAt9pKey {
     ed25519: [u8; 32],
-    /// The verified ML-DSA-65 subject key bound to `ed25519` in the capsule.
     ml_dsa_65: MlDsaVerifyingKey,
 }
 
-impl VerifiedAt9pKeys {
-    /// The GATE mint — the sole construction path for a [`VerifiedAt9pKeys`].
-    ///
-    /// This is the constructor-witness chokepoint: the fields are private, so the
-    /// *only* way to produce a `VerifiedAt9pKeys` is to call this method, which
-    /// encodes the GATE-ran provenance in its name. Trusted callers are the A4 GATE
-    /// resolver implementations (the real [`At9pCapsuleResolver`] impl in
-    /// `hyprstream-pds::at9p_resolver`, plus in-crate test fixtures). Code that has
-    /// not run the GATE has no business calling this — review a new call site as a
-    /// provenance decision, not a mechanical field set.
-    ///
-    /// (Rust cannot seal this across crates — `hyprstream-pds` is a *dependent* of
-    /// `hyprstream-rpc`, so rpc has no way to grant pds the mint while denying it
-    /// to arbitrary code. The private fields + single named mint convert the
-    /// provenance from "any code can write the struct literal" to "any code must go
-    /// through one review-visible chokepoint", which is the proportionate
-    /// hardening; the trust root remains "whoever injects the gate is trusted".)
-    pub fn new_gate_verified(ed25519: [u8; 32], ml_dsa_65: MlDsaVerifyingKey) -> Self {
-        Self { ed25519, ml_dsa_65 }
-    }
-
-    /// The content-verified Ed25519 genesis identity key.
+impl VerifiedAt9pKey {
+    /// The content-verified Ed25519 identity key.
     pub fn ed25519(&self) -> &[u8; 32] {
         &self.ed25519
     }
 
-    /// The verified ML-DSA-65 subject key bound to `ed25519` in the capsule.
+    /// The ML-DSA-65 key atomically bound to [`Self::ed25519`] in the capsule.
     pub fn ml_dsa_65(&self) -> &MlDsaVerifyingKey {
         &self.ml_dsa_65
+    }
+}
+
+/// The content-verified subject key **set** of a `did:at9p` capsule, re-expressed
+/// in the rpc-local key types so this crate need not depend on `hyprstream-pds`
+/// (pds depends on rpc; the dependency does not reverse).
+///
+/// `subjectKeys` is a *set* of currently-usable identity keys, never an ordered
+/// list with a positional "primary" (#1188 / #1183): a producer publishes the
+/// new key alongside the old to rotate without a flag day, and a classical key
+/// beside a PQ/composite key for hybrid rollout. A consumer selects the member
+/// it recognizes — here [`Self::for_ed25519`], keyed on the Ed25519 application
+/// signer identity — and skips the rest, never letting position confer
+/// authority. The set is non-empty and its Ed25519 halves are unique (enforced
+/// by the capsule schema), so selection is unambiguous.
+///
+/// A [`VerifiedAt9pKeys`] is only constructable via the GATE mints
+/// ([`VerifiedAt9pKeys::new_gate_verified`] / [`VerifiedAt9pKeys::new_gate_verified_set`]),
+/// which only an [`At9pCapsuleResolver`] that ran the A4 GATE pipeline
+/// (canon→hash→sig, #884) to completion reaches. The private field makes the
+/// "only constructable after the GATE ran" provenance a type-level invariant
+/// rather than a bare rustdoc claim: arbitrary code cannot build one with an
+/// unverified `ed25519`↔`ml_dsa_65` binding, so holding one is proof the binding
+/// came from **content-verified capsule material**, not a config file or a
+/// caller assertion (the D2/#894 provenance boundary, hardened in #964).
+#[derive(Clone)]
+pub struct VerifiedAt9pKeys {
+    /// The content-verified subject key set — non-empty, unique Ed25519 halves.
+    keys: Vec<VerifiedAt9pKey>,
+}
+
+impl VerifiedAt9pKeys {
+    /// The GATE mint for a **single** verified subject key — a convenience over
+    /// [`Self::new_gate_verified_set`] for the (common) single-key capsule.
+    ///
+    /// This is the constructor-witness chokepoint: the field is private, so the
+    /// *only* way to produce a `VerifiedAt9pKeys` is one of these mints, which
+    /// encode the GATE-ran provenance in their names. Trusted callers are the A4
+    /// GATE resolver implementations (the real [`At9pCapsuleResolver`] impl in
+    /// `hyprstream-pds::at9p_resolver`, plus in-crate test fixtures). Code that
+    /// has not run the GATE has no business calling this — review a new call site
+    /// as a provenance decision, not a mechanical field set.
+    ///
+    /// (Rust cannot seal this across crates — `hyprstream-pds` is a *dependent* of
+    /// `hyprstream-rpc`, so rpc has no way to grant pds the mint while denying it
+    /// to arbitrary code. The private field + named mints convert the provenance
+    /// from "any code can write the struct literal" to "any code must go through
+    /// one review-visible chokepoint", which is the proportionate hardening; the
+    /// trust root remains "whoever injects the gate is trusted".)
+    pub fn new_gate_verified(ed25519: [u8; 32], ml_dsa_65: MlDsaVerifyingKey) -> Self {
+        Self {
+            keys: vec![VerifiedAt9pKey { ed25519, ml_dsa_65 }],
+        }
+    }
+
+    /// The GATE mint for the full verified subject key **set** (#1188).
+    ///
+    /// The projected set MUST be non-empty (the schema guarantees it) and MUST
+    /// have unique Ed25519 halves so [`Self::for_ed25519`] selection is
+    /// unambiguous — the same discipline the capsule schema enforces on
+    /// `subjectKeys`. A violation is a projection bug, not attacker input, so it
+    /// is a fail-closed `Err` rather than a silent first-wins.
+    pub fn new_gate_verified_set(keys: Vec<VerifiedAt9pKey>) -> Result<Self> {
+        if keys.is_empty() {
+            return Err(anyhow!(
+                "VerifiedAt9pKeys: capsule projected an empty subject key set (fail-closed)"
+            ));
+        }
+        for (i, a) in keys.iter().enumerate() {
+            if keys[i + 1..].iter().any(|b| b.ed25519 == a.ed25519) {
+                return Err(anyhow!(
+                    "VerifiedAt9pKeys: duplicate Ed25519 subject key in projected set — \
+                     ambiguous selection (fail-closed)"
+                ));
+            }
+        }
+        Ok(Self { keys })
+    }
+
+    /// Build a [`VerifiedAt9pKey`] for the set mint — pds-side projection helper.
+    pub fn key(ed25519: [u8; 32], ml_dsa_65: MlDsaVerifyingKey) -> VerifiedAt9pKey {
+        VerifiedAt9pKey { ed25519, ml_dsa_65 }
+    }
+
+    /// Select the verified subject key whose Ed25519 half equals `ed25519`, if
+    /// the capsule published one — the set-semantics accessor (#1188).
+    ///
+    /// A consumer holding an Ed25519 application-signer identity finds *its*
+    /// hybrid pair by identity and takes the atomically-bound ML-DSA-65 half from
+    /// the same entry. Returns `None` when no published key matches; the caller
+    /// then rejects fail-closed rather than falling back to a positional key.
+    pub fn for_ed25519(&self, ed25519: &[u8; 32]) -> Option<&VerifiedAt9pKey> {
+        self.keys.iter().find(|k| &k.ed25519 == ed25519)
+    }
+
+    /// Whether `ed25519` is one of the published, content-verified subject keys.
+    pub fn publishes_ed25519(&self, ed25519: &[u8; 32]) -> bool {
+        self.for_ed25519(ed25519).is_some()
+    }
+
+    /// All content-verified subject keys in the set (non-empty).
+    pub fn keys(&self) -> &[VerifiedAt9pKey] {
+        &self.keys
     }
 }
 
@@ -260,6 +334,20 @@ impl<P: DidDocumentProvider> MethodDispatchResolver<P> {
     /// content-verified material, so the honest assurance ceiling is `PqHybrid`
     /// (the classical→hybrid trust upgrade). Any GATE failure, and a missing
     /// capsule resolver, fail closed.
+    ///
+    /// # Set semantics (#1188 / #1183)
+    ///
+    /// The capsule publishes a *set* of subject keys so overlap rotation and
+    /// PQ-hybrid rollout work. The scalar [`IdentityKeys`] this arm returns is
+    /// the anonymous *resolve* path — no application-signer selector is supplied,
+    /// so there is no key id/relationship to select by. Per the durable rule
+    /// (#1183: "when no selector exists, try each compatible candidate or reject
+    /// ambiguity"), a single published key is projected unambiguously, while a
+    /// multi-key set has no non-positional way to pick one here and fails closed
+    /// rather than silently taking `keys[0]`. Selection *by application signer*
+    /// (the admission path) handles the overlap set correctly via
+    /// [`VerifiedAt9pKeys::for_ed25519`]; teaching this scalar arm to carry the
+    /// whole set is the separately-tracked identity-resolver work (#1187).
     fn resolve_did_at9p(&self, did: &Did) -> Result<IdentityKeys> {
         let at9p = self.at9p.as_ref().ok_or_else(|| {
             anyhow!("did:at9p {did}: no capsule resolver configured — fail-closed")
@@ -267,9 +355,19 @@ impl<P: DidDocumentProvider> MethodDispatchResolver<P> {
         let verified = at9p
             .resolve(did.as_str())
             .map_err(|e| anyhow!("did:at9p {did}: capsule GATE failed: {e}"))?;
+        let keys = verified.keys();
+        if keys.len() != 1 {
+            return Err(anyhow!(
+                "did:at9p {did}: capsule publishes {} subject keys; the anonymous \
+                 resolve path has no selector to choose one non-positionally — \
+                 fail-closed (set-aware identity resolution is #1187)",
+                keys.len()
+            ));
+        }
+        let key = &keys[0];
         Ok(IdentityKeys {
-            ed25519: Some(*verified.ed25519()),
-            ml_dsa_65: Some(verified.ml_dsa_65().clone()),
+            ed25519: Some(*key.ed25519()),
+            ml_dsa_65: Some(key.ml_dsa_65().clone()),
             assurance: Assurance::PqHybrid,
         })
     }
@@ -516,8 +614,11 @@ mod tests {
             .resolve_identity_keys(&did)
             .expect("verified capsule resolves at PqHybrid");
         assert_eq!(resolved.assurance, Assurance::PqHybrid);
-        assert_eq!(resolved.ed25519, Some(*keys.ed25519()));
-        assert_eq!(ml_dsa_vk_bytes(&resolved.ml_dsa_65.unwrap()), ml_dsa_vk_bytes(keys.ml_dsa_65()));
+        // Single-key capsule → the resolve path projects that one key
+        // unambiguously (set semantics, #1188).
+        let only = &keys.keys()[0];
+        assert_eq!(resolved.ed25519, Some(*only.ed25519()));
+        assert_eq!(ml_dsa_vk_bytes(&resolved.ml_dsa_65.unwrap()), ml_dsa_vk_bytes(only.ml_dsa_65()));
         // The arm routed through the capsule resolver exactly once.
         assert_eq!(fixture.calls.lock().as_slice(), &["did:at9p:cid512abcdef"]);
     }

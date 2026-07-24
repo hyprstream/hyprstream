@@ -20,12 +20,14 @@
 //!
 //! # The four gates ([`validate_successor`])
 //!
-//! 1. **Signer authorization** — the update-record's signing key
-//!    (`new_capsule_body.subject_keys[0]`, revealed by the rotation) must have
-//!    its [`HybridKeyPair::commitment_digest`] present in the predecessor's
-//!    `next_key_commitments`. This is the key-selection decision B1 owns: it
-//!    picks *which* key [`verify_update_record`] must verify against, rather than
-//!    trusting a caller-supplied key.
+//! 1. **Signer authorization** — the update-record's signing key (one of the
+//!    revealed `new_capsule_body.subject_keys`, which is a published SET, not a
+//!    positional singleton — #1188 / #1183) must have its
+//!    [`HybridKeyPair::commitment_digest`] present in the predecessor's
+//!    `next_key_commitments`, and must actually have signed the record. This is
+//!    the key-selection decision B1 owns: it tries each pre-committed revealed
+//!    candidate and accepts the one that verifies, rather than trusting position
+//!    0 or a caller-supplied key.
 //! 2. **Linkage** — `prev_record_digest` equals the predecessor's record digest
 //!    (`H512` of its canonical bytes), chaining the segment back toward genesis.
 //! 3. **Monotonic epoch** — strictly increasing epoch.
@@ -247,32 +249,59 @@ pub fn validate_successor(
         return Err(SuccessorError::BrokenLinkage);
     }
 
-    // Gate 1 (signer authorization): the rotation reveals its now-current keys in
-    // new_capsule_body.subject_keys; the primary key is the authorizing signer.
-    // B1 selects THIS key for verification rather than trusting any caller input.
-    let signer: &HybridKeyPair =
-        candidate
-            .new_capsule_body
-            .subject_keys
-            .first()
-            .ok_or_else(|| {
-                SuccessorError::Malformed(anyhow::anyhow!(
-                    "update capsule body has no subject keys"
-                ))
-            })?;
-    let signer_digest = signer.commitment_digest();
-    if !predecessor
-        .next_key_commitments
+    // Gate 1 (signer authorization + signature): the rotation reveals its
+    // now-current keys in `new_capsule_body.subject_keys` — a published SET, not
+    // an ordered list with a positional "primary" (#1188 / #1183). The
+    // authorizing signer is whichever revealed key was BOTH pre-committed by the
+    // predecessor (its `commitment_digest` present in `next_key_commitments`) AND
+    // actually signed this record. B1 selects that key by trying each pre-rotation
+    // candidate rather than trusting position 0 or any caller input.
+    //
+    // This is the same discipline the durable rule (#1183) prescribes for a
+    // published key set with no wire-level selector: try each compatible
+    // candidate, accept the one that verifies, never let position confer
+    // authority. A predecessor may pre-commit to several next keys (hybrid /
+    // overlap), and the successor set may publish several; exactly one of them
+    // signs, and that one must have been pre-committed.
+    let precommitted: Vec<&HybridKeyPair> = candidate
+        .new_capsule_body
+        .subject_keys
         .iter()
-        .any(|commitment| commitment == &signer_digest)
-    {
+        .filter(|key| {
+            let digest = key.commitment_digest();
+            predecessor
+                .next_key_commitments
+                .iter()
+                .any(|commitment| commitment == &digest)
+        })
+        .collect();
+    if precommitted.is_empty() {
+        // No revealed subject key was pre-rotated: none is authorized to rotate
+        // this identity, regardless of whether the signature is otherwise valid.
         return Err(SuccessorError::SignerNotCommitted);
     }
 
-    // Gate 1 (signature): the pre-committed key must actually have signed the
+    // Gate 1 (signature): a pre-committed key must actually have signed the
     // record. Pinned-Hybrid (EdDSA + ML-DSA-65) verification (#939); done last as
-    // the most expensive check.
-    verify_update_record(candidate, signer).map_err(SuccessorError::SignatureInvalid)?;
+    // the most expensive check. Try each authorized candidate and accept the
+    // first whose composite verifies — set-selection by "which published key
+    // signed", not by index. If none verifies, the record was not signed by any
+    // authorized (pre-committed) key.
+    let mut last_err = None;
+    let signed = precommitted
+        .iter()
+        .any(|signer| match verify_update_record(candidate, signer) {
+            Ok(()) => true,
+            Err(e) => {
+                last_err = Some(e);
+                false
+            }
+        });
+    if !signed {
+        return Err(SuccessorError::SignatureInvalid(last_err.unwrap_or_else(
+            || anyhow::anyhow!("no pre-committed subject key verified the update record"),
+        )));
+    }
 
     // Gate 4 (freshness): now < expires_at.
     if !datetime_before(now, &candidate.expires_at).map_err(SuccessorError::Malformed)? {
@@ -681,6 +710,159 @@ mod tests {
         assert!(
             matches!(err, SuccessorError::SignatureInvalid(_)),
             "expected SignatureInvalid, got {err:?}"
+        );
+    }
+
+    // ── #1188 / #1183: subject_keys is a published SET, not a positional
+    //    singleton. These tests FAIL against the pre-fix `subject_keys.first()`
+    //    signer selection. ────────────────────────────────────────────────────
+
+    /// Build an update whose `new_capsule_body.subject_keys` publishes EVERY key
+    /// in `revealed` (a set — overlap/hybrid), signed by `signer_key` (which must
+    /// be one of `revealed`), and pre-committing to `next`.
+    fn update_revealing_set(
+        subject_cid512: &str,
+        epoch: u64,
+        prev_digest: [u8; H512_LEN],
+        revealed: &[&Signer],
+        signer_key: &Signer,
+        next: &[&Signer],
+        expires_at: &str,
+    ) -> UpdateRecord {
+        let mut body = CapsuleBody::new(
+            revealed.iter().map(|s| s.keypair.clone()).collect(),
+            service_entries(),
+        )
+        .unwrap();
+        body.next_key_commitments = next.iter().map(|s| s.keypair.commitment_digest()).collect();
+        sign_update_record(
+            subject_cid512.to_owned(),
+            epoch,
+            prev_digest,
+            body,
+            expires_at.to_owned(),
+            &signer_key.ed_sk,
+            &signer_key.pq_sk,
+        )
+        .unwrap()
+    }
+
+    /// Overlap rotation: the predecessor pre-commits to TWO next keys, and the
+    /// successor publishes BOTH as subject_keys but is signed by the SECOND
+    /// (non-position-0) one. The set-semantics successor-check must accept it by
+    /// trying each pre-committed candidate. The pre-fix code, which only ever
+    /// verified `subject_keys.first()`, rejects this as SignatureInvalid (the
+    /// first key did not sign).
+    #[test]
+    fn overlap_successor_signed_by_non_first_committed_key_accepted() {
+        let (g, n1, n2) = (signer(), signer(), signer());
+        // Genesis pre-commits to BOTH n1 and n2 (overlap: either may rotate).
+        let body = body_committing_to(&g, &[&n1, &n2]);
+        let capsule = sign_capsule(body, &g.ed_sk, &g.pq_sk).unwrap();
+        let s0 = ChainState::genesis(&capsule).unwrap();
+
+        // The successor publishes both n1 and n2 (n1 listed FIRST) but is signed
+        // by n2 — the second, non-positional key.
+        let (n3,) = (signer(),);
+        let rec = update_revealing_set(
+            &s0.subject_cid512,
+            1,
+            s0.record_digest,
+            &[&n1, &n2],
+            &n2,
+            &[&n3],
+            FUTURE,
+        );
+        let s1 = validate_successor(&s0, &rec, "2026-07-09T00:00:00Z")
+            .expect("a successor signed by any pre-committed published key must be accepted");
+        assert_eq!(s1.epoch, 1);
+    }
+
+    /// The dual guard: publishing a key in the set does NOT confer authority if
+    /// it was never pre-committed. Two shapes, both must be rejected:
+    ///
+    /// - set `[evil]` signed by `evil` (no committed key revealed at all) →
+    ///   `SignerNotCommitted`;
+    /// - set `[n1, evil]` signed by `evil` (a committed key `n1` is revealed but
+    ///   did not sign; `evil` signed but is uncommitted) → rejected. `n1` is
+    ///   tried and fails to verify, so the variant is `SignatureInvalid` — the
+    ///   record is still fail-closed, which is the property under test.
+    ///
+    /// Set semantics widens *which committed* key may sign, never admits an
+    /// uncommitted one.
+    #[test]
+    fn overlap_successor_signed_by_uncommitted_set_member_rejected() {
+        let (g, n1, evil) = (signer(), signer(), signer());
+        // Genesis pre-commits ONLY to n1.
+        let (_cap, s0) = genesis(&g, &n1);
+        let (n3,) = (signer(),);
+
+        // Shape 1: only the uncommitted `evil` is revealed and signs.
+        let rec_only_evil = update_revealing_set(
+            &s0.subject_cid512,
+            1,
+            s0.record_digest,
+            &[&evil],
+            &evil,
+            &[&n3],
+            FUTURE,
+        );
+        let err = validate_successor(&s0, &rec_only_evil, "2026-07-09T00:00:00Z").unwrap_err();
+        assert!(
+            matches!(err, SuccessorError::SignerNotCommitted),
+            "an uncommitted-only set must fail SignerNotCommitted, got {err:?}"
+        );
+
+        // Shape 2: committed `n1` is revealed but `evil` (uncommitted) signs.
+        let rec_mixed = update_revealing_set(
+            &s0.subject_cid512,
+            1,
+            s0.record_digest,
+            &[&n1, &evil],
+            &evil,
+            &[&n3],
+            FUTURE,
+        );
+        let err = validate_successor(&s0, &rec_mixed, "2026-07-09T00:00:00Z").unwrap_err();
+        assert!(
+            matches!(
+                err,
+                SuccessorError::SignatureInvalid(_) | SuccessorError::SignerNotCommitted
+            ),
+            "a rotation signed by an uncommitted set member must fail closed, got {err:?}"
+        );
+    }
+
+    /// Bounded retirement: a rotation is valid within its window and REJECTED
+    /// after it (freshness gate, §7.2). This is the "retired key rejected after
+    /// its bounded window" leg of the overlap test — the retired successor's
+    /// record has a bounded `expires_at`, and a `now` past it fails closed.
+    #[test]
+    fn overlap_retired_after_bounded_window_rejected() {
+        let (g, n1, n2) = (signer(), signer(), signer());
+        let body = body_committing_to(&g, &[&n1, &n2]);
+        let capsule = sign_capsule(body, &g.ed_sk, &g.pq_sk).unwrap();
+        let s0 = ChainState::genesis(&capsule).unwrap();
+
+        let (n3,) = (signer(),);
+        let bounded = "2026-07-10T00:00:00Z";
+        let rec = update_revealing_set(
+            &s0.subject_cid512,
+            1,
+            s0.record_digest,
+            &[&n1, &n2],
+            &n2,
+            &[&n3],
+            bounded,
+        );
+        // Inside the window: accepted.
+        validate_successor(&s0, &rec, "2026-07-09T00:00:00Z")
+            .expect("accepted inside the bounded window");
+        // After the window: the same record is rejected (retired).
+        let err = validate_successor(&s0, &rec, "2026-07-11T00:00:00Z").unwrap_err();
+        assert!(
+            matches!(err, SuccessorError::Expired { .. }),
+            "a rotation past its bounded window must be rejected, got {err:?}"
         );
     }
 }
