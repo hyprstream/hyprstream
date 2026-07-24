@@ -22,22 +22,44 @@ mkdir -p "${SCCACHE_DIR}"
 export TMPDIR="${PWD}/.citmp"
 mkdir -p "${TMPDIR}"
 
+run_phase() {
+  local label="$1"
+  shift
+  local started="${SECONDS}"
+  local status
+
+  echo "::group::${label}"
+  if "$@"; then
+    status=0
+  else
+    status=$?
+  fi
+  local elapsed=$((SECONDS - started))
+  echo "ci-phase name=${label@Q} elapsed_seconds=${elapsed} status=${status}"
+  echo "::endgroup::"
+  return "${status}"
+}
+
 # Default features (parity with the former x86 gate); libtorch is the image's
 # aarch64 wheel at /opt/libtorch, so NO download-libtorch feature here.
-cargo build --release
+run_phase "native release build" cargo build --release
 
 # wasm guest artifacts for the sandbox/mount tests (deny-on-missing-guest guard).
 # cd INTO each guest crate so cargo reads its .cargo/config.toml (the python guest
 # needs getrandom_backend="custom" for wasm32-unknown-unknown; see #1013).
-( cd crates/hyprstream-workers-python-guest && cargo build --release --target wasm32-unknown-unknown )
-( cd crates/hyprstream-workers-wasmtime-fsguest && cargo build --release --target wasm32-wasip1 )
+run_phase "Python guest WASM build" bash -c \
+  'cd crates/hyprstream-workers-python-guest && cargo build --release --target wasm32-unknown-unknown'
+run_phase "Wasmtime guest WASM build" bash -c \
+  'cd crates/hyprstream-workers-wasmtime-fsguest && cargo build --release --target wasm32-wasip1'
 export HYPRSTREAM_PYGUEST_WASM="${PWD}/crates/hyprstream-workers-python-guest/target/wasm32-unknown-unknown/release/hyprstream_workers_python_guest.wasm"
 export HYPRSTREAM_FSGUEST_WASM="${PWD}/crates/hyprstream-workers-wasmtime-fsguest/target/wasm32-wasip1/release/hyprstream-workers-wasmtime-fsguest.wasm"
 
 # nextest ci profile enforces the per-test slow-timeout from .config/nextest.toml;
 # fail-fast (the default) is what the merge gate wants.
-cargo nextest run --cargo-profile ci-test --profile ci
+run_phase "nextest" cargo nextest run --cargo-profile ci-test --profile ci
 # nextest does not run doctests; keep them in the merge gate.
-cargo test --release --doc
+run_phase "doctests" cargo test --release --doc
 
+echo "::group::sccache statistics"
 sccache --show-stats
+echo "::endgroup::"
