@@ -52,12 +52,13 @@ pub async fn exchange_jwt_bearer(
         }
     }
 
-    // Resolve the verification key based on subject / issuer.
-    let verifying_key: VerifyingKey = if sub.starts_with("service:") {
-        // Local service WIT — look up via global trust store.
+    // A service may publish drain and lead keys simultaneously. Verify against
+    // every current candidate and retain the exact key that succeeded.
+    let (claims, verified_service_key) = if sub.starts_with("service:") {
         let service_name = sub.trim_start_matches("service:");
-        match hyprstream_service::global_trust_store().resolve_one(service_name) {
-            Some(vk) => vk,
+        let token_endpoint = format!("{}/oauth/token", state.issuer_url.trim_end_matches('/'));
+        match decode_with_any_local_service_key(assertion, service_name, &token_endpoint) {
+            Some((claims, vk)) => (claims, Some(vk)),
             None => {
                 return jwt_bearer_error(
                     StatusCode::UNAUTHORIZED,
@@ -79,21 +80,18 @@ pub async fn exchange_jwt_bearer(
             }
         };
         // Fetch JWKS from the issuer's discovery document.
-        match resolve_federated_key(state, &iss, assertion, issuer_config.allow_http).await {
+        let vk = match resolve_federated_key(state, &iss, assertion, issuer_config.allow_http).await {
             Ok(vk) => vk,
             Err(e) => {
                 return jwt_bearer_error(StatusCode::UNAUTHORIZED, "invalid_grant", &e);
             }
-        }
-    };
-
-    // Full verification. Audience must be the token endpoint URL per RFC 7523 § 3.
-    let token_endpoint = format!("{}/oauth/token", state.issuer_url.trim_end_matches('/'));
-    let claims = match hyprstream_rpc::auth::decode_with_key(assertion, &verifying_key, Some(&token_endpoint)) {
-        Ok(c) => c,
-        Err(e) => {
-            return jwt_bearer_error(StatusCode::UNAUTHORIZED, "invalid_grant", &format!("Assertion verification failed: {e}"));
-        }
+        };
+        let token_endpoint = format!("{}/oauth/token", state.issuer_url.trim_end_matches('/'));
+        let claims = match hyprstream_rpc::auth::decode_with_key(assertion, &vk, Some(&token_endpoint)) {
+            Ok(claims) => claims,
+            Err(e) => return jwt_bearer_error(StatusCode::UNAUTHORIZED, "invalid_grant", &format!("Assertion verification failed: {e}")),
+        };
+        (claims, None)
     };
 
     let sub = claims.sub.clone();
@@ -107,7 +105,9 @@ pub async fn exchange_jwt_bearer(
             ttl: Some(state.token_ttl),
             audience: claims.aud.clone(),
             subject: Some(sub.clone()),
-            user_pub_key: None,
+            // OAuth signs the RPC envelope; PolicyService needs the service
+            // assertion key instead for its issued-token confirmation binding.
+            user_pub_key: verified_service_key.map(|key| URL_SAFE_NO_PAD.encode(key.to_bytes())),
             dpop_jkt: None,
             issuer: None,
         })
@@ -137,6 +137,32 @@ pub async fn exchange_jwt_bearer(
             jwt_bearer_error(StatusCode::INTERNAL_SERVER_ERROR, "server_error", "Failed to issue token")
         }
     }
+}
+
+/// Verify a local service assertion against each currently published key.
+/// The returned key is the successful verifier, not a sorted-set selection.
+pub(super) fn decode_with_any_local_service_key(
+    assertion: &str,
+    service_name: &str,
+    expected_audience: &str,
+) -> Option<(hyprstream_rpc::auth::Claims, VerifyingKey)> {
+    decode_with_any_service_key_at(
+        hyprstream_service::global_trust_store(), assertion, service_name,
+        expected_audience, chrono::Utc::now().timestamp(),
+    )
+}
+
+fn decode_with_any_service_key_at(
+    trust: &hyprstream_service::TrustStore,
+    assertion: &str,
+    service_name: &str,
+    expected_audience: &str,
+    now: i64,
+) -> Option<(hyprstream_rpc::auth::Claims, VerifyingKey)> {
+    trust.published_keys_for_scope_at(service_name, now).into_iter().find_map(|candidate| {
+        hyprstream_rpc::auth::decode_with_key(assertion, &candidate.verifying_key, Some(expected_audience))
+            .ok().map(|claims| (claims, candidate.verifying_key))
+    })
 }
 
 /// Fetch a verifying key for a federated issuer by resolving JWKS.
@@ -217,4 +243,40 @@ fn jwt_bearer_error(status: StatusCode, error: &str, description: &str) -> Respo
         })),
     )
         .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ed25519_dalek::SigningKey;
+
+    fn attestation(expires_at: i64) -> hyprstream_service::Attestation {
+        hyprstream_service::Attestation { scopes: std::iter::once("model".to_owned()).collect(), subject: None, jwt: None, expires_at, attested_by: None }
+    }
+
+    #[test]
+    fn overlap_accepts_both_keys_then_rejects_retired_key_at_deadline() {
+        let trust = hyprstream_service::TrustStore::new();
+        let retired = SigningKey::generate(&mut rand::rngs::OsRng);
+        let lead = SigningKey::generate(&mut rand::rngs::OsRng);
+        let now = chrono::Utc::now().timestamp();
+        let retirement = now + 60;
+        trust.insert(retired.verifying_key(), attestation(retirement));
+        trust.insert(lead.verifying_key(), attestation(now + 600));
+        for signer in [&retired, &lead] {
+            let assertion = hyprstream_rpc::auth::jwt::encode(
+                &hyprstream_rpc::auth::Claims::new("service:model".to_owned(), now, now + 300)
+                    .with_issuer("https://issuer.example".to_owned())
+                    .with_audience(Some("https://issuer.example/oauth/token".to_owned())), signer);
+            let Some((_, verified)) = decode_with_any_service_key_at(&trust, &assertion, "model", "https://issuer.example/oauth/token", now) else {
+                panic!("each overlap key must verify its own assertion");
+            };
+            assert_eq!(verified, signer.verifying_key());
+        }
+        let retired_assertion = hyprstream_rpc::auth::jwt::encode(
+            &hyprstream_rpc::auth::Claims::new("service:model".to_owned(), now, now + 300)
+                .with_issuer("https://issuer.example".to_owned())
+                .with_audience(Some("https://issuer.example/oauth/token".to_owned())), &retired);
+        assert!(decode_with_any_service_key_at(&trust, &retired_assertion, "model", "https://issuer.example/oauth/token", retirement).is_none());
+    }
 }

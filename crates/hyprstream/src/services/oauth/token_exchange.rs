@@ -114,7 +114,7 @@ pub async fn exchange_token_exchange(
         );
     }
 
-    // Encode cnf key bytes for PolicyService (same path as user_pub_key in other flows).
+    // Service assertions carry the exact key which verified their signature.
     let user_pub_key = verified.cnf_key_bytes.map(|b| URL_SAFE_NO_PAD.encode(b));
 
     let result = state
@@ -243,27 +243,26 @@ async fn verify_jwt(state: &Arc<OAuthState>, token: &str) -> Result<VerifiedSubj
 
     let token_endpoint = format!("{}/oauth/token", state.issuer_url.trim_end_matches('/'));
 
-    let vk = if sub.starts_with("service:") {
+    let (claims, service_signing_key) = if sub.starts_with("service:") {
         let svc_name = sub.trim_start_matches("service:");
-        hyprstream_service::global_trust_store()
-            .resolve_one(svc_name)
-            .ok_or_else(|| format!("Unknown service in trust store: {svc_name}"))?
+        let (claims, vk) = super::jwt_bearer::decode_with_any_local_service_key(token, svc_name, &token_endpoint)
+            .ok_or_else(|| format!("JWT verification failed for service: {svc_name}"))?;
+        (claims, Some(vk.to_bytes()))
     } else {
         let cfg = state
             .trusted_issuers
             .get(&iss)
             .ok_or_else(|| format!("Issuer not in trusted_issuers allow-list: {iss}"))?
             .clone();
-        super::jwt_bearer::resolve_federated_key(state, &iss, token, cfg.allow_http)
+        let vk = super::jwt_bearer::resolve_federated_key(state, &iss, token, cfg.allow_http)
             .await
-            .map_err(|e| format!("JWKS key resolution failed for {iss}: {e}"))?
+            .map_err(|e| format!("JWKS key resolution failed for {iss}: {e}"))?;
+        let claims = hyprstream_rpc::auth::decode_with_key(token, &vk, Some(&token_endpoint))
+            .map_err(|e| format!("JWT verification failed: {e}"))?;
+        (claims, None)
     };
 
-    // Full verify with audience = token endpoint (RFC 7523 §3).
-    let claims = hyprstream_rpc::auth::decode_with_key(token, &vk, Some(&token_endpoint))
-        .map_err(|e| format!("JWT verification failed: {e}"))?;
-
-    let cnf_key_bytes = claims.cnf_key_bytes(); // carry cnf.jwk through (WIT key binding)
+    let cnf_key_bytes = service_signing_key.or_else(|| claims.cnf_key_bytes());
     Ok(VerifiedSubject {
         sub: claims.sub,
         cnf_key_bytes,
