@@ -35,6 +35,7 @@ pub use crate::services::generated::model_client::KVQuantType;
 pub mod tensor_sampling; // Device-agnostic tensor-based sampling
 pub mod device_pool; // Multi-GPU device abstraction (DevicePool) — Send+Sync, holds only Device values
 pub mod image_utils; // Image loading and preprocessing for multimodal models
+pub mod interhost_pipeline; // Capacity planning, microbatch sizing, and recovery for inter-host stages
 pub mod kv_cache; // Key-Value caching for efficient autoregressive generation
 pub mod model_config; // Unified model configuration management
 pub mod model_factory; // Single factory for model creation
@@ -51,6 +52,11 @@ pub use torch_engine::{TorchEngine, TextStream, GenerationStats};
 
 // Multi-GPU device abstraction
 pub use device_pool::DevicePool;
+pub use interhost_pipeline::{
+    CompletionDisposition, HostCapacity, InterhostPipelinePlan, InterhostPipelinePlanner,
+    MicrobatchSizing, ModelFootprint, PipelineJobRecovery, PipelineJobState,
+    PipelineStageAssignment, PlannerOptions, RestartDirective,
+};
 
 // KV cache exports for multi-session support
 pub use kv_cache::{CacheConfig, CacheOwner, KVCacheManager, KVCacheRegistry};
