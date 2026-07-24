@@ -727,6 +727,7 @@ fn extract_union_variants(
         let vfs_kind_id = annotation_id_by_short_name(node_map, "vfsKind");
         let vfs_bulk_id = annotation_id_by_short_name(node_map, "vfsBulk");
         let vfs_hidden_id = annotation_id_by_short_name(node_map, "vfsHidden");
+        let vfs_mac_id = annotation_id_by_short_name(node_map, "vfsMac");
         let vfs_path = extract_annotation_text(
             field.get_annotations().map_err(|e| format!("{e}"))?,
             vfs_path_id,
@@ -745,6 +746,12 @@ fn extract_union_variants(
             field.get_annotations().map_err(|e| format!("{e}"))?,
             vfs_hidden_id,
         );
+        // $vfsMac (#699 carrier (a)): the MAC label this generated node carries.
+        // Empty when absent ⇒ the node is unlabeled ⇒ a genesis finding.
+        let vfs_mac = extract_annotation_text(
+            field.get_annotations().map_err(|e| format!("{e}"))?,
+            vfs_mac_id,
+        );
 
         variants.push(UnionVariant {
             name,
@@ -758,6 +765,7 @@ fn extract_union_variants(
             vfs_kind,
             vfs_bulk,
             vfs_hidden,
+            vfs_mac,
         });
     }
 
@@ -1656,6 +1664,7 @@ mod mandatory_scope_tests {
             vfs_kind: String::new(),
             vfs_bulk: false,
             vfs_hidden: false,
+            vfs_mac: String::new(),
         }
     }
 
