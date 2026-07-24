@@ -439,13 +439,11 @@ mod tests {
     }
 
     fn hybrid_keys(ed25519: [u8; 32]) -> IdentityKeys {
-        IdentityKeys {
-            candidates: vec![IdentityKeyCandidate {
+        IdentityKeys::new(vec![IdentityKeyCandidate {
                 id: "did:web:peer.example#mesh".to_owned(),
                 ed25519,
                 ml_dsa_65: Some(an_ml_dsa_vk()),
-            }],
-        }
+            }])
     }
 
     /// Fixture resolver returning fixed key material — the #549 stand-in for #579,
@@ -526,8 +524,7 @@ mod tests {
     fn overlap_selects_each_admitted_signer_then_rejects_the_retired_candidate() {
         let old = [30u8; 32];
         let new = [31u8; 32];
-        let overlap = IdentityKeys {
-            candidates: vec![
+        let overlap = IdentityKeys::new(vec![
                 IdentityKeyCandidate {
                     id: "did:web:peer.example#mesh-old".to_owned(),
                     ed25519: old,
@@ -538,8 +535,7 @@ mod tests {
                     ed25519: new,
                     ml_dsa_65: Some(an_ml_dsa_vk()),
                 },
-            ],
-        };
+            ]);
         let old_peer = AtprotoPerimeterGateway::new(FixtureResolver(overlap.clone()))
             .enroll(&admitted(Some(DID_WEB), old))
             .expect("draining key remains accepted during overlap");

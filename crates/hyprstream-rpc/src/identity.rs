@@ -301,10 +301,29 @@ impl IdentityKeyCandidate {
 /// format is intentional and self-certifying.
 #[derive(Clone, Default)]
 pub struct IdentityKeys {
-    pub candidates: Vec<IdentityKeyCandidate>,
+    candidates: Vec<IdentityKeyCandidate>,
 }
 
 impl IdentityKeys {
+    /// Construct a named candidate set.
+    ///
+    /// The collection stays private so authority cannot accidentally be chosen
+    /// with `.first()` or an index. Callers must use a protocol selector such as
+    /// [`Self::candidate_for_ed25519`].
+    pub fn new(candidates: Vec<IdentityKeyCandidate>) -> Self {
+        Self { candidates }
+    }
+
+    /// Number of published candidates, for diagnostics and set-cardinality tests.
+    pub fn len(&self) -> usize {
+        self.candidates.len()
+    }
+
+    /// Whether the identity published no usable candidate.
+    pub fn is_empty(&self) -> bool {
+        self.candidates.is_empty()
+    }
+
     /// Return the named candidate whose Ed25519 key authenticated the peer.
     pub fn candidate_for_ed25519(&self, key: &Ed25519Vk) -> Option<&IdentityKeyCandidate> {
         let mut matches = self
@@ -312,20 +331,31 @@ impl IdentityKeys {
             .iter()
             .filter(|candidate| &candidate.ed25519 == key);
         let candidate = matches.next()?;
-        // Duplicate named candidates for one signer are ambiguous: accepting an
-        // arbitrary one could attach a different hybrid binding.
-        matches.next().is_none().then_some(candidate)
+        let binding = candidate
+            .ml_dsa_65
+            .as_ref()
+            .map(crate::crypto::pq::ml_dsa_vk_bytes);
+        // Compatibility aliases for the same signer are safe only when every
+        // alias carries the same hybrid binding. Differing bindings remain
+        // ambiguous and fail closed.
+        matches
+            .all(|other| {
+                other
+                    .ml_dsa_65
+                    .as_ref()
+                    .map(crate::crypto::pq::ml_dsa_vk_bytes)
+                    == binding
+            })
+            .then_some(candidate)
     }
 
     /// Construct the intentional single-key `did:key` representation.
     pub fn single_ed25519(id: impl Into<String>, ed25519: Ed25519Vk) -> Self {
-        Self {
-            candidates: vec![IdentityKeyCandidate {
-                id: id.into(),
-                ed25519,
-                ml_dsa_65: None,
-            }],
-        }
+        Self::new(vec![IdentityKeyCandidate {
+            id: id.into(),
+            ed25519,
+            ml_dsa_65: None,
+        }])
     }
 }
 
