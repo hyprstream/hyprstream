@@ -436,11 +436,7 @@ async fn chat_completions(
                 .into_response();
         }
     };
-    info!(
-        "Template applied, prompt length: {}, preview: {}",
-        templated_prompt.len(),
-        &templated_prompt.as_str().chars().take(200).collect::<String>()
-    );
+    info!("Template applied, prompt length: {}", templated_prompt.len());
 
     // Build generation request with templated prompt
     let gen_params = crate::config::SamplingParams::from(&state.config.sampling_defaults)
