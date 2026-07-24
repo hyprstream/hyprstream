@@ -1949,14 +1949,18 @@ impl RegistryService {
             .await
             .map_err(|e| anyhow!("write not authorized on '{}': {}", data.grant_repo, e))?;
 
-        // ── Chunk + store + SERVER-SIDE merkle (caller supplied only bytes) ──
-        // Ingest through the L1 CAS substrate's default (untenanted, BLAKE3, local)
-        // domain (#812). The `security_label` carrier is left `None` here — object
-        // labeling/enforcement is #699/#767's job, not the ingest path's.
+        // ── Chunk + seal a labeled manifest + SERVER-SIDE merkle ────────────
+        // An uploader without a verified MAC clearance cannot create a CAS
+        // object: there is no default label. The derived context is already
+        // clamped to the verified signature's assurance.
+        let security_label = *ctx
+            .security_context()
+            .ok_or_else(|| anyhow!("putBlob requires a verified security clearance label"))?
+            .clearance();
         let substrate = crate::storage::CasSubstrate::from_env();
         let domain = crate::storage::DedupDomain::local_default();
         let put = substrate
-            .put(&domain, &data.bytes, None)
+            .put(&domain, &data.bytes, security_label)
             .await
             .map_err(|e| anyhow!("CAS ingest failed: {e}"))?;
 
