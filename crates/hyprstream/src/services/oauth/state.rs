@@ -1007,6 +1007,9 @@ pub struct OAuthState {
     /// or when derivation failed under Classical policy (Hybrid fails closed
     /// during `with_signing_key`).
     pub mesh_kem_public: Option<hyprstream_rpc::crypto::hybrid_kem::RecipientPublic>,
+    /// Self-certifying at9p capsule rendered from the same live signing key as
+    /// the root did:web document, never from deployment-provisioned bytes.
+    pub(crate) at9p_identity: Option<super::did_document::RenderedAt9pIdentity>,
     /// #282: the node's iroh endpoint id (its Ed25519 `node_id`, 32 bytes),
     /// published only as an `IrohTransport` service entry when bound. It is not
     /// a verification method or JWKS key (#1031).
@@ -1118,6 +1121,7 @@ impl OAuthState {
             quic_public_uri: None,
             mesh_pq_verifying_key: None,
             mesh_kem_public: None,
+            at9p_identity: None,
             iroh_node_id: None,
             iroh_relays: Vec::new(),
         }
@@ -1296,6 +1300,17 @@ impl OAuthState {
         let pq_sk = hyprstream_rpc::node_identity::derive_mesh_mldsa_key(&key);
         self.mesh_pq_verifying_key =
             Some(hyprstream_rpc::crypto::pq::ml_dsa_sk_to_vk_bytes(&pq_sk));
+        match super::did_document::render_at9p_identity(&self.issuer_url, &key, &pq_sk) {
+            Ok(identity) => self.at9p_identity = Some(identity),
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    issuer = %self.issuer_url,
+                    "skipping at9p identity publication"
+                );
+                self.at9p_identity = None;
+            }
+        }
         self.mesh_kem_public = mesh_kem_public_for_policy(&key, policy, |key| {
             hyprstream_rpc::node_identity::derive_mesh_kem_recipient(key)
         })?;

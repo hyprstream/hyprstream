@@ -42,6 +42,18 @@ use serde_json::{json, Value};
 
 use super::state::OAuthState;
 
+/// The node's live, self-certifying at9p identity.
+///
+/// The canonical capsule bytes and their CID are built together from the same
+/// in-process key that renders the root did:web document, so the two public
+/// representations cannot drift apart.
+#[derive(Clone, Debug)]
+pub(crate) struct RenderedAt9pIdentity {
+    pub did: String,
+    pub cid512: String,
+    pub capsule: Arc<[u8]>,
+}
+
 /// Extract the authority component (host[:port]) from the OAuth issuer URL.
 ///
 /// Used as the method-specific identifier in did:web — `did:web:{authority}:...`.
@@ -83,6 +95,46 @@ fn issuer_origin(issuer_url: &str) -> Option<String> {
     } else {
         Some(format!("{scheme}://{authority}"))
     }
+}
+
+/// Render the node's at9p genesis capsule from keys already held by
+/// hyprstream.
+pub(crate) fn render_at9p_identity(
+    issuer_url: &str,
+    ed_sk: &ed25519_dalek::SigningKey,
+    pq_sk: &hyprstream_rpc::crypto::pq::MlDsaSigningKey,
+) -> anyhow::Result<RenderedAt9pIdentity> {
+    use hyprstream_pds::at9p::{
+        CapsuleBody, HybridKeyPair, ServiceEndpoint, ServiceEntry, ServiceType, Transport,
+    };
+    use hyprstream_pds::at9p_sign::sign_capsule;
+
+    let authority = issuer_authority(issuer_url)
+        .ok_or_else(|| anyhow::anyhow!("OAuth issuer URL has no authority"))?;
+    let origin = issuer_origin(issuer_url)
+        .ok_or_else(|| anyhow::anyhow!("OAuth issuer URL has no origin"))?;
+    anyhow::ensure!(
+        origin.starts_with("https://"),
+        "at9p identity publication requires an HTTPS OAuth issuer"
+    );
+
+    let subject_key = HybridKeyPair::new(
+        ed_sk.verifying_key().to_bytes(),
+        hyprstream_rpc::crypto::pq::ml_dsa_sk_to_vk_bytes(pq_sk),
+    )?;
+    let endpoint = ServiceEndpoint::new(Transport::Https, origin)?;
+    let service = ServiceEntry::new("#pds", ServiceType::AtprotoPds, endpoint)?;
+    let mut body = CapsuleBody::new(vec![subject_key], vec![service])?;
+    body.also_known_as = Some(vec![format!("did:web:{authority}")]);
+
+    let capsule = sign_capsule(body, ed_sk, pq_sk)?;
+    let capsule_bytes = capsule.to_dag_cbor()?;
+    let cid512 = capsule.cid512()?;
+    Ok(RenderedAt9pIdentity {
+        did: format!("did:at9p:{cid512}"),
+        cid512,
+        capsule: Arc::from(capsule_bytes),
+    })
 }
 
 fn normalize_atproto_handle(handle: &str) -> Option<String> {
@@ -760,10 +812,47 @@ pub async fn root_did_document(State(state): State<Arc<OAuthState>>) -> Response
         state.mesh_kem_public.as_ref(),
     );
     append_root_identity_methods(&mut doc, &did, &root_methods);
+    if let Some(identity) = state.at9p_identity.as_ref() {
+        let mut aliases = doc
+            .get("alsoKnownAs")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        aliases.push(Value::String(identity.did.clone()));
+        doc["alsoKnownAs"] = Value::Array(aliases);
+    }
     (
         StatusCode::OK,
         [(header::CONTENT_TYPE, "application/did+json")],
         Json(doc),
+    )
+        .into_response()
+}
+
+/// `GET /.well-known/at9p/{cid}.cbor` — this node's live at9p genesis capsule.
+///
+/// Only the CID rendered from the current in-process identity is served.
+pub async fn at9p_capsule(
+    State(state): State<Arc<OAuthState>>,
+    Path(cid): Path<String>,
+) -> Response {
+    let Some(cid) = cid.strip_suffix(".cbor") else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let Some(identity) = state.at9p_identity.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    if cid != identity.cid512 {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+
+    (
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, "application/cbor"),
+            (header::CACHE_CONTROL, "no-store"),
+        ],
+        identity.capsule.to_vec(),
     )
         .into_response()
 }
@@ -909,6 +998,7 @@ fn extract_ed25519_keys_from_jwks(jwks: &Option<Value>) -> Vec<(String, Verifyin
 mod tests {
     use super::*;
     use ed25519_dalek::SigningKey;
+    use hyprstream_rpc::crypto::CryptoPolicy;
     use rand::rngs::OsRng;
 
     #[test]
@@ -925,6 +1015,170 @@ mod tests {
             issuer_authority("https://hyprstream.example.com").as_deref(),
             Some("hyprstream.example.com"),
         );
+    }
+
+    #[test]
+    fn rendered_at9p_capsule_is_key_owned_and_mutually_aliased() {
+        let sk = SigningKey::from_bytes(&[0x31; 32]);
+        let pq_sk = hyprstream_rpc::node_identity::derive_mesh_mldsa_key(&sk);
+        let identity =
+            render_at9p_identity("https://discovery.hyprstream.com", &sk, &pq_sk).unwrap();
+
+        let verified =
+            hyprstream_pds::at9p_gate::verify_did_at9p(&identity.did, &identity.capsule).unwrap();
+        assert_eq!(verified.cid512(), identity.cid512);
+        assert_eq!(
+            verified.capsule().body.subject_keys[0].ed25519_pub,
+            sk.verifying_key().to_bytes(),
+        );
+        assert_eq!(
+            verified.capsule().body.subject_keys[0].mldsa65_pub,
+            hyprstream_rpc::crypto::pq::ml_dsa_sk_to_vk_bytes(&pq_sk),
+        );
+        assert_eq!(
+            verified.capsule().body.also_known_as.as_deref(),
+            Some(&["did:web:discovery.hyprstream.com".to_owned()][..]),
+        );
+    }
+
+    #[test]
+    fn rendered_at9p_capsule_refuses_non_https_identity_origin() {
+        let sk = SigningKey::from_bytes(&[0x32; 32]);
+        let pq_sk = hyprstream_rpc::node_identity::derive_mesh_mldsa_key(&sk);
+        let error = render_at9p_identity("http://discovery.example", &sk, &pq_sk).unwrap_err();
+        assert!(error.to_string().contains("requires an HTTPS OAuth issuer"));
+    }
+
+    #[tokio::test]
+    async fn non_https_issuer_degrades_only_at9p_identity() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt as _;
+
+        let state = Arc::new(state_with_issuer("http://discovery.example"));
+        assert!(state.signing_key.is_some());
+        assert!(state.mesh_pq_verifying_key.is_some());
+        assert!(state.mesh_kem_public.is_some());
+        assert!(state.at9p_identity.is_none());
+
+        let cors = crate::config::server::CorsConfig {
+            enabled: false,
+            ..Default::default()
+        };
+        let response = super::super::create_app(state, &cors)
+            .oneshot(
+                Request::get("/.well-known/at9p/unavailable.cbor")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    fn state_with_issuer(issuer_url: &str) -> OAuthState {
+        use hyprstream_rpc::rpc_client::RpcClientImpl;
+        use hyprstream_rpc::signer::LocalSigner;
+        use hyprstream_rpc::transport::lazy_uds::LazyUdsTransport;
+
+        let local = SigningKey::from_bytes(&[0x33; 32]);
+        let remote = SigningKey::from_bytes(&[0x34; 32]).verifying_key();
+        let make_client = || {
+            Arc::new(
+                RpcClientImpl::new(
+                    LocalSigner::new(local.clone()),
+                    LazyUdsTransport::new("/dev/null/oauth-at9p-test.sock".into()),
+                    Some(remote),
+                )
+                .with_response_verify_policy(CryptoPolicy::Classical),
+            )
+        };
+        let mut config = crate::config::OAuthConfig::default();
+        config.external_url = Some(issuer_url.to_owned());
+        OAuthState::new(
+            &config,
+            crate::services::PolicyClient::new(make_client()),
+            crate::services::DiscoveryClient::new(make_client()),
+            local.verifying_key().to_bytes(),
+        )
+        .with_signing_key(local, CryptoPolicy::Hybrid)
+        .unwrap()
+    }
+
+    fn state_with_live_identity() -> Arc<OAuthState> {
+        Arc::new(state_with_issuer("https://discovery.hyprstream.com"))
+    }
+
+    #[tokio::test]
+    async fn public_router_serves_only_its_live_capsule_without_credentials() {
+        use axum::body::{to_bytes, Body};
+        use axum::http::Request;
+        use tower::ServiceExt as _;
+
+        let state = state_with_live_identity();
+        let identity = state.at9p_identity.as_ref().unwrap().clone();
+        let cors = crate::config::server::CorsConfig {
+            enabled: false,
+            ..Default::default()
+        };
+        let app = super::super::create_app(Arc::clone(&state), &cors);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::get(format!("/.well-known/at9p/{}.cbor", identity.cid512))
+                    .header(header::AUTHORIZATION, "Bearer must-be-ignored")
+                    .header(header::COOKIE, "session=must-be-ignored")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "application/cbor",
+        );
+        assert_eq!(
+            response.headers().get(header::CACHE_CONTROL).unwrap(),
+            "no-store",
+        );
+        assert!(!response.headers().contains_key(header::SET_COOKIE));
+        let bytes = to_bytes(response.into_body(), 4 * 1024 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(bytes.as_ref(), identity.capsule.as_ref());
+        hyprstream_pds::at9p_gate::verify_did_at9p(&identity.did, &bytes).unwrap();
+
+        let wrong = app
+            .clone()
+            .oneshot(
+                Request::get("/.well-known/at9p/not-this-node.cbor")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(wrong.status(), StatusCode::NOT_FOUND);
+
+        let did_response = app
+            .oneshot(
+                Request::get("/.well-known/did.json")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(did_response.status(), StatusCode::OK);
+        let did_bytes = to_bytes(did_response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let document: Value = serde_json::from_slice(&did_bytes).unwrap();
+        assert!(document["alsoKnownAs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|alias| alias == &identity.did));
     }
 
     #[test]
