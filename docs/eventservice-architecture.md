@@ -5,9 +5,11 @@
 EventService provides pub/sub event distribution for hyprstream using moq-lite
 as the transport. Services publish lifecycle events that other services
 subscribe to, replacing polling-based status checks. Since the EventService
-consolidation epic (#600), the bus is **group-keyed**: publishers can encrypt
-events under a per-prefix group key (AES-256-GCM) and sign them (Ed25519),
-with O(M) key rotation across M subscribers.
+consolidation epic (#600), the bus supports controller-managed confidential
+group epochs: publishers encrypt events with sender/track keys derived from a
+fresh epoch secret and attest them with hybrid Ed25519 + ML-DSA-65 signatures.
+Accepted members receive separate HyKEM/COSE grants, while a forwarding relay
+sees only opaque ciphertext.
 
 The event bus replaced the legacy ZMQ XPUB/XSUB proxy (`ProxyService`) in epic
 #131/#167; the publisher/subscriber API survived, only the transport changed.
@@ -132,87 +134,59 @@ For reliable status checking without a latch (e.g. CLI waiting for a
 container): query current state via RPC first, subscribe to events for
 updates, and handle the race by checking the timestamp in the query response.
 
-## Group-Keyed Encryption (epic #600)
+## Controller-Managed Hybrid Encryption (#555)
 
-**Sources:** `crates/hyprstream-rpc/src/events.rs` (publisher/subscriber +
-`EncryptedEvent` wire codec), `crates/hyprstream-rpc/src/crypto/event_crypto.rs`
-(AES-GCM, key wrapping), `crates/hyprstream-rpc/src/crypto/group_key.rs`
-(the reusable keyable-group primitive: `GroupKeyRegistry`, `RekeyPolicy`,
-`EncryptedEvent`, `WrappedKeyEntry`, rotation constants).
+**Sources:** `crates/hyprstream-rpc/src/events.rs` (publisher/subscriber and
+wire codec), `crypto/event_crypto.rs` (epoch-derived object encryption), and
+`crypto/group_key.rs` (controller epoch state machine and grants).
 
-Each `EventPublisher` selects a privacy mode (`EventPrivacy`,
-`crypto/event_crypto.rs`):
+Public publishers remain wire-compatible. Confidential `ZeroKnowledge` and
+`LimitedKnowledge` publishers fail closed until a controller installs a
+committed membership-version/epoch secret. The controller uses an explicit
+prepare/commit transaction: every join, leave, revocation, expiry, recipient
+rotation, accepted-state advance, or controller change prepares a fresh random
+epoch and keyset; commit atomically swaps membership and epoch coordinates.
+Abort leaves the committed state untouched.
 
-| Mode | Behavior |
-|------|----------|
-| `Public` (default for `EventPublisher::new`/`new_with_oid`/`new_oid_only`) | No encryption — payload written to the moq track unmodified, wire-identical to the pre-#600 plaintext bus |
-| `ZeroKnowledge` | Group-key encrypted; all events on one broadcast stream — the relay learns nothing about interests |
-| `LimitedKnowledge` | Group-key encrypted with a per-prefix keyed routing tag (`lk_tag`) — efficient per-prefix circuits, but the stable tag reveals topology/linkability |
+Each resulting member receives a separate COSE_Encrypt0 grant sealed to its
+HyKEM recipient (`X25519 + ML-KEM-768`). Grant AAD binds the group/keyset,
+controller and accepted state, subject and capability, recipient key ID,
+subscriber-generated blinded routing presentation, publisher Ed25519 and
+ML-DSA-65 anchors, retention/opaque-routing policies, membership version,
+epoch, and expiry. Signing keys and blinded Ristretto presentations are never
+used as KEX inputs. A stock MoQ relay receives neither grants nor epoch secrets.
 
-Flipping production publishers to an encrypted default is deferred until
-group-membership records (#602) and authenticated join (#604) land.
+For each publisher/track epoch installation, the publisher generates a fresh
+128-bit CSPRNG session ID and derives a session-scoped sender/track AEAD key from
+the epoch secret. AES-256-GCM AAD binds track, publisher key ID, session ID,
+membership version, epoch, and sequence. Within that fresh key domain the nonce
+is the injective `EVN1 || sequence_be` encoding, so restart/failover counter
+resets cannot reuse a key/nonce pair. The plaintext signature transcript binds
+topic, timestamp, session ID, membership version, epoch, and sequence and
+requires a hybrid Ed25519 + ML-DSA-65 composite signature anchored by the
+controller grant. Subscribers reject replay, nonce reuse, unknown/future epochs,
+retired objects, and events outside a bounded prior-epoch last-issued cutoff.
 
-### Encryption & signing
+One opaque ciphertext is published once and forwarded/cacheable byte-identically
+by a stock relay. Membership transitions distribute O(M) per-member grants but
+do not require per-subscriber event ciphertexts. Revoked members receive no next
+grant and cannot decrypt the fresh epoch.
 
-Encrypted publishers (`EventPublisher::new_encrypted(...)`) bind prefixes via
-`register_prefix`, which generates a random 32-byte group key. Each publish:
-
-- Encrypts the payload with **AES-256-GCM** under the current group key
-  (fresh OsRng nonce, topic-bound AAD)
-- Includes a 16-byte **key commitment** so subscribers can select the right
-  key without trial decryption
-- **Ed25519-signs** the event (`build_event_sig_message` over
-  topic ‖ payload ‖ timestamp); `EventSubscriber::recv` verifies the
-  signature before returning the payload. The embedded pubkey is
-  self-asserted — tamper-evidence, not identity; publisher↔DID binding is
-  EV4 (#604), gated on #446
-
-One ciphertext is written once per publish to a shared moq broadcast track and
-fans out natively to every subscriber of that track (group-level
-confidentiality: O(1) publish, not O(N) per-subscriber encryption).
-
-The `EncryptedEvent` body is a versioned, length-prefixed binary layout
-(internal-only, no capnp schema):
+The confidential body is versioned and length-prefixed:
 
 ```
-[1B version][12B nonce][16B key_commitment]
+[1B version][16B session_id][12B nonce][16B key_commitment]
 [4B tag_len][tag][4B ciphertext_len][ciphertext][4B lk_tag_len][lk_tag]
-[8B timestamp BE][32B publisher_pubkey][4B signature_len][signature]
+[8B timestamp BE][8B membership_version][8B epoch][8B sequence]
+[32B publisher_pubkey][4B signature_len][hybrid signature]
 ```
 
-The topic itself still travels as the moq frame's topic field, unencrypted —
-keyed/opaque topic routing is EV3 (#603).
+The topic remains the MoQ frame topic and is authenticated by the hybrid
+signature. `LimitedKnowledge` additionally carries a per-prefix keyed routing
+tag; the grant authenticates the selected opaque-routing policy.
 
-### Key distribution (wrapping)
-
-Subscribers join a prefix (`EventSubscriber::join_prefix`) with an ephemeral
-Ristretto255 DH keypair. The publisher wraps the group key per subscriber
-(`wrap_for_subscriber` → `derive_wrap_key`/`wrap_group_key`): Ristretto255
-ECDH with the subscriber's pubkey, then AES-256-GCM-wraps the group key under
-the derived wrap key with length-prefixed AAD binding the subscriber hash and
-prefix. Subscribers unwrap with `unwrap_group_key`.
-
-### Rotation (`RekeyPolicy`, O(M) re-wrap)
-
-`EventPublisher::rotate_key(prefix, effective_delay)` generates a new group
-key + ephemeral keypair and re-wraps for every known subscriber — **O(M) DH +
-wrap operations per rotation** (each `WrappedKeyEntry` carries a random
-routing tag, unlinkable across rekeys). The new key is held as a pending
-rekey and atomically promoted at `effective_at`; subscribers receive a
-`RekeyEvent` and keep the previous key in a `KeyRing` for a grace window
-(publisher `GRACE_PERIOD` 120s; subscriber default 30s).
-
-`RekeyPolicy` (`crypto/group_key.rs`) is the latency-vs-cost tradeoff:
-
-| Policy | Behavior |
-|--------|----------|
-| `Scheduled { interval }` (default: 1h, max lifetime 24h) | Bounded O(M) per interval; revocations deferred to the next rotation |
-| `Immediate` | Rotate on every revocation — prompt forward secrecy, but O(M) per revocation (O(M²) over M departures) |
-| `Jittered { interval, jitter }` | Scheduled with jitter for timing-attack resistance |
-
-`GroupKeyRegistry` (`crypto/group_key.rs`) is the generic keyable-group
-primitive behind this (group registration, membership-resolver-gated `join`,
-`begin_rekey`/`maybe_promote_pending`), reusable outside the event bus.
+Anonymous-member acceptance is intentionally not implemented here; it remains
+blocked on #1058 and #1060–#1062.
 
 ## Components
 
