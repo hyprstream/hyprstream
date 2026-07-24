@@ -57,9 +57,12 @@ use tokio::runtime::Handle;
 use tokenizers::Tokenizer;
 use tracing::{debug, error, info, trace, warn};
 
-// #1264: completion-time ledger spend (behind the `ledger` feature, default off).
+// #1264/#1265: completion-time ledger spend (behind the `ledger` feature,
+// default off).
 #[cfg(feature = "ledger")]
-use crate::services::ledger::{observe_spend_result, InferenceSpendEmitter, SpendInput};
+use crate::services::ledger::{
+    observe_spend_result, InferenceSpendEmitter, SpendInput, SpendResult,
+};
 
 
 /// Pending work to be executed after REP response is sent.
@@ -215,6 +218,146 @@ unsafe impl Sync for InferenceServiceInner {}
 
 // Intermediate response structs (DeltaStatusInfo, SaveAdaptationResult, SnapshotDeltaResult,
 // ExportPeftResult) eliminated — handlers return generated types directly.
+
+// ────────────────────────────────────────────────────────────────────────────
+// #1265: generation-loop accounting primitives (module-level, testable).
+//
+// `drive_generation_loop` consumes a generation output stream to a terminal
+// outcome (normal exhaustion / cancellation / stream error / publish failure).
+// It is the seam that makes "account for the work actually done" testable
+// without a live engine: `execute_stream` reads `completion_stats()` on the
+// SINGLE common exit after it returns, so no terminal path — including cancel
+// and publish-failure, which previously returned before the stats copy — can
+// skip the spend (#1265 blocker).
+// ────────────────────────────────────────────────────────────────────────────
+
+/// The terminal outcome of one generation output loop (#1265).
+#[derive(Debug)]
+enum GenLoopOutcome {
+    /// The stream was exhausted normally.
+    Exhausted,
+    /// The client cancelled / disconnected mid-stream.
+    Cancelled,
+    /// The generation stream yielded an error.
+    StreamError(anyhow::Error),
+    /// Publishing a generated chunk failed.
+    PublishFailed(anyhow::Error),
+}
+
+/// Abstraction over the stream publisher the generation loop writes to (#1265).
+/// A trait — not the concrete `AnyStreamPublisher` — so the loop can be driven by
+/// a fake sink in tests for the cancel / publish-failure / stream-error
+/// accounting paths without a live engine.
+trait GenSink {
+    /// Forward one generated chunk; an `Err` is a terminal publish-failure.
+    fn publish_chunk(&mut self, data: &str, rate: f32)
+        -> impl std::future::Future<Output = Result<()>>;
+}
+
+impl GenSink for hyprstream_rpc::moq_stream::AnyStreamPublisher {
+    fn publish_chunk(&mut self, data: &str, rate: f32)
+        -> impl std::future::Future<Output = Result<()>> {
+        self.publish_data_with_rate(data.as_bytes(), rate)
+    }
+}
+
+/// Abstraction over a generation output stream the loop consumes (#1265).
+/// Decouples the loop (and its tests) from `TextStream` / the PyTorch engine.
+trait GenOutput: futures::Stream<Item = anyhow::Result<String>> + Unpin {
+    /// Current EMA token rate (the per-chunk publish rate hint).
+    fn ema_rate(&self) -> f32;
+    /// Final completion stats (prefill + generated) — read on the common exit.
+    fn completion_stats(&self) -> crate::runtime::GenerationStats;
+}
+
+impl<'a> GenOutput for crate::runtime::TextStream<'a> {
+    fn ema_rate(&self) -> f32 {
+        self.stats().inference_tokens_per_sec_ema
+    }
+    fn completion_stats(&self) -> crate::runtime::GenerationStats {
+        self.stats()
+    }
+}
+
+/// Drive a generation output stream to a terminal outcome. Does NOT capture
+/// stats — the caller snapshots `output.completion_stats()` after this returns
+/// on the single common exit, so cancel / stream-error / publish-failure all
+/// account for the work actually done (#1265). Publish failures are terminal
+/// (returned to the caller, which lets the framework emit the Error frame,
+/// matching the prior behavior).
+async fn drive_generation_loop<S: GenOutput>(
+    stream: &mut S,
+    cancel: &tokio_util::sync::CancellationToken,
+    sink: &mut impl GenSink,
+) -> GenLoopOutcome {
+    use futures::StreamExt;
+    loop {
+        let next = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return GenLoopOutcome::Cancelled,
+            n = stream.next() => n,
+        };
+        match next {
+            None => return GenLoopOutcome::Exhausted,
+            Some(Err(e)) => return GenLoopOutcome::StreamError(e),
+            Some(Ok(text)) => {
+                let rate = stream.ema_rate();
+                if let Err(e) = sink.publish_chunk(&text, rate).await {
+                    return GenLoopOutcome::PublishFailed(e);
+                }
+            }
+        }
+    }
+}
+
+/// The content-free error frame emitted when a generation is denied because the
+/// caller has no self-certifying billing identity while a spend emitter is
+/// attached (#1265). Carries no subject DID and no prompt material.
+#[cfg_attr(not(feature = "ledger"), allow(dead_code))]  // only read on the ledger gate path
+const LEDGER_DENY_NO_IDENTITY: &str =
+    "generation denied: no verified billing identity for token-spend accounting";
+
+/// #1265: decide whether a generation must fail CLOSED before it starts because
+/// a #1264 spend emitter is attached but the caller has no self-certifying
+/// pairwise DID — the account owner the spend would debit. When `true`, the
+/// service denies the request with NO model output (see the gate in
+/// `execute_stream`, which precedes `engine.generate_with_delta`).
+///
+/// With no emitter attached the subsystem is inert — anonymous callers are
+/// unaffected. An explicit fail-open / debt policy for anonymous callers is a
+/// separate decision and is intentionally NOT implemented here.
+#[cfg_attr(not(feature = "ledger"), allow(dead_code))]  // only read on the ledger gate path
+fn ledger_requires_identity(emitter_attached: bool, owner_did: Option<&str>) -> bool {
+    emitter_attached && owner_did.is_none()
+}
+
+/// #1265: post the completion token-spend for the generation work actually done.
+/// Pure decision over the captured completion stats and the verified owner DID,
+/// delegating the single-phase debit to `emitter`. Returns:
+/// - `Some(SpendResult)` when a spend was attempted (Posted / Declined / Failed)
+///   — observe it as a content-free signal;
+/// - `None` when there is nothing to account for (no stats — generation never
+///   began — or no verified owner). A DID-less caller cannot reach the stats arm
+///   here in production: `execute_stream` gates it closed pre-generation.
+#[cfg(feature = "ledger")]
+async fn post_completion_spend(
+    emitter: &InferenceSpendEmitter,
+    stats: Option<&crate::runtime::GenerationStats>,
+    owner_did: Option<&str>,
+    stream_id: &str,
+) -> Option<SpendResult> {
+    let stats = stats?;
+    let owner = owner_did?;
+    let res = emitter
+        .post_generation_spend(SpendInput {
+            owner_did: owner,
+            stream_id,
+            prompt_tokens: stats.prefill_tokens as u64,
+            generated_tokens: stats.tokens_generated as u64,
+        })
+        .await;
+    Some(res)
+}
 
 impl InferenceService {
     /// Drain-time export hook (#869): force-snapshot every resident per-tenant delta
@@ -695,8 +838,6 @@ impl InferenceService {
     /// to avoid blocking the ZMQ REQ/REP handler.
     #[allow(clippy::await_holding_lock)]  // engine read-lock must be held while stream borrows it
     async fn execute_stream(&self, pending: PendingWork) {
-        use futures::StreamExt;
-
         // SAFETY: parking_lot::Mutex is safe here because InferenceService runs on
         // current_thread runtime — no task migration, no .await while lock held.
         debug_assert!(
@@ -705,12 +846,25 @@ impl InferenceService {
             "InferenceService must run on current_thread runtime for parking_lot safety"
         );
 
-        let PendingWork::Generation { stream_ctx, request, subject, ttt_overrides, owner_did } = pending else {
+        // #1265: `owner_did` is read only on the ledger spend path (itself
+        // `#[cfg(ledger)]`); in the default-off build it is an unused binding,
+        // so scope an `allow(unused_variables)` to THIS statement (not the crate)
+        // to keep the `-D warnings` clippy gate green without masking anything else.
+        #[cfg_attr(not(feature = "ledger"), allow(unused_variables))]
+        let PendingWork::Generation {
+            stream_ctx,
+            request,
+            subject,
+            ttt_overrides,
+            owner_did,
+        } = pending else {
             error!("execute_stream called with non-Generation PendingWork");
             return;
         };
         let stream_ctx = &stream_ctx;
-        // #1264: the spend's correlation entropy + the completion log key.
+        // #1264/#1265: the spend's correlation entropy + completion log key.
+        // Only needed on the ledger path.
+        #[cfg(feature = "ledger")]
         let stream_id_str = stream_ctx.stream_id().to_owned();
 
         // Get StreamChannel
@@ -721,6 +875,38 @@ impl InferenceService {
                 return;
             }
         };
+
+        // #1265: fail CLOSED before generation begins when a #1264 completion-
+        // spend emitter is attached but the caller has no self-certifying
+        // pairwise DID — that DID is the account owner the spend debits, so an
+        // authenticated-but-DID-less (anonymous) caller must not receive a
+        // completed zero-cost generation. Deny with a content-free error frame
+        // and NO model output (the engine is not even asked to generate). If the
+        // owner later wants an explicit fail-open / debt policy for anonymous
+        // callers, that is a separate policy change — do not implement it here.
+        #[cfg(feature = "ledger")]
+        {
+            if ledger_requires_identity(self.ledger.read().is_some(), owner_did.as_deref()) {
+                warn!(
+                    stream_id = %stream_id_str,
+                    "ledger: spend emitter attached but caller has no verified pairwise DID \
+                     — denying generation before it starts (fail-closed, #1265)"
+                );
+                if let Err(e) = stream_channel
+                    .run_stream(stream_ctx, |publisher| async move {
+                        (publisher, Err::<(), _>(anyhow!(LEDGER_DENY_NO_IDENTITY)))
+                    })
+                    .await
+                {
+                    error!(
+                        stream_id = %stream_id_str,
+                        error = %e,
+                        "failed to publish ledger deny frame"
+                    );
+                }
+                return;
+            }
+        }
 
         // Snapshot LoRA generation before TTT — used to detect reconfiguration mid-stream
         let lora_gen_before = self.lora_generation.load(Ordering::Acquire);
@@ -800,8 +986,10 @@ impl InferenceService {
         let engine = self.engine.read();
         let stream_result = engine.generate_with_delta(request, delta);
 
-        // #1264: capture the completion stats out of the stream closure so the
-        // token-spend can be posted after the client-visible completion frame.
+        // #1264/#1265: capture the completion stats out of the stream closure so
+        // the token-spend can be posted after the client-visible completion frame
+        // — on EVERY terminal path (normal end, cancel, stream error, publish
+        // failure), not only normal exhaustion.
         #[cfg(feature = "ledger")]
         let completion_stats: Arc<parking_lot::Mutex<Option<crate::runtime::GenerationStats>>> =
             Arc::new(parking_lot::Mutex::new(None));
@@ -813,46 +1001,41 @@ impl InferenceService {
                 let result = match stream_result {
                     Ok(mut stream) => {
                         let cancel = stream_ctx.cancel_token();
-                        loop {
-                            let chunk_result = tokio::select! {
-                                biased;
-                                _ = cancel.cancelled() => {
-                                    let _ = publisher.publish_error("cancelled").await;
-                                    return (publisher, Ok(()));
-                                }
-                                next = stream.next() => match next {
-                                    Some(r) => r,
-                                    None => break,
-                                },
-                            };
-                            match chunk_result {
-                                Ok(text) => {
-                                    let rate = stream.stats().inference_tokens_per_sec_ema;
-                                    if let Err(e) = publisher.publish_data_with_rate(text.as_bytes(), rate).await {
-                                        return (publisher, Err(e));
-                                    }
-                                }
-                                Err(e) => {
-                                    let _ = publisher.publish_error(&e.to_string()).await;
-                                    return (publisher, Ok(()));
-                                }
-                            }
-                        }
+                        // Drive the generation loop to a terminal outcome. The
+                        // loop publishes each chunk; cancel / stream-error /
+                        // publish-failure are all terminal. Completion stats are
+                        // captured on the SINGLE common exit below, so no
+                        // terminal path can skip accounting for the work actually
+                        // done (#1265).
+                        let outcome =
+                            drive_generation_loop(&mut stream, cancel, &mut publisher).await;
 
-                        // Normal completion with stats
-                        let stats = stream.stats();
+                        // Common exit: ALWAYS snapshot the stats once generation
+                        // has begun, regardless of how it ended — so a cancelled,
+                        // errored, or publish-failed generation still accounts.
+                        let stats = stream.completion_stats();
                         #[cfg(feature = "ledger")]
                         {
                             *completion_stats.lock() = Some(stats.clone());
                         }
-                        let mut complete = crate::services::rpc_types::InferenceComplete::from(&stats);
 
-                        // Attach TTT metrics to completion (from deferred TTT in execute_stream)
-                        complete.ttt_metrics = ttt_result.map(std::convert::Into::into);
-
-                        match publisher.complete_ref(&complete.to_bytes()).await {
-                            Ok(()) => Ok(()),
-                            Err(e) => Err(e),
+                        match outcome {
+                            GenLoopOutcome::Exhausted => {
+                                let mut complete =
+                                    crate::services::rpc_types::InferenceComplete::from(&stats);
+                                // Attach TTT metrics to completion (deferred TTT).
+                                complete.ttt_metrics = ttt_result.map(std::convert::Into::into);
+                                publisher.complete_ref(&complete.to_bytes()).await
+                            }
+                            GenLoopOutcome::Cancelled => {
+                                let _ = publisher.publish_error("cancelled").await;
+                                Ok(())
+                            }
+                            GenLoopOutcome::StreamError(e) => {
+                                let _ = publisher.publish_error(&e.to_string()).await;
+                                Ok(())
+                            }
+                            GenLoopOutcome::PublishFailed(e) => Err(e),
                         }
                     }
                     Err(e) => Err(e),  // framework sends Error frame automatically
@@ -869,48 +1052,38 @@ impl InferenceService {
             );
         }
 
-        // #1264: post the token-spend to the cell ledger on generation completion
-        // (quota burn). Fail-safe: a ledger/accounting failure MUST NOT break a
+        // #1264/#1265: post the token-spend for the work actually done (quota
+        // burn). Fail-safe: a ledger/accounting failure MUST NOT break a
         // generation that already produced output — the spend is best-effort and
         // every non-posted outcome is a content-free signal, never a silent drop.
-        // Anonymous caller ⇒ fail closed (no spend, no leak). Posted *after* the
-        // client-visible completion frame. (The engine read-lock is held across
-        // this best-effort await; covered by the `await_holding_lock` allow above
-        // and consistent with the stream itself.)
+        // Posted *after* the client-visible completion frame. (The engine
+        // read-lock is held across this best-effort await; covered by the
+        // `await_holding_lock` allow above and consistent with the stream itself.)
         #[cfg(feature = "ledger")]
         {
-            let emitter_opt = self.ledger.read().clone();
-            if let Some(emitter) = emitter_opt {
+            if let Some(emitter) = self.ledger.read().clone() {
                 let stats_opt = completion_stats.lock().clone();
-                match (stats_opt, owner_did.as_ref()) {
-                    (Some(stats), Some(owner)) => {
-                        let res = emitter
-                            .post_generation_spend(SpendInput {
-                                owner_did: owner,
-                                stream_id: &stream_id_str,
-                                prompt_tokens: stats.prefill_tokens as u64,
-                                generated_tokens: stats.tokens_generated as u64,
-                            })
-                            .await;
+                match post_completion_spend(
+                    &emitter,
+                    stats_opt.as_ref(),
+                    owner_did.as_deref(),
+                    &stream_id_str,
+                )
+                .await
+                {
+                    Some(res) => {
                         observe_spend_result(&res, &stream_id_str, emitter.unit());
                     }
-                    (Some(_), None) => {
-                        // Verified anonymous caller (no self-certifying DID) ⇒
-                        // fail closed: no spend, but signal it (#1264).
-                        warn!(
-                            stream_id = %stream_id_str,
-                            "ledger: anonymous caller — completion spend skipped (fail-closed)"
-                        );
-                    }
-                    (None, _) => {
-                        // No completion stats (errored/cancelled before the stats
-                        // frame) — nothing to account for; no signal needed.
+                    None => {
+                        // Nothing to account for: generation never began
+                        // (`engine.generate_with_delta` returned Err before the
+                        // loop ran). A DID-less caller cannot reach the stats arm
+                        // — the gate above denied it before generation started
+                        // (#1265).
                     }
                 }
             }
         }
-        #[cfg(not(feature = "ledger"))]
-        drop(stream_id_str);
     }
 
     /// Execute streaming training step - called AFTER REP response is sent.
@@ -2783,3 +2956,333 @@ impl StreamChunkMessage {
 
 // StreamHandle consolidated: uses hyprstream_rpc::streaming::StreamHandle (re-exported via rpc_types)
 // Use StreamChunkMessage::from_stream_payload() to convert StreamPayload → StreamChunkMessage
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    //! #1265 regression tests for the generation-loop accounting seam.
+    //!
+    //! These prove the three fixes without a live PyTorch engine:
+    //! - **#1 (blocker):** cancel / publish-failure / stream-error all capture
+    //!   the completion stats on the single common exit and a spend is posted
+    //!   for the work actually done.
+    //! - **#2 (major):** a missing verified billing DID fails closed before
+    //!   generation when an emitter is attached.
+    //!
+    //! `drive_generation_loop` is driven by a `FakeStream` (GenOutput) + a
+    //! recording/cancelling/failing `FakeSink` (GenSink); the spend is posted
+    //! through the real `InferenceSpendEmitter` against a `MemLedger` fixture.
+
+    use super::*;
+    use crate::runtime::GenerationStats;
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+
+    /// Build a `GenerationStats` with only the fields the spend reads.
+    fn stats(prefill: usize, generated: usize) -> GenerationStats {
+        GenerationStats {
+            tokens_generated: generated,
+            generation_time_ms: 0,
+            tokens_per_second: 0.0,
+            finish_reason: None,
+            quality_metrics: None,
+            prefill_tokens: prefill,
+            prefill_time_ms: 0,
+            prefill_tokens_per_sec: 0.0,
+            inference_tokens: generated,
+            inference_time_ms: 0,
+            inference_tokens_per_sec: 0.0,
+            inference_tokens_per_sec_ema: 0.0,
+        }
+    }
+
+    /// A generation output stream that yields a fixed sequence of chunks. Counts
+    /// Ok chunks consumed so far as the generated-token count.
+    struct FakeStream {
+        // `anyhow::Error` is not `Clone`, so store the error as a `String` and
+        // wrap it at yield time.
+        chunks: Vec<Result<String, String>>,
+        pos: usize,
+        prefill: usize,
+    }
+
+    impl FakeStream {
+        fn new(chunks: Vec<Result<String, String>>, prefill: usize) -> Self {
+            FakeStream { chunks, pos: 0, prefill }
+        }
+        fn generated(&self) -> usize {
+            self.chunks[..self.pos].iter().filter(|c| c.is_ok()).count()
+        }
+    }
+
+    impl futures::Stream for FakeStream {
+        type Item = anyhow::Result<String>;
+        fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+            let this = self.get_mut();
+            if this.pos < this.chunks.len() {
+                let c = this.chunks[this.pos].clone();
+                this.pos += 1;
+                Poll::Ready(Some(c.map_err(anyhow::Error::msg)))
+            } else {
+                Poll::Ready(None)
+            }
+        }
+    }
+
+    impl GenOutput for FakeStream {
+        fn ema_rate(&self) -> f32 {
+            1.0
+        }
+        fn completion_stats(&self) -> GenerationStats {
+            stats(self.prefill, self.generated())
+        }
+    }
+
+    /// A sink that records every chunk it publishes.
+    #[derive(Default)]
+    struct RecordingSink {
+        published: Vec<String>,
+    }
+
+    impl GenSink for RecordingSink {
+        fn publish_chunk(&mut self, data: &str, _rate: f32) -> impl Future<Output = Result<()>> {
+            self.published.push(data.to_owned());
+            std::future::ready(Ok(()))
+        }
+    }
+
+    /// A sink that cancels the generation after the Nth published chunk, so the
+    /// loop's cancel branch is exercised after partial output.
+    struct CancelAfterSink {
+        published: Vec<String>,
+        cancel: tokio_util::sync::CancellationToken,
+        cancel_after: usize,
+    }
+
+    impl CancelAfterSink {
+        fn new(cancel: tokio_util::sync::CancellationToken, cancel_after: usize) -> Self {
+            CancelAfterSink { published: vec![], cancel, cancel_after }
+        }
+    }
+
+    impl GenSink for CancelAfterSink {
+        fn publish_chunk(&mut self, data: &str, _rate: f32) -> impl Future<Output = Result<()>> {
+            self.published.push(data.to_owned());
+            if self.published.len() >= self.cancel_after {
+                self.cancel.cancel();
+            }
+            std::future::ready(Ok(()))
+        }
+    }
+
+    /// A sink that fails the Nth publish, exercising the publish-failure path.
+    struct FailOnSink {
+        published: Vec<String>,
+        fail_on: usize,
+    }
+
+    impl FailOnSink {
+        fn new(fail_on: usize) -> Self {
+            FailOnSink { published: vec![], fail_on }
+        }
+    }
+
+    impl GenSink for FailOnSink {
+        fn publish_chunk(&mut self, data: &str, _rate: f32) -> impl Future<Output = Result<()>> {
+            let will_fail = self.published.len() + 1 == self.fail_on;
+            self.published.push(data.to_owned());
+            std::future::ready(if will_fail {
+                Err(anyhow!("publish failed"))
+            } else {
+                Ok(())
+            })
+        }
+    }
+
+    // ── #1: stats captured on EVERY terminal path (default build) ─────────────
+
+    #[tokio::test]
+    async fn cancel_after_one_token_captures_partial_stats() {
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let mut stream =
+            FakeStream::new(vec![Ok("a".into()), Ok("b".into()), Ok("c".into())], 5);
+        let mut sink = CancelAfterSink::new(cancel.clone(), 1);
+        let outcome = drive_generation_loop(&mut stream, &cancel, &mut sink).await;
+        assert!(matches!(outcome, GenLoopOutcome::Cancelled), "{outcome:?}");
+        // One token made it to the subscriber before cancel.
+        assert_eq!(sink.published.len(), 1);
+        // Stats captured on the cancel exit reflect prefill + the one token.
+        let s = stream.completion_stats();
+        assert_eq!(s.prefill_tokens, 5);
+        assert_eq!(s.tokens_generated, 1);
+    }
+
+    #[tokio::test]
+    async fn publish_failure_after_partial_captures_stats() {
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let mut stream =
+            FakeStream::new(vec![Ok("a".into()), Ok("b".into()), Ok("c".into())], 5);
+        let mut sink = FailOnSink::new(2);
+        let outcome = drive_generation_loop(&mut stream, &cancel, &mut sink).await;
+        assert!(matches!(outcome, GenLoopOutcome::PublishFailed(_)), "{outcome:?}");
+        // "a" published; "b" generated then its publish failed.
+        let s = stream.completion_stats();
+        assert_eq!(s.prefill_tokens, 5);
+        assert_eq!(s.tokens_generated, 2);
+    }
+
+    #[tokio::test]
+    async fn stream_error_after_partial_captures_stats() {
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let mut stream =
+            FakeStream::new(vec![Ok("a".into()), Err("decode boom".to_owned())], 5);
+        let mut sink = RecordingSink::default();
+        let outcome = drive_generation_loop(&mut stream, &cancel, &mut sink).await;
+        assert!(matches!(outcome, GenLoopOutcome::StreamError(_)), "{outcome:?}");
+        // Only the one Ok token counts; the error chunk does not.
+        let s = stream.completion_stats();
+        assert_eq!(s.prefill_tokens, 5);
+        assert_eq!(s.tokens_generated, 1);
+    }
+
+    #[tokio::test]
+    async fn normal_completion_captures_full_stats() {
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let mut stream = FakeStream::new(vec![Ok("a".into()), Ok("b".into())], 5);
+        let mut sink = RecordingSink::default();
+        let outcome = drive_generation_loop(&mut stream, &cancel, &mut sink).await;
+        assert!(matches!(outcome, GenLoopOutcome::Exhausted), "{outcome:?}");
+        let s = stream.completion_stats();
+        assert_eq!(s.prefill_tokens, 5);
+        assert_eq!(s.tokens_generated, 2);
+    }
+
+    // ── #2: missing billing identity fails closed (default build) ─────────────
+
+    #[test]
+    fn missing_identity_denies_only_when_emitter_attached() {
+        // Emitter attached + no DID ⇒ deny (fail-closed before generation).
+        assert!(ledger_requires_identity(true, None));
+        // Authenticated caller with a DID ⇒ never deny.
+        assert!(!ledger_requires_identity(true, Some("did:web:alice")));
+        // Subsystem inert (no emitter) ⇒ anonymous callers unaffected.
+        assert!(!ledger_requires_identity(false, None));
+        assert!(!ledger_requires_identity(false, Some("did:web:alice")));
+    }
+
+    #[test]
+    fn deny_frame_is_content_free() {
+        // The fail-closed frame must carry no subject DID and no prompt material.
+        assert!(LEDGER_DENY_NO_IDENTITY.contains("billing identity"));
+        assert!(!LEDGER_DENY_NO_IDENTITY.contains("did:"));
+    }
+
+    // ── #1 + #2 spend posting (ledger build) ─────────────────────────────────
+    #[cfg(feature = "ledger")]
+    mod spend {
+        use super::*;
+        use crate::services::ledger::inference_spend::tests::{available, fixture};
+
+        // Drive a generation to a terminal outcome, then post the spend for the
+        // stats captured on that exit. Asserts the ledger is debited for the
+        // work actually done (prefill + generated).
+        async fn drive_and_post(
+            stream: &mut FakeStream,
+            cancel: &tokio_util::sync::CancellationToken,
+            sink: &mut impl GenSink,
+            emitter: &InferenceSpendEmitter,
+            stream_id: &str,
+        ) -> Option<SpendResult> {
+            drive_generation_loop(stream, cancel, sink).await;
+            post_completion_spend(
+                emitter,
+                Some(&stream.completion_stats()),
+                Some("did:web:alice"),
+                stream_id,
+            )
+            .await
+        }
+
+        #[tokio::test]
+        async fn cancelled_after_one_token_posts_spend() {
+            let (emitter, handle) = fixture(&[("did:web:alice", 1000)]).await;
+            let cancel = tokio_util::sync::CancellationToken::new();
+            let mut stream =
+                FakeStream::new(vec![Ok("a".into()), Ok("b".into()), Ok("c".into())], 5);
+            let mut sink = CancelAfterSink::new(cancel.clone(), 1);
+            let res = drive_and_post(&mut stream, &cancel, &mut sink, &emitter, "stream-cancel").await;
+            assert!(
+                matches!(res, Some(SpendResult::Posted { amount: 6, .. })),
+                "{res:?}"
+            );
+            // prefill(5) + 1 generated token debited; the rest never ran.
+            assert_eq!(available(&handle, "did:web:alice").await, 994);
+        }
+
+        #[tokio::test]
+        async fn publish_failure_after_partial_posts_spend() {
+            let (emitter, handle) = fixture(&[("did:web:alice", 1000)]).await;
+            let cancel = tokio_util::sync::CancellationToken::new();
+            let mut stream =
+                FakeStream::new(vec![Ok("a".into()), Ok("b".into()), Ok("c".into())], 5);
+            let mut sink = FailOnSink::new(2);
+            let res = drive_and_post(&mut stream, &cancel, &mut sink, &emitter, "stream-pubfail").await;
+            assert!(
+                matches!(res, Some(SpendResult::Posted { amount: 7, .. })),
+                "{res:?}"
+            );
+            // prefill(5) + 2 generated tokens (a published, b's publish failed).
+            assert_eq!(available(&handle, "did:web:alice").await, 993);
+        }
+
+        #[tokio::test]
+        async fn stream_error_after_partial_posts_spend() {
+            let (emitter, handle) = fixture(&[("did:web:alice", 1000)]).await;
+            let cancel = tokio_util::sync::CancellationToken::new();
+            let mut stream = FakeStream::new(vec![Ok("a".into()), Err("boom".to_owned())], 5);
+            let mut sink = RecordingSink::default();
+            let res = drive_and_post(&mut stream, &cancel, &mut sink, &emitter, "stream-err").await;
+            assert!(
+                matches!(res, Some(SpendResult::Posted { amount: 6, .. })),
+                "{res:?}"
+            );
+            // prefill(5) + 1 generated token before the error.
+            assert_eq!(available(&handle, "did:web:alice").await, 994);
+        }
+
+        #[tokio::test]
+        async fn normal_completion_posts_spend() {
+            let (emitter, handle) = fixture(&[("did:web:alice", 1000)]).await;
+            let cancel = tokio_util::sync::CancellationToken::new();
+            let mut stream = FakeStream::new(vec![Ok("a".into()), Ok("b".into())], 5);
+            let mut sink = RecordingSink::default();
+            let res = drive_and_post(&mut stream, &cancel, &mut sink, &emitter, "stream-ok").await;
+            assert!(
+                matches!(res, Some(SpendResult::Posted { amount: 7, .. })),
+                "{res:?}"
+            );
+            assert_eq!(available(&handle, "did:web:alice").await, 993);
+        }
+
+        #[tokio::test]
+        async fn missing_identity_posts_no_spend() {
+            // A DID-less caller (which the execute_stream gate denies
+            // pre-generation) posts no spend and touches no account.
+            let (emitter, handle) = fixture(&[("did:web:alice", 1000)]).await;
+            let s = stats(5, 1);
+            let res = post_completion_spend(&emitter, Some(&s), None, "stream-anon").await;
+            assert!(res.is_none(), "{res:?}");
+            assert_eq!(available(&handle, "did:web:alice").await, 1000);
+        }
+
+        #[tokio::test]
+        async fn no_stats_means_nothing_to_account() {
+            // Generation never began (engine returned Err) ⇒ no spend attempted.
+            let (emitter, handle) = fixture(&[("did:web:alice", 1000)]).await;
+            let res = post_completion_spend(&emitter, None, Some("did:web:alice"), "stream-nostart").await;
+            assert!(res.is_none(), "{res:?}");
+            assert_eq!(available(&handle, "did:web:alice").await, 1000);
+        }
+    }
+}

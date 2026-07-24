@@ -368,27 +368,27 @@ pub fn observe_spend_result(result: &SpendResult, stream_id: &str, unit: &UnitId
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::services::ledger::CoseCheckpointSigner;
     use std::sync::Arc;
     use hyprstream_ledger::{AccountSpec, IssueTransfer, LedgerBackend, MemLedger};
 
-    fn unit() -> UnitId {
+    pub(crate) fn unit() -> UnitId {
         UnitId {
             issuer: Did("did:web:cell.test".to_owned()),
             resource_class: "inference.tokens".to_owned(),
         }
     }
 
-    fn did(s: &str) -> Did {
+    pub(crate) fn did(s: &str) -> Did {
         Did(s.to_owned())
     }
 
     /// Open the issuer-liability + cell-usage accounts, plus one `Available`
     /// account per named holder, and issue `credit` to each holder. Returns the
     /// emitter and the spawned handle (for balance inspection).
-    async fn fixture(holders: &[(&str, u128)]) -> (InferenceSpendEmitter, LedgerHandle) {
+    pub(crate) async fn fixture(holders: &[(&str, u128)]) -> (InferenceSpendEmitter, LedgerHandle) {
         let cell = did("did:web:cell.test");
         let mut backend = MemLedger::new(cell.clone());
         let issuer_liab =
@@ -445,7 +445,7 @@ mod tests {
         (emitter, handle)
     }
 
-    async fn available(handle: &LedgerHandle, owner: &str) -> u128 {
+    pub(crate) async fn available(handle: &LedgerHandle, owner: &str) -> u128 {
         let cell = did("did:web:cell.test");
         let acct = holder_account(&cell, &did(owner), &unit()).unwrap();
         handle.balance(acct).await.unwrap().available
