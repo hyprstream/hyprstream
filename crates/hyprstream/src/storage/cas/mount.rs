@@ -2057,7 +2057,7 @@ mod tests {
             .await
             .unwrap();
 
-        // Declare two labels; the seal must join them (LUB).
+        // Declare two labels; the seal must apply the IFC provenance join.
         mount
             .write(&ctl, 0, b"label internal classical pii\n", &caller)
             .await
@@ -2083,18 +2083,29 @@ mod tests {
                 [Compartment::new("pii")],
             )
             .unwrap();
-        let finance = lattice
+        let pqhybrid_finance_input = lattice
             .label(
                 Level::Confidential,
                 Assurance::PqHybrid,
                 [Compartment::new("finance")],
             )
             .unwrap();
-        let joined = ifc_join(&[pii, finance]);
+        let joined = ifc_join(&[pii, pqhybrid_finance_input]);
+        let finance_at_joined_assurance = lattice
+            .label(
+                Level::Confidential,
+                joined.assurance,
+                [Compartment::new("finance")],
+            )
+            .unwrap();
         let manifest = mount.substrate.manifest(&mount.domain, &cid).unwrap();
         assert_eq!(manifest.security_label, joined);
+        assert_eq!(manifest.security_label.assurance, Assurance::Classical);
         assert!(manifest.security_label.can_access(&pii));
-        assert!(manifest.security_label.can_access(&finance));
+        assert!(manifest
+            .security_label
+            .can_access(&finance_at_joined_assurance));
+        assert!(!manifest.security_label.can_access(&pqhybrid_finance_input));
         assert!(manifest.security_label.compartments.contains(0));
         assert!(manifest.security_label.compartments.contains(1));
         mount.clunk(data, &caller).await;
