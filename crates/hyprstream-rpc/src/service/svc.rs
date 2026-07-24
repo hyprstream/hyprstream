@@ -299,13 +299,18 @@ impl EnvelopeContext {
     /// Until a separately verified tenant binding exists, this provides
     /// identity partitioning rather than a many-subject tenant boundary.
     ///
-    /// Anonymous callers and an identity named `"*"` have no usable domain.
-    /// Callers must deny this error rather than falling back to a wildcard.
+    /// Anonymous callers and identities with an empty, whitespace-only, or
+    /// `"*"` name have no usable domain. Callers must deny this error rather
+    /// than falling back to a wildcard.
     pub fn domain(&self) -> Result<String> {
         let subject = self.subject();
         let name = subject
             .name()
             .ok_or_else(|| anyhow::anyhow!("authorization denied: no verified identity domain"))?;
+        anyhow::ensure!(
+            !name.trim().is_empty(),
+            "authorization denied: no verified identity domain"
+        );
         anyhow::ensure!(
             name != "*",
             "authorization denied: wildcard is not a valid verified identity domain"
@@ -1131,6 +1136,41 @@ impl ServiceHandle {
     /// Check if the service is still running
     pub fn is_running(&self) -> bool {
         self.task.as_ref().map(|t| !t.is_finished()).unwrap_or(true)
+    }
+}
+
+#[cfg(test)]
+mod casbin_domain_tests {
+    use super::*;
+
+    fn ctx_for_verified_identity(name: &str) -> EnvelopeContext {
+        EnvelopeContext {
+            request_id: 1,
+            claims: None,
+            jwt_token: None,
+            key_derived_subject: Subject::new(name),
+            jwt_subject: None,
+            cnf: [0u8; 32],
+            envelope_wit_hash: None,
+            client_dh_public: None,
+            client_kem_public: None,
+            request_iat: 0,
+            request_nonce: [0; 16],
+            response_kem_recipient: None,
+            service_domain: None,
+            browser_method_discriminator: None,
+            is_local_caller: true,
+        }
+    }
+
+    #[test]
+    fn casbin_domain_rejects_empty_verified_identity_name() {
+        assert!(ctx_for_verified_identity("").domain().is_err());
+    }
+
+    #[test]
+    fn casbin_domain_rejects_whitespace_only_verified_identity_name() {
+        assert!(ctx_for_verified_identity(" \t\n").domain().is_err());
     }
 }
 
