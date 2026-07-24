@@ -28,21 +28,19 @@
 //!    the attested-resource saga convergence rule (#1064/#1066).
 //!
 //! The seal is the natural join point for [`crate::mac::ifc_join`]: any object
-//! labels declared via `label` ctl commands are joined (LUB) and plumbed through
-//! to the manifest's `security_label` carrier. Subject-clearance derivation
-//! (#698) is not wired here — MAC enforcement is dormant — so the join input is
-//! the caller-declared labels only today; the `Subject` contributes no clearance
-//! yet. The seam is in place for #699/#767 to widen.
+//! labels declared via `label` ctl commands are joined (LUB) and written into
+//! the manifest. A slot with no declared label cannot seal; unlabeled staging is
+//! transient only and is never admitted to the CAS.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
 use async_trait::async_trait;
 use cas_serve::StoreError;
-use hyprstream_rpc::auth::mac::{Assurance, CompartmentSet, Lattice, Level, SecurityLabel};
 use hyprstream_rpc::Subject;
-use hyprstream_vfs::{DirEntry, Fid, Mount, MountError, Stat, ORDWR, OREAD, OTRUNC, OWRITE};
+use hyprstream_rpc::auth::mac::{Assurance, CompartmentSet, Lattice, Level, SecurityLabel};
+use hyprstream_vfs::{DirEntry, Fid, Mount, MountError, ORDWR, OREAD, OTRUNC, OWRITE, Stat};
 use parking_lot::Mutex;
 use tokio::sync::Notify;
 use tracing::{debug, warn};
@@ -71,7 +69,7 @@ pub enum CasMountObjectKind {
     Stage,
 }
 
-/// Authorization request made before a CAS object is opened/read/stat'ed.
+/// Authorization request made before a CAS operation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CasMountAuthzRequest<'a> {
     /// Which CAS object namespace is being accessed.
@@ -81,8 +79,15 @@ pub struct CasMountAuthzRequest<'a> {
     /// Dedup domain the mount is serving.
     pub domain: &'a DedupDomain,
     /// Operation name for policy/audit (e.g. `open`, `read`, `stat`,
-    /// `stage:create`, `stage:commit`).
+    /// `stage:create`, `stage:label`, `stage:commit`).
     pub operation: &'static str,
+    /// Parsed object label proposed by a `stage:label` operation. `None` for
+    /// every other operation.
+    ///
+    /// A clearance-aware authorizer must resolve the caller's verified
+    /// [`hyprstream_rpc::auth::mac::SecurityContext`] and reject labels it does
+    /// not authorize. The raw ctl input is never authoritative by itself.
+    pub requested_label: Option<&'a SecurityLabel>,
 }
 
 /// Per-op authorization hook for [`CasMount`].
@@ -254,6 +259,23 @@ impl CasMountAuthorizer for BootstrapCasAuthorizer {
         caller: &Subject,
         request: CasMountAuthzRequest<'_>,
     ) -> Result<(), MountError> {
+        // Bootstrap grants do not carry verified subject clearances, so they
+        // can never authorize caller-selected object labels. A clearance-aware
+        // authorizer must replace this bootstrap seam before staging is enabled.
+        if request.requested_label.is_some() {
+            warn!(
+                subject = %caller,
+                kind = ?request.kind,
+                address = request.address,
+                operation = request.operation,
+                "CAS bootstrap grant: deny label declaration (no verified clearance)"
+            );
+            return Err(MountError::PermissionDenied(format!(
+                "CAS {} {:?} {} denied for {}: bootstrap authorizer has no verified clearance",
+                request.operation, request.kind, request.address, caller
+            )));
+        }
+
         for grant in &self.grants {
             if grant.subject.accepts(caller)
                 && grant.kinds.contains(&request.kind)
@@ -429,9 +451,9 @@ impl StagingSlot {
         self.declared_labels.lock().map_or(0, |(_, n)| n)
     }
 
-    /// The IFC-joined object label to plumb into the substrate at seal, or
-    /// `None` if the caller declared nothing. This is the #699 carrier-(b)
-    /// seam: subject clearance (#698) is not an input yet.
+    /// The IFC-joined object label to plumb into the substrate at seal. `None`
+    /// is valid only while staging; the seal boundary rejects it before bytes
+    /// are handed to CAS.
     fn joined_label(&self) -> Option<SecurityLabel> {
         self.declared_labels.lock().map(|(label, _)| label)
     }
@@ -660,6 +682,25 @@ impl CasMount {
                 address,
                 domain: &self.domain,
                 operation,
+                requested_label: None,
+            },
+        )
+    }
+
+    fn authorize_label(
+        &self,
+        caller: &Subject,
+        address: &str,
+        requested_label: &SecurityLabel,
+    ) -> Result<(), MountError> {
+        self.authorizer.authorize(
+            caller,
+            CasMountAuthzRequest {
+                kind: CasMountObjectKind::Stage,
+                address,
+                domain: &self.domain,
+                operation: "stage:label",
+                requested_label: Some(requested_label),
             },
         )
     }
@@ -699,6 +740,14 @@ impl CasMount {
     /// substrate, and record the CID (or void on failure). Idempotent — a
     /// second commit returns the same CID; concurrent commits serialize via CAS.
     async fn seal_slot(&self, slot: &Arc<StagingSlot>) -> Result<String, MountError> {
+        // An unlabeled slot is a staging-only state. Reject before taking bytes
+        // or transitioning to Sealing so the caller may label it and retry.
+        if slot.state() == SlotState::Open && slot.joined_label().is_none() {
+            return Err(MountError::PermissionDenied(
+                "cannot seal an unlabeled staging slot; declare a label first".into(),
+            ));
+        }
+
         loop {
             match slot.state.compare_exchange(
                 SlotState::Open as u8,
@@ -748,7 +797,22 @@ impl CasMount {
         // Won the CAS. Take the bytes + labels out from under their locks so we
         // don't hold them across the async substrate put.
         let bytes = std::mem::take(&mut *slot.buffer.lock());
-        let joined = slot.joined_label();
+        let joined = match slot.joined_label() {
+            Some(label) => label,
+            None => {
+                // `declare_label` only adds labels and the state transition above
+                // excludes concurrent declarations, so this is unreachable after
+                // the preflight. Preserve fail-closed terminal behavior if that
+                // invariant is ever changed.
+                let msg = "cannot seal an unlabeled staging slot".to_owned();
+                *slot.result.lock() = Some(Err(msg.clone()));
+                slot.state.store(SlotState::Voided as u8, Ordering::Release);
+                slot.seal_done.notify_waiters();
+                self.staging
+                    .adjust_subject(&slot.owner, -(bytes.len() as i64));
+                return Err(MountError::PermissionDenied(msg));
+            }
+        };
         let put_result = self.substrate.put(&self.domain, &bytes, joined).await;
 
         match put_result {
@@ -823,7 +887,7 @@ impl CasMount {
                     },
                 }
             }
-            Some("label") => self.declare_label_cmd(slot, tokens.collect()),
+            Some("label") => self.declare_label_cmd(id, slot, tokens.collect(), caller),
             Some(cmd) => Err(MountError::InvalidArgument(format!(
                 "unknown ctl command: {cmd}"
             ))),
@@ -832,8 +896,10 @@ impl CasMount {
 
     fn declare_label_cmd(
         &self,
+        id: &str,
         slot: &Arc<StagingSlot>,
         args: Vec<&str>,
+        caller: &Subject,
     ) -> Result<(), MountError> {
         // label <level> <assurance> [compartment...]
         let mut it = args.into_iter();
@@ -865,6 +931,10 @@ impl CasMount {
                 .label(level, assurance, comps)
                 .map_err(|e| MountError::InvalidArgument(format!("label: {e}")))?
         };
+        // Authorization sees the fully parsed label and runs before slot
+        // mutation. A rejection therefore cannot transition or persist label
+        // state, and a clearance-aware authorizer can enforce dominance.
+        self.authorize_label(caller, id, &label)?;
         slot.declare_label(label)
     }
 
@@ -1385,6 +1455,7 @@ fn map_cas_error(err: CasError) -> MountError {
         CasError::Store(StoreError::InvalidHash(s)) | CasError::Cid(s) | CasError::Hex(s) => {
             MountError::InvalidArgument(s)
         }
+        CasError::Manifest(s) => MountError::InvalidArgument(s),
         CasError::Store(e) => MountError::Io(e.to_string()),
         CasError::UnsupportedIngestAlgorithm(algo) => {
             MountError::InvalidArgument(format!("unsupported CAS algorithm: {algo:?}"))
@@ -1408,15 +1479,32 @@ mod tests {
     use hyprstream_vfs::{ORDWR, OWRITE};
     use parking_lot::Mutex;
 
+    fn label() -> SecurityLabel {
+        SecurityLabel::new(Level::Internal, Assurance::Classical, CompartmentSet::EMPTY)
+    }
+
+    async fn declare_test_label(mount: &CasMount, ctl: &Fid, caller: &Subject) {
+        mount
+            .write(ctl, 0, b"label internal classical\n", caller)
+            .await
+            .unwrap();
+    }
+
     #[derive(Default)]
     struct RecordingAuthorizer {
         deny: bool,
+        deny_labels: bool,
         calls: Mutex<Vec<(String, CasMountObjectKind, String, &'static str)>>,
+        label_calls: Mutex<Vec<(String, String, SecurityLabel)>>,
     }
 
     impl RecordingAuthorizer {
         fn calls(&self) -> Vec<(String, CasMountObjectKind, String, &'static str)> {
             self.calls.lock().clone()
+        }
+
+        fn label_calls(&self) -> Vec<(String, String, SecurityLabel)> {
+            self.label_calls.lock().clone()
         }
     }
 
@@ -1432,7 +1520,14 @@ mod tests {
                 request.address.to_owned(),
                 request.operation,
             ));
-            if self.deny {
+            if let Some(label) = request.requested_label {
+                self.label_calls.lock().push((
+                    caller.to_string(),
+                    request.address.to_owned(),
+                    *label,
+                ));
+            }
+            if self.deny || (self.deny_labels && request.requested_label.is_some()) {
                 Err(MountError::PermissionDenied("denied by test".into()))
             } else {
                 Ok(())
@@ -1448,7 +1543,7 @@ mod tests {
         let substrate = CasSubstrate::new(dir.path());
         let domain = DedupDomain::local_default();
         let manifest = substrate
-            .put(&domain, b"hello-cas-mount", None)
+            .put(&domain, b"hello-cas-mount", label())
             .await
             .unwrap();
         let authz = std::sync::Arc::new(RecordingAuthorizer::default());
@@ -1484,7 +1579,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let substrate = CasSubstrate::new(dir.path());
         let domain = DedupDomain::local_default();
-        let manifest = substrate.put(&domain, b"secret bytes", None).await.unwrap();
+        let manifest = substrate
+            .put(&domain, b"secret bytes", label())
+            .await
+            .unwrap();
         let mount = CasMount::new(substrate, domain);
         let caller = Subject::new("bob");
 
@@ -1502,7 +1600,7 @@ mod tests {
         let substrate = CasSubstrate::new(dir.path());
         let domain = DedupDomain::local_default();
         let manifest = substrate
-            .put(&domain, b"xorb-backed-payload", None)
+            .put(&domain, b"xorb-backed-payload", label())
             .await
             .unwrap();
         let xorb = manifest.xorb_hashes.first().expect("xorb hash").clone();
@@ -1540,7 +1638,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let substrate = CasSubstrate::new(dir.path());
         let manifest = substrate
-            .put(&DedupDomain::local_default(), bytes, None)
+            .put(&DedupDomain::local_default(), bytes, label())
             .await
             .unwrap();
         let xorb = manifest.xorb_hashes.first().expect("xorb hash").clone();
@@ -1584,7 +1682,7 @@ mod tests {
     async fn bootstrap_grant_denies_obj_reads_and_stage_ops() {
         let (_dir, substrate, xorb) = substrate_with_xorb(b"bootstrap-xorb").await;
         let manifest = substrate
-            .put(&DedupDomain::local_default(), b"obj-bytes", None)
+            .put(&DedupDomain::local_default(), b"obj-bytes", label())
             .await
             .unwrap();
         let mount = CasMount::with_authorizer(
@@ -1595,10 +1693,7 @@ mod tests {
         let caller = Subject::new("alice");
 
         // obj/* reads are outside the day-one grant.
-        let mut fid = mount
-            .walk(&["obj", &manifest.cid], &caller)
-            .await
-            .unwrap();
+        let mut fid = mount.walk(&["obj", &manifest.cid], &caller).await.unwrap();
         let err = mount.open(&mut fid, OREAD, &caller).await.unwrap_err();
         assert!(matches!(err, MountError::PermissionDenied(_)));
 
@@ -1627,8 +1722,11 @@ mod tests {
             address: "aa00",
             domain: &domain,
             operation: "read",
+            requested_label: None,
         };
-        let err = authz.authorize(&Subject::new("alice"), request).unwrap_err();
+        let err = authz
+            .authorize(&Subject::new("alice"), request)
+            .unwrap_err();
         assert!(matches!(err, MountError::PermissionDenied(_)));
     }
 
@@ -1638,6 +1736,30 @@ mod tests {
         assert_eq!(grant.subject, CasGrantSubject::AnyAuthenticated);
         assert_eq!(grant.kinds, &[CasMountObjectKind::Xorb]);
         assert_eq!(grant.operations, &["open", "read"]);
+    }
+
+    #[test]
+    fn bootstrap_cannot_grant_labels_without_verified_clearance() {
+        let authz = BootstrapCasAuthorizer::with_grants(vec![CasMountGrant {
+            name: "test:stage-label",
+            subject: CasGrantSubject::AnyAuthenticated,
+            kinds: &[CasMountObjectKind::Stage],
+            operations: &["stage:label"],
+        }]);
+        let domain = DedupDomain::local_default();
+        let requested_label = label();
+        let request = CasMountAuthzRequest {
+            kind: CasMountObjectKind::Stage,
+            address: "1",
+            domain: &domain,
+            operation: "stage:label",
+            requested_label: Some(&requested_label),
+        };
+
+        let err = authz
+            .authorize(&Subject::new("alice"), request)
+            .unwrap_err();
+        assert!(matches!(err, MountError::PermissionDenied(_)));
     }
 
     // ── write-then-seal (#814) ─────────────────────────────────────────────
@@ -1700,6 +1822,7 @@ mod tests {
         mount.write(&data, 6, b"world", &caller).await.unwrap();
 
         // Seal.
+        declare_test_label(&mount, &ctl, &caller).await;
         let n = mount.write(&ctl, 0, b"commit\n", &caller).await.unwrap();
         assert_eq!(n, 7);
 
@@ -1746,6 +1869,7 @@ mod tests {
         assert_eq!(&buf[5..8], b"xyz");
         assert_eq!(&buf[..5], &[0, 0, 0, 0, 0]);
 
+        declare_test_label(&mount, &ctl, &caller).await;
         mount.write(&ctl, 0, b"commit\n", &caller).await.unwrap();
         let status = ctl_str(&mount, &ctl, &caller).await;
         let cid = status.split("cid=").nth(1).unwrap().trim().to_owned();
@@ -1825,6 +1949,7 @@ mod tests {
         let (data, ctl) = open_data_ctl(&mount, &id, &caller).await;
         mount.write(&data, 0, b"payload", &caller).await.unwrap();
 
+        declare_test_label(&mount, &ctl, &caller).await;
         mount.write(&ctl, 0, b"commit\n", &caller).await.unwrap();
         let cid1 = {
             let s = ctl_str(&mount, &ctl, &caller).await;
@@ -1908,9 +2033,22 @@ mod tests {
 
     #[tokio::test]
     async fn seal_joins_declared_labels_into_manifest() {
-        use hyprstream_rpc::auth::mac::{Assurance, Level};
+        use hyprstream_rpc::auth::mac::{Compartment, LatticeVersion};
         let dir = tempfile::tempdir().unwrap();
-        let mount = staging_mount(CasSubstrate::new(dir.path()), 1 << 20, 4 << 20);
+        let lattice = Arc::new(Lattice::new(
+            LatticeVersion(1),
+            [Compartment::new("pii"), Compartment::new("finance")],
+        ));
+        let mount = CasMount::with_authorizer_and_staging(
+            CasSubstrate::new(dir.path()),
+            DedupDomain::local_default(),
+            AllowAllCasAuthorizer,
+            StagingConfig {
+                slot_quota_bytes: 1 << 20,
+                subject_quota_bytes: 4 << 20,
+                lattice: Some(lattice.clone()),
+            },
+        );
         let caller = Subject::new("alice");
         let (id, _root) = create_stage(&mount, &caller).await;
         let (data, ctl) = open_data_ctl(&mount, &id, &caller).await;
@@ -1921,11 +2059,11 @@ mod tests {
 
         // Declare two labels; the seal must join them (LUB).
         mount
-            .write(&ctl, 0, b"label internal classical\n", &caller)
+            .write(&ctl, 0, b"label internal classical pii\n", &caller)
             .await
             .unwrap();
         mount
-            .write(&ctl, 0, b"label secret pqhybrid\n", &caller)
+            .write(&ctl, 0, b"label confidential pqhybrid finance\n", &caller)
             .await
             .unwrap();
 
@@ -1938,19 +2076,56 @@ mod tests {
             s.split("cid=").nth(1).unwrap().trim().to_owned()
         };
 
-        // The joined label is the LUB: Secret × PqHybrid (no compartments).
-        let joined = SecurityLabel::new(Level::Secret, Assurance::PqHybrid, CompartmentSet::EMPTY);
-        // Reconstruct directly from the substrate to read the manifest carrier.
-        // The substrate `get` returns bytes only; verify via a fresh put that
-        // the same content with the same joined label yields the same CID and
-        // that the carrier round-trips through BlobManifest.
-        let manifest = mount
-            .substrate
-            .put(&mount.domain, b"labeled-bytes", Some(joined))
+        let pii = lattice
+            .label(
+                Level::Internal,
+                Assurance::Classical,
+                [Compartment::new("pii")],
+            )
+            .unwrap();
+        let finance = lattice
+            .label(
+                Level::Confidential,
+                Assurance::PqHybrid,
+                [Compartment::new("finance")],
+            )
+            .unwrap();
+        let joined = ifc_join(&[pii, finance]);
+        let manifest = mount.substrate.manifest(&mount.domain, &cid).unwrap();
+        assert_eq!(manifest.security_label, joined);
+        assert!(manifest.security_label.can_access(&pii));
+        assert!(manifest.security_label.can_access(&finance));
+        assert!(manifest.security_label.compartments.contains(0));
+        assert!(manifest.security_label.compartments.contains(1));
+        mount.clunk(data, &caller).await;
+        mount.clunk(ctl, &caller).await;
+    }
+
+    #[tokio::test]
+    async fn seal_without_a_label_fails_closed_before_cas_ingest() {
+        let dir = tempfile::tempdir().unwrap();
+        let mount = staging_mount(CasSubstrate::new(dir.path()), 1 << 20, 4 << 20);
+        let caller = Subject::new("alice");
+        let (id, _root) = create_stage(&mount, &caller).await;
+        let (data, ctl) = open_data_ctl(&mount, &id, &caller).await;
+        mount
+            .write(&data, 0, b"must-not-seal", &caller)
             .await
             .unwrap();
-        assert_eq!(manifest.cid, cid);
-        assert_eq!(manifest.security_label, Some(joined));
+
+        let err = mount
+            .write(&ctl, 0, b"commit\n", &caller)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, MountError::PermissionDenied(_)));
+        assert!(
+            ctl_str(&mount, &ctl, &caller)
+                .await
+                .contains("state=staging")
+        );
+
+        declare_test_label(&mount, &ctl, &caller).await;
+        mount.write(&ctl, 0, b"commit\n", &caller).await.unwrap();
         mount.clunk(data, &caller).await;
         mount.clunk(ctl, &caller).await;
     }
@@ -2043,6 +2218,7 @@ mod tests {
             .write(&data, 0, b"sealed-bytes", &caller)
             .await
             .unwrap();
+        declare_test_label(&mount, &ctl, &caller).await;
         mount.write(&ctl, 0, b"commit\n", &caller).await.unwrap();
         let err = mount.write(&ctl, 0, b"abort\n", &caller).await.unwrap_err();
         assert!(matches!(err, MountError::InvalidArgument(_)));
@@ -2070,6 +2246,7 @@ mod tests {
         let (id, _root) = create_stage(&mount, &caller).await;
         let (data, ctl) = open_data_ctl(&mount, &id, &caller).await;
         mount.write(&data, 0, b"bytes", &caller).await.unwrap();
+        declare_test_label(&mount, &ctl, &caller).await;
         mount.write(&ctl, 0, b"commit\n", &caller).await.unwrap();
         let err = mount
             .write(&ctl, 0, b"label secret pqhybrid\n", &caller)
@@ -2091,6 +2268,7 @@ mod tests {
             .write(&data, 0, b"raced-bytes", &caller)
             .await
             .unwrap();
+        declare_test_label(&mount, &ctl, &caller).await;
 
         // Two commits racing on the same slot: exactly one seals, the other
         // waits on the seal (never spinning) and converges on the same CID.
@@ -2123,6 +2301,7 @@ mod tests {
             .write(&data, 0, b"authz-bytes", &caller)
             .await
             .unwrap();
+        declare_test_label(&mount, &ctl, &caller).await;
         mount.write(&ctl, 0, b"commit\n", &caller).await.unwrap();
 
         // The commit authorization must address the staging id, not "ctl".
@@ -2133,6 +2312,38 @@ mod tests {
             .collect();
         assert_eq!(commit_calls.len(), 1);
         assert_eq!(commit_calls[0].2, id);
+        mount.clunk(data, &caller).await;
+        mount.clunk(ctl, &caller).await;
+    }
+
+    #[tokio::test]
+    async fn label_authorization_sees_requested_label_and_rejection_does_not_mutate_slot() {
+        let dir = tempfile::tempdir().unwrap();
+        let authz = std::sync::Arc::new(RecordingAuthorizer {
+            deny_labels: true,
+            ..RecordingAuthorizer::default()
+        });
+        let mount = CasMount::with_authorizer_and_staging(
+            CasSubstrate::new(dir.path()),
+            DedupDomain::local_default(),
+            authz.clone(),
+            StagingConfig::default(),
+        );
+        let caller = Subject::new("alice");
+        let (id, _root) = create_stage(&mount, &caller).await;
+        let (data, ctl) = open_data_ctl(&mount, &id, &caller).await;
+
+        let err = mount
+            .write(&ctl, 0, b"label internal classical\n", &caller)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, MountError::PermissionDenied(_)));
+        assert_eq!(authz.label_calls(), vec![("alice".to_owned(), id, label())]);
+        let status = ctl_str(&mount, &ctl, &caller).await;
+        assert!(
+            status.contains("labels=0"),
+            "rejected label must not mutate slot: {status}"
+        );
         mount.clunk(data, &caller).await;
         mount.clunk(ctl, &caller).await;
     }
