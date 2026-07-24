@@ -224,6 +224,57 @@ where
         return Ok(bytes);
     }
 
+    // 2b. Mandatory native-MAC dispatch PEP (epic #1267 T3, #1268).
+    //
+    // This is the mandatory, unavoidable gate between claims verification
+    // and handler invocation — the RPC-plane analogue of the 9P
+    // `NinePAccessDecider`. It composes the S1 two-input clearance derivation
+    // (Claims × VerifiedKeyMaterial via `EnvelopeContext::security_context`)
+    // with a trusted object-label resolver and the intrinsic `can_access`
+    // lattice floor. Fail-closed: missing clearance, missing label, or
+    // lattice-floor deny ⇒ handler is never called.
+    //
+    // **Activation gate (#1267):** the PEP is dormant until a node installs
+    // one process-globally via `install_mac_dispatch_pep`. Before activation,
+    // MAC enforcement is off (the documented dormant state, CLAUDE.md). After
+    // activation, the installed PEP is mandatory and fail-closed — there is
+    // no permissive mode (#547). This mirrors the compiled-policy and PQ
+    // trust-store installation patterns.
+    //
+    // Streaming continuations: the continuation produced by a permitted
+    // handler inherits this dispatch-time Permit. The AVC generation counter
+    // invalidates stale cached decisions on policy reload. Explicit re-check
+    // of long-running continuations against revoked authority is a follow-up
+    // (#1267 scope expansion).
+    if let Some(mac_pep) = crate::auth::mac::global_mac_dispatch_pep() {
+        let mac_decision = mac_pep.check(
+            &ctx,
+            actual_service_domain,
+            ctx.browser_method_discriminator,
+        );
+        if let crate::auth::mac::MacDecision::Deny(reason) = mac_decision {
+            warn!(
+                "{} MAC dispatch PEP denied {} (id={}, reason={:?})",
+                service.name(),
+                ctx.subject(),
+                request_id,
+                reason,
+            );
+            let error_payload =
+                service.build_error_payload(request_id, &format!("MAC deny: {reason:?}"));
+            let signed_response = sign_response(error_payload)?;
+
+            let mut message = Builder::new_default();
+            let mut builder =
+                message.init_root::<crate::common_capnp::response_envelope::Builder>();
+            signed_response.write_to(&mut builder);
+
+            let mut bytes = Vec::new();
+            serialize::write_message(&mut bytes, &message)?;
+            return Ok(bytes);
+        }
+    }
+
     // 3. Handle request
     let (response_payload, continuation) = match service.handle_request(&ctx, &payload).await {
         Ok((resp, cont)) => (resp, cont),
