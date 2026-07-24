@@ -186,24 +186,67 @@ impl Backend for MountBackend {
         // path as parent_path + components. An empty-components walk (attach /
         // clone) re-resolves the source fid's own path.
         let parent_path = self.fids.get(&fid).map(|e| e.path.clone()).unwrap_or_default();
+        let parent_len = parent_path.len();
         let mut new_path = parent_path;
         new_path.extend(components.iter().cloned());
 
-        let refs: Vec<&str> = new_path.iter().map(String::as_str).collect();
-        let handle = self
-            .mount
-            .walk(&refs, self.caller()?)
-            .await
-            .context("mount walk failed")?;
+        // Resolve each component independently so the 9P result carries one
+        // QID for every object the new fid actually traversed. Returning only a
+        // leaf QID while binding `newfid` to the complete path would let the
+        // translator cache a shallower, incorrectly authorized name.
+        let mut qids = Vec::with_capacity(components.len().max(1));
+        let mut handle = None;
+        let mut reached = Vec::with_capacity(components.len());
+        for component_count in 1..=components.len() {
+            let refs: Vec<&str> = new_path[..parent_len + component_count]
+                .iter()
+                .map(String::as_str)
+                .collect();
+            // On any failure past the first successful hop, `handle` still
+            // holds the previously-resolved mount `Fid`. That `Fid` has no
+            // `Drop` cleanup (see `hyprstream_vfs::Fid`) — for a remote mount
+            // it is a live 9P fid held open on the peer — so it must be
+            // explicitly clunked before returning the error, or every walk
+            // that fails past its first component (e.g. `/a/b` where `a`
+            // exists but `b` does not) leaks one backend handle.
+            let next = match self.mount.walk(&refs, self.caller()?).await {
+                Ok(next) => next,
+                Err(e) => {
+                    if let Some(previous) = handle.take() {
+                        self.mount.clunk(previous, self.caller()?).await;
+                    }
+                    return Err(anyhow::Error::new(e).context("mount walk failed"));
+                }
+            };
+            let qid = match self.qid_of(&next).await {
+                Ok(qid) => qid,
+                Err(e) => {
+                    self.mount.clunk(next, self.caller()?).await;
+                    if let Some(previous) = handle.take() {
+                        self.mount.clunk(previous, self.caller()?).await;
+                    }
+                    return Err(e);
+                }
+            };
+            if let Some(previous) = handle.replace(next) {
+                self.mount.clunk(previous, self.caller()?).await;
+            }
+            qids.push(qid);
+            reached.push(components[component_count - 1].clone());
+        }
 
-        // Mirror `ModelBackend::walk`: return the single leaf qid (the translator
-        // records its qtype for the new fid; clients here walk one hop at a time).
-        let qid = self.qid_of(&handle).await?;
+        if components.is_empty() {
+            let refs: Vec<&str> = new_path.iter().map(String::as_str).collect();
+            let next = self.mount.walk(&refs, self.caller()?).await.context("mount walk failed")?;
+            qids.push(self.qid_of(&next).await?);
+            handle = Some(next);
+        }
+        let handle = handle.ok_or_else(|| anyhow!("mount walk returned no handle"))?;
         self.fids.insert(
             newfid,
             Arc::new(MountFidEntry { path: new_path, handle: Mutex::new(Some(handle)) }),
         );
-        Ok(WalkResult { qids: vec![qid] })
+        Ok(WalkResult { qids, reached })
     }
 
     async fn open(&self, fid: u32, flags: u32) -> Result<OpenResult> {
@@ -334,6 +377,73 @@ mod tests {
         assert_eq!(lopen_flags_to_mode(0o1), 1);
         assert_eq!(lopen_flags_to_mode(0o2), 2);
         assert_eq!(lopen_flags_to_mode(0o101), 1);
+    }
+
+    /// Regression: a multi-component walk that fails past its first hop must
+    /// clunk every intermediate `Fid` it resolved before returning the error.
+    /// `Fid` has no `Drop` cleanup — for a remote mount it is a live 9P fid
+    /// held open on the peer — so a dropped-without-clunking handle leaks on
+    /// every walk that ENOENTs past its first component (e.g. `/a/b` where
+    /// `a` exists but `b` does not).
+    #[tokio::test]
+    async fn walk_clunks_intermediate_handle_on_mid_path_failure() {
+        use async_trait::async_trait;
+        use hyprstream_vfs::{DirEntry, Stat};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct TrackedMount {
+            clunks: AtomicUsize,
+        }
+
+        #[async_trait]
+        impl Mount for TrackedMount {
+            async fn walk(&self, components: &[&str], _c: &Subject) -> Result<Fid, MountError> {
+                match components {
+                    [] | ["a"] => Ok(Fid::new(components.len())),
+                    ["a", "b"] => Err(MountError::NotFound("a/b".into())),
+                    other => panic!("unexpected walk: {other:?}"),
+                }
+            }
+            async fn open(&self, _f: &mut Fid, _m: u8, _c: &Subject) -> Result<(), MountError> {
+                Err(MountError::PermissionDenied("open".into()))
+            }
+            async fn read(&self, _f: &Fid, _o: u64, _n: u32, _c: &Subject) -> Result<Vec<u8>, MountError> {
+                Err(MountError::Io("read".into()))
+            }
+            async fn write(&self, _f: &Fid, _o: u64, _d: &[u8], _c: &Subject) -> Result<u32, MountError> {
+                Err(MountError::NotSupported("write".into()))
+            }
+            async fn readdir(&self, _f: &Fid, _c: &Subject) -> Result<Vec<DirEntry>, MountError> {
+                Err(MountError::NotDirectory("readdir".into()))
+            }
+            async fn stat(&self, f: &Fid, _c: &Subject) -> Result<Stat, MountError> {
+                let depth = *f.downcast_ref::<usize>().unwrap_or(&0);
+                Ok(Stat::unknown_qid(0, depth as u64, "x".into(), 0))
+            }
+            async fn clunk(&self, _f: Fid, _c: &Subject) {
+                self.clunks.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let mount = Arc::new(TrackedMount { clunks: AtomicUsize::new(0) });
+        let backend = MountBackend::new(mount.clone(), Subject::new("tenant"));
+
+        // Attach (empty walk) binds fid 0 to the root.
+        backend.attach("tenant").await.unwrap();
+        backend.fids.insert(
+            0,
+            Arc::new(MountFidEntry { path: vec![], handle: Mutex::new(Some(Fid::new(0usize))) }),
+        );
+
+        // Walk fid 0 -> newfid 1 via ["a", "b"]: "a" resolves (handle A is
+        // held), "b" fails. Handle A must be clunked on this error path.
+        let err = backend.walk(0, 1, &["a".to_owned(), "b".to_owned()]).await;
+        assert!(err.is_err(), "walk into a missing leaf must fail");
+        assert_eq!(
+            mount.clunks.load(Ordering::SeqCst),
+            1,
+            "the intermediate handle for \"a\" must be clunked on the \"a/b\" failure, not leaked"
+        );
     }
 
     #[test]

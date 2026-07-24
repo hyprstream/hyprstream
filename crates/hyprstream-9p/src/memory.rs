@@ -72,11 +72,17 @@ impl Backend for MemoryBackend {
         newfid: u32,
         components: &[String],
     ) -> anyhow::Result<WalkResult> {
-        // Empty walk = clone/attach to root.
+        // An empty walk clones an existing fid. During attach the source fid
+        // is not bound yet, so materialize the root instead.
         if components.is_empty() {
+            let mut fids = self.fids.lock();
+            if let Some(link) = fids.get(&_fid).cloned() {
+                fids.insert(newfid, link);
+                return Ok(WalkResult { qids: Vec::new(), reached: Vec::new() });
+            }
             let link = FidLink { path: None, qid: Self::root_qid(), is_dir: true };
-            self.fids.lock().insert(newfid, link);
-            return Ok(WalkResult { qids: vec![Self::root_qid()] });
+            fids.insert(newfid, link);
+            return Ok(WalkResult { qids: vec![Self::root_qid()], reached: Vec::new() });
         }
 
         let name = &components[0];
@@ -89,7 +95,7 @@ impl Backend for MemoryBackend {
 
         let link = FidLink { path: Some(name.clone()), qid: qid.clone(), is_dir: false };
         self.fids.lock().insert(newfid, link);
-        Ok(WalkResult { qids: vec![qid] })
+        Ok(WalkResult { qids: vec![qid], reached: vec![name.clone()] })
     }
 
     async fn open(&self, fid: u32, _flags: u32) -> anyhow::Result<OpenResult> {

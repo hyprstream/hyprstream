@@ -24,6 +24,15 @@ pub struct WalkResult {
     /// number of components traversed; the client treats a short list as
     /// "walk stopped early").
     pub qids: Vec<Qid>,
+    /// Exact request-component prefix to which `newfid` is bound. For a
+    /// non-empty walk this has the same length as `qids`; a short prefix is a
+    /// 9P partial walk. Backends must report their actual binding here rather
+    /// than inferring it from the number of leaf qids they happen to return.
+    ///
+    /// The translator rejects a result that is not a prefix of its request or
+    /// whose QID count disagrees with this prefix, so a backend cannot bind a
+    /// deeper object while making the monitor cache a shallower name.
+    pub reached: Vec<String>,
 }
 
 /// Result of an open/lopen.
