@@ -265,6 +265,15 @@ fn hash_prefix_bytes(data: &[u8]) -> [u8; 32] {
     *blake3::hash(data).as_bytes()
 }
 
+fn tenant_prefix_key(tenant: &str, prefix: &str) -> String {
+    format!("{}:{tenant}{prefix}", tenant.len())
+}
+
+fn tenant_prefix_source(tenant: &str, prefix: &str) -> String {
+    let key = tenant_prefix_key(tenant, prefix);
+    format!("secure-{}", blake3::hash(key.as_bytes()).to_hex())
+}
+
 // ============================================================================
 // EventPublisher — the canonical broadcast publisher
 // ============================================================================
@@ -410,6 +419,8 @@ pub struct EventPublisher {
     /// `new_encrypted` publishers, which must use `publish_raw`.
     primary_source: String,
     prefixes: Arc<RwLock<HashMap<String, PrefixState>>>,
+    /// One verified tenant per encrypted publisher instance.
+    tenant: Arc<RwLock<Option<String>>>,
     /// Ed25519 signing key. `None` for `Public`-only publishers.
     signing_key: Option<SigningKey>,
     privacy_mode: EventPrivacy,
@@ -465,6 +476,7 @@ impl EventPublisher {
         Ok(Self {
             primary_source: source.to_owned(),
             prefixes: Arc::new(RwLock::new(map)),
+            tenant: Arc::new(RwLock::new(None)),
             signing_key: None,
             privacy_mode: EventPrivacy::Public,
             rekey_policy: RekeyPolicy::default(),
@@ -496,6 +508,7 @@ impl EventPublisher {
         Ok(Self {
             primary_source: String::new(),
             prefixes: Arc::new(RwLock::new(HashMap::new())),
+            tenant: Arc::new(RwLock::new(None)),
             signing_key: Some(signing_key),
             privacy_mode,
             rekey_policy,
@@ -537,10 +550,23 @@ impl EventPublisher {
                 "encrypted event prefixes require a verified non-wildcard tenant".to_owned(),
             );
         }
+        {
+            let mut registered_tenant = self.tenant.write().await;
+            match registered_tenant.as_deref() {
+                Some(existing) if existing != tenant => {
+                    return Err(format!(
+                        "encrypted publisher is already bound to tenant '{existing}'"
+                    ));
+                }
+                Some(_) => {}
+                None => *registered_tenant = Some(tenant.to_owned()),
+            }
+        }
         let origin = global_moq_event_origin().ok_or_else(|| {
             "moq event bus not initialized; start the event service first".to_owned()
         })?;
-        let moq = origin.publisher(prefix).map_err(|e| e.to_string())?;
+        let source = tenant_prefix_source(tenant, prefix);
+        let moq = origin.publisher(&source).map_err(|e| e.to_string())?;
 
         let mut group_key = Zeroizing::new([0u8; 32]);
         rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut *group_key);
@@ -561,7 +587,7 @@ impl EventPublisher {
         };
 
         self.prefixes.write().await.insert(
-            prefix.to_owned(),
+            tenant_prefix_key(tenant, prefix),
             PrefixState {
                 moq,
                 crypto: Some(crypto),
@@ -577,9 +603,10 @@ impl EventPublisher {
         prefix: &str,
         subscriber_pubkey: &[u8; 32],
     ) -> Result<Vec<u8>, String> {
+        let key = self.encrypted_prefix_key(prefix).await?;
         let mut prefixes = self.prefixes.write().await;
         let state = prefixes
-            .get_mut(prefix)
+            .get_mut(&key)
             .ok_or_else(|| format!("prefix '{prefix}' not registered"))?;
         let crypto = state
             .crypto
@@ -605,9 +632,10 @@ impl EventPublisher {
         prefix: &str,
         subscriber_pubkeys: &[[u8; 32]],
     ) -> Result<Vec<([u8; 32], Vec<u8>)>, String> {
+        let key = self.encrypted_prefix_key(prefix).await?;
         let mut prefixes = self.prefixes.write().await;
         let state = prefixes
-            .get_mut(prefix)
+            .get_mut(&key)
             .ok_or_else(|| format!("prefix '{prefix}' not registered"))?;
         let crypto = state
             .crypto
@@ -667,9 +695,14 @@ impl EventPublisher {
     /// the topic's prefix (`topic.split('.').next()`).
     pub async fn publish_raw(&self, topic: &str, payload: &[u8]) -> Result<()> {
         let prefix = topic.split('.').next().unwrap_or(topic).to_owned();
+        let key = if self.privacy_mode == EventPrivacy::Public {
+            prefix.clone()
+        } else {
+            self.encrypted_prefix_key(&prefix).await.map_err(anyhow::Error::msg)?
+        };
         let mut prefixes = self.prefixes.write().await;
         let state = prefixes
-            .get_mut(&prefix)
+            .get_mut(&key)
             .ok_or_else(|| anyhow!("prefix '{prefix}' not registered"))?;
 
         match state.crypto.as_mut() {
@@ -735,8 +768,11 @@ impl EventPublisher {
     /// True if a key rotation is due for `prefix` per this publisher's
     /// [`RekeyPolicy`].
     pub async fn needs_rotation(&self, prefix: &str) -> bool {
+        let Ok(key) = self.encrypted_prefix_key(prefix).await else {
+            return false;
+        };
         let prefixes = self.prefixes.read().await;
-        let Some(state) = prefixes.get(prefix) else {
+        let Some(state) = prefixes.get(&key) else {
             return false;
         };
         let Some(crypto) = state.crypto.as_ref() else {
@@ -766,9 +802,10 @@ impl EventPublisher {
         prefix: &str,
         effective_delay: Duration,
     ) -> Result<RotationResult, String> {
+        let key = self.encrypted_prefix_key(prefix).await?;
         let mut prefixes = self.prefixes.write().await;
         let state = prefixes
-            .get_mut(prefix)
+            .get_mut(&key)
             .ok_or_else(|| format!("prefix '{prefix}' not registered"))?;
         let crypto = state
             .crypto
@@ -829,6 +866,16 @@ impl EventPublisher {
         self.signing_key
             .as_ref()
             .map(|k| k.verifying_key().to_bytes())
+    }
+
+    async fn encrypted_prefix_key(&self, prefix: &str) -> Result<String, String> {
+        let tenant = self
+            .tenant
+            .read()
+            .await
+            .clone()
+            .ok_or_else(|| "encrypted publisher has no verified tenant binding".to_owned())?;
+        Ok(tenant_prefix_key(&tenant, prefix))
     }
 
     /// The bound primary source (single-prefix publishers only; empty for
@@ -898,6 +945,7 @@ struct SubscriberPrefixState {
     /// Verified tenant/domain used when the initial and rekey blobs were
     /// wrapped. It must match the publisher-side AAD input.
     tenant: String,
+    prefix: String,
     ephemeral_secret: Zeroizing<[u8; 32]>,
     ephemeral_pubkey: [u8; 32],
     /// Publisher's Ristretto255 DH pubkey (for wrap-key re-derivation during
@@ -925,6 +973,8 @@ pub struct RekeyEvent {
 pub struct EventSubscriber {
     inner: MoqEventSubscriber,
     prefixes: Arc<RwLock<HashMap<String, SubscriberPrefixState>>>,
+    /// One verified tenant per encrypted subscriber instance.
+    tenant: Arc<RwLock<Option<String>>>,
     rekey_tx: mpsc::Sender<RekeyEvent>,
     rekey_rx: Option<mpsc::Receiver<RekeyEvent>>,
 }
@@ -937,6 +987,7 @@ impl EventSubscriber {
         Ok(Self {
             inner: MoqEventSubscriber::new(),
             prefixes: Arc::new(RwLock::new(HashMap::new())),
+            tenant: Arc::new(RwLock::new(None)),
             rekey_tx: tx,
             rekey_rx: Some(rx),
         })
@@ -1026,17 +1077,33 @@ impl EventSubscriber {
                 "encrypted event prefixes require a verified non-wildcard tenant".to_owned(),
             );
         }
+        {
+            let mut joined_tenant = self.tenant.write().await;
+            match joined_tenant.as_deref() {
+                Some(existing) if existing != tenant => {
+                    return Err(format!(
+                        "encrypted subscriber is already bound to tenant '{existing}'"
+                    ));
+                }
+                Some(_) => {}
+                None => *joined_tenant = Some(tenant.to_owned()),
+            }
+        }
         let group_key = unwrap_group_key(&wrap_key, wrapped_key_blob, tenant, &sub_hash, prefix)?;
 
         let state = SubscriberPrefixState {
             tenant: tenant.to_owned(),
+            prefix: prefix.to_owned(),
             ephemeral_secret: Zeroizing::new(eph_secret_bytes),
             ephemeral_pubkey: eph_pubkey_bytes,
             publisher_dh_pubkey: *publisher_dh_pubkey,
             ring: KeyRing::new(group_key),
         };
 
-        self.prefixes.write().await.insert(prefix.to_owned(), state);
+        self.prefixes
+            .write()
+            .await
+            .insert(tenant_prefix_key(tenant, prefix), state);
         Ok(eph_pubkey_bytes)
     }
 
@@ -1050,10 +1117,11 @@ impl EventSubscriber {
         nonce: &[u8; 12],
         key_commitment: &[u8; 16],
     ) -> Result<Vec<u8>, String> {
+        let key = self.encrypted_prefix_key(prefix).await?;
         let (current_key, previous_key) = {
             let prefixes = self.prefixes.read().await;
             let state = prefixes
-                .get(prefix)
+                .get(&key)
                 .ok_or_else(|| format!("not joined to prefix: {prefix}"))?;
             let current = state.ring.current.clone();
             let previous = if !state.ring.is_grace_expired() {
@@ -1101,10 +1169,11 @@ impl EventSubscriber {
         new_publisher_dh_pubkey: &[u8; 32],
         effective_at: Instant,
     ) -> Result<(), String> {
+        let key = self.encrypted_prefix_key(prefix).await?;
         let (tenant, eph_secret, eph_pubkey) = {
             let prefixes = self.prefixes.read().await;
             let state = prefixes
-                .get(prefix)
+                .get(&key)
                 .ok_or_else(|| format!("not joined to prefix: {prefix}"))?;
             (
                 state.tenant.clone(),
@@ -1126,7 +1195,7 @@ impl EventSubscriber {
             {
                 {
                     let mut prefixes = self.prefixes.write().await;
-                    if let Some(state) = prefixes.get_mut(prefix) {
+                    if let Some(state) = prefixes.get_mut(&key) {
                         state.publisher_dh_pubkey = *new_publisher_dh_pubkey;
                     }
                 }
@@ -1154,9 +1223,10 @@ impl EventSubscriber {
         new_key: Zeroizing<[u8; 32]>,
         grace_period: Option<Duration>,
     ) -> Result<(), String> {
+        let key = self.encrypted_prefix_key(prefix).await?;
         let mut prefixes = self.prefixes.write().await;
         let state = prefixes
-            .get_mut(prefix)
+            .get_mut(&key)
             .ok_or_else(|| format!("not joined to prefix: {prefix}"))?;
 
         let grace = grace_period.unwrap_or(DEFAULT_SUBSCRIBER_GRACE_PERIOD);
@@ -1170,12 +1240,26 @@ impl EventSubscriber {
     /// Garbage-collect expired previous keys across all joined prefixes.
     pub async fn gc_expired_keys(&self) {
         let mut prefixes = self.prefixes.write().await;
-        for (prefix, state) in prefixes.iter_mut() {
+        for state in prefixes.values_mut() {
             if state.ring.previous.is_some() && state.ring.is_grace_expired() {
                 state.ring.gc_previous();
-                debug!(prefix, "expired previous key removed");
+                debug!(
+                    tenant = state.tenant,
+                    prefix = state.prefix,
+                    "expired previous key removed"
+                );
             }
         }
+    }
+
+    async fn encrypted_prefix_key(&self, prefix: &str) -> Result<String, String> {
+        let tenant = self
+            .tenant
+            .read()
+            .await
+            .clone()
+            .ok_or_else(|| "encrypted subscriber has no verified tenant binding".to_owned())?;
+        Ok(tenant_prefix_key(&tenant, prefix))
     }
 
     /// Receive the next event.
@@ -1226,12 +1310,16 @@ impl EventSubscriber {
         // requires being called from an async context to exist at all, so a
         // blocking `block_in_place`-free best-effort: prefixes not joined
         // (the overwhelmingly common Public-mode case) never touch the lock.
-        if topic
-            .split('.')
-            .next()
-            .map(|prefix| matches!(self.prefixes.try_read(), Ok(p) if p.contains_key(prefix)))
-            .unwrap_or(false)
-        {
+        let encrypted = topic.split('.').next().is_some_and(|prefix| {
+            matches!(
+                (self.tenant.try_read(), self.prefixes.try_read()),
+                (Ok(tenant), Ok(prefixes))
+                    if tenant.as_deref().is_some_and(|tenant| {
+                        prefixes.contains_key(&tenant_prefix_key(tenant, prefix))
+                    })
+            )
+        });
+        if encrypted {
             // An encrypted prefix; decoding requires the async path. Callers
             // needing non-blocking receive on encrypted prefixes should use
             // `recv_timeout(Duration::ZERO)` instead.
@@ -1244,7 +1332,10 @@ impl EventSubscriber {
 
     async fn decode_frame(&self, topic: &str, raw: &[u8]) -> FrameOutcome {
         let prefix = topic.split('.').next().unwrap_or(topic);
-        let joined = self.prefixes.read().await.contains_key(prefix);
+        let Ok(key) = self.encrypted_prefix_key(prefix).await else {
+            return FrameOutcome::Passthrough;
+        };
+        let joined = self.prefixes.read().await.contains_key(&key);
         if !joined {
             return FrameOutcome::Passthrough;
         }
@@ -1440,6 +1531,17 @@ mod tests {
         assert!(!PublisherIdentity::default().is_verified());
     }
 
+    #[test]
+    fn tenant_qualified_event_transport_keys_do_not_collide() {
+        let a_key = tenant_prefix_key("tenant-a", "orders");
+        let b_key = tenant_prefix_key("tenant-b", "orders");
+        assert_ne!(a_key, b_key);
+        assert_ne!(
+            tenant_prefix_source("tenant-a", "orders"),
+            tenant_prefix_source("tenant-b", "orders")
+        );
+    }
+
     #[tokio::test]
     async fn encrypted_publish_blocked_by_default_denyall_authz() {
         // The encrypted profile defaults to DenyAllEventAuthz (MAC
@@ -1474,10 +1576,13 @@ mod tests {
         // authz gate short-circuiting. Use the publisher's own map: register an
         // entry whose `moq` is sourced from a real origin when available.
         if let Some(origin) = global_moq_event_origin() {
-            if let Ok(moq) = origin.publisher("deny-test") {
+            let tenant = "tenant-test";
+            let prefix = "deny-test";
+            if let Ok(moq) = origin.publisher(&tenant_prefix_source(tenant, prefix)) {
+                *publisher.tenant.write().await = Some(tenant.to_owned());
                 let mut prefixes = publisher.prefixes.write().await;
                 prefixes.insert(
-                    "deny-test".to_owned(),
+                    tenant_prefix_key(tenant, prefix),
                     PrefixState {
                         moq,
                         crypto: Some(crypto),

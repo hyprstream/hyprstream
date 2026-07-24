@@ -2321,6 +2321,7 @@ mod tests {
                 user_pub_key: None,
                 dpop_jkt: None,
                 issuer: None,
+                tenant: None,
             })
             .await?
             .token;
@@ -2351,6 +2352,7 @@ mod tests {
                 user_pub_key: None,
                 dpop_jkt: None,
                 issuer: None,
+                tenant: None,
             })
             .await?
             .token;
@@ -2397,6 +2399,7 @@ mod tests {
                 user_pub_key: None,
                 dpop_jkt: None,
                 issuer: None,
+                tenant: None,
             })
             .await?
             .token;

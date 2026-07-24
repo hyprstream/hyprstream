@@ -52,6 +52,7 @@ const CLIENT_SIGNING_SEED: [u8; 32] = [0xC1; 32];
 /// per-subject authorization outcomes over the wire.
 const CLIENT_A_SIGNING_SEED: [u8; 32] = [0xC2; 32];
 const CLIENT_B_SIGNING_SEED: [u8; 32] = [0xC3; 32];
+const TEST_ISSUER: &str = "https://policy.test";
 
 /// Subjects the test trust-store attestations bind to client A / B keys.
 const TENANT_A_SUBJECT: &str = "tenant-a-user";
@@ -150,11 +151,66 @@ fn direct_addr(substrate: &IrohSubstrate) -> EndpointAddr {
     )
 }
 
+struct TestTokenAuthority {
+    ml_dsa: Arc<hyprstream_rpc::crypto::pq::MlDsaSigningKey>,
+    ed25519: Arc<SigningKey>,
+}
+
+impl TestTokenAuthority {
+    fn new(
+        root_signing_key: &SigningKey,
+    ) -> Result<(
+        Self,
+        Arc<hyprstream_rpc::auth::CompositeKeySet>,
+    )> {
+        use hyprstream_rpc::auth::{
+            CompositeKeyPair, CompositeKeySet, CompositePairRole, CompositePairState,
+        };
+
+        let ed25519 = Arc::new(hyprstream_rpc::node_identity::derive_purpose_key(
+            root_signing_key,
+            "hyprstream-jwt-v1",
+        ));
+        let (ml_dsa, ml_dsa_vk) = hyprstream_rpc::crypto::pq::ml_dsa_generate_keypair();
+        let ml_dsa = Arc::new(ml_dsa);
+        let kid = hyprstream_core::auth::jwt::composite_kid(
+            &ml_dsa_vk,
+            &ed25519.verifying_key(),
+        );
+        let pair = CompositeKeyPair::verifying(
+            kid,
+            ml_dsa_vk,
+            ed25519.verifying_key(),
+            CompositePairRole::Policy,
+            CompositePairState::Active,
+            0,
+            i64::MAX,
+        );
+        let key_set = Arc::new(CompositeKeySet::default());
+        key_set.publish(1, "policy-over-iroh".to_owned(), vec![pair])?;
+        Ok((Self { ml_dsa, ed25519 }, key_set))
+    }
+
+    fn token(&self, subject: &str, tenant: &str, signer: &SigningKey) -> String {
+        let now = chrono::Utc::now().timestamp();
+        let claims = hyprstream_rpc::auth::Claims::new(subject.to_owned(), now, now + 300)
+            .with_issuer(TEST_ISSUER.to_owned())
+            .with_tenant(tenant.to_owned())
+            .with_cnf_jwk(signer.verifying_key().as_bytes());
+        hyprstream_core::auth::jwt::encode_composite_ml_dsa_65_ed25519(
+            &claims,
+            &self.ml_dsa,
+            &self.ed25519,
+        )
+    }
+}
+
 /// Stand up a real `PolicyService` in a fresh tempdir and return it
 /// alongside its signing key and the tempdir guard (which must outlive
 /// the service).
 async fn make_policy_service() -> Result<(PolicyService, SigningKey, TempDir)> {
-    let (service, _manager, signing_key, temp) = make_policy_service_with_manager().await?;
+    let (service, _manager, signing_key, temp, _authority) =
+        make_policy_service_with_manager_and_authority().await?;
     Ok((service, signing_key, temp))
 }
 
@@ -163,6 +219,19 @@ async fn make_policy_service() -> Result<(PolicyService, SigningKey, TempDir)> {
 /// serving.
 async fn make_policy_service_with_manager(
 ) -> Result<(PolicyService, Arc<PolicyManager>, SigningKey, TempDir)> {
+    let (service, manager, signing_key, temp, _authority) =
+        make_policy_service_with_manager_and_authority().await?;
+    Ok((service, manager, signing_key, temp))
+}
+
+async fn make_policy_service_with_manager_and_authority(
+) -> Result<(
+    PolicyService,
+    Arc<PolicyManager>,
+    SigningKey,
+    TempDir,
+    TestTokenAuthority,
+)> {
     let temp = TempDir::new()?;
     let models_dir = temp.path().to_path_buf();
     let policies_dir = models_dir.join(".registry").join("policies");
@@ -175,15 +244,22 @@ async fn make_policy_service_with_manager(
     let git2db = Arc::new(RwLock::new(Git2DB::open(&models_dir).await?));
 
     let signing_key = policy_service_signing_key();
+    let (authority, composite_keys) = TestTokenAuthority::new(&signing_key)?;
+    let key_source = hyprstream_rpc::auth::ClusterKeySource::new(
+        authority.ed25519.verifying_key(),
+        TEST_ISSUER.to_owned(),
+    )
+    .with_composite_key_set(composite_keys);
     let service = PolicyService::new(
         Arc::clone(&policy_manager),
         Arc::new(signing_key.clone()),
         TokenConfig::default(),
         git2db,
         TransportConfig::inproc("policy-over-iroh-unused"),
-    );
+    )
+    .with_jwt_key_source(Arc::new(key_source));
 
-    Ok((service, policy_manager, signing_key, temp))
+    Ok((service, policy_manager, signing_key, temp, authority))
 }
 
 /// Build the iroh server side: PolicyService → LocalServiceBridge →
@@ -232,6 +308,25 @@ async fn client_for_key(
     response_pq_store: Arc<dyn PqTrustStore>,
     signing_key: SigningKey,
 ) -> Result<(IrohSubstrate, PolicyClient)> {
+    client_for_key_with_jwt(
+        server_addr,
+        server_vk,
+        request_kem_store,
+        response_pq_store,
+        signing_key,
+        None,
+    )
+    .await
+}
+
+async fn client_for_key_with_jwt(
+    server_addr: EndpointAddr,
+    server_vk: ed25519_dalek::VerifyingKey,
+    request_kem_store: Arc<dyn KemTrustStore>,
+    response_pq_store: Arc<dyn PqTrustStore>,
+    signing_key: SigningKey,
+    jwt: Option<String>,
+) -> Result<(IrohSubstrate, PolicyClient)> {
     let client_substrate = IrohSubstrate::new(
         fresh_node_key(),
         NoopHandler::new("c-moq"),
@@ -243,13 +338,16 @@ async fn client_for_key(
         .connect(server_addr, ALPN_HYPRSTREAM_RPC)
         .await?;
     let transport = IrohTransport::new(conn);
-    let rpc = RpcClientImpl::new(
+    let mut rpc = RpcClientImpl::new(
         LocalSigner::new(signing_key),
         transport,
         Some(server_vk),
     )
     .with_request_kem_store(request_kem_store)
     .with_response_pq_store(response_pq_store);
+    if let Some(jwt) = jwt {
+        rpc = rpc.with_default_jwt(jwt);
+    }
     let policy_client = PolicyClient::new(Arc::new(rpc));
     Ok((client_substrate, policy_client))
 }
@@ -381,7 +479,8 @@ async fn two_subjects_per_subject_isolation_over_rpc() -> Result<()> {
     let pq_store = install_hybrid_verify_config();
     install_test_key_subjects();
 
-    let (service, manager, server_signing, _temp) = make_policy_service_with_manager().await?;
+    let (service, manager, server_signing, _temp, authority) =
+        make_policy_service_with_manager_and_authority().await?;
     // Grant subject A (and only A): (1) the transport-level dispatch gate for
     // the method itself ($scope(manage) on `policy:RegisterEventPrefix`,
     // policy.capnp:64 — generated dispatch calls authorize() before the
@@ -408,20 +507,26 @@ async fn two_subjects_per_subject_isolation_over_rpc() -> Result<()> {
     let server_vk = server_signing.verifying_key();
     let (server, server_addr) = serve_over_iroh(service, &server_signing).await?;
 
-    let (client_a_substrate, policy_a) = client_for_key(
+    let client_a_key = policy_client_a_signing_key();
+    let client_a_jwt = authority.token(TENANT_A_SUBJECT, "tenant-a", &client_a_key);
+    let (client_a_substrate, policy_a) = client_for_key_with_jwt(
         server_addr.clone(),
         server_vk,
         policy_request_kem_store(&server_signing)?,
         Arc::clone(&pq_store),
-        policy_client_a_signing_key(),
+        client_a_key,
+        Some(client_a_jwt),
     )
     .await?;
-    let (client_b_substrate, policy_b) = client_for_key(
+    let client_b_key = policy_client_b_signing_key();
+    let client_b_jwt = authority.token(TENANT_B_SUBJECT, "tenant-b", &client_b_key);
+    let (client_b_substrate, policy_b) = client_for_key_with_jwt(
         server_addr,
         server_vk,
         policy_request_kem_store(&server_signing)?,
         pq_store,
-        policy_client_b_signing_key(),
+        client_b_key,
+        Some(client_b_jwt),
     )
     .await?;
 
@@ -528,23 +633,26 @@ async fn domain_grant_is_inert_over_rpc_gap1128() -> Result<()> {
     Ok(())
 }
 
-/// A verified RPC identity is the request domain. Two pairwise identities may
-/// each use their own policy domain on one server, but cannot use each other's.
+/// A verified tenant claim is the request domain. Two pairwise identities may
+/// use different policy domains on one server, but cannot use each other's.
 ///
 /// This is deliberately end-to-end: the server derives the domain from the
-/// signer key resolved by the trust store, rather than trusting request data.
-/// Replacing `ctx.domain()` with `"*"` makes own-domain admissions fail.
+/// signed, verified JWT tenant claim rather than the subject or request data.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn verified_identity_domains_isolate_pairwise_rpc_callers() -> Result<()> {
+async fn verified_tenant_domains_isolate_pairwise_rpc_callers() -> Result<()> {
     let pq_store = install_hybrid_verify_config();
     install_test_key_subjects();
 
-    let (service, manager, server_signing, _temp) = make_policy_service_with_manager().await?;
-    for (subject, prefix) in [(TENANT_A_SUBJECT, "alpha"), (TENANT_B_SUBJECT, "beta")] {
+    let (service, manager, server_signing, _temp, authority) =
+        make_policy_service_with_manager_and_authority().await?;
+    for (subject, tenant, prefix) in [
+        (TENANT_A_SUBJECT, "tenant-a", "alpha"),
+        (TENANT_B_SUBJECT, "tenant-b", "beta"),
+    ] {
         manager
             .add_policy_with_domain(
                 subject,
-                subject,
+                tenant,
                 "policy:RegisterEventPrefix",
                 "manage",
                 "allow",
@@ -553,7 +661,7 @@ async fn verified_identity_domains_isolate_pairwise_rpc_callers() -> Result<()> 
         manager
             .add_policy_with_domain(
                 subject,
-                subject,
+                tenant,
                 &format!("publish:events:{prefix}.*"),
                 "register",
                 "allow",
@@ -566,15 +674,28 @@ async fn verified_identity_domains_isolate_pairwise_rpc_callers() -> Result<()> 
 
     let server_vk = server_signing.verifying_key();
     let (server, server_addr) = serve_over_iroh(service, &server_signing).await?;
-    let (client_a_substrate, policy_a) = client_for_key(
+    let client_a_key = policy_client_a_signing_key();
+    let client_a_jwt = authority.token(TENANT_A_SUBJECT, "tenant-a", &client_a_key);
+    let (client_a_substrate, policy_a) = client_for_key_with_jwt(
         server_addr.clone(),
         server_vk,
         policy_request_kem_store(&server_signing)?,
         Arc::clone(&pq_store),
-        policy_client_a_signing_key(),
+        client_a_key,
+        Some(client_a_jwt),
     )
     .await?;
-    let (client_b_substrate, policy_b) = client_for_key(server_addr.clone(), server_vk, policy_request_kem_store(&server_signing)?, Arc::clone(&pq_store), policy_client_b_signing_key()).await?;
+    let client_b_key = policy_client_b_signing_key();
+    let client_b_jwt = authority.token(TENANT_B_SUBJECT, "tenant-b", &client_b_key);
+    let (client_b_substrate, policy_b) = client_for_key_with_jwt(
+        server_addr.clone(),
+        server_vk,
+        policy_request_kem_store(&server_signing)?,
+        Arc::clone(&pq_store),
+        client_b_key,
+        Some(client_b_jwt),
+    )
+    .await?;
     let (anonymous_substrate, anonymous_policy) = client_for(server_addr, server_vk, policy_request_kem_store(&server_signing)?, pq_store).await?;
 
     policy_a
@@ -618,7 +739,7 @@ async fn verified_identity_domains_isolate_pairwise_rpc_callers() -> Result<()> 
     let Err(err) = err else {
         panic!("domain-less request must not fall back to wildcard policy");
     };
-    assert!(err.to_string().contains("no verified identity domain"), "domain-less caller must fail closed, got: {err}");
+    assert!(err.to_string().contains("no verified tenant domain"), "domain-less caller must fail closed, got: {err}");
 
     client_a_substrate.shutdown().await?;
     client_b_substrate.shutdown().await?;
@@ -627,30 +748,27 @@ async fn verified_identity_domains_isolate_pairwise_rpc_callers() -> Result<()> 
     Ok(())
 }
 
-/// GAP (#1128): event-prefix registrations have NO ownership check.
-/// `handle_register_event_prefix` does an unconditional
-/// `prefixes.insert(...)` (policy.rs:1123-1129), so any caller with a
-/// dom="*" publish grant for the same scope silently replaces the existing
-/// publisher state (publisher key, schema, subscriber list, wrapped keys).
-/// Asserts current broken behavior: subject B takes over subject A's prefix.
-/// A fix must make B's register call fail (e.g. ALREADY_EXISTS / UNAUTHORIZED).
+/// Equal raw event prefixes are independent when their verified tenant differs.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn event_prefix_takeover_gap1128() -> Result<()> {
+async fn event_prefixes_are_isolated_across_verified_tenants() -> Result<()> {
     let pq_store = install_hybrid_verify_config();
     install_test_key_subjects();
 
     const PUBKEY_A: [u8; 32] = [0x0A; 32];
     const PUBKEY_B: [u8; 32] = [0x0B; 32];
 
-    let (service, manager, server_signing, _temp) = make_policy_service_with_manager().await?;
-    // Both subjects hold dom="*" publish grants for the same prefix scope
-    // (plus the transport-level method gates), and A can subscribe (to
-    // observe the stored publisher key).
-    for subject in [TENANT_A_SUBJECT, TENANT_B_SUBJECT] {
+    let (service, manager, server_signing, _temp, authority) =
+        make_policy_service_with_manager_and_authority().await?;
+    // Both subjects can register the same raw prefix, but only in their own
+    // verified tenant. A can subscribe there to verify B cannot replace it.
+    for (subject, tenant) in [
+        (TENANT_A_SUBJECT, "tenant-a"),
+        (TENANT_B_SUBJECT, "tenant-b"),
+    ] {
         manager
             .add_policy_with_domain(
                 subject,
-                "*",
+                tenant,
                 "policy:RegisterEventPrefix",
                 "manage",
                 "allow",
@@ -659,7 +777,7 @@ async fn event_prefix_takeover_gap1128() -> Result<()> {
         manager
             .add_policy_with_domain(
                 subject,
-                "*",
+                tenant,
                 "publish:events:orders.*",
                 "register",
                 "allow",
@@ -669,7 +787,7 @@ async fn event_prefix_takeover_gap1128() -> Result<()> {
     manager
         .add_policy_with_domain(
             TENANT_A_SUBJECT,
-            "*",
+            "tenant-a",
             "policy:SubscribeEventPrefix",
             "manage",
             "allow",
@@ -678,7 +796,7 @@ async fn event_prefix_takeover_gap1128() -> Result<()> {
     manager
         .add_policy_with_domain(
             TENANT_A_SUBJECT,
-            "*",
+            "tenant-a",
             "subscribe:events:orders.*",
             "subscribe",
             "allow",
@@ -687,20 +805,26 @@ async fn event_prefix_takeover_gap1128() -> Result<()> {
 
     let server_vk = server_signing.verifying_key();
     let (server, server_addr) = serve_over_iroh(service, &server_signing).await?;
-    let (client_a_substrate, policy_a) = client_for_key(
+    let client_a_key = policy_client_a_signing_key();
+    let client_a_jwt = authority.token(TENANT_A_SUBJECT, "tenant-a", &client_a_key);
+    let (client_a_substrate, policy_a) = client_for_key_with_jwt(
         server_addr.clone(),
         server_vk,
         policy_request_kem_store(&server_signing)?,
         Arc::clone(&pq_store),
-        policy_client_a_signing_key(),
+        client_a_key,
+        Some(client_a_jwt),
     )
     .await?;
-    let (client_b_substrate, policy_b) = client_for_key(
+    let client_b_key = policy_client_b_signing_key();
+    let client_b_jwt = authority.token(TENANT_B_SUBJECT, "tenant-b", &client_b_key);
+    let (client_b_substrate, policy_b) = client_for_key_with_jwt(
         server_addr,
         server_vk,
         policy_request_kem_store(&server_signing)?,
         pq_store,
-        policy_client_b_signing_key(),
+        client_b_key,
+        Some(client_b_jwt),
     )
     .await?;
 
@@ -726,20 +850,17 @@ async fn event_prefix_takeover_gap1128() -> Result<()> {
         "before takeover the stored publisher key must be A's"
     );
 
-    // GAP: B re-registers the SAME prefix and succeeds — there is no
-    // ownership guard, so this silently replaces A's EventPrefixState.
+    // B registers the same raw prefix in tenant-b; this must not replace A's
+    // tenant-a registry or transport identity.
     policy_b
         .register_event_prefix(&RegisterEventPrefix {
             prefix: "orders".to_owned(),
             publisher_ephemeral_pubkey: PUBKEY_B.to_vec(),
             schema: "schema-evil".to_owned(),
         })
-        .await
-        .map_err(|e| anyhow::anyhow!("GAP #1128 unexpectedly fixed? B's takeover register failed: {e}"))?;
+        .await?;
 
-    // Evidence of the takeover: the stored publisher key (and schema) are
-    // now B's, and A's prior state (schema, subscriber set, wrapped keys)
-    // was dropped with the unconditional insert.
+    // Tenant A still observes its own publisher key and schema.
     let access = policy_a
         .subscribe_event_prefix(&SubscribeEventPrefix {
             prefix: "orders".to_owned(),
@@ -748,12 +869,12 @@ async fn event_prefix_takeover_gap1128() -> Result<()> {
         .await?;
     assert_eq!(
         access.publisher_ephemeral_pubkey,
-        PUBKEY_B.to_vec(),
-        "GAP #1128: B's register silently replaced A's publisher state (policy.rs:1123-1129)"
+        PUBKEY_A.to_vec(),
+        "tenant-b registration must not replace tenant-a publisher state"
     );
     assert_eq!(
-        access.schema, "schema-evil",
-        "GAP #1128: prefix schema was replaced along with the publisher key"
+        access.schema, "schema-v1",
+        "tenant-b registration must not replace tenant-a schema"
     );
 
     client_a_substrate.shutdown().await?;

@@ -333,28 +333,48 @@ impl PolicyHandler for PolicyService {
         // JWT sub must contain a bare username (e.g. "randy", "birdetta") — the identity
         // system adds the namespace prefix ("token:randy") when the JWT is decoded.
         // For service tokens: sub = "service:{name}", e.g. "service:model".
-        let subject = if let Some(ref subj) = data.subject.as_ref().filter(|s| !s.is_empty()) {
-            // Explicit subject requires `manage` permission on `policy:IssueToken`
-            // (matches the capnp type name used by the transport-level Casbin check).
+        let caller_domain = ctx.domain()?;
+        let target_domain = data
+            .tenant
+            .as_ref()
+            .filter(|tenant| !tenant.is_empty())
+            .cloned()
+            .unwrap_or_else(|| caller_domain.clone());
+        if target_domain == "*" {
+            return Ok(PolicyResponseVariant::Error(ErrorInfo {
+                message: "Wildcard is not a valid token tenant".to_owned(),
+                code: "INVALID_TENANT".to_owned(),
+                details: String::new(),
+            }));
+        }
+
+        let requested_subject = data.subject.as_ref().filter(|subject| !subject.is_empty());
+        if requested_subject.is_some() || target_domain != caller_domain {
+            // Explicit-subject and cross-tenant issuance are authorized in the
+            // TARGET tenant. This permits deliberate delegation only when the
+            // caller has policy:IssueToken/manage there.
             let caller = ctx.subject().to_string();
-            let domain = ctx.domain()?;
             let allowed = self.policy_manager.check_with_domain(
                 &caller,
-                &domain,
+                &target_domain,
                 "policy:IssueToken",
                 "manage",
             ).await;
             if !allowed {
+                let target_subject = requested_subject
+                    .map_or_else(|| ctx.user().to_owned(), Clone::clone);
                 return Ok(PolicyResponseVariant::Error(ErrorInfo {
                     message: format!(
-                        "Subject '{}' is not authorized to issue tokens on behalf of '{}'",
-                        caller, subj
+                        "Subject '{}' is not authorized to issue tokens on behalf of '{}' in tenant '{}'",
+                        caller, target_subject, target_domain
                     ),
                     code: "UNAUTHORIZED_SUBJECT".to_owned(),
-                    details: "Requires 'manage' permission on 'policy:IssueToken'".to_owned(),
+                    details: "Requires 'manage' permission on 'policy:IssueToken' in the target tenant".to_owned(),
                 }));
             }
-            (*subj).clone()
+        }
+        let subject = if let Some(subj) = requested_subject {
+            subj.clone()
         } else {
             // Use bare username from the envelope identity.
             ctx.user().to_owned()
@@ -444,6 +464,7 @@ impl PolicyHandler for PolicyService {
             now,
             now + requested_ttl as i64,
         ).with_issuer(issuer)
+         .with_tenant(target_domain)
          .with_audience(audience)
          .with_scope(granted_scope);
 
@@ -994,7 +1015,9 @@ impl PolicyHandler for PolicyService {
         }
 
         // Apply the role assignment
-        self.policy_manager.add_role_for_user(&data.user, &data.role).await
+        self.policy_manager
+            .add_role_for_user_in_domain(&data.user, &data.role, &domain)
+            .await
             .map_err(|e| anyhow!("Failed to add role: {}", e))?;
 
         // Persist in-memory Casbin state to disk before staging
@@ -1003,8 +1026,8 @@ impl PolicyHandler for PolicyService {
 
         // Commit to git
         let commit_msg = format!(
-            "policy: grant role {} to {} [by {}]",
-            data.role, data.user, caller
+            "policy: grant role {} to {} in {} [by {}]",
+            data.role, data.user, domain, caller
         );
         let sha = match self.stage_and_commit_policies(&commit_msg).await {
             Ok(sha) => sha,
@@ -1014,7 +1037,10 @@ impl PolicyHandler for PolicyService {
             }
         };
 
-        info!("Granted role '{}' to '{}' (caller={})", data.role, data.user, caller);
+        info!(
+            "Granted role '{}' to '{}' in domain '{}' (caller={})",
+            data.role, data.user, domain, caller
+        );
         Ok(PolicyResponseVariant::AddGroupingResult(sha))
     }
 
@@ -1055,7 +1081,9 @@ impl PolicyHandler for PolicyService {
         }
 
         // Remove the role assignment
-        self.policy_manager.remove_role_for_user(&data.user, &data.role).await
+        self.policy_manager
+            .remove_role_for_user_in_domain(&data.user, &data.role, &domain)
+            .await
             .map_err(|e| anyhow!("Failed to remove role: {}", e))?;
 
         // Persist in-memory Casbin state to disk before staging
@@ -1064,8 +1092,8 @@ impl PolicyHandler for PolicyService {
 
         // Commit to git
         let commit_msg = format!(
-            "policy: revoke role {} from {} [by {}]",
-            data.role, data.user, caller
+            "policy: revoke role {} from {} in {} [by {}]",
+            data.role, data.user, domain, caller
         );
         let sha = match self.stage_and_commit_policies(&commit_msg).await {
             Ok(sha) => sha,
@@ -1075,7 +1103,10 @@ impl PolicyHandler for PolicyService {
             }
         };
 
-        info!("Revoked role '{}' from '{}' (caller={})", data.role, data.user, caller);
+        info!(
+            "Revoked role '{}' from '{}' in domain '{}' (caller={})",
+            data.role, data.user, domain, caller
+        );
         Ok(PolicyResponseVariant::RemoveGroupingResult(sha))
     }
 
@@ -1470,8 +1501,10 @@ impl PolicyHandler for PolicyService {
         })?;
 
         let issuer = self.default_audience.clone().unwrap_or_default();
+        let tenant = ctx.domain()?;
         let claims = hyprstream_rpc::auth::Claims::new(subject.clone(), now, expires_at)
             .with_issuer(issuer)
+            .with_tenant(tenant)
             .with_cnf_jwk(vk.as_bytes());
 
         let token = match self.sign_token(&claims, true).await {
@@ -1564,6 +1597,7 @@ impl PolicyHandler for PolicyService {
         let issuer = self.default_audience.clone().unwrap_or_default();
         let mut claims = hyprstream_rpc::auth::Claims::new(sub.clone(), now, expires_at)
             .with_issuer(issuer)
+            .with_tenant(domain)
             .with_audience(audience);
 
         // Key binding: carry cnf.jwk from WIT into the at+jwt.
@@ -1731,9 +1765,10 @@ pub(crate) async fn watch_policy_file(
 mod tests {
     use super::*;
 
-    async fn test_service() -> (PolicyService, tempfile::TempDir) {
+    async fn test_service_with_manager(
+        manager: Arc<PolicyManager>,
+    ) -> (PolicyService, tempfile::TempDir) {
         let root = tempfile::tempdir().expect("test: create policy git directory");
-        let manager = Arc::new(PolicyManager::permissive().await.expect("test: policy manager"));
         let git2db = Arc::new(RwLock::new(
             Git2DB::open(root.path()).await.expect("test: open policy git database"),
         ));
@@ -1747,6 +1782,11 @@ mod tests {
         (service, root)
     }
 
+    async fn test_service() -> (PolicyService, tempfile::TempDir) {
+        let manager = Arc::new(PolicyManager::permissive().await.expect("test: policy manager"));
+        test_service_with_manager(manager).await
+    }
+
     fn issue(subject: &str) -> IssueToken {
         IssueToken {
             requested_scopes: Some(vec!["read".to_owned()]),
@@ -1756,6 +1796,48 @@ mod tests {
             user_pub_key: None,
             dpop_jkt: None,
             issuer: None,
+            tenant: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn cross_domain_token_mint_is_denied_without_target_tenant_grant() {
+        let manager = Arc::new(
+            PolicyManager::new_in_memory()
+                .await
+                .expect("test: policy manager"),
+        );
+        manager
+            .add_policy_with_domain(
+                "service:test-caller",
+                "tenant-a",
+                "policy:IssueToken",
+                "manage",
+                "allow",
+            )
+            .await
+            .expect("test: caller-domain mint grant");
+        let (service, _root) = test_service_with_manager(manager).await;
+        let signer = SigningKey::from_bytes(&[0x52; 32]).verifying_key();
+        let ctx = EnvelopeContext::for_test_authenticated_subject_in_tenant(
+            Subject::new("service:test-caller"),
+            "tenant-a",
+            signer,
+        );
+        let mut request = issue("victim");
+        request.tenant = Some("tenant-b".to_owned());
+
+        let response = service
+            .handle_issue_token(&ctx, 1, &request)
+            .await
+            .expect("cross-domain denial is a policy response");
+
+        match response {
+            PolicyResponseVariant::Error(error) => {
+                assert_eq!(error.code, "UNAUTHORIZED_SUBJECT");
+                assert!(error.message.contains("tenant-b"));
+            }
+            other => panic!("cross-domain token mint unexpectedly proceeded: {other:?}"),
         }
     }
 

@@ -110,6 +110,7 @@ pub async fn exchange_jwt_bearer(
             user_pub_key: None,
             dpop_jkt: None,
             issuer: None,
+            tenant: claims.tenant.clone(),
         })
         .await;
 
