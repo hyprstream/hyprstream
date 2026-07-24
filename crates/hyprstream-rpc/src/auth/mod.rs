@@ -37,7 +37,7 @@ pub mod ucan;
 pub use atproto_perimeter::{AtprotoPerimeterGateway, EnrolledPeer, EnrollmentStore};
 // The identity-resolution contract (#579) lives canonically in `crate::identity`;
 // re-exported here so existing `crate::auth::{IdentityResolver, ...}` paths keep working.
-pub use crate::identity::{Ed25519Vk, IdentityKeys, IdentityResolver, MlDsaVk};
+pub use crate::identity::{Ed25519Vk, IdentityKeyCandidate, IdentityKeys, IdentityResolver, MlDsaVk};
 pub use claims::{
     ActClaim, Claims, Cnf, CnfJwk, IdTokenClaims, OneOrMany, compute_jkt, is_local_iss,
 };
@@ -52,10 +52,12 @@ pub use jti_blocklist::{InMemoryJtiBlocklist, JtiBlocklist};
 pub use jwt::{
     CompositeJwtDispatch, JwkThumbprintInput, JwtError, ProtectedHeader,
     RFC9068_ACCESS_TOKEN_TYPES, composite_kid, decode, decode_unverified, decode_with_any_key,
-    decode_with_any_key_lenient, decode_with_federation_candidates, decode_with_key, encode,
-    encode_service_jwt, header_alg, header_kid, is_rfc9068_access_token_type, jwk_thumbprint,
-    parse_composite_dispatch, parse_protected_header,
+    decode_with_any_key_lenient, decode_with_key, encode, encode_service_jwt, header_alg,
+    header_kid, is_rfc9068_access_token_type, jwk_thumbprint, parse_composite_dispatch,
+    parse_protected_header,
 };
+#[cfg(not(target_arch = "wasm32"))]
+pub use jwt::decode_with_federation_candidates;
 #[cfg(not(target_arch = "wasm32"))]
 pub use key_source::{
     ClusterKeySource, FederatedKeySource, IssuerResolver, JwksFetcher, JwksKeySource, JwksMode,

@@ -8,6 +8,7 @@
 pub mod device_challenge;
 pub mod identity_store;
 pub mod key_rotation;
+pub mod op_log;
 pub mod service_jwt;
 pub mod federation;
 pub mod federation_admission;
@@ -27,6 +28,11 @@ pub use hyprstream_rpc::annotations_capnp::ScopeAction;
 pub use federation::FederationKeyResolver;
 pub use jwt::{Claims, JwtError};
 pub use key_rotation::{SigningKeyStore, Es256SigningKeyStore, Es256KeySlot, RotationStores};
+pub use op_log::{
+    load_head_verifying_key, load_or_init_head_signing_key, publish_head_verifying_key,
+    resolve_oplog_state_dir, seal_op_log_head, ActiveGeneration, ActiveGenerationSource,
+    FixedGenerationSource, SealedHeadEs256Source, SealedOpLogHead,
+};
 pub use key_rotation::{MlDsaSigningKeyStore, MlDsaKeySlot};
 pub use policy_manager::{PolicyManager, PolicyError, write_policy_file, global_policy_manager, set_global_policy_manager};
 pub use policy_migration::migrate_policy_csv;

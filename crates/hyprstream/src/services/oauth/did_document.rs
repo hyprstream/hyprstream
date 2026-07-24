@@ -50,7 +50,11 @@ use super::state::OAuthState;
 pub(crate) fn issuer_authority(issuer_url: &str) -> Option<String> {
     let after_scheme = issuer_url.split_once("://").map(|(_, rest)| rest)?;
     let authority = after_scheme.split('/').next().unwrap_or(after_scheme);
-    if authority.is_empty() { None } else { Some(authority.to_owned()) }
+    if authority.is_empty() {
+        None
+    } else {
+        Some(authority.to_owned())
+    }
 }
 
 /// Build the multibase z-encoded Ed25519 public-key string per the
@@ -151,11 +155,21 @@ fn mldsa65_to_multibase(vk_bytes: &[u8]) -> String {
 }
 
 /// The node's atproto-native identity to embed in the root DID document:
-/// the P-256 signing key (published as the `#atproto` Multikey) plus the
-/// account handle (published in `alsoKnownAs` as `at://{handle}`).
+/// the active P-256 signing key plus the account handle. Bounded overlap keys
+/// use distinct fragments so stock atproto resolvers continue selecting only
+/// the active `#atproto` method.
 pub struct AtprotoIdentity<'a> {
     pub p256_vk: &'a p256::ecdsa::VerifyingKey,
     pub handle: &'a str,
+    pub drain: Option<AtprotoOverlapKey<'a>>,
+    pub lead: Option<AtprotoOverlapKey<'a>>,
+}
+
+/// A bounded verification-only overlap key. It is never selected for signing.
+pub struct AtprotoOverlapKey<'a> {
+    pub vk: &'a p256::ecdsa::VerifyingKey,
+    pub nbf: i64,
+    pub exp: i64,
 }
 
 /// An optional, additive transport endpoint advertised as a typed `service`
@@ -171,13 +185,55 @@ pub struct TransportEndpoint {
 }
 
 /// Build the atproto `#atproto` verification method (P-256 `Multikey`).
-fn atproto_verification_method(did: &str, vk: &p256::ecdsa::VerifyingKey) -> Value {
+pub(crate) fn atproto_verification_method(did: &str, vk: &p256::ecdsa::VerifyingKey) -> Value {
     json!({
         "id": format!("{did}#atproto"),
         "type": "Multikey",
         "controller": did,
         "publicKeyMultibase": p256_to_multibase(vk),
     })
+}
+
+fn atproto_overlap_verification_method(
+    did: &str,
+    fragment: &str,
+    key: &AtprotoOverlapKey<'_>,
+) -> Value {
+    json!({
+        "id": format!("{did}#{fragment}"),
+        "type": "Multikey",
+        "controller": did,
+        "publicKeyMultibase": p256_to_multibase(key.vk),
+        "nbf": key.nbf,
+        "exp": key.exp,
+    })
+}
+
+/// Build the active plus bounded drain/lead VMs used by the producer. The
+/// auxiliary fragments are deliberately distinct: upstream resolvers select
+/// the first exact `#atproto` fragment and ignore these entries.
+pub fn atproto_verification_methods(
+    did: &str,
+    active: &p256::ecdsa::VerifyingKey,
+    drain: Option<AtprotoOverlapKey<'_>>,
+    lead: Option<AtprotoOverlapKey<'_>>,
+) -> Vec<Value> {
+    let mut methods = vec![atproto_verification_method(did, active)];
+    if let Some(drain) = drain {
+        methods.push(atproto_overlap_verification_method(
+            did,
+            "atproto_drain",
+            &drain,
+        ));
+    }
+    if let Some(lead) = lead {
+        methods.push(atproto_overlap_verification_method(
+            did,
+            "atproto_lead",
+            &lead,
+        ));
+    }
+    methods
 }
 
 /// Build the verification-method JSON for a single Ed25519 key under a
@@ -377,13 +433,27 @@ pub(crate) fn build_did_document(
     mesh_pq_vk: Option<&[u8]>,
     mesh_kem_public: Option<&hyprstream_rpc::crypto::hybrid_kem::RecipientPublic>,
 ) -> Value {
-    let mut verification_methods = Vec::with_capacity(keys.len() * 2 + 2);
+    let mut verification_methods = Vec::with_capacity(keys.len() * 2 + 4);
     let mut authentication_refs = Vec::with_capacity(keys.len() * 2 + 2);
     let mut assertion_refs = Vec::with_capacity(keys.len() * 2 + 2);
 
-    // atproto signing key FIRST (atproto takes the first matching entry).
+    // The active key stays FIRST. Upstream resolvers select this exact fragment;
+    // bounded overlap keys use distinct fragments and are Hyprstream-only.
     if let Some(at) = atproto {
-        verification_methods.push(atproto_verification_method(did, at.p256_vk));
+        verification_methods.extend(atproto_verification_methods(
+            did,
+            at.p256_vk,
+            at.drain.as_ref().map(|key| AtprotoOverlapKey {
+                vk: key.vk,
+                nbf: key.nbf,
+                exp: key.exp,
+            }),
+            at.lead.as_ref().map(|key| AtprotoOverlapKey {
+                vk: key.vk,
+                nbf: key.nbf,
+                exp: key.exp,
+            }),
+        ));
         let atproto_vm_id = format!("{did}#atproto");
         authentication_refs.push(Value::String(atproto_vm_id.clone()));
         assertion_refs.push(Value::String(atproto_vm_id));
@@ -463,20 +533,132 @@ pub(crate) fn build_did_document(
     doc
 }
 
+#[derive(Clone)]
+struct RootIdentityMethod {
+    fragment: String,
+    vk: VerifyingKey,
+    pq_vk: Vec<u8>,
+    nbf: Option<i64>,
+    exp: Option<i64>,
+}
+
+fn root_identity_methods(
+    legacy_key: &ed25519_dalek::SigningKey,
+    legacy_pq: &[u8],
+    slots: Option<&crate::auth::key_rotation::KeySlots>,
+    now: i64,
+) -> Vec<RootIdentityMethod> {
+    let Some(slots) = slots else {
+        return vec![RootIdentityMethod {
+            fragment: "key-1".to_owned(),
+            vk: legacy_key.verifying_key(),
+            pq_vk: legacy_pq.to_vec(),
+            nbf: None,
+            exp: None,
+        }];
+    };
+
+    let legacy_bytes = legacy_key.verifying_key().to_bytes();
+    let legacy_slot = [&slots.active, &slots.drain, &slots.lead]
+        .into_iter()
+        .flatten()
+        .find(|slot| slot.verifying_key_bytes() == legacy_bytes && now < slot.exp);
+
+    let mut methods = Vec::new();
+    // Preserve the fleet's existing stable fragment during the bounded
+    // compatibility window. It aliases the exact same key and PQ binding as
+    // its named slot, so upgraded consumers can collapse it safely.
+    if let Some(slot) = legacy_slot {
+        methods.push(RootIdentityMethod {
+            fragment: "key-1".to_owned(),
+            vk: legacy_key.verifying_key(),
+            pq_vk: legacy_pq.to_vec(),
+            nbf: Some(slot.nbf),
+            exp: Some(slot.exp),
+        });
+    }
+
+    // Active is first for legacy order-based consumers after the compatibility
+    // alias retires. Drain and lead remain separately named and bounded.
+    for slot in [&slots.active, &slots.drain, &slots.lead]
+        .into_iter()
+        .flatten()
+    {
+        let pq = hyprstream_rpc::node_identity::derive_mesh_mldsa_key(&slot.key);
+        methods.push(RootIdentityMethod {
+            fragment: format!("mesh-{}", slot.kid()),
+            vk: slot.key.verifying_key(),
+            pq_vk: hyprstream_rpc::crypto::pq::ml_dsa_sk_to_vk_bytes(&pq),
+            nbf: Some(slot.nbf),
+            exp: Some(slot.exp),
+        });
+    }
+    methods
+}
+
+fn append_root_identity_methods(doc: &mut Value, did: &str, methods: &[RootIdentityMethod]) {
+    let Some(verification_methods) = doc
+        .get_mut("verificationMethod")
+        .and_then(Value::as_array_mut)
+    else {
+        return;
+    };
+    let mut relationship_ids = Vec::new();
+
+    for method in methods {
+        let mut ed = ed25519_verification_method(did, &method.fragment, &method.vk);
+        let mut ed_jwk = ed25519_verification_method_jwk(did, &method.fragment, &method.vk);
+        let pq_fragment = format!("{}-pq", method.fragment);
+        let mut pq = mldsa65_verification_method(did, &pq_fragment, &method.pq_vk);
+        for vm in [&mut ed, &mut ed_jwk, &mut pq] {
+            if let Some(nbf) = method.nbf {
+                vm["nbf"] = nbf.into();
+            }
+            if let Some(exp) = method.exp {
+                vm["exp"] = exp.into();
+            }
+        }
+        relationship_ids.extend([ed["id"].clone(), ed_jwk["id"].clone(), pq["id"].clone()]);
+        verification_methods.extend([ed, ed_jwk, pq]);
+    }
+
+    // Retain the old `#mesh-pq` DID URL as an alias for the first candidate's
+    // PQ half. Old consumers that pair by document order therefore preserve
+    // hybrid assurance in both mixed-version directions.
+    if let Some(first) = methods.first() {
+        let mut legacy_pq = mldsa65_verification_method(did, "mesh-pq", &first.pq_vk);
+        if let Some(nbf) = first.nbf {
+            legacy_pq["nbf"] = nbf.into();
+        }
+        if let Some(exp) = first.exp {
+            legacy_pq["exp"] = exp.into();
+        }
+        relationship_ids.push(legacy_pq["id"].clone());
+        verification_methods.push(legacy_pq);
+    }
+
+    for relationship in ["authentication", "assertionMethod"] {
+        if let Some(values) = doc.get_mut(relationship).and_then(Value::as_array_mut) {
+            values.extend(relationship_ids.iter().cloned());
+        }
+    }
+}
+
 /// `GET /.well-known/did.json` — root deployment DID document.
 ///
 /// `id = did:web:{authority}`. Verification methods: the OAuth issuer's
 /// current signing key (entity-signing key from OAuthState). Acts as the
 /// trust anchor that controls user/client DIDs under this authority.
-pub async fn root_did_document(
-    State(state): State<Arc<OAuthState>>,
-) -> Response {
+pub async fn root_did_document(State(state): State<Arc<OAuthState>>) -> Response {
     let authority = match issuer_authority(&state.issuer_url) {
         Some(a) => a,
-        None => return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "issuer URL has no authority",
-        ).into_response(),
+        None => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "issuer URL has no authority",
+            )
+                .into_response()
+        }
     };
     let did = format!("did:web:{authority}");
 
@@ -485,20 +667,48 @@ pub async fn root_did_document(
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             "OAuth signing key not configured",
-        ).into_response();
+        )
+            .into_response();
     };
-    let vk = sk.verifying_key();
+    let root_slots = if let Some(store) = &state.root_identity_key_store {
+        Some(store.slots_snapshot().await)
+    } else {
+        None
+    };
+    let now = chrono::Utc::now().timestamp();
+    let root_methods = root_identity_methods(
+        sk,
+        state.mesh_pq_verifying_key.as_deref().unwrap_or_default(),
+        root_slots.as_ref(),
+        now,
+    );
 
-    // atproto-native identity: the active P-256 key from the ES256 rotation
-    // store becomes the `#atproto` Multikey; the issuer authority is the handle.
-    let atproto_sk = match state.es256_key_store.as_ref() {
-        Some(store) => store.active_key().await,
-        None => None,
-    };
+    // The active key signs new commits. Bounded drain/lead slots are published
+    // only for verification overlap; they are never signing candidates.
+    let slots = state
+        .es256_key_store
+        .as_ref()
+        .map(|store| store.slots_snapshot())
+        .unwrap_or_default();
+    let (active_slot, drain_slot, lead_slot) = (slots.active, slots.drain, slots.lead);
     let handle = configured_handle_host(&state.issuer_url);
-    let atproto_vk = atproto_sk.as_ref().map(|sk| sk.verifying_key());
-    let atproto = atproto_vk.zip(handle.as_deref())
-        .map(|(vk, handle)| AtprotoIdentity { p256_vk: vk, handle });
+    let atproto = active_slot
+        .as_ref()
+        .zip(handle.as_deref())
+        .map(|(active, handle)| AtprotoIdentity {
+            p256_vk: active.key.verifying_key(),
+            handle,
+            drain: drain_slot.as_ref().map(|slot| AtprotoOverlapKey {
+                vk: slot.key.verifying_key(),
+                nbf: slot.nbf,
+                exp: slot.exp,
+            }),
+            lead: lead_slot.as_ref().map(|slot| AtprotoOverlapKey {
+                vk: slot.key.verifying_key(),
+                nbf: slot.nbf,
+                exp: slot.exp,
+            }),
+        });
 
     // Transport `service` entries: populate QUIC entry when cert hash is available (#185).
     // The cert hash was set at OAuthService startup from the node's QUIC TLS cert,
@@ -540,22 +750,22 @@ pub async fn root_did_document(
         });
     }
 
-    let keys: Vec<(String, VerifyingKey)> = vec![("key-1".to_owned(), vk)];
-
-    let doc = build_did_document(
+    let mut doc = build_did_document(
         &did,
         &state.issuer_url,
-        &keys,
+        &[],
         atproto.as_ref(),
         &transports,
-        state.mesh_pq_verifying_key.as_deref(),
+        None,
         state.mesh_kem_public.as_ref(),
     );
+    append_root_identity_methods(&mut doc, &did, &root_methods);
     (
         StatusCode::OK,
         [(header::CONTENT_TYPE, "application/did+json")],
         Json(doc),
-    ).into_response()
+    )
+        .into_response()
 }
 
 /// `GET /.well-known/atproto-did` — atproto handle→DID resolution (HTTP method).
@@ -570,21 +780,21 @@ pub async fn root_did_document(
 /// (`www-cyberdione-ai/src/api/atproto.ts:resolveHandleToDid`). This is a
 /// CORS-simple GET (no custom request headers → no preflight), so it needs only
 /// cross-origin readability from the public CORS layer, not permissive headers.
-pub async fn atproto_did(
-    State(state): State<Arc<OAuthState>>,
-) -> Response {
+pub async fn atproto_did(State(state): State<Arc<OAuthState>>) -> Response {
     let Some(authority) = issuer_authority(&state.issuer_url) else {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             "issuer URL has no authority",
-        ).into_response();
+        )
+            .into_response();
     };
     let did = format!("did:web:{authority}");
     (
         StatusCode::OK,
         [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
         did,
-    ).into_response()
+    )
+        .into_response()
 }
 
 /// `GET /users/:username/did.json` — frozen path-form account DID endpoint.
@@ -620,10 +830,13 @@ pub async fn client_did_document(
 ) -> Response {
     let authority = match issuer_authority(&state.issuer_url) {
         Some(a) => a,
-        None => return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "issuer URL has no authority",
-        ).into_response(),
+        None => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "issuer URL has no authority",
+            )
+                .into_response()
+        }
     };
     if client_id.contains(['/', '#', '?', ':']) || client_id.is_empty() {
         return (StatusCode::BAD_REQUEST, "invalid client_id").into_response();
@@ -645,7 +858,8 @@ pub async fn client_did_document(
         StatusCode::OK,
         [(header::CONTENT_TYPE, "application/did+json")],
         Json(doc),
-    ).into_response()
+    )
+        .into_response()
 }
 
 /// Extract Ed25519 VerifyingKeys from a JWKS JSON value.
@@ -667,13 +881,19 @@ fn extract_ed25519_keys_from_jwks(jwks: &Option<Value>) -> Vec<(String, Verifyin
         {
             continue;
         }
-        let Some(x) = key.get("x").and_then(|v| v.as_str()) else { continue };
-        let Ok(raw) = URL_SAFE_NO_PAD.decode(x) else { continue };
+        let Some(x) = key.get("x").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let Ok(raw) = URL_SAFE_NO_PAD.decode(x) else {
+            continue;
+        };
         let bytes: [u8; 32] = match raw.try_into() {
             Ok(b) => b,
             Err(_) => continue,
         };
-        let Ok(vk) = VerifyingKey::from_bytes(&bytes) else { continue };
+        let Ok(vk) = VerifyingKey::from_bytes(&bytes) else {
+            continue;
+        };
         let kid = key
             .get("kid")
             .and_then(|v| v.as_str())
@@ -734,9 +954,11 @@ mod tests {
     /// test replaces.
     #[tokio::test]
     async fn path_form_account_document_endpoint_is_a_hard_error() {
-        use crate::auth::user_store::{PubkeyEntry, UserFilter, UserProfile, UserProfilePatch, UserStore};
-        use crate::config::server::CorsConfig;
+        use crate::auth::user_store::{
+            PubkeyEntry, UserFilter, UserProfile, UserProfilePatch, UserStore,
+        };
         use crate::config::OAuthConfig;
+        use crate::config::server::CorsConfig;
         use crate::services::oauth::create_app;
         use crate::services::{DiscoveryClient, PolicyClient};
         use async_trait::async_trait;
@@ -763,10 +985,13 @@ mod tests {
             async fn set_profile(&self, _: &str, _: UserProfilePatch) -> anyhow::Result<()> {
                 unreachable!()
             }
-            async fn remove(&self, _: &str) -> anyhow::Result<bool> { unreachable!() }
-            async fn list_users(&self) -> Vec<String> { unreachable!() }
-            async fn search(&self, _: &UserFilter)
-                -> anyhow::Result<Vec<(String, UserProfile)>> {
+            async fn remove(&self, _: &str) -> anyhow::Result<bool> {
+                unreachable!()
+            }
+            async fn list_users(&self) -> Vec<String> {
+                unreachable!()
+            }
+            async fn search(&self, _: &UserFilter) -> anyhow::Result<Vec<(String, UserProfile)>> {
                 unreachable!()
             }
             async fn set_active(&self, _: &str, _: bool) -> anyhow::Result<()> {
@@ -776,17 +1001,22 @@ mod tests {
                 // This is the method the pre-PR `user_did_document` called to
                 // resolve keys before minting the path-form DID. Reaching it
                 // means the freeze was bypassed.
-                unreachable!(
-                    "frozen account-DID handler must not call list_pubkeys (#1159)"
-                )
+                unreachable!("frozen account-DID handler must not call list_pubkeys (#1159)")
             }
             async fn add_pubkey(
-                &self, _: &str, _: VerifyingKey, _: Option<String>,
+                &self,
+                _: &str,
+                _: VerifyingKey,
+                _: Option<String>,
             ) -> anyhow::Result<String> {
                 unreachable!()
             }
             async fn add_pubkey_hybrid(
-                &self, _: &str, _: VerifyingKey, _: Vec<u8>, _: Option<String>,
+                &self,
+                _: &str,
+                _: VerifyingKey,
+                _: Vec<u8>,
+                _: Option<String>,
             ) -> anyhow::Result<String> {
                 unreachable!()
             }
@@ -823,12 +1053,17 @@ mod tests {
                 DiscoveryClient::new(mk_client()),
                 [0x76; 32],
             )
-            .with_user_service(Arc::new(crate::services::oauth::user_service::UserService::new(
-                Arc::new(UntouchedUserStore),
-            ))),
+            .with_user_service(Arc::new(
+                crate::services::oauth::user_service::UserService::new(Arc::new(
+                    UntouchedUserStore,
+                )),
+            )),
         );
 
-        let cors = CorsConfig { enabled: false, ..Default::default() };
+        let cors = CorsConfig {
+            enabled: false,
+            ..Default::default()
+        };
         let app = create_app(state, &cors);
 
         let response = app
@@ -841,7 +1076,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::GONE);
-        let body = axum::body::to_bytes(response.into_body(), 4096).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
         assert!(
             std::str::from_utf8(&body)
                 .unwrap()
@@ -899,8 +1136,14 @@ mod tests {
         assert_eq!(vm["type"].as_str().unwrap(), "Multikey");
         assert!(vm["publicKeyMultibase"].as_str().unwrap().starts_with('z'));
         // The JWK fallback VM is retained.
-        assert_eq!(doc["verificationMethod"][1]["type"].as_str().unwrap(), "JsonWebKey2020");
-        assert_eq!(doc["service"][0]["type"].as_str().unwrap(), "HyprstreamService");
+        assert_eq!(
+            doc["verificationMethod"][1]["type"].as_str().unwrap(),
+            "JsonWebKey2020"
+        );
+        assert_eq!(
+            doc["service"][0]["type"].as_str().unwrap(),
+            "HyprstreamService"
+        );
         assert_eq!(
             doc["service"][0]["serviceEndpoint"].as_str().unwrap(),
             "https://hyprstream.example.com",
@@ -936,7 +1179,12 @@ mod tests {
         let p256_sk = p256::ecdsa::SigningKey::random(&mut OsRng);
         let p256_vk = p256_sk.verifying_key();
         let did = "did:web:hyprstream.example.com";
-        let atproto = AtprotoIdentity { p256_vk, handle: "hyprstream.example.com" };
+        let atproto = AtprotoIdentity {
+            p256_vk,
+            handle: "hyprstream.example.com",
+            drain: None,
+            lead: None,
+        };
         let transports = [TransportEndpoint {
             fragment: "iroh".to_owned(),
             vm_type: "IrohTransport".to_owned(),
@@ -957,19 +1205,35 @@ mod tests {
         let vms = doc["verificationMethod"].as_array().unwrap();
         assert_eq!(vms[0]["id"].as_str().unwrap(), format!("{did}#atproto"));
         assert_eq!(vms[0]["type"].as_str().unwrap(), "Multikey");
-        assert!(vms[0]["publicKeyMultibase"].as_str().unwrap().starts_with('z'));
+        assert!(
+            vms[0]["publicKeyMultibase"]
+                .as_str()
+                .unwrap()
+                .starts_with('z')
+        );
         // Ed25519 mesh VMs still present after it.
         assert_eq!(vms.len(), 1 + 2);
         // The ed25519 mesh VM is also a Multikey (#280), not the deprecated
         // Ed25519VerificationKey2020 type, with a multibase key; JWK fallback kept.
         assert_eq!(vms[1]["type"].as_str().unwrap(), "Multikey");
-        assert!(vms[1]["publicKeyMultibase"].as_str().unwrap().starts_with('z'));
+        assert!(
+            vms[1]["publicKeyMultibase"]
+                .as_str()
+                .unwrap()
+                .starts_with('z')
+        );
         assert_eq!(vms[2]["type"].as_str().unwrap(), "JsonWebKey2020");
 
         // #atproto_pds first, origin-only (no path), correct type.
         let svcs = doc["service"].as_array().unwrap();
-        assert_eq!(svcs[0]["id"].as_str().unwrap(), format!("{did}#atproto_pds"));
-        assert_eq!(svcs[0]["type"].as_str().unwrap(), "AtprotoPersonalDataServer");
+        assert_eq!(
+            svcs[0]["id"].as_str().unwrap(),
+            format!("{did}#atproto_pds")
+        );
+        assert_eq!(
+            svcs[0]["type"].as_str().unwrap(),
+            "AtprotoPersonalDataServer"
+        );
         assert_eq!(
             svcs[0]["serviceEndpoint"].as_str().unwrap(),
             "https://hyprstream.example.com"
@@ -980,7 +1244,10 @@ mod tests {
         assert!(iroh["serviceEndpoint"]["accept"].is_array());
 
         // alsoKnownAs handle.
-        assert_eq!(doc["alsoKnownAs"][0].as_str().unwrap(), "at://hyprstream.example.com");
+        assert_eq!(
+            doc["alsoKnownAs"][0].as_str().unwrap(),
+            "at://hyprstream.example.com"
+        );
     }
 
     /// #1113 rev2 finding 2/7: the per-user atproto DID document (served at
@@ -996,7 +1263,12 @@ mod tests {
         let issuer = "https://pds.example.com";
         let did = "did:web:pds.example.com:users:alice";
         let handle = "alice.pds.example.com";
-        let atproto = AtprotoIdentity { p256_vk, handle };
+        let atproto = AtprotoIdentity {
+            p256_vk,
+            handle,
+            drain: None,
+            lead: None,
+        };
         let doc = build_did_document(did, issuer, &[], Some(&atproto), &[], None, None);
 
         // The atproto PDS service is present and points at the issuer origin.
@@ -1012,13 +1284,198 @@ mod tests {
             "PDS serviceEndpoint MUST equal the AS issuer (PDS = its own AS)"
         );
         // The account handle alias is present.
-        assert_eq!(doc["alsoKnownAs"][0].as_str().unwrap(), "at://alice.pds.example.com");
+        assert_eq!(
+            doc["alsoKnownAs"][0].as_str().unwrap(),
+            "at://alice.pds.example.com"
+        );
         // The hosted-account #atproto VM (P-256 Multikey) is present.
-        assert!(doc["verificationMethod"]
+        assert!(
+            doc["verificationMethod"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|vm| vm["id"].as_str() == Some(&format!("{did}#atproto")))
+        );
+    }
+
+    /// #918 producer side: active remains the exact `#atproto` VM, while drain
+    /// and lead are bounded distinct-fragment overlap VMs.
+    #[test]
+    fn build_did_doc_publishes_bounded_overlap_slots() {
+        let active_sk = p256::ecdsa::SigningKey::random(&mut OsRng);
+        let active_vk = active_sk.verifying_key();
+        let drain_sk = p256::ecdsa::SigningKey::random(&mut OsRng);
+        let drain_vk = drain_sk.verifying_key();
+        let lead_sk = p256::ecdsa::SigningKey::random(&mut OsRng);
+        let lead_vk = lead_sk.verifying_key();
+        let did = "did:web:hyprstream.example.com";
+        let atproto = AtprotoIdentity {
+            p256_vk: active_vk,
+            handle: "hyprstream.example.com",
+            drain: Some(AtprotoOverlapKey {
+                vk: drain_vk,
+                nbf: 1_000,
+                exp: 2_000,
+            }),
+            lead: Some(AtprotoOverlapKey {
+                vk: lead_vk,
+                nbf: 1_500,
+                exp: 3_000,
+            }),
+        };
+        let doc = build_did_document(
+            did,
+            "https://hyprstream.example.com",
+            &[],
+            Some(&atproto),
+            &[],
+            None,
+            None,
+        );
+        let vms = doc["verificationMethod"].as_array().unwrap();
+        assert_eq!(vms[0]["id"].as_str().unwrap(), format!("{did}#atproto"));
+        // Exactly one active #atproto: stock resolvers keep their existing
+        // first-exact-fragment behavior.
+        assert_eq!(
+            vms.iter()
+                .filter(|v| v["id"]
+                    .as_str()
+                    .map(|s| s.ends_with("#atproto"))
+                    .unwrap_or(false))
+                .count(),
+            1,
+            "exactly one active #atproto method"
+        );
+        let drain = vms
+            .iter()
+            .find(|v| v["id"] == format!("{did}#atproto_drain"))
+            .unwrap();
+        assert_eq!(drain["nbf"], 1_000);
+        assert_eq!(drain["exp"], 2_000);
+        let lead = vms
+            .iter()
+            .find(|v| v["id"] == format!("{did}#atproto_lead"))
+            .unwrap();
+        assert_eq!(lead["nbf"], 1_500);
+        assert_eq!(lead["exp"], 3_000);
+
+        let published = hyprstream_pds::commit::PublishedAtprotoKeys::from_did_document(&doc, did)
+            .expect("published overlap document parses");
+        assert_eq!(published.len(), 3);
+        assert_eq!(published.live_keys(1_250).count(), 2, "active + drain");
+        assert_eq!(published.live_keys(2_500).count(), 2, "active + lead");
+    }
+
+    #[test]
+    fn root_identity_publisher_and_consumer_enforce_bounded_overlap() {
+        use hyprstream_rpc::admission::AdmittedIdentity;
+        use hyprstream_rpc::auth::AtprotoPerimeterGateway;
+        use hyprstream_rpc::auth::mac::Assurance;
+        use hyprstream_rpc::identity_resolver::{DidDocumentProvider, MethodDispatchResolver};
+
+        #[derive(Clone)]
+        struct Docs(Value);
+        impl DidDocumentProvider for Docs {
+            fn document(&self, _did: &str) -> anyhow::Result<Value> {
+                Ok(self.0.clone())
+            }
+        }
+
+        let old = SigningKey::generate(&mut OsRng);
+        let new = SigningKey::generate(&mut OsRng);
+        let lead = SigningKey::generate(&mut OsRng);
+        let old_pq = hyprstream_rpc::node_identity::derive_mesh_mldsa_key(&old);
+        let old_pq = hyprstream_rpc::crypto::pq::ml_dsa_sk_to_vk_bytes(&old_pq);
+        let slots = crate::auth::key_rotation::KeySlots {
+            drain: Some(crate::auth::key_rotation::KeySlot::new(
+                old.clone(),
+                100,
+                200,
+            )),
+            active: Some(crate::auth::key_rotation::KeySlot::new(
+                new.clone(),
+                150,
+                400,
+            )),
+            lead: Some(crate::auth::key_rotation::KeySlot::new(
+                lead.clone(),
+                350,
+                550,
+            )),
+        };
+        let methods = root_identity_methods(&old, &old_pq, Some(&slots), 175);
+        let did = "did:web:peer.example";
+        let mut doc = build_did_document(did, "https://peer.example", &[], None, &[], None, None);
+        append_root_identity_methods(&mut doc, did, &methods);
+
+        let ids: Vec<_> = doc["verificationMethod"]
             .as_array()
             .unwrap()
             .iter()
-            .any(|vm| vm["id"].as_str() == Some(&format!("{did}#atproto"))));
+            .filter_map(|vm| vm["id"].as_str())
+            .collect();
+        assert!(ids.contains(&format!("{did}#key-1").as_str()));
+        assert!(ids.contains(&format!("{did}#key-1-pq").as_str()));
+        assert!(ids.contains(&format!("{did}#mesh-pq").as_str()));
+        assert!(
+            ids.iter().any(|id| id.contains("#mesh-")),
+            "named rotation slots must be published"
+        );
+        // Mixed-version producer direction: the pre-upgrade resolver chose the
+        // first compatible Ed25519 and first compatible ML-DSA method. During
+        // the compatibility window those are still the old exact pair.
+        let vms = doc["verificationMethod"].as_array().unwrap();
+        let first_ed = vms
+            .iter()
+            .filter_map(|vm| vm["publicKeyMultibase"].as_str())
+            .find_map(|multibase| {
+                hyprstream_rpc::did_web::decode_ed25519_multikey(multibase).ok()
+            })
+            .unwrap();
+        let first_pq = vms
+            .iter()
+            .filter_map(|vm| vm["publicKeyMultibase"].as_str())
+            .find_map(|multibase| {
+                hyprstream_rpc::did_web::decode_multikey(
+                    multibase,
+                    &hyprstream_rpc::did_web::MULTICODEC_ML_DSA_65_PUB,
+                )
+                .ok()
+            })
+            .unwrap();
+        assert_eq!(first_ed, old.verifying_key().to_bytes());
+        assert_eq!(first_pq, old_pq);
+
+        let now = Arc::new(std::sync::atomic::AtomicI64::new(175));
+        let clock = Arc::clone(&now);
+        let resolver = MethodDispatchResolver::new(Docs(doc))
+            .with_clock(move || clock.load(std::sync::atomic::Ordering::SeqCst));
+        let gateway = AtprotoPerimeterGateway::new(resolver);
+        let admitted = |key: &SigningKey| AdmittedIdentity {
+            origin: "https://peer.example".to_owned(),
+            did: Some(did.to_owned()),
+            key: key.verifying_key().to_bytes(),
+        };
+
+        let old_peer = gateway
+            .enroll(&admitted(&old))
+            .expect("drain signer accepted during overlap");
+        let new_peer = gateway
+            .enroll(&admitted(&new))
+            .expect("active signer accepted during overlap");
+        assert_eq!(old_peer.assurance, Assurance::PqHybrid);
+        assert_eq!(new_peer.assurance, Assurance::PqHybrid);
+        assert!(
+            gateway.enroll(&admitted(&lead)).is_err(),
+            "lead is published before use but not accepted before nbf"
+        );
+
+        now.store(200, std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            gateway.enroll(&admitted(&old)).is_err(),
+            "retired signer must fail exactly when its bound closes"
+        );
+        assert!(gateway.enroll(&admitted(&new)).is_ok());
     }
 
     #[test]
@@ -1046,7 +1503,10 @@ mod tests {
         assert_eq!(vm["type"].as_str().unwrap(), "Multikey");
         assert_eq!(vm["controller"].as_str().unwrap(), did);
         let mb = vm["publicKeyMultibase"].as_str().unwrap();
-        assert!(mb.starts_with('z'), "Multikey publicKeyMultibase must be base58btc multibase");
+        assert!(
+            mb.starts_with('z'),
+            "Multikey publicKeyMultibase must be base58btc multibase"
+        );
         // The encoded key carries the ed25519-pub multicodec prefix (0xed 0x01).
         let decoded = bs58::decode(&mb[1..]).into_vec().unwrap();
         assert_eq!(&decoded[..2], &[0xed, 0x01]);
@@ -1088,7 +1548,10 @@ mod tests {
         let vms = doc["verificationMethod"].as_array().unwrap();
         // key-1 multibase + key-1 jwk + mesh-pq = 3.
         assert_eq!(vms.len(), 3);
-        let pq = vms.iter().find(|v| v["id"] == format!("{did}#mesh-pq")).unwrap();
+        let pq = vms
+            .iter()
+            .find(|v| v["id"] == format!("{did}#mesh-pq"))
+            .unwrap();
         assert_eq!(pq["type"].as_str().unwrap(), "Multikey");
         let mb = pq["publicKeyMultibase"].as_str().unwrap();
         let decoded = bs58::decode(&mb[1..]).into_vec().unwrap();
@@ -1096,8 +1559,20 @@ mod tests {
         assert_eq!(&decoded[2..], vk_bytes.as_slice());
         // Referenced as both an authentication and assertion method.
         let mesh_pq_id = format!("{did}#mesh-pq");
-        assert!(doc["authentication"].as_array().unwrap().iter().any(|v| *v == mesh_pq_id));
-        assert!(doc["assertionMethod"].as_array().unwrap().iter().any(|v| *v == mesh_pq_id));
+        assert!(
+            doc["authentication"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|v| *v == mesh_pq_id)
+        );
+        assert!(
+            doc["assertionMethod"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|v| *v == mesh_pq_id)
+        );
     }
 
     #[test]
@@ -1120,11 +1595,17 @@ mod tests {
             None,
         );
         let vms = doc["verificationMethod"].as_array().unwrap();
-        let pq = vms.iter().find(|v| v["id"] == format!("{did}#mesh-pq")).unwrap();
+        let pq = vms
+            .iter()
+            .find(|v| v["id"] == format!("{did}#mesh-pq"))
+            .unwrap();
         let mb = pq["publicKeyMultibase"].as_str().unwrap();
         let decoded = bs58::decode(&mb[1..]).into_vec().unwrap();
-        assert_eq!(&decoded[2..], pq_vk_bytes.as_slice(),
-            "published #mesh-pq key must equal the derived mesh signing key's public key");
+        assert_eq!(
+            &decoded[2..],
+            pq_vk_bytes.as_slice(),
+            "published #mesh-pq key must equal the derived mesh signing key's public key"
+        );
     }
 
     #[test]
@@ -1246,19 +1727,33 @@ mod tests {
         // are NOT duplicated into verificationMethod/authentication/assertionMethod.
         let kas = doc["keyAgreement"].as_array().unwrap();
         assert_eq!(kas.len(), 2);
-        assert_eq!(kas[0]["id"].as_str().unwrap(), format!("{did}#mesh-kem-x25519"));
+        assert_eq!(
+            kas[0]["id"].as_str().unwrap(),
+            format!("{did}#mesh-kem-x25519")
+        );
         assert_eq!(kas[0]["type"].as_str().unwrap(), "Multikey");
-        assert_eq!(kas[1]["id"].as_str().unwrap(), format!("{did}#mesh-kem-mlkem768"));
+        assert_eq!(
+            kas[1]["id"].as_str().unwrap(),
+            format!("{did}#mesh-kem-mlkem768")
+        );
         assert_eq!(kas[1]["type"].as_str().unwrap(), "Multikey");
 
         let vms = doc["verificationMethod"].as_array().unwrap();
-        assert!(!vms.iter().any(|v| v["id"] == format!("{did}#mesh-kem-x25519")));
-        assert!(!vms.iter().any(|v| v["id"] == format!("{did}#mesh-kem-mlkem768")));
-        assert!(!doc["authentication"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|v| v.as_str().map(|s| s.contains("mesh-kem")).unwrap_or(false)));
+        assert!(
+            !vms.iter()
+                .any(|v| v["id"] == format!("{did}#mesh-kem-x25519"))
+        );
+        assert!(
+            !vms.iter()
+                .any(|v| v["id"] == format!("{did}#mesh-kem-mlkem768"))
+        );
+        assert!(
+            !doc["authentication"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|v| v.as_str().map(|s| s.contains("mesh-kem")).unwrap_or(false))
+        );
 
         // The published X25519 leg round-trips to the exact bytes derived —
         // consistency between the DID doc and the key the node actually holds.

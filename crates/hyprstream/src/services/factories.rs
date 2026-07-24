@@ -113,9 +113,11 @@ pub fn with_checkpointed_native_announcements(
                 .services
                 .iter()
                 .any(|entry| entry.id == *service_name)
-                && state.current.subject_keys.first().is_some_and(|key| {
-                    key.ed25519_pub.as_slice() == signer.verifying_key().as_bytes()
-                })
+                && state
+                    .current
+                    .subject_keys
+                    .iter()
+                    .any(|key| key.ed25519_pub.as_slice() == signer.verifying_key().as_bytes())
         });
         let state = matching.next().ok_or_else(|| {
             anyhow::anyhow!(
@@ -702,10 +704,8 @@ fn create_registry_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawn
     // holder of the `#atproto` private key: it opens the durable store
     // read-write and, on register/commit, signs the repo's commit ONCE and
     // persists the signed bytes. Reads (the discovery service) are keyless.
-    // This node's `did:key` identity (the record `repo` at-uri authority) is
-    // derived from the node's own root Ed25519 key — the same identity TLS
-    // endorsement uses ("a node-level trust assertion, not specific to any
-    // per-service key"). The `#atproto` commit-signing key is the *active* key
+    // The record `repo` authority is the root `did:web` document that publishes
+    // the `#atproto` commit-verification key. The `#atproto` signing key is the *active* key
     // from the shared `Es256SigningKeyStore` — the same P-256 key
     // `oauth::did_document` publishes as the `#atproto` verification method, so
     // the writer and the published key are one source of truth (classical —
@@ -716,25 +716,29 @@ fn create_registry_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawn
     let pds_publisher = (|| -> anyhow::Result<crate::services::discovery::PdsPublisher> {
         let store_dir = pds_store_dir(ctx)?;
         let secrets_dir = crate::config::HyprConfig::resolve_secrets_dir()?;
+        // C4 (#1170, closes #1123): the publisher resolves the active
+        // `#atproto` generation from the **sealed op-log head** at sign time,
+        // not a key frozen here at construction. The head is written by the
+        // OAuth rotation task to a dedicated shared state dir (NOT the
+        // read-only credentials dir), and is signed by a dedicated head key
+        // whose *public* verifying key the registry loads here — the registry
+        // holds NO CA private key. Under `--ipc` a rotation by the OAuth
+        // process is observed with no event-delivery mechanism. If the head is
+        // absent (OAuth not booted, or the shared state dir not provisioned —
+        // #808 under systemd), `active_generation()` returns `None` and the
+        // publisher declines to sign: fail-closed, never a stale frozen key.
+        let oplog_state_dir = crate::auth::resolve_oplog_state_dir(&secrets_dir)?;
+        let generation_source: Arc<dyn crate::auth::ActiveGenerationSource> = Arc::new(
+            crate::auth::SealedHeadEs256Source::new(&oplog_state_dir, &secrets_dir),
+        );
         let es256_store =
             crate::auth::key_rotation::global_es256_key_store(&secrets_dir, &config.oauth);
-        // `active_key` is async (tokio RwLock); resolve it once here on the
-        // current runtime. `block_in_place` avoids stalling a worker reactor.
-        let active = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(es256_store.active_key())
-        })
-        .ok_or_else(|| anyhow::anyhow!("no active ES256 #atproto key for PDS publish"))?;
-        let atproto_key: p256::ecdsa::SigningKey = (*active).clone();
         let acceptance_identity = ctx.service_signing_key("registry");
         anyhow::ensure!(
             hyprstream_discovery::deployment_registry_verifier()?
                 .matches(&acceptance_identity.verifying_key()),
             "registry signing credential does not match authenticated deployment identity"
         );
-        // The alarm WAL must remain verifiable across OAuth key rotations and
-        // process restarts. Derive a dedicated, stable audit identity from the
-        // node/service root available in this deployment mode; the second
-        // derivation keeps the ML-DSA material separate from the Ed25519 key.
         let audit_ed = hyprstream_rpc::node_identity::derive_purpose_key(
             &acceptance_identity,
             "hyprstream-at9p-audit-ed25519-v1",
@@ -753,10 +757,13 @@ fn create_registry_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawn
             audit_pq,
         )?;
         let node_did = hyprstream_rpc::did_key::ed25519_to_did_key(&ctx.verifying_key().to_bytes());
-        Ok(
-            crate::services::discovery::PdsPublisher::new(store, node_did, atproto_key)
-                .with_at9p_state_ingest(at9p_state),
+        Ok(crate::services::discovery::PdsPublisher::with_generation_source(
+            store,
+            node_did,
+            generation_source,
         )
+        .with_at9p_state_ingest(at9p_state)
+        .with_es256_store(es256_store))
     })()
     .map_err(|e| tracing::warn!("PDS publish disabled: {e}"))
     .ok();
@@ -776,7 +783,11 @@ fn create_registry_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawn
     }
     registry_service = registry_service.with_jwt_key_source(ctx.cluster_key_source());
     if let Some(publisher) = pds_publisher {
-        registry_service = registry_service.with_pds_publisher(publisher);
+        // A promotion publishes the former active key as a bounded drain slot;
+        // no writer-local re-sign callback is needed, which keeps `--ipc`
+        // rotation viable when OAuth and registry run in different processes.
+        let publisher_arc = Arc::new(publisher);
+        registry_service = registry_service.with_pds_publisher_arc(publisher_arc);
     }
 
     Ok(ctx.into_spawnable_quic(registry_service, config.registry.quic_port))
@@ -1003,6 +1014,7 @@ fn create_worker_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
     use hyprstream_workers::{BackendCtx, SandboxBackend, WorkerService, resolve_backend};
 
     let config = load_config();
+    let sk = ctx.service_signing_key("worker");
     let worker_quic_port = config.worker.as_ref().and_then(|w| w.quic_port);
     // Operator-selected backend name ("auto" or a registered backend); resolved
     // fail-closed against the inventory registry below.
@@ -1051,6 +1063,15 @@ fn create_worker_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
     #[cfg(feature = "oci-image")]
     let rafs_store = Arc::new(RafsStore::new(image_config.clone())?);
 
+    let ninep_decider = tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current().block_on(crate::mac::production_ninep_decider(
+            sk.clone(),
+            &config.oauth,
+            "ninep-worker",
+        ))
+    })
+    .context("construct worker 9P MAC PEP")?;
+
     // Resolve + construct the backend fail-closed against the inventory registry
     // (config-driven by name; explicit requests are authoritative, missing
     // prerequisites error out rather than silently downgrading isolation; "auto"
@@ -1058,14 +1079,13 @@ fn create_worker_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
     // `_ => nspawn` fallback (#507 / #518).
     let backend_ctx = BackendCtx {
         pool_config: pool_config.clone(),
+        ninep_decider,
         #[cfg(feature = "oci-image")]
         image_config,
         #[cfg(feature = "oci-image")]
         rafs_store: Arc::clone(&rafs_store),
     };
     let backend: Arc<dyn SandboxBackend> = resolve_backend(&backend_name, &backend_ctx)?;
-
-    let sk = ctx.service_signing_key("worker");
 
     // Register this service's verifying key with PolicyService
     register_service_key(ctx, "worker", &sk)?;
@@ -1143,23 +1163,49 @@ fn create_oai_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
     let oauth_issuer_url = config.oauth.issuer_url();
     let server_state = tokio::task::block_in_place(|| {
         let rt = tokio::runtime::Handle::current();
-        rt.block_on(ServerState::new(
-            config.server.clone(),
-            model_client,
-            policy_client,
-            registry_client,
-            sk.clone(),
-            ctx.jwt_verifying_key(),
-            resource_url,
-            oauth_issuer_url,
-            &config.oauth.trusted_issuers,
-            // Share the PolicyService-owned JTI blocklist so POST /oauth/revoke
-            // immediately invalidates tokens at the OAI resource server.
-            SHARED_JTI_BLOCKLIST
-                .get()
-                .map(Arc::clone)
-                .unwrap_or_else(|| Arc::new(hyprstream_rpc::auth::InMemoryJtiBlocklist::new())),
-        ))
+        rt.block_on(async {
+            let secrets_dir = crate::config::HyprConfig::resolve_secrets_dir()?;
+            let ml_dsa_store =
+                crate::auth::key_rotation::global_ml_dsa_key_store(&secrets_dir, &config.oauth);
+            let signer = crate::mac::audit::cose::OwnedCoseAuditSigner::new(
+                Arc::new(sk.clone()),
+                ml_dsa_store.active_key().await,
+                hyprstream_rpc::envelope::mandatory_envelope_policy(),
+            );
+            anyhow::ensure!(
+                signer.can_sign(),
+                "9P MAC PEP audit signer unavailable under mandatory Hybrid policy"
+            );
+            let audit_store = crate::mac::audit::WalAuditStore::open(
+                secrets_dir.join("mac-audit").join("ninep"),
+                signer,
+            )
+            .map_err(|error| anyhow::anyhow!("open 9P MAC audit store: {error}"))?;
+            let resolver = crate::mac::GenesisGate::production().into_resolver();
+            let ninep_decider: Arc<dyn hyprstream_9p::AccessDecider> = Arc::new(
+                crate::mac::NinePAccessDecider::new(Arc::new(resolver), Arc::new(audit_store)),
+            );
+
+            ServerState::new(
+                config.server.clone(),
+                model_client,
+                policy_client,
+                registry_client,
+                sk.clone(),
+                ctx.jwt_verifying_key(),
+                resource_url,
+                oauth_issuer_url,
+                &config.oauth.trusted_issuers,
+                // Share the PolicyService-owned JTI blocklist so POST /oauth/revoke
+                // immediately invalidates tokens at the OAI resource server.
+                SHARED_JTI_BLOCKLIST
+                    .get()
+                    .map(Arc::clone)
+                    .unwrap_or_else(|| Arc::new(hyprstream_rpc::auth::InMemoryJtiBlocklist::new())),
+                ninep_decider,
+            )
+            .await
+        })
     })
     .context("Failed to create server state")?;
 
@@ -1240,6 +1286,29 @@ fn create_xet_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // Flight Service Factory
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Factory for `At9pVerifyService` — the credential-free HTTPS face that lets
+/// an external web app verify a `did:at9p` login assertion over plain HTTPS
+/// (#1114).
+///
+/// **No `depends_on`, no service key, no `register_service_key`, no Rep
+/// socket.** This face sits outside the RPC mesh by construction: it holds no
+/// mesh credentials (the better to serve a credential-free public origin), so
+/// it registers nothing and depends on nothing. `SocketKind` has no `Http`
+/// variant and this face is not announceable — that is the #1135 design
+/// statement made concrete. See `services::at9p_verify` for the full rationale.
+#[service_factory("at9p_verify")]
+fn create_at9p_verify_service(_ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>> {
+    use crate::services::At9pVerifyService;
+
+    let config = load_config();
+    Ok(Box::new(At9pVerifyService::new(
+        config.at9p_verify.clone(),
+        config.tls.clone(),
+    )))
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /// Factory for FlightService (Arrow Flight SQL server)
@@ -1866,9 +1935,23 @@ fn create_discovery_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spaw
             .context("failed to open PDS record store (read-only)")?
             .with_at9p_deployment_verifier(at9p_acceptance_identity),
     );
-    let record_resolver = std::sync::Arc::new(crate::services::discovery::PdsRecordResolver::new(
-        pds_store,
-    ));
+    // #918 — the local repo subject is the root did:web authority whose
+    // document is fed by this ES256 store. The resolver uses the same bounded
+    // publication snapshot, including drain, before placement ingest.
+    let secrets_dir = crate::config::HyprConfig::resolve_secrets_dir()?;
+    let es256_store =
+        crate::auth::key_rotation::global_es256_key_store(&secrets_dir, &config.oauth);
+    let issuer = ctx
+        .oauth_issuer_url()
+        .map(str::to_owned)
+        .unwrap_or_else(|| config.oauth.issuer_url());
+    let authority = crate::services::oauth::did_document::issuer_authority(&issuer)
+        .context("OAuth issuer has no did:web authority")?;
+    let node_did = format!("did:web:{authority}");
+    let record_resolver = std::sync::Arc::new(
+        crate::services::discovery::PdsRecordResolver::new(pds_store)
+            .with_es256_rotation(es256_store, node_did),
+    );
 
     let mut discovery_service = DiscoveryService::new(
         Arc::new(sk),

@@ -269,13 +269,31 @@ impl AcceptedAt9pState {
     /// are recomputed from the retained bytes.
     pub fn from_persisted_update(bytes: &[u8]) -> anyhow::Result<Self> {
         let record = UpdateRecord::from_dag_cbor(bytes)?;
-        let signer = record
-            .new_capsule_body
-            .subject_keys
-            .first()
-            .ok_or_else(|| anyhow::anyhow!("persisted update has no current signing key"))?;
-        crate::at9p_sign::verify_update_record(&record, signer)
-            .map_err(|e| anyhow::anyhow!("persisted update signature rejected: {e}"))?;
+        // `subjectKeys` is a published set (#1188 / #1183): the record was signed
+        // by one of the revealed keys, not necessarily position 0. Re-verify by
+        // trying each published subject key and accepting the record iff its
+        // composite verifies under one of them — the "try each candidate" rule
+        // for a set with no wire-level selector. (Authorization-by-pre-commitment
+        // was already enforced when this record was first accepted through
+        // `validate_successor`; here we only re-confirm the retained bytes carry
+        // an intact signature by a published key.)
+        let mut last_err = None;
+        let verified = record.new_capsule_body.subject_keys.iter().any(|signer| {
+            match crate::at9p_sign::verify_update_record(&record, signer) {
+                Ok(()) => true,
+                Err(e) => {
+                    last_err = Some(e);
+                    false
+                }
+            }
+        });
+        anyhow::ensure!(
+            verified,
+            "persisted update signature rejected: {}",
+            last_err
+                .map(|e| e.to_string())
+                .unwrap_or_else(|| "no published subject key verified the record".to_owned())
+        );
         Ok(Self::from_accepted_update(record))
     }
 

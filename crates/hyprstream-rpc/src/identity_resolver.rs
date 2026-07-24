@@ -17,11 +17,10 @@
 //! the DID method:
 //!
 //! - **`did:web`** — resolve the DID document and extract its verification
-//!   methods. An Ed25519 identity VM (for example `#mesh`) is the classical anchor; a
-//!   verified ML-DSA-65 VM (`#mesh-pq`, multicodec `0x1211`) is the PQ anchor.
-//!   Both present ⇒ [`Assurance::PqHybrid`] (a did:web we operate); Ed25519-only ⇒
-//!   [`Assurance::Classical`] (a third-party did:web). No Ed25519 VM ⇒ nothing to
-//!   bind ⇒ `Err` (fail-closed).
+//!   methods. An Ed25519 identity VM (for example `#mesh`) is the classical anchor;
+//!   its explicitly named ML-DSA-65 companion (`#mesh-pq`, multicodec `0x1211`)
+//!   makes that candidate [`Assurance::PqHybrid`]. Other candidates remain
+//!   [`Assurance::Classical`]. No Ed25519 VM ⇒ nothing to bind ⇒ `Err` (fail-closed).
 //! - **`did:key`** — a single Ed25519 key decoded from the DID string itself; no
 //!   fetch. A single classical key can never be hybrid, so the honest ceiling is
 //!   [`Assurance::Classical`].
@@ -53,15 +52,14 @@
 
 use std::sync::Arc;
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use serde_json::Value;
 
-use crate::auth::mac::Assurance;
+use crate::crypto::pq::{MlDsaVerifyingKey, ml_dsa_vk_from_bytes};
 use crate::did_web::{
-    did_key_to_ed25519, verification_method_ed25519_keys, verification_method_ml_dsa_65_keys,
+    MULTICODEC_ML_DSA_65_PUB, decode_ed25519_multikey, decode_multikey, did_key_to_ed25519,
 };
-use crate::crypto::pq::MlDsaVerifyingKey;
-use crate::identity::{Did, IdentityKeys, IdentityResolver};
+use crate::identity::{Did, IdentityKeyCandidate, IdentityKeys, IdentityResolver};
 
 /// A synchronous DID-document provider for the did:web arm.
 ///
@@ -73,58 +71,132 @@ pub trait DidDocumentProvider: Send + Sync {
     fn document(&self, did: &str) -> Result<Value>;
 }
 
-/// The content-verified subject keys of a `did:at9p` capsule, re-expressed in the
-/// rpc-local key types so this crate need not depend on `hyprstream-pds` (pds
-/// depends on rpc; the dependency does not reverse).
+/// One content-verified atomic hybrid subject key: an Ed25519 identity key and
+/// the ML-DSA-65 key **bound to it in the same capsule entry** (#1188 / #1183).
 ///
-/// `ed25519` is the capsule's primary genesis identity key, not carrier metadata
-/// or live possession proof. `ml_dsa_65` is the PQ half of the
-/// hybrid pair. A [`VerifiedAt9pKeys`]
-/// is only constructable via [`VerifiedAt9pKeys::new_gate_verified`] — the GATE
-/// mint — which only an [`At9pCapsuleResolver`] that ran the A4 GATE pipeline
-/// (canon→hash→sig, #884) to completion reaches. The private fields make the
-/// "only constructable after the GATE ran" provenance a type-level invariant
-/// rather than a bare rustdoc claim: arbitrary code cannot build one with an
-/// unverified `ed25519`↔`ml_dsa_65` pair, so holding one is proof the binding came
-/// from **content-verified capsule material**, not a config file or a caller
-/// assertion (the D2/#894 provenance boundary, hardened in #964).
+/// The pairing is atomic: the ML-DSA-65 half is never recombined with a
+/// different Ed25519 half. Selecting a subject key by its Ed25519 identity
+/// therefore yields exactly the PQ key the capsule author bound to it, which is
+/// what overlap rotation and PQ-hybrid rollout require — publish several keys,
+/// let each verifier take the whole pair it recognizes.
 #[derive(Clone)]
-pub struct VerifiedAt9pKeys {
-    /// The content-verified Ed25519 genesis identity key.
+pub struct VerifiedAt9pKey {
     ed25519: [u8; 32],
-    /// The verified ML-DSA-65 subject key bound to `ed25519` in the capsule.
     ml_dsa_65: MlDsaVerifyingKey,
 }
 
-impl VerifiedAt9pKeys {
-    /// The GATE mint — the sole construction path for a [`VerifiedAt9pKeys`].
-    ///
-    /// This is the constructor-witness chokepoint: the fields are private, so the
-    /// *only* way to produce a `VerifiedAt9pKeys` is to call this method, which
-    /// encodes the GATE-ran provenance in its name. Trusted callers are the A4 GATE
-    /// resolver implementations (the real [`At9pCapsuleResolver`] impl in
-    /// `hyprstream-pds::at9p_resolver`, plus in-crate test fixtures). Code that has
-    /// not run the GATE has no business calling this — review a new call site as a
-    /// provenance decision, not a mechanical field set.
-    ///
-    /// (Rust cannot seal this across crates — `hyprstream-pds` is a *dependent* of
-    /// `hyprstream-rpc`, so rpc has no way to grant pds the mint while denying it
-    /// to arbitrary code. The private fields + single named mint convert the
-    /// provenance from "any code can write the struct literal" to "any code must go
-    /// through one review-visible chokepoint", which is the proportionate
-    /// hardening; the trust root remains "whoever injects the gate is trusted".)
-    pub fn new_gate_verified(ed25519: [u8; 32], ml_dsa_65: MlDsaVerifyingKey) -> Self {
-        Self { ed25519, ml_dsa_65 }
-    }
-
-    /// The content-verified Ed25519 genesis identity key.
+impl VerifiedAt9pKey {
+    /// The content-verified Ed25519 identity key.
     pub fn ed25519(&self) -> &[u8; 32] {
         &self.ed25519
     }
 
-    /// The verified ML-DSA-65 subject key bound to `ed25519` in the capsule.
+    /// The ML-DSA-65 key atomically bound to [`Self::ed25519`] in the capsule.
     pub fn ml_dsa_65(&self) -> &MlDsaVerifyingKey {
         &self.ml_dsa_65
+    }
+}
+
+/// The content-verified subject key **set** of a `did:at9p` capsule, re-expressed
+/// in the rpc-local key types so this crate need not depend on `hyprstream-pds`
+/// (pds depends on rpc; the dependency does not reverse).
+///
+/// `subjectKeys` is a *set* of currently-usable identity keys, never an ordered
+/// list with a positional "primary" (#1188 / #1183): a producer publishes the
+/// new key alongside the old to rotate without a flag day, and a classical key
+/// beside a PQ/composite key for hybrid rollout. A consumer selects the member
+/// it recognizes — here [`Self::for_ed25519`], keyed on the Ed25519 application
+/// signer identity — and skips the rest, never letting position confer
+/// authority. The set is non-empty and its Ed25519 halves are unique (enforced
+/// by the capsule schema), so selection is unambiguous.
+///
+/// A [`VerifiedAt9pKeys`] is only constructable via the GATE mints
+/// ([`VerifiedAt9pKeys::new_gate_verified`] / [`VerifiedAt9pKeys::new_gate_verified_set`]),
+/// which only an [`At9pCapsuleResolver`] that ran the A4 GATE pipeline
+/// (canon→hash→sig, #884) to completion reaches. The private field makes the
+/// "only constructable after the GATE ran" provenance a type-level invariant
+/// rather than a bare rustdoc claim: arbitrary code cannot build one with an
+/// unverified `ed25519`↔`ml_dsa_65` binding, so holding one is proof the binding
+/// came from **content-verified capsule material**, not a config file or a
+/// caller assertion (the D2/#894 provenance boundary, hardened in #964).
+#[derive(Clone)]
+pub struct VerifiedAt9pKeys {
+    /// The content-verified subject key set — non-empty, unique Ed25519 halves.
+    keys: Vec<VerifiedAt9pKey>,
+}
+
+impl VerifiedAt9pKeys {
+    /// The GATE mint for a **single** verified subject key — a convenience over
+    /// [`Self::new_gate_verified_set`] for the (common) single-key capsule.
+    ///
+    /// This is the constructor-witness chokepoint: the field is private, so the
+    /// *only* way to produce a `VerifiedAt9pKeys` is one of these mints, which
+    /// encode the GATE-ran provenance in their names. Trusted callers are the A4
+    /// GATE resolver implementations (the real [`At9pCapsuleResolver`] impl in
+    /// `hyprstream-pds::at9p_resolver`, plus in-crate test fixtures). Code that
+    /// has not run the GATE has no business calling this — review a new call site
+    /// as a provenance decision, not a mechanical field set.
+    ///
+    /// (Rust cannot seal this across crates — `hyprstream-pds` is a *dependent* of
+    /// `hyprstream-rpc`, so rpc has no way to grant pds the mint while denying it
+    /// to arbitrary code. The private field + named mints convert the provenance
+    /// from "any code can write the struct literal" to "any code must go through
+    /// one review-visible chokepoint", which is the proportionate hardening; the
+    /// trust root remains "whoever injects the gate is trusted".)
+    pub fn new_gate_verified(ed25519: [u8; 32], ml_dsa_65: MlDsaVerifyingKey) -> Self {
+        Self {
+            keys: vec![VerifiedAt9pKey { ed25519, ml_dsa_65 }],
+        }
+    }
+
+    /// The GATE mint for the full verified subject key **set** (#1188).
+    ///
+    /// The projected set MUST be non-empty (the schema guarantees it) and MUST
+    /// have unique Ed25519 halves so [`Self::for_ed25519`] selection is
+    /// unambiguous — the same discipline the capsule schema enforces on
+    /// `subjectKeys`. A violation is a projection bug, not attacker input, so it
+    /// is a fail-closed `Err` rather than a silent first-wins.
+    pub fn new_gate_verified_set(keys: Vec<VerifiedAt9pKey>) -> Result<Self> {
+        if keys.is_empty() {
+            return Err(anyhow!(
+                "VerifiedAt9pKeys: capsule projected an empty subject key set (fail-closed)"
+            ));
+        }
+        for (i, a) in keys.iter().enumerate() {
+            if keys[i + 1..].iter().any(|b| b.ed25519 == a.ed25519) {
+                return Err(anyhow!(
+                    "VerifiedAt9pKeys: duplicate Ed25519 subject key in projected set — \
+                     ambiguous selection (fail-closed)"
+                ));
+            }
+        }
+        Ok(Self { keys })
+    }
+
+    /// Build a [`VerifiedAt9pKey`] for the set mint — pds-side projection helper.
+    pub fn key(ed25519: [u8; 32], ml_dsa_65: MlDsaVerifyingKey) -> VerifiedAt9pKey {
+        VerifiedAt9pKey { ed25519, ml_dsa_65 }
+    }
+
+    /// Select the verified subject key whose Ed25519 half equals `ed25519`, if
+    /// the capsule published one — the set-semantics accessor (#1188).
+    ///
+    /// A consumer holding an Ed25519 application-signer identity finds *its*
+    /// hybrid pair by identity and takes the atomically-bound ML-DSA-65 half from
+    /// the same entry. Returns `None` when no published key matches; the caller
+    /// then rejects fail-closed rather than falling back to a positional key.
+    pub fn for_ed25519(&self, ed25519: &[u8; 32]) -> Option<&VerifiedAt9pKey> {
+        self.keys.iter().find(|k| &k.ed25519 == ed25519)
+    }
+
+    /// Whether `ed25519` is one of the published, content-verified subject keys.
+    pub fn publishes_ed25519(&self, ed25519: &[u8; 32]) -> bool {
+        self.for_ed25519(ed25519).is_some()
+    }
+
+    /// All content-verified subject keys in the set (non-empty).
+    pub fn keys(&self) -> &[VerifiedAt9pKey] {
+        &self.keys
     }
 }
 
@@ -155,7 +227,9 @@ pub trait At9pCapsuleResolver: Send + Sync {
     /// (admission path). Pure over the bytes — no fetch, no I/O.
     fn verify_bytes(&self, did: &str, capsule_bytes: &[u8]) -> Result<VerifiedAt9pKeys> {
         let _ = (did, capsule_bytes);
-        Err(anyhow!("at9p capsule-byte verification is not configured (fail-closed)"))
+        Err(anyhow!(
+            "at9p capsule-byte verification is not configured (fail-closed)"
+        ))
     }
 
     /// Fetch the capsule for `did` from the untrusted locator and GATE-verify it
@@ -163,7 +237,9 @@ pub trait At9pCapsuleResolver: Send + Sync {
     /// honest implementation returns `Err`.
     fn resolve(&self, did: &str) -> Result<VerifiedAt9pKeys> {
         let _ = did;
-        Err(anyhow!("at9p capsule resolution (locator fetch) is not configured (fail-closed)"))
+        Err(anyhow!(
+            "at9p capsule resolution (locator fetch) is not configured (fail-closed)"
+        ))
     }
 }
 
@@ -176,12 +252,30 @@ pub trait At9pCapsuleResolver: Send + Sync {
 pub struct MethodDispatchResolver<P: DidDocumentProvider> {
     docs: P,
     at9p: Option<Arc<dyn At9pCapsuleResolver>>,
+    now: Arc<dyn Fn() -> i64 + Send + Sync>,
 }
 
 impl<P: DidDocumentProvider> MethodDispatchResolver<P> {
     /// Construct a resolver over a DID-document provider.
     pub fn new(docs: P) -> Self {
-        Self { docs, at9p: None }
+        Self {
+            docs,
+            at9p: None,
+            now: Arc::new(|| {
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |duration| duration.as_secs() as i64)
+            }),
+        }
+    }
+
+    /// Override the wall clock used to enforce bounded DID verification methods.
+    ///
+    /// Production uses Unix time. Tests and embedders can inject a deterministic
+    /// clock to prove overlap and retirement behavior without sleeping.
+    pub fn with_clock(mut self, now: impl Fn() -> i64 + Send + Sync + 'static) -> Self {
+        self.now = Arc::new(now);
+        self
     }
 
     /// Attach the `did:at9p` capsule resolver (D2/#894). Without it a `did:at9p`
@@ -193,8 +287,9 @@ impl<P: DidDocumentProvider> MethodDispatchResolver<P> {
 
     /// The did:web arm: resolve the document and derive key material + assurance.
     ///
-    /// - Ed25519 VM present + ML-DSA-65 VM present ⇒ `PqHybrid`.
-    /// - Ed25519 VM present, no ML-DSA-65 VM ⇒ `Classical`.
+    /// Each usable Ed25519 VM becomes a named candidate. A same-name `-pq` VM
+    /// explicitly upgrades only that candidate to `PqHybrid`; unrelated PQ VMs
+    /// are never paired by document order.
     /// - No Ed25519 VM ⇒ `Err` (fail-closed: nothing to anchor).
     ///
     /// # Assurance quality — the at9p asymmetry
@@ -205,12 +300,10 @@ impl<P: DidDocumentProvider> MethodDispatchResolver<P> {
     /// document**, not on a content-binding between the two keys. Two caveats
     /// follow, consistent with the ratified #579/D1 "did:web we operate" model:
     ///
-    /// - **Arbitrary pairing when multiple VMs exist:** the first Ed25519 VM and
-    ///   the first ML-DSA-65 VM in the document are paired. If a document carries
-    ///   several of either, which two get bound is incidental to document order,
-    ///   not cryptographic. (Operated nodes publish one of each, so this is a
-    ///   document-shape concern for third-party docs, not a live risk for nodes we
-    ///   run.)
+    /// - **Named pairing:** an Ed25519 VM `#mesh-old` may be paired only with
+    ///   the explicitly named ML-DSA-65 VM `#mesh-old-pq`. This gives each
+    ///   overlap slot an independent hybrid binding; a PQ VM with no matching
+    ///   Ed25519 VM is ignored rather than attached to an arbitrary key.
     /// - **No content binding:** the document attests both keys, but nothing in the
     ///   TLS fetch proves the Ed25519 and ML-DSA-65 keys belong to the same
     ///   principal beyond the document's own say-so. The at9p capsule proves this
@@ -221,21 +314,11 @@ impl<P: DidDocumentProvider> MethodDispatchResolver<P> {
             .document(did.as_str())
             .map_err(|e| anyhow!("did:web {did} document did not resolve: {e}"))?;
 
-        // First Ed25519 VM is the classical application-signing anchor.
-        // A did:web with no Ed25519 VM cannot be bound (the PQ trust store is
-        // keyed BY the Ed25519 identity), so fail closed.
-        let ed25519 = verification_method_ed25519_keys(&doc).into_iter().next().ok_or_else(|| {
-            anyhow!("did:web {did}: no Ed25519 verificationMethod to anchor — fail-closed")
-        })?;
-
-        // A verified ML-DSA-65 VM (`#mesh-pq`) upgrades the edge to PqHybrid; its
-        // absence is the ordinary classical case, not an error.
-        let ml_dsa_65 = verification_method_ml_dsa_65_keys(&doc).into_iter().next();
-
-        let assurance =
-            if ml_dsa_65.is_some() { Assurance::PqHybrid } else { Assurance::Classical };
-
-        Ok(IdentityKeys { ed25519: Some(ed25519), ml_dsa_65, assurance })
+        let candidates = did_web_key_candidates(&doc, (self.now)());
+        if candidates.is_empty() {
+            anyhow::bail!("did:web {did}: no Ed25519 verificationMethod to anchor — fail-closed");
+        }
+        Ok(IdentityKeys::new(candidates))
     }
 
     /// The did:key arm: a single self-certifying Ed25519 key, no fetch.
@@ -245,11 +328,7 @@ impl<P: DidDocumentProvider> MethodDispatchResolver<P> {
     fn resolve_did_key(&self, did: &Did) -> Result<IdentityKeys> {
         let ed25519 = did_key_to_ed25519(did.as_str())
             .map_err(|e| anyhow!("did:key {did} is not a valid Ed25519 identity: {e}"))?;
-        Ok(IdentityKeys {
-            ed25519: Some(ed25519),
-            ml_dsa_65: None,
-            assurance: Assurance::Classical,
-        })
+        Ok(IdentityKeys::single_ed25519(did.as_str(), ed25519))
     }
 
     /// The did:at9p arm (#894, D2): GATE-verify the capsule and derive `PqHybrid`.
@@ -260,6 +339,12 @@ impl<P: DidDocumentProvider> MethodDispatchResolver<P> {
     /// content-verified material, so the honest assurance ceiling is `PqHybrid`
     /// (the classical→hybrid trust upgrade). Any GATE failure, and a missing
     /// capsule resolver, fail closed.
+    ///
+    /// # Set semantics (#1188 / #1183)
+    ///
+    /// The capsule publishes a *set* of subject keys so overlap rotation and
+    /// PQ-hybrid rollout work. Every content-verified pair becomes a candidate;
+    /// callers select by the admitted Ed25519 signer, never by capsule position.
     fn resolve_did_at9p(&self, did: &Did) -> Result<IdentityKeys> {
         let at9p = self.at9p.as_ref().ok_or_else(|| {
             anyhow!("did:at9p {did}: no capsule resolver configured — fail-closed")
@@ -267,12 +352,103 @@ impl<P: DidDocumentProvider> MethodDispatchResolver<P> {
         let verified = at9p
             .resolve(did.as_str())
             .map_err(|e| anyhow!("did:at9p {did}: capsule GATE failed: {e}"))?;
-        Ok(IdentityKeys {
-            ed25519: Some(*verified.ed25519()),
-            ml_dsa_65: Some(verified.ml_dsa_65().clone()),
-            assurance: Assurance::PqHybrid,
-        })
+        Ok(IdentityKeys::new(
+            verified
+                .keys()
+                .iter()
+                .map(|key| IdentityKeyCandidate {
+                    id: format!(
+                        "{}#subject-{}",
+                        did.as_str(),
+                        bs58::encode(key.ed25519()).into_string()
+                    ),
+                    ed25519: *key.ed25519(),
+                    ml_dsa_65: Some(key.ml_dsa_65().clone()),
+                })
+                .collect(),
+        ))
     }
+}
+
+/// Decode the named DID verification-method set into compatible candidates.
+///
+/// DID VM ids are the selector. An Ed25519 VM `id` is upgraded only by an
+/// ML-DSA-65 VM whose id is `"{id}-pq"`; this is the mesh's stable, explicit
+/// hybrid binding convention (`#mesh` ↔ `#mesh-pq`). The function deliberately
+/// does not expose a positional selection API: callers receive every usable
+/// candidate and choose using a verified signer or another protocol selector.
+fn did_web_key_candidates(doc: &Value, now: i64) -> Vec<IdentityKeyCandidate> {
+    let Some(vms) = doc.get("verificationMethod").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+
+    let mut ed25519 = Vec::new();
+    let mut ml_dsa_65 = std::collections::HashMap::new();
+    for vm in vms {
+        let (Some(id), Some(multibase)) = (
+            vm.get("id").and_then(Value::as_str),
+            vm.get("publicKeyMultibase").and_then(Value::as_str),
+        ) else {
+            continue;
+        };
+        if !verification_method_is_live(vm, now) {
+            continue;
+        }
+        if let Ok(key) = decode_ed25519_multikey(multibase) {
+            ed25519.push((id.to_owned(), key));
+            continue;
+        }
+        let Ok(raw) = decode_multikey(multibase, &MULTICODEC_ML_DSA_65_PUB) else {
+            continue;
+        };
+        match ml_dsa_vk_from_bytes(&raw) {
+            Ok(key) => {
+                ml_dsa_65.insert(id.to_owned(), key);
+            }
+            Err(error) => {
+                tracing::debug!(%error, verification_method = %id, "skipping invalid ML-DSA-65 DID verification method");
+            }
+        }
+    }
+
+    let legacy_pq_id = doc
+        .get("id")
+        .and_then(Value::as_str)
+        .map(|did| format!("{did}#mesh-pq"));
+    let legacy_singleton = ed25519.len() == 1 && ed25519[0].0.ends_with("#key-1");
+
+    ed25519
+        .into_iter()
+        .map(|(id, ed25519)| {
+            let pq_id = format!("{id}-pq");
+            let explicit = ml_dsa_65.remove(&pq_id);
+            // Rolling-upgrade bridge for the previously published singleton
+            // `#key-1` + `#mesh-pq` document. It is deliberately restricted to
+            // that exact one-Ed25519 legacy shape so an unrelated PQ method can
+            // never be attached in a multi-candidate document.
+            let legacy = legacy_singleton
+                .then_some(legacy_pq_id.as_ref())
+                .flatten()
+                .and_then(|legacy_id| ml_dsa_65.remove(legacy_id));
+            IdentityKeyCandidate {
+                id,
+                ed25519,
+                ml_dsa_65: explicit.or(legacy),
+            }
+        })
+        .collect()
+}
+
+fn verification_method_is_live(vm: &Value, now: i64) -> bool {
+    let not_before = match vm.get("nbf") {
+        None => true,
+        Some(value) => value.as_i64().is_some_and(|nbf| now >= nbf),
+    };
+    let not_expired = match vm.get("exp") {
+        None => true,
+        Some(value) => value.as_i64().is_some_and(|exp| now < exp),
+    };
+    not_before && not_expired
 }
 
 impl<P: DidDocumentProvider> IdentityResolver for MethodDispatchResolver<P> {
@@ -285,7 +461,9 @@ impl<P: DidDocumentProvider> IdentityResolver for MethodDispatchResolver<P> {
             self.resolve_did_at9p(did)
         } else {
             // Unknown DID method — fail closed (never a default-Unverified Ok).
-            Err(anyhow!("unsupported DID method for {did}: no resolver arm — fail-closed"))
+            Err(anyhow!(
+                "unsupported DID method for {did}: no resolver arm — fail-closed"
+            ))
         }
     }
 }
@@ -294,8 +472,9 @@ impl<P: DidDocumentProvider> IdentityResolver for MethodDispatchResolver<P> {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-    use crate::crypto::pq::{ml_dsa_sk_to_vk_bytes, ml_dsa_generate_keypair, ml_dsa_vk_bytes};
-    use crate::did_key::{ed25519_to_did_key, MULTICODEC_ED25519_PUB, MULTICODEC_ML_DSA_65_PUB};
+    use crate::auth::mac::Assurance;
+    use crate::crypto::pq::{ml_dsa_generate_keypair, ml_dsa_sk_to_vk_bytes, ml_dsa_vk_bytes};
+    use crate::did_key::{MULTICODEC_ED25519_PUB, MULTICODEC_ML_DSA_65_PUB, ed25519_to_did_key};
     use ed25519_dalek::SigningKey;
     use rand::rngs::OsRng;
     use serde_json::json;
@@ -314,20 +493,70 @@ mod tests {
     /// A DID document with an Ed25519 `#mesh` VM and, optionally, an ML-DSA-65
     /// `#mesh-pq` VM.
     fn did_doc(ed: &[u8; 32], ml_dsa_vk_bytes: Option<&[u8]>) -> Value {
-        let mut vms = vec![json!({
-            "id": "did:web:peer.example#mesh",
-            "type": "Multikey",
-            "controller": "did:web:peer.example",
-            "publicKeyMultibase": encode_multikey(ed, MULTICODEC_ED25519_PUB),
-        })];
-        if let Some(pq) = ml_dsa_vk_bytes {
+        did_doc_with_named_vms(&[("mesh", ed)], ml_dsa_vk_bytes.map(|pq| ("mesh-pq", pq)))
+    }
+
+    fn did_doc_with_named_vms(
+        ed25519: &[(&str, &[u8; 32])],
+        ml_dsa_65: Option<(&str, &[u8])>,
+    ) -> Value {
+        let mut vms = Vec::with_capacity(ed25519.len() + usize::from(ml_dsa_65.is_some()));
+        for (name, key) in ed25519 {
             vms.push(json!({
-                "id": "did:web:peer.example#mesh-pq",
+                "id": format!("{DID_WEB}#{name}"),
                 "type": "Multikey",
-                "controller": "did:web:peer.example",
-                "publicKeyMultibase": encode_multikey(pq, MULTICODEC_ML_DSA_65_PUB),
+                "controller": DID_WEB,
+                "publicKeyMultibase": encode_multikey(*key, MULTICODEC_ED25519_PUB),
             }));
         }
+        if let Some((name, key)) = ml_dsa_65 {
+            vms.push(json!({
+                "id": format!("{DID_WEB}#{name}"),
+                "type": "Multikey",
+                "controller": DID_WEB,
+                "publicKeyMultibase": encode_multikey(key, MULTICODEC_ML_DSA_65_PUB),
+            }));
+        }
+        json!({
+            "@context": ["https://www.w3.org/ns/did/v1"],
+            "id": DID_WEB,
+            "verificationMethod": vms,
+            "service": [],
+        })
+    }
+
+    fn did_doc_with_two_hybrid_pairs(
+        old_ed: &[u8; 32],
+        old_pq: &[u8],
+        new_ed: &[u8; 32],
+        new_pq: &[u8],
+    ) -> Value {
+        let vms = vec![
+            json!({
+                "id": "did:web:peer.example#mesh-old",
+                "type": "Multikey",
+                "controller": "did:web:peer.example",
+                "publicKeyMultibase": encode_multikey(old_ed, MULTICODEC_ED25519_PUB),
+            }),
+            json!({
+                "id": "did:web:peer.example#mesh-old-pq",
+                "type": "Multikey",
+                "controller": "did:web:peer.example",
+                "publicKeyMultibase": encode_multikey(old_pq, MULTICODEC_ML_DSA_65_PUB),
+            }),
+            json!({
+                "id": "did:web:peer.example#mesh-new",
+                "type": "Multikey",
+                "controller": "did:web:peer.example",
+                "publicKeyMultibase": encode_multikey(new_ed, MULTICODEC_ED25519_PUB),
+            }),
+            json!({
+                "id": "did:web:peer.example#mesh-new-pq",
+                    "type": "Multikey",
+                    "controller": "did:web:peer.example",
+                "publicKeyMultibase": encode_multikey(new_pq, MULTICODEC_ML_DSA_65_PUB),
+            }),
+        ];
         json!({
             "@context": ["https://www.w3.org/ns/did/v1"],
             "id": "did:web:peer.example",
@@ -341,6 +570,23 @@ mod tests {
     impl DidDocumentProvider for FixtureDocs {
         fn document(&self, _did: &str) -> Result<Value> {
             Ok(self.0.clone())
+        }
+    }
+
+    #[derive(Clone)]
+    struct RotatingDocs(std::sync::Arc<parking_lot::Mutex<Value>>);
+    impl RotatingDocs {
+        fn new(document: Value) -> Self {
+            Self(std::sync::Arc::new(parking_lot::Mutex::new(document)))
+        }
+
+        fn publish(&self, document: Value) {
+            *self.0.lock() = document;
+        }
+    }
+    impl DidDocumentProvider for RotatingDocs {
+        fn document(&self, _did: &str) -> Result<Value> {
+            Ok(self.0.lock().clone())
         }
     }
 
@@ -369,9 +615,11 @@ mod tests {
         let keys = resolver
             .resolve_identity_keys(&Did::new(DID_WEB.to_owned()))
             .expect("ed25519-only did:web resolves");
-        assert_eq!(keys.assurance, Assurance::Classical);
-        assert_eq!(keys.ed25519, Some(ed));
-        assert!(keys.ml_dsa_65.is_none());
+        let candidate = keys
+            .candidate_for_ed25519(&ed)
+            .expect("published candidate");
+        assert_eq!(candidate.assurance(), Assurance::Classical);
+        assert!(candidate.ml_dsa_65.is_none());
     }
 
     #[test]
@@ -383,11 +631,82 @@ mod tests {
         let keys = resolver
             .resolve_identity_keys(&Did::new(DID_WEB.to_owned()))
             .expect("hybrid did:web resolves");
-        assert_eq!(keys.assurance, Assurance::PqHybrid);
-        assert_eq!(keys.ed25519, Some(ed));
+        let candidate = keys
+            .candidate_for_ed25519(&ed)
+            .expect("published candidate");
+        assert_eq!(candidate.assurance(), Assurance::PqHybrid);
         // The resolved PQ key is exactly the published one.
-        let resolved = keys.ml_dsa_65.expect("PQ anchor present");
-        assert_eq!(ml_dsa_vk_bytes(&resolved), pq_bytes);
+        let resolved = candidate.ml_dsa_65.as_ref().expect("PQ anchor present");
+        assert_eq!(ml_dsa_vk_bytes(resolved), pq_bytes);
+    }
+
+    #[test]
+    fn legacy_key_1_mesh_pq_document_remains_hybrid_during_upgrade() {
+        let ed = rand_ed25519();
+        let (_, pq) = ml_dsa_generate_keypair();
+        let pq = ml_dsa_vk_bytes(&pq);
+        let doc = did_doc_with_named_vms(&[("key-1", &ed)], Some(("mesh-pq", &pq)));
+        let keys = MethodDispatchResolver::new(FixtureDocs(doc))
+            .resolve_identity_keys(&Did::new(DID_WEB.to_owned()))
+            .expect("legacy singleton resolves");
+        let candidate = keys
+            .candidate_for_ed25519(&ed)
+            .expect("legacy signer candidate");
+        assert_eq!(candidate.assurance(), Assurance::PqHybrid);
+        assert_eq!(ml_dsa_vk_bytes(candidate.ml_dsa_65.as_ref().unwrap()), pq);
+    }
+
+    #[test]
+    fn authentication_relationship_is_not_a_second_inconsistent_authority_parser() {
+        let ed = rand_ed25519();
+        let mut doc = did_doc(&ed, None);
+        // Admission and identity resolution both consume verificationMethod.
+        // A malformed, relative, or embedded relationship cannot disable or
+        // tighten a separate enrollment-only filter because no such filter is
+        // applied here.
+        for authentication in [
+            json!("bad"),
+            json!({}),
+            json!(["#mesh"]),
+            json!([{
+                "id": format!("{DID_WEB}#mesh"),
+                "type": "Multikey",
+                "controller": DID_WEB,
+                "publicKeyMultibase": encode_multikey(&ed, MULTICODEC_ED25519_PUB),
+            }]),
+        ] {
+            doc["authentication"] = authentication;
+            let keys = MethodDispatchResolver::new(FixtureDocs(doc.clone()))
+                .resolve_identity_keys(&Did::new(DID_WEB.to_owned()))
+                .expect("verificationMethod remains authoritative");
+            assert!(keys.candidate_for_ed25519(&ed).is_some());
+        }
+    }
+
+    #[test]
+    fn bounded_verification_methods_follow_the_injected_clock() {
+        let old = rand_ed25519();
+        let new = rand_ed25519();
+        let mut doc = did_doc_with_named_vms(&[("mesh-old", &old), ("mesh-new", &new)], None);
+        let vms = doc["verificationMethod"].as_array_mut().unwrap();
+        vms[0]["nbf"] = json!(100);
+        vms[0]["exp"] = json!(200);
+        vms[1]["nbf"] = json!(150);
+        vms[1]["exp"] = json!(300);
+
+        let now = Arc::new(std::sync::atomic::AtomicI64::new(175));
+        let clock = Arc::clone(&now);
+        let resolver = MethodDispatchResolver::new(FixtureDocs(doc))
+            .with_clock(move || clock.load(std::sync::atomic::Ordering::SeqCst));
+        let did = Did::new(DID_WEB.to_owned());
+        let overlap = resolver.resolve_identity_keys(&did).unwrap();
+        assert!(overlap.candidate_for_ed25519(&old).is_some());
+        assert!(overlap.candidate_for_ed25519(&new).is_some());
+
+        now.store(200, std::sync::atomic::Ordering::SeqCst);
+        let retired = resolver.resolve_identity_keys(&did).unwrap();
+        assert!(retired.candidate_for_ed25519(&old).is_none());
+        assert!(retired.candidate_for_ed25519(&new).is_some());
     }
 
     #[test]
@@ -402,8 +721,74 @@ mod tests {
         let keys = resolver
             .resolve_identity_keys(&Did::new(DID_WEB.to_owned()))
             .expect("hybrid did:web resolves");
-        assert_eq!(keys.assurance, Assurance::PqHybrid);
-        assert_eq!(ml_dsa_vk_bytes(&keys.ml_dsa_65.unwrap()), pq_bytes);
+        let candidate = keys
+            .candidate_for_ed25519(&ed)
+            .expect("published candidate");
+        assert_eq!(candidate.assurance(), Assurance::PqHybrid);
+        assert_eq!(
+            ml_dsa_vk_bytes(candidate.ml_dsa_65.as_ref().unwrap()),
+            pq_bytes
+        );
+    }
+
+    #[test]
+    fn did_web_classical_overlap_accepts_both_then_rejects_retired_key_after_drain_window() {
+        let old = rand_ed25519();
+        let new = rand_ed25519();
+        let docs = RotatingDocs::new(did_doc_with_named_vms(
+            &[("mesh-old", &old), ("mesh-new", &new)],
+            None,
+        ));
+        let resolver = MethodDispatchResolver::new(docs.clone());
+
+        let overlap = resolver
+            .resolve_identity_keys(&Did::new(DID_WEB.to_owned()))
+            .expect("overlap document resolves");
+        assert_eq!(overlap.len(), 2);
+        assert_eq!(
+            overlap.candidate_for_ed25519(&old).unwrap().id,
+            format!("{DID_WEB}#mesh-old")
+        );
+        assert_eq!(
+            overlap.candidate_for_ed25519(&new).unwrap().id,
+            format!("{DID_WEB}#mesh-new")
+        );
+
+        // The old VM remains usable for the bounded drain window, then the
+        // publisher removes it. A fresh resolution must no longer accept it.
+        docs.publish(did_doc_with_named_vms(&[("mesh-new", &new)], None));
+        let after_drain = resolver
+            .resolve_identity_keys(&Did::new(DID_WEB.to_owned()))
+            .expect("post-drain document resolves");
+        assert!(after_drain.candidate_for_ed25519(&old).is_none());
+        assert!(after_drain.candidate_for_ed25519(&new).is_some());
+    }
+
+    #[test]
+    fn did_web_two_hybrid_pairs_remain_independent_overlap_candidates() {
+        let old_ed = rand_ed25519();
+        let new_ed = rand_ed25519();
+        let (_, old_pq) = ml_dsa_generate_keypair();
+        let (_, new_pq) = ml_dsa_generate_keypair();
+        let old_pq = ml_dsa_vk_bytes(&old_pq);
+        let new_pq = ml_dsa_vk_bytes(&new_pq);
+        let resolver = MethodDispatchResolver::new(FixtureDocs(did_doc_with_two_hybrid_pairs(
+            &old_ed, &old_pq, &new_ed, &new_pq,
+        )));
+
+        let keys = resolver
+            .resolve_identity_keys(&Did::new(DID_WEB.to_owned()))
+            .expect("hybrid overlap document resolves");
+        let old = keys
+            .candidate_for_ed25519(&old_ed)
+            .expect("old hybrid candidate");
+        let new = keys
+            .candidate_for_ed25519(&new_ed)
+            .expect("new hybrid candidate");
+        assert_eq!(old.assurance(), Assurance::PqHybrid);
+        assert_eq!(new.assurance(), Assurance::PqHybrid);
+        assert_eq!(ml_dsa_vk_bytes(old.ml_dsa_65.as_ref().unwrap()), old_pq);
+        assert_eq!(ml_dsa_vk_bytes(new.ml_dsa_65.as_ref().unwrap()), new_pq);
     }
 
     #[test]
@@ -418,20 +803,32 @@ mod tests {
             }],
         });
         let resolver = MethodDispatchResolver::new(FixtureDocs(doc));
-        assert!(resolver.resolve_identity_keys(&Did::new(DID_WEB.to_owned())).is_err());
+        assert!(
+            resolver
+                .resolve_identity_keys(&Did::new(DID_WEB.to_owned()))
+                .is_err()
+        );
     }
 
     #[test]
     fn did_web_empty_doc_fails_closed() {
         let doc = json!({ "id": DID_WEB, "verificationMethod": [] });
         let resolver = MethodDispatchResolver::new(FixtureDocs(doc));
-        assert!(resolver.resolve_identity_keys(&Did::new(DID_WEB.to_owned())).is_err());
+        assert!(
+            resolver
+                .resolve_identity_keys(&Did::new(DID_WEB.to_owned()))
+                .is_err()
+        );
     }
 
     #[test]
     fn did_web_fetch_failure_fails_closed() {
         let resolver = MethodDispatchResolver::new(FailingDocs);
-        assert!(resolver.resolve_identity_keys(&Did::new(DID_WEB.to_owned())).is_err());
+        assert!(
+            resolver
+                .resolve_identity_keys(&Did::new(DID_WEB.to_owned()))
+                .is_err()
+        );
     }
 
     #[test]
@@ -442,9 +839,9 @@ mod tests {
         let keys = resolver
             .resolve_identity_keys(&Did::new(did))
             .expect("did:key resolves without fetch");
-        assert_eq!(keys.assurance, Assurance::Classical);
-        assert_eq!(keys.ed25519, Some(ed));
-        assert!(keys.ml_dsa_65.is_none());
+        let candidate = keys.candidate_for_ed25519(&ed).expect("did:key candidate");
+        assert_eq!(candidate.assurance(), Assurance::Classical);
+        assert!(candidate.ml_dsa_65.is_none());
     }
 
     #[test]
@@ -509,17 +906,58 @@ mod tests {
         // A GATE-verified capsule yields PqHybrid assurance, carrying the
         // capsule's own Ed25519 + ML-DSA-65 keys (crypto-derived, not asserted).
         let keys = verified_keys();
-        let fixture = Arc::new(FixtureCapsule { keys: keys.clone(), calls: Mutex::new(vec![]), fail: false });
+        let fixture = Arc::new(FixtureCapsule {
+            keys: keys.clone(),
+            calls: Mutex::new(vec![]),
+            fail: false,
+        });
         let resolver = MethodDispatchResolver::new(NeverDocs).with_at9p(fixture.clone());
         let did = Did::new("did:at9p:cid512abcdef".to_owned());
         let resolved = resolver
             .resolve_identity_keys(&did)
             .expect("verified capsule resolves at PqHybrid");
-        assert_eq!(resolved.assurance, Assurance::PqHybrid);
-        assert_eq!(resolved.ed25519, Some(*keys.ed25519()));
-        assert_eq!(ml_dsa_vk_bytes(&resolved.ml_dsa_65.unwrap()), ml_dsa_vk_bytes(keys.ml_dsa_65()));
+        let only = &keys.keys()[0];
+        let candidate = resolved
+            .candidate_for_ed25519(only.ed25519())
+            .expect("capsule candidate");
+        assert_eq!(candidate.assurance(), Assurance::PqHybrid);
+        assert_eq!(
+            ml_dsa_vk_bytes(candidate.ml_dsa_65.as_ref().unwrap()),
+            ml_dsa_vk_bytes(only.ml_dsa_65())
+        );
         // The arm routed through the capsule resolver exactly once.
         assert_eq!(fixture.calls.lock().as_slice(), &["did:at9p:cid512abcdef"]);
+    }
+
+    #[test]
+    fn did_at9p_multi_key_capsule_preserves_the_full_candidate_set() {
+        let (_, old_pq) = ml_dsa_generate_keypair();
+        let (_, new_pq) = ml_dsa_generate_keypair();
+        let old = [10u8; 32];
+        let new = [11u8; 32];
+        let verified = VerifiedAt9pKeys::new_gate_verified_set(vec![
+            VerifiedAt9pKeys::key(old, old_pq),
+            VerifiedAt9pKeys::key(new, new_pq),
+        ])
+        .unwrap();
+        let fixture = Arc::new(FixtureCapsule {
+            keys: verified,
+            calls: Mutex::new(vec![]),
+            fail: false,
+        });
+        let resolved = MethodDispatchResolver::new(NeverDocs)
+            .with_at9p(fixture)
+            .resolve_identity_keys(&Did::new("did:at9p:cid512overlap".to_owned()))
+            .expect("verified overlap set resolves");
+        assert_eq!(resolved.len(), 2);
+        assert_eq!(
+            resolved.candidate_for_ed25519(&old).unwrap().assurance(),
+            Assurance::PqHybrid
+        );
+        assert_eq!(
+            resolved.candidate_for_ed25519(&new).unwrap().assurance(),
+            Assurance::PqHybrid
+        );
     }
 
     #[test]
@@ -547,11 +985,15 @@ mod tests {
             fail: false,
         });
         let ed = rand_ed25519();
-        let resolver = MethodDispatchResolver::new(FixtureDocs(did_doc(&ed, None))).with_at9p(fixture);
+        let resolver =
+            MethodDispatchResolver::new(FixtureDocs(did_doc(&ed, None))).with_at9p(fixture);
         let keys = resolver
             .resolve_identity_keys(&Did::new(DID_WEB.to_owned()))
             .expect("did:web resolves");
-        assert_eq!(keys.assurance, Assurance::Classical);
+        assert_eq!(
+            keys.candidate_for_ed25519(&ed).unwrap().assurance(),
+            Assurance::Classical
+        );
     }
 
     #[test]

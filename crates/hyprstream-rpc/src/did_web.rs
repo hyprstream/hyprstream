@@ -27,6 +27,7 @@
 
 use anyhow::{anyhow, bail, Result};
 use async_trait::async_trait;
+use serde::de::{self, Deserialize, Deserializer, MapAccess, SeqAccess, Visitor};
 use serde_json::Value;
 
 use crate::did_url::percent_decode;
@@ -34,6 +35,100 @@ use crate::registry::SocketKind;
 use crate::resolver::Resolver;
 use crate::service_entry::{decode_service_entry, DecodedEntry};
 use crate::transport::{EndpointType, TransportConfig};
+
+/// Parse a DID document while rejecting duplicate JSON object keys at every
+/// depth. `serde_json::Value` otherwise keeps only the last duplicate key,
+/// which makes the value ambiguous to another DID-document consumer that
+/// keeps the first one instead.
+pub(crate) fn parse_did_document_no_duplicates(body: &[u8], url: &str) -> Result<Value> {
+    serde_json::from_slice::<NoDuplicateJson>(body)
+        .map(|document| document.0)
+        .map_err(|e| anyhow!("DID document at {url} is invalid or ambiguous JSON: {e}"))
+}
+
+struct NoDuplicateJson(Value);
+
+impl<'de> Deserialize<'de> for NoDuplicateJson {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct NoDuplicateVisitor;
+
+        impl<'de> Visitor<'de> for NoDuplicateVisitor {
+            type Value = Value;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("valid JSON without duplicate object keys")
+            }
+
+            fn visit_bool<E: de::Error>(self, value: bool) -> std::result::Result<Value, E> {
+                Ok(Value::Bool(value))
+            }
+
+            fn visit_i64<E: de::Error>(self, value: i64) -> std::result::Result<Value, E> {
+                Ok(Value::Number(value.into()))
+            }
+
+            fn visit_u64<E: de::Error>(self, value: u64) -> std::result::Result<Value, E> {
+                Ok(Value::Number(value.into()))
+            }
+
+            fn visit_f64<E: de::Error>(self, value: f64) -> std::result::Result<Value, E> {
+                serde_json::Number::from_f64(value)
+                    .map(Value::Number)
+                    .ok_or_else(|| E::custom("JSON number is not finite"))
+            }
+
+            fn visit_str<E: de::Error>(self, value: &str) -> std::result::Result<Value, E> {
+                Ok(Value::String(value.to_owned()))
+            }
+
+            fn visit_string<E: de::Error>(self, value: String) -> std::result::Result<Value, E> {
+                Ok(Value::String(value))
+            }
+
+            fn visit_none<E: de::Error>(self) -> std::result::Result<Value, E> {
+                Ok(Value::Null)
+            }
+
+            fn visit_unit<E: de::Error>(self) -> std::result::Result<Value, E> {
+                Ok(Value::Null)
+            }
+
+            fn visit_seq<A: SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> std::result::Result<Value, A::Error> {
+                let mut values = Vec::new();
+                while let Some(value) = seq.next_element::<NoDuplicateJson>()? {
+                    values.push(value.0);
+                }
+                Ok(Value::Array(values))
+            }
+
+            fn visit_map<A: MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> std::result::Result<Value, A::Error> {
+                let mut keys = std::collections::HashSet::new();
+                let mut values = serde_json::Map::new();
+                while let Some(key) = map.next_key::<String>()? {
+                    if !keys.insert(key.clone()) {
+                        return Err(de::Error::custom(format!(
+                            "duplicate JSON object key `{key}`"
+                        )));
+                    }
+                    let value = map.next_value::<NoDuplicateJson>()?;
+                    values.insert(key, value.0);
+                }
+                Ok(Value::Object(values))
+            }
+        }
+
+        deserializer.deserialize_any(NoDuplicateVisitor).map(Self)
+    }
+}
 
 // ── did:web → URL derivation ──────────────────────────────────────────────────
 
@@ -92,7 +187,10 @@ pub fn did_web_to_url(did: &str) -> Result<String> {
         Ok(format!("https://{host}/.well-known/did.json"))
     } else {
         // Path form → document at the joined path.
-        Ok(format!("https://{host}/{}/did.json", path_segments.join("/")))
+        Ok(format!(
+            "https://{host}/{}/did.json",
+            path_segments.join("/")
+        ))
     }
 }
 
@@ -147,7 +245,10 @@ pub fn transport_entries(doc: &Value) -> Vec<DecodedEntry> {
     // (preference_rank, doc_index, decoded)
     let mut ranked: Vec<(u8, usize, DecodedEntry)> = Vec::new();
     for (idx, entry) in services.iter().enumerate() {
-        let ty = entry.get("type").and_then(Value::as_str).unwrap_or_default();
+        let ty = entry
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
         let rank = match ty {
             "IrohTransport" => 0,
             "QuicTransport" => 1,
@@ -276,7 +377,9 @@ pub fn verification_method_ed25519_keys(doc: &Value) -> Vec<[u8; 32]> {
 /// A document with no ML-DSA-65 VM yields an **empty** vec (the classical-only
 /// case): the caller treats "no PQ anchor" as `Assurance::Classical`, not an
 /// error.
-pub fn verification_method_ml_dsa_65_keys(doc: &Value) -> Vec<crate::crypto::pq::MlDsaVerifyingKey> {
+pub fn verification_method_ml_dsa_65_keys(
+    doc: &Value,
+) -> Vec<crate::crypto::pq::MlDsaVerifyingKey> {
     let Some(vms) = doc.get("verificationMethod").and_then(Value::as_array) else {
         return Vec::new();
     };
@@ -330,7 +433,11 @@ pub fn jwks_ed25519_keys(jwks: &Value) -> Vec<[u8; 32]> {
         let Some(x) = key.get("x").and_then(Value::as_str) else {
             continue;
         };
-        match URL_SAFE_NO_PAD.decode(x).ok().and_then(|raw| <[u8; 32]>::try_from(raw).ok()) {
+        match URL_SAFE_NO_PAD
+            .decode(x)
+            .ok()
+            .and_then(|raw| <[u8; 32]>::try_from(raw).ok())
+        {
             Some(k) => out.push(k),
             None => {
                 tracing::debug!("skipping JWKS OKP/Ed25519 key with malformed/wrong-length 'x'");
@@ -434,7 +541,9 @@ impl Resolver for ChainedResolver {
         match self.primary.resolve(name, kind).await {
             Ok(cfg) => Ok(cfg),
             Err(primary_err) => self.fallback.resolve(name, kind).await.map_err(|fb_err| {
-                anyhow!("resolve {name}: primary failed ({primary_err}); fallback failed ({fb_err})")
+                anyhow!(
+                    "resolve {name}: primary failed ({primary_err}); fallback failed ({fb_err})"
+                )
             }),
         }
     }
@@ -451,7 +560,9 @@ pub fn install_chained<F: DidDocFetcher + 'static>(did_web: DidWebResolver<F>) {
     let did_web: std::sync::Arc<dyn Resolver> = std::sync::Arc::new(did_web);
     match crate::resolver::try_global() {
         Some(existing) => {
-            crate::resolver::set_global(std::sync::Arc::new(ChainedResolver::new(did_web, existing)));
+            crate::resolver::set_global(std::sync::Arc::new(ChainedResolver::new(
+                did_web, existing,
+            )));
         }
         None => crate::resolver::set_global(did_web),
     }
@@ -562,8 +673,7 @@ impl DidDocFetcher for HttpDidDocFetcher {
         // Miss / expired — fetch over HTTPS (lock not held across await).
         let resp = self.http.get(url).send().await?.error_for_status()?;
         let body = read_capped(resp, MAX_DID_DOC_BYTES).await?;
-        let doc: Value = serde_json::from_slice(&body)
-            .map_err(|e| anyhow!("did:web document at {url} is not valid JSON: {e}"))?;
+        let doc = parse_did_document_no_duplicates(&body, url)?;
 
         {
             let mut cache = self.cache.lock();
@@ -644,6 +754,15 @@ mod tests {
     use crate::service_entry::{encode_iroh, encode_quic};
     use crate::transport::QuicServerAuth;
     use serde_json::json;
+
+    #[test]
+    fn parser_rejects_ambiguous_duplicate_keys() {
+        assert!(parse_did_document_no_duplicates(
+            br#"{"id":"did:web:example.com","id":"did:web:attacker.example"}"#,
+            "https://example.com/.well-known/did.json",
+        )
+        .is_err());
+    }
 
     // ── did:web → URL derivation ──────────────────────────────────────────
 
@@ -771,7 +890,10 @@ mod tests {
             matches!(entries[0].config.endpoint, EndpointType::Iroh { .. }),
             "iroh must be preferred first"
         );
-        assert!(matches!(entries[1].config.endpoint, EndpointType::Quic { .. }));
+        assert!(matches!(
+            entries[1].config.endpoint,
+            EndpointType::Quic { .. }
+        ));
         // Neither transport entry carries an application identity key.
     }
 
@@ -809,7 +931,10 @@ mod tests {
         ]);
         let entries = transport_entries(&doc);
         assert_eq!(entries.len(), 1);
-        assert!(matches!(entries[0].config.endpoint, EndpointType::Quic { .. }));
+        assert!(matches!(
+            entries[0].config.endpoint,
+            EndpointType::Quic { .. }
+        ));
     }
 
     #[test]
@@ -841,7 +966,10 @@ mod tests {
         ]);
         let entries = transport_entries(&doc);
         assert_eq!(entries.len(), 1);
-        assert!(matches!(entries[0].config.endpoint, EndpointType::Iroh { .. }));
+        assert!(matches!(
+            entries[0].config.endpoint,
+            EndpointType::Iroh { .. }
+        ));
     }
 
     #[test]
@@ -858,7 +986,10 @@ mod tests {
         ]);
         let entries = transport_entries(&doc);
         assert_eq!(entries.len(), 1);
-        assert!(matches!(entries[0].config.endpoint, EndpointType::Quic { .. }));
+        assert!(matches!(
+            entries[0].config.endpoint,
+            EndpointType::Quic { .. }
+        ));
     }
 
     #[test]
@@ -874,7 +1005,9 @@ mod tests {
         ));
         // Quic kind → the quic entry, skipping the (preferred) iroh.
         assert!(matches!(
-            preferred_transport(&doc, Some(SocketKind::Quic)).unwrap().endpoint,
+            preferred_transport(&doc, Some(SocketKind::Quic))
+                .unwrap()
+                .endpoint,
             EndpointType::Quic { .. }
         ));
         // A kind with no federated reach → None.
@@ -929,8 +1062,13 @@ mod tests {
     async fn resolver_empty_doc_errors_for_kind() {
         let doc = doc_with_services(vec![]);
         let resolver = DidWebResolver::new(FixtureFetcher { doc });
-        let res = resolver.resolve("did:web:example.com", SocketKind::Quic).await;
-        assert!(res.is_err(), "no reach → resolve() errors (resolve_all would be empty)");
+        let res = resolver
+            .resolve("did:web:example.com", SocketKind::Quic)
+            .await;
+        assert!(
+            res.is_err(),
+            "no reach → resolve() errors (resolve_all would be empty)"
+        );
     }
 
     // ── chaining ───────────────────────────────────────────────────────────
@@ -989,8 +1127,14 @@ mod tests {
     #[tokio::test]
     async fn fetcher_rejects_non_https() {
         let f = HttpDidDocFetcher::new(std::time::Duration::from_secs(1)).unwrap();
-        let err = f.fetch("http://example.com/.well-known/did.json").await.unwrap_err();
-        assert!(err.to_string().contains("https"), "must reject non-https: {err}");
+        let err = f
+            .fetch("http://example.com/.well-known/did.json")
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("https"),
+            "must reject non-https: {err}"
+        );
     }
 
     #[test]
@@ -1018,7 +1162,8 @@ mod tests {
 
     #[test]
     fn cache_is_bounded() {
-        let mut cache: std::collections::HashMap<String, CachedDoc> = std::collections::HashMap::new();
+        let mut cache: std::collections::HashMap<String, CachedDoc> =
+            std::collections::HashMap::new();
         let ttl = std::time::Duration::from_secs(3600);
         // Insert far more than the cap; eviction must keep it bounded.
         for i in 0..(MAX_CACHE_ENTRIES * 3) {
@@ -1064,7 +1209,10 @@ mod tests {
         // stable, spec-shaped fixture: the multicodec header + payload, not a
         // random key, so it pins the exact wire format we interoperate on.
         let did = ed25519_to_did_key(&[0u8; 32]);
-        assert!(did.starts_with("did:key:z6Mk"), "ed25519 did:key must start with z6Mk: {did}");
+        assert!(
+            did.starts_with("did:key:z6Mk"),
+            "ed25519 did:key must start with z6Mk: {did}"
+        );
         assert_eq!(did_key_to_ed25519(&did).unwrap(), [0u8; 32]);
     }
 

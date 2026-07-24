@@ -27,6 +27,7 @@ hyprstream-rpc-derive = { path = "../hyprstream-rpc-derive" }
 # #524 P1 — placement directory ingestion: CAR parsing + MST walk + record
 # decoding (ai.hyprstream.placement.* lexicons).
 hyprstream-pds = { path = "../hyprstream-pds" }
+hyprstream-crypto = { path = "../hyprstream-crypto" }
 
 # Async runtime
 async-trait = { workspace = true }
@@ -67,8 +68,9 @@ rocksdb = "0.23"
 p256 = { workspace = true }
 rand = { workspace = true }
 tokio = { workspace = true }
-# #893 (at9p D1) — mint real hybrid-signed capsules for the resolver tests.
-hyprstream-crypto = { path = "../hyprstream-crypto" }
+# Enable hyprstream-rpc's classical-policy test helpers (e.g. `SignedEnvelope::new_signed`,
+# `CryptoPolicy::Classical`) consumed by the discovery service announcement tests.
+hyprstream-rpc = { path = "../hyprstream-rpc", features = ["test-classical-policy"] }
 # K4c (#787) — property tests for the placement→PodSpec map's no-widening invariant.
 proptest = { workspace = true }
 serde_yaml = { workspace = true }

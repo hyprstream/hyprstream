@@ -70,10 +70,20 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use hyprstream_9p::{AccessDecider, Action};
+use hyprstream_rpc::auth::mac::{ObjectRef, SecurityContext};
 use hyprstream_workers::runtime::{KataBackend, PodSandbox, PodSandboxConfig, SandboxBackend};
 use hyprstream_workers::{HypervisorType, ImageConfig, PoolConfig, RafsStore};
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+struct FixtureAccessDecider;
+
+impl AccessDecider for FixtureAccessDecider {
+    fn check(&self, _ctx: &SecurityContext, _object: ObjectRef<'_>, _action: Action) -> bool {
+        true
+    }
+}
 
 /// Resolved preflight inputs for a real spawn.
 struct Preflight {
@@ -241,7 +251,11 @@ async fn kata_spawn_e2e() -> TestResult {
     // Boot the microVM via the real backend path.
     // ─────────────────────────────────────────────────────────────────────
     let pool_config = pool_config_for(&pre, runtime_dir.clone());
-    let backend = KataBackend::new(image_config, Arc::clone(&rafs_store));
+    let backend = KataBackend::new(
+        image_config,
+        Arc::clone(&rafs_store),
+        Arc::new(FixtureAccessDecider),
+    );
 
     assert!(
         backend.is_available(),

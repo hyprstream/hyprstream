@@ -179,26 +179,27 @@ fn verify_record(
     Ok(())
 }
 
-/// Sign a capsule body with its primary subject key, producing a fully-signed
-/// [`Capsule`]. Self-certifying: the signing keys MUST match
-/// `body.subject_keys[0]`.
+/// Sign a capsule body with one of its subject keys, producing a fully-signed
+/// [`Capsule`]. Self-certifying: the signing keys MUST match **some** published
+/// `body.subject_keys` entry (an atomic Ed25519↔ML-DSA-65 pair), not a
+/// positional "primary" — `subjectKeys` is a set (#1188 / #1183).
 pub fn sign_capsule(
     body: CapsuleBody,
     ed_sk: &SigningKey,
     pq_sk: &MlDsaSigningKey,
 ) -> Result<Capsule> {
     body.validate()?;
-    let primary = body
-        .subject_keys
-        .first()
-        .ok_or_else(|| anyhow::anyhow!("capsule has no subject keys"))?;
+    // Select the subject key the signer claims to be by its Ed25519 identity,
+    // then require the ML-DSA-65 half to match the SAME entry — the atomic hybrid
+    // binding. This admits any published key as the self-cert signer while
+    // forbidding a mismatched cross-pair.
+    let signer_ed = ed_sk.verifying_key().to_bytes();
+    let entry = body.subject_key_for_ed25519(&signer_ed).ok_or_else(|| {
+        anyhow::anyhow!("signing ed25519 key is not a published capsule subject key")
+    })?;
     ensure!(
-        primary.ed25519_pub == ed_sk.verifying_key().to_bytes(),
-        "signing ed25519 key does not match the capsule primary subject key"
-    );
-    ensure!(
-        primary.mldsa65_pub == ml_dsa_sk_to_vk_bytes(pq_sk),
-        "signing ML-DSA-65 key does not match the capsule primary subject key"
+        entry.mldsa65_pub == ml_dsa_sk_to_vk_bytes(pq_sk),
+        "signing ML-DSA-65 key does not match the atomically-bound subject key"
     );
 
     let payload = body.to_dag_cbor()?;
@@ -207,23 +208,39 @@ pub fn sign_capsule(
 }
 
 /// Verify a genesis/self-certifying [`Capsule`]: the composite signature must
-/// verify (pinned Hybrid) against the capsule's own primary subject key.
+/// verify (pinned Hybrid) against **some** published subject key.
+///
+/// `subjectKeys` is a published set (#1188 / #1183), so which member signed the
+/// self-certifying capsule is not positional. Try each published subject key and
+/// accept the capsule iff its composite signature verifies under one of them —
+/// the "try each candidate" rule for a set with no wire-level selector. A capsule
+/// signed by a key it does not publish, or signed by none, fails closed.
 pub fn verify_capsule(capsule: &Capsule) -> Result<()> {
     capsule.body.validate()?;
-    let primary = capsule
-        .body
-        .subject_keys
-        .first()
-        .ok_or_else(|| anyhow::anyhow!("capsule has no subject keys"))?;
-    let (ed_vk, pq_vk) = verifying_keys(primary)?;
     let payload = capsule.body.to_dag_cbor()?;
-    verify_record(
-        &payload,
-        &capsule.signatures,
-        CAPSULE_SIGNATURE_CONTEXT,
-        &ed_vk,
-        &pq_vk,
-    )
+    let mut last_err = None;
+    for subject in &capsule.body.subject_keys {
+        let (ed_vk, pq_vk) = match verifying_keys(subject) {
+            Ok(keys) => keys,
+            Err(e) => {
+                last_err = Some(e);
+                continue;
+            }
+        };
+        match verify_record(
+            &payload,
+            &capsule.signatures,
+            CAPSULE_SIGNATURE_CONTEXT,
+            &ed_vk,
+            &pq_vk,
+        ) {
+            Ok(()) => return Ok(()),
+            Err(e) => last_err = Some(e),
+        }
+    }
+    Err(last_err.unwrap_or_else(|| {
+        anyhow::anyhow!("capsule self-signature verified under no published subject key")
+    }))
 }
 
 /// Sign an update-record's content with the authorizing hybrid keypair,
@@ -504,5 +521,75 @@ mod tests {
             "ML-DSA-65 signature must be a real signature, not a placeholder"
         );
         verify_capsule(&capsule).unwrap();
+    }
+
+    // ── #1188 / #1183: subjectKeys is a published SET. A self-certifying capsule
+    //    may be signed by ANY published subject key, not positionally the first.
+    //    These FAIL against the pre-fix `subject_keys.first()` signer rule. ─────
+
+    fn two_key_body(first: &Signer, second: &Signer) -> CapsuleBody {
+        let endpoint = ServiceEndpoint::new(Transport::Iroh, "iroh://node0").unwrap();
+        let service = ServiceEntry::new("#ns", ServiceType::NinePExport, endpoint).unwrap();
+        CapsuleBody::new(
+            vec![first.keypair.clone(), second.keypair.clone()],
+            vec![service],
+        )
+        .unwrap()
+    }
+
+    /// Overlap/hybrid: a capsule publishes two subject keys and is signed by the
+    /// SECOND one. `sign_capsule` must accept any published key as the self-cert
+    /// signer, and `verify_capsule` must accept by trying each. The pre-fix code
+    /// required the signer to equal `subject_keys[0]`, so signing failed outright.
+    #[test]
+    fn capsule_signed_by_non_first_subject_key_verifies() {
+        let (k1, k2) = (signer(), signer());
+        let body = two_key_body(&k1, &k2);
+        // Sign with the SECOND published key.
+        let capsule = sign_capsule(body, &k2.ed_sk, &k2.pq_sk)
+            .expect("any published subject key may self-certify the capsule");
+        verify_capsule(&capsule).expect("capsule signed by a published key must verify");
+        // Round-trips through canonical bytes.
+        let decoded = Capsule::from_dag_cbor(&capsule.to_dag_cbor().unwrap()).unwrap();
+        verify_capsule(&decoded).expect("decoded two-key capsule must verify");
+    }
+
+    /// A capsule signed by a key it does NOT publish is rejected — set semantics
+    /// widens *which published key* may sign, never admits an unpublished one.
+    #[test]
+    fn capsule_signed_by_unpublished_key_rejected() {
+        let (k1, k2, outsider) = (signer(), signer(), signer());
+        let body = two_key_body(&k1, &k2);
+        // The body legitimately publishes k1,k2; forge a signature by `outsider`
+        // over the same bytes, then splice it in so schema still passes.
+        let capsule = sign_capsule(body.clone(), &k1.ed_sk, &k1.pq_sk).unwrap();
+        let payload = capsule.body.to_dag_cbor().unwrap();
+        let forged = sign_record(
+            &payload,
+            CAPSULE_SIGNATURE_CONTEXT,
+            &outsider.ed_sk,
+            &outsider.pq_sk,
+        )
+        .unwrap();
+        let spliced = Capsule::new(capsule.body, forged).unwrap();
+        assert!(
+            verify_capsule(&spliced).is_err(),
+            "a capsule signed by an unpublished key must fail closed"
+        );
+    }
+
+    /// The schema rejects an ambiguous subject key SET: a repeated Ed25519 half
+    /// across pairs would make application-signer selection ambiguous (#1188).
+    #[test]
+    fn duplicate_ed25519_subject_key_rejected() {
+        let k = signer();
+        let endpoint = ServiceEndpoint::new(Transport::Iroh, "iroh://node0").unwrap();
+        let service = ServiceEntry::new("#ns", ServiceType::NinePExport, endpoint).unwrap();
+        let err = CapsuleBody::new(vec![k.keypair.clone(), k.keypair.clone()], vec![service])
+            .expect_err("a duplicate subject key must be rejected");
+        assert!(
+            err.to_string().contains("subjectKeys") || err.to_string().contains("subject"),
+            "unexpected error: {err}"
+        );
     }
 }

@@ -84,14 +84,17 @@ impl NativeServiceAnnouncement {
                 .any(|entry| entry.id == format!("#{service_name}")),
             "accepted state does not authorize service {service_name}"
         );
-        let current = state
-            .current
-            .subject_keys
-            .first()
-            .ok_or_else(|| anyhow::anyhow!("accepted state has no current response key"))?;
+        // `subjectKeys` is a published set (#1188 / #1183): the local service
+        // signer must be *one of* the accepted current response keys, not
+        // positionally `first()`. An overlap-rotating identity publishes several
+        // usable keys at once; a service holding any of them is authorized.
         anyhow::ensure!(
-            current.ed25519_pub.as_slice() == signer.verifying_key().as_bytes(),
-            "service signer is not the accepted current response key"
+            state
+                .current
+                .subject_keys
+                .iter()
+                .any(|key| key.ed25519_pub.as_slice() == signer.verifying_key().as_bytes()),
+            "service signer is not one of the accepted current response keys"
         );
         let expires_at = state.expires_at.as_deref().ok_or_else(|| {
             anyhow::anyhow!("genesis-only accepted state has no bounded production expiry")
@@ -1017,6 +1020,83 @@ mod tests {
         assert!(announcement
             .validate("model", &signer.verifying_key())
             .is_err());
+    }
+
+    /// #1188 / #1183: a native service announcement projects from an accepted
+    /// state whose capsule publishes a SET of subject keys. The local service
+    /// signer must be admitted when it is ANY published subject key, not only
+    /// position 0 — an overlap-rotating identity publishes several usable keys at
+    /// once. The pre-fix code compared only `subject_keys.first()`, so a service
+    /// holding the second published key failed startup.
+    #[test]
+    fn native_announcement_admits_non_first_published_service_key() {
+        use ed25519_dalek::SigningKey as EdSigningKey;
+        use hyprstream_pds::at9p::{
+            CapsuleBody, HybridKeyPair, ServiceEndpoint, ServiceEntry, ServiceType, Transport,
+        };
+        use hyprstream_pds::at9p_duplicity::AcceptedAt9pState;
+        use hyprstream_pds::at9p_gate::verify_genesis_capsule;
+        use hyprstream_pds::at9p_sign::sign_capsule;
+        use hyprstream_rpc::crypto::pq::ml_dsa_sk_to_vk_bytes;
+
+        // Two service signers; k1 self-certifies, k2 is also published.
+        let k1 = EdSigningKey::from_bytes(&[0x61; 32]);
+        let k2 = EdSigningKey::from_bytes(&[0x62; 32]);
+        let pq1 = hyprstream_rpc::node_identity::derive_mesh_mldsa_key(&k1);
+        let pq2 = hyprstream_rpc::node_identity::derive_mesh_mldsa_key(&k2);
+        let kp1 = HybridKeyPair::new(
+            k1.verifying_key().to_bytes().to_vec(),
+            ml_dsa_sk_to_vk_bytes(&pq1),
+        )
+        .unwrap();
+        let kp2 = HybridKeyPair::new(
+            k2.verifying_key().to_bytes().to_vec(),
+            ml_dsa_sk_to_vk_bytes(&pq2),
+        )
+        .unwrap();
+
+        let endpoint = ServiceEndpoint::new(Transport::Iroh, "iroh://reach").unwrap();
+        let service = ServiceEntry::new("#model", ServiceType::NinePExport, endpoint).unwrap();
+        // k1 FIRST, k2 second; self-certify with k1.
+        let body = CapsuleBody::new(vec![kp1, kp2], vec![service]).unwrap();
+        let genesis = sign_capsule(body, &k1, &pq1).unwrap();
+        let bytes = genesis.to_dag_cbor().unwrap();
+        let cid = genesis.cid512().unwrap();
+        let verified = verify_genesis_capsule(&cid, &bytes).unwrap();
+        let state = AcceptedAt9pState::from_verified_genesis(&verified).unwrap();
+
+        // Genesis has no bounded successor expiry; from_accepted_state requires
+        // one, so this projection is expected to reject on expiry — but it must
+        // get PAST the signer-membership check for k2 first. We assert the error
+        // is the expiry gate, NOT a "signer is not a current response key"
+        // rejection (which is what the pre-fix positional check produced for k2).
+        let signer2 = SigningKey::from_bytes(&[0x62; 32]);
+        let err = match NativeServiceAnnouncement::from_accepted_state("model", &signer2, &state) {
+            Ok(_) => panic!("genesis-only state has no bounded expiry"),
+            Err(e) => e,
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("bounded production expiry") || msg.contains("expiry"),
+            "second published key must pass the membership check and fail only on \
+             the genesis expiry gate; got: {msg}"
+        );
+        assert!(
+            !msg.contains("not one of the accepted current response keys"),
+            "the second published subject key must be accepted as a member; got: {msg}"
+        );
+
+        // And a signer that is NOT published is rejected on membership.
+        let outsider = SigningKey::from_bytes(&[0x63; 32]);
+        let err = match NativeServiceAnnouncement::from_accepted_state("model", &outsider, &state) {
+            Ok(_) => panic!("a non-member signer must be rejected"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string()
+                .contains("not one of the accepted current response keys"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

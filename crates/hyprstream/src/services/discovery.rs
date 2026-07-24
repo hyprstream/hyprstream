@@ -128,6 +128,13 @@ fn at9p_checkpoint_key(subject_cid512: &str) -> Vec<u8> {
     format!("at9p-checkpoint\0{subject_cid512}").into_bytes()
 }
 
+/// Append-only, canonical accepted heads.  Startup replays this history from
+/// the GATE-pinned genesis before it accepts a current registry credential, so
+/// CA retirement cannot create a credential-ordering cycle.
+fn at9p_history_key(subject_cid512: &str, epoch: u64) -> Vec<u8> {
+    format!("at9p-history\0{subject_cid512}\0{epoch:020}").into_bytes()
+}
+
 const AT9P_STATE_MAGIC: &[u8; 8] = b"AT9PST02";
 const AT9P_STATE_HEADER_LEN: usize = 8 + 1 + 8 + 64 + 1 + 4;
 const AT9P_ACCEPTANCE_MAGIC: &[u8; 8] = b"AT9PAC01";
@@ -193,14 +200,12 @@ enum At9pAcceptanceVerifier {
 }
 
 impl At9pAcceptanceVerifier {
-    fn verify_strict(
-        &self,
-        message: &[u8],
-        signature: &ed25519_dalek::Signature,
-    ) -> AnyResult<()> {
+    fn verify_strict(&self, message: &[u8], signature: &ed25519_dalek::Signature) -> AnyResult<()> {
         match self {
             Self::Deployment(identity) => identity.verify_strict(message, signature),
-            Self::Local(identity) => identity.verify_strict(message, signature).map_err(Into::into),
+            Self::Local(identity) => identity
+                .verify_strict(message, signature)
+                .map_err(Into::into),
         }
     }
 }
@@ -285,6 +290,19 @@ impl PdsRecordStore {
         batch.put(record_key(did, collection, tid), record.to_dag_cbor());
         batch.put(commit_key(did), commit.to_dag_cbor());
         db.write(batch).context("PDS record+commit write failed")?;
+        Ok(())
+    }
+
+    /// Write ONLY the commit block (no record) — used by the #918 head re-sign
+    /// path to replace the persisted head's signature without changing any
+    /// record data. The MST root / `rev` / `prev` are unchanged; only `sig`
+    /// is refreshed.
+    fn put_commit(&self, did: &str, commit: &Commit) -> AnyResult<()> {
+        let RecordBacking::ReadWrite(db) = &self.backing else {
+            bail!("PdsRecordStore::put_commit called on a read-only store");
+        };
+        db.put(commit_key(did), commit.to_dag_cbor())
+            .context("PDS commit-only write failed")?;
         Ok(())
     }
 
@@ -387,11 +405,7 @@ impl PdsRecordStore {
         };
         let _advance = self.at9p_advance_lock.lock();
         let local_verifier = At9pAcceptanceVerifier::Local(acceptance_identity.verifying_key());
-        let current = load_at9p_state_from_db(
-            db,
-            &state.subject_cid512,
-            &local_verifier,
-        )?;
+        let current = load_at9p_state_from_db(db, &state.subject_cid512, &local_verifier)?;
         if current.as_ref().map(AcceptedAt9pState::watermark) != expected {
             return current.map_or_else(
                 || bail!("conditional accepted-state advance expected a durable head, but none exists"),
@@ -403,6 +417,15 @@ impl PdsRecordStore {
         let mut batch = rocksdb::WriteBatch::default();
         batch.put(at9p_state_key(&state.subject_cid512), encoded);
         batch.put(at9p_checkpoint_key(&state.subject_cid512), checkpoint);
+        if state.epoch > 0 {
+            let AcceptedAt9pHead::Update(update) = state.head() else {
+                bail!("accepted at9p genesis carried a nonzero epoch")
+            };
+            batch.put(
+                at9p_history_key(&state.subject_cid512, state.epoch),
+                update.to_dag_cbor()?,
+            );
+        }
         let mut options = rocksdb::WriteOptions::default();
         options.set_sync(true);
         db.write_opt(batch, &options)
@@ -926,6 +949,54 @@ fn harden_store_dir(path: &Path) {
 /// This is the **only** holder of the `#atproto` P-256 private key: it signs
 /// the repo's commit once, here, at write time, and persists the signed bytes.
 /// The resolver never sees the key.
+struct StoreGenerationSource(Arc<crate::auth::key_rotation::Es256SigningKeyStore>);
+
+impl crate::auth::ActiveGenerationSource for StoreGenerationSource {
+    fn active_generation(&self) -> AnyResult<Option<crate::auth::ActiveGeneration>> {
+        Ok(self.0.active_slot().map(|slot| crate::auth::ActiveGeneration {
+            seq: 0,
+            kid: slot.kid(),
+            verifying_key: *slot.key.verifying_key(),
+            signing_key: slot.key.as_ref().clone(),
+            head_at_op: None,
+        }))
+    }
+}
+
+pub trait IntoPdsGenerationSource {
+    fn into_pds_generation_source(
+        self,
+    ) -> (
+        Arc<dyn crate::auth::ActiveGenerationSource>,
+        Option<Arc<crate::auth::key_rotation::Es256SigningKeyStore>>,
+    );
+}
+
+impl IntoPdsGenerationSource for p256::ecdsa::SigningKey {
+    fn into_pds_generation_source(
+        self,
+    ) -> (
+        Arc<dyn crate::auth::ActiveGenerationSource>,
+        Option<Arc<crate::auth::key_rotation::Es256SigningKeyStore>>,
+    ) {
+        (
+            Arc::new(crate::auth::FixedGenerationSource::new(self)),
+            None,
+        )
+    }
+}
+
+impl IntoPdsGenerationSource for Arc<crate::auth::key_rotation::Es256SigningKeyStore> {
+    fn into_pds_generation_source(
+        self,
+    ) -> (
+        Arc<dyn crate::auth::ActiveGenerationSource>,
+        Option<Arc<crate::auth::key_rotation::Es256SigningKeyStore>>,
+    ) {
+        (Arc::new(StoreGenerationSource(Arc::clone(&self))), Some(self))
+    }
+}
+
 pub struct PdsPublisher {
     store: Arc<PdsRecordStore>,
     at9p_state: Option<At9pStateIngest>,
@@ -933,36 +1004,64 @@ pub struct PdsPublisher {
     /// every record this node publishes (single-node, self-hosted PDS; a
     /// per-account DID scheme is out of scope for #910a).
     did: String,
-    /// This node's `#atproto` commit-signing key (P-256/ES256), sourced from
-    /// the shared `Es256SigningKeyStore` — the *same* key `did_document.rs`
-    /// publishes as the `#atproto` verification method. Held only here (the
-    /// writer); resolvers hold no key. Used to sign each commit exactly once.
-    signing_key: p256::ecdsa::SigningKey,
+    /// Source of truth for the active `#atproto` ES256 generation. Resolved
+    /// **at sign time**, not at construction (#1123/C4): under `--ipc` this
+    /// reads the sealed op-log head so a rotation performed by the OAuth
+    /// process is observed here without any event-delivery mechanism. A frozen
+    /// construction-time copy would keep signing with a retired key after a
+    /// rotation. See [`crate::auth::ActiveGenerationSource`].
+    generation_source: Arc<dyn crate::auth::ActiveGenerationSource>,
+    /// Optional process-local store used only to install the promotion hook.
+    /// Production signing still resolves the sealed generation source.
+    es256_store: Option<Arc<crate::auth::key_rotation::Es256SigningKeyStore>>,
     /// Serializes the load→rebuild→sign→persist critical section (#910b).
-    ///
-    /// A publish is a read-modify-write over the WHOLE repo (one MST, one
-    /// signed root across all collections): two concurrent publishes that both
-    /// load the same prior state would each sign a commit covering only their
-    /// own record, and whichever lands last silently drops the other's from
-    /// the signed root — the store would then fail the read-side
-    /// root-consistency check. Holding this lock across the full critical
-    /// section makes each commit cover every prior write.
     publish_lock: parking_lot::Mutex<()>,
 }
 
 impl PdsPublisher {
-    pub fn new(
+    /// Construct with a fixed signing key. Preserved for tests and simple
+    /// embedders; production wiring uses [`Self::with_generation_source`] so
+    /// the publisher observes rotations.
+    pub fn new<S: IntoPdsGenerationSource>(
         store: Arc<PdsRecordStore>,
         did: String,
-        signing_key: p256::ecdsa::SigningKey,
+        source: S,
+    ) -> Self {
+        let (generation_source, es256_store) = source.into_pds_generation_source();
+        Self {
+            store,
+            at9p_state: None,
+            did,
+            generation_source,
+            es256_store,
+            publish_lock: parking_lot::Mutex::new(()),
+        }
+    }
+
+    /// Construct with a live generation source — the production shape (#1123).
+    /// The publisher resolves the active `#atproto` key from `source` at every
+    /// sign, so it never freezes a retired key.
+    pub fn with_generation_source(
+        store: Arc<PdsRecordStore>,
+        did: String,
+        source: Arc<dyn crate::auth::ActiveGenerationSource>,
     ) -> Self {
         Self {
             store,
             at9p_state: None,
             did,
-            signing_key,
+            generation_source: source,
+            es256_store: None,
             publish_lock: parking_lot::Mutex::new(()),
         }
+    }
+
+    pub fn with_es256_store(
+        mut self,
+        store: Arc<crate::auth::key_rotation::Es256SigningKeyStore>,
+    ) -> Self {
+        self.es256_store = Some(store);
+        self
     }
 
     /// Install the daemon-owned accepted-state ingest boundary. Production
@@ -971,6 +1070,29 @@ impl PdsPublisher {
     pub fn with_at9p_state_ingest(mut self, ingest: At9pStateIngest) -> Self {
         self.at9p_state = Some(ingest);
         self
+    }
+
+    /// Connect this publisher to the shared ES256 store's in-process
+    /// lead→active transition. A weak reference avoids a publisher→store→
+    /// publisher reference cycle; if its target has been dropped, the hook
+    /// errors so rotation remains pending. Cross-`--ipc` delivery is deferred
+    /// to #1123.
+    pub fn install_es256_promotion_hook(self: &Arc<Self>) -> AnyResult<()> {
+        let publisher = Arc::downgrade(self);
+        let store = self
+            .es256_store
+            .as_ref()
+            .ok_or_else(|| anyhow!("no process-local ES256 store for promotion hook"))?;
+        store.set_promotion_hook(Arc::new(move |key| {
+            let publisher = publisher
+                .upgrade()
+                .ok_or_else(|| anyhow!("PDS publisher dropped before ES256 promotion re-sign"))?;
+            publisher.resign_head_with_key(&key).map(|_| ())
+        }));
+        // Reconcile once at installation too: if promotion happened before the
+        // registry factory installed the callback, an idle persisted head must
+        // still be brought under the current active key.
+        self.resign_head().map(|_| ())
     }
 
     pub fn ingest_at9p_genesis(
@@ -1165,10 +1287,73 @@ impl PdsPublisher {
             None => (Tid::now(), None),
         };
         let unsigned = UnsignedCommit::new(self.did.clone(), root, rev, prev);
-        let commit = Commit::sign(&unsigned, &self.signing_key);
+        // Resolve the active `#atproto` generation at sign time (#1123/C4).
+        // Under `--ipc` this reads the sealed op-log head written by the OAuth
+        // rotation task, so a rotation on the other side is observed here with
+        // no propagation mechanism. Fail-closed: if no verified generation is
+        // observable, decline to sign rather than fall back to a stale key.
+        let generation = self
+            .generation_source
+            .active_generation()
+            .context("resolving active #atproto generation")?
+            .ok_or_else(|| {
+                anyhow!(
+                    "no active #atproto generation observable; declining to sign \
+                     (sealed op-log head not present or unverifiable)"
+                )
+            })?;
+        let commit = Commit::sign(&unsigned, &generation.signing_key);
 
         self.store
             .put_record_and_commit(&self.did, collection, tid, &record, &commit)
+    }
+
+    /// #918 re-sign-on-rotation: re-sign the EXISTING persisted repo head with
+    /// the current live active `#atproto` key, leaving the MST root, `rev`, and
+    /// `prev` unchanged — only the signature is refreshed. Called from the ES256
+    /// rotation hook before a lead→active promotion becomes visible. An idle
+    /// repo (no writes since the rotation) whose head was signed by K gets
+    /// re-signed with K' before the live DID document can publish K'.
+    ///
+    /// Holds the `publish_lock` to serialize with concurrent publishes. Returns
+    /// `Ok(true)` if the head was re-signed and `Ok(false)` if there is no repo.
+    /// A missing active key is an error. NOTE(#1123): in the cross-`--ipc`
+    /// split the rotation event must reach whichever process runs the publisher;
+    /// this single-process re-sign is the in-process piece.
+    pub fn resign_head(&self) -> AnyResult<bool> {
+        let active_key = if let Some(store) = &self.es256_store {
+            store.active_key().ok_or_else(|| {
+                anyhow!("no active ES256 #atproto signing key available for head re-sign")
+            })?
+        } else {
+            Arc::new(
+                self.generation_source
+                    .active_generation()
+                    .context("resolving active #atproto generation for head re-sign")?
+                    .ok_or_else(|| anyhow!("no active #atproto generation for head re-sign"))?
+                    .signing_key,
+            )
+        };
+        self.resign_head_with_key(&active_key)
+    }
+
+    /// Re-sign the existing head with an explicit candidate key while the
+    /// rotation store's write guard keeps that key hidden from DID-document
+    /// readers. Only after this succeeds does rotation install the candidate
+    /// as live active, making publication and persisted-head re-sign one
+    /// externally atomic transition.
+    fn resign_head_with_key(&self, key: &p256::ecdsa::SigningKey) -> AnyResult<bool> {
+        let _guard = self.publish_lock.lock();
+        let Some(repo) = self.store.load_repo(&self.did)? else {
+            return Ok(false); // no repo yet — nothing to re-sign
+        };
+        // Re-sign over the same canonical unsigned bytes — only the `sig`
+        // changes. The commit CID changes because it includes `sig`; the next
+        // normal publish will link `prev` to this re-signed head's CID.
+        let unsigned = repo.commit.unsigned();
+        let re_signed = Commit::sign(&unsigned, key);
+        self.store.put_commit(&self.did, &re_signed)?;
+        Ok(true)
     }
 }
 
@@ -1216,11 +1401,35 @@ fn atproto_datetime_now() -> String {
 /// commit served in the proof is the one the writer signed at publish time.
 pub struct PdsRecordResolver {
     store: Arc<PdsRecordStore>,
+    /// The rotation store feeding the root did:web document and that document's
+    /// repo DID. Local reads resolve exactly its bounded publication authority.
+    rotation: Option<(Arc<crate::auth::key_rotation::Es256SigningKeyStore>, String)>,
 }
 
 impl PdsRecordResolver {
     pub fn new(store: Arc<PdsRecordStore>) -> Self {
-        Self { store }
+        Self {
+            store,
+            rotation: None,
+        }
+    }
+
+    /// Install the ES256 rotation store + the root did:web repo DID.
+    pub fn with_es256_rotation(
+        mut self,
+        store: Arc<crate::auth::key_rotation::Es256SigningKeyStore>,
+        node_did: String,
+    ) -> Self {
+        self.rotation = Some((store, node_did));
+        self
+    }
+
+    fn local_generation_guard(
+        &self,
+        did: &str,
+    ) -> Option<parking_lot::RwLockReadGuard<'_, crate::auth::key_rotation::Es256KeySlots>> {
+        let (store, node_did) = self.rotation.as_ref()?;
+        (did == node_did).then(|| store.0.read())
     }
 
     pub fn accepted_at9p_state(
@@ -1285,6 +1494,17 @@ impl RecordResolver for PdsRecordResolver {
             Err(_) => return Ok(None),
         };
 
+        // Pair with promotion's write guard through the complete head snapshot
+        // and proof assembly. A reader therefore sees either generation K or
+        // generation K', never the K'-signed head during the hidden transition.
+        if let Some((store, _)) = self
+            .rotation
+            .as_ref()
+            .filter(|(_, local_did)| did == local_did)
+        {
+            store.refresh_from_disk();
+        }
+        let _generation_guard = self.local_generation_guard(did);
         let Some(repo) = self.store.load_repo(did)? else {
             return Ok(None);
         };
@@ -1303,6 +1523,14 @@ impl RecordResolver for PdsRecordResolver {
     }
 
     async fn resolve_repo(&self, did: &str) -> anyhow::Result<Option<RecordCarData>> {
+        if let Some((store, _)) = self
+            .rotation
+            .as_ref()
+            .filter(|(_, local_did)| did == local_did)
+        {
+            store.refresh_from_disk();
+        }
+        let _generation_guard = self.local_generation_guard(did);
         let Some(repo) = self.store.load_repo(did)? else {
             return Ok(None);
         };
@@ -1327,6 +1555,38 @@ impl RecordResolver for PdsRecordResolver {
         let uri = format!("at://{did}/{collection}/{}", tid.encode());
         Ok(Some(RecordCarData { uri, car }))
     }
+
+    async fn resolve_verifying_keys(
+        &self,
+        did: &str,
+    ) -> anyhow::Result<Option<hyprstream_pds::commit::PublishedAtprotoKeys>> {
+        let Some((store, local_did)) = self.rotation.as_ref() else {
+            return Ok(None);
+        };
+        if did != local_did {
+            return Ok(None);
+        }
+        // `slots_snapshot` is a single rotation generation and is the exact
+        // source used by root_did_document. No absent value loosens this check:
+        // an authority without an active slot cannot be resolved.
+        let slots = store.slots_snapshot();
+        let Some(active) = slots.active else {
+            return Ok(None);
+        };
+        let drain = slots
+            .drain
+            .map(|slot| (*slot.key.verifying_key(), slot.nbf, slot.exp));
+        let lead = slots
+            .lead
+            .map(|slot| (*slot.key.verifying_key(), slot.nbf, slot.exp));
+        Ok(Some(
+            hyprstream_pds::commit::PublishedAtprotoKeys::from_published_slots(
+                *active.key.verifying_key(),
+                drain,
+                lead,
+            )?,
+        ))
+    }
 }
 
 #[cfg(test)]
@@ -1340,6 +1600,18 @@ mod pds_store_tests {
     use super::*;
     use hyprstream_pds::car::{parse_car_v1, verify_record_proof};
     use p256::ecdsa::{SigningKey, VerifyingKey};
+
+    /// Build a test `Es256SigningKeyStore` holding `sk` as the single active
+    /// slot, so `PdsPublisher::new` can resolve it at sign time (#918
+    /// re-sign-on-rotation: the publisher holds the store, not a frozen key).
+    fn test_es256_store(sk: SigningKey) -> Arc<crate::auth::key_rotation::Es256SigningKeyStore> {
+        use crate::auth::key_rotation::{Es256KeySlot, Es256KeySlots, Es256SigningKeyStore};
+        Arc::new(Es256SigningKeyStore::new(Es256KeySlots {
+            drain: None,
+            active: Some(Es256KeySlot::new(sk, 0, i64::MAX)),
+            lead: None,
+        }))
+    }
 
     /// A 40-hex-char (SHA-1-shaped) git OID for the publish path.
     const SAMPLE_OID: &str = "1111111111111111111111111111111111111111";
@@ -1366,6 +1638,93 @@ mod pds_store_tests {
             .block_on(fut)
     }
 
+    /// #1123/#1170 acceptance test at the publisher level: the publisher
+    /// resolves the active `#atproto` generation from the sealed op-log head at
+    /// **sign time**, so a rotation performed by the (separate) OAuth process
+    /// is observed here with no event delivery. A frozen construction-time key
+    /// — the pre-C4 shape — would sign the second commit with the retired K1
+    /// and this test would fail on the final assertion.
+    #[test]
+    fn publisher_resolves_live_generation_across_rotation() {
+        use crate::auth::key_rotation::{
+            persist_es256_slot, Es256KeySlot, Es256KeySlots, Es256SigningKeyStore,
+        };
+        use crate::auth::op_log::{
+            publish_head_verifying_key, seal_op_log_head, SealedHeadEs256Source,
+        };
+        use ed25519_dalek::SigningKey as Ed25519SigningKey;
+
+        let pds_dir = tempfile::tempdir().expect("pds tempdir");
+        let secrets_dir = tempfile::tempdir().expect("secrets tempdir");
+        let state_dir = tempfile::tempdir().expect("oplog state tempdir");
+        let secrets = secrets_dir.path();
+        let state = state_dir.path();
+        // Dedicated head key; the public verifying key is published to the
+        // shared state dir (the registry loads only this public key).
+        let head_sk = Ed25519SigningKey::generate(&mut rand::rngs::OsRng);
+        publish_head_verifying_key(state, &head_sk).unwrap();
+
+        // Process A (the rotator): K1 active, persisted, head sealed (async).
+        let k1 = SigningKey::random(&mut rand::rngs::OsRng);
+        let k1_vk: VerifyingKey = *k1.verifying_key();
+        let k1_slot = Es256KeySlot::new(k1, 0, 0);
+        let es256_store = Es256SigningKeyStore::new(Es256KeySlots {
+            active: Some(k1_slot.clone()),
+            drain: None,
+            lead: None,
+        });
+        persist_es256_slot(secrets, "active", &k1_slot).unwrap();
+        block_on(seal_op_log_head(state, &head_sk, &es256_store)).expect("seal");
+
+        // Process B (the registry/publisher): resolves the generation from the
+        // sealed head — the `--ipc` cross-process read path. Holds no private
+        // head material.
+        let pds_store = Arc::new(PdsRecordStore::open(pds_dir.path()).expect("open rw"));
+        let source: Arc<dyn crate::auth::ActiveGenerationSource> =
+            Arc::new(SealedHeadEs256Source::new(state, secrets));
+        let publisher = PdsPublisher::with_generation_source(
+            Arc::clone(&pds_store),
+            DID.to_owned(),
+            source,
+        );
+
+        publisher.publish("repo-a", SAMPLE_OID).expect("publish K1");
+        let commit1 = pds_store
+            .load_repo(DID)
+            .expect("load")
+            .expect("repo exists")
+            .commit;
+        assert!(commit1.verify(&k1_vk).is_ok(), "first commit signed by K1");
+
+        // Process A rotates: K1 → drain, K2 → active. Persist + re-seal.
+        let k2 = SigningKey::random(&mut rand::rngs::OsRng);
+        let k2_vk: VerifyingKey = *k2.verifying_key();
+        let k2_slot = Es256KeySlot::new(k2, 0, 0);
+        persist_es256_slot(secrets, "drain", &k1_slot).unwrap();
+        persist_es256_slot(secrets, "active", &k2_slot).unwrap();
+        es256_store.0.write().active = Some(k2_slot);
+        block_on(seal_op_log_head(state, &head_sk, &es256_store)).expect("seal");
+
+        // Same publisher instance, new commit. It MUST be signed by K2 — the
+        // publisher observed the rotation through the re-sealed head.
+        publisher.publish("repo-a", SAMPLE_OID_2).expect("publish K2");
+        let commit2 = pds_store
+            .load_repo(DID)
+            .expect("load")
+            .expect("repo exists")
+            .commit;
+        assert!(
+            commit2.verify(&k2_vk).is_ok(),
+            "post-rotation commit must be signed by K2"
+        );
+        // Negative case: the post-rotation commit MUST NOT verify under the
+        // retired pre-rotation key K1.
+        assert!(
+            commit2.verify(&k1_vk).is_err(),
+            "publisher must not sign with the retired pre-rotation key K1"
+        );
+    }
+
     #[test]
     fn keyless_read_serves_writer_signed_commit() {
         // The writer signs once; a resolver constructed with NO key returns a
@@ -1375,7 +1734,7 @@ mod pds_store_tests {
         let vk: VerifyingKey = *sk.verifying_key();
 
         let store = Arc::new(PdsRecordStore::open(dir.path()).expect("open rw"));
-        let publisher = PdsPublisher::new(Arc::clone(&store), DID.to_owned(), sk);
+        let publisher = PdsPublisher::new(Arc::clone(&store), DID.to_owned(), test_es256_store(sk));
         publisher.publish("repo-a", SAMPLE_OID).expect("publish");
 
         // Resolver holds no key at all.
@@ -1392,6 +1751,447 @@ mod pds_store_tests {
     }
 
     #[test]
+    fn publisher_signs_new_commits_with_active_not_lead_key() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let active = SigningKey::random(&mut rand::rngs::OsRng);
+        let active_vk = VerifyingKey::from(&active);
+        let lead = SigningKey::random(&mut rand::rngs::OsRng);
+        let lead_vk = VerifyingKey::from(&lead);
+        let now = chrono::Utc::now().timestamp();
+        let keys = Arc::new(crate::auth::key_rotation::Es256SigningKeyStore::new(
+            crate::auth::key_rotation::Es256KeySlots {
+                drain: None,
+                active: Some(crate::auth::key_rotation::Es256KeySlot::new(
+                    active,
+                    now - 60,
+                    now + 60,
+                )),
+                lead: Some(crate::auth::key_rotation::Es256KeySlot::new(
+                    lead,
+                    now - 30,
+                    now + 120,
+                )),
+            },
+        ));
+        let store = Arc::new(PdsRecordStore::open(dir.path()).expect("open store"));
+        let publisher = PdsPublisher::new(Arc::clone(&store), DID.to_owned(), keys);
+        publisher.publish("repo-a", SAMPLE_OID).expect("publish");
+        let repo = store.load_repo(DID).expect("load").expect("repo");
+        repo.commit
+            .verify(&active_vk)
+            .expect("new commit must use the active key");
+        assert!(
+            repo.commit.verify(&lead_vk).is_err(),
+            "a published lead key must never sign a new commit"
+        );
+    }
+
+    /// #918 production-path rotation re-sign: publish with K, run the real
+    /// lead→active promotion (which invokes the installed publisher hook),
+    /// then assert the STORED head verifies under K' while the un-re-signed
+    /// control does not.
+    #[tokio::test]
+    async fn rotation_resigns_stored_head_with_new_key() {
+        use crate::auth::key_rotation::{
+            rotate_es256_keys, Es256KeySlot, Es256KeySlots, Es256SigningKeyStore,
+        };
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pds_dir = dir.path().join("pds");
+        let secrets_dir = dir.path().join("secrets");
+        std::fs::create_dir_all(&secrets_dir).expect("create secrets dir");
+        let now = chrono::Utc::now().timestamp();
+        let old_sk = SigningKey::random(&mut rand::rngs::OsRng);
+        let old_vk: VerifyingKey = *old_sk.verifying_key();
+        let new_sk = SigningKey::random(&mut rand::rngs::OsRng);
+        let new_vk: VerifyingKey = *new_sk.verifying_key();
+
+        let store = Arc::new(PdsRecordStore::open(&pds_dir).expect("open rw"));
+        // Capture the pre-rotation commit for the control assertion.
+        let es256_store = Arc::new(Es256SigningKeyStore::new(Es256KeySlots {
+            drain: None,
+            active: Some(Es256KeySlot::new(old_sk, now - 100, now + 1)),
+            lead: Some(Es256KeySlot::new(new_sk, now - 1, now + 30 * 86_400)),
+        }));
+        let publisher = Arc::new(PdsPublisher::new(
+            Arc::clone(&store),
+            DID.to_owned(),
+            Arc::clone(&es256_store),
+        ));
+        publisher
+            .install_es256_promotion_hook()
+            .expect("install promotion hook");
+        publisher.publish("repo-a", SAMPLE_OID).expect("publish");
+        let pre_rotation_commit = store
+            .load_repo(DID)
+            .expect("load")
+            .expect("repo present")
+            .commit;
+
+        // Run the production promotion function. Its in-store notification
+        // invokes PdsPublisher::resign_head; the test does not call it directly.
+        let promoted = rotate_es256_keys(
+            &crate::config::OAuthConfig::default(),
+            &secrets_dir,
+            &es256_store,
+            now,
+        )
+        .await;
+        assert!(promoted, "the prepared lead key must be promoted");
+
+        // The STORED head now verifies under K' (the current active key).
+        let post_rotation_commit = store
+            .load_repo(DID)
+            .expect("load")
+            .expect("repo present")
+            .commit;
+        assert_eq!(
+            post_rotation_commit.rev, pre_rotation_commit.rev,
+            "rev unchanged"
+        );
+        assert_eq!(
+            post_rotation_commit.data, pre_rotation_commit.data,
+            "MST root unchanged"
+        );
+        assert_eq!(
+            post_rotation_commit.unsigned().to_dag_cbor(),
+            pre_rotation_commit.unsigned().to_dag_cbor(),
+            "rotation must re-sign the exact same canonical unsigned DAG-CBOR bytes"
+        );
+        assert_ne!(
+            post_rotation_commit.sig, pre_rotation_commit.sig,
+            "signature must differ (re-signed with K')"
+        );
+        post_rotation_commit
+            .verify(&new_vk)
+            .expect("re-signed head must verify under K' (the new active key)");
+
+        // Control: the pre-rotation head (signed by K) does NOT verify under K'.
+        assert!(
+            pre_rotation_commit.verify(&new_vk).is_err(),
+            "the un-re-signed head must fail under K'"
+        );
+        // And the re-signed head does NOT verify under K (the old key).
+        assert!(
+            post_rotation_commit.verify(&old_vk).is_err(),
+            "the re-signed head must fail under K (the old key)"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_rotation_keeps_published_key_and_head_consistent_then_retries() {
+        use crate::auth::key_rotation::{
+            rotate_es256_keys, Es256KeySlot, Es256KeySlots, Es256SigningKeyStore,
+        };
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pds_dir = dir.path().join("pds");
+        let secrets_dir = dir.path().join("secrets");
+        std::fs::create_dir_all(&secrets_dir).expect("create secrets dir");
+        let now = chrono::Utc::now().timestamp();
+        let old_sk = SigningKey::random(&mut rand::rngs::OsRng);
+        let old_vk: VerifyingKey = *old_sk.verifying_key();
+        let new_sk = SigningKey::random(&mut rand::rngs::OsRng);
+        let new_vk: VerifyingKey = *new_sk.verifying_key();
+
+        let store = Arc::new(PdsRecordStore::open(&pds_dir).expect("open rw"));
+        let es256_store = Arc::new(Es256SigningKeyStore::new(Es256KeySlots {
+            drain: None,
+            active: Some(Es256KeySlot::new(old_sk, now - 100, now + 1)),
+            lead: Some(Es256KeySlot::new(new_sk, now - 1, now + 30 * 86_400)),
+        }));
+        let publisher = Arc::new(PdsPublisher::new(
+            Arc::clone(&store),
+            DID.to_owned(),
+            Arc::clone(&es256_store),
+        ));
+        publisher
+            .install_es256_promotion_hook()
+            .expect("install promotion hook");
+        publisher.publish("repo-a", SAMPLE_OID).expect("publish");
+
+        let fail_once = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let injected_failure = Arc::clone(&fail_once);
+        let weak_publisher = Arc::downgrade(&publisher);
+        es256_store.set_promotion_hook(Arc::new(move |key| {
+            if injected_failure.swap(false, std::sync::atomic::Ordering::AcqRel) {
+                bail!("injected persisted-head re-sign failure");
+            }
+            let publisher = weak_publisher
+                .upgrade()
+                .ok_or_else(|| anyhow!("publisher dropped during retry test"))?;
+            publisher.resign_head_with_key(&key).map(|_| ())
+        }));
+
+        assert!(
+            !rotate_es256_keys(
+                &crate::config::OAuthConfig::default(),
+                &secrets_dir,
+                &es256_store,
+                now,
+            )
+            .await,
+            "a failed head re-sign must leave promotion pending"
+        );
+        let failed_head = store
+            .load_repo(DID)
+            .expect("load")
+            .expect("repo present")
+            .commit;
+        failed_head
+            .verify(&old_vk)
+            .expect("head must remain signed by the still-published old key");
+        assert!(failed_head.verify(&new_vk).is_err());
+        assert_eq!(
+            es256_store.active_key().unwrap().verifying_key(),
+            &old_vk,
+            "candidate key must not become visible after re-sign failure"
+        );
+
+        assert!(
+            rotate_es256_keys(
+                &crate::config::OAuthConfig::default(),
+                &secrets_dir,
+                &es256_store,
+                now,
+            )
+            .await,
+            "the next tick must reconcile and finish promotion"
+        );
+        let reconciled_head = store
+            .load_repo(DID)
+            .expect("load")
+            .expect("repo present")
+            .commit;
+        reconciled_head
+            .verify(&new_vk)
+            .expect("retried head must match the newly published key");
+        assert!(reconciled_head.verify(&old_vk).is_err());
+        assert_eq!(es256_store.active_key().unwrap().verifying_key(), &new_vk);
+    }
+
+    #[tokio::test]
+    async fn dropped_publisher_hook_keeps_rotation_pending_and_head_consistent() {
+        use crate::auth::key_rotation::{
+            rotate_es256_keys, Es256KeySlot, Es256KeySlots, Es256SigningKeyStore,
+        };
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pds_dir = dir.path().join("pds");
+        let secrets_dir = dir.path().join("secrets");
+        std::fs::create_dir_all(&secrets_dir).expect("create secrets dir");
+        let now = chrono::Utc::now().timestamp();
+        let old_sk = SigningKey::random(&mut rand::rngs::OsRng);
+        let old_vk: VerifyingKey = *old_sk.verifying_key();
+        let new_sk = SigningKey::random(&mut rand::rngs::OsRng);
+        let new_vk: VerifyingKey = *new_sk.verifying_key();
+
+        let store = Arc::new(PdsRecordStore::open(&pds_dir).expect("open rw"));
+        let es256_store = Arc::new(Es256SigningKeyStore::new(Es256KeySlots {
+            drain: None,
+            active: Some(Es256KeySlot::new(old_sk, now - 100, now + 1)),
+            lead: Some(Es256KeySlot::new(new_sk, now - 1, now + 30 * 86_400)),
+        }));
+        let publisher = Arc::new(PdsPublisher::new(
+            Arc::clone(&store),
+            DID.to_owned(),
+            Arc::clone(&es256_store),
+        ));
+        publisher.publish("repo-a", SAMPLE_OID).expect("publish");
+        publisher
+            .install_es256_promotion_hook()
+            .expect("install promotion hook");
+        drop(publisher);
+
+        assert!(
+            !rotate_es256_keys(
+                &crate::config::OAuthConfig::default(),
+                &secrets_dir,
+                &es256_store,
+                now,
+            )
+            .await,
+            "a stale weak hook must leave promotion pending"
+        );
+
+        let slots = es256_store.0.read();
+        assert_eq!(slots.active.as_ref().unwrap().key.verifying_key(), &old_vk);
+        assert_eq!(slots.lead.as_ref().unwrap().key.verifying_key(), &new_vk);
+        assert!(slots.drain.is_none());
+        drop(slots);
+
+        let head = store
+            .load_repo(DID)
+            .expect("load")
+            .expect("repo present")
+            .commit;
+        head.verify(&old_vk)
+            .expect("head must remain signed by the still-live old key");
+        assert!(
+            head.verify(&new_vk).is_err(),
+            "candidate key must not sign or become live after publisher drop"
+        );
+    }
+
+    #[test]
+    fn repo_reader_waits_for_complete_rotation_generation() {
+        use crate::auth::key_rotation::{
+            rotate_es256_keys, Es256KeySlot, Es256KeySlots, Es256SigningKeyStore,
+        };
+        use std::sync::{mpsc, Barrier};
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pds_dir = dir.path().join("pds");
+        let secrets_dir = dir.path().join("secrets");
+        std::fs::create_dir_all(&secrets_dir).expect("create secrets dir");
+        let now = chrono::Utc::now().timestamp();
+        let old_sk = SigningKey::random(&mut rand::rngs::OsRng);
+        let new_sk = SigningKey::random(&mut rand::rngs::OsRng);
+        let new_vk: VerifyingKey = *new_sk.verifying_key();
+
+        let store = Arc::new(PdsRecordStore::open(&pds_dir).expect("open rw"));
+        let es256_store = Arc::new(Es256SigningKeyStore::new(Es256KeySlots {
+            drain: None,
+            active: Some(Es256KeySlot::new(old_sk, now - 100, now + 1)),
+            lead: Some(Es256KeySlot::new(new_sk, now - 1, now + 30 * 86_400)),
+        }));
+        let publisher = Arc::new(PdsPublisher::new(
+            Arc::clone(&store),
+            DID.to_owned(),
+            Arc::clone(&es256_store),
+        ));
+        publisher.publish("repo-a", SAMPLE_OID).expect("publish");
+        let resolver = Arc::new(
+            PdsRecordResolver::new(Arc::clone(&store))
+                .with_es256_rotation(Arc::clone(&es256_store), DID.to_owned()),
+        );
+
+        // Pause after K' has been persisted as the repo head but before the
+        // rotation write guard installs K' as the live/published key.
+        let transition_barrier = Arc::new(Barrier::new(2));
+        let hook_barrier = Arc::clone(&transition_barrier);
+        let (head_written_tx, head_written_rx) = mpsc::channel();
+        let weak_publisher = Arc::downgrade(&publisher);
+        es256_store.set_promotion_hook(Arc::new(move |key| {
+            let publisher = weak_publisher
+                .upgrade()
+                .ok_or_else(|| anyhow!("publisher dropped during rotation test"))?;
+            publisher.resign_head_with_key(&key)?;
+            head_written_tx
+                .send(())
+                .map_err(|_| anyhow!("test observer dropped"))?;
+            hook_barrier.wait();
+            Ok(())
+        }));
+
+        let rotation_store = Arc::clone(&es256_store);
+        let rotation_secrets = secrets_dir.clone();
+        let rotation = std::thread::spawn(move || {
+            block_on(rotate_es256_keys(
+                &crate::config::OAuthConfig::default(),
+                &rotation_secrets,
+                &rotation_store,
+                now,
+            ))
+        });
+        head_written_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("hook wrote candidate head");
+
+        let observer_store = Arc::clone(&es256_store);
+        let (observed_tx, observed_rx) = mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let repo = block_on(resolver.resolve_repo(DID))
+                .expect("resolve repo")
+                .expect("repo present");
+            let key = observer_store.active_key().expect("active key");
+            observed_tx
+                .send((commit_from_car(&repo.car), key))
+                .expect("send observation");
+        });
+        let early_observation = observed_rx.recv_timeout(Duration::from_millis(100));
+        let reader_was_blocked = matches!(&early_observation, Err(mpsc::RecvTimeoutError::Timeout));
+        transition_barrier.wait();
+        assert!(rotation.join().expect("rotation thread"));
+        reader.join().expect("reader thread");
+        assert!(
+            reader_was_blocked,
+            "repo reader must block while candidate head and live key generations differ"
+        );
+        let (commit, observed_key) = match early_observation {
+            Ok(observation) => observation,
+            Err(mpsc::RecvTimeoutError::Timeout) => observed_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("post-transition observation"),
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                panic!("reader disconnected before observation")
+            }
+        };
+        assert_eq!(observed_key.verifying_key(), &new_vk);
+        commit
+            .verify(&new_vk)
+            .expect("reader must observe the K'-signed generation");
+    }
+
+    #[test]
+    fn local_did_web_authority_admits_pre_rotation_commit_through_drain() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let secrets_dir = dir.path().join("secrets");
+        std::fs::create_dir_all(&secrets_dir).expect("create secrets");
+        let now = chrono::Utc::now().timestamp();
+        let old = SigningKey::random(&mut rand::rngs::OsRng);
+        let new = SigningKey::random(&mut rand::rngs::OsRng);
+        let es256_store = Arc::new(crate::auth::key_rotation::Es256SigningKeyStore::new(
+            crate::auth::key_rotation::Es256KeySlots {
+                drain: None,
+                active: Some(crate::auth::key_rotation::Es256KeySlot::new(
+                    old,
+                    now - 60,
+                    now + 1,
+                )),
+                lead: Some(crate::auth::key_rotation::Es256KeySlot::new(
+                    new,
+                    now - 1,
+                    now + 86_400,
+                )),
+            },
+        ));
+        let store = Arc::new(PdsRecordStore::open(dir.path()).expect("open rw"));
+        let publisher =
+            PdsPublisher::new(Arc::clone(&store), DID.to_owned(), Arc::clone(&es256_store));
+        publisher.publish("repo-a", SAMPLE_OID).expect("publish");
+        let resolver =
+            PdsRecordResolver::new(store).with_es256_rotation(es256_store, DID.to_owned());
+
+        assert!(block_on(crate::auth::key_rotation::rotate_es256_keys(
+            &crate::config::OAuthConfig::default(),
+            &secrets_dir,
+            resolver.rotation.as_ref().expect("rotation").0.as_ref(),
+            now,
+        )));
+        let keys = block_on(resolver.resolve_verifying_keys(DID))
+            .expect("resolve root authority")
+            .expect("matching did:web authority");
+        let repo = block_on(resolver.resolve_repo(DID))
+            .expect("resolve repo")
+            .expect("repo");
+        let commit = commit_from_car(&repo.car);
+        commit
+            .verify_against_published_keys(&keys, now)
+            .expect("K-signed commit must verify under published drain slot");
+        assert!(
+            block_on(resolver.resolve_verifying_keys("did:web:foreign.example"))
+                .expect("foreign resolution is unsupported")
+                .is_none(),
+            "foreign DID resolution stays unsupported so ingest can fail closed"
+        );
+        let index = hyprstream_discovery::placement_index::PlacementIndex::new();
+        block_on(index.ingest_did(&resolver, DID))
+            .expect("production placement ingest must accept the drain-authorized commit");
+    }
+
+    #[test]
     fn publish_read_full_proof_verifies() {
         // End-to-end: publish → getRecord → the FULL record proof (commit sig +
         // MST path + record CID) verifies keyless against the published key.
@@ -1400,7 +2200,7 @@ mod pds_store_tests {
         let vk: VerifyingKey = *sk.verifying_key();
 
         let store = Arc::new(PdsRecordStore::open(dir.path()).expect("open rw"));
-        let publisher = PdsPublisher::new(Arc::clone(&store), DID.to_owned(), sk);
+        let publisher = PdsPublisher::new(Arc::clone(&store), DID.to_owned(), test_es256_store(sk));
         publisher.publish("repo-a", SAMPLE_OID).expect("publish");
 
         // Reconstruct the proof the same way the resolver does (store holds no
@@ -1428,7 +2228,7 @@ mod pds_store_tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let sk = SigningKey::random(&mut rand::rngs::OsRng);
         let store = Arc::new(PdsRecordStore::open(dir.path()).expect("open rw"));
-        let publisher = PdsPublisher::new(Arc::clone(&store), DID.to_owned(), sk);
+        let publisher = PdsPublisher::new(Arc::clone(&store), DID.to_owned(), test_es256_store(sk));
 
         publisher.publish("repo-a", SAMPLE_OID).expect("publish 1");
         let first = store.load_repo(DID).expect("load").expect("repo").commit;
@@ -1454,7 +2254,8 @@ mod pds_store_tests {
 
         {
             let store = Arc::new(PdsRecordStore::open(dir.path()).expect("open rw"));
-            let publisher = PdsPublisher::new(Arc::clone(&store), DID.to_owned(), sk);
+            let publisher =
+                PdsPublisher::new(Arc::clone(&store), DID.to_owned(), test_es256_store(sk));
             publisher.publish("repo-b", SAMPLE_OID).expect("publish");
             // Writer handle dropped here — simulates a process restart.
         }
@@ -1547,7 +2348,7 @@ mod pds_store_tests {
         let vk: VerifyingKey = *sk.verifying_key();
 
         let store = Arc::new(PdsRecordStore::open(dir.path()).expect("open rw"));
-        let publisher = PdsPublisher::new(Arc::clone(&store), DID.to_owned(), sk);
+        let publisher = PdsPublisher::new(Arc::clone(&store), DID.to_owned(), test_es256_store(sk));
         publisher
             .publish("repo-a", SAMPLE_OID)
             .expect("publish model");
@@ -1579,7 +2380,7 @@ mod pds_store_tests {
         let vk: VerifyingKey = *sk.verifying_key();
 
         let store = Arc::new(PdsRecordStore::open(dir.path()).expect("open rw"));
-        let publisher = PdsPublisher::new(Arc::clone(&store), DID.to_owned(), sk);
+        let publisher = PdsPublisher::new(Arc::clone(&store), DID.to_owned(), test_es256_store(sk));
 
         let alloc = AllocationRecord::new(
             "bafyreiexamplegrantcid1234567890abcdef",
@@ -1648,7 +2449,7 @@ mod pds_store_tests {
         let vk: VerifyingKey = *sk.verifying_key();
 
         let store = Arc::new(PdsRecordStore::open(dir.path()).expect("open rw"));
-        let publisher = PdsPublisher::new(Arc::clone(&store), DID.to_owned(), sk);
+        let publisher = PdsPublisher::new(Arc::clone(&store), DID.to_owned(), test_es256_store(sk));
         publisher
             .publish("repo-a", SAMPLE_OID)
             .expect("publish model");
@@ -1704,7 +2505,11 @@ mod pds_store_tests {
         let vk: VerifyingKey = *sk.verifying_key();
 
         let store = Arc::new(PdsRecordStore::open(dir.path()).expect("open rw"));
-        let publisher = Arc::new(PdsPublisher::new(Arc::clone(&store), DID.to_owned(), sk));
+        let publisher = Arc::new(PdsPublisher::new(
+            Arc::clone(&store),
+            DID.to_owned(),
+            test_es256_store(sk),
+        ));
 
         const WRITERS_PER_COLLECTION: usize = 4;
         let mut handles = Vec::new();
@@ -1751,7 +2556,7 @@ mod pds_store_tests {
         let sk = SigningKey::random(&mut rand::rngs::OsRng);
 
         let store = Arc::new(PdsRecordStore::open(dir.path()).expect("open rw"));
-        let publisher = PdsPublisher::new(Arc::clone(&store), DID.to_owned(), sk);
+        let publisher = PdsPublisher::new(Arc::clone(&store), DID.to_owned(), test_es256_store(sk));
         publisher.publish("repo-a", SAMPLE_OID).expect("publish");
 
         // Corrupt the store: write a second record while re-persisting the
@@ -1790,7 +2595,7 @@ mod pds_store_tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let sk = SigningKey::random(&mut rand::rngs::OsRng);
         let store = Arc::new(PdsRecordStore::open(dir.path()).expect("open rw"));
-        let publisher = PdsPublisher::new(Arc::clone(&store), DID.to_owned(), sk);
+        let publisher = PdsPublisher::new(Arc::clone(&store), DID.to_owned(), test_es256_store(sk));
         for bad in ["", "with/slash", "with\0nul"] {
             assert!(
                 publisher.publish_record(bad, "repo-a", SAMPLE_OID).is_err(),
@@ -1874,7 +2679,7 @@ mod pds_store_tests {
         PdsPublisher::new(
             store,
             DID.to_owned(),
-            SigningKey::random(&mut rand::rngs::OsRng),
+            test_es256_store(SigningKey::random(&mut rand::rngs::OsRng)),
         )
         .with_at9p_state_ingest(ingest)
     }
@@ -2180,6 +2985,10 @@ mod pds_store_tests {
         let checkpoint_key = at9p_checkpoint_key(&cid);
         let old_state = db.get(&state_key).unwrap().unwrap();
         let old_checkpoint = db.get(&checkpoint_key).unwrap().unwrap();
+        assert!(
+            db.get(at9p_history_key(&cid, 0)).unwrap().is_none(),
+            "the pinned genesis is replayed from GATE, never copied into mutable history"
+        );
         let update = sign_update_record(
             cid.clone(),
             1,
@@ -2195,6 +3004,10 @@ mod pds_store_tests {
             .expect("advance");
         let new_state = db.get(&state_key).unwrap().unwrap();
         let new_checkpoint = db.get(&checkpoint_key).unwrap().unwrap();
+        assert!(
+            db.get(at9p_history_key(&cid, 1)).unwrap().is_some(),
+            "a production accepted-state advance must atomically retain its replayable update"
+        );
         db.delete(&state_key).expect("simulate state-half missing");
         assert!(publisher.accepted_at9p_state(&did, None).is_err());
         db.put(&state_key, &new_state).expect("restore state");

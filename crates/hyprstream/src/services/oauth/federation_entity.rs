@@ -50,7 +50,7 @@ pub async fn entity_configuration(
 /// Factored out of the HTTP handler so Phase 0.5 Stage D
 /// (`publish_entity_statement_to_discovery`) can reuse it.
 pub async fn build_entity_configuration_jwt(state: &OAuthState) -> Result<String, &'static str> {
-    let Some(ref sk) = state.signing_key else {
+    let Some(sk) = state.active_root_identity_signing_key().await else {
         return Err("signing key not configured for OpenID Federation");
     };
     let vk = sk.verifying_key();
@@ -109,7 +109,7 @@ pub async fn build_entity_configuration_jwt(state: &OAuthState) -> Result<String
 
     // ES256 keys from rotation store.
     if let Some(ref store) = state.es256_key_store {
-        for slot in store.all_slots_snapshot().await {
+        for slot in store.all_slots_snapshot() {
             jwks_keys.push(crate::auth::jwt::es256_jwk(&slot.key));
         }
     }
@@ -124,7 +124,7 @@ pub async fn build_entity_configuration_jwt(state: &OAuthState) -> Result<String
 
     Ok(build_entity_configuration_with_keys(
         issuer,
-        sk,
+        &sk,
         jwks_keys,
         as_metadata,
         &state.authority_hints,

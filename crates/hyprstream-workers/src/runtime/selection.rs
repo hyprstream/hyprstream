@@ -71,6 +71,11 @@ pub struct BackendCtx {
     /// Sandbox pool configuration (paths, hypervisor, limits).
     pub pool_config: PoolConfig,
 
+    /// Mandatory resolver-backed, audited policy-enforcement point for every
+    /// 9P export constructed by a backend.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub ninep_decider: Arc<dyn hyprstream_9p::AccessDecider>,
+
     /// Image storage configuration. Any backend that composes the RAFS image
     /// filesystem (kata over virtio-fs, or nspawn over FUSE — Model B #715)
     /// consumes it, so it exists on the `oci-image` build, not just `kata-vm`.
