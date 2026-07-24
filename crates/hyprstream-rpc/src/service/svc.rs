@@ -21,13 +21,14 @@ use tracing::warn;
 
 /// Authorization callback for policy checks.
 ///
-/// Parameters: (subject, resource, operation) -> allowed.
+/// Parameters: (subject, domain, resource, operation) -> allowed.
 /// Services store this and call it from their `authorize()` handler method.
 /// The concrete implementation typically wraps `PolicyClient::check_policy()`.
 ///
 /// Returns a boxed future to support async policy checks on single-threaded runtimes.
 pub type AuthorizeFn = Arc<
     dyn Fn(
+            String,
             String,
             String,
             String,
@@ -288,6 +289,33 @@ impl EnvelopeContext {
             return s.clone();
         }
         Subject::anonymous()
+    }
+
+    /// Derive the Casbin request domain from the verified RPC identity.
+    ///
+    /// This is deliberately the same stable identifier as the verified
+    /// subject. It is never read from a request payload: `subject()` only
+    /// exposes a trust-store binding or a JWT that `verify_claims()` verified.
+    /// Until a separately verified tenant binding exists, this provides
+    /// identity partitioning rather than a many-subject tenant boundary.
+    ///
+    /// Anonymous callers and identities with an empty, whitespace-only, or
+    /// `"*"` name have no usable domain. Callers must deny this error rather
+    /// than falling back to a wildcard.
+    pub fn domain(&self) -> Result<String> {
+        let subject = self.subject();
+        let name = subject
+            .name()
+            .ok_or_else(|| anyhow::anyhow!("authorization denied: no verified identity domain"))?;
+        anyhow::ensure!(
+            !name.trim().is_empty(),
+            "authorization denied: no verified identity domain"
+        );
+        anyhow::ensure!(
+            name != "*",
+            "authorization denied: wildcard is not a valid verified identity domain"
+        );
+        Ok(name.to_owned())
     }
 
     /// Get the bare username string.
@@ -1208,6 +1236,41 @@ impl ServiceHandle {
     /// Check if the service is still running
     pub fn is_running(&self) -> bool {
         self.task.as_ref().map(|t| !t.is_finished()).unwrap_or(true)
+    }
+}
+
+#[cfg(test)]
+mod casbin_domain_tests {
+    use super::*;
+
+    fn ctx_for_verified_identity(name: &str) -> EnvelopeContext {
+        EnvelopeContext {
+            request_id: 1,
+            claims: None,
+            jwt_token: None,
+            key_derived_subject: Subject::new(name),
+            jwt_subject: None,
+            cnf: [0u8; 32],
+            envelope_wit_hash: None,
+            client_dh_public: None,
+            client_kem_public: None,
+            request_iat: 0,
+            request_nonce: [0; 16],
+            response_kem_recipient: None,
+            service_domain: None,
+            browser_method_discriminator: None,
+            is_local_caller: true,
+        }
+    }
+
+    #[test]
+    fn casbin_domain_rejects_empty_verified_identity_name() {
+        assert!(ctx_for_verified_identity("").domain().is_err());
+    }
+
+    #[test]
+    fn casbin_domain_rejects_whitespace_only_verified_identity_name() {
+        assert!(ctx_for_verified_identity(" \t\n").domain().is_err());
     }
 }
 
