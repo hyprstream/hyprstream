@@ -179,6 +179,10 @@ pub mod service_entry;
 pub use hyprstream_crypto::did_key;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod did_web;
+// did:plc federation intake (#1161): configurable PLC directory, egress-
+// allowlisted fetch, TTL cache, subject binding, and no write API.
+#[cfg(not(target_arch = "wasm32"))]
+pub mod did_plc;
 // Pure DID URL parser + inert dereference plan (#906, at9p epic #880 G1).
 // Available on every target and intentionally independent of DID resolution,
 // transport decoding, dial targets, admission, and carrier possession.

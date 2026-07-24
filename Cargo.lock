@@ -7218,6 +7218,7 @@ dependencies = [
  "inventory",
  "iroh",
  "js-sys",
+ "k256",
  "ml-dsa",
  "ml-kem",
  "moq-net",
@@ -8495,6 +8496,20 @@ dependencies = [
  "rsa",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
+ "signature 2.2.0",
+]
+
+[[package]]
+name = "k256"
+version = "0.13.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f6e3919bbaa2945715f0bb6d3934a173d1e9a59ac23767fbaaef277265a7411b"
+dependencies = [
+ "cfg-if 1.0.3",
+ "ecdsa",
+ "elliptic-curve",
+ "once_cell",
  "sha2 0.10.9",
  "signature 2.2.0",
 ]

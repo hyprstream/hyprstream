@@ -44,7 +44,7 @@
 //! membership match, with JWKS fallback) is fully implemented and unit-tested
 //! here against fixtures. Live callers must feed stage 2 only the signer key from
 //! a verified application envelope. A NodeId, EndpointId, TLS certificate key,
-//! endpoint field, or caller assertion is not an [`ApplicationSignerKey`]. If a
+//! endpoint field, or caller assertion is not a [`VerifiedApplicationSigner`]. If a
 //! network path has no verified application proof, it must not invoke this gate
 //! as though carrier establishment supplied one.
 
@@ -52,9 +52,10 @@ use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use serde_json::Value;
 
+use crate::auth::mac::VerifiedKeyMaterial;
 use crate::did_web::{
-    did_key_to_ed25519, is_did_key, jwks_ed25519_keys, verification_method_ed25519_keys, DidDocFetcher,
-    DidWebResolver,
+    did_key_to_ed25519, is_did_key, jwks_ed25519_keys, verification_method_ed25519_keys,
+    DidDocFetcher, DidWebResolver,
 };
 use crate::envelope::KeyedPqTrustStore;
 use crate::identity::DID_AT9P_PREFIX;
@@ -117,7 +118,83 @@ impl ApplicationSignerKey {
 impl std::fmt::Debug for ApplicationSignerKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // Render a short fingerprint, not the full key, to keep logs tidy.
-        write!(f, "ApplicationSignerKey({:02x}{:02x}…)", self.0[0], self.0[1])
+        write!(
+            f,
+            "ApplicationSignerKey({:02x}{:02x}…)",
+            self.0[0], self.0[1]
+        )
+    }
+}
+
+/// The trust boundary on which admission is being attempted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AdmissionTrustSurface {
+    /// A native/SPINE trust surface. Classical-only proof is a downgrade and
+    /// must fail closed.
+    Native,
+    /// A named third-party interoperability perimeter where a foreign identity
+    /// may only provide classical signing material.
+    ThirdPartyInterop,
+}
+
+/// Application signer plus the assurance actually established by envelope
+/// verification. This is crypto-derived evidence, never a DID-document claim.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VerifiedApplicationSigner {
+    key: ApplicationSignerKey,
+    key_material: VerifiedKeyMaterial,
+}
+
+impl VerifiedApplicationSigner {
+    /// A signer whose Ed25519 + bound ML-DSA-65 composite verified.
+    pub fn pq_hybrid(key: [u8; 32]) -> Self {
+        Self {
+            key: ApplicationSignerKey(key),
+            key_material: VerifiedKeyMaterial::PqHybrid,
+        }
+    }
+
+    /// A classical signer verified specifically at a third-party interop edge.
+    ///
+    /// The deliberately long name prevents a generic/native caller from
+    /// selecting classical verification as an accidental default.
+    pub fn third_party_interop_classical(key: [u8; 32]) -> Self {
+        Self {
+            key: ApplicationSignerKey(key),
+            key_material: VerifiedKeyMaterial::Classical,
+        }
+    }
+
+    pub fn key(&self) -> ApplicationSignerKey {
+        self.key
+    }
+
+    pub fn key_material(&self) -> VerifiedKeyMaterial {
+        self.key_material
+    }
+}
+
+fn require_key_assurance(
+    origin: &str,
+    signer: VerifiedApplicationSigner,
+    surface: AdmissionTrustSurface,
+) -> Result<ApplicationSignerKey> {
+    match (surface, signer.key_material()) {
+        (AdmissionTrustSurface::Native, VerifiedKeyMaterial::PqHybrid)
+        | (
+            AdmissionTrustSurface::ThirdPartyInterop,
+            VerifiedKeyMaterial::Classical | VerifiedKeyMaterial::PqHybrid,
+        ) => Ok(signer.key()),
+        (AdmissionTrustSurface::Native, _) => Err(admission_reject(
+            origin,
+            signer.key(),
+            "native/SPINE admission requires verified PQ-hybrid application proof; classical Ed25519 alone is a downgrade",
+        )),
+        (_, VerifiedKeyMaterial::Unverified) => Err(admission_reject(
+            origin,
+            signer.key(),
+            "application signer proof is unverified",
+        )),
     }
 }
 
@@ -158,6 +235,16 @@ impl<F: DidDocFetcher> DidDocResolve for DidWebResolver<F> {
     }
 }
 
+/// A configured `did:plc` resolver can serve the existing federation admission
+/// boundary. Its URL derivation, egress allowlist, cache, and `doc.id` binding
+/// are all enforced before this gate inspects verification methods.
+#[async_trait]
+impl<F: crate::did_plc::PlcAuditFetcher> DidDocResolve for crate::did_plc::DidPlcResolver<F> {
+    async fn resolve_doc(&self, did: &str) -> Result<Value> {
+        self.resolve_document(did).await
+    }
+}
+
 /// The result of a successful two-stage admission: the peer's normalized origin
 /// bound to the authenticated key that matched its published DID-doc VM / JWKS.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -186,15 +273,20 @@ pub struct FederationAdmissionGate<O: OriginAdmission, R: DidDocResolve> {
 impl<O: OriginAdmission, R: DidDocResolve> FederationAdmissionGate<O, R> {
     /// Construct a gate over an origin-admission handle and a DID-doc resolver.
     pub fn new(origin_admission: O, resolver: R) -> Self {
-        Self { origin_admission, resolver }
+        Self {
+            origin_admission,
+            resolver,
+        }
     }
 
     /// Run the two-stage gate for an inbound peer.
     ///
     /// - `origin` — the peer's RFC 6454 origin (caller extracts it from the peer
     ///   DID / advertised issuer with `extract_origin`).
-    /// - `application_signer_key` — the verified application-envelope signer key (see
-    ///   [`ApplicationSignerKey`]).
+    /// - `application_signer` — the verified application-envelope signer key and assurance (see
+    ///   [`VerifiedApplicationSigner`]).
+    /// - `trust_surface` — explicit native/SPINE vs third-party interop
+    ///   classification. Native admission requires PQ-hybrid proof.
     /// - `did` — the peer's DID identifier for stage 2 (`did:web:…` resolved via
     ///   the DID-doc resolver, or `did:key:…` self-certifying / no fetch — #281).
     /// - `federation_jwks` — an optional already-resolved federation JWKS
@@ -207,7 +299,8 @@ impl<O: OriginAdmission, R: DidDocResolve> FederationAdmissionGate<O, R> {
     pub async fn admit(
         &self,
         origin: &str,
-        application_signer_key: ApplicationSignerKey,
+        application_signer: VerifiedApplicationSigner,
+        trust_surface: AdmissionTrustSurface,
         did: &str,
         federation_jwks: Option<&Value>,
     ) -> Result<AdmittedIdentity> {
@@ -220,7 +313,16 @@ impl<O: OriginAdmission, R: DidDocResolve> FederationAdmissionGate<O, R> {
             .map_err(|e| anyhow!("admission stage 1 (origin {origin}) denied: {e}"))?;
 
         // ── Stage 2: key binding (fail-closed) ────────────────────────────────
-        admit_key_against_did(&self.resolver, origin, application_signer_key, did, federation_jwks, None).await
+        admit_key_against_did(
+            &self.resolver,
+            origin,
+            application_signer,
+            trust_surface,
+            did,
+            federation_jwks,
+            None,
+        )
+        .await
     }
 }
 
@@ -228,7 +330,11 @@ impl<O: OriginAdmission, R: DidDocResolve> FederationAdmissionGate<O, R> {
 /// verified application signer key to its DID's published key material, and
 /// admit iff it matches.
 ///
-/// Two DID-method paths (chosen by the DID string):
+/// The assurance floor is enforced before DID dispatch: native/SPINE surfaces
+/// require verified PQ-hybrid proof; classical proof is accepted only when the
+/// caller explicitly names [`AdmissionTrustSurface::ThirdPartyInterop`].
+///
+/// Three DID-method paths (chosen by the DID string):
 ///
 /// - **`did:key` (self-certifying, #281)** — Tiles-style Ed25519 device/account
 ///   identity. The key *is* the identity: `did:key:z6Mk…` is exactly
@@ -253,18 +359,25 @@ impl<O: OriginAdmission, R: DidDocResolve> FederationAdmissionGate<O, R> {
 pub async fn admit_key_against_did<R: DidDocResolve>(
     resolver: &R,
     origin: &str,
-    application_signer_key: ApplicationSignerKey,
+    application_signer: VerifiedApplicationSigner,
+    trust_surface: AdmissionTrustSurface,
     did: &str,
     federation_jwks: Option<&Value>,
     at9p: Option<At9pAdmission<'_>>,
 ) -> Result<AdmittedIdentity> {
+    let application_signer_key = require_key_assurance(origin, application_signer, trust_surface)?;
     // ── did:key self-certifying arm (#281) ────────────────────────────────────
     // A did:key carries its own Ed25519 key — no DID-doc resolution / network
     // fetch. The verified application signer MUST equal the key the DID
     // encodes; any mismatch or parse error fails closed.
     if is_did_key(did) {
-        let did_key = did_key_to_ed25519(did)
-            .map_err(|e| admission_reject(origin, application_signer_key, &format!("did:key {did} is invalid: {e}")))?;
+        let did_key = did_key_to_ed25519(did).map_err(|e| {
+            admission_reject(
+                origin,
+                application_signer_key,
+                &format!("did:key {did} is invalid: {e}"),
+            )
+        })?;
         if key_eq(&did_key, application_signer_key.as_bytes()) {
             return Ok(AdmittedIdentity {
                 origin: origin.to_owned(),
@@ -275,7 +388,9 @@ pub async fn admit_key_against_did<R: DidDocResolve>(
         return Err(admission_reject(
             origin,
             application_signer_key,
-            &format!("application signer key does not match the self-certifying did:key identity {did}"),
+            &format!(
+                "application signer key does not match the self-certifying did:key identity {did}"
+            ),
         ));
     }
 
@@ -290,11 +405,17 @@ pub async fn admit_key_against_did<R: DidDocResolve>(
             admission_reject(
                 origin,
                 application_signer_key,
-                &format!("did:at9p {did} presented without a capsule/admission context — fail-closed"),
+                &format!(
+                    "did:at9p {did} presented without a capsule/admission context — fail-closed"
+                ),
             )
         })?;
         let verified = ctx.gate.verify_bytes(did, ctx.capsule_bytes).map_err(|e| {
-            admission_reject(origin, application_signer_key, &format!("did:at9p {did} capsule GATE rejected: {e}"))
+            admission_reject(
+                origin,
+                application_signer_key,
+                &format!("did:at9p {did} capsule GATE rejected: {e}"),
+            )
         })?;
         // The capsule's Ed25519 subject key is genesis identity material; the
         // separately verified application signer must equal it. This comparison
@@ -321,13 +442,19 @@ pub async fn admit_key_against_did<R: DidDocResolve>(
     // ── did:web resolver arm (#279/#137) ──────────────────────────────────────
     // Resolve the peer's DID document. A resolution failure is fail-closed:
     // without the published key material we cannot bind the application signer.
-    let doc = resolver
-        .resolve_doc(did)
-        .await
-        .map_err(|e| admission_reject(origin, application_signer_key, &format!("DID {did} did not resolve: {e}")))?;
+    let doc = resolver.resolve_doc(did).await.map_err(|e| {
+        admission_reject(
+            origin,
+            application_signer_key,
+            &format!("DID {did} did not resolve: {e}"),
+        )
+    })?;
 
     let vm_keys = verification_method_ed25519_keys(&doc);
-    if vm_keys.iter().any(|k| key_eq(k, application_signer_key.as_bytes())) {
+    if vm_keys
+        .iter()
+        .any(|k| key_eq(k, application_signer_key.as_bytes()))
+    {
         return Ok(AdmittedIdentity {
             origin: origin.to_owned(),
             did: Some(did.to_owned()),
@@ -337,7 +464,10 @@ pub async fn admit_key_against_did<R: DidDocResolve>(
 
     // Fallback: a federation-tagged JWKS the caller already resolved/cached.
     if let Some(jwks) = federation_jwks {
-        if jwks_ed25519_keys(jwks).iter().any(|k| key_eq(k, application_signer_key.as_bytes())) {
+        if jwks_ed25519_keys(jwks)
+            .iter()
+            .any(|k| key_eq(k, application_signer_key.as_bytes()))
+        {
             return Ok(AdmittedIdentity {
                 origin: origin.to_owned(),
                 // Matched via JWKS, not a specific DID-doc VM.
@@ -407,6 +537,14 @@ mod tests {
 
     fn random_ed25519() -> [u8; 32] {
         SigningKey::generate(&mut OsRng).verifying_key().to_bytes()
+    }
+
+    fn interop_signer(key: [u8; 32]) -> VerifiedApplicationSigner {
+        VerifiedApplicationSigner::third_party_interop_classical(key)
+    }
+
+    fn hybrid_signer(key: [u8; 32]) -> VerifiedApplicationSigner {
+        VerifiedApplicationSigner::pq_hybrid(key)
     }
 
     /// Decode-roundtrip sanity: our local Multikey encode is the inverse of the
@@ -525,7 +663,13 @@ mod tests {
         let key = random_ed25519();
         let gate = FederationAdmissionGate::new(AllowOrigin, FixtureDoc(did_doc_with_vm(&[key])));
         let admitted = gate
-            .admit(ORIGIN, ApplicationSignerKey(key), DID, None)
+            .admit(
+                ORIGIN,
+                interop_signer(key),
+                AdmissionTrustSurface::ThirdPartyInterop,
+                DID,
+                None,
+            )
             .await
             .expect("matching VM must admit");
         assert_eq!(admitted.origin, ORIGIN);
@@ -538,9 +682,16 @@ mod tests {
         // Doc publishes a different key than the peer presents.
         let published = random_ed25519();
         let peer = random_ed25519();
-        let gate = FederationAdmissionGate::new(AllowOrigin, FixtureDoc(did_doc_with_vm(&[published])));
+        let gate =
+            FederationAdmissionGate::new(AllowOrigin, FixtureDoc(did_doc_with_vm(&[published])));
         let err = gate
-            .admit(ORIGIN, ApplicationSignerKey(peer), DID, None)
+            .admit(
+                ORIGIN,
+                interop_signer(peer),
+                AdmissionTrustSurface::ThirdPartyInterop,
+                DID,
+                None,
+            )
             .await
             .expect_err("mismatched key must reject");
         assert!(err.to_string().contains("stage 2"), "{err}");
@@ -553,7 +704,13 @@ mod tests {
         let doc = json!({ "id": DID, "verificationMethod": [], "service": [] });
         let gate = FederationAdmissionGate::new(AllowOrigin, FixtureDoc(doc));
         let err = gate
-            .admit(ORIGIN, ApplicationSignerKey(peer), DID, None)
+            .admit(
+                ORIGIN,
+                interop_signer(peer),
+                AdmissionTrustSurface::ThirdPartyInterop,
+                DID,
+                None,
+            )
             .await
             .expect_err("no VM must reject");
         assert!(err.to_string().contains("stage 2"), "{err}");
@@ -567,11 +724,23 @@ mod tests {
         let peer = random_ed25519();
         let gate = FederationAdmissionGate::new(DenyOrigin, FailingResolve);
         let err = gate
-            .admit(ORIGIN, ApplicationSignerKey(peer), DID, None)
+            .admit(
+                ORIGIN,
+                interop_signer(peer),
+                AdmissionTrustSurface::ThirdPartyInterop,
+                DID,
+                None,
+            )
             .await
             .expect_err("denied origin must reject");
-        assert!(err.to_string().contains("stage 1"), "expected stage-1 rejection, got: {err}");
-        assert!(!err.to_string().contains("did not resolve"), "stage 2 must not run: {err}");
+        assert!(
+            err.to_string().contains("stage 1"),
+            "expected stage-1 rejection, got: {err}"
+        );
+        assert!(
+            !err.to_string().contains("did not resolve"),
+            "stage 2 must not run: {err}"
+        );
     }
 
     #[tokio::test]
@@ -579,10 +748,52 @@ mod tests {
         let peer = random_ed25519();
         let gate = FederationAdmissionGate::new(AllowOrigin, FailingResolve);
         let err = gate
-            .admit(ORIGIN, ApplicationSignerKey(peer), DID, None)
+            .admit(
+                ORIGIN,
+                interop_signer(peer),
+                AdmissionTrustSurface::ThirdPartyInterop,
+                DID,
+                None,
+            )
             .await
             .expect_err("resolution failure must reject (fail-closed)");
         assert!(err.to_string().contains("did not resolve"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn native_surface_rejects_classical_ed25519_before_resolution() {
+        let peer = random_ed25519();
+        let err = admit_key_against_did(
+            &NeverResolve,
+            ORIGIN,
+            interop_signer(peer),
+            AdmissionTrustSurface::Native,
+            &ed25519_to_did_key(&peer),
+            None,
+            None,
+        )
+        .await
+        .expect_err("native admission must require PQ-hybrid assurance");
+        assert!(err.to_string().contains("PQ-hybrid"), "{err}");
+        assert!(err.to_string().contains("downgrade"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn native_surface_accepts_verified_hybrid_proof() {
+        let peer = random_ed25519();
+        let did = ed25519_to_did_key(&peer);
+        let admitted = admit_key_against_did(
+            &NeverResolve,
+            ORIGIN,
+            hybrid_signer(peer),
+            AdmissionTrustSurface::Native,
+            &did,
+            None,
+            None,
+        )
+        .await
+        .expect("hybrid proof satisfies the native assurance floor");
+        assert_eq!(admitted.key, peer);
     }
 
     // ── JWKS fallback path ───────────────────────────────────────────────────
@@ -593,9 +804,16 @@ mod tests {
         let published = random_ed25519();
         let peer = random_ed25519();
         let jwks = jwks_with_keys(&[peer]);
-        let gate = FederationAdmissionGate::new(AllowOrigin, FixtureDoc(did_doc_with_vm(&[published])));
+        let gate =
+            FederationAdmissionGate::new(AllowOrigin, FixtureDoc(did_doc_with_vm(&[published])));
         let admitted = gate
-            .admit(ORIGIN, ApplicationSignerKey(peer), DID, Some(&jwks))
+            .admit(
+                ORIGIN,
+                interop_signer(peer),
+                AdmissionTrustSurface::ThirdPartyInterop,
+                DID,
+                Some(&jwks),
+            )
             .await
             .expect("JWKS fallback must admit");
         // Matched via JWKS, not a specific DID-doc VM.
@@ -609,9 +827,16 @@ mod tests {
         let jwks_key = random_ed25519();
         let peer = random_ed25519(); // in neither the doc nor the JWKS
         let jwks = jwks_with_keys(&[jwks_key]);
-        let gate = FederationAdmissionGate::new(AllowOrigin, FixtureDoc(did_doc_with_vm(&[published])));
+        let gate =
+            FederationAdmissionGate::new(AllowOrigin, FixtureDoc(did_doc_with_vm(&[published])));
         let err = gate
-            .admit(ORIGIN, ApplicationSignerKey(peer), DID, Some(&jwks))
+            .admit(
+                ORIGIN,
+                interop_signer(peer),
+                AdmissionTrustSurface::ThirdPartyInterop,
+                DID,
+                Some(&jwks),
+            )
             .await
             .expect_err("key in neither source must reject");
         assert!(err.to_string().contains("nor the federation JWKS"), "{err}");
@@ -621,7 +846,10 @@ mod tests {
     fn no_application_signer_proof_helper_is_fail_closed() {
         let err = reject_no_application_signer_proof(ORIGIN);
         assert!(err.to_string().contains("failing closed"), "{err}");
-        assert!(err.to_string().contains("carrier NodeId/EndpointId"), "{err}");
+        assert!(
+            err.to_string().contains("carrier NodeId/EndpointId"),
+            "{err}"
+        );
     }
 
     // ── did:key self-certifying arm (#281) ───────────────────────────────────
@@ -647,7 +875,13 @@ mod tests {
         let did = ed25519_to_did_key(&key);
         let gate = FederationAdmissionGate::new(AllowOrigin, NeverResolve);
         let admitted = gate
-            .admit(ORIGIN, ApplicationSignerKey(key), &did, None)
+            .admit(
+                ORIGIN,
+                interop_signer(key),
+                AdmissionTrustSurface::ThirdPartyInterop,
+                &did,
+                None,
+            )
             .await
             .expect("matching did:key must admit (self-certifying)");
         assert_eq!(admitted.origin, ORIGIN);
@@ -663,7 +897,13 @@ mod tests {
         let did = ed25519_to_did_key(&identity);
         let gate = FederationAdmissionGate::new(AllowOrigin, NeverResolve);
         let err = gate
-            .admit(ORIGIN, ApplicationSignerKey(peer), &did, None)
+            .admit(
+                ORIGIN,
+                interop_signer(peer),
+                AdmissionTrustSurface::ThirdPartyInterop,
+                &did,
+                None,
+            )
             .await
             .expect_err("mismatched did:key must reject");
         assert!(err.to_string().contains("stage 2"), "{err}");
@@ -679,10 +919,19 @@ mod tests {
         let did = ed25519_to_did_key(&key);
         let gate = FederationAdmissionGate::new(DenyOrigin, NeverResolve);
         let err = gate
-            .admit(ORIGIN, ApplicationSignerKey(key), &did, None)
+            .admit(
+                ORIGIN,
+                interop_signer(key),
+                AdmissionTrustSurface::ThirdPartyInterop,
+                &did,
+                None,
+            )
             .await
             .expect_err("denied origin must reject a did:key peer");
-        assert!(err.to_string().contains("stage 1"), "expected stage-1 rejection, got: {err}");
+        assert!(
+            err.to_string().contains("stage 1"),
+            "expected stage-1 rejection, got: {err}"
+        );
     }
 
     #[tokio::test]
@@ -693,7 +942,13 @@ mod tests {
         let bad_did = "did:key:zNotAValidEd25519Multikey";
         let gate = FederationAdmissionGate::new(AllowOrigin, NeverResolve);
         let err = gate
-            .admit(ORIGIN, ApplicationSignerKey(peer), bad_did, None)
+            .admit(
+                ORIGIN,
+                interop_signer(peer),
+                AdmissionTrustSurface::ThirdPartyInterop,
+                bad_did,
+                None,
+            )
             .await
             .expect_err("invalid did:key must reject (fail-closed)");
         assert!(err.to_string().contains("stage 2"), "{err}");
@@ -738,17 +993,25 @@ mod tests {
         // material (no config trust).
         let ed = random_ed25519();
         let keys = verified_subject(ed);
-        let gate = FixtureGate { keys: keys.clone(), fail: false };
+        let gate = FixtureGate {
+            keys: keys.clone(),
+            fail: false,
+        };
         let mut store = KeyedPqTrustStore::new();
         assert!(store.is_empty(), "store starts empty (no config trust)");
 
         let admitted = admit_key_against_did(
             &NeverResolve,
             ORIGIN,
-            ApplicationSignerKey(ed),
+            hybrid_signer(ed),
+            AdmissionTrustSurface::Native,
             AT9P_DID,
             None,
-            Some(At9pAdmission { capsule_bytes: b"<capsule>", gate: &gate, pq_store: &mut store }),
+            Some(At9pAdmission {
+                capsule_bytes: b"<capsule>",
+                gate: &gate,
+                pq_store: &mut store,
+            }),
         )
         .await
         .expect("verified capsule must admit");
@@ -758,9 +1021,7 @@ mod tests {
         // The binding is exactly the capsule's verified keys — comes from the
         // capsule, not config.
         assert_eq!(store.len(), 1, "exactly one hybrid binding installed");
-        let bound = store
-            .ml_dsa_key_for(&ed)
-            .expect("ed25519→ml_dsa_65 bound");
+        let bound = store.ml_dsa_key_for(&ed).expect("ed25519→ml_dsa_65 bound");
         assert_eq!(ml_dsa_vk_bytes(&bound), ml_dsa_vk_bytes(keys.ml_dsa_65()));
     }
 
@@ -769,16 +1030,24 @@ mod tests {
         // A capsule that fails GATE (bad sig / wrong cid) → reject, and crucially
         // NOTHING is bound into the trust store (no downgrade, no partial trust).
         let ed = random_ed25519();
-        let gate = FixtureGate { keys: verified_subject(ed), fail: true };
+        let gate = FixtureGate {
+            keys: verified_subject(ed),
+            fail: true,
+        };
         let mut store = KeyedPqTrustStore::new();
 
         let err = admit_key_against_did(
             &NeverResolve,
             ORIGIN,
-            ApplicationSignerKey(ed),
+            hybrid_signer(ed),
+            AdmissionTrustSurface::Native,
             AT9P_DID,
             None,
-            Some(At9pAdmission { capsule_bytes: b"<capsule>", gate: &gate, pq_store: &mut store }),
+            Some(At9pAdmission {
+                capsule_bytes: b"<capsule>",
+                gate: &gate,
+                pq_store: &mut store,
+            }),
         )
         .await
         .expect_err("GATE failure must reject (fail-closed)");
@@ -794,16 +1063,24 @@ mod tests {
         let identity = random_ed25519();
         let peer = random_ed25519();
         assert_ne!(identity, peer);
-        let gate = FixtureGate { keys: verified_subject(identity), fail: false };
+        let gate = FixtureGate {
+            keys: verified_subject(identity),
+            fail: false,
+        };
         let mut store = KeyedPqTrustStore::new();
 
         let err = admit_key_against_did(
             &NeverResolve,
             ORIGIN,
-            ApplicationSignerKey(peer),
+            hybrid_signer(peer),
+            AdmissionTrustSurface::Native,
             AT9P_DID,
             None,
-            Some(At9pAdmission { capsule_bytes: b"<capsule>", gate: &gate, pq_store: &mut store }),
+            Some(At9pAdmission {
+                capsule_bytes: b"<capsule>",
+                gate: &gate,
+                pq_store: &mut store,
+            }),
         )
         .await
         .expect_err("application-signer mismatch must reject");
@@ -816,9 +1093,17 @@ mod tests {
         // did:at9p presented but no capsule/admission context supplied (the live
         // accept path does not feed bytes yet) → fail closed.
         let peer = random_ed25519();
-        let err = admit_key_against_did(&NeverResolve, ORIGIN, ApplicationSignerKey(peer), AT9P_DID, None, None)
-            .await
-            .expect_err("missing capsule context must reject");
+        let err = admit_key_against_did(
+            &NeverResolve,
+            ORIGIN,
+            hybrid_signer(peer),
+            AdmissionTrustSurface::Native,
+            AT9P_DID,
+            None,
+            None,
+        )
+        .await
+        .expect_err("missing capsule context must reject");
         assert!(err.to_string().contains("stage 2"), "{err}");
         assert!(err.to_string().contains("fail-closed"), "{err}");
     }
@@ -829,11 +1114,20 @@ mod tests {
         let ed = random_ed25519();
         let gate = FederationAdmissionGate::new(DenyOrigin, NeverResolve);
         let err = gate
-            .admit(ORIGIN, ApplicationSignerKey(ed), AT9P_DID, None)
+            .admit(
+                ORIGIN,
+                hybrid_signer(ed),
+                AdmissionTrustSurface::Native,
+                AT9P_DID,
+                None,
+            )
             .await
             .expect_err("denied origin must reject a did:at9p peer");
         // gate.admit passes None for the at9p context, so stage 1's denial is what
         // surfaces (stage 2 never runs).
-        assert!(err.to_string().contains("stage 1"), "expected stage-1 rejection, got: {err}");
+        assert!(
+            err.to_string().contains("stage 1"),
+            "expected stage-1 rejection, got: {err}"
+        );
     }
 }
