@@ -114,9 +114,9 @@ pub mod manifest;
 
 pub use bind::{clamp_descendant, BindLabel, BindLabelMap};
 pub use dispatch_pep::{
-    check_dispatch_mac, global_mac_dispatch_pep, install_mac_dispatch_pep, DefaultMacDispatchPep,
-    DenyAllMacPep, DenyAllObjectResolver, MacDecision, MacDenyReason, MacDispatchPep,
-    RpcObjectLabelResolver,
+    check_dispatch_mac, ensure_dormant_mac_pep, global_mac_dispatch_pep, install_mac_dispatch_pep,
+    DefaultMacDispatchPep, DenyAllMacPep, DenyAllObjectResolver, DormantMacPep, MacDecision,
+    MacDenyReason, MacDispatchPep, RpcObjectLabelResolver,
 };
 pub use context::{SecurityContext, SubjectContextClaims, VerifiedKeyMaterial};
 pub use genesis::{GenesisMap, GenesisReport};

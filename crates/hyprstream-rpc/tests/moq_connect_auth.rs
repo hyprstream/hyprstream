@@ -16,6 +16,7 @@
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
+use hyprstream_rpc::auth::mac::ensure_dormant_mac_pep;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -133,6 +134,7 @@ fn trivial_processor() -> Arc<dyn hyprstream_rpc::transport::rpc_session::IrohRe
 /// shared endpoint; cross-tenant enumeration is structurally impossible.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn authenticated_peer_sees_only_own_tenant() -> Result<()> {
+    ensure_dormant_mac_pep();
     hyprstream_rpc::transport::install_pq_crypto_provider().expect("install PQ provider");
 
     // One shared origin carrying BOTH tenants' broadcasts.
@@ -199,6 +201,7 @@ async fn authenticated_peer_sees_only_own_tenant() -> Result<()> {
 /// REFUSED — the WebTransport CONNECT never completes. Fail-closed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
 async fn unauthenticated_connect_is_refused() -> Result<()> {
+    ensure_dormant_mac_pep();
     hyprstream_rpc::transport::install_pq_crypto_provider().expect("install PQ provider");
 
     let producer = moq_net::Origin::random().produce();
@@ -252,6 +255,7 @@ async fn unauthenticated_connect_is_refused() -> Result<()> {
 /// not parsing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
 async fn forged_credential_is_refused() -> Result<()> {
+    ensure_dormant_mac_pep();
     hyprstream_rpc::transport::install_pq_crypto_provider().expect("install PQ provider");
 
     let producer = moq_net::Origin::random().produce();
@@ -310,6 +314,7 @@ async fn forged_credential_is_refused() -> Result<()> {
 /// announce timing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
 async fn relay_mode_refuses_anonymous_connect() -> Result<()> {
+    ensure_dormant_mac_pep();
     hyprstream_rpc::transport::install_pq_crypto_provider().expect("install PQ provider");
 
     let relay_producer = moq_net::Origin::random().produce();
@@ -373,6 +378,7 @@ async fn relay_mode_refuses_anonymous_connect() -> Result<()> {
 /// verified tenant prefix.
 #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
 async fn relay_authenticated_cross_tenant_publish_refused() -> Result<()> {
+    ensure_dormant_mac_pep();
     hyprstream_rpc::transport::install_pq_crypto_provider().expect("install PQ provider");
 
     let relay_producer = moq_net::Origin::random().produce();
@@ -429,6 +435,7 @@ async fn relay_authenticated_cross_tenant_publish_refused() -> Result<()> {
 /// legitimate same-tenant traffic).
 #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
 async fn relay_authenticated_own_tenant_publish_succeeds() -> Result<()> {
+    ensure_dormant_mac_pep();
     hyprstream_rpc::transport::install_pq_crypto_provider().expect("install PQ provider");
 
     let relay_producer = moq_net::Origin::random().produce();
@@ -479,6 +486,7 @@ async fn relay_authenticated_own_tenant_publish_succeeds() -> Result<()> {
 /// Compile-time check that the documented public API surface is wired.
 #[test]
 fn authz_surface_is_public() {
+    ensure_dormant_mac_pep();
     fn _assert(
         _a: MoqConnectAuthz,
         _r: VerifiedSubjectTenantResolver,

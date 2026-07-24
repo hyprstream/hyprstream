@@ -26,6 +26,7 @@
 //! Libtorch is NOT required (this is transport, not inference).
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
+use hyprstream_rpc::auth::mac::ensure_dormant_mac_pep;
 use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
@@ -391,6 +392,7 @@ impl RequestService for RegistryService {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rpc_round_trip_model_status_and_registry_list_over_iroh() -> Result<()> {
+    ensure_dormant_mac_pep();
     install_hybrid_verify_policy();
 
     // ─── Server: bind Iroh substrate serving `hyprstream-rpc/1` ──────────────
@@ -569,6 +571,7 @@ impl RequestService for CompositeRpcService {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn anonymous_moq_handshake_over_iroh_is_rejected() -> Result<()> {
+    ensure_dormant_mac_pep();
     // ─── Server: real moq handler on the `moql` ALPN.
     let shared = OriginShared::new();
     let moq_handler = IrohMoqProtocolHandler::with_origin(shared);
@@ -628,6 +631,7 @@ async fn anonymous_moq_handshake_over_iroh_is_rejected() -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn one_substrate_serves_rpc_and_rejects_anonymous_moq() -> Result<()> {
+    ensure_dormant_mac_pep();
     install_hybrid_verify_policy();
 
     // ─── Server: one substrate, two real handlers ───────────────────────────
@@ -713,6 +717,7 @@ async fn one_substrate_serves_rpc_and_rejects_anonymous_moq() -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn dial_stream_iroh_without_reach_fails_fast() {
+    ensure_dormant_mac_pep();
     // Ensure the shared client endpoint is installed + live (otherwise the dial
     // would short-circuit on "no iroh client endpoint installed", which is
     // order-dependent across this binary's tests). With it installed we exercise
