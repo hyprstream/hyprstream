@@ -32,6 +32,7 @@ use tch::Device;
 use tch::{Kind as DType, Tensor};
 
 use super::KVQuantType;
+use super::kv_compat::KvCompatFingerprint;
 use super::torch_utils::{estimate_tensor_size_mb, safe_zeros};
 
 // ============================================================================
@@ -1930,6 +1931,11 @@ pub struct KVCacheManager {
     cached_token_ids: Vec<i64>,
     /// Where this cache's tensors currently reside
     location: CacheLocation,
+    /// Compatibility fingerprint under which this cache's KV was produced
+    /// (#1277). `None` until the cache is first populated; the engine stamps it
+    /// at reuse time and rejects (clears + recomputes) on mismatch against the
+    /// current expected fingerprint.
+    compat_fingerprint: Option<KvCompatFingerprint>,
 }
 
 impl KVCacheManager {
@@ -1956,6 +1962,7 @@ impl KVCacheManager {
             access_count: AtomicU64::new(0),
             cached_token_ids: Vec::new(),
             location: CacheLocation::Gpu,
+            compat_fingerprint: None,
         }
     }
 
@@ -1990,6 +1997,7 @@ impl KVCacheManager {
             access_count: AtomicU64::new(0),
             cached_token_ids: Vec::new(),
             location: CacheLocation::Gpu,
+            compat_fingerprint: None,
         }
     }
 
@@ -2033,6 +2041,20 @@ impl KVCacheManager {
         for mut cache_ref in self.layer_caches.iter_mut() {
             cache_ref.clear();
         }
+    }
+
+    /// The compatibility fingerprint stamped on this cache, or `None` until the
+    /// cache is first populated (#1277).
+    pub fn compat_fingerprint(&self) -> Option<KvCompatFingerprint> {
+        self.compat_fingerprint
+    }
+
+    /// Stamp (or re-stamp) the compatibility fingerprint under which this
+    /// cache's KV is being produced. Called by the engine at reuse time: a fresh
+    /// cache is stamped with the current config; an incompatible cache is
+    /// cleared and re-stamped after its stale KV is discarded.
+    pub fn set_compat_fingerprint(&mut self, fp: KvCompatFingerprint) {
+        self.compat_fingerprint = Some(fp);
     }
 
     /// Enable or disable caching
