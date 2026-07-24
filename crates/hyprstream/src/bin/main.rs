@@ -387,16 +387,16 @@ fn init_telemetry(provider: TelemetryProvider) -> Result<()> {
         .with_attribute(KeyValue::new("service.version", env!("CARGO_PKG_VERSION")))
         .build();
 
+    let endpoint = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
+        .unwrap_or_else(|_| "http://localhost:4317".to_owned());
+
     let tracer_provider = match provider {
         TelemetryProvider::Otlp => {
-            let endpoint = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
-                .unwrap_or_else(|_| "http://localhost:4317".to_owned());
-
             info!("Using OTLP exporter for OpenTelemetry at {}", endpoint);
 
             let exporter = SpanExporter::builder()
                 .with_tonic()
-                .with_endpoint(endpoint)
+                .with_endpoint(endpoint.clone())
                 .build()
                 .context("Failed to create OTLP exporter")?;
 
@@ -409,11 +409,41 @@ fn init_telemetry(provider: TelemetryProvider) -> Result<()> {
             info!("Using stdout exporter for OpenTelemetry (debug)");
 
             opentelemetry_sdk::trace::SdkTracerProvider::builder()
-                .with_resource(resource)
+                .with_resource(resource.clone())
                 .with_simple_exporter(opentelemetry_stdout::SpanExporter::default())
                 .build()
         }
     };
+
+    // Token-burn + other OTel metrics (#1261) only flow to a collector when a
+    // meter provider is registered; otherwise the global meter is a no-op. Build
+    // a periodic-exporting provider mirroring the tracer provider's transport.
+    let meter_provider = match provider {
+        TelemetryProvider::Otlp => {
+            let exporter = opentelemetry_otlp::MetricExporter::builder()
+                .with_tonic()
+                .with_endpoint(endpoint)
+                .build()
+                .context("Failed to create OTLP metric exporter")?;
+
+            opentelemetry_sdk::metrics::SdkMeterProvider::builder()
+                .with_resource(resource.clone())
+                .with_reader(
+                    opentelemetry_sdk::metrics::PeriodicReader::builder(exporter).build(),
+                )
+                .build()
+        }
+        TelemetryProvider::Stdout => opentelemetry_sdk::metrics::SdkMeterProvider::builder()
+            .with_resource(resource)
+            .with_reader(
+                opentelemetry_sdk::metrics::PeriodicReader::builder(
+                    opentelemetry_stdout::MetricExporter::default(),
+                )
+                .build(),
+            )
+            .build(),
+    };
+    opentelemetry::global::set_meter_provider(meter_provider);
 
     let tracer = tracer_provider.tracer("hyprstream");
     let otel_layer = OpenTelemetryLayer::new(tracer);
