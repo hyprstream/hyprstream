@@ -30,6 +30,7 @@ pub mod ttn_profile;  // TTN analysis pipeline: adaptive layer profiling + embed
 pub mod batched_lora; // Batched multi-tenant LoRA forward pass
 // REMOVED: pub mod conversation_router; // Dead code - VDB TemporalStreamingLayer removed
 pub mod generation_metrics; // Quality metrics for self-supervised training
+pub mod token_metrics; // OpenTelemetry token-burn metering (prompt + generated tokens per request)
 // KV cache quantization — re-export the generated Cap'n Proto enum as canonical type
 pub use crate::services::generated::model_client::KVQuantType;
 pub mod tensor_sampling; // Device-agnostic tensor-based sampling

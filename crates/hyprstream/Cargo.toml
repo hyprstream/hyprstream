@@ -256,6 +256,11 @@ rand.workspace = true
 tower = { version = "0.5", features = ["util"] }
 # Test-only: WebSocket client for the 9P-over-WS attach round-trip (H1a / #764).
 tokio-tungstenite = "0.24"
+# Test-only: the `testing` feature exposes `InMemoryMetricExporter` for the
+# token-burn meter tests. The SDK compiles it under cfg(test) or this feature;
+# dependencies are not built with cfg(test), so the feature is required here.
+# Dev-only, so production builds are unaffected.
+opentelemetry_sdk = { workspace = true, features = ["testing"] }
 
 [lints]
 workspace = true

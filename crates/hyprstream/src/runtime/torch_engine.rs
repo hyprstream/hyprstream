@@ -142,8 +142,15 @@ pub struct TorchEngine {
     // Note: Pre-training not supported (persistent_model doesn't expose VarStore), LoRA only
 }
 
-/// Tokenize `text` with `tokenizer`, emitting only bounded, content-redacted
-/// metadata to the process log (byte/char length, token count).
+/// Tokenize `text` with `tokenizer`, writing no caller content to the process
+/// log.
+///
+/// Token-burn counts (prompt token count) are now emitted as OTel metrics at the
+/// call site (`TextStream::new_with_delta`), not as log lines (#1261) — the log
+/// is no longer the metering source. This helper logs only on the two
+/// content-free diagnostic outcomes: an empty token sequence (failure) and a
+/// tokenize/decode roundtrip mismatch (a real tokenizer-bug signal), in both
+/// cases carrying only bounded lengths, never the text.
 ///
 /// #1253: the prompt and its decoded token text are tenant-private and must
 /// never reach process-wide logs — a shared inference process exposes them
@@ -167,8 +174,6 @@ fn tokenize_redacted(tokenizer: &Tokenizer, text: &str) -> Result<Vec<i64>> {
             chars
         ));
     }
-
-    tracing::info!(bytes, chars, tokens = token_ids.len(), "Tokenized prompt");
 
     // Surface roundtrip mismatches for diagnosis, but never the original or
     // decoded text — only that they diverged and the bounded lengths.
@@ -1325,6 +1330,22 @@ impl TorchEngine {
     }
 }
 
+impl TorchEngine {
+    /// Stable, content-free label identifying the loaded model for OTel metric
+    /// attributes (#1261). Prefers the model name (set on load); falls back to
+    /// architecture, then "unknown". Never the prompt or generated text.
+    fn model_label(&self) -> String {
+        let info = self.model_info.lock().clone();
+        if !info.name.is_empty() && info.name != "unloaded" {
+            info.name
+        } else if !info.architecture.is_empty() && info.architecture != "unknown" {
+            info.architecture
+        } else {
+            "unknown".to_owned()
+        }
+    }
+}
+
 #[async_trait]
 impl RuntimeEngine for TorchEngine {
     #[instrument(name = "torch_engine.load_model", skip(self), fields(path = %path.display()))]
@@ -2320,8 +2341,8 @@ mod tests {
             assert_eq!(ids.unwrap().len(), 3);
         });
         assert!(
-            logs.contains("Tokenized prompt"),
-            "success path must still emit bounded metadata: {logs}"
+            !logs.contains("Tokenized prompt"),
+            "success path must no longer emit a metering log line (token counts are OTel metrics now, #1261): {logs}"
         );
         assert!(
             !logs.contains(LEAK_CANARY),
@@ -2640,6 +2661,12 @@ pub struct TextStream<'a> {
     last_token_time: Option<std::time::Instant>,
     /// Exponential moving average of tokens per second
     ema_tokens_per_sec: f32,
+
+    /// Model label for OTel token-burn metric attributes (#1261).
+    model_label: String,
+    /// Opaque (hashed) tenant id for token-burn metric attributes — never the
+    /// raw request subject (#1253). `None` when no tenant is in scope.
+    tenant_hash: Option<u64>,
 }
 
 impl<'a> TextStream<'a> {
@@ -2656,6 +2683,15 @@ impl<'a> TextStream<'a> {
         let prompt_tokens = engine.tokenize(&request.prompt)?;
         let prompt_len = prompt_tokens.len();
 
+        // Token-burn metering (#1261): emit the prompt-token count at the
+        // tokenization boundary as an OTel metric. The raw tenant subject is never
+        // a metric attribute — it is reduced to an opaque hash (#1253); the
+        // authoritative spend ledger is #1264.
+        let tenant_hash = crate::runtime::token_metrics::opaque_tenant_id(&tenant_id);
+        let model_label = engine.model_label();
+        crate::runtime::token_metrics::TokenBurnMeter::global()
+            .record_prompt(&model_label, tenant_hash, prompt_len as u64);
+
         let tokenizer = engine.get_tokenizer()?;
         let stop_token_ids: Vec<u32> = request.stop_tokens.as_deref().unwrap_or(&[])
             .iter()
@@ -2667,11 +2703,12 @@ impl<'a> TextStream<'a> {
                 } else {
                     // The stop sequence is caller-supplied content and is never
                     // logged (#1253); only its byte length and resulting token
-                    // count are retained, plus the opaque tenant id.
+                    // count are retained. The tenant is referenced only by its
+                    // opaque hash — the raw subject is dropped from logs.
                     tracing::warn!(
                         stop_bytes = stop_str.len(),
                         encoded_tokens = ids.len(),
-                        tenant = ?tenant_id,
+                        tenant_hash = ?tenant_hash,
                         "Stop token encodes to multiple tokens, skipping (only single-token stops supported; content redacted)"
                     );
                     None
@@ -2820,6 +2857,8 @@ impl<'a> TextStream<'a> {
             first_token_time: None,
             last_token_time: None,
             ema_tokens_per_sec: 0.0,
+            model_label,
+            tenant_hash,
         })
     }
 
@@ -3271,13 +3310,9 @@ impl<'a> Stream for TextStream<'a> {
                     }
 
                     // DecodeStream returned text - emit it. The chunk text is
-                    // generated content and is never logged (#1253); only the
-                    // token id and byte length are retained for observability.
-                    tracing::debug!(
-                        token = next_token,
-                        len = text.len(),
-                        "Generated text chunk (content redacted)"
-                    );
+                    // generated content and is never logged (#1253); generated-
+                    // token counts are now emitted as OTel metrics at completion
+                    // (#1261), so the per-chunk count log is dropped.
                     return Poll::Ready(Some(Ok(text)));
                 }
                 Ok(None) => {
@@ -3314,5 +3349,18 @@ impl<'a> Drop for TextStream<'a> {
         // Save token IDs to the session cache for prefix matching on the next turn.
         // This runs on all exit paths (EOS, stop token, max tokens, timeout, error).
         self.save_cached_tokens();
+
+        // Token-burn metering (#1261): emit the generated-token count and the
+        // per-request total at completion. Drop runs on every exit path, so this
+        // covers normal EOS, stop-token, max-tokens, timeout, and error finishes.
+        // Only integer counts and the opaque tenant hash are metric attributes (#1253).
+        let generated = self.tokens_generated as u64;
+        let meter = crate::runtime::token_metrics::TokenBurnMeter::global();
+        meter.record_generated(&self.model_label, self.tenant_hash, generated);
+        meter.record_request_total(
+            &self.model_label,
+            self.tenant_hash,
+            self.prompt_len as u64 + generated,
+        );
     }
 }
