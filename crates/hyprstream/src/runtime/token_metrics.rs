@@ -165,7 +165,7 @@ mod tests {
     /// Drive the meter through a real SDK pipeline (in-memory exporter) and assert
     /// token burn lands on the right instruments with opaque, never-raw tenant attrs.
     #[test]
-    fn token_burn_meter_records_prompt_and_generated() {
+    fn token_burn_meter_records_prompt_and_generated() -> Result<(), Box<dyn std::error::Error>> {
         let exporter = InMemoryMetricExporter::default();
         let provider = SdkMeterProvider::builder()
             .with_reader(PeriodicReader::builder(exporter.clone()).build())
@@ -179,8 +179,8 @@ mod tests {
         m.record_generated("test-model", tenant_hash, 7);
         m.record_request_total("test-model", tenant_hash, 17);
 
-        provider.force_flush().unwrap();
-        let collected = exporter.get_finished_metrics().unwrap();
+        provider.force_flush()?;
+        let collected = exporter.get_finished_metrics()?;
 
         // Flatten (name, sum-or-count, serialized-attrs) across scopes/instruments.
         let mut counter_sum: u64 = 0;
@@ -235,6 +235,7 @@ mod tests {
             any_attrs.contains("tenant:"),
             "opaque tenant attr missing: {any_attrs}"
         );
+        Ok(())
     }
 
     #[test]
@@ -254,7 +255,7 @@ mod tests {
     }
 
     #[test]
-    fn zero_prompt_is_a_noop() {
+    fn zero_prompt_is_a_noop() -> Result<(), Box<dyn std::error::Error>> {
         // A zero count should not add a data point to the counter.
         let exporter = InMemoryMetricExporter::default();
         let provider = SdkMeterProvider::builder()
@@ -264,18 +265,21 @@ mod tests {
         let m = TokenBurnMeter::from_meter(meter);
         m.record_prompt("test-model", None, 0);
         m.record_generated("test-model", None, 0);
-        provider.force_flush().unwrap();
+        provider.force_flush()?;
 
         let mut any_counter: u64 = 0;
-        for rm in exporter.get_finished_metrics().unwrap() {
+        for rm in exporter.get_finished_metrics()? {
             for sm in rm.scope_metrics() {
                 for metric in sm.metrics() {
                     if let AggregatedMetrics::U64(MetricData::Sum(s)) = metric.data() {
-                        any_counter += s.data_points().map(|dp| dp.value()).sum::<u64>();
+                        for dp in s.data_points() {
+                            any_counter += dp.value();
+                        }
                     }
                 }
             }
         }
         assert_eq!(any_counter, 0, "zero-count records must not land on the counter");
+        Ok(())
     }
 }
