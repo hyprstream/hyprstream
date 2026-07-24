@@ -37,7 +37,7 @@ pub mod ucan;
 pub use atproto_perimeter::{AtprotoPerimeterGateway, EnrolledPeer, EnrollmentStore};
 // The identity-resolution contract (#579) lives canonically in `crate::identity`;
 // re-exported here so existing `crate::auth::{IdentityResolver, ...}` paths keep working.
-pub use crate::identity::{Ed25519Vk, IdentityKeys, IdentityResolver, MlDsaVk};
+pub use crate::identity::{Ed25519Vk, IdentityKeyCandidate, IdentityKeys, IdentityResolver, MlDsaVk};
 pub use claims::{
     ActClaim, Claims, Cnf, CnfJwk, IdTokenClaims, OneOrMany, compute_jkt, is_local_iss,
 };

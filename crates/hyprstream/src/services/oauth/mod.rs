@@ -680,6 +680,24 @@ impl Spawnable for OAuthService {
                 }
             };
 
+            // Root DID identity rotation is independent of JWT rotation. Seed
+            // the first active generation from the already-published service
+            // identity key so upgrading does not change `#key-1` bytes, then
+            // persist lead/active/drain beneath a dedicated directory.
+            let root_identity_dir = secrets_dir.join("root-did");
+            let root_identity_store = Arc::new(
+                crate::auth::key_rotation::load_or_init_root_identity_key_store(
+                    &root_identity_dir,
+                    &self.config,
+                    self.signing_key.clone(),
+                ),
+            );
+            crate::auth::key_rotation::spawn_root_identity_rotation_task(
+                Arc::clone(&oauth_config_arc),
+                root_identity_dir,
+                Arc::clone(&root_identity_store),
+            );
+
             // Create shared state — JWKS serves the CA JWT verifying key (from PolicyService)
             let jwt_verifying_key = self.jwt_verifying_key;
             let mut oauth_state = OAuthState::new(
@@ -703,6 +721,7 @@ impl Spawnable for OAuthService {
             if let Some(store) = signing_key_store {
                 oauth_state = oauth_state.with_signing_key_store(store);
             }
+            oauth_state = oauth_state.with_root_identity_key_store(root_identity_store);
             oauth_state = oauth_state.with_es256_key_store(Arc::clone(&es256_store));
             {
                 oauth_state = oauth_state.with_ml_dsa_key_store(Arc::clone(&ml_dsa_store));

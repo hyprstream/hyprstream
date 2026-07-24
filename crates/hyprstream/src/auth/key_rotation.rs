@@ -1101,6 +1101,11 @@ impl SigningKeyStore {
         slots.all().into_iter().cloned().collect()
     }
 
+    /// Snapshot the named drain/active/lead roles under one read guard.
+    pub async fn slots_snapshot(&self) -> KeySlots {
+        self.0.read().await.clone()
+    }
+
     /// Find a verifying key by kid across all slots (for token verification).
     pub async fn verifying_key_for_kid(&self, kid: &str) -> Option<ed25519_dalek::VerifyingKey> {
         let slots = self.0.read().await;
@@ -1234,6 +1239,59 @@ pub fn load_or_init_key_store(secrets_dir: &Path, config: &OAuthConfig) -> Signi
     })
 }
 
+/// Load the root-DID identity rotation set, seeding the first active slot from
+/// the already-provisioned node identity key.
+///
+/// `secrets_dir` is a dedicated subdirectory, so these durable slot files never
+/// collide with the JWT rotation set. Seeding from `initial_key` makes the first
+/// deployment a compatibility-preserving transition rather than a flag day.
+pub fn load_or_init_root_identity_key_store(
+    secrets_dir: &Path,
+    config: &OAuthConfig,
+    initial_key: SigningKey,
+) -> SigningKeyStore {
+    let now = chrono::Utc::now().timestamp();
+    let active_secs = config.active_secs();
+    let lead_secs = config.lead_secs();
+
+    let drain = load_slot(secrets_dir, "drain");
+    let mut active = load_slot(secrets_dir, "active");
+    let lead = load_slot(secrets_dir, "lead");
+
+    if active.is_none() {
+        let slot = KeySlot::new(initial_key, now, now + active_secs);
+        if let Err(error) = persist_slot(secrets_dir, "active", &slot) {
+            warn!("Could not persist root-DID active identity key: {error}");
+        } else {
+            info!("Seeded root-DID active identity key (kid={})", slot.kid());
+        }
+        active = Some(slot);
+    }
+
+    let should_generate_lead = lead.is_none()
+        && active
+            .as_ref()
+            .is_some_and(|slot| slot.exp - now < lead_secs);
+    if should_generate_lead {
+        let lead_nbf = active.as_ref().map_or(now, |slot| slot.exp - lead_secs);
+        let slot = generate_slot(lead_nbf, lead_nbf + active_secs);
+        if let Err(error) = persist_slot(secrets_dir, "lead", &slot) {
+            warn!("Could not persist root-DID lead identity key: {error}");
+        }
+    }
+    let lead = if should_generate_lead {
+        load_slot(secrets_dir, "lead")
+    } else {
+        lead
+    };
+
+    SigningKeyStore::new(KeySlots {
+        drain,
+        active,
+        lead,
+    })
+}
+
 // ── Rotation logic ──────────────────────────────────────────────────────────
 
 pub async fn rotate_jwt_keys(
@@ -1304,6 +1362,37 @@ pub async fn rotate_jwt_keys(
             }
         }
     }
+}
+
+/// Rotate only the root-DID Ed25519 identity set.
+///
+/// The same proven lead → active → bounded-drain state machine is reused, but
+/// the dedicated directory keeps its authority and persistence separate from
+/// JWT signing keys.
+pub fn spawn_root_identity_rotation_task(
+    config: Arc<OAuthConfig>,
+    secrets_dir: PathBuf,
+    store: Arc<SigningKeyStore>,
+) {
+    tokio::task::spawn_local(async move {
+        let mut interval = tokio::time::interval(
+            config
+                .rotation_check_interval()
+                .min(std::time::Duration::from_secs(60)),
+        );
+        interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            rotate_jwt_keys(
+                &config,
+                &secrets_dir,
+                &store,
+                chrono::Utc::now().timestamp(),
+            )
+            .await;
+        }
+    });
 }
 
 // ── Background task ─────────────────────────────────────────────────────────
@@ -2829,58 +2918,58 @@ mod tests {
         // it is used later to prove the committed drain remains usable.
         let oauth_url = std::fs::read_to_string(dir.path().join("oauth-http-url")).unwrap();
         let old_token = runtime.block_on(async {
-            policy_client_for_socket(dir.path())?
-                .issue_token(&crate::services::generated::policy_client::IssueToken {
-                    requested_scopes: Some(vec!["read".to_owned()]),
-                    ttl: Some(60),
-                    audience: Some("multiprocess".to_owned()),
-                    subject: Some("pre-rotation-policy".to_owned()),
-                    user_pub_key: None,
-                    dpop_jkt: None,
-                    issuer: None,
-                })
-                .await?;
-            let client = reqwest::Client::new();
-            let authorization_code_form = [
-                ("grant_type", "authorization_code"),
-                ("client_id", "multiprocess-client"),
-                ("code", "multiprocess-code"),
-                ("redirect_uri", "https://client.test/callback"),
-                ("code_verifier", "multiprocess-pkce-verifier"),
-            ];
-            let response = client
-                .post(format!("{oauth_url}/oauth/token"))
-                .form(&authorization_code_form)
-                .send()
-                .await?;
-            if !response.status().is_success() {
-                let status = response.status();
-                let body = response.text().await.unwrap_or_default();
-                anyhow::bail!("pre-rotation OAuth endpoint returned {status}: {body}");
-            }
-            let body: serde_json::Value = response.json().await?;
-            let token = body
-                .get("access_token")
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_owned)
+                policy_client_for_socket(dir.path())?
+                    .issue_token(&crate::services::generated::policy_client::IssueToken {
+                        requested_scopes: Some(vec!["read".to_owned()]),
+                        ttl: Some(60),
+                        audience: Some("multiprocess".to_owned()),
+                        subject: Some("pre-rotation-policy".to_owned()),
+                        user_pub_key: None,
+                        dpop_jkt: None,
+                        issuer: None,
+                    })
+                    .await?;
+                let client = reqwest::Client::new();
+                let authorization_code_form = [
+                    ("grant_type", "authorization_code"),
+                    ("client_id", "multiprocess-client"),
+                    ("code", "multiprocess-code"),
+                    ("redirect_uri", "https://client.test/callback"),
+                    ("code_verifier", "multiprocess-pkce-verifier"),
+                ];
+                let response = client
+                    .post(format!("{oauth_url}/oauth/token"))
+                    .form(&authorization_code_form)
+                    .send()
+                    .await?;
+                if !response.status().is_success() {
+                    let status = response.status();
+                    let body = response.text().await.unwrap_or_default();
+                    anyhow::bail!("pre-rotation OAuth endpoint returned {status}: {body}");
+                }
+                let body: serde_json::Value = response.json().await?;
+                let token = body
+                    .get("access_token")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
                 .ok_or_else(|| anyhow::anyhow!("pre-rotation OAuth response omitted access_token"))?;
-            let replay = client
-                .post(format!("{oauth_url}/oauth/token"))
-                .form(&authorization_code_form)
-                .send()
-                .await?;
-            anyhow::ensure!(
-                replay.status() == reqwest::StatusCode::BAD_REQUEST,
-                "authorization-code replay returned {}, expected 400",
-                replay.status()
-            );
-            let replay_body: serde_json::Value = replay.json().await?;
-            anyhow::ensure!(
-                replay_body.get("error").and_then(serde_json::Value::as_str)
-                    == Some("invalid_grant"),
-                "authorization-code replay was not rejected as invalid_grant: {replay_body}"
-            );
-            anyhow::Ok(token)
+                let replay = client
+                    .post(format!("{oauth_url}/oauth/token"))
+                    .form(&authorization_code_form)
+                    .send()
+                    .await?;
+                anyhow::ensure!(
+                    replay.status() == reqwest::StatusCode::BAD_REQUEST,
+                    "authorization-code replay returned {}, expected 400",
+                    replay.status()
+                );
+                let replay_body: serde_json::Value = replay.json().await?;
+                anyhow::ensure!(
+                    replay_body.get("error").and_then(serde_json::Value::as_str)
+                        == Some("invalid_grant"),
+                    "authorization-code replay was not rejected as invalid_grant: {replay_body}"
+                );
+                anyhow::Ok(token)
         }).unwrap();
         std::fs::write(dir.path().join("old-oauth-token"), old_token).unwrap();
 
@@ -3016,9 +3105,9 @@ mod tests {
             .collect();
         for kid in active_kids {
             assert!(jwks["keys"]
-                .as_array()
-                .unwrap()
-                .iter()
+                    .as_array()
+                    .unwrap()
+                    .iter()
                 .any(|key| { key.get("kid").and_then(serde_json::Value::as_str) == Some(kid) }));
         }
 
@@ -3168,9 +3257,9 @@ mod tests {
                 .any(|committed_pair| committed_pair.kid == candidate.kid)
         }) {
             assert!(!post_crash_jwks["keys"]
-                .as_array()
-                .unwrap()
-                .iter()
+                    .as_array()
+                    .unwrap()
+                    .iter()
                 .any(|key| key["kid"].as_str() == Some(pending_only.kid.as_str())));
         }
         let _ = (timeout_oauth_token, timeout_policy_token, post_crash_token);
@@ -3930,8 +4019,8 @@ mod tests {
         .await
         .unwrap();
         assert!(hyprstream_rpc::auth::global_composite_key_set()
-            .snapshot()
-            .pair(&old_kid)
+                .snapshot()
+                .pair(&old_kid)
             .is_none());
     }
 }

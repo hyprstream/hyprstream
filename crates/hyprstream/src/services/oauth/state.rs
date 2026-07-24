@@ -907,6 +907,12 @@ pub struct OAuthState {
     /// Ed25519 signing key for signing entity configurations (OpenID Federation 1.0).
     /// `None` when not configured.
     pub signing_key: Option<ed25519_dalek::SigningKey>,
+    /// Named root-DID identity slots (drain/active/lead).
+    ///
+    /// This store is seeded from `signing_key` on first deployment, then rotated
+    /// independently with bounded overlap. The root DID publisher snapshots all
+    /// three roles; entity statements sign with the active role.
+    pub root_identity_key_store: Option<Arc<crate::auth::SigningKeyStore>>,
     /// OpenID Federation 1.0 Trust Anchor URLs.
     /// Included as `authority_hints` in the entity configuration JWT.
     pub authority_hints: Vec<String>,
@@ -1079,6 +1085,7 @@ impl OAuthState {
             verifying_key_bytes,
             user_service: None,
             signing_key: None,
+            root_identity_key_store: None,
             authority_hints: config.authority_hints.clone(),
             pending_external_auths: RwLock::new(HashMap::new()),
             oidc_discovery: std::sync::Arc::new(
@@ -1140,6 +1147,15 @@ impl OAuthState {
     /// When set, JWKS serves all slots and WIT issuance uses the active key.
     pub fn with_signing_key_store(mut self, store: Arc<crate::auth::SigningKeyStore>) -> Self {
         self.signing_key_store = Some(store);
+        self
+    }
+
+    /// Attach the independently persisted root-DID identity rotation set.
+    pub fn with_root_identity_key_store(
+        mut self,
+        store: Arc<crate::auth::SigningKeyStore>,
+    ) -> Self {
+        self.root_identity_key_store = Some(store);
         self
     }
 
@@ -1223,6 +1239,16 @@ impl OAuthState {
             }
         }
         self.ca_jwt_key.clone()
+    }
+
+    /// Active root-DID signing key, falling back to the pre-rotation singleton.
+    pub async fn active_root_identity_signing_key(&self) -> Option<Arc<ed25519_dalek::SigningKey>> {
+        if let Some(store) = &self.root_identity_key_store {
+            if let Some(key) = store.active_key().await {
+                return Some(key);
+            }
+        }
+        self.signing_key.clone().map(Arc::new)
     }
 
     /// Attach a user credential store. Creates a `UserService` backed by the store
