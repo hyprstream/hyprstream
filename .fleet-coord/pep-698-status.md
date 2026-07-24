@@ -1,7 +1,7 @@
 # PEP-698 Status — Subject Clearance Provenance
 
 **Branch:** `feat/mac-clearance-provenance`
-**PR:** (pending push)
+**PR:** https://github.com/hyprstream/hyprstream/pull/1290
 **Issues:** [#698](https://github.com/hyprstream/hyprstream/issues/698) · [#1267](https://github.com/hyprstream/hyprstream/issues/1267)
 **Reviewer:** kimi-k3 (FINAL — do NOT self-merge)
 
