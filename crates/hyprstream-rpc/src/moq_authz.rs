@@ -45,6 +45,9 @@ use std::sync::Arc;
 #[cfg(not(target_arch = "wasm32"))]
 use moq_net::{OriginConsumer, Path};
 
+use crate::auth::mac::{MacDecision, MoqEventAction, MoqEventPep};
+use crate::envelope::Subject;
+
 /// The hierarchical track-name separator (`{tenant}/{service}/{topic}/{instance}`).
 pub const TRACK_NAME_SEP: char = '/';
 
@@ -297,6 +300,52 @@ impl SubscribeAuthorizer for DefaultAuthorizer {
 /// long-lived server/handler.
 pub type SharedSubscribeAuthorizer = Arc<dyn SubscribeAuthorizer>;
 
+// ────────────────────────────────────────────────────────────────────────────
+// MAC-backed subscribe authorizer (issue #1271, epic #547 track T3)
+// ────────────────────────────────────────────────────────────────────────────
+
+/// [`SubscribeAuthorizer`] backed by the shared [`MoqEventPep`] MAC floor.
+///
+/// Maps the [`PeerIdentity`]'s verified subject to a [`Subject`], resolves the
+/// track label + subject clearance via the PEP's seams, and applies
+/// `can_access`. Both seams fail closed (`None` ⇒ [`SubscribeDecision::Deny`]);
+/// there is no permissive bypass (epic #547: no permissive mode). Key possession
+/// (the §7.5 DH-derived topic capability) never substitutes for this decision —
+/// it gates metadata visibility, the MAC floor gates the labeled content.
+///
+/// Constructing this adapter installs an active PEP, so missing clearance and
+/// missing labels deny. Leaving the containing transport's authorizer unset is
+/// the dormant pre-activation state and remains pass-through.
+pub struct MacSubscribeAuthorizer {
+    pep: MoqEventPep,
+}
+
+impl MacSubscribeAuthorizer {
+    /// Build with a caller-supplied PEP (real resolver + clearance source).
+    pub fn new(pep: MoqEventPep) -> Self {
+        Self { pep }
+    }
+
+}
+
+impl SubscribeAuthorizer for MacSubscribeAuthorizer {
+    fn authorize(&self, peer: &PeerIdentity, track_name: &str) -> SubscribeDecision {
+        let subject = match &peer.subject {
+            Some(s) => Subject::new(s.clone()),
+            None => Subject::anonymous(),
+        };
+        if matches!(
+            self.pep
+                .check(&subject, track_name, MoqEventAction::Subscribe),
+            MacDecision::Permit
+        ) {
+            SubscribeDecision::Allow
+        } else {
+            SubscribeDecision::Deny
+        }
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
@@ -524,5 +573,27 @@ mod scope_tests {
         // bob/... is outside alice's scope → not reachable.
         let reached = scoped.announced_broadcast("bob/streams/run-9/i0").await;
         assert!(reached.is_none(), "alice-scoped consumer must not reach bob's broadcast");
+    }
+
+    // ── #1271: MAC-backed subscribe authorizer ─────────────────────────────
+
+    #[test]
+    fn dormant_subscribe_authorizer_is_absent() {
+        let config = crate::transport::iroh_moq::MoqAuthzConfig::default();
+        assert!(config.authorizer.is_none());
+    }
+
+    #[test]
+    fn mac_subscribe_authorizer_fail_closed_denies_all() {
+        // Once installed, missing clearance/labels deny.
+        let authz = super::MacSubscribeAuthorizer::new(crate::auth::mac::MoqEventPep::default());
+        assert_eq!(
+            authz.authorize(&PeerIdentity::anonymous(), "t"),
+            SubscribeDecision::Deny
+        );
+        assert_eq!(
+            authz.authorize(&PeerIdentity::authenticated("did:web:x"), "t"),
+            SubscribeDecision::Deny
+        );
     }
 }

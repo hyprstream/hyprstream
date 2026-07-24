@@ -56,6 +56,12 @@ impl MoqAuthzConfig {
     pub fn tenant_for(&self, peer: &PeerIdentity) -> Option<String> {
         self.tenant_resolver.as_ref().and_then(|r| r(peer))
     }
+
+    /// Set/replace the subscribe authorizer.
+    pub fn with_authorizer(mut self, authorizer: SharedSubscribeAuthorizer) -> Self {
+        self.authorizer = Some(authorizer);
+        self
+    }
 }
 
 /// Shared `Origin` clone-pair held by the handler.

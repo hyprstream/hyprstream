@@ -116,6 +116,7 @@ pub mod genesis;
 pub mod label;
 pub mod lattice;
 pub mod manifest;
+pub mod pep;
 
 pub use bind::{clamp_descendant, BindLabel, BindLabelMap};
 #[cfg(not(target_arch = "wasm32"))]
@@ -133,6 +134,9 @@ pub use lattice::{LabelError, Lattice, LatticeCodecError, LatticeDecodeError, La
 pub use manifest::{
     bind_time_label, import_label, ContentBoundLabel, LabeledObject, ObjectLabelResolver,
     ObjectRef, StaticNodeLabel,
+};
+pub use pep::{
+    ClearanceSource, DenyAllClearanceSource, MoqEventAction, MoqEventPep,
 };
 
 #[cfg(test)]
