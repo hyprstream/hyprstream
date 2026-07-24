@@ -2019,6 +2019,33 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn confidential_subscriber_rejects_cross_tenant_rebinding() {
+        let ed = signing_key();
+        let pq = crate::node_identity::derive_mesh_mldsa_key(&ed);
+        let subscriber = EventSubscriber::new().unwrap();
+        subscriber
+            .expect_confidential_prefix(
+                "tenant-a",
+                "orders",
+                "did:web:controller",
+                anchor(&ed, &pq),
+            )
+            .await
+            .unwrap();
+
+        let error = subscriber
+            .expect_confidential_prefix(
+                "tenant-b",
+                "orders",
+                "did:web:controller",
+                anchor(&ed, &pq),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.contains("already bound to tenant 'tenant-a'"));
+    }
+
     #[test]
     fn rekey_policy_and_authz_are_fail_closed() {
         assert!(RekeyPolicy::Scheduled {

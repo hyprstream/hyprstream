@@ -1017,6 +1017,7 @@ async fn issue_token_with_refresh(
             user_pub_key: user_pub_key_b64,
             dpop_jkt: dpop_jkt.clone(),
             issuer: Some(token_issuer.clone()),
+            tenant: None,
         })
         .await;
 
