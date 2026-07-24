@@ -713,6 +713,14 @@ async fn e6_gpu_load_and_stream_tokens() {
     use hyprstream_core::config::RuntimeConfig;
     use hyprstream_core::inference::{InferenceClient, LocalInferenceService};
 
+    // Hardware validation needs the production boundary and sampled-token
+    // traces. Tests do not otherwise install a tracing subscriber, so honor
+    // RUST_LOG here and write through libtest's captured output.
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_test_writer()
+        .try_init();
+
     let model = match gpu_and_model_ready() {
         Some(m) => m,
         None => return, // auto-skip on hosts without the prerequisites
@@ -766,6 +774,7 @@ async fn e6_gpu_load_and_stream_tokens() {
         ..Default::default()
     };
 
+    let generation_started = Instant::now();
     let mut handle = client
         .generate_stream(request)
         .await
@@ -773,9 +782,11 @@ async fn e6_gpu_load_and_stream_tokens() {
 
     let mut full = String::new();
     let mut chunks = 0usize;
+    let mut ttft = None;
     while let Some(chunk) = handle.next().await {
         match chunk {
             Ok(piece) => {
+                ttft.get_or_insert_with(|| generation_started.elapsed());
                 chunks += 1;
                 full.push_str(&piece);
             }
@@ -785,8 +796,11 @@ async fn e6_gpu_load_and_stream_tokens() {
     let stats = handle.stats().await.expect("final stream stats");
 
     eprintln!(
-        "[e2e_inference] produced {chunks} chunks, {} tokens, {:.1} tok/s: {:?}",
-        stats.tokens_generated, stats.tokens_per_second, full
+        "[e2e_inference] TTFT {:.2}ms; produced {chunks} chunks, {} tokens, {:.1} tok/s: {:?}",
+        ttft.unwrap_or_default().as_secs_f64() * 1000.0,
+        stats.tokens_generated,
+        stats.tokens_per_second,
+        full
     );
 
     // The load-bearing assertions: generation actually produced tokens over the
