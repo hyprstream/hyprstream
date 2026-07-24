@@ -11,6 +11,15 @@ on:
         description: Open PR number to validate
         required: true
         type: string
+      runner_label:
+        description: Runner flavor (use benchmark labels only for controlled sizing tests)
+        required: true
+        default: hyprstream-preflight
+        type: choice
+        options:
+          - hyprstream-preflight
+          - hyprstream-benchmark-4xlarge
+          - hyprstream-benchmark-8xlarge
   pull_request_target:
     types: [labeled]
 
@@ -77,7 +86,7 @@ jobs:
   build:
     name: Build + test (arm64 preflight)
     needs: resolve-pr
-    runs-on: [self-hosted, linux, arm64, graviton, hyprstream-preflight]
+    runs-on: [self-hosted, linux, arm64, graviton, "${{ inputs.runner_label || 'hyprstream-preflight' }}"]
     # Keep below the 150-minute reaper cap. This is deliberately the same full
     # validation script as the required merge-gate `build` job in rust.yml.
     timeout-minutes: 140
