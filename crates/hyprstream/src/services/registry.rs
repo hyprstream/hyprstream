@@ -1051,6 +1051,8 @@ impl RegistryService {
         &self,
         address: String,
         client_ephemeral_pubkey: Option<&[u8]>,
+        subject_id: String,
+        verified_tenant: Option<String>,
     ) -> Result<(StreamInfo, hyprstream_rpc::service::Continuation)> {
         let client_pub_bytes = client_ephemeral_pubkey
             .ok_or_else(|| anyhow!("Streaming requires client ephemeral pubkey for E2E authentication"))?;
@@ -1082,7 +1084,14 @@ impl RegistryService {
         };
 
         let continuation: hyprstream_rpc::service::Continuation = Box::pin(async move {
-            Self::execute_get_blob_stream(stream_channel, stream_ctx, address).await;
+            Self::execute_get_blob_stream(
+                stream_channel,
+                stream_ctx,
+                address,
+                subject_id,
+                verified_tenant,
+            )
+            .await;
         });
 
         Ok((stream_info, continuation))
@@ -1090,10 +1099,18 @@ impl RegistryService {
 
     /// Continuation body: reconstruct bytes and stream them. Reuses
     /// `cas_serve::CasStore` for reconstruction (no reimplementation).
+    ///
+    /// #1270: performs a MAC `can_access` recheck at the point of use (before
+    /// any bytes are read from the substrate). The subject identity was captured
+    /// from the verified `EnvelopeContext` at handler time. The explicitly
+    /// installed fail-closed [`CasPep`] denies when no CAS clearance adapter is
+    /// configured. There is no permissive mode inside the installed PEP.
     async fn execute_get_blob_stream(
         stream_channel: StreamChannel,
         stream_ctx: StreamContext,
         address: String,
+        subject_id: String,
+        verified_tenant: Option<String>,
     ) {
         // 64 KiB publish frames — bound per-message size for GB-scale weights.
         const CHUNK: usize = 64 * 1024;
@@ -1104,6 +1121,30 @@ impl RegistryService {
                 // layout-compatible with the legacy CasStore root (#812).
                 let substrate = crate::storage::CasSubstrate::from_env();
                 let domain = crate::storage::DedupDomain::local_default();
+
+                // #1270 MAC PEP recheck at point of use: derive the trusted
+                // content-bound label from the domain and check the subject's
+                // clearance BEFORE reading any bytes. Fail-closed: a deny
+                // produces zero bytes of output.
+                let resolver = crate::mac::CasObjectLabelResolver::from_domain(&domain);
+                let pep = crate::mac::cas_pep::CasPep::fail_closed();
+                let decision =
+                    pep.check_read(&subject_id, verified_tenant.as_deref(), &resolver);
+                if !decision.is_permit() {
+                    tracing::warn!(
+                        target: "hyprstream.mac.cas_pep",
+                        %subject_id,
+                        verified_tenant = ?verified_tenant,
+                        %address,
+                        ?decision,
+                        "getBlob MAC PEP denied at continuation; no bytes streamed (#1270)"
+                    );
+                    return (publisher, Err(anyhow!(
+                        "getBlob denied: MAC clearance check failed at point of use: \
+                         {decision:?} (#1270)"
+                    )));
+                }
+
                 let bytes = match substrate.get(&domain, &address).await {
                     Ok(b) => b,
                     Err(e) => return (publisher, Err(anyhow!("getBlob reconstruction failed: {}", e))),
@@ -1826,9 +1867,17 @@ impl RegistryHandler for RegistryService {
         // error response (no StreamInfo, no continuation, no bytes).
         let address = self.authorize_get_blob(ctx, data).await?;
         let client_ephemeral_pubkey = ctx.ephemeral_pubkey();
+        // #1270: capture the verified subject for the post-RPC MAC recheck in
+        // the streaming continuation. The continuation runs after the RPC
+        // returns; the PEP re-evaluates clearance at the point of use (before
+        // any bytes are read from the substrate).
+        let subject_id = ctx.subject().to_string();
+        let verified_tenant = ctx.verified_tenant().map(str::to_owned);
         self.prepare_get_blob_stream(
             address,
             client_ephemeral_pubkey.as_ref().map(<[u8; 32]>::as_slice),
+            subject_id,
+            verified_tenant,
         )
         .await
     }
@@ -1958,16 +2007,20 @@ impl RegistryService {
 
         // ── Chunk + seal a labeled manifest + SERVER-SIDE merkle ────────────
         // An uploader without a verified MAC clearance cannot create a CAS
-        // object: there is no default label. The derived context is already
-        // clamped to the verified signature's assurance.
+        // object. The verified clearance is a trusted restrict-only hint; the
+        // substrate joins it with the node-global CAS domain floor and binds
+        // the effective label into the manifest CID.
         let security_label = *ctx
             .security_context()
             .ok_or_else(|| anyhow!("putBlob requires a verified security clearance label"))?
             .clearance();
         let substrate = crate::storage::CasSubstrate::from_env();
+        // Registry CAS/provenance paths are node-global and carry no tenant key;
+        // preserve #1196's global-domain boundary rather than deriving a tenant
+        // domain from `EnvelopeContext::verified_tenant()`.
         let domain = crate::storage::DedupDomain::local_default();
         let put = substrate
-            .put(&domain, &data.bytes, security_label)
+            .put(&domain, &data.bytes, Some(security_label))
             .await
             .map_err(|e| anyhow!("CAS ingest failed: {e}"))?;
 

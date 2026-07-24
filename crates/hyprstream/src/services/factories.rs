@@ -1304,6 +1304,9 @@ fn create_xet_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
         store: crate::storage::CasSubstrate::from_env(),
         registry: Some(registry_client),
         auth,
+        // #1270: an explicitly installed PEP is fail-closed until an
+        // authority-backed CAS clearance adapter is configured.
+        cas_authorizer: Arc::new(crate::mac::MacCasAuthorizer::fail_closed()),
     };
 
     let xet_service = XetService::new(
