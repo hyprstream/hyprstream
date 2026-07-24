@@ -2964,10 +2964,8 @@ mod tests {
         const ORCHESTRATOR_DIR: &str = "HYPRSTREAM_COMPOSITE_ORCHESTRATOR_TEST_DIR";
         if std::env::var_os(ORCHESTRATOR_DIR).is_none() {
             // UDS socket paths are limited to ~108 bytes; keep the parent
-            // short even when the worktree has a long absolute path.
-            let test_tmp = std::env::temp_dir().join("hs-composite-tests");
-            std::fs::create_dir_all(&test_tmp).unwrap();
-            let dir = TempDir::new_in(test_tmp).unwrap();
+            // short and unique even when the worktree has a long absolute path.
+            let dir = TempDir::new().unwrap();
             let status = std::process::Command::new(std::env::current_exe().unwrap())
                 .args([
                     "--exact",
