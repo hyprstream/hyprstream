@@ -36,6 +36,7 @@ pub mod tui_capnp {
 pub mod api;
 pub mod archetypes;
 pub mod auth;
+pub mod account;
 pub mod cli;
 pub mod config;
 pub mod constants;
