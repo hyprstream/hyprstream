@@ -75,4 +75,4 @@ cache the `SubjectCtx` connection-scoped, enforce via AVC on every op.
 cargo nextest run --release --profile ci --workspace
 ```
 
-(full release suite — results pending)
+**Result: 3604 tests passed, 0 failed, 10 skipped.** ✅
