@@ -765,11 +765,20 @@ mod tests {
     #[test]
     fn resolver_cid_labeled_manifest() {
         let labeled = SecurityLabel::new(Level::Secret, Assurance::PqHybrid, Default::default());
-        let r = resolver_over(
-            &["/srv/policy"],
+        let import_floor =
+            SecurityLabel::new(Level::Internal, Assurance::Classical, Default::default());
+        let genesis = SitePolicy::floor_only(import_floor).materialize(["/srv/policy"]);
+        let r = CompositeObjectLabelResolver::new(
+            genesis,
+            import_floor,
             Arc::new(FixedManifests(Some(Some(labeled)))),
         );
-        assert_eq!(r.resolve(ObjectRef::Cid(&[1, 2, 3])), Some(labeled));
+        let expected = SecurityLabel::new(Level::Secret, Assurance::Classical, Default::default());
+        assert_eq!(
+            r.resolve(ObjectRef::Cid(&[1, 2, 3])),
+            Some(expected),
+            "PqHybrid provenance imported through a Classical floor must degrade to Classical"
+        );
     }
 
     #[test]
@@ -778,6 +787,7 @@ mod tests {
         let r = resolver_over(&["/srv/policy"], Arc::new(FixedManifests(Some(None))));
         let label = r.resolve(ObjectRef::Cid(&[1, 2, 3])).unwrap();
         assert_eq!(label, SitePolicy::conservative().floor());
+        assert_eq!(label.assurance, Assurance::Unverified);
     }
 
     #[test]
@@ -832,17 +842,20 @@ mod tests {
 
     #[test]
     fn gate_resolver_matches_report_coverage() {
-        // Every labeled node in the report must resolve through the gate's
-        // resolver (the report and the resolver agree on coverage).
+        // Every labeled node in the report must resolve to the exact site-policy
+        // label. Genesis carries no provenance evidence, so assurance remains at
+        // the fail-closed Unverified floor rather than acquiring a join identity.
         let gate = GenesisGate::production();
+        let policy = SitePolicy::conservative();
         for node in &gate.report().labeled {
             let components: Vec<&str> = node.trim_start_matches('/').split('/').collect();
-            assert!(
-                gate.resolver()
-                    .resolve(ObjectRef::Path(&components))
-                    .is_some(),
-                "labeled node {node} must resolve through the resolver"
+            let expected = policy.label_for(node);
+            assert_eq!(
+                gate.resolver().resolve(ObjectRef::Path(&components)),
+                Some(expected),
+                "labeled node {node} must resolve to its reported site-policy label"
             );
+            assert_eq!(expected.assurance, Assurance::Unverified);
         }
     }
 }
