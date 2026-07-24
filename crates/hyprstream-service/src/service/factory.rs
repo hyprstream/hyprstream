@@ -820,9 +820,10 @@ impl ServiceContext {
                     let policy_vk = trust
                         .resolve_one("policy")
                         .unwrap_or_else(|| panic!("trust store has no policy key"));
-                    let discovery_vk = crate::service::trust_store::global_trust_store()
-                        .resolve_one("discovery")
-                        .unwrap_or_else(|| panic!("trust store has no discovery key"));
+                    let discovery_vk = self.service_signing_key("discovery").verifying_key();
+                    if !trust.is_authorized(&discovery_vk, "discovery") {
+                        panic!("trust store has no discovery key");
+                    }
                     Some(shared.for_service_with_announce(
                         service.name(),
                         port,

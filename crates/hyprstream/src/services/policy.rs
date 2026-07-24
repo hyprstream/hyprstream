@@ -437,21 +437,56 @@ impl PolicyHandler for PolicyService {
             let svc_name = &subject["service:".len()..];
             let trust = hyprstream_service::global_trust_store();
             use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-            let requested_bytes: [u8; 32] = data.user_pub_key.as_deref()
-                .ok_or_else(|| anyhow!("service token issuance requires the assertion-verified Ed25519 public key"))
-                .and_then(|encoded| URL_SAFE_NO_PAD.decode(encoded)
-                    .map_err(|_| anyhow!("service token assertion key is not base64url"))?
-                    .try_into().map_err(|_| anyhow!("service token assertion key must be 32 bytes")))?;
-            let requested = VerifyingKey::from_bytes(&requested_bytes)
-                .map_err(|_| anyhow!("service token assertion key is not a valid Ed25519 verifying key"))?;
+            let invalid_assertion_key = |message: &str| {
+                PolicyResponseVariant::Error(ErrorInfo {
+                    message: message.to_owned(),
+                    code: "INVALID_ASSERTION_KEY".to_owned(),
+                    details: String::new(),
+                })
+            };
+            let Some(encoded) = data.user_pub_key.as_deref() else {
+                return Ok(invalid_assertion_key(
+                    "service token issuance requires the assertion-verified Ed25519 public key",
+                ));
+            };
+            let decoded = match URL_SAFE_NO_PAD.decode(encoded) {
+                Ok(decoded) => decoded,
+                Err(_) => return Ok(invalid_assertion_key(
+                    "service token assertion key is not base64url",
+                )),
+            };
+            let requested_bytes: [u8; 32] = match decoded.try_into() {
+                Ok(bytes) => bytes,
+                Err(_) => return Ok(invalid_assertion_key(
+                    "service token assertion key must be 32 bytes",
+                )),
+            };
+            let requested = match VerifyingKey::from_bytes(&requested_bytes) {
+                Ok(requested) => requested,
+                Err(_) => return Ok(invalid_assertion_key(
+                    "service token assertion key is not a valid Ed25519 verifying key",
+                )),
+            };
             if trust.is_authorized(&requested, svc_name) {
                 Some(requested_bytes)
             } else {
-                let caller = VerifyingKey::from_bytes(&ctx.cnf)
-                    .map_err(|_| anyhow!("service key rotation caller has an invalid Ed25519 verifying key"))?;
+                let caller = match VerifyingKey::from_bytes(&ctx.cnf) {
+                    Ok(caller) => caller,
+                    Err(_) => return Ok(PolicyResponseVariant::Error(ErrorInfo {
+                        message: "service key rotation caller has an invalid Ed25519 verifying key".to_owned(),
+                        code: "UNAUTHORIZED_SERVICE_KEY".to_owned(),
+                        details: String::new(),
+                    })),
+                };
                 let expected_subject = format!("service:{svc_name}");
                 if ctx.subject().name() != Some(expected_subject.as_str()) || !trust.is_authorized(&caller, svc_name) {
-                    anyhow::bail!("unregistered service key for '{svc_name}' may only be attested by a registered sibling");
+                    return Ok(PolicyResponseVariant::Error(ErrorInfo {
+                        message: format!(
+                            "unregistered service key for '{svc_name}' may only be attested by a registered sibling"
+                        ),
+                        code: "UNAUTHORIZED_SERVICE_KEY".to_owned(),
+                        details: String::new(),
+                    }));
                 }
                 Some(requested_bytes)
             }
@@ -1723,6 +1758,7 @@ pub(crate) async fn watch_policy_file(
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 
     async fn test_service() -> (PolicyService, tempfile::TempDir) {
         let root = tempfile::tempdir().expect("test: create policy git directory");
@@ -1853,5 +1889,71 @@ mod tests {
         assert_eq!(response.keys.len(), 1);
         assert_eq!(response.verifying_key, key.to_bytes());
         assert_eq!(response.service_jwt.as_deref(), Some("certificate"));
+    }
+
+    #[tokio::test]
+    async fn issue_token_returns_structured_errors_for_invalid_service_keys() {
+        let (service, _root) = test_service().await;
+        let mut ctx = EnvelopeContext::from_callback_service(1, "rotation-error-test");
+        ctx.cnf = SigningKey::generate(&mut rand::rngs::OsRng)
+            .verifying_key()
+            .to_bytes();
+
+        let mut request = issue("service:rotation-error-test");
+        request.user_pub_key = Some("not-base64url!".to_owned());
+        let malformed = service
+            .handle_issue_token(&ctx, 1, &request)
+            .await
+            .expect("malformed assertion key is a policy response");
+        assert!(matches!(
+            malformed,
+            PolicyResponseVariant::Error(ErrorInfo { ref code, .. })
+                if code == "INVALID_ASSERTION_KEY"
+        ));
+
+        let requested = SigningKey::generate(&mut rand::rngs::OsRng).verifying_key();
+        request.user_pub_key = Some(URL_SAFE_NO_PAD.encode(requested.as_bytes()));
+        let unauthorized = service
+            .handle_issue_token(&ctx, 2, &request)
+            .await
+            .expect("unregistered sibling is a policy response");
+        assert!(matches!(
+            unauthorized,
+            PolicyResponseVariant::Error(ErrorInfo { ref code, .. })
+                if code == "UNAUTHORIZED_SERVICE_KEY"
+        ));
+    }
+
+    #[tokio::test]
+    async fn registered_sibling_reaches_service_token_signing_boundary() {
+        let (service, _root) = test_service().await;
+        let caller = SigningKey::generate(&mut rand::rngs::OsRng).verifying_key();
+        let requested = SigningKey::generate(&mut rand::rngs::OsRng).verifying_key();
+        let trust = hyprstream_service::global_trust_store();
+        trust.insert(caller, hyprstream_service::Attestation {
+            scopes: std::iter::once("rotation-sibling-test".to_owned()).collect(),
+            subject: None,
+            jwt: Some("registered-sibling".to_owned()),
+            expires_at: chrono::Utc::now().timestamp() + 60,
+            attested_by: None,
+        });
+
+        let mut ctx = EnvelopeContext::from_callback_service(1, "rotation-sibling-test");
+        ctx.cnf = caller.to_bytes();
+        let mut request = issue("service:rotation-sibling-test");
+        request.user_pub_key = Some(URL_SAFE_NO_PAD.encode(requested.as_bytes()));
+        let response = service.handle_issue_token(&ctx, 1, &request).await;
+        trust.remove(&caller);
+
+        match response.expect("registered sibling reaches the signing boundary") {
+            PolicyResponseVariant::IssueTokenResult(info) => {
+                let claims = hyprstream_rpc::auth::decode_unverified(&info.token)
+                    .expect("issued service token decodes");
+                assert_eq!(claims.cnf_key_bytes(), Some(requested.to_bytes()));
+            }
+            PolicyResponseVariant::Error(ErrorInfo { code, .. })
+                if code == "SIGNING_NOT_CONFIGURED" => {}
+            other => panic!("registered sibling was rejected before signing: {other:?}"),
+        }
     }
 }
