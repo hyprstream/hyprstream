@@ -428,7 +428,16 @@ fn systemd_creds_encrypt(name: &str, plaintext: &[u8], credstore: &std::path::Pa
 /// generated service unit should include `ImportCredential=` directives.
 /// Returns `false` if `systemd-creds` is unavailable or no secrets were found.
 ///
-/// Pass `None` for `secrets_dir` to use the default: `~/.config/hyprstream/credentials`.
+/// Pass `None` for `secrets_dir` to use the default: the instance-namespaced
+/// `~/.config/hyprstream[/instances/{inst}]/credentials`.
+///
+/// # Best-effort defense-in-depth (#808)
+///
+/// The plaintext 0600 files in `secrets_dir` remain the authoritative copy and
+/// are NOT deleted: per-service `LoadCredential=` sources and CLI tooling read
+/// them directly. The encrypted credstore is an additional TPM2/host-key-bound
+/// copy consumed via `ImportCredential=` — protection here is best-effort
+/// defense-in-depth, not the sole at-rest control.
 pub fn encrypt_credentials_if_available(secrets_dir: Option<&std::path::Path>) -> bool {
     if !has_systemd_creds() {
         tracing::warn!(
@@ -444,11 +453,24 @@ pub fn encrypt_credentials_if_available(secrets_dir: Option<&std::path::Path>) -
     let dir: &std::path::Path = match secrets_dir {
         Some(d) => d,
         None => {
-            default_dir = dirs::config_dir()
-                .unwrap_or_else(|| std::path::PathBuf::from("/etc/hyprstream"))
-                .join("hyprstream")
-                .join("credentials");
-            &default_dir
+            default_dir = match units::hyprstream_config_dir() {
+                Ok(dir) => dir.map(|d| d.join("credentials")),
+                Err(error) => {
+                    tracing::error!(
+                        "Invalid instance name while resolving credentials directory: {error}"
+                    );
+                    return false;
+                }
+            };
+            match default_dir.as_deref() {
+                Some(d) => d,
+                None => {
+                    tracing::warn!(
+                        "Could not determine config dir for secrets; skipping credential encryption"
+                    );
+                    return false;
+                }
+            }
         }
     };
 
@@ -526,25 +548,6 @@ pub fn encrypt_credentials_if_available(secrets_dir: Option<&std::path::Path>) -
     // flat credstore (e.g., model-signing-key, model-service-jwt) so that
     // ImportCredential can decrypt them. Subdirectory encryption was removed
     // because SetLoadCredential doesn't decrypt systemd-creds encrypted files.
-
-    // Encrypt application-level credentials (oauth)
-    for name in units::OAUTH_CREDENTIAL_NAMES {
-        let secret_path = dir.join(name);
-        if !secret_path.exists() {
-            continue;
-        }
-        let plaintext = match std::fs::read(&secret_path) {
-            Ok(b) => b,
-            Err(e) => {
-                tracing::warn!("Could not read secret '{}': {e}", secret_path.display());
-                continue;
-            }
-        };
-        match systemd_creds_encrypt(name, &plaintext, &credstore) {
-            Ok(()) => encrypted_count += 1,
-            Err(e) => tracing::warn!("Failed to encrypt credential '{name}': {e}"),
-        }
-    }
 
     // Encrypt policy-only credentials (ca-key)
     for name in units::POLICY_CREDENTIAL_NAMES {

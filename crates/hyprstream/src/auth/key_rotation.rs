@@ -1024,7 +1024,7 @@ pub fn global_es256_key_store(
     let store = ES256_SIGNING_STORE
         .get_or_init(|| Arc::new(load_or_init_es256_key_store(secrets_dir, config)))
         .clone();
-    store.bind_secrets_dir(secrets_dir.to_path_buf());
+    store.bind_secrets_dir(rotation_state_dir(secrets_dir));
     store
 }
 
@@ -1120,6 +1120,57 @@ impl SigningKeyStore {
 
 // ── Persistence ─────────────────────────────────────────────────────────────
 
+/// Resolve the directory JWT rotation *state* is persisted to.
+///
+/// Rotation slots are runtime-mutated state, not provisioned credentials, so
+/// they need a writable home (#803). When `secrets_dir` is writable (bare
+/// metal, dev, non-systemd) the slots live there, as before. When it is
+/// read-only — the systemd `$CREDENTIALS_DIRECTORY` ramfs — slots fall back to
+/// the unit's `$STATE_DIRECTORY` (`StateDirectory=`), or to the XDG state dir
+/// when not running under systemd. Loading always checks the state dir first
+/// and falls back to `secrets_dir`, so credentials provisioned into the
+/// credstore still bootstrap the first boot.
+pub fn rotation_state_dir(secrets_dir: &Path) -> PathBuf {
+    if super::identity_store::is_writable(secrets_dir) {
+        return secrets_dir.to_path_buf();
+    }
+    // systemd: `StateDirectory=` sets $STATE_DIRECTORY to a writable,
+    // service-private dir (colon-separated list when multiple are declared;
+    // hyprstream units declare exactly one).
+    let systemd_state = std::env::var("STATE_DIRECTORY").ok().and_then(|v| {
+        let first = v.split(':').next().unwrap_or_default();
+        if first.is_empty() {
+            None
+        } else {
+            Some(PathBuf::from(first))
+        }
+    });
+    let base = match systemd_state {
+        // Namespace by instance to match the socket/config isolation.
+        Some(dir) => match std::env::var("HYPRSTREAM_INSTANCE") {
+            Ok(inst) if !inst.is_empty() => Some(dir.join("instances").join(inst)),
+            _ => Some(dir),
+        },
+        // Not systemd: XDG state home (already instance-namespaced via the
+        // StoragePaths prefix).
+        None => crate::storage::paths::StoragePaths::new()
+            .and_then(|s| s.state_dir())
+            .ok(),
+    };
+    match base {
+        Some(dir) => dir.join("credentials"),
+        None => {
+            error!(
+                "secrets dir '{}' is read-only and no writable state directory \
+                 could be resolved; JWT rotation state will NOT survive restart \
+                 (all issued tokens are invalidated on every restart)",
+                secrets_dir.display()
+            );
+            secrets_dir.to_path_buf()
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 struct SlotMeta {
     nbf: i64,
@@ -1196,15 +1247,22 @@ pub fn load_or_init_key_store(secrets_dir: &Path, config: &OAuthConfig) -> Signi
     let active_secs = config.active_secs();
     let lead_secs = config.lead_secs();
 
-    let drain = load_slot(secrets_dir, "drain");
-    let mut active = load_slot(secrets_dir, "active");
-    let lead = load_slot(secrets_dir, "lead");
+    // Slots are state: read/write them via the writable state dir (#803),
+    // falling back to the (possibly read-only, provisioned) secrets dir.
+    let state_dir = rotation_state_dir(secrets_dir);
+    let drain = load_slot(&state_dir, "drain").or_else(|| load_slot(secrets_dir, "drain"));
+    let mut active = load_slot(&state_dir, "active").or_else(|| load_slot(secrets_dir, "active"));
+    let lead = load_slot(&state_dir, "lead").or_else(|| load_slot(secrets_dir, "lead"));
 
     if active.is_none() {
         info!("No active JWT signing key found — generating on first boot");
         let slot = generate_slot(now, now + active_secs);
-        if let Err(e) = persist_slot(secrets_dir, "active", &slot) {
-            warn!("Could not persist active JWT key: {e}");
+        if let Err(e) = persist_slot(&state_dir, "active", &slot) {
+            error!(
+                "Could not persist active JWT key to '{}': {e}. The key is \
+                 process-ephemeral — every restart invalidates all issued tokens.",
+                state_dir.display()
+            );
         } else {
             info!("Active JWT key generated (kid={})", slot.kid());
         }
@@ -1218,8 +1276,12 @@ pub fn load_or_init_key_store(secrets_dir: &Path, config: &OAuthConfig) -> Signi
         let lead_nbf = active.as_ref().map(|a| a.exp).unwrap_or(now) - lead_secs;
         let lead_exp = lead_nbf + active_secs;
         let slot = generate_slot(lead_nbf, lead_exp);
-        if let Err(e) = persist_slot(secrets_dir, "lead", &slot) {
-            warn!("Could not persist lead JWT key: {e}");
+        if let Err(e) = persist_slot(&state_dir, "lead", &slot) {
+            error!(
+                "Could not persist lead JWT key to '{}': {e}. Rotation state will \
+                 not survive restart.",
+                state_dir.display()
+            );
         } else {
             info!("Lead JWT key pre-generated at startup (kid={})", slot.kid());
         }
@@ -1227,7 +1289,7 @@ pub fn load_or_init_key_store(secrets_dir: &Path, config: &OAuthConfig) -> Signi
 
     // Re-load lead if we just generated it
     let lead = if should_gen_lead {
-        load_slot(secrets_dir, "lead")
+        load_slot(&state_dir, "lead")
     } else {
         lead
     };
@@ -1305,6 +1367,7 @@ pub async fn rotate_jwt_keys(
     let active_secs = config.active_secs();
     let lead_secs = config.lead_secs();
     let drain_secs = config.drain_secs();
+    let state_dir = rotation_state_dir(secrets_dir);
 
     // 1. Promote lead → active if lead.nbf has passed.
     if let Some(new_lead) = slots.lead.take().filter(|l| l.nbf <= now) {
@@ -1315,19 +1378,27 @@ pub async fn rotate_jwt_keys(
         // Old active → drain (evict old drain first)
         if let Some(prev_drain) = slots.drain.take() {
             info!("Evicting drain JWT key (kid={})", prev_drain.kid());
-            delete_slot(secrets_dir, "drain");
+            delete_slot(&state_dir, "drain");
         }
         if let Some(old_active_slot) = old_active {
-            if let Err(e) = persist_slot(secrets_dir, "drain", &old_active_slot) {
-                warn!("Could not persist drain JWT key: {e}");
+            if let Err(e) = persist_slot(&state_dir, "drain", &old_active_slot) {
+                error!(
+                    "Could not persist drain JWT key to '{}': {e}. Rotation state \
+                     will not survive restart.",
+                    state_dir.display()
+                );
             }
             slots.drain = Some(old_active_slot);
         }
 
-        if let Err(e) = persist_slot(secrets_dir, "active", &new_lead) {
-            warn!("Could not persist active JWT key: {e}");
+        if let Err(e) = persist_slot(&state_dir, "active", &new_lead) {
+            error!(
+                "Could not persist active JWT key to '{}': {e}. The key is \
+                 process-ephemeral — every restart invalidates all issued tokens.",
+                state_dir.display()
+            );
         }
-        delete_slot(secrets_dir, "lead");
+        delete_slot(&state_dir, "lead");
         slots.active = Some(new_lead);
     }
 
@@ -1339,7 +1410,7 @@ pub async fn rotate_jwt_keys(
     {
         let kid = slots.drain.as_ref().map(KeySlot::kid).unwrap_or_default();
         info!("Removing expired drain JWT key (kid={kid})");
-        delete_slot(secrets_dir, "drain");
+        delete_slot(&state_dir, "drain");
         slots.drain = None;
     }
 
@@ -1355,8 +1426,12 @@ pub async fn rotate_jwt_keys(
                     new_lead.kid(),
                     new_lead.nbf
                 );
-                if let Err(e) = persist_slot(secrets_dir, "lead", &new_lead) {
-                    warn!("Could not persist lead JWT key: {e}");
+                if let Err(e) = persist_slot(&state_dir, "lead", &new_lead) {
+                    error!(
+                        "Could not persist lead JWT key to '{}': {e}. Rotation state \
+                         will not survive restart.",
+                        state_dir.display()
+                    );
                 }
                 slots.lead = Some(new_lead);
             }
@@ -1625,8 +1700,11 @@ impl Es256SigningKeyStore {
 /// disk — not the in-memory `OnceLock` — is what makes a cross-process reader
 /// observe a slot promoted by another process.
 pub(crate) fn es256_signing_key_for_kid(secrets_dir: &Path, kid: &str) -> Option<Es256SigningKey> {
+    let state_dir = rotation_state_dir(secrets_dir);
     for name in ["active", "drain", "lead"] {
-        if let Some(slot) = load_es256_slot(secrets_dir, name) {
+        if let Some(slot) =
+            load_es256_slot(&state_dir, name).or_else(|| load_es256_slot(secrets_dir, name))
+        {
             if slot.kid() == kid {
                 return Some((*slot.key).clone());
             }
@@ -1702,26 +1780,34 @@ pub fn load_or_init_es256_key_store(
     let active_secs = config.active_secs();
     let lead_secs = config.lead_secs();
 
-    let mut drain = load_es256_slot(secrets_dir, "drain");
-    let mut active = load_es256_slot(secrets_dir, "active");
-    let mut lead = load_es256_slot(secrets_dir, "lead");
+    let state_dir = rotation_state_dir(secrets_dir);
+    let mut drain =
+        load_es256_slot(&state_dir, "drain").or_else(|| load_es256_slot(secrets_dir, "drain"));
+    let mut active =
+        load_es256_slot(&state_dir, "active").or_else(|| load_es256_slot(secrets_dir, "active"));
+    let mut lead =
+        load_es256_slot(&state_dir, "lead").or_else(|| load_es256_slot(secrets_dir, "lead"));
 
     // Do not serve an already-expired bounded method after restart. This is
     // the same exclusive boundary the verifier and runtime cleanup use.
     if drain.as_ref().is_some_and(|slot| now >= slot.exp) {
-        delete_es256_slot(secrets_dir, "drain");
+        delete_es256_slot(&state_dir, "drain");
         drain = None;
     }
     if lead.as_ref().is_some_and(|slot| now >= slot.exp) {
-        delete_es256_slot(secrets_dir, "lead");
+        delete_es256_slot(&state_dir, "lead");
         lead = None;
     }
 
     if active.is_none() {
         info!("No active ES256 signing key found — generating on first boot");
         let slot = generate_es256_slot(now, now + active_secs);
-        if let Err(e) = persist_es256_slot(secrets_dir, "active", &slot) {
-            warn!("Could not persist active ES256 key: {e}");
+        if let Err(e) = persist_es256_slot(&state_dir, "active", &slot) {
+            error!(
+                "Could not persist active ES256 key to '{}': {e}. The key is \
+                 process-ephemeral — every restart invalidates all issued tokens.",
+                state_dir.display()
+            );
         } else {
             info!("Active ES256 key generated (kid={})", slot.kid());
         }
@@ -1734,13 +1820,17 @@ pub fn load_or_init_es256_key_store(
         let lead_nbf = active.as_ref().map(|a| a.exp).unwrap_or(now) - lead_secs;
         let lead_exp = lead_nbf + active_secs;
         let slot = generate_es256_slot(lead_nbf, lead_exp);
-        if let Err(e) = persist_es256_slot(secrets_dir, "lead", &slot) {
-            warn!("Could not persist lead ES256 key: {e}");
+        if let Err(e) = persist_es256_slot(&state_dir, "lead", &slot) {
+            error!(
+                "Could not persist lead ES256 key to '{}': {e}. Rotation state will \
+                 not survive restart.",
+                state_dir.display()
+            );
         }
     }
 
     let lead = if should_gen_lead {
-        load_es256_slot(secrets_dir, "lead")
+        load_es256_slot(&state_dir, "lead")
     } else {
         lead
     };
@@ -1762,6 +1852,16 @@ pub fn load_or_init_es256_key_store(
 pub async fn rotate_es256_keys(
     config: &OAuthConfig,
     secrets_dir: &Path,
+    store: &Es256SigningKeyStore,
+    now: i64,
+) -> bool {
+    let state_dir = rotation_state_dir(secrets_dir);
+    rotate_es256_keys_in_state_dir(config, &state_dir, store, now).await
+}
+
+async fn rotate_es256_keys_in_state_dir(
+    config: &OAuthConfig,
+    state_dir: &Path,
     store: &Es256SigningKeyStore,
     now: i64,
 ) -> bool {
@@ -1789,29 +1889,35 @@ pub async fn rotate_es256_keys(
         // Persist drain before active. A process that reloads between the two
         // writes can therefore still verify K-signed commits.
         if let Some(ref drain) = new_drain {
-            if let Err(error) = persist_es256_slot(secrets_dir, "drain", drain) {
+            if let Err(error) = persist_es256_slot(state_dir, "drain", drain) {
                 if let Some(ref old_drain) = old_drain {
-                    let _ = persist_es256_slot(secrets_dir, "drain", old_drain);
+                    let _ = persist_es256_slot(state_dir, "drain", old_drain);
                 } else {
-                    delete_es256_slot(secrets_dir, "drain");
+                    delete_es256_slot(state_dir, "drain");
                 }
-                warn!("ES256: failed to persist drain slot; retaining old active: {error}");
+                error!(
+                    "ES256: failed to persist drain slot to '{}'; retaining old active: {error}",
+                    state_dir.display()
+                );
                 return false;
             }
         }
 
-        if let Err(error) = persist_es256_slot(secrets_dir, "active", &new_active) {
+        if let Err(error) = persist_es256_slot(state_dir, "active", &new_active) {
             if let Some(ref old_active) = old_active {
-                let _ = persist_es256_slot(secrets_dir, "active", old_active);
+                let _ = persist_es256_slot(state_dir, "active", old_active);
             } else {
-                delete_es256_slot(secrets_dir, "active");
+                delete_es256_slot(state_dir, "active");
             }
             if let Some(ref old_drain) = old_drain {
-                let _ = persist_es256_slot(secrets_dir, "drain", old_drain);
+                let _ = persist_es256_slot(state_dir, "drain", old_drain);
             } else {
-                delete_es256_slot(secrets_dir, "drain");
+                delete_es256_slot(state_dir, "drain");
             }
-            warn!("ES256: failed to persist promoted active; retaining old active: {error}");
+            error!(
+                "ES256: failed to persist promoted active to '{}'; retaining old active: {error}",
+                state_dir.display()
+            );
             return false;
         }
 
@@ -1825,22 +1931,26 @@ pub async fn rotate_es256_keys(
                         "ES256: failed to restore PDS head after promotion failure: {rollback_error}"
                     );
                 }
-                if let Err(rollback_error) = persist_es256_slot(secrets_dir, "active", old_active) {
+                if let Err(rollback_error) =
+                    persist_es256_slot(state_dir, "active", old_active)
+                {
                     warn!(
                         "ES256: failed to restore persisted active after promotion failure: {rollback_error}"
                     );
                 }
             } else {
-                delete_es256_slot(secrets_dir, "active");
+                delete_es256_slot(state_dir, "active");
             }
             if let Some(ref old_drain) = old_drain {
-                if let Err(rollback_error) = persist_es256_slot(secrets_dir, "drain", old_drain) {
+                if let Err(rollback_error) =
+                    persist_es256_slot(state_dir, "drain", old_drain)
+                {
                     warn!(
                         "ES256: failed to restore persisted drain after promotion failure: {rollback_error}"
                     );
                 }
             } else {
-                delete_es256_slot(secrets_dir, "drain");
+                delete_es256_slot(state_dir, "drain");
             }
             warn!(
                 "ES256: failed to re-sign PDS head; retaining old active and retrying next tick: {error}"
@@ -1848,7 +1958,7 @@ pub async fn rotate_es256_keys(
             return false;
         }
 
-        delete_es256_slot(secrets_dir, "lead");
+        delete_es256_slot(state_dir, "lead");
         slots.drain = new_drain.or(old_drain);
         slots.active = Some(new_active);
         slots.lead = None;
@@ -1859,7 +1969,7 @@ pub async fn rotate_es256_keys(
     // Phase 2: remove expired drain
     if let Some(ref drain) = slots.drain {
         if now >= drain.exp {
-            delete_es256_slot(secrets_dir, "drain");
+            delete_es256_slot(state_dir, "drain");
             slots.drain = None;
             info!("ES256: removed expired drain slot");
         }
@@ -1868,7 +1978,7 @@ pub async fn rotate_es256_keys(
     // A lead is publication-only and must not survive its own bounded window
     // if an administrator supplied inconsistent slot files.
     if slots.lead.as_ref().is_some_and(|lead| now >= lead.exp) {
-        delete_es256_slot(secrets_dir, "lead");
+        delete_es256_slot(state_dir, "lead");
         slots.lead = None;
         info!("ES256: removed expired lead slot");
     }
@@ -1879,8 +1989,12 @@ pub async fn rotate_es256_keys(
             let lead_nbf = active.exp - lead_secs;
             let lead_exp = lead_nbf + active_secs;
             let new_lead = generate_es256_slot(lead_nbf, lead_exp);
-            if let Err(e) = persist_es256_slot(secrets_dir, "lead", &new_lead) {
-                warn!("ES256: failed to persist new lead: {e}");
+            if let Err(e) = persist_es256_slot(state_dir, "lead", &new_lead) {
+                error!(
+                    "ES256: failed to persist new lead to '{}': {e}. Rotation state \
+                     will not survive restart.",
+                    state_dir.display()
+                );
             } else {
                 info!("ES256: generated new lead key (kid={})", new_lead.kid());
             }
@@ -2029,15 +2143,23 @@ mod ml_dsa_rotation {
         let active_secs = config.active_secs();
         let lead_secs = config.lead_secs();
 
-        let drain = load_ml_dsa_slot(secrets_dir, "drain");
-        let mut active = load_ml_dsa_slot(secrets_dir, "active");
-        let lead = load_ml_dsa_slot(secrets_dir, "lead");
+        let state_dir = rotation_state_dir(secrets_dir);
+        let drain = load_ml_dsa_slot(&state_dir, "drain")
+            .or_else(|| load_ml_dsa_slot(secrets_dir, "drain"));
+        let mut active = load_ml_dsa_slot(&state_dir, "active")
+            .or_else(|| load_ml_dsa_slot(secrets_dir, "active"));
+        let lead =
+            load_ml_dsa_slot(&state_dir, "lead").or_else(|| load_ml_dsa_slot(secrets_dir, "lead"));
 
         if active.is_none() {
             info!("No active ML-DSA-65 signing key found — generating on first boot");
             let slot = generate_ml_dsa_slot(now, now + active_secs);
-            if let Err(e) = persist_ml_dsa_slot(secrets_dir, "active", &slot) {
-                warn!("Could not persist active ML-DSA key: {e}");
+            if let Err(e) = persist_ml_dsa_slot(&state_dir, "active", &slot) {
+                error!(
+                    "Could not persist active ML-DSA key to '{}': {e}. The key is \
+                     process-ephemeral — every restart invalidates all issued tokens.",
+                    state_dir.display()
+                );
             } else {
                 info!("Active ML-DSA-65 key generated");
             }
@@ -2050,13 +2172,17 @@ mod ml_dsa_rotation {
             let lead_nbf = active.as_ref().map(|a| a.exp).unwrap_or(now) - lead_secs;
             let lead_exp = lead_nbf + active_secs;
             let slot = generate_ml_dsa_slot(lead_nbf, lead_exp);
-            if let Err(e) = persist_ml_dsa_slot(secrets_dir, "lead", &slot) {
-                warn!("Could not persist lead ML-DSA key: {e}");
+            if let Err(e) = persist_ml_dsa_slot(&state_dir, "lead", &slot) {
+                error!(
+                    "Could not persist lead ML-DSA key to '{}': {e}. Rotation state \
+                     will not survive restart.",
+                    state_dir.display()
+                );
             }
         }
 
         let lead = if should_gen_lead {
-            load_ml_dsa_slot(secrets_dir, "lead")
+            load_ml_dsa_slot(&state_dir, "lead")
         } else {
             lead
         };
@@ -2077,22 +2203,32 @@ mod ml_dsa_rotation {
         let active_secs = config.active_secs();
         let lead_secs = config.lead_secs();
         let drain_secs = config.drain_secs();
+        let state_dir = rotation_state_dir(secrets_dir);
 
         // Phase 1: promote lead → active
         let lead_ready = slots.lead.as_ref().is_some_and(|lead| lead.nbf <= now);
         if lead_ready {
             if let Some(new_active) = slots.lead.take() {
                 if let Some(old_active) = slots.active.take() {
-                    delete_ml_dsa_slot(secrets_dir, "drain");
-                    if let Err(e) = persist_ml_dsa_slot(secrets_dir, "drain", &old_active) {
-                        warn!("ML-DSA: failed to persist drain slot: {e}");
+                    delete_ml_dsa_slot(&state_dir, "drain");
+                    if let Err(e) = persist_ml_dsa_slot(&state_dir, "drain", &old_active) {
+                        error!(
+                            "ML-DSA: failed to persist drain slot to '{}': {e}. Rotation \
+                             state will not survive restart.",
+                            state_dir.display()
+                        );
                     }
                     slots.drain = Some(old_active);
                 }
-                if let Err(e) = persist_ml_dsa_slot(secrets_dir, "active", &new_active) {
-                    warn!("ML-DSA: failed to persist promoted active: {e}");
+                if let Err(e) = persist_ml_dsa_slot(&state_dir, "active", &new_active) {
+                    error!(
+                        "ML-DSA: failed to persist promoted active to '{}': {e}. The key \
+                         is process-ephemeral — every restart invalidates all issued \
+                         tokens.",
+                        state_dir.display()
+                    );
                 }
-                delete_ml_dsa_slot(secrets_dir, "lead");
+                delete_ml_dsa_slot(&state_dir, "lead");
                 slots.active = Some(new_active);
                 info!("ML-DSA: promoted lead → active");
             }
@@ -2101,7 +2237,7 @@ mod ml_dsa_rotation {
         // Phase 2: remove expired drain
         if let Some(ref drain) = slots.drain {
             if now >= drain.exp + drain_secs {
-                delete_ml_dsa_slot(secrets_dir, "drain");
+                delete_ml_dsa_slot(&state_dir, "drain");
                 slots.drain = None;
                 info!("ML-DSA: removed expired drain slot");
             }
@@ -2113,8 +2249,12 @@ mod ml_dsa_rotation {
                 let lead_nbf = active.exp - lead_secs;
                 let lead_exp = lead_nbf + active_secs;
                 let new_lead = generate_ml_dsa_slot(lead_nbf, lead_exp);
-                if let Err(e) = persist_ml_dsa_slot(secrets_dir, "lead", &new_lead) {
-                    warn!("ML-DSA: failed to persist new lead: {e}");
+                if let Err(e) = persist_ml_dsa_slot(&state_dir, "lead", &new_lead) {
+                    error!(
+                        "ML-DSA: failed to persist new lead to '{}': {e}. Rotation state \
+                         will not survive restart.",
+                        state_dir.display()
+                    );
                 } else {
                     info!("ML-DSA: generated new lead key");
                 }
@@ -3658,7 +3798,7 @@ mod tests {
             lead: Some(lead),
         });
         assert!(
-            !rotate_es256_keys(&config, &invalid_secrets_dir, &store, now).await,
+            !rotate_es256_keys_in_state_dir(&config, &invalid_secrets_dir, &store, now).await,
             "failed active persistence must not report promotion"
         );
         {

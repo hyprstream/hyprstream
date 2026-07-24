@@ -69,6 +69,17 @@ impl StoragePaths {
         Ok(config_dir)
     }
 
+    /// Get the state directory path (XDG state home, instance-namespaced).
+    ///
+    /// Used for runtime-mutated state (e.g. JWT rotation slots, #803) that
+    /// must stay writable even when the config/credentials dir is a read-only
+    /// systemd credentials ramfs.
+    pub fn state_dir(&self) -> Result<PathBuf> {
+        let state_dir = self.base_dirs.get_state_home();
+        self.ensure_dir_exists(&state_dir)?;
+        Ok(state_dir)
+    }
+
     /// Get the temporary download directory
     pub fn temp_download_dir(&self) -> Result<PathBuf> {
         let temp_dir = self.cache_dir()?.join("downloads");
