@@ -447,6 +447,16 @@ impl RegistryService {
         self
     }
 
+    /// Like [`Self::with_pds_publisher`] but takes an already-`Arc`'d publisher,
+    /// so the caller can retain a weak clone for the ES256 promotion hook (#918).
+    pub fn with_pds_publisher_arc(
+        mut self,
+        publisher: Arc<crate::services::discovery::PdsPublisher>,
+    ) -> Self {
+        self.pds_publisher = Some(publisher);
+        self
+    }
+
     /// Best-effort publish/advance of `repo_id`'s PDS record (#910a).
     ///
     /// Failures are logged and swallowed, never surfaced to the RPC caller:
@@ -3559,9 +3569,20 @@ mod tests {
             Arc::clone(&store), &root.path().join("alarm"), key.clone(),
             ed25519_dalek::SigningKey::from_bytes(&[81u8; 32]),
             hyprstream_rpc::crypto::pq::ml_dsa_sk_from_seed(&[82u8; 32])).unwrap();
-        let publisher = crate::services::discovery::PdsPublisher::new(Arc::clone(&store),
-            "did:key:test".to_owned(), p256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng))
-            .with_at9p_state_ingest(ingest);
+        let publisher = {
+            use crate::auth::key_rotation::{Es256KeySlot, Es256KeySlots, Es256SigningKeyStore};
+            let store_for_pub = Arc::new(Es256SigningKeyStore::new(Es256KeySlots {
+                drain: None,
+                active: Some(Es256KeySlot::new(
+                    p256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng),
+                    0, i64::MAX,
+                )),
+                lead: None,
+            }));
+            crate::services::discovery::PdsPublisher::new(Arc::clone(&store),
+                "did:key:test".to_owned(), store_for_pub)
+                .with_at9p_state_ingest(ingest)
+        };
         let registry = RegistryService::new(&models, policy_client,
             TransportConfig::inproc("at9p-registry"), key.clone()).await.unwrap()
             .with_pds_publisher(publisher);

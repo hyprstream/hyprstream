@@ -547,22 +547,32 @@ pub trait RecordResolver: Send + Sync {
     /// Returns `Ok(None)` when no repo is stored for the DID.
     async fn resolve_repo(&self, did: &str) -> Result<Option<RecordCarData>>;
 
-    /// Resolve the DID's `#atproto` P-256 verifying key — the key a repo
-    /// CAR's commit is signed by — or `Ok(None)` when this resolver cannot
-    /// provide one.
+    /// Resolve the DID's `#atproto` P-256 verifying key — the key a repo CAR's
+    /// commit is signed by — or `Ok(None)` when this resolver cannot establish
+    /// one.
     ///
     /// This is the **signature-verification seam** for verified-by-construction
-    /// ingest: when a key is returned, [`PlacementIndex::ingest_did`] verifies
-    /// the ingested repo CAR's commit signature against it *before* any record
-    /// enters the index, and a record whose commit fails verification cannot
-    /// produce membership or any other derived fact (see #932). `None` is the
-    /// resolver declining to participate — the index then retains the trusted
-    /// in-process posture documented in `placement_index` (the day-1 stance;
-    /// full key resolution for foreign DIDs is the future federation-hardening
-    /// follow-up). A default of `Ok(None)` keeps resolvers that do not
-    /// participate unchanged.
+    /// ingest: [`PlacementIndex::ingest_did`] requires a key and verifies the
+    /// ingested repo CAR's commit signature against it *before* any record
+    /// enters the index. A failed resolution, including `Ok(None)`, is rejected
+    /// at that trust boundary; it never authorizes an unverified fallback.
+    /// The default keeps non-participating resolvers source-compatible while
+    /// preserving fail-closed ingest.
     async fn resolve_verifying_key(&self, _did: &str) -> Result<Option<p256::ecdsa::VerifyingKey>> {
         Ok(None)
+    }
+
+    /// Resolve every bounded `#atproto` verification slot currently published
+    /// for `did`. Implementations that only know one trusted active key retain
+    /// the fail-closed default through [`RecordResolver::resolve_verifying_key`].
+    async fn resolve_verifying_keys(
+        &self,
+        did: &str,
+    ) -> Result<Option<hyprstream_pds::commit::PublishedAtprotoKeys>> {
+        Ok(self
+            .resolve_verifying_key(did)
+            .await?
+            .map(hyprstream_pds::commit::PublishedAtprotoKeys::single))
     }
 }
 
@@ -5080,6 +5090,9 @@ mod get_record_tests {
     struct MockResolver {
         /// (collection, rkey) → (car bytes, uri). Built once in `build`.
         records: BTreeMap<(String, String), (Vec<u8>, String)>,
+        /// The `#atproto` verifying key the test repo was signed with, so
+        /// `ingest_did` can verify the commit (fail-closed #918).
+        verifying_key: p256::ecdsa::VerifyingKey,
     }
 
     /// Build a small repo with `n` records and return the resolver plus the
@@ -5135,7 +5148,10 @@ mod get_record_tests {
         let target_proof = tree.proof(COLLECTION_NSID, &target_tid).unwrap();
 
         (
-            MockResolver { records: out },
+            MockResolver {
+                records: out,
+                verifying_key,
+            },
             verifying_key,
             target_rkey,
             target_record,
@@ -5169,6 +5185,12 @@ mod get_record_tests {
                     uri: uri.clone(),
                     car: car.clone(),
                 }))
+        }
+        async fn resolve_verifying_key(
+            &self,
+            _did: &str,
+        ) -> Result<Option<p256::ecdsa::VerifyingKey>> {
+            Ok(Some(self.verifying_key))
         }
     }
 
@@ -5342,7 +5364,7 @@ mod query_candidates_tests {
     use hyprstream_pds::mst::Node;
     use hyprstream_pds::placement::node::{self, NodeRecord};
     use hyprstream_pds::tid::Tid;
-    use p256::ecdsa::SigningKey as P256SigningKey;
+    use p256::ecdsa::{SigningKey as P256SigningKey, VerifyingKey as P256VerifyingKey};
 
     /// Allows every (resource, operation) pair.
     struct AllowAll;
@@ -5418,7 +5440,7 @@ mod query_candidates_tests {
     /// A resolver serving one fixed repo CAR per DID (built with a real
     /// `NodeRecord` encoding — not hand-hacked bytes).
     struct FixedRepoResolver {
-        repos: HashMap<String, Vec<u8>>,
+        repos: HashMap<String, (Vec<u8>, P256VerifyingKey)>,
     }
     #[async_trait(?Send)]
     impl RecordResolver for FixedRepoResolver {
@@ -5431,17 +5453,21 @@ mod query_candidates_tests {
             Ok(None)
         }
         async fn resolve_repo(&self, did: &str) -> Result<Option<RecordCarData>> {
-            Ok(self.repos.get(did).map(|car| RecordCarData {
+            Ok(self.repos.get(did).map(|(car, _vk)| RecordCarData {
                 uri: format!("at://{did}"),
                 car: car.clone(),
             }))
+        }
+        async fn resolve_verifying_key(&self, did: &str) -> Result<Option<P256VerifyingKey>> {
+            Ok(self.repos.get(did).map(|(_, vk)| *vk))
         }
     }
 
     /// Build a one-record repo CAR for `did` carrying `rec` as its
     /// `ai.hyprstream.placement.node` record.
-    fn node_repo_car(did: &str, rec: &NodeRecord) -> Vec<u8> {
+    fn node_repo_car(did: &str, rec: &NodeRecord) -> (Vec<u8>, P256VerifyingKey) {
         let signing_key = P256SigningKey::random(&mut rand::rngs::OsRng);
+        let verifying_key = P256VerifyingKey::from(&signing_key);
         let key = format!("{}/3a", node::COLLECTION_NSID);
         let record_cid = Cid::from_dag_cbor(&rec.to_dag_cbor());
         let mut keyed: BTreeMap<String, Cid> = BTreeMap::new();
@@ -5456,7 +5482,7 @@ mod query_candidates_tests {
             blocks.push((cid, data.encode()));
         }
         blocks.push((record_cid, rec.to_dag_cbor()));
-        build_car_v1(&[commit.cid()], &blocks)
+        (build_car_v1(&[commit.cid()], &blocks), verifying_key)
     }
 
     fn sample_node_record(did: &str, labels: Vec<(&str, &str)>) -> NodeRecord {
@@ -5478,7 +5504,7 @@ mod query_candidates_tests {
 
     fn service_with(
         auth: Box<dyn AuthorizationProvider>,
-        repos: HashMap<String, Vec<u8>>,
+        repos: HashMap<String, (Vec<u8>, P256VerifyingKey)>,
     ) -> DiscoveryService {
         let (sk, vk) = hyprstream_rpc::crypto::generate_signing_keypair();
         DiscoveryService::new(
@@ -5529,8 +5555,9 @@ mod query_candidates_tests {
     async fn liveness_admission_denial_skips_cache_and_repository_ingest() {
         let did = "did:web:unadmitted-node.example.com";
         let rec = sample_node_record(did, vec![]);
+        let (car, _verifying_key) = node_repo_car(did, &rec);
         let resolver = Arc::new(TrackingRepoResolver {
-            repos: HashMap::from([(did.to_owned(), node_repo_car(did, &rec))]),
+            repos: HashMap::from([(did.to_owned(), car)]),
             resolved: parking_lot::Mutex::new(Vec::new()),
         });
         let (sk, vk) = hyprstream_rpc::crypto::generate_signing_keypair();

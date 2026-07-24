@@ -7151,6 +7151,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "blake3",
+ "bs58",
  "ed25519-dalek 2.2.0",
  "git2",
  "git2db",

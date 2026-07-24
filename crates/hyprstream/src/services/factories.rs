@@ -702,10 +702,8 @@ fn create_registry_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawn
     // holder of the `#atproto` private key: it opens the durable store
     // read-write and, on register/commit, signs the repo's commit ONCE and
     // persists the signed bytes. Reads (the discovery service) are keyless.
-    // This node's `did:key` identity (the record `repo` at-uri authority) is
-    // derived from the node's own root Ed25519 key — the same identity TLS
-    // endorsement uses ("a node-level trust assertion, not specific to any
-    // per-service key"). The `#atproto` commit-signing key is the *active* key
+    // The record `repo` authority is the root `did:web` document that publishes
+    // the `#atproto` commit-verification key. The `#atproto` signing key is the *active* key
     // from the shared `Es256SigningKeyStore` — the same P-256 key
     // `oauth::did_document` publishes as the `#atproto` verification method, so
     // the writer and the published key are one source of truth (classical —
@@ -731,16 +729,14 @@ fn create_registry_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawn
         let generation_source: Arc<dyn crate::auth::ActiveGenerationSource> = Arc::new(
             crate::auth::SealedHeadEs256Source::new(&oplog_state_dir, &secrets_dir),
         );
+        let es256_store =
+            crate::auth::key_rotation::global_es256_key_store(&secrets_dir, &config.oauth);
         let acceptance_identity = ctx.service_signing_key("registry");
         anyhow::ensure!(
             hyprstream_discovery::deployment_registry_verifier()?
                 .matches(&acceptance_identity.verifying_key()),
             "registry signing credential does not match authenticated deployment identity"
         );
-        // The alarm WAL must remain verifiable across OAuth key rotations and
-        // process restarts. Derive a dedicated, stable audit identity from the
-        // node/service root available in this deployment mode; the second
-        // derivation keeps the ML-DSA material separate from the Ed25519 key.
         let audit_ed = hyprstream_rpc::node_identity::derive_purpose_key(
             &acceptance_identity,
             "hyprstream-at9p-audit-ed25519-v1",
@@ -764,7 +760,8 @@ fn create_registry_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawn
             node_did,
             generation_source,
         )
-        .with_at9p_state_ingest(at9p_state))
+        .with_at9p_state_ingest(at9p_state)
+        .with_es256_store(es256_store))
     })()
     .map_err(|e| tracing::warn!("PDS publish disabled: {e}"))
     .ok();
@@ -784,7 +781,11 @@ fn create_registry_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawn
     }
     registry_service = registry_service.with_jwt_key_source(ctx.cluster_key_source());
     if let Some(publisher) = pds_publisher {
-        registry_service = registry_service.with_pds_publisher(publisher);
+        // A promotion publishes the former active key as a bounded drain slot;
+        // no writer-local re-sign callback is needed, which keeps `--ipc`
+        // rotation viable when OAuth and registry run in different processes.
+        let publisher_arc = Arc::new(publisher);
+        registry_service = registry_service.with_pds_publisher_arc(publisher_arc);
     }
 
     Ok(ctx.into_spawnable_quic(registry_service, config.registry.quic_port))
@@ -1874,9 +1875,23 @@ fn create_discovery_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spaw
             .context("failed to open PDS record store (read-only)")?
             .with_at9p_deployment_verifier(at9p_acceptance_identity),
     );
-    let record_resolver = std::sync::Arc::new(crate::services::discovery::PdsRecordResolver::new(
-        pds_store,
-    ));
+    // #918 — the local repo subject is the root did:web authority whose
+    // document is fed by this ES256 store. The resolver uses the same bounded
+    // publication snapshot, including drain, before placement ingest.
+    let secrets_dir = crate::config::HyprConfig::resolve_secrets_dir()?;
+    let es256_store =
+        crate::auth::key_rotation::global_es256_key_store(&secrets_dir, &config.oauth);
+    let issuer = ctx
+        .oauth_issuer_url()
+        .map(str::to_owned)
+        .unwrap_or_else(|| config.oauth.issuer_url());
+    let authority = crate::services::oauth::did_document::issuer_authority(&issuer)
+        .context("OAuth issuer has no did:web authority")?;
+    let node_did = format!("did:web:{authority}");
+    let record_resolver = std::sync::Arc::new(
+        crate::services::discovery::PdsRecordResolver::new(pds_store)
+            .with_es256_rotation(es256_store, node_did),
+    );
 
     let mut discovery_service = DiscoveryService::new(
         Arc::new(sk),
