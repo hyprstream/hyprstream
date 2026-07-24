@@ -48,7 +48,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use dashmap::DashMap;
-use hyprstream_rpc::auth::mac::SecurityContext;
+use hyprstream_rpc::auth::mac::ObjectRef;
 use hyprstream_rpc::Subject;
 use hyprstream_vfs::Mount;
 use tokio::io::{split, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -58,8 +58,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::backend::Backend;
 use crate::mac_seam::{
-    anonymous_floor, AccessDecider, AllowAllDecider, Action, AnonymousAuthenticator,
-    AttachAuthenticator,
+    anonymous_floor, AccessDecider, Action, ReferenceMonitor, SessionContext,
 };
 use crate::mount_backend::MountBackend;
 use crate::msg::{
@@ -77,10 +76,14 @@ struct FidState {
     qtype: u8,
     /// Whether open() has succeeded on this fid.
     opened: bool,
-    /// The caller's verified security context, derived once at `Tattach` by
-    /// the translator's [`AttachAuthenticator`] and inherited by every fid
-    /// walked from it (#568) — never re-derived per op.
-    ctx: SecurityContext,
+    /// Session derived once from the verified `Tattach` credential and
+    /// inherited by every descendant fid. `None` when the translator runs
+    /// without a [`ReferenceMonitor`] (the dormant pre-activation default).
+    session: Option<SessionContext>,
+    /// Absolute path of this walked fid, relative to the export root. The
+    /// reference monitor resolves this path through the trusted
+    /// manifest/genesis label resolver before every mediated operation.
+    path: Vec<String>,
 }
 
 /// Server-side fid table: 9P fid → state.
@@ -92,10 +95,19 @@ pub struct FidTable {
 }
 
 impl FidTable {
-    /// Insert state for a fid (from walk/attach), inheriting `ctx` from the
-    /// attach or the source fid being walked.
-    pub fn insert(&self, fid: u32, qtype: u8, ctx: SecurityContext) {
-        self.fids.insert(fid, FidState { qtype, opened: false, ctx });
+    /// Insert state for a fid, inheriting the verified attach session (when a
+    /// monitor is installed) and carrying the absolute walked path used for
+    /// content-label resolution.
+    pub fn insert(&self, fid: u32, qtype: u8, session: Option<SessionContext>, path: Vec<String>) {
+        self.fids.insert(
+            fid,
+            FidState {
+                qtype,
+                opened: false,
+                session,
+                path,
+            },
+        );
     }
 
     /// Mark a fid as opened.
@@ -110,9 +122,15 @@ impl FidTable {
         self.fids.get(&fid).map(|s| s.qtype)
     }
 
-    /// Look up a fid's cached security context (from attach/inherited walk).
-    pub fn security_context(&self, fid: u32) -> Option<SecurityContext> {
-        self.fids.get(&fid).map(|s| s.ctx.clone())
+    /// Look up the verified attach session inherited by a fid (`None` when
+    /// the fid is unknown or the translator runs without a monitor).
+    pub fn session(&self, fid: u32) -> Option<SessionContext> {
+        self.fids.get(&fid).and_then(|s| s.session.clone())
+    }
+
+    /// Look up a fid's absolute export-relative path for trusted label lookup.
+    pub fn path(&self, fid: u32) -> Option<Vec<String>> {
+        self.fids.get(&fid).map(|s| s.path.clone())
     }
 
     /// Remove a fid (clunk).
@@ -128,59 +146,35 @@ pub struct Translator {
     backend: Arc<dyn Backend>,
     backend_factory: Arc<dyn Fn() -> Arc<dyn Backend> + Send + Sync>,
     fids: Arc<FidTable>,
-    attach_ctx: OnceCell<SecurityContext>,
-    /// Verifies the `Tattach` credential and derives the fid's cached
-    /// [`SecurityContext`] (#568). Defaults to [`AnonymousAuthenticator`]
-    /// (always the anonymous floor), matching today's actual behavior — no
-    /// identity verification at attach. Real verification is an explicit
-    /// opt-in via [`Translator::with_authenticator`].
-    authenticator: Arc<dyn AttachAuthenticator>,
-    /// Authorizes each op against the fid's cached context (#568). Defaults
-    /// to [`AllowAllDecider`] (always allow), matching today's actual
-    /// behavior — no per-op authorization. See the module-level docs on
-    /// `mac_seam` for why a real deny-on-unlabeled decider must NOT be the
-    /// default: every object in the 9P namespace is unlabeled today, and the
-    /// S1 invariant is unlabeled ⇒ deny, not ⇒ floor.
+    attach_session: OnceCell<SessionContext>,
+    /// Mandatory resolver-backed, audited policy-enforcement point.
     decider: Arc<dyn AccessDecider>,
+    /// Optional S2 token/IFC composition. The mandatory decider remains active
+    /// when this richer attach-time monitor is not installed.
+    monitor: Option<Arc<ReferenceMonitor>>,
 }
 
 impl Translator {
-    /// Build a translator over the given backend. The fid table starts empty.
-    /// Attach/authorization use the inert defaults (no behavior change from
-    /// before #568): see [`Translator::with_authenticator`] /
-    /// [`Translator::with_decider`] to opt into real enforcement.
-    pub fn new(backend: Arc<dyn Backend>) -> Self {
+    /// Build a translator over the given backend and mandatory audited PEP.
+    pub fn new(backend: Arc<dyn Backend>, decider: Arc<dyn AccessDecider>) -> Self {
         let backend_factory_backend = Arc::clone(&backend);
         Self {
             backend,
             backend_factory: Arc::new(move || Arc::clone(&backend_factory_backend)),
             fids: Arc::new(FidTable::default()),
-            attach_ctx: OnceCell::new(),
-            authenticator: Arc::new(AnonymousAuthenticator),
-            decider: Arc::new(AllowAllDecider),
+            attach_session: OnceCell::new(),
+            decider,
+            monitor: None,
         }
     }
 
-    /// Replace the attach-time credential verifier. The `hyprstream` crate is
-    /// expected to call this with a real verifier (backed by the S6-minted
-    /// access token + the service trust store) once a standalone "verify a
-    /// presented token" entry point exists outside the OAuth HTTP handler —
-    /// see the #568 PR discussion for why that plumbing is not included here.
-    pub fn with_authenticator(mut self, authenticator: Arc<dyn AttachAuthenticator>) -> Self {
-        self.authenticator = authenticator;
-        self
-    }
-
-    /// Replace the per-op access decider. The `hyprstream` crate is expected
-    /// to call this with a real decider (backed by `mac::avc::CachingAvc`,
-    /// optionally wrapped in `mac_seam::AuditedDecider`) once object labels
-    /// are actually available for the mount being served (genesis labeling,
-    /// or #699 carrier-b for content-addressed data) — wiring a real decider
-    /// before that point would deny every existing 9P client, since an
-    /// unlabeled object must deny per the S1 invariant, not fall back to a
-    /// permissive floor.
-    pub fn with_decider(mut self, decider: Arc<dyn AccessDecider>) -> Self {
-        self.decider = decider;
+    /// Install the S2 reference monitor: every dispatched op on every fid is
+    /// then mediated (attach-time token verification, trusted label
+    /// resolution, token gate, independent IFC dominance, then the local
+    /// AVC/PDP), failing closed at each step. Without this call the translator
+    /// enforces nothing — the dormant pre-activation default.
+    pub fn with_reference_monitor(mut self, monitor: Arc<ReferenceMonitor>) -> Self {
+        self.monitor = Some(monitor);
         self
     }
 
@@ -193,7 +187,11 @@ impl Translator {
     /// mount in a [`MountBackend`] — the same [`Backend`] seam the capnp-RPC
     /// `ModelBackend` uses on the TCP path — so no new attachment mechanism is
     /// introduced; only the export root differs.
-    pub fn from_mount(mount: Arc<dyn Mount>, subject: Subject) -> Self {
+    pub fn from_mount(
+        mount: Arc<dyn Mount>,
+        subject: Subject,
+        decider: Arc<dyn AccessDecider>,
+    ) -> Self {
         let backend: Arc<dyn Backend> =
             Arc::new(MountBackend::new(Arc::clone(&mount), subject.clone()));
         Self {
@@ -203,9 +201,9 @@ impl Translator {
                     as Arc<dyn Backend>
             }),
             fids: Arc::new(FidTable::default()),
-            attach_ctx: OnceCell::new(),
-            authenticator: Arc::new(AnonymousAuthenticator),
-            decider: Arc::new(AllowAllDecider),
+            attach_session: OnceCell::new(),
+            decider,
+            monitor: None,
         }
     }
 
@@ -224,6 +222,7 @@ impl Translator {
     pub fn from_mount_authorized(
         mount: Arc<dyn Mount>,
         authorizer: Arc<dyn crate::mount_backend::AttachAuthorizer>,
+        decider: Arc<dyn AccessDecider>,
     ) -> Self {
         let backend: Arc<dyn Backend> = Arc::new(MountBackend::with_authorizer(
             Arc::clone(&mount),
@@ -238,9 +237,9 @@ impl Translator {
                 )) as Arc<dyn Backend>
             }),
             fids: Arc::new(FidTable::default()),
-            attach_ctx: OnceCell::new(),
-            authenticator: Arc::new(AnonymousAuthenticator),
-            decider: Arc::new(AllowAllDecider),
+            attach_session: OnceCell::new(),
+            decider,
+            monitor: None,
         }
     }
 
@@ -254,9 +253,9 @@ impl Translator {
             backend: (self.backend_factory)(),
             backend_factory: Arc::clone(&self.backend_factory),
             fids: Arc::new(FidTable::default()),
-            attach_ctx: OnceCell::new(),
-            authenticator: Arc::clone(&self.authenticator),
+            attach_session: OnceCell::new(),
             decider: Arc::clone(&self.decider),
+            monitor: self.monitor.clone(),
         }
     }
 
@@ -451,37 +450,67 @@ impl Translator {
     }
 
     async fn handle_attach(&self, fid: u32, uname: &str, aname: &str) -> Result<Response> {
-        // Establish the session first: on the attach-time ticket path (H1b) this
-        // validates `uname` and binds the session Subject; on the fixed-subject
-        // path it is a no-op. A denied ticket returns here and is mapped to an
-        // Rlerror by the serve loop — before any fid or mount handle exists.
-        self.backend.attach(uname).await?;
-        // #568: verify the attach credential exactly once, deriving the
-        // context every fid walked from this attach will inherit. The
-        // default AnonymousAuthenticator always floors — no behavior change
-        // until a real authenticator is injected via `with_authenticator`.
-        let ctx = self.authenticator.authenticate(uname, aname).await;
-        self.bind_attach_context(&ctx)?;
-        // Attach establishes the root fid. Walk the empty path to materialize
+        // A full S2 monitor verifies the attach credential and applies its
+        // token/IFC gates. Without one, the mandatory production decider still
+        // mediates the root against the anonymous-floor context.
+        let session = match &self.monitor {
+            Some(monitor) => {
+                let session = monitor.authenticate(uname, aname).await;
+                // The root fid itself is a mediated object. It has no
+                // synthetic exemption: an unlabeled root or missing/expired
+                // token denies at attach, before any backend object handle
+                // is exposed.
+                if !monitor.authorize(&session, &[], Action::Attach) {
+                    return Ok(Response::Error { ecode: libc_eperm() });
+                }
+                self.ensure_attach_session_compatible(&session)?;
+                Some(session)
+            }
+            None => {
+                let root: [&str; 0] = [];
+                if !self
+                    .decider
+                    .check(&anonymous_floor(), ObjectRef::Path(&root), Action::Attach)
+                {
+                    return Ok(Response::Error { ecode: libc_eperm() });
+                }
+                None
+            }
+        };
+
+        // Only an attach that cleared monitor authorization may bind a backend
+        // subject. Walk the empty path to materialize
         // a root qid from the backend, then record it.
+        self.backend.attach(uname).await?;
         let walk = self.backend.walk(fid, fid, &[]).await?;
+        if let Some(session) = &session {
+            self.bind_attach_session(session)?;
+        }
         let qtype = walk.qids.last().map(|q| q.qtype).unwrap_or(0);
-        self.fids.insert(fid, qtype, ctx);
+        self.fids.insert(fid, qtype, session, Vec::new());
         let qid = walk.qids.into_iter().next().unwrap_or_default();
         Ok(Response::Attach { qid })
     }
 
-    fn bind_attach_context(&self, ctx: &SecurityContext) -> Result<()> {
-        if self.attach_ctx.set(ctx.clone()).is_ok() {
+    fn ensure_attach_session_compatible(&self, session: &SessionContext) -> Result<()> {
+        match self.attach_session.get() {
+            // Compare by *attach identity*, not value equality: a real
+            // authenticator re-stamps the token deadline on every verification
+            // of the same ticket, so a value comparison would reject a
+            // legitimate re-attach of an identical, still-valid session (F2).
+            Some(existing) if existing.same_attach_identity(session) => Ok(()),
+            Some(_) => Err(anyhow::Error::new(hyprstream_vfs::MountError::PermissionDenied(
+                "conflicting attach session context".to_owned(),
+            ))),
+            None => Ok(()),
+        }
+    }
+
+    fn bind_attach_session(&self, session: &SessionContext) -> Result<()> {
+        if self.attach_session.set(session.clone()).is_ok() {
             return Ok(());
         }
-        match self.attach_ctx.get() {
-            Some(existing) if existing == ctx => Ok(()),
-            Some(_) => Err(anyhow::Error::new(hyprstream_vfs::MountError::PermissionDenied(
-                "conflicting attach security context".to_owned(),
-            ))),
-            None => Err(anyhow::anyhow!("attach context cell rejected without value")),
-        }
+        self.ensure_attach_session_compatible(session)
     }
 
     async fn handle_walk(
@@ -490,25 +519,58 @@ impl Translator {
         newfid: u32,
         wnames: Vec<String>,
     ) -> Result<Response> {
-        if let Some(err) = self.deny(fid, Action::Walk) {
-            return Ok(err);
+        // The session is inherited from the fid being walked (#568 — the
+        // credential is verified once at attach, never re-verified per op).
+        // The destination path extends the source fid's already-walked path.
+        let session = self.fids.session(fid);
+        let base = self.fids.path(fid).unwrap_or_default();
+
+        // Complete mediation: authorize every hop, not only the final
+        // destination. Labels need not be monotone with path depth. An empty
+        // walk is a fid clone and still mediates the object bound to the source
+        // fid; otherwise an unattached connection could clone another
+        // connection's fid without passing the monitor.
+        let mut prefix = base.clone();
+        if wnames.is_empty()
+            && !self.authorize_path(session.as_ref(), &prefix, Action::Walk)
+        {
+            return Ok(Response::Error { ecode: libc_eperm() });
         }
-        // The context is inherited from the fid being walked (#568 — a
-        // context is derived once at attach, never re-verified per op).
-        let ctx = self.fids.security_context(fid).unwrap_or_else(anonymous_floor);
+        for component in &wnames {
+            prefix.push(component.clone());
+            if !self.authorize_path(session.as_ref(), &prefix, Action::Walk) {
+                return Ok(Response::Error { ecode: libc_eperm() });
+            }
+        }
+
         // Mirror of RemoteModelMount::walk: call backend.walk with the source
         // fid, the new fid, and the path components.
         let result = self.backend.walk(fid, newfid, &wnames).await?;
+
+        // The backend is authoritative for the exact request prefix it bound
+        // to `newfid`. Enforce the Backend contract before caching it.
+        if !wnames.is_empty()
+            && (result.qids.len() != result.reached.len()
+                || result.reached.len() > wnames.len()
+                || result.reached != wnames[..result.reached.len()])
+        {
+            return Err(anyhow::anyhow!("backend walk result does not describe its reached prefix"));
+        }
+        let nwqid = result.qids.len();
+        let mut reached = base;
+        reached.extend(result.reached);
+
         if wnames.is_empty() {
             // nwname=0 is a fid *clone*: newfid aliases fid (same file), and
             // the backend returns no qids. newfid must still inherit the source
-            // fid's qtype and context — otherwise the clone has no cached
-            // context, floors to anonymous, and a real decider wrongly denies
-            // it for an already-authenticated client (#568).
+            // fid's qtype, session, and path — otherwise the clone has no
+            // cached session and a live monitor wrongly denies it for an
+            // already-authenticated client (#568).
             let qtype = self.fids.qtype(fid).unwrap_or(0);
-            self.fids.insert(newfid, qtype, ctx);
-        } else if let Some(q) = result.qids.last() {
-            self.fids.insert(newfid, q.qtype, ctx);
+            self.fids.insert(newfid, qtype, session, reached);
+        } else if nwqid > 0 {
+            let qtype = result.qids.last().map(|q| q.qtype).unwrap_or(0);
+            self.fids.insert(newfid, qtype, session, reached);
         }
         Ok(Response::Walk { qids: result.qids })
     }
@@ -565,23 +627,35 @@ impl Translator {
         Ok(Response::Readdir { data })
     }
 
-    /// Consults the decider for `fid`+`action` against the fid's cached
-    /// context. Returns `Some(Response::Error)` (EPERM) if denied, `None` if
-    /// allowed. No object label is available at this layer (see the
-    /// `mac_seam` module docs) — `object_label` is always `None` here; a real
-    /// decider must treat that as "deny" per the S1 invariant, not as
-    /// "unrestricted".
-    ///
-    /// A fid with no cached context (should not happen — every fid is
-    /// populated at attach or inherits from its parent on walk) is treated
-    /// as the anonymous floor rather than panicking.
+    /// Mediate one op through the optional full S2 monitor or, when it is not
+    /// installed, directly through the mandatory audited decider.
     fn deny(&self, fid: u32, action: Action) -> Option<Response> {
-        let ctx = self.fids.security_context(fid).unwrap_or_else(anonymous_floor);
-        if self.decider.check(&ctx, None, action) {
+        let Some(path) = self.fids.path(fid) else {
+            return Some(Response::Error { ecode: libc_eperm() });
+        };
+        let session = self.fids.session(fid);
+        if self.authorize_path(session.as_ref(), &path, action) {
             None
         } else {
             Some(Response::Error { ecode: libc_eperm() })
         }
+    }
+
+    fn authorize_path(
+        &self,
+        session: Option<&SessionContext>,
+        path: &[String],
+        action: Action,
+    ) -> bool {
+        if let Some(monitor) = &self.monitor {
+            return session.is_some_and(|session| monitor.authorize(session, path, action));
+        }
+        let components: Vec<&str> = path.iter().map(String::as_str).collect();
+        self.decider.check(
+            &anonymous_floor(),
+            ObjectRef::Path(&components),
+            action,
+        )
     }
 }
 
@@ -594,11 +668,14 @@ impl Translator {
 pub async fn serve_mount_uds(
     mount: Arc<dyn Mount>,
     subject: Subject,
+    decider: Arc<dyn AccessDecider>,
     path: impl AsRef<Path>,
 ) -> Result<()> {
     let listener = UnixListener::bind(path.as_ref())
         .with_context(|| format!("bind 9P UDS listener at {:?}", path.as_ref()))?;
-    Translator::from_mount(mount, subject).serve_uds(listener).await
+    Translator::from_mount(mount, subject, decider)
+        .serve_uds(listener)
+        .await
 }
 
 /// Bind a Cloud-Hypervisor **hybrid-vsock** host socket at `path` and serve
@@ -614,11 +691,14 @@ pub async fn serve_mount_uds(
 pub async fn serve_mount_vsock(
     mount: Arc<dyn Mount>,
     subject: Subject,
+    decider: Arc<dyn AccessDecider>,
     path: impl AsRef<Path>,
 ) -> Result<()> {
     let listener = UnixListener::bind(path.as_ref())
         .with_context(|| format!("bind 9P hybrid-vsock listener at {:?}", path.as_ref()))?;
-    Translator::from_mount(mount, subject).serve_vsock(listener).await
+    Translator::from_mount(mount, subject, decider)
+        .serve_vsock(listener)
+        .await
 }
 
 /// Bind a **raw** (no-handshake) hybrid-vsock **per-port** host socket at `path`
@@ -637,12 +717,15 @@ pub async fn serve_mount_vsock(
 pub async fn serve_mount_vsock_raw(
     mount: Arc<dyn Mount>,
     subject: Subject,
+    decider: Arc<dyn AccessDecider>,
     path: impl AsRef<Path>,
 ) -> Result<()> {
     let listener = UnixListener::bind(path.as_ref()).with_context(|| {
         format!("bind 9P raw hybrid-vsock per-port listener at {:?}", path.as_ref())
     })?;
-    Translator::from_mount(mount, subject).serve_vsock_raw(listener).await
+    Translator::from_mount(mount, subject, decider)
+        .serve_vsock_raw(listener)
+        .await
 }
 
 /// Transport-agnostic accept surface, implemented for [`TcpListener`] and
@@ -969,7 +1052,7 @@ mod tests {
         }
 
         let backend = MountBackend::new(Arc::new(StubMount), Subject::new("tenant"));
-        let t = Arc::new(Translator::new(Arc::new(backend)));
+        let t = Arc::new(Translator::new(Arc::new(backend), test_decider()));
 
         // Attach fid 0 as root (empty walk succeeds).
         t.handle_message(&msg::tattach(1, 0, u32::MAX, "u", "")).await.unwrap();
@@ -988,7 +1071,7 @@ mod tests {
 
     #[tokio::test]
     async fn version_round_trips() {
-        let t = Translator::new(Arc::new(MemoryBackend::default()));
+        let t = Translator::new(Arc::new(MemoryBackend::default()), test_decider());
         // Build a Tversion by hand via the codec and decode the response.
         let req = msg::tversion(1, 4096, "9P2000.L");
         let (tag, resp) = t.handle_message(&req).await.unwrap();
@@ -1006,7 +1089,7 @@ mod tests {
     async fn attach_then_walk_open_read_clunk() {
         let backend = MemoryBackend::default();
         backend.add_file("/hello.txt", b"hello world");
-        let t = Translator::new(Arc::new(backend));
+        let t = Translator::new(Arc::new(backend), test_decider());
 
         // Attach: fid 0 becomes the root.
         let req = msg::tattach(1, 0, u32::MAX, "user", "/");
@@ -1040,11 +1123,186 @@ mod tests {
         assert!(matches!(resp, Response::Clunk));
     }
 
-    /// #568: a translator with a real (non-default) decider actually blocks
-    /// ops, proving the `deny`/`FidTable::security_context` wiring is live —
-    /// not just present but inert. Uses a decider that denies `Action::Read`
-    /// unconditionally; walk/open (unblocked) still succeed, read is
-    /// rejected with `Rlerror EPERM` rather than reaching the backend.
+    // ── #568 reference-monitor test doubles ───────────────────────────
+    //
+    // The monitor seams are exercised with fakes that stand in for the
+    // application's verified-token authenticator, genesis/manifest label
+    // resolver, and AVC/PDP decider. No production path installs a monitor
+    // yet (activation is blocked on #698); the unmonitored tests in this
+    // module double as the dormant-default regression guard.
+
+    use crate::mac_seam::{
+        AccessDecider, AttachAuthenticator, ObjectLabelResolver, ObjectRef, VerifiedAttachIdentity,
+        VerifiedTokenScope,
+    };
+    use hyprstream_rpc::auth::mac::{
+        Assurance, CompartmentSet, Level, SecurityContext, SecurityLabel, VerifiedKeyMaterial,
+    };
+    use std::time::{Duration, Instant};
+
+    fn label(level: Level) -> SecurityLabel {
+        SecurityLabel::new(level, Assurance::Classical, CompartmentSet::EMPTY)
+    }
+
+    fn ctx(level: Level) -> SecurityContext {
+        // Classical key material so the derived assurance dominates the
+        // Classical-assurance object labels used across these tests.
+        SecurityContext::new(level, CompartmentSet::EMPTY, VerifiedKeyMaterial::Classical)
+    }
+
+    /// A session at `level` whose verified token permits exactly `ops` (with
+    /// a Secret ceiling) for the next hour.
+    fn permit_session(level: Level, ops: &[Action]) -> SessionContext {
+        permit_session_as("test-subject", level, ops)
+    }
+
+    fn permit_session_as(identity: &str, level: Level, ops: &[Action]) -> SessionContext {
+        SessionContext::from_verified_token(
+            VerifiedAttachIdentity::from_verified_identity(identity),
+            ctx(level),
+            VerifiedTokenScope::from_verified_token(
+                label(Level::Secret),
+                Arc::from(ops),
+                Instant::now() + Duration::from_secs(3600),
+            ),
+        )
+    }
+
+    const ALL_OPS: &[Action] = &[
+        Action::Attach,
+        Action::Walk,
+        Action::Open,
+        Action::Read,
+        Action::Write,
+        Action::Getattr,
+        Action::Readdir,
+    ];
+
+    /// Authenticator returning a fixed session (the token is treated as
+    /// already verified, as a real authenticator would after checking it).
+    struct StaticAuth(SessionContext);
+    #[async_trait]
+    impl AttachAuthenticator for StaticAuth {
+        async fn authenticate(&self, _u: &str, _a: &str) -> SessionContext {
+            self.0.clone()
+        }
+    }
+
+    /// Resolver returning a fixed label for every path (`None` = unlabeled).
+    struct StaticLabels(Option<SecurityLabel>);
+    impl ObjectLabelResolver for StaticLabels {
+        fn resolve(&self, _object: ObjectRef<'_>) -> Option<SecurityLabel> {
+            self.0
+        }
+    }
+
+    struct AllowAll;
+    impl AccessDecider for AllowAll {
+        fn check(
+            &self,
+            _ctx: &SecurityContext,
+            _object: ObjectRef<'_>,
+            _action: Action,
+        ) -> bool {
+            true
+        }
+    }
+
+    fn test_decider() -> Arc<dyn AccessDecider> {
+        Arc::new(AllowAll)
+    }
+
+    fn monitor(
+        auth: SessionContext,
+        resolved: Option<SecurityLabel>,
+        decider: Arc<dyn AccessDecider>,
+    ) -> Arc<ReferenceMonitor> {
+        Arc::new(ReferenceMonitor::new(
+            Arc::new(StaticAuth(auth)),
+            Arc::new(StaticLabels(resolved)),
+            decider,
+        ))
+    }
+
+    /// With a monitor installed, an unlabeled root denies the attach itself:
+    /// the root fid is a mediated object with no synthetic exemption.
+    #[tokio::test]
+    async fn monitor_denies_unlabeled_root_at_attach() {
+        let t = Translator::new(Arc::new(MemoryBackend::default()), test_decider()).with_reference_monitor(
+            monitor(permit_session(Level::Secret, ALL_OPS), None, Arc::new(AllowAll)),
+        );
+        let (_, resp) = t.handle_message(&msg::tattach(1, 0, u32::MAX, "user", "/")).await.unwrap();
+        match resp {
+            Response::Error { ecode } => assert_eq!(ecode, libc_eperm()),
+            other => panic!("expected Rlerror EPERM for unlabeled root, got {other:?}"),
+        }
+    }
+
+    /// A session without a verified token denies at attach, before any
+    /// backend object handle exists.
+    #[tokio::test]
+    async fn monitor_denies_missing_token_at_attach() {
+        let t = Translator::new(Arc::new(MemoryBackend::default()), test_decider()).with_reference_monitor(
+            monitor(SessionContext::deny(), Some(label(Level::Public)), Arc::new(AllowAll)),
+        );
+        let (_, resp) = t.handle_message(&msg::tattach(1, 0, u32::MAX, "user", "/")).await.unwrap();
+        match resp {
+            Response::Error { ecode } => assert_eq!(ecode, libc_eperm()),
+            other => panic!("expected Rlerror EPERM for missing token, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn monitor_denies_expired_token_at_attach() {
+        let expired = SessionContext::from_verified_token(
+            VerifiedAttachIdentity::from_verified_identity("test-subject"),
+            ctx(Level::Secret),
+            VerifiedTokenScope::from_verified_token(
+                label(Level::Secret),
+                Arc::from(ALL_OPS),
+                Instant::now() - Duration::from_secs(1),
+            ),
+        );
+        let t = Translator::new(Arc::new(MemoryBackend::default()), test_decider()).with_reference_monitor(
+            monitor(expired, Some(label(Level::Public)), Arc::new(AllowAll)),
+        );
+        let (_, resp) = t.handle_message(&msg::tattach(1, 0, u32::MAX, "user", "/")).await.unwrap();
+        match resp {
+            Response::Error { ecode } => assert_eq!(ecode, libc_eperm()),
+            other => panic!("expected Rlerror EPERM for expired token, got {other:?}"),
+        }
+    }
+
+    /// When every gate passes — labeled object, unexpired token covering the
+    /// op, dominating subject, permitting decider — the mediated session is
+    /// served end to end.
+    #[tokio::test]
+    async fn monitor_allows_when_all_gates_pass() {
+        let backend = MemoryBackend::default();
+        backend.add_file("/hello.txt", b"hello world");
+        let t = Translator::new(Arc::new(backend), test_decider()).with_reference_monitor(monitor(
+            permit_session(Level::Secret, ALL_OPS),
+            Some(label(Level::Public)),
+            Arc::new(AllowAll),
+        ));
+
+        let (_, resp) = t.handle_message(&msg::tattach(1, 0, u32::MAX, "user", "/")).await.unwrap();
+        assert!(matches!(resp, Response::Attach { .. }), "got {resp:?}");
+        let (_, resp) = t.handle_message(&msg::twalk(2, 0, 1, &["hello.txt"])).await.unwrap();
+        assert!(matches!(resp, Response::Walk { .. }), "got {resp:?}");
+        let (_, resp) = t.handle_message(&msg::tlopen(3, 1, 0)).await.unwrap();
+        assert!(matches!(resp, Response::Lopen { .. }), "got {resp:?}");
+        let (_, resp) = t.handle_message(&msg::tread(4, 1, 0, 64)).await.unwrap();
+        match resp {
+            Response::Read { data } => assert_eq!(&data, b"hello world"),
+            other => panic!("expected Read, got {other:?}"),
+        }
+    }
+
+    /// #568: a translator with a live monitor actually blocks ops the decider
+    /// rejects, proving the `deny` wiring is live — not just present but
+    /// inert. Walk/open (permitted) still succeed; read is rejected with
+    /// `Rlerror EPERM` rather than reaching the backend.
     #[tokio::test]
     async fn injected_decider_blocks_denied_action() {
         struct DenyReads;
@@ -1052,7 +1310,7 @@ mod tests {
             fn check(
                 &self,
                 _ctx: &SecurityContext,
-                _object_label: Option<&hyprstream_rpc::auth::mac::SecurityLabel>,
+                _object: ObjectRef<'_>,
                 action: Action,
             ) -> bool {
                 !matches!(action, Action::Read)
@@ -1061,11 +1319,14 @@ mod tests {
 
         let backend = MemoryBackend::default();
         backend.add_file("/hello.txt", b"hello world");
-        let t = Translator::new(Arc::new(backend)).with_decider(Arc::new(DenyReads));
+        let t = Translator::new(Arc::new(backend), test_decider()).with_reference_monitor(monitor(
+            permit_session(Level::Secret, ALL_OPS),
+            Some(label(Level::Public)),
+            Arc::new(DenyReads),
+        ));
 
         t.handle_message(&msg::tattach(1, 0, u32::MAX, "user", "/")).await.unwrap();
-        let (_, resp) =
-            t.handle_message(&msg::twalk(2, 0, 1, &["hello.txt"])).await.unwrap();
+        let (_, resp) = t.handle_message(&msg::twalk(2, 0, 1, &["hello.txt"])).await.unwrap();
         assert!(matches!(resp, Response::Walk { .. }), "walk must still succeed");
 
         let (_, resp) = t.handle_message(&msg::tlopen(3, 1, 0)).await.unwrap();
@@ -1078,8 +1339,133 @@ mod tests {
         }
     }
 
+    /// An op outside the verified token's operation set denies even when the
+    /// decider would permit it — the token gate runs before policy.
+    #[tokio::test]
+    async fn monitor_denies_op_outside_token_scope() {
+        let backend = MemoryBackend::default();
+        backend.add_file("/hello.txt", b"hello world");
+        let t = Translator::new(Arc::new(backend), test_decider()).with_reference_monitor(monitor(
+            permit_session(
+                Level::Secret,
+                &[Action::Attach, Action::Walk, Action::Open, Action::Read],
+            ),
+            Some(label(Level::Public)),
+            Arc::new(AllowAll),
+        ));
+
+        t.handle_message(&msg::tattach(1, 0, u32::MAX, "user", "/")).await.unwrap();
+        t.handle_message(&msg::twalk(2, 0, 1, &["hello.txt"])).await.unwrap();
+        t.handle_message(&msg::tlopen(3, 1, 1 /* OWRITE */)).await.unwrap();
+        let (_, resp) = t.handle_message(&msg::twrite(4, 1, 0, b"nope")).await.unwrap();
+        match resp {
+            Response::Error { ecode } => assert_eq!(ecode, libc_eperm()),
+            other => panic!("expected Rlerror EPERM for out-of-scope write, got {other:?}"),
+        }
+        let (_, resp) = t.handle_message(&msg::tread(5, 1, 0, 64)).await.unwrap();
+        assert!(matches!(resp, Response::Read { .. }), "in-scope read must pass: {resp:?}");
+    }
+
+    /// A walk is mediated against its destination label: the token ceiling
+    /// (Confidential) covers the public file but not the Secret one, so the
+    /// second walk denies even though the source fid was authorized.
+    #[tokio::test]
+    async fn monitor_walk_checked_against_destination_label() {
+        struct ByName;
+        impl ObjectLabelResolver for ByName {
+            fn resolve(&self, object: ObjectRef<'_>) -> Option<SecurityLabel> {
+                match object {
+                    ObjectRef::Path(parts) => Some(match parts.last().copied() {
+                        Some("secret.txt") => label(Level::Secret),
+                        _ => label(Level::Public),
+                    }),
+                    ObjectRef::Cid(_) => None,
+                }
+            }
+        }
+        let session = SessionContext::from_verified_token(
+            VerifiedAttachIdentity::from_verified_identity("test-subject"),
+            ctx(Level::Secret),
+            VerifiedTokenScope::from_verified_token(
+                label(Level::Confidential),
+                Arc::from(ALL_OPS),
+                Instant::now() + Duration::from_secs(3600),
+            ),
+        );
+        let backend = MemoryBackend::default();
+        backend.add_file("/hello.txt", b"hi");
+        backend.add_file("/secret.txt", b"classified");
+        let t = Translator::new(Arc::new(backend), test_decider()).with_reference_monitor(Arc::new(
+            ReferenceMonitor::new(
+                Arc::new(StaticAuth(session)),
+                Arc::new(ByName),
+                Arc::new(AllowAll),
+            ),
+        ));
+
+        t.handle_message(&msg::tattach(1, 0, u32::MAX, "user", "/")).await.unwrap();
+        let (_, resp) = t.handle_message(&msg::twalk(2, 0, 1, &["hello.txt"])).await.unwrap();
+        assert!(matches!(resp, Response::Walk { .. }), "public walk must pass: {resp:?}");
+        let (_, resp) = t.handle_message(&msg::twalk(3, 0, 2, &["secret.txt"])).await.unwrap();
+        match resp {
+            Response::Error { ecode } => assert_eq!(ecode, libc_eperm()),
+            other => panic!("expected Rlerror EPERM above the token ceiling, got {other:?}"),
+        }
+    }
+
+    /// The IFC floor is independent of the token and the policy matrix: a
+    /// Public subject holding a Secret-ceiling token with an allow-all
+    /// decider still cannot walk into a Secret-labeled object.
+    #[tokio::test]
+    async fn monitor_ifc_floor_not_bypassed_by_permissive_decider() {
+        struct AllSecret;
+        impl ObjectLabelResolver for AllSecret {
+            fn resolve(&self, object: ObjectRef<'_>) -> Option<SecurityLabel> {
+                match object {
+                    ObjectRef::Path([]) => Some(label(Level::Public)),
+                    ObjectRef::Path(_) => Some(label(Level::Secret)),
+                    ObjectRef::Cid(_) => None,
+                }
+            }
+        }
+        let backend = MemoryBackend::default();
+        backend.add_file("/secret.txt", b"classified");
+        let t = Translator::new(Arc::new(backend), test_decider()).with_reference_monitor(Arc::new(
+            ReferenceMonitor::new(
+                Arc::new(StaticAuth(permit_session(Level::Public, ALL_OPS))),
+                Arc::new(AllSecret),
+                Arc::new(AllowAll),
+            ),
+        ));
+
+        let (_, resp) = t.handle_message(&msg::tattach(1, 0, u32::MAX, "user", "/")).await.unwrap();
+        assert!(matches!(resp, Response::Attach { .. }), "public root must attach: {resp:?}");
+        let (_, resp) = t.handle_message(&msg::twalk(2, 0, 1, &["secret.txt"])).await.unwrap();
+        match resp {
+            Response::Error { ecode } => assert_eq!(ecode, libc_eperm()),
+            other => panic!("expected Rlerror EPERM for IFC non-dominance, got {other:?}"),
+        }
+    }
+
+    /// Clunk is fid disposal, not an object operation: it is never mediated,
+    /// so a denied op can never wedge connection teardown.
+    #[tokio::test]
+    async fn clunk_is_not_mediated() {
+        let backend = MemoryBackend::default();
+        backend.add_file("/hello.txt", b"hi");
+        let t = Translator::new(Arc::new(backend), test_decider()).with_reference_monitor(monitor(
+            permit_session(Level::Secret, &[Action::Attach, Action::Walk]),
+            Some(label(Level::Public)),
+            Arc::new(AllowAll),
+        ));
+        t.handle_message(&msg::tattach(1, 0, u32::MAX, "user", "/")).await.unwrap();
+        t.handle_message(&msg::twalk(2, 0, 1, &["hello.txt"])).await.unwrap();
+        let (_, resp) = t.handle_message(&msg::tclunk(3, 1)).await.unwrap();
+        assert!(matches!(resp, Response::Clunk), "clunk must not be mediated: {resp:?}");
+    }
+
     /// #767 review: `getattr` leaks object metadata (qid/mode/size/mtime) and
-    /// must be gated by the decider like every other fid op — it was the one
+    /// must be gated by the monitor like every other fid op — it was the one
     /// ungated op. A decider that denies `Action::Getattr` must produce EPERM.
     #[tokio::test]
     async fn injected_decider_blocks_getattr() {
@@ -1088,7 +1474,7 @@ mod tests {
             fn check(
                 &self,
                 _ctx: &SecurityContext,
-                _object_label: Option<&hyprstream_rpc::auth::mac::SecurityLabel>,
+                _object: ObjectRef<'_>,
                 action: Action,
             ) -> bool {
                 !matches!(action, Action::Getattr)
@@ -1097,7 +1483,11 @@ mod tests {
 
         let backend = MemoryBackend::default();
         backend.add_file("/hello.txt", b"hi");
-        let t = Translator::new(Arc::new(backend)).with_decider(Arc::new(DenyGetattr));
+        let t = Translator::new(Arc::new(backend), test_decider()).with_reference_monitor(monitor(
+            permit_session(Level::Secret, ALL_OPS),
+            Some(label(Level::Public)),
+            Arc::new(DenyGetattr),
+        ));
 
         t.handle_message(&msg::tattach(1, 0, u32::MAX, "user", "/")).await.unwrap();
         let (_, resp) = t.handle_message(&msg::twalk(2, 0, 1, &["hello.txt"])).await.unwrap();
@@ -1111,81 +1501,92 @@ mod tests {
     }
 
     /// #767 review: a zero-element walk (nwname=0) is a fid *clone*; the new
-    /// fid must inherit the source fid's cached context rather than being left
-    /// untracked (which floored to anonymous under a real decider and wrongly
-    /// denied an already-authenticated client).
+    /// fid must inherit the source fid's cached session rather than being left
+    /// untracked (which would fail closed under a live monitor and wrongly
+    /// deny an already-authenticated client).
     #[tokio::test]
     async fn walk_clone_inherits_source_context() {
-        use async_trait::async_trait;
-        use hyprstream_rpc::auth::mac::{
-            Assurance, CompartmentSet, Level, SecurityLabel, VerifiedKeyMaterial,
-        };
+        let t = Translator::new(Arc::new(MemoryBackend::default()), test_decider()).with_reference_monitor(
+            monitor(
+                permit_session(Level::Secret, ALL_OPS),
+                Some(label(Level::Public)),
+                Arc::new(AllowAll),
+            ),
+        );
 
-        struct ElevatedAuth;
-        #[async_trait]
-        impl AttachAuthenticator for ElevatedAuth {
-            async fn authenticate(&self, _u: &str, _a: &str) -> SecurityContext {
-                SecurityContext::from_clearance(
-                    SecurityLabel::new(Level::Secret, Assurance::Unverified, CompartmentSet::EMPTY),
-                    VerifiedKeyMaterial::Unverified,
-                )
-            }
-        }
-
-        let t = Translator::new(Arc::new(MemoryBackend::default()))
-            .with_authenticator(Arc::new(ElevatedAuth));
-
-        // Attach root fid 0 with the elevated (non-anonymous) context.
+        // Attach root fid 0 with the elevated (non-anonymous) session.
         t.handle_message(&msg::tattach(1, 0, u32::MAX, "user", "/")).await.unwrap();
         // Clone fid 0 -> fid 1 via a zero-element walk.
         let (_, resp) = t.handle_message(&msg::twalk(2, 0, 1, &[])).await.unwrap();
         assert!(matches!(resp, Response::Walk { .. }), "clone walk must succeed");
 
-        // The clone must carry the source's elevated context, not the anon floor.
-        let ctx = t
+        // The clone must carry the source's elevated session, not floor out.
+        let session = t
             .fids
-            .security_context(1)
+            .session(1)
             .expect("cloned fid must be tracked in the fid table");
-        assert_ne!(
-            ctx.level(),
-            Level::Public,
-            "cloned fid must inherit the source's elevated context, not floor to anonymous",
+        assert_eq!(
+            session.security_context().level(),
+            Level::Secret,
+            "cloned fid must inherit the source's elevated session",
         );
     }
 
     #[tokio::test]
-    async fn connection_scoped_translators_do_not_share_fid_context() {
-        use async_trait::async_trait;
-        use hyprstream_rpc::auth::mac::{
-            Assurance, CompartmentSet, Level, SecurityLabel, VerifiedKeyMaterial,
-        };
-
-        struct SecretAuth;
-        #[async_trait]
-        impl AttachAuthenticator for SecretAuth {
-            async fn authenticate(&self, _u: &str, _a: &str) -> SecurityContext {
-                SecurityContext::from_clearance(
-                    SecurityLabel::new(Level::Secret, Assurance::Unverified, CompartmentSet::EMPTY),
-                    VerifiedKeyMaterial::Unverified,
-                )
+    async fn review_empty_walk_clone_must_not_rebind_memory_fid_to_root() {
+        struct ByPath;
+        impl ObjectLabelResolver for ByPath {
+            fn resolve(&self, object: ObjectRef<'_>) -> Option<SecurityLabel> {
+                match object {
+                    ObjectRef::Path([]) => Some(label(Level::Secret)),
+                    ObjectRef::Path(["public.txt"]) => Some(label(Level::Public)),
+                    ObjectRef::Path(_) | ObjectRef::Cid(_) => None,
+                }
             }
         }
-
-        struct DenyAnonymous;
-        impl AccessDecider for DenyAnonymous {
+        struct DenySecretReads;
+        impl AccessDecider for DenySecretReads {
             fn check(
                 &self,
-                ctx: &SecurityContext,
-                _object_label: Option<&hyprstream_rpc::auth::mac::SecurityLabel>,
-                _action: Action,
+                _ctx: &SecurityContext,
+                object: ObjectRef<'_>,
+                action: Action,
             ) -> bool {
-                ctx.level() != Level::Public
+                !(action == Action::Read && matches!(object, ObjectRef::Path([])))
             }
         }
 
-        let root = Translator::new(Arc::new(MemoryBackend::default()))
-            .with_authenticator(Arc::new(SecretAuth))
-            .with_decider(Arc::new(DenyAnonymous));
+        let backend = MemoryBackend::default();
+        backend.add_file("/public.txt", b"public");
+        let t = Translator::new(Arc::new(backend), test_decider()).with_reference_monitor(Arc::new(
+            ReferenceMonitor::new(
+                Arc::new(StaticAuth(permit_session(Level::Secret, ALL_OPS))),
+                Arc::new(ByPath),
+                Arc::new(DenySecretReads),
+            ),
+        ));
+
+        t.handle_message(&msg::tattach(1, 0, u32::MAX, "ticket", "/")).await.unwrap();
+        t.handle_message(&msg::twalk(2, 0, 1, &["public.txt"])).await.unwrap();
+        t.handle_message(&msg::twalk(3, 1, 2, &[])).await.unwrap();
+        let (_, read) = t.handle_message(&msg::tread(4, 2, 0, 4096)).await.unwrap();
+        match read {
+            Response::Read { data } => assert_eq!(&data, b"public"),
+            other => panic!(
+                "clone must still point at public.txt; MemoryBackend rebound it to the Secret root: {other:?}"
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn connection_scoped_translators_do_not_share_fid_context() {
+        let root = Translator::new(Arc::new(MemoryBackend::default()), test_decider()).with_reference_monitor(
+            monitor(
+                permit_session(Level::Secret, ALL_OPS),
+                Some(label(Level::Public)),
+                Arc::new(AllowAll),
+            ),
+        );
         let conn_a = Arc::new(root.connection_scoped());
         let conn_b = Arc::new(root.connection_scoped());
 
@@ -1194,6 +1595,8 @@ mod tests {
             .await
             .unwrap();
 
+        // conn_b never attached: fid 1 is unknown to its table, and a fid
+        // outside a verified session fails closed under a live monitor.
         let (_, resp) = conn_b.handle_message(&msg::twalk(2, 1, 2, &[])).await.unwrap();
         match resp {
             Response::Error { ecode } => assert_eq!(ecode, libc_eperm()),
@@ -1203,29 +1606,28 @@ mod tests {
 
     #[tokio::test]
     async fn translator_rejects_conflicting_attach_security_context() {
-        use async_trait::async_trait;
-        use hyprstream_rpc::auth::mac::{
-            Assurance, CompartmentSet, Level, SecurityLabel, VerifiedKeyMaterial,
-        };
-
         struct TicketAuth;
         #[async_trait]
         impl AttachAuthenticator for TicketAuth {
-            async fn authenticate(&self, uname: &str, _aname: &str) -> SecurityContext {
-                let level = if uname == "alice-ticket" {
-                    Level::Secret
+            async fn authenticate(&self, uname: &str, _aname: &str) -> SessionContext {
+                let identity = if uname == "alice-ticket" {
+                    "verified-alice"
                 } else {
-                    Level::Public
+                    "verified-bob"
                 };
-                SecurityContext::from_clearance(
-                    SecurityLabel::new(level, Assurance::Unverified, CompartmentSet::EMPTY),
-                    VerifiedKeyMaterial::Unverified,
-                )
+                // Both principals have identical authorization attributes;
+                // only the verifier-produced identity differs.
+                permit_session_as(identity, Level::Secret, ALL_OPS)
             }
         }
 
-        let t = Translator::new(Arc::new(MemoryBackend::default()))
-            .with_authenticator(Arc::new(TicketAuth));
+        let t = Translator::new(Arc::new(MemoryBackend::default()), test_decider()).with_reference_monitor(
+            Arc::new(ReferenceMonitor::new(
+                Arc::new(TicketAuth),
+                Arc::new(StaticLabels(Some(label(Level::Public)))),
+                Arc::new(AllowAll),
+            )),
+        );
         let (_, resp) = t
             .handle_message(&msg::tattach(1, 1, u32::MAX, "alice-ticket", "/"))
             .await
@@ -1239,14 +1641,248 @@ mod tests {
         assert_eq!(
             errno_from_error(&err),
             EACCES,
-            "conflicting attach context must be EACCES",
+            "conflicting attach session must be EACCES",
+        );
+    }
+
+    /// F2: a real `AttachAuthenticator` re-stamps `Instant::now() + ttl` on
+    /// every verification of the *same* ticket. Re-attaching that identical,
+    /// still-valid ticket on a second fid of the same connection must be
+    /// accepted — not rejected as a "conflicting" session. Equality for re-attach
+    /// detection is over identity (subject + token scope), never the timestamp.
+    #[tokio::test]
+    async fn same_valid_ticket_reattach_is_accepted() {
+        struct FreshDeadlineAuth;
+        #[async_trait]
+        impl AttachAuthenticator for FreshDeadlineAuth {
+            async fn authenticate(&self, _uname: &str, _aname: &str) -> SessionContext {
+                // `permit_session` stamps `Instant::now()` into the token, so
+                // each call yields a distinct deadline — exactly what a real
+                // verifier does when re-checking the same ticket.
+                permit_session(Level::Secret, ALL_OPS)
+            }
+        }
+
+        let t = Translator::new(Arc::new(MemoryBackend::default()), test_decider()).with_reference_monitor(
+            Arc::new(ReferenceMonitor::new(
+                Arc::new(FreshDeadlineAuth),
+                Arc::new(StaticLabels(Some(label(Level::Public)))),
+                Arc::new(AllowAll),
+            )),
+        );
+
+        let (_, resp) = t
+            .handle_message(&msg::tattach(1, 1, u32::MAX, "alice-ticket", "/"))
+            .await
+            .unwrap();
+        assert!(matches!(resp, Response::Attach { .. }), "first attach: {resp:?}");
+
+        // Same ticket, freshly-stamped deadline, new fid on the same connection.
+        let (_, resp) = t
+            .handle_message(&msg::tattach(2, 2, u32::MAX, "alice-ticket", "/"))
+            .await
+            .unwrap();
+        assert!(
+            matches!(resp, Response::Attach { .. }),
+            "same valid ticket re-attach must be accepted, got {resp:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn denied_monitored_attach_does_not_poison_valid_retry() {
+        struct TicketAuth;
+        #[async_trait]
+        impl AttachAuthenticator for TicketAuth {
+            async fn authenticate(&self, uname: &str, _aname: &str) -> SessionContext {
+                if uname == "valid-ticket" {
+                    permit_session_as("verified-alice", Level::Secret, ALL_OPS)
+                } else {
+                    SessionContext::deny()
+                }
+            }
+        }
+        let t = Translator::new(Arc::new(MemoryBackend::default()), test_decider()).with_reference_monitor(
+            Arc::new(ReferenceMonitor::new(
+                Arc::new(TicketAuth),
+                Arc::new(StaticLabels(Some(label(Level::Public)))),
+                Arc::new(AllowAll),
+            )),
+        );
+        let (_, denied) = t
+            .handle_message(&msg::tattach(1, 1, u32::MAX, "forged-ticket", "/"))
+            .await
+            .unwrap();
+        assert!(matches!(denied, Response::Error { ecode } if ecode == libc_eperm()));
+        let (_, accepted) = t
+            .handle_message(&msg::tattach(2, 2, u32::MAX, "valid-ticket", "/"))
+            .await
+            .unwrap();
+        assert!(matches!(accepted, Response::Attach { .. }), "valid retry: {accepted:?}");
+    }
+
+    #[tokio::test]
+    async fn mount_backend_multiname_walk_mediates_the_bound_leaf() {
+        use hyprstream_vfs::{SyntheticMount, SyntheticNode};
+
+        struct ByPath;
+        impl ObjectLabelResolver for ByPath {
+            fn resolve(&self, object: ObjectRef<'_>) -> Option<SecurityLabel> {
+                match object {
+                    ObjectRef::Path([] | ["a"]) => Some(label(Level::Public)),
+                    ObjectRef::Path(["a", "b"]) => Some(label(Level::Secret)),
+                    ObjectRef::Path(_) | ObjectRef::Cid(_) => None,
+                }
+            }
+        }
+        struct DenySecretReads;
+        impl AccessDecider for DenySecretReads {
+            fn check(&self, _ctx: &SecurityContext, object: ObjectRef<'_>, action: Action) -> bool {
+                !(action == Action::Read && matches!(object, ObjectRef::Path(["a", "b"])))
+            }
+        }
+        let root = SyntheticNode::dir().with_child(
+            "a",
+            SyntheticNode::dir().with_child("b", SyntheticNode::file(b"secret-at-a-b".to_vec())),
+        );
+        let backend = MountBackend::new(
+            Arc::new(SyntheticMount::new(root)),
+            hyprstream_rpc::Subject::new("tenant"),
+        );
+        let t = Translator::new(Arc::new(backend), test_decider()).with_reference_monitor(Arc::new(
+            ReferenceMonitor::new(
+                Arc::new(StaticAuth(permit_session(Level::Secret, ALL_OPS))),
+                Arc::new(ByPath),
+                Arc::new(DenySecretReads),
+            ),
+        ));
+        t.handle_message(&msg::tattach(1, 0, u32::MAX, "ticket", "/")).await.unwrap();
+        let (_, walk) = t.handle_message(&msg::twalk(2, 0, 1, &["a", "b"])).await.unwrap();
+        match walk {
+            Response::Walk { qids } => assert_eq!(qids.len(), 2, "one QID per bound component"),
+            other => panic!("expected successful two-name walk, got {other:?}"),
+        }
+        assert_eq!(t.fids.path(1), Some(vec!["a".into(), "b".into()]));
+        let (_, read) = t.handle_message(&msg::tread(3, 1, 0, 64)).await.unwrap();
+        assert!(matches!(read, Response::Error { ecode } if ecode == libc_eperm()));
+    }
+
+    /// F1 (defect 1 — intermediate-hop mediation): content-truth labels need
+    /// not be monotone with depth. Here the `secret` directory hop is
+    /// Secret-labeled while its `public` leaf is Public. The walk must mediate
+    /// *every* hop, so a Public subject traversing through the Secret directory
+    /// is refused at the first hop — not cleared against only the (Public)
+    /// final destination.
+    #[tokio::test]
+    async fn walk_mediates_every_hop_not_just_destination() {
+        struct ByDepth;
+        impl ObjectLabelResolver for ByDepth {
+            fn resolve(&self, object: ObjectRef<'_>) -> Option<SecurityLabel> {
+                match object {
+                    // The single directory hop is Secret; anything deeper is Public
+                    // (a non-monotone lattice — the leaf is *less* classified than
+                    // the directory that contains it).
+                    ObjectRef::Path([]) => Some(label(Level::Public)),
+                    ObjectRef::Path([_]) => Some(label(Level::Secret)),
+                    ObjectRef::Path([_, ..]) => Some(label(Level::Public)),
+                    ObjectRef::Cid(_) => None,
+                }
+            }
+        }
+        let backend = MemoryBackend::default();
+        backend.add_file("/secret", b"classified");
+        let t = Translator::new(Arc::new(backend), test_decider()).with_reference_monitor(Arc::new(
+            ReferenceMonitor::new(
+                Arc::new(StaticAuth(permit_session(Level::Public, ALL_OPS))),
+                Arc::new(ByDepth),
+                Arc::new(AllowAll),
+            ),
+        ));
+
+        t.handle_message(&msg::tattach(1, 0, u32::MAX, "user", "/")).await.unwrap();
+        // Walk through the Secret directory toward the Public leaf. The Public
+        // subject cannot clear the Secret hop, so the walk must deny — even
+        // though the *destination* label is Public.
+        let (_, resp) = t
+            .handle_message(&msg::twalk(2, 0, 1, &["secret", "public"]))
+            .await
+            .unwrap();
+        match resp {
+            Response::Error { ecode } => assert_eq!(ecode, libc_eperm()),
+            other => panic!("expected EPERM at the Secret intermediate hop, got {other:?}"),
+        }
+    }
+
+    /// F1 (defect 2 — partial-walk path poisoning): 9P permits `nwqid < nwname`.
+    /// The fid must be tagged with the path the backend *reached* (the
+    /// returned-qid prefix), never the full requested suffix — otherwise later
+    /// ops resolve the label of a name the backend never opened (a name↔object
+    /// TOCTOU). `PartialWalkBackend` reaches only the first component no matter
+    /// how many are requested.
+    #[tokio::test]
+    async fn partial_walk_caches_reached_path_not_requested_suffix() {
+        use crate::backend::{Backend, OpenResult, StatResult, WalkResult};
+        struct PartialWalkBackend;
+        #[async_trait]
+        impl Backend for PartialWalkBackend {
+            async fn attach(&self, _uname: &str) -> anyhow::Result<()> {
+                Ok(())
+            }
+            async fn walk(
+                &self,
+                _fid: u32,
+                _newfid: u32,
+                _components: &[String],
+            ) -> anyhow::Result<WalkResult> {
+                // Reaches exactly one component, regardless of how many walked.
+                Ok(WalkResult { qids: vec![sample_qid(0, 1)], reached: vec!["a".to_owned()] })
+            }
+            async fn open(&self, _fid: u32, _flags: u32) -> anyhow::Result<OpenResult> {
+                unimplemented!("not reached")
+            }
+            async fn read(&self, _fid: u32, _offset: u64, _count: u32) -> anyhow::Result<Vec<u8>> {
+                unimplemented!("not reached")
+            }
+            async fn write(
+                &self,
+                _fid: u32,
+                _offset: u64,
+                _data: &[u8],
+            ) -> anyhow::Result<u32> {
+                unimplemented!("not reached")
+            }
+            async fn stat(&self, _fid: u32) -> anyhow::Result<StatResult> {
+                unimplemented!("not reached")
+            }
+            async fn readdir(
+                &self,
+                _fid: u32,
+                _offset: u64,
+                _count: u32,
+            ) -> anyhow::Result<Vec<u8>> {
+                unimplemented!("not reached")
+            }
+            async fn clunk(&self, _fid: u32) -> anyhow::Result<()> {
+                Ok(())
+            }
+        }
+
+        // No monitor: this isolates the path-caching fix from mediation.
+        let t = Translator::new(Arc::new(PartialWalkBackend), test_decider());
+        t.handle_message(&msg::tattach(1, 0, u32::MAX, "user", "/")).await.unwrap();
+        t.handle_message(&msg::twalk(2, 0, 1, &["a", "b"])).await.unwrap();
+
+        let cached = t.fids.path(1).expect("newfid must be tracked");
+        assert_eq!(
+            cached,
+            vec!["a".to_string()],
+            "cached path must be the reached prefix, not the unreached suffix",
         );
     }
 
     #[tokio::test]
     async fn fid_table_tracks_open_and_clunk() {
         let table = FidTable::default();
-        table.insert(7, 0x80, anonymous_floor());
+        table.insert(7, 0x80, None, Vec::new());
         assert_eq!(table.qtype(7), Some(0x80));
         table.set_opened(7);
         table.remove(7);
@@ -1268,7 +1904,7 @@ mod tests {
         let backend = MemoryBackend::default();
         backend.add_file("/one.txt", b"111");
         backend.add_file("/two.txt", b"22");
-        let t = Arc::new(Translator::new(Arc::new(backend)));
+        let t = Arc::new(Translator::new(Arc::new(backend), test_decider()));
 
         // Attach fid 0 as the (directory) root, then open + readdir it.
         t.handle_message(&msg::tattach(1, 0, u32::MAX, "u", "/")).await.unwrap();
@@ -1314,7 +1950,7 @@ mod tests {
         let backend = MemoryBackend::default();
         backend.add_file("/hello.txt", b"hello vsock");
         let listener = UnixListener::bind(&sock).expect("bind hybrid-vsock host UDS");
-        let translator = Translator::new(Arc::new(backend));
+        let translator = Translator::new(Arc::new(backend), test_decider());
         let server = tokio::spawn(translator.serve_vsock(listener));
 
         // ── Client side ─────────────────────────────────────────────────
@@ -1398,7 +2034,7 @@ mod tests {
         let backend = MemoryBackend::default();
         backend.add_file("/hello.txt", b"hello raw");
         let listener = UnixListener::bind(&sock).expect("bind raw vsock per-port host UDS");
-        let translator = Translator::new(Arc::new(backend));
+        let translator = Translator::new(Arc::new(backend), test_decider());
         let server = tokio::spawn(translator.serve_vsock_raw(listener));
 
         // ── Client (guest) side ─────────────────────────────────────────
@@ -1464,7 +2100,7 @@ mod tests {
         let _ = std::fs::remove_file(&sock);
 
         let listener = UnixListener::bind(&sock).unwrap();
-        let translator = Translator::new(Arc::new(MemoryBackend::default()));
+        let translator = Translator::new(Arc::new(MemoryBackend::default()), test_decider());
         let server = tokio::spawn(translator.serve_vsock(listener));
 
         // First client sends garbage; server should drop it and keep listening.
@@ -1522,7 +2158,11 @@ mod tests {
         let root = SyntheticNode::dir()
             .with_child("hello.txt", SyntheticNode::file(b"hi alice".to_vec()));
         let mount: Arc<dyn hyprstream_vfs::Mount> = Arc::new(SyntheticMount::new(root));
-        Arc::new(Translator::from_mount_authorized(mount, Arc::new(FakeTicketAuth)))
+        Arc::new(Translator::from_mount_authorized(
+            mount,
+            Arc::new(FakeTicketAuth),
+            test_decider(),
+        ))
     }
 
     /// A valid ticket in `Tattach.uname` binds the session Subject and the

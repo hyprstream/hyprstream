@@ -175,6 +175,20 @@ impl<S: RequestService + Send + Sync + 'static> Spawnable for UnifiedServiceConf
                     // `with_authz` is already honoured.
                     let _moq_authz_default =
                         hyprstream_rpc::transport::iroh_moq::MoqAuthzConfig::default();
+
+                    // #1153: the `/moq` CONNECT authenticator is resolved
+                    // per-CONNECT inside `QuinnRpcServer` (builder override OR
+                    // `global_moq_connect_authz()`), NOT snapshotted here at
+                    // construction — so registration order is not load-bearing.
+                    // The `hyprstream` crate registers an authenticator over its
+                    // authoritative subject→tenant provisioning map
+                    // (PolicyManager) via `set_global_moq_connect_authz` at
+                    // startup; until that wiring lands a served `/moq` plane
+                    // logs a one-time fail-open warning (the #1145 shape must be
+                    // detectable, not silent). See follow-up #1198 (client
+                    // credential threading) — flipping the boundary on before
+                    // clients can present a credential would outage every
+                    // legitimate Quinn subscriber/relay publisher.
                 }
 
                 // Register this endpoint for RPC resolution and, once, as the

@@ -519,7 +519,21 @@ mod tests {
     use crate::config::{ImageConfig, PoolConfig};
     use crate::image::RafsStore;
     use crate::runtime::kata_backend::KataBackend;
+    use hyprstream_rpc::auth::mac::{ObjectRef, SecurityContext};
     use tempfile::TempDir;
+
+    struct FixtureAccessDecider;
+
+    impl hyprstream_9p::AccessDecider for FixtureAccessDecider {
+        fn check(
+            &self,
+            _ctx: &SecurityContext,
+            _object: ObjectRef<'_>,
+            _action: hyprstream_9p::Action,
+        ) -> bool {
+            true
+        }
+    }
 
     /// Create a test pool with Kata backend and minimal configuration
     async fn create_test_pool(
@@ -553,8 +567,11 @@ mod tests {
         std::fs::create_dir_all(&pool_config.runtime_dir)?;
 
         let rafs_store = Arc::new(RafsStore::new(image_config.clone())?);
-        let backend: Arc<dyn SandboxBackend> =
-            Arc::new(KataBackend::new(image_config, rafs_store));
+        let backend: Arc<dyn SandboxBackend> = Arc::new(KataBackend::new(
+            image_config,
+            rafs_store,
+            Arc::new(FixtureAccessDecider),
+        ));
         let pool = Arc::new(SandboxPool::new(pool_config, backend));
 
         Ok((pool, temp_dir))

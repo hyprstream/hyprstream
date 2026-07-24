@@ -42,7 +42,7 @@ These fields apply to both provider kinds:
 | `"namespaced"` | `provider-slug:external-sub` (e.g. `github:12345678`). Default. |
 | `"email"` | Email address from external claims (requires `email_verified = true`) |
 | `{ claim = { name = "..." } }` | The value of a specific claim (e.g. `preferred_username`) |
-| `"didweb"` | `did:web:{issuer_authority}:users:{external_sub}` (e.g. `did:web:hyprstream.example.com:users:12345`) — the subject-identity format for did:web deployments. Opt-in: existing Casbin policies written against namespaced subjects must be migrated first. |
+| `"didweb"` | **Disabled.** Configuration and login both fail closed because the former path-form account DID was outside the atproto profile (#1159). A node with this setting refuses to start until it is changed; existing path-form profiles remain unusable under a replacement strategy until E4 (#1176) migrates them. Host-form account minting is tracked separately in #1163. |
 
 `"namespaced"` is the default and recommended for most deployments — it is stable,
 collision-free, and works for providers (like GitHub) whose `sub` is a numeric ID.
@@ -237,12 +237,17 @@ endpoint), use `oauth.trusted_issuers` instead of `oidc_providers`:
 ```toml
 [oauth.trusted_issuers."https://keycloak.example.com/realms/my-realm"]
 jwks_uri = "https://keycloak.example.com/realms/my-realm/protocol/openid-connect/certs"
+# Required only when accepting this issuer's ID tokens via RFC 8693.
+oidc_client_id = "hyprstream-cross-app"
 jwks_cache_ttl_secs = 300
 ```
 
 `trusted_issuers` is a TOML table keyed by the exact issuer URL (matching the token's
 `iss` claim). Per-issuer fields: `jwks_uri` (optional — auto-discovered when omitted),
-`jwks_cache_ttl_secs` (default 300), and `allow_http` (dev only). This allows Bearer
-authentication with externally issued JWTs, plus RFC 8693 token exchange and RFC 7523
-JWT bearer grants, without requiring a browser login flow. See the
+`oidc_client_id` (required for ID-token exchange), `jwks_cache_ttl_secs` (default
+300), and `allow_http` (dev only). ID-token exchange requires the configured client
+ID in `aud` and, for multi-audience tokens, in `azp`; omitting `oidc_client_id`
+disables ID-token exchange for that issuer. This allows Bearer authentication with
+externally issued JWTs, plus RFC 8693 token exchange and RFC 7523 JWT bearer grants,
+without requiring a browser login flow. See the
 [Keycloak guide](keycloak.md) for a worked example.

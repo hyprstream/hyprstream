@@ -470,11 +470,12 @@ impl Claims {
     pub fn verify_token(
         &self,
         verifying_key: &ed25519_dalek::VerifyingKey,
-        expected_aud: Option<&str>,
+        expected_aud: super::jwt::AudienceExpectation<'_>,
     ) -> std::result::Result<Option<Claims>, super::jwt::JwtError> {
         match &self.token {
             Some(token) => {
-                let verified = super::jwt::decode(token, verifying_key, expected_aud)?;
+                let verified =
+                    super::jwt::decode_with_expectation(token, verifying_key, expected_aud)?;
                 Ok(Some(verified))
             }
             None => Ok(None),
@@ -816,7 +817,14 @@ mod tests {
             .with_issuer("https://a.example.com".to_owned());
 
         let token = jwt::encode(&claims, &signing_key);
-        let decoded = jwt::decode(&token, &verifying_key, None).expect("decode failed");
+        let decoded = jwt::decode_with_expectation(
+            &token,
+            &verifying_key,
+            jwt::AudienceExpectation::ExplicitlyUnchecked {
+                reason: "the claim round-trip test does not exercise audience validation",
+            },
+        )
+        .expect("decode failed");
 
         assert_eq!(decoded.iss, "https://a.example.com");
         assert_eq!(decoded.sub, "alice");

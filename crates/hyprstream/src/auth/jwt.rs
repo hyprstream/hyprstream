@@ -3,7 +3,10 @@
 //! Re-exports EdDSA signing from hyprstream-rpc and adds ES256 (P-256) signing.
 
 pub use hyprstream_rpc::auth::{
-    decode, decode_with_key, encode, encode_service_jwt, Claims, JwtError,
+    decode, decode_id_token_unverified, decode_id_token_with_key, decode_with_any_key,
+    decode_with_any_key_lenient, decode_with_expectation, decode_with_federation_candidates,
+    decode_with_key, decode_with_key_expectation, encode, encode_service_jwt,
+    AudienceExpectation, Claims, JwtError,
 };
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
@@ -306,7 +309,14 @@ mod tests {
         assert_eq!(header["typ"], "at+jwt");
         assert!(header["kid"].as_str().unwrap().len() == 43);
 
-        let decoded = hyprstream_rpc::auth::jwt::decode_ml_dsa_65(&token, &vk, None).unwrap();
+        let decoded = hyprstream_rpc::auth::jwt::decode_ml_dsa_65(
+            &token,
+            &vk,
+            AudienceExpectation::ExplicitlyUnchecked {
+                reason: "the round-trip test exercises ML-DSA signing, not audience",
+            },
+        )
+        .unwrap();
         assert_eq!(decoded.sub, "alice");
         assert!(decoded.jti.is_some());
     }
@@ -341,8 +351,15 @@ mod tests {
 
         let dispatch = hyprstream_rpc::auth::parse_composite_dispatch(&token, &["at+jwt"]).unwrap();
         let decoded = hyprstream_rpc::auth::jwt::decode_composite(
-            &token, &ml_dsa_vk, &ed25519_vk, None, &dispatch,
-        ).unwrap();
+            &token,
+            &ml_dsa_vk,
+            &ed25519_vk,
+            AudienceExpectation::ExplicitlyUnchecked {
+                reason: "the round-trip test exercises composite signing, not audience",
+            },
+            &dispatch,
+        )
+        .unwrap();
         assert_eq!(decoded.sub, "bob");
         assert!(decoded.jti.is_some());
     }
@@ -368,7 +385,14 @@ mod tests {
         let (_, wrong_vk) = hyprstream_rpc::crypto::pq::ml_dsa_generate_keypair();
         let claims = Claims::new("alice".to_owned(), 0, 9_999_999_999);
         let token = encode_ml_dsa_65(&claims, &sk);
-        assert!(hyprstream_rpc::auth::jwt::decode_ml_dsa_65(&token, &wrong_vk, None).is_err());
+        assert!(hyprstream_rpc::auth::jwt::decode_ml_dsa_65(
+            &token,
+            &wrong_vk,
+            AudienceExpectation::ExplicitlyUnchecked {
+                reason: "the test exercises wrong-key rejection, not audience",
+            },
+        )
+        .is_err());
     }
 
     #[test]
@@ -381,8 +405,15 @@ mod tests {
         let token = encode_composite_ml_dsa_65_ed25519(&claims, &ml_dsa_sk, &ed25519_sk);
         let dispatch = hyprstream_rpc::auth::parse_composite_dispatch(&token, &["at+jwt"]).unwrap();
         assert!(hyprstream_rpc::auth::jwt::decode_composite(
-            &token, &ml_dsa_vk, &wrong_ed25519_vk, None, &dispatch,
-        ).is_err());
+            &token,
+            &ml_dsa_vk,
+            &wrong_ed25519_vk,
+            AudienceExpectation::ExplicitlyUnchecked {
+                reason: "the test exercises wrong-key rejection, not audience",
+            },
+            &dispatch,
+        )
+        .is_err());
     }
 
     #[test]
@@ -390,7 +421,14 @@ mod tests {
         let (sk, vk) = hyprstream_rpc::crypto::pq::ml_dsa_generate_keypair();
         let claims = Claims::new("alice".to_owned(), 0, 1);
         let token = encode_ml_dsa_65(&claims, &sk);
-        let err = hyprstream_rpc::auth::jwt::decode_ml_dsa_65(&token, &vk, None).unwrap_err();
+        let err = hyprstream_rpc::auth::jwt::decode_ml_dsa_65(
+            &token,
+            &vk,
+            AudienceExpectation::ExplicitlyUnchecked {
+                reason: "the test exercises expiry rejection, not audience",
+            },
+        )
+        .unwrap_err();
         assert!(matches!(err, hyprstream_rpc::auth::JwtError::Expired));
     }
 
@@ -403,8 +441,15 @@ mod tests {
         let token = encode_composite_ml_dsa_65_ed25519(&claims, &ml_dsa_sk, &ed25519_sk);
         let dispatch = hyprstream_rpc::auth::parse_composite_dispatch(&token, &["at+jwt"]).unwrap();
         let err = hyprstream_rpc::auth::jwt::decode_composite(
-            &token, &ml_dsa_vk, &ed25519_vk, None, &dispatch,
-        ).unwrap_err();
+            &token,
+            &ml_dsa_vk,
+            &ed25519_vk,
+            AudienceExpectation::ExplicitlyUnchecked {
+                reason: "the test exercises expiry rejection, not audience",
+            },
+            &dispatch,
+        )
+        .unwrap_err();
         assert!(matches!(err, hyprstream_rpc::auth::JwtError::Expired));
     }
 
@@ -414,18 +459,39 @@ mod tests {
         let claims = Claims::new("alice".to_owned(), 0, 9_999_999_999);
         let token = hyprstream_rpc::auth::encode(&claims, &ed25519_sk);
         let (_, vk) = hyprstream_rpc::crypto::pq::ml_dsa_generate_keypair();
-        assert!(hyprstream_rpc::auth::jwt::decode_ml_dsa_65(&token, &vk, None).is_err());
+        assert!(hyprstream_rpc::auth::jwt::decode_ml_dsa_65(
+            &token,
+            &vk,
+            AudienceExpectation::ExplicitlyUnchecked {
+                reason: "the test exercises algorithm rejection, not audience",
+            },
+        )
+        .is_err());
     }
 
     #[test]
-    fn ml_dsa_65_lenient_audience() {
+    fn ml_dsa_65_exact_audience_rejects_absent_claim() {
         let (sk, vk) = hyprstream_rpc::crypto::pq::ml_dsa_generate_keypair();
         let claims = Claims::new("alice".to_owned(), 0, 9_999_999_999);
-        // Token without aud should be accepted even when expected_aud is set
         let token = encode_ml_dsa_65(&claims, &sk);
-        assert!(hyprstream_rpc::auth::jwt::decode_ml_dsa_65(
-            &token, &vk, Some("https://example.com"),
-        ).is_ok());
+        assert!(matches!(
+            hyprstream_rpc::auth::jwt::decode_ml_dsa_65(
+                &token,
+                &vk,
+                AudienceExpectation::Exact("https://example.com"),
+            ),
+            Err(hyprstream_rpc::auth::JwtError::InvalidAudience)
+        ));
+
+        hyprstream_rpc::auth::jwt::decode_ml_dsa_65(
+            &token,
+            &vk,
+            AudienceExpectation::ExactOrMissing {
+                expected: "https://example.com",
+                reason: "federated ML-DSA compatibility test",
+            },
+        )
+        .expect("named compatibility posture permits an absent audience");
     }
 
     #[test]
@@ -435,8 +501,14 @@ mod tests {
         claims.aud = Some("https://wrong.example.com".to_owned());
         let token = encode_ml_dsa_65(&claims, &sk);
         let err = hyprstream_rpc::auth::jwt::decode_ml_dsa_65(
-            &token, &vk, Some("https://example.com"),
-        ).unwrap_err();
-        assert!(matches!(err, hyprstream_rpc::auth::JwtError::InvalidAudience));
+            &token,
+            &vk,
+            AudienceExpectation::Exact("https://example.com"),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            hyprstream_rpc::auth::JwtError::InvalidAudience
+        ));
     }
 }

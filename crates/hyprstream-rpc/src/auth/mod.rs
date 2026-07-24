@@ -18,13 +18,13 @@ pub mod composite;
 pub mod federation;
 pub mod jti_blocklist;
 pub mod jwt;
-/// Native MAC: security labels, lattice, subject contexts, genesis labeling
-/// (S1, #567). Platform-independent (no std-only deps) so it compiles for wasm.
-pub mod mac;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod key_source;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod key_subject_resolver;
+/// Native MAC: security labels, lattice, subject contexts, genesis labeling
+/// (S1, #567). Platform-independent (no std-only deps) so it compiles for wasm.
+pub mod mac;
 pub mod scope;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod scope_registry;
@@ -38,35 +38,44 @@ pub use atproto_perimeter::{AtprotoPerimeterGateway, EnrolledPeer, EnrollmentSto
 // The identity-resolution contract (#579) lives canonically in `crate::identity`;
 // re-exported here so existing `crate::auth::{IdentityResolver, ...}` paths keep working.
 pub use crate::identity::{Ed25519Vk, IdentityKeys, IdentityResolver, MlDsaVk};
-pub use claims::{ActClaim, Claims, Cnf, CnfJwk, IdTokenClaims, OneOrMany, compute_jkt, is_local_iss};
+pub use claims::{
+    ActClaim, Claims, Cnf, CnfJwk, IdTokenClaims, OneOrMany, compute_jkt, is_local_iss,
+};
 #[cfg(not(target_arch = "wasm32"))]
 pub use composite::{
-    global_composite_key_set, CompositeKeyPair, CompositeKeySet, CompositeKeySetSnapshot,
-    CompositePairRole, CompositePairState,
+    CompositeKeyPair, CompositeKeySet, CompositeKeySetSnapshot, CompositePairRole,
+    CompositePairState, global_composite_key_set,
 };
+#[cfg(not(target_arch = "wasm32"))]
+pub use federation::{FederationKey, FederationKeySource};
 pub use jti_blocklist::{InMemoryJtiBlocklist, JtiBlocklist};
-pub use mac::{
-    bind_time_label, import_label, Assurance, Compartment, CompartmentSet, ContentBoundLabel,
-    GenesisMap, GenesisReport, LabelError, LabeledObject, Lattice, LatticeCodecError,
-    LatticeDecodeError, LatticeVersion, Level, ObjectLabelResolver, ObjectRef, SecurityContext,
-    SecurityLabel, StaticNodeLabel, SubjectContextClaims, VerifiedKeyMaterial, MAX_COMPARTMENTS,
-};
-#[cfg(not(target_arch = "wasm32"))]
-pub use federation::FederationKeySource;
 pub use jwt::{
-    composite_kid, decode, decode_unverified, decode_with_key, encode, encode_service_jwt,
-    header_alg, header_kid, is_rfc9068_access_token_type, jwk_thumbprint,
-    parse_composite_dispatch, parse_protected_header, CompositeJwtDispatch, JwkThumbprintInput,
-    JwtError, ProtectedHeader, RFC9068_ACCESS_TOKEN_TYPES,
+    AudienceExpectation, CompositeJwtDispatch, JwkThumbprintInput, JwtError, ProtectedHeader,
+    RFC9068_ACCESS_TOKEN_TYPES, composite_kid, decode, decode_unverified, decode_with_any_key,
+    decode_with_any_key_lenient, decode_with_expectation, decode_id_token_unverified,
+    decode_id_token_with_key, decode_with_key, decode_with_key_expectation, encode,
+    encode_service_jwt, header_alg, header_kid, is_rfc9068_access_token_type, jwk_thumbprint,
+    parse_composite_dispatch, parse_protected_header,
 };
 #[cfg(not(target_arch = "wasm32"))]
-pub use key_source::{ClusterKeySource, FederatedKeySource, IssuerResolver, JwksFetcher, JwksKeySource, JwksMode, JwtKeySource};
+pub use jwt::decode_with_federation_candidates;
+#[cfg(not(target_arch = "wasm32"))]
+pub use key_source::{
+    ClusterKeySource, FederatedKeySource, IssuerResolver, JwksFetcher, JwksKeySource, JwksMode,
+    JwtKeySource,
+};
 #[cfg(not(target_arch = "wasm32"))]
 pub use key_subject_resolver::{KeySubjectResolver, set_global as set_global_key_subject_resolver};
+pub use mac::{
+    Assurance, Compartment, CompartmentSet, ContentBoundLabel, GenesisMap, GenesisReport,
+    LabelError, LabeledObject, Lattice, LatticeCodecError, LatticeDecodeError, LatticeVersion,
+    Level, MAX_COMPARTMENTS, ObjectLabelResolver, ObjectRef, SecurityContext, SecurityLabel,
+    StaticNodeLabel, SubjectContextClaims, VerifiedKeyMaterial, bind_time_label, import_label,
+};
 pub use scope::Scope;
 #[cfg(not(target_arch = "wasm32"))]
 pub use scope_registry::ScopeDefinition;
 pub use ucan::{
-    set_attenuates, Ability, ApprovalBinding, ApprovalError, Capability, CaveatValue, Caveats,
-    ChainError, Did, Resource, SignedApproval, Ucan, UcanError, UcanPayload, UcanVerifier,
+    Ability, ApprovalBinding, ApprovalError, Capability, CaveatValue, Caveats, ChainError, Did,
+    Resource, SignedApproval, Ucan, UcanError, UcanPayload, UcanVerifier, set_attenuates,
 };

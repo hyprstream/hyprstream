@@ -17,6 +17,7 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use sha2::{Digest, Sha256};
 
 use super::state::OAuthState;
+use hyprstream_pds::repo_authority::is_path_form_did_web;
 use crate::mac::exchange::{GrantDecision, GrantError, GrantRequest, GrantedAccess};
 use crate::services::generated::policy_client::IssueToken;
 
@@ -91,6 +92,17 @@ pub async fn exchange_token_exchange(
         }
     };
 
+    // The PolicyService check remains the shared signing boundary for every
+    // RPC issuer; this gives RFC 8693 callers a concrete OAuth error before a
+    // legacy subject can reach that RPC boundary.
+    if is_path_form_did_web(&verified.sub) {
+        return tx_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_grant",
+            "path-form did:web account subjects are frozen; host-form account minting is not available yet (#1159)",
+        );
+    }
+
     // Replay prevention: SHA-256 of the subject token as the replay key.
     // Covers all token types, regardless of whether they carry a jti claim.
     let token_hash = URL_SAFE_NO_PAD.encode(Sha256::digest(subject_token.as_bytes()));
@@ -151,10 +163,10 @@ pub async fn exchange_token_exchange(
 
 /// Verify an OIDC ID token from a trusted issuer (CrossAppAccessProvider path).
 ///
-/// `aud` is not strictly enforced — ID tokens target the OIDC client_id, not our
-/// token endpoint. Trust is established by the `iss` being in `trusted_issuers`.
+/// The issuer's configured `oidc_client_id` must be present in `aud`. For
+/// multi-audience tokens, `azp` must also equal that client ID.
 async fn verify_id_token(state: &Arc<OAuthState>, token: &str) -> Result<VerifiedSubject, String> {
-    let unverified = hyprstream_rpc::auth::decode_unverified(token)
+    let unverified = hyprstream_rpc::auth::decode_id_token_unverified(token)
         .map_err(|e| format!("Cannot parse id_token: {e}"))?;
 
     let iss = if unverified.iss.is_empty() {
@@ -168,6 +180,17 @@ async fn verify_id_token(state: &Arc<OAuthState>, token: &str) -> Result<Verifie
         .get(&iss)
         .ok_or_else(|| format!("Issuer not in trusted_issuers allow-list: {iss}"))?
         .clone();
+    let oidc_client_id = issuer_cfg
+        .oidc_client_id
+        .as_deref()
+        .filter(|client_id| !client_id.is_empty())
+        .ok_or_else(|| {
+            format!(
+                "OIDC ID-token exchange is not configured for issuer {iss}: \
+                 set trusted_issuers[issuer].oidc_client_id"
+            )
+        })?
+        .to_owned();
 
     check_nbf(token)?;
 
@@ -175,9 +198,13 @@ async fn verify_id_token(state: &Arc<OAuthState>, token: &str) -> Result<Verifie
         .await
         .map_err(|e| format!("JWKS key resolution failed for {iss}: {e}"))?;
 
-    // No audience check: ID token aud = OIDC client_id, not our token endpoint.
-    let claims = hyprstream_rpc::auth::decode_with_key(token, &vk, None)
-        .map_err(|e| format!("id_token signature verification failed: {e}"))?;
+    let claims = hyprstream_rpc::auth::decode_id_token_with_key(
+        token,
+        &vk,
+        &iss,
+        &oidc_client_id,
+    )
+    .map_err(|e| format!("id_token verification failed: {e}"))?;
 
     if claims.sub.is_empty() {
         return Err("id_token missing 'sub' claim".to_owned());
@@ -936,6 +963,19 @@ async fn mint_grant_token(
     // `act` claim below, so the token records "actor acting for delegator"
     // rather than collapsing to one identity (the confused-deputy fix).
     let sub = principals.sub.clone();
+
+    // #1159 freeze: UCAN issuance signs directly instead of using
+    // PolicyService, so it must enforce the same concrete-subject invariant at
+    // its own mint-and-refresh-persistence boundary. Return before signing or
+    // storing a refresh token so a legacy path-form chain cannot be extended.
+    if is_path_form_did_web(&sub) {
+        return tx_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_grant",
+            "path-form did:web account subjects are frozen; host-form account minting is not available yet (#1159)",
+        );
+    }
+
     let scope_str = format!(
         "{}@{}",
         granted.capability.ability, granted.capability.resource
@@ -1086,6 +1126,58 @@ mod tests {
     use hyprstream_rpc::auth::mac::{
         Assurance, CompartmentSet, Level, SecurityLabel, VerifiedKeyMaterial,
     };
+
+    fn mint_test_state() -> Arc<OAuthState> {
+        use crate::config::OAuthConfig;
+        use crate::services::{DiscoveryClient, PolicyClient};
+        use hyprstream_rpc::rpc_client::RpcClientImpl;
+        use hyprstream_rpc::signer::LocalSigner;
+        use hyprstream_rpc::transport::lazy_uds::LazyUdsTransport;
+
+        let key = ed25519_dalek::SigningKey::from_bytes(&[0x65; 32]);
+        let dummy = std::path::PathBuf::from("/dev/null/path-form-mint-test.sock");
+        let mk_client = || Arc::new(
+            RpcClientImpl::new(
+                LocalSigner::new(key.clone()),
+                LazyUdsTransport::new(dummy.clone()),
+                Some(key.verifying_key()),
+            ).with_response_verify_policy(hyprstream_rpc::crypto::CryptoPolicy::Classical),
+        );
+        Arc::new(OAuthState::new(
+            &OAuthConfig::default(),
+            PolicyClient::new(mk_client()),
+            DiscoveryClient::new(mk_client()),
+            key.verifying_key().to_bytes(),
+        ))
+    }
+
+    #[tokio::test]
+    async fn ucan_mint_rejects_path_form_subject_before_signing() {
+        use hyprstream_rpc::auth::ucan::{Ability, Capability, Resource};
+
+        let granted = GrantedAccess {
+            capability: Capability::new(Resource::new("mac://model/demo"), Ability::new("read")),
+            audience: None,
+        };
+        let response = mint_grant_token(
+            &mint_test_state(),
+            &granted,
+            "test-dpop-jkt",
+            None,
+            TokenPrincipals {
+                sub: "did:web:accounts.example:users:alice".to_owned(),
+                act: None,
+            },
+        ).await;
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), 4096).await.unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["error"].as_str(), Some("invalid_grant"));
+        assert!(value["error_description"].as_str().unwrap().contains("frozen"));
+        assert!(value.get("access_token").is_none());
+        assert!(value.get("refresh_token").is_none());
+    }
 
     /// A compartment bitset from bit indices.
     fn comps(bits: &[u32]) -> CompartmentSet {

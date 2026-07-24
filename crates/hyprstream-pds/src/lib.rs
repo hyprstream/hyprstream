@@ -35,7 +35,9 @@
 //! - No libtorch / inference — this is a metadata/crypto layer.
 //! - No networking — proofs are produced and verified in-process; a transport
 //!   (HTTP/moq) wraps this separately.
-//! - No on-disk storage — the store is in-memory; persistence is a caller concern.
+//! - No general repo database — MST/CAR stores remain in-memory. The narrow
+//!   exception is [`DirectoryHostedAccountStore`], which durably establishes
+//!   an account's immutable genesis bundle and generated `#atproto` secret.
 //!
 //! # Reused infrastructure
 //!
@@ -59,7 +61,9 @@ pub mod car;
 pub mod cid;
 pub mod commit;
 pub mod dag_cbor;
+pub mod did_op;
 pub mod event_group;
+pub mod hosted_account;
 pub mod ledger;
 pub mod list_record;
 pub mod mst;
@@ -70,6 +74,16 @@ pub mod repo_authority;
 pub mod tid;
 
 pub use cid::Cid;
+pub use did_op::{
+    sign_genesis, DidOpSignature, GenesisDidOp, GenesisRepoHead, GenesisRotationKeys,
+    HostKeyEnrollment, HostRotationKey, HybridRotationKey, RecoveryKeyEnrollment,
+    RecoveryRotationKey, RotationSlotRef, UnsignedGenesisDidOp, UserRotationKey,
+    DID_OP_SIGNATURE_CONTEXT, DID_OP_VERSION,
+};
+pub use hosted_account::{
+    AccountRecord, AllocatedAccountName, DirectoryHostedAccountStore, HostedAccountMint,
+    PendingHostedAccountMint, SealedHostedAccount, ACCOUNT_RECORD_VERSION,
+};
 pub use ledger::{AllocationRecord, CheckpointRecord, GrantClass, ReceiptRecord, StateRoot, Unit};
 pub use name_record::NameRecord;
 pub use placement::{GroupItemRecord, GroupRecord, NodeRecord, WorkloadRecord};

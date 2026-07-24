@@ -1,10 +1,10 @@
 //! Middleware for authentication, logging, and request processing
 
 use crate::auth::jwt;
-use crate::server::state::ServerState;
+use crate::server::state::{ResourceAuthState, ServerState};
 use axum::{
     extract::{Request, State},
-    http::{header, HeaderValue, StatusCode},
+    http::{HeaderValue, StatusCode, header},
     middleware::Next,
     response::{IntoResponse, Response},
 };
@@ -51,7 +51,7 @@ impl std::fmt::Debug for AuthenticatedUser {
 ///
 /// On success, inserts `AuthenticatedUser` into request extensions.
 pub async fn auth_middleware(
-    State(state): State<ServerState>,
+    State(state): State<ResourceAuthState>,
     mut request: Request,
     next: Next,
 ) -> Response {
@@ -91,7 +91,7 @@ pub async fn auth_middleware(
     // ticket validator (H1a / #764). DPoP sender-binding is enforced below,
     // after we hold the claims, because it is header/scheme-specific.
     let local_issuers: &[&str] = &[&*state.oauth_issuer_url];
-    let claims = match verify_token_claims(&state, &token).await {
+    let claims = match verify_resource_token_claims(&state, &token).await {
         Ok(c) => c,
         Err(reason) => {
             warn!(client_ip = %client_ip, method = %method, path = %path, reason, "Auth failure");
@@ -251,7 +251,7 @@ impl RateLimiter {
 /// Defaults: 300 requests per 60-second window (~5 req/s sustained).
 /// Returns 429 when the window quota is exceeded.
 pub async fn rate_limit_middleware(
-    State(state): State<ServerState>,
+    State(state): State<ResourceAuthState>,
     request: Request,
     next: Next,
 ) -> Response {
@@ -379,7 +379,9 @@ fn decode_composite_multi(
         hyprstream_rpc::auth::RFC9068_ACCESS_TOKEN_TYPES,
     )
     .map_err(|_| "JWT validation failed")?;
-    if dispatch.kid() != header.kid { return Err("JWT validation failed"); }
+    if dispatch.kid() != header.kid {
+        return Err("JWT validation failed");
+    }
     let pair = published_composite
         .iter()
         .find(|pair| pair.kid() == header.kid)
@@ -398,8 +400,8 @@ fn local_issuer_matches(claims: &jwt::Claims, expected: &str) -> bool {
     claims.iss == expected
 }
 
-pub(crate) async fn verify_token_claims(
-    state: &ServerState,
+async fn verify_resource_token_claims(
+    state: &ResourceAuthState,
     token: &str,
 ) -> Result<jwt::Claims, &'static str> {
     if !token.contains('.') {
@@ -427,7 +429,7 @@ pub(crate) async fn verify_token_claims(
         // MAC/key-rotation path populates at boot and after each ML-DSA rotation.
         // Empty under Classical policy or before the OAuth store is provisioned —
         // in which case a composite token simply fails closed here.
-        let published_composite = { hyprstream_rpc::auth::global_composite_key_set().snapshot() };
+        let published_composite = state.composite_key_set.snapshot();
         let claims = decode_local_multi_key(
             token,
             &state.verifying_key,
@@ -444,10 +446,28 @@ pub(crate) async fn verify_token_claims(
         if !state.federation_resolver.is_trusted(&iss) {
             return Err("untrusted federation issuer");
         }
-        match state.federation_resolver.get_key(&iss).await {
-            Ok(key) => jwt::decode_with_key(token, &key, Some(&state.resource_url))
-                .map_err(|_| "JWT validation failed")?,
-            Err(_) => return Err("federation key resolution failed"),
+        // Rotation-aware federation verification (#1185): the resolver
+        // returns every Ed25519 key the issuer currently publishes
+        // (ordered kid-first), and we accept the token if ANY candidate
+        // verifies it. This is what makes overlap rotation safe — a
+        // token signed by a non-first key succeeds when its kid is
+        // published — and mirrors `decode_local_multi_key` for external
+        // issuers. The token's own `kid`, when present, is passed to
+        // the resolver so it can refetch on an unknown kid.
+        let kid = extract_kid_from_token(token);
+        match state
+            .federation_resolver
+            .get_keys(&iss, kid.as_deref())
+            .await
+        {
+            Ok(candidates) if !candidates.is_empty() => jwt::decode_with_federation_candidates(
+                token,
+                &candidates,
+                Some(&state.resource_url),
+            )
+            .map_err(|_| "JWT validation failed")?,
+            // Empty candidate set or fetch failure: fail closed either way.
+            Ok(_) | Err(_) => return Err("federation key resolution failed"),
         }
     };
 
@@ -462,8 +482,15 @@ pub(crate) async fn verify_token_claims(
     Ok(claims)
 }
 
+pub(crate) async fn verify_token_claims(
+    state: &ServerState,
+    token: &str,
+) -> Result<jwt::Claims, &'static str> {
+    verify_resource_token_claims(&state.resource_auth_state(), token).await
+}
+
 /// Build WWW-Authenticate header value with resource_metadata URL (RFC 9728).
-fn build_www_authenticate(state: &ServerState) -> String {
+fn build_www_authenticate(state: &ResourceAuthState) -> String {
     let resource_metadata_url = format!(
         "{}/.well-known/oauth-protected-resource",
         state.resource_url
@@ -484,7 +511,7 @@ fn unauthorized_response(message: &str, www_authenticate: &str) -> Response {
 /// Exported for use in other middleware-like contexts (e.g. MCP inline auth).
 /// Returns an empty string on any parse failure.
 pub fn extract_iss_from_token(token: &str) -> String {
-    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+    use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
     let parts: Vec<&str> = token.splitn(3, '.').collect();
     if parts.len() < 2 {
         return String::new();
@@ -510,7 +537,7 @@ pub fn extract_iss_from_token(token: &str) -> String {
 
 /// Extract `kid` from a JWT header without full validation.
 pub fn extract_kid_from_token(token: &str) -> Option<String> {
-    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+    use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
     let header_b64 = token.split('.').next()?;
     if header_b64.len() > 4096 {
         return None;
@@ -604,30 +631,37 @@ pub fn cors_layer(config: &crate::server::state::CorsConfig) -> tower_http::cors
         cors = cors.allow_origin(Any);
         // Never allow credentials with wildcard
         cors = cors.allow_credentials(false);
-    } else if config.allowed_origins.is_empty() {
-        // If no origins specified, use default localhost origins
-        let default_origins = vec![
-            "http://localhost:3000",
-            "http://localhost:3001",
-            "http://127.0.0.1:3000",
-            "http://127.0.0.1:3001",
-        ];
-        for origin in default_origins {
-            if let Ok(header_value) = origin.parse::<HeaderValue>() {
-                cors = cors.allow_origin(header_value);
-            }
-        }
-        // Configure credentials based on config
-        if config.allow_credentials {
-            cors = cors.allow_credentials(true);
-        }
     } else {
-        // Allow specific origins
-        for origin in &config.allowed_origins {
-            if let Ok(header_value) = origin.parse::<HeaderValue>() {
-                cors = cors.allow_origin(header_value);
-            }
-        }
+        // Allow specific origins.
+        //
+        // The whole set MUST be passed in a single `allow_origin` call:
+        // `CorsLayer::allow_origin` is documented to *override* on every call
+        // (`self.allow_origin = origin.into()`), and a single `HeaderValue`
+        // becomes `AllowOrigin::exact(...)` — a constant `Access-Control-Allow-Origin`
+        // emitted unconditionally, not a membership check. Iterating and calling
+        // it once per origin would therefore honor only the LAST origin in the
+        // list, silently dropping every earlier origin. Passing the
+        // `Vec<HeaderValue>` makes tower-http build `AllowOrigin::list(...)`,
+        // which performs exact-equality membership matching against the full set.
+        let origins: Vec<HeaderValue> = if config.allowed_origins.is_empty() {
+            // If no origins specified, use default localhost origins
+            [
+                "http://localhost:3000",
+                "http://localhost:3001",
+                "http://127.0.0.1:3000",
+                "http://127.0.0.1:3001",
+            ]
+            .into_iter()
+            .filter_map(|o| o.parse::<HeaderValue>().ok())
+            .collect()
+        } else {
+            config
+                .allowed_origins
+                .iter()
+                .filter_map(|o| o.parse::<HeaderValue>().ok())
+                .collect()
+        };
+        cors = cors.allow_origin(origins);
         // Configure credentials based on config
         if config.allow_credentials {
             cors = cors.allow_credentials(true);
@@ -637,13 +671,196 @@ pub fn cors_layer(config: &crate::server::state::CorsConfig) -> tower_http::cors
     cors
 }
 
+/// Runtime-behavior tests for [`cors_layer`].
+///
+/// These drive the real axum `Router` + `CorsLayer` and assert the
+/// `Access-Control-Allow-Origin` / `Access-Control-Allow-Credentials` headers a
+/// browser would actually observe. They exist because the credentialed router's
+/// origin list used to be built with a per-origin loop of `allow_origin(...)`,
+/// which silently honored only the LAST entry — a config-vec assertion can't
+/// catch that (the vec is correct; the layer is wrong), so every check here
+/// exercises the layer end-to-end.
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod cors_layer_tests {
+    use super::cors_layer;
+    use crate::config::server::ServerConfig;
+    use crate::server::state::CorsConfig;
+    use axum::{body::Body, http::Request as HttpRequest, routing::get, Router};
+    use tower::ServiceExt;
+
+    /// Drive the credentialed CORS layer on a real `Router` and return the
+    /// `Access-Control-Allow-Origin` header it emits for `origin` (or `None` if
+    /// the request was rejected / header absent). This is the only honest way to
+    /// catch the classic "only the last origin in the list is honored" bug, which
+    /// a config-vec assertion will happily report as fixed while the runtime is
+    /// broken.
+    async fn acao_for(config: &CorsConfig, origin: &str) -> Option<String> {
+        let app = Router::new()
+            .route("/probe", get(|| async { "ok" }))
+            .layer(cors_layer(config));
+        let req = HttpRequest::get("/probe")
+            .header("Origin", origin)
+            .body(Body::empty())
+            .expect("request");
+        let resp = app.oneshot(req).await.expect("response");
+        resp.headers()
+            .get(axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned)
+    }
+
+    #[tokio::test]
+    async fn cors_layer_allows_every_default_origin_at_runtime() {
+        // Regression: the credentialed default list previously honored only the
+        // LAST origin (loop-of-override bug). Every dev origin must each produce
+        // an ACAO echoing itself back.
+        let config = CorsConfig::default();
+        for origin in [
+            "http://localhost:3000",
+            "http://localhost:3001",
+            "http://127.0.0.1:3000",
+            "http://127.0.0.1:3001",
+        ] {
+            assert_eq!(
+                acao_for(&config, origin).await,
+                Some(origin.to_owned()),
+                "credentialed CORS layer must echo allowed origin {origin}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn cors_layer_rejects_near_miss_origins() {
+        // tower-http's list path uses exact `HeaderValue` equality, so
+        // prefix/suffix/subdomain near-misses must NOT be reflected back. These
+        // are the classic CORS-bypass tricks; a reflect-any bug would leak them.
+        let config = ServerConfig::builder()
+            .cors_origins(vec![
+                "https://hyprstream.com".to_owned(),
+                "https://www.hyprstream.com".to_owned(),
+            ])
+            .build()
+            .cors;
+        for evil in [
+            "https://hyprstream.com.evil.tld", // suffix hijack
+            "https://evilhyprstream.com",      // subdomain look-alike
+            "http://hyprstream.com",           // scheme downgrade (no TLS)
+            "https://www.hyprstream.com.evil", // www suffix hijack
+        ] {
+            assert_eq!(
+                acao_for(&config, evil).await,
+                None,
+                "credentialed CORS layer must reject near-miss origin {evil}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn cors_layer_multiorigin_override_honors_all_entries() {
+        // An operator who supplies MULTIPLE origins via
+        // HYPRSTREAM_CORS_ORIGINS / builder must have all of them honored, not
+        // just the last. Single-origin overrides always worked; this guards the
+        // multi-origin case.
+        let config = ServerConfig::builder()
+            .cors_origins(vec![
+                "https://a.example.com".to_owned(),
+                "https://b.example.com".to_owned(),
+                "https://c.example.com".to_owned(),
+            ])
+            .build()
+            .cors;
+        for origin in [
+            "https://a.example.com",
+            "https://b.example.com",
+            "https://c.example.com",
+        ] {
+            assert_eq!(
+                acao_for(&config, origin).await,
+                Some(origin.to_owned()),
+                "multi-origin override must honor {origin}"
+            );
+        }
+        // And an unrelated origin still gets nothing.
+        assert_eq!(
+            acao_for(&config, "https://evil.example.com").await,
+            None,
+            "multi-origin override must not leak to unrelated origins"
+        );
+    }
+
+    #[tokio::test]
+    async fn cors_layer_credentials_header_present_for_allowed_origin() {
+        // The credentialed router must advertise `Access-Control-Allow-Credentials:
+        // true` so browser credentialed requests succeed for an allowed origin.
+        let config = CorsConfig::default();
+        let app = Router::new()
+            .route("/probe", get(|| async { "ok" }))
+            .layer(cors_layer(&config));
+        let resp = app
+            .oneshot(
+                HttpRequest::builder()
+                    .method("GET")
+                    .uri("/probe")
+                    .header("Origin", "http://localhost:3000")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(
+            resp.headers()
+                .get(axum::http::header::ACCESS_CONTROL_ALLOW_CREDENTIALS)
+                .and_then(|v| v.to_str().ok()),
+            Some("true"),
+            "credentialed router must set Access-Control-Allow-Credentials: true"
+        );
+    }
+
+    #[tokio::test]
+    async fn cors_layer_wildcard_never_pairs_with_credentials() {
+        // Even a hand-edited config with `["*"]` + credentials-true must be
+        // defused at layer-build time: wildcard forces credentials OFF.
+        let mut config = CorsConfig::public();
+        config.allow_credentials = true; // adversarial: try to force creds on with "*"
+        let app = Router::new()
+            .route("/probe", get(|| async { "ok" }))
+            .layer(cors_layer(&config));
+        let resp = app
+            .oneshot(
+                HttpRequest::builder()
+                    .method("GET")
+                    .uri("/probe")
+                    .header("Origin", "https://evil.example.com")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        // Wildcard surface mirrors any origin...
+        assert_eq!(
+            resp.headers()
+                .get(axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .and_then(|v| v.to_str().ok()),
+            Some("*"),
+        );
+        // ...but must NOT advertise credentials (spec-invalid + credential leak).
+        assert_eq!(
+            resp.headers()
+                .get(axum::http::header::ACCESS_CONTROL_ALLOW_CREDENTIALS),
+            None,
+            "wildcard + credentials is spec-invalid; layer must drop credentials"
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn test_extract_iss_from_token() {
-        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+        use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 
         // Craft a JWT with iss in payload: header.payload.sig
         // payload = base64url({"iss":"https://node-a","sub":"alice","exp":9999999999,"iat":0})
@@ -672,7 +889,7 @@ mod tests {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod rotation_aware_tests {
     use super::*;
-    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
     use ed25519_dalek::{Signer as _, SigningKey};
 
     const AUD: &str = "https://node-a/resource";
@@ -691,12 +908,7 @@ mod rotation_aware_tests {
         signed_token_with_type(key, aud, jti, "at+jwt")
     }
 
-    fn signed_token_with_type(
-        key: &SigningKey,
-        aud: &str,
-        jti: Option<&str>,
-        typ: &str,
-    ) -> String {
+    fn signed_token_with_type(key: &SigningKey, aud: &str, jti: Option<&str>, typ: &str) -> String {
         let n = now();
         let mut claims =
             jwt::Claims::new("alice".to_owned(), n, n + 3600).with_audience(Some(aud.to_owned()));
@@ -817,7 +1029,7 @@ mod rotation_aware_tests {
             Some(AUD),
             true,
         )
-            .unwrap_err();
+        .unwrap_err();
         assert_eq!(err, "JWT validation failed");
     }
 
@@ -838,7 +1050,7 @@ mod rotation_aware_tests {
             Some(AUD),
             true,
         )
-            .unwrap_err();
+        .unwrap_err();
         assert_eq!(err, "JWT validation failed");
     }
 
@@ -909,7 +1121,7 @@ mod rotation_aware_tests {
 mod composite_aware_tests {
     use super::*;
     use crate::auth::jwt::encode_composite_ml_dsa_65_ed25519;
-    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+    use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
     use ed25519_dalek::SigningKey;
 
     const AUD: &str = "https://node-a/resource";
@@ -1086,15 +1298,17 @@ mod composite_aware_tests {
             published_pair(pq_b_vk, ed_b.verifying_key()),
         ];
 
-        assert!(decode_local_multi_key(
-            &cross_token,
-            &ca.verifying_key(),
-            &[ed_a.verifying_key(), ed_b.verifying_key()],
-            &published,
-            Some(AUD),
-            false,
-        )
-        .is_err());
+        assert!(
+            decode_local_multi_key(
+                &cross_token,
+                &ca.verifying_key(),
+                &[ed_a.verifying_key(), ed_b.verifying_key()],
+                &published,
+                Some(AUD),
+                false,
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -1147,7 +1361,7 @@ mod composite_aware_tests {
             (
                 "future",
                 jwt::Claims::new("future".to_owned(), now() + 120, now() + 3600)
-                .with_audience(Some(AUD.to_owned())),
+                    .with_audience(Some(AUD.to_owned())),
             ),
             (
                 "no-aud",
@@ -1165,13 +1379,13 @@ mod composite_aware_tests {
             );
             assert!(
                 decode_local_multi_key(
-                &token,
-                &ca.verifying_key(),
-                &[ed.verifying_key()],
-                std::slice::from_ref(&pair),
-                Some(AUD),
-                false,
-            )
+                    &token,
+                    &ca.verifying_key(),
+                    &[ed.verifying_key()],
+                    std::slice::from_ref(&pair),
+                    Some(AUD),
+                    false,
+                )
                 .is_err(),
                 "accepted invalid {case} claims"
             );
@@ -1232,15 +1446,17 @@ mod composite_aware_tests {
         let sig_bytes = URL_SAFE_NO_PAD.decode(sig_b64).unwrap();
         for stripped in [&sig_bytes[..3309], &sig_bytes[3309..]] {
             let tampered = format!("{}.{}", &token[..dot2], URL_SAFE_NO_PAD.encode(stripped));
-            assert!(decode_local_multi_key(
-                &tampered,
-                &ca.verifying_key(),
-                &published_ed,
-                &pairs,
-                Some(AUD),
-                false,
-            )
-            .is_err());
+            assert!(
+                decode_local_multi_key(
+                    &tampered,
+                    &ca.verifying_key(),
+                    &published_ed,
+                    &pairs,
+                    Some(AUD),
+                    false,
+                )
+                .is_err()
+            );
         }
     }
 
@@ -1269,15 +1485,17 @@ mod composite_aware_tests {
         .unwrap();
         assert_eq!(claims.sub, "alice");
 
-        assert!(decode_local_multi_key(
-            &token,
-            &ca.verifying_key(),
-            &published_ed,
-            &pairs,
-            Some(AUD),
-            false,
-        )
-        .is_err());
+        assert!(
+            decode_local_multi_key(
+                &token,
+                &ca.verifying_key(),
+                &published_ed,
+                &pairs,
+                Some(AUD),
+                false,
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -1368,7 +1586,7 @@ mod composite_aware_tests {
 #[allow(clippy::expect_used)]
 mod browser_provisioning_rate_limit_tests {
     use super::*;
-    use axum::{body::Body, http::Request as HttpRequest, middleware, routing::get, Router};
+    use axum::{Router, body::Body, http::Request as HttpRequest, middleware, routing::get};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tower::ServiceExt;
 
@@ -1395,11 +1613,19 @@ mod browser_provisioning_rate_limit_tests {
 
         let first = app
             .clone()
-            .oneshot(HttpRequest::get("/provision").body(Body::empty()).expect("request"))
+            .oneshot(
+                HttpRequest::get("/provision")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
             .await
             .expect("first response");
         let rejected = app
-            .oneshot(HttpRequest::get("/provision").body(Body::empty()).expect("request"))
+            .oneshot(
+                HttpRequest::get("/provision")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
             .await
             .expect("limited response");
 

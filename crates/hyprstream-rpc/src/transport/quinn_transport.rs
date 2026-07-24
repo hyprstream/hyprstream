@@ -83,6 +83,35 @@ pub fn global_ninep_handler() -> Option<Arc<dyn NinePWtHandler>> {
     GLOBAL_NINEP_HANDLER.get().cloned()
 }
 
+/// Process-global `/moq` CONNECT authenticator (#1153), populated by the
+/// `hyprstream` crate at server startup — where the authoritative
+/// subject→tenant provisioning map (PolicyManager) is available — so the
+/// `hyprstream-service` spawner (which cannot depend on `hyprstream`) can
+/// pick it up at construction via [`global_moq_connect_authz`]. Same seam
+/// pattern as [`set_global_ninep_handler`]. First write wins.
+static GLOBAL_MOQ_CONNECT_AUTHZ: std::sync::OnceLock<
+    crate::transport::moq_connect_auth::MoqConnectAuthz,
+> = std::sync::OnceLock::new();
+
+/// Register the process-global `/moq` CONNECT authenticator (idempotent,
+/// first-wins). The `hyprstream` crate calls this at startup with an
+/// [`MoqConnectAuthz`] built over its PolicyManager subject→tenant map.
+pub fn set_global_moq_connect_authz(
+    authz: crate::transport::moq_connect_auth::MoqConnectAuthz,
+) -> bool {
+    GLOBAL_MOQ_CONNECT_AUTHZ.set(authz).is_ok()
+}
+
+/// The process-global `/moq` CONNECT authenticator, if one has been
+/// registered.
+pub fn global_moq_connect_authz() -> Option<crate::transport::moq_connect_auth::MoqConnectAuthz> {
+    GLOBAL_MOQ_CONNECT_AUTHZ.get().cloned()
+}
+
+/// One-shot guard so the "no authenticator on a served `/moq` plane" warning
+/// (#1153/F1) fires once per process rather than per-CONNECT.
+static MOQ_NO_AUTHZ_WARNED: std::sync::Once = std::sync::Once::new();
+
 /// A quinn-backed WebTransport server for the RPC plane.
 ///
 /// Accepts WebTransport sessions and spawns [`serve_rpc_connection`] for each.
@@ -124,6 +153,13 @@ pub struct QuinnRpcServer {
     /// #276 subscribe-authz + per-tenant announce-scoping config for the `/moq`
     /// plane. Defaults to "off" (open subscribe preserved).
     moq_authz: crate::transport::iroh_moq::MoqAuthzConfig,
+    /// #1153 CONNECT-time authenticator for the `/moq` plane. When set, every
+    /// `/moq` CONNECT must present a verifiable bearer JWT and resolve to a
+    /// tenant from the *verified* subject, or the CONNECT is refused
+    /// (fail-closed) before any stream is established. `None` = the `/moq`
+    /// plane is single-tenant/open (the deployment has not opted into the
+    /// shared-endpoint boundary).
+    moq_connect_authz: Option<crate::transport::moq_connect_auth::MoqConnectAuthz>,
     /// Optional 9P export handler (H1b / #765). When set, sessions whose
     /// WebTransport CONNECT URL path is [`crate::dial::NINEP_PATH`] are handed to
     /// it instead of the RPC core. Defaults to [`global_ninep_handler`] at
@@ -170,6 +206,14 @@ impl QuinnRpcServer {
             moq_consumer: None,
             moq_relay_origin: None,
             moq_authz: crate::transport::iroh_moq::MoqAuthzConfig::default(),
+            // #1153/F3: do NOT snapshot `global_moq_connect_authz()` here.
+            // Reading the OnceLock once at construction makes startup ordering
+            // a silent security property: a server built before the `hyprstream`
+            // crate registers the authenticator runs open forever with no error.
+            // The accept loop resolves the effective authenticator per-CONNECT
+            // (`builder override OR global`), so registration order is no longer
+            // load-bearing.
+            moq_connect_authz: None,
             // Pick up the process-global 9P handler if the `hyprstream` crate
             // registered one; a builder call can still override it.
             ninep_handler: global_ninep_handler(),
@@ -217,16 +261,40 @@ impl QuinnRpcServer {
     /// the `/moq` plane.
     ///
     /// **Identity caveat (documented seam):** the WebTransport `/moq` CONNECT is
-    /// *not* mutually authenticated — the server presents a pinned cert, but the
-    /// client is anonymous at the TLS layer. So the `tenant_resolver` is invoked
-    /// with [`crate::moq_authz::PeerIdentity::anonymous`]; per-tenant scoping on
-    /// this path is only effective if the resolver returns a tenant from
-    /// non-identity context (e.g. a single-tenant endpoint), and a policy-gated
-    /// authorizer will deny *private* subscribes here (fail-closed) while public
-    /// broadcasts stay open. Cross-tenant enumeration defense for authenticated
-    /// peers lives on the iroh `moql` path.
+    /// *not* mutually authenticated at the TLS layer. Per-tenant announce
+    /// scoping via this config's `tenant_resolver` is only effective when a
+    /// resolver yields a tenant from non-identity context (e.g. a single-tenant
+    /// endpoint) — it receives [`crate::moq_authz::PeerIdentity::anonymous`] on
+    /// the open path. For a **shared multi-tenant** endpoint, install
+    /// [`Self::with_moq_connect_authz`] (#1153): that authenticates the CONNECT
+    /// (bearer JWT, verified before the handshake completes), resolves the
+    /// tenant from the *verified* subject, and — when set — takes precedence
+    /// over this config's anonymous resolver path, refusing unauthenticated /
+    /// tenant-less CONNECTs (fail-closed) and serving each authenticated peer
+    /// only its own tenant's broadcasts. Cross-tenant enumeration defense for
+    /// authenticated peers over the iroh `moql` ALPN lives in
+    /// [`crate::transport::iroh_moq`].
     pub fn with_moq_authz(mut self, authz: crate::transport::iroh_moq::MoqAuthzConfig) -> Self {
         self.moq_authz = authz;
+        self
+    }
+
+    /// Install the #1153 CONNECT-time authenticator for the `/moq` plane.
+    ///
+    /// When set, the accept loop verifies a bearer JWT from the CONNECT's
+    /// HTTP/3 `Authorization` header **before** completing the WebTransport
+    /// handshake, resolves the tenant from the *verified* subject via the
+    /// configured resolver, and refuses the CONNECT (fail-closed) on any
+    /// failure — missing header, bad signature, expired token, or a verified
+    /// subject with no tenant. A connected peer then sees only its own
+    /// tenant's broadcasts (structural scoping). With this unset, the `/moq`
+    /// plane stays single-tenant/open (no boundary), preserving the
+    /// pre-#1153 behaviour for deployments that have not opted in.
+    pub fn with_moq_connect_authz(
+        mut self,
+        authz: crate::transport::moq_connect_auth::MoqConnectAuthz,
+    ) -> Self {
+        self.moq_connect_authz = Some(authz);
         self
     }
 
@@ -369,6 +437,7 @@ impl QuinnRpcServer {
                     let moq_consumer = self.moq_consumer.clone();
                     let moq_relay_origin = self.moq_relay_origin.clone();
                     let moq_authz = self.moq_authz.clone();
+                    let moq_connect_authz = self.moq_connect_authz.clone();
                     let ninep_handler = self.ninep_handler.clone();
                     let carrier = self.carrier;
                     tokio::spawn(async move {
@@ -382,6 +451,58 @@ impl QuinnRpcServer {
                         let is_ninep = request.url.path() == crate::dial::NINEP_PATH;
                         let is_browser_rpc = request.url.path()
                             == crate::browser_provisioning::BROWSER_RPC_PATH;
+                        // #1153/F3: resolve the effective authenticator
+                        // per-CONNECT (builder override OR process-global),
+                        // NOT once at construction. This removes the
+                        // ordering-dependent silent downgrade where a server
+                        // built before `set_global_moq_connect_authz` ran open
+                        // forever.
+                        let moq_connect_authz = moq_connect_authz
+                            .clone()
+                            .or_else(global_moq_connect_authz);
+                        // #1153/F1: if this endpoint serves `/moq` but no
+                        // authenticator is configured (override or global), warn
+                        // loudly ONCE per process — the unset state is exactly
+                        // the #1145 shape (an absent expected value silently
+                        // disabling the boundary) and must be detectable.
+                        if is_moq
+                            && (moq_consumer.is_some() || moq_relay_origin.is_some())
+                            && moq_connect_authz.is_none()
+                        {
+                            MOQ_NO_AUTHZ_WARNED.call_once(|| {
+                                tracing::warn!(
+                                    "quinn-moq: /moq plane is served with NO CONNECT authenticator (#1153) — \
+                                     anonymous/unscoped admission is LIVE. This is the #1145 fail-open shape; \
+                                     install MoqConnectAuthz via set_global_moq_connect_authz for a shared endpoint."
+                                );
+                            });
+                        }
+                        // #1153: authenticate the `/moq` CONNECT BEFORE the
+                        // WebTransport session is established. When a
+                        // `MoqConnectAuthz` is resolved, a `/moq` CONNECT must
+                        // present a verifiable bearer JWT (Authorization header)
+                        // whose subject the server resolves to a tenant; any
+                        // failure refuses the CONNECT — we `return` here,
+                        // dropping `request` so `request.ok()` never runs and the
+                        // client's CONNECT never completes. This is fail-closed:
+                        // there is no anonymous/wildcard admission on a
+                        // boundary-configured endpoint.
+                        let moq_connect_verified = if is_moq {
+                            match &moq_connect_authz {
+                                Some(authz) => match authz.verify(&request.headers) {
+                                    Some(verified) => Some(verified),
+                                    None => {
+                                        tracing::warn!(
+                                            "quinn-moq: refusing unauthenticated or tenant-less /moq CONNECT (#1153)"
+                                        );
+                                        return;
+                                    }
+                                },
+                                None => None,
+                            }
+                        } else {
+                            None
+                        };
                         // Resolve the handshake INSIDE the task, bounded (#162),
                         // so a slow/stalled CONNECT never blocks the accept loop.
                         let session = match tokio::time::timeout(
@@ -411,8 +532,62 @@ impl QuinnRpcServer {
                             // track name, so publisher and subscriber rendezvous
                             // here without either dialing the other. The relay
                             // holds no stream keys — frames pass through opaquely.
+                            //
+                            // #1153: when a `MoqConnectAuthz` is installed, an
+                            // anonymous CONNECT was already refused above (before
+                            // `request.ok()`), so reaching here on a
+                            // boundary-configured endpoint means the publisher is
+                            // an authenticated, tenant-resolved subject —
+                            // anonymous relay publish (the #1128 relay-mode gap)
+                            // is closed. The relay still routes by track name
+                            // (it must, to rendezvous publisher and subscriber),
+                            // so announce-name visibility through a relay is
+                            // inherent to relay mode; frame content is already
+                            // AEAD-sealed + chained-HMAC'd at the source.
+                            //
+                            // #1153 CRITICAL 3 (relay authorization): bind the
+                            // publisher's INGEST to its verified tenant prefix by
+                            // handing `Server::with_origin` a *scoped* producer.
+                            // Authentication alone let Alice publish into Bob's
+                            // namespace; `OriginProducer::scope` restricts this
+                            // session's publishes to `{tenant}/`, so a publish
+                            // of another tenant's prefix is rejected at ingest.
                             if let Some(relay_origin) = moq_relay_origin {
-                                let server = moq_net::Server::new().with_origin(relay_origin);
+                                let scoped_origin = match &moq_connect_verified {
+                                    Some(verified) => {
+                                        if !crate::moq_authz::is_valid_tenant_segment(
+                                            &verified.tenant,
+                                        ) {
+                                            tracing::warn!(
+                                                tenant = %verified.tenant,
+                                                "quinn-moq-relay: invalid tenant segment; refusing publisher"
+                                            );
+                                            return;
+                                        }
+                                        let prefix =
+                                            crate::moq_authz::tenant_prefix(&verified.tenant);
+                                        let path = moq_net::Path::new(&prefix);
+                                        match relay_origin.scope(&[path]) {
+                                            Some(scoped) => {
+                                                tracing::debug!(
+                                                    subject = ?verified.peer.subject,
+                                                    tenant = %verified.tenant,
+                                                    "quinn-moq-relay: admitting authenticated publisher scoped to tenant prefix"
+                                                );
+                                                scoped
+                                            }
+                                            None => {
+                                                tracing::warn!(
+                                                    tenant = %verified.tenant,
+                                                    "quinn-moq-relay: tenant prefix out of relay scope; refusing publisher"
+                                                );
+                                                return;
+                                            }
+                                        }
+                                    }
+                                    None => relay_origin,
+                                };
+                                let server = moq_net::Server::new().with_origin(scoped_origin);
                                 match server.accept(session).await {
                                     Ok(moq_session) => {
                                         tokio::select! {
@@ -431,32 +606,64 @@ impl QuinnRpcServer {
                             }
                             match moq_consumer {
                                 Some(consumer) => {
-                                    // #276: the `/moq` WebTransport CONNECT is NOT
-                                    // mutually authenticated, so no peer identity
-                                    // is available — treat the peer as anonymous.
-                                    let peer = crate::moq_authz::PeerIdentity::anonymous();
-                                    // Per-tenant announce scoping: only effective
-                                    // if the resolver yields a tenant from
-                                    // non-identity context (e.g. a single-tenant
-                                    // endpoint). With no resolver, serve unscoped
-                                    // (preserves the pre-#276 open model).
-                                    // TODO(#276): when the `/moq` plane gains a
-                                    // mutually-authenticated peer identity (client
-                                    // cert / app-level token), derive the tenant
-                                    // from it here instead of `anonymous()` so
-                                    // cross-tenant enumeration defense applies to
-                                    // network subscribers, not just iroh peers.
-                                    let publish_consumer = match moq_authz.tenant_for(&peer) {
-                                        Some(tenant) => {
-                                            match crate::moq_authz::tenant_scoped_consumer(&consumer, &tenant) {
-                                                Some(scoped) => scoped,
+                                    // #1153: resolve the publish consumer.
+                                    // - Authenticated path: a `MoqConnectAuthz`
+                                    //   is installed and the CONNECT was
+                                    //   verified; the tenant came from the
+                                    //   *verified* subject via the server-side
+                                    //   resolver. Serve ONLY that tenant's
+                                    //   broadcasts (structural scoping) — never
+                                    //   fall back to the unscoped consumer.
+                                    // - Open path: no authenticator installed.
+                                    //   Endpoint is single-tenant or explicitly
+                                    //   open; preserve the pre-#1153 resolver
+                                    //   behaviour.
+                                    let publish_consumer = match &moq_connect_verified {
+                                        Some(verified) => {
+                                            match crate::moq_authz::tenant_scoped_consumer(
+                                                &consumer,
+                                                &verified.tenant,
+                                            ) {
+                                                Some(scoped) => {
+                                                    tracing::debug!(
+                                                        subject = ?verified.peer.subject,
+                                                        tenant = %verified.tenant,
+                                                        "quinn-moq: CONNECT authenticated, serving tenant-scoped consumer"
+                                                    );
+                                                    scoped
+                                                }
                                                 None => {
-                                                    tracing::debug!(%tenant, "quinn-moq: tenant has no visible broadcasts; dropping session");
+                                                    tracing::debug!(
+                                                        tenant = %verified.tenant,
+                                                        "quinn-moq: tenant has no visible broadcasts; dropping session"
+                                                    );
                                                     return;
                                                 }
                                             }
                                         }
-                                        None => consumer,
+                                        None => {
+                                            // Legacy/open path: no CONNECT
+                                            // authenticator installed. The peer is
+                                            // anonymous and per-tenant scoping is
+                                            // only effective if the resolver
+                                            // yields a tenant from non-identity
+                                            // context (e.g. a single-tenant
+                                            // endpoint).
+                                            let peer =
+                                                crate::moq_authz::PeerIdentity::anonymous();
+                                            match moq_authz.tenant_for(&peer) {
+                                                Some(tenant) => {
+                                                    match crate::moq_authz::tenant_scoped_consumer(&consumer, &tenant) {
+                                                        Some(scoped) => scoped,
+                                                        None => {
+                                                            tracing::debug!(%tenant, "quinn-moq: tenant has no visible broadcasts; dropping session");
+                                                            return;
+                                                        }
+                                                    }
+                                                }
+                                                None => consumer,
+                                            }
+                                        }
                                     };
                                     // See iroh_moq::accept for why the authorizer
                                     // is not enforced per-track here (moq-net has
@@ -712,6 +919,29 @@ pub async fn connect_pinned_hashes_path(
         url::Url::parse(&format!("https://{addr}{path}")).map_err(|e| anyhow!("quinn url: {e}"))?;
     client
         .connect(url)
+        .await
+        .map_err(|e| anyhow!("quinn connect: {e}"))
+}
+
+/// [`connect_pinned_hashes_path`] variant that attaches extra HTTP/3 CONNECT
+/// headers to the WebTransport request — used by #1153 to carry the
+/// `Authorization: Bearer <jwt>` credential the `/moq` endpoint verifies at
+/// CONNECT time. Hermetic: dials an IP-literal URL.
+pub async fn connect_pinned_hashes_path_with_headers(
+    addr: std::net::SocketAddr,
+    cert_hashes: &[[u8; 32]],
+    path: &str,
+    headers: http::HeaderMap,
+) -> Result<web_transport_quinn::Session> {
+    let hashes: Vec<Vec<u8>> = cert_hashes.iter().map(|h| h.to_vec()).collect();
+    let client = external_client_builder()?
+        .with_server_certificate_hashes(hashes)
+        .map_err(|e| anyhow!("quinn client build: {e}"))?;
+    let url =
+        url::Url::parse(&format!("https://{addr}{path}")).map_err(|e| anyhow!("quinn url: {e}"))?;
+    let request = web_transport_quinn::proto::ConnectRequest::from(url).with_headers(headers);
+    client
+        .connect(request)
         .await
         .map_err(|e| anyhow!("quinn connect: {e}"))
 }

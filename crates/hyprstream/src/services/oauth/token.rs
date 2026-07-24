@@ -23,6 +23,7 @@ use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
 use super::state::{DeviceCodeStatus, OAuthState, RefreshTokenEntry};
+use hyprstream_pds::repo_authority::is_path_form_did_web;
 use hyprstream_rpc::auth::{JwkThumbprintInput, jwk_thumbprint};
 use crate::services::generated::policy_client::IssueToken;
 
@@ -631,6 +632,20 @@ async fn exchange_refresh_token(
                 return token_error(StatusCode::INTERNAL_SERVER_ERROR, "server_error", None);
             }
         };
+        // UCAN refresh bypasses `issue_token_with_refresh` after this atomic
+        // claim, so apply the freeze before handing the grant to the direct
+        // UCAN re-mint path. The credential remains single-use and cannot
+        // produce another access or refresh token for a path-form subject.
+        if is_path_form_did_web(&claimed.username) {
+            return token_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_grant",
+                Some(
+                    "token subject is a frozen path-form did:web account identifier; \
+                     host-form account minting is not available yet (#1159)",
+                ),
+            );
+        }
         let Some(claimed_grant) = claimed.ucan_grant.as_ref() else {
             tracing::error!("UCAN refresh token changed before atomic claim");
             return token_error(StatusCode::INTERNAL_SERVER_ERROR, "server_error", None);
@@ -919,6 +934,40 @@ async fn issue_token_with_refresh(
     client_assertion_jkt: Option<String>,
     vault_device_cookie: Option<String>,
 ) -> Response {
+    // ── #1159 freeze: path-form account subject guard ───────────────────────
+    // This is the OAuth helper boundary: the authorization_code, refresh_token,
+    // and device_code flows all funnel through here for both the access-token
+    // `subject` and the persisted rotated `RefreshTokenEntry.username`. Blocking
+    // `UserMappingStrategy::DidWeb` at config time stops NEW OIDC callbacks from
+    // constructing a path-form subject, but it does not touch subjects already
+    // durably persisted in refresh-token (and Valkey user-profile) stores. A
+    // pre-upgrade refresh token carries `did:web:{authority}:users:{name}` as its
+    // `username`; without this guard, refresh would mint a fresh access token for
+    // that subject AND persist a newly rotated ~30-day refresh token carrying it,
+    // keeping the path-form chain alive indefinitely.
+    //
+    // Fail-closed here bounds the OAuth refresh hole before it reaches the
+    // PolicyService signing boundary: a stored path-form subject can no longer
+    // be minted or rotated, so each pre-upgrade refresh token dies at its next
+    // refresh attempt or at natural expiry — it cannot extend the lifetime. The
+    // accounts themselves are reminted to host-form by E4 (#1176), not by this
+    // freeze; this PR does NOT scan or revoke stored records at startup, because
+    // that durable scan is exactly the out-of-band work #1176 owns and a partial
+    // scan here would risk the data migration the freeze deliberately defers.
+    // The predicate is the shared `is_path_form_did_web` so host-form
+    // `did:web:alice.example.com`, plain usernames, and every non-did:web subject
+    // pass through unchanged.
+    if is_path_form_did_web(sub) {
+        return token_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_grant",
+            Some(
+                "token subject is a frozen path-form did:web account identifier; \
+                 host-form account minting is not available yet (#1159)",
+            ),
+        );
+    }
+
     let scope_str = scopes.join(" ");
     let atproto_profile = super::state::atproto_profile_active(&scopes);
 
@@ -1391,5 +1440,243 @@ mod tests {
             (Some(a), Some(b)) if a == b
         );
         assert!(matches3, "equal jkt must bind");
+    }
+
+    // ── #1159 freeze: pre-upgrade path-form refresh token must not rotate ──
+
+    /// A `TokenStore` that counts `put` calls (rotation writes) and otherwise
+    /// behaves like a small in-memory map. Used to prove a path-form refresh
+    /// fails *without* persisting a rotated token.
+    struct RecordingTokenStore {
+        inner: parking_lot::Mutex<std::collections::HashMap<String, RefreshTokenEntry>>,
+        puts: std::sync::atomic::AtomicUsize,
+    }
+
+    impl RecordingTokenStore {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                inner: parking_lot::Mutex::new(std::collections::HashMap::new()),
+                puts: std::sync::atomic::AtomicUsize::new(0),
+            })
+        }
+        fn put_count(&self) -> usize {
+            self.puts.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::services::oauth::token_store::TokenStore for RecordingTokenStore {
+        async fn put(&self, token: &str, entry: &RefreshTokenEntry, _ttl: u64) -> anyhow::Result<()> {
+            self.puts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.lock().insert(token.to_owned(), entry.clone());
+            Ok(())
+        }
+        async fn get(&self, token: &str) -> anyhow::Result<Option<RefreshTokenEntry>> {
+            Ok(self.inner.lock().get(token).cloned())
+        }
+        async fn take(&self, token: &str) -> anyhow::Result<Option<RefreshTokenEntry>> {
+            Ok(self.inner.lock().remove(token))
+        }
+        async fn delete(&self, token: &str) -> anyhow::Result<()> {
+            self.inner.lock().remove(token);
+            Ok(())
+        }
+    }
+
+    /// Build a minimal `OAuthState` over dummy RPC clients (LazyUdsTransport at
+    /// /dev/null — never opened) and a recording refresh-token store.
+    async fn freeze_test_state(store: Arc<RecordingTokenStore>) -> Arc<OAuthState> {
+        use crate::config::OAuthConfig;
+        use crate::services::{DiscoveryClient, PolicyClient};
+        use hyprstream_rpc::rpc_client::RpcClientImpl;
+        use hyprstream_rpc::signer::LocalSigner;
+        use hyprstream_rpc::transport::lazy_uds::LazyUdsTransport;
+
+        let key = ed25519_dalek::SigningKey::from_bytes(&[0x76; 32]);
+        let vk = ed25519_dalek::SigningKey::from_bytes(&[0x73; 32]).verifying_key();
+        let dummy = std::path::PathBuf::from("/dev/null/freeze-test.sock");
+        let mk_client = || {
+            Arc::new(
+                RpcClientImpl::new(
+                    LocalSigner::new(key.clone()),
+                    LazyUdsTransport::new(dummy.clone()),
+                    Some(vk),
+                )
+                .with_response_verify_policy(hyprstream_rpc::crypto::CryptoPolicy::Classical),
+            )
+        };
+        let mut state = OAuthState::new(
+            &OAuthConfig::default(),
+            PolicyClient::new(mk_client()),
+            DiscoveryClient::new(mk_client()),
+            [0x76; 32],
+        );
+        state.with_token_store_impl(store as Arc<dyn crate::services::oauth::token_store::TokenStore>);
+        Arc::new(state)
+    }
+
+    /// The central mint guard: a path-form subject is rejected with
+    /// `invalid_grant` and no rotated refresh token is persisted.
+    #[tokio::test]
+    async fn path_form_subject_rejected_at_mint_boundary_without_rotation() {
+        let store = RecordingTokenStore::new();
+        let state = freeze_test_state(Arc::clone(&store)).await;
+
+        let resp = issue_token_with_refresh(
+            &state,
+            "client-1",
+            vec!["openid".to_owned()],
+            None,
+            "did:web:accounts.example:users:alice", // path-form — frozen under #1159
+            None,
+            false,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["error"].as_str(), Some("invalid_grant"));
+        assert!(
+            v["error_description"]
+                .as_str()
+                .unwrap()
+                .contains("frozen path-form did:web"),
+            "body was: {v}",
+        );
+        assert_eq!(
+            store.put_count(),
+            0,
+            "guard must return before persisting a rotated refresh token",
+        );
+    }
+
+    /// End-to-end refresh regression: a pre-upgrade refresh token whose stored
+    /// subject is path-form is consumed (taken) on refresh but NOT rotated —
+    /// no access token is minted and no replacement refresh token is written,
+    /// so the chain dies here rather than rotating indefinitely.
+    #[tokio::test]
+    async fn pre_upgrade_path_form_refresh_token_is_consumed_not_rotated() {
+        let store = RecordingTokenStore::new();
+        let state = freeze_test_state(Arc::clone(&store)).await;
+
+        // Seed a pre-upgrade refresh token carrying a path-form subject, exactly
+        // as a `didweb`-configured deployment would have persisted before #1159.
+        let path_form_entry = RefreshTokenEntry {
+            client_id: "client-1".to_owned(),
+            username: "did:web:accounts.example:users:alice".to_owned(),
+            scopes: vec!["openid".to_owned()],
+            resource: None,
+            expires_at_unix: chrono::Utc::now().timestamp() + 3600,
+            verifying_key_bytes: None,
+            dpop_jkt: None,
+            client_assertion_jkt: None,
+            ucan_grant: None,
+        };
+        state
+            .put_refresh_token("legacy-refresh", &path_form_entry, 3600)
+            .await
+            .unwrap();
+        assert_eq!(store.put_count(), 1, "seeding writes one entry");
+
+        let params = TokenRequest {
+            grant_type: "refresh_token".to_owned(),
+            refresh_token: Some("legacy-refresh".to_owned()),
+            client_id: "client-1".to_owned(),
+            code: None,
+            redirect_uri: None,
+            code_verifier: None,
+            device_code: None,
+            assertion: None,
+            client_assertion: None,
+            client_assertion_type: None,
+            subject_token: None,
+            subject_token_type: None,
+            requested_token_type: None,
+            actor_token: None,
+            scope: None,
+            audience: None,
+        };
+        let resp = exchange_refresh_token(Arc::clone(&state), params, None, None, None).await;
+
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["error"].as_str(), Some("invalid_grant"));
+        assert!(v["error_description"].as_str().unwrap().contains("frozen"));
+
+        // No rotated refresh token was persisted (put_count still equals the
+        // single seed write), and the legacy token is gone (taken on refresh) —
+        // the chain is dead, not extended.
+        assert_eq!(
+            store.put_count(),
+            1,
+            "refresh must not persist a rotated refresh token for a path-form subject",
+        );
+        assert!(
+            state.get_refresh_token("legacy-refresh").await.unwrap().is_none(),
+            "the path-form refresh token must be consumed (taken), not left reusable",
+        );
+    }
+
+    #[tokio::test]
+    async fn pre_upgrade_path_form_ucan_refresh_is_consumed_not_reminted() {
+        let store = RecordingTokenStore::new();
+        let state = freeze_test_state(Arc::clone(&store)).await;
+        let path_form_entry = RefreshTokenEntry {
+            client_id: "ucan-grant:did:web:accounts.example:users:alice".to_owned(),
+            username: "did:web:accounts.example:users:alice".to_owned(),
+            scopes: vec!["urn:hyprstream:grant-type:ucan".to_owned()],
+            resource: None,
+            expires_at_unix: chrono::Utc::now().timestamp() + 3600,
+            verifying_key_bytes: None,
+            dpop_jkt: None,
+            client_assertion_jkt: None,
+            ucan_grant: Some(crate::services::oauth::state::UcanGrantRefresh {
+                grant_cbor_b64: "not-reached".to_owned(),
+                grant_cid: "not-reached".to_owned(),
+                requested_scope: Some("read:model:demo".to_owned()),
+                audience: None,
+            }),
+        };
+        state
+            .put_refresh_token("legacy-ucan-refresh", &path_form_entry, 3600)
+            .await
+            .unwrap();
+
+        let params = TokenRequest {
+            grant_type: "refresh_token".to_owned(),
+            refresh_token: Some("legacy-ucan-refresh".to_owned()),
+            client_id: path_form_entry.client_id.clone(),
+            code: None,
+            redirect_uri: None,
+            code_verifier: None,
+            device_code: None,
+            assertion: None,
+            client_assertion: None,
+            client_assertion_type: None,
+            subject_token: None,
+            subject_token_type: None,
+            requested_token_type: None,
+            actor_token: None,
+            scope: None,
+            audience: None,
+        };
+        let resp = exchange_refresh_token(state.clone(), params, None, None, None).await;
+
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["error"].as_str(), Some("invalid_grant"));
+        assert!(value["error_description"].as_str().unwrap().contains("frozen"));
+        assert_eq!(store.put_count(), 1, "UCAN refresh must not persist a replacement");
+        assert!(
+            state.get_refresh_token("legacy-ucan-refresh").await.unwrap().is_none(),
+            "the legacy UCAN refresh must be consumed, not left reusable",
+        );
     }
 }

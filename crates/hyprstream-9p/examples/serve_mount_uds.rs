@@ -44,5 +44,11 @@ async fn main() -> anyhow::Result<()> {
     let subject = Subject::new("tenant-a");
 
     eprintln!("serving 9P mount at {path}");
-    serve_mount_uds(mount, subject, &path).await
+    serve_mount_uds(
+        mount,
+        subject,
+        Arc::new(hyprstream_9p::DenyAllDecider),
+        &path,
+    )
+    .await
 }

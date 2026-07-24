@@ -12,6 +12,11 @@ use ed25519_dalek::{SigningKey, VerifyingKey};
 
 const NEW_EXPIRY_TTL: i64 = 30 * 86_400;
 const RENEW_THRESHOLD: i64 = 7 * 86_400;
+/// Audience accepted exclusively by PolicyService's service-key registration
+/// endpoint. Service WITs are not bearer access tokens and must not be
+/// accepted at arbitrary HTTP resources.
+pub const SERVICE_KEY_REGISTRATION_AUDIENCE: &str =
+    "hyprstream:policy:register-service-key";
 
 /// Load an existing service JWT from disk, or sign a new one if absent or
 /// within `RENEW_THRESHOLD` seconds of expiry.
@@ -34,7 +39,9 @@ pub fn issue_or_load_service_jwt(
             // Re-issue if near expiry OR if the persisted token has no `iss`
             // (older bootstraps minted empty-issuer service JWTs, which the
             // #328 gate rejects on the IPC/AnySigner plane — see below).
-            (exp - now) <= RENEW_THRESHOLD || decode_jwt_iss(jwt).is_none_or(|s| s.is_empty())
+            (exp - now) <= RENEW_THRESHOLD
+                || decode_jwt_iss(jwt).is_none_or(|s| s.is_empty())
+                || decode_jwt_aud(jwt).as_deref() != Some(SERVICE_KEY_REGISTRATION_AUDIENCE)
         }
     };
 
@@ -61,7 +68,8 @@ pub fn issue_or_load_service_jwt(
         now,
         expiry,
     )
-    .with_cnf_jwk(service_vk.as_bytes());
+    .with_cnf_jwk(service_vk.as_bytes())
+    .with_audience(Some(SERVICE_KEY_REGISTRATION_AUDIENCE.to_owned()));
     if !local_issuer_url.is_empty() {
         claims = claims.with_issuer(local_issuer_url.to_owned());
     }
@@ -87,6 +95,13 @@ fn decode_jwt_iss(jwt: &str) -> Option<String> {
     value.get("iss")?.as_str().map(ToOwned::to_owned)
 }
 
+fn decode_jwt_aud(jwt: &str) -> Option<String> {
+    let payload_b64 = jwt.split('.').nth(1)?;
+    let payload = URL_SAFE_NO_PAD.decode(payload_b64).ok()?;
+    let value: serde_json::Value = serde_json::from_slice(&payload).ok()?;
+    value.get("aud")?.as_str().map(ToOwned::to_owned)
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -110,6 +125,10 @@ mod tests {
         .unwrap();
 
         assert_eq!(decode_jwt_iss(&jwt).as_deref(), Some(issuer));
+        assert_eq!(
+            decode_jwt_aud(&jwt).as_deref(),
+            Some(SERVICE_KEY_REGISTRATION_AUDIENCE)
+        );
     }
 
     /// PolicyService gets a `service:policy` JWT just like every other service

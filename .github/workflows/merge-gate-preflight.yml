@@ -1,0 +1,122 @@
+name: Merge-gate preflight
+
+# An opt-in, full merge-gate-equivalent build for a PR before it enters the
+# required merge queue. It is intentionally separate from `rust.yml`: a normal
+# PR retains fast feedback, while a maintainer can request this expensive gate
+# from either Actions or the PR's `run-preflight` label.
+on:
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: Open PR number to validate
+        required: true
+        type: string
+  pull_request_target:
+    types: [labeled]
+
+permissions:
+  contents: read
+  pull-requests: read
+  id-token: write
+
+concurrency:
+  # A newer request for the same PR supersedes the older one; different PRs may
+  # use the two-worker preflight pool concurrently.
+  group: merge-gate-preflight-${{ github.event.pull_request.number || inputs.pr_number }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTC_WRAPPER: sccache
+  SCCACHE_BUCKET: ${{ vars.AWS_SCCACHE_BUCKET }}
+  SCCACHE_REGION: ${{ vars.AWS_SCCACHE_REGION }}
+  CARGO_INCREMENTAL: 0
+  BUILDER_IMAGE: ghcr.io/hyprstream/rust-builder-arm64@sha256:aa9feb1c8432ebf4583fcfc9c8236c371cb050f489c4d0882a7f2d8c8589120e
+
+jobs:
+  resolve-pr:
+    # A label is merely the PR-page control; only this exact label starts a run.
+    # `pull_request_target` executes this controller from the trusted base
+    # branch, then resolves an immutable current head SHA through the API.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'pull_request_target' && github.event.label.name == 'run-preflight')
+    runs-on: ubuntu-latest
+    outputs:
+      number: ${{ steps.pr.outputs.number }}
+      sha: ${{ steps.pr.outputs.sha }}
+      url: ${{ steps.pr.outputs.url }}
+    steps:
+    - id: pr
+      uses: actions/github-script@v7
+      with:
+        script: |
+          const number = Number(
+            context.eventName === 'pull_request_target'
+              ? context.payload.pull_request.number
+              : context.payload.inputs.pr_number
+          );
+          if (!Number.isSafeInteger(number) || number <= 0) {
+            core.setFailed('pr_number must be a positive PR number');
+            return;
+          }
+
+          const { data: pr } = await github.rest.pulls.get({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            pull_number: number,
+          });
+          if (pr.state !== 'open') {
+            core.setFailed(`PR #${number} is not open`);
+            return;
+          }
+          core.setOutput('number', String(number));
+          core.setOutput('sha', pr.head.sha);
+          core.setOutput('url', pr.html_url);
+
+  build:
+    name: Build + test (arm64 preflight)
+    needs: resolve-pr
+    runs-on: [self-hosted, linux, arm64, graviton, hyprstream-preflight]
+    # Keep below the 150-minute reaper cap. This is deliberately the same full
+    # validation script as the required merge-gate `build` job in rust.yml.
+    timeout-minutes: 140
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        ref: ${{ needs.resolve-pr.outputs.sha }}
+        persist-credentials: false
+
+    - name: Report validated revision
+      run: |
+        echo "Preflighting PR #${{ needs.resolve-pr.outputs.number }} at ${{ needs.resolve-pr.outputs.sha }}"
+        echo "${{ needs.resolve-pr.outputs.url }}"
+
+    - name: Configure AWS credentials (OIDC → sccache S3)
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        role-to-assume: ${{ vars.AWS_SCCACHE_ROLE_ARN }}
+        aws-region: ${{ vars.AWS_SCCACHE_REGION }}
+
+    - name: Pull builder image
+      run: podman pull "$BUILDER_IMAGE"
+
+    - name: Build + test (release, in rust-builder container)
+      run: |
+        podman run --rm \
+          -v "$PWD":/build:Z -w /build \
+          -e RUSTC_WRAPPER=sccache -e SCCACHE_BUCKET -e SCCACHE_REGION \
+          -e SCCACHE_IDLE_TIMEOUT=0 \
+          -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY -e AWS_SESSION_TOKEN \
+          -e AWS_REGION -e AWS_DEFAULT_REGION \
+          -e LIBTORCH=/opt/libtorch -e LD_LIBRARY_PATH=/opt/libtorch/lib \
+          -e LIBTORCH_BYPASS_VERSION_CHECK=1 -e OPENSSL_NO_VENDOR=1 \
+          -e CARGO_INCREMENTAL=0 -e CARGO_TERM_COLOR=always \
+          "$BUILDER_IMAGE" \
+          bash -euo pipefail -c '
+            useradd -m ci
+            chmod a+rx /root
+            chmod -R a+rwX /root/.cargo /root/.rustup
+            chown -R ci:ci /build
+            runuser -u ci -- bash -euo pipefail /build/.github/scripts/graviton-build-test.sh
+          '

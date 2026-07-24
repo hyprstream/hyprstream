@@ -18,6 +18,20 @@ use anyhow::{bail, Result};
 
 use hyprstream_rpc::identity::Did;
 
+/// Whether `did` is a path-form `did:web` identifier.
+///
+/// The atproto DID profile permits only host-form `did:web`; any additional
+/// colon in the method-specific identifier introduces a path segment. Encoded
+/// host ports (`%3A`) do not contain a literal colon and are deliberately not
+/// classified here — this helper answers only the path-form question.
+pub fn is_path_form_did_web(did: &str) -> bool {
+    let Some(method_id) = did.strip_prefix("did:web:") else {
+        return false;
+    };
+    let method_id = method_id.split(['?', '#']).next().unwrap_or(method_id);
+    method_id.contains(':')
+}
+
 /// A DID method our PDS accepts as a repo authority.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RepoAuthority {
@@ -53,6 +67,11 @@ impl RepoAuthority {
 pub fn accept_repo_authority(did: &str) -> Result<RepoAuthority> {
     let d = Did::new(did.to_owned());
     if d.is_did_web() {
+        if is_path_form_did_web(did) {
+            bail!(
+                "path-form did:web {did:?} is not an accepted repo authority; the atproto profile requires host-form did:web"
+            );
+        }
         Ok(RepoAuthority::Web)
     } else if did.starts_with("did:plc:") {
         Ok(RepoAuthority::Plc)
@@ -84,6 +103,16 @@ mod tests {
         let plc = accept_repo_authority("did:plc:abc123").unwrap();
         assert_eq!(plc, RepoAuthority::Plc);
         assert!(plc.is_publicly_publishable());
+    }
+
+    #[test]
+    fn rejects_path_form_did_web_repo_authority() {
+        assert!(is_path_form_did_web("did:web:accounts.example:users:alice"));
+        assert!(!is_path_form_did_web("did:web:alice.accounts.example"));
+        assert!(!is_path_form_did_web("did:web:localhost%3A6791"));
+
+        let err = accept_repo_authority("did:web:accounts.example:users:alice").unwrap_err();
+        assert!(err.to_string().contains("path-form did:web"));
     }
 
     #[test]

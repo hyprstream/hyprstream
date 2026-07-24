@@ -28,22 +28,6 @@ pub struct ServerConfig {
     /// Path to TLS private key file
     #[arg(long = "tls-key", env = "HYPRSTREAM_TLS_KEY")]
     pub tls_key: Option<PathBuf>,
-
-    /// Path to CA certificate for client authentication (enables mTLS)
-    #[arg(long = "tls-client-ca", env = "HYPRSTREAM_TLS_CLIENT_CA")]
-    pub tls_client_ca: Option<PathBuf>,
-
-    /// Minimum TLS version (1.2|1.3)
-    #[arg(long, env = "HYPRSTREAM_TLS_MIN_VERSION")]
-    pub tls_min_version: Option<String>,
-
-    /// Allowed TLS cipher suites
-    #[arg(long, env = "HYPRSTREAM_TLS_CIPHER_LIST")]
-    pub tls_cipher_list: Option<String>,
-
-    /// Prefer server cipher order
-    #[arg(long, env = "HYPRSTREAM_TLS_PREFER_SERVER_CIPHERS")]
-    pub tls_prefer_server_ciphers: Option<bool>,
 }
 
 impl Default for ServerConfig {
@@ -55,10 +39,6 @@ impl Default for ServerConfig {
             pid_file: None,
             tls_cert: None,
             tls_key: None,
-            tls_client_ca: None,
-            tls_min_version: Some("1.2".to_owned()),
-            tls_cipher_list: None,
-            tls_prefer_server_ciphers: Some(true),
         }
     }
 }
@@ -90,30 +70,6 @@ impl ConfigSection for ServerConfig {
             ConfigOptionDef::new("server.tls_key", "Path to TLS private key file")
                 .with_env("HYPRSTREAM_TLS_KEY")
                 .with_cli("tls-key"),
-            ConfigOptionDef::new(
-                "server.tls_client_ca",
-                "Path to CA certificate for client authentication (enables mTLS)",
-            )
-            .with_env("HYPRSTREAM_TLS_CLIENT_CA")
-            .with_cli("tls-client-ca"),
-            ConfigOptionDef::new(
-                "server.tls_min_version",
-                "Minimum TLS version (1.2|1.3)",
-            )
-            .with_env("HYPRSTREAM_TLS_MIN_VERSION")
-            .with_cli("tls-min-version"),
-            ConfigOptionDef::new(
-                "server.tls_cipher_list",
-                "Allowed TLS cipher suites",
-            )
-            .with_env("HYPRSTREAM_TLS_CIPHER_LIST")
-            .with_cli("tls-cipher-list"),
-            ConfigOptionDef::new(
-                "server.tls_prefer_server_ciphers",
-                "Prefer server cipher order",
-            )
-            .with_env("HYPRSTREAM_TLS_PREFER_SERVER_CIPHERS")
-            .with_cli("tls-prefer-server-ciphers"),
         ]
     }
 
@@ -129,10 +85,6 @@ impl ConfigSection for ServerConfig {
             pid_file: Option<String>,
             tls_cert: Option<PathBuf>,
             tls_key: Option<PathBuf>,
-            tls_client_ca: Option<PathBuf>,
-            tls_min_version: Option<String>,
-            tls_cipher_list: Option<String>,
-            tls_prefer_server_ciphers: Option<bool>,
         }
 
         let config = ServerConfigFile::deserialize(deserializer)?;
@@ -143,10 +95,6 @@ impl ConfigSection for ServerConfig {
             pid_file: config.pid_file,
             tls_cert: config.tls_cert,
             tls_key: config.tls_key,
-            tls_client_ca: config.tls_client_ca,
-            tls_min_version: config.tls_min_version.or(Some("1.2".to_owned())),
-            tls_cipher_list: config.tls_cipher_list,
-            tls_prefer_server_ciphers: config.tls_prefer_server_ciphers.or(Some(true)),
         })
     }
 }

@@ -22,6 +22,7 @@ use crate::services::generated::policy_client::{
 };
 use anyhow::{anyhow, Result};
 use git2db::{Git2DB, RepoId};
+use hyprstream_pds::repo_authority::is_path_form_did_web;
 use hyprstream_rpc::prelude::*;
 use hyprstream_rpc::transport::TransportConfig;
 use std::collections::HashMap;
@@ -332,6 +333,19 @@ impl PolicyHandler for PolicyService {
             // Use bare username from the envelope identity.
             ctx.user().to_owned()
         };
+
+        // #1159 freeze: this is the shared signing boundary for every caller
+        // using PolicyClient::issue_token, including RFC 8693 token exchange
+        // and RFC 7523 JWT bearer. Check the resolved concrete subject, not
+        // merely an optional request field, so an envelope-derived subject
+        // cannot bypass the freeze either.
+        if is_path_form_did_web(&subject) {
+            return Ok(PolicyResponseVariant::Error(ErrorInfo {
+                message: "path-form did:web account subjects are frozen; host-form account minting is not available yet (#1159)".to_owned(),
+                code: "FROZEN_PATH_FORM_SUBJECT".to_owned(),
+                details: String::new(),
+            }));
+        }
 
         // Validate TTL — service tokens get a longer default (7 days)
         let default_ttl = if is_service_token {
@@ -1325,10 +1339,12 @@ impl PolicyHandler for PolicyService {
         // Verify the caller is who they claim to be.
         // The service JWT must be signed by the CA (our jwt_signing_key) and
         // its subject must match "service:{serviceName}".
-        let claims = hyprstream_rpc::auth::jwt::decode_with_key(
+        let claims = hyprstream_rpc::auth::jwt::decode_with_key_expectation(
             &data.service_jwt,
             &self.jwt_signing_key.verifying_key(),
-            None,
+            hyprstream_rpc::auth::AudienceExpectation::Exact(
+                crate::auth::service_jwt::SERVICE_KEY_REGISTRATION_AUDIENCE,
+            ),
         ).map_err(|e| anyhow!("Invalid service JWT: {e}"))?;
 
         let expected_sub = format!("service:{}", data.service_name);
@@ -1345,10 +1361,15 @@ impl PolicyHandler for PolicyService {
         let vk = VerifyingKey::from_bytes(&vk_bytes)
             .map_err(|e| anyhow!("Invalid Ed25519 verifying key: {e}"))?;
 
-        if let Some(cnf_bytes) = claims.cnf_key_bytes() {
-            if cnf_bytes != vk_bytes {
-                anyhow::bail!("JWT cnf.jwk does not match provided verifying key");
-            }
+        if ctx.cnf != vk_bytes {
+            anyhow::bail!("request signer does not match provided verifying key");
+        }
+
+        let cnf_bytes = claims
+            .cnf_key_bytes()
+            .ok_or_else(|| anyhow!("service JWT missing required cnf.jwk"))?;
+        if cnf_bytes != vk_bytes {
+            anyhow::bail!("JWT cnf.jwk does not match provided verifying key");
         }
 
         // Store in trust store (key-centric: the key IS the identity)
@@ -1412,7 +1433,10 @@ impl PolicyHandler for PolicyService {
         let issuer = self.default_audience.clone().unwrap_or_default();
         let claims = hyprstream_rpc::auth::Claims::new(subject.clone(), now, expires_at)
             .with_issuer(issuer)
-            .with_cnf_jwk(vk.as_bytes());
+            .with_cnf_jwk(vk.as_bytes())
+            .with_audience(Some(
+                crate::auth::service_jwt::SERVICE_KEY_REGISTRATION_AUDIENCE.to_owned(),
+            ));
 
         let token = match self.sign_token(&claims, true).await {
             Ok(t) => t,
@@ -1454,6 +1478,17 @@ impl PolicyHandler for PolicyService {
                 }));
             }
         };
+
+        // ExchangeWit signs directly rather than through `handle_issue_token`.
+        // Keep its authenticated-envelope subject under the same account-DID
+        // freeze before it can reach the direct signing boundary.
+        if is_path_form_did_web(&sub) {
+            return Ok(PolicyResponseVariant::Error(ErrorInfo {
+                message: "path-form did:web account subjects are frozen; host-form account minting is not available yet (#1159)".to_owned(),
+                code: "FROZEN_PATH_FORM_SUBJECT".to_owned(),
+                details: String::new(),
+            }));
+        }
 
         // cnf.jwk from the verified WIT — carried through into the issued at+jwt.
         let cnf_key_bytes = ctx.claims().and_then(hyprstream_rpc::auth::Claims::cnf_key_bytes);
@@ -1652,5 +1687,196 @@ pub(crate) async fn watch_policy_file(
             Ok(()) => info!("Policy reloaded from disk"),
             Err(e) => warn!("Failed to reload policy: {}", e),
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    async fn test_service() -> (PolicyService, tempfile::TempDir) {
+        let root = tempfile::tempdir().expect("test: create policy git directory");
+        let manager = Arc::new(PolicyManager::permissive().await.expect("test: policy manager"));
+        let git2db = Arc::new(RwLock::new(
+            Git2DB::open(root.path()).await.expect("test: open policy git database"),
+        ));
+        let service = PolicyService::new(
+            manager,
+            Arc::new(SigningKey::from_bytes(&[0x51; 32])),
+            crate::config::TokenConfig::default(),
+            git2db,
+            TransportConfig::inproc("policy-path-form-subject-test"),
+        );
+        (service, root)
+    }
+
+    fn issue(subject: &str) -> IssueToken {
+        IssueToken {
+            requested_scopes: Some(vec!["read".to_owned()]),
+            ttl: Some(60),
+            audience: None,
+            subject: Some(subject.to_owned()),
+            user_pub_key: None,
+            dpop_jkt: None,
+            issuer: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn issue_token_rejects_path_form_subject_at_shared_signing_boundary() {
+        let (service, _root) = test_service().await;
+        let ctx = EnvelopeContext::from_callback_service(1, "test-caller");
+
+        let response = service
+            .handle_issue_token(&ctx, 1, &issue("did:web:accounts.example:users:alice"))
+            .await
+            .expect("path-form rejection is a policy response");
+
+        match response {
+            PolicyResponseVariant::Error(error) => {
+                assert_eq!(error.code, "FROZEN_PATH_FORM_SUBJECT");
+                assert!(error.message.contains("path-form did:web"));
+            }
+            other => panic!("path-form subject reached token signing: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn issue_token_path_form_guard_allows_legitimate_subject_families() {
+        let (service, _root) = test_service().await;
+        let ctx = EnvelopeContext::from_callback_service(1, "test-caller");
+
+        for subject in [
+            "alice",
+            "did:web:alice.example",
+            "did:web:localhost%3A6791",
+            "did:key:z6MkpTHR8VNsBxYAAHWutMGeQ4hz2FV6B14xd9CZpkmS5i5o",
+            "service:model",
+        ] {
+            let response = service.handle_issue_token(&ctx, 1, &issue(subject)).await;
+            assert!(
+                !matches!(
+                    response,
+                    Ok(PolicyResponseVariant::Error(ErrorInfo { ref code, .. }))
+                        if code == "FROZEN_PATH_FORM_SUBJECT"
+                ),
+                "legitimate subject {subject:?} was rejected by the path-form guard",
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn service_registration_auth_rpc_binds_outer_signer_and_inner_cnf() {
+        use hyprstream_service::{InprocManager, ServiceManager};
+
+        // Unit-test processes share first-write-wins envelope policy globals.
+        // Keep this generated-client/dispatcher regression compatible with the
+        // existing inproc suite; production still emits Hybrid envelopes, and
+        // the defect under test is that no EdDSA WIT is attached as the outer
+        // JWT where RequestService's production JWT gate would reject it.
+        let _ = hyprstream_rpc::envelope::install_verify_config(
+            hyprstream_rpc::envelope::EnvelopeVerifyConfig {
+                policy: hyprstream_rpc::crypto::CryptoPolicy::Classical,
+                pq_store: None,
+            },
+        );
+        let _ = hyprstream_rpc::envelope::install_response_verify_config(
+            hyprstream_rpc::envelope::ResponseVerifyConfig {
+                policy: hyprstream_rpc::crypto::CryptoPolicy::Classical,
+                pq_store: None,
+            },
+        );
+
+        let root = tempfile::tempdir().expect("test: create policy git directory");
+        let manager =
+            Arc::new(PolicyManager::permissive().await.expect("test: policy manager"));
+        let git2db = Arc::new(RwLock::new(
+            Git2DB::open(root.path()).await.expect("test: open policy git database"),
+        ));
+        let policy_key = SigningKey::from_bytes(&[0x61; 32]);
+        let service_key = SigningKey::from_bytes(&[0x62; 32]);
+        let other_key = SigningKey::from_bytes(&[0x63; 32]);
+        let endpoint = "policy-service-registration-auth";
+        let service = PolicyService::new(
+            manager,
+            Arc::new(policy_key.clone()),
+            crate::config::TokenConfig::default(),
+            git2db,
+            TransportConfig::inproc(endpoint),
+        )
+        // If the WIT were still attached as the outer JWT, this generic
+        // audience would reject its registration-only audience pre-dispatch.
+        .with_default_audience("https://oauth.example".to_owned());
+
+        let inproc = InprocManager::new();
+        let mut handle = inproc
+            .spawn(Box::new(service))
+            .await
+            .expect("test: start PolicyService");
+        let client = crate::services::PolicyClient::for_local_endpoint_bootstrap(
+            &format!("inproc://{endpoint}"),
+            service_key.clone(),
+            policy_key.verifying_key(),
+            None,
+        )
+        .expect("test: build JWT-free registration client");
+
+        let now = chrono::Utc::now().timestamp();
+        let ca_jwt_key =
+            hyprstream_rpc::node_identity::derive_purpose_key(&policy_key, "hyprstream-jwt-v1");
+        let base_claims = |cnf: Option<&VerifyingKey>| {
+            let claims = hyprstream_rpc::auth::Claims::new(
+                "service:registration-auth-test".to_owned(),
+                now,
+                now + 300,
+            )
+            .with_issuer("https://oauth.example".to_owned())
+            .with_audience(Some(
+                crate::auth::service_jwt::SERVICE_KEY_REGISTRATION_AUDIENCE.to_owned(),
+            ));
+            match cnf {
+                Some(key) => claims.with_cnf_jwk(key.as_bytes()),
+                None => claims,
+            }
+        };
+        let request = |service_jwt: String| RegisterServiceKey {
+            service_name: "registration-auth-test".to_owned(),
+            verifying_key: service_key.verifying_key().to_bytes().to_vec(),
+            service_jwt,
+        };
+
+        let equal = hyprstream_rpc::auth::encode_service_jwt(
+            &base_claims(Some(&service_key.verifying_key())),
+            &ca_jwt_key,
+        );
+        client
+            .register_service_key(&request(equal))
+            .await
+            .expect("present and equal cnf.jwk must register through real RPC dispatch");
+
+        let missing =
+            hyprstream_rpc::auth::encode_service_jwt(&base_claims(None), &ca_jwt_key);
+        let missing_error = client
+            .register_service_key(&request(missing))
+            .await
+            .expect_err("missing cnf.jwk must reject");
+        assert!(missing_error.to_string().contains("missing required cnf.jwk"));
+
+        let mismatched = hyprstream_rpc::auth::encode_service_jwt(
+            &base_claims(Some(&other_key.verifying_key())),
+            &ca_jwt_key,
+        );
+        let mismatch_error = client
+            .register_service_key(&request(mismatched))
+            .await
+            .expect_err("mismatched cnf.jwk must reject");
+        assert!(
+            mismatch_error
+                .to_string()
+                .contains("cnf.jwk does not match provided verifying key")
+        );
+
+        let _ = handle.stop().await;
     }
 }

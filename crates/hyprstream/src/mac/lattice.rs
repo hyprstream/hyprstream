@@ -46,10 +46,11 @@ pub use hyprstream_rpc::auth::mac::{
 
 /// IFC convenience: join a slice of input labels into the derived label (design
 /// §3 — sealed at rollup). Thin forwarder over S1's intrinsic
-/// [`SecurityLabel::join_all`]; an empty input yields the lattice bottom ⊥ (the
-/// join identity), which the seal/rollup policy (S2) must treat as suspicious. This
-/// is the function S6/seal-time labeling calls; it lives here so PDP callers have a
-/// single entry-point without reaching across crates.
+/// [`SecurityLabel::join_all`]. Non-empty joins use the per-axis algebraic identity
+/// `(Public, PqHybrid, {})`; empty input instead yields the fail-closed
+/// `(Public, Unverified, {})`, which the seal/rollup policy (S2) must treat as
+/// suspicious. This is the function S6/seal-time labeling calls; it lives here so
+/// PDP callers have a single entry-point without reaching across crates.
 #[inline]
 #[must_use]
 pub fn ifc_join(inputs: &[SecurityLabel]) -> SecurityLabel {
@@ -83,7 +84,11 @@ mod tests {
             )
             .unwrap();
         let needs_pii = l
-            .label(Level::Confidential, Assurance::Classical, [Compartment::new("pii")])
+            .label(
+                Level::Confidential,
+                Assurance::Classical,
+                [Compartment::new("pii")],
+            )
             .unwrap();
         // dominates on every axis (level ≥, assurance ≥, compartments ⊇).
         assert!(cleared.can_access(&needs_pii));
@@ -91,21 +96,37 @@ mod tests {
     }
 
     #[test]
-    fn ifc_join_raises_to_lub() {
+    fn ifc_join_combines_blp_confidentiality_and_biba_integrity() {
         let l = lattice();
         let secret = l
-            .label(Level::Secret, Assurance::PqHybrid, [Compartment::new("pii")])
+            .label(
+                Level::Secret,
+                Assurance::PqHybrid,
+                [Compartment::new("pii")],
+            )
             .unwrap();
-        let public = l
-            .label(Level::Public, Assurance::Classical, [])
-            .unwrap();
+        let public = l.label(Level::Public, Assurance::Classical, []).unwrap();
         let derived = ifc_join(&[secret, public]);
-        assert_eq!(derived.level, Level::Secret);
-        assert_eq!(derived.assurance, Assurance::PqHybrid);
-        assert!(derived.can_access(&secret));
-        assert!(derived.can_access(&public));
-        // empty input folds to the join identity ⊥.
-        assert!(ifc_join(&[]).is_bottom());
+
+        // Confidentiality and compartments take their upper bounds.
+        assert!(derived.level >= secret.level && derived.level >= public.level);
+        assert!(secret.compartments.is_subset(derived.compartments));
+        assert!(public.compartments.is_subset(derived.compartments));
+        // Biba provenance integrity takes the floor (weakest input).
+        assert!(derived.assurance <= secret.assurance);
+        assert!(derived.assurance <= public.assurance);
+        assert_eq!(derived.assurance, Assurance::Classical);
+
+        // The algebraic identity is (Public, PqHybrid, {}), but an empty input
+        // is deliberately fail-closed rather than returning that identity.
+        let algebraic_identity =
+            SecurityLabel::new(Level::Public, Assurance::PqHybrid, CompartmentSet::EMPTY);
+        assert_eq!(ifc_join(&[algebraic_identity, secret]), secret);
+        let empty = ifc_join(&[]);
+        assert_eq!(empty.level, Level::Public);
+        assert_eq!(empty.assurance, Assurance::Unverified);
+        assert!(empty.compartments.is_empty());
+        assert_ne!(empty, algebraic_identity);
     }
 
     #[test]
@@ -116,7 +137,11 @@ mod tests {
         let restored = Lattice::from_bytes(&l.to_bytes()).unwrap();
         assert_eq!(restored.compartment_names(), l.compartment_names());
         let label = l
-            .label(Level::Internal, Assurance::Classical, [Compartment::new("tenant:acme")])
+            .label(
+                Level::Internal,
+                Assurance::Classical,
+                [Compartment::new("tenant:acme")],
+            )
             .unwrap();
         assert!(restored.validate(&label).is_ok());
         assert_eq!(restored.bit_of(&Compartment::new("tenant:acme")), Some(2));

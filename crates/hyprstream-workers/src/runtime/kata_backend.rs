@@ -73,7 +73,10 @@ fn rootless_kata_runtime_dir(
     let base = match xdg_runtime_dir.map(str::trim).filter(|s| !s.is_empty()) {
         Some(xdg) => PathBuf::from(xdg).join("kata"),
         None => {
-            let tmp = tmpdir.map(str::trim).filter(|s| !s.is_empty()).unwrap_or("/tmp");
+            let tmp = tmpdir
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .unwrap_or("/tmp");
             PathBuf::from(tmp).join(format!("kata-{euid}"))
         }
     };
@@ -164,8 +167,14 @@ impl std::fmt::Debug for KataHandle {
         f.debug_struct("KataHandle")
             .field("api_socket", &self.api_socket)
             .field("virtiofs_socket", &self.virtiofs_socket)
-            .field("vfs_socket", &self.vfs_server.as_ref().map(SandboxFsServer::socket_path))
-            .field("vfs_9p_socket", &self.vfs_9p.as_ref().map(Vfs9pVsockServer::socket_path))
+            .field(
+                "vfs_socket",
+                &self.vfs_server.as_ref().map(SandboxFsServer::socket_path),
+            )
+            .field(
+                "vfs_9p_socket",
+                &self.vfs_9p.as_ref().map(Vfs9pVsockServer::socket_path),
+            )
             .field("rootfs_mount_tag", &self.rootfs_mount_tag())
             .finish_non_exhaustive()
     }
@@ -260,13 +269,19 @@ impl std::fmt::Debug for Vfs9pVsockServer {
 pub struct KataBackend {
     image_config: ImageConfig,
     rafs_store: Arc<RafsStore>,
+    ninep_decider: Arc<dyn hyprstream_9p::AccessDecider>,
 }
 
 impl KataBackend {
-    pub fn new(image_config: ImageConfig, rafs_store: Arc<RafsStore>) -> Self {
+    pub fn new(
+        image_config: ImageConfig,
+        rafs_store: Arc<RafsStore>,
+        ninep_decider: Arc<dyn hyprstream_9p::AccessDecider>,
+    ) -> Self {
         Self {
             image_config,
             rafs_store,
+            ninep_decider,
         }
     }
 
@@ -283,14 +298,12 @@ impl KataBackend {
 
         config.path = if pool_config.hypervisor_path.as_os_str().is_empty() {
             match pool_config.hypervisor {
-                HypervisorType::CloudHypervisor => {
-                    which::which("cloud-hypervisor")
-                        .map(|p| p.to_string_lossy().to_string())
-                        .unwrap_or_else(|e| {
-                            tracing::warn!("Failed to find cloud-hypervisor in PATH: {}", e);
-                            "cloud-hypervisor".to_owned()
-                        })
-                }
+                HypervisorType::CloudHypervisor => which::which("cloud-hypervisor")
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_else(|e| {
+                        tracing::warn!("Failed to find cloud-hypervisor in PATH: {}", e);
+                        "cloud-hypervisor".to_owned()
+                    }),
                 #[cfg(feature = "dragonball")]
                 HypervisorType::Dragonball => String::new(),
             }
@@ -518,20 +531,26 @@ impl KataBackend {
         let meta_data_path = sandbox_runtime_dir.join("meta-data");
         tokio::fs::write(&meta_data_path, meta_data).await?;
 
-        let iso_path_str = iso_path
-            .to_str()
-            .ok_or_else(|| WorkerError::CloudInitFailed("ISO path contains invalid UTF-8".into()))?;
-        let user_data_str = user_data_path
-            .to_str()
-            .ok_or_else(|| WorkerError::CloudInitFailed("User data path contains invalid UTF-8".into()))?;
-        let meta_data_str = meta_data_path
-            .to_str()
-            .ok_or_else(|| WorkerError::CloudInitFailed("Meta data path contains invalid UTF-8".into()))?;
+        let iso_path_str = iso_path.to_str().ok_or_else(|| {
+            WorkerError::CloudInitFailed("ISO path contains invalid UTF-8".into())
+        })?;
+        let user_data_str = user_data_path.to_str().ok_or_else(|| {
+            WorkerError::CloudInitFailed("User data path contains invalid UTF-8".into())
+        })?;
+        let meta_data_str = meta_data_path.to_str().ok_or_else(|| {
+            WorkerError::CloudInitFailed("Meta data path contains invalid UTF-8".into())
+        })?;
 
         let status = tokio::process::Command::new("genisoimage")
             .args([
-                "-output", iso_path_str, "-volid", "cidata", "-joliet", "-rock",
-                user_data_str, meta_data_str,
+                "-output",
+                iso_path_str,
+                "-volid",
+                "cidata",
+                "-joliet",
+                "-rock",
+                user_data_str,
+                meta_data_str,
             ])
             .status()
             .await
@@ -686,7 +705,15 @@ impl SandboxBackend for KataBackend {
         // boots from is unaffected).
         let mut vfs_9p: Option<Vfs9pVsockServer> = None;
         if let Some((tenant_mount, subject)) = tenant_vfs {
-            match Self::serve_tenant_vfs_9p(&hypervisor, &sandbox.id, tenant_mount, subject).await {
+            match Self::serve_tenant_vfs_9p(
+                &hypervisor,
+                &sandbox.id,
+                tenant_mount,
+                subject,
+                Arc::clone(&self.ninep_decider),
+            )
+            .await
+            {
                 Ok(server) => vfs_9p = Some(server),
                 Err(e) => tracing::warn!(
                     sandbox_id = %sandbox.id,
@@ -827,7 +854,10 @@ impl SandboxBackend for KataBackend {
         use super::backend::{NamespaceDelivery, NamespaceTransport};
 
         let (socket_path, mount_tag) = match transport {
-            NamespaceTransport::VirtioFs { socket_path, mount_tag } => (socket_path, mount_tag),
+            NamespaceTransport::VirtioFs {
+                socket_path,
+                mount_tag,
+            } => (socket_path, mount_tag),
             other => {
                 return Err(WorkerError::Unsupported(format!(
                     "kata backend only supports the VirtioFs namespace transport, got {other:?}"
@@ -844,7 +874,9 @@ impl SandboxBackend for KataBackend {
         let socket_for_serve = socket_path.clone();
         let server = tokio::task::spawn_blocking(move || sandbox_fs.serve_on(socket_for_serve, rt))
             .await
-            .map_err(|e| WorkerError::SandboxCreationFailed(format!("VFS serve task join: {e}")))??;
+            .map_err(|e| {
+                WorkerError::SandboxCreationFailed(format!("VFS serve task join: {e}"))
+            })??;
 
         // Hot-attach when a hypervisor handle already exists for this sandbox
         // (VM already prepared/running). If the sandbox hasn't started yet,
@@ -853,8 +885,13 @@ impl SandboxBackend for KataBackend {
         // own compose-then-attach ordering).
         if let Some(handle) = sandbox.backend_handle.as_ref() {
             if let Some(kata) = handle.as_any().downcast_ref::<KataHandle>() {
-                Self::attach_share_fs(&kata.hypervisor, &sandbox.id, server.socket_path(), &mount_tag)
-                    .await?;
+                Self::attach_share_fs(
+                    &kata.hypervisor,
+                    &sandbox.id,
+                    server.socket_path(),
+                    &mount_tag,
+                )
+                .await?;
                 // #742: record the delivered share's tag as the container
                 // rootfs tag on the (already-`Arc`-shared) `KataHandle` via
                 // interior mutability. The delivered namespace is the fully
@@ -951,11 +988,17 @@ impl SandboxBackend for KataBackend {
                     // concurrent exec on another task may already have swapped
                     // in a fresh client, and clearing that one would discard a
                     // good connection.
-                    if guard.as_ref().map(|c| Arc::ptr_eq(c, &client)).unwrap_or(false) {
+                    if guard
+                        .as_ref()
+                        .map(|c| Arc::ptr_eq(c, &client))
+                        .unwrap_or(false)
+                    {
                         *guard = None;
                     }
                 }
-                Err(WorkerError::ExecFailed(format!("kata-agent exec failed: {e:#}")))
+                Err(WorkerError::ExecFailed(format!(
+                    "kata-agent exec failed: {e:#}"
+                )))
             }
         }
     }
@@ -979,9 +1022,12 @@ impl SandboxBackend for KataBackend {
         let handle = sandbox.backend_handle.as_ref().ok_or_else(|| {
             WorkerError::Internal("update_resources: sandbox has no backend handle".into())
         })?;
-        let kata = handle.as_any().downcast_ref::<KataHandle>().ok_or_else(|| {
-            WorkerError::Internal("update_resources: backend handle is not a KataHandle".into())
-        })?;
+        let kata = handle
+            .as_any()
+            .downcast_ref::<KataHandle>()
+            .ok_or_else(|| {
+                WorkerError::Internal("update_resources: backend handle is not a KataHandle".into())
+            })?;
 
         let client = self.guest_agent_client(kata).await?;
         let container_id = sandbox.id.clone();
@@ -1149,12 +1195,13 @@ impl KataBackend {
             .get_agent_socket()
             .await
             .map_err(|e| WorkerError::ExecFailed(format!("get_agent_socket failed: {e}")))?;
-        let address = AgentAddress::parse(&address)
-            .map_err(|e| WorkerError::ExecFailed(format!("unparseable agent socket address: {e}")))?;
+        let address = AgentAddress::parse(&address).map_err(|e| {
+            WorkerError::ExecFailed(format!("unparseable agent socket address: {e}"))
+        })?;
 
-        let client = KataAgentClient::connect(&address)
-            .await
-            .map_err(|e| WorkerError::ExecFailed(format!("failed to connect to kata-agent: {e:#}")))?;
+        let client = KataAgentClient::connect(&address).await.map_err(|e| {
+            WorkerError::ExecFailed(format!("failed to connect to kata-agent: {e:#}"))
+        })?;
         let client = Arc::new(client);
         *guard = Some(Arc::clone(&client));
         Ok(client)
@@ -1177,6 +1224,7 @@ impl KataBackend {
         sandbox_id: &str,
         mount: Arc<dyn Mount>,
         subject: Subject,
+        decider: Arc<dyn hyprstream_9p::AccessDecider>,
     ) -> Result<Vfs9pVsockServer> {
         // The CH hybrid-vsock base UDS (`hvsock://<base>`), same source the
         // kata-agent client uses — keeps CH/Dragonball working without a branch.
@@ -1226,8 +1274,13 @@ impl KataBackend {
         // initiated, CH-multiplexer) direction; using it here would consume the
         // guest's first 9P `Tversion` bytes and break the handshake.
         let task = tokio::spawn(async move {
-            if let Err(e) =
-                hyprstream_9p::serve_mount_vsock_raw(mount, subject, &sock_for_task).await
+            if let Err(e) = hyprstream_9p::serve_mount_vsock_raw(
+                mount,
+                subject,
+                decider,
+                &sock_for_task,
+            )
+            .await
             {
                 tracing::warn!(
                     sandbox_id = %sandbox_id,
@@ -1279,6 +1332,7 @@ inventory::submit! {
             Ok(Arc::new(KataBackend::new(
                 ctx.image_config.clone(),
                 Arc::clone(&ctx.rafs_store),
+                Arc::clone(&ctx.ninep_decider),
             )) as Arc<dyn crate::runtime::SandboxBackend>)
         },
     }
@@ -1291,7 +1345,21 @@ mod tests {
     use crate::config::{ImageConfig, PoolConfig};
     use crate::error::WorkerError;
     use crate::image::RafsStore;
+    use hyprstream_rpc::auth::mac::{ObjectRef, SecurityContext};
     use tempfile::TempDir;
+
+    struct FixtureAccessDecider;
+
+    impl hyprstream_9p::AccessDecider for FixtureAccessDecider {
+        fn check(
+            &self,
+            _ctx: &SecurityContext,
+            _object: ObjectRef<'_>,
+            _action: hyprstream_9p::Action,
+        ) -> bool {
+            true
+        }
+    }
 
     #[test]
     fn vfs_9p_vsock_port_distinct_from_agent() {
@@ -1341,7 +1409,11 @@ mod tests {
         std::fs::create_dir_all(&image_config.cache_dir).unwrap();
 
         let rafs_store = Arc::new(RafsStore::new(image_config.clone()).unwrap());
-        let backend = KataBackend::new(image_config, Arc::clone(&rafs_store));
+        let backend = KataBackend::new(
+            image_config,
+            Arc::clone(&rafs_store),
+            Arc::new(FixtureAccessDecider),
+        );
         (backend, rafs_store, temp_dir)
     }
 
@@ -1458,7 +1530,11 @@ mod tests {
             .expect("deliver_namespace should serve the namespace");
 
         match result {
-            NamespaceDelivery::VirtioFs { socket_path: served, mount_tag, guard } => {
+            NamespaceDelivery::VirtioFs {
+                socket_path: served,
+                mount_tag,
+                guard,
+            } => {
                 assert_eq!(served, socket_path);
                 assert_eq!(mount_tag, "hyprstream-vfs");
                 assert!(guard.is_some(), "kata should return a serving-thread guard");
@@ -1493,7 +1569,10 @@ mod tests {
 
         // Re-delivery re-roots the container: last write wins.
         handle.record_rootfs_mount_tag("re-delivered-tag".to_owned());
-        assert_eq!(handle.rootfs_mount_tag().as_deref(), Some("re-delivered-tag"));
+        assert_eq!(
+            handle.rootfs_mount_tag().as_deref(),
+            Some("re-delivered-tag")
+        );
     }
 
     #[tokio::test]
@@ -1544,7 +1623,10 @@ mod tests {
             .exec_sync(&sandbox, &["echo".into(), "hello".into()], 1)
             .await;
 
-        assert!(result.is_err(), "exec against an unprepared VM must fail, not hang");
+        assert!(
+            result.is_err(),
+            "exec against an unprepared VM must fail, not hang"
+        );
     }
 
     #[tokio::test]
@@ -1589,7 +1671,10 @@ mod tests {
             backend.exec_sync(&sandbox, &["echo".into(), "hi".into()], 1),
         )
         .await;
-        assert!(result.is_ok(), "exec_sync against a dead cached client must not hang");
+        assert!(
+            result.is_ok(),
+            "exec_sync against a dead cached client must not hang"
+        );
         assert!(
             result.unwrap().is_err(),
             "exec against a dead cached client must fail, not silently succeed"
@@ -1602,7 +1687,6 @@ mod tests {
             "cached dead agent client must be cleared on exec failure"
         );
     }
-
 
     #[test]
     fn test_is_available() {
@@ -1828,7 +1912,10 @@ mod tests {
 
         // virtiofs socket should be cleared on reset (the composed VFS server
         // is not reused; a recycled sandbox composes a fresh one on next start).
-        assert!(kata.virtiofs_socket.is_none(), "virtiofs_socket should be cleared");
+        assert!(
+            kata.virtiofs_socket.is_none(),
+            "virtiofs_socket should be cleared"
+        );
 
         // api_socket should be preserved
         assert_eq!(kata.api_socket, sandbox_path.join("test.sock"));
@@ -1842,8 +1929,14 @@ mod tests {
     fn test_debug_impl() {
         let (backend, _, _temp) = create_test_backend();
         let debug = format!("{backend:?}");
-        assert!(debug.contains("KataBackend"), "debug should contain struct name");
-        assert!(debug.contains("image_config"), "debug should contain image_config field");
+        assert!(
+            debug.contains("KataBackend"),
+            "debug should contain struct name"
+        );
+        assert!(
+            debug.contains("image_config"),
+            "debug should contain image_config field"
+        );
     }
 
     // ─────────────────────────────────────────────────────────────────────
@@ -1905,7 +1998,9 @@ mod tests {
         mem_data.limit = 4000;
         let mut mem_stats = agent::MemoryStats::new();
         mem_stats.usage = protobuf::MessageField::some(mem_data);
-        mem_stats.stats.insert("total_inactive_file".to_owned(), 200);
+        mem_stats
+            .stats
+            .insert("total_inactive_file".to_owned(), 200);
         mem_stats.stats.insert("total_rss".to_owned(), 700);
         mem_stats.stats.insert("total_pgfault".to_owned(), 42);
         mem_stats.stats.insert("total_pgmajfault".to_owned(), 7);

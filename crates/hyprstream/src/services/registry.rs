@@ -169,6 +169,29 @@ fn now_epoch_secs() -> u64 {
         .as_secs()
 }
 
+/// Collapse a policy decision transport failure to denial.
+///
+/// Authorization is a security expectation: an unavailable policy service
+/// cannot be interpreted as an affirmative grant.
+fn policy_result_or_deny<
+    E: std::fmt::Display,
+    S: std::fmt::Display,
+    R: std::fmt::Display,
+>(
+    result: std::result::Result<bool, E>,
+    subject: S,
+    resource: R,
+    operation: &str,
+) -> bool {
+    result.unwrap_or_else(|error| {
+        warn!(
+            "Policy check RPC error: sub={} obj={} act={} err={} - denying access",
+            subject, resource, operation, error
+        );
+        false
+    })
+}
+
 /// Build a Qid from filesystem metadata.
 ///
 /// Advisory identity hint only — see the qid-soundness invariant on
@@ -444,6 +467,16 @@ impl RegistryService {
     /// the repo's `ai.hyprstream.model` record through it.
     pub fn with_pds_publisher(mut self, publisher: crate::services::discovery::PdsPublisher) -> Self {
         self.pds_publisher = Some(Arc::new(publisher));
+        self
+    }
+
+    /// Like [`Self::with_pds_publisher`] but takes an already-`Arc`'d publisher,
+    /// so the caller can retain a weak clone for the ES256 promotion hook (#918).
+    pub fn with_pds_publisher_arc(
+        mut self,
+        publisher: Arc<crate::services::discovery::PdsPublisher>,
+    ) -> Self {
+        self.pds_publisher = Some(publisher);
         self
     }
 
@@ -1712,15 +1745,19 @@ impl RegistryHandler for RegistryService {
         // Pass the operation string as-is to the policy check rather than
         // round-tripping through Operation enum (which maps "query" → "query.status").
         let subject = ctx.subject();
-        let allowed = self.policy_client.check(&PolicyCheck {
-            subject: subject.to_string(),
-            domain: "*".to_owned(),
-            resource: resource.to_owned(),
-            operation: operation.to_owned(),
-        }).await.unwrap_or_else(|e| {
-            warn!("Policy check RPC error: sub={} obj={} act={} err={} - denying access", subject, resource, operation, e);
-            false
-        });
+        let allowed = policy_result_or_deny(
+            self.policy_client
+                .check(&PolicyCheck {
+                    subject: subject.to_string(),
+                    domain: "*".to_owned(),
+                    resource: resource.to_owned(),
+                    operation: operation.to_owned(),
+                })
+                .await,
+            &subject,
+            resource,
+            operation,
+        );
         if allowed {
             Ok(())
         } else {
@@ -1743,10 +1780,19 @@ impl RegistryHandler for RegistryService {
 
             // Policy gate: only include repos the caller has at least query access to
             let resource = format!("model:{}", name);
-            let permitted = self.policy_client
-                .check(&PolicyCheck { subject: subject.clone(), domain: "*".to_owned(), resource: resource.clone(), operation: "query".to_owned() })
-                .await
-                .unwrap_or(true); // default allow if policy service unavailable
+            let permitted = policy_result_or_deny(
+                self.policy_client
+                    .check(&PolicyCheck {
+                        subject: subject.clone(),
+                        domain: "*".to_owned(),
+                        resource: resource.clone(),
+                        operation: "query".to_owned(),
+                    })
+                    .await,
+                &subject,
+                &resource,
+                "query",
+            );
             if !permitted { continue; }
 
             // Collect worktrees with capabilities (holds registry read lock internally)
@@ -3430,6 +3476,17 @@ mod tests {
     use hyprstream_service::ServiceManager;
     use tempfile::TempDir;
 
+    #[test]
+    fn policy_rpc_failure_denies_repository_listing() {
+        let allowed = policy_result_or_deny(
+            Err(anyhow::anyhow!("policy service unavailable")),
+            "alice",
+            "model:private-repo",
+            "query",
+        );
+        assert!(!allowed, "policy transport failure must not disclose a repository");
+    }
+
     struct At9pTestSigner {
         ed: ed25519_dalek::SigningKey,
         pq: hyprstream_rpc::crypto::pq::MlDsaSigningKey,
@@ -3559,9 +3616,20 @@ mod tests {
             Arc::clone(&store), &root.path().join("alarm"), key.clone(),
             ed25519_dalek::SigningKey::from_bytes(&[81u8; 32]),
             hyprstream_rpc::crypto::pq::ml_dsa_sk_from_seed(&[82u8; 32])).unwrap();
-        let publisher = crate::services::discovery::PdsPublisher::new(Arc::clone(&store),
-            "did:key:test".to_owned(), p256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng))
-            .with_at9p_state_ingest(ingest);
+        let publisher = {
+            use crate::auth::key_rotation::{Es256KeySlot, Es256KeySlots, Es256SigningKeyStore};
+            let store_for_pub = Arc::new(Es256SigningKeyStore::new(Es256KeySlots {
+                drain: None,
+                active: Some(Es256KeySlot::new(
+                    p256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng),
+                    0, i64::MAX,
+                )),
+                lead: None,
+            }));
+            crate::services::discovery::PdsPublisher::new(Arc::clone(&store),
+                "did:key:test".to_owned(), store_for_pub)
+                .with_at9p_state_ingest(ingest)
+        };
         let registry = RegistryService::new(&models, policy_client,
             TransportConfig::inproc("at9p-registry"), key.clone()).await.unwrap()
             .with_pds_publisher(publisher);

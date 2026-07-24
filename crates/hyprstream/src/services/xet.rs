@@ -13,22 +13,21 @@
 //! | `POST /v1/xorbs/{key}`               | 501         | xorb→`putBlob(grantRepo)` mapping unresolved |
 //! | `POST /v1/shards`                    | 501         | shard ingest is follow-up |
 //!
-//! # Architecture (mirrors `OAIService`)
+//! # Architecture
 //!
-//! A dual-stack service: an HTTP data plane (this file's axum `Router`) plus an
-//! RPC control channel (health/shutdown) registered via `Spawnable`. It is a
-//! **thin translator** over the authenticated core — it dials the `registry`
+//! An HTTP data plane (this file's axum `Router`) implemented as a **thin
+//! translator** over the authenticated core — it dials the `registry`
 //! service (reusing the authenticated `putBlob`/`getBlob` RPCs) and holds no
 //! standing CAS *write* authority of its own. Reads for `/get_xorb` go through
 //! the Subject-threaded CAS mount, not a bare store read.
 //!
 //! # Auth
 //!
-//! Every route is behind [`xet_auth_middleware`], which requires a valid
-//! `Authorization: Bearer <jwt>` verified with the cluster JWT key
-//! (`ctx.jwt_verifying_key()`) — the same Ed25519 verification path the OAI
-//! service uses. The mapped identity (`sub`) is attached as
-//! [`AuthenticatedUser`] for downstream authorization.
+//! Every data route uses the same shared resource authentication and rate-limit
+//! middleware as OAI: DPoP sender binding/replay protection, federated issuer
+//! resolution, rotation and composite keys, JTI revocation, strict audience
+//! validation, and per-subject quotas. The mapped identity (`sub`) is attached
+//! as [`AuthenticatedUser`] for downstream authorization.
 //!
 //! ## Known provenance gap (foundation-level)
 //!
@@ -48,16 +47,17 @@
 //! [`BootstrapCasAuthorizer`].
 
 use crate::config::{TlsConfig, XetConfig};
-use crate::server::AuthenticatedUser;
+use crate::server::state::ResourceAuthState;
 use crate::server::tls::{resolve_rustls_config, serve_app};
+use crate::server::{AuthenticatedUser, middleware as server_middleware};
 use crate::services::RegistryClient;
 use crate::storage::cas::{BootstrapCasAuthorizer, CasMount, CasSubstrate, DedupDomain};
 use anyhow::Result;
 use axum::{
-    Router,
-    extract::{Path, Request, State},
+    Json, Router,
+    extract::{Path, State},
     http::{HeaderMap, StatusCode, header},
-    middleware::{self, Next},
+    middleware,
     response::{IntoResponse, Response},
     routing::{get, post},
 };
@@ -89,37 +89,24 @@ pub struct XetState {
     /// implemented (the read/auth surface is exercisable without a live registry).
     #[allow(dead_code)]
     pub registry: Option<RegistryClient>,
-    /// Cluster JWT verifying key (Ed25519) — same key path the OAI face uses.
-    pub jwt_verifying_key: VerifyingKey,
-    /// Expected JWT audience (this server's resource URL).
-    pub audience: String,
+    /// Shared OAI-equivalent authentication and rate-limit state.
+    pub auth: ResourceAuthState,
 }
 
-/// XetService — HF-XET CAS HTTP face with an RPC control channel.
+/// XetService — HF-XET CAS HTTP face.
 pub struct XetService {
     config: XetConfig,
     tls_config: TlsConfig,
     state: XetState,
-    control_transport: TransportConfig,
-    #[allow(dead_code)]
-    verifying_key: VerifyingKey,
 }
 
 impl XetService {
     /// Create a new XetService.
-    pub fn new(
-        config: XetConfig,
-        tls_config: TlsConfig,
-        state: XetState,
-        control_transport: TransportConfig,
-        verifying_key: VerifyingKey,
-    ) -> Self {
+    pub fn new(config: XetConfig, tls_config: TlsConfig, state: XetState) -> Self {
         Self {
             config,
             tls_config,
             state,
-            control_transport,
-            verifying_key,
         }
     }
 
@@ -135,7 +122,7 @@ impl XetService {
 /// Build the HF-XET CAS wire router. Route paths are the exact compatibility
 /// contract with xet-core's `cas_client` — do not rename them.
 pub fn create_xet_router(state: XetState) -> Router {
-    Router::new()
+    let protected_routes = Router::new()
         // IMPLEMENTED: raw xorb bytes, Range-aware.
         .route("/get_xorb/:hash/", get(get_xorb_handler))
         // 501 stubs (see module docs for the interop gap each carries).
@@ -143,63 +130,36 @@ pub fn create_xet_router(state: XetState) -> Router {
         .route("/v1/chunks/:key", get(chunks_stub))
         .route("/v1/xorbs/:key", post(upload_xorb_stub))
         .route("/v1/shards", post(upload_shard_stub))
-        // Auth applies to every route above.
+        // Rate limiting is inner, so it sees the identity inserted by auth.
         .layer(middleware::from_fn_with_state(
-            state.clone(),
-            xet_auth_middleware,
+            state.auth.clone(),
+            server_middleware::rate_limit_middleware,
         ))
+        .layer(middleware::from_fn_with_state(
+            state.auth.clone(),
+            server_middleware::auth_middleware,
+        ));
+
+    Router::new()
+        .route(
+            "/.well-known/oauth-protected-resource",
+            get(xet_protected_resource_metadata),
+        )
+        .merge(protected_routes)
         .with_state(state)
 }
 
-/// JWT auth middleware: require `Authorization: Bearer <jwt>`, verify it with the
-/// cluster JWT key (same verification the OAI face performs), and attach the
-/// mapped identity for downstream authorization. Rejects unauthenticated
-/// requests with 401 (fail-closed).
-async fn xet_auth_middleware(
+/// RFC 9728 metadata is Xet's public discovery surface. HTTP faces cannot be
+/// represented by the RPC endpoint registry, whose socket kinds are RPC-only.
+async fn xet_protected_resource_metadata(
     State(state): State<XetState>,
-    mut request: Request,
-    next: Next,
-) -> Response {
-    let token = match bearer_token(request.headers()) {
-        Some(t) => t,
-        None => return unauthorized("missing bearer token"),
-    };
-
-    // Verify with the cluster JWT key, binding the audience to this resource.
-    match crate::auth::jwt::decode(&token, &state.jwt_verifying_key, Some(&state.audience)) {
-        Ok(claims) => {
-            request.extensions_mut().insert(AuthenticatedUser {
-                user: claims.sub,
-                token: Some(token),
-                exp: Some(claims.exp),
-            });
-            next.run(request).await
-        }
-        Err(e) => {
-            warn!(error = %e, "xet auth: JWT validation failed");
-            unauthorized("invalid token")
-        }
-    }
-}
-
-/// Extract a bearer token from the `Authorization` header (RFC 6750).
-fn bearer_token(headers: &HeaderMap) -> Option<String> {
-    let h = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
-    if h.len() > 7 && h[..7].eq_ignore_ascii_case("bearer ") {
-        Some(h[7..].trim().to_owned())
-    } else {
-        None
-    }
-}
-
-/// Standard 401 with `WWW-Authenticate: Bearer`.
-fn unauthorized(detail: &str) -> Response {
-    (
-        StatusCode::UNAUTHORIZED,
-        [(header::WWW_AUTHENTICATE, "Bearer")],
-        detail.to_owned(),
-    )
-        .into_response()
+) -> Json<crate::services::oauth::ProtectedResourceMetadata> {
+    let mut metadata = crate::services::oauth::protected_resource_metadata(
+        &state.auth.resource_url,
+        &state.auth.oauth_issuer_url,
+    );
+    metadata.resource_name = Some("HyprStream HuggingFace-XET CAS API".to_owned());
+    Json(metadata)
 }
 
 /// `GET /get_xorb/{hash}/` — serve the raw bytes of a single xorb, honoring a
@@ -334,12 +294,10 @@ fn parse_range(header_val: Option<&axum::http::HeaderValue>, len: u64) -> RangeO
         },
         // closed: "S-E"
         (s, e) => match (s.parse::<u64>(), e.parse::<u64>()) {
-            (Ok(start), Ok(end)) if start <= end && start <= last => {
-                RangeOutcome::Partial {
-                    start,
-                    end: end.min(last),
-                }
-            }
+            (Ok(start), Ok(end)) if start <= end && start <= last => RangeOutcome::Partial {
+                start,
+                end: end.min(last),
+            },
             (Ok(_), Ok(_)) => RangeOutcome::Unsatisfiable,
             _ => RangeOutcome::Full,
         },
@@ -394,11 +352,7 @@ async fn upload_shard_stub() -> Response {
 
 /// Uniform 501 with a `TODO(#654)`-tagged reason.
 fn not_implemented(reason: &str) -> Response {
-    (
-        StatusCode::NOT_IMPLEMENTED,
-        format!("TODO(#654): {reason}"),
-    )
-        .into_response()
+    (StatusCode::NOT_IMPLEMENTED, format!("TODO(#654): {reason}")).into_response()
 }
 
 impl Spawnable for XetService {
@@ -407,7 +361,9 @@ impl Spawnable for XetService {
     }
 
     fn registrations(&self) -> Vec<(SocketKind, TransportConfig)> {
-        vec![(SocketKind::Rep, self.control_transport.clone())]
+        // Xet has no RequestService implementation or RPC control handler. An
+        // advertised Rep endpoint would therefore be an unservable liveness lie.
+        Vec::new()
     }
 
     fn run(
@@ -436,7 +392,21 @@ impl Spawnable for XetService {
             let scheme = if rustls_config.is_some() { "https" } else { "http" };
             let app = create_xet_router(self.state.clone());
 
-            info!("HF-XET CAS API available at {scheme}://{addr} (get_xorb implemented; other routes 501, see #654)");
+            let audience = &self.state.auth.resource_url;
+            let issuer = &self.state.auth.oauth_issuer_url;
+            if !audience.starts_with(&format!("{scheme}://")) {
+                warn!(
+                    effective_audience = %audience,
+                    served_scheme = scheme,
+                    "Xet JWT audience scheme differs from the HTTP transport; tokens must use the logged effective audience"
+                );
+            }
+
+            info!(
+                effective_audience = %audience,
+                oauth_issuer = %issuer,
+                "HF-XET CAS API available at {scheme}://{addr} (get_xorb implemented; other routes 501, see #654)"
+            );
 
             if let Some(tx) = on_ready {
                 let _ = tx.send(());
@@ -454,32 +424,128 @@ mod tests {
     use super::*;
     use axum::body::Body;
     use axum::http::Request as HttpRequest;
+    use hyprstream_rpc::auth::{
+        CompositeKeyPair, CompositeKeySet, CompositePairRole, CompositePairState,
+        InMemoryJtiBlocklist, JtiBlocklist as _,
+    };
+    use std::collections::HashMap;
     use tower::ServiceExt; // oneshot
+
+    const AUDIENCE: &str = "http://localhost:6792";
+    const ISSUER: &str = "http://localhost:6791";
+
+    // A valid 64-hex (sha256-shaped) content address the store's hash parser accepts.
+    const HASH: &str = "aa00bb11cc22dd33ee44ff5566778899aabbccddeeff00112233445566778899";
+
+    struct TestIssuer {
+        ml_dsa: hyprstream_rpc::crypto::pq::MlDsaSigningKey,
+        ed25519: ed25519_dalek::SigningKey,
+        key_set: Arc<CompositeKeySet>,
+    }
+
+    impl TestIssuer {
+        fn new() -> Self {
+            let (ml_dsa, ml_dsa_vk) = hyprstream_rpc::crypto::pq::ml_dsa_generate_keypair();
+            let ed25519 = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+            let kid = crate::auth::jwt::composite_kid(&ml_dsa_vk, &ed25519.verifying_key());
+            let pair = CompositeKeyPair::verifying(
+                kid,
+                ml_dsa_vk,
+                ed25519.verifying_key(),
+                CompositePairRole::OAuth,
+                CompositePairState::Active,
+                0,
+                i64::MAX,
+            );
+            let key_set = Arc::new(CompositeKeySet::default());
+            key_set
+                .publish(1, "xet-test-keys".to_owned(), vec![pair])
+                .unwrap();
+            Self {
+                ml_dsa,
+                ed25519,
+                key_set,
+            }
+        }
+
+        fn token(&self, audience: &str, jti: &str) -> String {
+            let now = chrono::Utc::now().timestamp();
+            let mut claims = crate::auth::jwt::Claims::new("alice".to_owned(), now, now + 3600)
+                .with_issuer(ISSUER.to_owned())
+                .with_audience(Some(audience.to_owned()));
+            claims.jti = Some(jti.to_owned());
+            crate::auth::jwt::encode_composite_ml_dsa_65_ed25519(
+                &claims,
+                &self.ml_dsa,
+                &self.ed25519,
+            )
+        }
+    }
+
+    /// Build an XetState over a temp CasStore holding one xorb.
+    fn test_state_with_xorb(dir: &std::path::Path, hash: &str, bytes: &[u8]) -> XetState {
+        std::fs::create_dir_all(dir.join("xorbs")).unwrap();
+        std::fs::write(dir.join("xorbs").join(format!("default.{hash}")), bytes).unwrap();
+
+        let (_sk, vk) = hyprstream_rpc::crypto::generate_signing_keypair();
+        let trusted_issuers = HashMap::new();
+        let federation_resolver =
+            Arc::new(crate::auth::FederationKeyResolver::new(&trusted_issuers));
+
+        XetState {
+            store: CasSubstrate::new(dir),
+            // Write path is 501; no live registry needed to exercise reads/auth.
+            registry: None,
+            auth: ResourceAuthState::new(
+                vk,
+                AUDIENCE.to_owned(),
+                ISSUER.to_owned(),
+                federation_resolver,
+                Arc::new(InMemoryJtiBlocklist::new()),
+            ),
+        }
+    }
+
+    fn with_test_issuer(mut state: XetState, issuer: &TestIssuer) -> XetState {
+        state.auth.composite_key_set = Arc::clone(&issuer.key_set);
+        state
+    }
+
+    fn authorized_request(uri: &str, token: &str) -> HttpRequest<Body> {
+        HttpRequest::builder()
+            .uri(uri)
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap()
+    }
 
     #[test]
     fn test_service_name() {
         assert_eq!(SERVICE_NAME, "xet");
     }
 
-    /// Build an XetState over a temp CasStore holding one xorb, plus a random
-    /// (never-signed-for) JWT key so auth rejects everything unauthenticated.
-    fn test_state_with_xorb(dir: &std::path::Path, hash: &str, bytes: &[u8]) -> XetState {
-        std::fs::create_dir_all(dir.join("xorbs")).unwrap();
-        std::fs::write(dir.join("xorbs").join(format!("default.{hash}")), bytes).unwrap();
-
-        let (_sk, vk) = hyprstream_rpc::crypto::generate_signing_keypair();
-
-        XetState {
-            store: CasSubstrate::new(dir),
-            // Write path is 501; no live registry needed to exercise reads/auth.
-            registry: None,
-            jwt_verifying_key: vk,
-            audience: "http://localhost:6792".to_owned(),
-        }
+    #[test]
+    fn does_not_advertise_an_unserved_rpc_endpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state_with_xorb(dir.path(), HASH, b"x");
+        let service = XetService::new(XetConfig::default(), TlsConfig::default(), state);
+        assert!(service.registrations().is_empty());
     }
 
-    // A valid 64-hex (sha256-shaped) content address the store's hash parser accepts.
-    const HASH: &str = "aa00bb11cc22dd33ee44ff5566778899aabbccddeeff00112233445566778899";
+    #[test]
+    fn config_has_no_second_enable_switch() {
+        let serialized = serde_json::to_value(XetConfig::default()).unwrap();
+        assert!(serialized.get("enabled").is_none());
+    }
+
+    #[test]
+    fn configured_external_url_is_the_effective_audience() {
+        let config = XetConfig {
+            external_url: Some("https://xet.example.test/cas".to_owned()),
+            ..XetConfig::default()
+        };
+        assert_eq!(config.resource_url(), "https://xet.example.test/cas");
+    }
 
     #[tokio::test]
     async fn get_xorb_happy_path_returns_bytes() {
@@ -550,6 +616,105 @@ mod tests {
             .unwrap();
 
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            resp.headers()
+                .get(header::WWW_AUTHENTICATE)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            format!("Bearer resource_metadata=\"{AUDIENCE}/.well-known/oauth-protected-resource\"")
+        );
+    }
+
+    #[tokio::test]
+    async fn wrong_audience_token_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let issuer = TestIssuer::new();
+        let state = with_test_issuer(test_state_with_xorb(dir.path(), HASH, b"x"), &issuer);
+        let token = issuer.token("https://wrong.example/resource", "wrong-aud");
+
+        let resp = create_xet_router(state)
+            .oneshot(authorized_request(&format!("/get_xorb/{HASH}/"), &token))
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn revoked_jti_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let issuer = TestIssuer::new();
+        let state = with_test_issuer(test_state_with_xorb(dir.path(), HASH, b"x"), &issuer);
+        state.auth.jti_blocklist.revoke(
+            "revoked-xet".to_owned(),
+            chrono::Utc::now().timestamp() + 3600,
+        );
+        let token = issuer.token(AUDIENCE, "revoked-xet");
+
+        let resp = create_xet_router(state)
+            .oneshot(authorized_request(&format!("/get_xorb/{HASH}/"), &token))
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn shared_subject_rate_limit_is_enforced() {
+        let dir = tempfile::tempdir().unwrap();
+        let issuer = TestIssuer::new();
+        let mut state = with_test_issuer(test_state_with_xorb(dir.path(), HASH, b"x"), &issuer);
+        state.auth.rate_limiter = Arc::new(server_middleware::RateLimiter::new(1, 60));
+        let app = create_xet_router(state);
+
+        let first = app
+            .clone()
+            .oneshot(authorized_request(
+                &format!("/v1/reconstructions/{HASH}"),
+                &issuer.token(AUDIENCE, "rate-1"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::NOT_IMPLEMENTED);
+
+        let second = app
+            .oneshot(authorized_request(
+                &format!("/v1/reconstructions/{HASH}"),
+                &issuer.token(AUDIENCE, "rate-2"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[tokio::test]
+    async fn protected_resource_metadata_is_public_and_xet_specific() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state_with_xorb(dir.path(), HASH, b"x");
+
+        let resp = create_xet_router(state)
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/.well-known/oauth-protected-resource")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let metadata: crate::services::oauth::ProtectedResourceMetadata =
+            serde_json::from_slice(&body).unwrap();
+        assert_eq!(metadata.resource, AUDIENCE);
+        assert_eq!(metadata.authorization_servers, vec![ISSUER]);
+        assert_eq!(
+            metadata.resource_name.as_deref(),
+            Some("HyprStream HuggingFace-XET CAS API")
+        );
     }
 
     #[tokio::test]

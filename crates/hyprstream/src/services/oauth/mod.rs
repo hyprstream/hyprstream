@@ -652,6 +652,20 @@ impl Spawnable for OAuthService {
                             composite_ca_key: Arc::new(key.clone()),
                         },
                     );
+                    // C4 (#1170): publish the head verifying key and write the
+                    // initial sealed op-log head so the registry's
+                    // `PdsPublisher` (this process under inproc, or a separate
+                    // process under `--ipc`) can resolve the active `#atproto`
+                    // generation before the first rotation tick. Dedicated head
+                    // key + shared state dir; async because the ES256 store is a
+                    // tokio RwLock (F1). The rotation task re-seals after every
+                    // promotion. C2 (#1168) seam — see `auth::op_log`.
+                    if let Err(e) =
+                        crate::auth::op_log::advance_sealed_head(&secrets_dir, &es256_store)
+                            .await
+                    {
+                        tracing::error!("failed to seal initial op-log head: {e}");
+                    }
                     info!("JWT signing key rotation task started (active_days={}, lead_days={}, drain_days={})",
                         self.config.jwt_key_active_days,
                         self.config.jwt_key_lead_days,

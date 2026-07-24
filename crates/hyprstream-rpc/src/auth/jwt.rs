@@ -10,12 +10,12 @@
 //! - Payload: Claims (sub, exp, iat)
 //! - Signature: Ed25519 over `base64url(header).base64url(payload)`
 
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::Utc;
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use thiserror::Error;
 
-use super::Claims;
+use super::{Claims, IdTokenClaims};
 
 /// The two exact access-token type forms resource servers must accept under
 /// RFC 9068 section 4. Matching is intentionally case- and whitespace-sensitive.
@@ -109,7 +109,7 @@ impl<'de> serde::Deserialize<'de> for ProtectedHeader {
                             return Err(A::Error::unknown_field(
                                 &key,
                                 &["alg", "typ", "kid", "crit"],
-                            ))
+                            ));
                         }
                     }
                 }
@@ -257,6 +257,45 @@ pub fn header_kid(token: &str) -> Result<Option<String>, JwtError> {
     Ok(header.get("kid").and_then(|v| v.as_str()).map(String::from))
 }
 
+/// The audience constraint applied while verifying a JWT.
+///
+/// A verifier must make its audience posture explicit. In particular, an
+/// absent configuration is not equivalent to an unchecked audience: legacy
+/// `Option<&str>` inputs are converted to [`Self::Missing`] and rejected.
+/// Callers that intentionally verify a token whose audience belongs to a
+/// different protocol (for example, an OIDC ID token) must state that choice
+/// with [`Self::ExplicitlyUnchecked`] and a reviewable reason.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AudienceExpectation<'a> {
+    /// Require an exact audience match (trailing slashes are normalized where
+    /// the JWT profile historically permits it).
+    Exact(&'a str),
+    /// Deliberately bypass audience verification for a protocol-specific
+    /// reason. This variant is intentionally noisy in call sites.
+    ExplicitlyUnchecked { reason: &'static str },
+    /// Require an exact audience when present, but permit an absent claim for
+    /// a documented federated protocol exception.
+    ///
+    /// This is never the default for an exact expectation. Callers must name
+    /// the compatibility reason at the verification boundary.
+    ExactOrMissing {
+        expected: &'a str,
+        reason: &'static str,
+    },
+    /// No expected audience was configured. Verification rejects this state.
+    ///
+    /// This exists solely so pre-existing `Option<&str>` callers fail closed
+    /// during migration; new callers should use [`Self::Exact`] or
+    /// [`Self::ExplicitlyUnchecked`].
+    Missing,
+}
+
+impl<'a> From<Option<&'a str>> for AudienceExpectation<'a> {
+    fn from(expected: Option<&'a str>) -> Self {
+        expected.map_or(Self::Missing, Self::Exact)
+    }
+}
+
 /// Errors from JWT operations
 #[derive(Error, Debug)]
 pub enum JwtError {
@@ -283,6 +322,12 @@ pub enum JwtError {
 
     #[error("Invalid audience")]
     InvalidAudience,
+
+    #[error("Invalid issuer")]
+    InvalidIssuer,
+
+    #[error("Expected audience is not configured")]
+    MissingExpectedAudience,
 
     #[error("Unsupported algorithm: {0}")]
     UnsupportedAlgorithm(String),
@@ -363,38 +408,138 @@ pub fn encode_id_token(claims: &super::IdTokenClaims, signing_key: &SigningKey) 
 /// For tokens from foreign issuers (federation), use [`decode_with_key`]
 /// with the key obtained from `FederationKeyResolver::get_key`.
 ///
-/// Uses strict audience validation: if `expected_aud` is `Some`, the token
-/// must have a matching `aud` claim (absent `aud` is rejected).
+/// Uses strict audience validation: [`AudienceExpectation::Exact`] requires a
+/// matching `aud` claim, while an absent configuration is rejected.
 pub fn decode(
     token: &str,
     verifying_key: &VerifyingKey,
     expected_aud: Option<&str>,
+) -> Result<Claims, JwtError> {
+    decode_with_expectation(token, verifying_key, expected_aud.into())
+}
+
+/// Decode a JWT with an explicit audience-validation posture.
+///
+/// New verification code should prefer this function over the legacy
+/// compatibility entry point above.
+pub fn decode_with_expectation(
+    token: &str,
+    verifying_key: &VerifyingKey,
+    expected_aud: AudienceExpectation<'_>,
 ) -> Result<Claims, JwtError> {
     decode_inner(token, verifying_key, expected_aud, false)
 }
 
 /// Decode a JWT using a caller-supplied verifying key (for multi-issuer support).
 ///
-/// Uses lenient audience validation: if `expected_aud` is `Some`, a wrong `aud`
-/// is rejected but an absent `aud` is accepted. This allows federated tokens
-/// from issuers that don't set `aud` while still rejecting cross-node replay
-/// attacks from issuers that do.
+/// [`AudienceExpectation::Exact`] requires a present matching audience,
+/// including for federated issuers. A protocol that intentionally permits an
+/// absent claim must use [`AudienceExpectation::ExactOrMissing`].
 pub fn decode_with_key(
     token: &str,
     verifying_key: &VerifyingKey,
     expected_aud: Option<&str>,
 ) -> Result<Claims, JwtError> {
+    decode_with_key_expectation(token, verifying_key, expected_aud.into())
+}
+
+/// Decode a federated JWT with an explicit audience-validation posture.
+pub fn decode_with_key_expectation(
+    token: &str,
+    verifying_key: &VerifyingKey,
+    expected_aud: AudienceExpectation<'_>,
+) -> Result<Claims, JwtError> {
     decode_inner(token, verifying_key, expected_aud, true)
+}
+
+/// Try every supplied Ed25519 key for a JWT that has no `kid`.
+///
+/// Candidate verification is intentionally unavailable to named tokens: under
+/// invariant I2, a token declaring `kid=X` must be resolved and verified only
+/// with key X. Each kid-less candidate receives a complete verification,
+/// including the pinned `EdDSA` algorithm and all claim checks.
+pub fn decode_with_any_key(
+    token: &str,
+    candidates: &[VerifyingKey],
+    expected_aud: Option<&str>,
+) -> Result<Claims, JwtError> {
+    decode_with_any_key_inner(token, candidates, expected_aud, false)
+}
+
+/// Lenient-audience twin of [`decode_with_any_key`]. This remains restricted
+/// to kid-less JWTs; only the absent-audience behavior differs.
+pub fn decode_with_any_key_lenient(
+    token: &str,
+    candidates: &[VerifyingKey],
+    expected_aud: Option<&str>,
+) -> Result<Claims, JwtError> {
+    decode_with_any_key_inner(token, candidates, expected_aud, true)
+}
+
+fn decode_with_any_key_inner(
+    token: &str,
+    candidates: &[VerifyingKey],
+    expected_aud: Option<&str>,
+    lenient_aud: bool,
+) -> Result<Claims, JwtError> {
+    if header_kid(token)?.is_some() || candidates.is_empty() {
+        return Err(JwtError::InvalidSignature);
+    }
+
+    let mut last_err = JwtError::InvalidSignature;
+    for key in candidates {
+        match decode_inner(token, key, expected_aud.into(), lenient_aud) {
+            Ok(claims) => return Ok(claims),
+            Err(error) => {
+                #[cfg(not(target_arch = "wasm32"))]
+                tracing::debug!(%error, "kid-less JWT candidate did not verify");
+                last_err = error;
+            }
+        }
+    }
+    Err(last_err)
+}
+
+/// Verify a federation JWT without losing its JWKS `kid` binding.
+///
+/// A named token must have exactly one candidate carrying that name and is
+/// verified only with that key. A kid-less token may try every published
+/// Ed25519 candidate, each through full pinned-algorithm verification.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn decode_with_federation_candidates(
+    token: &str,
+    candidates: &[super::FederationKey],
+    expected_aud: Option<&str>,
+) -> Result<Claims, JwtError> {
+    match header_kid(token)? {
+        Some(kid) => {
+            let mut named = candidates
+                .iter()
+                .filter(|candidate| candidate.kid.as_deref() == Some(kid.as_str()));
+            let key = named.next().ok_or(JwtError::InvalidSignature)?;
+            if named.next().is_some() {
+                return Err(JwtError::InvalidSignature);
+            }
+            decode_with_key(token, &key.verifying_key, expected_aud)
+        }
+        None => {
+            let keys: Vec<VerifyingKey> = candidates
+                .iter()
+                .map(|candidate| candidate.verifying_key)
+                .collect();
+            decode_with_any_key_lenient(token, &keys, expected_aud)
+        }
+    }
 }
 
 /// Internal decode implementation shared by `decode` and `decode_with_key`.
 ///
-/// `lenient_aud`: when true, accepts tokens with no `aud` claim even when
-/// `expected_aud` is `Some`. Wrong `aud` is always rejected.
+/// `lenient_aud` is retained only for the explicit
+/// [`AudienceExpectation::ExactOrMissing`] posture.
 fn decode_inner(
     token: &str,
     verifying_key: &VerifyingKey,
-    expected_aud: Option<&str>,
+    expected_aud: AudienceExpectation<'_>,
     lenient_aud: bool,
 ) -> Result<Claims, JwtError> {
     // Split into parts
@@ -455,17 +600,39 @@ fn decode_inner(
         return Err(JwtError::NotYetValid);
     }
 
-    // Validate audience if expected (trailing-slash tolerant)
-    if let Some(expected) = expected_aud {
-        let expected_norm = expected.trim_end_matches('/');
-        match &claims.aud {
-            Some(aud) if aud.trim_end_matches('/') == expected_norm => {}
-            None if lenient_aud => {}
-            Some(_) | None => return Err(JwtError::InvalidAudience),
-        }
-    }
+    validate_audience(&claims, expected_aud, lenient_aud)?;
 
     Ok(claims)
+}
+
+fn validate_audience(
+    claims: &Claims,
+    expectation: AudienceExpectation<'_>,
+    lenient_absence: bool,
+) -> Result<(), JwtError> {
+    match expectation {
+        AudienceExpectation::Exact(expected) => {
+            let expected_norm = expected.trim_end_matches('/');
+            match &claims.aud {
+                Some(aud) if aud.trim_end_matches('/') == expected_norm => Ok(()),
+                Some(_) | None => Err(JwtError::InvalidAudience),
+            }
+        }
+        AudienceExpectation::ExactOrMissing { expected, reason } => {
+            debug_assert!(!reason.is_empty(), "missing-audience exception requires a reason");
+            let expected_norm = expected.trim_end_matches('/');
+            match &claims.aud {
+                Some(aud) if aud.trim_end_matches('/') == expected_norm => Ok(()),
+                None if lenient_absence => Ok(()),
+                Some(_) | None => Err(JwtError::InvalidAudience),
+            }
+        }
+        AudienceExpectation::ExplicitlyUnchecked { reason } => {
+            debug_assert!(!reason.is_empty(), "unchecked audience requires a reason");
+            Ok(())
+        }
+        AudienceExpectation::Missing => Err(JwtError::MissingExpectedAudience),
+    }
 }
 
 /// Decode a JWT without verifying the signature.
@@ -488,16 +655,117 @@ pub fn decode_unverified(token: &str) -> Result<Claims, JwtError> {
     serde_json::from_slice(&payload_bytes).map_err(|e| JwtError::InvalidJson(e.to_string()))
 }
 
+/// Decode OIDC ID-token claims without verifying the signature.
+///
+/// This is only for issuer/JWKS routing. Callers must subsequently use
+/// [`decode_id_token_with_key`] on the same token before trusting any claim.
+pub fn decode_id_token_unverified(token: &str) -> Result<IdTokenClaims, JwtError> {
+    let parts: Vec<&str> = token.split('.').collect();
+    if parts.len() != 3 {
+        return Err(JwtError::InvalidFormat);
+    }
+    let payload_bytes = URL_SAFE_NO_PAD
+        .decode(parts[1])
+        .map_err(|_| JwtError::InvalidBase64)?;
+    serde_json::from_slice(&payload_bytes).map_err(|e| JwtError::InvalidJson(e.to_string()))
+}
+
+/// Decode and verify an EdDSA OIDC ID token for one exact issuer and client.
+///
+/// OIDC ID-token audiences may be either a string or an array. The expected
+/// client must be present in `aud`; when the token names multiple audiences,
+/// `azp` is required and must equal that same client. A present `azp` is always
+/// checked, including on single-audience tokens, so a token issued to another
+/// authorized party cannot be replayed at this client.
+pub fn decode_id_token_with_key(
+    token: &str,
+    verifying_key: &VerifyingKey,
+    expected_issuer: &str,
+    expected_client_id: &str,
+) -> Result<IdTokenClaims, JwtError> {
+    if expected_issuer.is_empty() {
+        return Err(JwtError::MissingClaim("expected issuer".to_owned()));
+    }
+    if expected_client_id.is_empty() {
+        return Err(JwtError::MissingExpectedAudience);
+    }
+
+    let parts: Vec<&str> = token.split('.').collect();
+    if parts.len() != 3 {
+        return Err(JwtError::InvalidFormat);
+    }
+
+    let signing_input = format!("{}.{}", parts[0], parts[1]);
+    let signature_bytes = URL_SAFE_NO_PAD
+        .decode(parts[2])
+        .map_err(|_| JwtError::InvalidBase64)?;
+    let signature_bytes: [u8; 64] = signature_bytes
+        .try_into()
+        .map_err(|_| JwtError::InvalidSignature)?;
+    verifying_key
+        .verify(
+            signing_input.as_bytes(),
+            &Signature::from_bytes(&signature_bytes),
+        )
+        .map_err(|_| JwtError::InvalidSignature)?;
+
+    let header_bytes = URL_SAFE_NO_PAD
+        .decode(parts[0])
+        .map_err(|_| JwtError::InvalidBase64)?;
+    let header: serde_json::Value =
+        serde_json::from_slice(&header_bytes).map_err(|e| JwtError::InvalidJson(e.to_string()))?;
+    if header.get("alg").and_then(|value| value.as_str()) != Some("EdDSA") {
+        return Err(JwtError::InvalidSignature);
+    }
+
+    let payload_bytes = URL_SAFE_NO_PAD
+        .decode(parts[1])
+        .map_err(|_| JwtError::InvalidBase64)?;
+    let claims: IdTokenClaims =
+        serde_json::from_slice(&payload_bytes).map_err(|e| JwtError::InvalidJson(e.to_string()))?;
+
+    let now = Utc::now().timestamp();
+    if now > claims.exp + 5 {
+        return Err(JwtError::Expired);
+    }
+    if claims.iat > now + 60 {
+        return Err(JwtError::NotYetValid);
+    }
+    if claims.iss != expected_issuer {
+        return Err(JwtError::InvalidIssuer);
+    }
+
+    let audiences = claims.aud.as_slice();
+    if audiences.is_empty()
+        || !audiences
+            .iter()
+            .any(|audience| audience == expected_client_id)
+    {
+        return Err(JwtError::InvalidAudience);
+    }
+    if audiences.len() > 1 && claims.azp.is_none() {
+        return Err(JwtError::MissingClaim("azp".to_owned()));
+    }
+    if claims
+        .azp
+        .as_deref()
+        .is_some_and(|azp| azp != expected_client_id)
+    {
+        return Err(JwtError::InvalidAudience);
+    }
+
+    Ok(claims)
+}
+
 /// Decode and verify a JWT signed with ML-DSA-65 (`alg: "ML-DSA-65"`).
 ///
-/// Uses lenient audience validation (same as `decode_with_key`): if
-/// `expected_aud` is `Some`, a wrong `aud` is rejected but an absent
-/// `aud` is accepted.
-pub fn decode_ml_dsa_65(
+/// Uses the same audience posture as [`decode_with_key`].
+pub fn decode_ml_dsa_65<'a>(
     token: &str,
     vk: &crate::crypto::pq::MlDsaVerifyingKey,
-    expected_aud: Option<&str>,
+    expected_aud: impl Into<AudienceExpectation<'a>>,
 ) -> Result<Claims, JwtError> {
+    let expected_aud = expected_aud.into();
     let parts: Vec<&str> = token.split('.').collect();
     if parts.len() != 3 {
         return Err(JwtError::InvalidFormat);
@@ -540,13 +808,7 @@ pub fn decode_ml_dsa_65(
         return Err(JwtError::NotYetValid);
     }
 
-    if let Some(expected) = expected_aud {
-        match &claims.aud {
-            Some(aud) if aud == expected => {}
-            None => {} // lenient: absent aud accepted
-            Some(_) => return Err(JwtError::InvalidAudience), // wrong aud rejected
-        }
-    }
+    validate_audience(&claims, expected_aud, true)?;
 
     Ok(claims)
 }
@@ -555,13 +817,14 @@ pub fn decode_ml_dsa_65(
 ///
 /// Per draft-ietf-jose-pq-composite-sigs, the signature is
 /// `ml_dsa_sig (3309 bytes) ∥ ed25519_sig (64 bytes)`.
-pub fn decode_composite(
+pub fn decode_composite<'a>(
     token: &str,
     ml_dsa_vk: &crate::crypto::pq::MlDsaVerifyingKey,
     ed25519_vk: &VerifyingKey,
-    expected_aud: Option<&str>,
+    expected_aud: impl Into<AudienceExpectation<'a>>,
     dispatch: &CompositeJwtDispatch,
 ) -> Result<Claims, JwtError> {
+    let expected_aud = expected_aud.into();
     let header = &dispatch.header;
     if header.alg != "ML-DSA-65-Ed25519" {
         return Err(JwtError::UnsupportedAlgorithm(header.alg.clone()));
@@ -622,12 +885,7 @@ pub fn decode_composite(
         return Err(JwtError::NotYetValid);
     }
 
-    if let Some(expected) = expected_aud {
-        match claims.aud.as_deref() {
-            Some(aud) if aud.trim_end_matches('/') == expected.trim_end_matches('/') => {}
-            _ => return Err(JwtError::InvalidAudience),
-        }
-    }
+    validate_audience(&claims, expected_aud, false)?;
 
     Ok(claims)
 }
@@ -636,7 +894,7 @@ pub fn decode_composite(
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-    use crate::auth::Claims;
+    use crate::auth::{Claims, IssuerResolver, JwksFetcher, JwksKeySource, JwksMode, JwtKeySource};
     use ed25519_dalek::SigningKey;
 
     fn make_key(seed: u8) -> SigningKey {
@@ -687,7 +945,15 @@ mod tests {
         let dispatch = parse_composite_dispatch(&token, &["at+jwt"]).unwrap();
         let separately_valid = composite_token_with_keys("wit+jwt", &pq_sk, &pq, &ed_sk);
         assert!(matches!(
-            decode_composite(&separately_valid, &pq, &ed, None, &dispatch),
+            decode_composite(
+                &separately_valid,
+                &pq,
+                &ed,
+                AudienceExpectation::ExplicitlyUnchecked {
+                    reason: "the test exercises signature/header binding, not audience",
+                },
+                &dispatch,
+            ),
             Err(JwtError::InvalidSignature)
         ));
     }
@@ -710,7 +976,10 @@ mod tests {
             "JWT",
             "wit+jwt",
         ] {
-            assert!(!is_rfc9068_access_token_type(rejected), "accepted {rejected:?}");
+            assert!(
+                !is_rfc9068_access_token_type(rejected),
+                "accepted {rejected:?}"
+            );
         }
     }
 
@@ -727,18 +996,175 @@ mod tests {
         let token = encode(&claims, &key_a);
 
         // decode_with_key should accept the correct key
-        let decoded = decode_with_key(&token, &vk_a, None)
-            .expect("decode_with_key with correct key must succeed");
+        let decoded = decode_with_key_expectation(
+            &token,
+            &vk_a,
+            AudienceExpectation::ExplicitlyUnchecked {
+                reason: "the test exercises multi-issuer key selection, not audience",
+            },
+        )
+        .expect("decode_with_key with correct key must succeed");
         assert_eq!(decoded.iss, "https://node-a");
         assert_eq!(decoded.sub, "alice");
 
         // decode_with_key must reject the wrong key
         let vk_b = key_b.verifying_key();
-        let result = decode_with_key(&token, &vk_b, None);
+        let result = decode_with_key_expectation(
+            &token,
+            &vk_b,
+            AudienceExpectation::ExplicitlyUnchecked {
+                reason: "the test exercises wrong-key rejection, not audience",
+            },
+        );
         assert!(
             matches!(result, Err(JwtError::InvalidSignature)),
             "wrong key must yield InvalidSignature"
         );
+    }
+
+    /// I2b / #1234: every JWKS-derived lookup is issuer-scoped. In
+    /// particular, preloading issuer A must not make an issuer-B token signed
+    /// by A acceptable merely because both JWKS documents reuse a `kid`.
+    #[tokio::test]
+    async fn cross_issuer_shared_kid_rejects_issuer_a_signature() -> anyhow::Result<()> {
+        use std::sync::{
+            atomic::{AtomicU32, Ordering},
+            Arc,
+        };
+
+        const ISSUER_A: &str = "https://issuer-a.example";
+        const ISSUER_B: &str = "https://issuer-b.example";
+        const SHARED_KID: &str = "shared-kid";
+        const METADATA_KID: &str = "shared-metadata-kid";
+
+        struct TestResolver;
+
+        #[async_trait::async_trait]
+        impl IssuerResolver for TestResolver {
+            async fn resolve(&self, issuer: &str) -> anyhow::Result<String> {
+                Ok(format!("{issuer}/jwks"))
+            }
+        }
+
+        fn ed25519_jwk(signing_key: &SigningKey, kid: &str) -> serde_json::Value {
+            serde_json::json!({
+                "kty": "OKP",
+                "crv": "Ed25519",
+                "use": "sig",
+                "alg": "EdDSA",
+                "kid": kid,
+                "x": URL_SAFE_NO_PAD.encode(signing_key.verifying_key().as_bytes()),
+            })
+        }
+
+        let issuer_a_key = make_key(0xA1);
+        let issuer_b_key = make_key(0xB2);
+        let issuer_a_jwks = serde_json::json!({
+            "keys": [
+                ed25519_jwk(&issuer_a_key, SHARED_KID),
+                {
+                    "kty": "AKP",
+                    "use": "sig",
+                    "alg": "ML-DSA-65-Ed25519",
+                    "kid": METADATA_KID,
+                    "pub": URL_SAFE_NO_PAD.encode([0u8; 16]),
+                },
+            ]
+        });
+        let issuer_b_jwks = serde_json::json!({
+            "keys": [
+                ed25519_jwk(&issuer_b_key, SHARED_KID),
+                {
+                    "kty": "AKP",
+                    "use": "sig",
+                    "alg": "ML-DSA-65",
+                    "kid": METADATA_KID,
+                    "pub": URL_SAFE_NO_PAD.encode([1u8; 16]),
+                },
+            ]
+        });
+
+        let issuer_a_fetches = Arc::new(AtomicU32::new(0));
+        let issuer_b_fetches = Arc::new(AtomicU32::new(0));
+        let fetcher: JwksFetcher = {
+            let issuer_a_fetches = issuer_a_fetches.clone();
+            let issuer_b_fetches = issuer_b_fetches.clone();
+            Arc::new(move |url| {
+                let jwks = if url == format!("{ISSUER_A}/jwks") {
+                    issuer_a_fetches.fetch_add(1, Ordering::Relaxed);
+                    issuer_a_jwks.clone()
+                } else if url == format!("{ISSUER_B}/jwks") {
+                    issuer_b_fetches.fetch_add(1, Ordering::Relaxed);
+                    issuer_b_jwks.clone()
+                } else {
+                    return Box::pin(async move { anyhow::bail!("unexpected JWKS URL: {url}") });
+                };
+                Box::pin(async move { Ok(jwks) })
+            })
+        };
+
+        let key_source = JwksKeySource::new(
+            JwksMode::Federated {
+                local_jwks_url: "https://local.example/jwks".to_owned(),
+                resolver: Arc::new(TestResolver),
+            },
+            "https://local.example".to_owned(),
+            fetcher,
+        );
+
+        // Prime issuer A's positive cache under the deliberately shared kid.
+        let selected_a = key_source.get_key(ISSUER_A, Some(SHARED_KID)).await?;
+        assert_eq!(selected_a, issuer_a_key.verifying_key());
+
+        let claims = Claims::new("issuer-b-subject".to_owned(), 0, 9_999_999_999)
+            .with_issuer(ISSUER_B.to_owned())
+            .with_audience(Some("https://resource.example".to_owned()));
+        let header = format!(r#"{{"alg":"EdDSA","typ":"JWT","kid":"{SHARED_KID}"}}"#);
+        let forged = encode_with_header(&claims, &issuer_a_key, &header);
+
+        // Issuer B must resolve only B's key, so A's signature is rejected.
+        let selected_b = key_source.get_key(ISSUER_B, Some(SHARED_KID)).await?;
+        assert_eq!(selected_b, issuer_b_key.verifying_key());
+        assert!(matches!(
+            decode_with_key(
+                &forged,
+                &selected_b,
+                Some("https://resource.example"),
+            ),
+            Err(JwtError::InvalidSignature)
+        ));
+
+        // Kid-less candidates and kid→alg metadata are issuer-scoped too.
+        assert_eq!(
+            key_source.get_keys(ISSUER_B, None).await?,
+            vec![issuer_b_key.verifying_key()]
+        );
+        assert_eq!(
+            key_source.kid_algs(ISSUER_A, METADATA_KID),
+            vec!["ML-DSA-65-Ed25519".to_owned()]
+        );
+        assert_eq!(
+            key_source.kid_algs(ISSUER_B, METADATA_KID),
+            vec!["ML-DSA-65".to_owned()]
+        );
+
+        // A negative hit for issuer A must not suppress issuer B's fetch.
+        assert!(key_source
+            .get_key(ISSUER_A, Some("missing-kid"))
+            .await
+            .is_err());
+        assert!(key_source
+            .get_key(ISSUER_A, Some("missing-kid"))
+            .await
+            .is_err());
+        assert_eq!(issuer_a_fetches.load(Ordering::Relaxed), 2);
+        assert!(key_source
+            .get_key(ISSUER_B, Some("missing-kid"))
+            .await
+            .is_err());
+        assert_eq!(issuer_b_fetches.load(Ordering::Relaxed), 2);
+
+        Ok(())
     }
 
     #[test]
@@ -760,14 +1186,114 @@ mod tests {
     }
 
     #[test]
+    fn id_token_requires_configured_client_audience() {
+        let key = make_key(0x02);
+        let now = Utc::now().timestamp();
+        let claims = IdTokenClaims::new(
+            "https://issuer.example".to_owned(),
+            "alice".to_owned(),
+            "other-client".to_owned(),
+            now,
+            now + 300,
+        );
+        let token = encode_id_token(&claims, &key);
+
+        assert!(matches!(
+            decode_id_token_with_key(
+                &token,
+                &key.verifying_key(),
+                "https://issuer.example",
+                "hyprstream-client",
+            ),
+            Err(JwtError::InvalidAudience)
+        ));
+    }
+
+    #[test]
+    fn id_token_single_audience_accepts_only_matching_client() {
+        let key = make_key(0x03);
+        let now = Utc::now().timestamp();
+        let claims = IdTokenClaims::new(
+            "https://issuer.example".to_owned(),
+            "alice".to_owned(),
+            "hyprstream-client".to_owned(),
+            now,
+            now + 300,
+        );
+        let token = encode_id_token(&claims, &key);
+
+        let verified = decode_id_token_with_key(
+            &token,
+            &key.verifying_key(),
+            "https://issuer.example",
+            "hyprstream-client",
+        )
+        .unwrap();
+        assert_eq!(verified.sub, "alice");
+    }
+
+    #[test]
+    fn id_token_multi_audience_requires_matching_azp() {
+        let key = make_key(0x04);
+        let now = Utc::now().timestamp();
+        let mut claims = IdTokenClaims::new(
+            "https://issuer.example".to_owned(),
+            "alice".to_owned(),
+            "hyprstream-client".to_owned(),
+            now,
+            now + 300,
+        );
+        claims.aud = crate::auth::OneOrMany::from_vec(vec![
+            "hyprstream-client".to_owned(),
+            "other-client".to_owned(),
+        ]);
+
+        let missing_azp = encode_id_token(&claims, &key);
+        assert!(matches!(
+            decode_id_token_with_key(
+                &missing_azp,
+                &key.verifying_key(),
+                "https://issuer.example",
+                "hyprstream-client",
+            ),
+            Err(JwtError::MissingClaim(claim)) if claim == "azp"
+        ));
+
+        claims.azp = Some("other-client".to_owned());
+        let wrong_azp = encode_id_token(&claims, &key);
+        assert!(matches!(
+            decode_id_token_with_key(
+                &wrong_azp,
+                &key.verifying_key(),
+                "https://issuer.example",
+                "hyprstream-client",
+            ),
+            Err(JwtError::InvalidAudience)
+        ));
+
+        claims.azp = Some("hyprstream-client".to_owned());
+        let matching_azp = encode_id_token(&claims, &key);
+        decode_id_token_with_key(
+            &matching_azp,
+            &key.verifying_key(),
+            "https://issuer.example",
+            "hyprstream-client",
+        )
+        .unwrap();
+    }
+
+    #[test]
     fn test_decode_and_decode_with_key_are_equivalent() {
         let key = make_key(0x42);
         let vk = key.verifying_key();
         let claims = Claims::new("carol".to_owned(), 0, 9_999_999_999);
         let token = encode(&claims, &key);
 
-        let via_decode = decode(&token, &vk, None).unwrap();
-        let via_decode_with_key = decode_with_key(&token, &vk, None).unwrap();
+        let expectation = AudienceExpectation::ExplicitlyUnchecked {
+            reason: "the test compares decoder signature and lifetime behavior",
+        };
+        let via_decode = decode_with_expectation(&token, &vk, expectation).unwrap();
+        let via_decode_with_key = decode_with_key_expectation(&token, &vk, expectation).unwrap();
         assert_eq!(via_decode.sub, via_decode_with_key.sub);
         assert_eq!(via_decode.exp, via_decode_with_key.exp);
     }
@@ -780,7 +1306,11 @@ mod tests {
         let claims = Claims::new("dave".to_owned(), 0, 9_999_999_999);
         let token = encode(&claims, &key);
 
-        let result = decode(&token, &vk, Some("http://localhost:6789"));
+        let result = decode_with_expectation(
+            &token,
+            &vk,
+            AudienceExpectation::Exact("http://localhost:6789"),
+        );
         assert!(
             matches!(result, Err(JwtError::InvalidAudience)),
             "strict mode must reject absent aud"
@@ -788,17 +1318,19 @@ mod tests {
     }
 
     #[test]
-    fn test_decode_with_key_lenient_accepts_absent_audience() {
-        // Federated tokens (via decode_with_key) accept absent aud
+    fn exact_federated_audience_rejects_absent_claim() {
         let key = make_key(0x20);
         let vk = key.verifying_key();
         let claims = Claims::new("eve".to_owned(), 0, 9_999_999_999)
             .with_issuer("https://remote-node".to_owned());
         let token = encode(&claims, &key);
 
-        // Lenient mode: absent aud is accepted
-        decode_with_key(&token, &vk, Some("http://localhost:6789"))
-            .expect("lenient mode must accept absent aud");
+        let result = decode_with_key_expectation(
+            &token,
+            &vk,
+            AudienceExpectation::Exact("http://localhost:6789"),
+        );
+        assert!(matches!(result, Err(JwtError::InvalidAudience)));
     }
 
     #[test]
@@ -811,11 +1343,24 @@ mod tests {
             .with_audience(Some("https://node-b".to_owned()));
         let token = encode(&claims, &key);
 
-        let result = decode_with_key(&token, &vk, Some("https://node-c"));
+        let result = decode_with_key_expectation(
+            &token,
+            &vk,
+            AudienceExpectation::Exact("https://node-c"),
+        );
         assert!(
             matches!(result, Err(JwtError::InvalidAudience)),
             "lenient mode must reject wrong aud"
         );
+    }
+
+    #[test]
+    fn absent_expected_audience_fails_closed() {
+        let key = make_key(0x33);
+        let token = encode(&Claims::new("alice".to_owned(), 0, 9_999_999_999), &key);
+
+        let result = decode(&token, &key.verifying_key(), None);
+        assert!(matches!(result, Err(JwtError::MissingExpectedAudience)));
     }
 
     #[test]
@@ -879,5 +1424,106 @@ mod tests {
 
         let kid = header_kid(&token).unwrap();
         assert!(kid.is_none());
+    }
+
+    // #1184/I2 — candidate verification is permitted only when the JWT has no
+    // kid. Each candidate gets a complete EdDSA + claims verification.
+    #[test]
+    fn decode_with_any_key_accepts_kid_less_non_first_published_key() {
+        let key_a = make_key(0xA1);
+        let key_b = make_key(0xB2);
+        let claims = Claims::new("overlap-test".to_owned(), 0, 9_999_999_999)
+            .with_audience(Some("https://resource.example".to_owned()));
+        let header = r#"{"alg":"EdDSA","typ":"at+jwt"}"#;
+        let token = encode_with_header(&claims, &key_b, header);
+        let candidates = vec![key_a.verifying_key(), key_b.verifying_key()];
+
+        let decoded = decode_with_any_key_lenient(
+            &token,
+            &candidates,
+            Some("https://resource.example"),
+        )
+        .expect("kid-less second key verifies");
+        assert_eq!(decoded.sub, "overlap-test");
+    }
+
+    #[test]
+    fn decode_with_any_key_rejects_named_token_even_if_another_candidate_verifies() {
+        let old = make_key(0xA1);
+        let new = make_key(0xB2);
+        let claims = Claims::new("kid-substitution".to_owned(), 0, 9_999_999_999)
+            .with_audience(Some("https://resource.example".to_owned()));
+        let header = format!(
+            r#"{{"alg":"EdDSA","typ":"at+jwt","kid":"{}"}}"#,
+            kid_for_key(&new)
+        );
+        let token = encode_with_header(&claims, &old, &header);
+        let candidates = vec![new.verifying_key(), old.verifying_key()];
+
+        assert!(
+            decode_with_any_key_lenient(
+                &token,
+                &candidates,
+                Some("https://resource.example"),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn decode_with_any_key_rejects_when_no_candidate_verifies() {
+        let signer = make_key(0x11);
+        let unrelated = make_key(0x99);
+        let claims = Claims::new("no-match".to_owned(), 0, 9_999_999_999)
+            .with_audience(Some("https://resource.example".to_owned()));
+        let token = encode_with_header(
+            &claims,
+            &signer,
+            r#"{"alg":"EdDSA","typ":"at+jwt"}"#,
+        );
+        assert!(decode_with_any_key_lenient(
+            &token,
+            &[unrelated.verifying_key()],
+            Some("https://resource.example")
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn decode_with_any_key_empty_set_fails_closed() {
+        let signer = make_key(0x22);
+        let claims = Claims::new("empty".to_owned(), 0, 9_999_999_999);
+        let token = encode_with_header(
+            &claims,
+            &signer,
+            r#"{"alg":"EdDSA","typ":"at+jwt"}"#,
+        );
+        assert!(decode_with_any_key_lenient(&token, &[], None).is_err());
+    }
+
+    #[test]
+    fn federation_candidates_reject_mismatched_named_key() {
+        use crate::auth::FederationKey;
+
+        let old = make_key(0xA1);
+        let new = make_key(0xB2);
+        let claims = Claims::new("kid-binding".to_owned(), 0, 9_999_999_999);
+        let token = encode(&claims, &old);
+        let old_kid = kid_for_key(&old);
+
+        // The token names `old_kid`, but only a different co-published key is
+        // attached to that name. The bare-key candidate loop would accept the
+        // `old` entry below; the federation path must reject it.
+        let candidates = vec![
+            FederationKey {
+                kid: Some(old_kid),
+                verifying_key: new.verifying_key(),
+            },
+            FederationKey {
+                kid: Some(kid_for_key(&new)),
+                verifying_key: old.verifying_key(),
+            },
+        ];
+        assert!(decode_with_federation_candidates(&token, &candidates, None).is_err());
     }
 }

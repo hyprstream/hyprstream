@@ -66,10 +66,20 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use hyprstream_9p::{AccessDecider, Action};
+use hyprstream_rpc::auth::mac::{ObjectRef, SecurityContext};
 use hyprstream_workers::runtime::{KataBackend, PodSandbox, PodSandboxConfig, SandboxBackend};
 use hyprstream_workers::{HypervisorType, ImageConfig, PoolConfig, RafsStore};
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+struct FixtureAccessDecider;
+
+impl AccessDecider for FixtureAccessDecider {
+    fn check(&self, _ctx: &SecurityContext, _object: ObjectRef<'_>, _action: Action) -> bool {
+        true
+    }
+}
 
 /// In-guest path to the staged `hypr9p-guest` binary, overridable so the
 /// operator can stage it wherever the rootfs puts it.
@@ -204,7 +214,11 @@ async fn kata_9p_vsock_e2e() -> TestResult {
     // on VFS_9P_VSOCK_PORT (564).
     // ─────────────────────────────────────────────────────────────────────
     let pool_config = pool_config_for(&pre, runtime_dir.clone());
-    let backend = KataBackend::new(image_config, Arc::clone(&rafs_store));
+    let backend = KataBackend::new(
+        image_config,
+        Arc::clone(&rafs_store),
+        Arc::new(FixtureAccessDecider),
+    );
 
     assert!(
         backend.is_available(),
@@ -377,7 +391,11 @@ async fn kata_9p_fuse_mount_e2e() -> TestResult {
     let (image_config, rafs_store) = image_store(scratch.path())?;
 
     let pool_config = pool_config_for(&pre, runtime_dir.clone());
-    let backend = KataBackend::new(image_config, Arc::clone(&rafs_store));
+    let backend = KataBackend::new(
+        image_config,
+        Arc::clone(&rafs_store),
+        Arc::new(FixtureAccessDecider),
+    );
     assert!(
         backend.is_available(),
         "cloud-hypervisor was on PATH at preflight but backend reports unavailable"

@@ -12,11 +12,11 @@
 //! # Spend-authorization verification (§5.3)
 //!
 //! The subject signs `{grant_cid, host, transfer_id, max_amount, exp}` with its
-//! identity key (COSE composite; Classical-only clients yield Classical-
-//! assurance receipts, labeled not rejected). [`CreditGate::verify_spend_authz`]
-//! verifies that signature against the *same* verified key material as the
-//! envelope. The authorization is captured at admission — no signature
-//! round-trip at completion time.
+//! identity key using a PQ-hybrid COSE composite. Ledger admission is an
+//! internal surface, so Classical-only signatures are rejected.
+//! [`CreditGate::verify_spend_authz`] verifies that signature against the
+//! *same* verified key material as the envelope. The authorization is captured
+//! at admission — no signature round-trip at completion time.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -39,6 +39,8 @@ pub enum DenyReason {
     UnverifiableGrant(String),
     /// The unit is not one this enforcer recognizes (no account materialized).
     UnknownUnit,
+    /// The authenticated transport subject is not the holder named by the grant.
+    HolderMismatch,
     /// The spend-authorization signature was absent or invalid.
     InvalidSpendAuthorization(String),
     /// The locally-materialized balance cannot cover the requested amount.
@@ -62,7 +64,9 @@ pub enum DenyReason {
 /// keyed by its [`Cid`] so the hot path never re-verifies (plan §5.2).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerifiedGrant {
-    /// The holder (the identity whose inventory this is).
+    /// The verified, exact pairwise identity whose inventory this grant names.
+    /// A verifier that cannot establish this value must return
+    /// [`DenyReason::UnverifiableGrant`] rather than construct a grant.
     pub holder: Did,
     /// The unit (names its issuer — INV-1).
     pub unit: UnitId,
@@ -123,19 +127,16 @@ impl SpendAuthorization {
 }
 
 impl CreditGate {
-    /// Verify a spend-authorization signature against the subject's verified
-    /// key material (§5.3). `require_pq` follows the cell's `CryptoPolicy` — a
-    /// Classical-only client yields a Classical-assurance receipt (labeled, not
-    /// rejected), so callers pass `require_pq = false` when no PQ key is
-    /// presented.
+    /// Verify a PQ-hybrid spend-authorization signature against the subject's
+    /// verified key material (§5.3). Ledger admission is internal, so absent
+    /// PQ key material fails closed rather than selecting Classical policy.
     pub fn verify_spend_authz(
         authz: &SpendAuthorization,
         ed_vk: &ed25519_dalek::VerifyingKey,
         pq_vk: Option<&MlDsaVerifyingKey>,
-        require_pq: bool,
     ) -> Result<(), DenyReason> {
         let payload = authz.digest();
-        verify_composite(&authz.signature, ed_vk, pq_vk, &payload, &[], require_pq)
+        verify_composite(&authz.signature, ed_vk, pq_vk, &payload, &[], true)
             .map(|_| ())
             .map_err(|e| DenyReason::InvalidSpendAuthorization(e.to_string()))
     }
@@ -501,10 +502,10 @@ mod tests {
             hyprstream_crypto::cose_sign::sign_composite(&ed_sk, Some(&pq_sk), &digest, &[])
                 .unwrap();
 
-        assert!(CreditGate::verify_spend_authz(&authz, &ed_vk, Some(&pq_vk), true).is_ok());
+        assert!(CreditGate::verify_spend_authz(&authz, &ed_vk, Some(&pq_vk)).is_ok());
 
         // Tamper: raising max_amount invalidates the signature.
         authz.max_amount = 2000;
-        assert!(CreditGate::verify_spend_authz(&authz, &ed_vk, Some(&pq_vk), true).is_err());
+        assert!(CreditGate::verify_spend_authz(&authz, &ed_vk, Some(&pq_vk)).is_err());
     }
 }

@@ -1467,9 +1467,23 @@ mod tests {
     use crate::config::ImageConfig;
     use crate::image::RafsStore;
     use crate::runtime::{PodSandboxConfig, PodSandboxState, ContainerConfig};
+    use hyprstream_rpc::auth::mac::{ObjectRef, SecurityContext};
     use hyprstream_rpc::crypto::generate_signing_keypair;
     use hyprstream_rpc::transport::TransportConfig;
     use tempfile::TempDir;
+
+    struct FixtureAccessDecider;
+
+    impl hyprstream_9p::AccessDecider for FixtureAccessDecider {
+        fn check(
+            &self,
+            _ctx: &SecurityContext,
+            _object: ObjectRef<'_>,
+            _action: hyprstream_9p::Action,
+        ) -> bool {
+            true
+        }
+    }
 
     /// Create a test WorkerService with temporary directories
     async fn create_test_service() -> std::result::Result<(WorkerService, TempDir), Box<dyn std::error::Error>> {
@@ -1512,7 +1526,11 @@ mod tests {
         let (signing_key, _verifying_key) = generate_signing_keypair();
 
         let backend: Arc<dyn crate::runtime::backend::SandboxBackend> = Arc::new(
-            crate::runtime::kata_backend::KataBackend::new(image_config, Arc::clone(&rafs_store)),
+            crate::runtime::kata_backend::KataBackend::new(
+                image_config,
+                Arc::clone(&rafs_store),
+                Arc::new(FixtureAccessDecider),
+            ),
         );
         let service = WorkerService::new(pool_config, backend, Some(rafs_store), transport, signing_key)?;
         Ok((service, temp_dir))

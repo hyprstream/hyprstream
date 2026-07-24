@@ -32,8 +32,8 @@ use hyprstream_service::{ServiceContext, Spawnable};
 use tokio::sync::RwLock;
 use tracing::info;
 
-use crate::auth::identity_store::credentials_dir;
 use crate::auth::PolicyManager;
+use crate::auth::identity_store::credentials_dir;
 use crate::config::{HyprConfig, TokenConfig};
 use crate::services::generated::policy_client::{RefreshServiceTokenRequest, RegisterServiceKey};
 use crate::services::{
@@ -44,13 +44,6 @@ use crate::services::{
 /// Load HyprConfig, falling back to default on error.
 fn load_config() -> HyprConfig {
     HyprConfig::load().unwrap_or_default()
-}
-
-/// Get the JWT token for a service from the trust store.
-fn service_token(service_name: &str) -> Option<String> {
-    let trust = hyprstream_service::global_trust_store();
-    let vk = trust.resolve_one(service_name)?;
-    trust.get(&vk).and_then(|att| att.jwt.clone())
 }
 
 /// Shared Git2DB registry instance. Lazily initialized by the first factory
@@ -186,8 +179,7 @@ fn resolve_registration_jwt(
 /// (`credentials/{service}/service-jwt`), written by the wizard/bootstrap
 /// manager. At process startup only the bootstrap *pubkeys* are seeded into
 /// the trust store (with `jwt: None`); the JWT itself is loaded here and
-/// seeded into the trust store so that peer-client construction
-/// (`service_token`) and the background renewal task can read it.
+/// seeded into the trust store so that the background renewal task can read it.
 fn register_service_key(
     _ctx: &ServiceContext,
     service_name: &str,
@@ -212,10 +204,10 @@ fn register_service_key(
     };
     let jwt = resolve_registration_jwt(service_name, &creds_dir, from_trust)?;
 
-    // Seed the loaded JWT into the trust store so that peer-client construction
-    // (`service_token`) and the background renewal task can read it. Bind it to
-    // this service's own verifying key — the key we actually sign with — so the
-    // advertised key == the actual signer (the #441 invariant).
+    // Seed the loaded JWT into the trust store so the background renewal task
+    // can read it. Bind it to this service's own verifying key — the key we
+    // actually sign with — so the advertised key == the actual signer (the
+    // #441 invariant).
     {
         let vk = signing_key.verifying_key();
         let trust = hyprstream_service::global_trust_store();
@@ -238,8 +230,12 @@ fn register_service_key(
     let policy_vk = hyprstream_service::global_trust_store()
         .resolve_one("policy")
         .ok_or_else(|| anyhow::anyhow!("trust store has no policy key"))?;
-    let policy_client =
-        PolicyClient::for_local_bootstrap(signing_key.clone(), policy_vk, Some(jwt.clone()))?;
+    // The WIT is the inner registration assertion, not an outer bearer
+    // credential. The request envelope already authenticates the service key
+    // with the mandatory Hybrid suite; attaching this registration-only,
+    // EdDSA WIT outside would make RequestService reject it before dispatch
+    // under both its generic audience and JWT-algorithm gates.
+    let policy_client = PolicyClient::for_local_bootstrap(signing_key.clone(), policy_vk, None)?;
 
     let request = RegisterServiceKey {
         service_name: service_name.to_owned(),
@@ -269,8 +265,8 @@ fn register_service_key(
 /// Used for local-disk JWTs that we issued ourselves — signature is verified
 /// by PolicyService; here we only need the expiry to decide whether to renew.
 fn decode_jwt_exp(jwt: &str) -> Option<i64> {
-    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use base64::Engine as _;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     let payload_b64 = jwt.split('.').nth(1)?;
     let payload = URL_SAFE_NO_PAD.decode(payload_b64).ok()?;
     let value: serde_json::Value = serde_json::from_slice(&payload).ok()?;
@@ -312,10 +308,11 @@ fn spawn_jwt_renewal_task(
                 continue;
             }
 
-            // Build a PolicyClient using current trust-store JWT
-            let (policy_vk, current_jwt) = {
+            // The registered Hybrid envelope signer is the outer RPC
+            // credential. The service WIT is not a general-purpose bearer.
+            let policy_vk = {
                 let trust = hyprstream_service::global_trust_store();
-                let vk = match trust.resolve_one("policy") {
+                match trust.resolve_one("policy") {
                     Some(v) => v,
                     None => {
                         tracing::warn!(
@@ -324,28 +321,13 @@ fn spawn_jwt_renewal_task(
                         );
                         continue;
                     }
-                };
-                let svc_jwt = match trust
-                    .resolve_one(&service_name)
-                    .and_then(|vk| trust.get(&vk))
-                    .and_then(|att| att.jwt.clone())
-                {
-                    Some(j) => j,
-                    None => {
-                        tracing::warn!(
-                            service = service_name,
-                            "service JWT not in trust store; skipping renewal"
-                        );
-                        continue;
-                    }
-                };
-                (vk, svc_jwt)
+                }
             };
 
             let policy_client = match PolicyClient::for_local_bootstrap(
                 signing_key.clone(),
                 policy_vk,
-                Some(current_jwt),
+                None,
             ) {
                 Ok(c) => c,
                 Err(e) => {
@@ -494,7 +476,9 @@ fn create_ledger_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
     let config = load_config();
     let lcfg = config.ledger.clone();
     if !lcfg.is_enabled() {
-        anyhow::bail!("ledger service requested but [ledger] enabled = false (the Phase-1 enforcer is opt-in)");
+        anyhow::bail!(
+            "ledger service requested but [ledger] enabled = false (the Phase-1 enforcer is opt-in)"
+        );
     }
 
     // Cell identity = did:key over the service Ed25519 key.
@@ -517,7 +501,11 @@ fn create_ledger_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
             tokio::runtime::Handle::current().block_on(async { store.active_key().await })
         });
         match pq_key {
-            Some(k) => Arc::new(CoseCheckpointSigner::hybrid(cell_identity.clone(), ed_sk, (*k).clone())),
+            Some(k) => Arc::new(CoseCheckpointSigner::hybrid(
+                cell_identity.clone(),
+                ed_sk,
+                (*k).clone(),
+            )),
             None => anyhow::bail!(
                 "ledger: require_pq_signatures is set but no ML-DSA-65 key is available (fail-closed)"
             ),
@@ -689,17 +677,14 @@ fn create_registry_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawn
     let policy_vk = hyprstream_service::global_trust_store()
         .resolve_one("policy")
         .ok_or_else(|| anyhow::anyhow!("trust store has no policy key"))?;
-    let policy_client =
-        PolicyClient::for_local_bootstrap(sk.clone(), policy_vk, service_token("registry"))?;
+    let policy_client = PolicyClient::for_local_bootstrap(sk.clone(), policy_vk, None)?;
 
     // #910a — the registry service is the sole PDS-record writer AND the sole
     // holder of the `#atproto` private key: it opens the durable store
     // read-write and, on register/commit, signs the repo's commit ONCE and
     // persists the signed bytes. Reads (the discovery service) are keyless.
-    // This node's `did:key` identity (the record `repo` at-uri authority) is
-    // derived from the node's own root Ed25519 key — the same identity TLS
-    // endorsement uses ("a node-level trust assertion, not specific to any
-    // per-service key"). The `#atproto` commit-signing key is the *active* key
+    // The record `repo` authority is the root `did:web` document that publishes
+    // the `#atproto` commit-verification key. The `#atproto` signing key is the *active* key
     // from the shared `Es256SigningKeyStore` — the same P-256 key
     // `oauth::did_document` publishes as the `#atproto` verification method, so
     // the writer and the published key are one source of truth (classical —
@@ -710,25 +695,29 @@ fn create_registry_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawn
     let pds_publisher = (|| -> anyhow::Result<crate::services::discovery::PdsPublisher> {
         let store_dir = pds_store_dir(ctx)?;
         let secrets_dir = crate::config::HyprConfig::resolve_secrets_dir()?;
+        // C4 (#1170, closes #1123): the publisher resolves the active
+        // `#atproto` generation from the **sealed op-log head** at sign time,
+        // not a key frozen here at construction. The head is written by the
+        // OAuth rotation task to a dedicated shared state dir (NOT the
+        // read-only credentials dir), and is signed by a dedicated head key
+        // whose *public* verifying key the registry loads here — the registry
+        // holds NO CA private key. Under `--ipc` a rotation by the OAuth
+        // process is observed with no event-delivery mechanism. If the head is
+        // absent (OAuth not booted, or the shared state dir not provisioned —
+        // #808 under systemd), `active_generation()` returns `None` and the
+        // publisher declines to sign: fail-closed, never a stale frozen key.
+        let oplog_state_dir = crate::auth::resolve_oplog_state_dir(&secrets_dir)?;
+        let generation_source: Arc<dyn crate::auth::ActiveGenerationSource> = Arc::new(
+            crate::auth::SealedHeadEs256Source::new(&oplog_state_dir, &secrets_dir),
+        );
         let es256_store =
             crate::auth::key_rotation::global_es256_key_store(&secrets_dir, &config.oauth);
-        // `active_key` is async (tokio RwLock); resolve it once here on the
-        // current runtime. `block_in_place` avoids stalling a worker reactor.
-        let active = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(es256_store.active_key())
-        })
-        .ok_or_else(|| anyhow::anyhow!("no active ES256 #atproto key for PDS publish"))?;
-        let atproto_key: p256::ecdsa::SigningKey = (*active).clone();
         let acceptance_identity = ctx.service_signing_key("registry");
         anyhow::ensure!(
             hyprstream_discovery::deployment_registry_verifier()?
                 .matches(&acceptance_identity.verifying_key()),
             "registry signing credential does not match authenticated deployment identity"
         );
-        // The alarm WAL must remain verifiable across OAuth key rotations and
-        // process restarts. Derive a dedicated, stable audit identity from the
-        // node/service root available in this deployment mode; the second
-        // derivation keeps the ML-DSA material separate from the Ed25519 key.
         let audit_ed = hyprstream_rpc::node_identity::derive_purpose_key(
             &acceptance_identity,
             "hyprstream-at9p-audit-ed25519-v1",
@@ -747,10 +736,13 @@ fn create_registry_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawn
             audit_pq,
         )?;
         let node_did = hyprstream_rpc::did_key::ed25519_to_did_key(&ctx.verifying_key().to_bytes());
-        Ok(
-            crate::services::discovery::PdsPublisher::new(store, node_did, atproto_key)
-                .with_at9p_state_ingest(at9p_state),
+        Ok(crate::services::discovery::PdsPublisher::with_generation_source(
+            store,
+            node_did,
+            generation_source,
         )
+        .with_at9p_state_ingest(at9p_state)
+        .with_es256_store(es256_store))
     })()
     .map_err(|e| tracing::warn!("PDS publish disabled: {e}"))
     .ok();
@@ -770,7 +762,11 @@ fn create_registry_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawn
     }
     registry_service = registry_service.with_jwt_key_source(ctx.cluster_key_source());
     if let Some(publisher) = pds_publisher {
-        registry_service = registry_service.with_pds_publisher(publisher);
+        // A promotion publishes the former active key as a bounded drain slot;
+        // no writer-local re-sign callback is needed, which keeps `--ipc`
+        // rotation viable when OAuth and registry run in different processes.
+        let publisher_arc = Arc::new(publisher);
+        registry_service = registry_service.with_pds_publisher_arc(publisher_arc);
     }
 
     Ok(ctx.into_spawnable_quic(registry_service, config.registry.quic_port))
@@ -931,12 +927,10 @@ fn create_model_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnabl
     let policy_vk = hyprstream_service::global_trust_store()
         .resolve_one("policy")
         .ok_or_else(|| anyhow::anyhow!("trust store has no policy key"))?;
-    let policy_client =
-        PolicyClient::for_local_bootstrap(sk.clone(), policy_vk, service_token("model"))?;
+    let policy_client = PolicyClient::for_local_bootstrap(sk.clone(), policy_vk, None)?;
 
     // Create registry client
-    let registry_client: RegistryClient =
-        RegistryClient::from_resolver(sk.clone(), service_token("model"))?;
+    let registry_client: RegistryClient = RegistryClient::from_resolver(sk.clone(), None)?;
 
     #[allow(clippy::expect_used)]
     let mut model_service = tokio::task::block_in_place(|| {
@@ -994,9 +988,10 @@ fn create_worker_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
     use hyprstream_workers::config::PoolConfig;
     #[cfg(feature = "oci-image")]
     use hyprstream_workers::image::RafsStore;
-    use hyprstream_workers::{resolve_backend, BackendCtx, SandboxBackend, WorkerService};
+    use hyprstream_workers::{BackendCtx, SandboxBackend, WorkerService, resolve_backend};
 
     let config = load_config();
+    let sk = ctx.service_signing_key("worker");
     let worker_quic_port = config.worker.as_ref().and_then(|w| w.quic_port);
     // Operator-selected backend name ("auto" or a registered backend); resolved
     // fail-closed against the inventory registry below.
@@ -1045,6 +1040,15 @@ fn create_worker_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
     #[cfg(feature = "oci-image")]
     let rafs_store = Arc::new(RafsStore::new(image_config.clone())?);
 
+    let ninep_decider = tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current().block_on(crate::mac::production_ninep_decider(
+            sk.clone(),
+            &config.oauth,
+            "ninep-worker",
+        ))
+    })
+    .context("construct worker 9P MAC PEP")?;
+
     // Resolve + construct the backend fail-closed against the inventory registry
     // (config-driven by name; explicit requests are authoritative, missing
     // prerequisites error out rather than silently downgrading isolation; "auto"
@@ -1052,14 +1056,13 @@ fn create_worker_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
     // `_ => nspawn` fallback (#507 / #518).
     let backend_ctx = BackendCtx {
         pool_config: pool_config.clone(),
+        ninep_decider,
         #[cfg(feature = "oci-image")]
         image_config,
         #[cfg(feature = "oci-image")]
         rafs_store: Arc::clone(&rafs_store),
     };
     let backend: Arc<dyn SandboxBackend> = resolve_backend(&backend_name, &backend_ctx)?;
-
-    let sk = ctx.service_signing_key("worker");
 
     // Register this service's verifying key with PolicyService
     register_service_key(ctx, "worker", &sk)?;
@@ -1086,7 +1089,7 @@ fn create_worker_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
     let policy_client = crate::services::PolicyClient::for_local_bootstrap(
         sk.clone(),
         policy_vk,
-        service_token("worker"),
+        None,
     )?;
     worker_service.set_authorize_fn(super::worker::build_authorize_fn(policy_client));
     if let Some(issuer) = ctx.oauth_issuer_url() {
@@ -1110,8 +1113,8 @@ fn create_oai_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
     info!("Creating OAIService");
 
     use crate::server::state::ServerState;
-    use crate::services::generated::model_client::ModelClient;
     use crate::services::OAIService;
+    use crate::services::generated::model_client::ModelClient;
 
     // Load full config for OAI settings
     let config = load_config();
@@ -1121,39 +1124,63 @@ fn create_oai_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
     register_service_key(ctx, "oai", &sk)?;
 
     // Create ZMQ clients for Model and Policy services
-    let model_client = ModelClient::from_resolver(sk.clone(), service_token("oai"))?;
+    let model_client = ModelClient::from_resolver(sk.clone(), None)?;
     let policy_vk = hyprstream_service::global_trust_store()
         .resolve_one("policy")
         .ok_or_else(|| anyhow::anyhow!("trust store has no policy key"))?;
-    let policy_client =
-        PolicyClient::for_local_bootstrap(sk.clone(), policy_vk, service_token("oai"))?;
+    let policy_client = PolicyClient::for_local_bootstrap(sk.clone(), policy_vk, None)?;
 
     // Create registry client
-    let registry_client: RegistryClient =
-        RegistryClient::from_resolver(sk.clone(), service_token("oai"))?;
+    let registry_client: RegistryClient = RegistryClient::from_resolver(sk.clone(), None)?;
 
     // Create server state (blocking since we're in sync context)
     let resource_url = config.oai.resource_url();
     let oauth_issuer_url = config.oauth.issuer_url();
     let server_state = tokio::task::block_in_place(|| {
         let rt = tokio::runtime::Handle::current();
-        rt.block_on(ServerState::new(
-            config.server.clone(),
-            model_client,
-            policy_client,
-            registry_client,
-            sk.clone(),
-            ctx.jwt_verifying_key(),
-            resource_url,
-            oauth_issuer_url,
-            &config.oauth.trusted_issuers,
-            // Share the PolicyService-owned JTI blocklist so POST /oauth/revoke
-            // immediately invalidates tokens at the OAI resource server.
-            SHARED_JTI_BLOCKLIST
-                .get()
-                .map(Arc::clone)
-                .unwrap_or_else(|| Arc::new(hyprstream_rpc::auth::InMemoryJtiBlocklist::new())),
-        ))
+        rt.block_on(async {
+            let secrets_dir = crate::config::HyprConfig::resolve_secrets_dir()?;
+            let ml_dsa_store =
+                crate::auth::key_rotation::global_ml_dsa_key_store(&secrets_dir, &config.oauth);
+            let signer = crate::mac::audit::cose::OwnedCoseAuditSigner::new(
+                Arc::new(sk.clone()),
+                ml_dsa_store.active_key().await,
+                hyprstream_rpc::envelope::mandatory_envelope_policy(),
+            );
+            anyhow::ensure!(
+                signer.can_sign(),
+                "9P MAC PEP audit signer unavailable under mandatory Hybrid policy"
+            );
+            let audit_store = crate::mac::audit::WalAuditStore::open(
+                secrets_dir.join("mac-audit").join("ninep"),
+                signer,
+            )
+            .map_err(|error| anyhow::anyhow!("open 9P MAC audit store: {error}"))?;
+            let resolver = crate::mac::GenesisGate::production().into_resolver();
+            let ninep_decider: Arc<dyn hyprstream_9p::AccessDecider> = Arc::new(
+                crate::mac::NinePAccessDecider::new(Arc::new(resolver), Arc::new(audit_store)),
+            );
+
+            ServerState::new(
+                config.server.clone(),
+                model_client,
+                policy_client,
+                registry_client,
+                sk.clone(),
+                ctx.jwt_verifying_key(),
+                resource_url,
+                oauth_issuer_url,
+                &config.oauth.trusted_issuers,
+                // Share the PolicyService-owned JTI blocklist so POST /oauth/revoke
+                // immediately invalidates tokens at the OAI resource server.
+                SHARED_JTI_BLOCKLIST
+                    .get()
+                    .map(Arc::clone)
+                    .unwrap_or_else(|| Arc::new(hyprstream_rpc::auth::InMemoryJtiBlocklist::new())),
+                ninep_decider,
+            )
+            .await
+        })
     })
     .context("Failed to create server state")?;
 
@@ -1174,7 +1201,7 @@ fn create_oai_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
 
 /// Factory for XetService (HuggingFace-XET CAS HTTP face, epic #654).
 ///
-/// Dual-stack HTTP service that speaks the HF-XET CAS wire protocol so a standard
+/// HTTP service that speaks the HF-XET CAS wire protocol so a standard
 /// xet-enabled git repo can point its CAS endpoint at hyprstream. It dials the
 /// `registry` service (reusing the authenticated `putBlob`/`getBlob` core) and
 /// holds no standing CAS write authority of its own. Reads come from the shared
@@ -1183,6 +1210,7 @@ fn create_oai_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
 fn create_xet_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>> {
     info!("Creating XetService");
 
+    use crate::server::state::ResourceAuthState;
     use crate::services::{XetService, XetState};
 
     let config = load_config();
@@ -1192,24 +1220,39 @@ fn create_xet_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
     register_service_key(ctx, "xet", &sk)?;
 
     // Dial the registry — the authenticated write core the HTTP face translates to.
-    let registry_client: RegistryClient =
-        RegistryClient::from_resolver(sk.clone(), service_token("xet"))?;
+    let registry_client: RegistryClient = RegistryClient::from_resolver(sk.clone(), None)?;
+
+    // Reuse the same narrow authentication core as OAI without constructing an
+    // inference-oriented ServerState. The policy client is used by federated
+    // issuer admission and key resolution.
+    let policy_vk = hyprstream_service::global_trust_store()
+        .resolve_one("policy")
+        .ok_or_else(|| anyhow::anyhow!("trust store has no policy key"))?;
+    let policy_client = PolicyClient::for_local_bootstrap(sk.clone(), policy_vk, None)?;
+    let federation_resolver = Arc::new(
+        crate::auth::FederationKeyResolver::new(&config.oauth.trusted_issuers)
+            .with_policy_client(Arc::new(policy_client)),
+    );
+    let jti_blocklist = SHARED_JTI_BLOCKLIST
+        .get()
+        .map(Arc::clone)
+        .context("PolicyService did not publish the shared JTI blocklist before Xet startup")?;
+    let auth = ResourceAuthState::new(
+        ctx.jwt_verifying_key(),
+        config.xet.resource_url(),
+        config.oauth.issuer_url(),
+        federation_resolver,
+        jti_blocklist,
+    );
 
     let state = XetState {
         // Reads share the same L1 CAS substrate the registry's getBlob uses (#812).
         store: crate::storage::CasSubstrate::from_env(),
         registry: Some(registry_client),
-        jwt_verifying_key: ctx.jwt_verifying_key(),
-        audience: config.xet.resource_url(),
+        auth,
     };
 
-    let xet_service = XetService::new(
-        config.xet.clone(),
-        config.tls.clone(),
-        state,
-        ctx.transport("xet", SocketKind::Rep),
-        ctx.verifying_key(),
-    );
+    let xet_service = XetService::new(config.xet.clone(), config.tls.clone(), state);
 
     Ok(Box::new(xet_service))
 }
@@ -1239,8 +1282,7 @@ fn create_flight_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
     // RegistryClient already implements hyprstream_metrics::RegistryClient
     let registry_client: Option<Arc<dyn hyprstream_metrics::RegistryClient>> =
         if config.flight.default_dataset.is_some() {
-            let registry_client: RegistryClient =
-                RegistryClient::from_resolver(sk.clone(), service_token("flight"))?;
+            let registry_client: RegistryClient = RegistryClient::from_resolver(sk.clone(), None)?;
             Some(Arc::new(registry_client))
         } else {
             None
@@ -1291,7 +1333,9 @@ fn create_oauth_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnabl
     if let Some(bl) = SHARED_JTI_BLOCKLIST.get() {
         oauth_service = oauth_service.with_jti_blocklist(Arc::clone(bl));
     } else {
-        tracing::warn!("JTI blocklist not set by PolicyService factory — revoked access tokens will not be blocked at RPC layer");
+        tracing::warn!(
+            "JTI blocklist not set by PolicyService factory — revoked access tokens will not be blocked at RPC layer"
+        );
     }
 
     Ok(Box::new(oauth_service))
@@ -1363,7 +1407,7 @@ fn create_mcp_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
             let fallback_policy_client = std::sync::Arc::new(PolicyClient::for_local_bootstrap(
                 ctx.service_signing_key("mcp"),
                 policy_vk,
-                service_token("mcp"),
+                None,
             )?);
             std::sync::Arc::new(
                 crate::auth::FederationKeyResolver::new(&config.oauth.trusted_issuers)
@@ -1477,8 +1521,25 @@ fn create_mcp_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
                             let iss = crate::server::middleware::extract_iss_from_token(&t);
                             let kid = crate::server::middleware::extract_kid_from_token(&t);
                             let result = if let Some(ref key_source) = jwt_key_source {
-                                match key_source.get_key(&iss, kid.as_deref()).await {
-                                    Ok(key) => crate::auth::jwt::decode(&t, &key, Some(mcp_resource_url.as_str())),
+                                let resolved = if let Some(kid) = kid.as_deref() {
+                                    key_source
+                                        .get_key(&iss, Some(kid))
+                                        .await
+                                        .map(|key| vec![key])
+                                } else {
+                                    key_source.get_keys(&iss, None).await
+                                };
+                                match resolved {
+                                    Ok(keys) if kid.is_some() => crate::auth::jwt::decode(
+                                        &t,
+                                        &keys[0],
+                                        Some(mcp_resource_url.as_str()),
+                                    ),
+                                    Ok(keys) => crate::auth::jwt::decode_with_any_key(
+                                        &t,
+                                        &keys,
+                                        Some(mcp_resource_url.as_str()),
+                                    ),
                                     Err(e) => {
                                         tracing::debug!(%method, %uri, issuer = %iss, error = %e, "MCP JWT key resolution failed");
                                         let mut res = (StatusCode::UNAUTHORIZED, "Authentication failed").into_response();
@@ -1489,8 +1550,19 @@ fn create_mcp_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
                                     }
                                 }
                             } else {
-                                match federation_resolver.get_key(&iss).await {
-                                    Ok(key) => crate::auth::jwt::decode_with_key(&t, &key, Some(mcp_resource_url.as_str())),
+                                // Rotation-aware federation verification (#1185):
+                                // try each published candidate (kid-first) so a
+                                // token signed by a non-first published key
+                                // verifies during overlap rotation.
+                                match federation_resolver.get_keys(&iss, kid.as_deref()).await {
+                                    Ok(candidates) if !candidates.is_empty() => {
+                                        crate::auth::jwt::decode_with_federation_candidates(
+                                            &t,
+                                            &candidates,
+                                            Some(mcp_resource_url.as_str()),
+                                        )
+                                    }
+                                    Ok(_) => Err(crate::auth::jwt::JwtError::InvalidFormat),
                                     Err(e) => {
                                         tracing::debug!(%method, %uri, issuer = %iss, error = %e, "MCP federation key resolution failed");
                                         let mut res = (StatusCode::UNAUTHORIZED, "Authentication failed").into_response();
@@ -1690,7 +1762,7 @@ fn create_mcp_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
 fn create_tui_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>> {
     info!("Creating TuiService");
 
-    use crate::tui::{service::TuiService, TuiState};
+    use crate::tui::{TuiState, service::TuiService};
 
     // TUI publishes terminal frames (stdin/stdout) over moq via
     // StreamChannel::publisher(), and returns its per-PID moq UDS path to the
@@ -1714,8 +1786,7 @@ fn create_tui_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
     let policy_vk = hyprstream_service::global_trust_store()
         .resolve_one("policy")
         .ok_or_else(|| anyhow::anyhow!("trust store has no policy key"))?;
-    let policy_client =
-        PolicyClient::for_local_bootstrap(sk.clone(), policy_vk, service_token("tui"))?;
+    let policy_client = PolicyClient::for_local_bootstrap(sk.clone(), policy_vk, None)?;
 
     // Build VFS namespace for ChatApps spawned via TUI RPC.
     let (vfs_ns, vfs_subject) = crate::tui::vfs::build_chat_vfs_namespace(&sk)?;
@@ -1788,8 +1859,7 @@ fn create_discovery_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spaw
     let policy_vk = hyprstream_service::global_trust_store()
         .resolve_one("policy")
         .ok_or_else(|| anyhow::anyhow!("trust store has no policy key"))?;
-    let policy_client =
-        PolicyClient::for_local_bootstrap(sk.clone(), policy_vk, service_token("discovery"))?;
+    let policy_client = PolicyClient::for_local_bootstrap(sk.clone(), policy_vk, None)?;
     let auth_provider = crate::services::discovery::PolicyAuthProvider::new(policy_client);
 
     // #431 — record resolver backing getRecord/getRepo, over the durable
@@ -1812,9 +1882,23 @@ fn create_discovery_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spaw
             .context("failed to open PDS record store (read-only)")?
             .with_at9p_deployment_verifier(at9p_acceptance_identity),
     );
-    let record_resolver = std::sync::Arc::new(crate::services::discovery::PdsRecordResolver::new(
-        pds_store,
-    ));
+    // #918 — the local repo subject is the root did:web authority whose
+    // document is fed by this ES256 store. The resolver uses the same bounded
+    // publication snapshot, including drain, before placement ingest.
+    let secrets_dir = crate::config::HyprConfig::resolve_secrets_dir()?;
+    let es256_store =
+        crate::auth::key_rotation::global_es256_key_store(&secrets_dir, &config.oauth);
+    let issuer = ctx
+        .oauth_issuer_url()
+        .map(str::to_owned)
+        .unwrap_or_else(|| config.oauth.issuer_url());
+    let authority = crate::services::oauth::did_document::issuer_authority(&issuer)
+        .context("OAuth issuer has no did:web authority")?;
+    let node_did = format!("did:web:{authority}");
+    let record_resolver = std::sync::Arc::new(
+        crate::services::discovery::PdsRecordResolver::new(pds_store)
+            .with_es256_rotation(es256_store, node_did),
+    );
 
     let mut discovery_service = DiscoveryService::new(
         Arc::new(sk),
@@ -1881,9 +1965,9 @@ fn create_metrics_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawna
     init_local_moq_stream_plane("metrics");
 
     use crate::services::MetricsService;
+    use hyprstream_metrics::StorageBackend as _;
     use hyprstream_metrics::query::QueryOrchestrator;
     use hyprstream_metrics::storage::duckdb::DuckDbBackend;
-    use hyprstream_metrics::StorageBackend as _;
 
     let config = load_config();
     let mc = &config.metrics;
@@ -1917,8 +2001,7 @@ fn create_metrics_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawna
     let policy_vk = hyprstream_service::global_trust_store()
         .resolve_one("policy")
         .ok_or_else(|| anyhow::anyhow!("trust store has no policy key"))?;
-    let policy_client =
-        PolicyClient::for_local_bootstrap(sk.clone(), policy_vk, service_token("metrics"))?;
+    let policy_client = PolicyClient::for_local_bootstrap(sk.clone(), policy_vk, None)?;
 
     let mut metrics_service = MetricsService::new(
         orchestrator,

@@ -14,15 +14,10 @@
 //! [`EnrollmentSubjectContextResolver`](crate::mac::EnrollmentSubjectContextResolver)
 //! inert. This module is the one missing wire.
 //!
-//! ## DORMANT — this does NOT enable enforcement
-//!
-//! Installing a compiled policy only makes the PDP *inputs* real: it flips
+//! Installing a compiled policy makes the PDP inputs real: it flips
 //! [`crate::mac::compiled_policy`] to `Some`, so the enrollment resolver
-//! resolves genuine clearances instead of denying every DID. The per-op
-//! deciders remain AllowAll — no PEP consults this PDP yet (see the "Current
-//! status" note in `CLAUDE.md` / the epic). Turning enforcement *on* is a
-//! separate, deliberate step; this keeps the framework fail-closed and correct
-//! while wiring the last dormant input.
+//! resolves genuine clearances instead of denying every DID. The active 9P PEP
+//! records the loaded generation and policy hash on every audited decision.
 //!
 //! ## Fail-closed
 //!
@@ -187,7 +182,7 @@ fn install_self_approved_empty_baseline(
     sign_load_install(policy, approval, ed_sk, pq_sk)
 }
 
-/// Install the node's **dormant baseline** compiled policy at daemon boot.
+/// Install the node's baseline compiled policy at daemon boot.
 ///
 /// The baseline is intentionally minimal: a self-issued empty grant over an
 /// empty lattice generation and an empty object registry, so the compiled TE
@@ -195,8 +190,7 @@ fn install_self_approved_empty_baseline(
 /// is to make [`crate::mac::compiled_policy`] return `Some`, which switches the
 /// grant path's subject resolver from deny-all to the real
 /// [`EnrollmentSubjectContextResolver`](crate::mac::EnrollmentSubjectContextResolver).
-/// Enforcement stays AllowAll — this is the dormant activation prerequisite, not
-/// the enforcement flip.
+/// The active 9P PEP uses this policy as decision provenance.
 ///
 /// Unlike [`compile_sign_load_install`], this path locally derives an approval;
 /// that exception is confined to a private helper which constructs the empty

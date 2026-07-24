@@ -14,11 +14,19 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use hyprstream_9p::msg::{self, Response};
-use hyprstream_9p::Translator;
+use hyprstream_9p::{AccessDecider, Action, Translator};
+use hyprstream_rpc::auth::mac::{ObjectRef, SecurityContext};
 use hyprstream_rpc::Subject;
 use hyprstream_vfs::{DirEntry, Fid, Mount, MountError, Stat};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
+
+struct TestDecider;
+impl AccessDecider for TestDecider {
+    fn check(&self, _: &SecurityContext, _: ObjectRef<'_>, _: Action) -> bool {
+        true
+    }
+}
 
 /// Opaque per-fid state for `TestMount`: the absolute path it resolves to.
 struct TestFid {
@@ -121,7 +129,7 @@ async fn uds_full_session() {
     let listener = UnixListener::bind(&sock).unwrap();
 
     let subject = Subject::new("tenant-a");
-    let translator = Translator::from_mount(mount, subject);
+    let translator = Translator::from_mount(mount, subject, Arc::new(TestDecider));
     let server = tokio::spawn(async move {
         let _ = translator.serve_uds(listener).await;
     });

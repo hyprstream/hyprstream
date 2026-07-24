@@ -97,7 +97,7 @@ pub async fn jwks_json(
 
     // ES256 from rotation store — publish all slots (drain/active/lead)
     if let Some(ref store) = state.es256_key_store {
-        for slot in store.all_slots_snapshot().await {
+        for slot in store.all_slots_snapshot() {
             let mut jwk = crate::auth::jwt::es256_jwk(&slot.key);
             if let Some(obj) = jwk.as_object_mut() {
                 obj.insert("nbf".to_owned(), slot.nbf.into());

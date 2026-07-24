@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tokio::time::MissedTickBehavior;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use crate::config::OAuthConfig;
 
@@ -195,9 +195,7 @@ fn read_composite_ledger_selected_by_commit(
         Ok(bytes) => serde_json::from_slice(&bytes)?,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             match std::fs::symlink_metadata(&immutable) {
-                Err(metadata_error)
-                    if metadata_error.kind() == std::io::ErrorKind::NotFound =>
-                {
+                Err(metadata_error) if metadata_error.kind() == std::io::ErrorKind::NotFound => {
                     serde_json::from_slice(&std::fs::read(composite_ledger_path(dir))?)?
                 }
                 Ok(_) => return Err(error.into()),
@@ -228,9 +226,7 @@ fn load_or_migrate_committed_composite_ledger(
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             match std::fs::symlink_metadata(&marker_path) {
-                Err(metadata_error)
-                    if metadata_error.kind() == std::io::ErrorKind::NotFound =>
-                {
+                Err(metadata_error) if metadata_error.kind() == std::io::ErrorKind::NotFound => {
                     return Ok(None);
                 }
                 Ok(_) => return Err(error.into()),
@@ -453,8 +449,7 @@ fn start_composite_authority_subscription(
                         pending.component_digest == local_digest,
                         "pending composite ledger does not match local component authority"
                     );
-                    let _staged =
-                        ledger_pairs_from_local_keys(&pending, &ed, &pq, ca_key, true)?;
+                    let _staged = ledger_pairs_from_local_keys(&pending, &ed, &pq, ca_key, true)?;
                     super::identity_store::write_secret(
                         &subscribers,
                         &name,
@@ -772,17 +767,10 @@ async fn publish_composite_key_set(
             let digest = persisted_digest.ok_or_else(|| {
                 anyhow::anyhow!("committed composite digest disappeared during restore")
             })?;
-            key_set.publish(
-                persisted_version,
-                digest,
-                pairs,
-            )?;
+            key_set.publish(persisted_version, digest, pairs)?;
         }
         #[cfg(not(test))]
-        start_composite_authority_subscription(
-            secrets_dir.to_path_buf(),
-            ca_key.verifying_key(),
-        )?;
+        start_composite_authority_subscription(secrets_dir.to_path_buf(), ca_key.verifying_key())?;
         return Ok(());
     }
 
@@ -1033,9 +1021,11 @@ pub fn global_es256_key_store(
     secrets_dir: &Path,
     config: &OAuthConfig,
 ) -> Arc<Es256SigningKeyStore> {
-    ES256_SIGNING_STORE
+    let store = ES256_SIGNING_STORE
         .get_or_init(|| Arc::new(load_or_init_es256_key_store(secrets_dir, config)))
-        .clone()
+        .clone();
+    store.bind_secrets_dir(secrets_dir.to_path_buf());
+    store
 }
 
 // ── Key slot ────────────────────────────────────────────────────────────────
@@ -1332,7 +1322,14 @@ pub fn spawn_rotation_task(
     extra: RotationStores,
 ) {
     tokio::task::spawn_local(async move {
-        let mut interval = tokio::time::interval(config.rotation_check_interval());
+        // Bounded overlap is an expiry contract, not merely six-hour
+        // housekeeping. Do not leave an expired method served for a full
+        // default rotation interval.
+        let mut interval = tokio::time::interval(
+            config
+                .rotation_check_interval()
+                .min(std::time::Duration::from_secs(60)),
+        );
         interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
         // Skip the first tick (fires immediately on creation)
         interval.tick().await;
@@ -1353,6 +1350,20 @@ pub fn spawn_rotation_task(
             refresh_ed25519_verifying_keys(&store).await;
             if let Some(ref es256) = extra.es256 {
                 rotate_es256_keys(&config, &secrets_dir, es256, now).await;
+                // C4 (#1170): re-seal the op-log head after the ES256
+                // promotion so cross-process readers (the registry's
+                // `PdsPublisher` under `--ipc`) observe the new active
+                // `#atproto` generation. Dedicated head-signing key + shared
+                // state dir; async because the ES256 store is a tokio RwLock
+                // (F1). C2 (#1168) seam — see `auth::op_log`.
+                if let Err(error) =
+                    super::op_log::advance_sealed_head(&secrets_dir, es256).await
+                {
+                    error!(
+                        "failed to re-seal op-log head after ES256 rotation; \
+                         cross-process readers will retain the prior generation: {error}"
+                    );
+                }
             }
             if let (Some(ref ml_dsa), Some(expected_component_digest)) =
                 (&extra.ml_dsa, expected_component_digest.as_deref())
@@ -1405,7 +1416,7 @@ impl Es256KeySlot {
     }
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct Es256KeySlots {
     pub drain: Option<Es256KeySlot>,
     pub active: Option<Es256KeySlot>,
@@ -1421,26 +1432,118 @@ impl Es256KeySlots {
     }
 }
 
+type Es256PromotionHook = dyn Fn(Arc<Es256SigningKey>) -> anyhow::Result<()> + Send + Sync;
+
 #[derive(Clone)]
-pub struct Es256SigningKeyStore(pub Arc<RwLock<Es256KeySlots>>);
+pub struct Es256SigningKeyStore(
+    pub Arc<parking_lot::RwLock<Es256KeySlots>>,
+    Arc<parking_lot::RwLock<Option<Arc<Es256PromotionHook>>>>,
+    Arc<parking_lot::RwLock<Option<PathBuf>>>,
+);
 
 impl Es256SigningKeyStore {
     pub fn new(slots: Es256KeySlots) -> Self {
-        Self(Arc::new(RwLock::new(slots)))
+        Self(
+            Arc::new(parking_lot::RwLock::new(slots)),
+            Arc::new(parking_lot::RwLock::new(None)),
+            Arc::new(parking_lot::RwLock::new(None)),
+        )
     }
 
-    pub async fn active_key(&self) -> Option<Arc<Es256SigningKey>> {
-        self.0
-            .read()
-            .await
-            .active
-            .as_ref()
-            .map(|s| Arc::clone(&s.key))
+    /// Bind this process-local cache to the durable slot directory.  Each
+    /// process refreshes before it signs or resolves, so `--ipc` workers see a
+    /// promotion made by the OAuth process rather than retaining a stale key.
+    pub fn bind_secrets_dir(&self, secrets_dir: PathBuf) {
+        *self.2.write() = Some(secrets_dir);
     }
 
-    pub async fn all_slots_snapshot(&self) -> Vec<Es256KeySlot> {
-        self.0.read().await.all().into_iter().cloned().collect()
+    pub fn refresh_from_disk(&self) {
+        let Some(secrets_dir) = self.2.read().clone() else {
+            return;
+        };
+        let active = load_es256_slot(&secrets_dir, "active");
+        // Never replace a usable in-memory authority with a partially written
+        // or unavailable filesystem snapshot.
+        let Some(active) = active else {
+            warn!("ES256: durable active slot unavailable; retaining cached authority");
+            return;
+        };
+        *self.0.write() = Es256KeySlots {
+            drain: load_es256_slot(&secrets_dir, "drain"),
+            active: Some(active),
+            lead: load_es256_slot(&secrets_dir, "lead"),
+        };
     }
+
+    /// Install the in-process action run while a lead → active transition is
+    /// still hidden behind the store write guard. The publisher stores a weak
+    /// self-reference in this hook, so the shared key store does not keep the
+    /// service alive. Cross-`--ipc` promotion delivery remains tracked by
+    /// #1123.
+    pub(crate) fn set_promotion_hook(&self, hook: Arc<Es256PromotionHook>) {
+        *self.1.write() = Some(hook);
+    }
+
+    fn notify_promotion(&self, key: Arc<Es256SigningKey>) -> anyhow::Result<()> {
+        let hook = self.1.read().clone();
+        if let Some(hook) = hook {
+            hook(key)?;
+        }
+        Ok(())
+    }
+
+    /// The current active ES256 signing key — the single `#atproto` key the
+    /// DID document publishes and the repo head is signed with (#918
+    /// re-sign-on-rotation). Synchronous (parking_lot lock) so the publisher
+    /// can resolve the LIVE key at sign time without an async runtime.
+    pub fn active_key(&self) -> Option<Arc<Es256SigningKey>> {
+        self.refresh_from_disk();
+        self.0.read().active.as_ref().map(|s| Arc::clone(&s.key))
+    }
+
+    /// Take active, drain and lead from one read guard so a DID document never
+    /// mixes two rotation generations.
+    pub fn slots_snapshot(&self) -> Es256KeySlots {
+        self.refresh_from_disk();
+        self.0.read().clone()
+    }
+
+    /// The active slot (key + `nbf`/`exp` bounds), if present.
+    pub fn active_slot(&self) -> Option<Es256KeySlot> {
+        self.0.read().active.clone()
+    }
+
+    /// Snapshot the bounded verification-only drain slot, if any.
+    pub fn drain_slot(&self) -> Option<Es256KeySlot> {
+        self.0.read().drain.clone()
+    }
+
+    /// Snapshot the bounded verification-only lead slot, if any. New commits
+    /// are always signed by [`Es256SigningKeyStore::active_key`].
+    pub fn lead_slot(&self) -> Option<Es256KeySlot> {
+        self.0.read().lead.clone()
+    }
+
+    pub fn all_slots_snapshot(&self) -> Vec<Es256KeySlot> {
+        self.0.read().all().into_iter().cloned().collect()
+    }
+}
+
+/// Resolve an ES256 signing key by kid from the persisted slot files in
+/// `secrets_dir` (scans drain/active/lead). Used by the sealed op-log head
+/// reader ([`super::op_log`]) to materialize the active generation's signing
+/// key once the head has authenticated *which* kid is active. Reading from
+/// disk — not the in-memory `OnceLock` — is what makes a cross-process reader
+/// observe a slot promoted by another process.
+pub(crate) fn es256_signing_key_for_kid(secrets_dir: &Path, kid: &str) -> Option<Es256SigningKey> {
+    for name in ["active", "drain", "lead"] {
+        if let Some(slot) = load_es256_slot(secrets_dir, name) {
+            if slot.kid() == kid {
+                return Some((*slot.key).clone());
+            }
+        }
+    }
+    None
 }
 
 // ── ES256 persistence ──────────────────────────────────────────────────────
@@ -1468,7 +1571,11 @@ fn load_es256_slot(secrets_dir: &Path, name: &str) -> Option<Es256KeySlot> {
     Some(Es256KeySlot::new(key, meta.nbf, meta.exp))
 }
 
-fn persist_es256_slot(secrets_dir: &Path, name: &str, slot: &Es256KeySlot) -> anyhow::Result<()> {
+pub(crate) fn persist_es256_slot(
+    secrets_dir: &Path,
+    name: &str,
+    slot: &Es256KeySlot,
+) -> anyhow::Result<()> {
     // Atomic write + 0600 perms (#179).
     super::identity_store::write_secret(
         secrets_dir,
@@ -1506,9 +1613,20 @@ pub fn load_or_init_es256_key_store(
     let active_secs = config.active_secs();
     let lead_secs = config.lead_secs();
 
-    let drain = load_es256_slot(secrets_dir, "drain");
+    let mut drain = load_es256_slot(secrets_dir, "drain");
     let mut active = load_es256_slot(secrets_dir, "active");
-    let lead = load_es256_slot(secrets_dir, "lead");
+    let mut lead = load_es256_slot(secrets_dir, "lead");
+
+    // Do not serve an already-expired bounded method after restart. This is
+    // the same exclusive boundary the verifier and runtime cleanup use.
+    if drain.as_ref().is_some_and(|slot| now >= slot.exp) {
+        delete_es256_slot(secrets_dir, "drain");
+        drain = None;
+    }
+    if lead.as_ref().is_some_and(|slot| now >= slot.exp) {
+        delete_es256_slot(secrets_dir, "lead");
+        lead = None;
+    }
 
     if active.is_none() {
         info!("No active ES256 signing key found — generating on first boot");
@@ -1544,45 +1662,126 @@ pub fn load_or_init_es256_key_store(
     })
 }
 
+/// Returns `true` if the active key was promoted (lead → active). An installed
+/// in-process promotion hook is invoked before the candidate becomes visible.
+///
+/// Promotion is recoverable with respect to the live key: the store write
+/// guard prevents readers from observing the candidate key until persistence
+/// and the persisted repo-head re-sign both succeed. Deployments without an
+/// in-process publisher may omit the hook and rely on the bounded overlap
+/// slots used by `--ipc` workers.
 pub async fn rotate_es256_keys(
     config: &OAuthConfig,
     secrets_dir: &Path,
     store: &Es256SigningKeyStore,
     now: i64,
-) {
-    let mut slots = store.0.write().await;
+) -> bool {
+    let mut slots = store.0.write();
     let active_secs = config.active_secs();
     let lead_secs = config.lead_secs();
     let drain_secs = config.drain_secs();
+    let mut promoted = false;
 
     // Phase 1: promote lead → active if lead.nbf <= now
-    if let Some(ref lead) = slots.lead {
-        if lead.nbf <= now {
-            if let Some(old_active) = slots.active.take() {
-                delete_es256_slot(secrets_dir, "drain");
-                if let Err(e) = persist_es256_slot(secrets_dir, "drain", &old_active) {
-                    warn!("ES256: failed to persist drain slot: {e}");
+    if let Some(new_active) = slots.lead.as_ref().filter(|lead| lead.nbf <= now).cloned() {
+        let old_active = slots.active.clone();
+        let old_drain = slots.drain.clone();
+        let new_drain = old_active.as_ref().map(|old_active| {
+            // The old active key becomes verification-only for one bounded
+            // drain interval. Store the actual publication expiry in the slot
+            // itself so the DID document and cleanup use one boundary.
+            Es256KeySlot::new(
+                old_active.key.as_ref().clone(),
+                old_active.nbf,
+                now.saturating_add(drain_secs),
+            )
+        });
+
+        // Persist drain before active. A process that reloads between the two
+        // writes can therefore still verify K-signed commits.
+        if let Some(ref drain) = new_drain {
+            if let Err(error) = persist_es256_slot(secrets_dir, "drain", drain) {
+                if let Some(ref old_drain) = old_drain {
+                    let _ = persist_es256_slot(secrets_dir, "drain", old_drain);
+                } else {
+                    delete_es256_slot(secrets_dir, "drain");
                 }
-                slots.drain = Some(old_active);
-            }
-            if let Some(new_active) = slots.lead.take() {
-                if let Err(e) = persist_es256_slot(secrets_dir, "active", &new_active) {
-                    warn!("ES256: failed to persist promoted active: {e}");
-                }
-                delete_es256_slot(secrets_dir, "lead");
-                slots.active = Some(new_active);
-                info!("ES256: promoted lead → active");
+                warn!("ES256: failed to persist drain slot; retaining old active: {error}");
+                return false;
             }
         }
+
+        if let Err(error) = persist_es256_slot(secrets_dir, "active", &new_active) {
+            if let Some(ref old_active) = old_active {
+                let _ = persist_es256_slot(secrets_dir, "active", old_active);
+            } else {
+                delete_es256_slot(secrets_dir, "active");
+            }
+            if let Some(ref old_drain) = old_drain {
+                let _ = persist_es256_slot(secrets_dir, "drain", old_drain);
+            } else {
+                delete_es256_slot(secrets_dir, "drain");
+            }
+            warn!("ES256: failed to persist promoted active; retaining old active: {error}");
+            return false;
+        }
+
+        if let Err(error) = store.notify_promotion(Arc::clone(&new_active.key)) {
+            // A hook may have committed the candidate head before returning an
+            // error. Re-sign with the old key defensively, then restore the
+            // durable slot generation so the queued lead can be retried.
+            if let Some(ref old_active) = old_active {
+                if let Err(rollback_error) = store.notify_promotion(Arc::clone(&old_active.key)) {
+                    warn!(
+                        "ES256: failed to restore PDS head after promotion failure: {rollback_error}"
+                    );
+                }
+                if let Err(rollback_error) = persist_es256_slot(secrets_dir, "active", old_active) {
+                    warn!(
+                        "ES256: failed to restore persisted active after promotion failure: {rollback_error}"
+                    );
+                }
+            } else {
+                delete_es256_slot(secrets_dir, "active");
+            }
+            if let Some(ref old_drain) = old_drain {
+                if let Err(rollback_error) = persist_es256_slot(secrets_dir, "drain", old_drain) {
+                    warn!(
+                        "ES256: failed to restore persisted drain after promotion failure: {rollback_error}"
+                    );
+                }
+            } else {
+                delete_es256_slot(secrets_dir, "drain");
+            }
+            warn!(
+                "ES256: failed to re-sign PDS head; retaining old active and retrying next tick: {error}"
+            );
+            return false;
+        }
+
+        delete_es256_slot(secrets_dir, "lead");
+        slots.drain = new_drain.or(old_drain);
+        slots.active = Some(new_active);
+        slots.lead = None;
+        promoted = true;
+        info!("ES256: promoted lead → active");
     }
 
     // Phase 2: remove expired drain
     if let Some(ref drain) = slots.drain {
-        if now >= drain.exp + drain_secs {
+        if now >= drain.exp {
             delete_es256_slot(secrets_dir, "drain");
             slots.drain = None;
             info!("ES256: removed expired drain slot");
         }
+    }
+
+    // A lead is publication-only and must not survive its own bounded window
+    // if an administrator supplied inconsistent slot files.
+    if slots.lead.as_ref().is_some_and(|lead| now >= lead.exp) {
+        delete_es256_slot(secrets_dir, "lead");
+        slots.lead = None;
+        info!("ES256: removed expired lead slot");
     }
 
     // Phase 3: generate lead if active is near expiry
@@ -1599,6 +1798,7 @@ pub async fn rotate_es256_keys(
             slots.lead = Some(new_lead);
         }
     }
+    promoted
 }
 
 // ════════════════════════════════════════════════════════════════════════════════
@@ -1982,7 +2182,10 @@ mod tests {
         configure_composite_authority(dir);
         initialize_composite_key_set(dir, &ed, &pq, ca, 300).await?;
         if subscribe {
-            start_composite_authority_subscription(dir.to_path_buf(), authority_ca_key().verifying_key())?;
+            start_composite_authority_subscription(
+                dir.to_path_buf(),
+                authority_ca_key().verifying_key(),
+            )?;
         }
         Ok((ed, pq))
     }
@@ -2124,19 +2327,20 @@ mod tests {
                     state.pending_codes.write().await.insert(
                         code.to_owned(),
                         crate::services::oauth::state::PendingAuthCode {
-                        code: code.to_owned(),
-                        client_id: "multiprocess-client".to_owned(),
-                        redirect_uri: "https://client.test/callback".to_owned(),
-                        code_challenge: challenge.clone(),
-                        scopes: vec!["read".to_owned()],
-                        resource: Some("multiprocess".to_owned()),
-                        oidc_nonce: None,
-                        created_at: std::time::Instant::now(),
-                        expires_at: std::time::Instant::now() + std::time::Duration::from_secs(60),
-                        username: "multiprocess-oauth".to_owned(),
-                        verifying_key: None,
-                        dpop_jkt: None,
-                        client_assertion_jkt: None,
+                            code: code.to_owned(),
+                            client_id: "multiprocess-client".to_owned(),
+                            redirect_uri: "https://client.test/callback".to_owned(),
+                            code_challenge: challenge.clone(),
+                            scopes: vec!["read".to_owned()],
+                            resource: Some("multiprocess".to_owned()),
+                            oidc_nonce: None,
+                            created_at: std::time::Instant::now(),
+                            expires_at: std::time::Instant::now()
+                                + std::time::Duration::from_secs(60),
+                            username: "multiprocess-oauth".to_owned(),
+                            verifying_key: None,
+                            dpop_jkt: None,
+                            client_assertion_jkt: None,
                         },
                     );
                 }
@@ -2320,9 +2524,7 @@ mod tests {
                     Arc::new(SigningKey::from_bytes(&[0x73; 32])),
                     crate::config::TokenConfig::default(),
                     git2db,
-                    hyprstream_rpc::transport::TransportConfig::ipc(
-                        dir.join("stale-policy.sock"),
-                    ),
+                    hyprstream_rpc::transport::TransportConfig::ipc(dir.join("stale-policy.sock")),
                 )
                 .with_default_audience("multiprocess".to_owned());
                 let shutdown = Arc::new(tokio::sync::Notify::new());
@@ -2388,22 +2590,16 @@ mod tests {
             return;
         };
         let runtime = tokio::runtime::Runtime::new().unwrap();
-        runtime.block_on(async {
-            let config = test_config();
-            let ed = load_or_init_key_store(&dir, &config);
-            let pq = load_or_init_ml_dsa_key_store(&dir, &config);
-            mutate_authority_for_failure(&ed, &pq, Some(&dir)).await;
-            let expected = std::fs::read_to_string(dir.join("crash-expected-digest"))?;
-            refresh_composite_key_set(
-                &dir,
-                &ed,
-                &pq,
-                authority_ca_key(),
-                300,
-                &expected,
-            )
-            .await
-        }).unwrap();
+        runtime
+            .block_on(async {
+                let config = test_config();
+                let ed = load_or_init_key_store(&dir, &config);
+                let pq = load_or_init_ml_dsa_key_store(&dir, &config);
+                mutate_authority_for_failure(&ed, &pq, Some(&dir)).await;
+                let expected = std::fs::read_to_string(dir.join("crash-expected-digest"))?;
+                refresh_composite_key_set(&dir, &ed, &pq, authority_ca_key(), 300, &expected).await
+            })
+            .unwrap();
         panic!("crash mutation returned instead of exiting after stage");
     }
 
@@ -2420,16 +2616,10 @@ mod tests {
                 let pq = load_or_init_ml_dsa_key_store(&dir, &config);
                 mutate_authority_for_failure(&ed, &pq, None).await;
                 let expected = std::fs::read_to_string(dir.join("timeout-expected-digest"))?;
-                let error = refresh_composite_key_set(
-                    &dir,
-                    &ed,
-                    &pq,
-                    authority_ca_key(),
-                    300,
-                    &expected,
-                )
-                .await
-                .expect_err("unacknowledged composite generation committed");
+                let error =
+                    refresh_composite_key_set(&dir, &ed, &pq, authority_ca_key(), 300, &expected)
+                        .await
+                        .expect_err("unacknowledged composite generation committed");
                 anyhow::ensure!(
                     error.to_string().contains("was not acknowledged"),
                     "unexpected acknowledgement-timeout error: {error:#}"
@@ -2901,10 +3091,9 @@ mod tests {
         );
         wait_path(&dir.path().join("timeout-writer-refused"));
         assert!(timing_out_writer.wait().unwrap().success());
-        let committed_after_timeout: CompositeCommit = serde_json::from_slice(
-            &std::fs::read(composite_committed_path(dir.path())).unwrap(),
-        )
-        .unwrap();
+        let committed_after_timeout: CompositeCommit =
+            serde_json::from_slice(&std::fs::read(composite_committed_path(dir.path())).unwrap())
+                .unwrap();
         assert_eq!(committed_after_timeout.version, committed.version);
         assert_eq!(
             committed_after_timeout.component_digest,
@@ -2927,7 +3116,10 @@ mod tests {
         let pending_after_crash: CompositeLedger =
             serde_json::from_slice(&std::fs::read(composite_ledger_path(dir.path())).unwrap())
                 .unwrap();
-        assert_ne!(pending_after_crash.component_digest, committed.component_digest);
+        assert_ne!(
+            pending_after_crash.component_digest,
+            committed.component_digest
+        );
         let (post_crash_token, post_crash_jwks) = runtime
             .block_on(async {
                 let client = reqwest::Client::new();
@@ -3190,8 +3382,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let config = test_config();
         let store = load_or_init_es256_key_store(dir.path(), &config);
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let key = rt.block_on(store.active_key());
+        let key = store.active_key();
         assert!(key.is_some());
     }
 
@@ -3200,17 +3391,31 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let config = test_config();
         let store1 = load_or_init_es256_key_store(dir.path(), &config);
-        let rt = tokio::runtime::Runtime::new().unwrap();
         let kid1 = {
-            let slots = rt.block_on(store1.all_slots_snapshot());
+            let slots = store1.all_slots_snapshot();
             slots[0].kid()
         };
         let store2 = load_or_init_es256_key_store(dir.path(), &config);
         let kid2 = {
-            let slots = rt.block_on(store2.all_slots_snapshot());
+            let slots = store2.all_slots_snapshot();
             slots[0].kid()
         };
         assert_eq!(kid1, kid2, "ES256 key must survive reload from disk");
+    }
+
+    #[test]
+    fn es256_startup_removes_expired_bounded_slots() {
+        let dir = TempDir::new().unwrap();
+        let config = test_config();
+        let now = chrono::Utc::now().timestamp();
+        let active = generate_es256_slot(now - 60, now + 86_400);
+        let expired_drain = generate_es256_slot(now - 120, now);
+        persist_es256_slot(dir.path(), "active", &active).unwrap();
+        persist_es256_slot(dir.path(), "drain", &expired_drain).unwrap();
+
+        let store = load_or_init_es256_key_store(dir.path(), &config);
+        assert!(store.drain_slot().is_none());
+        assert!(load_es256_slot(dir.path(), "drain").is_none());
     }
 
     #[tokio::test]
@@ -3230,13 +3435,153 @@ mod tests {
             active: Some(active),
             lead: Some(lead),
         });
+        store.set_promotion_hook(Arc::new(|_| Ok(())));
 
         rotate_es256_keys(&config, dir.path(), &store, now).await;
 
-        let slots = store.0.read().await;
+        let slots = store.0.read();
         assert_eq!(slots.active.as_ref().unwrap().kid(), lead_kid);
         assert!(slots.drain.is_some());
         assert!(slots.lead.is_none());
+    }
+
+    #[tokio::test]
+    async fn es256_drain_is_removed_at_its_published_expiry() {
+        let dir = TempDir::new().unwrap();
+        let config = test_config();
+        let now = chrono::Utc::now().timestamp();
+        let active = generate_es256_slot(now - 14 * 86400, now + 1);
+        let lead = generate_es256_slot(now - 1, now + 14 * 86400);
+        let store = Es256SigningKeyStore::new(Es256KeySlots {
+            drain: None,
+            active: Some(active),
+            lead: Some(lead),
+        });
+        store.set_promotion_hook(Arc::new(|_| Ok(())));
+
+        assert!(rotate_es256_keys(&config, dir.path(), &store, now).await);
+        let published_expiry = store.drain_slot().expect("drain after promotion").exp;
+        assert!(
+            rotate_es256_keys(&config, dir.path(), &store, published_expiry).await
+                || store.active_slot().is_some(),
+            "cleanup tick remains operational"
+        );
+        assert!(
+            store.drain_slot().is_none(),
+            "the drain slot must leave the publication source at its expiry"
+        );
+    }
+
+    #[tokio::test]
+    async fn es256_rotate_without_hook_publishes_drain_for_ipc_workers() {
+        let dir = TempDir::new().unwrap();
+        let config = test_config();
+        let now = chrono::Utc::now().timestamp();
+
+        let active = generate_es256_slot(now - 14 * 86400, now + 1);
+        let active_kid = active.kid();
+        let lead = generate_es256_slot(now - 1, now + 14 * 86400);
+        let lead_kid = lead.kid();
+        persist_es256_slot(dir.path(), "active", &active).unwrap();
+        persist_es256_slot(dir.path(), "lead", &lead).unwrap();
+        let store = Es256SigningKeyStore::new(Es256KeySlots {
+            drain: None,
+            active: Some(active),
+            lead: Some(lead),
+        });
+
+        assert!(rotate_es256_keys(&config, dir.path(), &store, now).await);
+        let slots = store.0.read();
+        assert_eq!(slots.active.as_ref().unwrap().kid(), lead_kid);
+        assert!(slots.lead.is_none());
+        assert_eq!(slots.drain.as_ref().unwrap().kid(), active_kid);
+        assert_eq!(
+            load_es256_slot(dir.path(), "active").unwrap().kid(),
+            lead_kid
+        );
+    }
+
+    #[tokio::test]
+    async fn es256_rotation_retries_after_promotion_hook_failure() {
+        let dir = TempDir::new().unwrap();
+        let config = test_config();
+        let now = chrono::Utc::now().timestamp();
+
+        let active = generate_es256_slot(now - 14 * 86400, now + 1);
+        let active_kid = active.kid();
+        let lead = generate_es256_slot(now - 1, now + 14 * 86400);
+        let lead_kid = lead.kid();
+        persist_es256_slot(dir.path(), "active", &active).unwrap();
+        persist_es256_slot(dir.path(), "lead", &lead).unwrap();
+
+        let store = Es256SigningKeyStore::new(Es256KeySlots {
+            drain: None,
+            active: Some(active),
+            lead: Some(lead),
+        });
+        let fail_once = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let injected_failure = Arc::clone(&fail_once);
+        store.set_promotion_hook(Arc::new(move |_| {
+            if injected_failure.swap(false, Ordering::AcqRel) {
+                anyhow::bail!("injected head re-sign failure");
+            }
+            Ok(())
+        }));
+
+        assert!(
+            !rotate_es256_keys(&config, dir.path(), &store, now).await,
+            "a failed promotion hook must leave the candidate queued"
+        );
+        {
+            let slots = store.0.read();
+            assert_eq!(slots.active.as_ref().unwrap().kid(), active_kid);
+            assert_eq!(slots.lead.as_ref().unwrap().kid(), lead_kid);
+            assert!(slots.drain.is_none());
+        }
+        assert_eq!(
+            load_es256_slot(dir.path(), "active").unwrap().kid(),
+            active_kid,
+            "failed promotion must restore the durable active key"
+        );
+
+        assert!(rotate_es256_keys(&config, dir.path(), &store, now).await);
+        let slots = store.0.read();
+        assert_eq!(slots.active.as_ref().unwrap().kid(), lead_kid);
+        assert!(slots.lead.is_none());
+    }
+
+    #[tokio::test]
+    async fn es256_rotate_retries_after_active_persistence_failure() {
+        let dir = TempDir::new().unwrap();
+        let invalid_secrets_dir = dir.path().join("not-a-directory");
+        std::fs::write(&invalid_secrets_dir, b"file").unwrap();
+        let valid_secrets_dir = dir.path().join("secrets");
+        let config = test_config();
+        let now = chrono::Utc::now().timestamp();
+
+        let active = generate_es256_slot(now - 14 * 86400, now + 1);
+        let active_kid = active.kid();
+        let lead = generate_es256_slot(now - 1, now + 14 * 86400);
+        let lead_kid = lead.kid();
+        let store = Es256SigningKeyStore::new(Es256KeySlots {
+            drain: None,
+            active: Some(active),
+            lead: Some(lead),
+        });
+        assert!(
+            !rotate_es256_keys(&config, &invalid_secrets_dir, &store, now).await,
+            "failed active persistence must not report promotion"
+        );
+        {
+            let slots = store.0.read();
+            assert_eq!(slots.active.as_ref().unwrap().kid(), active_kid);
+            assert_eq!(slots.lead.as_ref().unwrap().kid(), lead_kid);
+        }
+        assert!(
+            rotate_es256_keys(&config, &valid_secrets_dir, &store, now).await,
+            "queued lead must be retried after persistence recovers"
+        );
+        assert_eq!(store.active_slot().unwrap().kid(), lead_kid);
     }
 
     // ── ML-DSA store tests ─────────────────────────────────────────────────
@@ -3343,23 +3688,16 @@ mod tests {
             let ca = Arc::new(SigningKey::from_bytes(&[0x6a; 32]));
             let ed = load_or_init_key_store(dir.path(), &config);
             let pq = load_or_init_ml_dsa_key_store(dir.path(), &config);
-            initialize_composite_key_set(
-                dir.path(),
-                &ed,
-                &pq,
-                Arc::clone(&ca),
-                300,
-            )
-            .await
-            .unwrap();
+            initialize_composite_key_set(dir.path(), &ed, &pq, Arc::clone(&ca), 300)
+                .await
+                .unwrap();
 
             let marker_bytes = std::fs::read(composite_committed_path(dir.path())).unwrap();
             let commit: CompositeCommit = serde_json::from_slice(&marker_bytes).unwrap();
             let immutable = composite_committed_ledger_path(dir.path(), &commit);
-            let mut pending: CompositeLedger = serde_json::from_slice(
-                &std::fs::read(composite_ledger_path(dir.path())).unwrap(),
-            )
-            .unwrap();
+            let mut pending: CompositeLedger =
+                serde_json::from_slice(&std::fs::read(composite_ledger_path(dir.path())).unwrap())
+                    .unwrap();
             pending.version = pending.version.saturating_add(1);
             pending.component_digest = "staged-component-C".to_owned();
             let pending_bytes = serde_json::to_vec(&pending).unwrap();
@@ -3377,15 +3715,9 @@ mod tests {
                 }
             }
 
-            let error = initialize_composite_key_set(
-                dir.path(),
-                &ed,
-                &pq,
-                Arc::clone(&ca),
-                300,
-            )
-            .await
-            .expect_err("marker-selected authority failure must fail closed");
+            let error = initialize_composite_key_set(dir.path(), &ed, &pq, Arc::clone(&ca), 300)
+                .await
+                .expect_err("marker-selected authority failure must fail closed");
             assert!(!error.to_string().is_empty());
             assert_eq!(
                 std::fs::read(composite_committed_path(dir.path())).unwrap(),
@@ -3438,10 +3770,9 @@ mod tests {
         initialize_composite_key_set(dir.path(), &ed, &pq, Arc::clone(&ca), 300)
             .await
             .unwrap();
-        let commit: CompositeCommit = serde_json::from_slice(
-            &std::fs::read(composite_committed_path(dir.path())).unwrap(),
-        )
-        .unwrap();
+        let commit: CompositeCommit =
+            serde_json::from_slice(&std::fs::read(composite_committed_path(dir.path())).unwrap())
+                .unwrap();
         let immutable = composite_committed_ledger_path(dir.path(), &commit);
         let committed_bytes = std::fs::read(&immutable).unwrap();
 
@@ -3453,8 +3784,7 @@ mod tests {
             .unwrap();
         assert_eq!(std::fs::read(&immutable).unwrap(), committed_bytes);
 
-        let mut pending: CompositeLedger =
-            serde_json::from_slice(&committed_bytes).unwrap();
+        let mut pending: CompositeLedger = serde_json::from_slice(&committed_bytes).unwrap();
         pending.version = pending.version.saturating_add(1);
         pending.component_digest = "staged-component-C".to_owned();
         std::fs::write(

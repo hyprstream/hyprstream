@@ -39,10 +39,17 @@ Add the following to `hyprstream.toml`:
 ```toml
 [oauth.trusted_issuers."https://keycloak.example.com/realms/myrealm"]
 jwks_uri = "https://keycloak.example.com/realms/myrealm/protocol/openid-connect/certs"
+# Set this to the Keycloak client whose ID tokens may be exchanged.
+oidc_client_id = "hyprstream-cross-app"
 jwks_cache_ttl_secs = 300
 ```
 
 > **Important:** The key in `trusted_issuers` must match the `iss` claim in Keycloak JWTs exactly, including any trailing slashes.
+
+`oidc_client_id` is required only for RFC 8693 ID-token exchange. Hyprstream
+requires that value in `aud` and, when `aud` contains multiple clients, requires
+the same value in `azp`. Without it, ID-token exchange for this issuer is disabled;
+ordinary access-token validation is unaffected.
 
 ## 4. Grant Access to Keycloak Users
 

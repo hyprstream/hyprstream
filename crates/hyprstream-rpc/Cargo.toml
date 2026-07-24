@@ -37,7 +37,7 @@ subtle = { workspace = true }
 rand = { workspace = true }
 
 # FIPS mode (optional)
-p256 = { workspace = true, optional = true }
+p256 = { workspace = true }
 
 # Post-quantum hybrid — always compiled (PQ mode is selected at RUNTIME via
 # CryptoPolicy, not at compile time). See M3 (#152).
@@ -133,6 +133,7 @@ url = { workspace = true }
 # HTTPS did:web DID-document fetch (#279). Native-only; mirrors the JWKS
 # fetch+cache posture used by FederationKeyResolver in the hyprstream crate.
 reqwest = { workspace = true }
+k256 = { workspace = true }
 
 # Async runtime
 tokio = { workspace = true, features = ["io-util", "net", "sync"] }
@@ -155,7 +156,7 @@ systemd = { version = "0.10", optional = true }
 
 [features]
 default = []
-fips = ["p256", "hmac", "hyprstream-crypto/fips"]  # FIPS mode uses P-256 + HMAC-SHA256 (hkdf is always enabled)
+fips = ["hmac", "hyprstream-crypto/fips"]  # FIPS mode uses P-256 + HMAC-SHA256 (hkdf is always enabled)
 # `pq-hybrid` is retained as a NO-OP alias for source/build compatibility.
 # Post-quantum primitives (ML-DSA-65 + ML-KEM-768) are always compiled and the
 # production policy is the pinned Hybrid suite.

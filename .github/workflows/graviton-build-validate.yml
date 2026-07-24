@@ -15,6 +15,12 @@ name: Graviton Build Validation
 # reaches the default branch).
 on:
   workflow_dispatch:
+    inputs:
+      cuda_spike:
+        description: 'Run the experimental arm64 CUDA 13.0 wheel compatibility spike'
+        required: false
+        type: boolean
+        default: false
   # Re-run on changes that can affect the arm64 build — the Dockerfile
   # (toolchain), workspace source (arch-specific fixes), or this workflow.
   push:
@@ -31,6 +37,9 @@ permissions:
 
 jobs:
   build-arm64:
+    # A CUDA-spike dispatch runs its dedicated job below; avoid consuming a
+    # second Graviton runner with the normal CPU validation at the same time.
+    if: ${{ !inputs.cuda_spike }}
     runs-on: [self-hosted, linux, arm64, graviton, hyprstream-merge-gate]
     timeout-minutes: 150
     steps:
@@ -84,3 +93,46 @@ jobs:
             -e CARGO_TERM_COLOR=always \
             hyprstream-builder-arm64:ci \
             cargo build --release --no-default-features --features otel,gittorrent,xet
+
+  cuda130-arm64-spike:
+    # The Dockerfile target and normal dispatch-only workflow live on this
+    # branch. This mirror exists solely because GitHub permits dispatching only
+    # workflows already present on the default branch.
+    if: inputs.cuda_spike
+    runs-on: [self-hosted, linux, arm64, graviton, hyprstream-merge-gate]
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build the arm64 CUDA libtorch spike image
+        run: |
+          podman build \
+            --target builder-cuda130-arm64-spike \
+            -t hyprstream-cuda130-arm64-spike:ci \
+            -f Dockerfile \
+            .
+
+      - name: Verify native CUDA wheel and compile Hyprstream
+        run: |
+          podman run --rm \
+            -v "$PWD":/build:Z -w /build \
+            -e OPENSSL_NO_VENDOR=1 \
+            -e LIBTORCH=/opt/libtorch \
+            -e LD_LIBRARY_PATH=/opt/libtorch/lib \
+            -e LIBTORCH_BYPASS_VERSION_CHECK=1 \
+            -e CARGO_INCREMENTAL=0 \
+            hyprstream-cuda130-arm64-spike:ci \
+            bash -euo pipefail -c '
+              test -s /opt/libtorch/lib/libtorch_cuda.so
+              python3 -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available())"
+              cargo build -p hyprstream --release --features otel
+              ldd target/release/hyprstream | grep -E "libtorch|not found" || true
+            '
+
+      - name: Record GPU availability
+        run: |
+          if command -v nvidia-smi >/dev/null; then
+            nvidia-smi || echo "::notice::nvidia-smi is installed but no usable NVIDIA driver/device is attached"
+          else
+            echo '::notice::No NVIDIA device is attached to this Graviton build runner; this spike validates packaging and linking only.'
+          fi

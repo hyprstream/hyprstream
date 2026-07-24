@@ -49,6 +49,7 @@ use hyprstream_pds::car::{build_record_proof_car, car_block_bytes, car_header_by
 use hyprstream_pds::commit::Commit;
 use hyprstream_pds::mst::{Node, NodeData};
 use hyprstream_pds::record::{ModelRecord, COLLECTION_NSID};
+use hyprstream_pds::repo_authority::accept_repo_authority;
 use hyprstream_pds::tid::Tid;
 use hyprstream_pds::Cid;
 
@@ -138,6 +139,8 @@ impl RepoSnapshot {
         let atproto = AtprotoIdentity {
             p256_vk: &self.atproto_vk,
             handle: &self.handle,
+            drain: None,
+            lead: None,
         };
         build_did_document(&self.did, issuer_url, &[], Some(&atproto), &[], None, None)
     }
@@ -164,9 +167,11 @@ impl XrpcRepoStore {
         Self::default()
     }
 
-    /// Insert or replace a snapshot for a DID.
-    pub async fn put(&self, snap: RepoSnapshot) {
+    /// Insert or replace a snapshot for an atproto-valid repo authority.
+    pub async fn put(&self, snap: RepoSnapshot) -> anyhow::Result<()> {
+        accept_repo_authority(&snap.did)?;
         self.by_did.write().await.insert(snap.did.clone(), Arc::new(snap));
+        Ok(())
     }
 
     /// Look up a snapshot by DID (any visibility — for internal/admin use).
@@ -728,7 +733,7 @@ mod tests {
     #[tokio::test]
     async fn endpoint_non_public_invisible_describe_repo() {
         let store = XrpcRepoStore::new();
-        store.put(sample_snapshot("did:web:priv.example.com", "priv.example.com", false)).await;
+        store.put(sample_snapshot("did:web:priv.example.com", "priv.example.com", false)).await.unwrap();
         let resp = describe_repo_core(&store, ISSUER, "did:web:priv.example.com").await;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         let body = body_json(resp).await;
@@ -738,7 +743,7 @@ mod tests {
     #[tokio::test]
     async fn endpoint_non_public_invisible_get_record() {
         let store = XrpcRepoStore::new();
-        store.put(sample_snapshot("did:web:priv.example.com", "priv.example.com", false)).await;
+        store.put(sample_snapshot("did:web:priv.example.com", "priv.example.com", false)).await.unwrap();
         let resp = get_record_core(
             &store,
             "did:web:priv.example.com",
@@ -755,7 +760,7 @@ mod tests {
     #[tokio::test]
     async fn endpoint_non_public_invisible_get_repo() {
         let store = XrpcRepoStore::new();
-        store.put(sample_snapshot("did:web:priv.example.com", "priv.example.com", false)).await;
+        store.put(sample_snapshot("did:web:priv.example.com", "priv.example.com", false)).await.unwrap();
         let resp = get_repo_core(&store, "did:web:priv.example.com", false).await;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         let body = body_json(resp).await;
@@ -765,7 +770,7 @@ mod tests {
     #[tokio::test]
     async fn endpoint_non_public_invisible_resolve_handle() {
         let store = XrpcRepoStore::new();
-        store.put(sample_snapshot("did:web:priv.example.com", "priv.example.com", false)).await;
+        store.put(sample_snapshot("did:web:priv.example.com", "priv.example.com", false)).await.unwrap();
         let resp = resolve_handle_core(&store, ISSUER, "priv.example.com").await;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         let body = body_json(resp).await;
@@ -775,7 +780,7 @@ mod tests {
     #[tokio::test]
     async fn endpoint_public_snapshot_visible_describe_repo() {
         let store = XrpcRepoStore::new();
-        store.put(sample_snapshot("did:web:pub.example.com", "pub.example.com", true)).await;
+        store.put(sample_snapshot("did:web:pub.example.com", "pub.example.com", true)).await.unwrap();
         let resp = describe_repo_core(&store, ISSUER, "did:web:pub.example.com").await;
         assert_eq!(resp.status(), StatusCode::OK);
         let body = body_json(resp).await;
@@ -785,11 +790,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn store_rejects_path_form_did_web_snapshot() {
+        let store = XrpcRepoStore::new();
+        let did = "did:web:accounts.example:users:alice";
+        let err = store
+            .put(sample_snapshot(did, "alice.example", true))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("path-form did:web"));
+        assert!(store.get(did).await.is_none());
+    }
+
+    #[tokio::test]
     async fn endpoint_get_record_cid_mismatch() {
         let store = XrpcRepoStore::new();
         let snap = sample_snapshot("did:web:pub.example.com", "pub.example.com", true);
         let rkey = snap.records.keys().next().unwrap().encode();
-        store.put(snap).await;
+        store.put(snap).await.unwrap();
         let resp = get_record_core(
             &store,
             "did:web:pub.example.com",
@@ -809,7 +826,7 @@ mod tests {
         let snap = sample_snapshot("did:web:pub.example.com", "pub.example.com", true);
         let rkey = snap.records.keys().next().unwrap().encode();
         let cid = snap.records.values().next().unwrap().cid().to_string();
-        store.put(snap).await;
+        store.put(snap).await.unwrap();
         let resp =
             get_record_core(&store, "did:web:pub.example.com", HOSTED_COLLECTION, &rkey, Some(&cid))
                 .await;
@@ -821,7 +838,7 @@ mod tests {
     #[tokio::test]
     async fn since_non_empty_rejected() {
         let store = XrpcRepoStore::new();
-        store.put(sample_snapshot("did:web:pub.example.com", "pub.example.com", true)).await;
+        store.put(sample_snapshot("did:web:pub.example.com", "pub.example.com", true)).await.unwrap();
         let resp = get_repo_core(&store, "did:web:pub.example.com", true).await;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         let body = body_json(resp).await;
@@ -831,7 +848,7 @@ mod tests {
     #[tokio::test]
     async fn get_repo_without_since_succeeds() {
         let store = XrpcRepoStore::new();
-        store.put(sample_snapshot("did:web:pub.example.com", "pub.example.com", true)).await;
+        store.put(sample_snapshot("did:web:pub.example.com", "pub.example.com", true)).await.unwrap();
         let resp = get_repo_core(&store, "did:web:pub.example.com", false).await;
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(
@@ -931,11 +948,13 @@ mod tests {
         state
             .xrpc_repos
             .put(sample_snapshot("did:web:pub.example.com", "pub.example.com", true))
-            .await;
+            .await
+            .unwrap();
         state
             .xrpc_repos
             .put(sample_snapshot("did:web:priv.example.com", "priv.example.com", false))
-            .await;
+            .await
+            .unwrap();
         state
     }
 
@@ -1259,7 +1278,7 @@ mod tests {
         let snap = sample_snapshot_fixed_tid("did:web:fixed.example.com", "fixed.example.com", true);
         let rkey = snap.records.keys().next().unwrap().encode();
         let cid = snap.records.values().next().unwrap().cid().to_string();
-        state.xrpc_repos.put(snap).await;
+        state.xrpc_repos.put(snap).await.unwrap();
         let app = build_production_app_from_state(state).await;
         let uri = format!(
             "/xrpc/com.atproto.repo.getRecord?repo=did:web:fixed.example.com\
@@ -1277,7 +1296,7 @@ mod tests {
         let state = build_test_state(true).await;
         let snap = sample_snapshot_fixed_tid("did:web:fixed.example.com", "fixed.example.com", true);
         let rkey = snap.records.keys().next().unwrap().encode();
-        state.xrpc_repos.put(snap).await;
+        state.xrpc_repos.put(snap).await.unwrap();
         let app = build_production_app_from_state(state).await;
         let uri = format!(
             "/xrpc/com.atproto.repo.getRecord?repo=did:web:fixed.example.com\

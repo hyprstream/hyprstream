@@ -1166,8 +1166,17 @@ fn handle_quick_command(
                             .as_ref()
                             .map(|w| w.backend.clone())
                             .unwrap_or_else(|| "auto".to_owned());
+                        let ninep_decider =
+                            hyprstream_core::mac::production_ninep_decider(
+                                signing_key.clone(),
+                                &ctx.config().oauth,
+                                "ninep-worker",
+                            )
+                            .await
+                            .context("construct worker 9P MAC PEP")?;
                         let backend_ctx = BackendCtx {
                             pool_config: pool_config.clone(),
+                            ninep_decider,
                             #[cfg(feature = "oci-image")]
                             image_config,
                             #[cfg(feature = "oci-image")]
@@ -1455,8 +1464,15 @@ fn resolve_service_vk(service_name: &str) -> Option<VerifyingKey> {
     trust.resolve_one(service_name)
 }
 
-fn install_process_production_resolver(signing_key: &SigningKey) -> Result<()> {
-    hyprstream_discovery::bootstrap_deployment_process(signing_key.clone())?;
+async fn install_process_production_resolver(
+    signing_key: &SigningKey,
+    config: &HyprConfig,
+) -> Result<()> {
+    let trust_source = hyprstream_discovery::DeploymentTrustSource::from_anchors(
+        config.cluster_at9p_did.as_deref(),
+        config.cluster_did_web.as_deref(),
+    )?;
+    hyprstream_discovery::bootstrap_deployment_process(signing_key.clone(), trust_source).await?;
     hyprstream_rpc::envelope::install_browser_currentness_verifier(
         hyprstream_discovery::production_browser_currentness_verifier()?,
     )
@@ -1896,7 +1912,7 @@ fn main() -> Result<()> {
             let signing_key = load_or_generate_signing_key(&keys_dir).await?;
             let verifying_key = signing_key.verifying_key();
 
-            install_process_production_resolver(&signing_key)
+            install_process_production_resolver(&signing_key, &config).await
                 .context("Failed to install checkpoint-backed production resolver")?;
             let client = hyprstream_core::services::RegistryClient::from_resolver(
                 signing_key.clone(),
@@ -1986,9 +2002,8 @@ fn main() -> Result<()> {
                     // foreground (the mode that actually hosts services, incl.
                     // systemd ExecStart and standalone-spawned children),
                     // standalone, and the systemd/spawner dispatch below.
-                    // DORMANT — this only emits the activation coverage-gate
-                    // evidence (which nodes are labeled / would deny); it flips
-                    // no decider to enforcing (see `mac::genesis`).
+                    // Emit the coverage-gate evidence consumed by the active
+                    // 9P translator PEP (see `mac::genesis`).
                     hyprstream_core::mac::GenesisGate::production().log_report();
 
                     if foreground || standalone {
@@ -2113,12 +2128,21 @@ fn main() -> Result<()> {
                                         }
                                     }
 
-                                    // C3 fix: systemd uses flat %d/signing-key, standalone uses subdirectory.
+                                    // C3 fix: scoped credential providers use flat
+                                    // %d/signing-key, while standalone uses a subdirectory.
                                     // #759: "policy" always resolves to the flat root/CA key regardless of
-                                    // deployment mode — see `resolve_service_signing_key` for why.
-                                    let systemd_mode = std::env::var("HYPRSTREAM__SECRETS__PATH").is_ok();
+                                    // secrets profile — see `resolve_service_signing_key` for why.
+                                    let secrets_profile = if std::env::var(
+                                        "HYPRSTREAM__SECRETS__PATH",
+                                    )
+                                    .is_ok()
+                                    {
+                                        hyprstream_core::auth::identity_store::SecretsProfile::PerServiceScoped
+                                    } else {
+                                        hyprstream_core::auth::identity_store::SecretsProfile::SharedDirectory
+                                    };
                                     let own_key = hyprstream_core::auth::identity_store::resolve_service_signing_key(
-                                        &secrets_dir, &name, systemd_mode,
+                                        &secrets_dir, &name, secrets_profile,
                                     )?;
 
                                     if name == "policy" {
@@ -2198,7 +2222,11 @@ fn main() -> Result<()> {
                                     // key — see `resolve_service_signing_key` for why. This mirrors the
                                     // same fix applied to the `--ipc` branch above.
                                     for svc_name in &service_names {
-                                        let svc_key = hyprstream_core::auth::identity_store::resolve_service_signing_key(&secrets_dir, svc_name, false)
+                                        let svc_key = hyprstream_core::auth::identity_store::resolve_service_signing_key(
+                                            &secrets_dir,
+                                            svc_name,
+                                            hyprstream_core::auth::identity_store::SecretsProfile::SharedDirectory,
+                                        )
                                             .with_context(|| format!("Failed to load signing key for service '{}'", svc_name))?;
                                         ctx = ctx.with_service_key(svc_name, svc_key.clone());
 
@@ -2386,10 +2414,8 @@ fn main() -> Result<()> {
                                     // `DenyUnlabeledResolver` to the real (#698)
                                     // `EnrollmentSubjectContextResolver`.
                                     //
-                                    // DORMANT: installing a compiled policy does NOT
-                                    // enable enforcement — the per-op deciders stay
-                                    // AllowAll (no PEP consults this PDP yet). It only
-                                    // makes the PDP inputs real.
+                                    // The 9P PEP is active and records the
+                                    // bootloaded policy as audit provenance.
                                     //
                                     // Fail-closed: the baseline is hybrid-signed
                                     // (EdDSA + ML-DSA-65) and verified with
@@ -2408,7 +2434,7 @@ fn main() -> Result<()> {
                                         ) {
                                             Ok((policy, true)) => tracing::info!(
                                                 "MAC S4: baseline compiled policy installed \
-                                                 (generation {}, DORMANT — enforcement not enabled)",
+                                                 (generation {}, 9P enforcement active)",
                                                 policy.generation
                                             ),
                                             // The seam is write-once: a policy was
@@ -2852,10 +2878,10 @@ mod resolver_startup_controls {
             .next()
             .expect("production binary source");
         let startup = production
-            .find("install_process_production_resolver(&signing_key)")
+            .find("install_process_production_resolver(&signing_key, &config).await")
             .expect("trusted startup boundary");
         let install = production[startup..]
-            .find("install_process_production_resolver(&signing_key)")
+            .find("install_process_production_resolver(&signing_key, &config).await")
             .expect("process resolver install");
         let first_generated = production[startup..]
             .find("RegistryClient::from_resolver(")
@@ -2867,7 +2893,7 @@ mod resolver_startup_controls {
         assert!(first_generated < command_dispatch);
         assert_eq!(
             production
-                .matches("install_process_production_resolver(&signing_key)")
+                .matches("install_process_production_resolver(&signing_key, &config).await")
                 .count(),
             1
         );

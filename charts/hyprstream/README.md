@@ -55,6 +55,56 @@ Values are documented inline in `values.yaml`. Highlights:
 - `config.tls.enabled` — false by default so in-cluster HTTP probes and the
   port-forward quick start use plain HTTP on the oai Service port.
 
+## Custom Resource Definitions (K5a, #788)
+
+The chart's `crds/` directory ships the five hyprstream CRDs, which Helm
+installs before any template:
+
+| Group | Kind | Scope |
+|-------|------|-------|
+| `models.hyprstream.io/v1alpha1` | `Model`, `Adapter` | Namespaced |
+| `training.hyprstream.io/v1alpha1` | `TrainingRun` | Namespaced |
+| `serving.hyprstream.io/v1alpha1` | `InferenceService` | Namespaced |
+| `mesh.hyprstream.io/v1alpha1` | `TenantBinding` | **Cluster** |
+
+The YAML is generated from the Rust types in `crates/hyprstream-k8s` (single
+source of truth) — regenerate both committed copies with
+`cargo run -p hyprstream-k8s --bin gen-crds`; never edit the chart copies by
+hand. `TenantBinding` is deliberately cluster-scoped: it is the explicit,
+admin-created namespace↔tenant mapping (the #778 confused-deputy fix), so a
+tenant confined to its own namespace cannot forge one. All CRDs follow the
+single-writer rule — `spec` is desired STEP intent, `status` is observed
+git/runtime truth; git owns the weights.
+
+### Upgrades install CRDs once — schema changes need an out-of-band apply
+
+**Helm installs everything in `crds/` on first install and never touches it again.**
+`helm upgrade` does not create, update, or delete CRDs — that is a deliberate Helm
+design decision, not a chart limitation. So a schema change shipped in a new chart
+version **will not reach a cluster that already has the CRDs installed**, and the
+symptom is silent: the chart upgrades cleanly, the new fields simply do not exist, and
+resources using them are rejected by the apiserver as unknown fields.
+
+Apply schema changes out of band before upgrading the release:
+
+```bash
+kubectl apply -f charts/hyprstream/crds/
+helm upgrade hyprstream charts/hyprstream --namespace hyprstream
+```
+
+**Treat every CRD schema change as a migration.** Once a CRD is live, its stored
+resources are real data: removing or narrowing a field, tightening a CEL rule, or
+changing an enum can invalidate objects that already exist in etcd. `v1alpha1`
+signals that breaking changes are expected — it does not make them cheap. There is a
+single version today, so no conversion strategy is exercised yet; the conversion
+webhook is K5b's, and until it exists a stored-version change requires operator
+action rather than an automatic upgrade path.
+
+`helm uninstall` likewise leaves CRDs and their custom resources in place. That is
+usually what you want — uninstalling the release should not delete a tenant's
+`TenantBinding` records — but it means a reinstall inherits whatever schema was
+already there.
+
 ## Key/trust bootstrap
 
 Set `keyBootstrap.enabled=true` to mount the flat credential directory expected

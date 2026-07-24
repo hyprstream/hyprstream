@@ -7,6 +7,17 @@
 use anyhow::Result;
 use ed25519_dalek::VerifyingKey;
 
+/// One named Ed25519 key published in a federation JWKS.
+///
+/// `kid` stays attached to its key until verification.  Collapsing this to a
+/// bare `VerifyingKey` would let a token that names one key verify with a
+/// different, merely co-published key.
+#[derive(Clone, Debug)]
+pub struct FederationKey {
+    pub kid: Option<String>,
+    pub verifying_key: VerifyingKey,
+}
+
 /// Resolves external JWT issuer URLs to Ed25519 verifying keys.
 ///
 /// Implemented by `hyprstream::auth::FederationKeyResolver`. Services that
@@ -14,9 +25,21 @@ use ed25519_dalek::VerifyingKey;
 /// `RequestService::federation_key_source()` so the default `verify_claims()`
 /// can perform real key resolution instead of rejecting federated JWTs.
 ///
+/// # Key-set semantics (rotation-aware, #1185)
+///
+/// A published JWKS is a **named set**, never an ordered singleton. `get_keys`
+/// returns every usable named Ed25519 entry from the issuer's current JWKS so
+/// a token without a `kid` can try each candidate. When the JWT carries a
+/// `kid`, it returns only entries with that exact `kid`; a named token must
+/// never verify with another co-published key.
+///
+/// The resolver MUST NOT collapse the set to a positional singleton: returning
+/// the "first" Ed25519 key forecloses rotation (#1183). An empty result is an
+/// `Err`.
+///
 /// # Note on `Send` bounds
 ///
-/// `get_key` uses the default (`Send`) flavour of `#[async_trait]` because
+/// `get_keys` uses the default (`Send`) flavour of `#[async_trait]` because
 /// `FederationKeyResolver` performs real async I/O (HTTPS JWKS fetch) whose
 /// future must be `Send`. Call sites inside `#[async_trait(?Send)]` contexts
 /// (e.g. `RequestService::verify_claims`) may `.await` this future directly:
@@ -28,23 +51,30 @@ use ed25519_dalek::VerifyingKey;
 pub trait FederationKeySource: Send + Sync + 'static {
     /// Return `true` if `issuer` is in the configured trusted-issuer list.
     ///
-    /// Callers should check this before calling `get_key` to distinguish an
+    /// Callers should check this before calling `get_keys` to distinguish an
     /// untrusted issuer (policy reject → 401) from a transient fetch error
     /// (retry eligible → 503).
     fn is_trusted(&self, issuer: &str) -> bool;
 
-    /// Fetch (or return from cache) the Ed25519 verifying key for `issuer`.
+    /// Fetch (or return from cache) the Ed25519 candidate verifying keys for
+    /// `issuer`.
+    ///
+    /// Returns every usable named Ed25519 key from the issuer's JWKS. When
+    /// `kid` is `Some`, every returned entry has that exact `kid`; when it is
+    /// `None`, the caller may try each candidate against the JWT.
+    ///
+    /// On a cache miss for the requested `kid`, the resolver refetches the
+    /// JWKS once and re-checks. A `kid` that is still absent after a fresh
+    /// fetch fails closed (`Err`); the resolver MUST NOT silently substitute
+    /// another key for a named `kid`.
     ///
     /// # Errors
     ///
     /// Returns `Err` if:
     /// - the issuer is not in the trusted list (`is_trusted` returns `false`), or
-    /// - the JWKS endpoint is unreachable or returns an invalid key.
-    ///
-    /// Callers that need to distinguish these cases should call `is_trusted`
-    /// first; a subsequent `Err` from `get_key` then indicates a fetch/parse
-    /// failure rather than a policy rejection.
-    async fn get_key(&self, issuer: &str) -> Result<VerifyingKey>;
+    /// - the JWKS endpoint is unreachable or returns no usable Ed25519 key, or
+    /// - `kid` is `Some` and no candidate with that `kid` exists after refetch.
+    async fn get_keys(&self, issuer: &str, kid: Option<&str>) -> Result<Vec<FederationKey>>;
 }
 
 #[cfg(test)]
@@ -62,7 +92,8 @@ mod tests {
             false
         }
 
-        async fn get_key(&self, issuer: &str) -> Result<VerifyingKey> {
+        async fn get_keys(&self, issuer: &str, _kid: Option<&str>) -> Result<Vec<FederationKey>> {
+            let _ = issuer;
             anyhow::bail!("Issuer not trusted: {}", issuer)
         }
     }
@@ -71,6 +102,10 @@ mod tests {
     async fn trait_object_compiles_and_rejects() {
         let src: Arc<dyn FederationKeySource> = Arc::new(AlwaysReject);
         assert!(!src.is_trusted("https://evil.example.com"));
-        assert!(src.get_key("https://evil.example.com").await.is_err());
+        assert!(
+            src.get_keys("https://evil.example.com", None)
+                .await
+                .is_err()
+        );
     }
 }

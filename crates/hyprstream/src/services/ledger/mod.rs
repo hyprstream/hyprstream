@@ -44,7 +44,10 @@ pub use credit_gate::{
     CreditGate, DenyReason, GrantVerifier, Hold, SpendAuthorization, StaticGrantVerifier,
     VerifiedGrant,
 };
-pub use enforcer::{AdmissionRequest, AdmissionResult, LocalEnforcer, Rejection};
+pub use enforcer::{
+    AdmissionRequest, AdmissionResult, AuthenticatedSubject, AuthenticatedSubjectError,
+    LocalEnforcer, Rejection,
+};
 pub use handle::LedgerHandle;
 pub use service::LedgerService;
 pub use signer::CoseCheckpointSigner;

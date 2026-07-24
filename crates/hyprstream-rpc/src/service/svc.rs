@@ -307,6 +307,82 @@ impl EnvelopeContext {
         !self.subject().is_anonymous()
     }
 
+    /// Return the verified Ed25519 signer key for this authenticated request.
+    ///
+    /// This is the authentication-bound key material for the subject returned
+    /// by [`Self::subject`].  For JWT callers, `verify_claims()` requires the
+    /// JWT confirmation key to match `cnf` before the context reaches a
+    /// handler.  For key-resolved callers, the subject is resolved from this
+    /// same verified key.  Callback contexts have no envelope signer and are
+    /// deliberately refused.
+    #[must_use]
+    pub fn authenticated_signer_key(&self) -> Option<ed25519_dalek::VerifyingKey> {
+        if !self.is_authenticated() || self.cnf == [0u8; 32] {
+            return None;
+        }
+        ed25519_dalek::VerifyingKey::from_bytes(&self.cnf).ok()
+    }
+
+    /// Return this request's self-certifying pairwise DID.
+    ///
+    /// This is deliberately distinct from [`Self::subject`]. The latter is a
+    /// Casbin-facing authorization label (for example `"alice"` or
+    /// `"https://issuer:alice"`); it is not a decentralized identifier and
+    /// must never be relabelled as one. The pairwise DID is derived only from
+    /// the Ed25519 key whose possession the verified envelope established.
+    /// Callback contexts and anonymous requests have no such identity.
+    #[must_use]
+    pub fn authenticated_pairwise_did(&self) -> Option<crate::identity::Did> {
+        let signer = self.authenticated_signer_key()?;
+        Some(crate::identity::Did::from_ed25519(&signer.to_bytes()))
+    }
+
+    /// Return the trusted PQ key anchored to this request's verified signer.
+    ///
+    /// A missing binding is represented as `None` because Classical transport
+    /// authentication is a valid, lower-assurance state; the returned key is
+    /// never taken from request data.
+    #[must_use]
+    pub fn authenticated_pq_signer_key(&self) -> Option<crate::crypto::pq::MlDsaVerifyingKey> {
+        self.authenticated_signer_key()?;
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            crate::envelope::global_pq_store().and_then(|store| store.ml_dsa_key_for(&self.cnf))
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            None
+        }
+    }
+
+    /// Build an authenticated context fixture for downstream integration tests.
+    ///
+    /// This is intentionally absent from production builds: production contexts
+    /// are created only after envelope verification.
+    #[cfg(any(test, feature = "test-classical-policy"))]
+    pub fn for_test_authenticated_subject(
+        subject: Subject,
+        signer: ed25519_dalek::VerifyingKey,
+    ) -> Self {
+        Self {
+            request_id: 0,
+            claims: None,
+            jwt_token: None,
+            key_derived_subject: subject,
+            jwt_subject: None,
+            cnf: signer.to_bytes(),
+            envelope_wit_hash: None,
+            client_dh_public: None,
+            client_kem_public: None,
+            request_iat: 0,
+            request_nonce: [0; 16],
+            response_kem_recipient: None,
+            service_domain: None,
+            browser_method_discriminator: None,
+            is_local_caller: false,
+        }
+    }
+
     /// Get user claims (if present, after verify_claims has run).
     pub fn claims(&self) -> Option<&crate::auth::Claims> {
         self.claims.as_ref()
@@ -589,8 +665,9 @@ pub trait RequestService: 'static {
 
     /// Expected audience (resource URL) for JWT validation.
     ///
-    /// When `Some`, `verify_claims()` rejects tokens whose `aud` claim doesn't match.
-    /// Override this on services that should bind tokens to a specific resource.
+    /// `verify_claims()` rejects a presented JWT when this is `None`; absence
+    /// is a missing security expectation, never an unchecked audience. Override
+    /// this on every service that enables [`Self::jwt_key_source`].
     fn expected_audience(&self) -> Option<&str> {
         None
     }
@@ -764,7 +841,7 @@ pub trait RequestService: 'static {
         // post-quantum half of a composite signature and presenting only the
         // classical EdDSA half under the composite kid.
         if let Some(ref kid_str) = kid {
-            let listed_algs = key_source.kid_algs(kid_str);
+            let listed_algs = key_source.kid_algs(&unverified.iss, kid_str);
             if !listed_algs.is_empty() {
                 if !listed_algs.iter().any(|a| a == &alg) {
                     tracing::warn!(
@@ -872,22 +949,46 @@ pub trait RequestService: 'static {
                 })?
             }
             "EdDSA" => {
-                let verifying_key = key_source
-                    .get_key(&unverified.iss, kid.as_deref())
-                    .await
-                    .map_err(|e| {
-                        tracing::warn!(
-                            "JWT key resolution failed for iss={}: {}",
-                            unverified.iss,
-                            e
-                        );
-                        anyhow::anyhow!("JWT key resolution failed")
-                    })?;
-                crate::auth::decode_with_key(&token, &verifying_key, self.expected_audience())
-                    .map_err(|e| {
-                        tracing::warn!("JWT verification failed: {}", e);
-                        anyhow::anyhow!("JWT verification failed")
-                    })?
+                let verified = if let Some(kid) = kid.as_deref() {
+                    let verifying_key = key_source
+                        .get_key(&unverified.iss, Some(kid))
+                        .await
+                        .map_err(|e| {
+                            tracing::warn!(
+                                "JWT key resolution failed for iss={} kid={}: {}",
+                                unverified.iss,
+                                kid,
+                                e
+                            );
+                            anyhow::anyhow!("JWT key resolution failed")
+                        })?;
+                    crate::auth::decode_with_key(
+                        &token,
+                        &verifying_key,
+                        self.expected_audience(),
+                    )
+                } else {
+                    let candidates = key_source
+                        .get_keys(&unverified.iss, None)
+                        .await
+                        .map_err(|e| {
+                            tracing::warn!(
+                                "JWT key resolution failed for kid-less iss={}: {}",
+                                unverified.iss,
+                                e
+                            );
+                            anyhow::anyhow!("JWT key resolution failed")
+                        })?;
+                    crate::auth::decode_with_any_key_lenient(
+                        &token,
+                        &candidates,
+                        self.expected_audience(),
+                    )
+                };
+                verified.map_err(|e| {
+                    tracing::warn!("JWT verification failed: {}", e);
+                    anyhow::anyhow!("JWT verification failed")
+                })?
             }
             _ => anyhow::bail!("unsupported JWT algorithm"),
         };
@@ -1157,6 +1258,9 @@ mod empty_iss_gate_tests {
         fn jwt_key_source(&self) -> Option<std::sync::Arc<dyn crate::auth::JwtKeySource>> {
             Some(self.key_source.clone())
         }
+        fn expected_audience(&self) -> Option<&str> {
+            Some("https://mock")
+        }
         fn require_cnf_binding(&self) -> bool {
             false
         }
@@ -1212,7 +1316,8 @@ mod empty_iss_gate_tests {
     fn empty_iss_token(ca: &SigningKey) -> String {
         // iss defaults to empty in Claims::new — the local bare-sub token.
         let now = chrono::Utc::now().timestamp();
-        let claims = Claims::new("alice".to_owned(), now, now + 3600);
+        let claims = Claims::new("alice".to_owned(), now, now + 3600)
+            .with_audience(Some("https://mock".to_owned()));
         assert!(claims.iss.is_empty(), "test token must have empty iss");
         crate::auth::jwt::encode(&claims, ca)
     }
@@ -1328,8 +1433,9 @@ mod empty_iss_gate_tests {
             policy: crate::crypto::CryptoPolicy::Hybrid,
         };
         let now = chrono::Utc::now().timestamp();
-        let claims =
-            Claims::new("alice".to_owned(), now, now + 60).with_issuer("https://local".to_owned());
+        let claims = Claims::new("alice".to_owned(), now, now + 60)
+            .with_issuer("https://local".to_owned())
+            .with_audience(Some("https://mock".to_owned()));
         for typ in crate::auth::RFC9068_ACCESS_TOKEN_TYPES {
             let header = format!(r#"{{"alg":"ML-DSA-65-Ed25519","typ":"{typ}","kid":"{kid_a}"}}"#);
             let valid = composite_token(&header, &claims, &pq_a, &ed_a, false);
@@ -2100,7 +2206,6 @@ mod browser_method_commitment_tests {
     fn non_browser_context_preserves_legacy_dispatch_compatibility() {
         let ctx = EnvelopeContext::from_callback_service(7, "model");
         ctx.ensure_browser_method(u16::MAX)
-            .expect("non-browser carriers have no method commitment to compare"
-        );
+            .expect("non-browser carriers have no method commitment to compare");
     }
 }

@@ -10,9 +10,17 @@ use std::time::Duration;
 
 use hyprstream_9p::memory::MemoryBackend;
 use hyprstream_9p::msg::{self, Response};
-use hyprstream_9p::Translator;
+use hyprstream_9p::{AccessDecider, Action, Translator};
+use hyprstream_rpc::auth::mac::{ObjectRef, SecurityContext};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+
+struct TestDecider;
+impl AccessDecider for TestDecider {
+    fn check(&self, _: &SecurityContext, _: ObjectRef<'_>, _: Action) -> bool {
+        true
+    }
+}
 
 /// Read one complete 9P message (length-prefixed) from `stream`.
 async fn recv_message(stream: &mut TcpStream) -> Vec<u8> {
@@ -39,7 +47,7 @@ async fn tcp_full_session() {
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let translator = Translator::new(Arc::new(backend));
+    let translator = Translator::new(Arc::new(backend), Arc::new(TestDecider));
     // Spawn the accept loop; it returns on listener close, which we never
     // trigger, so unwrap it onto a background task.
     let server = tokio::spawn(async move {
@@ -104,7 +112,7 @@ async fn tcp_write_then_read() {
     backend.add_file("/pipe", b"");
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let translator = Translator::new(Arc::new(backend));
+    let translator = Translator::new(Arc::new(backend), Arc::new(TestDecider));
     let server = tokio::spawn(async move {
         let _ = translator.serve(listener).await;
     });

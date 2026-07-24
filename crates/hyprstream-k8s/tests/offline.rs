@@ -279,17 +279,24 @@ fn tenant_binding_cel_validates_namespace_and_tenant() {
 #[test]
 fn committed_yaml_matches_generated() {
     // Guards against forgetting to re-run `gen-crds` after a schema change.
+    // Both committed copies are checked: the crate's `crds/` and the Helm
+    // chart's `crds/` (Helm installs the latter before any template).
+    let dirs = [
+        concat!(env!("CARGO_MANIFEST_DIR"), "/crds/"),
+        concat!(env!("CARGO_MANIFEST_DIR"), "/../../charts/hyprstream/crds/"),
+    ];
     for (crd, stem) in hyprstream_k8s::crd_manifests() {
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/crds/");
-        let file = std::path::Path::new(path).join(format!("{stem}.yaml"));
-        let on_disk = std::fs::read_to_string(&file)
-            .unwrap_or_else(|e| panic!("read {}: {e}", file.display()));
         let regenerated = serde_yaml::to_string(&crd).unwrap();
-        assert!(
-            on_disk.contains(regenerated.trim()),
-            "committed {} is stale; re-run `cargo run -p hyprstream-k8s --bin gen-crds`",
-            file.display()
-        );
+        for dir in &dirs {
+            let file = std::path::Path::new(dir).join(format!("{stem}.yaml"));
+            let on_disk = std::fs::read_to_string(&file)
+                .unwrap_or_else(|e| panic!("read {}: {e}", file.display()));
+            assert!(
+                on_disk.contains(regenerated.trim()),
+                "committed {} is stale; re-run `cargo run -p hyprstream-k8s --bin gen-crds`",
+                file.display()
+            );
+        }
     }
 }
 

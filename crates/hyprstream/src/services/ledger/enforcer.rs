@@ -64,11 +64,61 @@ impl Rejection {
     }
 }
 
+/// Identity produced by the authenticated transport boundary.
+///
+/// This is deliberately opaque. Production callers can only create it from
+/// [`hyprstream_rpc::EnvelopeContext`], after the RPC layer has verified the
+/// envelope and bound its subject to the same signer key. Request fields cannot
+/// manufacture an authenticated identity for ledger admission.
+#[derive(Debug, Clone)]
+pub struct AuthenticatedSubject {
+    did: Did,
+    ed_vk: ed25519_dalek::VerifyingKey,
+    pq_vk: Option<MlDsaVerifyingKey>,
+}
+
+/// Why an authenticated transport context could not be converted for ledger
+/// admission. The caller must fail closed rather than substitute request data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthenticatedSubjectError {
+    /// The transport did not establish a non-anonymous subject.
+    Anonymous,
+    /// The verified transport signer was not a valid Ed25519 public key.
+    InvalidSignerKey,
+}
+
+impl AuthenticatedSubject {
+    /// Convert the current RPC authentication result into a ledger subject.
+    ///
+    /// `EnvelopeContext` is produced after signature verification. The pairwise
+    /// DID is self-certifying: it is derived from the exact signer key verified
+    /// for this envelope, never from the Casbin-facing authorization subject.
+    /// JWT confirmation binding ensures a JWT's user label is bound to that same
+    /// signer, but that label is not itself a ledger identity.
+    pub fn from_verified_envelope(
+        ctx: &hyprstream_rpc::EnvelopeContext,
+    ) -> Result<Self, AuthenticatedSubjectError> {
+        let did = ctx
+            .authenticated_pairwise_did()
+            .map(|did| Did(did.to_string()))
+            .ok_or(AuthenticatedSubjectError::Anonymous)?;
+        let ed_vk = ctx
+            .authenticated_signer_key()
+            .ok_or(AuthenticatedSubjectError::InvalidSignerKey)?;
+        Ok(Self {
+            did,
+            ed_vk,
+            pq_vk: ctx.authenticated_pq_signer_key(),
+        })
+    }
+}
+
 /// A spend admission request presented at the PEP.
 #[derive(Debug, Clone)]
 pub struct AdmissionRequest {
-    /// The verified holder identity. `None` ⇒ anonymous ⇒ deny (plan §5.4).
-    pub subject: Option<Did>,
+    /// The caller identity and key material authenticated by the transport.
+    /// `None` ⇒ anonymous ⇒ deny (plan §5.4). This is not request-supplied.
+    pub authenticated_subject: Option<AuthenticatedSubject>,
     /// The presented allocation grant.
     pub grant_cid: Cid,
     /// The unit being spent (must match the grant's unit).
@@ -82,10 +132,6 @@ pub struct AdmissionRequest {
     /// The subject's spend authorization (§5.3). Required when
     /// [`LedgerConfig`] demands it.
     pub spend_authz: Option<SpendAuthorization>,
-    /// The subject's verified Ed25519 key (same material the envelope verified).
-    pub subject_ed_vk: Option<ed25519_dalek::VerifyingKey>,
-    /// The subject's verified ML-DSA-65 key, if presented (Hybrid).
-    pub subject_pq_vk: Option<MlDsaVerifyingKey>,
 }
 
 /// The result of admission.
@@ -120,7 +166,6 @@ pub struct LocalEnforcer {
     breaker: Arc<DebtBreaker>,
     cell_identity: Did,
     reserve_timeout_s: u32,
-    require_pq: bool,
 }
 
 impl std::fmt::Debug for LocalEnforcer {
@@ -128,7 +173,6 @@ impl std::fmt::Debug for LocalEnforcer {
         f.debug_struct("LocalEnforcer")
             .field("cell_identity", &self.cell_identity)
             .field("reserve_timeout_s", &self.reserve_timeout_s)
-            .field("require_pq", &self.require_pq)
             .finish()
     }
 }
@@ -149,7 +193,6 @@ impl LocalEnforcer {
             breaker,
             cell_identity,
             reserve_timeout_s: config.reserve_timeout_secs,
-            require_pq: config.require_pq_signatures,
         }
     }
 
@@ -164,16 +207,18 @@ impl LocalEnforcer {
     }
 
     /// The Phase-1 admission contract (plan §5.1). `now` is the unix-second
-    /// clock used only for grant-expiry (the balance CAS uses no clock).
+    /// clock used for grant and spend-authorization expiry (the balance CAS
+    /// uses no clock).
     ///
     /// This is `async` only because grant verification is an async trait (the
     /// production UCAN path); on a cache hit it performs no I/O. The balance
     /// gate ([`CreditGate::try_hold`]) is a sync atomic CAS — INV-2(a).
     pub async fn admit(&self, req: &AdmissionRequest, now: u64) -> AdmissionResult {
         // 1. Fail-closed identity: anonymous holds no inventory ⇒ deny.
-        if req.subject.is_none() {
-            return AdmissionResult::Rejected(Rejection::hard(DenyReason::Anonymous));
-        }
+        let subject = match req.authenticated_subject.as_ref() {
+            Some(subject) => subject,
+            None => return AdmissionResult::Rejected(Rejection::hard(DenyReason::Anonymous)),
+        };
 
         // 2. Receipt debt ⇒ fail-closed for new spends (§2e). Committed spends
         //    stand; only new ones gate.
@@ -195,32 +240,65 @@ impl LocalEnforcer {
             )));
         }
 
-        // 4. Unknown unit ⇒ deny. The requested unit must match the grant's.
+        // 4. Bind the authenticated transport subject to the verified grant
+        //    holder. Both DID and key material originate in the same opaque
+        //    authentication result; request fields cannot assert either.
+        if subject.did != grant.holder {
+            return AdmissionResult::Rejected(Rejection::hard(DenyReason::HolderMismatch));
+        }
+
+        // 5. Unknown unit ⇒ deny. The requested unit must match the grant's.
         if grant.unit != req.unit {
             return AdmissionResult::Rejected(Rejection::hard(DenyReason::UnknownUnit));
         }
 
-        // 5. Spend-authorization verification (§5.3). Required by default; a
-        //    Classical-only client passes no PQ key and is verified under the
-        //    Classical policy (labeled, not rejected).
-        if req.amount > 0 {
+        // 6. Mint the deterministic transfer id (idempotency key) BEFORE authz
+        //    verification: the signed authorization must bind to exactly this
+        //    id, or one signed authz replays across arbitrarily many distinct
+        //    nonces up to `max_amount` each for its whole `exp` window (#985).
+        //    Minting is a pure hash of (grant_cid, nonce) — no side effects.
+        let transfer_id = mint_transfer_id(&req.grant_cid, req.nonce);
+
+        // 7. Spend-authorization verification (§5.3). Required for EVERY
+        //    admission, including zero-amount metered-rate jobs: `Admitted` is
+        //    the decision that permits work to start, and a zero reservation
+        //    cannot be converted into a nonzero post later — so an unsigned
+        //    zero admission would be unauthenticated work, not harmless
+        //    accounting (PR #1129 review, finding 1). Ledger admission is an
+        //    internal hyprstream-to-hyprstream surface: PQ-hybrid is mandatory
+        //    and absent PQ key material is a hard rejection, never a request
+        //    to select Classical verification.
+        {
             match &req.spend_authz {
                 Some(authz) => {
-                    let ed_vk = match &req.subject_ed_vk {
-                        Some(k) => k,
-                        None => {
-                            return AdmissionResult::Rejected(Rejection::hard(
-                                DenyReason::InvalidSpendAuthorization(
-                                    "no subject verifying key presented".to_owned(),
-                                ),
-                            ));
-                        }
-                    };
                     // The authz must bind to this grant and (if known) this cell.
                     if authz.grant_cid != req.grant_cid || authz.host != self.cell_identity {
                         return AdmissionResult::Rejected(Rejection::hard(
                             DenyReason::InvalidSpendAuthorization(
                                 "authz not bound to this grant/host".to_owned(),
+                            ),
+                        ));
+                    }
+                    // The signed expiry bounds the authorization itself: `exp`
+                    // is in the signed digest but was never compared to `now`,
+                    // leaving a bound authz valid forever (PR #1129 review,
+                    // finding 2). Fail closed at the boundary, like grant.exp.
+                    if now >= authz.exp {
+                        return AdmissionResult::Rejected(Rejection::hard(
+                            DenyReason::InvalidSpendAuthorization(
+                                "spend authorization expired".to_owned(),
+                            ),
+                        ));
+                    }
+                    // #985 pre-activation gate: the signed transfer id must be
+                    // THE transfer id this admission mints. `transfer_id` is in
+                    // the signed digest, so without this equality a single
+                    // authorization authenticates unlimited distinct transfers
+                    // (replay-amplification within the subject's own credit).
+                    if authz.transfer_id != transfer_id {
+                        return AdmissionResult::Rejected(Rejection::hard(
+                            DenyReason::InvalidSpendAuthorization(
+                                "authz transfer id does not match this transfer".to_owned(),
                             ),
                         ));
                     }
@@ -231,12 +309,10 @@ impl LocalEnforcer {
                             ),
                         ));
                     }
-                    let require_pq = self.require_pq && req.subject_pq_vk.is_some();
                     if let Err(reason) = CreditGate::verify_spend_authz(
                         authz,
-                        ed_vk,
-                        req.subject_pq_vk.as_ref(),
-                        require_pq,
+                        &subject.ed_vk,
+                        subject.pq_vk.as_ref(),
                     ) {
                         return AdmissionResult::Rejected(Rejection::hard(reason));
                     }
@@ -251,10 +327,7 @@ impl LocalEnforcer {
             }
         }
 
-        // 6. Mint the deterministic transfer id (idempotency key).
-        let transfer_id = mint_transfer_id(&req.grant_cid, req.nonce);
-
-        // 7. Balance gate: sync CAS on the materialized cell. Cold gate /
+        // 8. Balance gate: sync CAS on the materialized cell. Cold gate /
         //    insufficient credit ⇒ retryable reject, never queue.
         let hold = match self.gate.try_hold(&req.grant_cid, req.amount) {
             Ok(h) => h,
@@ -386,7 +459,7 @@ fn derived_id(domain: &[u8], reserve: TransferId) -> TransferId {
 mod tests {
     use super::*;
     use crate::services::ledger::{
-        CoseCheckpointSigner, CreditGate, DebtBreaker, StaticGrantVerifier,
+        CoseCheckpointSigner, CreditGate, DebtBreaker, GrantVerifier, StaticGrantVerifier,
     };
     use hyprstream_crypto::cose_sign::sign_composite;
     use hyprstream_crypto::pq::{ml_dsa_sk_from_seed, ml_dsa_sk_to_vk_bytes, ml_dsa_vk_from_bytes};
@@ -401,6 +474,32 @@ mod tests {
 
     fn cid(b: u8) -> Cid {
         Cid(vec![b])
+    }
+
+    /// A client-nonce test value drawn from `OsRng`, exactly as a real client
+    /// would generate its idempotency-key entropy — rather than a hard-coded
+    /// literal. `req.nonce` / `transfer_nonce` are public inputs to a
+    /// deterministic hash ([`mint_transfer_id`]), not secret cryptographic
+    /// material, so a literal here is a test-only false positive for CodeQL's
+    /// `rust/hard-coded-cryptographic-value` query (precedent: #1121). Drawing
+    /// from `OsRng` clears the alert at the root and is at least as faithful a
+    /// test of the real shape.
+    fn rand_nonce() -> u128 {
+        use rand::RngCore;
+        let mut buf = [0u8; 16];
+        rand::rngs::OsRng.fill_bytes(&mut buf);
+        u128::from_be_bytes(buf)
+    }
+
+    fn authenticated_transport_subject(ed_sk: &ed25519_dalek::SigningKey) -> AuthenticatedSubject {
+        let ctx = hyprstream_rpc::EnvelopeContext::for_test_authenticated_subject(
+            // Casbin's subject is intentionally unrelated to the ledger DID.
+            // The conversion must use the authenticated signer instead.
+            hyprstream_rpc::Subject::new("alice"),
+            ed_sk.verifying_key(),
+        );
+        AuthenticatedSubject::from_verified_envelope(&ctx)
+            .expect("authenticated transport context must convert")
     }
 
     /// Build a fully-wired enforcer over a fresh MemLedger, with `grant_cap`
@@ -419,9 +518,11 @@ mod tests {
         hyprstream_crypto::pq::MlDsaSigningKey,
     ) {
         let cell = Did("did:web:cell.test".to_owned());
-        let holder = Did("did:web:alice".to_owned());
         let ed_sk = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
         let pq_sk = ml_dsa_sk_from_seed(&[2u8; 32]);
+        let holder = Did(hyprstream_crypto::did_key::ed25519_to_did_key(
+            &ed_sk.verifying_key().to_bytes(),
+        ));
 
         // Backend + handle.
         let mut backend = MemLedger::new(cell.clone());
@@ -485,7 +586,6 @@ mod tests {
         gate.materialize(&cid(1), bal.available);
         let cfg = LedgerConfig {
             enabled: true,
-            require_pq_signatures: false,
             ..LedgerConfig::default()
         };
         let breaker = Arc::new(DebtBreaker::new(&cfg, gate.generation_handle()));
@@ -506,6 +606,7 @@ mod tests {
         host: &Did,
         transfer_nonce: u128,
         max_amount: u128,
+        exp: u64,
         ed_sk: &ed25519_dalek::SigningKey,
         pq_sk: &hyprstream_crypto::pq::MlDsaSigningKey,
     ) -> (
@@ -520,7 +621,7 @@ mod tests {
             host: host.clone(),
             transfer_id,
             max_amount,
-            exp: u64::MAX,
+            exp,
             signature: Vec::new(),
         };
         let digest = authz.digest();
@@ -534,14 +635,12 @@ mod tests {
     async fn anonymous_subject_denied_hard() {
         let (enf, _holder, _cid, _debit, _credit, _, _) = fixture(1000).await;
         let req = AdmissionRequest {
-            subject: None,
+            authenticated_subject: None,
             grant_cid: cid(1),
             unit: unit(),
             amount: 10,
-            nonce: 1,
+            nonce: rand_nonce(),
             spend_authz: None,
-            subject_ed_vk: None,
-            subject_pq_vk: None,
         };
         match enf.admit(&req, 0).await {
             AdmissionResult::Rejected(r) => {
@@ -552,20 +651,176 @@ mod tests {
         }
     }
 
+    /// #985: an authorization signed for one transfer must not admit another.
+    /// The happy-path test reuses the signing nonce as the request nonce, which
+    /// masked the missing equality check — this signs for one nonce and
+    /// submits a different one, so the signature verifies but the minted
+    /// transfer id differs.
+    #[tokio::test]
+    async fn authz_for_different_transfer_denied_hard() {
+        let (enf, _holder, grant_cid, _debit, _credit, ed_sk, pq_sk) = fixture(1000).await;
+        let signing_nonce = rand_nonce();
+        let request_nonce = rand_nonce(); // ≠ the nonce the authz was minted/signed for
+        assert_ne!(
+            signing_nonce, request_nonce,
+            "test requires two distinct 128-bit nonces"
+        );
+        let (authz, _ed_vk, _pq_vk, _tid) = signed_authz(
+            &grant_cid,
+            enf.cell_identity(),
+            signing_nonce,
+            100,
+            u64::MAX,
+            &ed_sk,
+            &pq_sk,
+        );
+        let req = AdmissionRequest {
+            authenticated_subject: Some(authenticated_transport_subject(&ed_sk)),
+            grant_cid,
+            unit: unit(),
+            amount: 100,
+            nonce: request_nonce,
+            spend_authz: Some(authz),
+        };
+        match enf.admit(&req, 0).await {
+            AdmissionResult::Rejected(r) => {
+                assert!(
+                    matches!(r.reason, DenyReason::InvalidSpendAuthorization(_)),
+                    "expected InvalidSpendAuthorization, got {:?}",
+                    r.reason
+                );
+                assert!(r.retry_after_secs.is_none(), "must be a hard reject");
+            }
+            other => panic!("authz for a different transfer must be denied, got {other:?}"),
+        }
+    }
+
+    /// PR #1129 review finding 1: `Admitted` permits work to start, so a
+    /// zero-amount (metered-rate) admission without a spend authorization is
+    /// unauthenticated work, not harmless accounting. Must hard-reject.
+    #[tokio::test]
+    async fn zero_amount_without_authz_denied_hard() {
+        let (enf, _holder, grant_cid, _debit, _credit, ed_sk, _pq_sk) = fixture(1000).await;
+        let req = AdmissionRequest {
+            authenticated_subject: Some(authenticated_transport_subject(&ed_sk)),
+            grant_cid,
+            unit: unit(),
+            amount: 0,
+            nonce: rand_nonce(),
+            spend_authz: None,
+        };
+        match enf.admit(&req, 0).await {
+            AdmissionResult::Rejected(r) => {
+                assert!(
+                    matches!(r.reason, DenyReason::InvalidSpendAuthorization(_)),
+                    "expected InvalidSpendAuthorization, got {:?}",
+                    r.reason
+                );
+                assert!(r.retry_after_secs.is_none(), "must be a hard reject");
+            }
+            other => panic!("zero-amount admission without authz must be denied, got {other:?}"),
+        }
+    }
+
+    /// PR #1129 review finding 2: `authz.exp` is in the signed digest but was
+    /// never compared to `now` — a correctly bound authorization stayed valid
+    /// forever. A valid, correctly bound, expired authz must hard-reject.
+    #[tokio::test]
+    async fn expired_authz_denied_hard() {
+        let (enf, _holder, grant_cid, _debit, _credit, ed_sk, pq_sk) = fixture(1000).await;
+        // Valid signature, right grant/host/nonce/transfer id — but exp = 5.
+        let nonce = rand_nonce();
+        let (authz, _ed_vk, _pq_vk, _tid) = signed_authz(
+            &grant_cid,
+            enf.cell_identity(),
+            nonce,
+            100,
+            5,
+            &ed_sk,
+            &pq_sk,
+        );
+        let req = AdmissionRequest {
+            authenticated_subject: Some(authenticated_transport_subject(&ed_sk)),
+            grant_cid,
+            unit: unit(),
+            amount: 100,
+            nonce,
+            spend_authz: Some(authz),
+        };
+        // now == exp is already expired (>=, mirroring the grant-expiry check).
+        match enf.admit(&req, 5).await {
+            AdmissionResult::Rejected(r) => {
+                assert!(
+                    matches!(r.reason, DenyReason::InvalidSpendAuthorization(_)),
+                    "expected InvalidSpendAuthorization, got {:?}",
+                    r.reason
+                );
+                assert!(r.retry_after_secs.is_none(), "must be a hard reject");
+            }
+            other => panic!("expired authz must be denied, got {other:?}"),
+        }
+    }
+
+    /// Ledger admission is an internal surface, so a caller cannot select
+    /// Classical verification by omitting the required ML-DSA-65 key.
+    #[tokio::test]
+    async fn missing_pq_key_denied_hard() {
+        let (enf, holder, grant_cid, _debit, _credit, ed_sk, pq_sk) = fixture(1000).await;
+        let nonce = rand_nonce();
+        let (authz, _ed_vk, _pq_vk, _tid) = signed_authz(
+            &grant_cid,
+            enf.cell_identity(),
+            nonce,
+            100,
+            u64::MAX,
+            &ed_sk,
+            &pq_sk,
+        );
+        let req = AdmissionRequest {
+            authenticated_subject: Some(AuthenticatedSubject {
+                did: holder,
+                ed_vk: ed_sk.verifying_key(),
+                pq_vk: None,
+            }),
+            grant_cid,
+            unit: unit(),
+            amount: 100,
+            nonce,
+            spend_authz: Some(authz),
+        };
+        match enf.admit(&req, 0).await {
+            AdmissionResult::Rejected(r) => {
+                assert!(
+                    matches!(r.reason, DenyReason::InvalidSpendAuthorization(_)),
+                    "expected InvalidSpendAuthorization, got {:?}",
+                    r.reason
+                );
+                assert!(r.retry_after_secs.is_none(), "must be a hard reject");
+            }
+            other => panic!("admission without a PQ key must be denied, got {other:?}"),
+        }
+    }
+
     #[tokio::test]
     async fn admitted_then_post_and_void_roundtrip() {
-        let (enf, holder, grant_cid, debit, credit, ed_sk, pq_sk) = fixture(1000).await;
-        let (authz, ed_vk, pq_vk, _tid) =
-            signed_authz(&grant_cid, enf.cell_identity(), 7, 100, &ed_sk, &pq_sk);
+        let (enf, _holder, grant_cid, debit, credit, ed_sk, pq_sk) = fixture(1000).await;
+        let nonce = rand_nonce();
+        let (authz, _ed_vk, _pq_vk, _tid) = signed_authz(
+            &grant_cid,
+            enf.cell_identity(),
+            nonce,
+            100,
+            u64::MAX,
+            &ed_sk,
+            &pq_sk,
+        );
         let req = AdmissionRequest {
-            subject: Some(holder.clone()),
+            authenticated_subject: Some(authenticated_transport_subject(&ed_sk)),
             grant_cid: grant_cid.clone(),
             unit: unit(),
             amount: 100,
-            nonce: 7,
+            nonce,
             spend_authz: Some(authz),
-            subject_ed_vk: Some(ed_vk),
-            subject_pq_vk: Some(pq_vk),
         };
         let (transfer_id, hold, grant) = match enf.admit(&req, 0).await {
             AdmissionResult::Admitted {
@@ -586,20 +841,128 @@ mod tests {
         assert!(post.is_ok(), "post should succeed: {post:?}");
     }
 
+    /// Ledger admission cannot select Classical verification by presenting a
+    /// Classical-only authorization.
+    #[tokio::test]
+    async fn classical_only_authz_denied_hard() {
+        let (enf, holder, grant_cid, _debit, _credit, ed_sk, _pq_sk) = fixture(1000).await;
+        let nonce = rand_nonce();
+        let mut authz = SpendAuthorization {
+            grant_cid: grant_cid.clone(),
+            host: enf.cell_identity().clone(),
+            transfer_id: mint_transfer_id(&grant_cid, nonce),
+            max_amount: 100,
+            exp: u64::MAX,
+            signature: Vec::new(),
+        };
+        // A Classical signature is valid only when the configured PQ policy is
+        // not silently weakened by missing authenticated key material.
+        authz.signature = sign_composite(&ed_sk, None, &authz.digest(), &[]).unwrap();
+        let req = AdmissionRequest {
+            // Deliberately model the only admissible representation of a
+            // Classical transport identity at this boundary: authenticated
+            // Ed25519 holder, but no trusted PQ binding.
+            authenticated_subject: Some(AuthenticatedSubject {
+                did: holder,
+                ed_vk: ed_sk.verifying_key(),
+                pq_vk: None,
+            }),
+            grant_cid,
+            unit: unit(),
+            amount: 100,
+            nonce,
+            spend_authz: Some(authz),
+        };
+
+        match enf.admit(&req, 0).await {
+            AdmissionResult::Rejected(r) => {
+                assert!(
+                    matches!(r.reason, DenyReason::InvalidSpendAuthorization(_)),
+                    "expected InvalidSpendAuthorization, got {:?}",
+                    r.reason
+                );
+                assert!(r.retry_after_secs.is_none(), "must be a hard reject");
+            }
+            other => panic!("missing authenticated PQ key must be denied, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn different_authenticated_subject_presenting_valid_grant_denied_hard() {
+        let (enf, _holder, grant_cid, _debit, _credit, _ed_sk, _pq_sk) = fixture(1000).await;
+        let attacker_ed_sk = ed25519_dalek::SigningKey::from_bytes(&[3u8; 32]);
+        let attacker_pq_sk = ml_dsa_sk_from_seed(&[4u8; 32]);
+        let nonce = rand_nonce();
+        let (authz, _ed_vk, _pq_vk, _) = signed_authz(
+            &grant_cid,
+            enf.cell_identity(),
+            nonce,
+            100,
+            u64::MAX,
+            &attacker_ed_sk,
+            &attacker_pq_sk,
+        );
+        let req = AdmissionRequest {
+            // Alice's grant is presented with Bob's *authenticated* transport
+            // identity and Bob's matching verified keys. There is no
+            // caller-controlled subject field to assert Alice instead.
+            authenticated_subject: Some(authenticated_transport_subject(&attacker_ed_sk)),
+            grant_cid,
+            unit: unit(),
+            amount: 100,
+            nonce,
+            spend_authz: Some(authz),
+        };
+
+        match enf.admit(&req, 0).await {
+            AdmissionResult::Rejected(r) => {
+                assert_eq!(r.reason, DenyReason::HolderMismatch);
+                assert!(r.retry_after_secs.is_none());
+            }
+            other => panic!("different authenticated subject must be denied, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn absent_holder_refuses_at_verification_boundary() {
+        struct HolderlessVerifier;
+
+        #[async_trait::async_trait]
+        impl GrantVerifier for HolderlessVerifier {
+            async fn verify(&self, _grant_cid: &Cid) -> Result<VerifiedGrant, DenyReason> {
+                Err(DenyReason::UnverifiableGrant(
+                    "grant has no holder".to_owned(),
+                ))
+            }
+        }
+
+        let gate = CreditGate::new(Arc::new(HolderlessVerifier));
+        assert_eq!(
+            gate.verify_grant(&cid(1)).await.unwrap_err(),
+            DenyReason::UnverifiableGrant("grant has no holder".to_owned())
+        );
+    }
+
     #[tokio::test]
     async fn insufficient_credit_rejects_retryable_not_queues() {
-        let (enf, holder, grant_cid, _debit, _credit, ed_sk, pq_sk) = fixture(100).await;
-        let (authz, ed_vk, pq_vk, _) =
-            signed_authz(&grant_cid, enf.cell_identity(), 1, 500, &ed_sk, &pq_sk);
+        let (enf, _holder, grant_cid, _debit, _credit, ed_sk, pq_sk) = fixture(100).await;
+        let nonce = rand_nonce();
+        let (authz, _ed_vk, _pq_vk, _) = signed_authz(
+            &grant_cid,
+            enf.cell_identity(),
+            nonce,
+            500,
+            u64::MAX,
+            &ed_sk,
+            &pq_sk,
+        );
         let req = AdmissionRequest {
-            subject: Some(holder),
+            authenticated_subject: Some(authenticated_transport_subject(&ed_sk)),
             grant_cid,
             unit: unit(),
             amount: 500, // > available 100
-            nonce: 1,
+            nonce,
             spend_authz: Some(authz),
-            subject_ed_vk: Some(ed_vk),
-            subject_pq_vk: Some(pq_vk),
         };
         match enf.admit(&req, 0).await {
             AdmissionResult::Rejected(r) => {

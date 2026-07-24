@@ -25,21 +25,14 @@
 //! 3. [`CompositeObjectLabelResolver`] — the production [`ObjectLabelResolver`]:
 //!    genesis static nodes → bind-time D2 descendant inheritance → CAS
 //!    [`BlobManifest`](crate::storage::cas::manifest::BlobManifest)-carried
-//!    labels; a manifest present but unlabeled clamps to the D2 floor; anything
+//!    labels; a manifest present but unlabeled is denied; anything
 //!    unresolvable returns `None` ⇒ deny.
 //! 4. [`GenesisGate`] — constructed at boot: it runs the enumerator, materialize,
 //!    and report, and holds the resolver, so the startup path can log/emit the
 //!    [`GenesisReport`] and a status surface can render coverage evidence.
 //!
-//! ## Stage 0: dormant, zero behavior change
-//!
-//! Nothing here flips a decider to enforcing. The composite resolver is
-//! constructed and testable, but the 9P PEP (`hyprstream-9p::mac_seam`) still
-//! defaults to [`AllowAllDecider`](hyprstream_9p::mac_seam::AllowAllDecider), so
-//! no request is allowed or denied differently than before this module existed.
-//! The value delivered now is the **coverage-gate evidence**: proof that a
-//! complete, well-formed genesis exists (or an explicit list of the gaps) so the
-//! activation decision has something to gate on.
+//! The production resolver is consumed by the authoritative 9P translator PEP.
+//! Missing and unlabeled objects deny; there is no permissive fallback.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -53,7 +46,7 @@ use hyprstream_rpc::auth::mac::{
 /// `server::routes::ninep::build_export_mount` + the `#730` host VFS layout).
 /// These are structural container directories, always present regardless of which
 /// services are running.
-pub const EXPORT_ROOTS: &[&str] = &["/srv", "/worktree", "/stream"];
+pub const EXPORT_ROOTS: &[&str] = &["/", "/srv", "/worktree", "/stream"];
 
 /// Non-service mount points the standard namespace binds (see
 /// `services::namespace_builder::build_standard_namespace` and
@@ -168,8 +161,7 @@ impl NamespaceEnumerator {
 }
 
 /// Normalize a node path to a canonical absolute form: leading slash, no trailing
-/// slash, no empty components. `""`/`"/"` normalize to `""` (dropped — the root is
-/// not itself an addressable node in this inventory).
+/// slash, no empty components. `""`/`"/"` normalize to the addressable root.
 fn normalize_node_path(path: &str) -> String {
     let mut out = String::new();
     for component in path.split('/') {
@@ -179,7 +171,11 @@ fn normalize_node_path(path: &str) -> String {
         out.push('/');
         out.push_str(component);
     }
-    out
+    if out.is_empty() {
+        "/".to_owned()
+    } else {
+        out
+    }
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -317,9 +313,7 @@ impl SitePolicy {
 /// The outer `Option` is "does a manifest exist for this CID?" and the inner is
 /// the manifest's `security_label` carrier field:
 /// - `Some(Some(label))` — manifest present and labeled ⇒ use the label.
-/// - `Some(None)` — manifest present but the carrier is empty ⇒ **missing
-///   carrier**: the composite clamps to the D2 floor (not deny — a real object
-///   exists, it just isn't labeled yet).
+/// - `Some(None)` — manifest present but unlabeled ⇒ deny.
 /// - `None` — no manifest for this CID ⇒ unresolvable ⇒ deny.
 pub trait ManifestLabelSource: Send + Sync {
     /// The label carried by the manifest for `cid`, per the semantics above.
@@ -350,7 +344,7 @@ impl ManifestLabelSource for NoManifests {
 /// 3. Neither ⇒ `None` ⇒ deny.
 ///
 /// For a **CID** reference: the CAS [`ManifestLabelSource`] — a present-but-
-/// unlabeled manifest clamps to the D2 floor, an absent manifest denies.
+/// unlabeled manifest denies, and an absent manifest denies.
 ///
 /// Every arm honors the S1 invariant: an unresolvable reference returns `None`
 /// (deny), never a manufactured permissive default.
@@ -377,6 +371,9 @@ impl CompositeObjectLabelResolver {
 
     /// Resolve a walked path (already split into components) to a label.
     fn resolve_path(&self, components: &[&str]) -> Option<SecurityLabel> {
+        if components.is_empty() {
+            return self.genesis.resolve("/").copied();
+        }
         // Walk from the full path up its ancestors. The first genesis assignment
         // found is either the exact node (arm 1) or the nearest labeled ancestor
         // (arm 2 — bind-time D2 descendant inheritance).
@@ -415,12 +412,9 @@ impl CompositeObjectLabelResolver {
             // `Internal` (D2 — object labels clamp to the importing boundary's
             // floor, never returned unrestricted).
             Some(Some(label)) => Some(import_label(self.floor, label)),
-            // Manifest present, carrier empty ⇒ D2 join-to-floor. `import_label`
-            // is the restrict-only clamp: join(floor, ⊥) == floor, and it can
-            // only ever raise, never lower, the effective label.
-            Some(None) => Some(import_label(self.floor, SecurityLabel::bottom())),
-            // No manifest ⇒ unresolvable ⇒ deny.
-            None => None,
+            // Present-but-unlabeled and absent manifests both deny. Never
+            // manufacture a label or join either case to a floor.
+            Some(None) | None => None,
         }
     }
 }
@@ -507,6 +501,11 @@ impl GenesisGate {
     /// The production object-label resolver (for wiring a real decider later).
     pub fn resolver(&self) -> &CompositeObjectLabelResolver {
         &self.resolver
+    }
+
+    /// Consume the gate and transfer its production resolver to the live PEP.
+    pub fn into_resolver(self) -> CompositeObjectLabelResolver {
+        self.resolver
     }
 
     /// The enumerated node set the report covers.
@@ -644,8 +643,8 @@ mod tests {
     fn enumerator_normalizes_paths() {
         assert_eq!(normalize_node_path("/srv//model/"), "/srv/model");
         assert_eq!(normalize_node_path("srv/model"), "/srv/model");
-        assert_eq!(normalize_node_path("/"), "");
-        assert_eq!(normalize_node_path(""), "");
+        assert_eq!(normalize_node_path("/"), "/");
+        assert_eq!(normalize_node_path(""), "/");
     }
 
     #[test]
@@ -691,9 +690,11 @@ mod tests {
 
     #[test]
     fn materialize_assigns_every_node_no_catch_all() {
-        let nodes = ["/srv/policy".to_owned(),
+        let nodes = [
+            "/srv/policy".to_owned(),
             "/srv/model".to_owned(),
-            "/srv".to_owned()];
+            "/srv".to_owned(),
+        ];
         let p = SitePolicy::conservative();
         let map = p.materialize(nodes.iter().map(String::as_str));
         // Every node resolves to a concrete label (materialized, not a default).
@@ -765,19 +766,26 @@ mod tests {
     #[test]
     fn resolver_cid_labeled_manifest() {
         let labeled = SecurityLabel::new(Level::Secret, Assurance::PqHybrid, Default::default());
-        let r = resolver_over(
-            &["/srv/policy"],
+        let import_floor =
+            SecurityLabel::new(Level::Internal, Assurance::Classical, Default::default());
+        let genesis = SitePolicy::floor_only(import_floor).materialize(["/srv/policy"]);
+        let r = CompositeObjectLabelResolver::new(
+            genesis,
+            import_floor,
             Arc::new(FixedManifests(Some(Some(labeled)))),
         );
-        assert_eq!(r.resolve(ObjectRef::Cid(&[1, 2, 3])), Some(labeled));
+        let expected = SecurityLabel::new(Level::Secret, Assurance::Classical, Default::default());
+        assert_eq!(
+            r.resolve(ObjectRef::Cid(&[1, 2, 3])),
+            Some(expected),
+            "PqHybrid provenance imported through a Classical floor must degrade to Classical"
+        );
     }
 
     #[test]
-    fn resolver_cid_unlabeled_manifest_clamps_to_floor() {
-        // Manifest present but carrier empty ⇒ D2 join-to-floor (NOT deny).
+    fn resolver_cid_unlabeled_manifest_is_denied() {
         let r = resolver_over(&["/srv/policy"], Arc::new(FixedManifests(Some(None))));
-        let label = r.resolve(ObjectRef::Cid(&[1, 2, 3])).unwrap();
-        assert_eq!(label, SitePolicy::conservative().floor());
+        assert!(r.resolve(ObjectRef::Cid(&[1, 2, 3])).is_none());
     }
 
     #[test]
@@ -832,17 +840,23 @@ mod tests {
 
     #[test]
     fn gate_resolver_matches_report_coverage() {
-        // Every labeled node in the report must resolve through the gate's
-        // resolver (the report and the resolver agree on coverage).
+        // Every labeled node in the report must resolve to the exact site-policy
+        // label. Genesis carries no provenance evidence, so assurance remains at
+        // the fail-closed Unverified floor rather than acquiring a join identity.
         let gate = GenesisGate::production();
+        let policy = SitePolicy::conservative();
         for node in &gate.report().labeled {
-            let components: Vec<&str> = node.trim_start_matches('/').split('/').collect();
-            assert!(
-                gate.resolver()
-                    .resolve(ObjectRef::Path(&components))
-                    .is_some(),
-                "labeled node {node} must resolve through the resolver"
+            let components: Vec<&str> = node
+                .split('/')
+                .filter(|component| !component.is_empty())
+                .collect();
+            let expected = policy.label_for(node);
+            assert_eq!(
+                gate.resolver().resolve(ObjectRef::Path(&components)),
+                Some(expected),
+                "labeled node {node} must resolve to its reported site-policy label"
             );
+            assert_eq!(expected.assurance, Assurance::Unverified);
         }
     }
 }

@@ -234,7 +234,7 @@ pub(super) async fn validate_oauth_access_token(
                 token,
                 pair.ml_dsa(),
                 pair.ed25519(),
-                Some(&expected_audience),
+                hyprstream_rpc::auth::AudienceExpectation::Exact(&expected_audience),
                 &dispatch,
             )
             .map_err(|_| "composite JWT validation failed")?

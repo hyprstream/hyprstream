@@ -161,6 +161,16 @@ pub struct HyprConfig {
     #[serde(default)]
     pub secrets: SecretsConfig,
 
+    /// Public self-certifying cluster identity pin used by the explicit
+    /// DID-anchored deployment trust source (#1136).
+    /// Must be configured together with `cluster_did_web`.
+    #[serde(default)]
+    pub cluster_at9p_did: Option<String>,
+
+    /// Public did:web alias/discovery anchor paired with `cluster_at9p_did`.
+    #[serde(default)]
+    pub cluster_did_web: Option<String>,
+
     /// Phase-1 cellular-ledger local-enforcer configuration (epic #922, #925).
     ///
     /// Only present when the `ledger` cargo feature is enabled; `enabled`
@@ -620,19 +630,14 @@ fn default_oai_host() -> String { "0.0.0.0".to_owned() }
 fn default_oai_port() -> u16 { 6789 }
 fn default_oai_timeout() -> u64 { 300 }
 
-/// XetService configuration — dual-stack HuggingFace-XET CAS HTTP face.
+/// XetService configuration — HuggingFace-XET CAS HTTP face.
 ///
-/// When enabled, exposes the HF-XET CAS wire routes (`/get_xorb/{hash}/`,
+/// When listed in `[services] startup`, exposes the HF-XET CAS wire routes (`/get_xorb/{hash}/`,
 /// `/v1/reconstructions/{hash}`, `/v1/chunks/{key}`, `/v1/xorbs/{key}`,
 /// `/v1/shards`) so a standard xet-enabled git repo can point its CAS endpoint
 /// at hyprstream as an alternative XET backend to HuggingFace. See epic #654.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct XetConfig {
-    /// Whether the XetService is served. Disabled by default: this is a
-    /// foundation surface (most routes 501 pending interop verification).
-    #[serde(default)]
-    pub enabled: bool,
-
     /// Host address for the HTTP server.
     #[serde(default = "default_xet_host")]
     pub host: String,
@@ -658,7 +663,6 @@ pub struct XetConfig {
 impl Default for XetConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
             host: default_xet_host(),
             port: default_xet_port(),
             external_url: None,
@@ -812,6 +816,13 @@ pub struct TrustedIssuerConfig {
     /// If absent, JWKS URI is auto-discovered from `{issuer}/.well-known/oauth-authorization-server`.
     #[serde(default)]
     pub jwks_uri: Option<String>,
+    /// OIDC client ID allowed to exchange this issuer's ID tokens.
+    ///
+    /// ID-token exchange is disabled for this issuer when absent. This is
+    /// deliberately separate from issuer trust: a valid token issued to some
+    /// other client at the same issuer must never be accepted here.
+    #[serde(default)]
+    pub oidc_client_id: Option<String>,
     /// How long to cache the JWKS before re-fetching (default: 300 seconds).
     #[serde(default = "default_jwks_cache_ttl")]
     pub jwks_cache_ttl_secs: u64,
@@ -1017,17 +1028,9 @@ pub enum UserMappingStrategy {
         /// The claim name to use as the local subject.
         name: String,
     },
-    /// `did:web:{issuer_authority}:users:{external_sub}` per Phase 0.5
-    /// architecture-doc Subject Identity Format.
-    ///
-    /// Uses the OAuth issuer URL's authority (host[:port]) as the DID
-    /// method-specific identifier and the external `sub` claim as the
-    /// user path component. Example: `did:web:hyprstream.example.com:users:12345`.
-    ///
-    /// **Opt-in**: existing deployments continue to use [`Namespaced`] by
-    /// default so Casbin policies don't break. Operators migrating to
-    /// did:web should land Phase 0e (Casbin policy migration) before
-    /// switching this strategy.
+    /// Disabled legacy setting that attempted to mint path-form account DIDs.
+    /// Configuration validation and the runtime mapping path both reject it.
+    /// Host-form account minting is a separate design (#1163).
     DidWeb,
 }
 
@@ -2030,6 +2033,8 @@ pub struct HyprConfigBuilder {
     discovery: DiscoveryServiceConfig,
     tui: TuiServiceConfig,
     metrics: MetricsConfig,
+    cluster_at9p_did: Option<String>,
+    cluster_did_web: Option<String>,
 }
 
 impl HyprConfigBuilder {
@@ -2059,6 +2064,8 @@ impl HyprConfigBuilder {
             discovery: DiscoveryServiceConfig::default(),
             tui: TuiServiceConfig::default(),
             metrics: MetricsConfig::default(),
+            cluster_at9p_did: None,
+            cluster_did_web: None,
         }
     }
 
@@ -2088,6 +2095,8 @@ impl HyprConfigBuilder {
             discovery: config.discovery,
             tui: config.tui,
             metrics: config.metrics,
+            cluster_at9p_did: config.cluster_at9p_did,
+            cluster_did_web: config.cluster_did_web,
         }
     }
 
@@ -2134,6 +2143,8 @@ impl HyprConfigBuilder {
             metrics: self.metrics,
             signing_key: None,
             secrets: Default::default(),
+            cluster_at9p_did: self.cluster_at9p_did,
+            cluster_did_web: self.cluster_did_web,
             #[cfg(feature = "ledger")]
             ledger: Default::default(),
         }
@@ -2237,6 +2248,45 @@ impl HyprConfig {
                 "Configured model path does not exist: {}",
                 self.model.path.display()
             );
+        }
+
+        let mut disabled_did_web_providers: Vec<&str> = self
+            .oauth
+            .oidc_providers
+            .iter()
+            .filter_map(|(name, provider)| {
+                matches!(&provider.user_mapping, UserMappingStrategy::DidWeb)
+                    .then_some(name.as_str())
+            })
+            .collect();
+        disabled_did_web_providers.sort_unstable();
+        if !disabled_did_web_providers.is_empty() {
+            anyhow::bail!(
+                "OIDC provider(s) {} configure disabled user_mapping = \"didweb\"; path-form did:web account minting is forbidden (#1159)",
+                disabled_did_web_providers.join(", ")
+            );
+        }
+
+        // #1136 DID-anchored trust: the two anchors are a PAIR, not two
+        // independent settings. #905 §2/§6 is bidirectional-or-not-believed —
+        // a did:web claim is credited only when the at9p side names it back —
+        // so a one-sided anchor configuration can never establish trust. It
+        // must be rejected here rather than loading cleanly and failing later
+        // in `install_process_production_resolver()`: a config that parses and
+        // then dies at resolver install is an outage discovered at startup
+        // instead of at validation.
+        match (&self.cluster_at9p_did, &self.cluster_did_web) {
+            (Some(_), None) => anyhow::bail!(
+                "cluster_at9p_did is set without cluster_did_web; the DID-anchored trust \
+                 source requires BOTH anchors (#1136, #905 §2/§6 mutual aliasing)"
+            ),
+            (None, Some(_)) => anyhow::bail!(
+                "cluster_did_web is set without cluster_at9p_did; the DID-anchored trust \
+                 source requires BOTH anchors (#1136, #905 §2/§6 mutual aliasing)"
+            ),
+            // Both absent = anchors not configured, the OS-owned path applies.
+            // Both present = the pairing the resolver expects.
+            (None, None) | (Some(_), Some(_)) => {}
         }
 
         Ok(())
@@ -2625,10 +2675,56 @@ impl From<&crate::config::server::SamplingParamDefaults> for SamplingParams {
 
 #[cfg(test)]
 mod tests {
+    /// #1136 anchors are a PAIR. #905 §2/§6 is bidirectional-or-not-believed, so a
+    /// one-sided anchor config can never establish trust and must fail at validation
+    /// rather than at `install_process_production_resolver()`.
+    #[test]
+    fn validate_rejects_one_sided_did_anchor_config() {
+        let mut c = HyprConfig::default();
+        c.model.path = std::path::PathBuf::new();
+
+        c.cluster_at9p_did = Some("did:at9p:example".to_owned());
+        c.cluster_did_web = None;
+        assert!(c.validate().is_err(), "at9p without did:web must be rejected");
+
+        c.cluster_at9p_did = None;
+        c.cluster_did_web = Some("did:web:example.com".to_owned());
+        assert!(c.validate().is_err(), "did:web without at9p must be rejected");
+
+        // Both absent: anchors simply not configured — the OS-owned path applies.
+        c.cluster_did_web = None;
+        assert!(c.validate().is_ok(), "no anchors configured must remain valid");
+
+        // Both present: the pairing the resolver expects.
+        c.cluster_at9p_did = Some("did:at9p:example".to_owned());
+        c.cluster_did_web = Some("did:web:example.com".to_owned());
+        assert!(c.validate().is_ok(), "paired anchors must be accepted");
+    }
+
     use super::*;
 
     /// Serialize process-env mutations for secrets-dir resolver tests.
     static SECRETS_DIR_ENV_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn public_cluster_did_anchors_deserialize_from_root_config() {
+        let config: HyprConfig = toml::from_str(
+            r#"
+cluster_at9p_did = "did:at9p:bafyclusterpin"
+cluster_did_web = "did:web:discovery.hyprstream.com"
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            config.cluster_at9p_did.as_deref(),
+            Some("did:at9p:bafyclusterpin")
+        );
+        assert_eq!(
+            config.cluster_did_web.as_deref(),
+            Some("did:web:discovery.hyprstream.com")
+        );
+    }
 
     #[test]
     #[allow(clippy::unwrap_used)]
@@ -2833,6 +2929,24 @@ mod tests {
         assert_eq!(config.lead_secs(), 25);
         assert_eq!(config.drain_secs(), 20);
         assert_eq!(config.rotation_check_interval(), std::time::Duration::from_secs(3));
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn validation_rejects_didweb_user_mapping() {
+        let provider: OidcProviderConfig = serde_json::from_value(serde_json::json!({
+            "client_id": "legacy-client",
+            "user_mapping": "didweb"
+        }))
+        .unwrap();
+        let mut config = HyprConfig::default();
+        config
+            .oauth
+            .oidc_providers
+            .insert("legacy".to_owned(), provider);
+
+        let err = config.validate().unwrap_err();
+        assert!(err.to_string().contains("disabled user_mapping = \"didweb\""));
     }
 
     #[test]
