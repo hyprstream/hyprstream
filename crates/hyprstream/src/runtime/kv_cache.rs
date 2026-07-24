@@ -2673,6 +2673,71 @@ mod tests {
         Ok(())
     }
 
+    /// The cache-level lifecycle the KV-compat reuse guard (#1277) relies on:
+    /// `cached_token_count() == 0` is the "provably empty" signal, and a populated
+    /// cache with no stamp must be rejected (DiscardAndRecompute), never adopted.
+    #[test]
+    fn test_kv_compat_fail_closed_lifecycle() {
+        use crate::runtime::kv_compat::{
+            decide_cache_reuse, CacheReuseDecision, KvCompatDescriptor, WeightIdentity,
+            KV_COMPAT_FORMAT_VERSION,
+        };
+
+        let expected = KvCompatDescriptor {
+            format_version: KV_COMPAT_FORMAT_VERSION,
+            weights: WeightIdentity::base_only("sha256:base"),
+            tokenizer_hash: Some("deadbeef".to_owned()),
+            ..Default::default()
+        }
+        .fingerprint();
+
+        let mut manager = KVCacheManager::new(2, 64, KVQuantType::None);
+
+        // (1) Fresh cache: empty, un-stamped. An authoritative identity is available
+        //     → stamp fresh and let prefill populate it.
+        assert_eq!(manager.cached_token_count(), 0);
+        assert!(manager.compat_fingerprint().is_none());
+        assert_eq!(
+            decide_cache_reuse(Some(&expected), manager.compat_fingerprint().as_ref(), true),
+            CacheReuseDecision::StampFresh
+        );
+        manager.set_compat_fingerprint(expected);
+
+        // (2) Cache now populated but its stamp matches → reuse.
+        manager.set_cached_tokens(vec![1, 2, 3, 4]);
+        assert_eq!(
+            decide_cache_reuse(
+                Some(&expected),
+                manager.compat_fingerprint().as_ref(),
+                manager.cached_token_count() == 0
+            ),
+            CacheReuseDecision::Reuse
+        );
+
+        // (3) A populated cache carrying NO stamp (e.g. produced before stamping
+        //     existed) must be rejected, never silently adopted.
+        let mut unstamped = KVCacheManager::new(2, 64, KVQuantType::None);
+        unstamped.set_cached_tokens(vec![9, 9, 9]);
+        assert_eq!(
+            decide_cache_reuse(
+                Some(&expected),
+                unstamped.compat_fingerprint().as_ref(),
+                unstamped.cached_token_count() == 0
+            ),
+            CacheReuseDecision::DiscardAndRecompute,
+            "an unstamped populated cache must fail-closed to discard"
+        );
+
+        // (4) Discard clears the emptiness signal so the cache is treated fresh again.
+        unstamped.set_cached_tokens(Vec::new());
+        unstamped.clear_all();
+        assert_eq!(unstamped.cached_token_count(), 0);
+        assert_eq!(
+            decide_cache_reuse(Some(&expected), unstamped.compat_fingerprint().as_ref(), true),
+            CacheReuseDecision::StampFresh
+        );
+    }
+
     // ========================================================================
     // TTT → KV invalidation wiring (#1254, epic #1246)
     // ========================================================================

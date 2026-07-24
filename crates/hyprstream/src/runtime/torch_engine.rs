@@ -279,19 +279,30 @@ impl TorchEngine {
         );
     }
 
-    /// Current KV-cache compatibility fingerprint for the loaded model, or
-    /// `None` if no descriptor has been recorded (no model loaded yet).
+    /// Expected KV-cache compatibility fingerprint for the loaded model under the
+    /// given adapter/delta generation, or `None` when no authoritative identity is
+    /// available.
     ///
-    /// The session-reuse path compares this against each cache's stamped
-    /// fingerprint (#1277): a mismatch means the cache's KV was produced under
-    /// an incompatible config and is rejected (cleared + recomputed). `None`
-    /// means compatibility tracking is inactive — there is nothing to guard, so
-    /// callers treat it as "no gating" rather than "reject everything".
-    pub fn kv_compat_fingerprint(&self) -> Option<crate::runtime::kv_compat::KvCompatFingerprint> {
-        self.kv_compat
-            .lock()
-            .as_ref()
-            .map(crate::runtime::kv_compat::KvCompatFingerprint::of)
+    /// The effective identity folds in the base-weight content digest, the full
+    /// effective architecture/runtime config, and the live `adapter_generation`
+    /// actually applied to the request. Returns `None` when no descriptor was
+    /// built (the base-weight digest could not be computed) or when the descriptor
+    /// is not yet authoritatively complete (tokenizer identity not yet folded in,
+    /// or tokenizer hashing failed). The session-reuse path treats `None` as
+    /// **fail-closed**: it discards a cache rather than reusing it under a
+    /// missing or uncertain identity — it never treats absence as "no gating".
+    pub fn kv_compat_fingerprint_for(
+        &self,
+        adapter_generation: u64,
+    ) -> Option<crate::runtime::kv_compat::KvCompatFingerprint> {
+        let guard = self.kv_compat.lock();
+        let desc = guard.as_ref()?;
+        if !desc.is_authoritatively_complete() {
+            return None;
+        }
+        let mut effective = desc.clone();
+        effective.weights.adapter_generation = adapter_generation;
+        Some(crate::runtime::kv_compat::KvCompatFingerprint::of(&effective))
     }
 
     /// Compute a KV cache memory budget based on model size and available GPU memory.
@@ -753,6 +764,50 @@ impl TorchEngine {
         self.var_store.lock().is_some()
     }
 
+    /// Authoritative content digest of the base weights actually loaded from
+    /// `model_path` — a SHA-256 over every `.safetensors` shard (filename + full
+    /// bytes) in sorted name order. This is the base-weight identity for the
+    /// KV-compat fingerprint (#1277): two snapshots sharing a basename but
+    /// differing in content diverge here, unlike a path/label. Streams each
+    /// shard in 64 KiB chunks; returns an error when there are no shards or a
+    /// shard cannot be read, in which case the caller declines to build a
+    /// descriptor and KV reuse fails closed.
+    fn weights_content_digest(model_path: &Path) -> std::result::Result<String, std::io::Error> {
+        use sha2::Digest;
+        use std::io::Read;
+        let mut shards: Vec<std::path::PathBuf> = std::fs::read_dir(model_path)?
+            .filter_map(Result::ok)
+            .map(|e| e.path())
+            .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("safetensors"))
+            .collect();
+        shards.sort();
+        if shards.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("no .safetensors weight shards in {}", model_path.display()),
+            ));
+        }
+        let mut hasher = sha2::Sha256::new();
+        let mut buf = [0u8; 65536];
+        for shard in &shards {
+            let name = shard
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("");
+            hasher.update(name.as_bytes());
+            hasher.update([0u8]);
+            let mut f = std::fs::File::open(shard)?;
+            loop {
+                let n = f.read(&mut buf)?;
+                if n == 0 {
+                    break;
+                }
+                hasher.update(&buf[..n]);
+            }
+        }
+        Ok(hex::encode(hasher.finalize()))
+    }
+
     /// Initialize XET storage with default configuration
     /// Initialize the persistent model instance using ModelFactory
     async fn initialize_persistent_model(&mut self, model_path: &Path) -> Result<()> {
@@ -834,49 +889,80 @@ impl TorchEngine {
         // identity of the model + runtime config that produces this engine's KV.
         // Every reusable/durable KV lookup is checked against its fingerprint.
         // Built here (where the full `ModelConfig` is in scope) from authoritative
-        // inputs only — never a human label. The tokenizer identity is folded in
-        // later by `load_tokenizer`, before any generation reads the fingerprint.
-        {
-            use crate::runtime::kv_compat::{
-                KvCompatDescriptor, KvDtype, KvQuantMode, RopeScalingFp, WeightIdentity,
-                KV_COMPAT_FORMAT_VERSION,
-            };
-            let kv_quant = match self.config.kv_quant_type {
-                crate::runtime::KVQuantType::None => KvQuantMode::None,
-                crate::runtime::KVQuantType::Int8 => KvQuantMode::Int8,
-                crate::runtime::KVQuantType::Nf4 => KvQuantMode::Nf4,
-                crate::runtime::KVQuantType::Fp4 => KvQuantMode::Fp4,
-            };
-            let model_name = model_path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("")
-                .to_owned();
-            let descriptor = KvCompatDescriptor {
-                format_version: KV_COMPAT_FORMAT_VERSION,
-                weights: WeightIdentity::base_only(model_name.clone()),
-                model_name,
-                architecture: config.model_type.clone(),
-                model_version: config.version,
-                num_hidden_layers: config.num_hidden_layers,
-                num_attention_heads: config.num_attention_heads,
-                num_key_value_heads: config.num_key_value_heads,
-                head_dim: config.head_dim,
-                hidden_size: config.hidden_size,
-                rope_theta_bits: config.rope_theta.to_bits(),
-                rope_scaling: config
-                    .rope_scaling
-                    .as_ref()
-                    .map(|rs| RopeScalingFp::new(&rs.rope_type, rs.factor)),
-                max_position_embeddings: config.max_position_embeddings,
-                dtype: KvDtype::from_str(&config.dtype),
-                kv_quant,
-                block_size: crate::runtime::kv_cache::BLOCK_SIZE,
-                max_context: effective_max_context,
-                vocab_size: config.vocab_size,
-                tokenizer_hash: None,
-            };
-            *self.kv_compat.lock() = Some(descriptor);
+        // inputs only — never a human label. The base-weight identity is a content
+        // digest of the resolved shards; the tokenizer identity is folded in later
+        // by `load_tokenizer`, before any generation reads the fingerprint. If no
+        // authoritative base digest can be computed, the descriptor is left unset
+        // and the cache boundary fails closed (KV recomputed, not reused).
+        match Self::weights_content_digest(model_path) {
+            Ok(base_revision) => {
+                use crate::runtime::kv_compat::{
+                    KvCompatDescriptor, KvDtype, KvQuantMode, RopeScalingFp, WeightIdentity,
+                    KV_COMPAT_FORMAT_VERSION,
+                };
+                let kv_quant = match self.config.kv_quant_type {
+                    crate::runtime::KVQuantType::None => KvQuantMode::None,
+                    crate::runtime::KVQuantType::Int8 => KvQuantMode::Int8,
+                    crate::runtime::KVQuantType::Nf4 => KvQuantMode::Nf4,
+                    crate::runtime::KVQuantType::Fp4 => KvQuantMode::Fp4,
+                };
+                // `model_name` is a display label for mismatch messages; the
+                // authoritative weight identity is the content digest above.
+                let model_name = model_path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("")
+                    .to_owned();
+                let descriptor = KvCompatDescriptor {
+                    format_version: KV_COMPAT_FORMAT_VERSION,
+                    weights: WeightIdentity::base_only(base_revision),
+                    model_name,
+                    architecture: config.model_type.clone(),
+                    model_version: config.version,
+                    num_hidden_layers: config.num_hidden_layers,
+                    num_attention_heads: config.num_attention_heads,
+                    num_key_value_heads: config.num_key_value_heads,
+                    head_dim: config.head_dim,
+                    hidden_size: config.hidden_size,
+                    // Effective attention behavior — every field below can change
+                    // KV *values* without changing coarse geometry (#1277 review).
+                    use_qk_norm: config.use_qk_norm,
+                    partial_rotary_factor_bits: config.partial_rotary_factor.map(f32::to_bits),
+                    layer_types: config.layer_types.clone(),
+                    linear_key_head_dim: config.linear_key_head_dim,
+                    linear_value_head_dim: config.linear_value_head_dim,
+                    linear_num_key_heads: config.linear_num_key_heads,
+                    linear_num_value_heads: config.linear_num_value_heads,
+                    linear_conv_kernel_dim: config.linear_conv_kernel_dim,
+                    rope_theta_bits: config.rope_theta.to_bits(),
+                    rope_scaling: config
+                        .rope_scaling
+                        .as_ref()
+                        .map(|rs| RopeScalingFp::new(&rs.rope_type, rs.factor)),
+                    max_position_embeddings: config.max_position_embeddings,
+                    dtype: KvDtype::from_name(&config.dtype),
+                    kv_quant,
+                    block_size: crate::runtime::kv_cache::BLOCK_SIZE,
+                    max_context: effective_max_context,
+                    vocab_size: config.vocab_size,
+                    // Folded in by `load_tokenizer`; descriptor is non-authoritative
+                    // (fingerprint = None) until then, so reuse fails closed.
+                    tokenizer_hash: None,
+                };
+                *self.kv_compat.lock() = Some(descriptor);
+            }
+            Err(e) => {
+                warn!(
+                    "Cannot compute authoritative base-weight digest for {}: {} \
+                     — KV-cache reuse disabled (fail-closed)",
+                    model_path.display(),
+                    e
+                );
+                // Leave kv_compat unset (None): the reuse boundary will discard
+                // rather than adopt any cache, since there is no authoritative
+                // identity to compare against.
+                *self.kv_compat.lock() = None;
+            }
         }
 
         // Use the factory to create the model. When `device_pool` is set and
@@ -1002,21 +1088,30 @@ impl TorchEngine {
             // a different tokenizer (even with the same vocab size) must reject.
             // The on-disk `tokenizer.json` bytes are the authoritative identity;
             // deterministic model-driven mutation (e.g. Qwen vocab padding) is
-            // already captured by `vocab_size`.
+            // already captured by `vocab_size`. FAIL-CLOSED: if the bytes cannot
+            // be hashed, the tokenizer identity is left unset, the descriptor is
+            // non-authoritative (fingerprint = None), and the cache boundary
+            // discards rather than adopts any cache — we never silently degrade
+            // to a weaker vocab-only identity.
             {
                 let mut guard = self.kv_compat.lock();
-                let tokenizer_hash = std::fs::read(&tokenizer_path).ok().map(|bytes| {
-                    use sha2::{Digest, Sha256};
-                    let mut hasher = Sha256::new();
-                    hasher.update(&bytes);
-                    hex::encode(hasher.finalize())
-                });
-                if tokenizer_hash.is_none() {
-                    tracing::warn!(
-                        "Could not read {} for KV-compat tokenizer identity; matching on vocab size only",
-                        tokenizer_path.display()
-                    );
-                }
+                let tokenizer_hash = match std::fs::read(&tokenizer_path) {
+                    Ok(bytes) => {
+                        use sha2::{Digest, Sha256};
+                        let mut hasher = Sha256::new();
+                        hasher.update(&bytes);
+                        Some(hex::encode(hasher.finalize()))
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            "Could not read {} for KV-compat tokenizer identity ({}): \
+                             KV-cache reuse disabled (fail-closed)",
+                            tokenizer_path.display(),
+                            e
+                        );
+                        None
+                    }
+                };
                 if let Some(desc) = guard.as_mut() {
                     desc.set_tokenizer(final_vocab_size, tokenizer_hash);
                 }
@@ -1812,6 +1907,10 @@ impl TorchEngine {
     /// during generation. The delta is locked per-token (not held across the entire
     /// generation) to allow concurrent training updates.
     ///
+    /// `adapter_generation` is the live LoRA/delta generation actually applied to
+    /// this request; it is folded into the KV-compat expected identity so a
+    /// re-adapted model is detected as incompatible and its stale KV rejected.
+    ///
     /// `tenant_id` is the effective tenant whose delta contributed to the weights
     /// (`Some` only when a per-tenant delta is in play, `None` otherwise), and
     /// `weight_epoch` is that delta's current weight epoch. The pair is threaded
@@ -1826,6 +1925,7 @@ impl TorchEngine {
         delta: Option<std::sync::Arc<parking_lot::Mutex<crate::training::TenantDelta>>>,
         tenant_id: Option<String>,
         weight_epoch: u64,
+        adapter_generation: u64,
     ) -> Result<TextStream<'_>> {
         if let Some(seed) = request.seed {
             self.set_seed(seed as u64);
@@ -1835,7 +1935,14 @@ impl TorchEngine {
             request.timeout_ms = Some(self.config.default_generation_timeout_ms);
         }
 
-        TextStream::new_with_delta(self, request, delta, tenant_id, weight_epoch)
+        TextStream::new_with_delta(
+            self,
+            request,
+            delta,
+            tenant_id,
+            weight_epoch,
+            adapter_generation,
+        )
     }
 
     /// Non-streaming generation with optional delta (convenience wrapper)
@@ -1845,6 +1952,7 @@ impl TorchEngine {
         delta: Option<std::sync::Arc<parking_lot::Mutex<crate::training::TenantDelta>>>,
         tenant_id: Option<String>,
         weight_epoch: u64,
+        adapter_generation: u64,
     ) -> Result<crate::config::GenerationResult> {
         use futures::StreamExt;
 
@@ -1854,7 +1962,8 @@ impl TorchEngine {
             ));
         }
 
-        let mut stream = self.generate_with_delta(request, delta, tenant_id, weight_epoch)?;
+        let mut stream =
+            self.generate_with_delta(request, delta, tenant_id, weight_epoch, adapter_generation)?;
         let mut accumulated_text = String::new();
 
         while let Some(text_chunk) = stream.next().await {
@@ -2783,7 +2892,9 @@ pub struct TextStream<'a> {
 
 impl<'a> TextStream<'a> {
     fn new(engine: &'a TorchEngine, request: GenerationRequest) -> Result<Self> {
-        Self::new_with_delta(engine, request, None, None, 0)
+        // No delta path: no tenant dependency and adapter generation 0 (base
+        // weights only).
+        Self::new_with_delta(engine, request, None, None, 0, 0)
     }
 
     fn new_with_delta(
@@ -2792,6 +2903,7 @@ impl<'a> TextStream<'a> {
         delta: Option<std::sync::Arc<parking_lot::Mutex<crate::training::TenantDelta>>>,
         tenant_id: Option<String>,
         weight_epoch: u64,
+        adapter_generation: u64,
     ) -> Result<Self> {
         let prompt_tokens = engine.tokenize(&request.prompt)?;
         let prompt_len = prompt_tokens.len();
@@ -2845,30 +2957,57 @@ impl<'a> TextStream<'a> {
                     let mut cache_guard = cache.lock();
 
                     // KV-cache compatibility guard (#1277): KV produced under an
-                    // incompatible model/runtime config is never reused. A fresh
-                    // (un-stamped) cache is stamped with the current config; a
-                    // stamp mismatch discards the stale KV (clear + re-stamp) so
-                    // prefill recomputes from zero. This is the pull-based
+                    // incompatible (or unproven) model/runtime config is never
+                    // reused. The policy is **fail-closed** via
+                    // `decide_cache_reuse`: a stamp mismatch, an unstamped but
+                    // *populated* cache, or the absence of an authoritative
+                    // expected identity all discard the KV and recompute. Only a
+                    // genuinely fresh (empty) cache under an authoritative
+                    // identity is stamped for reuse. This is the pull-based
                     // complement to the registry's push-based delta invalidation.
-                    if let Some(expected) = engine.kv_compat_fingerprint() {
-                        match cache_guard.compat_fingerprint() {
-                            None => {
-                                // Fresh cache: stamp it with the config that will populate it.
-                                cache_guard.set_compat_fingerprint(expected);
+                    let expected = engine.kv_compat_fingerprint_for(adapter_generation);
+                    let stored = cache_guard.compat_fingerprint();
+                    let cache_is_empty = cache_guard.cached_token_count() == 0;
+                    match crate::runtime::kv_compat::decide_cache_reuse(
+                        expected.as_ref(),
+                        stored.as_ref(),
+                        cache_is_empty,
+                    ) {
+                        crate::runtime::kv_compat::CacheReuseDecision::Reuse => {
+                            tracing::debug!(target: "kv_compat", "KV cache reuse: compatible");
+                        }
+                        crate::runtime::kv_compat::CacheReuseDecision::StampFresh => {
+                            // Empty cache under an authoritative identity: stamp
+                            // it so the KV about to be produced is attributable.
+                            if let Some(exp) = expected {
+                                cache_guard.set_compat_fingerprint(exp);
                             }
-                            Some(stored) if stored != expected => {
-                                tracing::info!(
-                                    target: "kv_compat",
-                                    "KV cache compatibility mismatch \
-                                     (stored={}, expected={}): discarding stale KV and recomputing",
-                                    stored.to_hex(),
-                                    expected.to_hex(),
-                                );
-                                cache_guard.set_cached_tokens(Vec::new());
-                                cache_guard.clear_all();
-                                cache_guard.set_compat_fingerprint(expected);
+                        }
+                        crate::runtime::kv_compat::CacheReuseDecision::DiscardAndRecompute => {
+                            // Fail-closed: discard the (untrusted or mismatched)
+                            // KV and recompute from zero.
+                            let reason = match (expected.as_ref(), stored.as_ref()) {
+                                (_, Some(s)) => format!(
+                                    "stamp mismatch (stored={}, expected={})",
+                                    s.to_hex(),
+                                    expected
+                                        .map(|e| e.to_hex())
+                                        .unwrap_or_else(|| "<none>".into())
+                                ),
+                                (_, None) if !cache_is_empty =>
+                                    "populated cache with no compatibility stamp".into(),
+                                _ => "no authoritative compatibility identity".into(),
+                            };
+                            tracing::info!(
+                                target: "kv_compat",
+                                reason = %reason,
+                                "KV cache not reusable: discarding and recomputing (fail-closed)"
+                            );
+                            cache_guard.set_cached_tokens(Vec::new());
+                            cache_guard.clear_all();
+                            if let Some(exp) = expected {
+                                cache_guard.set_compat_fingerprint(exp);
                             }
-                            Some(_) => {} // compatible — reuse as-is
                         }
                     }
 

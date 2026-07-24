@@ -25,10 +25,14 @@
 //! Every field of [`KvCompatDescriptor`] is derived from the model/runtime state
 //! that actually produced the KV tensors — never from a human label:
 //!
-//! - **Effective weights** — base-weight revision + adapter/delta generation.
+//! - **Effective weights** — base-weight **content digest** + adapter/delta
+//!   generation (the live `lora_generation` actually applied to the request).
 //! - **Model identity** — name, architecture (`model_type`), config version.
 //! - **Attention geometry** — layers, KV heads, attention heads, head dim,
 //!   hidden size (determines K/V tensor *shape*).
+//! - **Effective attention behavior** — QK-norm, partial-rotary dimension,
+//!   per-layer local/global layout (`layer_types`), and hybrid/linear-attention
+//!   dimensions (change K/V *values*, not just shape).
 //! - **Position encoding** — RoPE theta, RoPE scaling, max position embeddings
 //!   (determines K *values* post-RoPE).
 //! - **Compute dtype** — the dtype the model computes/stores K/V in.
@@ -38,6 +42,16 @@
 //! - **Tokenizer identity** — vocab size + a digest of the tokenizer bytes
 //!   (cached token ids are only meaningful relative to one tokenizer).
 //! - **Format version** — the wire/layout version of the fingerprint itself.
+//!
+//! ## Authority and fail-closed reuse
+//!
+//! A descriptor is only usable to bless a cache when every authoritative axis is
+//! populated ([`KvCompatDescriptor::is_authoritatively_complete`]): the
+//! base-weight content digest and the tokenizer hash. If the loader cannot
+//! obtain the base digest, or tokenizer hashing fails, the engine declines to
+//! mint an expected identity and the cache boundary **fails closed** — KV is
+//! recomputed rather than reused under a guess ([`decide_cache_reuse`]). An
+//! unstamped but populated cache is likewise discarded, never silently adopted.
 //!
 //! ## Relation to TTT delta invalidation
 //!
@@ -57,7 +71,11 @@ use sha2::{Digest, Sha256};
 /// their canonical encoding, changes in a backward-incompatible way. A cache
 /// produced (or persisted) under an older format version is **never** reused —
 /// the rejection policy treats a format-version mismatch as a hard reject.
-pub const KV_COMPAT_FORMAT_VERSION: u32 = 1;
+///
+/// v2 adds the behavior-affecting effective-config fields (`use_qk_norm`,
+/// partial rotary dimension, attention layer layout, and linear-attention
+/// dimensions) that change KV byte-content without changing coarse geometry.
+pub const KV_COMPAT_FORMAT_VERSION: u32 = 2;
 
 /// Default tokens-per-block for paged KV storage.
 ///
@@ -79,15 +97,19 @@ pub const KV_BLOCK_SIZE_DEFAULT: usize = 256;
 /// distinct from a geometry or dtype change.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Default)]
 pub struct WeightIdentity {
-    /// Identity of the base model weights. Today this is the loaded model's
-    /// path/identity; future work feeds a git2db content oid (issue #1285) for
-    /// a true content address.
+    /// Authoritative identity of the base model weights — a content digest of
+    /// the weight shards actually resolved by the loader (today a SHA-256 over
+    /// the sorted `.safetensors` shard bytes; a git2db content OID when one is
+    /// associated with the loaded worktree, issue #1285). This is **never** a
+    /// human/path label: two snapshots sharing a basename but differing in
+    /// content diverge here. Empty when no authoritative digest could be
+    /// obtained, in which case the descriptor is treated as non-authoritative
+    /// and reuse fails closed (see [`KvCompatDescriptor::is_authoritatively_complete`]).
     pub base_revision: String,
     /// Adapter/delta generation active when the KV was produced. `0` means base
-    /// weights only (no adapter). The live `lora_generation` counter (issue
-    /// #1260) is the intended producer; until it is wired, per-tenant delta
-    /// staleness is handled by the registry's push-based
-    /// [`invalidate_for_tenant`][crate::runtime::kv_cache::KVCacheRegistry::invalidate_for_tenant].
+    /// weights only (no adapter). Populated at the per-request reuse boundary
+    /// from the live `lora_generation` counter actually applied to the request,
+    /// so a re-adapted model is detected as incompatible (issue #1260).
     pub adapter_generation: u64,
 }
 
@@ -268,6 +290,28 @@ pub struct KvCompatDescriptor {
     pub head_dim: usize,
     pub hidden_size: usize,
 
+    // --- effective attention behavior (changes K/V *values*, not just shape) ---
+    /// QK-norm applied to queries/keys (Gemma3, Qwen3 families). Off vs. on
+    /// normalizes K and changes every downstream value.
+    pub use_qk_norm: bool,
+    /// `f32::to_bits` of the partial-rotary factor. Determines `rotary_dim`
+    /// (`head_dim * factor`), i.e. how much of each key is rotated by RoPE —
+    /// a different factor rotates a different slice of K. `None` = full rotary.
+    pub partial_rotary_factor_bits: Option<u32>,
+    /// Per-layer attention type in layer order (e.g. `"global"`/`"local"`,
+    /// `"full_attention"`/`"linear_attention"`). The local/global layout and any
+    /// local-RoPE behavior change which tokens each layer attends to and thus its
+    /// K/V. Stored lowercased; canonicalized at hash time.
+    pub layer_types: Vec<String>,
+    /// Linear/hybrid-attention state dimensions (Qwen3.5 GatedDeltaNet etc.).
+    /// Non-zero on hybrid models; a different dimension changes the per-layer
+    /// recurrent state that feeds later K/V.
+    pub linear_key_head_dim: usize,
+    pub linear_value_head_dim: usize,
+    pub linear_num_key_heads: usize,
+    pub linear_num_value_heads: usize,
+    pub linear_conv_kernel_dim: usize,
+
     // --- position encoding (determines K values post-RoPE) ---
     /// `f32::to_bits` of `rope_theta`.
     pub rope_theta_bits: u32,
@@ -301,6 +345,26 @@ impl KvCompatDescriptor {
     /// Set the RoPE theta from an `f32` (canonicalized to bits).
     pub fn set_rope_theta(&mut self, theta: f32) {
         self.rope_theta_bits = theta.to_bits();
+    }
+
+    /// The partial-rotary factor, recovered from its bit pattern (`None` = full rotary).
+    pub fn partial_rotary_factor(&self) -> Option<f32> {
+        self.partial_rotary_factor_bits.map(f32::from_bits)
+    }
+
+    /// Set the partial-rotary factor from an `f32` (canonicalized to bits).
+    pub fn set_partial_rotary_factor(&mut self, factor: Option<f32>) {
+        self.partial_rotary_factor_bits = factor.map(f32::to_bits);
+    }
+
+    /// True iff every authoritative identity axis is populated.
+    ///
+    /// A descriptor missing the base-weight digest or the tokenizer identity was
+    /// built from a non-authoritative source and must **not** be used to bless a
+    /// cache for reuse: the engine treats a non-authoritative expected identity
+    /// as fail-closed (discard + recompute) rather than stamping a guess.
+    pub fn is_authoritatively_complete(&self) -> bool {
+        !self.weights.base_revision.is_empty() && self.tokenizer_hash.is_some()
     }
 
     /// Record the tokenizer identity (vocab size + digest of its bytes).
@@ -346,6 +410,16 @@ impl KvCompatDescriptor {
         put_usize(hash, self.num_key_value_heads);
         put_usize(hash, self.head_dim);
         put_usize(hash, self.hidden_size);
+
+        // Effective attention behavior.
+        put_bool(hash, self.use_qk_norm);
+        put_opt_u32(hash, self.partial_rotary_factor_bits);
+        put_str_vec(hash, &self.layer_types);
+        put_usize(hash, self.linear_key_head_dim);
+        put_usize(hash, self.linear_value_head_dim);
+        put_usize(hash, self.linear_num_key_heads);
+        put_usize(hash, self.linear_num_value_heads);
+        put_usize(hash, self.linear_conv_kernel_dim);
 
         put_u32(hash, self.rope_theta_bits);
         match &self.rope_scaling {
@@ -455,6 +529,18 @@ pub enum KvCompatMismatch {
         expected: usize,
         observed: usize,
     },
+    UseQkNorm {
+        expected: bool,
+        observed: bool,
+    },
+    PartialRotaryFactor {
+        expected_bits: Option<u32>,
+        observed_bits: Option<u32>,
+    },
+    LayerTypes {
+        expected: Vec<String>,
+        observed: Vec<String>,
+    },
     RopeTheta {
         expected_bits: u32,
         observed_bits: u32,
@@ -523,6 +609,21 @@ impl std::fmt::Display for KvCompatMismatch {
             } => write!(
                 f,
                 "KV compat mismatch: geometry field {field:?} (expected {expected}, observed {observed})"
+            ),
+            KvCompatMismatch::UseQkNorm { expected, observed } => write!(
+                f,
+                "KV compat mismatch: use_qk_norm (expected {expected}, observed {observed})"
+            ),
+            KvCompatMismatch::PartialRotaryFactor {
+                expected_bits,
+                observed_bits,
+            } => write!(
+                f,
+                "KV compat mismatch: partial_rotary_factor (expected bits {expected_bits:?}, observed bits {observed_bits:?})"
+            ),
+            KvCompatMismatch::LayerTypes { expected, observed } => write!(
+                f,
+                "KV compat mismatch: layer_types (expected {expected:?}, observed {observed:?})"
             ),
             KvCompatMismatch::RopeTheta {
                 expected_bits,
@@ -647,6 +748,60 @@ pub fn check_compatibility(
             observed.hidden_size,
         ));
     }
+    // Effective attention behavior (changes K/V *values*, not just shape).
+    if expected.use_qk_norm != observed.use_qk_norm {
+        return Err(KvCompatMismatch::UseQkNorm {
+            expected: expected.use_qk_norm,
+            observed: observed.use_qk_norm,
+        });
+    }
+    if expected.partial_rotary_factor_bits != observed.partial_rotary_factor_bits {
+        return Err(KvCompatMismatch::PartialRotaryFactor {
+            expected_bits: expected.partial_rotary_factor_bits,
+            observed_bits: observed.partial_rotary_factor_bits,
+        });
+    }
+    if expected.layer_types != observed.layer_types {
+        return Err(KvCompatMismatch::LayerTypes {
+            expected: expected.layer_types.clone(),
+            observed: observed.layer_types.clone(),
+        });
+    }
+    if expected.linear_key_head_dim != observed.linear_key_head_dim {
+        return Err(geometry(
+            "linear_key_head_dim",
+            expected.linear_key_head_dim,
+            observed.linear_key_head_dim,
+        ));
+    }
+    if expected.linear_value_head_dim != observed.linear_value_head_dim {
+        return Err(geometry(
+            "linear_value_head_dim",
+            expected.linear_value_head_dim,
+            observed.linear_value_head_dim,
+        ));
+    }
+    if expected.linear_num_key_heads != observed.linear_num_key_heads {
+        return Err(geometry(
+            "linear_num_key_heads",
+            expected.linear_num_key_heads,
+            observed.linear_num_key_heads,
+        ));
+    }
+    if expected.linear_num_value_heads != observed.linear_num_value_heads {
+        return Err(geometry(
+            "linear_num_value_heads",
+            expected.linear_num_value_heads,
+            observed.linear_num_value_heads,
+        ));
+    }
+    if expected.linear_conv_kernel_dim != observed.linear_conv_kernel_dim {
+        return Err(geometry(
+            "linear_conv_kernel_dim",
+            expected.linear_conv_kernel_dim,
+            observed.linear_conv_kernel_dim,
+        ));
+    }
     if expected.rope_theta_bits != observed.rope_theta_bits {
         return Err(KvCompatMismatch::RopeTheta {
             expected_bits: expected.rope_theta_bits,
@@ -713,12 +868,79 @@ fn geometry(field: &'static str, expected: usize, observed: usize) -> KvCompatMi
 }
 
 // ===========================================================================
+// Reuse decision (fail-closed policy at the cache boundary)
+// ===========================================================================
+
+/// What to do with a cache encountered at the reuse boundary, produced by
+/// [`decide_cache_reuse`]. The policy is **fail-closed**: it never blesses a
+/// cache whose KV cannot be proven compatible with an authoritative identity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CacheReuseDecision {
+    /// Cache KV is provably compatible with an authoritative expected identity —
+    /// reuse it as-is.
+    Reuse,
+    /// Cache is empty and carries no stamp, and an authoritative expected
+    /// identity is available. Stamp it and keep the (empty) cache; prefill will
+    /// populate it under that identity.
+    StampFresh,
+    /// The cache's KV cannot be proven compatible. This covers a stamp mismatch,
+    /// an **unstamped but populated** cache (produced under an unknown identity),
+    /// and the absence of any authoritative expected identity. Discard the KV and
+    /// recompute; stamp with the authoritative identity if one is available.
+    DiscardAndRecompute,
+}
+
+/// Decide whether a cache may be reused, given the authoritative expected
+/// identity (if any), the stamp currently on the cache (if any), and whether the
+/// cache provably carries no KV.
+///
+/// Decision matrix (every non-`Reuse` outcome discards KV — fail-closed):
+///
+/// | expected | stored  | empty | decision              |
+/// |----------|---------|-------|-----------------------|
+/// | Some(e)  | Some(s) | *     | `e == s` ? Reuse : DiscardAndRecompute |
+/// | Some(_)  | None    | true  | StampFresh            |
+/// | Some(_)  | None    | false | DiscardAndRecompute   |
+/// | None     | *       | *     | DiscardAndRecompute   |
+///
+/// The unstamped-but-populated and no-authoritative-identity rows are the
+/// fail-closed guards: a cache we cannot authoritatively attribute is never
+/// reused, only recomputed.
+pub fn decide_cache_reuse(
+    expected: Option<&KvCompatFingerprint>,
+    stored: Option<&KvCompatFingerprint>,
+    cache_is_empty: bool,
+) -> CacheReuseDecision {
+    match (expected, stored) {
+        (Some(exp), Some(stored)) if exp == stored => CacheReuseDecision::Reuse,
+        (Some(_), None) if cache_is_empty => CacheReuseDecision::StampFresh,
+        _ => CacheReuseDecision::DiscardAndRecompute,
+    }
+}
+
+// ===========================================================================
 // Canonical byte framing for stable hashing
 // ===========================================================================
 
 #[inline]
 fn put_u32(hash: &mut Sha256, v: u32) {
     hash.update(v.to_le_bytes());
+}
+
+#[inline]
+fn put_opt_u32(hash: &mut Sha256, v: Option<u32>) {
+    match v {
+        Some(x) => {
+            hash.update([1u8]);
+            put_u32(hash, x);
+        }
+        None => hash.update([0u8]),
+    }
+}
+
+#[inline]
+fn put_bool(hash: &mut Sha256, v: bool) {
+    hash.update([if v { 1u8 } else { 0u8 }]);
 }
 
 #[inline]
@@ -750,6 +972,17 @@ fn put_opt_str(hash: &mut Sha256, s: Option<&str>) {
     }
 }
 
+/// Hash a `Vec<String>` as a length-prefixed sequence of canonicalized
+/// (trimmed, lowercased) strings so layout casing/order changes are caught.
+#[inline]
+fn put_str_vec(hash: &mut Sha256, v: &[String]) {
+    put_u64(hash, v.len() as u64);
+    for s in v {
+        let canon: String = s.trim().to_ascii_lowercase();
+        put_str(hash, &canon);
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -760,7 +993,7 @@ mod tests {
     fn baseline() -> KvCompatDescriptor {
         KvCompatDescriptor {
             format_version: KV_COMPAT_FORMAT_VERSION,
-            weights: WeightIdentity::base_only("my-model"),
+            weights: WeightIdentity::base_only("sha256:my-model-weights"),
             model_name: "my-model".to_string(),
             architecture: "llama".to_string(),
             model_version: 1,
@@ -769,6 +1002,15 @@ mod tests {
             num_key_value_heads: 8,
             head_dim: 128,
             hidden_size: 4096,
+            // Plain Llama: no QK-norm, full rotary, uniform layers, no linear attn.
+            use_qk_norm: false,
+            partial_rotary_factor_bits: None,
+            layer_types: Vec::new(),
+            linear_key_head_dim: 0,
+            linear_value_head_dim: 0,
+            linear_num_key_heads: 0,
+            linear_num_value_heads: 0,
+            linear_conv_kernel_dim: 0,
             rope_theta_bits: 10_000.0f32.to_bits(),
             rope_scaling: None,
             max_position_embeddings: 4096,
@@ -778,6 +1020,18 @@ mod tests {
             max_context: 4096,
             vocab_size: 32_000,
             tokenizer_hash: Some("deadbeef".to_string()),
+        }
+    }
+
+    /// Test helper: set one of the linear-attention dimensions by name.
+    fn set_linear_dim(d: &mut KvCompatDescriptor, field: &str, val: usize) {
+        match field {
+            "linear_key_head_dim" => d.linear_key_head_dim = val,
+            "linear_value_head_dim" => d.linear_value_head_dim = val,
+            "linear_num_key_heads" => d.linear_num_key_heads = val,
+            "linear_num_value_heads" => d.linear_num_value_heads = val,
+            "linear_conv_kernel_dim" => d.linear_conv_kernel_dim = val,
+            _ => panic!("unknown linear dim field {field}"),
         }
     }
 
@@ -838,15 +1092,15 @@ mod tests {
             |d| d.weights.base_revision = "other-model".into(),
             Some(KvCompatMismatch::Weights {
                 expected: WeightIdentity::base_only("other-model"),
-                observed: WeightIdentity::base_only("my-model"),
+                observed: WeightIdentity::base_only("sha256:my-model-weights"),
             }),
         );
         assert_field_diverges(
             "weights.adapter_generation",
             |d| d.weights.adapter_generation = 7,
             Some(KvCompatMismatch::Weights {
-                expected: WeightIdentity::base_only("my-model").with_adapter(7),
-                observed: WeightIdentity::base_only("my-model"),
+                expected: WeightIdentity::base_only("sha256:my-model-weights").with_adapter(7),
+                observed: WeightIdentity::base_only("sha256:my-model-weights"),
             }),
         );
         // Model identity.
@@ -879,6 +1133,74 @@ mod tests {
             |d| d.hidden_size = 2048,
             Some(geometry("hidden_size", 2048, 4096)),
         );
+        // Effective attention behavior (changes K/V *values*, not just shape).
+        assert_field_diverges(
+            "use_qk_norm",
+            |d| d.use_qk_norm = true,
+            Some(KvCompatMismatch::UseQkNorm {
+                expected: true,
+                observed: false,
+            }),
+        );
+        assert_field_diverges(
+            "partial_rotary_factor",
+            |d| d.set_partial_rotary_factor(Some(0.25)),
+            Some(KvCompatMismatch::PartialRotaryFactor {
+                expected_bits: Some(0.25f32.to_bits()),
+                observed_bits: None,
+            }),
+        );
+        assert_field_diverges(
+            "partial_rotary_factor None->Some spelling",
+            |d| d.set_partial_rotary_factor(Some(1.0)),
+            Some(KvCompatMismatch::PartialRotaryFactor {
+                expected_bits: Some(1.0f32.to_bits()),
+                observed_bits: None,
+            }),
+        );
+        assert_field_diverges(
+            "layer_types",
+            |d| d.layer_types = vec!["global".to_string(), "local".to_string()],
+            Some(KvCompatMismatch::LayerTypes {
+                expected: vec!["global".to_string(), "local".to_string()],
+                observed: Vec::new(),
+            }),
+        );
+        // layer_types must be compared case-insensitively (canonicalized).
+        {
+            let mut d = baseline();
+            let fp0 = d.fingerprint();
+            d.layer_types = vec!["GLOBAL".to_string(), "Local".to_string()];
+            let mut d2 = baseline();
+            d2.layer_types = vec!["global".to_string(), "local".to_string()];
+            assert_eq!(
+                d.fingerprint(),
+                d2.fingerprint(),
+                "layer_types casing must canonicalize before hashing"
+            );
+            assert_ne!(fp0, d.fingerprint(), "non-empty layer layout must diverge");
+        }
+        for (field, val) in [
+            ("linear_key_head_dim", 512usize),
+            ("linear_value_head_dim", 256usize),
+            ("linear_num_key_heads", 8usize),
+            ("linear_num_value_heads", 8usize),
+            ("linear_conv_kernel_dim", 4usize),
+        ] {
+            let mut d = baseline();
+            set_linear_dim(&mut d, field, val);
+            let divergent_fp = d.fingerprint();
+            assert_ne!(
+                baseline().fingerprint(),
+                divergent_fp,
+                "{field}: changing the linear dim must change the fingerprint"
+            );
+            assert_eq!(
+                check_compatibility(&d, &baseline()).unwrap_err(),
+                geometry(field, val, 0),
+                "{field}: mismatch variant"
+            );
+        }
         // Position encoding.
         assert_field_diverges(
             "rope_theta",
@@ -1091,7 +1413,97 @@ mod tests {
         // Adapter generation changes the fingerprint.
         let mut d = baseline();
         let fp0 = d.fingerprint();
-        d.weights = WeightIdentity::base_only("my-model").with_adapter(1);
+        d.weights = WeightIdentity::base_only("sha256:my-model-weights").with_adapter(1);
         assert_ne!(fp0, d.fingerprint());
+    }
+
+    /// Golden digest: pins the exact canonical bytes of a fully-populated
+    /// descriptor across builds/refactors. If this changes, it is an intentional
+    /// format bump (`KV_COMPAT_FORMAT_VERSION`) — never a silent drift.
+    #[test]
+    fn golden_digest_is_pinned() {
+        let fp = baseline().fingerprint();
+        let hex = fp.to_hex();
+        let expected = "767058c0b3505492e27b5f477f7cec63344a5a78c9bafa7837d44deab5730170";
+        assert_eq!(
+            hex, expected,
+            "KV-compat golden digest drifted; computed = {hex}. \
+             If the canonical encoding changed intentionally, bump \
+             KV_COMPAT_FORMAT_VERSION and update this pinned value."
+        );
+    }
+
+    /// Two weight snapshots sharing a basename but differing in *content* must
+    /// diverge in base identity (the #1277 "authoritative, not a label" rule).
+    #[test]
+    fn base_revision_content_diverges() {
+        let mut a = baseline();
+        let mut b = baseline();
+        a.weights.base_revision = "sha256:snapshot-A".into();
+        b.weights.base_revision = "sha256:snapshot-B".into();
+        assert_ne!(
+            a.fingerprint(),
+            b.fingerprint(),
+            "different base-weight content must produce different fingerprints"
+        );
+        // Same content → same fingerprint (stable).
+        let mut c = baseline();
+        c.weights.base_revision = "sha256:snapshot-A".into();
+        assert_eq!(a.fingerprint(), c.fingerprint());
+    }
+
+    #[test]
+    fn authority_completeness_gate() {
+        // Baseline is fully authoritative.
+        assert!(baseline().is_authoritatively_complete());
+
+        // Missing base-weight digest → not authoritative (fail-closed).
+        let mut no_base = baseline();
+        no_base.weights.base_revision.clear();
+        assert!(!no_base.is_authoritatively_complete());
+
+        // Missing tokenizer identity → not authoritative (fail-closed).
+        let mut no_tok = baseline();
+        no_tok.tokenizer_hash = None;
+        assert!(!no_tok.is_authoritatively_complete());
+    }
+
+    #[test]
+    fn decide_cache_reuse_is_fail_closed() {
+        use CacheReuseDecision::*;
+        let exp = baseline().fingerprint();
+        let other = {
+            let mut d = baseline();
+            d.kv_quant = KvQuantMode::Int8;
+            d.fingerprint()
+        };
+
+        // Authoritative + matching stamp → reuse.
+        assert_eq!(decide_cache_reuse(Some(&exp), Some(&exp), false), Reuse);
+        assert_eq!(decide_cache_reuse(Some(&exp), Some(&exp), true), Reuse);
+
+        // Authoritative + mismatching stamp → discard.
+        assert_eq!(
+            decide_cache_reuse(Some(&exp), Some(&other), false),
+            DiscardAndRecompute
+        );
+
+        // Authoritative + empty unstamped → stamp fresh and reuse (empty) cache.
+        assert_eq!(decide_cache_reuse(Some(&exp), None, true), StampFresh);
+
+        // Authoritative + POPULATED unstamped → fail-closed discard (the bug fix).
+        assert_eq!(
+            decide_cache_reuse(Some(&exp), None, false),
+            DiscardAndRecompute
+        );
+
+        // No authoritative identity at all → always discard, even on an empty
+        // unstamped cache (nothing to bless) and even on a stamped cache.
+        assert_eq!(decide_cache_reuse(None, None, true), DiscardAndRecompute);
+        assert_eq!(
+            decide_cache_reuse(None, Some(&exp), false),
+            DiscardAndRecompute
+        );
+        assert_eq!(decide_cache_reuse(None, Some(&exp), true), DiscardAndRecompute);
     }
 }

@@ -1090,7 +1090,11 @@ impl InferenceService {
         // Run the stream with StreamChannel's async publisher callback.
         // Engine read-lock held across await: generate_with_delta returns a stream borrowing engine.
         let engine = self.engine.read();
-        let stream_result = engine.generate_with_delta(request, delta, tenant_id, weight_epoch);
+        // Pass the live LoRA generation so the KV-compat expected identity reflects
+        // the effective adapter actually applied (#1277): a re-adapted model is
+        // detected as incompatible and its stale KV is rejected at the cache boundary.
+        let stream_result =
+            engine.generate_with_delta(request, delta, tenant_id, weight_epoch, lora_gen_now);
 
         // #1264/#1265: capture the completion stats out of the stream closure so
         // the token-spend can be posted after the client-visible completion frame
