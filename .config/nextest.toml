@@ -12,3 +12,13 @@
 # KILLED after `terminate-after` periods, not merely flagged slow).
 [profile.ci]
 slow-timeout = { period = "60s", terminate-after = 3 }
+
+[test-groups]
+production-authority = { max-threads = 1 }
+
+[[profile.ci.overrides]]
+filter = 'test(=auth::key_rotation::tests::composite_authority_production_paths_reject_semantic_rollback)'
+test-group = 'production-authority'
+# This test re-execs the release test binary and runs several authority
+# processes concurrently. Reserve the runner while it owns that process tree.
+threads-required = "num-cpus"
