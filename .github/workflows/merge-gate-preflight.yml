@@ -54,7 +54,7 @@ jobs:
           const number = Number(
             context.eventName === 'pull_request_target'
               ? context.payload.pull_request.number
-              : core.getInput('pr_number')
+              : context.payload.inputs.pr_number
           );
           if (!Number.isSafeInteger(number) || number <= 0) {
             core.setFailed('pr_number must be a positive PR number');
