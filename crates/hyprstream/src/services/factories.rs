@@ -1012,6 +1012,7 @@ fn create_worker_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
     use hyprstream_workers::{BackendCtx, SandboxBackend, WorkerService, resolve_backend};
 
     let config = load_config();
+    let sk = ctx.service_signing_key("worker");
     let worker_quic_port = config.worker.as_ref().and_then(|w| w.quic_port);
     // Operator-selected backend name ("auto" or a registered backend); resolved
     // fail-closed against the inventory registry below.
@@ -1060,6 +1061,15 @@ fn create_worker_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
     #[cfg(feature = "oci-image")]
     let rafs_store = Arc::new(RafsStore::new(image_config.clone())?);
 
+    let ninep_decider = tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current().block_on(crate::mac::production_ninep_decider(
+            sk.clone(),
+            &config.oauth,
+            "ninep-worker",
+        ))
+    })
+    .context("construct worker 9P MAC PEP")?;
+
     // Resolve + construct the backend fail-closed against the inventory registry
     // (config-driven by name; explicit requests are authoritative, missing
     // prerequisites error out rather than silently downgrading isolation; "auto"
@@ -1067,14 +1077,13 @@ fn create_worker_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
     // `_ => nspawn` fallback (#507 / #518).
     let backend_ctx = BackendCtx {
         pool_config: pool_config.clone(),
+        ninep_decider,
         #[cfg(feature = "oci-image")]
         image_config,
         #[cfg(feature = "oci-image")]
         rafs_store: Arc::clone(&rafs_store),
     };
     let backend: Arc<dyn SandboxBackend> = resolve_backend(&backend_name, &backend_ctx)?;
-
-    let sk = ctx.service_signing_key("worker");
 
     // Register this service's verifying key with PolicyService
     register_service_key(ctx, "worker", &sk)?;
@@ -1152,23 +1161,49 @@ fn create_oai_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
     let oauth_issuer_url = config.oauth.issuer_url();
     let server_state = tokio::task::block_in_place(|| {
         let rt = tokio::runtime::Handle::current();
-        rt.block_on(ServerState::new(
-            config.server.clone(),
-            model_client,
-            policy_client,
-            registry_client,
-            sk.clone(),
-            ctx.jwt_verifying_key(),
-            resource_url,
-            oauth_issuer_url,
-            &config.oauth.trusted_issuers,
-            // Share the PolicyService-owned JTI blocklist so POST /oauth/revoke
-            // immediately invalidates tokens at the OAI resource server.
-            SHARED_JTI_BLOCKLIST
-                .get()
-                .map(Arc::clone)
-                .unwrap_or_else(|| Arc::new(hyprstream_rpc::auth::InMemoryJtiBlocklist::new())),
-        ))
+        rt.block_on(async {
+            let secrets_dir = crate::config::HyprConfig::resolve_secrets_dir()?;
+            let ml_dsa_store =
+                crate::auth::key_rotation::global_ml_dsa_key_store(&secrets_dir, &config.oauth);
+            let signer = crate::mac::audit::cose::OwnedCoseAuditSigner::new(
+                Arc::new(sk.clone()),
+                ml_dsa_store.active_key().await,
+                hyprstream_rpc::envelope::mandatory_envelope_policy(),
+            );
+            anyhow::ensure!(
+                signer.can_sign(),
+                "9P MAC PEP audit signer unavailable under mandatory Hybrid policy"
+            );
+            let audit_store = crate::mac::audit::WalAuditStore::open(
+                secrets_dir.join("mac-audit").join("ninep"),
+                signer,
+            )
+            .map_err(|error| anyhow::anyhow!("open 9P MAC audit store: {error}"))?;
+            let resolver = crate::mac::GenesisGate::production().into_resolver();
+            let ninep_decider: Arc<dyn hyprstream_9p::AccessDecider> = Arc::new(
+                crate::mac::NinePAccessDecider::new(Arc::new(resolver), Arc::new(audit_store)),
+            );
+
+            ServerState::new(
+                config.server.clone(),
+                model_client,
+                policy_client,
+                registry_client,
+                sk.clone(),
+                ctx.jwt_verifying_key(),
+                resource_url,
+                oauth_issuer_url,
+                &config.oauth.trusted_issuers,
+                // Share the PolicyService-owned JTI blocklist so POST /oauth/revoke
+                // immediately invalidates tokens at the OAI resource server.
+                SHARED_JTI_BLOCKLIST
+                    .get()
+                    .map(Arc::clone)
+                    .unwrap_or_else(|| Arc::new(hyprstream_rpc::auth::InMemoryJtiBlocklist::new())),
+                ninep_decider,
+            )
+            .await
+        })
     })
     .context("Failed to create server state")?;
 

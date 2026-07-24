@@ -46,11 +46,9 @@ pub mod memory;
 // The browser/wasm build reaches the backend through the DMA/Wanix client path.
 #[cfg(not(target_arch = "wasm32"))]
 pub mod translator;
-// 9P reference-monitor contract (S2 / #568): the attach-time token seam, the
-// per-op mediation composition (`ReferenceMonitor`), and fail-closed defaults.
-// Dormant groundwork — `Translator` runs without a monitor unless the
-// application installs one (activation is blocked on #698). Native-only
-// alongside `translator`, its only consumer today.
+// 9P reference-monitor contract (S2 / #568): attach-time token verification,
+// optional full token/IFC composition, and the mandatory per-op access-decider
+// seam. Native-only alongside `translator`, its only consumer today.
 #[cfg(not(target_arch = "wasm32"))]
 pub mod mac_seam;
 // `MountBackend` bridges a VFS `Mount` (+ `Subject`) to the `Backend` seam so
