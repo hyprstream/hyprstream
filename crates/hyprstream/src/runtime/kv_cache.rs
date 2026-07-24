@@ -89,8 +89,6 @@ pub struct CacheConfig {
     pub max_seq_len: usize,
     /// Quantization type for memory efficiency
     pub quant_type: KVQuantType,
-    /// Whether this cache is exempt from eviction (e.g., for training)
-    pub eviction_exempt: bool,
     /// Use paged block storage (PagedAttention-style) instead of contiguous tensors.
     /// Requires a BlockPool to be initialized on the registry.
     pub paged: bool,
@@ -103,7 +101,6 @@ impl CacheConfig {
             num_layers,
             max_seq_len,
             quant_type: KVQuantType::None,
-            eviction_exempt: false,
             paged: false,
         }
     }
@@ -111,12 +108,6 @@ impl CacheConfig {
     /// Set quantization type
     pub fn with_quant_type(mut self, quant_type: KVQuantType) -> Self {
         self.quant_type = quant_type;
-        self
-    }
-
-    /// Mark as eviction exempt
-    pub fn with_eviction_exempt(mut self, exempt: bool) -> Self {
-        self.eviction_exempt = exempt;
         self
     }
 
@@ -260,13 +251,15 @@ impl KVCacheRegistry {
     pub fn release(&self, owner: &CacheOwner) {
         match owner {
             CacheOwner::Stateless(_) => {
-                // Stateless caches are removed immediately
+                // Stateless caches (and their delta dependency) are removed immediately.
                 self.caches.remove(owner);
+                self.delta_dependencies.remove(owner);
                 tracing::debug!("Released stateless cache: {:?}", owner);
             }
             CacheOwner::Session(_) | CacheOwner::Training { .. } => {
-                // Session and training caches are kept for reuse
-                // They will be evicted by LRU if memory pressure occurs
+                // Session and training caches are kept for reuse; their delta
+                // dependency is retained so a later tenant-delta eviction can
+                // still invalidate them. They fall to LRU eviction under memory pressure.
                 tracing::debug!("Marked session cache for potential reuse: {:?}", owner);
             }
         }
@@ -284,14 +277,17 @@ impl KVCacheRegistry {
             return;
         }
 
-        // Collect eviction candidates (skip eviction-exempt and training caches)
+        // Collect eviction candidates. `CacheOwner::Training` caches are exempt
+        // from eviction by rule — they hold validation/eval state for an active
+        // training run and must survive memory pressure (the run owns their
+        // lifecycle). All other owners (Stateless/Session) are evictable.
         let mut candidates: Vec<(CacheOwner, u64, usize)> = self
             .caches
             .iter()
             .filter_map(|entry| {
                 let owner = entry.key().clone();
 
-                // Skip training caches
+                // Skip training caches (exempt by rule — see comment above).
                 if matches!(owner, CacheOwner::Training { .. }) {
                     return None;
                 }
@@ -335,6 +331,7 @@ impl KVCacheRegistry {
                     if guard.location() == CacheLocation::Cpu {
                         drop(guard);
                         self.caches.remove(&owner);
+                        self.delta_dependencies.remove(&owner);
                         freed += size;
                         tracing::info!("Evicted CPU cache {:?}, freed {} bytes", owner, size);
                     }
@@ -363,13 +360,47 @@ impl KVCacheRegistry {
         tracing::info!("Cleared all KV caches from registry");
     }
 
-    /// Register a dependency between a cache owner and a subject's delta.
+    /// Register the tenant delta that produced a cache owner's KV.
     ///
-    /// When the subject's delta is later evicted or reset, all dependent caches
-    /// will be invalidated since they were computed with stale weights.
-    pub fn register_delta_dependency(&self, owner: &CacheOwner, tenant_id: Option<String>) {
-        self.delta_dependencies
-            .insert(owner.clone(), tenant_id);
+    /// Records `tenant_id` as the effective tenant whose delta contributed to
+    /// the cache's weights — pass `None` when no tenant delta contributes (bare
+    /// base model or base-delta-only inference). When that tenant's delta is
+    /// later evicted, reset, or removed, [`Self::invalidate_for_tenant`] clears
+    /// every cache recorded under it.
+    ///
+    /// **Stale-weight guard:** if the effective tenant differs from the value
+    /// recorded the last time this owner's cache was computed, the existing KV
+    /// was produced under different weights and is cleared in place (cached
+    /// token IDs + every layer cache) before the new dependency is recorded, so
+    /// generation can never reuse it. Returns `true` when such a stale cache was
+    /// cleared. This is the barrier that stops a session cache from crossing a
+    /// no-delta↔delta (or tenant-A↔tenant-B) weight boundary: the next request
+    /// re-`register`s with the now-effective tenant, the mismatch is detected,
+    /// and the stale KV is dropped, forcing a full recompute. A cache with no
+    /// prior record (fresh, or just invalidated) is never treated as stale.
+    pub fn register_delta_dependency(&self, owner: &CacheOwner, tenant_id: Option<String>) -> bool {
+        let stale = match self.delta_dependencies.get(owner) {
+            Some(prev) => *prev != tenant_id,
+            None => false,
+        };
+        self.delta_dependencies.insert(owner.clone(), tenant_id);
+
+        if stale {
+            if let Some(cache) = self.caches.get(owner) {
+                let mut guard = cache.lock();
+                // Mirror invalidate_for_tenant's cleanup: wipe both the prefix
+                // tokens and the layer caches so neither prefix-matching nor a
+                // retained tensor can resurrect the stale values.
+                guard.set_cached_tokens(Vec::new());
+                guard.clear_all();
+                tracing::info!(
+                    "Cleared stale KV cache for {:?}: effective tenant changed since last compute",
+                    owner
+                );
+            }
+        }
+
+        stale
     }
 
     /// Invalidate all KV caches that depend on a specific subject's delta.
@@ -2599,5 +2630,161 @@ mod tests {
         assert_eq!(pool.used_blocks(), 0);
         assert_eq!(pool.owner_of(block), None);
         Ok(())
+    }
+
+    // ========================================================================
+    // TTT → KV invalidation wiring (#1254, epic #1246)
+    // ========================================================================
+
+    /// Write 4 cached token IDs + a 4-token KV entry into layer 0 of a cache,
+    /// so "cleared" is observable as both empty token IDs (cached_token_count)
+    /// and an empty layer (seq_pos == 0).
+    fn populate_cache(cache: &Arc<Mutex<KVCacheManager>>) {
+        let mut g = cache.lock();
+        g.set_cached_tokens(vec![10, 20, 30, 40]);
+        g.with_layer_cache(0, |c| {
+            let k = Tensor::ones([1, 4, 2, 4], (DType::Float, Device::Cpu));
+            let v = Tensor::ones([1, 4, 2, 4], (DType::Float, Device::Cpu));
+            c.update(&k, &v, 0).expect("layer 0 update");
+        });
+    }
+
+    /// seq_pos of layer 0 (None when caching disabled / layer absent).
+    fn layer0_seq_pos(cache: &Arc<Mutex<KVCacheManager>>) -> Option<usize> {
+        cache.lock().with_layer_cache(0, |c| c.seq_pos)
+    }
+
+    /// Invalidating one tenant's delta clears that tenant's cache while every
+    /// other tenant's cache is left intact — the core cross-tenant isolation
+    /// invariant the missing `register_delta_dependency` call broke (#1254).
+    #[test]
+    fn test_invalidate_for_tenant_isolates_tenants() {
+        let registry = KVCacheRegistry::new(CacheConfig::new(2, 128), None);
+
+        let owner_a = CacheOwner::Session("session-a".into());
+        let owner_b = CacheOwner::Session("session-b".into());
+
+        let cache_a = registry.get_or_create(owner_a.clone());
+        let cache_b = registry.get_or_create(owner_b.clone());
+        populate_cache(&cache_a);
+        populate_cache(&cache_b);
+
+        // Register each cache under its own tenant delta.
+        registry.register_delta_dependency(&owner_a, Some("tenant-a".into()));
+        registry.register_delta_dependency(&owner_b, Some("tenant-b".into()));
+
+        assert_eq!(registry.cache_count(), 2);
+        assert_eq!(cache_a.lock().cached_token_count(), 4);
+        assert_eq!(cache_b.lock().cached_token_count(), 4);
+
+        // Evict tenant-a's delta: only A's cache is invalidated; B is untouched.
+        let invalidated = registry.invalidate_for_tenant("tenant-a");
+        assert_eq!(invalidated, 1);
+        assert_eq!(registry.cache_count(), 1, "only tenant-a's cache is removed");
+
+        // A's cache (Arc still held by the test) was cleared in place.
+        assert_eq!(cache_a.lock().cached_token_count(), 0, "tenant-a cache cleared");
+        assert_eq!(layer0_seq_pos(&cache_a), Some(0), "tenant-a layer KV cleared");
+
+        // B's cache survives with its KV intact.
+        assert_eq!(cache_b.lock().cached_token_count(), 4, "tenant-b cache intact");
+        assert_eq!(layer0_seq_pos(&cache_b), Some(4), "tenant-b layer KV intact");
+    }
+
+    /// A session cache must not survive a weight-version change: no-delta↔delta
+    /// and tenant-A↔tenant-B transitions all clear the stale KV; re-registering
+    /// the SAME tenant preserves it. This is the stale-cache-crossing-weight-
+    /// versions guard the serving path now enforces via register_delta_dependency.
+    #[test]
+    fn test_register_clears_stale_kv_on_tenant_transition() {
+        let registry = KVCacheRegistry::new(CacheConfig::new(2, 128), None);
+        let owner = CacheOwner::Session("session-x".into());
+        let cache = registry.get_or_create(owner.clone());
+        populate_cache(&cache);
+
+        // 1. First compute under NO tenant delta — fresh, nothing stale.
+        assert!(
+            !registry.register_delta_dependency(&owner, None),
+            "fresh cache is not stale"
+        );
+        assert_eq!(cache.lock().cached_token_count(), 4, "KV preserved on first register");
+
+        // 2. no-delta → tenant delta: weights changed, KV is stale and cleared.
+        assert!(
+            registry.register_delta_dependency(&owner, Some("tenant-1".into())),
+            "no-delta → delta must clear stale KV"
+        );
+        assert_eq!(cache.lock().cached_token_count(), 0, "KV cleared across weight version");
+        assert_eq!(layer0_seq_pos(&cache), Some(0));
+
+        // Repopulate to simulate a fresh compute under tenant-1.
+        populate_cache(&cache);
+        assert_eq!(cache.lock().cached_token_count(), 4);
+
+        // 3. Same tenant again — NOT stale, KV preserved.
+        assert!(
+            !registry.register_delta_dependency(&owner, Some("tenant-1".into())),
+            "same tenant is not stale"
+        );
+        assert_eq!(cache.lock().cached_token_count(), 4, "KV preserved for same tenant");
+
+        // 4. delta → no-delta: weights changed again, stale and cleared.
+        assert!(
+            registry.register_delta_dependency(&owner, None),
+            "delta → no-delta must clear stale KV"
+        );
+        assert_eq!(cache.lock().cached_token_count(), 0);
+
+        // 5. Repopulate, then switch tenants (tenant-1 effective → tenant-2): stale.
+        populate_cache(&cache);
+        assert!(
+            registry.register_delta_dependency(&owner, Some("tenant-2".into())),
+            "tenant change must clear stale KV"
+        );
+        assert_eq!(cache.lock().cached_token_count(), 0);
+
+        // 6. After a clear, the recorded tenant is tenant-2; invalidating
+        //    tenant-2 still finds (and removes) the owner entry.
+        assert_eq!(registry.invalidate_for_tenant("tenant-2"), 1);
+    }
+
+    /// Releasing or evicting a cache must drop its delta dependency so the map
+    /// has no orphan entries that a later invalidation would chase. Covers the
+    /// Stateless release path; evict_to_budget mirrors the same removal.
+    #[test]
+    fn test_release_clears_delta_dependency() {
+        let registry = KVCacheRegistry::new(CacheConfig::new(2, 128), None);
+
+        let owner = CacheOwner::Stateless(42);
+        let _cache = registry.get_or_create(owner.clone());
+        registry.register_delta_dependency(&owner, Some("tenant-s".into()));
+        assert!(registry.delta_dependencies.contains_key(&owner));
+
+        // Releasing a stateless cache removes both the cache and its dependency.
+        registry.release(&owner);
+        assert!(!registry.caches.contains_key(&owner), "stateless cache removed");
+        assert!(
+            !registry.delta_dependencies.contains_key(&owner),
+            "delta dependency removed on release"
+        );
+
+        // No orphan dependency → a later invalidation finds nothing.
+        assert_eq!(registry.invalidate_for_tenant("tenant-s"), 0);
+    }
+
+    /// A no-tenant cache (registered `None`) must NOT be cleared by any tenant's
+    /// invalidation — it carries no tenant dependency.
+    #[test]
+    fn test_no_tenant_cache_survives_any_invalidation() {
+        let registry = KVCacheRegistry::new(CacheConfig::new(2, 128), None);
+        let owner = CacheOwner::Session("base-only".into());
+        let cache = registry.get_or_create(owner.clone());
+        populate_cache(&cache);
+        registry.register_delta_dependency(&owner, None);
+
+        // Invalidating any tenant leaves the no-tenant cache untouched.
+        assert_eq!(registry.invalidate_for_tenant("anyone"), 0);
+        assert_eq!(registry.cache_count(), 1);
+        assert_eq!(cache.lock().cached_token_count(), 4, "no-tenant cache intact");
     }
 }
