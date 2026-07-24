@@ -5,6 +5,7 @@ using import "/annotations.capnp".scope;
 using import "/annotations.capnp".mcpDescription;
 using import "/annotations.capnp".vfsKind;
 using import "/annotations.capnp".vfsPath;
+using import "/annotations.capnp".vfsMac;
 using import "/streaming.capnp".StreamInfo;
 
 # 9P types — shared across all services with fs scope.
@@ -65,7 +66,8 @@ struct RegistryRequest {
     # Check registry service health
     healthCheck @7 :Void $scope(query)
         $mcpDescription("Check if the registry service is healthy and responding.")
-        $vfsKind(file) $vfsPath("health");
+        $vfsKind(file) $vfsPath("health")
+        $vfsMac("internal:pq-hybrid");
     # Clone a model repository from a URL (streaming progress)
     cloneStream @8 :CloneRequest $scope(write) $mcpDescription("Clone a model repository from a URL (streaming progress)");
 
