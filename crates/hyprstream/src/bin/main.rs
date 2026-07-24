@@ -164,6 +164,10 @@ fn build_cli() -> ClapCommand {
         ClapCommand::new("pds")
             .about("Attach this host to its home personal data server")
             .subcommand(
+                ClapCommand::new("init-deployment-store")
+                    .about("Initialize the checkpoint store for an explicitly provisioned fresh deployment"),
+            )
+            .subcommand(
                 ClapCommand::new("join")
                     .visible_alias("attach")
                     .about("Authorize and attach this host to one home PDS")
@@ -1468,11 +1472,41 @@ async fn install_process_production_resolver(
     signing_key: &SigningKey,
     config: &HyprConfig,
 ) -> Result<()> {
+    // The bootstrap pins the discovery service key from the process trust
+    // store; in CLI/service-start mode nothing has seeded it yet. Seed from
+    // the node's own bootstrap-pubkeys (the same source resolve_service_vk
+    // uses on first use) — a no-op when already populated or unprovisioned.
+    let _ = resolve_service_vk("discovery");
     let trust_source = hyprstream_discovery::DeploymentTrustSource::from_anchors(
         config.cluster_at9p_did.as_deref(),
         config.cluster_did_web.as_deref(),
     )?;
-    hyprstream_discovery::bootstrap_deployment_process(signing_key.clone(), trust_source).await?;
+    // Private-PKI deployments may terminate the did:web host with an internal
+    // CA; the extra root is additive (never disables verification), and an
+    // unreadable file is a hard configuration error, not a silent skip.
+    let trust_source = match (&trust_source, &config.cluster_anchor_root_cert) {
+        (hyprstream_discovery::DeploymentTrustSource::DidAnchored(anchors), Some(path)) => {
+            let pem = std::fs::read(path).with_context(|| {
+                format!("cluster_anchor_root_cert is not readable: {}", path.display())
+            })?;
+            hyprstream_discovery::DeploymentTrustSource::DidAnchored(
+                anchors.clone().with_root_cert_pem(pem),
+            )
+        }
+        (hyprstream_discovery::DeploymentTrustSource::OsOwnedFiles, Some(path)) => {
+            anyhow::bail!(
+                "cluster_anchor_root_cert ({}) is set but no DID anchors are configured",
+                path.display()
+            )
+        }
+        _ => trust_source,
+    };
+    hyprstream_discovery::bootstrap_deployment_process(
+        signing_key.clone(),
+        trust_source,
+        config.cluster_remote_node,
+    )
+    .await?;
     hyprstream_rpc::envelope::install_browser_currentness_verifier(
         hyprstream_discovery::production_browser_currentness_verifier()?,
     )
@@ -1881,6 +1915,11 @@ fn main() -> Result<()> {
     // newly provisioned host before local services are running.
     if let Some(("pds", sub_m)) = matches.subcommand() {
         match sub_m.subcommand() {
+            Some(("init-deployment-store", _)) => {
+                hyprstream_discovery::initialize_deployment_checkpoint_store()?;
+                println!("initialized empty deployment checkpoint store");
+                return Ok(());
+            }
             Some(("join", join_m)) => {
                 let pds_url = join_m
                     .get_one::<String>("url")
@@ -1891,7 +1930,7 @@ fn main() -> Result<()> {
                     || hyprstream_core::cli::pds_handlers::handle_pds_join(&config, pds_url, scope),
                 );
             }
-            _ => anyhow::bail!("usage: hyprstream pds join <PDS_URL> [--scope <SCOPE>]"),
+            _ => anyhow::bail!("usage: hyprstream pds init-deployment-store | pds join <PDS_URL> [--scope <SCOPE>]"),
         }
     }
 

@@ -861,9 +861,12 @@ impl ServiceContext {
 /// authenticated process bootstrap. No caller-provided context or path can
 /// influence this value.
 pub fn deployment_data_dir() -> anyhow::Result<std::path::PathBuf> {
-    let data_dir = hyprstream_rpc::paths::data_dir()
+    let data_dir = hyprstream_rpc::paths::try_data_dir()?
         .ok_or_else(|| anyhow::anyhow!("deployment data directory is unavailable"))?;
-    anyhow::ensure!(data_dir.is_absolute(), "deployment data directory must be absolute");
+    anyhow::ensure!(
+        data_dir.is_absolute(),
+        "deployment data directory must be absolute"
+    );
     Ok(data_dir.join("models/.registry"))
 }
 
@@ -1152,5 +1155,4 @@ mod tests {
             .expect("authority mutation subprocess");
         assert!(status.success(), "authority mutation subprocess failed");
     }
-
 }

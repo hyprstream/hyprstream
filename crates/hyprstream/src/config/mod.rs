@@ -175,6 +175,22 @@ pub struct HyprConfig {
     #[serde(default)]
     pub cluster_did_web: Option<String>,
 
+    /// Optional extra TLS root certificate (PEM file) for private-PKI
+    /// deployments whose did:web host terminates TLS with an internal CA
+    /// (#1137). ADDITIVE — public WebPKI roots remain enabled; an unreadable
+    /// or malformed file fails the bootstrap rather than degrading.
+    #[serde(default)]
+    pub cluster_anchor_root_cert: Option<PathBuf>,
+
+    /// When `true`, this node is REMOTE from the cluster's Discovery service:
+    /// the DID-anchored bootstrap dials the did:web-advertised network
+    /// transport and requires a signed liveness ping before installing the
+    /// resolver (#1137). When `false` (default — same-node fabric, e.g. the
+    /// metal stack's containers sharing the IPC volume), a lazy local
+    /// discovery client is used, matching the OS-owned path's posture.
+    #[serde(default)]
+    pub cluster_remote_node: bool,
+
     /// Phase-1 cellular-ledger local-enforcer configuration (epic #922, #925).
     ///
     /// Only present when the `ledger` cargo feature is enabled; `enabled`
@@ -1147,6 +1163,17 @@ pub struct OAuthConfig {
     #[serde(default)]
     pub quic_port: Option<u16>,
 
+    /// Deployment static well-known directory (#1137 / #1136 serving half).
+    /// When set, this OAuth instance terminates the deployment's did:web host:
+    /// `/.well-known/did.json` serves `<dir>/did.json` (replacing the dynamic
+    /// node document), `/.well-known/at9p/<cid>.cbor` serves the cluster at9p
+    /// capsule, and `/.well-known/deployment/registry-service.jwt` serves the
+    /// current CA-signed registry deployment credential. All are public,
+    /// integrity-anchored bytes re-read on every request so an external
+    /// credential-refresh agent needs no restart.
+    #[serde(default)]
+    pub deployment_well_known_dir: Option<PathBuf>,
+
     /// CORS configuration for the OAuth HTTP server
     #[serde(default = "default_oauth_cors")]
     pub cors: server::CorsConfig,
@@ -1288,6 +1315,7 @@ impl Default for OAuthConfig {
             // atproto profile at the authorize handler level.
             require_pushed_authorization_requests: false,
             xrpc_read_slice: false,
+            deployment_well_known_dir: None,
         }
     }
 }
@@ -2091,6 +2119,8 @@ pub struct HyprConfigBuilder {
     metrics: MetricsConfig,
     cluster_at9p_did: Option<String>,
     cluster_did_web: Option<String>,
+    cluster_anchor_root_cert: Option<PathBuf>,
+    cluster_remote_node: bool,
 }
 
 impl HyprConfigBuilder {
@@ -2122,6 +2152,8 @@ impl HyprConfigBuilder {
             metrics: MetricsConfig::default(),
             cluster_at9p_did: None,
             cluster_did_web: None,
+            cluster_anchor_root_cert: None,
+            cluster_remote_node: false,
         }
     }
 
@@ -2153,6 +2185,8 @@ impl HyprConfigBuilder {
             metrics: config.metrics,
             cluster_at9p_did: config.cluster_at9p_did,
             cluster_did_web: config.cluster_did_web,
+            cluster_anchor_root_cert: config.cluster_anchor_root_cert,
+            cluster_remote_node: config.cluster_remote_node,
         }
     }
 
@@ -2202,6 +2236,8 @@ impl HyprConfigBuilder {
             secrets: Default::default(),
             cluster_at9p_did: self.cluster_at9p_did,
             cluster_did_web: self.cluster_did_web,
+            cluster_anchor_root_cert: self.cluster_anchor_root_cert,
+            cluster_remote_node: self.cluster_remote_node,
             #[cfg(feature = "ledger")]
             ledger: Default::default(),
         }
