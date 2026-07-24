@@ -199,12 +199,6 @@ fn validate_zone_apex(apex: &str) -> Result<(), AccountZoneError> {
     }
 
     let labels: Vec<&str> = apex.split('.').collect();
-    if labels.len() < 2 {
-        return Err(bad(
-            "zone name must be delegated below a public suffix (a bare TLD is not an account zone)",
-        ));
-    }
-
     for label in &labels {
         if label.is_empty() {
             return Err(bad("zone name has a consecutive dot / empty label"));
@@ -218,6 +212,17 @@ fn validate_zone_apex(apex: &str) -> Result<(), AccountZoneError> {
         if label.starts_with('-') || label.ends_with('-') {
             return Err(bad("labels must not start or end with a hyphen"));
         }
+    }
+
+    // A label-count check cannot distinguish a registrable name from a
+    // multi-label public suffix (`example.co.uk` vs. `co.uk`). `psl` embeds the
+    // Mozilla Public Suffix List, so this check is deterministic and does not
+    // require network access at configuration time. Unknown/internal suffixes
+    // still follow the prevailing `*` rule and remain usable below one label.
+    if psl::domain(apex.as_bytes()).is_none() {
+        return Err(bad(
+            "zone name must include at least one registrable label below its public suffix",
+        ));
     }
 
     Ok(())
@@ -247,11 +252,20 @@ mod tests {
     }
 
     #[test]
-    fn rejects_bare_tld_and_bad_forms() {
-        assert!(matches!(
-            AccountZone::new("com").unwrap_err(),
-            AccountZoneError::Invalid { .. }
-        ));
+    fn rejects_public_suffixes_and_bad_forms() {
+        for public_suffix in ["com", "co.uk", "com.au", "ac.uk"] {
+            assert!(
+                matches!(
+                    AccountZone::new(public_suffix).unwrap_err(),
+                    AccountZoneError::Invalid { .. }
+                ),
+                "expected public suffix {public_suffix:?} to be rejected"
+            );
+        }
+        assert!(
+            AccountZone::new("acct.example.co.uk").is_ok(),
+            "a delegated zone below a multi-label public suffix must be accepted"
+        );
         for bad in [
             "",
             "Acct.Example.com",
