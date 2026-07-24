@@ -1308,6 +1308,7 @@ fn create_at9p_verify_service(_ctx: &ServiceContext) -> anyhow::Result<Box<dyn S
     Ok(Box::new(At9pVerifyService::new(
         config.at9p_verify.clone(),
         config.tls.clone(),
+        config.account.clone(),
     )))
 }
 

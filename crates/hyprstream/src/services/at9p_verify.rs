@@ -315,12 +315,21 @@ async fn verify_handler(
 pub struct At9pVerifyService {
     config: At9pVerifyConfig,
     tls_config: TlsConfig,
+    account_config: crate::account::AccountZoneConfig,
 }
 
 impl At9pVerifyService {
-    /// Construct the face from its config section and the process TLS config.
-    pub fn new(config: At9pVerifyConfig, tls_config: TlsConfig) -> Self {
-        Self { config, tls_config }
+    /// Construct the face from its config section and process-wide TLS configuration.
+    pub fn new(
+        config: At9pVerifyConfig,
+        tls_config: TlsConfig,
+        account_config: crate::account::AccountZoneConfig,
+    ) -> Self {
+        Self {
+            config,
+            tls_config,
+            account_config,
+        }
     }
 
     fn http_addr(&self) -> Result<SocketAddr, RpcError> {
@@ -356,6 +365,7 @@ impl Spawnable for At9pVerifyService {
 
             let rustls_config = resolve_rustls_config(
                 &self.tls_config,
+                &self.account_config,
                 self.config.tls_cert.as_ref(),
                 self.config.tls_key.as_ref(),
             )
