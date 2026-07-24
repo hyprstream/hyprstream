@@ -929,6 +929,14 @@ pub struct OAuthState {
     /// When `true`, the XRPC read-slice routes (`/xrpc/…`) are mounted on the
     /// OAuth router (#1112). Copied from `OAuthConfig::xrpc_read_slice`.
     pub xrpc_read_slice: bool,
+    /// Deployment static well-known directory (#1137 serving half). When set,
+    /// this OAuth instance terminates the deployment's did:web host: it serves
+    /// `<dir>/did.json` in place of the dynamic node document, plus
+    /// `<dir>/at9p/<cid>.cbor` and `<dir>/deployment/registry-service.jwt`.
+    /// All three are public, integrity-anchored bytes — see
+    /// `deployment_well_known.rs`. Copied from
+    /// `OAuthConfig::deployment_well_known_dir`.
+    pub deployment_well_known_dir: Option<std::path::PathBuf>,
     /// RSA encoding key for RS256 id_token signing (optional, loaded from secrets).
     pub rsa_encoding_key: Option<jsonwebtoken::EncodingKey>,
     /// RSA public key as JWK JSON (for the JWKS endpoint).
@@ -1097,6 +1105,7 @@ impl OAuthState {
             sessions: super::session::SessionStore::default(),
             xrpc_repos: Arc::new(super::xrpc::XrpcRepoStore::new()),
             xrpc_read_slice: config.xrpc_read_slice,
+            deployment_well_known_dir: config.deployment_well_known_dir.clone(),
             rsa_encoding_key: None,
             rsa_jwk: None,
             rsa_kid: None,

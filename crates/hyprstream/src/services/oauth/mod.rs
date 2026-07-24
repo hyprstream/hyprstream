@@ -31,6 +31,7 @@ pub mod authorize;
 pub mod challenge;
 pub mod cimd_cache;
 pub mod client_auth;
+pub mod deployment_well_known;
 pub mod device;
 pub mod device_enrollment;
 pub mod did_document;
@@ -213,16 +214,26 @@ pub fn create_app(state: Arc<OAuthState>, cors_config: &crate::config::CorsConfi
     // permissive-header CORS layer (CorsConfig::did_document) — kept separate from
     // the broad public router so the relaxation never reaches secret-bearing
     // endpoints like /oauth/token (closes #472).
-    let mut did_router = Router::new()
-        // Phase 0c — did:web document endpoints
-        .route(
+    let mut did_router = Router::new();
+    if state.deployment_well_known_dir.is_some() {
+        // #1137 serving half — deployment mode: this host terminates the
+        // deployment's did:web. The static router owns `/.well-known/did.json`
+        // plus the at9p capsule and registry credential endpoints (each 404s
+        // when its file is absent — never a silent fall-through).
+        did_router = did_router.merge(deployment_well_known::router(
+            state.deployment_well_known_dir.clone(),
+        ));
+    } else {
+        did_router = did_router.route(
             "/.well-known/did.json",
             get(did_document::root_did_document),
         )
         .route(
             "/.well-known/at9p/:cid.cbor",
             get(did_document::at9p_capsule),
-        )
+        );
+    }
+    let mut did_router = did_router
         // atproto handle→DID HTTP resolution (#500) — plaintext bare DID
         .route("/.well-known/atproto-did", get(did_document::atproto_did))
         .route(

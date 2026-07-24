@@ -50,6 +50,10 @@ impl CheckpointedPdsAcceptedStateSource {
         path: &Path,
         acceptance_identity: crate::service::RegistryDeploymentVerifier,
     ) -> Result<Self> {
+        // The monotonic checkpoint history is security state. A missing
+        // database is indistinguishable from deletion of that history, so it
+        // must never be recreated at resolver bootstrap. First boot is an
+        // explicit deployment-provisioning step before services may start.
         let _probe = rocksdb::DB::open_for_read_only(&readonly_opts(), path, false)
             .with_context(|| format!("failed to open checkpointed PDS store at {path:?}"))?;
         Ok(Self {
@@ -79,6 +83,24 @@ impl CheckpointedPdsAcceptedStateSource {
         }
         Ok(state)
     }
+}
+
+/// Explicitly create the empty checkpoint store for a newly provisioned
+/// deployment. Resolver startup never calls this: a missing store there is
+/// treated as lost security history and fails closed.
+pub(crate) fn initialize_deployment_store() -> Result<()> {
+    let path = hyprstream_service::deployment_data_dir()?.join("pds-store");
+    anyhow::ensure!(
+        !path.exists(),
+        "refusing to initialize existing checkpointed PDS store at {}",
+        path.display()
+    );
+    let mut opts = rocksdb::Options::default();
+    opts.create_if_missing(true);
+    drop(rocksdb::DB::open(&opts, &path).with_context(|| {
+        format!("failed to initialize checkpointed PDS store at {path:?}")
+    })?);
+    Ok(())
 }
 
 impl super::service::AcceptedStateSource for CheckpointedPdsAcceptedStateSource {
