@@ -30,10 +30,12 @@
 //! A reader is NOT guaranteed to observe a rotation instantaneously (bounded
 //! by one rotation tick + filesystem visibility). The fail-closed contract:
 //! the reader verifies the head's node signature, **rejects a `seq`
-//! regression** against the highest generation it has already observed
-//! ([`SealedHeadEs256Source`] holds a monotonic `AtomicU64`), and resolves
-//! the signing key **by kid** from the key-material store. A retired key is
-//! never presented as active; a replayed older-but-valid head is rejected.
+//! regression** against both the highest generation it has observed in memory
+//! and the rotator's durable high-water mark, and resolves the signing key
+//! **by kid** from the key-material store. A retired key is never presented as
+//! active; replaying only an older-but-valid head is rejected even after a
+//! reader restart. As with any node-local checkpoint, coordinated rollback of
+//! the head and its high-water mark is outside this file-level guarantee.
 //!
 //! ## Dependency honesty — C2 (#1168) is not built
 //!
@@ -49,7 +51,8 @@
 use anyhow::{anyhow, Context as _, Result};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use ed25519_dalek::{
-    Signature, Signer, SigningKey as Ed25519SigningKey, Verifier, VerifyingKey as Ed25519VerifyingKey,
+    Signature, Signer, SigningKey as Ed25519SigningKey, Verifier,
+    VerifyingKey as Ed25519VerifyingKey,
 };
 use p256::ecdsa::{SigningKey as Es256SigningKey, VerifyingKey as Es256VerifyingKey};
 use serde::{Deserialize, Serialize};
@@ -69,6 +72,8 @@ pub const HEAD_SIGNING_KEY_NAME: &str = "oplog-head-key";
 pub const HEAD_VERIFYING_KEY_FILENAME: &str = "atproto-oplog-head-pubkey";
 /// The sealed head file.
 pub const SEALED_HEAD_FILENAME: &str = "atproto-oplog-head.json";
+/// Durable sequence high-water mark, written by the rotator after each head.
+pub const SEALED_HEAD_MAX_SEQ_FILENAME: &str = "atproto-oplog-head-max-seq";
 /// Env override for the shared head state dir (#808 systemd seam).
 pub const OPLOG_STATE_DIR_ENV: &str = "HYPRSTREAM_OPLOG_STATE_DIR";
 
@@ -190,8 +195,7 @@ impl SealedOpLogHead {
 
     /// Verify the head signature under `head_vk` and return the active vk.
     pub fn verify(&self, head_vk: &Ed25519VerifyingKey) -> Result<Es256VerifyingKey> {
-        let sig =
-            Signature::from_slice(&self.sig).context("sealed head signature is malformed")?;
+        let sig = Signature::from_slice(&self.sig).context("sealed head signature is malformed")?;
         head_vk
             .verify(&self.signing_payload()?, &sig)
             .context("sealed head signature does not verify under the head verifying key")?;
@@ -237,10 +241,7 @@ pub struct FixedGenerationSource {
 impl FixedGenerationSource {
     pub fn new(signing_key: Es256SigningKey) -> Self {
         let kid = es256_kid(&signing_key);
-        Self {
-            kid,
-            signing_key,
-        }
+        Self { kid, signing_key }
     }
 }
 
@@ -263,8 +264,8 @@ impl ActiveGenerationSource for FixedGenerationSource {
 pub struct SealedHeadEs256Source {
     state_dir: PathBuf,
     key_material_dir: PathBuf,
-    /// Highest `seq` ever accepted by this reader. A head with `seq <= max` is
-    /// rejected as a rollback. `0` means "no generation observed yet".
+    /// Highest `seq` accepted by this process. A lower head is rejected as a
+    /// rollback; the same head may be resolved repeatedly between rotations.
     max_seq: AtomicU64,
 }
 
@@ -305,13 +306,30 @@ impl ActiveGenerationSource for SealedHeadEs256Source {
             Some(h) => h,
             None => return Ok(None),
         };
-        // F2: reject a rolled-back head. `seq` must strictly advance past the
-        // highest generation this reader has already accepted.
-        let prev_max = self.max_seq.load(Ordering::Acquire);
-        if head.seq <= prev_max {
+        // F2: reject a rolled-back head against the rotator's durable anchor,
+        // including on a reader's first call after process restart.
+        let durable_max = read_durable_max_seq(&self.state_dir)?.ok_or_else(|| {
+            anyhow!(
+                "sealed head exists without durable sequence anchor {}",
+                SEALED_HEAD_MAX_SEQ_FILENAME
+            )
+        })?;
+        if head.seq < durable_max {
             return Err(anyhow!(
-                "sealed head seq {} is not newer than the last accepted {} \
-                 (rollback or replay rejected)",
+                "sealed head seq {} is older than durable high-water mark {} \
+                 (cold-start rollback or replay rejected)",
+                head.seq,
+                durable_max
+            ));
+        }
+
+        // The same sealed generation is expected to serve many publishes.
+        // Only a lower seq is a regression; equality is safe and necessary.
+        let prev_max = self.max_seq.load(Ordering::Acquire);
+        if head.seq < prev_max {
+            return Err(anyhow!(
+                "sealed head seq {} is older than the last accepted {} \
+                 (rollback rejected)",
                 head.seq,
                 prev_max
             ));
@@ -330,9 +348,17 @@ impl ActiveGenerationSource for SealedHeadEs256Source {
                 head.active_kid
             )
         })?;
-        // Publish the new high-water mark only after the key resolves, so a
-        // head whose kid is missing does not poison the monotonic anchor.
-        self.max_seq.store(head.seq, Ordering::Release);
+        // Publish the new process-local high-water mark only after the key
+        // resolves. `fetch_max` closes the race between concurrent readers.
+        let concurrent_max = self.max_seq.fetch_max(head.seq, Ordering::AcqRel);
+        if head.seq < concurrent_max {
+            return Err(anyhow!(
+                "sealed head seq {} is older than the concurrently accepted {} \
+                 (rollback rejected)",
+                head.seq,
+                concurrent_max
+            ));
+        }
         Ok(Some(ActiveGeneration {
             seq: head.seq,
             kid: head.active_kid,
@@ -381,7 +407,7 @@ pub async fn seal_op_log_head(
     let vk_sec1 = URL_SAFE_NO_PAD.encode(signing_key.verifying_key().to_sec1_bytes());
 
     // F5: carry the chain forward only from a verified prior head.
-    let (seq, prev) = prior_chain(state_dir, head_signing_key);
+    let (seq, prev) = prior_chain(state_dir, head_signing_key)?;
 
     let mut head = SealedOpLogHead {
         version: PROJECTION_VERSION,
@@ -399,35 +425,76 @@ pub async fn seal_op_log_head(
         &state_dir.join(SEALED_HEAD_FILENAME),
         &serde_json::to_vec(&head)?,
     )?;
+    // Write the durable anchor after the head. If a crash lands between these
+    // renames, the previous anchor already rejects every older head; the new
+    // head remains acceptable because it is newer than that anchor.
+    write_durable_max_seq(state_dir, head.seq)?;
     Ok(())
 }
 
+fn read_durable_max_seq(state_dir: &Path) -> Result<Option<u64>> {
+    let path = state_dir.join(SEALED_HEAD_MAX_SEQ_FILENAME);
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => {
+            return Err(e)
+                .with_context(|| format!("reading sealed-head high-water mark {}", path.display()))
+        }
+    };
+    let text = std::str::from_utf8(&bytes).context("sealed-head high-water mark is not UTF-8")?;
+    let seq = text
+        .parse::<u64>()
+        .context("sealed-head high-water mark is not a u64")?;
+    Ok(Some(seq))
+}
+
+fn write_durable_max_seq(state_dir: &Path, seq: u64) -> Result<()> {
+    atomic_write_public(
+        &state_dir.join(SEALED_HEAD_MAX_SEQ_FILENAME),
+        seq.to_string().as_bytes(),
+    )
+}
+
 /// Return `(seq, prev)` for the new head, carrying forward only from a
-/// signature-verified prior head (F5). An absent or unverified prior starts a
-/// fresh chain at seq=1.
+/// signature-verified prior head (F5). An absent or unverified prior breaks the
+/// hash link, but the durable high-water mark still prevents `seq` reuse.
 fn prior_chain(
     state_dir: &Path,
     head_signing_key: &Ed25519SigningKey,
-) -> (u64, Option<[u8; 32]>) {
+) -> Result<(u64, Option<[u8; 32]>)> {
+    let durable_max = read_durable_max_seq(state_dir)?.unwrap_or(0);
+    let next_unlinked = || {
+        durable_max
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("sealed-head sequence exhausted at {durable_max}"))
+            .map(|seq| (seq, None))
+    };
     let head_vk = head_signing_key.verifying_key();
     let bytes = match std::fs::read(state_dir.join(SEALED_HEAD_FILENAME)) {
         Ok(b) => b,
-        Err(_) => return (1, None),
+        Err(_) => return next_unlinked(),
     };
     let prior: SealedOpLogHead = match serde_json::from_slice(&bytes) {
         Ok(h) => h,
-        Err(_) => return (1, None),
+        Err(_) => return next_unlinked(),
     };
     // F5: verify the prior head before trusting its seq/prev. A tampered prior
-    // cannot inject an arbitrary sequence — we start fresh instead.
+    // cannot inject an arbitrary sequence. The durable anchor still advances.
     if prior.verify(&head_vk).is_err() {
-        return (1, None);
+        return next_unlinked();
     }
     let prev_hash = match prior.signing_payload() {
         Ok(p) => sha256_fixed(&p),
-        Err(_) => return (1, None),
+        Err(_) => return next_unlinked(),
     };
-    (prior.seq.checked_add(1).unwrap_or(prior.seq), Some(prev_hash))
+    let seq = prior
+        .seq
+        .max(durable_max)
+        .checked_add(1)
+        .ok_or_else(|| anyhow!("sealed-head sequence exhausted at {}", u64::MAX))?;
+    let prev = (prior.seq >= durable_max).then_some(prev_hash);
+    Ok((seq, prev))
 }
 
 fn sha256_fixed(bytes: &[u8]) -> [u8; 32] {
@@ -440,7 +507,16 @@ fn sha256_fixed(bytes: &[u8]) -> [u8; 32] {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use std::process::Command;
+    use std::time::{Duration, Instant};
     use tempfile::TempDir;
+
+    const CROSS_PROCESS_CHILD_ENV: &str = "HYPRSTREAM_TEST_OPLOG_CHILD";
+    const CROSS_PROCESS_STATE_ENV: &str = "HYPRSTREAM_TEST_OPLOG_STATE";
+    const CROSS_PROCESS_SECRETS_ENV: &str = "HYPRSTREAM_TEST_OPLOG_SECRETS";
+    const CROSS_PROCESS_READY_ENV: &str = "HYPRSTREAM_TEST_OPLOG_READY";
+    const CROSS_PROCESS_CONTINUE_ENV: &str = "HYPRSTREAM_TEST_OPLOG_CONTINUE";
+    const CROSS_PROCESS_RESULT_ENV: &str = "HYPRSTREAM_TEST_OPLOG_RESULT";
 
     /// A rotator fixture: dedicated head key + published verifying key + a
     /// populated ES256 store. `state_dir` is the shared head state dir;
@@ -478,7 +554,11 @@ mod tests {
             tokio::runtime::Builder::new_current_thread()
                 .build()
                 .unwrap()
-                .block_on(seal_op_log_head(&self.state_dir, &self.head_sk, &self.store))
+                .block_on(seal_op_log_head(
+                    &self.state_dir,
+                    &self.head_sk,
+                    &self.store,
+                ))
                 .unwrap();
         }
 
@@ -549,6 +629,127 @@ mod tests {
         );
     }
 
+    #[test]
+    fn cold_start_reader_rejects_rolled_back_head() {
+        let r = Rotator::new();
+        let k1 = Es256SigningKey::random(&mut rand::rngs::OsRng);
+        r.set_active(k1.clone());
+        r.persist_slot("active", &k1);
+        r.seal();
+        let seq1_head = std::fs::read(r.state_dir.join(SEALED_HEAD_FILENAME)).unwrap();
+
+        let k2 = Es256SigningKey::random(&mut rand::rngs::OsRng);
+        r.persist_slot("drain", &k1);
+        r.persist_slot("active", &k2);
+        r.set_active(k2);
+        r.seal();
+        assert_eq!(read_durable_max_seq(&r.state_dir).unwrap(), Some(2));
+
+        // Replay only the older, still-valid head, then construct a brand-new
+        // source to model a process cold start. The durable anchor survives.
+        std::fs::write(r.state_dir.join(SEALED_HEAD_FILENAME), seq1_head).unwrap();
+        let restarted_reader = SealedHeadEs256Source::new(&r.state_dir, &r.secrets_dir);
+        let err = restarted_reader.active_generation().unwrap_err();
+        assert!(
+            err.to_string().contains("cold-start rollback"),
+            "a cold reader must reject an older signed head: {err}"
+        );
+    }
+
+    #[test]
+    fn reader_can_resolve_the_same_head_repeatedly() {
+        let r = Rotator::new();
+        let k1 = Es256SigningKey::random(&mut rand::rngs::OsRng);
+        r.set_active(k1.clone());
+        r.persist_slot("active", &k1);
+        r.seal();
+
+        let reader = SealedHeadEs256Source::new(&r.state_dir, &r.secrets_dir);
+        assert_eq!(reader.active_generation().unwrap().unwrap().seq, 1);
+        assert_eq!(reader.active_generation().unwrap().unwrap().seq, 1);
+    }
+
+    /// #1123/#1170 acceptance test: the rotator stays in this process while a
+    /// child test process holds the reader across the K1 -> K2 rotation.
+    #[test]
+    fn cross_process_rotation_observed_via_sealed_head() {
+        if std::env::var_os(CROSS_PROCESS_CHILD_ENV).is_some() {
+            cross_process_reader_child();
+            return;
+        }
+
+        let r = Rotator::new();
+        let k1 = Es256SigningKey::random(&mut rand::rngs::OsRng);
+        let k1_kid = es256_kid(&k1);
+        r.set_active(k1.clone());
+        r.persist_slot("active", &k1);
+        r.seal();
+
+        let coordination = TempDir::new().unwrap();
+        let ready = coordination.path().join("ready");
+        let continue_path = coordination.path().join("continue");
+        let result = coordination.path().join("result");
+        let test_name = "auth::op_log::tests::cross_process_rotation_observed_via_sealed_head";
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg(test_name)
+            .arg("--nocapture")
+            .env(CROSS_PROCESS_CHILD_ENV, "1")
+            .env(CROSS_PROCESS_STATE_ENV, &r.state_dir)
+            .env(CROSS_PROCESS_SECRETS_ENV, &r.secrets_dir)
+            .env(CROSS_PROCESS_READY_ENV, &ready)
+            .env(CROSS_PROCESS_CONTINUE_ENV, &continue_path)
+            .env(CROSS_PROCESS_RESULT_ENV, &result)
+            .spawn()
+            .unwrap();
+
+        wait_for_path(&ready);
+
+        let k2 = Es256SigningKey::random(&mut rand::rngs::OsRng);
+        let k2_kid = es256_kid(&k2);
+        r.persist_slot("drain", &k1);
+        r.persist_slot("active", &k2);
+        r.set_active(k2);
+        r.seal();
+        std::fs::write(&continue_path, b"rotate").unwrap();
+
+        let status = child.wait().unwrap();
+        assert!(status.success(), "cross-process reader child failed");
+        let observed = std::fs::read_to_string(result).unwrap();
+        assert_eq!(observed, format!("{k1_kid}\n{k2_kid}\n"));
+        assert_ne!(
+            k1_kid, k2_kid,
+            "the child must stop presenting the pre-rotation generation"
+        );
+    }
+
+    fn cross_process_reader_child() {
+        let state = PathBuf::from(std::env::var_os(CROSS_PROCESS_STATE_ENV).unwrap());
+        let secrets = PathBuf::from(std::env::var_os(CROSS_PROCESS_SECRETS_ENV).unwrap());
+        let ready = PathBuf::from(std::env::var_os(CROSS_PROCESS_READY_ENV).unwrap());
+        let continue_path = PathBuf::from(std::env::var_os(CROSS_PROCESS_CONTINUE_ENV).unwrap());
+        let result = PathBuf::from(std::env::var_os(CROSS_PROCESS_RESULT_ENV).unwrap());
+        let reader = SealedHeadEs256Source::new(&state, &secrets);
+
+        let before = reader.active_generation().unwrap().unwrap();
+        std::fs::write(&ready, b"ready").unwrap();
+        wait_for_path(&continue_path);
+        let after = reader.active_generation().unwrap().unwrap();
+        std::fs::write(result, format!("{}\n{}\n", before.kid, after.kid)).unwrap();
+    }
+
+    fn wait_for_path(path: &Path) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !path.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for {}",
+                path.display()
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     // ── F3: a reader (verifying key only) cannot forge a head ───────────────
 
     #[test]
@@ -610,19 +811,19 @@ mod tests {
         )
         .unwrap();
 
-        // Re-seal: the tampered prior does not verify, so the new head starts
-        // fresh at seq=1 rather than carrying forward 1_000_000.
+        // Re-seal: the tampered prior does not verify, so the hash chain
+        // restarts, but the durable sequence anchor still advances.
         let k2 = Es256SigningKey::random(&mut rand::rngs::OsRng);
         r.set_active(k2);
         r.seal();
-        let head: SealedOpLogHead = serde_json::from_slice(
-            &std::fs::read(r.state_dir.join(SEALED_HEAD_FILENAME)).unwrap(),
-        )
-        .unwrap();
+        let head: SealedOpLogHead =
+            serde_json::from_slice(&std::fs::read(r.state_dir.join(SEALED_HEAD_FILENAME)).unwrap())
+                .unwrap();
         assert_eq!(
-            head.seq, 1,
-            "an unverified prior must not inject its seq into the new head"
+            head.seq, 2,
+            "an unverified prior must not inject or regress the new head seq"
         );
+        assert_eq!(head.prev, None);
     }
 
     // ── F4/torn: a corrupt head is rejected; absent head returns None ───────
