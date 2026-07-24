@@ -26,7 +26,7 @@
 //! acme_directory = "https://acme-v02.api.letsencrypt.org/directory"
 //! acme_contact = "mailto:ops@example.com"
 //! wildcard_ipv4 = "203.0.113.10"
-//! wildcard_ipv6 = "2001:db8::10"
+//! wildcard_ipv6 = "2001:db8::20"
 //! ```
 
 use std::net::{Ipv4Addr, Ipv6Addr};
