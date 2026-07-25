@@ -220,6 +220,8 @@ pub enum DecisionReason {
     FloorDeny,
     /// The PEP could not resolve a content-bound label for the object.
     UnlabeledObject,
+    /// The PEP could not derive a verified subject clearance.
+    NoClearance,
     /// A write was denied because the system's IFC write direction is not yet
     /// ratified. Writes fail closed until that policy decision is made.
     WriteDirectionUndecided,
@@ -267,6 +269,7 @@ impl DecisionReason {
             DecisionReason::Permit => "permit",
             DecisionReason::FloorDeny => "floor_deny",
             DecisionReason::UnlabeledObject => "unlabeled_object",
+            DecisionReason::NoClearance => "no_clearance",
             DecisionReason::WriteDirectionUndecided => "write_direction_undecided",
             DecisionReason::TeMiss => "te_miss",
             DecisionReason::Escalate => "escalate",

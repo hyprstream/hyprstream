@@ -649,6 +649,24 @@ impl CasMount {
         Self::with_authorizer_and_staging(substrate, domain, authorizer, StagingConfig::default())
     }
 
+    /// Construct a CAS mount with an already shared authorizer.
+    ///
+    /// Service state uses this form so the installed policy object is explicit
+    /// and injectable without wrapping an `Arc` inside another `Arc`.
+    pub fn with_shared_authorizer(
+        substrate: CasSubstrate,
+        domain: DedupDomain,
+        authorizer: Arc<dyn CasMountAuthorizer>,
+    ) -> Self {
+        Self {
+            substrate,
+            domain,
+            authorizer,
+            staging: Arc::new(StagingRegistry::new()),
+            staging_cfg: StagingConfig::default(),
+        }
+    }
+
     /// Construct a CAS mount with an explicit authorizer and staging config.
     pub fn with_authorizer_and_staging<A>(
         substrate: CasSubstrate,
@@ -794,8 +812,10 @@ impl CasMount {
             }
         }
 
-        // Won the CAS. Take the bytes + labels out from under their locks so we
-        // don't hold them across the async substrate put.
+        // Won the CAS. Take the bytes + staging hint label out from under their
+        // locks so we don't hold them across the async substrate put. The hint
+        // is a D1 restrict-only input — the substrate derives the trusted
+        // content-bound label via seal_label(domain, hint) (#1270).
         let bytes = std::mem::take(&mut *slot.buffer.lock());
         let joined = match slot.joined_label() {
             Some(label) => label,
@@ -813,7 +833,10 @@ impl CasMount {
                 return Err(MountError::PermissionDenied(msg));
             }
         };
-        let put_result = self.substrate.put(&self.domain, &bytes, joined).await;
+        let put_result = self
+            .substrate
+            .put(&self.domain, &bytes, Some(joined))
+            .await;
 
         match put_result {
             Ok(manifest) => {
@@ -1543,7 +1566,7 @@ mod tests {
         let substrate = CasSubstrate::new(dir.path());
         let domain = DedupDomain::local_default();
         let manifest = substrate
-            .put(&domain, b"hello-cas-mount", label())
+            .put(&domain, b"hello-cas-mount", Some(label()))
             .await
             .unwrap();
         let authz = std::sync::Arc::new(RecordingAuthorizer::default());
@@ -1580,7 +1603,7 @@ mod tests {
         let substrate = CasSubstrate::new(dir.path());
         let domain = DedupDomain::local_default();
         let manifest = substrate
-            .put(&domain, b"secret bytes", label())
+            .put(&domain, b"secret bytes", Some(label()))
             .await
             .unwrap();
         let mount = CasMount::new(substrate, domain);
@@ -1600,7 +1623,7 @@ mod tests {
         let substrate = CasSubstrate::new(dir.path());
         let domain = DedupDomain::local_default();
         let manifest = substrate
-            .put(&domain, b"xorb-backed-payload", label())
+            .put(&domain, b"xorb-backed-payload", Some(label()))
             .await
             .unwrap();
         let xorb = manifest.xorb_hashes.first().expect("xorb hash").clone();
@@ -1638,7 +1661,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let substrate = CasSubstrate::new(dir.path());
         let manifest = substrate
-            .put(&DedupDomain::local_default(), bytes, label())
+            .put(&DedupDomain::local_default(), bytes, Some(label()))
             .await
             .unwrap();
         let xorb = manifest.xorb_hashes.first().expect("xorb hash").clone();
@@ -1682,7 +1705,7 @@ mod tests {
     async fn bootstrap_grant_denies_obj_reads_and_stage_ops() {
         let (_dir, substrate, xorb) = substrate_with_xorb(b"bootstrap-xorb").await;
         let manifest = substrate
-            .put(&DedupDomain::local_default(), b"obj-bytes", label())
+            .put(&DedupDomain::local_default(), b"obj-bytes", Some(label()))
             .await
             .unwrap();
         let mount = CasMount::with_authorizer(

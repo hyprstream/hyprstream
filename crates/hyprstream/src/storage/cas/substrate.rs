@@ -112,7 +112,15 @@ impl CasSubstrate {
     /// Chunking (gearhash CDC), xorb aggregation, content-addressed dedup, and the
     /// server-computed merkle all happen inside the underlying `CasStore` — byte
     /// boundaries stay identical to xet-core. The substrate adds the canonical
-    /// manifest CID with a required, content-bound `security_label`.
+    /// manifest CID and derives a required, **trusted content-bound**
+    /// `security_label` from the domain (#1270).
+    ///
+    /// The `hint_label` parameter is a D1 hint trusted only from our own staging
+    /// path (the `CasMount::seal_slot` joined LUB). The effective seal label is
+    /// `join(domain_label(domain), hint)` — restrict-only, never permissive. A
+    /// `None` hint yields just the domain-derived label. **Callers must not pass
+    /// untrusted/caller-asserted labels** — the interface policy in `CLAUDE.md`
+    /// forbids caller-supplied labels as authoritative PDP inputs.
     ///
     /// Only **BLAKE3-256** ingest is implemented today: the merkle the store
     /// computes is the 32-byte BLAKE3 reconstruction hash, so the domain must
@@ -126,7 +134,7 @@ impl CasSubstrate {
         &self,
         domain: &DedupDomain,
         data: &[u8],
-        security_label: SecurityLabel,
+        hint_label: Option<SecurityLabel>,
     ) -> Result<BlobManifest, CasError> {
         if domain.algorithm != HashAlgo::Blake3 || domain.digest_length != 32 {
             return Err(CasError::UnsupportedIngestAlgorithm(domain.algorithm));
@@ -141,6 +149,9 @@ impl CasSubstrate {
             "store merkle must be the declared {}-byte digest",
             domain.digest_length
         );
+        // #1270: derive the trusted label from structural provenance and only
+        // use the staging label as a restrict-only hint.
+        let security_label = crate::mac::cas_pep::seal_label(domain, hint_label);
         let manifest = BlobManifest::new(
             put.merkle,
             put.xorb_hashes,
@@ -217,7 +228,7 @@ mod tests {
         let domain = DedupDomain::local_default();
         let original = payload(7, 256 * 1024);
 
-        let m = sub.put(&domain, &original, label()).await.unwrap();
+        let m = sub.put(&domain, &original, Some(label())).await.unwrap();
         assert!(m.cid.starts_with('b'));
         assert_eq!(m.byte_len, original.len() as u64);
         assert!(m.bytes_stored > 0);
@@ -238,7 +249,7 @@ mod tests {
         let original = payload(3, 200 * 1024);
 
         let m = sub
-            .put(&DedupDomain::local_default(), &original, label())
+            .put(&DedupDomain::local_default(), &original, Some(label()))
             .await
             .unwrap();
 
@@ -257,8 +268,14 @@ mod tests {
         let default_domain = DedupDomain::local_default();
         let tenant_domain = DedupDomain::local_tenant(Compartment::new("tenant:acme"));
 
-        let a = sub.put(&default_domain, &original, label()).await.unwrap();
-        let b = sub.put(&tenant_domain, &original, label()).await.unwrap();
+        let a = sub
+            .put(&default_domain, &original, Some(label()))
+            .await
+            .unwrap();
+        let b = sub
+            .put(&tenant_domain, &original, Some(label()))
+            .await
+            .unwrap();
 
         // Content-addressed ⇒ identical merkle regardless of domain.
         assert_eq!(a.merkle, b.merkle);
@@ -280,8 +297,14 @@ mod tests {
         let domain = DedupDomain::local_default();
         let original = payload(11, 200 * 1024);
 
-        let first = sub.put(&domain, &original, label()).await.unwrap();
-        let second = sub.put(&domain, &original, label()).await.unwrap();
+        let first = sub
+            .put(&domain, &original, Some(label()))
+            .await
+            .unwrap();
+        let second = sub
+            .put(&domain, &original, Some(label()))
+            .await
+            .unwrap();
         assert_eq!(first.merkle, second.merkle);
         assert_eq!(second.bytes_stored, 0, "same-domain re-upload fully dedups");
     }
@@ -295,7 +318,10 @@ mod tests {
             digest_length: 32,
             ..DedupDomain::local_default()
         };
-        let err = sub.put(&domain, b"hello", label()).await.unwrap_err();
+        let err = sub
+            .put(&domain, b"hello", Some(label()))
+            .await
+            .unwrap_err();
         assert!(matches!(err, CasError::UnsupportedIngestAlgorithm(_)));
     }
 
@@ -311,7 +337,10 @@ mod tests {
             digest_length: 64,
             ..DedupDomain::local_default()
         };
-        let err = sub.put(&domain, b"hello", label()).await.unwrap_err();
+        let err = sub
+            .put(&domain, b"hello", Some(label()))
+            .await
+            .unwrap_err();
         assert!(
             matches!(err, CasError::UnsupportedIngestAlgorithm(_)),
             "BLAKE3-512 ingest must be rejected until #881 lands"
@@ -319,19 +348,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn carrier_label_is_passed_through() {
+    async fn seal_label_is_derived_from_domain() {
         use hyprstream_rpc::auth::mac::{Assurance, CompartmentSet, Level};
         let dir = tempfile::tempdir().unwrap();
         let sub = CasSubstrate::new(dir.path());
-        let label =
-            SecurityLabel::new(Level::Internal, Assurance::Classical, CompartmentSet::EMPTY);
+        // No hint → label derived purely from the domain (local_default → Internal).
         let m = sub
-            .put(&DedupDomain::local_default(), b"payload-bytes", label)
+            .put(&DedupDomain::local_default(), b"payload-bytes", None)
             .await
             .unwrap();
+        let expected = SecurityLabel::new(Level::Internal, Assurance::Classical, CompartmentSet::EMPTY);
         assert_eq!(
-            m.security_label, label,
-            "required label plumbs through unchanged"
+            m.security_label, expected,
+            "seal label must be derived from the domain, not caller-asserted"
         );
     }
 
@@ -340,13 +369,31 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let domain = DedupDomain::local_default();
         let manifest = CasSubstrate::new(dir.path())
-            .put(&domain, b"durable-manifest", label())
+            .put(&domain, b"durable-manifest", Some(label()))
             .await
             .unwrap();
         let reopened = CasSubstrate::new(dir.path());
         assert_eq!(
             reopened.get(&domain, &manifest.cid).await.unwrap(),
             b"durable-manifest"
+        );
+    }
+
+    #[tokio::test]
+    async fn seal_label_hint_joins_restrict_only() {
+        use hyprstream_rpc::auth::mac::{Assurance, CompartmentSet, Level};
+        let dir = tempfile::tempdir().unwrap();
+        let sub = CasSubstrate::new(dir.path());
+        // Hint = Secret → effective = Secret (more restrictive than domain's Internal).
+        let hint = SecurityLabel::new(Level::Secret, Assurance::Classical, CompartmentSet::EMPTY);
+        let m = sub
+            .put(&DedupDomain::local_default(), b"payload-bytes", Some(hint))
+            .await
+            .unwrap();
+        assert_eq!(
+            m.security_label.level,
+            Level::Secret,
+            "hint label must join restrict-only with the domain floor"
         );
     }
 }

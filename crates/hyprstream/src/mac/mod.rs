@@ -71,6 +71,9 @@ pub mod genesis;
 pub mod lattice;
 // #676: the production S3-scope ↔ S5-TE-rule vocabulary (injective + exact;
 // wildcards expand at compile time over a closed registry).
+// #1270: CAS-native MAC PEP — trusted content-bound label at seal +
+// can_access enforcement on ingest/read (epic #1267 T3).
+pub mod cas_pep;
 pub mod pep;
 pub mod permission_map;
 pub mod te;
@@ -111,6 +114,11 @@ pub use genesis::{
     GenesisGate, ManifestLabelSource, NamespaceEnumerator, NoManifests, SitePolicy,
 };
 pub use pep::{production_ninep_decider, NinePAccessDecider};
+// #1270: CAS-native MAC PEP — the shared CAS enforcement contract.
+pub use cas_pep::{
+    domain_label, seal_label, CasClearanceSource, CasObjectLabelResolver, CasPep,
+    DenyAllClearanceSource, MacCasAuthorizer,
+};
 // S4 (#570): the boot path that installs the verified `CompiledPolicy` at daemon
 // startup (dormant — makes the PDP inputs real without enabling enforcement).
 pub use bootload::{compile_sign_load_install, install_baseline_boot_policy, BootPolicyError};

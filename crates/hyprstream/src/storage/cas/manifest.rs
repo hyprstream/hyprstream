@@ -47,8 +47,14 @@ pub struct BlobManifest {
     /// Total byte length of the reconstructed content.
     pub byte_len: u64,
 
-    /// The MAC object label for this sealed blob. It is required and covered by
-    /// the manifest CID, so relabeling necessarily creates a distinct object.
+    /// **Trusted content-bound label (#1270).** The MAC object label for this
+    /// sealed blob, derived from the
+    /// [`DedupDomain`](crate::storage::cas::DedupDomain) at seal time.
+    ///
+    /// The substrate derives this via [`crate::mac::cas_pep::seal_label`] as a
+    /// restrict-only join of the domain's structural label and any trusted
+    /// staging hint. It is required and covered by the manifest CID, so
+    /// relabeling necessarily creates a distinct object.
     pub security_label: SecurityLabel,
 }
 

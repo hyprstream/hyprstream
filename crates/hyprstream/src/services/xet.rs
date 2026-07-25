@@ -36,22 +36,18 @@
 //! `grantRepo` and enforces per-repo entitlement — "the hash is not a
 //! capability"). #813 moved this route behind the Subject-threaded CAS mount so
 //! the policy boundary is the same `Mount` surface used by namespaces, and
-//! #1094 made that boundary **enforcing**: the mount runs
-//! [`BootstrapCasAuthorizer`], where the day-one grant "any authenticated
-//! subject may read xorb X" is an explicit, audited policy object and
-//! everything else is default-deny — plane #1 of #1091's R4b
-//! compile-and-ratchet MAC rollout. The remaining work is attaching
-//! repo/compartment provenance labels to xorb objects (#699) and flowing
-//! subject clearances (#698) so grant breadth ratchets to 0 and the mount can
-//! make a full AVC decision; the ratchet path is documented on
-//! [`BootstrapCasAuthorizer`].
+//! #1270 made that boundary a **MAC-enforcing** PEP: the mount runs
+//! [`MacCasAuthorizer`](crate::mac::MacCasAuthorizer), which derives the trusted
+//! content-bound label from the dedup domain and checks the subject clearance
+//! via the CAS PEP. Until an authority-backed CAS clearance adapter is
+//! configured, this explicitly installed PEP is fail-closed (deny all reads).
 
 use crate::config::{TlsConfig, XetConfig};
 use crate::server::state::ResourceAuthState;
 use crate::server::tls::{resolve_rustls_config, serve_app};
 use crate::server::{AuthenticatedUser, middleware as server_middleware};
 use crate::services::RegistryClient;
-use crate::storage::cas::{BootstrapCasAuthorizer, CasMount, CasSubstrate, DedupDomain};
+use crate::storage::cas::{CasMount, CasMountAuthorizer, CasSubstrate, DedupDomain};
 use anyhow::Result;
 use axum::{
     Json, Router,
@@ -91,6 +87,13 @@ pub struct XetState {
     pub registry: Option<RegistryClient>,
     /// Shared OAI-equivalent authentication and rate-limit state.
     pub auth: ResourceAuthState,
+    /// Explicitly installed CAS read PEP.
+    ///
+    /// Production installs [`crate::mac::MacCasAuthorizer::fail_closed`]
+    /// until an authority-backed clearance adapter is configured. Tests and
+    /// future production wiring may inject another concrete authorizer without
+    /// bypassing the `CasMount` enforcement point.
+    pub cas_authorizer: Arc<dyn CasMountAuthorizer>,
 }
 
 /// XetService — HF-XET CAS HTTP face.
@@ -183,13 +186,10 @@ async fn get_xorb_handler(
     axum::extract::Extension(user): axum::extract::Extension<AuthenticatedUser>,
 ) -> Response {
     let subject = Subject::new(user.user);
-    let mount = CasMount::with_authorizer(
+    let mount = CasMount::with_shared_authorizer(
         state.store.clone(),
         DedupDomain::local_default(),
-        // #1094 plane #1: enforcing authorizer behind the explicit day-one
-        // bootstrap grant ("any authenticated subject may read xorb X"),
-        // default-deny for everything else. Never AllowAll on this route.
-        BootstrapCasAuthorizer::new(),
+        Arc::clone(&state.cas_authorizer),
     );
     let mut fid = match mount.walk(&["xorb", hash.as_str()], &subject).await {
         Ok(fid) => fid,
@@ -511,6 +511,9 @@ mod tests {
                 federation_resolver,
                 Arc::new(InMemoryJtiBlocklist::new()),
             ),
+            // These handler tests exercise successful byte/range behavior.
+            // Production installs the fail-closed MAC authorizer in the factory.
+            cas_authorizer: Arc::new(crate::storage::cas::AllowAllCasAuthorizer),
         }
     }
 
