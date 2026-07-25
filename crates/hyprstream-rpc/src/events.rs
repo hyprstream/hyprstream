@@ -353,16 +353,14 @@ impl EventAuthz for MacEventAuthz {
 
     fn can_subscribe(&self, caller: &Subject, prefix: &str) -> bool {
         matches!(
-            self.pep
-                .check(caller, prefix, MoqEventAction::Subscribe),
+            self.pep.check(caller, prefix, MoqEventAction::Subscribe),
             MacDecision::Permit
         )
     }
 
     fn can_join_decrypt(&self, caller: &Subject, prefix: &str) -> bool {
         matches!(
-            self.pep
-                .check(caller, prefix, MoqEventAction::JoinDecrypt),
+            self.pep.check(caller, prefix, MoqEventAction::JoinDecrypt),
             MacDecision::Permit
         )
     }
@@ -1084,10 +1082,7 @@ impl EventSubscriber {
             );
         }
         let prefix_key = self.encrypted_prefix_key(prefix).await?;
-        if !self
-            .authz
-            .can_join_decrypt(&self.caller, &prefix_key)
-        {
+        if !self.authz.can_join_decrypt(&self.caller, &prefix_key) {
             return Err(format!(
                 "join/decrypt denied by event-plane MAC for prefix '{prefix}'"
             ));
@@ -1267,9 +1262,6 @@ impl EventSubscriber {
             return Ok(None);
         };
         let prefix = topic.split('.').next().unwrap_or(&topic);
-        if !self.authz.can_subscribe(&self.caller, prefix) {
-            return Ok(None);
-        }
         if self.prefix_is_confidential(prefix)? {
             // An encrypted prefix; decoding requires the async path. Callers
             // needing non-blocking receive on encrypted prefixes should use
@@ -1277,6 +1269,9 @@ impl EventSubscriber {
             return Err(anyhow!(
                 "try_recv() does not support decoding encrypted prefixes; use recv_timeout(Duration::ZERO)"
             ));
+        }
+        if !self.authz.can_subscribe(&self.caller, prefix) {
+            return Ok(None);
         }
         Ok(Some((topic, raw)))
     }

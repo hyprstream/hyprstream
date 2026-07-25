@@ -119,13 +119,13 @@ pub mod manifest;
 pub mod pep;
 
 pub use bind::{clamp_descendant, BindLabel, BindLabelMap};
+pub use context::{SecurityContext, SubjectContextClaims, VerifiedKeyMaterial};
 #[cfg(not(target_arch = "wasm32"))]
 pub use dispatch_pep::{
     check_dispatch_mac, global_mac_dispatch_pep, install_mac_dispatch_pep, DefaultMacDispatchPep,
     DenyAllMacPep, DenyAllObjectResolver, MacDecision, MacDenyReason, MacDispatchPep,
     RpcObjectLabelResolver,
 };
-pub use context::{SecurityContext, SubjectContextClaims, VerifiedKeyMaterial};
 pub use genesis::{GenesisMap, GenesisReport};
 pub use label::{
     Assurance, Compartment, CompartmentSet, Level, SecurityLabel, MAX_COMPARTMENTS,
@@ -135,9 +135,7 @@ pub use manifest::{
     bind_time_label, import_label, ContentBoundLabel, LabeledObject, ObjectLabelResolver,
     ObjectRef, StaticNodeLabel,
 };
-pub use pep::{
-    ClearanceSource, DenyAllClearanceSource, MoqEventAction, MoqEventPep,
-};
+pub use pep::{ClearanceSource, DenyAllClearanceSource, MoqEventAction, MoqEventPep};
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]

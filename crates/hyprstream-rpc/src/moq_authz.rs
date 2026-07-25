@@ -325,7 +325,6 @@ impl MacSubscribeAuthorizer {
     pub fn new(pep: MoqEventPep) -> Self {
         Self { pep }
     }
-
 }
 
 impl SubscribeAuthorizer for MacSubscribeAuthorizer {

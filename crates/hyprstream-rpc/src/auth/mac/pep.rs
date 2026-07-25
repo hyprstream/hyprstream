@@ -118,20 +118,14 @@ impl Default for MoqEventPep {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use crate::auth::mac::{
-        Assurance, CompartmentSet, Level, SecurityLabel, VerifiedKeyMaterial,
-    };
+    use crate::auth::mac::{Assurance, CompartmentSet, Level, SecurityLabel, VerifiedKeyMaterial};
 
     fn public_label() -> SecurityLabel {
         SecurityLabel::new(Level::Public, Assurance::Classical, CompartmentSet::EMPTY)
     }
 
     fn secret_label() -> SecurityLabel {
-        SecurityLabel::new(
-            Level::Secret,
-            Assurance::PqHybrid,
-            CompartmentSet::EMPTY,
-        )
+        SecurityLabel::new(Level::Secret, Assurance::PqHybrid, CompartmentSet::EMPTY)
     }
 
     struct StaticResolver {
