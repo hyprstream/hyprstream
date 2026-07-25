@@ -7174,6 +7174,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "hyprstream-pds-service"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "ed25519-dalek 2.2.0",
+ "hyprstream-crypto",
+ "hyprstream-pds",
+ "hyprstream-rpc",
+ "hyprstream-vfs",
+ "rand 0.8.5",
+ "thiserror 1.0.69",
+ "tokio",
+]
+
+[[package]]
 name = "hyprstream-resource"
 version = "0.1.0"
 dependencies = [
