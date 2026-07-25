@@ -988,16 +988,18 @@ fn create_model_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnabl
             .build()
             .expect("failed to create runtime for model factory");
         let local = tokio::task::LocalSet::new();
-        local.block_on(
-            &rt,
+        local.block_on(&rt, {
+            let mut model_config = ModelServiceConfig::default();
+            model_config.inference_deployment =
+                crate::runtime::inference_profile::InferenceDeploymentProfile::from_env()?;
             ModelService::new(
-                ModelServiceConfig::default(),
+                model_config,
                 sk.clone(),
                 policy_client,
                 registry_client,
                 ctx.transport("model", SocketKind::Rep),
-            ),
-        )
+            )
+        })
     })?;
     if let Some(issuer) = ctx.oauth_issuer_url() {
         model_service = model_service.with_expected_audience(issuer.to_owned());

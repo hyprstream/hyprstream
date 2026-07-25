@@ -35,6 +35,7 @@ pub use crate::services::generated::model_client::KVQuantType;
 pub mod tensor_sampling; // Device-agnostic tensor-based sampling
 pub mod device_pool; // Multi-GPU device abstraction (DevicePool) — Send+Sync, holds only Device values
 pub mod image_utils; // Image loading and preprocessing for multimodal models
+pub mod inference_profile; // Explicit inference isolation/deployment scheduling profile
 pub mod kv_cache; // Key-Value caching for efficient autoregressive generation
 pub mod model_config; // Unified model configuration management
 pub mod model_factory; // Single factory for model creation

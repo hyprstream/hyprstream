@@ -31,6 +31,10 @@ use async_trait::async_trait;
 // GenerationRequest import removed — was only used by deleted ModelZmqClient
 use crate::runtime::KVQuantType;
 use crate::runtime::RuntimeConfig;
+use crate::runtime::inference_profile::{
+    InferenceCompute, InferenceDeploymentProfile, InferenceInstanceId,
+    InferenceIsolationProfile,
+};
 use crate::services::{
     EnvelopeContext,
     PolicyClient,
@@ -89,6 +93,8 @@ pub enum ModelLoadTerminal {
 /// per-epoch keying the first `Loaded` latch would shadow every reload.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ModelLoadKey {
+    /// Authority-verified tenant that owns this load attempt.
+    pub tenant: String,
     /// The model reference string (e.g. "qwen3-small:main").
     pub model_ref: String,
     /// Monotonic load-attempt number for this process.
@@ -102,6 +108,8 @@ pub struct ModelLoadKey {
 
 /// Information about a loaded model
 pub struct LoadedModel {
+    /// Tenant/model/replica identity of this inference instance.
+    pub instance: InferenceInstanceId,
     /// Model reference string (e.g., "qwen3-small:main")
     pub model_ref: String,
     /// Resolved transport for this model's InferenceService (#320). For a
@@ -144,6 +152,8 @@ pub struct ModelServiceConfig {
     pub max_context: Option<u32>,
     /// KV cache quantization type
     pub kv_quant: KVQuantType,
+    /// Isolation, tenancy, compute, and resource contract for spawned engines.
+    pub inference_deployment: InferenceDeploymentProfile,
 }
 
 impl Default for ModelServiceConfig {
@@ -152,6 +162,7 @@ impl Default for ModelServiceConfig {
             max_models: 5,
             max_context: None,
             kv_quant: KVQuantType::None,
+            inference_deployment: InferenceDeploymentProfile::default(),
         }
     }
 }
@@ -160,9 +171,9 @@ impl Default for ModelServiceConfig {
 pub struct ModelServiceInner {
     // Business logic
     /// LRU cache of loaded models
-    loaded_models: RwLock<LruCache<String, LoadedModel>>,
+    loaded_models: RwLock<LruCache<InferenceInstanceId, LoadedModel>>,
     /// Models currently being loaded (accepted but not yet in LRU cache)
-    pending_loads: Mutex<HashSet<String>>,
+    pending_loads: Mutex<HashSet<InferenceInstanceId>>,
     /// Service configuration
     config: ModelServiceConfig,
     /// Ed25519 signing key for creating InferenceClients
@@ -184,8 +195,8 @@ pub struct ModelServiceInner {
     /// federation; `resolve_model_ref`'s at:// branch then falls through to
     /// local resolution.
     discovery_client: Option<Arc<hyprstream_discovery::DiscoveryClient>>,
-    /// Persistent 9P synthetic tree for the fs scope (lazily initialized).
-    fs_tree: std::sync::OnceLock<crate::services::fs::SyntheticTree>,
+    /// Persistent 9P synthetic trees, partitioned by authority-verified tenant.
+    fs_trees: dashmap::DashMap<String, Arc<crate::services::fs::SyntheticTree>>,
     /// Retained terminal for each model load attempt (EV7/#649) — the
     /// host-side "file holds the truth" retain. A late `load --wait` reads the
     /// retained [`ModelLoadTerminal`] from here instead of missing the live
@@ -197,6 +208,9 @@ pub struct ModelServiceInner {
     /// allocates the next value, keying a fresh [`TerminalStore`] entry so a
     /// reload latches under a new key (reload ⇒ new terminal, EV7/#649).
     load_epoch: AtomicU64,
+    /// The sole tenant admitted by an in-process deployment. A second tenant
+    /// must never share the FFI engine fault radius.
+    in_process_tenant: std::sync::OnceLock<String>,
 }
 
 /// Model service that manages InferenceService lifecycle.
@@ -210,6 +224,30 @@ pub struct ModelServiceInner {
 /// list, health, info, and other requests during long GPU weight transfers.
 pub struct ModelService {
     inner: Arc<ModelServiceInner>,
+}
+
+fn admit_in_process_tenant(
+    admitted_tenant: &std::sync::OnceLock<String>,
+    verified_tenant: &str,
+) -> Result<()> {
+    if let Some(admitted) = admitted_tenant.get() {
+        anyhow::ensure!(
+            admitted == verified_tenant,
+            "in-process inference is bound to tenant {admitted:?}; refusing cross-tenant engine sharing"
+        );
+        return Ok(());
+    }
+
+    if admitted_tenant.set(verified_tenant.to_owned()).is_err() {
+        let admitted = admitted_tenant
+            .get()
+            .ok_or_else(|| anyhow!("in-process tenant admission raced without a winner"))?;
+        anyhow::ensure!(
+            admitted == verified_tenant,
+            "in-process inference is bound to tenant {admitted:?}; refusing cross-tenant engine sharing"
+        );
+    }
+    Ok(())
 }
 
 impl Clone for ModelService {
@@ -293,6 +331,7 @@ impl ModelService {
         registry: RegistryClient,
         transport: TransportConfig,
     ) -> Result<Self> {
+        config.inference_deployment.validate()?;
         // SAFETY: 5 is a valid non-zero value
         const DEFAULT_CACHE_SIZE: NonZeroUsize = match NonZeroUsize::new(5) {
             Some(n) => n,
@@ -316,9 +355,10 @@ impl ModelService {
             expected_audience: None,
             jwt_key_source: None,
             discovery_client: None,
-            fs_tree: std::sync::OnceLock::new(),
+            fs_trees: dashmap::DashMap::new(),
             load_terminals: TerminalStore::new(),
             load_epoch: AtomicU64::new(0),
+            in_process_tenant: std::sync::OnceLock::new(),
         })})
     }
 
@@ -384,7 +424,12 @@ impl ModelService {
     /// wins; a real attempt always latches under a fresh epoch, so the guard is
     /// belt-and-suspenders. Split out so the latch decision is unit-testable
     /// independent of the full load path.
-    fn latch_load_terminal(&self, model_ref: &str, epoch: u64, result: &Result<String>) {
+    fn latch_load_terminal(
+        &self,
+        instance: &InferenceInstanceId,
+        epoch: u64,
+        result: &Result<String>,
+    ) {
         let terminal = match result {
             Ok(endpoint) => Terminal {
                 value: ModelLoadTerminal::Loaded { endpoint: endpoint.clone() },
@@ -395,14 +440,42 @@ impl ModelService {
                 latched_by: "model-service".to_owned(),
             },
         };
-        let key = ModelLoadKey { model_ref: model_ref.to_owned(), epoch };
+        let key = ModelLoadKey {
+            tenant: instance.tenant().to_owned(),
+            model_ref: instance.model_ref().to_owned(),
+            epoch,
+        };
         let _ = self.load_terminals.latch(key, terminal);
     }
 
-    fn inference_transport(model_ref_str: &str) -> TransportConfig {
-        let safe_name = model_ref_str.replace([':', '/', '\\'], "-");
-        let service_name = format!("inference-{safe_name}");
-        registry().endpoint(&service_name, SocketKind::Rep)
+    /// Build an instance key only from the authority-verified tenant binding.
+    fn inference_instance(
+        ctx: &EnvelopeContext,
+        model_ref_str: &str,
+    ) -> Result<InferenceInstanceId> {
+        InferenceInstanceId::new(&ctx.domain()?, model_ref_str, 0)
+    }
+
+    /// Enforce the configured fault-radius contract before touching model state.
+    fn admit_instance(&self, instance: &InferenceInstanceId) -> Result<()> {
+        self.config.inference_deployment.validate()?;
+        match &self.config.inference_deployment.isolation {
+            InferenceIsolationProfile::InProcess => {
+                admit_in_process_tenant(&self.in_process_tenant, instance.tenant())
+            }
+            InferenceIsolationProfile::PerTenantSubprocess
+            | InferenceIsolationProfile::PerTenantMicroVmTask { .. } => {
+                anyhow::bail!(
+                    "inference isolation profile {:?} requires the external tenant launcher; \
+                     refusing to downgrade to an in-process engine",
+                    self.config.inference_deployment.isolation
+                )
+            }
+        }
+    }
+
+    fn inference_transport(instance: &InferenceInstanceId) -> TransportConfig {
+        registry().endpoint(&instance.service_name(), SocketKind::Rep)
     }
 
     /// The deterministic InferenceService endpoint *string* for a model ref.
@@ -410,8 +483,8 @@ impl ModelService {
     /// Retained only for human-facing display and the JSON `model.loaded` event
     /// (`EventPayload::ModelLoaded`); the routable reach is the typed
     /// [`Self::inference_transport`] / the capnp `reach` list (#320).
-    fn inference_endpoint(model_ref_str: &str) -> String {
-        Self::inference_transport(model_ref_str).endpoint_string()
+    fn inference_endpoint(instance: &InferenceInstanceId) -> String {
+        Self::inference_transport(instance).endpoint_string()
     }
 
     /// The network-routable reach list a remote caller would use to dial this
@@ -682,14 +755,21 @@ impl ModelService {
     }
 
     /// Load a model by reference with optional per-model config, returns the inference endpoint
-    async fn load_model(&self, model_ref_str: &str, max_context: Option<u32>, kv_quant: Option<KVQuantType>) -> Result<String> {
+    async fn load_model(
+        &self,
+        instance: &InferenceInstanceId,
+        max_context: Option<u32>,
+        kv_quant: Option<KVQuantType>,
+    ) -> Result<String> {
+        self.admit_instance(instance)?;
+        let model_ref_str = instance.model_ref();
         // Check if already loaded
         {
             let mut cache = self.loaded_models.write().await;
-            if let Some(model) = cache.get_mut(model_ref_str) {
+            if let Some(model) = cache.get_mut(instance) {
                 model.last_used = Instant::now();
                 debug!("Model {} already loaded", model_ref_str);
-                return Ok(Self::inference_endpoint(model_ref_str));
+                return Ok(Self::inference_endpoint(instance));
             }
         }
 
@@ -698,7 +778,7 @@ impl ModelService {
         // HashSet::insert returns false if the value was already present.
         {
             let mut pending = self.pending_loads.lock().await;
-            if !pending.insert(model_ref_str.to_owned()) {
+            if !pending.insert(instance.clone()) {
                 anyhow::bail!(
                     "Model {} is already being loaded — please retry shortly",
                     model_ref_str
@@ -711,14 +791,14 @@ impl ModelService {
         // terminal latches under a new key (reload ⇒ new terminal).
         let epoch = self.allocate_load_epoch();
 
-        let result = self.load_model_inner(model_ref_str, max_context, kv_quant).await;
+        let result = self.load_model_inner(instance, max_context, kv_quant).await;
 
         // Always remove from pending, whether load succeeded or failed
-        self.pending_loads.lock().await.remove(model_ref_str);
+        self.pending_loads.lock().await.remove(instance);
 
         // EV7/#649: latch the retained terminal (Loaded / LoadFailed) for this
         // load attempt — the host-side retain a late `load --wait` reads.
-        self.latch_load_terminal(model_ref_str, epoch, &result);
+        self.latch_load_terminal(instance, epoch, &result);
 
         if result.is_ok() {
             info!("Model {} loaded successfully", model_ref_str);
@@ -727,7 +807,13 @@ impl ModelService {
     }
 
     /// Inner model loading logic, called by load_model() which manages pending_loads.
-    async fn load_model_inner(&self, model_ref_str: &str, max_context: Option<u32>, kv_quant: Option<KVQuantType>) -> Result<String> {
+    async fn load_model_inner(
+        &self,
+        instance: &InferenceInstanceId,
+        max_context: Option<u32>,
+        kv_quant: Option<KVQuantType>,
+    ) -> Result<String> {
+        let model_ref_str = instance.model_ref();
         // Parse/resolve model reference
         let model_ref = self.resolve_model_ref(model_ref_str).await?;
 
@@ -755,7 +841,7 @@ impl ModelService {
             ));
         }
 
-        let endpoint = Self::inference_endpoint(model_ref_str);
+        let endpoint = Self::inference_endpoint(instance);
 
         info!("Loading model {} at endpoint {}", model_ref_str, endpoint);
 
@@ -763,6 +849,17 @@ impl ModelService {
         let runtime_config = RuntimeConfig {
             max_context: max_context.or(self.config.max_context),
             kv_quant_type: kv_quant.unwrap_or(self.config.kv_quant),
+            use_gpu: self.config.inference_deployment.compute != InferenceCompute::Cpu,
+            gpu_device_id: if self.config.inference_deployment.compute == InferenceCompute::Cpu {
+                None
+            } else {
+                RuntimeConfig::default().gpu_device_id
+            },
+            devices: if self.config.inference_deployment.compute == InferenceCompute::Cpu {
+                Vec::new()
+            } else {
+                RuntimeConfig::default().devices
+            },
             ..Default::default()
         };
 
@@ -779,7 +876,7 @@ impl ModelService {
         // the inference client path. (The cross-host/Iroh reach is resolved via
         // the Resolver when an inference service has a network endpoint; pkarr
         // auto-discovery stays deferred to #282.)
-        let transport = Self::inference_transport(model_ref_str);
+        let transport = Self::inference_transport(instance);
         let mut service_config = crate::services::InferenceServiceConfig::new(
             &model_path,
             runtime_config,
@@ -787,6 +884,11 @@ impl ModelService {
             self.signing_key.clone(),
             transport.clone(),
             fs,
+        )
+        .with_instance_identity(
+            instance.service_name(),
+            instance.tenant().to_owned(),
+            self.signing_key.verifying_key(),
         );
         if let Some(ref aud) = self.expected_audience {
             service_config = service_config.with_expected_audience(aud.clone());
@@ -835,7 +937,11 @@ impl ModelService {
             let mut cache = self.loaded_models.write().await;
             if cache.len() >= self.config.max_models {
                 if let Some((evicted_ref, mut evicted)) = cache.pop_lru() {
-                    info!("Evicting model {} to load {}", evicted_ref, model_ref_str);
+                    info!(
+                        "Evicting model {} to load {}",
+                        evicted_ref.model_ref(),
+                        model_ref_str
+                    );
                     // Stop the evicted service in background (fire-and-forget)
                     #[allow(clippy::let_underscore_future)]
                     let _ = tokio::spawn(async move {
@@ -846,8 +952,9 @@ impl ModelService {
 
             // Add to cache
             cache.put(
-                model_ref_str.to_owned(),
+                instance.clone(),
                 LoadedModel {
+                    instance: instance.clone(),
                     model_ref: model_ref_str.to_owned(),
                     transport: transport.clone(),
                     service_handle,
@@ -885,9 +992,10 @@ impl ModelService {
     }
 
     /// Unload a model
-    async fn unload_model(&self, model_ref_str: &str) -> Result<()> {
+    async fn unload_model(&self, instance: &InferenceInstanceId) -> Result<()> {
+        let model_ref_str = instance.model_ref();
         let mut cache = self.loaded_models.write().await;
-        if let Some((_, mut model)) = cache.pop_entry(model_ref_str) {
+        if let Some((_, mut model)) = cache.pop_entry(instance) {
             info!("Unloading model {}", model_ref_str);
             let _ = model.service_handle.stop().await;
             let model_name = model_ref_str.split(':').next().unwrap_or(model_ref_str);
@@ -935,11 +1043,12 @@ impl ModelService {
 
     /// Return status entries for all known models (loaded + loading).
     /// Absence from this list means unloaded.
-    async fn model_status_all(&self) -> Vec<GenModelStatusEntry> {
+    async fn model_status_all(&self, verified_tenant: &str) -> Vec<GenModelStatusEntry> {
         let cache = self.loaded_models.read().await;
         let pending = self.pending_loads.lock().await;
         let mut entries: Vec<GenModelStatusEntry> = cache
             .iter()
+            .filter(|(instance, _)| instance.tenant() == verified_tenant)
             .map(|(_, model)| GenModelStatusEntry {
                 model_ref: model.model_ref.clone(),
                 status: "loaded".to_owned(),
@@ -952,10 +1061,10 @@ impl ModelService {
                 generation_defaults: Self::sampling_params_to_wire(&model.generation_defaults),
             })
             .collect();
-        for model_ref in pending.iter() {
-            if !cache.contains(model_ref) {
+        for instance in pending.iter().filter(|instance| instance.tenant() == verified_tenant) {
+            if !cache.contains(instance) {
                 entries.push(GenModelStatusEntry {
-                    model_ref: model_ref.clone(),
+                    model_ref: instance.model_ref().to_owned(),
                     status: "loading".to_owned(),
                     reach: Vec::new(),
                     loaded_at: 0,
@@ -969,11 +1078,11 @@ impl ModelService {
     }
 
     /// Return status entry for a specific model ref (0 or 1 element).
-    async fn model_status_single(&self, model_ref_str: &str) -> Vec<GenModelStatusEntry> {
+    async fn model_status_single(&self, instance: &InferenceInstanceId) -> Vec<GenModelStatusEntry> {
         let cache = self.loaded_models.read().await;
-        if let Some(model) = cache.peek(model_ref_str) {
+        if let Some(model) = cache.peek(instance) {
             return vec![GenModelStatusEntry {
-                model_ref: model_ref_str.to_owned(),
+                model_ref: instance.model_ref().to_owned(),
                 status: "loaded".to_owned(),
                 reach: Self::model_reach(&model.transport),
                 loaded_at: model.loaded_at.elapsed().as_millis() as i64,
@@ -985,9 +1094,9 @@ impl ModelService {
             }];
         }
         let pending = self.pending_loads.lock().await;
-        if pending.contains(model_ref_str) {
+        if pending.contains(instance) {
             vec![GenModelStatusEntry {
-                model_ref: model_ref_str.to_owned(),
+                model_ref: instance.model_ref().to_owned(),
                 status: "loading".to_owned(),
                 reach: Vec::new(),
                 loaded_at: 0,
@@ -1001,9 +1110,9 @@ impl ModelService {
     }
 
     /// Get model status
-    async fn model_status(&self, model_ref_str: &str) -> ModelStatusResponse {
+    async fn model_status(&self, instance: &InferenceInstanceId) -> ModelStatusResponse {
         let cache = self.loaded_models.read().await;
-        if let Some(model) = cache.peek(model_ref_str) {
+        if let Some(model) = cache.peek(instance) {
             ModelStatusResponse {
                 loaded: true,
                 reach: Self::model_reach(&model.transport),
@@ -1017,10 +1126,11 @@ impl ModelService {
         }
     }
     async fn get_inference_client(&self, model_ref_str: &str, ctx: &EnvelopeContext) -> Result<InferenceClient> {
-        let _endpoint = self.load_model(model_ref_str, None, None).await?;
+        let instance = Self::inference_instance(ctx, model_ref_str)?;
+        let _endpoint = self.load_model(&instance, None, None).await?;
         let mut cache = self.loaded_models.write().await;
         let model = cache
-            .get_mut(model_ref_str)
+            .get_mut(&instance)
             .ok_or_else(|| anyhow!("Model {} not found after loading", model_ref_str))?;
         model.last_used = Instant::now();
         // #322 placement key. The envelope does not yet carry an explicit
@@ -1206,7 +1316,7 @@ impl TttHandler for ModelService {
     }
 
     async fn handle_write_ttt_config(
-        &self, _ctx: &EnvelopeContext, _request_id: u64,
+        &self, ctx: &EnvelopeContext, _request_id: u64,
         model_ref: &str, data: &WriteTttConfigRequest,
     ) -> Result<()> {
         // 1. Parse/resolve model ref and resolve worktree path
@@ -1269,14 +1379,15 @@ impl TttHandler for ModelService {
 
         // 5. Auto-reload if requested and model is loaded
         if data.auto_reload {
+            let instance = Self::inference_instance(ctx, model_ref)?;
             let is_loaded = {
                 let cache = self.loaded_models.read().await;
-                cache.contains(model_ref)
+                cache.contains(&instance)
             };
             if is_loaded {
                 info!("Auto-reloading {} after TTT config change", model_ref);
-                self.unload_model(model_ref).await?;
-                self.load_model(model_ref, None, None).await?;
+                self.unload_model(&instance).await?;
+                self.load_model(&instance, None, None).await?;
             }
         }
 
@@ -1403,9 +1514,10 @@ impl InferHandler for ModelService {
     }
 
     async fn handle_status(
-        &self, _ctx: &EnvelopeContext, _request_id: u64, model_ref: &str,
+        &self, ctx: &EnvelopeContext, _request_id: u64, model_ref: &str,
     ) -> Result<ModelStatusResponse> {
-        Ok(self.model_status(model_ref).await)
+        let instance = Self::inference_instance(ctx, model_ref)?;
+        Ok(self.model_status(&instance).await)
     }
 }
 
@@ -1426,16 +1538,17 @@ impl ModelHandler for ModelService {
     }
 
     async fn handle_load(
-        &self, _ctx: &EnvelopeContext, _request_id: u64,
+        &self, ctx: &EnvelopeContext, _request_id: u64,
         data: &LoadModelRequest,
     ) -> Result<ModelResponseVariant> {
         let max_ctx = data.max_context.filter(|&n| n != 0);
         let kv_q = data.kv_quant.filter(|q| *q != KVQuantType::None);
         let model_ref = &data.model_ref;
-        match self.load_model(model_ref, max_ctx, kv_q).await {
+        let instance = Self::inference_instance(ctx, model_ref)?;
+        match self.load_model(&instance, max_ctx, kv_q).await {
             Ok(_endpoint) => Ok(ModelResponseVariant::LoadResult(LoadedModelResponse {
                 model_ref: model_ref.to_owned(),
-                reach: Self::model_reach(&Self::inference_transport(model_ref)),
+                reach: Self::model_reach(&Self::inference_transport(&instance)),
             })),
             Err(e) => Ok(ModelResponseVariant::Error(ErrorInfo {
                 message: format!("Failed to load model: {e}"),
@@ -1446,11 +1559,12 @@ impl ModelHandler for ModelService {
     }
 
     async fn handle_unload(
-        &self, _ctx: &EnvelopeContext, _request_id: u64,
+        &self, ctx: &EnvelopeContext, _request_id: u64,
         data: &UnloadModelRequest,
     ) -> Result<ModelResponseVariant> {
         let model_ref = &data.model_ref;
-        match self.unload_model(model_ref).await {
+        let instance = Self::inference_instance(ctx, model_ref)?;
+        match self.unload_model(&instance).await {
             Ok(()) => Ok(ModelResponseVariant::UnloadResult),
             Err(e) => Ok(ModelResponseVariant::Error(ErrorInfo {
                 message: format!("Failed to unload model: {e}"),
@@ -1461,30 +1575,36 @@ impl ModelHandler for ModelService {
     }
 
     async fn handle_status(
-        &self, _ctx: &EnvelopeContext, _request_id: u64,
+        &self, ctx: &EnvelopeContext, _request_id: u64,
         data: &StatusRequest,
     ) -> Result<ModelResponseVariant> {
+        let tenant = ctx.domain()?;
         let entries = if data.model_ref.is_empty() {
-            self.model_status_all().await
+            self.model_status_all(&tenant).await
         } else {
-            self.model_status_single(&data.model_ref).await
+            let instance = InferenceInstanceId::new(&tenant, &data.model_ref, 0)?;
+            self.model_status_single(&instance).await
         };
         Ok(ModelResponseVariant::StatusResult(entries))
     }
 
     async fn handle_health_check(
-        &self, _ctx: &EnvelopeContext, _request_id: u64,
+        &self, ctx: &EnvelopeContext, _request_id: u64,
     ) -> Result<ModelResponseVariant> {
+        let tenant = ctx.domain()?;
         let cache = self.loaded_models.read().await;
-                let loaded_count = cache.len() as u32;
-                let max_models = self.config.max_models as u32;
-                drop(cache);
-                Ok(ModelResponseVariant::HealthCheckResult(ModelHealthStatus {
-                    status: "healthy".into(),
-                    loaded_model_count: loaded_count,
-                    max_models,
-                    total_memory_bytes: 0,
-                }))
+        let loaded_count = cache
+            .iter()
+            .filter(|(instance, _)| instance.tenant() == tenant.as_str())
+            .count() as u32;
+        let max_models = self.config.max_models as u32;
+        drop(cache);
+        Ok(ModelResponseVariant::HealthCheckResult(ModelHealthStatus {
+            status: "healthy".into(),
+            loaded_model_count: loaded_count,
+            max_models,
+            total_memory_bytes: 0,
+        }))
     }
 }
 
@@ -1502,15 +1622,26 @@ use crate::services::fs::{SyntheticTree, SyntheticNode, SyntheticQid};
 use hyprstream_vfs::DirEntry;
 
 impl ModelService {
-    /// Get the persistent synthetic 9P tree (lazily initialized).
-    fn fs_tree(&self) -> &SyntheticTree {
-        self.inner.fs_tree.get_or_init(|| self.build_fs_tree())
+    /// Get the persistent tenant-partitioned synthetic 9P tree.
+    fn fs_tree(&self, verified_tenant: &str) -> Arc<SyntheticTree> {
+        if let Some(tree) = self.inner.fs_trees.get(verified_tenant) {
+            return Arc::clone(tree.value());
+        }
+        let tree = Arc::new(self.build_fs_tree(verified_tenant.to_owned()));
+        let entry = self
+            .inner
+            .fs_trees
+            .entry(verified_tenant.to_owned())
+            .or_insert(tree);
+        Arc::clone(entry.value())
     }
 
     /// Build a synthetic 9P tree from current model service state.
-    fn build_fs_tree(&self) -> SyntheticTree {
+    fn build_fs_tree(&self, verified_tenant: String) -> SyntheticTree {
         let inner_list = Arc::clone(&self.inner);
         let inner_resolve = Arc::clone(&self.inner);
+        let list_tenant = verified_tenant.clone();
+        let resolve_tenant = verified_tenant;
 
         SyntheticTree::new(SyntheticNode::DynamicDir {
             list: Box::new(move || {
@@ -1518,19 +1649,40 @@ impl ModelService {
                 let pending = inner_list.pending_loads.blocking_lock();
                 let mut entries: Vec<DirEntry> = cache
                     .iter()
-                    .map(|(name, _)| DirEntry { name: name.clone(), is_dir: true, size: 0, stat: None })
+                    .filter(|(instance, _)| instance.tenant() == list_tenant)
+                    .map(|(instance, _)| DirEntry {
+                        name: instance.service_name(),
+                        is_dir: true,
+                        size: 0,
+                        stat: None,
+                    })
                     .collect();
-                for name in pending.iter() {
-                    if !cache.contains(name) {
-                        entries.push(DirEntry { name: name.clone(), is_dir: true, size: 0, stat: None });
+                for instance in pending
+                    .iter()
+                    .filter(|instance| instance.tenant() == list_tenant)
+                {
+                    if !cache.contains(instance) {
+                        entries.push(DirEntry {
+                            name: instance.service_name(),
+                            is_dir: true,
+                            size: 0,
+                            stat: None,
+                        });
                     }
                 }
                 entries
             }),
             resolve: Box::new(move |ref_name| {
                 let cache = inner_resolve.loaded_models.blocking_read();
-                let is_loaded = cache.contains(ref_name);
-                let defaults_json = if let Some(model) = cache.peek(ref_name) {
+                let model = cache
+                    .iter()
+                    .find(|(instance, _)| {
+                        instance.tenant() == resolve_tenant
+                            && instance.service_name() == ref_name
+                    })
+                    .map(|(_, model)| model);
+                let is_loaded = model.is_some();
+                let defaults_json = if let Some(model) = model {
                     serde_json::to_vec_pretty(&model.generation_defaults).unwrap_or_default()
                 } else {
                     b"{}".to_vec()
@@ -1566,7 +1718,7 @@ impl FsHandler for ModelService {
     async fn handle_walk(&self, ctx: &EnvelopeContext, _request_id: u64,
         _model_ref: &str, data: &NpWalk,
     ) -> Result<RWalk> {
-        let tree = self.fs_tree();
+        let tree = self.fs_tree(&ctx.domain()?);
         let owner = ctx.subject().to_string();
         let (_fid, qid) = tree.walk(&data.wnames, &owner, Some(data.newfid))
             .map_err(|e| anyhow::anyhow!(e))?;
@@ -1576,7 +1728,7 @@ impl FsHandler for ModelService {
     async fn handle_open(&self, ctx: &EnvelopeContext, _request_id: u64,
         _model_ref: &str, data: &NpOpen,
     ) -> Result<ROpen> {
-        let tree = self.fs_tree();
+        let tree = self.fs_tree(&ctx.domain()?);
         let owner = ctx.subject().to_string();
         // Re-walk to get the fid, then open.
         let (qid, iounit) = tree.open(data.fid, data.mode, &owner)
@@ -1587,7 +1739,7 @@ impl FsHandler for ModelService {
     async fn handle_read(&self, ctx: &EnvelopeContext, _request_id: u64,
         _model_ref: &str, data: &NpRead,
     ) -> Result<RRead> {
-        let tree = self.fs_tree();
+        let tree = self.fs_tree(&ctx.domain()?);
         let owner = ctx.subject().to_string();
         let bytes = tree.read(data.fid, data.offset, data.count, &owner)
             .map_err(|e| anyhow::anyhow!(e))?;
@@ -1597,7 +1749,7 @@ impl FsHandler for ModelService {
     async fn handle_write(&self, ctx: &EnvelopeContext, _request_id: u64,
         _model_ref: &str, data: &NpWrite,
     ) -> Result<RWrite> {
-        let tree = self.fs_tree();
+        let tree = self.fs_tree(&ctx.domain()?);
         let subject = ctx.subject();
         let owner = subject.to_string();
         let count = tree.write(data.fid, data.offset, &data.data, &owner, &subject)
@@ -1608,7 +1760,7 @@ impl FsHandler for ModelService {
     async fn handle_clunk(&self, ctx: &EnvelopeContext, _request_id: u64,
         _model_ref: &str, data: &NpClunk,
     ) -> Result<()> {
-        let tree = self.fs_tree();
+        let tree = self.fs_tree(&ctx.domain()?);
         let owner = ctx.subject().to_string();
         tree.clunk(data.fid, &owner);
         Ok(())
@@ -1617,7 +1769,7 @@ impl FsHandler for ModelService {
     async fn handle_stat(&self, ctx: &EnvelopeContext, _request_id: u64,
         _model_ref: &str, data: &NpStatReq,
     ) -> Result<RStat> {
-        let tree = self.fs_tree();
+        let tree = self.fs_tree(&ctx.domain()?);
         let owner = ctx.subject().to_string();
         let (qid, name) = tree.stat(data.fid, &owner)
             .map_err(|e| anyhow::anyhow!(e))?;
@@ -1729,10 +1881,23 @@ impl crate::services::RequestService for ModelService {
         // Instead, return an immediate "accepted" response and do the actual
         // load in a Continuation (spawned via spawn_local after the REP is sent).
         if let Some((request_id, load_data)) = Self::try_parse_load_request(payload) {
+            // This fast path bypasses generated dispatch, so reproduce its
+            // mandatory operation-level authorization and audit record exactly
+            // (`load` is `$scope(write)` in model.capnp).
+            let audit_resource = "model:Load";
+            let authorization =
+                <Self as ModelHandler>::authorize(self, ctx, audit_resource, "write").await;
+            ctx.audit_authz(audit_resource, "write", authorization.is_ok());
+            authorization?;
+
+            // This interception runs before generated dispatch, so derive the
+            // instance only from the already-verified tenant in the envelope.
+            let instance = Self::inference_instance(ctx, &load_data.model_ref)?;
+            self.admit_instance(&instance)?;
             // Fast path: if already loaded or already loading, return immediately
             {
                 let mut cache = self.loaded_models.write().await;
-                if let Some(model) = cache.get_mut(&load_data.model_ref) {
+                if let Some(model) = cache.get_mut(&instance) {
                     model.last_used = Instant::now();
                     let response = serialize_response(request_id, &ModelResponseVariant::LoadResult(
                         LoadedModelResponse {
@@ -1747,12 +1912,12 @@ impl crate::services::RequestService for ModelService {
             // without spawning a duplicate continuation
             {
                 let pending = self.pending_loads.lock().await;
-                if pending.contains(&load_data.model_ref) {
+                if pending.contains(&instance) {
                     debug!("Model {} already being loaded, deduplicating", load_data.model_ref);
                     let response = serialize_response(request_id, &ModelResponseVariant::LoadResult(
                         LoadedModelResponse {
                             model_ref: load_data.model_ref.clone(),
-                            reach: Self::model_reach(&Self::inference_transport(&load_data.model_ref)),
+                            reach: Self::model_reach(&Self::inference_transport(&instance)),
                         },
                     ))?;
                     return Ok((response, None));
@@ -1766,7 +1931,7 @@ impl crate::services::RequestService for ModelService {
             let response = serialize_response(request_id, &ModelResponseVariant::LoadResult(
                 LoadedModelResponse {
                     model_ref: model_ref.clone(),
-                    reach: Self::model_reach(&Self::inference_transport(&model_ref)),
+                    reach: Self::model_reach(&Self::inference_transport(&instance)),
                 },
             ))?;
 
@@ -1775,7 +1940,7 @@ impl crate::services::RequestService for ModelService {
             let continuation: crate::services::Continuation = Box::pin(async move {
                 let model_name = model_ref.split(':').next().unwrap_or(&model_ref);
                 let scope = format!("serve:model:{}", model_name);
-                match service.load_model(&model_ref, load_max_context, load_kv_quant).await {
+                match service.load_model(&instance, load_max_context, load_kv_quant).await {
                     Ok(endpoint) => {
                         info!("Model {} loaded successfully at {}", model_ref, endpoint);
                         let event = crate::events::EventEnvelope::new(
@@ -1868,6 +2033,10 @@ mod tests {
         assert_eq!(config.max_models, 5);
         assert_eq!(config.max_context, None);
         assert_eq!(config.kv_quant, KVQuantType::None);
+        assert_eq!(
+            config.inference_deployment.isolation,
+            InferenceIsolationProfile::InProcess
+        );
     }
 
     // ========================================================================
@@ -1911,7 +2080,11 @@ mod tests {
     #[test]
     fn load_terminal_is_monotonic_write_once_per_epoch() {
         let store: TerminalStore<ModelLoadKey, ModelLoadTerminal> = TerminalStore::new();
-        let key = ModelLoadKey { model_ref: "qwen3:main".to_owned(), epoch: 1 };
+        let key = ModelLoadKey {
+            tenant: "tenant-a".to_owned(),
+            model_ref: "qwen3:main".to_owned(),
+            epoch: 1,
+        };
         assert!(store.latch(key.clone(), loaded_term("ep1")));
         // A late failure for the SAME attempt cannot overwrite the real Loaded.
         assert!(!store.latch(key.clone(), failed_term("race")));
@@ -1928,10 +2101,18 @@ mod tests {
     fn reload_latches_new_terminal_under_new_epoch() {
         let store: TerminalStore<ModelLoadKey, ModelLoadTerminal> = TerminalStore::new();
         // First load attempt (epoch 1): Loaded.
-        let k1 = ModelLoadKey { model_ref: "qwen3:main".to_owned(), epoch: 1 };
+        let k1 = ModelLoadKey {
+            tenant: "tenant-a".to_owned(),
+            model_ref: "qwen3:main".to_owned(),
+            epoch: 1,
+        };
         assert!(store.latch(k1.clone(), loaded_term("ep1")));
         // Reload (epoch 2): a distinct key, so it latches a fresh terminal.
-        let k2 = ModelLoadKey { model_ref: "qwen3:main".to_owned(), epoch: 2 };
+        let k2 = ModelLoadKey {
+            tenant: "tenant-a".to_owned(),
+            model_ref: "qwen3:main".to_owned(),
+            epoch: 2,
+        };
         assert!(store.latch(k2.clone(), loaded_term("ep2")));
         // Both attempts' terminals are retained (monotonic per-epoch).
         assert_eq!(
@@ -1950,12 +2131,49 @@ mod tests {
     #[test]
     fn failed_then_reload_latches_distinct_terminals() {
         let store: TerminalStore<ModelLoadKey, ModelLoadTerminal> = TerminalStore::new();
-        let kf = ModelLoadKey { model_ref: "qwen3:main".to_owned(), epoch: 1 };
+        let kf = ModelLoadKey {
+            tenant: "tenant-a".to_owned(),
+            model_ref: "qwen3:main".to_owned(),
+            epoch: 1,
+        };
         assert!(store.latch(kf.clone(), failed_term("oom")));
-        let ks = ModelLoadKey { model_ref: "qwen3:main".to_owned(), epoch: 2 };
+        let ks = ModelLoadKey {
+            tenant: "tenant-a".to_owned(),
+            model_ref: "qwen3:main".to_owned(),
+            epoch: 2,
+        };
         assert!(store.latch(ks.clone(), loaded_term("ep2")));
         assert!(matches!(latched_value(&store, &kf), ModelLoadTerminal::LoadFailed { .. }));
         assert!(matches!(latched_value(&store, &ks), ModelLoadTerminal::Loaded { .. }));
+    }
+
+    #[test]
+    fn load_terminals_are_tenant_scoped() {
+        let store: TerminalStore<ModelLoadKey, ModelLoadTerminal> = TerminalStore::new();
+        let tenant_a = ModelLoadKey {
+            tenant: "tenant-a".to_owned(),
+            model_ref: "qwen3:main".to_owned(),
+            epoch: 1,
+        };
+        let tenant_b = ModelLoadKey {
+            tenant: "tenant-b".to_owned(),
+            model_ref: "qwen3:main".to_owned(),
+            epoch: 1,
+        };
+        assert!(store.latch(tenant_a.clone(), loaded_term("a")));
+        assert!(store.latch(tenant_b.clone(), loaded_term("b")));
+        assert_ne!(
+            latched_value(&store, &tenant_a),
+            latched_value(&store, &tenant_b)
+        );
+    }
+
+    #[test]
+    fn in_process_profile_never_admits_two_tenants() {
+        let admitted = std::sync::OnceLock::new();
+        assert!(admit_in_process_tenant(&admitted, "tenant-a").is_ok());
+        assert!(admit_in_process_tenant(&admitted, "tenant-a").is_ok());
+        assert!(admit_in_process_tenant(&admitted, "tenant-b").is_err());
     }
 
     /// #320: the co-located InferenceService resolves (via the local Resolver
@@ -1965,12 +2183,14 @@ mod tests {
     fn inference_transport_is_inproc_co_located() {
         // Default registry mode is Inproc; idempotent if another test inited it.
         hyprstream_rpc::registry::init(hyprstream_rpc::registry::EndpointMode::Inproc, None);
-        let t = ModelService::inference_transport("qwen3-small:main");
+        let instance = InferenceInstanceId::new("tenant-a", "qwen3-small:main", 0)
+            .unwrap_or_else(|e| panic!("valid instance: {e}"));
+        let t = ModelService::inference_transport(&instance);
         match &t.endpoint {
             hyprstream_rpc::transport::EndpointType::Inproc { endpoint } => {
                 assert!(
-                    endpoint.contains("inference-qwen3-small-main"),
-                    "deterministic per-model inproc name, got {endpoint}"
+                    endpoint.contains("inference-"),
+                    "opaque deterministic per-tenant/model inproc name, got {endpoint}"
                 );
             }
             other => panic!("expected Inproc co-located transport, got {other:?}"),
