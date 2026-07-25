@@ -198,8 +198,33 @@ fn err_status(_code: &str) -> StatusCode {
 /// Constructed solely from [`VerifyFaceState`] (tunables + clock); no
 /// credential-bearing state is accepted, so none can be layered. The single
 /// route is `POST /at9p/verify`.
+///
+/// #1273 / epic #1267: the route is the one reviewed
+/// `mac::public_exemptions` entry for this face; the path/method are read from
+/// the registry so an unregistered change is caught at startup rather than
+/// silently bypassing MAC mediation.
 pub fn credential_free_router(state: VerifyFaceState) -> Router {
-    Router::new().route("/at9p/verify", post(verify_handler)).with_state(state)
+    use crate::mac::public_exemptions::{self, HttpFace, PublicRouteHandler, RouteMethod};
+
+    if let Err(error) = public_exemptions::validate() {
+        panic!("invalid public exemption registry: {error}");
+    }
+
+    let exemption = public_exemptions::require(HttpFace::At9pVerify, "at9p-verify");
+    // Fail closed if the registry and this builder disagree.
+    assert_eq!(
+        exemption.handler,
+        PublicRouteHandler::At9pVerify,
+        "at9p-verify exemption wired to the wrong handler"
+    );
+    assert_eq!(
+        exemption.method,
+        RouteMethod::Post,
+        "at9p-verify exemption must be POST"
+    );
+    Router::new()
+        .route(exemption.path, post(verify_handler))
+        .with_state(state)
 }
 
 /// The handler. Extracts only tunable state + the JSON body — no headers, no

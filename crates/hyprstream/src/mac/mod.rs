@@ -73,6 +73,11 @@ pub mod lattice;
 // wildcards expand at compile time over a closed registry).
 pub mod pep;
 pub mod permission_map;
+// #1273 (epic #1267): the reviewed public/declassifier exemption registry —
+// the explicit, pinned set of HTTP routes intentionally unmediated by native
+// MAC. Public routers derive from this so a new route must be added here (and
+// to the drift test) in the same reviewed PR.
+pub mod public_exemptions;
 pub mod te;
 
 // Re-export the per-op contract surface S2 (PEP) and S5/S6 (policy producers) consume.
