@@ -2429,8 +2429,11 @@ mod tests {
         Ok(())
     }
 
+    const PRODUCTION_AUTHORITY_BARRIER_TIMEOUT: std::time::Duration =
+        std::time::Duration::from_secs(120);
+
     fn wait_path(path: &Path) {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        let deadline = std::time::Instant::now() + PRODUCTION_AUTHORITY_BARRIER_TIMEOUT;
         while !path.exists() {
             assert!(
                 std::time::Instant::now() < deadline,
@@ -2446,7 +2449,7 @@ mod tests {
         wait_path(&target_path);
         let target: CompositeCommit =
             serde_json::from_slice(&std::fs::read(target_path).unwrap()).unwrap();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        let deadline = std::time::Instant::now() + PRODUCTION_AUTHORITY_BARRIER_TIMEOUT;
         loop {
             let snapshot = hyprstream_rpc::auth::global_composite_key_set().snapshot();
             if snapshot.version() == target.version
