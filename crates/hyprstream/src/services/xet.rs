@@ -97,15 +97,22 @@ pub struct XetState {
 pub struct XetService {
     config: XetConfig,
     tls_config: TlsConfig,
+    account_config: crate::account::AccountZoneConfig,
     state: XetState,
 }
 
 impl XetService {
     /// Create a new XetService.
-    pub fn new(config: XetConfig, tls_config: TlsConfig, state: XetState) -> Self {
+    pub fn new(
+        config: XetConfig,
+        tls_config: TlsConfig,
+        account_config: crate::account::AccountZoneConfig,
+        state: XetState,
+    ) -> Self {
         Self {
             config,
             tls_config,
+            account_config,
             state,
         }
     }
@@ -383,6 +390,7 @@ impl Spawnable for XetService {
 
             let rustls_config = resolve_rustls_config(
                 &self.tls_config,
+                &self.account_config,
                 self.config.tls_cert.as_ref(),
                 self.config.tls_key.as_ref(),
             )
@@ -528,7 +536,12 @@ mod tests {
     fn does_not_advertise_an_unserved_rpc_endpoint() {
         let dir = tempfile::tempdir().unwrap();
         let state = test_state_with_xorb(dir.path(), HASH, b"x");
-        let service = XetService::new(XetConfig::default(), TlsConfig::default(), state);
+        let service = XetService::new(
+            XetConfig::default(),
+            TlsConfig::default(),
+            crate::account::AccountZoneConfig::default(),
+            state,
+        );
         assert!(service.registrations().is_empty());
     }
 

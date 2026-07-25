@@ -167,6 +167,7 @@ pub async fn start_server_tls(
     let hypr_config = crate::config::HyprConfig::load().unwrap_or_default();
     let rustls_config = tls::resolve_rustls_config(
         &hypr_config.tls,
+        &hypr_config.account,
         hypr_config.oai.tls_cert.as_ref(),
         hypr_config.oai.tls_key.as_ref(),
     )

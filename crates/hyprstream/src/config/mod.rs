@@ -116,6 +116,16 @@ pub struct HyprConfig {
     #[serde(default)]
     pub tls: TlsConfig,
 
+    /// Account identity configuration (epic #1158, A3 / #1162).
+    ///
+    /// Names the deployment-chosen account zone, the zone-scoped DNS-01
+    /// credential, and the wildcard address targets. `Default` is the
+    /// **unconfigured** state — when the operator sets no `[account]` section,
+    /// did:web minting and DNS-01 wildcard TLS issuance degrade sanely (clear
+    /// error, no panic, no synthesized default zone name).
+    #[serde(default)]
+    pub account: crate::account::AccountZoneConfig,
+
     /// QUIC/WebTransport configuration
     ///
     /// Enabled by default. Services expose a WebTransport endpoint alongside ZMQ,
@@ -254,12 +264,17 @@ impl SecretsConfig {
 ///
 /// ```toml
 /// [tls]
-/// mode = "self-signed"   # or "acme" or "files"
+/// mode = "self-signed"   # or "acme", "acme-dns01", or "files"
 /// server_name = "localhost"
-/// # ACME mode:
+/// # ACME (HTTP-01/TLS-ALPN-01) mode:
 /// # acme_domain = "node.example.com"
 /// # acme_contact = "mailto:ops@example.com"
 /// # acme_cache_dir = "/var/lib/hyprstream/acme"
+/// # ACME DNS-01 wildcard mode (epic #1158 / A3 — the account zone):
+/// # mode = "acme-dns01"
+/// # [account]
+/// # zone = "acct.example.com"
+/// # dns01_credential = "ref:secretstore/account-zone-token"
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
@@ -267,8 +282,19 @@ pub enum TlsMode {
     /// Auto-generate a self-signed certificate at startup (dev/air-gapped only).
     #[default]
     SelfSigned,
-    /// Obtain a certificate automatically via ACME (RFC 8555) — Let's Encrypt or step-ca.
+    /// Obtain a certificate automatically via ACME (RFC 8555) — Let's Encrypt
+    /// or step-ca. Uses HTTP-01/TLS-ALPN-01 for a single named domain
+    /// (`acme_domain`). Does **not** support wildcard issuance.
     Acme,
+    /// DNS-01 wildcard issuance for the deployment's account zone (epic #1158,
+    /// A3 / #1162). Obtains a `*.<apex>` certificate using the zone-scoped
+    /// credential configured under `[account]`. Wildcards cannot use HTTP-01;
+    /// DNS-01 is the only validation method public CAs accept for `*.<apex>`.
+    ///
+    /// When the account zone is unconfigured this mode **degrades sanely** to
+    /// the existing self-signed/files materials — it never panics and never
+    /// synthesizes a zone name (one-way door #1).
+    AcmeDns01,
     /// Load certificate and key from `cert_path`/`key_path` (operator-managed).
     Files,
 }
@@ -2121,6 +2147,7 @@ pub struct HyprConfigBuilder {
     cluster_did_web: Option<String>,
     cluster_anchor_root_cert: Option<PathBuf>,
     cluster_remote_node: bool,
+    account: crate::account::AccountZoneConfig,
 }
 
 impl HyprConfigBuilder {
@@ -2154,6 +2181,7 @@ impl HyprConfigBuilder {
             cluster_did_web: None,
             cluster_anchor_root_cert: None,
             cluster_remote_node: false,
+            account: Default::default(),
         }
     }
 
@@ -2187,6 +2215,7 @@ impl HyprConfigBuilder {
             cluster_did_web: config.cluster_did_web,
             cluster_anchor_root_cert: config.cluster_anchor_root_cert,
             cluster_remote_node: config.cluster_remote_node,
+            account: config.account,
         }
     }
 
@@ -2238,6 +2267,7 @@ impl HyprConfigBuilder {
             cluster_did_web: self.cluster_did_web,
             cluster_anchor_root_cert: self.cluster_anchor_root_cert,
             cluster_remote_node: self.cluster_remote_node,
+            account: self.account,
             #[cfg(feature = "ledger")]
             ledger: Default::default(),
         }
