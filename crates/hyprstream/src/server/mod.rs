@@ -34,6 +34,13 @@ pub fn extract_user(auth_user: Option<&Extension<AuthenticatedUser>>) -> String 
 
 /// Create the main application router
 pub fn create_app(state: ServerState) -> Router {
+    // Validate the complete cross-face registry before constructing any live
+    // route. Duplicate ids/routes, empty justifications, or a face/handler
+    // mismatch are startup-fatal rather than test-only findings.
+    if let Err(error) = crate::mac::public_exemptions::validate() {
+        panic!("invalid public exemption registry: {error}");
+    }
+
     // H1b (#765): register the 9P-over-WebTransport handler for the QUIC
     // path-mux `/9p` arm, co-located with H1a's axum `/9p` WS route below so
     // both planes share one `ServerState` (export mount + ticket validator).
@@ -46,44 +53,16 @@ pub fn create_app(state: ServerState) -> Router {
     let timeout_duration = Duration::from_secs(state.config.request_timeout_secs);
     let resource_auth_state = state.resource_auth_state();
 
-    // Public browser provisioning is independently rate-limited before the
-    // handler can resolve accepted state or perform hybrid signing.
-    let browser_provisioning_routes = Router::new()
-        .route(
-            "/.well-known/hyprstream/browser-provisioning/:service",
-            get(routes::browser_provisioning::browser_provisioning),
-        )
-        .layer(axum_middleware::from_fn_with_state(
-            Arc::clone(&state.browser_provisioning_rate_limiter),
-            middleware::browser_provisioning_rate_limit_middleware,
-        ));
-
-    // Public routes (no auth required)
-    let public_routes = Router::new()
-        .route("/", get(health_check))
-        .route("/health", get(health_check))
-        .route(
-            "/.well-known/oauth-protected-resource",
-            get(oauth_protected_resource_metadata),
-        )
-        // 9P-over-WebSocket export (H1a / #764). Public routes: the mount
-        // ticket rides the URL query (browser WS can't set headers) and is
-        // validated inside the /9p handler, so these bypass `auth_middleware`
-        // (which requires an Authorization header).
-        .route(
-            "/.well-known/export9p",
-            get(routes::ninep::export9p_metadata),
-        )
-        // Wire-plane discovery table (#821 / epic #809): enumerates every
-        // non-file wire plane (9p, moq, …) → its current path + carriers, the
-        // source of truth a client resolves the `/9p` selector against instead
-        // of a hardcoded constant. Companions (does not replace) export9p.
-        .route(
-            "/.well-known/planes",
-            get(routes::ninep::wire_planes_metadata),
-        )
-        .route("/9p", get(routes::ninep::ninep_ws))
-        .merge(browser_provisioning_routes);
+    // Public routes (no auth required).
+    //
+    // #1273 / epic #1267: the unmediated public set is the reviewed
+    // `mac::public_exemptions` registry. These routes are built FROM the
+    // registry — adding an unmediated route requires appending a reviewed
+    // `PublicExemption` entry plus a handler arm below (two review surfaces).
+    // Every route NOT here stays on the protected (auth-mediated) router; the
+    // default is mediated, never permissive. See `mac::public_exemptions`.
+    let (public_routes, browser_provisioning_routes) =
+        build_public_routes_from_registry(Arc::clone(&state.browser_provisioning_rate_limiter));
 
     // Protected routes (auth required)
     let protected_routes = Router::new()
@@ -102,6 +81,7 @@ pub fn create_app(state: ServerState) -> Router {
         ));
 
     let mut app = public_routes
+        .merge(browser_provisioning_routes)
         .merge(protected_routes)
         // Add middleware (order matters: timeout should be before state)
         .layer(TimeoutLayer::with_status_code(StatusCode::REQUEST_TIMEOUT, timeout_duration))
@@ -114,6 +94,83 @@ pub fn create_app(state: ServerState) -> Router {
     }
 
     app
+}
+
+/// Build the main-app public (unmediated) routers from the reviewed
+/// `mac::public_exemptions` registry (#1273 / epic #1267).
+///
+/// Returns `(public_routes, browser_provisioning_routes)`. The caller merges
+/// them and applies `.with_state(state)`. Wiring is driven by iterating the
+/// registry, so an unmediated route cannot appear without a reviewed
+/// `PublicExemption` entry plus a handler arm in the exhaustive match below.
+fn build_public_routes_from_registry(
+    browser_provisioning_rate_limiter: Arc<crate::server::middleware::RateLimiter>,
+) -> (Router<ServerState>, Router<ServerState>) {
+    use crate::mac::public_exemptions::{for_face, HttpFace, PublicRouteHandler, RouteMethod};
+
+    let mut public_routes: Router<ServerState> = Router::new();
+    let mut browser_provisioning_routes: Router<ServerState> = Router::new();
+
+    for exemption in for_face(HttpFace::MainApp) {
+        // Every reviewed MainApp public route is GET today. Fail closed if a
+        // non-GET route is added: extend this builder with method dispatch and
+        // update the registry snapshot test in the same PR.
+        assert_eq!(
+            exemption.method,
+            RouteMethod::Get,
+            "non-GET MainApp public route {:?} requires method dispatch in \
+             build_public_routes_from_registry",
+            exemption.id,
+        );
+        // Exhaustive match: wiring a new public route requires a handler arm
+        // here AND a registry entry — the double review touch that keeps the
+        // exempt set from silently growing.
+        match exemption.handler {
+            PublicRouteHandler::HealthCheck => {
+                public_routes = public_routes.route(exemption.path, get(health_check));
+            }
+            PublicRouteHandler::OauthProtectedResourceMetadata => {
+                public_routes = public_routes
+                    .route(exemption.path, get(oauth_protected_resource_metadata));
+            }
+            PublicRouteHandler::Export9pMetadata => {
+                public_routes =
+                    public_routes.route(exemption.path, get(routes::ninep::export9p_metadata));
+            }
+            PublicRouteHandler::WirePlanesMetadata => {
+                public_routes =
+                    public_routes.route(exemption.path, get(routes::ninep::wire_planes_metadata));
+            }
+            PublicRouteHandler::NinepWebSocket => {
+                public_routes = public_routes.route(exemption.path, get(routes::ninep::ninep_ws));
+            }
+            PublicRouteHandler::BrowserProvisioning => {
+                // Public browser provisioning is independently rate-limited
+                // before the handler can resolve accepted state or perform
+                // hybrid signing; it rides its own sub-router + layer.
+                browser_provisioning_routes = browser_provisioning_routes
+                    .route(
+                        exemption.path,
+                        get(routes::browser_provisioning::browser_provisioning),
+                    )
+                    .layer(axum_middleware::from_fn_with_state(
+                        Arc::clone(&browser_provisioning_rate_limiter),
+                        middleware::browser_provisioning_rate_limit_middleware,
+                    ));
+            }
+            PublicRouteHandler::At9pVerify => {
+                // Lives on a separate credential-free face; validate() ensures
+                // it never appears under HttpFace::MainApp. Crashing here is the
+                // fail-closed response to a misconfigured registry.
+                unreachable!(
+                    "At9pVerify belongs to a separate face; mac::public_exemptions::validate() \
+                     should have prevented it appearing on HttpFace::MainApp"
+                );
+            }
+        }
+    }
+
+    (public_routes, browser_provisioning_routes)
 }
 
 /// Health check endpoint
@@ -180,4 +237,89 @@ pub async fn start_server_tls(
     tls::serve_app(addr, app, rustls_config, shutdown, "Hyprstream")
         .await
         .map_err(|e| anyhow::anyhow!("{}", e))
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::*;
+    use crate::mac::public_exemptions::{self, for_face, HttpFace};
+    use std::collections::BTreeSet;
+
+    /// Extract the concrete paths configured in an Axum router's live path
+    /// table. Axum has no public route-enumeration API; its `Debug`
+    /// implementation deliberately includes the path router's `Node.paths`
+    /// map. A dependency change that removes or changes that representation
+    /// fails this load-bearing test closed until the extractor is reviewed.
+    fn live_router_paths<S>(router: &Router<S>) -> BTreeSet<String> {
+        let debug = format!("{router:?}");
+        let path_router = debug
+            .split_once("path_router: ")
+            .map(|(_, rest)| rest)
+            .and_then(|rest| {
+                rest.split_once(", fallback_router: ")
+                    .map(|(paths, _)| paths)
+            })
+            .expect("Axum Router Debug must expose the live path_router");
+        let paths = path_router
+            .split_once("node: Node { paths: {")
+            .map(|(_, rest)| rest)
+            .and_then(|rest| rest.split_once("} }").map(|(paths, _)| paths))
+            .expect("Axum PathRouter Debug must expose the live Node.paths map");
+
+        paths
+            .split('"')
+            .skip(1)
+            .step_by(2)
+            .filter(|value| value.starts_with('/'))
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// #1273 load-bearing drift gate: the concrete, live public route table
+    /// must equal the reviewed registry exactly.
+    ///
+    /// This is intentionally stronger than checking that every registry entry
+    /// builds. Adding `.route("/bypass", ...)` directly to either public router
+    /// changes `live_router_paths` without changing the registry and fails this
+    /// equality. Conversely, a registry entry without a live route also fails.
+    /// Since the public set is exact, protected paths remain outside it and are
+    /// still mediated by `auth_middleware` when `create_app` merges the
+    /// protected router.
+    #[test]
+    fn public_exemptions_match_live_routes() {
+        public_exemptions::validate().expect("registry must be self-consistent before wiring");
+
+        let rate_limiter = Arc::new(middleware::RateLimiter::new(u32::MAX, 3600));
+        let (public, browser_provisioning) = build_public_routes_from_registry(rate_limiter);
+        let live = live_router_paths(&public.merge(browser_provisioning));
+        let registered = for_face(HttpFace::MainApp)
+            .map(|exemption| exemption.path.to_owned())
+            .collect::<BTreeSet<_>>();
+
+        assert_eq!(
+            live, registered,
+            "live unmediated main-app routes diverged from PUBLIC_EXEMPTIONS"
+        );
+        assert!(
+            !live.contains("/models") && !live.contains("/oai/v1"),
+            "protected route roots must never appear in the public router"
+        );
+
+        let at9p = crate::services::at9p_verify::credential_free_router(
+            crate::services::at9p_verify::VerifyFaceState {
+                max_skew_seconds: 300,
+                max_challenge_bytes: 256,
+            },
+        );
+        let live_at9p = live_router_paths(&at9p);
+        let registered_at9p = for_face(HttpFace::At9pVerify)
+            .map(|exemption| exemption.path.to_owned())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            live_at9p, registered_at9p,
+            "live unmediated at9p routes diverged from PUBLIC_EXEMPTIONS"
+        );
+    }
 }
