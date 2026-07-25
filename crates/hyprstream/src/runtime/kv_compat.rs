@@ -72,10 +72,16 @@ use sha2::{Digest, Sha256};
 /// produced (or persisted) under an older format version is **never** reused —
 /// the rejection policy treats a format-version mismatch as a hard reject.
 ///
-/// v2 adds the behavior-affecting effective-config fields (`use_qk_norm`,
-/// partial rotary dimension, attention layer layout, and linear-attention
-/// dimensions) that change KV byte-content without changing coarse geometry.
-pub const KV_COMPAT_FORMAT_VERSION: u32 = 2;
+/// v3 adds the remaining behavior-affecting effective model configuration:
+/// RMS/LayerNorm epsilon, activation/embedding/attention scaling, MoE routing,
+/// and local-RoPE/sliding-window settings. Two runs with identical weight bytes
+/// and coarse geometry can still produce different KV when any of these differ,
+/// so they are authoritative for reuse.
+///
+/// v2 added `use_qk_norm`, partial rotary dimension, attention layer layout,
+/// and linear-attention dimensions (K/V-value-affecting fields below coarse
+/// geometry).
+pub const KV_COMPAT_FORMAT_VERSION: u32 = 3;
 
 /// Default tokens-per-block for paged KV storage.
 ///
@@ -127,6 +133,23 @@ impl WeightIdentity {
         self.adapter_generation = generation;
         self
     }
+}
+
+/// Mixture-of-experts routing configuration. Different routing changes which
+/// expert FFN each token traverses, and therefore the residual — and thus later
+/// K/V — feeding downstream attention. A dense model (the default) is all-zero.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Default)]
+pub struct MoeRouting {
+    /// Whether this is a MoE model (e.g. `model_type` contains `"moe"`).
+    pub is_moe: bool,
+    /// Total number of experts.
+    pub num_experts: usize,
+    /// Experts activated per token (top-k routing).
+    pub num_experts_per_tok: usize,
+    /// Per-expert FFN intermediate size.
+    pub moe_intermediate_size: usize,
+    /// Shared-expert intermediate size (Qwen3.5 MoE), if any.
+    pub shared_expert_intermediate_size: usize,
 }
 
 // ===========================================================================
@@ -312,6 +335,33 @@ pub struct KvCompatDescriptor {
     pub linear_num_value_heads: usize,
     pub linear_conv_kernel_dim: usize,
 
+    // --- effective model config (changes hidden states / downstream K/V) ---
+    /// `f32::to_bits` of `rms_norm_eps`. The RMS epsilon changes the normalized
+    /// inputs to Q/K and every layer's residual, so it changes all downstream
+    /// K/V. Stored as bits for byte-stable hashing (no `f32` equality pitfalls).
+    pub rms_norm_eps_bits: u32,
+    /// `f32::to_bits` of `layer_norm_eps` when the architecture uses LayerNorm
+    /// instead of RMSNorm. `None` when LayerNorm is not in effect.
+    pub layer_norm_eps_bits: Option<u32>,
+    /// Activation function (e.g. `"silu"`, `"gelu_pytorch_tanh"`). A different
+    /// activation changes every FFN output and thus the residual feeding later
+    /// K/V. Canonicalized (trimmed, lowercased) at construction.
+    pub hidden_activation: String,
+    /// Whether embeddings are scaled before entering the stack (changes all
+    /// layer inputs and therefore all K/V).
+    pub scale_embeddings: bool,
+    /// `f32::to_bits` of `query_pre_attn_scalar` (Gemma attention logit scale),
+    /// when set. Changes the attention scores and thus the per-layer output.
+    pub query_pre_attn_scalar_bits: Option<u32>,
+    /// MoE routing config. `is_moe == false` and all-zero for a dense model.
+    pub moe: MoeRouting,
+    /// Sliding-window size for local-attention layers (Gemma3), when set.
+    /// Changes which tokens each local layer attends to and thus its K/V.
+    pub sliding_window: Option<usize>,
+    /// `f32::to_bits` of `rope_local_base_freq` (the RoPE theta used in local
+    /// layers, Gemma3), when set. Changes local-layer post-RoPE key values.
+    pub rope_local_base_freq_bits: Option<u32>,
+
     // --- position encoding (determines K values post-RoPE) ---
     /// `f32::to_bits` of `rope_theta`.
     pub rope_theta_bits: u32,
@@ -355,6 +405,26 @@ impl KvCompatDescriptor {
     /// Set the partial-rotary factor from an `f32` (canonicalized to bits).
     pub fn set_partial_rotary_factor(&mut self, factor: Option<f32>) {
         self.partial_rotary_factor_bits = factor.map(f32::to_bits);
+    }
+
+    /// Set the RMS norm epsilon from an `f32` (canonicalized to bits).
+    pub fn set_rms_norm_eps(&mut self, eps: f32) {
+        self.rms_norm_eps_bits = eps.to_bits();
+    }
+
+    /// Set the LayerNorm epsilon from an `f32`, or `None`.
+    pub fn set_layer_norm_eps(&mut self, eps: Option<f32>) {
+        self.layer_norm_eps_bits = eps.map(f32::to_bits);
+    }
+
+    /// Set the query pre-attention scalar from an `f32`, or `None`.
+    pub fn set_query_pre_attn_scalar(&mut self, scalar: Option<f32>) {
+        self.query_pre_attn_scalar_bits = scalar.map(f32::to_bits);
+    }
+
+    /// Set the local-RoPE base frequency from an `f32`, or `None`.
+    pub fn set_rope_local_base_freq(&mut self, freq: Option<f32>) {
+        self.rope_local_base_freq_bits = freq.map(f32::to_bits);
     }
 
     /// True iff every authoritative identity axis is populated.
@@ -420,6 +490,20 @@ impl KvCompatDescriptor {
         put_usize(hash, self.linear_num_key_heads);
         put_usize(hash, self.linear_num_value_heads);
         put_usize(hash, self.linear_conv_kernel_dim);
+
+        // Effective model config (changes hidden states / downstream K/V).
+        put_u32(hash, self.rms_norm_eps_bits);
+        put_opt_u32(hash, self.layer_norm_eps_bits);
+        put_str(hash, &canon_str(&self.hidden_activation));
+        put_bool(hash, self.scale_embeddings);
+        put_opt_u32(hash, self.query_pre_attn_scalar_bits);
+        put_bool(hash, self.moe.is_moe);
+        put_usize(hash, self.moe.num_experts);
+        put_usize(hash, self.moe.num_experts_per_tok);
+        put_usize(hash, self.moe.moe_intermediate_size);
+        put_usize(hash, self.moe.shared_expert_intermediate_size);
+        put_opt_usize(hash, self.sliding_window);
+        put_opt_u32(hash, self.rope_local_base_freq_bits);
 
         put_u32(hash, self.rope_theta_bits);
         match &self.rope_scaling {
@@ -541,6 +625,39 @@ pub enum KvCompatMismatch {
         expected: Vec<String>,
         observed: Vec<String>,
     },
+    /// Effective model config (changes hidden states / downstream K/V).
+    RmsNormEps {
+        expected_bits: u32,
+        observed_bits: u32,
+    },
+    LayerNormEps {
+        expected_bits: Option<u32>,
+        observed_bits: Option<u32>,
+    },
+    HiddenActivation {
+        expected: String,
+        observed: String,
+    },
+    ScaleEmbeddings {
+        expected: bool,
+        observed: bool,
+    },
+    QueryPreAttnScalar {
+        expected_bits: Option<u32>,
+        observed_bits: Option<u32>,
+    },
+    MoeRouting {
+        expected: MoeRouting,
+        observed: MoeRouting,
+    },
+    SlidingWindow {
+        expected: Option<usize>,
+        observed: Option<usize>,
+    },
+    RopeLocalBaseFreq {
+        expected_bits: Option<u32>,
+        observed_bits: Option<u32>,
+    },
     RopeTheta {
         expected_bits: u32,
         observed_bits: u32,
@@ -624,6 +741,50 @@ impl std::fmt::Display for KvCompatMismatch {
             KvCompatMismatch::LayerTypes { expected, observed } => write!(
                 f,
                 "KV compat mismatch: layer_types (expected {expected:?}, observed {observed:?})"
+            ),
+            KvCompatMismatch::RmsNormEps {
+                expected_bits,
+                observed_bits,
+            } => write!(
+                f,
+                "KV compat mismatch: rms_norm_eps (expected bits {expected_bits:#x}, observed bits {observed_bits:#x})"
+            ),
+            KvCompatMismatch::LayerNormEps {
+                expected_bits,
+                observed_bits,
+            } => write!(
+                f,
+                "KV compat mismatch: layer_norm_eps (expected bits {expected_bits:?}, observed bits {observed_bits:?})"
+            ),
+            KvCompatMismatch::HiddenActivation { expected, observed } => write!(
+                f,
+                "KV compat mismatch: hidden_activation (expected {expected:?}, observed {observed:?})"
+            ),
+            KvCompatMismatch::ScaleEmbeddings { expected, observed } => write!(
+                f,
+                "KV compat mismatch: scale_embeddings (expected {expected}, observed {observed})"
+            ),
+            KvCompatMismatch::QueryPreAttnScalar {
+                expected_bits,
+                observed_bits,
+            } => write!(
+                f,
+                "KV compat mismatch: query_pre_attn_scalar (expected bits {expected_bits:?}, observed bits {observed_bits:?})"
+            ),
+            KvCompatMismatch::MoeRouting { expected, observed } => write!(
+                f,
+                "KV compat mismatch: moe routing (expected {expected:?}, observed {observed:?})"
+            ),
+            KvCompatMismatch::SlidingWindow { expected, observed } => write!(
+                f,
+                "KV compat mismatch: sliding_window (expected {expected:?}, observed {observed:?})"
+            ),
+            KvCompatMismatch::RopeLocalBaseFreq {
+                expected_bits,
+                observed_bits,
+            } => write!(
+                f,
+                "KV compat mismatch: rope_local_base_freq (expected bits {expected_bits:?}, observed bits {observed_bits:?})"
             ),
             KvCompatMismatch::RopeTheta {
                 expected_bits,
@@ -761,11 +922,19 @@ pub fn check_compatibility(
             observed_bits: observed.partial_rotary_factor_bits,
         });
     }
-    if expected.layer_types != observed.layer_types {
-        return Err(KvCompatMismatch::LayerTypes {
-            expected: expected.layer_types.clone(),
-            observed: observed.layer_types.clone(),
-        });
+    // `layer_types` is canonicalized (trimmed, lowercased) before hashing
+    // (`put_str_vec`), so compare the canonical forms here too — aliases like
+    // "GLOBAL"/"global" must be compatible in both the hot-path fingerprint and
+    // this structured policy (#1277 review, hot-path/policy equivalence).
+    {
+        let exp_lt = canonical_layer_types(&expected.layer_types);
+        let obs_lt = canonical_layer_types(&observed.layer_types);
+        if exp_lt != obs_lt {
+            return Err(KvCompatMismatch::LayerTypes {
+                expected: exp_lt,
+                observed: obs_lt,
+            });
+        }
     }
     if expected.linear_key_head_dim != observed.linear_key_head_dim {
         return Err(geometry(
@@ -801,6 +970,56 @@ pub fn check_compatibility(
             expected.linear_conv_kernel_dim,
             observed.linear_conv_kernel_dim,
         ));
+    }
+    // Effective model config — changes hidden states / downstream K/V even when
+    // coarse geometry is identical (#1277 review finding F3).
+    if expected.rms_norm_eps_bits != observed.rms_norm_eps_bits {
+        return Err(KvCompatMismatch::RmsNormEps {
+            expected_bits: expected.rms_norm_eps_bits,
+            observed_bits: observed.rms_norm_eps_bits,
+        });
+    }
+    if expected.layer_norm_eps_bits != observed.layer_norm_eps_bits {
+        return Err(KvCompatMismatch::LayerNormEps {
+            expected_bits: expected.layer_norm_eps_bits,
+            observed_bits: observed.layer_norm_eps_bits,
+        });
+    }
+    if canon_str(&expected.hidden_activation) != canon_str(&observed.hidden_activation) {
+        return Err(KvCompatMismatch::HiddenActivation {
+            expected: canon_str(&expected.hidden_activation),
+            observed: canon_str(&observed.hidden_activation),
+        });
+    }
+    if expected.scale_embeddings != observed.scale_embeddings {
+        return Err(KvCompatMismatch::ScaleEmbeddings {
+            expected: expected.scale_embeddings,
+            observed: observed.scale_embeddings,
+        });
+    }
+    if expected.query_pre_attn_scalar_bits != observed.query_pre_attn_scalar_bits {
+        return Err(KvCompatMismatch::QueryPreAttnScalar {
+            expected_bits: expected.query_pre_attn_scalar_bits,
+            observed_bits: observed.query_pre_attn_scalar_bits,
+        });
+    }
+    if expected.moe != observed.moe {
+        return Err(KvCompatMismatch::MoeRouting {
+            expected: expected.moe.clone(),
+            observed: observed.moe.clone(),
+        });
+    }
+    if expected.sliding_window != observed.sliding_window {
+        return Err(KvCompatMismatch::SlidingWindow {
+            expected: expected.sliding_window,
+            observed: observed.sliding_window,
+        });
+    }
+    if expected.rope_local_base_freq_bits != observed.rope_local_base_freq_bits {
+        return Err(KvCompatMismatch::RopeLocalBaseFreq {
+            expected_bits: expected.rope_local_base_freq_bits,
+            observed_bits: observed.rope_local_base_freq_bits,
+        });
     }
     if expected.rope_theta_bits != observed.rope_theta_bits {
         return Err(KvCompatMismatch::RopeTheta {
@@ -956,6 +1175,17 @@ fn put_usize(hash: &mut Sha256, v: usize) {
 }
 
 #[inline]
+fn put_opt_usize(hash: &mut Sha256, v: Option<usize>) {
+    match v {
+        Some(x) => {
+            hash.update([1u8]);
+            put_usize(hash, x);
+        }
+        None => hash.update([0u8]),
+    }
+}
+
+#[inline]
 fn put_str(hash: &mut Sha256, s: &str) {
     put_u64(hash, s.len() as u64);
     hash.update(s.as_bytes());
@@ -972,15 +1202,65 @@ fn put_opt_str(hash: &mut Sha256, s: Option<&str>) {
     }
 }
 
+/// Canonicalize a string identifier: trim and ASCII-lowercase. Used everywhere
+/// a string participates in the fingerprint or the structured comparison so
+/// aliases ("GLOBAL"/"global") cannot disagree between the two (#1277 review).
+#[inline]
+fn canon_str(s: &str) -> String {
+    s.trim().to_ascii_lowercase()
+}
+
+/// Canonicalized (trimmed, lowercased) copy of a `layer_types` sequence, in
+/// order. Used by both the hash ([`put_str_vec`]) and the structured comparison
+/// ([`check_compatibility`]) so they agree on casing/whitespace aliases.
+fn canonical_layer_types(v: &[String]) -> Vec<String> {
+    v.iter().map(|s| canon_str(s)).collect()
+}
+
 /// Hash a `Vec<String>` as a length-prefixed sequence of canonicalized
 /// (trimmed, lowercased) strings so layout casing/order changes are caught.
 #[inline]
 fn put_str_vec(hash: &mut Sha256, v: &[String]) {
     put_u64(hash, v.len() as u64);
     for s in v {
-        let canon: String = s.trim().to_ascii_lowercase();
-        put_str(hash, &canon);
+        put_str(hash, &canon_str(s));
     }
+}
+
+// ===========================================================================
+// Authoritative base-weight content digest (#1277, finding F1)
+// ===========================================================================
+//
+// The base-weight identity is a content digest over the *resolved* weight shards
+// the loader actually builds tensors from — never a directory listing or a path
+// label, and never a pointer stub. Two snapshots sharing a basename but
+// differing in content diverge here. These pure helpers own the canonical
+// framing; the engine seam (`TorchEngine::weights_content_digest`) resolves each
+// shard's bytes (transparently resolving LFS/XET pointers) and feeds them here.
+
+/// SHA-256 of a single shard's resolved content bytes.
+pub fn shard_content_digest(bytes: &[u8]) -> [u8; 32] {
+    let mut h = Sha256::new();
+    h.update(bytes);
+    let mut out = [0u8; 32];
+    out.copy_from_slice(h.finalize().as_slice());
+    out
+}
+
+/// Canonical base-weight digest over a shard set: the shard count, then for each
+/// shard a length-prefixed filename and that shard's content digest. Emitting
+/// the count and length-prefixing every name makes distinct shard segmentations
+/// collide-resistant (shard A+B split at byte N cannot masquerade as a single
+/// shard, nor can two shard sets of equal total bytes share a digest). Shards
+/// must be supplied sorted by name for determinism.
+pub(crate) fn base_weight_digest_from_shards(shards: &[(String, [u8; 32])]) -> String {
+    let mut h = Sha256::new();
+    put_u64(&mut h, shards.len() as u64);
+    for (name, digest) in shards {
+        put_str(&mut h, name);
+        h.update(digest);
+    }
+    hex::encode(h.finalize())
 }
 
 #[cfg(test)]
@@ -1011,6 +1291,16 @@ mod tests {
             linear_num_key_heads: 0,
             linear_num_value_heads: 0,
             linear_conv_kernel_dim: 0,
+            // Effective model config (plain-Llama defaults; non-default below
+            // diverge the fingerprint in every_authoritative_field_participates).
+            rms_norm_eps_bits: 1e-5f32.to_bits(),
+            layer_norm_eps_bits: None,
+            hidden_activation: "silu".to_owned(),
+            scale_embeddings: false,
+            query_pre_attn_scalar_bits: None,
+            moe: MoeRouting::default(),
+            sliding_window: None,
+            rope_local_base_freq_bits: None,
             rope_theta_bits: 10_000.0f32.to_bits(),
             rope_scaling: None,
             max_position_embeddings: 4096,
@@ -1166,7 +1456,8 @@ mod tests {
                 observed: Vec::new(),
             }),
         );
-        // layer_types must be compared case-insensitively (canonicalized).
+        // layer_types must be compared case-insensitively (canonicalized) — in
+        // BOTH the fingerprint hash and the structured policy (#1277 MINOR).
         {
             let mut d = baseline();
             let fp0 = d.fingerprint();
@@ -1177,6 +1468,12 @@ mod tests {
                 d.fingerprint(),
                 d2.fingerprint(),
                 "layer_types casing must canonicalize before hashing"
+            );
+            // Equal fingerprints must imply a compatible structured policy:
+            // casing/whitespace aliases must NOT report a LayerTypes mismatch.
+            assert!(
+                check_compatibility(&d, &d2).is_ok(),
+                "layer_types casing alias must be policy-compatible, not just hash-equal"
             );
             assert_ne!(fp0, d.fingerprint(), "non-empty layer layout must diverge");
         }
@@ -1201,6 +1498,125 @@ mod tests {
                 "{field}: mismatch variant"
             );
         }
+        // Effective model config — each demonstrably changes hidden states /
+        // downstream K/V without changing coarse geometry (#1277 F3).
+        assert_field_diverges(
+            "rms_norm_eps",
+            |d| d.set_rms_norm_eps(1e-6),
+            Some(KvCompatMismatch::RmsNormEps {
+                expected_bits: 1e-6f32.to_bits(),
+                observed_bits: 1e-5f32.to_bits(),
+            }),
+        );
+        assert_field_diverges(
+            "layer_norm_eps",
+            |d| d.set_layer_norm_eps(Some(1e-5)),
+            Some(KvCompatMismatch::LayerNormEps {
+                expected_bits: Some(1e-5f32.to_bits()),
+                observed_bits: None,
+            }),
+        );
+        assert_field_diverges(
+            "hidden_activation",
+            |d| d.hidden_activation = "gelu_pytorch_tanh".into(),
+            Some(KvCompatMismatch::HiddenActivation {
+                expected: "gelu_pytorch_tanh".into(),
+                observed: "silu".into(),
+            }),
+        );
+        // hidden_activation must canonicalize (casing/whitespace) in both the
+        // hash and the policy — an alias must be compatible, a real change must
+        // not.
+        {
+            let mut d = baseline();
+            d.hidden_activation = "  SiLU ".into();
+            assert_eq!(
+                d.fingerprint(),
+                baseline().fingerprint(),
+                "hidden_activation casing/whitespace must canonicalize"
+            );
+            assert!(check_compatibility(&d, &baseline()).is_ok());
+        }
+        assert_field_diverges(
+            "scale_embeddings",
+            |d| d.scale_embeddings = true,
+            Some(KvCompatMismatch::ScaleEmbeddings {
+                expected: true,
+                observed: false,
+            }),
+        );
+        assert_field_diverges(
+            "query_pre_attn_scalar",
+            |d| d.set_query_pre_attn_scalar(Some(256.0)),
+            Some(KvCompatMismatch::QueryPreAttnScalar {
+                expected_bits: Some(256.0f32.to_bits()),
+                observed_bits: None,
+            }),
+        );
+        // MoE routing — each field individually diverges. `is_moe` (bool) and the
+        // four usize routing fields are exercised separately.
+        {
+            let mut d = baseline();
+            d.moe.is_moe = true;
+            assert_ne!(
+                baseline().fingerprint(),
+                d.fingerprint(),
+                "moe.is_moe: setting MoE must change the fingerprint"
+            );
+            assert_eq!(
+                check_compatibility(&d, &baseline()).unwrap_err(),
+                KvCompatMismatch::MoeRouting {
+                    expected: d.moe.clone(),
+                    observed: baseline().moe,
+                },
+                "moe.is_moe: mismatch variant"
+            );
+        }
+        for (field, val) in [
+            ("num_experts", 64usize),
+            ("num_experts_per_tok", 8usize),
+            ("moe_intermediate_size", 2048usize),
+            ("shared_expert_intermediate_size", 1024usize),
+        ] {
+            let mut d = baseline();
+            match field {
+                "num_experts" => d.moe.num_experts = val,
+                "num_experts_per_tok" => d.moe.num_experts_per_tok = val,
+                "moe_intermediate_size" => d.moe.moe_intermediate_size = val,
+                "shared_expert_intermediate_size" => d.moe.shared_expert_intermediate_size = val,
+                _ => unreachable!(),
+            }
+            let divergent_fp = d.fingerprint();
+            assert_ne!(
+                baseline().fingerprint(),
+                divergent_fp,
+                "{field}: MoE routing change must change the fingerprint"
+            );
+            assert_eq!(
+                check_compatibility(&d, &baseline()).unwrap_err(),
+                KvCompatMismatch::MoeRouting {
+                    expected: d.moe.clone(),
+                    observed: baseline().moe,
+                },
+                "{field}: MoE mismatch variant"
+            );
+        }
+        assert_field_diverges(
+            "sliding_window",
+            |d| d.sliding_window = Some(1024),
+            Some(KvCompatMismatch::SlidingWindow {
+                expected: Some(1024),
+                observed: None,
+            }),
+        );
+        assert_field_diverges(
+            "rope_local_base_freq",
+            |d| d.set_rope_local_base_freq(Some(10_000.0)),
+            Some(KvCompatMismatch::RopeLocalBaseFreq {
+                expected_bits: Some(10_000.0f32.to_bits()),
+                observed_bits: None,
+            }),
+        );
         // Position encoding.
         assert_field_diverges(
             "rope_theta",
@@ -1424,7 +1840,7 @@ mod tests {
     fn golden_digest_is_pinned() {
         let fp = baseline().fingerprint();
         let hex = fp.to_hex();
-        let expected = "767058c0b3505492e27b5f477f7cec63344a5a78c9bafa7837d44deab5730170";
+        let expected = "2c1658e12b2935e6444e0503c35b9e36b3f2e941614d9078b445776eae5cc55c";
         assert_eq!(
             hex, expected,
             "KV-compat golden digest drifted; computed = {hex}. \
@@ -1450,6 +1866,104 @@ mod tests {
         let mut c = baseline();
         c.weights.base_revision = "sha256:snapshot-A".into();
         assert_eq!(a.fingerprint(), c.fingerprint());
+    }
+
+    // ---- base-weight content digest producer (#1277, finding F1) ----
+    //
+    // These exercise the pure framing/digest helpers that the engine seam feeds
+    // with the *resolved* shard bytes. The fail-closed enumeration + pointer
+    // resolution is covered by `torch_engine::tests::weights_content_digest_*`.
+
+    /// Helper: build a digested shard set (name + per-shard content digest) from
+    /// raw bytes, mirroring what `TorchEngine::weights_content_digest` produces.
+    fn digested(shards: &[(&str, &[u8])]) -> Vec<(String, [u8; 32])> {
+        shards
+            .iter()
+            .map(|(n, b)| ((*n).to_owned(), shard_content_digest(b)))
+            .collect()
+    }
+
+    #[test]
+    fn shard_content_digest_is_deterministic_and_distinct() {
+        let a = b"hello weights";
+        let b = b"hello weights!";
+        // Deterministic.
+        assert_eq!(shard_content_digest(a), shard_content_digest(a));
+        // Distinct content → distinct digest.
+        assert_ne!(shard_content_digest(a), shard_content_digest(b));
+        // 32 bytes.
+        assert_eq!(shard_content_digest(a).len(), 32);
+    }
+
+    #[test]
+    fn base_weight_digest_is_stable() {
+        let s = digested(&[("model-00001-of-00002.safetensors", b"AAA"), ("model-00002-of-00002.safetensors", b"BBB")]);
+        // Same sorted input → identical digest.
+        assert_eq!(
+            base_weight_digest_from_shards(&s),
+            base_weight_digest_from_shards(&s)
+        );
+    }
+
+    /// Same basenames, different content → different base-weight digest (the
+    /// "authoritative, not a label" rule; two snapshots sharing a path stem but
+    /// differing in bytes must diverge).
+    #[test]
+    fn base_weight_digest_same_basename_different_bytes_diverge() {
+        let names = ["model-00001-of-00002.safetensors", "model-00002-of-00002.safetensors"];
+        let a = digested(&[(names[0], b"content-A"), (names[1], b"content-B")]);
+        let b = digested(&[(names[0], b"content-A!"), (names[1], b"content-B")]);
+        assert_ne!(
+            base_weight_digest_from_shards(&a),
+            base_weight_digest_from_shards(&b),
+            "different shard content must produce a different digest"
+        );
+    }
+
+    /// Canonical framing must disambiguate shard boundaries: a single shard
+    /// whose bytes are the concatenation of two others must NOT collide with the
+    /// two-shard set, even though total bytes are equal.
+    #[test]
+    fn base_weight_digest_shard_boundary_disambiguates() {
+        let two = digested(&[
+            ("model-00001-of-00002.safetensors", b"PART-ONE-"),
+            ("model-00002-of-00002.safetensors", b"PART-TWO"),
+        ]);
+        let one = digested(&[("model.safetensors", b"PART-ONE-PART-TWO")]);
+        assert_ne!(
+            base_weight_digest_from_shards(&two),
+            base_weight_digest_from_shards(&one),
+            "shard segmentation must not be ambiguous in the digest"
+        );
+    }
+
+    /// A different shard count alone (same content, split differently) must
+    /// diverge — the count is part of the canonical frame.
+    #[test]
+    fn base_weight_digest_shard_count_participates() {
+        // Two shards each carrying the same bytes vs one shard carrying them.
+        let two = digested(&[
+            ("a-00001.safetensors", b"X"),
+            ("a-00002.safetensors", b"X"),
+        ]);
+        let one = digested(&[("a.safetensors", b"X")]);
+        assert_ne!(
+            base_weight_digest_from_shards(&two),
+            base_weight_digest_from_shards(&one)
+        );
+    }
+
+    /// Renaming a shard (same content, different filename) must diverge — the
+    /// length-prefixed name is part of the frame.
+    #[test]
+    fn base_weight_digest_filename_participates() {
+        let a = digested(&[("model-00001.safetensors", b"X")]);
+        let b = digested(&[("model-00002.safetensors", b"X")]);
+        assert_ne!(
+            base_weight_digest_from_shards(&a),
+            base_weight_digest_from_shards(&b),
+            "shard filename must participate in the digest"
+        );
     }
 
     #[test]

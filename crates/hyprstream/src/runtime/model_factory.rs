@@ -71,6 +71,24 @@ fn glob_shard_files(model_path: &Path) -> Result<Vec<std::path::PathBuf>> {
 /// Factory for creating models with proper configuration management
 pub struct ModelFactory;
 
+/// Resolved content of a weight shard after transparent LFS/XET pointer
+/// resolution — the exact bytes the loader builds tensors from.
+///
+/// Large ordinary shards are returned as an open [`File`] so the KV-compat
+/// base-weight digest can *stream* them (the on-disk bytes ARE the content —
+/// already smudged, or never a pointer). A resolved pointer, or any small file,
+/// is returned owned. This is the single shared resolution surface used by both
+/// the loader ([`ModelFactory::load_file_with_pointer_detection`]) and the
+/// KV-compat digest ([`ModelFactory::resolve_weight_for_digest`]) so the two
+/// never disagree about what bytes a shard resolves to (#1277).
+pub(crate) enum ResolvedWeight {
+    /// Resolved bytes held in memory (a resolved LFS/XET pointer, or a small
+    /// ordinary file).
+    Owned(Vec<u8>),
+    /// An open ordinary file ≥1 KiB; read or stream it directly.
+    File(std::fs::File),
+}
+
 impl ModelFactory {
     /// Detect the dtype of a model by examining its tensors
     pub async fn detect_model_dtype(model_path: &Path) -> Result<DType> {
@@ -383,6 +401,8 @@ impl ModelFactory {
     /// Load file with automatic LFS/XET pointer detection
     ///
     /// Fast path for already-smudged files, fallback for un-smudged pointers.
+    /// Resolution is shared with the KV-compat base-weight digest via
+    /// [`Self::try_resolve_lfs_pointer`] so both see the identical bytes (#1277).
     async fn load_file_with_pointer_detection(path: &Path) -> Result<Vec<u8>> {
         let metadata = tokio::fs::metadata(path).await?;
 
@@ -392,34 +412,80 @@ impl ModelFactory {
         }
 
         let data = tokio::fs::read(path).await?;
-
-        // Check for LFS pointer header
-        if data.len() < 1024 {
-            if let Ok(text) = String::from_utf8(data.clone()) {
-                if text.starts_with("version https://git-lfs") || text.starts_with("version https://hawser") {
-                    #[cfg(feature = "xet")]
-                    {
-                        debug!("Un-smudged LFS pointer, using git2db::lfs fallback: {}", path.display());
-                        let config = git2db::XetConfig::default();
-                        let storage = git2db::LfsStorage::new(&config).await
-                            .map_err(|e| anyhow!("Failed to create LfsStorage: {}", e))?;
-                        return storage.load_file(path).await
-                            .map_err(|e| anyhow!("Failed to load LFS file: {}", e));
-                    }
-
-                    #[cfg(not(feature = "xet"))]
-                    {
-                        anyhow::bail!(
-                            "Un-smudged LFS pointer at {} but XET feature disabled. \
-                             Enable with --features xet or ensure files are smudged during checkout.",
-                            path.display()
-                        );
-                    }
-                }
-            }
+        if let Some(resolved) = Self::try_resolve_lfs_pointer(path, &data).await? {
+            return Ok(resolved);
         }
-
         Ok(data)
+    }
+
+    /// If `data` is an un-smudged LFS/XET pointer, resolve it to the actual
+    /// object content via the git2db LFS fallback. Returns `Ok(None)` when
+    /// `data` is ordinary content (no pointer header, or too large to be one).
+    /// Any resolution failure propagates as an error — **fail-closed**: the
+    /// caller (loader *and* the KV-compat digest) never silently hashes or
+    /// deserializes a pointer stub in place of the resolved bytes.
+    ///
+    /// Single source of truth for pointer resolution: extracted from the old
+    /// inline block in `load_file_with_pointer_detection`.
+    async fn try_resolve_lfs_pointer(path: &Path, data: &[u8]) -> Result<Option<Vec<u8>>> {
+        // Large buffers cannot be LFS pointers (which are < 1 KiB).
+        if data.len() >= 1024 {
+            return Ok(None);
+        }
+        let text = match std::str::from_utf8(data) {
+            Ok(t) => t,
+            Err(_) => return Ok(None),
+        };
+        if !text.starts_with("version https://git-lfs")
+            && !text.starts_with("version https://hawser")
+        {
+            return Ok(None);
+        }
+        #[cfg(feature = "xet")]
+        {
+            debug!("Un-smudged LFS pointer, resolving via git2db::lfs fallback: {}", path.display());
+            let config = git2db::XetConfig::default();
+            let storage = git2db::LfsStorage::new(&config)
+                .await
+                .map_err(|e| anyhow!("Failed to create LfsStorage: {}", e))?;
+            let bytes = storage
+                .load_file(path)
+                .await
+                .map_err(|e| anyhow!("Failed to load LFS file: {}", e))?;
+            Ok(Some(bytes))
+        }
+        #[cfg(not(feature = "xet"))]
+        {
+            let _ = path;
+            anyhow::bail!(
+                "Un-smudged LFS pointer at {} but XET feature disabled. \
+                 Enable with --features xet or ensure files are smudged during checkout.",
+                path.display()
+            )
+        }
+    }
+
+    /// Resolve a weight shard for the KV-compat base-weight digest (#1277).
+    ///
+    /// Returns the shard's resolved content: a large ordinary shard as an open
+    /// [`File`] (to stream), and a resolved pointer or any small file as owned
+    /// bytes. This walks the **same** resolution path as the loader
+    /// ([`Self::load_file_with_pointer_detection`] → [`Self::try_resolve_lfs_pointer`]),
+    /// so the digest hashes the actual tensor bytes — never a pointer stub — and
+    /// fails closed (returns `Err`) on any metadata/read/resolve error.
+    pub(crate) async fn resolve_weight_for_digest(path: &Path) -> Result<ResolvedWeight> {
+        let metadata = tokio::fs::metadata(path).await?;
+        // A large file cannot be an LFS pointer (pointers are < 1 KiB): its
+        // on-disk bytes are the resolved content — stream it, don't buffer it.
+        if metadata.len() >= 1024 {
+            let file = std::fs::File::open(path)?;
+            return Ok(ResolvedWeight::File(file));
+        }
+        let data = tokio::fs::read(path).await?;
+        if let Some(resolved) = Self::try_resolve_lfs_pointer(path, &data).await? {
+            return Ok(ResolvedWeight::Owned(resolved));
+        }
+        Ok(ResolvedWeight::Owned(data))
     }
 
     /// Create tensors from deserialized safetensors
