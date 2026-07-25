@@ -66,8 +66,8 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use hyprstream_9p::{AccessDecider, Action};
-use hyprstream_rpc::auth::mac::{ObjectRef, SecurityContext};
+use hyprstream_9p::{AccessDecider, Action, ReferenceMonitorDenyReason};
+use hyprstream_rpc::auth::mac::{ObjectRef, SecurityContext, SecurityLabel};
 use hyprstream_workers::runtime::{KataBackend, PodSandbox, PodSandboxConfig, SandboxBackend};
 use hyprstream_workers::{HypervisorType, ImageConfig, PoolConfig, RafsStore};
 
@@ -78,6 +78,16 @@ struct FixtureAccessDecider;
 impl AccessDecider for FixtureAccessDecider {
     fn check(&self, _ctx: &SecurityContext, _object: ObjectRef<'_>, _action: Action) -> bool {
         true
+    }
+
+    fn audit_denial(
+        &self,
+        _ctx: &SecurityContext,
+        _object: ObjectRef<'_>,
+        _object_label: Option<SecurityLabel>,
+        _action: Action,
+        _reason: ReferenceMonitorDenyReason,
+    ) {
     }
 }
 

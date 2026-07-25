@@ -14,14 +14,23 @@
 - **SessionContext::from_verified_clearance** (`hyprstream-9p`): verified
   clearance but no S6 token — denies at the token gate. Structural constructor
   for the #698-not-wired case.
+- **Audited early denials** (`hyprstream-9p` + production PEP): label
+  resolution, token-gate, and IFC-floor denials call the decider's required
+  audit hook; `NinePAccessDecider` writes those records through the same
+  tamper-evident WAL sink used for final policy decisions.
+- **Tenant-bound verified attach identity** (`hyprstream-9p`):
+  `VerifiedAttachIdentity` carries subject + tenant from the same verified
+  credential. Deny-only sessions carry no verified identity.
 - **Plane-specific 9P PEP** (`hyprstream/src/mac/pep.rs`):
   - `NinePClearanceSource` trait — clean clearance-input seam (#698).
   - `EnrollmentClearanceSource` — production impl via enrollment resolver
     (fail-closed when no policy / unenrolled).
-  - `ClearanceAttachAuthenticator<C>` — `AttachAuthenticator` wrapping a
-    clearance source.
+  - `VerifiedClearanceSessionFactory<C>` — consumes only an already verified,
+    tenant-bound identity; it cannot accept raw `Tattach` fields.
   - `production_ninep_reference_monitor` / `enrollment_ninep_reference_monitor`
-    — monitor assembler.
+    — monitor assembler. The current production helper explicitly installs
+    `AnonymousAuthenticator`, because no verified attach credential reaches the
+    seam yet; raw `uname` is never promoted to identity.
   - `NinePAccessDecider::check` — writes resolved via `can_write_to` (was
     blanket-deny `WriteDirectionUndecided`).
 - **4 production constructors wired**:
@@ -36,10 +45,9 @@
 ## What is NOT wired (gated dependencies)
 
 - **#698** — production 9P clearance issuance: although RPC `Claims` can carry
-  clearance, the 9P attach path does not yet carry the verified clearance/token
-  material. `EnrollmentClearanceSource` resolves via the compiled policy
-  enrollment table; an absent policy or unenrolled identity resolves to `None`
-  → deny.
+  clearance, the 9P attach path does not yet carry verified identity + tenant +
+  clearance/token material. The production authenticator therefore returns a
+  deny-only session with no verified identity.
 - **S6 sender-bound token** — not wired into 9P `Tattach`. Sessions constructed
   via `from_verified_clearance` (token = None) → token gate denies every op.
 - **#699 / name↔object TOCTOU** — `ReferenceMonitor::authorize` resolves labels
@@ -62,5 +70,7 @@
   This PR adds no `EnvelopeContext` initializer. The 9P genesis/content-truth
   resolver is node-global, so it deliberately remains in the global domain;
   tenant isolation continues at the Subject-scoped export boundary.
-- **`anonymous_floor()` reachability**: not reachable from any production
-  constructor (all 4 install `Some(monitor)`). Still used by tests.
+- **`anonymous_floor()` semantics**: all 4 production constructors install
+  `Some(monitor)`. Until verified attach credentials are wired, their
+  authenticator returns a deny-only session at the anonymous diagnostic floor
+  with no token and no verified identity; every attempted op denies and audits.

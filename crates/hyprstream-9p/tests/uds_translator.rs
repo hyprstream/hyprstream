@@ -14,8 +14,8 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use hyprstream_9p::msg::{self, Response};
-use hyprstream_9p::{AccessDecider, Action, Translator};
-use hyprstream_rpc::auth::mac::{ObjectRef, SecurityContext};
+use hyprstream_9p::{AccessDecider, Action, ReferenceMonitorDenyReason, Translator};
+use hyprstream_rpc::auth::mac::{ObjectRef, SecurityContext, SecurityLabel};
 use hyprstream_rpc::Subject;
 use hyprstream_vfs::{DirEntry, Fid, Mount, MountError, Stat};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -25,6 +25,16 @@ struct TestDecider;
 impl AccessDecider for TestDecider {
     fn check(&self, _: &SecurityContext, _: ObjectRef<'_>, _: Action) -> bool {
         true
+    }
+
+    fn audit_denial(
+        &self,
+        _: &SecurityContext,
+        _: ObjectRef<'_>,
+        _: Option<SecurityLabel>,
+        _: Action,
+        _: ReferenceMonitorDenyReason,
+    ) {
     }
 }
 

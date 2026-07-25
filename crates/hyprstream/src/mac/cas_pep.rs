@@ -343,6 +343,8 @@ impl CasPep {
             object_label: label.unwrap_or_else(SecurityLabel::bottom),
             action: crate::mac::te::Action::from_scope_action(crate::mac::te::ScopeAction::Query),
             reason,
+            subject_id: None,
+            object_id: None,
         };
 
         match self.sink.record(&record) {

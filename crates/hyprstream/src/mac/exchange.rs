@@ -487,6 +487,8 @@ fn audit_grant_outcome(
         object_label: request.object_label.unwrap_or_else(SecurityLabel::bottom),
         action,
         reason,
+        subject_id: None,
+        object_id: None,
     };
 
     match sink.record(&record) {

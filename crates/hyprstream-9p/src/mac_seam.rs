@@ -168,7 +168,7 @@ impl VerifiedTokenScope {
 /// constructor from raw `uname`, `Subject`, claims, paths, or labels.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SessionContext {
-    attach_identity: VerifiedAttachIdentity,
+    attach_identity: Option<VerifiedAttachIdentity>,
     security_context: SecurityContext,
     token: Option<VerifiedTokenScope>,
 }
@@ -181,12 +181,36 @@ pub struct SessionContext {
 /// verifier must derive this from the verified subject or stable credential
 /// fingerprint, never from an unverified `Tattach.uname` string.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct VerifiedAttachIdentity(Arc<str>);
+pub struct VerifiedAttachIdentity {
+    subject: Arc<str>,
+    tenant: Arc<str>,
+}
 
 impl VerifiedAttachIdentity {
-    /// Construct an identity obtained from verified credential material.
-    pub fn from_verified_identity(identity: impl Into<Arc<str>>) -> Self {
-        Self(identity.into())
+    /// Construct an identity and tenant obtained from verified credential
+    /// material.
+    ///
+    /// Both values must come from the same successful ticket/attach
+    /// verification. Raw `Tattach.uname` input is not verified credential
+    /// material and must never be passed here.
+    pub fn from_verified_credential(
+        subject: impl Into<Arc<str>>,
+        tenant: impl Into<Arc<str>>,
+    ) -> Self {
+        Self {
+            subject: subject.into(),
+            tenant: tenant.into(),
+        }
+    }
+
+    /// Verified subject identity.
+    pub fn subject(&self) -> &str {
+        &self.subject
+    }
+
+    /// Verified tenant/domain bound by the same credential.
+    pub fn tenant(&self) -> &str {
+        &self.tenant
     }
 }
 
@@ -199,7 +223,7 @@ impl SessionContext {
         token: VerifiedTokenScope,
     ) -> Self {
         Self {
-            attach_identity,
+            attach_identity: Some(attach_identity),
             security_context,
             token: Some(token),
         }
@@ -223,7 +247,7 @@ impl SessionContext {
         security_context: SecurityContext,
     ) -> Self {
         Self {
-            attach_identity,
+            attach_identity: Some(attach_identity),
             security_context,
             token: None,
         }
@@ -234,10 +258,15 @@ impl SessionContext {
     /// makes every operation deny before the AVC/PDP is reached.
     pub fn deny() -> Self {
         Self {
-            attach_identity: VerifiedAttachIdentity::from_verified_identity("denied"),
+            attach_identity: None,
             security_context: anonymous_floor(),
             token: None,
         }
+    }
+
+    /// Verified, tenant-bound attach identity, absent for a fail-closed session.
+    pub fn verified_attach_identity(&self) -> Option<&VerifiedAttachIdentity> {
+        self.attach_identity.as_ref()
     }
 
     /// The context derived at attach from verified identity and key material.
@@ -340,6 +369,33 @@ impl ObjectLabelResolver for DenyUnlabeledResolver {
 /// label—keeps label resolution and auditing inside the authoritative PEP.
 pub trait AccessDecider: Send + Sync {
     fn check(&self, ctx: &SecurityContext, object: ObjectRef<'_>, action: Action) -> bool;
+
+    /// Record a denial made by the reference monitor before the local policy
+    /// decision is reached.
+    ///
+    /// Production implementations must write through the same tamper-evident
+    /// audit sink used by [`Self::check`]. This method is required rather than
+    /// defaulted so adding an early-return gate cannot silently create an
+    /// unaudited denial path.
+    fn audit_denial(
+        &self,
+        ctx: &SecurityContext,
+        object: ObjectRef<'_>,
+        object_label: Option<SecurityLabel>,
+        action: Action,
+        reason: ReferenceMonitorDenyReason,
+    );
+}
+
+/// Denial gates owned by [`ReferenceMonitor`] rather than the local decider.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReferenceMonitorDenyReason {
+    /// Trusted object-label resolution returned no label.
+    UnlabeledObject,
+    /// The verified sender-bound token was missing, expired, or insufficient.
+    TokenGate,
+    /// The independent read/write IFC floor denied.
+    FloorDeny,
 }
 
 /// Fail-closed fallback for layers that cannot construct the production
@@ -357,6 +413,25 @@ impl AccessDecider for DenyAllDecider {
             "9P access denied: production MAC decider unavailable"
         );
         false
+    }
+
+    fn audit_denial(
+        &self,
+        ctx: &SecurityContext,
+        object: ObjectRef<'_>,
+        object_label: Option<SecurityLabel>,
+        action: Action,
+        reason: ReferenceMonitorDenyReason,
+    ) {
+        tracing::warn!(
+            target: "hyprstream.mac.audit",
+            ?object,
+            ?object_label,
+            ?action,
+            ?reason,
+            clearance = ?ctx.clearance(),
+            "9P access denied before local decider: production MAC decider unavailable"
+        );
     }
 }
 
@@ -405,13 +480,28 @@ impl ReferenceMonitor {
     /// subject, or decider denial all return `false`.
     pub fn authorize(&self, session: &SessionContext, path: &[String], action: Action) -> bool {
         let components: Vec<&str> = path.iter().map(String::as_str).collect();
+        let object = ObjectRef::Path(&components);
         let Some(object_label) = self.labels.resolve(ObjectRef::Path(&components)) else {
+            self.decider.audit_denial(
+                session.security_context(),
+                object,
+                None,
+                action,
+                ReferenceMonitorDenyReason::UnlabeledObject,
+            );
             return false;
         };
 
         // Token is a deny-only capability gate. Its label ceiling is checked
         // against the trusted object label, never a token/UCAN-provided label.
         if !session.token_authorizes(&object_label, action) {
+            self.decider.audit_denial(
+                session.security_context(),
+                object,
+                Some(object_label),
+                action,
+                ReferenceMonitorDenyReason::TokenGate,
+            );
             return false;
         }
 
@@ -425,6 +515,13 @@ impl ReferenceMonitor {
             session.security_context().can_access(&object_label)
         };
         if !ifc_ok {
+            self.decider.audit_denial(
+                session.security_context(),
+                object,
+                Some(object_label),
+                action,
+                ReferenceMonitorDenyReason::FloorDeny,
+            );
             return false;
         }
 
@@ -469,13 +566,18 @@ mod tests {
 
     struct AllowAll;
     impl AccessDecider for AllowAll {
-        fn check(
+        fn check(&self, _ctx: &SecurityContext, _object: ObjectRef<'_>, _action: Action) -> bool {
+            true
+        }
+
+        fn audit_denial(
             &self,
             _ctx: &SecurityContext,
             _object: ObjectRef<'_>,
+            _object_label: Option<SecurityLabel>,
             _action: Action,
-        ) -> bool {
-            true
+            _reason: ReferenceMonitorDenyReason,
+        ) {
         }
     }
 
@@ -517,8 +619,11 @@ mod tests {
     #[test]
     fn authorize_allows_when_all_gates_pass() {
         let monitor = monitor(Some(label(Level::Public)), Arc::new(AllowAll));
-        let session =
-            SessionContext::from_verified_token(VerifiedAttachIdentity::from_verified_identity("test-subject"), ctx(Level::Secret), permit_token(&[Action::Read]));
+        let session = SessionContext::from_verified_token(
+            VerifiedAttachIdentity::from_verified_credential("test-subject", "test-tenant"),
+            ctx(Level::Secret),
+            permit_token(&[Action::Read]),
+        );
         assert!(monitor.authorize(&session, &path(&["a.txt"]), Action::Read));
     }
 
@@ -526,8 +631,11 @@ mod tests {
     fn authorize_denies_unlabeled_before_decider() {
         // Even a permit-everything decider cannot rescue an unlabeled object.
         let monitor = monitor(None, Arc::new(AllowAll));
-        let session =
-            SessionContext::from_verified_token(VerifiedAttachIdentity::from_verified_identity("test-subject"), ctx(Level::Secret), permit_token(&[Action::Read]));
+        let session = SessionContext::from_verified_token(
+            VerifiedAttachIdentity::from_verified_credential("test-subject", "test-tenant"),
+            ctx(Level::Secret),
+            permit_token(&[Action::Read]),
+        );
         assert!(!monitor.authorize(&session, &path(&["a.txt"]), Action::Read));
     }
 
@@ -535,8 +643,11 @@ mod tests {
     fn authorize_denies_missing_or_scope_violating_token() {
         let monitor = monitor(Some(label(Level::Public)), Arc::new(AllowAll));
         assert!(!monitor.authorize(&SessionContext::deny(), &path(&["a.txt"]), Action::Read));
-        let read_only =
-            SessionContext::from_verified_token(VerifiedAttachIdentity::from_verified_identity("test-subject"), ctx(Level::Secret), permit_token(&[Action::Read]));
+        let read_only = SessionContext::from_verified_token(
+            VerifiedAttachIdentity::from_verified_credential("test-subject", "test-tenant"),
+            ctx(Level::Secret),
+            permit_token(&[Action::Read]),
+        );
         assert!(!monitor.authorize(&read_only, &path(&["a.txt"]), Action::Write));
     }
 
@@ -546,8 +657,11 @@ mod tests {
         // subject reading a Secret object denies even with an allow-all
         // decider and a token whose ceiling covers it.
         let monitor = monitor(Some(label(Level::Secret)), Arc::new(AllowAll));
-        let session =
-            SessionContext::from_verified_token(VerifiedAttachIdentity::from_verified_identity("test-subject"), ctx(Level::Public), permit_token(&[Action::Read]));
+        let session = SessionContext::from_verified_token(
+            VerifiedAttachIdentity::from_verified_credential("test-subject", "test-tenant"),
+            ctx(Level::Public),
+            permit_token(&[Action::Read]),
+        );
         assert!(!monitor.authorize(&session, &path(&["secret.txt"]), Action::Read));
     }
 
@@ -565,7 +679,7 @@ mod tests {
         let public_obj = label(Level::Public);
         let mon = monitor(Some(secret_obj), Arc::new(AllowAll));
         let session = SessionContext::from_verified_token(
-            VerifiedAttachIdentity::from_verified_identity("writer"),
+            VerifiedAttachIdentity::from_verified_credential("writer", "test-tenant"),
             ctx(Level::Secret),
             VerifiedTokenScope::from_verified_token(
                 label(Level::Secret),
@@ -588,10 +702,32 @@ mod tests {
         // permissive decider and a Public object. Fail-closed structural shape.
         let mon = monitor(Some(label(Level::Public)), Arc::new(AllowAll));
         let session = SessionContext::from_verified_clearance(
-            VerifiedAttachIdentity::from_verified_identity("stub"),
+            VerifiedAttachIdentity::from_verified_credential("stub", "test-tenant"),
             ctx(Level::Secret),
         );
         assert!(!mon.authorize(&session, &path(&["public"]), Action::Read));
         assert!(!mon.authorize(&session, &path(&["public"]), Action::Write));
+    }
+
+    #[test]
+    fn verified_attach_identity_is_tenant_bound_and_denied_sessions_have_none() {
+        let tenant_a = SessionContext::from_verified_clearance(
+            VerifiedAttachIdentity::from_verified_credential("alice", "tenant-a"),
+            ctx(Level::Secret),
+        );
+        let tenant_b = SessionContext::from_verified_clearance(
+            VerifiedAttachIdentity::from_verified_credential("alice", "tenant-b"),
+            ctx(Level::Secret),
+        );
+
+        assert!(!tenant_a.same_attach_identity(&tenant_b));
+        assert_eq!(
+            tenant_a
+                .verified_attach_identity()
+                .expect("verified session")
+                .tenant(),
+            "tenant-a",
+        );
+        assert!(SessionContext::deny().verified_attach_identity().is_none());
     }
 }

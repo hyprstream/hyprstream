@@ -1142,7 +1142,7 @@ mod tests {
 
     use crate::mac_seam::{
         AccessDecider, AttachAuthenticator, ObjectLabelResolver, ObjectRef, VerifiedAttachIdentity,
-        VerifiedTokenScope,
+        ReferenceMonitorDenyReason, VerifiedTokenScope,
     };
     use hyprstream_rpc::auth::mac::{
         Assurance, CompartmentSet, Level, SecurityContext, SecurityLabel, VerifiedKeyMaterial,
@@ -1167,7 +1167,7 @@ mod tests {
 
     fn permit_session_as(identity: &str, level: Level, ops: &[Action]) -> SessionContext {
         SessionContext::from_verified_token(
-            VerifiedAttachIdentity::from_verified_identity(identity),
+            VerifiedAttachIdentity::from_verified_credential(identity, "test-tenant"),
             ctx(level),
             VerifiedTokenScope::from_verified_token(
                 label(Level::Secret),
@@ -1214,6 +1214,16 @@ mod tests {
             _action: Action,
         ) -> bool {
             true
+        }
+
+        fn audit_denial(
+            &self,
+            _ctx: &SecurityContext,
+            _object: ObjectRef<'_>,
+            _object_label: Option<SecurityLabel>,
+            _action: Action,
+            _reason: ReferenceMonitorDenyReason,
+        ) {
         }
     }
 
@@ -1264,7 +1274,7 @@ mod tests {
     #[tokio::test]
     async fn monitor_denies_expired_token_at_attach() {
         let expired = SessionContext::from_verified_token(
-            VerifiedAttachIdentity::from_verified_identity("test-subject"),
+            VerifiedAttachIdentity::from_verified_credential("test-subject", "test-tenant"),
             ctx(Level::Secret),
             VerifiedTokenScope::from_verified_token(
                 label(Level::Secret),
@@ -1323,6 +1333,16 @@ mod tests {
                 action: Action,
             ) -> bool {
                 !matches!(action, Action::Read)
+            }
+
+            fn audit_denial(
+                &self,
+                _ctx: &SecurityContext,
+                _object: ObjectRef<'_>,
+                _object_label: Option<SecurityLabel>,
+                _action: Action,
+                _reason: ReferenceMonitorDenyReason,
+            ) {
             }
         }
 
@@ -1393,7 +1413,7 @@ mod tests {
             }
         }
         let session = SessionContext::from_verified_token(
-            VerifiedAttachIdentity::from_verified_identity("test-subject"),
+            VerifiedAttachIdentity::from_verified_credential("test-subject", "test-tenant"),
             ctx(Level::Secret),
             VerifiedTokenScope::from_verified_token(
                 label(Level::Confidential),
@@ -1488,6 +1508,16 @@ mod tests {
             ) -> bool {
                 !matches!(action, Action::Getattr)
             }
+
+            fn audit_denial(
+                &self,
+                _ctx: &SecurityContext,
+                _object: ObjectRef<'_>,
+                _object_label: Option<SecurityLabel>,
+                _action: Action,
+                _reason: ReferenceMonitorDenyReason,
+            ) {
+            }
         }
 
         let backend = MemoryBackend::default();
@@ -1562,6 +1592,16 @@ mod tests {
                 action: Action,
             ) -> bool {
                 !(action == Action::Read && matches!(object, ObjectRef::Path([])))
+            }
+
+            fn audit_denial(
+                &self,
+                _ctx: &SecurityContext,
+                _object: ObjectRef<'_>,
+                _object_label: Option<SecurityLabel>,
+                _action: Action,
+                _reason: ReferenceMonitorDenyReason,
+            ) {
             }
         }
 
@@ -1747,6 +1787,16 @@ mod tests {
         impl AccessDecider for DenySecretReads {
             fn check(&self, _ctx: &SecurityContext, object: ObjectRef<'_>, action: Action) -> bool {
                 !(action == Action::Read && matches!(object, ObjectRef::Path(["a", "b"])))
+            }
+
+            fn audit_denial(
+                &self,
+                _ctx: &SecurityContext,
+                _object: ObjectRef<'_>,
+                _object_label: Option<SecurityLabel>,
+                _action: Action,
+                _reason: ReferenceMonitorDenyReason,
+            ) {
             }
         }
         let root = SyntheticNode::dir().with_child(

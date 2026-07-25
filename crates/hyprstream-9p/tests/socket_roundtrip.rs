@@ -13,8 +13,10 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use hyprstream_9p::{serve_mount_uds, AccessDecider, Action, Remote9pMount};
-use hyprstream_rpc::auth::mac::{ObjectRef, SecurityContext};
+use hyprstream_9p::{
+    serve_mount_uds, AccessDecider, Action, ReferenceMonitorDenyReason, Remote9pMount,
+};
+use hyprstream_rpc::auth::mac::{ObjectRef, SecurityContext, SecurityLabel};
 use hyprstream_rpc::Subject;
 use hyprstream_vfs::{Mount, SyntheticMount, SyntheticNode};
 
@@ -22,6 +24,16 @@ struct TestDecider;
 impl AccessDecider for TestDecider {
     fn check(&self, _: &SecurityContext, _: ObjectRef<'_>, _: Action) -> bool {
         true
+    }
+
+    fn audit_denial(
+        &self,
+        _: &SecurityContext,
+        _: ObjectRef<'_>,
+        _: Option<SecurityLabel>,
+        _: Action,
+        _: ReferenceMonitorDenyReason,
+    ) {
     }
 }
 

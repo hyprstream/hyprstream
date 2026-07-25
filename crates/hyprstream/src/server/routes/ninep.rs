@@ -626,6 +626,16 @@ mod tests {
         ) -> bool {
             true
         }
+
+        fn audit_denial(
+            &self,
+            _ctx: &hyprstream_rpc::auth::mac::SecurityContext,
+            _object: hyprstream_rpc::auth::mac::ObjectRef<'_>,
+            _object_label: Option<hyprstream_rpc::auth::mac::SecurityLabel>,
+            _action: hyprstream_9p::Action,
+            _reason: hyprstream_9p::ReferenceMonitorDenyReason,
+        ) {
+        }
     }
 
     /// Discovery doc round-trips and advertises the H1a contract.

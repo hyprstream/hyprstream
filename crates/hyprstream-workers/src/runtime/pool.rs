@@ -533,6 +533,16 @@ mod tests {
         ) -> bool {
             true
         }
+
+        fn audit_denial(
+            &self,
+            _ctx: &SecurityContext,
+            _object: ObjectRef<'_>,
+            _object_label: Option<hyprstream_rpc::auth::mac::SecurityLabel>,
+            _action: hyprstream_9p::Action,
+            _reason: hyprstream_9p::ReferenceMonitorDenyReason,
+        ) {
+        }
     }
 
     /// Create a test pool with Kata backend and minimal configuration

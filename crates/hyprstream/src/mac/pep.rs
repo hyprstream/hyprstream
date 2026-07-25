@@ -10,26 +10,25 @@
 //!
 //! [`production_ninep_reference_monitor`] assembles the full
 //! [`ReferenceMonitor`](hyprstream_9p::ReferenceMonitor) from the mandatory
-//! decider, the genesis content-truth resolver, and a
-//! [`NinePClearanceSource`] (the #698 clearance-provenance seam). Production
-//! 9P constructors install the monitor via `Translator::with_reference_monitor`;
-//! the `anonymous_floor()` fallback is not reachable from any production path.
+//! decider, the genesis content-truth resolver, and an attach authenticator.
+//! Production 9P constructors install the monitor via
+//! `Translator::with_reference_monitor`; until the verified attach credential
+//! is wired into that seam they explicitly install a deny-only authenticator.
 //!
 //! **Fail-closed until #698 + S6 wire clearance and token issuance**: the
-//! production clearance source resolves to `None` (deny) for unenrolled
-//! subjects, and the S6 sender-bound token is not yet attached to 9P
-//! `Tattach`. So the installed monitor denies every operation — there is no
-//! permissive default (per #547). The structure is correct; functional
-//! permitting follows #698 and the S6 grant path.
+//! raw `Tattach.uname` is not verified identity material, and the S6
+//! sender-bound token is not yet attached to 9P `Tattach`. So the installed
+//! monitor denies every operation — there is no permissive default (per #547).
+//! Functional permitting requires an authenticator that derives both identity
+//! and tenant from verified attach credentials.
 
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
-use async_trait::async_trait;
 use hyprstream_9p::{
-    AccessDecider, Action as NinePAction, AttachAuthenticator, ReferenceMonitor,
-    SessionContext, VerifiedAttachIdentity,
+    AccessDecider, Action as NinePAction, AnonymousAuthenticator, AttachAuthenticator,
+    ReferenceMonitor, ReferenceMonitorDenyReason, SessionContext, VerifiedAttachIdentity,
 };
 use hyprstream_rpc::auth::mac::{
     ObjectLabelResolver, ObjectRef, SecurityContext, SecurityLabel,
@@ -89,6 +88,8 @@ impl NinePAccessDecider {
             object_label: label.unwrap_or_else(SecurityLabel::bottom),
             action: audit_action(action),
             reason,
+            subject_id: None,
+            object_id: None,
         };
 
         match self.sink.record(&record) {
@@ -204,8 +205,8 @@ impl NinePClearanceSource for EnrollmentClearanceSource {
     }
 }
 
-/// 9P [`AttachAuthenticator`] that derives [`SessionContext`] from a verified
-/// subject identity via a [`NinePClearanceSource`].
+/// Constructs a 9P [`SessionContext`] from an identity that an attach
+/// credential verifier has already authenticated and tenant-bound.
 ///
 /// **Fail-closed by construction** — there is no permissive path:
 /// - An unresolvable clearance (unenrolled DID, no policy) →
@@ -215,55 +216,42 @@ impl NinePClearanceSource for EnrollmentClearanceSource {
 ///   [`SessionContext::from_verified_clearance`], which denies every op at the
 ///   token gate.
 ///
-/// Once the S6 grant path issues a sender-bound token at `Tattach`, the
-/// authenticator will construct via `SessionContext::from_verified_token`
-/// instead — the structural seam ([`NinePClearanceSource`]) stays unchanged.
-pub struct ClearanceAttachAuthenticator<C: NinePClearanceSource> {
+/// This type deliberately does **not** implement [`AttachAuthenticator`]:
+/// that trait receives raw `Tattach` fields, while this factory accepts only a
+/// [`VerifiedAttachIdentity`] produced after credential verification. This
+/// prevents raw `uname` from silently becoming a verified identity when S6 is
+/// wired.
+pub struct VerifiedClearanceSessionFactory<C: NinePClearanceSource> {
     clearance: Arc<C>,
 }
 
-impl<C: NinePClearanceSource> ClearanceAttachAuthenticator<C> {
+impl<C: NinePClearanceSource> VerifiedClearanceSessionFactory<C> {
     pub fn new(clearance: Arc<C>) -> Self {
         Self { clearance }
     }
-}
 
-#[async_trait]
-impl<C: NinePClearanceSource + 'static> AttachAuthenticator for ClearanceAttachAuthenticator<C> {
-    async fn authenticate(&self, uname: &str, _aname: &str) -> SessionContext {
-        // The verified subject identity. In a production authenticator this is
-        // derived from the verified ticket/DPoP material, NOT the raw uname.
-        // Until the S6 token path lands at Tattach, the uname *is* the verified
-        // subject DID for the WS/UDS/vsock planes (the transport already
-        // authenticated the peer). The WT plane presents the mount ticket as
-        // uname; the authenticator is plane-specific.
-        let Some(security_context) = self.clearance.clearance_for(uname) else {
+    /// Derive a token-less, fail-closed session from a credential-verified,
+    /// tenant-bound identity.
+    pub fn session_for(&self, identity: VerifiedAttachIdentity) -> SessionContext {
+        let Some(security_context) = self.clearance.clearance_for(identity.subject()) else {
             return SessionContext::deny();
         };
-        // No S6 sender-bound token is wired into the 9P attach path yet (#698).
-        // A token-less session denies every op at the token gate — fail-closed
-        // structural shape, not a permissive default.
-        SessionContext::from_verified_clearance(
-            VerifiedAttachIdentity::from_verified_identity(uname),
-            security_context,
-        )
+        SessionContext::from_verified_clearance(identity, security_context)
     }
 }
 
 /// Assemble the production 9P [`ReferenceMonitor`] from the mandatory audited
 /// decider, the genesis content-truth label resolver, and a clearance source.
 ///
-/// All three seams are required (all-or-nothing enforcement). The decider and
-/// resolver are the same objects [`production_ninep_decider`] builds; the
-/// clearance source is the #698 seam. Call this once at each production 9P
-/// constructor and install via `Translator::with_reference_monitor`.
-pub fn production_ninep_reference_monitor<C: NinePClearanceSource + 'static>(
+/// All three seams are required (all-or-nothing enforcement). The caller must
+/// supply an authenticator that verifies the attach credential itself; passing
+/// [`AnonymousAuthenticator`] explicitly selects the fail-closed state for
+/// transports whose verified attach-credential path is not yet wired.
+pub fn production_ninep_reference_monitor(
     decider: Arc<dyn AccessDecider>,
-    clearance: Arc<C>,
+    authenticator: Arc<dyn AttachAuthenticator>,
 ) -> Arc<ReferenceMonitor> {
     let resolver = crate::mac::GenesisGate::production().into_resolver();
-    let authenticator: Arc<dyn AttachAuthenticator> =
-        Arc::new(ClearanceAttachAuthenticator::new(clearance));
     Arc::new(ReferenceMonitor::new(
         authenticator,
         Arc::new(resolver),
@@ -271,12 +259,18 @@ pub fn production_ninep_reference_monitor<C: NinePClearanceSource + 'static>(
     ))
 }
 
-/// Convenience: assemble the reference monitor with the production
-/// [`EnrollmentClearanceSource`] (#698 Decision D, fail-closed when no policy).
+/// Assemble the production reference monitor in its current fail-closed state.
+///
+/// The raw 9P attach fields are not credential proof. This helper therefore
+/// refuses to derive an identity or tenant from them; a later S6 integration
+/// must replace the authenticator with one backed by verified attach material.
 pub fn enrollment_ninep_reference_monitor(
     decider: Arc<dyn AccessDecider>,
 ) -> Arc<ReferenceMonitor> {
-    production_ninep_reference_monitor(decider, Arc::new(EnrollmentClearanceSource))
+    // No production 9P transport currently passes a verified, sender-bound S6
+    // credential into the monitor. Raw `Tattach.uname` is untrusted, so the
+    // only safe activation state is an explicit deny-only authenticator.
+    production_ninep_reference_monitor(decider, Arc::new(AnonymousAuthenticator))
 }
 
 impl AccessDecider for NinePAccessDecider {
@@ -315,6 +309,22 @@ impl AccessDecider for NinePAccessDecider {
             },
         )
     }
+
+    fn audit_denial(
+        &self,
+        ctx: &SecurityContext,
+        _object: ObjectRef<'_>,
+        object_label: Option<SecurityLabel>,
+        action: NinePAction,
+        reason: ReferenceMonitorDenyReason,
+    ) {
+        let reason = match reason {
+            ReferenceMonitorDenyReason::UnlabeledObject => DecisionReason::UnlabeledObject,
+            ReferenceMonitorDenyReason::TokenGate => DecisionReason::TokenGate,
+            ReferenceMonitorDenyReason::FloorDeny => DecisionReason::FloorDeny,
+        };
+        let _ = self.audit(ctx, object_label, action, Decision::Deny, reason);
+    }
 }
 
 const fn audit_action(action: NinePAction) -> Action {
@@ -331,6 +341,8 @@ const fn audit_action(action: NinePAction) -> Action {
 
 #[cfg(test)]
 mod tests {
+    use std::time::{Duration, Instant};
+
     use parking_lot::Mutex;
 
     use hyprstream_rpc::auth::mac::{Assurance, CompartmentSet, Level, VerifiedKeyMaterial};
@@ -355,6 +367,21 @@ mod tests {
         }
     }
 
+    struct MonitorResolver {
+        public: SecurityLabel,
+        secret: SecurityLabel,
+    }
+
+    impl ObjectLabelResolver for MonitorResolver {
+        fn resolve(&self, object: ObjectRef<'_>) -> Option<SecurityLabel> {
+            match object {
+                ObjectRef::Path(["public"] | ["decider-deny"]) => Some(self.public),
+                ObjectRef::Path(["secret"]) => Some(self.secret),
+                _ => None,
+            }
+        }
+    }
+
     #[derive(Default)]
     struct SpySink {
         records: Mutex<Vec<AuditRecord>>,
@@ -373,6 +400,18 @@ mod tests {
 
     fn context(level: Level) -> SecurityContext {
         SecurityContext::from_clearance(label(level), VerifiedKeyMaterial::Classical)
+    }
+
+    fn identity(tenant: &str) -> VerifiedAttachIdentity {
+        VerifiedAttachIdentity::from_verified_credential("did:key:alice", tenant)
+    }
+
+    fn read_token() -> hyprstream_9p::VerifiedTokenScope {
+        hyprstream_9p::VerifiedTokenScope::from_verified_token(
+            label(Level::Secret),
+            Arc::from([NinePAction::Read]),
+            Instant::now() + Duration::from_secs(60),
+        )
     }
 
     #[test]
@@ -442,5 +481,90 @@ mod tests {
         assert_eq!(records.len(), 2);
         assert_eq!(records[0].decision, Decision::Permit);
         assert_eq!(records[1].reason, DecisionReason::FloorDeny);
+    }
+
+    #[test]
+    fn every_reference_monitor_deny_stage_is_audited() {
+        let sink = Arc::new(SpySink::default());
+        let decider: Arc<dyn AccessDecider> = Arc::new(NinePAccessDecider::new(
+            Arc::new(FixtureResolver {
+                public: label(Level::Public),
+                secret: label(Level::Secret),
+            }),
+            sink.clone(),
+        ));
+        let monitor = ReferenceMonitor::new(
+            Arc::new(AnonymousAuthenticator),
+            Arc::new(MonitorResolver {
+                public: label(Level::Public),
+                secret: label(Level::Secret),
+            }),
+            decider,
+        );
+        let permitted = SessionContext::from_verified_token(
+            identity("tenant-a"),
+            context(Level::Secret),
+            read_token(),
+        );
+
+        assert!(!monitor.authorize(
+            &permitted,
+            &["unlabeled".to_owned()],
+            NinePAction::Read,
+        ));
+        assert!(!monitor.authorize(
+            &SessionContext::from_verified_clearance(
+                identity("tenant-a"),
+                context(Level::Secret),
+            ),
+            &["public".to_owned()],
+            NinePAction::Read,
+        ));
+        assert!(!monitor.authorize(
+            &SessionContext::from_verified_token(
+                identity("tenant-a"),
+                context(Level::Public),
+                read_token(),
+            ),
+            &["secret".to_owned()],
+            NinePAction::Read,
+        ));
+        assert!(!monitor.authorize(
+            &permitted,
+            &["decider-deny".to_owned()],
+            NinePAction::Read,
+        ));
+
+        let records = sink.records.lock();
+        assert_eq!(records.len(), 4, "one WAL record per denied operation");
+        assert_eq!(records[0].reason, DecisionReason::UnlabeledObject);
+        assert_eq!(records[1].reason, DecisionReason::TokenGate);
+        assert_eq!(records[2].reason, DecisionReason::FloorDeny);
+        assert_eq!(records[3].reason, DecisionReason::UnlabeledObject);
+        assert!(records
+            .iter()
+            .all(|record| record.decision == Decision::Deny));
+    }
+
+    #[tokio::test]
+    async fn raw_attach_uname_never_becomes_verified_identity_or_tenant() {
+        let sink = Arc::new(SpySink::default());
+        let decider: Arc<dyn AccessDecider> = Arc::new(NinePAccessDecider::new(
+            Arc::new(FixtureResolver {
+                public: label(Level::Public),
+                secret: label(Level::Secret),
+            }),
+            sink,
+        ));
+        let monitor = enrollment_ninep_reference_monitor(decider);
+
+        let session = monitor
+            .authenticate("did:key:victim", "tenant-victim")
+            .await;
+        assert!(
+            session.verified_attach_identity().is_none(),
+            "unverified Tattach fields must not mint identity or tenant"
+        );
+        assert!(!session.token_authorizes(&label(Level::Public), NinePAction::Read));
     }
 }
