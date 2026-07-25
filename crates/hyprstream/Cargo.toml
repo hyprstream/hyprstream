@@ -72,12 +72,6 @@ hyprstream-p2p = { workspace = true, optional = true }  # P2P transport (formerl
 clap.workspace = true
 inquire = "0.7"
 tracing.workspace = true
-tracing-opentelemetry = { workspace = true, optional = true }
-opentelemetry = { workspace = true, optional = true }
-opentelemetry_sdk = { workspace = true, optional = true }
-opentelemetry-otlp = { workspace = true, optional = true }
-opentelemetry-semantic-conventions = { workspace = true, optional = true }
-opentelemetry-stdout = { workspace = true, optional = true }
 parking_lot.workspace = true
 num_cpus.workspace = true
 once_cell.workspace = true  # For global GitService singleton
@@ -205,13 +199,32 @@ keyring = { version = "3", features = ["windows-native"] }
 [target.'cfg(any(target_os = "freebsd", target_os = "openbsd"))'.dependencies]
 keyring = { version = "3", features = ["sync-secret-service", "crypto-rust"] }
 
+# OpenTelemetry (#1305): the SDK/OTLP stack is not wasm32-compatible (SDK
+# std::time panic opentelemetry-rust#696; OTLP Send-bounds #3155 — both
+# upstream-open), so the optional `otel` deps are native-only. The `otel`
+# feature may still be *enabled* on a wasm32 build (feature flags are
+# target-independent); all otel code is therefore gated
+# `#[cfg(all(feature = "otel", not(target_arch = "wasm32")))]`.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tracing-opentelemetry = { workspace = true, optional = true }
+opentelemetry = { workspace = true, optional = true }
+opentelemetry_sdk = { workspace = true, optional = true }
+opentelemetry-otlp = { workspace = true, optional = true }
+opentelemetry-semantic-conventions = { workspace = true, optional = true }
+opentelemetry-stdout = { workspace = true, optional = true }
+
 [features]
 default = ["gittorrent", "xet", "systemd", "otel", "kata-vm", "nspawn"]
 cuda = []
 valkey = ["dep:fred"]  # Enable Valkey/Redis-backed user and token stores
 bnb = ["dep:bitsandbytes-sys"]  # Enable bitsandbytes KV cache quantization (requires compatible ROCm/CUDA)
 xet = ["git2db/xet-storage"]  # Enable XET large file storage
-otel = ["dep:tracing-opentelemetry", "dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp", "dep:opentelemetry-semantic-conventions", "dep:opentelemetry-stdout"]
+# NOTE: plain dependency names (not `dep:`) — cargo rejects `dep:` references
+# to target-specific optional dependencies, and the otel stack is target-gated
+# to non-wasm (#1305, see the target table below). On wasm32 the feature may be
+# enabled but pulls nothing; all otel code is gated
+# `#[cfg(all(feature = "otel", not(target_arch = "wasm32")))]`.
+otel = ["tracing-opentelemetry", "opentelemetry", "opentelemetry_sdk", "opentelemetry-otlp", "opentelemetry-semantic-conventions", "opentelemetry-stdout"]
 gittorrent = ["dep:hyprstream-p2p", "git2db/gittorrent-transport"]  # Enable P2P model sharing via hyprstream-p2p transport (feature name kept for compat)
 download-libtorch = ["tch/download-libtorch"]
 overlayfs = ["git2db/overlayfs"]  # Enable overlayfs-backed worktrees (delegated to git2db)

@@ -78,19 +78,19 @@ fn supports_tui() -> bool {
     true
 }
 // Tracing imports (feature-gated)
-#[cfg(feature = "otel")]
+#[cfg(all(feature = "otel", not(target_arch = "wasm32")))]
 use opentelemetry::trace::TracerProvider;
-#[cfg(feature = "otel")]
+#[cfg(all(feature = "otel", not(target_arch = "wasm32")))]
 use opentelemetry::KeyValue;
-#[cfg(feature = "otel")]
+#[cfg(all(feature = "otel", not(target_arch = "wasm32")))]
 use opentelemetry_otlp::{SpanExporter, WithExportConfig};
-#[cfg(feature = "otel")]
+#[cfg(all(feature = "otel", not(target_arch = "wasm32")))]
 use opentelemetry_sdk::Resource;
-#[cfg(feature = "otel")]
+#[cfg(all(feature = "otel", not(target_arch = "wasm32")))]
 use tracing_opentelemetry::OpenTelemetryLayer;
-#[cfg(not(feature = "otel"))]
+#[cfg(any(not(feature = "otel"), target_arch = "wasm32"))]
 use tracing_subscriber::EnvFilter;
-#[cfg(feature = "otel")]
+#[cfg(all(feature = "otel", not(target_arch = "wasm32")))]
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 use tracing_appender::rolling::{RollingFileAppender, Rotation};
 
@@ -370,7 +370,7 @@ where
 // Telemetry
 // ─────────────────────────────────────────────────────────────────────────────
 
-#[cfg(feature = "otel")]
+#[cfg(all(feature = "otel", not(target_arch = "wasm32")))]
 /// Telemetry provider type
 #[derive(Debug, Clone, Copy)]
 enum TelemetryProvider {
@@ -380,7 +380,7 @@ enum TelemetryProvider {
     Stdout,
 }
 
-#[cfg(feature = "otel")]
+#[cfg(all(feature = "otel", not(target_arch = "wasm32")))]
 /// Initialize OpenTelemetry with the specified provider
 fn init_telemetry(provider: TelemetryProvider) -> Result<()> {
     let service_name =
@@ -1709,7 +1709,7 @@ fn main() -> Result<()> {
     let is_service_command = matches.subcommand_name() == Some("service");
     let _log_guard: Option<tracing_appender::non_blocking::WorkerGuard>;
 
-    #[cfg(feature = "otel")]
+    #[cfg(all(feature = "otel", not(target_arch = "wasm32")))]
     {
         let telemetry_provider = if is_service_command {
             TelemetryProvider::Otlp
@@ -1763,7 +1763,7 @@ fn main() -> Result<()> {
         }
     }
 
-    #[cfg(not(feature = "otel"))]
+    #[cfg(any(not(feature = "otel"), target_arch = "wasm32"))]
     {
         let default_log_level = if is_service_command {
             "hyprstream=info"

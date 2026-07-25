@@ -406,11 +406,17 @@ pub fn generate_mount(service_name: &str, resolved: &ResolvedSchema) -> TokenStr
         // #699 carrier (a) inventory: register this table so the genesis
         // coverage gate can walk every reachable generated node (annotated or
         // not) at startup. Submitted at module scope via the `inventory`
-        // re-export on `hyprstream_rpc::metadata` (wasm-safe; same pattern as
+        // re-export on `hyprstream_rpc::metadata` (same pattern as
         // `ScopeDefinition`), so consumer crates need not declare an `inventory`
         // dep directly. The gate iterates this to build the startup activation
         // gate; a node missing a `$vfsMac` surfaces as a finding (unlabeled ⇒
         // deny) rather than being silently absent.
+        //
+        // Native-only (#1305): inventory's linker-section registration does not
+        // resolve on wasm32, so the submit is gated off there. The generated
+        // `vfs_nodes()` fn above stays available on all targets — it is the
+        // wasm-compatible path for any browser client that needs the table.
+        #[cfg(not(target_arch = "wasm32"))]
         hyprstream_rpc::metadata::inventory::submit! {
             hyprstream_rpc::metadata::VfsNodeTable {
                 name: #service_name,

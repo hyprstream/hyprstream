@@ -27,10 +27,16 @@ impl ScopeDefinition {
     }
 }
 
-// Collect all registered scopes
+// Collect all registered scopes.
+//
+// Native-only (#1305): inventory's link-time registration doesn't resolve on
+// wasm32. The browser client has no scope-registry consumer, so no wasm
+// fallback is needed — the collection and its iterator are compiled out.
+#[cfg(not(target_arch = "wasm32"))]
 inventory::collect!(ScopeDefinition);
 
 /// Get all registered scopes.
+#[cfg(not(target_arch = "wasm32"))]
 pub fn registered_scopes() -> impl Iterator<Item = &'static ScopeDefinition> {
     inventory::iter::<ScopeDefinition>()
 }

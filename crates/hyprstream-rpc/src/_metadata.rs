@@ -188,6 +188,10 @@ pub type VfsNodesFn = fn() -> (&'static str, &'static [VfsNode]);
 /// walks it) and lets this crate stay free of a `hyprstream-service`
 /// dependency: the macro emits the `inventory::submit!` in whatever crate owns
 /// the generated client module, and the gate (in the daemon crate) iterates it.
+///
+/// On wasm32 (#1305) the link-time registration is compiled out (inventory's
+/// linker-section mechanism doesn't resolve there); the generated
+/// `vfs_nodes()` fn is the wasm-compatible path and stays directly callable.
 pub struct VfsNodeTable {
     /// The `/srv/{name}` service this table belongs to.
     pub name: &'static str,
@@ -195,6 +199,7 @@ pub struct VfsNodeTable {
     pub nodes_fn: VfsNodesFn,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 inventory::collect!(VfsNodeTable);
 
 /// Function type for service schema metadata.

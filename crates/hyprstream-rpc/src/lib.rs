@@ -135,6 +135,14 @@ pub mod metadata {
     /// declare an `inventory` dependency — `hyprstream_rpc::metadata::inventory`
     /// resolves wherever `hyprstream-rpc` is a dependency (same pattern the crate
     /// already uses internally for `ScopeDefinition`).
+    ///
+    /// Native-only (#1305): `inventory`'s link-time section registration does not
+    /// work on wasm32, so the dep lives under `cfg(not(target_arch = "wasm32"))`
+    /// and the codegen emits the `submit!` behind the same cfg. On wasm32 the
+    /// generated `vfs_nodes()` table fn remains directly callable — that is the
+    /// wasm-compatible path; nothing in the browser client consumes the
+    /// link-time registry (the only iterator is the native genesis gate).
+    #[cfg(not(target_arch = "wasm32"))]
     pub use inventory;
 
     pub use crate::_metadata::*;

@@ -1024,12 +1024,16 @@ pub fn register_scopes(_attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     }
 
-    // Generate inventory submissions
+    // Generate inventory submissions.
+    //
+    // Native-only (#1305): inventory's linker-section registration doesn't
+    // resolve on wasm32, so each submit is gated off there.
     let registrations: Vec<_> = scopes.iter().map(|(action, resource)| {
         let example = format!("{action}:{resource}:*");
         let description = format!("{action} on {resource}");
 
         quote! {
+            #[cfg(not(target_arch = "wasm32"))]
             inventory::submit! {
                 hyprstream_rpc::auth::ScopeDefinition::new(
                     #action,
@@ -1117,11 +1121,16 @@ pub fn service_factory(attr: TokenStream, item: TokenStream) -> TokenStream {
         quote! { .with_depends_on(&[#(#deps),*]) }
     };
 
+    // The `submit!` registrations are native-only (#1305): inventory's
+    // linker-section registration doesn't resolve on wasm32. All current
+    // `#[service_factory]` consumers are native (the daemon); the factory fn
+    // itself is re-emitted ungated.
     let expanded = match (&args.schema, &args.metadata) {
         (Some(schema_path), Some(metadata_path)) => {
             quote! {
                 #func
 
+                #[cfg(not(target_arch = "wasm32"))]
                 inventory::submit! {
                     hyprstream_service::ServiceFactory::with_metadata(
                         #name,
@@ -1136,6 +1145,7 @@ pub fn service_factory(attr: TokenStream, item: TokenStream) -> TokenStream {
             quote! {
                 #func
 
+                #[cfg(not(target_arch = "wasm32"))]
                 inventory::submit! {
                     hyprstream_service::ServiceFactory::with_schema(
                         #name,
@@ -1149,6 +1159,7 @@ pub fn service_factory(attr: TokenStream, item: TokenStream) -> TokenStream {
             quote! {
                 #func
 
+                #[cfg(not(target_arch = "wasm32"))]
                 inventory::submit! {
                     hyprstream_service::ServiceFactory::new(
                         #name,
