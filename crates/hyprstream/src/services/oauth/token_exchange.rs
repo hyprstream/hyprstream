@@ -415,13 +415,17 @@ async fn verify_atproto_service_jwt(
         format!("{}.{}", parts[0], parts[1]).as_bytes(),
         parts[2],
     )?;
+    // The service assertion proves the DID, not a tenant. Resolve any local
+    // tenant binding only after signature verification and only from the
+    // authority-owned hosted-account record store.
+    let verified_tenant = state.hosted_account_tenant(&claims.iss).await?;
 
     Ok(VerifiedSubject {
         sub: claims.iss.clone(),
         cnf_key_bytes: None,
         iat: claims.iat,
         granted_scopes: Some(vec!["transition:generic".to_owned()]),
-        verified_tenant: None,
+        verified_tenant,
         atproto_replay: Some((claims.iss, claims.jti, claims.exp)),
         require_clearance: true,
         ttl_ceiling: Some(MAX_ATPROTO_EXCHANGE_TOKEN_TTL),
@@ -494,11 +498,10 @@ fn exchange_tenant(
         }
         (Some(verified), _) => Ok(Some(verified.to_owned())),
         // Tenant selection is an authority assertion, not an exchange
-        // parameter. Federated identity proofs (including enrolled ATProto
-        // DIDs) establish identity and possibly clearance, but do not bind the
-        // subject to a local Casbin domain. Mirror `strip_federated_tenant`:
-        // only a tenant preserved from a verified local-issuer token may reach
-        // PolicyService.
+        // parameter. Federated identity proofs establish identity but do not
+        // bind the subject to a local Casbin domain. Only a tenant preserved
+        // from a verified local-issuer token or resolved from a hosted account
+        // record may reach PolicyService.
         (None, Some(_)) => Err("subject token has no verified local tenant binding"),
         (None, None) if subject.require_clearance => {
             Err("tenant is required for the ATProto exchange")

@@ -56,6 +56,7 @@ ml-dsa = { workspace = true }  # ML-DSA-65 — always compiled (runtime CryptoPo
 hyprstream-rpc-std = { path = "../hyprstream-rpc-std" }  # Standard service schemas + clients
 hyprstream-discovery = { path = "../hyprstream-discovery" }  # Service discovery
 hyprstream-pds = { path = "../hyprstream-pds" }  # atproto PDS record store: DAG-CBOR + MST + signed commit + CAR proof (#392/#431)
+hyprstream-pds-service = { path = "../hyprstream-pds-service" }  # authority-owned hosted-account tenant lookup
 hyprstream-ledger = { path = "../hyprstream-ledger", optional = true }  # Cellular credit ledger accounting plane (#923); the Phase-1 local-enforcer service (#925) lands behind the `ledger` feature, default off
 hyprstream-crypto = { path = "../hyprstream-crypto" }  # COSE composite (EdDSA + ML-DSA-65) sign/verify — used by the ledger checkpoint signer (#925)
 hyprstream-service = { path = "../hyprstream-service" }  # Service orchestration

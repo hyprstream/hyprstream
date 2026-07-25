@@ -963,6 +963,10 @@ pub struct OAuthState {
     /// Now backed by `user_service`. Legacy code uses `user_store_reader()`.
     /// Kept as Option for backward-compatible `is_none()` checks.
     pub user_service: Option<Arc<UserService>>,
+    /// Authority-owned hosted-account records used to resolve an ATProto DID
+    /// to its local tenant binding. `None` means every ATProto identity is
+    /// federated-only for tenant exchange purposes.
+    pub hosted_account_store: Option<Arc<hyprstream_pds_service::AccountRecordStore>>,
     /// Ed25519 signing key for signing entity configurations (OpenID Federation 1.0).
     /// `None` when not configured.
     pub signing_key: Option<ed25519_dalek::SigningKey>,
@@ -1159,6 +1163,7 @@ impl OAuthState {
                 .unwrap_or_default(),
             verifying_key_bytes,
             user_service: None,
+            hosted_account_store: None,
             signing_key: None,
             root_identity_key_store: None,
             authority_hints: config.authority_hints.clone(),
@@ -1218,6 +1223,33 @@ impl OAuthState {
     ) -> Self {
         self.atproto_did_resolver = resolver;
         self
+    }
+
+    /// Attach the authority-owned hosted-account record store.
+    pub fn with_hosted_account_store(
+        mut self,
+        store: Arc<hyprstream_pds_service::AccountRecordStore>,
+    ) -> Self {
+        self.hosted_account_store = Some(store);
+        self
+    }
+
+    /// Resolve a signed ATProto subject DID to its hosted local tenant.
+    ///
+    /// The request tenant is deliberately absent from this API. A missing
+    /// store or record is a federated-only identity (`Ok(None)`); store
+    /// corruption, authorization failure, and ambiguous bindings are errors.
+    pub async fn hosted_account_tenant(&self, did: &str) -> Result<Option<String>, String> {
+        let Some(store) = &self.hosted_account_store else {
+            return Ok(None);
+        };
+        store
+            .resolve_tenant_for_hosted_did(
+                &hyprstream_rpc::Subject::new("service:oauth"),
+                did,
+            )
+            .await
+            .map_err(|error| format!("hosted account tenant resolution failed: {error}"))
     }
 
     /// Host service DID accepted in ATProto service-auth `aud`.
