@@ -217,7 +217,11 @@ impl ModelFactory {
     ///
     /// Prefers `model.safetensors.index.json` (authoritative HuggingFace shard manifest)
     /// over filename glob patterns, which are fragile across model families.
-    fn find_shard_files(model_path: &Path) -> Result<Vec<std::path::PathBuf>> {
+    ///
+    /// This is THE loader's shard selector — also used by the KV-compat
+    /// base-weight digest (#1277) so the fingerprint covers exactly the
+    /// loader-selected set, never extra/unreferenced `.safetensors` files.
+    pub(crate) fn find_shard_files(model_path: &Path) -> Result<Vec<std::path::PathBuf>> {
         // 1. Use index file if present (most reliable)
         let index_path = model_path.join("model.safetensors.index.json");
         if index_path.exists() {

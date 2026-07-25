@@ -765,40 +765,52 @@ impl TorchEngine {
     }
 
     /// Authoritative content digest of the base weights actually loaded from
-    /// `model_path` — a canonical SHA-256 over every `.safetensors` shard's
-    /// **resolved** bytes (shard count + length-prefixed name + per-shard content
-    /// digest), in sorted name order. This is the base-weight identity for the
-    /// KV-compat fingerprint (#1277): two snapshots sharing a basename but
-    /// differing in content diverge here, unlike a path/label.
+    /// `model_path` — a canonical SHA-256 over the **loader-selected**
+    /// `.safetensors` shards' **resolved** bytes (shard count + length-prefixed
+    /// name + per-shard content digest), in sorted name order. This is the
+    /// base-weight identity for the KV-compat fingerprint (#1277): two snapshots
+    /// sharing a basename but differing in content diverge here, unlike a
+    /// path/label.
+    ///
+    /// The shard set comes from the **same selector the loader uses**
+    /// (`ModelFactory::find_shard_files`: `model.safetensors.index.json` →
+    /// `model.safetensors` → shard-name glob), so the digest covers EXACTLY the
+    /// shards the loader reads — an extra/unreferenced `.safetensors` in the
+    /// directory (stale shard, alt-precision copy) cannot shift the fingerprint
+    /// while the loaded weights are identical.
     ///
     /// The digest hashes the **resolved** bytes — the identical resolution path
     /// the loader walks (`ModelFactory::resolve_weight_for_digest` transparently
     /// resolves an un-smudged LFS/XET pointer to its object content), so it never
     /// hashes a pointer stub in place of the real tensors. It is **fail-closed**:
-    /// any directory/entry/read/resolve error propagates, so the caller declines
+    /// any selection/read/resolve error, an empty selection, or an
+    /// index-referenced shard that is missing propagates, so the caller declines
     /// to mint a descriptor and KV reuse fails closed rather than hashing a
     /// partial shard set.
     async fn weights_content_digest(model_path: &Path) -> Result<String> {
         use crate::runtime::kv_compat;
         use crate::runtime::model_factory::{ModelFactory, ResolvedWeight};
 
-        // Fail-closed shard enumeration: propagate EVERY directory/entry error.
-        // (No `filter_map(Result::ok)` — swallowing an entry error would make the
-        // digest authoritative over a partial shard set, the opposite of closed.)
-        let mut shards: Vec<std::path::PathBuf> = Vec::new();
-        for entry in std::fs::read_dir(model_path)? {
-            let entry = entry?;
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) == Some("safetensors") {
-                shards.push(path);
-            }
-        }
-        shards.sort();
+        // Resolve the loader-selected shard set (the loader's own selector).
+        let shards = ModelFactory::find_shard_files(model_path)?;
+
+        // Fail closed on an empty or inconsistent selection: the loader would
+        // have nothing authoritative to load (or the index disagrees with the
+        // directory), so reuse must be declined rather than minted over a
+        // partial/ambiguous set.
         if shards.is_empty() {
             anyhow::bail!(
-                "no .safetensors weight shards in {}",
+                "no loader-selected .safetensors weight shards in {}",
                 model_path.display()
             );
+        }
+        for shard in &shards {
+            if !shard.is_file() {
+                anyhow::bail!(
+                    "loader-selected shard {} is missing or not a regular file",
+                    shard.display()
+                );
+            }
         }
 
         let mut digested: Vec<(String, [u8; 32])> = Vec::with_capacity(shards.len());
@@ -2662,8 +2674,10 @@ mod tests {
     // ---- base-weight content digest (#1277, finding F1) ----
     //
     // The pure framing/digest helpers live in `kv_compat`; these cover the engine
-    // seam: fail-closed shard enumeration, resolved-byte hashing (incl. LFS/XET
-    // pointer handling), determinism, and parity with the pure helpers.
+    // seam: loader-selected shard-set resolution (extra/unreferenced `.safetensors`
+    // files are never hashed), fail-closed selection, resolved-byte hashing
+    // (incl. LFS/XET pointer handling), determinism, and parity with the pure
+    // helpers.
 
     use crate::runtime::kv_compat;
 
@@ -2674,6 +2688,24 @@ mod tests {
         let mut f = std::fs::File::create(&p).unwrap();
         f.write_all(bytes).unwrap();
         p
+    }
+
+    /// Write a minimal `model.safetensors.index.json` whose `weight_map`
+    /// references exactly `shard_names`.
+    fn write_index(dir: &std::path::Path, shard_names: &[&str]) {
+        let weight_map: serde_json::Map<String, serde_json::Value> = shard_names
+            .iter()
+            .enumerate()
+            .map(|(i, name)| {
+                (format!("tensor.{i}"), serde_json::Value::String((*name).to_owned()))
+            })
+            .collect();
+        let index = serde_json::json!({ "weight_map": weight_map });
+        std::fs::write(
+            dir.join("model.safetensors.index.json"),
+            serde_json::to_string_pretty(&index).unwrap(),
+        )
+        .unwrap();
     }
 
     #[tokio::test]
@@ -2795,6 +2827,132 @@ mod tests {
         assert!(
             res.is_err(),
             "an unreadable shard must fail closed, not hash a partial set"
+        );
+    }
+
+    /// An extra/unreferenced `.safetensors` in the directory must NOT shift the
+    /// digest: only the index-referenced (loader-selected) shards are hashed.
+    #[tokio::test]
+    async fn weights_content_digest_ignores_unreferenced_extra_shard() {
+        let dir = tempfile::tempdir().unwrap();
+        write_shard(dir.path(), "model-00001-of-00002.safetensors", b"AAAA-content");
+        write_shard(dir.path(), "model-00002-of-00002.safetensors", b"BBBB-content");
+        write_index(dir.path(), &[
+            "model-00001-of-00002.safetensors",
+            "model-00002-of-00002.safetensors",
+        ]);
+        let selected_only = TorchEngine::weights_content_digest(dir.path()).await.unwrap();
+
+        // A stale shard with a shard-like name the loader never references.
+        write_shard(dir.path(), "model-00003-of-00002.safetensors", b"STALE-alt-precision");
+        let with_extra = TorchEngine::weights_content_digest(dir.path()).await.unwrap();
+
+        assert_eq!(
+            selected_only, with_extra,
+            "an unreferenced extra shard must be invariant to the digest"
+        );
+        let expected = kv_compat::base_weight_digest_from_shards(&[
+            ("model-00001-of-00002.safetensors".into(), kv_compat::shard_content_digest(b"AAAA-content")),
+            ("model-00002-of-00002.safetensors".into(), kv_compat::shard_content_digest(b"BBBB-content")),
+        ]);
+        assert_eq!(
+            with_extra, expected,
+            "digest must cover exactly the loader-selected set, no more"
+        );
+    }
+
+    /// With a single `model.safetensors`, an extra shard-like file is not part
+    /// of the loader's selection and must not shift the digest.
+    #[tokio::test]
+    async fn weights_content_digest_single_file_ignores_extra_shard() {
+        let dir = tempfile::tempdir().unwrap();
+        write_shard(dir.path(), "model.safetensors", b"single-file-weights");
+        let baseline = TorchEngine::weights_content_digest(dir.path()).await.unwrap();
+        let expected = kv_compat::base_weight_digest_from_shards(&[(
+            "model.safetensors".into(),
+            kv_compat::shard_content_digest(b"single-file-weights"),
+        )]);
+        assert_eq!(baseline, expected);
+
+        // Even a name matching the shard glob is not selected when
+        // `model.safetensors` is the loader's pick.
+        write_shard(dir.path(), "model-00001-of-00001.safetensors", b"UNREFERENCED");
+        let with_extra = TorchEngine::weights_content_digest(dir.path()).await.unwrap();
+        assert_eq!(
+            baseline, with_extra,
+            "an extra shard next to model.safetensors must be invariant"
+        );
+    }
+
+    /// Changing a SELECTED shard changes the digest; adding, removing, or
+    /// mutating an UNREFERENCED shard does not.
+    #[tokio::test]
+    async fn weights_content_digest_selected_mutations_diverge_unreferenced_do_not() {
+        let dir = tempfile::tempdir().unwrap();
+        write_shard(dir.path(), "model-00001-of-00002.safetensors", b"AAAA-content");
+        write_shard(dir.path(), "model-00002-of-00002.safetensors", b"BBBB-content");
+        write_index(dir.path(), &[
+            "model-00001-of-00002.safetensors",
+            "model-00002-of-00002.safetensors",
+        ]);
+        let baseline = TorchEngine::weights_content_digest(dir.path()).await.unwrap();
+
+        // Add an unreferenced shard.
+        let extra = write_shard(dir.path(), "stale-backup.safetensors", b"stale");
+        assert_eq!(
+            TorchEngine::weights_content_digest(dir.path()).await.unwrap(),
+            baseline,
+            "adding an unreferenced shard must not change the digest"
+        );
+        // Mutate the unreferenced shard.
+        write_shard(dir.path(), "stale-backup.safetensors", b"stale-CHANGED");
+        assert_eq!(
+            TorchEngine::weights_content_digest(dir.path()).await.unwrap(),
+            baseline,
+            "mutating an unreferenced shard must not change the digest"
+        );
+        // Remove the unreferenced shard.
+        std::fs::remove_file(&extra).unwrap();
+        assert_eq!(
+            TorchEngine::weights_content_digest(dir.path()).await.unwrap(),
+            baseline,
+            "removing an unreferenced shard must not change the digest"
+        );
+        // Change a SELECTED shard.
+        write_shard(dir.path(), "model-00002-of-00002.safetensors", b"BBBB-CHANGED");
+        assert_ne!(
+            TorchEngine::weights_content_digest(dir.path()).await.unwrap(),
+            baseline,
+            "changing a selected shard must change the digest"
+        );
+    }
+
+    /// A directory whose only `.safetensors` files match no loader selection
+    /// pattern has ZERO selected shards and must fail closed (reuse declined).
+    #[tokio::test]
+    async fn weights_content_digest_zero_selected_shards_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        write_shard(dir.path(), "backup.safetensors", b"not-a-selected-shard");
+        write_shard(dir.path(), "optimizer.safetensors", b"also-not-selected");
+        assert!(
+            TorchEngine::weights_content_digest(dir.path()).await.is_err(),
+            "a dir with no loader-selected shards must fail closed"
+        );
+    }
+
+    /// An index referencing a shard that does not exist on disk is an
+    /// inconsistent selection and must fail closed (reuse declined).
+    #[tokio::test]
+    async fn weights_content_digest_missing_index_shard_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        write_shard(dir.path(), "model-00001-of-00002.safetensors", b"AAAA-content");
+        write_index(dir.path(), &[
+            "model-00001-of-00002.safetensors",
+            "model-00002-of-00002.safetensors", // referenced but absent
+        ]);
+        assert!(
+            TorchEngine::weights_content_digest(dir.path()).await.is_err(),
+            "an index referencing a missing shard must fail closed"
         );
     }
 
