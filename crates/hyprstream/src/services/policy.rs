@@ -217,6 +217,31 @@ impl PolicyService {
 
         Ok(oid.to_string())
     }
+
+    /// Select the Casbin domain for PolicyService itself.
+    ///
+    /// Tenant-bearing callers stay in their authority-verified tenant. The
+    /// policy/OAuth authority is also a global, cross-tenant subsystem: a
+    /// tenantless, authenticated `service:*` principal (or the PolicyService
+    /// authority key itself during bootstrap) therefore remains in the global
+    /// policy domain. Ordinary tenantless identities still fail closed.
+    fn request_domain(&self, ctx: &EnvelopeContext) -> Result<String> {
+        if ctx.verified_tenant().is_some() {
+            return ctx.domain();
+        }
+
+        let subject = ctx.subject();
+        let is_global_service = subject
+            .name()
+            .is_some_and(|name| name.starts_with("service:"));
+        let is_policy_authority =
+            ctx.cnf == self.signing_key.verifying_key().to_bytes();
+        anyhow::ensure!(
+            is_global_service || is_policy_authority,
+            "authorization denied: no verified tenant domain"
+        );
+        Ok("*".to_owned())
+    }
 }
 
 /// Collect all supported scopes from compile-time schema metadata
@@ -325,7 +350,7 @@ fn validate_service_key_registration(
 impl PolicyHandler for PolicyService {
     async fn authorize(&self, ctx: &EnvelopeContext, resource: &str, operation: &str) -> Result<()> {
         let subject = ctx.subject();
-        let domain = ctx.domain()?;
+        let domain = self.request_domain(ctx)?;
         let allowed = self.policy_manager.check_with_domain(
             &subject.to_string(),
             &domain,
@@ -377,20 +402,20 @@ impl PolicyHandler for PolicyService {
         // JWT sub must contain a bare username (e.g. "randy", "birdetta") — the identity
         // system adds the namespace prefix ("token:randy") when the JWT is decoded.
         // For service tokens: sub = "service:{name}", e.g. "service:model".
-        let caller_domain = ctx.domain()?;
-        let target_domain = data
+        let caller_domain = self.request_domain(ctx)?;
+        let requested_tenant = data
             .tenant
             .as_ref()
             .filter(|tenant| !tenant.is_empty())
-            .cloned()
-            .unwrap_or_else(|| caller_domain.clone());
-        if target_domain == "*" {
+            .cloned();
+        if requested_tenant.as_deref() == Some("*") {
             return Ok(PolicyResponseVariant::Error(ErrorInfo {
                 message: "Wildcard is not a valid token tenant".to_owned(),
                 code: "INVALID_TENANT".to_owned(),
                 details: String::new(),
             }));
         }
+        let target_domain = requested_tenant.unwrap_or_else(|| caller_domain.clone());
 
         let requested_subject = data.subject.as_ref().filter(|subject| !subject.is_empty());
         if requested_subject.is_some() || target_domain != caller_domain {
@@ -555,9 +580,11 @@ impl PolicyHandler for PolicyService {
             now,
             now + requested_ttl as i64,
         ).with_issuer(issuer)
-         .with_tenant(target_domain)
          .with_audience(audience)
          .with_scope(granted_scope);
+        if target_domain != "*" {
+            claims = claims.with_tenant(target_domain);
+        }
 
         // DPoP jkt takes priority over userPubKey (RFC 9449 § 6).
         if let Some(ref jkt) = data.dpop_jkt {
@@ -1882,6 +1909,55 @@ mod tests {
             issuer: None,
             tenant: None,
         }
+    }
+
+    #[tokio::test]
+    async fn request_domain_keeps_only_global_authorities_outside_tenant_domains() {
+        let (service, _root) = test_service().await;
+        let service_signer = SigningKey::from_bytes(&[0x50; 32]).verifying_key();
+
+        let oauth = EnvelopeContext::for_test_authenticated_subject(
+            Subject::new("service:oauth"),
+            service_signer,
+        );
+        assert_eq!(
+            service.request_domain(&oauth).expect("global OAuth domain"),
+            "*"
+        );
+
+        let tenant_user = EnvelopeContext::for_test_authenticated_subject_in_tenant(
+            Subject::new("alice"),
+            "tenant-a",
+            service_signer,
+        );
+        assert_eq!(
+            service
+                .request_domain(&tenant_user)
+                .expect("verified tenant domain"),
+            "tenant-a"
+        );
+
+        let tenantless_user =
+            EnvelopeContext::for_test_authenticated_subject(Subject::new("alice"), service_signer);
+        assert!(service.request_domain(&tenantless_user).is_err());
+
+        let wildcard_service = EnvelopeContext::for_test_authenticated_subject_in_tenant(
+            Subject::new("service:oauth"),
+            "*",
+            service_signer,
+        );
+        assert!(service.request_domain(&wildcard_service).is_err());
+
+        let policy_authority = EnvelopeContext::for_test_authenticated_subject(
+            Subject::anonymous(),
+            service.signing_key.verifying_key(),
+        );
+        assert_eq!(
+            service
+                .request_domain(&policy_authority)
+                .expect("PolicyService bootstrap authority domain"),
+            "*"
+        );
     }
 
     #[tokio::test]

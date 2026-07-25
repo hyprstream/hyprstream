@@ -319,6 +319,19 @@ impl EnvelopeContext {
         Ok(tenant.to_owned())
     }
 
+    /// Return the authority-verified tenant binding, if the request has one.
+    ///
+    /// Callers must still use [`Self::domain`] before treating this value as a
+    /// Casbin domain: that accessor rejects empty and wildcard tenant claims.
+    /// This optional view lets cross-tenant authorities distinguish a missing
+    /// tenant (where an authenticated service principal may use the global
+    /// policy domain) from a present-but-invalid tenant (which must fail
+    /// closed).
+    #[must_use]
+    pub fn verified_tenant(&self) -> Option<&str> {
+        self.verified_tenant.as_deref()
+    }
+
     /// Get the bare username string.
     pub fn user(&self) -> &str {
         // Resolution order mirrors subject(): prefer key-derived, then JWT, then anonymous.
