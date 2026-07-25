@@ -167,6 +167,11 @@ pub struct InferenceServiceInner {
     /// LoRA generation counter — incremented on create/load/unload.
     /// Checked before generation to detect LoRA reconfiguration mid-stream.
     lora_generation: Arc<AtomicU64>,
+    /// Authority-verified tenant that owns this engine instance.
+    tenant_domain: String,
+    /// Verified key of the ModelService controller allowed to bridge a local
+    /// request into this tenant-bound instance.
+    controller_pubkey: VerifyingKey,
 }
 
 /// ZMQ-based inference service
@@ -194,6 +199,23 @@ impl std::ops::Deref for InferenceService {
 // TestTimeTrainer, etc.) which all have `unsafe impl Send + Sync`.
 unsafe impl Send for InferenceServiceInner {}
 unsafe impl Sync for InferenceServiceInner {}
+
+fn resolve_instance_domain(
+    tenant_domain: &str,
+    controller_pubkey: &VerifyingKey,
+    ctx: &EnvelopeContext,
+) -> Result<String> {
+    let domain = ctx.domain()?;
+    if domain == tenant_domain {
+        return Ok(domain);
+    }
+    if domain == "local" && ctx.cnf == controller_pubkey.to_bytes() {
+        return Ok(tenant_domain.to_owned());
+    }
+    anyhow::bail!(
+        "authorization denied: inference instance is bound to a different verified tenant"
+    )
+}
 
 // Intermediate response structs (DeltaStatusInfo, SaveAdaptationResult, SnapshotDeltaResult,
 // ExportPeftResult) eliminated — handlers return generated types directly.
@@ -255,6 +277,8 @@ impl InferenceService {
         nonce_cache: Arc<InMemoryNonceCache>,
         policy_client: PolicyClient,
         fs: Option<WorktreeClient>,
+        tenant_domain: String,
+        controller_pubkey: VerifyingKey,
     ) -> Result<Self> {
         // Capture runtime handle for reuse in handlers
         let runtime_handle = Handle::current();
@@ -401,8 +425,20 @@ impl InferenceService {
                 fs,
                 transport: hyprstream_rpc::transport::TransportConfig::inproc("inference-unset"),
                 lora_generation: Arc::new(AtomicU64::new(0)),
+                tenant_domain,
+                controller_pubkey,
             }),
         })
+    }
+
+    /// Resolve the authorization domain for this tenant-bound engine.
+    ///
+    /// A direct caller must carry the same authority-verified tenant. The only
+    /// exception is the local ModelService bridge, whose verified signer key is
+    /// pinned when the instance is created; that bridge inherits this
+    /// instance's tenant instead of the generic `local` domain.
+    fn authorization_domain(&self, ctx: &EnvelopeContext) -> Result<String> {
+        resolve_instance_domain(&self.tenant_domain, &self.controller_pubkey, ctx)
     }
 
     /// Resolve the effective delta for a subject: compose base_delta + tenant delta if both exist.
@@ -1892,7 +1928,7 @@ fn map_adaptation_strategy(
 impl InferenceHandler for InferenceService {
     async fn authorize(&self, ctx: &EnvelopeContext, resource: &str, operation: &str) -> Result<()> {
         let subject = ctx.subject();
-        let domain = ctx.domain()?;
+        let domain = self.authorization_domain(ctx)?;
         let allowed = self.policy_client.check(&PolicyCheck { subject: subject.to_string(), domain, resource: resource.to_owned(), operation: operation.to_owned() }).await.unwrap_or_else(|e| {
             warn!("Policy check failed for {} on {}: {} - denying access", subject, resource, e);
             false
@@ -2374,6 +2410,8 @@ impl hyprstream_rpc::service::RequestService for InferenceZmqAdapter {
     }
 
     fn name(&self) -> &str {
+        // Keep the canonical MAC object label even though the Spawnable
+        // registration is instance-specific.
         "inference"
     }
 
@@ -2424,6 +2462,7 @@ impl hyprstream_rpc::service::RequestService for InferenceZmqAdapter {
 /// It is `Send` and can be moved to a dedicated thread via `Spawnable::run()`.
 /// The actual GPU initialization happens on the service thread.
 pub struct InferenceServiceConfig {
+    service_name: String,
     model_path: PathBuf,
     config: RuntimeConfig,
     server_pubkey: VerifyingKey,
@@ -2439,6 +2478,10 @@ pub struct InferenceServiceConfig {
     expected_audience: Option<String>,
     /// JWT key source for verifying JWTs (local and federated).
     jwt_key_source: Option<std::sync::Arc<dyn hyprstream_rpc::auth::JwtKeySource>>,
+    /// Tenant binding inherited from the authority-verified ModelService call.
+    tenant_domain: String,
+    /// ModelService key allowed to bridge local calls into this tenant.
+    controller_pubkey: VerifyingKey,
 }
 
 impl InferenceServiceConfig {
@@ -2460,6 +2503,7 @@ impl InferenceServiceConfig {
     ) -> Self {
         let policy_signing_key = signing_key.clone();
         Self {
+            service_name: "inference".to_owned(),
             model_path: model_path.as_ref().to_path_buf(),
             config,
             server_pubkey,
@@ -2469,7 +2513,23 @@ impl InferenceServiceConfig {
             fs,
             expected_audience: None,
             jwt_key_source: None,
+            tenant_domain: "local".to_owned(),
+            controller_pubkey: server_pubkey,
         }
+    }
+
+    /// Bind this engine to one verified tenant and one controller identity.
+    #[must_use]
+    pub fn with_instance_identity(
+        mut self,
+        service_name: String,
+        tenant_domain: String,
+        controller_pubkey: VerifyingKey,
+    ) -> Self {
+        self.service_name = service_name;
+        self.tenant_domain = tenant_domain;
+        self.controller_pubkey = controller_pubkey;
+        self
     }
 
     /// Set the expected audience for JWT validation.
@@ -2490,7 +2550,7 @@ impl InferenceServiceConfig {
 
 impl hyprstream_service::Spawnable for InferenceServiceConfig {
     fn name(&self) -> &str {
-        "inference"
+        &self.service_name
     }
 
     fn registrations(&self) -> Vec<(hyprstream_rpc::registry::SocketKind, hyprstream_rpc::transport::TransportConfig)> {
@@ -2521,6 +2581,7 @@ impl hyprstream_service::Spawnable for InferenceServiceConfig {
 
             // Destructure so the (Send) config moves into the on-thread builder.
             let InferenceServiceConfig {
+                service_name: _,
                 model_path,
                 config,
                 server_pubkey,
@@ -2530,6 +2591,8 @@ impl hyprstream_service::Spawnable for InferenceServiceConfig {
                 fs,
                 expected_audience,
                 jwt_key_source,
+                tenant_domain,
+                controller_pubkey,
             } = *self;
             let adapter_transport = transport.clone();
 
@@ -2552,6 +2615,8 @@ impl hyprstream_service::Spawnable for InferenceServiceConfig {
                         Arc::clone(&bridge_nonce),
                         policy_client,
                         fs,
+                        tenant_domain,
+                        controller_pubkey,
                     )
                     .await
                     .map_err(|e| anyhow::anyhow!("inference init: {e}"))?;
@@ -2681,3 +2746,58 @@ impl StreamChunkMessage {
 
 // StreamHandle consolidated: uses hyprstream_rpc::streaming::StreamHandle (re-exported via rpc_types)
 // Use StreamChunkMessage::from_stream_payload() to convert StreamPayload → StreamChunkMessage
+
+#[cfg(test)]
+mod tenant_binding_tests {
+    use super::*;
+    use hyprstream_rpc::envelope::Subject;
+
+    fn key(seed: u8) -> SigningKey {
+        SigningKey::from_bytes(&[seed; 32])
+    }
+
+    #[test]
+    fn direct_request_must_match_instance_tenant() {
+        let controller = key(7).verifying_key();
+        let caller = key(8).verifying_key();
+        let same = EnvelopeContext::for_test_authenticated_subject_in_tenant(
+            Subject::new("alice"),
+            "tenant-a",
+            caller,
+        );
+        assert_eq!(
+            resolve_instance_domain("tenant-a", &controller, &same)
+                .unwrap_or_else(|e| panic!("matching tenant must pass: {e}")),
+            "tenant-a"
+        );
+
+        let other = EnvelopeContext::for_test_authenticated_subject_in_tenant(
+            Subject::new("mallory"),
+            "tenant-b",
+            caller,
+        );
+        assert!(resolve_instance_domain("tenant-a", &controller, &other).is_err());
+    }
+
+    #[test]
+    fn only_pinned_controller_can_bridge_local_domain() {
+        let controller = key(7).verifying_key();
+        let local_controller = EnvelopeContext::for_test_authenticated_subject_in_tenant(
+            Subject::new("system"),
+            "local",
+            controller,
+        );
+        assert_eq!(
+            resolve_instance_domain("tenant-a", &controller, &local_controller)
+                .unwrap_or_else(|e| panic!("pinned controller must pass: {e}")),
+            "tenant-a"
+        );
+
+        let impostor = EnvelopeContext::for_test_authenticated_subject_in_tenant(
+            Subject::new("system"),
+            "local",
+            key(9).verifying_key(),
+        );
+        assert!(resolve_instance_domain("tenant-a", &controller, &impostor).is_err());
+    }
+}
