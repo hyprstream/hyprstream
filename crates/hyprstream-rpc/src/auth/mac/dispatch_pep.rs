@@ -26,8 +26,9 @@
 //!                                         false ⇒ Deny(FloorDeny)
 //! ```
 //!
-//! Every `None` or `false` is a hard deny. There is **no permissive mode**
-//! (epic #547 invariant: "no unlabeled-default-allow").
+//! Once a PEP is installed, every `None` or `false` produced by that PEP is a
+//! hard deny. There is **no permissive mode inside an active PEP** (epic #547
+//! invariant: "no unlabeled-default-allow").
 //!
 //! ## Clearance provenance (#698 dependency)
 //!
@@ -39,10 +40,10 @@
 //!
 //! ## Process-global installation
 //!
-//! Like the PQ trust store and compiled MAC policy, the PEP is installed
-//! once at startup via [`install_mac_dispatch_pep`]. Until installed,
-//! [`global_mac_dispatch_pep`] returns `None` and `process_request` denies
-//! every request with [`MacDenyReason::NoPepInstalled`].
+//! Like the PQ trust store and compiled MAC policy, the PEP is installed at
+//! startup via [`install_mac_dispatch_pep`]. Until installed, MAC enforcement
+//! is dormant and dispatch remains a true pass-through. Once installed, every
+//! request is mediated and every installed-PEP denial is authoritative.
 
 use std::sync::Arc;
 
@@ -72,10 +73,11 @@ impl MacDecision {
 /// Why a MAC decision denied. Auditable and testable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MacDenyReason {
-    /// No PEP installed process-globally — fail-closed default.
+    /// The explicitly installed deny-all PEP has no operational policy.
     ///
-    /// This is the state of a node that has not yet constructed and installed
-    /// a PEP at startup. Every request is denied until the operator wires one.
+    /// An uninstalled PEP is the dormant, pass-through state and does not
+    /// produce this decision. [`DenyAllMacPep`] uses this reason when an
+    /// operator deliberately installs a fail-closed sentinel.
     NoPepInstalled,
     /// Subject has no derivable clearance (unlabeled subject).
     ///
@@ -145,8 +147,9 @@ impl RpcObjectLabelResolver for DenyAllObjectResolver {
 /// [`MacDecision::Deny`], the handler is never invoked — the error payload
 /// is signed and returned to the caller.
 ///
-/// If no PEP is installed process-globally, `process_request` denies every
-/// request with [`MacDenyReason::NoPepInstalled`] — there is no bypass.
+/// If no PEP is installed process-globally, MAC enforcement is dormant and
+/// `process_request` passes through without calling this trait. Once installed,
+/// this check is mandatory and cannot be bypassed.
 pub trait MacDispatchPep: Send + Sync {
     /// Check mandatory MAC access before handler dispatch.
     ///
@@ -225,8 +228,12 @@ impl MacDispatchPep for DefaultMacDispatchPep {
     }
 }
 
-/// A PEP that unconditionally denies. Used as the process-global default
-/// when no real PEP has been installed.
+/// A PEP that unconditionally denies.
+///
+/// Install this explicitly when dispatch must fail closed before a real
+/// object-label resolver is available. Merely leaving the global PEP
+/// uninstalled keeps MAC enforcement dormant and preserves pre-activation RPC
+/// behavior.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct DenyAllMacPep;
 
@@ -242,46 +249,6 @@ impl MacDispatchPep for DenyAllMacPep {
     }
 }
 
-/// A PEP that unconditionally permits — the **dormant** state.
-///
-/// This represents "MAC enforcement is intentionally off." Integration tests
-/// that exercise the RPC dispatch pipeline (but don't test MAC itself) install
-/// this so `process_request` doesn't deny with `NoPepInstalled`.
-///
-/// **NEVER use in production** — a dormant PEP provides zero MAC enforcement.
-/// Production installs a [`DefaultMacDispatchPep`] (or a production resolver)
-/// via [`install_mac_dispatch_pep`] at startup.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct DormantMacPep;
-
-impl MacDispatchPep for DormantMacPep {
-    #[inline]
-    fn check(
-        &self,
-        _ctx: &EnvelopeContext,
-        _service_domain: &str,
-        _method: Option<u16>,
-    ) -> MacDecision {
-        MacDecision::Permit
-    }
-}
-
-/// Test/integration helper: install the [`DormantMacPep`] if no PEP has been
-/// installed yet in this process. Idempotent (uses `Once`).
-///
-/// Integration tests call this at the start of each test to ensure
-/// `process_request` doesn't deny with `NoPepInstalled` when the test is
-/// exercising non-MAC functionality. Tests that specifically exercise MAC
-/// behavior install their own PEP instead.
-pub fn ensure_dormant_mac_pep() {
-    static INSTALL: std::sync::Once = std::sync::Once::new();
-    INSTALL.call_once(|| {
-        if global_mac_dispatch_pep().is_none() {
-            install_mac_dispatch_pep(Arc::new(DormantMacPep));
-        }
-    });
-}
-
 // ── Process-global installation ───────────────────────────────────────────
 
 static GLOBAL_PEP: parking_lot::RwLock<Option<Arc<dyn MacDispatchPep>>> =
@@ -291,38 +258,38 @@ static GLOBAL_PEP: parking_lot::RwLock<Option<Arc<dyn MacDispatchPep>>> =
 ///
 /// Production calls this exactly once at startup with a
 /// [`DefaultMacDispatchPep`] (or a production resolver). Until this is
-/// called, [`global_mac_dispatch_pep`] returns `None` and
-/// [`process_request`](crate::service::dispatch::process_request) denies
-/// every request with [`MacDenyReason::NoPepInstalled`] — fail-closed,
-/// not pass-through.
+/// called, [`global_mac_dispatch_pep`] returns `None` and MAC enforcement is
+/// dormant: [`process_request`](crate::service::dispatch::process_request)
+/// remains a true pass-through.
 ///
-/// Backed by `parking_lot::RwLock` (no poisoning) so that integration tests
-/// can install a dormant PEP per-binary. Production callers SHOULD install
-/// exactly once; the security boundary is the PEP trait itself (a PEP that
-/// denies is correct regardless of how many times it has been set).
+/// Backed by `parking_lot::RwLock` (no poisoning). Production callers SHOULD
+/// install exactly once; the security boundary is the PEP trait itself (a PEP
+/// that denies is correct regardless of how many times it has been set).
 ///
 /// # Activation gate (epic #1267)
 ///
-/// MAC enforcement is **off** (every request denied with `NoPepInstalled`)
-/// until a PEP is installed. Activation is a deliberate operator choice.
-/// There is no permissive default (epic #547 invariant).
+/// MAC enforcement is **off** until a PEP is installed. Activation is a
+/// deliberate operator choice. After activation, the installed PEP is
+/// mandatory and its missing-clearance, missing-label, and lattice-floor
+/// decisions fail closed.
 pub fn install_mac_dispatch_pep(pep: Arc<dyn MacDispatchPep>) {
     *GLOBAL_PEP.write() = Some(pep);
 }
 
 /// The installed MAC dispatch PEP, if any.
 ///
-/// `None` on a node that hasn't installed one — callers (specifically
-/// `process_request`) MUST fail closed ([`MacDenyReason::NoPepInstalled`]),
-/// never substitute a permissive default.
+/// `None` on a node that has not activated MAC enforcement. Dispatch treats
+/// this dormant state as pass-through so installing the PEP remains an
+/// explicit activation boundary.
 #[must_use]
 pub fn global_mac_dispatch_pep() -> Option<Arc<dyn MacDispatchPep>> {
     GLOBAL_PEP.read().clone()
 }
 
-/// The MAC decision `process_request` reaches when no PEP is installed.
-/// Exposed so tests and callers can assert the fail-closed default without
-/// constructing a full PEP.
+/// Check the installed dispatch PEP, or permit while enforcement is dormant.
+///
+/// Once a PEP is installed, its result is returned unchanged: an installed
+/// fail-closed PEP cannot be bypassed by this wrapper.
 #[must_use]
 pub fn check_dispatch_mac(
     ctx: &EnvelopeContext,
@@ -331,7 +298,7 @@ pub fn check_dispatch_mac(
 ) -> MacDecision {
     match global_mac_dispatch_pep() {
         Some(pep) => pep.check(ctx, service_domain, method),
-        None => MacDecision::Deny(MacDenyReason::NoPepInstalled),
+        None => MacDecision::Permit,
     }
 }
 
@@ -456,32 +423,29 @@ mod tests {
     }
 
     #[test]
-    fn check_dispatch_mac_denies_no_pep_installed() {
+    fn check_dispatch_mac_permits_while_pep_is_dormant() {
         reset_global_pep();
         assert!(global_mac_dispatch_pep().is_none());
 
         let ctx = ctx_with_clearance(Some(secret_label()));
         let decision = check_dispatch_mac(&ctx, "model", None);
-        assert_eq!(
-            decision,
-            MacDecision::Deny(MacDenyReason::NoPepInstalled)
-        );
+        assert_eq!(decision, MacDecision::Permit);
     }
 
     #[test]
     fn install_mac_dispatch_pep_is_swappable() {
         reset_global_pep();
 
-        let pep1: Arc<dyn MacDispatchPep> = Arc::new(DormantMacPep);
+        let pep1: Arc<dyn MacDispatchPep> = Arc::new(DefaultMacDispatchPep::fail_closed());
         install_mac_dispatch_pep(pep1);
         assert!(global_mac_dispatch_pep().is_some());
 
-        // Verify the installed PEP actually runs (DormantMacPep permits).
+        // Verify the installed PEP actually runs and fails closed.
         let ctx = ctx_with_clearance(Some(secret_label()));
         assert_eq!(
             check_dispatch_mac(&ctx, "model", None),
-            MacDecision::Permit,
-            "DormantMacPep must permit after install"
+            MacDecision::Deny(MacDenyReason::UnlabeledObject),
+            "installed PEP must fail closed on an unlabeled object"
         );
 
         // Swap to a deny-all PEP — the RwLock allows replacement.
@@ -495,29 +459,6 @@ mod tests {
 
         reset_global_pep();
     }
-
-    #[test]
-    fn dormant_pep_permits_everything() {
-        let pep = DormantMacPep;
-        let ctx = ctx_with_clearance(None); // even unlabeled
-        assert_eq!(pep.check(&ctx, "anything", None), MacDecision::Permit);
-    }
-
-    #[test]
-    fn ensure_dormant_mac_pep_installs_once() {
-        reset_global_pep();
-        assert!(global_mac_dispatch_pep().is_none());
-
-        ensure_dormant_mac_pep();
-        assert!(global_mac_dispatch_pep().is_some());
-
-        // Calling again is a no-op (Once guards).
-        ensure_dormant_mac_pep();
-        assert!(global_mac_dispatch_pep().is_some());
-
-        reset_global_pep();
-    }
-
     // ── MacDecision helpers ───────────────────────────────────────────
 
     #[test]

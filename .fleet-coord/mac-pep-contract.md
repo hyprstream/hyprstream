@@ -13,7 +13,7 @@ pub enum MacDecision { Permit, Deny(MacDenyReason) }
 
 /// Why a MAC decision denied. Auditable and testable.
 pub enum MacDenyReason {
-    NoPepInstalled,     // no PEP installed process-globally — fail-closed default
+    NoPepInstalled,     // explicitly installed deny-all sentinel has no policy
     NoClearance,        // subject has no derivable clearance (unlabeled subject)
     UnlabeledObject,    // object has no trusted label
     FloorDeny,          // clearance does not dominate the object label (lattice floor)
@@ -68,18 +68,15 @@ boundary.
 ## Process-global installation (RPC lane)
 
 ```rust
-/// Install the RPC dispatch PEP. RwLock-backed (swappable for tests).
-/// Until installed, process_request denies every request (NoPepInstalled).
+/// Install the RPC dispatch PEP. RwLock-backed.
+/// Until installed, MAC enforcement is dormant and dispatch passes through.
 pub fn install_mac_dispatch_pep(pep: Arc<dyn MacDispatchPep>);
 
-/// The installed PEP, if any. None ⇒ deny (NoPepInstalled).
+/// The installed PEP, if any. None means enforcement is dormant.
 pub fn global_mac_dispatch_pep() -> Option<Arc<dyn MacDispatchPep>>;
 
-/// Convenience: read global PEP, check, or deny if None.
+/// Check the global PEP, or permit if enforcement is dormant.
 pub fn check_dispatch_mac(ctx, service_domain, method) -> MacDecision;
-
-/// Test helper: install a DormantMacPep (permits everything). Idempotent.
-pub fn ensure_dormant_mac_pep();
 ```
 
 ## Integration point in `process_request`
@@ -92,9 +89,11 @@ check_dispatch_mac(ctx, domain, method) ← MANDATORY gate (#1268)
 handle_request(ctx, payload)            ← existing (line 228)
 ```
 
-**Fail-closed:** no PEP installed ⇒ `Deny(NoPepInstalled)`. There is NO
-pass-through / dormant path in dispatch. Integration tests install a
-`DormantMacPep` via `ensure_dormant_mac_pep()`.
+**Activation semantics:** no PEP installed means enforcement is dormant and
+dispatch is a true pass-through. Once a PEP is installed, every dispatch
+passes through its mandatory check and every denial is authoritative. The
+production-shaped PEP fails closed on missing clearance, missing labels, and
+lattice-floor denial.
 
 ## Streaming continuations — DEFERRED
 
@@ -116,7 +115,7 @@ a follow-up issue ([#1291](https://github.com/hyprstream/hyprstream/issues/1291)
 
 ## Rules (from #547, non-negotiable)
 
-1. **No permissive default.** Missing PEP, missing clearance, missing label ⇒ Deny.
+1. **No permissive active PEP.** Once installed, missing clearance or label ⇒ Deny.
 2. **MAC context is never a plaintext contract field** — derive from verified identity.
 3. **Method-level Casbin/TE is discretionary** — the MAC PEP is the mandatory floor.
 4. **Streaming continuations re-check** — DEFERRED (filed as follow-up; `StaleAuthority` reserved).

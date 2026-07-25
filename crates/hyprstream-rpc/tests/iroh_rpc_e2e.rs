@@ -16,7 +16,6 @@
 //! suite over iroh) requires `services/factories.rs` wiring — tracked as
 //! Phase 2 part 3 of #133.
 
-use hyprstream_rpc::auth::mac::ensure_dormant_mac_pep;
 use std::future::Future;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -159,7 +158,6 @@ where
 
 #[tokio::test]
 async fn silent_drop_oracle_rejects_nonresponsive_peer_control() {
-    ensure_dormant_mac_pep();
     let started = Instant::now();
     let assertion = tokio::spawn(assert_silent_drop(
         std::future::pending::<Result<Vec<u8>>>(),
@@ -237,7 +235,6 @@ where
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn hykem_encrypted_envelope_round_trip_over_iroh() -> Result<()> {
-    ensure_dormant_mac_pep();
     // ─── Server side ──────────────────────────────────────────────────────
     let server_signing = fresh_signing_key();
     let server_verifying: VerifyingKey = server_signing.verifying_key();
@@ -375,7 +372,6 @@ async fn hykem_encrypted_envelope_round_trip_over_iroh() -> Result<()> {
 /// before the echo handler runs. No attacker-triggered signed error is emitted.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cleartext_envelope_rejected_on_iroh_receive() -> Result<()> {
-    ensure_dormant_mac_pep();
     use hyprstream_rpc::envelope::{
         current_timestamp, generate_nonce, Authorization, RequestEnvelope,
     };
@@ -475,7 +471,6 @@ async fn cleartext_envelope_rejected_on_iroh_receive() -> Result<()> {
 /// processor extension point must be refused on a real iroh carrier.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn false_encrypted_marker_never_reaches_custom_processor_over_iroh() -> Result<()> {
-    ensure_dormant_mac_pep();
     use bytes::Bytes;
     use hyprstream_rpc::envelope::{
         current_timestamp, generate_nonce, Authorization, RequestEnvelope,
@@ -559,7 +554,6 @@ async fn false_encrypted_marker_never_reaches_custom_processor_over_iroh() -> Re
 /// and never invoke the application handler.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn repeated_garbage_is_silently_dropped_without_handler_work() -> Result<()> {
-    ensure_dormant_mac_pep();
     let server_signing = fresh_signing_key();
     let invocations = Arc::new(AtomicUsize::new(0));
     let bridge = LocalServiceBridge::spawn(

@@ -216,7 +216,8 @@ where
         let signed_response = sign_response(error_payload)?;
 
         let mut message = Builder::new_default();
-        let mut builder = message.init_root::<crate::common_capnp::response_envelope::Builder>();
+        let mut builder =
+            message.init_root::<crate::common_capnp::response_envelope::Builder>();
         signed_response.write_to(&mut builder);
 
         let mut bytes = Vec::new();
@@ -231,14 +232,13 @@ where
     // `NinePAccessDecider`. It composes the S1 two-input clearance derivation
     // (Claims × VerifiedKeyMaterial via `EnvelopeContext::security_context`)
     // with a trusted object-label resolver and the intrinsic `can_access`
-    // lattice floor. Fail-closed: no PEP installed, missing clearance, missing
-    // label, or lattice-floor deny ⇒ handler is never called.
+    // lattice floor. Once installed, the PEP fails closed: missing clearance,
+    // missing label, or lattice-floor deny ⇒ handler is never called.
     //
-    // There is NO pass-through / dormant mode in the dispatch path. If no PEP
-    // is installed process-globally (`install_mac_dispatch_pep`), every
-    // request denies with `NoPepInstalled` (epic #547 invariant: no
-    // permissive default). Integration tests that exercise the dispatch
-    // pipeline install a `DormantMacPep` via `ensure_dormant_mac_pep()`.
+    // **Activation gate (#1267):** until a node installs a PEP
+    // process-globally via `install_mac_dispatch_pep`, enforcement is dormant
+    // and this gate is a true pass-through. After activation, the installed
+    // PEP is mandatory and its decision is authoritative.
     //
     // Streaming continuations: the continuation produced by a permitted
     // handler inherits this dispatch-time Permit. Explicit re-check of
@@ -263,8 +263,7 @@ where
         let signed_response = sign_response(error_payload)?;
 
         let mut message = Builder::new_default();
-        let mut builder =
-            message.init_root::<crate::common_capnp::response_envelope::Builder>();
+        let mut builder = message.init_root::<crate::common_capnp::response_envelope::Builder>();
         signed_response.write_to(&mut builder);
 
         let mut bytes = Vec::new();
