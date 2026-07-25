@@ -9,10 +9,8 @@
 
 use std::sync::Arc;
 
-use super::dispatch_pep::{
-    DenyAllObjectResolver, MacDecision, MacDenyReason, RpcObjectLabelResolver,
-};
-use super::SecurityContext;
+use super::dispatch_pep::{MacDecision, MacDenyReason, RpcObjectLabelResolver};
+use super::{SecurityContext, SecurityLabel};
 use crate::envelope::Subject;
 
 /// The MoQ/event verb being authorized.
@@ -39,6 +37,50 @@ pub trait ClearanceSource: Send + Sync {
     fn clearance(&self, subject: &Subject) -> Option<SecurityContext>;
 }
 
+/// Why a MoQ MAC denial was recorded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MoqMacAuditReason {
+    /// A denial returned by the canonical shared MAC contract.
+    Mac(MacDenyReason),
+    /// An authorizer was installed, but moq-net exposed no per-track callback.
+    ///
+    /// The transport denies the whole session until #276 lands rather than
+    /// serving tracks that bypass the installed policy.
+    TrackAdmissionHookUnavailable,
+}
+
+/// Plane-neutral denial record handed to the parent crate's MAC audit adapter.
+///
+/// `hyprstream-rpc` cannot depend on `hyprstream`'s WAL without creating a
+/// crate cycle. Active construction therefore requires this record sink; the
+/// parent adapter converts it to the canonical signed [`AuditRecord`][1].
+///
+/// [1]: https://github.com/hyprstream/hyprstream/issues/573
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MoqMacAuditRecord {
+    /// Independently verified subject, or `None` for anonymous.
+    pub subject: Option<String>,
+    /// Track or event prefix whose access was denied.
+    pub object: String,
+    /// Operation that was denied.
+    pub action: MoqEventAction,
+    /// Resolved subject clearance, when resolution reached that step.
+    pub subject_clearance: Option<SecurityLabel>,
+    /// Resolved content label, when resolution reached that step.
+    pub object_label: Option<SecurityLabel>,
+    /// Exact denial cause.
+    pub reason: MoqMacAuditReason,
+}
+
+/// Required audit destination for an active MoQ/event MAC PEP.
+///
+/// Production supplies the parent crate's signed WAL adapter. There is
+/// deliberately no no-op/default implementation: an installed PEP must always
+/// attempt a durable audit write for every denial.
+pub trait MoqMacAuditSink: Send + Sync {
+    fn record_deny(&self, record: &MoqMacAuditRecord) -> Result<(), String>;
+}
+
 /// The installed MoQ/event MAC floor.
 ///
 /// Dormancy is represented by the caller not installing this PEP. Every check
@@ -46,18 +88,51 @@ pub trait ClearanceSource: Send + Sync {
 pub struct MoqEventPep {
     resolver: Arc<dyn RpcObjectLabelResolver>,
     clearance: Arc<dyn ClearanceSource>,
+    audit: Arc<dyn MoqMacAuditSink>,
 }
 
 impl MoqEventPep {
     /// Construct an active, fail-closed PEP from the canonical object-label
-    /// resolver and this plane's verified-subject clearance source.
+    /// resolver, verified-subject clearance source, and mandatory audit sink.
     pub fn new(
         resolver: Arc<dyn RpcObjectLabelResolver>,
         clearance: Arc<dyn ClearanceSource>,
+        audit: Arc<dyn MoqMacAuditSink>,
     ) -> Self {
         Self {
             resolver,
             clearance,
+            audit,
+        }
+    }
+
+    fn audit_deny(
+        &self,
+        subject: &Subject,
+        track_or_prefix: &str,
+        action: MoqEventAction,
+        subject_clearance: Option<SecurityLabel>,
+        object_label: Option<SecurityLabel>,
+        reason: MoqMacAuditReason,
+    ) {
+        let record = MoqMacAuditRecord {
+            subject: subject.name().map(str::to_owned),
+            object: track_or_prefix.to_owned(),
+            action,
+            subject_clearance,
+            object_label,
+            reason,
+        };
+        if let Err(error) = self.audit.record_deny(&record) {
+            tracing::error!(
+                target: "hyprstream.mac.audit",
+                %error,
+                subject = ?record.subject,
+                object = %record.object,
+                action = ?record.action,
+                reason = ?record.reason,
+                "MoQ MAC deny could not be durably audited; enforcing deny"
+            );
         }
     }
 
@@ -71,19 +146,63 @@ impl MoqEventPep {
         &self,
         subject: &Subject,
         track_or_prefix: &str,
-        _action: MoqEventAction,
+        action: MoqEventAction,
     ) -> MacDecision {
         let Some(subject_ctx) = self.clearance.clearance(subject) else {
-            return MacDecision::Deny(MacDenyReason::NoClearance);
+            let reason = MacDenyReason::NoClearance;
+            self.audit_deny(
+                subject,
+                track_or_prefix,
+                action,
+                None,
+                None,
+                MoqMacAuditReason::Mac(reason),
+            );
+            return MacDecision::Deny(reason);
         };
         let Some(object_label) = self.resolver.resolve(track_or_prefix, None) else {
-            return MacDecision::Deny(MacDenyReason::UnlabeledObject);
+            let reason = MacDenyReason::UnlabeledObject;
+            self.audit_deny(
+                subject,
+                track_or_prefix,
+                action,
+                Some(*subject_ctx.clearance()),
+                None,
+                MoqMacAuditReason::Mac(reason),
+            );
+            return MacDecision::Deny(reason);
         };
         if subject_ctx.can_access(&object_label) {
             MacDecision::Permit
         } else {
-            MacDecision::Deny(MacDenyReason::FloorDeny)
+            let reason = MacDenyReason::FloorDeny;
+            self.audit_deny(
+                subject,
+                track_or_prefix,
+                action,
+                Some(*subject_ctx.clearance()),
+                Some(object_label),
+                MoqMacAuditReason::Mac(reason),
+            );
+            MacDecision::Deny(reason)
         }
+    }
+
+    /// Audit and deny a transport session because no per-track callback exists.
+    ///
+    /// This is the fail-closed bridge to #276: an installed track authorizer
+    /// must never be retained as dead configuration while tracks are served.
+    pub fn deny_track_admission_without_hook(&self, subject: &Subject) {
+        self.audit_deny(
+            subject,
+            "<moq-session:track-hook-unavailable>",
+            MoqEventAction::Subscribe,
+            self.clearance
+                .clearance(subject)
+                .map(|ctx| *ctx.clearance()),
+            None,
+            MoqMacAuditReason::TrackAdmissionHookUnavailable,
+        );
     }
 
     pub fn resolver(&self) -> &Arc<dyn RpcObjectLabelResolver> {
@@ -105,20 +224,14 @@ impl ClearanceSource for DenyAllClearanceSource {
     }
 }
 
-impl Default for MoqEventPep {
-    fn default() -> Self {
-        Self::new(
-            Arc::new(DenyAllObjectResolver),
-            Arc::new(DenyAllClearanceSource),
-        )
-    }
-}
-
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use crate::auth::mac::{Assurance, CompartmentSet, Level, SecurityLabel, VerifiedKeyMaterial};
+    use crate::auth::mac::{
+        Assurance, CompartmentSet, DenyAllObjectResolver, Level, VerifiedKeyMaterial,
+    };
+    use parking_lot::Mutex;
 
     fn public_label() -> SecurityLabel {
         SecurityLabel::new(Level::Public, Assurance::Classical, CompartmentSet::EMPTY)
@@ -163,9 +276,26 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct RecordingAudit {
+        records: Mutex<Vec<MoqMacAuditRecord>>,
+    }
+
+    impl MoqMacAuditSink for RecordingAudit {
+        fn record_deny(&self, record: &MoqMacAuditRecord) -> Result<(), String> {
+            self.records.lock().push(record.clone());
+            Ok(())
+        }
+    }
+
     #[test]
-    fn installed_default_denies_missing_clearance() {
-        let pep = MoqEventPep::default();
+    fn installed_pep_audits_every_missing_clearance_deny() {
+        let audit = Arc::new(RecordingAudit::default());
+        let pep = MoqEventPep::new(
+            Arc::new(DenyAllObjectResolver),
+            Arc::new(DenyAllClearanceSource),
+            audit.clone(),
+        );
         for action in [
             MoqEventAction::Publish,
             MoqEventAction::Subscribe,
@@ -176,15 +306,22 @@ mod tests {
                 MacDecision::Deny(MacDenyReason::NoClearance)
             );
         }
+        let records = audit.records.lock();
+        assert_eq!(records.len(), 3);
+        assert!(records
+            .iter()
+            .all(|record| { record.reason == MoqMacAuditReason::Mac(MacDenyReason::NoClearance) }));
     }
 
     #[test]
     fn installed_pep_denies_unlabeled_object() {
+        let audit = Arc::new(RecordingAudit::default());
         let pep = MoqEventPep::new(
             Arc::new(DenyAllObjectResolver),
             Arc::new(TieredClearance {
                 cleared_did: "did:web:cleared".to_owned(),
             }),
+            audit.clone(),
         );
         assert_eq!(
             pep.check(
@@ -194,10 +331,17 @@ mod tests {
             ),
             MacDecision::Deny(MacDenyReason::UnlabeledObject)
         );
+        let records = audit.records.lock();
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].reason,
+            MoqMacAuditReason::Mac(MacDenyReason::UnlabeledObject)
+        );
     }
 
     #[test]
     fn installed_pep_enforces_label_ceiling_for_every_action() {
+        let audit = Arc::new(RecordingAudit::default());
         let pep = MoqEventPep::new(
             Arc::new(StaticResolver {
                 secret_track: "tenant/streams/secret".to_owned(),
@@ -205,6 +349,7 @@ mod tests {
             Arc::new(TieredClearance {
                 cleared_did: "did:web:cleared".to_owned(),
             }),
+            audit.clone(),
         );
         for action in [
             MoqEventAction::Publish,
@@ -228,5 +373,10 @@ mod tests {
                 MacDecision::Permit
             );
         }
+        let records = audit.records.lock();
+        assert_eq!(records.len(), 3);
+        assert!(records
+            .iter()
+            .all(|record| record.reason == MoqMacAuditReason::Mac(MacDenyReason::FloorDeny)));
     }
 }

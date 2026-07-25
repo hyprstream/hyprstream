@@ -33,9 +33,11 @@
 //!
 //! The **subscribe authorization hook** ([`SubscribeAuthorizer`]) is the
 //! pluggable policy layer on top of that structural scoping, for the
-//! public-vs-private distinction within a tenant. It is wired where the peer
-//! identity needed to evaluate policy is actually available (see the wiring
-//! notes on [`SubscribeAuthorizer`]).
+//! public-vs-private distinction within a tenant. Until moq-net exposes the
+//! per-track callback tracked by #276, installing an authorizer rejects the
+//! session at admission. This is intentionally coarse but fail-closed: an
+//! installed policy is never retained as dead configuration while tracks are
+//! served around it.
 //!
 //! Track names are hierarchical `{tenant}/{service}/{topic}/{instance}` (the
 //! #134 CDN-portability invariant). The first path segment is the tenant.
@@ -217,6 +219,14 @@ impl PeerIdentity {
 pub trait SubscribeAuthorizer: Send + Sync {
     /// Decide whether `peer` may subscribe to `track_name`.
     fn authorize(&self, peer: &PeerIdentity, track_name: &str) -> SubscribeDecision;
+
+    /// Decide admission while moq-net provides no track name callback (#276).
+    ///
+    /// The default is deny. Implementations with an audit path should override
+    /// this method to record the coarse session denial.
+    fn authorize_without_track_hook(&self, _peer: &PeerIdentity) -> SubscribeDecision {
+        SubscribeDecision::Deny
+    }
 }
 
 /// Classifies a track name as public or private. Returning [`Visibility::Public`]
@@ -342,6 +352,15 @@ impl SubscribeAuthorizer for MacSubscribeAuthorizer {
         } else {
             SubscribeDecision::Deny
         }
+    }
+
+    fn authorize_without_track_hook(&self, peer: &PeerIdentity) -> SubscribeDecision {
+        let subject = match &peer.subject {
+            Some(s) => Subject::new(s.clone()),
+            None => Subject::anonymous(),
+        };
+        self.pep.deny_track_admission_without_hook(&subject);
+        SubscribeDecision::Deny
     }
 }
 
@@ -584,8 +603,32 @@ mod scope_tests {
 
     #[test]
     fn mac_subscribe_authorizer_fail_closed_denies_all() {
+        use crate::auth::mac::{
+            DenyAllClearanceSource, DenyAllObjectResolver, MoqMacAuditReason, MoqMacAuditRecord,
+            MoqMacAuditSink,
+        };
+        use parking_lot::Mutex;
+
+        #[derive(Default)]
+        struct RecordingAudit {
+            records: Mutex<Vec<MoqMacAuditRecord>>,
+        }
+        impl MoqMacAuditSink for RecordingAudit {
+            fn record_deny(&self, record: &MoqMacAuditRecord) -> Result<(), String> {
+                self.records.lock().push(record.clone());
+                Ok(())
+            }
+        }
+
         // Once installed, missing clearance/labels deny.
-        let authz = super::MacSubscribeAuthorizer::new(crate::auth::mac::MoqEventPep::default());
+        let audit = Arc::new(RecordingAudit::default());
+        let authz = Arc::new(super::MacSubscribeAuthorizer::new(
+            crate::auth::mac::MoqEventPep::new(
+                Arc::new(DenyAllObjectResolver),
+                Arc::new(DenyAllClearanceSource),
+                audit.clone(),
+            ),
+        ));
         assert_eq!(
             authz.authorize(&PeerIdentity::anonymous(), "t"),
             SubscribeDecision::Deny
@@ -593,6 +636,18 @@ mod scope_tests {
         assert_eq!(
             authz.authorize(&PeerIdentity::authenticated("did:web:x"), "t"),
             SubscribeDecision::Deny
+        );
+        let config =
+            crate::transport::iroh_moq::MoqAuthzConfig::default().with_authorizer(authz);
+        assert_eq!(
+            config.authorize_without_track_hook(&PeerIdentity::authenticated("did:web:x")),
+            SubscribeDecision::Deny
+        );
+        let records = audit.records.lock();
+        assert_eq!(records.len(), 3);
+        assert_eq!(
+            records[2].reason,
+            MoqMacAuditReason::TrackAdmissionHookUnavailable
         );
     }
 }

@@ -32,7 +32,9 @@ use moq_net::{Origin, OriginConsumer, OriginProducer, Server, StatsHandle};
 use tokio_util::sync::CancellationToken;
 use web_transport_iroh::Session;
 
-use crate::moq_authz::{tenant_scoped_consumer, PeerIdentity, SharedSubscribeAuthorizer};
+use crate::moq_authz::{
+    tenant_scoped_consumer, PeerIdentity, SharedSubscribeAuthorizer, SubscribeDecision,
+};
 
 /// Resolves the tenant for an independently authenticated application peer.
 /// Carrier NodeId is never passed here. Until a caller can supply fresh proof,
@@ -61,6 +63,19 @@ impl MoqAuthzConfig {
     pub fn with_authorizer(mut self, authorizer: SharedSubscribeAuthorizer) -> Self {
         self.authorizer = Some(authorizer);
         self
+    }
+
+    /// Gate an MoQ session while the transport cannot surface track names.
+    ///
+    /// Dormant (`None`) preserves the legacy pass-through. Once an authorizer
+    /// is installed, its coarse admission decision is mandatory; current
+    /// implementations deny until moq-net's #276 per-track callback exists.
+    pub fn authorize_without_track_hook(&self, peer: &PeerIdentity) -> SubscribeDecision {
+        self.authorizer
+            .as_ref()
+            .map_or(SubscribeDecision::Allow, |a| {
+                a.authorize_without_track_hook(peer)
+            })
     }
 }
 
@@ -209,6 +224,18 @@ impl ProtocolHandler for IrohMoqProtocolHandler {
         // Carrier NodeId is transport metadata only. Until #1027 supplies fresh
         // inside-carrier proof, authorization must see an anonymous peer.
         let peer = PeerIdentity::anonymous();
+        if !self
+            .inner
+            .authz
+            .authorize_without_track_hook(&peer)
+            .is_allowed()
+        {
+            tracing::warn!(
+                "iroh-moq: installed track authorizer denied session because #276 callback is unavailable"
+            );
+            conn.close(0u32.into(), b"per-track authorization unavailable");
+            return Ok(());
+        }
         if !peer.is_authenticated() {
             tracing::warn!(
                 "iroh-moq: refusing anonymous carrier pending verified session proof (#1027/#726)"
@@ -249,18 +276,6 @@ impl ProtocolHandler for IrohMoqProtocolHandler {
                 return Ok(());
             }
         };
-
-        // NOTE (#276 subscribe-authz seam): `moq_net::Server` exposes no
-        // per-subscribe callback, so we cannot gate individual `subscribe_track`
-        // calls in-band. The public/private decision is therefore enforced
-        // *structurally* by what the served consumer can see (tenant scoping
-        // above). The pluggable `SubscribeAuthorizer` is retained as the policy
-        // unit a richer moq-net (one that surfaces a subscribe hook) would call;
-        // it is exercised by unit tests in `crate::moq_authz`. Until moq-net
-        // grows that hook, private-vs-public must be expressed as scoping (e.g.
-        // a private broadcast lives under a prefix only entitled peers' tenant
-        // scope includes).
-        let _authorizer = self.inner.authz.authorizer.as_ref();
 
         let session = Session::raw(conn);
         let server = Server::new()

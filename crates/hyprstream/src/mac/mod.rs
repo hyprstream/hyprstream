@@ -69,6 +69,7 @@ pub mod exchange;
 // ObjectLabelResolver + boot-time coverage gate consumed by the active 9P PEP.
 pub mod genesis;
 pub mod lattice;
+pub mod moq_audit;
 // #676: the production S3-scope ↔ S5-TE-rule vocabulary (injective + exact;
 // wildcards expand at compile time over a closed registry).
 // #1270: CAS-native MAC PEP — trusted content-bound label at seal +
@@ -115,9 +116,10 @@ pub use compiler::{
 };
 // S1 activation (#567): production genesis content/enumerator/resolver/gate.
 pub use genesis::{
-    floor_label, genesis_lattice, CompositeObjectLabelResolver, GeneratedNodeCoverage,
-    GenesisGate, ManifestLabelSource, NamespaceEnumerator, NoManifests, SitePolicy,
+    floor_label, genesis_lattice, CompositeObjectLabelResolver, GeneratedNodeCoverage, GenesisGate,
+    ManifestLabelSource, NamespaceEnumerator, NoManifests, SitePolicy,
 };
+pub use moq_audit::{audited_moq_event_pep, MoqAuditSinkAdapter};
 // #1270: CAS-native MAC PEP — the shared CAS enforcement contract.
 pub use cas_pep::{
     domain_label, seal_label, CasClearanceSource, CasObjectLabelResolver, CasPep,

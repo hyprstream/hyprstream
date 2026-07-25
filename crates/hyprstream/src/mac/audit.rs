@@ -212,7 +212,7 @@ pub struct AuditRecord {
     /// plane has a stable identifier. Omitted for legacy/type-only records.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subject_id: Option<String>,
-    /// Concrete tenant-qualified object, when known. Omitted for
+    /// Concrete tenant-qualified object/track, when known. Omitted for
     /// legacy/type-only records.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub object_id: Option<String>,
@@ -242,6 +242,14 @@ pub enum DecisionReason {
     /// **Fail-closed:** the audit write failed, so a Permit was downgraded to
     /// Deny. This is itself auditable (the deny is what the PEP enforced).
     AuditFailClosed,
+    /// The active MoQ/event PEP could not derive subject clearance.
+    MoqUnlabeledSubject,
+    /// The explicitly installed MoQ/event PEP had no operational policy.
+    MoqNoPepInstalled,
+    /// A streaming continuation's MoQ authority was stale or revoked.
+    MoqStaleAuthority,
+    /// Track admission was denied because moq-net has no #276 callback.
+    MoqTrackAdmissionHookUnavailable,
 
     // ── B2 (#674): the S6 grant-path decision kind (see [`crate::mac::te::
     // GRANT_PATH_SUBJECT`]). One variant per `mac::exchange::GrantError`
@@ -283,6 +291,12 @@ impl DecisionReason {
             DecisionReason::Escalate => "escalate",
             DecisionReason::TokenGate => "token_gate",
             DecisionReason::AuditFailClosed => "audit_fail_closed",
+            DecisionReason::MoqUnlabeledSubject => "moq_unlabeled_subject",
+            DecisionReason::MoqNoPepInstalled => "moq_no_pep_installed",
+            DecisionReason::MoqStaleAuthority => "moq_stale_authority",
+            DecisionReason::MoqTrackAdmissionHookUnavailable => {
+                "moq_track_admission_hook_unavailable"
+            }
             DecisionReason::GrantMissingSenderBinding => "grant_missing_sender_binding",
             DecisionReason::GrantEmptyGrant => "grant_empty_grant",
             DecisionReason::GrantUnlabeledSubject => "grant_unlabeled_subject",

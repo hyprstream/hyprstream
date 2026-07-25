@@ -9,7 +9,8 @@ PR: https://github.com/hyprstream/hyprstream/pull/1296 (branch `feat/mac-moq-eve
   parallel verdict, deny-reason, or resolver contract.
 - `MoqEventPep` is the active event/MoQ PEP. An installed instance fails
   closed on missing verified-subject clearance, missing object labels, and
-  lattice-floor denial.
+  lattice-floor denial. Construction requires an audit sink; the parent
+  `MoqAuditSinkAdapter` writes denials into the canonical signed MAC WAL.
 - Dormant event/MoQ enforcement remains pass-through. Public event publishers
   and subscribers retain the pre-activation `AllowAllEventAuthz`, and MoQ
   transports retain `MoqAuthzConfig::default()` with no installed authorizer.
@@ -24,16 +25,26 @@ PR: https://github.com/hyprstream/hyprstream/pull/1296 (branch `feat/mac-moq-eve
   tenant binding; public/node-global event sources retain their global prefix.
 - `EventSubscriber` carries an injected authz and independently verified
   subject. Key release is checked before the HyKEM epoch grant is opened, and
-  received objects are checked before passthrough/decrypt.
-- `MacSubscribeAuthorizer` adapts the same PEP to the MoQ subscribe surface.
-  The existing structural verified-tenant consumer scoping remains intact.
+  received objects are checked before passthrough/decrypt. `try_recv` returns
+  an explicit error for a subscribe denial; it never reports that denial as an
+  empty queue.
+- `MacSubscribeAuthorizer` adapts the same PEP to the MoQ authorization
+  contract. The existing structural verified-tenant consumer scoping remains
+  intact.
 
-## Known external seam
+## #276 transport dependency and current fail-closed gate
 
-`moq_net::Server` still has no per-subscribe callback (#276), so the transport
-authorizer is available for installation and unit-tested but is not invoked
-per-track by `moq_net` itself. Event-plane enforcement is active at the event
-publisher/subscriber boundary.
+`moq_net::Server` still has no per-subscribe callback
+([#276](https://github.com/hyprstream/hyprstream/issues/276)). Consequently
+this PR does **not** claim live per-track policy decisions at the transport
+surface. Instead, both iroh and quinn reject the entire MoQ session whenever a
+track authorizer is installed; the MAC adapter records that denial through the
+same WAL path. Dormant transports with no installed authorizer retain their
+pre-activation behavior. Once #276 supplies the callback, the coarse admission
+gate can call `authorize(peer, track)` per track.
+
+Event-plane publishing, subscribing, and join/decrypt are independently
+mediated when `MacEventAuthz` is installed.
 
 ## Review gate
 

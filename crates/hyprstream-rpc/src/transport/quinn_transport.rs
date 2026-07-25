@@ -526,6 +526,21 @@ impl QuinnRpcServer {
                         };
 
                         if is_moq {
+                            let moq_peer = moq_connect_verified.as_ref().map_or_else(
+                                crate::moq_authz::PeerIdentity::anonymous,
+                                |verified| verified.peer.clone(),
+                            );
+                            if !moq_authz
+                                .authorize_without_track_hook(&moq_peer)
+                                .is_allowed()
+                            {
+                                tracing::warn!(
+                                    subject = ?moq_peer.subject,
+                                    "quinn-moq: installed track authorizer denied session because #276 callback is unavailable"
+                                );
+                                return;
+                            }
+
                             // Relay (bidirectional) mode takes precedence (#358):
                             // ingest a producer's announced broadcasts into the
                             // shared origin AND re-serve them to subscribers by
@@ -665,11 +680,6 @@ impl QuinnRpcServer {
                                             }
                                         }
                                     };
-                                    // See iroh_moq::accept for why the authorizer
-                                    // is not enforced per-track here (moq-net has
-                                    // no subscribe callback); structural scoping
-                                    // is the live enforcement.
-                                    let _authorizer = moq_authz.authorizer.as_ref();
                                     // Serve moq over this session, mirroring
                                     // IrohMoqProtocolHandler: publish the shared
                                     // origin consumer to remote subscribers.

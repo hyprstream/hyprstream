@@ -1256,7 +1256,10 @@ impl EventSubscriber {
     /// Try to receive without blocking. Same decode/decrypt behavior as
     /// [`Self::recv`], except a frame that fails to decode/verify/decrypt is
     /// dropped and `Ok(None)` returned immediately rather than continuing to
-    /// poll (this method must not block).
+    /// poll (this method must not block). Authorization denials are different:
+    /// they are returned as an explicit error (and an installed MAC adapter
+    /// audits the denial) so callers cannot confuse enforcement with an empty
+    /// queue.
     pub fn try_recv(&mut self) -> Result<Option<(String, Vec<u8>)>> {
         let Some((topic, raw)) = self.inner.try_recv()? else {
             return Ok(None);
@@ -1271,7 +1274,9 @@ impl EventSubscriber {
             ));
         }
         if !self.authz.can_subscribe(&self.caller, prefix) {
-            return Ok(None);
+            return Err(anyhow!(
+                "subscribe denied by event-plane MAC for prefix '{prefix}'"
+            ));
         }
         Ok(Some((topic, raw)))
     }
@@ -1481,6 +1486,40 @@ mod tests {
         let mut secret = [0u8; 32];
         rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut secret);
         SigningKey::from_bytes(&secret)
+    }
+
+    #[tokio::test]
+    async fn try_recv_surfaces_subscribe_denial_as_error() {
+        let origin = crate::moq_event::MoqEventOrigin::new();
+        let source = format!("mac-deny-{}", rand::random::<u64>());
+        let mut publisher = origin.publisher(&source).unwrap();
+        let mut subscriber = EventSubscriber {
+            inner: MoqEventSubscriber::new_for_test(origin.consumer()),
+            prefixes: Arc::new(RwLock::new(HashMap::new())),
+            tenant: Arc::new(RwLock::new(None)),
+            authz: Arc::new(DenyAllEventAuthz),
+            caller: Subject::new("did:web:denied"),
+        };
+        subscriber.subscribe(&format!("{source}.")).unwrap();
+
+        // Start the background reader, then publish until it has relayed a
+        // frame into this subscriber's non-blocking queue.
+        assert!(subscriber.try_recv().unwrap().is_none());
+        for _ in 0..50 {
+            publisher.publish("object", "changed", b"payload").unwrap();
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            match subscriber.try_recv() {
+                Err(error) => {
+                    assert!(error
+                        .to_string()
+                        .contains("subscribe denied by event-plane MAC"));
+                    return;
+                }
+                Ok(None) => {}
+                Ok(Some(_)) => panic!("denied event must never be returned"),
+            }
+        }
+        panic!("subscriber did not observe the test frame");
     }
 
     fn member(recipient: &RecipientKeypair, did: &str, blind: u8) -> GroupMembership {
