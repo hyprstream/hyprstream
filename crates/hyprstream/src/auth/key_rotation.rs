@@ -2650,6 +2650,7 @@ mod tests {
                         dpop_jkt: None,
                         issuer: None,
                         tenant: None,
+                        require_clearance: false,
                     })
                     .await?
                     .token;
@@ -2777,6 +2778,7 @@ mod tests {
                         dpop_jkt: None,
                         issuer: None,
                         tenant: None,
+                        require_clearance: false,
                     })
                     .await;
                 anyhow::ensure!(result.is_err(), "stale PolicyService minted a token");
@@ -2937,6 +2939,7 @@ mod tests {
                         dpop_jkt: None,
                         issuer: None,
                         tenant: None,
+                        require_clearance: false,
                     })
                     .await?
                     .token;
@@ -3072,6 +3075,7 @@ mod tests {
                         dpop_jkt: None,
                         issuer: None,
                         tenant: None,
+                        require_clearance: false,
                     })
                     .await?;
                 let client = reqwest::Client::new();
@@ -3302,6 +3306,7 @@ mod tests {
                         dpop_jkt: None,
                         issuer: None,
                         tenant: None,
+                        require_clearance: false,
                     })
                     .await?
                     .token;

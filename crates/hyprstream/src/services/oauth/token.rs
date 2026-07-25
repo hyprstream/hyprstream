@@ -75,6 +75,8 @@ pub struct TokenRequest {
     pub scope: Option<String>,
     #[serde(default)]
     pub audience: Option<String>,
+    #[serde(default)]
+    pub tenant: Option<String>,
 }
 
 /// POST /oauth/token — token exchange
@@ -170,6 +172,7 @@ pub async fn exchange_token(
                 params.scope.as_deref(),
                 params.actor_token.as_deref(),
                 params.requested_token_type.as_deref(),
+                params.tenant.as_deref(),
             ).await
         }
         _ => token_error(
@@ -1018,6 +1021,7 @@ async fn issue_token_with_refresh(
             dpop_jkt: dpop_jkt.clone(),
             issuer: Some(token_issuer.clone()),
             tenant: None,
+            require_clearance: false,
         })
         .await;
 
@@ -1601,6 +1605,7 @@ mod tests {
             actor_token: None,
             scope: None,
             audience: None,
+            tenant: None,
         };
         let resp = exchange_refresh_token(Arc::clone(&state), params, None, None, None).await;
 
@@ -1666,6 +1671,7 @@ mod tests {
             actor_token: None,
             scope: None,
             audience: None,
+            tenant: None,
         };
         let resp = exchange_refresh_token(state.clone(), params, None, None, None).await;
 

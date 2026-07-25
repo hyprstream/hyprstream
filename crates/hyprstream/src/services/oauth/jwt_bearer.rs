@@ -111,6 +111,7 @@ pub async fn exchange_jwt_bearer(
             dpop_jkt: None,
             issuer: None,
             tenant: claims.tenant.clone(),
+            require_clearance: false,
         })
         .await;
 

@@ -115,6 +115,10 @@ pub fn create_app(state: Arc<OAuthState>, cors_config: &crate::config::CorsConfi
         )
         .route("/oauth/register", post(registration::register_client))
         .route(
+            "/xrpc/ai.hyprstream.identity.exchangeUcan",
+            post(token_exchange::exchange_atproto_ucan),
+        )
+        .route(
             "/oauth/authorize",
             get(authorize::authorize_get).post(authorize::authorize_post),
         )
@@ -1352,7 +1356,19 @@ mod tests {
             git2db,
             TransportConfig::inproc(&policy_tag),
         )
-        .with_default_audience(GENERIC_ISSUER.to_owned());
+        .with_default_audience(GENERIC_ISSUER.to_owned())
+        .with_token_clearance_resolver(Arc::new(|subject| {
+            use hyprstream_rpc::auth::mac::{
+                Assurance, CompartmentSet, Level, SecurityLabel,
+            };
+            (subject == MAPPED_DID).then(|| {
+                SecurityLabel::new(
+                    Level::Secret,
+                    Assurance::PqHybrid,
+                    CompartmentSet::single(0),
+                )
+            })
+        }));
         let manager = InprocManager::new();
         let mut policy_handle = manager.spawn(Box::new(policy_service)).await?;
         let policy_client = PolicyClient::for_local_endpoint_bootstrap(
@@ -1403,13 +1419,49 @@ mod tests {
         let mut config = crate::config::OAuthConfig::default();
         // Generic OAuth preserves this path; atproto emissions use its origin.
         config.external_url = Some(GENERIC_ISSUER.to_owned());
+
+        struct FixtureAtprotoDidResolver(serde_json::Value);
+        #[async_trait::async_trait]
+        impl super::state::AtprotoDidDocumentResolver for FixtureAtprotoDidResolver {
+            async fn resolve_document(&self, did: &str) -> anyhow::Result<serde_json::Value> {
+                anyhow::ensure!(
+                    self.0.get("id").and_then(serde_json::Value::as_str) == Some(did),
+                    "fixture DID mismatch"
+                );
+                Ok(self.0.clone())
+            }
+        }
+        let atproto_signing_key =
+            p256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
+        let mut atproto_multikey = vec![0x80, 0x24];
+        atproto_multikey.extend_from_slice(
+            atproto_signing_key
+                .verifying_key()
+                .to_encoded_point(true)
+                .as_bytes(),
+        );
+        let atproto_document = serde_json::json!({
+            "id": MAPPED_DID,
+            "verificationMethod": [{
+                "id": format!("{MAPPED_DID}#atproto"),
+                "type": "Multikey",
+                "controller": MAPPED_DID,
+                "publicKeyMultibase": format!(
+                    "z{}",
+                    bs58::encode(atproto_multikey).into_string()
+                )
+            }]
+        });
         let mut oauth_state = OAuthState::new(
             &config,
             policy_client,
             DiscoveryClient::new(dummy_rpc),
             service_key.verifying_key().to_bytes(),
         )
-        .with_user_store(user_store);
+        .with_user_store(user_store)
+        .with_atproto_did_resolver(Arc::new(FixtureAtprotoDidResolver(
+            atproto_document,
+        )));
         let token_dir = tempfile::TempDir::new()?;
         oauth_state.with_token_store_impl(Arc::new(RocksDbTokenStore::open(
             token_dir.path().join("refresh.db"),
@@ -1483,6 +1535,131 @@ mod tests {
             ..Default::default()
         };
         let app = create_app(Arc::clone(&state), &cors);
+
+        // #1119 demo path: exact lxm/aud service auth becomes a tenant-scoped,
+        // authority-labeled local session credential.
+        let now = chrono::Utc::now().timestamp();
+        let service_header = URL_SAFE_NO_PAD.encode(
+            serde_json::to_vec(&serde_json::json!({
+                "alg": "ES256", "typ": "JWT", "kid": "#atproto"
+            }))?,
+        );
+        let make_service_jwt = |audience: &str, lxm: &str, jti: &str| -> anyhow::Result<String> {
+            let payload = URL_SAFE_NO_PAD.encode(
+                serde_json::to_vec(&serde_json::json!({
+                    "iss": MAPPED_DID,
+                    "aud": audience,
+                    "iat": now,
+                    "exp": now + 60,
+                    "lxm": lxm,
+                    "jti": jti
+                }))?,
+            );
+            let signing_input = format!("{service_header}.{payload}");
+            let signature: p256::ecdsa::Signature =
+                atproto_signing_key.sign(signing_input.as_bytes());
+            Ok(format!(
+                "{signing_input}.{}",
+                URL_SAFE_NO_PAD.encode(signature.to_bytes())
+            ))
+        };
+        let service_jwt = make_service_jwt(
+            "did:web:pds.example.test",
+            token_exchange::ATPROTO_EXCHANGE_NSID,
+            "demo-1119-jti",
+        )?;
+        use tower::ServiceExt as _;
+        let exchange_request = |jwt: &str| {
+            axum::http::Request::post("/xrpc/ai.hyprstream.identity.exchangeUcan")
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .header(
+                    axum::http::header::AUTHORIZATION,
+                    format!("Bearer {jwt}"),
+                )
+                .body(axum::body::Body::from(
+                    serde_json::json!({
+                        "tenant": "tenant-demo",
+                        "scope": "transition:generic",
+                        "audience": ISSUER
+                    })
+                    .to_string(),
+                ))
+                .unwrap()
+        };
+        let wrong_audience = make_service_jwt(
+            "did:web:other.example",
+            token_exchange::ATPROTO_EXCHANGE_NSID,
+            "demo-1119-wrong-aud",
+        )?;
+        let rejected_audience = app
+            .clone()
+            .oneshot(exchange_request(&wrong_audience))
+            .await?;
+        assert_eq!(
+            rejected_audience.status(),
+            axum::http::StatusCode::UNAUTHORIZED
+        );
+        let wrong_lxm = make_service_jwt(
+            "did:web:pds.example.test",
+            "com.atproto.repo.uploadBlob",
+            "demo-1119-wrong-lxm",
+        )?;
+        let rejected_lxm = app.clone().oneshot(exchange_request(&wrong_lxm)).await?;
+        assert_eq!(rejected_lxm.status(), axum::http::StatusCode::UNAUTHORIZED);
+
+        let exchanged = app.clone().oneshot(exchange_request(&service_jwt)).await?;
+        assert_eq!(exchanged.status(), axum::http::StatusCode::OK);
+        let exchanged_json = response_json(exchanged).await;
+        assert_eq!(exchanged_json["token_type"], "Bearer");
+        assert!(
+            exchanged_json["expires_in"].as_i64().is_some_and(|ttl| {
+                ttl > 0 && ttl <= i64::from(token_exchange::MAX_ATPROTO_EXCHANGE_TOKEN_TTL)
+            })
+        );
+        let exchanged_token = exchanged_json["access_token"].as_str().unwrap();
+        let exchanged_claims = jwt_claims(exchanged_token);
+        assert_eq!(exchanged_claims["sub"], MAPPED_DID);
+        assert_eq!(exchanged_claims["tenant"], "tenant-demo");
+        assert_eq!(exchanged_claims["scope"], "transition:generic");
+        assert_eq!(exchanged_claims["clearance"]["level"], "secret");
+        assert_eq!(exchanged_claims["clearance"]["assurance"], "classical");
+        assert!(
+            exchanged_claims.get("cnf").is_none(),
+            "service-auth is bearer auth; do not fabricate sender binding"
+        );
+
+        // verified_tenant survives for a local issuer and is stripped at the
+        // federation boundary.
+        let mut local_claims = auth::validate_oauth_access_token(&state, exchanged_token)
+            .await
+            .map_err(anyhow::Error::msg)?;
+        local_claims.strip_federated_tenant(&[GENERIC_ISSUER]);
+        assert_eq!(local_claims.tenant.as_deref(), Some("tenant-demo"));
+        use hyprstream_rpc::auth::mac::SubjectContextClaims as _;
+        let subject_context = local_claims
+            .security_context(hyprstream_rpc::auth::mac::VerifiedKeyMaterial::Classical)
+            .expect("exchange must produce a labeled subject");
+        let authorized_object = hyprstream_rpc::auth::mac::SecurityLabel::new(
+            hyprstream_rpc::auth::mac::Level::Confidential,
+            hyprstream_rpc::auth::mac::Assurance::Classical,
+            hyprstream_rpc::auth::mac::CompartmentSet::single(0),
+        );
+        assert!(subject_context.can_access(&authorized_object));
+        let pq_only_object = hyprstream_rpc::auth::mac::SecurityLabel::new(
+            hyprstream_rpc::auth::mac::Level::Public,
+            hyprstream_rpc::auth::mac::Assurance::PqHybrid,
+            hyprstream_rpc::auth::mac::CompartmentSet::EMPTY,
+        );
+        assert!(!subject_context.can_access(&pq_only_object));
+        local_claims.iss = "https://foreign.example".to_owned();
+        local_claims.strip_federated_tenant(&[GENERIC_ISSUER]);
+        local_claims.strip_federated_clearance(&[GENERIC_ISSUER]);
+        assert_eq!(local_claims.tenant, None);
+        assert_eq!(local_claims.clearance, None);
+
+        let replay = app.clone().oneshot(exchange_request(&service_jwt)).await?;
+        assert_eq!(replay.status(), axum::http::StatusCode::BAD_REQUEST);
+        assert_eq!(response_json(replay).await["error"], "InvalidToken");
 
         // Device authorization rejects unknown clients at the real endpoint.
         let unknown_device = post_form(
@@ -2339,6 +2516,7 @@ mod tests {
                 dpop_jkt: None,
                 issuer: None,
                 tenant: None,
+                require_clearance: false,
             })
             .await?
             .token;
@@ -2370,6 +2548,7 @@ mod tests {
                 dpop_jkt: None,
                 issuer: None,
                 tenant: None,
+                require_clearance: false,
             })
             .await?
             .token;
@@ -2417,6 +2596,7 @@ mod tests {
                 dpop_jkt: None,
                 issuer: None,
                 tenant: None,
+                require_clearance: false,
             })
             .await?
             .token;

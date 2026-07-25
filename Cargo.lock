@@ -6814,6 +6814,7 @@ dependencies = [
  "iroh",
  "json-threat-protection",
  "jsonwebtoken 10.3.0",
+ "k256",
  "keyring",
  "libc",
  "listenfd",

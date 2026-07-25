@@ -186,6 +186,40 @@ where
         true
     }
 
+    /// Atomically insert `key` only if it is absent and capacity is available.
+    ///
+    /// Unlike [`Self::insert_if_absent`], this variant never evicts a live
+    /// entry to make room. It returns `false` for either a duplicate key or a
+    /// full cache. This fail-closed behavior is intended for replay caches
+    /// whose live entries are security state: evicting one early would allow
+    /// the corresponding assertion to be accepted again.
+    pub fn insert_if_absent_no_evict(&self, key: K, value: V, ttl: Duration) -> bool {
+        let now = Instant::now();
+        let expires_at = now + ttl;
+        let version = self.next_version.fetch_add(1, Ordering::Relaxed);
+
+        let mut inner = self.inner.lock();
+        Self::reap(&mut inner, now, self.reap_budget);
+
+        if inner.entries.contains_key(&key) || inner.entries.len() >= self.max_entries {
+            return false;
+        }
+        inner.entries.insert(
+            key.clone(),
+            Entry {
+                value,
+                expires_at,
+                version,
+            },
+        );
+        inner.heap.push(Reverse(HeapEntry {
+            expires_at,
+            key,
+            version,
+        }));
+        true
+    }
+
     /// Look up `key`, returning a clone of the value if present and not
     /// yet expired. Performs a bounded inline reap first.
     ///
@@ -378,5 +412,17 @@ mod tests {
         assert!(cache.insert_if_absent("jti".to_owned(), (), Duration::from_millis(5)));
         std::thread::sleep(Duration::from_millis(20));
         assert!(cache.insert_if_absent("jti".to_owned(), (), Duration::from_secs(60)));
+    }
+
+    #[test]
+    fn insert_if_absent_no_evict_fails_closed_at_capacity() {
+        let cache: TtlCache<String, ()> = TtlCache::new(2, 16);
+        assert!(cache.insert_if_absent_no_evict("jti-1".to_owned(), (), Duration::from_secs(60)));
+        assert!(cache.insert_if_absent_no_evict("jti-2".to_owned(), (), Duration::from_secs(60)));
+
+        assert!(!cache.insert_if_absent_no_evict("jti-3".to_owned(), (), Duration::from_secs(60)));
+        assert_eq!(cache.len(), 2);
+        assert_eq!(cache.get("jti-1"), Some(()));
+        assert_eq!(cache.get("jti-2"), Some(()));
     }
 }
