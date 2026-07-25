@@ -7,47 +7,65 @@
 //!
 //! # Instruments
 //!
-//! - `inference_tokens_total` — `Counter<u64>` (unit "tokens"), cumulative tokens
-//!   consumed, with attributes `kind` = `prompt` | `generated`, `model`, and an
-//!   **opaque hashed** tenant id.
-//! - `inference_request_tokens` — `Histogram<u64>` (unit "tokens"), total tokens
-//!   (prompt + generated) per request, same `model` / `tenant` attributes.
+//! - `inference_tokens_total` — `Counter<u64>` (unit `{token}`, UCUM custom-unit
+//!   form), cumulative tokens consumed, with attributes `kind` =
+//!   `prompt` | `generated`, `model`, and an **opaque keyed-hash** tenant id.
+//! - `inference_request_tokens` — `Histogram<u64>` (unit `{token}`), total tokens
+//!   (prompt + generated) per request, with `model` / `tenant` attributes only.
 //!
 //! # Security
 //!
 //! The raw request subject is **never** used as a metric attribute: metrics are
 //! aggregatable across tenants and must not carry tenant-identifying content. The
-//! tenant is reduced to an opaque 64-bit hash via [`opaque_tenant_id`] before it
-//! becomes an attribute. Prompt text, token text, and generated text are likewise
-//! never in metrics — only integer counts. See the no-leak canary test in
-//! [`crate::runtime::torch_engine`] which guards the same property for logs.
+//! tenant is reduced to an opaque keyed hash via [`opaque_tenant_id`] before it
+//! becomes an attribute. Prompt text, token text, generated text, and token IDs
+//! are likewise never in metrics — only integer counts. See the no-leak canary
+//! test in [`crate::runtime::torch_engine`] which guards the same property for
+//! logs.
+//!
+//! # Platform gating
+//!
+//! The opentelemetry dependency family is not wasm32-compatible, so the crates
+//! are target-gated in `Cargo.toml` and the instruments here compile only for
+//! `all(feature = "otel", not(target_arch = "wasm32"))`. Everywhere else a no-op
+//! [`TokenBurnMeter`] keeps the call sites compiling — the wasm/browser client
+//! pays no metric cost and non-`otel` builds meter nothing.
 
-#[cfg(feature = "otel")]
+#[cfg(all(feature = "otel", not(target_arch = "wasm32")))]
 mod metered {
+    use once_cell::sync::Lazy;
     use opentelemetry::{KeyValue, metrics::Meter};
 
     /// OTel meter scope name for inference token-burn instruments.
     const METER_NAME: &str = "hyprstream.inference";
     const METRIC_TOKENS_TOTAL: &str = "inference_tokens_total";
     const METRIC_REQUEST_TOKENS: &str = "inference_request_tokens";
-    const UNIT: &str = "tokens";
+    /// UCUM custom-unit form for token counts (OTel convention: `{unit}`).
+    const UNIT: &str = "{token}";
 
     const KIND_PROMPT: &str = "prompt";
     const KIND_GENERATED: &str = "generated";
-    const KIND_TOTAL: &str = "total";
 
-    /// Build the (kind, model, opaque-tenant) attribute set for a metric point.
-    fn attrs(kind: &str, model: &str, tenant: Option<u64>) -> [KeyValue; 3] {
-        let tenant_attr = match tenant {
-            // Opaque hashed id; never the raw subject.
+    /// The tenant attribute: opaque keyed-hash id, never the raw subject.
+    fn tenant_attr(tenant: Option<u64>) -> KeyValue {
+        match tenant {
             Some(h) => KeyValue::new("tenant", format!("tenant:{h:016x}")),
             None => KeyValue::new("tenant", "anonymous"),
-        };
+        }
+    }
+
+    /// (kind, model, opaque-tenant) attribute set for the counter.
+    fn counter_attrs(kind: &str, model: &str, tenant: Option<u64>) -> [KeyValue; 3] {
         [
             KeyValue::new("kind", kind.to_owned()),
             KeyValue::new("model", model.to_owned()),
-            tenant_attr,
+            tenant_attr(tenant),
         ]
+    }
+
+    /// (model, opaque-tenant) attribute set for the per-request histogram.
+    fn request_attrs(model: &str, tenant: Option<u64>) -> [KeyValue; 2] {
+        [KeyValue::new("model", model.to_owned()), tenant_attr(tenant)]
     }
 
     /// Token-burn instruments built from an OTel [`Meter`].
@@ -68,8 +86,8 @@ mod metered {
             Self::from_meter(opentelemetry::global::meter(METER_NAME))
         }
 
-        /// Build from an explicit meter — used in tests with a local SDK meter
-        /// provider so recording can be asserted hermetically.
+        /// Build from an explicit meter — the test seam, used with a local SDK
+        /// meter provider so recording can be asserted hermetically.
         pub fn from_meter(meter: Meter) -> Self {
             Self {
                 tokens_total: meter
@@ -93,7 +111,7 @@ mod metered {
                 return;
             }
             self.tokens_total
-                .add(count, &attrs(KIND_PROMPT, model, tenant));
+                .add(count, &counter_attrs(KIND_PROMPT, model, tenant));
         }
 
         /// Record generated tokens produced by a completed request.
@@ -102,30 +120,43 @@ mod metered {
                 return;
             }
             self.tokens_total
-                .add(count, &attrs(KIND_GENERATED, model, tenant));
+                .add(count, &counter_attrs(KIND_GENERATED, model, tenant));
         }
 
         /// Record the per-request token total (prompt + generated) on the histogram.
         pub fn record_request_total(&self, model: &str, tenant: Option<u64>, total: u64) {
             // Record even when total == 0 so an empty-generation request is still
             // observable as a sample; the counter carries the non-zero breakdown.
-            self.request_tokens
-                .record(total, &attrs(KIND_TOTAL, model, tenant));
+            self.request_tokens.record(total, &request_attrs(model, tenant));
         }
+    }
+
+    /// Process-global instrument bundle, built **once** on first recording — not
+    /// per request (#1261 review: instrument construction must not be hot-path
+    /// work). Built lazily so a provider installed at startup (`init_telemetry`)
+    /// is already in place; if recording ever raced ahead of provider install,
+    /// the global meter defers and connects the instruments once the provider is
+    /// set, so no points are lost.
+    static GLOBAL_METER: Lazy<TokenBurnMeter> = Lazy::new(TokenBurnMeter::global);
+
+    /// Shared process-global token-burn instruments.
+    pub fn global_meter() -> &'static TokenBurnMeter {
+        &GLOBAL_METER
     }
 }
 
-#[cfg(feature = "otel")]
-pub use metered::TokenBurnMeter;
+#[cfg(all(feature = "otel", not(target_arch = "wasm32")))]
+pub use metered::{TokenBurnMeter, global_meter};
 
-/// No-op instruments when the `otel` feature is disabled.
+/// No-op instruments when the `otel` feature is disabled or the target is wasm32
+/// (the opentelemetry crates are not wasm-compatible and are target-gated out).
 ///
 /// Keeps the recording call sites compiling without an OTel SDK so non-`otel`
-/// builds still meter nothing without conditionalizing every call site.
-#[cfg(not(feature = "otel"))]
+/// and wasm builds meter nothing without conditionalizing every call site.
+#[cfg(not(all(feature = "otel", not(target_arch = "wasm32"))))]
 pub struct TokenBurnMeter;
 
-#[cfg(not(feature = "otel"))]
+#[cfg(not(all(feature = "otel", not(target_arch = "wasm32"))))]
 impl TokenBurnMeter {
     pub fn global() -> Self {
         Self
@@ -135,35 +166,56 @@ impl TokenBurnMeter {
     pub fn record_request_total(&self, _model: &str, _tenant: Option<u64>, _total: u64) {}
 }
 
-/// Reduce a raw tenant subject to an opaque, stable 64-bit id for metric attrs.
-///
-/// The tenant subject is never carried verbatim in metrics (it is aggregatable
-/// across tenants and must not leak identity). A deterministic hash is emitted so
-/// the same tenant maps to the same opaque id across process restarts, enabling
-/// continuity in dashboards without ever revealing the subject. Returns `None`
-/// when no tenant is in scope.
-///
-/// This is pure std and available regardless of the `otel` feature so it can be
-/// unit-tested hermetically.
-pub fn opaque_tenant_id(tenant: &Option<String>) -> Option<u64> {
-    use std::hash::{Hash, Hasher};
-    let subject = tenant.as_ref()?;
-    // DefaultHasher is deterministic (fixed SipHash keys), not the per-process
-    // randomized RandomState — chosen deliberately for cross-restart stability.
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    subject.hash(&mut hasher);
-    Some(hasher.finish())
+/// Shared no-op instruments for non-`otel` / wasm32 builds.
+#[cfg(not(all(feature = "otel", not(target_arch = "wasm32"))))]
+pub fn global_meter() -> &'static TokenBurnMeter {
+    static NOOP_METER: TokenBurnMeter = TokenBurnMeter;
+    &NOOP_METER
 }
 
-#[cfg(all(test, feature = "otel"))]
+/// Reduce a raw tenant subject to an opaque 64-bit id for metric attrs and
+/// tenant-safe logs.
+///
+/// The tenant subject is never carried verbatim in metrics or logs (metrics are
+/// aggregatable across tenants and must not leak identity). The hash is a
+/// SipHash keyed with **process-random** keys (`RandomState`, drawn from the OS
+/// RNG): an unkeyed hash such as `DefaultHasher::new()` is offline-enumerable —
+/// anyone can precompute the ids of guessed low-entropy subjects (#1261 review).
+/// With a random key the id is stable within the process but cannot be
+/// precomputed or correlated across deployments. Returns `None` when no tenant
+/// is in scope.
+///
+/// This is pure std and available regardless of the `otel` feature or target so
+/// it can be unit-tested hermetically and reused by tenant-safe logging.
+pub fn opaque_tenant_id(tenant: &Option<String>) -> Option<u64> {
+    use std::collections::hash_map::RandomState;
+    use std::hash::BuildHasher;
+    use std::sync::OnceLock;
+
+    static TENANT_HASH_KEY: OnceLock<RandomState> = OnceLock::new();
+
+    let subject = tenant.as_ref()?;
+    Some(TENANT_HASH_KEY.get_or_init(RandomState::new).hash_one(subject))
+}
+
+#[cfg(all(test, feature = "otel", not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
     use opentelemetry::metrics::MeterProvider;
     use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData};
     use opentelemetry_sdk::metrics::{InMemoryMetricExporter, PeriodicReader, SdkMeterProvider};
 
+    /// Render a data point's attributes as a sorted `k=v` list for exact
+    /// set comparisons.
+    fn attr_set<'a, I: Iterator<Item = &'a opentelemetry::KeyValue>>(attrs: I) -> Vec<String> {
+        let mut v: Vec<String> = attrs.map(|kv| format!("{}={}", kv.key, kv.value)).collect();
+        v.sort();
+        v
+    }
+
     /// Drive the meter through a real SDK pipeline (in-memory exporter) and assert
-    /// token burn lands on the right instruments with opaque, never-raw tenant attrs.
+    /// token burn lands on the right instruments with the exact attribute contract
+    /// and opaque, never-raw tenant attrs.
     #[test]
     fn token_burn_meter_records_prompt_and_generated() -> Result<(), Box<dyn std::error::Error>> {
         let exporter = InMemoryMetricExporter::default();
@@ -175,6 +227,7 @@ mod tests {
 
         let tenant_hash = opaque_tenant_id(&Some("did:web:acme.example".to_owned()));
         assert!(tenant_hash.is_some(), "tenant hashes to an opaque id");
+        let expected_tenant = format!("tenant=tenant:{:016x}", tenant_hash.unwrap_or(0));
         m.record_prompt("test-model", tenant_hash, 10);
         m.record_generated("test-model", tenant_hash, 7);
         m.record_request_total("test-model", tenant_hash, 17);
@@ -182,35 +235,31 @@ mod tests {
         provider.force_flush()?;
         let collected = exporter.get_finished_metrics()?;
 
-        // Flatten (name, sum-or-count, serialized-attrs) across scopes/instruments.
-        let mut counter_sum: u64 = 0;
-        let mut histogram_count: u64 = 0;
-        let mut histogram_sum: u64 = 0;
+        let mut counter_points: Vec<(Vec<String>, u64)> = Vec::new();
+        let mut counter_unit = String::new();
+        let mut histogram_points: Vec<(Vec<String>, u64, u64)> = Vec::new();
+        let mut histogram_unit = String::new();
         let mut any_attrs = String::new();
         for rm in collected {
             for sm in rm.scope_metrics() {
                 for metric in sm.metrics() {
-                    let name = metric.name();
                     match metric.data() {
                         AggregatedMetrics::U64(MetricData::Sum(s)) => {
+                            assert_eq!(metric.name(), "inference_tokens_total");
+                            counter_unit = metric.unit().to_owned();
                             for dp in s.data_points() {
-                                if name == "inference_tokens_total" {
-                                    counter_sum += dp.value();
-                                }
-                                for kv in dp.attributes() {
-                                    any_attrs.push_str(&format!("{kv:?}"));
-                                }
+                                let attrs = attr_set(dp.attributes());
+                                any_attrs.push_str(&attrs.join(","));
+                                counter_points.push((attrs, dp.value()));
                             }
                         }
                         AggregatedMetrics::U64(MetricData::Histogram(h)) => {
+                            assert_eq!(metric.name(), "inference_request_tokens");
+                            histogram_unit = metric.unit().to_owned();
                             for dp in h.data_points() {
-                                if name == "inference_request_tokens" {
-                                    histogram_count += dp.count();
-                                    histogram_sum += dp.sum();
-                                }
-                                for kv in dp.attributes() {
-                                    any_attrs.push_str(&format!("{kv:?}"));
-                                }
+                                let attrs = attr_set(dp.attributes());
+                                any_attrs.push_str(&attrs.join(","));
+                                histogram_points.push((attrs, dp.count(), dp.sum()));
                             }
                         }
                         _ => {}
@@ -219,21 +268,46 @@ mod tests {
             }
         }
 
-        // Counter: 10 (prompt) + 7 (generated) = 17 cumulative tokens.
-        assert_eq!(counter_sum, 17, "inference_tokens_total should sum to 17");
-        // Histogram: one request totaling 17 tokens.
-        assert_eq!(histogram_count, 1, "one request recorded on the histogram");
-        assert_eq!(histogram_sum, 17, "histogram total should be 17");
+        // Units use the UCUM custom-unit form.
+        assert_eq!(counter_unit, "{token}", "counter unit");
+        assert_eq!(histogram_unit, "{token}", "histogram unit");
 
-        // The raw tenant subject must never appear in metric attributes; only the
-        // opaque hash form does.
+        // Counter: exactly two points — kind=prompt (10) and kind=generated (7) —
+        // each with the exact (kind, model, tenant) attribute set. The SDK does
+        // not guarantee data-point order, so sort before comparing.
+        counter_points.sort();
+        let expected_prompt_attrs = vec![
+            "kind=prompt".to_owned(),
+            "model=test-model".to_owned(),
+            expected_tenant.clone(),
+        ];
+        let expected_generated_attrs = vec![
+            "kind=generated".to_owned(),
+            "model=test-model".to_owned(),
+            expected_tenant.clone(),
+        ];
+        assert_eq!(
+            counter_points,
+            vec![
+                (expected_generated_attrs, 7),
+                (expected_prompt_attrs, 10),
+            ],
+            "counter points must be exactly prompt=10 and generated=7 with exact attrs"
+        );
+
+        // Histogram: exactly one point (count 1, sum 17) with ONLY the
+        // (model, tenant) attribute set — no kind.
+        let expected_histogram_attrs = vec!["model=test-model".to_owned(), expected_tenant];
+        assert_eq!(
+            histogram_points,
+            vec![(expected_histogram_attrs, 1, 17)],
+            "histogram must carry one request of 17 tokens with (model, tenant) attrs only"
+        );
+
+        // The raw tenant subject must never appear in metric attributes.
         assert!(
             !any_attrs.contains("acme.example"),
             "raw tenant subject leaked into metric attrs: {any_attrs}"
-        );
-        assert!(
-            any_attrs.contains("tenant:"),
-            "opaque tenant attr missing: {any_attrs}"
         );
         Ok(())
     }

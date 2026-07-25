@@ -156,6 +156,18 @@ ratatui = { version = "0.30", default-features = false }  # TUI framework for pa
 critical-section = { version = "1", features = ["std"] }
 vte = "0.13"  # VT100/ANSI escape sequence parser for TUI pane ingestion
 
+# OpenTelemetry (0.30 + OTLP/stdout exporters + tokio) is not wasm32-compatible.
+# The `otel` feature stays in the default set, but the dependency family only
+# resolves for non-wasm targets; the OTel code paths are cfg-gated to match and
+# fall back to a no-op on wasm32 (#1253/#1261, browser client).
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tracing-opentelemetry = { workspace = true, optional = true }
+opentelemetry = { workspace = true, optional = true }
+opentelemetry_sdk = { workspace = true, optional = true }
+opentelemetry-otlp = { workspace = true, optional = true }
+opentelemetry-semantic-conventions = { workspace = true, optional = true }
+opentelemetry-stdout = { workspace = true, optional = true }
+
 [target.'cfg(target_os = "linux")'.dependencies]
 lru.workspace = true  # LRU cache for model caching and Git repository handles
 dashmap.workspace = true  # Concurrent HashMap for thread-safe repository caching
@@ -275,7 +287,9 @@ tokio-tungstenite = "0.24"
 # Test-only: the `testing` feature exposes `InMemoryMetricExporter` for the
 # token-burn meter tests. The SDK compiles it under cfg(test) or this feature;
 # dependencies are not built with cfg(test), so the feature is required here.
-# Dev-only, so production builds are unaffected.
+# Dev-only and non-wasm-only (the OTel family is target-gated off wasm32), so
+# production and wasm builds are unaffected.
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 opentelemetry_sdk = { workspace = true, features = ["testing"] }
 
 [lints]

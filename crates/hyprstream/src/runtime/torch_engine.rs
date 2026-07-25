@@ -2342,11 +2342,12 @@ mod tests {
     /// regardless of tokenization outcome — success, empty-token failure, or
     /// roundtrip mismatch.
     ///
-    /// (Cancellation and stream-error paths were audited: after this change they
-    /// log only token IDs and error objects, never prompt or generated text.
-    /// They require a full model to drive, so the content-bearing tokenization
-    /// outcomes — which are exactly where the prompt is handled — are covered
-    /// hermetically here.)
+    /// (Generation, stop, cancellation, and stream-error paths were audited:
+    /// after the #1261 redaction they log only positions/counts and error
+    /// objects — never prompt text, generated text, or token IDs, which are
+    /// reversible to text via the loaded tokenizer. Those paths require a full
+    /// model to drive, so the content-bearing tokenization outcomes — which are
+    /// exactly where the prompt is handled — are covered hermetically here.)
     #[test]
     fn tokenize_redacted_never_logs_prompt_content() {
         let tokenizer = redact_test_tokenizer();
@@ -2706,7 +2707,7 @@ impl<'a> TextStream<'a> {
         // authoritative spend ledger is #1264.
         let tenant_hash = crate::runtime::token_metrics::opaque_tenant_id(&tenant_id);
         let model_label = engine.model_label();
-        crate::runtime::token_metrics::TokenBurnMeter::global()
+        crate::runtime::token_metrics::global_meter()
             .record_prompt(&model_label, tenant_hash, prompt_len as u64);
 
         let tokenizer = engine.get_tokenizer()?;
@@ -3071,9 +3072,11 @@ impl<'a> TextStream<'a> {
             })?;
 
             if self.tokens_generated.is_multiple_of(50) {
+                // Counts/positions only — token IDs are reversible to text via the
+                // loaded tokenizer and must never hit process logs (#1253/#1261).
                 tracing::debug!(
-                    "🔵 KV cache position: {}, tokens_generated: {}, last_token: {}",
-                    self.kv_cache_position, self.tokens_generated, last_token
+                    "🔵 KV cache position: {}, tokens_generated: {}",
+                    self.kv_cache_position, self.tokens_generated
                 );
             }
 
@@ -3294,7 +3297,10 @@ impl<'a> Stream for TextStream<'a> {
 
             // Check EOS
             if self.engine.is_eos_token(next_token as usize) {
-                tracing::debug!("EOS token detected: {}", next_token);
+                tracing::debug!(
+                    "EOS token detected at generated position {}",
+                    self.tokens_generated
+                );
                 self.finished = true;
                 self.finish_reason = Some(FinishReason::EndOfSequence);
                 return Poll::Ready(None);
@@ -3302,7 +3308,12 @@ impl<'a> Stream for TextStream<'a> {
 
             // Check stop tokens
             if self.stop_token_ids.contains(&next_token) {
-                tracing::debug!("Stop token ID {} detected", next_token);
+                // Never log the matched stop-token ID: it identifies a
+                // caller-supplied stop string (#1253/#1261). Position only.
+                tracing::debug!(
+                    "Stop token matched at generated position {}",
+                    self.tokens_generated
+                );
                 self.finished = true;
                 self.finish_reason = Some(FinishReason::StopToken(format!("{next_token}")));
                 return Poll::Ready(None);
@@ -3344,14 +3355,23 @@ impl<'a> Stream for TextStream<'a> {
                         self.recent_tokens.pop_front();
                     }
 
-                    // Simple trace without expensive tokenizer lock or decode
-                    tracing::trace!("Token {} -> buffering (incomplete UTF-8)", next_token);
+                    // Simple trace without expensive tokenizer lock or decode.
+                    // Counts/positions only — token IDs are reversible to text
+                    // and must never hit process logs (#1253/#1261).
+                    tracing::trace!(
+                        "Token at generated position {} buffering (incomplete UTF-8)",
+                        self.tokens_generated
+                    );
                     continue;
                 }
                 Err(e) => {
                     // CRITICAL: Do NOT update state on decode_stream error
                     // This prevents state corruption and keeps generation consistent
-                    tracing::error!("DecodeStream error on token {}: {}", next_token, e);
+                    tracing::error!(
+                        "DecodeStream error at generated position {}: {}",
+                        self.tokens_generated,
+                        e
+                    );
                     self.finished = true;
                     self.finish_reason = Some(FinishReason::Error(e.to_string()));
                     return Poll::Ready(Some(Err(anyhow::anyhow!("Decode error: {}", e))));
@@ -3372,7 +3392,7 @@ impl<'a> Drop for TextStream<'a> {
         // covers normal EOS, stop-token, max-tokens, timeout, and error finishes.
         // Only integer counts and the opaque tenant hash are metric attributes (#1253).
         let generated = self.tokens_generated as u64;
-        let meter = crate::runtime::token_metrics::TokenBurnMeter::global();
+        let meter = crate::runtime::token_metrics::global_meter();
         meter.record_generated(&self.model_label, self.tenant_hash, generated);
         meter.record_request_total(
             &self.model_label,

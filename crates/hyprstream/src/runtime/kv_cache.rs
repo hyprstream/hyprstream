@@ -449,10 +449,15 @@ impl KVCacheRegistry {
         }
 
         if invalidated > 0 {
+            // Never log the raw tenant subject (#1253/#1261 review): emit the
+            // same opaque keyed-hash id used for metric attributes.
+            let opaque = crate::runtime::token_metrics::opaque_tenant_id(&Some(
+                tenant_id.to_owned(),
+            ));
             tracing::info!(
-                "Invalidated {} KV caches dependent on subject delta '{}'",
+                "Invalidated {} KV caches dependent on subject delta (tenant {})",
                 invalidated,
-                tenant_id
+                opaque.map_or_else(|| "anonymous".to_owned(), |h| format!("tenant:{h:016x}"))
             );
         }
 
