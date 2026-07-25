@@ -104,12 +104,20 @@
 
 pub mod bind;
 pub mod context;
+// #1268: the mandatory RPC dispatch PEP — fail-closed gate between
+// verify_claims and handle_request in process_request.
+pub mod dispatch_pep;
 pub mod genesis;
 pub mod label;
 pub mod lattice;
 pub mod manifest;
 
 pub use bind::{clamp_descendant, BindLabel, BindLabelMap};
+pub use dispatch_pep::{
+    check_dispatch_mac, global_mac_dispatch_pep, install_mac_dispatch_pep, DefaultMacDispatchPep,
+    DenyAllMacPep, DenyAllObjectResolver, MacDecision, MacDenyReason, MacDispatchPep,
+    RpcObjectLabelResolver,
+};
 pub use context::{SecurityContext, SubjectContextClaims, VerifiedKeyMaterial};
 pub use genesis::{GenesisMap, GenesisReport};
 pub use label::{
