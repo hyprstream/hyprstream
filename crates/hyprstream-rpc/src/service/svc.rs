@@ -313,7 +313,7 @@ impl EnvelopeContext {
             .as_deref()
             .ok_or_else(|| anyhow::anyhow!("authorization denied: no verified tenant domain"))?;
         anyhow::ensure!(
-            !tenant.is_empty() && tenant != "*",
+            !tenant.trim().is_empty() && tenant != "*",
             "authorization denied: empty or wildcard tenant domain"
         );
         Ok(tenant.to_owned())
@@ -1296,7 +1296,7 @@ mod policy_tenant_domain_tests {
     }
 
     #[test]
-    fn missing_and_wildcard_tenant_domains_fail_closed() {
+    fn missing_wildcard_and_blank_tenant_domains_fail_closed() {
         let signer = SigningKey::from_bytes(&[0x45; 32]).verifying_key();
         let missing =
             EnvelopeContext::for_test_authenticated_subject(Subject::new("alice"), signer);
@@ -1305,9 +1305,21 @@ mod policy_tenant_domain_tests {
             "*",
             signer,
         );
+        let empty = EnvelopeContext::for_test_authenticated_subject_in_tenant(
+            Subject::new("alice"),
+            "",
+            signer,
+        );
+        let whitespace = EnvelopeContext::for_test_authenticated_subject_in_tenant(
+            Subject::new("alice"),
+            " \t\n",
+            signer,
+        );
 
         assert!(missing.domain().is_err());
         assert!(wildcard.domain().is_err());
+        assert!(empty.domain().is_err());
+        assert!(whitespace.domain().is_err());
     }
 }
 
