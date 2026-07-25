@@ -19,6 +19,7 @@ production-authority = { max-threads = 1 }
 [[profile.ci.overrides]]
 filter = 'test(=auth::key_rotation::tests::composite_authority_production_paths_reject_semantic_rollback)'
 test-group = 'production-authority'
+retries = 2  # heavyweight self-re-exec + spawned authority subprocesses: internally flaky under variable runner speed even when serialized. Scoped retry — this test ONLY, no global masking. See #1275.
 # This test re-execs the release test binary and runs several authority
 # processes concurrently. Reserve the runner while it owns that process tree.
 threads-required = "num-cpus"
