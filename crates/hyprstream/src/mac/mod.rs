@@ -118,7 +118,11 @@ pub use genesis::{
     floor_label, genesis_lattice, CompositeObjectLabelResolver, GeneratedNodeCoverage,
     GenesisGate, ManifestLabelSource, NamespaceEnumerator, NoManifests, SitePolicy,
 };
-pub use pep::{production_ninep_decider, NinePAccessDecider};
+pub use pep::{
+    enrollment_ninep_reference_monitor, production_ninep_decider,
+    production_ninep_reference_monitor, EnrollmentClearanceSource, NinePAccessDecider,
+    NinePClearanceSource, VerifiedClearanceSessionFactory,
+};
 // #1270: CAS-native MAC PEP — the shared CAS enforcement contract.
 pub use cas_pep::{
     domain_label, seal_label, CasClearanceSource, CasObjectLabelResolver, CasPep,

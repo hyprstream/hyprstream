@@ -83,5 +83,5 @@ pub use translator::{
 pub use mac_seam::{
     anonymous_floor, AccessDecider, Action, AnonymousAuthenticator, AttachAuthenticator,
     DenyAllDecider, DenyUnlabeledResolver, ObjectLabelResolver, ObjectRef, ReferenceMonitor,
-    SessionContext, VerifiedAttachIdentity, VerifiedTokenScope,
+    ReferenceMonitorDenyReason, SessionContext, VerifiedAttachIdentity, VerifiedTokenScope,
 };

@@ -386,6 +386,32 @@ impl SecurityLabel {
             && object.compartments.is_subset(self.compartments)
     }
 
+    /// Bell–LaPadula *-property (confinement / no-write-down): may a subject
+    /// with clearance `self` **write** to an object labelled `object`?
+    ///
+    /// The write-direction dual of [`can_access`]. A subject may write only to
+    /// objects at least as restrictive as its own clearance — preventing a
+    /// high-level subject from leaking secrets to a lower-level object:
+    /// - `object.level >= self.level`              (no-write-down)
+    /// - `self.assurance >= object.assurance`       (crypto floor is NOT flipped —
+    ///   you cannot write to a higher-assurance object than your key proves)
+    /// - `self.compartments.is_subset(object.compartments)` (no compartment
+    ///   write-down: the target must be at least as compartmented as the writer)
+    ///
+    /// The assurance axis intentionally does **not** flip: it is a
+    /// crypto-authentication floor on both read and write, not a confidentiality
+    /// axis. This is conservative — it tightens rather than relaxes the gate.
+    /// See the assurance-axis overload note on [`can_access`] and #1232.
+    ///
+    /// [`can_access`]: SecurityLabel::can_access
+    #[inline]
+    #[must_use]
+    pub fn can_write_to(&self, object: &SecurityLabel) -> bool {
+        object.level >= self.level
+            && self.assurance >= object.assurance
+            && self.compartments.is_subset(object.compartments)
+    }
+
     /// IFC provenance join over confidentiality, integrity, and compartments.
     ///
     /// `a ⊔ b` = `(max(level), min(assurance), union(compartments))`: secrecy
@@ -515,6 +541,49 @@ mod tests {
         let unverified = label(Level::Secret, Assurance::Unverified, &[0]);
         let needs_classical = label(Level::Public, Assurance::Classical, &[]);
         assert!(!unverified.can_access(&needs_classical));
+    }
+
+    #[test]
+    fn write_direction_no_write_down() {
+        // A Secret subject may write to a Secret object (same level).
+        let secret = label(Level::Secret, Assurance::Classical, &[]);
+        assert!(secret.can_write_to(&secret));
+
+        // A Secret subject may NOT write to a Public object (no-write-down).
+        let public = label(Level::Public, Assurance::Classical, &[]);
+        assert!(!secret.can_write_to(&public));
+
+        // A Public subject MAY write to a Secret object (writing up is allowed).
+        assert!(public.can_write_to(&secret));
+    }
+
+    #[test]
+    fn write_direction_compartments_no_write_out() {
+        // A subject in {0,1} may write to an object in {0,1} or a superset.
+        let subj = label(Level::Secret, Assurance::Classical, &[0, 1]);
+        let same = label(Level::Secret, Assurance::Classical, &[0, 1]);
+        let superset = label(Level::Secret, Assurance::Classical, &[0, 1, 2]);
+        assert!(subj.can_write_to(&same));
+        assert!(subj.can_write_to(&superset));
+
+        // Writing to a subset (e.g. {0}) leaks compartment-1 data — denied.
+        let subset = label(Level::Secret, Assurance::Classical, &[0]);
+        assert!(!subj.can_write_to(&subset));
+    }
+
+    #[test]
+    fn write_direction_assurance_floor_not_flipped() {
+        // Assurance is a crypto floor on both axes: a Classical subject cannot
+        // write to a PqHybrid-required object even though the *-property level
+        // direction is satisfied (Public→Public or Public→Secret is "write up").
+        let classical_subj = label(Level::Public, Assurance::Classical, &[]);
+        let pqc_object = label(Level::Secret, Assurance::PqHybrid, &[]);
+        assert!(!classical_subj.can_write_to(&pqc_object));
+
+        // A PqHybrid subject writing to a Classical object at ≥ level: allowed.
+        let pqc_subj = label(Level::Public, Assurance::PqHybrid, &[]);
+        let classical_obj = label(Level::Secret, Assurance::Classical, &[]);
+        assert!(pqc_subj.can_write_to(&classical_obj));
     }
 
     #[test]

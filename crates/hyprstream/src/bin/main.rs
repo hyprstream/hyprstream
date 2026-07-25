@@ -1178,9 +1178,16 @@ fn handle_quick_command(
                             )
                             .await
                             .context("construct worker 9P MAC PEP")?;
+                        // #1269: install the full ReferenceMonitor at every
+                        // production 9P constructor. Fail-closed until #698
+                        // wires clearance issuance + S6 token path.
+                        let ninep_monitor = Some(hyprstream_core::mac::enrollment_ninep_reference_monitor(
+                            Arc::clone(&ninep_decider),
+                        ));
                         let backend_ctx = BackendCtx {
                             pool_config: pool_config.clone(),
                             ninep_decider,
+                            ninep_monitor,
                             #[cfg(feature = "oci-image")]
                             image_config,
                             #[cfg(feature = "oci-image")]

@@ -1100,6 +1100,11 @@ fn create_worker_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
     })
     .context("construct worker 9P MAC PEP")?;
 
+    // #1269: install the full ReferenceMonitor — fail-closed until #698 + S6.
+    let ninep_monitor = Some(crate::mac::enrollment_ninep_reference_monitor(
+        Arc::clone(&ninep_decider),
+    ));
+
     // Resolve + construct the backend fail-closed against the inventory registry
     // (config-driven by name; explicit requests are authoritative, missing
     // prerequisites error out rather than silently downgrading isolation; "auto"
@@ -1108,6 +1113,7 @@ fn create_worker_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
     let backend_ctx = BackendCtx {
         pool_config: pool_config.clone(),
         ninep_decider,
+        ninep_monitor,
         #[cfg(feature = "oci-image")]
         image_config,
         #[cfg(feature = "oci-image")]

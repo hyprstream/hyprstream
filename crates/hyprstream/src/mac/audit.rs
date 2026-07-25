@@ -208,6 +208,14 @@ pub struct AuditRecord {
     pub action: Action,
     /// Human-readable decision reason (which gate denied, or "permit").
     pub reason: DecisionReason,
+    /// Independently verified application principal, when the enforcement
+    /// plane has a stable identifier. Omitted for legacy/type-only records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject_id: Option<String>,
+    /// Concrete tenant-qualified object, when known. Omitted for
+    /// legacy/type-only records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub object_id: Option<String>,
 }
 
 /// Why the PDP returned this decision. Recorded so denials are diagnosable and
@@ -1042,6 +1050,8 @@ impl<A: Avc, S: AuditSink> AuditedAvc<A, S> {
             object_label: object.label,
             action,
             reason,
+            subject_id: None,
+            object_id: None,
         };
         match self.sink.record(&record) {
             Ok(()) => enforced,
@@ -1560,6 +1570,8 @@ mod tests {
             object_label: low(),
             action: Action(1),
             reason: DecisionReason::Permit,
+            subject_id: None,
+            object_id: None,
         };
         let hash = rec.content_hash().expect("canonical encode + hash");
         let hex = hex::encode(hash);
@@ -1585,6 +1597,8 @@ mod tests {
             object_label: low(),
             action: Action(1),
             reason: DecisionReason::Permit,
+            subject_id: None,
+            object_id: None,
         };
         let h1 = rec.content_hash().unwrap();
         // Same fields → same hash.
@@ -1624,6 +1638,8 @@ mod tests {
             object_label: low(),
             action: Action(1),
             reason: DecisionReason::Permit,
+            subject_id: None,
+            object_id: None,
         };
 
         // `None` is skipped: the field name never appears in the canonical
@@ -1732,6 +1748,8 @@ mod tests {
             object_label: low(),
             action: Action(1),
             reason: DecisionReason::Permit,
+            subject_id: None,
+            object_id: None,
         };
         store.record(&rec).unwrap();
         store.record(&rec).unwrap();
@@ -1775,6 +1793,8 @@ mod tests {
             object_label: low(),
             action: Action(9),
             reason: DecisionReason::TeMiss,
+            subject_id: None,
+            object_id: None,
         };
         store.record(&rec).unwrap();
 
@@ -1826,6 +1846,8 @@ mod tests {
             object_label: low(),
             action: Action(1),
             reason: DecisionReason::Permit,
+            subject_id: None,
+            object_id: None,
         };
         store.record(&rec).unwrap();
 
@@ -1902,6 +1924,8 @@ mod tests {
             object_label: low(),
             action: Action(1),
             reason: DecisionReason::Permit,
+            subject_id: None,
+            object_id: None,
         };
         // Write two records (store assigns seq 0, then 1).
         store.record(&base).unwrap();
@@ -1952,6 +1976,8 @@ mod tests {
             object_label: low(),
             action: Action(1),
             reason: DecisionReason::Permit,
+            subject_id: None,
+            object_id: None,
         }
     }
 

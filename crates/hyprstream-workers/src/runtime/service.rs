@@ -1484,6 +1484,16 @@ mod tests {
         ) -> bool {
             true
         }
+
+        fn audit_denial(
+            &self,
+            _ctx: &SecurityContext,
+            _object: ObjectRef<'_>,
+            _object_label: Option<hyprstream_rpc::auth::mac::SecurityLabel>,
+            _action: hyprstream_9p::Action,
+            _reason: hyprstream_9p::ReferenceMonitorDenyReason,
+        ) {
+        }
     }
 
     /// Create a test WorkerService with temporary directories
@@ -1531,6 +1541,7 @@ mod tests {
                 image_config,
                 Arc::clone(&rafs_store),
                 Arc::new(FixtureAccessDecider),
+                None,
             ),
         );
         let service = WorkerService::new(pool_config, backend, Some(rafs_store), transport, signing_key)?;

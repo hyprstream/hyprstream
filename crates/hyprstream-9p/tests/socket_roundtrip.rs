@@ -13,8 +13,10 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use hyprstream_9p::{serve_mount_uds, AccessDecider, Action, Remote9pMount};
-use hyprstream_rpc::auth::mac::{ObjectRef, SecurityContext};
+use hyprstream_9p::{
+    serve_mount_uds, AccessDecider, Action, ReferenceMonitorDenyReason, Remote9pMount,
+};
+use hyprstream_rpc::auth::mac::{ObjectRef, SecurityContext, SecurityLabel};
 use hyprstream_rpc::Subject;
 use hyprstream_vfs::{Mount, SyntheticMount, SyntheticNode};
 
@@ -22,6 +24,16 @@ struct TestDecider;
 impl AccessDecider for TestDecider {
     fn check(&self, _: &SecurityContext, _: ObjectRef<'_>, _: Action) -> bool {
         true
+    }
+
+    fn audit_denial(
+        &self,
+        _: &SecurityContext,
+        _: ObjectRef<'_>,
+        _: Option<SecurityLabel>,
+        _: Action,
+        _: ReferenceMonitorDenyReason,
+    ) {
     }
 }
 
@@ -48,7 +60,7 @@ async fn socket_client_mount_round_trips_against_translator() {
         let sock = sock.clone();
         async move {
             // Returns only on listener error / shutdown; we abort it at the end.
-            let _ = serve_mount_uds(mount, subject, Arc::new(TestDecider), sock).await;
+            let _ = serve_mount_uds(mount, subject, Arc::new(TestDecider), None, sock).await;
         }
     });
 

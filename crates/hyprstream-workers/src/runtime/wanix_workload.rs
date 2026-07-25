@@ -289,6 +289,7 @@ pub async fn inject_9p_socket(
     mount: Arc<dyn Mount>,
     subject: Subject,
     decider: Arc<dyn hyprstream_9p::AccessDecider>,
+    monitor: Option<Arc<hyprstream_9p::ReferenceMonitor>>,
     workload_dir: &Path,
     guest_cfg: &WanixGuestConfig,
 ) -> Result<WanixInjection> {
@@ -316,9 +317,14 @@ pub async fn inject_9p_socket(
     let task = tokio::spawn(async move {
         // `serve_uds` is PR-A's wire-faithful 9P2000.L server; it runs until the
         // socket errors/closes (or the task is aborted on teardown).
-        if let Err(e) = hyprstream_9p::Translator::from_mount(mount, subject, decider)
-            .serve_uds(listener)
-            .await
+        // #1269: when a ReferenceMonitor is supplied, every dispatched op is
+        // mediated (attach-time token verification, trusted label resolution,
+        // token gate, independent IFC dominance, then the local AVC/PDP).
+        let mut translator = hyprstream_9p::Translator::from_mount(mount, subject, decider);
+        if let Some(monitor) = monitor {
+            translator = translator.with_reference_monitor(monitor);
+        }
+        if let Err(e) = translator.serve_uds(listener).await
         {
             warn!(socket = %sock_for_log.display(), error = %e, "9P workload server exited with error");
         }
@@ -535,11 +541,12 @@ pub async fn prepare_wanix_workload(
     mount: Arc<dyn Mount>,
     subject: Subject,
     decider: Arc<dyn hyprstream_9p::AccessDecider>,
+    monitor: Option<Arc<hyprstream_9p::ReferenceMonitor>>,
     workload_dir: &Path,
     guest_cfg: &WanixGuestConfig,
 ) -> Result<WanixInjection> {
     super::require_9p_socket_capability(backend_type)?;
-    inject_9p_socket(mount, subject, decider, workload_dir, guest_cfg).await
+    inject_9p_socket(mount, subject, decider, monitor, workload_dir, guest_cfg).await
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -568,6 +575,16 @@ mod tests {
             _action: hyprstream_9p::Action,
         ) -> bool {
             true
+        }
+
+        fn audit_denial(
+            &self,
+            _ctx: &SecurityContext,
+            _object: ObjectRef<'_>,
+            _object_label: Option<hyprstream_rpc::auth::mac::SecurityLabel>,
+            _action: hyprstream_9p::Action,
+            _reason: hyprstream_9p::ReferenceMonitorDenyReason,
+        ) {
         }
     }
 
@@ -606,6 +623,7 @@ mod tests {
             tenant_mount(),
             Subject::anonymous(),
             Arc::new(FixtureAccessDecider),
+            None,
             dir.path(),
             &cfg,
         )
@@ -754,6 +772,7 @@ mod tests {
             tenant_mount(),
             Subject::anonymous(),
             Arc::new(FixtureAccessDecider),
+            None,
             dir.path(),
             &WanixGuestConfig::default(),
         )
@@ -812,6 +831,7 @@ mod tests {
             tenant_mount(),
             Subject::anonymous(),
             Arc::new(FixtureAccessDecider),
+            None,
             dir.path(),
             &WanixGuestConfig::default(),
         )
@@ -835,6 +855,7 @@ mod tests {
             tenant_mount(),
             Subject::anonymous(),
             Arc::new(FixtureAccessDecider),
+            None,
             dir.path(),
             &WanixGuestConfig::default(),
         )
@@ -858,6 +879,7 @@ mod tests {
             tenant_mount(),
             Subject::anonymous(),
             Arc::new(FixtureAccessDecider),
+            None,
             dir.path(),
             &WanixGuestConfig::default(),
         )
