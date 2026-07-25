@@ -1066,6 +1066,9 @@ pub trait RequestService: 'static {
         // from any federated token before the MAC PDP can read it (⇒ unlabeled
         // ⇒ deny). Local-issuer tokens are unaffected.
         verified.strip_federated_clearance(&local_issuers_refs);
+        // Tenant domains are likewise local authority assertions. A federated
+        // issuer trusted for identity cannot select a local Casbin domain.
+        verified.strip_federated_tenant(&local_issuers_refs);
         let s = verified.subject(&local_issuers_refs);
         if !s.is_anonymous() {
             ctx.jwt_subject = Some(s);
@@ -1318,7 +1321,9 @@ mod policy_tenant_domain_tests {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod empty_iss_gate_tests {
     use super::*;
-    use crate::auth::{Claims, ClusterKeySource};
+    use crate::auth::{
+        Claims, ClusterKeySource, FederatedKeySource, FederationKey, FederationKeySource,
+    };
     use crate::transport::TransportConfig;
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
     use ed25519_dalek::{Signer as _, SigningKey};
@@ -1407,6 +1412,26 @@ mod empty_iss_gate_tests {
         (svc, ca)
     }
 
+    struct MockFederation {
+        issuer: String,
+        verifying_key: ed25519_dalek::VerifyingKey,
+    }
+
+    #[async_trait]
+    impl FederationKeySource for MockFederation {
+        fn is_trusted(&self, issuer: &str) -> bool {
+            issuer == self.issuer
+        }
+
+        async fn get_keys(&self, issuer: &str, kid: Option<&str>) -> Result<Vec<FederationKey>> {
+            anyhow::ensure!(self.is_trusted(issuer), "untrusted issuer");
+            Ok(vec![FederationKey {
+                kid: kid.map(str::to_owned),
+                verifying_key: self.verifying_key,
+            }])
+        }
+    }
+
     fn empty_iss_token(ca: &SigningKey) -> String {
         // iss defaults to empty in Claims::new — the local bare-sub token.
         let now = chrono::Utc::now().timestamp();
@@ -1446,6 +1471,76 @@ mod empty_iss_gate_tests {
         );
         // And the local bare-sub subject is resolved.
         assert_eq!(ctx.subject().name(), Some("alice"));
+    }
+
+    #[tokio::test]
+    async fn federated_issuer_cannot_assert_local_tenant() {
+        let local_ca = SigningKey::from_bytes(&[9u8; 32]);
+        let federated_signer = SigningKey::from_bytes(&[10u8; 32]);
+        let local_issuer = "https://this.node";
+        let federated_issuer = "https://idp.example.com";
+        let federation = std::sync::Arc::new(MockFederation {
+            issuer: federated_issuer.to_owned(),
+            verifying_key: federated_signer.verifying_key(),
+        });
+        let key_source = std::sync::Arc::new(FederatedKeySource::new(
+            ClusterKeySource::new(local_ca.verifying_key(), local_issuer.to_owned()),
+            federation,
+        ));
+        let svc = MockService {
+            signing_key: local_ca,
+            transport: TransportConfig::inproc("mock"),
+            key_source,
+            policy: crate::crypto::CryptoPolicy::Classical,
+        };
+        let now = chrono::Utc::now().timestamp();
+        let claims = Claims::new("alice".to_owned(), now, now + 3600)
+            .with_issuer(federated_issuer.to_owned())
+            .with_tenant("acme".to_owned());
+        let token = crate::auth::jwt::encode(&claims, &federated_signer);
+        let mut ctx = ctx_with_token(token, /* is_local_caller */ false);
+
+        svc.verify_claims(&mut ctx)
+            .await
+            .expect("federated identity token should verify");
+
+        assert_eq!(ctx.subject().name(), Some("https://idp.example.com:alice"));
+        assert_ne!(ctx.verified_tenant(), Some("acme"));
+        assert_eq!(ctx.verified_tenant(), None);
+        assert!(
+            ctx.domain().is_err(),
+            "a stripped federated tenant must fail domain resolution closed"
+        );
+    }
+
+    #[tokio::test]
+    async fn local_issuer_preserves_verified_tenant() {
+        let local_ca = SigningKey::from_bytes(&[11u8; 32]);
+        let local_issuer = "https://this.node";
+        let key_source = std::sync::Arc::new(ClusterKeySource::new(
+            local_ca.verifying_key(),
+            local_issuer.to_owned(),
+        ));
+        let svc = MockService {
+            signing_key: local_ca.clone(),
+            transport: TransportConfig::inproc("mock"),
+            key_source,
+            policy: crate::crypto::CryptoPolicy::Classical,
+        };
+        let now = chrono::Utc::now().timestamp();
+        let claims = Claims::new("alice".to_owned(), now, now + 3600)
+            .with_issuer(local_issuer.to_owned())
+            .with_tenant("acme".to_owned());
+        let token = crate::auth::jwt::encode(&claims, &local_ca);
+        let mut ctx = ctx_with_token(token, /* is_local_caller */ false);
+
+        svc.verify_claims(&mut ctx)
+            .await
+            .expect("local identity token should verify");
+
+        assert_eq!(ctx.subject().name(), Some("alice"));
+        assert_eq!(ctx.verified_tenant(), Some("acme"));
+        assert_eq!(ctx.domain().expect("local tenant domain"), "acme");
     }
 
     fn composite_token(

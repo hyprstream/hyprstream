@@ -527,6 +527,19 @@ impl Claims {
         }
     }
 
+    /// Strip the authority-asserted tenant when this token's issuer is not
+    /// local.
+    ///
+    /// A federated issuer trusted for identity is not trusted to select a local
+    /// Casbin tenant domain. Clearing the claim makes downstream domain
+    /// resolution fail closed, while preserving tenant bindings minted by local
+    /// issuers.
+    pub fn strip_federated_tenant(&mut self, local_issuers: &[&str]) {
+        if !self.is_local_to(local_issuers) {
+            self.tenant = None;
+        }
+    }
+
     /// Derive the Casbin authorization subject from these claims.
     ///
     /// Local tokens (issued by this node) produce bare subjects (`"alice"`)
