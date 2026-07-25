@@ -773,26 +773,31 @@ impl TorchEngine {
     /// path/label.
     ///
     /// The shard set comes from the **same selector the loader uses**
-    /// (`ModelFactory::find_shard_files`: `model.safetensors.index.json` →
+    /// (`ModelFactory::find_shard_files_for_digest`, the digest-authoritative
+    /// variant of the loader's selector: `model.safetensors.index.json` →
     /// `model.safetensors` → shard-name glob), so the digest covers EXACTLY the
     /// shards the loader reads — an extra/unreferenced `.safetensors` in the
     /// directory (stale shard, alt-precision copy) cannot shift the fingerprint
-    /// while the loaded weights are identical.
+    /// while the loaded weights are identical. Unlike the loader, the digest
+    /// REJECTS an ambiguous manifest-less multi-shard glob set regardless of
+    /// `HYPRSTREAM_STRICT_LOADER` — fingerprint authority is stricter than
+    /// loader permissiveness.
     ///
     /// The digest hashes the **resolved** bytes — the identical resolution path
     /// the loader walks (`ModelFactory::resolve_weight_for_digest` transparently
     /// resolves an un-smudged LFS/XET pointer to its object content), so it never
     /// hashes a pointer stub in place of the real tensors. It is **fail-closed**:
-    /// any selection/read/resolve error, an empty selection, or an
-    /// index-referenced shard that is missing propagates, so the caller declines
-    /// to mint a descriptor and KV reuse fails closed rather than hashing a
-    /// partial shard set.
+    /// any selection/read/resolve error, an empty selection, an
+    /// index-referenced shard that is missing, or an ambiguous manifest-less
+    /// multi-shard set propagates, so the caller declines to mint a descriptor
+    /// and KV reuse fails closed rather than hashing a partial shard set.
     async fn weights_content_digest(model_path: &Path) -> Result<String> {
         use crate::runtime::kv_compat;
         use crate::runtime::model_factory::{ModelFactory, ResolvedWeight};
 
-        // Resolve the loader-selected shard set (the loader's own selector).
-        let shards = ModelFactory::find_shard_files(model_path)?;
+        // Resolve the loader-selected shard set (the digest-authoritative
+        // variant of the loader's own selector).
+        let shards = ModelFactory::find_shard_files_for_digest(model_path)?;
 
         // Fail closed on an empty or inconsistent selection: the loader would
         // have nothing authoritative to load (or the index disagrees with the
@@ -2713,6 +2718,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         write_shard(dir.path(), "model-00001-of-00002.safetensors", b"AAAA-content");
         write_shard(dir.path(), "model-00002-of-00002.safetensors", b"BBBB-content");
+        write_index(dir.path(), &[
+            "model-00001-of-00002.safetensors",
+            "model-00002-of-00002.safetensors",
+        ]);
         let a = TorchEngine::weights_content_digest(dir.path()).await.unwrap();
         let b = TorchEngine::weights_content_digest(dir.path()).await.unwrap();
         assert_eq!(a, b, "digest must be deterministic across runs");
@@ -2730,8 +2739,16 @@ mod tests {
         let d2 = tempfile::tempdir().unwrap();
         write_shard(d1.path(), "model-00001-of-00002.safetensors", b"content-A");
         write_shard(d1.path(), "model-00002-of-00002.safetensors", b"content-B");
+        write_index(d1.path(), &[
+            "model-00001-of-00002.safetensors",
+            "model-00002-of-00002.safetensors",
+        ]);
         write_shard(d2.path(), "model-00001-of-00002.safetensors", b"content-A!");
         write_shard(d2.path(), "model-00002-of-00002.safetensors", b"content-B");
+        write_index(d2.path(), &[
+            "model-00001-of-00002.safetensors",
+            "model-00002-of-00002.safetensors",
+        ]);
         let a = TorchEngine::weights_content_digest(d1.path()).await.unwrap();
         let b = TorchEngine::weights_content_digest(d2.path()).await.unwrap();
         assert_ne!(a, b, "same basenames, different content must diverge");
@@ -2745,9 +2762,17 @@ mod tests {
         let d2 = tempfile::tempdir().unwrap();
         write_shard(d1.path(), "model-00001-of-00002.safetensors", b"X");
         write_shard(d1.path(), "model-00002-of-00002.safetensors", b"Y");
+        write_index(d1.path(), &[
+            "model-00001-of-00002.safetensors",
+            "model-00002-of-00002.safetensors",
+        ]);
         // Reverse creation order in d2.
         write_shard(d2.path(), "model-00002-of-00002.safetensors", b"Y");
         write_shard(d2.path(), "model-00001-of-00002.safetensors", b"X");
+        write_index(d2.path(), &[
+            "model-00001-of-00002.safetensors",
+            "model-00002-of-00002.safetensors",
+        ]);
         let a = TorchEngine::weights_content_digest(d1.path()).await.unwrap();
         let b = TorchEngine::weights_content_digest(d2.path()).await.unwrap();
         assert_eq!(a, b, "digest must be independent of enumeration order");
@@ -2953,6 +2978,43 @@ mod tests {
         assert!(
             TorchEngine::weights_content_digest(dir.path()).await.is_err(),
             "an index referencing a missing shard must fail closed"
+        );
+    }
+
+    /// A manifest-less MULTI-shard glob selection is ambiguous (the glob can
+    /// silently drop/duplicate shards), so the digest must fail closed —
+    /// decline reuse — even though the LOADER only warns in its permissive
+    /// default mode. Fingerprint authority is stricter than loader
+    /// permissiveness (#1277 revise-4): this holds regardless of
+    /// `HYPRSTREAM_STRICT_LOADER` (the test env does not set it, exercising
+    /// the permissive loader path).
+    #[tokio::test]
+    async fn weights_content_digest_manifestless_multi_shard_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        write_shard(dir.path(), "model-00001-of-00002.safetensors", b"AAAA-content");
+        write_shard(dir.path(), "model-00002-of-00002.safetensors", b"BBBB-content");
+        // NO model.safetensors.index.json — the loader warns and continues;
+        // the digest must refuse.
+        assert!(
+            TorchEngine::weights_content_digest(dir.path()).await.is_err(),
+            "an ambiguous manifest-less multi-shard glob set must fail closed"
+        );
+    }
+
+    /// A SINGLE globbed shard (no index, no model.safetensors) is unambiguous
+    /// and must still digest — only multi-shard glob sets are ambiguous.
+    #[tokio::test]
+    async fn weights_content_digest_single_globbed_shard_passes() {
+        let dir = tempfile::tempdir().unwrap();
+        write_shard(dir.path(), "model-00001-of-00001.safetensors", b"single-shard-content");
+        let digest = TorchEngine::weights_content_digest(dir.path()).await.unwrap();
+        let expected = kv_compat::base_weight_digest_from_shards(&[(
+            "model-00001-of-00001.safetensors".into(),
+            kv_compat::shard_content_digest(b"single-shard-content"),
+        )]);
+        assert_eq!(
+            digest, expected,
+            "a single globbed shard is unambiguous and must digest"
         );
     }
 

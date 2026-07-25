@@ -238,6 +238,33 @@ impl ModelFactory {
         glob_shard_files(model_path)
     }
 
+    /// Shard selection for the KV-compat base-weight digest (#1277).
+    ///
+    /// Fingerprint authority is stricter than loader permissiveness: the
+    /// loader may warn-and-continue on a manifest-less multi-shard glob
+    /// (unless [`STRICT_LOADER_ENV`]), but the digest must NEVER mint an
+    /// authoritative identity over that ambiguous set — a glob can silently
+    /// drop/duplicate shards, so two snapshots could share a fingerprint
+    /// while loading different weights. Such a set is rejected here
+    /// regardless of `HYPRSTREAM_STRICT_LOADER`, and the caller declines KV
+    /// reuse. A single globbed shard remains unambiguous and passes.
+    pub(crate) fn find_shard_files_for_digest(
+        model_path: &Path,
+    ) -> Result<Vec<std::path::PathBuf>> {
+        let shards = Self::find_shard_files(model_path)?;
+        if shards.len() > 1 && !model_path.join("model.safetensors.index.json").exists() {
+            return Err(anyhow!(
+                "{} loader-selected .safetensors shards in {} but no \
+                 model.safetensors.index.json manifest; the glob-selected set is \
+                 ambiguous, so no authoritative base-weight digest can be minted \
+                 (KV reuse is declined). Provide the index.json manifest.",
+                shards.len(),
+                model_path.display()
+            ));
+        }
+        Ok(shards)
+    }
+
     /// Parse shard filenames from `model.safetensors.index.json`.
     /// Returns unique shard paths in sorted order (guaranteed by the index).
     fn shard_files_from_index(
