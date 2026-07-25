@@ -493,7 +493,13 @@ fn exchange_tenant(
             Err("requested tenant differs from the verified source-token tenant")
         }
         (Some(verified), _) => Ok(Some(verified.to_owned())),
-        (None, Some(requested)) => Ok(Some(requested.to_owned())),
+        // Tenant selection is an authority assertion, not an exchange
+        // parameter. Federated identity proofs (including enrolled ATProto
+        // DIDs) establish identity and possibly clearance, but do not bind the
+        // subject to a local Casbin domain. Mirror `strip_federated_tenant`:
+        // only a tenant preserved from a verified local-issuer token may reach
+        // PolicyService.
+        (None, Some(_)) => Err("subject token has no verified local tenant binding"),
         (None, None) if subject.require_clearance => {
             Err("tenant is required for the ATProto exchange")
         }
@@ -1482,8 +1488,8 @@ mod tests {
     }
 
     #[test]
-    fn exchange_tenant_honors_verified_source_and_rejects_replacement() {
-        let subject = VerifiedSubject {
+    fn exchange_tenant_requires_verified_local_binding() {
+        let local_subject = VerifiedSubject {
             sub: "did:plc:abcdefghijklmnqrstuvwx2p".to_owned(),
             cnf_key_bytes: None,
             iat: 1,
@@ -1494,10 +1500,32 @@ mod tests {
             ttl_ceiling: None,
         };
         assert_eq!(
-            exchange_tenant(&subject, None).unwrap().as_deref(),
+            exchange_tenant(&local_subject, None).unwrap().as_deref(),
             Some("tenant-source")
         );
-        assert!(exchange_tenant(&subject, Some("tenant-other")).is_err());
+        assert_eq!(
+            exchange_tenant(&local_subject, Some("tenant-source"))
+                .unwrap()
+                .as_deref(),
+            Some("tenant-source")
+        );
+        assert!(exchange_tenant(&local_subject, Some("tenant-other")).is_err());
+
+        let external_enrolled_subject = VerifiedSubject {
+            sub: "did:plc:externalenrolledsubject".to_owned(),
+            cnf_key_bytes: None,
+            iat: 1,
+            granted_scopes: Some(vec!["transition:generic".to_owned()]),
+            verified_tenant: None,
+            atproto_replay: None,
+            require_clearance: true,
+            ttl_ceiling: Some(MAX_ATPROTO_EXCHANGE_TOKEN_TTL),
+        };
+        assert_eq!(
+            exchange_tenant(&external_enrolled_subject, Some("tenant-foreign")),
+            Err("subject token has no verified local tenant binding"),
+            "an enrolled external DID cannot turn a client assertion into a local tenant binding"
+        );
     }
 
     fn mint_test_state() -> Arc<OAuthState> {

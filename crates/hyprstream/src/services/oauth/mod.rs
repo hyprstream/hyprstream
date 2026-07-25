@@ -1536,8 +1536,8 @@ mod tests {
         };
         let app = create_app(Arc::clone(&state), &cors);
 
-        // #1119 demo path: exact lxm/aud service auth becomes a tenant-scoped,
-        // authority-labeled local session credential.
+        // #1119 service assertions prove the external DID and requested
+        // operation. They do not bind that DID to a local tenant.
         let now = chrono::Utc::now().timestamp();
         let service_header = URL_SAFE_NO_PAD.encode(
             serde_json::to_vec(&serde_json::json!({
@@ -1578,7 +1578,7 @@ mod tests {
                 )
                 .body(axum::body::Body::from(
                     serde_json::json!({
-                        "tenant": "tenant-demo",
+                        "tenant": "tenant-foreign",
                         "scope": "transition:generic",
                         "audience": ISSUER
                     })
@@ -1607,59 +1607,23 @@ mod tests {
         let rejected_lxm = app.clone().oneshot(exchange_request(&wrong_lxm)).await?;
         assert_eq!(rejected_lxm.status(), axum::http::StatusCode::UNAUTHORIZED);
 
-        let exchanged = app.clone().oneshot(exchange_request(&service_jwt)).await?;
-        assert_eq!(exchanged.status(), axum::http::StatusCode::OK);
-        let exchanged_json = response_json(exchanged).await;
-        assert_eq!(exchanged_json["token_type"], "Bearer");
+        // #1314: enrollment supplies MAC clearance only. Even this enrolled DID
+        // cannot turn the request's tenant into a verified local binding.
+        let rejected_tenant = app.clone().oneshot(exchange_request(&service_jwt)).await?;
+        assert_eq!(
+            rejected_tenant.status(),
+            axum::http::StatusCode::BAD_REQUEST
+        );
+        let rejected_tenant_json = response_json(rejected_tenant).await;
+        assert_eq!(rejected_tenant_json["error"], "InvalidRequest");
+        assert_eq!(
+            rejected_tenant_json["message"],
+            "subject token has no verified local tenant binding"
+        );
         assert!(
-            exchanged_json["expires_in"].as_i64().is_some_and(|ttl| {
-                ttl > 0 && ttl <= i64::from(token_exchange::MAX_ATPROTO_EXCHANGE_TOKEN_TTL)
-            })
+            rejected_tenant_json.get("access_token").is_none(),
+            "an enrolled external DID must not receive a credential for a client-selected tenant"
         );
-        let exchanged_token = exchanged_json["access_token"].as_str().unwrap();
-        let exchanged_claims = jwt_claims(exchanged_token);
-        assert_eq!(exchanged_claims["sub"], MAPPED_DID);
-        assert_eq!(exchanged_claims["tenant"], "tenant-demo");
-        assert_eq!(exchanged_claims["scope"], "transition:generic");
-        assert_eq!(exchanged_claims["clearance"]["level"], "secret");
-        assert_eq!(exchanged_claims["clearance"]["assurance"], "classical");
-        assert!(
-            exchanged_claims.get("cnf").is_none(),
-            "service-auth is bearer auth; do not fabricate sender binding"
-        );
-
-        // verified_tenant survives for a local issuer and is stripped at the
-        // federation boundary.
-        let mut local_claims = auth::validate_oauth_access_token(&state, exchanged_token)
-            .await
-            .map_err(anyhow::Error::msg)?;
-        local_claims.strip_federated_tenant(&[GENERIC_ISSUER]);
-        assert_eq!(local_claims.tenant.as_deref(), Some("tenant-demo"));
-        use hyprstream_rpc::auth::mac::SubjectContextClaims as _;
-        let subject_context = local_claims
-            .security_context(hyprstream_rpc::auth::mac::VerifiedKeyMaterial::Classical)
-            .expect("exchange must produce a labeled subject");
-        let authorized_object = hyprstream_rpc::auth::mac::SecurityLabel::new(
-            hyprstream_rpc::auth::mac::Level::Confidential,
-            hyprstream_rpc::auth::mac::Assurance::Classical,
-            hyprstream_rpc::auth::mac::CompartmentSet::single(0),
-        );
-        assert!(subject_context.can_access(&authorized_object));
-        let pq_only_object = hyprstream_rpc::auth::mac::SecurityLabel::new(
-            hyprstream_rpc::auth::mac::Level::Public,
-            hyprstream_rpc::auth::mac::Assurance::PqHybrid,
-            hyprstream_rpc::auth::mac::CompartmentSet::EMPTY,
-        );
-        assert!(!subject_context.can_access(&pq_only_object));
-        local_claims.iss = "https://foreign.example".to_owned();
-        local_claims.strip_federated_tenant(&[GENERIC_ISSUER]);
-        local_claims.strip_federated_clearance(&[GENERIC_ISSUER]);
-        assert_eq!(local_claims.tenant, None);
-        assert_eq!(local_claims.clearance, None);
-
-        let replay = app.clone().oneshot(exchange_request(&service_jwt)).await?;
-        assert_eq!(replay.status(), axum::http::StatusCode::BAD_REQUEST);
-        assert_eq!(response_json(replay).await["error"], "InvalidToken");
 
         // Device authorization rejects unknown clients at the real endpoint.
         let unknown_device = post_form(
