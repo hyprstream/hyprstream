@@ -21,13 +21,14 @@ use tracing::warn;
 
 /// Authorization callback for policy checks.
 ///
-/// Parameters: (subject, resource, operation) -> allowed.
+/// Parameters: (subject, domain, resource, operation) -> allowed.
 /// Services store this and call it from their `authorize()` handler method.
 /// The concrete implementation typically wraps `PolicyClient::check_policy()`.
 ///
 /// Returns a boxed future to support async policy checks on single-threaded runtimes.
 pub type AuthorizeFn = Arc<
     dyn Fn(
+            String,
             String,
             String,
             String,
@@ -110,6 +111,12 @@ pub struct EnvelopeContext {
     /// Populated by `verify_claims()` after JWT signature verification.
     claims: Option<crate::auth::Claims>,
 
+    /// Tenant/domain from a verified JWT claim or a trusted local constructor.
+    ///
+    /// Network callers cannot populate this directly: `verify_claims()` copies
+    /// it only after the JWT signature and issuer have been verified.
+    verified_tenant: Option<String>,
+
     /// Raw JWT token from the envelope. Server decodes and verifies this.
     /// Preferred over the legacy `claims` field when present.
     jwt_token: Option<String>,
@@ -179,6 +186,7 @@ impl EnvelopeContext {
         Self {
             request_id: envelope.request_id(),
             claims: None,
+            verified_tenant: None,
             jwt_token: envelope.envelope.jwt_token().map(ToOwned::to_owned),
             key_derived_subject: Subject::anonymous(),
             jwt_subject: None,
@@ -205,6 +213,7 @@ impl EnvelopeContext {
         Self {
             request_id: envelope.request_id(),
             claims: None,
+            verified_tenant: Some("local".to_owned()),
             jwt_token: envelope.envelope.jwt_token().map(ToOwned::to_owned),
             key_derived_subject: Subject::new("system"),
             jwt_subject: None,
@@ -235,6 +244,7 @@ impl EnvelopeContext {
         Self {
             request_id,
             claims: None,
+            verified_tenant: Some("local".to_owned()),
             jwt_token: None,
             key_derived_subject: Subject::new(format!("service:{service_name}")),
             jwt_subject: None,
@@ -288,6 +298,38 @@ impl EnvelopeContext {
             return s.clone();
         }
         Subject::anonymous()
+    }
+
+    /// Derive the Casbin request domain from the verified tenant binding.
+    ///
+    /// For network callers this comes only from a JWT after `verify_claims()`
+    /// verifies its signature and issuer. Trusted in-process constructors bind
+    /// their callers to the local tenant. The subject name is deliberately not
+    /// a fallback: multiple subjects may share a tenant, and identities without
+    /// a tenant binding must fail closed.
+    pub fn domain(&self) -> Result<String> {
+        let tenant = self
+            .verified_tenant
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("authorization denied: no verified tenant domain"))?;
+        anyhow::ensure!(
+            !tenant.is_empty() && tenant != "*",
+            "authorization denied: empty or wildcard tenant domain"
+        );
+        Ok(tenant.to_owned())
+    }
+
+    /// Return the authority-verified tenant binding, if the request has one.
+    ///
+    /// Callers must still use [`Self::domain`] before treating this value as a
+    /// Casbin domain: that accessor rejects empty and wildcard tenant claims.
+    /// This optional view lets cross-tenant authorities distinguish a missing
+    /// tenant (where an authenticated service principal may use the global
+    /// policy domain) from a present-but-invalid tenant (which must fail
+    /// closed).
+    #[must_use]
+    pub fn verified_tenant(&self) -> Option<&str> {
+        self.verified_tenant.as_deref()
     }
 
     /// Get the bare username string.
@@ -367,6 +409,7 @@ impl EnvelopeContext {
         Self {
             request_id: 0,
             claims: None,
+            verified_tenant: None,
             jwt_token: None,
             key_derived_subject: subject,
             jwt_subject: None,
@@ -381,6 +424,18 @@ impl EnvelopeContext {
             browser_method_discriminator: None,
             is_local_caller: false,
         }
+    }
+
+    /// Build an authenticated context fixture with an authority-bound tenant.
+    #[cfg(any(test, feature = "test-classical-policy"))]
+    pub fn for_test_authenticated_subject_in_tenant(
+        subject: Subject,
+        tenant: impl Into<String>,
+        signer: ed25519_dalek::VerifyingKey,
+    ) -> Self {
+        let mut context = Self::for_test_authenticated_subject(subject, signer);
+        context.verified_tenant = Some(tenant.into());
+        context
     }
 
     /// Get user claims (if present, after verify_claims has run).
@@ -1011,10 +1066,14 @@ pub trait RequestService: 'static {
         // from any federated token before the MAC PDP can read it (⇒ unlabeled
         // ⇒ deny). Local-issuer tokens are unaffected.
         verified.strip_federated_clearance(&local_issuers_refs);
+        // Tenant domains are likewise local authority assertions. A federated
+        // issuer trusted for identity cannot select a local Casbin domain.
+        verified.strip_federated_tenant(&local_issuers_refs);
         let s = verified.subject(&local_issuers_refs);
         if !s.is_anonymous() {
             ctx.jwt_subject = Some(s);
         }
+        ctx.verified_tenant = verified.tenant.clone();
         ctx.claims = Some(verified.clone());
 
         // R2: Bind JWT cnf.jwk claim to envelope signer (WIMSE WIT key binding).
@@ -1211,6 +1270,47 @@ impl ServiceHandle {
     }
 }
 
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod policy_tenant_domain_tests {
+    use super::*;
+    use ed25519_dalek::SigningKey;
+
+    #[test]
+    fn multiple_verified_identities_share_the_claimed_tenant_domain() {
+        let signer = SigningKey::from_bytes(&[0x44; 32]).verifying_key();
+        let alice = EnvelopeContext::for_test_authenticated_subject_in_tenant(
+            Subject::new("alice"),
+            "tenant-a",
+            signer,
+        );
+        let bob = EnvelopeContext::for_test_authenticated_subject_in_tenant(
+            Subject::new("bob"),
+            "tenant-a",
+            signer,
+        );
+
+        assert_ne!(alice.subject(), bob.subject());
+        assert_eq!(alice.domain().expect("verified tenant"), "tenant-a");
+        assert_eq!(bob.domain().expect("verified tenant"), "tenant-a");
+    }
+
+    #[test]
+    fn missing_and_wildcard_tenant_domains_fail_closed() {
+        let signer = SigningKey::from_bytes(&[0x45; 32]).verifying_key();
+        let missing =
+            EnvelopeContext::for_test_authenticated_subject(Subject::new("alice"), signer);
+        let wildcard = EnvelopeContext::for_test_authenticated_subject_in_tenant(
+            Subject::new("alice"),
+            "*",
+            signer,
+        );
+
+        assert!(missing.domain().is_err());
+        assert!(wildcard.domain().is_err());
+    }
+}
+
 /// Empty-`iss` transport-gating tests (#328).
 ///
 /// An empty JWT issuer denotes the local PolicyService's bare-`sub` token, which
@@ -1221,7 +1321,9 @@ impl ServiceHandle {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod empty_iss_gate_tests {
     use super::*;
-    use crate::auth::{Claims, ClusterKeySource};
+    use crate::auth::{
+        Claims, ClusterKeySource, FederatedKeySource, FederationKey, FederationKeySource,
+    };
     use crate::transport::TransportConfig;
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
     use ed25519_dalek::{Signer as _, SigningKey};
@@ -1277,6 +1379,7 @@ mod empty_iss_gate_tests {
         EnvelopeContext {
             request_id: 1,
             claims: None,
+            verified_tenant: None,
             jwt_token: Some(token),
             key_derived_subject: Subject::anonymous(),
             jwt_subject: None,
@@ -1307,6 +1410,26 @@ mod empty_iss_gate_tests {
             policy: crate::crypto::CryptoPolicy::Classical,
         };
         (svc, ca)
+    }
+
+    struct MockFederation {
+        issuer: String,
+        verifying_key: ed25519_dalek::VerifyingKey,
+    }
+
+    #[async_trait]
+    impl FederationKeySource for MockFederation {
+        fn is_trusted(&self, issuer: &str) -> bool {
+            issuer == self.issuer
+        }
+
+        async fn get_keys(&self, issuer: &str, kid: Option<&str>) -> Result<Vec<FederationKey>> {
+            anyhow::ensure!(self.is_trusted(issuer), "untrusted issuer");
+            Ok(vec![FederationKey {
+                kid: kid.map(str::to_owned),
+                verifying_key: self.verifying_key,
+            }])
+        }
     }
 
     fn empty_iss_token(ca: &SigningKey) -> String {
@@ -1348,6 +1471,76 @@ mod empty_iss_gate_tests {
         );
         // And the local bare-sub subject is resolved.
         assert_eq!(ctx.subject().name(), Some("alice"));
+    }
+
+    #[tokio::test]
+    async fn federated_issuer_cannot_assert_local_tenant() {
+        let local_ca = SigningKey::from_bytes(&[9u8; 32]);
+        let federated_signer = SigningKey::from_bytes(&[10u8; 32]);
+        let local_issuer = "https://this.node";
+        let federated_issuer = "https://idp.example.com";
+        let federation = std::sync::Arc::new(MockFederation {
+            issuer: federated_issuer.to_owned(),
+            verifying_key: federated_signer.verifying_key(),
+        });
+        let key_source = std::sync::Arc::new(FederatedKeySource::new(
+            ClusterKeySource::new(local_ca.verifying_key(), local_issuer.to_owned()),
+            federation,
+        ));
+        let svc = MockService {
+            signing_key: local_ca,
+            transport: TransportConfig::inproc("mock"),
+            key_source,
+            policy: crate::crypto::CryptoPolicy::Classical,
+        };
+        let now = chrono::Utc::now().timestamp();
+        let claims = Claims::new("alice".to_owned(), now, now + 3600)
+            .with_issuer(federated_issuer.to_owned())
+            .with_tenant("acme".to_owned());
+        let token = crate::auth::jwt::encode(&claims, &federated_signer);
+        let mut ctx = ctx_with_token(token, /* is_local_caller */ false);
+
+        svc.verify_claims(&mut ctx)
+            .await
+            .expect("federated identity token should verify");
+
+        assert_eq!(ctx.subject().name(), Some("https://idp.example.com:alice"));
+        assert_ne!(ctx.verified_tenant(), Some("acme"));
+        assert_eq!(ctx.verified_tenant(), None);
+        assert!(
+            ctx.domain().is_err(),
+            "a stripped federated tenant must fail domain resolution closed"
+        );
+    }
+
+    #[tokio::test]
+    async fn local_issuer_preserves_verified_tenant() {
+        let local_ca = SigningKey::from_bytes(&[11u8; 32]);
+        let local_issuer = "https://this.node";
+        let key_source = std::sync::Arc::new(ClusterKeySource::new(
+            local_ca.verifying_key(),
+            local_issuer.to_owned(),
+        ));
+        let svc = MockService {
+            signing_key: local_ca.clone(),
+            transport: TransportConfig::inproc("mock"),
+            key_source,
+            policy: crate::crypto::CryptoPolicy::Classical,
+        };
+        let now = chrono::Utc::now().timestamp();
+        let claims = Claims::new("alice".to_owned(), now, now + 3600)
+            .with_issuer(local_issuer.to_owned())
+            .with_tenant("acme".to_owned());
+        let token = crate::auth::jwt::encode(&claims, &local_ca);
+        let mut ctx = ctx_with_token(token, /* is_local_caller */ false);
+
+        svc.verify_claims(&mut ctx)
+            .await
+            .expect("local identity token should verify");
+
+        assert_eq!(ctx.subject().name(), Some("alice"));
+        assert_eq!(ctx.verified_tenant(), Some("acme"));
+        assert_eq!(ctx.domain().expect("local tenant domain"), "acme");
     }
 
     fn composite_token(
@@ -1653,6 +1846,7 @@ mod ipc_key_identity_tests {
         EnvelopeContext {
             request_id: 1,
             claims: None,
+            verified_tenant: None,
             jwt_token: None,
             key_derived_subject: Subject::anonymous(),
             jwt_subject: None,
@@ -1881,6 +2075,7 @@ mod accounting_audit_tests {
         EnvelopeContext {
             request_id: 42,
             claims: None,
+            verified_tenant: None,
             jwt_token: None,
             key_derived_subject: Subject::new(name),
             jwt_subject: None,
@@ -1937,6 +2132,7 @@ mod accounting_audit_tests {
         let ctx = EnvelopeContext {
             request_id: 7,
             claims: None,
+            verified_tenant: None,
             jwt_token: None,
             key_derived_subject: Subject::anonymous(),
             jwt_subject: None,
@@ -2003,6 +2199,7 @@ mod accounting_audit_tests {
         EnvelopeContext {
             request_id: 1,
             claims,
+            verified_tenant: None,
             jwt_token: None,
             key_derived_subject: Subject::anonymous(),
             jwt_subject: None,

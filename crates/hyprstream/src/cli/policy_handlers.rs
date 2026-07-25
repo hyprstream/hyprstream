@@ -319,7 +319,7 @@ pub async fn handle_policy_check(
 ) -> Result<()> {
     let client = create_policy_client(signing_key)?;
 
-    let allowed = client.check(&PolicyCheck { subject: user.to_owned(), domain: "*".to_owned(), resource: resource.to_owned(), operation: action.to_owned() }).await
+    let allowed = client.check(&PolicyCheck { subject: user.to_owned(), domain: user.to_owned(), resource: resource.to_owned(), operation: action.to_owned() }).await
         .context("Failed to check policy via PolicyService. Are services running?")?;
 
     println!("User:     {user}");

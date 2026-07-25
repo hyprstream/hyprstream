@@ -188,6 +188,10 @@ fn build_sql(q: &MetricQuery) -> Result<String> {
 impl MetricsHandler for MetricsService {
     async fn authorize(&self, ctx: &EnvelopeContext, resource: &str, operation: &str) -> Result<()> {
         let subject = ctx.subject().to_string();
+        // Metrics and their DuckDB view registry are node-global: neither
+        // MetricRecord nor view_metadata carries a tenant key. Keep policy
+        // checks in the global domain instead of claiming tenant isolation that
+        // the storage layer does not provide.
         let allowed = self.policy_client
             .check(&PolicyCheck {
                 subject: subject.clone(),

@@ -1413,7 +1413,8 @@ impl InferHandler for ModelService {
 impl ModelHandler for ModelService {
     async fn authorize(&self, ctx: &EnvelopeContext, resource: &str, operation: &str) -> Result<()> {
         let subject = ctx.subject();
-        let allowed = self.policy_client.check(&PolicyCheck { subject: subject.to_string(), domain: "*".to_owned(), resource: resource.to_owned(), operation: operation.to_owned() }).await.unwrap_or_else(|e| {
+        let domain = ctx.domain()?;
+        let allowed = self.policy_client.check(&PolicyCheck { subject: subject.to_string(), domain, resource: resource.to_owned(), operation: operation.to_owned() }).await.unwrap_or_else(|e| {
             warn!("Policy check failed for {} on {}: {} - denying access", subject, resource, e);
             false
         });

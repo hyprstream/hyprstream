@@ -1722,6 +1722,10 @@ impl RegistryHandler for RegistryService {
         // Pass the operation string as-is to the policy check rather than
         // round-tripping through Operation enum (which maps "query" → "query.status").
         let subject = ctx.subject();
+        // The registry and its worktree namespace are node-global: repository
+        // metadata and paths carry no tenant key. Keep this authorization in
+        // the global policy domain rather than claiming storage isolation that
+        // the registry does not provide.
         let allowed = self.policy_client.check(&PolicyCheck {
             subject: subject.to_string(),
             domain: "*".to_owned(),
@@ -1756,7 +1760,10 @@ impl RegistryHandler for RegistryService {
             let permitted = self.policy_client
                 .check(&PolicyCheck { subject: subject.clone(), domain: "*".to_owned(), resource: resource.clone(), operation: "query".to_owned() })
                 .await
-                .unwrap_or(true); // default allow if policy service unavailable
+                .unwrap_or_else(|e| {
+                    warn!("Policy check RPC error while filtering {}: {} - denying access", resource, e);
+                    false
+                });
             if !permitted { continue; }
 
             // Collect worktrees with capabilities (holds registry read lock internally)

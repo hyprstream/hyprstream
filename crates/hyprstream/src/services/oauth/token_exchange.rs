@@ -127,6 +127,7 @@ pub async fn exchange_token_exchange(
             user_pub_key,
             dpop_jkt: None,
             issuer: None,
+            tenant: None,
         })
         .await;
 

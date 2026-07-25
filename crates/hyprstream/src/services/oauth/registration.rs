@@ -409,7 +409,7 @@ async fn check_federation_register(state: &OAuthState, origin: &str) -> Result<(
         .policy_client
         .check(&PolicyCheck {
             subject: origin.to_owned(),
-            domain: "*".to_owned(),
+            domain: origin.to_owned(),
             resource: "federation:register".to_owned(),
             operation: "check".to_owned(),
         })

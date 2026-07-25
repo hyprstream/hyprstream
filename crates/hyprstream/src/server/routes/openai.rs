@@ -312,7 +312,7 @@ async fn chat_completions(
         .policy_client
         .check(&crate::services::generated::policy_client::PolicyCheck {
             subject: user.clone(),
-            domain: "*".to_owned(),
+            domain: user.clone(),
             resource: resource.clone(),
             operation: Operation::Infer.as_str().to_owned(),
         })
@@ -903,7 +903,7 @@ async fn completions(
         .policy_client
         .check(&crate::services::generated::policy_client::PolicyCheck {
             subject: user.clone(),
-            domain: "*".to_owned(),
+            domain: user.clone(),
             resource: resource.clone(),
             operation: Operation::Infer.as_str().to_owned(),
         })
@@ -1134,8 +1134,6 @@ fn to_rpc_messages(
         tool_call_id: m.tool_call_id.as_deref().unwrap_or("").to_owned(),
     }).collect()
 }
-
-
 
 
 

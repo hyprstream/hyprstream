@@ -144,12 +144,13 @@ p = sub, dom, obj, act, eft
 
 [role_definition]
 g = _, _
+g2 = _, _, _
 
 [policy_effect]
 e = some(where (p.eft == allow)) && !some(where (p.eft == deny))
 
 [matchers]
-m = (g(r.sub, p.sub) || keyMatch(r.sub, p.sub)) && \
+m = (g(r.sub, p.sub) || g2(r.sub, p.sub, r.dom) || keyMatch(r.sub, p.sub)) && \
     (p.dom == "*" || r.dom == p.dom) && \
     keyMatch(r.obj, p.obj) && \
     (p.act == "*" || keyMatch(r.act, p.act))
@@ -190,7 +191,8 @@ fn default_policy_csv() -> String {
 ///
 /// Ensures all policy lines have the correct number of fields:
 /// - Policy lines (p, ...): 6 fields (p, subject, domain, resource, action, effect)
-/// - Role lines (g, ...): 3 fields (g, user, role)
+/// - Global role lines (g, ...): 3 fields (g, user, role)
+/// - Domain role lines (g2, ...): 4 fields (g2, user, role, domain)
 fn validate_policy_csv(policy_path: &Path) -> Result<(), PolicyError> {
     let content = std::fs::read_to_string(policy_path)
         .map_err(PolicyError::IoError)?;
@@ -230,6 +232,21 @@ fn validate_policy_csv(policy_path: &Path) -> Result<(), PolicyError> {
                 )));
             }
         }
+
+        // Domain-scoped role membership (g2, user, role, domain)
+        if line.starts_with("g2,") || line.starts_with("g2 ") {
+            let fields: Vec<&str> = line.split(',').map(str::trim).collect();
+            if fields.len() != 4 {
+                return Err(PolicyError::ValidationError(format!(
+                    "Invalid domain role format at line {}:\n\
+                    Found:    {}\n\
+                    Expected: g2, user, role, domain\n\
+                    Example:  g2, alice, trainer, tenant-a",
+                    line_num + 1,
+                    line
+                )));
+            }
+        }
     }
     Ok(())
 }
@@ -246,6 +263,38 @@ pub async fn write_policy_file(path: &Path, content: impl AsRef<[u8]>) -> Result
         use std::os::unix::fs::PermissionsExt;
         tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o640)).await?;
     }
+    Ok(())
+}
+
+async fn ensure_domain_role_model(model_path: &Path) -> Result<(), PolicyError> {
+    let content = tokio::fs::read_to_string(model_path).await?;
+    if content.contains("g2 = _, _, _")
+        && content.contains("g2(r.sub, p.sub, r.dom)")
+    {
+        return Ok(());
+    }
+
+    let migrated = content
+        .replacen(
+            "[role_definition]\ng = _, _",
+            "[role_definition]\ng = _, _\ng2 = _, _, _",
+            1,
+        )
+        .replacen(
+            "m = (g(r.sub, p.sub) || keyMatch(r.sub, p.sub))",
+            "m = (g(r.sub, p.sub) || g2(r.sub, p.sub, r.dom) || keyMatch(r.sub, p.sub))",
+            1,
+        );
+    if !migrated.contains("g2 = _, _, _")
+        || !migrated.contains("g2(r.sub, p.sub, r.dom)")
+    {
+        return Err(PolicyError::ValidationError(format!(
+            "{} must define domain-scoped g2(user, role, domain) membership",
+            model_path.display()
+        )));
+    }
+
+    write_policy_file(model_path, migrated).await?;
     Ok(())
 }
 
@@ -283,6 +332,7 @@ impl PolicyManager {
             info!("Creating default model.conf");
             write_policy_file(&model_path, DEFAULT_MODEL_CONF).await?;
         }
+        ensure_domain_role_model(&model_path).await?;
 
         // Create default policy.csv if not exists
         if !policy_path.exists() {
@@ -630,6 +680,54 @@ impl PolicyManager {
             .map_err(PolicyError::CasbinError)
     }
 
+    /// Add a role membership scoped to one verified tenant/domain.
+    pub async fn add_role_for_user_in_domain(
+        &self,
+        user: &str,
+        role: &str,
+        domain: &str,
+    ) -> Result<bool, PolicyError> {
+        validate_policy_component(user, "user")?;
+        validate_policy_component(role, "role")?;
+        validate_policy_component(domain, "domain")?;
+
+        let mut enforcer = self.enforcer.write().await;
+        enforcer
+            .add_named_grouping_policy(
+                "g2",
+                vec![user.to_owned(), role.to_owned(), domain.to_owned()],
+            )
+            .await
+            .map_err(PolicyError::CasbinError)
+    }
+
+    /// Remove only the role membership belonging to one tenant/domain.
+    pub async fn remove_role_for_user_in_domain(
+        &self,
+        user: &str,
+        role: &str,
+        domain: &str,
+    ) -> Result<bool, PolicyError> {
+        validate_policy_component(user, "user")?;
+        validate_policy_component(role, "role")?;
+        validate_policy_component(domain, "domain")?;
+
+        let mut enforcer = self.enforcer.write().await;
+        enforcer
+            .remove_named_grouping_policy(
+                "g2",
+                vec![user.to_owned(), role.to_owned(), domain.to_owned()],
+            )
+            .await
+            .map_err(PolicyError::CasbinError)
+    }
+
+    /// Get domain-scoped role membership records (`user`, `role`, `domain`).
+    pub async fn get_domain_grouping_policy(&self) -> Vec<Vec<String>> {
+        let enforcer = self.enforcer.read().await;
+        enforcer.get_named_grouping_policy("g2")
+    }
+
     /// Get all roles for a user
     pub async fn get_roles_for_user(&self, user: &str) -> Vec<String> {
         let enforcer = self.enforcer.read().await;
@@ -750,6 +848,7 @@ impl PolicyManager {
     pub async fn format_policy(&self) -> String {
         let policies = self.get_policy().await;
         let groupings = self.get_grouping_policy().await;
+        let domain_groupings = self.get_domain_grouping_policy().await;
 
         let mut output = String::new();
 
@@ -767,6 +866,16 @@ impl PolicyManager {
             output.push_str("# Role Assignments\n");
             for g in &groupings {
                 output.push_str(&format!("g, {}\n", g.join(", ")));
+            }
+        }
+
+        if !domain_groupings.is_empty() {
+            if !output.is_empty() {
+                output.push('\n');
+            }
+            output.push_str("# Domain Role Assignments\n");
+            for grouping in &domain_groupings {
+                output.push_str(&format!("g2, {}\n", grouping.join(", ")));
             }
         }
 
@@ -855,6 +964,78 @@ mod tests {
 
         // Bob without role should not
         assert!(!pm.check("bob", "model:test", Operation::Infer).await);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cross_tenant_global_role_mutation_is_denied() -> Result<(), PolicyError> {
+        let pm = PolicyManager::new_in_memory().await?;
+        for tenant in ["tenant-a", "tenant-b"] {
+            pm.add_policy_with_domain(
+                "trainer",
+                tenant,
+                "model:*",
+                "infer.generate",
+                "allow",
+            )
+            .await?;
+        }
+
+        pm.add_role_for_user_in_domain("alice", "trainer", "tenant-a")
+            .await?;
+
+        assert!(
+            pm.check_with_domain("alice", "tenant-a", "model:test", "infer.generate")
+                .await
+        );
+        assert!(
+            !pm.check_with_domain("alice", "tenant-b", "model:test", "infer.generate")
+                .await,
+            "tenant-a role membership must not authorize tenant-b"
+        );
+        assert!(
+            pm.get_grouping_policy().await.is_empty(),
+            "mutable assignment must not create a global g(user, role) entry"
+        );
+        assert_eq!(
+            pm.get_domain_grouping_policy().await,
+            vec![vec![
+                "alice".to_owned(),
+                "trainer".to_owned(),
+                "tenant-a".to_owned()
+            ]]
+        );
+
+        assert!(
+            !pm.remove_role_for_user_in_domain("alice", "trainer", "tenant-b")
+                .await?,
+            "tenant-b removal must not delete tenant-a membership"
+        );
+        assert!(
+            pm.check_with_domain("alice", "tenant-a", "model:test", "infer.generate")
+                .await
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn multiple_identities_share_only_their_tenant_grant() -> Result<(), PolicyError> {
+        let pm = PolicyManager::new_in_memory().await?;
+        pm.add_policy_with_domain("*", "tenant-a", "event:orders", "subscribe", "allow")
+            .await?;
+
+        for identity in ["alice", "bob"] {
+            assert!(
+                pm.check_with_domain(identity, "tenant-a", "event:orders", "subscribe")
+                    .await,
+                "{identity} should receive the shared tenant-a grant"
+            );
+            assert!(
+                !pm.check_with_domain(identity, "tenant-b", "event:orders", "subscribe")
+                    .await,
+                "{identity} must not receive the tenant-a grant in tenant-b"
+            );
+        }
         Ok(())
     }
 
