@@ -1,6 +1,6 @@
 # PEP #1271 status — MAC per-object PEP for events + MoQ pub/sub
 
-Branch: `feat/mac-moq-event-pep`. Package: `hyprstream-rpc`.
+PR: https://github.com/hyprstream/hyprstream/pull/1296 (branch `feat/mac-moq-event-pep`). Package: `hyprstream-rpc`.
 
 ## Reconciled with the canonical #1288 contract
 

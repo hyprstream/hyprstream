@@ -12,7 +12,7 @@ use std::sync::Arc;
 use super::dispatch_pep::{
     DenyAllObjectResolver, MacDecision, MacDenyReason, RpcObjectLabelResolver,
 };
-use super::{SecurityContext, VerifiedKeyMaterial};
+use super::SecurityContext;
 use crate::envelope::Subject;
 
 /// The MoQ/event verb being authorized.
