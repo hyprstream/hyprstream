@@ -141,8 +141,11 @@ pub struct KVCacheRegistry {
     /// Memory budget in bytes (None = unlimited)
     memory_budget_bytes: Option<usize>,
     /// Maps cache owners to the subject delta that was active when the cache was computed.
-    /// When a delta is evicted or reset, dependent caches must be invalidated.
-    delta_dependencies: DashMap<CacheOwner, Option<String>>,
+    /// The value is `(tenant_id, weight_epoch)`: the tenant whose delta contributed to
+    /// the KV, plus the delta's weight epoch at compute time. When a delta is evicted
+    /// or reset, dependent caches must be invalidated; when the epoch has advanced
+    /// (in-place re-adaptation under the same tenant), the cached KV is weight-stale.
+    delta_dependencies: DashMap<CacheOwner, Option<(String, u64)>>,
     /// Shared block pool for paged KV cache storage (None if paged mode not enabled)
     block_pool: Option<Arc<Mutex<BlockPool>>>,
 }
@@ -362,28 +365,39 @@ impl KVCacheRegistry {
 
     /// Register the tenant delta that produced a cache owner's KV.
     ///
-    /// Records `tenant_id` as the effective tenant whose delta contributed to
-    /// the cache's weights — pass `None` when no tenant delta contributes (bare
-    /// base model or base-delta-only inference). When that tenant's delta is
-    /// later evicted, reset, or removed, [`Self::invalidate_for_tenant`] clears
-    /// every cache recorded under it.
+    /// Records `(tenant_id, weight_epoch)` as the effective tenant whose delta
+    /// contributed to the cache's weights, along with that delta's weight epoch
+    /// at compute time — pass `None` when no tenant delta contributes (bare
+    /// base model or base-delta-only inference; the epoch is then irrelevant).
+    /// When that tenant's delta is later evicted, reset, or removed,
+    /// [`Self::invalidate_for_tenant`] clears every cache recorded under it.
     ///
-    /// **Stale-weight guard:** if the effective tenant differs from the value
-    /// recorded the last time this owner's cache was computed, the existing KV
-    /// was produced under different weights and is cleared in place (cached
-    /// token IDs + every layer cache) before the new dependency is recorded, so
-    /// generation can never reuse it. Returns `true` when such a stale cache was
-    /// cleared. This is the barrier that stops a session cache from crossing a
-    /// no-delta↔delta (or tenant-A↔tenant-B) weight boundary: the next request
-    /// re-`register`s with the now-effective tenant, the mismatch is detected,
-    /// and the stale KV is dropped, forcing a full recompute. A cache with no
+    /// **Stale-weight guard:** if the effective `(tenant_id, weight_epoch)`
+    /// differs from the value recorded the last time this owner's cache was
+    /// computed, the existing KV was produced under different weights and is
+    /// cleared in place (cached token IDs + every layer cache) before the new
+    /// dependency is recorded, so generation can never reuse it. Returns `true`
+    /// when such a stale cache was cleared. This is the barrier that stops a
+    /// session cache from crossing a weight boundary — no-delta↔delta,
+    /// tenant-A↔tenant-B, *and* same-tenant in-place re-adaptation (the epoch
+    /// advances while the tenant id stays the same): the next request
+    /// re-`register`s with the now-effective tenant and epoch, the mismatch is
+    /// detected, and the stale KV is dropped, forcing a full recompute. Both
+    /// the bump (at adapt/train/rollback/reset time) and this comparison are
+    /// O(1) — no per-adaptation scan of the dependency map. A cache with no
     /// prior record (fresh, or just invalidated) is never treated as stale.
-    pub fn register_delta_dependency(&self, owner: &CacheOwner, tenant_id: Option<String>) -> bool {
+    pub fn register_delta_dependency(
+        &self,
+        owner: &CacheOwner,
+        tenant_id: Option<String>,
+        weight_epoch: u64,
+    ) -> bool {
+        let dependency = tenant_id.map(|t| (t, weight_epoch));
         let stale = match self.delta_dependencies.get(owner) {
-            Some(prev) => *prev != tenant_id,
+            Some(prev) => *prev != dependency,
             None => false,
         };
-        self.delta_dependencies.insert(owner.clone(), tenant_id);
+        self.delta_dependencies.insert(owner.clone(), dependency);
 
         if stale {
             if let Some(cache) = self.caches.get(owner) {
@@ -394,7 +408,7 @@ impl KVCacheRegistry {
                 guard.set_cached_tokens(Vec::new());
                 guard.clear_all();
                 tracing::info!(
-                    "Cleared stale KV cache for {:?}: effective tenant changed since last compute",
+                    "Cleared stale KV cache for {:?}: effective tenant or weight epoch changed since last compute",
                     owner
                 );
             }
@@ -413,7 +427,7 @@ impl KVCacheRegistry {
             .delta_dependencies
             .iter()
             .filter_map(|entry| {
-                if entry.value().as_deref() == Some(tenant_id) {
+                if entry.value().as_ref().map(|(t, _)| t.as_str()) == Some(tenant_id) {
                     Some(entry.key().clone())
                 } else {
                     None
@@ -2670,8 +2684,8 @@ mod tests {
         populate_cache(&cache_b);
 
         // Register each cache under its own tenant delta.
-        registry.register_delta_dependency(&owner_a, Some("tenant-a".into()));
-        registry.register_delta_dependency(&owner_b, Some("tenant-b".into()));
+        registry.register_delta_dependency(&owner_a, Some("tenant-a".into()), 1);
+        registry.register_delta_dependency(&owner_b, Some("tenant-b".into()), 1);
 
         assert_eq!(registry.cache_count(), 2);
         assert_eq!(cache_a.lock().cached_token_count(), 4);
@@ -2704,14 +2718,14 @@ mod tests {
 
         // 1. First compute under NO tenant delta — fresh, nothing stale.
         assert!(
-            !registry.register_delta_dependency(&owner, None),
+            !registry.register_delta_dependency(&owner, None, 0),
             "fresh cache is not stale"
         );
         assert_eq!(cache.lock().cached_token_count(), 4, "KV preserved on first register");
 
         // 2. no-delta → tenant delta: weights changed, KV is stale and cleared.
         assert!(
-            registry.register_delta_dependency(&owner, Some("tenant-1".into())),
+            registry.register_delta_dependency(&owner, Some("tenant-1".into()), 1),
             "no-delta → delta must clear stale KV"
         );
         assert_eq!(cache.lock().cached_token_count(), 0, "KV cleared across weight version");
@@ -2721,16 +2735,16 @@ mod tests {
         populate_cache(&cache);
         assert_eq!(cache.lock().cached_token_count(), 4);
 
-        // 3. Same tenant again — NOT stale, KV preserved.
+        // 3. Same tenant, same weight epoch — NOT stale, KV preserved.
         assert!(
-            !registry.register_delta_dependency(&owner, Some("tenant-1".into())),
-            "same tenant is not stale"
+            !registry.register_delta_dependency(&owner, Some("tenant-1".into()), 1),
+            "same tenant at the same epoch is not stale"
         );
         assert_eq!(cache.lock().cached_token_count(), 4, "KV preserved for same tenant");
 
         // 4. delta → no-delta: weights changed again, stale and cleared.
         assert!(
-            registry.register_delta_dependency(&owner, None),
+            registry.register_delta_dependency(&owner, None, 0),
             "delta → no-delta must clear stale KV"
         );
         assert_eq!(cache.lock().cached_token_count(), 0);
@@ -2738,7 +2752,7 @@ mod tests {
         // 5. Repopulate, then switch tenants (tenant-1 effective → tenant-2): stale.
         populate_cache(&cache);
         assert!(
-            registry.register_delta_dependency(&owner, Some("tenant-2".into())),
+            registry.register_delta_dependency(&owner, Some("tenant-2".into()), 1),
             "tenant change must clear stale KV"
         );
         assert_eq!(cache.lock().cached_token_count(), 0);
@@ -2746,6 +2760,59 @@ mod tests {
         // 6. After a clear, the recorded tenant is tenant-2; invalidating
         //    tenant-2 still finds (and removes) the owner entry.
         assert_eq!(registry.invalidate_for_tenant("tenant-2"), 1);
+    }
+
+    /// Same-tenant in-place re-adaptation (adapt_tenant/train_step/rollback/reset
+    /// bumps the delta's weight epoch while the tenant id stays the same) must
+    /// clear the stale KV on the next reuse; reusing at the SAME epoch (no
+    /// re-adaptation) must preserve it. This is the F1 regression test: the
+    /// recorded `(tenant_id, weight_epoch)` pair detects weight staleness that a
+    /// tenant-id-only comparison cannot (#1254).
+    #[test]
+    fn test_register_clears_stale_kv_on_weight_epoch_advance() {
+        let registry = KVCacheRegistry::new(CacheConfig::new(2, 128), None);
+        let owner = CacheOwner::Session("session-ttt".into());
+        let cache = registry.get_or_create(owner.clone());
+        populate_cache(&cache);
+
+        // Compute under tenant-1 at weight epoch 1 — fresh, nothing stale.
+        assert!(
+            !registry.register_delta_dependency(&owner, Some("tenant-1".into()), 1),
+            "fresh cache is not stale"
+        );
+        assert_eq!(cache.lock().cached_token_count(), 4);
+
+        // No re-adaptation: same tenant, same epoch → KV preserved.
+        assert!(
+            !registry.register_delta_dependency(&owner, Some("tenant-1".into()), 1),
+            "same tenant at the same epoch must preserve KV"
+        );
+        assert_eq!(cache.lock().cached_token_count(), 4, "KV preserved within a weight epoch");
+        assert_eq!(layer0_seq_pos(&cache), Some(4));
+
+        // In-place re-adaptation: tenant id unchanged, epoch bumped 1 → 2.
+        // The cached KV was computed under the old weights → stale, cleared.
+        assert!(
+            registry.register_delta_dependency(&owner, Some("tenant-1".into()), 2),
+            "same tenant at an advanced epoch must clear stale KV"
+        );
+        assert_eq!(cache.lock().cached_token_count(), 0, "weight-stale KV cleared");
+        assert_eq!(layer0_seq_pos(&cache), Some(0));
+
+        // Repopulate under the new weights; the new epoch is now recorded.
+        populate_cache(&cache);
+        assert!(
+            !registry.register_delta_dependency(&owner, Some("tenant-1".into()), 2),
+            "post-clear reuse at the recorded epoch is not stale"
+        );
+        assert_eq!(cache.lock().cached_token_count(), 4, "KV preserved after recompute");
+
+        // A reset/rollback bumps the epoch again → stale again.
+        assert!(
+            registry.register_delta_dependency(&owner, Some("tenant-1".into()), 3),
+            "further epoch advance (reset/rollback) must clear stale KV"
+        );
+        assert_eq!(cache.lock().cached_token_count(), 0);
     }
 
     /// Releasing or evicting a cache must drop its delta dependency so the map
@@ -2757,7 +2824,7 @@ mod tests {
 
         let owner = CacheOwner::Stateless(42);
         let _cache = registry.get_or_create(owner.clone());
-        registry.register_delta_dependency(&owner, Some("tenant-s".into()));
+        registry.register_delta_dependency(&owner, Some("tenant-s".into()), 1);
         assert!(registry.delta_dependencies.contains_key(&owner));
 
         // Releasing a stateless cache removes both the cache and its dependency.
@@ -2780,7 +2847,7 @@ mod tests {
         let owner = CacheOwner::Session("base-only".into());
         let cache = registry.get_or_create(owner.clone());
         populate_cache(&cache);
-        registry.register_delta_dependency(&owner, None);
+        registry.register_delta_dependency(&owner, None, 0);
 
         // Invalidating any tenant leaves the no-tenant cache untouched.
         assert_eq!(registry.invalidate_for_tenant("anyone"), 0);

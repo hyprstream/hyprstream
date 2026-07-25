@@ -260,6 +260,11 @@ pub struct TenantDelta {
     pub rank_oracle: Option<super::ttt::RankOracle>,
     /// Lifecycle state of any pending adaptation (Idle or Pending with snapshot).
     pub adaptation_state: crate::training::adaptation_state::DeltaAdaptationState,
+    /// Weight epoch: a version counter bumped on every in-place weight mutation
+    /// (adaptation, train step, rollback/restore, reset). Session KV caches record
+    /// the epoch they were computed under; a mismatch on reuse means the cached
+    /// KV is weight-stale and must be cleared (#1254 F1 fix).
+    weight_epoch: u64,
 }
 
 impl TenantDelta {
@@ -409,6 +414,7 @@ impl TenantDelta {
             alpha: config.alpha,
             rank_oracle: None,
             adaptation_state: crate::training::adaptation_state::DeltaAdaptationState::Idle,
+            weight_epoch: 0,
         })
     }
 
@@ -617,12 +623,30 @@ impl TenantDelta {
             }
         }
 
+        // Restoring a state dict changes the effective weights in place
+        // (rollback / snapshot rehydrate) — bump the weight epoch so session
+        // KV computed under the previous weights is treated as stale.
+        self.bump_weight_epoch();
+
         Ok(())
     }
 
     /// Update last access time
     pub fn touch(&mut self) {
         self.last_access = Instant::now();
+    }
+
+    /// Current weight epoch (version counter for KV-cache staleness detection).
+    pub fn weight_epoch(&self) -> u64 {
+        self.weight_epoch
+    }
+
+    /// Bump the weight epoch. Must be called on every in-place mutation of the
+    /// effective weights that happens without a remove/re-add of the delta —
+    /// adaptations, train steps, rollback restores, resets. O(1); the session
+    /// KV layer compares epochs on reuse and clears weight-stale caches.
+    pub fn bump_weight_epoch(&mut self) {
+        self.weight_epoch = self.weight_epoch.wrapping_add(1);
     }
 
     /// Estimate memory usage in bytes
@@ -655,6 +679,9 @@ impl TenantDelta {
         self.request_count = 0;
         self.avg_loss_improvement = 0.0;
         self.adaptation_state = crate::training::adaptation_state::DeltaAdaptationState::Idle;
+        // Zeroing the LoRA weights is the largest possible in-place weight
+        // change — bump the epoch so dependent session KV is invalidated.
+        self.bump_weight_epoch();
     }
 
     /// Zero all gradients on trainable variables.
@@ -845,6 +872,7 @@ impl TenantDelta {
             alpha: 1.0, // Already pre-scaled during composition
             rank_oracle: None,
             adaptation_state: crate::training::adaptation_state::DeltaAdaptationState::Idle,
+            weight_epoch: 0,
         }))
     }
 }
@@ -1042,6 +1070,7 @@ impl TenantDelta {
             alpha,
             rank_oracle: None,
             adaptation_state: crate::training::adaptation_state::DeltaAdaptationState::Idle,
+            weight_epoch: 0,
         })
     }
 }
@@ -1225,6 +1254,27 @@ mod tests {
             .sum(Kind::Float)
             .double_value(&[]);
         assert!(diff1 < 1e-6, "State dict roundtrip should preserve layer 1 values");
+    }
+
+    /// The weight epoch starts at 0 and advances on every in-place weight
+    /// mutation that bypasses remove/re-add — reset() and load_state_dict()
+    /// (rollback / snapshot rehydrate) here; adapt_tenant/train_step bump it in
+    /// the trainer. The KV layer keys staleness on this counter (#1254 F1 fix).
+    #[test]
+    fn test_weight_epoch_bumps_on_in_place_mutation() {
+        let config = TenantDeltaConfig::default();
+        let dims = test_module_dims();
+        let mut delta = TenantDelta::new(&config, &dims, Device::Cpu, TEST_NUM_LAYERS).unwrap();
+        assert_eq!(delta.weight_epoch(), 0, "fresh delta starts at epoch 0");
+
+        // reset() zeroes the LoRA B weights in place → epoch advances.
+        delta.reset();
+        assert_eq!(delta.weight_epoch(), 1, "reset bumps the weight epoch");
+
+        // load_state_dict() restores weights in place (rollback path) → epoch advances.
+        let state = delta.extract_state_dict();
+        delta.load_state_dict(&state).unwrap();
+        assert_eq!(delta.weight_epoch(), 2, "state restore bumps the weight epoch");
     }
 
     #[test]

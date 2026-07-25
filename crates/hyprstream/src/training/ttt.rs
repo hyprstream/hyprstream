@@ -871,6 +871,14 @@ impl TestTimeTrainer {
                 // Restore SSM states so TTT training data does not pollute inference recurrent state.
                 engine.restore_ssm_states(ssm_snapshot);
 
+                // The LoRA weights were mutated in place (same tenant key, new
+                // effective weights) — bump the weight epoch so session KV
+                // computed under the pre-adaptation weights is cleared as stale
+                // on the next reuse (#1254 F1 fix).
+                if actual_steps > 0 {
+                    delta.bump_weight_epoch();
+                }
+
                 Ok((
                     TTTResult {
                         avg_loss,
@@ -1202,6 +1210,13 @@ impl TestTimeTrainer {
 
                 // Restore SSM states so training data does not pollute inference recurrent state.
                 engine.restore_ssm_states(ssm_snapshot);
+
+                // The LoRA weights were mutated in place — bump the weight epoch
+                // so session KV computed under the pre-training weights is
+                // cleared as stale on the next reuse (#1254 F1 fix).
+                if actual_steps > 0 {
+                    delta.bump_weight_epoch();
+                }
 
                 Ok(TTTResult {
                     avg_loss,

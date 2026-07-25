@@ -344,12 +344,24 @@ impl TorchEngine {
     /// a session cache was swapped in.
     ///
     /// `tenant_id` is the effective tenant whose delta contributed to this
-    /// request's weights (`None` when no tenant delta contributes). It is
-    /// registered against the owner cache *before* the cache is installed in the
-    /// model, so the cache is tracked for invalidation (and cleared if its
-    /// previously-computed KV is stale w.r.t. a different tenant) before
-    /// generation can read a single token from it.
-    pub fn swap_session_cache(&self, tenant_id: Option<String>) -> bool {
+    /// request's weights (`None` when no tenant delta contributes), and
+    /// `weight_epoch` is that delta's current weight epoch (ignored when
+    /// `tenant_id` is `None`). The pair is registered against the owner cache
+    /// *before* the cache is installed in the model, so the cache is tracked
+    /// for invalidation (and cleared if its previously-computed KV is stale
+    /// w.r.t. a different tenant or an older weight epoch) before generation
+    /// can read a single token from it.
+    ///
+    /// **Atomicity invariant (F2):** the register→install sequence below is
+    /// *not* guarded by a lock spanning both operations. It is race-free today
+    /// because `InferenceService` runs on a single-threaded `current_thread`
+    /// Tokio runtime inside a `LocalSet`, and this function is await-free — no
+    /// other request task can interleave between `register_delta_dependency`
+    /// and `set_kv_cache`, so the pair executes atomically with respect to
+    /// other requests. If `InferenceService` ever moves to a multi-threaded
+    /// runtime (or an `.await` is introduced here), this invariant breaks and a
+    /// spanning lock or an epoch handshake would be required.
+    pub fn swap_session_cache(&self, tenant_id: Option<String>, weight_epoch: u64) -> bool {
         let owner = match self.active_cache_owner.lock().clone() {
             Some(o) => o,
             None => return false,
@@ -370,7 +382,7 @@ impl TorchEngine {
         // in place. Ordering matters: registration/staleness-clear precede
         // set_kv_cache, so the model can never publish output from an untracked
         // or weight-stale cache.
-        let cleared_stale = registry.register_delta_dependency(&owner, tenant_id);
+        let cleared_stale = registry.register_delta_dependency(&owner, tenant_id, weight_epoch);
         let mut model = model_arc.lock();
         model.set_kv_cache(session_cache);
         tracing::debug!(
@@ -1665,16 +1677,19 @@ impl TorchEngine {
     /// generation) to allow concurrent training updates.
     ///
     /// `tenant_id` is the effective tenant whose delta contributed to the weights
-    /// (`Some` only when a per-tenant delta is in play, `None` otherwise). It is
-    /// threaded to the session-cache swap so the resulting KV is registered for
+    /// (`Some` only when a per-tenant delta is in play, `None` otherwise), and
+    /// `weight_epoch` is that delta's current weight epoch. The pair is threaded
+    /// to the session-cache swap so the resulting KV is registered for
     /// tenant-delta invalidation and cleared if the weights changed under a
-    /// different tenant. The caller must derive it from the verified request
-    /// subject, not invent a new identity source.
+    /// different tenant or an older weight epoch (same-tenant in-place
+    /// re-adaptation). The caller must derive the tenant id from the verified
+    /// request subject, not invent a new identity source.
     pub fn generate_with_delta(
         &self,
         mut request: GenerationRequest,
         delta: Option<std::sync::Arc<parking_lot::Mutex<crate::training::TenantDelta>>>,
         tenant_id: Option<String>,
+        weight_epoch: u64,
     ) -> Result<TextStream<'_>> {
         if let Some(seed) = request.seed {
             self.set_seed(seed as u64);
@@ -1684,7 +1699,7 @@ impl TorchEngine {
             request.timeout_ms = Some(self.config.default_generation_timeout_ms);
         }
 
-        TextStream::new_with_delta(self, request, delta, tenant_id)
+        TextStream::new_with_delta(self, request, delta, tenant_id, weight_epoch)
     }
 
     /// Non-streaming generation with optional delta (convenience wrapper)
@@ -1693,6 +1708,7 @@ impl TorchEngine {
         request: GenerationRequest,
         delta: Option<std::sync::Arc<parking_lot::Mutex<crate::training::TenantDelta>>>,
         tenant_id: Option<String>,
+        weight_epoch: u64,
     ) -> Result<crate::config::GenerationResult> {
         use futures::StreamExt;
 
@@ -1702,7 +1718,7 @@ impl TorchEngine {
             ));
         }
 
-        let mut stream = self.generate_with_delta(request, delta, tenant_id)?;
+        let mut stream = self.generate_with_delta(request, delta, tenant_id, weight_epoch)?;
         let mut accumulated_text = String::new();
 
         while let Some(text_chunk) = stream.next().await {
@@ -2504,7 +2520,7 @@ pub struct TextStream<'a> {
 
 impl<'a> TextStream<'a> {
     fn new(engine: &'a TorchEngine, request: GenerationRequest) -> Result<Self> {
-        Self::new_with_delta(engine, request, None, None)
+        Self::new_with_delta(engine, request, None, None, 0)
     }
 
     fn new_with_delta(
@@ -2512,6 +2528,7 @@ impl<'a> TextStream<'a> {
         request: GenerationRequest,
         delta: Option<std::sync::Arc<parking_lot::Mutex<crate::training::TenantDelta>>>,
         tenant_id: Option<String>,
+        weight_epoch: u64,
     ) -> Result<Self> {
         let prompt_tokens = engine.tokenize(&request.prompt)?;
         let prompt_len = prompt_tokens.len();
@@ -2542,7 +2559,7 @@ impl<'a> TextStream<'a> {
         // If an active session exists, swap its KV cache into the model and check
         // if the new prompt shares a prefix with the cached tokens. This avoids
         // re-computing attention for unchanged conversation history.
-        let prefill_start_pos = if engine.swap_session_cache(tenant_id) {
+        let prefill_start_pos = if engine.swap_session_cache(tenant_id, weight_epoch) {
             // Session cache swapped in — check for prefix match
             let prefix_len = if let Some(model_arc) = &engine.persistent_model {
                 let model = model_arc.lock();

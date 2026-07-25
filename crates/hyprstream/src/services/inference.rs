@@ -446,18 +446,22 @@ impl InferenceService {
     /// Returns None if no deltas exist (base model only), which is the common case
     /// and incurs zero overhead.
     ///
-    /// Returns `(delta, tenant_id)` where `tenant_id` is `Some(subject)` only when
-    /// a per-tenant delta contributed to the effective weights. The engine
-    /// registers that id against the session KV cache so a later tenant-delta
-    /// eviction/reset/removal invalidates it; base-delta-only and bare-base
-    /// requests carry no tenant dependency (`None`) and are never cleared by a
-    /// tenant eviction.
+    /// Returns `(delta, tenant_id, weight_epoch)` where `tenant_id` is
+    /// `Some(subject)` only when a per-tenant delta contributed to the effective
+    /// weights, and `weight_epoch` is that tenant delta's current weight epoch
+    /// (0 when no tenant delta is in play). The engine registers the pair
+    /// against the session KV cache so a later tenant-delta eviction/reset/removal
+    /// invalidates it, and so an epoch advance (in-place re-adaptation under the
+    /// same tenant) marks the cached KV weight-stale; base-delta-only and
+    /// bare-base requests carry no tenant dependency (`None`) and are never
+    /// cleared by a tenant eviction.
     fn resolve_delta(
         &self,
         subject: &hyprstream_rpc::Subject,
     ) -> (
         Option<Arc<Mutex<crate::training::TenantDelta>>>,
         Option<String>,
+        u64,
     ) {
         let base = self.base_delta.lock().clone();
         let tenant = self.delta_pool.as_ref().and_then(|pool| pool.get(subject));
@@ -465,6 +469,13 @@ impl InferenceService {
         // The id is the verified request subject — the existing RPC tenant
         // identity — not a new identity source.
         let tenant_id = tenant.as_ref().map(|_| subject.to_string());
+        // Read the epoch AFTER any adaptation for this request has completed
+        // (resolve_delta runs after apply_ttt_adaptation on the serving path),
+        // so a re-adapted tenant's new epoch is what gets registered.
+        let weight_epoch = tenant
+            .as_ref()
+            .map(|d| d.lock().weight_epoch())
+            .unwrap_or(0);
 
         let delta = match (base, tenant) {
             (Some(base), Some(tenant)) => {
@@ -476,7 +487,7 @@ impl InferenceService {
             (None, None) => None,
         };
 
-        (delta, tenant_id)
+        (delta, tenant_id, weight_epoch)
     }
 
     /// Apply TTT adaptation if enabled (adapts model to input BEFORE generation)
@@ -783,7 +794,7 @@ impl InferenceService {
         };
 
         // Re-resolve delta after TTT (may have been updated by adaptation)
-        let (delta, tenant_id) = self.resolve_delta(&subject);
+        let (delta, tenant_id, weight_epoch) = self.resolve_delta(&subject);
 
         trace!(
             stream_id = %stream_ctx.stream_id(),
@@ -813,7 +824,7 @@ impl InferenceService {
         // Run the stream with StreamChannel's async publisher callback.
         // Engine read-lock held across await: generate_with_delta returns a stream borrowing engine.
         let engine = self.engine.read();
-        let stream_result = engine.generate_with_delta(request, delta, tenant_id);
+        let stream_result = engine.generate_with_delta(request, delta, tenant_id, weight_epoch);
 
         let result = stream_channel.run_stream(stream_ctx, |mut publisher| async move {
             let result = match stream_result {
