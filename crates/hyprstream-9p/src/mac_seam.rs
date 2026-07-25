@@ -367,7 +367,8 @@ impl AccessDecider for DenyAllDecider {
 ///
 /// Constructed by the application (`hyprstream` crate) at activation time from
 /// its concrete token verifier, genesis/manifest label resolver, and AVC/PDP
-/// adapter. Not installed by any production path yet — see the module docs.
+/// adapter. The application installs it at every production 9P constructor;
+/// monitor-less translators remain available for tests and dormant embeddings.
 pub struct ReferenceMonitor {
     authenticator: Arc<dyn AttachAuthenticator>,
     labels: Arc<dyn ObjectLabelResolver + Send + Sync>,

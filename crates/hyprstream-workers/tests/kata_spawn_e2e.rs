@@ -255,6 +255,7 @@ async fn kata_spawn_e2e() -> TestResult {
         image_config,
         Arc::clone(&rafs_store),
         Arc::new(FixtureAccessDecider),
+        None,
     );
 
     assert!(

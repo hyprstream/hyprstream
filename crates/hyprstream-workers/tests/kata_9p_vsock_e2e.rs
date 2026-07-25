@@ -218,6 +218,7 @@ async fn kata_9p_vsock_e2e() -> TestResult {
         image_config,
         Arc::clone(&rafs_store),
         Arc::new(FixtureAccessDecider),
+        None,
     );
 
     assert!(
@@ -395,6 +396,7 @@ async fn kata_9p_fuse_mount_e2e() -> TestResult {
         image_config,
         Arc::clone(&rafs_store),
         Arc::new(FixtureAccessDecider),
+        None,
     );
     assert!(
         backend.is_available(),

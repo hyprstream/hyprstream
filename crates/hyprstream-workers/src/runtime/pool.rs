@@ -571,6 +571,7 @@ mod tests {
             image_config,
             rafs_store,
             Arc::new(FixtureAccessDecider),
+            None,
         ));
         let pool = Arc::new(SandboxPool::new(pool_config, backend));
 

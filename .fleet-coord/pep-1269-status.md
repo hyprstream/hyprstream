@@ -2,7 +2,7 @@
 
 **Lane:** T3 / #1269 (epic #1267)
 **Branch:** feat/mac-9p-activate
-**Status:** STRUCTURE INSTALLED, fail-closed. Ready for kimi-k3 review.
+**Status:** REBASED ON #1288/#1196; STRUCTURE INSTALLED, fail-closed.
 
 ## What landed
 
@@ -14,7 +14,7 @@
 - **SessionContext::from_verified_clearance** (`hyprstream-9p`): verified
   clearance but no S6 token — denies at the token gate. Structural constructor
   for the #698-not-wired case.
-- **SHARED MAC PEP contract** (`hyprstream/src/mac/pep.rs`):
+- **Plane-specific 9P PEP** (`hyprstream/src/mac/pep.rs`):
   - `NinePClearanceSource` trait — clean clearance-input seam (#698).
   - `EnrollmentClearanceSource` — production impl via enrollment resolver
     (fail-closed when no policy / unenrolled).
@@ -35,9 +35,10 @@
 
 ## What is NOT wired (gated dependencies)
 
-- **#698** — production clearance issuance: `Claims.clearance` field not present.
-  `EnrollmentClearanceSource` resolves via the compiled policy enrollment table;
-  no enrollment table populated in production → all subjects resolve to `None`
+- **#698** — production 9P clearance issuance: although RPC `Claims` can carry
+  clearance, the 9P attach path does not yet carry the verified clearance/token
+  material. `EnrollmentClearanceSource` resolves via the compiled policy
+  enrollment table; an absent policy or unenrolled identity resolves to `None`
   → deny.
 - **S6 sender-bound token** — not wired into 9P `Tattach`. Sessions constructed
   via `from_verified_clearance` (token = None) → token gate denies every op.
@@ -46,12 +47,20 @@
   object. The `..` / bind / symlink gap is unchanged; activation does not close
   it. Flagged in the `mac_seam.rs` module docs.
 
-## Fleet-coordination notes
+## Canonical contract reconciliation
 
-- **#1268 contract** (`mac-pep-contract.md`) was NOT published at start. Built
-  plane-specific label resolution (genesis resolver) + a clean clearance-input
-  seam (`NinePClearanceSource`) as directed by the fallback clause. The
-  `NinePClearanceSource` trait is the seam #1268 can consume/extend when it
-  publishes the shared claims→clearance contract.
+- Rebased onto the merged #1288 contract and retained its canonical
+  `MacDispatchPep` / `MacDecision` / `MacDenyReason` /
+  `RpcObjectLabelResolver` definitions unchanged. In particular, an
+  uninstalled RPC dispatch PEP remains dormant and returns `Permit`; only an
+  installed PEP is fail-closed.
+- Per `.fleet-coord/mac-pep-contract.md`, 9P does not implement
+  `MacDispatchPep` or depend on `EnvelopeContext`; it retains the existing
+  plane-specific `NinePAccessDecider`, trusted path/CID label resolution, and
+  verified-attach clearance seam.
+- #1196's `EnvelopeContext::verified_tenant` initializers arrive from main.
+  This PR adds no `EnvelopeContext` initializer. The 9P genesis/content-truth
+  resolver is node-global, so it deliberately remains in the global domain;
+  tenant isolation continues at the Subject-scoped export boundary.
 - **`anonymous_floor()` reachability**: not reachable from any production
   constructor (all 4 install `Some(monitor)`). Still used by tests.

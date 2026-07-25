@@ -1531,6 +1531,7 @@ mod tests {
                 image_config,
                 Arc::clone(&rafs_store),
                 Arc::new(FixtureAccessDecider),
+                None,
             ),
         );
         let service = WorkerService::new(pool_config, backend, Some(rafs_store), transport, signing_key)?;
