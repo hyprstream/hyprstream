@@ -26,6 +26,7 @@ members = [
     "crates/hyprstream-rpc-std",
     "crates/hyprstream-9p",
     "crates/hyprstream-pds",
+    "crates/hyprstream-pds-service",
     "crates/hyprstream-workers-wasmtime",
     "crates/hyprstream-workers-python",
     "crates/hyprstream-k8s",

@@ -1,0 +1,24 @@
+[package]
+name = "hyprstream-pds-service"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Tenant-scoped PDS account record service over the Hyprstream 9P mount plane"
+
+[dependencies]
+anyhow = { workspace = true }
+hyprstream-pds = { path = "../hyprstream-pds" }
+hyprstream-rpc = { path = "../hyprstream-rpc" }
+hyprstream-vfs = { path = "../hyprstream-vfs" }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+ed25519-dalek = { workspace = true }
+hyprstream-crypto = { path = "../hyprstream-crypto" }
+hyprstream-rpc = { path = "../hyprstream-rpc", features = ["test-classical-policy"] }
+rand = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+[lints]
+workspace = true
