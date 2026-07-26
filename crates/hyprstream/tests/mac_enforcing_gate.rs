@@ -289,8 +289,8 @@ struct ReadCountingBackend {
 
 #[async_trait]
 impl Backend for ReadCountingBackend {
-    async fn attach(&self, uname: &str) -> Result<()> {
-        self.inner.attach(uname).await
+    async fn attach(&self, uname: &str, aname: &str) -> Result<()> {
+        self.inner.attach(uname, aname).await
     }
 
     async fn walk(&self, fid: u32, newfid: u32, components: &[String]) -> Result<WalkResult> {
