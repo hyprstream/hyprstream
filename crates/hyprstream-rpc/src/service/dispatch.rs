@@ -251,6 +251,25 @@ where
         ctx.browser_method_discriminator,
     );
     if let crate::auth::mac::MacDecision::Deny(reason) = mac_decision {
+        let mac_resource = match ctx.browser_method_discriminator {
+            Some(method) => format!("{actual_service_domain}:method:{method}"),
+            None => format!("{actual_service_domain}:*"),
+        };
+        // S7/#1274: a mandatory-MAC rejection is an authorization decision,
+        // not merely a diagnostic warning. Emit it on the unified MAC audit
+        // target before returning the signed deny response so the RPC and 9P
+        // planes have the same fail-closed audit contract.
+        warn!(
+            target: "hyprstream.mac.audit",
+            decision = "deny",
+            subject = %ctx.subject(),
+            resource = %mac_resource,
+            action = "rpc-dispatch",
+            request_id,
+            plane = "rpc",
+            reason = ?reason,
+            "authorization decision"
+        );
         warn!(
             "{} MAC dispatch PEP denied {} (id={}, reason={:?})",
             service.name(),
