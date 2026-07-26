@@ -52,6 +52,7 @@ pub async fn exchange_token_exchange(
     audience: Option<&str>,
     scope: Option<&str>,
     actor_token: Option<&str>,
+    output_dpop_jkt: Option<String>,
     requested_token_type: Option<&str>,
     tenant: Option<&str>,
 ) -> Response {
@@ -145,6 +146,8 @@ pub async fn exchange_token_exchange(
 
     // Service assertions carry the exact key which verified their signature.
     let user_pub_key = verified.cnf_key_bytes.map(|b| URL_SAFE_NO_PAD.encode(b));
+    let output_issuer =
+        state.issuer_for_scopes(requested_scopes.as_deref().unwrap_or_default());
 
     let result = state
         .policy_client
@@ -156,8 +159,10 @@ pub async fn exchange_token_exchange(
             audience: audience.map(str::to_owned),
             subject: Some(verified.sub.clone()),
             user_pub_key,
-            dpop_jkt: None,
-            issuer: None,
+            dpop_jkt: output_dpop_jkt,
+            // RFC 8693/XRPC credentials cross a network boundary. They must
+            // never inherit the PolicyService's empty-issuer local-IPC profile.
+            issuer: Some(output_issuer),
             tenant,
             require_clearance: verified.require_clearance,
         })
@@ -565,6 +570,24 @@ pub async fn exchange_atproto_ucan(
             "Authorization: Bearer service JWT is required",
         );
     };
+    let endpoint = format!(
+        "{}/xrpc/ai.hyprstream.identity.exchangeUcan",
+        state.atproto_issuer_url().trim_end_matches('/')
+    );
+    let output_dpop_jkt = match headers
+        .get("DPoP")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|proof| super::dpop::verify_dpop_proof(proof, "POST", &endpoint, None).ok())
+    {
+        Some(proof) => Some(proof.jkt),
+        None => {
+            return xrpc_error(
+                StatusCode::BAD_REQUEST,
+                "InvalidRequest",
+                "a valid DPoP proof is required to bind the exchanged credential",
+            );
+        }
+    };
     let response = exchange_token_exchange(
         &state,
         assertion,
@@ -572,6 +595,7 @@ pub async fn exchange_atproto_ucan(
         request.audience.as_deref(),
         request.scope.as_deref(),
         None,
+        output_dpop_jkt,
         Some(ISSUED_TOKEN_TYPE),
         Some(&request.tenant),
     ).await;

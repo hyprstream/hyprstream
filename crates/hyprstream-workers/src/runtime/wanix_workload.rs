@@ -322,10 +322,11 @@ pub async fn inject_9p_socket(
         // token gate, independent IFC dominance, then the local AVC/PDP).
         let mut translator = hyprstream_9p::Translator::from_mount(mount, subject, decider);
         if let Some(monitor) = monitor {
-            translator = translator.with_reference_monitor(monitor);
+            translator = translator
+                .with_reference_monitor(monitor)
+                .with_activation_control();
         }
-        if let Err(e) = translator.serve_uds(listener).await
-        {
+        if let Err(e) = translator.serve_uds(listener).await {
             warn!(socket = %sock_for_log.display(), error = %e, "9P workload server exited with error");
         }
     });
@@ -804,14 +805,8 @@ mod tests {
                 "expected Rversion from the injected 9P server"
             );
 
-            c.write_all(&hyprstream_9p::msg::tattach(
-                2,
-                0,
-                u32::MAX,
-                "wanix",
-                "",
-            ))
-            .unwrap();
+            c.write_all(&hyprstream_9p::msg::tattach(2, 0, u32::MAX, "wanix", ""))
+                .unwrap();
             read_frame(&mut c)[4]
         })
         .await

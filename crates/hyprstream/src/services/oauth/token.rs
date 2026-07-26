@@ -210,6 +210,24 @@ pub async fn exchange_token(
                 )
                 .await;
             }
+            let output_dpop_jkt = match dpop_header.as_deref() {
+                Some(proof) => {
+                    let endpoint =
+                        format!("{}/oauth/token", state.issuer_url.trim_end_matches('/'));
+                    match super::dpop::verify_dpop_proof(proof, "POST", &endpoint, None) {
+                        Ok(verified) => Some(verified.jkt),
+                        Err(error) => {
+                            tracing::warn!(%error, "token exchange rejected invalid DPoP proof");
+                            return token_error(
+                                StatusCode::BAD_REQUEST,
+                                "invalid_dpop_proof",
+                                Some("DPoP proof verification failed"),
+                            );
+                        }
+                    }
+                }
+                None => None,
+            };
             super::token_exchange::exchange_token_exchange(
                 &state,
                 &subject_token,
@@ -217,6 +235,7 @@ pub async fn exchange_token(
                 params.audience.as_deref(),
                 params.scope.as_deref(),
                 params.actor_token.as_deref(),
+                output_dpop_jkt,
                 params.requested_token_type.as_deref(),
                 params.tenant.as_deref(),
             )

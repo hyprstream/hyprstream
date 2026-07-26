@@ -646,7 +646,7 @@ impl GenesisGate {
             tracing::info!(
                 nodes = self.nodes.len(),
                 labeled = r.labeled.len(),
-                "MAC genesis coverage COMPLETE (dormant): every enumerated node is labeled and well-formed"
+                "MAC genesis coverage COMPLETE: floor-only monitors remain active; operator may evaluate the remaining G2-G7 evidence"
             );
         } else {
             tracing::warn!(
@@ -654,7 +654,7 @@ impl GenesisGate {
                 labeled = r.labeled.len(),
                 unlabeled = r.unlabeled.len(),
                 ill_formed = r.ill_formed.len(),
-                "MAC genesis coverage INCOMPLETE (dormant): enforcement must NOT be enabled until gaps are closed"
+                "MAC genesis coverage INCOMPLETE: identity-aware widening is blocked; floor-only monitors remain active"
             );
             for node in &r.unlabeled {
                 tracing::warn!(node = %node, "MAC genesis gap: unlabeled node (would deny under enforcement)");
@@ -680,7 +680,7 @@ impl GenesisGate {
         };
         let _ = writeln!(
             out,
-            "MAC genesis coverage: {status} (enforcement dormant — Stage 0)"
+            "MAC genesis coverage: {status} (monitors active; subject context floor-only until operator widening)"
         );
         let _ = writeln!(
             out,

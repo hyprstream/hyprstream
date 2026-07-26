@@ -91,6 +91,7 @@ async fn vfs_proxy_loop(
 
 pub fn build_chat_vfs_namespace(
     signing_key: &ed25519_dalek::SigningKey,
+    pep: Arc<hyprstream_vfs::NamespacePep>,
 ) -> anyhow::Result<(Arc<Namespace>, Subject)> {
     let subject = {
         let vk = signing_key.verifying_key();
@@ -111,6 +112,7 @@ pub fn build_chat_vfs_namespace(
         subject: subject.clone(),
         model_client,
         registry: None,
+        pep: Some(pep),
         model_path: "/srv/model".to_owned(),
         registry_path: "/srv/registry".to_owned(),
         worktree_path: "/worktree".to_owned(),

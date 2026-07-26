@@ -12,15 +12,11 @@
 //! [`ReferenceMonitor`](hyprstream_9p::ReferenceMonitor) from the mandatory
 //! decider, the genesis content-truth resolver, and an attach authenticator.
 //! Production 9P constructors install the monitor via
-//! `Translator::with_reference_monitor`; until the verified attach credential
-//! is wired into that seam they explicitly install a deny-only authenticator.
-//!
-//! **Fail-closed until #698 + S6 wire clearance and token issuance**: the
-//! raw `Tattach.uname` is not verified identity material, and the S6
-//! sender-bound token is not yet attached to 9P `Tattach`. So the installed
-//! monitor denies every operation — there is no permissive default (per #547).
-//! Functional permitting requires an authenticator that derives both identity
-//! and tenant from verified attach credentials.
+//! `Translator::with_reference_monitor`. HTTP and WebTransport attach paths
+//! now supply one unified verified attach bundle; transports without a
+//! credential carrier explicitly retain the deny-only authenticator. The
+//! operator gate selects floor-only or identity-aware context without removing
+//! this monitor.
 
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -133,8 +129,7 @@ pub async fn production_ninep_decider(
     );
 
     let secrets_dir = crate::config::HyprConfig::resolve_secrets_dir()?;
-    let ml_dsa_store =
-        crate::auth::key_rotation::global_ml_dsa_key_store(&secrets_dir, oauth);
+    let ml_dsa_store = crate::auth::key_rotation::global_ml_dsa_key_store(&secrets_dir, oauth);
     let signer = crate::mac::audit::cose::OwnedCoseAuditSigner::new(
         Arc::new(signing_key),
         ml_dsa_store.active_key().await,
@@ -526,29 +521,16 @@ impl NamespaceAccessDecider for VfsAccessDecider {
     }
 }
 
-/// Fail-closed `SubjectContextResolver` for the VFS PEP (#698 dependency
-/// window).
-///
-/// The direct `Namespace` API carries only an unauthenticated `Subject` string
-/// — it has no verified `EnvelopeContext`/claims the way the RPC dispatch
-/// plane does (#1268 owns threading those through). Until production clearance
-/// provenance (#698) wires a real resolver (e.g. one keyed on the installed
-/// `CompiledPolicy` enrollment table, mirroring
-/// [`EnrollmentSubjectContextResolver`]), this stub resolves **no** subject,
-/// so an armed VFS PEP denies every op — the correct fail-closed posture
-/// (#547: no permissive default).
-///
-/// Replacing this with a real resolver is the activation B-lane (#1267), not
-/// this struct's existence.
+/// Production VFS resolver backed by contexts derived only at verified
+/// `Claims × VerifiedKeyMaterial` boundaries. Missing, expired, or
+/// tenant-incompatible entries deny; the activation control supplies the
+/// anonymous floor until an operator-approved widening.
 #[derive(Debug, Default, Clone, Copy)]
-pub struct DenyUnenrolledSubjects;
+pub struct VerifiedClaimsSubjects;
 
-impl SubjectContextResolver for DenyUnenrolledSubjects {
-    fn resolve(
-        &self,
-        _subject: &hyprstream_rpc::Subject,
-    ) -> Option<SecurityContext> {
-        None
+impl SubjectContextResolver for VerifiedClaimsSubjects {
+    fn resolve(&self, subject: &hyprstream_rpc::Subject) -> Option<SecurityContext> {
+        hyprstream_rpc::auth::mac::subject_context(subject, None)
     }
 }
 
@@ -558,10 +540,9 @@ impl SubjectContextResolver for DenyUnenrolledSubjects {
 /// This is the `hyprstream`-crate wiring that satisfies the
 /// [`hyprstream_vfs::NamespacePep`] contract: the genesis composite
 /// `RpcObjectLabelResolver` (carriers (a)+(c), #1228) feeds label resolution, a
-/// [`VfsAccessDecider`] over the WAL audit sink evaluates the policy, and —
-/// pending #698 — the subject seam is [`DenyUnenrolledSubjects`] (fail-closed:
-/// every op denies until clearance provenance is wired). Swapping the subject
-/// resolver for a real one is the activation B-lane (#1267).
+/// [`VfsAccessDecider`] over the WAL audit sink evaluates the policy, and
+/// [`VerifiedClaimsSubjects`] supplies the activation-controlled subject
+/// context.
 ///
 /// Callers propagate the error and refuse to arm a `Namespace` with a
 /// permissive fallback; there is no permissive arm path.
@@ -579,8 +560,7 @@ pub async fn production_vfs_pep(
     );
 
     let secrets_dir = crate::config::HyprConfig::resolve_secrets_dir()?;
-    let ml_dsa_store =
-        crate::auth::key_rotation::global_ml_dsa_key_store(&secrets_dir, oauth);
+    let ml_dsa_store = crate::auth::key_rotation::global_ml_dsa_key_store(&secrets_dir, oauth);
     let signer = crate::mac::audit::cose::OwnedCoseAuditSigner::new(
         Arc::new(signing_key),
         ml_dsa_store.active_key().await,
@@ -599,7 +579,7 @@ pub async fn production_vfs_pep(
     let resolver = crate::mac::GenesisGate::production().into_resolver();
 
     Ok(std::sync::Arc::new(hyprstream_vfs::NamespacePep::new(
-        std::sync::Arc::new(DenyUnenrolledSubjects),
+        std::sync::Arc::new(VerifiedClaimsSubjects),
         std::sync::Arc::new(resolver),
         std::sync::Arc::new(VfsAccessDecider::new(std::sync::Arc::new(audit_store))),
     )))
@@ -799,16 +779,9 @@ mod tests {
             read_token(),
         );
 
+        assert!(!monitor.authorize(&permitted, &["unlabeled".to_owned()], NinePAction::Read,));
         assert!(!monitor.authorize(
-            &permitted,
-            &["unlabeled".to_owned()],
-            NinePAction::Read,
-        ));
-        assert!(!monitor.authorize(
-            &SessionContext::from_verified_clearance(
-                identity("tenant-a"),
-                context(Level::Secret),
-            ),
+            &SessionContext::from_verified_clearance(identity("tenant-a"), context(Level::Secret),),
             &["public".to_owned()],
             NinePAction::Read,
         ));
@@ -821,11 +794,7 @@ mod tests {
             &["secret".to_owned()],
             NinePAction::Read,
         ));
-        assert!(!monitor.authorize(
-            &permitted,
-            &["decider-deny".to_owned()],
-            NinePAction::Read,
-        ));
+        assert!(!monitor.authorize(&permitted, &["decider-deny".to_owned()], NinePAction::Read,));
 
         let records = sink.records.lock();
         assert_eq!(records.len(), 4, "one WAL record per denied operation");
@@ -850,14 +819,13 @@ mod tests {
         ));
         let monitor = enrollment_ninep_reference_monitor(decider);
 
-        let session = monitor
+        let denied = monitor
             .authenticate("did:key:victim", "tenant-victim")
             .await;
         assert!(
-            session.verified_attach_identity().is_none(),
-            "unverified Tattach fields must not mint identity or tenant"
+            denied.is_err(),
+            "unverified Tattach fields must not mint an attach bundle"
         );
-        assert!(!session.token_authorizes(&label(Level::Public), NinePAction::Read));
     }
 
     #[test]
@@ -913,7 +881,9 @@ mod tests {
 
         let records = sink.records.lock();
         assert_eq!(records.len(), 4);
-        assert!(records.iter().all(|record| record.decision == Decision::Deny));
+        assert!(records
+            .iter()
+            .all(|record| record.decision == Decision::Deny));
         assert_eq!(records[0].reason, DecisionReason::NoClearance);
         assert_eq!(records[1].reason, DecisionReason::UnlabeledObject);
         assert_eq!(records[2].reason, DecisionReason::FloorDeny);

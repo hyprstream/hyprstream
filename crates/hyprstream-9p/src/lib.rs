@@ -37,10 +37,10 @@
 //! stories (wasm's `unsafe impl` is only sound single-threaded, native is
 //! genuinely thread-safe) and are gated to disjoint targets.
 
-pub mod msg;
-pub mod client;
 pub mod backend;
+pub mod client;
 pub mod memory;
+pub mod msg;
 // The translator is the server-side TCP/UDS accept loop (tokio::net). `net`
 // pulls `mio`, which has no wasm32 backend, so these modules are native-only.
 // The browser/wasm build reaches the backend through the DMA/Wanix client path.
@@ -58,9 +58,9 @@ pub mod mount_backend;
 // The socket 9P *client* Mount (import a remote 9P namespace over UDS/TCP). Uses
 // `tokio::net`, so native-only — the wasm build imports via the DMA/Wanix path.
 #[cfg(not(target_arch = "wasm32"))]
-pub mod socket_transport;
-#[cfg(not(target_arch = "wasm32"))]
 pub mod remote_mount;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod socket_transport;
 
 #[cfg(target_arch = "wasm32")]
 pub mod dma;
@@ -70,6 +70,13 @@ pub mod wanix_mount;
 pub use backend::{Backend, OpenResult, StatResult, WalkResult};
 pub use client::{P9Client, P9Transport};
 #[cfg(not(target_arch = "wasm32"))]
+pub use mac_seam::{
+    anonymous_floor, AccessDecider, Action, AnonymousAuthenticator, AttachAuthenticator,
+    DenyAllDecider, DenyUnlabeledResolver, ObjectLabelResolver, ObjectRef, ReferenceMonitor,
+    ReferenceMonitorDenyReason, SessionContext, VerifiedAttach, VerifiedAttachIdentity,
+    VerifiedTokenScope,
+};
+#[cfg(not(target_arch = "wasm32"))]
 pub use mount_backend::{AttachAuthorizer, MountBackend};
 #[cfg(not(target_arch = "wasm32"))]
 pub use remote_mount::Remote9pMount;
@@ -78,10 +85,4 @@ pub use socket_transport::SocketTransport;
 #[cfg(not(target_arch = "wasm32"))]
 pub use translator::{
     serve_mount_uds, serve_mount_vsock, serve_mount_vsock_raw, FidTable, Translator,
-};
-#[cfg(not(target_arch = "wasm32"))]
-pub use mac_seam::{
-    anonymous_floor, AccessDecider, Action, AnonymousAuthenticator, AttachAuthenticator,
-    DenyAllDecider, DenyUnlabeledResolver, ObjectLabelResolver, ObjectRef, ReferenceMonitor,
-    ReferenceMonitorDenyReason, SessionContext, VerifiedAttachIdentity, VerifiedTokenScope,
 };

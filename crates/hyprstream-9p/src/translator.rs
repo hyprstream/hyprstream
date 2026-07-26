@@ -57,13 +57,9 @@ use tokio::sync::OnceCell;
 use tracing::{debug, error, info, warn};
 
 use crate::backend::Backend;
-use crate::mac_seam::{
-    anonymous_floor, AccessDecider, Action, ReferenceMonitor, SessionContext,
-};
+use crate::mac_seam::{anonymous_floor, AccessDecider, Action, ReferenceMonitor, SessionContext};
 use crate::mount_backend::MountBackend;
-use crate::msg::{
-    self, encode_response, parse_request, rflush, Request, Response,
-};
+use crate::msg::{self, encode_response, parse_request, rflush, Request, Response};
 
 /// Negotiated maximum message size. Generous: Kata guest mounts may issue
 /// large read-ahead. The backend's iounit still bounds individual reads.
@@ -152,6 +148,10 @@ pub struct Translator {
     /// Optional S2 token/IFC composition. The mandatory decider remains active
     /// when this richer attach-time monitor is not installed.
     monitor: Option<Arc<ReferenceMonitor>>,
+    /// Production-only coverage-gated subject-context selection. Tests and
+    /// embeddings that explicitly install a monitor retain direct
+    /// identity-aware behavior unless they opt into this control.
+    activation_controlled: bool,
 }
 
 impl Translator {
@@ -165,6 +165,7 @@ impl Translator {
             attach_session: OnceCell::new(),
             decider,
             monitor: None,
+            activation_controlled: false,
         }
     }
 
@@ -197,13 +198,13 @@ impl Translator {
         Self {
             backend,
             backend_factory: Arc::new(move || {
-                Arc::new(MountBackend::new(Arc::clone(&mount), subject.clone()))
-                    as Arc<dyn Backend>
+                Arc::new(MountBackend::new(Arc::clone(&mount), subject.clone())) as Arc<dyn Backend>
             }),
             fids: Arc::new(FidTable::default()),
             attach_session: OnceCell::new(),
             decider,
             monitor: None,
+            activation_controlled: false,
         }
     }
 
@@ -240,6 +241,7 @@ impl Translator {
             attach_session: OnceCell::new(),
             decider,
             monitor: None,
+            activation_controlled: false,
         }
     }
 
@@ -256,7 +258,22 @@ impl Translator {
             attach_session: OnceCell::new(),
             decider: Arc::clone(&self.decider),
             monitor: self.monitor.clone(),
+            activation_controlled: self.activation_controlled,
         }
+    }
+
+    /// Use the process-global coverage-gated widen/narrow control. Production
+    /// constructors call this after installing the mandatory monitor.
+    pub fn with_activation_control(mut self) -> Self {
+        self.activation_controlled = true;
+        self
+    }
+
+    fn identity_aware(&self) -> bool {
+        self.monitor.is_some()
+            && (!self.activation_controlled
+                || hyprstream_rpc::auth::mac::global_mac_activation_control().mode()
+                    == hyprstream_rpc::auth::mac::MacActivationMode::IdentityAware)
     }
 
     /// Run a TCP accept loop until the listener errors or is closed.
@@ -290,7 +307,8 @@ impl Translator {
     /// [`serve`](Self::serve) / [`serve_uds`](Self::serve_uds); the
     /// `Subject`-per-op enforcement is unchanged — only the transport differs.
     pub async fn serve_vsock(self, listener: UnixListener) -> Result<()> {
-        self.serve_listener(HybridVsockListener { inner: listener }).await
+        self.serve_listener(HybridVsockListener { inner: listener })
+            .await
     }
 
     /// Run the accept loop over a **raw** (no-handshake) hybrid-vsock host
@@ -313,7 +331,8 @@ impl Translator {
     /// are byte-identical to every other transport; only the accept surface
     /// differs (raw, via [`RawVsockListener`]).
     pub async fn serve_vsock_raw(self, listener: UnixListener) -> Result<()> {
-        self.serve_listener(RawVsockListener { inner: listener }).await
+        self.serve_listener(RawVsockListener { inner: listener })
+            .await
     }
 
     /// Transport-agnostic accept loop shared by [`serve`](Self::serve) and
@@ -412,22 +431,20 @@ impl Translator {
         let (tag, req) = parse_request(buf).context("decode 9P T-message")?;
         let resp = match req {
             Request::Version { msize, version } => self.handle_version(msize, version),
-            Request::Attach { fid, uname, aname, .. } => {
-                self.handle_attach(fid, &uname, &aname).await?
-            }
+            Request::Attach {
+                fid, uname, aname, ..
+            } => self.handle_attach(fid, &uname, &aname).await?,
             // Flush is intercepted in serve_connection before reaching here;
             // this arm is unreachable but kept exhaustive.
             Request::Flush { .. } => Response::Clunk,
-            Request::Walk { fid, newfid, wnames } => {
-                self.handle_walk(fid, newfid, wnames).await?
-            }
+            Request::Walk {
+                fid,
+                newfid,
+                wnames,
+            } => self.handle_walk(fid, newfid, wnames).await?,
             Request::Lopen { fid, flags } => self.handle_lopen(fid, flags).await?,
-            Request::Read { fid, offset, count } => {
-                self.handle_read(fid, offset, count).await?
-            }
-            Request::Write { fid, offset, data } => {
-                self.handle_write(fid, offset, &data).await?
-            }
+            Request::Read { fid, offset, count } => self.handle_read(fid, offset, count).await?,
+            Request::Write { fid, offset, data } => self.handle_write(fid, offset, &data).await?,
             Request::Clunk { fid } => self.handle_clunk(fid).await,
             Request::Getattr { fid, .. } => self.handle_getattr(fid).await?,
             Request::Readdir { fid, offset, count } => {
@@ -443,39 +460,59 @@ impl Translator {
 
     fn handle_version(&self, requested: u32, version: String) -> Response {
         if version != "9P2000.L" && !version.starts_with("9P2000") {
-            return Response::Error { ecode: libc_einval() };
+            return Response::Error {
+                ecode: libc_einval(),
+            };
         }
         let msize = requested.clamp(256, MSG_SIZE);
-        Response::Version { msize, version: "9P2000.L".into() }
+        Response::Version {
+            msize,
+            version: "9P2000.L".into(),
+        }
     }
 
     async fn handle_attach(&self, fid: u32, uname: &str, aname: &str) -> Result<Response> {
-        // A full S2 monitor verifies the attach credential and applies its
-        // token/IFC gates. Without one, the mandatory production decider still
-        // mediates the root against the anonymous-floor context.
-        let session = match &self.monitor {
-            Some(monitor) => {
-                let session = monitor.authenticate(uname, aname).await;
-                // The root fid itself is a mediated object. It has no
-                // synthetic exemption: an unlabeled root or missing/expired
-                // token denies at attach, before any backend object handle
-                // is exposed.
-                if !monitor.authorize(&session, &[], Action::Attach) {
-                    return Ok(Response::Error { ecode: libc_eperm() });
+        // The monitor is always present in production. The operator control
+        // narrows/widens only the subject context it evaluates; it never
+        // removes mediation.
+        let (verified, session) = if self.identity_aware() {
+            let Some(monitor) = &self.monitor else {
+                return Ok(Response::Error {
+                    ecode: libc_eperm(),
+                });
+            };
+            // One credential verification yields the unified MAC+VFS bundle.
+            // Nothing independently derives a Subject after this point.
+            let verified = match monitor.authenticate(uname, aname).await {
+                Ok(verified) => verified,
+                Err(_) => {
+                    return Ok(Response::Error {
+                        ecode: libc_eperm(),
+                    })
                 }
-                self.ensure_attach_session_compatible(&session)?;
-                Some(session)
+            };
+            let session = verified.session().clone();
+            if !monitor.authorize(&session, &[], Action::Attach) {
+                return Ok(Response::Error {
+                    ecode: libc_eperm(),
+                });
             }
-            None => {
-                let root: [&str; 0] = [];
-                if !self
-                    .decider
-                    .check(&anonymous_floor(), ObjectRef::Path(&root), Action::Attach)
-                {
-                    return Ok(Response::Error { ecode: libc_eperm() });
-                }
-                None
+            self.ensure_attach_session_compatible(&session)?;
+            (Some(verified), Some(session))
+        } else {
+            let root: [&str; 0] = [];
+            if !self
+                .decider
+                .check(&anonymous_floor(), ObjectRef::Path(&root), Action::Attach)
+            {
+                return Ok(Response::Error {
+                    ecode: libc_eperm(),
+                });
             }
+            // A ticket-authorized backend authenticates exactly once below.
+            // Fixed-subject backends were bound by their production
+            // constructor and do not require a client credential at floor.
+            (None, None)
         };
 
         // Only an attach that cleared monitor authorization may bind a backend
@@ -484,7 +521,24 @@ impl Translator {
         // granted namespace and deny an unknown/forbidden selector with EACCES
         // before any fid exists. Walk the empty path to materialize a root qid
         // from the backend, then record it.
-        self.backend.attach(uname, aname).await?;
+        let bound = self.backend.attach(uname, aname, verified.clone()).await?;
+        if let Some(expected) = verified.as_ref() {
+            if bound.as_ref() != Some(expected) {
+                return Err(anyhow::Error::new(
+                    hyprstream_vfs::MountError::PermissionDenied(
+                        "backend did not bind the verified attach bundle".to_owned(),
+                    ),
+                ));
+            }
+        }
+        if self.identity_aware() && bound.is_none() {
+            return Err(anyhow::Error::new(
+                hyprstream_vfs::MountError::PermissionDenied(
+                    "backend did not bind a verified attach bundle".to_owned(),
+                ),
+            ));
+        }
+        let session = session.or_else(|| bound.as_ref().map(|attach| attach.session().clone()));
         let walk = self.backend.walk(fid, fid, &[]).await?;
         if let Some(session) = &session {
             self.bind_attach_session(session)?;
@@ -502,9 +556,11 @@ impl Translator {
             // of the same ticket, so a value comparison would reject a
             // legitimate re-attach of an identical, still-valid session (F2).
             Some(existing) if existing.same_attach_identity(session) => Ok(()),
-            Some(_) => Err(anyhow::Error::new(hyprstream_vfs::MountError::PermissionDenied(
-                "conflicting attach session context".to_owned(),
-            ))),
+            Some(_) => Err(anyhow::Error::new(
+                hyprstream_vfs::MountError::PermissionDenied(
+                    "conflicting attach session context".to_owned(),
+                ),
+            )),
             None => Ok(()),
         }
     }
@@ -516,12 +572,7 @@ impl Translator {
         self.ensure_attach_session_compatible(session)
     }
 
-    async fn handle_walk(
-        &self,
-        fid: u32,
-        newfid: u32,
-        wnames: Vec<String>,
-    ) -> Result<Response> {
+    async fn handle_walk(&self, fid: u32, newfid: u32, wnames: Vec<String>) -> Result<Response> {
         // The session is inherited from the fid being walked (#568 — the
         // credential is verified once at attach, never re-verified per op).
         // The destination path extends the source fid's already-walked path.
@@ -534,15 +585,17 @@ impl Translator {
         // fid; otherwise an unattached connection could clone another
         // connection's fid without passing the monitor.
         let mut prefix = base.clone();
-        if wnames.is_empty()
-            && !self.authorize_path(session.as_ref(), &prefix, Action::Walk)
-        {
-            return Ok(Response::Error { ecode: libc_eperm() });
+        if wnames.is_empty() && !self.authorize_path(session.as_ref(), &prefix, Action::Walk) {
+            return Ok(Response::Error {
+                ecode: libc_eperm(),
+            });
         }
         for component in &wnames {
             prefix.push(component.clone());
             if !self.authorize_path(session.as_ref(), &prefix, Action::Walk) {
-                return Ok(Response::Error { ecode: libc_eperm() });
+                return Ok(Response::Error {
+                    ecode: libc_eperm(),
+                });
             }
         }
 
@@ -557,7 +610,9 @@ impl Translator {
                 || result.reached.len() > wnames.len()
                 || result.reached != wnames[..result.reached.len()])
         {
-            return Err(anyhow::anyhow!("backend walk result does not describe its reached prefix"));
+            return Err(anyhow::anyhow!(
+                "backend walk result does not describe its reached prefix"
+            ));
         }
         let nwqid = result.qids.len();
         let mut reached = base;
@@ -584,7 +639,10 @@ impl Translator {
         }
         let open = self.backend.open(fid, flags).await?;
         self.fids.set_opened(fid);
-        Ok(Response::Lopen { qid: open.qid, iounit: open.iounit })
+        Ok(Response::Lopen {
+            qid: open.qid,
+            iounit: open.iounit,
+        })
     }
 
     async fn handle_read(&self, fid: u32, offset: u64, count: u32) -> Result<Response> {
@@ -619,7 +677,12 @@ impl Translator {
             return Ok(err);
         }
         let st = self.backend.stat(fid).await?;
-        Ok(Response::Getattr { qid: st.qid, mode: st.mode, size: st.size, mtime_sec: st.mtime_sec })
+        Ok(Response::Getattr {
+            qid: st.qid,
+            mode: st.mode,
+            size: st.size,
+            mtime_sec: st.mtime_sec,
+        })
     }
 
     async fn handle_readdir(&self, fid: u32, offset: u64, count: u32) -> Result<Response> {
@@ -634,13 +697,17 @@ impl Translator {
     /// installed, directly through the mandatory audited decider.
     fn deny(&self, fid: u32, action: Action) -> Option<Response> {
         let Some(path) = self.fids.path(fid) else {
-            return Some(Response::Error { ecode: libc_eperm() });
+            return Some(Response::Error {
+                ecode: libc_eperm(),
+            });
         };
         let session = self.fids.session(fid);
         if self.authorize_path(session.as_ref(), &path, action) {
             None
         } else {
-            Some(Response::Error { ecode: libc_eperm() })
+            Some(Response::Error {
+                ecode: libc_eperm(),
+            })
         }
     }
 
@@ -650,15 +717,14 @@ impl Translator {
         path: &[String],
         action: Action,
     ) -> bool {
-        if let Some(monitor) = &self.monitor {
-            return session.is_some_and(|session| monitor.authorize(session, path, action));
+        if self.identity_aware() {
+            return self.monitor.as_ref().is_some_and(|monitor| {
+                session.is_some_and(|session| monitor.authorize(session, path, action))
+            });
         }
         let components: Vec<&str> = path.iter().map(String::as_str).collect();
-        self.decider.check(
-            &anonymous_floor(),
-            ObjectRef::Path(&components),
-            action,
-        )
+        self.decider
+            .check(&anonymous_floor(), ObjectRef::Path(&components), action)
     }
 }
 
@@ -679,7 +745,7 @@ pub async fn serve_mount_uds(
         .with_context(|| format!("bind 9P UDS listener at {:?}", path.as_ref()))?;
     let mut t = Translator::from_mount(mount, subject, decider);
     if let Some(monitor) = monitor {
-        t = t.with_reference_monitor(monitor);
+        t = t.with_reference_monitor(monitor).with_activation_control();
     }
     t.serve_uds(listener).await
 }
@@ -705,7 +771,7 @@ pub async fn serve_mount_vsock(
         .with_context(|| format!("bind 9P hybrid-vsock listener at {:?}", path.as_ref()))?;
     let mut t = Translator::from_mount(mount, subject, decider);
     if let Some(monitor) = monitor {
-        t = t.with_reference_monitor(monitor);
+        t = t.with_reference_monitor(monitor).with_activation_control();
     }
     t.serve_vsock(listener).await
 }
@@ -731,11 +797,14 @@ pub async fn serve_mount_vsock_raw(
     path: impl AsRef<Path>,
 ) -> Result<()> {
     let listener = UnixListener::bind(path.as_ref()).with_context(|| {
-        format!("bind 9P raw hybrid-vsock per-port listener at {:?}", path.as_ref())
+        format!(
+            "bind 9P raw hybrid-vsock per-port listener at {:?}",
+            path.as_ref()
+        )
     })?;
     let mut t = Translator::from_mount(mount, subject, decider);
     if let Some(monitor) = monitor {
-        t = t.with_reference_monitor(monitor);
+        t = t.with_reference_monitor(monitor).with_activation_control();
     }
     t.serve_vsock_raw(listener).await
 }
@@ -1048,10 +1117,22 @@ mod tests {
             async fn open(&self, _f: &mut Fid, _m: u8, _c: &Subject) -> Result<(), MountError> {
                 Err(MountError::PermissionDenied("open".into()))
             }
-            async fn read(&self, _f: &Fid, _o: u64, _n: u32, _c: &Subject) -> Result<Vec<u8>, MountError> {
+            async fn read(
+                &self,
+                _f: &Fid,
+                _o: u64,
+                _n: u32,
+                _c: &Subject,
+            ) -> Result<Vec<u8>, MountError> {
                 Err(MountError::Io("read".into()))
             }
-            async fn write(&self, _f: &Fid, _o: u64, _d: &[u8], _c: &Subject) -> Result<u32, MountError> {
+            async fn write(
+                &self,
+                _f: &Fid,
+                _o: u64,
+                _d: &[u8],
+                _c: &Subject,
+            ) -> Result<u32, MountError> {
                 Err(MountError::NotSupported("write".into()))
             }
             async fn readdir(&self, _f: &Fid, _c: &Subject) -> Result<Vec<DirEntry>, MountError> {
@@ -1067,18 +1148,28 @@ mod tests {
         let t = Arc::new(Translator::new(Arc::new(backend), test_decider()));
 
         // Attach fid 0 as root (empty walk succeeds).
-        t.handle_message(&msg::tattach(1, 0, u32::MAX, "u", "")).await.unwrap();
+        t.handle_message(&msg::tattach(1, 0, u32::MAX, "u", ""))
+            .await
+            .unwrap();
 
         // Walk to a missing child → Err whose errno must be ENOENT.
         let err = t
             .handle_message(&msg::twalk(2, 0, 1, &["nope"]))
             .await
             .unwrap_err();
-        assert_eq!(errno_from_error(&err), ENOENT, "missing path must be ENOENT, not EIO");
+        assert_eq!(
+            errno_from_error(&err),
+            ENOENT,
+            "missing path must be ENOENT, not EIO"
+        );
     }
 
     fn sample_qid(qtype: u8, path: u64) -> Qid {
-        Qid { qtype, version: 1, path }
+        Qid {
+            qtype,
+            version: 1,
+            path,
+        }
     }
 
     #[tokio::test]
@@ -1144,8 +1235,8 @@ mod tests {
     // module double as the dormant-default regression guard.
 
     use crate::mac_seam::{
-        AccessDecider, AttachAuthenticator, ObjectLabelResolver, ObjectRef, VerifiedAttachIdentity,
-        ReferenceMonitorDenyReason, VerifiedTokenScope,
+        AccessDecider, AttachAuthenticator, ObjectLabelResolver, ObjectRef,
+        ReferenceMonitorDenyReason, VerifiedAttach, VerifiedAttachIdentity, VerifiedTokenScope,
     };
     use hyprstream_rpc::auth::mac::{
         Assurance, CompartmentSet, Level, SecurityContext, SecurityLabel, VerifiedKeyMaterial,
@@ -1180,6 +1271,19 @@ mod tests {
         )
     }
 
+    fn verified_attach(session: SessionContext) -> VerifiedAttach {
+        let identity = session
+            .verified_attach_identity()
+            .expect("fixture session has verified identity")
+            .clone();
+        VerifiedAttach::try_new(
+            identity.clone(),
+            hyprstream_rpc::Subject::new(identity.subject()),
+            session,
+        )
+        .expect("fixture bundle is internally bound")
+    }
+
     const ALL_OPS: &[Action] = &[
         Action::Attach,
         Action::Walk,
@@ -1195,8 +1299,17 @@ mod tests {
     struct StaticAuth(SessionContext);
     #[async_trait]
     impl AttachAuthenticator for StaticAuth {
-        async fn authenticate(&self, _u: &str, _a: &str) -> SessionContext {
-            self.0.clone()
+        async fn authenticate(
+            &self,
+            _u: &str,
+            _a: &str,
+        ) -> std::result::Result<VerifiedAttach, hyprstream_vfs::MountError> {
+            if self.0.verified_attach_identity().is_none() {
+                return Err(hyprstream_vfs::MountError::PermissionDenied(
+                    "credential did not produce a verified attach identity".to_owned(),
+                ));
+            }
+            Ok(verified_attach(self.0.clone()))
         }
     }
 
@@ -1210,12 +1323,7 @@ mod tests {
 
     struct AllowAll;
     impl AccessDecider for AllowAll {
-        fn check(
-            &self,
-            _ctx: &SecurityContext,
-            _object: ObjectRef<'_>,
-            _action: Action,
-        ) -> bool {
+        fn check(&self, _ctx: &SecurityContext, _object: ObjectRef<'_>, _action: Action) -> bool {
             true
         }
 
@@ -1250,10 +1358,16 @@ mod tests {
     /// the root fid is a mediated object with no synthetic exemption.
     #[tokio::test]
     async fn monitor_denies_unlabeled_root_at_attach() {
-        let t = Translator::new(Arc::new(MemoryBackend::default()), test_decider()).with_reference_monitor(
-            monitor(permit_session(Level::Secret, ALL_OPS), None, Arc::new(AllowAll)),
-        );
-        let (_, resp) = t.handle_message(&msg::tattach(1, 0, u32::MAX, "user", "/")).await.unwrap();
+        let t = Translator::new(Arc::new(MemoryBackend::default()), test_decider())
+            .with_reference_monitor(monitor(
+                permit_session(Level::Secret, ALL_OPS),
+                None,
+                Arc::new(AllowAll),
+            ));
+        let (_, resp) = t
+            .handle_message(&msg::tattach(1, 0, u32::MAX, "user", "/"))
+            .await
+            .unwrap();
         match resp {
             Response::Error { ecode } => assert_eq!(ecode, libc_eperm()),
             other => panic!("expected Rlerror EPERM for unlabeled root, got {other:?}"),
@@ -1264,10 +1378,16 @@ mod tests {
     /// backend object handle exists.
     #[tokio::test]
     async fn monitor_denies_missing_token_at_attach() {
-        let t = Translator::new(Arc::new(MemoryBackend::default()), test_decider()).with_reference_monitor(
-            monitor(SessionContext::deny(), Some(label(Level::Public)), Arc::new(AllowAll)),
-        );
-        let (_, resp) = t.handle_message(&msg::tattach(1, 0, u32::MAX, "user", "/")).await.unwrap();
+        let t = Translator::new(Arc::new(MemoryBackend::default()), test_decider())
+            .with_reference_monitor(monitor(
+                SessionContext::deny(),
+                Some(label(Level::Public)),
+                Arc::new(AllowAll),
+            ));
+        let (_, resp) = t
+            .handle_message(&msg::tattach(1, 0, u32::MAX, "user", "/"))
+            .await
+            .unwrap();
         match resp {
             Response::Error { ecode } => assert_eq!(ecode, libc_eperm()),
             other => panic!("expected Rlerror EPERM for missing token, got {other:?}"),
@@ -1285,10 +1405,16 @@ mod tests {
                 Instant::now() - Duration::from_secs(1),
             ),
         );
-        let t = Translator::new(Arc::new(MemoryBackend::default()), test_decider()).with_reference_monitor(
-            monitor(expired, Some(label(Level::Public)), Arc::new(AllowAll)),
-        );
-        let (_, resp) = t.handle_message(&msg::tattach(1, 0, u32::MAX, "user", "/")).await.unwrap();
+        let t = Translator::new(Arc::new(MemoryBackend::default()), test_decider())
+            .with_reference_monitor(monitor(
+                expired,
+                Some(label(Level::Public)),
+                Arc::new(AllowAll),
+            ));
+        let (_, resp) = t
+            .handle_message(&msg::tattach(1, 0, u32::MAX, "user", "/"))
+            .await
+            .unwrap();
         match resp {
             Response::Error { ecode } => assert_eq!(ecode, libc_eperm()),
             other => panic!("expected Rlerror EPERM for expired token, got {other:?}"),
@@ -1308,9 +1434,15 @@ mod tests {
             Arc::new(AllowAll),
         ));
 
-        let (_, resp) = t.handle_message(&msg::tattach(1, 0, u32::MAX, "user", "/")).await.unwrap();
+        let (_, resp) = t
+            .handle_message(&msg::tattach(1, 0, u32::MAX, "user", "/"))
+            .await
+            .unwrap();
         assert!(matches!(resp, Response::Attach { .. }), "got {resp:?}");
-        let (_, resp) = t.handle_message(&msg::twalk(2, 0, 1, &["hello.txt"])).await.unwrap();
+        let (_, resp) = t
+            .handle_message(&msg::twalk(2, 0, 1, &["hello.txt"]))
+            .await
+            .unwrap();
         assert!(matches!(resp, Response::Walk { .. }), "got {resp:?}");
         let (_, resp) = t.handle_message(&msg::tlopen(3, 1, 0)).await.unwrap();
         assert!(matches!(resp, Response::Lopen { .. }), "got {resp:?}");
@@ -1357,12 +1489,23 @@ mod tests {
             Arc::new(DenyReads),
         ));
 
-        t.handle_message(&msg::tattach(1, 0, u32::MAX, "user", "/")).await.unwrap();
-        let (_, resp) = t.handle_message(&msg::twalk(2, 0, 1, &["hello.txt"])).await.unwrap();
-        assert!(matches!(resp, Response::Walk { .. }), "walk must still succeed");
+        t.handle_message(&msg::tattach(1, 0, u32::MAX, "user", "/"))
+            .await
+            .unwrap();
+        let (_, resp) = t
+            .handle_message(&msg::twalk(2, 0, 1, &["hello.txt"]))
+            .await
+            .unwrap();
+        assert!(
+            matches!(resp, Response::Walk { .. }),
+            "walk must still succeed"
+        );
 
         let (_, resp) = t.handle_message(&msg::tlopen(3, 1, 0)).await.unwrap();
-        assert!(matches!(resp, Response::Lopen { .. }), "open must still succeed");
+        assert!(
+            matches!(resp, Response::Lopen { .. }),
+            "open must still succeed"
+        );
 
         let (_, resp) = t.handle_message(&msg::tread(4, 1, 0, 64)).await.unwrap();
         match resp {
@@ -1386,16 +1529,28 @@ mod tests {
             Arc::new(AllowAll),
         ));
 
-        t.handle_message(&msg::tattach(1, 0, u32::MAX, "user", "/")).await.unwrap();
-        t.handle_message(&msg::twalk(2, 0, 1, &["hello.txt"])).await.unwrap();
-        t.handle_message(&msg::tlopen(3, 1, 1 /* OWRITE */)).await.unwrap();
-        let (_, resp) = t.handle_message(&msg::twrite(4, 1, 0, b"nope")).await.unwrap();
+        t.handle_message(&msg::tattach(1, 0, u32::MAX, "user", "/"))
+            .await
+            .unwrap();
+        t.handle_message(&msg::twalk(2, 0, 1, &["hello.txt"]))
+            .await
+            .unwrap();
+        t.handle_message(&msg::tlopen(3, 1, 1 /* OWRITE */))
+            .await
+            .unwrap();
+        let (_, resp) = t
+            .handle_message(&msg::twrite(4, 1, 0, b"nope"))
+            .await
+            .unwrap();
         match resp {
             Response::Error { ecode } => assert_eq!(ecode, libc_eperm()),
             other => panic!("expected Rlerror EPERM for out-of-scope write, got {other:?}"),
         }
         let (_, resp) = t.handle_message(&msg::tread(5, 1, 0, 64)).await.unwrap();
-        assert!(matches!(resp, Response::Read { .. }), "in-scope read must pass: {resp:?}");
+        assert!(
+            matches!(resp, Response::Read { .. }),
+            "in-scope read must pass: {resp:?}"
+        );
     }
 
     /// A walk is mediated against its destination label: the token ceiling
@@ -1427,18 +1582,29 @@ mod tests {
         let backend = MemoryBackend::default();
         backend.add_file("/hello.txt", b"hi");
         backend.add_file("/secret.txt", b"classified");
-        let t = Translator::new(Arc::new(backend), test_decider()).with_reference_monitor(Arc::new(
-            ReferenceMonitor::new(
+        let t = Translator::new(Arc::new(backend), test_decider()).with_reference_monitor(
+            Arc::new(ReferenceMonitor::new(
                 Arc::new(StaticAuth(session)),
                 Arc::new(ByName),
                 Arc::new(AllowAll),
-            ),
-        ));
+            )),
+        );
 
-        t.handle_message(&msg::tattach(1, 0, u32::MAX, "user", "/")).await.unwrap();
-        let (_, resp) = t.handle_message(&msg::twalk(2, 0, 1, &["hello.txt"])).await.unwrap();
-        assert!(matches!(resp, Response::Walk { .. }), "public walk must pass: {resp:?}");
-        let (_, resp) = t.handle_message(&msg::twalk(3, 0, 2, &["secret.txt"])).await.unwrap();
+        t.handle_message(&msg::tattach(1, 0, u32::MAX, "user", "/"))
+            .await
+            .unwrap();
+        let (_, resp) = t
+            .handle_message(&msg::twalk(2, 0, 1, &["hello.txt"]))
+            .await
+            .unwrap();
+        assert!(
+            matches!(resp, Response::Walk { .. }),
+            "public walk must pass: {resp:?}"
+        );
+        let (_, resp) = t
+            .handle_message(&msg::twalk(3, 0, 2, &["secret.txt"]))
+            .await
+            .unwrap();
         match resp {
             Response::Error { ecode } => assert_eq!(ecode, libc_eperm()),
             other => panic!("expected Rlerror EPERM above the token ceiling, got {other:?}"),
@@ -1462,17 +1628,26 @@ mod tests {
         }
         let backend = MemoryBackend::default();
         backend.add_file("/secret.txt", b"classified");
-        let t = Translator::new(Arc::new(backend), test_decider()).with_reference_monitor(Arc::new(
-            ReferenceMonitor::new(
+        let t = Translator::new(Arc::new(backend), test_decider()).with_reference_monitor(
+            Arc::new(ReferenceMonitor::new(
                 Arc::new(StaticAuth(permit_session(Level::Public, ALL_OPS))),
                 Arc::new(AllSecret),
                 Arc::new(AllowAll),
-            ),
-        ));
+            )),
+        );
 
-        let (_, resp) = t.handle_message(&msg::tattach(1, 0, u32::MAX, "user", "/")).await.unwrap();
-        assert!(matches!(resp, Response::Attach { .. }), "public root must attach: {resp:?}");
-        let (_, resp) = t.handle_message(&msg::twalk(2, 0, 1, &["secret.txt"])).await.unwrap();
+        let (_, resp) = t
+            .handle_message(&msg::tattach(1, 0, u32::MAX, "user", "/"))
+            .await
+            .unwrap();
+        assert!(
+            matches!(resp, Response::Attach { .. }),
+            "public root must attach: {resp:?}"
+        );
+        let (_, resp) = t
+            .handle_message(&msg::twalk(2, 0, 1, &["secret.txt"]))
+            .await
+            .unwrap();
         match resp {
             Response::Error { ecode } => assert_eq!(ecode, libc_eperm()),
             other => panic!("expected Rlerror EPERM for IFC non-dominance, got {other:?}"),
@@ -1490,10 +1665,17 @@ mod tests {
             Some(label(Level::Public)),
             Arc::new(AllowAll),
         ));
-        t.handle_message(&msg::tattach(1, 0, u32::MAX, "user", "/")).await.unwrap();
-        t.handle_message(&msg::twalk(2, 0, 1, &["hello.txt"])).await.unwrap();
+        t.handle_message(&msg::tattach(1, 0, u32::MAX, "user", "/"))
+            .await
+            .unwrap();
+        t.handle_message(&msg::twalk(2, 0, 1, &["hello.txt"]))
+            .await
+            .unwrap();
         let (_, resp) = t.handle_message(&msg::tclunk(3, 1)).await.unwrap();
-        assert!(matches!(resp, Response::Clunk), "clunk must not be mediated: {resp:?}");
+        assert!(
+            matches!(resp, Response::Clunk),
+            "clunk must not be mediated: {resp:?}"
+        );
     }
 
     /// #767 review: `getattr` leaks object metadata (qid/mode/size/mtime) and
@@ -1531,11 +1713,22 @@ mod tests {
             Arc::new(DenyGetattr),
         ));
 
-        t.handle_message(&msg::tattach(1, 0, u32::MAX, "user", "/")).await.unwrap();
-        let (_, resp) = t.handle_message(&msg::twalk(2, 0, 1, &["hello.txt"])).await.unwrap();
-        assert!(matches!(resp, Response::Walk { .. }), "walk must still succeed");
+        t.handle_message(&msg::tattach(1, 0, u32::MAX, "user", "/"))
+            .await
+            .unwrap();
+        let (_, resp) = t
+            .handle_message(&msg::twalk(2, 0, 1, &["hello.txt"]))
+            .await
+            .unwrap();
+        assert!(
+            matches!(resp, Response::Walk { .. }),
+            "walk must still succeed"
+        );
 
-        let (_, resp) = t.handle_message(&msg::tgetattr(3, 1, u64::MAX)).await.unwrap();
+        let (_, resp) = t
+            .handle_message(&msg::tgetattr(3, 1, u64::MAX))
+            .await
+            .unwrap();
         match resp {
             Response::Error { ecode } => assert_eq!(ecode, libc_eperm()),
             other => panic!("expected Rlerror EPERM for gated getattr, got {other:?}"),
@@ -1548,19 +1741,23 @@ mod tests {
     /// deny an already-authenticated client).
     #[tokio::test]
     async fn walk_clone_inherits_source_context() {
-        let t = Translator::new(Arc::new(MemoryBackend::default()), test_decider()).with_reference_monitor(
-            monitor(
+        let t = Translator::new(Arc::new(MemoryBackend::default()), test_decider())
+            .with_reference_monitor(monitor(
                 permit_session(Level::Secret, ALL_OPS),
                 Some(label(Level::Public)),
                 Arc::new(AllowAll),
-            ),
-        );
+            ));
 
         // Attach root fid 0 with the elevated (non-anonymous) session.
-        t.handle_message(&msg::tattach(1, 0, u32::MAX, "user", "/")).await.unwrap();
+        t.handle_message(&msg::tattach(1, 0, u32::MAX, "user", "/"))
+            .await
+            .unwrap();
         // Clone fid 0 -> fid 1 via a zero-element walk.
         let (_, resp) = t.handle_message(&msg::twalk(2, 0, 1, &[])).await.unwrap();
-        assert!(matches!(resp, Response::Walk { .. }), "clone walk must succeed");
+        assert!(
+            matches!(resp, Response::Walk { .. }),
+            "clone walk must succeed"
+        );
 
         // The clone must carry the source's elevated session, not floor out.
         let session = t
@@ -1588,12 +1785,7 @@ mod tests {
         }
         struct DenySecretReads;
         impl AccessDecider for DenySecretReads {
-            fn check(
-                &self,
-                _ctx: &SecurityContext,
-                object: ObjectRef<'_>,
-                action: Action,
-            ) -> bool {
+            fn check(&self, _ctx: &SecurityContext, object: ObjectRef<'_>, action: Action) -> bool {
                 !(action == Action::Read && matches!(object, ObjectRef::Path([])))
             }
 
@@ -1610,16 +1802,20 @@ mod tests {
 
         let backend = MemoryBackend::default();
         backend.add_file("/public.txt", b"public");
-        let t = Translator::new(Arc::new(backend), test_decider()).with_reference_monitor(Arc::new(
-            ReferenceMonitor::new(
+        let t = Translator::new(Arc::new(backend), test_decider()).with_reference_monitor(
+            Arc::new(ReferenceMonitor::new(
                 Arc::new(StaticAuth(permit_session(Level::Secret, ALL_OPS))),
                 Arc::new(ByPath),
                 Arc::new(DenySecretReads),
-            ),
-        ));
+            )),
+        );
 
-        t.handle_message(&msg::tattach(1, 0, u32::MAX, "ticket", "/")).await.unwrap();
-        t.handle_message(&msg::twalk(2, 0, 1, &["public.txt"])).await.unwrap();
+        t.handle_message(&msg::tattach(1, 0, u32::MAX, "ticket", "/"))
+            .await
+            .unwrap();
+        t.handle_message(&msg::twalk(2, 0, 1, &["public.txt"]))
+            .await
+            .unwrap();
         t.handle_message(&msg::twalk(3, 1, 2, &[])).await.unwrap();
         let (_, read) = t.handle_message(&msg::tread(4, 2, 0, 4096)).await.unwrap();
         match read {
@@ -1632,13 +1828,12 @@ mod tests {
 
     #[tokio::test]
     async fn connection_scoped_translators_do_not_share_fid_context() {
-        let root = Translator::new(Arc::new(MemoryBackend::default()), test_decider()).with_reference_monitor(
-            monitor(
+        let root = Translator::new(Arc::new(MemoryBackend::default()), test_decider())
+            .with_reference_monitor(monitor(
                 permit_session(Level::Secret, ALL_OPS),
                 Some(label(Level::Public)),
                 Arc::new(AllowAll),
-            ),
-        );
+            ));
         let conn_a = Arc::new(root.connection_scoped());
         let conn_b = Arc::new(root.connection_scoped());
 
@@ -1649,7 +1844,10 @@ mod tests {
 
         // conn_b never attached: fid 1 is unknown to its table, and a fid
         // outside a verified session fails closed under a live monitor.
-        let (_, resp) = conn_b.handle_message(&msg::twalk(2, 1, 2, &[])).await.unwrap();
+        let (_, resp) = conn_b
+            .handle_message(&msg::twalk(2, 1, 2, &[]))
+            .await
+            .unwrap();
         match resp {
             Response::Error { ecode } => assert_eq!(ecode, libc_eperm()),
             other => panic!("expected EPERM for unauthenticated fid reuse, got {other:?}"),
@@ -1661,7 +1859,11 @@ mod tests {
         struct TicketAuth;
         #[async_trait]
         impl AttachAuthenticator for TicketAuth {
-            async fn authenticate(&self, uname: &str, _aname: &str) -> SessionContext {
+            async fn authenticate(
+                &self,
+                uname: &str,
+                _aname: &str,
+            ) -> std::result::Result<VerifiedAttach, hyprstream_vfs::MountError> {
                 let identity = if uname == "alice-ticket" {
                     "verified-alice"
                 } else {
@@ -1669,17 +1871,20 @@ mod tests {
                 };
                 // Both principals have identical authorization attributes;
                 // only the verifier-produced identity differs.
-                permit_session_as(identity, Level::Secret, ALL_OPS)
+                Ok(verified_attach(permit_session_as(
+                    identity,
+                    Level::Secret,
+                    ALL_OPS,
+                )))
             }
         }
 
-        let t = Translator::new(Arc::new(MemoryBackend::default()), test_decider()).with_reference_monitor(
-            Arc::new(ReferenceMonitor::new(
+        let t = Translator::new(Arc::new(MemoryBackend::default()), test_decider())
+            .with_reference_monitor(Arc::new(ReferenceMonitor::new(
                 Arc::new(TicketAuth),
                 Arc::new(StaticLabels(Some(label(Level::Public)))),
                 Arc::new(AllowAll),
-            )),
-        );
+            )));
         let (_, resp) = t
             .handle_message(&msg::tattach(1, 1, u32::MAX, "alice-ticket", "/"))
             .await
@@ -1707,27 +1912,33 @@ mod tests {
         struct FreshDeadlineAuth;
         #[async_trait]
         impl AttachAuthenticator for FreshDeadlineAuth {
-            async fn authenticate(&self, _uname: &str, _aname: &str) -> SessionContext {
+            async fn authenticate(
+                &self,
+                _uname: &str,
+                _aname: &str,
+            ) -> std::result::Result<VerifiedAttach, hyprstream_vfs::MountError> {
                 // `permit_session` stamps `Instant::now()` into the token, so
                 // each call yields a distinct deadline — exactly what a real
                 // verifier does when re-checking the same ticket.
-                permit_session(Level::Secret, ALL_OPS)
+                Ok(verified_attach(permit_session(Level::Secret, ALL_OPS)))
             }
         }
 
-        let t = Translator::new(Arc::new(MemoryBackend::default()), test_decider()).with_reference_monitor(
-            Arc::new(ReferenceMonitor::new(
+        let t = Translator::new(Arc::new(MemoryBackend::default()), test_decider())
+            .with_reference_monitor(Arc::new(ReferenceMonitor::new(
                 Arc::new(FreshDeadlineAuth),
                 Arc::new(StaticLabels(Some(label(Level::Public)))),
                 Arc::new(AllowAll),
-            )),
-        );
+            )));
 
         let (_, resp) = t
             .handle_message(&msg::tattach(1, 1, u32::MAX, "alice-ticket", "/"))
             .await
             .unwrap();
-        assert!(matches!(resp, Response::Attach { .. }), "first attach: {resp:?}");
+        assert!(
+            matches!(resp, Response::Attach { .. }),
+            "first attach: {resp:?}"
+        );
 
         // Same ticket, freshly-stamped deadline, new fid on the same connection.
         let (_, resp) = t
@@ -1745,21 +1956,30 @@ mod tests {
         struct TicketAuth;
         #[async_trait]
         impl AttachAuthenticator for TicketAuth {
-            async fn authenticate(&self, uname: &str, _aname: &str) -> SessionContext {
+            async fn authenticate(
+                &self,
+                uname: &str,
+                _aname: &str,
+            ) -> std::result::Result<VerifiedAttach, hyprstream_vfs::MountError> {
                 if uname == "valid-ticket" {
-                    permit_session_as("verified-alice", Level::Secret, ALL_OPS)
+                    Ok(verified_attach(permit_session_as(
+                        "verified-alice",
+                        Level::Secret,
+                        ALL_OPS,
+                    )))
                 } else {
-                    SessionContext::deny()
+                    Err(hyprstream_vfs::MountError::PermissionDenied(
+                        "invalid ticket".to_owned(),
+                    ))
                 }
             }
         }
-        let t = Translator::new(Arc::new(MemoryBackend::default()), test_decider()).with_reference_monitor(
-            Arc::new(ReferenceMonitor::new(
+        let t = Translator::new(Arc::new(MemoryBackend::default()), test_decider())
+            .with_reference_monitor(Arc::new(ReferenceMonitor::new(
                 Arc::new(TicketAuth),
                 Arc::new(StaticLabels(Some(label(Level::Public)))),
                 Arc::new(AllowAll),
-            )),
-        );
+            )));
         let (_, denied) = t
             .handle_message(&msg::tattach(1, 1, u32::MAX, "forged-ticket", "/"))
             .await
@@ -1769,7 +1989,10 @@ mod tests {
             .handle_message(&msg::tattach(2, 2, u32::MAX, "valid-ticket", "/"))
             .await
             .unwrap();
-        assert!(matches!(accepted, Response::Attach { .. }), "valid retry: {accepted:?}");
+        assert!(
+            matches!(accepted, Response::Attach { .. }),
+            "valid retry: {accepted:?}"
+        );
     }
 
     #[tokio::test]
@@ -1808,17 +2031,22 @@ mod tests {
         );
         let backend = MountBackend::new(
             Arc::new(SyntheticMount::new(root)),
-            hyprstream_rpc::Subject::new("tenant"),
+            hyprstream_rpc::Subject::new("test-subject"),
         );
-        let t = Translator::new(Arc::new(backend), test_decider()).with_reference_monitor(Arc::new(
-            ReferenceMonitor::new(
+        let t = Translator::new(Arc::new(backend), test_decider()).with_reference_monitor(
+            Arc::new(ReferenceMonitor::new(
                 Arc::new(StaticAuth(permit_session(Level::Secret, ALL_OPS))),
                 Arc::new(ByPath),
                 Arc::new(DenySecretReads),
-            ),
-        ));
-        t.handle_message(&msg::tattach(1, 0, u32::MAX, "ticket", "/")).await.unwrap();
-        let (_, walk) = t.handle_message(&msg::twalk(2, 0, 1, &["a", "b"])).await.unwrap();
+            )),
+        );
+        t.handle_message(&msg::tattach(1, 0, u32::MAX, "ticket", "/"))
+            .await
+            .unwrap();
+        let (_, walk) = t
+            .handle_message(&msg::twalk(2, 0, 1, &["a", "b"]))
+            .await
+            .unwrap();
         match walk {
             Response::Walk { qids } => assert_eq!(qids.len(), 2, "one QID per bound component"),
             other => panic!("expected successful two-name walk, got {other:?}"),
@@ -1852,15 +2080,17 @@ mod tests {
         }
         let backend = MemoryBackend::default();
         backend.add_file("/secret", b"classified");
-        let t = Translator::new(Arc::new(backend), test_decider()).with_reference_monitor(Arc::new(
-            ReferenceMonitor::new(
+        let t = Translator::new(Arc::new(backend), test_decider()).with_reference_monitor(
+            Arc::new(ReferenceMonitor::new(
                 Arc::new(StaticAuth(permit_session(Level::Public, ALL_OPS))),
                 Arc::new(ByDepth),
                 Arc::new(AllowAll),
-            ),
-        ));
+            )),
+        );
 
-        t.handle_message(&msg::tattach(1, 0, u32::MAX, "user", "/")).await.unwrap();
+        t.handle_message(&msg::tattach(1, 0, u32::MAX, "user", "/"))
+            .await
+            .unwrap();
         // Walk through the Secret directory toward the Public leaf. The Public
         // subject cannot clear the Secret hop, so the walk must deny — even
         // though the *destination* label is Public.
@@ -1886,8 +2116,13 @@ mod tests {
         struct PartialWalkBackend;
         #[async_trait]
         impl Backend for PartialWalkBackend {
-            async fn attach(&self, _uname: &str, _aname: &str) -> anyhow::Result<()> {
-                Ok(())
+            async fn attach(
+                &self,
+                _uname: &str,
+                _aname: &str,
+                verified: Option<crate::VerifiedAttach>,
+            ) -> anyhow::Result<Option<crate::VerifiedAttach>> {
+                Ok(verified)
             }
             async fn walk(
                 &self,
@@ -1896,7 +2131,10 @@ mod tests {
                 _components: &[String],
             ) -> anyhow::Result<WalkResult> {
                 // Reaches exactly one component, regardless of how many walked.
-                Ok(WalkResult { qids: vec![sample_qid(0, 1)], reached: vec!["a".to_owned()] })
+                Ok(WalkResult {
+                    qids: vec![sample_qid(0, 1)],
+                    reached: vec!["a".to_owned()],
+                })
             }
             async fn open(&self, _fid: u32, _flags: u32) -> anyhow::Result<OpenResult> {
                 unimplemented!("not reached")
@@ -1904,12 +2142,7 @@ mod tests {
             async fn read(&self, _fid: u32, _offset: u64, _count: u32) -> anyhow::Result<Vec<u8>> {
                 unimplemented!("not reached")
             }
-            async fn write(
-                &self,
-                _fid: u32,
-                _offset: u64,
-                _data: &[u8],
-            ) -> anyhow::Result<u32> {
+            async fn write(&self, _fid: u32, _offset: u64, _data: &[u8]) -> anyhow::Result<u32> {
                 unimplemented!("not reached")
             }
             async fn stat(&self, _fid: u32) -> anyhow::Result<StatResult> {
@@ -1930,8 +2163,12 @@ mod tests {
 
         // No monitor: this isolates the path-caching fix from mediation.
         let t = Translator::new(Arc::new(PartialWalkBackend), test_decider());
-        t.handle_message(&msg::tattach(1, 0, u32::MAX, "user", "/")).await.unwrap();
-        t.handle_message(&msg::twalk(2, 0, 1, &["a", "b"])).await.unwrap();
+        t.handle_message(&msg::tattach(1, 0, u32::MAX, "user", "/"))
+            .await
+            .unwrap();
+        t.handle_message(&msg::twalk(2, 0, 1, &["a", "b"]))
+            .await
+            .unwrap();
 
         let cached = t.fids.path(1).expect("newfid must be tracked");
         assert_eq!(
@@ -1969,15 +2206,28 @@ mod tests {
         let t = Arc::new(Translator::new(Arc::new(backend), test_decider()));
 
         // Attach fid 0 as the (directory) root, then open + readdir it.
-        t.handle_message(&msg::tattach(1, 0, u32::MAX, "u", "/")).await.unwrap();
+        t.handle_message(&msg::tattach(1, 0, u32::MAX, "u", "/"))
+            .await
+            .unwrap();
         t.handle_message(&msg::tlopen(2, 0, 0)).await.unwrap();
-        let (tag, resp) = t.handle_message(&msg::treaddir(3, 0, 0, 8192)).await.unwrap();
+        let (tag, resp) = t
+            .handle_message(&msg::treaddir(3, 0, 0, 8192))
+            .await
+            .unwrap();
 
         // Encode to the wire exactly as serve_connection does, and check the
         // message-type byte is RREADDIR, not RREAD.
         let wire = msg::encode_response(tag, &resp);
-        assert_eq!(wire[4], msg::RREADDIR, "readdir must be framed as RREADDIR (41)");
-        assert_ne!(wire[4], msg::RREAD, "readdir must NOT be framed as RREAD (117)");
+        assert_eq!(
+            wire[4],
+            msg::RREADDIR,
+            "readdir must be framed as RREADDIR (41)"
+        );
+        assert_ne!(
+            wire[4],
+            msg::RREAD,
+            "readdir must NOT be framed as RREAD (117)"
+        );
 
         // The payload must decode as standard dirent records.
         let data = match resp {
@@ -2004,9 +2254,12 @@ mod tests {
         use tokio::net::UnixStream;
 
         // Unique temp UDS path (no tempfile dep in this crate).
-        let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
-        let sock = std::env::temp_dir()
-            .join(format!("hs9p-vsock-{}-{nanos}.sock", std::process::id()));
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let sock =
+            std::env::temp_dir().join(format!("hs9p-vsock-{}-{nanos}.sock", std::process::id()));
         let _ = std::fs::remove_file(&sock);
 
         let backend = MemoryBackend::default();
@@ -2047,23 +2300,44 @@ mod tests {
         }
 
         // Tversion → Rversion.
-        client.write_all(&msg::tversion(1, MSG_SIZE, "9P2000.L")).await.unwrap();
+        client
+            .write_all(&msg::tversion(1, MSG_SIZE, "9P2000.L"))
+            .await
+            .unwrap();
         let (_, resp) = msg::parse_response(&read_frame(&mut client).await).unwrap();
-        assert!(matches!(resp, Response::Version { .. }), "expected Rversion, got {resp:?}");
+        assert!(
+            matches!(resp, Response::Version { .. }),
+            "expected Rversion, got {resp:?}"
+        );
 
         // Tattach fid 0 as root.
-        client.write_all(&msg::tattach(2, 0, u32::MAX, "u", "/")).await.unwrap();
+        client
+            .write_all(&msg::tattach(2, 0, u32::MAX, "u", "/"))
+            .await
+            .unwrap();
         let (_, resp) = msg::parse_response(&read_frame(&mut client).await).unwrap();
-        assert!(matches!(resp, Response::Attach { .. }), "expected Rattach, got {resp:?}");
+        assert!(
+            matches!(resp, Response::Attach { .. }),
+            "expected Rattach, got {resp:?}"
+        );
 
         // Twalk to the file, Tlopen, Tread.
-        client.write_all(&msg::twalk(3, 0, 1, &["hello.txt"])).await.unwrap();
+        client
+            .write_all(&msg::twalk(3, 0, 1, &["hello.txt"]))
+            .await
+            .unwrap();
         let (_, resp) = msg::parse_response(&read_frame(&mut client).await).unwrap();
-        assert!(matches!(resp, Response::Walk { .. }), "expected Rwalk, got {resp:?}");
+        assert!(
+            matches!(resp, Response::Walk { .. }),
+            "expected Rwalk, got {resp:?}"
+        );
 
         client.write_all(&msg::tlopen(4, 1, 0)).await.unwrap();
         let (_, resp) = msg::parse_response(&read_frame(&mut client).await).unwrap();
-        assert!(matches!(resp, Response::Lopen { .. }), "expected Rlopen, got {resp:?}");
+        assert!(
+            matches!(resp, Response::Lopen { .. }),
+            "expected Rlopen, got {resp:?}"
+        );
 
         client.write_all(&msg::tread(5, 1, 0, 64)).await.unwrap();
         let (_, resp) = msg::parse_response(&read_frame(&mut client).await).unwrap();
@@ -2088,9 +2362,12 @@ mod tests {
         use std::time::{SystemTime, UNIX_EPOCH};
         use tokio::net::UnixStream;
 
-        let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
-        let sock = std::env::temp_dir()
-            .join(format!("hs9p-rawvsock-{}-{nanos}.sock", std::process::id()));
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let sock =
+            std::env::temp_dir().join(format!("hs9p-rawvsock-{}-{nanos}.sock", std::process::id()));
         let _ = std::fs::remove_file(&sock);
 
         let backend = MemoryBackend::default();
@@ -2100,7 +2377,9 @@ mod tests {
         let server = tokio::spawn(translator.serve_vsock_raw(listener));
 
         // ── Client (guest) side ─────────────────────────────────────────
-        let mut client = UnixStream::connect(&sock).await.expect("dial per-port host UDS");
+        let mut client = UnixStream::connect(&sock)
+            .await
+            .expect("dial per-port host UDS");
 
         async fn read_frame(s: &mut UnixStream) -> Vec<u8> {
             let mut len = [0u8; 4];
@@ -2115,7 +2394,10 @@ mod tests {
         // FIRST bytes on the wire are 9P Tversion — NO `connect <port>\n`
         // preamble. If the raw path erroneously stripped a preamble it would
         // swallow these bytes and the session would hang / fail here.
-        client.write_all(&msg::tversion(1, MSG_SIZE, "9P2000.L")).await.unwrap();
+        client
+            .write_all(&msg::tversion(1, MSG_SIZE, "9P2000.L"))
+            .await
+            .unwrap();
         let (_, resp) = msg::parse_response(&read_frame(&mut client).await).unwrap();
         assert!(
             matches!(resp, Response::Version { .. }),
@@ -2123,17 +2405,32 @@ mod tests {
         );
 
         // Rest of the session proves the stream was never desynchronized.
-        client.write_all(&msg::tattach(2, 0, u32::MAX, "u", "/")).await.unwrap();
+        client
+            .write_all(&msg::tattach(2, 0, u32::MAX, "u", "/"))
+            .await
+            .unwrap();
         let (_, resp) = msg::parse_response(&read_frame(&mut client).await).unwrap();
-        assert!(matches!(resp, Response::Attach { .. }), "expected Rattach, got {resp:?}");
+        assert!(
+            matches!(resp, Response::Attach { .. }),
+            "expected Rattach, got {resp:?}"
+        );
 
-        client.write_all(&msg::twalk(3, 0, 1, &["hello.txt"])).await.unwrap();
+        client
+            .write_all(&msg::twalk(3, 0, 1, &["hello.txt"]))
+            .await
+            .unwrap();
         let (_, resp) = msg::parse_response(&read_frame(&mut client).await).unwrap();
-        assert!(matches!(resp, Response::Walk { .. }), "expected Rwalk, got {resp:?}");
+        assert!(
+            matches!(resp, Response::Walk { .. }),
+            "expected Rwalk, got {resp:?}"
+        );
 
         client.write_all(&msg::tlopen(4, 1, 0)).await.unwrap();
         let (_, resp) = msg::parse_response(&read_frame(&mut client).await).unwrap();
-        assert!(matches!(resp, Response::Lopen { .. }), "expected Rlopen, got {resp:?}");
+        assert!(
+            matches!(resp, Response::Lopen { .. }),
+            "expected Rlopen, got {resp:?}"
+        );
 
         client.write_all(&msg::tread(5, 1, 0, 64)).await.unwrap();
         let (_, resp) = msg::parse_response(&read_frame(&mut client).await).unwrap();
@@ -2156,9 +2453,14 @@ mod tests {
         use std::time::{SystemTime, UNIX_EPOCH};
         use tokio::net::UnixStream;
 
-        let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
-        let sock = std::env::temp_dir()
-            .join(format!("hs9p-vsock-bad-{}-{nanos}.sock", std::process::id()));
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let sock = std::env::temp_dir().join(format!(
+            "hs9p-vsock-bad-{}-{nanos}.sock",
+            std::process::id()
+        ));
         let _ = std::fs::remove_file(&sock);
 
         let listener = UnixListener::bind(&sock).unwrap();
@@ -2204,23 +2506,29 @@ mod tests {
     struct FakeTicketAuth;
     #[async_trait::async_trait]
     impl crate::mount_backend::AttachAuthorizer for FakeTicketAuth {
-        async fn authorize(
+        async fn authenticate(
             &self,
             uname: &str,
             aname: &str,
-        ) -> std::result::Result<hyprstream_rpc::Subject, hyprstream_vfs::MountError> {
-            let subject = match uname {
-                "good-ticket" => hyprstream_rpc::Subject::new("alice"),
-                "other-ticket" => hyprstream_rpc::Subject::new("bob"),
+        ) -> std::result::Result<VerifiedAttach, hyprstream_vfs::MountError> {
+            let identity = match uname {
+                "good-ticket" => "alice",
+                "other-ticket" => "bob",
                 _ => {
-                    return Err(hyprstream_vfs::MountError::PermissionDenied("bad ticket".into()))
+                    return Err(hyprstream_vfs::MountError::PermissionDenied(
+                        "bad ticket".into(),
+                    ))
                 }
             };
             // Export-selection gate (#877 fail-closed contract): only the
             // default export is granted today; an explicit `aname` selecting any
             // other export denies — there is NO fallback to the default.
             if aname.is_empty() {
-                Ok(subject)
+                Ok(verified_attach(permit_session_as(
+                    identity,
+                    Level::Secret,
+                    ALL_OPS,
+                )))
             } else {
                 Err(hyprstream_vfs::MountError::PermissionDenied(format!(
                     "export {aname:?} not granted by ticket"
@@ -2231,8 +2539,8 @@ mod tests {
 
     fn authorized_translator() -> Arc<Translator> {
         use hyprstream_vfs::{SyntheticMount, SyntheticNode};
-        let root = SyntheticNode::dir()
-            .with_child("hello.txt", SyntheticNode::file(b"hi alice".to_vec()));
+        let root =
+            SyntheticNode::dir().with_child("hello.txt", SyntheticNode::file(b"hi alice".to_vec()));
         let mount: Arc<dyn hyprstream_vfs::Mount> = Arc::new(SyntheticMount::new(root));
         Arc::new(Translator::from_mount_authorized(
             mount,
@@ -2251,10 +2559,16 @@ mod tests {
             .handle_message(&msg::tattach(1, 0, u32::MAX, "good-ticket", ""))
             .await
             .unwrap();
-        assert!(matches!(resp, Response::Attach { .. }), "valid ticket must attach: {resp:?}");
+        assert!(
+            matches!(resp, Response::Attach { .. }),
+            "valid ticket must attach: {resp:?}"
+        );
 
         // The bound Subject now threads through walk/open/read.
-        let (_, resp) = t.handle_message(&msg::twalk(2, 0, 1, &["hello.txt"])).await.unwrap();
+        let (_, resp) = t
+            .handle_message(&msg::twalk(2, 0, 1, &["hello.txt"]))
+            .await
+            .unwrap();
         assert!(matches!(resp, Response::Walk { .. }), "got {resp:?}");
         let (_, resp) = t.handle_message(&msg::tlopen(3, 1, 0)).await.unwrap();
         assert!(matches!(resp, Response::Lopen { .. }), "got {resp:?}");
@@ -2275,7 +2589,11 @@ mod tests {
             .handle_message(&msg::tattach(1, 0, u32::MAX, "forged", ""))
             .await
             .unwrap_err();
-        assert_eq!(errno_from_error(&err), EACCES, "denied ticket must be EACCES");
+        assert_eq!(
+            errno_from_error(&err),
+            EACCES,
+            "denied ticket must be EACCES"
+        );
     }
 
     /// An empty `uname` (no ticket presented) is likewise denied — the ticket is
@@ -2287,7 +2605,11 @@ mod tests {
             .handle_message(&msg::tattach(1, 0, u32::MAX, "", ""))
             .await
             .unwrap_err();
-        assert_eq!(errno_from_error(&err), EACCES, "missing ticket must be EACCES");
+        assert_eq!(
+            errno_from_error(&err),
+            EACCES,
+            "missing ticket must be EACCES"
+        );
     }
 
     /// A second attach may repeat the same ticket, but it must not re-scope the
@@ -2305,7 +2627,11 @@ mod tests {
             .handle_message(&msg::tattach(2, 0, u32::MAX, "other-ticket", ""))
             .await
             .unwrap_err();
-        assert_eq!(errno_from_error(&err), EACCES, "conflicting attach must be EACCES");
+        assert_eq!(
+            errno_from_error(&err),
+            EACCES,
+            "conflicting attach must be EACCES"
+        );
     }
 
     /// A valid ticket presenting an `aname` for an export it did not grant fails
@@ -2326,12 +2652,19 @@ mod tests {
             ))
             .await
             .unwrap_err();
-        assert_eq!(errno_from_error(&err), EACCES, "denied aname must be EACCES");
+        assert_eq!(
+            errno_from_error(&err),
+            EACCES,
+            "denied aname must be EACCES"
+        );
         // The root fid (fid 0, the attach target) must not exist after a denied
         // attach — the deny happened in `backend.attach` before the translator
         // bound any fid (the fail-closed contract: no fid leak on a denied
         // export).
-        assert!(t.fids.qtype(0).is_none(), "no fid may be created for a denied aname");
+        assert!(
+            t.fids.qtype(0).is_none(),
+            "no fid may be created for a denied aname"
+        );
     }
 
     /// Fail-closed: an op arriving before a successful attach binds the Subject
@@ -2340,7 +2673,10 @@ mod tests {
     async fn op_before_attach_fails_closed() {
         let t = authorized_translator();
         // No Tattach: a walk cannot resolve a caller and must error, not serve.
-        let err = t.handle_message(&msg::twalk(1, 0, 1, &["hello.txt"])).await.unwrap_err();
+        let err = t
+            .handle_message(&msg::twalk(1, 0, 1, &["hello.txt"]))
+            .await
+            .unwrap_err();
         // Untyped bookkeeping error (no MountError) → EIO, never a success.
         assert_eq!(errno_from_error(&err), EIO);
     }

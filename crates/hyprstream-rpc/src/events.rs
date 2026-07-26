@@ -32,7 +32,7 @@
 //! routing policy into each member grant.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Result};
@@ -300,6 +300,30 @@ pub trait EventAuthz: Send + Sync {
     }
 }
 
+static EVENT_AUTHZ: OnceLock<Arc<dyn EventAuthz>> = OnceLock::new();
+
+fn installed_event_authz() -> Option<Arc<dyn EventAuthz>> {
+    EVENT_AUTHZ.get().cloned()
+}
+
+/// Whether the process-wide event reference monitor has been installed.
+#[must_use]
+pub fn event_authz_installed() -> bool {
+    EVENT_AUTHZ.get().is_some()
+}
+
+/// Install the process-wide production event authorization adapter.
+///
+/// This is one-shot because replacing a live reference monitor would create a
+/// policy gap between already-constructed and new publishers.
+pub fn install_event_authz(
+    authz: Arc<dyn EventAuthz>,
+) -> std::result::Result<(), &'static str> {
+    EVENT_AUTHZ
+        .set(authz)
+        .map_err(|_| "event authorization already installed")
+}
+
 /// Fail-closed authz: denies every publish/subscribe. The default for the
 /// encrypted (`ZeroKnowledge`/`LimitedKnowledge`) profile — MAC deny-by-default
 /// by construction. Production wires a real UCAN/capability-backed impl (S3/S4
@@ -487,8 +511,9 @@ impl EventPublisher {
             pq_signing_key: None,
             privacy_mode: EventPrivacy::Public,
             rekey_policy: RekeyPolicy::default(),
-            // Public firehose profile: no authz by design; identity N/A.
-            authz: Arc::new(AllowAllEventAuthz),
+            // Production installs the MAC adapter before constructing event
+            // publishers.  The fallback preserves direct test embeddings.
+            authz: installed_event_authz().unwrap_or_else(|| Arc::new(AllowAllEventAuthz)),
             publisher_identity: PublisherIdentity::anonymous(),
         })
     }
@@ -935,7 +960,7 @@ impl EventSubscriber {
             inner: MoqEventSubscriber::new(),
             prefixes: Arc::new(RwLock::new(HashMap::new())),
             tenant: Arc::new(RwLock::new(None)),
-            authz: Arc::new(AllowAllEventAuthz),
+            authz: installed_event_authz().unwrap_or_else(|| Arc::new(AllowAllEventAuthz)),
             caller: Subject::anonymous(),
         })
     }
@@ -1033,10 +1058,7 @@ impl EventSubscriber {
         let mut prefixes = self.prefixes.write().await;
         match prefixes.get(&key) {
             None => {
-                prefixes.insert(
-                    key,
-                    SubscriberPrefixState::Expected(Box::new(expectation)),
-                );
+                prefixes.insert(key, SubscriberPrefixState::Expected(Box::new(expectation)));
                 Ok(())
             }
             Some(SubscriberPrefixState::Expected(existing))
@@ -1422,12 +1444,10 @@ impl EventSubscriber {
     }
 
     async fn encrypted_prefix_key(&self, prefix: &str) -> Result<String, String> {
-        let tenant = self
-            .tenant
-            .read()
-            .await
-            .clone()
-            .ok_or_else(|| "confidential subscriber has no verified tenant binding".to_owned())?;
+        let tenant =
+            self.tenant.read().await.clone().ok_or_else(|| {
+                "confidential subscriber has no verified tenant binding".to_owned()
+            })?;
         Ok(tenant_prefix_key(&tenant, prefix))
     }
 }

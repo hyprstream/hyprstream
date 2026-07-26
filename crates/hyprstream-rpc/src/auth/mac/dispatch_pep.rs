@@ -184,12 +184,27 @@ pub trait MacDispatchPep: Send + Sync {
 /// permissive PEP from these inputs.
 pub struct DefaultMacDispatchPep {
     resolver: Box<dyn RpcObjectLabelResolver>,
+    activation_controlled: bool,
 }
 
 impl DefaultMacDispatchPep {
     /// Construct with a specific object-label resolver.
     pub fn new(resolver: Box<dyn RpcObjectLabelResolver>) -> Self {
-        Self { resolver }
+        Self {
+            resolver,
+            activation_controlled: false,
+        }
+    }
+
+    /// Select subject contexts through the process-global coverage gate.
+    ///
+    /// Production constructors opt into this explicitly.  Direct unit-test
+    /// and embedding constructors retain their historical identity-aware
+    /// behavior so the operator gate cannot make unrelated PEP tests
+    /// order-dependent.
+    pub fn with_activation_control(mut self) -> Self {
+        self.activation_controlled = true;
+        self
     }
 
     /// Construct with the fail-closed [`DenyAllObjectResolver`].
@@ -209,8 +224,20 @@ impl MacDispatchPep for DefaultMacDispatchPep {
         service_domain: &str,
         method: Option<u16>,
     ) -> MacDecision {
-        // 1. Subject clearance (S1 two-input derivation: Claims × VerifiedKeyMaterial).
-        let Some(subject_ctx) = ctx.security_context() else {
+        // Preserve the verified context for the direct VFS/CAS/MoQ PEPs, whose
+        // low-level APIs carry Subject but not the full verified envelope.
+        super::activation::remember_verified_subject(ctx);
+
+        // 1. Subject clearance selected by the coverage-gated activation
+        // control. Floor-only uses anonymous_floor; identity-aware consumes the
+        // two-input Claims × VerifiedKeyMaterial derivation.
+        let subject_ctx = if self.activation_controlled {
+            super::activation::global_mac_activation_control()
+                .select_context(ctx.security_context())
+        } else {
+            ctx.security_context()
+        };
+        let Some(subject_ctx) = subject_ctx else {
             return MacDecision::Deny(MacDenyReason::NoClearance);
         };
 

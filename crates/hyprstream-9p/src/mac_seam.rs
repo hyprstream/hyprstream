@@ -1,4 +1,4 @@
-//! 9P reference-monitor contract (S2 / #568, epic #547) — **dormant groundwork**.
+//! 9P reference-monitor contract (S2 / #568, epic #547).
 //!
 //! `hyprstream-9p` owns the 9P operation choke point but deliberately does not
 //! depend on the application crate that owns MAC policy loading and the AVC.
@@ -19,24 +19,14 @@
 //! mandatory token/IFC floor. Per-op cost is a fid-table lookup plus a local
 //! AVC call — never UCAN chain validation or Casbin matching.
 //!
-//! ## Not active by default
+//! ## Production activation posture
 //!
-//! This is the S2 machinery. [`Translator`](crate::Translator) runs **without**
-//! a [`ReferenceMonitor`] unless the application installs one via
-//! `with_reference_monitor`. Production constructors install the monitor
-//! structurally (the PEP is wired at every 9P constructor), but **clearance
-//! issuance and the S6 sender-bound token are not yet wired** — so every
-//! session resolves to fail-closed denial at the token gate until:
-//!
-//! - **#698** — the production token-issuance path attaches `Claims.clearance`,
-//!   letting the monitor resolve a permitting subject context; and
-//! - **the S6 grant path** mints a sender-bound token at `Tattach` so the token
-//!   gate passes for authorized operations.
-//!
-//! Until both land, the installed monitor is the correct fail-closed shape:
-//! every operation denies. There is no permissive default. The
-//! `anonymous_floor()` fallback is **not reachable from production
-//! constructors** — only tests construct a monitor-less translator.
+//! [`Translator`](crate::Translator) can run without a [`ReferenceMonitor`] for
+//! tests and embeddings, but every production constructor installs one. The
+//! mount-ticket paths derive a unified [`VerifiedAttach`] from verified Claims
+//! and key material, while fixed-subject transports remain floor-only until
+//! they gain a credential carrier. The operator activation control widens or
+//! narrows the subject context; it never removes mediation.
 //!
 //! ## Mediation is over the *name*, not the *object* (read before relying on it)
 //!
@@ -78,8 +68,8 @@
 //!
 //! Closing the name↔object TOCTOU by making the monitor authoritative over the
 //! **fid/object** (e.g. resolving labels from the backend's reached object, or
-//! via `ObjectRef::Cid`) is **activation-blocking** alongside #698 and tracked
-//! with #699. Until then, treat "complete mediation by construction" as the
+//! via `ObjectRef::Cid`) is **activation-blocking** and tracked with #699.
+//! Until then, treat "complete mediation by construction" as the
 //! *two-independent-resolutions-agree* claim above, not as object authority.
 
 use std::sync::Arc;
@@ -89,6 +79,8 @@ use async_trait::async_trait;
 use hyprstream_rpc::auth::mac::{
     Assurance, CompartmentSet, Level, SecurityContext, SecurityLabel, VerifiedKeyMaterial,
 };
+use hyprstream_rpc::Subject;
+use hyprstream_vfs::MountError;
 
 pub use hyprstream_rpc::auth::mac::{ObjectLabelResolver, ObjectRef};
 
@@ -184,6 +176,62 @@ pub struct SessionContext {
 pub struct VerifiedAttachIdentity {
     subject: Arc<str>,
     tenant: Arc<str>,
+}
+
+/// One credential verification result shared by both enforcement sides of a
+/// 9P attach.  The MAC session and the VFS subject cannot be supplied
+/// independently.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VerifiedAttach {
+    identity: VerifiedAttachIdentity,
+    subject: Subject,
+    session: SessionContext,
+}
+
+impl VerifiedAttach {
+    /// Bind a credential-verified identity to the exact VFS subject and MAC
+    /// session derived from that same verification.
+    pub fn try_new(
+        identity: VerifiedAttachIdentity,
+        subject: Subject,
+        session: SessionContext,
+    ) -> Result<Self, MountError> {
+        let subject_name = subject.name().ok_or_else(|| {
+            MountError::PermissionDenied("verified attach has anonymous VFS subject".to_owned())
+        })?;
+        if subject_name != identity.subject() {
+            return Err(MountError::PermissionDenied(
+                "MAC identity and VFS subject diverge".to_owned(),
+            ));
+        }
+        if identity.tenant().is_empty() {
+            return Err(MountError::PermissionDenied(
+                "verified attach has no authority-bound tenant".to_owned(),
+            ));
+        }
+        if session.verified_attach_identity() != Some(&identity) {
+            return Err(MountError::PermissionDenied(
+                "MAC session identity and verified attach identity diverge".to_owned(),
+            ));
+        }
+        Ok(Self {
+            identity,
+            subject,
+            session,
+        })
+    }
+
+    pub fn identity(&self) -> &VerifiedAttachIdentity {
+        &self.identity
+    }
+
+    pub fn subject(&self) -> &Subject {
+        &self.subject
+    }
+
+    pub fn session(&self) -> &SessionContext {
+        &self.session
+    }
 }
 
 impl VerifiedAttachIdentity {
@@ -323,7 +371,7 @@ impl SessionContext {
 /// to [`VerifiedTokenScope`]. Invalid input returns [`SessionContext::deny`].
 #[async_trait]
 pub trait AttachAuthenticator: Send + Sync {
-    async fn authenticate(&self, uname: &str, aname: &str) -> SessionContext;
+    async fn authenticate(&self, uname: &str, aname: &str) -> Result<VerifiedAttach, MountError>;
 }
 
 /// Fail-closed authenticator: every attach resolves to a deny-only session.
@@ -334,8 +382,10 @@ pub struct AnonymousAuthenticator;
 
 #[async_trait]
 impl AttachAuthenticator for AnonymousAuthenticator {
-    async fn authenticate(&self, _uname: &str, _aname: &str) -> SessionContext {
-        SessionContext::deny()
+    async fn authenticate(&self, _uname: &str, _aname: &str) -> Result<VerifiedAttach, MountError> {
+        Err(MountError::PermissionDenied(
+            "no verified attach credential".to_owned(),
+        ))
     }
 }
 
@@ -443,7 +493,7 @@ impl AccessDecider for DenyAllDecider {
 /// Constructed by the application (`hyprstream` crate) at activation time from
 /// its concrete token verifier, genesis/manifest label resolver, and AVC/PDP
 /// adapter. The application installs it at every production 9P constructor;
-/// monitor-less translators remain available for tests and dormant embeddings.
+/// monitor-less translators remain available for tests and embeddings.
 pub struct ReferenceMonitor {
     authenticator: Arc<dyn AttachAuthenticator>,
     labels: Arc<dyn ObjectLabelResolver + Send + Sync>,
@@ -469,7 +519,11 @@ impl ReferenceMonitor {
     }
 
     /// Verify the `Tattach` credential exactly once for this connection.
-    pub async fn authenticate(&self, uname: &str, aname: &str) -> SessionContext {
+    pub async fn authenticate(
+        &self,
+        uname: &str,
+        aname: &str,
+    ) -> Result<VerifiedAttach, MountError> {
         self.authenticator.authenticate(uname, aname).await
     }
 
