@@ -115,6 +115,10 @@ pub fn create_app(state: Arc<OAuthState>, cors_config: &crate::config::CorsConfi
         )
         .route("/oauth/register", post(registration::register_client))
         .route(
+            "/xrpc/ai.hyprstream.identity.exchangeUcan",
+            post(token_exchange::exchange_atproto_ucan),
+        )
+        .route(
             "/oauth/authorize",
             get(authorize::authorize_get).post(authorize::authorize_post),
         )
@@ -387,6 +391,9 @@ pub struct OAuthService {
     jwt_verifying_key: [u8; 32],
     /// Shared JTI blocklist (same Arc as PolicyService) for cross-plane revocation.
     jti_blocklist: Option<Arc<hyprstream_rpc::auth::InMemoryJtiBlocklist>>,
+    /// Authority-owned hosted-account records for ATProto DID → tenant
+    /// resolution. Attached by the PDS service composition layer.
+    hosted_account_store: Option<Arc<hyprstream_pds_service::AccountRecordStore>>,
 }
 
 impl OAuthService {
@@ -409,6 +416,7 @@ impl OAuthService {
             verifying_key,
             jwt_verifying_key: jwt_verifying_key.to_bytes(),
             jti_blocklist: None,
+            hosted_account_store: None,
         }
     }
 
@@ -424,6 +432,15 @@ impl OAuthService {
         bl: Arc<hyprstream_rpc::auth::InMemoryJtiBlocklist>,
     ) -> Self {
         self.jti_blocklist = Some(bl);
+        self
+    }
+
+    /// Attach the PDS hosted-account read service.
+    pub fn with_hosted_account_store(
+        mut self,
+        store: Arc<hyprstream_pds_service::AccountRecordStore>,
+    ) -> Self {
+        self.hosted_account_store = Some(store);
         self
     }
 }
@@ -727,6 +744,9 @@ impl Spawnable for OAuthService {
                 discovery_client.clone(),
                 jwt_verifying_key,
             );
+            if let Some(store) = &self.hosted_account_store {
+                oauth_state = oauth_state.with_hosted_account_store(Arc::clone(store));
+            }
             if let Some(store) = user_store {
                 oauth_state = oauth_state.with_user_store(store);
             }
@@ -1306,6 +1326,7 @@ mod tests {
         use hyprstream_rpc::transport::lazy_uds::LazyUdsTransport;
         use hyprstream_rpc::transport::TransportConfig;
         use hyprstream_service::{InprocManager, ServiceManager as _};
+        use hyprstream_vfs::{SyntheticMount, SyntheticNode};
         use sha2::{Digest as _, Sha256};
 
         use super::state::RegisteredClient;
@@ -1320,7 +1341,8 @@ mod tests {
         const CLIENT_ID: &str = "handler-client";
         const PRIVATE_CLIENT_ID: &str = "handler-private-client";
         const REDIRECT_URI: &str = "https://client.example.test/callback";
-        const MAPPED_DID: &str = "did:plc:abcdefghijklmnqrstuvwx2p";
+        const MAPPED_DID: &str = "did:web:alice.acct.example.test";
+        const HOSTED_TENANT: &str = "tenant-demo";
         const PKCE_VERIFIER: &str = "r5-handler-pkce-verifier-abcdefghijklmnopqrstuvwxyz012345";
         const GENERIC_PKCE_VERIFIER: &str =
             "r7-generic-pkce-verifier-abcdefghijklmnopqrstuvwxyz012345";
@@ -1352,7 +1374,19 @@ mod tests {
             git2db,
             TransportConfig::inproc(&policy_tag),
         )
-        .with_default_audience(GENERIC_ISSUER.to_owned());
+        .with_default_audience(GENERIC_ISSUER.to_owned())
+        .with_token_clearance_resolver(Arc::new(|subject| {
+            use hyprstream_rpc::auth::mac::{
+                Assurance, CompartmentSet, Level, SecurityLabel,
+            };
+            (subject == MAPPED_DID).then(|| {
+                SecurityLabel::new(
+                    Level::Secret,
+                    Assurance::PqHybrid,
+                    CompartmentSet::single(0),
+                )
+            })
+        }));
         let manager = InprocManager::new();
         let mut policy_handle = manager.spawn(Box::new(policy_service)).await?;
         let policy_client = PolicyClient::for_local_endpoint_bootstrap(
@@ -1403,13 +1437,95 @@ mod tests {
         let mut config = crate::config::OAuthConfig::default();
         // Generic OAuth preserves this path; atproto emissions use its origin.
         config.external_url = Some(GENERIC_ISSUER.to_owned());
+
+        struct FixtureAtprotoDidResolver(serde_json::Value);
+        #[async_trait::async_trait]
+        impl super::state::AtprotoDidDocumentResolver for FixtureAtprotoDidResolver {
+            async fn resolve_document(&self, did: &str) -> anyhow::Result<serde_json::Value> {
+                anyhow::ensure!(
+                    self.0.get("id").and_then(serde_json::Value::as_str) == Some(did),
+                    "fixture DID mismatch"
+                );
+                Ok(self.0.clone())
+            }
+        }
+        // #1314: the hosted account record is the authority binding between
+        // this DID and HOSTED_TENANT. Its generated #atproto key signs the
+        // service assertion below, so the fixture exercises the real record
+        // shape rather than an independent tenant map.
+        let account_ed = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let (account_pq, account_pq_vk) = hyprstream_crypto::pq::ml_dsa_generate_keypair();
+        let account_hybrid = hyprstream_pds::did_op::HybridRotationKey::new(
+            account_ed.verifying_key().to_bytes(),
+            hyprstream_crypto::pq::ml_dsa_vk_bytes(&account_pq_vk),
+        )?;
+        let account_rotations = hyprstream_pds::did_op::GenesisRotationKeys::new(
+            hyprstream_pds::did_op::UserRotationKey::new(account_hybrid),
+            hyprstream_pds::did_op::RecoveryKeyEnrollment::Declined,
+            hyprstream_pds::did_op::HostKeyEnrollment::Absent,
+        )?;
+        let account_mint = hyprstream_pds::HostedAccountMint::begin(
+            hyprstream_pds::AllocatedAccountName::new("alice", MAPPED_DID)?,
+            account_rotations,
+        )?;
+        let pending_account = account_mint.prepare_genesis(
+            hyprstream_pds::Cid::from_raw(b"handler-hosted-account-doc"),
+            hyprstream_pds::did_op::GenesisRepoHead::EmptyRepo,
+        )?;
+        let account_signature = hyprstream_pds::did_op::sign_genesis(
+            pending_account.unsigned_genesis(),
+            &account_ed,
+            &account_pq,
+        )?;
+        let sealed_account = pending_account.seal(account_signature)?;
+        let atproto_signing_key = sealed_account.atproto_signing_key().clone();
+        let pds_root = SyntheticNode::dir().with_child(
+            HOSTED_TENANT,
+            SyntheticNode::dir().with_child(
+                "accounts",
+                SyntheticNode::dir().with_child(
+                    "alice",
+                    SyntheticNode::dir().with_child(
+                        "account-record.cbor",
+                        SyntheticNode::file(sealed_account.record_bytes().to_vec()),
+                    ),
+                ),
+            ),
+        );
+        let hosted_account_store =
+            Arc::new(hyprstream_pds_service::AccountRecordStore::new(Arc::new(
+                SyntheticMount::new(pds_root),
+            )));
+        let mut atproto_multikey = vec![0x80, 0x24];
+        atproto_multikey.extend_from_slice(
+            atproto_signing_key
+                .verifying_key()
+                .to_encoded_point(true)
+                .as_bytes(),
+        );
+        let atproto_document = serde_json::json!({
+            "id": MAPPED_DID,
+            "verificationMethod": [{
+                "id": format!("{MAPPED_DID}#atproto"),
+                "type": "Multikey",
+                "controller": MAPPED_DID,
+                "publicKeyMultibase": format!(
+                    "z{}",
+                    bs58::encode(atproto_multikey).into_string()
+                )
+            }]
+        });
         let mut oauth_state = OAuthState::new(
             &config,
             policy_client,
             DiscoveryClient::new(dummy_rpc),
             service_key.verifying_key().to_bytes(),
         )
-        .with_user_store(user_store);
+        .with_user_store(user_store)
+        .with_hosted_account_store(hosted_account_store)
+        .with_atproto_did_resolver(Arc::new(FixtureAtprotoDidResolver(
+            atproto_document,
+        )));
         let token_dir = tempfile::TempDir::new()?;
         oauth_state.with_token_store_impl(Arc::new(RocksDbTokenStore::open(
             token_dir.path().join("refresh.db"),
@@ -1483,6 +1599,121 @@ mod tests {
             ..Default::default()
         };
         let app = create_app(Arc::clone(&state), &cors);
+
+        // #1119 service assertions prove the external DID and requested
+        // operation. They do not bind that DID to a local tenant.
+        let now = chrono::Utc::now().timestamp();
+        let service_header = URL_SAFE_NO_PAD.encode(
+            serde_json::to_vec(&serde_json::json!({
+                "alg": "ES256", "typ": "JWT", "kid": "#atproto"
+            }))?,
+        );
+        let make_service_jwt = |audience: &str, lxm: &str, jti: &str| -> anyhow::Result<String> {
+            let payload = URL_SAFE_NO_PAD.encode(
+                serde_json::to_vec(&serde_json::json!({
+                    "iss": MAPPED_DID,
+                    "aud": audience,
+                    "iat": now,
+                    "exp": now + 60,
+                    "lxm": lxm,
+                    "jti": jti
+                }))?,
+            );
+            let signing_input = format!("{service_header}.{payload}");
+            let signature: p256::ecdsa::Signature =
+                atproto_signing_key.sign(signing_input.as_bytes());
+            Ok(format!(
+                "{signing_input}.{}",
+                URL_SAFE_NO_PAD.encode(signature.to_bytes())
+            ))
+        };
+        let service_jwt = make_service_jwt(
+            "did:web:pds.example.test",
+            token_exchange::ATPROTO_EXCHANGE_NSID,
+            "demo-1119-jti",
+        )?;
+        use tower::ServiceExt as _;
+        let exchange_request = |jwt: &str, tenant: &str| {
+            axum::http::Request::post("/xrpc/ai.hyprstream.identity.exchangeUcan")
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .header(
+                    axum::http::header::AUTHORIZATION,
+                    format!("Bearer {jwt}"),
+                )
+                .body(axum::body::Body::from(
+                    serde_json::json!({
+                        "tenant": tenant,
+                        "scope": "transition:generic",
+                        "audience": ISSUER
+                    })
+                    .to_string(),
+                ))
+                .unwrap()
+        };
+        let wrong_audience = make_service_jwt(
+            "did:web:other.example",
+            token_exchange::ATPROTO_EXCHANGE_NSID,
+            "demo-1119-wrong-aud",
+        )?;
+        let rejected_audience = app
+            .clone()
+            .oneshot(exchange_request(&wrong_audience, HOSTED_TENANT))
+            .await?;
+        assert_eq!(
+            rejected_audience.status(),
+            axum::http::StatusCode::UNAUTHORIZED
+        );
+        let wrong_lxm = make_service_jwt(
+            "did:web:pds.example.test",
+            "com.atproto.repo.uploadBlob",
+            "demo-1119-wrong-lxm",
+        )?;
+        let rejected_lxm = app
+            .clone()
+            .oneshot(exchange_request(&wrong_lxm, HOSTED_TENANT))
+            .await?;
+        assert_eq!(rejected_lxm.status(), axum::http::StatusCode::UNAUTHORIZED);
+
+        // #1314: the authority-owned account record supplies the binding. A
+        // matching request succeeds and the minted credential carries exactly
+        // that record's tenant.
+        let exchanged = app
+            .clone()
+            .oneshot(exchange_request(&service_jwt, HOSTED_TENANT))
+            .await?;
+        assert_eq!(exchanged.status(), axum::http::StatusCode::OK);
+        let exchanged_json = response_json(exchanged).await;
+        let exchanged_token = exchanged_json["access_token"]
+            .as_str()
+            .expect("hosted ATProto identity receives a credential");
+        let exchanged_claims = jwt_claims(exchanged_token);
+        assert_eq!(exchanged_claims["sub"], MAPPED_DID);
+        assert_eq!(exchanged_claims["tenant"], HOSTED_TENANT);
+        assert_eq!(exchanged_claims["scope"], "transition:generic");
+
+        let wrong_tenant_jwt = make_service_jwt(
+            "did:web:pds.example.test",
+            token_exchange::ATPROTO_EXCHANGE_NSID,
+            "demo-1119-wrong-tenant",
+        )?;
+        let rejected_tenant = app
+            .clone()
+            .oneshot(exchange_request(&wrong_tenant_jwt, "tenant-foreign"))
+            .await?;
+        assert_eq!(
+            rejected_tenant.status(),
+            axum::http::StatusCode::BAD_REQUEST
+        );
+        let rejected_tenant_json = response_json(rejected_tenant).await;
+        assert_eq!(rejected_tenant_json["error"], "InvalidRequest");
+        assert_eq!(
+            rejected_tenant_json["message"],
+            "requested tenant differs from the verified source-token tenant"
+        );
+        assert!(
+            rejected_tenant_json.get("access_token").is_none(),
+            "a hosted DID must not receive a credential for a tenant other than its account binding"
+        );
 
         // Device authorization rejects unknown clients at the real endpoint.
         let unknown_device = post_form(
@@ -2339,6 +2570,7 @@ mod tests {
                 dpop_jkt: None,
                 issuer: None,
                 tenant: None,
+                require_clearance: false,
             })
             .await?
             .token;
@@ -2370,6 +2602,7 @@ mod tests {
                 dpop_jkt: None,
                 issuer: None,
                 tenant: None,
+                require_clearance: false,
             })
             .await?
             .token;
@@ -2417,6 +2650,7 @@ mod tests {
                 dpop_jkt: None,
                 issuer: None,
                 tenant: None,
+                require_clearance: false,
             })
             .await?
             .token;

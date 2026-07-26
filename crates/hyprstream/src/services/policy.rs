@@ -103,6 +103,10 @@ pub struct PolicyService {
     es256_key_store: Option<Arc<crate::auth::Es256SigningKeyStore>>,
     /// ML-DSA-65 key rotation store for PQ-hybrid composite token issuance.
     ml_dsa_key_store: Option<Arc<crate::auth::MlDsaSigningKeyStore>>,
+    /// Authority-owned enrollment lookup for MAC-labeled credentials.
+    token_clearance_resolver: Arc<
+        dyn Fn(&str) -> Option<hyprstream_rpc::auth::mac::SecurityLabel> + Send + Sync,
+    >,
 }
 
 impl PolicyService {
@@ -131,6 +135,10 @@ impl PolicyService {
             jti_blocklist: Arc::new(hyprstream_rpc::auth::InMemoryJtiBlocklist::new()),
             es256_key_store: None,
             ml_dsa_key_store: None,
+            token_clearance_resolver: Arc::new(|subject| {
+                let policy = crate::mac::compiled_policy()?;
+                policy.clearance_for(subject)
+            }),
         }
     }
 
@@ -142,6 +150,17 @@ impl PolicyService {
     /// Set the default audience for issued tokens (typically the OAuth issuer URL).
     pub fn with_default_audience(mut self, audience: String) -> Self {
         self.default_audience = Some(audience);
+        self
+    }
+
+    /// Override enrollment lookup for an isolated service fixture.
+    pub fn with_token_clearance_resolver(
+        mut self,
+        resolver: Arc<
+            dyn Fn(&str) -> Option<hyprstream_rpc::auth::mac::SecurityLabel> + Send + Sync,
+        >,
+    ) -> Self {
+        self.token_clearance_resolver = resolver;
         self
     }
 
@@ -449,6 +468,25 @@ impl PolicyHandler for PolicyService {
             ctx.user().to_owned()
         };
 
+        let subject_clearance = if data.require_clearance {
+            (self.token_clearance_resolver)(&subject).map(|clearance| {
+                let context = hyprstream_rpc::auth::mac::SecurityContext::from_clearance(
+                    clearance,
+                    hyprstream_rpc::auth::mac::VerifiedKeyMaterial::Classical,
+                );
+                *context.clearance()
+            })
+        } else {
+            None
+        };
+        if data.require_clearance && subject_clearance.is_none() {
+            return Ok(PolicyResponseVariant::Error(ErrorInfo {
+                message: format!("Subject '{subject}' has no verified enrollment clearance"),
+                code: "UNLABELED_SUBJECT".to_owned(),
+                details: "MAC-enforcing token issuance fails closed for unenrolled subjects".to_owned(),
+            }));
+        }
+
         // #1159 freeze: this is the shared signing boundary for every caller
         // using PolicyClient::issue_token, including RFC 8693 token exchange
         // and RFC 7523 JWT bearer. Check the resolved concrete subject, not
@@ -584,6 +622,9 @@ impl PolicyHandler for PolicyService {
          .with_scope(granted_scope);
         if target_domain != "*" {
             claims = claims.with_tenant(target_domain);
+        }
+        if let Some(clearance) = subject_clearance {
+            claims = claims.with_clearance(clearance);
         }
 
         // DPoP jkt takes priority over userPubKey (RFC 9449 § 6).
@@ -1908,6 +1949,7 @@ mod tests {
             dpop_jkt: None,
             issuer: None,
             tenant: None,
+            require_clearance: false,
         }
     }
 

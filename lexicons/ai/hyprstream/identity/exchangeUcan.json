@@ -1,0 +1,55 @@
+{
+  "lexicon": 1,
+  "id": "ai.hyprstream.identity.exchangeUcan",
+  "defs": {
+    "main": {
+      "type": "procedure",
+      "description": "Exchange a one-use ATProto service-auth JWT for a short-lived, MAC-labeled hyprstream bearer session credential.",
+      "input": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": ["tenant"],
+          "properties": {
+            "tenant": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128
+            },
+            "scope": {
+              "type": "string",
+              "description": "Optional attenuation of the fixed transition:generic exchange grant."
+            },
+            "audience": {
+              "type": "string",
+              "description": "Optional RFC 8707 resource indicator for the issued credential."
+            }
+          }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": [
+            "access_token",
+            "issued_token_type",
+            "token_type",
+            "expires_in"
+          ],
+          "properties": {
+            "access_token": { "type": "string" },
+            "issued_token_type": { "type": "string", "const": "urn:ietf:params:oauth:token-type:access_token" },
+            "token_type": { "type": "string", "const": "Bearer" },
+            "expires_in": { "type": "integer", "minimum": 0 }
+          }
+        }
+      },
+      "errors": [
+        { "name": "InvalidToken", "description": "The service-auth JWT is invalid, expired, or already used." },
+        { "name": "InvalidRequest", "description": "The requested tenant, scope, or audience is invalid." },
+        { "name": "InternalServerError", "description": "The host could not issue a credential." }
+      ]
+    }
+  }
+}

@@ -1304,6 +1304,22 @@ pub struct OAuthConfig {
     /// When `false`, the XRPC routes are not mounted at all.
     #[serde(default)]
     pub xrpc_read_slice: bool,
+
+    /// Read-only PLC directory used to resolve ATProto account signing keys.
+    #[serde(default = "default_atproto_plc_directory_url")]
+    pub atproto_plc_directory_url: String,
+
+    /// TTL for validated ATProto DID documents.
+    #[serde(default = "default_atproto_did_cache_ttl")]
+    pub atproto_did_cache_ttl_secs: u64,
+}
+
+fn default_atproto_plc_directory_url() -> String {
+    "https://plc.directory".to_owned()
+}
+
+fn default_atproto_did_cache_ttl() -> u64 {
+    3600
 }
 
 fn default_oauth_cors() -> server::CorsConfig {
@@ -1341,6 +1357,8 @@ impl Default for OAuthConfig {
             // atproto profile at the authorize handler level.
             require_pushed_authorization_requests: false,
             xrpc_read_slice: false,
+            atproto_plc_directory_url: default_atproto_plc_directory_url(),
+            atproto_did_cache_ttl_secs: default_atproto_did_cache_ttl(),
             deployment_well_known_dir: None,
         }
     }

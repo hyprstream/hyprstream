@@ -145,6 +145,11 @@ struct IssueToken {
   # Empty inherits the caller's verified tenant. Cross-tenant issuance requires
   # policy:IssueToken/manage in this target tenant.
   tenant @7 :Text $optional;
+
+  # Require the PolicyService to resolve an authority-owned enrollment
+  # clearance for the subject before minting. The resolved clearance is
+  # clamped to Classical assurance and stamped into the signed claims.
+  requireClearance @8 :Bool;
 }
 
 # Apply a built-in policy template

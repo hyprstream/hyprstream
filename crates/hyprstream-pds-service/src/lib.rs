@@ -24,6 +24,7 @@ const ACCOUNTS_DIRECTORY: &str = "accounts";
 const ACCOUNT_RECORD_FILE: &str = "account-record.cbor";
 const DEFAULT_MAX_RECORD_BYTES: usize = 64 * 1024;
 const READ_CHUNK_BYTES: usize = 8 * 1024;
+const OAUTH_ACCOUNT_RESOLVER_SUBJECT: &str = "service:oauth";
 
 /// Failure from the mandatory tenant boundary or the PDS record read.
 #[derive(Debug, Error)]
@@ -36,6 +37,12 @@ pub enum AccountReadError {
     InvalidVerifiedTenant(String),
     #[error("invalid hosted account label {0:?}")]
     InvalidAccountLabel(String),
+    #[error("PDS hosted-account tenant resolution denied for {0:?}")]
+    UnauthorizedTenantResolver(String),
+    #[error("invalid hosted account DID {0:?}")]
+    InvalidHostedAccountDid(String),
+    #[error("hosted account DID {0:?} is bound to more than one tenant")]
+    AmbiguousHostedAccountDid(String),
     #[error("PDS account record exceeds the {limit}-byte read limit")]
     RecordTooLarge { limit: usize },
     #[error("PDS account record for {requested:?} contains label {stored:?}")]
@@ -94,6 +101,69 @@ impl AccountRecordStore {
             tenant,
             subject,
         })
+    }
+
+    /// Resolve a hosted account DID to its authority-owned tenant binding.
+    ///
+    /// Unlike [`Self::scope`], this lookup starts without a tenant because the
+    /// ATProto assertion proves only the DID. It therefore accepts no tenant
+    /// argument: the OAuth service identity scans the account-record index and
+    /// returns the tenant containing the one canonical record whose DID
+    /// matches. Missing records return `Ok(None)` (federated-only identity);
+    /// corrupt, denied, or ambiguous records fail closed.
+    pub async fn resolve_tenant_for_hosted_did(
+        &self,
+        authority: &Subject,
+        did: &str,
+    ) -> Result<Option<String>, AccountReadError> {
+        if authority.name() != Some(OAUTH_ACCOUNT_RESOLVER_SUBJECT) {
+            return Err(AccountReadError::UnauthorizedTenantResolver(
+                authority.to_string(),
+            ));
+        }
+        let Some(label) = hosted_account_label(did)? else {
+            return Ok(None);
+        };
+
+        let tenants = read_directory(self.pds_mount.as_ref(), &[], authority).await?;
+        let mut resolved = None;
+        for entry in tenants.into_iter().filter(|entry| entry.is_dir) {
+            validate_tenant_component(&entry.name)?;
+            let components = [
+                entry.name.as_str(),
+                ACCOUNTS_DIRECTORY,
+                label,
+                ACCOUNT_RECORD_FILE,
+            ];
+            let bytes = match read_file(
+                self.pds_mount.as_ref(),
+                &components,
+                authority,
+                self.max_record_bytes,
+            )
+            .await
+            {
+                Ok(bytes) => bytes,
+                Err(AccountReadError::Mount(MountError::NotFound(_))) => continue,
+                Err(error) => return Err(error),
+            };
+            let record =
+                AccountRecord::from_dag_cbor(&bytes).map_err(AccountReadError::InvalidRecord)?;
+            if record.name().label() != label {
+                return Err(AccountReadError::RecordLabelMismatch {
+                    requested: label.to_owned(),
+                    stored: record.name().label().to_owned(),
+                });
+            }
+            if record.name().did() != did {
+                continue;
+            }
+            if resolved.is_some() {
+                return Err(AccountReadError::AmbiguousHostedAccountDid(did.to_owned()));
+            }
+            resolved = Some(entry.name);
+        }
+        Ok(resolved)
     }
 
     #[cfg(test)]
@@ -190,6 +260,22 @@ fn validate_account_label(label: &str) -> Result<(), AccountReadError> {
     }
 }
 
+fn hosted_account_label(did: &str) -> Result<Option<&str>, AccountReadError> {
+    let Some(host) = did.strip_prefix("did:web:") else {
+        return Ok(None);
+    };
+    if host.contains([':', '/']) {
+        return Err(AccountReadError::InvalidHostedAccountDid(did.to_owned()));
+    }
+    let label = host
+        .split('.')
+        .next()
+        .ok_or_else(|| AccountReadError::InvalidHostedAccountDid(did.to_owned()))?;
+    validate_account_label(label)
+        .map_err(|_| AccountReadError::InvalidHostedAccountDid(did.to_owned()))?;
+    Ok(Some(label))
+}
+
 async fn read_file(
     mount: &dyn Mount,
     components: &[&str],
@@ -203,6 +289,21 @@ async fn read_file(
     }
 
     let result = read_open_fid(mount, &fid, subject, limit).await;
+    mount.clunk(fid, subject).await;
+    result
+}
+
+async fn read_directory(
+    mount: &dyn Mount,
+    components: &[&str],
+    subject: &Subject,
+) -> Result<Vec<hyprstream_vfs::DirEntry>, AccountReadError> {
+    let mut fid = mount.walk(components, subject).await?;
+    if let Err(error) = mount.open(&mut fid, OREAD, subject).await {
+        mount.clunk(fid, subject).await;
+        return Err(error.into());
+    }
+    let result = mount.readdir(&fid, subject).await.map_err(Into::into);
     mount.clunk(fid, subject).await;
     result
 }
@@ -305,6 +406,10 @@ mod tests {
         )
     }
 
+    fn oauth_authority() -> Subject {
+        Subject::new(OAUTH_ACCOUNT_RESOLVER_SUBJECT)
+    }
+
     #[tokio::test]
     async fn verified_tenant_selects_the_only_visible_account_tree() {
         let store = store();
@@ -318,6 +423,59 @@ mod tests {
         assert_eq!(beta.tenant(), "beta");
         assert_eq!(acme_record.name().did(), "did:web:alice.acme.example");
         assert_eq!(beta_record.name().did(), "did:web:alice.beta.example");
+    }
+
+    #[tokio::test]
+    async fn oauth_authority_resolves_tenant_from_matching_account_record() {
+        let store = store();
+
+        assert_eq!(
+            store
+                .resolve_tenant_for_hosted_did(&oauth_authority(), "did:web:alice.acme.example",)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("acme"),
+        );
+        assert_eq!(
+            store
+                .resolve_tenant_for_hosted_did(&oauth_authority(), "did:web:missing.acme.example",)
+                .await
+                .unwrap(),
+            None,
+        );
+        assert_eq!(
+            store
+                .resolve_tenant_for_hosted_did(&oauth_authority(), "did:plc:federated-only",)
+                .await
+                .unwrap(),
+            None,
+        );
+    }
+
+    #[tokio::test]
+    async fn hosted_did_resolution_requires_oauth_authority_and_is_unambiguous() {
+        let denied = store()
+            .resolve_tenant_for_hosted_did(&Subject::new("alice"), "did:web:alice.acme.example")
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            denied,
+            AccountReadError::UnauthorizedTenantResolver(_)
+        ));
+
+        let duplicated = account_bytes("alice", "acme.example");
+        let root = SyntheticNode::dir()
+            .with_child("acme", tenant_node("alice", duplicated.clone()))
+            .with_child("beta", tenant_node("alice", duplicated));
+        let ambiguous = AccountRecordStore::new(Arc::new(SyntheticMount::new(root)))
+            .resolve_tenant_for_hosted_did(&oauth_authority(), "did:web:alice.acme.example")
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            ambiguous,
+            AccountReadError::AmbiguousHostedAccountDid(_)
+        ));
     }
 
     #[test]

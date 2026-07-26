@@ -56,6 +56,7 @@ ml-dsa = { workspace = true }  # ML-DSA-65 — always compiled (runtime CryptoPo
 hyprstream-rpc-std = { path = "../hyprstream-rpc-std" }  # Standard service schemas + clients
 hyprstream-discovery = { path = "../hyprstream-discovery" }  # Service discovery
 hyprstream-pds = { path = "../hyprstream-pds" }  # atproto PDS record store: DAG-CBOR + MST + signed commit + CAR proof (#392/#431)
+hyprstream-pds-service = { path = "../hyprstream-pds-service" }  # authority-owned hosted-account tenant lookup
 hyprstream-ledger = { path = "../hyprstream-ledger", optional = true }  # Cellular credit ledger accounting plane (#923); the Phase-1 local-enforcer service (#925) lands behind the `ledger` feature, default off
 hyprstream-crypto = { path = "../hyprstream-crypto" }  # COSE composite (EdDSA + ML-DSA-65) sign/verify — used by the ledger checkpoint signer (#925)
 hyprstream-service = { path = "../hyprstream-service" }  # Service orchestration
@@ -171,6 +172,7 @@ base64.workspace = true                  # JWT token encoding
 ed25519-dalek.workspace = true           # JWT Ed25519 signatures
 ssh-key = { version = "0.6", features = ["ed25519", "encryption"] }  # OpenSSH Ed25519 key import (user create --ssh)
 p256.workspace = true                    # ES256 DPoP verification (atproto interop)
+k256.workspace = true                    # ES256K ATProto service-auth verification
 keyring = { version = "3", features = ["linux-native"] }  # OS keyring — Linux keyutils
 curve25519-dalek.workspace = true        # Ristretto255 DH for stream authentication
 hkdf.workspace = true                    # HKDF key derivation

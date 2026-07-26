@@ -95,7 +95,7 @@ pub async fn exchange_jwt_bearer(
     };
 
     let sub = claims.sub.clone();
-
+    let tenant = authority_verified_assertion_tenant(&claims, verified_service_key.is_some());
 
     // Delegate token issuance to PolicyService (authorization enforced there via Casbin).
     let result = state
@@ -110,7 +110,8 @@ pub async fn exchange_jwt_bearer(
             user_pub_key: verified_service_key.map(|key| URL_SAFE_NO_PAD.encode(key.to_bytes())),
             dpop_jkt: None,
             issuer: None,
-            tenant: claims.tenant.clone(),
+            tenant,
+            require_clearance: false,
         })
         .await;
 
@@ -137,6 +138,21 @@ pub async fn exchange_jwt_bearer(
             tracing::error!(sub = %sub, error = %e, "JWT bearer token issuance failed");
             jwt_bearer_error(StatusCode::INTERNAL_SERVER_ERROR, "server_error", "Failed to issue token")
         }
+    }
+}
+
+/// Preserve tenant claims only for assertions signed by a locally published
+/// service key. A trusted federated issuer proves identity, not membership in
+/// a local tenant; carrying its claim into a locally issued token would
+/// launder that external assertion into `verified_tenant`.
+fn authority_verified_assertion_tenant(
+    claims: &hyprstream_rpc::auth::Claims,
+    locally_verified_service: bool,
+) -> Option<String> {
+    if locally_verified_service {
+        claims.tenant.clone()
+    } else {
+        None
     }
 }
 
@@ -279,5 +295,28 @@ mod tests {
                 .with_issuer("https://issuer.example".to_owned())
                 .with_audience(Some("https://issuer.example/oauth/token".to_owned())), &retired);
         assert!(decode_with_any_service_key_at(&trust, &retired_assertion, "model", "https://issuer.example/oauth/token", retirement).is_none());
+    }
+
+    #[test]
+    fn federated_bearer_cannot_launder_tenant_into_local_token() {
+        let now = chrono::Utc::now().timestamp();
+        let claims = hyprstream_rpc::auth::Claims::new(
+            "external-user".to_owned(),
+            now,
+            now + 300,
+        )
+        .with_issuer("https://federated.example".to_owned())
+        .with_tenant("victim-domain".to_owned());
+
+        assert_eq!(
+            authority_verified_assertion_tenant(&claims, false),
+            None,
+            "a federated assertion's tenant must not reach PolicyService",
+        );
+        assert_eq!(
+            authority_verified_assertion_tenant(&claims, true).as_deref(),
+            Some("victim-domain"),
+            "a locally published service key remains an authority source",
+        );
     }
 }

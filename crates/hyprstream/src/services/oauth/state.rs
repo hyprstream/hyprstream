@@ -18,6 +18,65 @@ use crate::config::OAuthConfig;
 use crate::services::{DiscoveryClient, PolicyClient};
 use hyprstream_util::TtlCache;
 
+/// Read-only resolver used by the ATProto service-auth exchange perimeter.
+#[async_trait::async_trait]
+pub trait AtprotoDidDocumentResolver: Send + Sync {
+    async fn resolve_document(&self, did: &str) -> anyhow::Result<serde_json::Value>;
+}
+
+struct HttpAtprotoDidDocumentResolver {
+    plc: hyprstream_rpc::did_plc::DidPlcResolver<hyprstream_rpc::did_plc::HttpPlcFetcher>,
+    web: hyprstream_rpc::did_web::HttpDidDocFetcher,
+}
+
+#[async_trait::async_trait]
+impl AtprotoDidDocumentResolver for HttpAtprotoDidDocumentResolver {
+    async fn resolve_document(&self, did: &str) -> anyhow::Result<serde_json::Value> {
+        if hyprstream_rpc::did_plc::is_did_plc(did) {
+            return self.plc.resolve_document(did).await;
+        }
+        if did.starts_with("did:web:") {
+            use hyprstream_rpc::did_web::DidDocFetcher as _;
+            let url = hyprstream_rpc::did_web::did_web_to_url(did)?;
+            let doc = self.web.fetch(&url).await?;
+            anyhow::ensure!(
+                doc.get("id").and_then(serde_json::Value::as_str) == Some(did),
+                "did:web document id does not match requested DID"
+            );
+            return Ok(doc);
+        }
+        anyhow::bail!("unsupported ATProto account DID method")
+    }
+}
+
+struct DenyAtprotoDidDocumentResolver(String);
+
+#[async_trait::async_trait]
+impl AtprotoDidDocumentResolver for DenyAtprotoDidDocumentResolver {
+    async fn resolve_document(&self, _did: &str) -> anyhow::Result<serde_json::Value> {
+        anyhow::bail!("ATProto DID resolver is unavailable: {}", self.0)
+    }
+}
+
+fn atproto_did_resolver(config: &OAuthConfig) -> Arc<dyn AtprotoDidDocumentResolver> {
+    let build = (|| -> anyhow::Result<HttpAtprotoDidDocumentResolver> {
+        let ttl = Duration::from_secs(config.atproto_did_cache_ttl_secs);
+        let base = url::Url::parse(&config.atproto_plc_directory_url)?;
+        let plc_config = hyprstream_rpc::did_plc::PlcResolverConfig::new(base, ttl)?;
+        Ok(HttpAtprotoDidDocumentResolver {
+            plc: hyprstream_rpc::did_plc::DidPlcResolver::new(plc_config)?,
+            web: hyprstream_rpc::did_web::HttpDidDocFetcher::new(ttl)?,
+        })
+    })();
+    match build {
+        Ok(resolver) => Arc::new(resolver),
+        Err(error) => {
+            tracing::error!(%error, "ATProto DID resolver configuration rejected");
+            Arc::new(DenyAtprotoDidDocumentResolver(error.to_string()))
+        }
+    }
+}
+
 /// Extract RSA public key components (n, e) from PKCS#8 DER and build a JWK.
 ///
 /// Uses simple_asn1 (transitive dep of jsonwebtoken) for DER parsing.
@@ -904,6 +963,10 @@ pub struct OAuthState {
     /// Now backed by `user_service`. Legacy code uses `user_store_reader()`.
     /// Kept as Option for backward-compatible `is_none()` checks.
     pub user_service: Option<Arc<UserService>>,
+    /// Authority-owned hosted-account records used to resolve an ATProto DID
+    /// to its local tenant binding. `None` means every ATProto identity is
+    /// federated-only for tenant exchange purposes.
+    pub hosted_account_store: Option<Arc<hyprstream_pds_service::AccountRecordStore>>,
     /// Ed25519 signing key for signing entity configurations (OpenID Federation 1.0).
     /// `None` when not configured.
     pub signing_key: Option<ed25519_dalek::SigningKey>,
@@ -952,6 +1015,11 @@ pub struct OAuthState {
     /// the assertion's remaining `exp` lifetime. See
     /// `check_and_record_assertion_jti`.
     pub assertion_jti_seen: TtlCache<String, ()>,
+    /// One-use ATProto service-auth JTIs, namespaced by issuer and retained
+    /// until the source assertion expires.
+    pub atproto_service_jti_seen: TtlCache<String, ()>,
+    /// Validated did:plc/did:web document source for service-auth keys.
+    pub atproto_did_resolver: Arc<dyn AtprotoDidDocumentResolver>,
     /// Server-issued DPoP nonces. Value = expiry unix timestamp.
     pub dpop_nonces: RwLock<HashMap<String, i64>>,
     /// Per-client (keyed by DPoP `jkt` thumbprint) nonce-issuance state.
@@ -1095,6 +1163,7 @@ impl OAuthState {
                 .unwrap_or_default(),
             verifying_key_bytes,
             user_service: None,
+            hosted_account_store: None,
             signing_key: None,
             root_identity_key_store: None,
             authority_hints: config.authority_hints.clone(),
@@ -1114,6 +1183,11 @@ impl OAuthState {
                 Self::ASSERTION_JTI_MAX_ENTRIES,
                 Self::ASSERTION_JTI_REAP_BUDGET,
             ),
+            atproto_service_jti_seen: TtlCache::new(
+                Self::ASSERTION_JTI_MAX_ENTRIES,
+                Self::ASSERTION_JTI_REAP_BUDGET,
+            ),
+            atproto_did_resolver: atproto_did_resolver(config),
             dpop_nonces: RwLock::new(HashMap::new()),
             dpop_clients_seen: RwLock::new(HashMap::new()),
             trusted_issuers: config.trusted_issuers.clone(),
@@ -1140,6 +1214,48 @@ impl OAuthState {
     pub fn with_device_store(mut self, store: Arc<dyn crate::auth::DeviceStore>) -> Self {
         self.device_store = Some(store);
         self
+    }
+
+    /// Override ATProto DID resolution with a validated fixture or private resolver.
+    pub fn with_atproto_did_resolver(
+        mut self,
+        resolver: Arc<dyn AtprotoDidDocumentResolver>,
+    ) -> Self {
+        self.atproto_did_resolver = resolver;
+        self
+    }
+
+    /// Attach the authority-owned hosted-account record store.
+    pub fn with_hosted_account_store(
+        mut self,
+        store: Arc<hyprstream_pds_service::AccountRecordStore>,
+    ) -> Self {
+        self.hosted_account_store = Some(store);
+        self
+    }
+
+    /// Resolve a signed ATProto subject DID to its hosted local tenant.
+    ///
+    /// The request tenant is deliberately absent from this API. A missing
+    /// store or record is a federated-only identity (`Ok(None)`); store
+    /// corruption, authorization failure, and ambiguous bindings are errors.
+    pub async fn hosted_account_tenant(&self, did: &str) -> Result<Option<String>, String> {
+        let Some(store) = &self.hosted_account_store else {
+            return Ok(None);
+        };
+        store
+            .resolve_tenant_for_hosted_did(
+                &hyprstream_rpc::Subject::new("service:oauth"),
+                did,
+            )
+            .await
+            .map_err(|error| format!("hosted account tenant resolution failed: {error}"))
+    }
+
+    /// Host service DID accepted in ATProto service-auth `aud`.
+    pub fn atproto_service_did(&self) -> Option<String> {
+        super::did_document::issuer_authority(&self.issuer_url)
+            .map(|authority| format!("did:web:{authority}"))
     }
 
     /// Set JWT signing key validity window for the JWKS endpoint.
@@ -1385,6 +1501,25 @@ impl OAuthState {
         let ttl_secs = ((iat + 120) - now).max(0) as u64;
         self.dpop_jti_seen
             .insert_if_absent(jti.to_owned(), (), Duration::from_secs(ttl_secs))
+    }
+
+    /// Atomically consume an ATProto service-auth assertion identifier.
+    pub fn check_and_record_atproto_service_jti(
+        &self,
+        issuer: &str,
+        jti: &str,
+        exp: i64,
+    ) -> bool {
+        let remaining = exp - chrono::Utc::now().timestamp();
+        if remaining <= 0 {
+            return false;
+        }
+        let ttl_secs = remaining as u64;
+        self.atproto_service_jti_seen.insert_if_absent_no_evict(
+            format!("{issuer}\u{1f}{jti}"),
+            (),
+            Duration::from_secs(ttl_secs),
+        )
     }
 
     /// Check a client-assertion JTI for replay and record it if new
