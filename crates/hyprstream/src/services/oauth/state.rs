@@ -1249,7 +1249,9 @@ impl OAuthState {
         };
         store
             .resolve_tenant_for_hosted_did(
-                &hyprstream_rpc::Subject::new("service:oauth"),
+                &hyprstream_rpc::Subject::new(
+                    hyprstream_pds_service::OAUTH_ACCOUNT_RESOLVER_SUBJECT,
+                ),
                 did,
             )
             .await

@@ -2277,6 +2277,20 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    struct PermitFixtureAccountReads;
+
+    impl hyprstream_pds_service::AccountRecordReadAuthorizer for PermitFixtureAccountReads {
+        fn check_read(
+            &self,
+            _subject: &hyprstream_rpc::Subject,
+            _verified_tenant: Option<&str>,
+            _security_context: Option<&hyprstream_rpc::auth::mac::SecurityContext>,
+            _object_id: &str,
+        ) -> hyprstream_rpc::auth::mac::MacDecision {
+            hyprstream_rpc::auth::mac::MacDecision::Permit
+        }
+    }
+
     fn hosted_account_store(
         label: &str,
         zone: &str,
@@ -2319,9 +2333,10 @@ mod tests {
             ),
         );
         Ok(Arc::new(
-            hyprstream_pds_service::AccountRecordStore::new(Arc::new(
-                hyprstream_vfs::SyntheticMount::new(root),
-            )),
+            hyprstream_pds_service::AccountRecordStore::new(
+                Arc::new(hyprstream_vfs::SyntheticMount::new(root)),
+                Arc::new(PermitFixtureAccountReads),
+            ),
         ))
     }
 
