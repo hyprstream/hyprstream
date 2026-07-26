@@ -142,6 +142,59 @@ pub struct TorchEngine {
     // Note: Pre-training not supported (persistent_model doesn't expose VarStore), LoRA only
 }
 
+/// Tokenize `text` with `tokenizer`, writing no caller content to the process
+/// log.
+///
+/// Token-burn counts (prompt token count) are now emitted as OTel metrics at the
+/// call site (`TextStream::new_with_delta`), not as log lines (#1261) — the log
+/// is no longer the metering source. This helper logs only on the two
+/// content-free diagnostic outcomes: an empty token sequence (failure) and a
+/// tokenize/decode roundtrip mismatch (a real tokenizer-bug signal), in both
+/// cases carrying only bounded lengths, never the text.
+///
+/// #1253: the prompt and its decoded token text are tenant-private and must
+/// never reach process-wide logs — a shared inference process exposes them
+/// outside the caller's request boundary. This helper is split out from
+/// [`TorchEngine::tokenize`] so its no-leak behavior is unit-testable without
+/// a full engine/model.
+fn tokenize_redacted(tokenizer: &Tokenizer, text: &str) -> Result<Vec<i64>> {
+    let bytes = text.len();
+    let chars = text.chars().count();
+
+    let encoding = tokenizer
+        .encode(text, false)
+        .map_err(|e| anyhow!("Tokenization failed: {}", e))?;
+    let token_ids: Vec<i64> = encoding.get_ids().iter().map(|&id| id as i64).collect();
+
+    if token_ids.is_empty() {
+        tracing::warn!(bytes, chars, "Tokenization produced empty token sequence");
+        return Err(anyhow!(
+            "Tokenization produced empty token sequence ({} bytes, {} chars)",
+            bytes,
+            chars
+        ));
+    }
+
+    // Surface roundtrip mismatches for diagnosis, but never the original or
+    // decoded text — only that they diverged and the bounded lengths.
+    if let Ok(decoded) = tokenizer.decode(
+        &token_ids.iter().map(|&id| id as u32).collect::<Vec<_>>(),
+        false,
+    ) {
+        if decoded != text {
+            tracing::warn!(
+                bytes,
+                chars,
+                tokens = token_ids.len(),
+                decoded_bytes = decoded.len(),
+                "Tokenization roundtrip mismatch (content redacted)"
+            );
+        }
+    }
+
+    Ok(token_ids)
+}
+
 /// Helper functions for tensor operations
 impl TorchEngine {
     /// Set the random seed for deterministic generation
@@ -933,45 +986,17 @@ impl TorchEngine {
     }
 
     /// Tokenize text to input IDs - thread safe
+    ///
+    /// Only bounded, content-redacted metadata (byte/char length, token count)
+    /// is written to the process log. The prompt itself and its token text are
+    /// tenant-private and never logged (#1253).
     fn tokenize(&self, text: &str) -> Result<Vec<i64>> {
         let tokenizer_guard = self.tokenizer.lock();
         let tokenizer = tokenizer_guard
             .as_ref()
             .ok_or_else(|| anyhow!("Tokenizer not loaded. Call load_tokenizer() first."))?;
 
-        // Log the raw input for debugging prompt issues
-        tracing::info!("📝 Raw prompt before tokenization:\n{}", text);
-
-        let encoding = tokenizer
-            .encode(text, false)
-            .map_err(|e| anyhow!("Tokenization failed: {}", e))?;
-        let token_ids: Vec<i64> = encoding.get_ids().iter().map(|&id| id as i64).collect();
-
-        if token_ids.is_empty() {
-            return Err(anyhow!(
-                "Tokenization produced empty token sequence for text: '{}'",
-                text
-            ));
-        }
-
-        // Show tokenization details
-        tracing::debug!("Tokenized '{}' -> {} tokens: {:?}",
-            text.chars().take(100).collect::<String>(),
-            token_ids.len(),
-            token_ids
-        );
-
-        // Decode back to verify tokenization is correct
-        if let Ok(decoded) = tokenizer.decode(&token_ids.iter().map(|&id| id as u32).collect::<Vec<_>>(), false) {
-            if decoded != text {
-                tracing::warn!("⚠️  Tokenization roundtrip mismatch!\nOriginal: {}\nDecoded:  {}",
-                    text.chars().take(200).collect::<String>(),
-                    decoded.chars().take(200).collect::<String>()
-                );
-            }
-        }
-
-        Ok(token_ids)
+        tokenize_redacted(tokenizer, text)
     }
 
     /// Format text with dynamic chat template
@@ -1314,6 +1339,22 @@ impl TorchEngine {
             previous_tokens,
             penalty_exempt_tokens,
         )
+    }
+}
+
+impl TorchEngine {
+    /// Stable, content-free label identifying the loaded model for OTel metric
+    /// attributes (#1261). Prefers the model name (set on load); falls back to
+    /// architecture, then "unknown". Never the prompt or generated text.
+    fn model_label(&self) -> String {
+        let info = self.model_info.lock().clone();
+        if !info.name.is_empty() && info.name != "unloaded" {
+            info.name
+        } else if !info.architecture.is_empty() && info.architecture != "unknown" {
+            info.architecture
+        } else {
+            "unknown".to_owned()
+        }
     }
 }
 
@@ -2237,6 +2278,127 @@ impl Drop for TorchEngine {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use parking_lot::Mutex;
+    use std::io::Write;
+    use std::sync::Arc;
+
+    // ===== #1253: prompt/token text must never reach process logs =====
+
+    /// Distinctive canary planted in prompt inputs; the assertions below prove
+    /// it never appears in captured process logs.
+    const LEAK_CANARY: &str = "PROMPTLEAKCANARY7q3z";
+
+    /// Minimal in-memory WordLevel tokenizer (no model files needed). The canary
+    /// is a known vocab entry so it tokenizes cleanly on the success path; any
+    /// other word maps to `[UNK]`, exercising the roundtrip-mismatch path.
+    fn redact_test_tokenizer() -> Tokenizer {
+        const TOK_JSON: &str = r#"{"version":"1.0","truncation":null,"padding":null,"added_tokens":[],"normalizer":null,"pre_tokenizer":{"type":"Whitespace"},"post_processor":null,"decoder":null,"model":{"type":"WordLevel","vocab":{"hello":0,"world":1,"[UNK]":3,"PROMPTLEAKCANARY7q3z":7},"unk_token":"[UNK]"}}"#;
+        Tokenizer::from_bytes(TOK_JSON.as_bytes()).expect("valid in-memory tokenizer")
+    }
+
+    /// `tracing_subscriber` writer that buffers all output into a shared Vec.
+    struct CapturingWriter(Arc<Mutex<Vec<u8>>>);
+    impl Write for CapturingWriter {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Newtype wrapper so we can implement the foreign `MakeWriter` trait for a
+    /// local type (orphan rule).
+    #[derive(Clone)]
+    struct CaptureSink(Arc<Mutex<Vec<u8>>>);
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CaptureSink {
+        type Writer = CapturingWriter;
+        fn make_writer(&'a self) -> Self::Writer {
+            CapturingWriter(self.0.clone())
+        }
+    }
+
+    /// Run `f` under a thread-local TRACE subscriber whose output is captured.
+    /// TRACE is deliberate: #1253 forbids relocating prompt text to DEBUG, so
+    /// the canary must be absent even at the lowest log level.
+    fn capture_logs<F: FnOnce()>(f: F) -> String {
+        let sink = CaptureSink(Arc::new(Mutex::new(Vec::new())));
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_ansi(false)
+            .with_writer(sink.clone())
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        f();
+        // Drain the captured bytes into a local so the MutexGuard drops before
+        // `sink` itself (block-end drop order).
+        let cells = std::mem::take(&mut *sink.0.lock());
+        String::from_utf8(cells).unwrap()
+    }
+
+    /// #1253: a distinctive prompt secret must never appear in process logs,
+    /// regardless of tokenization outcome — success, empty-token failure, or
+    /// roundtrip mismatch.
+    ///
+    /// (Generation, stop, cancellation, and stream-error paths were audited:
+    /// after the #1261 redaction they log only positions/counts and error
+    /// objects — never prompt text, generated text, or token IDs, which are
+    /// reversible to text via the loaded tokenizer. Those paths require a full
+    /// model to drive, so the content-bearing tokenization outcomes — which are
+    /// exactly where the prompt is handled — are covered hermetically here.)
+    #[test]
+    fn tokenize_redacted_never_logs_prompt_content() {
+        let tokenizer = redact_test_tokenizer();
+
+        // --- success: every word is a known token ---
+        let logs = capture_logs(|| {
+            let ids = tokenize_redacted(&tokenizer, &format!("hello {LEAK_CANARY} world"));
+            assert_eq!(ids.unwrap().len(), 3);
+        });
+        assert!(
+            !logs.contains("Tokenized prompt"),
+            "success path must no longer emit a metering log line (token counts are OTel metrics now, #1261): {logs}"
+        );
+        assert!(
+            !logs.contains(LEAK_CANARY),
+            "prompt secret leaked into logs on success: {logs}"
+        );
+
+        // --- roundtrip mismatch: unknown word decodes to [UNK] ---
+        let logs = capture_logs(|| {
+            let ids = tokenize_redacted(&tokenizer, &format!("{LEAK_CANARY} zzz_unknown"));
+            // non-empty -> Ok, but the decode diverges -> mismatch warning
+            assert_eq!(ids.unwrap().len(), 2);
+        });
+        assert!(
+            logs.contains("roundtrip mismatch"),
+            "mismatch path must still emit bounded metadata: {logs}"
+        );
+        assert!(
+            !logs.contains(LEAK_CANARY),
+            "prompt secret leaked into logs on mismatch: {logs}"
+        );
+        assert!(
+            !logs.contains("zzz_unknown"),
+            "decoded token text leaked into logs on mismatch: {logs}"
+        );
+
+        // --- empty-token failure: 0 tokens (pure whitespace input) ---
+        // An input that carries the canary always yields >=1 token with this
+        // tokenizer, so the failure path is exercised with whitespace; we still
+        // assert it logs only bounded metadata ("empty token sequence") and no
+        // prompt content.
+        let logs = capture_logs(|| {
+            let res = tokenize_redacted(&tokenizer, "   ");
+            assert!(res.is_err(), "whitespace-only input must fail");
+        });
+        assert!(
+            logs.contains("empty token sequence"),
+            "failure path must still emit bounded metadata: {logs}"
+        );
+    }
 
     #[test]
     fn test_generation_config_in_engine_has_correct_max_tokens() {
@@ -2516,6 +2678,12 @@ pub struct TextStream<'a> {
     last_token_time: Option<std::time::Instant>,
     /// Exponential moving average of tokens per second
     ema_tokens_per_sec: f32,
+
+    /// Model label for OTel token-burn metric attributes (#1261).
+    model_label: String,
+    /// Opaque (hashed) tenant id for token-burn metric attributes — never the
+    /// raw request subject (#1253). `None` when no tenant is in scope.
+    tenant_hash: Option<u64>,
 }
 
 impl<'a> TextStream<'a> {
@@ -2533,6 +2701,15 @@ impl<'a> TextStream<'a> {
         let prompt_tokens = engine.tokenize(&request.prompt)?;
         let prompt_len = prompt_tokens.len();
 
+        // Token-burn metering (#1261): emit the prompt-token count at the
+        // tokenization boundary as an OTel metric. The raw tenant subject is never
+        // a metric attribute — it is reduced to an opaque hash (#1253); the
+        // authoritative spend ledger is #1264.
+        let tenant_hash = crate::runtime::token_metrics::opaque_tenant_id(&tenant_id);
+        let model_label = engine.model_label();
+        crate::runtime::token_metrics::global_meter()
+            .record_prompt(&model_label, tenant_hash, prompt_len as u64);
+
         let tokenizer = engine.get_tokenizer()?;
         let stop_token_ids: Vec<u32> = request.stop_tokens.as_deref().unwrap_or(&[])
             .iter()
@@ -2542,9 +2719,15 @@ impl<'a> TextStream<'a> {
                 if ids.len() == 1 {
                     Some(ids[0])
                 } else {
+                    // The stop sequence is caller-supplied content and is never
+                    // logged (#1253); only its byte length and resulting token
+                    // count are retained. The tenant is referenced only by its
+                    // opaque hash — the raw subject is dropped from logs.
                     tracing::warn!(
-                        "Stop token '{}' encodes to {} tokens, skipping (only single-token stops supported)",
-                        stop_str, ids.len()
+                        stop_bytes = stop_str.len(),
+                        encoded_tokens = ids.len(),
+                        tenant_hash = ?tenant_hash,
+                        "Stop token encodes to multiple tokens, skipping (only single-token stops supported; content redacted)"
                     );
                     None
                 }
@@ -2692,6 +2875,8 @@ impl<'a> TextStream<'a> {
             first_token_time: None,
             last_token_time: None,
             ema_tokens_per_sec: 0.0,
+            model_label,
+            tenant_hash,
         })
     }
 
@@ -2887,9 +3072,11 @@ impl<'a> TextStream<'a> {
             })?;
 
             if self.tokens_generated.is_multiple_of(50) {
+                // Counts/positions only — token IDs are reversible to text via the
+                // loaded tokenizer and must never hit process logs (#1253/#1261).
                 tracing::debug!(
-                    "🔵 KV cache position: {}, tokens_generated: {}, last_token: {}",
-                    self.kv_cache_position, self.tokens_generated, last_token
+                    "🔵 KV cache position: {}, tokens_generated: {}",
+                    self.kv_cache_position, self.tokens_generated
                 );
             }
 
@@ -3110,7 +3297,10 @@ impl<'a> Stream for TextStream<'a> {
 
             // Check EOS
             if self.engine.is_eos_token(next_token as usize) {
-                tracing::debug!("EOS token detected: {}", next_token);
+                tracing::debug!(
+                    "EOS token detected at generated position {}",
+                    self.tokens_generated
+                );
                 self.finished = true;
                 self.finish_reason = Some(FinishReason::EndOfSequence);
                 return Poll::Ready(None);
@@ -3118,7 +3308,12 @@ impl<'a> Stream for TextStream<'a> {
 
             // Check stop tokens
             if self.stop_token_ids.contains(&next_token) {
-                tracing::debug!("Stop token ID {} detected", next_token);
+                // Never log the matched stop-token ID: it identifies a
+                // caller-supplied stop string (#1253/#1261). Position only.
+                tracing::debug!(
+                    "Stop token matched at generated position {}",
+                    self.tokens_generated
+                );
                 self.finished = true;
                 self.finish_reason = Some(FinishReason::StopToken(format!("{next_token}")));
                 return Poll::Ready(None);
@@ -3142,13 +3337,10 @@ impl<'a> Stream for TextStream<'a> {
                         self.recent_tokens.pop_front();
                     }
 
-                    // DecodeStream returned text - emit it
-                    tracing::debug!(
-                        "Token {} -> text chunk (len={}): {:?}",
-                        next_token,
-                        text.len(),
-                        text
-                    );
+                    // DecodeStream returned text - emit it. The chunk text is
+                    // generated content and is never logged (#1253); generated-
+                    // token counts are now emitted as OTel metrics at completion
+                    // (#1261), so the per-chunk count log is dropped.
                     return Poll::Ready(Some(Ok(text)));
                 }
                 Ok(None) => {
@@ -3163,14 +3355,23 @@ impl<'a> Stream for TextStream<'a> {
                         self.recent_tokens.pop_front();
                     }
 
-                    // Simple trace without expensive tokenizer lock or decode
-                    tracing::trace!("Token {} -> buffering (incomplete UTF-8)", next_token);
+                    // Simple trace without expensive tokenizer lock or decode.
+                    // Counts/positions only — token IDs are reversible to text
+                    // and must never hit process logs (#1253/#1261).
+                    tracing::trace!(
+                        "Token at generated position {} buffering (incomplete UTF-8)",
+                        self.tokens_generated
+                    );
                     continue;
                 }
                 Err(e) => {
                     // CRITICAL: Do NOT update state on decode_stream error
                     // This prevents state corruption and keeps generation consistent
-                    tracing::error!("DecodeStream error on token {}: {}", next_token, e);
+                    tracing::error!(
+                        "DecodeStream error at generated position {}: {}",
+                        self.tokens_generated,
+                        e
+                    );
                     self.finished = true;
                     self.finish_reason = Some(FinishReason::Error(e.to_string()));
                     return Poll::Ready(Some(Err(anyhow::anyhow!("Decode error: {}", e))));
@@ -3185,5 +3386,18 @@ impl<'a> Drop for TextStream<'a> {
         // Save token IDs to the session cache for prefix matching on the next turn.
         // This runs on all exit paths (EOS, stop token, max tokens, timeout, error).
         self.save_cached_tokens();
+
+        // Token-burn metering (#1261): emit the generated-token count and the
+        // per-request total at completion. Drop runs on every exit path, so this
+        // covers normal EOS, stop-token, max-tokens, timeout, and error finishes.
+        // Only integer counts and the opaque tenant hash are metric attributes (#1253).
+        let generated = self.tokens_generated as u64;
+        let meter = crate::runtime::token_metrics::global_meter();
+        meter.record_generated(&self.model_label, self.tenant_hash, generated);
+        meter.record_request_total(
+            &self.model_label,
+            self.tenant_hash,
+            self.prompt_len as u64 + generated,
+        );
     }
 }
