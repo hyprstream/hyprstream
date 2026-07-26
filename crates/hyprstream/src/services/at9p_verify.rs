@@ -82,7 +82,7 @@ use crate::config::{At9pVerifyConfig, TlsConfig};
 use crate::server::tls::{resolve_rustls_config, serve_app};
 
 /// Service name for logging (not registered in the RPC mesh — see module docs).
-pub const SERVICE_NAME: &str = "at9p_verify";
+pub const SERVICE_NAME: &str = "at9p-verify";
 
 /// Default freshness window for a liveness proof (seconds, symmetric skew).
 pub const DEFAULT_MAX_SKEW_SECONDS: u64 = 300;
@@ -359,8 +359,9 @@ impl At9pVerifyService {
 
     fn http_addr(&self) -> Result<SocketAddr, RpcError> {
         let s = format!("{}:{}", self.config.host, self.config.port);
-        s.parse()
-            .map_err(|e| RpcError::SpawnFailed(format!("at9p_verify: invalid bind address: {e}")))
+        s.parse().map_err(|e| {
+            RpcError::SpawnFailed(format!("{SERVICE_NAME}: invalid bind address: {e}"))
+        })
     }
 }
 
@@ -383,7 +384,7 @@ impl Spawnable for At9pVerifyService {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
-            .map_err(|e| RpcError::SpawnFailed(format!("at9p_verify runtime: {e}")))?;
+            .map_err(|e| RpcError::SpawnFailed(format!("{SERVICE_NAME} runtime: {e}")))?;
 
         rt.block_on(async move {
             let addr = self.http_addr()?;
@@ -395,7 +396,7 @@ impl Spawnable for At9pVerifyService {
                 self.config.tls_key.as_ref(),
             )
             .await
-            .map_err(|e| RpcError::SpawnFailed(format!("at9p_verify TLS config: {e}")))?;
+            .map_err(|e| RpcError::SpawnFailed(format!("{SERVICE_NAME} TLS config: {e}")))?;
 
             let scheme = if rustls_config.is_some() { "https" } else { "http" };
             let state = VerifyFaceState {
@@ -463,6 +464,16 @@ mod tests {
             max_skew_seconds: 300,
             max_challenge_bytes: 256,
         }
+    }
+
+    #[test]
+    fn service_name_is_dns_safe_and_stable() {
+        assert_eq!(SERVICE_NAME, "at9p-verify");
+        assert!(
+            SERVICE_NAME
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-'),
+        );
     }
 
     /// POST a JSON body to the credential-free router and return (status, body).

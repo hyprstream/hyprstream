@@ -1344,7 +1344,7 @@ fn create_xet_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
 /// it registers nothing and depends on nothing. `SocketKind` has no `Http`
 /// variant and this face is not announceable — that is the #1135 design
 /// statement made concrete. See `services::at9p_verify` for the full rationale.
-#[service_factory("at9p_verify")]
+#[service_factory("at9p-verify")]
 fn create_at9p_verify_service(_ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>> {
     use crate::services::At9pVerifyService;
 
@@ -2231,6 +2231,21 @@ fn compute_tls_endorsement(
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn at9p_verify_factory_uses_canonical_service_name() {
+        let factory =
+            hyprstream_service::get_factory(crate::services::at9p_verify::SERVICE_NAME)
+                .expect("at9p-verify factory must be registered");
+        assert_eq!(factory.name, "at9p-verify");
+        assert!(
+            factory
+                .name
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-'),
+        );
+        assert!(hyprstream_service::get_factory("at9p_verify").is_none());
+    }
 
     /// Helper: generate an ECDSA P-256 key pair and return (pkcs8_der, public_key_der)
     fn generate_ecdsa_p256_pair() -> (Vec<u8>, Vec<u8>) {
