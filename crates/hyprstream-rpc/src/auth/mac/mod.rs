@@ -106,6 +106,11 @@ pub mod bind;
 pub mod context;
 // #1268: the mandatory RPC dispatch PEP — fail-closed gate between
 // verify_claims and handle_request in process_request.
+//
+// Native-only: the PEP consumes `crate::service::EnvelopeContext`, and the
+// `service` module is compiled out on wasm32 — the browser client does no
+// server-side dispatch MAC enforcement (same gate pattern as #1307).
+#[cfg(not(target_arch = "wasm32"))]
 pub mod dispatch_pep;
 pub mod genesis;
 pub mod label;
@@ -113,6 +118,7 @@ pub mod lattice;
 pub mod manifest;
 
 pub use bind::{clamp_descendant, BindLabel, BindLabelMap};
+#[cfg(not(target_arch = "wasm32"))]
 pub use dispatch_pep::{
     check_dispatch_mac, global_mac_dispatch_pep, install_mac_dispatch_pep, DefaultMacDispatchPep,
     DenyAllMacPep, DenyAllObjectResolver, MacDecision, MacDenyReason, MacDispatchPep,
