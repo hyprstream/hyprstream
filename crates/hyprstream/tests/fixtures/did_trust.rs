@@ -77,17 +77,21 @@ pub fn register_discovery_key(vk: ed25519_dalek::VerifyingKey) {
     );
 }
 
-pub fn deployment_domain(ca_vk: &ed25519_dalek::VerifyingKey) -> String {
-    hyprstream_rpc::auth::jwk_thumbprint(&hyprstream_rpc::auth::JwkThumbprintInput::Ed25519 {
-        x: ca_vk.as_bytes(),
-    })
+pub fn deployment_domain(ca: &SigningKey) -> String {
+    let ca_vk = ca.verifying_key();
+    let ca_pq = hyprstream_rpc::crypto::pq::ml_dsa_sk_from_seed(&ca.to_bytes());
+    let ca_pq_vk = hyprstream_rpc::crypto::pq::ml_dsa_vk_from_bytes(
+        &hyprstream_rpc::crypto::pq::ml_dsa_sk_to_vk_bytes(&ca_pq),
+    )
+    .expect("fixture ML-DSA-65 deployment CA");
+    hyprstream_rpc::auth::composite_kid(&ca_pq_vk, &ca_vk)
 }
 
 /// Mint a registry deployment credential with the exact production profile.
 pub fn mint_credential(ca: &SigningKey, registry: &SigningKey) -> String {
-    let domain = deployment_domain(&ca.verifying_key());
+    let domain = deployment_domain(ca);
     let now = chrono::Utc::now().timestamp();
-    let protected = json!({"alg": "EdDSA", "typ": "wit+jwt", "kid": domain});
+    let protected = json!({"alg": "ML-DSA-65-Ed25519", "typ": "wit+jwt", "kid": domain});
     let claims = json!({
         "iss": format!("urn:hyprstream:deployment:{domain}"),
         "sub": "service:registry",
@@ -106,8 +110,13 @@ pub fn mint_credential(ca: &SigningKey, registry: &SigningKey) -> String {
     let protected = URL_SAFE_NO_PAD.encode(protected.to_string().as_bytes());
     let claims = URL_SAFE_NO_PAD.encode(claims.to_string().as_bytes());
     let input = format!("{protected}.{claims}");
-    let sig = ca.sign(input.as_bytes());
-    format!("{input}.{}", URL_SAFE_NO_PAD.encode(sig.to_bytes()))
+    let ca_pq = hyprstream_rpc::crypto::pq::ml_dsa_sk_from_seed(&ca.to_bytes());
+    let pq_signature = hyprstream_rpc::crypto::pq::ml_dsa_sign(&ca_pq, input.as_bytes());
+    let ed_signature = ca.sign(input.as_bytes());
+    let mut composite_signature = Vec::with_capacity(3_309 + 64);
+    composite_signature.extend_from_slice(&pq_signature);
+    composite_signature.extend_from_slice(&ed_signature.to_bytes());
+    format!("{input}.{}", URL_SAFE_NO_PAD.encode(composite_signature))
 }
 
 pub struct CapsuleMaterial {
@@ -121,10 +130,10 @@ fn make_capsule_with_endpoint(
     endpoint: ServiceEndpoint,
 ) -> CapsuleMaterial {
     let ed = SigningKey::from_bytes(&[tag; 32]);
-    let (pq, pq_vk) = hyprstream_crypto::pq::ml_dsa_generate_keypair();
+    let pq = hyprstream_crypto::pq::ml_dsa_sk_from_seed(&ed.to_bytes());
     let pair = HybridKeyPair::new(
         ed.verifying_key().to_bytes().to_vec(),
-        hyprstream_crypto::pq::ml_dsa_vk_bytes(&pq_vk),
+        hyprstream_crypto::pq::ml_dsa_sk_to_vk_bytes(&pq),
     )
     .unwrap();
     let service = ServiceEntry::new("#ns", ServiceType::NinePExport, endpoint).unwrap();

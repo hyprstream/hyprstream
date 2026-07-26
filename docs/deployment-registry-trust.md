@@ -7,17 +7,19 @@ public setter, or a caller-provided path for this authority.
 
 The OS-owned deployment seam is deliberately small and fail-closed:
 
-- `/etc/hyprstream/trust/deployment-ca.ed25519` is the independently provisioned
-  32-byte Ed25519 deployment CA public key.
+- `/etc/hyprstream/trust/deployment-ca.hybrid` is the independently provisioned
+  1984-byte deployment CA public key: exactly 32 bytes of Ed25519 followed by
+  1952 bytes of ML-DSA-65. A legacy 32-byte Ed25519-only pin is rejected.
 - `/run/hyprstream/credentials/registry-service.jwt` is the separately
   provisioned, short-lived `service:registry` credential. Its `cnf.jwk` names the
   registry key that certifies accepted `did:at9p:<cid512>` state.
 
 Both files must be regular, root-owned, and not group/world writable. Missing,
 malformed, symlinked, or incorrectly owned material makes production resolver
-startup fail closed. The JWT is verified against the `/etc` pin before its key is
-represented by an opaque verification-only capability. The raw key and one-shot
-witness are not exposed through the public service or Discovery APIs.
+startup fail closed. Both JWT signature components are verified against the
+`/etc` pin before its key is represented by an opaque verification-only
+capability. The raw keys and one-shot witness are not exposed through the
+public service or Discovery APIs.
 
 The repository does not yet contain an operator enrollment protocol. Deployments
 using this OS-owned source must therefore provision the `/etc` pin through their
@@ -59,12 +61,13 @@ configured `did:web`. Only after both directions verify does startup accept the
 at9p identity as authoritative.
 
 The deployment CA and Discovery reach are taken from the GATE-verified capsule,
-never from the `did:web` document. The CA is the capsule's primary hybrid
-subject key's Ed25519 half (`body.subject_keys[0]`), and reach is the capsule's
-`#ns` `NinePExport` service, dialed by its independent iroh `nodeId` or signed
-QUIC socket carrier. The document contributes only the reciprocal identifier
-vouch; any keys or services it publishes are advisory and are never installed
-as trust material.
+never from the `did:web` document. The CA is both halves of the capsule's
+primary hybrid subject key (`body.subject_keys[0].ed25519Pub` and
+`body.subject_keys[0].mldsa65Pub`), and reach is the capsule's `#ns`
+`NinePExport` service, dialed by its independent iroh `nodeId` or signed QUIC
+socket carrier. Missing or malformed key material in either half fails closed.
+The document contributes only the reciprocal identifier vouch; any keys or
+services it publishes are advisory and are never installed as trust material.
 
 Capsule content only proves a content-bound reach claim, not that the endpoint
 is currently live. Startup therefore dials the capsule-derived Discovery
@@ -137,13 +140,15 @@ was lost; startup logs a loud warning and proceeds at genesis posture.
 ## Registry credential profile
 
 `registry-service.jwt` is a closed, one-hour-maximum deployment credential, not
-a generic JWT or access token. Let `D` be the RFC 7638 Ed25519 JWK thumbprint of
-the exact public key selected as the deployment CA (from
-`deployment-ca.ed25519` or the GATE-verified capsule). Provisioning
-must use the following profile exactly:
+a generic JWT or access token. Let `D` be the composite `kid` of the exact
+ML-DSA-65 + Ed25519 public-key pair selected as the deployment CA (from
+`deployment-ca.hybrid` or the GATE-verified capsule). It is the RFC 7638
+thumbprint of the AKP representation whose `alg` is `ML-DSA-65-Ed25519` and
+whose public bytes are `ML-DSA-65 || Ed25519`. Provisioning must use the
+following profile exactly:
 
 - The protected header contains only `alg`, `typ`, and `kid`, with values
-  `EdDSA`, `wit+jwt`, and `D`, respectively.
+  `ML-DSA-65-Ed25519`, `wit+jwt`, and `D`, respectively.
 - The claims object contains only `iss`, `sub`, `aud`, `exp`, `nbf`, `iat`,
   `deployment_domain`, `profile`, and `cnf`. `iss` is
   `urn:hyprstream:deployment:D`; `sub` is `service:registry`; `aud` is
@@ -158,6 +163,11 @@ must use the following profile exactly:
   permitted. The JWK contains only `kty: "OKP"`, `crv: "Ed25519"`, and `x`.
   `x` is canonical unpadded base64url for exactly 32 bytes and is the registry
   public key installed as the process's verification-only PDS authority.
+- The compact JWT signature segment decodes to exactly 3373 bytes:
+  `ML-DSA-65 signature (3309) || Ed25519 signature (64)`. Both components sign
+  the exact `base64url(protected) + "." + base64url(claims)` input and both
+  must verify against the pinned deployment CA. A missing, stripped, malformed,
+  or invalid component is rejected; there is no classical fallback.
 
 All JSON objects are parsed with duplicate-member rejection. Unknown members,
 optional JOSE/JWK metadata (`crit`, `use`, `key_ops`, or a JWK-local `alg` or
@@ -165,3 +175,8 @@ optional JOSE/JWK metadata (`crit`, `use`, `key_ops`, or a JWK-local `alg` or
 token types, and a signature or key identifier that does not bind the pinned CA
 fail closed before a registry witness can be minted. The credential file is the
 compact JWT itself with no surrounding whitespace or trailing newline.
+
+Classical-only atproto peer keys remain supported only at the separately named
+peer/federation record-resolution surface. That P-256 interoperability path
+does not construct the hybrid deployment root, cannot authenticate a deployment
+credential, and is never consulted by either deployment-root provider.

@@ -1505,19 +1505,78 @@ static PRODUCTION_RESOLVER: std::sync::OnceLock<Arc<DiscoveryServiceResolver>> =
 static PROCESS_REGISTRY_VERIFIER: std::sync::OnceLock<RegistryDeploymentVerifier> =
     std::sync::OnceLock::new();
 
-const DEPLOYMENT_CA_ROOT_PATH: &str = "/etc/hyprstream/trust/deployment-ca.ed25519";
+const DEPLOYMENT_CA_ROOT_PATH: &str = "/etc/hyprstream/trust/deployment-ca.hybrid";
 const REGISTRY_DEPLOYMENT_CREDENTIAL_PATH: &str =
     "/run/hyprstream/credentials/registry-service.jwt";
 const REGISTRY_DEPLOYMENT_CREDENTIAL_PROFILE: &str = "hyprstream.registry-deployment.v1";
 const REGISTRY_DEPLOYMENT_CREDENTIAL_AUDIENCE: &str = "urn:hyprstream:service:registry";
 const REGISTRY_DEPLOYMENT_CREDENTIAL_MAX_TTL_SECONDS: i64 = 3_600;
 const REGISTRY_DEPLOYMENT_CREDENTIAL_CLOCK_SKEW_SECONDS: i64 = 60;
+const ED25519_PUBLIC_KEY_BYTES: usize = 32;
+const ML_DSA_65_PUBLIC_KEY_BYTES: usize = 1_952;
+const DEPLOYMENT_CA_ROOT_BYTES: usize = ED25519_PUBLIC_KEY_BYTES + ML_DSA_65_PUBLIC_KEY_BYTES;
+const HYBRID_JWT_SIGNATURE_BYTES: usize = 3_309 + 64;
+
+/// Non-optional Ed25519 + ML-DSA-65 deployment trust root.
+///
+/// This type has no classical-only constructor. Both the OS-owned and
+/// DID-anchored providers must parse both halves before a registry credential
+/// can be authenticated.
+#[derive(Clone)]
+pub(crate) struct HybridDeploymentCa {
+    ed25519: VerifyingKey,
+    ml_dsa_65: hyprstream_rpc::crypto::pq::MlDsaVerifyingKey,
+}
+
+impl HybridDeploymentCa {
+    pub(crate) fn from_public_key_bytes(ed25519: &[u8], ml_dsa_65: &[u8]) -> Result<Self> {
+        let ed25519: [u8; ED25519_PUBLIC_KEY_BYTES] = ed25519
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("deployment CA Ed25519 key must be 32 bytes"))?;
+        let ed25519 = VerifyingKey::from_bytes(&ed25519)
+            .map_err(|error| anyhow::anyhow!("deployment CA Ed25519 key is malformed: {error}"))?;
+        let ml_dsa_65 =
+            hyprstream_rpc::crypto::pq::ml_dsa_vk_from_bytes(ml_dsa_65).map_err(|error| {
+                anyhow::anyhow!("deployment CA ML-DSA-65 key is malformed: {error}")
+            })?;
+        Ok(Self { ed25519, ml_dsa_65 })
+    }
+
+    fn from_os_pin(bytes: &[u8]) -> Result<Self> {
+        anyhow::ensure!(
+            bytes.len() == DEPLOYMENT_CA_ROOT_BYTES,
+            "deployment CA root must be exactly {DEPLOYMENT_CA_ROOT_BYTES} bytes \
+             (32-byte Ed25519 followed by 1952-byte ML-DSA-65)"
+        );
+        let (ed25519, ml_dsa_65) = bytes.split_at(ED25519_PUBLIC_KEY_BYTES);
+        Self::from_public_key_bytes(ed25519, ml_dsa_65)
+    }
+
+    fn domain(&self) -> String {
+        hyprstream_rpc::auth::composite_kid(&self.ml_dsa_65, &self.ed25519)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn ed25519_bytes(&self) -> [u8; ED25519_PUBLIC_KEY_BYTES] {
+        self.ed25519.to_bytes()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn ml_dsa_65_bytes(&self) -> Vec<u8> {
+        hyprstream_rpc::crypto::pq::ml_dsa_vk_bytes(&self.ml_dsa_65)
+    }
+}
 
 /// Opaque verification-only view of the authenticated deployment registry.
-/// It exposes neither the raw key nor an authority replacement operation.
+/// It exposes neither raw root material nor an authority replacement
+/// operation. Retaining the authenticated hybrid CA prevents this capability
+/// from being represented as provenance from a classical-only root.
 #[derive(Clone)]
 pub struct RegistryDeploymentVerifier {
     verifying_key: VerifyingKey,
+    // Retained as non-extractable provenance; the leading underscore is
+    // intentional because verification consumed it before construction.
+    _deployment_ca: Arc<HybridDeploymentCa>,
 }
 
 impl RegistryDeploymentVerifier {
@@ -1533,6 +1592,11 @@ impl RegistryDeploymentVerifier {
 
     pub fn matches(&self, key: &VerifyingKey) -> bool {
         self.verifying_key == *key
+    }
+
+    #[cfg(test)]
+    fn matches_deployment_root(&self, root: &HybridDeploymentCa) -> bool {
+        self._deployment_ca.domain() == root.domain()
     }
 }
 
@@ -1550,7 +1614,7 @@ struct AuthenticatedRegistryDeploymentIdentity {
 }
 
 struct TrustedRegistryDeploymentCredentials {
-    ca_verifying_key: VerifyingKey,
+    ca_verifying_key: HybridDeploymentCa,
     registry_credential: String,
 }
 
@@ -1724,10 +1788,8 @@ fn parse_unique_jwt_json(
     Ok(value.0)
 }
 
-fn deployment_domain(ca_verifying_key: &VerifyingKey) -> String {
-    hyprstream_rpc::auth::jwk_thumbprint(&hyprstream_rpc::auth::JwkThumbprintInput::Ed25519 {
-        x: ca_verifying_key.as_bytes(),
-    })
+fn deployment_domain(ca_verifying_key: &HybridDeploymentCa) -> String {
+    ca_verifying_key.domain()
 }
 
 fn validate_registry_credential_numeric_dates(
@@ -1767,7 +1829,7 @@ fn validate_registry_credential_numeric_dates(
 
 fn validate_registry_deployment_credential_profile(
     token: &str,
-    ca_verifying_key: &VerifyingKey,
+    ca_verifying_key: &HybridDeploymentCa,
 ) -> Result<[u8; 32]> {
     let mut segments = token.split('.');
     let protected_segment = segments.next().unwrap_or_default();
@@ -1777,13 +1839,17 @@ fn validate_registry_deployment_credential_profile(
         segments.next().is_none(),
         "credential must contain exactly three segments"
     );
-    decode_canonical_jwt_segment(signature_segment, "credential signature", 128)?;
+    let signature = decode_canonical_jwt_segment(signature_segment, "credential signature", 8_192)?;
+    anyhow::ensure!(
+        signature.len() == HYBRID_JWT_SIGNATURE_BYTES,
+        "credential signature must contain both ML-DSA-65 and Ed25519 components"
+    );
 
     let protected = parse_unique_jwt_json(protected_segment, "protected header", 4_096)?;
     let protected = exact_json_object(&protected, &["alg", "typ", "kid"], "protected header")?;
     anyhow::ensure!(
-        exact_string_member(protected, "alg", "protected header")? == "EdDSA",
-        "protected header alg must be exactly EdDSA"
+        exact_string_member(protected, "alg", "protected header")? == "ML-DSA-65-Ed25519",
+        "protected header alg must be exactly ML-DSA-65-Ed25519"
     );
     anyhow::ensure!(
         exact_string_member(protected, "typ", "protected header")? == "wit+jwt",
@@ -1863,12 +1929,16 @@ fn validate_registry_deployment_credential_profile(
 
     // Signature verification is deliberately last: no parsed material can mint
     // authority unless the exact closed profile is authenticated by the fixed CA.
-    let verified = hyprstream_rpc::auth::jwt::decode(
+    let dispatch = hyprstream_rpc::auth::jwt::parse_composite_dispatch(token, &["wit+jwt"])
+        .map_err(|error| anyhow::anyhow!("credential composite dispatch rejected: {error}"))?;
+    let verified = hyprstream_rpc::auth::jwt::decode_composite(
         token,
-        ca_verifying_key,
+        &ca_verifying_key.ml_dsa_65,
+        &ca_verifying_key.ed25519,
         Some(REGISTRY_DEPLOYMENT_CREDENTIAL_AUDIENCE),
+        &dispatch,
     )
-    .map_err(|error| anyhow::anyhow!("credential signature rejected: {error}"))?;
+    .map_err(|error| anyhow::anyhow!("credential hybrid signature rejected: {error}"))?;
     anyhow::ensure!(
         verified.sub == "service:registry" && verified.cnf_key_bytes() == Some(key),
         "verified credential differs from the exact deployment profile"
@@ -1927,12 +1997,7 @@ fn load_trusted_registry_deployment_credentials() -> Result<TrustedRegistryDeplo
         std::path::Path::new(DEPLOYMENT_CA_ROOT_PATH),
         "deployment CA root",
     )?;
-    let ca_bytes: [u8; 32] = ca_bytes
-        .as_slice()
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("deployment CA root must be 32 bytes"))?;
-    let ca_verifying_key = VerifyingKey::from_bytes(&ca_bytes)
-        .map_err(|error| anyhow::anyhow!("deployment CA root is malformed: {error}"))?;
+    let ca_verifying_key = HybridDeploymentCa::from_os_pin(&ca_bytes)?;
     let registry_credential = load_registry_deployment_credential()?;
     Ok(TrustedRegistryDeploymentCredentials {
         ca_verifying_key,
@@ -1951,7 +2016,10 @@ fn authenticate_registry_deployment_credentials(
     let verifying_key = VerifyingKey::from_bytes(&key_bytes)
         .map_err(|error| anyhow::anyhow!("registry credential key is malformed: {error}"))?;
     Ok(AuthenticatedRegistryDeploymentIdentity {
-        verifier: RegistryDeploymentVerifier { verifying_key },
+        verifier: RegistryDeploymentVerifier {
+            verifying_key,
+            _deployment_ca: Arc::new(credentials.ca_verifying_key),
+        },
     })
 }
 
@@ -2434,13 +2502,8 @@ impl RpcClient for ProductionRpcClient {
                 let o = options.clone();
                 let s = service.clone();
                 async move {
-                    c.call_with_options_for_service_with_method(
-                        &s,
-                        method_discriminator,
-                        p,
-                        o,
-                    )
-                    .await
+                    c.call_with_options_for_service_with_method(&s, method_discriminator, p, o)
+                        .await
                 }
             })
             .await?
@@ -2699,29 +2762,56 @@ mod resolver_tests {
         now.checked_add(offset).expect("test NumericDate offset")
     }
 
+    struct TestDeploymentCa {
+        ed25519: SigningKey,
+        ml_dsa_65: hyprstream_rpc::crypto::pq::MlDsaSigningKey,
+        verifying_keys: HybridDeploymentCa,
+    }
+
+    fn test_deployment_ca(tag: u8) -> TestDeploymentCa {
+        let ed25519 = SigningKey::from_bytes(&[tag; 32]);
+        let (ml_dsa_65, ml_dsa_65_vk) = hyprstream_rpc::crypto::pq::ml_dsa_generate_keypair();
+        let verifying_keys = HybridDeploymentCa::from_public_key_bytes(
+            ed25519.verifying_key().as_bytes(),
+            &hyprstream_rpc::crypto::pq::ml_dsa_vk_bytes(&ml_dsa_65_vk),
+        )
+        .expect("test hybrid deployment CA");
+        TestDeploymentCa {
+            ed25519,
+            ml_dsa_65,
+            verifying_keys,
+        }
+    }
+
     fn sign_registry_credential_json(
-        ca: &SigningKey,
+        ca: &TestDeploymentCa,
         protected_json: &str,
         claims_json: &str,
     ) -> String {
         let protected = URL_SAFE_NO_PAD.encode(protected_json.as_bytes());
         let claims = URL_SAFE_NO_PAD.encode(claims_json.as_bytes());
         let signing_input = format!("{protected}.{claims}");
-        let signature = ca.sign(signing_input.as_bytes());
-        format!(
-            "{signing_input}.{}",
-            URL_SAFE_NO_PAD.encode(signature.to_bytes())
-        )
+        let ml_dsa_signature =
+            hyprstream_rpc::crypto::pq::ml_dsa_sign(&ca.ml_dsa_65, signing_input.as_bytes());
+        let ed25519_signature = ca.ed25519.sign(signing_input.as_bytes());
+        let mut signature = Vec::with_capacity(HYBRID_JWT_SIGNATURE_BYTES);
+        signature.extend_from_slice(&ml_dsa_signature);
+        signature.extend_from_slice(&ed25519_signature.to_bytes());
+        format!("{signing_input}.{}", URL_SAFE_NO_PAD.encode(signature))
     }
 
     fn exact_registry_credential_values(
-        ca: &SigningKey,
+        ca: &TestDeploymentCa,
         registry: &SigningKey,
     ) -> (serde_json::Value, serde_json::Value) {
-        let domain = deployment_domain(&ca.verifying_key());
+        let domain = deployment_domain(&ca.verifying_keys);
         let now = chrono::Utc::now().timestamp();
         (
-            serde_json::json!({"alg":"EdDSA", "typ":"wit+jwt", "kid":domain}),
+            serde_json::json!({
+                "alg":"ML-DSA-65-Ed25519",
+                "typ":"wit+jwt",
+                "kid":domain
+            }),
             serde_json::json!({
                 "iss": format!("urn:hyprstream:deployment:{domain}"),
                 "sub": "service:registry",
@@ -2740,23 +2830,23 @@ mod resolver_tests {
         )
     }
 
-    fn exact_registry_credential(ca: &SigningKey, registry: &SigningKey) -> String {
+    fn exact_registry_credential(ca: &TestDeploymentCa, registry: &SigningKey) -> String {
         let (protected, claims) = exact_registry_credential_values(ca, registry);
         sign_registry_credential_json(ca, &protected.to_string(), &claims.to_string())
     }
 
     fn authenticate_test_registry_credential(
-        ca: &SigningKey,
+        ca: &TestDeploymentCa,
         credential: String,
     ) -> Result<AuthenticatedRegistryDeploymentIdentity> {
         authenticate_registry_deployment_credentials(TrustedRegistryDeploymentCredentials {
-            ca_verifying_key: ca.verifying_key(),
+            ca_verifying_key: ca.verifying_keys.clone(),
             registry_credential: credential,
         })
     }
 
     fn assert_registry_credential_rejected(
-        ca: &SigningKey,
+        ca: &TestDeploymentCa,
         protected: &serde_json::Value,
         claims: &serde_json::Value,
         case: &str,
@@ -2771,12 +2861,73 @@ mod resolver_tests {
 
     #[test]
     fn exact_registry_deployment_credential_installs_the_exact_bound_jwk() {
-        let ca = SigningKey::from_bytes(&[0x31; 32]);
+        let ca = test_deployment_ca(0x31);
         let registry = SigningKey::from_bytes(&[0x32; 32]);
         let witness =
             authenticate_test_registry_credential(&ca, exact_registry_credential(&ca, &registry))
                 .expect("exact deployment credential profile");
         assert!(witness.verifier.matches(&registry.verifying_key()));
+        assert!(
+            witness.verifier.matches_deployment_root(&ca.verifying_keys),
+            "registry verifier lost its hybrid deployment-root provenance"
+        );
+    }
+
+    #[test]
+    fn classical_only_deployment_root_and_credential_fail_closed() {
+        let classical_ca = SigningKey::from_bytes(&[0x41; 32]);
+        assert!(
+            HybridDeploymentCa::from_public_key_bytes(
+                classical_ca.verifying_key().as_bytes(),
+                &[],
+            )
+            .is_err(),
+            "classical-only deployment CA was accepted"
+        );
+        assert!(
+            HybridDeploymentCa::from_os_pin(classical_ca.verifying_key().as_bytes()).is_err(),
+            "legacy 32-byte classical root pin was accepted"
+        );
+
+        let ca = test_deployment_ca(0x42);
+        let registry = SigningKey::from_bytes(&[0x43; 32]);
+        let (protected, claims) = exact_registry_credential_values(&ca, &registry);
+        let protected = URL_SAFE_NO_PAD.encode(protected.to_string());
+        let claims = URL_SAFE_NO_PAD.encode(claims.to_string());
+        let signing_input = format!("{protected}.{claims}");
+        let classical_signature = ca.ed25519.sign(signing_input.as_bytes());
+        let classical_token = format!(
+            "{signing_input}.{}",
+            URL_SAFE_NO_PAD.encode(classical_signature.to_bytes())
+        );
+        assert!(
+            authenticate_test_registry_credential(&ca, classical_token).is_err(),
+            "classical-only credential was accepted beneath the hybrid root"
+        );
+    }
+
+    #[test]
+    fn hybrid_deployment_credential_requires_each_signature_half() {
+        let ca = test_deployment_ca(0x44);
+        let registry = SigningKey::from_bytes(&[0x45; 32]);
+        let credential = exact_registry_credential(&ca, &registry);
+        authenticate_test_registry_credential(&ca, credential.clone())
+            .expect("intact hybrid deployment credential");
+
+        let (signing_input, signature_segment) =
+            credential.rsplit_once('.').expect("credential signature");
+        let signature = URL_SAFE_NO_PAD
+            .decode(signature_segment)
+            .expect("hybrid signature");
+        for (case, index) in [("ML-DSA-65", 0usize), ("Ed25519", 3_309usize)] {
+            let mut corrupted = signature.clone();
+            corrupted[index] ^= 0x01;
+            let token = format!("{signing_input}.{}", URL_SAFE_NO_PAD.encode(corrupted));
+            assert!(
+                authenticate_test_registry_credential(&ca, token).is_err(),
+                "credential with invalid {case} half was accepted"
+            );
+        }
     }
 
     #[test]
@@ -2887,7 +3038,7 @@ mod resolver_tests {
 
     #[test]
     fn deployment_credential_rejects_signed_wraparound_lifetime_in_all_profiles() {
-        let ca = SigningKey::from_bytes(&[0x6a; 32]);
+        let ca = test_deployment_ca(0x6a);
         let registry = SigningKey::from_bytes(&[0x6b; 32]);
         let (protected, mut claims) = exact_registry_credential_values(&ca, &registry);
         claims["exp"] = serde_json::json!(checked_test_time(
@@ -2907,8 +3058,8 @@ mod resolver_tests {
 
     #[test]
     fn deployment_credential_rejects_every_protected_and_trust_dimension() {
-        let ca = SigningKey::from_bytes(&[0x33; 32]);
-        let other_ca = SigningKey::from_bytes(&[0x34; 32]);
+        let ca = test_deployment_ca(0x33);
+        let other_ca = test_deployment_ca(0x34);
         let registry = SigningKey::from_bytes(&[0x35; 32]);
         let (protected, claims) = exact_registry_credential_values(&ca, &registry);
 
@@ -2958,7 +3109,7 @@ mod resolver_tests {
 
     #[test]
     fn deployment_credential_rejects_every_claim_and_time_dimension() {
-        let ca = SigningKey::from_bytes(&[0x36; 32]);
+        let ca = test_deployment_ca(0x36);
         let registry = SigningKey::from_bytes(&[0x37; 32]);
         let (protected, claims) = exact_registry_credential_values(&ca, &registry);
         let now = chrono::Utc::now().timestamp();
@@ -3045,7 +3196,7 @@ mod resolver_tests {
 
     #[test]
     fn deployment_credential_rejects_every_confirmation_and_jwk_dimension() {
-        let ca = SigningKey::from_bytes(&[0x38; 32]);
+        let ca = test_deployment_ca(0x38);
         let registry = SigningKey::from_bytes(&[0x39; 32]);
         let (protected, claims) = exact_registry_credential_values(&ca, &registry);
 
@@ -3096,14 +3247,20 @@ mod resolver_tests {
 
     #[test]
     fn deployment_credential_duplicate_members_fail_closed_at_every_level() {
-        let ca = SigningKey::from_bytes(&[0x3a; 32]);
+        let ca = test_deployment_ca(0x3a);
         let registry = SigningKey::from_bytes(&[0x3b; 32]);
-        let domain = deployment_domain(&ca.verifying_key());
+        let domain = deployment_domain(&ca.verifying_keys);
         let (_, claims) = exact_registry_credential_values(&ca, &registry);
         let duplicate_headers = [
-            format!(r#"{{"alg":"EdDSA","alg":"ES256","typ":"wit+jwt","kid":"{domain}"}}"#),
-            format!(r#"{{"alg":"EdDSA","typ":"wit+jwt","typ":"at+jwt","kid":"{domain}"}}"#),
-            format!(r#"{{"alg":"EdDSA","typ":"wit+jwt","kid":"{domain}","kid":"attacker"}}"#),
+            format!(
+                r#"{{"alg":"ML-DSA-65-Ed25519","alg":"ES256","typ":"wit+jwt","kid":"{domain}"}}"#
+            ),
+            format!(
+                r#"{{"alg":"ML-DSA-65-Ed25519","typ":"wit+jwt","typ":"at+jwt","kid":"{domain}"}}"#
+            ),
+            format!(
+                r#"{{"alg":"ML-DSA-65-Ed25519","typ":"wit+jwt","kid":"{domain}","kid":"attacker"}}"#
+            ),
         ];
         for header in duplicate_headers {
             let token = sign_registry_credential_json(&ca, &header, &claims.to_string());
@@ -3113,7 +3270,11 @@ mod resolver_tests {
         let now = chrono::Utc::now().timestamp();
         let exp = checked_test_time(now, 3600);
         let x = URL_SAFE_NO_PAD.encode(registry.verifying_key().as_bytes());
-        let protected = serde_json::json!({"alg":"EdDSA", "typ":"wit+jwt", "kid":domain});
+        let protected = serde_json::json!({
+            "alg":"ML-DSA-65-Ed25519",
+            "typ":"wit+jwt",
+            "kid":domain
+        });
         for duplicate_claims in [
             format!(
                 r#"{{"iss":"urn:hyprstream:deployment:{domain}","sub":"service:registry","sub":"service:model","aud":"{REGISTRY_DEPLOYMENT_CREDENTIAL_AUDIENCE}","exp":{},"nbf":{now},"iat":{now},"deployment_domain":"{domain}","profile":"{REGISTRY_DEPLOYMENT_CREDENTIAL_PROFILE}","cnf":{{"jwk":{{"kty":"OKP","crv":"Ed25519","x":"{x}"}}}}}}"#,
@@ -3180,7 +3341,7 @@ mod resolver_tests {
         assert!(!production.contains("pub fn authenticate_discovery_bootstrap("));
         assert!(!production.contains("pub struct AuthenticatedDiscoveryBootstrap"));
         assert!(!production.contains("pub fn bootstrap_authenticated_process("));
-        assert!(production.contains("/etc/hyprstream/trust/deployment-ca.ed25519"));
+        assert!(production.contains("/etc/hyprstream/trust/deployment-ca.hybrid"));
         assert!(production.contains("/run/hyprstream/credentials/registry-service.jwt"));
         let loader = production
             .split("fn load_trusted_registry_deployment_credentials()")
@@ -3808,14 +3969,12 @@ mod resolver_tests {
         }
 
         let alternate = tempfile::tempdir().expect("alternate credential directory");
-        let ca = SigningKey::from_bytes(&[0x71; 32]);
+        let ca = test_deployment_ca(0x71);
         let registry = SigningKey::from_bytes(&[0x72; 32]);
         let jwt = exact_registry_credential(&ca, &registry);
-        std::fs::write(
-            alternate.path().join("ca-pubkey"),
-            ca.verifying_key().as_bytes(),
-        )
-        .expect("alternate CA");
+        let mut ca_pin = ca.verifying_keys.ed25519_bytes().to_vec();
+        ca_pin.extend_from_slice(&ca.verifying_keys.ml_dsa_65_bytes());
+        std::fs::write(alternate.path().join("ca-pubkey"), ca_pin).expect("alternate CA");
         std::fs::write(alternate.path().join("registry-service-jwt"), jwt)
             .expect("alternate registry JWT");
         let user_config = alternate.path().join("user-config");
@@ -3871,11 +4030,11 @@ mod resolver_tests {
                 attested_by: None,
             },
         );
-        let ca = SigningKey::from_bytes(&[0x62; 32]);
+        let ca = test_deployment_ca(0x62);
         let registry = SigningKey::from_bytes(&[0x63; 32]);
         let witness =
             authenticate_registry_deployment_credentials(TrustedRegistryDeploymentCredentials {
-                ca_verifying_key: ca.verifying_key(),
+                ca_verifying_key: ca.verifying_keys.clone(),
                 registry_credential: exact_registry_credential(&ca, &registry),
             })
             .expect("trusted pair");
@@ -5396,6 +5555,23 @@ mod get_record_tests {
     fn test_ctx() -> EnvelopeContext {
         // A genuine service-identity caller; subject() → "service:test-caller".
         EnvelopeContext::from_callback_service(1, "test-caller")
+    }
+
+    /// Classical atproto peer interoperability is an explicit federation-edge
+    /// surface. It remains P-256-only and does not construct, accept, or flow
+    /// through the hybrid deployment-root capability.
+    #[tokio::test]
+    async fn classical_atproto_peer_key_remains_on_separate_interop_surface() {
+        let (resolver, expected, _rkey, _record, _cid, _proof) = build_repo(1);
+        let published = resolver
+            .resolve_verifying_keys(TEST_DID)
+            .await
+            .expect("classical peer key resolution")
+            .expect("published classical atproto key");
+        let live = published
+            .live_keys(chrono::Utc::now().timestamp())
+            .collect::<Vec<_>>();
+        assert_eq!(live, vec![&expected]);
     }
 
     /// (a) An accessible record returns a valid CAR proof that verifies offline.
