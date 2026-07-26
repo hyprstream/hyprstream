@@ -9,6 +9,7 @@
 
 use crate::capnp::{FromCapnp, ToCapnp};
 use crate::common_capnp;
+use crate::identity::UNAUTHENTICATED_DID_SENTINEL;
 use anyhow::Result;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
@@ -545,8 +546,12 @@ impl Claims {
     /// Local tokens (issued by this node) produce bare subjects (`"alice"`)
     /// matching existing Casbin rules.  Federated tokens produce namespaced
     /// subjects (`"https://other.node:alice"`) to prevent cross-node spoofing.
+    ///
+    /// [`UNAUTHENTICATED_DID_SENTINEL`] is credential absence, not a principal.
+    /// Even a verified token carrying it therefore resolves to the
+    /// unauthenticated floor and can never authenticate as the sentinel.
     pub fn subject(&self, local_issuers: &[&str]) -> crate::envelope::Subject {
-        if self.sub.is_empty() {
+        if self.sub.is_empty() || self.sub == UNAUTHENTICATED_DID_SENTINEL {
             return crate::envelope::Subject::anonymous();
         }
         if self.is_local_to(local_issuers) {
@@ -795,6 +800,9 @@ mod tests {
         use crate::envelope::Subject;
         let claims = Claims::new("alice".to_owned(), 1000, 2000);
         assert_eq!(Subject::from(&claims), Subject::new("alice"));
+
+        let sentinel = Claims::new(UNAUTHENTICATED_DID_SENTINEL.to_owned(), 1000, 2000);
+        assert_eq!(Subject::from(&sentinel), Subject::anonymous());
     }
 
     #[test]
@@ -822,6 +830,8 @@ mod tests {
         let federated = Claims::new("bob".to_owned(), 0, 9999)
             .with_issuer("https://other.example.com".to_owned());
         let no_sub = Claims::new(String::new(), 0, 9999);
+        let sentinel = Claims::new(UNAUTHENTICATED_DID_SENTINEL.to_owned(), 0, 9999)
+            .with_issuer("https://node.example.com".to_owned());
 
         assert_eq!(
             local.subject(&["https://node.example.com"]),
@@ -832,6 +842,10 @@ mod tests {
             Subject::federated("https://other.example.com", "bob")
         );
         assert_eq!(no_sub.subject(&[]), Subject::anonymous());
+        assert_eq!(
+            sentinel.subject(&["https://node.example.com"]),
+            Subject::anonymous()
+        );
     }
 
     #[test]

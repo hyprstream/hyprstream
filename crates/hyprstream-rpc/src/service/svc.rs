@@ -9,6 +9,7 @@
 //! - Handlers receive `EnvelopeContext` with verified identity
 //! - Services use `ctx.subject()` for policy checks
 
+use crate::identity::UNAUTHENTICATED_DID_SENTINEL;
 use crate::prelude::*;
 use crate::transport::TransportConfig;
 use anyhow::Result;
@@ -885,6 +886,12 @@ pub trait RequestService: 'static {
         let Some(token) = token else {
             // No JWT — try trust store lookup for cached key bindings
             if let Some(subject) = self.resolve_key_subject(&ctx.cnf) {
+                if subject.name() == Some(UNAUTHENTICATED_DID_SENTINEL) {
+                    tracing::warn!(
+                        "Ignored reserved unauthenticated subject from signer-key resolver"
+                    );
+                    return Ok(());
+                }
                 ctx.key_derived_subject = subject;
                 return Ok(());
             }
@@ -1116,6 +1123,12 @@ pub trait RequestService: 'static {
         }
 
         // Store verified claims on context for downstream use
+        if verified.sub == UNAUTHENTICATED_DID_SENTINEL {
+            tracing::warn!("Rejected JWT whose subject is the reserved unauthenticated sentinel");
+            anyhow::bail!(
+                "{UNAUTHENTICATED_DID_SENTINEL} is credential absence and cannot authenticate"
+            );
+        }
         let local_issuers = key_source.local_issuers();
         let local_issuers_refs: Vec<&str> = local_issuers.iter().map(String::as_str).collect();
         // Fu5/#677: MAC clearance is authority-asserted and honored only from
@@ -1160,8 +1173,10 @@ pub trait RequestService: 'static {
                     };
                     let subject_str = claims.subject(&local_issuers_refs);
                     if let Some(subject_name) = subject_str.name() {
-                        self.cache_key_binding(vk, subject_name, &token, claims.exp);
-                        tracing::info!(subject = %subject_name, "Cached key binding in trust store");
+                        if subject_name != UNAUTHENTICATED_DID_SENTINEL {
+                            self.cache_key_binding(vk, subject_name, &token, claims.exp);
+                            tracing::info!(subject = %subject_name, "Cached key binding in trust store");
+                        }
                     }
                 } else if let Some(jkt) = claims.cnf_jkt() {
                     // R2b: DPoP path — JWT has cnf.jkt (thumbprint) instead of cnf.jwk.
@@ -1185,8 +1200,10 @@ pub trait RequestService: 'static {
                     };
                     let subject_str = claims.subject(&local_issuers_refs);
                     if let Some(subject_name) = subject_str.name() {
-                        self.cache_key_binding(vk, subject_name, &token, claims.exp);
-                        tracing::info!(subject = %subject_name, "Cached key binding from cnf.jkt");
+                        if subject_name != UNAUTHENTICATED_DID_SENTINEL {
+                            self.cache_key_binding(vk, subject_name, &token, claims.exp);
+                            tracing::info!(subject = %subject_name, "Cached key binding from cnf.jkt");
+                        }
                     }
                 } else if self.require_cnf_binding() {
                     tracing::warn!("JWT missing cnf binding (jwk or jkt): sub={}", claims.sub);
@@ -1412,6 +1429,7 @@ mod empty_iss_gate_tests {
         key_source: std::sync::Arc<dyn crate::auth::JwtKeySource>,
         policy: crate::crypto::CryptoPolicy,
         relay: Option<[u8; 32]>,
+        cached_subjects: std::sync::Arc<parking_lot::Mutex<Vec<String>>>,
     }
 
     #[async_trait(?Send)]
@@ -1449,6 +1467,15 @@ mod empty_iss_gate_tests {
         }
         fn accept_delegated_bearer(&self, signer_pubkey: &[u8; 32]) -> bool {
             self.relay.as_ref() == Some(signer_pubkey)
+        }
+        fn cache_key_binding(
+            &self,
+            _verifying_key: ed25519_dalek::VerifyingKey,
+            subject: &str,
+            _jwt: &str,
+            _expires_at: i64,
+        ) {
+            self.cached_subjects.lock().push(subject.to_owned());
         }
     }
 
@@ -1489,6 +1516,7 @@ mod empty_iss_gate_tests {
             key_source,
             policy: crate::crypto::CryptoPolicy::Classical,
             relay: None,
+            cached_subjects: std::sync::Arc::default(),
         };
         (svc, ca)
     }
@@ -1555,6 +1583,50 @@ mod empty_iss_gate_tests {
     }
 
     #[tokio::test]
+    async fn verified_local_did_unknown_jwt_cannot_authenticate() {
+        let (svc, ca) = mock_service();
+        let now = chrono::Utc::now().timestamp();
+        let claims = Claims::new(UNAUTHENTICATED_DID_SENTINEL.to_owned(), now, now + 3600)
+            .with_tenant("attacker-tenant".to_owned());
+        let token = crate::auth::jwt::encode(&claims, &ca);
+        let mut ctx = ctx_with_token(token, /* is_local_caller */ true);
+
+        let error = svc
+            .verify_claims(&mut ctx)
+            .await
+            .expect_err("the credential-absence sentinel must not authenticate");
+
+        assert!(
+            error.to_string().contains("cannot authenticate"),
+            "{error:#}"
+        );
+        assert!(ctx.subject().is_anonymous());
+        assert!(ctx.claims().is_none());
+        assert_eq!(ctx.verified_tenant(), None);
+    }
+
+    #[tokio::test]
+    async fn did_unknown_cnf_signer_is_never_cached() {
+        let (svc, ca) = mock_service();
+        let signer = SigningKey::from_bytes(&[0x71; 32]);
+        let now = chrono::Utc::now().timestamp();
+        let claims = Claims::new(UNAUTHENTICATED_DID_SENTINEL.to_owned(), now, now + 3600)
+            .with_cnf_jwk(signer.verifying_key().as_bytes());
+        let token = crate::auth::jwt::encode(&claims, &ca);
+        let mut ctx = ctx_with_token(token, /* is_local_caller */ true);
+        ctx.cnf = signer.verifying_key().to_bytes();
+
+        svc.verify_claims(&mut ctx)
+            .await
+            .expect_err("the sentinel token must be rejected before cnf caching");
+
+        assert!(
+            svc.cached_subjects.lock().is_empty(),
+            "no signer may be cached for did:unknown"
+        );
+    }
+
+    #[tokio::test]
     async fn delegated_bearer_is_denied_by_default() {
         let (svc, ca) = mock_service();
         let token = empty_iss_token(&ca);
@@ -1608,6 +1680,7 @@ mod empty_iss_gate_tests {
             key_source,
             policy: crate::crypto::CryptoPolicy::Classical,
             relay: None,
+            cached_subjects: std::sync::Arc::default(),
         };
         let now = chrono::Utc::now().timestamp();
         let claims = Claims::new("alice".to_owned(), now, now + 3600)
@@ -1643,6 +1716,7 @@ mod empty_iss_gate_tests {
             key_source,
             policy: crate::crypto::CryptoPolicy::Classical,
             relay: None,
+            cached_subjects: std::sync::Arc::default(),
         };
         let now = chrono::Utc::now().timestamp();
         let claims = Claims::new("alice".to_owned(), now, now + 3600)
@@ -1737,6 +1811,7 @@ mod empty_iss_gate_tests {
             key_source,
             policy: crate::crypto::CryptoPolicy::Hybrid,
             relay: None,
+            cached_subjects: std::sync::Arc::default(),
         };
         let now = chrono::Utc::now().timestamp();
         let claims =
@@ -2036,6 +2111,37 @@ mod ipc_key_identity_tests {
         // Fail-closed: no registered binding → anonymous → still denied writes.
         assert!(ctx.subject().is_anonymous());
         assert_eq!(ctx.subject().to_string(), "anonymous");
+    }
+
+    #[tokio::test]
+    async fn no_jwt_recovery_cannot_resurrect_did_unknown() {
+        let _guard = RESOLVER_LOCK.lock().await;
+
+        let caller_pub = SigningKey::from_bytes(&[55u8; 32])
+            .verifying_key()
+            .to_bytes();
+        let mut bindings = HashMap::new();
+        bindings.insert(
+            caller_pub,
+            crate::identity::UNAUTHENTICATED_DID_SENTINEL.to_owned(),
+        );
+        set_key_resolver(std::sync::Arc::new(MapResolver { bindings }));
+
+        let svc = PlainService {
+            signing_key: SigningKey::from_bytes(&[22u8; 32]),
+            transport: TransportConfig::inproc("discovery"),
+        };
+        let mut ctx = ctx_for_signer(caller_pub);
+
+        svc.verify_claims(&mut ctx)
+            .await
+            .expect("reserved recovery binding must collapse to the unauthenticated floor");
+
+        assert!(ctx.subject().is_anonymous());
+        assert_ne!(
+            ctx.subject().name(),
+            Some(crate::identity::UNAUTHENTICATED_DID_SENTINEL)
+        );
     }
 }
 

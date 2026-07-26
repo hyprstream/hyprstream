@@ -23,6 +23,7 @@
 
 use dashmap::DashMap;
 use ed25519_dalek::VerifyingKey;
+use hyprstream_rpc::identity::UNAUTHENTICATED_DID_SENTINEL;
 use std::collections::HashSet;
 use std::sync::Arc;
 use tracing;
@@ -78,6 +79,13 @@ impl TrustStore {
     /// expires later. Otherwise the existing entry is kept (prevents downgrade).
     /// Logs a warning on equal-expiry discard.
     pub fn insert(&self, key: VerifyingKey, attestation: Attestation) {
+        if attestation.subject.as_deref() == Some(UNAUTHENTICATED_DID_SENTINEL) {
+            tracing::warn!(
+                key = ?key.to_bytes()[..4],
+                "Trust store: rejected reserved unauthenticated subject binding"
+            );
+            return;
+        }
         let subject_debug = attestation.subject.as_deref().unwrap_or("<scope-derived>").to_owned();
         let scopes_debug: Vec<String> = attestation.scopes.iter().cloned().collect();
         let expires_debug = attestation.expires_at;
@@ -209,6 +217,13 @@ impl TrustStore {
         let att = self.get(&vk)?;
         // User keys: explicit subject
         if let Some(ref subject) = att.subject {
+            if subject == UNAUTHENTICATED_DID_SENTINEL {
+                tracing::warn!(
+                    key = ?vk.to_bytes()[..4],
+                    "Trust store: ignored legacy reserved unauthenticated subject binding"
+                );
+                return None;
+            }
             return Some(hyprstream_rpc::envelope::Subject::new(subject.clone()));
         }
         // Service keys: derive from scope
@@ -337,6 +352,25 @@ mod tests {
 
         assert!(store.is_authorized(&key, "model"));
         assert!(!store.is_authorized(&key, "policy"));
+    }
+
+    #[test]
+    fn reserved_unauthenticated_subject_is_neither_cached_nor_recovered() {
+        let store = TrustStore::new();
+        let (_, key) = random_key();
+        let mut sentinel = make_attestation(&[], chrono::Utc::now().timestamp() + 3600);
+        sentinel.subject = Some(UNAUTHENTICATED_DID_SENTINEL.to_owned());
+
+        store.insert(key, sentinel.clone());
+        assert!(
+            store.get(&key).is_none(),
+            "public insertion must reject did:unknown"
+        );
+
+        // Simulate a legacy/corrupt cache entry written before the insertion
+        // guard existed. Resolution must still refuse to resurrect it.
+        store.inner.insert(key, sentinel);
+        assert_eq!(store.resolve_subject(&key.to_bytes()), None);
     }
 
     /// #441 invariant: authoritative service-key resolution.
