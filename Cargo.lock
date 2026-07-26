@@ -7182,12 +7182,16 @@ name = "hyprstream-pds-service"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "ed25519-dalek 2.2.0",
  "hyprstream-crypto",
  "hyprstream-pds",
  "hyprstream-rpc",
  "hyprstream-vfs",
+ "parking_lot 0.12.4",
  "rand 0.8.5",
+ "serde",
+ "serde_json",
  "thiserror 1.0.69",
  "tokio",
 ]

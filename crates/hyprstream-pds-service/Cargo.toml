@@ -8,9 +8,13 @@ description = "Tenant-scoped PDS account record service over the Hyprstream 9P m
 
 [dependencies]
 anyhow = { workspace = true }
+async-trait = { workspace = true }
 hyprstream-pds = { path = "../hyprstream-pds" }
 hyprstream-rpc = { path = "../hyprstream-rpc" }
 hyprstream-vfs = { path = "../hyprstream-vfs" }
+parking_lot = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]

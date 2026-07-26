@@ -51,6 +51,15 @@ pub struct Did(String);
 /// (`at9p_gate`) so the literal cannot drift across the three arms (D2/#964).
 pub const DID_AT9P_PREFIX: &str = "did:at9p:";
 
+/// Reserved sentinel naming the credential-absence floor.
+///
+/// This string is not a DID subject: it has no keys, document, genesis
+/// operation, hosted account, or local tenant. Clients cannot authenticate as
+/// it; servers apply the unauthenticated floor only when no credential is
+/// presented. Identity directories, federation intake, and inventory read
+/// models must reject or omit it rather than treating it as a real identity.
+pub const UNAUTHENTICATED_DID_SENTINEL: &str = "did:unknown";
+
 impl Did {
     /// Wrap a DID string verbatim. **No validation** — strict checks belong at the
     /// admission gate (see the type docs).

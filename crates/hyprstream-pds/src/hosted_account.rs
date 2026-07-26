@@ -38,6 +38,7 @@ use crate::did_op::{
     UnsignedGenesisDidOp,
 };
 use crate::hosted_did_document::SealedHostedDidDocument;
+use hyprstream_rpc::identity::UNAUTHENTICATED_DID_SENTINEL;
 
 /// Version of the durable hosted-account record.
 pub const ACCOUNT_RECORD_VERSION: u16 = 1;
@@ -76,6 +77,10 @@ impl AllocatedAccountName {
     }
 
     fn validate(&self) -> Result<()> {
+        ensure!(
+            self.did != UNAUTHENTICATED_DID_SENTINEL,
+            "{UNAUTHENTICATED_DID_SENTINEL} is reserved for the unauthenticated floor and cannot be registered or minted"
+        );
         ensure!(!self.label.is_empty(), "allocated account label is empty");
         ensure!(
             self.label.len() <= 63,
@@ -1022,6 +1027,15 @@ mod tests {
             "did:web:alice.example.acct.example.com"
         )
         .is_err());
+    }
+
+    #[test]
+    fn unauthenticated_sentinel_cannot_be_registered_or_minted() {
+        let error = AllocatedAccountName::new("unknown", UNAUTHENTICATED_DID_SENTINEL).unwrap_err();
+        assert!(
+            error.to_string().contains("cannot be registered or minted"),
+            "{error:#}"
+        );
     }
 
     #[test]

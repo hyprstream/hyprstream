@@ -496,13 +496,11 @@ impl FromStr for Subject {
 
 impl From<&Claims> for Subject {
     fn from(claims: &Claims) -> Self {
-        // Phase 7: Federated subjects use "iss:sub" format so that
-        // "alice@node-a" and local "alice" never collide in Casbin policy.
-        if claims.iss.is_empty() {
-            Subject::new(claims.sub.clone())
-        } else {
-            Subject::federated(&claims.iss, &claims.sub)
-        }
+        // Keep every claims→subject entry point on Claims::subject(), including
+        // its reserved unauthenticated-sentinel handling. With no configured
+        // local issuers, empty `iss` remains local and non-empty `iss` remains
+        // federated, preserving this conversion's prior routing behavior.
+        claims.subject(&[])
     }
 }
 
