@@ -1,10 +1,17 @@
 name: Rust
 
+# Triggers (see #1331): pull_request runs the fast PR checks (clippy/wasm/deny/
+# loopback); merge_group runs the sole required heavy `build` against the
+# synthetic merge candidate (the exact landing commit only once the gate passes
+# — it is NOT landed yet at test time); workflow_dispatch lets an operator
+# request full validation of any ref. A push to `main` is intentionally NOT a
+# trigger — once the merge-group gate passes, GitHub performs the landing push,
+# and firing this workflow again on that push would only duplicate the
+# self-hosted build and re-run the fast checks for nothing.
 on:
-  push:
-    branches: [ "main" ]
   pull_request:
   merge_group:
+  workflow_dispatch:
 
 # id-token: write lets jobs mint an OIDC token to assume the sccache S3 role
 # (AWS_SCCACHE_ROLE_ARN). No long-lived AWS secrets live in the repo — the role
@@ -98,6 +105,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v4
+      # This checkout runs repo-controlled code below (cargo-deny reads deny.toml;
+      # the #1331 matrix gate runs scripts/check_rust_workflow_matrix.py). Do NOT
+      # persist the GITHUB_TOKEN in .git/config — closes the artipacked vector
+      # (zizmor, CodeRabbit), matching the loopback-burndown job.
+      with:
+        persist-credentials: false
     - name: Install cargo-deny
       uses: taiki-e/install-action@v2
       with:
@@ -110,6 +123,15 @@ jobs:
       run: |
         unset RUSTC_WRAPPER
         cargo deny check bans licenses
+    - name: Static workflow-matrix regression (#1331)
+      # Pure static YAML inspection — no network, no build, no runner. Locks the
+      # Rust workflow to the trigger/job matrix introduced by #1331 (no push-to-
+      # main duplicate run; workflow_dispatch for operator full validation) and
+      # pins the corrected AppImage-trigger comment. Runs on every event this
+      # job sees (PR, merge_group, workflow_dispatch) so a regression cannot
+      # slip past the merge gate. Must be able to fail — do NOT add `|| true`.
+      run: |
+        python3 scripts/check_rust_workflow_matrix.py
 
   loopback-burndown:
     name: Loopback-literal burn-down (#1152 W4)
@@ -122,7 +144,7 @@ jobs:
     # Advisory-only on the merge queue: `build` is the sole required merge-group
     # check (see the note on the preflight build job). Running this ratchet on
     # merge_group made a non-required shrink fail the group and livelock the queue;
-    # keep it on PR/push where it advises, matching the other non-required jobs.
+    # keep it on PR/manual-dispatch where it advises, matching the other non-required jobs.
     if: github.event_name != 'merge_group'
     runs-on: ubuntu-latest
     steps:
@@ -177,11 +199,16 @@ jobs:
 
   build:
     # MERGE GATE — not a per-PR-push check. The heavy build+test runs in the merge
-    # queue (`merge_group`) against latest main + the PR, and on push to `main` — but
-    # NOT on every PR push. PR review keeps the fast jobs (clippy/deny/wasm) for quick
-    # feedback; `build` is the required check enforced by the `protection` ruleset's
-    # merge queue. (Per-PR AppImage artifacts were dropped with the PR build; the
-    # `appimage.yml` workflow still builds the AppImage on push to `main`.)
+    # queue (`merge_group`) against the synthetic merge candidate (latest main + the
+    # PR — the exact landing commit only once this gate passes), and on
+    # `workflow_dispatch` for operator-requested full validation — but NOT on every
+    # PR push, and NOT on a push to `main` either: the post-merge duplicate run was
+    # removed in #1331 because the merge-group gate already validated the candidate
+    # that GitHub then lands. PR review keeps the fast jobs (clippy/deny/wasm) for
+    # quick feedback; `build` is the required check enforced by the `protection`
+    # ruleset's merge queue. AppImage artifacts are produced by `appimage.yml` on a
+    # nightly schedule, on `v*` tags, and on manual dispatch — never on a push to
+    # `main`.
     if: github.event_name != 'pull_request'
     # MERGE GATE runs on the self-hosted Graviton (arm64) fleet, INSIDE the
     # prebuilt rust-builder container via `podman run` — the same layer clippy +
