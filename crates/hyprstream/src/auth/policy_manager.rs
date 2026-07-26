@@ -33,7 +33,11 @@
 
 use crate::auth::policy_templates::{base_policies_to_csv, base_policies_to_vec, ServiceGrouping, ServicePolicyRule};
 use crate::auth::Operation;
-use casbin::{CoreApi, DefaultModel, Enforcer, FileAdapter, MemoryAdapter, MgmtApi, RbacApi};
+use casbin::function_map::{dynamic_to_str, OperatorFunction};
+use casbin::rhai::Dynamic;
+use casbin::{
+    CoreApi, DefaultModel, Enforcer, FileAdapter, MemoryAdapter, MgmtApi, RbacApi,
+};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 use thiserror::Error;
@@ -93,6 +97,96 @@ pub fn federation_registration_resource(origin: &str) -> Result<String, PolicyEr
     let resource = format!("{FEDERATION_REGISTER_RESOURCE_PREFIX}{origin}");
     validate_policy_component(&resource, "federation registration resource")?;
     Ok(resource)
+}
+
+fn federation_origin_pattern_matches(request_origin: &str, policy_origin: &str) -> bool {
+    if request_origin == policy_origin {
+        return true;
+    }
+    if policy_origin.matches('*').count() != 1 {
+        return false;
+    }
+
+    let Some((scheme, authority_pattern)) = policy_origin.split_once("://") else {
+        return false;
+    };
+    let Some(authority_suffix) = authority_pattern.strip_prefix("*.") else {
+        return false;
+    };
+    if authority_suffix.contains('*') {
+        return false;
+    }
+
+    // Substitute a valid DNS label so URL parsing can validate the scheme,
+    // authority, and optional port without ever evaluating an operator-provided
+    // glob as executable matcher syntax.
+    let Ok(policy_url) = url::Url::parse(&format!("{scheme}://wildcard.{authority_suffix}")) else {
+        return false;
+    };
+    let Ok(request_url) = url::Url::parse(request_origin) else {
+        return false;
+    };
+    if policy_url.path() != "/"
+        || request_url.path() != "/"
+        || policy_url.query().is_some()
+        || request_url.query().is_some()
+        || policy_url.fragment().is_some()
+        || request_url.fragment().is_some()
+        || !policy_url.username().is_empty()
+        || !request_url.username().is_empty()
+        || policy_url.password().is_some()
+        || request_url.password().is_some()
+        || policy_url.scheme() != request_url.scheme()
+        || policy_url.port_or_known_default() != request_url.port_or_known_default()
+    {
+        return false;
+    }
+
+    let Some(policy_host) = policy_url.host_str() else {
+        return false;
+    };
+    let Some(host_suffix) = policy_host.strip_prefix("wildcard.") else {
+        return false;
+    };
+    let Some(request_host) = request_url.host_str() else {
+        return false;
+    };
+    request_host
+        .strip_suffix(host_suffix)
+        .is_some_and(|prefix| !prefix.is_empty() && prefix.ends_with('.'))
+}
+
+fn federation_resource_matches(request_resource: &str, policy_resource: &str) -> bool {
+    if policy_resource == "*" {
+        return true;
+    }
+    let Some(request_origin) = request_resource.strip_prefix(FEDERATION_REGISTER_RESOURCE_PREFIX)
+    else {
+        return false;
+    };
+    let Some(policy_origin) = policy_resource.strip_prefix(FEDERATION_REGISTER_RESOURCE_PREFIX)
+    else {
+        return false;
+    };
+    if policy_origin == "*" {
+        return true;
+    }
+    federation_origin_pattern_matches(request_origin, policy_origin)
+}
+
+fn federation_match_operator(request: Dynamic, policy: Dynamic) -> Dynamic {
+    federation_resource_matches(
+        dynamic_to_str(&request).as_ref(),
+        dynamic_to_str(&policy).as_ref(),
+    )
+    .into()
+}
+
+fn install_policy_functions(enforcer: &mut Enforcer) {
+    enforcer.add_function(
+        "federationMatch",
+        OperatorFunction::Arg2(federation_match_operator),
+    );
 }
 
 /// Validate a policy component for security
@@ -168,7 +262,7 @@ e = some(where (p.eft == allow)) && !some(where (p.eft == deny))
 [matchers]
 m = ((r.dom == "*" && g(r.sub, p.sub)) || g2(r.sub, p.sub, r.dom) || keyMatch(r.sub, p.sub)) && \
     (p.dom == "*" || r.dom == p.dom) && \
-    keyMatch(r.obj, p.obj) && \
+    ((keyMatch(r.obj, "federation:register:*") && federationMatch(r.obj, p.obj)) || (!keyMatch(r.obj, "federation:register:*") && keyMatch(r.obj, p.obj))) && \
     (p.act == "*" || keyMatch(r.act, p.act))
 "#;
 
@@ -287,15 +381,17 @@ async fn ensure_domain_role_model(model_path: &Path) -> Result<(), PolicyError> 
     const GLOBAL_ROLE_CALL: &str = "g(r.sub, p.sub)";
     const GUARDED_ROLE_MATCHER: &str =
         "m = ((r.dom == \"*\" && g(r.sub, p.sub)) || g2(r.sub, p.sub, r.dom) || keyMatch(r.sub, p.sub))";
+    const SAFE_RESOURCE_MATCHER: &str = "((keyMatch(r.obj, \"federation:register:*\") && federationMatch(r.obj, p.obj)) || (!keyMatch(r.obj, \"federation:register:*\") && keyMatch(r.obj, p.obj)))";
 
     if content.contains("g2 = _, _, _")
         && content.contains(GUARDED_ROLE_MATCHER)
+        && content.contains(SAFE_RESOURCE_MATCHER)
         && content.matches(GLOBAL_ROLE_CALL).count() == 1
     {
         return Ok(());
     }
 
-    let migrated = content
+    let mut migrated = content
         .replacen(
             "[role_definition]\ng = _, _",
             "[role_definition]\ng = _, _\ng2 = _, _, _",
@@ -311,12 +407,19 @@ async fn ensure_domain_role_model(model_path: &Path) -> Result<(), PolicyError> 
             GUARDED_ROLE_MATCHER,
             1,
         );
+    if !migrated.contains(SAFE_RESOURCE_MATCHER) {
+        migrated = migrated.replacen("keyMatch(r.obj, p.obj)", SAFE_RESOURCE_MATCHER, 1);
+    }
+    if !migrated.contains(SAFE_RESOURCE_MATCHER) {
+        migrated = migrated.replacen("keyMatch(r.obj,p.obj)", SAFE_RESOURCE_MATCHER, 1);
+    }
     if !migrated.contains("g2 = _, _, _")
         || !migrated.contains(GUARDED_ROLE_MATCHER)
+        || !migrated.contains(SAFE_RESOURCE_MATCHER)
         || migrated.matches(GLOBAL_ROLE_CALL).count() != 1
     {
         return Err(PolicyError::ValidationError(format!(
-            "{} must restrict legacy g(user, role) membership to the global '*' domain and define domain-scoped g2(user, role, domain) membership",
+            "{} must restrict legacy g(user, role) membership to the global '*' domain, define domain-scoped g2(user, role, domain) membership, and use separator-aware matching for federation origins",
             model_path.display()
         )));
     }
@@ -437,6 +540,7 @@ impl PolicyManager {
         let mut enforcer = Enforcer::new(model, adapter)
             .await
             .map_err(|e| PolicyError::PolicyLoadError(e.to_string()))?;
+        install_policy_functions(&mut enforcer);
         if migrate_federation_origin_policies(&mut enforcer).await? {
             enforcer
                 .save_policy()
@@ -490,6 +594,7 @@ impl PolicyManager {
         let mut enforcer = Enforcer::new(model, adapter)
             .await
             .map_err(|e| PolicyError::PolicyLoadError(e.to_string()))?;
+        install_policy_functions(&mut enforcer);
 
         // Add permissive default rule: anyone can do anything in any domain
         enforcer
@@ -523,9 +628,10 @@ impl PolicyManager {
             .map_err(|e| PolicyError::ModelLoadError(e.to_string()))?;
 
         let adapter = MemoryAdapter::default();
-        let enforcer = Enforcer::new(model, adapter)
+        let mut enforcer = Enforcer::new(model, adapter)
             .await
             .map_err(|e| PolicyError::PolicyLoadError(e.to_string()))?;
+        install_policy_functions(&mut enforcer);
 
         Ok(Self {
             enforcer: Arc::new(RwLock::new(enforcer)),
@@ -1200,6 +1306,43 @@ mod tests {
                 .await
         );
         Ok(())
+    }
+
+    #[test]
+    fn federation_origin_wildcards_are_dns_label_scoped_and_fail_closed() {
+        let pattern = "https://*.partner.example";
+        assert!(federation_origin_pattern_matches(
+            "https://app.partner.example",
+            pattern
+        ));
+        assert!(federation_origin_pattern_matches(
+            "https://deep.app.partner.example",
+            pattern
+        ));
+        for denied in [
+            "https://partner.example",
+            "https://blocked.example",
+            "https://app.partner.example.evil",
+            "http://app.partner.example",
+            "https://app.partner.example:8443",
+        ] {
+            assert!(
+                !federation_origin_pattern_matches(denied, pattern),
+                "{denied} must not match {pattern}"
+            );
+        }
+        assert!(!federation_origin_pattern_matches(
+            "https://app.partner.example",
+            "https://*.*.partner.example"
+        ));
+        assert!(federation_origin_pattern_matches(
+            "https://[::1]:8443",
+            "https://[::1]:8443"
+        ));
+        assert!(!federation_resource_matches(
+            "federation:register:https://app.partner.example",
+            "federation:register"
+        ));
     }
 
     #[tokio::test]
