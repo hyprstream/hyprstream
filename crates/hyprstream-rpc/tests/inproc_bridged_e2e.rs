@@ -9,6 +9,8 @@
 //! regression where the bridge dropped/rejected continuations, silently breaking
 //! streaming services (model / tui).
 
+mod support;
+
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -70,6 +72,7 @@ fn fresh_key() -> SigningKey {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn inproc_bridged_round_trip_and_continuation_spawned() -> Result<()> {
+    support::install_explicit_dispatch_pep();
     let client_key = fresh_key();
     let client_pq = derive_mesh_mldsa_key(&client_key);
     let client_pq_vk = hyprstream_rpc::crypto::pq::ml_dsa_vk_from_bytes(

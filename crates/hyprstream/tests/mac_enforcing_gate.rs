@@ -34,9 +34,9 @@ use hyprstream_9p::{
 use hyprstream_core::mac::audit::{AuditError, AuditRecord, AuditSink, DecisionReason};
 use hyprstream_core::mac::NinePAccessDecider;
 use hyprstream_rpc::auth::mac::{
-    install_mac_dispatch_pep, Assurance, CompartmentSet, DefaultMacDispatchPep, Level,
-    MacDispatchPep, ObjectLabelResolver, ObjectRef, RpcObjectLabelResolver, SecurityContext,
-    SecurityLabel,
+    install_mac_dispatch_pep, Assurance, CompartmentSet, DefaultMacDispatchPep, Level, MacDecision,
+    MacDenyReason, MacDispatchPep, ObjectLabelResolver, ObjectRef, RpcObjectLabelResolver,
+    SecurityContext, SecurityLabel,
 };
 use hyprstream_rpc::dial::{dial_with_crypto_stores, register_inproc};
 use hyprstream_rpc::envelope::{InMemoryNonceCache, KeyedPqTrustStore};
@@ -76,11 +76,7 @@ fn label(level: Level, assurance: Assurance) -> SecurityLabel {
 /// when the T8 test is eventually unignored beside the negative gate.
 fn install_gate_crypto() -> Result<()> {
     let mut store = KeyedPqTrustStore::new();
-    for bytes in [
-        FLOOR_CLIENT_KEY,
-        T8_RPC_CLIENT_KEY,
-        POLICY_SERVICE_KEY,
-    ] {
+    for bytes in [FLOOR_CLIENT_KEY, T8_RPC_CLIENT_KEY, POLICY_SERVICE_KEY] {
         let ed = SigningKey::from_bytes(&bytes);
         let pq = derive_mesh_mldsa_key(&ed);
         let pq_vk = hyprstream_rpc::crypto::pq::ml_dsa_vk_from_bytes(
@@ -108,6 +104,28 @@ struct RpcFloorLabels(&'static str);
 impl RpcObjectLabelResolver for RpcFloorLabels {
     fn resolve(&self, service_domain: &str, _method: Option<u16>) -> Option<SecurityLabel> {
         (service_domain == self.0).then(|| label(Level::Public, Assurance::Classical))
+    }
+}
+
+/// Explicit, test-only bootstrap authority for the fixture policy service.
+///
+/// The OAuth fixture's local policy client intentionally carries no end-user
+/// clearance. It must still install a narrowly scoped PEP now that the
+/// uninstalled dispatch state denies at rest.
+struct ExactServiceBootstrapPep(String);
+
+impl MacDispatchPep for ExactServiceBootstrapPep {
+    fn check(
+        &self,
+        _ctx: &EnvelopeContext,
+        service_domain: &str,
+        _method: Option<u16>,
+    ) -> MacDecision {
+        if service_domain == self.0 {
+            MacDecision::Permit
+        } else {
+            MacDecision::Deny(MacDenyReason::UnlabeledObject)
+        }
     }
 }
 
@@ -554,6 +572,7 @@ async fn t8_atproto_session_credential() -> Result<T8SessionCredential> {
     // than replacing the signing boundary with a fixture token.
     let policy_signing = SigningKey::from_bytes(&POLICY_SERVICE_KEY);
     let policy_tag = format!("mac-gate-policy-{}", uuid::Uuid::new_v4());
+    install_mac_dispatch_pep(Arc::new(ExactServiceBootstrapPep("policy".to_owned())));
     let policy_dir = tempfile::TempDir::new()?;
     let git2db = Arc::new(tokio::sync::RwLock::new(
         git2db::Git2DB::open(policy_dir.path()).await?,
@@ -639,9 +658,7 @@ async fn t8_atproto_session_credential() -> Result<T8SessionCredential> {
     );
     let hosted_store = Arc::new(hyprstream_pds_service::AccountRecordStore::new(
         Arc::new(SyntheticMount::new(pds_root)),
-        hyprstream_core::mac::production_pds_account_read_authorizer(Arc::new(
-            SpyAudit::default(),
-        )),
+        hyprstream_core::mac::production_pds_account_read_authorizer(Arc::new(SpyAudit::default())),
     ));
 
     let mut atproto_multikey = vec![0x80, 0x24];

@@ -10,7 +10,7 @@
 //! startup path calls [`MacActivationControl::widen_identity_aware`]
 //! automatically; narrowing is always available.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::OnceLock;
 
@@ -41,6 +41,7 @@ pub struct MacActivationError {
     pub unlabeled: usize,
     pub ill_formed: usize,
     pub missing_gates: Vec<&'static str>,
+    pub blocked_transports: Vec<&'static str>,
 }
 
 impl std::fmt::Display for MacActivationError {
@@ -48,8 +49,8 @@ impl std::fmt::Display for MacActivationError {
         write!(
             f,
             "MAC identity-aware widening refused: readiness evidence incomplete \
-             (unlabeled={}, ill_formed={}, missing_gates={:?})",
-            self.unlabeled, self.ill_formed, self.missing_gates
+             (unlabeled={}, ill_formed={}, missing_gates={:?}, blocked_transports={:?})",
+            self.unlabeled, self.ill_formed, self.missing_gates, self.blocked_transports
         )
     }
 }
@@ -100,12 +101,14 @@ impl MacActivationEvidence<'_> {
 #[derive(Debug)]
 pub struct MacActivationControl {
     mode: AtomicU8,
+    unverified_attach_transports: RwLock<BTreeSet<&'static str>>,
 }
 
 impl Default for MacActivationControl {
     fn default() -> Self {
         Self {
             mode: AtomicU8::new(FLOOR_ONLY),
+            unverified_attach_transports: RwLock::new(BTreeSet::new()),
         }
     }
 }
@@ -127,14 +130,22 @@ impl MacActivationControl {
         &self,
         evidence: &MacActivationEvidence<'_>,
     ) -> Result<(), MacActivationError> {
-        let missing_gates = evidence.missing_gates();
+        let blocked_transports = self.blocked_transports();
+        let mut missing_gates = evidence.missing_gates();
+        if !blocked_transports.is_empty() && !missing_gates.contains(&"G2") {
+            missing_gates.push("G2");
+        }
         if !missing_gates.is_empty() {
             return Err(MacActivationError {
                 unlabeled: evidence.genesis.unlabeled.len(),
                 ill_formed: evidence.genesis.ill_formed.len(),
                 missing_gates,
+                blocked_transports,
             });
         }
+        // A widening starts a new cache generation. No verified subject
+        // context from an earlier floor-only/reload epoch can survive it.
+        flush_verified_subject_cache_generation();
         self.mode.store(IDENTITY_AWARE, Ordering::Release);
         Ok(())
     }
@@ -143,6 +154,7 @@ impl MacActivationControl {
     /// leaving every monitor installed and authoritative.
     pub fn narrow_to_floor(&self) {
         self.mode.store(FLOOR_ONLY, Ordering::Release);
+        flush_verified_subject_cache_generation();
     }
 
     /// Select the context a PEP must evaluate in the current mode.
@@ -153,6 +165,27 @@ impl MacActivationControl {
             MacActivationMode::IdentityAware => verified,
         }
     }
+
+    /// Permanently block identity-aware widening in this process while a live
+    /// 9P transport still has no verified attach-credential carrier.
+    ///
+    /// Registration also narrows an already-widened process immediately, so a
+    /// late worker constructor cannot turn UDS/vsock attaches into a deny-all
+    /// availability outage.
+    pub fn block_unverified_attach_transport(&self, transport: &'static str) {
+        self.unverified_attach_transports.write().insert(transport);
+        self.narrow_to_floor();
+    }
+
+    /// Runtime transport blockers that make G2 structurally incomplete.
+    #[must_use]
+    pub fn blocked_transports(&self) -> Vec<&'static str> {
+        self.unverified_attach_transports
+            .read()
+            .iter()
+            .copied()
+            .collect()
+    }
 }
 
 /// The process-global activation control.  It starts floor-only.
@@ -160,6 +193,14 @@ impl MacActivationControl {
 pub fn global_mac_activation_control() -> &'static MacActivationControl {
     static CONTROL: OnceLock<MacActivationControl> = OnceLock::new();
     CONTROL.get_or_init(MacActivationControl::default)
+}
+
+/// Register a live production 9P transport that still uses a deny-only
+/// authenticator. Once registered, this process cannot widen identity-aware
+/// MAC until that constructor is replaced with a verified credential carrier
+/// in a fresh process.
+pub fn block_identity_widening_for_unverified_attach_transport(transport: &'static str) {
+    global_mac_activation_control().block_unverified_attach_transport(transport);
 }
 
 /// Canonical anonymous-floor context used by every PEP during narrowing.
@@ -176,11 +217,47 @@ struct VerifiedSubjectEntry {
     context: SecurityContext,
     tenant: Option<String>,
     expires_at: i64,
+    jti: Option<String>,
+    generation: u64,
 }
 
-fn verified_subjects() -> &'static RwLock<HashMap<String, VerifiedSubjectEntry>> {
-    static SUBJECTS: OnceLock<RwLock<HashMap<String, VerifiedSubjectEntry>>> = OnceLock::new();
-    SUBJECTS.get_or_init(|| RwLock::new(HashMap::new()))
+#[derive(Default)]
+struct VerifiedSubjectCache {
+    generation: u64,
+    subjects: HashMap<String, VerifiedSubjectEntry>,
+}
+
+fn verified_subjects() -> &'static RwLock<VerifiedSubjectCache> {
+    static SUBJECTS: OnceLock<RwLock<VerifiedSubjectCache>> = OnceLock::new();
+    SUBJECTS.get_or_init(|| RwLock::new(VerifiedSubjectCache::default()))
+}
+
+/// Revoke every cached subject context derived from `jti`.
+///
+/// The shared in-memory JTI blocklist calls this hook on every revocation, so
+/// VFS/CAS/MoQ lookups cannot continue using authority cached before the
+/// blocklist update.
+pub fn revoke_verified_subject_jti(jti: &str) -> usize {
+    if jti.is_empty() {
+        return 0;
+    }
+    let mut cache = verified_subjects().write();
+    let before = cache.subjects.len();
+    cache
+        .subjects
+        .retain(|_, entry| entry.jti.as_deref() != Some(jti));
+    before.saturating_sub(cache.subjects.len())
+}
+
+/// Advance the verified-subject cache generation and remove all prior entries.
+///
+/// Policy/resolver reload and revocation control planes call this G7 hook.
+/// Widening and narrowing also rotate the generation automatically.
+pub fn flush_verified_subject_cache_generation() -> u64 {
+    let mut cache = verified_subjects().write();
+    cache.generation = cache.generation.saturating_add(1);
+    cache.subjects.clear();
+    cache.generation
 }
 
 /// Cache the context of a request whose envelope and Claims have already been
@@ -230,12 +307,16 @@ pub fn remember_verified_claims(
     let Some(context) = claims.security_context(key_material) else {
         return;
     };
-    verified_subjects().write().insert(
+    let mut cache = verified_subjects().write();
+    let generation = cache.generation;
+    cache.subjects.insert(
         name.to_owned(),
         VerifiedSubjectEntry {
             context,
             tenant: verified_tenant.map(str::to_owned),
             expires_at: claims.exp,
+            jti: claims.jti.clone(),
+            generation,
         },
     );
 }
@@ -249,10 +330,14 @@ pub fn subject_context(
 ) -> Option<SecurityContext> {
     let verified = subject.name().and_then(|name| {
         let now = chrono::Utc::now().timestamp();
-        let mut subjects = verified_subjects().write();
-        let entry = subjects.get(name)?.clone();
+        let mut cache = verified_subjects().write();
+        let entry = cache.subjects.get(name)?.clone();
+        if entry.generation != cache.generation {
+            cache.subjects.remove(name);
+            return None;
+        }
         if entry.expires_at <= now {
-            subjects.remove(name);
+            cache.subjects.remove(name);
             return None;
         }
         if let Some(expected) = verified_tenant {
@@ -269,6 +354,8 @@ pub fn subject_context(
 mod tests {
     use super::*;
 
+    static TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
     fn report(complete: bool) -> GenesisReport {
         GenesisReport {
             labeled: vec!["/".to_owned()],
@@ -283,6 +370,7 @@ mod tests {
 
     #[test]
     fn widening_requires_complete_coverage_and_narrowing_is_always_available() {
+        let _guard = TEST_LOCK.lock();
         let control = MacActivationControl::default();
         let incomplete = report(false);
         let mut evidence = MacActivationEvidence {
@@ -301,5 +389,64 @@ mod tests {
         assert_eq!(control.mode(), MacActivationMode::IdentityAware);
         control.narrow_to_floor();
         assert_eq!(control.mode(), MacActivationMode::FloorOnly);
+    }
+
+    #[test]
+    fn unverified_attach_transport_structurally_blocks_g2_widening() {
+        let _guard = TEST_LOCK.lock();
+        let control = MacActivationControl::default();
+        control.block_unverified_attach_transport("worker-uds-vsock");
+
+        let complete = report(true);
+        let evidence = MacActivationEvidence {
+            genesis: &complete,
+            mediation_integrity_g2: true,
+            denial_handling_g4: true,
+            observability_g5: true,
+            runbook_signoff_g6: true,
+            revocation_reload_g7: true,
+        };
+        let Err(error) = control.widen_identity_aware(&evidence) else {
+            panic!("unverified worker transport must block identity-aware widening");
+        };
+        assert_eq!(control.mode(), MacActivationMode::FloorOnly);
+        assert!(error.missing_gates.contains(&"G2"));
+        assert_eq!(error.blocked_transports, vec!["worker-uds-vsock"]);
+    }
+
+    #[test]
+    fn jti_revocation_and_generation_rotation_evict_cached_subjects() {
+        let _guard = TEST_LOCK.lock();
+        flush_verified_subject_cache_generation();
+
+        let now = chrono::Utc::now().timestamp();
+        let mut claims =
+            crate::auth::Claims::new("did:web:alice".to_owned(), now, now + 300).with_clearance(
+                SecurityLabel::new(Level::Secret, Assurance::Classical, CompartmentSet::EMPTY),
+            );
+        claims.jti = Some("revocable-jti".to_owned());
+        let subject = Subject::new("did:web:alice");
+        remember_verified_claims(
+            &subject,
+            &claims,
+            VerifiedKeyMaterial::Classical,
+            Some("tenant-a"),
+        );
+
+        assert_eq!(verified_subjects().read().subjects.len(), 1);
+        assert_eq!(revoke_verified_subject_jti("other-jti"), 0);
+        assert_eq!(revoke_verified_subject_jti("revocable-jti"), 1);
+        assert!(verified_subjects().read().subjects.is_empty());
+
+        remember_verified_claims(
+            &subject,
+            &claims,
+            VerifiedKeyMaterial::Classical,
+            Some("tenant-a"),
+        );
+        let old_generation = verified_subjects().read().generation;
+        let new_generation = flush_verified_subject_cache_generation();
+        assert!(new_generation >= old_generation);
+        assert!(verified_subjects().read().subjects.is_empty());
     }
 }

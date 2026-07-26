@@ -1132,6 +1132,13 @@ fn create_worker_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
     // Fixed-subject worker transports keep the mandatory monitor and floor
     // context. Identity-aware widening remains blocked until those transports
     // have a credential-bearing attach carrier (G2 evidence).
+    // The worker UDS/vsock carrier still has no verified attach credential.
+    // Make that runtime fact a structural G2 blocker: operator evidence cannot
+    // widen this process until the constructor is replaced with a credentialed
+    // authenticator.
+    hyprstream_rpc::auth::mac::block_identity_widening_for_unverified_attach_transport(
+        "worker-uds-vsock",
+    );
     let ninep_monitor = Some(crate::mac::enrollment_ninep_reference_monitor(Arc::clone(
         &ninep_decider,
     )));

@@ -3542,6 +3542,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_registry_service_health_check() {
+        crate::mac::install_explicit_test_dispatch_pep();
         use hyprstream_service::InprocManager;
         use hyprstream_rpc::transport::TransportConfig;
 
@@ -3617,6 +3618,7 @@ mod tests {
 
     #[tokio::test]
     async fn registry_rpc_is_live_at9p_candidate_boundary() {
+        crate::mac::install_explicit_test_dispatch_pep();
         use hyprstream_pds::at9p_sign::{sign_capsule, sign_update_record};
         use hyprstream_service::InprocManager;
         const NOW: &str = "2026-07-16T12:00:00Z";

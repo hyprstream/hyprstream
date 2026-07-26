@@ -14,6 +14,8 @@
 //! follow-up under Phase 5 (#136), since every service will need the same
 //! change at the same place.
 
+mod support;
+
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -357,6 +359,7 @@ async fn client_for_key_with_jwt(
 /// produced by the bootstrap `SERVICE_BASE_POLICIES`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn policy_check_allow_and_deny_over_iroh() -> Result<()> {
+    support::install_explicit_dispatch_pep();
     let pq_store = install_hybrid_verify_config();
 
     let (service, server_signing, _temp) = make_policy_service().await?;
@@ -400,6 +403,7 @@ async fn policy_check_allow_and_deny_over_iroh() -> Result<()> {
 /// holds under a real service's response shape.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn policy_concurrent_checks_over_iroh() -> Result<()> {
+    support::install_explicit_dispatch_pep();
     let pq_store = install_hybrid_verify_config();
 
     let (service, server_signing, _temp) = make_policy_service().await?;
@@ -476,6 +480,7 @@ async fn policy_concurrent_checks_over_iroh() -> Result<()> {
 /// on the RPC path — the missing piece for #1128 is domains, not subjects.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn two_subjects_per_subject_isolation_over_rpc() -> Result<()> {
+    support::install_explicit_dispatch_pep();
     let pq_store = install_hybrid_verify_config();
     install_test_key_subjects();
 
@@ -571,6 +576,7 @@ async fn two_subjects_per_subject_isolation_over_rpc() -> Result<()> {
 /// behavior; a fix must make the first assertion ALLOW.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn domain_grant_is_inert_over_rpc_gap1128() -> Result<()> {
+    support::install_explicit_dispatch_pep();
     let pq_store = install_hybrid_verify_config();
     install_test_key_subjects();
 
@@ -640,6 +646,7 @@ async fn domain_grant_is_inert_over_rpc_gap1128() -> Result<()> {
 /// signed, verified JWT tenant claim rather than the subject or request data.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn verified_tenant_domains_isolate_pairwise_rpc_callers() -> Result<()> {
+    support::install_explicit_dispatch_pep();
     let pq_store = install_hybrid_verify_config();
     install_test_key_subjects();
 
@@ -751,6 +758,7 @@ async fn verified_tenant_domains_isolate_pairwise_rpc_callers() -> Result<()> {
 /// Equal raw event prefixes are independent when their verified tenant differs.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn event_prefixes_are_isolated_across_verified_tenants() -> Result<()> {
+    support::install_explicit_dispatch_pep();
     let pq_store = install_hybrid_verify_config();
     install_test_key_subjects();
 

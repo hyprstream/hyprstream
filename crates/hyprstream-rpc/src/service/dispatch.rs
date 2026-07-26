@@ -216,8 +216,7 @@ where
         let signed_response = sign_response(error_payload)?;
 
         let mut message = Builder::new_default();
-        let mut builder =
-            message.init_root::<crate::common_capnp::response_envelope::Builder>();
+        let mut builder = message.init_root::<crate::common_capnp::response_envelope::Builder>();
         signed_response.write_to(&mut builder);
 
         let mut bytes = Vec::new();
@@ -235,10 +234,10 @@ where
     // lattice floor. Once installed, the PEP fails closed: missing clearance,
     // missing label, or lattice-floor deny ⇒ handler is never called.
     //
-    // **Activation gate (#1267):** until a node installs a PEP
-    // process-globally via `install_mac_dispatch_pep`, enforcement is dormant
-    // and this gate is a true pass-through. After activation, the installed
-    // PEP is mandatory and its decision is authoritative.
+    // **Activation gate (#1267):** identity-aware subject selection remains
+    // operator-gated, but mediation is mandatory at rest. Until a node installs
+    // a PEP process-globally via `install_mac_dispatch_pep`, this gate denies
+    // with `NoPepInstalled`; after installation its decision is authoritative.
     //
     // Streaming continuations: the continuation produced by a permitted
     // handler inherits this dispatch-time Permit. Explicit re-check of

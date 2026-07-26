@@ -13,14 +13,19 @@ Capture and retain one reviewed evidence bundle covering every epic gate:
    zero `ill_formed` nodes.
 2. G2: the PEP/TOCTOU audit proves every live path is mediated and the labeled
    identity/object is bound to the subject/object actually served. Include the
-   `VerifiedAttach` divergence-denial test.
+   `VerifiedAttach` divergence-denial test. The runtime control also refuses
+   widening while any worker UDS/vsock transport is registered without a
+   verified attach-credential carrier; operator attestation cannot override
+   that blocker.
 3. G3: a staging exercise widens and then calls `narrow_to_floor`; the PEP
    remains installed and denials remain audited.
 4. G4: denial-to-proposal handling passes end to end.
 5. G5: deny audit export, metrics, and alerting are live.
 6. G6: the release validation and Kimi security review are attached, and the
    named operator signs off this runbook.
-7. G7: revocation, policy/resolver reload, and AVC flush are demonstrated.
+7. G7: revocation, policy/resolver reload, AVC flush, JTI eviction from the
+   verified-subject cache, and verified-subject cache generation rotation are
+   demonstrated.
 
 `MacActivationControl::widen_identity_aware` accepts a
 `MacActivationEvidence` containing G1-G7 attestations and refuses the widening

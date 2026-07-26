@@ -14,6 +14,8 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+mod support;
+
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 
@@ -237,6 +239,7 @@ fn capnp_application_request(method_discriminator: u16) -> Vec<u8> {
 /// an exact request for A to B.
 #[tokio::test]
 async fn exact_same_key_request_is_bound_to_destination_service() {
+    support::install_explicit_dispatch_pep();
     let k = keys();
     let (service_a, invoked_a) = SentinelService::new_named(k.server_sk.clone(), "service-a");
     let (service_b, invoked_b) = SentinelService::new_named(k.server_sk.clone(), "service-b");
@@ -331,6 +334,7 @@ fn decode_response(bytes: &[u8]) -> ResponseEnvelope {
 
 #[tokio::test]
 async fn browser_dispatch_recovers_exact_bytes_and_rejects_post_refetch_advance() {
+    support::install_explicit_dispatch_pep();
     let k = keys();
     let verifier = browser_currentness();
     verifier.advanced.store(false, Ordering::SeqCst);
@@ -438,6 +442,7 @@ async fn cleartext_on_untrusted_carrier_rejected_before_handler() {
 /// not on the carrier.
 #[tokio::test]
 async fn encrypted_on_untrusted_carrier_dispatches() {
+    support::install_explicit_dispatch_pep();
     let k = keys();
     let (service, invoked) = SentinelService::new(k.server_sk.clone());
     let nonce_cache = envelope::InMemoryNonceCache::new();
@@ -520,6 +525,7 @@ async fn missing_response_recipient_drops_without_handler_on_all_network_carrier
 
 #[tokio::test]
 async fn post_admission_handler_error_is_sealed_not_cleartext() {
+    support::install_explicit_dispatch_pep();
     let k = keys();
     let (service, invoked) = SentinelService::new(k.server_sk.clone());
     let nonce_cache = envelope::InMemoryNonceCache::new();

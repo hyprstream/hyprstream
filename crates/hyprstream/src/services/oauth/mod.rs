@@ -1328,6 +1328,7 @@ mod tests {
     /// a real in-process PolicyService.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn oauth_handler_atproto_and_legacy_conformance() -> anyhow::Result<()> {
+        crate::mac::install_explicit_test_dispatch_pep();
         use base64::{
             engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
             Engine as _,

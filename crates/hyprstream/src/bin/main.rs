@@ -1211,9 +1211,19 @@ fn handle_quick_command(
                         // #1269: install the full ReferenceMonitor at every
                         // production 9P constructor. Fail-closed until #698
                         // wires clearance issuance + S6 token path.
-                        let ninep_monitor = Some(hyprstream_core::mac::enrollment_ninep_reference_monitor(
-                            Arc::clone(&ninep_decider),
-                        ));
+                        // This worker transport still carries no verified
+                        // attach credential. Register the live UDS/vsock seam
+                        // as a structural G2 blocker before constructing its
+                        // deny-only authenticator; a late registration also
+                        // narrows an already-widened process.
+                        hyprstream_rpc::auth::mac::block_identity_widening_for_unverified_attach_transport(
+                            "worker-uds-vsock",
+                        );
+                        let ninep_monitor = Some(
+                            hyprstream_core::mac::enrollment_ninep_reference_monitor(Arc::clone(
+                                &ninep_decider,
+                            )),
+                        );
                         let backend_ctx = BackendCtx {
                             pool_config: pool_config.clone(),
                             ninep_decider,

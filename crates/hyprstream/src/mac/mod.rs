@@ -119,6 +119,27 @@ pub fn install_production_rpc_dispatch_pep() {
             .with_activation_control(),
     ));
 }
+
+/// Explicit permit fixture for unit tests that exercise service plumbing
+/// rather than MAC policy. Production's uninstalled dispatch state still
+/// denies at rest.
+#[cfg(test)]
+pub(crate) fn install_explicit_test_dispatch_pep() {
+    struct ExplicitTestPep;
+
+    impl hyprstream_rpc::auth::mac::MacDispatchPep for ExplicitTestPep {
+        fn check(
+            &self,
+            _ctx: &hyprstream_rpc::service::EnvelopeContext,
+            _service_domain: &str,
+            _method: Option<u16>,
+        ) -> hyprstream_rpc::auth::mac::MacDecision {
+            hyprstream_rpc::auth::mac::MacDecision::Permit
+        }
+    }
+
+    hyprstream_rpc::auth::mac::install_mac_dispatch_pep(std::sync::Arc::new(ExplicitTestPep));
+}
 // S5 (#571): the UCAN→TE policy compiler — compile a validated grant into a
 // CompiledPolicy, verify it grants no privilege beyond the grant, and sign it
 // (fail-closed). Lives here (not `hyprstream-rpc`) because it needs both the UCAN

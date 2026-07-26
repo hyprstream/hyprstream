@@ -58,7 +58,10 @@ impl JtiBlocklist for InMemoryJtiBlocklist {
         }
         #[cfg(target_arch = "wasm32")]
         {
-            self.revoked.read().expect("jti blocklist lock poisoned").contains_key(jti)
+            self.revoked
+                .read()
+                .expect("jti blocklist lock poisoned")
+                .contains_key(jti)
         }
     }
 
@@ -67,11 +70,16 @@ impl JtiBlocklist for InMemoryJtiBlocklist {
         #[cfg(not(target_arch = "wasm32"))]
         {
             let mut map = self.revoked.write();
-            map.insert(jti, expires_at);
-            if map.len() > 10_000 {
-                drop(map);
+            map.insert(jti.clone(), expires_at);
+            let cleanup = map.len() > 10_000;
+            drop(map);
+            if cleanup {
                 self.cleanup(now);
             }
+            // Publish the revocation before evicting derived authority. New
+            // verifications now fail the blocklist check, while cached
+            // contexts derived from the revoked token are removed below.
+            crate::auth::mac::revoke_verified_subject_jti(&jti);
         }
         #[cfg(target_arch = "wasm32")]
         {

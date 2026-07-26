@@ -14,6 +14,8 @@
 //! identity, and the signed response verifies back at the client — the same
 //! exit criterion the iroh canary proves, on the ipc transport.
 
+mod support;
+
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -84,6 +86,7 @@ fn fresh_signing_key() -> SigningKey {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn signed_envelope_round_trip_over_uds() -> Result<()> {
+    support::install_explicit_dispatch_pep();
     let client_signing = fresh_signing_key();
     let client_pq = derive_mesh_mldsa_key(&client_signing);
     let client_pq_vk = hyprstream_rpc::crypto::pq::ml_dsa_vk_from_bytes(

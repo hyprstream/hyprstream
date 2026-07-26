@@ -16,6 +16,8 @@
 //! suite over iroh) requires `services/factories.rs` wiring — tracked as
 //! Phase 2 part 3 of #133.
 
+mod support;
+
 use std::future::Future;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -235,6 +237,7 @@ where
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn hykem_encrypted_envelope_round_trip_over_iroh() -> Result<()> {
+    support::install_explicit_dispatch_pep();
     // ─── Server side ──────────────────────────────────────────────────────
     let server_signing = fresh_signing_key();
     let server_verifying: VerifyingKey = server_signing.verifying_key();
