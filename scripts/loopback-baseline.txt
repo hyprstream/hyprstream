@@ -29,7 +29,6 @@
 1	crates/hyprstream/src/cli/sign_challenge.rs
 1	crates/hyprstream/src/cli/wizard_handlers.rs
 10	crates/hyprstream/src/config/mod.rs
-4	crates/hyprstream/src/config/server.rs
 5	crates/hyprstream/src/server/middleware.rs
 14	crates/hyprstream/src/services/oauth/authorize.rs
 10	crates/hyprstream/src/services/oauth/mod.rs
