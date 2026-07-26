@@ -82,8 +82,8 @@ struct ModelListItem {
 #[allow(clippy::result_large_err)]
 fn policy_identity(
     auth_user: Option<&Extension<AuthenticatedUser>>,
-) -> Result<(String, String), axum::response::Response> {
-    server::extract_policy_identity(auth_user).map_err(|_| {
+) -> Result<(String, String, Option<String>), axum::response::Response> {
+    let (user, domain) = server::extract_policy_identity(auth_user).map_err(|_| {
         (
             StatusCode::FORBIDDEN,
             Json(serde_json::json!({
@@ -91,7 +91,12 @@ fn policy_identity(
             })),
         )
             .into_response()
-    })
+    })?;
+    Ok((
+        user,
+        domain,
+        auth_user.and_then(|Extension(identity)| identity.token.clone()),
+    ))
 }
 
 /// List all available models
@@ -99,19 +104,23 @@ async fn list_models(
     State(state): State<ServerState>,
     auth_user: Option<Extension<AuthenticatedUser>>,
 ) -> impl IntoResponse {
-    let (user, domain) = match policy_identity(auth_user.as_ref()) {
+    let (user, domain, bearer) = match policy_identity(auth_user.as_ref()) {
         Ok(identity) => identity,
         Err(response) => return response,
     };
-    if !state
-        .policy_client
-        .check(&crate::services::generated::policy_client::PolicyCheck {
-            subject: user.clone(),
-            domain,
-            resource: "registry:*".to_owned(),
-            operation: Operation::Query.as_str().to_owned(),
-        })
-        .await
+    let request = crate::services::generated::policy_client::PolicyCheck {
+        subject: user.clone(),
+        domain,
+        resource: "registry:*".to_owned(),
+        operation: Operation::Query.as_str().to_owned(),
+    };
+    if !crate::services::policy::check_with_verified_bearer(
+        &state.policy_client,
+        &request,
+        bearer.as_deref(),
+        &hyprstream_rpc::envelope::Subject::new(user.clone()),
+    )
+    .await
         .unwrap_or(false)
     {
         return (
@@ -177,20 +186,24 @@ async fn get_model_info(
     auth_user: Option<Extension<AuthenticatedUser>>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    let (user, domain) = match policy_identity(auth_user.as_ref()) {
+    let (user, domain, bearer) = match policy_identity(auth_user.as_ref()) {
         Ok(identity) => identity,
         Err(response) => return response,
     };
     let resource = format!("model:{id}");
-    if !state
-        .policy_client
-        .check(&crate::services::generated::policy_client::PolicyCheck {
-            subject: user.clone(),
-            domain,
-            resource: resource.clone(),
-            operation: Operation::Query.as_str().to_owned(),
-        })
-        .await
+    let request = crate::services::generated::policy_client::PolicyCheck {
+        subject: user.clone(),
+        domain,
+        resource: resource.clone(),
+        operation: Operation::Query.as_str().to_owned(),
+    };
+    if !crate::services::policy::check_with_verified_bearer(
+        &state.policy_client,
+        &request,
+        bearer.as_deref(),
+        &hyprstream_rpc::envelope::Subject::new(user.clone()),
+    )
+    .await
         .unwrap_or(false)
     {
         return (
@@ -238,19 +251,23 @@ async fn download_model(
     auth_user: Option<Extension<AuthenticatedUser>>,
     Json(request): Json<DownloadModelRequest>,
 ) -> impl IntoResponse {
-    let (user, domain) = match policy_identity(auth_user.as_ref()) {
+    let (user, domain, bearer) = match policy_identity(auth_user.as_ref()) {
         Ok(identity) => identity,
         Err(response) => return response,
     };
-    if !state
-        .policy_client
-        .check(&crate::services::generated::policy_client::PolicyCheck {
-            subject: user.clone(),
-            domain,
-            resource: "registry:*".to_owned(),
-            operation: Operation::Write.as_str().to_owned(),
-        })
-        .await
+    let policy_request = crate::services::generated::policy_client::PolicyCheck {
+        subject: user.clone(),
+        domain,
+        resource: "registry:*".to_owned(),
+        operation: Operation::Write.as_str().to_owned(),
+    };
+    if !crate::services::policy::check_with_verified_bearer(
+        &state.policy_client,
+        &policy_request,
+        bearer.as_deref(),
+        &hyprstream_rpc::envelope::Subject::new(user.clone()),
+    )
+    .await
         .unwrap_or(false)
     {
         return (
@@ -373,20 +390,24 @@ async fn load_model(
     auth_user: Option<Extension<AuthenticatedUser>>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    let (user, domain) = match policy_identity(auth_user.as_ref()) {
+    let (user, domain, bearer) = match policy_identity(auth_user.as_ref()) {
         Ok(identity) => identity,
         Err(response) => return response,
     };
     let resource = format!("model:{id}");
-    if !state
-        .policy_client
-        .check(&crate::services::generated::policy_client::PolicyCheck {
-            subject: user.clone(),
-            domain,
-            resource: resource.clone(),
-            operation: Operation::Manage.as_str().to_owned(),
-        })
-        .await
+    let request = crate::services::generated::policy_client::PolicyCheck {
+        subject: user.clone(),
+        domain,
+        resource: resource.clone(),
+        operation: Operation::Manage.as_str().to_owned(),
+    };
+    if !crate::services::policy::check_with_verified_bearer(
+        &state.policy_client,
+        &request,
+        bearer.as_deref(),
+        &hyprstream_rpc::envelope::Subject::new(user.clone()),
+    )
+    .await
         .unwrap_or(false)
     {
         return (
@@ -441,20 +462,24 @@ async fn unload_model(
     auth_user: Option<Extension<AuthenticatedUser>>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    let (user, domain) = match policy_identity(auth_user.as_ref()) {
+    let (user, domain, bearer) = match policy_identity(auth_user.as_ref()) {
         Ok(identity) => identity,
         Err(response) => return response,
     };
     let resource = format!("model:{id}");
-    if !state
-        .policy_client
-        .check(&crate::services::generated::policy_client::PolicyCheck {
-            subject: user.clone(),
-            domain,
-            resource: resource.clone(),
-            operation: Operation::Manage.as_str().to_owned(),
-        })
-        .await
+    let request = crate::services::generated::policy_client::PolicyCheck {
+        subject: user.clone(),
+        domain,
+        resource: resource.clone(),
+        operation: Operation::Manage.as_str().to_owned(),
+    };
+    if !crate::services::policy::check_with_verified_bearer(
+        &state.policy_client,
+        &request,
+        bearer.as_deref(),
+        &hyprstream_rpc::envelope::Subject::new(user.clone()),
+    )
+    .await
         .unwrap_or(false)
     {
         return (
@@ -478,19 +503,23 @@ async fn refresh_cache(
     State(state): State<ServerState>,
     auth_user: Option<Extension<AuthenticatedUser>>,
 ) -> impl IntoResponse {
-    let (user, domain) = match policy_identity(auth_user.as_ref()) {
+    let (user, domain, bearer) = match policy_identity(auth_user.as_ref()) {
         Ok(identity) => identity,
         Err(response) => return response,
     };
-    if !state
-        .policy_client
-        .check(&crate::services::generated::policy_client::PolicyCheck {
-            subject: user.clone(),
-            domain,
-            resource: "registry:*".to_owned(),
-            operation: Operation::Manage.as_str().to_owned(),
-        })
-        .await
+    let request = crate::services::generated::policy_client::PolicyCheck {
+        subject: user.clone(),
+        domain,
+        resource: "registry:*".to_owned(),
+        operation: Operation::Manage.as_str().to_owned(),
+    };
+    if !crate::services::policy::check_with_verified_bearer(
+        &state.policy_client,
+        &request,
+        bearer.as_deref(),
+        &hyprstream_rpc::envelope::Subject::new(user.clone()),
+    )
+    .await
         .unwrap_or(false)
     {
         return (

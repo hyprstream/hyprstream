@@ -396,7 +396,7 @@ pub(crate) async fn check_federation_register_for_client_auth(
 ///   - applying the `federation-open` template (any HTTPS origin allowed —
 ///     covers both third-party clients AND remote peer servers), or
 ///   - allowlisting specific origins:
-///     `p, https://*.partner.org, *, federation:register, check, allow`
+///     `p, *, *, federation:register:https://*.partner.org, check, allow`
 ///
 /// The same rule covers a CIMD client at app.partner.org AND a peer
 /// hyprstream instance at hyprstream.partner.org.
@@ -405,12 +405,14 @@ pub(crate) async fn check_federation_register_for_client_auth(
 /// posture is preserved over availability of new federation registrations.
 async fn check_federation_register(state: &OAuthState, origin: &str) -> Result<(), String> {
     use crate::services::generated::policy_client::PolicyCheck;
+    let resource = crate::auth::federation_registration_resource(origin)
+        .map_err(|error| format!("invalid federation origin policy resource: {error}"))?;
     match state
         .policy_client
         .check(&PolicyCheck {
-            subject: origin.to_owned(),
-            domain: origin.to_owned(),
-            resource: "federation:register".to_owned(),
+            subject: String::new(),
+            domain: String::new(),
+            resource,
             operation: "check".to_owned(),
         })
         .await

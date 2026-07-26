@@ -500,6 +500,7 @@ pub trait AuthorizationProvider: Send + Sync {
         domain: &str,
         resource: &str,
         operation: &str,
+        bearer: Option<&str>,
     ) -> Result<bool>;
 }
 
@@ -4373,7 +4374,7 @@ impl DiscoveryHandler for DiscoveryService {
         if let Some(ref auth) = self.auth_provider {
             let subject = ctx.subject().to_string();
             let allowed = auth
-                .check(&subject, "*", resource, operation)
+                .check(&subject, "*", resource, operation, ctx.jwt_token())
                 .await
                 .unwrap_or_else(|e| {
                     tracing::warn!("Discovery auth check failed for {}: {}", subject, e);
@@ -5420,6 +5421,7 @@ mod get_record_tests {
             _domain: &str,
             resource: &str,
             operation: &str,
+            _bearer: Option<&str>,
         ) -> Result<bool> {
             Ok(self
                 .allow
@@ -5736,6 +5738,7 @@ mod query_candidates_tests {
             _domain: &str,
             _resource: &str,
             _operation: &str,
+            _bearer: Option<&str>,
         ) -> Result<bool> {
             Ok(true)
         }
@@ -5752,6 +5755,7 @@ mod query_candidates_tests {
             _domain: &str,
             resource: &str,
             operation: &str,
+            _bearer: Option<&str>,
         ) -> Result<bool> {
             Ok(resource != format!("placement:candidate:{}", self.0) || operation != "query")
         }
@@ -5767,6 +5771,7 @@ mod query_candidates_tests {
             _domain: &str,
             resource: &str,
             operation: &str,
+            _bearer: Option<&str>,
         ) -> Result<bool> {
             Ok(resource != format!("placement:candidate:{}", self.0) || operation != "write")
         }

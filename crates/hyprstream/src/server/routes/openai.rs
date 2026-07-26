@@ -343,15 +343,19 @@ async fn chat_completions(
 
     // Check permission for inference on this model via ZMQ
     let resource = format!("model:{}", request.model);
-    match state
-        .policy_client
-        .check(&crate::services::generated::policy_client::PolicyCheck {
-            subject: user.clone(),
-            domain: domain.clone(),
-            resource: resource.clone(),
-            operation: Operation::Infer.as_str().to_owned(),
-        })
-        .await
+    let policy_request = crate::services::generated::policy_client::PolicyCheck {
+        subject: user.clone(),
+        domain: domain.clone(),
+        resource: resource.clone(),
+        operation: Operation::Infer.as_str().to_owned(),
+    };
+    match crate::services::policy::check_with_verified_bearer(
+        &state.policy_client,
+        &policy_request,
+        jwt_token.as_deref(),
+        &hyprstream_rpc::envelope::Subject::new(user.clone()),
+    )
+    .await
     {
         Ok(allowed) if !allowed => {
             return (
@@ -1005,15 +1009,19 @@ async fn completions(
 
     // Check permission for inference on this model
     let resource = format!("model:{}", request.model);
-    match state
-        .policy_client
-        .check(&crate::services::generated::policy_client::PolicyCheck {
-            subject: user.clone(),
-            domain: domain.clone(),
-            resource: resource.clone(),
-            operation: Operation::Infer.as_str().to_owned(),
-        })
-        .await
+    let policy_request = crate::services::generated::policy_client::PolicyCheck {
+        subject: user.clone(),
+        domain: domain.clone(),
+        resource: resource.clone(),
+        operation: Operation::Infer.as_str().to_owned(),
+    };
+    match crate::services::policy::check_with_verified_bearer(
+        &state.policy_client,
+        &policy_request,
+        jwt_token.as_deref(),
+        &hyprstream_rpc::envelope::Subject::new(user.clone()),
+    )
+    .await
     {
         Ok(allowed) if !allowed => {
             return (
@@ -1205,7 +1213,7 @@ async fn list_models(
     State(state): State<ServerState>,
     auth_user: Option<Extension<AuthenticatedUser>>,
 ) -> impl IntoResponse {
-    let (user, domain, _, _) = match extract_auth(auth_user.as_ref().map(|Extension(u)| u)) {
+    let (user, domain, jwt_token, _) = match extract_auth(auth_user.as_ref().map(|Extension(u)| u)) {
         Ok(identity) => identity,
         Err(_) => {
             return (
@@ -1219,15 +1227,19 @@ async fn list_models(
                 .into_response();
         }
     };
-    if !state
-        .policy_client
-        .check(&crate::services::generated::policy_client::PolicyCheck {
-            subject: user,
-            domain,
-            resource: "registry:*".to_owned(),
-            operation: Operation::Query.as_str().to_owned(),
-        })
-        .await
+    let policy_request = crate::services::generated::policy_client::PolicyCheck {
+        subject: user.clone(),
+        domain,
+        resource: "registry:*".to_owned(),
+        operation: Operation::Query.as_str().to_owned(),
+    };
+    if !crate::services::policy::check_with_verified_bearer(
+        &state.policy_client,
+        &policy_request,
+        jwt_token.as_deref(),
+        &hyprstream_rpc::envelope::Subject::new(user),
+    )
+    .await
         .unwrap_or(false)
     {
         return (

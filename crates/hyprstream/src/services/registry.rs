@@ -1779,12 +1779,20 @@ impl RegistryHandler for RegistryService {
         // metadata and paths carry no tenant key. Keep this authorization in
         // the global policy domain rather than claiming storage isolation that
         // the registry does not provide.
-        let allowed = self.policy_client.check(&PolicyCheck {
+        let request = PolicyCheck {
             subject: subject.to_string(),
             domain: "*".to_owned(),
             resource: resource.to_owned(),
             operation: operation.to_owned(),
-        }).await.unwrap_or_else(|e| {
+        };
+        let allowed = crate::services::policy::check_with_verified_bearer(
+            &self.policy_client,
+            &request,
+            ctx.jwt_token(),
+            &ctx.subject(),
+        )
+        .await
+        .unwrap_or_else(|e| {
             warn!("Policy check RPC error: sub={} obj={} act={} err={} - denying access", subject, resource, operation, e);
             false
         });
@@ -1811,13 +1819,23 @@ impl RegistryHandler for RegistryService {
 
             // Policy gate: only include repos the caller has at least query access to
             let resource = format!("model:{}", name);
-            let permitted = self.policy_client
-                .check(&PolicyCheck { subject: subject.clone(), domain: domain.clone(), resource: resource.clone(), operation: "query".to_owned() })
-                .await
-                .unwrap_or_else(|e| {
-                    warn!("Policy check RPC error while filtering {}: {} - denying access", resource, e);
-                    false
-                });
+            let request = PolicyCheck {
+                subject: subject.clone(),
+                domain: domain.clone(),
+                resource: resource.clone(),
+                operation: "query".to_owned(),
+            };
+            let permitted = crate::services::policy::check_with_verified_bearer(
+                &self.policy_client,
+                &request,
+                ctx.jwt_token(),
+                &ctx.subject(),
+            )
+            .await
+            .unwrap_or_else(|e| {
+                warn!("Policy check RPC error while filtering {}: {} - denying access", resource, e);
+                false
+            });
             if !permitted { continue; }
 
             // Collect worktrees with capabilities (holds registry read lock internally)
@@ -3566,6 +3584,16 @@ mod tests {
 
         // Generate keypair for signing/verification
         let (signing_key, _verifying_key) = generate_signing_keypair();
+        hyprstream_service::global_trust_store().insert(
+            signing_key.verifying_key(),
+            hyprstream_service::Attestation {
+                scopes: std::collections::HashSet::new(),
+                subject: Some("service:registry".to_owned()),
+                jwt: None,
+                expires_at: 0,
+                attested_by: None,
+            },
+        );
 
         // Create a permissive policy manager and start PolicyService first
         let policy_manager = Arc::new(PolicyManager::permissive().await.expect("test: create policy manager"));
@@ -3634,6 +3662,16 @@ mod tests {
         let models = root.path().join("models");
         let pds = root.path().join("pds");
         let (key, _) = generate_signing_keypair();
+        hyprstream_service::global_trust_store().insert(
+            key.verifying_key(),
+            hyprstream_service::Attestation {
+                scopes: std::collections::HashSet::new(),
+                subject: Some("service:registry".to_owned()),
+                jwt: None,
+                expires_at: 0,
+                attested_by: None,
+            },
+        );
         let policy_manager = Arc::new(PolicyManager::permissive().await.unwrap());
         let policy_git = Arc::new(RwLock::new(Git2DB::open(&models).await.unwrap()));
         let policy = PolicyService::new(policy_manager, Arc::new(key.clone()),

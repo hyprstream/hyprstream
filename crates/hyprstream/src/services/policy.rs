@@ -30,6 +30,37 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{debug, info, trace, warn};
 
+/// Evaluate a policy check on behalf of an already-verified upstream caller.
+///
+/// The compatibility `PolicyCheck.subject/domain` fields are never identity
+/// evidence. A service that mediates a user request relays the original bearer
+/// in its signed envelope so PolicyService can independently verify both the
+/// user and the hosted-account tenant.
+pub(crate) async fn check_with_verified_bearer(
+    client: &crate::services::PolicyClient,
+    request: &PolicyCheck,
+    bearer: Option<&str>,
+    upstream_subject: &Subject,
+) -> Result<bool> {
+    match bearer {
+        Some(token) => client
+            .clone()
+            .with_delegated_bearer(token.to_owned())
+            .check(request)
+            .await,
+        None => {
+            anyhow::ensure!(
+                !upstream_subject.is_federated()
+                    && upstream_subject
+                        .name()
+                        .is_some_and(|name| { name == "system" || name.starts_with("service:") }),
+                "service-mediated user policy check requires a verified upstream bearer"
+            );
+            client.check(request).await
+        }
+    }
+}
+
 // ============================================================================
 // PolicyService (server-side)
 // ============================================================================
@@ -252,7 +283,8 @@ impl PolicyService {
         let subject = ctx.subject();
         let is_global_service = subject
             .name()
-            .is_some_and(|name| name.starts_with("service:"));
+            .is_some_and(|name| name.starts_with("service:"))
+            && !subject.is_federated();
         let is_policy_authority =
             ctx.cnf == self.signing_key.verifying_key().to_bytes();
         anyhow::ensure!(
@@ -385,25 +417,67 @@ impl PolicyHandler for PolicyService {
 
     async fn handle_check(
         &self,
-        _ctx: &EnvelopeContext,
+        ctx: &EnvelopeContext,
         _request_id: u64,
         data: &PolicyCheck,
     ) -> Result<PolicyResponseVariant> {
+        let subject = ctx.subject();
+        if !ctx.is_authenticated() {
+            warn!(
+                requested_subject = %data.subject,
+                requested_domain = %data.domain,
+                resource = %data.resource,
+                operation = %data.operation,
+                "policy check denied: unauthenticated envelope context"
+            );
+            ctx.audit_authz(&data.resource, &data.operation, false);
+            return Ok(PolicyResponseVariant::CheckResult(false));
+        }
+        let domain = match self.request_domain(ctx) {
+            Ok(domain) => domain,
+            Err(error) => {
+                warn!(
+                    caller = %subject,
+                    requested_subject = %data.subject,
+                    requested_domain = %data.domain,
+                    resource = %data.resource,
+                    operation = %data.operation,
+                    %error,
+                    "policy check denied: no verified authorization domain"
+                );
+                ctx.audit_authz(&data.resource, &data.operation, false);
+                return Ok(PolicyResponseVariant::CheckResult(false));
+            }
+        };
+
         trace!(
-            "Policy check: subject={}, domain={}, resource={}, operation={}",
-            data.subject, data.domain, data.resource, data.operation
+            "Policy check: verified_subject={}, verified_domain={}, resource={}, operation={}",
+            subject, domain, data.resource, data.operation
         );
 
-        // Check authorization — pass the operation string directly so dot-namespaced
-        // actions (e.g. "ttt.writeback") are forwarded verbatim to the Casbin enforcer.
+        // Subject and domain are derived exclusively from the verified envelope.
+        // The request fields remain on the wire for compatibility, but cannot
+        // select another identity or tenant. Pass the operation string directly
+        // so dot-namespaced actions are forwarded verbatim to Casbin.
         let allowed = self.policy_manager.check_with_domain(
-            &data.subject,
-            &data.domain,
+            &subject.to_string(),
+            &domain,
             &data.resource,
             &data.operation,
         ).await;
 
-        debug!("Policy check result: allowed={}", allowed);
+        if allowed {
+            debug!(caller = %subject, %domain, "policy check allowed");
+        } else {
+            warn!(
+                caller = %subject,
+                %domain,
+                resource = %data.resource,
+                operation = %data.operation,
+                "policy check denied by policy"
+            );
+        }
+        ctx.audit_authz(&data.resource, &data.operation, allowed);
         Ok(PolicyResponseVariant::CheckResult(allowed))
     }
 
@@ -1830,6 +1904,28 @@ impl RequestService for PolicyService {
         });
     }
 
+    fn accept_delegated_bearer(&self, signer_pubkey: &[u8; 32]) -> bool {
+        let Some(actor) =
+            hyprstream_service::global_trust_store().resolve_subject(signer_pubkey)
+        else {
+            return false;
+        };
+        let Some(actor_name) = actor.name() else {
+            return false;
+        };
+        if actor.is_federated() || !actor_name.starts_with("service:") {
+            return false;
+        }
+
+        policy_templates::SERVICE_BASE_POLICIES.iter().any(|rule| {
+            (rule.subject == actor_name || rule.subject == "service:*")
+                && rule.domain == "*"
+                && matches!(rule.resource, "policy:*" | "policy:PolicyCheck")
+                && matches!(rule.action, "*" | "check")
+                && rule.effect == "allow"
+        })
+    }
+
     fn build_error_payload(&self, request_id: u64, error: &str) -> Vec<u8> {
         let variant = PolicyResponseVariant::Error(ErrorInfo {
             message: error.to_owned(),
@@ -1983,6 +2079,15 @@ mod tests {
             EnvelopeContext::for_test_authenticated_subject(Subject::new("alice"), service_signer);
         assert!(service.request_domain(&tenantless_user).is_err());
 
+        let federated_service = EnvelopeContext::for_test_authenticated_subject(
+            Subject::federated("https://peer.example", "service:oauth"),
+            service_signer,
+        );
+        assert!(
+            service.request_domain(&federated_service).is_err(),
+            "a federated subject cannot claim local global-service authority by name"
+        );
+
         let wildcard_service = EnvelopeContext::for_test_authenticated_subject_in_tenant(
             Subject::new("service:oauth"),
             "*",
@@ -2000,6 +2105,329 @@ mod tests {
                 .expect("PolicyService bootstrap authority domain"),
             "*"
         );
+    }
+
+    #[tokio::test]
+    async fn unauthenticated_policy_check_is_denied() {
+        let manager = Arc::new(
+            PolicyManager::new_in_memory()
+                .await
+                .expect("test: policy manager"),
+        );
+        manager
+            .add_policy_with_domain(
+                "alice",
+                "tenant-a",
+                "model:allowed",
+                "infer.generate",
+                "allow",
+            )
+            .await
+            .expect("test: policy grant");
+        let (service, _root) = test_service_with_manager(manager).await;
+        let ctx = EnvelopeContext::for_test_authenticated_subject(
+            Subject::anonymous(),
+            SigningKey::from_bytes(&[0x53; 32]).verifying_key(),
+        );
+        let request = PolicyCheck {
+            subject: "alice".to_owned(),
+            domain: "tenant-a".to_owned(),
+            resource: "model:allowed".to_owned(),
+            operation: "infer.generate".to_owned(),
+        };
+
+        let response = service
+            .handle_check(&ctx, 1, &request)
+            .await
+            .expect("denial is a policy response");
+        assert!(matches!(
+            response,
+            PolicyResponseVariant::CheckResult(false)
+        ));
+    }
+
+    #[tokio::test]
+    async fn policy_check_uses_verified_context_not_requested_identity() {
+        let manager = Arc::new(
+            PolicyManager::new_in_memory()
+                .await
+                .expect("test: policy manager"),
+        );
+        manager
+            .add_policy_with_domain(
+                "alice",
+                "tenant-a",
+                "model:own",
+                "infer.generate",
+                "allow",
+            )
+            .await
+            .expect("test: own-tenant grant");
+        manager
+            .add_policy_with_domain(
+                "victim",
+                "tenant-b",
+                "model:foreign",
+                "infer.generate",
+                "allow",
+            )
+            .await
+            .expect("test: foreign-tenant grant");
+        let (service, _root) = test_service_with_manager(manager).await;
+        let ctx = EnvelopeContext::for_test_authenticated_subject_in_tenant(
+            Subject::new("alice"),
+            "tenant-a",
+            SigningKey::from_bytes(&[0x54; 32]).verifying_key(),
+        );
+
+        let forged_probe = PolicyCheck {
+            subject: "victim".to_owned(),
+            domain: "tenant-b".to_owned(),
+            resource: "model:foreign".to_owned(),
+            operation: "infer.generate".to_owned(),
+        };
+        let denied = service
+            .handle_check(&ctx, 1, &forged_probe)
+            .await
+            .expect("denial is a policy response");
+        assert!(matches!(
+            denied,
+            PolicyResponseVariant::CheckResult(false)
+        ));
+
+        let stale_wire_identity = PolicyCheck {
+            subject: "victim".to_owned(),
+            domain: "tenant-b".to_owned(),
+            resource: "model:own".to_owned(),
+            operation: "infer.generate".to_owned(),
+        };
+        let allowed = service
+            .handle_check(&ctx, 2, &stale_wire_identity)
+            .await
+            .expect("allow is a policy response");
+        assert!(matches!(
+            allowed,
+            PolicyResponseVariant::CheckResult(true)
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn service_mediated_check_uses_verified_user_not_broad_deputy() {
+        use hyprstream_service::{InprocManager, ServiceManager};
+
+        crate::mac::install_explicit_test_dispatch_pep();
+        let _ = hyprstream_rpc::envelope::install_verify_config(
+            hyprstream_rpc::envelope::EnvelopeVerifyConfig {
+                policy: hyprstream_rpc::crypto::CryptoPolicy::Classical,
+                pq_store: None,
+            },
+        );
+        let _ = hyprstream_rpc::envelope::install_response_verify_config(
+            hyprstream_rpc::envelope::ResponseVerifyConfig {
+                policy: hyprstream_rpc::crypto::CryptoPolicy::Classical,
+                pq_store: None,
+            },
+        );
+
+        let manager = Arc::new(
+            PolicyManager::new_in_memory()
+                .await
+                .expect("test: policy manager"),
+        );
+        manager
+            .add_policy_with_domain(
+                "alice",
+                "did:web:tenant-a.example",
+                "model:allowed",
+                "infer.generate",
+                "allow",
+            )
+            .await
+            .expect("test: tenant user grant");
+        manager
+            .add_policy_with_domain(
+                "service:registry",
+                "*",
+                "model:deputy-only",
+                "infer.generate",
+                "allow",
+            )
+            .await
+            .expect("test: broad deputy grant");
+        let allowed_federation =
+            crate::auth::federation_registration_resource("https://allowed.example")
+                .expect("test: federation resource");
+        let blocked_federation =
+            crate::auth::federation_registration_resource("https://blocked.example")
+                .expect("test: federation resource");
+        manager
+            .add_policy_with_domain(
+                "*",
+                "*",
+                &allowed_federation,
+                "check",
+                "allow",
+            )
+            .await
+            .expect("test: per-origin federation grant");
+
+        let endpoint = format!("policy-delegation-{}", rand::random::<u64>());
+        let policy_key = SigningKey::from_bytes(&[0x70; 32]);
+        let actor_key = SigningKey::from_bytes(&[0x71; 32]);
+        let actor_verifying_key = actor_key.verifying_key();
+        let user_key = SigningKey::from_bytes(&[0x72; 32]);
+        let other_user_key = SigningKey::from_bytes(&[0x73; 32]);
+        let issuer = "https://policy-delegation.test";
+        let key_source = hyprstream_rpc::auth::ClusterKeySource::new(
+            policy_key.verifying_key(),
+            issuer.to_owned(),
+        );
+        let root = tempfile::tempdir().expect("test: policy git directory");
+        let git2db = Arc::new(RwLock::new(
+            Git2DB::open(root.path())
+                .await
+                .expect("test: open policy git database"),
+        ));
+        let service = PolicyService::new(
+            manager,
+            Arc::new(policy_key.clone()),
+            crate::config::TokenConfig::default(),
+            git2db,
+            TransportConfig::inproc(&endpoint),
+        )
+        .with_jwt_key_source(Arc::new(key_source));
+        let services = InprocManager::new();
+        services
+            .spawn(Box::new(service))
+            .await
+            .expect("test: spawn policy service");
+
+        let now = chrono::Utc::now().timestamp();
+        hyprstream_service::global_trust_store().insert(
+            actor_verifying_key,
+            hyprstream_service::Attestation {
+                scopes: ["registry".to_owned()].into_iter().collect(),
+                subject: None,
+                jwt: None,
+                expires_at: now + 300,
+                attested_by: Some(policy_key.verifying_key().to_bytes()),
+            },
+        );
+        let user_token = hyprstream_rpc::auth::jwt::encode(
+            &hyprstream_rpc::auth::Claims::new("alice".to_owned(), now, now + 300)
+                .with_issuer(issuer.to_owned())
+                .with_tenant("did:web:tenant-a.example".to_owned())
+                .with_cnf_jwk(user_key.verifying_key().as_bytes()),
+            &policy_key,
+        );
+        let other_tenant_token = hyprstream_rpc::auth::jwt::encode(
+            &hyprstream_rpc::auth::Claims::new("bob".to_owned(), now, now + 300)
+                .with_issuer(issuer.to_owned())
+                .with_tenant("did:web:tenant-b.example".to_owned())
+                .with_cnf_jwk(other_user_key.verifying_key().as_bytes()),
+            &policy_key,
+        );
+        let client = crate::services::PolicyClient::for_local_endpoint_bootstrap(
+            &format!("inproc://{endpoint}"),
+            actor_key,
+            policy_key.verifying_key(),
+            None,
+        )
+        .expect("test: policy client");
+
+        let allowed_origin = client
+            .check(&PolicyCheck {
+                subject: String::new(),
+                domain: String::new(),
+                resource: allowed_federation,
+                operation: "check".to_owned(),
+            })
+            .await
+            .expect("test: allowlisted federation decision");
+        assert!(allowed_origin, "the allowlisted origin must be admitted");
+
+        let blocked_origin = client
+            .check(&PolicyCheck {
+                subject: String::new(),
+                domain: String::new(),
+                resource: blocked_federation,
+                operation: "check".to_owned(),
+            })
+            .await
+            .expect("test: non-allowlisted federation decision");
+        assert!(
+            !blocked_origin,
+            "the decision must vary by origin, not the deputy service"
+        );
+
+        let allowed = client
+            .clone()
+            .with_delegated_bearer(user_token.clone())
+            .check(&PolicyCheck {
+                subject: "victim".to_owned(),
+                domain: "did:web:tenant-b.example".to_owned(),
+                resource: "model:allowed".to_owned(),
+                operation: "infer.generate".to_owned(),
+            })
+            .await
+            .expect("test: tenant user decision");
+        assert!(allowed, "verified delegated user grant must be effective");
+
+        let cross_tenant = client
+            .clone()
+            .with_delegated_bearer(other_tenant_token)
+            .check(&PolicyCheck {
+                subject: "alice".to_owned(),
+                domain: "did:web:tenant-a.example".to_owned(),
+                resource: "model:allowed".to_owned(),
+                operation: "infer.generate".to_owned(),
+            })
+            .await
+            .expect("test: cross-tenant decision");
+        assert!(
+            !cross_tenant,
+            "tenant-b's verified bearer must not inherit tenant-a's grant"
+        );
+
+        let denied = client
+            .with_delegated_bearer(user_token)
+            .check(&PolicyCheck {
+                subject: "service:registry".to_owned(),
+                domain: "*".to_owned(),
+                resource: "model:deputy-only".to_owned(),
+                operation: "infer.generate".to_owned(),
+            })
+            .await
+            .expect("test: broad deputy decision");
+        assert!(
+            !denied,
+            "the deputy's broad global grant must not replace the delegated user"
+        );
+        hyprstream_service::global_trust_store().remove(&actor_verifying_key);
+    }
+
+    #[tokio::test]
+    async fn tenantless_user_policy_check_is_denied() {
+        let (service, _root) = test_service().await;
+        let ctx = EnvelopeContext::for_test_authenticated_subject(
+            Subject::new("alice"),
+            SigningKey::from_bytes(&[0x55; 32]).verifying_key(),
+        );
+        let request = PolicyCheck {
+            subject: "alice".to_owned(),
+            domain: "*".to_owned(),
+            resource: "model:any".to_owned(),
+            operation: "infer.generate".to_owned(),
+        };
+
+        let response = service
+            .handle_check(&ctx, 1, &request)
+            .await
+            .expect("denial is a policy response");
+        assert!(matches!(
+            response,
+            PolicyResponseVariant::CheckResult(false)
+        ));
     }
 
     #[tokio::test]

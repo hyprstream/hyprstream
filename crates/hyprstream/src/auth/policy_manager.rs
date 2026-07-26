@@ -33,7 +33,11 @@
 
 use crate::auth::policy_templates::{base_policies_to_csv, base_policies_to_vec, ServiceGrouping, ServicePolicyRule};
 use crate::auth::Operation;
-use casbin::{CoreApi, DefaultModel, Enforcer, FileAdapter, MemoryAdapter, MgmtApi, RbacApi};
+use casbin::function_map::{dynamic_to_str, OperatorFunction};
+use casbin::rhai::Dynamic;
+use casbin::{
+    CoreApi, DefaultModel, Enforcer, FileAdapter, MemoryAdapter, MgmtApi, RbacApi,
+};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 use thiserror::Error;
@@ -79,6 +83,111 @@ pub enum PolicyError {
 
 /// Maximum length for policy components (user, resource, operation)
 const MAX_POLICY_COMPONENT_LEN: usize = 256;
+
+/// Resource namespace for the unified third-party/peer federation gate.
+///
+/// The origin is policy data, not an authenticated principal. Keeping it in
+/// the resource means `PolicyCheck.subject` can remain inert while the
+/// decision still varies by the normalized RFC 6454 origin.
+pub const FEDERATION_REGISTER_RESOURCE_PREFIX: &str = "federation:register:";
+
+/// Encode a normalized federation origin as a policy resource.
+pub fn federation_registration_resource(origin: &str) -> Result<String, PolicyError> {
+    validate_policy_component(origin, "federation origin")?;
+    let resource = format!("{FEDERATION_REGISTER_RESOURCE_PREFIX}{origin}");
+    validate_policy_component(&resource, "federation registration resource")?;
+    Ok(resource)
+}
+
+fn federation_origin_pattern_matches(request_origin: &str, policy_origin: &str) -> bool {
+    if request_origin == policy_origin {
+        return true;
+    }
+    if policy_origin.matches('*').count() != 1 {
+        return false;
+    }
+
+    let Some((scheme, authority_pattern)) = policy_origin.split_once("://") else {
+        return false;
+    };
+    let Some(authority_suffix) = authority_pattern.strip_prefix("*.") else {
+        return false;
+    };
+    if authority_suffix.contains('*') {
+        return false;
+    }
+
+    // Substitute a valid DNS label so URL parsing can validate the scheme,
+    // authority, and optional port without ever evaluating an operator-provided
+    // glob as executable matcher syntax.
+    let Ok(policy_url) = url::Url::parse(&format!("{scheme}://wildcard.{authority_suffix}")) else {
+        return false;
+    };
+    let Ok(request_url) = url::Url::parse(request_origin) else {
+        return false;
+    };
+    if policy_url.path() != "/"
+        || request_url.path() != "/"
+        || policy_url.query().is_some()
+        || request_url.query().is_some()
+        || policy_url.fragment().is_some()
+        || request_url.fragment().is_some()
+        || !policy_url.username().is_empty()
+        || !request_url.username().is_empty()
+        || policy_url.password().is_some()
+        || request_url.password().is_some()
+        || policy_url.scheme() != request_url.scheme()
+        || policy_url.port_or_known_default() != request_url.port_or_known_default()
+    {
+        return false;
+    }
+
+    let Some(policy_host) = policy_url.host_str() else {
+        return false;
+    };
+    let Some(host_suffix) = policy_host.strip_prefix("wildcard.") else {
+        return false;
+    };
+    let Some(request_host) = request_url.host_str() else {
+        return false;
+    };
+    request_host
+        .strip_suffix(host_suffix)
+        .is_some_and(|prefix| !prefix.is_empty() && prefix.ends_with('.'))
+}
+
+fn federation_resource_matches(request_resource: &str, policy_resource: &str) -> bool {
+    if policy_resource == "*" {
+        return true;
+    }
+    let Some(request_origin) = request_resource.strip_prefix(FEDERATION_REGISTER_RESOURCE_PREFIX)
+    else {
+        return false;
+    };
+    let Some(policy_origin) = policy_resource.strip_prefix(FEDERATION_REGISTER_RESOURCE_PREFIX)
+    else {
+        return false;
+    };
+    if policy_origin == "*" {
+        return true;
+    }
+    federation_origin_pattern_matches(request_origin, policy_origin)
+}
+
+fn federation_match_operator(request: Dynamic, policy: Dynamic) -> Dynamic {
+    federation_resource_matches(
+        dynamic_to_str(&request).as_ref(),
+        dynamic_to_str(&policy).as_ref(),
+    )
+    .into()
+}
+
+fn install_policy_functions(enforcer: &mut Enforcer) {
+    enforcer.add_function(
+        "federationMatch",
+        OperatorFunction::Arg2(federation_match_operator),
+    );
+}
 
 /// Validate a policy component for security
 ///
@@ -135,7 +244,8 @@ fn validate_policy_component(component: &str, name: &str) -> Result<(), PolicyEr
 /// - Domain-scoped access control (e.g., HfModel, HfDataset)
 /// - Deny rules via explicit effect column
 /// - Wildcards for domain and action
-/// - Role-based access via g()
+/// - Global-service role access via g() in the explicit `*` domain
+/// - Tenant-scoped role access via g2()
 const DEFAULT_MODEL_CONF: &str = r#"[request_definition]
 r = sub, dom, obj, act
 
@@ -150,9 +260,9 @@ g2 = _, _, _
 e = some(where (p.eft == allow)) && !some(where (p.eft == deny))
 
 [matchers]
-m = (g(r.sub, p.sub) || g2(r.sub, p.sub, r.dom) || keyMatch(r.sub, p.sub)) && \
+m = ((r.dom == "*" && g(r.sub, p.sub)) || g2(r.sub, p.sub, r.dom) || keyMatch(r.sub, p.sub)) && \
     (p.dom == "*" || r.dom == p.dom) && \
-    keyMatch(r.obj, p.obj) && \
+    ((keyMatch(r.obj, "federation:register:*") && federationMatch(r.obj, p.obj)) || (!keyMatch(r.obj, "federation:register:*") && keyMatch(r.obj, p.obj))) && \
     (p.act == "*" || keyMatch(r.act, p.act))
 "#;
 
@@ -268,34 +378,110 @@ pub async fn write_policy_file(path: &Path, content: impl AsRef<[u8]>) -> Result
 
 async fn ensure_domain_role_model(model_path: &Path) -> Result<(), PolicyError> {
     let content = tokio::fs::read_to_string(model_path).await?;
+    const GLOBAL_ROLE_CALL: &str = "g(r.sub, p.sub)";
+    const GUARDED_ROLE_MATCHER: &str =
+        "m = ((r.dom == \"*\" && g(r.sub, p.sub)) || g2(r.sub, p.sub, r.dom) || keyMatch(r.sub, p.sub))";
+    const SAFE_RESOURCE_MATCHER: &str = "((keyMatch(r.obj, \"federation:register:*\") && federationMatch(r.obj, p.obj)) || (!keyMatch(r.obj, \"federation:register:*\") && keyMatch(r.obj, p.obj)))";
+
     if content.contains("g2 = _, _, _")
-        && content.contains("g2(r.sub, p.sub, r.dom)")
+        && content.contains(GUARDED_ROLE_MATCHER)
+        && content.contains(SAFE_RESOURCE_MATCHER)
+        && content.matches(GLOBAL_ROLE_CALL).count() == 1
     {
         return Ok(());
     }
 
-    let migrated = content
+    let mut migrated = content
         .replacen(
             "[role_definition]\ng = _, _",
             "[role_definition]\ng = _, _\ng2 = _, _, _",
             1,
         )
         .replacen(
-            "m = (g(r.sub, p.sub) || keyMatch(r.sub, p.sub))",
             "m = (g(r.sub, p.sub) || g2(r.sub, p.sub, r.dom) || keyMatch(r.sub, p.sub))",
+            GUARDED_ROLE_MATCHER,
+            1,
+        )
+        .replacen(
+            "m = (g(r.sub, p.sub) || keyMatch(r.sub, p.sub))",
+            GUARDED_ROLE_MATCHER,
             1,
         );
+    if !migrated.contains(SAFE_RESOURCE_MATCHER) {
+        migrated = migrated.replacen("keyMatch(r.obj, p.obj)", SAFE_RESOURCE_MATCHER, 1);
+    }
+    if !migrated.contains(SAFE_RESOURCE_MATCHER) {
+        migrated = migrated.replacen("keyMatch(r.obj,p.obj)", SAFE_RESOURCE_MATCHER, 1);
+    }
     if !migrated.contains("g2 = _, _, _")
-        || !migrated.contains("g2(r.sub, p.sub, r.dom)")
+        || !migrated.contains(GUARDED_ROLE_MATCHER)
+        || !migrated.contains(SAFE_RESOURCE_MATCHER)
+        || migrated.matches(GLOBAL_ROLE_CALL).count() != 1
     {
         return Err(PolicyError::ValidationError(format!(
-            "{} must define domain-scoped g2(user, role, domain) membership",
+            "{} must restrict legacy g(user, role) membership to the global '*' domain, define domain-scoped g2(user, role, domain) membership, and use separator-aware matching for federation origins",
             model_path.display()
         )));
     }
 
     write_policy_file(model_path, migrated).await?;
     Ok(())
+}
+
+fn is_legacy_federation_origin_subject(subject: &str) -> bool {
+    subject == "*"
+        || subject.starts_with("https://")
+        || subject.starts_with("http://")
+}
+
+/// Move pre-hardening federation rules from the caller identity slot into the
+/// resource slot. This preserves existing per-origin allow/deny lists without
+/// making an HTTPS origin a trusted envelope subject.
+async fn migrate_federation_origin_policies(
+    enforcer: &mut Enforcer,
+) -> Result<bool, PolicyError> {
+    let legacy: Vec<Vec<String>> = enforcer
+        .get_policy()
+        .into_iter()
+        .filter(|rule| {
+            rule.len() == 5
+                && rule.get(2).is_some_and(|resource| resource == "federation:register")
+                && rule
+                    .first()
+                    .is_some_and(|subject| is_legacy_federation_origin_subject(subject))
+        })
+        .collect();
+
+    if legacy.is_empty() {
+        return Ok(false);
+    }
+
+    for old_rule in legacy {
+        let origin_pattern = old_rule
+            .first()
+            .ok_or_else(|| {
+                PolicyError::ValidationError(
+                    "legacy federation rule is missing its origin subject".to_owned(),
+                )
+            })?
+            .clone();
+        let mut migrated_rule = old_rule.clone();
+        migrated_rule[0] = "*".to_owned();
+        migrated_rule[2] = federation_registration_resource(&origin_pattern)?;
+
+        enforcer
+            .remove_policy(old_rule)
+            .await
+            .map_err(PolicyError::CasbinError)?;
+        if !enforcer.get_policy().contains(&migrated_rule) {
+            enforcer
+                .add_policy(migrated_rule)
+                .await
+                .map_err(PolicyError::CasbinError)?;
+        }
+    }
+
+    Ok(true)
 }
 
 /// Policy manager wrapping Casbin enforcer
@@ -354,6 +540,13 @@ impl PolicyManager {
         let mut enforcer = Enforcer::new(model, adapter)
             .await
             .map_err(|e| PolicyError::PolicyLoadError(e.to_string()))?;
+        install_policy_functions(&mut enforcer);
+        if migrate_federation_origin_policies(&mut enforcer).await? {
+            enforcer
+                .save_policy()
+                .await
+                .map_err(|e| PolicyError::PolicySaveError(e.to_string()))?;
+        }
 
         // Inject SERVICE_BASE_POLICIES into the in-memory enforcer.
         // These are code-defined infrastructure rules (service key resolution,
@@ -401,6 +594,7 @@ impl PolicyManager {
         let mut enforcer = Enforcer::new(model, adapter)
             .await
             .map_err(|e| PolicyError::PolicyLoadError(e.to_string()))?;
+        install_policy_functions(&mut enforcer);
 
         // Add permissive default rule: anyone can do anything in any domain
         enforcer
@@ -434,9 +628,10 @@ impl PolicyManager {
             .map_err(|e| PolicyError::ModelLoadError(e.to_string()))?;
 
         let adapter = MemoryAdapter::default();
-        let enforcer = Enforcer::new(model, adapter)
+        let mut enforcer = Enforcer::new(model, adapter)
             .await
             .map_err(|e| PolicyError::PolicyLoadError(e.to_string()))?;
+        install_policy_functions(&mut enforcer);
 
         Ok(Self {
             enforcer: Arc::new(RwLock::new(enforcer)),
@@ -571,6 +766,15 @@ impl PolicyManager {
         operation: &str,
         effect: &str,
     ) -> Result<bool, PolicyError> {
+        let migrated_resource;
+        let (user, resource) =
+            if resource == "federation:register" && is_legacy_federation_origin_subject(user) {
+                migrated_resource = federation_registration_resource(user)?;
+                ("*", migrated_resource.as_str())
+            } else {
+                (user, resource)
+            };
+
         // Validate all inputs
         validate_policy_component(user, "user")?;
         validate_policy_component(domain, "domain")?;
@@ -622,6 +826,15 @@ impl PolicyManager {
         operation: &str,
         effect: &str,
     ) -> Result<bool, PolicyError> {
+        let migrated_resource;
+        let (user, resource) =
+            if resource == "federation:register" && is_legacy_federation_origin_subject(user) {
+                migrated_resource = federation_registration_resource(user)?;
+                ("*", migrated_resource.as_str())
+            } else {
+                (user, resource)
+            };
+
         // Validate all inputs
         validate_policy_component(user, "user")?;
         validate_policy_component(domain, "domain")?;
@@ -772,6 +985,12 @@ impl PolicyManager {
             .load_policy()
             .await
             .map_err(|e| PolicyError::PolicyLoadError(e.to_string()))?;
+        if migrate_federation_origin_policies(&mut enforcer).await? {
+            enforcer
+                .save_policy()
+                .await
+                .map_err(|e| PolicyError::PolicySaveError(e.to_string()))?;
+        }
         // Filter out rules already loaded from CSV (Casbin add_policies
         // aborts the entire batch on first duplicate).
         let base = base_policies_to_vec();
@@ -797,22 +1016,55 @@ impl PolicyManager {
         &self,
         template: &crate::auth::policy_templates::PolicyTemplate,
     ) -> Result<(), PolicyError> {
+        let policies = template.expanded_policies();
+        let tenant_domains: std::collections::BTreeSet<&str> = policies
+            .iter()
+            .map(|policy| policy.domain)
+            .filter(|domain| *domain != "*")
+            .collect();
+        if template.groupings.is_some() && tenant_domains.len() > 1 {
+            return Err(PolicyError::ValidationError(format!(
+                "template '{}' has role assignments spanning multiple tenant domains",
+                template.name
+            )));
+        }
+
+        // Validate the complete template before mutating the enforcer so a
+        // rejected multi-tenant grouping cannot leave partial policy rows.
         let mut enforcer = self.enforcer.write().await;
 
         // Add policy rules
-        let policies = template.expanded_policies();
-        let policy_vecs: Vec<Vec<String>> = policies.iter().map(ServicePolicyRule::to_vec).collect();
+        let policy_vecs: Vec<Vec<String>> = policies
+            .iter()
+            .map(ServicePolicyRule::to_vec)
+            .collect();
         if !policy_vecs.is_empty() {
-            enforcer
-                .add_policies(policy_vecs)
+            enforcer.add_policies(policy_vecs)
                 .await
                 .map_err(PolicyError::CasbinError)?;
         }
 
-        // Add grouping rules
+        // Add grouping rules. A template whose policies name one concrete
+        // tenant gets g2 memberships in that tenant. Global/role-alias
+        // templates retain g memberships, which the model evaluates only when
+        // the verified request domain itself is `*`.
         if let Some(groupings) = template.groupings {
-            let grouping_vecs: Vec<Vec<String>> = groupings.iter().map(ServiceGrouping::to_vec).collect();
-            if !grouping_vecs.is_empty() {
+            if let Some(domain) = tenant_domains.first() {
+                for grouping in groupings {
+                    enforcer
+                        .add_named_grouping_policy(
+                            "g2",
+                            vec![
+                                grouping.user.to_owned(),
+                                grouping.role.to_owned(),
+                                (*domain).to_owned(),
+                            ],
+                        )
+                        .await
+                        .map_err(PolicyError::CasbinError)?;
+                }
+            } else {
+                let grouping_vecs: Vec<Vec<String>> = groupings.iter().map(ServiceGrouping::to_vec).collect();
                 enforcer
                     .add_grouping_policies(grouping_vecs)
                     .await
@@ -1015,6 +1267,167 @@ mod tests {
             pm.check_with_domain("alice", "tenant-a", "model:test", "infer.generate")
                 .await
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn legacy_global_role_grant_is_inert_in_tenant_domains() -> Result<(), PolicyError> {
+        let pm = PolicyManager::new_in_memory().await?;
+        for tenant in ["tenant-a", "tenant-b"] {
+            pm.add_policy_with_domain(
+                "operator",
+                tenant,
+                "model:*",
+                "ttt.writeback",
+                "allow",
+            )
+            .await?;
+        }
+
+        // Simulate a pre-#1196 g(user, role) row already present in policy.csv.
+        pm.add_role_for_user("alice", "operator").await?;
+
+        for tenant in ["tenant-a", "tenant-b"] {
+            assert!(
+                !pm.check_with_domain("alice", tenant, "model:test", "ttt.writeback")
+                    .await,
+                "legacy global role membership must not authorize tenant {tenant}"
+            );
+        }
+
+        pm.add_role_for_user_in_domain("alice", "operator", "tenant-a")
+            .await?;
+        assert!(
+            pm.check_with_domain("alice", "tenant-a", "model:test", "ttt.writeback")
+                .await
+        );
+        assert!(
+            !pm.check_with_domain("alice", "tenant-b", "model:test", "ttt.writeback")
+                .await
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn federation_origin_wildcards_are_dns_label_scoped_and_fail_closed() {
+        let pattern = "https://*.partner.example";
+        assert!(federation_origin_pattern_matches(
+            "https://app.partner.example",
+            pattern
+        ));
+        assert!(federation_origin_pattern_matches(
+            "https://deep.app.partner.example",
+            pattern
+        ));
+        for denied in [
+            "https://partner.example",
+            "https://blocked.example",
+            "https://app.partner.example.evil",
+            "http://app.partner.example",
+            "https://app.partner.example:8443",
+        ] {
+            assert!(
+                !federation_origin_pattern_matches(denied, pattern),
+                "{denied} must not match {pattern}"
+            );
+        }
+        assert!(!federation_origin_pattern_matches(
+            "https://app.partner.example",
+            "https://*.*.partner.example"
+        ));
+        assert!(federation_origin_pattern_matches(
+            "https://[::1]:8443",
+            "https://[::1]:8443"
+        ));
+        assert!(!federation_resource_matches(
+            "federation:register:https://app.partner.example",
+            "federation:register"
+        ));
+    }
+
+    #[tokio::test]
+    async fn legacy_federation_origin_rule_is_migrated_to_resource() -> Result<(), PolicyError> {
+        let temp = TempDir::new().map_err(PolicyError::IoError)?;
+        let policies_dir = temp.path().join("policies");
+        tokio::fs::create_dir_all(&policies_dir).await?;
+        write_policy_file(&policies_dir.join("model.conf"), DEFAULT_MODEL_CONF).await?;
+        write_policy_file(
+            &policies_dir.join("policy.csv"),
+            "p, https://allowed.example, *, federation:register, check, allow\n\
+             p, https://*.partner.example, *, federation:register, check, allow\n",
+        )
+        .await?;
+
+        let pm = PolicyManager::new(&policies_dir).await?;
+        let allowed = federation_registration_resource("https://allowed.example")?;
+        let wildcard_allowed =
+            federation_registration_resource("https://app.partner.example")?;
+        let blocked = federation_registration_resource("https://blocked.example")?;
+
+        assert!(
+            pm.check_with_domain("service:oauth", "*", &allowed, "check")
+                .await,
+            "the migrated decision must still admit its configured origin"
+        );
+        assert!(
+            pm.check_with_domain("service:oauth", "*", &wildcard_allowed, "check")
+                .await,
+            "migrated wildcard origin patterns must remain effective"
+        );
+        assert!(
+            !pm.check_with_domain("service:oauth", "*", &blocked, "check")
+                .await,
+            "the decision must vary by origin instead of the deputy service"
+        );
+
+        let policies = pm.get_policy().await;
+        assert!(policies.iter().any(|rule| {
+            rule
+                == &vec![
+                    "*".to_owned(),
+                    "*".to_owned(),
+                    allowed.clone(),
+                    "check".to_owned(),
+                    "allow".to_owned(),
+                ]
+        }));
+        assert!(!policies.iter().any(|rule| {
+            rule.first().is_some_and(|subject| subject.starts_with("https://"))
+                && rule
+                    .get(2)
+                    .is_some_and(|resource| resource == "federation:register")
+        }));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn legacy_model_is_migrated_before_global_roles_are_loaded() -> Result<(), PolicyError> {
+        let temp = TempDir::new().map_err(PolicyError::IoError)?;
+        let policies_dir = temp.path().join("policies");
+        tokio::fs::create_dir_all(&policies_dir).await?;
+        let legacy_model = DEFAULT_MODEL_CONF.replace(
+            "m = ((r.dom == \"*\" && g(r.sub, p.sub)) || g2(r.sub, p.sub, r.dom) || keyMatch(r.sub, p.sub))",
+            "m = (g(r.sub, p.sub) || g2(r.sub, p.sub, r.dom) || keyMatch(r.sub, p.sub))",
+        );
+        write_policy_file(&policies_dir.join("model.conf"), legacy_model).await?;
+        write_policy_file(
+            &policies_dir.join("policy.csv"),
+            "p, operator, tenant-a, model:*, ttt.writeback, allow\n\
+             p, operator, tenant-b, model:*, ttt.writeback, allow\n\
+             g, alice, operator\n",
+        )
+        .await?;
+
+        let pm = PolicyManager::new(&policies_dir).await?;
+        let migrated = tokio::fs::read_to_string(policies_dir.join("model.conf")).await?;
+        assert!(migrated.contains("r.dom == \"*\" && g(r.sub, p.sub)"));
+        for tenant in ["tenant-a", "tenant-b"] {
+            assert!(
+                !pm.check_with_domain("alice", tenant, "model:test", "ttt.writeback")
+                    .await,
+                "loaded legacy grant must be inert in tenant {tenant}"
+            );
+        }
         Ok(())
     }
 
@@ -1362,14 +1775,26 @@ mod tests {
     async fn apply_template(pm: &PolicyManager, name: &str) {
         let tmpl = crate::auth::policy_templates::get_template(name)
             .unwrap_or_else(|| panic!("template {name} must exist"));
-        for r in tmpl.expanded_policies() {
+        let policies = tmpl.expanded_policies();
+        let tenant_domains: std::collections::BTreeSet<&str> = policies
+            .iter()
+            .map(|policy| policy.domain)
+            .filter(|domain| *domain != "*")
+            .collect();
+        for r in policies {
             pm.add_policy_with_domain(r.subject, r.domain, r.resource, r.action, r.effect)
                 .await
                 .unwrap();
         }
         if let Some(groupings) = tmpl.groupings {
             for g in groupings {
-                pm.add_role_for_user(g.user, g.role).await.unwrap();
+                if let Some(domain) = tenant_domains.first() {
+                    pm.add_role_for_user_in_domain(g.user, g.role, domain)
+                        .await
+                        .unwrap();
+                } else {
+                    pm.add_role_for_user(g.user, g.role).await.unwrap();
+                }
             }
         }
     }

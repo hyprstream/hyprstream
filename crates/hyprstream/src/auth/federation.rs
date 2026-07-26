@@ -201,11 +201,12 @@ impl FederationKeyResolver {
             // app.partner.org AND a peer at hyprstream.partner.org.
             let origin = crate::services::oauth::registration::extract_origin(issuer)
                 .ok_or_else(|| anyhow!("Invalid issuer URL: {issuer}"))?;
+            let resource = crate::auth::federation_registration_resource(&origin)?;
             match pc
                 .check(&PolicyCheck {
-                    subject: origin.clone(),
-                    domain: origin.clone(),
-                    resource: "federation:register".to_owned(),
+                    subject: String::new(),
+                    domain: String::new(),
+                    resource,
                     operation: "check".to_owned(),
                 })
                 .await

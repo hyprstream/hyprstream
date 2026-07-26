@@ -4,8 +4,9 @@
 //! [`hyprstream_rpc::admission`] (lower crate, no `PolicyService` client). This
 //! module supplies the **stage-1 origin-admission decision** over the real
 //! `PolicyService`, reusing the existing unified federation trust gate
-//! (`federation:register`) verbatim — the same Casbin resource checked by CIMD
-//! client registration and [`crate::auth::federation::FederationKeyResolver`].
+//! (`federation:register:<origin>`) — the same origin-scoped Casbin resource
+//! checked by CIMD client registration and
+//! [`crate::auth::federation::FederationKeyResolver`].
 //!
 //! It also exposes a constructor that assembles a ready-to-use
 //! [`hyprstream_rpc::admission::FederationAdmissionGate`] from a `PolicyClient`
@@ -38,10 +39,10 @@ use crate::services::PolicyClient;
 /// Stage-1 origin admission over `PolicyService` `federation:register`.
 ///
 /// Wraps the same decision as [`crate::auth::federation::FederationKeyResolver`]'s
-/// peer trust gate: an origin is admitted iff Casbin returns `allow` for
-/// `(subject = origin, domain = "*", resource = "federation:register", op =
-/// "check")`. Fail-closed on denial **and** on `PolicyService` outage — never
-/// default-allow.
+/// peer trust gate: an origin is admitted iff Casbin returns `allow` for the
+/// origin-scoped `federation:register:<origin>` resource. The RPC subject and
+/// domain remain inert; PolicyService derives those only from the verified
+/// envelope context. Fail-closed on denial **and** on `PolicyService` outage.
 pub struct PolicyOriginAdmission {
     policy_client: Arc<PolicyClient>,
 }
@@ -55,12 +56,13 @@ impl PolicyOriginAdmission {
 impl OriginAdmission for PolicyOriginAdmission {
     async fn admit_origin(&self, origin: &str) -> Result<()> {
         use crate::services::generated::policy_client::PolicyCheck;
+        let resource = crate::auth::federation_registration_resource(origin)?;
         match self
             .policy_client
             .check(&PolicyCheck {
-                subject: origin.to_owned(),
-                domain: origin.to_owned(),
-                resource: "federation:register".to_owned(),
+                subject: String::new(),
+                domain: String::new(),
+                resource,
                 operation: "check".to_owned(),
             })
             .await

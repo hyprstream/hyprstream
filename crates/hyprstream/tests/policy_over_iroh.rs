@@ -54,6 +54,7 @@ const CLIENT_SIGNING_SEED: [u8; 32] = [0xC1; 32];
 /// per-subject authorization outcomes over the wire.
 const CLIENT_A_SIGNING_SEED: [u8; 32] = [0xC2; 32];
 const CLIENT_B_SIGNING_SEED: [u8; 32] = [0xC3; 32];
+const SERVICE_CLIENT_SIGNING_SEED: [u8; 32] = [0xC4; 32];
 const TEST_ISSUER: &str = "https://policy.test";
 
 /// Subjects the test trust-store attestations bind to client A / B keys.
@@ -74,6 +75,10 @@ fn policy_client_a_signing_key() -> SigningKey {
 
 fn policy_client_b_signing_key() -> SigningKey {
     SigningKey::from_bytes(&CLIENT_B_SIGNING_SEED)
+}
+
+fn policy_service_client_signing_key() -> SigningKey {
+    SigningKey::from_bytes(&SERVICE_CLIENT_SIGNING_SEED)
 }
 
 /// Bind the fixed-seed client keys to bare user subjects in the global trust
@@ -115,6 +120,7 @@ fn policy_pq_trust_store() -> Arc<dyn PqTrustStore> {
     bind_mesh_anchor(&mut store, &policy_client_signing_key());
     bind_mesh_anchor(&mut store, &policy_client_a_signing_key());
     bind_mesh_anchor(&mut store, &policy_client_b_signing_key());
+    bind_mesh_anchor(&mut store, &policy_service_client_signing_key());
     Arc::new(store)
 }
 
@@ -205,25 +211,18 @@ impl TestTokenAuthority {
             &self.ed25519,
         )
     }
-}
 
-/// Stand up a real `PolicyService` in a fresh tempdir and return it
-/// alongside its signing key and the tempdir guard (which must outlive
-/// the service).
-async fn make_policy_service() -> Result<(PolicyService, SigningKey, TempDir)> {
-    let (service, _manager, signing_key, temp, _authority) =
-        make_policy_service_with_manager_and_authority().await?;
-    Ok((service, signing_key, temp))
-}
-
-/// Like [`make_policy_service`] but also returns the `Arc<PolicyManager>` so
-/// tests can write grants (e.g. per-tenant domain rules for #1128) before
-/// serving.
-async fn make_policy_service_with_manager(
-) -> Result<(PolicyService, Arc<PolicyManager>, SigningKey, TempDir)> {
-    let (service, manager, signing_key, temp, _authority) =
-        make_policy_service_with_manager_and_authority().await?;
-    Ok((service, manager, signing_key, temp))
+    fn service_token(&self, subject: &str, signer: &SigningKey) -> String {
+        let now = chrono::Utc::now().timestamp();
+        let claims = hyprstream_rpc::auth::Claims::new(subject.to_owned(), now, now + 300)
+            .with_issuer(TEST_ISSUER.to_owned())
+            .with_cnf_jwk(signer.verifying_key().as_bytes());
+        hyprstream_core::auth::jwt::encode_composite_ml_dsa_65_ed25519(
+            &claims,
+            &self.ml_dsa,
+            &self.ed25519,
+        )
+    }
 }
 
 async fn make_policy_service_with_manager_and_authority(
@@ -354,44 +353,53 @@ async fn client_for_key_with_jwt(
     Ok((client_substrate, policy_client))
 }
 
-/// Real PolicyService over iroh — verifies the canary path end-to-end with
-/// a representative `check` RPC, including both ALLOW and DENY outcomes
-/// produced by the bootstrap `SERVICE_BASE_POLICIES`.
+/// Real PolicyService over iroh — verifies that `check` uses the authenticated
+/// envelope caller, not the subject/domain fields carried for wire compatibility.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn policy_check_allow_and_deny_over_iroh() -> Result<()> {
     support::install_explicit_dispatch_pep();
     let pq_store = install_hybrid_verify_config();
 
-    let (service, server_signing, _temp) = make_policy_service().await?;
+    let (service, _manager, server_signing, _temp, authority) =
+        make_policy_service_with_manager_and_authority().await?;
     let server_vk = server_signing.verifying_key();
     let request_kem_store = policy_request_kem_store(&server_signing)?;
 
     let (server, server_addr) = serve_over_iroh(service, &server_signing).await?;
-    let (client_substrate, policy) =
-        client_for(server_addr, server_vk, request_kem_store, pq_store).await?;
+    let client_key = policy_service_client_signing_key();
+    let jwt = authority.service_token("service:oauth", &client_key);
+    let (client_substrate, policy) = client_for_key_with_jwt(
+        server_addr,
+        server_vk,
+        request_kem_store,
+        pq_store,
+        client_key,
+        Some(jwt),
+    )
+    .await?;
 
-    // ALLOW: service:oauth → policy:ResolveServiceKey:query (from
-    // SERVICE_BASE_POLICIES, asserted in policy_manager.rs base-rules test).
+    // The forged wire identity is ignored: the verified service:oauth caller
+    // receives its bootstrap grant in the global domain.
     let allow_resp = policy
         .check(&PolicyCheck {
-            subject: "service:oauth".to_owned(),
-            domain: "*".to_owned(),
+            subject: "service:unknown".to_owned(),
+            domain: "tenant-forged".to_owned(),
             resource: "policy:ResolveServiceKey".to_owned(),
             operation: "query".to_owned(),
         })
         .await?;
     assert!(allow_resp, "service:oauth must be allowed: {allow_resp:?}");
 
-    // DENY: service:unknown is not in the base policies.
+    // A resource outside service:oauth's bootstrap grants is denied.
     let deny_resp = policy
         .check(&PolicyCheck {
-            subject: "service:unknown".to_owned(),
+            subject: "service:policy".to_owned(),
             domain: "*".to_owned(),
-            resource: "policy:ResolveServiceKey".to_owned(),
-            operation: "query".to_owned(),
+            resource: "registry:DeleteEverything".to_owned(),
+            operation: "manage".to_owned(),
         })
         .await?;
-    assert!(!deny_resp, "service:unknown must be denied: {deny_resp:?}");
+    assert!(!deny_resp, "ungranted operation must be denied: {deny_resp:?}");
 
     client_substrate.shutdown().await?;
     server.shutdown().await?;
@@ -406,31 +414,36 @@ async fn policy_concurrent_checks_over_iroh() -> Result<()> {
     support::install_explicit_dispatch_pep();
     let pq_store = install_hybrid_verify_config();
 
-    let (service, server_signing, _temp) = make_policy_service().await?;
+    let (service, _manager, server_signing, _temp, authority) =
+        make_policy_service_with_manager_and_authority().await?;
     let server_vk = server_signing.verifying_key();
     let request_kem_store = policy_request_kem_store(&server_signing)?;
 
     let (server, server_addr) = serve_over_iroh(service, &server_signing).await?;
-    let (client_substrate, policy) =
-        client_for(server_addr, server_vk, request_kem_store, pq_store).await?;
+    let client_key = policy_service_client_signing_key();
+    let jwt = authority.service_token("service:oauth", &client_key);
+    let (client_substrate, policy) = client_for_key_with_jwt(
+        server_addr,
+        server_vk,
+        request_kem_store,
+        pq_store,
+        client_key,
+        Some(jwt),
+    )
+    .await?;
     let policy = Arc::new(policy);
 
-    // Cases chosen so wildcard base rules don't interfere:
-    //   - policy:ResolveServiceKey:query is granted ONLY to specific services
-    //     (service:oauth, service:policy, service:model, service:registry,
-    //     service:worker, service:mcp), so unknown service:* subjects deny.
-    //   - policy:Check:check is similarly per-service.
-    //   - Non-`service:` subjects (e.g. "alice") deny on everything below
-    //     unless explicitly granted.
+    // Every stream carries the same verified service:oauth identity; forged
+    // wire subjects cannot change an outcome.
     let cases: Vec<(&str, &str, &str, bool)> = vec![
         ("service:oauth", "policy:ResolveServiceKey", "query", true),
-        ("service:policy", "policy:ResolveServiceKey", "query", true),
-        ("service:model", "policy:Check", "check", true),
+        ("service:unknown", "policy:ResolveServiceKey", "query", true),
         ("service:oauth", "policy:IssueToken", "manage", true),
-        ("service:bogus0", "policy:ResolveServiceKey", "query", false),
-        ("service:bogus1", "policy:Check", "check", false),
-        ("alice", "policy:ResolveServiceKey", "query", false),
-        ("alice", "policy:IssueToken", "manage", false),
+        ("service:policy", "policy:IssueToken", "manage", true),
+        ("service:oauth", "registry:DeleteEverything", "manage", false),
+        ("service:policy", "registry:DeleteEverything", "manage", false),
+        ("alice", "model:secret", "infer.generate", false),
+        ("alice", "metrics:secret", "write", false),
     ];
     let mut handles = Vec::new();
     for (subject, resource, operation, expect_allow) in cases {
@@ -464,14 +477,10 @@ async fn policy_concurrent_checks_over_iroh() -> Result<()> {
 }
 
 // ============================================================================
-// Issue #1128 spike: tenancy-isolation evidence tests
+// Tenancy-isolation evidence tests
 //
-// These tests document the CURRENT behavior of the PolicyService RPC path
-// with respect to tenants (Casbin domains) and event-prefix ownership.
-// Tests named `*_gap1128` assert behavior that is known-broken for
-// multi-tenancy; they are expected to PASS against today's code and to be
-// inverted when the fix lands. Every gap assertion names the production
-// site responsible.
+// These tests exercise the PolicyService RPC path with authority-verified
+// tenants (Casbin domains), subjects, and event-prefix ownership.
 // ============================================================================
 
 /// Baseline (expected green, not a gap): two clients with distinct signing
@@ -567,20 +576,16 @@ async fn two_subjects_per_subject_isolation_over_rpc() -> Result<()> {
     Ok(())
 }
 
-/// GAP (#1128): a grant written in Casbin domain "tenant-a" is INERT on the
-/// RPC path. The RPC authorize path hardcodes the request domain to "*"
-/// (registry.rs:1701, policy.rs:271 — every `check_with_domain(caller, "*",
-/// ...)` call), and the matcher only fires when `p.dom == "*" || r.dom ==
-/// p.dom` (policy_manager.rs:152-155), so a non-wildcard-domain policy can
-/// never authorize an RPC call. This test asserts the current broken
-/// behavior; a fix must make the first assertion ALLOW.
+/// The authority-verified tenant is effective over the RPC path and cannot be
+/// replaced by the compatibility fields in `PolicyCheck`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn domain_grant_is_inert_over_rpc_gap1128() -> Result<()> {
+async fn verified_domain_grant_is_effective_over_rpc() -> Result<()> {
     support::install_explicit_dispatch_pep();
     let pq_store = install_hybrid_verify_config();
     install_test_key_subjects();
 
-    let (service, manager, server_signing, _temp) = make_policy_service_with_manager().await?;
+    let (service, manager, server_signing, _temp, authority) =
+        make_policy_service_with_manager_and_authority().await?;
     // Grant exists ONLY in domain "tenant-a".
     manager
         .add_policy_with_domain(
@@ -594,44 +599,44 @@ async fn domain_grant_is_inert_over_rpc_gap1128() -> Result<()> {
 
     let server_vk = server_signing.verifying_key();
     let (server, server_addr) = serve_over_iroh(service, &server_signing).await?;
-    let (client_substrate, policy) = client_for_key(
+    let client_key = policy_client_a_signing_key();
+    let jwt = authority.token(TENANT_A_SUBJECT, "tenant-a", &client_key);
+    let (client_substrate, policy) = client_for_key_with_jwt(
         server_addr,
         server_vk,
         policy_request_kem_store(&server_signing)?,
         pq_store,
-        policy_client_a_signing_key(),
+        client_key,
+        Some(jwt),
     )
     .await?;
 
-    // The enforce path used by RPC authorization always passes r.dom="*":
-    // with r.dom="*" the tenant-a grant does not match → DENIED. This is the
-    // gap: the domain-scoped grant cannot take effect over RPC.
-    let denied = policy
-        .check(&PolicyCheck {
-            subject: TENANT_A_SUBJECT.to_owned(),
-            domain: "*".to_owned(),
-            resource: "data:orders".to_owned(),
-            operation: "read".to_owned(),
-        })
-        .await?;
-    assert!(
-        !denied,
-        "GAP #1128: tenant-a domain grant must be inert when r.dom=\"*\" (RPC path)"
-    );
-
-    // Control: the grant itself is real — when the domain is evaluated as
-    // "tenant-a" (which no RPC authorize call ever does today), it allows.
+    // Forged compatibility fields do not displace the verified tenant-a
+    // identity, so the real tenant-a grant is effective.
     let allowed = policy
         .check(&PolicyCheck {
-            subject: TENANT_A_SUBJECT.to_owned(),
-            domain: "tenant-a".to_owned(),
+            subject: TENANT_B_SUBJECT.to_owned(),
+            domain: "tenant-b".to_owned(),
             resource: "data:orders".to_owned(),
             operation: "read".to_owned(),
         })
         .await?;
     assert!(
         allowed,
-        "control: the tenant-a grant must match when the domain is actually evaluated"
+        "verified tenant-a grant must be effective despite forged wire identity"
+    );
+
+    let denied = policy
+        .check(&PolicyCheck {
+            subject: TENANT_A_SUBJECT.to_owned(),
+            domain: "tenant-a".to_owned(),
+            resource: "data:tenant-b-only".to_owned(),
+            operation: "read".to_owned(),
+        })
+        .await?;
+    assert!(
+        !denied,
+        "verified tenant-a caller must not gain an ungranted resource"
     );
 
     client_substrate.shutdown().await?;

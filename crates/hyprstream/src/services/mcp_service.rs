@@ -1065,16 +1065,20 @@ impl McpService {
                 None,
             )
         })?;
-        let allowed = self
-            .policy_client
-            .check(&PolicyCheck {
-                subject: identity.user.clone(),
-                domain: domain.clone(),
-                resource: resource.to_owned(),
-                operation: operation.to_owned(),
-            })
-            .await
-            .unwrap_or(false);
+        let request = PolicyCheck {
+            subject: identity.user.clone(),
+            domain: domain.clone(),
+            resource: resource.to_owned(),
+            operation: operation.to_owned(),
+        };
+        let allowed = crate::services::policy::check_with_verified_bearer(
+            &self.policy_client,
+            &request,
+            identity.token.as_deref(),
+            &hyprstream_rpc::envelope::Subject::new(identity.user.clone()),
+        )
+        .await
+        .unwrap_or(false);
         if !allowed {
             tracing::info!(
                 subject = %identity.user,
@@ -1235,15 +1239,19 @@ impl McpHandler for McpService {
     ) -> anyhow::Result<()> {
         let subject = ctx.subject().to_string();
         let domain = ctx.domain()?;
-        let result = self
-            .policy_client
-            .check(&PolicyCheck {
-                subject: subject.clone(),
-                domain,
-                resource: resource.to_owned(),
-                operation: operation.to_owned(),
-            })
-            .await;
+        let request = PolicyCheck {
+            subject: subject.clone(),
+            domain,
+            resource: resource.to_owned(),
+            operation: operation.to_owned(),
+        };
+        let result = crate::services::policy::check_with_verified_bearer(
+            &self.policy_client,
+            &request,
+            ctx.jwt_token(),
+            &ctx.subject(),
+        )
+        .await;
         match result {
             Ok(allowed) => {
                 if allowed {

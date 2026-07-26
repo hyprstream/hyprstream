@@ -86,6 +86,13 @@ pub const SERVICE_BASE_POLICIES: &[ServicePolicyRule] = &[
     ServicePolicyRule { subject: "service:notification", domain: "*", resource: "policy:*", action: "check", effect: "allow" },
     ServicePolicyRule { subject: "service:metrics", domain: "*", resource: "policy:*", action: "check", effect: "allow" },
     ServicePolicyRule { subject: "service:mcp", domain: "*", resource: "policy:*", action: "*", effect: "allow" },
+    ServicePolicyRule {
+        subject: "service:flight",
+        domain: "*",
+        resource: "policy:*",
+        action: "check",
+        effect: "allow",
+    },
     // Service key resolution: any service can resolve other service keys via policy
     ServicePolicyRule { subject: "service:oauth", domain: "*", resource: "policy:*", action: "query", effect: "allow" },
     ServicePolicyRule { subject: "service:registry", domain: "*", resource: "policy:*", action: "query", effect: "allow" },
@@ -135,9 +142,9 @@ pub const SERVICE_BASE_POLICIES: &[ServicePolicyRule] = &[
     //
     // Operators opt in by applying the `federation-open` template, or
     // by allowlisting specific origins:
-    //   p, https://app.partner.org,        *, federation:register, check, allow
-    //   p, https://*.partner.org,          *, federation:register, check, allow
-    //   p, https://hyprstream.partner.org, *, federation:register, check, allow
+    //   p, *, *, federation:register:https://app.partner.org,        check, allow
+    //   p, *, *, federation:register:https://*.partner.org,          check, allow
+    //   p, *, *, federation:register:https://hyprstream.partner.org, check, allow
     //
     // The same rule shape covers a CIMD client at app.partner.org and
     // a peer hyprstream instance at hyprstream.partner.org. Wizard may
@@ -232,7 +239,7 @@ pub fn get_templates() -> &'static [PolicyTemplate] {
                 ServicePolicyRule {
                     subject: "*",
                     domain: "*",
-                    resource: "federation:register",
+                    resource: "federation:register:*",
                     action: "check",
                     effect: "allow",
                 },
