@@ -580,8 +580,9 @@ async fn t8_atproto_session_credential() -> Result<T8SessionCredential> {
         hyprstream_pds::AllocatedAccountName::new("alice", SUBJECT_DID)?,
         rotations,
     )?;
+    let document = mint.seal_did_document("https://pds.example.com")?;
     let pending = mint.prepare_genesis(
-        hyprstream_pds::Cid::from_raw(b"mac-gate-hosted-account"),
+        document,
         hyprstream_pds::did_op::GenesisRepoHead::EmptyRepo,
     )?;
     let signature =
