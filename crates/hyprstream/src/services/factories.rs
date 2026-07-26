@@ -1486,6 +1486,16 @@ fn create_oauth_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnabl
     // Register this service's verifying key with PolicyService
     register_service_key(ctx, "oauth", &sk)?;
 
+    let identity_registration_api =
+        crate::services::oauth::identity_registration::production_identity_registration_api(
+            &config.oauth,
+            &config.account,
+            &config.quic,
+            sk.clone(),
+            ctx.deployment_data_dir()?.join("pds"),
+        )
+        .context("compose production identity registration API")?;
+
     // Pass signing key instead of a pre-created PolicyClient.
     // OAuthService runs in its own tokio runtime (separate thread), so the
     // PolicyClient must be created inside that runtime for ZMQ async I/O to work.
@@ -1498,7 +1508,8 @@ fn create_oauth_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnabl
         ctx.verifying_key(),
         ctx.jwt_verifying_key(),
     )
-    .with_quic_config(config.quic.clone());
+    .with_quic_config(config.quic.clone())
+    .with_identity_registration_api(identity_registration_api);
     if let Some(bl) = SHARED_JTI_BLOCKLIST.get() {
         oauth_service = oauth_service.with_jti_blocklist(Arc::clone(bl));
     } else {

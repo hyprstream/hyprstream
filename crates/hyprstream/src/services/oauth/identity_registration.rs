@@ -10,30 +10,377 @@
 //! resolver network I/O.
 
 use std::collections::BTreeSet;
+use std::fs::{File, OpenOptions};
+use std::io::Write as _;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
-use anyhow::{ensure, Result};
+use anyhow::{ensure, Context as _, Result};
 use async_trait::async_trait;
 use axum::extract::{Extension, Request, State};
 use axum::http::StatusCode;
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use hyprstream_pds::{DidOpSignature, UnsignedGenesisDidOp};
-use hyprstream_pds_service::federation_intake::{FederationIntake, InventoryEntry};
+use hyprstream_pds::{
+    sign_genesis, AllocatedAccountName, DidOpSignature, DirectoryHostedAccountStore,
+    GenesisRotationKeys, HostKeyEnrollment, HybridRotationKey, RecoveryKeyEnrollment,
+    UnsignedGenesisDidOp, UserRotationKey,
+};
+use hyprstream_pds_service::federation_intake::{
+    FederatedDidDocumentResolver, FederatedDidResolver, FederationIntake,
+    InMemoryIdentityInventory, InventoryEntry,
+};
 use hyprstream_pds_service::hosted_account_mint::{
-    HostedAccountGenesisSigner, HostedAccountRegistrationRequest, HostedAccountRegistrationResult,
-    HostedPdsAccountMinter,
+    AuthorityHostedAccountBinding, HostedAccountAuthority, HostedAccountGenesisSigner,
+    HostedAccountRegistrationRequest, HostedAccountRegistrationResult, HostedPdsAccountMinter,
+    HostedPdsAccountPublication, HostedPdsAccountPublisher, HostedPdsDiscovery,
+    LiveHostedPdsDiscovery,
 };
 use hyprstream_rpc::identity::UNAUTHENTICATED_DID_SENTINEL;
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 use url::Url;
+use zeroize::Zeroize as _;
 
 use super::auth::AuthenticatedUser;
 use super::session;
 use super::state::OAuthState;
+use crate::account::AccountZoneConfig;
+use crate::config::{OAuthConfig, QuicConfig};
 use crate::server::middleware::RateLimiter;
+
+const REGISTRATION_RATE_LIMIT_REQUESTS: u32 = 10;
+const REGISTRATION_RATE_LIMIT_WINDOW_SECS: i64 = 60;
+const ACCOUNT_GENESIS_ED25519_PURPOSE: &str = "hyprstream-hosted-account-genesis-ed25519-v1";
+const ACCOUNT_GENESIS_MLDSA65_PURPOSE: &str = "hyprstream-hosted-account-genesis-mldsa65-v1";
+
+/// Assemble the production registration face installed by the OAuth factory.
+///
+/// The account zone may be unconfigured: the API remains installed so
+/// federation intake still works, while minting fails closed at the authority
+/// boundary with the account-zone configuration error.
+pub(crate) fn production_identity_registration_api(
+    oauth: &OAuthConfig,
+    account: &AccountZoneConfig,
+    quic: &QuicConfig,
+    oauth_signing_key: ed25519_dalek::SigningKey,
+    pds_root: PathBuf,
+) -> Result<Arc<IdentityRegistrationApi>> {
+    let ttl = Duration::from_secs(oauth.atproto_did_cache_ttl_secs);
+    let plc_config = hyprstream_rpc::did_plc::PlcResolverConfig::new(
+        Url::parse(&oauth.atproto_plc_directory_url)
+            .context("identity intake PLC directory URL is invalid")?,
+        ttl,
+    )
+    .context("identity intake PLC resolver configuration is invalid")?;
+    let plc = Arc::new(
+        hyprstream_rpc::did_plc::DidPlcResolver::new(plc_config)
+            .context("identity intake PLC resolver construction failed")?,
+    );
+    let web = Arc::new(hyprstream_rpc::did_web::DidWebResolver::new(
+        hyprstream_rpc::did_web::HttpDidDocFetcher::new(ttl)
+            .context("identity intake did:web HTTPS client construction failed")?,
+    ));
+    let resolver: Arc<dyn FederatedDidDocumentResolver> =
+        Arc::new(FederatedDidResolver::new(plc, web));
+    compose_identity_registration_api(oauth, account, quic, oauth_signing_key, pds_root, resolver)
+}
+
+fn compose_identity_registration_api(
+    oauth: &OAuthConfig,
+    account: &AccountZoneConfig,
+    quic: &QuicConfig,
+    oauth_signing_key: ed25519_dalek::SigningKey,
+    pds_root: PathBuf,
+    resolver: Arc<dyn FederatedDidDocumentResolver>,
+) -> Result<Arc<IdentityRegistrationApi>> {
+    let authority = Arc::new(ProductionHostedAccountAuthority {
+        account: account.clone(),
+        pds_root: pds_root.clone(),
+        signing_root: oauth_signing_key.clone(),
+    });
+    let discovery = Arc::new(ConfiguredHostedPdsDiscovery {
+        pds_endpoint: oauth.issuer_url(),
+        quic: quic.clone(),
+    });
+    let publisher = Arc::new(ProductionHostedAccountPublisher { pds_root });
+    let minter = Arc::new(HostedPdsAccountMinter::new(authority, discovery, publisher));
+    let signer = Arc::new(ProductionRegistrationGenesisSigner {
+        signing_root: oauth_signing_key,
+    });
+    let intake = Arc::new(FederationIntake::new(
+        resolver,
+        Arc::new(InMemoryIdentityInventory::default()),
+        vec![oauth.issuer_url()],
+    ));
+    let allowlist = DidWebOriginAllowlist::new(&oauth.identity_registration_did_web_origins)
+        .context("identity registration did:web origin allowlist is invalid")?;
+    Ok(Arc::new(IdentityRegistrationApi::new(
+        minter,
+        signer,
+        intake,
+        allowlist,
+        Arc::new(RateLimiter::new(
+            REGISTRATION_RATE_LIMIT_REQUESTS,
+            REGISTRATION_RATE_LIMIT_WINDOW_SECS,
+        )),
+    )))
+}
+
+struct ProductionHostedAccountAuthority {
+    account: AccountZoneConfig,
+    pds_root: PathBuf,
+    signing_root: ed25519_dalek::SigningKey,
+}
+
+impl HostedAccountAuthority for ProductionHostedAccountAuthority {
+    fn allocate(&self, requested_handle: &str) -> Result<AuthorityHostedAccountBinding> {
+        let zone = self
+            .account
+            .resolve_zone()
+            .context("hosted-account minting is not configured")?;
+        let host = zone.host_for_label(requested_handle)?;
+        let name = AllocatedAccountName::new(requested_handle, format!("did:web:{host}"))?;
+        let tenant = zone.apex().to_owned();
+
+        // Allocation is a permanent, authority-owned reservation. A failed
+        // post-allocation mint burns the label instead of allowing a different
+        // identity to reuse the permanent DID.
+        let reservation_dir = self.pds_root.join(&tenant).join(".allocated");
+        create_private_dir_all(&reservation_dir)?;
+        let reservation = reservation_dir.join(requested_handle);
+        let mut file = private_create_new(&reservation)
+            .with_context(|| format!("hosted-account label {requested_handle:?} is unavailable"))?;
+        file.write_all(name.did().as_bytes())?;
+        file.sync_all()?;
+        sync_directory(&reservation_dir)?;
+        sync_directory(
+            reservation_dir
+                .parent()
+                .context("hosted-account reservation directory has no tenant parent")?,
+        )?;
+
+        AuthorityHostedAccountBinding::new(
+            tenant,
+            name,
+            account_genesis_rotation_keys(&self.signing_root, requested_handle)?,
+        )
+    }
+}
+
+struct ProductionRegistrationGenesisSigner {
+    signing_root: ed25519_dalek::SigningKey,
+}
+
+impl RegistrationGenesisSigner for ProductionRegistrationGenesisSigner {
+    fn sign_genesis(
+        &self,
+        caller: &str,
+        operator_manual: bool,
+        unsigned: &UnsignedGenesisDidOp,
+    ) -> Result<DidOpSignature> {
+        ensure!(
+            !caller.is_empty() && caller != UNAUTHENTICATED_DID_SENTINEL,
+            "genesis signing requires an authenticated caller"
+        );
+        ensure!(
+            !operator_manual || caller.starts_with("service:"),
+            "manual genesis signing requires a service authority"
+        );
+        let label = hosted_account_label(unsigned.did())?;
+        let (ed, pq) = account_genesis_signing_keys(&self.signing_root, label);
+        sign_genesis(unsigned, &ed, &pq)
+    }
+}
+
+fn account_genesis_signing_keys(
+    root: &ed25519_dalek::SigningKey,
+    label: &str,
+) -> (
+    ed25519_dalek::SigningKey,
+    hyprstream_crypto::pq::MlDsaSigningKey,
+) {
+    let ed = hyprstream_rpc::node_identity::derive_purpose_key(
+        root,
+        &format!("{ACCOUNT_GENESIS_ED25519_PURPOSE}/{label}"),
+    );
+    let pq_seed_key = hyprstream_rpc::node_identity::derive_purpose_key(
+        root,
+        &format!("{ACCOUNT_GENESIS_MLDSA65_PURPOSE}/{label}"),
+    );
+    let mut pq_seed = pq_seed_key.to_bytes();
+    let pq = hyprstream_crypto::pq::ml_dsa_sk_from_seed(&pq_seed);
+    pq_seed.zeroize();
+    (ed, pq)
+}
+
+fn account_genesis_rotation_keys(
+    root: &ed25519_dalek::SigningKey,
+    label: &str,
+) -> Result<GenesisRotationKeys> {
+    let (ed, pq) = account_genesis_signing_keys(root, label);
+    let hybrid = HybridRotationKey::new(
+        ed.verifying_key().to_bytes(),
+        hyprstream_crypto::pq::ml_dsa_sk_to_vk_bytes(&pq),
+    )?;
+    GenesisRotationKeys::new(
+        UserRotationKey::new(hybrid),
+        RecoveryKeyEnrollment::Declined,
+        HostKeyEnrollment::Absent,
+    )
+}
+
+fn hosted_account_label(did: &str) -> Result<&str> {
+    let host = did
+        .strip_prefix("did:web:")
+        .context("hosted-account genesis DID must use did:web")?;
+    let label = host
+        .split('.')
+        .next()
+        .context("hosted-account genesis DID has no account label")?;
+    ensure!(
+        !label.is_empty() && !label.contains([':', '/', '%']),
+        "hosted-account genesis DID has an invalid account label"
+    );
+    Ok(label)
+}
+
+struct ConfiguredHostedPdsDiscovery {
+    pds_endpoint: String,
+    quic: QuicConfig,
+}
+
+impl HostedPdsDiscovery for ConfiguredHostedPdsDiscovery {
+    fn current(&self) -> Result<LiveHostedPdsDiscovery> {
+        ensure!(
+            self.quic.enabled,
+            "hosted-account minting requires live QUIC"
+        );
+        let endpoint = Url::parse(&self.pds_endpoint).context("hosted PDS endpoint is invalid")?;
+        ensure!(
+            endpoint.scheme() == "https",
+            "hosted PDS endpoint must use HTTPS"
+        );
+        let pds_endpoint = endpoint.origin().ascii_serialization();
+        let host = endpoint
+            .host_str()
+            .context("hosted PDS endpoint has no host")?;
+        let port = self.quic.socket_addr()?.port();
+        let quic_url = format!("https://{host}:{port}");
+        let (cert_chain, _) = self.quic.load_tls_materials()?;
+        let leaf = cert_chain
+            .first()
+            .context("hosted PDS QUIC certificate chain is empty")?;
+        let digest = ring::digest::digest(&ring::digest::SHA256, leaf);
+        let mut cert_hash = [0_u8; 32];
+        cert_hash.copy_from_slice(digest.as_ref());
+        let auth = hyprstream_rpc::transport::QuicServerAuth::pinned(vec![cert_hash])?;
+        let entry = serde_json::json!({
+            "id": format!("{pds_endpoint}#quic"),
+            "type": "QuicTransport",
+            "serviceEndpoint": hyprstream_rpc::service_entry::encode_quic(
+                &quic_url,
+                &auth,
+                &["hyprstream-rpc/1"],
+            ),
+        });
+        Ok(LiveHostedPdsDiscovery {
+            pds_endpoint,
+            browser_quic_reach: hyprstream_rpc::service_entry::decode_browser_quic_reach(&entry)?,
+        })
+    }
+}
+
+struct ProductionHostedAccountPublisher {
+    pds_root: PathBuf,
+}
+
+impl HostedPdsAccountPublisher for ProductionHostedAccountPublisher {
+    fn publish(&self, publication: HostedPdsAccountPublication<'_>) -> Result<()> {
+        let tenant_root = self.pds_root.join(publication.tenant());
+        let accounts_root = tenant_root.join("accounts");
+        create_private_dir_all(&accounts_root)?;
+        sync_directory(&tenant_root)?;
+        let staging = tempfile::Builder::new()
+            .prefix(".account-mint-")
+            .tempdir_in(&tenant_root)?;
+        let staging_store = DirectoryHostedAccountStore::new(staging.path());
+        publication.account().write_to(&staging_store)?;
+        let staged_account = staging.path().join(publication.label());
+        write_repo_genesis(&staged_account, publication.repo())?;
+
+        let final_account = accounts_root.join(publication.label());
+        #[cfg(all(target_os = "linux", target_env = "gnu"))]
+        nix::fcntl::renameat2(
+            None,
+            &staged_account,
+            None,
+            &final_account,
+            nix::fcntl::RenameFlags::RENAME_NOREPLACE,
+        )
+        .with_context(|| {
+            format!(
+                "failed to atomically publish hosted account {:?}",
+                publication.label()
+            )
+        })?;
+        #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+        anyhow::bail!("atomic hosted-account publication requires Linux renameat2");
+        sync_directory(&accounts_root)
+    }
+}
+
+fn write_repo_genesis(account_dir: &Path, repo: &hyprstream_pds::HostedRepoGenesis) -> Result<()> {
+    let repo_dir = account_dir.join("repo");
+    let blocks_dir = repo_dir.join("blocks");
+    create_private_dir_all(&blocks_dir)?;
+    for (cid, bytes) in repo.mst_blocks() {
+        write_private_file(&blocks_dir.join(format!("{cid}.cbor")), bytes)?;
+    }
+    write_private_file(&repo_dir.join("commit.cbor"), repo.commit_bytes())?;
+    write_private_file(
+        &repo_dir.join("head"),
+        repo.commit_cid().to_string().as_bytes(),
+    )?;
+    sync_directory(&blocks_dir)?;
+    sync_directory(&repo_dir)?;
+    sync_directory(account_dir)
+}
+
+fn create_private_dir_all(path: &Path) -> Result<()> {
+    std::fs::create_dir_all(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+fn private_create_new(path: &Path) -> Result<File> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    Ok(options.open(path)?)
+}
+
+fn write_private_file(path: &Path, bytes: &[u8]) -> Result<()> {
+    let mut file = private_create_new(path)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    Ok(())
+}
+
+fn sync_directory(path: &Path) -> Result<()> {
+    File::open(path)?.sync_all()?;
+    Ok(())
+}
 
 /// Handle-only registration payload.
 ///
@@ -715,15 +1062,122 @@ mod tests {
         )
     }
 
-    fn post(path: &str, cookie: Option<String>) -> axum::http::Request<axum::body::Body> {
+    struct FixtureFederatedResolver;
+
+    #[async_trait]
+    impl FederatedDidDocumentResolver for FixtureFederatedResolver {
+        async fn resolve_federated_document(&self, did: &str) -> Result<serde_json::Value> {
+            Ok(serde_json::json!({
+                "id": did,
+                "alsoKnownAs": ["at://foreign.example"],
+                "service": [{
+                    "id": format!("{did}#atproto_pds"),
+                    "type": "AtprotoPersonalDataServer",
+                    "serviceEndpoint": "https://foreign.example",
+                }],
+            }))
+        }
+    }
+
+    struct ProductionRouterFixture {
+        state: Arc<OAuthState>,
+        cors: crate::config::CorsConfig,
+        signing_key: ed25519_dalek::SigningKey,
+        storage: tempfile::TempDir,
+    }
+
+    fn production_router_fixture() -> ProductionRouterFixture {
+        use hyprstream_rpc::crypto::CryptoPolicy;
+        use hyprstream_rpc::rpc_client::RpcClientImpl;
+        use hyprstream_rpc::signer::LocalSigner;
+        use hyprstream_rpc::transport::lazy_uds::LazyUdsTransport;
+
+        let storage = tempfile::TempDir::new().unwrap();
+        let certified =
+            rcgen::generate_simple_self_signed(vec!["pds.example.test".to_owned()]).unwrap();
+        let cert_path = storage.path().join("quic-cert.pem");
+        let key_path = storage.path().join("quic-key.pem");
+        std::fs::write(&cert_path, certified.cert.pem()).unwrap();
+        std::fs::write(&key_path, certified.key_pair.serialize_pem()).unwrap();
+
+        let mut oauth = crate::config::OAuthConfig::default();
+        oauth.external_url = Some("https://pds.example.test".to_owned());
+        oauth.identity_registration_did_web_origins = vec!["https://foreign.example".to_owned()];
+        let account = AccountZoneConfig {
+            zone: Some("accounts.example.com".to_owned()),
+            ..AccountZoneConfig::default()
+        };
+        let quic = QuicConfig {
+            enabled: true,
+            bind_addr: "127.0.0.1:4433".to_owned(),
+            server_name: "pds.example.test".to_owned(),
+            cert_path: cert_path.to_string_lossy().into_owned(),
+            key_path: key_path.to_string_lossy().into_owned(),
+            iroh: false,
+            relay: String::new(),
+        };
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[0x53; 32]);
+        let api = compose_identity_registration_api(
+            &oauth,
+            &account,
+            &quic,
+            signing_key.clone(),
+            storage.path().join("pds"),
+            Arc::new(FixtureFederatedResolver),
+        )
+        .unwrap();
+
+        let remote_key = ed25519_dalek::SigningKey::from_bytes(&[0x54; 32]).verifying_key();
+        let make_client = || {
+            Arc::new(
+                RpcClientImpl::new(
+                    LocalSigner::new(signing_key.clone()),
+                    LazyUdsTransport::new(
+                        "/dev/null/identity-registration-production-test.sock".into(),
+                    ),
+                    Some(remote_key),
+                )
+                .with_response_verify_policy(CryptoPolicy::Classical),
+            )
+        };
+        let cors = oauth.cors.clone();
+        let state = Arc::new(
+            OAuthState::new(
+                &oauth,
+                crate::services::PolicyClient::new(make_client()),
+                crate::services::DiscoveryClient::new(make_client()),
+                signing_key.verifying_key().to_bytes(),
+            )
+            .with_identity_registration_api(api),
+        );
+        ProductionRouterFixture {
+            state,
+            cors,
+            signing_key,
+            storage,
+        }
+    }
+
+    fn post(
+        path: &str,
+        body: &'static str,
+        cookie: Option<String>,
+        bearer: Option<&str>,
+    ) -> axum::http::Request<axum::body::Body> {
         let mut request = axum::http::Request::post(path)
             .header(axum::http::header::CONTENT_TYPE, "application/json")
-            .body(axum::body::Body::from(r#"{"handle":"alice"}"#))
+            .body(axum::body::Body::from(body))
             .unwrap();
         if let Some(cookie) = cookie {
             request
                 .headers_mut()
                 .insert(axum::http::header::COOKIE, cookie.parse().unwrap());
+        }
+        if let Some(bearer) = bearer {
+            request.headers_mut().insert(
+                axum::http::header::AUTHORIZATION,
+                format!("Bearer {bearer}").parse().unwrap(),
+            );
         }
         request
     }
@@ -740,7 +1194,11 @@ mod tests {
             "/api/identity/intake",
             "/api/identity/register/manual",
         ] {
-            let response = app.clone().oneshot(post(path, None)).await.unwrap();
+            let response = app
+                .clone()
+                .oneshot(post(path, r#"{"handle":"alice"}"#, None, None))
+                .await
+                .unwrap();
             assert_eq!(
                 response.status(),
                 StatusCode::UNAUTHORIZED,
@@ -755,7 +1213,9 @@ mod tests {
         let response = app
             .oneshot(post(
                 "/api/identity/register",
+                r#"{"handle":"alice"}"#,
                 Some(format!("{}={session_id}", session::SESSION_COOKIE_NAME)),
+                None,
             ))
             .await
             .unwrap();
@@ -764,5 +1224,114 @@ mod tests {
             StatusCode::SERVICE_UNAVAILABLE,
             "an authenticated route with no injected minter must fail closed"
         );
+    }
+
+    #[tokio::test]
+    async fn production_composition_live_session_register_mints_and_publishes() {
+        use tower::ServiceExt;
+
+        let fixture = production_router_fixture();
+        let session_id = fixture
+            .state
+            .sessions
+            .create("did:web:member.example".to_owned(), "local".to_owned())
+            .await;
+        let response = super::super::create_app(Arc::clone(&fixture.state), &fixture.cors)
+            .oneshot(post(
+                "/api/identity/register",
+                r#"{"handle":"alice"}"#,
+                Some(format!("{}={session_id}", session::SESSION_COOKIE_NAME)),
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value.as_object().unwrap().len(), 5);
+        assert_eq!(value["handle"], "at://alice.accounts.example.com");
+        assert_eq!(value["did"], "did:web:alice.accounts.example.com");
+        assert_eq!(value["pdsEndpoint"], "https://pds.example.test");
+        assert_eq!(value["quicUrl"], "https://pds.example.test:4433");
+        assert!(value["certHash"]
+            .as_str()
+            .is_some_and(|hash| !hash.is_empty()));
+        let published = fixture
+            .storage
+            .path()
+            .join("pds/accounts.example.com/accounts/alice");
+        assert!(published.join("account-record.cbor").is_file());
+        assert!(published.join("genesis.didop.cbor").is_file());
+        assert!(published.join("did-document.json").is_file());
+        assert!(published.join("repo/commit.cbor").is_file());
+    }
+
+    #[tokio::test]
+    async fn production_composition_live_global_manual_register_mints() {
+        use tower::ServiceExt;
+
+        let fixture = production_router_fixture();
+        let now = chrono::Utc::now().timestamp();
+        let claims = hyprstream_rpc::auth::Claims::new(
+            "service:identity-operator".to_owned(),
+            now,
+            now + 60,
+        )
+        .with_issuer("https://pds.example.test".to_owned())
+        .with_audience(Some("https://pds.example.test".to_owned()));
+        let token = hyprstream_rpc::auth::jwt::encode(&claims, &fixture.signing_key);
+        let response = super::super::create_app(Arc::clone(&fixture.state), &fixture.cors)
+            .oneshot(post(
+                "/api/identity/register/manual",
+                r#"{"handle":"operator"}"#,
+                None,
+                Some(&token),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["did"], "did:web:operator.accounts.example.com");
+        assert!(fixture
+            .storage
+            .path()
+            .join("pds/accounts.example.com/accounts/operator/account-record.cbor")
+            .is_file());
+    }
+
+    #[tokio::test]
+    async fn production_composition_live_allowlisted_intake_indexes_identity() {
+        use tower::ServiceExt;
+
+        let fixture = production_router_fixture();
+        let session_id = fixture
+            .state
+            .sessions
+            .create("did:web:member.example".to_owned(), "local".to_owned())
+            .await;
+        let response = super::super::create_app(Arc::clone(&fixture.state), &fixture.cors)
+            .oneshot(post(
+                "/api/identity/intake",
+                r#"{"did":"did:web:foreign.example"}"#,
+                Some(format!("{}={session_id}", session::SESSION_COOKIE_NAME)),
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["did"], "did:web:foreign.example");
+        assert_eq!(value["handle"], "foreign.example");
+        assert_eq!(value["kind"], "federated");
+        assert!(value["tenant"].is_null());
+        assert_eq!(value["pdsEndpoint"], "https://foreign.example");
     }
 }
