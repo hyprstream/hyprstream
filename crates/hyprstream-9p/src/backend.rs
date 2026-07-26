@@ -62,17 +62,22 @@ pub struct StatResult {
 #[async_trait]
 pub trait Backend: Send + Sync {
     /// Establish the session at `Tattach`, given the `uname` the client
-    /// presented. The default is a no-op: backends whose caller identity is
-    /// fixed at construction (the UDS/vsock listeners) ignore `uname`.
+    /// presented and the `aname` export selector it requested. The default is a
+    /// no-op: backends whose caller identity is fixed at construction
+    /// (the UDS/vsock listeners) ignore both.
     ///
     /// A backend that resolves its caller identity from the attach itself
     /// (the H1b `/9p` WebTransport plane carries a mount ticket in
     /// `Tattach.uname` — the browser `WebSocket` can't set headers and the
     /// cert-pinned WT session has no URL query) validates it here and binds
-    /// the session `Subject`. Returning `Err` fails the attach; the translator
-    /// maps it to an `Rlerror` errno (a `hyprstream_vfs::MountError` in the
-    /// cause chain picks the errno — e.g. `PermissionDenied → EACCES`).
-    async fn attach(&self, _uname: &str) -> anyhow::Result<()> {
+    /// the session `Subject`. `aname` is the requested export (the 9P attach
+    /// name); an authorizing backend validates it against the ticket's granted
+    /// namespace and **denies an unknown/forbidden/malformed selector** rather
+    /// than falling back to a default export (#877/#1071 fail-closed contract).
+    /// Returning `Err` fails the attach; the translator maps it to an `Rlerror`
+    /// errno (a `hyprstream_vfs::MountError` in the cause chain picks the errno
+    /// — e.g. `PermissionDenied → EACCES`).
+    async fn attach(&self, _uname: &str, _aname: &str) -> anyhow::Result<()> {
         Ok(())
     }
 

@@ -55,8 +55,17 @@ use crate::msg::{self, Qid, ReaddirEntry};
 /// errno (e.g. [`MountError::PermissionDenied`] → `EACCES`).
 #[async_trait]
 pub trait AttachAuthorizer: Send + Sync {
-    /// Validate the `uname` ticket and return the narrowed session [`Subject`].
-    async fn authorize(&self, uname: &str) -> Result<Subject, MountError>;
+    /// Validate the `uname` ticket and the requested `aname` export selector,
+    /// and return the narrowed session [`Subject`].
+    ///
+    /// `aname` is the 9P attach name — the export the client requested. The
+    /// authorizer validates it against the ticket's granted namespace and
+    /// **denies an unknown/forbidden/malformed selector** (returning a
+    /// [`MountError::PermissionDenied`] → `EACCES`) rather than falling back to
+    /// a default export (#877/#1071 fail-closed contract). Selection and the
+    /// `Subject` bind happen in this one authorization so a future
+    /// `ExportResolver` cannot split them.
+    async fn authorize(&self, uname: &str, aname: &str) -> Result<Subject, MountError>;
 }
 
 /// Max bytes a single read/write returns. Kept below the translator's `MSG_SIZE`
@@ -145,15 +154,18 @@ impl MountBackend {
 
 #[async_trait]
 impl Backend for MountBackend {
-    async fn attach(&self, uname: &str) -> Result<()> {
+    async fn attach(&self, uname: &str, aname: &str) -> Result<()> {
         // Fixed-subject listeners have no authorizer; the Subject is already
-        // bound and `uname` is advisory (ignored, as on the UDS/vsock paths).
+        // bound and `uname`/`aname` are advisory (ignored, as on the UDS/vsock
+        // paths).
         let Some(authorizer) = self.authorizer.as_ref() else {
             return Ok(());
         };
-        // Attach-time ticket path (H1b): resolve+narrow. A MountError here maps
-        // to an Rlerror errno (PermissionDenied → EACCES) via the translator.
-        let subject = authorizer.authorize(uname).await.map_err(anyhow::Error::new)?;
+        // Attach-time ticket path (H1b): resolve+narrow the Subject AND validate
+        // the requested `aname` export against the ticket's namespace grant in
+        // one authorization. A MountError here maps to an Rlerror errno
+        // (PermissionDenied → EACCES) via the translator, before any fid exists.
+        let subject = authorizer.authorize(uname, aname).await.map_err(anyhow::Error::new)?;
         let attempted_subject = subject.clone();
         // First attach wins; a second attach on the same connection must not
         // silently re-scope the session. Ignore a redundant identical set,
@@ -428,8 +440,9 @@ mod tests {
         let mount = Arc::new(TrackedMount { clunks: AtomicUsize::new(0) });
         let backend = MountBackend::new(mount.clone(), Subject::new("tenant"));
 
-        // Attach (empty walk) binds fid 0 to the root.
-        backend.attach("tenant").await.unwrap();
+        // Attach (empty walk) binds fid 0 to the root. `MountBackend::new`
+        // fixes the Subject, so `uname`/`aname` are advisory here.
+        backend.attach("tenant", "").await.unwrap();
         backend.fids.insert(
             0,
             Arc::new(MountFidEntry { path: vec![], handle: Mutex::new(Some(Fid::new(0usize))) }),
