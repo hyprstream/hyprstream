@@ -119,6 +119,11 @@ jobs:
     # shrink. Plain text scan, no build — stays on the free runner. Must be
     # able to fail — do NOT add `|| true`. See
     # scripts/check_loopback_burndown.py for the stated methodology.
+    # Advisory-only on the merge queue: `build` is the sole required merge-group
+    # check (see the note on the preflight build job). Running this ratchet on
+    # merge_group made a non-required shrink fail the group and livelock the queue;
+    # keep it on PR/push where it advises, matching the other non-required jobs.
+    if: github.event_name != 'merge_group'
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v4
