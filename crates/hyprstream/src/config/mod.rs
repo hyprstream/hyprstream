@@ -666,9 +666,17 @@ impl OAIConfig {
             } else {
                 "http"
             };
-            let host = if self.host == "0.0.0.0" { "localhost" } else { &self.host };
+            let host = resource_url_host(&self.host);
             format!("{scheme}://{host}:{}", self.port)
         }
+    }
+}
+
+fn resource_url_host(bind_host: &str) -> &str {
+    if bind_host == "0.0.0.0" {
+        "localhost"
+    } else {
+        bind_host
     }
 }
 
@@ -810,6 +818,10 @@ pub struct FlightConfig {
     #[serde(default = "default_flight_port")]
     pub port: u16,
 
+    /// External resource URL used as the exact JWT audience.
+    #[serde(default)]
+    pub external_url: Option<String>,
+
     /// Default dataset to serve (optional)
     #[serde(default)]
     pub default_dataset: Option<String>,
@@ -832,11 +844,28 @@ impl Default for FlightConfig {
         Self {
             host: default_flight_host(),
             port: default_flight_port(),
+            external_url: None,
             default_dataset: None,
             tls_cert: None,
             tls_key: None,
             quic_port: None,
         }
+    }
+}
+
+impl FlightConfig {
+    /// Resource URL used as the exact Flight access-token audience.
+    pub fn resource_url(&self) -> String {
+        if let Some(ref url) = self.external_url {
+            return url.clone();
+        }
+        let scheme = if self.tls_cert.is_some() && self.tls_key.is_some() {
+            "https"
+        } else {
+            "http"
+        };
+        let host = resource_url_host(&self.host);
+        format!("{scheme}://{host}:{}", self.port)
     }
 }
 

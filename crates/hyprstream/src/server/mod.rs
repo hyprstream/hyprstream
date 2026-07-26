@@ -32,6 +32,14 @@ pub fn extract_user(auth_user: Option<&Extension<AuthenticatedUser>>) -> String 
         .unwrap_or_else(|| "anonymous".to_owned())
 }
 
+/// Extract the subject and its authority-verified hosted-account policy domain.
+pub fn extract_policy_identity(
+    auth_user: Option<&Extension<AuthenticatedUser>>,
+) -> Result<(String, String), &'static str> {
+    let Extension(user) = auth_user.ok_or("authenticated identity missing")?;
+    Ok((user.user.clone(), user.authorization_domain()?))
+}
+
 /// Create the main application router
 pub fn create_app(state: ServerState) -> Router {
     // Validate the complete cross-face registry before constructing any live

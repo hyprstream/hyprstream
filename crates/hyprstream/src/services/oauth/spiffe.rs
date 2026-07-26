@@ -177,6 +177,14 @@ pub async fn issue_service_svid(
     Extension(user): Extension<AuthenticatedUser>,
     Json(body): Json<ServiceSvidRequest>,
 ) -> Response {
+    let requester_service = user.user.strip_prefix("service:");
+    if requester_service != Some(body.service.as_str()) {
+        return oauth_error(
+            StatusCode::FORBIDDEN,
+            "insufficient_scope",
+            Some("service authority may mint only its own JWT-SVID"),
+        );
+    }
     if !valid_service_name(&body.service) {
         return oauth_error(
             StatusCode::BAD_REQUEST,
@@ -472,6 +480,13 @@ mod tests {
             service_spiffe_id("https://hypr.example.test/oauth", "model"),
             "spiffe://hypr.example.test/service/model"
         );
+    }
+
+    #[test]
+    fn service_svid_requester_binding_is_exact() {
+        let requester = "service:model";
+        assert_eq!(requester.strip_prefix("service:"), Some("model"));
+        assert_ne!(requester.strip_prefix("service:"), Some("policy"));
     }
 
     #[test]

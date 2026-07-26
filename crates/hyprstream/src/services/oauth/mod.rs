@@ -172,20 +172,10 @@ pub fn create_app(state: Arc<OAuthState>, cors_config: &crate::config::CorsConfi
     // ── Protected routes ───────────────────────────────────────────────────────
     // All require a valid Bearer token (validated by require_bearer_token).
     // Inserts AuthenticatedUser into request extensions for downstream handlers.
-    let protected_router = Router::new()
-        .route("/oauth/introspect", post(introspection::introspect_token))
-        .route("/oauth/wit", post(wit_bootstrap::issue_browser_wit))
-        .route(
-            "/oauth/mount-ticket",
-            post(mount_ticket::issue_mount_ticket),
-        )
+    let authority_router = Router::new()
         .route(
             "/oauth/spiffe/service-svid",
             post(spiffe::issue_service_svid),
-        )
-        .route(
-            "/oauth/userinfo",
-            get(userinfo::userinfo).post(userinfo::userinfo),
         )
         // SCIM 2.0 user management (RFC 7644)
         .route(
@@ -206,6 +196,22 @@ pub fn create_app(state: Arc<OAuthState>, cors_config: &crate::config::CorsConfi
             "/scim/v2/Users/:id/keys/:fingerprint",
             axum::routing::delete(scim::remove_user_key),
         )
+        .layer(axum::middleware::from_fn(
+            auth::require_global_service_authority,
+        ));
+
+    let protected_router = Router::new()
+        .route("/oauth/introspect", post(introspection::introspect_token))
+        .route("/oauth/wit", post(wit_bootstrap::issue_browser_wit))
+        .route(
+            "/oauth/mount-ticket",
+            post(mount_ticket::issue_mount_ticket),
+        )
+        .route(
+            "/oauth/userinfo",
+            get(userinfo::userinfo).post(userinfo::userinfo),
+        )
+        .merge(authority_router)
         .layer(axum::middleware::from_fn_with_state(
             Arc::clone(&state),
             auth::require_bearer_token,
@@ -746,6 +752,13 @@ impl Spawnable for OAuthService {
             );
             if let Some(store) = &self.hosted_account_store {
                 oauth_state = oauth_state.with_hosted_account_store(Arc::clone(store));
+            }
+            match self.account_config.resolve_zone() {
+                Ok(zone) => oauth_state = oauth_state.with_hosted_account_zone(zone),
+                Err(error) => tracing::warn!(
+                    %error,
+                    "OAuth user-token minting disabled: no deployment account zone"
+                ),
             }
             if let Some(store) = user_store {
                 oauth_state = oauth_state.with_user_store(store);
@@ -1525,7 +1538,10 @@ mod tests {
         .with_hosted_account_store(hosted_account_store)
         .with_atproto_did_resolver(Arc::new(FixtureAtprotoDidResolver(
             atproto_document,
-        )));
+        )))
+        .with_hosted_account_zone(crate::account::AccountZone::new(
+            "acct.example.test",
+        )?);
         let token_dir = tempfile::TempDir::new()?;
         oauth_state.with_token_store_impl(Arc::new(RocksDbTokenStore::open(
             token_dir.path().join("refresh.db"),
@@ -1949,6 +1965,7 @@ mod tests {
         let claims = jwt_claims(&token_response.access_token);
         assert_eq!(claims["iss"], ISSUER);
         assert_eq!(claims["sub"], MAPPED_DID);
+        assert_eq!(claims["tenant"], HOSTED_TENANT);
         assert_eq!(claims["aud"], ISSUER);
         assert_eq!(claims["scope"], "atproto");
 
@@ -2433,6 +2450,7 @@ mod tests {
         assert!(state.get_refresh_token(&refresh_token).await?.is_none());
         let refreshed_claims = jwt_claims(refreshed_json["access_token"].as_str().unwrap());
         assert_eq!(refreshed_claims["sub"], MAPPED_DID);
+        assert_eq!(refreshed_claims["tenant"], HOSTED_TENANT);
         assert_eq!(refreshed_claims["scope"], "atproto");
 
         // A non-atproto PAR consent cannot be upgraded to the atproto profile
@@ -2569,7 +2587,7 @@ mod tests {
                 user_pub_key: None,
                 dpop_jkt: None,
                 issuer: None,
-                tenant: None,
+                tenant: Some(HOSTED_TENANT.to_owned()),
                 require_clearance: false,
             })
             .await?
@@ -2587,6 +2605,34 @@ mod tests {
             axum::http::StatusCode::OK,
             "the AS must accept its path-bearing default audience alias"
         );
+        assert_eq!(response_json(default_audience_auth).await["active"], true);
+
+        let cross_tenant_token = state
+            .policy_client
+            .issue_token(&IssueToken {
+                requested_scopes: Some(vec!["read:*:*".to_owned()]),
+                ttl: Some(300),
+                audience: Some(ISSUER.to_owned()),
+                subject: Some("cross-tenant-introspector".to_owned()),
+                user_pub_key: None,
+                dpop_jkt: None,
+                issuer: None,
+                tenant: Some("other.example.test".to_owned()),
+                require_clearance: false,
+            })
+            .await?
+            .token;
+        let cross_tenant_introspection = post_form_bearer(
+            &app,
+            "/oauth/introspect",
+            &[("token", &generic_access_token)],
+            &cross_tenant_token,
+        )
+        .await;
+        assert_eq!(
+            response_json(cross_tenant_introspection).await["active"],
+            false
+        );
 
         // Token exchange may only attenuate the verified subject token's signed
         // grant. A caller holding read:*:* cannot write transition:generic into
@@ -2601,7 +2647,7 @@ mod tests {
                 user_pub_key: None,
                 dpop_jkt: None,
                 issuer: None,
-                tenant: None,
+                tenant: Some("example.test".to_owned()),
                 require_clearance: false,
             })
             .await?
@@ -2649,7 +2695,7 @@ mod tests {
                 user_pub_key: None,
                 dpop_jkt: None,
                 issuer: None,
-                tenant: None,
+                tenant: Some("example.test".to_owned()),
                 require_clearance: false,
             })
             .await?

@@ -21,10 +21,10 @@ pub mod service;
 
 // Re-export main types
 pub use client::FlightClient;
-pub use service::FlightSqlServer;
+pub use service::{DenyAllFlightAuthorizer, FlightAuthError, FlightAuthorizer, FlightSqlServer};
 
-use hyprstream_metrics::RegistryClient;
 use hyprstream_metrics::storage::{duckdb::DuckDbBackend, StorageBackendType};
+use hyprstream_metrics::RegistryClient;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -120,6 +120,22 @@ pub async fn start_flight_server(
     dataset_name: &str,
     config: FlightConfig,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    start_flight_server_with_authorizer(
+        client,
+        dataset_name,
+        config,
+        Arc::new(DenyAllFlightAuthorizer),
+    )
+    .await
+}
+
+/// Start Flight with an explicit authentication + tenant-policy boundary.
+pub async fn start_flight_server_with_authorizer(
+    client: Option<Arc<dyn RegistryClient>>,
+    dataset_name: &str,
+    config: FlightConfig,
+    authorizer: Arc<dyn FlightAuthorizer>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Determine connection string based on whether we have a registry client
     let connection_string = if let Some(ref registry_client) = client {
         // Look up dataset in registry
@@ -159,6 +175,14 @@ pub async fn start_flight_server(
     let flight_service = FlightSqlServer::new(StorageBackendType::DuckDb(backend))
         .await
         .map_err(|e| format!("Failed to create Flight SQL server: {e}"))?
+        .with_authorizer(
+            authorizer,
+            if dataset_name.is_empty() {
+                "flight:*".to_owned()
+            } else {
+                format!("flight:dataset:{dataset_name}")
+            },
+        )
         .into_service();
 
     let mut server = Server::builder();

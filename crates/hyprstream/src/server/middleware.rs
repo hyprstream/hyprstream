@@ -4,7 +4,7 @@ use crate::auth::jwt;
 use crate::server::state::{ResourceAuthState, ServerState};
 use axum::{
     extract::{Request, State},
-    http::{HeaderValue, StatusCode, header},
+    http::{header, HeaderValue, StatusCode},
     middleware::Next,
     response::{IntoResponse, Response},
 };
@@ -20,6 +20,11 @@ use tracing::{debug, info, warn};
 pub struct AuthenticatedUser {
     /// Username (from JWT sub claim)
     pub user: String,
+    /// Tenant/Casbin domain from the authority-verified hosted-account binding.
+    ///
+    /// This is copied only from a successfully verified JWT. It is never
+    /// inferred from `user` or accepted from request data.
+    pub verified_tenant: Option<String>,
     /// Original JWT token for e2e verification through service chain.
     /// SECURITY: Never logged — custom Debug impl redacts this field.
     pub token: Option<String>,
@@ -31,9 +36,45 @@ impl std::fmt::Debug for AuthenticatedUser {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AuthenticatedUser")
             .field("user", &self.user)
+            .field("verified_tenant", &self.verified_tenant)
             .field("token", &self.token.as_ref().map(|_| "[REDACTED]"))
             .field("exp", &self.exp)
             .finish()
+    }
+}
+
+impl AuthenticatedUser {
+    /// Select the Casbin domain for an authenticated HTTP request.
+    ///
+    /// Tenant-bound identities stay in their authority-verified hosted-account
+    /// tenant. A tenantless `service:*` authority may use the global domain,
+    /// matching `PolicyService::request_domain`; ordinary tenantless identities
+    /// fail closed. A present but malformed/wildcard binding always fails,
+    /// including for services.
+    pub fn authorization_domain(&self) -> Result<String, &'static str> {
+        if let Some(tenant) = self.verified_tenant.as_deref() {
+            let valid_component = !tenant.is_empty()
+                && tenant.len() <= 253
+                && tenant != "."
+                && tenant != ".."
+                && tenant != "*"
+                && tenant.bytes().all(|byte| {
+                    byte.is_ascii_alphanumeric()
+                        || byte == b'-'
+                        || byte == b'_'
+                        || byte == b'.'
+                });
+            if !valid_component {
+                return Err("invalid verified tenant");
+            }
+            return Ok(tenant.to_owned());
+        }
+
+        if self.user.starts_with("service:") {
+            return Ok("*".to_owned());
+        }
+
+        Err("missing verified tenant")
     }
 }
 
@@ -90,7 +131,10 @@ pub async fn auth_middleware(
     // audience validation, JTI revocation). Reused verbatim by the 9P mount
     // ticket validator (H1a / #764). DPoP sender-binding is enforced below,
     // after we hold the claims, because it is header/scheme-specific.
-    let local_issuers: &[&str] = &[&*state.oauth_issuer_url];
+    let atproto_issuer =
+        crate::services::oauth::state::canonical_issuer_origin(&state.oauth_issuer_url)
+            .unwrap_or_else(|| state.oauth_issuer_url.clone());
+    let local_issuers: &[&str] = &[&*state.oauth_issuer_url, &atproto_issuer];
     let claims = match verify_resource_token_claims(&state, &token).await {
         Ok(c) => c,
         Err(reason) => {
@@ -175,9 +219,18 @@ pub async fn auth_middleware(
     };
     let user = AuthenticatedUser {
         user: user_str,
+        verified_tenant: claims.tenant.clone(),
         token: Some(token),
         exp: Some(claims.exp),
     };
+    if let Err(reason) = user.authorization_domain() {
+        warn!(subject = %user.user, reason, "HTTP authorization has no valid hosted-account tenant binding");
+        return (
+            StatusCode::FORBIDDEN,
+            "Verified hosted-account tenant binding required",
+        )
+            .into_response();
+    }
     request.extensions_mut().insert(user);
     next.run(request).await
 }
@@ -400,7 +453,7 @@ fn local_issuer_matches(claims: &jwt::Claims, expected: &str) -> bool {
     claims.iss == expected
 }
 
-async fn verify_resource_token_claims(
+pub(crate) async fn verify_resource_token_claims(
     state: &ResourceAuthState,
     token: &str,
 ) -> Result<jwt::Claims, &'static str> {
@@ -410,8 +463,11 @@ async fn verify_resource_token_claims(
 
     // Extract iss for key routing (local node key vs trusted federation peer).
     let iss = extract_iss_from_token(token);
-    let local_issuers: &[&str] = &[&*state.oauth_issuer_url];
-    let claims = if hyprstream_rpc::auth::is_local_iss(&iss, local_issuers) {
+    let atproto_issuer =
+        crate::services::oauth::state::canonical_issuer_origin(&state.oauth_issuer_url)
+            .unwrap_or_else(|| state.oauth_issuer_url.clone());
+    let local_issuers: &[&str] = &[&*state.oauth_issuer_url, &atproto_issuer];
+    let mut claims = if hyprstream_rpc::auth::is_local_iss(&iss, local_issuers) {
         // Local-issuer tokens may be signed by EITHER the cluster CA key OR any
         // currently-published rotation slot (the OAuth token endpoint signs with
         // `active_jwt_signing_key()` → the rotation active slot). Validate against
@@ -479,6 +535,9 @@ async fn verify_resource_token_claims(
         }
     }
 
+    // Federation is trusted for identity, never for choosing a local PDS/Casbin
+    // tenant. Only this node's OAuth authority may assert the hosted binding.
+    claims.strip_federated_tenant(local_issuers);
     Ok(claims)
 }
 
@@ -511,7 +570,7 @@ fn unauthorized_response(message: &str, www_authenticate: &str) -> Response {
 /// Exported for use in other middleware-like contexts (e.g. MCP inline auth).
 /// Returns an empty string on any parse failure.
 pub fn extract_iss_from_token(token: &str) -> String {
-    use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
     let parts: Vec<&str> = token.splitn(3, '.').collect();
     if parts.len() < 2 {
         return String::new();
@@ -537,7 +596,7 @@ pub fn extract_iss_from_token(token: &str) -> String {
 
 /// Extract `kid` from a JWT header without full validation.
 pub fn extract_kid_from_token(token: &str) -> Option<String> {
-    use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
     let header_b64 = token.split('.').next()?;
     if header_b64.len() > 4096 {
         return None;
@@ -855,12 +914,138 @@ mod cors_layer_tests {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
     use super::*;
 
     #[test]
+    fn http_domain_uses_verified_hosted_account_tenant_not_subject() {
+        let alice = AuthenticatedUser {
+            user: "did:web:alice.accounts.example".to_owned(),
+            verified_tenant: Some("acme.example".to_owned()),
+            token: None,
+            exp: None,
+        };
+        let bob = AuthenticatedUser {
+            user: "did:web:bob.accounts.example".to_owned(),
+            verified_tenant: Some("acme.example".to_owned()),
+            token: None,
+            exp: None,
+        };
+
+        assert_eq!(
+            alice.authorization_domain().unwrap(),
+            "acme.example"
+        );
+        assert_eq!(alice.authorization_domain(), bob.authorization_domain());
+        assert_ne!(alice.authorization_domain().unwrap(), alice.user);
+    }
+
+    #[test]
+    fn http_domain_fails_closed_except_for_tenantless_services() {
+        for verified_tenant in [
+            None,
+            Some(String::new()),
+            Some("*".to_owned()),
+            Some(" acme.example".to_owned()),
+            Some("did:web:alice.acme.example".to_owned()),
+            Some("../acme".to_owned()),
+        ] {
+            let user = AuthenticatedUser {
+                user: "did:web:alice.accounts.example".to_owned(),
+                verified_tenant,
+                token: None,
+                exp: None,
+            };
+            assert!(user.authorization_domain().is_err());
+        }
+
+        let service = AuthenticatedUser {
+            user: "service:oauth".to_owned(),
+            verified_tenant: None,
+            token: None,
+            exp: None,
+        };
+        assert_eq!(service.authorization_domain().unwrap(), "*");
+
+        let malformed_service = AuthenticatedUser {
+            user: "service:oauth".to_owned(),
+            verified_tenant: Some("*".to_owned()),
+            token: None,
+            exp: None,
+        };
+        assert!(malformed_service.authorization_domain().is_err());
+    }
+
+    #[test]
+    fn federated_tenant_assertion_cannot_select_http_domain() {
+        let mut claims = jwt::Claims::new("service:forged".to_owned(), 1, 2)
+            .with_issuer("https://idp.example".to_owned())
+            .with_tenant("victim.example".to_owned());
+        claims.strip_federated_tenant(&["https://oauth.local"]);
+        let subject = claims.subject(&["https://oauth.local"]);
+        let user = AuthenticatedUser {
+            user: subject.name().unwrap().to_owned(),
+            verified_tenant: claims.tenant,
+            token: None,
+            exp: None,
+        };
+        assert!(user.authorization_domain().is_err());
+        assert!(!user.user.starts_with("service:"));
+    }
+
+    #[tokio::test]
+    async fn http_policy_domain_blocks_cross_tenant_replay() {
+        let policy = crate::auth::PolicyManager::new_in_memory().await.unwrap();
+        policy
+            .add_policy_with_domain(
+                "did:web:alice.accounts.example",
+                "tenant-a.example",
+                "model:qwen",
+                "infer.generate",
+                "allow",
+            )
+            .await
+            .unwrap();
+
+        let tenant_a = AuthenticatedUser {
+            user: "did:web:alice.accounts.example".to_owned(),
+            verified_tenant: Some("tenant-a.example".to_owned()),
+            token: None,
+            exp: None,
+        };
+        let replayed_in_tenant_b = AuthenticatedUser {
+            user: tenant_a.user.clone(),
+            verified_tenant: Some("tenant-b.example".to_owned()),
+            token: None,
+            exp: None,
+        };
+
+        assert!(
+            policy
+                .check_with_domain(
+                    &tenant_a.user,
+                    &tenant_a.authorization_domain().unwrap(),
+                    "model:qwen",
+                    "infer.generate",
+                )
+                .await
+        );
+        assert!(
+            !policy
+                .check_with_domain(
+                    &replayed_in_tenant_b.user,
+                    &replayed_in_tenant_b.authorization_domain().unwrap(),
+                    "model:qwen",
+                    "infer.generate",
+                )
+                .await
+        );
+    }
+
+    #[test]
     fn test_extract_iss_from_token() {
-        use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 
         // Craft a JWT with iss in payload: header.payload.sig
         // payload = base64url({"iss":"https://node-a","sub":"alice","exp":9999999999,"iat":0})
@@ -889,7 +1074,7 @@ mod tests {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod rotation_aware_tests {
     use super::*;
-    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
     use ed25519_dalek::{Signer as _, SigningKey};
 
     const AUD: &str = "https://node-a/resource";
@@ -1121,7 +1306,7 @@ mod rotation_aware_tests {
 mod composite_aware_tests {
     use super::*;
     use crate::auth::jwt::encode_composite_ml_dsa_65_ed25519;
-    use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
     use ed25519_dalek::SigningKey;
 
     const AUD: &str = "https://node-a/resource";
@@ -1298,17 +1483,15 @@ mod composite_aware_tests {
             published_pair(pq_b_vk, ed_b.verifying_key()),
         ];
 
-        assert!(
-            decode_local_multi_key(
-                &cross_token,
-                &ca.verifying_key(),
-                &[ed_a.verifying_key(), ed_b.verifying_key()],
-                &published,
-                Some(AUD),
-                false,
-            )
-            .is_err()
-        );
+        assert!(decode_local_multi_key(
+            &cross_token,
+            &ca.verifying_key(),
+            &[ed_a.verifying_key(), ed_b.verifying_key()],
+            &published,
+            Some(AUD),
+            false,
+        )
+        .is_err());
     }
 
     #[test]
@@ -1446,17 +1629,15 @@ mod composite_aware_tests {
         let sig_bytes = URL_SAFE_NO_PAD.decode(sig_b64).unwrap();
         for stripped in [&sig_bytes[..3309], &sig_bytes[3309..]] {
             let tampered = format!("{}.{}", &token[..dot2], URL_SAFE_NO_PAD.encode(stripped));
-            assert!(
-                decode_local_multi_key(
-                    &tampered,
-                    &ca.verifying_key(),
-                    &published_ed,
-                    &pairs,
-                    Some(AUD),
-                    false,
-                )
-                .is_err()
-            );
+            assert!(decode_local_multi_key(
+                &tampered,
+                &ca.verifying_key(),
+                &published_ed,
+                &pairs,
+                Some(AUD),
+                false,
+            )
+            .is_err());
         }
     }
 
@@ -1485,17 +1666,15 @@ mod composite_aware_tests {
         .unwrap();
         assert_eq!(claims.sub, "alice");
 
-        assert!(
-            decode_local_multi_key(
-                &token,
-                &ca.verifying_key(),
-                &published_ed,
-                &pairs,
-                Some(AUD),
-                false,
-            )
-            .is_err()
-        );
+        assert!(decode_local_multi_key(
+            &token,
+            &ca.verifying_key(),
+            &published_ed,
+            &pairs,
+            Some(AUD),
+            false,
+        )
+        .is_err());
     }
 
     #[test]
@@ -1586,7 +1765,7 @@ mod composite_aware_tests {
 #[allow(clippy::expect_used)]
 mod browser_provisioning_rate_limit_tests {
     use super::*;
-    use axum::{Router, body::Body, http::Request as HttpRequest, middleware, routing::get};
+    use axum::{body::Body, http::Request as HttpRequest, middleware, routing::get, Router};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tower::ServiceExt;
 

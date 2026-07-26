@@ -976,6 +976,9 @@ pub struct IdTokenClaims {
     /// Authorized party (REQUIRED when aud has multiple values).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub azp: Option<String>,
+    /// Authority-verified hosted-account tenant for local token exchange.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tenant: Option<String>,
 
     // ── Profile claims (included based on requested scopes) ─────────────
     /// Full name.
@@ -1004,6 +1007,7 @@ impl IdTokenClaims {
             nonce: None,
             auth_time: None,
             azp: None,
+            tenant: None,
             name: None,
             email: None,
             email_verified: None,
@@ -1020,6 +1024,12 @@ impl IdTokenClaims {
     /// Set the authentication time.
     pub fn with_auth_time(mut self, auth_time: i64) -> Self {
         self.auth_time = Some(auth_time);
+        self
+    }
+
+    /// Bind this local ID token to the user's hosted-account tenant.
+    pub fn with_tenant(mut self, tenant: String) -> Self {
+        self.tenant = Some(tenant);
         self
     }
 

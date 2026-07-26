@@ -2277,6 +2277,53 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    fn hosted_account_store(
+        label: &str,
+        zone: &str,
+    ) -> anyhow::Result<Arc<hyprstream_pds_service::AccountRecordStore>> {
+        let ed = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let (pq, pq_vk) = hyprstream_crypto::pq::ml_dsa_generate_keypair();
+        let hybrid = hyprstream_pds::did_op::HybridRotationKey::new(
+            ed.verifying_key().to_bytes(),
+            hyprstream_crypto::pq::ml_dsa_vk_bytes(&pq_vk),
+        )?;
+        let rotations = hyprstream_pds::did_op::GenesisRotationKeys::new(
+            hyprstream_pds::did_op::UserRotationKey::new(hybrid),
+            hyprstream_pds::did_op::RecoveryKeyEnrollment::Declined,
+            hyprstream_pds::did_op::HostKeyEnrollment::Absent,
+        )?;
+        let name = hyprstream_pds::AllocatedAccountName::new(
+            label,
+            format!("did:web:{label}.{zone}"),
+        )?;
+        let pending = hyprstream_pds::HostedAccountMint::begin(name, rotations)?
+            .prepare_genesis(
+                hyprstream_pds::Cid::from_raw(zone.as_bytes()),
+                hyprstream_pds::did_op::GenesisRepoHead::EmptyRepo,
+            )?;
+        let signature =
+            hyprstream_pds::did_op::sign_genesis(pending.unsigned_genesis(), &ed, &pq)?;
+        let record = pending.seal(signature)?.record_bytes().to_vec();
+        let root = hyprstream_vfs::SyntheticNode::dir().with_child(
+            zone,
+            hyprstream_vfs::SyntheticNode::dir().with_child(
+                "accounts",
+                hyprstream_vfs::SyntheticNode::dir().with_child(
+                    label,
+                    hyprstream_vfs::SyntheticNode::dir().with_child(
+                        "account-record.cbor",
+                        hyprstream_vfs::SyntheticNode::file(record),
+                    ),
+                ),
+            ),
+        );
+        Ok(Arc::new(
+            hyprstream_pds_service::AccountRecordStore::new(Arc::new(
+                hyprstream_vfs::SyntheticMount::new(root),
+            )),
+        ))
+    }
+
     fn test_config() -> OAuthConfig {
         OAuthConfig {
             jwt_key_active_days: 14,
@@ -2542,12 +2589,37 @@ mod tests {
                     SigningKey::from_bytes(&[0x77; 32]).verifying_key(),
                     None,
                 )?;
-                let state = Arc::new(crate::services::oauth::state::OAuthState::new(
-                    &config,
-                    policy_client_for_socket(&dir)?,
-                    discovery,
-                    authority_ca_key().verifying_key().to_bytes(),
-                ));
+                let user_store = Arc::new(crate::auth::RocksDbUserStore::open(
+                    &dir.join("oauth-users"),
+                )?);
+                crate::auth::UserStore::register(user_store.as_ref(), "multiprocess-oauth").await?;
+                crate::auth::UserStore::set_profile(
+                    user_store.as_ref(),
+                    "multiprocess-oauth",
+                    crate::auth::UserProfilePatch {
+                        atproto_did: Some(Some(
+                            "did:web:multiprocess-oauth.example.test".to_owned(),
+                        )),
+                        ..Default::default()
+                    },
+                )
+                .await?;
+                let state = Arc::new(
+                    crate::services::oauth::state::OAuthState::new(
+                        &config,
+                        policy_client_for_socket(&dir)?,
+                        discovery,
+                        authority_ca_key().verifying_key().to_bytes(),
+                    )
+                    .with_user_store(user_store)
+                    .with_hosted_account_zone(crate::account::AccountZone::new(
+                        "example.test",
+                    )?)
+                    .with_hosted_account_store(hosted_account_store(
+                        "multiprocess-oauth",
+                        "example.test",
+                    )?),
+                );
                 let verifier = "multiprocess-pkce-verifier";
                 let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
                 for code in [

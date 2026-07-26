@@ -181,12 +181,48 @@ pub async fn require_bearer_token(
         }
     }
 
-    request.extensions_mut().insert(AuthenticatedUser {
+    let user = AuthenticatedUser {
         user: claims.sub,
+        verified_tenant: claims.tenant,
         token: Some(token),
         exp: Some(claims.exp),
-    });
+    };
+    if user.authorization_domain().is_err() {
+        return (
+            StatusCode::FORBIDDEN,
+            axum::Json(serde_json::json!({
+                "error": "insufficient_scope",
+                "error_description": "Verified hosted-account tenant binding required"
+            })),
+        )
+            .into_response();
+    }
+    request.extensions_mut().insert(user);
 
+    next.run(request).await
+}
+
+/// Restrict cross-tenant OAuth administration to a tenantless service authority.
+///
+/// This layer runs inside [`require_bearer_token`], after the verified identity
+/// has been inserted. Tenant-bound users may use self-service OAuth routes, but
+/// cannot enumerate or mutate the global SCIM store or mint service workload
+/// identities. Introspection has its own same-tenant check.
+pub async fn require_global_service_authority(request: Request, next: Next) -> Response {
+    let authorized = request
+        .extensions()
+        .get::<AuthenticatedUser>()
+        .is_some_and(|user| user.authorization_domain().as_deref() == Ok("*"));
+    if !authorized {
+        return (
+            StatusCode::FORBIDDEN,
+            axum::Json(serde_json::json!({
+                "error": "insufficient_scope",
+                "error_description": "global service authority required"
+            })),
+        )
+            .into_response();
+    }
     next.run(request).await
 }
 
