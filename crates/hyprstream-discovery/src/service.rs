@@ -1595,6 +1595,34 @@ impl RegistryDeploymentVerifier {
         self.verifying_key == *key
     }
 
+    /// Hybrid public key authenticated as this deployment's trust root.
+    ///
+    /// The operable PLC directory uses this projection to prove that an
+    /// operator-manual genesis was signed by the same mandatory-Hybrid root
+    /// installed at process bootstrap. It deliberately exposes no signing
+    /// material and has no classical-only representation.
+    pub(crate) fn deployment_did_op_key(&self) -> Result<crate::did_op::HybridRotationKey> {
+        crate::did_op::HybridRotationKey::new(
+            self._deployment_ca.ed25519.to_bytes(),
+            hyprstream_rpc::crypto::pq::ml_dsa_vk_bytes(&self._deployment_ca.ml_dsa_65),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test_deployment_root(
+        ed25519: &SigningKey,
+        ml_dsa_65: &hyprstream_rpc::crypto::pq::MlDsaSigningKey,
+    ) -> Result<Self> {
+        let root = HybridDeploymentCa::from_public_key_bytes(
+            ed25519.verifying_key().as_bytes(),
+            &hyprstream_rpc::crypto::pq::ml_dsa_sk_to_vk_bytes(ml_dsa_65),
+        )?;
+        Ok(Self {
+            verifying_key: ed25519.verifying_key(),
+            _deployment_ca: Arc::new(root),
+        })
+    }
+
     #[cfg(test)]
     fn matches_deployment_root(&self, root: &HybridDeploymentCa) -> bool {
         self._deployment_ca.domain() == root.domain()

@@ -107,7 +107,7 @@ impl HybridRotationKey {
         Self::new(ed25519, required(value, "mldsa65Pub")?.as_bytes()?.to_vec())
     }
 
-    fn verifying_keys(&self) -> Result<(VerifyingKey, MlDsaVerifyingKey)> {
+    pub(crate) fn verifying_keys(&self) -> Result<(VerifyingKey, MlDsaVerifyingKey)> {
         ensure!(
             self.mldsa65_pub.len() == ML_DSA65_PUBLIC_KEY_LEN,
             "ML-DSA-65 public key must be {ML_DSA65_PUBLIC_KEY_LEN} bytes"
@@ -119,7 +119,7 @@ impl HybridRotationKey {
         Ok((ed, pq))
     }
 
-    fn matches_signers(&self, ed25519: &SigningKey, mldsa65: &MlDsaSigningKey) -> bool {
+    pub(crate) fn matches_signers(&self, ed25519: &SigningKey, mldsa65: &MlDsaSigningKey) -> bool {
         self.ed25519_pub == ed25519.verifying_key().to_bytes()
             && self.mldsa65_pub == ml_dsa_sk_to_vk_bytes(mldsa65)
     }
@@ -140,7 +140,7 @@ impl HybridDidOpSignature {
         }
     }
 
-    fn validate_shape(&self) -> Result<()> {
+    pub(crate) fn validate_shape(&self) -> Result<()> {
         ensure!(
             self.ed25519.len() == ED25519_SIGNATURE_LEN,
             "Ed25519 signature must be {ED25519_SIGNATURE_LEN} bytes"
