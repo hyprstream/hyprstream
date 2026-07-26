@@ -58,6 +58,12 @@ jobs:
         password: ${{ secrets.DOCKER_PASSWORD }}
     - name: Checkout repository
       uses: actions/checkout@v4
+      with:
+        # workflow_run sets GITHUB_SHA to the current default-branch tip, which
+        # may be newer than the commit that passed Rust. Build the exact tested
+        # commit; tag pushes fall back to the tagged SHA.
+        ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+        persist-credentials: false
 
     - name: Set up Docker Buildx
       uses: docker/setup-buildx-action@v3
@@ -85,6 +91,12 @@ jobs:
           type=semver,pattern={{major}}.{{minor}},suffix=-${{ matrix.tag_suffix }}
           # Latest tag for main branch
           type=raw,value=latest,enable={{is_default_branch}},suffix=-${{ matrix.tag_suffix }}
+          # Architecture-specific CPU staging tags. The manifest job below
+          # combines these with the native arm64 image under the normal CPU tag.
+          type=semver,pattern={{version}},suffix=-cpu-amd64,enable=${{ matrix.variant == 'cpu' }}
+          type=semver,pattern={{major}}.{{minor}},suffix=-cpu-amd64,enable=${{ matrix.variant == 'cpu' }}
+          type=raw,value=edge,suffix=-cpu-amd64,enable=${{ matrix.variant == 'cpu' && github.event_name == 'workflow_run' }}
+          type=raw,value=latest,suffix=-cpu-amd64,enable=${{ matrix.variant == 'cpu' && github.event_name == 'workflow_run' }}
 
     - name: Build and push Docker image
       uses: docker/build-push-action@v6
@@ -174,6 +186,11 @@ jobs:
     permissions:
       contents: read
       packages: write
+    env:
+      # The golden AMI root filesystem is only 29 GB. Put all image layers and
+      # BuildKit cache mounts on the dedicated 196 GB CI-cache volume instead.
+      PODMAN_ROOT: /mnt/hypr-ci-cache/podman-image-${{ github.run_id }}-${{ github.run_attempt }}
+      PODMAN_RUNROOT: /mnt/hypr-ci-cache/podman-run-${{ github.run_id }}-${{ github.run_attempt }}
     # Two concurrence regimes:
     #  - main (workflow_run) builds contend only on the moving edge/latest
     #    tags, so they share ONE per-branch group and the superseded run is
@@ -234,6 +251,7 @@ jobs:
         TAGS: ${{ steps.meta.outputs.tags }}
       run: |
         set -euo pipefail
+        mkdir -p "$PODMAN_ROOT" "$PODMAN_RUNROOT"
         # Turn the newline-separated tag list into repeated `-t` args.
         tag_args=()
         while IFS= read -r t; do
@@ -247,7 +265,7 @@ jobs:
         echo '```' >> "$GITHUB_STEP_SUMMARY"
         printf '  %s\n' "${tag_args[@]}" >> "$GITHUB_STEP_SUMMARY"
         echo '```' >> "$GITHUB_STEP_SUMMARY"
-        podman build \
+        podman --root "$PODMAN_ROOT" --runroot "$PODMAN_RUNROOT" build \
           --target runtime \
           --build-arg VARIANT=cpu-arm64 \
           "${tag_args[@]}" \
@@ -261,14 +279,67 @@ jobs:
       run: |
         set -euo pipefail
         while IFS= read -r t; do
-          [ -n "$t" ] && podman push "$t"
+          [ -n "$t" ] && podman --root "$PODMAN_ROOT" --runroot "$PODMAN_RUNROOT" push "$t"
         done <<< "$TAGS"
 
     - name: Clean up disk space after build
       if: always()
       run: |
         echo "=== Cleaning up after arm64 CPU build ==="
-        podman system prune -af || true
+        podman --root "$PODMAN_ROOT" --runroot "$PODMAN_RUNROOT" system reset --force || true
         rm -rf ~/.cargo/registry/cache ~/.cargo/git 2>/dev/null || true
         echo "=== Disk usage after cleanup ==="
         df -h
+
+  # Publish the normal CPU contract as an OCI index only after both native
+  # builds succeeded. The Graviton target can keep pulling `latest-cpu`; GHCR
+  # selects linux/arm64 while existing x86 hosts receive linux/amd64.
+  publish-cpu-manifest:
+    if: >-
+      github.event_name == 'push' ||
+      (
+        github.event.workflow_run.event == 'push' &&
+        github.event.workflow_run.head_repository.full_name == github.repository &&
+        github.event.workflow_run.conclusion == 'success'
+      )
+    needs: [build-docker, build-docker-arm64]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
+    - name: Log in to Container Registry
+      env:
+        REGISTRY_USER: ${{ github.actor }}
+        REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        echo "$REGISTRY_TOKEN" | docker login ghcr.io -u "$REGISTRY_USER" --password-stdin
+
+    - name: Extract CPU manifest tags
+      id: meta
+      uses: docker/metadata-action@v5
+      with:
+        images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+        tags: |
+          type=semver,pattern={{version}},suffix=-cpu
+          type=semver,pattern={{major}}.{{minor}},suffix=-cpu
+          type=raw,value=edge,suffix=-cpu,enable=${{ github.event_name == 'workflow_run' }}
+          type=raw,value=latest,suffix=-cpu,enable=${{ github.event_name == 'workflow_run' }}
+
+    - name: Publish multi-arch CPU manifests
+      env:
+        TAGS: ${{ steps.meta.outputs.tags }}
+      run: |
+        set -euo pipefail
+        while IFS= read -r tag; do
+          [ -n "$tag" ] || continue
+          docker buildx imagetools create \
+            --tag "$tag" \
+            "${tag}-amd64" \
+            "${tag}-arm64"
+          docker buildx imagetools inspect "$tag"
+        done <<< "$TAGS"
