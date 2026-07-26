@@ -229,6 +229,10 @@ pub mod web_transport;
 #[cfg(target_arch = "wasm32")]
 pub mod dial_wasm;
 pub mod browser_provisioning;
+/// Browser-side RFC 8693 token-exchange (#1314) for the wasm client. Pure
+/// parsing helpers compile on all targets (unit-tested on native); the browser
+/// `fetch` glue is `wasm32`-only.
+pub mod wasm_token_exchange;
 // Iroh carrier reach + pkarr helpers for wasm32. NodeId is exposed only as an
 // endpoint address/diagnostic; no DID or application-identity conversion exists.
 #[cfg(target_arch = "wasm32")]
