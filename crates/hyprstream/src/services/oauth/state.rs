@@ -970,6 +970,10 @@ pub struct OAuthState {
     /// to its local tenant binding. `None` means every ATProto identity is
     /// federated-only for tenant exchange purposes.
     pub hosted_account_store: Option<Arc<hyprstream_pds_service::AccountRecordStore>>,
+    /// Authenticated registration/intake wire adapter. `None` keeps every
+    /// identity mutation endpoint fail-closed with 503 after authentication.
+    pub identity_registration_api:
+        Option<Arc<super::identity_registration::IdentityRegistrationApi>>,
     /// Ed25519 signing key for signing entity configurations (OpenID Federation 1.0).
     /// `None` when not configured.
     pub signing_key: Option<ed25519_dalek::SigningKey>,
@@ -1168,6 +1172,7 @@ impl OAuthState {
             verifying_key_bytes,
             user_service: None,
             hosted_account_store: None,
+            identity_registration_api: None,
             signing_key: None,
             root_identity_key_store: None,
             authority_hints: config.authority_hints.clone(),
@@ -1235,6 +1240,15 @@ impl OAuthState {
         store: Arc<hyprstream_pds_service::AccountRecordStore>,
     ) -> Self {
         self.hosted_account_store = Some(store);
+        self
+    }
+
+    /// Attach the authenticated hosted-account registration/intake adapter.
+    pub fn with_identity_registration_api(
+        mut self,
+        api: Arc<super::identity_registration::IdentityRegistrationApi>,
+    ) -> Self {
+        self.identity_registration_api = Some(api);
         self
     }
 
