@@ -29,7 +29,10 @@ pub const GRANT_TYPE: &str = "urn:ietf:params:oauth:grant-type:token-exchange";
 pub const ISSUED_TOKEN_TYPE: &str = "urn:ietf:params:oauth:token-type:access_token";
 
 /// A successfully exchanged short-lived Bearer (at+jwt).
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Debug` is manual and redacts `access_token` so an accidental `{:?}` log
+/// can't leak the Bearer.
+#[derive(Clone, PartialEq, Eq)]
 pub struct ExchangedToken {
     /// The at+jwt `access_token` — presented as the client's default JWT.
     pub access_token: String,
@@ -37,6 +40,15 @@ pub struct ExchangedToken {
     /// uses a static default-JWT; a refresh path (`withTokenProvider`) is the
     /// future-work follow-on the recon notes.
     pub expires_in: i64,
+}
+
+impl std::fmt::Debug for ExchangedToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ExchangedToken")
+            .field("access_token", &"<redacted>")
+            .field("expires_in", &self.expires_in)
+            .finish()
+    }
 }
 
 #[derive(Deserialize)]
@@ -128,6 +140,12 @@ mod fetch {
     use wasm_bindgen::JsCast as _;
     use wasm_bindgen_futures::JsFuture;
 
+    /// Cap on a token-exchange response body. An OAuth token response is a few
+    /// hundred bytes; anything larger signals a misconfigured/compromised
+    /// endpoint trying to exhaust the browser tab (mirrors the spirit of
+    /// `browser_provisioning::MAX_PROVISIONING_BYTES`).
+    const MAX_EXCHANGE_RESPONSE_BYTES: usize = 64 * 1024;
+
     /// Validate `endpoint` is an absolute, credential-free HTTPS origin.
     fn parse_origin(endpoint: &str) -> Result<url::Url> {
         let parsed = url::Url::parse(endpoint).context("invalid exchange endpoint")?;
@@ -170,7 +188,13 @@ mod fetch {
             let chunk: js_sys::Uint8Array = value
                 .dyn_into()
                 .map_err(|_| anyhow!("token-exchange chunk was not a Uint8Array"))?;
-            bytes.extend_from_slice(&chunk.to_vec());
+            let chunk_bytes = chunk.to_vec();
+            if bytes.len().saturating_add(chunk_bytes.len()) > MAX_EXCHANGE_RESPONSE_BYTES {
+                return Err(anyhow!(
+                    "token-exchange response exceeds {MAX_EXCHANGE_RESPONSE_BYTES} bytes"
+                ));
+            }
+            bytes.extend_from_slice(&chunk_bytes);
         }
         String::from_utf8(bytes).context("token-exchange response was not valid UTF-8")
     }
@@ -234,6 +258,7 @@ mod fetch {
 pub use fetch::fetch_exchange_token;
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
@@ -323,5 +348,20 @@ mod tests {
     #[test]
     fn subject_rejects_non_jwt() {
         assert!(subject_from_access_token("not-a-jwt").is_err());
+    }
+
+    #[test]
+    fn exchanged_token_debug_redacts_access_token() {
+        let t = ExchangedToken {
+            access_token: "secret-bearer-value".to_owned(),
+            expires_in: 300,
+        };
+        let rendered = format!("{t:?}");
+        assert!(
+            !rendered.contains("secret-bearer-value"),
+            "ExchangedToken Debug leaked the access_token: {rendered}"
+        );
+        assert!(rendered.contains("<redacted>"));
+        assert!(rendered.contains("300"));
     }
 }
