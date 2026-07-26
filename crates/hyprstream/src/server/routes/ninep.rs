@@ -523,21 +523,56 @@ struct TicketAttachAuthorizer {
 
 #[async_trait]
 impl AttachAuthorizer for TicketAttachAuthorizer {
-    async fn authorize(&self, uname: &str) -> Result<Subject, MountError> {
+    async fn authorize(&self, uname: &str, aname: &str) -> Result<Subject, MountError> {
         if uname.is_empty() {
             return Err(MountError::PermissionDenied(
                 "missing mount ticket".to_owned(),
             ));
         }
-        match verify_mount_ticket(&self.state, uname, PLANE_WEBTRANSPORT, ROOT_NAMESPACE_PATH).await
-        {
+        // Resolve the requested export (`aname`) to the namespace path the
+        // ticket must grant, then let the ticket capability check decide. An
+        // empty `aname` selects the default (root) export; an explicit selector
+        // is normalized as an absolute, `..`-free path so the accept-side
+        // canonical form agrees with the capability a ticket encodes. A
+        // malformed `aname` denies here; an otherwise well-formed but ungranted
+        // one denies inside `verify_mount_ticket` (the ticket capability won't
+        // match). Either way this is EACCES before any fid exists, and there is
+        // NO fallback to a default export after an explicit selector
+        // (#877/#1071 fail-closed contract).
+        let requested_ns = aname_to_namespace_path(aname)?;
+        match verify_mount_ticket(&self.state, uname, PLANE_WEBTRANSPORT, &requested_ns).await {
             Ok(subject) => Ok(subject),
             Err(reason) => {
-                warn!(reason, "9P WT attach rejected: invalid mount ticket");
+                warn!(reason, aname = %aname, "9P WT attach rejected: invalid mount ticket or export");
                 Err(MountError::PermissionDenied(reason.to_owned()))
             }
         }
     }
+}
+
+/// Normalize the 9P `aname` (export selector) a client presents at `Tattach`
+/// into the namespace path the mount ticket must grant.
+///
+/// An empty `aname` selects the default (root) export → [`ROOT_NAMESPACE_PATH`].
+/// An explicit selector is normalized as an absolute, `..`-free path (a bare
+/// name is anchored at the root) by reusing the mint-side normalizer so the
+/// accept-side canonical form agrees byte-for-byte with the capability a ticket
+/// encodes. A malformed selector (`..`, non-normalizable) denies — it is never
+/// silently coerced to the default.
+///
+/// Today mount tickets are minted only for `/` (`mount_ticket.rs`), so the only
+/// `aname` that can match a grant is one normalizing to `/` (empty or `/`
+/// itself); any other selector denies with `EACCES`. Widening this to real
+/// per-export grants is the `ExportResolver` (#877/#1071) — out of scope here,
+/// where the seam is made `aname`-aware and fail-closed.
+fn aname_to_namespace_path(aname: &str) -> Result<String, MountError> {
+    if aname.is_empty() {
+        return Ok(ROOT_NAMESPACE_PATH.to_owned());
+    }
+    let anchored = if aname.starts_with('/') { aname.to_owned() } else { format!("/{aname}") };
+    crate::services::oauth::mount_ticket::normalize_namespace_path(&anchored).ok_or_else(|| {
+        MountError::PermissionDenied(format!("malformed aname (export selector): {aname:?}"))
+    })
 }
 
 /// The injected 9P-over-WebTransport handler (H1b / #765).

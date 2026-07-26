@@ -246,7 +246,7 @@ fn valid_plane(value: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
 }
 
-fn normalize_namespace_path(value: &str) -> Option<String> {
+pub(crate) fn normalize_namespace_path(value: &str) -> Option<String> {
     if !value.starts_with('/') {
         return None;
     }

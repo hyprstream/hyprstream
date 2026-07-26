@@ -479,9 +479,12 @@ impl Translator {
         };
 
         // Only an attach that cleared monitor authorization may bind a backend
-        // subject. Walk the empty path to materialize
-        // a root qid from the backend, then record it.
-        self.backend.attach(uname).await?;
+        // subject. Forward BOTH `uname` and `aname` so the backend's
+        // authorizer can validate the requested export against the ticket's
+        // granted namespace and deny an unknown/forbidden selector with EACCES
+        // before any fid exists. Walk the empty path to materialize a root qid
+        // from the backend, then record it.
+        self.backend.attach(uname, aname).await?;
         let walk = self.backend.walk(fid, fid, &[]).await?;
         if let Some(session) = &session {
             self.bind_attach_session(session)?;
@@ -1883,7 +1886,7 @@ mod tests {
         struct PartialWalkBackend;
         #[async_trait]
         impl Backend for PartialWalkBackend {
-            async fn attach(&self, _uname: &str) -> anyhow::Result<()> {
+            async fn attach(&self, _uname: &str, _aname: &str) -> anyhow::Result<()> {
                 Ok(())
             }
             async fn walk(
@@ -2195,19 +2198,33 @@ mod tests {
     // ── Attach-time mount ticket (H1b / #765) ───────────────────────────
 
     /// A fake [`AttachAuthorizer`] mirroring the H1b `Tattach.uname` ticket
-    /// check: one fixed ticket string maps to a narrowed Subject; anything else
-    /// is denied with `PermissionDenied` (→ `EACCES`).
+    /// check PLUS the `aname` export-selection gate: one fixed ticket string
+    /// maps to a narrowed Subject, and only the default export (empty `aname`)
+    /// is granted; anything else is denied with `PermissionDenied` (→ `EACCES`).
     struct FakeTicketAuth;
     #[async_trait::async_trait]
     impl crate::mount_backend::AttachAuthorizer for FakeTicketAuth {
         async fn authorize(
             &self,
             uname: &str,
+            aname: &str,
         ) -> std::result::Result<hyprstream_rpc::Subject, hyprstream_vfs::MountError> {
-            match uname {
-                "good-ticket" => Ok(hyprstream_rpc::Subject::new("alice")),
-                "other-ticket" => Ok(hyprstream_rpc::Subject::new("bob")),
-                _ => Err(hyprstream_vfs::MountError::PermissionDenied("bad ticket".into())),
+            let subject = match uname {
+                "good-ticket" => hyprstream_rpc::Subject::new("alice"),
+                "other-ticket" => hyprstream_rpc::Subject::new("bob"),
+                _ => {
+                    return Err(hyprstream_vfs::MountError::PermissionDenied("bad ticket".into()))
+                }
+            };
+            // Export-selection gate (#877 fail-closed contract): only the
+            // default export is granted today; an explicit `aname` selecting any
+            // other export denies — there is NO fallback to the default.
+            if aname.is_empty() {
+                Ok(subject)
+            } else {
+                Err(hyprstream_vfs::MountError::PermissionDenied(format!(
+                    "export {aname:?} not granted by ticket"
+                )))
             }
         }
     }
@@ -2289,6 +2306,32 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(errno_from_error(&err), EACCES, "conflicting attach must be EACCES");
+    }
+
+    /// A valid ticket presenting an `aname` for an export it did not grant fails
+    /// the attach; the authorizer's `PermissionDenied` maps to an `Rlerror`
+    /// `EACCES` before any fid or mount handle is ever created. Fail-closed:
+    /// there is NO fallback to a default export after an explicit selector
+    /// (#877/#1071 contract).
+    #[tokio::test]
+    async fn attach_aname_denied_returns_eacces() {
+        let t = authorized_translator();
+        let err = t
+            .handle_message(&msg::tattach(
+                1,
+                0,
+                u32::MAX,
+                "good-ticket",
+                "forbidden-export",
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(errno_from_error(&err), EACCES, "denied aname must be EACCES");
+        // The root fid (fid 0, the attach target) must not exist after a denied
+        // attach — the deny happened in `backend.attach` before the translator
+        // bound any fid (the fail-closed contract: no fid leak on a denied
+        // export).
+        assert!(t.fids.qtype(0).is_none(), "no fid may be created for a denied aname");
     }
 
     /// Fail-closed: an op arriving before a successful attach binds the Subject
