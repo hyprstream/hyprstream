@@ -324,6 +324,29 @@ impl HostedAccountMint {
             unsigned,
         })
     }
+
+    /// Create and sign the account's empty initial repo, then bind that commit
+    /// CID into the hosted DID's genesis operation.
+    ///
+    /// The generated `#atproto` key never crosses this boundary: it signs the
+    /// repo commit in place and remains owned by the pending account mint.
+    pub fn prepare_pds_genesis(
+        self,
+        did_document: SealedHostedDidDocument,
+        rev: crate::tid::Tid,
+    ) -> Result<(
+        PendingHostedAccountMint,
+        crate::hosted_repo::HostedRepoGenesis,
+    )> {
+        let repo = crate::hosted_repo::HostedRepoGenesis::seal(
+            self.name.did(),
+            &self.atproto_signing_key,
+            rev,
+        )?;
+        let pending =
+            self.prepare_genesis(did_document, GenesisRepoHead::Existing(repo.commit_cid()))?;
+        Ok((pending, repo))
+    }
 }
 
 /// Mint state waiting for the user-held priority-zero signature.

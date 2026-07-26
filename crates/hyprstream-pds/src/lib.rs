@@ -66,6 +66,7 @@ pub mod did_op;
 pub mod event_group;
 pub mod hosted_account;
 pub mod hosted_did_document;
+pub mod hosted_repo;
 pub mod ledger;
 pub mod list_record;
 pub mod mst;
@@ -89,6 +90,7 @@ pub use hosted_account::{
 pub use hosted_did_document::{
     SealedHostedDidDocument, DID_DOCUMENT_MEDIA_TYPE, DID_DOCUMENT_PATH, DID_OPERATION_LOG_PATH,
 };
+pub use hosted_repo::HostedRepoGenesis;
 pub use ledger::{AllocationRecord, CheckpointRecord, GrantClass, ReceiptRecord, StateRoot, Unit};
 pub use name_record::NameRecord;
 pub use placement::{GroupItemRecord, GroupRecord, NodeRecord, WorkloadRecord};
