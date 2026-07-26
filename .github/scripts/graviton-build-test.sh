@@ -57,8 +57,11 @@ export HYPRSTREAM_FSGUEST_WASM="${PWD}/crates/hyprstream-workers-wasmtime-fsgues
 # nextest ci profile enforces the per-test slow-timeout from .config/nextest.toml;
 # fail-fast (the default) is what the merge gate wants.
 run_phase "nextest" cargo nextest run --cargo-profile ci-test --profile ci
-# nextest does not run doctests; keep them in the merge gate.
-run_phase "doctests" cargo test --release --doc
+# nextest does not run doctests; keep them in the merge gate. Use the ci-test
+# cargo profile (not --release) so doctests skip release ThinLTO — #1010's
+# acceptance criterion: a measured 318s doctest phase was paying release LTO
+# for almost no runtime win on doc examples. Parity with the nextest profile.
+run_phase "doctests" cargo test --profile ci-test --doc
 
 echo "::group::sccache statistics"
 sccache --show-stats

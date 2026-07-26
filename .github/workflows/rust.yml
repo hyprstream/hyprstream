@@ -203,7 +203,8 @@ jobs:
     # mid-run. A COLD-cache build+test can approach this; once sccache (S3) is
     # warm, real runs finish well under the merge queue's 120-min
     # check_response_timeout. The nextest ci-test profile avoids release ThinLTO
-    # on test binaries to keep the suite bounded.
+    # on test binaries to keep the suite bounded; the merge-gate doctest phase
+    # uses the same ci-test cargo profile for the same reason (#1010).
     timeout-minutes: 140
 
     steps:
