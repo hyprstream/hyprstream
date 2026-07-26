@@ -14,12 +14,23 @@ env:
   REGISTRY: ghcr.io
   IMAGE_NAME: hyprstream/hyprstream
 
+# Keep moving main tags ordered as a unit across the amd64 build, arm64 build,
+# and final manifest publication. Release tags are never cancelled mid-push.
+concurrency:
+  group: docker-publish-${{ github.event_name == 'workflow_run' && 'main' || 'release' }}
+  cancel-in-progress: ${{ github.event_name == 'workflow_run' }}
+
 jobs:
   build-docker:
-    # Only run if: tag push OR Rust workflow succeeded
+    # workflow_run carries write-capable credentials, so accept successful
+    # same-repository push runs only. A fork branch named main must not publish.
     if: >-
       github.event_name == 'push' ||
-      github.event.workflow_run.conclusion == 'success'
+      (
+        github.event.workflow_run.event == 'push' &&
+        github.event.workflow_run.head_repository.full_name == github.repository &&
+        github.event.workflow_run.conclusion == 'success'
+      )
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -83,16 +94,17 @@ jobs:
         images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
         tags: |
           # PR builds - tagged as pr-{number}
-          type=ref,event=pr,suffix=-${{ matrix.tag_suffix }},prefix=pr-
+          type=ref,event=pr,suffix=-${{ matrix.tag_suffix }},prefix=pr-,enable=${{ matrix.variant != 'cpu' }}
           # Branch builds (excluding main) - tagged as {branch}
-          type=ref,event=branch,suffix=-${{ matrix.tag_suffix }},enable=${{ github.ref_name != 'main' }}
+          type=ref,event=branch,suffix=-${{ matrix.tag_suffix }},enable=${{ matrix.variant != 'cpu' && github.ref_name != 'main' }}
           # Tag builds (releases) - semantic versioning
-          type=semver,pattern={{version}},suffix=-${{ matrix.tag_suffix }}
-          type=semver,pattern={{major}}.{{minor}},suffix=-${{ matrix.tag_suffix }}
+          type=semver,pattern={{version}},suffix=-${{ matrix.tag_suffix }},enable=${{ matrix.variant != 'cpu' }}
+          type=semver,pattern={{major}}.{{minor}},suffix=-${{ matrix.tag_suffix }},enable=${{ matrix.variant != 'cpu' }}
           # Latest tag for main branch
-          type=raw,value=latest,enable={{is_default_branch}},suffix=-${{ matrix.tag_suffix }}
+          type=raw,value=latest,enable=${{ matrix.variant != 'cpu' && github.event_name == 'workflow_run' }},suffix=-${{ matrix.tag_suffix }}
           # Architecture-specific CPU staging tags. The manifest job below
-          # combines these with the native arm64 image under the normal CPU tag.
+          # is the sole writer of canonical CPU tags, and combines these with
+          # the native arm64 image only after both architecture builds pass.
           type=semver,pattern={{version}},suffix=-cpu-amd64,enable=${{ matrix.variant == 'cpu' }}
           type=semver,pattern={{major}}.{{minor}},suffix=-cpu-amd64,enable=${{ matrix.variant == 'cpu' }}
           type=raw,value=edge,suffix=-cpu-amd64,enable=${{ matrix.variant == 'cpu' && github.event_name == 'workflow_run' }}
