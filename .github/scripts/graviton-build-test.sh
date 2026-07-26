@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Merge-gate build + test for the self-hosted Graviton (arm64) fleet, run INSIDE
-# the rust-builder container as a NON-ROOT user (#1011). rust.yml invokes it as:
+# Merge-gate browser-WASM check + native build/test for the self-hosted Graviton
+# (arm64) fleet, run INSIDE the rust-builder container as a NON-ROOT user
+# (#1011). rust.yml invokes it as:
 #   runuser -u ci -- bash -euo pipefail /build/.github/scripts/graviton-build-test.sh
 # from the bind-mounted workspace (cwd = /build). Root-only setup (cargo-nextest,
 # git-lfs, wasm rustup targets, the ci user + perms) happens in the workflow before
@@ -39,6 +40,13 @@ run_phase() {
   echo "::endgroup::"
   return "${status}"
 }
+
+# Fail fast on browser-only composition regressions in the required merge-gate
+# job. Keep the WebTransport cfg scoped to this command so it cannot leak into
+# the native release/test phases below. This reuses the same checkout, target,
+# sccache process, and container instead of consuming another runner slot.
+run_phase "browser WASM check" env RUSTFLAGS=--cfg=web_sys_unstable_apis \
+  cargo check --target wasm32-unknown-unknown -p hyprstream-rpc
 
 # Default features (parity with the former x86 gate); libtorch is the image's
 # aarch64 wheel at /opt/libtorch, so NO download-libtorch feature here.

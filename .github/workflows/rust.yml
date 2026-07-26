@@ -137,8 +137,9 @@ jobs:
 
   wasm:
     name: WASM (browser client)
-    # The PR check has already validated this target. Keep the merge queue's
-    # critical path to the full integration build rather than recompiling it.
+    # Preserve fast PR feedback. The synthetic merge candidate is checked again
+    # by the required `build` job, in its existing container, so composition-only
+    # browser regressions cannot pass the merge queue.
     if: github.event_name != 'merge_group'
     runs-on: [self-hosted, linux, arm64, graviton, hyprstream-merge-gate]
     timeout-minutes: 30
@@ -197,7 +198,8 @@ jobs:
     #      served by sccache-S3 + crates.io). It only sets up the non-root ci user.
     runs-on: [self-hosted, linux, arm64, graviton, hyprstream-merge-gate]
     # Do not wait for a duplicate lint pass on merge_group. PR lint/WASM checks
-    # run before enqueueing; this required job validates the merged candidate.
+    # run before enqueueing; this required job validates the merged candidate
+    # and rechecks browser WASM before starting the native release build.
     # Backstop below the fleet's 150-min reaper cap (metal reaper_max_lifetime_
     # minutes) so a genuine hang fails definitively rather than being reaped
     # mid-run. A COLD-cache build+test can approach this; once sccache (S3) is
@@ -221,12 +223,12 @@ jobs:
     - name: Pull builder image
       run: podman pull "$BUILDER_IMAGE"
 
-    # Full merge-gate build + test in ONE container so sccache stays warm and the
-    # bind-mounted target/ persists across build → wasm-guests → nextest →
-    # doctests. Mirrors the clippy/wasm invocation (libtorch + sccache-to-S3 from
-    # the image); AWS creds forward by name (`-e VAR` with no value passes the
-    # host value) so the in-image sccache reaches the same-region S3 bucket.
-    - name: Build + test (release, in rust-builder container)
+    # Browser-WASM preflight + full merge-gate build/test run in ONE container,
+    # so sccache stays warm and the bind-mounted target/ persists across the
+    # browser check → native build → wasm guests → nextest → doctests. AWS creds
+    # forward by name (`-e VAR` with no value passes the host value) so the
+    # in-image sccache reaches the same-region S3 bucket.
+    - name: WASM preflight + build + test (in rust-builder container)
       run: |
         podman run --rm \
           -v "$PWD":/build:Z -w /build \
