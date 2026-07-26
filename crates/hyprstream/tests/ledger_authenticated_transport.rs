@@ -25,6 +25,8 @@ use hyprstream_ledger::{
 };
 use parking_lot::Mutex;
 
+mod support;
+
 fn unit() -> UnitId {
     UnitId {
         issuer: Did("did:web:issuer.test".to_owned()),
@@ -153,6 +155,8 @@ fn signed_authz(
 
 #[tokio::test]
 async fn verified_user_transport_did_admits_its_grant_and_refuses_another_signer() {
+    support::install_explicit_dispatch_pep();
+
     struct AdmissionProbe {
         enforcer: Arc<LocalEnforcer>,
         grant_cid: Cid,
