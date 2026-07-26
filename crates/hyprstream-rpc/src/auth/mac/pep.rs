@@ -9,6 +9,7 @@
 
 use std::sync::Arc;
 
+#[cfg(not(target_arch = "wasm32"))]
 use super::dispatch_pep::{MacDecision, MacDenyReason, RpcObjectLabelResolver};
 use super::{SecurityContext, SecurityLabel};
 use crate::envelope::Subject;
@@ -41,6 +42,7 @@ pub trait ClearanceSource: Send + Sync {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MoqMacAuditReason {
     /// A denial returned by the canonical shared MAC contract.
+    #[cfg(not(target_arch = "wasm32"))]
     Mac(MacDenyReason),
     /// An authorizer was installed, but moq-net exposed no per-track callback.
     ///
@@ -86,6 +88,7 @@ pub trait MoqMacAuditSink: Send + Sync {
 /// Dormancy is represented by the caller not installing this PEP. Every check
 /// on an installed instance is fail-closed.
 pub struct MoqEventPep {
+    #[cfg(not(target_arch = "wasm32"))]
     resolver: Arc<dyn RpcObjectLabelResolver>,
     clearance: Arc<dyn ClearanceSource>,
     audit: Arc<dyn MoqMacAuditSink>,
@@ -94,6 +97,7 @@ pub struct MoqEventPep {
 impl MoqEventPep {
     /// Construct an active, fail-closed PEP from the canonical object-label
     /// resolver, verified-subject clearance source, and mandatory audit sink.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn new(
         resolver: Arc<dyn RpcObjectLabelResolver>,
         clearance: Arc<dyn ClearanceSource>,
@@ -123,10 +127,11 @@ impl MoqEventPep {
             object_label,
             reason,
         };
-        if let Err(error) = self.audit.record_deny(&record) {
+        if let Err(_error) = self.audit.record_deny(&record) {
+            #[cfg(not(target_arch = "wasm32"))]
             tracing::error!(
                 target: "hyprstream.mac.audit",
-                %error,
+                error = %_error,
                 subject = ?record.subject,
                 object = %record.object,
                 action = ?record.action,
@@ -142,6 +147,7 @@ impl MoqEventPep {
     /// coordinate. MoQ/event checks have no browser method discriminator, so
     /// the resolver always receives `None`.
     #[must_use]
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn check(
         &self,
         subject: &Subject,
@@ -205,6 +211,7 @@ impl MoqEventPep {
         );
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn resolver(&self) -> &Arc<dyn RpcObjectLabelResolver> {
         &self.resolver
     }
@@ -224,7 +231,7 @@ impl ClearanceSource for DenyAllClearanceSource {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
