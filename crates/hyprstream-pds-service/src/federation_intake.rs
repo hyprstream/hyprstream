@@ -18,6 +18,19 @@ use hyprstream_rpc::identity::UNAUTHENTICATED_DID_SENTINEL;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use thiserror::Error;
+
+/// Leak-safe failure from a direct identity-directory read.
+///
+/// Wire adapters must map this to HTTP 404 (or the transport's equivalent),
+/// never 403. Missing objects and objects above the caller's clearance are
+/// intentionally indistinguishable.
+#[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
+pub enum IdentityDirectoryReadError {
+    /// The identity does not exist or is not visible to this caller.
+    #[error("identity not found")]
+    NotFound,
+}
 
 /// Resolver for the two foreign ATProto DID methods accepted by intake.
 ///
@@ -136,7 +149,7 @@ impl InventoryEntry {
 #[serde(rename_all = "camelCase")]
 pub struct ResolvedDiscovery {
     quic_url: Option<String>,
-    cert_hashes: Vec<String>,
+    cert_hash: Option<String>,
 }
 
 impl ResolvedDiscovery {
@@ -144,7 +157,7 @@ impl ResolvedDiscovery {
         let Some(services) = document.get("service").and_then(Value::as_array) else {
             return Ok(Self {
                 quic_url: None,
-                cert_hashes: Vec::new(),
+                cert_hash: None,
             });
         };
         let mut quic_entries = services
@@ -153,7 +166,7 @@ impl ResolvedDiscovery {
         let Some(entry) = quic_entries.next() else {
             return Ok(Self {
                 quic_url: None,
-                cert_hashes: Vec::new(),
+                cert_hash: None,
             });
         };
         ensure!(
@@ -184,9 +197,13 @@ impl ResolvedDiscovery {
             })
             .transpose()?
             .unwrap_or_default();
+        ensure!(
+            cert_hashes.len() <= 1,
+            "DID document contains ambiguous QUIC certificate hashes"
+        );
         Ok(Self {
             quic_url,
-            cert_hashes,
+            cert_hash: cert_hashes.into_iter().next(),
         })
     }
 
@@ -195,9 +212,9 @@ impl ResolvedDiscovery {
         self.quic_url.as_deref()
     }
 
-    /// Current overlapping certificate-pin set.
-    pub fn cert_hashes(&self) -> &[String] {
-        &self.cert_hashes
+    /// Current certificate pin, if the DID document publishes one.
+    pub fn cert_hash(&self) -> Option<&str> {
+        self.cert_hash.as_deref()
     }
 }
 
@@ -224,6 +241,12 @@ pub trait IdentityInventoryReadModel: Send + Sync {
     /// can observe only this post-filter vector's length. Implementations must
     /// never return [`UNAUTHENTICATED_DID_SENTINEL`] as a real host.
     fn list(&self, viewer: &SecurityContext) -> Result<Vec<InventoryEntry>>;
+
+    /// Fetch one entry without revealing whether a filtered object exists.
+    ///
+    /// `None` means absent, no caller clearance, or above caller clearance.
+    /// Wire adapters must map every `None` case to the same 404-style result.
+    fn get(&self, viewer: Option<&SecurityContext>, did: &str) -> Result<Option<InventoryEntry>>;
 }
 
 /// Thin in-memory inventory read model, useful for embedded/demo deployments.
@@ -260,6 +283,17 @@ impl IdentityInventoryReadModel for InMemoryIdentityInventory {
             })
             .map(|stored| stored.entry.clone())
             .collect())
+    }
+
+    fn get(&self, viewer: Option<&SecurityContext>, did: &str) -> Result<Option<InventoryEntry>> {
+        if did == UNAUTHENTICATED_DID_SENTINEL {
+            return Ok(None);
+        }
+        let identities = self.identities.read();
+        Ok(identities
+            .get(did)
+            .filter(|stored| viewer.is_some_and(|clearance| clearance.can_access(&stored.label)))
+            .map(|stored| stored.entry.clone()))
     }
 }
 
@@ -314,9 +348,18 @@ impl FederationIntake {
         self.intake_inner(did).await
     }
 
-    /// Resolve current connect-time discovery without consulting AppView data.
-    pub async fn resolve(&self, did: &str) -> Result<ResolvedDiscovery> {
-        ensure_real_identity_did(did)?;
+    /// Resolve current connect-time discovery for a visible inventory entry.
+    ///
+    /// The inventory lookup happens before resolver I/O. Missing, no-clearance,
+    /// and above-clearance identities all return the same 404-style error.
+    pub async fn resolve(
+        &self,
+        did: &str,
+        viewer: Option<&SecurityContext>,
+    ) -> Result<ResolvedDiscovery> {
+        if self.inventory.get(viewer, did)?.is_none() {
+            return Err(IdentityDirectoryReadError::NotFound.into());
+        }
         let document = self.resolver.resolve_federated_document(did).await?;
         ResolvedDiscovery::from_document(&document)
     }
@@ -548,9 +591,17 @@ mod tests {
             inventory.list(&unauthenticated_viewer()).unwrap(),
             vec![resolved]
         );
-        let discovery = intake.resolve(FEDERATED_WEB_DID).await.unwrap();
+        let viewer = unauthenticated_viewer();
+        let discovery = intake
+            .resolve(FEDERATED_WEB_DID, Some(&viewer))
+            .await
+            .unwrap();
         assert_eq!(discovery.quic_url(), Some("https://alice.example:443"));
-        assert!(discovery.cert_hashes().is_empty());
+        assert_eq!(discovery.cert_hash(), None);
+        let projected = serde_json::to_value(discovery).unwrap();
+        assert!(projected.get("quicUrl").is_some());
+        assert!(projected.get("certHash").is_some());
+        assert!(projected.get("certHashes").is_none());
     }
 
     #[test]
@@ -588,6 +639,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn above_floor_direct_access_is_not_found_not_forbidden() {
+        const HIDDEN_DID: &str = "did:web:hidden.example";
+        const MISSING_DID: &str = "did:web:missing.example";
+
+        let inventory = Arc::new(InMemoryIdentityInventory::default());
+        inventory.identities.write().insert(
+            HIDDEN_DID.to_owned(),
+            StoredInventoryEntry {
+                entry: InventoryEntry {
+                    did: HIDDEN_DID.to_owned(),
+                    handle: None,
+                    kind: InventoryKind::Federated,
+                    tenant: None,
+                    pds_endpoint: None,
+                },
+                label: SecurityLabel::new(
+                    Level::Secret,
+                    hyprstream_rpc::auth::mac::Assurance::Unverified,
+                    CompartmentSet::EMPTY,
+                ),
+            },
+        );
+        let intake = FederationIntake::new(
+            Arc::new(FederatedDidResolver::new(
+                Arc::new(NeverResolver),
+                Arc::new(NeverResolver),
+            )),
+            inventory.clone(),
+            Vec::new(),
+        );
+        let viewer = unauthenticated_viewer();
+
+        assert_eq!(inventory.get(Some(&viewer), HIDDEN_DID).unwrap(), None);
+        assert_eq!(inventory.get(Some(&viewer), MISSING_DID).unwrap(), None);
+        assert_eq!(inventory.get(None, HIDDEN_DID).unwrap(), None);
+
+        for did in [HIDDEN_DID, MISSING_DID] {
+            let error = intake.resolve(did, Some(&viewer)).await.unwrap_err();
+            assert_eq!(
+                error.downcast_ref::<IdentityDirectoryReadError>(),
+                Some(&IdentityDirectoryReadError::NotFound),
+                "direct access to {did} must be 404-style, never forbidden: {error:#}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn unauthenticated_sentinel_is_never_resolved_or_listed() {
         let resolver = Arc::new(FederatedDidResolver::new(
             Arc::new(NeverResolver),
@@ -608,6 +706,17 @@ mod tests {
             .list(&unauthenticated_viewer())
             .unwrap()
             .is_empty());
+        let error = intake
+            .resolve(
+                UNAUTHENTICATED_DID_SENTINEL,
+                Some(&unauthenticated_viewer()),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<IdentityDirectoryReadError>(),
+            Some(&IdentityDirectoryReadError::NotFound)
+        );
 
         inventory.identities.write().insert(
             UNAUTHENTICATED_DID_SENTINEL.to_owned(),
