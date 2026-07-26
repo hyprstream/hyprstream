@@ -2416,6 +2416,36 @@ impl RpcClient for ProductionRpcClient {
             .await?
             .0)
     }
+    async fn call_with_options_for_service_with_method(
+        &self,
+        service: &str,
+        method_discriminator: u16,
+        payload: Vec<u8>,
+        options: CallOptions,
+    ) -> Result<Vec<u8>> {
+        anyhow::ensure!(
+            service == self.service_name,
+            "generated service authority mismatch"
+        );
+        let service = service.to_owned();
+        Ok(self
+            .attempt(|c| {
+                let p = payload.clone();
+                let o = options.clone();
+                let s = service.clone();
+                async move {
+                    c.call_with_options_for_service_with_method(
+                        &s,
+                        method_discriminator,
+                        p,
+                        o,
+                    )
+                    .await
+                }
+            })
+            .await?
+            .0)
+    }
     async fn call_streaming(&self, payload: Vec<u8>, ephemeral: [u8; 32]) -> Result<Vec<u8>> {
         Ok(self
             .attempt(|c| {
@@ -2445,6 +2475,31 @@ impl RpcClient for ProductionRpcClient {
             .await?
             .0)
     }
+    async fn call_streaming_with_options_for_service(
+        &self,
+        service: &str,
+        payload: Vec<u8>,
+        ephemeral: [u8; 32],
+        options: CallOptions,
+    ) -> Result<Vec<u8>> {
+        anyhow::ensure!(
+            service == self.service_name,
+            "generated service authority mismatch"
+        );
+        let service = service.to_owned();
+        Ok(self
+            .attempt(|c| {
+                let p = payload.clone();
+                let o = options.clone();
+                let s = service.clone();
+                async move {
+                    c.call_streaming_with_options_for_service(&s, p, ephemeral, o)
+                        .await
+                }
+            })
+            .await?
+            .0)
+    }
     async fn call_streaming_for_service_with_method(
         &self,
         service: &str,
@@ -2464,6 +2519,38 @@ impl RpcClient for ProductionRpcClient {
                 async move {
                     c.call_streaming_for_service_with_method(&s, method_discriminator, p, ephemeral)
                         .await
+                }
+            })
+            .await?
+            .0)
+    }
+    async fn call_streaming_with_options_for_service_with_method(
+        &self,
+        service: &str,
+        method_discriminator: u16,
+        payload: Vec<u8>,
+        ephemeral: [u8; 32],
+        options: CallOptions,
+    ) -> Result<Vec<u8>> {
+        anyhow::ensure!(
+            service == self.service_name,
+            "generated service authority mismatch"
+        );
+        let service = service.to_owned();
+        Ok(self
+            .attempt(|c| {
+                let p = payload.clone();
+                let o = options.clone();
+                let s = service.clone();
+                async move {
+                    c.call_streaming_with_options_for_service_with_method(
+                        &s,
+                        method_discriminator,
+                        p,
+                        ephemeral,
+                        o,
+                    )
+                    .await
                 }
             })
             .await?

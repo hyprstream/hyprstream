@@ -193,6 +193,7 @@ pub struct InferenceServiceInner {
     /// is itself a follow-up). Gated behind the `ledger` feature.
     #[cfg(feature = "ledger")]
     ledger: parking_lot::RwLock<Option<Arc<InferenceSpendEmitter>>>,
+    object_label: hyprstream_rpc::auth::mac::SecurityLabel,
 }
 
 /// ZMQ-based inference service
@@ -236,6 +237,29 @@ fn resolve_instance_domain(
     anyhow::bail!(
         "authorization denied: inference instance is bound to a different verified tenant"
     )
+}
+pub(crate) fn enforce_inference_mac(
+    ctx: &EnvelopeContext,
+    object_label: &hyprstream_rpc::auth::mac::SecurityLabel,
+) -> Result<()> {
+    enforce_inference_security_context(ctx.security_context(), object_label)
+}
+/// Canonical content label for the inference engine boundary.
+pub(crate) fn inference_object_label() -> hyprstream_rpc::auth::mac::SecurityLabel {
+    crate::mac::genesis::SitePolicy::conservative().label_for("/srv/inference")
+}
+fn enforce_inference_security_context(
+    security_context: Option<hyprstream_rpc::auth::mac::SecurityContext>,
+    object_label: &hyprstream_rpc::auth::mac::SecurityLabel,
+) -> Result<()> {
+    let security_context = security_context.ok_or_else(|| {
+        anyhow!("authorization denied: inference caller has no verified MAC clearance")
+    })?;
+    anyhow::ensure!(
+        security_context.can_access(object_label),
+        "authorization denied: inference caller clearance does not dominate engine label {object_label}"
+    );
+    Ok(())
 }
 
 // Intermediate response structs (DeltaStatusInfo, SaveAdaptationResult, SnapshotDeltaResult,
@@ -580,6 +604,7 @@ impl InferenceService {
         // Create StreamChannel upfront.
         let stream_channel = StreamChannel::new(signing_key.clone())
             .with_reach_config(hyprstream_rpc::moq_stream::ProducerReachConfig::default());
+        let object_label = inference_object_label();
 
         Ok(InferenceService {
             inner: Arc::new(InferenceServiceInner {
@@ -603,6 +628,7 @@ impl InferenceService {
                 controller_pubkey,
                 #[cfg(feature = "ledger")]
                 ledger: parking_lot::RwLock::new(None),
+                object_label,
             }),
         })
     }
@@ -2223,6 +2249,7 @@ impl InferenceHandler for InferenceService {
     async fn authorize(&self, ctx: &EnvelopeContext, resource: &str, operation: &str) -> Result<()> {
         let subject = ctx.subject();
         let domain = self.authorization_domain(ctx)?;
+        enforce_inference_mac(ctx, &self.object_label)?;
         let allowed = self.policy_client.check(&PolicyCheck { subject: subject.to_string(), domain, resource: resource.to_owned(), operation: operation.to_owned() }).await.unwrap_or_else(|e| {
             warn!("Policy check failed for {} on {}: {} - denying access", subject, resource, e);
             false
@@ -2733,6 +2760,9 @@ impl hyprstream_rpc::service::RequestService for InferenceZmqAdapter {
     fn jwt_key_source(&self) -> Option<std::sync::Arc<dyn hyprstream_rpc::auth::JwtKeySource>> {
         self.jwt_key_source.clone()
     }
+    fn accept_delegated_bearer(&self, signer_pubkey: &[u8; 32]) -> bool {
+        signer_pubkey == &self.service.controller_pubkey.to_bytes()
+    }
 
     /// Resolve a verified mesh-peer signer key to its per-host subject (#328).
     ///
@@ -2785,6 +2815,10 @@ pub struct InferenceServiceConfig {
     tenant_domain: String,
     /// ModelService key allowed to bridge local calls into this tenant.
     controller_pubkey: VerifyingKey,
+    /// Network reach published after the engine and Iroh endpoint are ready.
+    network_reach: Arc<
+        parking_lot::RwLock<Option<hyprstream_rpc::transport::TransportConfig>>,
+    >,
 }
 
 impl InferenceServiceConfig {
@@ -2818,6 +2852,7 @@ impl InferenceServiceConfig {
             jwt_key_source: None,
             tenant_domain: "local".to_owned(),
             controller_pubkey: server_pubkey,
+            network_reach: Arc::new(parking_lot::RwLock::new(None)),
         }
     }
 
@@ -2848,6 +2883,12 @@ impl InferenceServiceConfig {
     ) -> Self {
         self.jwt_key_source = Some(src);
         self
+    }
+    #[must_use]
+    pub fn network_reach_handle(
+        &self,
+    ) -> Arc<parking_lot::RwLock<Option<hyprstream_rpc::transport::TransportConfig>>> {
+        Arc::clone(&self.network_reach)
     }
 }
 
@@ -2884,7 +2925,7 @@ impl hyprstream_service::Spawnable for InferenceServiceConfig {
 
             // Destructure so the (Send) config moves into the on-thread builder.
             let InferenceServiceConfig {
-                service_name: _,
+                service_name,
                 model_path,
                 config,
                 server_pubkey,
@@ -2896,6 +2937,7 @@ impl hyprstream_service::Spawnable for InferenceServiceConfig {
                 jwt_key_source,
                 tenant_domain,
                 controller_pubkey,
+                network_reach,
             } = *self;
             let adapter_transport = transport.clone();
 
@@ -2948,7 +2990,38 @@ impl hyprstream_service::Spawnable for InferenceServiceConfig {
 
             let processor: Arc<dyn hyprstream_rpc::transport::rpc_session::IrohRequestProcessor> =
                 Arc::new(bridge);
-            hyprstream_rpc::service::serve::serve_bridged(
+            let purpose =
+                crate::runtime::inference_profile::inference_iroh_key_purpose(&service_name);
+            let iroh_key =
+                hyprstream_rpc::node_identity::derive_purpose_key(&server_signing_key, &purpose);
+            let rpc_handler =
+                hyprstream_rpc::transport::iroh_rpc::IrohRpcProtocolHandler::with_stream_limit(
+                    Arc::clone(&processor),
+                    server_signing_key.clone(),
+                    hyprstream_rpc::transport::rpc_session::DEFAULT_STREAM_LIMIT,
+                );
+            let substrate =
+                hyprstream_rpc::transport::iroh_substrate::IrohSubstrate::new(
+                    iroh_key.to_bytes(),
+                    hyprstream_rpc::transport::iroh_substrate::RefuseHandler::new(
+                        "inference streaming uses the existing StreamService",
+                    ),
+                    rpc_handler,
+                )
+                .await
+                .map_err(|e| {
+                    hyprstream_rpc::error::RpcError::SpawnFailed(format!(
+                        "inference iroh bind: {e}"
+                    ))
+                })?;
+            let node_id = *substrate.endpoint_id().as_bytes();
+            let direct_addrs = substrate.endpoint().bound_sockets().into_iter().collect();
+            *network_reach.write() = Some(hyprstream_rpc::transport::TransportConfig::iroh(
+                node_id,
+                direct_addrs,
+                None,
+            ));
+            let result = hyprstream_rpc::service::serve::serve_bridged(
                 &transport,
                 processor,
                 server_signing_key,
@@ -2956,7 +3029,11 @@ impl hyprstream_service::Spawnable for InferenceServiceConfig {
                 on_ready,
             )
             .await
-            .map_err(|e| hyprstream_rpc::error::RpcError::SpawnFailed(e.to_string()))
+            .map_err(|e| hyprstream_rpc::error::RpcError::SpawnFailed(e.to_string()));
+            if let Err(error) = substrate.shutdown().await {
+                tracing::warn!(%error, "inference iroh shutdown failed");
+            }
+            result
         })
     }
 }
@@ -3053,6 +3130,10 @@ impl StreamChunkMessage {
 #[cfg(test)]
 mod tenant_binding_tests {
     use super::*;
+    use hyprstream_rpc::auth::mac::{
+        Assurance, CompartmentSet, Level, SecurityContext, SecurityLabel,
+        VerifiedKeyMaterial,
+    };
     use hyprstream_rpc::envelope::Subject;
 
     fn key(seed: u8) -> SigningKey {
@@ -3102,6 +3183,31 @@ mod tenant_binding_tests {
             key(9).verifying_key(),
         );
         assert!(resolve_instance_domain("tenant-a", &controller, &impostor).is_err());
+    }
+
+    #[test]
+    fn mac_denies_missing_clearance() {
+        let object =
+            SecurityLabel::new(Level::Internal, Assurance::Classical, CompartmentSet::EMPTY);
+        assert!(enforce_inference_security_context(None, &object).is_err());
+    }
+
+    #[test]
+    fn mac_denies_insufficient_clearance() {
+        let subject =
+            SecurityContext::new(Level::Public, CompartmentSet::EMPTY, VerifiedKeyMaterial::Classical);
+        let object =
+            SecurityLabel::new(Level::Internal, Assurance::Classical, CompartmentSet::EMPTY);
+        assert!(enforce_inference_security_context(Some(subject), &object).is_err());
+    }
+
+    #[test]
+    fn mac_allows_dominating_clearance() {
+        let subject =
+            SecurityContext::new(Level::Secret, CompartmentSet::EMPTY, VerifiedKeyMaterial::Classical);
+        let object =
+            SecurityLabel::new(Level::Internal, Assurance::Classical, CompartmentSet::EMPTY);
+        assert!(enforce_inference_security_context(Some(subject), &object).is_ok());
     }
 
 }

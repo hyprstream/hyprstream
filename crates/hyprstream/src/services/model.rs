@@ -112,12 +112,13 @@ pub struct LoadedModel {
     pub instance: InferenceInstanceId,
     /// Model reference string (e.g., "qwen3-small:main")
     pub model_ref: String,
-    /// Resolved transport for this model's InferenceService (#320). For a
-    /// co-located service this is the `Inproc` arm registered in the in-process
-    /// dial registry by the spawner; the cross-host/Iroh reach (when an
-    /// inference service has a network endpoint) is resolved via the Resolver.
-    /// The router single-selects this to talk to the inference service.
+    /// Local transport for this model's InferenceService (#320). This remains
+    /// the `Inproc` arm registered by the spawner and is never advertised as a
+    /// remotely dialable reach.
     pub transport: TransportConfig,
+    /// Advertised network reach for remote callers. Local dispatch continues
+    /// to use `transport` as the in-process fast path.
+    pub network_transport: TransportConfig,
     /// Handle to stop the InferenceService
     pub service_handle: hyprstream_service::SpawnedService,
     /// Client for communicating with the InferenceService (built from
@@ -453,6 +454,8 @@ impl ModelService {
         ctx: &EnvelopeContext,
         model_ref_str: &str,
     ) -> Result<InferenceInstanceId> {
+        let object_label = crate::services::inference::inference_object_label();
+        crate::services::inference::enforce_inference_mac(ctx, &object_label)?;
         InferenceInstanceId::new(&ctx.domain()?, model_ref_str, 0)
     }
 
@@ -478,21 +481,18 @@ impl ModelService {
         registry().endpoint(&instance.service_name(), SocketKind::Rep)
     }
 
-    /// The deterministic InferenceService endpoint *string* for a model ref.
+    /// The deterministic local InferenceService endpoint string for diagnostics.
     ///
-    /// Retained only for human-facing display and the JSON `model.loaded` event
-    /// (`EventPayload::ModelLoaded`); the routable reach is the typed
-    /// [`Self::inference_transport`] / the capnp `reach` list (#320).
+    /// This is never advertised. Loaded status and lifecycle events use the
+    /// separately bound Iroh network reach.
     fn inference_endpoint(instance: &InferenceInstanceId) -> String {
         Self::inference_transport(instance).endpoint_string()
     }
 
     /// The network-routable reach list a remote caller would use to dial this
-    /// model's InferenceService (#320). For a co-located service the transport is
-    /// the `Inproc` arm, which is NEVER advertised on the wire (a remote caller
-    /// can't dial it; a co-located caller uses the in-process fast path), so this
-    /// returns an EMPTY list. A networked (Quic/Iroh) inference reach maps to the
-    /// corresponding wire arm via the single dial→wire reach codec.
+    /// model's InferenceService (#320). An `Inproc` transport is never
+    /// advertised; a networked (Quic/Iroh) reach maps through the single
+    /// dial-to-wire reach codec.
     fn model_reach(transport: &TransportConfig) -> Vec<WireTransportConfig> {
         hyprstream_rpc::moq_stream::dial_transport_to_wire(transport)
             .into_iter()
@@ -769,7 +769,7 @@ impl ModelService {
             if let Some(model) = cache.get_mut(instance) {
                 model.last_used = Instant::now();
                 debug!("Model {} already loaded", model_ref_str);
-                return Ok(Self::inference_endpoint(instance));
+                return Ok(model.network_transport.endpoint_string());
             }
         }
 
@@ -873,9 +873,8 @@ impl ModelService {
         // (#320). For a co-located service this is the `Inproc` arm; the spawner
         // registers it in the in-process dial registry (`register_inproc`) and
         // the same typed transport builds the client below — no string parsing on
-        // the inference client path. (The cross-host/Iroh reach is resolved via
-        // the Resolver when an inference service has a network endpoint; pkarr
-        // auto-discovery stays deferred to #282.)
+        // the inference client path. The service also binds an Iroh endpoint
+        // before readiness and publishes that separate network reach below.
         let transport = Self::inference_transport(instance);
         let mut service_config = crate::services::InferenceServiceConfig::new(
             &model_path,
@@ -896,8 +895,14 @@ impl ModelService {
         if let Some(ref src) = self.jwt_key_source {
             service_config = service_config.with_jwt_key_source(src.clone());
         }
+        let network_reach = service_config.network_reach_handle();
         let service_handle = spawner.spawn(service_config).await
             .map_err(|e| anyhow!("Failed to spawn inference service: {}", e))?;
+        let network_transport = network_reach
+            .read()
+            .clone()
+            .ok_or_else(|| anyhow!("InferenceService became ready without network reach"))?;
+        let endpoint = network_transport.endpoint_string();
 
         // Create client for this service from the typed transport (#320).
         // Inference services share the model service's signing key, so use our
@@ -957,6 +962,7 @@ impl ModelService {
                     instance: instance.clone(),
                     model_ref: model_ref_str.to_owned(),
                     transport: transport.clone(),
+                    network_transport,
                     service_handle,
                     client,
                     // #322 leaf cell-router. v1: single co-located replica. Its
@@ -1052,7 +1058,7 @@ impl ModelService {
             .map(|(_, model)| GenModelStatusEntry {
                 model_ref: model.model_ref.clone(),
                 status: "loaded".to_owned(),
-                reach: Self::model_reach(&model.transport),
+                reach: Self::model_reach(&model.network_transport),
                 loaded_at: model.loaded_at.elapsed().as_millis() as i64,
                 last_used: model.last_used.elapsed().as_millis() as i64,
                 online_training_config: model.ttt_config.as_ref()
@@ -1084,7 +1090,7 @@ impl ModelService {
             return vec![GenModelStatusEntry {
                 model_ref: instance.model_ref().to_owned(),
                 status: "loaded".to_owned(),
-                reach: Self::model_reach(&model.transport),
+                reach: Self::model_reach(&model.network_transport),
                 loaded_at: model.loaded_at.elapsed().as_millis() as i64,
                 last_used: model.last_used.elapsed().as_millis() as i64,
                 online_training_config: model.ttt_config.as_ref()
@@ -1115,7 +1121,7 @@ impl ModelService {
         if let Some(model) = cache.peek(instance) {
             ModelStatusResponse {
                 loaded: true,
-                reach: Self::model_reach(&model.transport),
+                reach: Self::model_reach(&model.network_transport),
                 online_training_config: model.ttt_config.as_ref()
                     .map(Self::ttt_config_to_wire)
                     .unwrap_or_default(),
@@ -1141,11 +1147,10 @@ impl ModelService {
         // subject-keyed, by design.
         let placement_key = ctx.subject().to_string();
         let client = self.select_inference_server(model, &placement_key).await;
-        // TODO: Forward user JWT to worker via per-call builder (delegated_bearer or
-        // request().jwt(token).call(payload)) once inference methods support CallOptions.
-        // The previous with_jwt() call was mutating shared state — unsafe with pooling.
-        let _ = ctx.jwt_token();
-        Ok(client)
+        let bearer = ctx
+            .jwt_token()
+            .ok_or_else(|| anyhow!("inference dispatch requires a verified bearer token"))?;
+        Ok(client.with_delegated_bearer(bearer.to_owned()))
     }
 
     /// Load a LoRA adapter from a file
@@ -1526,6 +1531,8 @@ impl ModelHandler for ModelService {
     async fn authorize(&self, ctx: &EnvelopeContext, resource: &str, operation: &str) -> Result<()> {
         let subject = ctx.subject();
         let domain = ctx.domain()?;
+        let object_label = crate::services::inference::inference_object_label();
+        crate::services::inference::enforce_inference_mac(ctx, &object_label)?;
         let allowed = self.policy_client.check(&PolicyCheck { subject: subject.to_string(), domain, resource: resource.to_owned(), operation: operation.to_owned() }).await.unwrap_or_else(|e| {
             warn!("Policy check failed for {} on {}: {} - denying access", subject, resource, e);
             false
@@ -1546,10 +1553,16 @@ impl ModelHandler for ModelService {
         let model_ref = &data.model_ref;
         let instance = Self::inference_instance(ctx, model_ref)?;
         match self.load_model(&instance, max_ctx, kv_q).await {
-            Ok(_endpoint) => Ok(ModelResponseVariant::LoadResult(LoadedModelResponse {
-                model_ref: model_ref.to_owned(),
-                reach: Self::model_reach(&Self::inference_transport(&instance)),
-            })),
+            Ok(_endpoint) => {
+                let cache = self.loaded_models.read().await;
+                let model = cache
+                    .peek(&instance)
+                    .ok_or_else(|| anyhow!("model missing after successful load"))?;
+                Ok(ModelResponseVariant::LoadResult(LoadedModelResponse {
+                    model_ref: model_ref.to_owned(),
+                    reach: Self::model_reach(&model.network_transport),
+                }))
+            }
             Err(e) => Ok(ModelResponseVariant::Error(ErrorInfo {
                 message: format!("Failed to load model: {e}"),
                 code: "LOAD_FAILED".into(),
@@ -1902,7 +1915,7 @@ impl crate::services::RequestService for ModelService {
                     let response = serialize_response(request_id, &ModelResponseVariant::LoadResult(
                         LoadedModelResponse {
                             model_ref: load_data.model_ref.clone(),
-                            reach: Self::model_reach(&model.transport),
+                            reach: Self::model_reach(&model.network_transport),
                         },
                     ))?;
                     return Ok((response, None));
@@ -1917,7 +1930,7 @@ impl crate::services::RequestService for ModelService {
                     let response = serialize_response(request_id, &ModelResponseVariant::LoadResult(
                         LoadedModelResponse {
                             model_ref: load_data.model_ref.clone(),
-                            reach: Self::model_reach(&Self::inference_transport(&instance)),
+                            reach: Vec::new(),
                         },
                     ))?;
                     return Ok((response, None));
@@ -1931,7 +1944,7 @@ impl crate::services::RequestService for ModelService {
             let response = serialize_response(request_id, &ModelResponseVariant::LoadResult(
                 LoadedModelResponse {
                     model_ref: model_ref.clone(),
-                    reach: Self::model_reach(&Self::inference_transport(&instance)),
+                    reach: Vec::new(),
                 },
             ))?;
 
@@ -2036,6 +2049,20 @@ mod tests {
         assert_eq!(
             config.inference_deployment.isolation,
             InferenceIsolationProfile::InProcess
+        );
+    }
+
+    #[test]
+    fn inference_instance_denies_unlabeled_tenant_before_load() {
+        let signer = SigningKey::from_bytes(&[44u8; 32]).verifying_key();
+        let ctx = EnvelopeContext::for_test_authenticated_subject_in_tenant(
+            hyprstream_rpc::envelope::Subject::new("alice"),
+            "did-hosted-account",
+            signer,
+        );
+        assert!(
+            ModelService::inference_instance(&ctx, "tiny-llama:main").is_err(),
+            "an authority-bound tenant without MAC clearance must not reach engine loading"
         );
     }
 

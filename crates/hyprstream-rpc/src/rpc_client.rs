@@ -106,9 +106,8 @@ impl PendingResponse {
 /// - `jwt`: Overrides the client's default JWT for this call.
 ///   Used when a service needs to present a specific token.
 /// - `delegated_bearer`: Bearer token relayed on behalf of a user.
-///   Only trusted services (OAI, MCP) may set this. Policy gates which
-///   services can relay bearer tokens. The server resolves the subject
-///   from the bearer token, not the service identity.
+///   Only explicitly pinned service identities may set this. The server
+///   resolves the subject from the verified bearer, not the relay identity.
 #[derive(Debug, Clone, Default)]
 pub struct CallOptions {
     /// Override the client's default JWT for this call.
@@ -510,6 +509,23 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
             .await
     }
 
+    /// Send an option-bearing streaming request bound to a canonical destination.
+    pub async fn call_streaming_with_options_for_service(
+        &self,
+        service_domain: &str,
+        payload: Vec<u8>,
+        ephemeral_pubkey: [u8; 32],
+        options: CallOptions,
+    ) -> Result<Vec<u8>> {
+        self.call_streaming_with_options_bound(
+            payload,
+            ephemeral_pubkey,
+            options,
+            Some(service_domain),
+            None,
+        )
+        .await
+    }
 
     /// Send an option-bearing generated streaming request bound to its service and method.
     pub async fn call_streaming_with_options_for_service_with_method(
@@ -1100,6 +1116,17 @@ pub trait RpcClient: Send + Sync {
         payload: Vec<u8>,
         options: CallOptions,
     ) -> Result<Vec<u8>>;
+    async fn call_with_options_for_service_with_method(
+        &self, service_domain: &str, method_discriminator: u16,
+        payload: Vec<u8>, options: CallOptions,
+    ) -> Result<Vec<u8>> {
+        anyhow::ensure!(
+            options.jwt.is_none() && options.delegated_bearer.is_none(),
+            "this RPC client does not support method-bound call options"
+        );
+        self.call_for_service_with_method(service_domain, method_discriminator, payload)
+            .await
+    }
 
     /// Send a streaming request with ephemeral DH pubkey.
     async fn call_streaming(&self, payload: Vec<u8>, ephemeral_pubkey: [u8; 32])
@@ -1112,6 +1139,20 @@ pub trait RpcClient: Send + Sync {
         payload: Vec<u8>,
         ephemeral_pubkey: [u8; 32],
     ) -> Result<Vec<u8>>;
+    async fn call_streaming_with_options_for_service(
+        &self,
+        service_domain: &str,
+        payload: Vec<u8>,
+        ephemeral_pubkey: [u8; 32],
+        options: CallOptions,
+    ) -> Result<Vec<u8>> {
+        anyhow::ensure!(
+            options.jwt.is_none() && options.delegated_bearer.is_none(),
+            "this RPC client does not support streaming call options"
+        );
+        self.call_streaming_for_service(service_domain, payload, ephemeral_pubkey)
+            .await
+    }
 
     /// Send a generated streaming request with an explicit schema method id.
     async fn call_streaming_for_service_with_method(
@@ -1121,6 +1162,22 @@ pub trait RpcClient: Send + Sync {
         payload: Vec<u8>,
         ephemeral_pubkey: [u8; 32],
     ) -> Result<Vec<u8>>;
+    async fn call_streaming_with_options_for_service_with_method(
+        &self, service_domain: &str, method_discriminator: u16,
+        payload: Vec<u8>, ephemeral_pubkey: [u8; 32], options: CallOptions,
+    ) -> Result<Vec<u8>> {
+        anyhow::ensure!(
+            options.jwt.is_none() && options.delegated_bearer.is_none(),
+            "this RPC client does not support method-bound streaming call options"
+        );
+        self.call_streaming_for_service_with_method(
+            service_domain,
+            method_discriminator,
+            payload,
+            ephemeral_pubkey,
+        )
+        .await
+    }
 
     /// Open a verified streaming subscription.
     async fn open_stream(&self, payload: Vec<u8>) -> Result<Box<dyn StreamHandle>>;
@@ -1176,6 +1233,14 @@ impl<S: Signer, T: Transport + 'static> RpcClient for RpcClientImpl<S, T> {
     ) -> Result<Vec<u8>> {
         RpcClientImpl::call_with_options_for_service(self, service_domain, payload, options).await
     }
+    async fn call_with_options_for_service_with_method(
+        &self, service_domain: &str, method_discriminator: u16,
+        payload: Vec<u8>, options: CallOptions,
+    ) -> Result<Vec<u8>> {
+        RpcClientImpl::call_with_options_for_service_with_method(
+            self, service_domain, method_discriminator, payload, options,
+        ).await
+    }
 
     async fn call_streaming(
         &self,
@@ -1194,6 +1259,22 @@ impl<S: Signer, T: Transport + 'static> RpcClient for RpcClientImpl<S, T> {
         RpcClientImpl::call_streaming_for_service(self, service_domain, payload, ephemeral_pubkey)
             .await
     }
+    async fn call_streaming_with_options_for_service(
+        &self,
+        service_domain: &str,
+        payload: Vec<u8>,
+        ephemeral_pubkey: [u8; 32],
+        options: CallOptions,
+    ) -> Result<Vec<u8>> {
+        RpcClientImpl::call_streaming_with_options_for_service(
+            self,
+            service_domain,
+            payload,
+            ephemeral_pubkey,
+            options,
+        )
+        .await
+    }
 
     async fn call_streaming_for_service_with_method(
         &self,
@@ -1210,6 +1291,14 @@ impl<S: Signer, T: Transport + 'static> RpcClient for RpcClientImpl<S, T> {
             ephemeral_pubkey,
         )
         .await
+    }
+    async fn call_streaming_with_options_for_service_with_method(
+        &self, service_domain: &str, method_discriminator: u16,
+        payload: Vec<u8>, ephemeral_pubkey: [u8; 32], options: CallOptions,
+    ) -> Result<Vec<u8>> {
+        RpcClientImpl::call_streaming_with_options_for_service_with_method(
+            self, service_domain, method_discriminator, payload, ephemeral_pubkey, options,
+        ).await
     }
 
     #[cfg(not(feature = "fips"))]
