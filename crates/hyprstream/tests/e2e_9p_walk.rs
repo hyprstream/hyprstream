@@ -208,6 +208,16 @@ struct Services {
 
 async fn spawn_services(repo_dir: &std::path::Path, repo_name: &str) -> Result<Services> {
     let signing_key = generate_signing_keypair().0;
+    hyprstream_service::global_trust_store().insert(
+        signing_key.verifying_key(),
+        hyprstream_service::Attestation {
+            scopes: std::collections::HashSet::new(),
+            subject: Some("service:registry".to_owned()),
+            jwt: None,
+            expires_at: 0,
+            attested_by: None,
+        },
+    );
 
     // ── PolicyService (permissive) ──────────────────────────────────────────
     let policy_temp = TempDir::new()?;

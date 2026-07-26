@@ -385,25 +385,67 @@ impl PolicyHandler for PolicyService {
 
     async fn handle_check(
         &self,
-        _ctx: &EnvelopeContext,
+        ctx: &EnvelopeContext,
         _request_id: u64,
         data: &PolicyCheck,
     ) -> Result<PolicyResponseVariant> {
+        let subject = ctx.subject();
+        if !ctx.is_authenticated() {
+            warn!(
+                requested_subject = %data.subject,
+                requested_domain = %data.domain,
+                resource = %data.resource,
+                operation = %data.operation,
+                "policy check denied: unauthenticated envelope context"
+            );
+            ctx.audit_authz(&data.resource, &data.operation, false);
+            return Ok(PolicyResponseVariant::CheckResult(false));
+        }
+        let domain = match self.request_domain(ctx) {
+            Ok(domain) => domain,
+            Err(error) => {
+                warn!(
+                    caller = %subject,
+                    requested_subject = %data.subject,
+                    requested_domain = %data.domain,
+                    resource = %data.resource,
+                    operation = %data.operation,
+                    %error,
+                    "policy check denied: no verified authorization domain"
+                );
+                ctx.audit_authz(&data.resource, &data.operation, false);
+                return Ok(PolicyResponseVariant::CheckResult(false));
+            }
+        };
+
         trace!(
-            "Policy check: subject={}, domain={}, resource={}, operation={}",
-            data.subject, data.domain, data.resource, data.operation
+            "Policy check: verified_subject={}, verified_domain={}, resource={}, operation={}",
+            subject, domain, data.resource, data.operation
         );
 
-        // Check authorization — pass the operation string directly so dot-namespaced
-        // actions (e.g. "ttt.writeback") are forwarded verbatim to the Casbin enforcer.
+        // Subject and domain are derived exclusively from the verified envelope.
+        // The request fields remain on the wire for compatibility, but cannot
+        // select another identity or tenant. Pass the operation string directly
+        // so dot-namespaced actions are forwarded verbatim to Casbin.
         let allowed = self.policy_manager.check_with_domain(
-            &data.subject,
-            &data.domain,
+            &subject.to_string(),
+            &domain,
             &data.resource,
             &data.operation,
         ).await;
 
-        debug!("Policy check result: allowed={}", allowed);
+        if allowed {
+            debug!(caller = %subject, %domain, "policy check allowed");
+        } else {
+            warn!(
+                caller = %subject,
+                %domain,
+                resource = %data.resource,
+                operation = %data.operation,
+                "policy check denied by policy"
+            );
+        }
+        ctx.audit_authz(&data.resource, &data.operation, allowed);
         Ok(PolicyResponseVariant::CheckResult(allowed))
     }
 
@@ -2000,6 +2042,134 @@ mod tests {
                 .expect("PolicyService bootstrap authority domain"),
             "*"
         );
+    }
+
+    #[tokio::test]
+    async fn unauthenticated_policy_check_is_denied() {
+        let manager = Arc::new(
+            PolicyManager::new_in_memory()
+                .await
+                .expect("test: policy manager"),
+        );
+        manager
+            .add_policy_with_domain(
+                "alice",
+                "tenant-a",
+                "model:allowed",
+                "infer.generate",
+                "allow",
+            )
+            .await
+            .expect("test: policy grant");
+        let (service, _root) = test_service_with_manager(manager).await;
+        let ctx = EnvelopeContext::for_test_authenticated_subject(
+            Subject::anonymous(),
+            SigningKey::from_bytes(&[0x53; 32]).verifying_key(),
+        );
+        let request = PolicyCheck {
+            subject: "alice".to_owned(),
+            domain: "tenant-a".to_owned(),
+            resource: "model:allowed".to_owned(),
+            operation: "infer.generate".to_owned(),
+        };
+
+        let response = service
+            .handle_check(&ctx, 1, &request)
+            .await
+            .expect("denial is a policy response");
+        assert!(matches!(
+            response,
+            PolicyResponseVariant::CheckResult(false)
+        ));
+    }
+
+    #[tokio::test]
+    async fn policy_check_uses_verified_context_not_requested_identity() {
+        let manager = Arc::new(
+            PolicyManager::new_in_memory()
+                .await
+                .expect("test: policy manager"),
+        );
+        manager
+            .add_policy_with_domain(
+                "alice",
+                "tenant-a",
+                "model:own",
+                "infer.generate",
+                "allow",
+            )
+            .await
+            .expect("test: own-tenant grant");
+        manager
+            .add_policy_with_domain(
+                "victim",
+                "tenant-b",
+                "model:foreign",
+                "infer.generate",
+                "allow",
+            )
+            .await
+            .expect("test: foreign-tenant grant");
+        let (service, _root) = test_service_with_manager(manager).await;
+        let ctx = EnvelopeContext::for_test_authenticated_subject_in_tenant(
+            Subject::new("alice"),
+            "tenant-a",
+            SigningKey::from_bytes(&[0x54; 32]).verifying_key(),
+        );
+
+        let forged_probe = PolicyCheck {
+            subject: "victim".to_owned(),
+            domain: "tenant-b".to_owned(),
+            resource: "model:foreign".to_owned(),
+            operation: "infer.generate".to_owned(),
+        };
+        let denied = service
+            .handle_check(&ctx, 1, &forged_probe)
+            .await
+            .expect("denial is a policy response");
+        assert!(matches!(
+            denied,
+            PolicyResponseVariant::CheckResult(false)
+        ));
+
+        let stale_wire_identity = PolicyCheck {
+            subject: "victim".to_owned(),
+            domain: "tenant-b".to_owned(),
+            resource: "model:own".to_owned(),
+            operation: "infer.generate".to_owned(),
+        };
+        let allowed = service
+            .handle_check(&ctx, 2, &stale_wire_identity)
+            .await
+            .expect("allow is a policy response");
+        assert!(matches!(
+            allowed,
+            PolicyResponseVariant::CheckResult(true)
+        ));
+    }
+
+    #[tokio::test]
+    async fn tenantless_user_policy_check_is_denied() {
+        let (service, _root) = test_service().await;
+        let ctx = EnvelopeContext::for_test_authenticated_subject(
+            Subject::new("alice"),
+            SigningKey::from_bytes(&[0x55; 32]).verifying_key(),
+        );
+        let request = PolicyCheck {
+            subject: "alice".to_owned(),
+            domain: "*".to_owned(),
+            resource: "model:any".to_owned(),
+            operation: "infer.generate".to_owned(),
+        };
+
+        let response = service
+            .handle_check(&ctx, 1, &request)
+            .await
+            .expect("denial is a policy response");
+        assert!(matches!(
+            response,
+            PolicyResponseVariant::CheckResult(false)
+        ));
     }
 
     #[tokio::test]

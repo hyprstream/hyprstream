@@ -686,6 +686,16 @@ mod tests {
             },
         );
         let (signing_key, _vk) = generate_signing_keypair();
+        hyprstream_service::global_trust_store().insert(
+            signing_key.verifying_key(),
+            hyprstream_service::Attestation {
+                scopes: std::collections::HashSet::new(),
+                subject: Some("service:metrics".to_owned()),
+                jwt: None,
+                expires_at: 0,
+                attested_by: None,
+            },
+        );
 
         // Permissive policy service so authorize() always passes.
         let policy_tag = format!("test-policy-{tag}");

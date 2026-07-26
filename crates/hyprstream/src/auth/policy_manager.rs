@@ -135,7 +135,8 @@ fn validate_policy_component(component: &str, name: &str) -> Result<(), PolicyEr
 /// - Domain-scoped access control (e.g., HfModel, HfDataset)
 /// - Deny rules via explicit effect column
 /// - Wildcards for domain and action
-/// - Role-based access via g()
+/// - Global-service role access via g() in the explicit `*` domain
+/// - Tenant-scoped role access via g2()
 const DEFAULT_MODEL_CONF: &str = r#"[request_definition]
 r = sub, dom, obj, act
 
@@ -150,7 +151,7 @@ g2 = _, _, _
 e = some(where (p.eft == allow)) && !some(where (p.eft == deny))
 
 [matchers]
-m = (g(r.sub, p.sub) || g2(r.sub, p.sub, r.dom) || keyMatch(r.sub, p.sub)) && \
+m = ((r.dom == "*" && g(r.sub, p.sub)) || g2(r.sub, p.sub, r.dom) || keyMatch(r.sub, p.sub)) && \
     (p.dom == "*" || r.dom == p.dom) && \
     keyMatch(r.obj, p.obj) && \
     (p.act == "*" || keyMatch(r.act, p.act))
@@ -268,8 +269,13 @@ pub async fn write_policy_file(path: &Path, content: impl AsRef<[u8]>) -> Result
 
 async fn ensure_domain_role_model(model_path: &Path) -> Result<(), PolicyError> {
     let content = tokio::fs::read_to_string(model_path).await?;
+    const GLOBAL_ROLE_CALL: &str = "g(r.sub, p.sub)";
+    const GUARDED_ROLE_MATCHER: &str =
+        "m = ((r.dom == \"*\" && g(r.sub, p.sub)) || g2(r.sub, p.sub, r.dom) || keyMatch(r.sub, p.sub))";
+
     if content.contains("g2 = _, _, _")
-        && content.contains("g2(r.sub, p.sub, r.dom)")
+        && content.contains(GUARDED_ROLE_MATCHER)
+        && content.matches(GLOBAL_ROLE_CALL).count() == 1
     {
         return Ok(());
     }
@@ -281,15 +287,21 @@ async fn ensure_domain_role_model(model_path: &Path) -> Result<(), PolicyError> 
             1,
         )
         .replacen(
-            "m = (g(r.sub, p.sub) || keyMatch(r.sub, p.sub))",
             "m = (g(r.sub, p.sub) || g2(r.sub, p.sub, r.dom) || keyMatch(r.sub, p.sub))",
+            GUARDED_ROLE_MATCHER,
+            1,
+        )
+        .replacen(
+            "m = (g(r.sub, p.sub) || keyMatch(r.sub, p.sub))",
+            GUARDED_ROLE_MATCHER,
             1,
         );
     if !migrated.contains("g2 = _, _, _")
-        || !migrated.contains("g2(r.sub, p.sub, r.dom)")
+        || !migrated.contains(GUARDED_ROLE_MATCHER)
+        || migrated.matches(GLOBAL_ROLE_CALL).count() != 1
     {
         return Err(PolicyError::ValidationError(format!(
-            "{} must define domain-scoped g2(user, role, domain) membership",
+            "{} must restrict legacy g(user, role) membership to the global '*' domain and define domain-scoped g2(user, role, domain) membership",
             model_path.display()
         )));
     }
@@ -809,10 +821,39 @@ impl PolicyManager {
                 .map_err(PolicyError::CasbinError)?;
         }
 
-        // Add grouping rules
+        // Add grouping rules. A template whose policies name one concrete
+        // tenant gets g2 memberships in that tenant. Global/role-alias
+        // templates retain g memberships, which the model evaluates only when
+        // the verified request domain itself is `*`.
         if let Some(groupings) = template.groupings {
-            let grouping_vecs: Vec<Vec<String>> = groupings.iter().map(ServiceGrouping::to_vec).collect();
-            if !grouping_vecs.is_empty() {
+            let tenant_domains: std::collections::BTreeSet<&str> = policies
+                .iter()
+                .map(|policy| policy.domain)
+                .filter(|domain| *domain != "*")
+                .collect();
+            if tenant_domains.len() > 1 {
+                return Err(PolicyError::ValidationError(format!(
+                    "template '{}' has role assignments spanning multiple tenant domains",
+                    template.name
+                )));
+            }
+
+            if let Some(domain) = tenant_domains.first() {
+                for grouping in groupings {
+                    enforcer
+                        .add_named_grouping_policy(
+                            "g2",
+                            vec![
+                                grouping.user.to_owned(),
+                                grouping.role.to_owned(),
+                                (*domain).to_owned(),
+                            ],
+                        )
+                        .await
+                        .map_err(PolicyError::CasbinError)?;
+                }
+            } else {
+                let grouping_vecs: Vec<Vec<String>> = groupings.iter().map(ServiceGrouping::to_vec).collect();
                 enforcer
                     .add_grouping_policies(grouping_vecs)
                     .await
@@ -1015,6 +1056,75 @@ mod tests {
             pm.check_with_domain("alice", "tenant-a", "model:test", "infer.generate")
                 .await
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn legacy_global_role_grant_is_inert_in_tenant_domains() -> Result<(), PolicyError> {
+        let pm = PolicyManager::new_in_memory().await?;
+        for tenant in ["tenant-a", "tenant-b"] {
+            pm.add_policy_with_domain(
+                "operator",
+                tenant,
+                "model:*",
+                "ttt.writeback",
+                "allow",
+            )
+            .await?;
+        }
+
+        // Simulate a pre-#1196 g(user, role) row already present in policy.csv.
+        pm.add_role_for_user("alice", "operator").await?;
+
+        for tenant in ["tenant-a", "tenant-b"] {
+            assert!(
+                !pm.check_with_domain("alice", tenant, "model:test", "ttt.writeback")
+                    .await,
+                "legacy global role membership must not authorize tenant {tenant}"
+            );
+        }
+
+        pm.add_role_for_user_in_domain("alice", "operator", "tenant-a")
+            .await?;
+        assert!(
+            pm.check_with_domain("alice", "tenant-a", "model:test", "ttt.writeback")
+                .await
+        );
+        assert!(
+            !pm.check_with_domain("alice", "tenant-b", "model:test", "ttt.writeback")
+                .await
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn legacy_model_is_migrated_before_global_roles_are_loaded() -> Result<(), PolicyError> {
+        let temp = TempDir::new().map_err(PolicyError::IoError)?;
+        let policies_dir = temp.path().join("policies");
+        tokio::fs::create_dir_all(&policies_dir).await?;
+        let legacy_model = DEFAULT_MODEL_CONF.replace(
+            "m = ((r.dom == \"*\" && g(r.sub, p.sub)) || g2(r.sub, p.sub, r.dom) || keyMatch(r.sub, p.sub))",
+            "m = (g(r.sub, p.sub) || g2(r.sub, p.sub, r.dom) || keyMatch(r.sub, p.sub))",
+        );
+        write_policy_file(&policies_dir.join("model.conf"), legacy_model).await?;
+        write_policy_file(
+            &policies_dir.join("policy.csv"),
+            "p, operator, tenant-a, model:*, ttt.writeback, allow\n\
+             p, operator, tenant-b, model:*, ttt.writeback, allow\n\
+             g, alice, operator\n",
+        )
+        .await?;
+
+        let pm = PolicyManager::new(&policies_dir).await?;
+        let migrated = tokio::fs::read_to_string(policies_dir.join("model.conf")).await?;
+        assert!(migrated.contains("r.dom == \"*\" && g(r.sub, p.sub)"));
+        for tenant in ["tenant-a", "tenant-b"] {
+            assert!(
+                !pm.check_with_domain("alice", tenant, "model:test", "ttt.writeback")
+                    .await,
+                "loaded legacy grant must be inert in tenant {tenant}"
+            );
+        }
         Ok(())
     }
 
@@ -1362,14 +1472,26 @@ mod tests {
     async fn apply_template(pm: &PolicyManager, name: &str) {
         let tmpl = crate::auth::policy_templates::get_template(name)
             .unwrap_or_else(|| panic!("template {name} must exist"));
-        for r in tmpl.expanded_policies() {
+        let policies = tmpl.expanded_policies();
+        let tenant_domains: std::collections::BTreeSet<&str> = policies
+            .iter()
+            .map(|policy| policy.domain)
+            .filter(|domain| *domain != "*")
+            .collect();
+        for r in policies {
             pm.add_policy_with_domain(r.subject, r.domain, r.resource, r.action, r.effect)
                 .await
                 .unwrap();
         }
         if let Some(groupings) = tmpl.groupings {
             for g in groupings {
-                pm.add_role_for_user(g.user, g.role).await.unwrap();
+                if let Some(domain) = tenant_domains.first() {
+                    pm.add_role_for_user_in_domain(g.user, g.role, domain)
+                        .await
+                        .unwrap();
+                } else {
+                    pm.add_role_for_user(g.user, g.role).await.unwrap();
+                }
             }
         }
     }
