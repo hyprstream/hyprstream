@@ -79,6 +79,13 @@ pub mod at9p_alias;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod did_anchored;
 
+/// #1167 — canonical, append-only, hash-chained DID operation log.
+///
+/// Defines the genesis/rotation wire format and its pinned-Hybrid
+/// (Ed25519 + ML-DSA-65) fail-closed verifier. Kept separate from DID
+/// resolution and anchored-DID policy.
+pub mod did_op;
+
 /// #524 P1 — placement directory record ingestion + in-process index.
 ///
 /// Polls `RecordResolver::resolve_repo` for a bootstrap set of node DIDs,

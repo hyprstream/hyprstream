@@ -27,6 +27,9 @@ hyprstream-rpc-derive = { path = "../hyprstream-rpc-derive" }
 # #524 P1 — placement directory ingestion: CAR parsing + MST walk + record
 # decoding (ai.hyprstream.placement.* lexicons).
 hyprstream-pds = { path = "../hyprstream-pds" }
+# #1167 — transport-free Ed25519 + ML-DSA-65 composite signatures for the
+# append-only did:plc operation log.
+hyprstream-crypto = { path = "../hyprstream-crypto" }
 
 # Async runtime
 async-trait = { workspace = true }
@@ -51,6 +54,7 @@ reqwest = { workspace = true }
 # Crypto (for signing keys)
 ed25519-dalek = { workspace = true }
 blake3 = { workspace = true }
+sha2 = { workspace = true }
 hex = { workspace = true }
 # #932 — the `#atproto` P-256 verifying key type named by the verified-by-
 # construction ingest seam (`RecordResolver::resolve_verifying_key`); also used
