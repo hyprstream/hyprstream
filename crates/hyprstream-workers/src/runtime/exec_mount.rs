@@ -84,6 +84,73 @@ impl Verb {
             _ => None,
         }
     }
+
+    /// Whether this verb mutates the instance lifecycle destructively (stop/
+    /// kill/destroy). These are the verbs the MAC PEP must mediate (#1272):
+    /// `start` is constructive (it cannot remove or halt another subject's
+    /// instance), so it is not in the mediated set.
+    fn is_lifecycle_destructive(self) -> bool {
+        matches!(self, Verb::Stop | Verb::Kill | Verb::Destroy)
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Lifecycle authorization seam (#1272)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The destructive lifecycle verbs a [`LifecyclePolicy`] mediates.
+///
+/// These are the `ctl` ops that halt or remove an instance — the
+/// "lifecycle mutation" surface issue #1272 names. `Start` is deliberately
+/// absent: it is constructive, not a mutation of another subject's running
+/// instance.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LifecycleVerb {
+    Stop,
+    Kill,
+    Destroy,
+}
+
+/// Fail-closed authorization seam for destructive `ctl` lifecycle verbs
+/// (#1272, epic #1267 T3).
+///
+/// `ExecMount`'s `write` path previously ignored `_caller` entirely when
+/// invoking `stop`/`kill`/`destroy`. This trait is the mediation point: when a
+/// policy is installed on the mount ([`ExecMount::new_with_lifecycle`]), every
+/// destructive verb must pass `authorize` before the backend is touched.
+///
+/// **Fail-closed contract:** returning `Err` ⇒ the verb is refused
+/// (`MountError::PermissionDenied`); there is no permissive default inside a
+/// policy. The mount's status-quo (no policy installed) is represented by
+/// `lifecycle: None`, NOT by a permissive policy — mirroring the
+/// [`hyprstream_vfs::NamespacePep`] activation posture (the separately-gated
+/// B-lane flips construction sites to armed).
+///
+/// The clearance-provenance dependency (#698) is the same as the VFS PEP's: a
+/// production policy resolves the caller's `SecurityContext` from verified
+/// credential material and applies MAC `can_access` against the instance's
+/// label. Until #698 wires that, the policy is a structural seam.
+pub trait LifecyclePolicy: Send + Sync {
+    /// Authorize `verb` on instance `id` by `caller`. `Ok(())` permits;
+    /// `Err(detail)` denies with a human-readable reason.
+    fn authorize(&self, caller: &Subject, id: &str, verb: LifecycleVerb) -> Result<(), String>;
+}
+
+/// Fail-closed policy: denies every destructive verb for every subject.
+/// Installing this arms the mediation point to deny-by-default (e.g. during
+/// the #698 dependency window).
+#[derive(Debug, Default, Clone, Copy)]
+pub struct DenyAllLifecycle;
+
+impl LifecyclePolicy for DenyAllLifecycle {
+    fn authorize(
+        &self,
+        _caller: &Subject,
+        _id: &str,
+        _verb: LifecycleVerb,
+    ) -> Result<(), String> {
+        Err("lifecycle verb denied: no permissive policy".into())
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -167,17 +234,40 @@ pub struct ExecMount {
     /// fan-out this mount doesn't need). `TerminalStore` is still the single
     /// source of retained truth; this only wakes waiters once it's written.
     waiters: PmMutex<HashMap<String, Arc<Notify>>>,
+    /// Optional MAC lifecycle policy over destructive `ctl` verbs (#1272).
+    /// `None` ⇒ the un-enforced status quo (the mount's `write` ignores the
+    /// caller, the gap #1272 describes); `Some` ⇒ `stop`/`kill`/`destroy`
+    /// must pass [`LifecyclePolicy::authorize`] before the backend is touched.
+    lifecycle: Option<Arc<dyn LifecyclePolicy>>,
 }
 
 impl ExecMount {
-    /// Create a new `ExecMount` over the given pool.
+    /// Create a new `ExecMount` over the given pool, **unenforced**.
+    ///
+    /// No lifecycle policy is installed: destructive `ctl` verbs behave as
+    /// before (the dormant posture). To arm fail-closed mediation, use
+    /// [`Self::new_with_lifecycle`].
     pub fn new(pool: Arc<SandboxPool>) -> Self {
         Self {
             pool,
             terminal: TerminalStore::new(),
             terminal_ids: PmMutex::new(std::collections::HashSet::new()),
             waiters: PmMutex::new(HashMap::new()),
+            lifecycle: None,
         }
+    }
+
+    /// Create a new `ExecMount` with a MAC lifecycle policy armed.
+    ///
+    /// Every destructive verb (`stop`/`kill`/`destroy`) written to
+    /// `/exec/instances/<id>/ctl` must pass `policy.authorize(caller, id, verb)`
+    /// before the backend is touched; a denial yields
+    /// [`MountError::PermissionDenied`]. Pass [`DenyAllLifecycle`] for the
+    /// fail-closed default during the #698 dependency window.
+    pub fn new_with_lifecycle(pool: Arc<SandboxPool>, policy: Arc<dyn LifecyclePolicy>) -> Self {
+        let mut mount = Self::new(pool);
+        mount.lifecycle = Some(policy);
+        mount
     }
 
     /// Get (or create) the `Notify` an `exit` reader waits on for `id`.
@@ -191,7 +281,11 @@ impl ExecMount {
     }
 
     /// Resolve the verb against the pool/backend for instance `id`.
-    async fn apply_verb(&self, id: &str, verb: Verb) -> Result<String, MountError> {
+    ///
+    /// `caller` is the [`Subject`] that wrote the `ctl` verb (#1272): when a
+    /// [`LifecyclePolicy`] is armed, destructive verbs (stop/kill/destroy)
+    /// must pass it before any backend state is touched.
+    async fn apply_verb(&self, id: &str, verb: Verb, caller: &Subject) -> Result<String, MountError> {
         // Instances already marked terminal (destroyed through this mount)
         // are not present in the pool's active map any more; ctl ops on them
         // are rejected rather than silently no-op'd.
@@ -199,6 +293,30 @@ impl ExecMount {
             return Err(MountError::InvalidArgument(format!(
                 "instance {id} is already terminal"
             )));
+        }
+
+        // MAC lifecycle gate (#1272): a destructive verb must be authorized by
+        // the armed policy before we touch the backend. No policy ⇒ the
+        // un-enforced status quo (the documented gap); a policy ⇒ fail-closed
+        // (its `authorize` returns Err ⇒ PermissionDenied).
+        if verb.is_lifecycle_destructive() {
+            if let Some(policy) = &self.lifecycle {
+                let lv = match verb {
+                    Verb::Stop => LifecycleVerb::Stop,
+                    Verb::Kill => LifecycleVerb::Kill,
+                    Verb::Destroy => LifecycleVerb::Destroy,
+                    // is_lifecycle_destructive() is false for Start, so this
+                    // arm is unreachable here; kept exhaustive without `expect`.
+                    Verb::Start => {
+                        return Err(MountError::InvalidArgument(
+                            "start is not a lifecycle-destructive verb".into(),
+                        ))
+                    }
+                };
+                policy
+                    .authorize(caller, id, lv)
+                    .map_err(MountError::PermissionDenied)?;
+            }
         }
 
         let sandbox = self
@@ -404,7 +522,7 @@ impl Mount for ExecMount {
         fid: &Fid,
         _offset: u64,
         data: &[u8],
-        _caller: &Subject,
+        caller: &Subject,
     ) -> Result<u32, MountError> {
         let inner = fid
             .downcast_ref::<ExecFid>()
@@ -416,7 +534,10 @@ impl Mount for ExecMount {
                 let verb = Verb::parse(&text).ok_or_else(|| {
                     MountError::InvalidArgument(format!("unknown ctl verb: {}", text.trim()))
                 })?;
-                let result = self.apply_verb(id, verb).await;
+                // `caller` is now threaded into the lifecycle gate inside
+                // `apply_verb` (#1272): a destructive verb is mediated by the
+                // armed [`LifecyclePolicy`] before the backend is touched.
+                let result = self.apply_verb(id, verb, caller).await;
                 let response_bytes = match result {
                     Ok(s) => s.into_bytes(),
                     Err(e) => format!("error: {e}\n").into_bytes(),

@@ -1047,7 +1047,7 @@ mod tests {
 
         // Fork and restrict.
         let mut sandbox = ns.fork();
-        sandbox.unmount("/srv/worker");
+        let _ = sandbox.unmount("/srv/worker");
 
         // Parent can access both.
         assert!(ns.cat("/srv/model/test-model/status", &caller).await.is_ok());

@@ -166,7 +166,7 @@ impl VfsFileSystem {
     fn route(&self, components: &[String]) -> io::Result<(Vec<MountTarget>, Vec<String>)> {
         let path = Self::abs_path(components);
         self.ns
-            .resolve_targets(&path)
+            .resolve_targets(&path, &self.subject)
             .map_err(|_| io::Error::from_raw_os_error(libc::ENOENT))
     }
 
@@ -790,4 +790,3 @@ impl FileSystem for VfsFileSystem {
         Ok(ListxattrReply::Names(Vec::new()))
     }
 }
-

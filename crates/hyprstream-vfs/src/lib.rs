@@ -18,6 +18,10 @@
 
 pub mod devfile;
 mod fsmount;
+/// MAC PEP for the direct Namespace API (#1272): the contract `Namespace`
+/// invokes per op, plus fail-closed defaults. The audited production impl lives
+/// in `hyprstream::mac::pep`.
+pub mod mac_pep;
 mod mount;
 mod namespace;
 #[cfg(not(target_arch = "wasm32"))]
@@ -44,6 +48,10 @@ pub use fsmount::{FsMount, SetAttr};
 pub use hyprstream_rpc::Subject;
 pub use mount::{DirEntry, Fid, Mount, MountError, Stat, OREAD, OWRITE, ORDWR, OTRUNC, ORCLOSE, DMDIR};
 pub use namespace::{BindFlag, MountTarget, Namespace, NamespaceError};
+pub use mac_pep::{
+    DenyAllNamespace, DenyAllSubjects, DenyUnlabeledResolver, NamespaceAccessDecider,
+    NamespaceAction, NamespacePep, SubjectContextResolver,
+};
 
 #[cfg(not(target_arch = "wasm32"))]
 pub use fuse_adapter::FuseFileSystemMount;

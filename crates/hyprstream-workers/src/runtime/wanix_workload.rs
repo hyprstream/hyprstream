@@ -433,7 +433,7 @@ impl ImportedGuestNamespace {
     /// Remove the imported tree from `host_ns` (the teardown counterpart of the
     /// bind [`import_guest_namespace`] performed).
     pub fn unmount(&self, host_ns: &mut Namespace) {
-        host_ns.unmount(&self.prefix);
+        let _ = host_ns.unmount(&self.prefix);
     }
 }
 

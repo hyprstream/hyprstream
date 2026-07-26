@@ -474,6 +474,19 @@ impl ObjectLabelResolver for CompositeObjectLabelResolver {
     }
 }
 
+/// Adapt the genesis/bind carrier resolver to the canonical cross-plane MAC
+/// resolver contract. For the VFS plane, `service_domain` is the normalized
+/// absolute object path and there is no browser method discriminator.
+impl hyprstream_rpc::auth::mac::RpcObjectLabelResolver for CompositeObjectLabelResolver {
+    fn resolve(&self, service_domain: &str, _method: Option<u16>) -> Option<SecurityLabel> {
+        let components: Vec<&str> = service_domain
+            .split('/')
+            .filter(|component| !component.is_empty() && *component != "." && *component != "..")
+            .collect();
+        self.resolve_path(&components)
+    }
+}
+
 /// Join path components into a normalized absolute path (`["srv","model"]` →
 /// `"/srv/model"`), matching [`normalize_node_path`]'s output so genesis lookups
 /// hit.

@@ -31,7 +31,7 @@ use hyprstream_9p::{
     ReferenceMonitor, ReferenceMonitorDenyReason, SessionContext, VerifiedAttachIdentity,
 };
 use hyprstream_rpc::auth::mac::{
-    ObjectLabelResolver, ObjectRef, SecurityContext, SecurityLabel,
+    MacDecision, MacDenyReason, ObjectLabelResolver, ObjectRef, SecurityContext, SecurityLabel,
 };
 use hyprstream_rpc::SigningKey;
 
@@ -339,6 +339,272 @@ const fn audit_action(action: NinePAction) -> Action {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// VFS-plane PEP — the direct `Namespace` API reference monitor (#1272).
+//
+// Mirrors `NinePAccessDecider` for the *in-process* direct API: the 9P
+// translator decider authorizes wire ops; this decider authorizes the
+// `Namespace::cat`/`echo`/`create`/`ls`/`ctl` convenience methods (and the
+// `mount`/`bind_mount`/`unmount` mutation surface) once a `NamespacePep` is
+// installed. It reuses the SAME `ObjectLabelResolver` (the genesis composite),
+// the SAME `AuditSink` (the WAL), and the SAME `can_access` floor — it does
+// not reinvent any MAC primitive, only adapts the action surface.
+// ─────────────────────────────────────────────────────────────────────────────
+
+use hyprstream_vfs::{NamespaceAccessDecider, NamespaceAction, SubjectContextResolver};
+
+/// Reserved audit subject/object type ids for VFS-PEP decisions (distinct from
+/// the 9P sentinels above so audit consumers can distinguish the plane).
+const VFS_SUBJECT_TYPE: SubjectType = SubjectType(u32::MAX - 2);
+const VFS_OBJECT_TYPE: ObjectType = ObjectType(u32::MAX - 2);
+
+/// Audited `NamespaceAccessDecider` for the direct VFS API (#1272).
+///
+/// This is the production impl of [`hyprstream_vfs::NamespaceAccessDecider`]:
+/// it applies the intrinsic lattice dominance rule for read-class operations,
+/// denies write-class pending the VFS IFC write-direction decision, and records
+/// every outcome through the MAC audit sink. It
+/// receives the attempted subject context and label resolution from
+/// [`hyprstream_vfs::NamespacePep`], including `None` for missing clearance or
+/// labels, so fail-closed precondition denials cannot bypass the audit WAL.
+pub struct VfsAccessDecider {
+    sink: Arc<dyn AuditSink>,
+}
+
+impl VfsAccessDecider {
+    /// Wrap the process-wide MAC audit sink. The sink is mandatory; a decision
+    /// that cannot be durably audited is downgraded to Deny (fail-closed),
+    /// exactly as the 9P decider does.
+    pub fn new(sink: Arc<dyn AuditSink>) -> Self {
+        Self { sink }
+    }
+
+    fn audit(
+        &self,
+        ctx: Option<&SecurityContext>,
+        label: Option<SecurityLabel>,
+        action: NamespaceAction,
+        decision: Decision,
+        reason: DecisionReason,
+    ) -> bool {
+        let policy = crate::mac::compiled_policy();
+        let generation = policy.as_ref().map_or(0, |p| p.generation);
+        let policy_hash = policy.as_ref().and_then(|p| p.policy_hash().ok());
+        let record = AuditRecord {
+            seq: 0,
+            prev_hash: [0; 32],
+            ts_unix_nanos: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos()),
+            decision,
+            generation,
+            policy_hash,
+            subject_type: VFS_SUBJECT_TYPE,
+            // Bottom is an audit-schema placeholder when clearance could not
+            // be proven. `NoClearance` is authoritative and the placeholder
+            // never enters authorization.
+            subject_clearance: ctx.map_or_else(SecurityLabel::bottom, |ctx| *ctx.clearance()),
+            on_behalf_of: None,
+            object_type: VFS_OBJECT_TYPE,
+            // Likewise, an unresolved object is represented only in the audit
+            // schema; `UnlabeledObject` remains the authoritative reason.
+            object_label: label.unwrap_or_else(SecurityLabel::bottom),
+            action: vfs_audit_action(action),
+            reason,
+            subject_id: None,
+            object_id: None,
+        };
+
+        match self.sink.record(&record) {
+            Ok(()) => decision.is_permit(),
+            Err(error) => {
+                let deny_record = AuditRecord {
+                    decision: Decision::Deny,
+                    reason: DecisionReason::AuditFailClosed,
+                    ..record
+                };
+                let _ = self.sink.record(&deny_record);
+                tracing::error!(
+                    target: "hyprstream.mac.audit",
+                    %error,
+                    reason = DecisionReason::AuditFailClosed.as_str(),
+                    "VFS PEP decision could not be durably audited; enforcing deny"
+                );
+                false
+            }
+        }
+    }
+}
+
+const fn vfs_audit_action(action: NamespaceAction) -> Action {
+    match action {
+        NamespaceAction::Read => Action::from_scope_action(ScopeAction::Query),
+        // Write/create + namespace mutation (mount/bind/unmount) and raw-handle
+        // extraction are all write-capable operations over an object — audited
+        // as Write. The deny-on-write-direction pause applies to all of them
+        // until IFC lands.
+        NamespaceAction::Write
+        | NamespaceAction::Create
+        | NamespaceAction::Mount
+        | NamespaceAction::BindMount
+        | NamespaceAction::Unmount
+        | NamespaceAction::ResolveHandle => Action::from_scope_action(ScopeAction::Write),
+    }
+}
+
+impl NamespaceAccessDecider for VfsAccessDecider {
+    fn check(
+        &self,
+        ctx: Option<&SecurityContext>,
+        object_label: Option<SecurityLabel>,
+        action: NamespaceAction,
+    ) -> MacDecision {
+        let Some(ctx) = ctx else {
+            self.audit(
+                None,
+                object_label,
+                action,
+                Decision::Deny,
+                DecisionReason::NoClearance,
+            );
+            return MacDecision::Deny(MacDenyReason::NoClearance);
+        };
+        let Some(object_label) = object_label else {
+            self.audit(
+                Some(ctx),
+                None,
+                action,
+                Decision::Deny,
+                DecisionReason::UnlabeledObject,
+            );
+            return MacDecision::Deny(MacDenyReason::UnlabeledObject);
+        };
+
+        // Write/create/mutate deny pending the VFS IFC write-direction
+        // decision.
+        let is_write_class = matches!(
+            action,
+            NamespaceAction::Write
+                | NamespaceAction::Create
+                | NamespaceAction::Mount
+                | NamespaceAction::BindMount
+                | NamespaceAction::Unmount
+                | NamespaceAction::ResolveHandle
+        );
+        if is_write_class {
+            self.audit(
+                Some(ctx),
+                Some(object_label),
+                action,
+                Decision::Deny,
+                DecisionReason::WriteDirectionUndecided,
+            );
+            return MacDecision::Deny(MacDenyReason::FloorDeny);
+        }
+
+        let permitted = ctx.can_access(&object_label);
+        let audited_permit = self.audit(
+            Some(ctx),
+            Some(object_label),
+            action,
+            if permitted {
+                Decision::Permit
+            } else {
+                Decision::Deny
+            },
+            if permitted {
+                DecisionReason::Permit
+            } else {
+                DecisionReason::FloorDeny
+            },
+        );
+        if permitted && audited_permit {
+            MacDecision::Permit
+        } else {
+            MacDecision::Deny(MacDenyReason::FloorDeny)
+        }
+    }
+}
+
+/// Fail-closed `SubjectContextResolver` for the VFS PEP (#698 dependency
+/// window).
+///
+/// The direct `Namespace` API carries only an unauthenticated `Subject` string
+/// — it has no verified `EnvelopeContext`/claims the way the RPC dispatch
+/// plane does (#1268 owns threading those through). Until production clearance
+/// provenance (#698) wires a real resolver (e.g. one keyed on the installed
+/// `CompiledPolicy` enrollment table, mirroring
+/// [`EnrollmentSubjectContextResolver`]), this stub resolves **no** subject,
+/// so an armed VFS PEP denies every op — the correct fail-closed posture
+/// (#547: no permissive default).
+///
+/// Replacing this with a real resolver is the activation B-lane (#1267), not
+/// this struct's existence.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct DenyUnenrolledSubjects;
+
+impl SubjectContextResolver for DenyUnenrolledSubjects {
+    fn resolve(
+        &self,
+        _subject: &hyprstream_rpc::Subject,
+    ) -> Option<SecurityContext> {
+        None
+    }
+}
+
+/// Assemble the production VFS-plane PEP from the genesis label resolver and
+/// the tamper-evident MAC audit sink (#1272).
+///
+/// This is the `hyprstream`-crate wiring that satisfies the
+/// [`hyprstream_vfs::NamespacePep`] contract: the genesis composite
+/// `RpcObjectLabelResolver` (carriers (a)+(c), #1228) feeds label resolution, a
+/// [`VfsAccessDecider`] over the WAL audit sink evaluates the policy, and —
+/// pending #698 — the subject seam is [`DenyUnenrolledSubjects`] (fail-closed:
+/// every op denies until clearance provenance is wired). Swapping the subject
+/// resolver for a real one is the activation B-lane (#1267).
+///
+/// Callers propagate the error and refuse to arm a `Namespace` with a
+/// permissive fallback; there is no permissive arm path.
+pub async fn production_vfs_pep(
+    signing_key: SigningKey,
+    oauth: &crate::config::OAuthConfig,
+    audit_stream: &str,
+) -> anyhow::Result<std::sync::Arc<hyprstream_vfs::NamespacePep>> {
+    anyhow::ensure!(
+        !audit_stream.is_empty()
+            && audit_stream
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_'),
+        "invalid VFS MAC audit stream name"
+    );
+
+    let secrets_dir = crate::config::HyprConfig::resolve_secrets_dir()?;
+    let ml_dsa_store =
+        crate::auth::key_rotation::global_ml_dsa_key_store(&secrets_dir, oauth);
+    let signer = crate::mac::audit::cose::OwnedCoseAuditSigner::new(
+        Arc::new(signing_key),
+        ml_dsa_store.active_key().await,
+        hyprstream_rpc::envelope::mandatory_envelope_policy(),
+    );
+    anyhow::ensure!(
+        signer.can_sign(),
+        "VFS MAC PEP audit signer unavailable under mandatory Hybrid policy"
+    );
+
+    let audit_store = crate::mac::audit::WalAuditStore::open(
+        secrets_dir.join("mac-audit").join(audit_stream),
+        signer,
+    )
+    .context("open VFS MAC audit store")?;
+    let resolver = crate::mac::GenesisGate::production().into_resolver();
+
+    Ok(std::sync::Arc::new(hyprstream_vfs::NamespacePep::new(
+        std::sync::Arc::new(DenyUnenrolledSubjects),
+        std::sync::Arc::new(resolver),
+        std::sync::Arc::new(VfsAccessDecider::new(std::sync::Arc::new(audit_store))),
+    )))
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::{Duration, Instant};
@@ -391,6 +657,32 @@ mod tests {
         fn record(&self, record: &AuditRecord) -> Result<(), AuditError> {
             self.records.lock().push(record.clone());
             Ok(())
+        }
+    }
+
+    struct FixtureVfsSubjects {
+        name: &'static str,
+        ctx: SecurityContext,
+    }
+
+    impl SubjectContextResolver for FixtureVfsSubjects {
+        fn resolve(&self, subject: &hyprstream_rpc::Subject) -> Option<SecurityContext> {
+            (subject.name() == Some(self.name)).then(|| self.ctx.clone())
+        }
+    }
+
+    struct FixtureVfsLabels {
+        public: SecurityLabel,
+        secret: SecurityLabel,
+    }
+
+    impl hyprstream_rpc::auth::mac::RpcObjectLabelResolver for FixtureVfsLabels {
+        fn resolve(&self, service_domain: &str, _method: Option<u16>) -> Option<SecurityLabel> {
+            match service_domain {
+                "/public" => Some(self.public),
+                "/secret" => Some(self.secret),
+                _ => None,
+            }
         }
     }
 
@@ -566,5 +858,65 @@ mod tests {
             "unverified Tattach fields must not mint identity or tenant"
         );
         assert!(!session.token_authorizes(&label(Level::Public), NinePAction::Read));
+    }
+
+    #[test]
+    fn vfs_fail_closed_denies_are_audited() {
+        let sink = Arc::new(SpySink::default());
+        let pep = hyprstream_vfs::NamespacePep::new(
+            Arc::new(FixtureVfsSubjects {
+                name: "alice",
+                ctx: context(Level::Public),
+            }),
+            Arc::new(FixtureVfsLabels {
+                public: label(Level::Public),
+                secret: label(Level::Secret),
+            }),
+            Arc::new(VfsAccessDecider::new(sink.clone())),
+        );
+
+        // Missing verified clearance, missing content label, lattice-floor
+        // denial, and the write-direction pause must all cross the same audit
+        // sink before the VFS reference monitor returns Deny.
+        assert_eq!(
+            pep.check(
+                &hyprstream_rpc::Subject::new("mallory"),
+                "/public",
+                NamespaceAction::Read,
+            ),
+            MacDecision::Deny(MacDenyReason::NoClearance)
+        );
+        assert_eq!(
+            pep.check(
+                &hyprstream_rpc::Subject::new("alice"),
+                "/missing",
+                NamespaceAction::Read,
+            ),
+            MacDecision::Deny(MacDenyReason::UnlabeledObject)
+        );
+        assert_eq!(
+            pep.check(
+                &hyprstream_rpc::Subject::new("alice"),
+                "/secret",
+                NamespaceAction::Read,
+            ),
+            MacDecision::Deny(MacDenyReason::FloorDeny)
+        );
+        assert_eq!(
+            pep.check(
+                &hyprstream_rpc::Subject::new("alice"),
+                "/public",
+                NamespaceAction::Write,
+            ),
+            MacDecision::Deny(MacDenyReason::FloorDeny)
+        );
+
+        let records = sink.records.lock();
+        assert_eq!(records.len(), 4);
+        assert!(records.iter().all(|record| record.decision == Decision::Deny));
+        assert_eq!(records[0].reason, DecisionReason::NoClearance);
+        assert_eq!(records[1].reason, DecisionReason::UnlabeledObject);
+        assert_eq!(records[2].reason, DecisionReason::FloorDeny);
+        assert_eq!(records[3].reason, DecisionReason::WriteDirectionUndecided);
     }
 }
