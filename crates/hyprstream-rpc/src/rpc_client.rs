@@ -556,7 +556,17 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
     ) -> Result<Vec<u8>> {
         self.ensure_pre_seal_current().await?;
         let request_id = self.next_id();
-        let jwt = options.jwt.or_else(|| self.effective_jwt());
+        anyhow::ensure!(
+            !(options.jwt.is_some() && options.delegated_bearer.is_some()),
+            "an RPC envelope cannot carry both a direct JWT and a delegated bearer"
+        );
+        // Delegation is an explicit principal-selection mode. Do not let a
+        // pooled client's default JWT silently take precedence over it.
+        let jwt = if options.delegated_bearer.is_some() {
+            None
+        } else {
+            options.jwt.or_else(|| self.effective_jwt())
+        };
         let (signed_bytes, pending) = self
             .sign_envelope(
                 request_id,
@@ -625,7 +635,17 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
     ) -> Result<Vec<u8>> {
         self.ensure_pre_seal_current().await?;
         let request_id = self.next_id();
-        let jwt = options.jwt.or_else(|| self.effective_jwt());
+        anyhow::ensure!(
+            !(options.jwt.is_some() && options.delegated_bearer.is_some()),
+            "an RPC envelope cannot carry both a direct JWT and a delegated bearer"
+        );
+        // Delegation is an explicit principal-selection mode. Do not let a
+        // pooled client's default JWT silently take precedence over it.
+        let jwt = if options.delegated_bearer.is_some() {
+            None
+        } else {
+            options.jwt.or_else(|| self.effective_jwt())
+        };
         let (signed_bytes, pending) = self
             .sign_envelope(
                 request_id,
@@ -1374,6 +1394,7 @@ mod request_kem_tests {
     struct LifecycleState {
         behavior: AtomicU8,
         recipients: parking_lot::Mutex<Vec<Vec<u8>>>,
+        auth: parking_lot::Mutex<Vec<(Option<String>, Option<String>)>>,
         swap_waiters: Mutex<Vec<(Vec<u8>, oneshot::Sender<Vec<u8>>)>>,
         entered: Notify,
     }
@@ -1398,6 +1419,10 @@ mod request_kem_tests {
                 .as_deref()
                 .ok_or_else(|| anyhow::anyhow!("test request omitted service domain"))?;
             self.state.recipients.lock().push(recipient.encode());
+            self.state.auth.lock().push((
+                request.jwt_token().map(str::to_owned),
+                request.delegation_token.clone(),
+            ));
             let pq_sk = crate::node_identity::derive_mesh_mldsa_key(&self.server_sk);
             let response = crate::envelope::ResponseEnvelope::new_signed_encrypted(
                 request.request_id,
@@ -1483,6 +1508,17 @@ mod request_kem_tests {
         Arc<LifecycleState>,
         Arc<AtomicUsize>,
     ) {
+        lifecycle_client_with_options(browser_binding, None)
+    }
+
+    fn lifecycle_client_with_options(
+        browser_binding: Option<crate::browser_provisioning::BrowserRequestBinding>,
+        default_jwt: Option<String>,
+    ) -> (
+        Arc<RpcClientImpl<LocalSigner, LifecycleTransport>>,
+        Arc<LifecycleState>,
+        Arc<AtomicUsize>,
+    ) {
         let (server_sk, server_vk) = generate_signing_keypair();
         let (client_sk, _client_vk) = generate_signing_keypair();
         let mut kem_store = KeyedKemTrustStore::new();
@@ -1500,6 +1536,7 @@ mod request_kem_tests {
         let state = Arc::new(LifecycleState {
             behavior: AtomicU8::new(LIFECYCLE_SUCCESS),
             recipients: parking_lot::Mutex::new(Vec::new()),
+            auth: parking_lot::Mutex::new(Vec::new()),
             swap_waiters: Mutex::new(Vec::new()),
             entered: Notify::new(),
         });
@@ -1515,6 +1552,10 @@ mod request_kem_tests {
         .with_request_kem_store(Arc::new(kem_store))
         .with_response_pq_store(Arc::new(pq_store))
         .with_response_secret_drop_probe(Arc::clone(&drops));
+        let client = match default_jwt {
+            Some(token) => client.with_default_jwt(token),
+            None => client,
+        };
         let client = match browser_binding {
             Some(binding) => client
                 .with_browser_provisioning_binding(binding)
@@ -1522,6 +1563,60 @@ mod request_kem_tests {
             None => client,
         };
         (Arc::new(client), state, drops)
+    }
+
+    #[tokio::test]
+    async fn delegated_bearer_suppresses_pooled_default_jwt() {
+        let (client, state, _drops) =
+            lifecycle_client_with_options(None, Some("pooled-default".to_owned()));
+
+        client
+            .call_with_options_for_service(
+                "model",
+                b"unary".to_vec(),
+                CallOptions::new().delegated_bearer("delegated-user"),
+            )
+            .await
+            .expect("delegated unary call");
+        client
+            .call_streaming_with_options_for_service(
+                "model",
+                b"streaming".to_vec(),
+                [0x55; 32],
+                CallOptions::new().delegated_bearer("delegated-user"),
+            )
+            .await
+            .expect("delegated streaming call");
+
+        let auth = state.auth.lock();
+        assert_eq!(auth.len(), 2);
+        for (jwt, delegated) in auth.iter() {
+            assert!(jwt.is_none(), "default JWT must not override delegation");
+            assert_eq!(delegated.as_deref(), Some("delegated-user"));
+        }
+    }
+
+    #[tokio::test]
+    async fn explicit_jwt_and_delegated_bearer_are_rejected() {
+        let (client, state, _drops) = lifecycle_client();
+        let error = client
+            .call_with_options_for_service(
+                "model",
+                b"payload".to_vec(),
+                CallOptions::new()
+                    .jwt("direct-user")
+                    .delegated_bearer("delegated-user"),
+            )
+            .await
+            .expect_err("ambiguous principal selection must fail");
+        assert!(
+            error.to_string().contains("both a direct JWT and a delegated bearer"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            state.auth.lock().is_empty(),
+            "ambiguous request must not reach the transport"
+        );
     }
 
     #[async_trait]
