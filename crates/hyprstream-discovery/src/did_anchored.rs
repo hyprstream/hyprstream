@@ -13,7 +13,6 @@ use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
-use ed25519_dalek::VerifyingKey;
 use hyprstream_pds::at9p::{ServiceType, Transport as At9pTransport};
 use hyprstream_pds::at9p_alias::AuthoritativeIdentity;
 use hyprstream_pds::at9p_gate::VerifiedCapsule;
@@ -24,6 +23,7 @@ use serde_json::Value;
 
 use crate::at9p_alias::At9pAliasResolver;
 use crate::at9p_resolver::CapsuleSource;
+use crate::service::HybridDeploymentCa;
 
 const MAX_CAPSULE_BYTES: usize = 4 * 1024 * 1024;
 const DEPLOYMENT_REACH_SERVICE: &str = "#ns";
@@ -98,7 +98,7 @@ impl DeploymentTrustSource {
 
 /// Verified public material extracted from a mutually-attested identity pair.
 pub(crate) struct DidAnchoredTrust {
-    pub ca_verifying_key: VerifyingKey,
+    pub ca_verifying_key: HybridDeploymentCa,
     pub discovery_transport: TransportConfig,
     pub authoritative_identity: AuthoritativeIdentity,
     /// The current CA-signed registry deployment credential, fetched from the
@@ -250,19 +250,15 @@ fn document_names_at9p(document: &Value, at9p_did: &str) -> bool {
 
 /// Extract the deployment CA from the primary hybrid subject key that signed
 /// the GATE-verified capsule.
-fn ca_key_from_capsule(verified: &VerifiedCapsule) -> Result<VerifyingKey> {
+fn ca_key_from_capsule(verified: &VerifiedCapsule) -> Result<HybridDeploymentCa> {
     let primary = verified
         .capsule()
         .body
         .subject_keys
         .first()
         .ok_or_else(|| anyhow::anyhow!("GATE-verified capsule has no subject key"))?;
-    let ed: [u8; 32] = primary
-        .ed25519_pub
-        .as_slice()
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("capsule subject Ed25519 key is not 32 bytes"))?;
-    VerifyingKey::from_bytes(&ed).context("capsule subject Ed25519 key is malformed")
+    HybridDeploymentCa::from_public_key_bytes(&primary.ed25519_pub, &primary.mldsa65_pub)
+        .context("capsule primary subject key is not a valid hybrid deployment CA")
 }
 
 /// Extract Discovery reach from the capsule's typed `#ns` service. The
@@ -420,8 +416,10 @@ mod tests {
     use hyprstream_crypto::pq::{ml_dsa_generate_keypair, ml_dsa_vk_bytes, MlDsaSigningKey};
     use hyprstream_pds::at9p::{
         CapsuleBody, HybridKeyPair, ServiceEndpoint, ServiceEntry, ServiceType, Transport,
+        ML_DSA65_PUBLIC_KEY_LEN,
     };
     use hyprstream_pds::at9p_sign::sign_capsule;
+    use hyprstream_pds::dag_cbor::DagCbor;
     use serde_json::json;
 
     struct FixedCapsuleSource(Vec<u8>);
@@ -523,6 +521,38 @@ mod tests {
         document
     }
 
+    fn remove_primary_ml_dsa_key(capsule: &[u8]) -> Vec<u8> {
+        let mut value = DagCbor::decode(capsule).expect("test capsule DAG-CBOR");
+        let DagCbor::Map(capsule_members) = &mut value else {
+            panic!("capsule map");
+        };
+        let body = capsule_members
+            .iter_mut()
+            .find_map(|(key, value)| {
+                matches!(key, DagCbor::Text(name) if name == "body").then_some(value)
+            })
+            .expect("capsule body");
+        let DagCbor::Map(body_members) = body else {
+            panic!("body map");
+        };
+        let subject_keys = body_members
+            .iter_mut()
+            .find_map(|(key, value)| {
+                matches!(key, DagCbor::Text(name) if name == "subjectKeys").then_some(value)
+            })
+            .expect("subject keys");
+        let DagCbor::List(subject_keys) = subject_keys else {
+            panic!("subject key list");
+        };
+        let DagCbor::Map(primary_members) = subject_keys.first_mut().expect("primary subject key")
+        else {
+            panic!("primary subject key map");
+        };
+        primary_members
+            .retain(|(key, _)| !matches!(key, DagCbor::Text(name) if name == "mldsa65Pub"));
+        value.encode()
+    }
+
     #[test]
     fn unset_anchors_preserve_os_owned_files_selection() {
         assert_eq!(
@@ -596,7 +626,11 @@ mod tests {
         .unwrap();
         assert_eq!(trust.authoritative_identity.at9p_did.as_str(), at9p);
         assert_eq!(trust.authoritative_identity.classical_did.as_str(), web);
-        assert_eq!(trust.ca_verifying_key.to_bytes(), capsule_ca(4));
+        assert_eq!(trust.ca_verifying_key.ed25519_bytes(), capsule_ca(4));
+        assert_eq!(
+            trust.ca_verifying_key.ml_dsa_65_bytes().len(),
+            ML_DSA65_PUBLIC_KEY_LEN
+        );
         match trust.discovery_transport.endpoint {
             EndpointType::Iroh { node_id, .. } => assert_eq!(node_id, [0xC0; 32]),
             other => panic!("expected iroh reach from capsule, got {other:?}"),
@@ -630,13 +664,45 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(honest.ca_verifying_key, substituted.ca_verifying_key);
+        assert_eq!(
+            honest.ca_verifying_key.ed25519_bytes(),
+            substituted.ca_verifying_key.ed25519_bytes()
+        );
+        assert_eq!(
+            honest.ca_verifying_key.ml_dsa_65_bytes(),
+            substituted.ca_verifying_key.ml_dsa_65_bytes()
+        );
         assert_eq!(honest.discovery_transport, substituted.discovery_transport);
-        assert_eq!(honest.ca_verifying_key.to_bytes(), capsule_ca(4));
+        assert_eq!(honest.ca_verifying_key.ed25519_bytes(), capsule_ca(4));
         match honest.discovery_transport.endpoint {
             EndpointType::Iroh { node_id, .. } => assert_eq!(node_id, [0xC0; 32]),
             other => panic!("expected capsule-bound iroh reach, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn classical_only_capsule_cannot_supply_the_deployment_root() {
+        let web = "did:web:cluster.example";
+        let (bytes, at9p) = capsule(web, 0x46);
+        let classical_only = remove_primary_ml_dsa_key(&bytes);
+        let anchors = DidAnchors {
+            cluster_at9p_did: at9p.clone(),
+            cluster_did_web: web.to_owned(),
+            extra_root_cert_pem: None,
+        };
+        let error = verify_did_anchored_document(
+            &anchors,
+            &document(web, Some(&at9p)),
+            Arc::new(FixedCapsuleSource(classical_only)),
+            "unused-test-credential".to_owned(),
+        )
+        .await
+        .err()
+        .expect("classical-only capsule unexpectedly supplied deployment root");
+        assert!(
+            format!("{error:#}").contains("mldsa65Pub"),
+            "failure did not identify the missing PQ root half: {error:#}"
+        );
     }
 
     #[tokio::test]
