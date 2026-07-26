@@ -1356,6 +1356,20 @@ mod tests {
         const REDIRECT_URI: &str = "https://client.example.test/callback";
         const MAPPED_DID: &str = "did:web:alice.acct.example.test";
         const HOSTED_TENANT: &str = "tenant-demo";
+
+        struct PermitFixtureAccountReads;
+
+        impl hyprstream_pds_service::AccountRecordReadAuthorizer for PermitFixtureAccountReads {
+            fn check_read(
+                &self,
+                _subject: &hyprstream_rpc::Subject,
+                _verified_tenant: Option<&str>,
+                _security_context: Option<&hyprstream_rpc::auth::mac::SecurityContext>,
+                _object_id: &str,
+            ) -> hyprstream_rpc::auth::mac::MacDecision {
+                hyprstream_rpc::auth::mac::MacDecision::Permit
+            }
+        }
         const PKCE_VERIFIER: &str = "r5-handler-pkce-verifier-abcdefghijklmnopqrstuvwxyz012345";
         const GENERIC_PKCE_VERIFIER: &str =
             "r7-generic-pkce-verifier-abcdefghijklmnopqrstuvwxyz012345";
@@ -1508,10 +1522,10 @@ mod tests {
                 ),
             ),
         );
-        let hosted_account_store =
-            Arc::new(hyprstream_pds_service::AccountRecordStore::new(Arc::new(
-                SyntheticMount::new(pds_root),
-            )));
+        let hosted_account_store = Arc::new(hyprstream_pds_service::AccountRecordStore::new(
+            Arc::new(SyntheticMount::new(pds_root)),
+            Arc::new(PermitFixtureAccountReads),
+        ));
         let mut oauth_state = OAuthState::new(
             &config,
             policy_client,

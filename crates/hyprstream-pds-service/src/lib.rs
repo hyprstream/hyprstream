@@ -13,6 +13,7 @@
 use std::sync::Arc;
 
 use hyprstream_pds::AccountRecord;
+use hyprstream_rpc::auth::mac::{MacDecision, MacDenyReason, SecurityContext};
 use hyprstream_rpc::{EnvelopeContext, Subject};
 use hyprstream_vfs::{Mount, MountError, OREAD};
 use thiserror::Error;
@@ -20,11 +21,14 @@ use thiserror::Error;
 /// Namespace location at which an [`AccountRecordStore`] backing mount is bound.
 pub const PDS_NAMESPACE: &str = "/pds";
 
-const ACCOUNTS_DIRECTORY: &str = "accounts";
-const ACCOUNT_RECORD_FILE: &str = "account-record.cbor";
+/// Directory component containing hosted account records within a tenant.
+pub const PDS_ACCOUNTS_DIRECTORY: &str = "accounts";
+/// Public account-record publication marker.
+pub const PDS_ACCOUNT_RECORD_FILE: &str = "account-record.cbor";
+/// Fixed internal principal allowed to resolve a hosted DID to its tenant.
+pub const OAUTH_ACCOUNT_RESOLVER_SUBJECT: &str = "service:oauth";
 const DEFAULT_MAX_RECORD_BYTES: usize = 64 * 1024;
 const READ_CHUNK_BYTES: usize = 8 * 1024;
-const OAUTH_ACCOUNT_RESOLVER_SUBJECT: &str = "service:oauth";
 
 /// Failure from the mandatory tenant boundary or the PDS record read.
 #[derive(Debug, Error)]
@@ -39,6 +43,12 @@ pub enum AccountReadError {
     InvalidAccountLabel(String),
     #[error("PDS hosted-account tenant resolution denied for {0:?}")]
     UnauthorizedTenantResolver(String),
+    #[error("PDS account read denied for {subject:?} on {object:?}: {reason:?}")]
+    MacDenied {
+        subject: String,
+        object: String,
+        reason: MacDenyReason,
+    },
     #[error("invalid hosted account DID {0:?}")]
     InvalidHostedAccountDid(String),
     #[error("hosted account DID {0:?} is bound to more than one tenant")]
@@ -59,22 +69,52 @@ impl From<MountError> for AccountReadError {
     }
 }
 
+/// Mandatory MAC capability for account-record reads.
+///
+/// Implementations resolve the subject clearance and the trusted label of the
+/// exact canonical `object_id`, apply the lattice floor, and audit every MAC
+/// decision. Input-validation and mount-resolution errors are not policy
+/// decisions; they fail before an object read is attempted. The account store
+/// has no constructor without this capability.
+pub trait AccountRecordReadAuthorizer: Send + Sync {
+    /// Check a read before the store opens or reads the fid bound to
+    /// `object_id`.
+    ///
+    /// `security_context` is derived from the verified request envelope and
+    /// retains its assurance and delegated attenuation. It is `None` only when
+    /// the request had no MAC clearance, or for the fixed OAuth service's
+    /// tenant-index lookup before a hosted-account binding has been resolved.
+    fn check_read(
+        &self,
+        subject: &Subject,
+        verified_tenant: Option<&str>,
+        security_context: Option<&SecurityContext>,
+        object_id: &str,
+    ) -> MacDecision;
+}
+
 /// Read-only account record service over a mount rooted at [`PDS_NAMESPACE`].
 ///
-/// The mount remains responsible for its normal per-operation authorization.
-/// This service adds the cross-tenant invariant: every path begins with the
-/// authority-verified tenant captured by [`Self::scope`].
+/// Every construction requires an [`AccountRecordReadAuthorizer`]. The store
+/// binds the requested canonical name to one fid, MAC-authorizes that exact
+/// name, and only then opens and reads from the same fid.
 #[derive(Clone)]
 pub struct AccountRecordStore {
     pds_mount: Arc<dyn Mount>,
+    read_authorizer: Arc<dyn AccountRecordReadAuthorizer>,
     max_record_bytes: usize,
 }
 
 impl AccountRecordStore {
-    /// Construct a store over the mount bound at `/pds`.
-    pub fn new(pds_mount: Arc<dyn Mount>) -> Self {
+    /// Construct a store over the mount bound at `/pds` and a mandatory MAC
+    /// read capability.
+    pub fn new(
+        pds_mount: Arc<dyn Mount>,
+        read_authorizer: Arc<dyn AccountRecordReadAuthorizer>,
+    ) -> Self {
         Self {
             pds_mount,
+            read_authorizer,
             max_record_bytes: DEFAULT_MAX_RECORD_BYTES,
         }
     }
@@ -97,9 +137,11 @@ impl AccountRecordStore {
 
         Ok(AccountReadScope {
             pds_mount: Arc::clone(&self.pds_mount),
+            read_authorizer: Arc::clone(&self.read_authorizer),
             max_record_bytes: self.max_record_bytes,
             tenant,
             subject,
+            security_context: context.security_context(),
         })
     }
 
@@ -125,20 +167,31 @@ impl AccountRecordStore {
             return Ok(None);
         };
 
-        let tenants = read_directory(self.pds_mount.as_ref(), &[], authority).await?;
+        let tenants = read_directory(
+            self.pds_mount.as_ref(),
+            self.read_authorizer.as_ref(),
+            &[],
+            authority,
+            None,
+            None,
+        )
+        .await?;
         let mut resolved = None;
         for entry in tenants.into_iter().filter(|entry| entry.is_dir) {
             validate_tenant_component(&entry.name)?;
             let components = [
                 entry.name.as_str(),
-                ACCOUNTS_DIRECTORY,
+                PDS_ACCOUNTS_DIRECTORY,
                 label,
-                ACCOUNT_RECORD_FILE,
+                PDS_ACCOUNT_RECORD_FILE,
             ];
             let bytes = match read_file(
                 self.pds_mount.as_ref(),
+                self.read_authorizer.as_ref(),
                 &components,
                 authority,
+                Some(entry.name.as_str()),
+                None,
                 self.max_record_bytes,
             )
             .await
@@ -178,9 +231,11 @@ impl AccountRecordStore {
 /// There is intentionally no method that changes the tenant after creation.
 pub struct AccountReadScope {
     pds_mount: Arc<dyn Mount>,
+    read_authorizer: Arc<dyn AccountRecordReadAuthorizer>,
     max_record_bytes: usize,
     tenant: String,
     subject: Subject,
+    security_context: Option<SecurityContext>,
 }
 
 impl AccountReadScope {
@@ -200,14 +255,17 @@ impl AccountReadScope {
         validate_account_label(label)?;
         let components = [
             self.tenant.as_str(),
-            ACCOUNTS_DIRECTORY,
+            PDS_ACCOUNTS_DIRECTORY,
             label,
-            ACCOUNT_RECORD_FILE,
+            PDS_ACCOUNT_RECORD_FILE,
         ];
         let bytes = match read_file(
             self.pds_mount.as_ref(),
+            self.read_authorizer.as_ref(),
             &components,
             &self.subject,
+            Some(self.tenant.as_str()),
+            self.security_context.as_ref(),
             self.max_record_bytes,
         )
         .await
@@ -278,11 +336,29 @@ fn hosted_account_label(did: &str) -> Result<Option<&str>, AccountReadError> {
 
 async fn read_file(
     mount: &dyn Mount,
+    authorizer: &dyn AccountRecordReadAuthorizer,
     components: &[&str],
     subject: &Subject,
+    verified_tenant: Option<&str>,
+    security_context: Option<&SecurityContext>,
     limit: usize,
 ) -> Result<Vec<u8>, AccountReadError> {
     let mut fid = mount.walk(components, subject).await?;
+    let object_id = canonical_object_id(components);
+    if let MacDecision::Deny(reason) =
+        authorizer.check_read(subject, verified_tenant, security_context, &object_id)
+    {
+        mount.clunk(fid, subject).await;
+        return Err(AccountReadError::MacDenied {
+            subject: subject.to_string(),
+            object: object_id,
+            reason,
+        });
+    }
+
+    // The walk above binds the canonical name to this fid. Authorization is
+    // complete before open/stat/read, and the same fid is consumed below:
+    // there is no partial resolution or post-check re-walk/handle substitution.
     if let Err(error) = mount.open(&mut fid, OREAD, subject).await {
         mount.clunk(fid, subject).await;
         return Err(error.into());
@@ -295,10 +371,24 @@ async fn read_file(
 
 async fn read_directory(
     mount: &dyn Mount,
+    authorizer: &dyn AccountRecordReadAuthorizer,
     components: &[&str],
     subject: &Subject,
+    verified_tenant: Option<&str>,
+    security_context: Option<&SecurityContext>,
 ) -> Result<Vec<hyprstream_vfs::DirEntry>, AccountReadError> {
     let mut fid = mount.walk(components, subject).await?;
+    let object_id = canonical_object_id(components);
+    if let MacDecision::Deny(reason) =
+        authorizer.check_read(subject, verified_tenant, security_context, &object_id)
+    {
+        mount.clunk(fid, subject).await;
+        return Err(AccountReadError::MacDenied {
+            subject: subject.to_string(),
+            object: object_id,
+            reason,
+        });
+    }
     if let Err(error) = mount.open(&mut fid, OREAD, subject).await {
         mount.clunk(fid, subject).await;
         return Err(error.into());
@@ -306,6 +396,13 @@ async fn read_directory(
     let result = mount.readdir(&fid, subject).await.map_err(Into::into);
     mount.clunk(fid, subject).await;
     result
+}
+
+fn canonical_object_id(components: &[&str]) -> String {
+    if components.is_empty() {
+        return PDS_NAMESPACE.to_owned();
+    }
+    format!("{PDS_NAMESPACE}/{}", components.join("/"))
 }
 
 async fn read_open_fid(
@@ -354,6 +451,24 @@ mod tests {
     use hyprstream_vfs::{SyntheticMount, SyntheticNode};
     use rand::rngs::OsRng;
 
+    struct PermitAccountReads;
+
+    impl AccountRecordReadAuthorizer for PermitAccountReads {
+        fn check_read(
+            &self,
+            _subject: &Subject,
+            _verified_tenant: Option<&str>,
+            _security_context: Option<&SecurityContext>,
+            _object_id: &str,
+        ) -> MacDecision {
+            MacDecision::Permit
+        }
+    }
+
+    fn permit_account_reads() -> Arc<dyn AccountRecordReadAuthorizer> {
+        Arc::new(PermitAccountReads)
+    }
+
     fn account_bytes(label: &str, zone: &str) -> Vec<u8> {
         let ed = SigningKey::generate(&mut OsRng);
         let (pq, pq_vk) = ml_dsa_generate_keypair();
@@ -377,10 +492,11 @@ mod tests {
 
     fn tenant_node(label: &str, record: Vec<u8>) -> SyntheticNode {
         SyntheticNode::dir().with_child(
-            ACCOUNTS_DIRECTORY,
+            PDS_ACCOUNTS_DIRECTORY,
             SyntheticNode::dir().with_child(
                 label,
-                SyntheticNode::dir().with_child(ACCOUNT_RECORD_FILE, SyntheticNode::file(record)),
+                SyntheticNode::dir()
+                    .with_child(PDS_ACCOUNT_RECORD_FILE, SyntheticNode::file(record)),
             ),
         )
     }
@@ -395,7 +511,7 @@ mod tests {
                 "beta",
                 tenant_node("alice", account_bytes("alice", "beta.example")),
             );
-        AccountRecordStore::new(Arc::new(SyntheticMount::new(root)))
+        AccountRecordStore::new(Arc::new(SyntheticMount::new(root)), permit_account_reads())
     }
 
     fn context(tenant: &str) -> EnvelopeContext {
@@ -469,10 +585,11 @@ mod tests {
         let root = SyntheticNode::dir()
             .with_child("acme", tenant_node("alice", duplicated.clone()))
             .with_child("beta", tenant_node("alice", duplicated));
-        let ambiguous = AccountRecordStore::new(Arc::new(SyntheticMount::new(root)))
-            .resolve_tenant_for_hosted_did(&oauth_authority(), "did:web:alice.acme.example")
-            .await
-            .unwrap_err();
+        let ambiguous =
+            AccountRecordStore::new(Arc::new(SyntheticMount::new(root)), permit_account_reads())
+                .resolve_tenant_for_hosted_did(&oauth_authority(), "did:web:alice.acme.example")
+                .await
+                .unwrap_err();
         assert!(matches!(
             ambiguous,
             AccountReadError::AmbiguousHostedAccountDid(_)
@@ -522,8 +639,11 @@ mod tests {
     #[tokio::test]
     async fn oversized_and_mislabeled_records_fail_closed() {
         let oversized = SyntheticNode::dir().with_child("acme", tenant_node("alice", vec![0; 32]));
-        let store = AccountRecordStore::new(Arc::new(SyntheticMount::new(oversized)))
-            .with_max_record_bytes(8);
+        let store = AccountRecordStore::new(
+            Arc::new(SyntheticMount::new(oversized)),
+            permit_account_reads(),
+        )
+        .with_max_record_bytes(8);
         let error = store
             .scope(&context("acme"))
             .unwrap()
@@ -536,12 +656,15 @@ mod tests {
             "acme",
             tenant_node("bob", account_bytes("alice", "acme.example")),
         );
-        let error = AccountRecordStore::new(Arc::new(SyntheticMount::new(mislabeled)))
-            .scope(&context("acme"))
-            .unwrap()
-            .get("bob")
-            .await
-            .expect_err("mislabeled record must fail");
+        let error = AccountRecordStore::new(
+            Arc::new(SyntheticMount::new(mislabeled)),
+            permit_account_reads(),
+        )
+        .scope(&context("acme"))
+        .unwrap()
+        .get("bob")
+        .await
+        .expect_err("mislabeled record must fail");
         assert!(matches!(
             error,
             AccountReadError::RecordLabelMismatch { .. }

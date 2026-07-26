@@ -70,6 +70,8 @@ pub mod exchange;
 pub mod genesis;
 pub mod lattice;
 pub mod moq_audit;
+// #1319: audited MAC adapter at the tenant account-record read boundary.
+pub mod pds_pep;
 // #676: the production S3-scope ↔ S5-TE-rule vocabulary (injective + exact;
 // wildcards expand at compile time over a closed registry).
 // #1270: CAS-native MAC PEP — trusted content-bound label at seal +
@@ -120,6 +122,12 @@ pub use genesis::{
     ManifestLabelSource, NamespaceEnumerator, NoManifests, SitePolicy,
 };
 pub use moq_audit::{audited_moq_event_pep, MoqAuditSinkAdapter};
+pub use pds_pep::{
+    production_pds_account_read_authorizer, EnrollmentPdsClearanceSource,
+    PdsAccountObjectLabelResolver, PdsAccountReadPep, PdsClearanceSource,
+};
+#[cfg(not(target_arch = "wasm32"))]
+pub use pds_pep::{production_pds_account_record_store, PdsDirectoryMount};
 // #1270: CAS-native MAC PEP — the shared CAS enforcement contract.
 pub use cas_pep::{
     domain_label, seal_label, CasClearanceSource, CasObjectLabelResolver, CasPep,

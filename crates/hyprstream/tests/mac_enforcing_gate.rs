@@ -602,9 +602,12 @@ async fn t8_atproto_session_credential() -> Result<T8SessionCredential> {
             ),
         ),
     );
-    let hosted_store = Arc::new(hyprstream_pds_service::AccountRecordStore::new(Arc::new(
-        SyntheticMount::new(pds_root),
-    )));
+    let hosted_store = Arc::new(hyprstream_pds_service::AccountRecordStore::new(
+        Arc::new(SyntheticMount::new(pds_root)),
+        hyprstream_core::mac::production_pds_account_read_authorizer(Arc::new(
+            SpyAudit::default(),
+        )),
+    ));
 
     let mut atproto_multikey = vec![0x80, 0x24];
     atproto_multikey.extend_from_slice(
