@@ -47,7 +47,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use axum::{
@@ -60,7 +60,11 @@ use axum::{
     Json,
 };
 use futures::{SinkExt, StreamExt};
-use hyprstream_9p::{AttachAuthorizer, Translator};
+use hyprstream_9p::{
+    Action as NinePAction, AttachAuthorizer, SessionContext, Translator, VerifiedAttach,
+    VerifiedAttachIdentity, VerifiedTokenScope,
+};
+use hyprstream_rpc::auth::mac::{SubjectContextClaims as _, VerifiedKeyMaterial};
 use hyprstream_rpc::transport::quinn_transport::{NinePWtHandler, NinePWtStream};
 use hyprstream_rpc::Subject;
 use hyprstream_vfs::{Mount, MountError, SyntheticMount, SyntheticNode};
@@ -273,7 +277,7 @@ pub async fn ninep_ws(
         }
     };
 
-    let subject =
+    let verified =
         match validate_ticket(&state, ticket, &headers, PLANE_WS, ROOT_NAMESPACE_PATH).await {
             Ok(s) => s,
             Err(reason) => {
@@ -282,18 +286,23 @@ pub async fn ninep_ws(
             }
         };
 
-    let mount = build_export_mount(&state, &subject);
-    // #1269: install the full ReferenceMonitor — the anonymous_floor() fallback
-    // is unreachable from this production constructor. Fail-closed until #698
-    // wires clearance issuance and the S6 token path mints a sender-bound token.
-    let monitor = crate::mac::enrollment_ninep_reference_monitor(Arc::clone(
-        &state.ninep_decider,
-    ));
+    let mount = build_export_mount(&state, verified.subject());
+    // Install the full monitor with the same VerifiedAttach bundle already
+    // derived from the mount ticket. The operator control starts floor-only.
+    let monitor = crate::mac::production_ninep_reference_monitor(
+        Arc::clone(&state.ninep_decider),
+        Arc::new(PreverifiedAttachAuthorizer(verified.clone())),
+    );
     // `from_mount` wraps the Subject-scoped mount in a `MountBackend` and threads
     // `subject` onto every backend op — the same seam UDS/vsock use.
     let translator = Arc::new(
-        Translator::from_mount(mount, subject, Arc::clone(&state.ninep_decider))
-            .with_reference_monitor(monitor),
+        Translator::from_mount(
+            mount,
+            verified.subject().clone(),
+            Arc::clone(&state.ninep_decider),
+        )
+        .with_reference_monitor(monitor)
+        .with_activation_control(),
     );
 
     // No subprotocol negotiation: stock wanix connects with none.
@@ -316,7 +325,7 @@ async fn validate_ticket(
     _headers: &HeaderMap,
     plane: &str,
     namespace_path: &str,
-) -> Result<Subject, &'static str> {
+) -> Result<VerifiedAttach, &'static str> {
     verify_mount_ticket(state, ticket, plane, namespace_path).await
 }
 
@@ -331,7 +340,7 @@ async fn verify_mount_ticket(
     ticket: &str,
     plane: &str,
     namespace_path: &str,
-) -> Result<Subject, &'static str> {
+) -> Result<VerifiedAttach, &'static str> {
     let claims = crate::server::middleware::verify_token_claims(state, ticket).await?;
     if !crate::services::oauth::mount_ticket::is_mount_ticket_for(&claims, plane, namespace_path) {
         return Err("token is not valid for this 9P plane/path");
@@ -360,7 +369,72 @@ async fn verify_mount_ticket(
     ) {
         return Err("mount ticket already used");
     }
-    Ok(subject)
+    verified_attach_from_claims(claims, subject)
+}
+
+const NINEP_ALL_ACTIONS: &[NinePAction] = &[
+    NinePAction::Attach,
+    NinePAction::Walk,
+    NinePAction::Open,
+    NinePAction::Read,
+    NinePAction::Write,
+    NinePAction::Getattr,
+    NinePAction::Readdir,
+];
+
+fn verified_attach_from_claims(
+    claims: hyprstream_rpc::auth::Claims,
+    subject: Subject,
+) -> Result<VerifiedAttach, &'static str> {
+    let tenant = claims
+        .tenant
+        .as_deref()
+        .filter(|tenant| !tenant.is_empty() && *tenant != "*")
+        .ok_or("mount ticket missing authority-bound tenant")?;
+    // The ticket signature has just been verified by the local authority.
+    // Assurance is Classical unless an attach-specific subject key proof is
+    // added; the clearance claim cannot upgrade it.
+    let security_context = claims
+        .security_context(VerifiedKeyMaterial::Classical)
+        .ok_or("mount ticket missing verified Claims clearance")?;
+    let valid_for = (claims.exp - chrono::Utc::now().timestamp()).max(0) as u64;
+    if valid_for == 0 {
+        return Err("mount ticket expired");
+    }
+    let identity =
+        VerifiedAttachIdentity::from_verified_credential(claims.sub.clone(), tenant.to_owned());
+    let scope = VerifiedTokenScope::from_verified_token(
+        *security_context.clearance(),
+        Arc::from(NINEP_ALL_ACTIONS),
+        Instant::now() + Duration::from_secs(valid_for),
+    );
+    let session = SessionContext::from_verified_token(identity.clone(), security_context, scope);
+    let verified = VerifiedAttach::try_new(identity, subject, session)
+        .map_err(|_| "verified attach binding failed")?;
+    // Seed the direct VFS PEP from the same verified Claims that produced the
+    // unified bundle. The VFS Subject can never acquire authority from uname.
+    hyprstream_rpc::auth::mac::remember_verified_claims(
+        verified.subject(),
+        &claims,
+        VerifiedKeyMaterial::Classical,
+        Some(tenant),
+    );
+    Ok(verified)
+}
+
+#[derive(Clone)]
+struct PreverifiedAttachAuthorizer(VerifiedAttach);
+
+#[async_trait]
+impl AttachAuthorizer for PreverifiedAttachAuthorizer {
+    async fn authenticate(&self, _uname: &str, aname: &str) -> Result<VerifiedAttach, MountError> {
+        if aname_to_namespace_path(aname)? != ROOT_NAMESPACE_PATH {
+            return Err(MountError::PermissionDenied(
+                "preverified ticket is not valid for requested export".to_owned(),
+            ));
+        }
+        Ok(self.0.clone())
+    }
 }
 
 /// Build the Subject-scoped VFS [`Mount`] exported as the 9P root.
@@ -526,7 +600,7 @@ struct TicketAttachAuthorizer {
 
 #[async_trait]
 impl AttachAuthorizer for TicketAttachAuthorizer {
-    async fn authorize(&self, uname: &str, aname: &str) -> Result<Subject, MountError> {
+    async fn authenticate(&self, uname: &str, aname: &str) -> Result<VerifiedAttach, MountError> {
         if uname.is_empty() {
             return Err(MountError::PermissionDenied(
                 "missing mount ticket".to_owned(),
@@ -544,7 +618,7 @@ impl AttachAuthorizer for TicketAttachAuthorizer {
         // (#877/#1071 fail-closed contract).
         let requested_ns = aname_to_namespace_path(aname)?;
         match verify_mount_ticket(&self.state, uname, PLANE_WEBTRANSPORT, &requested_ns).await {
-            Ok(subject) => Ok(subject),
+            Ok(verified) => Ok(verified),
             Err(reason) => {
                 warn!(reason, aname = %aname, "9P WT attach rejected: invalid mount ticket or export");
                 Err(MountError::PermissionDenied(reason.to_owned()))
@@ -572,7 +646,11 @@ fn aname_to_namespace_path(aname: &str) -> Result<String, MountError> {
     if aname.is_empty() {
         return Ok(ROOT_NAMESPACE_PATH.to_owned());
     }
-    let anchored = if aname.starts_with('/') { aname.to_owned() } else { format!("/{aname}") };
+    let anchored = if aname.starts_with('/') {
+        aname.to_owned()
+    } else {
+        format!("/{aname}")
+    };
     crate::services::oauth::mount_ticket::normalize_namespace_path(&anchored).ok_or_else(|| {
         MountError::PermissionDenied(format!("malformed aname (export selector): {aname:?}"))
     })
@@ -611,20 +689,20 @@ impl NinePWtHandler for NinePWtExport {
         let authorizer: Arc<dyn AttachAuthorizer> = Arc::new(TicketAttachAuthorizer {
             state: self.state.clone(),
         });
-        // #1269: install the full ReferenceMonitor (fail-closed until #698 +
-        // S6). The `from_mount_authorized` seam binds the Subject at Tattach
-        // from the ticket; the MAC monitor independently derives the session
-        // context for the token/IFC gates.
-        let monitor = crate::mac::enrollment_ninep_reference_monitor(Arc::clone(
-            &self.state.ninep_decider,
-        ));
+        // Install the full monitor. `from_mount_authorized` and the MAC path
+        // consume the exact same VerifiedAttach result from one ticket check.
+        let monitor = crate::mac::production_ninep_reference_monitor(
+            Arc::clone(&self.state.ninep_decider),
+            Arc::clone(&authorizer) as Arc<dyn hyprstream_9p::AttachAuthenticator>,
+        );
         let translator = Arc::new(
             Translator::from_mount_authorized(
                 mount,
                 authorizer,
                 Arc::clone(&self.state.ninep_decider),
             )
-            .with_reference_monitor(monitor),
+            .with_reference_monitor(monitor)
+            .with_activation_control(),
         );
         if let Err(e) = translator.serve_connection(stream).await {
             debug!(error = %e, "9P WT serve loop ended with error");

@@ -57,6 +57,8 @@
 
 use std::sync::Arc;
 
+use anyhow::Context as _;
+use ed25519_dalek::SigningKey;
 use hyprstream_rpc::auth::mac::{
     MacDecision, MacDenyReason, RpcObjectLabelResolver, SecurityContext, SecurityLabel,
 };
@@ -207,6 +209,24 @@ impl CasClearanceSource for DenyAllClearanceSource {
         _verified_tenant: Option<&str>,
     ) -> Option<SecurityContext> {
         None
+    }
+}
+
+/// Production CAS clearance source backed only by contexts derived from
+/// verified `Claims × VerifiedKeyMaterial` at an RPC/attach boundary.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct VerifiedClaimsCasClearanceSource;
+
+impl CasClearanceSource for VerifiedClaimsCasClearanceSource {
+    fn clearance_for(
+        &self,
+        subject_id: &str,
+        verified_tenant: Option<&str>,
+    ) -> Option<SecurityContext> {
+        hyprstream_rpc::auth::mac::subject_context(
+            &Subject::new(subject_id.to_owned()),
+            verified_tenant,
+        )
     }
 }
 
@@ -440,6 +460,43 @@ impl crate::storage::cas::CasMountAuthorizer for MacCasAuthorizer {
             )))
         }
     }
+}
+
+/// Assemble the production CAS PEP from verified subject contexts and a
+/// tamper-evident signed WAL.  Failure to obtain either signing key aborts the
+/// production constructor; it never substitutes the test-only null sink.
+pub async fn production_cas_pep(
+    signing_key: SigningKey,
+    oauth: &crate::config::OAuthConfig,
+    audit_stream: &str,
+) -> anyhow::Result<Arc<CasPep>> {
+    anyhow::ensure!(
+        !audit_stream.is_empty()
+            && audit_stream
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_'),
+        "invalid CAS MAC audit stream name"
+    );
+    let secrets_dir = crate::config::HyprConfig::resolve_secrets_dir()?;
+    let ml_dsa_store = crate::auth::key_rotation::global_ml_dsa_key_store(&secrets_dir, oauth);
+    let signer = crate::mac::audit::cose::OwnedCoseAuditSigner::new(
+        Arc::new(signing_key),
+        ml_dsa_store.active_key().await,
+        hyprstream_rpc::envelope::mandatory_envelope_policy(),
+    );
+    anyhow::ensure!(
+        signer.can_sign(),
+        "CAS MAC PEP audit signer unavailable under mandatory Hybrid policy"
+    );
+    let audit_store = crate::mac::audit::WalAuditStore::open(
+        secrets_dir.join("mac-audit").join(audit_stream),
+        signer,
+    )
+    .context("open CAS MAC audit store")?;
+    Ok(Arc::new(CasPep::new(
+        Arc::new(VerifiedClaimsCasClearanceSource),
+        Arc::new(audit_store),
+    )))
 }
 
 // ────────────────────────────────────────────────────────────────────────────

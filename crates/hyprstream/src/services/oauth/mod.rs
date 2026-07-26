@@ -1328,6 +1328,7 @@ mod tests {
     /// a real in-process PolicyService.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn oauth_handler_atproto_and_legacy_conformance() -> anyhow::Result<()> {
+        crate::mac::install_explicit_test_dispatch_pep();
         use base64::{
             engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
             Engine as _,
@@ -1646,6 +1647,13 @@ mod tests {
             token_exchange::ATPROTO_EXCHANGE_NSID,
             "demo-1119-jti",
         )?;
+        let exchange_dpop_key = p256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
+        let exchange_dpop = dpop_proof(
+            &exchange_dpop_key,
+            &format!("{ISSUER}/xrpc/ai.hyprstream.identity.exchangeUcan"),
+            "demo-1119-exchange-dpop",
+            None,
+        );
         use tower::ServiceExt as _;
         let exchange_request = |jwt: &str, tenant: &str| {
             axum::http::Request::post("/xrpc/ai.hyprstream.identity.exchangeUcan")
@@ -1654,6 +1662,7 @@ mod tests {
                     axum::http::header::AUTHORIZATION,
                     format!("Bearer {jwt}"),
                 )
+                .header("DPoP", &exchange_dpop)
                 .body(axum::body::Body::from(
                     serde_json::json!({
                         "tenant": tenant,

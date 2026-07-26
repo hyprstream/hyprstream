@@ -7,10 +7,10 @@
 use std::sync::Arc;
 
 use axum::{
-    Extension, Json,
     extract::State,
-    http::{HeaderMap, StatusCode, header},
+    http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
+    Extension, Json,
 };
 use hyprstream_pds::repo_authority::is_path_form_did_web;
 use serde::{Deserialize, Serialize};
@@ -121,10 +121,41 @@ pub async fn issue_mount_ticket(
             );
         }
     };
+    // `AuthenticatedUser.token` is populated only after the resource
+    // middleware verifies the source JWT. Re-read its signed authorization
+    // attributes and bind them to the already-verified subject/tenant; never
+    // manufacture clearance from the Subject string.
+    let source_claims = match user
+        .token
+        .as_deref()
+        .and_then(|token| hyprstream_rpc::auth::decode_unverified(token).ok())
+    {
+        Some(claims)
+            if claims.sub == user.user
+                && claims.tenant.as_deref() == user.verified_tenant.as_deref() =>
+        {
+            claims
+        }
+        _ => {
+            return oauth_error(
+                StatusCode::FORBIDDEN,
+                "insufficient_scope",
+                Some("verified source Claims required for MAC-bound mount ticket"),
+            );
+        }
+    };
+    let Some(clearance) = source_claims.clearance else {
+        return oauth_error(
+            StatusCode::FORBIDDEN,
+            "insufficient_scope",
+            Some("source credential has no authority-stamped MAC clearance"),
+        );
+    };
     let mut claims = hyprstream_rpc::auth::Claims::new(user.user.clone(), now, exp)
         .with_issuer(state.issuer_url.clone())
         .with_audience(Some(audience.clone()))
-        .with_cap(capability.clone());
+        .with_cap(capability.clone())
+        .with_clearance(clearance);
     if domain != "*" {
         claims = claims.with_tenant(domain);
     }
@@ -168,14 +199,16 @@ mod freeze_tests {
     fn test_state() -> Arc<OAuthState> {
         let key = ed25519_dalek::SigningKey::from_bytes(&[0x75; 32]);
         let dummy = std::path::PathBuf::from("/dev/null/mount-ticket-freeze-test.sock");
-        let make_client = || Arc::new(
-            RpcClientImpl::new(
-                LocalSigner::new(key.clone()),
-                LazyUdsTransport::new(dummy.clone()),
-                Some(key.verifying_key()),
+        let make_client = || {
+            Arc::new(
+                RpcClientImpl::new(
+                    LocalSigner::new(key.clone()),
+                    LazyUdsTransport::new(dummy.clone()),
+                    Some(key.verifying_key()),
+                )
+                .with_response_verify_policy(hyprstream_rpc::crypto::CryptoPolicy::Classical),
             )
-            .with_response_verify_policy(hyprstream_rpc::crypto::CryptoPolicy::Classical),
-        );
+        };
         Arc::new(
             OAuthState::new(
                 &OAuthConfig::default(),
@@ -215,12 +248,26 @@ mod freeze_tests {
 
     #[tokio::test]
     async fn mount_ticket_allows_ordinary_authenticated_user() {
+        let source = hyprstream_rpc::auth::Claims::new(
+            "alice".to_owned(),
+            chrono::Utc::now().timestamp(),
+            chrono::Utc::now().timestamp() + 300,
+        )
+        .with_issuer(test_state().issuer_url.clone())
+        .with_tenant("tenant-a.example".to_owned())
+        .with_clearance(hyprstream_rpc::auth::mac::SecurityLabel::new(
+            hyprstream_rpc::auth::mac::Level::Secret,
+            hyprstream_rpc::auth::mac::Assurance::Classical,
+            hyprstream_rpc::auth::mac::CompartmentSet::EMPTY,
+        ));
+        let source_token =
+            crate::auth::jwt::encode(&source, &ed25519_dalek::SigningKey::from_bytes(&[0x75; 32]));
         let response = issue_mount_ticket(
             State(test_state()),
             Extension(AuthenticatedUser {
                 user: "alice".to_owned(),
                 verified_tenant: Some("tenant-a.example".to_owned()),
-                token: None,
+                token: Some(source_token),
                 exp: None,
             }),
             HeaderMap::new(),
@@ -240,6 +287,7 @@ mod freeze_tests {
         )
         .unwrap();
         assert_eq!(claims.tenant.as_deref(), Some("tenant-a.example"));
+        assert_eq!(claims.clearance, source.clearance);
     }
 }
 

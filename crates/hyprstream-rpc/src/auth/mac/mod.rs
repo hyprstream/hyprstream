@@ -102,6 +102,8 @@
 //!    fail-closed, which is correct. No type change needed when #153 lands —
 //!    it's a new compartment/level value, not a new axis.
 
+#[cfg(not(target_arch = "wasm32"))]
+pub mod activation;
 pub mod bind;
 pub mod context;
 // #1268: the mandatory RPC dispatch PEP — fail-closed gate between
@@ -118,6 +120,14 @@ pub mod lattice;
 pub mod manifest;
 pub mod pep;
 
+#[cfg(not(target_arch = "wasm32"))]
+pub use activation::{
+    anonymous_floor, block_identity_widening_for_unverified_attach_transport,
+    flush_verified_subject_cache_generation, global_mac_activation_control,
+    remember_verified_claims, remember_verified_subject, revoke_verified_subject_jti,
+    subject_context, MacActivationControl, MacActivationError, MacActivationEvidence,
+    MacActivationMode,
+};
 pub use bind::{clamp_descendant, BindLabel, BindLabelMap};
 pub use context::{SecurityContext, SubjectContextClaims, VerifiedKeyMaterial};
 #[cfg(not(target_arch = "wasm32"))]

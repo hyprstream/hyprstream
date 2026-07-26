@@ -306,10 +306,19 @@ pub async fn handle_shell_tui(
     // `/srv/registry` (+ `/worktree` alias) — the TUI ChatApp builder does
     // not currently have one and omits it.
     let vfs_ns: std::sync::Arc<hyprstream_vfs::Namespace> = {
+        let config = crate::config::HyprConfig::load().unwrap_or_default();
+        let pep = crate::mac::production_vfs_pep(
+            signing_key.clone(),
+            &config.oauth,
+            "vfs-shell",
+        )
+        .await
+        .context("construct shell VFS MAC PEP")?;
         let ns = crate::services::build_standard_namespace(crate::services::StandardNamespaceConfig {
             subject: vfs_subject.clone(),
             model_client: model_client.clone(),
             registry: Some(Clone::clone(&registry)),
+            pep: Some(pep),
             model_path: "/srv/model".to_owned(),
             registry_path: "/srv/registry".to_owned(),
             worktree_path: "/worktree".to_owned(),

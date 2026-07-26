@@ -108,6 +108,38 @@ pub use te::{
     Action, Decision, LatticeTeEvaluator, ObjectCtx, ObjectType, ScopeAction, SubjectCtx,
     SubjectType, TeEvaluator, TeMatrix, TeRule,
 };
+
+/// Install the mandatory RPC-dispatch PEP in its activation-ready, floor-only
+/// state.  The coverage-gated operator control selects identity-aware contexts;
+/// installing this monitor does not perform that widening.
+pub fn install_production_rpc_dispatch_pep() {
+    let resolver = GenesisGate::production().into_resolver();
+    hyprstream_rpc::auth::mac::install_mac_dispatch_pep(std::sync::Arc::new(
+        hyprstream_rpc::auth::mac::DefaultMacDispatchPep::new(Box::new(resolver))
+            .with_activation_control(),
+    ));
+}
+
+/// Explicit permit fixture for unit tests that exercise service plumbing
+/// rather than MAC policy. Production's uninstalled dispatch state still
+/// denies at rest.
+#[cfg(test)]
+pub(crate) fn install_explicit_test_dispatch_pep() {
+    struct ExplicitTestPep;
+
+    impl hyprstream_rpc::auth::mac::MacDispatchPep for ExplicitTestPep {
+        fn check(
+            &self,
+            _ctx: &hyprstream_rpc::service::EnvelopeContext,
+            _service_domain: &str,
+            _method: Option<u16>,
+        ) -> hyprstream_rpc::auth::mac::MacDecision {
+            hyprstream_rpc::auth::mac::MacDecision::Permit
+        }
+    }
+
+    hyprstream_rpc::auth::mac::install_mac_dispatch_pep(std::sync::Arc::new(ExplicitTestPep));
+}
 // S5 (#571): the UCAN→TE policy compiler — compile a validated grant into a
 // CompiledPolicy, verify it grants no privilege beyond the grant, and sign it
 // (fail-closed). Lives here (not `hyprstream-rpc`) because it needs both the UCAN
@@ -121,7 +153,10 @@ pub use genesis::{
     floor_label, genesis_lattice, CompositeObjectLabelResolver, GeneratedNodeCoverage, GenesisGate,
     ManifestLabelSource, NamespaceEnumerator, NoManifests, SitePolicy,
 };
-pub use moq_audit::{audited_moq_event_pep, MoqAuditSinkAdapter};
+pub use moq_audit::{
+    audited_moq_event_pep, production_moq_event_pep, MoqAuditSinkAdapter,
+    VerifiedClaimsMoqClearanceSource,
+};
 pub use pds_pep::{
     production_pds_account_read_authorizer, EnrollmentPdsClearanceSource,
     PdsAccountObjectLabelResolver, PdsAccountReadPep, PdsClearanceSource,
@@ -130,13 +165,13 @@ pub use pds_pep::{
 pub use pds_pep::{production_pds_account_record_store, PdsDirectoryMount};
 // #1270: CAS-native MAC PEP — the shared CAS enforcement contract.
 pub use cas_pep::{
-    domain_label, seal_label, CasClearanceSource, CasObjectLabelResolver, CasPep,
-    DenyAllClearanceSource, MacCasAuthorizer,
+    domain_label, production_cas_pep, seal_label, CasClearanceSource, CasObjectLabelResolver,
+    CasPep, DenyAllClearanceSource, MacCasAuthorizer, VerifiedClaimsCasClearanceSource,
 };
 pub use pep::{
     enrollment_ninep_reference_monitor, production_ninep_decider,
-    production_ninep_reference_monitor, production_vfs_pep, DenyUnenrolledSubjects,
-    EnrollmentClearanceSource, NinePAccessDecider, NinePClearanceSource,
+    production_ninep_reference_monitor, production_vfs_pep, EnrollmentClearanceSource,
+    NinePAccessDecider, NinePClearanceSource, VerifiedClaimsSubjects,
     VerifiedClearanceSessionFactory, VfsAccessDecider,
 };
 // S4 (#570): the boot path that installs the verified `CompiledPolicy` at daemon

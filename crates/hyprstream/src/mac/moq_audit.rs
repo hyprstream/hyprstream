@@ -8,10 +8,13 @@
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use anyhow::Context as _;
+use ed25519_dalek::SigningKey;
 use hyprstream_rpc::auth::mac::{
     ClearanceSource, MacDenyReason, MoqEventAction, MoqEventPep, MoqMacAuditReason,
     MoqMacAuditRecord, MoqMacAuditSink, RpcObjectLabelResolver, SecurityLabel,
 };
+use hyprstream_rpc::envelope::Subject;
 
 use crate::mac::audit::{AuditRecord, AuditSink, DecisionReason};
 use crate::mac::te::{Action, Decision, ObjectType, ScopeAction, SubjectType};
@@ -77,6 +80,55 @@ pub fn audited_moq_event_pep(
         clearance,
         Arc::new(MoqAuditSinkAdapter::new(sink)),
     )
+}
+
+/// Assemble the production MoQ/event PEP from the genesis resolver, verified
+/// subject contexts, and the mandatory signed audit WAL.
+pub async fn production_moq_event_pep(
+    signing_key: SigningKey,
+    oauth: &crate::config::OAuthConfig,
+    audit_stream: &str,
+) -> anyhow::Result<MoqEventPep> {
+    anyhow::ensure!(
+        !audit_stream.is_empty()
+            && audit_stream
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_'),
+        "invalid MoQ MAC audit stream name"
+    );
+    let secrets_dir = crate::config::HyprConfig::resolve_secrets_dir()?;
+    let ml_dsa_store = crate::auth::key_rotation::global_ml_dsa_key_store(&secrets_dir, oauth);
+    let signer = crate::mac::audit::cose::OwnedCoseAuditSigner::new(
+        Arc::new(signing_key),
+        ml_dsa_store.active_key().await,
+        hyprstream_rpc::envelope::mandatory_envelope_policy(),
+    );
+    anyhow::ensure!(
+        signer.can_sign(),
+        "MoQ MAC PEP audit signer unavailable under mandatory Hybrid policy"
+    );
+    let audit_store = crate::mac::audit::WalAuditStore::open(
+        secrets_dir.join("mac-audit").join(audit_stream),
+        signer,
+    )
+    .context("open MoQ MAC audit store")?;
+    let resolver = crate::mac::GenesisGate::production().into_resolver();
+    Ok(audited_moq_event_pep(
+        Arc::new(resolver),
+        Arc::new(VerifiedClaimsMoqClearanceSource),
+        Arc::new(audit_store),
+    ))
+}
+
+/// Event/MoQ subject resolver backed by the same verified-Claims cache as the
+/// direct VFS and CAS PEPs.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct VerifiedClaimsMoqClearanceSource;
+
+impl ClearanceSource for VerifiedClaimsMoqClearanceSource {
+    fn clearance(&self, subject: &Subject) -> Option<hyprstream_rpc::auth::mac::SecurityContext> {
+        hyprstream_rpc::auth::mac::subject_context(subject, None)
+    }
 }
 
 const fn audit_action(action: MoqEventAction) -> Action {
@@ -170,10 +222,7 @@ mod tests {
         assert_eq!(records[0].reason, DecisionReason::UnlabeledObject);
         assert_eq!(records[0].subject_type, SubjectType(u32::MAX - 4));
         assert_eq!(records[0].object_type, ObjectType(u32::MAX - 4));
-        assert_eq!(
-            records[0].subject_id.as_deref(),
-            Some("did:web:tenant-a")
-        );
+        assert_eq!(records[0].subject_id.as_deref(), Some("did:web:tenant-a"));
         assert_eq!(
             records[0].object_id.as_deref(),
             Some("tenant-b/events/private")

@@ -341,6 +341,9 @@ pub struct RegistryService {
     /// fail-closed XET `getBlob` gate (#436 / #509). Pointer presence is
     /// necessary-but-not-sufficient: entitlement requires a provenance record.
     xet_provenance: Arc<XetProvenanceStore>,
+    /// Per-read CAS MAC PEP, production-wired to verified subject contexts and
+    /// a signed WAL.
+    cas_pep: Arc<crate::mac::CasPep>,
     /// Publishes/advances a repo's `ai.hyprstream.model` PDS record on
     /// register + commit (#910a). `None` means this node has no PDS
     /// configured — register/commit proceed exactly as before.
@@ -427,6 +430,7 @@ impl RegistryService {
             expected_audience: None,
             jwt_key_source: None,
             xet_provenance,
+            cas_pep: Arc::new(crate::mac::CasPep::fail_closed()),
             pds_publisher: None,
         };
 
@@ -481,6 +485,12 @@ impl RegistryService {
         src: std::sync::Arc<dyn hyprstream_rpc::auth::JwtKeySource>,
     ) -> Self {
         self.jwt_key_source = Some(src);
+        self
+    }
+
+    /// Install the production CAS PEP used by streaming continuations.
+    pub fn with_cas_pep(mut self, pep: Arc<crate::mac::CasPep>) -> Self {
+        self.cas_pep = pep;
         self
     }
 
@@ -1082,6 +1092,7 @@ impl RegistryService {
             announced_at: stream_ctx.reach(),
             ..Default::default()
         };
+        let cas_pep = Arc::clone(&self.cas_pep);
 
         let continuation: hyprstream_rpc::service::Continuation = Box::pin(async move {
             Self::execute_get_blob_stream(
@@ -1090,6 +1101,7 @@ impl RegistryService {
                 address,
                 subject_id,
                 verified_tenant,
+                cas_pep,
             )
             .await;
         });
@@ -1111,6 +1123,7 @@ impl RegistryService {
         address: String,
         subject_id: String,
         verified_tenant: Option<String>,
+        cas_pep: Arc<crate::mac::CasPep>,
     ) {
         // 64 KiB publish frames — bound per-message size for GB-scale weights.
         const CHUNK: usize = 64 * 1024;
@@ -1127,9 +1140,8 @@ impl RegistryService {
                 // clearance BEFORE reading any bytes. Fail-closed: a deny
                 // produces zero bytes of output.
                 let resolver = crate::mac::CasObjectLabelResolver::from_domain(&domain);
-                let pep = crate::mac::cas_pep::CasPep::fail_closed();
                 let decision =
-                    pep.check_read(&subject_id, verified_tenant.as_deref(), &resolver);
+                    cas_pep.check_read(&subject_id, verified_tenant.as_deref(), &resolver);
                 if !decision.is_permit() {
                     tracing::warn!(
                         target: "hyprstream.mac.cas_pep",
@@ -3530,6 +3542,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_registry_service_health_check() {
+        crate::mac::install_explicit_test_dispatch_pep();
         use hyprstream_service::InprocManager;
         use hyprstream_rpc::transport::TransportConfig;
 
@@ -3605,6 +3618,7 @@ mod tests {
 
     #[tokio::test]
     async fn registry_rpc_is_live_at9p_candidate_boundary() {
+        crate::mac::install_explicit_test_dispatch_pep();
         use hyprstream_pds::at9p_sign::{sign_capsule, sign_update_record};
         use hyprstream_service::InprocManager;
         const NOW: &str = "2026-07-16T12:00:00Z";

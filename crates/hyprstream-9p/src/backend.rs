@@ -13,6 +13,7 @@
 
 use async_trait::async_trait;
 
+use crate::mac_seam::VerifiedAttach;
 use crate::msg::Qid;
 
 /// Result of a walk: the qid of the resolved path and, for directories, the
@@ -77,8 +78,13 @@ pub trait Backend: Send + Sync {
     /// Returning `Err` fails the attach; the translator maps it to an `Rlerror`
     /// errno (a `hyprstream_vfs::MountError` in the cause chain picks the errno
     /// — e.g. `PermissionDenied → EACCES`).
-    async fn attach(&self, _uname: &str, _aname: &str) -> anyhow::Result<()> {
-        Ok(())
+    async fn attach(
+        &self,
+        _uname: &str,
+        _aname: &str,
+        verified: Option<VerifiedAttach>,
+    ) -> anyhow::Result<Option<VerifiedAttach>> {
+        Ok(verified)
     }
 
     /// Walk `components` from `fid` (the previously-walked parent, or the

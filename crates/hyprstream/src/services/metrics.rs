@@ -669,6 +669,7 @@ mod tests {
     async fn start_metrics_service(
         tag: &str,
     ) -> (MetricsClient, InprocManager) {
+        crate::mac::install_explicit_test_dispatch_pep();
         // Tests use Classical (EdDSA-only) keys — install Classical verify
         // policy on both the request and response arms so the global
         // fail-closed Hybrid defaults don't reject them.

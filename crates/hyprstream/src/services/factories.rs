@@ -422,8 +422,25 @@ fn spawn_jwt_renewal_task(
 /// no forwarding proxy or thread is needed. The returned service just holds the
 /// shutdown barrier so the orchestrator tracks lifecycle correctly.
 #[service_factory("event")]
-fn create_event_service(_ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>> {
+fn create_event_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>> {
     info!("Creating EventService (moq-lite event bus)");
+
+    if !hyprstream_rpc::events::event_authz_installed() {
+        let config = load_config();
+        let sk = ctx.service_signing_key("event");
+        let pep = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(crate::mac::production_moq_event_pep(
+                sk,
+                &config.oauth,
+                "moq-event",
+            ))
+        })
+        .context("construct MoQ/event MAC PEP")?;
+        hyprstream_rpc::events::install_event_authz(Arc::new(
+            hyprstream_rpc::events::MacEventAuthz::new(pep),
+        ))
+        .map_err(anyhow::Error::msg)?;
+    }
 
     let origin = MoqEventOrigin::new();
     hyprstream_rpc::moq_event::init_global_moq_event_origin(origin.clone());
@@ -800,12 +817,21 @@ fn create_registry_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawn
     // Create registry service with infrastructure (blocking since we're in sync context)
     let mut registry_service = tokio::task::block_in_place(|| {
         let rt = tokio::runtime::Handle::current();
-        rt.block_on(RegistryService::new(
-            ctx.models_dir(),
-            policy_client,
-            ctx.transport("registry", SocketKind::Rep),
-            sk.clone(),
-        ))
+        rt.block_on(async {
+            let cas_pep = crate::mac::production_cas_pep(sk.clone(), &config.oauth, "cas-registry")
+                .await
+                .context("construct registry CAS MAC PEP")?;
+            Ok::<_, anyhow::Error>(
+                RegistryService::new(
+                    ctx.models_dir(),
+                    policy_client,
+                    ctx.transport("registry", SocketKind::Rep),
+                    sk.clone(),
+                )
+                .await?
+                .with_cas_pep(cas_pep),
+            )
+        })
     })?;
     if let Some(issuer) = ctx.oauth_issuer_url() {
         registry_service = registry_service.with_expected_audience(issuer.to_owned());
@@ -1103,10 +1129,19 @@ fn create_worker_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
     })
     .context("construct worker 9P MAC PEP")?;
 
-    // #1269: install the full ReferenceMonitor — fail-closed until #698 + S6.
-    let ninep_monitor = Some(crate::mac::enrollment_ninep_reference_monitor(
-        Arc::clone(&ninep_decider),
-    ));
+    // Fixed-subject worker transports keep the mandatory monitor and floor
+    // context. Identity-aware widening remains blocked until those transports
+    // have a credential-bearing attach carrier (G2 evidence).
+    // The worker UDS/vsock carrier still has no verified attach credential.
+    // Make that runtime fact a structural G2 blocker: operator evidence cannot
+    // widen this process until the constructor is replaced with a credentialed
+    // authenticator.
+    hyprstream_rpc::auth::mac::block_identity_widening_for_unverified_attach_transport(
+        "worker-uds-vsock",
+    );
+    let ninep_monitor = Some(crate::mac::enrollment_ninep_reference_monitor(Arc::clone(
+        &ninep_decider,
+    )));
 
     // Resolve + construct the backend fail-closed against the inventory registry
     // (config-driven by name; explicit requests are authoritative, missing
@@ -1309,15 +1344,24 @@ fn create_xet_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
         federation_resolver,
         jti_blocklist,
     );
+    let cas_pep = tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current().block_on(crate::mac::production_cas_pep(
+            sk.clone(),
+            &config.oauth,
+            "cas-xet",
+        ))
+    })
+    .context("construct Xet CAS MAC PEP")?;
 
     let state = XetState {
         // Reads share the same L1 CAS substrate the registry's getBlob uses (#812).
         store: crate::storage::CasSubstrate::from_env(),
         registry: Some(registry_client),
         auth,
-        // #1270: an explicitly installed PEP is fail-closed until an
-        // authority-backed CAS clearance adapter is configured.
-        cas_authorizer: Arc::new(crate::mac::MacCasAuthorizer::fail_closed()),
+        // T8: the production CAS hook resolves only contexts remembered from
+        // verified Claims × VerifiedKeyMaterial.  The activation control keeps
+        // that source at anonymous_floor until an operator widens it.
+        cas_authorizer: Arc::new(crate::mac::MacCasAuthorizer::new(cas_pep)),
     };
 
     let xet_service = XetService::new(
@@ -1934,8 +1978,17 @@ fn create_tui_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
     let policy_client =
         PolicyClient::for_local_bootstrap(sk.clone(), policy_vk, service_token(&sk))?;
 
-    // Build VFS namespace for ChatApps spawned via TUI RPC.
-    let (vfs_ns, vfs_subject) = crate::tui::vfs::build_chat_vfs_namespace(&sk)?;
+    // Build the direct-VFS PEP before exposing the namespace. Failure to open
+    // its signed WAL aborts construction; there is no unarmed fallback.
+    let vfs_pep = tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current().block_on(crate::mac::production_vfs_pep(
+            sk.clone(),
+            &config.oauth,
+            "vfs-tui",
+        ))
+    })
+    .context("construct TUI VFS MAC PEP")?;
+    let (vfs_ns, vfs_subject) = crate::tui::vfs::build_chat_vfs_namespace(&sk, vfs_pep)?;
 
     let mut tui_service = TuiService::new(state, ctx.transport("tui", SocketKind::Rep), sk.clone())
         .with_policy_client(policy_client)

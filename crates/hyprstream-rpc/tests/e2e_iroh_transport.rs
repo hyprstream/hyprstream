@@ -26,6 +26,8 @@
 //! Libtorch is NOT required (this is transport, not inference).
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
+mod support;
+
 use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
@@ -391,6 +393,7 @@ impl RequestService for RegistryService {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rpc_round_trip_model_status_and_registry_list_over_iroh() -> Result<()> {
+    support::install_explicit_dispatch_pep();
     install_hybrid_verify_policy();
 
     // ─── Server: bind Iroh substrate serving `hyprstream-rpc/1` ──────────────
@@ -628,6 +631,7 @@ async fn anonymous_moq_handshake_over_iroh_is_rejected() -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn one_substrate_serves_rpc_and_rejects_anonymous_moq() -> Result<()> {
+    support::install_explicit_dispatch_pep();
     install_hybrid_verify_policy();
 
     // ─── Server: one substrate, two real handlers ───────────────────────────

@@ -59,10 +59,7 @@ impl AuthenticatedUser {
                 && tenant != ".."
                 && tenant != "*"
                 && tenant.bytes().all(|byte| {
-                    byte.is_ascii_alphanumeric()
-                        || byte == b'-'
-                        || byte == b'_'
-                        || byte == b'.'
+                    byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_' || byte == b'.'
                 });
             if !valid_component {
                 return Err("invalid verified tenant");
@@ -559,8 +556,9 @@ pub(crate) async fn verify_resource_token_claims(
         }
     }
 
-    // Federation is trusted for identity, never for choosing a local PDS/Casbin
-    // tenant. Only this node's OAuth authority may assert the hosted binding.
+    // Federation is trusted for identity, never for choosing a local
+    // PDS/Casbin tenant or asserting local MAC clearance.
+    claims.strip_federated_clearance(local_issuers);
     claims.strip_federated_tenant(local_issuers);
     Ok(claims)
 }
@@ -1090,10 +1088,7 @@ mod tests {
             exp: None,
         };
 
-        assert_eq!(
-            alice.authorization_domain().unwrap(),
-            "acme.example"
-        );
+        assert_eq!(alice.authorization_domain().unwrap(), "acme.example");
         assert_eq!(alice.authorization_domain(), bob.authorization_domain());
         assert_ne!(alice.authorization_domain().unwrap(), alice.user);
     }

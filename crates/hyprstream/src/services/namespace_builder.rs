@@ -59,6 +59,9 @@ pub struct StandardNamespaceConfig {
     /// `None` — this was already the pre-#634 behavior of each builder, now
     /// made an explicit parameter rather than silently unified.
     pub registry: Option<RegistryClient>,
+    /// Production direct-VFS PEP.  Callers must construct this with the signed
+    /// audit WAL; `None` is reserved for non-production embeddings.
+    pub pep: Option<Arc<hyprstream_vfs::NamespacePep>>,
     /// Path at which `model_client`'s 9P filesystem is mounted (caller
     /// convention today: `/srv/model`).
     pub model_path: String,
@@ -91,6 +94,7 @@ pub fn build_standard_namespace(cfg: StandardNamespaceConfig) -> Namespace {
         subject,
         model_client,
         registry,
+        pep,
         model_path,
         registry_path,
         worktree_path,
@@ -124,7 +128,11 @@ pub fn build_standard_namespace(cfg: StandardNamespaceConfig) -> Namespace {
         // `worktree_path` is an alias for `registry_path` — same backing
         // mount, exposed under a separate path for ergonomic worktree
         // access. Both resolve to the same worktree content.
-        let _ = ns.bind_mount(&worktree_path, registry_mount, hyprstream_vfs::BindFlag::After);
+        let _ = ns.bind_mount(
+            &worktree_path,
+            registry_mount,
+            hyprstream_vfs::BindFlag::After,
+        );
     }
 
     // /bin/ — static directory entries for listing purposes.
@@ -176,7 +184,11 @@ pub fn build_standard_namespace(cfg: StandardNamespaceConfig) -> Namespace {
     let tools = discover_tools(&tools_dir);
     if !tools.is_empty() {
         let tools_tree = SyntheticTree::new(SyntheticNode::Dir { children: tools });
-        let _ = ns.bind_mount(&bin_path, Arc::new(tools_tree), hyprstream_vfs::BindFlag::After);
+        let _ = ns.bind_mount(
+            &bin_path,
+            Arc::new(tools_tree),
+            hyprstream_vfs::BindFlag::After,
+        );
     }
 
     // /env/ — session variables as files (Plan9 per-process /env/).
@@ -219,13 +231,20 @@ pub fn build_standard_namespace(cfg: StandardNamespaceConfig) -> Namespace {
     // tcl_path — the driver gets a fork() snapshot of the namespace (taken
     // before tcl_path is mounted, so it never observes itself) for
     // `{bin_path}/{cmd}` fallback resolution inside `{tcl_path}/eval`.
-    let driver_ns = Arc::new(ns.fork());
+    let mut driver_ns = ns.fork();
+    if let Some(pep) = pep.as_ref() {
+        driver_ns.set_pep(Arc::clone(pep));
+    }
+    let driver_ns = Arc::new(driver_ns);
     let tcl_mount = Arc::new(hyprstream_workers_tcl::TclMount::spawn(subject, driver_ns));
     let _ = ns.mount(&tcl_path, tcl_mount);
 
     // /lang/python needs a wasm Sandbox this builder does not hold; wiring it
     // is tracked in #632.
 
+    if let Some(pep) = pep {
+        ns.set_pep(pep);
+    }
     ns
 }
 

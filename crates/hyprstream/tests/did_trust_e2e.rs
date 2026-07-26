@@ -23,6 +23,8 @@
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
+mod support;
+
 #[path = "fixtures/did_trust.rs"]
 mod did_trust;
 use did_trust::*;
@@ -248,6 +250,7 @@ async fn build_fixture() -> Fixture {
 /// QUIC discovery, real liveness ping, real resolver install.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn did_anchored_bootstrap_boots_end_to_end() {
+    support::install_explicit_dispatch_pep();
     let fixture = build_fixture().await;
     hyprstream_discovery::initialize_deployment_checkpoint_store()
         .expect("fresh test deployment must provision its checkpoint store");

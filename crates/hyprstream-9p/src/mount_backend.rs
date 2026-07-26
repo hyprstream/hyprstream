@@ -37,6 +37,8 @@ use hyprstream_vfs::{DirEntry, Fid, Mount, MountError};
 use tokio::sync::{Mutex, OnceCell};
 
 use crate::backend::{Backend, OpenResult, StatResult, WalkResult};
+pub use crate::mac_seam::AttachAuthenticator as AttachAuthorizer;
+use crate::mac_seam::VerifiedAttach;
 use crate::msg::{self, Qid, ReaddirEntry};
 
 /// Resolves the mount ticket a client presents in `Tattach.uname` to the
@@ -53,21 +55,6 @@ use crate::msg::{self, Qid, ReaddirEntry};
 ///
 /// On denial, return a [`MountError`] — the translator maps it to an `Rlerror`
 /// errno (e.g. [`MountError::PermissionDenied`] → `EACCES`).
-#[async_trait]
-pub trait AttachAuthorizer: Send + Sync {
-    /// Validate the `uname` ticket and the requested `aname` export selector,
-    /// and return the narrowed session [`Subject`].
-    ///
-    /// `aname` is the 9P attach name — the export the client requested. The
-    /// authorizer validates it against the ticket's granted namespace and
-    /// **denies an unknown/forbidden/malformed selector** (returning a
-    /// [`MountError::PermissionDenied`] → `EACCES`) rather than falling back to
-    /// a default export (#877/#1071 fail-closed contract). Selection and the
-    /// `Subject` bind happen in this one authorization so a future
-    /// `ExportResolver` cannot split them.
-    async fn authorize(&self, uname: &str, aname: &str) -> Result<Subject, MountError>;
-}
-
 /// Max bytes a single read/write returns. Kept below the translator's `MSG_SIZE`
 /// (8 KiB) so an `Rread` carrying a full iounit plus its 9P header still fits the
 /// negotiated msize.
@@ -107,7 +94,12 @@ impl MountBackend {
         let cell = OnceCell::new();
         // Infallible on a fresh cell.
         let _ = cell.set(subject);
-        Self { mount, subject: cell, authorizer: None, fids: DashMap::new() }
+        Self {
+            mount,
+            subject: cell,
+            authorizer: None,
+            fids: DashMap::new(),
+        }
     }
 
     /// Wrap `mount` as the 9P export root whose session [`Subject`] is resolved
@@ -148,37 +140,65 @@ impl MountBackend {
             .stat(handle, self.caller()?)
             .await
             .context("mount stat failed")?;
-        Ok(Qid { qtype: st.qtype, version: st.version, path: st.path })
+        Ok(Qid {
+            qtype: st.qtype,
+            version: st.version,
+            path: st.path,
+        })
     }
 }
 
 #[async_trait]
 impl Backend for MountBackend {
-    async fn attach(&self, uname: &str, aname: &str) -> Result<()> {
+    async fn attach(
+        &self,
+        uname: &str,
+        aname: &str,
+        verified: Option<VerifiedAttach>,
+    ) -> Result<Option<VerifiedAttach>> {
         // Fixed-subject listeners have no authorizer; the Subject is already
         // bound and `uname`/`aname` are advisory (ignored, as on the UDS/vsock
         // paths).
         let Some(authorizer) = self.authorizer.as_ref() else {
-            return Ok(());
+            if let Some(verified) = verified {
+                let existing = self
+                    .subject
+                    .get()
+                    .ok_or_else(|| anyhow!("fixed 9P subject missing"))?;
+                if existing != verified.subject() {
+                    return Err(anyhow::Error::new(MountError::PermissionDenied(
+                        "verified attach subject differs from fixed VFS subject".to_owned(),
+                    )));
+                }
+                return Ok(Some(verified));
+            }
+            return Ok(None);
         };
         // Attach-time ticket path (H1b): resolve+narrow the Subject AND validate
         // the requested `aname` export against the ticket's namespace grant in
         // one authorization. A MountError here maps to an Rlerror errno
         // (PermissionDenied → EACCES) via the translator, before any fid exists.
-        let subject = authorizer.authorize(uname, aname).await.map_err(anyhow::Error::new)?;
+        let verified = match verified {
+            Some(verified) => verified,
+            None => authorizer
+                .authenticate(uname, aname)
+                .await
+                .map_err(anyhow::Error::new)?,
+        };
+        let subject = verified.subject().clone();
         let attempted_subject = subject.clone();
         // First attach wins; a second attach on the same connection must not
         // silently re-scope the session. Ignore a redundant identical set,
         // reject a conflicting one.
         match self.subject.set(subject) {
-            Ok(()) => Ok(()),
+            Ok(()) => Ok(Some(verified)),
             Err(_) => {
                 let existing = self
                     .subject
                     .get()
                     .ok_or_else(|| anyhow!("bind session Subject: cell rejected without value"))?;
                 if existing == &attempted_subject {
-                    Ok(())
+                    Ok(Some(verified))
                 } else {
                     Err(anyhow::Error::new(MountError::PermissionDenied(
                         "conflicting attach subject".to_owned(),
@@ -188,16 +208,15 @@ impl Backend for MountBackend {
         }
     }
 
-    async fn walk(
-        &self,
-        fid: u32,
-        newfid: u32,
-        components: &[String],
-    ) -> Result<WalkResult> {
+    async fn walk(&self, fid: u32, newfid: u32, components: &[String]) -> Result<WalkResult> {
         // A Mount walk resolves from the root, so build the target's absolute
         // path as parent_path + components. An empty-components walk (attach /
         // clone) re-resolves the source fid's own path.
-        let parent_path = self.fids.get(&fid).map(|e| e.path.clone()).unwrap_or_default();
+        let parent_path = self
+            .fids
+            .get(&fid)
+            .map(|e| e.path.clone())
+            .unwrap_or_default();
         let parent_len = parent_path.len();
         let mut new_path = parent_path;
         new_path.extend(components.iter().cloned());
@@ -249,14 +268,21 @@ impl Backend for MountBackend {
 
         if components.is_empty() {
             let refs: Vec<&str> = new_path.iter().map(String::as_str).collect();
-            let next = self.mount.walk(&refs, self.caller()?).await.context("mount walk failed")?;
+            let next = self
+                .mount
+                .walk(&refs, self.caller()?)
+                .await
+                .context("mount walk failed")?;
             qids.push(self.qid_of(&next).await?);
             handle = Some(next);
         }
         let handle = handle.ok_or_else(|| anyhow!("mount walk returned no handle"))?;
         self.fids.insert(
             newfid,
-            Arc::new(MountFidEntry { path: new_path, handle: Mutex::new(Some(handle)) }),
+            Arc::new(MountFidEntry {
+                path: new_path,
+                handle: Mutex::new(Some(handle)),
+            }),
         );
         Ok(WalkResult { qids, reached })
     }
@@ -264,20 +290,27 @@ impl Backend for MountBackend {
     async fn open(&self, fid: u32, flags: u32) -> Result<OpenResult> {
         let entry = self.entry(fid)?;
         let mut guard = entry.handle.lock().await;
-        let handle = guard.as_mut().ok_or_else(|| anyhow!("open: fid {fid} is clunked"))?;
+        let handle = guard
+            .as_mut()
+            .ok_or_else(|| anyhow!("open: fid {fid} is clunked"))?;
         let mode = lopen_flags_to_mode(flags);
         self.mount
             .open(handle, mode, self.caller()?)
             .await
             .context("mount open failed")?;
         let qid = self.qid_of(handle).await?;
-        Ok(OpenResult { qid, iounit: IOUNIT })
+        Ok(OpenResult {
+            qid,
+            iounit: IOUNIT,
+        })
     }
 
     async fn read(&self, fid: u32, offset: u64, count: u32) -> Result<Vec<u8>> {
         let entry = self.entry(fid)?;
         let guard = entry.handle.lock().await;
-        let handle = guard.as_ref().ok_or_else(|| anyhow!("read: fid {fid} is clunked"))?;
+        let handle = guard
+            .as_ref()
+            .ok_or_else(|| anyhow!("read: fid {fid} is clunked"))?;
         self.mount
             .read(handle, offset, count, self.caller()?)
             .await
@@ -287,7 +320,9 @@ impl Backend for MountBackend {
     async fn write(&self, fid: u32, offset: u64, data: &[u8]) -> Result<u32> {
         let entry = self.entry(fid)?;
         let guard = entry.handle.lock().await;
-        let handle = guard.as_ref().ok_or_else(|| anyhow!("write: fid {fid} is clunked"))?;
+        let handle = guard
+            .as_ref()
+            .ok_or_else(|| anyhow!("write: fid {fid} is clunked"))?;
         self.mount
             .write(handle, offset, data, self.caller()?)
             .await
@@ -297,7 +332,9 @@ impl Backend for MountBackend {
     async fn stat(&self, fid: u32) -> Result<StatResult> {
         let entry = self.entry(fid)?;
         let guard = entry.handle.lock().await;
-        let handle = guard.as_ref().ok_or_else(|| anyhow!("stat: fid {fid} is clunked"))?;
+        let handle = guard
+            .as_ref()
+            .ok_or_else(|| anyhow!("stat: fid {fid} is clunked"))?;
         let st = self
             .mount
             .stat(handle, self.caller()?)
@@ -306,7 +343,11 @@ impl Backend for MountBackend {
         let is_dir = st.qtype & QTDIR != 0;
         let mode = if is_dir { 0o040755 } else { 0o100644 };
         Ok(StatResult {
-            qid: Qid { qtype: st.qtype, version: st.version, path: st.path },
+            qid: Qid {
+                qtype: st.qtype,
+                version: st.version,
+                path: st.path,
+            },
             mode,
             size: st.size,
             mtime_sec: st.mtime,
@@ -317,7 +358,9 @@ impl Backend for MountBackend {
         let entry = self.entry(fid)?;
         let entries = {
             let guard = entry.handle.lock().await;
-            let handle = guard.as_ref().ok_or_else(|| anyhow!("readdir: fid {fid} is clunked"))?;
+            let handle = guard
+                .as_ref()
+                .ok_or_else(|| anyhow!("readdir: fid {fid} is clunked"))?;
             self.mount
                 .readdir(handle, self.caller()?)
                 .await
@@ -356,10 +399,21 @@ fn encode_dir_entries(entries: &[DirEntry], offset: u64, count: u32) -> Vec<u8> 
         .iter()
         .map(|e| {
             let qid = match &e.stat {
-                Some(st) => Qid { qtype: st.qtype, version: st.version, path: st.path },
-                None => Qid { qtype: if e.is_dir { QTDIR } else { 0 }, version: 0, path: 0 },
+                Some(st) => Qid {
+                    qtype: st.qtype,
+                    version: st.version,
+                    path: st.path,
+                },
+                None => Qid {
+                    qtype: if e.is_dir { QTDIR } else { 0 },
+                    version: 0,
+                    path: 0,
+                },
             };
-            ReaddirEntry { qid, name: e.name.clone() }
+            ReaddirEntry {
+                qid,
+                name: e.name.clone(),
+            }
         })
         .collect();
     msg::encode_readdir_page(&records, offset, count)
@@ -419,10 +473,22 @@ mod tests {
             async fn open(&self, _f: &mut Fid, _m: u8, _c: &Subject) -> Result<(), MountError> {
                 Err(MountError::PermissionDenied("open".into()))
             }
-            async fn read(&self, _f: &Fid, _o: u64, _n: u32, _c: &Subject) -> Result<Vec<u8>, MountError> {
+            async fn read(
+                &self,
+                _f: &Fid,
+                _o: u64,
+                _n: u32,
+                _c: &Subject,
+            ) -> Result<Vec<u8>, MountError> {
                 Err(MountError::Io("read".into()))
             }
-            async fn write(&self, _f: &Fid, _o: u64, _d: &[u8], _c: &Subject) -> Result<u32, MountError> {
+            async fn write(
+                &self,
+                _f: &Fid,
+                _o: u64,
+                _d: &[u8],
+                _c: &Subject,
+            ) -> Result<u32, MountError> {
                 Err(MountError::NotSupported("write".into()))
             }
             async fn readdir(&self, _f: &Fid, _c: &Subject) -> Result<Vec<DirEntry>, MountError> {
@@ -437,15 +503,20 @@ mod tests {
             }
         }
 
-        let mount = Arc::new(TrackedMount { clunks: AtomicUsize::new(0) });
+        let mount = Arc::new(TrackedMount {
+            clunks: AtomicUsize::new(0),
+        });
         let backend = MountBackend::new(mount.clone(), Subject::new("tenant"));
 
         // Attach (empty walk) binds fid 0 to the root. `MountBackend::new`
         // fixes the Subject, so `uname`/`aname` are advisory here.
-        backend.attach("tenant", "").await.unwrap();
+        backend.attach("tenant", "", None).await.unwrap();
         backend.fids.insert(
             0,
-            Arc::new(MountFidEntry { path: vec![], handle: Mutex::new(Some(Fid::new(0usize))) }),
+            Arc::new(MountFidEntry {
+                path: vec![],
+                handle: Mutex::new(Some(Fid::new(0usize))),
+            }),
         );
 
         // Walk fid 0 -> newfid 1 via ["a", "b"]: "a" resolves (handle A is
@@ -464,8 +535,18 @@ mod tests {
         use crate::msg::parse_readdir_entries;
 
         let entries = vec![
-            DirEntry { name: "a".into(), is_dir: true, size: 0, stat: None },
-            DirEntry { name: "bb".into(), is_dir: false, size: 7, stat: None },
+            DirEntry {
+                name: "a".into(),
+                is_dir: true,
+                size: 0,
+                stat: None,
+            },
+            DirEntry {
+                name: "bb".into(),
+                is_dir: false,
+                size: 7,
+                stat: None,
+            },
         ];
         let full = encode_dir_entries(&entries, 0, u32::MAX);
         assert!(!full.is_empty());

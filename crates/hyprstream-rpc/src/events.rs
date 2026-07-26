@@ -32,7 +32,7 @@
 //! routing policy into each member grant.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Result};
@@ -300,6 +300,28 @@ pub trait EventAuthz: Send + Sync {
     }
 }
 
+static EVENT_AUTHZ: OnceLock<Arc<dyn EventAuthz>> = OnceLock::new();
+
+fn installed_event_authz() -> Option<Arc<dyn EventAuthz>> {
+    EVENT_AUTHZ.get().cloned()
+}
+
+/// Whether the process-wide event reference monitor has been installed.
+#[must_use]
+pub fn event_authz_installed() -> bool {
+    EVENT_AUTHZ.get().is_some()
+}
+
+/// Install the process-wide production event authorization adapter.
+///
+/// This is one-shot because replacing a live reference monitor would create a
+/// policy gap between already-constructed and new publishers.
+pub fn install_event_authz(authz: Arc<dyn EventAuthz>) -> std::result::Result<(), &'static str> {
+    EVENT_AUTHZ
+        .set(authz)
+        .map_err(|_| "event authorization already installed")
+}
+
 /// Fail-closed authz: denies every publish/subscribe. The default for the
 /// encrypted (`ZeroKnowledge`/`LimitedKnowledge`) profile — MAC deny-by-default
 /// by construction. Production wires a real UCAN/capability-backed impl (S3/S4
@@ -314,9 +336,8 @@ impl EventAuthz for DenyAllEventAuthz {
     }
 }
 
-/// Permissive authz: allows every publish/subscribe. For the public (`Public`)
-/// profile (the open firehose — no authz by design) and for tests until a real
-/// authz is wired.
+/// Explicit permissive authz for callers that deliberately construct a public
+/// firehose or a test fixture. It is never an implicit fallback.
 pub struct AllowAllEventAuthz;
 impl EventAuthz for AllowAllEventAuthz {
     fn can_publish(&self, _caller: &Subject, _prefix: &str) -> bool {
@@ -330,9 +351,8 @@ impl EventAuthz for AllowAllEventAuthz {
 /// Adapter from the canonical MAC contract to the event authorization surface.
 ///
 /// Constructing this type installs an active PEP, so all missing clearance or
-/// object labels fail closed. Public publishers/subscribers retain
-/// [`AllowAllEventAuthz`] until an operator explicitly installs this adapter;
-/// that dormant state is the canonical pre-activation pass-through.
+/// object labels fail closed. Uninstalled publishers/subscribers use
+/// [`DenyAllEventAuthz`], never a dormant permit fallback.
 pub struct MacEventAuthz {
     pep: MoqEventPep,
 }
@@ -424,9 +444,8 @@ pub struct EventPublisher {
     pq_signing_key: Option<MlDsaSigningKey>,
     privacy_mode: EventPrivacy,
     rekey_policy: RekeyPolicy,
-    /// Event-plane authz (EV4). `AllowAll` for the `Public` profile (open
-    /// firehose — no authz by design); `DenyAll` (fail-closed) for the
-    /// encrypted profile until a real UCAN/capability impl is wired via
+    /// Event-plane authz (EV4). Uninstalled state is `DenyAll`; an explicit
+    /// public firehose or test fixture must inject [`AllowAllEventAuthz`] via
     /// [`Self::with_authz`].
     authz: Arc<dyn EventAuthz>,
     /// Publisher's verified identity (EV4 authn-on-publish). `None` DID
@@ -487,8 +506,8 @@ impl EventPublisher {
             pq_signing_key: None,
             privacy_mode: EventPrivacy::Public,
             rekey_policy: RekeyPolicy::default(),
-            // Public firehose profile: no authz by design; identity N/A.
-            authz: Arc::new(AllowAllEventAuthz),
+            // An omitted production installation is a hard deny at rest.
+            authz: installed_event_authz().unwrap_or_else(|| Arc::new(DenyAllEventAuthz)),
             publisher_identity: PublisherIdentity::anonymous(),
         })
     }
@@ -921,8 +940,7 @@ pub struct EventSubscriber {
     prefixes: Arc<RwLock<HashMap<String, SubscriberPrefixState>>>,
     /// One verified tenant/domain per confidential subscriber instance.
     tenant: Arc<RwLock<Option<String>>>,
-    /// Dormant pass-through by default; an injected MAC adapter is active and
-    /// fail-closed.
+    /// Deny-all by default; an injected MAC adapter is active and fail-closed.
     authz: Arc<dyn EventAuthz>,
     /// Verified subscriber identity, or anonymous when the carrier has not
     /// supplied an independently authenticated application subject.
@@ -935,7 +953,7 @@ impl EventSubscriber {
             inner: MoqEventSubscriber::new(),
             prefixes: Arc::new(RwLock::new(HashMap::new())),
             tenant: Arc::new(RwLock::new(None)),
-            authz: Arc::new(AllowAllEventAuthz),
+            authz: installed_event_authz().unwrap_or_else(|| Arc::new(DenyAllEventAuthz)),
             caller: Subject::anonymous(),
         })
     }
@@ -1033,10 +1051,7 @@ impl EventSubscriber {
         let mut prefixes = self.prefixes.write().await;
         match prefixes.get(&key) {
             None => {
-                prefixes.insert(
-                    key,
-                    SubscriberPrefixState::Expected(Box::new(expectation)),
-                );
+                prefixes.insert(key, SubscriberPrefixState::Expected(Box::new(expectation)));
                 Ok(())
             }
             Some(SubscriberPrefixState::Expected(existing))
@@ -1422,12 +1437,10 @@ impl EventSubscriber {
     }
 
     async fn encrypted_prefix_key(&self, prefix: &str) -> Result<String, String> {
-        let tenant = self
-            .tenant
-            .read()
-            .await
-            .clone()
-            .ok_or_else(|| "confidential subscriber has no verified tenant binding".to_owned())?;
+        let tenant =
+            self.tenant.read().await.clone().ok_or_else(|| {
+                "confidential subscriber has no verified tenant binding".to_owned()
+            })?;
         Ok(tenant_prefix_key(&tenant, prefix))
     }
 }
@@ -1654,6 +1667,12 @@ mod tests {
         }
     }
 
+    fn permissive_test_subscriber() -> EventSubscriber {
+        EventSubscriber::new()
+            .unwrap()
+            .with_authz(Arc::new(AllowAllEventAuthz))
+    }
+
     async fn expect_confidential(
         subscriber: &EventSubscriber,
         prefix: &str,
@@ -1693,7 +1712,7 @@ mod tests {
         let ed = signing_key();
         let pq = crate::node_identity::derive_mesh_mldsa_key(&ed);
         let (grant, key) = grant_for(&recipient, &ed, &pq).await;
-        let subscriber = EventSubscriber::new().unwrap();
+        let subscriber = permissive_test_subscriber();
         expect_confidential(&subscriber, "worker", &ed, &pq).await;
         subscriber
             .install_epoch_grant("worker", &recipient, &grant, anchor(&ed, &pq), None, None)
@@ -1718,7 +1737,7 @@ mod tests {
     async fn expected_confidential_prefix_without_grant_drops_plaintext() {
         let ed = signing_key();
         let pq = crate::node_identity::derive_mesh_mldsa_key(&ed);
-        let subscriber = EventSubscriber::new().unwrap();
+        let subscriber = permissive_test_subscriber();
         expect_confidential(&subscriber, "worker", &ed, &pq).await;
 
         assert!(matches!(
@@ -1731,7 +1750,7 @@ mod tests {
     async fn contended_confidential_state_never_allows_passthrough() {
         let ed = signing_key();
         let pq = crate::node_identity::derive_mesh_mldsa_key(&ed);
-        let subscriber = EventSubscriber::new().unwrap();
+        let subscriber = permissive_test_subscriber();
         expect_confidential(&subscriber, "worker", &ed, &pq).await;
 
         let _held = subscriber.prefixes.write().await;
@@ -1805,8 +1824,8 @@ mod tests {
             .find(|grant| grant.subject_did == "did:web:member-b")
             .unwrap();
         assert!(crate::crypto::group_key::open_epoch_grant(&relay_recipient, grant_a_2).is_err());
-        let subscriber_a = EventSubscriber::new().unwrap();
-        let subscriber_b = EventSubscriber::new().unwrap();
+        let subscriber_a = permissive_test_subscriber();
+        let subscriber_b = permissive_test_subscriber();
         expect_confidential(&subscriber_a, "worker", &ed, &pq).await;
         expect_confidential(&subscriber_b, "worker", &ed, &pq).await;
         subscriber_a
@@ -1883,7 +1902,7 @@ mod tests {
         let ed = signing_key();
         let pq = crate::node_identity::derive_mesh_mldsa_key(&ed);
         let (grant, key) = grant_for(&recipient, &ed, &pq).await;
-        let subscriber = EventSubscriber::new().unwrap();
+        let subscriber = permissive_test_subscriber();
         expect_confidential(&subscriber, "worker", &ed, &pq).await;
         subscriber
             .install_epoch_grant("worker", &recipient, &grant, anchor(&ed, &pq), None, None)
@@ -1932,7 +1951,7 @@ mod tests {
         let ed = signing_key();
         let pq = crate::node_identity::derive_mesh_mldsa_key(&ed);
         let (grant, _) = grant_for(&recipient, &ed, &pq).await;
-        let subscriber = EventSubscriber::new().unwrap();
+        let subscriber = permissive_test_subscriber();
         expect_confidential(&subscriber, "worker", &ed, &pq).await;
         subscriber
             .install_epoch_grant("worker", &recipient, &grant, anchor(&ed, &pq), None, None)
@@ -1963,7 +1982,7 @@ mod tests {
         let ed = signing_key();
         let pq = crate::node_identity::derive_mesh_mldsa_key(&ed);
         let (grant, key) = grant_for(&recipient, &ed, &pq).await;
-        let subscriber = EventSubscriber::new().unwrap();
+        let subscriber = permissive_test_subscriber();
         expect_confidential(&subscriber, "worker", &ed, &pq).await;
         subscriber
             .install_epoch_grant("worker", &recipient, &grant, anchor(&ed, &pq), None, None)
@@ -2116,7 +2135,7 @@ mod tests {
         let ed = signing_key();
         let pq = crate::node_identity::derive_mesh_mldsa_key(&ed);
         let (grant, _) = grant_for(&recipient, &ed, &pq).await;
-        let subscriber = EventSubscriber::new().unwrap();
+        let subscriber = permissive_test_subscriber();
         expect_confidential(&subscriber, "worker", &ed, &pq).await;
         assert!(subscriber
             .install_epoch_grant("worker", &wrong, &grant, anchor(&ed, &pq), None, None)
@@ -2147,7 +2166,7 @@ mod tests {
     async fn confidential_subscriber_rejects_cross_tenant_rebinding() {
         let ed = signing_key();
         let pq = crate::node_identity::derive_mesh_mldsa_key(&ed);
-        let subscriber = EventSubscriber::new().unwrap();
+        let subscriber = permissive_test_subscriber();
         subscriber
             .expect_confidential_prefix(
                 "tenant-a",
@@ -2186,5 +2205,29 @@ mod tests {
             RekeyPolicy::default(),
         )
         .is_err());
+    }
+
+    #[tokio::test]
+    async fn uninstalled_public_event_authz_denies_at_rest() {
+        assert!(
+            !event_authz_installed(),
+            "unit-test process must not install the production singleton"
+        );
+        let origin = crate::moq_event::MoqEventOrigin::new();
+        let source = format!("uninstalled-authz-{}", rand::random::<u64>());
+        let moq = origin.publisher(&source).unwrap();
+        let publisher = EventPublisher::from_public_prefix(&source, moq).unwrap();
+        let error = publisher
+            .publish("object", "changed", b"payload")
+            .await
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("publish denied by event-plane authz"));
+
+        let subscriber = EventSubscriber::new().unwrap();
+        assert!(!subscriber
+            .authz
+            .can_subscribe(&Subject::anonymous(), &source));
     }
 }

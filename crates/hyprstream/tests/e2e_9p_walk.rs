@@ -38,6 +38,8 @@
 
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::print_stdout)]
 
+mod support;
+
 use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
@@ -344,6 +346,7 @@ fn bare_clone(src: &std::path::Path, dst: &std::path::Path) -> Result<()> {
 /// alternative (one test per check) would each pay the ~1s service-spawn cost.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn e2e_9p_walk_read_stat_create_promote() -> Result<()> {
+    support::install_explicit_dispatch_pep();
     install_classical_verify();
 
     // ── Setup: temp git repo with config.json ──────────────────────────────
@@ -634,6 +637,7 @@ async fn e2e_9p_walk_read_stat_create_promote() -> Result<()> {
 /// `is_dir` branch of `handle_create` (the main test creates a plain file).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn e2e_9p_create_directory_and_stat_qtype() -> Result<()> {
+    support::install_explicit_dispatch_pep();
     install_classical_verify();
 
     let scratch = TempDir::new()?;

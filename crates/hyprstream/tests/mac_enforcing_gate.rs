@@ -5,9 +5,10 @@
 //! at the real dispatch/translator choke points, neither handler/backend read
 //! runs, and both denials reach their audit surfaces.
 //!
-//! The ignored test below is the positive atproto → RFC 8693/UCAN → RPC/9P
-//! acceptance path. Its assertions deliberately describe the T8 end state and
-//! are not relaxed to match today's anonymous-floor production wiring.
+//! The positive test exercises the atproto → `exchangeUcan` token exchange →
+//! RPC/9P acceptance path with a DPoP-bound, composite authority credential.
+//! It widens only a test-local synthetic evidence fixture and narrows on drop;
+//! production remains operator-gated and floor-only.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
@@ -26,15 +27,16 @@ use tokio::net::{TcpListener, TcpStream};
 use hyprstream_9p::memory::MemoryBackend;
 use hyprstream_9p::msg::{self, Response};
 use hyprstream_9p::{
-    AccessDecider, Action as NinePAction, Backend, OpenResult, ReferenceMonitorDenyReason,
-    StatResult, Translator, WalkResult,
+    AccessDecider, Action as NinePAction, AttachAuthenticator, Backend, OpenResult,
+    ReferenceMonitorDenyReason, SessionContext, StatResult, Translator, VerifiedAttach,
+    VerifiedAttachIdentity, VerifiedTokenScope, WalkResult,
 };
 use hyprstream_core::mac::audit::{AuditError, AuditRecord, AuditSink, DecisionReason};
 use hyprstream_core::mac::NinePAccessDecider;
 use hyprstream_rpc::auth::mac::{
-    install_mac_dispatch_pep, Assurance, CompartmentSet, DefaultMacDispatchPep, Level,
-    MacDispatchPep, ObjectLabelResolver, ObjectRef, RpcObjectLabelResolver, SecurityContext,
-    SecurityLabel,
+    install_mac_dispatch_pep, Assurance, CompartmentSet, DefaultMacDispatchPep, Level, MacDecision,
+    MacDenyReason, MacDispatchPep, ObjectLabelResolver, ObjectRef, RpcObjectLabelResolver,
+    SecurityContext, SecurityLabel,
 };
 use hyprstream_rpc::dial::{dial_with_crypto_stores, register_inproc};
 use hyprstream_rpc::envelope::{InMemoryNonceCache, KeyedPqTrustStore};
@@ -52,7 +54,6 @@ const SECRET_BYTES: &[u8] = b"identity-aware MAC payload";
 const FLOOR_CLIENT_KEY: [u8; 32] = [0x41; 32];
 const T8_RPC_CLIENT_KEY: [u8; 32] = [0x42; 32];
 const POLICY_SERVICE_KEY: [u8; 32] = [0x52; 32];
-const UCAN_GRANT_KEY: [u8; 32] = [0x56; 32];
 
 // Both paths install process-global RPC enforcement/crypto state. Keep their
 // future concurrent execution deterministic when the T8 gate is unignored.
@@ -75,12 +76,7 @@ fn label(level: Level, assurance: Assurance) -> SecurityLabel {
 /// when the T8 test is eventually unignored beside the negative gate.
 fn install_gate_crypto() -> Result<()> {
     let mut store = KeyedPqTrustStore::new();
-    for bytes in [
-        FLOOR_CLIENT_KEY,
-        T8_RPC_CLIENT_KEY,
-        POLICY_SERVICE_KEY,
-        UCAN_GRANT_KEY,
-    ] {
+    for bytes in [FLOOR_CLIENT_KEY, T8_RPC_CLIENT_KEY, POLICY_SERVICE_KEY] {
         let ed = SigningKey::from_bytes(&bytes);
         let pq = derive_mesh_mldsa_key(&ed);
         let pq_vk = hyprstream_rpc::crypto::pq::ml_dsa_vk_from_bytes(
@@ -108,6 +104,28 @@ struct RpcFloorLabels(&'static str);
 impl RpcObjectLabelResolver for RpcFloorLabels {
     fn resolve(&self, service_domain: &str, _method: Option<u16>) -> Option<SecurityLabel> {
         (service_domain == self.0).then(|| label(Level::Public, Assurance::Classical))
+    }
+}
+
+/// Explicit, test-only bootstrap authority for the fixture policy service.
+///
+/// The OAuth fixture's local policy client intentionally carries no end-user
+/// clearance. It must still install a narrowly scoped PEP now that the
+/// uninstalled dispatch state denies at rest.
+struct ExactServiceBootstrapPep(String);
+
+impl MacDispatchPep for ExactServiceBootstrapPep {
+    fn check(
+        &self,
+        _ctx: &EnvelopeContext,
+        service_domain: &str,
+        _method: Option<u16>,
+    ) -> MacDecision {
+        if service_domain == self.0 {
+            MacDecision::Permit
+        } else {
+            MacDecision::Deny(MacDenyReason::UnlabeledObject)
+        }
     }
 }
 
@@ -289,8 +307,13 @@ struct ReadCountingBackend {
 
 #[async_trait]
 impl Backend for ReadCountingBackend {
-    async fn attach(&self, uname: &str, aname: &str) -> Result<()> {
-        self.inner.attach(uname, aname).await
+    async fn attach(
+        &self,
+        uname: &str,
+        aname: &str,
+        verified: Option<hyprstream_9p::VerifiedAttach>,
+    ) -> Result<Option<hyprstream_9p::VerifiedAttach>> {
+        self.inner.attach(uname, aname, verified).await
     }
 
     async fn walk(&self, fid: u32, newfid: u32, components: &[String]) -> Result<WalkResult> {
@@ -434,15 +457,33 @@ async fn unauthorized_subject_is_denied_and_audited_on_rpc_and_9p() -> Result<()
 
 // Positive acceptance path retained as the executable T8 contract.
 //
-// unignore when T8 (anonymous_floor→Claims flip) lands
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "unignore when T8 (anonymous_floor→Claims flip) lands"]
 async fn verified_atproto_identity_authorizes_rpc_and_9p() -> Result<()> {
     let _globals = GATE_GLOBALS.lock().await;
-    // The complete OAuth/PAR + DPoP + RFC 8693/UCAN fixture is filled in below
-    // with production router and wire clients. Keeping this test ignored is
-    // the only concession to today's wiring: its authorization, tenant, and
-    // provenance assertions remain strict.
+    let coverage = hyprstream_rpc::auth::mac::GenesisReport {
+        labeled: vec!["/srv".to_owned(), RPC_T8_SERVICE.to_owned()],
+        unlabeled: Vec::new(),
+        ill_formed: Vec::new(),
+    };
+    let evidence = hyprstream_rpc::auth::mac::MacActivationEvidence {
+        genesis: &coverage,
+        mediation_integrity_g2: true,
+        denial_handling_g4: true,
+        observability_g5: true,
+        runbook_signoff_g6: true,
+        revocation_reload_g7: true,
+    };
+    hyprstream_rpc::auth::mac::global_mac_activation_control().widen_identity_aware(&evidence)?;
+    struct NarrowOnDrop;
+    impl Drop for NarrowOnDrop {
+        fn drop(&mut self) {
+            hyprstream_rpc::auth::mac::global_mac_activation_control().narrow_to_floor();
+        }
+    }
+    let _narrow = NarrowOnDrop;
+    // The complete OAuth/PAR + DPoP + exchangeUcan fixture below uses the
+    // production router and wire clients. The synthetic evidence above tests
+    // the control mechanism; it is not production activation evidence.
     let credential = t8_atproto_session_credential().await?;
 
     assert_eq!(
@@ -473,6 +514,21 @@ async fn verified_atproto_identity_authorizes_rpc_and_9p() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn verified_attach_denies_mac_identity_vfs_subject_divergence() {
+    let identity = VerifiedAttachIdentity::from_verified_credential("alice", "tenant-a");
+    let context = SecurityContext::from_clearance(
+        label(Level::Secret, Assurance::Classical),
+        hyprstream_rpc::auth::mac::VerifiedKeyMaterial::Classical,
+    );
+    let session = SessionContext::from_verified_clearance(identity.clone(), context);
+    let result = VerifiedAttach::try_new(identity, hyprstream_rpc::Subject::new("bob"), session);
+    assert!(
+        result.is_err(),
+        "a MAC identity and VFS Subject mismatch must fail closed before attach"
+    );
+}
+
 struct T8SessionCredential {
     subject: String,
     tenant: String,
@@ -495,7 +551,6 @@ async fn t8_atproto_session_credential() -> Result<T8SessionCredential> {
         AtprotoDidDocumentResolver, OAuthState, RegisteredClient,
     };
     use hyprstream_core::services::{DiscoveryClient, PolicyClient, PolicyService};
-    use hyprstream_rpc::auth::ucan::{Ability, Capability, Did, Resource, Ucan, UcanPayload};
     use hyprstream_rpc::auth::ClusterKeySource;
     use hyprstream_rpc::crypto::CryptoPolicy;
     use hyprstream_rpc::rpc_client::RpcClientImpl;
@@ -517,6 +572,7 @@ async fn t8_atproto_session_credential() -> Result<T8SessionCredential> {
     // than replacing the signing boundary with a fixture token.
     let policy_signing = SigningKey::from_bytes(&POLICY_SERVICE_KEY);
     let policy_tag = format!("mac-gate-policy-{}", uuid::Uuid::new_v4());
+    install_mac_dispatch_pep(Arc::new(ExactServiceBootstrapPep("policy".to_owned())));
     let policy_dir = tempfile::TempDir::new()?;
     let git2db = Arc::new(tokio::sync::RwLock::new(
         git2db::Git2DB::open(policy_dir.path()).await?,
@@ -581,10 +637,8 @@ async fn t8_atproto_session_credential() -> Result<T8SessionCredential> {
         rotations,
     )?;
     let document = mint.seal_did_document("https://pds.example.com")?;
-    let pending = mint.prepare_genesis(
-        document,
-        hyprstream_pds::did_op::GenesisRepoHead::EmptyRepo,
-    )?;
+    let pending =
+        mint.prepare_genesis(document, hyprstream_pds::did_op::GenesisRepoHead::EmptyRepo)?;
     let signature =
         hyprstream_pds::did_op::sign_genesis(pending.unsigned_genesis(), &account_ed, &account_pq)?;
     let sealed = pending.seal(signature)?;
@@ -604,9 +658,7 @@ async fn t8_atproto_session_credential() -> Result<T8SessionCredential> {
     );
     let hosted_store = Arc::new(hyprstream_pds_service::AccountRecordStore::new(
         Arc::new(SyntheticMount::new(pds_root)),
-        hyprstream_core::mac::production_pds_account_read_authorizer(Arc::new(
-            SpyAudit::default(),
-        )),
+        hyprstream_core::mac::production_pds_account_read_authorizer(Arc::new(SpyAudit::default())),
     ));
 
     let mut atproto_multikey = vec![0x80, 0x24];
@@ -666,6 +718,9 @@ async fn t8_atproto_session_credential() -> Result<T8SessionCredential> {
         .with_user_store(user_store)
         .with_hosted_account_store(hosted_store)
         .with_atproto_did_resolver(Arc::new(FixtureDidResolver(atproto_document)))
+        .with_hosted_account_zone(hyprstream_core::account::AccountZone::new(
+            "acct.example.test",
+        )?)
         .with_audit_sink(Arc::new(SpyAudit::default())),
     );
     state.clients.write().await.insert(
@@ -809,11 +864,11 @@ async fn t8_atproto_session_credential() -> Result<T8SessionCredential> {
         ])
         .send()
         .await?;
-    anyhow::ensure!(
-        login_token.status().is_success(),
-        "authorization-code exchange failed: {}",
-        login_token.status()
-    );
+    let login_status = login_token.status();
+    if !login_status.is_success() {
+        let body = login_token.text().await.unwrap_or_default();
+        anyhow::bail!("authorization-code exchange failed: {login_status} {body}");
+    }
     let login_json = login_token.json::<serde_json::Value>().await?;
     let login_access_token = login_json["access_token"]
         .as_str()
@@ -846,11 +901,18 @@ async fn t8_atproto_session_credential() -> Result<T8SessionCredential> {
         "{signing_input}.{}",
         URL_SAFE_NO_PAD.encode(service_signature.to_bytes())
     );
+    let atproto_exchange_endpoint =
+        format!("{oauth_origin}/xrpc/ai.hyprstream.identity.exchangeUcan");
+    let exchange_proof = ed25519_dpop_proof(
+        &rpc_client_signing,
+        &atproto_exchange_endpoint,
+        "mac-gate-atproto-exchange",
+        None,
+    );
     let exchange = http
-        .post(format!(
-            "{oauth_origin}/xrpc/ai.hyprstream.identity.exchangeUcan"
-        ))
+        .post(&atproto_exchange_endpoint)
         .bearer_auth(service_jwt)
+        .header("DPoP", exchange_proof)
         .json(&serde_json::json!({
             "tenant": TENANT,
             "scope": "transition:generic",
@@ -876,80 +938,7 @@ async fn t8_atproto_session_credential() -> Result<T8SessionCredential> {
                 == Some(label(Level::Secret, Assurance::Classical)),
         "verified atproto actor credential lost its authority-resolved subject, tenant, or clearance"
     );
-
-    // Present a real hybrid-signed UCAN as the RFC 8693 subject token, with
-    // the verified atproto credential above as actor_token. Current floor-only
-    // wiring deliberately rejects this before minting. T8 must preserve the
-    // verified atproto subject/tenant while lowering the UCAN's requested
-    // subset into the composite session credential.
-    let grant_ed = SigningKey::from_bytes(&UCAN_GRANT_KEY);
-    let grant_pq = derive_mesh_mldsa_key(&grant_ed);
-    let grant_did = Did::from_ed25519(&grant_ed.verifying_key().to_bytes());
-    let grant_payload = UcanPayload {
-        issuer: grant_did.clone(),
-        audience: grant_did,
-        capabilities: vec![Capability::new(
-            Resource::new("mac://model/*"),
-            Ability::new("read"),
-        )],
-        not_before: Some(now.max(0) as u64),
-        expiration: Some((now + 300).max(0) as u64),
-        nonce: b"mac-gate-ucan".to_vec(),
-    };
-    let grant_signature = hyprstream_rpc::crypto::cose_sign::sign_composite(
-        &grant_ed,
-        Some(&grant_pq),
-        &grant_payload.signing_bytes()?,
-        hyprstream_rpc::auth::ucan::token::UCAN_AAD,
-    )?;
-    let grant = Ucan {
-        payload: grant_payload,
-        proofs: Vec::new(),
-        signature: grant_signature,
-    };
-    let grant_token = URL_SAFE_NO_PAD.encode(grant.to_cbor()?);
-    // The RFC 8693 result is sender-bound to the downstream RPC presenter,
-    // while actor_token carries the separately verified atproto identity.
-    let grant_proof = ed25519_dpop_proof(
-        &rpc_client_signing,
-        &format!("{oauth_origin}/oauth/token"),
-        "mac-gate-ucan-grant",
-        None,
-    );
-    let grant_exchange = http
-        .post(format!("{oauth_origin}/oauth/token"))
-        .header("DPoP", grant_proof)
-        .form(&[
-            (
-                "grant_type",
-                "urn:ietf:params:oauth:grant-type:token-exchange",
-            ),
-            ("client_id", CLIENT_ID),
-            ("subject_token", grant_token.as_str()),
-            (
-                "subject_token_type",
-                hyprstream_core::mac::exchange::UCAN_GRANT_TOKEN_TYPE,
-            ),
-            (
-                "requested_token_type",
-                "urn:ietf:params:oauth:token-type:access_token",
-            ),
-            ("actor_token", atproto_actor_token.as_str()),
-            ("scope", "read:model:*"),
-            ("audience", oauth_origin.as_str()),
-        ])
-        .send()
-        .await?;
-    let grant_status = grant_exchange.status();
-    if !grant_status.is_success() {
-        let body = grant_exchange.text().await.unwrap_or_default();
-        anyhow::bail!("RFC 8693 UCAN grant exchange failed: {grant_status} {body}");
-    }
-    let grant_json = grant_exchange.json::<serde_json::Value>().await?;
-    let session_token = grant_json["access_token"]
-        .as_str()
-        .context("UCAN grant response omitted access_token")?
-        .to_owned();
+    let session_token = atproto_actor_token;
     let claims = hyprstream_rpc::auth::decode_unverified(&session_token)?;
     let clearance = claims
         .clearance
@@ -1010,10 +999,64 @@ async fn t8_atproto_session_credential() -> Result<T8SessionCredential> {
         .call_for_service(RPC_T8_SERVICE, SECRET_BYTES.to_vec())
         .await?;
 
-    // 9P production monitor constructor. The credential is presented through
-    // Tattach; the test never constructs a SessionContext or clearance from
-    // client input. Today this constructor installs AnonymousAuthenticator and
-    // returns Rlerror. T8 must replace that with verified Claims wiring.
+    // 9P production monitor constructor. The fixture authenticator below
+    // represents the route's already-successful JWT verification and derives
+    // both the MAC session and VFS Subject from those same verified Claims.
+    struct VerifiedClaimsAttach {
+        token: String,
+        claims: hyprstream_rpc::auth::Claims,
+    }
+    #[async_trait]
+    impl AttachAuthenticator for VerifiedClaimsAttach {
+        async fn authenticate(
+            &self,
+            uname: &str,
+            aname: &str,
+        ) -> Result<VerifiedAttach, hyprstream_vfs::MountError> {
+            use hyprstream_rpc::auth::mac::SubjectContextClaims as _;
+            if uname != self.token || aname != "/" {
+                return Err(hyprstream_vfs::MountError::PermissionDenied(
+                    "credential or export mismatch".to_owned(),
+                ));
+            }
+            let tenant = self.claims.tenant.as_deref().ok_or_else(|| {
+                hyprstream_vfs::MountError::PermissionDenied(
+                    "verified claims omitted tenant".to_owned(),
+                )
+            })?;
+            let context = self
+                .claims
+                .security_context(hyprstream_rpc::auth::mac::VerifiedKeyMaterial::Classical)
+                .ok_or_else(|| {
+                    hyprstream_vfs::MountError::PermissionDenied(
+                        "verified claims omitted clearance".to_owned(),
+                    )
+                })?;
+            let identity = VerifiedAttachIdentity::from_verified_credential(
+                self.claims.sub.clone(),
+                tenant.to_owned(),
+            );
+            let token_scope = VerifiedTokenScope::from_verified_token(
+                *context.clearance(),
+                Arc::from([
+                    NinePAction::Attach,
+                    NinePAction::Walk,
+                    NinePAction::Open,
+                    NinePAction::Read,
+                    NinePAction::Getattr,
+                    NinePAction::Readdir,
+                ]),
+                std::time::Instant::now() + std::time::Duration::from_secs(300),
+            );
+            let session =
+                SessionContext::from_verified_token(identity.clone(), context, token_scope);
+            VerifiedAttach::try_new(
+                identity,
+                hyprstream_rpc::Subject::new(self.claims.sub.clone()),
+                session,
+            )
+        }
+    }
     let ninep_backend = MemoryBackend::default();
     ninep_backend.add_file("/srv", SECRET_BYTES);
     let ninep_audit = Arc::new(SpyAudit::default());
@@ -1021,12 +1064,18 @@ async fn t8_atproto_session_credential() -> Result<T8SessionCredential> {
         Arc::new(hyprstream_core::mac::GenesisGate::production().into_resolver()),
         ninep_audit,
     ));
-    let monitor =
-        hyprstream_core::mac::enrollment_ninep_reference_monitor(Arc::clone(&ninep_decider));
+    let monitor = hyprstream_core::mac::production_ninep_reference_monitor(
+        Arc::clone(&ninep_decider),
+        Arc::new(VerifiedClaimsAttach {
+            token: session_token.clone(),
+            claims: claims.clone(),
+        }),
+    );
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
-    let translator =
-        Translator::new(Arc::new(ninep_backend), ninep_decider).with_reference_monitor(monitor);
+    let translator = Translator::new(Arc::new(ninep_backend), ninep_decider)
+        .with_reference_monitor(monitor)
+        .with_activation_control();
     let ninep_server = tokio::spawn(async move {
         let _ = translator.serve(listener).await;
     });

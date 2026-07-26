@@ -1211,9 +1211,19 @@ fn handle_quick_command(
                         // #1269: install the full ReferenceMonitor at every
                         // production 9P constructor. Fail-closed until #698
                         // wires clearance issuance + S6 token path.
-                        let ninep_monitor = Some(hyprstream_core::mac::enrollment_ninep_reference_monitor(
-                            Arc::clone(&ninep_decider),
-                        ));
+                        // This worker transport still carries no verified
+                        // attach credential. Register the live UDS/vsock seam
+                        // as a structural G2 blocker before constructing its
+                        // deny-only authenticator; a late registration also
+                        // narrows an already-widened process.
+                        hyprstream_rpc::auth::mac::block_identity_widening_for_unverified_attach_transport(
+                            "worker-uds-vsock",
+                        );
+                        let ninep_monitor = Some(
+                            hyprstream_core::mac::enrollment_ninep_reference_monitor(Arc::clone(
+                                &ninep_decider,
+                            )),
+                        );
                         let backend_ctx = BackendCtx {
                             pool_config: pool_config.clone(),
                             ninep_decider,
@@ -2080,7 +2090,11 @@ fn main() -> Result<()> {
                     // standalone, and the systemd/spawner dispatch below.
                     // Emit the coverage-gate evidence consumed by the active
                     // 9P translator PEP (see `mac::genesis`).
-                    hyprstream_core::mac::GenesisGate::production().log_report();
+                    let mac_gate = hyprstream_core::mac::GenesisGate::production();
+                    mac_gate.log_report();
+                    // Installation is activation-ready but remains floor-only.
+                    // Only the explicit G1-G7 operator control may widen it.
+                    hyprstream_core::mac::install_production_rpc_dispatch_pep();
 
                     if foreground || standalone {
                         // --foreground requires a service name or --services list;
@@ -2551,6 +2565,34 @@ fn main() -> Result<()> {
                                 // Policy: Hybrid is mandatory. With no anchored
                                 // peer key the verifier FAILS CLOSED.
                                 install_envelope_verify_config(Some(&config.oauth));
+
+                                // Install MoQ/event authorization in every
+                                // production service process before any model,
+                                // worker, workflow, or system publisher can be
+                                // constructed. In multi-process mode only the
+                                // event origin lives in the `event` process;
+                                // authorization still belongs at each local
+                                // publisher/subscriber choke point.
+                                if !hyprstream_rpc::events::event_authz_installed() {
+                                    let audit_stream =
+                                        format!("moq-event-{}", service_names.join("-"));
+                                    let pep =
+                                        hyprstream_core::mac::production_moq_event_pep(
+                                            signing_key.clone(),
+                                            &config.oauth,
+                                            &audit_stream,
+                                        )
+                                        .await
+                                        .context(
+                                            "construct process-wide MoQ/event MAC PEP",
+                                        )?;
+                                    hyprstream_rpc::events::install_event_authz(
+                                        std::sync::Arc::new(
+                                            hyprstream_rpc::events::MacEventAuthz::new(pep),
+                                        ),
+                                    )
+                                    .map_err(anyhow::Error::msg)?;
+                                }
 
                                 let manager = InprocManager::new();
                                 let mut handles = Vec::new();
