@@ -11,23 +11,26 @@ validation of an arbitrary ref.
 
 This gate freezes that decision so a future edit cannot silently reintroduce
 the post-merge duplicate run. It also pins the corrected AppImage-trigger
-comment: `appimage.yml` runs on schedule / tags / `workflow_dispatch` only —
-never on a push to a branch.
+comment: `appimage.yml` runs on its one nightly schedule, `v*` tags, and manual
+dispatch only — never on a push to a branch.
 
 METHODOLOGY
 -----------
 Pure Python-stdlib inspection — no third-party YAML parser, no network, no
-runner, no build. A focused line-based parser extracts the top-level `on:`
-triggers (and their nested children) and each job's `if:` expression; the
-assertions then lock the matrix to the shape #1331 introduced. Failures exit
-non-zero so the CI step can fail. Do NOT add `|| true`.
+runner, no build. A focused fail-closed line parser extracts the top-level
+`on:` triggers (including inline values), job blocks, and job-level `if:`
+expressions. Assertions lock exact trigger sets, exact normalized conditions,
+and the job identities that implement the #1331 event matrix. Unsupported YAML
+shapes are rejected rather than guessed at. Failures exit non-zero so the CI
+step can fail. Do NOT add `|| true`.
 
 NON-VACUOUS
 -----------
-`--self-test` (run automatically by `main()` when the script is invoked with
-no arguments after the live check) feeds known-bad mutations of the live
-workflow through the same check function and asserts each one is rejected.
-If a mutation slips through, the gate fails — proving the assertions fire.
+The self-test (run automatically after the live check) feeds known-bad
+mutations of both workflows through the same check functions and asserts each
+one is rejected. It includes semantic condition bypasses and alternate trigger
+forms. If a mutation slips through, the gate fails — proving the assertions
+fire.
 """
 
 from __future__ import annotations
@@ -67,9 +70,12 @@ def _on_blocks(text: str) -> dict[str, str]:
     (empty string if the trigger has no children, e.g. `pull_request:` with
     nothing nested). Returns {} if the file has no top-level `on:`.
 
-    Handles the two forms used in this repo:
+    Handles the forms needed to fail closed around this repo:
       block:      on:\n  pull_request:\n  merge_group:\n
-      inline/map: on: push               (single trigger, no nesting)
+      inline/list: on: [pull_request, merge_group]
+
+    A value on an individual trigger is retained in `nested_subtext`, so an
+    inline map such as `push: {branches: [main]}` cannot disappear.
     """
     lines = text.splitlines()
     on_idx = None
@@ -117,19 +123,44 @@ def _on_blocks(text: str) -> dict[str, str]:
             if cur_name is not None:
                 blocks[cur_name] = "\n".join(buf)
             stripped = line.strip()
+            inline_value = ""
             if stripped.startswith("- "):
                 cur_name = _strip_key(stripped[2:])
             elif ":" in stripped:
-                cur_name = _strip_key(stripped.split(":", 1)[0])
+                key, value = stripped.split(":", 1)
+                cur_name = _strip_key(key)
+                inline_value = value.split("#", 1)[0].strip()
             else:
                 cur_name = _strip_key(stripped)
-            buf = []
+            buf = [inline_value] if inline_value else []
         else:
             if cur_name is not None:
                 buf.append(line)
     if cur_name is not None:
         blocks[cur_name] = "\n".join(buf)
     return blocks
+
+
+def _job_blocks(text: str) -> dict[str, str]:
+    """Return raw text for each direct child of the top-level `jobs:` map."""
+    lines = text.splitlines()
+    in_jobs = False
+    blocks: dict[str, list[str]] = {}
+    cur_job: str | None = None
+    for line in lines:
+        if line.strip() and not line.lstrip().startswith("#"):
+            indent = len(line) - len(line.lstrip())
+            if indent == 0:
+                cur_job = None
+                in_jobs = _strip_key(line.split(":", 1)[0]) == "jobs"
+                continue
+            if in_jobs and indent == 2 and line.rstrip(" \t").endswith(":"):
+                cur_job = _strip_key(line.strip()[:-1])
+                blocks[cur_job] = []
+                continue
+        if in_jobs and cur_job is not None:
+            blocks[cur_job].append(line)
+    return {name: "\n".join(lines) for name, lines in blocks.items()}
 
 
 def _jobs_if_map(text: str) -> dict[str, str | None]:
@@ -141,34 +172,50 @@ def _jobs_if_map(text: str) -> dict[str, str | None]:
     in this repo's files); nested `if:` lines deeper than the job body are
     ignored once the first `if:` has been recorded.
     """
-    lines = text.splitlines()
-    in_jobs = False
     jobs: dict[str, str | None] = {}
-    cur_job: str | None = None
-    cur_job_indent: int | None = None
-    for line in lines:
-        if not line.strip() or line.lstrip().startswith("#"):
-            continue
-        indent = len(line) - len(line.lstrip())
-        if indent == 0:
-            cur_job = None
-            cur_job_indent = None
-            in_jobs = _strip_key(line.split(":", 1)[0]) == "jobs"
-            continue
-        if not in_jobs:
-            continue
-        if indent == 2 and line.rstrip(" \t").endswith(":"):
-            cur_job = _strip_key(line.strip()[:-1])
-            cur_job_indent = indent
-            jobs[cur_job] = None
-            continue
-        if cur_job is None or cur_job_indent is None:
-            continue
-        if jobs.get(cur_job) is None and indent > cur_job_indent:
-            m = re.match(r"\s*if:\s*(.+?)\s*(?:#.*)?$", line)
+    for name, block in _job_blocks(text).items():
+        jobs[name] = None
+        for line in block.splitlines():
+            m = re.match(r" {4}if:\s*(.+?)\s*(?:#.*)?$", line)
             if m:
-                jobs[cur_job] = m.group(1).strip()
+                jobs[name] = m.group(1).strip()
+                break
     return jobs
+
+
+def _normalized_condition(expr: str | None) -> str | None:
+    """Normalize only harmless syntax around a GitHub Actions condition.
+
+    Optional expression delimiters, one layer of YAML scalar quotes, quote
+    style, and whitespace are normalized. Operators/parentheses/tokens are not
+    rewritten: semantically broader or negated expressions therefore cannot
+    retain an accepted condition as a substring and escape.
+    """
+    if expr is None:
+        return None
+    value = expr.strip()
+    if len(value) >= 2 and value[0] in "\"'" and value[-1] == value[0]:
+        value = value[1:-1].strip()
+    if value.startswith("${{") and value.endswith("}}"):
+        value = value[3:-2].strip()
+    value = value.replace('"', "'")
+    return re.sub(r"\s+", "", value)
+
+
+def _content_lines(block: str) -> list[str]:
+    """Return stripped non-comment lines from a constrained YAML sub-block."""
+    return [
+        line.split("#", 1)[0].strip()
+        for line in block.splitlines()
+        if line.split("#", 1)[0].strip()
+    ]
+
+
+def _unquote(value: str) -> str:
+    value = value.strip()
+    if len(value) >= 2 and value[0] in "\"'" and value[-1] == value[0]:
+        return value[1:-1]
+    return value
 
 
 # --------------------------------------------------------------------------
@@ -182,44 +229,80 @@ def _assert(cond: bool, msg: str) -> None:
 
 
 def check_rust_text(text: str) -> None:
-    triggers = list(_on_blocks(text).keys())
-    for required in ("pull_request", "merge_group", "workflow_dispatch"):
-        _assert(
-            required in triggers,
-            f"rust.yml: missing required trigger {required!r}; got {triggers}",
-        )
+    trigger_blocks = _on_blocks(text)
+    triggers = set(trigger_blocks)
+    expected_triggers = {"pull_request", "merge_group", "workflow_dispatch"}
     _assert(
-        "push" not in triggers,
-        "rust.yml: 'push' trigger must not be present (reintroduces the #1331 "
-        f"duplicate post-merge run); got {triggers}",
+        triggers == expected_triggers,
+        "rust.yml: triggers must be exactly pull_request, merge_group, and "
+        f"workflow_dispatch; got {sorted(triggers)}",
     )
+    for name, block in trigger_blocks.items():
+        _assert(
+            not _content_lines(block),
+            f"rust.yml: trigger {name!r} must be unfiltered; got {block!r}",
+        )
 
     jobs = _jobs_if_map(text)
     for name in ("clippy", "deny", "loopback-burndown", "wasm", "build"):
         _assert(name in jobs, f"rust.yml: required job {name!r} missing; got {sorted(jobs)}")
 
+    skip_merge_group = "github.event_name!='merge_group'"
     for name in ("clippy", "wasm", "loopback-burndown"):
         cond = jobs.get(name)
         _assert(
-            cond is not None and "github.event_name != 'merge_group'" in cond,
-            f"rust.yml: job {name!r} must skip on merge_group (if={cond!r})",
+            _normalized_condition(cond) == skip_merge_group,
+            f"rust.yml: job {name!r} condition must be exactly the merge_group "
+            f"skip (if={cond!r})",
         )
 
+    _assert(
+        jobs.get("deny") is None,
+        f"rust.yml: 'deny' must run on every supported event (if={jobs.get('deny')!r})",
+    )
     build_if = jobs.get("build")
     _assert(
-        build_if is not None and build_if.strip() == "github.event_name != 'pull_request'",
-        f"rust.yml: 'build' if must be the single 'pull_request' skip (if={build_if!r})",
+        _normalized_condition(build_if) == "github.event_name!='pull_request'",
+        f"rust.yml: 'build' condition must be exactly the pull_request skip "
+        f"(if={build_if!r})",
     )
 
 
 def check_appimage_text(text: str) -> None:
-    """Pin the corrected rust.yml comment: AppImage is nightly/tag/manual only."""
+    """Pin AppImage to one nightly cron, v* tags, and manual dispatch only."""
     blocks = _on_blocks(text)
-    push = blocks.get("push", "")
+    expected_triggers = {"schedule", "workflow_dispatch", "push"}
     _assert(
-        "branches" not in push,
-        "appimage.yml: a 'push.branches' trigger is forbidden (the rust.yml "
-        f"comment claims AppImage is nightly/tag/manual only); push block was:\n{push}",
+        set(blocks) == expected_triggers,
+        "appimage.yml: triggers must be exactly schedule, workflow_dispatch, "
+        f"and push; got {sorted(blocks)}",
+    )
+    _assert(
+        not _content_lines(blocks["workflow_dispatch"]),
+        "appimage.yml: workflow_dispatch must be unfiltered",
+    )
+
+    schedule = _content_lines(blocks["schedule"])
+    _assert(
+        len(schedule) == 1 and schedule[0].startswith("- cron:"),
+        f"appimage.yml: schedule must contain exactly one cron; got {schedule}",
+    )
+    cron = _unquote(schedule[0].split(":", 1)[1])
+    _assert(
+        cron == "30 3 * * *",
+        f"appimage.yml: nightly cron must remain '30 3 * * *'; got {cron!r}",
+    )
+
+    push = _content_lines(blocks["push"])
+    _assert(
+        len(push) == 2 and push[0] == "tags:" and push[1].startswith("-"),
+        "appimage.yml: push must use the fail-closed tags-only block form; "
+        f"got {push}",
+    )
+    tag = _unquote(push[1][1:])
+    _assert(
+        tag == "v*",
+        f"appimage.yml: push must be limited to the single 'v*' tag; got {tag!r}",
     )
 
 
@@ -228,7 +311,7 @@ def check_appimage_text(text: str) -> None:
 # --------------------------------------------------------------------------
 
 
-def _mutations(rust_text: str) -> list[tuple[str, str]]:
+def _rust_mutations(rust_text: str) -> list[tuple[str, str]]:
     """Return (label, mutated_text) pairs that MUST each be rejected."""
     return [
         (
@@ -240,22 +323,56 @@ def _mutations(rust_text: str) -> list[tuple[str, str]]:
             ),
         ),
         (
-            "drop workflow_dispatch",
+            "add Rust schedule trigger",
+            rust_text.replace(
+                "  workflow_dispatch:\n",
+                "  workflow_dispatch:\n  schedule:\n    - cron: '0 0 * * *'\n",
+                1,
+            ),
+        ),
+        (
+            "drop workflow_dispatch trigger",
             rust_text.replace("  workflow_dispatch:\n", "", 1),
         ),
         (
-            "make build fire on PR",
+            "broaden merge_group skip with always",
             rust_text.replace(
-                "github.event_name != 'pull_request'",
-                "github.event_name == 'pull_request'",
+                "if: github.event_name != 'merge_group'",
+                "if: github.event_name != 'merge_group' || always()",
+                1,
+            ),
+        ),
+        (
+            "negate condition retaining expected substring",
+            rust_text.replace(
+                "if: github.event_name != 'merge_group'",
+                "if: ${{ !(github.event_name != 'merge_group') }}",
                 1,
             ),
         ),
         (
             "make clippy run on merge_group",
             rust_text.replace(
-                "    if: github.event_name != 'merge_group'\n    runs-on: [self-hosted, linux, arm64, graviton, hyprstream-merge-gate]\n    # The last successful run",
-                "    if: github.event_name != 'workflow_dispatch'\n    runs-on: [self-hosted, linux, arm64, graviton, hyprstream-merge-gate]\n    # The last successful run",
+                "if: github.event_name != 'merge_group'",
+                "if: github.event_name == 'merge_group'",
+                1,
+            ),
+        ),
+        (
+            "make build run on pull_request",
+            rust_text.replace(
+                "if: github.event_name != 'pull_request'",
+                "if: github.event_name == 'pull_request'",
+                1,
+            ),
+        ),
+        (
+            "make deny skip pull_request",
+            rust_text.replace(
+                "  deny:\n    name: cargo-deny (bans + licenses)\n",
+                "  deny:\n"
+                "    name: cargo-deny (bans + licenses)\n"
+                "    if: github.event_name != 'pull_request'\n",
                 1,
             ),
         ),
@@ -266,18 +383,48 @@ def _mutations(rust_text: str) -> list[tuple[str, str]]:
     ]
 
 
-def self_test(rust_text: str) -> list[str]:
+def _appimage_mutations(appimage_text: str) -> list[tuple[str, str]]:
+    """Return AppImage trigger mutations that MUST each be rejected."""
+    return [
+        (
+            "add AppImage pull_request trigger",
+            appimage_text.replace("on:\n", "on:\n  pull_request:\n", 1),
+        ),
+        (
+            "inline AppImage push branches map",
+            appimage_text.replace(
+                "  push:\n    tags:\n      - 'v*'\n",
+                "  push: {branches: [main], tags: ['v*']}\n",
+                1,
+            ),
+        ),
+    ]
+
+
+def self_test(rust_text: str, appimage_text: str) -> list[str]:
     """Run each negative mutation; return labels that WRONGLY passed check."""
     escaped: list[str] = []
-    for label, mutated in _mutations(rust_text):
-        if mutated == rust_text:
-            escaped.append(f"{label} (mutation did not apply — fixture is stale)")
-            continue
-        try:
-            check_rust_text(mutated)
-        except AssertionError:
-            continue  # correctly rejected
-        escaped.append(label)
+    cases = [
+        ("rust", check_rust_text, rust_text, _rust_mutations(rust_text)),
+        (
+            "appimage",
+            check_appimage_text,
+            appimage_text,
+            _appimage_mutations(appimage_text),
+        ),
+    ]
+    for source, check, original, mutations in cases:
+        for label, mutated in mutations:
+            if mutated == original:
+                escaped.append(
+                    f"{source}: {label} (mutation did not apply — fixture is stale)"
+                )
+                continue
+            try:
+                check(mutated)
+            except AssertionError:
+                continue  # correctly rejected
+            escaped.append(f"{source}: {label}")
     return escaped
 
 
@@ -298,7 +445,7 @@ def main(argv: list[str]) -> int:
         except AssertionError as exc:
             failures.append(f"{name}: {exc}")
 
-    escaped = self_test(rust_text)
+    escaped = self_test(rust_text, appimage_text)
     for label in escaped:
         failures.append(f"self-test: mutation {label!r} was NOT rejected (gate is vacuous)")
 
@@ -308,7 +455,13 @@ def main(argv: list[str]) -> int:
             print(f"  - {fail}", file=sys.stderr)
         return 1
 
-    print("#1331 workflow-matrix regression: OK (incl. 5 negative mutations)")
+    mutation_count = len(_rust_mutations(rust_text)) + len(
+        _appimage_mutations(appimage_text)
+    )
+    print(
+        f"#1331 workflow-matrix regression: OK "
+        f"(incl. {mutation_count} negative mutations)"
+    )
     return 0
 
 

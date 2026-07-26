@@ -128,8 +128,8 @@ jobs:
       # Rust workflow to the trigger/job matrix introduced by #1331 (no push-to-
       # main duplicate run; workflow_dispatch for operator full validation) and
       # pins the corrected AppImage-trigger comment. Runs on every event this
-      # job sees (PR, merge_group, workflow_dispatch) so a regression cannot
-      # slip past the merge gate. Must be able to fail — do NOT add `|| true`.
+      # job sees (PR, merge_group, workflow_dispatch). Must be able to fail — do
+      # NOT add `|| true`.
       run: |
         python3 scripts/check_rust_workflow_matrix.py
 
@@ -144,7 +144,8 @@ jobs:
     # Advisory-only on the merge queue: `build` is the sole required merge-group
     # check (see the note on the preflight build job). Running this ratchet on
     # merge_group made a non-required shrink fail the group and livelock the queue;
-    # keep it on PR/manual-dispatch where it advises, matching the other non-required jobs.
+    # keep it on PR/manual-dispatch where it advises, matching the other
+    # non-required jobs.
     if: github.event_name != 'merge_group'
     runs-on: ubuntu-latest
     steps:
