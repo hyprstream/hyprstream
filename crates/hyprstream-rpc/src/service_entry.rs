@@ -34,10 +34,11 @@
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 use anyhow::{anyhow, bail, Context, Result};
+use base64::Engine as _;
 use serde_json::{json, Value};
 
 use crate::did_key::MULTICODEC_ED25519_PUB;
-use crate::transport::{QuicServerAuth, TransportConfig};
+use crate::transport::{EndpointType, QuicServerAuth, TransportConfig};
 
 /// multihash prefix for `sha2-256` with a 32-byte digest (`0x12` code, `0x20` len).
 const MULTIHASH_SHA2_256: [u8; 2] = [0x12, 0x20];
@@ -47,6 +48,15 @@ const MULTIHASH_SHA2_256: [u8; 2] = [0x12, 0x20];
 pub struct DecodedEntry {
     /// Dial target for [`crate::dial::dial`].
     pub config: TransportConfig,
+}
+
+/// Browser projection of the primary live QUIC reach.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BrowserQuicReach {
+    /// URL copied from the validated live `QuicTransport` entry.
+    pub quic_url: String,
+    /// Standard-base64 SHA-256 leaf-certificate hash for WebTransport.
+    pub cert_hash: String,
 }
 
 // ── multibase helpers ────────────────────────────────────────────────────────
@@ -67,7 +77,11 @@ fn multibase_decode_32(s: &str, prefix: [u8; 2], what: &str) -> Result<[u8; 32]>
         .into_vec()
         .map_err(|e| anyhow!("{what}: invalid base58: {e}"))?;
     if bytes.len() != prefix.len() + 32 {
-        bail!("{what}: expected {} bytes, got {}", prefix.len() + 32, bytes.len());
+        bail!(
+            "{what}: expected {} bytes, got {}",
+            prefix.len() + 32,
+            bytes.len()
+        );
     }
     if bytes[..2] != prefix[..] {
         bail!("{what}: wrong multiformats prefix");
@@ -124,16 +138,48 @@ pub fn decode_service_entry(entry: &Value) -> Result<DecodedEntry> {
     }
 }
 
+/// Validate a live `QuicTransport` service entry and project its certificate
+/// pin into the singular browser registration shape.
+///
+/// Discovery models `certHashes` as a set for rotation overlap, while the
+/// registration contract currently has one `certHash`. Ambiguous overlap
+/// therefore fails closed instead of selecting a pin with no defined primary.
+pub fn decode_browser_quic_reach(entry: &Value) -> Result<BrowserQuicReach> {
+    let decoded = decode_service_entry(entry)?;
+    let EndpointType::Quic { auth, .. } = &decoded.config.endpoint else {
+        bail!("browser QUIC reach requires a QuicTransport service entry");
+    };
+    let [cert_hash] = auth.accept_cert_hashes() else {
+        bail!("browser QUIC reach requires exactly one live certificate hash");
+    };
+    let quic_url = entry
+        .get("serviceEndpoint")
+        .and_then(|endpoint| endpoint.get("uri"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("quic: missing `uri`"))?
+        .to_owned();
+    Ok(BrowserQuicReach {
+        quic_url,
+        cert_hash: base64::engine::general_purpose::STANDARD.encode(cert_hash),
+    })
+}
+
 fn decode_iroh(svc: &Value) -> Result<DecodedEntry> {
     let node_id = multibase_decode_32(
-        svc.get("nodeId").and_then(Value::as_str).ok_or_else(|| anyhow!("iroh: missing `nodeId`"))?,
+        svc.get("nodeId")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("iroh: missing `nodeId`"))?,
         MULTICODEC_ED25519_PUB,
         "iroh nodeId",
     )?;
     let relays: Vec<String> = svc
         .get("relays")
         .and_then(Value::as_array)
-        .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_owned)).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(str::to_owned))
+                .collect()
+        })
         .unwrap_or_default();
     // Direct addresses are not published (privacy + iroh discovery); the resolver
     // supplies a relay and lets iroh discover direct paths.
@@ -144,7 +190,10 @@ fn decode_iroh(svc: &Value) -> Result<DecodedEntry> {
 }
 
 fn decode_quic(svc: &Value) -> Result<DecodedEntry> {
-    let uri = svc.get("uri").and_then(Value::as_str).ok_or_else(|| anyhow!("quic: missing `uri`"))?;
+    let uri = svc
+        .get("uri")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("quic: missing `uri`"))?;
     let (host, port) = parse_https_authority(uri)?;
     // Default `webpki` to true (safe-by-default: a CA-fronted public peer).
     let require_web_pki = svc.get("webpki").and_then(Value::as_bool).unwrap_or(true);
@@ -154,7 +203,9 @@ fn decode_quic(svc: &Value) -> Result<DecodedEntry> {
         .map(|a| -> Result<Vec<[u8; 32]>> {
             a.iter()
                 .map(|v| {
-                    let s = v.as_str().ok_or_else(|| anyhow!("quic certHashes: non-string entry"))?;
+                    let s = v
+                        .as_str()
+                        .ok_or_else(|| anyhow!("quic certHashes: non-string entry"))?;
                     multibase_decode_32(s, MULTIHASH_SHA2_256, "quic certHash")
                 })
                 .collect()
@@ -185,7 +236,10 @@ fn decode_quic(svc: &Value) -> Result<DecodedEntry> {
 /// 443 when no port is given.
 fn parse_https_authority(uri: &str) -> Result<(String, u16)> {
     let url = url::Url::parse(uri).with_context(|| format!("quic uri parse: {uri}"))?;
-    let host = url.host_str().ok_or_else(|| anyhow!("quic uri has no host: {uri}"))?.to_owned();
+    let host = url
+        .host_str()
+        .ok_or_else(|| anyhow!("quic uri has no host: {uri}"))?
+        .to_owned();
     let port = url.port().unwrap_or(443);
     Ok((host, port))
 }
@@ -207,7 +261,11 @@ mod tests {
         });
         let decoded = decode_service_entry(&entry).unwrap();
         match &decoded.config.endpoint {
-            EndpointType::Iroh { node_id: n, relay_url, direct_addrs } => {
+            EndpointType::Iroh {
+                node_id: n,
+                relay_url,
+                direct_addrs,
+            } => {
                 assert_eq!(*n, node_id);
                 assert_eq!(relay_url.as_deref(), Some("https://relay.example"));
                 assert!(direct_addrs.is_empty());
@@ -225,7 +283,11 @@ mod tests {
         });
         let decoded = decode_service_entry(&entry).unwrap();
         match &decoded.config.endpoint {
-            EndpointType::Quic { addr, server_name, auth: a } => {
+            EndpointType::Quic {
+                addr,
+                server_name,
+                auth: a,
+            } => {
                 assert_eq!(addr.to_string(), "10.0.0.1:4433");
                 assert_eq!(server_name, "10.0.0.1");
                 assert!(!a.require_web_pki());
@@ -233,6 +295,42 @@ mod tests {
             }
             other => panic!("expected Quic, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn browser_quic_projection_uses_the_live_pin() {
+        let auth = QuicServerAuth::pinned(vec![[3u8; 32]]).unwrap();
+        let entry = json!({
+            "type": "QuicTransport",
+            "serviceEndpoint": encode_quic(
+                "https://pds.example:4433/wt",
+                &auth,
+                &["hyprstream-rpc/1"],
+            ),
+        });
+
+        let browser = decode_browser_quic_reach(&entry).unwrap();
+        assert_eq!(browser.quic_url, "https://pds.example:4433/wt");
+        assert_eq!(
+            browser.cert_hash,
+            base64::engine::general_purpose::STANDARD.encode([3u8; 32])
+        );
+    }
+
+    #[test]
+    fn browser_quic_projection_rejects_rotation_overlap_ambiguity() {
+        let auth = QuicServerAuth::pinned(vec![[3u8; 32], [4u8; 32]]).unwrap();
+        let entry = json!({
+            "type": "QuicTransport",
+            "serviceEndpoint": encode_quic(
+                "https://pds.example:4433/wt",
+                &auth,
+                &["hyprstream-rpc/1"],
+            ),
+        });
+
+        let error = decode_browser_quic_reach(&entry).unwrap_err();
+        assert!(error.to_string().contains("exactly one"), "{error:#}");
     }
 
     #[test]
@@ -244,7 +342,11 @@ mod tests {
         });
         let decoded = decode_service_entry(&entry).unwrap();
         match &decoded.config.endpoint {
-            EndpointType::Quic { addr, server_name, auth } => {
+            EndpointType::Quic {
+                addr,
+                server_name,
+                auth,
+            } => {
                 assert!(auth.require_web_pki());
                 assert!(auth.accept_cert_hashes().is_empty());
                 assert_eq!(server_name, "host.example");

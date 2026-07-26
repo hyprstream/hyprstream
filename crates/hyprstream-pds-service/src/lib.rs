@@ -25,6 +25,9 @@ pub const PDS_NAMESPACE: &str = "/pds";
 pub const PDS_ACCOUNTS_DIRECTORY: &str = "accounts";
 /// Public account-record publication marker.
 pub const PDS_ACCOUNT_RECORD_FILE: &str = "account-record.cbor";
+
+pub mod hosted_account_mint;
+
 /// Fixed internal principal allowed to resolve a hosted DID to its tenant.
 pub const OAUTH_ACCOUNT_RESOLVER_SUBJECT: &str = "service:oauth";
 const DEFAULT_MAX_RECORD_BYTES: usize = 64 * 1024;
