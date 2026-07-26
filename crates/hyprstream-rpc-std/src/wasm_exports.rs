@@ -25,8 +25,20 @@ pub use hyprstream_rpc::wasm_api::*;
 ///
 /// All I/O goes through `RpcClient<JsSigner, WtConnection>` → ZMTP/QUIC → server.
 ///
+/// `connect` first exchanges `subject_token` for a short-lived at+jwt Bearer via
+/// the #1314 token-exchange endpoint (`POST {exchangeEndpoint}/oauth/token`), then
+/// dials the registry + model services through browser-provisioning (the only
+/// working browser dial) and presents that Bearer as the default JWT on every
+/// request. The shell's `Subject` is decoded from the Bearer's `sub` claim.
+///
 /// ```js
-/// const shell = await VfsShell.connect(regUrl, modelUrl, certHash, signerPubkey, signFn);
+/// const shell = await VfsShell.connect(
+///   registryOrigin, modelOrigin,            // https provisioning origins
+///   ed25519Pubkey, ed25519SignFn,            // hybrid signer (Ed25519 arm)
+///   mlDsa65Pubkey, mlDsa65SignFn,            // hybrid signer (PQ arm)
+///   exchangeEndpoint,                        // https origin hosting POST /oauth/token
+///   atprotoJwt, "urn:ietf:params:oauth:token-type:jwt",
+/// );
 /// const result = await shell.eval('ls /srv/registry');
 /// ```
 #[wasm_bindgen]
@@ -36,77 +48,94 @@ pub struct VfsShell {
 
 #[wasm_bindgen]
 impl VfsShell {
-    /// Create a new VFS shell by connecting to services.
+    /// Create a new VFS shell by authenticating + connecting to services.
     ///
-    /// Creates its own `RpcClient` instances for the registry and model services.
-    /// Both clients share the same `signer_pubkey` and `sign_fn`.
-    ///
-    /// - `signer_pubkey`: 32-byte Ed25519 public key for every envelope
-    /// - `sign_fn`: async JS callback `(canonicalBytes: Uint8Array) => Promise<Uint8Array>`
+    /// - `registry_origin` / `model_origin`: HTTPS origins serving the
+    ///   `/.well-known/hyprstream/browser-provisioning/{registry,model}`
+    ///   discovery documents. Cert pinning is server-supplied by provisioning
+    ///   (there is no caller `cert_hash` on the resolved path — that is the
+    ///   security model the `dial_wasm` stub deliberately forced us onto).
+    /// - `signer_pubkey` / `sign_fn`: 32-byte Ed25519 pubkey + async JS callback
+    ///   `(canonicalBytes: Uint8Array) => Promise<Uint8Array>` (hybrid Ed25519 arm).
+    /// - `signer_ml_dsa65_pubkey` / `pq_sign_fn`: ML-DSA-65 pubkey + PQ sign
+    ///   callback (hybrid PQ arm; required by the resolved path).
+    /// - `exchange_endpoint`: HTTPS origin hosting the #1314 `POST /oauth/token`.
+    /// - `subject_token` / `subject_token_type`: the credential to exchange
+    ///   (e.g. an atproto JWT, `subject_token_type = urn:ietf:params:oauth:token-type:jwt`).
     pub async fn connect(
-        registry_url: &str,
-        model_url: &str,
-        cert_hash: Option<String>,
+        registry_origin: &str,
+        model_origin: &str,
         signer_pubkey: &[u8],
         sign_fn: Function,
+        signer_ml_dsa65_pubkey: &[u8],
+        pq_sign_fn: Function,
+        exchange_endpoint: &str,
+        subject_token: String,
+        subject_token_type: String,
     ) -> Result<VfsShell, JsError> {
         console_error_panic_hook::set_once();
 
-        use hyprstream_rpc::crypto::VerifyingKey;
-        // #409 Path A: route through the wasm32 `dial()` factory instead of
-        // hand-assembling `RpcClientImpl` here. This is the browser counterpart
-        // to native `dial()` — same `Arc<dyn RpcClient>` return, hiding the
-        // concrete `WtConnection` transport behind the object-safe trait.
-        use hyprstream_rpc::dial_wasm;
-
-        // TODO: Get server verifying key from discovery endpoint
-        let server_key = VerifyingKey::from_bytes(&[0u8; 32]).unwrap_or_else(|_| {
-            VerifyingKey::from_bytes(&[
-                0xd7, 0x5a, 0x98, 0x01, 0x82, 0xb1, 0x0a, 0xb7,
-                0xd5, 0x4b, 0xfe, 0xd3, 0xc9, 0x64, 0x07, 0x3a,
-                0x0e, 0xe1, 0x72, 0xf3, 0xda, 0xa3, 0x23, 0x28,
-                0x27, 0xbf, 0x5c, 0xdc, 0xb3, 0xa0, 0x35, 0x6c,
-            ]).expect("fallback key")
-        });
-
-        // Connect to registry
-        web_sys::console::log_1(&"[VfsShell] Connecting to registry...".into());
-        let reg_signer = hyprstream_rpc::signer::JsSigner::new(signer_pubkey, sign_fn.clone())
-            .map_err(|e| JsError::new(&e.to_string()))?;
-        let reg_client: Arc<dyn hyprstream_rpc::rpc_client::RpcClient> = dial_wasm::dial(
-            registry_url,
-            cert_hash.as_deref(),
-            reg_signer,
-            Some(server_key.clone()),
-            None,
+        // 1) Exchange the atproto/external JWT for a short-lived at+jwt Bearer (#1314).
+        web_sys::console::log_1(&"[VfsShell] Exchanging subject token...".into());
+        let exchanged = hyprstream_rpc::wasm_token_exchange::fetch_exchange_token(
+            exchange_endpoint,
+            &subject_token,
+            &subject_token_type,
         )
         .await
         .map_err(|e| JsError::new(&e.to_string()))?;
+
+        // 2) Derive the display Subject from the freshly-minted Bearer's `sub`.
+        //    The response does not echo `sub` (the mint stamps `sub = verified.sub`),
+        //    so decode it client-side. Authority is re-verified by the server on
+        //    every RPC; this decode is bookkeeping only.
+        let subject = hyprstream_rpc::wasm_token_exchange::subject_from_access_token(
+            &exchanged.access_token,
+        )
+        .map_err(|e| JsError::new(&e.to_string()))?;
+        web_sys::console::log_1(&"[VfsShell] Subject resolved from exchanged token".into());
+
+        // 3) Connect to registry + model through the resolved browser-provisioning
+        //    path (the only working browser dial), presenting the Bearer as the
+        //    default JWT on every request. The `dial_wasm::dial` stub is dropped.
+        let bearer = Some(exchanged.access_token);
+        web_sys::console::log_1(&"[VfsShell] Connecting to registry...".into());
+        let reg_client: Arc<dyn hyprstream_rpc::rpc_client::RpcClient> = Arc::new(
+            crate::wasm_rpc_client::build_resolved_client(
+                registry_origin,
+                "registry",
+                signer_pubkey,
+                sign_fn.clone(),
+                signer_ml_dsa65_pubkey,
+                pq_sign_fn.clone(),
+                bearer.clone(),
+            )
+            .await?,
+        );
         web_sys::console::log_1(&"[VfsShell] Registry connected".into());
 
-        // Connect to model
         web_sys::console::log_1(&"[VfsShell] Connecting to model...".into());
-        let model_signer = hyprstream_rpc::signer::JsSigner::new(signer_pubkey, sign_fn)
-            .map_err(|e| JsError::new(&e.to_string()))?;
-        let model_client: Arc<dyn hyprstream_rpc::rpc_client::RpcClient> = dial_wasm::dial(
-            model_url,
-            cert_hash.as_deref(),
-            model_signer,
-            Some(server_key),
-            None,
-        )
-        .await
-        .map_err(|e| JsError::new(&e.to_string()))?;
+        let model_client: Arc<dyn hyprstream_rpc::rpc_client::RpcClient> = Arc::new(
+            crate::wasm_rpc_client::build_resolved_client(
+                model_origin,
+                "model",
+                signer_pubkey,
+                sign_fn,
+                signer_ml_dsa65_pubkey,
+                pq_sign_fn,
+                bearer,
+            )
+            .await?,
+        );
         web_sys::console::log_1(&"[VfsShell] Model connected".into());
 
-        // Build VFS namespace
+        // 4) Build VFS namespace + Tcl shell with the authenticated subject.
         web_sys::console::log_1(&"[VfsShell] Building namespace...".into());
-        let (ns, _stream_registry) = crate::vfs_mount::build_browser_namespace(reg_client, model_client);
+        let (ns, _stream_registry) =
+            crate::vfs_mount::build_browser_namespace(reg_client, model_client);
         let ns = Arc::new(ns);
         web_sys::console::log_1(&"[VfsShell] Namespace built".into());
 
-        // Create Tcl shell
-        let subject = hyprstream_rpc::Subject::anonymous();
         let shell = hyprstream_workers_tcl::TclShell::new(subject, ns);
 
         Ok(VfsShell {
