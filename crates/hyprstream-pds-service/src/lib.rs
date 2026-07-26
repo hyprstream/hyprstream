@@ -349,7 +349,7 @@ mod tests {
         sign_genesis, GenesisRepoHead, GenesisRotationKeys, HostKeyEnrollment, HybridRotationKey,
         RecoveryKeyEnrollment, UserRotationKey,
     };
-    use hyprstream_pds::{AllocatedAccountName, Cid, HostedAccountMint};
+    use hyprstream_pds::{AllocatedAccountName, HostedAccountMint};
     use hyprstream_rpc::Subject;
     use hyprstream_vfs::{SyntheticMount, SyntheticNode};
     use rand::rngs::OsRng;
@@ -366,9 +366,10 @@ mod tests {
         )
         .unwrap();
         let name = AllocatedAccountName::new(label, format!("did:web:{label}.{zone}")).unwrap();
-        let pending = HostedAccountMint::begin(name, rotations)
-            .unwrap()
-            .prepare_genesis(Cid::from_raw(zone.as_bytes()), GenesisRepoHead::EmptyRepo)
+        let mint = HostedAccountMint::begin(name, rotations).unwrap();
+        let document = mint.seal_did_document("https://pds.example.com").unwrap();
+        let pending = mint
+            .prepare_genesis(document, GenesisRepoHead::EmptyRepo)
             .unwrap();
         let signature = sign_genesis(pending.unsigned_genesis(), &ed, &pq).unwrap();
         pending.seal(signature).unwrap().record_bytes().to_vec()

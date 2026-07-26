@@ -36,6 +36,7 @@ tracing = { workspace = true }
 # resolved DID document, so the trust-chain primitive is self-contained.
 serde_json = { workspace = true }
 bs58 = "0.5"
+url = { workspace = true }
 # Note: DAG-CBOR + CIDv1 + varints are hand-rolled in src/dag_cbor.rs and
 # src/cid.rs to enforce the determinism invariants (sorted keys, minimal ints,
 # tag-42 links) that serde-driven CBOR cannot guarantee. No CBOR/CID crate dep.
@@ -56,6 +57,7 @@ git2db = { path = "../git2db" }
 git2 = { workspace = true }
 # Temp dirs for the git2db registry + source repos.
 tempfile = { workspace = true }
+hex = { workspace = true }
 # Async test runtime (git2db commit/clone are async).
 tokio = { workspace = true }
 tokio-test = { workspace = true }
