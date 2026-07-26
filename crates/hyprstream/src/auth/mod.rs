@@ -34,7 +34,10 @@ pub use op_log::{
     FixedGenerationSource, SealedHeadEs256Source, SealedOpLogHead,
 };
 pub use key_rotation::{MlDsaSigningKeyStore, MlDsaKeySlot};
-pub use policy_manager::{PolicyManager, PolicyError, write_policy_file, global_policy_manager, set_global_policy_manager};
+pub use policy_manager::{
+    federation_registration_resource, global_policy_manager, set_global_policy_manager,
+    write_policy_file, PolicyError, PolicyManager,
+};
 pub use policy_migration::migrate_policy_csv;
 pub use policy_templates::{PolicyTemplate, ServicePolicyRule, SERVICE_BASE_POLICIES, get_template, get_templates};
 pub use user_store::{DeviceRecord, DeviceStore, KeyAlgorithm, UserFilter, UserProfile, UserProfilePatch, UserStore, PubkeyEntry, pubkey_fingerprint, decode_pubkey_base64};

@@ -2253,6 +2253,22 @@ mod tests {
             )
             .await
             .expect("test: broad deputy grant");
+        let allowed_federation =
+            crate::auth::federation_registration_resource("https://allowed.example")
+                .expect("test: federation resource");
+        let blocked_federation =
+            crate::auth::federation_registration_resource("https://blocked.example")
+                .expect("test: federation resource");
+        manager
+            .add_policy_with_domain(
+                "*",
+                "*",
+                &allowed_federation,
+                "check",
+                "allow",
+            )
+            .await
+            .expect("test: per-origin federation grant");
 
         let endpoint = format!("policy-delegation-{}", rand::random::<u64>());
         let policy_key = SigningKey::from_bytes(&[0x70; 32]);
@@ -2317,6 +2333,31 @@ mod tests {
             None,
         )
         .expect("test: policy client");
+
+        let allowed_origin = client
+            .check(&PolicyCheck {
+                subject: String::new(),
+                domain: String::new(),
+                resource: allowed_federation,
+                operation: "check".to_owned(),
+            })
+            .await
+            .expect("test: allowlisted federation decision");
+        assert!(allowed_origin, "the allowlisted origin must be admitted");
+
+        let blocked_origin = client
+            .check(&PolicyCheck {
+                subject: String::new(),
+                domain: String::new(),
+                resource: blocked_federation,
+                operation: "check".to_owned(),
+            })
+            .await
+            .expect("test: non-allowlisted federation decision");
+        assert!(
+            !blocked_origin,
+            "the decision must vary by origin, not the deputy service"
+        );
 
         let allowed = client
             .clone()

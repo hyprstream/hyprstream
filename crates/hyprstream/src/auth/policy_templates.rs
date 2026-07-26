@@ -142,9 +142,9 @@ pub const SERVICE_BASE_POLICIES: &[ServicePolicyRule] = &[
     //
     // Operators opt in by applying the `federation-open` template, or
     // by allowlisting specific origins:
-    //   p, https://app.partner.org,        *, federation:register, check, allow
-    //   p, https://*.partner.org,          *, federation:register, check, allow
-    //   p, https://hyprstream.partner.org, *, federation:register, check, allow
+    //   p, *, *, federation:register:https://app.partner.org,        check, allow
+    //   p, *, *, federation:register:https://*.partner.org,          check, allow
+    //   p, *, *, federation:register:https://hyprstream.partner.org, check, allow
     //
     // The same rule shape covers a CIMD client at app.partner.org and
     // a peer hyprstream instance at hyprstream.partner.org. Wizard may
@@ -239,7 +239,7 @@ pub fn get_templates() -> &'static [PolicyTemplate] {
                 ServicePolicyRule {
                     subject: "*",
                     domain: "*",
-                    resource: "federation:register",
+                    resource: "federation:register:*",
                     action: "check",
                     effect: "allow",
                 },
