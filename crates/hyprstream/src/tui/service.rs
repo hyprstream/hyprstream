@@ -248,18 +248,23 @@ impl TuiService {
         let policy_client = self.policy_client.as_ref().ok_or_else(|| {
             anyhow::anyhow!("Authorization denied: no policy client configured")
         })?;
-        let allowed = policy_client
-            .check(&crate::services::generated::policy_client::PolicyCheck {
-                subject: subject.clone(),
-                domain,
-                resource: resource.to_owned(),
-                operation: operation.to_owned(),
-            })
-            .await
-            .unwrap_or_else(|e| {
-                warn!("TUI policy check failed for {}: {}", subject, e);
-                false
-            });
+        let request = crate::services::generated::policy_client::PolicyCheck {
+            subject: subject.clone(),
+            domain,
+            resource: resource.to_owned(),
+            operation: operation.to_owned(),
+        };
+        let allowed = crate::services::policy::check_with_verified_bearer(
+            policy_client,
+            &request,
+            ctx.jwt_token(),
+            &ctx.subject(),
+        )
+        .await
+        .unwrap_or_else(|e| {
+            warn!("TUI policy check failed for {}: {}", subject, e);
+            false
+        });
         if !allowed {
             anyhow::bail!("Unauthorized: {} cannot {} on {}", subject, operation, resource);
         }

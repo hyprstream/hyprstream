@@ -192,15 +192,20 @@ impl MetricsHandler for MetricsService {
         // MetricRecord nor view_metadata carries a tenant key. Keep policy
         // checks in the global domain instead of claiming tenant isolation that
         // the storage layer does not provide.
-        let allowed = self.policy_client
-            .check(&PolicyCheck {
-                subject: subject.clone(),
-                domain: "*".to_owned(),
-                resource: resource.to_owned(),
-                operation: operation.to_owned(),
-            })
-            .await
-            .map_err(|e| anyhow::anyhow!("Policy check error for {}: {}", subject, e))?;
+        let request = PolicyCheck {
+            subject: subject.clone(),
+            domain: "*".to_owned(),
+            resource: resource.to_owned(),
+            operation: operation.to_owned(),
+        };
+        let allowed = crate::services::policy::check_with_verified_bearer(
+            &self.policy_client,
+            &request,
+            ctx.jwt_token(),
+            &ctx.subject(),
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("Policy check error for {}: {}", subject, e))?;
         if allowed {
             Ok(())
         } else {

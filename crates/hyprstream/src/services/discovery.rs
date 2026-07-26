@@ -56,15 +56,21 @@ impl AuthorizationProvider for PolicyAuthProvider {
         domain: &str,
         resource: &str,
         operation: &str,
+        bearer: Option<&str>,
     ) -> anyhow::Result<bool> {
-        self.client
-            .check(&PolicyCheck {
-                subject: subject.to_owned(),
-                domain: domain.to_owned(),
-                resource: resource.to_owned(),
-                operation: operation.to_owned(),
-            })
-            .await
+        let request = PolicyCheck {
+            subject: subject.to_owned(),
+            domain: domain.to_owned(),
+            resource: resource.to_owned(),
+            operation: operation.to_owned(),
+        };
+        crate::services::policy::check_with_verified_bearer(
+            &self.client,
+            &request,
+            bearer,
+            &hyprstream_rpc::envelope::Subject::new(subject),
+        )
+        .await
     }
 }
 

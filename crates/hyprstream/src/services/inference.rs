@@ -2250,7 +2250,20 @@ impl InferenceHandler for InferenceService {
         let subject = ctx.subject();
         let domain = self.authorization_domain(ctx)?;
         enforce_inference_mac(ctx, &self.object_label)?;
-        let allowed = self.policy_client.check(&PolicyCheck { subject: subject.to_string(), domain, resource: resource.to_owned(), operation: operation.to_owned() }).await.unwrap_or_else(|e| {
+        let request = PolicyCheck {
+            subject: subject.to_string(),
+            domain,
+            resource: resource.to_owned(),
+            operation: operation.to_owned(),
+        };
+        let allowed = crate::services::policy::check_with_verified_bearer(
+            &self.policy_client,
+            &request,
+            ctx.jwt_token(),
+            &ctx.subject(),
+        )
+        .await
+        .unwrap_or_else(|e| {
             warn!("Policy check failed for {} on {}: {} - denying access", subject, resource, e);
             false
         });

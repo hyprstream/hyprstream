@@ -809,14 +809,30 @@ impl PolicyManager {
         &self,
         template: &crate::auth::policy_templates::PolicyTemplate,
     ) -> Result<(), PolicyError> {
+        let policies = template.expanded_policies();
+        let tenant_domains: std::collections::BTreeSet<&str> = policies
+            .iter()
+            .map(|policy| policy.domain)
+            .filter(|domain| *domain != "*")
+            .collect();
+        if template.groupings.is_some() && tenant_domains.len() > 1 {
+            return Err(PolicyError::ValidationError(format!(
+                "template '{}' has role assignments spanning multiple tenant domains",
+                template.name
+            )));
+        }
+
+        // Validate the complete template before mutating the enforcer so a
+        // rejected multi-tenant grouping cannot leave partial policy rows.
         let mut enforcer = self.enforcer.write().await;
 
         // Add policy rules
-        let policies = template.expanded_policies();
-        let policy_vecs: Vec<Vec<String>> = policies.iter().map(ServicePolicyRule::to_vec).collect();
+        let policy_vecs: Vec<Vec<String>> = policies
+            .iter()
+            .map(ServicePolicyRule::to_vec)
+            .collect();
         if !policy_vecs.is_empty() {
-            enforcer
-                .add_policies(policy_vecs)
+            enforcer.add_policies(policy_vecs)
                 .await
                 .map_err(PolicyError::CasbinError)?;
         }
@@ -826,18 +842,6 @@ impl PolicyManager {
         // templates retain g memberships, which the model evaluates only when
         // the verified request domain itself is `*`.
         if let Some(groupings) = template.groupings {
-            let tenant_domains: std::collections::BTreeSet<&str> = policies
-                .iter()
-                .map(|policy| policy.domain)
-                .filter(|domain| *domain != "*")
-                .collect();
-            if tenant_domains.len() > 1 {
-                return Err(PolicyError::ValidationError(format!(
-                    "template '{}' has role assignments spanning multiple tenant domains",
-                    template.name
-                )));
-            }
-
             if let Some(domain) = tenant_domains.first() {
                 for grouping in groupings {
                     enforcer

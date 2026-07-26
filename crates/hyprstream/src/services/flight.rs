@@ -114,16 +114,22 @@ impl hyprstream_flight::FlightAuthorizer for TenantFlightAuthorizer {
                 "Verified hosted-account tenant binding required".to_owned(),
             )
         })?;
-        let allowed = self
-            .policy_client
-            .check(&crate::services::generated::policy_client::PolicyCheck {
-                subject: identity.user,
-                domain,
-                resource: resource.to_owned(),
-                operation: operation.to_owned(),
-            })
-            .await
-            .unwrap_or(false);
+        let upstream_subject =
+            hyprstream_rpc::envelope::Subject::new(identity.user.clone());
+        let request = crate::services::generated::policy_client::PolicyCheck {
+            subject: identity.user,
+            domain,
+            resource: resource.to_owned(),
+            operation: operation.to_owned(),
+        };
+        let allowed = crate::services::policy::check_with_verified_bearer(
+            &self.policy_client,
+            &request,
+            Some(token),
+            &upstream_subject,
+        )
+        .await
+        .unwrap_or(false);
         if allowed {
             Ok(())
         } else {

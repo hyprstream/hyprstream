@@ -32,6 +32,7 @@ pub type AuthorizeFn = Arc<
             String,
             String,
             String,
+            Option<String>,
         ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool>> + Send>>
         + Send
         + Sync,
@@ -557,9 +558,15 @@ impl EnvelopeContext {
         claims.security_context(key_material)
     }
 
-    /// Get the raw JWT token from the envelope (if present).
+    /// Get the effective verified JWT token from the envelope.
+    ///
+    /// For an authorized relay this is the delegated bearer, allowing a
+    /// downstream service to preserve the original user's verified identity
+    /// across another local service boundary.
     pub fn jwt_token(&self) -> Option<&str> {
-        self.jwt_token.as_deref()
+        self.jwt_token
+            .as_deref()
+            .or(self.delegation_token.as_deref())
     }
 
     /// Check if request has user context
@@ -1579,13 +1586,14 @@ mod empty_iss_gate_tests {
         let token = empty_iss_token(&ca);
         let mut ctx = ctx_with_token(token.clone(), /* is_local_caller */ true);
         ctx.jwt_token = None;
-        ctx.delegation_token = Some(token);
+        ctx.delegation_token = Some(token.clone());
         ctx.cnf = relay;
 
         svc.verify_claims(&mut ctx)
             .await
             .expect("the pinned relay may delegate a bearer for re-verification");
         assert_eq!(ctx.subject().name(), Some("alice"));
+        assert_eq!(ctx.jwt_token(), Some(token.as_str()));
     }
 
     #[tokio::test]

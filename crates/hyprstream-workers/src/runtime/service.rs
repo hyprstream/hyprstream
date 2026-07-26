@@ -34,9 +34,9 @@ use tracing::{debug, info, warn};
 // RPC service infrastructure from hyprstream-rpc: the pluggable Cap'n Proto
 // bridged transport (inproc/UDS/QUIC/iroh) + the moq streaming plane. ZMQ is
 // gone (#138/#167) — this is not a ZMQ socket API.
+use hyprstream_rpc::moq_stream::AnyStreamPublisher;
 use hyprstream_rpc::prelude::SigningKey;
 use hyprstream_rpc::service::{AuthorizeFn, EnvelopeContext, RequestService};
-use hyprstream_rpc::moq_stream::AnyStreamPublisher;
 use hyprstream_rpc::streaming::StreamChannel;
 use hyprstream_rpc::transport::TransportConfig;
 
@@ -1398,11 +1398,18 @@ impl WorkerHandler for WorkerService {
         if let Some(ref auth_fn) = self.authorize_fn {
             let subject = ctx.subject().to_string();
             let domain = ctx.domain()?;
-            let allowed = auth_fn(subject.clone(), domain, resource.to_owned(), operation.to_owned()).await
-                .unwrap_or_else(|e| {
-                    warn!("Policy check failed for {} on {}: {} - denying access", subject, resource, e);
-                    false
-                });
+            let allowed = auth_fn(
+                subject.clone(),
+                domain,
+                resource.to_owned(),
+                operation.to_owned(),
+                ctx.jwt_token().map(str::to_owned),
+            )
+            .await
+            .unwrap_or_else(|e| {
+                warn!("Policy check failed for {} on {}: {} - denying access", subject, resource, e);
+                false
+            });
             if allowed {
                 Ok(())
             } else {

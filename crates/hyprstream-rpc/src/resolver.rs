@@ -428,6 +428,37 @@ impl RpcClient for ResolvedRpcClient {
         })
         .await
     }
+
+    async fn call_with_options_for_service_with_method(
+        &self,
+        service: &str,
+        method_discriminator: u16,
+        payload: Vec<u8>,
+        options: CallOptions,
+    ) -> anyhow::Result<Vec<u8>> {
+        anyhow::ensure!(
+            service == self.service_name,
+            "generated service authority mismatch"
+        );
+        let service = service.to_owned();
+        self.attempt(|client| {
+            let payload = payload.clone();
+            let options = options.clone();
+            let service = service.clone();
+            async move {
+                client
+                    .call_with_options_for_service_with_method(
+                        &service,
+                        method_discriminator,
+                        payload,
+                        options,
+                    )
+                    .await
+            }
+        })
+        .await
+    }
+
     async fn call_streaming(
         &self,
         payload: Vec<u8>,

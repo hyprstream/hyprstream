@@ -86,6 +86,13 @@ pub const SERVICE_BASE_POLICIES: &[ServicePolicyRule] = &[
     ServicePolicyRule { subject: "service:notification", domain: "*", resource: "policy:*", action: "check", effect: "allow" },
     ServicePolicyRule { subject: "service:metrics", domain: "*", resource: "policy:*", action: "check", effect: "allow" },
     ServicePolicyRule { subject: "service:mcp", domain: "*", resource: "policy:*", action: "*", effect: "allow" },
+    ServicePolicyRule {
+        subject: "service:flight",
+        domain: "*",
+        resource: "policy:*",
+        action: "check",
+        effect: "allow",
+    },
     // Service key resolution: any service can resolve other service keys via policy
     ServicePolicyRule { subject: "service:oauth", domain: "*", resource: "policy:*", action: "query", effect: "allow" },
     ServicePolicyRule { subject: "service:registry", domain: "*", resource: "policy:*", action: "query", effect: "allow" },

@@ -47,12 +47,32 @@ use crate::services::PolicyClient;
 /// The returned closure is async-compatible (returns a boxed future) so it
 /// works on single-threaded runtimes used by RequestService.
 pub fn build_authorize_fn(policy_client: PolicyClient) -> AuthorizeFn {
-    Arc::new(move |subject: String, domain: String, resource: String, operation: String| {
-        let client = policy_client.clone();
-        Box::pin(async move {
-            client.check(&PolicyCheck { subject, domain, resource, operation }).await
-        })
-    })
+    Arc::new(
+        move |subject: String,
+              domain: String,
+              resource: String,
+              operation: String,
+              bearer: Option<String>| {
+            let client = policy_client.clone();
+            Box::pin(async move {
+                let upstream_subject =
+                    hyprstream_rpc::envelope::Subject::new(subject.clone());
+                let request = PolicyCheck {
+                    subject,
+                    domain,
+                    resource,
+                    operation,
+                };
+                crate::services::policy::check_with_verified_bearer(
+                    &client,
+                    &request,
+                    bearer.as_deref(),
+                    &upstream_subject,
+                )
+                .await
+            })
+        },
+    )
 }
 
 // WorkerZmqClient / attach_container removed — use generated WorkerClient +
