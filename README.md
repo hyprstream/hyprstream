@@ -342,7 +342,12 @@ export HYPRSTREAM_SERVER_PORT=6789
 
 # CORS settings
 export HYPRSTREAM_CORS_ENABLED=true
+# This is the default: browser authority is carried by Bearer/DPoP headers,
+# so the product and MCP APIs allow any origin without ambient credentials.
 export HYPRSTREAM_CORS_ORIGINS="*"
+# Legacy cookie/HTTP-auth deployments must use an exact list before opting in:
+# export HYPRSTREAM_CORS_ORIGINS="https://app.example"
+# export HYPRSTREAM_CORS_CREDENTIALS=true
 
 # Model management
 export HYPRSTREAM_PRELOAD_MODELS=model1,model2,model3

@@ -80,6 +80,12 @@ pub struct ServerState {
     /// before checkpoint resolution and hybrid projection signing.
     pub browser_provisioning_rate_limiter: Arc<crate::server::middleware::RateLimiter>,
 
+    /// Stable global limiter for public metadata and pre-upgrade routes.
+    ///
+    /// There is no authenticated tenant on these routes, and client-controlled
+    /// forwarding headers must not select independent buckets.
+    pub public_route_rate_limiter: Arc<crate::server::middleware::RateLimiter>,
+
     /// Mandatory resolver-backed, audited PEP shared by every 9P transport.
     pub ninep_decider: Arc<dyn hyprstream_9p::AccessDecider>,
 }
@@ -245,6 +251,9 @@ impl ServerState {
             browser_provisioning_rate_limiter: Arc::new(
                 crate::server::middleware::RateLimiter::new(60, 60),
             ),
+            public_route_rate_limiter: Arc::new(crate::server::middleware::RateLimiter::new(
+                3_000, 60,
+            )),
             ninep_decider,
         })
     }

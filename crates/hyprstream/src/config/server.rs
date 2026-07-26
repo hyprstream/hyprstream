@@ -18,11 +18,20 @@ pub struct CorsConfig {
     #[serde(default = "default_cors_enabled")]
     pub enabled: bool,
 
-    /// Allowed origins (use ["*"] for all origins - NOT recommended for production)
+    /// Allowed origins.
+    ///
+    /// The default is `["*"]` because these HTTP resource faces carry authority
+    /// explicitly in Bearer/DPoP headers, never in ambient browser credentials.
+    /// Operators may still configure an exact origin list; pairing that list
+    /// with `allow_credentials = true` preserves the legacy deployment posture.
     #[serde(default = "default_cors_origins")]
     pub allowed_origins: Vec<String>,
 
-    /// Allow credentials in CORS requests
+    /// Allow ambient browser credentials (cookies or HTTP authentication).
+    ///
+    /// Disabled by default. Bearer and DPoP request headers do not require this
+    /// flag and remain subject to the normal authentication, tenant, and MAC
+    /// enforcement path.
     #[serde(default = "default_cors_credentials")]
     pub allow_credentials: bool,
 
@@ -47,15 +56,10 @@ fn default_cors_enabled() -> bool {
     true
 }
 fn default_cors_origins() -> Vec<String> {
-    vec![
-        "http://localhost:3000".to_owned(),
-        "http://localhost:3001".to_owned(),
-        "http://127.0.0.1:3000".to_owned(),
-        "http://127.0.0.1:3001".to_owned(),
-    ]
+    vec!["*".to_owned()]
 }
 fn default_cors_credentials() -> bool {
-    true
+    false
 }
 fn default_cors_max_age() -> u64 {
     3600
@@ -358,7 +362,6 @@ impl ServerConfigBuilder {
         self
     }
 
-    
     pub fn cancellation_check_interval(mut self, interval: u64) -> Self {
         self.config.cancellation_check_interval = interval;
         self
@@ -454,7 +457,6 @@ impl ServerConfigBuilder {
             }
         }
 
-        
         if let Ok(interval) = std::env::var("HYPRSTREAM_CANCELLATION_CHECK_INTERVAL") {
             if let Ok(i) = interval.parse() {
                 self.config.cancellation_check_interval = i;
@@ -494,7 +496,15 @@ impl ServerConfigBuilder {
         }
 
         if let Ok(cors_credentials) = std::env::var("HYPRSTREAM_CORS_CREDENTIALS") {
-            if !self.config.cors.allowed_origins.contains(&"*".to_owned()) {
+            if self.config.cors.allowed_origins.contains(&"*".to_owned()) {
+                if cors_credentials.eq_ignore_ascii_case("true") {
+                    tracing::warn!(
+                        "HYPRSTREAM_CORS_CREDENTIALS=true ignored: wildcard CORS origins require \
+                         credentials to remain disabled; set HYPRSTREAM_CORS_ORIGINS to an exact \
+                         origin list before enabling credentials"
+                    );
+                }
+            } else {
                 self.config.cors.allow_credentials = cors_credentials.to_lowercase() == "true";
             }
         }
@@ -557,8 +567,7 @@ mod tests {
         for seg in rel.split('/') {
             p.push(seg);
         }
-        std::fs::read_to_string(&p)
-            .unwrap_or_else(|e| panic!("could not read src/{rel}: {e}"))
+        std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("could not read src/{rel}: {e}"))
     }
 
     /// The four TLS knobs + mTLS CA + the two CORS helpers must not reappear in
