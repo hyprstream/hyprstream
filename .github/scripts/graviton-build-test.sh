@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Merge-gate build + test for the self-hosted Graviton (arm64) fleet, run INSIDE
-# the rust-builder container as a NON-ROOT user (#1011). rust.yml invokes it as:
+# Merge-gate browser-WASM check + native build/test for the self-hosted Graviton
+# (arm64) fleet, run INSIDE the rust-builder container as a NON-ROOT user
+# (#1011). rust.yml invokes it as:
 #   runuser -u ci -- bash -euo pipefail /build/.github/scripts/graviton-build-test.sh
 # from the bind-mounted workspace (cwd = /build). Root-only setup (cargo-nextest,
 # git-lfs, wasm rustup targets, the ci user + perms) happens in the workflow before
@@ -40,6 +41,13 @@ run_phase() {
   return "${status}"
 }
 
+# Fail fast on browser-only composition regressions in the required merge-gate
+# job. Keep the WebTransport cfg scoped to this command so it cannot leak into
+# the native release/test phases below. This reuses the same checkout, target,
+# sccache process, and container instead of consuming another runner slot.
+run_phase "browser WASM check" env RUSTFLAGS=--cfg=web_sys_unstable_apis \
+  cargo check --target wasm32-unknown-unknown -p hyprstream-rpc
+
 # Default features (parity with the former x86 gate); libtorch is the image's
 # aarch64 wheel at /opt/libtorch, so NO download-libtorch feature here.
 run_phase "native release build" cargo build --release
@@ -57,8 +65,11 @@ export HYPRSTREAM_FSGUEST_WASM="${PWD}/crates/hyprstream-workers-wasmtime-fsgues
 # nextest ci profile enforces the per-test slow-timeout from .config/nextest.toml;
 # fail-fast (the default) is what the merge gate wants.
 run_phase "nextest" cargo nextest run --cargo-profile ci-test --profile ci
-# nextest does not run doctests; keep them in the merge gate.
-run_phase "doctests" cargo test --release --doc
+# nextest does not run doctests; keep them in the merge gate. Use the ci-test
+# cargo profile (not --release) so doctests skip release ThinLTO — #1010's
+# acceptance criterion: a measured 318s doctest phase was paying release LTO
+# for almost no runtime win on doc examples. Parity with the nextest profile.
+run_phase "doctests" cargo test --profile ci-test --doc
 
 echo "::group::sccache statistics"
 sccache --show-stats
