@@ -42,6 +42,7 @@ use tokio::sync::RwLock;
 use tracing::debug;
 use zeroize::Zeroizing;
 
+use crate::auth::mac::{MacDecision, MoqEventAction, MoqEventPep};
 use crate::crypto::cose_sign::{sign_composite, verify_composite};
 use crate::crypto::event_crypto::{
     build_epoch_event_sig_message, decrypt_epoch_event, derive_event_nonce, encrypt_epoch_event,
@@ -293,6 +294,10 @@ pub trait EventAuthz: Send + Sync {
     /// May `caller` subscribe to the group/`prefix`? Maps to the `subscribe`
     /// ScopeAction.
     fn can_subscribe(&self, caller: &Subject, prefix: &str) -> bool;
+    /// May `caller` receive an encrypted epoch key and decrypt this prefix?
+    fn can_join_decrypt(&self, caller: &Subject, prefix: &str) -> bool {
+        self.can_subscribe(caller, prefix)
+    }
 }
 
 /// Fail-closed authz: denies every publish/subscribe. The default for the
@@ -319,6 +324,45 @@ impl EventAuthz for AllowAllEventAuthz {
     }
     fn can_subscribe(&self, _caller: &Subject, _prefix: &str) -> bool {
         true
+    }
+}
+
+/// Adapter from the canonical MAC contract to the event authorization surface.
+///
+/// Constructing this type installs an active PEP, so all missing clearance or
+/// object labels fail closed. Public publishers/subscribers retain
+/// [`AllowAllEventAuthz`] until an operator explicitly installs this adapter;
+/// that dormant state is the canonical pre-activation pass-through.
+pub struct MacEventAuthz {
+    pep: MoqEventPep,
+}
+
+impl MacEventAuthz {
+    pub fn new(pep: MoqEventPep) -> Self {
+        Self { pep }
+    }
+}
+
+impl EventAuthz for MacEventAuthz {
+    fn can_publish(&self, caller: &Subject, prefix: &str) -> bool {
+        matches!(
+            self.pep.check(caller, prefix, MoqEventAction::Publish),
+            MacDecision::Permit
+        )
+    }
+
+    fn can_subscribe(&self, caller: &Subject, prefix: &str) -> bool {
+        matches!(
+            self.pep.check(caller, prefix, MoqEventAction::Subscribe),
+            MacDecision::Permit
+        )
+    }
+
+    fn can_join_decrypt(&self, caller: &Subject, prefix: &str) -> bool {
+        matches!(
+            self.pep.check(caller, prefix, MoqEventAction::JoinDecrypt),
+            MacDecision::Permit
+        )
     }
 }
 
@@ -653,21 +697,22 @@ impl EventPublisher {
             .get_mut(&key)
             .ok_or_else(|| anyhow!("prefix '{prefix}' not registered"))?;
 
+        let caller = match &self.publisher_identity.did {
+            Some(did) => Subject::new(did.clone()),
+            None => Subject::anonymous(),
+        };
+        let object = if state.confidential { &key } else { &prefix };
+        if !self.authz.can_publish(&caller, object) {
+            return Err(anyhow!(
+                "publish denied by event-plane authz for prefix '{prefix}'"
+            ));
+        }
         if !state.confidential {
             return state.moq.publish_raw(topic, payload);
         }
         let crypto = state.crypto.as_mut().ok_or_else(|| {
             anyhow!("confidential prefix '{prefix}' has no committed controller epoch installed")
         })?;
-        let caller = match &self.publisher_identity.did {
-            Some(did) => Subject::new(did.clone()),
-            None => Subject::anonymous(),
-        };
-        if !self.authz.can_publish(&caller, &prefix) {
-            return Err(anyhow!(
-                "publish denied by event-plane authz for prefix '{prefix}'"
-            ));
-        }
         let signing_key = self
             .signing_key
             .as_ref()
@@ -876,6 +921,12 @@ pub struct EventSubscriber {
     prefixes: Arc<RwLock<HashMap<String, SubscriberPrefixState>>>,
     /// One verified tenant/domain per confidential subscriber instance.
     tenant: Arc<RwLock<Option<String>>>,
+    /// Dormant pass-through by default; an injected MAC adapter is active and
+    /// fail-closed.
+    authz: Arc<dyn EventAuthz>,
+    /// Verified subscriber identity, or anonymous when the carrier has not
+    /// supplied an independently authenticated application subject.
+    caller: Subject,
 }
 
 impl EventSubscriber {
@@ -884,7 +935,22 @@ impl EventSubscriber {
             inner: MoqEventSubscriber::new(),
             prefixes: Arc::new(RwLock::new(HashMap::new())),
             tenant: Arc::new(RwLock::new(None)),
+            authz: Arc::new(AllowAllEventAuthz),
+            caller: Subject::anonymous(),
         })
+    }
+
+    /// Install event-plane authorization. Installing [`MacEventAuthz`] makes
+    /// missing subject clearance and missing object labels deny.
+    pub fn with_authz(mut self, authz: Arc<dyn EventAuthz>) -> Self {
+        self.authz = authz;
+        self
+    }
+
+    /// Bind the subscriber to an independently verified application subject.
+    pub fn with_caller(mut self, caller: Subject) -> Self {
+        self.caller = caller;
+        self
     }
 
     pub fn subscribe(&mut self, pattern: &str) -> Result<()> {
@@ -1015,8 +1081,13 @@ impl EventSubscriber {
                     .to_owned(),
             );
         }
-        let key = open_epoch_grant(recipient, grant)?;
         let prefix_key = self.encrypted_prefix_key(prefix).await?;
+        if !self.authz.can_join_decrypt(&self.caller, &prefix_key) {
+            return Err(format!(
+                "join/decrypt denied by event-plane MAC for prefix '{prefix}'"
+            ));
+        }
+        let key = open_epoch_grant(recipient, grant)?;
         let mut prefixes = self.prefixes.write().await;
         match prefixes.get_mut(&prefix_key) {
             None => Err(
@@ -1185,7 +1256,10 @@ impl EventSubscriber {
     /// Try to receive without blocking. Same decode/decrypt behavior as
     /// [`Self::recv`], except a frame that fails to decode/verify/decrypt is
     /// dropped and `Ok(None)` returned immediately rather than continuing to
-    /// poll (this method must not block).
+    /// poll (this method must not block). Authorization denials are different:
+    /// they are returned as an explicit error (and an installed MAC adapter
+    /// audits the denial) so callers cannot confuse enforcement with an empty
+    /// queue.
     pub fn try_recv(&mut self) -> Result<Option<(String, Vec<u8>)>> {
         let Some((topic, raw)) = self.inner.try_recv()? else {
             return Ok(None);
@@ -1197,6 +1271,11 @@ impl EventSubscriber {
             // `recv_timeout(Duration::ZERO)` instead.
             return Err(anyhow!(
                 "try_recv() does not support decoding encrypted prefixes; use recv_timeout(Duration::ZERO)"
+            ));
+        }
+        if !self.authz.can_subscribe(&self.caller, prefix) {
+            return Err(anyhow!(
+                "subscribe denied by event-plane MAC for prefix '{prefix}'"
             ));
         }
         Ok(Some((topic, raw)))
@@ -1223,8 +1302,19 @@ impl EventSubscriber {
     async fn decode_frame(&self, topic: &str, raw: &[u8]) -> FrameOutcome {
         let prefix = topic.split('.').next().unwrap_or(topic);
         let Ok(key) = self.encrypted_prefix_key(prefix).await else {
-            return FrameOutcome::Passthrough;
+            return if self.authz.can_subscribe(&self.caller, prefix) {
+                FrameOutcome::Passthrough
+            } else {
+                FrameOutcome::Drop(
+                    "subscribe denied by event-plane MAC for public prefix".to_owned(),
+                )
+            };
         };
+        if !self.authz.can_subscribe(&self.caller, &key) {
+            return FrameOutcome::Drop(
+                "subscribe denied by event-plane MAC for tenant-qualified prefix".to_owned(),
+            );
+        }
         let mut prefixes = self.prefixes.write().await;
         let state = match prefixes.get_mut(&key) {
             None => return FrameOutcome::Passthrough,
@@ -1396,6 +1486,40 @@ mod tests {
         let mut secret = [0u8; 32];
         rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut secret);
         SigningKey::from_bytes(&secret)
+    }
+
+    #[tokio::test]
+    async fn try_recv_surfaces_subscribe_denial_as_error() {
+        let origin = crate::moq_event::MoqEventOrigin::new();
+        let source = format!("mac-deny-{}", rand::random::<u64>());
+        let mut publisher = origin.publisher(&source).unwrap();
+        let mut subscriber = EventSubscriber {
+            inner: MoqEventSubscriber::new_for_test(origin.consumer()),
+            prefixes: Arc::new(RwLock::new(HashMap::new())),
+            tenant: Arc::new(RwLock::new(None)),
+            authz: Arc::new(DenyAllEventAuthz),
+            caller: Subject::new("did:web:denied"),
+        };
+        subscriber.subscribe(&format!("{source}.")).unwrap();
+
+        // Start the background reader, then publish until it has relayed a
+        // frame into this subscriber's non-blocking queue.
+        assert!(subscriber.try_recv().unwrap().is_none());
+        for _ in 0..50 {
+            publisher.publish("object", "changed", b"payload").unwrap();
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            match subscriber.try_recv() {
+                Err(error) => {
+                    assert!(error
+                        .to_string()
+                        .contains("subscribe denied by event-plane MAC"));
+                    return;
+                }
+                Ok(None) => {}
+                Ok(Some(_)) => panic!("denied event must never be returned"),
+            }
+        }
+        panic!("subscriber did not observe the test frame");
     }
 
     fn member(recipient: &RecipientKeypair, did: &str, blind: u8) -> GroupMembership {

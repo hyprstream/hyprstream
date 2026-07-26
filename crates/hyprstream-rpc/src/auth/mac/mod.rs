@@ -116,23 +116,26 @@ pub mod genesis;
 pub mod label;
 pub mod lattice;
 pub mod manifest;
+pub mod pep;
 
 pub use bind::{clamp_descendant, BindLabel, BindLabelMap};
+pub use context::{SecurityContext, SubjectContextClaims, VerifiedKeyMaterial};
 #[cfg(not(target_arch = "wasm32"))]
 pub use dispatch_pep::{
     check_dispatch_mac, global_mac_dispatch_pep, install_mac_dispatch_pep, DefaultMacDispatchPep,
     DenyAllMacPep, DenyAllObjectResolver, MacDecision, MacDenyReason, MacDispatchPep,
     RpcObjectLabelResolver,
 };
-pub use context::{SecurityContext, SubjectContextClaims, VerifiedKeyMaterial};
 pub use genesis::{GenesisMap, GenesisReport};
-pub use label::{
-    Assurance, Compartment, CompartmentSet, Level, SecurityLabel, MAX_COMPARTMENTS,
-};
+pub use label::{Assurance, Compartment, CompartmentSet, Level, SecurityLabel, MAX_COMPARTMENTS};
 pub use lattice::{LabelError, Lattice, LatticeCodecError, LatticeDecodeError, LatticeVersion};
 pub use manifest::{
     bind_time_label, import_label, ContentBoundLabel, LabeledObject, ObjectLabelResolver,
     ObjectRef, StaticNodeLabel,
+};
+pub use pep::{
+    ClearanceSource, DenyAllClearanceSource, MoqEventAction, MoqEventPep, MoqMacAuditReason,
+    MoqMacAuditRecord, MoqMacAuditSink,
 };
 
 #[cfg(test)]
@@ -231,7 +234,8 @@ mod integration_tests {
         // A derived object sealed from a secret + a classical input is
         // secret/pq-hybrid — and a merely-classical subject can't read it.
         let secret_in = SecurityLabel::new(Level::Secret, Assurance::PqHybrid, comps(&[0]));
-        let public_in = SecurityLabel::new(Level::Public, Assurance::Classical, CompartmentSet::EMPTY);
+        let public_in =
+            SecurityLabel::new(Level::Public, Assurance::Classical, CompartmentSet::EMPTY);
         let derived = SecurityLabel::join_all([&secret_in, &public_in]);
         let object = StaticNodeLabel::labeled(derived);
 

@@ -593,6 +593,10 @@ mod tests {
         let conn2 = client.connect(direct_addr(&server), ALPN_MOQ_LITE).await?;
         drop(conn2);
 
+        // Release every caller-owned connection before draining the routers.
+        // Keeping this RPC handle alive races noq's driver teardown and can
+        // intermittently trip its GSO-batch alignment assertion.
+        drop(conn);
         client.shutdown().await?;
         server.shutdown().await?;
         Ok(())

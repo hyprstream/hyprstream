@@ -281,11 +281,19 @@ impl CasPep {
             .clearance_source
             .clearance_for(subject_id, verified_tenant)
         else {
-            return self.audit(None, label, MacDecision::Deny(MacDenyReason::NoClearance));
+            return self.audit(
+                subject_id,
+                verified_tenant,
+                None,
+                label,
+                MacDecision::Deny(MacDenyReason::NoClearance),
+            );
         };
 
         let Some(label) = label else {
             return self.audit(
+                subject_id,
+                verified_tenant,
                 Some(&ctx),
                 None,
                 MacDecision::Deny(MacDenyReason::UnlabeledObject),
@@ -297,11 +305,19 @@ impl CasPep {
         } else {
             MacDecision::Deny(MacDenyReason::FloorDeny)
         };
-        self.audit(Some(&ctx), Some(label), decision)
+        self.audit(
+            subject_id,
+            verified_tenant,
+            Some(&ctx),
+            Some(label),
+            decision,
+        )
     }
 
     fn audit(
         &self,
+        subject_id: &str,
+        verified_tenant: Option<&str>,
         ctx: Option<&SecurityContext>,
         label: Option<SecurityLabel>,
         decision: MacDecision,
@@ -343,8 +359,11 @@ impl CasPep {
             object_label: label.unwrap_or_else(SecurityLabel::bottom),
             action: crate::mac::te::Action::from_scope_action(crate::mac::te::ScopeAction::Query),
             reason,
-            subject_id: None,
-            object_id: None,
+            subject_id: Some(subject_id.to_owned()),
+            object_id: Some(match verified_tenant {
+                Some(tenant) => format!("{tenant}/{CAS_SERVICE_DOMAIN}"),
+                None => CAS_SERVICE_DOMAIN.to_owned(),
+            }),
         };
 
         match self.sink.record(&record) {
@@ -640,6 +659,8 @@ mod tests {
         let records = sink.records.lock();
         assert_eq!(records[0].decision, Decision::Deny);
         assert_eq!(records[0].reason, DecisionReason::FloorDeny);
+        assert_eq!(records[0].subject_id.as_deref(), Some("public-user"));
+        assert_eq!(records[0].object_id.as_deref(), Some("tenant-a/cas"));
     }
 
     #[test]
