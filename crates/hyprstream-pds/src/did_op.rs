@@ -52,6 +52,7 @@ use hyprstream_crypto::cose_sign::{
 use hyprstream_crypto::pq::{
     ml_dsa_sk_to_vk_bytes, ml_dsa_vk_bytes, ml_dsa_vk_from_bytes, MlDsaSigningKey,
 };
+use hyprstream_rpc::identity::UNAUTHENTICATED_DID_SENTINEL;
 
 use crate::cid::Cid;
 use crate::dag_cbor::DagCbor;
@@ -442,6 +443,10 @@ impl UnsignedGenesisDidOp {
     }
 
     fn validate(&self) -> Result<()> {
+        ensure!(
+            self.did != UNAUTHENTICATED_DID_SENTINEL,
+            "{UNAUTHENTICATED_DID_SENTINEL} is reserved for the unauthenticated floor and cannot have a genesis operation"
+        );
         validate_host_form_did_web(&self.did)?;
         self.rotation_keys.validate()
     }
@@ -883,6 +888,29 @@ mod tests {
             GenesisRepoHead::EmptyRepo,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn unauthenticated_sentinel_cannot_have_a_genesis_operation() {
+        let user = signer();
+        let rotations = GenesisRotationKeys::new(
+            UserRotationKey::new(user.public),
+            RecoveryKeyEnrollment::Declined,
+            HostKeyEnrollment::Absent,
+        )
+        .unwrap();
+
+        let error = UnsignedGenesisDidOp::new(
+            UNAUTHENTICATED_DID_SENTINEL,
+            Cid::from_raw(b"sentinel must not have a document"),
+            rotations,
+            GenesisRepoHead::EmptyRepo,
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("unauthenticated floor"),
+            "{error:#}"
+        );
     }
 
     #[test]

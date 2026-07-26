@@ -35,8 +35,8 @@ const READ_CHUNK_BYTES: usize = 8 * 1024;
 /// Failure from the mandatory tenant boundary or the PDS record read.
 #[derive(Debug, Error)]
 pub enum AccountReadError {
-    #[error("PDS account access denied: caller is anonymous")]
-    AnonymousCaller,
+    #[error("PDS account access denied: caller is unauthenticated")]
+    UnauthenticatedCaller,
     #[error("PDS account access denied: no valid verified tenant")]
     MissingVerifiedTenant,
     #[error("PDS account access denied: invalid verified tenant {0:?}")]
@@ -129,7 +129,7 @@ impl AccountRecordStore {
     pub fn scope(&self, context: &EnvelopeContext) -> Result<AccountReadScope, AccountReadError> {
         let subject = context.subject();
         if subject.is_anonymous() {
-            return Err(AccountReadError::AnonymousCaller);
+            return Err(AccountReadError::UnauthenticatedCaller);
         }
 
         let tenant = context
@@ -570,6 +570,16 @@ mod tests {
                 .unwrap(),
             None,
         );
+        assert_eq!(
+            store
+                .resolve_tenant_for_hosted_did(
+                    &oauth_authority(),
+                    hyprstream_rpc::identity::UNAUTHENTICATED_DID_SENTINEL,
+                )
+                .await
+                .unwrap(),
+            None,
+        );
     }
 
     #[tokio::test]
@@ -610,19 +620,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn anonymous_and_path_injection_fail_before_mount_access() {
+    async fn unauthenticated_and_path_injection_fail_before_mount_access() {
         let store = store();
         let signer = SigningKey::generate(&mut OsRng);
-        let anonymous = EnvelopeContext::for_test_authenticated_subject_in_tenant(
+        let unauthenticated = EnvelopeContext::for_test_authenticated_subject_in_tenant(
             Subject::anonymous(),
             "acme",
             signer.verifying_key(),
         );
         let error = store
-            .scope(&anonymous)
+            .scope(&unauthenticated)
             .err()
-            .expect("anonymous caller must be denied");
-        assert!(matches!(error, AccountReadError::AnonymousCaller));
+            .expect("unauthenticated caller must be denied");
+        assert!(matches!(error, AccountReadError::UnauthenticatedCaller));
 
         let error = store
             .scope(&context("../acme"))

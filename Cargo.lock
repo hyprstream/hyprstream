@@ -7190,6 +7190,7 @@ dependencies = [
  "hyprstream-vfs",
  "parking_lot 0.12.4",
  "rand 0.8.5",
+ "serde",
  "serde_json",
  "thiserror 1.0.69",
  "tokio",

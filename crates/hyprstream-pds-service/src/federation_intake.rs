@@ -12,8 +12,11 @@ use std::sync::Arc;
 use anyhow::{bail, ensure, Result};
 use async_trait::async_trait;
 use hyprstream_rpc::admission::DidDocResolve;
+use hyprstream_rpc::auth::mac::{SecurityContext, SecurityLabel};
 use hyprstream_rpc::auth::Claims;
+use hyprstream_rpc::identity::UNAUTHENTICATED_DID_SENTINEL;
 use parking_lot::RwLock;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 /// Resolver for the two foreign ATProto DID methods accepted by intake.
@@ -43,6 +46,7 @@ pub trait FederatedDidDocumentResolver: Send + Sync {
 #[async_trait]
 impl FederatedDidDocumentResolver for FederatedDidResolver {
     async fn resolve_federated_document(&self, did: &str) -> Result<Value> {
+        ensure_real_identity_did(did)?;
         let resolver = if hyprstream_rpc::did_plc::is_did_plc(did) {
             &self.plc
         } else if did.starts_with("did:web:") {
@@ -59,79 +63,210 @@ impl FederatedDidDocumentResolver for FederatedDidResolver {
     }
 }
 
-/// A derived, read-only inventory projection for a foreign identity.
-///
-/// `tenant` is retained as an explicit optional field so API consumers can use
-/// the same shape for local and federated inventory entries. Federation intake
-/// constructs records only with `None`; there is no public constructor that can
-/// attach a tenant.
-#[derive(Clone, Debug, PartialEq)]
-pub struct FederatedIdentityRecord {
-    did: String,
-    document: Value,
-    tenant: Option<String>,
+/// Authority class represented by one derived inventory entry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum InventoryKind {
+    /// A DID with an authority-resolved local hosted-account binding.
+    Local,
+    /// A real foreign DID discovered read-only.
+    Federated,
+    /// The immutable credential-absence floor, never emitted as a real host.
+    Unauthenticated,
 }
 
-impl FederatedIdentityRecord {
-    fn new(did: String, document: Value) -> Self {
-        Self {
+/// Derived AppView projection. It is an index, never identity authority.
+///
+/// Live discovery data is intentionally absent. In particular, this type
+/// cannot carry a QUIC URL or certificate hash; callers obtain rotating reach
+/// through [`FederationIntake::resolve`] at connect time.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InventoryEntry {
+    did: String,
+    handle: Option<String>,
+    kind: InventoryKind,
+    tenant: Option<String>,
+    pds_endpoint: Option<String>,
+}
+
+impl InventoryEntry {
+    fn federated(did: String, document: &Value) -> Result<Self> {
+        ensure_real_identity_did(&did)?;
+        Ok(Self {
             did,
-            document,
+            handle: extract_handle(document)?,
+            kind: InventoryKind::Federated,
             tenant: None,
-        }
+            pds_endpoint: extract_pds_endpoint(document)?,
+        })
     }
 
-    /// The resolved foreign DID.
+    /// The indexed DID.
     pub fn did(&self) -> &str {
         &self.did
     }
 
-    /// The validated DID document used to derive this projection.
-    pub fn document(&self) -> &Value {
-        &self.document
+    /// Optional ATProto handle derived from `alsoKnownAs`.
+    pub fn handle(&self) -> Option<&str> {
+        self.handle.as_deref()
     }
 
-    /// Always `None` for records produced by federation intake.
+    /// Local, federated, or unauthenticated classification.
+    pub fn kind(&self) -> InventoryKind {
+        self.kind
+    }
+
+    /// Authority-resolved local tenant, always `None` for federation intake.
     pub fn tenant(&self) -> Option<&str> {
         self.tenant.as_deref()
     }
+
+    /// PDS endpoint pointer. This is not live transport reach.
+    pub fn pds_endpoint(&self) -> Option<&str> {
+        self.pds_endpoint.as_deref()
+    }
 }
 
-/// Non-authoritative inventory sink consumed by federation intake.
+/// Live connect-time discovery resolved from current DID authority.
+///
+/// This type is separate from [`InventoryEntry`] so rotating transport
+/// credentials cannot become stale AppView data.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResolvedDiscovery {
+    quic_url: Option<String>,
+    cert_hashes: Vec<String>,
+}
+
+impl ResolvedDiscovery {
+    fn from_document(document: &Value) -> Result<Self> {
+        let Some(services) = document.get("service").and_then(Value::as_array) else {
+            return Ok(Self {
+                quic_url: None,
+                cert_hashes: Vec::new(),
+            });
+        };
+        let mut quic_entries = services
+            .iter()
+            .filter(|entry| entry.get("type").and_then(Value::as_str) == Some("QuicTransport"));
+        let Some(entry) = quic_entries.next() else {
+            return Ok(Self {
+                quic_url: None,
+                cert_hashes: Vec::new(),
+            });
+        };
+        ensure!(
+            quic_entries.next().is_none(),
+            "DID document contains ambiguous QuicTransport discovery entries"
+        );
+        hyprstream_rpc::service_entry::decode_service_entry(entry)?;
+        let endpoint = entry
+            .get("serviceEndpoint")
+            .and_then(Value::as_object)
+            .ok_or_else(|| anyhow::anyhow!("QuicTransport serviceEndpoint is not an object"))?;
+        let quic_url = endpoint
+            .get("uri")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        let cert_hashes = endpoint
+            .get("certHashes")
+            .and_then(Value::as_array)
+            .map(|hashes| {
+                hashes
+                    .iter()
+                    .map(|hash| {
+                        hash.as_str()
+                            .map(str::to_owned)
+                            .ok_or_else(|| anyhow::anyhow!("QUIC cert hash is not a string"))
+                    })
+                    .collect::<Result<Vec<_>>>()
+            })
+            .transpose()?
+            .unwrap_or_default();
+        Ok(Self {
+            quic_url,
+            cert_hashes,
+        })
+    }
+
+    /// Current QUIC URL, if the DID document publishes one.
+    pub fn quic_url(&self) -> Option<&str> {
+        self.quic_url.as_deref()
+    }
+
+    /// Current overlapping certificate-pin set.
+    pub fn cert_hashes(&self) -> &[String] {
+        &self.cert_hashes
+    }
+}
+
+#[derive(Clone)]
+struct StoredInventoryEntry {
+    entry: InventoryEntry,
+    label: SecurityLabel,
+}
+
+/// Non-authoritative inventory read model consumed by federation intake.
 ///
 /// A pglite/Postgres implementation can replace the in-memory implementation
 /// without changing resolution or tenant-safety logic.
-pub trait FederatedIdentityInventory: Send + Sync {
+pub trait IdentityInventoryReadModel: Send + Sync {
     /// Insert or refresh one derived foreign-identity projection.
-    fn upsert(&self, identity: FederatedIdentityRecord) -> Result<()>;
+    ///
+    /// Implementations must reject [`UNAUTHENTICATED_DID_SENTINEL`].
+    fn upsert_federated(&self, identity: InventoryEntry) -> Result<()>;
 
-    /// List the currently indexed foreign identities in deterministic DID order.
-    fn list(&self) -> Result<Vec<FederatedIdentityRecord>>;
+    /// List only entries dominated by the viewer's verified clearance.
+    ///
+    /// Filtering happens inside the read model before any response is built.
+    /// The return shape intentionally has no total/hidden-count field: callers
+    /// can observe only this post-filter vector's length. Implementations must
+    /// never return [`UNAUTHENTICATED_DID_SENTINEL`] as a real host.
+    fn list(&self, viewer: &SecurityContext) -> Result<Vec<InventoryEntry>>;
 }
 
 /// Thin in-memory inventory read model, useful for embedded/demo deployments.
 #[derive(Default)]
-pub struct InMemoryFederatedIdentityInventory {
-    identities: RwLock<BTreeMap<String, FederatedIdentityRecord>>,
+pub struct InMemoryIdentityInventory {
+    identities: RwLock<BTreeMap<String, StoredInventoryEntry>>,
 }
 
-impl FederatedIdentityInventory for InMemoryFederatedIdentityInventory {
-    fn upsert(&self, identity: FederatedIdentityRecord) -> Result<()> {
+impl IdentityInventoryReadModel for InMemoryIdentityInventory {
+    fn upsert_federated(&self, identity: InventoryEntry) -> Result<()> {
+        ensure_real_identity_did(identity.did())?;
+        ensure!(
+            identity.kind == InventoryKind::Federated && identity.tenant.is_none(),
+            "federation intake inventory entry must be federated with no local tenant"
+        );
         let mut identities = self.identities.write();
-        identities.insert(identity.did.clone(), identity);
+        identities.insert(
+            identity.did.clone(),
+            StoredInventoryEntry {
+                entry: identity,
+                label: SecurityLabel::bottom(),
+            },
+        );
         Ok(())
     }
 
-    fn list(&self) -> Result<Vec<FederatedIdentityRecord>> {
+    fn list(&self, viewer: &SecurityContext) -> Result<Vec<InventoryEntry>> {
         let identities = self.identities.read();
-        Ok(identities.values().cloned().collect())
+        Ok(identities
+            .values()
+            .filter(|stored| {
+                stored.entry.did() != UNAUTHENTICATED_DID_SENTINEL
+                    && viewer.can_access(&stored.label)
+            })
+            .map(|stored| stored.entry.clone())
+            .collect())
     }
 }
 
 /// Resolve and project foreign identities without granting local authority.
 pub struct FederationIntake {
     resolver: Arc<dyn FederatedDidDocumentResolver>,
-    inventory: Arc<dyn FederatedIdentityInventory>,
+    inventory: Arc<dyn IdentityInventoryReadModel>,
     local_issuers: Vec<String>,
 }
 
@@ -139,7 +274,7 @@ impl FederationIntake {
     /// Construct an intake service over a resolver and derived inventory sink.
     pub fn new(
         resolver: Arc<dyn FederatedDidDocumentResolver>,
-        inventory: Arc<dyn FederatedIdentityInventory>,
+        inventory: Arc<dyn IdentityInventoryReadModel>,
         local_issuers: Vec<String>,
     ) -> Self {
         Self {
@@ -150,7 +285,7 @@ impl FederationIntake {
     }
 
     /// Resolve and index a foreign DID discovered without identity claims.
-    pub async fn intake(&self, did: &str) -> Result<FederatedIdentityRecord> {
+    pub async fn intake(&self, did: &str) -> Result<InventoryEntry> {
         self.intake_inner(did).await
     }
 
@@ -165,7 +300,7 @@ impl FederationIntake {
         &self,
         did: &str,
         mut claims: Claims,
-    ) -> Result<FederatedIdentityRecord> {
+    ) -> Result<InventoryEntry> {
         let local_issuers: Vec<&str> = self.local_issuers.iter().map(String::as_str).collect();
         ensure!(
             !claims.is_local_to(&local_issuers),
@@ -179,12 +314,70 @@ impl FederationIntake {
         self.intake_inner(did).await
     }
 
-    async fn intake_inner(&self, did: &str) -> Result<FederatedIdentityRecord> {
+    /// Resolve current connect-time discovery without consulting AppView data.
+    pub async fn resolve(&self, did: &str) -> Result<ResolvedDiscovery> {
+        ensure_real_identity_did(did)?;
         let document = self.resolver.resolve_federated_document(did).await?;
-        let identity = FederatedIdentityRecord::new(did.to_owned(), document);
-        self.inventory.upsert(identity.clone())?;
+        ResolvedDiscovery::from_document(&document)
+    }
+
+    async fn intake_inner(&self, did: &str) -> Result<InventoryEntry> {
+        ensure_real_identity_did(did)?;
+        let document = self.resolver.resolve_federated_document(did).await?;
+        let identity = InventoryEntry::federated(did.to_owned(), &document)?;
+        self.inventory.upsert_federated(identity.clone())?;
         Ok(identity)
     }
+}
+
+fn extract_handle(document: &Value) -> Result<Option<String>> {
+    let Some(aliases) = document.get("alsoKnownAs").and_then(Value::as_array) else {
+        return Ok(None);
+    };
+    let handles = aliases
+        .iter()
+        .filter_map(Value::as_str)
+        .filter_map(|alias| alias.strip_prefix("at://"))
+        .filter(|handle| !handle.is_empty() && !handle.contains('/'))
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    ensure!(
+        handles.len() <= 1,
+        "DID document contains ambiguous ATProto handles"
+    );
+    Ok(handles.into_iter().next())
+}
+
+fn extract_pds_endpoint(document: &Value) -> Result<Option<String>> {
+    let Some(services) = document.get("service").and_then(Value::as_array) else {
+        return Ok(None);
+    };
+    let endpoints = services
+        .iter()
+        .filter(|entry| {
+            entry.get("type").and_then(Value::as_str) == Some("AtprotoPersonalDataServer")
+        })
+        .map(|entry| {
+            entry
+                .get("serviceEndpoint")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .ok_or_else(|| anyhow::anyhow!("ATProto PDS serviceEndpoint is not a string"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    ensure!(
+        endpoints.len() <= 1,
+        "DID document contains ambiguous ATProto PDS endpoints"
+    );
+    Ok(endpoints.into_iter().next())
+}
+
+fn ensure_real_identity_did(did: &str) -> Result<()> {
+    ensure!(
+        did != UNAUTHENTICATED_DID_SENTINEL,
+        "{UNAUTHENTICATED_DID_SENTINEL} is reserved for the unauthenticated floor and is not a federated identity"
+    );
+    Ok(())
 }
 
 #[cfg(test)]
@@ -192,7 +385,9 @@ mod tests {
     #![allow(clippy::expect_used, clippy::unwrap_used)]
 
     use super::*;
-    use hyprstream_rpc::auth::mac::{MacDecision, SecurityContext};
+    use hyprstream_rpc::auth::mac::{
+        CompartmentSet, Level, MacDecision, SecurityContext, VerifiedKeyMaterial,
+    };
     use hyprstream_rpc::Subject;
     use hyprstream_vfs::{SyntheticMount, SyntheticNode};
 
@@ -237,6 +432,14 @@ mod tests {
         }
     }
 
+    fn unauthenticated_viewer() -> SecurityContext {
+        SecurityContext::new(
+            Level::Public,
+            CompartmentSet::EMPTY,
+            VerifiedKeyMaterial::Unverified,
+        )
+    }
+
     #[tokio::test]
     async fn federated_did_resolves_lists_and_has_no_hosted_tenant() {
         let resolver = Arc::new(FederatedDidResolver::new(
@@ -244,12 +447,17 @@ mod tests {
                 expected_did: FEDERATED_DID,
                 document: serde_json::json!({
                     "id": FEDERATED_DID,
-                    "alsoKnownAs": ["at://alice.example"]
+                    "alsoKnownAs": ["at://alice.example"],
+                    "service": [{
+                        "id": format!("{FEDERATED_DID}#atproto_pds"),
+                        "type": "AtprotoPersonalDataServer",
+                        "serviceEndpoint": "https://pds.alice.example"
+                    }]
                 }),
             }),
             Arc::new(NeverResolver),
         ));
-        let inventory = Arc::new(InMemoryFederatedIdentityInventory::default());
+        let inventory = Arc::new(InMemoryIdentityInventory::default());
         let intake = FederationIntake::new(
             resolver,
             inventory.clone(),
@@ -264,12 +472,20 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resolved.did(), FEDERATED_DID);
+        assert_eq!(resolved.handle(), Some("alice.example"));
+        assert_eq!(resolved.kind(), InventoryKind::Federated);
         assert_eq!(resolved.tenant(), None);
+        assert_eq!(resolved.pds_endpoint(), Some("https://pds.alice.example"));
 
-        let listed = inventory.list().unwrap();
+        let listed = inventory.list(&unauthenticated_viewer()).unwrap();
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].did(), FEDERATED_DID);
         assert_eq!(listed[0].tenant(), None);
+        let projected = serde_json::to_value(&listed[0]).unwrap();
+        assert!(projected.get("quicUrl").is_none());
+        assert!(projected.get("certHash").is_none());
+        assert!(projected.get("certHashes").is_none());
+        assert!(projected.get("document").is_none());
 
         let account_store = AccountRecordStore::new(
             Arc::new(SyntheticMount::new(SyntheticNode::dir())),
@@ -310,17 +526,109 @@ mod tests {
                 expected_did: FEDERATED_WEB_DID,
                 document: serde_json::json!({
                     "id": FEDERATED_WEB_DID,
-                    "service": []
+                    "service": [{
+                        "id": format!("{FEDERATED_WEB_DID}#quic"),
+                        "type": "QuicTransport",
+                        "serviceEndpoint": {
+                            "uri": "https://alice.example:443",
+                            "webpki": true,
+                            "certHashes": []
+                        }
+                    }]
                 }),
             }),
         ));
-        let inventory = Arc::new(InMemoryFederatedIdentityInventory::default());
+        let inventory = Arc::new(InMemoryIdentityInventory::default());
         let intake = FederationIntake::new(resolver, inventory.clone(), Vec::new());
 
         let resolved = intake.intake(FEDERATED_WEB_DID).await.unwrap();
         assert_eq!(resolved.did(), FEDERATED_WEB_DID);
         assert_eq!(resolved.tenant(), None);
-        assert_eq!(inventory.list().unwrap(), vec![resolved]);
+        assert_eq!(
+            inventory.list(&unauthenticated_viewer()).unwrap(),
+            vec![resolved]
+        );
+        let discovery = intake.resolve(FEDERATED_WEB_DID).await.unwrap();
+        assert_eq!(discovery.quic_url(), Some("https://alice.example:443"));
+        assert!(discovery.cert_hashes().is_empty());
+    }
+
+    #[test]
+    fn inventory_listing_prefilters_above_clearance_without_a_hidden_count() {
+        let inventory = InMemoryIdentityInventory::default();
+        let public = InventoryEntry {
+            did: "did:web:public.example".to_owned(),
+            handle: None,
+            kind: InventoryKind::Federated,
+            tenant: None,
+            pds_endpoint: None,
+        };
+        inventory.upsert_federated(public.clone()).unwrap();
+        inventory.identities.write().insert(
+            "did:web:hidden.example".to_owned(),
+            StoredInventoryEntry {
+                entry: InventoryEntry {
+                    did: "did:web:hidden.example".to_owned(),
+                    handle: None,
+                    kind: InventoryKind::Federated,
+                    tenant: None,
+                    pds_endpoint: None,
+                },
+                label: SecurityLabel::new(
+                    Level::Secret,
+                    hyprstream_rpc::auth::mac::Assurance::Unverified,
+                    CompartmentSet::EMPTY,
+                ),
+            },
+        );
+
+        let visible = inventory.list(&unauthenticated_viewer()).unwrap();
+        assert_eq!(visible, vec![public]);
+        assert_eq!(visible.len(), 1, "only the post-filter count is observable");
+    }
+
+    #[tokio::test]
+    async fn unauthenticated_sentinel_is_never_resolved_or_listed() {
+        let resolver = Arc::new(FederatedDidResolver::new(
+            Arc::new(NeverResolver),
+            Arc::new(NeverResolver),
+        ));
+        let inventory = Arc::new(InMemoryIdentityInventory::default());
+        let intake = FederationIntake::new(resolver, inventory.clone(), Vec::new());
+
+        let error = intake
+            .intake(UNAUTHENTICATED_DID_SENTINEL)
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("unauthenticated floor"),
+            "{error:#}"
+        );
+        assert!(inventory
+            .list(&unauthenticated_viewer())
+            .unwrap()
+            .is_empty());
+
+        inventory.identities.write().insert(
+            UNAUTHENTICATED_DID_SENTINEL.to_owned(),
+            StoredInventoryEntry {
+                entry: InventoryEntry {
+                    did: UNAUTHENTICATED_DID_SENTINEL.to_owned(),
+                    handle: None,
+                    kind: InventoryKind::Unauthenticated,
+                    tenant: None,
+                    pds_endpoint: None,
+                },
+                label: SecurityLabel::bottom(),
+            },
+        );
+        assert!(
+            inventory
+                .list(&unauthenticated_viewer())
+                .unwrap()
+                .is_empty(),
+            "legacy/corrupt sentinel rows must be filtered from inventory listing"
+        );
     }
 
     #[tokio::test]
@@ -329,7 +637,7 @@ mod tests {
             Arc::new(NeverResolver),
             Arc::new(NeverResolver),
         ));
-        let inventory = Arc::new(InMemoryFederatedIdentityInventory::default());
+        let inventory = Arc::new(InMemoryIdentityInventory::default());
         let intake = FederationIntake::new(
             resolver,
             inventory.clone(),
@@ -344,6 +652,9 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.to_string().contains("foreign issuer"));
-        assert!(inventory.list().unwrap().is_empty());
+        assert!(inventory
+            .list(&unauthenticated_viewer())
+            .unwrap()
+            .is_empty());
     }
 }
