@@ -897,7 +897,7 @@ pub fn generate_client(
         .map(|sc| sc.factory_name.as_str())
         .collect();
 
-    // Request methods (portable — uses self.client.call(), not CallOptions)
+    // Request methods (portable, carrying immutable per-client call options).
     let request_methods: Vec<TokenStream> = resolved
         .raw
         .request_variants
@@ -941,6 +941,7 @@ pub fn generate_client(
         #[derive(Clone)]
         pub struct #client_name {
             client: std::sync::Arc<dyn hyprstream_rpc::RpcClient>,
+            call_options: hyprstream_rpc::CallOptions,
         }
 
         impl #client_name {
@@ -949,7 +950,12 @@ pub fn generate_client(
 
             /// Create from any RpcClient implementation.
             pub fn new(client: std::sync::Arc<dyn hyprstream_rpc::RpcClient>) -> Self {
-                Self { client }
+                Self { client, call_options: hyprstream_rpc::CallOptions::default() }
+            }
+            #[must_use]
+            pub fn with_delegated_bearer(mut self, token: impl Into<String>) -> Self {
+                self.call_options.delegated_bearer = Some(token.into());
+                self
             }
 
             /// Get the next request ID.
@@ -963,12 +969,18 @@ pub fn generate_client(
             /// context without mutating the shared client. Safe for use with
             /// connection pooling.
             pub fn request(&self) -> hyprstream_rpc::RequestBuilder<'_> {
-                hyprstream_rpc::RequestBuilder::for_service(&self.client, Self::SERVICE_NAME)
+                let builder =
+                    hyprstream_rpc::RequestBuilder::for_service(&self.client, Self::SERVICE_NAME);
+                match &self.call_options.delegated_bearer {
+                    Some(token) => builder.delegated_bearer(token.clone()),
+                    None => builder,
+                }
             }
 
             /// Send a raw request and return the raw response bytes.
             pub async fn call(&self, payload: Vec<u8>) -> anyhow::Result<Vec<u8>> {
-                self.client.call_for_service(Self::SERVICE_NAME, payload).await
+                self.client.call_with_options_for_service(
+                    Self::SERVICE_NAME, payload, self.call_options.clone()).await
             }
 
             /// Send a generated request with its canonical schema method id.
@@ -978,13 +990,17 @@ pub fn generate_client(
                 payload: Vec<u8>,
             ) -> anyhow::Result<Vec<u8>> {
                 self.client
-                    .call_for_service_with_method(Self::SERVICE_NAME, method_discriminator, payload)
+                    .call_with_options_for_service_with_method(
+                        Self::SERVICE_NAME, method_discriminator, payload,
+                        self.call_options.clone())
                     .await
             }
 
             /// Send a streaming request with ephemeral DH pubkey.
             pub async fn call_streaming(&self, payload: Vec<u8>, ephemeral_pubkey: [u8; 32]) -> anyhow::Result<Vec<u8>> {
-                self.client.call_streaming_for_service(Self::SERVICE_NAME, payload, ephemeral_pubkey).await
+                self.client.call_streaming_with_options_for_service(
+                    Self::SERVICE_NAME, payload, ephemeral_pubkey,
+                    self.call_options.clone()).await
             }
 
             /// Send a generated streaming request with its schema method id.
@@ -995,11 +1011,12 @@ pub fn generate_client(
                 ephemeral_pubkey: [u8; 32],
             ) -> anyhow::Result<Vec<u8>> {
                 self.client
-                    .call_streaming_for_service_with_method(
+                    .call_streaming_with_options_for_service_with_method(
                         Self::SERVICE_NAME,
                         method_discriminator,
                         payload,
-                        ephemeral_pubkey,).await
+                        ephemeral_pubkey,
+                        self.call_options.clone(),).await
             }
 
             #(#request_methods)*
@@ -1743,6 +1760,7 @@ fn generate_portable_scoped_factory_method(sc: &ScopedClient) -> TokenStream {
         pub fn #method_name(&self #(, #params)*) -> #client_name_ident {
             #client_name_ident {
                 client: std::sync::Arc::clone(&self.client),
+                call_options: self.call_options.clone(),
                 #(#field_inits,)*
             }
         }

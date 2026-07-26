@@ -120,6 +120,8 @@ pub struct EnvelopeContext {
     /// Raw JWT token from the envelope. Server decodes and verifies this.
     /// Preferred over the legacy `claims` field when present.
     jwt_token: Option<String>,
+    /// Bearer relayed by an authenticated service; deny-by-default.
+    delegation_token: Option<String>,
 
     /// Authorization subject derived from the verified Ed25519 signer key.
     ///
@@ -188,6 +190,7 @@ impl EnvelopeContext {
             claims: None,
             verified_tenant: None,
             jwt_token: envelope.envelope.jwt_token().map(ToOwned::to_owned),
+            delegation_token: envelope.envelope.delegation_token.clone(),
             key_derived_subject: Subject::anonymous(),
             jwt_subject: None,
             cnf: envelope.cnf,
@@ -215,6 +218,7 @@ impl EnvelopeContext {
             claims: None,
             verified_tenant: Some("local".to_owned()),
             jwt_token: envelope.envelope.jwt_token().map(ToOwned::to_owned),
+            delegation_token: envelope.envelope.delegation_token.clone(),
             key_derived_subject: Subject::new("system"),
             jwt_subject: None,
             cnf: envelope.cnf,
@@ -246,6 +250,7 @@ impl EnvelopeContext {
             claims: None,
             verified_tenant: Some("local".to_owned()),
             jwt_token: None,
+            delegation_token: None,
             key_derived_subject: Subject::new(format!("service:{service_name}")),
             jwt_subject: None,
             cnf: [0u8; 32],
@@ -291,6 +296,7 @@ impl EnvelopeContext {
             claims,
             verified_tenant: Some("local".to_owned()),
             jwt_token: None,
+            delegation_token: None,
             key_derived_subject: crate::envelope::Subject::anonymous(),
             jwt_subject: None,
             cnf,
@@ -442,6 +448,7 @@ impl EnvelopeContext {
             claims: None,
             verified_tenant: None,
             jwt_token: None,
+            delegation_token: None,
             key_derived_subject: subject,
             jwt_subject: None,
             cnf: signer.to_bytes(),
@@ -837,6 +844,12 @@ pub trait RequestService: 'static {
     ) {
     }
 
+    /// Accept a relayed bearer from this verified envelope signer. Services
+    /// enabling this must pin an independently configured controller key.
+    fn accept_delegated_bearer(&self, _signer_pubkey: &[u8; 32]) -> bool {
+        false
+    }
+
     /// E2E JWT verification with unified key source.
     ///
     /// Called by `process_request` after envelope signature verification.
@@ -850,10 +863,24 @@ pub trait RequestService: 'static {
     /// The legacy `claims` path is kept for backwards compat with older clients.
     async fn verify_claims(&self, ctx: &mut EnvelopeContext) -> anyhow::Result<()> {
         // Prefer jwt_token (new path) over legacy claims
-        let token = ctx
+        let direct_token = ctx
             .jwt_token
             .clone()
             .or_else(|| ctx.claims().and_then(|c| c.token.clone()));
+        let delegated = direct_token.is_none() && ctx.delegation_token.is_some();
+        let token = match direct_token {
+            Some(token) => Some(token),
+            None => match ctx.delegation_token.clone() {
+                Some(token) => {
+                    anyhow::ensure!(
+                        self.accept_delegated_bearer(&ctx.cnf),
+                        "delegated bearer rejected: envelope signer is not an authorized relay"
+                    );
+                    Some(token)
+                }
+                None => None,
+            },
+        };
 
         let Some(token) = token else {
             // No JWT — try trust store lookup for cached key bindings
@@ -1110,58 +1137,63 @@ pub trait RequestService: 'static {
         // R2: Bind JWT cnf.jwk claim to envelope signer (WIMSE WIT key binding).
         // When a JWT carries a cnf.jwk (Ed25519 pubkey), the envelope signer must
         // match. Prevents a valid JWT holder from signing envelopes with a different
-        // key and being attributed the JWT's subject identity.
-        if let Some(ref claims) = ctx.claims {
-            if let Some(expected) = claims.cnf_key_bytes() {
-                use subtle::ConstantTimeEq as _;
-                if expected.ct_ne(&ctx.cnf).into() {
-                    tracing::warn!("JWT cnf.jwk mismatch: sub={}", claims.sub);
-                    anyhow::bail!("JWT cnf.jwk does not match envelope signer");
-                }
-
-                // Cache the (key → subject) binding in the trust store.
-                let vk = match ed25519_dalek::VerifyingKey::from_bytes(&expected) {
-                    Ok(vk) => vk,
-                    Err(_) => {
-                        tracing::warn!("Invalid Ed25519 verifying key in JWT cnf.jwk");
-                        anyhow::bail!("Invalid Ed25519 verifying key in JWT cnf.jwk");
+        // key and being attributed the JWT's subject identity. A pinned relay is
+        // the sole exception: it already verified that binding at ingress, and
+        // the downstream envelope is necessarily signed by the relay instead.
+        // Do not cache a bearer-to-relay binding on this path.
+        if !delegated {
+            if let Some(ref claims) = ctx.claims {
+                if let Some(expected) = claims.cnf_key_bytes() {
+                    use subtle::ConstantTimeEq as _;
+                    if expected.ct_ne(&ctx.cnf).into() {
+                        tracing::warn!("JWT cnf.jwk mismatch: sub={}", claims.sub);
+                        anyhow::bail!("JWT cnf.jwk does not match envelope signer");
                     }
-                };
-                let subject_str = claims.subject(&local_issuers_refs);
-                if let Some(subject_name) = subject_str.name() {
-                    self.cache_key_binding(vk, subject_name, &token, claims.exp);
-                    tracing::info!(subject = %subject_name, "Cached key binding in trust store");
-                }
-            } else if let Some(jkt) = claims.cnf_jkt() {
-                // R2b: DPoP path — JWT has cnf.jkt (thumbprint) instead of cnf.jwk.
-                // Compute the JWK thumbprint of the envelope signer and compare.
-                use subtle::ConstantTimeEq as _;
-                let envelope_jkt =
-                    crate::auth::jwk_thumbprint(&crate::auth::JwkThumbprintInput::Ed25519 {
-                        x: &ctx.cnf,
-                    });
-                if envelope_jkt.as_bytes().ct_ne(jkt.as_bytes()).into() {
-                    tracing::warn!("JWT cnf.jkt mismatch: sub={}", claims.sub);
-                    anyhow::bail!("JWT cnf.jkt does not match envelope signer");
-                }
 
-                let vk = match ed25519_dalek::VerifyingKey::from_bytes(&ctx.cnf) {
-                    Ok(vk) => vk,
-                    Err(_) => {
-                        tracing::warn!("Invalid Ed25519 verifying key in envelope cnf");
-                        anyhow::bail!("Invalid Ed25519 verifying key in envelope cnf");
+                    // Cache the (key → subject) binding in the trust store.
+                    let vk = match ed25519_dalek::VerifyingKey::from_bytes(&expected) {
+                        Ok(vk) => vk,
+                        Err(_) => {
+                            tracing::warn!("Invalid Ed25519 verifying key in JWT cnf.jwk");
+                            anyhow::bail!("Invalid Ed25519 verifying key in JWT cnf.jwk");
+                        }
+                    };
+                    let subject_str = claims.subject(&local_issuers_refs);
+                    if let Some(subject_name) = subject_str.name() {
+                        self.cache_key_binding(vk, subject_name, &token, claims.exp);
+                        tracing::info!(subject = %subject_name, "Cached key binding in trust store");
                     }
-                };
-                let subject_str = claims.subject(&local_issuers_refs);
-                if let Some(subject_name) = subject_str.name() {
-                    self.cache_key_binding(vk, subject_name, &token, claims.exp);
-                    tracing::info!(subject = %subject_name, "Cached key binding from cnf.jkt");
+                } else if let Some(jkt) = claims.cnf_jkt() {
+                    // R2b: DPoP path — JWT has cnf.jkt (thumbprint) instead of cnf.jwk.
+                    // Compute the JWK thumbprint of the envelope signer and compare.
+                    use subtle::ConstantTimeEq as _;
+                    let envelope_jkt =
+                        crate::auth::jwk_thumbprint(&crate::auth::JwkThumbprintInput::Ed25519 {
+                            x: &ctx.cnf,
+                        });
+                    if envelope_jkt.as_bytes().ct_ne(jkt.as_bytes()).into() {
+                        tracing::warn!("JWT cnf.jkt mismatch: sub={}", claims.sub);
+                        anyhow::bail!("JWT cnf.jkt does not match envelope signer");
+                    }
+
+                    let vk = match ed25519_dalek::VerifyingKey::from_bytes(&ctx.cnf) {
+                        Ok(vk) => vk,
+                        Err(_) => {
+                            tracing::warn!("Invalid Ed25519 verifying key in envelope cnf");
+                            anyhow::bail!("Invalid Ed25519 verifying key in envelope cnf");
+                        }
+                    };
+                    let subject_str = claims.subject(&local_issuers_refs);
+                    if let Some(subject_name) = subject_str.name() {
+                        self.cache_key_binding(vk, subject_name, &token, claims.exp);
+                        tracing::info!(subject = %subject_name, "Cached key binding from cnf.jkt");
+                    }
+                } else if self.require_cnf_binding() {
+                    tracing::warn!("JWT missing cnf binding (jwk or jkt): sub={}", claims.sub);
+                    anyhow::bail!(
+                        "JWT must include cnf binding for key binding (required by this service)"
+                    );
                 }
-            } else if self.require_cnf_binding() {
-                tracing::warn!("JWT missing cnf binding (jwk or jkt): sub={}", claims.sub);
-                anyhow::bail!(
-                    "JWT must include cnf binding for key binding (required by this service)"
-                );
             }
         }
 
@@ -1379,6 +1411,7 @@ mod empty_iss_gate_tests {
         transport: TransportConfig,
         key_source: std::sync::Arc<dyn crate::auth::JwtKeySource>,
         policy: crate::crypto::CryptoPolicy,
+        relay: Option<[u8; 32]>,
     }
 
     #[async_trait(?Send)]
@@ -1414,6 +1447,9 @@ mod empty_iss_gate_tests {
         fn jwt_verify_policy(&self) -> crate::crypto::CryptoPolicy {
             self.policy
         }
+        fn accept_delegated_bearer(&self, signer_pubkey: &[u8; 32]) -> bool {
+            self.relay.as_ref() == Some(signer_pubkey)
+        }
     }
 
     /// Build an `EnvelopeContext` carrying `jwt_token`, with the chosen
@@ -1424,6 +1460,7 @@ mod empty_iss_gate_tests {
             claims: None,
             verified_tenant: None,
             jwt_token: Some(token),
+            delegation_token: None,
             key_derived_subject: Subject::anonymous(),
             jwt_subject: None,
             cnf: [0u8; 32],
@@ -1451,6 +1488,7 @@ mod empty_iss_gate_tests {
             transport: TransportConfig::inproc("mock"),
             key_source,
             policy: crate::crypto::CryptoPolicy::Classical,
+            relay: None,
         };
         (svc, ca)
     }
@@ -1517,6 +1555,40 @@ mod empty_iss_gate_tests {
     }
 
     #[tokio::test]
+    async fn delegated_bearer_is_denied_by_default() {
+        let (svc, ca) = mock_service();
+        let token = empty_iss_token(&ca);
+        let relay = [19u8; 32];
+        let mut ctx = ctx_with_token(token.clone(), /* is_local_caller */ true);
+        ctx.jwt_token = None;
+        ctx.delegation_token = Some(token);
+        ctx.cnf = relay;
+
+        let error = svc
+            .verify_claims(&mut ctx)
+            .await
+            .expect_err("services must reject delegated bearers unless explicitly enabled");
+        assert!(error.to_string().contains("not an authorized relay"));
+    }
+
+    #[tokio::test]
+    async fn delegated_bearer_is_verified_for_pinned_relay() {
+        let (mut svc, ca) = mock_service();
+        let relay = [19u8; 32];
+        svc.relay = Some(relay);
+        let token = empty_iss_token(&ca);
+        let mut ctx = ctx_with_token(token.clone(), /* is_local_caller */ true);
+        ctx.jwt_token = None;
+        ctx.delegation_token = Some(token);
+        ctx.cnf = relay;
+
+        svc.verify_claims(&mut ctx)
+            .await
+            .expect("the pinned relay may delegate a bearer for re-verification");
+        assert_eq!(ctx.subject().name(), Some("alice"));
+    }
+
+    #[tokio::test]
     async fn federated_issuer_cannot_assert_local_tenant() {
         let local_ca = SigningKey::from_bytes(&[9u8; 32]);
         let federated_signer = SigningKey::from_bytes(&[10u8; 32]);
@@ -1535,6 +1607,7 @@ mod empty_iss_gate_tests {
             transport: TransportConfig::inproc("mock"),
             key_source,
             policy: crate::crypto::CryptoPolicy::Classical,
+            relay: None,
         };
         let now = chrono::Utc::now().timestamp();
         let claims = Claims::new("alice".to_owned(), now, now + 3600)
@@ -1569,6 +1642,7 @@ mod empty_iss_gate_tests {
             transport: TransportConfig::inproc("mock"),
             key_source,
             policy: crate::crypto::CryptoPolicy::Classical,
+            relay: None,
         };
         let now = chrono::Utc::now().timestamp();
         let claims = Claims::new("alice".to_owned(), now, now + 3600)
@@ -1662,6 +1736,7 @@ mod empty_iss_gate_tests {
             transport: TransportConfig::inproc("mock"),
             key_source,
             policy: crate::crypto::CryptoPolicy::Hybrid,
+            relay: None,
         };
         let now = chrono::Utc::now().timestamp();
         let claims =
@@ -1891,6 +1966,7 @@ mod ipc_key_identity_tests {
             claims: None,
             verified_tenant: None,
             jwt_token: None,
+            delegation_token: None,
             key_derived_subject: Subject::anonymous(),
             jwt_subject: None,
             cnf: signer_pubkey,
@@ -2120,6 +2196,7 @@ mod accounting_audit_tests {
             claims: None,
             verified_tenant: None,
             jwt_token: None,
+            delegation_token: None,
             key_derived_subject: Subject::new(name),
             jwt_subject: None,
             cnf: [0u8; 32],
@@ -2177,6 +2254,7 @@ mod accounting_audit_tests {
             claims: None,
             verified_tenant: None,
             jwt_token: None,
+            delegation_token: None,
             key_derived_subject: Subject::anonymous(),
             jwt_subject: None,
             cnf: [0u8; 32],
@@ -2244,6 +2322,7 @@ mod accounting_audit_tests {
             claims,
             verified_tenant: None,
             jwt_token: None,
+            delegation_token: None,
             key_derived_subject: Subject::anonymous(),
             jwt_subject: None,
             cnf,

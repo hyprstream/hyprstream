@@ -266,6 +266,11 @@ pub struct InferenceInstanceId {
     replica: u16,
 }
 
+/// Domain-separated carrier-key purpose for one opaque service instance.
+pub(crate) fn inference_iroh_key_purpose(service_name: &str) -> String {
+    format!("hyprstream-inference-iroh-v1/{service_name}")
+}
+
 impl InferenceInstanceId {
     pub fn new(verified_tenant: &str, model_ref: &str, replica: u16) -> Result<Self> {
         let tenant = verified_tenant.trim();
@@ -312,6 +317,10 @@ impl InferenceInstanceId {
         let suffix = hex::encode(&digest.finalize()[..12]);
         format!("inference-{suffix}")
     }
+    #[must_use]
+    pub fn iroh_key_purpose(&self) -> String {
+        inference_iroh_key_purpose(&self.service_name())
+    }
 
     /// Same-host cross-process dial target for a subprocess placement.
     #[must_use]
@@ -353,6 +362,7 @@ mod tests {
             first.ipc_transport(Path::new("/run/hyprstream")),
             second.ipc_transport(Path::new("/run/hyprstream"))
         );
+        assert_ne!(first.iroh_key_purpose(), second.iroh_key_purpose());
         assert!(!first.service_name().contains("tenant-a"));
         Ok(())
     }
@@ -380,6 +390,22 @@ mod tests {
             first.ipc_transport(Path::new("/run/hyprstream")),
             second.ipc_transport(Path::new("/run/hyprstream"))
         );
+        let service_key =
+            hyprstream_rpc::prelude::SigningKey::from_bytes(&[31u8; 32]);
+        let first_carrier = hyprstream_rpc::node_identity::derive_purpose_key(
+            &service_key,
+            &first.iroh_key_purpose(),
+        );
+        let second_carrier = hyprstream_rpc::node_identity::derive_purpose_key(
+            &service_key,
+            &second.iroh_key_purpose(),
+        );
+        assert_ne!(
+            first_carrier.verifying_key(),
+            service_key.verifying_key(),
+            "carrier address must not reuse application authority"
+        );
+        assert_ne!(first_carrier.verifying_key(), second_carrier.verifying_key());
         Ok(())
     }
 }

@@ -207,6 +207,21 @@ fn claims_from_auth(
     claims
 }
 
+/// Build a request-local ModelService client carrying the HTTP bearer as a
+/// direct JWT. The HTTP middleware already verified this token, and
+/// ModelService re-verifies it before deriving the hosted-account tenant and
+/// MAC clearance. A missing bearer remains missing and therefore fails closed
+/// at the ModelService PEP.
+fn model_client_for_request(
+    state: &ServerState,
+    jwt_token: Option<&str>,
+) -> anyhow::Result<ModelClient> {
+    ModelClient::from_resolver(
+        (*state.signing_key).clone(),
+        jwt_token.map(str::to_owned),
+    )
+}
+
 /// Helper: Resolve model name to filesystem path (also validates inference capability)
 async fn resolve_model_path(
     state: &ServerState,
@@ -414,6 +429,13 @@ async fn chat_completions(
 
     // Apply chat template via ZMQ ModelService
     info!("Applying chat template via ModelService...");
+    let model_client = match model_client_for_request(&state, jwt_token.as_deref()) {
+        Ok(client) => client,
+        Err(e) => {
+            tracing::error!("Failed to create authenticated ModelClient: {e}");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "Client creation failed").into_response();
+        }
+    };
 
     // Serialize tools to JSON Value for the template engine (if provided)
     let tools_json: Option<serde_json::Value> = request.tools.as_ref().map(|t| {
@@ -435,8 +457,7 @@ async fn chat_completions(
         .as_ref()
         .map(|t| serde_json::to_string(t).unwrap_or_default())
         .unwrap_or_default();
-    let templated_prompt = match state
-        .model_client
+    let templated_prompt = match model_client
         .infer(&request.model)
         .apply_chat_template(
             &crate::services::generated::model_client::ChatTemplateRequest {
@@ -486,17 +507,9 @@ async fn chat_completions(
         gen_request.prompt.len()
     );
 
-    // Call inference via collect-stream (per-request ZMQ client preserves caller identity for TTT delta routing)
-    let model_client = match ModelClient::from_resolver((*state.signing_key).clone(), None) {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::error!("Failed to create ModelClient: {e}");
-            return (StatusCode::INTERNAL_SERVER_ERROR, "Client creation failed").into_response();
-        }
-    };
     let _claims = claims_from_auth(&user, &domain, jwt_token.as_deref(), jwt_exp);
-    // Note: OAI adapter currently creates a fresh client per request.
-    // For bearer delegation, use: model_client.request().delegated_bearer(jwt).call(payload)
+    // The request-local client carries the verified HTTP JWT through both
+    // template formatting and inference dispatch.
     let result = collect_stream_to_result(&model_client, &request.model, &gen_request).await;
 
     info!("Generation completed - success: {}", result.is_ok());
@@ -690,13 +703,20 @@ async fn stream_chat(
 
         // Apply chat template via ZMQ ModelService (tools passed to template)
         info!("Applying chat template for streaming...");
+        let model_client = match model_client_for_request(&state, jwt_token.as_deref()) {
+            Ok(client) => client,
+            Err(e) => {
+                error!("Failed to create authenticated ModelClient: {}", e);
+                let _ = tx.send(Err(anyhow::anyhow!("Client creation failed: {}", e))).await;
+                return;
+            }
+        };
         let rpc_messages = to_rpc_messages(&messages);
         let tools_str = tools_json
             .as_ref()
             .map(|t| serde_json::to_string(t).unwrap_or_default())
             .unwrap_or_default();
-        let templated_prompt = match state
-            .model_client
+        let templated_prompt = match model_client
             .infer(&model_name)
             .apply_chat_template(
                 &crate::services::generated::model_client::ChatTemplateRequest {
@@ -749,19 +769,7 @@ async fn stream_chat(
             gen_request.repeat_penalty
         );
 
-        // Start ZMQ stream with per-request client (preserves caller identity for TTT delta routing)
-        let model_client = match ModelClient::from_resolver((*state.signing_key).clone(), None) {
-            Ok(c) => c,
-            Err(e) => {
-                error!("Failed to create ModelClient: {}", e);
-                let _ = tx
-                    .send(Err(anyhow::anyhow!("Client creation failed: {}", e)))
-                    .await;
-                return;
-            }
-        };
         let _claims = claims_from_auth(&user, &domain, jwt_token.as_deref(), jwt_exp);
-        // Note: For bearer delegation, use: model_client.request().delegated_bearer(jwt).call(payload)
         use crate::services::generated::model_client::InferRpc;
         let mut stream_handle =
             match InferRpc::generate_stream(&model_client.infer(&model_name), &gen_request).await {
@@ -1055,6 +1063,13 @@ async fn completions(
 
     // Convert raw prompt to chat format and apply template via ZMQ ModelService
     // The completions endpoint expects raw text, but modern models need templated input
+    let model_client = match model_client_for_request(&state, jwt_token.as_deref()) {
+        Ok(client) => client,
+        Err(e) => {
+            tracing::error!("Failed to create authenticated ModelClient: {e}");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "Client creation failed").into_response();
+        }
+    };
     let rpc_messages = vec![crate::services::generated::inference_client::ChatMessage {
         role: "user".to_owned(),
         content: request.prompt.clone(),
@@ -1062,8 +1077,7 @@ async fn completions(
         tool_call_id: String::new(),
     }];
 
-    let templated_prompt = match state
-        .model_client
+    let templated_prompt = match model_client
         .infer(&request.model)
         .apply_chat_template(
             &crate::services::generated::model_client::ChatTemplateRequest {
@@ -1110,14 +1124,6 @@ async fn completions(
         gen_request.repeat_penalty
     );
 
-    // Call inference via collect-stream (per-request ZMQ client preserves caller identity for TTT delta routing)
-    let model_client = match ModelClient::from_resolver((*state.signing_key).clone(), None) {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::error!("Failed to create ModelClient: {e}");
-            return (StatusCode::INTERNAL_SERVER_ERROR, "Client creation failed").into_response();
-        }
-    };
     let _claims = claims_from_auth(&user, &domain, jwt_token.as_deref(), jwt_exp);
     let result = collect_stream_to_result(&model_client, &request.model, &gen_request).await;
 

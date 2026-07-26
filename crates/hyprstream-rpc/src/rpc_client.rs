@@ -106,9 +106,8 @@ impl PendingResponse {
 /// - `jwt`: Overrides the client's default JWT for this call.
 ///   Used when a service needs to present a specific token.
 /// - `delegated_bearer`: Bearer token relayed on behalf of a user.
-///   Only trusted services (OAI, MCP) may set this. Policy gates which
-///   services can relay bearer tokens. The server resolves the subject
-///   from the bearer token, not the service identity.
+///   Only explicitly pinned service identities may set this. The server
+///   resolves the subject from the verified bearer, not the relay identity.
 #[derive(Debug, Clone, Default)]
 pub struct CallOptions {
     /// Override the client's default JWT for this call.
@@ -510,6 +509,23 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
             .await
     }
 
+    /// Send an option-bearing streaming request bound to a canonical destination.
+    pub async fn call_streaming_with_options_for_service(
+        &self,
+        service_domain: &str,
+        payload: Vec<u8>,
+        ephemeral_pubkey: [u8; 32],
+        options: CallOptions,
+    ) -> Result<Vec<u8>> {
+        self.call_streaming_with_options_bound(
+            payload,
+            ephemeral_pubkey,
+            options,
+            Some(service_domain),
+            None,
+        )
+        .await
+    }
 
     /// Send an option-bearing generated streaming request bound to its service and method.
     pub async fn call_streaming_with_options_for_service_with_method(
@@ -540,7 +556,17 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
     ) -> Result<Vec<u8>> {
         self.ensure_pre_seal_current().await?;
         let request_id = self.next_id();
-        let jwt = options.jwt.or_else(|| self.effective_jwt());
+        anyhow::ensure!(
+            !(options.jwt.is_some() && options.delegated_bearer.is_some()),
+            "an RPC envelope cannot carry both a direct JWT and a delegated bearer"
+        );
+        // Delegation is an explicit principal-selection mode. Do not let a
+        // pooled client's default JWT silently take precedence over it.
+        let jwt = if options.delegated_bearer.is_some() {
+            None
+        } else {
+            options.jwt.or_else(|| self.effective_jwt())
+        };
         let (signed_bytes, pending) = self
             .sign_envelope(
                 request_id,
@@ -609,7 +635,17 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
     ) -> Result<Vec<u8>> {
         self.ensure_pre_seal_current().await?;
         let request_id = self.next_id();
-        let jwt = options.jwt.or_else(|| self.effective_jwt());
+        anyhow::ensure!(
+            !(options.jwt.is_some() && options.delegated_bearer.is_some()),
+            "an RPC envelope cannot carry both a direct JWT and a delegated bearer"
+        );
+        // Delegation is an explicit principal-selection mode. Do not let a
+        // pooled client's default JWT silently take precedence over it.
+        let jwt = if options.delegated_bearer.is_some() {
+            None
+        } else {
+            options.jwt.or_else(|| self.effective_jwt())
+        };
         let (signed_bytes, pending) = self
             .sign_envelope(
                 request_id,
@@ -1100,6 +1136,17 @@ pub trait RpcClient: Send + Sync {
         payload: Vec<u8>,
         options: CallOptions,
     ) -> Result<Vec<u8>>;
+    async fn call_with_options_for_service_with_method(
+        &self, service_domain: &str, method_discriminator: u16,
+        payload: Vec<u8>, options: CallOptions,
+    ) -> Result<Vec<u8>> {
+        anyhow::ensure!(
+            options.jwt.is_none() && options.delegated_bearer.is_none(),
+            "this RPC client does not support method-bound call options"
+        );
+        self.call_for_service_with_method(service_domain, method_discriminator, payload)
+            .await
+    }
 
     /// Send a streaming request with ephemeral DH pubkey.
     async fn call_streaming(&self, payload: Vec<u8>, ephemeral_pubkey: [u8; 32])
@@ -1112,6 +1159,20 @@ pub trait RpcClient: Send + Sync {
         payload: Vec<u8>,
         ephemeral_pubkey: [u8; 32],
     ) -> Result<Vec<u8>>;
+    async fn call_streaming_with_options_for_service(
+        &self,
+        service_domain: &str,
+        payload: Vec<u8>,
+        ephemeral_pubkey: [u8; 32],
+        options: CallOptions,
+    ) -> Result<Vec<u8>> {
+        anyhow::ensure!(
+            options.jwt.is_none() && options.delegated_bearer.is_none(),
+            "this RPC client does not support streaming call options"
+        );
+        self.call_streaming_for_service(service_domain, payload, ephemeral_pubkey)
+            .await
+    }
 
     /// Send a generated streaming request with an explicit schema method id.
     async fn call_streaming_for_service_with_method(
@@ -1121,6 +1182,22 @@ pub trait RpcClient: Send + Sync {
         payload: Vec<u8>,
         ephemeral_pubkey: [u8; 32],
     ) -> Result<Vec<u8>>;
+    async fn call_streaming_with_options_for_service_with_method(
+        &self, service_domain: &str, method_discriminator: u16,
+        payload: Vec<u8>, ephemeral_pubkey: [u8; 32], options: CallOptions,
+    ) -> Result<Vec<u8>> {
+        anyhow::ensure!(
+            options.jwt.is_none() && options.delegated_bearer.is_none(),
+            "this RPC client does not support method-bound streaming call options"
+        );
+        self.call_streaming_for_service_with_method(
+            service_domain,
+            method_discriminator,
+            payload,
+            ephemeral_pubkey,
+        )
+        .await
+    }
 
     /// Open a verified streaming subscription.
     async fn open_stream(&self, payload: Vec<u8>) -> Result<Box<dyn StreamHandle>>;
@@ -1176,6 +1253,14 @@ impl<S: Signer, T: Transport + 'static> RpcClient for RpcClientImpl<S, T> {
     ) -> Result<Vec<u8>> {
         RpcClientImpl::call_with_options_for_service(self, service_domain, payload, options).await
     }
+    async fn call_with_options_for_service_with_method(
+        &self, service_domain: &str, method_discriminator: u16,
+        payload: Vec<u8>, options: CallOptions,
+    ) -> Result<Vec<u8>> {
+        RpcClientImpl::call_with_options_for_service_with_method(
+            self, service_domain, method_discriminator, payload, options,
+        ).await
+    }
 
     async fn call_streaming(
         &self,
@@ -1194,6 +1279,22 @@ impl<S: Signer, T: Transport + 'static> RpcClient for RpcClientImpl<S, T> {
         RpcClientImpl::call_streaming_for_service(self, service_domain, payload, ephemeral_pubkey)
             .await
     }
+    async fn call_streaming_with_options_for_service(
+        &self,
+        service_domain: &str,
+        payload: Vec<u8>,
+        ephemeral_pubkey: [u8; 32],
+        options: CallOptions,
+    ) -> Result<Vec<u8>> {
+        RpcClientImpl::call_streaming_with_options_for_service(
+            self,
+            service_domain,
+            payload,
+            ephemeral_pubkey,
+            options,
+        )
+        .await
+    }
 
     async fn call_streaming_for_service_with_method(
         &self,
@@ -1210,6 +1311,14 @@ impl<S: Signer, T: Transport + 'static> RpcClient for RpcClientImpl<S, T> {
             ephemeral_pubkey,
         )
         .await
+    }
+    async fn call_streaming_with_options_for_service_with_method(
+        &self, service_domain: &str, method_discriminator: u16,
+        payload: Vec<u8>, ephemeral_pubkey: [u8; 32], options: CallOptions,
+    ) -> Result<Vec<u8>> {
+        RpcClientImpl::call_streaming_with_options_for_service_with_method(
+            self, service_domain, method_discriminator, payload, ephemeral_pubkey, options,
+        ).await
     }
 
     #[cfg(not(feature = "fips"))]
@@ -1285,6 +1394,7 @@ mod request_kem_tests {
     struct LifecycleState {
         behavior: AtomicU8,
         recipients: parking_lot::Mutex<Vec<Vec<u8>>>,
+        auth: parking_lot::Mutex<Vec<(Option<String>, Option<String>)>>,
         swap_waiters: Mutex<Vec<(Vec<u8>, oneshot::Sender<Vec<u8>>)>>,
         entered: Notify,
     }
@@ -1309,6 +1419,10 @@ mod request_kem_tests {
                 .as_deref()
                 .ok_or_else(|| anyhow::anyhow!("test request omitted service domain"))?;
             self.state.recipients.lock().push(recipient.encode());
+            self.state.auth.lock().push((
+                request.jwt_token().map(str::to_owned),
+                request.delegation_token.clone(),
+            ));
             let pq_sk = crate::node_identity::derive_mesh_mldsa_key(&self.server_sk);
             let response = crate::envelope::ResponseEnvelope::new_signed_encrypted(
                 request.request_id,
@@ -1394,6 +1508,17 @@ mod request_kem_tests {
         Arc<LifecycleState>,
         Arc<AtomicUsize>,
     ) {
+        lifecycle_client_with_options(browser_binding, None)
+    }
+
+    fn lifecycle_client_with_options(
+        browser_binding: Option<crate::browser_provisioning::BrowserRequestBinding>,
+        default_jwt: Option<String>,
+    ) -> (
+        Arc<RpcClientImpl<LocalSigner, LifecycleTransport>>,
+        Arc<LifecycleState>,
+        Arc<AtomicUsize>,
+    ) {
         let (server_sk, server_vk) = generate_signing_keypair();
         let (client_sk, _client_vk) = generate_signing_keypair();
         let mut kem_store = KeyedKemTrustStore::new();
@@ -1411,6 +1536,7 @@ mod request_kem_tests {
         let state = Arc::new(LifecycleState {
             behavior: AtomicU8::new(LIFECYCLE_SUCCESS),
             recipients: parking_lot::Mutex::new(Vec::new()),
+            auth: parking_lot::Mutex::new(Vec::new()),
             swap_waiters: Mutex::new(Vec::new()),
             entered: Notify::new(),
         });
@@ -1426,6 +1552,10 @@ mod request_kem_tests {
         .with_request_kem_store(Arc::new(kem_store))
         .with_response_pq_store(Arc::new(pq_store))
         .with_response_secret_drop_probe(Arc::clone(&drops));
+        let client = match default_jwt {
+            Some(token) => client.with_default_jwt(token),
+            None => client,
+        };
         let client = match browser_binding {
             Some(binding) => client
                 .with_browser_provisioning_binding(binding)
@@ -1433,6 +1563,60 @@ mod request_kem_tests {
             None => client,
         };
         (Arc::new(client), state, drops)
+    }
+
+    #[tokio::test]
+    async fn delegated_bearer_suppresses_pooled_default_jwt() {
+        let (client, state, _drops) =
+            lifecycle_client_with_options(None, Some("pooled-default".to_owned()));
+
+        client
+            .call_with_options_for_service(
+                "model",
+                b"unary".to_vec(),
+                CallOptions::new().delegated_bearer("delegated-user"),
+            )
+            .await
+            .expect("delegated unary call");
+        client
+            .call_streaming_with_options_for_service(
+                "model",
+                b"streaming".to_vec(),
+                [0x55; 32],
+                CallOptions::new().delegated_bearer("delegated-user"),
+            )
+            .await
+            .expect("delegated streaming call");
+
+        let auth = state.auth.lock();
+        assert_eq!(auth.len(), 2);
+        for (jwt, delegated) in auth.iter() {
+            assert!(jwt.is_none(), "default JWT must not override delegation");
+            assert_eq!(delegated.as_deref(), Some("delegated-user"));
+        }
+    }
+
+    #[tokio::test]
+    async fn explicit_jwt_and_delegated_bearer_are_rejected() {
+        let (client, state, _drops) = lifecycle_client();
+        let error = client
+            .call_with_options_for_service(
+                "model",
+                b"payload".to_vec(),
+                CallOptions::new()
+                    .jwt("direct-user")
+                    .delegated_bearer("delegated-user"),
+            )
+            .await
+            .expect_err("ambiguous principal selection must fail");
+        assert!(
+            error.to_string().contains("both a direct JWT and a delegated bearer"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            state.auth.lock().is_empty(),
+            "ambiguous request must not reach the transport"
+        );
     }
 
     #[async_trait]

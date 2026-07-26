@@ -343,6 +343,7 @@ fn generate_portable_scoped_client_recursive(
         #[derive(Clone)]
         pub struct #client_name {
             client: std::sync::Arc<dyn hyprstream_rpc::RpcClient>,
+            call_options: hyprstream_rpc::CallOptions,
             #(#all_scope_field_defs,)*
         }
 
@@ -354,7 +355,8 @@ fn generate_portable_scoped_client_recursive(
 
             /// Send a raw request and return the raw response bytes.
             pub async fn call(&self, payload: Vec<u8>) -> anyhow::Result<Vec<u8>> {
-                self.client.call_for_service(#service_name, payload).await
+                self.client.call_with_options_for_service(
+                    #service_name, payload, self.call_options.clone()).await
             }
 
             /// Send a generated request with its canonical root method id.
@@ -364,14 +366,18 @@ fn generate_portable_scoped_client_recursive(
                 payload: Vec<u8>,
             ) -> anyhow::Result<Vec<u8>> {
                 self.client
-                    .call_for_service_with_method(#service_name, method_discriminator, payload)
+                    .call_with_options_for_service_with_method(
+                        #service_name, method_discriminator, payload,
+                        self.call_options.clone())
                     .await
             }
 
             /// Send a streaming request with ephemeral DH pubkey.
             pub async fn call_streaming(&self, payload: Vec<u8>, ephemeral_pubkey: [u8; 32]) -> anyhow::Result<Vec<u8>> {
                 self.client
-                    .call_streaming_for_service(#service_name, payload, ephemeral_pubkey)
+                    .call_streaming_with_options_for_service(
+                        #service_name, payload, ephemeral_pubkey,
+                        self.call_options.clone())
                     .await
             }
 
@@ -383,11 +389,12 @@ fn generate_portable_scoped_client_recursive(
                 ephemeral_pubkey: [u8; 32],
             ) -> anyhow::Result<Vec<u8>> {
                 self.client
-                    .call_streaming_for_service_with_method(
+                    .call_streaming_with_options_for_service_with_method(
                         #service_name,
                         method_discriminator,
                         payload,
                         ephemeral_pubkey,
+                        self.call_options.clone(),
                     )
                     .await
             }
@@ -447,6 +454,7 @@ fn generate_portable_nested_factory_method(
         pub fn #method_name(&self #(, #params)*) -> #client_name_ident {
             #client_name_ident {
                 client: std::sync::Arc::clone(&self.client),
+                call_options: self.call_options.clone(),
                 #(#all_parent_field_inits,)*
                 #(#own_field_inits,)*
             }

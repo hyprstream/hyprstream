@@ -280,7 +280,10 @@ ENV LD_LIBRARY_PATH=/opt/libtorch/lib
 RUN --mount=type=cache,target=/root/.cargo/registry \
     --mount=type=cache,target=/root/.cargo/git \
     --mount=type=cache,target=/sccache \
-    OPENSSL_NO_VENDOR=1 cargo build --locked --release --no-default-features --features otel,gittorrent,xet
+    --mount=type=cache,target=/build/target,sharing=locked \
+    OPENSSL_NO_VENDOR=1 cargo build --locked --release --no-default-features --features otel,gittorrent,xet \
+    && mkdir -p /out \
+    && cp /build/target/release/hyprstream /out/hyprstream
 
 #############################################
 # Runtime Stage Selection (Distroless)
@@ -383,8 +386,10 @@ COPY --from=builder /opt/libtorch/lib/ /opt/libtorch/lib/
 
 FROM runtime-${VARIANT} AS runtime
 
-# Copy binary from builder
-COPY --from=builder /build/target/release/hyprstream /hyprstream
+# Copy only the final binary out of the builder. Cargo's target directory is a
+# cache mount, so tens of gigabytes of intermediate objects never enter an OCI
+# layer (critical on the Graviton publisher's small root filesystem).
+COPY --from=builder /out/hyprstream /hyprstream
 
 # Set library paths
 ENV LD_LIBRARY_PATH=/opt/libtorch/lib:/usr/local/cuda/lib64

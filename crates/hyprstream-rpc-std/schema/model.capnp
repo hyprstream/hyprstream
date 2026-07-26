@@ -276,9 +276,10 @@ struct UnloadModelRequest {
 # (#320): the typed `TransportConfig` union resolved via the Resolver, replacing
 # the old local-only `endpoint :Text`. Only network-routable arms (Iroh; Quic)
 # are carried — a co-located caller (same process as ModelService) ignores it and
-# uses the in-process dial registry fast path, so an EMPTY list means
-# "co-located only, no remote reach published". The router single-selects ONE
-# reach per request (List is the seam for future replica balancing).
+# uses the in-process dial registry fast path. An EMPTY list means either the
+# accepted load is still pending network readiness or the service is deliberately
+# co-located-only. A loaded network service publishes non-empty reach. The router
+# single-selects ONE reach per request (List is the seam for future balancing).
 struct LoadedModelResponse {
   modelRef @0 :Text;
   reach @1 :List(TransportConfig);
@@ -306,7 +307,7 @@ struct GenerationDefaults {
 struct ModelStatusEntry {
   modelRef   @0 :Text;
   status     @1 :Text;    # "loaded" | "loading"
-  reach      @2 :List(TransportConfig);  # network reach (#320); empty if loading or co-located-only
+  reach      @2 :List(TransportConfig);  # network reach (#320); empty while loading or if co-located-only
   loadedAt   @3 :Int64;   # ms elapsed since load (0 if loading)
   lastUsed   @4 :Int64;   # ms elapsed since last use (0 if loading)
   onlineTrainingConfig @5 :OnlineTrainingConfig;
@@ -331,7 +332,7 @@ struct ModelStatusResponse {
   loaded @0 :Bool;
   memoryBytes @1 :UInt64;
   sessionCount @2 :UInt32;
-  reach @3 :List(TransportConfig);  # network reach (#320); empty if co-located-only / not loaded
+  reach @3 :List(TransportConfig);  # network reach (#320); empty while loading, co-located-only, or not loaded
 
   # Online training configuration (if model loaded)
   onlineTrainingConfig @4 :OnlineTrainingConfig;
