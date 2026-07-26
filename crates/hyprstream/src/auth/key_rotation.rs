@@ -2296,11 +2296,12 @@ mod tests {
             label,
             format!("did:web:{label}.{zone}"),
         )?;
-        let pending = hyprstream_pds::HostedAccountMint::begin(name, rotations)?
-            .prepare_genesis(
-                hyprstream_pds::Cid::from_raw(zone.as_bytes()),
-                hyprstream_pds::did_op::GenesisRepoHead::EmptyRepo,
-            )?;
+        let mint = hyprstream_pds::HostedAccountMint::begin(name, rotations)?;
+        let document = mint.seal_did_document(&format!("https://{zone}"))?;
+        let pending = mint.prepare_genesis(
+            document,
+            hyprstream_pds::did_op::GenesisRepoHead::EmptyRepo,
+        )?;
         let signature =
             hyprstream_pds::did_op::sign_genesis(pending.unsigned_genesis(), &ed, &pq)?;
         let record = pending.seal(signature)?.record_bytes().to_vec();

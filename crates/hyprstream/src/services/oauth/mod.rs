@@ -1481,8 +1481,9 @@ mod tests {
             hyprstream_pds::AllocatedAccountName::new("alice", MAPPED_DID)?,
             account_rotations,
         )?;
+        let account_document = account_mint.seal_did_document(ISSUER)?;
         let pending_account = account_mint.prepare_genesis(
-            hyprstream_pds::Cid::from_raw(b"handler-hosted-account-doc"),
+            account_document,
             hyprstream_pds::did_op::GenesisRepoHead::EmptyRepo,
         )?;
         let account_signature = hyprstream_pds::did_op::sign_genesis(
@@ -1492,6 +1493,8 @@ mod tests {
         )?;
         let sealed_account = pending_account.seal(account_signature)?;
         let atproto_signing_key = sealed_account.atproto_signing_key().clone();
+        let atproto_document =
+            serde_json::from_slice(sealed_account.did_document().as_bytes())?;
         let pds_root = SyntheticNode::dir().with_child(
             HOSTED_TENANT,
             SyntheticNode::dir().with_child(
@@ -1509,25 +1512,6 @@ mod tests {
             Arc::new(hyprstream_pds_service::AccountRecordStore::new(Arc::new(
                 SyntheticMount::new(pds_root),
             )));
-        let mut atproto_multikey = vec![0x80, 0x24];
-        atproto_multikey.extend_from_slice(
-            atproto_signing_key
-                .verifying_key()
-                .to_encoded_point(true)
-                .as_bytes(),
-        );
-        let atproto_document = serde_json::json!({
-            "id": MAPPED_DID,
-            "verificationMethod": [{
-                "id": format!("{MAPPED_DID}#atproto"),
-                "type": "Multikey",
-                "controller": MAPPED_DID,
-                "publicKeyMultibase": format!(
-                    "z{}",
-                    bs58::encode(atproto_multikey).into_string()
-                )
-            }]
-        });
         let mut oauth_state = OAuthState::new(
             &config,
             policy_client,
