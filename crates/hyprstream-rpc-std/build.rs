@@ -40,6 +40,16 @@ fn main() {
 
     hyprstream_rpc_build::compile_schemas(schema_dir, out_path, import_paths, &schemas);
 
+    // Copy CGR files to stable codegen-out/ for TypeScript codegen
+    let codegen_dir = Path::new(&manifest_dir).join("../../codegen-out");
+    let _ = std::fs::create_dir_all(&codegen_dir);
+    for name in &schemas {
+        let cgr_path = out_path.join(format!("{name}.cgr"));
+        if cgr_path.exists() {
+            let _ = std::fs::copy(&cgr_path, codegen_dir.join(format!("{name}.cgr")));
+        }
+    }
+
     // Export OUT_DIR so downstream crates (hyprstream) can find our CGR files
     // via the DEP_HYPRSTREAM_RPC_STD_OUT_DIR env var.
     println!("cargo:out_dir={}", out_dir);
