@@ -2440,7 +2440,11 @@ mod tests {
     }
 
     fn authority_process_dir() -> Option<PathBuf> {
-        std::env::var_os("HYPRSTREAM_COMPOSITE_PRODUCTION_TEST_DIR").map(PathBuf::from)
+        let dir = std::env::var_os("HYPRSTREAM_COMPOSITE_PRODUCTION_TEST_DIR")?;
+        // Each authority role runs in a fresh process, so the dispatch fixture
+        // must be installed here rather than in the parent orchestrator.
+        crate::mac::install_explicit_test_dispatch_pep();
+        Some(PathBuf::from(dir))
     }
 
     fn authority_ca_key() -> Arc<SigningKey> {
