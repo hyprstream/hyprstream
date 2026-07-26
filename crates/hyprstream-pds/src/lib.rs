@@ -65,6 +65,7 @@ pub mod dag_cbor;
 pub mod did_op;
 pub mod event_group;
 pub mod hosted_account;
+pub mod hosted_did_document;
 pub mod ledger;
 pub mod list_record;
 pub mod mst;
@@ -84,6 +85,9 @@ pub use did_op::{
 pub use hosted_account::{
     AccountRecord, AllocatedAccountName, DirectoryHostedAccountStore, HostedAccountMint,
     PendingHostedAccountMint, SealedHostedAccount, ACCOUNT_RECORD_VERSION,
+};
+pub use hosted_did_document::{
+    SealedHostedDidDocument, DID_DOCUMENT_MEDIA_TYPE, DID_DOCUMENT_PATH, DID_OPERATION_LOG_PATH,
 };
 pub use ledger::{AllocationRecord, CheckpointRecord, GrantClass, ReceiptRecord, StateRoot, Unit};
 pub use name_record::NameRecord;

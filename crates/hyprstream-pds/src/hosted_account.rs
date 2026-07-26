@@ -4,9 +4,9 @@
 //!
 //! 1. [`HostedAccountMint::begin`] consumes an already-allocated account name
 //!    and generates a fresh per-account ES256 `#atproto` key.
-//! 2. The caller uses [`HostedAccountMint::atproto_verifying_key`] to build and
-//!    seal the canonical DID document (B2/#1164), then supplies that document's
-//!    CID to [`HostedAccountMint::prepare_genesis`].
+//! 2. [`HostedAccountMint::seal_did_document`] builds the canonical DID
+//!    document (B2/#1164) from that generated key, and
+//!    [`HostedAccountMint::prepare_genesis`] binds the sealed artifact.
 //! 3. The user signs [`PendingHostedAccountMint::signing_bytes`] with the
 //!    required priority-zero Hybrid rotation key.
 //! 4. [`PendingHostedAccountMint::seal`] verifies that signature before it can
@@ -37,12 +37,14 @@ use crate::did_op::{
     validate_host_form_did_web, DidOpSignature, GenesisDidOp, GenesisRepoHead, GenesisRotationKeys,
     UnsignedGenesisDidOp,
 };
+use crate::hosted_did_document::SealedHostedDidDocument;
 
 /// Version of the durable hosted-account record.
 pub const ACCOUNT_RECORD_VERSION: u16 = 1;
 const COMPRESSED_P256_PUBLIC_KEY_LEN: usize = 33;
 const ACCOUNT_RECORD_FILE: &str = "account-record.cbor";
 const GENESIS_DID_OP_FILE: &str = "genesis.didop.cbor";
+const DID_DOCUMENT_FILE: &str = "did-document.json";
 const ATPROTO_SIGNING_KEY_FILE: &str = "atproto-signing-key";
 
 /// The output of the A2 allocation + A3 configured-zone seam.
@@ -273,17 +275,47 @@ impl HostedAccountMint {
         *self.atproto_signing_key.verifying_key()
     }
 
+    /// Build the canonical DID document from this mint's DID and generated
+    /// account-specific `#atproto` key.
+    pub fn seal_did_document(&self, pds_endpoint: &str) -> Result<SealedHostedDidDocument> {
+        SealedHostedDidDocument::seal(
+            &self.name,
+            self.atproto_signing_key.verifying_key(),
+            pds_endpoint,
+        )
+    }
+
     /// Bind the sealed DID document and deliberate genesis repo-head state.
+    ///
+    /// Accepting the artifact instead of a free-form CID makes DID/key
+    /// substitution unrepresentable at this boundary.
     pub fn prepare_genesis(
         self,
-        doc_cid: Cid,
+        did_document: SealedHostedDidDocument,
         head_at_op: GenesisRepoHead,
     ) -> Result<PendingHostedAccountMint> {
-        let unsigned =
-            UnsignedGenesisDidOp::new(self.name.did.clone(), doc_cid, self.rotations, head_at_op)?;
+        ensure!(
+            did_document.did() == self.name.did(),
+            "sealed DID document names a different hosted account"
+        );
+        ensure!(
+            did_document.atproto_verifying_key()?.to_encoded_point(true)
+                == self
+                    .atproto_signing_key
+                    .verifying_key()
+                    .to_encoded_point(true),
+            "sealed DID document contains a different #atproto key"
+        );
+        let unsigned = UnsignedGenesisDidOp::new(
+            self.name.did.clone(),
+            did_document.cid(),
+            self.rotations,
+            head_at_op,
+        )?;
         Ok(PendingHostedAccountMint {
             name: self.name,
             atproto_signing_key: self.atproto_signing_key,
+            did_document,
             unsigned,
         })
     }
@@ -295,6 +327,7 @@ impl HostedAccountMint {
 pub struct PendingHostedAccountMint {
     name: AllocatedAccountName,
     atproto_signing_key: AtprotoSigningKey,
+    did_document: SealedHostedDidDocument,
     unsigned: UnsignedGenesisDidOp,
 }
 
@@ -334,6 +367,7 @@ impl PendingHostedAccountMint {
             record_bytes,
             genesis,
             genesis_bytes,
+            did_document: self.did_document,
             atproto_signing_key: self.atproto_signing_key,
         })
     }
@@ -350,6 +384,7 @@ pub struct SealedHostedAccount {
     record_bytes: Vec<u8>,
     genesis: GenesisDidOp,
     genesis_bytes: Vec<u8>,
+    did_document: SealedHostedDidDocument,
     atproto_signing_key: AtprotoSigningKey,
 }
 
@@ -370,6 +405,10 @@ impl SealedHostedAccount {
         &self.genesis_bytes
     }
 
+    pub fn did_document(&self) -> &SealedHostedDidDocument {
+        &self.did_document
+    }
+
     pub fn atproto_signing_key(&self) -> &AtprotoSigningKey {
         &self.atproto_signing_key
     }
@@ -382,6 +421,7 @@ impl SealedHostedAccount {
         Vec<u8>,
         GenesisDidOp,
         Vec<u8>,
+        SealedHostedDidDocument,
         AtprotoSigningKey,
     ) {
         (
@@ -389,6 +429,7 @@ impl SealedHostedAccount {
             self.record_bytes,
             self.genesis,
             self.genesis_bytes,
+            self.did_document,
             self.atproto_signing_key,
         )
     }
@@ -412,8 +453,9 @@ impl SealedHostedAccount {
 /// written in this order:
 ///
 /// 1. the generated `#atproto` private key;
-/// 2. the sealed genesis operation;
-/// 3. the public account record, **last**, as the publication marker.
+/// 2. the sealed canonical DID document;
+/// 3. the sealed genesis operation;
+/// 4. the public account record, **last**, as the publication marker.
 ///
 /// A crash before publication leaves no label directory. A crash after
 /// publication leaves the complete account. A retry removes only an invalid or
@@ -466,6 +508,13 @@ impl DirectoryHostedAccountStore {
             WriteFault::AtprotoFileCreate,
             WriteFault::AtprotoFileWrite,
             WriteFault::AtprotoFileSync,
+        )?;
+        self.write_new_file(
+            &staging_dir.join(DID_DOCUMENT_FILE),
+            account.did_document.as_bytes(),
+            WriteFault::DidDocumentFileCreate,
+            WriteFault::DidDocumentFileWrite,
+            WriteFault::DidDocumentFileSync,
         )?;
         self.write_new_file(
             &staging_dir.join(GENESIS_DID_OP_FILE),
@@ -587,6 +636,9 @@ enum WriteFault {
     AtprotoFileCreate,
     AtprotoFileWrite,
     AtprotoFileSync,
+    DidDocumentFileCreate,
+    DidDocumentFileWrite,
+    DidDocumentFileSync,
     GenesisFileCreate,
     GenesisFileWrite,
     GenesisFileSync,
@@ -599,11 +651,14 @@ enum WriteFault {
 }
 
 #[cfg(test)]
-const WRITE_FAULTS: [WriteFault; 13] = [
+const WRITE_FAULTS: [WriteFault; 16] = [
     WriteFault::StagingDirectoryCreate,
     WriteFault::AtprotoFileCreate,
     WriteFault::AtprotoFileWrite,
     WriteFault::AtprotoFileSync,
+    WriteFault::DidDocumentFileCreate,
+    WriteFault::DidDocumentFileWrite,
+    WriteFault::DidDocumentFileSync,
     WriteFault::GenesisFileCreate,
     WriteFault::GenesisFileWrite,
     WriteFault::GenesisFileSync,
@@ -643,6 +698,7 @@ fn complete_account_matches(path: &Path, expected: &SealedHostedAccount) -> Resu
             }
         }
     };
+    let document_bytes = read(DID_DOCUMENT_FILE)?;
     let (Some(record_bytes), Some(genesis_bytes), Some(secret_bytes)) = (
         read(ACCOUNT_RECORD_FILE)?,
         read(GENESIS_DID_OP_FILE)?,
@@ -674,6 +730,24 @@ fn complete_account_matches(path: &Path, expected: &SealedHostedAccount) -> Resu
             && genesis_bytes == expected.genesis_bytes
             && secret_bytes == expected.atproto_signing_key.to_bytes().as_slice(),
         "hosted-account label directory {path:?} already contains a different complete account"
+    );
+    let document_bytes = document_bytes.ok_or_else(|| {
+        anyhow::anyhow!(
+            "hosted-account label directory {path:?} is a valid pre-B2 account without its sealed DID document; preserve it and run an explicit migration"
+        )
+    })?;
+    let document = SealedHostedDidDocument::from_canonical_json(&document_bytes)
+        .context("hosted-account directory contains an invalid sealed DID document")?;
+    ensure!(
+        record.doc_cid() == document.cid()
+            && record.name().did() == document.did()
+            && record.atproto_verifying_key()?.to_encoded_point(true)
+                == document.atproto_verifying_key()?.to_encoded_point(true),
+        "hosted-account directory's sealed DID document does not match its account record"
+    );
+    ensure!(
+        document_bytes == expected.did_document.as_bytes(),
+        "hosted-account label directory {path:?} contains a different sealed DID document"
     );
     Ok(true)
 }
@@ -736,6 +810,25 @@ fn validate_sealed_bundle(account: &SealedHostedAccount) -> Result<()> {
     ensure!(
         account.record.doc_cid() == account.genesis.unsigned().doc_cid(),
         "account record and genesis operation disagree on the DID document CID"
+    );
+    ensure!(
+        account.record.doc_cid() == account.did_document.cid(),
+        "account record does not name its sealed DID document"
+    );
+    ensure!(
+        account.record.name().did() == account.did_document.did(),
+        "account record and sealed DID document name different accounts"
+    );
+    ensure!(
+        account
+            .record
+            .atproto_verifying_key()?
+            .to_encoded_point(true)
+            == account
+                .did_document
+                .atproto_verifying_key()?
+                .to_encoded_point(true),
+        "account record and sealed DID document contain different #atproto keys"
     );
     ensure!(
         account
@@ -835,6 +928,12 @@ mod tests {
         .unwrap()
     }
 
+    fn prepare(mint: HostedAccountMint) -> PendingHostedAccountMint {
+        let document = mint.seal_did_document("https://pds.example.com").unwrap();
+        mint.prepare_genesis(document, GenesisRepoHead::EmptyRepo)
+            .unwrap()
+    }
+
     #[test]
     fn mint_generates_account_specific_atproto_key_and_never_serializes_secret() {
         let user = user_signer();
@@ -846,9 +945,7 @@ mod tests {
             second.atproto_verifying_key().to_encoded_point(true)
         );
 
-        let pending = first
-            .prepare_genesis(Cid::from_raw(b"did document"), GenesisRepoHead::EmptyRepo)
-            .unwrap();
+        let pending = prepare(first);
         let signature = sign_genesis(pending.unsigned_genesis(), &user.ed, &user.pq).unwrap();
         let sealed = pending.seal(signature).unwrap();
         assert_eq!(
@@ -880,18 +977,30 @@ mod tests {
     fn account_record_is_not_produced_before_valid_user_signature() {
         let user = user_signer();
         let attacker = user_signer();
-        let pending = begin(&user)
-            .prepare_genesis(Cid::from_raw(b"did document"), GenesisRepoHead::EmptyRepo)
-            .unwrap();
+        let pending = prepare(begin(&user));
         assert!(sign_genesis(pending.unsigned_genesis(), &attacker.ed, &attacker.pq).is_err());
+    }
+
+    #[test]
+    fn genesis_rejects_a_document_from_another_mint() {
+        let user = user_signer();
+        let first = begin(&user);
+        let other_document = first.seal_did_document("https://pds.example.com").unwrap();
+        let second = begin(&user);
+        let error = second
+            .prepare_genesis(other_document, GenesisRepoHead::EmptyRepo)
+            .err()
+            .expect("a document with another mint's #atproto key must fail");
+        assert!(
+            error.to_string().contains("different #atproto key"),
+            "{error:#}"
+        );
     }
 
     #[test]
     fn account_and_genesis_roundtrip_byte_exactly() {
         let user = user_signer();
-        let pending = begin(&user)
-            .prepare_genesis(Cid::from_raw(b"did document"), GenesisRepoHead::EmptyRepo)
-            .unwrap();
+        let pending = prepare(begin(&user));
         let signature = sign_genesis(pending.unsigned_genesis(), &user.ed, &user.pq).unwrap();
         let sealed = pending.seal(signature).unwrap();
         let account = AccountRecord::from_dag_cbor(sealed.record_bytes()).unwrap();
@@ -901,6 +1010,7 @@ mod tests {
         assert_eq!(account.genesis_op(), genesis.cid().unwrap());
         assert_eq!(account.current_op(), account.genesis_op());
         assert_eq!(account.doc_cid(), genesis.unsigned().doc_cid());
+        assert_eq!(account.doc_cid(), sealed.did_document().cid());
     }
 
     #[test]
@@ -917,9 +1027,7 @@ mod tests {
     #[test]
     fn operation_one_version_is_sealed_before_account_record() {
         let user = user_signer();
-        let pending = begin(&user)
-            .prepare_genesis(Cid::from_raw(b"did document"), GenesisRepoHead::EmptyRepo)
-            .unwrap();
+        let pending = prepare(begin(&user));
         let signing_value = DagCbor::decode(&pending.signing_bytes().unwrap()).unwrap();
         assert_eq!(
             signing_value.get("version").unwrap().as_unsigned().unwrap(),
@@ -932,14 +1040,13 @@ mod tests {
     #[test]
     fn durable_writer_publishes_record_last_and_never_overwrites() {
         let user = user_signer();
-        let pending = begin(&user)
-            .prepare_genesis(Cid::from_raw(b"did document"), GenesisRepoHead::EmptyRepo)
-            .unwrap();
+        let pending = prepare(begin(&user));
         let signature = sign_genesis(pending.unsigned_genesis(), &user.ed, &user.pq).unwrap();
         let sealed = pending.seal(signature).unwrap();
         let expected_record = sealed.record().clone();
         let expected_record_bytes = sealed.record_bytes().to_vec();
         let expected_genesis_bytes = sealed.genesis_bytes().to_vec();
+        let expected_document_bytes = sealed.did_document().as_bytes().to_vec();
         let expected_secret = sealed.atproto_signing_key().to_bytes();
 
         let temporary = tempfile::tempdir().unwrap();
@@ -957,17 +1064,16 @@ mod tests {
             expected_genesis_bytes
         );
         assert_eq!(
+            std::fs::read(account_dir.join(DID_DOCUMENT_FILE)).unwrap(),
+            expected_document_bytes
+        );
+        assert_eq!(
             std::fs::read(account_dir.join(ATPROTO_SIGNING_KEY_FILE)).unwrap(),
             expected_secret.as_slice()
         );
 
         // The label directory is the exclusive never-overwrite boundary.
-        let second = begin(&user)
-            .prepare_genesis(
-                Cid::from_raw(b"other did document"),
-                GenesisRepoHead::EmptyRepo,
-            )
-            .unwrap();
+        let second = prepare(begin(&user));
         let second_signature = sign_genesis(second.unsigned_genesis(), &user.ed, &user.pq).unwrap();
         assert!(second
             .seal(second_signature)
@@ -996,9 +1102,7 @@ mod tests {
     #[test]
     fn durable_writer_recovers_from_every_interrupted_boundary() {
         let user = user_signer();
-        let pending = begin(&user)
-            .prepare_genesis(Cid::from_raw(b"did document"), GenesisRepoHead::EmptyRepo)
-            .unwrap();
+        let pending = prepare(begin(&user));
         let signature = sign_genesis(pending.unsigned_genesis(), &user.ed, &user.pq).unwrap();
         let sealed = pending.seal(signature).unwrap();
 
@@ -1023,5 +1127,28 @@ mod tests {
             recovery.write_new(&sealed).unwrap();
             assert!(complete_account_matches(&final_directory, &sealed).unwrap());
         }
+    }
+
+    #[test]
+    fn durable_writer_preserves_a_valid_pre_b2_account_for_explicit_migration() {
+        let user = user_signer();
+        let pending = prepare(begin(&user));
+        let signature = sign_genesis(pending.unsigned_genesis(), &user.ed, &user.pq).unwrap();
+        let sealed = pending.seal(signature).unwrap();
+
+        let temporary = tempfile::tempdir().unwrap();
+        let store = DirectoryHostedAccountStore::new(temporary.path().join("accounts"));
+        sealed.write_to(&store).unwrap();
+        let account_dir = store.root().join("alice");
+        std::fs::remove_file(account_dir.join(DID_DOCUMENT_FILE)).unwrap();
+
+        let error = sealed
+            .write_to(&store)
+            .expect_err("pre-B2 account must require an explicit migration");
+        assert!(error.to_string().contains("pre-B2"), "{error:#}");
+        assert!(account_dir.join(ACCOUNT_RECORD_FILE).exists());
+        assert!(account_dir.join(GENESIS_DID_OP_FILE).exists());
+        assert!(account_dir.join(ATPROTO_SIGNING_KEY_FILE).exists());
+        assert!(!account_dir.join(DID_DOCUMENT_FILE).exists());
     }
 }
