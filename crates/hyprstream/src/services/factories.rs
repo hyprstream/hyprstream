@@ -32,8 +32,8 @@ use hyprstream_service::{ServiceContext, Spawnable};
 use tokio::sync::RwLock;
 use tracing::info;
 
-use crate::auth::PolicyManager;
 use crate::auth::identity_store::credentials_dir;
+use crate::auth::PolicyManager;
 use crate::config::{HyprConfig, TokenConfig};
 use crate::services::generated::policy_client::{RefreshServiceTokenRequest, RegisterServiceKey};
 use crate::services::{
@@ -49,7 +49,9 @@ fn load_config() -> HyprConfig {
 /// Get the JWT bound to this service instance's exact signing key.
 fn service_token(signing_key: &SigningKey) -> Option<String> {
     let trust = hyprstream_service::global_trust_store();
-    trust.get(&signing_key.verifying_key()).and_then(|att| att.jwt)
+    trust
+        .get(&signing_key.verifying_key())
+        .and_then(|att| att.jwt)
 }
 
 /// Shared Git2DB registry instance. Lazily initialized by the first factory
@@ -216,8 +218,7 @@ fn register_service_key(
             .get(&signing_key.verifying_key())
             .and_then(|att| att.jwt.clone())
     };
-    let jwt =
-        resolve_registration_jwt(service_name, &creds_dir, secrets_profile, from_trust)?;
+    let jwt = resolve_registration_jwt(service_name, &creds_dir, secrets_profile, from_trust)?;
 
     // Seed the loaded JWT into the trust store so that peer-client construction
     // (`service_token`) and the background renewal task can read it. Bind it to
@@ -281,8 +282,8 @@ fn register_service_key(
 /// Used for local-disk JWTs that we issued ourselves — signature is verified
 /// by PolicyService; here we only need the expiry to decide whether to renew.
 fn decode_jwt_exp(jwt: &str) -> Option<i64> {
-    use base64::Engine as _;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine as _;
     let payload_b64 = jwt.split('.').nth(1)?;
     let payload = URL_SAFE_NO_PAD.decode(payload_b64).ok()?;
     let value: serde_json::Value = serde_json::from_slice(&payload).ok()?;
@@ -783,13 +784,15 @@ fn create_registry_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawn
             audit_pq,
         )?;
         let node_did = hyprstream_rpc::did_key::ed25519_to_did_key(&ctx.verifying_key().to_bytes());
-        Ok(crate::services::discovery::PdsPublisher::with_generation_source(
-            store,
-            node_did,
-            generation_source,
+        Ok(
+            crate::services::discovery::PdsPublisher::with_generation_source(
+                store,
+                node_did,
+                generation_source,
+            )
+            .with_at9p_state_ingest(at9p_state)
+            .with_es256_store(es256_store),
         )
-        .with_at9p_state_ingest(at9p_state)
-        .with_es256_store(es256_store))
     })()
     .map_err(|e| tracing::warn!("PDS publish disabled: {e}"))
     .ok();
@@ -1039,7 +1042,7 @@ fn create_worker_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
     use hyprstream_workers::config::PoolConfig;
     #[cfg(feature = "oci-image")]
     use hyprstream_workers::image::RafsStore;
-    use hyprstream_workers::{BackendCtx, SandboxBackend, WorkerService, resolve_backend};
+    use hyprstream_workers::{resolve_backend, BackendCtx, SandboxBackend, WorkerService};
 
     let config = load_config();
     let sk = ctx.service_signing_key("worker");
@@ -1170,8 +1173,8 @@ fn create_oai_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
     info!("Creating OAIService");
 
     use crate::server::state::ServerState;
-    use crate::services::OAIService;
     use crate::services::generated::model_client::ModelClient;
+    use crate::services::OAIService;
 
     // Load full config for OAI settings
     let config = load_config();
@@ -1359,7 +1362,7 @@ fn create_at9p_verify_service(_ctx: &ServiceContext) -> anyhow::Result<Box<dyn S
 ///
 /// This service provides Flight SQL protocol for dataset queries.
 /// It optionally uses RegistryClient for dataset lookup.
-#[service_factory("flight", depends_on = ["registry", "discovery"])]
+#[service_factory("flight", depends_on = ["policy", "registry", "discovery"])]
 fn create_flight_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>> {
     info!("Creating FlightService");
 
@@ -1371,6 +1374,31 @@ fn create_flight_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
 
     // Register this service's verifying key with PolicyService
     register_service_key(ctx, "flight", &sk)?;
+
+    let policy_vk = hyprstream_service::global_trust_store()
+        .resolve_one("policy")
+        .ok_or_else(|| anyhow::anyhow!("trust store has no policy key"))?;
+    let policy_client =
+        PolicyClient::for_local_bootstrap(sk.clone(), policy_vk, service_token(&sk))?;
+    let federation_resolver = Arc::new(
+        crate::auth::FederationKeyResolver::new(&config.oauth.trusted_issuers)
+            .with_policy_client(Arc::new(policy_client.clone())),
+    );
+    let jti_blocklist = SHARED_JTI_BLOCKLIST
+        .get()
+        .map(Arc::clone)
+        .context("PolicyService did not publish the shared JTI blocklist before Flight startup")?;
+    let auth = crate::server::state::ResourceAuthState::new(
+        ctx.jwt_verifying_key(),
+        config.flight.resource_url(),
+        config.oauth.issuer_url(),
+        federation_resolver,
+        jti_blocklist,
+    );
+    let authorizer = Arc::new(crate::services::flight::TenantFlightAuthorizer::new(
+        auth,
+        policy_client,
+    ));
 
     // Create registry client for dataset lookup (if default_dataset is configured)
     // RegistryClient already implements hyprstream_metrics::RegistryClient
@@ -1388,6 +1416,7 @@ fn create_flight_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
         registry_client,
         ctx.transport("flight", SocketKind::Rep),
         ctx.verifying_key(),
+        authorizer,
     );
 
     Ok(Box::new(flight_service))
@@ -1572,7 +1601,7 @@ fn create_mcp_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
                     move |mut req: axum::extract::Request, next: axum::middleware::Next| {
                         let www_authenticate = www_authenticate.clone();
                         let mcp_resource_url = mcp_resource_url.clone();
-                        let _mcp_oauth_issuer = mcp_oauth_issuer_clone.clone();
+                        let mcp_oauth_issuer = mcp_oauth_issuer_clone.clone();
                         let federation_resolver = mcp_federation_resolver.clone();
                         let jwt_key_source = jwt_key_source.clone();
                         let jti_blocklist = mcp_jti_blocklist.clone();
@@ -1669,7 +1698,7 @@ fn create_mcp_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
                                     }
                                 }
                             };
-                            let claims = match result {
+                            let mut claims = match result {
                                 Ok(c) => c,
                                 Err(e) => {
                                     tracing::warn!(%method, %uri, error = %e, "MCP auth REJECTED");
@@ -1680,6 +1709,19 @@ fn create_mcp_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
                                     return res;
                                 }
                             };
+                            let atproto_issuer =
+                                crate::services::oauth::state::canonical_issuer_origin(
+                                    &mcp_oauth_issuer,
+                                )
+                                .unwrap_or_else(|| mcp_oauth_issuer.clone());
+                            let local_issuers =
+                                [mcp_oauth_issuer.as_str(), atproto_issuer.as_str()];
+                            claims.strip_federated_tenant(&local_issuers);
+                            let subject = claims.subject(&local_issuers);
+                            if subject.validate().is_err() || subject.name().is_none() {
+                                tracing::warn!(%method, %uri, "MCP auth rejected: invalid subject");
+                                return (StatusCode::UNAUTHORIZED, "Authentication failed").into_response();
+                            }
                             // JTI revocation check (RFC 7009)
                             if let Some(ref jti) = claims.jti {
                                 let revoked = jti_blocklist.as_ref().map(|bl| bl.is_revoked(jti)).unwrap_or(false);
@@ -1762,11 +1804,17 @@ fn create_mcp_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
                             }
                             tracing::debug!(%method, %uri, sub = %claims.sub, "MCP auth OK");
                             // Insert AuthenticatedUser so MCP handlers see validated identity
-                            req.extensions_mut().insert(crate::server::middleware::AuthenticatedUser {
-                                user: claims.sub.clone(),
+                            let authenticated = crate::server::middleware::AuthenticatedUser {
+                                user: subject.name().unwrap_or_default().to_owned(),
+                                verified_tenant: claims.tenant.clone(),
                                 token: Some(t.clone()),
                                 exp: Some(claims.exp),
-                            });
+                            };
+                            if authenticated.authorization_domain().is_err() {
+                                tracing::warn!(%method, %uri, sub = %claims.sub, "MCP auth rejected: no valid hosted-account tenant binding");
+                                return (StatusCode::FORBIDDEN, "Verified hosted-account tenant binding required").into_response();
+                            }
+                            req.extensions_mut().insert(authenticated);
                             next.run(req).await
                         }
                     }
@@ -1859,7 +1907,7 @@ fn create_mcp_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
 fn create_tui_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>> {
     info!("Creating TuiService");
 
-    use crate::tui::{TuiState, service::TuiService};
+    use crate::tui::{service::TuiService, TuiState};
 
     // TUI publishes terminal frames (stdin/stdout) over moq via
     // StreamChannel::publisher(), and returns its per-PID moq UDS path to the
@@ -2064,9 +2112,9 @@ fn create_metrics_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawna
     init_local_moq_stream_plane("metrics");
 
     use crate::services::MetricsService;
-    use hyprstream_metrics::StorageBackend as _;
     use hyprstream_metrics::query::QueryOrchestrator;
     use hyprstream_metrics::storage::duckdb::DuckDbBackend;
+    use hyprstream_metrics::StorageBackend as _;
 
     let config = load_config();
     let mc = &config.metrics;

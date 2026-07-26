@@ -33,14 +33,106 @@ use crate::config::FlightConfig as HyprFlightConfig;
 use anyhow::Result;
 use hyprstream_rpc::prelude::*;
 use hyprstream_rpc::registry::SocketKind;
-use hyprstream_service::Spawnable;
 use hyprstream_rpc::transport::TransportConfig;
+use hyprstream_service::Spawnable;
 use std::sync::Arc;
 use tokio::sync::Notify;
 use tracing::{error, info};
 
 /// Service name for registry and logging
 pub const SERVICE_NAME: &str = "flight";
+
+/// Flight's gRPC authentication and tenant-policy adapter.
+pub struct TenantFlightAuthorizer {
+    auth: crate::server::state::ResourceAuthState,
+    policy_client: crate::services::PolicyClient,
+}
+
+impl TenantFlightAuthorizer {
+    pub fn new(
+        auth: crate::server::state::ResourceAuthState,
+        policy_client: crate::services::PolicyClient,
+    ) -> Self {
+        Self {
+            auth,
+            policy_client,
+        }
+    }
+}
+
+#[tonic::async_trait]
+impl hyprstream_flight::FlightAuthorizer for TenantFlightAuthorizer {
+    async fn authorize(
+        &self,
+        authorization: Option<&str>,
+        resource: &str,
+        operation: &str,
+    ) -> Result<(), hyprstream_flight::FlightAuthError> {
+        let authorization = authorization.ok_or_else(|| {
+            hyprstream_flight::FlightAuthError::Unauthenticated("Bearer token required".to_owned())
+        })?;
+        let token = authorization.strip_prefix("Bearer ").ok_or_else(|| {
+            hyprstream_flight::FlightAuthError::Unauthenticated("Bearer token required".to_owned())
+        })?;
+        let claims = crate::server::middleware::verify_resource_token_claims(&self.auth, token)
+            .await
+            .map_err(|_| {
+                hyprstream_flight::FlightAuthError::Unauthenticated(
+                    "Invalid access token".to_owned(),
+                )
+            })?;
+        if claims.cnf_jkt().is_some() {
+            return Err(hyprstream_flight::FlightAuthError::Unauthenticated(
+                "DPoP-bound tokens are not accepted on Flight without a proof transport".to_owned(),
+            ));
+        }
+        let atproto_issuer =
+            crate::services::oauth::state::canonical_issuer_origin(
+                &self.auth.oauth_issuer_url,
+            )
+            .unwrap_or_else(|| self.auth.oauth_issuer_url.clone());
+        let local_issuers =
+            [self.auth.oauth_issuer_url.as_str(), atproto_issuer.as_str()];
+        let subject = claims.subject(&local_issuers);
+        subject.validate().map_err(|_| {
+            hyprstream_flight::FlightAuthError::Unauthenticated(
+                "Invalid access-token subject".to_owned(),
+            )
+        })?;
+        let identity = crate::server::middleware::AuthenticatedUser {
+            user: subject.name().ok_or_else(|| {
+                hyprstream_flight::FlightAuthError::Unauthenticated(
+                    "Invalid access-token subject".to_owned(),
+                )
+            })?.to_owned(),
+            verified_tenant: claims.tenant,
+            token: Some(token.to_owned()),
+            exp: Some(claims.exp),
+        };
+        let domain = identity.authorization_domain().map_err(|_| {
+            hyprstream_flight::FlightAuthError::Forbidden(
+                "Verified hosted-account tenant binding required".to_owned(),
+            )
+        })?;
+        let allowed = self
+            .policy_client
+            .check(&crate::services::generated::policy_client::PolicyCheck {
+                subject: identity.user,
+                domain,
+                resource: resource.to_owned(),
+                operation: operation.to_owned(),
+            })
+            .await
+            .unwrap_or(false);
+        if allowed {
+            Ok(())
+        } else {
+            Err(hyprstream_flight::FlightAuthError::Forbidden(
+                "Flight request denied by tenant policy".to_owned(),
+            ))
+        }
+    }
+}
 
 /// FlightService - Arrow Flight SQL with RPC control channel
 ///
@@ -63,6 +155,9 @@ pub struct FlightService {
     /// Verifying key for envelope verification
     #[allow(dead_code)]
     verifying_key: VerifyingKey,
+
+    /// Mandatory JWT + hosted-tenant + Casbin boundary for the gRPC data plane.
+    authorizer: Arc<dyn hyprstream_flight::FlightAuthorizer>,
 }
 
 impl FlightService {
@@ -79,12 +174,14 @@ impl FlightService {
         registry_client: Option<Arc<dyn hyprstream_metrics::RegistryClient>>,
         control_transport: TransportConfig,
         verifying_key: VerifyingKey,
+        authorizer: Arc<dyn hyprstream_flight::FlightAuthorizer>,
     ) -> Self {
         Self {
             config,
             registry_client,
             control_transport,
             verifying_key,
+            authorizer,
         }
     }
 }
@@ -123,7 +220,11 @@ impl Spawnable for FlightService {
                 "FlightService starting on {}:{} (dataset: {})",
                 self.config.host,
                 self.config.port,
-                if dataset_name.is_empty() { "<in-memory>" } else { dataset_name }
+                if dataset_name.is_empty() {
+                    "<in-memory>"
+                } else {
+                    dataset_name
+                }
             );
 
             // Signal ready before starting server
@@ -147,10 +248,11 @@ impl Spawnable for FlightService {
                     // It will be terminated when the runtime drops
                 }
 
-                result = hyprstream_flight::start_flight_server(
+                result = hyprstream_flight::start_flight_server_with_authorizer(
                     self.registry_client.clone(),
                     dataset_name,
                     flight_config,
+                    Arc::clone(&self.authorizer),
                 ) => {
                     match result {
                         Ok(()) => info!("FlightService stopped normally"),

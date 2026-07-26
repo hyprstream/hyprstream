@@ -409,7 +409,9 @@ impl crate::storage::cas::CasMountAuthorizer for MacCasAuthorizer {
         request: crate::storage::cas::CasMountAuthzRequest<'_>,
     ) -> Result<(), hyprstream_vfs::MountError> {
         let resolver = CasObjectLabelResolver::from_domain(request.domain);
-        let decision = self.pep.check_read(&caller.to_string(), None, &resolver);
+        let decision = self
+            .pep
+            .check_read(&caller.to_string(), request.verified_tenant, &resolver);
         if decision.is_permit() {
             Ok(())
         } else {
@@ -689,6 +691,7 @@ mod tests {
             kind: CasMountObjectKind::Xorb,
             address: "deadbeef",
             domain: &domain,
+            verified_tenant: Some("tenant-a"),
             operation: "read",
             requested_label: None,
         };
@@ -712,11 +715,43 @@ mod tests {
             kind: CasMountObjectKind::Xorb,
             address: "deadbeef",
             domain: &domain,
+            verified_tenant: Some("tenant-a"),
             operation: "read",
             requested_label: None,
         };
         let subject = Subject::new("secret-user");
         assert!(authz.authorize(&subject, req).is_ok());
+    }
+
+    #[test]
+    fn mac_cas_authorizer_uses_verified_http_tenant_for_clearance() {
+        let pep = Arc::new(CasPep::new(
+            Arc::new(TenantClearance),
+            Arc::new(SpySink::default()),
+        ));
+        let authz = MacCasAuthorizer::new(pep);
+        let domain = DedupDomain::local_default();
+        let subject = Subject::new("alice");
+
+        let tenant_a = CasMountAuthzRequest {
+            kind: CasMountObjectKind::Xorb,
+            address: "deadbeef",
+            domain: &domain,
+            verified_tenant: Some("tenant-a"),
+            operation: "read",
+            requested_label: None,
+        };
+        assert!(authz.authorize(&subject, tenant_a).is_ok());
+
+        let tenant_b = CasMountAuthzRequest {
+            kind: CasMountObjectKind::Xorb,
+            address: "deadbeef",
+            domain: &domain,
+            verified_tenant: Some("tenant-b"),
+            operation: "read",
+            requested_label: None,
+        };
+        assert!(authz.authorize(&subject, tenant_b).is_err());
     }
 
     #[test]
@@ -740,6 +775,7 @@ mod tests {
             kind: CasMountObjectKind::Object,
             address: "some-addr",
             domain: &domain,
+            verified_tenant: Some("tenant-a"),
             operation: "open",
             requested_label: None,
         };

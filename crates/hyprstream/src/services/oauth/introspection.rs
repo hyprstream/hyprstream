@@ -11,7 +11,7 @@
 use std::sync::Arc;
 
 use axum::{
-    extract::State,
+    extract::{Extension, State},
     http::{header, StatusCode},
     response::{IntoResponse, Response},
     Form, Json,
@@ -19,6 +19,7 @@ use axum::{
 use serde::Deserialize;
 
 use super::state::OAuthState;
+use crate::server::middleware::AuthenticatedUser;
 
 #[derive(Deserialize)]
 pub struct IntrospectRequest {
@@ -30,21 +31,38 @@ pub struct IntrospectRequest {
 /// POST /oauth/introspect (RFC 7662)
 pub async fn introspect_token(
     State(state): State<Arc<OAuthState>>,
+    Extension(caller): Extension<AuthenticatedUser>,
     Form(params): Form<IntrospectRequest>,
 ) -> Response {
     // JWT tokens contain dots; opaque tokens do not.
     if params.token.contains('.') {
-        introspect_jwt(&state, &params.token).await
+        introspect_jwt(&state, &caller, &params.token).await
     } else {
-        introspect_refresh(&state, &params.token).await
+        introspect_refresh(&state, &caller, &params.token).await
     }
 }
 
-async fn introspect_jwt(state: &Arc<OAuthState>, token: &str) -> Response {
+fn caller_may_introspect_tenant(caller: &AuthenticatedUser, tenant: Option<&str>) -> bool {
+    match caller.authorization_domain() {
+        Ok(domain) if domain == "*" => true,
+        Ok(domain) => tenant.is_some_and(|tenant| tenant == domain),
+        Err(_) => false,
+    }
+}
+
+async fn introspect_jwt(
+    state: &Arc<OAuthState>,
+    caller: &AuthenticatedUser,
+    token: &str,
+) -> Response {
     let claims = match super::auth::validate_oauth_access_token(state, token).await {
         Ok(c) => c,
         Err(_) => return inactive_response(),
     };
+
+    if !caller_may_introspect_tenant(caller, claims.tenant.as_deref()) {
+        return inactive_response();
+    }
 
     let now = chrono::Utc::now().timestamp();
     if claims.exp < now {
@@ -68,9 +86,24 @@ async fn introspect_jwt(state: &Arc<OAuthState>, token: &str) -> Response {
         .into_response()
 }
 
-async fn introspect_refresh(state: &Arc<OAuthState>, token: &str) -> Response {
+async fn introspect_refresh(
+    state: &Arc<OAuthState>,
+    caller: &AuthenticatedUser,
+    token: &str,
+) -> Response {
     match state.get_refresh_token(token).await {
         Ok(Some(entry)) => {
+            let tenant = super::token::resolve_hosted_account_binding(
+                state,
+                &entry.username,
+            )
+                .await
+                .ok()
+                .map(|(_, tenant)| tenant);
+            if !caller_may_introspect_tenant(caller, tenant.as_deref()) {
+                return inactive_response();
+            }
+
             // Match the mint boundary: generic tokens retain the username,
             // while active atproto-profile tokens report the mapped DID.
             let sub = if super::state::atproto_profile_active(&entry.scopes) {

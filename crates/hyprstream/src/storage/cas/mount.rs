@@ -33,14 +33,14 @@
 //! transient only and is never admitted to the CAS.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
 use async_trait::async_trait;
 use cas_serve::StoreError;
-use hyprstream_rpc::Subject;
 use hyprstream_rpc::auth::mac::{Assurance, CompartmentSet, Lattice, Level, SecurityLabel};
-use hyprstream_vfs::{DirEntry, Fid, Mount, MountError, ORDWR, OREAD, OTRUNC, OWRITE, Stat};
+use hyprstream_rpc::Subject;
+use hyprstream_vfs::{DirEntry, Fid, Mount, MountError, Stat, ORDWR, OREAD, OTRUNC, OWRITE};
 use parking_lot::Mutex;
 use tokio::sync::Notify;
 use tracing::{debug, warn};
@@ -78,6 +78,10 @@ pub struct CasMountAuthzRequest<'a> {
     pub address: &'a str,
     /// Dedup domain the mount is serving.
     pub domain: &'a DedupDomain,
+    /// Authority-verified hosted-account tenant for the caller, when the
+    /// transport has one. This is transport context, never an object/path
+    /// field supplied by the caller.
+    pub verified_tenant: Option<&'a str>,
     /// Operation name for policy/audit (e.g. `open`, `read`, `stat`,
     /// `stage:create`, `stage:label`, `stage:commit`).
     pub operation: &'static str,
@@ -615,6 +619,7 @@ fn owner_key(owner: &Subject) -> String {
 pub struct CasMount {
     substrate: CasSubstrate,
     domain: DedupDomain,
+    verified_tenant: Option<String>,
     authorizer: Arc<dyn CasMountAuthorizer>,
     staging: Arc<StagingRegistry>,
     staging_cfg: StagingConfig,
@@ -661,6 +666,7 @@ impl CasMount {
         Self {
             substrate,
             domain,
+            verified_tenant: None,
             authorizer,
             staging: Arc::new(StagingRegistry::new()),
             staging_cfg: StagingConfig::default(),
@@ -680,10 +686,20 @@ impl CasMount {
         Self {
             substrate,
             domain,
+            verified_tenant: None,
             authorizer: Arc::new(authorizer),
             staging: Arc::new(StagingRegistry::new()),
             staging_cfg,
         }
+    }
+
+    /// Bind this request-scoped mount to a transport-verified tenant.
+    ///
+    /// Only HTTP/RPC authentication adapters should call this. The value is
+    /// passed to the MAC clearance source and is not used for object routing.
+    pub(crate) fn with_verified_tenant(mut self, verified_tenant: String) -> Self {
+        self.verified_tenant = Some(verified_tenant);
+        self
     }
 
     fn authorize(
@@ -699,6 +715,7 @@ impl CasMount {
                 kind,
                 address,
                 domain: &self.domain,
+                verified_tenant: self.verified_tenant.as_deref(),
                 operation,
                 requested_label: None,
             },
@@ -717,6 +734,7 @@ impl CasMount {
                 kind: CasMountObjectKind::Stage,
                 address,
                 domain: &self.domain,
+                verified_tenant: self.verified_tenant.as_deref(),
                 operation: "stage:label",
                 requested_label: Some(requested_label),
             },
@@ -833,10 +851,7 @@ impl CasMount {
                 return Err(MountError::PermissionDenied(msg));
             }
         };
-        let put_result = self
-            .substrate
-            .put(&self.domain, &bytes, Some(joined))
-            .await;
+        let put_result = self.substrate.put(&self.domain, &bytes, Some(joined)).await;
 
         match put_result {
             Ok(manifest) => {
@@ -1744,6 +1759,7 @@ mod tests {
             kind: CasMountObjectKind::Xorb,
             address: "aa00",
             domain: &domain,
+            verified_tenant: None,
             operation: "read",
             requested_label: None,
         };
@@ -1775,6 +1791,7 @@ mod tests {
             kind: CasMountObjectKind::Stage,
             address: "1",
             domain: &domain,
+            verified_tenant: None,
             operation: "stage:label",
             requested_label: Some(&requested_label),
         };
@@ -2152,11 +2169,9 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, MountError::PermissionDenied(_)));
-        assert!(
-            ctl_str(&mount, &ctl, &caller)
-                .await
-                .contains("state=staging")
-        );
+        assert!(ctl_str(&mount, &ctl, &caller)
+            .await
+            .contains("state=staging"));
 
         declare_test_label(&mount, &ctl, &caller).await;
         mount.write(&ctl, 0, b"commit\n", &caller).await.unwrap();

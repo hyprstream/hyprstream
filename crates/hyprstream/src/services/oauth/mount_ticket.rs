@@ -111,10 +111,23 @@ pub async fn issue_mount_ticket(
     let exp = now + MOUNT_TICKET_TTL;
     let audience = state.issuer_url.clone();
     let capability = ticket_capability(&body.plane, &normalized_path);
-    let claims = hyprstream_rpc::auth::Claims::new(user.user.clone(), now, exp)
+    let domain = match user.authorization_domain() {
+        Ok(domain) => domain,
+        Err(_) => {
+            return oauth_error(
+                StatusCode::FORBIDDEN,
+                "insufficient_scope",
+                Some("Verified hosted-account tenant binding required"),
+            );
+        }
+    };
+    let mut claims = hyprstream_rpc::auth::Claims::new(user.user.clone(), now, exp)
         .with_issuer(state.issuer_url.clone())
         .with_audience(Some(audience.clone()))
         .with_cap(capability.clone());
+    if domain != "*" {
+        claims = claims.with_tenant(domain);
+    }
     let ticket = hyprstream_rpc::auth::jwt::encode(&claims, &key);
 
     tracing::info!(
@@ -188,6 +201,7 @@ mod freeze_tests {
             State(test_state()),
             Extension(AuthenticatedUser {
                 user: "did:web:accounts.example:users:alice".to_owned(),
+                verified_tenant: Some("tenant-a.example".to_owned()),
                 token: None,
                 exp: None,
             }),
@@ -205,6 +219,7 @@ mod freeze_tests {
             State(test_state()),
             Extension(AuthenticatedUser {
                 user: "alice".to_owned(),
+                verified_tenant: Some("tenant-a.example".to_owned()),
                 token: None,
                 exp: None,
             }),
@@ -214,6 +229,17 @@ mod freeze_tests {
         .await;
 
         assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let claims = crate::auth::jwt::decode(
+            json["ticket"].as_str().unwrap(),
+            &ed25519_dalek::SigningKey::from_bytes(&[0x75; 32]).verifying_key(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(claims.tenant.as_deref(), Some("tenant-a.example"));
     }
 }
 

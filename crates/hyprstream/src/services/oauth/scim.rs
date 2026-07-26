@@ -75,6 +75,33 @@ fn user_service(state: &Arc<OAuthState>) -> Result<&Arc<user_service::UserServic
         .ok_or_else(|| Box::new(scim_error_simple(503, "User service not configured")))
 }
 
+fn hosted_account_did_from_body(
+    state: &OAuthState,
+    body: &serde_json::Value,
+) -> Result<Option<String>, Box<axum::response::Response>> {
+    let did = body
+        .get(SCIM_SCHEMA_EXT_HYPRSTREAM)
+        .and_then(|extension| extension.get("hosted_account_did"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|did| !did.is_empty())
+        .map(str::to_owned);
+    if let Some(did) = did.as_deref() {
+        super::token::hosted_account_tenant_from_did(
+            did,
+            state.hosted_account_zone.as_ref(),
+        )
+        .map_err(|error| {
+            Box::new(scim_error(
+                400,
+                "invalidValue",
+                &format!("invalid hosted_account_did: {error}"),
+            ))
+        })?;
+    }
+    Ok(did)
+}
+
 fn user_to_scim(
     info: &user_service::UserInfo,
     base_url: &str,
@@ -84,7 +111,9 @@ fn user_to_scim(
     ScimUser {
         schemas: {
             let mut s = vec![SCIM_SCHEMA_USER.to_owned()];
-            if include_pubkey {
+            if include_pubkey
+                && (!info.pubkey_base64.is_empty() || info.atproto_did.is_some())
+            {
                 s.push(SCIM_SCHEMA_EXT_HYPRSTREAM.to_owned());
             }
             s
@@ -108,9 +137,12 @@ fn user_to_scim(
             location: Some(format!("{base_url}/scim/v2/Users/{}", info.sub)),
             version: Some(etag),
         },
-        hyprstream: if include_pubkey && !info.pubkey_base64.is_empty() {
+        hyprstream: if include_pubkey
+            && (!info.pubkey_base64.is_empty() || info.atproto_did.is_some())
+        {
             Some(ScimHyprstreamExtension {
                 pubkey_base64: info.pubkey_base64.clone(),
+                hosted_account_did: info.atproto_did.clone(),
             })
         } else {
             None
@@ -305,6 +337,10 @@ pub async fn create_user(
         .and_then(|v| v.as_str())
         .map(std::borrow::ToOwned::to_owned);
     let external_id = body.get("externalId").and_then(|v| v.as_str()).map(std::borrow::ToOwned::to_owned);
+    let hosted_account_did = match hosted_account_did_from_body(&state, &body) {
+        Ok(did) => did,
+        Err(response) => return *response,
+    };
 
     let _info = match svc.register(&user_name, &pubkey_base64).await {
         Ok(i) => i,
@@ -312,13 +348,17 @@ pub async fn create_user(
     };
 
     // Set optional profile fields
-    if display_name.is_some() || email.is_some() || external_id.is_some() {
+    if display_name.is_some()
+        || email.is_some()
+        || external_id.is_some()
+        || hosted_account_did.is_some()
+    {
         let update = user_service::UserUpdate {
             name: display_name.map(Some),
             email: email.map(Some),
             external_id: external_id.map(Some),
             email_verified: None,
-            atproto_did: None,
+            atproto_did: hosted_account_did.map(Some),
         };
         if let Err(e) = svc.update(&user_name, update).await {
             return scim_error_simple(500, &e.to_string());
@@ -407,13 +447,17 @@ pub async fn replace_user(
         .map(std::borrow::ToOwned::to_owned);
     let external_id = body.get("externalId").and_then(|v| v.as_str()).map(std::borrow::ToOwned::to_owned);
     let active = body.get("active").and_then(serde_json::Value::as_bool);
+    let hosted_account_did = match hosted_account_did_from_body(&state, &body) {
+        Ok(did) => did,
+        Err(response) => return *response,
+    };
 
     let update = user_service::UserUpdate {
         name: display_name.map(Some),
         email: email.map(Some),
         external_id: external_id.map(Some),
         email_verified: None,
-            atproto_did: None,
+        atproto_did: hosted_account_did.map(Some),
     };
 
     match svc.update(&info.username, update).await {

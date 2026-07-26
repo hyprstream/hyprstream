@@ -336,8 +336,11 @@ async fn verify_mount_ticket(
     if !crate::services::oauth::mount_ticket::is_mount_ticket_for(&claims, plane, namespace_path) {
         return Err("token is not valid for this 9P plane/path");
     }
-    let local_issuers: &[&str] = &[&*state.oauth_issuer_url];
-    let subject = claims.subject(local_issuers);
+    let atproto_issuer =
+        crate::services::oauth::state::canonical_issuer_origin(&state.oauth_issuer_url)
+            .unwrap_or_else(|| state.oauth_issuer_url.clone());
+    let local_issuers = [&*state.oauth_issuer_url, atproto_issuer.as_str()];
+    let subject = claims.subject(&local_issuers);
     subject
         .validate()
         .map_err(|_| "subject validation failed")?;

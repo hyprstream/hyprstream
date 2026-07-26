@@ -16,20 +16,19 @@ use tracing::{error, info, trace};
 use crate::{
     api::{
         openai_compat::{
-            ChatChoice, ChatCompletionRequest, ChatCompletionResponse, ChatMessage, CompletionChoice,
-            CompletionRequest, CompletionResponse, EmbeddingRequest, ListModelsResponse, Model,
-            OnlineTrainingDetails, Usage,
+            ChatChoice, ChatCompletionRequest, ChatCompletionResponse, ChatMessage,
+            CompletionChoice, CompletionRequest, CompletionResponse, EmbeddingRequest,
+            ListModelsResponse, Model, OnlineTrainingDetails, Usage,
         },
         tools,
     },
     archetypes::capabilities::Infer,
     auth::Operation,
-    runtime::GenerationRequest,
     runtime::CacheOwner,
+    runtime::GenerationRequest,
     server::{state::ServerState, AuthenticatedUser},
     services::generated::model_client::ModelClient,
 };
-
 
 /// RAII guard for metrics cleanup
 struct MetricsGuard<'a> {
@@ -84,7 +83,6 @@ impl ErrorResponse {
             },
         }
     }
-
 }
 
 /// Result of collecting a stream into a single response.
@@ -118,11 +116,10 @@ async fn collect_stream_to_result(
                 }
                 StreamPayload::Complete(meta) => {
                     let stats: crate::services::rpc_types::InferenceComplete =
-                        serde_json::from_slice(&meta)
-                            .unwrap_or_else(|e| {
-                                tracing::warn!("Failed to parse InferenceComplete: {e}");
-                                crate::services::rpc_types::InferenceComplete::empty()
-                            });
+                        serde_json::from_slice(&meta).unwrap_or_else(|e| {
+                            tracing::warn!("Failed to parse InferenceComplete: {e}");
+                            crate::services::rpc_types::InferenceComplete::empty()
+                        });
                     return Ok(CollectedResult { text, stats });
                 }
                 StreamPayload::Error(msg) => {
@@ -177,22 +174,33 @@ fn extract_cache_owner(headers: &HeaderMap) -> CacheOwner {
     }
 }
 
-/// Extract auth info: (username, jwt_token, jwt_exp)
-fn extract_auth(auth_user: Option<&AuthenticatedUser>) -> (String, Option<String>, Option<i64>) {
-    if let Some(user) = auth_user {
-        trace!("Using authenticated user: {}", user.user);
-        (user.user.clone(), user.token.clone(), user.exp)
-    } else {
-        trace!("No authentication provided, using anonymous identity");
-        ("anonymous".to_owned(), None, None)
-    }
+/// Extract auth info, including the authority-verified hosted-account tenant.
+fn extract_auth(
+    auth_user: Option<&AuthenticatedUser>,
+) -> Result<(String, String, Option<String>, Option<i64>), &'static str> {
+    let user = auth_user.ok_or("authenticated identity missing")?;
+    trace!("Using authenticated user: {}", user.user);
+    Ok((
+        user.user.clone(),
+        user.authorization_domain()?,
+        user.token.clone(),
+        user.exp,
+    ))
 }
 
 /// Build Claims from auth info, using the JWT's real exp for timeout enforcement.
-fn claims_from_auth(user: &str, jwt_token: Option<&str>, jwt_exp: Option<i64>) -> hyprstream_rpc::auth::Claims {
+fn claims_from_auth(
+    user: &str,
+    domain: &str,
+    jwt_token: Option<&str>,
+    jwt_exp: Option<i64>,
+) -> hyprstream_rpc::auth::Claims {
     let now = chrono::Utc::now().timestamp();
     let exp = jwt_exp.unwrap_or(now + 3600);
     let mut claims = hyprstream_rpc::auth::Claims::new(user.to_owned(), now, exp);
+    if domain != "*" {
+        claims = claims.with_tenant(domain.to_owned());
+    }
     if let Some(token) = jwt_token {
         claims = claims.with_token(token.to_owned());
     }
@@ -235,7 +243,8 @@ async fn resolve_model_path(
         // Derive path locally
         let storage_paths = crate::storage::StoragePaths::new()?;
         storage_paths.worktree_path(model_ref.name(), &branch)
-    }.await;
+    }
+    .await;
 
     match path_result {
         Ok(path) => {
@@ -281,10 +290,7 @@ fn add_no_cache_headers(response: &mut axum::response::Response) {
         header::CACHE_CONTROL,
         HeaderValue::from_static("no-cache, no-store, must-revalidate"),
     );
-    headers.insert(
-        header::PRAGMA,
-        HeaderValue::from_static("no-cache"),
-    );
+    headers.insert(header::PRAGMA, HeaderValue::from_static("no-cache"));
 }
 
 /// Create OpenAI API router
@@ -304,7 +310,21 @@ async fn chat_completions(
     Json(request): Json<ChatCompletionRequest>,
 ) -> impl IntoResponse {
     // Extract user identity from JWT (via middleware)
-    let (user, jwt_token, jwt_exp) = extract_auth(auth_user.as_ref().map(|Extension(u)| u));
+    let (user, domain, jwt_token, jwt_exp) =
+        match extract_auth(auth_user.as_ref().map(|Extension(u)| u)) {
+            Ok(identity) => identity,
+            Err(_) => {
+                return (
+                    StatusCode::FORBIDDEN,
+                    Json(ErrorResponse::new(
+                        "Verified hosted-account tenant binding required",
+                        "permission_denied",
+                        "missing_tenant",
+                    )),
+                )
+                    .into_response();
+            }
+        };
 
     // Check permission for inference on this model via ZMQ
     let resource = format!("model:{}", request.model);
@@ -312,7 +332,7 @@ async fn chat_completions(
         .policy_client
         .check(&crate::services::generated::policy_client::PolicyCheck {
             subject: user.clone(),
-            domain: user.clone(),
+            domain: domain.clone(),
             resource: resource.clone(),
             operation: Operation::Infer.as_str().to_owned(),
         })
@@ -322,7 +342,10 @@ async fn chat_completions(
             return (
                 StatusCode::FORBIDDEN,
                 Json(ErrorResponse::new(
-                    format!("Permission denied: user '{}' cannot infer on '{}'", user, request.model),
+                    format!(
+                        "Permission denied: user '{}' cannot infer on '{}'",
+                        user, request.model
+                    ),
                     "permission_denied",
                     "insufficient_permissions",
                 )),
@@ -365,7 +388,9 @@ async fn chat_completions(
 
     if is_streaming {
         info!("Handling streaming request");
-        return stream_chat(state, headers, request, user, jwt_token, jwt_exp).await.into_response();
+        return stream_chat(state, headers, request, user, domain, jwt_token, jwt_exp)
+            .await
+            .into_response();
     }
     info!("Handling non-streaming request");
 
@@ -406,20 +431,23 @@ async fn chat_completions(
     };
 
     let rpc_messages = to_rpc_messages(&request.messages);
-    let tools_str = tools_json.as_ref()
+    let tools_str = tools_json
+        .as_ref()
         .map(|t| serde_json::to_string(t).unwrap_or_default())
         .unwrap_or_default();
     let templated_prompt = match state
         .model_client
         .infer(&request.model)
-        .apply_chat_template(&crate::services::generated::model_client::ChatTemplateRequest {
-            messages: rpc_messages.clone(),
-            add_generation_prompt: true,
-            tools_json: Some(tools_str.clone()).filter(|s| !s.is_empty()),
-            max_tokens: request.max_tokens.map(|v| v as u32),
-            enable_thinking: None,
-            template_vars_json: None,
-        })
+        .apply_chat_template(
+            &crate::services::generated::model_client::ChatTemplateRequest {
+                messages: rpc_messages.clone(),
+                add_generation_prompt: true,
+                tools_json: Some(tools_str.clone()).filter(|s| !s.is_empty()),
+                max_tokens: request.max_tokens.map(|v| v as u32),
+                enable_thinking: None,
+                template_vars_json: None,
+            },
+        )
         .await
     {
         Ok(prompt_str) => crate::config::TemplatedPrompt::new(prompt_str),
@@ -439,12 +467,20 @@ async fn chat_completions(
     info!(
         "Template applied, prompt length: {}, preview: {}",
         templated_prompt.len(),
-        &templated_prompt.as_str().chars().take(200).collect::<String>()
+        &templated_prompt
+            .as_str()
+            .chars()
+            .take(200)
+            .collect::<String>()
     );
 
     // Build generation request with templated prompt
     let gen_params = crate::config::SamplingParams::from(&state.config.sampling_defaults)
-        .merge(crate::config::SamplingParams::from_model_path(&model_path).await.unwrap_or_default())
+        .merge(
+            crate::config::SamplingParams::from_model_path(&model_path)
+                .await
+                .unwrap_or_default(),
+        )
         .merge((&request).into());
     let gen_request = gen_params.into_generation_request(templated_prompt.into_inner());
 
@@ -466,7 +502,7 @@ async fn chat_completions(
             return (StatusCode::INTERNAL_SERVER_ERROR, "Client creation failed").into_response();
         }
     };
-    let _claims = claims_from_auth(&user, jwt_token.as_deref(), jwt_exp);
+    let _claims = claims_from_auth(&user, &domain, jwt_token.as_deref(), jwt_exp);
     // Note: OAI adapter currently creates a fresh client per request.
     // For bearer delegation, use: model_client.request().delegated_bearer(jwt).call(payload)
     let result = collect_stream_to_result(&model_client, &request.model, &gen_request).await;
@@ -488,24 +524,43 @@ async fn chat_completions(
             let finish_reason_str = &collected.stats.finish_reason;
 
             // Parse tool calls from response using format-aware detection
-            let (content, tool_calls, finish_reason) = if tools::has_tool_calls_for_format(tool_call_format, &collected.text) {
-                info!("Detected tool calls in response (format: {:?})", tool_call_format);
-                match tools::parse_tool_calls_for_format(tool_call_format, &collected.text) {
-                    Ok(parsed_tool_calls) if !parsed_tool_calls.is_empty() => {
-                        let content_text = tools::extract_text_content_for_format(tool_call_format, &collected.text);
-                        let content = if content_text.is_empty() { None } else { Some(content_text) };
-                        info!("Parsed {} tool calls", parsed_tool_calls.len());
-                        (content, Some(parsed_tool_calls), "tool_calls")
+            let (content, tool_calls, finish_reason) =
+                if tools::has_tool_calls_for_format(tool_call_format, &collected.text) {
+                    info!(
+                        "Detected tool calls in response (format: {:?})",
+                        tool_call_format
+                    );
+                    match tools::parse_tool_calls_for_format(tool_call_format, &collected.text) {
+                        Ok(parsed_tool_calls) if !parsed_tool_calls.is_empty() => {
+                            let content_text = tools::extract_text_content_for_format(
+                                tool_call_format,
+                                &collected.text,
+                            );
+                            let content = if content_text.is_empty() {
+                                None
+                            } else {
+                                Some(content_text)
+                            };
+                            info!("Parsed {} tool calls", parsed_tool_calls.len());
+                            (content, Some(parsed_tool_calls), "tool_calls")
+                        }
+                        Ok(_) | Err(_) => {
+                            let fr = if finish_reason_str == "max_tokens" {
+                                "length"
+                            } else {
+                                "stop"
+                            };
+                            (Some(collected.text), None, fr)
+                        }
                     }
-                    Ok(_) | Err(_) => {
-                        let fr = if finish_reason_str == "max_tokens" { "length" } else { "stop" };
-                        (Some(collected.text), None, fr)
-                    }
-                }
-            } else {
-                let fr = if finish_reason_str == "max_tokens" { "length" } else { "stop" };
-                (Some(collected.text), None, fr)
-            };
+                } else {
+                    let fr = if finish_reason_str == "max_tokens" {
+                        "length"
+                    } else {
+                        "stop"
+                    };
+                    (Some(collected.text), None, fr)
+                };
 
             let response = ChatCompletionResponse {
                 id: format!("chatcmpl-{}", uuid::Uuid::new_v4()),
@@ -526,7 +581,11 @@ async fn chat_completions(
                     prompt_tokens: 0,
                     completion_tokens: tokens_generated,
                     total_tokens: tokens_generated,
-                    online_training_details: collected.stats.ttt_metrics.as_ref().map(OnlineTrainingDetails::from),
+                    online_training_details: collected
+                        .stats
+                        .ttt_metrics
+                        .as_ref()
+                        .map(OnlineTrainingDetails::from),
                 }),
             };
 
@@ -552,7 +611,15 @@ async fn chat_completions(
 }
 
 /// Handle streaming chat completions via ZMQ PUB/SUB
-async fn stream_chat(state: ServerState, _headers: HeaderMap, request: ChatCompletionRequest, user: String, jwt_token: Option<String>, jwt_exp: Option<i64>) -> impl IntoResponse {
+async fn stream_chat(
+    state: ServerState,
+    _headers: HeaderMap,
+    request: ChatCompletionRequest,
+    user: String,
+    domain: String,
+    jwt_token: Option<String>,
+    jwt_exp: Option<i64>,
+) -> impl IntoResponse {
     // Create channel for SSE events
     let (tx, rx) = mpsc::channel::<Result<serde_json::Value, anyhow::Error>>(100);
 
@@ -580,7 +647,9 @@ async fn stream_chat(state: ServerState, _headers: HeaderMap, request: ChatCompl
         let model_ref = match crate::storage::ModelRef::parse(&model_name) {
             Ok(r) => r,
             Err(e) => {
-                let _ = tx.send(Err(anyhow::anyhow!("Invalid model reference: {}", e))).await;
+                let _ = tx
+                    .send(Err(anyhow::anyhow!("Invalid model reference: {}", e)))
+                    .await;
                 return;
             }
         };
@@ -600,10 +669,14 @@ async fn stream_chat(state: ServerState, _headers: HeaderMap, request: ChatCompl
             // Derive path locally
             let storage_paths = crate::storage::StoragePaths::new()?;
             storage_paths.worktree_path(model_ref.name(), &branch)
-        }.await {
+        }
+        .await
+        {
             Ok(path) => path,
             Err(e) => {
-                let _ = tx.send(Err(anyhow::anyhow!("Could not get model path: {}", e))).await;
+                let _ = tx
+                    .send(Err(anyhow::anyhow!("Could not get model path: {}", e)))
+                    .await;
                 return;
             }
         };
@@ -626,36 +699,49 @@ async fn stream_chat(state: ServerState, _headers: HeaderMap, request: ChatCompl
         // Apply chat template via ZMQ ModelService (tools passed to template)
         info!("Applying chat template for streaming...");
         let rpc_messages = to_rpc_messages(&messages);
-        let tools_str = tools_json.as_ref()
+        let tools_str = tools_json
+            .as_ref()
             .map(|t| serde_json::to_string(t).unwrap_or_default())
             .unwrap_or_default();
-        let templated_prompt = match state.model_client
+        let templated_prompt = match state
+            .model_client
             .infer(&model_name)
-            .apply_chat_template(&crate::services::generated::model_client::ChatTemplateRequest {
-                messages: rpc_messages.clone(),
-                add_generation_prompt: true,
-                tools_json: Some(tools_str.clone()).filter(|s| !s.is_empty()),
-                max_tokens: request.max_tokens.map(|v| v as u32),
-                enable_thinking: None,
-                template_vars_json: None,
-            })
+            .apply_chat_template(
+                &crate::services::generated::model_client::ChatTemplateRequest {
+                    messages: rpc_messages.clone(),
+                    add_generation_prompt: true,
+                    tools_json: Some(tools_str.clone()).filter(|s| !s.is_empty()),
+                    max_tokens: request.max_tokens.map(|v| v as u32),
+                    enable_thinking: None,
+                    template_vars_json: None,
+                },
+            )
             .await
         {
             Ok(prompt_str) => {
                 let prompt = crate::config::TemplatedPrompt::new(prompt_str);
-                info!("Streaming template applied, prompt length: {}", prompt.len());
+                info!(
+                    "Streaming template applied, prompt length: {}",
+                    prompt.len()
+                );
                 prompt
             }
             Err(e) => {
                 error!("Template formatting failed in streaming: {}", e);
-                let _ = tx.send(Err(anyhow::anyhow!("Template formatting failed: {}", e))).await;
+                let _ = tx
+                    .send(Err(anyhow::anyhow!("Template formatting failed: {}", e)))
+                    .await;
                 return;
             }
         };
 
         // Build generation request
         let mut gen_params = crate::config::SamplingParams::from(&defaults)
-            .merge(crate::config::SamplingParams::from_model_path(&model_path).await.unwrap_or_default())
+            .merge(
+                crate::config::SamplingParams::from_model_path(&model_path)
+                    .await
+                    .unwrap_or_default(),
+            )
             .merge((&request).into());
         if !stop_sequences.is_empty() {
             gen_params.stop_tokens = Some(stop_sequences);
@@ -664,7 +750,11 @@ async fn stream_chat(state: ServerState, _headers: HeaderMap, request: ChatCompl
 
         info!(
             "Streaming: max_tokens={:?}, temp={:?}, top_p={:?}, top_k={:?}, repeat_penalty={:?}",
-            gen_request.max_tokens, gen_request.temperature, gen_request.top_p, gen_request.top_k, gen_request.repeat_penalty
+            gen_request.max_tokens,
+            gen_request.temperature,
+            gen_request.top_p,
+            gen_request.top_k,
+            gen_request.repeat_penalty
         );
 
         // Start ZMQ stream with per-request client (preserves caller identity for TTT delta routing)
@@ -672,21 +762,26 @@ async fn stream_chat(state: ServerState, _headers: HeaderMap, request: ChatCompl
             Ok(c) => c,
             Err(e) => {
                 error!("Failed to create ModelClient: {}", e);
-                let _ = tx.send(Err(anyhow::anyhow!("Client creation failed: {}", e))).await;
+                let _ = tx
+                    .send(Err(anyhow::anyhow!("Client creation failed: {}", e)))
+                    .await;
                 return;
             }
         };
-        let _claims = claims_from_auth(&user, jwt_token.as_deref(), jwt_exp);
+        let _claims = claims_from_auth(&user, &domain, jwt_token.as_deref(), jwt_exp);
         // Note: For bearer delegation, use: model_client.request().delegated_bearer(jwt).call(payload)
         use crate::services::generated::model_client::InferRpc;
-        let mut stream_handle = match InferRpc::generate_stream(&model_client.infer(&model_name), &gen_request).await {
-            Ok(h) => h,
-            Err(e) => {
-                error!("Failed to start ZMQ stream: {}", e);
-                let _ = tx.send(Err(anyhow::anyhow!("Generation failed: {}", e))).await;
-                return;
-            }
-        };
+        let mut stream_handle =
+            match InferRpc::generate_stream(&model_client.infer(&model_name), &gen_request).await {
+                Ok(h) => h,
+                Err(e) => {
+                    error!("Failed to start ZMQ stream: {}", e);
+                    let _ = tx
+                        .send(Err(anyhow::anyhow!("Generation failed: {}", e)))
+                        .await;
+                    return;
+                }
+            };
 
         // OpenAI-style stream ID for SSE responses
         let sse_stream_id = format!("chatcmpl-{}", uuid::Uuid::new_v4());
@@ -710,7 +805,7 @@ async fn stream_chat(state: ServerState, _headers: HeaderMap, request: ChatCompl
 
         // ZMQ receive loop - forward StreamBlock payloads to SSE
         info!("Starting ZMQ streaming receive loop (StreamBlock format)...");
-        
+
         // Accumulate full response text for tool call parsing
         let mut accumulated_text = String::new();
 
@@ -879,10 +974,7 @@ async fn stream_chat(state: ServerState, _headers: HeaderMap, request: ChatCompl
     add_no_cache_headers(&mut response);
     response
         .headers_mut()
-        .insert(
-            header::EXPIRES,
-            axum::http::HeaderValue::from_static("0"),
-        );
+        .insert(header::EXPIRES, axum::http::HeaderValue::from_static("0"));
 
     response
 }
@@ -895,7 +987,21 @@ async fn completions(
     Json(request): Json<CompletionRequest>,
 ) -> impl IntoResponse {
     // Extract user identity from JWT (via middleware)
-    let (user, jwt_token, jwt_exp) = extract_auth(auth_user.as_ref().map(|Extension(u)| u));
+    let (user, domain, jwt_token, jwt_exp) =
+        match extract_auth(auth_user.as_ref().map(|Extension(u)| u)) {
+            Ok(identity) => identity,
+            Err(_) => {
+                return (
+                    StatusCode::FORBIDDEN,
+                    Json(ErrorResponse::new(
+                        "Verified hosted-account tenant binding required",
+                        "permission_denied",
+                        "missing_tenant",
+                    )),
+                )
+                    .into_response();
+            }
+        };
 
     // Check permission for inference on this model
     let resource = format!("model:{}", request.model);
@@ -903,7 +1009,7 @@ async fn completions(
         .policy_client
         .check(&crate::services::generated::policy_client::PolicyCheck {
             subject: user.clone(),
-            domain: user.clone(),
+            domain: domain.clone(),
             resource: resource.clone(),
             operation: Operation::Infer.as_str().to_owned(),
         })
@@ -913,7 +1019,10 @@ async fn completions(
             return (
                 StatusCode::FORBIDDEN,
                 Json(ErrorResponse::new(
-                    format!("Permission denied: user '{}' cannot infer on '{}'", user, request.model),
+                    format!(
+                        "Permission denied: user '{}' cannot infer on '{}'",
+                        user, request.model
+                    ),
                     "permission_denied",
                     "insufficient_permissions",
                 )),
@@ -964,14 +1073,16 @@ async fn completions(
     let templated_prompt = match state
         .model_client
         .infer(&request.model)
-        .apply_chat_template(&crate::services::generated::model_client::ChatTemplateRequest {
-            messages: rpc_messages.clone(),
-            add_generation_prompt: true,
-            tools_json: None,
-            max_tokens: request.max_tokens.map(|v| v as u32),
-            enable_thinking: None,
-            template_vars_json: None,
-        })
+        .apply_chat_template(
+            &crate::services::generated::model_client::ChatTemplateRequest {
+                messages: rpc_messages.clone(),
+                add_generation_prompt: true,
+                tools_json: None,
+                max_tokens: request.max_tokens.map(|v| v as u32),
+                enable_thinking: None,
+                template_vars_json: None,
+            },
+        )
         .await
     {
         Ok(prompt_str) => crate::config::TemplatedPrompt::new(prompt_str),
@@ -990,13 +1101,21 @@ async fn completions(
     };
 
     let gen_params = crate::config::SamplingParams::from(&state.config.sampling_defaults)
-        .merge(crate::config::SamplingParams::from_model_path(&model_path).await.unwrap_or_default())
+        .merge(
+            crate::config::SamplingParams::from_model_path(&model_path)
+                .await
+                .unwrap_or_default(),
+        )
         .merge((&request).into());
     let gen_request = gen_params.into_generation_request(templated_prompt.into_inner());
 
     info!(
         "Completions: max_tokens={:?}, temp={:?}, top_p={:?}, top_k={:?}, repeat_penalty={:?}",
-        gen_request.max_tokens, gen_request.temperature, gen_request.top_p, gen_request.top_k, gen_request.repeat_penalty
+        gen_request.max_tokens,
+        gen_request.temperature,
+        gen_request.top_p,
+        gen_request.top_k,
+        gen_request.repeat_penalty
     );
 
     // Call inference via collect-stream (per-request ZMQ client preserves caller identity for TTT delta routing)
@@ -1007,7 +1126,7 @@ async fn completions(
             return (StatusCode::INTERNAL_SERVER_ERROR, "Client creation failed").into_response();
         }
     };
-    let _claims = claims_from_auth(&user, jwt_token.as_deref(), jwt_exp);
+    let _claims = claims_from_auth(&user, &domain, jwt_token.as_deref(), jwt_exp);
     let result = collect_stream_to_result(&model_client, &request.model, &gen_request).await;
 
     // Metrics automatically decremented by MetricsGuard on drop
@@ -1023,13 +1142,24 @@ async fn completions(
                     text: collected.text,
                     index: 0,
                     logprobs: None,
-                    finish_reason: Some(if collected.stats.finish_reason == "max_tokens" { "length" } else { "stop" }.to_owned()),
+                    finish_reason: Some(
+                        if collected.stats.finish_reason == "max_tokens" {
+                            "length"
+                        } else {
+                            "stop"
+                        }
+                        .to_owned(),
+                    ),
                 }],
                 usage: Some(Usage {
                     prompt_tokens: request.prompt.len() / 4, // Rough estimate: 4 chars per token
                     completion_tokens: collected.stats.tokens_generated,
                     total_tokens: request.prompt.len() / 4 + collected.stats.tokens_generated,
-                    online_training_details: collected.stats.ttt_metrics.as_ref().map(OnlineTrainingDetails::from),
+                    online_training_details: collected
+                        .stats
+                        .ttt_metrics
+                        .as_ref()
+                        .map(OnlineTrainingDetails::from),
                 }),
             };
 
@@ -1037,19 +1167,17 @@ async fn completions(
             add_no_cache_headers(&mut response);
             response
         }
-        Err(e) => {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({
-                    "error": {
-                        "message": format!("Generation failed: {}", e),
-                        "type": "generation_error",
-                        "code": "internal_error"
-                    }
-                })),
-            )
-                .into_response()
-        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": {
+                    "message": format!("Generation failed: {}", e),
+                    "type": "generation_error",
+                    "code": "internal_error"
+                }
+            })),
+        )
+            .into_response(),
     }
 }
 
@@ -1075,19 +1203,62 @@ async fn embeddings(
 ///
 /// Returns all worktrees as model:branch references.
 /// Models are only accessible via their worktree branches.
-async fn list_models(State(state): State<ServerState>) -> impl IntoResponse {
+async fn list_models(
+    State(state): State<ServerState>,
+    auth_user: Option<Extension<AuthenticatedUser>>,
+) -> impl IntoResponse {
+    let (user, domain, _, _) = match extract_auth(auth_user.as_ref().map(|Extension(u)| u)) {
+        Ok(identity) => identity,
+        Err(_) => {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(ErrorResponse::new(
+                    "Verified hosted-account tenant binding required",
+                    "permission_denied",
+                    "missing_tenant",
+                )),
+            )
+                .into_response();
+        }
+    };
+    if !state
+        .policy_client
+        .check(&crate::services::generated::policy_client::PolicyCheck {
+            subject: user,
+            domain,
+            resource: "registry:*".to_owned(),
+            operation: Operation::Query.as_str().to_owned(),
+        })
+        .await
+        .unwrap_or(false)
+    {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(ErrorResponse::new(
+                "Permission denied: cannot query registry",
+                "permission_denied",
+                "insufficient_permissions",
+            )),
+        )
+            .into_response();
+    }
+
     let mut models = vec![];
 
     // Get all worktrees from registry (formatted as model:branch)
     let result: Result<(), anyhow::Error> = async {
         let repos = state.registry.list().await?;
         for repo in repos {
-            if repo.name.is_empty() { continue; }
+            if repo.name.is_empty() {
+                continue;
+            }
             let name = &repo.name;
             match state.registry.repo(&repo.id).list_worktrees().await {
                 Ok(worktrees) => {
                     for wt in worktrees {
-                        if wt.branch_name.is_empty() { continue; }
+                        if wt.branch_name.is_empty() {
+                            continue;
+                        }
                         let display = format!("{}:{}", name, wt.branch_name);
                         models.push(Model {
                             id: display,
@@ -1103,7 +1274,8 @@ async fn list_models(State(state): State<ServerState>) -> impl IntoResponse {
             }
         }
         Ok(())
-    }.await;
+    }
+    .await;
 
     if let Err(e) = result {
         error!("Failed to list models from storage: {}", e);
@@ -1127,15 +1299,12 @@ fn to_rpc_messages(
     msgs: &[ChatMessage],
 ) -> Vec<crate::services::generated::inference_client::ChatMessage> {
     use crate::services::generated::inference_client::ChatMessage as RpcMsg;
-    msgs.iter().map(|m| RpcMsg {
-        role: m.role.clone(),
-        content: m.content.as_deref().unwrap_or("").to_owned(),
-        tool_calls: m.tool_calls.clone().unwrap_or_default(),
-        tool_call_id: m.tool_call_id.as_deref().unwrap_or("").to_owned(),
-    }).collect()
+    msgs.iter()
+        .map(|m| RpcMsg {
+            role: m.role.clone(),
+            content: m.content.as_deref().unwrap_or("").to_owned(),
+            tool_calls: m.tool_calls.clone().unwrap_or_default(),
+            tool_call_id: m.tool_call_id.as_deref().unwrap_or("").to_owned(),
+        })
+        .collect()
 }
-
-
-
-
-

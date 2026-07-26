@@ -102,9 +102,26 @@ pub async fn issue_browser_wit(
     let now = chrono::Utc::now().timestamp();
     let expires_at = now + BROWSER_WIT_TTL;
 
-    let claims = hyprstream_rpc::auth::Claims::new(sub.clone(), now, expires_at)
+    let domain = match user.authorization_domain() {
+        Ok(domain) => domain,
+        Err(_) => {
+            return (
+                StatusCode::FORBIDDEN,
+                [(header::CACHE_CONTROL, "no-store"), (header::PRAGMA, "no-cache")],
+                Json(serde_json::json!({
+                    "error": "insufficient_scope",
+                    "error_description": "Verified hosted-account tenant binding required",
+                })),
+            )
+                .into_response();
+        }
+    };
+    let mut claims = hyprstream_rpc::auth::Claims::new(sub.clone(), now, expires_at)
         .with_issuer(state.issuer_url.clone())
         .with_cnf_jwk(&pubkey_bytes);
+    if domain != "*" {
+        claims = claims.with_tenant(domain);
+    }
 
     let wit = hyprstream_rpc::auth::jwt::encode_service_jwt(&claims, ca_key);
 
@@ -166,6 +183,7 @@ mod tests {
             State(test_state()),
             Extension(AuthenticatedUser {
                 user: "did:web:accounts.example:users:alice".to_owned(),
+                verified_tenant: Some("tenant-a.example".to_owned()),
                 token: None,
                 exp: None,
             }),
@@ -182,6 +200,7 @@ mod tests {
             State(test_state()),
             Extension(AuthenticatedUser {
                 user: "alice".to_owned(),
+                verified_tenant: Some("tenant-a.example".to_owned()),
                 token: None,
                 exp: None,
             }),
@@ -190,5 +209,16 @@ mod tests {
         .await;
 
         assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let claims = crate::auth::jwt::decode(
+            json["wit"].as_str().unwrap(),
+            &ed25519_dalek::SigningKey::from_bytes(&[0x73; 32]).verifying_key(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(claims.tenant.as_deref(), Some("tenant-a.example"));
     }
 }

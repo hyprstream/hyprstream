@@ -1,6 +1,10 @@
 //! Model management endpoints
 
-use crate::{auth::Operation, server::{self, state::ServerState, AuthenticatedUser}, storage::paths::StoragePaths};
+use crate::{
+    auth::Operation,
+    server::{self, state::ServerState, AuthenticatedUser},
+    storage::paths::StoragePaths,
+};
 use axum::{
     extract::{Json, Path, State},
     http::StatusCode,
@@ -29,8 +33,10 @@ async fn resolve_model_path(
     }
     // Derive path locally
     let storage_paths = StoragePaths::new()?;
-    Ok(storage_paths.worktree_path(model_ref.name(), &branch)?
-        .to_string_lossy().to_string())
+    Ok(storage_paths
+        .worktree_path(model_ref.name(), &branch)?
+        .to_string_lossy()
+        .to_string())
 }
 
 /// Create model management router
@@ -42,7 +48,7 @@ pub fn create_router() -> Router<ServerState> {
         .route("/:id/load", post(load_model))
         .route("/:id/unload", post(unload_model))
         .route("/cache/refresh", post(refresh_cache))
-        // REMOVED: .route("/cache/stats", get(cache_stats)) - ModelCache replaced by ZMQ
+    // REMOVED: .route("/cache/stats", get(cache_stats)) - ModelCache replaced by ZMQ
 }
 
 /// Request to download a model
@@ -73,24 +79,48 @@ struct ModelListItem {
     local_path: Option<String>,
 }
 
+#[allow(clippy::result_large_err)]
+fn policy_identity(
+    auth_user: Option<&Extension<AuthenticatedUser>>,
+) -> Result<(String, String), axum::response::Response> {
+    server::extract_policy_identity(auth_user).map_err(|_| {
+        (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": "Verified hosted-account tenant binding required"
+            })),
+        )
+            .into_response()
+    })
+}
+
 /// List all available models
 async fn list_models(
     State(state): State<ServerState>,
     auth_user: Option<Extension<AuthenticatedUser>>,
 ) -> impl IntoResponse {
-    let user = server::extract_user(auth_user.as_ref());
-    if !state.policy_client.check(&crate::services::generated::policy_client::PolicyCheck {
-        subject: user.clone(),
-        domain: user.clone(),
-        resource: "registry:*".to_owned(),
-        operation: Operation::Query.as_str().to_owned(),
-    }).await.unwrap_or(false) {
+    let (user, domain) = match policy_identity(auth_user.as_ref()) {
+        Ok(identity) => identity,
+        Err(response) => return response,
+    };
+    if !state
+        .policy_client
+        .check(&crate::services::generated::policy_client::PolicyCheck {
+            subject: user.clone(),
+            domain,
+            resource: "registry:*".to_owned(),
+            operation: Operation::Query.as_str().to_owned(),
+        })
+        .await
+        .unwrap_or(false)
+    {
         return (
             StatusCode::FORBIDDEN,
             Json(serde_json::json!({
                 "error": format!("Permission denied: user '{}' cannot query registry", user)
             })),
-        ).into_response();
+        )
+            .into_response();
     }
 
     // Inline list_models: iterate repos + worktrees
@@ -98,12 +128,16 @@ async fn list_models(
         let repos = state.registry.list().await?;
         let mut model_list = Vec::new();
         for repo in repos {
-            if repo.name.is_empty() { continue; }
+            if repo.name.is_empty() {
+                continue;
+            }
             let name = &repo.name;
             match state.registry.repo(&repo.id).list_worktrees().await {
                 Ok(worktrees) => {
                     for wt in worktrees {
-                        if wt.branch_name.is_empty() { continue; }
+                        if wt.branch_name.is_empty() {
+                            continue;
+                        }
                         let display = format!("{}:{}", name, wt.branch_name);
                         model_list.push(ModelListItem {
                             id: name.clone(),
@@ -122,7 +156,8 @@ async fn list_models(
             }
         }
         Ok(model_list)
-    }.await;
+    }
+    .await;
 
     match result {
         Ok(model_list) => Json(model_list).into_response(),
@@ -142,28 +177,36 @@ async fn get_model_info(
     auth_user: Option<Extension<AuthenticatedUser>>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    let user = server::extract_user(auth_user.as_ref());
+    let (user, domain) = match policy_identity(auth_user.as_ref()) {
+        Ok(identity) => identity,
+        Err(response) => return response,
+    };
     let resource = format!("model:{id}");
-    if !state.policy_client.check(&crate::services::generated::policy_client::PolicyCheck {
-        subject: user.clone(),
-        domain: user.clone(),
-        resource: resource.clone(),
-        operation: Operation::Query.as_str().to_owned(),
-    }).await.unwrap_or(false) {
+    if !state
+        .policy_client
+        .check(&crate::services::generated::policy_client::PolicyCheck {
+            subject: user.clone(),
+            domain,
+            resource: resource.clone(),
+            operation: Operation::Query.as_str().to_owned(),
+        })
+        .await
+        .unwrap_or(false)
+    {
         return (
             StatusCode::FORBIDDEN,
             Json(serde_json::json!({
                 "error": format!("Permission denied: user '{}' cannot query '{}'", user, resource)
             })),
-        ).into_response();
+        )
+            .into_response();
     }
 
     // Parse model reference and resolve path
     use crate::storage::model_ref::ModelRef;
     if let Ok(model_ref) = ModelRef::parse(&id) {
-        let path_result: Result<String, anyhow::Error> = async {
-            resolve_model_path(&state.registry, &model_ref).await
-        }.await;
+        let path_result: Result<String, anyhow::Error> =
+            async { resolve_model_path(&state.registry, &model_ref).await }.await;
         if let Ok(_path) = path_result {
             // Create metadata for the found model
             let metadata = crate::storage::ModelMetadata {
@@ -195,19 +238,28 @@ async fn download_model(
     auth_user: Option<Extension<AuthenticatedUser>>,
     Json(request): Json<DownloadModelRequest>,
 ) -> impl IntoResponse {
-    let user = server::extract_user(auth_user.as_ref());
-    if !state.policy_client.check(&crate::services::generated::policy_client::PolicyCheck {
-        subject: user.clone(),
-        domain: user.clone(),
-        resource: "registry:*".to_owned(),
-        operation: Operation::Write.as_str().to_owned(),
-    }).await.unwrap_or(false) {
+    let (user, domain) = match policy_identity(auth_user.as_ref()) {
+        Ok(identity) => identity,
+        Err(response) => return response,
+    };
+    if !state
+        .policy_client
+        .check(&crate::services::generated::policy_client::PolicyCheck {
+            subject: user.clone(),
+            domain,
+            resource: "registry:*".to_owned(),
+            operation: Operation::Write.as_str().to_owned(),
+        })
+        .await
+        .unwrap_or(false)
+    {
         return (
             StatusCode::FORBIDDEN,
             Json(serde_json::json!({
                 "error": format!("Permission denied: user '{}' cannot write to registry", user)
             })),
-        ).into_response();
+        )
+            .into_response();
     }
 
     // Basic validation - must be a non-empty string
@@ -256,7 +308,8 @@ async fn download_model(
             .split('/')
             .next_back()
             .unwrap_or("")
-            .trim_end_matches(".git").to_owned()
+            .trim_end_matches(".git")
+            .to_owned()
     });
 
     if model_name.is_empty() {
@@ -270,13 +323,17 @@ async fn download_model(
     }
 
     // Use registry client to clone model (no duplicate service)
-    if let Err(e) = state.registry.clone(&crate::services::generated::registry_client::CloneRequest {
-        url: request.uri.clone(),
-        name: model_name.clone(),
-        shallow: true,
-        depth: 1,
-        branch: String::new(),
-    }).await {
+    if let Err(e) = state
+        .registry
+        .clone(&crate::services::generated::registry_client::CloneRequest {
+            url: request.uri.clone(),
+            name: model_name.clone(),
+            shallow: true,
+            depth: 1,
+            branch: String::new(),
+        })
+        .await
+    {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({
@@ -316,20 +373,29 @@ async fn load_model(
     auth_user: Option<Extension<AuthenticatedUser>>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    let user = server::extract_user(auth_user.as_ref());
+    let (user, domain) = match policy_identity(auth_user.as_ref()) {
+        Ok(identity) => identity,
+        Err(response) => return response,
+    };
     let resource = format!("model:{id}");
-    if !state.policy_client.check(&crate::services::generated::policy_client::PolicyCheck {
-        subject: user.clone(),
-        domain: user.clone(),
-        resource: resource.clone(),
-        operation: Operation::Manage.as_str().to_owned(),
-    }).await.unwrap_or(false) {
+    if !state
+        .policy_client
+        .check(&crate::services::generated::policy_client::PolicyCheck {
+            subject: user.clone(),
+            domain,
+            resource: resource.clone(),
+            operation: Operation::Manage.as_str().to_owned(),
+        })
+        .await
+        .unwrap_or(false)
+    {
         return (
             StatusCode::FORBIDDEN,
             Json(serde_json::json!({
                 "error": format!("Permission denied: user '{}' cannot manage '{}'", user, resource)
             })),
-        ).into_response();
+        )
+            .into_response();
     }
 
     // Parse model reference
@@ -375,20 +441,29 @@ async fn unload_model(
     auth_user: Option<Extension<AuthenticatedUser>>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    let user = server::extract_user(auth_user.as_ref());
+    let (user, domain) = match policy_identity(auth_user.as_ref()) {
+        Ok(identity) => identity,
+        Err(response) => return response,
+    };
     let resource = format!("model:{id}");
-    if !state.policy_client.check(&crate::services::generated::policy_client::PolicyCheck {
-        subject: user.clone(),
-        domain: user.clone(),
-        resource: resource.clone(),
-        operation: Operation::Manage.as_str().to_owned(),
-    }).await.unwrap_or(false) {
+    if !state
+        .policy_client
+        .check(&crate::services::generated::policy_client::PolicyCheck {
+            subject: user.clone(),
+            domain,
+            resource: resource.clone(),
+            operation: Operation::Manage.as_str().to_owned(),
+        })
+        .await
+        .unwrap_or(false)
+    {
         return (
             StatusCode::FORBIDDEN,
             Json(serde_json::json!({
                 "error": format!("Permission denied: user '{}' cannot manage '{}'", user, resource)
             })),
-        ).into_response();
+        )
+            .into_response();
     }
 
     Json(serde_json::json!({
@@ -403,19 +478,28 @@ async fn refresh_cache(
     State(state): State<ServerState>,
     auth_user: Option<Extension<AuthenticatedUser>>,
 ) -> impl IntoResponse {
-    let user = server::extract_user(auth_user.as_ref());
-    if !state.policy_client.check(&crate::services::generated::policy_client::PolicyCheck {
-        subject: user.clone(),
-        domain: user.clone(),
-        resource: "registry:*".to_owned(),
-        operation: Operation::Manage.as_str().to_owned(),
-    }).await.unwrap_or(false) {
+    let (user, domain) = match policy_identity(auth_user.as_ref()) {
+        Ok(identity) => identity,
+        Err(response) => return response,
+    };
+    if !state
+        .policy_client
+        .check(&crate::services::generated::policy_client::PolicyCheck {
+            subject: user.clone(),
+            domain,
+            resource: "registry:*".to_owned(),
+            operation: Operation::Manage.as_str().to_owned(),
+        })
+        .await
+        .unwrap_or(false)
+    {
         return (
             StatusCode::FORBIDDEN,
             Json(serde_json::json!({
                 "error": format!("Permission denied: user '{}' cannot manage registry", user)
             })),
-        ).into_response();
+        )
+            .into_response();
     }
 
     // Cache is automatically maintained

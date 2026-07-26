@@ -946,6 +946,9 @@ pub struct OAuthState {
     pub discovery_client: DiscoveryClient,
     /// Issuer URL (e.g., "http://localhost:6791")
     pub issuer_url: String,
+    /// Deployment-owned account-zone apex. User tokens may carry only a tenant
+    /// derived from a hosted DID under this exact configured zone.
+    pub hosted_account_zone: Option<crate::account::AccountZone>,
     /// Default scopes for new clients
     pub default_scopes: Vec<String>,
     /// Access token TTL in seconds
@@ -1153,6 +1156,7 @@ impl OAuthState {
             policy_client,
             discovery_client,
             issuer_url: config.issuer_url(),
+            hosted_account_zone: None,
             default_scopes: config.default_scopes.clone(),
             token_ttl: config.token_ttl_seconds,
             refresh_token_ttl: config.refresh_token_ttl_seconds,
@@ -1384,6 +1388,12 @@ impl OAuthState {
     /// for SCIM/RPC access and legacy OAuth handler reads.
     pub fn with_user_store(mut self, store: Arc<dyn UserStore>) -> Self {
         self.user_service = Some(Arc::new(UserService::new(store)));
+        self
+    }
+
+    /// Bind token issuance to the account zone this deployment actually hosts.
+    pub fn with_hosted_account_zone(mut self, zone: crate::account::AccountZone) -> Self {
+        self.hosted_account_zone = Some(zone);
         self
     }
 

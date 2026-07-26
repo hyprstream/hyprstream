@@ -45,10 +45,13 @@ pub struct ScimEmail {
     pub email_type: Option<String>,
 }
 
-/// Hyprstream extension — Ed25519 public key.
+/// Hyprstream extension — account credentials and authority-owned DID binding.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScimHyprstreamExtension {
+    #[serde(default)]
     pub pubkey_base64: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hosted_account_did: Option<String>,
 }
 
 /// SCIM metadata (RFC 7643 §3.1).

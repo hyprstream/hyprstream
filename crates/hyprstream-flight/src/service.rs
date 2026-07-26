@@ -1,32 +1,80 @@
 // tonic::Status is the idiomatic gRPC error type - boxing would break API
 #![allow(clippy::result_large_err)]
 
-use hyprstream_metrics::storage::{
-    view::ViewDefinition,
-    StorageBackend, StorageBackendType,
-};
-use hyprstream_metrics::query::QueryOrchestrator;
 use arrow_flight::{
+    encode::FlightDataEncoderBuilder,
+    error::FlightError,
     flight_service_server::{FlightService, FlightServiceServer},
     sql::{
-        server::FlightSqlService,
-        CommandStatementQuery, TicketStatementQuery,
+        server::FlightSqlService, ActionClosePreparedStatementRequest,
         ActionCreatePreparedStatementRequest, ActionCreatePreparedStatementResult,
-        ActionClosePreparedStatementRequest, CommandPreparedStatementQuery,
-        SqlInfo, ProstMessageExt,
+        CommandPreparedStatementQuery, CommandStatementQuery, ProstMessageExt, SqlInfo,
+        TicketStatementQuery,
     },
-    Action, FlightDescriptor, FlightInfo, Ticket, HandshakeRequest, HandshakeResponse, FlightEndpoint,
-    encode::FlightDataEncoderBuilder, error::FlightError,
+    Action, FlightDescriptor, FlightEndpoint, FlightInfo, HandshakeRequest, HandshakeResponse,
+    Ticket,
 };
-use futures::{Stream, StreamExt, TryStreamExt};
-use prost::Message;
-use std::pin::Pin;
 use arrow_schema::Schema;
+use futures::{Stream, StreamExt, TryStreamExt};
+use hyprstream_metrics::query::QueryOrchestrator;
+use hyprstream_metrics::storage::{view::ViewDefinition, StorageBackend, StorageBackendType};
+use parking_lot::Mutex;
+use prost::Message;
 use serde::Deserialize;
 use serde_json;
+use std::pin::Pin;
 use std::sync::{atomic::AtomicU64, Arc};
-use parking_lot::Mutex;
 use tonic::{Request, Response, Status, Streaming};
+
+/// Transport-neutral failure from the embedding server's Flight PEP.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FlightAuthError {
+    Unauthenticated(String),
+    Forbidden(String),
+    Internal(String),
+}
+
+impl FlightAuthError {
+    fn into_status(self) -> Status {
+        match self {
+            Self::Unauthenticated(message) => Status::unauthenticated(message),
+            Self::Forbidden(message) => Status::permission_denied(message),
+            Self::Internal(message) => Status::internal(message),
+        }
+    }
+}
+
+/// Authentication and tenant-policy boundary for the Flight data plane.
+///
+/// The implementation lives in the embedding binary so this leaf crate does
+/// not depend on Hyprstream's JWT or PolicyClient types.
+#[tonic::async_trait]
+pub trait FlightAuthorizer: Send + Sync {
+    async fn authorize(
+        &self,
+        authorization: Option<&str>,
+        resource: &str,
+        operation: &str,
+    ) -> Result<(), FlightAuthError>;
+}
+
+/// Fail-closed default used by standalone constructors.
+#[derive(Debug, Default)]
+pub struct DenyAllFlightAuthorizer;
+
+#[tonic::async_trait]
+impl FlightAuthorizer for DenyAllFlightAuthorizer {
+    async fn authorize(
+        &self,
+        _authorization: Option<&str>,
+        _resource: &str,
+        _operation: &str,
+    ) -> Result<(), FlightAuthError> {
+        Err(FlightAuthError::Unauthenticated(
+            "Flight authorization is not configured".to_owned(),
+        ))
+    }
+}
 
 #[derive(Debug, Deserialize)]
 struct CreateTableCmd {
@@ -83,8 +131,14 @@ impl Command {
 /// Command types for table and view operations
 #[derive(Debug)]
 enum TableCommand {
-    CreateTable { name: String, schema: Arc<Schema> },
-    CreateView { name: String, definition: ViewDefinition },
+    CreateTable {
+        name: String,
+        schema: Arc<Schema>,
+    },
+    CreateView {
+        name: String,
+        definition: ViewDefinition,
+    },
     DropTable(String),
     DropView(String),
 }
@@ -121,7 +175,8 @@ impl TableCommand {
                     })?;
                 let name = value["data"]["name"]
                     .as_str()
-                    .ok_or_else(|| Status::invalid_argument("Missing view name"))?.to_owned();
+                    .ok_or_else(|| Status::invalid_argument("Missing view name"))?
+                    .to_owned();
                 Ok(TableCommand::CreateView { name, definition })
             }
             Some("drop_table") => {
@@ -149,6 +204,33 @@ pub struct FlightSqlServer {
     #[allow(dead_code)]
     statement_counter: Arc<AtomicU64>,
     prepared_statements: Arc<Mutex<Vec<(u64, String)>>>,
+    authorizer: Arc<dyn FlightAuthorizer>,
+    resource: String,
+}
+
+impl std::fmt::Debug for FlightSqlServer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FlightSqlServer")
+            .field("resource", &self.resource)
+            .finish_non_exhaustive()
+    }
+}
+
+impl FlightSqlServer {
+    fn authorization<T>(request: &Request<T>) -> Option<String> {
+        request
+            .metadata()
+            .get("authorization")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned)
+    }
+
+    async fn authorize(&self, authorization: Option<&str>, operation: &str) -> Result<(), Status> {
+        self.authorizer
+            .authorize(authorization, &self.resource, operation)
+            .await
+            .map_err(FlightAuthError::into_status)
+    }
 }
 
 #[tonic::async_trait]
@@ -160,7 +242,12 @@ impl FlightSqlService for FlightSqlServer {
     async fn do_handshake(
         &self,
         request: Request<Streaming<HandshakeRequest>>,
-    ) -> Result<Response<Pin<Box<dyn Stream<Item = Result<HandshakeResponse, Status>> + Send>>>, Status> {
+    ) -> Result<
+        Response<Pin<Box<dyn Stream<Item = Result<HandshakeResponse, Status>> + Send>>>,
+        Status,
+    > {
+        let authorization = Self::authorization(&request);
+        self.authorize(authorization.as_deref(), "query").await?;
         let mut stream = request.into_inner();
         let response_stream = async_stream::try_stream! {
             while let Some(request) = stream.next().await {
@@ -179,8 +266,13 @@ impl FlightSqlService for FlightSqlServer {
         query: CommandStatementQuery,
         request: Request<FlightDescriptor>,
     ) -> Result<Response<FlightInfo>, Status> {
+        let authorization = Self::authorization(&request);
+        self.authorize(authorization.as_deref(), "query").await?;
         // Use QueryOrchestrator to prepare and get schema
-        let cached_stmt = self.orchestrator.prepare(&query.query).await
+        let cached_stmt = self
+            .orchestrator
+            .prepare(&query.query)
+            .await
             .map_err(|e| Status::internal(format!("Query preparation failed: {e}")))?;
 
         let schema = cached_stmt.schema.clone();
@@ -204,10 +296,9 @@ impl FlightSqlService for FlightSqlServer {
             .try_with_schema(schema.as_ref())
             .map_err(|e| Status::internal(format!("Unable to serialize schema: {e}")))?
             .with_descriptor(flight_descriptor)
-            .with_endpoint(FlightEndpoint::new()
-                .with_ticket(Ticket {
-                    ticket: ticket.as_any().encode_to_vec().into(),
-                }))
+            .with_endpoint(FlightEndpoint::new().with_ticket(Ticket {
+                ticket: ticket.as_any().encode_to_vec().into(),
+            }))
             .with_total_records(-1)
             .with_total_bytes(-1)
             .with_ordered(false);
@@ -218,30 +309,39 @@ impl FlightSqlService for FlightSqlServer {
     async fn do_get_statement(
         &self,
         ticket: TicketStatementQuery,
-        _request: Request<Ticket>,
+        request: Request<Ticket>,
     ) -> Result<Response<<Self as FlightService>::DoGetStream>, Status> {
+        let authorization = Self::authorization(&request);
+        self.authorize(authorization.as_deref(), "query").await?;
         // Get statement handle from ticket
         let handle = u64::from_le_bytes(
-            ticket.statement_handle.to_vec()
+            ticket
+                .statement_handle
+                .to_vec()
                 .try_into()
-                .map_err(|_| Status::invalid_argument("Invalid statement handle"))?
+                .map_err(|_| Status::invalid_argument("Invalid statement handle"))?,
         );
 
         // Get cached statement from orchestrator
-        let cached_stmt = self.orchestrator.get_statement(handle).await
+        let cached_stmt = self
+            .orchestrator
+            .get_statement(handle)
+            .await
             .ok_or_else(|| Status::invalid_argument("Statement handle not found"))?;
 
         let schema = cached_stmt.schema.clone();
 
         // Execute using the orchestrator's cached physical plan
-        let result_stream = self.orchestrator.execute(&cached_stmt).await
+        let result_stream = self
+            .orchestrator
+            .execute(&cached_stmt)
+            .await
             .map_err(|e| Status::internal(format!("Query execution failed: {e}")))?;
 
         // Convert DataFusion stream to Flight stream
-        let stream = result_stream
-            .map_err(|e| FlightError::ExternalError(Box::new(std::io::Error::other(
-                e.to_string(),
-            ))));
+        let stream = result_stream.map_err(|e| {
+            FlightError::ExternalError(Box::new(std::io::Error::other(e.to_string())))
+        });
 
         let stream = FlightDataEncoderBuilder::new()
             .with_schema(schema)
@@ -256,7 +356,9 @@ impl FlightSqlService for FlightSqlServer {
         _cmd: CommandPreparedStatementQuery,
         _request: Request<FlightDescriptor>,
     ) -> Result<Response<FlightInfo>, Status> {
-        Err(Status::unimplemented("get_flight_info_prepared_statement not implemented"))
+        Err(Status::unimplemented(
+            "get_flight_info_prepared_statement not implemented",
+        ))
     }
 
     async fn do_get_prepared_statement(
@@ -264,7 +366,9 @@ impl FlightSqlService for FlightSqlServer {
         _query: CommandPreparedStatementQuery,
         _request: Request<Ticket>,
     ) -> Result<Response<<Self as FlightService>::DoGetStream>, Status> {
-        Err(Status::unimplemented("do_get_prepared_statement not implemented"))
+        Err(Status::unimplemented(
+            "do_get_prepared_statement not implemented",
+        ))
     }
 
     async fn do_action_create_prepared_statement(
@@ -272,7 +376,9 @@ impl FlightSqlService for FlightSqlServer {
         _query: ActionCreatePreparedStatementRequest,
         _request: Request<Action>,
     ) -> Result<ActionCreatePreparedStatementResult, Status> {
-        Err(Status::unimplemented("do_action_create_prepared_statement not implemented"))
+        Err(Status::unimplemented(
+            "do_action_create_prepared_statement not implemented",
+        ))
     }
 
     async fn do_action_close_prepared_statement(
@@ -280,7 +386,9 @@ impl FlightSqlService for FlightSqlServer {
         _query: ActionClosePreparedStatementRequest,
         _request: Request<Action>,
     ) -> Result<(), Status> {
-        Err(Status::unimplemented("do_action_close_prepared_statement not implemented"))
+        Err(Status::unimplemented(
+            "do_action_close_prepared_statement not implemented",
+        ))
     }
 }
 
@@ -298,7 +406,20 @@ impl FlightSqlServer {
             orchestrator: Arc::new(orchestrator),
             statement_counter: Arc::new(AtomicU64::new(0)),
             prepared_statements: Arc::new(Mutex::new(Vec::new())),
+            authorizer: Arc::new(DenyAllFlightAuthorizer),
+            resource: "flight:*".to_owned(),
         })
+    }
+
+    /// Install the embedding server's JWT + tenant-policy authorizer.
+    pub fn with_authorizer(
+        mut self,
+        authorizer: Arc<dyn FlightAuthorizer>,
+        resource: impl Into<String>,
+    ) -> Self {
+        self.authorizer = authorizer;
+        self.resource = resource.into();
+        self
     }
 
     pub fn into_service(self) -> FlightServiceServer<Self> {
@@ -340,13 +461,18 @@ impl FlightSqlServer {
             }
             Command::Sql(SqlCommand::Execute(sql)) => {
                 // Execute statement via orchestrator
-                self.orchestrator.query_collect(&sql).await
+                self.orchestrator
+                    .query_collect(&sql)
+                    .await
                     .map_err(|e| Status::internal(format!("Query execution failed: {e}")))?;
                 Ok(vec![])
             }
             Command::Sql(SqlCommand::Query(sql)) => {
                 // Prepare statement via orchestrator
-                let cached_stmt = self.orchestrator.prepare(&sql).await
+                let cached_stmt = self
+                    .orchestrator
+                    .prepare(&sql)
+                    .await
                     .map_err(|e| Status::internal(format!("Query preparation failed: {e}")))?;
 
                 let handle = cached_stmt.handle;
@@ -366,5 +492,23 @@ impl FlightSqlServer {
     /// Get reference to the query orchestrator
     pub fn orchestrator(&self) -> &Arc<QueryOrchestrator> {
         &self.orchestrator
+    }
+}
+
+#[cfg(test)]
+mod authorization_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn standalone_flight_authorizer_fails_closed() {
+        let authorizer = DenyAllFlightAuthorizer;
+        assert_eq!(
+            authorizer
+                .authorize(Some("Bearer attacker"), "flight:*", "query")
+                .await,
+            Err(FlightAuthError::Unauthenticated(
+                "Flight authorization is not configured".to_owned()
+            ))
+        );
     }
 }

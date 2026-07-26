@@ -45,17 +45,17 @@
 use crate::config::{TlsConfig, XetConfig};
 use crate::server::state::ResourceAuthState;
 use crate::server::tls::{resolve_rustls_config, serve_app};
-use crate::server::{AuthenticatedUser, middleware as server_middleware};
+use crate::server::{middleware as server_middleware, AuthenticatedUser};
 use crate::services::RegistryClient;
 use crate::storage::cas::{CasMount, CasMountAuthorizer, CasSubstrate, DedupDomain};
 use anyhow::Result;
 use axum::{
-    Json, Router,
     extract::{Path, State},
-    http::{HeaderMap, StatusCode, header},
+    http::{header, HeaderMap, StatusCode},
     middleware,
     response::{IntoResponse, Response},
     routing::{get, post},
+    Json, Router,
 };
 use hyprstream_rpc::prelude::*;
 use hyprstream_rpc::registry::SocketKind;
@@ -185,12 +185,17 @@ async fn get_xorb_handler(
     headers: HeaderMap,
     axum::extract::Extension(user): axum::extract::Extension<AuthenticatedUser>,
 ) -> Response {
+    let domain = match user.authorization_domain() {
+        Ok(domain) if domain != "*" => domain,
+        _ => return (StatusCode::FORBIDDEN, "tenant binding required").into_response(),
+    };
     let subject = Subject::new(user.user);
     let mount = CasMount::with_shared_authorizer(
         state.store.clone(),
         DedupDomain::local_default(),
         Arc::clone(&state.cas_authorizer),
-    );
+    )
+    .with_verified_tenant(domain);
     let mut fid = match mount.walk(&["xorb", hash.as_str()], &subject).await {
         Ok(fid) => fid,
         Err(e) => return mount_error_response(e, "get_xorb: mount walk failed"),
@@ -480,6 +485,7 @@ mod tests {
             let now = chrono::Utc::now().timestamp();
             let mut claims = crate::auth::jwt::Claims::new("alice".to_owned(), now, now + 3600)
                 .with_issuer(ISSUER.to_owned())
+                .with_tenant("tenant-a.example".to_owned())
                 .with_audience(Some(audience.to_owned()));
             claims.jti = Some(jti.to_owned());
             crate::auth::jwt::encode_composite_ml_dsa_65_ed25519(
@@ -575,6 +581,7 @@ mod tests {
             HeaderMap::new(),
             axum::extract::Extension(AuthenticatedUser {
                 user: "alice".to_owned(),
+                verified_tenant: Some("tenant-a.example".to_owned()),
                 token: None,
                 exp: None,
             }),
@@ -602,6 +609,7 @@ mod tests {
             headers,
             axum::extract::Extension(AuthenticatedUser {
                 user: "alice".to_owned(),
+                verified_tenant: Some("tenant-a.example".to_owned()),
                 token: None,
                 exp: None,
             }),

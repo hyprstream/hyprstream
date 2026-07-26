@@ -19,9 +19,9 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 use super::state::OAuthState;
-use hyprstream_pds::repo_authority::is_path_form_did_web;
 use crate::mac::exchange::{GrantDecision, GrantError, GrantRequest, GrantedAccess};
 use crate::services::generated::policy_client::IssueToken;
+use hyprstream_pds::repo_authority::is_path_form_did_web;
 
 const TOKEN_TYPE_ID_TOKEN: &str = "urn:ietf:params:oauth:token-type:id_token";
 const TOKEN_TYPE_ACCESS_TOKEN: &str = "urn:ietf:params:oauth:token-type:access_token";
@@ -94,11 +94,7 @@ pub async fn exchange_token_exchange(
     let requested_scopes = match attenuate_exchange_scopes(&verified, scope) {
         Ok(scopes) => scopes,
         Err(description) => {
-            return tx_error(
-                StatusCode::BAD_REQUEST,
-                "invalid_scope",
-                description,
-            );
+            return tx_error(StatusCode::BAD_REQUEST, "invalid_scope", description);
         }
     };
 
@@ -117,6 +113,19 @@ pub async fn exchange_token_exchange(
             StatusCode::BAD_REQUEST,
             "invalid_grant",
             "path-form did:web account subjects are frozen; host-form account minting is not available yet (#1159)",
+        );
+    }
+    let subject_identity = crate::server::middleware::AuthenticatedUser {
+        user: verified.sub.clone(),
+        verified_tenant: tenant.clone(),
+        token: None,
+        exp: None,
+    };
+    if subject_identity.authorization_domain().is_err() {
+        return tx_error(
+            StatusCode::UNAUTHORIZED,
+            "invalid_grant",
+            "subject token has no valid verified hosted-account tenant binding",
         );
     }
 
@@ -220,7 +229,10 @@ async fn verify_id_token(state: &Arc<OAuthState>, token: &str) -> Result<Verifie
     }
 
     Ok(VerifiedSubject {
-        sub: claims.sub,
+        sub: hyprstream_rpc::Subject::federated(&iss, &claims.sub)
+            .name()
+            .ok_or_else(|| "id_token subject is empty".to_owned())?
+            .to_owned(),
         cnf_key_bytes: None, // ID tokens carry no key binding
         iat: claims.iat,
         granted_scopes: None,
@@ -289,8 +301,9 @@ async fn verify_jwt(state: &Arc<OAuthState>, token: &str) -> Result<VerifiedSubj
 
     let (claims, service_signing_key) = if sub.starts_with("service:") {
         let svc_name = sub.trim_start_matches("service:");
-        let (claims, vk) = super::jwt_bearer::decode_with_any_local_service_key(token, svc_name, &token_endpoint)
-            .ok_or_else(|| format!("JWT verification failed for service: {svc_name}"))?;
+        let (claims, vk) =
+            super::jwt_bearer::decode_with_any_local_service_key(token, svc_name, &token_endpoint)
+                .ok_or_else(|| format!("JWT verification failed for service: {svc_name}"))?;
         (claims, Some(vk.to_bytes()))
     } else {
         let cfg = state
@@ -306,13 +319,24 @@ async fn verify_jwt(state: &Arc<OAuthState>, token: &str) -> Result<VerifiedSubj
         (claims, None)
     };
 
+    let mut claims = claims;
+    let atproto_issuer = state.atproto_issuer_url();
+    let local_issuers = [atproto_issuer.as_str(), state.issuer_url.as_str()];
+    claims.strip_federated_tenant(&local_issuers);
+    let subject = claims.subject(&local_issuers);
+    subject
+        .validate()
+        .map_err(|error| format!("invalid JWT subject: {error}"))?;
     let cnf_key_bytes = service_signing_key.or_else(|| claims.cnf_key_bytes());
     Ok(VerifiedSubject {
-        sub: claims.sub,
+        sub: subject
+            .name()
+            .ok_or_else(|| "JWT subject is empty".to_owned())?
+            .to_owned(),
         cnf_key_bytes,
         iat: claims.iat,
         granted_scopes: None,
-        verified_tenant: None,
+        verified_tenant: claims.tenant,
         atproto_replay: None,
         require_clearance: false,
         ttl_ceiling: None,
@@ -1038,7 +1062,15 @@ pub async fn exchange_ucan_grant(
     // met context from resolve_grant_subject — its clearance is the
     // authority-assigned label the enrollment table holds for this subject.
     let subject_clearance = subject_ctx.map(|c| *c.clearance());
-    mint_grant_token(state, &granted, &dpop_jkt, Some(grant_refresh), principals, subject_clearance).await
+    mint_grant_token(
+        state,
+        &granted,
+        &dpop_jkt,
+        Some(grant_refresh),
+        principals,
+        subject_clearance,
+    )
+    .await
 }
 
 /// Re-evaluate a UCAN grant on refresh and re-mint (MAC #547 / B1 #673).
@@ -1177,7 +1209,15 @@ pub(crate) async fn exchange_ucan_grant_refresh(
     // #698: same clearance threading as mint — refresh must not be more
     // permissive (B1/#673).
     let subject_clearance = subject_ctx.map(|c| *c.clearance());
-    mint_grant_token(state, &granted, &dpop_jkt, Some(ucan_grant.clone()), principals, subject_clearance).await
+    mint_grant_token(
+        state,
+        &granted,
+        &dpop_jkt,
+        Some(ucan_grant.clone()),
+        principals,
+        subject_clearance,
+    )
+    .await
 }
 
 /// Map an S6 [`GrantError`] to a concrete OAuth 2.1 error response. Every variant
@@ -1205,9 +1245,11 @@ fn grant_error_response(e: GrantError) -> Response {
         // B2 (#674): a would-be Permit that could not be durably audited.
         // Fail-closed, not the client's fault — surfaced as server_error
         // (matches the "audit trail not configured" preflight response).
-        GrantError::AuditUnavailable => {
-            (StatusCode::INTERNAL_SERVER_ERROR, "server_error", e.to_string())
-        }
+        GrantError::AuditUnavailable => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "server_error",
+            e.to_string(),
+        ),
     };
     tx_error(status, code, &desc)
 }
@@ -1343,16 +1385,18 @@ async fn mint_grant_token(
         Ok(snapshot) => snapshot,
         Err(error) => {
             tracing::error!("composite authority unavailable or stale; refusing to mint: {error}");
-            return tx_error(StatusCode::INTERNAL_SERVER_ERROR, "server_error", "hybrid token authority is not current");
+            return tx_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "server_error",
+                "hybrid token authority is not current",
+            );
         }
     };
     let signing = snapshot
         .active_signing_pair(hyprstream_rpc::auth::CompositePairRole::OAuth)
         .and_then(hyprstream_rpc::auth::CompositeKeyPair::signing_keys);
     let token = match signing {
-        Some((pq, ed)) => crate::auth::jwt::encode_composite_ml_dsa_65_ed25519(
-            &claims, &pq, &ed,
-        ),
+        Some((pq, ed)) => crate::auth::jwt::encode_composite_ml_dsa_65_ed25519(&claims, &pq, &ed),
         None => {
             tracing::error!(
                 "no authorized active OAuth composite pair; refusing to mint (fail-closed)"
@@ -1540,13 +1584,16 @@ mod tests {
 
         let key = ed25519_dalek::SigningKey::from_bytes(&[0x65; 32]);
         let dummy = std::path::PathBuf::from("/dev/null/path-form-mint-test.sock");
-        let mk_client = || Arc::new(
-            RpcClientImpl::new(
-                LocalSigner::new(key.clone()),
-                LazyUdsTransport::new(dummy.clone()),
-                Some(key.verifying_key()),
-            ).with_response_verify_policy(hyprstream_rpc::crypto::CryptoPolicy::Classical),
-        );
+        let mk_client = || {
+            Arc::new(
+                RpcClientImpl::new(
+                    LocalSigner::new(key.clone()),
+                    LazyUdsTransport::new(dummy.clone()),
+                    Some(key.verifying_key()),
+                )
+                .with_response_verify_policy(hyprstream_rpc::crypto::CryptoPolicy::Classical),
+            )
+        };
         Arc::new(OAuthState::new(
             &OAuthConfig::default(),
             PolicyClient::new(mk_client()),
@@ -1574,13 +1621,19 @@ mod tests {
             },
             // No clearance — this test checks the path-form freeze, not MAC.
             None,
-        ).await;
+        )
+        .await;
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        let body = axum::body::to_bytes(response.into_body(), 4096).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
         let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(value["error"].as_str(), Some("invalid_grant"));
-        assert!(value["error_description"].as_str().unwrap().contains("frozen"));
+        assert!(value["error_description"]
+            .as_str()
+            .unwrap()
+            .contains("frozen"));
         assert!(value.get("access_token").is_none());
         assert!(value.get("refresh_token").is_none());
     }
@@ -1689,18 +1742,13 @@ mod tests {
     // infrastructure (which is orthogonal — the Claims construction is what
     // carries the clearance, and it happens before signing).
 
-    use crate::mac::{
-        CompiledPolicy, EnrollmentSubjectContextResolver, TeMatrix,
-    };
+    use crate::mac::{CompiledPolicy, EnrollmentSubjectContextResolver, TeMatrix};
     use hyprstream_rpc::auth::mac::{Lattice as LatticeType, LatticeVersion};
     use std::collections::BTreeMap;
     use std::sync::Arc;
 
     /// Build a compiled policy with one enrolled DID at the given clearance.
-    fn policy_with_enrollment(
-        did: &str,
-        clearance: SecurityLabel,
-    ) -> Arc<CompiledPolicy> {
+    fn policy_with_enrollment(did: &str, clearance: SecurityLabel) -> Arc<CompiledPolicy> {
         let lattice = LatticeType::new(LatticeVersion(1), []);
         let policy = CompiledPolicy::new(TeMatrix::default(), &lattice)
             .with_enrollment(BTreeMap::from([(did.to_owned(), clearance)]));
@@ -1716,8 +1764,7 @@ mod tests {
     #[test]
     fn issuer_path_stamps_clearance_readable_by_pep_resolver() {
         let did = "did:key:z6MkpTHR8VNsBxYAAHWutMGeQ4hz2FV6B14xd9CZpkmS5i5o";
-        let enrolled =
-            SecurityLabel::new(Level::Secret, Assurance::PqHybrid, comps(&[0, 1]));
+        let enrolled = SecurityLabel::new(Level::Secret, Assurance::PqHybrid, comps(&[0, 1]));
 
         // Step 1: enrollment resolver derives the clearance (what the grant
         // path does via `exchange_enrollment_resolver()`).
@@ -1801,8 +1848,10 @@ mod tests {
             SecurityLabel::new(Level::Confidential, Assurance::Classical, comps(&[1]));
 
         // Both enrolled in their own resolver (simulating two enrollment entries).
-        let user_ctx = SecurityContext::from_clearance(user_clearance, VerifiedKeyMaterial::Classical);
-        let mcp_ctx = SecurityContext::from_clearance(mcp_clearance, VerifiedKeyMaterial::Classical);
+        let user_ctx =
+            SecurityContext::from_clearance(user_clearance, VerifiedKeyMaterial::Classical);
+        let mcp_ctx =
+            SecurityContext::from_clearance(mcp_clearance, VerifiedKeyMaterial::Classical);
         let met = SecurityContext::delegated(Some(&user_ctx), Some(&mcp_ctx))
             .expect("both principals resolved");
 
@@ -1820,7 +1869,11 @@ mod tests {
             .expect("met clearance resolves");
 
         // It's the meet (Confidential / {1}), NOT the delegator's Secret / {0,1}.
-        assert_eq!(pep_ctx.level(), Level::Confidential, "met level, not delegator's");
+        assert_eq!(
+            pep_ctx.level(),
+            Level::Confidential,
+            "met level, not delegator's"
+        );
         assert_eq!(
             pep_ctx.compartments(),
             comps(&[1]),
@@ -1875,7 +1928,10 @@ mod tests {
         let back: super::super::state::RefreshTokenEntry = serde_json::from_str(&json).unwrap();
         let ug = back.ucan_grant.expect("ucan_grant survives round-trip");
         assert_eq!(ug.grant_cbor_b64, "Zm9vYmFy");
-        assert_eq!(ug.grant_cid, blake3::hash(b"the-grant").to_hex().to_string());
+        assert_eq!(
+            ug.grant_cid,
+            blake3::hash(b"the-grant").to_hex().to_string()
+        );
         assert_eq!(ug.requested_scope.as_deref(), Some("read:model:llama"));
     }
 
@@ -1979,13 +2035,21 @@ mod tests {
         // meet = min level (Confidential) ∩ compartments ({1}).
         let context = context.expect("both principals resolved ⇒ Some");
         assert_eq!(context.level(), Level::Confidential, "min level");
-        assert_eq!(context.compartments(), comps(&[1]), "compartment intersection");
+        assert_eq!(
+            context.compartments(),
+            comps(&[1]),
+            "compartment intersection"
+        );
         // The audit `on_behalf_of` carries the DELEGATOR (the user's own
         // clearance), distinct from the met `subject` context above — this is
         // the two-principal attribution (#445/#681): the met context is what the
         // gates saw, the delegator is who the actor acted for.
         let obo = on_behalf_of.expect("a delegated grant records its delegator");
-        assert_eq!(obo.level(), Level::Secret, "on_behalf_of is the delegator's own level");
+        assert_eq!(
+            obo.level(),
+            Level::Secret,
+            "on_behalf_of is the delegator's own level"
+        );
         assert_eq!(
             obo.compartments(),
             comps(&[0, 1]),
@@ -2021,7 +2085,10 @@ mod tests {
         assert!(principals.act.is_some());
         // The delegator resolved, so it is still available for audit even though
         // the decision itself fails closed on the unresolved actor.
-        assert!(on_behalf_of.is_some(), "the resolved delegator is still recorded");
+        assert!(
+            on_behalf_of.is_some(),
+            "the resolved delegator is still recorded"
+        );
     }
 
     /// Multi-hop delegation roots the delegator at the CHAIN ROOT issuer, not
@@ -2037,7 +2104,9 @@ mod tests {
         // No clearances resolved — we only assert the principal identities.
         let resolver = MapResolver(HashMap::new());
         let ResolvedGrantSubject {
-            on_behalf_of, principals, ..
+            on_behalf_of,
+            principals,
+            ..
         } = resolve_grant_subject(&leaf, &resolver);
         assert!(
             on_behalf_of.is_none(),
