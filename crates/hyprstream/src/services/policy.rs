@@ -2215,6 +2215,7 @@ mod tests {
     async fn service_mediated_check_uses_verified_user_not_broad_deputy() {
         use hyprstream_service::{InprocManager, ServiceManager};
 
+        crate::mac::install_explicit_test_dispatch_pep();
         let _ = hyprstream_rpc::envelope::install_verify_config(
             hyprstream_rpc::envelope::EnvelopeVerifyConfig {
                 policy: hyprstream_rpc::crypto::CryptoPolicy::Classical,
