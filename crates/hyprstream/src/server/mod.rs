@@ -5,13 +5,16 @@
 //! - Model management at /models
 
 use anyhow::Result;
-use axum::{middleware as axum_middleware, response::IntoResponse, routing::get, Json, Router};
+use axum::http::StatusCode;
+use axum::{
+    extract::State, middleware as axum_middleware, response::IntoResponse, routing::get, Json,
+    Router,
+};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio::sync::Notify;
-use axum::http::StatusCode;
 use tower_http::{timeout::TimeoutLayer, trace::TraceLayer};
 use tracing::info;
 
@@ -20,9 +23,9 @@ pub mod routes;
 pub mod state;
 pub mod tls;
 
+use axum::Extension;
 pub use middleware::AuthenticatedUser;
 use state::ServerState;
-use axum::Extension;
 
 /// Extract user identity from optional authenticated user extension.
 /// Returns "anonymous" if no authentication present.
@@ -61,10 +64,16 @@ pub fn create_app(state: ServerState) -> Router {
     // `PublicExemption` entry plus a handler arm below (two review surfaces).
     // Every route NOT here stays on the protected (auth-mediated) router; the
     // default is mediated, never permissive. See `mac::public_exemptions`.
-    let (public_routes, browser_provisioning_routes) =
-        build_public_routes_from_registry(Arc::clone(&state.browser_provisioning_rate_limiter));
+    let (public_routes, browser_provisioning_routes) = build_public_routes_from_registry(
+        Arc::clone(&state.public_route_rate_limiter),
+        Arc::clone(&state.browser_provisioning_rate_limiter),
+    );
 
-    // Protected routes (auth required)
+    // Protected routes (auth required). CORS only controls which browser
+    // origins may read responses; it never supplies identity or authority.
+    // The verified token drives tenant resolution (the DID's hosted-account
+    // binding) and the enforcing MAC path; `Origin` is not an authorization
+    // or tenant input.
     let protected_routes = Router::new()
         // OpenAI-compatible API routes at /oai/v1
         .nest("/oai/v1", routes::openai::create_router())
@@ -84,7 +93,10 @@ pub fn create_app(state: ServerState) -> Router {
         .merge(browser_provisioning_routes)
         .merge(protected_routes)
         // Add middleware (order matters: timeout should be before state)
-        .layer(TimeoutLayer::with_status_code(StatusCode::REQUEST_TIMEOUT, timeout_duration))
+        .layer(TimeoutLayer::with_status_code(
+            StatusCode::REQUEST_TIMEOUT,
+            timeout_duration,
+        ))
         .layer(TraceLayer::new_for_http())
         .with_state(state);
 
@@ -104,11 +116,13 @@ pub fn create_app(state: ServerState) -> Router {
 /// registry, so an unmediated route cannot appear without a reviewed
 /// `PublicExemption` entry plus a handler arm in the exhaustive match below.
 fn build_public_routes_from_registry(
+    public_route_rate_limiter: Arc<crate::server::middleware::RateLimiter>,
     browser_provisioning_rate_limiter: Arc<crate::server::middleware::RateLimiter>,
 ) -> (Router<ServerState>, Router<ServerState>) {
     use crate::mac::public_exemptions::{for_face, HttpFace, PublicRouteHandler, RouteMethod};
 
     let mut public_routes: Router<ServerState> = Router::new();
+    let mut rate_limited_public_routes: Router<ServerState> = Router::new();
     let mut browser_provisioning_routes: Router<ServerState> = Router::new();
 
     for exemption in for_face(HttpFace::MainApp) {
@@ -130,19 +144,20 @@ fn build_public_routes_from_registry(
                 public_routes = public_routes.route(exemption.path, get(health_check));
             }
             PublicRouteHandler::OauthProtectedResourceMetadata => {
-                public_routes = public_routes
+                rate_limited_public_routes = rate_limited_public_routes
                     .route(exemption.path, get(oauth_protected_resource_metadata));
             }
             PublicRouteHandler::Export9pMetadata => {
-                public_routes =
-                    public_routes.route(exemption.path, get(routes::ninep::export9p_metadata));
+                rate_limited_public_routes = rate_limited_public_routes
+                    .route(exemption.path, get(routes::ninep::export9p_metadata));
             }
             PublicRouteHandler::WirePlanesMetadata => {
-                public_routes =
-                    public_routes.route(exemption.path, get(routes::ninep::wire_planes_metadata));
+                rate_limited_public_routes = rate_limited_public_routes
+                    .route(exemption.path, get(routes::ninep::wire_planes_metadata));
             }
             PublicRouteHandler::NinepWebSocket => {
-                public_routes = public_routes.route(exemption.path, get(routes::ninep::ninep_ws));
+                rate_limited_public_routes =
+                    rate_limited_public_routes.route(exemption.path, get(routes::ninep::ninep_ws));
             }
             PublicRouteHandler::BrowserProvisioning => {
                 // Public browser provisioning is independently rate-limited
@@ -170,6 +185,16 @@ fn build_public_routes_from_registry(
         }
     }
 
+    // Public metadata and the 9P pre-upgrade path have no authenticated
+    // subject. Meter them through one non-client-selectable bucket while
+    // keeping liveness probes out of the failure domain.
+    public_routes = public_routes.merge(rate_limited_public_routes.layer(
+        axum_middleware::from_fn_with_state(
+            public_route_rate_limiter,
+            middleware::public_route_rate_limit_middleware,
+        ),
+    ));
+
     (public_routes, browser_provisioning_routes)
 }
 
@@ -185,14 +210,10 @@ async fn health_check() -> impl IntoResponse {
 /// Protected Resource Metadata (RFC 9728) for the OAI server.
 ///
 /// Advertises the OAuth authorization server that protects this resource.
-async fn oauth_protected_resource_metadata() -> impl IntoResponse {
-    let config = crate::config::HyprConfig::load().unwrap_or_default();
-    let oai_url = config.oai.resource_url();
-    let oauth_issuer = config.oauth.issuer_url();
-
+async fn oauth_protected_resource_metadata(State(state): State<ServerState>) -> impl IntoResponse {
     let mut meta = crate::services::oauth::protected_resource_metadata(
-        &oai_url,
-        &oauth_issuer,
+        &state.resource_url,
+        &state.oauth_issuer_url,
     );
     meta.resource_name = Some("HyprStream OpenAI-Compatible API".to_owned());
     meta.scopes_supported = Some(vec!["infer:model:*".into(), "read:model:*".into()]);
@@ -230,7 +251,11 @@ pub async fn start_server_tls(
     )
     .await?;
 
-    let scheme = if rustls_config.is_some() { "https" } else { "http" };
+    let scheme = if rustls_config.is_some() {
+        "https"
+    } else {
+        "http"
+    };
     info!("OpenAI-compatible API available at {scheme}://{addr}/oai/v1");
 
     let app = create_app(state);
@@ -292,7 +317,8 @@ mod tests {
         public_exemptions::validate().expect("registry must be self-consistent before wiring");
 
         let rate_limiter = Arc::new(middleware::RateLimiter::new(u32::MAX, 3600));
-        let (public, browser_provisioning) = build_public_routes_from_registry(rate_limiter);
+        let (public, browser_provisioning) =
+            build_public_routes_from_registry(Arc::clone(&rate_limiter), rate_limiter);
         let live = live_router_paths(&public.merge(browser_provisioning));
         let registered = for_face(HttpFace::MainApp)
             .map(|exemption| exemption.path.to_owned())
