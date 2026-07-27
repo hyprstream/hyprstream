@@ -1450,8 +1450,8 @@ mod tests {
         use crate::services::generated::policy_client::IssueToken;
         use crate::services::{DiscoveryClient, PolicyClient, PolicyService};
 
-        const ISSUER: &str = "https://pds.example.test";
-        const GENERIC_ISSUER: &str = "https://pds.example.test/configured/path";
+        const ISSUER: &str = "https://pds.example.test:8443";
+        const GENERIC_ISSUER: &str = "https://pds.example.test:8443/configured/path";
         const CLIENT_ID: &str = "handler-client";
         const PRIVATE_CLIENT_ID: &str = "handler-private-client";
         const REDIRECT_URI: &str = "https://client.example.test/callback";
@@ -1748,7 +1748,7 @@ mod tests {
             ))
         };
         let service_jwt = make_service_jwt(
-            "did:web:pds.example.test",
+            "did:web:pds.example.test%3A8443",
             token_exchange::ATPROTO_EXCHANGE_NSID,
             "demo-1119-jti",
         )?;
@@ -1792,7 +1792,7 @@ mod tests {
             axum::http::StatusCode::UNAUTHORIZED
         );
         let wrong_lxm = make_service_jwt(
-            "did:web:pds.example.test",
+            "did:web:pds.example.test%3A8443",
             "com.atproto.repo.uploadBlob",
             "demo-1119-wrong-lxm",
         )?;
@@ -1820,7 +1820,7 @@ mod tests {
         assert_eq!(exchanged_claims["scope"], "transition:generic");
 
         let wrong_tenant_jwt = make_service_jwt(
-            "did:web:pds.example.test",
+            "did:web:pds.example.test%3A8443",
             token_exchange::ATPROTO_EXCHANGE_NSID,
             "demo-1119-wrong-tenant",
         )?;
