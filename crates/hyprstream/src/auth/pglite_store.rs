@@ -71,7 +71,7 @@ CREATE TABLE IF NOT EXISTS oidc_bindings (
 CREATE TABLE IF NOT EXISTS pubkeys (
     fingerprint TEXT PRIMARY KEY CHECK (fingerprint <> ''),
     username TEXT NOT NULL REFERENCES users(username) ON DELETE CASCADE,
-    pubkey BYTEA NOT NULL CHECK (octet_length(pubkey) = 32),
+    pubkey BYTEA NOT NULL,
     label BYTEA,
     algorithm TEXT NOT NULL DEFAULT 'ed25519'
         CHECK (algorithm IN ('ed25519', 'ed25519+ml-dsa-65')),
@@ -81,9 +81,7 @@ CREATE TABLE IF NOT EXISTS pubkeys (
     CHECK (
         (algorithm = 'ed25519' AND pq_pubkey IS NULL)
         OR
-        (algorithm = 'ed25519+ml-dsa-65'
-            AND pq_pubkey IS NOT NULL
-            AND octet_length(pq_pubkey) = 1952)
+        (algorithm = 'ed25519+ml-dsa-65' AND pq_pubkey IS NOT NULL)
     )
 );
 CREATE INDEX IF NOT EXISTS pubkeys_username_idx ON pubkeys(username);
@@ -114,13 +112,23 @@ pub struct PgliteUserStore {
 }
 
 impl PgliteUserStore {
-    /// Standalone substrate factory. Application wiring should normally open
-    /// PGlite once and call [`Self::from_database`] for every repository.
+    /// Standalone substrate factory — **TEST/MIGRATION ONLY**.
+    ///
+    /// This constructor does NOT enable at-rest encryption. Production
+    /// wiring MUST use [`Self::with_cipher`] instead. This constructor
+    /// exists for #1376 tests and one-time migration from plaintext stores.
+    #[deprecated(note = "production wiring must use with_cipher() for at-rest encryption (#1377)")]
     pub async fn open(data_dir: impl AsRef<Path>) -> Result<Self> {
         let database = Arc::new(PGlite::open(data_dir).await.context("opening PGlite")?);
+        #[allow(deprecated)]
         Self::from_database(database).await
     }
 
+    /// Shared-handle factory — **TEST/MIGRATION ONLY**.
+    ///
+    /// Does NOT enable at-rest encryption. Production MUST use
+    /// [`Self::with_cipher`].
+    #[deprecated(note = "production wiring must use with_cipher() for at-rest encryption (#1377)")]
     pub async fn from_database(database: Arc<PGlite>) -> Result<Self> {
         database
             .exec(USERSTORE_SCHEMA)
@@ -132,19 +140,23 @@ impl PgliteUserStore {
         })
     }
 
-    /// Open with at-rest envelope encryption (#1377). When `cipher` is `Some`,
-    /// every BYTEA value column is sealed before storage and unsealed on read.
-    /// Passing `None` is equivalent to [`Self::from_database`].
+    /// Open with at-rest envelope encryption (#1377) — the PRODUCTION
+    /// constructor. Every BYTEA value column is sealed before storage and
+    /// unsealed on read. A valid cipher is REQUIRED; production wiring
+    /// MUST use this constructor, not the plaintext [`Self::from_database`].
     #[allow(dead_code)] // deployment-wiring call-site is #1378
     pub(crate) async fn with_cipher(
         database: Arc<PGlite>,
-        cipher: Option<ColumnCipher>,
+        cipher: ColumnCipher,
     ) -> Result<Self> {
         database
             .exec(USERSTORE_SCHEMA)
             .await
             .context("applying UserStore schema")?;
-        Ok(Self { database, cipher })
+        Ok(Self {
+            database,
+            cipher: Some(cipher),
+        })
     }
 
     pub fn database(&self) -> Arc<PGlite> {
@@ -180,6 +192,12 @@ impl PgliteUserStore {
     /// Unseal the user's persisted root DEK. Fails closed when the wrapped DEK
     /// is absent (user deleted / crypto-shredded) or when key material is
     /// unavailable at runtime.
+    ///
+    /// **IMPORTANT**: this queries through `self.database` (the outer handle).
+    /// It MUST NOT be called while a transaction is open on the same PGlite
+    /// connection — PGlite is single-connection and the outer query will
+    /// deadlock against the active transaction. Inside a transaction, use
+    /// [`Self::load_user_key_tx`] instead.
     async fn load_user_key(&self, username: &str) -> Result<Zeroizing<[u8; ROOT_DEK_BYTES]>> {
         let cipher = self
             .cipher
@@ -187,6 +205,30 @@ impl PgliteUserStore {
             .context("encryption is not configured for this store")?;
         let rows = self
             .database
+            .query(
+                "SELECT wrapped_dek FROM user_encryption_keys WHERE username=$1",
+                &[&username],
+            )
+            .await?;
+        let wrapped: Vec<u8> = rows
+            .first()
+            .context("wrapped UserStore DEK is absent — key material revoked or never provisioned")?
+            .get(0)?;
+        cipher.open_user_key(&wrapped).await
+    }
+
+    /// Transaction-scoped DEK load — queries through the active transaction
+    /// to avoid self-deadlock on PGlite's single connection.
+    async fn load_user_key_tx(
+        &self,
+        tx: &pglite::Transaction<'_>,
+        username: &str,
+    ) -> Result<Zeroizing<[u8; ROOT_DEK_BYTES]>> {
+        let cipher = self
+            .cipher
+            .as_ref()
+            .context("encryption is not configured for this store")?;
+        let rows = tx
             .query(
                 "SELECT wrapped_dek FROM user_encryption_keys WHERE username=$1",
                 &[&username],
@@ -491,17 +533,19 @@ impl UserStore for PgliteUserStore {
         let fingerprint = super::pubkey_fingerprint(&pubkey);
         let tx = self.database.transaction().await.map_err(hosted_backend)?;
 
-        let root = if self.is_encrypted() {
-            Some(self.load_user_key(username).await.map_err(hosted_backend)?)
-        } else {
-            None
-        };
-
+        // Check user existence BEFORE loading the DEK — a new user has no DEK
+        // yet, and loading through self.database would deadlock the tx.
         let profiles = tx
             .query(PROFILE_SELECT, &[&username])
             .await
             .map_err(hosted_backend)?;
         if let Some(profile_row) = profiles.first() {
+            // User exists — load DEK through the active transaction.
+            let root = if self.is_encrypted() {
+                Some(self.load_user_key_tx(&tx, username).await.map_err(hosted_backend)?)
+            } else {
+                None
+            };
             if profiles.len() != 1 {
                 return Err(hosted_backend(anyhow!(
                     "username primary key returned duplicates"
@@ -584,7 +628,7 @@ impl UserStore for PgliteUserStore {
             }
             let owner: String = owner_row.get(0).map_err(hosted_backend)?;
             let owner_root = if self.is_encrypted() {
-                Some(self.load_user_key(&owner).await.map_err(hosted_backend)?)
+                Some(self.load_user_key_tx(&tx, &owner).await.map_err(hosted_backend)?)
             } else {
                 None
             };
@@ -628,6 +672,16 @@ impl UserStore for PgliteUserStore {
 
         let sub = uuid::Uuid::new_v4().to_string();
         let now = chrono::Utc::now().timestamp();
+        // Insert the parent users row FIRST — user_encryption_keys and
+        // pubkeys both have FK references to it.
+        tx.query(
+            "INSERT INTO users(username, sub, active, key_custody) \
+             VALUES($1, $2, FALSE, $3)",
+            &[&username, &sub, &custody.as_str()],
+        )
+        .await
+        .map_err(hosted_backend)?;
+        // Now safe to mint the DEK (FK to users is satisfied).
         let create_root = if self.is_encrypted() {
             Some(self.create_user_key(&tx, username).await.map_err(hosted_backend)?)
         } else {
@@ -639,13 +693,6 @@ impl UserStore for PgliteUserStore {
         let label_bytes = self
             .seal_text(create_root.as_ref(), username, EncryptedColumn::PublicKeyLabel { fingerprint: &fingerprint }, Some("aegis-vault".to_owned()))
             .map_err(hosted_backend)?;
-        tx.query(
-            "INSERT INTO users(username, sub, active, key_custody) \
-             VALUES($1, $2, FALSE, $3)",
-            &[&username, &sub, &custody.as_str()],
-        )
-        .await
-        .map_err(hosted_backend)?;
         tx.query(
             "INSERT INTO user_did_bindings(username, atproto_did) VALUES($1, $2)",
             &[&username, &atproto_did],
@@ -682,7 +729,7 @@ impl UserStore for PgliteUserStore {
     ) -> std::result::Result<(), HostedAccountProvisionError> {
         let tx = self.database.transaction().await.map_err(hosted_backend)?;
         let root = if self.is_encrypted() {
-            Some(self.load_user_key(username).await.map_err(hosted_backend)?)
+            Some(self.load_user_key_tx(&tx, username).await.map_err(hosted_backend)?)
         } else {
             None
         };
@@ -754,7 +801,7 @@ impl UserStore for PgliteUserStore {
         );
         let tx = self.database.transaction().await?;
         let root = if self.is_encrypted() {
-            Some(self.load_user_key(username).await?)
+            Some(self.load_user_key_tx(&tx, username).await?)
         } else {
             None
         };
@@ -1112,7 +1159,7 @@ impl UserStore for PgliteUserStore {
 
 
 #[cfg(all(test, feature = "pglite"))]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::mem_forget)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::mem_forget, deprecated)]
 mod tests {
     use super::*;
     use ed25519_dalek::SigningKey;
