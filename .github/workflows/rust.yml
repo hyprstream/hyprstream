@@ -132,6 +132,7 @@ jobs:
       # NOT add `|| true`.
       run: |
         python3 scripts/check_rust_workflow_matrix.py
+        python3 scripts/check_browser_wasm_gate.py
 
   loopback-burndown:
     name: Loopback-literal burn-down (#1152 W4)
@@ -180,9 +181,10 @@ jobs:
     - name: Pull builder image
       run: podman pull "$BUILDER_IMAGE"
 
-    # Guards the browser/WebTransport build (#225/#226): getrandom wasm_js (Cargo.toml) +
-    # the web_sys_unstable_apis rustflag for WebTransport. Catches wasm-only breakage the
-    # native clippy/build jobs miss (e.g. the PQ-crypto getrandom regression).
+    # Guards the complete browser-facing Rust surface consumed by www:
+    # hyprstream-rpc, hyprstream-vfs, and hyprstream-rpc-std. The shared script
+    # carries the exact web-sys/getrandom cfgs and is also invoked by the required
+    # merge-group build, preventing the two gates from drifting apart.
     - name: Check wasm32 browser build (in rust-builder container)
       run: |
         podman run --rm \
@@ -191,10 +193,9 @@ jobs:
           -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY -e AWS_SESSION_TOKEN \
           -e AWS_REGION -e AWS_DEFAULT_REGION \
           -e CARGO_INCREMENTAL=0 -e CARGO_TERM_COLOR=always \
-          -e RUSTFLAGS='--cfg=web_sys_unstable_apis' \
           "$BUILDER_IMAGE" \
           bash -euo pipefail -c '
-            cargo check --target wasm32-unknown-unknown -p hyprstream-rpc
+            bash /build/.github/scripts/browser-wasm-check.sh
             sccache --show-stats
           '
 
