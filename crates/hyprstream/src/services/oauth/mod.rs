@@ -587,26 +587,86 @@ impl Spawnable for OAuthService {
                 )
             })?;
 
-            // Load the user store and token store based on configured backend.
-            // Failure is non-fatal; endpoints will report "not configured" instead.
+            // Load the user store (account system of record) based on the
+            // configured backend. A configured system-of-record failure fails
+            // closed — never silently fall back to a different account store.
             use crate::config::CredentialsBackend;
             let credentials_config = crate::config::HyprConfig::load()
                 .map(|c| c.credentials)
                 .unwrap_or_default();
 
+            // The device store is independent of the user-store backend. It
+            // always uses RocksDB (device-authorization state is not account
+            // data and there is no pglite DeviceStore). Every match arm below
+            // assigns it, so the initial `None` is structurally required by
+            // Rust's initialization rules but is always overwritten before read.
+            #[allow(unused_assignments)]
             let mut device_store_opt: Option<Arc<dyn crate::auth::DeviceStore>> = None;
+
+            // Helper: open a RocksDbUserStore solely for its DeviceStore trait
+            // (used when the account backend is not RocksDB).
+            #[cfg(any(feature = "pglite", feature = "valkey"))]
+            // (used when the account backend is not RocksDB).
+            macro_rules! open_rocksdb_device_store {
+                () => {{
+                    match crate::auth::RocksDbUserStore::open(&credentials_dir) {
+                        Ok(ds) => {
+                            let arc: Arc<crate::auth::RocksDbUserStore> = Arc::new(ds);
+                            Some(arc as Arc<dyn crate::auth::DeviceStore>)
+                        }
+                        Err(e) => {
+                            tracing::warn!("Could not open device store (RocksDB): {e}");
+                            None
+                        }
+                    }
+                }};
+            }
+
             let user_store: Option<Arc<dyn crate::auth::user_store::UserStore>> = match credentials_config.backend {
+                CredentialsBackend::Pglite => {
+                    #[cfg(feature = "pglite")]
+                    {
+                        let db_path = credentials_dir.join("pglite");
+                        // Open the shared PGlite handle explicitly so it can be
+                        // injected into other repositories (AppView inventory)
+                        // via from_database in the future. #1376's PgliteUserStore
+                        // owns the schema application; we own the connection.
+                        let database = Arc::new(
+                            pglite::PGlite::open(&db_path)
+                                .await
+                                .map_err(|e| hyprstream_rpc::error::RpcError::SpawnFailed(
+                                    format!("failed to open PGlite at {db_path:?}: {e}")
+                                ))?,
+                        );
+                        let store = crate::auth::PgliteUserStore::from_database(database)
+                            .await
+                            .map_err(|e| hyprstream_rpc::error::RpcError::SpawnFailed(
+                                format!("failed to initialize UserStore schema: {e}")
+                            ))?;
+                        info!("User store (PGlite) opened at {:?}", db_path);
+                        device_store_opt = open_rocksdb_device_store!();
+                        Some(Arc::new(store) as Arc<dyn crate::auth::user_store::UserStore>)
+                    }
+                    #[cfg(not(feature = "pglite"))]
+                    {
+                        return Err(hyprstream_rpc::error::RpcError::SpawnFailed(
+                            "credentials.backend = \"pglite\" but binary was not compiled with --features pglite".to_owned()
+                        ));
+                    }
+                }
                 CredentialsBackend::Rocksdb => {
                     match crate::auth::RocksDbUserStore::open(&credentials_dir) {
                         Ok(store) => {
                             info!("User store (RocksDB) opened at {:?}", credentials_dir);
                             let arc = Arc::new(store);
+                            // RocksDbUserStore implements both traits — share the object.
                             device_store_opt = Some(arc.clone() as Arc<dyn crate::auth::DeviceStore>);
                             Some(arc as Arc<dyn crate::auth::user_store::UserStore>)
                         }
                         Err(e) => {
-                            tracing::warn!("Could not open user store (endpoints will report 'not configured'): {}", e);
-                            None
+                            return Err(hyprstream_rpc::error::RpcError::SpawnFailed(
+                                format!("failed to open RocksDB user store at {credentials_dir:?}: {e}")
+                            ));
                         }
                     }
                 }
@@ -617,18 +677,21 @@ impl Spawnable for OAuthService {
                         match crate::auth::ValkeyUserStore::connect(url).await {
                             Ok(store) => {
                                 info!("User store (Valkey) connected at {url}");
+                                device_store_opt = open_rocksdb_device_store!();
                                 Some(Arc::new(store))
                             }
                             Err(e) => {
-                                tracing::warn!("Could not connect user store (Valkey): {e}");
-                                None
+                                return Err(hyprstream_rpc::error::RpcError::SpawnFailed(
+                                    format!("failed to connect Valkey user store at {url}: {e}")
+                                ));
                             }
                         }
                     }
                     #[cfg(not(feature = "valkey"))]
                     {
-                        tracing::error!("credentials.backend = \"valkey\" but binary was not compiled with --features valkey");
-                        None
+                        return Err(hyprstream_rpc::error::RpcError::SpawnFailed(
+                            "credentials.backend = \"valkey\" but binary was not compiled with --features valkey".to_owned()
+                        ));
                     }
                 }
             };
@@ -844,9 +907,13 @@ impl Spawnable for OAuthService {
             oauth_state = oauth_state.with_jwt_key_timestamps(key_nbf, key_nbf + 14 * 86400);
 
             // Open persistent refresh token store (non-fatal — tokens simply don't survive restart).
+            // The token store is decoupled from the account backend: a pglite
+            // UserStore does not imply a pglite TokenStore — refresh tokens
+            // always go to RocksDB or Valkey.
             let token_db_path = credentials_dir.join("oauth-tokens");
             let token_store: Option<Arc<dyn crate::services::oauth::token_store::TokenStore>> = match credentials_config.backend {
-                CredentialsBackend::Rocksdb => {
+                // Pglite account store falls through to RocksDB for tokens.
+                CredentialsBackend::Pglite | CredentialsBackend::Rocksdb => {
                     match crate::services::oauth::token_store::RocksDbTokenStore::open(&token_db_path) {
                         Ok(s) => {
                             info!("Refresh token store (RocksDB) opened at {:?}", token_db_path);

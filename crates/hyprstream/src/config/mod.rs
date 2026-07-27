@@ -1460,12 +1460,18 @@ fn default_oauth_host() -> String { "0.0.0.0".to_owned() }
 fn default_oauth_port() -> u16 { 6791 }
 
 /// Which backend stores user credentials and refresh tokens.
+///
+/// `Pglite` selects the shared embedded PGlite/Postgres relational store for
+/// the **account system of record** (UserStore). Token and device stores
+/// remain on RocksDB/Valkey — a pglite TokenStore does not exist.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum CredentialsBackend {
     #[default]
     Rocksdb,
     Valkey,
+    /// Relational UserStore on the shared #1351 PGlite substrate.
+    Pglite,
 }
 
 /// Valkey connection settings (used when `backend = "valkey"`).
