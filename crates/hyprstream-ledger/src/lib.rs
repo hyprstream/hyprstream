@@ -42,6 +42,8 @@ pub mod engine;
 pub mod errors;
 pub mod journal;
 pub mod mem;
+#[cfg(feature = "postgres")]
+pub mod postgres;
 pub mod types;
 
 pub use backend::LedgerBackend;
