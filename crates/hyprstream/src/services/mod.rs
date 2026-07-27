@@ -67,12 +67,14 @@ pub use worktree_helpers::StatResult;
 pub mod discovery;
 pub mod editing;
 pub mod factories;
+#[cfg(feature = "metrics")]
 pub mod flight;
 pub mod generated;
 #[cfg(feature = "oci-image")]
 pub mod image_substrate;
 pub mod inference;
 pub mod mcp_service;
+#[cfg(feature = "metrics")]
 pub mod metrics;
 pub mod at9p_verify;
 pub mod ninep_bridge;
@@ -144,8 +146,10 @@ pub use at9p_verify::{At9pVerifyService, VerifyFaceState, credential_free_router
 pub use image_substrate::{
     create_image_substrate_router, ImageSubstratePolicy, ImageSubstrateState,
 };
+#[cfg(feature = "metrics")]
 pub use flight::FlightService;
 pub use discovery::DiscoveryService;
 pub use generated::discovery_client::DiscoveryClient;
 pub use mcp_service::{McpConfig, McpService};
+#[cfg(feature = "metrics")]
 pub use metrics::MetricsService;

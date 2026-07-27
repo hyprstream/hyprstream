@@ -890,11 +890,34 @@ mod tests {
     use ed25519_dalek::SigningKey;
     use rand::rngs::OsRng;
 
-    /// Open a PGlite store in a temp dir under the working tree (not /tmp
-    /// tmpfs, which bricks shells on EDQUOT — see agent_build_target_on_home).
-    async fn make_store() -> PgliteUserStore {
+    use std::sync::OnceLock;
+
+    /// PGlite is a process singleton — it cannot be reopened after close in
+    /// the same process. All tests share this one instance, serialized by a
+    /// mutex so parallel `cargo test` is safe without `--test-threads=1`.
+    static SHARED_DB: OnceLock<PgliteUserStore> = OnceLock::new();
+    static TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    async fn shared() -> &'static PgliteUserStore {
+        if let Some(s) = SHARED_DB.get() {
+            return s;
+        }
         let dir = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
-        PgliteUserStore::open(dir.path()).await.unwrap()
+        let path = dir.path().to_owned();
+        std::mem::forget(dir); // keep the data dir alive for the process lifetime
+        let s = PgliteUserStore::open(&path).await.unwrap();
+        let _ = SHARED_DB.set(s);
+        SHARED_DB.get().unwrap()
+    }
+
+    /// Acquire the test serialization lock AND wipe all rows. The returned
+    /// guard must be held (`_guard`) for the entire test body so no two
+    /// tests touch the shared database concurrently.
+    async fn fresh() -> tokio::sync::MutexGuard<'static, ()> {
+        let guard = TEST_LOCK.lock().await;
+        let s = shared().await;
+        s.database.query("DELETE FROM users", &[]).await.unwrap();
+        guard
     }
 
     fn make_key() -> VerifyingKey {
@@ -905,7 +928,8 @@ mod tests {
 
     #[tokio::test]
     async fn register_get_profile_round_trip() {
-        let store = make_store().await;
+        let _guard = fresh().await;
+    let store = shared().await;
         let sub = store.register("alice").await.unwrap();
         let profile = store.get_profile("alice").await.unwrap().unwrap();
         assert_eq!(profile.sub.as_deref(), Some(sub.as_str()));
@@ -915,19 +939,22 @@ mod tests {
 
     #[tokio::test]
     async fn get_profile_missing_user_returns_none() {
-        let store = make_store().await;
+        let _guard = fresh().await;
+    let store = shared().await;
         assert!(store.get_profile("nobody").await.unwrap().is_none());
     }
 
     #[tokio::test]
     async fn register_empty_username_fails() {
-        let store = make_store().await;
+        let _guard = fresh().await;
+    let store = shared().await;
         assert!(store.register("").await.is_err());
     }
 
     #[tokio::test]
     async fn set_profile_updates_columns() {
-        let store = make_store().await;
+        let _guard = fresh().await;
+    let store = shared().await;
         store.register("alice").await.unwrap();
         store
             .set_profile(
@@ -949,7 +976,8 @@ mod tests {
 
     #[tokio::test]
     async fn set_profile_atproto_did_clears_binding() {
-        let store = make_store().await;
+        let _guard = fresh().await;
+    let store = shared().await;
         store.register("alice").await.unwrap();
         store
             .set_profile(
@@ -984,7 +1012,8 @@ mod tests {
 
     #[tokio::test]
     async fn set_profile_unknown_user_fails() {
-        let store = make_store().await;
+        let _guard = fresh().await;
+    let store = shared().await;
         assert!(store
             .set_profile("nobody", UserProfilePatch::default())
             .await
@@ -993,7 +1022,8 @@ mod tests {
 
     #[tokio::test]
     async fn remove_cascades_pubkeys_and_did_binding() {
-        let store = make_store().await;
+        let _guard = fresh().await;
+    let store = shared().await;
         store.register("alice").await.unwrap();
         let key = make_key();
         let fp = store.add_pubkey("alice", key, None).await.unwrap();
@@ -1014,7 +1044,8 @@ mod tests {
 
     #[tokio::test]
     async fn set_active_toggles() {
-        let store = make_store().await;
+        let _guard = fresh().await;
+    let store = shared().await;
         store.register("alice").await.unwrap();
         store.set_active("alice", false).await.unwrap();
         assert_eq!(
@@ -1032,7 +1063,8 @@ mod tests {
 
     #[tokio::test]
     async fn search_filters_and_paginates() {
-        let store = make_store().await;
+        let _guard = fresh().await;
+    let store = shared().await;
         store.register("alice").await.unwrap();
         store.register("bob").await.unwrap();
         store.register("carol").await.unwrap();
@@ -1074,7 +1106,8 @@ mod tests {
 
     #[tokio::test]
     async fn add_list_remove_pubkey() {
-        let store = make_store().await;
+        let _guard = fresh().await;
+    let store = shared().await;
         store.register("alice").await.unwrap();
         let key = make_key();
         let fp = store
@@ -1103,7 +1136,8 @@ mod tests {
 
     #[tokio::test]
     async fn add_pubkey_hybrid_upgrades_classical() {
-        let store = make_store().await;
+        let _guard = fresh().await;
+    let store = shared().await;
         store.register("alice").await.unwrap();
         let key = make_key();
         let fp = store.add_pubkey("alice", key, None).await.unwrap();
@@ -1123,7 +1157,8 @@ mod tests {
 
     #[tokio::test]
     async fn add_pubkey_hybrid_wrong_length_fails() {
-        let store = make_store().await;
+        let _guard = fresh().await;
+    let store = shared().await;
         store.register("alice").await.unwrap();
         let key = make_key();
         assert!(store
@@ -1136,7 +1171,8 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_or_bind_creates_and_resolves() {
-        let store = make_store().await;
+        let _guard = fresh().await;
+    let store = shared().await;
         let res1 = store
             .resolve_or_bind_external_idp("https://idp.example", "sub-123", "alice")
             .await
@@ -1157,7 +1193,8 @@ mod tests {
 
     #[tokio::test]
     async fn list_and_get_external_identities() {
-        let store = make_store().await;
+        let _guard = fresh().await;
+    let store = shared().await;
         store
             .resolve_or_bind_external_idp("https://idp.example", "sub-1", "alice")
             .await
@@ -1178,7 +1215,8 @@ mod tests {
 
     #[tokio::test]
     async fn provision_stages_inactive_account() {
-        let store = make_store().await;
+        let _guard = fresh().await;
+    let store = shared().await;
         let key = make_key();
         let result = store
             .provision_hosted_account(
@@ -1204,7 +1242,8 @@ mod tests {
 
     #[tokio::test]
     async fn provision_exact_repeat_resumes() {
-        let store = make_store().await;
+        let _guard = fresh().await;
+    let store = shared().await;
         let key = make_key();
         let first = store
             .provision_hosted_account(
@@ -1231,7 +1270,8 @@ mod tests {
 
     #[tokio::test]
     async fn activate_flips_staged_to_active() {
-        let store = make_store().await;
+        let _guard = fresh().await;
+    let store = shared().await;
         let key = make_key();
         let provisioned = store
             .provision_hosted_account(
@@ -1257,7 +1297,8 @@ mod tests {
 
     #[tokio::test]
     async fn activate_idempotent_on_already_active() {
-        let store = make_store().await;
+        let _guard = fresh().await;
+    let store = shared().await;
         let key = make_key();
         let fp = super::super::pubkey_fingerprint(&key);
         store
@@ -1292,7 +1333,8 @@ mod tests {
 
     #[tokio::test]
     async fn activate_rejects_changed_did() {
-        let store = make_store().await;
+        let _guard = fresh().await;
+    let store = shared().await;
         let key = make_key();
         let fp = super::super::pubkey_fingerprint(&key);
         store
@@ -1317,7 +1359,8 @@ mod tests {
 
     #[tokio::test]
     async fn provision_account_already_exists() {
-        let store = make_store().await;
+        let _guard = fresh().await;
+    let store = shared().await;
         let key = make_key();
         // Stage and fully activate a hosted account.
         let provisioned = store
@@ -1357,7 +1400,8 @@ mod tests {
 
     #[tokio::test]
     async fn provision_key_already_bound() {
-        let store = make_store().await;
+        let _guard = fresh().await;
+    let store = shared().await;
         let key = make_key();
         // Stage+activate alice with this key.
         let provisioned = store
@@ -1396,7 +1440,8 @@ mod tests {
 
     #[tokio::test]
     async fn provision_corrupt_inactive_state_is_backend_error() {
-        let store = make_store().await;
+        let _guard = fresh().await;
+    let store = shared().await;
         let key = make_key();
         store
             .provision_hosted_account(
@@ -1430,14 +1475,13 @@ mod tests {
 
     #[tokio::test]
     async fn from_database_shares_one_handle() {
-        let dir = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
-        let db = Arc::new(PGlite::open(dir.path()).await.unwrap());
-        let store = PgliteUserStore::from_database(Arc::clone(&db))
+        let _guard = fresh().await;
+        let s = shared().await;
+        let db = s.database();
+        let store2 = PgliteUserStore::from_database(Arc::clone(&db))
             .await
             .unwrap();
-        store.register("alice").await.unwrap();
         // The handle returned by database() is the same Arc.
-        let handle = store.database();
-        assert!(Arc::ptr_eq(&handle, &db));
+        assert!(Arc::ptr_eq(&store2.database(), &db));
     }
 }

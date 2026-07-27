@@ -62,8 +62,8 @@ hyprstream-ledger = { path = "../hyprstream-ledger", optional = true }  # Cellul
 hyprstream-crypto = { path = "../hyprstream-crypto" }  # COSE composite (EdDSA + ML-DSA-65) sign/verify — used by the ledger checkpoint signer (#925)
 hyprstream-service = { path = "../hyprstream-service" }  # Service orchestration
 hyprstream-rpc-derive = { path = "../hyprstream-rpc-derive" }  # RPC code generation proc macros
-hyprstream-flight = { path = "../hyprstream-flight" }  # Flight SQL server and client
-hyprstream-metrics = { path = "../hyprstream-metrics" }  # Metrics storage (for RegistryClient trait)
+hyprstream-flight = { path = "../hyprstream-flight", optional = true }  # Flight SQL server and client
+hyprstream-metrics = { path = "../hyprstream-metrics", optional = true }  # Metrics storage (DuckDB) — optional so pglite builds don't link DuckDB (#1376 P1)
 hyprstream-workers = { path = "../hyprstream-workers" }  # Worker runtime (Kata containers)
 hyprstream-vfs = { path = "../hyprstream-vfs" }  # VFS namespace (Mount trait)
 hyprstream-9p = { path = "../hyprstream-9p" }  # 9P codec + Kata translator (Backend, Translator)
@@ -222,6 +222,7 @@ default = ["gittorrent", "xet", "systemd", "otel", "kata-vm", "nspawn"]
 cuda = []
 valkey = ["dep:fred"]  # Enable Valkey/Redis-backed user and token stores
 pglite = ["dep:pglite-rs"]  # Enable PGlite embedded relational UserStore (#1376)
+metrics = ["dep:hyprstream-metrics", "dep:hyprstream-flight"]  # Enable DuckDB-backed metrics service (conflicts with pglite at link time)
 bnb = ["dep:bitsandbytes-sys"]  # Enable bitsandbytes KV cache quantization (requires compatible ROCm/CUDA)
 xet = ["git2db/xet-storage"]  # Enable XET large file storage
 # NOTE: plain dependency names (not `dep:`) — cargo rejects `dep:` references

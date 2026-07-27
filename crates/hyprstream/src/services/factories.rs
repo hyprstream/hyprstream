@@ -1480,6 +1480,7 @@ fn create_at9p_verify_service(_ctx: &ServiceContext) -> anyhow::Result<Box<dyn S
 ///
 /// This service provides Flight SQL protocol for dataset queries.
 /// It optionally uses RegistryClient for dataset lookup.
+#[cfg(feature = "metrics")]
 #[service_factory("flight", depends_on = ["policy", "registry", "discovery"])]
 fn create_flight_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>> {
     info!("Creating FlightService");
@@ -2240,6 +2241,7 @@ fn create_discovery_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spaw
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /// Factory for MetricsService (DuckDB-backed time-series ingest + DataFusion query)
+#[cfg(feature = "metrics")]
 #[service_factory("metrics", schema = "../../../hyprstream-rpc-std/schema/metrics.capnp", metadata = crate::services::generated::metrics_client::schema_metadata, depends_on = ["policy", "discovery"])]
 fn create_metrics_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>> {
     info!("Creating MetricsService");
