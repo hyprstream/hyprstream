@@ -50,29 +50,61 @@ struct HostedBindingMarker {
     pubkey_base64: String,
 }
 
+fn validate_stored_key_record(
+    fingerprint: &str,
+    key_json: &str,
+) -> Result<(StoredKey, VerifyingKey, Option<Vec<u8>>)> {
+    use base64::engine::general_purpose::STANDARD;
+    use base64::Engine;
+
+    let key: StoredKey = serde_json::from_str(key_json)?;
+    let key_bytes: [u8; 32] = STANDARD
+        .decode(&key.pubkey_base64)?
+        .try_into()
+        .map_err(|_| anyhow!("bad key length"))?;
+    let verifying_key = VerifyingKey::from_bytes(&key_bytes)?;
+    if pubkey_fingerprint(&verifying_key) != fingerprint {
+        anyhow::bail!("stored key does not match fingerprint {fingerprint}");
+    }
+
+    // Keep hosted-account activation/conflict classification and ordinary
+    // authentication on one complete-record acceptance policy. A metadata-
+    // corrupt record must never become a recovery-triggering trusted 409.
+    let pq_pubkey = match key.pq_pubkey_base64.as_deref() {
+        Some(b64) if !b64.is_empty() => Some(
+            STANDARD
+                .decode(b64)
+                .with_context(|| format!("invalid base64 ML-DSA-65 key for {fingerprint}"))?,
+        ),
+        _ => None,
+    };
+    match (key.algorithm.is_hybrid(), &pq_pubkey) {
+        (true, Some(_)) | (false, None) => {}
+        (true, None) => anyhow::bail!(
+            "hybrid pubkey record {fingerprint} is missing its ML-DSA-65 key \
+             material (refusing to read — fail closed)"
+        ),
+        (false, Some(_)) => anyhow::bail!(
+            "classical pubkey record {fingerprint} carries unexpected ML-DSA-65 \
+             key material (refusing to read)"
+        ),
+    }
+
+    Ok((key, verifying_key, pq_pubkey))
+}
+
 fn validated_stored_key_base64(
     fingerprint: &str,
     key_json: Option<&str>,
 ) -> std::result::Result<String, HostedAccountProvisionError> {
-    use base64::engine::general_purpose::STANDARD;
-    use base64::Engine;
-
-    let invalid = || {
-        HostedAccountProvisionError::Backend(anyhow!(
-            "stored hosted-account key does not match its indexed fingerprint"
-        ))
-    };
-    let key: StoredKey =
-        serde_json::from_str(key_json.ok_or_else(invalid)?).map_err(|_| invalid())?;
-    let key_bytes = STANDARD
-        .decode(&key.pubkey_base64)
-        .ok()
-        .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
-        .ok_or_else(invalid)?;
-    let verifying_key = VerifyingKey::from_bytes(&key_bytes).map_err(|_| invalid())?;
-    if pubkey_fingerprint(&verifying_key) != fingerprint {
-        return Err(invalid());
-    }
+    let key_json = key_json.ok_or_else(|| {
+        HostedAccountProvisionError::Backend(anyhow!("stored hosted-account key is missing"))
+    })?;
+    let (key, _, _) = validate_stored_key_record(fingerprint, key_json).map_err(|error| {
+        HostedAccountProvisionError::Backend(
+            error.context("stored hosted-account key is not authentication-usable"),
+        )
+    })?;
     Ok(key.pubkey_base64)
 }
 
@@ -187,6 +219,27 @@ impl ValkeyUserStore {
             key_json.as_deref(),
             marker_json.as_deref(),
         )
+    }
+
+    async fn validate_account_conflict(
+        &self,
+        username: &str,
+    ) -> std::result::Result<(), HostedAccountProvisionError> {
+        // list_pubkeys applies the same complete-record policy as activation
+        // and trusted key conflicts, and fails the whole account read if any
+        // algorithm/PQ metadata is corrupt.
+        let keys = self
+            .list_pubkeys(username)
+            .await
+            .map_err(HostedAccountProvisionError::Backend)?;
+        for key in keys {
+            if self.validate_key_conflict(&key.fingerprint).await.is_ok() {
+                return Ok(());
+            }
+        }
+        Err(HostedAccountProvisionError::Backend(anyhow!(
+            "existing hosted account has no complete active credential binding"
+        )))
     }
 
     async fn validated_staged_public_key(
@@ -416,7 +469,10 @@ return 0
                 fingerprint,
                 resumed: false,
             }),
-            1 => Err(HostedAccountProvisionError::AccountAlreadyExists),
+            1 => {
+                self.validate_account_conflict(username).await?;
+                Err(HostedAccountProvisionError::AccountAlreadyExists)
+            }
             2 => {
                 self.validate_key_conflict(&fingerprint).await?;
                 Err(HostedAccountProvisionError::KeyAlreadyBound)
@@ -760,34 +816,7 @@ return 0
         for fp in fps {
             let val: Option<String> = self.pool.get(format!("hs:key:{fp}")).await?;
             if let Some(s) = val {
-                let stored: StoredKey = serde_json::from_str(&s)?;
-                use base64::Engine;
-                let raw =
-                    base64::engine::general_purpose::STANDARD.decode(&stored.pubkey_base64)?;
-                let key_bytes: [u8; 32] = raw.try_into().map_err(|_| anyhow!("bad key length"))?;
-                let pubkey = VerifyingKey::from_bytes(&key_bytes)?;
-                // Decode + invariant-check the PQ component (fail closed on a
-                // Hybrid record with no/empty PQ bytes — never a silent
-                // downgrade to Ed25519).
-                let pq_pubkey = match stored.pq_pubkey_base64.as_deref() {
-                    Some(b64) if !b64.is_empty() => Some(
-                        base64::engine::general_purpose::STANDARD
-                            .decode(b64)
-                            .with_context(|| format!("invalid base64 ML-DSA-65 key for {fp}"))?,
-                    ),
-                    _ => None,
-                };
-                match (stored.algorithm.is_hybrid(), &pq_pubkey) {
-                    (true, Some(_)) | (false, None) => {}
-                    (true, None) => anyhow::bail!(
-                        "hybrid pubkey record {fp} is missing its ML-DSA-65 key \
-                         material (refusing to read — fail closed)"
-                    ),
-                    (false, Some(_)) => anyhow::bail!(
-                        "classical pubkey record {fp} carries unexpected ML-DSA-65 \
-                         key material (refusing to read)"
-                    ),
-                }
+                let (stored, pubkey, pq_pubkey) = validate_stored_key_record(&fp, &s)?;
                 entries.push(PubkeyEntry {
                     fingerprint: fp,
                     pubkey,
@@ -1086,6 +1115,84 @@ mod tests {
             ),
             Err(HostedAccountProvisionError::Backend(_))
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn corrupt_algorithm_pq_metadata_never_becomes_trusted_key_conflict() -> Result<()> {
+        use base64::engine::general_purpose::STANDARD;
+        use base64::Engine;
+
+        let key = ed25519_dalek::SigningKey::from_bytes(&[0x78; 32]).verifying_key();
+        let fingerprint = pubkey_fingerprint(&key);
+        let key_base64 = STANDARD.encode(key.as_bytes());
+        let profile_json = serde_json::to_string(&UserProfile {
+            sub: Some("alice-sub".to_owned()),
+            active: Some(true),
+            atproto_did: Some("did:web:alice.accounts.example.test".to_owned()),
+            key_custody: Some(AccountKeyCustody::SelfCustody),
+            ..Default::default()
+        })?;
+        let marker_json = serde_json::to_string(&HostedBindingMarker {
+            fingerprint: fingerprint.clone(),
+            did: "did:web:alice.accounts.example.test".to_owned(),
+            custody: "self_custody".to_owned(),
+            pubkey_base64: key_base64.clone(),
+        })?;
+        let conflict_result = |algorithm: crate::auth::KeyAlgorithm,
+                               pq_pubkey_base64: Option<String>| {
+            let key_json = serde_json::to_string(&StoredKey {
+                pubkey_base64: key_base64.clone(),
+                label: Some("aegis-vault".to_owned()),
+                created_at: 1,
+                last_used_at: None,
+                algorithm,
+                pq_pubkey_base64,
+            })
+            .unwrap();
+            validate_key_conflict_snapshot(
+                &fingerprint,
+                Some("alice"),
+                true,
+                Some(&profile_json),
+                Some(&key_json),
+                Some(&marker_json),
+            )
+        };
+
+        // Hybrid tag without its mandatory ML-DSA-65 component.
+        assert!(matches!(
+            conflict_result(crate::auth::KeyAlgorithm::HybridEd25519MlDsa65, None),
+            Err(HostedAccountProvisionError::Backend(_))
+        ));
+
+        // Classical tag carrying PQ material is inconsistent and must not be
+        // treated as an authentication-usable hosted binding.
+        assert!(matches!(
+            conflict_result(
+                crate::auth::KeyAlgorithm::Ed25519,
+                Some(STANDARD.encode(vec![0x5a; 1952])),
+            ),
+            Err(HostedAccountProvisionError::Backend(_))
+        ));
+
+        // A hybrid record with malformed PQ encoding cannot be read by the
+        // ordinary authentication path, so it cannot justify a trusted 409.
+        assert!(matches!(
+            conflict_result(
+                crate::auth::KeyAlgorithm::HybridEd25519MlDsa65,
+                Some("not-base64".to_owned()),
+            ),
+            Err(HostedAccountProvisionError::Backend(_))
+        ));
+
+        // Preserve the positive side of the invariant: a complete hybrid
+        // record with the same Ed25519 anchor remains accepted.
+        assert!(conflict_result(
+            crate::auth::KeyAlgorithm::HybridEd25519MlDsa65,
+            Some(STANDARD.encode(vec![0x5a; 1952])),
+        )
+        .is_ok());
         Ok(())
     }
 
