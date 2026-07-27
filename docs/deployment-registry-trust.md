@@ -13,8 +13,11 @@ The OS-owned deployment seam is deliberately small and fail-closed:
 - `/run/hyprstream/credentials/registry-service.jwt` is the separately
   provisioned, short-lived `service:registry` credential. Its `cnf.jwk` names the
   registry key that certifies accepted `did:at9p:<cid512>` state.
+- `/etc/hyprstream/trust/deployment-authority.log.json` is the public,
+  root-anchored authority-set checkpoint required when the credential was
+  issued by a scoped delegated signer.
 
-Both files must be regular, root-owned, and not group/world writable. Missing,
+All installed files must be regular, root-owned, and not group/world writable. Missing,
 malformed, symlinked, or incorrectly owned material makes production resolver
 startup fail closed. Both JWT signature components are verified against the
 `/etc` pin before its key is represented by an opaque verification-only
@@ -175,6 +178,21 @@ optional JOSE/JWK metadata (`crit`, `use`, `key_ops`, or a JWK-local `alg` or
 token types, and a signature or key identifier that does not bind the pinned CA
 fail closed before a registry witness can be minted. The credential file is the
 compact JWT itself with no surrounding whitespace or trailing newline.
+
+The common operational form adds exactly one `delegation` claim to that closed
+claim set. It is canonical unpadded base64url JSON containing the scoped UCAN,
+the delegated 1,984-byte hybrid public key, and the stable authority-log DID.
+The separately installed current root-anchored DidOp log must have that DID,
+and the UCAN issuer must still be in its active any-of-N authority set. The
+UCAN is restricted to this deployment's registry-service mint ability, exact
+profile and audience, and the one-hour ceiling. Direct rare-root credentials
+retain the original claim set without `delegation`.
+
+This profile is deployment/registry scoped. It has no PDS or host identifier.
+The demo therefore projects one shared deployment CA and current credential to
+both PDS hosts; a per-PDS binding would require a new profile or separate roots.
+The exact mint, rotation, recovery, publisher, and Metal input contracts are in
+[`deployment-trust-contract.md`](deployment-trust-contract.md).
 
 Classical-only atproto peer keys remain supported only at the separately named
 peer/federation record-resolution surface. That P-256 interoperability path
