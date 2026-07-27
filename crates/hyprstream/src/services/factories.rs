@@ -581,35 +581,47 @@ fn create_ledger_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
         ))
     };
 
-    // Backend selection (PAY-01): PostgresLedger when postgres-ledger feature
-    // is compiled and a URL is configured; MemLedger for dev/test.
-    #[cfg(feature = "postgres-ledger")]
-    let backend: Box<dyn hyprstream_ledger::LedgerBackend + Send + 'static> =
-        if let Some(pg_url) = config.ledger_postgres_url.as_ref().filter(|u| !u.is_empty()) {
-            let pg_config = hyprstream_ledger::postgres::PostgresConfig {
-                url: pg_url.clone(),
-                pool_size: config.ledger_postgres_pool_size.unwrap_or(4),
-            };
-            let pg = hyprstream_ledger::postgres::PostgresLedger::connect(
-                pg_config,
-                cell_identity.clone(),
-            )
-            .map_err(|e| {
-                anyhow::anyhow!(
-                    "ledger: PostgresLedger::connect failed (fail-closed): {e}"
-                )
-            })?;
-            info!("Ledger backend: PostgresLedger (production durable)");
-            Box::new(pg)
-        } else {
-            info!("Ledger backend: MemLedger (no postgres URL configured — dev/test only)");
+    // Backend selection (PAY-01 F8): BackendKind drives construction.
+    // **Postgres = production (fail-closed on unavailability); Mem = dev/test.**
+    // No silent fallback — a configured Postgres backend that cannot connect
+    // is FATAL.
+    let backend: Box<dyn hyprstream_ledger::LedgerBackend + Send + 'static> = match lcfg.backend {
+        crate::services::ledger::BackendKind::Postgres => {
+            #[cfg(feature = "postgres-ledger")]
+            {
+                let pg_url = config.ledger_postgres_url.as_deref().filter(|u| !u.is_empty()).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "ledger: backend = Postgres but no ledger_postgres_url configured \
+                         (FATAL — production requires a durable backend)"
+                    )
+                })?;
+                let pg_config = hyprstream_ledger::postgres::PostgresConfig {
+                    url: pg_url.to_owned(),
+                    pool_size: config.ledger_postgres_pool_size.unwrap_or(4),
+                };
+                let pg = hyprstream_ledger::postgres::PostgresLedger::connect(
+                    pg_config,
+                    cell_identity.clone(),
+                ).map_err(|e| {
+                    anyhow::anyhow!(
+                        "ledger: PostgresLedger::connect FAILED (FATAL — no silent fallback): {e}"
+                    )
+                })?;
+                info!("Ledger backend: PostgresLedger (production durable)");
+                Box::new(pg)
+            }
+            #[cfg(not(feature = "postgres-ledger"))]
+            {
+                anyhow::bail!(
+                    "ledger: backend = Postgres but postgres-ledger feature is not compiled \
+                     (FATAL — rebuild with --features postgres-ledger for production)"
+                );
+            }
+        }
+        crate::services::ledger::BackendKind::Mem => {
+            info!("Ledger backend: MemLedger (dev/test only — all state is volatile)");
             Box::new(MemLedger::new(cell_identity.clone()))
-        };
-
-    #[cfg(not(feature = "postgres-ledger"))]
-    let backend: Box<dyn hyprstream_ledger::LedgerBackend + Send + 'static> = {
-        info!("Ledger backend: MemLedger (postgres-ledger feature not compiled)");
-        Box::new(MemLedger::new(cell_identity.clone()))
+        }
     };
 
     let verifier: Arc<dyn crate::services::ledger::GrantVerifier + Send + Sync> =

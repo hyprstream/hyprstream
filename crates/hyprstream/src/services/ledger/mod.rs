@@ -65,6 +65,12 @@ use serde::{Deserialize, Serialize};
 /// `enabled` defaults to **false**: the whole subsystem is inert until an
 /// operator opts in, so the scheduler quota path is byte-for-byte unchanged
 /// for everyone who does not set `[ledger] enabled = true`.
+///
+/// **Production activation (PAY-01 F8):** when `enabled = true` and
+/// `backend = Postgres`, the factory requires a successful Postgres connection,
+/// strict rehydration, and integrity verification. A missing/unavailable
+/// Postgres backend is **FATAL** — never silently falls back to MemLedger.
+/// MemLedger is only valid behind `backend = Mem` (explicit dev/test).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct LedgerConfig {
@@ -72,6 +78,10 @@ pub struct LedgerConfig {
     /// started and the [`CreditGate`] never gates admission — the scheduler
     /// behaves exactly as before #925.
     pub enabled: bool,
+    /// Backend selection (PAY-01 F8). **`Postgres` is production; `Mem` is
+    /// dev/test only.** When `Postgres` is selected and the connection fails,
+    /// startup is **FATAL** — no silent MemLedger fallback.
+    pub backend: BackendKind,
     /// Receipt-debt fail-closed threshold (plan §2e / Appendix A.5): if the
     /// oldest unemitted receipt has been outstanding for longer than this, the
     /// enforcer's epoch is bumped with reason `ReceiptDebt`, flipping
@@ -98,10 +108,31 @@ pub struct LedgerConfig {
     pub require_pq_signatures: bool,
 }
 
+/// Durable backend selection (PAY-01 F8).
+///
+/// `Postgres` is the only production-safe backend. `Mem` is volatile —
+/// dev/test only. The factory **never** silently substitutes one for the
+/// other: if `Postgres` is selected and unavailable, startup is FATAL.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BackendKind {
+    /// In-memory backend (MemLedger). **Dev/test only.** All state is lost
+    /// on restart. The factory refuses to start with this backend if
+    /// `enabled = true` and no explicit `dev_mode` flag is set (future:
+    /// guard via a `--dev` CLI flag or `HS_DEV=1` env var).
+    Mem,
+    /// Production durable Postgres backend (PostgresLedger). Requires a
+    /// valid `ledger_postgres_url` in HyprConfig. Connection/rehydration/
+    /// chain-verification failures are **FATAL**.
+    #[default]
+    Postgres,
+}
+
 impl Default for LedgerConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            backend: BackendKind::Postgres,
             receipt_debt_age_secs: 15 * 60,
             receipt_debt_max: 10_000,
             tick_interval_secs: 10,

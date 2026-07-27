@@ -449,39 +449,32 @@ impl PostgresLedger {
     // ─── The commit loop ───────────────────────────────────────────────────
 
     fn commit(&mut self, op: Op) -> Outcome {
-        // F4: No mirror-level idempotency pre-check — the DB is the source of
-        // truth. The DB transaction performs the outcomes-table check below.
+        // R2-F1 / R2-F2: the DB transaction is the source of truth for both
+        // idempotency AND the chain head. The mirror is a performance cache;
+        // the journal seq/prev_hash are derived from the DB head inside the
+        // locked transaction — never from the mirror.
 
-        // 1. Stage against the mirror (pure).
+        // 1. Stage against the mirror (pure). We need `staged.result` for the
+        //    journal entry and `staged.deltas` for the mirror update on the
+        //    commit path. The JournalEntry itself is NOT built here — the DB
+        //    head may differ from the mirror head (another writer committed
+        //    first), and the entry's `seq`/`prev_hash` MUST chain off the DB.
         let staged = engine::stage(self, &op);
 
-        // 2. Build journal entry + hash.
-        let seq = self.head.seq + 1;
-        let prev_hash = self.head.head_hash;
-        let entry = JournalEntry {
-            seq,
-            prev_hash,
-            ts: self.clock,
-            op: op.clone(),
-            result: staged.result.clone(),
-        };
-        let new_head_hash = match entry.hash() {
-            Ok(h) => h,
-            Err(e) => {
-                return Outcome {
-                    result: Err(e),
-                    seq: self.head.seq,
-                };
-            }
-        };
-
-        // 3. Write to DB transactionally. The DB transaction does the
-        //    idempotency check against ledger_outcomes.
         let clock = self.clock;
         let deltas = staged.deltas.clone();
         let staged_result = staged.result.clone();
         let idempotency_id = op.idempotency_id();
 
+        // 2. Write to DB transactionally. The DB transaction (a) acquires the
+        //    writer advisory lock, (b) locks + reads the authoritative head
+        //    row, (c) checks idempotency, (d) on commit builds the
+        //    JournalEntry from the DB head, inserts everything, and advances
+        //    the head. The CBOR wire format returned to the caller is a
+        //    4-tuple: `(result_cbor, seq, is_committed, new_head_hash)`.
+        //    `is_committed=false` covers both replay and ambiguous-commit
+        //    reconciliation — in neither case does the caller apply deltas or
+        //    advance its mirror head.
         let db_result: Result<Vec<u8>, LedgerError> = self.call_db(move |pool| {
             let rt = rt_new()?;
             rt.block_on(async {
@@ -491,8 +484,53 @@ impl PostgresLedger {
                     .await
                     .map_err(|e| ie(format!("begin: {e}")))?;
 
-                // F4: DB-level idempotency — check outcomes table inside the
-                // transaction. This is the authoritative check.
+                // R2-F2: serialize all writers with a transaction-scoped
+                // advisory lock. `pg_advisory_xact_lock` takes a 32-bit key;
+                // `hashtext('hs-ledger-writer')` projects the constant string
+                // into int4 deterministically. The lock auto-releases on
+                // commit/rollback.
+                tx.execute(
+                    "SELECT pg_advisory_xact_lock(hashtext('hs-ledger-writer'))",
+                    &[],
+                )
+                .await
+                .map_err(|e| ie(format!("advisory lock: {e}")))?;
+
+                // R2-F2: lock + read the authoritative head row. FOR UPDATE
+                // blocks any other writer (who also holds the advisory lock,
+                // so in practice the lock is what serializes — but the row
+                // lock is belt-and-suspenders and makes the read-fetch
+                // non-stale inside this transaction).
+                let head_row = tx
+                    .query_opt(
+                        "SELECT value FROM ledger_meta WHERE key = 'head' FOR UPDATE",
+                        &[],
+                    )
+                    .await
+                    .map_err(|e| ie(format!("head lock: {e}")))?;
+                let (db_seq, db_prev_hash): (u64, [u8; 32]) = match head_row {
+                    Some(r) => {
+                        let val: Vec<u8> = r.get(0);
+                        if val.len() < 40 {
+                            return Err(ie(format!(
+                                "head row short: {} bytes (need 40)",
+                                val.len()
+                            )));
+                        }
+                        let mut seq_arr = [0u8; 8];
+                        seq_arr.copy_from_slice(&val[..8]);
+                        let mut hash_arr = [0u8; 32];
+                        hash_arr.copy_from_slice(&val[8..40]);
+                        (u64::from_be_bytes(seq_arr), hash_arr)
+                    }
+                    None => (0u64, [0u8; 32]),
+                };
+
+                // R2-F1: DB-level idempotency check inside the locked
+                // transaction. If the transfer_id already has an outcome, this
+                // is a replay — return the stored result verbatim and do NOT
+                // insert anything. The caller learns `is_committed=false` and
+                // skips both delta application and head advancement.
                 if let Some(id) = idempotency_id {
                     let id_bytes = u128_to_bytes(id.0);
                     let row = tx
@@ -506,14 +544,30 @@ impl PostgresLedger {
                     if let Some(row) = row {
                         let result_cbor: Vec<u8> = row.get(0);
                         let seq_i: i64 = row.get(1);
-                        // Replay — return stored outcome and rollback the
-                        // empty transaction.
+                        // Replay — rollback the empty transaction and surface
+                        // the stored outcome with is_committed=false. The
+                        // new_head_hash slot is unused on replay, so zero it.
                         let _ = tx.rollback().await;
                         let mut buf = Vec::new();
-                        cbor(&(result_cbor, seq_i as u64), &mut buf)?;
+                        cbor(&(result_cbor, seq_i as u64, false, [0u8; 32]), &mut buf)?;
                         return Ok(buf);
                     }
                 }
+
+                // Build the JournalEntry from the DB head — seq/prev_hash
+                // chain off the authoritative DB state, not the mirror.
+                let seq = db_seq + 1;
+                let prev_hash = db_prev_hash;
+                let entry = JournalEntry {
+                    seq,
+                    prev_hash,
+                    ts: clock,
+                    op: op.clone(),
+                    result: staged_result.clone(),
+                };
+                let new_head_hash = entry
+                    .hash()
+                    .map_err(|e| ie(format!("entry hash: {e}")))?;
 
                 // Serialize op + persisted result for persistence.
                 // F2: PersistedResult = Result<TransferResult, LedgerError>,
@@ -659,38 +713,45 @@ impl PostgresLedger {
                     .await
                     .map_err(|e| ie(format!("commit: {e}")))?;
 
-                // Return result_cbor + seq for the caller to decode.
+                // R2-F1: tagged wire reply — is_committed=true with the fresh
+                // head hash so the caller can advance its mirror.
                 let mut buf = Vec::new();
-                cbor(&(result_cbor_buf, seq), &mut buf)?;
+                cbor(&(result_cbor_buf, seq, true, new_head_hash), &mut buf)?;
                 Ok(buf)
             })
         });
 
-        // 4. Decode the reply. On error, attempt reconciliation: the tx may
-        //    have committed but the reply was lost (ambiguous commit).
-        let (result_cbor_bytes, committed_seq) = match db_result {
-            Ok(data) => {
-                let (cbor_vec, seq): (Vec<u8>, u64) = match ciborium::from_reader(data.as_slice())
-                {
-                    Ok(v) => v,
-                    Err(e) => {
-                        return Outcome {
-                            result: Err(LedgerError::Internal(format!(
-                                "commit decode: {e}"
-                            ))),
-                            seq: self.head.seq,
-                        };
-                    }
-                };
-                (cbor_vec, seq)
-            }
+        // 3. Decode the 4-tuple wire reply. On error, attempt reconciliation:
+        //    the tx may have committed but the reply was lost (ambiguous
+        //    commit). A reconciled result has is_committed=false — the DB
+        //    already has it, the caller did not commit this time.
+        let (result_cbor_bytes, committed_seq, is_committed, new_head_hash): (
+            Vec<u8>,
+            u64,
+            bool,
+            [u8; 32],
+        ) = match db_result {
+            Ok(data) => match ciborium::from_reader(data.as_slice()) {
+                Ok(v) => v,
+                Err(e) => {
+                    return Outcome {
+                        result: Err(LedgerError::Internal(format!("commit decode: {e}"))),
+                        seq: self.head.seq,
+                    };
+                }
+            },
             Err(e) => {
                 // Ambiguous commit — reconcile from DB if this op was
                 // idempotent. If it was not idempotent, or reconciliation
                 // finds nothing, the error was real.
                 if let Some(id) = idempotency_id {
                     match self.reconcile_outcome(id) {
-                        Ok(Some((cbor_vec, seq))) => (cbor_vec, seq),
+                        Ok(Some((cbor_vec, seq))) => {
+                            // The DB already has this op — we did not commit
+                            // it on this call. is_committed=false; the
+                            // new_head_hash slot is unused.
+                            (cbor_vec, seq, false, [0u8; 32])
+                        }
                         Ok(None) => {
                             return Outcome {
                                 result: Err(e),
@@ -713,10 +774,9 @@ impl PostgresLedger {
             }
         };
 
-        // 5. Decode the persisted result.
-        let persisted: PersistedResult = match ciborium::from_reader(
-            result_cbor_bytes.as_slice(),
-        ) {
+        // 4. Decode the persisted result.
+        let persisted: PersistedResult = match ciborium::from_reader(result_cbor_bytes.as_slice())
+        {
             Ok(v) => v,
             Err(e) => {
                 return Outcome {
@@ -731,21 +791,31 @@ impl PostgresLedger {
             seq: committed_seq,
         };
 
-        // 6. Update the mirror with the staged deltas.
-        for delta in staged.deltas {
-            match delta {
-                engine::Delta::Account(a) => {
-                    self.accounts.insert(a.id, a);
-                }
-                engine::Delta::Pending(r) => {
-                    self.pending.insert(r.transfer.id, r);
+        // 5. R2-F1: ONLY apply deltas + advance the mirror head when this
+        //    call actually committed. Replays and reconciled ambiguous
+        //    commits (is_committed=false) leave the mirror untouched — the
+        //    deltas were already applied by the original commit, and applying
+        //    them again would double-state staged mutations.
+        if is_committed {
+            for delta in staged.deltas {
+                match delta {
+                    engine::Delta::Account(a) => {
+                        self.accounts.insert(a.id, a);
+                    }
+                    engine::Delta::Pending(r) => {
+                        self.pending.insert(r.transfer.id, r);
+                    }
                 }
             }
+            self.head = ChainHead {
+                seq: committed_seq,
+                head_hash: new_head_hash,
+            };
         }
-        self.head = ChainHead {
-            seq: committed_seq,
-            head_hash: new_head_hash,
-        };
+        // Always mirror the outcomes cache for idempotent ops — both commit
+        // and replay paths need this so a future in-process replay hits the
+        // cache. The cache value is the persisted outcome (verbatim on
+        // replay, freshly-computed on commit).
         if let Some(id) = idempotency_id {
             self.outcomes.insert(id, outcome.clone());
         }

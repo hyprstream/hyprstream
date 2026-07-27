@@ -4,7 +4,7 @@
 //! Contains no KYC/legal-identity fields. This is the seam definition;
 //! the Postgres impl lands with PAY-06 (Stripe integration).
 
-use hyprstream_ledger::{AccountId, Did, TransferId, UnitId};
+use hyprstream_ledger::{AccountId, TransferId};
 use hyprstream_pay::{PayError, UnitRef};
 
 /// A committed settlement row in the restricted store.

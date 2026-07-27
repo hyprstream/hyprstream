@@ -14,6 +14,21 @@
 //! 5. **Restricted credit**: the only path to `LedgerHandle::credit` is through
 //!    the [`SettlementAuthority`] sealed token (F7)
 //!
+//! ## Current status — scoped out to PAY-02
+//!
+//! This module implements the in-process trait logic (attestation verification
+//! → settlement store lookup → restricted credit) but **does NOT yet wire**:
+//! - Cap'n Proto-generated server/client bindings (build.rs + capnp deps)
+//! - iroh/QUIC RPC handler registration
+//! - `#[authorize]` scope enforcement on the RPC surface
+//! - Concrete PQ-hybrid `verify_composite` attestation verifier
+//! - Durable Postgres `SettlementStore` implementation
+//! - Pay service `#[service_factory]` registration
+//!
+//! These are explicitly **PAY-02** scope. The current module provides the
+//! verified-trait-logic skeleton that PAY-02's RPC/verifier wiring will
+//! complete.
+//!
 //! This module is AGPL (part of the `hyprstream` crate). The protocol surface
 //! (`hyprstream-pay`) is MIT.
 
@@ -28,7 +43,7 @@ pub use tariff::StaticTariffProvider;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use hyprstream_ledger::{IssueTransfer, TransferId};
+use hyprstream_ledger::IssueTransfer;
 use hyprstream_pay::{IssueRequest, IssueResponse, PayError, SettlementIssuer};
 
 use super::ledger::{LedgerHandle, SettlementAuthority};
@@ -98,7 +113,13 @@ impl SettlementIssuer for SettlementIssuerService {
         let amount = row.amount_minor;
         let grant_cid = row.grant_cid.clone();
 
-        // 4. Construct the internal IssueTransfer and call the restricted
+        // 4. Mark settlement as issuance-pending BEFORE attempting the credit.
+        //    R2-F8: persist settlement state transitions with recovery semantics.
+        self.store
+            .mark_issuance_pending(&req.settlement_id, transfer_id)
+            .await?;
+
+        // 5. Construct the internal IssueTransfer and call the restricted
         //    credit path (F7: only SettlementAuthority can do this).
         let issue = IssueTransfer {
             id: transfer_id,
@@ -109,11 +130,18 @@ impl SettlementIssuer for SettlementIssuerService {
                 resource_class: unit.resource_class,
             },
             amount,
-            grant_cid: grant_cid.map(|b| hyprstream_ledger::Cid(b)),
+            grant_cid: grant_cid.map(hyprstream_ledger::Cid),
             user_data: [0u8; 32], // correlation: settlement_id hash
         };
 
         let outcome = self.handle.credit(&self.auth, issue).await;
+
+        // 6. If issuance succeeded, mark the settlement as issued.
+        if outcome.is_ok() {
+            self.store
+                .mark_issued(&req.settlement_id)
+                .await?;
+        }
 
         Ok(IssueResponse {
             transfer_id_lo: (transfer_id.0 & u64::MAX as u128) as u64,
@@ -132,12 +160,21 @@ impl SettlementIssuer for SettlementIssuerService {
             .ok_or_else(|| PayError::SettlementNotFound(settlement_id.to_owned()))?;
 
         let transfer_id = row.derive_transfer_id();
+
+        // R2-F8: report success ONLY if the settlement has actually been issued
+        // (not merely committed). A committed-but-not-issued settlement is
+        // NOT success — it means issuance has not completed yet.
+        let is_issued = matches!(
+            row.state,
+            crate::services::pay::settlement_store::SettlementState::Issued
+        );
+
         Ok(IssueResponse {
             transfer_id_lo: (transfer_id.0 & u64::MAX as u128) as u64,
             transfer_id_hi: (transfer_id.0 >> 64) as u64,
-            outcome_seq: 0, // TODO: query the ledger for the outcome seq
-            ok: row.is_committed(),
-            error: if row.is_committed() {
+            outcome_seq: 0, // TODO(PAY-02): query the ledger outcome for this transfer_id
+            ok: is_issued,
+            error: if is_issued {
                 None
             } else {
                 Some(row.state_label())
