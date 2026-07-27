@@ -689,11 +689,8 @@ return 0
         Ok(true)
     }
 
-    async fn list_users(&self) -> Vec<String> {
-        self.pool
-            .smembers::<Vec<String>, _>("hs:users")
-            .await
-            .unwrap_or_default()
+    async fn list_users(&self) -> Result<Vec<String>> {
+        Ok(self.pool.smembers::<Vec<String>, _>("hs:users").await?)
     }
 
     async fn search(&self, filter: &UserFilter) -> Result<Vec<(String, UserProfile)>> {

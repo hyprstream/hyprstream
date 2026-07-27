@@ -82,7 +82,7 @@ pub async fn handle_user_register(credentials_dir: &Path, username: &str) -> Res
 /// Handle `user list`
 pub async fn handle_user_list(credentials_dir: &Path) -> Result<()> {
     let store = open_store(credentials_dir)?;
-    let mut users = store.list_users().await;
+    let mut users = store.list_users().await?;
     if users.is_empty() {
         println!("No users registered.");
     } else {

@@ -303,8 +303,8 @@ mod tests {
             anyhow::bail!("not used")
         }
 
-        async fn list_users(&self) -> Vec<String> {
-            Vec::new()
+        async fn list_users(&self) -> anyhow::Result<Vec<String>> {
+            Ok(Vec::new())
         }
 
         async fn search(

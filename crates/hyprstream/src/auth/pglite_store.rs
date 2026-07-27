@@ -4,8 +4,8 @@
 //! embedded database.  Server PostgreSQL can use the same schema/repository.
 
 use super::{
-    HostedAccountProvision, HostedAccountProvisionResult, PubkeyEntry, UserFilter, UserProfile,
-    UserProfilePatch, UserStore,
+    AccountKeyCustody, ExternalIdentityResolution, HostedAccountProvisionError,
+    HostedAccountProvisioning, PubkeyEntry, UserFilter, UserProfile, UserProfilePatch, UserStore,
 };
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -16,25 +16,49 @@ use uuid::Uuid;
 
 pub const USERSTORE_SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS users (
- username TEXT PRIMARY KEY, sub TEXT NOT NULL UNIQUE, profile BYTEA NOT NULL,
- active BOOLEAN NOT NULL DEFAULT TRUE, created_at TIMESTAMPTZ NOT NULL DEFAULT now(), updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    username TEXT PRIMARY KEY CHECK (username <> ''),
+    sub TEXT NOT NULL UNIQUE CHECK (sub <> ''),
+    name BYTEA,
+    email BYTEA,
+    email_verified BOOLEAN,
+    active BOOLEAN NOT NULL DEFAULT TRUE,
+    external_id BYTEA,
+    key_custody TEXT
+        CHECK (key_custody IS NULL OR key_custody IN ('self_custody', 'managed')),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE TABLE IF NOT EXISTS user_did_bindings (
- username TEXT PRIMARY KEY REFERENCES users(username) ON DELETE CASCADE,
- atproto_did TEXT NOT NULL UNIQUE
+    username TEXT PRIMARY KEY REFERENCES users(username) ON DELETE CASCADE,
+    atproto_did TEXT NOT NULL UNIQUE CHECK (atproto_did <> '')
 );
 CREATE TABLE IF NOT EXISTS oidc_bindings (
- issuer TEXT NOT NULL, issuer_sub TEXT NOT NULL,
- username TEXT NOT NULL REFERENCES users(username) ON DELETE CASCADE,
- PRIMARY KEY (issuer, issuer_sub), UNIQUE (issuer, username)
+    issuer TEXT NOT NULL CHECK (issuer <> ''),
+    issuer_sub TEXT NOT NULL CHECK (issuer_sub <> ''),
+    username TEXT NOT NULL REFERENCES users(username) ON DELETE CASCADE,
+    PRIMARY KEY (issuer, issuer_sub),
+    UNIQUE (issuer, username)
 );
 CREATE TABLE IF NOT EXISTS pubkeys (
- fingerprint TEXT PRIMARY KEY, username TEXT NOT NULL REFERENCES users(username) ON DELETE CASCADE,
- pubkey BYTEA NOT NULL, label BYTEA, algorithm TEXT NOT NULL DEFAULT 'ed25519', pq_pubkey BYTEA,
- created_at BIGINT NOT NULL, last_used_at BIGINT,
- CHECK ((algorithm = 'ed25519') = (pq_pubkey IS NULL))
+    fingerprint TEXT PRIMARY KEY CHECK (fingerprint <> ''),
+    username TEXT NOT NULL REFERENCES users(username) ON DELETE CASCADE,
+    pubkey BYTEA NOT NULL CHECK (octet_length(pubkey) = 32),
+    label BYTEA,
+    algorithm TEXT NOT NULL DEFAULT 'ed25519'
+        CHECK (algorithm IN ('ed25519', 'ed25519+ml-dsa-65')),
+    pq_pubkey BYTEA,
+    created_at BIGINT NOT NULL,
+    last_used_at BIGINT,
+    CHECK (
+        (algorithm = 'ed25519' AND pq_pubkey IS NULL)
+        OR
+        (algorithm = 'ed25519+ml-dsa-65'
+            AND pq_pubkey IS NOT NULL
+            AND octet_length(pq_pubkey) = 1952)
+    )
 );
 CREATE INDEX IF NOT EXISTS pubkeys_username_idx ON pubkeys(username);
+CREATE INDEX IF NOT EXISTS oidc_bindings_username_idx ON oidc_bindings(username);
 "#;
 
 #[derive(Clone)]
@@ -59,9 +83,10 @@ impl PgliteUserStore {
     }
 }
 
-fn blob<T: serde::Serialize>(v: &T) -> Result<Vec<u8>> {
-    Ok(serde_json::to_vec(v)?)
+fn blob<T: serde::Serialize>(value: &T) -> Result<Vec<u8>> {
+    Ok(serde_json::to_vec(value)?)
 }
+
 fn decode_profile(row: &Row) -> Result<UserProfile> {
     let bytes = row.get::<Vec<u8>>(0)?;
     Ok(serde_json::from_slice(&bytes)?)
@@ -71,32 +96,35 @@ fn decode_profile(row: &Row) -> Result<UserProfile> {
 impl UserStore for PgliteUserStore {
     async fn provision_hosted_account(
         &self,
-        request: HostedAccountProvision,
-    ) -> Result<HostedAccountProvisionResult> {
-        let tx = self.database.transaction().await?;
-        let existing = tx.query("SELECT username, sub FROM users WHERE username=$1 OR sub=$2", &[&request.username, &request.sub]).await?;
-        if !existing.is_empty() {
-            let same = existing.iter().any(|r| r.get::<String>(0).ok().as_deref() == Some(&request.username) && r.get::<String>(1).ok().as_deref() == Some(&request.sub));
-            if same { tx.commit().await?; return Ok(HostedAccountProvisionResult::Resumed); }
-            tx.rollback().await?;
-            anyhow::bail!("hosted account conflict is not an exact trusted match")
-        }
-        let profile = UserProfile { sub: Some(request.sub.clone()), atproto_did: Some(request.atproto_did.clone()), active: Some(false), ..Default::default() };
-        let bytes = blob(&profile)?;
-        tx.query("INSERT INTO users(username,sub,profile,active) VALUES($1,$2,$3,FALSE)", &[&request.username, &request.sub, &bytes]).await?;
-        tx.query("INSERT INTO user_did_bindings(username,atproto_did) VALUES($1,$2)", &[&request.username, &request.atproto_did]).await?;
-        tx.query("INSERT INTO pubkeys(fingerprint,username,pubkey,pq_pubkey,algorithm,created_at) VALUES($1,$2,$3,$4,$5,$6)", &[&request.fingerprint, &request.username, &request.pubkey, &request.pq_pubkey, &if request.pq_pubkey.is_some() { "ed25519+ml-dsa-65" } else { "ed25519" }, &chrono::Utc::now().timestamp()]).await?;
-        tx.commit().await?;
-        Ok(HostedAccountProvisionResult::Provisioned)
+        _username: &str,
+        _atproto_did: &str,
+        _pubkey: VerifyingKey,
+        _custody: AccountKeyCustody,
+    ) -> std::result::Result<HostedAccountProvisioning, HostedAccountProvisionError> {
+        Err(HostedAccountProvisionError::Backend(anyhow::anyhow!(
+            "PGlite hosted-account repository implementation is pending"
+        )))
     }
-    async fn bind_external_idp(&self, issuer: &str, issuer_subject: &str, username: &str) -> Result<()> {
-        let tx = self.database.transaction().await?;
-        tx.query("INSERT INTO oidc_bindings(issuer,issuer_sub,username) VALUES($1,$2,$3)", &[&issuer,&issuer_subject,&username]).await?;
-        tx.commit().await?; Ok(())
+
+    async fn activate_hosted_account(
+        &self,
+        _username: &str,
+        _atproto_did: &str,
+        _fingerprint: &str,
+        _custody: AccountKeyCustody,
+    ) -> std::result::Result<(), HostedAccountProvisionError> {
+        Err(HostedAccountProvisionError::Backend(anyhow::anyhow!(
+            "PGlite hosted-account repository implementation is pending"
+        )))
     }
-    async fn resolve_external_idp(&self, issuer: &str, issuer_subject: &str) -> Result<Option<String>> {
-        let rows=self.database.query("SELECT username FROM oidc_bindings WHERE issuer=$1 AND issuer_sub=$2", &[&issuer,&issuer_subject]).await?;
-        rows.first().map(|r| r.get::<String>(0)).transpose().map_err(Into::into)
+
+    async fn resolve_or_bind_external_idp(
+        &self,
+        _issuer: &str,
+        _subject: &str,
+        _username: &str,
+    ) -> Result<ExternalIdentityResolution> {
+        anyhow::bail!("PGlite external IdP repository implementation is pending")
     }
     async fn get_profile(&self, username: &str) -> Result<Option<UserProfile>> {
         let rows = self
@@ -151,14 +179,14 @@ impl UserStore for PgliteUserStore {
             .await?;
         Ok(!rows.is_empty())
     }
-    async fn list_users(&self) -> Vec<String> {
-        self.database
+    async fn list_users(&self) -> Result<Vec<String>> {
+        Ok(self
+            .database
             .query("SELECT username FROM users ORDER BY username", &[])
-            .await
-            .unwrap_or_default()
+            .await?
             .iter()
-            .filter_map(|r| r.get::<String>(0).ok())
-            .collect()
+            .map(|row| row.get::<String>(0).map_err(Into::into))
+            .collect::<Result<Vec<_>>>()?)
     }
     async fn search(&self, _filter: &UserFilter) -> Result<Vec<(String, UserProfile)>> {
         let rows = self

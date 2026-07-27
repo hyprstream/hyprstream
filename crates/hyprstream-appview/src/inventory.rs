@@ -113,9 +113,16 @@ pub struct PGliteIdentityInventory {
 impl PGliteIdentityInventory {
     /// Open the embedded Postgres data directory and apply the idempotent schema.
     pub async fn open(data_dir: impl AsRef<Path>) -> Result<Self> {
-        let database = PGlite::open(data_dir)
-            .await
-            .context("opening AppView PGlite database")?;
+        let database = Arc::new(
+            PGlite::open(data_dir)
+                .await
+                .context("opening AppView PGlite database")?,
+        );
+        Self::from_database(database).await
+    }
+
+    /// Apply the inventory schema to an already-open shared PGlite handle.
+    pub async fn from_database(database: Arc<PGlite>) -> Result<Self> {
         let schema = CREATE_SCHEMA_TEMPLATE.replace(
             "__UNAUTHENTICATED_DID_SENTINEL__",
             UNAUTHENTICATED_DID_SENTINEL,
@@ -124,9 +131,12 @@ impl PGliteIdentityInventory {
             .exec(&schema)
             .await
             .context("creating AppView inventory schema")?;
-        Ok(Self {
-            database: Arc::new(database),
-        })
+        Ok(Self { database })
+    }
+
+    /// Return the shared embedded Postgres handle for sibling repositories.
+    pub fn database(&self) -> Arc<PGlite> {
+        Arc::clone(&self.database)
     }
 
     async fn visible_rows(

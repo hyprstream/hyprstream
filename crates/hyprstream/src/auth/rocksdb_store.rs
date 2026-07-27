@@ -652,19 +652,16 @@ impl UserStore for RocksDbUserStore {
         }
     }
 
-    async fn list_users(&self) -> Vec<String> {
+    async fn list_users(&self) -> Result<Vec<String>> {
         let mut users = Vec::new();
         let iter = self.db.prefix_iterator(USER_PREFIX);
         for item in iter {
-            let (key, _) = match item {
-                Ok(kv) => kv,
-                Err(_) => continue,
-            };
+            let (key, _) = item?;
             if let Some(username) = strip_user_prefix(&key) {
                 users.push(username.to_owned());
             }
         }
-        users
+        Ok(users)
     }
 
     async fn search(&self, filter: &UserFilter) -> Result<Vec<(String, UserProfile)>> {
@@ -1049,7 +1046,7 @@ mod tests {
         let store = make_store(dir.path());
         store.register("alice").await?;
         store.register("bob").await?;
-        let mut users = store.list_users().await;
+        let mut users = store.list_users().await?;
         users.sort();
         assert_eq!(users, vec!["alice", "bob"]);
         Ok(())
@@ -1546,7 +1543,7 @@ mod tests {
             store.register("bob").await?;
         }
         let store2 = RocksDbUserStore::open(dir.path())?;
-        let mut users = store2.list_users().await;
+        let mut users = store2.list_users().await?;
         users.sort();
         assert_eq!(users, vec!["alice", "bob"]);
 

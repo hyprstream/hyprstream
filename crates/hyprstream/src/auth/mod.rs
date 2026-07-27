@@ -50,8 +50,8 @@ pub use rocksdb_store::RocksDbUserStore;
 pub use user_store::{
     decode_pubkey_base64, pubkey_fingerprint, AccountKeyCustody, DeviceRecord, DeviceStore,
     ExternalIdentityBinding, ExternalIdentityResolution, HostedAccountProvisionError,
-    HostedAccountProvisioning, KeyAlgorithm, PubkeyEntry, UserFilter, UserProfile, UserProfilePatch,
-    UserStore,
+    HostedAccountProvisioning, KeyAlgorithm, PubkeyEntry, UserFilter, UserProfile,
+    UserProfilePatch, UserStore,
 };
 #[cfg(feature = "valkey")]
 pub use valkey::ValkeyUserStore;
