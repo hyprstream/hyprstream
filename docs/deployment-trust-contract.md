@@ -18,8 +18,8 @@ validating them through `hyprstream trust verify-deployment`:
 | Authority head checkpoint | `/etc/hyprstream/trust/deployment-authority.head.json` | Independently provisioned `hyprstream.deployment-authority-checkpoint.v1` JSON containing the expected domain, log DID, sequence, and head CID |
 | Registry credential | `/run/hyprstream/credentials/registry-service.jwt` | Compact hybrid JWT with no whitespace or newline, profile `hyprstream.registry-deployment.v1`, audience `urn:hyprstream:service:registry`, lifetime at most 3,600 seconds |
 
-Every file and parent directory is a regular root-owned OS path and must not be
-group/world writable. The verifier requires the log and checkpoint for
+Every fixed-path file and parent directory is a regular root-owned OS path and
+must not be group/world writable. The verifier requires the log and checkpoint for
 direct-root and delegated credentials alike. A supplied log is accepted only
 when its verified DID, sequence, and head CID exactly equal the independently
 provisioned checkpoint; a signature-valid historical prefix therefore cannot
@@ -28,6 +28,27 @@ checkpointed any-of-N active authority set. Replacing/removing an authority
 revokes both its direct credentials and delegations without changing the
 original 1,984-byte root pin. Logless genesis validation is a separately named,
 one-time tooling mode and is never inferred from a missing production file.
+
+For rootless development and `systemd --user`, the daemon also supports the
+explicit loader contract below:
+
+```text
+HYPRSTREAM_DEPLOYMENT_TRUST_DIR=/absolute/trust/directory
+CREDENTIALS_DIRECTORY=/absolute/systemd/credentials/directory
+```
+
+The trust directory supplies `deployment-ca.hybrid`,
+`deployment-authority.log.json`, and `deployment-authority.head.json`.
+`CREDENTIALS_DIRECTORY` supplies `registry-service.jwt`. Each variable controls
+only its named side of the split; an absent variable falls back to the fixed
+path in the table, while an invalid present value fails startup without
+fallback. User-service paths require real, non-group/world-writable files and
+ancestors owned by root or the daemon's effective user, and symlinks are
+rejected.
+
+This is path and ownership resolution only. It does not add a genesis mode or
+relax the 1,984-byte hybrid CA, exact checkpoint/log binding, JWT profile,
+audience, freshness, claim-shape, delegation, or hybrid-signature checks.
 
 ## Metal #38 input schema
 

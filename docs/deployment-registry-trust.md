@@ -1,9 +1,10 @@
 # Deployment registry trust provisioning
 
 Production Discovery/PDS authority is rooted before commands, factories, plugins,
-or generated clients run. The executable does not consult
-`CREDENTIALS_DIRECTORY`, XDG/user configuration, `HYPRSTREAM__SECRETS__PATH`, a
-public setter, or a caller-provided path for this authority.
+or generated clients run. The executable consults only the explicit deployment
+trust sources described below. It does not consult XDG/user configuration,
+`HYPRSTREAM__SECRETS__PATH`, a public setter, or an arbitrary caller-provided
+file path for this authority.
 
 The OS-owned deployment seam is deliberately small and fail-closed:
 
@@ -19,21 +20,49 @@ The OS-owned deployment seam is deliberately small and fail-closed:
   provisioned expected log head: schema, deployment domain, log DID, sequence,
   and head CID. The supplied log must match it exactly.
 
-All installed files must be regular, root-owned, and not group/world writable. Missing,
-malformed, symlinked, or incorrectly owned material makes production resolver
-startup fail closed. Missing log or checkpoint never selects a less restrictive
-verifier. Both JWT signature components are verified against the checkpointed
-active authority before its key is represented by an opaque verification-only
-capability. The raw keys and one-shot witness are not exposed through the
-public service or Discovery APIs.
+By default, all installed files and parent directories must be real,
+root-owned paths and not group/world writable. Missing, malformed, symlinked,
+or incorrectly owned material makes production resolver startup fail closed.
+Missing log or checkpoint never selects a less restrictive verifier. Both JWT
+signature components are verified against the checkpointed active authority
+before its key is represented by an opaque verification-only capability. The
+raw keys and one-shot witness are not exposed through the public service or
+Discovery APIs.
 
 The repository does not yet contain an operator enrollment protocol. Deployments
 using this OS-owned source must therefore provision the `/etc` pin through their
 OS image, configuration manager, measured-boot policy, or equivalent root-owned
 mechanism, and project the registry JWT into the fixed `/run` location before
-starting hyprstream. User-mode service-manager installations that cannot provide
-these fixed OS-owned files are intentionally not production-authoritative and
-fail closed; ambient credential-directory fallback is not supported.
+starting hyprstream.
+
+## Explicit user-service trust paths
+
+A rootless service may select a complete public trust directory with:
+
+```text
+HYPRSTREAM_DEPLOYMENT_TRUST_DIR=/absolute/path/to/trust
+```
+
+That directory must contain exactly the same named public artifacts:
+`deployment-ca.hybrid`, `deployment-authority.log.json`, and
+`deployment-authority.head.json`. The registry JWT is independently resolved
+from systemd's absolute `$CREDENTIALS_DIRECTORY` as
+`$CREDENTIALS_DIRECTORY/registry-service.jwt`. Either variable being present
+but empty, relative, or containing `..` components is a startup error; it
+never falls back to a fixed path. When a variable is absent, only its fixed
+root-owned path is used.
+
+Explicit user-service artifacts and every real ancestor must be owned by root
+or the daemon's effective user and must not be group/world writable. Symlinks
+are rejected and the final file is opened with `O_NOFOLLOW`. This mode trusts
+the service account to provision its own development trust inputs; it does not
+turn XDG or general secret directories into authority.
+
+Path selection changes no cryptographic rule. The CA is still exactly the
+mandatory 1,984-byte Ed25519 + ML-DSA-65 pair; the authority log must still
+match the independent checkpoint exactly; and the registry JWT still passes
+the closed profile, audience, shape, lifetime, currentness, delegation, and
+both-signature checks. Any incomplete or invalid selected set fails startup.
 
 The CA authenticates the registry credential. The registry key in that credential
 then certifies the purpose-derived audit key used by accepted-state envelopes and
