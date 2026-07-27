@@ -942,11 +942,15 @@ async fn resolve_authorize_query(
     })
 }
 
-/// Generate a fresh nonce and record it in `pending_nonces` with a 5-min expiry.
-async fn issue_nonce(state: &OAuthState) -> String {
+fn fresh_nonce() -> String {
     let mut nonce_bytes = [0u8; 32];
     rand::rngs::OsRng.fill_bytes(&mut nonce_bytes);
-    let nonce = URL_SAFE_NO_PAD.encode(nonce_bytes);
+    URL_SAFE_NO_PAD.encode(nonce_bytes)
+}
+
+/// Generate a fresh nonce and record it in `pending_nonces` with a 5-min expiry.
+async fn issue_nonce(state: &OAuthState) -> String {
+    let nonce = fresh_nonce();
     let expiry = Instant::now() + Duration::from_secs(300);
     state
         .pending_nonces
@@ -1270,20 +1274,22 @@ mod tests {
 
     #[test]
     fn signup_proof_challenge_is_domain_separated_and_transaction_bound() {
+        let authorize_nonce = fresh_nonce();
+        let other_nonce = fresh_nonce();
         let challenge =
-            signup_proof_challenge("alice", "SHA256:key", "authorize-nonce", "pkce-challenge");
+            signup_proof_challenge("alice", "SHA256:key", &authorize_nonce, "pkce-challenge");
         assert!(challenge.starts_with(SIGNUP_PROOF_DOMAIN));
         assert_ne!(
             challenge,
-            signup_proof_challenge("bob", "SHA256:key", "authorize-nonce", "pkce-challenge")
+            signup_proof_challenge("bob", "SHA256:key", &authorize_nonce, "pkce-challenge")
         );
         assert_ne!(
             challenge,
-            signup_proof_challenge("alice", "SHA256:key", "other-nonce", "pkce-challenge")
+            signup_proof_challenge("alice", "SHA256:key", &other_nonce, "pkce-challenge")
         );
         assert_ne!(
             challenge,
-            signup_proof_challenge("alice", "SHA256:key", "authorize-nonce", "other-pkce")
+            signup_proof_challenge("alice", "SHA256:key", &authorize_nonce, "other-pkce")
         );
     }
 
@@ -1421,7 +1427,7 @@ mod tests {
             },
         );
 
-        let nonce = "signup-authorize-nonce".to_owned();
+        let nonce = fresh_nonce();
         let code_challenge = "signup-pkce-challenge".to_owned();
         let request = AuthorizeParams {
             client_id: "signup-client".to_owned(),
