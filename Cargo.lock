@@ -6852,6 +6852,7 @@ dependencies = [
  "opentelemetry_sdk",
  "p256",
  "parking_lot 0.12.4",
+ "pglite-rs",
  "proptest",
  "prost 0.13.5",
  "psl",

@@ -241,6 +241,18 @@ pub struct UserFilter {
     pub sort_order: Option<String>,
 }
 
+/// Durable result of atomically resolving or binding an external IdP identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExternalIdentityResolution {
+    /// The authoritative local username. This can differ from the candidate
+    /// when `(issuer, subject)` was already bound.
+    pub username: String,
+    /// Stable local OIDC subject.
+    pub sub: String,
+    /// True only when this transaction created the local user.
+    pub provisioned: bool,
+}
+
 /// Abstraction over user credential stores.
 ///
 /// Supports profile CRUD and multi-pubkey management (like GitHub SSH keys).
@@ -253,6 +265,22 @@ pub trait UserStore: Send + Sync {
 
     /// Register a new user. Returns the generated subject UUID.
     async fn register(&self, username: &str) -> Result<String>;
+
+    /// Atomically resolve an existing external identity or bind it to the
+    /// candidate username. If the candidate does not exist, the same
+    /// transaction creates its active local profile and stable subject.
+    ///
+    /// Existing `(issuer, subject)` bindings are authoritative and are never
+    /// rebound to the candidate. Empty identifiers, dangling references, and
+    /// non-exact uniqueness races must fail closed.
+    async fn resolve_or_bind_external_idp(
+        &self,
+        _issuer: &str,
+        _subject: &str,
+        _username: &str,
+    ) -> Result<ExternalIdentityResolution> {
+        anyhow::bail!("external IdP binding is unsupported by this credential store")
+    }
 
     /// Atomically create a hosted AS account and its first authentication key.
     ///
@@ -299,7 +327,7 @@ pub trait UserStore: Send + Sync {
     async fn remove(&self, username: &str) -> Result<bool>;
 
     /// List all registered usernames.
-    async fn list_users(&self) -> Vec<String>;
+    async fn list_users(&self) -> Result<Vec<String>>;
 
     /// Search users with SCIM-aligned filtering, sorting, and pagination.
     async fn search(&self, filter: &UserFilter) -> Result<Vec<(String, UserProfile)>>;
@@ -376,7 +404,7 @@ pub trait UserStore: Send + Sync {
             anyhow::bail!("external identity issuer and subject must be non-empty");
         }
         let mut match_user = None;
-        for username in self.list_users().await {
+        for username in self.list_users().await? {
             let Some(profile) = self.get_profile(&username).await? else {
                 continue;
             };

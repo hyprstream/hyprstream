@@ -25,6 +25,7 @@ path = "src/bin/main.rs"
 [dependencies]
 # Arrow and DataFusion dependencies removed - focused on ML inference only
 bytes.workspace = true
+pglite-rs = { workspace = true, optional = true }
 futures.workspace = true
 tokio.workspace = true
 tonic.workspace = true
@@ -220,6 +221,7 @@ opentelemetry-stdout = { workspace = true, optional = true }
 default = ["gittorrent", "xet", "systemd", "otel", "kata-vm", "nspawn"]
 cuda = []
 valkey = ["dep:fred"]  # Enable Valkey/Redis-backed user and token stores
+pglite = ["dep:pglite-rs"]
 bnb = ["dep:bitsandbytes-sys"]  # Enable bitsandbytes KV cache quantization (requires compatible ROCm/CUDA)
 xet = ["git2db/xet-storage"]  # Enable XET large file storage
 # NOTE: plain dependency names (not `dep:`) — cargo rejects `dep:` references
