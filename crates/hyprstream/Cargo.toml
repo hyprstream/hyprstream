@@ -26,6 +26,7 @@ path = "src/bin/main.rs"
 # Arrow and DataFusion dependencies removed - focused on ML inference only
 bytes.workspace = true
 pglite-rs = { workspace = true, optional = true }
+aes-gcm-siv.workspace = true             # At-rest UserStore envelope encryption (#1377)
 futures.workspace = true
 tokio.workspace = true
 tonic.workspace = true
