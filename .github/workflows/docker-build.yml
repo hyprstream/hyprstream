@@ -20,7 +20,46 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  verify-source:
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+    steps:
+    - name: Verify protected-main Rust gate
+      if: github.ref == 'refs/heads/main'
+      env:
+        EXPECTED_SHA: ${{ github.sha }}
+        GH_TOKEN: ${{ github.token }}
+        REPOSITORY: ${{ github.repository }}
+      run: |
+        set -euo pipefail
+        runs="$(
+          gh api \
+            "repos/${REPOSITORY}/actions/runs?head_sha=${EXPECTED_SHA}&event=merge_group&per_page=100"
+        )"
+        matches="$(
+          jq \
+            --arg sha "$EXPECTED_SHA" \
+            '[
+              .workflow_runs[] |
+              select(
+                .name == "Rust" and
+                .path == ".github/workflows/rust.yml" and
+                .event == "merge_group" and
+                .head_sha == $sha and
+                .conclusion == "success"
+              )
+            ] | length' \
+            <<< "$runs"
+        )"
+        if [ "$matches" -lt 1 ]; then
+          echo "::error::refusing to publish ${EXPECTED_SHA}: no successful Rust merge-group gate found"
+          exit 1
+        fi
+
   build-docker:
+    needs: verify-source
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -168,6 +207,7 @@ jobs:
   # Graviton runner. Only pushes to this repository's protected main branch or
   # version tags can schedule it; pull requests and fork branches cannot.
   build-docker-arm64:
+    needs: verify-source
     runs-on: [self-hosted, linux, arm64, graviton, hyprstream-merge-gate]
     # Fleet reaper hard-kills Graviton instances at 150 min from LAUNCH (not
     # job start); rust.yml uses 140 for the same reason. Stay below the cap so
