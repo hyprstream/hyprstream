@@ -1553,23 +1553,31 @@ fn preflight_outputs<'a>(paths: impl IntoIterator<Item = &'a PathBuf>, force: bo
             "duplicate output path {}",
             path.display()
         );
-        if path.exists() && !force {
-            bail!(
-                "refusing to replace existing output {} without --force",
-                path.display()
-            );
-        }
-        if let Ok(metadata) = std::fs::symlink_metadata(path) {
-            ensure!(
-                metadata.file_type().is_file() && !metadata.file_type().is_symlink(),
-                "refusing non-regular or symlink output target {}",
-                path.display()
-            );
+        match std::fs::symlink_metadata(path) {
+            Ok(metadata) => {
+                ensure!(
+                    force,
+                    "refusing to replace existing output {} without --force",
+                    path.display()
+                );
+                ensure!(
+                    metadata.file_type().is_file() && !metadata.file_type().is_symlink(),
+                    "refusing non-regular or symlink output target {}",
+                    path.display()
+                );
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("inspect output target {}", path.display()));
+            }
         }
         let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        let parent_metadata = std::fs::metadata(parent)
+            .with_context(|| format!("inspect output parent {}", parent.display()))?;
         ensure!(
-            parent.is_dir(),
-            "output parent does not exist: {}",
+            parent_metadata.is_dir(),
+            "output parent is not a directory: {}",
             parent.display()
         );
     }
@@ -1607,7 +1615,9 @@ enum CommitOperation {
     StageWrite(usize),
     StageSync(usize),
     StageKeep(usize),
+    BackupMetadata(usize),
     BackupCreate(usize),
+    BackupPlaceholderKeep(usize),
     BackupPlaceholderRemove(usize),
     BackupRename(usize),
     BackupParentsSync,
@@ -1654,6 +1664,28 @@ fn commit_outputs(outputs: Vec<PendingOutput<'_>>) -> Result<()> {
     commit_outputs_with_faults(outputs, &mut CommitFaultInjector::default())
 }
 
+fn destination_exists_for_backup(
+    output: &PendingOutput<'_>,
+    index: usize,
+    faults: &mut CommitFaultInjector,
+) -> Result<bool> {
+    faults.check(CommitOperation::BackupMetadata(index))?;
+    match std::fs::symlink_metadata(output.path) {
+        Ok(metadata) => {
+            ensure!(
+                metadata.file_type().is_file() && !metadata.file_type().is_symlink(),
+                "refusing non-regular or symlink output target {}",
+                output.path.display()
+            );
+            Ok(true)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => {
+            Err(error).with_context(|| format!("inspect output target {}", output.path.display()))
+        }
+    }
+}
+
 fn commit_outputs_with_faults(
     outputs: Vec<PendingOutput<'_>>,
     faults: &mut CommitFaultInjector,
@@ -1691,7 +1723,18 @@ fn commit_outputs_with_faults(
 
     let mut backups: Vec<Option<PathBuf>> = vec![None; outputs.len()];
     for (index, output) in outputs.iter().enumerate() {
-        if output.path.exists() {
+        let destination_exists = match destination_exists_for_backup(output, index, faults) {
+            Ok(exists) => exists,
+            Err(error) => {
+                return Err(transaction_failure(
+                    error,
+                    format!("inspect existing {}", output.path.display()),
+                    restore_outputs(&outputs, &backups, 0, faults),
+                    cleanup_paths(&staged, faults),
+                ));
+            }
+        };
+        if destination_exists {
             let parent = output.path.parent().unwrap_or_else(|| Path::new("."));
             let backup = (|| -> Result<PathBuf> {
                 faults.check(CommitOperation::BackupCreate(index))?;
@@ -1699,11 +1742,23 @@ fn commit_outputs_with_faults(
                     .prefix(".hyprstream-backup-")
                     .tempfile_in(parent)
                     .with_context(|| format!("stage backup for {}", output.path.display()))?;
-                let backup = placeholder.path().to_path_buf();
-                faults.check(CommitOperation::BackupPlaceholderRemove(index))?;
-                placeholder.close().with_context(|| {
-                    format!("release backup placeholder for {}", output.path.display())
+                faults.check(CommitOperation::BackupPlaceholderKeep(index))?;
+                let (_file, backup) = placeholder.keep().with_context(|| {
+                    format!("retain backup placeholder for {}", output.path.display())
                 })?;
+                let removal = faults
+                    .check(CommitOperation::BackupPlaceholderRemove(index))
+                    .and_then(|()| {
+                        std::fs::remove_file(&backup).with_context(|| {
+                            format!("remove backup placeholder {}", backup.display())
+                        })
+                    });
+                if let Err(error) = removal {
+                    bail!(
+                        "backup placeholder removal failed; preserved empty recovery marker at {}: {error:#}",
+                        backup.display()
+                    );
+                }
                 Ok(backup)
             })();
             let backup = match backup {
@@ -1864,15 +1919,15 @@ fn restore_outputs(
 fn cleanup_paths(paths: &[PathBuf], faults: &mut CommitFaultInjector) -> Result<()> {
     let mut errors = Vec::new();
     for (index, path) in paths.iter().enumerate() {
-        if path.exists() {
-            let removal = faults
-                .check(CommitOperation::StageCleanup(index))
-                .and_then(|()| {
-                    std::fs::remove_file(path)
-                        .with_context(|| format!("remove staged {}", path.display()))
-                });
-            if let Err(error) = removal {
-                errors.push(format!("remove staged {}: {error:#}", path.display()));
+        if let Err(error) = faults.check(CommitOperation::StageCleanup(index)) {
+            errors.push(format!("remove staged {}: {error:#}", path.display()));
+            continue;
+        }
+        match std::fs::remove_file(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                errors.push(format!("remove staged {}: {error}", path.display()));
             }
         }
     }
@@ -2116,8 +2171,9 @@ mod tests {
             CommitOperation::StageWrite(1),
             CommitOperation::StageSync(1),
             CommitOperation::StageKeep(1),
+            CommitOperation::BackupMetadata(1),
             CommitOperation::BackupCreate(1),
-            CommitOperation::BackupPlaceholderRemove(1),
+            CommitOperation::BackupPlaceholderKeep(1),
             CommitOperation::BackupRename(0),
             CommitOperation::BackupRename(1),
             CommitOperation::BackupParentsSync,
@@ -2225,6 +2281,21 @@ mod tests {
         assert_eq!(std::fs::read(&first).unwrap(), b"old-first");
         assert_eq!(std::fs::read(&second).unwrap(), b"old-second");
         assert_eq!(directory_entries(directory.path()).len(), 3);
+
+        let (directory, first, second, result) =
+            transaction_fault_case([CommitOperation::BackupPlaceholderRemove(1)]);
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("preserved empty recovery marker"));
+        assert_eq!(std::fs::read(&first).unwrap(), b"old-first");
+        assert_eq!(std::fs::read(&second).unwrap(), b"old-second");
+        let entries = directory_entries(directory.path());
+        assert_eq!(entries.len(), 3);
+        assert!(
+            entries
+                .iter()
+                .any(|name| name.starts_with(".hyprstream-backup-")),
+            "failed placeholder unlink did not preserve and expose its path"
+        );
     }
 
     #[test]
