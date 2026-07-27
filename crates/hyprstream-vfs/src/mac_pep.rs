@@ -45,13 +45,17 @@
 //! Flipping the default at construction sites is the separately-gated
 //! activation B-lane (#1267), not this PR.
 
+#[cfg(not(target_arch = "wasm32"))]
 use std::sync::Arc;
 
+#[cfg(not(target_arch = "wasm32"))]
 pub use hyprstream_rpc::auth::mac::{
     MacDecision, MacDenyReason, RpcObjectLabelResolver, SecurityContext, SecurityLabel,
 };
+#[cfg(not(target_arch = "wasm32"))]
 use hyprstream_rpc::Subject;
 
+#[cfg(not(target_arch = "wasm32"))]
 use crate::NamespaceError;
 
 /// The direct-`Namespace`-API operation a [`NamespaceAccessDecider`] is asked
@@ -101,6 +105,7 @@ pub enum NamespaceAction {
 /// Implementations MUST NOT derive clearance from an unverified,
 /// caller-supplied label (D1 — labels in wire schemas are hints; here the
 /// `Subject` name is even weaker: an unauthenticated string).
+#[cfg(not(target_arch = "wasm32"))]
 pub trait SubjectContextResolver: Send + Sync {
     /// Resolve `subject` to its verified security context, or `None` if its
     /// clearance cannot be proven — which the PEP treats as deny.
@@ -111,9 +116,11 @@ pub trait SubjectContextResolver: Send + Sync {
 ///
 /// This is the default a [`NamespacePep`] uses for the subject seam when no
 /// production resolver (#698) has been wired — every mediated op denies.
+#[cfg(not(target_arch = "wasm32"))]
 #[derive(Debug, Default, Clone, Copy)]
 pub struct DenyAllSubjects;
 
+#[cfg(not(target_arch = "wasm32"))]
 impl SubjectContextResolver for DenyAllSubjects {
     fn resolve(&self, _subject: &Subject) -> Option<SecurityContext> {
         // No SubjectContextResolver wired (#698 not landed). The authorize()
@@ -134,6 +141,7 @@ impl SubjectContextResolver for DenyAllSubjects {
 /// `hyprstream` crate can write those fail-closed decisions to the same
 /// tamper-evident WAL as policy-floor denials. No deny may return before this
 /// audit boundary.
+#[cfg(not(target_arch = "wasm32"))]
 pub trait NamespaceAccessDecider: Send + Sync {
     /// Return the canonical MAC decision and record every outcome through the
     /// MAC audit sink.
@@ -152,9 +160,11 @@ pub trait NamespaceAccessDecider: Send + Sync {
 
 /// Fail-closed decider for a [`NamespacePep`] whose production audited decider
 /// is unavailable. Every op denies.
+#[cfg(not(target_arch = "wasm32"))]
 #[derive(Debug, Default, Clone, Copy)]
 pub struct DenyAllNamespace;
 
+#[cfg(not(target_arch = "wasm32"))]
 impl NamespaceAccessDecider for DenyAllNamespace {
     fn check(
         &self,
@@ -170,9 +180,11 @@ impl NamespaceAccessDecider for DenyAllNamespace {
 /// `hyprstream_9p::DenyUnlabeledResolver`. Returning `None` is a mandatory
 /// deny (design §1 invariant 2) — the PEP refuses to authorize any op whose
 /// object has no trusted label.
+#[cfg(not(target_arch = "wasm32"))]
 #[derive(Debug, Default, Clone, Copy)]
 pub struct DenyUnlabeledResolver;
 
+#[cfg(not(target_arch = "wasm32"))]
 impl RpcObjectLabelResolver for DenyUnlabeledResolver {
     fn resolve(&self, _service_domain: &str, _method: Option<u16>) -> Option<SecurityLabel> {
         None
@@ -191,18 +203,21 @@ impl RpcObjectLabelResolver for DenyUnlabeledResolver {
 /// populate. Building a `NamespacePep` is therefore always fail-closed;
 /// "unenforced" is represented by *not installing* one on the `Namespace`
 /// (the dormant status quo), never by a permissive PEP.
+#[cfg(not(target_arch = "wasm32"))]
 pub struct NamespacePep {
     subjects: Arc<dyn SubjectContextResolver>,
     labels: Arc<dyn RpcObjectLabelResolver>,
     decider: Arc<dyn NamespaceAccessDecider>,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl std::fmt::Debug for NamespacePep {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("NamespacePep").finish_non_exhaustive()
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl NamespacePep {
     /// Assemble the monitor from its three mandatory seams.
     ///
@@ -292,6 +307,7 @@ impl NamespacePep {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn denial_detail(subject: &Subject, reason: &str) -> String {
     match subject.name() {
         Some(n) => format!("'{n}': {reason}"),
@@ -299,6 +315,7 @@ fn denial_detail(subject: &Subject, reason: &str) -> String {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 const fn deny_reason_detail(reason: MacDenyReason) -> &'static str {
     match reason {
         MacDenyReason::NoPepInstalled => "explicit deny-all PEP installed",
@@ -309,7 +326,7 @@ const fn deny_reason_detail(reason: MacDenyReason) -> &'static str {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
     use hyprstream_rpc::auth::mac::{

@@ -37,8 +37,10 @@
 //! stories (wasm's `unsafe impl` is only sound single-threaded, native is
 //! genuinely thread-safe) and are gated to disjoint targets.
 
+#[cfg(not(target_arch = "wasm32"))]
 pub mod backend;
 pub mod client;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod memory;
 pub mod msg;
 // The translator is the server-side TCP/UDS accept loop (tokio::net). `net`
@@ -67,6 +69,7 @@ pub mod dma;
 #[cfg(target_arch = "wasm32")]
 pub mod wanix_mount;
 
+#[cfg(not(target_arch = "wasm32"))]
 pub use backend::{Backend, OpenResult, StatResult, WalkResult};
 pub use client::{P9Client, P9Transport};
 #[cfg(not(target_arch = "wasm32"))]
