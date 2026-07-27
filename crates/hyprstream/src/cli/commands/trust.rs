@@ -29,6 +29,10 @@ pub struct MintDeploymentCaArgs {
     #[arg(long, default_value = "deployment-authority.log.json")]
     pub authority_log: PathBuf,
 
+    /// Independently provisioned expected authority-log head.
+    #[arg(long, default_value = "deployment-authority.head.json")]
+    pub authority_checkpoint: PathBuf,
+
     /// Native age or age-plugin recipient. Repeat to add recovery recipients.
     #[arg(long = "recipient", value_name = "AGE_RECIPIENT")]
     pub recipients: Vec<String>,
@@ -59,6 +63,10 @@ pub struct DelegateRegistrySignerArgs {
     /// Signed authority rotation log.
     #[arg(long, default_value = "deployment-authority.log.json")]
     pub authority_log: PathBuf,
+
+    /// Independently trusted expected authority-log head.
+    #[arg(long, default_value = "deployment-authority.head.json")]
+    pub authority_checkpoint: PathBuf,
 
     /// Age-encrypted root/current authority bundle.
     #[arg(long, default_value = "deployment-ca.age")]
@@ -140,13 +148,13 @@ pub struct MintRegistryJwtArgs {
     )]
     pub delegation: Option<PathBuf>,
 
-    /// Installed/current public authority log. Required for delegated credentials.
-    #[arg(
-        long,
-        value_name = "AUTHORITY_LOG.json",
-        required_unless_present = "root"
-    )]
-    pub authority_log: Option<PathBuf>,
+    /// Installed/current public authority log. Required for every credential.
+    #[arg(long, default_value = "deployment-authority.log.json")]
+    pub authority_log: PathBuf,
+
+    /// Independently trusted expected authority-log head.
+    #[arg(long, default_value = "deployment-authority.head.json")]
+    pub authority_checkpoint: PathBuf,
 
     /// Rare/bootstrap path: sign directly with the deployment authority.
     #[arg(long, conflicts_with = "via_delegated_signer")]
@@ -182,6 +190,10 @@ pub struct RotateAuthorityArgs {
     /// Current signed authority rotation log.
     #[arg(long, default_value = "deployment-authority.log.json")]
     pub authority_log: PathBuf,
+
+    /// Current independently trusted expected authority-log head.
+    #[arg(long, default_value = "deployment-authority.head.json")]
+    pub authority_checkpoint: PathBuf,
 
     /// Age-encrypted currently active authority used to sign the rotation.
     #[arg(long, default_value = "deployment-ca.age")]
@@ -223,6 +235,10 @@ pub struct RotateAuthorityArgs {
     #[arg(long, default_value = "deployment-authority.log.next.json")]
     pub authority_log_out: PathBuf,
 
+    /// Updated independently trusted authority-log head output.
+    #[arg(long, default_value = "deployment-authority.head.next.json")]
+    pub authority_checkpoint_out: PathBuf,
+
     /// Replace existing output files.
     #[arg(long)]
     pub force: bool,
@@ -238,9 +254,13 @@ pub struct VerifyDeploymentArgs {
     #[arg(long, default_value = "registry-service.jwt")]
     pub jwt: PathBuf,
 
-    /// Installed/current authority log (required for delegated credentials).
-    #[arg(long)]
-    pub authority_log: Option<PathBuf>,
+    /// Installed/current authority log (required for every credential).
+    #[arg(long, default_value = "deployment-authority.log.json")]
+    pub authority_log: PathBuf,
+
+    /// Independently trusted expected authority-log head.
+    #[arg(long, default_value = "deployment-authority.head.json")]
+    pub authority_checkpoint: PathBuf,
 
     /// Optional contract whose public artifacts must match the files.
     #[arg(long)]

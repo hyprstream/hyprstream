@@ -1508,6 +1508,8 @@ static PROCESS_REGISTRY_VERIFIER: std::sync::OnceLock<RegistryDeploymentVerifier
 
 const DEPLOYMENT_CA_ROOT_PATH: &str = "/etc/hyprstream/trust/deployment-ca.hybrid";
 const DEPLOYMENT_AUTHORITY_LOG_PATH: &str = "/etc/hyprstream/trust/deployment-authority.log.json";
+const DEPLOYMENT_AUTHORITY_CHECKPOINT_PATH: &str =
+    "/etc/hyprstream/trust/deployment-authority.head.json";
 const REGISTRY_DEPLOYMENT_CREDENTIAL_PATH: &str =
     "/run/hyprstream/credentials/registry-service.jwt";
 const REGISTRY_DEPLOYMENT_CREDENTIAL_PROFILE: &str = "hyprstream.registry-deployment.v1";
@@ -1519,6 +1521,7 @@ const ML_DSA_65_PUBLIC_KEY_BYTES: usize = 1_952;
 const DEPLOYMENT_CA_ROOT_BYTES: usize = ED25519_PUBLIC_KEY_BYTES + ML_DSA_65_PUBLIC_KEY_BYTES;
 const HYBRID_JWT_SIGNATURE_BYTES: usize = 3_309 + 64;
 const AUTHORITY_LOG_SCHEMA: &str = "hyprstream.deployment-authority-log.v1";
+const AUTHORITY_CHECKPOINT_SCHEMA: &str = "hyprstream.deployment-authority-checkpoint.v1";
 const REGISTRY_DELEGATION_SCHEMA: &str = "hyprstream.registry-delegation.v1";
 const MAX_AUTHORITY_LOG_OPERATIONS: usize = 128;
 const MAX_REGISTRY_DELEGATION_BYTES: usize = 256 * 1024;
@@ -1533,6 +1536,21 @@ pub struct DeploymentAuthorityLog {
     pub deployment_domain: String,
     pub did: String,
     pub operations_b64: Vec<String>,
+}
+
+/// Independently provisioned expected head of the deployment authority log.
+///
+/// This checkpoint is deliberately separate from the remotely supplied log:
+/// a signature-valid historical prefix cannot redefine the expected sequence
+/// or CID and thereby reactivate retired authority keys.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeploymentAuthorityCheckpoint {
+    pub schema: String,
+    pub deployment_domain: String,
+    pub did: String,
+    pub sequence: u64,
+    pub head_cid: String,
 }
 
 /// Root/current-authority UCAN delegation embedded in delegated registry JWTs.
@@ -1672,8 +1690,21 @@ struct AuthenticatedRegistryDeploymentIdentity {
 
 struct TrustedRegistryDeploymentCredentials {
     ca_verifying_key: HybridDeploymentCa,
-    authority_log: Option<DeploymentAuthorityLog>,
+    authority_log: DeploymentAuthorityLog,
+    authority_checkpoint: DeploymentAuthorityCheckpoint,
     registry_credential: String,
+}
+
+enum DeploymentAuthorityState<'a> {
+    /// Explicit, one-time genesis verification before enrollment. Production
+    /// loaders never select this state from an absent file.
+    GenesisOnly,
+    /// Normal enrolled operation: both independently trusted checkpoint and
+    /// current root-anchored log are mandatory.
+    Enrolled {
+        authority_log: &'a DeploymentAuthorityLog,
+        authority_checkpoint: &'a DeploymentAuthorityCheckpoint,
+    },
 }
 
 /// JSON value decoded while preserving the security property that every object
@@ -1888,8 +1919,8 @@ fn validate_registry_credential_numeric_dates(
 fn validate_registry_deployment_credential_profile(
     token: &str,
     ca_verifying_key: &HybridDeploymentCa,
-    installed_authority_log: Option<&DeploymentAuthorityLog>,
-) -> Result<[u8; 32]> {
+    authority_state: DeploymentAuthorityState<'_>,
+) -> Result<([u8; 32], i64)> {
     anyhow::ensure!(
         !token.is_empty() && !token.bytes().any(|byte| byte.is_ascii_whitespace()),
         "registry credential must be compact with no whitespace"
@@ -2015,8 +2046,27 @@ fn validate_registry_deployment_credential_profile(
         .try_into()
         .map_err(|_| anyhow::anyhow!("credential cnf.jwk.x must decode to exactly 32 bytes"))?;
 
+    let enrolled = match authority_state {
+        DeploymentAuthorityState::GenesisOnly => None,
+        DeploymentAuthorityState::Enrolled {
+            authority_log,
+            authority_checkpoint,
+        } => Some((
+            authority_log,
+            validate_deployment_authority_log(
+                ca_verifying_key,
+                authority_log,
+                authority_checkpoint,
+            )?,
+        )),
+    };
     let delegated_ca;
     let signing_ca = if delegated {
+        let (installed_authority_log, active) = enrolled.as_ref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "delegated credential is forbidden during one-time genesis verification"
+            )
+        })?;
         let encoded = exact_string_member(claims, "delegation", "credential claims")?;
         let bytes = decode_canonical_jwt_segment(
             encoded,
@@ -2025,18 +2075,15 @@ fn validate_registry_deployment_credential_profile(
         )?;
         let artifact: RegistryDelegationArtifact = serde_json::from_slice(&bytes)
             .map_err(|error| anyhow::anyhow!("credential delegation is malformed: {error}"))?;
-        let installed_authority_log = installed_authority_log.ok_or_else(|| {
-            anyhow::anyhow!("delegated credential requires the installed deployment authority log")
-        })?;
         delegated_ca = validate_registry_delegation_artifact(
             ca_verifying_key,
             &artifact,
             installed_authority_log,
+            active,
             u64::try_from(now).map_err(|_| anyhow::anyhow!("system clock precedes Unix epoch"))?,
         )?;
         &delegated_ca
-    } else if let Some(installed_authority_log) = installed_authority_log {
-        let active = validate_deployment_authority_log(ca_verifying_key, installed_authority_log)?;
+    } else if let Some((_installed_authority_log, active)) = enrolled.as_ref() {
         anyhow::ensure!(
             active.rotation_keys.iter().any(|key| {
                 key.ed25519_pub == ca_verifying_key.ed25519.to_bytes()
@@ -2070,7 +2117,7 @@ fn validate_registry_deployment_credential_profile(
         verified.sub == "service:registry" && verified.cnf_key_bytes() == Some(key),
         "verified credential differs from the exact deployment profile"
     );
-    Ok(key)
+    Ok((key, exp))
 }
 
 struct AuthoritySetUcanVerifier<'a> {
@@ -2113,6 +2160,7 @@ fn validate_registry_delegation_artifact(
     root: &HybridDeploymentCa,
     artifact: &RegistryDelegationArtifact,
     installed_authority_log: &DeploymentAuthorityLog,
+    active: &crate::did_op::VerifiedDidOpLog,
     now: u64,
 ) -> Result<HybridDeploymentCa> {
     use hyprstream_rpc::auth::ucan::{
@@ -2127,7 +2175,6 @@ fn validate_registry_delegation_artifact(
         artifact.deployment_domain == root.domain(),
         "registry delegation deployment domain does not match pinned root"
     );
-    let active = validate_deployment_authority_log(root, installed_authority_log)?;
     anyhow::ensure!(
         artifact.authority_log_did == installed_authority_log.did,
         "registry delegation names a different authority log"
@@ -2213,6 +2260,7 @@ fn validate_registry_delegation_artifact(
 fn validate_deployment_authority_log(
     root: &HybridDeploymentCa,
     log: &DeploymentAuthorityLog,
+    checkpoint: &DeploymentAuthorityCheckpoint,
 ) -> Result<crate::did_op::VerifiedDidOpLog> {
     anyhow::ensure!(
         log.schema == AUTHORITY_LOG_SCHEMA,
@@ -2238,6 +2286,21 @@ fn validate_deployment_authority_log(
         .collect::<Result<Vec<_>>>()?;
     let active = crate::did_op::verify_did_op_log(&log.did, &operations)
         .context("verifying deployment authority log")?;
+    anyhow::ensure!(
+        checkpoint.schema == AUTHORITY_CHECKPOINT_SCHEMA,
+        "unsupported deployment authority-checkpoint schema"
+    );
+    anyhow::ensure!(
+        checkpoint.deployment_domain == root.domain(),
+        "deployment authority checkpoint domain does not match pinned root"
+    );
+    anyhow::ensure!(
+        checkpoint.did == log.did
+            && checkpoint.did == active.did
+            && checkpoint.sequence == active.sequence
+            && checkpoint.head_cid == active.head_cid,
+        "deployment authority-log head does not match the independently trusted checkpoint"
+    );
     let genesis = operations
         .first()
         .ok_or_else(|| anyhow::anyhow!("deployment authority log is empty"))?;
@@ -2271,45 +2334,53 @@ fn validate_deployment_authority_log(
     Ok(active)
 }
 
-/// Result of verifying the two deployment artifacts consumed at production
-/// bootstrap. This exposes no authority material and cannot install or replace
-/// process trust.
+/// Result of verifying the enrolled deployment artifact set consumed at
+/// production bootstrap. This exposes no authority material and cannot install
+/// or replace process trust.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VerifiedDeploymentArtifacts {
     pub deployment_domain: String,
     pub registry_public_key: [u8; ED25519_PUBLIC_KEY_BYTES],
+    pub expires_at: i64,
 }
 
 /// Parse the exact production public-root pin and return its stable deployment
-/// domain. This is the mint-time half of [`verify_deployment_artifacts`].
+/// domain. This is the mint-time half of
+/// [`verify_deployment_artifacts_with_authority_log`].
 pub fn verify_deployment_public_ca(public_ca: &[u8]) -> Result<String> {
     HybridDeploymentCa::from_os_pin(public_ca).map(|ca| ca.domain())
 }
 
-/// Parse and verify deployment artifacts through the exact production
-/// `HybridDeploymentCa` and closed registry-credential profile.
+/// Explicitly verify a direct-root credential during one-time genesis before
+/// authority-log enrollment. Production startup never calls this function and
+/// never infers genesis mode from a missing file.
 ///
 /// Tooling uses this entry point for pre-installation self-checks. Keeping the
 /// parser and validator here prevents a mint tool from accidentally blessing a
 /// byte layout or JWT shape that production would reject.
-pub fn verify_deployment_artifacts(
+pub fn verify_genesis_deployment_artifacts(
     public_ca: &[u8],
     registry_credential: &str,
 ) -> Result<VerifiedDeploymentArtifacts> {
     let ca = HybridDeploymentCa::from_os_pin(public_ca)?;
-    let registry_public_key =
-        validate_registry_deployment_credential_profile(registry_credential, &ca, None)?;
+    let (registry_public_key, expires_at) = validate_registry_deployment_credential_profile(
+        registry_credential,
+        &ca,
+        DeploymentAuthorityState::GenesisOnly,
+    )?;
     Ok(VerifiedDeploymentArtifacts {
         deployment_domain: ca.domain(),
         registry_public_key,
+        expires_at,
     })
 }
 
-/// Verify a delegated deployment credential against the public root and the
-/// installed/current authority-log checkpoint.
+/// Verify any enrolled deployment credential against the public root, the
+/// installed/current authority log, and its independently trusted head.
 pub fn verify_deployment_artifacts_with_authority_log(
     public_ca: &[u8],
     authority_log_json: &[u8],
+    authority_checkpoint_json: &[u8],
     registry_credential: &str,
 ) -> Result<VerifiedDeploymentArtifacts> {
     anyhow::ensure!(
@@ -2321,14 +2392,26 @@ pub fn verify_deployment_artifacts_with_authority_log(
         .map_err(|error| {
             anyhow::anyhow!("installed deployment authority log is malformed: {error}")
         })?;
-    let registry_public_key = validate_registry_deployment_credential_profile(
+    anyhow::ensure!(
+        authority_checkpoint_json.len() <= MAX_DEPLOYMENT_CLOUD_SECRET_BYTES,
+        "installed deployment authority checkpoint is too large"
+    );
+    let authority_checkpoint: DeploymentAuthorityCheckpoint =
+        serde_json::from_slice(authority_checkpoint_json).map_err(|error| {
+            anyhow::anyhow!("installed deployment authority checkpoint is malformed: {error}")
+        })?;
+    let (registry_public_key, expires_at) = validate_registry_deployment_credential_profile(
         registry_credential,
         &ca,
-        Some(&authority_log),
+        DeploymentAuthorityState::Enrolled {
+            authority_log: &authority_log,
+            authority_checkpoint: &authority_checkpoint,
+        },
     )?;
     Ok(VerifiedDeploymentArtifacts {
         deployment_domain: ca.domain(),
         registry_public_key,
+        expires_at,
     })
 }
 
@@ -2384,35 +2467,49 @@ fn load_trusted_registry_deployment_credentials() -> Result<TrustedRegistryDeplo
         "deployment CA root",
     )?;
     let ca_verifying_key = HybridDeploymentCa::from_os_pin(&ca_bytes)?;
-    let authority_log_path = std::path::Path::new(DEPLOYMENT_AUTHORITY_LOG_PATH);
-    let authority_log =
-        if authority_log_path.exists() {
-            let bytes = read_os_owned_file(authority_log_path, "deployment authority log")?;
-            anyhow::ensure!(
-                bytes.len() <= MAX_DEPLOYMENT_CLOUD_SECRET_BYTES,
-                "deployment authority log exceeds the 64 KiB cloud-secret contract"
-            );
-            Some(serde_json::from_slice(&bytes).map_err(|error| {
-                anyhow::anyhow!("deployment authority log is malformed: {error}")
-            })?)
-        } else {
-            None
-        };
+    let authority_log_bytes = read_os_owned_file(
+        std::path::Path::new(DEPLOYMENT_AUTHORITY_LOG_PATH),
+        "deployment authority log",
+    )?;
+    anyhow::ensure!(
+        authority_log_bytes.len() <= MAX_DEPLOYMENT_CLOUD_SECRET_BYTES,
+        "deployment authority log exceeds the 64 KiB cloud-secret contract"
+    );
+    let authority_log = serde_json::from_slice(&authority_log_bytes)
+        .map_err(|error| anyhow::anyhow!("deployment authority log is malformed: {error}"))?;
+    let authority_checkpoint = load_deployment_authority_checkpoint()?;
     let registry_credential = load_registry_deployment_credential()?;
     Ok(TrustedRegistryDeploymentCredentials {
         ca_verifying_key,
         authority_log,
+        authority_checkpoint,
         registry_credential,
     })
+}
+
+fn load_deployment_authority_checkpoint() -> Result<DeploymentAuthorityCheckpoint> {
+    let bytes = read_os_owned_file(
+        std::path::Path::new(DEPLOYMENT_AUTHORITY_CHECKPOINT_PATH),
+        "deployment authority checkpoint",
+    )?;
+    anyhow::ensure!(
+        bytes.len() <= MAX_DEPLOYMENT_CLOUD_SECRET_BYTES,
+        "deployment authority checkpoint exceeds the 64 KiB cloud-secret contract"
+    );
+    serde_json::from_slice(&bytes)
+        .map_err(|error| anyhow::anyhow!("deployment authority checkpoint is malformed: {error}"))
 }
 
 fn authenticate_registry_deployment_credentials(
     credentials: TrustedRegistryDeploymentCredentials,
 ) -> Result<AuthenticatedRegistryDeploymentIdentity> {
-    let key_bytes = validate_registry_deployment_credential_profile(
+    let (key_bytes, _expires_at) = validate_registry_deployment_credential_profile(
         &credentials.registry_credential,
         &credentials.ca_verifying_key,
-        credentials.authority_log.as_ref(),
+        DeploymentAuthorityState::Enrolled {
+            authority_log: &credentials.authority_log,
+            authority_checkpoint: &credentials.authority_checkpoint,
+        },
     )
     .map_err(|error| anyhow::anyhow!("registry deployment credential rejected: {error}"))?;
     let verifying_key = VerifyingKey::from_bytes(&key_bytes)
@@ -2582,22 +2679,34 @@ async fn authenticate_did_anchored_bootstrap(
 )> {
     seal_process_bootstrap_authority()?;
     let trust = crate::did_anchored::resolve_did_anchored_trust(anchors).await?;
-    let witness =
-        authenticate_registry_deployment_credentials(TrustedRegistryDeploymentCredentials {
-            ca_verifying_key: trust.ca_verifying_key,
-            authority_log: None,
-            registry_credential: trust.registry_credential,
-        })?;
+    let authority_checkpoint = load_deployment_authority_checkpoint()?;
+    let discovery_transport = trust.discovery_transport.clone();
+    let mesh_kem_recipient = trust.mesh_kem_recipient.clone();
+    let ml_dsa_65_keys = trust.ml_dsa_65_keys.clone();
+    let verifier = authenticate_resolved_did_trust(trust, authority_checkpoint)?;
     let authority = ProcessBootstrapAuthority {
         store_path: hyprstream_service::deployment_data_dir()?.join("pds-store"),
-        acceptance_identity: ProcessAcceptanceIdentity::Deployment(witness.verifier),
+        acceptance_identity: ProcessAcceptanceIdentity::Deployment(verifier),
     };
     Ok((
         authority,
-        trust.discovery_transport,
-        trust.mesh_kem_recipient,
-        trust.ml_dsa_65_keys,
+        discovery_transport,
+        mesh_kem_recipient,
+        ml_dsa_65_keys,
     ))
+}
+
+pub(crate) fn authenticate_resolved_did_trust(
+    trust: crate::did_anchored::DidAnchoredTrust,
+    authority_checkpoint: DeploymentAuthorityCheckpoint,
+) -> Result<RegistryDeploymentVerifier> {
+    authenticate_registry_deployment_credentials(TrustedRegistryDeploymentCredentials {
+        ca_verifying_key: trust.ca_verifying_key,
+        authority_log: trust.authority_log,
+        authority_checkpoint,
+        registry_credential: trust.registry_credential,
+    })
+    .map(|witness| witness.verifier)
 }
 
 /// Resolve the configured DID anchors and authenticate the fetched registry
@@ -2614,13 +2723,10 @@ pub async fn resolve_and_authenticate_did_anchors(
     anchors: &crate::DidAnchors,
 ) -> Result<(RegistryDeploymentVerifier, TransportConfig)> {
     let trust = crate::did_anchored::resolve_did_anchored_trust(anchors).await?;
-    let witness =
-        authenticate_registry_deployment_credentials(TrustedRegistryDeploymentCredentials {
-            ca_verifying_key: trust.ca_verifying_key,
-            authority_log: None,
-            registry_credential: trust.registry_credential,
-        })?;
-    Ok((witness.verifier, trust.discovery_transport))
+    let authority_checkpoint = load_deployment_authority_checkpoint()?;
+    let discovery_transport = trust.discovery_transport.clone();
+    let verifier = authenticate_resolved_did_trust(trust, authority_checkpoint)?;
+    Ok((verifier, discovery_transport))
 }
 
 #[cfg(test)]
@@ -3243,10 +3349,18 @@ mod resolver_tests {
         ca: &TestDeploymentCa,
         credential: String,
     ) -> Result<AuthenticatedRegistryDeploymentIdentity> {
-        authenticate_registry_deployment_credentials(TrustedRegistryDeploymentCredentials {
-            ca_verifying_key: ca.verifying_keys.clone(),
-            authority_log: None,
-            registry_credential: credential,
+        let (key_bytes, _expires_at) = validate_registry_deployment_credential_profile(
+            &credential,
+            &ca.verifying_keys,
+            DeploymentAuthorityState::GenesisOnly,
+        )?;
+        let verifying_key = VerifyingKey::from_bytes(&key_bytes)
+            .map_err(|error| anyhow::anyhow!("registry credential key is malformed: {error}"))?;
+        Ok(AuthenticatedRegistryDeploymentIdentity {
+            verifier: RegistryDeploymentVerifier {
+                verifying_key,
+                _deployment_ca: Arc::new(ca.verifying_keys.clone()),
+            },
         })
     }
 
@@ -4438,12 +4552,8 @@ mod resolver_tests {
         let ca = test_deployment_ca(0x62);
         let registry = SigningKey::from_bytes(&[0x63; 32]);
         let witness =
-            authenticate_registry_deployment_credentials(TrustedRegistryDeploymentCredentials {
-                ca_verifying_key: ca.verifying_keys.clone(),
-                authority_log: None,
-                registry_credential: exact_registry_credential(&ca, &registry),
-            })
-            .expect("trusted pair");
+            authenticate_test_registry_credential(&ca, exact_registry_credential(&ca, &registry))
+                .expect("explicit genesis-only trusted pair");
         std::env::set_var("CREDENTIALS_DIRECTORY", "post-start-attacker-directory");
         std::env::set_var("XDG_CONFIG_HOME", "post-start-attacker-config");
         assert!(witness.verifier.matches(&registry.verifying_key()));

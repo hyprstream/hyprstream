@@ -1226,10 +1226,12 @@ pub struct OAuthConfig {
     /// When set, this OAuth instance terminates the deployment's did:web host:
     /// `/.well-known/did.json` serves `<dir>/did.json` (replacing the dynamic
     /// node document), `/.well-known/at9p/<cid>.cbor` serves the cluster at9p
-    /// capsule, and `/.well-known/deployment/registry-service.jwt` serves the
-    /// current CA-signed registry deployment credential. All are public,
-    /// integrity-anchored bytes re-read on every request so an external
-    /// credential-refresh agent needs no restart.
+    /// capsule, `/.well-known/deployment/deployment-authority.log.json` serves
+    /// the current root-anchored authority log, and
+    /// `/.well-known/deployment/registry-service.jwt` serves the current
+    /// registry credential. All are public, integrity-anchored bytes re-read
+    /// on every request so an external credential-refresh agent needs no
+    /// restart.
     #[serde(default)]
     pub deployment_well_known_dir: Option<PathBuf>,
 

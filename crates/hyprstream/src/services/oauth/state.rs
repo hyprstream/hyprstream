@@ -1002,8 +1002,10 @@ pub struct OAuthState {
     /// Deployment static well-known directory (#1137 serving half). When set,
     /// this OAuth instance terminates the deployment's did:web host: it serves
     /// `<dir>/did.json` in place of the dynamic node document, plus
-    /// `<dir>/at9p/<cid>.cbor` and `<dir>/deployment/registry-service.jwt`.
-    /// All three are public, integrity-anchored bytes — see
+    /// `<dir>/at9p/<cid>.cbor`,
+    /// `<dir>/deployment/deployment-authority.log.json`, and
+    /// `<dir>/deployment/registry-service.jwt`. All four are public,
+    /// integrity-anchored bytes — see
     /// `deployment_well_known.rs`. Copied from
     /// `OAuthConfig::deployment_well_known_dir`.
     pub deployment_well_known_dir: Option<std::path::PathBuf>,

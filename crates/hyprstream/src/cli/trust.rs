@@ -20,6 +20,7 @@ use hyprstream_discovery::did_op::{
     verify_did_op_log, DidOp, HybridDidOpSignature, HybridRotationKey, DID_OP_SIGNATURE_CONTEXT,
 };
 use hyprstream_discovery::{
+    DeploymentAuthorityCheckpoint as AuthorityCheckpointFile,
     DeploymentAuthorityLog as AuthorityLogFile, RegistryDelegationArtifact as DelegationArtifact,
 };
 use hyprstream_rpc::{
@@ -46,7 +47,7 @@ use std::{
     path::{Path, PathBuf},
     process::{Command, Stdio},
 };
-use zeroize::Zeroize as _;
+use zeroize::{Zeroize as _, Zeroizing};
 
 const PUBLIC_CA_BYTES: usize = 32 + 1_952;
 const HYBRID_SIGNATURE_BYTES: usize = 3_309 + 64;
@@ -54,6 +55,7 @@ const REGISTRY_AUDIENCE: &str = "urn:hyprstream:service:registry";
 const REGISTRY_PROFILE: &str = "hyprstream.registry-deployment.v1";
 const AUTHORITY_BUNDLE_SCHEMA: &str = "hyprstream.deployment-authority.v1";
 const AUTHORITY_LOG_SCHEMA: &str = "hyprstream.deployment-authority-log.v1";
+const AUTHORITY_CHECKPOINT_SCHEMA: &str = "hyprstream.deployment-authority-checkpoint.v1";
 const DELEGATION_SCHEMA: &str = "hyprstream.registry-delegation.v1";
 const PUBLISHER_MANIFEST_SCHEMA: &str = "hyprstream.deployment-trust-publisher-manifest.v1";
 const DELEGATION_RESOURCE_PREFIX: &str = "hyprstream://deployment";
@@ -61,6 +63,11 @@ const DELEGATION_ABILITY: &str = "mint-registry-jwt";
 const MAX_AUTHORITY_LOG_OPERATIONS: usize = 128;
 const MAX_DELEGATION_BYTES: usize = 256 * 1024;
 const MAX_CLOUD_SECRET_BYTES: usize = 64 * 1024;
+const PUBLIC_CA_INSTALL_PATH: &str = "/etc/hyprstream/trust/deployment-ca.hybrid";
+const AUTHORITY_LOG_INSTALL_PATH: &str = "/etc/hyprstream/trust/deployment-authority.log.json";
+const AUTHORITY_CHECKPOINT_INSTALL_PATH: &str =
+    "/etc/hyprstream/trust/deployment-authority.head.json";
+const REGISTRY_JWT_INSTALL_PATH: &str = "/run/hyprstream/credentials/registry-service.jwt";
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
@@ -118,6 +125,12 @@ struct CaMintOutput {
     schema: &'static str,
     deployment_domain: String,
     authority_log_did: String,
+    authority_log_sequence: u64,
+    authority_log_head_cid: String,
+    authority_log_path: String,
+    authority_log_install_path: &'static str,
+    authority_checkpoint_path: String,
+    authority_checkpoint_install_path: &'static str,
     public_ca_path: String,
     public_ca_install_path: &'static str,
     public_ca_bytes: usize,
@@ -149,7 +162,8 @@ struct PublisherManifest {
     audience: String,
     expires_at: i64,
     public_ca: PublisherArtifact,
-    authority_log: Option<PublisherArtifact>,
+    authority_log: PublisherArtifact,
+    authority_checkpoint: PublisherArtifact,
     registry_jwt: PublisherArtifact,
     private_authority_exported: bool,
     terraform_state_may_contain_private_authority: bool,
@@ -201,7 +215,12 @@ pub fn handle_trust_command(command: TrustCommand) -> Result<()> {
 
 fn mint_deployment_ca(args: &MintDeploymentCaArgs) -> Result<()> {
     preflight_outputs(
-        [&args.public_ca, &args.authority_key, &args.authority_log],
+        [
+            &args.public_ca,
+            &args.authority_key,
+            &args.authority_log,
+            &args.authority_checkpoint,
+        ],
         args.force,
     )?;
     let recipients = root_recipient_ring(args)?;
@@ -214,7 +233,7 @@ fn mint_deployment_ca(args: &MintDeploymentCaArgs) -> Result<()> {
                 Ed25519Secret::YubikeyPiv {
                     slot: slot.clone(),
                     public_b64: STANDARD.encode(public.as_bytes()),
-                    recovery_seed_b64: STANDARD.encode(recovery_key.to_bytes()),
+                    recovery_seed_b64: encode_secret_b64(recovery_key.to_bytes()),
                 },
                 LoadedEdSigner::YubikeyPiv { slot, public },
             )
@@ -223,7 +242,7 @@ fn mint_deployment_ca(args: &MintDeploymentCaArgs) -> Result<()> {
             let key = SigningKey::generate(&mut rand::rngs::OsRng);
             (
                 Ed25519Secret::Software {
-                    seed_b64: STANDARD.encode(key.to_bytes()),
+                    seed_b64: encode_secret_b64(key.to_bytes()),
                     public_b64: STANDARD.encode(key.verifying_key().as_bytes()),
                 },
                 LoadedEdSigner::Software(key),
@@ -254,7 +273,9 @@ fn mint_deployment_ca(args: &MintDeploymentCaArgs) -> Result<()> {
         &pq,
     )?;
     let authority_log = authority_log_from_ops(&deployment_domain, vec![genesis])?;
-    validate_authority_log(&public_ca, &authority_log)?;
+    let verified_log = validate_authority_log_root(&public_ca, &authority_log)?;
+    let checkpoint = authority_checkpoint(&deployment_domain, &verified_log);
+    validate_authority_log(&public_ca, &authority_log, &checkpoint)?;
 
     let bundle = AuthorityBundle {
         schema: AUTHORITY_BUNDLE_SCHEMA.to_owned(),
@@ -262,12 +283,11 @@ fn mint_deployment_ca(args: &MintDeploymentCaArgs) -> Result<()> {
         deployment_domain: deployment_domain.clone(),
         public_key_sha256: sha256_hex(&public_ca),
         ed25519: ed_secret,
-        ml_dsa_65_seed_b64: STANDARD.encode(ml_dsa_sk_to_seed(&pq)),
+        ml_dsa_65_seed_b64: encode_secret_b64(ml_dsa_sk_to_seed(&pq)),
         recipient_count: recipients.len(),
     };
-    let mut plaintext = serde_json::to_vec(&bundle).context("encode authority bundle")?;
+    let plaintext = serialize_secret_json(&bundle).context("encode authority bundle")?;
     let encrypted = encrypt_age(&plaintext, &recipients)?;
-    plaintext.zeroize();
 
     commit_outputs(vec![
         PendingOutput::new(&args.public_ca, public_ca.clone(), 0o644),
@@ -277,14 +297,25 @@ fn mint_deployment_ca(args: &MintDeploymentCaArgs) -> Result<()> {
             pretty_json_bytes(&authority_log)?,
             0o644,
         ),
+        PendingOutput::new(
+            &args.authority_checkpoint,
+            pretty_json_bytes(&checkpoint)?,
+            0o644,
+        ),
     ])?;
 
     let output = CaMintOutput {
         schema: "hyprstream.deployment-ca-mint-output.v1",
         deployment_domain,
         authority_log_did: authority_log.did,
+        authority_log_sequence: checkpoint.sequence,
+        authority_log_head_cid: checkpoint.head_cid,
+        authority_log_path: display_path(&args.authority_log),
+        authority_log_install_path: AUTHORITY_LOG_INSTALL_PATH,
+        authority_checkpoint_path: display_path(&args.authority_checkpoint),
+        authority_checkpoint_install_path: AUTHORITY_CHECKPOINT_INSTALL_PATH,
         public_ca_path: display_path(&args.public_ca),
-        public_ca_install_path: "/etc/hyprstream/trust/deployment-ca.hybrid",
+        public_ca_install_path: PUBLIC_CA_INSTALL_PATH,
         public_ca_bytes: public_ca.len(),
         public_ca_base64: STANDARD.encode(&public_ca),
         public_ca_sha256: sha256_hex(&public_ca),
@@ -305,7 +336,9 @@ fn delegate_registry_signer(args: &DelegateRegistrySignerArgs) -> Result<()> {
     let signer_recipients = distinct_recipients(args.signer_recipients.clone())?;
     let public_ca = read_limited(&args.public_ca, PUBLIC_CA_BYTES)?;
     let log: AuthorityLogFile = read_json_limited(&args.authority_log, MAX_CLOUD_SECRET_BYTES)?;
-    let active = validate_authority_log(&public_ca, &log)?;
+    let checkpoint: AuthorityCheckpointFile =
+        read_json_limited(&args.authority_checkpoint, MAX_CLOUD_SECRET_BYTES)?;
+    let active = validate_authority_log(&public_ca, &log, &checkpoint)?;
 
     let identities = combined_identities(&args.identities, &args.yubikey_identities)?;
     let authority = decrypt_authority(&args.authority_key, &identities, args.software_recovery)?;
@@ -348,15 +381,14 @@ fn delegate_registry_signer(args: &DelegateRegistrySignerArgs) -> Result<()> {
         deployment_domain: authority.bundle.deployment_domain.clone(),
         public_key_sha256: sha256_hex(&delegated_public),
         ed25519: Ed25519Secret::Software {
-            seed_b64: STANDARD.encode(delegated_ed.to_bytes()),
+            seed_b64: encode_secret_b64(delegated_ed.to_bytes()),
             public_b64: STANDARD.encode(delegated_ed.verifying_key().as_bytes()),
         },
-        ml_dsa_65_seed_b64: STANDARD.encode(ml_dsa_sk_to_seed(&delegated_pq)),
+        ml_dsa_65_seed_b64: encode_secret_b64(ml_dsa_sk_to_seed(&delegated_pq)),
         recipient_count: signer_recipients.len(),
     };
-    let mut plaintext = serde_json::to_vec(&delegated_bundle)?;
+    let plaintext = serialize_secret_json(&delegated_bundle)?;
     let encrypted = encrypt_age(&plaintext, &signer_recipients)?;
-    plaintext.zeroize();
 
     let artifact = DelegationArtifact {
         schema: DELEGATION_SCHEMA.to_owned(),
@@ -365,7 +397,7 @@ fn delegate_registry_signer(args: &DelegateRegistrySignerArgs) -> Result<()> {
         delegated_public_key_b64: STANDARD.encode(&delegated_public),
         ucan_b64: STANDARD.encode(ucan.to_cbor()?),
     };
-    validate_delegation_artifact(&public_ca, &log, &artifact, now)?;
+    validate_delegation_artifact(&public_ca, &log, &checkpoint, &artifact, now)?;
     commit_outputs(vec![
         PendingOutput::new(&args.delegated_key, encrypted, 0o600),
         PendingOutput::new(&args.delegation, pretty_json_bytes(&artifact)?, 0o644),
@@ -398,8 +430,17 @@ fn mint_registry_jwt(args: &MintRegistryJwtArgs) -> Result<()> {
         .map_err(|_| anyhow!("registry public key must be exactly 32 bytes"))?;
     VerifyingKey::from_bytes(&registry_key).context("invalid registry Ed25519 public key")?;
     let identities = combined_identities(&args.identities, &args.yubikey_identities)?;
+    let authority_log_bytes = read_limited(&args.authority_log, MAX_CLOUD_SECRET_BYTES)?;
+    let installed_log: AuthorityLogFile =
+        serde_json::from_slice(&authority_log_bytes).context("decode installed authority log")?;
+    let authority_checkpoint_bytes =
+        read_limited(&args.authority_checkpoint, MAX_CLOUD_SECRET_BYTES)?;
+    let installed_checkpoint: AuthorityCheckpointFile =
+        serde_json::from_slice(&authority_checkpoint_bytes)
+            .context("decode installed authority checkpoint")?;
+    let active = validate_authority_log(&public_ca, &installed_log, &installed_checkpoint)?;
 
-    let (signer, delegation_b64, authority_log) = if args.root {
+    let (signer, delegation_b64) = if args.root {
         let authority =
             decrypt_authority(&args.authority_key, &identities, args.software_recovery)?;
         ensure!(
@@ -410,16 +451,8 @@ fn mint_registry_jwt(args: &MintRegistryJwtArgs) -> Result<()> {
             authority.public_bytes() == public_ca,
             "root authority does not match the pinned public CA"
         );
-        let authority_log = args
-            .authority_log
-            .as_ref()
-            .map(|path| read_json_limited::<AuthorityLogFile>(path, MAX_CLOUD_SECRET_BYTES))
-            .transpose()?;
-        if let Some(log) = authority_log.as_ref() {
-            let active = validate_authority_log(&public_ca, log)?;
-            ensure_active_authority(&authority, &active)?;
-        }
-        (authority, None, authority_log)
+        ensure_active_authority(&authority, &active)?;
+        (authority, None)
     } else {
         let delegated_path = args
             .via_delegated_signer
@@ -430,14 +463,13 @@ fn mint_registry_jwt(args: &MintRegistryJwtArgs) -> Result<()> {
             .as_ref()
             .ok_or_else(|| anyhow!("--delegation is required"))?;
         let artifact: DelegationArtifact = read_json_limited(artifact_path, MAX_DELEGATION_BYTES)?;
-        let authority_log_path = args
-            .authority_log
-            .as_ref()
-            .ok_or_else(|| anyhow!("--authority-log is required with delegated signing"))?;
-        let installed_log: AuthorityLogFile =
-            read_json_limited(authority_log_path, MAX_CLOUD_SECRET_BYTES)?;
-        validate_authority_log(&public_ca, &installed_log)?;
-        validate_delegation_artifact(&public_ca, &installed_log, &artifact, now_unix_u64()?)?;
+        validate_delegation_artifact(
+            &public_ca,
+            &installed_log,
+            &installed_checkpoint,
+            &artifact,
+            now_unix_u64()?,
+        )?;
         let delegated = decrypt_authority(delegated_path, &identities, args.software_recovery)?;
         ensure!(
             delegated.bundle.purpose == AuthorityPurpose::RegistryDelegatedSigner,
@@ -451,11 +483,7 @@ fn mint_registry_jwt(args: &MintRegistryJwtArgs) -> Result<()> {
             "delegated private key does not match the root-authorized delegation"
         );
         let artifact_json = serde_json::to_vec(&artifact)?;
-        (
-            delegated,
-            Some(URL_SAFE_NO_PAD.encode(artifact_json)),
-            Some(installed_log),
-        )
+        (delegated, Some(URL_SAFE_NO_PAD.encode(artifact_json)))
     };
     ensure!(
         signer.bundle.deployment_domain == root_domain,
@@ -471,14 +499,12 @@ fn mint_registry_jwt(args: &MintRegistryJwtArgs) -> Result<()> {
         token.len() <= MAX_CLOUD_SECRET_BYTES,
         "registry JWT exceeds the 64 KiB cloud-secret contract"
     );
-    let verified = match authority_log.as_ref() {
-        Some(log) => hyprstream_discovery::verify_deployment_artifacts_with_authority_log(
-            &public_ca,
-            &serde_json::to_vec(log)?,
-            &token,
-        ),
-        None => hyprstream_discovery::verify_deployment_artifacts(&public_ca, &token),
-    }
+    let verified = hyprstream_discovery::verify_deployment_artifacts_with_authority_log(
+        &public_ca,
+        &authority_log_bytes,
+        &authority_checkpoint_bytes,
+        &token,
+    )
     .context("production deployment verifier rejected minted credential")?;
     ensure!(
         verified.registry_public_key == registry_key && verified.deployment_domain == root_domain,
@@ -494,40 +520,34 @@ fn mint_registry_jwt(args: &MintRegistryJwtArgs) -> Result<()> {
         expires_at: exp,
         public_ca: PublisherArtifact {
             local_path: display_path(&args.public_ca),
-            install_path: "/etc/hyprstream/trust/deployment-ca.hybrid".to_owned(),
+            install_path: PUBLIC_CA_INSTALL_PATH.to_owned(),
             encoding: "raw".to_owned(),
             base64: STANDARD.encode(&public_ca),
             sha256: sha256_hex(&public_ca),
             size_bytes: public_ca.len(),
             cloud_secret_store: true,
         },
-        authority_log: authority_log
-            .as_ref()
-            .map(|log| {
-                let path = args
-                    .authority_log
-                    .as_ref()
-                    .ok_or_else(|| anyhow!("authority log path disappeared"))?;
-                let bytes = read_limited(path, MAX_CLOUD_SECRET_BYTES)?;
-                let persisted: AuthorityLogFile = serde_json::from_slice(&bytes)?;
-                ensure!(
-                    &persisted == log,
-                    "authority log changed while building publisher manifest"
-                );
-                Ok::<PublisherArtifact, anyhow::Error>(PublisherArtifact {
-                    local_path: display_path(path),
-                    install_path: "/etc/hyprstream/trust/deployment-authority.log.json".to_owned(),
-                    encoding: "json".to_owned(),
-                    base64: STANDARD.encode(&bytes),
-                    sha256: sha256_hex(&bytes),
-                    size_bytes: bytes.len(),
-                    cloud_secret_store: true,
-                })
-            })
-            .transpose()?,
+        authority_log: PublisherArtifact {
+            local_path: display_path(&args.authority_log),
+            install_path: AUTHORITY_LOG_INSTALL_PATH.to_owned(),
+            encoding: "json".to_owned(),
+            base64: STANDARD.encode(&authority_log_bytes),
+            sha256: sha256_hex(&authority_log_bytes),
+            size_bytes: authority_log_bytes.len(),
+            cloud_secret_store: true,
+        },
+        authority_checkpoint: PublisherArtifact {
+            local_path: display_path(&args.authority_checkpoint),
+            install_path: AUTHORITY_CHECKPOINT_INSTALL_PATH.to_owned(),
+            encoding: "json".to_owned(),
+            base64: STANDARD.encode(&authority_checkpoint_bytes),
+            sha256: sha256_hex(&authority_checkpoint_bytes),
+            size_bytes: authority_checkpoint_bytes.len(),
+            cloud_secret_store: true,
+        },
         registry_jwt: PublisherArtifact {
             local_path: display_path(&args.jwt),
-            install_path: "/run/hyprstream/credentials/registry-service.jwt".to_owned(),
+            install_path: REGISTRY_JWT_INSTALL_PATH.to_owned(),
             encoding: "utf8".to_owned(),
             base64: STANDARD.encode(jwt_bytes),
             sha256: sha256_hex(jwt_bytes),
@@ -547,8 +567,8 @@ fn mint_registry_jwt(args: &MintRegistryJwtArgs) -> Result<()> {
 
 fn verify_deployment(args: &VerifyDeploymentArgs) -> Result<()> {
     let public_ca = read_limited(&args.public_ca, PUBLIC_CA_BYTES)?;
-    let token = String::from_utf8(read_limited(&args.jwt, MAX_CLOUD_SECRET_BYTES)?)
-        .context("registry JWT is not UTF-8")?;
+    let token_bytes = read_limited(&args.jwt, MAX_CLOUD_SECRET_BYTES)?;
+    let token = String::from_utf8(token_bytes.clone()).context("registry JWT is not UTF-8")?;
     ensure!(
         !token.is_empty() && !token.bytes().any(|byte| byte.is_ascii_whitespace()),
         "registry JWT must be compact with no surrounding or embedded whitespace"
@@ -558,43 +578,63 @@ fn verify_deployment(args: &VerifyDeploymentArgs) -> Result<()> {
         .as_ref()
         .map(|path| read_json_limited::<PublisherManifest>(path, 1024 * 1024))
         .transpose()?;
-    let authority_log = match (&args.authority_log, contract.as_ref()) {
-        (Some(path), _) => Some(read_limited(path, MAX_CLOUD_SECRET_BYTES)?),
-        (None, Some(contract)) => contract
-            .authority_log
-            .as_ref()
-            .map(|artifact| STANDARD.decode(&artifact.base64))
-            .transpose()?,
-        (None, None) => None,
-    };
-    let verified = match authority_log.as_deref() {
-        Some(log) => hyprstream_discovery::verify_deployment_artifacts_with_authority_log(
-            &public_ca, log, &token,
-        ),
-        None => hyprstream_discovery::verify_deployment_artifacts(&public_ca, &token),
-    }?;
+    let authority_log = read_limited(&args.authority_log, MAX_CLOUD_SECRET_BYTES)?;
+    let authority_checkpoint = read_limited(&args.authority_checkpoint, MAX_CLOUD_SECRET_BYTES)?;
+    let verified = hyprstream_discovery::verify_deployment_artifacts_with_authority_log(
+        &public_ca,
+        &authority_log,
+        &authority_checkpoint,
+        &token,
+    )?;
     if let Some(contract) = contract {
         ensure!(
             contract.schema == PUBLISHER_MANIFEST_SCHEMA,
             "unsupported contract schema"
         );
         ensure!(
-            STANDARD.decode(&contract.public_ca.base64)? == public_ca,
-            "contract public CA does not match file"
+            contract.deployment_domain == verified.deployment_domain,
+            "contract deployment domain does not match authenticated JWT/root"
         );
         ensure!(
-            STANDARD.decode(&contract.registry_jwt.base64)? == token.as_bytes(),
-            "contract JWT does not match file"
+            contract.profile == REGISTRY_PROFILE,
+            "contract profile does not match the fixed deployment profile"
         );
-        if let Some(artifact) = contract.authority_log.as_ref() {
-            let log = authority_log
-                .as_ref()
-                .ok_or_else(|| anyhow!("contract authority log was not verified"))?;
-            ensure!(
-                STANDARD.decode(&artifact.base64)? == *log,
-                "contract authority log does not match verified bytes"
-            );
-        }
+        ensure!(
+            contract.audience == REGISTRY_AUDIENCE,
+            "contract audience does not match the fixed registry audience"
+        );
+        ensure!(
+            contract.expires_at == verified.expires_at,
+            "contract expiry does not equal the authenticated JWT exp"
+        );
+        verify_publisher_artifact(
+            &contract.public_ca,
+            &public_ca,
+            &display_path(&args.public_ca),
+            PUBLIC_CA_INSTALL_PATH,
+            "raw",
+        )?;
+        verify_publisher_artifact(
+            &contract.authority_log,
+            &authority_log,
+            &display_path(&args.authority_log),
+            AUTHORITY_LOG_INSTALL_PATH,
+            "json",
+        )?;
+        verify_publisher_artifact(
+            &contract.authority_checkpoint,
+            &authority_checkpoint,
+            &display_path(&args.authority_checkpoint),
+            AUTHORITY_CHECKPOINT_INSTALL_PATH,
+            "json",
+        )?;
+        verify_publisher_artifact(
+            &contract.registry_jwt,
+            &token_bytes,
+            &display_path(&args.jwt),
+            REGISTRY_JWT_INSTALL_PATH,
+            "utf8",
+        )?;
         ensure!(
             !contract.private_authority_exported
                 && !contract.terraform_state_may_contain_private_authority,
@@ -615,6 +655,51 @@ fn verify_deployment(args: &VerifyDeploymentArgs) -> Result<()> {
     Ok(())
 }
 
+fn verify_publisher_artifact(
+    artifact: &PublisherArtifact,
+    expected_bytes: &[u8],
+    expected_local_path: &str,
+    expected_install_path: &str,
+    expected_encoding: &str,
+) -> Result<()> {
+    ensure!(
+        artifact.local_path == expected_local_path,
+        "contract artifact local path does not match the verified input"
+    );
+    ensure!(
+        artifact.install_path == expected_install_path,
+        "contract artifact install path is not the fixed deployment path"
+    );
+    ensure!(
+        artifact.encoding == expected_encoding,
+        "contract artifact encoding is not the fixed deployment encoding"
+    );
+    ensure!(
+        artifact.cloud_secret_store,
+        "contract artifact unexpectedly forbids cloud secret-store publication"
+    );
+    let decoded = STANDARD
+        .decode(&artifact.base64)
+        .context("decode contract artifact base64")?;
+    ensure!(
+        STANDARD.encode(&decoded) == artifact.base64,
+        "contract artifact base64 is not canonical"
+    );
+    ensure!(
+        decoded == expected_bytes,
+        "contract artifact bytes do not match the verified input"
+    );
+    ensure!(
+        artifact.size_bytes == decoded.len(),
+        "contract artifact size does not match authenticated bytes"
+    );
+    ensure!(
+        artifact.sha256 == sha256_hex(&decoded),
+        "contract artifact SHA-256 does not match authenticated bytes"
+    );
+    Ok(())
+}
+
 fn rotate_authority(args: &RotateAuthorityArgs) -> Result<()> {
     ensure!(
         args.add ^ args.replace,
@@ -625,6 +710,7 @@ fn rotate_authority(args: &RotateAuthorityArgs) -> Result<()> {
             &args.new_authority_key,
             &args.new_public_key,
             &args.authority_log_out,
+            &args.authority_checkpoint_out,
         ],
         args.force,
     )?;
@@ -635,7 +721,9 @@ fn rotate_authority(args: &RotateAuthorityArgs) -> Result<()> {
     );
     let public_ca = read_limited(&args.public_ca, PUBLIC_CA_BYTES)?;
     let log: AuthorityLogFile = read_json_limited(&args.authority_log, MAX_CLOUD_SECRET_BYTES)?;
-    let active = validate_authority_log(&public_ca, &log)?;
+    let checkpoint: AuthorityCheckpointFile =
+        read_json_limited(&args.authority_checkpoint, MAX_CLOUD_SECRET_BYTES)?;
+    let active = validate_authority_log(&public_ca, &log, &checkpoint)?;
     let identities = combined_identities(&args.identities, &args.yubikey_identities)?;
     let current = decrypt_authority(&args.authority_key, &identities, args.software_recovery)?;
     ensure_active_authority(&current, &active)?;
@@ -678,7 +766,17 @@ fn rotate_authority(args: &RotateAuthorityArgs) -> Result<()> {
     let mut operations = operations;
     operations.push(next);
     let next_log = authority_log_from_ops(&log.deployment_domain, operations)?;
-    validate_authority_log(&public_ca, &next_log)?;
+    let next_verified = validate_authority_log_root(&public_ca, &next_log)?;
+    let expected_sequence = checkpoint
+        .sequence
+        .checked_add(1)
+        .ok_or_else(|| anyhow!("authority checkpoint sequence overflow"))?;
+    ensure!(
+        next_verified.did == checkpoint.did && next_verified.sequence == expected_sequence,
+        "authority rotation did not advance the trusted checkpoint exactly once"
+    );
+    let next_checkpoint = authority_checkpoint(&next_log.deployment_domain, &next_verified);
+    validate_authority_log(&public_ca, &next_log, &next_checkpoint)?;
 
     let new_bundle = AuthorityBundle {
         schema: AUTHORITY_BUNDLE_SCHEMA.to_owned(),
@@ -686,15 +784,14 @@ fn rotate_authority(args: &RotateAuthorityArgs) -> Result<()> {
         deployment_domain: log.deployment_domain.clone(),
         public_key_sha256: sha256_hex(&new_public),
         ed25519: Ed25519Secret::Software {
-            seed_b64: STANDARD.encode(new_ed.to_bytes()),
+            seed_b64: encode_secret_b64(new_ed.to_bytes()),
             public_b64: STANDARD.encode(new_ed.verifying_key().as_bytes()),
         },
-        ml_dsa_65_seed_b64: STANDARD.encode(ml_dsa_sk_to_seed(&new_pq)),
+        ml_dsa_65_seed_b64: encode_secret_b64(ml_dsa_sk_to_seed(&new_pq)),
         recipient_count: recipients.len(),
     };
-    let mut plaintext = serde_json::to_vec(&new_bundle)?;
+    let plaintext = serialize_secret_json(&new_bundle)?;
     let encrypted = encrypt_age(&plaintext, &recipients)?;
-    plaintext.zeroize();
 
     commit_outputs(vec![
         PendingOutput::new(&args.new_public_key, new_public, 0o644),
@@ -704,6 +801,11 @@ fn rotate_authority(args: &RotateAuthorityArgs) -> Result<()> {
             pretty_json_bytes(&next_log)?,
             0o644,
         ),
+        PendingOutput::new(
+            &args.authority_checkpoint_out,
+            pretty_json_bytes(&next_checkpoint)?,
+            0o644,
+        ),
     ])?;
     println!(
         "{}",
@@ -711,11 +813,13 @@ fn rotate_authority(args: &RotateAuthorityArgs) -> Result<()> {
             "schema": "hyprstream.authority-rotation-output.v1",
             "deployment_domain": next_log.deployment_domain,
             "authority_log_did": next_log.did,
-            "sequence": next_log.operations_b64.len() - 1,
+            "sequence": next_checkpoint.sequence,
+            "head_cid": next_checkpoint.head_cid,
             "mode": if args.add { "add" } else { "replace" },
             "new_public_key_path": display_path(&args.new_public_key),
             "new_authority_key_path": display_path(&args.new_authority_key),
-            "authority_log_path": display_path(&args.authority_log_out)
+            "authority_log_path": display_path(&args.authority_log_out),
+            "authority_checkpoint_path": display_path(&args.authority_checkpoint_out)
         }))?
     );
     Ok(())
@@ -803,7 +907,7 @@ fn encrypt_age(plaintext: &[u8], recipients: &[String]) -> Result<Vec<u8>> {
     Ok(output.stdout)
 }
 
-fn decrypt_age(path: &Path, identities: &[PathBuf]) -> Result<Vec<u8>> {
+fn decrypt_age(path: &Path, identities: &[PathBuf]) -> Result<Zeroizing<Vec<u8>>> {
     let mut command = Command::new("age");
     command
         .arg("--decrypt")
@@ -817,12 +921,14 @@ fn decrypt_age(path: &Path, identities: &[PathBuf]) -> Result<Vec<u8>> {
     }
     command.arg(path);
     let output = command.output().context("launch age decryption")?;
-    ensure!(output.status.success(), "age decryption failed");
+    let status = output.status;
+    let plaintext = Zeroizing::new(output.stdout);
+    ensure!(status.success(), "age decryption failed");
     ensure!(
-        output.stdout.len() <= 128 * 1024,
+        plaintext.len() <= 128 * 1024,
         "decrypted authority bundle is too large"
     );
-    Ok(output.stdout)
+    Ok(plaintext)
 }
 
 fn decrypt_authority(
@@ -830,17 +936,15 @@ fn decrypt_authority(
     identities: &[PathBuf],
     software_recovery: bool,
 ) -> Result<LoadedAuthority> {
-    let mut plaintext = decrypt_age(path, identities)?;
+    let plaintext = decrypt_age(path, identities)?;
     let bundle: AuthorityBundle =
         serde_json::from_slice(&plaintext).context("decode authority bundle")?;
-    plaintext.zeroize();
     ensure!(
         bundle.schema == AUTHORITY_BUNDLE_SCHEMA,
         "unsupported authority bundle schema"
     );
-    let mut pq_seed = decode_fixed_b64::<32>(&bundle.ml_dsa_65_seed_b64, "ML-DSA-65 seed")?;
+    let pq_seed = decode_fixed_b64::<32>(&bundle.ml_dsa_65_seed_b64, "ML-DSA-65 seed")?;
     let pq = ml_dsa_sk_from_seed(&pq_seed);
-    pq_seed.zeroize();
     let ed = match &bundle.ed25519 {
         Ed25519Secret::Software {
             seed_b64,
@@ -850,9 +954,8 @@ fn decrypt_authority(
                 !software_recovery,
                 "--software-recovery applies only to a PIV-backed authority"
             );
-            let mut seed = decode_fixed_b64::<32>(seed_b64, "Ed25519 seed")?;
+            let seed = decode_fixed_b64::<32>(seed_b64, "Ed25519 seed")?;
             let key = SigningKey::from_bytes(&seed);
-            seed.zeroize();
             ensure!(
                 STANDARD.decode(public_b64)? == key.verifying_key().as_bytes(),
                 "authority Ed25519 public key does not match seed"
@@ -869,10 +972,8 @@ fn decrypt_authority(
             let public =
                 VerifyingKey::from_bytes(&public_bytes).context("invalid PIV public key")?;
             if software_recovery {
-                let mut seed =
-                    decode_fixed_b64::<32>(recovery_seed_b64, "PIV recovery Ed25519 seed")?;
+                let seed = decode_fixed_b64::<32>(recovery_seed_b64, "PIV recovery Ed25519 seed")?;
                 let key = SigningKey::from_bytes(&seed);
-                seed.zeroize();
                 ensure!(
                     key.verifying_key() == public,
                     "PIV recovery seed does not match the recorded public key"
@@ -1119,7 +1220,7 @@ fn decode_authority_operations(log: &AuthorityLogFile) -> Result<Vec<DidOp>> {
         .collect()
 }
 
-fn validate_authority_log(
+fn validate_authority_log_root(
     public_ca: &[u8],
     log: &AuthorityLogFile,
 ) -> Result<hyprstream_discovery::did_op::VerifiedDidOpLog> {
@@ -1155,6 +1256,43 @@ fn validate_authority_log(
             key.ed25519_pub == root_ed.to_bytes() && key.mldsa65_pub == ml_dsa_vk_bytes(&root_pq)
         }),
         "authority log genesis is not anchored by the pinned public root"
+    );
+    Ok(verified)
+}
+
+fn authority_checkpoint(
+    deployment_domain: &str,
+    verified: &hyprstream_discovery::did_op::VerifiedDidOpLog,
+) -> AuthorityCheckpointFile {
+    AuthorityCheckpointFile {
+        schema: AUTHORITY_CHECKPOINT_SCHEMA.to_owned(),
+        deployment_domain: deployment_domain.to_owned(),
+        did: verified.did.clone(),
+        sequence: verified.sequence,
+        head_cid: verified.head_cid.clone(),
+    }
+}
+
+fn validate_authority_log(
+    public_ca: &[u8],
+    log: &AuthorityLogFile,
+    checkpoint: &AuthorityCheckpointFile,
+) -> Result<hyprstream_discovery::did_op::VerifiedDidOpLog> {
+    let verified = validate_authority_log_root(public_ca, log)?;
+    ensure!(
+        checkpoint.schema == AUTHORITY_CHECKPOINT_SCHEMA,
+        "unsupported authority-checkpoint schema"
+    );
+    ensure!(
+        checkpoint.deployment_domain == log.deployment_domain,
+        "authority checkpoint deployment domain does not match log"
+    );
+    ensure!(
+        checkpoint.did == log.did
+            && checkpoint.did == verified.did
+            && checkpoint.sequence == verified.sequence
+            && checkpoint.head_cid == verified.head_cid,
+        "authority-log head does not match the independently trusted checkpoint"
     );
     Ok(verified)
 }
@@ -1256,6 +1394,7 @@ fn validate_registry_delegation_ucan(
 fn validate_delegation_artifact(
     public_ca: &[u8],
     authority_log: &AuthorityLogFile,
+    authority_checkpoint: &AuthorityCheckpointFile,
     artifact: &DelegationArtifact,
     now: u64,
 ) -> Result<()> {
@@ -1263,7 +1402,7 @@ fn validate_delegation_artifact(
         artifact.schema == DELEGATION_SCHEMA,
         "unsupported delegation schema"
     );
-    let active = validate_authority_log(public_ca, authority_log)?;
+    let active = validate_authority_log(public_ca, authority_log, authority_checkpoint)?;
     ensure!(
         artifact.deployment_domain == authority_log.deployment_domain,
         "delegation domain does not match authority log"
@@ -1429,6 +1568,12 @@ fn pretty_json_bytes(value: &impl Serialize) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
+fn serialize_secret_json(value: &impl Serialize) -> Result<Zeroizing<Vec<u8>>> {
+    let mut plaintext = Zeroizing::new(Vec::new());
+    serde_json::to_writer(&mut *plaintext, value)?;
+    Ok(plaintext)
+}
+
 struct PendingOutput<'a> {
     path: &'a Path,
     bytes: Vec<u8>,
@@ -1469,49 +1614,125 @@ fn commit_outputs(outputs: Vec<PendingOutput<'_>>) -> Result<()> {
             let backup = placeholder.path().to_path_buf();
             drop(placeholder);
             if let Err(error) = std::fs::rename(output.path, &backup) {
-                restore_outputs(&outputs, &backups, 0);
-                cleanup_paths(&staged);
-                return Err(error)
-                    .with_context(|| format!("back up existing {}", output.path.display()));
+                return Err(transaction_failure(
+                    error.into(),
+                    format!("back up existing {}", output.path.display()),
+                    restore_outputs(&outputs, &backups, 0),
+                    cleanup_paths(&staged),
+                ));
             }
             backups[index] = Some(backup);
         }
     }
+    if let Err(error) = sync_output_parents(&outputs) {
+        return Err(transaction_failure(
+            error,
+            "durably record output backups".to_owned(),
+            restore_outputs(&outputs, &backups, 0),
+            cleanup_paths(&staged),
+        ));
+    }
 
     for (index, output) in outputs.iter().enumerate() {
         if let Err(error) = std::fs::rename(&staged[index], output.path) {
-            restore_outputs(&outputs, &backups, index);
-            cleanup_paths(&staged[index..]);
-            return Err(error).with_context(|| format!("commit {}", output.path.display()));
+            return Err(transaction_failure(
+                error.into(),
+                format!("commit {}", output.path.display()),
+                restore_outputs(&outputs, &backups, index),
+                cleanup_paths(&staged[index..]),
+            ));
         }
     }
-
-    for backup in backups.into_iter().flatten() {
-        let _ = std::fs::remove_file(backup);
+    if let Err(error) = sync_output_parents(&outputs) {
+        return Err(transaction_failure(
+            error,
+            "durably record committed outputs".to_owned(),
+            restore_outputs(&outputs, &backups, outputs.len()),
+            Ok(()),
+        ));
     }
-    sync_output_parents(&outputs);
+
+    let mut cleanup_errors = Vec::new();
+    for backup in backups.into_iter().flatten() {
+        if let Err(error) = std::fs::remove_file(&backup) {
+            cleanup_errors.push(format!("remove backup {}: {error}", backup.display()));
+        }
+    }
+    if let Err(error) = sync_output_parents(&outputs) {
+        cleanup_errors.push(format!("durably record backup deletion: {error:#}"));
+    }
+    ensure!(
+        cleanup_errors.is_empty(),
+        "outputs committed, but transaction cleanup was incomplete; preserved backup state where possible: {}",
+        cleanup_errors.join("; ")
+    );
     Ok(())
 }
 
-fn restore_outputs(outputs: &[PendingOutput<'_>], backups: &[Option<PathBuf>], committed: usize) {
+fn transaction_failure(
+    primary: anyhow::Error,
+    context: String,
+    rollback: Result<()>,
+    staged_cleanup: Result<()>,
+) -> anyhow::Error {
+    let mut message = format!("{context}: {primary:#}");
+    if let Err(error) = rollback {
+        message.push_str(&format!(
+            "; ROLLBACK INCOMPLETE (backup state preserved where possible): {error:#}"
+        ));
+    }
+    if let Err(error) = staged_cleanup {
+        message.push_str(&format!("; staged-output cleanup incomplete: {error:#}"));
+    }
+    anyhow!(message)
+}
+
+fn restore_outputs(
+    outputs: &[PendingOutput<'_>],
+    backups: &[Option<PathBuf>],
+    committed: usize,
+) -> Result<()> {
+    let mut errors = Vec::new();
     for output in outputs.iter().take(committed) {
-        let _ = std::fs::remove_file(output.path);
+        if let Err(error) = std::fs::remove_file(output.path) {
+            errors.push(format!(
+                "remove newly committed {}: {error}",
+                output.path.display()
+            ));
+        }
     }
     for (output, backup) in outputs.iter().zip(backups).rev() {
         if let Some(backup) = backup {
-            let _ = std::fs::rename(backup, output.path);
+            if let Err(error) = std::fs::rename(backup, output.path) {
+                errors.push(format!(
+                    "restore {} from {}: {error}",
+                    output.path.display(),
+                    backup.display()
+                ));
+            }
         }
     }
-    sync_output_parents(outputs);
-}
-
-fn cleanup_paths(paths: &[PathBuf]) {
-    for path in paths {
-        let _ = std::fs::remove_file(path);
+    if let Err(error) = sync_output_parents(outputs) {
+        errors.push(format!("durably record rollback: {error:#}"));
     }
+    ensure!(errors.is_empty(), "{}", errors.join("; "));
+    Ok(())
 }
 
-fn sync_output_parents(outputs: &[PendingOutput<'_>]) {
+fn cleanup_paths(paths: &[PathBuf]) -> Result<()> {
+    let mut errors = Vec::new();
+    for path in paths {
+        if path.exists() {
+            if let Err(error) = std::fs::remove_file(path) {
+                errors.push(format!("remove staged {}: {error}", path.display()));
+            }
+        }
+    }
+    ensure!(errors.is_empty(), "{}", errors.join("; "));
+    Ok(())
+}
+
+fn sync_output_parents(outputs: &[PendingOutput<'_>]) -> Result<()> {
     let parents: BTreeSet<_> = outputs
         .iter()
         .map(|output| {
@@ -1523,10 +1744,13 @@ fn sync_output_parents(outputs: &[PendingOutput<'_>]) {
         })
         .collect();
     for parent in parents {
-        if let Ok(directory) = std::fs::File::open(parent) {
-            let _ = directory.sync_all();
-        }
+        let directory = std::fs::File::open(&parent)
+            .with_context(|| format!("open output directory {}", parent.display()))?;
+        directory
+            .sync_all()
+            .with_context(|| format!("fsync output directory {}", parent.display()))?;
     }
+    Ok(())
 }
 
 fn read_limited(path: &Path, max: usize) -> Result<Vec<u8>> {
@@ -1558,12 +1782,22 @@ fn read_json_limited<T: for<'de> Deserialize<'de>>(path: &Path, max: usize) -> R
         .with_context(|| format!("decode JSON {}", path.display()))
 }
 
-fn decode_fixed_b64<const N: usize>(value: &str, description: &str) -> Result<[u8; N]> {
-    STANDARD
-        .decode(value)
-        .with_context(|| format!("decode {description}"))?
+fn decode_fixed_b64<const N: usize>(value: &str, description: &str) -> Result<Zeroizing<[u8; N]>> {
+    let decoded = Zeroizing::new(
+        STANDARD
+            .decode(value)
+            .with_context(|| format!("decode {description}"))?,
+    );
+    decoded
+        .as_slice()
         .try_into()
+        .map(Zeroizing::new)
         .map_err(|_| anyhow!("{description} must decode to exactly {N} bytes"))
+}
+
+fn encode_secret_b64<const N: usize>(secret: [u8; N]) -> String {
+    let secret = Zeroizing::new(secret);
+    STANDARD.encode(secret.as_ref())
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -1575,7 +1809,14 @@ fn sha256_hex(bytes: &[u8]) -> String {
 
 fn display_path(path: &Path) -> String {
     path.canonicalize()
-        .unwrap_or_else(|_| path.to_path_buf())
+        .unwrap_or_else(|_| {
+            path.parent()
+                .unwrap_or_else(|| Path::new("."))
+                .canonicalize()
+                .ok()
+                .and_then(|parent| path.file_name().map(|name| parent.join(name)))
+                .unwrap_or_else(|| path.to_path_buf())
+        })
         .display()
         .to_string()
 }
@@ -1614,15 +1855,35 @@ mod tests {
                 deployment_domain: domain,
                 public_key_sha256: sha256_hex(&public),
                 ed25519: Ed25519Secret::Software {
-                    seed_b64: STANDARD.encode(ed.to_bytes()),
+                    seed_b64: encode_secret_b64(ed.to_bytes()),
                     public_b64: STANDARD.encode(ed.verifying_key().as_bytes()),
                 },
-                ml_dsa_65_seed_b64: STANDARD.encode(ml_dsa_sk_to_seed(&pq)),
+                ml_dsa_65_seed_b64: encode_secret_b64(ml_dsa_sk_to_seed(&pq)),
                 recipient_count: 2,
             },
             ed: LoadedEdSigner::Software(ed),
             pq,
         }
+    }
+
+    fn checkpoint_for(log: &AuthorityLogFile) -> AuthorityCheckpointFile {
+        let operations = decode_authority_operations(log).unwrap();
+        let verified = verify_did_op_log(&log.did, &operations).unwrap();
+        authority_checkpoint(&log.deployment_domain, &verified)
+    }
+
+    fn verify_with_log(
+        public_ca: &[u8],
+        log: &AuthorityLogFile,
+        checkpoint: &AuthorityCheckpointFile,
+        token: &str,
+    ) -> Result<hyprstream_discovery::VerifiedDeploymentArtifacts> {
+        hyprstream_discovery::verify_deployment_artifacts_with_authority_log(
+            public_ca,
+            &serde_json::to_vec(log)?,
+            &serde_json::to_vec(checkpoint)?,
+            token,
+        )
     }
 
     #[test]
@@ -1633,6 +1894,7 @@ mod tests {
             public_ca: "ca".into(),
             authority_key: "key".into(),
             authority_log: "log".into(),
+            authority_checkpoint: "head".into(),
             recipients: vec!["age1one".to_owned(), "age1one".to_owned()],
             yubikey_recipients: vec![],
             kms_plugin_recipients: vec![],
@@ -1684,7 +1946,24 @@ mod tests {
                 size_bytes: 1,
                 cloud_secret_store: true,
             },
-            authority_log: None,
+            authority_log: PublisherArtifact {
+                local_path: "log".to_owned(),
+                install_path: AUTHORITY_LOG_INSTALL_PATH.to_owned(),
+                encoding: "json".to_owned(),
+                base64: "eA==".to_owned(),
+                sha256: sha256_hex(b"x"),
+                size_bytes: 1,
+                cloud_secret_store: true,
+            },
+            authority_checkpoint: PublisherArtifact {
+                local_path: "head".to_owned(),
+                install_path: AUTHORITY_CHECKPOINT_INSTALL_PATH.to_owned(),
+                encoding: "json".to_owned(),
+                base64: "eA==".to_owned(),
+                sha256: sha256_hex(b"x"),
+                size_bytes: 1,
+                cloud_secret_store: true,
+            },
             registry_jwt: PublisherArtifact {
                 local_path: "jwt".to_owned(),
                 install_path: "jwt".to_owned(),
@@ -1701,6 +1980,67 @@ mod tests {
         let object = value.as_object().unwrap();
         assert!(!object.contains_key("authority_key"));
         assert_eq!(object["private_authority_exported"], false);
+    }
+
+    #[test]
+    fn publisher_artifact_verification_covers_every_contract_field() {
+        let bytes = b"authenticated artifact bytes";
+        let valid = PublisherArtifact {
+            local_path: "/operator/artifact".to_owned(),
+            install_path: PUBLIC_CA_INSTALL_PATH.to_owned(),
+            encoding: "raw".to_owned(),
+            base64: STANDARD.encode(bytes),
+            sha256: sha256_hex(bytes),
+            size_bytes: bytes.len(),
+            cloud_secret_store: true,
+        };
+        verify_publisher_artifact(
+            &valid,
+            bytes,
+            "/operator/artifact",
+            PUBLIC_CA_INSTALL_PATH,
+            "raw",
+        )
+        .unwrap();
+
+        let mutations: [(&str, fn(&mut PublisherArtifact)); 7] = [
+            ("local_path", |artifact| {
+                artifact.local_path = "/attacker".to_owned();
+            }),
+            ("install_path", |artifact| {
+                artifact.install_path = "/tmp/attacker".to_owned();
+            }),
+            ("encoding", |artifact| {
+                artifact.encoding = "utf8".to_owned();
+            }),
+            ("base64", |artifact| {
+                artifact.base64 = STANDARD.encode(b"attacker");
+            }),
+            ("sha256", |artifact| {
+                artifact.sha256 = "00".repeat(32);
+            }),
+            ("size_bytes", |artifact| {
+                artifact.size_bytes += 1;
+            }),
+            ("cloud_secret_store", |artifact| {
+                artifact.cloud_secret_store = false;
+            }),
+        ];
+        for (field, mutate) in mutations {
+            let mut changed = valid.clone();
+            mutate(&mut changed);
+            assert!(
+                verify_publisher_artifact(
+                    &changed,
+                    bytes,
+                    "/operator/artifact",
+                    PUBLIC_CA_INSTALL_PATH,
+                    "raw",
+                )
+                .is_err(),
+                "modified contract field {field} was accepted"
+            );
+        }
     }
 
     #[test]
@@ -1725,6 +2065,7 @@ mod tests {
         .unwrap();
         let genesis_log =
             authority_log_from_ops(&root.bundle.deployment_domain, vec![genesis.clone()]).unwrap();
+        let genesis_checkpoint = checkpoint_for(&genesis_log);
 
         let delegated = test_authority(
             AuthorityPurpose::RegistryDelegatedSigner,
@@ -1772,18 +2113,8 @@ mod tests {
             Some(&URL_SAFE_NO_PAD.encode(serde_json::to_vec(&artifact).unwrap())),
         )
         .unwrap();
-        hyprstream_discovery::verify_deployment_artifacts_with_authority_log(
-            &public_ca,
-            &serde_json::to_vec(&genesis_log).unwrap(),
-            &direct_token,
-        )
-        .unwrap();
-        hyprstream_discovery::verify_deployment_artifacts_with_authority_log(
-            &public_ca,
-            &serde_json::to_vec(&genesis_log).unwrap(),
-            &token,
-        )
-        .unwrap();
+        verify_with_log(&public_ca, &genesis_log, &genesis_checkpoint, &direct_token).unwrap();
+        verify_with_log(&public_ca, &genesis_log, &genesis_checkpoint, &token).unwrap();
 
         let added = test_authority(
             AuthorityPurpose::RotatedAuthority,
@@ -1810,12 +2141,8 @@ mod tests {
             vec![genesis.clone(), add.clone()],
         )
         .unwrap();
-        hyprstream_discovery::verify_deployment_artifacts_with_authority_log(
-            &public_ca,
-            &serde_json::to_vec(&add_log).unwrap(),
-            &token,
-        )
-        .unwrap();
+        let add_checkpoint = checkpoint_for(&add_log);
+        verify_with_log(&public_ca, &add_log, &add_checkpoint, &token).unwrap();
 
         let replace = sign_did_op(
             DidOp {
@@ -1831,21 +2158,14 @@ mod tests {
         let replace_log =
             authority_log_from_ops(&root.bundle.deployment_domain, vec![genesis, add, replace])
                 .unwrap();
+        let replace_checkpoint = checkpoint_for(&replace_log);
         assert!(
-            hyprstream_discovery::verify_deployment_artifacts_with_authority_log(
-                &public_ca,
-                &serde_json::to_vec(&replace_log).unwrap(),
-                &token,
-            )
-            .is_err()
+            verify_with_log(&public_ca, &genesis_log, &replace_checkpoint, &token,).is_err(),
+            "historical authority-log prefix matched against a newer checkpoint"
         );
+        assert!(verify_with_log(&public_ca, &replace_log, &replace_checkpoint, &token,).is_err());
         assert!(
-            hyprstream_discovery::verify_deployment_artifacts_with_authority_log(
-                &public_ca,
-                &serde_json::to_vec(&replace_log).unwrap(),
-                &direct_token,
-            )
-            .is_err()
+            verify_with_log(&public_ca, &replace_log, &replace_checkpoint, &direct_token,).is_err()
         );
     }
 
@@ -1862,10 +2182,22 @@ mod tests {
             None,
         )
         .unwrap();
+        assert!(hyprstream_discovery::verify_genesis_deployment_artifacts(
+            &root.public_bytes(),
+            &token
+        )
+        .is_ok());
         assert!(
-            hyprstream_discovery::verify_deployment_artifacts(&root.public_bytes(), &token).is_ok()
+            hyprstream_discovery::verify_deployment_artifacts_with_authority_log(
+                &root.public_bytes(),
+                b"",
+                b"",
+                &token,
+            )
+            .is_err(),
+            "enrolled verification inferred direct-root genesis mode from omitted trust files"
         );
-        assert!(hyprstream_discovery::verify_deployment_artifacts(
+        assert!(hyprstream_discovery::verify_genesis_deployment_artifacts(
             &root.public_bytes(),
             &format!("{token}\n")
         )

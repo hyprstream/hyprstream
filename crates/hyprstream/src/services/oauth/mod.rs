@@ -264,8 +264,9 @@ pub fn create_app(state: Arc<OAuthState>, cors_config: &crate::config::CorsConfi
     if state.deployment_well_known_dir.is_some() {
         // #1137 serving half — deployment mode: this host terminates the
         // deployment's did:web. The static router owns `/.well-known/did.json`
-        // plus the at9p capsule and registry credential endpoints (each 404s
-        // when its file is absent — never a silent fall-through).
+        // plus the at9p capsule, authority log, and registry credential
+        // endpoints (each 404s when its file is absent — never a silent
+        // fall-through).
         did_router = did_router.merge(deployment_well_known::router(
             state.deployment_well_known_dir.clone(),
         ));
