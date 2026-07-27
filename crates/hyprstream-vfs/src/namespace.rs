@@ -6,7 +6,9 @@
 use std::sync::Arc;
 
 use hyprstream_rpc::Subject;
-use crate::mac_pep::{NamespaceAction, NamespacePep};
+use crate::mac_pep::NamespaceAction;
+#[cfg(not(target_arch = "wasm32"))]
+use crate::mac_pep::NamespacePep;
 use crate::mount::{DirEntry, Mount, MountError, Stat, OWRITE};
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -103,6 +105,7 @@ pub struct Namespace {
     mounts: Vec<MountEntry>,
     /// Mandatory MAC reference monitor over the direct API. `None` ⇒ the
     /// un-enforced status quo; `Some` ⇒ every mediated op must pass it.
+    #[cfg(not(target_arch = "wasm32"))]
     pep: Option<Arc<NamespacePep>>,
 }
 
@@ -115,6 +118,7 @@ impl Namespace {
     pub fn new() -> Self {
         Self {
             mounts: Vec::new(),
+            #[cfg(not(target_arch = "wasm32"))]
             pep: None,
         }
     }
@@ -128,19 +132,28 @@ impl Namespace {
     /// itself is fail-closed by construction (see [`NamespacePep`]).
     ///
     /// Returns the previous PEP, if any (enables atomic re-arm in tests).
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn set_pep(&mut self, pep: Arc<NamespacePep>) -> Option<Arc<NamespacePep>> {
         self.pep.replace(pep)
     }
 
     /// Whether a MAC PEP is currently armed on this namespace.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn pep_armed(&self) -> bool {
         self.pep.is_some()
+    }
+
+    /// Browser namespaces are clients; server-side MAC enforcement is absent.
+    #[cfg(target_arch = "wasm32")]
+    pub const fn pep_armed(&self) -> bool {
+        false
     }
 
     /// Enforce `action` by `subject` against the object at `path` when a PEP is
     /// armed. No-op (permit) when no PEP is installed — the dormant status quo.
     /// Fail-closed when armed: any unresolvable clearance/label or failed
     /// `can_access` yields [`NamespaceError::Denied`].
+    #[cfg(not(target_arch = "wasm32"))]
     fn enforce(&self, subject: &Subject, path: &str, action: NamespaceAction) -> Result<(), NamespaceError> {
         let Some(pep) = &self.pep else {
             return Ok(());
@@ -151,6 +164,18 @@ impl Namespace {
         // namespace supplies only the path, never a caller-authored label.
         let normalized = normalize_path(path);
         pep.authorize(subject, &normalized, action)
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    const fn enforce(
+        &self,
+        _subject: &Subject,
+        _path: &str,
+        _action: NamespaceAction,
+    ) -> Result<(), NamespaceError> {
+        // Browser VFS is a client. The native service boundary owns the
+        // mandatory MAC reference monitor and never delegates it to wasm.
+        Ok(())
     }
 
     /// Mount a target at a path prefix (replaces any existing mount).
@@ -186,6 +211,7 @@ impl Namespace {
     /// Like [`Self::mount`], this is the **construction** path (no subject):
     /// when a PEP is armed it denies — use [`Self::bind_mount_as`].
     pub fn bind_mount(&mut self, prefix: &str, target: MountTarget, flag: BindFlag) -> Result<(), NamespaceError> {
+        #[cfg(not(target_arch = "wasm32"))]
         if let Some(pep) = &self.pep {
             // An armed namespace cannot mutate without a proven subject — the
             // subject-less construction path is intentionally closed once the
@@ -263,6 +289,7 @@ impl Namespace {
     /// Construction path (no subject): denies when a PEP is armed — use
     /// [`Self::unmount_as`].
     pub fn unmount(&mut self, prefix: &str) -> Result<(), NamespaceError> {
+        #[cfg(not(target_arch = "wasm32"))]
         if let Some(pep) = &self.pep {
             let normalized = normalize_path(prefix);
             return Err(pep.deny_uncredentialed(&normalized, NamespaceAction::Unmount));
@@ -288,6 +315,7 @@ impl Namespace {
     /// child do not affect the parent.
     pub fn fork(&self) -> Namespace {
         Namespace {
+            #[cfg(not(target_arch = "wasm32"))]
             pep: self.pep.clone(),
             mounts: self.mounts.iter().map(|m| MountEntry {
                 prefix: m.prefix.clone(),
@@ -900,7 +928,7 @@ fn split_path(path: &str) -> Vec<&str> {
 // Tests
 // ─────────────────────────────────────────────────────────────────────────────
 
-#[cfg(test)]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 #[allow(clippy::unwrap_used, clippy::disallowed_types)]
 mod tests {
     use super::*;
