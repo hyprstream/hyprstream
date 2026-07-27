@@ -394,26 +394,110 @@ impl UserStore for RocksDbUserStore {
         use base64::Engine;
 
         let _guard = self.provisioning_lock.lock();
-        if self
+        let fingerprint = pubkey_fingerprint(&pubkey);
+        let usable_binding = |owner: &str,
+                              raw: &(String, UserProfile, Vec<StoredPubkey>)|
+         -> std::result::Result<bool, HostedAccountProvisionError> {
+            let (sub, profile, keys) = raw;
+            if sub.is_empty()
+                || profile.sub.as_deref() != Some(sub)
+                || profile.active != Some(true)
+                || !profile
+                    .atproto_did
+                    .as_deref()
+                    .is_some_and(|did| did.starts_with("did:web:"))
+                || profile.key_custody.is_none()
+                || keys.is_empty()
+            {
+                return Ok(false);
+            }
+            for key in keys {
+                let valid_key = URL_SAFE_NO_PAD
+                    .decode(&key.pubkey_base64)
+                    .ok()
+                    .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
+                    .and_then(|bytes| VerifyingKey::from_bytes(&bytes).ok())
+                    .is_some_and(|key_bytes| pubkey_fingerprint(&key_bytes) == key.fingerprint);
+                if !valid_key {
+                    continue;
+                }
+                if self
+                    .get_pubkey_index(&key.fingerprint)
+                    .map_err(HostedAccountProvisionError::Backend)?
+                    .as_deref()
+                    == Some(owner)
+                {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        };
+
+        if let Some(raw) = self
             .get_raw(username)
             .map_err(HostedAccountProvisionError::Backend)?
-            .is_some()
         {
-            return Err(HostedAccountProvisionError::AccountAlreadyExists);
+            let (_, profile, keys) = &raw;
+            let exact_key = keys.iter().any(|key| {
+                key.fingerprint == fingerprint
+                    && key.algorithm == KeyAlgorithm::Ed25519
+                    && key.pq_pubkey.is_none()
+                    && URL_SAFE_NO_PAD
+                        .decode(&key.pubkey_base64)
+                        .is_ok_and(|bytes| bytes.as_slice() == pubkey.as_bytes())
+            });
+            let exact = profile.sub.as_deref() == Some(raw.0.as_str())
+                && profile.active.is_some()
+                && profile.atproto_did.as_deref() == Some(atproto_did)
+                && profile.key_custody == Some(custody)
+                && profile.external_identities.is_empty()
+                && exact_key
+                && self
+                    .get_pubkey_index(&fingerprint)
+                    .map_err(HostedAccountProvisionError::Backend)?
+                    .as_deref()
+                    == Some(username);
+            if exact {
+                return Ok(HostedAccountProvisioning {
+                    sub: raw.0,
+                    fingerprint,
+                    resumed: true,
+                });
+            }
+            if usable_binding(username, &raw)? {
+                return Err(HostedAccountProvisionError::AccountAlreadyExists);
+            }
+            return Err(HostedAccountProvisionError::Backend(anyhow!(
+                "existing hosted-account username has no usable credential binding"
+            )));
         }
-        let fingerprint = pubkey_fingerprint(&pubkey);
-        if self
+
+        if let Some(owner) = self
             .get_pubkey_index(&fingerprint)
             .map_err(HostedAccountProvisionError::Backend)?
-            .is_some()
         {
-            return Err(HostedAccountProvisionError::KeyAlreadyBound);
+            let owner_raw = self
+                .get_raw(&owner)
+                .map_err(HostedAccountProvisionError::Backend)?
+                .ok_or_else(|| {
+                    HostedAccountProvisionError::Backend(anyhow!(
+                        "hosted-account key owner profile is missing"
+                    ))
+                })?;
+            if usable_binding(&owner, &owner_raw)? {
+                return Err(HostedAccountProvisionError::KeyAlreadyBound);
+            }
+            return Err(HostedAccountProvisionError::Backend(anyhow!(
+                "existing hosted-account key owner has no usable credential binding"
+            )));
         }
 
         let sub = uuid::Uuid::new_v4().to_string();
         let profile = UserProfile {
             sub: Some(sub.clone()),
-            active: Some(true),
+            // The OAuth authorize transaction activates this binding only
+            // after durable PDS genesis publication succeeds.
+            active: Some(false),
             atproto_did: Some(atproto_did.to_owned()),
             key_custody: Some(custody),
             external_identities: Vec::new(),
@@ -443,7 +527,69 @@ impl UserStore for RocksDbUserStore {
             .write(batch)
             .map_err(|error| HostedAccountProvisionError::Backend(error.into()))?;
 
-        Ok(HostedAccountProvisioning { sub, fingerprint })
+        Ok(HostedAccountProvisioning {
+            sub,
+            fingerprint,
+            resumed: false,
+        })
+    }
+
+    async fn activate_hosted_account(
+        &self,
+        username: &str,
+        atproto_did: &str,
+        fingerprint: &str,
+        custody: AccountKeyCustody,
+    ) -> std::result::Result<(), HostedAccountProvisionError> {
+        let _guard = self.provisioning_lock.lock();
+        let (sub, mut profile, pubkeys) = self
+            .get_raw(username)
+            .map_err(HostedAccountProvisionError::Backend)?
+            .ok_or_else(|| {
+                HostedAccountProvisionError::Backend(anyhow!(
+                    "staged hosted-account profile is missing"
+                ))
+            })?;
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use base64::Engine;
+        let key_matches = pubkeys.iter().any(|key| {
+            key.fingerprint == fingerprint
+                && URL_SAFE_NO_PAD
+                    .decode(&key.pubkey_base64)
+                    .ok()
+                    .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
+                    .and_then(|bytes| VerifyingKey::from_bytes(&bytes).ok())
+                    .is_some_and(|key_bytes| pubkey_fingerprint(&key_bytes) == fingerprint)
+        });
+        let reverse_matches = self
+            .get_pubkey_index(fingerprint)
+            .map_err(HostedAccountProvisionError::Backend)?
+            .as_deref()
+            == Some(username);
+        if profile.sub.as_deref() != Some(sub.as_str())
+            || profile.atproto_did.as_deref() != Some(atproto_did)
+            || profile.key_custody != Some(custody)
+            || !key_matches
+            || !reverse_matches
+        {
+            return Err(HostedAccountProvisionError::Backend(anyhow!(
+                "staged hosted-account binding changed before activation"
+            )));
+        }
+        if profile.active == Some(true) {
+            return Ok(());
+        }
+        if profile.active != Some(false) {
+            return Err(HostedAccountProvisionError::Backend(anyhow!(
+                "staged hosted-account binding has an invalid activation state"
+            )));
+        }
+        profile.active = Some(true);
+        let profile_bytes = Self::serialize_profile(&sub, &profile, &pubkeys)
+            .map_err(HostedAccountProvisionError::Backend)?;
+        self.db
+            .put(user_key(username), profile_bytes)
+            .map_err(|error| HostedAccountProvisionError::Backend(error.into()))
     }
 
     async fn set_profile(&self, username: &str, update: UserProfilePatch) -> Result<()> {
@@ -1133,16 +1279,40 @@ mod tests {
             )
             .await?;
         assert_eq!(provisioned.fingerprint, pubkey_fingerprint(&alice_key));
+        assert!(!provisioned.resumed);
         let profile = store.get_profile("alice").await?.unwrap();
         assert_eq!(
             profile.atproto_did.as_deref(),
             Some("did:web:alice.accounts.example.test")
         );
         assert_eq!(profile.key_custody, Some(AccountKeyCustody::SelfCustody));
+        assert_eq!(profile.active, Some(false));
         assert!(profile.external_identities.is_empty());
         assert_eq!(
             store.get_pubkey_user(&provisioned.fingerprint).await?,
             Some("alice".to_owned())
+        );
+        let resumed = store
+            .provision_hosted_account(
+                "alice",
+                "did:web:alice.accounts.example.test",
+                alice_key,
+                AccountKeyCustody::SelfCustody,
+            )
+            .await?;
+        assert!(resumed.resumed);
+        assert_eq!(resumed.sub, provisioned.sub);
+        store
+            .activate_hosted_account(
+                "alice",
+                "did:web:alice.accounts.example.test",
+                &provisioned.fingerprint,
+                AccountKeyCustody::SelfCustody,
+            )
+            .await?;
+        assert_eq!(
+            store.get_profile("alice").await?.unwrap().active,
+            Some(true)
         );
         assert!(matches!(
             store
@@ -1192,6 +1362,71 @@ mod tests {
                 subject: "external-alice".to_owned(),
             }]
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn concurrent_same_key_different_handles_never_reserves_two_accounts() -> Result<()> {
+        let dir = TempDir::new()?;
+        let store = std::sync::Arc::new(make_store(dir.path()));
+        let key = ed25519_dalek::SigningKey::from_bytes(&[0x73; 32]).verifying_key();
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(3));
+
+        let attempt = |handle: &'static str| {
+            let store = store.clone();
+            let barrier = barrier.clone();
+            tokio::spawn(async move {
+                barrier.wait().await;
+                store
+                    .provision_hosted_account(
+                        handle,
+                        &format!("did:web:{handle}.accounts.example.test"),
+                        key,
+                        AccountKeyCustody::SelfCustody,
+                    )
+                    .await
+                    .map(|provisioned| (handle, provisioned))
+            })
+        };
+        let alice = attempt("alice");
+        let bob = attempt("bob");
+        barrier.wait().await;
+        let results = [alice.await?, bob.await?];
+        let winner = results
+            .iter()
+            .find_map(|result| result.as_ref().ok())
+            .expect("one transaction must win");
+        assert_eq!(
+            results.iter().filter(|result| result.is_ok()).count(),
+            1,
+            "the same vault key must never stage two handles"
+        );
+        assert!(results
+            .iter()
+            .any(|result| matches!(result, Err(HostedAccountProvisionError::Backend(_)))));
+        let loser = if winner.0 == "alice" { "bob" } else { "alice" };
+        assert!(store.get_profile(winner.0).await?.is_some());
+        assert!(store.get_profile(loser).await?.is_none());
+
+        store
+            .activate_hosted_account(
+                winner.0,
+                &format!("did:web:{}.accounts.example.test", winner.0),
+                &winner.1.fingerprint,
+                AccountKeyCustody::SelfCustody,
+            )
+            .await?;
+        assert!(matches!(
+            store
+                .provision_hosted_account(
+                    loser,
+                    &format!("did:web:{loser}.accounts.example.test"),
+                    key,
+                    AccountKeyCustody::SelfCustody,
+                )
+                .await,
+            Err(HostedAccountProvisionError::KeyAlreadyBound)
+        ));
         Ok(())
     }
 

@@ -576,95 +576,20 @@ pub async fn authorize_post(
             }
         };
 
-        // Fail before consuming an authority label on every conflict the AS
-        // can already observe. The authority reservation remains the final
-        // race-safe handle arbiter.
-        match user_store.get_profile(handle).await {
-            Ok(Some(_)) => {
-                return error_response(
-                    StatusCode::CONFLICT,
-                    "handle_unavailable",
-                    "Requested hosted-account handle is unavailable",
-                );
-            }
-            Ok(None) => {}
-            Err(error) => {
-                tracing::error!(%error, handle, "UserStore availability check failed");
-                return error_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "server_error",
-                    "Account availability could not be verified",
-                );
-            }
-        }
-        match user_store.get_pubkey_user(&form.fingerprint).await {
-            Ok(Some(_)) => {
-                return error_response(
-                    StatusCode::CONFLICT,
-                    "key_already_bound",
-                    "Account public key is already bound",
-                );
-            }
-            Ok(None) => {}
-            Err(error) => {
-                tracing::error!(%error, fingerprint = %form.fingerprint, "UserStore key availability check failed");
-                return error_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "server_error",
-                    "Account key availability could not be verified",
-                );
-            }
-        }
-
-        let minted =
-            match registration_api.mint_for_oauth_signup(handle, dpop_jkt, &form.fingerprint) {
-                Ok(result) => result,
-                Err(IdentityApiError::RateLimited) => {
-                    return error_response(
-                        StatusCode::TOO_MANY_REQUESTS,
-                        "rate_limited",
-                        "Signup rate limit exceeded",
-                    );
-                }
-                Err(IdentityApiError::HandleUnavailable) => {
-                    return error_response(
-                        StatusCode::CONFLICT,
-                        "handle_unavailable",
-                        "Requested hosted-account handle is unavailable",
-                    );
-                }
-                Err(error) => {
-                    tracing::error!(?error, handle, "Hosted-account signup mint failed");
-                    return error_response(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "server_error",
-                        "Hosted-account minting failed",
-                    );
-                }
-            };
-        if expected_did.as_str() != minted.did {
-            tracing::error!(
-                requested_handle = handle,
-                minted_did = %minted.did,
-                "Authority returned a DID outside the configured host-form account zone"
-            );
-            return error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "server_error",
-                "Hosted-account authority binding is invalid",
-            );
-        }
-
-        match user_store
+        // The credential store is the first durable uniqueness commit. It
+        // stages the exact handle/DID/key binding inactive, or resumes that
+        // same verified pair. No authority reservation or PDS generation is
+        // published before this succeeds.
+        let provisioned = match user_store
             .provision_hosted_account(
                 handle,
-                &minted.did,
+                &expected_did,
                 verifying_key,
                 AccountKeyCustody::SelfCustody,
             )
             .await
         {
-            Ok(provisioned) if provisioned.fingerprint == form.fingerprint => {}
+            Ok(provisioned) if provisioned.fingerprint == form.fingerprint => provisioned,
             Ok(provisioned) => {
                 tracing::error!(
                     expected = %form.fingerprint,
@@ -700,6 +625,64 @@ pub async fn authorize_post(
                     "Hosted-account credential binding failed",
                 );
             }
+        };
+
+        tracing::debug!(
+            handle,
+            resumed = provisioned.resumed,
+            "Hosted-account credential transaction is staged"
+        );
+
+        let minted =
+            match registration_api.mint_for_oauth_signup(handle, dpop_jkt, &form.fingerprint) {
+                Ok(result) => result,
+                Err(IdentityApiError::RateLimited) => {
+                    return error_response(
+                        StatusCode::TOO_MANY_REQUESTS,
+                        "rate_limited",
+                        "Signup rate limit exceeded",
+                    );
+                }
+                Err(error) => {
+                    // The staged credential binding is intentionally retained:
+                    // an exact retry can resume the authority/PDS transaction.
+                    // Authority conflicts after staging indicate inconsistent
+                    // backend state and are never a client-trusted 409.
+                    tracing::error!(?error, handle, "Hosted-account signup mint failed");
+                    return error_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "server_error",
+                        "Hosted-account minting failed",
+                    );
+                }
+            };
+        if expected_did.as_str() != minted.did {
+            tracing::error!(
+                requested_handle = handle,
+                minted_did = %minted.did,
+                "Authority returned a DID outside the configured host-form account zone"
+            );
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "server_error",
+                "Hosted-account authority binding is invalid",
+            );
+        }
+        if let Err(error) = user_store
+            .activate_hosted_account(
+                handle,
+                &minted.did,
+                &form.fingerprint,
+                AccountKeyCustody::SelfCustody,
+            )
+            .await
+        {
+            tracing::error!(?error, handle, "Hosted-account final AS activation failed");
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "server_error",
+                "Hosted-account activation failed",
+            );
         }
         (handle.to_owned(), verifying_key)
     } else if action == AUTHORIZE_ACTION {
@@ -717,7 +700,35 @@ pub async fn authorize_post(
         )
         .await
         {
-            Ok(pair) => pair,
+            Ok((username, verifying_key)) => match user_store.get_profile(&username).await {
+                Ok(Some(profile)) if profile.active != Some(false) => (username, verifying_key),
+                Ok(Some(_)) => {
+                    return error_response(
+                        StatusCode::FORBIDDEN,
+                        "access_denied",
+                        "Account is not active",
+                    );
+                }
+                Ok(None) => {
+                    tracing::error!(
+                        username,
+                        "Credential reverse index resolved to a missing user profile"
+                    );
+                    return error_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "server_error",
+                        "Account credential binding is inconsistent",
+                    );
+                }
+                Err(error) => {
+                    tracing::error!(%error, username, "UserStore activation check failed");
+                    return error_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "server_error",
+                        "Account activation could not be verified",
+                    );
+                }
+            },
             Err(e) => {
                 if matches!(e, challenge::ChallengeError::UserStoreError(_)) {
                     tracing::error!(fingerprint = %form.fingerprint, "UserStore lookup error during authorize");
@@ -1294,9 +1305,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn signup_action_provisions_account_and_issues_standard_auth_code() -> anyhow::Result<()>
-    {
-        use std::sync::atomic::{AtomicUsize, Ordering};
+    async fn signup_resumes_after_crash_after_genesis_before_activation() -> anyhow::Result<()> {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
         use async_trait::async_trait;
         use base64::engine::general_purpose::STANDARD;
@@ -1310,7 +1320,10 @@ mod tests {
             IdentityConnectTimeResolver, IdentityRegistrationApi, RegistrationGenesisSigner,
         };
 
-        struct SignupMint(AtomicUsize);
+        struct SignupMint {
+            calls: AtomicUsize,
+            fail_after_publish_once: AtomicBool,
+        }
         impl HostedRegistrationMint for SignupMint {
             fn mint(
                 &self,
@@ -1319,7 +1332,10 @@ mod tests {
             ) -> anyhow::Result<
                 hyprstream_pds_service::hosted_account_mint::HostedAccountRegistrationResult,
             > {
-                self.0.fetch_add(1, Ordering::SeqCst);
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                if self.fail_after_publish_once.swap(false, Ordering::SeqCst) {
+                    anyhow::bail!("simulated crash after durable PDS genesis publication");
+                }
                 Ok(
                     hyprstream_pds_service::hosted_account_mint::HostedAccountRegistrationResult {
                         handle: format!("at://{}.accounts.example.test", request.handle()),
@@ -1386,7 +1402,10 @@ mod tests {
         config.external_url = Some("https://pds.example.test".to_owned());
         let user_dir = tempfile::TempDir::new()?;
         let user_store = Arc::new(RocksDbUserStore::open(user_dir.path())?);
-        let mint = Arc::new(SignupMint(AtomicUsize::new(0)));
+        let mint = Arc::new(SignupMint {
+            calls: AtomicUsize::new(0),
+            fail_after_publish_once: AtomicBool::new(true),
+        });
         let identity_api = Arc::new(IdentityRegistrationApi::new(
             mint.clone(),
             Arc::new(UnusedSigner),
@@ -1477,14 +1496,75 @@ mod tests {
         )
         .await;
 
-        assert_eq!(response.status(), StatusCode::SEE_OTHER);
-        assert_eq!(mint.0.load(Ordering::SeqCst), 1);
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(mint.calls.load(Ordering::SeqCst), 1);
+        let staged = user_store.get_profile("alice").await?.unwrap();
+        assert_eq!(staged.active, Some(false));
+        assert_eq!(
+            user_store.get_pubkey_user(&fingerprint).await?,
+            Some("alice".to_owned())
+        );
+        assert!(state.pending_codes.read().await.is_empty());
+
+        // A fresh, fully verified OAuth authorize transaction for the exact
+        // same handle/key resumes minting and performs final activation.
+        let retry_nonce = fresh_nonce();
+        let retry_code_challenge = "signup-pkce-challenge-retry".to_owned();
+        let retry_request = AuthorizeParams {
+            client_id: "signup-client".to_owned(),
+            redirect_uri: "https://client.example/callback".to_owned(),
+            code_challenge: retry_code_challenge.clone(),
+            code_challenge_method: "S256".to_owned(),
+            response_type: "code".to_owned(),
+            state: Some("signup-state-retry".to_owned()),
+            scope: Some("atproto".to_owned()),
+            resource: Some("https://pds.example.test".to_owned()),
+            nonce: None,
+            dpop_jkt: Some("par-verified-dpop-thumbprint".to_owned()),
+            client_assertion_jkt: None,
+        };
+        state.pending_nonces.write().await.insert(
+            retry_nonce.clone(),
+            Instant::now() + Duration::from_secs(300),
+        );
+        state.pending_authorize_bindings.write().await.insert(
+            retry_nonce.clone(),
+            super::super::state::AuthorizeBinding {
+                request: retry_request,
+            },
+        );
+        let retry_challenge =
+            signup_proof_challenge("alice", &fingerprint, &retry_nonce, &retry_code_challenge);
+        let retry_signature = STANDARD.encode(vault_key.sign(&retry_challenge).to_bytes());
+        let retry_response = authorize_post(
+            State(state.clone()),
+            Ok(Form(ConsentForm {
+                action: Some(SIGNUP_ACTION.to_owned()),
+                client_id: "signup-client".to_owned(),
+                redirect_uri: "https://client.example/callback".to_owned(),
+                code_challenge: retry_code_challenge,
+                scope: "atproto".to_owned(),
+                state: Some("signup-state-retry".to_owned()),
+                resource: Some("https://pds.example.test".to_owned()),
+                nonce: retry_nonce,
+                fingerprint: fingerprint.clone(),
+                signature: retry_signature,
+                handle: Some("alice".to_owned()),
+                account_public_key: Some(STANDARD.encode(vault_key.verifying_key().as_bytes())),
+                oidc_nonce: None,
+            })),
+        )
+        .await;
+
+        assert_eq!(retry_response.status(), StatusCode::SEE_OTHER);
+        assert_eq!(mint.calls.load(Ordering::SeqCst), 2);
         let profile = user_store.get_profile("alice").await?.unwrap();
         assert_eq!(
             profile.atproto_did.as_deref(),
             Some("did:web:alice.accounts.example.test")
         );
         assert_eq!(profile.key_custody, Some(AccountKeyCustody::SelfCustody));
+        assert_eq!(profile.active, Some(true));
         assert!(profile.external_identities.is_empty());
         assert_eq!(
             user_store.get_pubkey_user(&fingerprint).await?,

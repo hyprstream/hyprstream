@@ -8,6 +8,7 @@
 //!   hs:user:{u}:keys          SET of fingerprints
 //!   hs:key:{fp}               JSON pubkey data (base64, label, timestamps)
 //!   hs:keyowner:{fp}          username string (fingerprint → user reverse index)
+//!   hs:hosted-binding:{u}:{fp} activated hosted-binding integrity marker
 //!   hs:idx:sub:{sub}          username (sub → username reverse index)
 //!   hs:idx:extid:{extid}      username (externalId → username reverse index)
 
@@ -100,7 +101,7 @@ impl UserStore for ValkeyUserStore {
         let fingerprint = pubkey_fingerprint(&pubkey);
         let profile = UserProfile {
             sub: Some(sub.clone()),
-            active: Some(true),
+            active: Some(false),
             atproto_did: Some(atproto_did.to_owned()),
             key_custody: Some(custody),
             external_identities: Vec::new(),
@@ -119,11 +120,83 @@ impl UserStore for ValkeyUserStore {
         let key_json = serde_json::to_string(&stored_key)
             .map_err(|error| HostedAccountProvisionError::Backend(error.into()))?;
 
-        // All conflict checks and writes run inside one Valkey script. Status:
-        // 0 = inserted, 1 = username exists, 2 = key owner exists.
+        // All conflict checks and writes run inside one Valkey script. A
+        // conflict status is emitted only after the existing hosted binding
+        // has passed profile/key/reverse-index integrity checks.
+        // Status: 0 = inserted, 1 = usable username conflict,
+        // 2 = usable key conflict, 3 = exact resumable binding,
+        // 4 = partial/corrupt state.
         const PROVISION_HOSTED_ACCOUNT: &str = r#"
-if redis.call('EXISTS', KEYS[1]) == 1 then return 1 end
-if redis.call('EXISTS', KEYS[5]) == 1 then return 2 end
+local function usable(owner, profile, fingerprint)
+  if not profile or profile == false then return false end
+  local ok, decoded = pcall(cjson.decode, profile)
+  if not ok or decoded.active ~= true
+      or type(decoded.sub) ~= 'string' or decoded.sub == ''
+      or type(decoded.atproto_did) ~= 'string'
+      or string.sub(decoded.atproto_did, 1, 8) ~= 'did:web:'
+      or type(decoded.key_custody) ~= 'string' then
+    return false
+  end
+  local key_json = redis.call('GET', 'hs:key:' .. fingerprint)
+  if redis.call('SISMEMBER', 'hs:user:' .. owner .. ':keys', fingerprint) ~= 1
+      or redis.call('GET', 'hs:keyowner:' .. fingerprint) ~= owner
+      or not key_json then
+    return false
+  end
+  local key_ok, key = pcall(cjson.decode, key_json)
+  if not key_ok or type(key.pubkey_base64) ~= 'string'
+      or key.pubkey_base64 == '' then return false end
+  local marker_json = redis.call(
+      'GET', 'hs:hosted-binding:' .. owner .. ':' .. fingerprint)
+  if not marker_json then return false end
+  local marker_ok, marker = pcall(cjson.decode, marker_json)
+  if not marker_ok
+      or marker.did ~= decoded.atproto_did
+      or marker.custody ~= decoded.key_custody
+      or marker.pubkey_base64 ~= key.pubkey_base64 then
+    return false
+  end
+  return true
+end
+
+local existing_profile = redis.call('GET', KEYS[1])
+if existing_profile then
+  local ok, decoded = pcall(cjson.decode, existing_profile)
+  local exact = ok
+      and (decoded.active == true or decoded.active == false)
+      and type(decoded.sub) == 'string' and decoded.sub ~= ''
+      and decoded.atproto_did == ARGV[5]
+      and decoded.key_custody == ARGV[6]
+      and (decoded.external_identities == nil
+          or (type(decoded.external_identities) == 'table'
+              and next(decoded.external_identities) == nil))
+      and redis.call('GET', KEYS[5]) == ARGV[2]
+      and redis.call('SISMEMBER', KEYS[6], ARGV[4]) == 1
+  local existing_key = redis.call('GET', KEYS[4])
+  if exact and existing_key then
+    local key_ok, key_decoded = pcall(cjson.decode, existing_key)
+    exact = key_ok and key_decoded.pubkey_base64 == ARGV[7]
+  else
+    exact = false
+  end
+  if exact and (decoded.active == false
+      or usable(ARGV[2], existing_profile, ARGV[4])) then return 3 end
+  if exact then return 4 end
+
+  local fingerprints = redis.call('SMEMBERS', KEYS[6])
+  for _, existing_fingerprint in ipairs(fingerprints) do
+    if usable(ARGV[2], existing_profile, existing_fingerprint) then return 1 end
+  end
+  return 4
+end
+
+local existing_owner = redis.call('GET', KEYS[5])
+if existing_owner then
+  if usable(existing_owner, redis.call('GET', 'hs:user:' .. existing_owner), ARGV[4]) then
+    return 2
+  end
+  return 4
+end
 redis.call('SET', KEYS[1], ARGV[1])
 redis.call('SADD', KEYS[2], ARGV[2])
 redis.call('SET', KEYS[3], ARGV[2])
@@ -149,16 +222,112 @@ return 0
                     username.to_owned(),
                     key_json,
                     fingerprint.clone(),
+                    atproto_did.to_owned(),
+                    custody.as_str().to_owned(),
+                    base64::engine::general_purpose::STANDARD.encode(pubkey.as_bytes()),
                 ],
             )
             .await
             .map_err(|error| HostedAccountProvisionError::Backend(error.into()))?;
         match status {
-            0 => Ok(HostedAccountProvisioning { sub, fingerprint }),
+            0 => Ok(HostedAccountProvisioning {
+                sub,
+                fingerprint,
+                resumed: false,
+            }),
             1 => Err(HostedAccountProvisionError::AccountAlreadyExists),
             2 => Err(HostedAccountProvisionError::KeyAlreadyBound),
+            3 => {
+                let existing = self
+                    .get_profile_raw(username)
+                    .await
+                    .map_err(HostedAccountProvisionError::Backend)?;
+                let existing_sub = existing
+                    .filter(|profile| {
+                        profile.active.is_some()
+                            && profile.atproto_did.as_deref() == Some(atproto_did)
+                            && profile.key_custody == Some(custody)
+                            && profile.external_identities.is_empty()
+                    })
+                    .and_then(|profile| profile.sub)
+                    .filter(|sub| !sub.is_empty())
+                    .ok_or_else(|| {
+                        HostedAccountProvisionError::Backend(anyhow!(
+                            "resumed hosted-account profile has no subject"
+                        ))
+                    })?;
+                Ok(HostedAccountProvisioning {
+                    sub: existing_sub,
+                    fingerprint,
+                    resumed: true,
+                })
+            }
+            4 => Err(HostedAccountProvisionError::Backend(anyhow!(
+                "existing hosted-account state is incomplete or inconsistent"
+            ))),
             other => Err(HostedAccountProvisionError::Backend(anyhow!(
                 "unexpected hosted-account provisioning status {other}"
+            ))),
+        }
+    }
+
+    async fn activate_hosted_account(
+        &self,
+        username: &str,
+        atproto_did: &str,
+        fingerprint: &str,
+        custody: AccountKeyCustody,
+    ) -> std::result::Result<(), HostedAccountProvisionError> {
+        const ACTIVATE_HOSTED_ACCOUNT: &str = r#"
+local profile_json = redis.call('GET', KEYS[1])
+if not profile_json then return 1 end
+local ok, profile = pcall(cjson.decode, profile_json)
+local key_json = redis.call('GET', KEYS[4])
+local key_ok, key = pcall(cjson.decode, key_json or '')
+if not ok
+    or not key_ok
+    or (profile.active ~= false and profile.active ~= true)
+    or profile.atproto_did ~= ARGV[1]
+    or profile.key_custody ~= ARGV[4]
+    or type(key.pubkey_base64) ~= 'string' or key.pubkey_base64 == ''
+    or redis.call('GET', KEYS[2]) ~= ARGV[2]
+    or redis.call('SISMEMBER', KEYS[3], ARGV[3]) ~= 1
+    or not key_json then
+  return 1
+end
+profile.active = true
+redis.call('SET', KEYS[1], cjson.encode(profile))
+redis.call('SET', KEYS[5], cjson.encode({
+  did = ARGV[1],
+  custody = ARGV[4],
+  pubkey_base64 = key.pubkey_base64
+}))
+return 0
+"#;
+        let status: i64 = self
+            .pool
+            .eval(
+                ACTIVATE_HOSTED_ACCOUNT,
+                vec![
+                    format!("hs:user:{username}"),
+                    format!("hs:keyowner:{fingerprint}"),
+                    format!("hs:user:{username}:keys"),
+                    format!("hs:key:{fingerprint}"),
+                    format!("hs:hosted-binding:{username}:{fingerprint}"),
+                ],
+                vec![
+                    atproto_did.to_owned(),
+                    username.to_owned(),
+                    fingerprint.to_owned(),
+                    custody.as_str().to_owned(),
+                ],
+            )
+            .await
+            .map_err(|error| HostedAccountProvisionError::Backend(error.into()))?;
+        match status {
+            0 => Ok(()),
+            _ => Err(HostedAccountProvisionError::Backend(anyhow!(
+                "staged hosted-account binding changed before activation"
             ))),
         }
     }
@@ -243,6 +412,11 @@ return 0
             let _: i64 = self
                 .pool
                 .del(format!("hs:keyowner:{fp}"))
+                .await
+                .unwrap_or(0);
+            let _: i64 = self
+                .pool
+                .del(format!("hs:hosted-binding:{username}:{fp}"))
                 .await
                 .unwrap_or(0);
         }
@@ -565,6 +739,11 @@ return 0
             let _: i64 = self
                 .pool
                 .del(format!("hs:keyowner:{fingerprint}"))
+                .await
+                .unwrap_or(0);
+            let _: i64 = self
+                .pool
+                .del(format!("hs:hosted-binding:{username}:{fingerprint}"))
                 .await
                 .unwrap_or(0);
         }

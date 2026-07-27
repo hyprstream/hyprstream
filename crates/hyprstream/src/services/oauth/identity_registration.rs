@@ -28,8 +28,8 @@ use hyprstream_discovery::{
 };
 use hyprstream_pds::{
     sign_genesis, AccountRecord, AllocatedAccountName, DidOpSignature, DirectoryHostedAccountStore,
-    GenesisDidOp, GenesisRotationKeys, HostKeyEnrollment, HybridRotationKey, RecoveryKeyEnrollment,
-    SealedHostedDidDocument, UnsignedGenesisDidOp, UserRotationKey,
+    GenesisDidOp, GenesisRepoHead, GenesisRotationKeys, HostKeyEnrollment, HybridRotationKey,
+    RecoveryKeyEnrollment, SealedHostedDidDocument, UnsignedGenesisDidOp, UserRotationKey,
 };
 use hyprstream_pds_service::federation_intake::{
     FederatedDidDocumentResolver, FederatedDidResolver, FederationIntake,
@@ -61,6 +61,15 @@ const COLD_SIGNUP_GLOBAL_RATE_LIMIT_BUCKET: &str = "oauth-authorize-signup-globa
 const MAX_AUTHORITY_ARTIFACT_BYTES: u64 = 64 * 1024;
 const ACCOUNT_GENESIS_ED25519_PURPOSE: &str = "hyprstream-hosted-account-genesis-ed25519-v1";
 const ACCOUNT_GENESIS_MLDSA65_PURPOSE: &str = "hyprstream-hosted-account-genesis-mldsa65-v1";
+const SIGNUP_TRANSACTION_FILE: &str = "signup-transaction.json";
+
+#[derive(Debug, Deserialize, Serialize)]
+struct HostedAccountReservation {
+    version: u8,
+    did: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    transaction_id: Option<String>,
+}
 
 /// Assemble the production registration face installed by the OAuth factory.
 ///
@@ -172,8 +181,12 @@ struct ProductionHostedAccountAuthority {
     signing_root: ed25519_dalek::SigningKey,
 }
 
-impl HostedAccountAuthority for ProductionHostedAccountAuthority {
-    fn allocate(&self, requested_handle: &str) -> Result<AuthorityHostedAccountBinding> {
+impl ProductionHostedAccountAuthority {
+    fn allocate_inner(
+        &self,
+        requested_handle: &str,
+        transaction_id: Option<&str>,
+    ) -> Result<AuthorityHostedAccountBinding> {
         let zone = self
             .account
             .resolve_zone()
@@ -182,28 +195,98 @@ impl HostedAccountAuthority for ProductionHostedAccountAuthority {
         let name = AllocatedAccountName::new(requested_handle, format!("did:web:{host}"))?;
         let tenant = zone.apex().to_owned();
 
-        // Allocation is a permanent, authority-owned reservation. A failed
-        // post-allocation mint burns the label instead of allowing a different
-        // identity to reuse the permanent DID.
+        // Allocation is a permanent, authority-owned reservation. OAuth
+        // signup binds it to the already-committed AS credential transaction,
+        // allowing only that exact verified pair to resume.
         let reservation_dir = self.pds_root.join(&tenant).join(".allocated");
         create_private_dir_all(&reservation_dir)?;
         let reservation = reservation_dir.join(requested_handle);
-        let mut file = private_create_new(&reservation)
-            .with_context(|| format!("hosted-account label {requested_handle:?} is unavailable"))?;
-        file.write_all(name.did().as_bytes())?;
-        file.sync_all()?;
-        sync_directory(&reservation_dir)?;
-        sync_directory(
-            reservation_dir
-                .parent()
-                .context("hosted-account reservation directory has no tenant parent")?,
-        )?;
+        let reservation_value = HostedAccountReservation {
+            version: 1,
+            did: name.did().to_owned(),
+            transaction_id: transaction_id.map(str::to_owned),
+        };
+        let mut staged_reservation = tempfile::Builder::new()
+            .prefix(".allocation-")
+            .tempfile_in(&reservation_dir)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(
+                staged_reservation.path(),
+                std::fs::Permissions::from_mode(0o600),
+            )?;
+        }
+        serde_json::to_writer(staged_reservation.as_file_mut(), &reservation_value)?;
+        staged_reservation.as_file_mut().write_all(b"\n")?;
+        staged_reservation.as_file_mut().sync_all()?;
+        #[cfg(all(target_os = "linux", target_env = "gnu"))]
+        match nix::fcntl::renameat2(
+            None,
+            staged_reservation.path(),
+            None,
+            &reservation,
+            nix::fcntl::RenameFlags::RENAME_NOREPLACE,
+        ) {
+            Ok(()) => {
+                sync_directory(&reservation_dir)?;
+                sync_directory(
+                    reservation_dir
+                        .parent()
+                        .context("hosted-account reservation directory has no tenant parent")?,
+                )?;
+            }
+            Err(nix::errno::Errno::EEXIST) => {
+                let existing: HostedAccountReservation = serde_json::from_slice(
+                    &read_authority_artifact(&reservation)
+                        .context("reading hosted-account reservation")?,
+                )
+                .context("verifying hosted-account reservation")?;
+                ensure!(
+                    existing.version == 1
+                        && existing.did == name.did()
+                        && transaction_id.is_some()
+                        && existing.transaction_id.as_deref() == transaction_id,
+                    std::io::Error::new(
+                        std::io::ErrorKind::AlreadyExists,
+                        format!("hosted-account label {requested_handle:?} is unavailable"),
+                    )
+                );
+                sync_directory(&reservation_dir)?;
+                sync_directory(
+                    reservation_dir
+                        .parent()
+                        .context("hosted-account reservation directory has no tenant parent")?,
+                )?;
+            }
+            Err(error) => return Err(error.into()),
+        }
+        #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+        anyhow::bail!("atomic hosted-account allocation requires Linux renameat2");
 
         AuthorityHostedAccountBinding::new(
             tenant,
             name,
             account_genesis_rotation_keys(&self.signing_root, requested_handle)?,
         )
+    }
+}
+
+impl HostedAccountAuthority for ProductionHostedAccountAuthority {
+    fn allocate(&self, requested_handle: &str) -> Result<AuthorityHostedAccountBinding> {
+        self.allocate_inner(requested_handle, None)
+    }
+
+    fn allocate_for_transaction(
+        &self,
+        requested_handle: &str,
+        transaction_id: &str,
+    ) -> Result<AuthorityHostedAccountBinding> {
+        ensure!(
+            !transaction_id.is_empty(),
+            "hosted-account reservation transaction id is empty"
+        );
+        self.allocate_inner(requested_handle, Some(transaction_id))
     }
 }
 
@@ -494,26 +577,116 @@ impl HostedPdsAccountPublisher for ProductionHostedAccountPublisher {
         publication.account().write_to(&staging_store)?;
         let staged_account = staging.path().join(publication.label());
         write_repo_genesis(&staged_account, publication.repo())?;
+        if let Some(transaction_id) = publication.transaction_id() {
+            let transaction = serde_json::to_vec(&serde_json::json!({
+                "version": 1,
+                "transaction_id": transaction_id,
+            }))?;
+            write_private_file(&staged_account.join(SIGNUP_TRANSACTION_FILE), &transaction)?;
+            sync_directory(&staged_account)?;
+        }
 
         let final_account = accounts_root.join(publication.label());
         #[cfg(all(target_os = "linux", target_env = "gnu"))]
-        nix::fcntl::renameat2(
+        match nix::fcntl::renameat2(
             None,
             &staged_account,
             None,
             &final_account,
             nix::fcntl::RenameFlags::RENAME_NOREPLACE,
-        )
-        .with_context(|| {
-            format!(
-                "failed to atomically publish hosted account {:?}",
-                publication.label()
-            )
-        })?;
+        ) {
+            Ok(()) => {}
+            Err(nix::errno::Errno::EEXIST) if publication.transaction_id().is_some() => {
+                verify_resumable_signup_publication(&final_account, &publication)?;
+                sync_directory(&accounts_root)?;
+                return Ok(());
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "failed to atomically publish hosted account {:?}",
+                        publication.label()
+                    )
+                });
+            }
+        }
         #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
         anyhow::bail!("atomic hosted-account publication requires Linux renameat2");
         sync_directory(&accounts_root)
     }
+}
+
+fn verify_resumable_signup_publication(
+    account_dir: &Path,
+    expected: &HostedPdsAccountPublication<'_>,
+) -> Result<()> {
+    let transaction: serde_json::Value = serde_json::from_slice(
+        &read_authority_artifact(&account_dir.join(SIGNUP_TRANSACTION_FILE))
+            .context("reading hosted signup transaction marker")?,
+    )
+    .context("verifying hosted signup transaction marker")?;
+    ensure!(
+        transaction
+            .get("version")
+            .and_then(serde_json::Value::as_u64)
+            == Some(1)
+            && transaction
+                .get("transaction_id")
+                .and_then(serde_json::Value::as_str)
+                == expected.transaction_id(),
+        "published hosted account belongs to a different signup transaction"
+    );
+
+    let record_bytes = read_authority_artifact(&account_dir.join("account-record.cbor"))
+        .context("reading published hosted account record")?;
+    let record =
+        AccountRecord::from_dag_cbor(&record_bytes).context("verifying hosted account record")?;
+    let genesis = GenesisDidOp::from_dag_cbor(
+        &read_authority_artifact(&account_dir.join("genesis.didop.cbor"))
+            .context("reading published hosted account genesis")?,
+    )
+    .context("verifying hosted account genesis")?;
+    let document = SealedHostedDidDocument::from_canonical_json(
+        &read_authority_artifact(&account_dir.join("did-document.json"))
+            .context("reading published hosted account DID document")?,
+    )
+    .context("verifying hosted account DID document")?;
+    let expected_name = expected.account().record().name();
+    ensure!(
+        record.name() == expected_name
+            && document.did() == expected_name.did()
+            && document.handle() == expected.account().did_document().handle()
+            && document.pds_endpoint() == expected.account().did_document().pds_endpoint()
+            && record.genesis_op() == genesis.cid()?
+            && record.current_op() == record.genesis_op()
+            && record.doc_cid() == genesis.unsigned().doc_cid()
+            && record.doc_cid() == document.cid()
+            && record.atproto_verifying_key()?.to_encoded_point(true)
+                == document.atproto_verifying_key()?.to_encoded_point(true),
+        "published hosted signup authority artifacts are inconsistent"
+    );
+
+    let commit_bytes = read_authority_artifact(&account_dir.join("repo/commit.cbor"))
+        .context("reading published hosted repo commit")?;
+    let commit = hyprstream_pds::commit::Commit::from_dag_cbor(&commit_bytes)
+        .context("verifying published hosted repo commit")?;
+    commit
+        .verify(&record.atproto_verifying_key()?)
+        .context("published hosted repo signature is invalid")?;
+    let commit_cid = commit.cid();
+    ensure!(
+        commit.did == expected_name.did()
+            && commit.prev.is_none()
+            && genesis.unsigned().head_at_op() == GenesisRepoHead::Existing(commit_cid)
+            && read_authority_artifact(
+                &account_dir.join(format!("repo/blocks/{}.cbor", commit.data))
+            )
+            .is_ok_and(|bytes| hyprstream_pds::Cid::from_dag_cbor(&bytes) == commit.data)
+            && std::fs::read_to_string(account_dir.join("repo/head"))
+                .is_ok_and(|head| head == commit_cid.to_string()),
+        "published hosted signup repo genesis is incomplete or inconsistent"
+    );
+    Ok(())
 }
 
 fn write_repo_genesis(account_dir: &Path, repo: &hyprstream_pds::HostedRepoGenesis) -> Result<()> {
@@ -543,7 +716,7 @@ fn create_private_dir_all(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn private_create_new(path: &Path) -> Result<File> {
+fn private_create_new(path: &Path) -> std::io::Result<File> {
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
@@ -551,7 +724,7 @@ fn private_create_new(path: &Path) -> Result<File> {
         use std::os::unix::fs::OpenOptionsExt as _;
         options.mode(0o600);
     }
-    Ok(options.open(path)?)
+    options.open(path)
 }
 
 fn write_private_file(path: &Path, bytes: &[u8]) -> Result<()> {
@@ -660,6 +833,15 @@ pub trait HostedRegistrationMint: Send + Sync {
         request: &HostedAccountRegistrationRequest,
         signer: &dyn HostedAccountGenesisSigner,
     ) -> Result<HostedAccountRegistrationResult>;
+
+    fn mint_for_transaction(
+        &self,
+        request: &HostedAccountRegistrationRequest,
+        signer: &dyn HostedAccountGenesisSigner,
+        _transaction_id: &str,
+    ) -> Result<HostedAccountRegistrationResult> {
+        self.mint(request, signer)
+    }
 }
 
 impl HostedRegistrationMint for HostedPdsAccountMinter {
@@ -669,6 +851,15 @@ impl HostedRegistrationMint for HostedPdsAccountMinter {
         signer: &dyn HostedAccountGenesisSigner,
     ) -> Result<HostedAccountRegistrationResult> {
         HostedPdsAccountMinter::mint(self, request, signer)
+    }
+
+    fn mint_for_transaction(
+        &self,
+        request: &HostedAccountRegistrationRequest,
+        signer: &dyn HostedAccountGenesisSigner,
+        transaction_id: &str,
+    ) -> Result<HostedAccountRegistrationResult> {
+        HostedPdsAccountMinter::mint_for_transaction(self, request, signer, transaction_id)
     }
 }
 
@@ -849,17 +1040,20 @@ impl IdentityRegistrationApi {
             caller: &caller,
             operator_manual: false,
         };
-        let result = self.minter.mint(&mint_request, &signer).map_err(|error| {
-            if error.chain().any(|cause| {
-                cause
-                    .downcast_ref::<std::io::Error>()
-                    .is_some_and(|io| io.kind() == std::io::ErrorKind::AlreadyExists)
-            }) {
-                IdentityApiError::HandleUnavailable
-            } else {
-                IdentityApiError::Backend(error)
-            }
-        })?;
+        let result = self
+            .minter
+            .mint_for_transaction(&mint_request, &signer, fingerprint)
+            .map_err(|error| {
+                if error.chain().any(|cause| {
+                    cause
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|io| io.kind() == std::io::ErrorKind::AlreadyExists)
+                }) {
+                    IdentityApiError::HandleUnavailable
+                } else {
+                    IdentityApiError::Backend(error)
+                }
+            })?;
         if result.did == UNAUTHENTICATED_DID_SENTINEL {
             return Err(IdentityApiError::Backend(anyhow::anyhow!(
                 "hosted-account mint returned the reserved unauthenticated DID"
@@ -1767,6 +1961,35 @@ mod tests {
         assert!(published.join("genesis.didop.cbor").is_file());
         assert!(published.join("did-document.json").is_file());
         assert!(published.join("repo/commit.cbor").is_file());
+    }
+
+    #[test]
+    fn production_cold_signup_mint_resumes_published_genesis_for_exact_transaction() {
+        let fixture = production_router_fixture();
+        let api = fixture.state.identity_registration_api.as_ref().unwrap();
+
+        let first = api
+            .mint_for_oauth_signup("alice", "verified-dpop-jkt", "SHA256:vault-key")
+            .unwrap();
+        let second = api
+            .mint_for_oauth_signup("alice", "verified-dpop-jkt", "SHA256:vault-key")
+            .unwrap();
+
+        assert_eq!(second, first);
+        assert!(matches!(
+            api.mint_for_oauth_signup("alice", "verified-dpop-jkt", "SHA256:different-key"),
+            Err(IdentityApiError::HandleUnavailable)
+        ));
+        let account = fixture
+            .storage
+            .path()
+            .join("pds/accounts.example.com/accounts/alice");
+        assert!(account.join("account-record.cbor").is_file());
+        assert!(account.join("repo/commit.cbor").is_file());
+        let transaction: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(account.join(SIGNUP_TRANSACTION_FILE)).unwrap())
+                .unwrap();
+        assert_eq!(transaction["transaction_id"], "SHA256:vault-key");
     }
 
     #[tokio::test]

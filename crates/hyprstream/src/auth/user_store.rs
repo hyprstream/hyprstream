@@ -120,6 +120,11 @@ impl From<UserProfile> for UserProfilePatch {
 pub struct HostedAccountProvisioning {
     pub sub: String,
     pub fingerprint: String,
+    /// True when this call found the same complete credential binding created
+    /// by an earlier attempt. It may still be staged inactive; callers must
+    /// resume downstream publication/activation instead of treating it as a
+    /// conflict.
+    pub resumed: bool,
 }
 
 /// Fail-closed conflict/backend distinction for hosted-account provisioning.
@@ -254,7 +259,13 @@ pub trait UserStore: Send + Sync {
     /// Implementations must not overwrite either an existing username or an
     /// existing key reverse-index entry. The account profile, DID mapping,
     /// custody discriminator, empty external-binding collection, public key,
-    /// and reverse index become visible together.
+    /// and reverse index become visible together. Repeating the exact same
+    /// `(username, DID, key, custody)` returns `Ok` with `resumed = true`.
+    ///
+    /// Conflict errors are trustworthy recovery signals: implementations may
+    /// return them only when the conflicting profile, key, and reverse index
+    /// form a complete usable hosted-account binding. Partial/corrupt state is
+    /// a backend error and must fail closed.
     async fn provision_hosted_account(
         &self,
         _username: &str,
@@ -264,6 +275,20 @@ pub trait UserStore: Send + Sync {
     ) -> std::result::Result<HostedAccountProvisioning, HostedAccountProvisionError> {
         Err(HostedAccountProvisionError::Backend(anyhow::anyhow!(
             "hosted-account provisioning is unsupported by this credential store"
+        )))
+    }
+
+    /// Atomically mark an exactly matching staged hosted binding active after
+    /// its durable PDS genesis is known to exist.
+    async fn activate_hosted_account(
+        &self,
+        _username: &str,
+        _atproto_did: &str,
+        _fingerprint: &str,
+        _custody: AccountKeyCustody,
+    ) -> std::result::Result<(), HostedAccountProvisionError> {
+        Err(HostedAccountProvisionError::Backend(anyhow::anyhow!(
+            "hosted-account activation is unsupported by this credential store"
         )))
     }
 
