@@ -212,6 +212,13 @@ pub struct ModelServiceInner {
     /// The sole tenant admitted by an in-process deployment. A second tenant
     /// must never share the FFI engine fault radius.
     in_process_tenant: std::sync::OnceLock<String>,
+    /// QUIC/MoQ reach populated by the outer service spawner after bind.
+    ///
+    /// Dynamically loaded inference engines share this handle so their stream
+    /// tokens advertise the ModelService's browser-addressable `/moq` relay.
+    producer_reach_config: hyprstream_rpc::moq_stream::ProducerReachConfigHandle,
+    /// Service-scoped MoQ origin populated by the outer service spawner.
+    moq_origin: hyprstream_rpc::moq_stream::MoqStreamOriginHandle,
 }
 
 /// Model service that manages InferenceService lifecycle.
@@ -360,6 +367,10 @@ impl ModelService {
             load_terminals: TerminalStore::new(),
             load_epoch: AtomicU64::new(0),
             in_process_tenant: std::sync::OnceLock::new(),
+            producer_reach_config: std::sync::Arc::new(parking_lot::RwLock::new(
+                hyprstream_rpc::moq_stream::ProducerReachConfig::default(),
+            )),
+            moq_origin: std::sync::Arc::new(parking_lot::RwLock::new(None)),
         })})
     }
 
@@ -888,6 +899,10 @@ impl ModelService {
             instance.service_name(),
             instance.tenant().to_owned(),
             self.signing_key.verifying_key(),
+        )
+        .with_stream_plane(
+            Arc::clone(&self.producer_reach_config),
+            Arc::clone(&self.moq_origin),
         );
         if let Some(ref aud) = self.expected_audience {
             service_config = service_config.with_expected_audience(aud.clone());
@@ -2023,6 +2038,18 @@ impl crate::services::RequestService for ModelService {
 
     fn jwt_key_source(&self) -> Option<std::sync::Arc<dyn hyprstream_rpc::auth::JwtKeySource>> {
         self.inner.jwt_key_source.clone()
+    }
+
+    fn producer_reach_config_handle(
+        &self,
+    ) -> Option<hyprstream_rpc::moq_stream::ProducerReachConfigHandle> {
+        Some(Arc::clone(&self.producer_reach_config))
+    }
+
+    fn moq_origin_handle(
+        &self,
+    ) -> Option<hyprstream_rpc::moq_stream::MoqStreamOriginHandle> {
+        Some(Arc::clone(&self.moq_origin))
     }
 
     fn build_error_payload(&self, request_id: u64, error: &str) -> Vec<u8> {

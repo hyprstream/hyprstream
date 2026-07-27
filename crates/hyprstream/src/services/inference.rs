@@ -51,7 +51,7 @@ use hyprstream_rpc::prelude::*;
 use hyprstream_rpc::StreamChannel;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use parking_lot::Mutex;
 use tokio::runtime::Handle;
 use tokenizers::Tokenizer;
@@ -186,6 +186,12 @@ pub struct InferenceServiceInner {
     /// Verified key of the ModelService controller allowed to bridge a local
     /// request into this tenant-bound instance.
     controller_pubkey: VerifyingKey,
+    /// True only while the network stream plane is bound and accepting.
+    network_ready: Arc<AtomicBool>,
+    /// Rejects new generation streams once lifecycle drain begins.
+    draining: Arc<AtomicBool>,
+    /// Process/service shutdown notification.
+    shutdown: Arc<tokio::sync::Notify>,
     /// Optional #1264 completion-spend emitter. `None` (default) ⇒ inert: the
     /// completion path posts no spend. Behind a `RwLock` so an operator can
     /// attach it after the service thread constructs the inner (the emitter's
@@ -477,6 +483,11 @@ impl InferenceService {
         fs: Option<WorktreeClient>,
         tenant_domain: String,
         controller_pubkey: VerifyingKey,
+        producer_reach_config: hyprstream_rpc::moq_stream::ProducerReachConfigHandle,
+        moq_origin: hyprstream_rpc::moq_stream::MoqStreamOriginHandle,
+        network_ready: Arc<AtomicBool>,
+        draining: Arc<AtomicBool>,
+        shutdown: Arc<tokio::sync::Notify>,
     ) -> Result<Self> {
         // Capture runtime handle for reuse in handlers
         let runtime_handle = Handle::current();
@@ -603,7 +614,8 @@ impl InferenceService {
 
         // Create StreamChannel upfront.
         let stream_channel = StreamChannel::new(signing_key.clone())
-            .with_reach_config(hyprstream_rpc::moq_stream::ProducerReachConfig::default());
+            .with_reach_config_handle(producer_reach_config)
+            .with_moq_origin_handle(moq_origin);
         let object_label = inference_object_label();
 
         Ok(InferenceService {
@@ -626,6 +638,9 @@ impl InferenceService {
                 lora_generation: Arc::new(AtomicU64::new(0)),
                 tenant_domain,
                 controller_pubkey,
+                network_ready,
+                draining,
+                shutdown,
                 #[cfg(feature = "ledger")]
                 ledger: parking_lot::RwLock::new(None),
                 object_label,
@@ -863,6 +878,10 @@ impl InferenceService {
         Vec<hyprstream_rpc::stream_info::Destination>,
         PendingWork,
     )> {
+        anyhow::ensure!(
+            !self.draining.load(Ordering::Acquire),
+            "inference service is draining and refuses new streams"
+        );
         // TTT adaptation is deferred to execute_stream (runs in continuation after REP
         // is sent) to avoid blocking the ZMQ REQ/REP handler with GPU-intensive work.
 
@@ -887,9 +906,7 @@ impl InferenceService {
 
         let stream_id = stream_ctx.stream_id().to_owned();
         let server_pubkey = *stream_ctx.server_pubkey();
-        let broadcast_path = hyprstream_rpc::moq_stream::global_moq_origin()
-            .map(|o| o.broadcast_path(stream_ctx.topic()))
-            .unwrap_or_default();
+        let broadcast_path = stream_channel.broadcast_path(stream_ctx.topic())?;
         // #384: per-stream reach (server-authored RelayChoice on the ctx);
         // ServerDefault unless set to Only/Override for anonymized/per-tenant.
         let reach = stream_ctx.reach();
@@ -1233,6 +1250,8 @@ impl InferenceService {
     /// Handle is ready request
     async fn handle_is_ready(&self) -> bool {
         self.engine.read().is_loaded()
+            && self.network_ready.load(Ordering::Acquire)
+            && !self.draining.load(Ordering::Acquire)
     }
 
     /// Handle apply chat template
@@ -2455,8 +2474,19 @@ impl InferenceHandler for InferenceService {
 
     async fn handle_health_check(&self, _ctx: &EnvelopeContext, _request_id: u64) -> Result<InferenceResponseVariant> {
         let model_loaded = self.engine.read().is_loaded();
+        let network_ready = self.network_ready.load(Ordering::Acquire);
+        let draining = self.draining.load(Ordering::Acquire);
+        let status = if draining {
+            "draining"
+        } else if !model_loaded {
+            "not_loaded"
+        } else if !network_ready {
+            "stream_plane_unavailable"
+        } else {
+            "ok"
+        };
         Ok(InferenceResponseVariant::HealthCheckResult(HealthStatus {
-            status: if model_loaded { "ok".into() } else { "not_loaded".into() },
+            status: status.into(),
             model_loaded,
             kv_cache_usage_percent: 0.0,
             gpu_memory_used_mb: 0,
@@ -2466,6 +2496,13 @@ impl InferenceHandler for InferenceService {
 
     async fn handle_shutdown(&self, _ctx: &EnvelopeContext, _request_id: u64) -> Result<InferenceResponseVariant> {
         info!("Inference service shutdown requested");
+        self.draining.store(true, Ordering::Release);
+        self.network_ready.store(false, Ordering::Release);
+        let shutdown = Arc::clone(&self.shutdown);
+        tokio::spawn(async move {
+            tokio::task::yield_now().await;
+            shutdown.notify_waiters();
+        });
         Ok(InferenceResponseVariant::Success)
     }
 
@@ -2832,6 +2869,17 @@ pub struct InferenceServiceConfig {
     network_reach: Arc<
         parking_lot::RwLock<Option<hyprstream_rpc::transport::TransportConfig>>,
     >,
+    /// Reach and origin shared with the browser-addressable QUIC/MoQ relay.
+    producer_reach_config: hyprstream_rpc::moq_stream::ProducerReachConfigHandle,
+    moq_origin: hyprstream_rpc::moq_stream::MoqStreamOriginHandle,
+    /// Standalone services own and bind this QUIC/WebTransport endpoint.
+    quic_config: Option<hyprstream_rpc::service::QuicLoopConfig>,
+    /// Explicit externally routable reach advertised for this QUIC bind.
+    quic_advertise_addr: Option<std::net::SocketAddr>,
+    /// False when an outer ModelService owns the advertised stream plane.
+    owns_stream_plane: bool,
+    network_ready: Arc<AtomicBool>,
+    draining: Arc<AtomicBool>,
 }
 
 impl InferenceServiceConfig {
@@ -2866,6 +2914,18 @@ impl InferenceServiceConfig {
             tenant_domain: "local".to_owned(),
             controller_pubkey: server_pubkey,
             network_reach: Arc::new(parking_lot::RwLock::new(None)),
+            producer_reach_config: Arc::new(parking_lot::RwLock::new(
+                hyprstream_rpc::moq_stream::ProducerReachConfig::default(),
+            )),
+            moq_origin: Arc::new(parking_lot::RwLock::new(None)),
+            quic_config: None,
+            quic_advertise_addr: None,
+            owns_stream_plane: true,
+            // Legacy in-process/training services do not attach a browser
+            // stream plane; preserve their model-based readiness until a
+            // network plane is explicitly configured below.
+            network_ready: Arc::new(AtomicBool::new(true)),
+            draining: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -2880,6 +2940,46 @@ impl InferenceServiceConfig {
         self.service_name = service_name;
         self.tenant_domain = tenant_domain;
         self.controller_pubkey = controller_pubkey;
+        self
+    }
+
+    /// Publish generated streams through an outer service's QUIC/MoQ relay.
+    #[must_use]
+    pub fn with_stream_plane(
+        mut self,
+        producer_reach_config: hyprstream_rpc::moq_stream::ProducerReachConfigHandle,
+        moq_origin: hyprstream_rpc::moq_stream::MoqStreamOriginHandle,
+    ) -> Self {
+        self.producer_reach_config = producer_reach_config;
+        self.moq_origin = moq_origin;
+        self.owns_stream_plane = false;
+        self.network_ready.store(
+            self.producer_reach_config.read().quic_reach.is_some(),
+            Ordering::Release,
+        );
+        self
+    }
+
+    /// Bind a browser-addressable RPC/MoQ endpoint owned by this process.
+    #[must_use]
+    pub fn with_quic_config(
+        mut self,
+        quic_config: Option<hyprstream_rpc::service::QuicLoopConfig>,
+    ) -> Self {
+        if quic_config.is_some() {
+            self.network_ready.store(false, Ordering::Release);
+        }
+        self.quic_config = quic_config;
+        self
+    }
+
+    /// Set the externally routable address signed into `StreamInfo`.
+    #[must_use]
+    pub fn with_quic_advertise_addr(
+        mut self,
+        advertise_addr: Option<std::net::SocketAddr>,
+    ) -> Self {
+        self.quic_advertise_addr = advertise_addr;
         self
     }
 
@@ -2902,6 +3002,187 @@ impl InferenceServiceConfig {
         &self,
     ) -> Arc<parking_lot::RwLock<Option<hyprstream_rpc::transport::TransportConfig>>> {
         Arc::clone(&self.network_reach)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn serve_inference_bridged(
+    service_name: &str,
+    transport: &hyprstream_rpc::transport::TransportConfig,
+    processor: Arc<
+        dyn hyprstream_rpc::transport::rpc_session::IrohRequestProcessor,
+    >,
+    signing_key: SigningKey,
+    shutdown: Arc<tokio::sync::Notify>,
+    on_ready: Option<tokio::sync::oneshot::Sender<()>>,
+    quic_config: Option<hyprstream_rpc::service::QuicLoopConfig>,
+    quic_advertise_addr: Option<std::net::SocketAddr>,
+    producer_reach_config: hyprstream_rpc::moq_stream::ProducerReachConfigHandle,
+    moq_origin: hyprstream_rpc::moq_stream::MoqStreamOriginHandle,
+    network_ready: Arc<AtomicBool>,
+    draining: Arc<AtomicBool>,
+) -> hyprstream_rpc::error::Result<()> {
+    let Some(mut qc) = quic_config else {
+        return hyprstream_rpc::service::serve::serve_bridged(
+            transport,
+            processor,
+            signing_key,
+            shutdown,
+            on_ready,
+        )
+        .await
+        .map_err(|e| hyprstream_rpc::error::RpcError::SpawnFailed(e.to_string()));
+    };
+
+    hyprstream_rpc::transport::install_pq_crypto_provider().map_err(|error| {
+        hyprstream_rpc::error::RpcError::SpawnFailed(format!(
+            "QUIC crypto provider: {error}"
+        ))
+    })?;
+    let chain: Vec<rustls::pki_types::CertificateDer<'static>> = qc
+        .cert_chain
+        .iter()
+        .map(|der| rustls::pki_types::CertificateDer::from(der.clone()))
+        .collect();
+    let key = rustls::pki_types::PrivateKeyDer::try_from((*qc.key_der).clone())
+        .map_err(|e| {
+            hyprstream_rpc::error::RpcError::SpawnFailed(format!("QUIC key: {e}"))
+        })?;
+    let wt_server = web_transport_quinn::ServerBuilder::new()
+        .with_addr(qc.bind_addr)
+        .with_certificate(chain, key)
+        .map_err(|e| {
+            hyprstream_rpc::error::RpcError::SpawnFailed(format!("QUIC bind: {e}"))
+        })?;
+    let actual_addr = wt_server.local_addr().map_err(|e| {
+        hyprstream_rpc::error::RpcError::SpawnFailed(format!("QUIC local_addr: {e}"))
+    })?;
+    let advertise_addr = if let Some(advertise_addr) = quic_advertise_addr {
+        advertise_addr
+    } else if actual_addr.ip().is_unspecified() {
+        match actual_addr {
+            std::net::SocketAddr::V4(_) => std::net::SocketAddr::from((
+                std::net::Ipv4Addr::LOCALHOST,
+                actual_addr.port(),
+            )),
+            std::net::SocketAddr::V6(_) => std::net::SocketAddr::from((
+                std::net::Ipv6Addr::LOCALHOST,
+                actual_addr.port(),
+            )),
+        }
+    } else {
+        actual_addr
+    };
+    let pin =
+        hyprstream_rpc::transport::quinn_transport::cert_sha256(&qc.cert_chain[0]);
+    let origin = moq_origin
+        .read()
+        .clone()
+        .or_else(|| hyprstream_rpc::moq_stream::global_moq_origin().cloned())
+        .ok_or_else(|| {
+            hyprstream_rpc::error::RpcError::SpawnFailed(
+                "standalone inference has no MoQ origin".to_owned(),
+            )
+        })?;
+
+    let rpc_server =
+        hyprstream_rpc::transport::quinn_transport::QuinnRpcServer::with_capacity(
+            wt_server,
+            Arc::clone(&processor),
+            signing_key.clone(),
+            hyprstream_rpc::transport::rpc_session::DEFAULT_STREAM_LIMIT,
+        )
+        .with_moq_consumer(origin.consumer().clone());
+
+    if let Some(registry) = hyprstream_rpc::registry::try_global() {
+        registry.register(
+            service_name,
+            hyprstream_rpc::registry::SocketKind::Quic,
+            hyprstream_rpc::transport::TransportConfig::quic_pinned(
+                advertise_addr,
+                &qc.server_name,
+                pin,
+            ),
+            None,
+        );
+    }
+    {
+        let mut reach = producer_reach_config.write();
+        reach.quic_reach = Some(hyprstream_rpc::moq_stream::NodeStreamReach {
+            addr: advertise_addr,
+            server_name: qc.server_name.clone(),
+            cert_hashes: vec![pin],
+        });
+        reach.relay = qc.moq_relay.clone();
+    }
+    network_ready.store(true, Ordering::Release);
+    if let Some(callback) = qc.on_quic_bound.take() {
+        callback(
+            service_name.to_owned(),
+            advertise_addr,
+            qc.server_name.clone(),
+        );
+    }
+    if let Some(relay) = qc.moq_relay.take() {
+        hyprstream_rpc::moq_stream::serve_origin_to_relay_background(
+            origin.producer().clone(),
+            relay,
+        );
+    }
+
+    let drain_limit = rpc_server.stream_limit();
+    let drain_capacity = rpc_server.capacity();
+    let drain_token = rpc_server.shutdown_token();
+    let drain_shutdown = Arc::clone(&shutdown);
+    let drain_state = Arc::clone(&draining);
+    let drain_ready = Arc::clone(&network_ready);
+    tokio::spawn(async move {
+        drain_shutdown.notified().await;
+        drain_state.store(true, Ordering::Release);
+        drain_ready.store(false, Ordering::Release);
+        hyprstream_rpc::transport::quinn_transport::QuinnRpcServer::shutdown(
+            &drain_limit,
+            drain_capacity,
+            &drain_token,
+        )
+        .await;
+    });
+
+    let rep = hyprstream_rpc::service::serve::serve_bridged(
+        transport,
+        Arc::clone(&processor),
+        signing_key,
+        Arc::clone(&shutdown),
+        on_ready,
+    );
+    let mut rep = Box::pin(rep);
+    let mut quic = Box::pin(rpc_server.run());
+    tokio::select! {
+        rep_result = &mut rep => {
+            shutdown.notify_waiters();
+            let quic_result = quic.await;
+            network_ready.store(false, Ordering::Release);
+            if let Err(error) = quic_result {
+                tracing::warn!(%error, "standalone inference QUIC loop ended during drain");
+            }
+            rep_result.map_err(|e| {
+                hyprstream_rpc::error::RpcError::SpawnFailed(e.to_string())
+            })
+        }
+        quic_result = &mut quic => {
+            network_ready.store(false, Ordering::Release);
+            if draining.load(Ordering::Acquire) {
+                return rep.await.map_err(|error| {
+                    hyprstream_rpc::error::RpcError::SpawnFailed(error.to_string())
+                });
+            }
+            shutdown.notify_waiters();
+            let detail = match quic_result {
+                Ok(()) => "QUIC server exited unexpectedly".to_owned(),
+                Err(error) => format!("QUIC server failed: {error}"),
+            };
+            Err(hyprstream_rpc::error::RpcError::SpawnFailed(detail))
+        }
     }
 }
 
@@ -2951,8 +3232,39 @@ impl hyprstream_service::Spawnable for InferenceServiceConfig {
                 tenant_domain,
                 controller_pubkey,
                 network_reach,
+                producer_reach_config,
+                moq_origin,
+                quic_config,
+                quic_advertise_addr,
+                owns_stream_plane,
+                network_ready,
+                draining,
             } = *self;
             let adapter_transport = transport.clone();
+
+            let lifecycle_ready = Arc::clone(&network_ready);
+            let lifecycle_draining = Arc::clone(&draining);
+            let lifecycle_shutdown = Arc::clone(&shutdown);
+            tokio::spawn(async move {
+                lifecycle_shutdown.notified().await;
+                lifecycle_draining.store(true, Ordering::Release);
+                lifecycle_ready.store(false, Ordering::Release);
+            });
+
+            // Standalone instances use an isolated origin so two CPU replicas
+            // in one deployment cannot expose each other's broadcast namespace.
+            if owns_stream_plane && quic_config.is_some() {
+                *moq_origin.write() = Some(
+                    hyprstream_rpc::moq_stream::MoqStreamOrigin::standalone()
+                        .with_prefix(hyprstream_rpc::moq_stream::DEFAULT_PREFIX)
+                        .build(),
+                );
+            }
+            let bridge_reach_config = Arc::clone(&producer_reach_config);
+            let bridge_moq_origin = Arc::clone(&moq_origin);
+            let bridge_network_ready = Arc::clone(&network_ready);
+            let bridge_draining = Arc::clone(&draining);
+            let bridge_shutdown = Arc::clone(&shutdown);
 
             // Build PolicyClient + GPU service + adapter ON the bridge thread.
             let (bridge, ready) = hyprstream_rpc::transport::iroh_rpc::LocalServiceBridge::spawn_with(
@@ -2975,6 +3287,11 @@ impl hyprstream_service::Spawnable for InferenceServiceConfig {
                         fs,
                         tenant_domain,
                         controller_pubkey,
+                        bridge_reach_config,
+                        bridge_moq_origin,
+                        bridge_network_ready,
+                        bridge_draining,
+                        bridge_shutdown,
                     )
                     .await
                     .map_err(|e| anyhow::anyhow!("inference init: {e}"))?;
@@ -3034,15 +3351,21 @@ impl hyprstream_service::Spawnable for InferenceServiceConfig {
                 direct_addrs,
                 None,
             ));
-            let result = hyprstream_rpc::service::serve::serve_bridged(
+            let result = serve_inference_bridged(
+                &service_name,
                 &transport,
                 processor,
                 server_signing_key,
                 shutdown,
                 on_ready,
+                quic_config,
+                quic_advertise_addr,
+                producer_reach_config,
+                moq_origin,
+                network_ready,
+                draining,
             )
-            .await
-            .map_err(|e| hyprstream_rpc::error::RpcError::SpawnFailed(e.to_string()));
+            .await;
             if let Err(error) = substrate.shutdown().await {
                 tracing::warn!(%error, "inference iroh shutdown failed");
             }
@@ -3151,6 +3474,48 @@ mod tenant_binding_tests {
 
     fn key(seed: u8) -> SigningKey {
         SigningKey::from_bytes(&[seed; 32])
+    }
+
+    #[test]
+    fn inference_config_shares_outer_moq_plane_by_identity() {
+        let reach = Arc::new(parking_lot::RwLock::new(
+            hyprstream_rpc::moq_stream::ProducerReachConfig::default(),
+        ));
+        let origin = Arc::new(parking_lot::RwLock::new(None));
+        let signing_key = key(4);
+        let config = InferenceServiceConfig::new(
+            "/model",
+            RuntimeConfig::default(),
+            signing_key.verifying_key(),
+            signing_key.clone(),
+            hyprstream_rpc::transport::TransportConfig::inproc(
+                "inference-stream-plane-test",
+            ),
+            None,
+        )
+        .with_stream_plane(Arc::clone(&reach), Arc::clone(&origin));
+
+        assert!(Arc::ptr_eq(&config.producer_reach_config, &reach));
+        assert!(Arc::ptr_eq(&config.moq_origin, &origin));
+        assert!(!config.owns_stream_plane);
+        assert!(!config.network_ready.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn legacy_in_process_config_preserves_model_based_readiness() {
+        let signing_key = key(5);
+        let config = InferenceServiceConfig::new(
+            "/model",
+            RuntimeConfig::default(),
+            signing_key.verifying_key(),
+            signing_key,
+            hyprstream_rpc::transport::TransportConfig::inproc(
+                "inference-legacy-readiness-test",
+            ),
+            None,
+        );
+
+        assert!(config.network_ready.load(Ordering::Acquire));
     }
 
     #[test]

@@ -6889,6 +6889,7 @@ dependencies = [
  "walkdir",
  "waxterm",
  "web-transport-iroh",
+ "web-transport-quinn",
  "xdg",
  "zeroize",
 ]

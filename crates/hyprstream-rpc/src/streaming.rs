@@ -753,6 +753,19 @@ impl StreamChannel {
         self.moq_origin.clone()
     }
 
+    fn selected_moq_origin(&self) -> Result<crate::moq_stream::MoqStreamOrigin> {
+        self.moq_origin
+            .read()
+            .clone()
+            .or_else(|| crate::moq_stream::global_moq_origin().cloned())
+            .ok_or_else(|| anyhow::anyhow!("no moq stream origin — server not initialized"))
+    }
+
+    /// Return the broadcast path on the exact origin this channel publishes to.
+    pub fn broadcast_path(&self, topic: &str) -> Result<String> {
+        Ok(self.selected_moq_origin()?.broadcast_path(topic))
+    }
+
     /// Install the node's persistent ML-DSA-65 signing key, replacing the
     /// auto-generated one. The matching public key must be anchored in the
     /// StreamService verifier's PQ trust store for Hybrid verification to
@@ -911,12 +924,7 @@ impl StreamChannel {
         &self,
         ctx: &StreamContext,
     ) -> Result<crate::moq_stream::AnyStreamPublisher> {
-        let scoped_origin = self.moq_origin.read().clone();
-        let origin = match scoped_origin.as_ref() {
-            Some(origin) => origin,
-            None => crate::moq_stream::global_moq_origin()
-                .ok_or_else(|| anyhow::anyhow!("no moq stream origin — server not initialized"))?,
-        };
+        let origin = self.selected_moq_origin()?;
         // #321: on the DH (mesh) path, sign each StreamBlock with the node's per-host
         // hybrid identity (Ed25519 + the deterministically-derived mesh ML-DSA key)
         // so consumers can attribute blocks to this host (C-PROV / threat T3). The
@@ -1593,6 +1601,7 @@ mod tests {
         let _publisher = channel.publisher(&stream).await?;
 
         let path = scoped_origin.broadcast_path(stream.topic());
+        assert_eq!(channel.broadcast_path(stream.topic())?, path);
         tokio::time::timeout(
             std::time::Duration::from_secs(1),
             scoped_origin.consumer().announced_broadcast(&path),

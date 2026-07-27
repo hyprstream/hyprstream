@@ -32,6 +32,10 @@ pub struct HyprConfig {
     #[serde(default)]
     pub model: ModelConfig,
 
+    /// Standalone CPU inference service configuration (#1236/#1247).
+    #[serde(default)]
+    pub inference: InferenceServerConfig,
+
     /// Runtime execution settings
     #[serde(default)]
     pub runtime: RuntimeConfig,
@@ -1840,6 +1844,171 @@ pub struct ModelConfig {
     pub quic_port: Option<u16>,
 }
 
+/// Configuration for one deployable, CPU-only inference process.
+///
+/// The service is opt-in: an empty `model_path` is the unconfigured default.
+/// Metal runs two separate processes with distinct `replica` values and
+/// resource limits, keeping libtorch and KV-cache fault domains isolated.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InferenceServerConfig {
+    /// Materialized model directory loaded before the service becomes ready.
+    #[serde(default)]
+    pub model_path: PathBuf,
+    /// Authority-facing model reference used for logs and deployment identity.
+    #[serde(default)]
+    pub model_ref: String,
+    /// Authenticated immutable Git object ID for the materialized model.
+    #[serde(default)]
+    pub model_oid: String,
+    /// Verified tenant to which this process is exclusively bound.
+    #[serde(default)]
+    pub tenant: String,
+    /// Replica ordinal. Metal deploys ordinals 0 and 1.
+    #[serde(default)]
+    pub replica: u16,
+    /// Inclusive transformer layer start. Partial ranges remain blocked on #314.
+    #[serde(default)]
+    pub stage_start: u32,
+    /// Exclusive transformer layer end. `None` means the complete model.
+    #[serde(default)]
+    pub stage_end: Option<u32>,
+    /// Browser-addressable QUIC/WebTransport port.
+    #[serde(default)]
+    pub quic_port: Option<u16>,
+    /// Routable address placed in signed `StreamInfo.announcedAt`.
+    #[serde(default)]
+    pub advertise_addr: Option<std::net::SocketAddr>,
+}
+
+impl Default for InferenceServerConfig {
+    fn default() -> Self {
+        Self {
+            model_path: PathBuf::new(),
+            model_ref: String::new(),
+            model_oid: String::new(),
+            tenant: String::new(),
+            replica: 0,
+            stage_start: 0,
+            stage_end: None,
+            quic_port: None,
+            advertise_addr: None,
+        }
+    }
+}
+
+impl InferenceServerConfig {
+    /// Validate the deployable CPU service contract without loading weights.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !self.model_path.as_os_str().is_empty(),
+            "inference.model_path is required"
+        );
+        anyhow::ensure!(
+            self.model_path.is_absolute(),
+            "inference.model_path must be absolute"
+        );
+        anyhow::ensure!(
+            self.model_path.is_dir(),
+            "inference.model_path is not a directory: {}",
+            self.model_path.display()
+        );
+        anyhow::ensure!(!self.model_ref.trim().is_empty(), "inference.model_ref is required");
+        anyhow::ensure!(!self.tenant.trim().is_empty(), "inference.tenant is required");
+        let advertise_addr = self.advertise_addr.ok_or_else(|| {
+            anyhow::anyhow!(
+                "inference.advertise_addr is required for network-addressable browser MoQ"
+            )
+        })?;
+        anyhow::ensure!(
+            !advertise_addr.ip().is_unspecified()
+                && !advertise_addr.ip().is_loopback()
+                && advertise_addr.port() != 0,
+            "inference.advertise_addr must be a non-loopback routable IP and non-zero port"
+        );
+        let quic_port = self.quic_port.ok_or_else(|| {
+            anyhow::anyhow!(
+                "inference.quic_port is required and must match inference.advertise_addr"
+            )
+        })?;
+        anyhow::ensure!(
+            quic_port != 0 && quic_port == advertise_addr.port(),
+            "inference.quic_port must be non-zero and match inference.advertise_addr port"
+        );
+        anyhow::ensure!(
+            matches!(self.model_oid.len(), 40 | 64)
+                && self.model_oid.bytes().all(|b| b.is_ascii_hexdigit()),
+            "inference.model_oid must be a 40- or 64-character hexadecimal object ID"
+        );
+        anyhow::ensure!(
+            self.stage_start == 0 && self.stage_end.is_none(),
+            "partial inference stage ranges require the #314 subset loader; configure the complete range as stage_start=0 and omit stage_end"
+        );
+        Ok(())
+    }
+
+    /// Verify that the configured path is inside the checkout at `model_oid`.
+    ///
+    /// A deployment may not pair an arbitrary directory with a claimed OID:
+    /// the immutable Git identity is checked before any weights are loaded.
+    pub fn verify_materialized_oid(&self) -> anyhow::Result<()> {
+        let model_path = self.model_path.canonicalize()?;
+        let repository = git2::Repository::discover(&model_path).map_err(|error| {
+            anyhow::anyhow!(
+                "inference.model_path is not in a Git checkout: {error}"
+            )
+        })?;
+        let checkout = repository
+            .workdir()
+            .ok_or_else(|| anyhow::anyhow!("inference model repository is bare"))?
+            .canonicalize()?;
+        anyhow::ensure!(
+            model_path.starts_with(&checkout),
+            "inference.model_path escapes its discovered checkout"
+        );
+        let actual = repository
+            .head()?
+            .target()
+            .ok_or_else(|| anyhow::anyhow!("inference model checkout has no direct HEAD OID"))?
+            .to_string();
+        anyhow::ensure!(
+            actual.eq_ignore_ascii_case(&self.model_oid),
+            "inference model OID mismatch: configured {}, materialized {}",
+            self.model_oid,
+            actual
+        );
+
+        let model_relative = model_path
+            .strip_prefix(&checkout)
+            .map_err(|_| anyhow::anyhow!("inference model path is outside its checkout"))?;
+        let mut options = git2::StatusOptions::new();
+        options
+            .include_untracked(true)
+            .recurse_untracked_dirs(true)
+            // Ignored bytes under the model subtree are still mutable model
+            // inputs and must not inherit the checkout's authenticated OID.
+            .include_ignored(true)
+            .include_unmodified(false);
+        for entry in repository.statuses(Some(&mut options))?.iter() {
+            let Some(path) = entry.path() else {
+                anyhow::bail!("inference model checkout contains a non-UTF-8 changed path");
+            };
+            if std::path::Path::new(path).starts_with(model_relative) {
+                anyhow::bail!(
+                    "inference model checkout is not immutable at {}: {path} has status {:?}",
+                    self.model_oid,
+                    entry.status()
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Stable deployment identity for logs and capacity reporting.
+    pub fn instance_name(&self) -> String {
+        format!("inference-cpu-{}", self.replica)
+    }
+}
+
 impl Default for ModelConfig {
     fn default() -> Self {
         Self {
@@ -2169,6 +2338,7 @@ impl Default for LoraAppConfig {
 pub struct HyprConfigBuilder {
     server_builder: ServerConfigBuilder,
     model: ModelConfig,
+    inference: InferenceServerConfig,
     runtime: RuntimeConfig,
     generation: GenerationConfig,
     lora: LoraAppConfig,
@@ -2203,6 +2373,7 @@ impl HyprConfigBuilder {
         Self {
             server_builder: ServerConfigBuilder::new(),
             model: ModelConfig::default(),
+            inference: InferenceServerConfig::default(),
             runtime: RuntimeConfig::default(),
             generation: GenerationConfig::default(),
             lora: LoraAppConfig::default(),
@@ -2237,6 +2408,7 @@ impl HyprConfigBuilder {
         Self {
             server_builder: config.server.to_builder(),
             model: config.model,
+            inference: config.inference,
             runtime: config.runtime,
             generation: config.generation,
             lora: config.lora,
@@ -2283,6 +2455,7 @@ impl HyprConfigBuilder {
         HyprConfig {
             server: self.server_builder.build(),
             model: self.model,
+            inference: self.inference,
             runtime: self.runtime,
             generation: self.generation,
             lora: self.lora,
@@ -2845,6 +3018,147 @@ impl From<&crate::config::server::SamplingParamDefaults> for SamplingParams {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn standalone_inference_config_rejects_partial_stage_without_subset_loader() {
+        let model = tempfile::TempDir::new().unwrap_or_else(|e| panic!("{e}"));
+        let config = InferenceServerConfig {
+            model_path: model.path().to_path_buf(),
+            model_ref: "demo:main".to_owned(),
+            model_oid: "1".repeat(40),
+            tenant: "demo.example".to_owned(),
+            quic_port: Some(7440),
+            advertise_addr: Some(
+                "192.0.2.10:7440"
+                    .parse()
+                    .unwrap_or_else(|e| panic!("{e}")),
+            ),
+            stage_start: 8,
+            stage_end: Some(16),
+            ..InferenceServerConfig::default()
+        };
+        let error = match config.validate() {
+            Ok(()) => panic!("partial ranges must fail closed until #314"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("#314"));
+    }
+
+    #[test]
+    fn standalone_inference_replicas_have_distinct_runtime_names() {
+        let first = InferenceServerConfig {
+            replica: 0,
+            ..InferenceServerConfig::default()
+        };
+        let second = InferenceServerConfig {
+            replica: 1,
+            ..InferenceServerConfig::default()
+        };
+        assert_eq!(first.instance_name(), "inference-cpu-0");
+        assert_eq!(second.instance_name(), "inference-cpu-1");
+        assert_ne!(first.instance_name(), second.instance_name());
+    }
+
+    #[test]
+    fn standalone_inference_rejects_mismatched_advertised_port() {
+        let model = tempfile::TempDir::new().unwrap_or_else(|e| panic!("{e}"));
+        let config = InferenceServerConfig {
+            model_path: model.path().to_path_buf(),
+            model_ref: "demo:main".to_owned(),
+            model_oid: "1".repeat(40),
+            tenant: "demo.example".to_owned(),
+            quic_port: Some(7441),
+            advertise_addr: Some(
+                "192.0.2.10:7440"
+                    .parse()
+                    .unwrap_or_else(|e| panic!("{e}")),
+            ),
+            ..InferenceServerConfig::default()
+        };
+
+        let error = match config.validate() {
+            Ok(()) => panic!("bound and advertised QUIC ports must agree"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("must be non-zero and match"));
+    }
+
+    #[test]
+    fn standalone_inference_verifies_materialized_git_oid() {
+        let model = tempfile::TempDir::new().unwrap_or_else(|e| panic!("{e}"));
+        let repository =
+            git2::Repository::init(model.path()).unwrap_or_else(|e| panic!("{e}"));
+        std::fs::write(model.path().join("config.json"), b"{}")
+            .unwrap_or_else(|e| panic!("{e}"));
+        std::fs::write(model.path().join(".gitignore"), b"ignored.bin\n")
+            .unwrap_or_else(|e| panic!("{e}"));
+        let mut index = repository.index().unwrap_or_else(|e| panic!("{e}"));
+        index
+            .add_path(std::path::Path::new("config.json"))
+            .unwrap_or_else(|e| panic!("{e}"));
+        index
+            .add_path(std::path::Path::new(".gitignore"))
+            .unwrap_or_else(|e| panic!("{e}"));
+        index.write().unwrap_or_else(|e| panic!("{e}"));
+        let tree_oid = index.write_tree().unwrap_or_else(|e| panic!("{e}"));
+        let tree = repository
+            .find_tree(tree_oid)
+            .unwrap_or_else(|e| panic!("{e}"));
+        let signature =
+            git2::Signature::now("hyprstream-test", "test@hyprstream.local")
+                .unwrap_or_else(|e| panic!("{e}"));
+        let oid = repository
+            .commit(
+                Some("HEAD"),
+                &signature,
+                &signature,
+                "fixture",
+                &tree,
+                &[],
+            )
+            .unwrap_or_else(|e| panic!("{e}"));
+
+        let mut config = InferenceServerConfig {
+            model_path: model.path().to_path_buf(),
+            model_ref: "demo:main".to_owned(),
+            model_oid: oid.to_string(),
+            tenant: "demo.example".to_owned(),
+            quic_port: Some(7440),
+            advertise_addr: Some(
+                "192.0.2.10:7440"
+                    .parse()
+                    .unwrap_or_else(|e| panic!("{e}")),
+            ),
+            ..InferenceServerConfig::default()
+        };
+        config
+            .validate()
+            .unwrap_or_else(|e| panic!("valid fixture rejected: {e}"));
+        config
+            .verify_materialized_oid()
+            .unwrap_or_else(|e| panic!("matching OID rejected: {e}"));
+
+        std::fs::write(model.path().join("config.json"), b"{\"tampered\":true}")
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert!(
+            config.verify_materialized_oid().is_err(),
+            "dirty tracked model bytes must not inherit the HEAD identity"
+        );
+        std::fs::write(model.path().join("config.json"), b"{}")
+            .unwrap_or_else(|e| panic!("{e}"));
+
+        std::fs::write(model.path().join("ignored.bin"), b"mutable weights")
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert!(
+            config.verify_materialized_oid().is_err(),
+            "ignored model bytes must not inherit the HEAD identity"
+        );
+        std::fs::remove_file(model.path().join("ignored.bin"))
+            .unwrap_or_else(|e| panic!("{e}"));
+
+        config.model_oid = "f".repeat(40);
+        assert!(config.verify_materialized_oid().is_err());
+    }
+
     /// #1136 anchors are a PAIR. #905 §2/§6 is bidirectional-or-not-believed, so a
     /// one-sided anchor config can never establish trust and must fail at validation
     /// rather than at `install_process_production_resolver()`.

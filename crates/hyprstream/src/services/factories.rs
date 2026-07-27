@@ -1052,6 +1052,80 @@ fn create_model_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnabl
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// Standalone CPU Inference Service Factory (#1236/#1247)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// One model, one tenant, one CPU-only process. Metal starts two independent
+/// copies with replica ordinals 0 and 1; no engine or KV-cache state is shared.
+#[service_factory("inference", schema = "../../../hyprstream-rpc-std/schema/inference.capnp", metadata = crate::services::generated::inference_client::schema_metadata, depends_on = ["policy", "discovery"])]
+fn create_inference_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>> {
+    info!("Creating standalone CPU InferenceService");
+
+    let config = load_config();
+    config.inference.validate()?;
+    config.inference.verify_materialized_oid()?;
+
+    let sk = ctx.service_signing_key("inference");
+    register_service_key(ctx, "inference", &sk)?;
+    let instance_name = config.inference.instance_name();
+
+    // The standalone image is a CPU fault domain even if a host happens to
+    // expose CUDA. Explicitly clear every GPU selector at the service boundary.
+    let runtime = crate::config::RuntimeConfig {
+        use_gpu: false,
+        gpu_device_id: None,
+        devices: Vec::new(),
+        gpu_layers: None,
+        ..config.runtime.clone()
+    };
+    // Do not announce both replicas under the singleton Discovery key:
+    // Discovery currently replaces, rather than pools, duplicate service
+    // endpoints. Metal #1309 owns the canonical two-backend load-balancer.
+    let quic = ctx
+        .quic_shared()
+        .map(|shared| {
+            shared.for_service(
+                &instance_name,
+                config.inference.quic_port.unwrap_or(0),
+            )
+        })
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "standalone inference requires [quic].enabled=true for browser MoQ"
+            )
+        })?;
+
+    let mut service = crate::services::InferenceServiceConfig::new(
+        &config.inference.model_path,
+        runtime,
+        sk.verifying_key(),
+        sk.clone(),
+        ctx.transport(&instance_name, SocketKind::Rep),
+        None,
+    )
+    .with_instance_identity(
+        instance_name.clone(),
+        config.inference.tenant.clone(),
+        sk.verifying_key(),
+    )
+    .with_quic_config(Some(quic))
+    .with_quic_advertise_addr(config.inference.advertise_addr);
+    if let Some(issuer) = ctx.oauth_issuer_url() {
+        service = service.with_expected_audience(issuer.to_owned());
+    }
+    service = service.with_jwt_key_source(ctx.cluster_key_source());
+
+    info!(
+        instance = %config.inference.instance_name(),
+        model_ref = %config.inference.model_ref,
+        model_oid = %config.inference.model_oid,
+        tenant = %config.inference.tenant,
+        "standalone CPU inference configured"
+    );
+    Ok(Box::new(service))
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // Worker Service Factory
 // ═══════════════════════════════════════════════════════════════════════════════
 
