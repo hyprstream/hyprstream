@@ -1,36 +1,26 @@
 name: Build Docker Images
 
 on:
-  # Run after Rust workflow completes successfully
-  workflow_run:
-    workflows: ["Rust"]
-    types: [completed]
-    branches: [ "main" ]
-  # Also run on version tags (releases)
+  # Merge-queue candidates pass the Rust gate before GitHub lands their exact
+  # SHA on main. Publish that landed SHA directly; Rust intentionally has no
+  # duplicate push-to-main run (#1331).
   push:
+    branches: [ "main" ]
     tags: [ 'v*.*.*' ]
 
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: hyprstream/hyprstream
 
-# Keep moving main tags ordered as a unit across the amd64 build, arm64 build,
-# and final manifest publication. Release tags are never cancelled mid-push.
+# Serialize publication without cancelling a process that may already be
+# pushing. Platform images use revision-qualified staging tags, and the
+# manifest job refuses to move main tags when its SHA is no longer main.
 concurrency:
-  group: docker-publish-${{ github.event_name == 'workflow_run' && 'main' || 'release' }}
-  cancel-in-progress: ${{ github.event_name == 'workflow_run' }}
+  group: docker-publish-${{ github.ref == 'refs/heads/main' && 'main' || 'release' }}
+  cancel-in-progress: false
 
 jobs:
   build-docker:
-    # workflow_run carries write-capable credentials, so accept successful
-    # same-repository push runs only. A fork branch named main must not publish.
-    if: >-
-      github.event_name == 'push' ||
-      (
-        github.event.workflow_run.event == 'push' &&
-        github.event.workflow_run.head_repository.full_name == github.repository &&
-        github.event.workflow_run.conclusion == 'success'
-      )
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -70,10 +60,9 @@ jobs:
     - name: Checkout repository
       uses: actions/checkout@v4
       with:
-        # workflow_run sets GITHUB_SHA to the current default-branch tip, which
-        # may be newer than the commit that passed Rust. Build the exact tested
-        # commit; tag pushes fall back to the tagged SHA.
-        ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+        # Main only lands merge-queue SHAs that passed Rust; tag pushes resolve
+        # to their tagged SHA. Build exactly the revision that triggered us.
+        ref: ${{ github.sha }}
         persist-credentials: false
 
     - name: Set up Docker Buildx
@@ -101,14 +90,13 @@ jobs:
           type=semver,pattern={{version}},suffix=-${{ matrix.tag_suffix }},enable=${{ matrix.variant != 'cpu' }}
           type=semver,pattern={{major}}.{{minor}},suffix=-${{ matrix.tag_suffix }},enable=${{ matrix.variant != 'cpu' }}
           # Latest tag for main branch
-          type=raw,value=latest,enable=${{ matrix.variant != 'cpu' && github.event_name == 'workflow_run' }},suffix=-${{ matrix.tag_suffix }}
-          # Architecture-specific CPU staging tags. The manifest job below
-          # is the sole writer of canonical CPU tags, and combines these with
-          # the native arm64 image only after both architecture builds pass.
+          type=raw,value=latest,enable=${{ matrix.variant != 'cpu' && github.ref == 'refs/heads/main' }},suffix=-${{ matrix.tag_suffix }}
+          # Immutable architecture-specific CPU staging tag. The manifest job
+          # composes only this exact revision, never a moving platform tag.
+          type=raw,value=sha-${{ github.sha }},suffix=-cpu-amd64,enable=${{ matrix.variant == 'cpu' }}
+          # Release-only architecture tags remain for compatibility.
           type=semver,pattern={{version}},suffix=-cpu-amd64,enable=${{ matrix.variant == 'cpu' }}
           type=semver,pattern={{major}}.{{minor}},suffix=-cpu-amd64,enable=${{ matrix.variant == 'cpu' }}
-          type=raw,value=edge,suffix=-cpu-amd64,enable=${{ matrix.variant == 'cpu' && github.event_name == 'workflow_run' }}
-          type=raw,value=latest,suffix=-cpu-amd64,enable=${{ matrix.variant == 'cpu' && github.event_name == 'workflow_run' }}
 
     - name: Build and push Docker image
       uses: docker/build-push-action@v6
@@ -165,10 +153,9 @@ jobs:
   # push` directly and CANNOT use docker/build-push-action like the amd64 leg.
   #
   # Tag scheme (GHCR; consumed by the AWS rocky10 arm64 quadlets):
+  #   sha-<full-revision>-cpu-arm64 — immutable manifest staging input
   #   1.2.3-cpu-arm64      — immutable, on v*.*.* release tags
   #   1.2-cpu-arm64        — rolling major.minor, on v*.*.* release tags
-  #   latest-cpu-arm64     — moving, on default-branch (main) builds
-  #   edge-cpu-arm64       — moving HEAD-of-main pointer
   # NOTE: docker/metadata-action `type=semver,pattern={{version}}` STRIPS the
   # leading `v` (emits `1.2.3`, not `v1.2.3`) — the same {{version}} form the
   # amd64 leg uses. Consumers pull the UNPREFIXED tag. {{raw}} would keep the
@@ -178,18 +165,9 @@ jobs:
   # x86_64-only today).
   #
   # Security: this job holds `packages: write` on a privileged self-hosted
-  # Graviton runner, so the workflow_run leg is gated to SAME-REPOSITORY `push`
-  # runs only (head_repository.full_name == repository.full_name). A fork PR
-  # whose head branch is named `main` cannot schedule this job. See
-  # https://securitylab.github.com/resources/github-actions-preventing-pwn-requests/
+  # Graviton runner. Only pushes to this repository's protected main branch or
+  # version tags can schedule it; pull requests and fork branches cannot.
   build-docker-arm64:
-    if: >-
-      github.event_name == 'push' ||
-      (
-        github.event.workflow_run.event == 'push' &&
-        github.event.workflow_run.head_repository.full_name == github.repository &&
-        github.event.workflow_run.conclusion == 'success'
-      )
     runs-on: [self-hosted, linux, arm64, graviton, hyprstream-merge-gate]
     # Fleet reaper hard-kills Graviton instances at 150 min from LAUNCH (not
     # job start); rust.yml uses 140 for the same reason. Stay below the cap so
@@ -204,9 +182,9 @@ jobs:
       PODMAN_ROOT: /mnt/hypr-ci-cache/podman-image-${{ github.run_id }}-${{ github.run_attempt }}
       PODMAN_RUNROOT: /mnt/hypr-ci-cache/podman-run-${{ github.run_id }}-${{ github.run_attempt }}
     # Two concurrence regimes:
-    #  - main (workflow_run) builds contend only on the moving edge/latest
-    #    tags, so they share ONE per-branch group and the superseded run is
-    #    cancelled (cancel-in-progress true).
+    #  - main builds are serialized without cancellation; each writes only its
+    #    immutable revision staging tag, and stale runs cannot move canonical
+    #    tags in the manifest job.
     #  - release (tag) publishes contend on the mutable ROLLING tag
     #    (e.g. 1.2-cpu-arm64) regardless of version, so ALL releases share a
     #    single serialized group with cancel-in-progress FALSE — an in-flight
@@ -215,19 +193,16 @@ jobs:
     # Job-scoped so the amd64 leg (no concurrency guard) stays byte-for-byte
     # unchanged.
     concurrency:
-      group: arm64-publish-${{ github.event_name == 'workflow_run' && 'main' || 'release' }}
-      cancel-in-progress: ${{ github.event_name == 'workflow_run' }}
+      group: arm64-publish-${{ github.ref == 'refs/heads/main' && 'main' || 'release' }}
+      cancel-in-progress: false
 
     steps:
-    # workflow_run sets GITHUB_SHA to the DEFAULT-branch tip, NOT the commit
-    # that triggered Rust. Check out the exact head_sha that passed Rust so we
-    # never build/publish a later commit that hasn't passed (or has since
-    # failed). For tag-push events workflow_run is empty and we fall back to
-    # github.sha (the tagged commit). Provenance is already gated in `if:`.
+    # Main only lands merge-queue SHAs that passed Rust. For tag pushes,
+    # github.sha is the tagged commit.
     - name: Checkout repository
       uses: actions/checkout@v4
       with:
-        ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+        ref: ${{ github.sha }}
         # Do not persist the GITHUB_TOKEN into .git/config on the self-hosted
         # runner (actions/checkout writes it there by default for later git
         # pushes). This job only reads; the token must not outlive the step.
@@ -251,12 +226,11 @@ jobs:
       with:
         images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
         tags: |
+          # Immutable architecture-specific staging tag
+          type=raw,value=sha-${{ github.sha }},suffix=-cpu-arm64
           # Tag builds (releases) — semver, arm64 CPU suffix
           type=semver,pattern={{version}},suffix=-cpu-arm64
           type=semver,pattern={{major}}.{{minor}},suffix=-cpu-arm64
-          # Default-branch (main) moving pointers
-          type=raw,value=edge,enable={{is_default_branch}},suffix=-cpu-arm64
-          type=raw,value=latest,enable={{is_default_branch}},suffix=-cpu-arm64
 
     - name: Build arm64 CPU image (native podman, no QEMU)
       env:
@@ -307,13 +281,6 @@ jobs:
   # builds succeeded. The Graviton target can keep pulling `latest-cpu`; GHCR
   # selects linux/arm64 while existing x86 hosts receive linux/amd64.
   publish-cpu-manifest:
-    if: >-
-      github.event_name == 'push' ||
-      (
-        github.event.workflow_run.event == 'push' &&
-        github.event.workflow_run.head_repository.full_name == github.repository &&
-        github.event.workflow_run.conclusion == 'success'
-      )
     needs: [build-docker, build-docker-arm64]
     runs-on: ubuntu-latest
     permissions:
@@ -331,27 +298,60 @@ jobs:
       run: |
         echo "$REGISTRY_TOKEN" | docker login ghcr.io -u "$REGISTRY_USER" --password-stdin
 
+    - name: Check publication freshness
+      id: freshness
+      env:
+        EXPECTED_SHA: ${{ github.sha }}
+        REPOSITORY: ${{ github.repository }}
+      run: |
+        set -euo pipefail
+        if [ "$GITHUB_REF" != "refs/heads/main" ]; then
+          echo "publish=true" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+        current_sha="$(
+          git ls-remote "https://github.com/${REPOSITORY}.git" refs/heads/main |
+            awk 'NR == 1 { print $1 }'
+        )"
+        if [ "$current_sha" = "$EXPECTED_SHA" ]; then
+          echo "publish=true" >> "$GITHUB_OUTPUT"
+        else
+          echo "publish=false" >> "$GITHUB_OUTPUT"
+          echo "::notice::not moving canonical CPU tags: ${EXPECTED_SHA} is stale; main is ${current_sha}"
+        fi
+
     - name: Extract CPU manifest tags
       id: meta
+      if: steps.freshness.outputs.publish == 'true'
       uses: docker/metadata-action@v5
       with:
         images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
         tags: |
           type=semver,pattern={{version}},suffix=-cpu
           type=semver,pattern={{major}}.{{minor}},suffix=-cpu
-          type=raw,value=edge,suffix=-cpu,enable=${{ github.event_name == 'workflow_run' }}
-          type=raw,value=latest,suffix=-cpu,enable=${{ github.event_name == 'workflow_run' }}
+          type=raw,value=edge,suffix=-cpu,enable=${{ github.ref == 'refs/heads/main' }}
+          type=raw,value=latest,suffix=-cpu,enable=${{ github.ref == 'refs/heads/main' }}
 
     - name: Publish multi-arch CPU manifests
+      id: publish
+      if: steps.freshness.outputs.publish == 'true'
       env:
         TAGS: ${{ steps.meta.outputs.tags }}
+        IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+        REVISION: ${{ github.sha }}
       run: |
         set -euo pipefail
         while IFS= read -r tag; do
           [ -n "$tag" ] || continue
           docker buildx imagetools create \
             --tag "$tag" \
-            "${tag}-amd64" \
-            "${tag}-arm64"
+            "${IMAGE}:sha-${REVISION}-cpu-amd64" \
+            "${IMAGE}:sha-${REVISION}-cpu-arm64"
           docker buildx imagetools inspect "$tag"
+          raw_manifest="$(mktemp)"
+          docker buildx imagetools inspect "$tag" --raw > "$raw_manifest"
+          digest="sha256:$(sha256sum "$raw_manifest" | awk '{ print $1 }')"
+          rm -f "$raw_manifest"
+          echo "${tag}@${digest}" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
         done <<< "$TAGS"
