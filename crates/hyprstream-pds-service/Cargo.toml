@@ -13,6 +13,7 @@ hyprstream-pds = { path = "../hyprstream-pds" }
 hyprstream-rpc = { path = "../hyprstream-rpc" }
 hyprstream-vfs = { path = "../hyprstream-vfs" }
 parking_lot = { workspace = true }
+p256 = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

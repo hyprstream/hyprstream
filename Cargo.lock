@@ -7224,6 +7224,7 @@ dependencies = [
  "hyprstream-pds",
  "hyprstream-rpc",
  "hyprstream-vfs",
+ "p256",
  "parking_lot 0.12.4",
  "rand 0.8.5",
  "serde",

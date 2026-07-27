@@ -5,7 +5,7 @@
 //! remains deliberately no-networking: this module is the serving layer that
 //! calls its data functions (`Commit`/`MST`/`car::build_record_proof_car`).
 //!
-//! # Endpoints (public reads only)
+//! # Endpoints
 //!
 //! | Method | Path (under `/xrpc/`) | Notes |
 //! |--------|-----------------------|-------|
@@ -13,6 +13,7 @@
 //! | GET    | `com.atproto.repo.describeRepo`     | DID/handle + commit head + didDoc |
 //! | GET    | `com.atproto.repo.getRecord`        | record JSON (optional `cid` pinning) |
 //! | GET    | `com.atproto.sync.getRepo`          | full-repo CARv1 export (lazy stream) |
+//! | GET    | `com.atproto.server.getServiceAuth` | protected hosted-account service JWT |
 //!
 //! **Session endpoints (`createSession`/`getSession`) are deliberately NOT in
 //! this PR.** Credential verification (password / app-password) and the OAuth
@@ -35,13 +36,15 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use axum::{
-    extract::{RawQuery, State},
+    extract::{Extension, RawQuery, State},
     http::{header, StatusCode},
     response::{IntoResponse, Response},
 };
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use bytes::Bytes;
 use futures::{stream, Stream};
 use p256::ecdsa::VerifyingKey;
+use rand::RngCore as _;
 use serde_json::{json, Value};
 use tokio::sync::{OwnedSemaphorePermit, RwLock, Semaphore};
 
@@ -55,9 +58,19 @@ use hyprstream_pds::Cid;
 
 use super::did_document::{build_did_document, issuer_authority, AtprotoIdentity};
 use super::state::OAuthState;
+use super::{
+    auth::{self, AuthenticatedUser},
+    token_exchange::{ATPROTO_SESSION_EXCHANGE_NSID, MAX_ATPROTO_SERVICE_TOKEN_LIFETIME},
+};
 
 /// `ai.hyprstream.model` is the only collection this PDS hosts today.
 pub const HOSTED_COLLECTION: &str = COLLECTION_NSID;
+
+/// Protected hosted-PDS service-auth endpoint from the ATProto server lexicon.
+pub const GET_SERVICE_AUTH_PATH: &str = "/xrpc/com.atproto.server.getServiceAuth";
+
+const DEFAULT_SERVICE_AUTH_TTL_SECONDS: i64 = 60;
+const MAX_SERVICE_AUTH_PARAMETER_BYTES: usize = 2_048;
 
 /// Maximum number of concurrent `sync.getRepo` (full-CAR export) requests.
 /// Each request streams the entire repo; bounding concurrency prevents
@@ -114,11 +127,15 @@ impl RepoSnapshot {
     pub fn record_proof_car(&self, rkey: &str) -> Option<Vec<u8>> {
         let tid = Tid::parse(rkey).ok()?;
         let rec = self.records.get(&tid)?;
-        let cids: BTreeMap<Tid, Cid> =
-            self.records.iter().map(|(t, r)| (*t, r.cid())).collect();
+        let cids: BTreeMap<Tid, Cid> = self.records.iter().map(|(t, r)| (*t, r.cid())).collect();
         let tree = Node::from_records(HOSTED_COLLECTION, &cids);
         let proof = tree.proof(HOSTED_COLLECTION, &tid)?;
-        Some(build_record_proof_car(&self.commit, &proof, &self.node_blocks, rec))
+        Some(build_record_proof_car(
+            &self.commit,
+            &proof,
+            &self.node_blocks,
+            rec,
+        ))
     }
 
     pub fn record_json(&self, rkey: &str, rec: &ModelRecord) -> Value {
@@ -170,7 +187,10 @@ impl XrpcRepoStore {
     /// Insert or replace a snapshot for an atproto-valid repo authority.
     pub async fn put(&self, snap: RepoSnapshot) -> anyhow::Result<()> {
         accept_repo_authority(&snap.did)?;
-        self.by_did.write().await.insert(snap.did.clone(), Arc::new(snap));
+        self.by_did
+            .write()
+            .await
+            .insert(snap.did.clone(), Arc::new(snap));
         Ok(())
     }
 
@@ -199,7 +219,9 @@ impl XrpcRepoStore {
     /// Acquire an **owned** concurrency permit for full-CAR export. The permit
     /// lives until the body stream is consumed or dropped — not just until the
     /// handler returns. Bounded by [`GET_REPO_CONCURRENCY`].
-    pub async fn acquire_get_repo_owned(&self) -> Result<OwnedSemaphorePermit, tokio::sync::AcquireError> {
+    pub async fn acquire_get_repo_owned(
+        &self,
+    ) -> Result<OwnedSemaphorePermit, tokio::sync::AcquireError> {
         self.get_repo_sema.clone().acquire_owned().await
     }
 }
@@ -279,10 +301,7 @@ fn lazy_car_stream(
                             *ridx += 1;
                             let rec = &snap.records[&tid];
                             return Some((
-                                Ok(Bytes::from(car_block_bytes(
-                                    rec.cid(),
-                                    &rec.to_dag_cbor(),
-                                ))),
+                                Ok(Bytes::from(car_block_bytes(rec.cid(), &rec.to_dag_cbor()))),
                                 state,
                             ));
                         }
@@ -310,11 +329,294 @@ pub fn xrpc_error(status: StatusCode, error: &str, message: impl Into<String>) -
 
 pub mod errors {
     pub const INVALID_REQUEST: &str = "InvalidRequest";
+    pub const BAD_EXPIRATION: &str = "BadExpiration";
     pub const ACCOUNT_NOT_FOUND: &str = "AccountNotFound";
     pub const HANDLE_NOT_FOUND: &str = "HandleNotFound";
     pub const RECORD_NOT_FOUND: &str = "RecordNotFound";
     pub const REPO_NOT_FOUND: &str = "RepoNotFound";
     pub const INTERNAL_SERVER_ERROR: &str = "InternalServerError";
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Protected hosted-account service auth
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[derive(Debug, PartialEq, Eq)]
+struct GetServiceAuthParams {
+    aud: String,
+    exp: Option<i64>,
+    lxm: String,
+}
+
+fn parse_get_service_auth_query(raw: Option<&str>) -> Result<GetServiceAuthParams, &'static str> {
+    let mut aud = None;
+    let mut exp = None;
+    let mut lxm = None;
+    for (key, value) in url::form_urlencoded::parse(raw.unwrap_or_default().as_bytes()) {
+        if key.len() > MAX_SERVICE_AUTH_PARAMETER_BYTES
+            || value.len() > MAX_SERVICE_AUTH_PARAMETER_BYTES
+        {
+            return Err("service-auth query parameter is too long");
+        }
+        match key.as_ref() {
+            "aud" if aud.is_none() && !value.is_empty() => aud = Some(value.into_owned()),
+            "exp" if exp.is_none() && !value.is_empty() => {
+                exp = Some(
+                    value
+                        .parse()
+                        .map_err(|_| "exp must be an integer Unix timestamp")?,
+                );
+            }
+            "lxm" if lxm.is_none() && !value.is_empty() => lxm = Some(value.into_owned()),
+            "aud" | "exp" | "lxm" => {
+                return Err("service-auth query parameters must be non-empty and unique");
+            }
+            _ => return Err("unknown service-auth query parameter"),
+        }
+    }
+    Ok(GetServiceAuthParams {
+        aud: aud.ok_or("aud is required")?,
+        exp,
+        // The upstream lexicon permits an unbound token, but this hosted-PDS
+        // surface only mints the one method-bound assertion consumed by #1354.
+        lxm: lxm.ok_or("lxm is required")?,
+    })
+}
+
+fn service_auth_response(status: StatusCode, body: Value) -> Response {
+    (
+        status,
+        [
+            (header::CACHE_CONTROL, "no-store"),
+            (header::PRAGMA, "no-cache"),
+        ],
+        axum::Json(body),
+    )
+        .into_response()
+}
+
+fn service_auth_error(status: StatusCode, error: &str, message: impl Into<String>) -> Response {
+    service_auth_response(status, xrpc_error_body(error, message))
+}
+
+/// Mint a short-lived, method-bound ATProto service JWT using the hosted
+/// account's persisted `#atproto` key.
+///
+/// Authentication and DPoP proof verification happen in the protected-router
+/// middleware. This handler independently re-verifies the signed OAuth grant
+/// before deriving scope, subject, or tenant authority from it.
+pub async fn get_service_auth(
+    State(state): State<Arc<OAuthState>>,
+    Extension(user): Extension<AuthenticatedUser>,
+    RawQuery(raw): RawQuery,
+) -> Response {
+    let params = match parse_get_service_auth_query(raw.as_deref()) {
+        Ok(params) => params,
+        Err(message) => {
+            return service_auth_error(StatusCode::BAD_REQUEST, errors::INVALID_REQUEST, message);
+        }
+    };
+    let expected_aud = match state.atproto_service_did() {
+        Some(did) => did,
+        None => {
+            return service_auth_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                errors::INTERNAL_SERVER_ERROR,
+                "host service DID is unavailable",
+            );
+        }
+    };
+    if params.aud != expected_aud {
+        return service_auth_error(
+            StatusCode::BAD_REQUEST,
+            errors::INVALID_REQUEST,
+            "aud must equal this PDS host DID",
+        );
+    }
+    if params.lxm != ATPROTO_SESSION_EXCHANGE_NSID {
+        return service_auth_error(
+            StatusCode::BAD_REQUEST,
+            errors::INVALID_REQUEST,
+            format!("lxm must equal {ATPROTO_SESSION_EXCHANGE_NSID}"),
+        );
+    }
+
+    let now = chrono::Utc::now().timestamp();
+    let exp = match params
+        .exp
+        .unwrap_or_else(|| now.saturating_add(DEFAULT_SERVICE_AUTH_TTL_SECONDS))
+        .checked_sub(now)
+    {
+        Some(ttl) if ttl > 0 && ttl <= MAX_ATPROTO_SERVICE_TOKEN_LIFETIME => now + ttl,
+        _ => {
+            return service_auth_error(
+                StatusCode::BAD_REQUEST,
+                errors::BAD_EXPIRATION,
+                "exp must be in the future and no more than one hour from now",
+            );
+        }
+    };
+
+    let token = match user.token.as_deref() {
+        Some(token) => token,
+        None => {
+            return service_auth_error(
+                StatusCode::UNAUTHORIZED,
+                errors::INVALID_REQUEST,
+                "verified OAuth access token is required",
+            );
+        }
+    };
+    let claims = match auth::validate_oauth_access_token(&state, token).await {
+        Ok(claims) => claims,
+        Err(_) => {
+            return service_auth_error(
+                StatusCode::UNAUTHORIZED,
+                errors::INVALID_REQUEST,
+                "OAuth access token is invalid or expired",
+            );
+        }
+    };
+    if claims.sub != user.user || claims.tenant != user.verified_tenant {
+        tracing::error!("service-auth middleware and handler identity claims disagree");
+        return service_auth_error(
+            StatusCode::UNAUTHORIZED,
+            errors::INVALID_REQUEST,
+            "OAuth identity binding is invalid",
+        );
+    }
+    if !claims.has_scope("atproto") {
+        return service_auth_error(
+            StatusCode::FORBIDDEN,
+            "InsufficientScope",
+            "the atproto scope is required",
+        );
+    }
+    if claims.cnf_jkt().is_none() {
+        return service_auth_error(
+            StatusCode::UNAUTHORIZED,
+            errors::INVALID_REQUEST,
+            "a DPoP-bound OAuth access token is required",
+        );
+    }
+    if super::token::hosted_account_tenant_from_did(&claims.sub, state.hosted_account_zone.as_ref())
+        .is_err()
+    {
+        return service_auth_error(
+            StatusCode::BAD_REQUEST,
+            errors::ACCOUNT_NOT_FOUND,
+            "OAuth subject is not a hosted account on this PDS",
+        );
+    }
+    let record_tenant = match state.hosted_account_tenant(&claims.sub).await {
+        Ok(Some(tenant)) => tenant,
+        Ok(None) => {
+            return service_auth_error(
+                StatusCode::BAD_REQUEST,
+                errors::ACCOUNT_NOT_FOUND,
+                "OAuth subject has no hosted account record",
+            );
+        }
+        Err(error) => {
+            tracing::error!(
+                subject = %claims.sub,
+                error = %error,
+                "hosted account tenant verification failed"
+            );
+            return service_auth_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                errors::INTERNAL_SERVER_ERROR,
+                "hosted account verification failed",
+            );
+        }
+    };
+    if claims.tenant.as_deref() != Some(record_tenant.as_str()) {
+        tracing::error!(
+            subject = %claims.sub,
+            "OAuth tenant does not match the authority-owned hosted account record"
+        );
+        return service_auth_error(
+            StatusCode::UNAUTHORIZED,
+            errors::INVALID_REQUEST,
+            "OAuth hosted-account tenant binding is invalid",
+        );
+    }
+
+    let mut jti_bytes = [0_u8; 16];
+    rand::rngs::OsRng.fill_bytes(&mut jti_bytes);
+    let header_segment = match serde_json::to_vec(&json!({
+        "alg": "ES256",
+        "typ": "JWT",
+        "kid": "#atproto",
+    })) {
+        Ok(bytes) => URL_SAFE_NO_PAD.encode(bytes),
+        Err(_) => {
+            return service_auth_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                errors::INTERNAL_SERVER_ERROR,
+                "failed to encode service JWT",
+            );
+        }
+    };
+    let claims_segment = match serde_json::to_vec(&json!({
+        "iss": claims.sub,
+        "aud": expected_aud,
+        "iat": now,
+        "exp": exp,
+        "lxm": ATPROTO_SESSION_EXCHANGE_NSID,
+        "jti": URL_SAFE_NO_PAD.encode(jti_bytes),
+    })) {
+        Ok(bytes) => URL_SAFE_NO_PAD.encode(bytes),
+        Err(_) => {
+            return service_auth_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                errors::INTERNAL_SERVER_ERROR,
+                "failed to encode service JWT",
+            );
+        }
+    };
+    let signing_input = format!("{header_segment}.{claims_segment}");
+    let Some(store) = state.hosted_account_store.as_ref() else {
+        return service_auth_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            errors::INTERNAL_SERVER_ERROR,
+            "hosted account signer is unavailable",
+        );
+    };
+    let authority =
+        hyprstream_rpc::Subject::new(hyprstream_pds_service::OAUTH_ACCOUNT_RESOLVER_SUBJECT);
+    let signature = match store
+        .sign_for_hosted_did(&authority, &user.user, signing_input.as_bytes())
+        .await
+    {
+        Ok(Some(signature)) => signature,
+        Ok(None) => {
+            return service_auth_error(
+                StatusCode::BAD_REQUEST,
+                errors::ACCOUNT_NOT_FOUND,
+                "OAuth subject has no hosted account signing record",
+            );
+        }
+        Err(error) => {
+            tracing::error!(
+                subject = %user.user,
+                error = %error,
+                "hosted account service JWT signing failed"
+            );
+            return service_auth_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                errors::INTERNAL_SERVER_ERROR,
+                "hosted account signing failed",
+            );
+        }
+    };
+
+    service_auth_response(
+        StatusCode::OK,
+        json!({
+            "token": format!("{signing_input}.{}", URL_SAFE_NO_PAD.encode(signature)),
+        }),
+    )
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -378,11 +680,7 @@ fn hex_val(b: u8) -> Option<u8> {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Resolve a handle to a DID via the store + issuer-derived self-handle.
-async fn resolve_handle_core(
-    store: &XrpcRepoStore,
-    issuer_url: &str,
-    handle: &str,
-) -> Response {
+async fn resolve_handle_core(store: &XrpcRepoStore, issuer_url: &str, handle: &str) -> Response {
     if let Some(snap) = store.by_handle_public(handle).await {
         return axum::Json(json!({ "did": snap.did })).into_response();
     }
@@ -516,10 +814,7 @@ async fn get_repo_core(store: &XrpcRepoStore, did: &str, since_present: bool) ->
         .into_response()
 }
 
-async fn lookup_public_snapshot(
-    store: &XrpcRepoStore,
-    key: &str,
-) -> Option<Arc<RepoSnapshot>> {
+async fn lookup_public_snapshot(store: &XrpcRepoStore, key: &str) -> Option<Arc<RepoSnapshot>> {
     if key.starts_with("did:") {
         store.get_public(key).await
     } else {
@@ -567,13 +862,16 @@ pub async fn describe_repo(
     describe_repo_core(&state.xrpc_repos, &state.issuer_url, key).await
 }
 
-pub async fn get_record(
-    State(state): State<Arc<OAuthState>>,
-    RawQuery(raw): RawQuery,
-) -> Response {
+pub async fn get_record(State(state): State<Arc<OAuthState>>, RawQuery(raw): RawQuery) -> Response {
     let params = parse_query(raw.as_deref());
-    let collection = params.get("collection").map(std::string::String::as_str).unwrap_or("");
-    let rkey = params.get("rkey").map(std::string::String::as_str).unwrap_or("");
+    let collection = params
+        .get("collection")
+        .map(std::string::String::as_str)
+        .unwrap_or("");
+    let rkey = params
+        .get("rkey")
+        .map(std::string::String::as_str)
+        .unwrap_or("");
     let repo = match params.get("repo") {
         Some(r) if !r.is_empty() => r.trim(),
         _ => {
@@ -588,10 +886,7 @@ pub async fn get_record(
     get_record_core(&state.xrpc_repos, repo, collection, rkey, cid).await
 }
 
-pub async fn get_repo(
-    State(state): State<Arc<OAuthState>>,
-    RawQuery(raw): RawQuery,
-) -> Response {
+pub async fn get_repo(State(state): State<Arc<OAuthState>>, RawQuery(raw): RawQuery) -> Response {
     let params = parse_query(raw.as_deref());
     let did = match params.get("did") {
         Some(d) if !d.is_empty() => d.trim(),
@@ -664,7 +959,11 @@ mod tests {
 
     #[tokio::test]
     async fn lazy_car_stream_produces_valid_car() {
-        let snap = Arc::new(sample_snapshot("did:web:h.example.com", "h.example.com", true));
+        let snap = Arc::new(sample_snapshot(
+            "did:web:h.example.com",
+            "h.example.com",
+            true,
+        ));
         let store = XrpcRepoStore::new();
         let permit = store.acquire_get_repo_owned().await.unwrap();
         let strm = lazy_car_stream(Arc::clone(&snap), permit);
@@ -713,7 +1012,11 @@ mod tests {
         for _ in 0..GET_REPO_CONCURRENCY {
             held.push(store.acquire_get_repo_owned().await.unwrap());
         }
-        let snap = Arc::new(sample_snapshot("did:web:h.example.com", "h.example.com", true));
+        let snap = Arc::new(sample_snapshot(
+            "did:web:h.example.com",
+            "h.example.com",
+            true,
+        ));
         // Acquire one more for the stream.
         let stream_permit = held.pop().unwrap();
         let strm = lazy_car_stream(snap, stream_permit);
@@ -733,7 +1036,14 @@ mod tests {
     #[tokio::test]
     async fn endpoint_non_public_invisible_describe_repo() {
         let store = XrpcRepoStore::new();
-        store.put(sample_snapshot("did:web:priv.example.com", "priv.example.com", false)).await.unwrap();
+        store
+            .put(sample_snapshot(
+                "did:web:priv.example.com",
+                "priv.example.com",
+                false,
+            ))
+            .await
+            .unwrap();
         let resp = describe_repo_core(&store, ISSUER, "did:web:priv.example.com").await;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         let body = body_json(resp).await;
@@ -743,7 +1053,14 @@ mod tests {
     #[tokio::test]
     async fn endpoint_non_public_invisible_get_record() {
         let store = XrpcRepoStore::new();
-        store.put(sample_snapshot("did:web:priv.example.com", "priv.example.com", false)).await.unwrap();
+        store
+            .put(sample_snapshot(
+                "did:web:priv.example.com",
+                "priv.example.com",
+                false,
+            ))
+            .await
+            .unwrap();
         let resp = get_record_core(
             &store,
             "did:web:priv.example.com",
@@ -760,7 +1077,14 @@ mod tests {
     #[tokio::test]
     async fn endpoint_non_public_invisible_get_repo() {
         let store = XrpcRepoStore::new();
-        store.put(sample_snapshot("did:web:priv.example.com", "priv.example.com", false)).await.unwrap();
+        store
+            .put(sample_snapshot(
+                "did:web:priv.example.com",
+                "priv.example.com",
+                false,
+            ))
+            .await
+            .unwrap();
         let resp = get_repo_core(&store, "did:web:priv.example.com", false).await;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         let body = body_json(resp).await;
@@ -770,7 +1094,14 @@ mod tests {
     #[tokio::test]
     async fn endpoint_non_public_invisible_resolve_handle() {
         let store = XrpcRepoStore::new();
-        store.put(sample_snapshot("did:web:priv.example.com", "priv.example.com", false)).await.unwrap();
+        store
+            .put(sample_snapshot(
+                "did:web:priv.example.com",
+                "priv.example.com",
+                false,
+            ))
+            .await
+            .unwrap();
         let resp = resolve_handle_core(&store, ISSUER, "priv.example.com").await;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         let body = body_json(resp).await;
@@ -780,7 +1111,14 @@ mod tests {
     #[tokio::test]
     async fn endpoint_public_snapshot_visible_describe_repo() {
         let store = XrpcRepoStore::new();
-        store.put(sample_snapshot("did:web:pub.example.com", "pub.example.com", true)).await.unwrap();
+        store
+            .put(sample_snapshot(
+                "did:web:pub.example.com",
+                "pub.example.com",
+                true,
+            ))
+            .await
+            .unwrap();
         let resp = describe_repo_core(&store, ISSUER, "did:web:pub.example.com").await;
         assert_eq!(resp.status(), StatusCode::OK);
         let body = body_json(resp).await;
@@ -827,9 +1165,14 @@ mod tests {
         let rkey = snap.records.keys().next().unwrap().encode();
         let cid = snap.records.values().next().unwrap().cid().to_string();
         store.put(snap).await.unwrap();
-        let resp =
-            get_record_core(&store, "did:web:pub.example.com", HOSTED_COLLECTION, &rkey, Some(&cid))
-                .await;
+        let resp = get_record_core(
+            &store,
+            "did:web:pub.example.com",
+            HOSTED_COLLECTION,
+            &rkey,
+            Some(&cid),
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
@@ -838,7 +1181,14 @@ mod tests {
     #[tokio::test]
     async fn since_non_empty_rejected() {
         let store = XrpcRepoStore::new();
-        store.put(sample_snapshot("did:web:pub.example.com", "pub.example.com", true)).await.unwrap();
+        store
+            .put(sample_snapshot(
+                "did:web:pub.example.com",
+                "pub.example.com",
+                true,
+            ))
+            .await
+            .unwrap();
         let resp = get_repo_core(&store, "did:web:pub.example.com", true).await;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         let body = body_json(resp).await;
@@ -848,7 +1198,14 @@ mod tests {
     #[tokio::test]
     async fn get_repo_without_since_succeeds() {
         let store = XrpcRepoStore::new();
-        store.put(sample_snapshot("did:web:pub.example.com", "pub.example.com", true)).await.unwrap();
+        store
+            .put(sample_snapshot(
+                "did:web:pub.example.com",
+                "pub.example.com",
+                true,
+            ))
+            .await
+            .unwrap();
         let resp = get_repo_core(&store, "did:web:pub.example.com", false).await;
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(
@@ -887,21 +1244,66 @@ mod tests {
     fn parse_query_percent_decodes_values() {
         // did%3Aweb%3Ax → did:web:x (colons percent-encoded).
         let q = parse_query(Some("repo=did%3Aweb%3Ax&collection=ai.hyprstream.model"));
-        assert_eq!(q.get("repo").map(std::string::String::as_str), Some("did:web:x"));
-        assert_eq!(q.get("collection").map(std::string::String::as_str), Some("ai.hyprstream.model"));
+        assert_eq!(
+            q.get("repo").map(std::string::String::as_str),
+            Some("did:web:x")
+        );
+        assert_eq!(
+            q.get("collection").map(std::string::String::as_str),
+            Some("ai.hyprstream.model")
+        );
     }
 
     #[test]
     fn parse_query_plus_becomes_space() {
         let q = parse_query(Some("handle=foo+bar"));
-        assert_eq!(q.get("handle").map(std::string::String::as_str), Some("foo bar"));
+        assert_eq!(
+            q.get("handle").map(std::string::String::as_str),
+            Some("foo bar")
+        );
     }
 
     #[test]
     fn parse_query_extracts_key_value_pairs() {
-        let q = parse_query(Some("repo=did:web:x&collection=ai.hyprstream.model&rkey=abc"));
-        assert_eq!(q.get("repo").map(std::string::String::as_str), Some("did:web:x"));
-        assert_eq!(q.get("collection").map(std::string::String::as_str), Some("ai.hyprstream.model"));
+        let q = parse_query(Some(
+            "repo=did:web:x&collection=ai.hyprstream.model&rkey=abc",
+        ));
+        assert_eq!(
+            q.get("repo").map(std::string::String::as_str),
+            Some("did:web:x")
+        );
+        assert_eq!(
+            q.get("collection").map(std::string::String::as_str),
+            Some("ai.hyprstream.model")
+        );
+    }
+
+    #[test]
+    fn service_auth_query_is_strict_and_method_bound() {
+        assert_eq!(
+            parse_get_service_auth_query(Some(
+                "aud=did%3Aweb%3Apds.example.test&lxm=ai.hyprstream.identity.exchangeSession"
+            ))
+            .unwrap(),
+            GetServiceAuthParams {
+                aud: "did:web:pds.example.test".to_owned(),
+                exp: None,
+                lxm: ATPROTO_SESSION_EXCHANGE_NSID.to_owned(),
+            }
+        );
+        for malformed in [
+            "",
+            "aud=did:web:pds.example.test",
+            "lxm=ai.hyprstream.identity.exchangeSession",
+            "aud=did:web:pds.example.test&aud=did:web:other&lxm=ai.hyprstream.identity.exchangeSession",
+            "aud=did:web:pds.example.test&lxm=ai.hyprstream.identity.exchangeSession&extra=1",
+            "aud=did:web:pds.example.test&lxm=ai.hyprstream.identity.exchangeSession&exp=tomorrow",
+        ] {
+            assert!(
+                parse_get_service_auth_query(Some(malformed)).is_err(),
+                "query should fail closed: {malformed}"
+            );
+        }
     }
 
     // ── Router-mounted tests (findings 1 + 2) ─────────────────────────────────
@@ -947,12 +1349,20 @@ mod tests {
 
         state
             .xrpc_repos
-            .put(sample_snapshot("did:web:pub.example.com", "pub.example.com", true))
+            .put(sample_snapshot(
+                "did:web:pub.example.com",
+                "pub.example.com",
+                true,
+            ))
             .await
             .unwrap();
         state
             .xrpc_repos
-            .put(sample_snapshot("did:web:priv.example.com", "priv.example.com", false))
+            .put(sample_snapshot(
+                "did:web:priv.example.com",
+                "priv.example.com",
+                false,
+            ))
             .await
             .unwrap();
         state
@@ -1022,10 +1432,19 @@ mod tests {
     }
 
     fn req(uri: &str) -> HttpRequest<Body> {
-        HttpRequest::builder()
-            .uri(uri)
-            .body(Body::empty())
-            .unwrap()
+        HttpRequest::builder().uri(uri).body(Body::empty()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn service_auth_is_mounted_and_protected_without_public_read_slice() {
+        let app = build_production_app(false).await;
+        let response = app
+            .oneshot(req("/xrpc/com.atproto.server.getServiceAuth\
+                 ?aud=did%3Aweb%3Ah.example.com\
+                 &lxm=ai.hyprstream.identity.exchangeSession"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
     // ── Finding 1: real capacity test through the mounted router ──────────────
@@ -1055,12 +1474,11 @@ mod tests {
         held.pop();
 
         // N+1th should now complete.
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            n1.as_mut(),
-        )
-        .await;
-        assert!(result.is_ok(), "N+1th getRepo did not complete after dropping a body");
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), n1.as_mut()).await;
+        assert!(
+            result.is_ok(),
+            "N+1th getRepo did not complete after dropping a body"
+        );
         assert_eq!(result.unwrap().unwrap().status(), StatusCode::OK);
     }
 
@@ -1070,7 +1488,9 @@ mod tests {
     async fn router_private_repo_invisible_describe_repo() {
         let app = build_xrpc_router().await;
         let resp = app
-            .oneshot(req("/xrpc/com.atproto.repo.describeRepo?repo=did:web:priv.example.com"))
+            .oneshot(req(
+                "/xrpc/com.atproto.repo.describeRepo?repo=did:web:priv.example.com",
+            ))
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
@@ -1097,7 +1517,9 @@ mod tests {
     async fn router_private_repo_invisible_get_repo() {
         let app = build_xrpc_router().await;
         let resp = app
-            .oneshot(req("/xrpc/com.atproto.sync.getRepo?did=did:web:priv.example.com"))
+            .oneshot(req(
+                "/xrpc/com.atproto.sync.getRepo?did=did:web:priv.example.com",
+            ))
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
@@ -1109,7 +1531,9 @@ mod tests {
     async fn router_private_repo_invisible_resolve_handle() {
         let app = build_xrpc_router().await;
         let resp = app
-            .oneshot(req("/xrpc/com.atproto.identity.resolveHandle?handle=priv.example.com"))
+            .oneshot(req(
+                "/xrpc/com.atproto.identity.resolveHandle?handle=priv.example.com",
+            ))
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
@@ -1121,7 +1545,9 @@ mod tests {
     async fn router_public_describe_repo_ok() {
         let app = build_xrpc_router().await;
         let resp = app
-            .oneshot(req("/xrpc/com.atproto.repo.describeRepo?repo=did:web:pub.example.com"))
+            .oneshot(req(
+                "/xrpc/com.atproto.repo.describeRepo?repo=did:web:pub.example.com",
+            ))
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
@@ -1152,7 +1578,9 @@ mod tests {
         // Missing repo param.
         let resp = app
             .clone()
-            .oneshot(req("/xrpc/com.atproto.repo.getRecord?collection=ai.hyprstream.model"))
+            .oneshot(req(
+                "/xrpc/com.atproto.repo.getRecord?collection=ai.hyprstream.model",
+            ))
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
@@ -1173,7 +1601,9 @@ mod tests {
     async fn router_unknown_handle_handle_not_found() {
         let app = build_xrpc_router().await;
         let resp = app
-            .oneshot(req("/xrpc/com.atproto.identity.resolveHandle?handle=does-not-exist.com"))
+            .oneshot(req(
+                "/xrpc/com.atproto.identity.resolveHandle?handle=does-not-exist.com",
+            ))
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
@@ -1185,7 +1615,9 @@ mod tests {
     async fn router_since_empty_rejected() {
         let app = build_xrpc_router().await;
         let resp = app
-            .oneshot(req("/xrpc/com.atproto.sync.getRepo?did=did:web:pub.example.com&since="))
+            .oneshot(req(
+                "/xrpc/com.atproto.sync.getRepo?did=did:web:pub.example.com&since=",
+            ))
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
@@ -1212,7 +1644,9 @@ mod tests {
     async fn router_get_repo_ok_streams_car() {
         let app = build_xrpc_router().await;
         let resp = app
-            .oneshot(req("/xrpc/com.atproto.sync.getRepo?did=did:web:pub.example.com"))
+            .oneshot(req(
+                "/xrpc/com.atproto.sync.getRepo?did=did:web:pub.example.com",
+            ))
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
@@ -1275,7 +1709,8 @@ mod tests {
     #[tokio::test]
     async fn router_get_record_cid_match_returns_record() {
         let state = build_test_state(true).await;
-        let snap = sample_snapshot_fixed_tid("did:web:fixed.example.com", "fixed.example.com", true);
+        let snap =
+            sample_snapshot_fixed_tid("did:web:fixed.example.com", "fixed.example.com", true);
         let rkey = snap.records.keys().next().unwrap().encode();
         let cid = snap.records.values().next().unwrap().cid().to_string();
         state.xrpc_repos.put(snap).await.unwrap();
@@ -1294,7 +1729,8 @@ mod tests {
     #[tokio::test]
     async fn router_get_record_cid_mismatch_returns_record_not_found() {
         let state = build_test_state(true).await;
-        let snap = sample_snapshot_fixed_tid("did:web:fixed.example.com", "fixed.example.com", true);
+        let snap =
+            sample_snapshot_fixed_tid("did:web:fixed.example.com", "fixed.example.com", true);
         let rkey = snap.records.keys().next().unwrap().encode();
         state.xrpc_repos.put(snap).await.unwrap();
         let app = build_production_app_from_state(state).await;
@@ -1308,7 +1744,10 @@ mod tests {
         let body = resp_json(resp).await;
         assert_eq!(body["error"], errors::RECORD_NOT_FOUND);
         assert!(
-            body["message"].as_str().unwrap().contains("does not match cid"),
+            body["message"]
+                .as_str()
+                .unwrap()
+                .contains("does not match cid"),
             "message must explain the cid mismatch: {}",
             body["message"]
         );
@@ -1320,10 +1759,8 @@ mod tests {
         // ?repo= — empty value at the wrapper boundary.
         let resp = app
             .clone()
-            .oneshot(req(
-                "/xrpc/com.atproto.repo.getRecord?repo=\
-                 &collection=ai.hyprstream.model&rkey=abc",
-            ))
+            .oneshot(req("/xrpc/com.atproto.repo.getRecord?repo=\
+                 &collection=ai.hyprstream.model&rkey=abc"))
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);

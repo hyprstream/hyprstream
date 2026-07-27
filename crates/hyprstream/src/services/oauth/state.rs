@@ -704,6 +704,32 @@ mod tests {
         assert!(canonical_issuer_origin("pds.example.com").is_none());
     }
 
+    #[test]
+    fn atproto_service_did_matches_browser_origin_encoding() {
+        assert_eq!(
+            atproto_service_did_for_origin("https://pds.example.test").as_deref(),
+            Some("did:web:pds.example.test")
+        );
+        assert_eq!(
+            atproto_service_did_for_origin("https://pds.example.test/oauth/par").as_deref(),
+            Some("did:web:pds.example.test")
+        );
+        assert_eq!(
+            atproto_service_did_for_origin("https://pds.example.test:443/oauth/par").as_deref(),
+            Some("did:web:pds.example.test")
+        );
+        assert_eq!(
+            atproto_service_did_for_origin("https://pds.example.test:8443/oauth/par").as_deref(),
+            Some("did:web:pds.example.test%3A8443")
+        );
+        assert_eq!(
+            atproto_service_did_for_origin("http://127.0.0.1:6791").as_deref(),
+            Some("did:web:127.0.0.1%3A6791")
+        );
+        assert!(atproto_service_did_for_origin("https://[::1]:8443").is_none());
+        assert!(atproto_service_did_for_origin("ftp://pds.example.test").is_none());
+    }
+
     /// #1113 rev2 F4/F6: the default grant set (omitted-scope fallback) must
     /// NOT include `atproto` — those scopes are supported-but-explicit. A
     /// client that omits `scope` must NOT silently activate the strict profile.
@@ -1274,8 +1300,7 @@ impl OAuthState {
 
     /// Host service DID accepted in ATProto service-auth `aud`.
     pub fn atproto_service_did(&self) -> Option<String> {
-        super::did_document::issuer_authority(&self.issuer_url)
-            .map(|authority| format!("did:web:{authority}"))
+        atproto_service_did_for_origin(&self.issuer_url)
     }
 
     /// Set JWT signing key validity window for the JWKS endpoint.
@@ -1990,4 +2015,31 @@ pub fn canonical_issuer_origin(issuer_url: &str) -> Option<String> {
         return None;
     }
     Some(format!("{scheme}://{authority}"))
+}
+
+/// Convert the configured OAuth URL to the host-form `did:web` service DID
+/// used by ATProto service-auth audiences.
+///
+/// For supported DNS/IPv4 origins this mirrors the browser's
+/// `originToDidWeb`: URL parsing normalizes an explicit default port away,
+/// while a non-default port is retained and its domain-segment separator is
+/// encoded as `%3A`. IPv6 is rejected until client and server share one
+/// canonical DID representation for it.
+fn atproto_service_did_for_origin(issuer_url: &str) -> Option<String> {
+    let url = url::Url::parse(issuer_url).ok()?;
+    if !matches!(url.scheme(), "http" | "https")
+        || !url.username().is_empty()
+        || url.password().is_some()
+    {
+        return None;
+    }
+    let host = match url.host()? {
+        url::Host::Domain(domain) => domain.to_owned(),
+        url::Host::Ipv4(address) => address.to_string(),
+        url::Host::Ipv6(_) => return None,
+    };
+    Some(match url.port() {
+        Some(port) => format!("did:web:{host}%3A{port}"),
+        None => format!("did:web:{host}"),
+    })
 }
