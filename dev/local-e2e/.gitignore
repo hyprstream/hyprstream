@@ -1,0 +1,5 @@
+# All generated material is local-only. Some entries contain private keys.
+/generated/
+/private/
+/state/
+/runtime/

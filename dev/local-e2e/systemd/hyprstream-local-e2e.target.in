@@ -1,0 +1,14 @@
+[Unit]
+Description=Hyprstream local cold-signup to inference E2E target
+Wants=hyprstream-local-e2e-policy.service
+Wants=hyprstream-local-e2e-discovery.service
+Wants=hyprstream-local-e2e-registry.service
+Wants=hyprstream-local-e2e-pds.service
+Wants=hyprstream-local-e2e-inference@0.service
+Wants=hyprstream-local-e2e-inference@1.service
+After=hyprstream-local-e2e-policy.service
+After=hyprstream-local-e2e-discovery.service
+After=hyprstream-local-e2e-registry.service
+
+[Install]
+WantedBy=default.target
