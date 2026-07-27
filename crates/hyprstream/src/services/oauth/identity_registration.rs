@@ -1,4 +1,4 @@
-//! Authenticated identity registration and federation-intake HTTP face.
+//! Identity registration, federation-intake, and public resolution HTTP face.
 //!
 //! Registration has two distinct routes with the same handle-only body:
 //! browser-session self service and bearer-authenticated operator manual
@@ -11,22 +11,25 @@
 
 use std::collections::BTreeSet;
 use std::fs::{File, OpenOptions};
-use std::io::Write as _;
+use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{ensure, Context as _, Result};
 use async_trait::async_trait;
-use axum::extract::{Extension, Request, State};
+use axum::extract::{Extension, Query, Request, State};
 use axum::http::StatusCode;
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
+use hyprstream_discovery::{
+    ConnectTimeDiscovery, InMemoryPlcDirectoryStore, LivePlcDiscovery, PlcDirectory,
+};
 use hyprstream_pds::{
-    sign_genesis, AllocatedAccountName, DidOpSignature, DirectoryHostedAccountStore,
-    GenesisRotationKeys, HostKeyEnrollment, HybridRotationKey, RecoveryKeyEnrollment,
-    UnsignedGenesisDidOp, UserRotationKey,
+    sign_genesis, AccountRecord, AllocatedAccountName, DidOpSignature, DirectoryHostedAccountStore,
+    GenesisDidOp, GenesisRotationKeys, HostKeyEnrollment, HybridRotationKey, RecoveryKeyEnrollment,
+    SealedHostedDidDocument, UnsignedGenesisDidOp, UserRotationKey,
 };
 use hyprstream_pds_service::federation_intake::{
     FederatedDidDocumentResolver, FederatedDidResolver, FederationIntake,
@@ -47,12 +50,14 @@ use zeroize::Zeroize as _;
 use super::auth::AuthenticatedUser;
 use super::session;
 use super::state::OAuthState;
-use crate::account::AccountZoneConfig;
+use crate::account::{AccountZone, AccountZoneConfig};
 use crate::config::{OAuthConfig, QuicConfig};
 use crate::server::middleware::RateLimiter;
 
 const REGISTRATION_RATE_LIMIT_REQUESTS: u32 = 10;
 const REGISTRATION_RATE_LIMIT_WINDOW_SECS: i64 = 60;
+const PUBLIC_RESOLVE_RATE_LIMIT_BUCKET: &str = "identity-resolve-unauthenticated-floor";
+const MAX_AUTHORITY_ARTIFACT_BYTES: u64 = 64 * 1024;
 const ACCOUNT_GENESIS_ED25519_PURPOSE: &str = "hyprstream-hosted-account-genesis-ed25519-v1";
 const ACCOUNT_GENESIS_MLDSA65_PURPOSE: &str = "hyprstream-hosted-account-genesis-mldsa65-v1";
 
@@ -85,7 +90,36 @@ pub(crate) fn production_identity_registration_api(
     ));
     let resolver: Arc<dyn FederatedDidDocumentResolver> =
         Arc::new(FederatedDidResolver::new(plc, web));
-    compose_identity_registration_api(oauth, account, quic, oauth_signing_key, pds_root, resolver)
+    let live_discovery = Arc::new(ConfiguredHostedPdsDiscovery {
+        pds_endpoint: oauth.issuer_url(),
+        quic: quic.clone(),
+    });
+    let directory = PlcDirectory::new(
+        Arc::new(InMemoryPlcDirectoryStore::default()),
+        live_discovery.clone(),
+        hyprstream_discovery::deployment_registry_verifier()
+            .context("identity PLC directory authority is not installed")?,
+    );
+    let identity_resolver = Arc::new(AuthorityConnectTimeResolver {
+        plc: directory,
+        hosted: account
+            .resolve_zone()
+            .ok()
+            .map(|zone| HostedConnectTimeResolver {
+                pds_root: pds_root.clone(),
+                zone,
+                live_discovery,
+            }),
+    });
+    compose_identity_registration_api(
+        oauth,
+        account,
+        quic,
+        oauth_signing_key,
+        pds_root,
+        resolver,
+        identity_resolver,
+    )
 }
 
 fn compose_identity_registration_api(
@@ -95,6 +129,7 @@ fn compose_identity_registration_api(
     oauth_signing_key: ed25519_dalek::SigningKey,
     pds_root: PathBuf,
     resolver: Arc<dyn FederatedDidDocumentResolver>,
+    identity_resolver: Arc<dyn IdentityConnectTimeResolver>,
 ) -> Result<Arc<IdentityRegistrationApi>> {
     let authority = Arc::new(ProductionHostedAccountAuthority {
         account: account.clone(),
@@ -121,6 +156,7 @@ fn compose_identity_registration_api(
         minter,
         signer,
         intake,
+        identity_resolver,
         allowlist,
         Arc::new(RateLimiter::new(
             REGISTRATION_RATE_LIMIT_REQUESTS,
@@ -293,6 +329,136 @@ impl HostedPdsDiscovery for ConfiguredHostedPdsDiscovery {
     }
 }
 
+impl LivePlcDiscovery for ConfiguredHostedPdsDiscovery {
+    fn current(
+        &self,
+        _did: &str,
+        pds_endpoint: &str,
+    ) -> Result<hyprstream_rpc::service_entry::BrowserQuicReach> {
+        let current = <Self as HostedPdsDiscovery>::current(self)?;
+        let bound_endpoint = Url::parse(pds_endpoint)
+            .context("PLC directory PDS endpoint is invalid")?
+            .origin()
+            .ascii_serialization();
+        ensure!(
+            current.pds_endpoint == bound_endpoint,
+            "PLC directory identity is not bound to this hosted PDS"
+        );
+        Ok(current.browser_quic_reach)
+    }
+}
+
+struct HostedConnectTimeResolver {
+    pds_root: PathBuf,
+    zone: AccountZone,
+    live_discovery: Arc<ConfiguredHostedPdsDiscovery>,
+}
+
+impl HostedConnectTimeResolver {
+    fn local_label<'a>(&self, did: &'a str) -> Option<&'a str> {
+        let host = did.strip_prefix("did:web:")?;
+        let suffix = format!(".{}", self.zone.apex());
+        let label = host.strip_suffix(&suffix)?;
+        let name = AllocatedAccountName::new(label, did).ok()?;
+        (self.zone.host_for_label(name.label()).ok()?.as_str() == host).then_some(label)
+    }
+
+    fn resolve(&self, did: &str) -> Result<ConnectTimeDiscovery> {
+        let label = self
+            .local_label(did)
+            .context("DID is not a local hosted account")?;
+        let account_dir = self
+            .pds_root
+            .join(self.zone.apex())
+            .join("accounts")
+            .join(label);
+        let record = AccountRecord::from_dag_cbor(
+            &read_authority_artifact(&account_dir.join("account-record.cbor"))
+                .context("reading hosted account record")?,
+        )
+        .context("verifying hosted account record")?;
+        let genesis = GenesisDidOp::from_dag_cbor(
+            &read_authority_artifact(&account_dir.join("genesis.didop.cbor"))
+                .context("reading hosted account genesis")?,
+        )
+        .context("verifying hosted account genesis")?;
+        let document = SealedHostedDidDocument::from_canonical_json(
+            &read_authority_artifact(&account_dir.join("did-document.json"))
+                .context("reading hosted account DID document")?,
+        )
+        .context("verifying hosted account DID document")?;
+        ensure!(
+            record.name().label() == label
+                && record.name().did() == did
+                && document.did() == did
+                && record.genesis_op() == genesis.cid()?
+                && record.current_op() == record.genesis_op()
+                && record.doc_cid() == genesis.unsigned().doc_cid()
+                && record.doc_cid() == document.cid()
+                && record.atproto_verifying_key()?.to_encoded_point(true)
+                    == document.atproto_verifying_key()?.to_encoded_point(true),
+            "hosted account authority artifacts are inconsistent"
+        );
+        let reach = <ConfiguredHostedPdsDiscovery as LivePlcDiscovery>::current(
+            self.live_discovery.as_ref(),
+            did,
+            document.pds_endpoint(),
+        )?;
+        serde_json::from_value(serde_json::json!({
+            "quicUrl": reach.quic_url,
+            "certHash": reach.cert_hash,
+        }))
+        .context("encoding hosted connect-time discovery")
+    }
+}
+
+impl IdentityConnectTimeResolver for HostedConnectTimeResolver {
+    fn recognizes(&self, did: &str) -> bool {
+        self.local_label(did).is_some()
+    }
+
+    fn resolve(&self, did: &str) -> Result<ConnectTimeDiscovery> {
+        HostedConnectTimeResolver::resolve(self, did)
+    }
+}
+
+fn read_authority_artifact(path: &Path) -> Result<Vec<u8>> {
+    let mut limited = File::open(path)?.take(MAX_AUTHORITY_ARTIFACT_BYTES + 1);
+    let mut bytes = Vec::new();
+    limited.read_to_end(&mut bytes)?;
+    ensure!(
+        bytes.len() <= MAX_AUTHORITY_ARTIFACT_BYTES as usize,
+        "authority artifact exceeds the {MAX_AUTHORITY_ARTIFACT_BYTES}-byte read limit"
+    );
+    Ok(bytes)
+}
+
+struct AuthorityConnectTimeResolver {
+    plc: PlcDirectory,
+    hosted: Option<HostedConnectTimeResolver>,
+}
+
+impl IdentityConnectTimeResolver for AuthorityConnectTimeResolver {
+    fn recognizes(&self, did: &str) -> bool {
+        hyprstream_rpc::did_plc::is_did_plc(did)
+            || self
+                .hosted
+                .as_ref()
+                .and_then(|resolver| resolver.local_label(did))
+                .is_some()
+    }
+
+    fn resolve(&self, did: &str) -> Result<ConnectTimeDiscovery> {
+        if hyprstream_rpc::did_plc::is_did_plc(did) {
+            return self.plc.resolve(did);
+        }
+        self.hosted
+            .as_ref()
+            .context("hosted account resolution is not configured")?
+            .resolve(did)
+    }
+}
+
 struct ProductionHostedAccountPublisher {
     pds_root: PathBuf,
 }
@@ -422,6 +588,13 @@ pub struct FederationIntakeRequest {
     pub did: String,
 }
 
+/// Public connect-time resolution query.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ResolveIdentityQuery {
+    pub did: String,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RegistrationPath {
     SelfService,
@@ -494,6 +667,14 @@ impl FederatedIdentityIntake for FederationIntake {
     }
 }
 
+/// Injectable connect-time boundary over authority-known local identities.
+pub trait IdentityConnectTimeResolver: Send + Sync {
+    /// Pure classification that must not perform resolver or network I/O.
+    fn recognizes(&self, did: &str) -> bool;
+
+    fn resolve(&self, did: &str) -> Result<ConnectTimeDiscovery>;
+}
+
 /// Exact HTTPS origins that may be resolved through the `did:web` intake arm.
 ///
 /// Wildcards and suffix matching are intentionally unsupported. An empty set
@@ -543,11 +724,12 @@ impl DidWebOriginAllowlist {
     }
 }
 
-/// Authenticated, rate-limited wire adapter over hosted mint and intake.
+/// Rate-limited wire adapter over hosted mint, intake, and public local resolution.
 pub struct IdentityRegistrationApi {
     minter: Arc<dyn HostedRegistrationMint>,
     signer: Arc<dyn RegistrationGenesisSigner>,
     intake: Arc<dyn FederatedIdentityIntake>,
+    identity_resolver: Arc<dyn IdentityConnectTimeResolver>,
     did_web_origins: DidWebOriginAllowlist,
     rate_limiter: Arc<RateLimiter>,
 }
@@ -558,6 +740,7 @@ impl IdentityRegistrationApi {
         minter: Arc<dyn HostedRegistrationMint>,
         signer: Arc<dyn RegistrationGenesisSigner>,
         intake: Arc<dyn FederatedIdentityIntake>,
+        identity_resolver: Arc<dyn IdentityConnectTimeResolver>,
         did_web_origins: DidWebOriginAllowlist,
         rate_limiter: Arc<RateLimiter>,
     ) -> Self {
@@ -565,6 +748,7 @@ impl IdentityRegistrationApi {
             minter,
             signer,
             intake,
+            identity_resolver,
             did_web_origins,
             rate_limiter,
         }
@@ -624,6 +808,23 @@ impl IdentityRegistrationApi {
             .map_err(IdentityApiError::Backend)
     }
 
+    fn resolve(&self, did: &str) -> Result<ConnectTimeDiscovery, IdentityApiError> {
+        if self
+            .rate_limiter
+            .check_and_increment(PUBLIC_RESOLVE_RATE_LIMIT_BUCKET)
+        {
+            return Err(IdentityApiError::ResolveRateLimited);
+        }
+        if did == UNAUTHENTICATED_DID_SENTINEL || !self.identity_resolver.recognizes(did) {
+            return Err(IdentityApiError::NotFound(anyhow::anyhow!(
+                "identity is outside the local authority directory"
+            )));
+        }
+        self.identity_resolver
+            .resolve(did)
+            .map_err(IdentityApiError::NotFound)
+    }
+
     fn check_rate(&self, caller: &AuthenticatedIdentityCaller) -> Result<(), IdentityApiError> {
         if self.rate_limiter.check_and_increment(caller.subject()) {
             return Err(IdentityApiError::RateLimited);
@@ -650,8 +851,10 @@ enum IdentityApiError {
     Unauthenticated,
     Forbidden,
     RateLimited,
+    ResolveRateLimited,
     ResolvableHostDenied,
     InvalidRequest,
+    NotFound(anyhow::Error),
     Backend(anyhow::Error),
 }
 
@@ -673,6 +876,11 @@ impl IntoResponse for IdentityApiError {
                 "rate_limited",
                 "Identity mutation rate limit exceeded",
             ),
+            Self::ResolveRateLimited => (
+                StatusCode::TOO_MANY_REQUESTS,
+                "rate_limited",
+                "Identity resolution rate limit exceeded",
+            ),
             Self::ResolvableHostDenied => (
                 StatusCode::FORBIDDEN,
                 "origin_not_allowed",
@@ -683,6 +891,11 @@ impl IntoResponse for IdentityApiError {
                 "invalid_request",
                 "Registration or intake request is invalid",
             ),
+            Self::NotFound(_) => (
+                StatusCode::NOT_FOUND,
+                "not_found",
+                "Identity resolution not found",
+            ),
             Self::Backend(_) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "server_error",
@@ -691,6 +904,9 @@ impl IntoResponse for IdentityApiError {
         };
         if let Self::Backend(error) = &self {
             warn!(%error, "identity registration/intake backend failed");
+        }
+        if let Self::NotFound(error) = &self {
+            warn!(%error, "identity resolution failed closed");
         }
         (
             status,
@@ -777,6 +993,16 @@ pub(super) async fn intake_federated_identity(
     }
 }
 
+pub(super) async fn resolve_identity(
+    State(state): State<Arc<OAuthState>>,
+    Query(query): Query<ResolveIdentityQuery>,
+) -> Response {
+    match state.identity_registration_api.as_deref() {
+        Some(api) => api.resolve(&query.did).map(Json).into_response(),
+        None => unavailable_response(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::expect_used, clippy::unwrap_used)]
@@ -786,6 +1012,9 @@ mod tests {
     use anyhow::bail;
 
     use super::*;
+
+    const PUBLIC_PLC_DID: &str = "did:plc:ewvi7nxzyoun6zhxrhs64oiz";
+    const LOCAL_HOSTED_DID: &str = "did:web:alice.accounts.example.com";
 
     struct FakeMint {
         calls: AtomicUsize,
@@ -838,21 +1067,54 @@ mod tests {
         }
     }
 
-    fn fixture(max_requests: u32) -> (Arc<FakeMint>, Arc<CountingIntake>, IdentityRegistrationApi) {
+    struct CountingIdentityResolver {
+        calls: AtomicUsize,
+    }
+
+    impl IdentityConnectTimeResolver for CountingIdentityResolver {
+        fn recognizes(&self, did: &str) -> bool {
+            matches!(did, PUBLIC_PLC_DID | LOCAL_HOSTED_DID)
+                || did == "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+
+        fn resolve(&self, did: &str) -> Result<ConnectTimeDiscovery> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if !matches!(did, PUBLIC_PLC_DID | LOCAL_HOSTED_DID) {
+                bail!("identity not found");
+            }
+            Ok(serde_json::from_value(serde_json::json!({
+                "quicUrl": "https://pds.example:4433",
+                "certHash": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=",
+            }))?)
+        }
+    }
+
+    fn fixture(
+        max_requests: u32,
+    ) -> (
+        Arc<FakeMint>,
+        Arc<CountingIntake>,
+        Arc<CountingIdentityResolver>,
+        IdentityRegistrationApi,
+    ) {
         let mint = Arc::new(FakeMint {
             calls: AtomicUsize::new(0),
         });
         let intake = Arc::new(CountingIntake {
             calls: AtomicUsize::new(0),
         });
+        let identity_resolver = Arc::new(CountingIdentityResolver {
+            calls: AtomicUsize::new(0),
+        });
         let api = IdentityRegistrationApi::new(
             mint.clone(),
             Arc::new(FakeSigner),
             intake.clone(),
+            identity_resolver.clone(),
             DidWebOriginAllowlist::new(["https://federated.example"]).unwrap(),
             Arc::new(RateLimiter::new(max_requests, 60)),
         );
-        (mint, intake, api)
+        (mint, intake, identity_resolver, api)
     }
 
     #[test]
@@ -872,7 +1134,7 @@ mod tests {
 
     #[test]
     fn self_service_and_manual_paths_return_exact_registration_contract() {
-        let (mint, _intake, api) = fixture(10);
+        let (mint, _intake, _plc_resolver, api) = fixture(10);
         let self_caller = AuthenticatedIdentityCaller::new("did:web:alice.example").unwrap();
         let response = api
             .register(
@@ -913,7 +1175,7 @@ mod tests {
 
     #[test]
     fn manual_path_rejects_non_service_and_unknown_before_mint() {
-        let (mint, _intake, api) = fixture(10);
+        let (mint, _intake, _plc_resolver, api) = fixture(10);
         let user = AuthenticatedIdentityCaller::new("did:web:alice.example").unwrap();
         assert!(matches!(
             api.register(
@@ -940,7 +1202,7 @@ mod tests {
 
     #[test]
     fn reserved_did_is_rejected_again_at_the_api_output_boundary() {
-        let (mint, _intake, api) = fixture(10);
+        let (mint, _intake, _plc_resolver, api) = fixture(10);
         let caller = AuthenticatedIdentityCaller::new("did:web:alice.example").unwrap();
         assert!(matches!(
             api.register(
@@ -957,7 +1219,7 @@ mod tests {
 
     #[test]
     fn rate_limit_runs_before_mint() {
-        let (mint, _intake, api) = fixture(1);
+        let (mint, _intake, _plc_resolver, api) = fixture(1);
         let caller = AuthenticatedIdentityCaller::new("did:web:alice.example").unwrap();
         let request = || RegisterHostedAccountRequest {
             handle: "alice".to_owned(),
@@ -973,7 +1235,7 @@ mod tests {
 
     #[tokio::test]
     async fn intake_constrains_did_web_before_resolver_io() {
-        let (_mint, intake, api) = fixture(10);
+        let (_mint, intake, _plc_resolver, api) = fixture(10);
         let caller = AuthenticatedIdentityCaller::new("did:web:alice.example").unwrap();
 
         assert!(matches!(
@@ -1009,6 +1271,68 @@ mod tests {
             .unwrap_err();
         assert!(matches!(error, IdentityApiError::Backend(_)));
         assert_eq!(intake.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn public_resolution_returns_exact_connect_time_contract() {
+        let (_mint, _intake, identity_resolver, api) = fixture(10);
+
+        let response = api.resolve(PUBLIC_PLC_DID).unwrap();
+
+        assert_eq!(response.quic_url(), "https://pds.example:4433");
+        assert_eq!(
+            serde_json::to_value(response).unwrap(),
+            serde_json::json!({
+                "quicUrl": "https://pds.example:4433",
+                "certHash": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=",
+            })
+        );
+        assert_eq!(identity_resolver.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn public_resolution_covers_local_hosted_inventory_entries() {
+        let (_mint, _intake, identity_resolver, api) = fixture(10);
+
+        let response = api.resolve(LOCAL_HOSTED_DID).unwrap();
+
+        assert_eq!(response.quic_url(), "https://pds.example:4433");
+        assert_eq!(identity_resolver.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn public_resolution_rejects_sentinel_and_external_dids_before_resolver_io() {
+        let (_mint, _intake, identity_resolver, api) = fixture(10);
+
+        for did in [
+            UNAUTHENTICATED_DID_SENTINEL,
+            "did:web:foreign.example",
+            "did:key:zAttacker",
+        ] {
+            assert!(matches!(
+                api.resolve(did),
+                Err(IdentityApiError::NotFound(_))
+            ));
+        }
+        assert_eq!(identity_resolver.calls.load(Ordering::SeqCst), 0);
+
+        assert!(matches!(
+            api.resolve("did:plc:aaaaaaaaaaaaaaaaaaaaaaaa"),
+            Err(IdentityApiError::NotFound(_))
+        ));
+        assert_eq!(identity_resolver.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn public_resolution_rate_limit_runs_before_resolver_io() {
+        let (_mint, _intake, identity_resolver, api) = fixture(1);
+
+        api.resolve(PUBLIC_PLC_DID).unwrap();
+        assert!(matches!(
+            api.resolve(PUBLIC_PLC_DID),
+            Err(IdentityApiError::ResolveRateLimited)
+        ));
+        assert_eq!(identity_resolver.calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]
@@ -1082,6 +1406,7 @@ mod tests {
     struct ProductionRouterFixture {
         state: Arc<OAuthState>,
         cors: crate::config::CorsConfig,
+        quic: QuicConfig,
         signing_key: ed25519_dalek::SigningKey,
         storage: tempfile::TempDir,
     }
@@ -1124,6 +1449,9 @@ mod tests {
             signing_key.clone(),
             storage.path().join("pds"),
             Arc::new(FixtureFederatedResolver),
+            Arc::new(CountingIdentityResolver {
+                calls: AtomicUsize::new(0),
+            }),
         )
         .unwrap();
 
@@ -1153,6 +1481,7 @@ mod tests {
         ProductionRouterFixture {
             state,
             cors,
+            quic,
             signing_key,
             storage,
         }
@@ -1180,6 +1509,12 @@ mod tests {
             );
         }
         request
+    }
+
+    fn get(path: &str) -> axum::http::Request<axum::body::Body> {
+        axum::http::Request::get(path)
+            .body(axum::body::Body::empty())
+            .unwrap()
     }
 
     #[tokio::test]
@@ -1227,6 +1562,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn public_resolve_route_is_floor_readable_for_plc_and_hosted_local_dids() {
+        use tower::ServiceExt;
+
+        for did in [PUBLIC_PLC_DID, LOCAL_HOSTED_DID] {
+            let fixture = production_router_fixture();
+            let response = super::super::create_app(Arc::clone(&fixture.state), &fixture.cors)
+                .oneshot(get(&format!("/api/identity/resolve?did={did}")))
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::OK,
+                "{did} must resolve without authentication"
+            );
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(
+                value,
+                serde_json::json!({
+                    "quicUrl": "https://pds.example:4433",
+                    "certHash": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=",
+                })
+            );
+            assert_eq!(value.as_object().unwrap().len(), 2);
+        }
+    }
+
+    #[tokio::test]
+    async fn public_resolve_route_collapses_sentinel_external_and_missing_to_not_found() {
+        use tower::ServiceExt;
+
+        for did in [
+            UNAUTHENTICATED_DID_SENTINEL,
+            "did:web:foreign.example",
+            "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa",
+        ] {
+            let fixture = production_router_fixture();
+            let response = super::super::create_app(Arc::clone(&fixture.state), &fixture.cors)
+                .oneshot(get(&format!("/api/identity/resolve?did={did}")))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+                serde_json::json!({
+                    "error": "not_found",
+                    "error_description": "Identity resolution not found",
+                })
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn production_composition_live_session_register_mints_and_publishes() {
         use tower::ServiceExt;
 
@@ -1266,6 +1659,67 @@ mod tests {
         assert!(published.join("genesis.didop.cbor").is_file());
         assert!(published.join("did-document.json").is_file());
         assert!(published.join("repo/commit.cbor").is_file());
+    }
+
+    #[tokio::test]
+    async fn minted_hosted_account_is_browser_resolvable_from_authority_storage() {
+        use tower::ServiceExt;
+
+        let mut fixture = production_router_fixture();
+        let session_id = fixture
+            .state
+            .sessions
+            .create("did:web:member.example".to_owned(), "local".to_owned())
+            .await;
+        let response = super::super::create_app(Arc::clone(&fixture.state), &fixture.cors)
+            .oneshot(post(
+                "/api/identity/register",
+                r#"{"handle":"alice"}"#,
+                Some(format!("{}={session_id}", session::SESSION_COOKIE_NAME)),
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let identity_resolver = Arc::new(HostedConnectTimeResolver {
+            pds_root: fixture.storage.path().join("pds"),
+            zone: AccountZone::new("accounts.example.com").unwrap(),
+            live_discovery: Arc::new(ConfiguredHostedPdsDiscovery {
+                pds_endpoint: "https://pds.example.test".to_owned(),
+                quic: fixture.quic.clone(),
+            }),
+        });
+        assert!(!identity_resolver.recognizes("did:web:foreign.example"));
+        let api = IdentityRegistrationApi::new(
+            Arc::new(FakeMint {
+                calls: AtomicUsize::new(0),
+            }),
+            Arc::new(FakeSigner),
+            Arc::new(CountingIntake {
+                calls: AtomicUsize::new(0),
+            }),
+            identity_resolver,
+            DidWebOriginAllowlist::new(["https://foreign.example"]).unwrap(),
+            Arc::new(RateLimiter::new(10, 60)),
+        );
+        Arc::get_mut(&mut fixture.state)
+            .unwrap()
+            .identity_registration_api = Some(Arc::new(api));
+
+        let response = super::super::create_app(Arc::clone(&fixture.state), &fixture.cors)
+            .oneshot(get(
+                "/api/identity/resolve?did=did:web:alice.accounts.example.com",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let resolved: ConnectTimeDiscovery = serde_json::from_slice(&body).unwrap();
+        assert_eq!(resolved.quic_url(), "https://pds.example.test:4433");
+        assert!(!resolved.cert_hash().is_empty());
     }
 
     #[tokio::test]

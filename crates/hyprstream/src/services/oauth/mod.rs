@@ -120,6 +120,10 @@ pub fn create_app(state: Arc<OAuthState>, cors_config: &crate::config::CorsConfi
             post(token_exchange::exchange_atproto_ucan),
         )
         .route(
+            "/api/identity/resolve",
+            get(identity_registration::resolve_identity),
+        )
+        .route(
             "/oauth/authorize",
             get(authorize::authorize_get).post(authorize::authorize_post),
         )
