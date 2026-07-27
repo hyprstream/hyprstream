@@ -35,6 +35,26 @@ MERGE_DRIVER_WORKFLOW_INVOCATION = (
     "/build/.github/scripts/graviton-build-test.sh"
 )
 MERGE_INVOCATION = "bash .github/scripts/browser-wasm-check.sh"
+EXPECTED_EXECUTION_TAIL = """\
+append_rustflag '--cfg=web_sys_unstable_apis'
+append_rustflag '--cfg=getrandom_backend="wasm_js"'
+export RUSTFLAGS
+
+readonly -a BROWSER_WASM_PACKAGES=(
+  hyprstream-rpc
+  hyprstream-vfs
+  hyprstream-rpc-std
+)
+
+package_args=()
+for package in "${BROWSER_WASM_PACKAGES[@]}"; do
+  package_args+=( -p "$package" )
+done
+
+cargo check --locked \\
+  --target wasm32-unknown-unknown \\
+  "${package_args[@]}"
+"""
 
 
 def _assert(condition: bool, message: str) -> None:
@@ -94,6 +114,11 @@ def check(workflow: str, merge_driver: str, wasm_check: str) -> None:
         wasm_check.count("cargo check --locked") == 1,
         "browser check must use one locked cargo check",
     )
+    _assert(
+        wasm_check.count(EXPECTED_EXECUTION_TAIL) == 1,
+        "browser cfgs, package array/loop, target, and Cargo arguments must remain "
+        "one directly connected execution chain",
+    )
 
 
 def mutations(
@@ -147,6 +172,32 @@ def mutations(
                 "",
                 1,
             ),
+        ),
+        (
+            "disconnect package args from cargo",
+            workflow,
+            merge_driver,
+            wasm_check.replace(
+                '"${package_args[@]}"',
+                "-p hyprstream-rpc",
+                1,
+            ),
+        ),
+        (
+            "disconnect package array from args",
+            workflow,
+            merge_driver,
+            wasm_check.replace(
+                '  package_args+=( -p "$package" )',
+                "  :",
+                1,
+            ),
+        ),
+        (
+            "stop exporting browser cfgs",
+            workflow,
+            merge_driver,
+            wasm_check.replace("export RUSTFLAGS", ": # RUSTFLAGS not exported", 1),
         ),
     ]
     for package in sorted(EXPECTED_PACKAGES):
