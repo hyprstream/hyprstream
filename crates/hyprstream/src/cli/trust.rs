@@ -69,6 +69,13 @@ const AUTHORITY_CHECKPOINT_INSTALL_PATH: &str =
     "/etc/hyprstream/trust/deployment-authority.head.json";
 const REGISTRY_JWT_INSTALL_PATH: &str = "/run/hyprstream/credentials/registry-service.jwt";
 
+#[cfg(test)]
+static SECRET_BUNDLE_DROPS: [std::sync::atomic::AtomicUsize; 3] = [
+    std::sync::atomic::AtomicUsize::new(0),
+    std::sync::atomic::AtomicUsize::new(0),
+    std::sync::atomic::AtomicUsize::new(0),
+];
+
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
 enum AuthorityPurpose {
@@ -117,6 +124,13 @@ struct AuthorityBundle {
 impl Drop for AuthorityBundle {
     fn drop(&mut self) {
         self.ml_dsa_65_seed_b64.zeroize();
+        #[cfg(test)]
+        SECRET_BUNDLE_DROPS[match &self.purpose {
+            AuthorityPurpose::Root => 0,
+            AuthorityPurpose::RotatedAuthority => 1,
+            AuthorityPurpose::RegistryDelegatedSigner => 2,
+        }]
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -233,7 +247,7 @@ fn mint_deployment_ca(args: &MintDeploymentCaArgs) -> Result<()> {
                 Ed25519Secret::YubikeyPiv {
                     slot: slot.clone(),
                     public_b64: STANDARD.encode(public.as_bytes()),
-                    recovery_seed_b64: encode_secret_b64(recovery_key.to_bytes()),
+                    recovery_seed_b64: encode_ed25519_seed_b64(&recovery_key),
                 },
                 LoadedEdSigner::YubikeyPiv { slot, public },
             )
@@ -242,7 +256,7 @@ fn mint_deployment_ca(args: &MintDeploymentCaArgs) -> Result<()> {
             let key = SigningKey::generate(&mut rand::rngs::OsRng);
             (
                 Ed25519Secret::Software {
-                    seed_b64: encode_secret_b64(key.to_bytes()),
+                    seed_b64: encode_ed25519_seed_b64(&key),
                     public_b64: STANDARD.encode(key.verifying_key().as_bytes()),
                 },
                 LoadedEdSigner::Software(key),
@@ -283,7 +297,7 @@ fn mint_deployment_ca(args: &MintDeploymentCaArgs) -> Result<()> {
         deployment_domain: deployment_domain.clone(),
         public_key_sha256: sha256_hex(&public_ca),
         ed25519: ed_secret,
-        ml_dsa_65_seed_b64: encode_secret_b64(ml_dsa_sk_to_seed(&pq)),
+        ml_dsa_65_seed_b64: encode_ml_dsa_seed_b64(&pq),
         recipient_count: recipients.len(),
     };
     let plaintext = serialize_secret_json(&bundle).context("encode authority bundle")?;
@@ -381,10 +395,10 @@ fn delegate_registry_signer(args: &DelegateRegistrySignerArgs) -> Result<()> {
         deployment_domain: authority.bundle.deployment_domain.clone(),
         public_key_sha256: sha256_hex(&delegated_public),
         ed25519: Ed25519Secret::Software {
-            seed_b64: encode_secret_b64(delegated_ed.to_bytes()),
+            seed_b64: encode_ed25519_seed_b64(&delegated_ed),
             public_b64: STANDARD.encode(delegated_ed.verifying_key().as_bytes()),
         },
-        ml_dsa_65_seed_b64: encode_secret_b64(ml_dsa_sk_to_seed(&delegated_pq)),
+        ml_dsa_65_seed_b64: encode_ml_dsa_seed_b64(&delegated_pq),
         recipient_count: signer_recipients.len(),
     };
     let plaintext = serialize_secret_json(&delegated_bundle)?;
@@ -784,10 +798,10 @@ fn rotate_authority(args: &RotateAuthorityArgs) -> Result<()> {
         deployment_domain: log.deployment_domain.clone(),
         public_key_sha256: sha256_hex(&new_public),
         ed25519: Ed25519Secret::Software {
-            seed_b64: encode_secret_b64(new_ed.to_bytes()),
+            seed_b64: encode_ed25519_seed_b64(&new_ed),
             public_b64: STANDARD.encode(new_ed.verifying_key().as_bytes()),
         },
-        ml_dsa_65_seed_b64: encode_secret_b64(ml_dsa_sk_to_seed(&new_pq)),
+        ml_dsa_65_seed_b64: encode_ml_dsa_seed_b64(&new_pq),
         recipient_count: recipients.len(),
     };
     let plaintext = serialize_secret_json(&new_bundle)?;
@@ -1586,79 +1600,189 @@ impl<'a> PendingOutput<'a> {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CommitOperation {
+    StageCreate(usize),
+    StagePermissions(usize),
+    StageWrite(usize),
+    StageSync(usize),
+    StageKeep(usize),
+    BackupCreate(usize),
+    BackupPlaceholderRemove(usize),
+    BackupRename(usize),
+    BackupParentsSync,
+    CommitRename(usize),
+    CommitParentsSync,
+    BackupDelete(usize),
+    CleanupParentsSync,
+    RollbackRemove(usize),
+    RollbackRestore(usize),
+    RollbackParentsSync,
+    StageCleanup(usize),
+}
+
+#[derive(Default)]
+struct CommitFaultInjector {
+    #[cfg(test)]
+    faults: std::collections::VecDeque<CommitOperation>,
+}
+
+impl CommitFaultInjector {
+    fn check(&mut self, operation: CommitOperation) -> Result<()> {
+        #[cfg(test)]
+        if self.faults.front() == Some(&operation) {
+            self.faults.pop_front();
+            bail!("injected transaction fault at {operation:?}");
+        }
+        let _ = operation;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn with_faults(faults: impl IntoIterator<Item = CommitOperation>) -> Self {
+        Self {
+            faults: faults.into_iter().collect(),
+        }
+    }
+}
+
 /// Stage every output before moving any destination, then roll back the whole
-/// set if a rename fails. Each rename is filesystem-atomic; the rollback closes
-/// the ordinary error path across the multi-file mint commands.
+/// set if any subsequent operation fails. Each rename is filesystem-atomic;
+/// every fallible step after the first retained staging path is routed through
+/// the same rollback/cleanup path.
 fn commit_outputs(outputs: Vec<PendingOutput<'_>>) -> Result<()> {
+    commit_outputs_with_faults(outputs, &mut CommitFaultInjector::default())
+}
+
+fn commit_outputs_with_faults(
+    outputs: Vec<PendingOutput<'_>>,
+    faults: &mut CommitFaultInjector,
+) -> Result<()> {
     let mut staged = Vec::with_capacity(outputs.len());
-    for output in &outputs {
+    for (index, output) in outputs.iter().enumerate() {
         let parent = output.path.parent().unwrap_or_else(|| Path::new("."));
-        let mut temp = tempfile::NamedTempFile::new_in(parent)
-            .with_context(|| format!("create staged output for {}", output.path.display()))?;
-        temp.as_file_mut()
-            .set_permissions(std::fs::Permissions::from_mode(output.mode))?;
-        temp.write_all(&output.bytes)?;
-        temp.as_file_mut().sync_all()?;
-        let (_file, path) = temp.keep().context("retain staged output")?;
-        staged.push(path);
+        let staged_result = (|| -> Result<PathBuf> {
+            faults.check(CommitOperation::StageCreate(index))?;
+            let mut temp = tempfile::NamedTempFile::new_in(parent)
+                .with_context(|| format!("create staged output for {}", output.path.display()))?;
+            faults.check(CommitOperation::StagePermissions(index))?;
+            temp.as_file_mut()
+                .set_permissions(std::fs::Permissions::from_mode(output.mode))?;
+            faults.check(CommitOperation::StageWrite(index))?;
+            temp.write_all(&output.bytes)?;
+            faults.check(CommitOperation::StageSync(index))?;
+            temp.as_file_mut().sync_all()?;
+            faults.check(CommitOperation::StageKeep(index))?;
+            let (_file, path) = temp.keep().context("retain staged output")?;
+            Ok(path)
+        })();
+        match staged_result {
+            Ok(path) => staged.push(path),
+            Err(error) => {
+                return Err(transaction_failure(
+                    error,
+                    format!("stage {}", output.path.display()),
+                    Ok(()),
+                    cleanup_paths(&staged, faults),
+                ));
+            }
+        }
     }
 
     let mut backups: Vec<Option<PathBuf>> = vec![None; outputs.len()];
     for (index, output) in outputs.iter().enumerate() {
         if output.path.exists() {
             let parent = output.path.parent().unwrap_or_else(|| Path::new("."));
-            let placeholder = tempfile::Builder::new()
-                .prefix(".hyprstream-backup-")
-                .tempfile_in(parent)
-                .with_context(|| format!("stage backup for {}", output.path.display()))?;
-            let backup = placeholder.path().to_path_buf();
-            drop(placeholder);
-            if let Err(error) = std::fs::rename(output.path, &backup) {
+            let backup = (|| -> Result<PathBuf> {
+                faults.check(CommitOperation::BackupCreate(index))?;
+                let placeholder = tempfile::Builder::new()
+                    .prefix(".hyprstream-backup-")
+                    .tempfile_in(parent)
+                    .with_context(|| format!("stage backup for {}", output.path.display()))?;
+                let backup = placeholder.path().to_path_buf();
+                faults.check(CommitOperation::BackupPlaceholderRemove(index))?;
+                placeholder.close().with_context(|| {
+                    format!("release backup placeholder for {}", output.path.display())
+                })?;
+                Ok(backup)
+            })();
+            let backup = match backup {
+                Ok(backup) => backup,
+                Err(error) => {
+                    return Err(transaction_failure(
+                        error,
+                        format!("reserve backup for {}", output.path.display()),
+                        restore_outputs(&outputs, &backups, 0, faults),
+                        cleanup_paths(&staged, faults),
+                    ));
+                }
+            };
+            let rename = faults
+                .check(CommitOperation::BackupRename(index))
+                .and_then(|()| {
+                    std::fs::rename(output.path, &backup)
+                        .with_context(|| format!("back up existing {}", output.path.display()))
+                });
+            if let Err(error) = rename {
                 return Err(transaction_failure(
-                    error.into(),
+                    error,
                     format!("back up existing {}", output.path.display()),
-                    restore_outputs(&outputs, &backups, 0),
-                    cleanup_paths(&staged),
+                    restore_outputs(&outputs, &backups, 0, faults),
+                    cleanup_paths(&staged, faults),
                 ));
             }
             backups[index] = Some(backup);
         }
     }
-    if let Err(error) = sync_output_parents(&outputs) {
+    if let Err(error) = sync_output_parents(&outputs, faults, CommitOperation::BackupParentsSync) {
         return Err(transaction_failure(
             error,
             "durably record output backups".to_owned(),
-            restore_outputs(&outputs, &backups, 0),
-            cleanup_paths(&staged),
+            restore_outputs(&outputs, &backups, 0, faults),
+            cleanup_paths(&staged, faults),
         ));
     }
 
     for (index, output) in outputs.iter().enumerate() {
-        if let Err(error) = std::fs::rename(&staged[index], output.path) {
+        let rename = faults
+            .check(CommitOperation::CommitRename(index))
+            .and_then(|()| {
+                std::fs::rename(&staged[index], output.path)
+                    .with_context(|| format!("commit {}", output.path.display()))
+            });
+        if let Err(error) = rename {
             return Err(transaction_failure(
-                error.into(),
+                error,
                 format!("commit {}", output.path.display()),
-                restore_outputs(&outputs, &backups, index),
-                cleanup_paths(&staged[index..]),
+                restore_outputs(&outputs, &backups, index, faults),
+                cleanup_paths(&staged[index..], faults),
             ));
         }
     }
-    if let Err(error) = sync_output_parents(&outputs) {
+    if let Err(error) = sync_output_parents(&outputs, faults, CommitOperation::CommitParentsSync) {
         return Err(transaction_failure(
             error,
             "durably record committed outputs".to_owned(),
-            restore_outputs(&outputs, &backups, outputs.len()),
+            restore_outputs(&outputs, &backups, outputs.len(), faults),
             Ok(()),
         ));
     }
 
     let mut cleanup_errors = Vec::new();
-    for backup in backups.into_iter().flatten() {
-        if let Err(error) = std::fs::remove_file(&backup) {
-            cleanup_errors.push(format!("remove backup {}: {error}", backup.display()));
+    for (index, backup) in backups.into_iter().enumerate() {
+        if let Some(backup) = backup {
+            let removal = faults
+                .check(CommitOperation::BackupDelete(index))
+                .and_then(|()| {
+                    std::fs::remove_file(&backup)
+                        .with_context(|| format!("remove backup {}", backup.display()))
+                });
+            if let Err(error) = removal {
+                cleanup_errors.push(format!("{error:#}"));
+            }
         }
     }
-    if let Err(error) = sync_output_parents(&outputs) {
+    if let Err(error) = sync_output_parents(&outputs, faults, CommitOperation::CleanupParentsSync) {
         cleanup_errors.push(format!("durably record backup deletion: {error:#}"));
     }
     ensure!(
@@ -1691,40 +1815,64 @@ fn restore_outputs(
     outputs: &[PendingOutput<'_>],
     backups: &[Option<PathBuf>],
     committed: usize,
+    faults: &mut CommitFaultInjector,
 ) -> Result<()> {
     let mut errors = Vec::new();
-    for output in outputs.iter().take(committed) {
-        if let Err(error) = std::fs::remove_file(output.path) {
+    for (index, output) in outputs.iter().take(committed).enumerate() {
+        let removal = faults
+            .check(CommitOperation::RollbackRemove(index))
+            .and_then(|()| {
+                std::fs::remove_file(output.path)
+                    .with_context(|| format!("remove newly committed {}", output.path.display()))
+            });
+        if let Err(error) = removal {
             errors.push(format!(
-                "remove newly committed {}: {error}",
-                output.path.display()
+                "remove newly committed {}: {error:#}",
+                output.path.display(),
             ));
         }
     }
-    for (output, backup) in outputs.iter().zip(backups).rev() {
+    for (index, (output, backup)) in outputs.iter().zip(backups).enumerate().rev() {
         if let Some(backup) = backup {
-            if let Err(error) = std::fs::rename(backup, output.path) {
+            let restore = faults
+                .check(CommitOperation::RollbackRestore(index))
+                .and_then(|()| {
+                    std::fs::rename(backup, output.path).with_context(|| {
+                        format!(
+                            "restore {} from {}",
+                            output.path.display(),
+                            backup.display()
+                        )
+                    })
+                });
+            if let Err(error) = restore {
                 errors.push(format!(
-                    "restore {} from {}: {error}",
+                    "restore {} from {}: {error:#}",
                     output.path.display(),
-                    backup.display()
+                    backup.display(),
                 ));
             }
         }
     }
-    if let Err(error) = sync_output_parents(outputs) {
+    if let Err(error) = sync_output_parents(outputs, faults, CommitOperation::RollbackParentsSync) {
         errors.push(format!("durably record rollback: {error:#}"));
     }
     ensure!(errors.is_empty(), "{}", errors.join("; "));
     Ok(())
 }
 
-fn cleanup_paths(paths: &[PathBuf]) -> Result<()> {
+fn cleanup_paths(paths: &[PathBuf], faults: &mut CommitFaultInjector) -> Result<()> {
     let mut errors = Vec::new();
-    for path in paths {
+    for (index, path) in paths.iter().enumerate() {
         if path.exists() {
-            if let Err(error) = std::fs::remove_file(path) {
-                errors.push(format!("remove staged {}: {error}", path.display()));
+            let removal = faults
+                .check(CommitOperation::StageCleanup(index))
+                .and_then(|()| {
+                    std::fs::remove_file(path)
+                        .with_context(|| format!("remove staged {}", path.display()))
+                });
+            if let Err(error) = removal {
+                errors.push(format!("remove staged {}: {error:#}", path.display()));
             }
         }
     }
@@ -1732,7 +1880,12 @@ fn cleanup_paths(paths: &[PathBuf]) -> Result<()> {
     Ok(())
 }
 
-fn sync_output_parents(outputs: &[PendingOutput<'_>]) -> Result<()> {
+fn sync_output_parents(
+    outputs: &[PendingOutput<'_>],
+    faults: &mut CommitFaultInjector,
+    operation: CommitOperation,
+) -> Result<()> {
+    faults.check(operation)?;
     let parents: BTreeSet<_> = outputs
         .iter()
         .map(|output| {
@@ -1788,16 +1941,25 @@ fn decode_fixed_b64<const N: usize>(value: &str, description: &str) -> Result<Ze
             .decode(value)
             .with_context(|| format!("decode {description}"))?,
     );
-    decoded
-        .as_slice()
-        .try_into()
-        .map(Zeroizing::new)
-        .map_err(|_| anyhow!("{description} must decode to exactly {N} bytes"))
+    ensure!(
+        decoded.len() == N,
+        "{description} must decode to exactly {N} bytes"
+    );
+    let mut fixed = Zeroizing::new([0; N]);
+    fixed.copy_from_slice(&decoded);
+    Ok(fixed)
 }
 
-fn encode_secret_b64<const N: usize>(secret: [u8; N]) -> String {
-    let secret = Zeroizing::new(secret);
+fn encode_secret_b64<const N: usize>(secret: Zeroizing<[u8; N]>) -> String {
     STANDARD.encode(secret.as_ref())
+}
+
+fn encode_ed25519_seed_b64(key: &SigningKey) -> String {
+    encode_secret_b64(Zeroizing::new(key.to_bytes()))
+}
+
+fn encode_ml_dsa_seed_b64(key: &MlDsaSigningKey) -> String {
+    encode_secret_b64(Zeroizing::new(ml_dsa_sk_to_seed(key)))
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -1855,10 +2017,10 @@ mod tests {
                 deployment_domain: domain,
                 public_key_sha256: sha256_hex(&public),
                 ed25519: Ed25519Secret::Software {
-                    seed_b64: encode_secret_b64(ed.to_bytes()),
+                    seed_b64: encode_ed25519_seed_b64(&ed),
                     public_b64: STANDARD.encode(ed.verifying_key().as_bytes()),
                 },
-                ml_dsa_65_seed_b64: encode_secret_b64(ml_dsa_sk_to_seed(&pq)),
+                ml_dsa_65_seed_b64: encode_ml_dsa_seed_b64(&pq),
                 recipient_count: 2,
             },
             ed: LoadedEdSigner::Software(ed),
@@ -1884,6 +2046,185 @@ mod tests {
             &serde_json::to_vec(checkpoint)?,
             token,
         )
+    }
+
+    fn transaction_fault_case(
+        faults: impl IntoIterator<Item = CommitOperation>,
+    ) -> (tempfile::TempDir, PathBuf, PathBuf, Result<()>) {
+        let directory = tempfile::tempdir().unwrap();
+        let first = directory.path().join("first");
+        let second = directory.path().join("second");
+        std::fs::write(&first, b"old-first").unwrap();
+        std::fs::write(&second, b"old-second").unwrap();
+        let result = commit_outputs_with_faults(
+            vec![
+                PendingOutput::new(&first, b"new-first".to_vec(), 0o600),
+                PendingOutput::new(&second, b"new-second".to_vec(), 0o600),
+            ],
+            &mut CommitFaultInjector::with_faults(faults),
+        );
+        (directory, first, second, result)
+    }
+
+    fn directory_entries(directory: &Path) -> Vec<String> {
+        let mut entries: Vec<_> = std::fs::read_dir(directory)
+            .unwrap()
+            .map(|entry| {
+                entry
+                    .unwrap()
+                    .file_name()
+                    .into_string()
+                    .expect("test path is UTF-8")
+            })
+            .collect();
+        entries.sort();
+        entries
+    }
+
+    #[test]
+    fn generated_secret_bundles_zeroize_on_error_for_every_authority_purpose() {
+        let purposes = [
+            (AuthorityPurpose::Root, 0),
+            (AuthorityPurpose::RotatedAuthority, 1),
+            (AuthorityPurpose::RegistryDelegatedSigner, 2),
+        ];
+        for (purpose, counter) in purposes {
+            let before = SECRET_BUNDLE_DROPS[counter].load(std::sync::atomic::Ordering::SeqCst);
+            let result = (|| -> Result<()> {
+                let _authority = test_authority(purpose, None);
+                bail!("injected error after guarded seed encoding");
+            })();
+            assert!(result.is_err());
+            assert!(
+                SECRET_BUNDLE_DROPS[counter].load(std::sync::atomic::Ordering::SeqCst) > before,
+                "secret bundle did not run its wiping drop on the error path"
+            );
+        }
+
+        let guarded = Zeroizing::new([0xA5; 32]);
+        assert_eq!(
+            STANDARD.decode(encode_secret_b64(guarded)).unwrap(),
+            vec![0xA5; 32]
+        );
+    }
+
+    #[test]
+    fn transaction_faults_before_durable_commit_restore_the_complete_old_set() {
+        let faults = [
+            CommitOperation::StageCreate(1),
+            CommitOperation::StagePermissions(1),
+            CommitOperation::StageWrite(1),
+            CommitOperation::StageSync(1),
+            CommitOperation::StageKeep(1),
+            CommitOperation::BackupCreate(1),
+            CommitOperation::BackupPlaceholderRemove(1),
+            CommitOperation::BackupRename(0),
+            CommitOperation::BackupRename(1),
+            CommitOperation::BackupParentsSync,
+            CommitOperation::CommitRename(0),
+            CommitOperation::CommitRename(1),
+            CommitOperation::CommitParentsSync,
+        ];
+        for fault in faults {
+            let (directory, first, second, result) = transaction_fault_case([fault]);
+            assert!(result.is_err(), "{fault:?} unexpectedly succeeded");
+            assert_eq!(
+                std::fs::read(&first).unwrap(),
+                b"old-first",
+                "{fault:?} did not restore the first output"
+            );
+            assert_eq!(
+                std::fs::read(&second).unwrap(),
+                b"old-second",
+                "{fault:?} did not restore the second output"
+            );
+            assert_eq!(
+                directory_entries(directory.path()),
+                vec!["first", "second"],
+                "{fault:?} left unreported transaction state"
+            );
+        }
+    }
+
+    #[test]
+    fn transaction_cleanup_faults_return_error_with_recovery_state() {
+        let (directory, first, second, result) =
+            transaction_fault_case([CommitOperation::BackupDelete(0)]);
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("transaction cleanup was incomplete"));
+        assert_eq!(std::fs::read(&first).unwrap(), b"new-first");
+        assert_eq!(std::fs::read(&second).unwrap(), b"new-second");
+        assert!(
+            directory_entries(directory.path())
+                .iter()
+                .any(|name| name.starts_with(".hyprstream-backup-")),
+            "failed backup deletion did not preserve the recovery file"
+        );
+
+        let (directory, first, second, result) =
+            transaction_fault_case([CommitOperation::CleanupParentsSync]);
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("durably record backup deletion"));
+        assert_eq!(std::fs::read(&first).unwrap(), b"new-first");
+        assert_eq!(std::fs::read(&second).unwrap(), b"new-second");
+        assert_eq!(directory_entries(directory.path()), vec!["first", "second"]);
+    }
+
+    #[test]
+    fn transaction_reports_and_preserves_incomplete_rollback_or_staging_cleanup() {
+        let (directory, first, second, result) = transaction_fault_case([
+            CommitOperation::CommitRename(1),
+            CommitOperation::RollbackRemove(0),
+        ]);
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("ROLLBACK INCOMPLETE"));
+        assert_eq!(std::fs::read(&first).unwrap(), b"old-first");
+        assert_eq!(std::fs::read(&second).unwrap(), b"old-second");
+        assert_eq!(directory_entries(directory.path()), vec!["first", "second"]);
+
+        let (directory, first, second, result) = transaction_fault_case([
+            CommitOperation::CommitRename(1),
+            CommitOperation::RollbackRestore(1),
+        ]);
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("ROLLBACK INCOMPLETE"));
+        assert_eq!(std::fs::read(&first).unwrap(), b"old-first");
+        assert!(!second.exists());
+        assert!(
+            directory_entries(directory.path())
+                .iter()
+                .any(|name| name.starts_with(".hyprstream-backup-")),
+            "failed restoration did not preserve its backup"
+        );
+
+        let (_directory, first, second, result) = transaction_fault_case([
+            CommitOperation::CommitRename(1),
+            CommitOperation::RollbackParentsSync,
+        ]);
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("ROLLBACK INCOMPLETE"));
+        assert_eq!(std::fs::read(&first).unwrap(), b"old-first");
+        assert_eq!(std::fs::read(&second).unwrap(), b"old-second");
+
+        let (directory, first, second, result) = transaction_fault_case([
+            CommitOperation::StageCreate(1),
+            CommitOperation::StageCleanup(0),
+        ]);
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("staged-output cleanup incomplete"));
+        assert_eq!(std::fs::read(&first).unwrap(), b"old-first");
+        assert_eq!(std::fs::read(&second).unwrap(), b"old-second");
+        assert_eq!(directory_entries(directory.path()).len(), 3);
     }
 
     #[test]
