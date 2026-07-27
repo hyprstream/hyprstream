@@ -1243,6 +1243,16 @@ pub struct OAuthConfig {
     #[serde(default)]
     pub trusted_issuers: std::collections::HashMap<String, TrustedIssuerConfig>,
 
+    /// Exact HTTPS origins permitted for authenticated `did:web` federation
+    /// intake through the identity registration API.
+    ///
+    /// This is deliberately separate from CORS, OIDC issuers, and federation
+    /// policy. Entries must be origins only (no wildcard, path, query,
+    /// fragment, or userinfo). An empty list disables `did:web` intake while
+    /// retaining the fixed-directory `did:plc` arm.
+    #[serde(default)]
+    pub identity_registration_did_web_origins: Vec<String>,
+
     /// Trusted mesh peers' post-quantum signing identities (#157).
     /// Key = an operator-chosen peer label (informational only).
     /// Value = the peer's Ed25519 mesh signer key + ML-DSA-65 mesh verifying
@@ -1374,6 +1384,7 @@ impl Default for OAuthConfig {
             quic_port: None,
             cors: default_oauth_cors(),
             trusted_issuers: std::collections::HashMap::new(),
+            identity_registration_did_web_origins: Vec::new(),
             mesh_peers: std::collections::HashMap::new(),
             authority_hints: Vec::new(),
             oidc_providers: std::collections::HashMap::new(),

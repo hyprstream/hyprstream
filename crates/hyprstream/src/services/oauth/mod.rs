@@ -37,6 +37,7 @@ pub mod device_enrollment;
 pub mod did_document;
 pub mod dpop;
 pub mod federation_entity;
+pub mod identity_registration;
 pub mod introspection;
 pub mod jwks;
 pub mod jwt_bearer;
@@ -119,6 +120,10 @@ pub fn create_app(state: Arc<OAuthState>, cors_config: &crate::config::CorsConfi
             post(token_exchange::exchange_atproto_ucan),
         )
         .route(
+            "/api/identity/resolve",
+            get(identity_registration::resolve_identity),
+        )
+        .route(
             "/oauth/authorize",
             get(authorize::authorize_get).post(authorize::authorize_post),
         )
@@ -174,6 +179,10 @@ pub fn create_app(state: Arc<OAuthState>, cors_config: &crate::config::CorsConfi
     // Inserts AuthenticatedUser into request extensions for downstream handlers.
     let authority_router = Router::new()
         .route(
+            "/api/identity/register/manual",
+            post(identity_registration::register_operator_manual),
+        )
+        .route(
             "/oauth/spiffe/service-svid",
             post(spiffe::issue_service_svid),
         )
@@ -217,6 +226,24 @@ pub fn create_app(state: Arc<OAuthState>, cors_config: &crate::config::CorsConfi
             auth::require_bearer_token,
         ));
 
+    // Browser identity mutations authenticate with the server-side login
+    // session. This is separate from the tenant-requiring bearer middleware:
+    // registration is the onboarding step that creates the authority-owned
+    // hosted-account tenant binding.
+    let self_service_identity_router = Router::new()
+        .route(
+            "/api/identity/register",
+            post(identity_registration::register_self_service),
+        )
+        .route(
+            "/api/identity/intake",
+            post(identity_registration::intake_federated_identity),
+        )
+        .layer(axum::middleware::from_fn_with_state(
+            Arc::clone(&state),
+            identity_registration::require_registration_session,
+        ));
+
     // ── DID-document routes ──────────────────────────────────────────────────────
     // Public, secret-free GET endpoints (did:web + atproto handle resolution).
     // Per W3C DID Core a DID document is an open identity anchor that must be
@@ -255,7 +282,9 @@ pub fn create_app(state: Arc<OAuthState>, cors_config: &crate::config::CorsConfi
             get(did_document::client_did_document),
         );
 
-    let mut api_router = public_router.merge(protected_router);
+    let mut api_router = public_router
+        .merge(protected_router)
+        .merge(self_service_identity_router);
 
     // CORS innermost per route-group, before the shared logging layer.
     // The broad router keeps the restrictive header allowlist; only the DID routes
@@ -400,6 +429,8 @@ pub struct OAuthService {
     /// Authority-owned hosted-account records for ATProto DID → tenant
     /// resolution. Attached by the PDS service composition layer.
     hosted_account_store: Option<Arc<hyprstream_pds_service::AccountRecordStore>>,
+    /// Authenticated hosted-account registration and federation-intake face.
+    identity_registration_api: Option<Arc<identity_registration::IdentityRegistrationApi>>,
 }
 
 impl OAuthService {
@@ -423,6 +454,7 @@ impl OAuthService {
             jwt_verifying_key: jwt_verifying_key.to_bytes(),
             jti_blocklist: None,
             hosted_account_store: None,
+            identity_registration_api: None,
         }
     }
 
@@ -447,6 +479,15 @@ impl OAuthService {
         store: Arc<hyprstream_pds_service::AccountRecordStore>,
     ) -> Self {
         self.hosted_account_store = Some(store);
+        self
+    }
+
+    /// Attach the hosted-account registration/intake wire adapter.
+    pub fn with_identity_registration_api(
+        mut self,
+        api: Arc<identity_registration::IdentityRegistrationApi>,
+    ) -> Self {
+        self.identity_registration_api = Some(api);
         self
     }
 }
@@ -752,6 +793,9 @@ impl Spawnable for OAuthService {
             );
             if let Some(store) = &self.hosted_account_store {
                 oauth_state = oauth_state.with_hosted_account_store(Arc::clone(store));
+            }
+            if let Some(api) = &self.identity_registration_api {
+                oauth_state = oauth_state.with_identity_registration_api(Arc::clone(api));
             }
             match self.account_config.resolve_zone() {
                 Ok(zone) => oauth_state = oauth_state.with_hosted_account_zone(zone),
