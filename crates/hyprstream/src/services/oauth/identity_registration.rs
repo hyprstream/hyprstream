@@ -122,7 +122,7 @@ pub(crate) fn production_identity_registration_api(
     )
 }
 
-fn compose_identity_registration_api(
+pub(super) fn compose_identity_registration_api(
     oauth: &OAuthConfig,
     account: &AccountZoneConfig,
     quic: &QuicConfig,

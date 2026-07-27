@@ -240,6 +240,35 @@ mod tests {
         }
     }
 
+    struct RejectFederatedResolver;
+
+    #[async_trait::async_trait]
+    impl hyprstream_pds_service::federation_intake::FederatedDidDocumentResolver
+        for RejectFederatedResolver
+    {
+        async fn resolve_federated_document(
+            &self,
+            _did: &str,
+        ) -> anyhow::Result<serde_json::Value> {
+            anyhow::bail!("federation intake is outside the browser-session fixture")
+        }
+    }
+
+    struct RejectIdentityResolver;
+
+    impl super::super::identity_registration::IdentityConnectTimeResolver for RejectIdentityResolver {
+        fn recognizes(&self, _did: &str) -> bool {
+            false
+        }
+
+        fn resolve(
+            &self,
+            _did: &str,
+        ) -> anyhow::Result<hyprstream_discovery::ConnectTimeDiscovery> {
+            anyhow::bail!("identity resolution is outside the browser-session fixture")
+        }
+    }
+
     struct PermitAccountReads;
 
     impl hyprstream_pds_service::AccountRecordReadAuthorizer for PermitAccountReads {
@@ -359,12 +388,14 @@ mod tests {
             relay: String::new(),
         };
         let registration_api =
-            super::super::identity_registration::production_identity_registration_api(
+            super::super::identity_registration::compose_identity_registration_api(
                 &oauth,
                 &account,
                 &quic,
                 signing_key.clone(),
                 storage.path().join("pds"),
+                Arc::new(RejectFederatedResolver),
+                Arc::new(RejectIdentityResolver),
             )
             .unwrap();
 
