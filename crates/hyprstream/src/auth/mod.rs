@@ -40,7 +40,11 @@ pub use policy_manager::{
 };
 pub use policy_migration::migrate_policy_csv;
 pub use policy_templates::{PolicyTemplate, ServicePolicyRule, SERVICE_BASE_POLICIES, get_template, get_templates};
-pub use user_store::{DeviceRecord, DeviceStore, KeyAlgorithm, UserFilter, UserProfile, UserProfilePatch, UserStore, PubkeyEntry, pubkey_fingerprint, decode_pubkey_base64};
+pub use user_store::{
+    decode_pubkey_base64, pubkey_fingerprint, AccountKeyCustody, DeviceRecord, DeviceStore,
+    ExternalIdentityBinding, HostedAccountProvisionError, HostedAccountProvisioning, KeyAlgorithm,
+    PubkeyEntry, UserFilter, UserProfile, UserProfilePatch, UserStore,
+};
 pub use rocksdb_store::RocksDbUserStore;
 #[cfg(feature = "valkey")]
 pub use valkey::ValkeyUserStore;

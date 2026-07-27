@@ -57,6 +57,7 @@ use crate::server::middleware::RateLimiter;
 const REGISTRATION_RATE_LIMIT_REQUESTS: u32 = 10;
 const REGISTRATION_RATE_LIMIT_WINDOW_SECS: i64 = 60;
 const PUBLIC_RESOLVE_RATE_LIMIT_BUCKET: &str = "identity-resolve-unauthenticated-floor";
+const COLD_SIGNUP_GLOBAL_RATE_LIMIT_BUCKET: &str = "oauth-authorize-signup-global-floor";
 const MAX_AUTHORITY_ARTIFACT_BYTES: u64 = 64 * 1024;
 const ACCOUNT_GENESIS_ED25519_PURPOSE: &str = "hyprstream-hosted-account-genesis-ed25519-v1";
 const ACCOUNT_GENESIS_MLDSA65_PURPOSE: &str = "hyprstream-hosted-account-genesis-mldsa65-v1";
@@ -420,6 +421,13 @@ impl IdentityConnectTimeResolver for HostedConnectTimeResolver {
     fn resolve(&self, did: &str) -> Result<ConnectTimeDiscovery> {
         HostedConnectTimeResolver::resolve(self, did)
     }
+
+    fn hosted_tenant(&self, did: &str) -> Result<Option<String>> {
+        // Verify the authority artifacts before returning the deployment-owned
+        // tenant. Classification by DID suffix alone is not sufficient.
+        HostedConnectTimeResolver::resolve(self, did)?;
+        Ok(Some(self.zone.apex().to_owned()))
+    }
 }
 
 fn read_authority_artifact(path: &Path) -> Result<Vec<u8>> {
@@ -456,6 +464,16 @@ impl IdentityConnectTimeResolver for AuthorityConnectTimeResolver {
             .as_ref()
             .context("hosted account resolution is not configured")?
             .resolve(did)
+    }
+
+    fn hosted_tenant(&self, did: &str) -> Result<Option<String>> {
+        if hyprstream_rpc::did_plc::is_did_plc(did) {
+            return Ok(None);
+        }
+        match &self.hosted {
+            Some(hosted) => hosted.hosted_tenant(did),
+            None => Ok(None),
+        }
     }
 }
 
@@ -673,6 +691,13 @@ pub trait IdentityConnectTimeResolver: Send + Sync {
     fn recognizes(&self, did: &str) -> bool;
 
     fn resolve(&self, did: &str) -> Result<ConnectTimeDiscovery>;
+
+    /// Return the deployment-authority tenant for a verified local hosted DID.
+    ///
+    /// Federation resolvers and test fakes default to no local binding.
+    fn hosted_tenant(&self, _did: &str) -> Result<Option<String>> {
+        Ok(None)
+    }
 }
 
 /// Exact HTTPS origins that may be resolved through the `did:web` intake arm.
@@ -788,6 +813,79 @@ impl IdentityRegistrationApi {
         Ok(RegisterHostedAccountResponse::from(result))
     }
 
+    /// Mint a hosted account from a cryptographically authenticated OAuth
+    /// authorize transaction.
+    ///
+    /// This is deliberately an internal call, not an HTTP registration route.
+    /// `dpop_jkt` comes from the verified PAR snapshot and `fingerprint` from
+    /// the verified vault proof. Both are used only as rate-limit identities;
+    /// the deployment authority still allocates the DID and tenant.
+    pub(super) fn mint_for_oauth_signup(
+        &self,
+        handle: &str,
+        dpop_jkt: &str,
+        fingerprint: &str,
+    ) -> Result<RegisterHostedAccountResponse, IdentityApiError> {
+        if handle.is_empty()
+            || handle == UNAUTHENTICATED_DID_SENTINEL
+            || dpop_jkt.is_empty()
+            || fingerprint.is_empty()
+        {
+            return Err(IdentityApiError::InvalidRequest);
+        }
+        if self
+            .rate_limiter
+            .check_and_increment(&format!("oauth-authorize-signup-key:{fingerprint}"))
+        {
+            return Err(IdentityApiError::RateLimited);
+        }
+
+        let mint_request =
+            HostedAccountRegistrationRequest::from_client_fields(handle.to_owned(), None)
+                .map_err(|_| IdentityApiError::InvalidRequest)?;
+        let caller = format!("oauth-signup:{fingerprint}");
+        let signer = CallerGenesisSigner {
+            provider: self.signer.as_ref(),
+            caller: &caller,
+            operator_manual: false,
+        };
+        let result = self.minter.mint(&mint_request, &signer).map_err(|error| {
+            if error.chain().any(|cause| {
+                cause
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|io| io.kind() == std::io::ErrorKind::AlreadyExists)
+            }) {
+                IdentityApiError::HandleUnavailable
+            } else {
+                IdentityApiError::Backend(error)
+            }
+        })?;
+        if result.did == UNAUTHENTICATED_DID_SENTINEL {
+            return Err(IdentityApiError::Backend(anyhow::anyhow!(
+                "hosted-account mint returned the reserved unauthenticated DID"
+            )));
+        }
+        Ok(result.into())
+    }
+
+    /// Charge the public/global and verified PAR-DPoP signup buckets before
+    /// performing even an Ed25519 proof verification. A single-use authorize
+    /// nonce limits replay; these bounded buckets limit fresh-PAR abuse.
+    pub(super) fn check_oauth_signup_rate(&self, dpop_jkt: &str) -> Result<(), IdentityApiError> {
+        if dpop_jkt.is_empty() {
+            return Err(IdentityApiError::InvalidRequest);
+        }
+        for bucket in [
+            COLD_SIGNUP_GLOBAL_RATE_LIMIT_BUCKET.to_owned(),
+            format!("oauth-authorize-signup-dpop:{dpop_jkt}"),
+        ] {
+            if self.rate_limiter.check_and_increment(&bucket) {
+                return Err(IdentityApiError::RateLimited);
+            }
+        }
+        Ok(())
+    }
+
     async fn intake(
         &self,
         caller: &AuthenticatedIdentityCaller,
@@ -825,6 +923,10 @@ impl IdentityRegistrationApi {
             .map_err(IdentityApiError::NotFound)
     }
 
+    pub(super) fn hosted_tenant(&self, did: &str) -> Result<Option<String>> {
+        self.identity_resolver.hosted_tenant(did)
+    }
+
     fn check_rate(&self, caller: &AuthenticatedIdentityCaller) -> Result<(), IdentityApiError> {
         if self.rate_limiter.check_and_increment(caller.subject()) {
             return Err(IdentityApiError::RateLimited);
@@ -847,13 +949,14 @@ impl HostedAccountGenesisSigner for CallerGenesisSigner<'_> {
 }
 
 #[derive(Debug)]
-enum IdentityApiError {
+pub(super) enum IdentityApiError {
     Unauthenticated,
     Forbidden,
     RateLimited,
     ResolveRateLimited,
     ResolvableHostDenied,
     InvalidRequest,
+    HandleUnavailable,
     NotFound(anyhow::Error),
     Backend(anyhow::Error),
 }
@@ -890,6 +993,11 @@ impl IntoResponse for IdentityApiError {
                 StatusCode::BAD_REQUEST,
                 "invalid_request",
                 "Registration or intake request is invalid",
+            ),
+            Self::HandleUnavailable => (
+                StatusCode::CONFLICT,
+                "handle_unavailable",
+                "Requested hosted-account handle is unavailable",
             ),
             Self::NotFound(_) => (
                 StatusCode::NOT_FOUND,

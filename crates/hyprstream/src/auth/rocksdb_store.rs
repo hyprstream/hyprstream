@@ -13,13 +13,19 @@ use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use capnp::message::{Builder, ReaderOptions};
 use ed25519_dalek::VerifyingKey;
+use parking_lot::Mutex;
 use std::io::Cursor;
 use std::path::Path;
 
-use super::user_store::{pubkey_fingerprint, matches_filter, DeviceRecord, DeviceStore, KeyAlgorithm, PubkeyEntry, UserFilter, UserProfile, UserProfilePatch, UserStore};
+use super::user_store::{
+    matches_filter, pubkey_fingerprint, AccountKeyCustody, DeviceRecord, DeviceStore,
+    ExternalIdentityBinding, HostedAccountProvisionError, HostedAccountProvisioning, KeyAlgorithm,
+    PubkeyEntry, UserFilter, UserProfile, UserProfilePatch, UserStore,
+};
 
 const USER_PREFIX: &[u8] = b"user:";
 const PUBKEY_PREFIX: &[u8] = b"pubkey:";
+const ACCOUNT_AUTH_PREFIX: &[u8] = b"account-auth:";
 
 fn user_key(username: &str) -> Vec<u8> {
     let mut key = USER_PREFIX.to_vec();
@@ -33,13 +39,23 @@ fn pubkey_key(fingerprint: &str) -> Vec<u8> {
     key
 }
 
+fn account_auth_key(username: &str) -> Vec<u8> {
+    let mut key = ACCOUNT_AUTH_PREFIX.to_vec();
+    key.extend_from_slice(username.as_bytes());
+    key
+}
+
 fn strip_user_prefix(key: &[u8]) -> Option<&str> {
-    key.strip_prefix(USER_PREFIX).and_then(|s| std::str::from_utf8(s).ok())
+    key.strip_prefix(USER_PREFIX)
+        .and_then(|s| std::str::from_utf8(s).ok())
 }
 
 /// Helper text: reads a capnp Text field, returning None if not set or empty.
 fn text_or_none(reader: capnp::Result<capnp::text::Reader<'_>>) -> Option<String> {
-    reader.ok().filter(|t| !t.is_empty()).and_then(|t| t.to_string().ok())
+    reader
+        .ok()
+        .filter(|t| !t.is_empty())
+        .and_then(|t| t.to_string().ok())
 }
 
 /// Internal representation of a pubkey entry for serialization.
@@ -57,8 +73,24 @@ struct StoredPubkey {
     pq_pubkey: Option<Vec<u8>>,
 }
 
+/// Hosted-account authentication metadata is intentionally a separate record
+/// from the legacy Cap'n Proto user object. This is the persisted seam for
+/// custody flavor and 0..N external identities without widening control-plane
+/// RPC schema. Old accounts have no sidecar and deserialize to the defaults.
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+struct StoredAccountAuth {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    key_custody: Option<AccountKeyCustody>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    external_identities: Vec<ExternalIdentityBinding>,
+}
+
 pub struct RocksDbUserStore {
     db: rocksdb::DB,
+    /// RocksDB permits only one process to hold the writer lock. This mutex
+    /// additionally serializes conditional user/key inserts inside that
+    /// process so the checks and write batch form one provisioning operation.
+    provisioning_lock: Mutex<()>,
 }
 
 impl RocksDbUserStore {
@@ -73,7 +105,10 @@ impl RocksDbUserStore {
         let db = rocksdb::DB::open(&opts, &db_path)
             .with_context(|| format!("Failed to open RocksDB at {:?}", db_path))?;
 
-        Ok(Self { db })
+        Ok(Self {
+            db,
+            provisioning_lock: Mutex::new(()),
+        })
     }
 
     /// Open the RocksDB user store in read-only mode.
@@ -89,7 +124,10 @@ impl RocksDbUserStore {
         let db = rocksdb::DB::open_for_read_only(&opts, &db_path, false)
             .with_context(|| format!("Failed to open RocksDB (read-only) at {:?}", db_path))?;
 
-        Ok(Self { db })
+        Ok(Self {
+            db,
+            provisioning_lock: Mutex::new(()),
+        })
     }
 
     /// Returns true if this store was opened under the write lock.
@@ -106,7 +144,11 @@ impl RocksDbUserStore {
 
     /// Serialize a `UserProfile` + pubkeys into Cap'n Proto `UserInfo` bytes with a 1-byte
     /// presence prefix for optional Bool fields.
-    fn serialize_profile(sub: &str, profile: &UserProfile, pubkeys: &[StoredPubkey]) -> Result<Vec<u8>> {
+    fn serialize_profile(
+        sub: &str,
+        profile: &UserProfile,
+        pubkeys: &[StoredPubkey],
+    ) -> Result<Vec<u8>> {
         let mut flags: u8 = 0;
         if profile.email_verified.is_some() {
             flags |= Self::FLAG_EMAIL_VERIFIED;
@@ -133,7 +175,6 @@ impl RocksDbUserStore {
             if let Some(ref did) = profile.atproto_did {
                 ui.set_atproto_did(did);
             }
-
             // Serialize pubkeys list
             let mut pk_list = ui.init_pubkeys(pubkeys.len() as u32);
             for (i, pk) in pubkeys.iter().enumerate() {
@@ -194,6 +235,8 @@ impl RocksDbUserStore {
             },
             external_id: text_or_none(ui.get_external_id()),
             atproto_did: text_or_none(ui.get_atproto_did()),
+            key_custody: None,
+            external_identities: Vec::new(),
         };
 
         // Deserialize pubkeys list
@@ -246,19 +289,43 @@ impl RocksDbUserStore {
         let key = user_key(username);
         match self.db.get(&key)? {
             Some(bytes) => {
-                let tuple = Self::deserialize_profile(&bytes)
+                let (sub, mut profile, pubkeys) = Self::deserialize_profile(&bytes)
                     .with_context(|| format!("Failed to deserialize profile for '{}'", username))?;
-                Ok(Some(tuple))
+                if let Some(metadata) = self.db.get(account_auth_key(username))? {
+                    let stored: StoredAccountAuth = serde_json::from_slice(&metadata)
+                        .with_context(|| {
+                            format!(
+                                "Failed to deserialize hosted-account auth metadata for '{}'",
+                                username
+                            )
+                        })?;
+                    profile.key_custody = stored.key_custody;
+                    profile.external_identities = stored.external_identities;
+                }
+                Ok(Some((sub, profile, pubkeys)))
             }
             None => Ok(None),
         }
     }
 
     /// Store the user record and update pubkey reverse indexes.
-    fn put_user(&self, username: &str, sub: &str, profile: &UserProfile, pubkeys: &[StoredPubkey]) -> Result<()> {
+    fn put_user(
+        &self,
+        username: &str,
+        sub: &str,
+        profile: &UserProfile,
+        pubkeys: &[StoredPubkey],
+    ) -> Result<()> {
         let bytes = Self::serialize_profile(sub, profile, pubkeys)?;
         let key = user_key(username);
-        self.db.put(&key, bytes)?;
+        let metadata = serde_json::to_vec(&StoredAccountAuth {
+            key_custody: profile.key_custody,
+            external_identities: profile.external_identities.clone(),
+        })?;
+        let mut batch = rocksdb::WriteBatch::default();
+        batch.put(key, bytes);
+        batch.put(account_auth_key(username), metadata);
+        self.db.write(batch)?;
         Ok(())
     }
 
@@ -303,6 +370,7 @@ impl UserStore for RocksDbUserStore {
                 username
             );
         }
+        let _guard = self.provisioning_lock.lock();
         if self.get_raw(username)?.is_some() {
             tracing::warn!(
                 "Overwriting existing entry for user '{}' in credential store",
@@ -315,8 +383,72 @@ impl UserStore for RocksDbUserStore {
         Ok(sub)
     }
 
+    async fn provision_hosted_account(
+        &self,
+        username: &str,
+        atproto_did: &str,
+        pubkey: VerifyingKey,
+        custody: AccountKeyCustody,
+    ) -> std::result::Result<HostedAccountProvisioning, HostedAccountProvisionError> {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use base64::Engine;
+
+        let _guard = self.provisioning_lock.lock();
+        if self
+            .get_raw(username)
+            .map_err(HostedAccountProvisionError::Backend)?
+            .is_some()
+        {
+            return Err(HostedAccountProvisionError::AccountAlreadyExists);
+        }
+        let fingerprint = pubkey_fingerprint(&pubkey);
+        if self
+            .get_pubkey_index(&fingerprint)
+            .map_err(HostedAccountProvisionError::Backend)?
+            .is_some()
+        {
+            return Err(HostedAccountProvisionError::KeyAlreadyBound);
+        }
+
+        let sub = uuid::Uuid::new_v4().to_string();
+        let profile = UserProfile {
+            sub: Some(sub.clone()),
+            active: Some(true),
+            atproto_did: Some(atproto_did.to_owned()),
+            key_custody: Some(custody),
+            external_identities: Vec::new(),
+            ..Default::default()
+        };
+        let stored_key = StoredPubkey {
+            fingerprint: fingerprint.clone(),
+            pubkey_base64: URL_SAFE_NO_PAD.encode(pubkey.as_bytes()),
+            label: Some("aegis-vault".to_owned()),
+            created_at: chrono::Utc::now().timestamp(),
+            last_used_at: 0,
+            algorithm: KeyAlgorithm::Ed25519,
+            pq_pubkey: None,
+        };
+        let profile_bytes = Self::serialize_profile(&sub, &profile, &[stored_key])
+            .map_err(HostedAccountProvisionError::Backend)?;
+        let metadata_bytes = serde_json::to_vec(&StoredAccountAuth {
+            key_custody: profile.key_custody,
+            external_identities: profile.external_identities.clone(),
+        })
+        .map_err(|error| HostedAccountProvisionError::Backend(error.into()))?;
+        let mut batch = rocksdb::WriteBatch::default();
+        batch.put(user_key(username), profile_bytes);
+        batch.put(account_auth_key(username), metadata_bytes);
+        batch.put(pubkey_key(&fingerprint), username.as_bytes());
+        self.db
+            .write(batch)
+            .map_err(|error| HostedAccountProvisionError::Backend(error.into()))?;
+
+        Ok(HostedAccountProvisioning { sub, fingerprint })
+    }
+
     async fn set_profile(&self, username: &str, update: UserProfilePatch) -> Result<()> {
-        let (mut sub, mut profile, pubkeys) = self.get_raw(username)
+        let (mut sub, mut profile, pubkeys) = self
+            .get_raw(username)
             .with_context(|| format!("User '{}' not found", username))?
             .ok_or_else(|| anyhow!("User '{}' not found", username))?;
 
@@ -341,6 +473,12 @@ impl UserStore for RocksDbUserStore {
         if let Some(value) = update.atproto_did {
             profile.atproto_did = value;
         }
+        if let Some(value) = update.key_custody {
+            profile.key_custody = value;
+        }
+        if let Some(value) = update.external_identities {
+            profile.external_identities = value;
+        }
 
         self.put_user(username, &sub, &profile, &pubkeys)?;
         Ok(())
@@ -354,7 +492,10 @@ impl UserStore for RocksDbUserStore {
                 for pk in &pubkeys {
                     self.delete_pubkey_index(&pk.fingerprint)?;
                 }
-                self.db.delete(&key)?;
+                let mut batch = rocksdb::WriteBatch::default();
+                batch.delete(&key);
+                batch.delete(account_auth_key(username));
+                self.db.write(batch)?;
                 Ok(true)
             }
             None => Ok(false),
@@ -400,7 +541,13 @@ impl UserStore for RocksDbUserStore {
             }
 
             if let Some(ref expr) = filter.filter {
-                if !matches_filter(expr, &username, &profile.sub, &profile.external_id, profile.active) {
+                if !matches_filter(
+                    expr,
+                    &username,
+                    &profile.sub,
+                    &profile.external_id,
+                    profile.active,
+                ) {
                     continue;
                 }
             }
@@ -419,7 +566,11 @@ impl UserStore for RocksDbUserStore {
                     "externalId" => a.1.external_id.cmp(&b.1.external_id),
                     _ => std::cmp::Ordering::Equal,
                 };
-                if descending { cmp.reverse() } else { cmp }
+                if descending {
+                    cmp.reverse()
+                } else {
+                    cmp
+                }
             });
         }
 
@@ -430,7 +581,8 @@ impl UserStore for RocksDbUserStore {
     }
 
     async fn set_active(&self, username: &str, active: bool) -> Result<()> {
-        let (sub, mut profile, pubkeys) = self.get_raw(username)
+        let (sub, mut profile, pubkeys) = self
+            .get_raw(username)
             .with_context(|| format!("User '{}' not found", username))?
             .ok_or_else(|| anyhow!("User '{}' not found", username))?;
         profile.active = Some(active);
@@ -444,14 +596,17 @@ impl UserStore for RocksDbUserStore {
         use base64::engine::general_purpose::URL_SAFE_NO_PAD;
         use base64::Engine;
 
-        let (_, _, stored) = self.get_raw(username)?
+        let (_, _, stored) = self
+            .get_raw(username)?
             .ok_or_else(|| anyhow!("User '{}' not found", username))?;
 
         let mut entries = Vec::with_capacity(stored.len());
         for sp in stored {
-            let pubkey_bytes = URL_SAFE_NO_PAD.decode(&sp.pubkey_base64)
+            let pubkey_bytes = URL_SAFE_NO_PAD
+                .decode(&sp.pubkey_base64)
                 .with_context(|| format!("Invalid base64 for pubkey {}", sp.fingerprint))?;
-            let pubkey_arr: [u8; 32] = pubkey_bytes.try_into()
+            let pubkey_arr: [u8; 32] = pubkey_bytes
+                .try_into()
                 .map_err(|_| anyhow!("Pubkey {} is not 32 bytes", sp.fingerprint))?;
             let pubkey = VerifyingKey::from_bytes(&pubkey_arr)?;
 
@@ -460,7 +615,11 @@ impl UserStore for RocksDbUserStore {
                 pubkey,
                 label: sp.label,
                 created_at: sp.created_at,
-                last_used_at: if sp.last_used_at == 0 { None } else { Some(sp.last_used_at) },
+                last_used_at: if sp.last_used_at == 0 {
+                    None
+                } else {
+                    Some(sp.last_used_at)
+                },
                 algorithm: sp.algorithm,
                 pq_pubkey: sp.pq_pubkey,
             });
@@ -477,14 +636,20 @@ impl UserStore for RocksDbUserStore {
         use base64::engine::general_purpose::URL_SAFE_NO_PAD;
         use base64::Engine;
 
-        let (sub, profile, mut pubkeys) = self.get_raw(username)?
+        let _guard = self.provisioning_lock.lock();
+        let (sub, profile, mut pubkeys) = self
+            .get_raw(username)?
             .ok_or_else(|| anyhow!("User '{}' not found", username))?;
 
         let fingerprint = pubkey_fingerprint(&pubkey);
 
         // Check if this fingerprint already exists for this user
         if pubkeys.iter().any(|pk| pk.fingerprint == fingerprint) {
-            anyhow::bail!("Pubkey with fingerprint {} already exists for user '{}'", fingerprint, username);
+            anyhow::bail!(
+                "Pubkey with fingerprint {} already exists for user '{}'",
+                fingerprint,
+                username
+            );
         }
 
         // Check if fingerprint is already associated with another user
@@ -522,11 +687,13 @@ impl UserStore for RocksDbUserStore {
         use base64::engine::general_purpose::URL_SAFE_NO_PAD;
         use base64::Engine;
 
+        let _guard = self.provisioning_lock.lock();
         if ml_dsa_vk.is_empty() {
             anyhow::bail!("add_pubkey_hybrid: empty ML-DSA-65 verifying key");
         }
 
-        let (sub, profile, mut pubkeys) = self.get_raw(username)?
+        let (sub, profile, mut pubkeys) = self
+            .get_raw(username)?
             .ok_or_else(|| anyhow!("User '{}' not found", username))?;
 
         // Fingerprint is the Ed25519 anchor's (kid) — the PQ vk does not change it.
@@ -570,7 +737,8 @@ impl UserStore for RocksDbUserStore {
     }
 
     async fn remove_pubkey(&self, username: &str, fingerprint: &str) -> Result<bool> {
-        let (sub, profile, mut pubkeys) = self.get_raw(username)?
+        let (sub, profile, mut pubkeys) = self
+            .get_raw(username)?
             .ok_or_else(|| anyhow!("User '{}' not found", username))?;
 
         let original_len = pubkeys.len();
@@ -591,7 +759,8 @@ impl UserStore for RocksDbUserStore {
     }
 
     async fn touch_pubkey(&self, username: &str, fingerprint: &str) -> Result<()> {
-        let (sub, profile, mut pubkeys) = self.get_raw(username)?
+        let (sub, profile, mut pubkeys) = self
+            .get_raw(username)?
             .ok_or_else(|| anyhow!("User '{}' not found", username))?;
 
         let now = chrono::Utc::now().timestamp();
@@ -630,7 +799,9 @@ impl DeviceStore for RocksDbUserStore {
     async fn enroll_device(&self, record: DeviceRecord) -> anyhow::Result<()> {
         let key = device_key(&record.fingerprint);
         // Preserve existing user_sub and label on re-enrollment.
-        let existing: Option<DeviceRecord> = self.db.get(&key)?
+        let existing: Option<DeviceRecord> = self
+            .db
+            .get(&key)?
             .and_then(|v| serde_json::from_slice(&v).ok());
         let to_store = if let Some(existing) = existing {
             DeviceRecord {
@@ -660,12 +831,17 @@ impl DeviceStore for RocksDbUserStore {
 
     async fn get_device(&self, fingerprint: &str) -> anyhow::Result<Option<DeviceRecord>> {
         let key = device_key(fingerprint);
-        Ok(self.db.get(&key)?.and_then(|v| serde_json::from_slice(&v).ok()))
+        Ok(self
+            .db
+            .get(&key)?
+            .and_then(|v| serde_json::from_slice(&v).ok()))
     }
 
     async fn touch_device(&self, fingerprint: &str) -> anyhow::Result<()> {
         let key = device_key(fingerprint);
-        let Some(bytes) = self.db.get(&key)? else { return Ok(()); };
+        let Some(bytes) = self.db.get(&key)? else {
+            return Ok(());
+        };
         let mut record: DeviceRecord = serde_json::from_slice(&bytes)?;
         record.last_seen_at = Some(chrono::Utc::now().timestamp());
         self.db.put(&key, serde_json::to_vec(&record)?)?;
@@ -699,7 +875,9 @@ mod tests {
         let store = make_store(dir.path());
         let sub = store.register("alice").await?;
         assert!(!sub.is_empty(), "sub should be returned on register");
-        let profile = store.get_profile("alice").await?
+        let profile = store
+            .get_profile("alice")
+            .await?
             .ok_or_else(|| anyhow!("alice not found"))?;
         assert_eq!(profile.sub.as_deref(), Some(sub.as_str()));
         Ok(())
@@ -744,7 +922,10 @@ mod tests {
         let store = make_store(dir.path());
         let result = store.register("a:b:c").await;
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("must not contain more than one"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("must not contain more than one"));
         Ok(())
     }
 
@@ -764,10 +945,12 @@ mod tests {
         store.register("alice").await?;
         store.register("bob").await?;
 
-        let results = store.search(&UserFilter {
-            filter: Some(r#"userName eq "alice""#.to_owned()),
-            ..Default::default()
-        }).await?;
+        let results = store
+            .search(&UserFilter {
+                filter: Some(r#"userName eq "alice""#.to_owned()),
+                ..Default::default()
+            })
+            .await?;
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].0, "alice");
         Ok(())
@@ -779,17 +962,24 @@ mod tests {
         let store = make_store(dir.path());
         store.register("alice").await?;
 
-        let results = store.search(&UserFilter {
-            filter: Some("userName pr".to_owned()),
-            ..Default::default()
-        }).await?;
+        let results = store
+            .search(&UserFilter {
+                filter: Some("userName pr".to_owned()),
+                ..Default::default()
+            })
+            .await?;
         assert_eq!(results.len(), 1);
 
-        let results = store.search(&UserFilter {
-            filter: Some("active pr".to_owned()),
-            ..Default::default()
-        }).await?;
-        assert!(results.is_empty(), "active is None by default, pr should not match");
+        let results = store
+            .search(&UserFilter {
+                filter: Some("active pr".to_owned()),
+                ..Default::default()
+            })
+            .await?;
+        assert!(
+            results.is_empty(),
+            "active is None by default, pr should not match"
+        );
         Ok(())
     }
 
@@ -801,18 +991,22 @@ mod tests {
             store.register(name).await?;
         }
 
-        let results = store.search(&UserFilter {
-            start_index: Some(1),
-            count: Some(2),
-            ..Default::default()
-        }).await?;
+        let results = store
+            .search(&UserFilter {
+                start_index: Some(1),
+                count: Some(2),
+                ..Default::default()
+            })
+            .await?;
         assert_eq!(results.len(), 2);
 
-        let results = store.search(&UserFilter {
-            start_index: Some(3),
-            count: Some(2),
-            ..Default::default()
-        }).await?;
+        let results = store
+            .search(&UserFilter {
+                start_index: Some(3),
+                count: Some(2),
+                ..Default::default()
+            })
+            .await?;
         assert_eq!(results.len(), 1);
         Ok(())
     }
@@ -825,20 +1019,24 @@ mod tests {
         store.register("alice").await?;
         store.register("bob").await?;
 
-        let results = store.search(&UserFilter {
-            sort_by: Some("userName".to_owned()),
-            sort_order: Some("ascending".to_owned()),
-            ..Default::default()
-        }).await?;
+        let results = store
+            .search(&UserFilter {
+                sort_by: Some("userName".to_owned()),
+                sort_order: Some("ascending".to_owned()),
+                ..Default::default()
+            })
+            .await?;
         assert_eq!(results[0].0, "alice");
         assert_eq!(results[1].0, "bob");
         assert_eq!(results[2].0, "carol");
 
-        let results = store.search(&UserFilter {
-            sort_by: Some("userName".to_owned()),
-            sort_order: Some("descending".to_owned()),
-            ..Default::default()
-        }).await?;
+        let results = store
+            .search(&UserFilter {
+                sort_by: Some("userName".to_owned()),
+                sort_order: Some("descending".to_owned()),
+                ..Default::default()
+            })
+            .await?;
         assert_eq!(results[0].0, "carol");
         assert_eq!(results[1].0, "bob");
         assert_eq!(results[2].0, "alice");
@@ -858,10 +1056,12 @@ mod tests {
         let profile = store.get_profile("alice").await?.unwrap();
         assert_eq!(profile.active, Some(false));
 
-        let results = store.search(&UserFilter {
-            active_only: Some(true),
-            ..Default::default()
-        }).await?;
+        let results = store
+            .search(&UserFilter {
+                active_only: Some(true),
+                ..Default::default()
+            })
+            .await?;
         assert!(results.is_empty());
 
         store.set_active("alice", true).await?;
@@ -876,15 +1076,26 @@ mod tests {
         {
             let store = make_store(dir.path());
             store.register("alice").await?;
-            store.set_profile("alice", UserProfile {
-                sub: None,
-                name: Some("Alice Smith".to_owned()),
-                email: Some("alice@example.com".to_owned()),
-                email_verified: Some(true),
-                active: Some(true),
-                external_id: Some("ext-123".to_owned()),
-                atproto_did: Some("did:plc:abcdefghijklmnqrstuvwx2p".to_owned()),
-            }.into()).await?;
+            store
+                .set_profile(
+                    "alice",
+                    UserProfile {
+                        sub: None,
+                        name: Some("Alice Smith".to_owned()),
+                        email: Some("alice@example.com".to_owned()),
+                        email_verified: Some(true),
+                        active: Some(true),
+                        external_id: Some("ext-123".to_owned()),
+                        atproto_did: Some("did:plc:abcdefghijklmnqrstuvwx2p".to_owned()),
+                        key_custody: Some(AccountKeyCustody::SelfCustody),
+                        external_identities: vec![ExternalIdentityBinding {
+                            issuer: "https://issuer.example".to_owned(),
+                            subject: "alice-123".to_owned(),
+                        }],
+                    }
+                    .into(),
+                )
+                .await?;
         }
         // Open a fresh store instance to verify persistence
         let store2 = RocksDbUserStore::open(dir.path())?;
@@ -897,6 +1108,90 @@ mod tests {
             profile.atproto_did.as_deref(),
             Some("did:plc:abcdefghijklmnqrstuvwx2p")
         );
+        assert_eq!(profile.key_custody, Some(AccountKeyCustody::SelfCustody));
+        assert_eq!(
+            profile.external_identities,
+            vec![ExternalIdentityBinding {
+                issuer: "https://issuer.example".to_owned(),
+                subject: "alice-123".to_owned(),
+            }]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn hosted_account_provisioning_is_atomic_and_preserves_future_idp_seam() -> Result<()> {
+        let dir = TempDir::new()?;
+        let store = make_store(dir.path());
+        let alice_key = ed25519_dalek::SigningKey::from_bytes(&[0x71; 32]).verifying_key();
+        let provisioned = store
+            .provision_hosted_account(
+                "alice",
+                "did:web:alice.accounts.example.test",
+                alice_key,
+                AccountKeyCustody::SelfCustody,
+            )
+            .await?;
+        assert_eq!(provisioned.fingerprint, pubkey_fingerprint(&alice_key));
+        let profile = store.get_profile("alice").await?.unwrap();
+        assert_eq!(
+            profile.atproto_did.as_deref(),
+            Some("did:web:alice.accounts.example.test")
+        );
+        assert_eq!(profile.key_custody, Some(AccountKeyCustody::SelfCustody));
+        assert!(profile.external_identities.is_empty());
+        assert_eq!(
+            store.get_pubkey_user(&provisioned.fingerprint).await?,
+            Some("alice".to_owned())
+        );
+        assert!(matches!(
+            store
+                .provision_hosted_account(
+                    "alice",
+                    "did:web:alice.accounts.example.test",
+                    ed25519_dalek::SigningKey::from_bytes(&[0x72; 32]).verifying_key(),
+                    AccountKeyCustody::SelfCustody,
+                )
+                .await,
+            Err(HostedAccountProvisionError::AccountAlreadyExists)
+        ));
+        assert!(matches!(
+            store
+                .provision_hosted_account(
+                    "bob",
+                    "did:web:bob.accounts.example.test",
+                    alice_key,
+                    AccountKeyCustody::SelfCustody,
+                )
+                .await,
+            Err(HostedAccountProvisionError::KeyAlreadyBound)
+        ));
+
+        store
+            .set_profile(
+                "alice",
+                UserProfilePatch {
+                    external_identities: Some(vec![ExternalIdentityBinding {
+                        issuer: "https://issuer.example".to_owned(),
+                        subject: "external-alice".to_owned(),
+                    }]),
+                    ..Default::default()
+                },
+            )
+            .await?;
+        assert_eq!(
+            store
+                .get_external_identity_user("https://issuer.example", "external-alice")
+                .await?,
+            Some("alice".to_owned())
+        );
+        assert_eq!(
+            store.list_external_identities("alice").await?,
+            vec![ExternalIdentityBinding {
+                issuer: "https://issuer.example".to_owned(),
+                subject: "external-alice".to_owned(),
+            }]
+        );
         Ok(())
     }
 
@@ -905,16 +1200,26 @@ mod tests {
         let dir = TempDir::new()?;
         let store = std::sync::Arc::new(make_store(dir.path()));
         store.register("alice").await?;
-        store.set_profile("alice", UserProfilePatch {
-            atproto_did: Some(Some("did:plc:abcdefghijklmnqrstuvwx2p".to_owned())),
-            ..Default::default()
-        }).await?;
+        store
+            .set_profile(
+                "alice",
+                UserProfilePatch {
+                    atproto_did: Some(Some("did:plc:abcdefghijklmnqrstuvwx2p".to_owned())),
+                    ..Default::default()
+                },
+            )
+            .await?;
 
         let service = crate::services::oauth::user_service::UserService::new(store.clone());
-        service.update("alice", crate::services::oauth::user_service::UserUpdate {
-            atproto_did: Some(None),
-            ..Default::default()
-        }).await?;
+        service
+            .update(
+                "alice",
+                crate::services::oauth::user_service::UserUpdate {
+                    atproto_did: Some(None),
+                    ..Default::default()
+                },
+            )
+            .await?;
 
         let profile = store.get_profile("alice").await?.unwrap();
         assert_eq!(profile.atproto_did, None);
@@ -950,7 +1255,9 @@ mod tests {
         let signing_key = SigningKey::generate(&mut rand::thread_rng());
         let pubkey = signing_key.verifying_key();
 
-        let fingerprint = store.add_pubkey("alice", pubkey, Some("laptop".to_owned())).await?;
+        let fingerprint = store
+            .add_pubkey("alice", pubkey, Some("laptop".to_owned()))
+            .await?;
         assert!(!fingerprint.is_empty());
 
         let keys = store.list_pubkeys("alice").await?;
@@ -997,8 +1304,12 @@ mod tests {
         let key1 = SigningKey::generate(&mut rand::thread_rng()).verifying_key();
         let key2 = SigningKey::generate(&mut rand::thread_rng()).verifying_key();
 
-        let fp1 = store.add_pubkey("alice", key1, Some("laptop".to_owned())).await?;
-        let fp2 = store.add_pubkey("alice", key2, Some("phone".to_owned())).await?;
+        let fp1 = store
+            .add_pubkey("alice", key1, Some("laptop".to_owned()))
+            .await?;
+        let fp2 = store
+            .add_pubkey("alice", key2, Some("phone".to_owned()))
+            .await?;
 
         let keys = store.list_pubkeys("alice").await?;
         assert_eq!(keys.len(), 2);
@@ -1039,8 +1350,14 @@ mod tests {
         let alice_fp = store.add_pubkey("alice", alice_key, None).await?;
         let bob_fp = store.add_pubkey("bob", bob_key, None).await?;
 
-        assert_eq!(store.get_pubkey_user(&alice_fp).await?, Some("alice".to_owned()));
-        assert_eq!(store.get_pubkey_user(&bob_fp).await?, Some("bob".to_owned()));
+        assert_eq!(
+            store.get_pubkey_user(&alice_fp).await?,
+            Some("alice".to_owned())
+        );
+        assert_eq!(
+            store.get_pubkey_user(&bob_fp).await?,
+            Some("bob".to_owned())
+        );
         assert_eq!(store.get_pubkey_user("nonexistent").await?, None);
         Ok(())
     }
@@ -1075,7 +1392,10 @@ mod tests {
         let fingerprint = store.add_pubkey("alice", key, None).await?;
 
         // Verify reverse lookup works
-        assert_eq!(store.get_pubkey_user(&fingerprint).await?, Some("alice".to_owned()));
+        assert_eq!(
+            store.get_pubkey_user(&fingerprint).await?,
+            Some("alice".to_owned())
+        );
 
         // Remove user
         store.remove("alice").await?;
@@ -1092,10 +1412,14 @@ mod tests {
         store.register("alice").await?;
 
         let key = SigningKey::generate(&mut rand::thread_rng()).verifying_key();
-        store.add_pubkey("alice", key, Some("first".to_owned())).await?;
+        store
+            .add_pubkey("alice", key, Some("first".to_owned()))
+            .await?;
 
         // Adding same key again should fail
-        let result = store.add_pubkey("alice", key, Some("second".to_owned())).await;
+        let result = store
+            .add_pubkey("alice", key, Some("second".to_owned()))
+            .await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("already exists"));
         Ok(())
@@ -1114,7 +1438,10 @@ mod tests {
         // Adding same key to different user should fail
         let result = store.add_pubkey("bob", key, None).await;
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("already associated"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("already associated"));
         Ok(())
     }
 
@@ -1126,7 +1453,9 @@ mod tests {
         {
             let store = make_store(dir.path());
             store.register("alice").await?;
-            fingerprint = store.add_pubkey("alice", key, Some("laptop".to_owned())).await?;
+            fingerprint = store
+                .add_pubkey("alice", key, Some("laptop".to_owned()))
+                .await?;
         }
 
         // Reopen and verify
@@ -1137,7 +1466,10 @@ mod tests {
         assert_eq!(keys[0].label.as_deref(), Some("laptop"));
 
         // Reverse lookup should also work
-        assert_eq!(store2.get_pubkey_user(&fingerprint).await?, Some("alice".to_owned()));
+        assert_eq!(
+            store2.get_pubkey_user(&fingerprint).await?,
+            Some("alice".to_owned())
+        );
         Ok(())
     }
 
@@ -1178,7 +1510,10 @@ mod tests {
         let fp2 = store
             .add_pubkey_hybrid("alice", key, vec![0x11u8; 1952], None)
             .await?;
-        assert_eq!(fp1, fp2, "hybrid upgrade keeps the Ed25519 anchor fingerprint");
+        assert_eq!(
+            fp1, fp2,
+            "hybrid upgrade keeps the Ed25519 anchor fingerprint"
+        );
 
         let keys = store.list_pubkeys("alice").await?;
         assert_eq!(keys.len(), 1, "in-place upgrade, not a second key");
@@ -1244,7 +1579,9 @@ mod tests {
         let err = RocksDbUserStore::deserialize_profile(&bytes)
             .expect_err("unknown algorithm tag must fail the read");
         assert!(
-            err.to_string().to_lowercase().contains("unknown key algorithm"),
+            err.to_string()
+                .to_lowercase()
+                .contains("unknown key algorithm"),
             "error must name the unknown tag: {err}"
         );
     }

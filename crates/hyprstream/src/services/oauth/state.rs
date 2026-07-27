@@ -291,7 +291,11 @@ mod tests {
             anyhow::bail!("not used")
         }
 
-        async fn set_profile(&self, _username: &str, _profile: crate::auth::UserProfilePatch) -> anyhow::Result<()> {
+        async fn set_profile(
+            &self,
+            _username: &str,
+            _profile: crate::auth::UserProfilePatch,
+        ) -> anyhow::Result<()> {
             anyhow::bail!("not used")
         }
 
@@ -528,7 +532,8 @@ mod tests {
                     UserProfile {
                         atproto_did: Some("did:plc:abcdefghijklmnqrstuvwx2p".to_owned()),
                         ..Default::default()
-                    }.into(),
+                    }
+                    .into(),
                 )
                 .await
                 .unwrap();
@@ -591,7 +596,9 @@ mod tests {
 
     #[tokio::test]
     async fn authorize_binding_sweep_tracks_live_nonces() {
-        let store = Arc::new(KeyReadErrorStore { profile: UserProfile::default() });
+        let store = Arc::new(KeyReadErrorStore {
+            profile: UserProfile::default(),
+        });
         let state = state_with_user_store(store);
         let binding = AuthorizeBinding {
             request: crate::services::oauth::authorize::AuthorizeParams {
@@ -609,8 +616,16 @@ mod tests {
             },
         };
         let now = Instant::now();
-        state.pending_nonces.write().await.insert("live".to_owned(), now + Duration::from_secs(60));
-        state.pending_nonces.write().await.insert("expired".to_owned(), now - Duration::from_secs(1));
+        state
+            .pending_nonces
+            .write()
+            .await
+            .insert("live".to_owned(), now + Duration::from_secs(60));
+        state
+            .pending_nonces
+            .write()
+            .await
+            .insert("expired".to_owned(), now - Duration::from_secs(1));
         let mut bindings = state.pending_authorize_bindings.write().await;
         bindings.insert("live".to_owned(), binding.clone());
         bindings.insert("expired".to_owned(), binding.clone());
@@ -1258,18 +1273,23 @@ impl OAuthState {
     /// store or record is a federated-only identity (`Ok(None)`); store
     /// corruption, authorization failure, and ambiguous bindings are errors.
     pub async fn hosted_account_tenant(&self, did: &str) -> Result<Option<String>, String> {
-        let Some(store) = &self.hosted_account_store else {
-            return Ok(None);
-        };
-        store
-            .resolve_tenant_for_hosted_did(
-                &hyprstream_rpc::Subject::new(
-                    hyprstream_pds_service::OAUTH_ACCOUNT_RESOLVER_SUBJECT,
-                ),
-                did,
-            )
-            .await
-            .map_err(|error| format!("hosted account tenant resolution failed: {error}"))
+        if let Some(store) = &self.hosted_account_store {
+            return store
+                .resolve_tenant_for_hosted_did(
+                    &hyprstream_rpc::Subject::new(
+                        hyprstream_pds_service::OAUTH_ACCOUNT_RESOLVER_SUBJECT,
+                    ),
+                    did,
+                )
+                .await
+                .map_err(|error| format!("hosted account tenant resolution failed: {error}"));
+        }
+        match &self.identity_registration_api {
+            Some(api) => api
+                .hosted_tenant(did)
+                .map_err(|error| format!("hosted account tenant resolution failed: {error:#}")),
+            None => Ok(None),
+        }
     }
 
     /// Host service DID accepted in ATProto service-auth `aud`.
@@ -1501,7 +1521,10 @@ impl OAuthState {
 
     /// Atomically claim a refresh token for one-time rotation. Only one caller
     /// across all OAuth replicas can receive a given entry.
-    pub async fn take_refresh_token(&self, token: &str) -> anyhow::Result<Option<RefreshTokenEntry>> {
+    pub async fn take_refresh_token(
+        &self,
+        token: &str,
+    ) -> anyhow::Result<Option<RefreshTokenEntry>> {
         let Some(ref store) = self.token_db else {
             return Ok(None);
         };
@@ -1530,12 +1553,7 @@ impl OAuthState {
     }
 
     /// Atomically consume an ATProto service-auth assertion identifier.
-    pub fn check_and_record_atproto_service_jti(
-        &self,
-        issuer: &str,
-        jti: &str,
-        exp: i64,
-    ) -> bool {
+    pub fn check_and_record_atproto_service_jti(&self, issuer: &str, jti: &str, exp: i64) -> bool {
         let remaining = exp - chrono::Utc::now().timestamp();
         if remaining <= 0 {
             return false;

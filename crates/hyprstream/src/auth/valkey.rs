@@ -13,15 +13,16 @@
 
 #![cfg(feature = "valkey")]
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use ed25519_dalek::VerifyingKey;
 use fred::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use super::user_store::{
-    matches_filter, pubkey_fingerprint, PubkeyEntry, ScimFilter, UserFilter, UserProfile,
-    UserProfilePatch, UserStore,
+    matches_filter, pubkey_fingerprint, AccountKeyCustody, HostedAccountProvisionError,
+    HostedAccountProvisioning, PubkeyEntry, ScimFilter, UserFilter, UserProfile, UserProfilePatch,
+    UserStore,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -45,8 +46,7 @@ pub struct ValkeyUserStore {
 
 impl ValkeyUserStore {
     pub async fn connect(url: &str) -> Result<Self> {
-        let config = RedisConfig::from_url(url)
-            .context("invalid Valkey URL")?;
+        let config = RedisConfig::from_url(url).context("invalid Valkey URL")?;
         let pool = Builder::from_config(config).build_pool(8)?;
         pool.connect();
         pool.wait_for_connect().await?;
@@ -77,10 +77,90 @@ impl UserStore for ValkeyUserStore {
             ..Default::default()
         };
         let json = serde_json::to_string(&profile)?;
-        self.pool.set::<(), _, _>(format!("hs:user:{username}"), json, None, None, false).await?;
+        self.pool
+            .set::<(), _, _>(format!("hs:user:{username}"), json, None, None, false)
+            .await?;
         self.pool.sadd::<i64, _, _>("hs:users", username).await?;
-        self.pool.set::<(), _, _>(format!("hs:idx:sub:{sub}"), username, None, None, false).await?;
+        self.pool
+            .set::<(), _, _>(format!("hs:idx:sub:{sub}"), username, None, None, false)
+            .await?;
         Ok(sub)
+    }
+
+    async fn provision_hosted_account(
+        &self,
+        username: &str,
+        atproto_did: &str,
+        pubkey: VerifyingKey,
+        custody: AccountKeyCustody,
+    ) -> std::result::Result<HostedAccountProvisioning, HostedAccountProvisionError> {
+        use base64::Engine;
+
+        let sub = uuid::Uuid::new_v4().to_string();
+        let fingerprint = pubkey_fingerprint(&pubkey);
+        let profile = UserProfile {
+            sub: Some(sub.clone()),
+            active: Some(true),
+            atproto_did: Some(atproto_did.to_owned()),
+            key_custody: Some(custody),
+            external_identities: Vec::new(),
+            ..Default::default()
+        };
+        let profile_json = serde_json::to_string(&profile)
+            .map_err(|error| HostedAccountProvisionError::Backend(error.into()))?;
+        let stored_key = StoredKey {
+            pubkey_base64: base64::engine::general_purpose::STANDARD.encode(pubkey.as_bytes()),
+            label: Some("aegis-vault".to_owned()),
+            created_at: chrono::Utc::now().timestamp(),
+            last_used_at: None,
+            algorithm: crate::auth::KeyAlgorithm::Ed25519,
+            pq_pubkey_base64: None,
+        };
+        let key_json = serde_json::to_string(&stored_key)
+            .map_err(|error| HostedAccountProvisionError::Backend(error.into()))?;
+
+        // All conflict checks and writes run inside one Valkey script. Status:
+        // 0 = inserted, 1 = username exists, 2 = key owner exists.
+        const PROVISION_HOSTED_ACCOUNT: &str = r#"
+if redis.call('EXISTS', KEYS[1]) == 1 then return 1 end
+if redis.call('EXISTS', KEYS[5]) == 1 then return 2 end
+redis.call('SET', KEYS[1], ARGV[1])
+redis.call('SADD', KEYS[2], ARGV[2])
+redis.call('SET', KEYS[3], ARGV[2])
+redis.call('SET', KEYS[4], ARGV[3])
+redis.call('SADD', KEYS[6], ARGV[4])
+redis.call('SET', KEYS[5], ARGV[2])
+return 0
+"#;
+        let status: i64 = self
+            .pool
+            .eval(
+                PROVISION_HOSTED_ACCOUNT,
+                vec![
+                    format!("hs:user:{username}"),
+                    "hs:users".to_owned(),
+                    format!("hs:idx:sub:{sub}"),
+                    format!("hs:key:{fingerprint}"),
+                    format!("hs:keyowner:{fingerprint}"),
+                    format!("hs:user:{username}:keys"),
+                ],
+                vec![
+                    profile_json,
+                    username.to_owned(),
+                    key_json,
+                    fingerprint.clone(),
+                ],
+            )
+            .await
+            .map_err(|error| HostedAccountProvisionError::Backend(error.into()))?;
+        match status {
+            0 => Ok(HostedAccountProvisioning { sub, fingerprint }),
+            1 => Err(HostedAccountProvisionError::AccountAlreadyExists),
+            2 => Err(HostedAccountProvisionError::KeyAlreadyBound),
+            other => Err(HostedAccountProvisionError::Backend(anyhow!(
+                "unexpected hosted-account provisioning status {other}"
+            ))),
+        }
     }
 
     async fn set_profile(&self, username: &str, new: UserProfilePatch) -> Result<()> {
@@ -88,8 +168,16 @@ impl UserStore for ValkeyUserStore {
 
         // Remove stale externalId index if it changed.
         if let Some(ref old_extid) = existing.external_id {
-            if new.external_id.as_ref().is_some_and(|value| value.as_deref() != Some(old_extid)) {
-                let _: i64 = self.pool.del(format!("hs:idx:extid:{old_extid}")).await.unwrap_or(0);
+            if new
+                .external_id
+                .as_ref()
+                .is_some_and(|value| value.as_deref() != Some(old_extid))
+            {
+                let _: i64 = self
+                    .pool
+                    .del(format!("hs:idx:extid:{old_extid}"))
+                    .await
+                    .unwrap_or(0);
             }
         }
 
@@ -102,44 +190,81 @@ impl UserStore for ValkeyUserStore {
             active: new.active.unwrap_or(existing.active),
             external_id: new.external_id.unwrap_or(existing.external_id),
             atproto_did: new.atproto_did.unwrap_or(existing.atproto_did),
+            key_custody: new.key_custody.unwrap_or(existing.key_custody),
+            external_identities: new
+                .external_identities
+                .unwrap_or(existing.external_identities),
         };
 
         // Write new externalId index.
         if let Some(ref extid) = merged.external_id {
-            self.pool.set::<(), _, _>(format!("hs:idx:extid:{extid}"), username, None, None, false).await?;
+            self.pool
+                .set::<(), _, _>(format!("hs:idx:extid:{extid}"), username, None, None, false)
+                .await?;
         }
 
         let json = serde_json::to_string(&merged)?;
-        self.pool.set::<(), _, _>(format!("hs:user:{username}"), json, None, None, false).await?;
+        self.pool
+            .set::<(), _, _>(format!("hs:user:{username}"), json, None, None, false)
+            .await?;
         Ok(())
     }
 
     async fn remove(&self, username: &str) -> Result<bool> {
         let existing = self.get_profile_raw(username).await?;
-        let Some(profile) = existing else { return Ok(false) };
+        let Some(profile) = existing else {
+            return Ok(false);
+        };
 
         // Delete reverse indexes.
         if let Some(ref sub) = profile.sub {
-            let _: i64 = self.pool.del(format!("hs:idx:sub:{sub}")).await.unwrap_or(0);
+            let _: i64 = self
+                .pool
+                .del(format!("hs:idx:sub:{sub}"))
+                .await
+                .unwrap_or(0);
         }
         if let Some(ref extid) = profile.external_id {
-            let _: i64 = self.pool.del(format!("hs:idx:extid:{extid}")).await.unwrap_or(0);
+            let _: i64 = self
+                .pool
+                .del(format!("hs:idx:extid:{extid}"))
+                .await
+                .unwrap_or(0);
         }
 
         // Delete pubkeys.
-        let fps: Vec<String> = self.pool.smembers(format!("hs:user:{username}:keys")).await.unwrap_or_default();
+        let fps: Vec<String> = self
+            .pool
+            .smembers(format!("hs:user:{username}:keys"))
+            .await
+            .unwrap_or_default();
         for fp in &fps {
             let _: i64 = self.pool.del(format!("hs:key:{fp}")).await.unwrap_or(0);
-            let _: i64 = self.pool.del(format!("hs:keyowner:{fp}")).await.unwrap_or(0);
+            let _: i64 = self
+                .pool
+                .del(format!("hs:keyowner:{fp}"))
+                .await
+                .unwrap_or(0);
         }
-        let _: i64 = self.pool.del(format!("hs:user:{username}:keys")).await.unwrap_or(0);
-        let _: i64 = self.pool.del(format!("hs:user:{username}")).await.unwrap_or(0);
+        let _: i64 = self
+            .pool
+            .del(format!("hs:user:{username}:keys"))
+            .await
+            .unwrap_or(0);
+        let _: i64 = self
+            .pool
+            .del(format!("hs:user:{username}"))
+            .await
+            .unwrap_or(0);
         let _: i64 = self.pool.srem("hs:users", username).await.unwrap_or(0);
         Ok(true)
     }
 
     async fn list_users(&self) -> Vec<String> {
-        self.pool.smembers::<Vec<String>, _>("hs:users").await.unwrap_or_default()
+        self.pool
+            .smembers::<Vec<String>, _>("hs:users")
+            .await
+            .unwrap_or_default()
     }
 
     async fn search(&self, filter: &UserFilter) -> Result<Vec<(String, UserProfile)>> {
@@ -155,7 +280,8 @@ impl UserStore for ValkeyUserStore {
                     };
                 }
                 ScimFilter::IdEq(sub) => {
-                    let username: Option<String> = self.pool.get(format!("hs:idx:sub:{sub}")).await?;
+                    let username: Option<String> =
+                        self.pool.get(format!("hs:idx:sub:{sub}")).await?;
                     if let Some(u) = username {
                         if let Some(p) = self.get_profile_raw(&u).await? {
                             return Ok(vec![(u, p)]);
@@ -164,7 +290,8 @@ impl UserStore for ValkeyUserStore {
                     return Ok(vec![]);
                 }
                 ScimFilter::ExternalIdEq(extid) => {
-                    let username: Option<String> = self.pool.get(format!("hs:idx:extid:{extid}")).await?;
+                    let username: Option<String> =
+                        self.pool.get(format!("hs:idx:extid:{extid}")).await?;
                     if let Some(u) = username {
                         if let Some(p) = self.get_profile_raw(&u).await? {
                             return Ok(vec![(u, p)]);
@@ -180,7 +307,9 @@ impl UserStore for ValkeyUserStore {
         let all_usernames: Vec<String> = self.pool.smembers("hs:users").await?;
         let mut results: Vec<(String, UserProfile)> = Vec::new();
         for username in all_usernames {
-            let Some(profile) = self.get_profile_raw(&username).await? else { continue };
+            let Some(profile) = self.get_profile_raw(&username).await? else {
+                continue;
+            };
 
             // Apply active_only shortcut.
             if filter.active_only == Some(true) && profile.active == Some(false) {
@@ -207,7 +336,9 @@ impl UserStore for ValkeyUserStore {
                     ),
                     _ => true, // point-lookup cases already handled above
                 };
-                if !pass { continue; }
+                if !pass {
+                    continue;
+                }
             }
             results.push((username, profile));
         }
@@ -220,7 +351,11 @@ impl UserStore for ValkeyUserStore {
                     "id" | "sub" => a_prof.sub.cmp(&b_prof.sub),
                     _ => a_name.cmp(b_name),
                 };
-                if descending { ord.reverse() } else { ord }
+                if descending {
+                    ord.reverse()
+                } else {
+                    ord
+                }
             });
         }
 
@@ -231,16 +366,21 @@ impl UserStore for ValkeyUserStore {
     }
 
     async fn set_active(&self, username: &str, active: bool) -> Result<()> {
-        let mut profile = self.get_profile_raw(username).await?
+        let mut profile = self
+            .get_profile_raw(username)
+            .await?
             .ok_or_else(|| anyhow!("User '{username}' not found"))?;
         profile.active = Some(active);
         let json = serde_json::to_string(&profile)?;
-        self.pool.set::<(), _, _>(format!("hs:user:{username}"), json, None, None, false).await?;
+        self.pool
+            .set::<(), _, _>(format!("hs:user:{username}"), json, None, None, false)
+            .await?;
         Ok(())
     }
 
     async fn list_pubkeys(&self, username: &str) -> Result<Vec<PubkeyEntry>> {
-        let fps: Vec<String> = self.pool
+        let fps: Vec<String> = self
+            .pool
             .smembers(format!("hs:user:{username}:keys"))
             .await?;
         let mut entries = Vec::new();
@@ -249,7 +389,8 @@ impl UserStore for ValkeyUserStore {
             if let Some(s) = val {
                 let stored: StoredKey = serde_json::from_str(&s)?;
                 use base64::Engine;
-                let raw = base64::engine::general_purpose::STANDARD.decode(&stored.pubkey_base64)?;
+                let raw =
+                    base64::engine::general_purpose::STANDARD.decode(&stored.pubkey_base64)?;
                 let key_bytes: [u8; 32] = raw.try_into().map_err(|_| anyhow!("bad key length"))?;
                 let pubkey = VerifyingKey::from_bytes(&key_bytes)?;
                 // Decode + invariant-check the PQ component (fail closed on a
@@ -288,7 +429,12 @@ impl UserStore for ValkeyUserStore {
         Ok(entries)
     }
 
-    async fn add_pubkey(&self, username: &str, pubkey: VerifyingKey, label: Option<String>) -> Result<String> {
+    async fn add_pubkey(
+        &self,
+        username: &str,
+        pubkey: VerifyingKey,
+        label: Option<String>,
+    ) -> Result<String> {
         use base64::Engine;
         let fp = pubkey_fingerprint(&pubkey);
         let pubkey_base64 = base64::engine::general_purpose::STANDARD.encode(pubkey.as_bytes());
@@ -302,10 +448,33 @@ impl UserStore for ValkeyUserStore {
             pq_pubkey_base64: None,
         };
         let json = serde_json::to_string(&stored)?;
-        self.pool.set::<(), _, _>(format!("hs:key:{fp}"), json, None, None, false).await?;
-        self.pool.sadd::<i64, _, _>(format!("hs:user:{username}:keys"), &fp).await?;
-        self.pool.set::<(), _, _>(format!("hs:keyowner:{fp}"), username, None, None, false).await?;
-        Ok(fp)
+        const ADD_CLASSICAL_KEY: &str = r#"
+local owner = redis.call('GET', KEYS[1])
+if owner and owner ~= ARGV[1] then return 1 end
+if redis.call('SISMEMBER', KEYS[3], ARGV[3]) == 1 then return 2 end
+redis.call('SET', KEYS[2], ARGV[2])
+redis.call('SADD', KEYS[3], ARGV[3])
+redis.call('SET', KEYS[1], ARGV[1])
+return 0
+"#;
+        let status: i64 = self
+            .pool
+            .eval(
+                ADD_CLASSICAL_KEY,
+                vec![
+                    format!("hs:keyowner:{fp}"),
+                    format!("hs:key:{fp}"),
+                    format!("hs:user:{username}:keys"),
+                ],
+                vec![username.to_owned(), json, fp.clone()],
+            )
+            .await?;
+        match status {
+            0 => Ok(fp),
+            1 => anyhow::bail!("Pubkey already associated with another user"),
+            2 => anyhow::bail!("Pubkey with fingerprint {fp} already exists for user '{username}'"),
+            other => anyhow::bail!("unexpected add-pubkey status {other}"),
+        }
     }
 
     async fn add_pubkey_hybrid(
@@ -330,19 +499,21 @@ impl UserStore for ValkeyUserStore {
             }
         }
         let pubkey_base64 = base64::engine::general_purpose::STANDARD.encode(pubkey.as_bytes());
-        let pq_pubkey_base64 =
-            Some(base64::engine::general_purpose::STANDARD.encode(&ml_dsa_vk));
+        let pq_pubkey_base64 = Some(base64::engine::general_purpose::STANDARD.encode(&ml_dsa_vk));
 
         // In-place upgrade (Ed25519 → Hybrid) or idempotent re-bind: preserve
         // the original created_at/last_used_at if a record already exists.
-        let (created_at, last_used_at, existing_label) =
-            match self.pool.get::<Option<String>, _>(format!("hs:key:{fp}")).await? {
-                Some(s) => {
-                    let prev: StoredKey = serde_json::from_str(&s)?;
-                    (prev.created_at, prev.last_used_at, prev.label)
-                }
-                None => (chrono::Utc::now().timestamp(), None, None),
-            };
+        let (created_at, last_used_at, existing_label) = match self
+            .pool
+            .get::<Option<String>, _>(format!("hs:key:{fp}"))
+            .await?
+        {
+            Some(s) => {
+                let prev: StoredKey = serde_json::from_str(&s)?;
+                (prev.created_at, prev.last_used_at, prev.label)
+            }
+            None => (chrono::Utc::now().timestamp(), None, None),
+        };
 
         let stored = StoredKey {
             pubkey_base64,
@@ -353,17 +524,49 @@ impl UserStore for ValkeyUserStore {
             pq_pubkey_base64,
         };
         let json = serde_json::to_string(&stored)?;
-        self.pool.set::<(), _, _>(format!("hs:key:{fp}"), json, None, None, false).await?;
-        self.pool.sadd::<i64, _, _>(format!("hs:user:{username}:keys"), &fp).await?;
-        self.pool.set::<(), _, _>(format!("hs:keyowner:{fp}"), username, None, None, false).await?;
-        Ok(fp)
+        const UPSERT_HYBRID_KEY: &str = r#"
+local owner = redis.call('GET', KEYS[1])
+if owner and owner ~= ARGV[1] then return 1 end
+redis.call('SET', KEYS[2], ARGV[2])
+redis.call('SADD', KEYS[3], ARGV[3])
+redis.call('SET', KEYS[1], ARGV[1])
+return 0
+"#;
+        let status: i64 = self
+            .pool
+            .eval(
+                UPSERT_HYBRID_KEY,
+                vec![
+                    format!("hs:keyowner:{fp}"),
+                    format!("hs:key:{fp}"),
+                    format!("hs:user:{username}:keys"),
+                ],
+                vec![username.to_owned(), json, fp.clone()],
+            )
+            .await?;
+        match status {
+            0 => Ok(fp),
+            1 => anyhow::bail!("Pubkey already associated with another user"),
+            other => anyhow::bail!("unexpected hybrid add-pubkey status {other}"),
+        }
     }
 
     async fn remove_pubkey(&self, username: &str, fingerprint: &str) -> Result<bool> {
-        let removed: i64 = self.pool.srem(format!("hs:user:{username}:keys"), fingerprint).await?;
+        let removed: i64 = self
+            .pool
+            .srem(format!("hs:user:{username}:keys"), fingerprint)
+            .await?;
         if removed > 0 {
-            let _: i64 = self.pool.del(format!("hs:key:{fingerprint}")).await.unwrap_or(0);
-            let _: i64 = self.pool.del(format!("hs:keyowner:{fingerprint}")).await.unwrap_or(0);
+            let _: i64 = self
+                .pool
+                .del(format!("hs:key:{fingerprint}"))
+                .await
+                .unwrap_or(0);
+            let _: i64 = self
+                .pool
+                .del(format!("hs:keyowner:{fingerprint}"))
+                .await
+                .unwrap_or(0);
         }
         Ok(removed > 0)
     }
@@ -378,7 +581,9 @@ impl UserStore for ValkeyUserStore {
             let mut stored: StoredKey = serde_json::from_str(&s)?;
             stored.last_used_at = Some(chrono::Utc::now().timestamp());
             let json = serde_json::to_string(&stored)?;
-            self.pool.set::<(), _, _>(format!("hs:key:{fingerprint}"), json, None, None, false).await?;
+            self.pool
+                .set::<(), _, _>(format!("hs:key:{fingerprint}"), json, None, None, false)
+                .await?;
         }
         Ok(())
     }
