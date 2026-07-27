@@ -29,7 +29,7 @@ const TOKEN_TYPE_JWT: &str = "urn:ietf:params:oauth:token-type:jwt";
 const ISSUED_TOKEN_TYPE: &str = "urn:ietf:params:oauth:token-type:access_token";
 pub const ATPROTO_EXCHANGE_NSID: &str = "ai.hyprstream.identity.exchangeUcan";
 pub const ATPROTO_SESSION_EXCHANGE_NSID: &str = "ai.hyprstream.identity.exchangeSession";
-const MAX_ATPROTO_SERVICE_TOKEN_LIFETIME: i64 = 3600;
+pub(super) const MAX_ATPROTO_SERVICE_TOKEN_LIFETIME: i64 = 3600;
 pub(super) const MAX_ATPROTO_EXCHANGE_TOKEN_TTL: u32 = 300;
 
 pub(super) struct VerifiedSubject {

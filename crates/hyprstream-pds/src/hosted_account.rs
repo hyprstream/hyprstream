@@ -46,7 +46,13 @@ const COMPRESSED_P256_PUBLIC_KEY_LEN: usize = 33;
 const ACCOUNT_RECORD_FILE: &str = "account-record.cbor";
 const GENESIS_DID_OP_FILE: &str = "genesis.didop.cbor";
 const DID_DOCUMENT_FILE: &str = "did-document.json";
-const ATPROTO_SIGNING_KEY_FILE: &str = "atproto-signing-key";
+/// Secret account-specific P-256 key paired with the public `#atproto`
+/// verification method in the immutable account record and DID document.
+///
+/// Serving layers must never return this file. They may use it only after
+/// binding the caller to the exact hosted DID and re-checking that its public
+/// key matches the account record.
+pub const ATPROTO_SIGNING_KEY_FILE: &str = "atproto-signing-key";
 
 /// The output of the A2 allocation + A3 configured-zone seam.
 ///

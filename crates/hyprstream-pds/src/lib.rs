@@ -86,6 +86,7 @@ pub use did_op::{
 pub use hosted_account::{
     AccountRecord, AllocatedAccountName, DirectoryHostedAccountStore, HostedAccountMint,
     PendingHostedAccountMint, SealedHostedAccount, ACCOUNT_RECORD_VERSION,
+    ATPROTO_SIGNING_KEY_FILE,
 };
 pub use hosted_did_document::{
     SealedHostedDidDocument, DID_DOCUMENT_MEDIA_TYPE, DID_DOCUMENT_PATH, DID_OPERATION_LOG_PATH,

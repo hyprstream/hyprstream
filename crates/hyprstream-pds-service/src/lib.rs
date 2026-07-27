@@ -14,7 +14,7 @@ pub mod federation_intake;
 
 use std::sync::Arc;
 
-use hyprstream_pds::AccountRecord;
+use hyprstream_pds::{AccountRecord, ATPROTO_SIGNING_KEY_FILE};
 use hyprstream_rpc::auth::mac::{MacDecision, MacDenyReason, SecurityContext};
 use hyprstream_rpc::{EnvelopeContext, Subject};
 use hyprstream_vfs::{Mount, MountError, OREAD};
@@ -34,6 +34,7 @@ pub mod hosted_account_mint;
 pub const OAUTH_ACCOUNT_RESOLVER_SUBJECT: &str = "service:oauth";
 const DEFAULT_MAX_RECORD_BYTES: usize = 64 * 1024;
 const READ_CHUNK_BYTES: usize = 8 * 1024;
+const ATPROTO_SIGNING_KEY_BYTES: usize = 32;
 
 /// Failure from the mandatory tenant boundary or the PDS record read.
 #[derive(Debug, Error)]
@@ -62,6 +63,14 @@ pub enum AccountReadError {
     RecordTooLarge { limit: usize },
     #[error("PDS account record for {requested:?} contains label {stored:?}")]
     RecordLabelMismatch { requested: String, stored: String },
+    #[error("PDS account record for {requested:?} contains DID {stored:?}")]
+    RecordDidMismatch { requested: String, stored: String },
+    #[error("hosted account #atproto signing key for {0:?} is unavailable")]
+    SigningKeyUnavailable(String),
+    #[error("hosted account #atproto signing key for {0:?} is invalid")]
+    InvalidSigningKey(String),
+    #[error("hosted account #atproto signing key for {0:?} does not match its account record")]
+    SigningKeyMismatch(String),
     #[error("invalid PDS account record: {0}")]
     InvalidRecord(#[source] anyhow::Error),
     #[error("PDS mount operation failed: {0}")]
@@ -222,6 +231,104 @@ impl AccountRecordStore {
             resolved = Some(entry.name);
         }
         Ok(resolved)
+    }
+
+    /// Sign bytes with the account-specific `#atproto` key for one hosted DID.
+    ///
+    /// This is deliberately an authority-only operation: the caller supplies
+    /// neither a tenant nor a label. The store resolves the tenant from the
+    /// immutable account index, reloads the exact public account record, and
+    /// verifies the secret key against that record before signing. Missing,
+    /// corrupt, substituted, or ambiguous state fails closed and the secret
+    /// key never leaves this service boundary.
+    pub async fn sign_for_hosted_did(
+        &self,
+        authority: &Subject,
+        did: &str,
+        signing_input: &[u8],
+    ) -> Result<Option<Vec<u8>>, AccountReadError> {
+        use p256::ecdsa::signature::Signer as _;
+
+        let Some(tenant) = self.resolve_tenant_for_hosted_did(authority, did).await? else {
+            return Ok(None);
+        };
+        let Some(label) = hosted_account_label(did)? else {
+            return Ok(None);
+        };
+
+        let record_components = [
+            tenant.as_str(),
+            PDS_ACCOUNTS_DIRECTORY,
+            label,
+            PDS_ACCOUNT_RECORD_FILE,
+        ];
+        let record_bytes = read_file(
+            self.pds_mount.as_ref(),
+            self.read_authorizer.as_ref(),
+            &record_components,
+            authority,
+            Some(tenant.as_str()),
+            None,
+            self.max_record_bytes,
+        )
+        .await?;
+        let record =
+            AccountRecord::from_dag_cbor(&record_bytes).map_err(AccountReadError::InvalidRecord)?;
+        if record.name().label() != label {
+            return Err(AccountReadError::RecordLabelMismatch {
+                requested: label.to_owned(),
+                stored: record.name().label().to_owned(),
+            });
+        }
+        if record.name().did() != did {
+            return Err(AccountReadError::RecordDidMismatch {
+                requested: did.to_owned(),
+                stored: record.name().did().to_owned(),
+            });
+        }
+
+        let key_components = [
+            tenant.as_str(),
+            PDS_ACCOUNTS_DIRECTORY,
+            label,
+            ATPROTO_SIGNING_KEY_FILE,
+        ];
+        let key_bytes = match read_file(
+            self.pds_mount.as_ref(),
+            self.read_authorizer.as_ref(),
+            &key_components,
+            authority,
+            Some(tenant.as_str()),
+            None,
+            ATPROTO_SIGNING_KEY_BYTES,
+        )
+        .await
+        {
+            Ok(bytes) => bytes,
+            Err(AccountReadError::Mount(MountError::NotFound(_))) => {
+                return Err(AccountReadError::SigningKeyUnavailable(did.to_owned()));
+            }
+            Err(AccountReadError::RecordTooLarge { .. }) => {
+                return Err(AccountReadError::InvalidSigningKey(did.to_owned()));
+            }
+            Err(error) => return Err(error),
+        };
+        if key_bytes.len() != ATPROTO_SIGNING_KEY_BYTES {
+            return Err(AccountReadError::InvalidSigningKey(did.to_owned()));
+        }
+        let signing_key = p256::ecdsa::SigningKey::from_slice(&key_bytes)
+            .map_err(|_| AccountReadError::InvalidSigningKey(did.to_owned()))?;
+        if signing_key.verifying_key().to_encoded_point(true)
+            != record
+                .atproto_verifying_key()
+                .map_err(AccountReadError::InvalidRecord)?
+                .to_encoded_point(true)
+        {
+            return Err(AccountReadError::SigningKeyMismatch(did.to_owned()));
+        }
+
+        let signature: p256::ecdsa::Signature = signing_key.sign(signing_input);
+        Ok(Some(signature.to_bytes().to_vec()))
     }
 
     #[cfg(test)]
@@ -474,7 +581,7 @@ mod tests {
         Arc::new(PermitAccountReads)
     }
 
-    fn account_bytes(label: &str, zone: &str) -> Vec<u8> {
+    fn account_artifacts(label: &str, zone: &str) -> (Vec<u8>, Vec<u8>) {
         let ed = SigningKey::generate(&mut OsRng);
         let (pq, pq_vk) = ml_dsa_generate_keypair();
         let hybrid =
@@ -492,7 +599,15 @@ mod tests {
             .prepare_genesis(document, GenesisRepoHead::EmptyRepo)
             .unwrap();
         let signature = sign_genesis(pending.unsigned_genesis(), &ed, &pq).unwrap();
-        pending.seal(signature).unwrap().record_bytes().to_vec()
+        let account = pending.seal(signature).unwrap();
+        (
+            account.record_bytes().to_vec(),
+            account.atproto_signing_key().to_bytes().to_vec(),
+        )
+    }
+
+    fn account_bytes(label: &str, zone: &str) -> Vec<u8> {
+        account_artifacts(label, zone).0
     }
 
     fn tenant_node(label: &str, record: Vec<u8>) -> SyntheticNode {
@@ -502,6 +617,18 @@ mod tests {
                 label,
                 SyntheticNode::dir()
                     .with_child(PDS_ACCOUNT_RECORD_FILE, SyntheticNode::file(record)),
+            ),
+        )
+    }
+
+    fn tenant_node_with_key(label: &str, record: Vec<u8>, key: Vec<u8>) -> SyntheticNode {
+        SyntheticNode::dir().with_child(
+            PDS_ACCOUNTS_DIRECTORY,
+            SyntheticNode::dir().with_child(
+                label,
+                SyntheticNode::dir()
+                    .with_child(PDS_ACCOUNT_RECORD_FILE, SyntheticNode::file(record))
+                    .with_child(ATPROTO_SIGNING_KEY_FILE, SyntheticNode::file(key)),
             ),
         )
     }
@@ -609,6 +736,67 @@ mod tests {
             ambiguous,
             AccountReadError::AmbiguousHostedAccountDid(_)
         ));
+    }
+
+    #[tokio::test]
+    async fn hosted_service_auth_signing_is_authority_bound_and_record_bound() {
+        use p256::ecdsa::signature::Verifier as _;
+
+        let did = "did:web:alice.acme.example";
+        let (record, key) = account_artifacts("alice", "acme.example");
+        let verifying_key = p256::ecdsa::SigningKey::from_slice(&key)
+            .unwrap()
+            .verifying_key()
+            .to_owned();
+        let root = SyntheticNode::dir().with_child(
+            "acme",
+            tenant_node_with_key("alice", record.clone(), key.clone()),
+        );
+        let store =
+            AccountRecordStore::new(Arc::new(SyntheticMount::new(root)), permit_account_reads());
+        let input = b"header.payload";
+        let signature = store
+            .sign_for_hosted_did(&oauth_authority(), did, input)
+            .await
+            .unwrap()
+            .expect("hosted account key");
+        let signature = p256::ecdsa::Signature::from_slice(&signature).unwrap();
+        verifying_key.verify(input, &signature).unwrap();
+
+        let denied = store
+            .sign_for_hosted_did(&Subject::new("alice"), did, input)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            denied,
+            AccountReadError::UnauthorizedTenantResolver(_)
+        ));
+
+        let missing_root =
+            SyntheticNode::dir().with_child("acme", tenant_node("alice", record.clone()));
+        let missing = AccountRecordStore::new(
+            Arc::new(SyntheticMount::new(missing_root)),
+            permit_account_reads(),
+        )
+        .sign_for_hosted_did(&oauth_authority(), did, input)
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            missing,
+            AccountReadError::SigningKeyUnavailable(_)
+        ));
+
+        let (_, other_key) = account_artifacts("other", "acme.example");
+        let mismatch_root = SyntheticNode::dir()
+            .with_child("acme", tenant_node_with_key("alice", record, other_key));
+        let mismatch = AccountRecordStore::new(
+            Arc::new(SyntheticMount::new(mismatch_root)),
+            permit_account_reads(),
+        )
+        .sign_for_hosted_did(&oauth_authority(), did, input)
+        .await
+        .unwrap_err();
+        assert!(matches!(mismatch, AccountReadError::SigningKeyMismatch(_)));
     }
 
     #[test]

@@ -184,7 +184,7 @@ pub fn create_app(state: Arc<OAuthState>, cors_config: &crate::config::CorsConfi
     };
 
     // ── Protected routes ───────────────────────────────────────────────────────
-    // All require a valid Bearer token (validated by require_bearer_token).
+    // All require a valid Bearer/DPoP token (validated by require_bearer_token).
     // Inserts AuthenticatedUser into request extensions for downstream handlers.
     let authority_router = Router::new()
         .route(
@@ -219,6 +219,10 @@ pub fn create_app(state: Arc<OAuthState>, cors_config: &crate::config::CorsConfi
         ));
 
     let protected_router = Router::new()
+        .route(
+            xrpc::GET_SERVICE_AUTH_PATH,
+            get(xrpc::get_service_auth),
+        )
         .route("/oauth/introspect", post(introspection::introspect_token))
         .route("/oauth/wit", post(wit_bootstrap::issue_browser_wit))
         .route(
@@ -1256,6 +1260,49 @@ mod tests {
         )
     }
 
+    fn dpop_resource_proof(
+        signing_key: &p256::ecdsa::SigningKey,
+        method: &str,
+        htu: &str,
+        access_token: &str,
+        jti: &str,
+        nonce: Option<&str>,
+    ) -> String {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+        use p256::ecdsa::signature::Signer as _;
+        use sha2::{Digest as _, Sha256};
+
+        let point = signing_key.verifying_key().to_encoded_point(false);
+        let header = serde_json::json!({
+            "typ": "dpop+jwt",
+            "alg": "ES256",
+            "jwk": {
+                "kty": "EC",
+                "crv": "P-256",
+                "x": URL_SAFE_NO_PAD.encode(point.x().unwrap()),
+                "y": URL_SAFE_NO_PAD.encode(point.y().unwrap()),
+            }
+        });
+        let mut payload = serde_json::json!({
+            "jti": jti,
+            "htm": method,
+            "htu": htu,
+            "iat": chrono::Utc::now().timestamp(),
+            "ath": URL_SAFE_NO_PAD.encode(Sha256::digest(access_token.as_bytes())),
+        });
+        if let Some(value) = nonce {
+            payload["nonce"] = serde_json::Value::String(value.to_owned());
+        }
+        let header = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&header).unwrap());
+        let payload = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&payload).unwrap());
+        let signing_input = format!("{header}.{payload}");
+        let signature: p256::ecdsa::Signature = signing_key.sign(signing_input.as_bytes());
+        format!(
+            "{signing_input}.{}",
+            URL_SAFE_NO_PAD.encode(signature.to_bytes())
+        )
+    }
+
     fn private_key_jwt_assertion(
         signing_key: &p256::ecdsa::SigningKey,
         kid: &str,
@@ -1569,10 +1616,15 @@ mod tests {
                 "accounts",
                 SyntheticNode::dir().with_child(
                     "alice",
-                    SyntheticNode::dir().with_child(
-                        "account-record.cbor",
-                        SyntheticNode::file(sealed_account.record_bytes().to_vec()),
-                    ),
+                    SyntheticNode::dir()
+                        .with_child(
+                            "account-record.cbor",
+                            SyntheticNode::file(sealed_account.record_bytes().to_vec()),
+                        )
+                        .with_child(
+                            hyprstream_pds::ATPROTO_SIGNING_KEY_FILE,
+                            SyntheticNode::file(atproto_signing_key.to_bytes().to_vec()),
+                        ),
                 ),
             ),
         );
@@ -2028,6 +2080,92 @@ mod tests {
         assert_eq!(claims["tenant"], HOSTED_TENANT);
         assert_eq!(claims["aud"], ISSUER);
         assert_eq!(claims["scope"], "atproto");
+
+        // The protected hosted-PDS route consumes the standard DPoP-bound
+        // OAuth access token and signs the exact #1354 method/audience with
+        // the account's persisted #atproto key.
+        let service_auth_htu = format!("{ISSUER}{}", xrpc::GET_SERVICE_AUTH_PATH);
+        let service_auth_uri = format!(
+            "{}?aud={}&lxm={}",
+            xrpc::GET_SERVICE_AUTH_PATH,
+            urlencoding::encode(&state.atproto_service_did().unwrap()),
+            urlencoding::encode(token_exchange::ATPROTO_SESSION_EXCHANGE_NSID),
+        );
+        let service_auth_proof = dpop_resource_proof(
+            &dpop_key,
+            "GET",
+            &service_auth_htu,
+            &token_response.access_token,
+            "handler-service-auth-jti",
+            Some(&token_nonce),
+        );
+        let service_auth = app
+            .clone()
+            .oneshot(
+                axum::http::Request::get(service_auth_uri)
+                    .header(
+                        axum::http::header::AUTHORIZATION,
+                        format!("DPoP {}", token_response.access_token),
+                    )
+                    .header("DPoP", service_auth_proof)
+                    .body(axum::body::Body::empty())?,
+            )
+            .await?;
+        let service_auth_status = service_auth.status();
+        let service_auth_cache_control = service_auth
+            .headers()
+            .get(axum::http::header::CACHE_CONTROL)
+            .cloned();
+        let service_auth_json = response_json(service_auth).await;
+        assert_eq!(
+            service_auth_status,
+            axum::http::StatusCode::OK,
+            "{service_auth_json}"
+        );
+        assert_eq!(
+            service_auth_cache_control.as_ref().unwrap(),
+            "no-store"
+        );
+        let service_jwt = service_auth_json["token"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("service-auth response token"))?
+            .to_owned();
+        let verified = token_exchange::verify_atproto_service_jwt(
+            &state,
+            &service_jwt,
+            token_exchange::ATPROTO_SESSION_EXCHANGE_NSID,
+        )
+        .await
+        .map_err(anyhow::Error::msg)?;
+        assert_eq!(verified.sub, MAPPED_DID);
+        assert_eq!(verified.verified_tenant.as_deref(), Some(HOSTED_TENANT));
+
+        // The first hyprstream_session is still issued by the existing #1354
+        // exchange route; getServiceAuth does not create a parallel session.
+        let session_proof = dpop_proof(
+            &dpop_key,
+            &format!("{ISSUER}{}", browser_session::SESSION_EXCHANGE_PATH),
+            "handler-session-exchange-jti",
+            None,
+        );
+        let session = app
+            .clone()
+            .oneshot(
+                axum::http::Request::post(browser_session::SESSION_EXCHANGE_PATH)
+                    .header(
+                        axum::http::header::AUTHORIZATION,
+                        format!("Bearer {service_jwt}"),
+                    )
+                    .header("DPoP", session_proof)
+                    .body(axum::body::Body::empty())?,
+            )
+            .await?;
+        assert_eq!(session.status(), axum::http::StatusCode::OK);
+        assert!(
+            session.headers()[axum::http::header::SET_COOKIE]
+                .to_str()?
+                .starts_with("hyprstream_session=")
+        );
 
         // A confidential atproto client signs private_key_jwt with the AS
         // issuer as the assertion audience (atproto mandate, #1146 T1.2),
