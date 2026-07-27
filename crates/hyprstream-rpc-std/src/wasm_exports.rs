@@ -12,10 +12,46 @@
 use std::sync::Arc;
 
 use js_sys::Function;
+use serde::Serialize as _;
 use wasm_bindgen::prelude::*;
 
 // Re-export low-level WASM API (crypto primitives, ZMTP framing) from hyprstream-rpc.
 pub use hyprstream_rpc::wasm_api::*;
+
+/// Exchange an ATProto service-auth JWT plus DPoP proof for hyprstream's
+/// opaque HttpOnly browser session. The service JWT must target
+/// `ai.hyprstream.identity.exchangeSession`.
+#[wasm_bindgen(js_name = "exchangeBrowserSession")]
+pub async fn exchange_browser_session(
+    exchange_endpoint: &str,
+    service_auth_jwt: &str,
+    dpop_proof: &str,
+) -> Result<JsValue, JsError> {
+    let context = hyprstream_rpc::wasm_token_exchange::fetch_session_exchange(
+        exchange_endpoint,
+        service_auth_jwt,
+        dpop_proof,
+    )
+    .await
+    .map_err(|error| JsError::new(&error.to_string()))?;
+    context
+        .serialize(&serde_wasm_bindgen::Serializer::json_compatible())
+        .map_err(|error| JsError::new(&format!("session context serialization failed: {error}")))
+}
+
+/// Read the current server-derived viewer context from the HttpOnly session.
+#[wasm_bindgen(js_name = "browserSessionWhoami")]
+pub async fn browser_session_whoami(
+    exchange_endpoint: &str,
+) -> Result<JsValue, JsError> {
+    let context =
+        hyprstream_rpc::wasm_token_exchange::fetch_session_context(exchange_endpoint)
+            .await
+            .map_err(|error| JsError::new(&error.to_string()))?;
+    context
+        .serialize(&serde_wasm_bindgen::Serializer::json_compatible())
+        .map_err(|error| JsError::new(&format!("session context serialization failed: {error}")))
+}
 
 // ============================================================================
 // VFS Shell — Tcl + Namespace backed by RpcClient

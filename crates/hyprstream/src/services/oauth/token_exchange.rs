@@ -28,18 +28,19 @@ const TOKEN_TYPE_ACCESS_TOKEN: &str = "urn:ietf:params:oauth:token-type:access_t
 const TOKEN_TYPE_JWT: &str = "urn:ietf:params:oauth:token-type:jwt";
 const ISSUED_TOKEN_TYPE: &str = "urn:ietf:params:oauth:token-type:access_token";
 pub const ATPROTO_EXCHANGE_NSID: &str = "ai.hyprstream.identity.exchangeUcan";
+pub const ATPROTO_SESSION_EXCHANGE_NSID: &str = "ai.hyprstream.identity.exchangeSession";
 const MAX_ATPROTO_SERVICE_TOKEN_LIFETIME: i64 = 3600;
 pub(super) const MAX_ATPROTO_EXCHANGE_TOKEN_TTL: u32 = 300;
 
-struct VerifiedSubject {
-    sub: String,
+pub(super) struct VerifiedSubject {
+    pub(super) sub: String,
     cnf_key_bytes: Option<[u8; 32]>,
     iat: i64,
     /// Authority from a locally validated OAuth access-token grant. Identity
     /// tokens and generic JWTs do not carry a server-authorized OAuth grant.
     granted_scopes: Option<Vec<String>>,
-    verified_tenant: Option<String>,
-    atproto_replay: Option<(String, String, i64)>,
+    pub(super) verified_tenant: Option<String>,
+    pub(super) atproto_replay: Option<(String, String, i64)>,
     require_clearance: bool,
     ttl_ceiling: Option<u32>,
 }
@@ -287,7 +288,7 @@ async fn verify_jwt(state: &Arc<OAuthState>, token: &str) -> Result<VerifiedSubj
     if issuer_hint.as_deref().is_some_and(|issuer| {
         issuer.starts_with("did:plc:") || issuer.starts_with("did:web:")
     }) {
-        return verify_atproto_service_jwt(state, token).await;
+        return verify_atproto_service_jwt(state, token, ATPROTO_EXCHANGE_NSID).await;
     }
 
     let unverified = hyprstream_rpc::auth::decode_unverified(token)
@@ -367,9 +368,10 @@ struct AtprotoServiceClaims {
     jti: String,
 }
 
-async fn verify_atproto_service_jwt(
+pub(super) async fn verify_atproto_service_jwt(
     state: &Arc<OAuthState>,
     token: &str,
+    expected_lxm: &str,
 ) -> Result<VerifiedSubject, String> {
     let parts: Vec<&str> = token.split('.').collect();
     if parts.len() != 3 || parts.iter().any(|part| part.is_empty()) {
@@ -390,8 +392,8 @@ async fn verify_atproto_service_jwt(
     if claims.aud != expected_audience {
         return Err(format!("ATProto service JWT aud must equal host DID {expected_audience}"));
     }
-    if claims.lxm != ATPROTO_EXCHANGE_NSID {
-        return Err(format!("ATProto service JWT lxm must equal {ATPROTO_EXCHANGE_NSID}"));
+    if claims.lxm != expected_lxm {
+        return Err(format!("ATProto service JWT lxm must equal {expected_lxm}"));
     }
     let now = chrono::Utc::now().timestamp();
     if claims.exp <= now {
