@@ -8,6 +8,7 @@
 //!   hs:user:{u}:keys          SET of fingerprints
 //!   hs:key:{fp}               JSON pubkey data (base64, label, timestamps)
 //!   hs:keyowner:{fp}          username string (fingerprint → user reverse index)
+//!   hs:hosted-staged-binding:{u}:{fp} immutable expected hosted-binding bytes
 //!   hs:hosted-binding:{u}:{fp} activated hosted-binding integrity marker
 //!   hs:idx:sub:{sub}          username (sub → username reverse index)
 //!   hs:idx:extid:{extid}      username (externalId → username reverse index)
@@ -41,6 +42,83 @@ struct StoredKey {
     pq_pubkey_base64: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct HostedBindingMarker {
+    fingerprint: String,
+    did: String,
+    custody: String,
+    pubkey_base64: String,
+}
+
+fn validated_stored_key_base64(
+    fingerprint: &str,
+    key_json: Option<&str>,
+) -> std::result::Result<String, HostedAccountProvisionError> {
+    use base64::engine::general_purpose::STANDARD;
+    use base64::Engine;
+
+    let invalid = || {
+        HostedAccountProvisionError::Backend(anyhow!(
+            "stored hosted-account key does not match its indexed fingerprint"
+        ))
+    };
+    let key: StoredKey =
+        serde_json::from_str(key_json.ok_or_else(invalid)?).map_err(|_| invalid())?;
+    let key_bytes = STANDARD
+        .decode(&key.pubkey_base64)
+        .ok()
+        .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
+        .ok_or_else(invalid)?;
+    let verifying_key = VerifyingKey::from_bytes(&key_bytes).map_err(|_| invalid())?;
+    if pubkey_fingerprint(&verifying_key) != fingerprint {
+        return Err(invalid());
+    }
+    Ok(key.pubkey_base64)
+}
+
+fn validate_key_conflict_snapshot(
+    fingerprint: &str,
+    owner: Option<&str>,
+    owner_has_fingerprint: bool,
+    profile_json: Option<&str>,
+    key_json: Option<&str>,
+    marker_json: Option<&str>,
+) -> std::result::Result<(), HostedAccountProvisionError> {
+    let invalid = || {
+        HostedAccountProvisionError::Backend(anyhow!(
+            "existing hosted-account key binding is incomplete or inconsistent"
+        ))
+    };
+    owner
+        .filter(|owner| !owner.is_empty())
+        .ok_or_else(invalid)?;
+    if !owner_has_fingerprint {
+        return Err(invalid());
+    }
+    let profile: UserProfile =
+        serde_json::from_str(profile_json.ok_or_else(invalid)?).map_err(|_| invalid())?;
+    let did = profile
+        .atproto_did
+        .as_deref()
+        .filter(|did| did.starts_with("did:web:"))
+        .ok_or_else(invalid)?;
+    let custody = profile
+        .key_custody
+        .filter(|_| profile.active == Some(true))
+        .ok_or_else(invalid)?;
+    let key_base64 = validated_stored_key_base64(fingerprint, key_json)?;
+    let marker: HostedBindingMarker =
+        serde_json::from_str(marker_json.ok_or_else(invalid)?).map_err(|_| invalid())?;
+    if marker.fingerprint != fingerprint
+        || marker.did != did
+        || marker.custody != custody.as_str()
+        || marker.pubkey_base64 != key_base64
+    {
+        return Err(invalid());
+    }
+    Ok(())
+}
+
 pub struct ValkeyUserStore {
     pool: RedisPool,
 }
@@ -61,6 +139,91 @@ impl ValkeyUserStore {
             None => Ok(None),
             Some(s) => Ok(Some(serde_json::from_str(&s)?)),
         }
+    }
+
+    async fn validate_key_conflict(
+        &self,
+        fingerprint: &str,
+    ) -> std::result::Result<(), HostedAccountProvisionError> {
+        let owner: Option<String> = self
+            .pool
+            .get(format!("hs:keyowner:{fingerprint}"))
+            .await
+            .map_err(|error| HostedAccountProvisionError::Backend(error.into()))?;
+        let profile_json: Option<String> = match owner.as_deref() {
+            Some(owner) => self
+                .pool
+                .get(format!("hs:user:{owner}"))
+                .await
+                .map_err(|error| HostedAccountProvisionError::Backend(error.into()))?,
+            None => None,
+        };
+        let key_json: Option<String> = self
+            .pool
+            .get(format!("hs:key:{fingerprint}"))
+            .await
+            .map_err(|error| HostedAccountProvisionError::Backend(error.into()))?;
+        let marker_json: Option<String> = match owner.as_deref() {
+            Some(owner) => self
+                .pool
+                .get(format!("hs:hosted-binding:{owner}:{fingerprint}"))
+                .await
+                .map_err(|error| HostedAccountProvisionError::Backend(error.into()))?,
+            None => None,
+        };
+        let owner_has_fingerprint = match owner.as_deref() {
+            Some(owner) => self
+                .pool
+                .sismember(format!("hs:user:{owner}:keys"), fingerprint)
+                .await
+                .map_err(|error| HostedAccountProvisionError::Backend(error.into()))?,
+            None => false,
+        };
+        validate_key_conflict_snapshot(
+            fingerprint,
+            owner.as_deref(),
+            owner_has_fingerprint,
+            profile_json.as_deref(),
+            key_json.as_deref(),
+            marker_json.as_deref(),
+        )
+    }
+
+    async fn validated_staged_public_key(
+        &self,
+        username: &str,
+        atproto_did: &str,
+        fingerprint: &str,
+        custody: AccountKeyCustody,
+    ) -> std::result::Result<String, HostedAccountProvisionError> {
+        let key_json: Option<String> = self
+            .pool
+            .get(format!("hs:key:{fingerprint}"))
+            .await
+            .map_err(|error| HostedAccountProvisionError::Backend(error.into()))?;
+        let public_key = validated_stored_key_base64(fingerprint, key_json.as_deref())?;
+        let marker_json: Option<String> = self
+            .pool
+            .get(format!("hs:hosted-staged-binding:{username}:{fingerprint}"))
+            .await
+            .map_err(|error| HostedAccountProvisionError::Backend(error.into()))?;
+        let marker: HostedBindingMarker =
+            serde_json::from_str(marker_json.as_deref().ok_or_else(|| {
+                HostedAccountProvisionError::Backend(anyhow!(
+                    "staged hosted-account key binding marker is missing"
+                ))
+            })?)
+            .map_err(|error| HostedAccountProvisionError::Backend(error.into()))?;
+        if marker.fingerprint != fingerprint
+            || marker.did != atproto_did
+            || marker.custody != custody.as_str()
+            || marker.pubkey_base64 != public_key
+        {
+            return Err(HostedAccountProvisionError::Backend(anyhow!(
+                "staged hosted-account key binding marker is inconsistent"
+            )));
+        }
+        Ok(public_key)
     }
 }
 
@@ -119,6 +282,13 @@ impl UserStore for ValkeyUserStore {
         };
         let key_json = serde_json::to_string(&stored_key)
             .map_err(|error| HostedAccountProvisionError::Backend(error.into()))?;
+        let marker_json = serde_json::to_string(&HostedBindingMarker {
+            fingerprint: fingerprint.clone(),
+            did: atproto_did.to_owned(),
+            custody: custody.as_str().to_owned(),
+            pubkey_base64: base64::engine::general_purpose::STANDARD.encode(pubkey.as_bytes()),
+        })
+        .map_err(|error| HostedAccountProvisionError::Backend(error.into()))?;
 
         // All conflict checks and writes run inside one Valkey script. A
         // conflict status is emitted only after the existing hosted binding
@@ -151,6 +321,7 @@ local function usable(owner, profile, fingerprint)
   if not marker_json then return false end
   local marker_ok, marker = pcall(cjson.decode, marker_json)
   if not marker_ok
+      or marker.fingerprint ~= fingerprint
       or marker.did ~= decoded.atproto_did
       or marker.custody ~= decoded.key_custody
       or marker.pubkey_base64 ~= key.pubkey_base64 then
@@ -173,9 +344,16 @@ if existing_profile then
       and redis.call('GET', KEYS[5]) == ARGV[2]
       and redis.call('SISMEMBER', KEYS[6], ARGV[4]) == 1
   local existing_key = redis.call('GET', KEYS[4])
-  if exact and existing_key then
+  local existing_marker = redis.call('GET', KEYS[7])
+  if exact and existing_key and existing_marker then
     local key_ok, key_decoded = pcall(cjson.decode, existing_key)
-    exact = key_ok and key_decoded.pubkey_base64 == ARGV[7]
+    local marker_ok, marker = pcall(cjson.decode, existing_marker)
+    exact = key_ok and marker_ok
+        and key_decoded.pubkey_base64 == ARGV[7]
+        and marker.fingerprint == ARGV[4]
+        and marker.did == ARGV[5]
+        and marker.custody == ARGV[6]
+        and marker.pubkey_base64 == ARGV[7]
   else
     exact = false
   end
@@ -203,6 +381,7 @@ redis.call('SET', KEYS[3], ARGV[2])
 redis.call('SET', KEYS[4], ARGV[3])
 redis.call('SADD', KEYS[6], ARGV[4])
 redis.call('SET', KEYS[5], ARGV[2])
+redis.call('SET', KEYS[7], ARGV[8])
 return 0
 "#;
         let status: i64 = self
@@ -216,6 +395,7 @@ return 0
                     format!("hs:key:{fingerprint}"),
                     format!("hs:keyowner:{fingerprint}"),
                     format!("hs:user:{username}:keys"),
+                    format!("hs:hosted-staged-binding:{username}:{fingerprint}"),
                 ],
                 vec![
                     profile_json,
@@ -225,6 +405,7 @@ return 0
                     atproto_did.to_owned(),
                     custody.as_str().to_owned(),
                     base64::engine::general_purpose::STANDARD.encode(pubkey.as_bytes()),
+                    marker_json,
                 ],
             )
             .await
@@ -236,7 +417,10 @@ return 0
                 resumed: false,
             }),
             1 => Err(HostedAccountProvisionError::AccountAlreadyExists),
-            2 => Err(HostedAccountProvisionError::KeyAlreadyBound),
+            2 => {
+                self.validate_key_conflict(&fingerprint).await?;
+                Err(HostedAccountProvisionError::KeyAlreadyBound)
+            }
             3 => {
                 let existing = self
                     .get_profile_raw(username)
@@ -278,30 +462,38 @@ return 0
         fingerprint: &str,
         custody: AccountKeyCustody,
     ) -> std::result::Result<(), HostedAccountProvisionError> {
+        let expected_public_key = self
+            .validated_staged_public_key(username, atproto_did, fingerprint, custody)
+            .await?;
         const ACTIVATE_HOSTED_ACCOUNT: &str = r#"
 local profile_json = redis.call('GET', KEYS[1])
 if not profile_json then return 1 end
 local ok, profile = pcall(cjson.decode, profile_json)
 local key_json = redis.call('GET', KEYS[4])
 local key_ok, key = pcall(cjson.decode, key_json or '')
+local marker_json = redis.call('GET', KEYS[5])
+local marker_ok, marker = pcall(cjson.decode, marker_json or '')
 if not ok
     or not key_ok
+    or not marker_ok
     or (profile.active ~= false and profile.active ~= true)
     or profile.atproto_did ~= ARGV[1]
     or profile.key_custody ~= ARGV[4]
     or type(key.pubkey_base64) ~= 'string' or key.pubkey_base64 == ''
+    or marker.fingerprint ~= ARGV[3]
+    or marker.did ~= ARGV[1]
+    or marker.custody ~= ARGV[4]
+    or marker.pubkey_base64 ~= key.pubkey_base64
+    or marker.pubkey_base64 ~= ARGV[5]
     or redis.call('GET', KEYS[2]) ~= ARGV[2]
     or redis.call('SISMEMBER', KEYS[3], ARGV[3]) ~= 1
-    or not key_json then
+    or not key_json
+    or not marker_json then
   return 1
 end
 profile.active = true
 redis.call('SET', KEYS[1], cjson.encode(profile))
-redis.call('SET', KEYS[5], cjson.encode({
-  did = ARGV[1],
-  custody = ARGV[4],
-  pubkey_base64 = key.pubkey_base64
-}))
+redis.call('SET', KEYS[6], marker_json)
 return 0
 "#;
         let status: i64 = self
@@ -313,6 +505,7 @@ return 0
                     format!("hs:keyowner:{fingerprint}"),
                     format!("hs:user:{username}:keys"),
                     format!("hs:key:{fingerprint}"),
+                    format!("hs:hosted-staged-binding:{username}:{fingerprint}"),
                     format!("hs:hosted-binding:{username}:{fingerprint}"),
                 ],
                 vec![
@@ -320,6 +513,7 @@ return 0
                     username.to_owned(),
                     fingerprint.to_owned(),
                     custody.as_str().to_owned(),
+                    expected_public_key,
                 ],
             )
             .await
@@ -417,6 +611,11 @@ return 0
             let _: i64 = self
                 .pool
                 .del(format!("hs:hosted-binding:{username}:{fp}"))
+                .await
+                .unwrap_or(0);
+            let _: i64 = self
+                .pool
+                .del(format!("hs:hosted-staged-binding:{username}:{fp}"))
                 .await
                 .unwrap_or(0);
         }
@@ -746,6 +945,11 @@ return 0
                 .del(format!("hs:hosted-binding:{username}:{fingerprint}"))
                 .await
                 .unwrap_or(0);
+            let _: i64 = self
+                .pool
+                .del(format!("hs:hosted-staged-binding:{username}:{fingerprint}"))
+                .await
+                .unwrap_or(0);
         }
         Ok(removed > 0)
     }
@@ -771,6 +975,119 @@ return 0
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn corrupt_key_conflict_snapshot_never_becomes_trusted_conflict() -> Result<()> {
+        use base64::engine::general_purpose::STANDARD;
+        use base64::Engine;
+
+        let key = ed25519_dalek::SigningKey::from_bytes(&[0x76; 32]).verifying_key();
+        let fingerprint = pubkey_fingerprint(&key);
+        let profile_json = serde_json::to_string(&UserProfile {
+            sub: Some("alice-sub".to_owned()),
+            active: Some(true),
+            atproto_did: Some("did:web:alice.accounts.example.test".to_owned()),
+            key_custody: Some(AccountKeyCustody::SelfCustody),
+            ..Default::default()
+        })?;
+        let key_base64 = STANDARD.encode(key.as_bytes());
+        let key_json = serde_json::to_string(&StoredKey {
+            pubkey_base64: key_base64.clone(),
+            label: Some("aegis-vault".to_owned()),
+            created_at: 1,
+            last_used_at: None,
+            algorithm: crate::auth::KeyAlgorithm::Ed25519,
+            pq_pubkey_base64: None,
+        })?;
+        let marker_json = serde_json::to_string(&HostedBindingMarker {
+            fingerprint: fingerprint.clone(),
+            did: "did:web:alice.accounts.example.test".to_owned(),
+            custody: "self_custody".to_owned(),
+            pubkey_base64: key_base64,
+        })?;
+        assert!(validate_key_conflict_snapshot(
+            &fingerprint,
+            Some("alice"),
+            true,
+            Some(&profile_json),
+            Some(&key_json),
+            Some(&marker_json),
+        )
+        .is_ok());
+
+        for corrupt in [
+            validate_key_conflict_snapshot(
+                &fingerprint,
+                Some("alice"),
+                false,
+                Some(&profile_json),
+                Some(&key_json),
+                Some(&marker_json),
+            ),
+            validate_key_conflict_snapshot(
+                &fingerprint,
+                Some("alice"),
+                true,
+                Some(&profile_json),
+                None,
+                Some(&marker_json),
+            ),
+        ] {
+            assert!(matches!(
+                corrupt,
+                Err(HostedAccountProvisionError::Backend(_))
+            ));
+        }
+
+        let malformed_key_json = serde_json::to_string(&StoredKey {
+            pubkey_base64: "not-base64".to_owned(),
+            label: None,
+            created_at: 1,
+            last_used_at: None,
+            algorithm: crate::auth::KeyAlgorithm::Ed25519,
+            pq_pubkey_base64: None,
+        })?;
+        assert!(matches!(
+            validate_key_conflict_snapshot(
+                &fingerprint,
+                Some("alice"),
+                true,
+                Some(&profile_json),
+                Some(&malformed_key_json),
+                Some(&marker_json),
+            ),
+            Err(HostedAccountProvisionError::Backend(_))
+        ));
+
+        let different_key = ed25519_dalek::SigningKey::from_bytes(&[0x77; 32]).verifying_key();
+        let mismatch_base64 = STANDARD.encode(different_key.as_bytes());
+        let mismatch_key_json = serde_json::to_string(&StoredKey {
+            pubkey_base64: mismatch_base64.clone(),
+            label: None,
+            created_at: 1,
+            last_used_at: None,
+            algorithm: crate::auth::KeyAlgorithm::Ed25519,
+            pq_pubkey_base64: None,
+        })?;
+        let mismatch_marker_json = serde_json::to_string(&HostedBindingMarker {
+            fingerprint: fingerprint.clone(),
+            did: "did:web:alice.accounts.example.test".to_owned(),
+            custody: "self_custody".to_owned(),
+            pubkey_base64: mismatch_base64,
+        })?;
+        assert!(matches!(
+            validate_key_conflict_snapshot(
+                &fingerprint,
+                Some("alice"),
+                true,
+                Some(&profile_json),
+                Some(&mismatch_key_json),
+                Some(&mismatch_marker_json),
+            ),
+            Err(HostedAccountProvisionError::Backend(_))
+        ));
+        Ok(())
+    }
 
     #[tokio::test]
     async fn list_pubkeys_propagates_smembers_read_error() -> Result<()> {

@@ -396,7 +396,8 @@ impl UserStore for RocksDbUserStore {
         let _guard = self.provisioning_lock.lock();
         let fingerprint = pubkey_fingerprint(&pubkey);
         let usable_binding = |owner: &str,
-                              raw: &(String, UserProfile, Vec<StoredPubkey>)|
+                              raw: &(String, UserProfile, Vec<StoredPubkey>),
+                              required_fingerprint: Option<&str>|
          -> std::result::Result<bool, HostedAccountProvisionError> {
             let (sub, profile, keys) = raw;
             if sub.is_empty()
@@ -412,6 +413,9 @@ impl UserStore for RocksDbUserStore {
                 return Ok(false);
             }
             for key in keys {
+                if required_fingerprint.is_some_and(|required| key.fingerprint != required) {
+                    continue;
+                }
                 let valid_key = URL_SAFE_NO_PAD
                     .decode(&key.pubkey_base64)
                     .ok()
@@ -464,7 +468,7 @@ impl UserStore for RocksDbUserStore {
                     resumed: true,
                 });
             }
-            if usable_binding(username, &raw)? {
+            if usable_binding(username, &raw, None)? {
                 return Err(HostedAccountProvisionError::AccountAlreadyExists);
             }
             return Err(HostedAccountProvisionError::Backend(anyhow!(
@@ -484,7 +488,7 @@ impl UserStore for RocksDbUserStore {
                         "hosted-account key owner profile is missing"
                     ))
                 })?;
-            if usable_binding(&owner, &owner_raw)? {
+            if usable_binding(&owner, &owner_raw, Some(&fingerprint))? {
                 return Err(HostedAccountProvisionError::KeyAlreadyBound);
             }
             return Err(HostedAccountProvisionError::Backend(anyhow!(
@@ -1362,6 +1366,78 @@ mod tests {
                 subject: "external-alice".to_owned(),
             }]
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn corrupt_exact_key_index_never_returns_trusted_key_conflict() -> Result<()> {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use base64::Engine;
+
+        let dir = TempDir::new()?;
+        let store = make_store(dir.path());
+        let alice_key = SigningKey::from_bytes(&[0x74; 32]).verifying_key();
+        let alice = store
+            .provision_hosted_account(
+                "alice",
+                "did:web:alice.accounts.example.test",
+                alice_key,
+                AccountKeyCustody::SelfCustody,
+            )
+            .await?;
+        store
+            .activate_hosted_account(
+                "alice",
+                "did:web:alice.accounts.example.test",
+                &alice.fingerprint,
+                AccountKeyCustody::SelfCustody,
+            )
+            .await?;
+
+        let conflicting_key = SigningKey::from_bytes(&[0x75; 32]).verifying_key();
+        let conflicting_fingerprint = pubkey_fingerprint(&conflicting_key);
+        store
+            .db
+            .put(pubkey_key(&conflicting_fingerprint), b"alice")?;
+
+        let attempt = || {
+            store.provision_hosted_account(
+                "bob",
+                "did:web:bob.accounts.example.test",
+                conflicting_key,
+                AccountKeyCustody::SelfCustody,
+            )
+        };
+        assert!(matches!(
+            attempt().await,
+            Err(HostedAccountProvisionError::Backend(_))
+        ));
+
+        let (sub, profile, mut keys) = store.get_raw("alice")?.unwrap();
+        keys.push(StoredPubkey {
+            fingerprint: conflicting_fingerprint,
+            // The index claims the conflicting fingerprint, but these are
+            // Alice's other key bytes. Recomputing the fingerprint must catch
+            // the mismatch instead of trusting any usable owner key.
+            pubkey_base64: URL_SAFE_NO_PAD.encode(alice_key.as_bytes()),
+            label: Some("corrupt-mismatch".to_owned()),
+            created_at: chrono::Utc::now().timestamp(),
+            last_used_at: 0,
+            algorithm: KeyAlgorithm::Ed25519,
+            pq_pubkey: None,
+        });
+        store.put_user("alice", &sub, &profile, &keys)?;
+        assert!(matches!(
+            attempt().await,
+            Err(HostedAccountProvisionError::Backend(_))
+        ));
+
+        keys.last_mut().unwrap().pubkey_base64 = "not-base64".to_owned();
+        store.put_user("alice", &sub, &profile, &keys)?;
+        assert!(matches!(
+            attempt().await,
+            Err(HostedAccountProvisionError::Backend(_))
+        ));
         Ok(())
     }
 
