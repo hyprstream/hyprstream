@@ -2,9 +2,9 @@
 
 This is the operator and Metal #38 contract for deployment registry trust. The
 scope is one Hyprstream deployment, not a PDS or host. For the demo, the same
-deployment CA, authority log, and current registry credential are projected to
-both PDS hosts. The v1 credential has no PDS/host claim; consumers must not
-invent one.
+deployment CA, authority log, independently trusted log-head checkpoint, and
+current registry credential are projected to both PDS hosts. The v1 credential
+has no PDS/host claim; consumers must not invent one.
 
 ## Fixed runtime artifacts
 
@@ -14,17 +14,20 @@ validating them through `hyprstream trust verify-deployment`:
 | Artifact | Fixed path | Required representation |
 | --- | --- | --- |
 | Deployment public CA | `/etc/hyprstream/trust/deployment-ca.hybrid` | Exactly 1,984 raw bytes: 32-byte Ed25519 public key followed by 1,952-byte ML-DSA-65 public key |
-| Authority rotation log | `/etc/hyprstream/trust/deployment-authority.log.json` | Root-anchored `hyprstream.deployment-authority-log.v1` JSON; public metadata, required by delegated credentials |
+| Authority rotation log | `/etc/hyprstream/trust/deployment-authority.log.json` | Root-anchored `hyprstream.deployment-authority-log.v1` JSON; public metadata, required for every credential |
+| Authority head checkpoint | `/etc/hyprstream/trust/deployment-authority.head.json` | Independently provisioned `hyprstream.deployment-authority-checkpoint.v1` JSON containing the expected domain, log DID, sequence, and head CID |
 | Registry credential | `/run/hyprstream/credentials/registry-service.jwt` | Compact hybrid JWT with no whitespace or newline, profile `hyprstream.registry-deployment.v1`, audience `urn:hyprstream:service:registry`, lifetime at most 3,600 seconds |
 
 Every file and parent directory is a regular root-owned OS path and must not be
-group/world writable. The first and third paths and representations are the
-stable executable contract. The public authority log is the design-in rotation
-checkpoint: the verifier accepts a UCAN delegation only when the installed
-root-anchored log has the DID named by the delegation and its issuer remains in
-the installed any-of-N active authority set. Replacing/removing an authority
-therefore revokes its delegations without changing the original 1,984-byte root
-pin.
+group/world writable. The verifier requires the log and checkpoint for
+direct-root and delegated credentials alike. A supplied log is accepted only
+when its verified DID, sequence, and head CID exactly equal the independently
+provisioned checkpoint; a signature-valid historical prefix therefore cannot
+reactivate a retired authority. The UCAN issuer must also remain in the
+checkpointed any-of-N active authority set. Replacing/removing an authority
+revokes both its direct credentials and delegations without changing the
+original 1,984-byte root pin. Logless genesis validation is a separately named,
+one-time tooling mode and is never inferred from a missing production file.
 
 ## Metal #38 input schema
 
@@ -46,6 +49,13 @@ deployment_trust = {
     schema     = "hyprstream.deployment-authority-log.v1"
     max_bytes  = 65536
   }
+  authority_checkpoint = {
+    secret_arn = "exact cloud-secret ARN"
+    version_id = "same rollout as authority_log"
+    sha256     = "lowercase SHA-256 of the exact checkpoint JSON bytes"
+    schema     = "hyprstream.deployment-authority-checkpoint.v1"
+    max_bytes  = 65536
+  }
   registry_credential = {
     secret_arn             = "exact rotating cloud-secret ARN"
     version_stage          = "AWSCURRENT"
@@ -62,22 +72,25 @@ read, render, output, log, or store the CA/JWT values in state, plans, tfvars,
 user data, or cloud-init. The exact secret ARNs and required KMS encryption
 context are the entire instance IAM read scope. The projection unit retrieves
 the referenced values at runtime, validates the CA length/layout, authority-log
-root and head, JWT profile/audience/freshness/signatures, then uses
+root and exact independently trusted head, JWT
+profile/audience/freshness/signatures, then uses
 write-fsync-rename to replace the fixed files. A failed fetch or verification
 never replaces the last valid file, and startup fails when no current valid
 set exists.
 
-The mint and verifier cap both the rotating JWT and public authority log at
-65,536 bytes so either remains a valid cloud-secret value. The delegation names
+The mint and verifier cap the rotating JWT, public authority log, and checkpoint
+at 65,536 bytes so each remains a valid cloud-secret value. The delegation names
 the stable authority-log DID instead of embedding its growing DidOp history, so
 hourly JWT size does not grow with rotations. A deployment that exhausts the
 log's 65,536-byte append budget must perform the documented new-CA
 reprovisioning flow; v1 does not claim a history-compaction protocol.
 
-The CA and authority-log versions are immutable inputs for a rollout. The JWT
-intentionally follows `AWSCURRENT` and is refreshed before expiry. An authority
-rotation is a deliberate Metal input update to the new immutable log version;
-it is not the hourly JWT refresh path.
+The CA, authority-log, and authority-checkpoint versions are immutable inputs
+for a rollout. The log and checkpoint are minted and durably committed together,
+and Metal must project them as one rollout unit; a mixed pair fails closed. The
+JWT intentionally follows `AWSCURRENT` and is refreshed before expiry. An
+authority rotation is a deliberate Metal input update to the new immutable log
+and checkpoint versions; it is not the hourly JWT refresh path.
 
 ## Out-of-band mint and publish flow
 
@@ -90,6 +103,7 @@ hyprstream trust mint-deployment-ca \
   --public-ca deployment-ca.hybrid \
   --authority-key deployment-ca.age \
   --authority-log deployment-authority.log.json \
+  --authority-checkpoint deployment-authority.head.json \
   --yubikey age1yubikey1PRIMARY... \
   --yubikey age1yubikey1BACKUP... \
   --recipient age1BREAKGLASS...
@@ -114,6 +128,7 @@ online hybrid signer:
 hyprstream trust delegate-registry-signer \
   --public-ca deployment-ca.hybrid \
   --authority-log deployment-authority.log.json \
+  --authority-checkpoint deployment-authority.head.json \
   --authority-key deployment-ca.age \
   --yubikey-identity primary-yubikey-identity.txt \
   --signer-recipient age1ONLINE_KMS_OR_SERVICE_IDENTITY... \
@@ -131,6 +146,7 @@ The online job uses it hourly without the root:
 hyprstream trust mint-registry-jwt \
   --public-ca deployment-ca.hybrid \
   --authority-log deployment-authority.log.json \
+  --authority-checkpoint deployment-authority.head.json \
   --identity online-signer-identity.txt \
   --via-delegated-signer registry-delegated-signer.age \
   --delegation registry-signer.delegation.json \
@@ -148,9 +164,10 @@ The JSON `--contract` output is
 base64 artifact values, and fingerprints for an out-of-band secret publisher.
 It contains no authority key. Because it contains the JWT and public artifacts,
 it is sensitive operational input and must never be passed to OpenTofu. The
-publisher writes the public CA and authority log to immutable cloud-secret
-versions, rotates only the JWT's `AWSCURRENT` version hourly, and returns the
-reference-only Metal object above through a separate control path.
+publisher writes the public CA, authority log, and authority checkpoint to
+immutable cloud-secret versions, rotates only the JWT's `AWSCURRENT` version
+hourly, and returns the reference-only Metal object above through a separate
+control path.
 
 Verify the exact bytes before publishing:
 
@@ -158,6 +175,7 @@ Verify the exact bytes before publishing:
 hyprstream trust verify-deployment \
   --public-ca deployment-ca.hybrid \
   --authority-log deployment-authority.log.json \
+  --authority-checkpoint deployment-authority.head.json \
   --jwt registry-service.jwt \
   --contract deployment-trust.publisher-manifest.json
 ```
@@ -166,8 +184,9 @@ hyprstream trust verify-deployment \
 
 `hyprstream trust rotate-authority --add` signs a DidOp head that retains the
 old active keys and adds the new hybrid key. Publish and roll out the new
-authority log, create a new delegation with the new authority, then use
-`--replace` to publish a later head that retires the old set. During the add
+authority log and its same-transaction checkpoint, create a new delegation with
+the new authority, then use `--replace` to publish a later log/checkpoint pair
+that retires the old set. During the add
 phase, delegations from retained authorities remain valid because they name the
 same log DID; after replacement, the same delegations fail because their issuer
 is no longer active.
@@ -175,9 +194,9 @@ is no longer active.
 Loss of one age recipient is recovered by decrypting with another, then
 rotating the recipient ring and authority as appropriate. Full loss of every
 root recipient is not cryptographically recoverable: generate a new deployment
-CA, re-provision `/etc/hyprstream/trust/deployment-ca.hybrid` and the new
-authority log on every instance, issue a new delegation, and replace the
-registry credential.
+CA, re-provision `/etc/hyprstream/trust/deployment-ca.hybrid`, the new authority
+log, and its head checkpoint on every instance, issue a new delegation, and
+replace the registry credential.
 
 Threshold M-of-N signing is deliberately deferred. FROST-style Ed25519
 threshold schemes do not solve the ML-DSA-65 leg, whose threshold signing and
