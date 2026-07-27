@@ -218,11 +218,15 @@ opentelemetry-semantic-conventions = { workspace = true, optional = true }
 opentelemetry-stdout = { workspace = true, optional = true }
 
 [features]
+# The credential/PDS service is the default production shape. Keep DuckDB-backed
+# metrics opt-in: DuckDB and PGlite export overlapping PostgreSQL C symbols and
+# cannot be linked into the same process.
 default = ["gittorrent", "xet", "systemd", "otel", "kata-vm", "nspawn"]
 cuda = []
 valkey = ["dep:fred"]  # Enable Valkey/Redis-backed user and token stores
 pglite = ["dep:pglite-rs"]  # Enable PGlite embedded relational UserStore (#1376)
-metrics = ["dep:hyprstream-metrics", "dep:hyprstream-flight"]  # Enable DuckDB-backed metrics service (conflicts with pglite at link time)
+credential-pds = ["pglite"]  # Production credential/PDS service profile; intentionally excludes metrics/DuckDB
+metrics = ["dep:hyprstream-metrics", "dep:hyprstream-flight"]  # Separate DuckDB-backed metrics/inference/Flight service build
 bnb = ["dep:bitsandbytes-sys"]  # Enable bitsandbytes KV cache quantization (requires compatible ROCm/CUDA)
 xet = ["git2db/xet-storage"]  # Enable XET large file storage
 # NOTE: plain dependency names (not `dep:`) — cargo rejects `dep:` references
