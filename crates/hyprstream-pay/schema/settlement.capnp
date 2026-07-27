@@ -19,7 +19,19 @@ struct UnitRef {
 
 struct IssueRequest {
     settlementId    @0 :Text;    # internal settlement row id (opaque)
-    attestation     @1 :Data;    # PQ-hybrid-signed settlement attestation
+    # PQ-hybrid-signed settlement attestation.
+    #
+    # NOT an arbitrary blob: these bytes are the canonical wire form of
+    # `hyprstream_pay::attestation::SettlementAttestation` (domain tag
+    # "hs-pay-settlement-attestation-v1", canonical DAG-CBOR, 16-byte
+    # big-endian amounts). See that module for the normative field order.
+    #
+    # The encoding is canonical and the record is self-contained, so the blob
+    # has a stable CID (blake3 over these exact bytes) and a future exchange
+    # record (#926) can embed it verbatim with no re-encoding. A decoder MUST
+    # reject non-canonical bytes rather than normalize them, since normalizing
+    # would change the content address a peer already committed to.
+    attestation     @1 :Data;
     unit            @2 :UnitRef; # target unit to issue
     destinationDid  @3 :Text;    # credit destination DID (pseudonymous)
     amountMinorLo   @4 :UInt64;  # u128 minor units (low 64 bits)

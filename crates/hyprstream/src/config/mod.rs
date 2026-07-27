@@ -2612,6 +2612,25 @@ impl HyprConfig {
 
     /// Validate the entire configuration
     pub fn validate(&self) -> anyhow::Result<()> {
+        // Ledger production mode (PAY-01): turns the deliberately-inert
+        // development defaults into startup failures, so a production node
+        // cannot come up with credit enforcement silently disabled or with a
+        // volatile accounting backend.
+        //
+        // Both the ledger config and its DSN are feature-gated, and they are
+        // gated independently: a build with `ledger` but not `postgres-ledger`
+        // has nowhere to configure a durable backend, so it reports no DSN and
+        // production validation fails — which is the correct answer, since such
+        // a build cannot serve a durable ledger at all.
+        #[cfg(feature = "ledger")]
+        {
+            #[cfg(feature = "postgres-ledger")]
+            let postgres_url = self.ledger_postgres_url.as_deref();
+            #[cfg(not(feature = "postgres-ledger"))]
+            let postgres_url: Option<&str> = None;
+            self.ledger.validate_for_production(postgres_url)?;
+        }
+
         // Validate model config
         if !self.model.path.as_os_str().is_empty() && !self.model.path.exists() {
             anyhow::bail!(

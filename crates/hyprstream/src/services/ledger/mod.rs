@@ -37,6 +37,7 @@ pub mod credit_gate;
 pub mod enforcer;
 pub mod handle;
 pub mod inference_spend;
+pub mod mint_authority;
 pub mod service;
 pub mod signer;
 pub mod sink;
@@ -55,6 +56,7 @@ pub use inference_spend::{
     SpendResult,
 };
 pub use service::LedgerService;
+pub use mint_authority::CoseMintVerifier;
 pub use signer::CoseCheckpointSigner;
 pub use sink::{DebtBreaker, LoggingReceiptSink, ReceiptPayload, ReceiptSink};
 
@@ -106,6 +108,18 @@ pub struct LedgerConfig {
     /// selection. When `true`, a missing PQ key **fails closed** at sign time
     /// (never silently downgrades to Classical). Default `true`.
     pub require_pq_signatures: bool,
+    /// Declare this deployment as production (PAY-01 R4 finding 4).
+    ///
+    /// The ledger's defaults are deliberately inert so that a developer machine
+    /// behaves exactly as it did before the ledger existed. That inertness is
+    /// wrong for a real deployment, where "the accounting plane quietly did not
+    /// run" must be a startup failure rather than a silent state. Setting this
+    /// converts the permissive defaults into hard requirements — see
+    /// [`LedgerConfig::validate_for_production`].
+    ///
+    /// Also settable out-of-band with `HS_LEDGER_PRODUCTION=1`, so an operator
+    /// can enforce it from the environment without editing config.
+    pub production: bool,
 }
 
 /// Durable backend selection (PAY-01 F8).
@@ -140,6 +154,7 @@ impl Default for LedgerConfig {
             checkpoint_every_n: 4096,
             checkpoint_every_t_secs: 60,
             require_pq_signatures: true,
+            production: false,
         }
     }
 }
@@ -149,5 +164,124 @@ impl LedgerConfig {
     /// only need the on/off answer.
     pub fn is_enabled(&self) -> bool {
         self.enabled
+    }
+
+    /// Whether this deployment is declared production, from config or from
+    /// `HS_LEDGER_PRODUCTION`.
+    pub fn is_production(&self) -> bool {
+        if self.production {
+            return true;
+        }
+        matches!(
+            std::env::var("HS_LEDGER_PRODUCTION").as_deref(),
+            Ok("1") | Ok("true") | Ok("TRUE")
+        )
+    }
+
+    /// Convert the permissive development defaults into startup failures.
+    ///
+    /// Three things are inert-by-default and must not be inert in production:
+    /// the ledger being switched off entirely, a volatile in-memory backend,
+    /// and a Postgres backend with nowhere to connect. Each of them means the
+    /// accounting plane is not actually accounting, so each is fatal here
+    /// rather than a log line nobody reads.
+    pub fn validate_for_production(&self, postgres_url: Option<&str>) -> anyhow::Result<()> {
+        if !self.is_production() {
+            return Ok(());
+        }
+        if !self.enabled {
+            anyhow::bail!(
+                "ledger: production mode requires [ledger] enabled = true (FATAL —                  credit enforcement would otherwise be bypassed entirely)"
+            );
+        }
+        if self.backend != BackendKind::Postgres {
+            anyhow::bail!(
+                "ledger: production mode requires [ledger] backend = postgres (FATAL — \
+                 backend = {:?} is volatile and would lose all ledger state on restart)",
+                self.backend
+            );
+        }
+        if postgres_url.map(str::trim).unwrap_or("").is_empty() {
+            anyhow::bail!(
+                "ledger: production mode requires a non-empty ledger_postgres_url (FATAL —                  the durable backend has nowhere to connect)"
+            );
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod production_activation_tests {
+    // A test asserting a known-good value legitimately unwraps.
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::*;
+
+    /// The development defaults must stay permissive — a developer machine
+    /// behaves exactly as it did before the ledger existed.
+    #[test]
+    fn defaults_are_inert_outside_production() {
+        let cfg = LedgerConfig::default();
+        assert!(!cfg.enabled);
+        assert!(cfg.validate_for_production(None).is_ok());
+    }
+
+    /// ...and must become startup failures once production is declared.
+    #[test]
+    fn production_requires_the_ledger_to_be_enabled() {
+        let cfg = LedgerConfig {
+            production: true,
+            enabled: false,
+            ..Default::default()
+        };
+        let err = cfg
+            .validate_for_production(Some("postgres://localhost/ledger"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("enabled = true"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn production_refuses_the_volatile_backend() {
+        let cfg = LedgerConfig {
+            production: true,
+            enabled: true,
+            backend: BackendKind::Mem,
+            ..Default::default()
+        };
+        let err = cfg
+            .validate_for_production(Some("postgres://localhost/ledger"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("backend = postgres"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn production_requires_somewhere_to_connect() {
+        let cfg = LedgerConfig {
+            production: true,
+            enabled: true,
+            backend: BackendKind::Postgres,
+            ..Default::default()
+        };
+        for url in [None, Some(""), Some("   ")] {
+            let err = cfg.validate_for_production(url).unwrap_err().to_string();
+            assert!(
+                err.contains("ledger_postgres_url"),
+                "unexpected error for {url:?}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_fully_configured_production_ledger_validates() {
+        let cfg = LedgerConfig {
+            production: true,
+            enabled: true,
+            backend: BackendKind::Postgres,
+            ..Default::default()
+        };
+        cfg.validate_for_production(Some("postgres://localhost/ledger"))
+            .unwrap();
     }
 }

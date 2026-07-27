@@ -7228,6 +7228,8 @@ name = "hyprstream-pay"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "blake3",
+ "ciborium",
  "serde",
  "serde_json",
  "thiserror 1.0.69",

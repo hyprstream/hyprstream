@@ -40,6 +40,10 @@ pub struct MemLedger {
     head: ChainHead,
     clock: u64,
     last_checkpoint: Option<SignedCheckpoint>,
+    /// Verifies issuance authorizations. Defaults to
+    /// [`DenyAllMintVerifier`](crate::mint::DenyAllMintVerifier) so a ledger
+    /// nobody explicitly granted an issuance authority cannot mint.
+    mint_verifier: Box<dyn crate::mint::MintVerifier>,
 }
 
 impl MemLedger {
@@ -56,7 +60,19 @@ impl MemLedger {
             head: ChainHead::default(),
             clock: 0,
             last_checkpoint: None,
+            mint_verifier: Box::new(crate::mint::DenyAllMintVerifier),
         }
+    }
+
+    /// Install the issuance authority for this ledger.
+    ///
+    /// Without this, [`LedgerBackend::credit`] can never succeed: the default
+    /// verifier refuses every authorization, so an un-configured ledger is
+    /// mint-disabled rather than mint-open.
+    #[must_use]
+    pub fn with_mint_verifier(mut self, verifier: Box<dyn crate::mint::MintVerifier>) -> Self {
+        self.mint_verifier = verifier;
+        self
     }
 
     /// The cell identity.
@@ -218,8 +234,16 @@ impl LedgerBackend for MemLedger {
         }
     }
 
-    fn credit(&mut self, t: IssueTransfer) -> Outcome {
-        self.commit(Op::Credit(t))
+    fn credit(&mut self, cap: crate::mint::MintCapability<'_>) -> Outcome {
+        self.commit(Op::Credit(cap.transfer().clone()))
+    }
+
+    fn authorize_mint<'a>(
+        &self,
+        t: &'a IssueTransfer,
+        sig: &[u8],
+    ) -> Result<crate::mint::MintCapability<'a>, LedgerError> {
+        crate::mint::authorize(self.mint_verifier.as_ref(), t, sig)
     }
 
     fn debit(&mut self, t: Transfer) -> Outcome {

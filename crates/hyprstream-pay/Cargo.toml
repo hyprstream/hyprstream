@@ -12,6 +12,11 @@ description = "MIT-licensed settlement/tariff RPC contract + client stub — the
 
 [dependencies]
 serde = { workspace = true }
+# Canonical DAG-CBOR + content addressing for the settlement attestation
+# (PAY-ARCH-01): the blob must have one byte representation and a stable CID so
+# a future exchange record (#926) can embed it verbatim.
+ciborium = { workspace = true }
+blake3 = { workspace = true }
 serde_json = { workspace = true }
 async-trait = { workspace = true }
 thiserror = { workspace = true }

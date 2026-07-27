@@ -390,7 +390,8 @@ pub(crate) mod tests {
     /// emitter and the spawned handle (for balance inspection).
     pub(crate) async fn fixture(holders: &[(&str, u128)]) -> (InferenceSpendEmitter, LedgerHandle) {
         let cell = did("did:web:cell.test");
-        let mut backend = MemLedger::new(cell.clone());
+        let mut backend = MemLedger::new(cell.clone())
+            .with_mint_verifier(Box::new(crate::services::ledger::enforcer::TestMintVerifier));
         let issuer_liab =
             AccountId::derive(&cell, &unit().issuer, &unit(), &Purpose::IssuerLiability).unwrap();
         backend
@@ -421,8 +422,9 @@ pub(crate) mod tests {
                     Purpose::Available,
                 ))
                 .unwrap();
-            backend
-                .credit(IssueTransfer {
+            crate::services::ledger::enforcer::test_mint(
+                &mut backend,
+                IssueTransfer {
                     // Monotonic, holder-distinct idempotency id per issuance.
                     id: TransferId(1_000 + idx as u128),
                     issuer_liability: issuer_liab,
@@ -431,9 +433,10 @@ pub(crate) mod tests {
                     amount: *credit,
                     grant_cid: None,
                     user_data: [0u8; 32],
-                })
-                .result
-                .unwrap();
+                },
+            )
+            .result
+            .unwrap();
         }
 
         let signer = Arc::new(CoseCheckpointSigner::classical(

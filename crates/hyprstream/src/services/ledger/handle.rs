@@ -123,7 +123,29 @@ impl LedgerHandle {
                         let _ = r.send(backend.open_account(spec));
                     }
                     LedgerCmd::Credit(t, r) => {
-                        let _ = r.send(backend.credit(t));
+                        // Issuance is sealed in the ledger crate: `credit`
+                        // needs a capability produced by verifying a signature
+                        // bound to this exact transfer. The actor is inside the
+                        // TCB and holds the cell's signing key, so it is what
+                        // mints that authorization — which is why no consumer
+                        // holding only a `LedgerHandle` (or only a backend) can
+                        // reach the mint.
+                        let outcome = match hyprstream_ledger::mint_signing_input(&t)
+                            .and_then(|input| signer.sign(&input))
+                        {
+                            Ok(sig) => match backend.authorize_mint(&t, &sig) {
+                                Ok(cap) => backend.credit(cap),
+                                Err(e) => hyprstream_ledger::types::Outcome {
+                                    result: Err(e),
+                                    seq: backend.head().seq,
+                                },
+                            },
+                            Err(e) => hyprstream_ledger::types::Outcome {
+                                result: Err(e),
+                                seq: backend.head().seq,
+                            },
+                        };
+                        let _ = r.send(outcome);
                     }
                     LedgerCmd::Debit(t, r) => {
                         let _ = r.send(backend.debit(t));

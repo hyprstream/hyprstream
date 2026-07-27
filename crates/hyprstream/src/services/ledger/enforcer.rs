@@ -525,7 +525,8 @@ mod tests {
         ));
 
         // Backend + handle.
-        let mut backend = MemLedger::new(cell.clone());
+        let mut backend = MemLedger::new(cell.clone())
+            .with_mint_verifier(Box::new(crate::services::ledger::enforcer::TestMintVerifier));
         let issuer_liab =
             AccountId::derive(&cell, &unit().issuer, &unit(), &Purpose::IssuerLiability).unwrap();
         let holder_acct = AccountId::derive(&cell, &holder, &unit(), &Purpose::Available).unwrap();
@@ -555,8 +556,9 @@ mod tests {
             ))
             .unwrap();
         // Issue `grant_cap` from the issuer liability to the holder.
-        backend
-            .credit(hyprstream_ledger::IssueTransfer {
+        test_mint(
+            &mut backend,
+            hyprstream_ledger::IssueTransfer {
                 id: TransferId(1),
                 issuer_liability: issuer_liab,
                 destination: holder_acct,
@@ -564,9 +566,10 @@ mod tests {
                 amount: grant_cap,
                 grant_cid: Some(cid(1)),
                 user_data: [0u8; 32],
-            })
-            .result
-            .unwrap();
+            },
+        )
+        .result
+        .unwrap();
 
         let signer = Arc::new(CoseCheckpointSigner::classical(cell.clone(), ed_sk.clone()));
         let handle = LedgerHandle::spawn(Box::new(backend), signer);
@@ -1009,5 +1012,36 @@ mod tests {
         let void = mint_void_id(a);
         assert_ne!(post, void, "post and void ids must not collide");
         assert_ne!(post, a);
+    }
+}
+
+/// Install a permissive issuance authority and mint through the sealed path.
+///
+/// Issuance is gated on a verified, transfer-bound capability, so a fixture has
+/// to go through the same seam production does — there is no back door that
+/// skips it. The accept-all verifier stands in for the hybrid-PQC one.
+#[cfg(test)]
+#[derive(Debug)]
+pub(crate) struct TestMintVerifier;
+
+#[cfg(test)]
+impl hyprstream_ledger::MintVerifier for TestMintVerifier {
+    fn verify(&self, _signing_input: &[u8], _sig: &[u8]) -> Result<(), hyprstream_ledger::LedgerError> {
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn test_mint(
+    backend: &mut hyprstream_ledger::MemLedger,
+    t: hyprstream_ledger::IssueTransfer,
+) -> hyprstream_ledger::Outcome {
+    use hyprstream_ledger::LedgerBackend;
+    match backend.authorize_mint(&t, b"test") {
+        Ok(cap) => backend.credit(cap),
+        Err(e) => hyprstream_ledger::Outcome {
+            result: Err(e),
+            seq: backend.head().seq,
+        },
     }
 }

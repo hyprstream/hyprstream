@@ -26,10 +26,42 @@ fn unit() -> UnitId {
     }
 }
 
+/// Test issuance authority. Issuance is sealed behind a verified, transfer-bound
+/// capability (see `hyprstream_ledger::mint`), so a ledger under test has to be
+/// given an authority the same way production does — there is deliberately no
+/// back door that skips the seam.
+#[derive(Debug)]
+struct TestMintVerifier;
+
+impl hyprstream_ledger::MintVerifier for TestMintVerifier {
+    fn verify(&self, _signing_input: &[u8], sig: &[u8]) -> Result<(), LedgerError> {
+        // Stands in for a real hybrid-PQC check: accepts one fixed marker so the
+        // tests still exercise "authorization is required and is checked".
+        if sig == TEST_MINT_SIG {
+            Ok(())
+        } else {
+            Err(LedgerError::MintNotAuthorized("bad test signature".to_owned()))
+        }
+    }
+}
+
+const TEST_MINT_SIG: &[u8] = b"test-mint-authorization";
+
+/// Authorize and issue in one step, the way the settlement issuer does.
+fn mint(l: &mut MemLedger, t: IssueTransfer) -> hyprstream_ledger::Outcome {
+    match l.authorize_mint(&t, TEST_MINT_SIG) {
+        Ok(cap) => l.credit(cap),
+        Err(e) => hyprstream_ledger::Outcome {
+            result: Err(e),
+            seq: l.head().seq,
+        },
+    }
+}
+
 /// Build a ledger with an issuer-liability account (index 0) and `K_SPENDABLE`
 /// spendable accounts. Returns their account ids indexed 0..=K.
 fn fresh() -> (MemLedger, Vec<hyprstream_ledger::AccountId>) {
-    let mut l = MemLedger::new(ledger_id());
+    let mut l = MemLedger::new(ledger_id()).with_mint_verifier(Box::new(TestMintVerifier));
     let mut ids = Vec::new();
     let liability = l
         .open_account(AccountSpec::new(
@@ -181,10 +213,10 @@ proptest! {
                         grant_cid: None,
                         user_data: ud(),
                     };
-                    let out1 = l.credit(t.clone());
+                    let out1 = mint(&mut l, t.clone());
                     // Inline idempotency: replay is transparent, no state change.
                     let before = snapshot(&l);
-                    let out2 = l.credit(t);
+                    let out2 = mint(&mut l, t);
                     prop_assert_eq!(&out1, &out2);
                     prop_assert_eq!(before, snapshot(&l));
                 }
@@ -258,7 +290,7 @@ proptest! {
 
         // Fund the debit account generously so the reserve always succeeds.
         let fund = next_id(&mut counter);
-        l.credit(IssueTransfer {
+        mint(&mut l, IssueTransfer {
             id: fund,
             issuer_liability: ids[0],
             destination: ids[1],
@@ -378,7 +410,7 @@ fn timeout_bounds_are_plan_values() {
 
 #[test]
 fn issuance_rejects_available_account_even_with_empty_flags() {
-    let mut l = MemLedger::new(ledger_id());
+    let mut l = MemLedger::new(ledger_id()).with_mint_verifier(Box::new(TestMintVerifier));
     let source = l
         .open_account(AccountSpec {
             ledger_id: ledger_id(),
@@ -397,7 +429,7 @@ fn issuance_rejects_available_account_even_with_empty_flags() {
         ))
         .unwrap();
 
-    let out = l.credit(IssueTransfer {
+    let out = mint(&mut l, IssueTransfer {
         id: TransferId(1),
         issuer_liability: source.id,
         destination: dest.id,

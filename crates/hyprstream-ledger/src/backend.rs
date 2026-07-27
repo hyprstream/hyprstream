@@ -13,6 +13,7 @@ use crate::errors::LedgerError;
 use crate::journal::{
     ChainHead, CheckpointSigner, JournalEntry, OutboxItem, OutboxSeq, SignedCheckpoint, TickReport,
 };
+use crate::mint::MintCapability;
 use crate::types::{
     Account, AccountId, AccountSpec, BalanceView, IssueTransfer, Outcome, Transfer, TransferId,
 };
@@ -36,7 +37,27 @@ pub trait LedgerBackend: Send {
     /// Single-phase issuance: issuer liability → destination. INV-1: the only
     /// entry point that grows a unit's supply; the debit side MUST be the
     /// issuer's `IssuerLiability` account for the unit (checked).
-    fn credit(&mut self, t: IssueTransfer) -> Outcome;
+    ///
+    /// **Sealed.** This takes a [`MintCapability`], which has no public
+    /// constructor — the only way to obtain one is [`Self::authorize_mint`],
+    /// which verifies a signature bound to that exact transfer against the
+    /// verifier this backend was built with. Holding a backend is therefore not
+    /// sufficient to mint; holding a *verified authorization for a specific
+    /// issuance* is. See [`crate::mint`].
+    fn credit(&mut self, cap: MintCapability<'_>) -> Outcome;
+
+    /// Verify an issuance authorization against this backend's configured mint
+    /// verifier, yielding the capability [`Self::credit`] requires.
+    ///
+    /// `sig` must cover [`crate::mint_signing_input`] for `t`. This is the sole
+    /// route to a [`MintCapability`], which is why implementations of this
+    /// trait are confined to this crate: an out-of-crate backend could not mint
+    /// capabilities, and one that could would defeat the seal.
+    fn authorize_mint<'a>(
+        &self,
+        t: &'a IssueTransfer,
+        sig: &[u8],
+    ) -> Result<MintCapability<'a>, LedgerError>;
 
     /// Single-phase spend. Overdraft-checked on the debit side (plan §2b.1).
     fn debit(&mut self, t: Transfer) -> Outcome;

@@ -35,9 +35,11 @@
 //! composite) and **re-verified server-side** — never trusts a client
 //! assertion. This reuses the #1129 spend-authorization verification path.
 
+pub mod attestation;
 pub mod capability;
 pub mod types;
 
+pub use attestation::{SettlementAttestation, ATTESTATION_V1_TAG};
 pub use capability::ALL_SCOPES;
 pub use types::{IssueRequest, IssueResponse, TariffQuote, TariffRequest, UnitRef};
 

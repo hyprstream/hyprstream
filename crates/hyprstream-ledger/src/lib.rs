@@ -42,6 +42,7 @@ pub mod engine;
 pub mod errors;
 pub mod journal;
 pub mod mem;
+pub mod mint;
 #[cfg(feature = "postgres")]
 pub mod postgres;
 pub mod types;
@@ -54,6 +55,7 @@ pub use journal::{
     TickReport,
 };
 pub use mem::MemLedger;
+pub use mint::{mint_signing_input, DenyAllMintVerifier, MintCapability, MintVerifier};
 pub use types::{
     Account, AccountFlags, AccountId, AccountSpec, BalanceView, Cid, Did, IssueTransfer, Outcome,
     PendingReservation, PendingState, Purpose, Transfer, TransferId, TransferResult, UnitId,

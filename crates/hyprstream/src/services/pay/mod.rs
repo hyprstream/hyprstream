@@ -86,9 +86,23 @@ impl SettlementIssuerService {
 impl SettlementIssuer for SettlementIssuerService {
     async fn issue(&self, req: IssueRequest) -> Result<IssueResponse, PayError> {
         // 1. Verify the attestation server-side (PQ-hybrid signature check).
-        self.verifier
+        //
+        // The verified identity is then *bound* to the request rather than
+        // discarded: the attestation is self-contained and carries its own
+        // settlement id, so a blob that verifies but attests to a different
+        // settlement must be refused here. Trusting the caller-supplied id
+        // while only signature-checking the blob would let a valid attestation
+        // for a cheap settlement authorize issuance against an expensive one.
+        let verified = self
+            .verifier
             .verify(&req.attestation, &req.settlement_id)
             .await?;
+        if verified.settlement_id != req.settlement_id {
+            return Err(PayError::AttestationInvalid(format!(
+                "attestation attests to settlement {} but was presented for {}",
+                verified.settlement_id, req.settlement_id
+            )));
+        }
 
         // 2. Load the committed settlement row from the restricted store.
         let row = self

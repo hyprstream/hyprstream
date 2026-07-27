@@ -545,6 +545,17 @@ fn create_ledger_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
         );
     }
 
+    // Re-assert the production contract here as well as at config load: this
+    // factory is reachable from paths that construct a config programmatically
+    // rather than through `HyprConfig::validate`. The DSN field only exists in
+    // a `postgres-ledger` build; without it there is no durable backend to
+    // name, and production validation correctly refuses.
+    #[cfg(feature = "postgres-ledger")]
+    let production_dsn = config.ledger_postgres_url.as_deref();
+    #[cfg(not(feature = "postgres-ledger"))]
+    let production_dsn: Option<&str> = None;
+    lcfg.validate_for_production(production_dsn)?;
+
     // Cell identity = did:key over the service Ed25519 key.
     let ed_sk = ctx.service_signing_key("ledger");
     let ed_vk = ed_sk.verifying_key();
@@ -556,6 +567,12 @@ fn create_ledger_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
     // PQ (ML-DSA-65) key under the Hybrid policy. Fail-closed construction:
     // `require_pq_signatures` set with no key available ⇒ refuse to start the
     // ledger service rather than silently downgrade checkpoints to Classical.
+    // The mint verifier is derived from the SAME key material as the checkpoint
+    // signer, because the actor signs issuance authorizations with that signer.
+    // Building both here keeps the two halves of the seal in lockstep — a
+    // verifier configured more permissively than the signer would re-open the
+    // hole the seal exists to close.
+    let mut mint_pq_vk: Option<std::sync::Arc<hyprstream_crypto::pq::MlDsaVerifyingKey>> = None;
     let signer: Arc<dyn hyprstream_ledger::CheckpointSigner + Send + Sync> = if lcfg
         .require_pq_signatures
     {
@@ -565,11 +582,18 @@ fn create_ledger_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
             tokio::runtime::Handle::current().block_on(async { store.active_key().await })
         });
         match pq_key {
-            Some(k) => Arc::new(CoseCheckpointSigner::hybrid(
-                cell_identity.clone(),
-                ed_sk,
-                (*k).clone(),
-            )),
+            Some(k) => {
+                let vk_bytes = hyprstream_crypto::pq::ml_dsa_sk_to_vk_bytes(&k);
+                let vk = hyprstream_crypto::pq::ml_dsa_vk_from_bytes(&vk_bytes).map_err(|e| {
+                    anyhow::anyhow!("ledger: could not derive the ML-DSA-65 verifying key: {e}")
+                })?;
+                mint_pq_vk = Some(std::sync::Arc::new(vk));
+                Arc::new(CoseCheckpointSigner::hybrid(
+                    cell_identity.clone(),
+                    ed_sk,
+                    (*k).clone(),
+                ))
+            }
             None => anyhow::bail!(
                 "ledger: require_pq_signatures is set but no ML-DSA-65 key is available (fail-closed)"
             ),
@@ -580,6 +604,12 @@ fn create_ledger_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
             ed_sk,
         ))
     };
+
+    let mint_verifier = crate::services::ledger::CoseMintVerifier::new(
+        ed_vk,
+        mint_pq_vk.clone(),
+        lcfg.require_pq_signatures,
+    );
 
     // Backend selection (PAY-01 F8): BackendKind drives construction.
     // **Postgres = production (fail-closed on unavailability); Mem = dev/test.**
@@ -608,7 +638,7 @@ fn create_ledger_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
                     )
                 })?;
                 info!("Ledger backend: PostgresLedger (production durable)");
-                Box::new(pg)
+                Box::new(pg.with_mint_verifier(Box::new(mint_verifier)))
             }
             #[cfg(not(feature = "postgres-ledger"))]
             {
@@ -619,8 +649,18 @@ fn create_ledger_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
             }
         }
         crate::services::ledger::BackendKind::Mem => {
+            // A volatile backend cannot hold a money ledger. In production this
+            // is fatal rather than a warning: silently accounting into memory
+            // that vanishes on restart is worse than refusing to start.
+            if lcfg.is_production() {
+                anyhow::bail!(
+                    "ledger: backend = Mem is not permitted in production (FATAL — \
+                     all ledger state would be lost on restart). Set [ledger] backend = \"postgres\" \
+                     with a ledger_postgres_url, or unset the production mode to run dev/test."
+                );
+            }
             info!("Ledger backend: MemLedger (dev/test only — all state is volatile)");
-            Box::new(MemLedger::new(cell_identity.clone()))
+            Box::new(MemLedger::new(cell_identity.clone()).with_mint_verifier(Box::new(mint_verifier)))
         }
     };
 
