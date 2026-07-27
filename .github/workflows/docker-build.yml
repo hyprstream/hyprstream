@@ -346,35 +346,40 @@ jobs:
       run: |
         set -euo pipefail
         if [ "$GITHUB_REF" != "refs/heads/main" ]; then
-          echo "publish=true" >> "$GITHUB_OUTPUT"
+          echo "aliases=false" >> "$GITHUB_OUTPUT"
           exit 0
         fi
-        current_sha="$(
+        if ! current_sha="$(
           git ls-remote "https://github.com/${REPOSITORY}.git" refs/heads/main |
             awk 'NR == 1 { print $1 }'
-        )"
+        )"; then
+          echo "aliases=false" >> "$GITHUB_OUTPUT"
+          echo "::warning::could not resolve current main; publishing immutable index only"
+          exit 0
+        fi
         if [ "$current_sha" = "$EXPECTED_SHA" ]; then
-          echo "publish=true" >> "$GITHUB_OUTPUT"
+          echo "aliases=true" >> "$GITHUB_OUTPUT"
         else
-          echo "publish=false" >> "$GITHUB_OUTPUT"
+          echo "aliases=false" >> "$GITHUB_OUTPUT"
           echo "::notice::not moving canonical CPU tags: ${EXPECTED_SHA} is stale; main is ${current_sha}"
         fi
 
     - name: Extract CPU manifest tags
       id: meta
-      if: steps.freshness.outputs.publish == 'true'
       uses: docker/metadata-action@v5
       with:
         images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
         tags: |
+          # Every validated build gets an immutable, revision-qualified index.
+          type=raw,value=sha-${{ github.sha }},suffix=-cpu
           type=semver,pattern={{version}},suffix=-cpu
           type=semver,pattern={{major}}.{{minor}},suffix=-cpu
-          type=raw,value=edge,suffix=-cpu,enable=${{ github.ref == 'refs/heads/main' }}
-          type=raw,value=latest,suffix=-cpu,enable=${{ github.ref == 'refs/heads/main' }}
+          # Only the current main revision may move canonical aliases.
+          type=raw,value=edge,suffix=-cpu,enable=${{ github.ref == 'refs/heads/main' && steps.freshness.outputs.aliases == 'true' }}
+          type=raw,value=latest,suffix=-cpu,enable=${{ github.ref == 'refs/heads/main' && steps.freshness.outputs.aliases == 'true' }}
 
     - name: Publish multi-arch CPU manifests
       id: publish
-      if: steps.freshness.outputs.publish == 'true'
       env:
         TAGS: ${{ steps.meta.outputs.tags }}
         IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
@@ -383,15 +388,16 @@ jobs:
         set -euo pipefail
         while IFS= read -r tag; do
           [ -n "$tag" ] || continue
+          metadata="$(mktemp)"
           docker buildx imagetools create \
+            --metadata-file "$metadata" \
             --tag "$tag" \
             "${IMAGE}:sha-${REVISION}-cpu-amd64" \
             "${IMAGE}:sha-${REVISION}-cpu-arm64"
           docker buildx imagetools inspect "$tag"
-          raw_manifest="$(mktemp)"
-          docker buildx imagetools inspect "$tag" --raw > "$raw_manifest"
-          digest="sha256:$(sha256sum "$raw_manifest" | awk '{ print $1 }')"
-          rm -f "$raw_manifest"
+          digest="$(jq -er '."containerimage.descriptor".digest' "$metadata")"
+          rm -f "$metadata"
+          docker buildx imagetools inspect "${IMAGE}@${digest}"
           echo "${tag}@${digest}" | tee -a "$GITHUB_STEP_SUMMARY"
           echo "digest=${digest}" >> "$GITHUB_OUTPUT"
         done <<< "$TAGS"
