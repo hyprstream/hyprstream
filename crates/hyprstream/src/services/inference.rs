@@ -3057,22 +3057,22 @@ async fn serve_inference_bridged(
     let actual_addr = wt_server.local_addr().map_err(|e| {
         hyprstream_rpc::error::RpcError::SpawnFailed(format!("QUIC local_addr: {e}"))
     })?;
-    let advertise_addr = if let Some(advertise_addr) = quic_advertise_addr {
-        advertise_addr
-    } else if actual_addr.ip().is_unspecified() {
-        match actual_addr {
-            std::net::SocketAddr::V4(_) => std::net::SocketAddr::from((
-                std::net::Ipv4Addr::LOCALHOST,
-                actual_addr.port(),
-            )),
-            std::net::SocketAddr::V6(_) => std::net::SocketAddr::from((
-                std::net::Ipv6Addr::LOCALHOST,
-                actual_addr.port(),
-            )),
-        }
-    } else {
-        actual_addr
-    };
+    let advertise_addr = quic_advertise_addr.ok_or_else(|| {
+        hyprstream_rpc::error::RpcError::SpawnFailed(
+            "standalone inference requires an explicit routable QUIC advertise address"
+                .to_owned(),
+        )
+    })?;
+    if advertise_addr.ip().is_unspecified()
+        || advertise_addr.ip().is_loopback()
+        || advertise_addr.port() == 0
+        || advertise_addr.port() != actual_addr.port()
+    {
+        return Err(hyprstream_rpc::error::RpcError::SpawnFailed(format!(
+            "standalone inference advertise address {advertise_addr} is not routable or does not match bound QUIC port {}",
+            actual_addr.port()
+        )));
+    }
     let pin =
         hyprstream_rpc::transport::quinn_transport::cert_sha256(&qc.cert_chain[0]);
     let origin = moq_origin
