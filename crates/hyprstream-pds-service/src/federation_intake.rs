@@ -105,14 +105,81 @@ pub struct InventoryEntry {
 
 impl InventoryEntry {
     fn federated(did: String, document: &Value) -> Result<Self> {
-        ensure_real_identity_did(&did)?;
-        Ok(Self {
+        Self::indexed_federated(
             did,
-            handle: extract_handle(document)?,
+            extract_handle(document)?,
+            extract_pds_endpoint(document)?,
+        )
+    }
+
+    /// Build a local projection from an authority-owned hosted-account source.
+    ///
+    /// This constructor validates the invariant at the read-model boundary:
+    /// only a local entry may carry a tenant, and a local entry must carry one.
+    pub fn local(
+        did: impl Into<String>,
+        handle: Option<String>,
+        tenant: impl Into<String>,
+        pds_endpoint: Option<String>,
+    ) -> Result<Self> {
+        let entry = Self {
+            did: did.into(),
+            handle,
+            kind: InventoryKind::Local,
+            tenant: Some(tenant.into()),
+            pds_endpoint,
+        };
+        entry.validate()?;
+        Ok(entry)
+    }
+
+    /// Build a foreign projection from already-resolved federation intake.
+    pub fn indexed_federated(
+        did: impl Into<String>,
+        handle: Option<String>,
+        pds_endpoint: Option<String>,
+    ) -> Result<Self> {
+        let entry = Self {
+            did: did.into(),
+            handle,
             kind: InventoryKind::Federated,
             tenant: None,
-            pds_endpoint: extract_pds_endpoint(document)?,
-        })
+            pds_endpoint,
+        };
+        entry.validate()?;
+        Ok(entry)
+    }
+
+    /// Revalidate a projection before a derived store accepts it.
+    pub fn validate(&self) -> Result<()> {
+        ensure_real_identity_did(&self.did)?;
+        ensure!(!self.did.is_empty(), "inventory DID must not be empty");
+        ensure!(
+            self.handle.as_deref().is_none_or(|value| !value.is_empty()),
+            "inventory handle must not be empty"
+        );
+        ensure!(
+            self.pds_endpoint
+                .as_deref()
+                .is_none_or(|value| !value.is_empty()),
+            "inventory PDS endpoint must not be empty"
+        );
+        match self.kind {
+            InventoryKind::Local => ensure!(
+                self.tenant
+                    .as_deref()
+                    .is_some_and(|value| !value.is_empty()),
+                "local inventory entry requires an authority-resolved tenant"
+            ),
+            InventoryKind::Federated => ensure!(
+                self.tenant.is_none(),
+                "only a local inventory entry may carry a tenant"
+            ),
+            InventoryKind::Unauthenticated => {
+                bail!("the unauthenticated floor is not a listable inventory host")
+            }
+        }
+        Ok(())
     }
 
     /// The indexed DID.
@@ -228,25 +295,56 @@ struct StoredInventoryEntry {
 ///
 /// A pglite/Postgres implementation can replace the in-memory implementation
 /// without changing resolution or tenant-safety logic.
+#[async_trait]
 pub trait IdentityInventoryReadModel: Send + Sync {
-    /// Insert or refresh one derived foreign-identity projection.
+    /// Insert or refresh one derived projection and its trusted object label.
     ///
-    /// Implementations must reject [`UNAUTHENTICATED_DID_SENTINEL`].
-    fn upsert_federated(&self, identity: InventoryEntry) -> Result<()>;
+    /// The projection must already come from federation intake or an
+    /// authority-owned hosted-account source. Implementations must revalidate
+    /// tenant/kind invariants and reject [`UNAUTHENTICATED_DID_SENTINEL`].
+    async fn upsert_derived(&self, identity: InventoryEntry, label: SecurityLabel) -> Result<()>;
 
-    /// List only entries dominated by the viewer's verified clearance.
+    /// Query only entries dominated by the viewer's verified clearance.
     ///
     /// Filtering happens inside the read model before any response is built.
     /// The return shape intentionally has no total/hidden-count field: callers
     /// can observe only this post-filter vector's length. Implementations must
     /// never return [`UNAUTHENTICATED_DID_SENTINEL`] as a real host.
-    fn list(&self, viewer: &SecurityContext) -> Result<Vec<InventoryEntry>>;
+    async fn query(
+        &self,
+        viewer: &SecurityContext,
+        filter: Option<&str>,
+    ) -> Result<Vec<InventoryEntry>> {
+        self.query_page(viewer, filter, None, 200).await
+    }
+
+    /// Query one deterministic, post-clearance page.
+    ///
+    /// `after` is an exclusive DID cursor over the stable DID ordering. The
+    /// caller must enforce a finite `limit`; implementations apply it after
+    /// clearance and filter predicates and never compute a pre-filter total.
+    async fn query_page(
+        &self,
+        viewer: &SecurityContext,
+        filter: Option<&str>,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<InventoryEntry>>;
+
+    /// List all entries visible to this viewer.
+    async fn list(&self, viewer: &SecurityContext) -> Result<Vec<InventoryEntry>> {
+        self.query(viewer, None).await
+    }
 
     /// Fetch one entry without revealing whether a filtered object exists.
     ///
     /// `None` means absent, no caller clearance, or above caller clearance.
     /// Wire adapters must map every `None` case to the same 404-style result.
-    fn get(&self, viewer: Option<&SecurityContext>, did: &str) -> Result<Option<InventoryEntry>>;
+    async fn get(
+        &self,
+        viewer: Option<&SecurityContext>,
+        did: &str,
+    ) -> Result<Option<InventoryEntry>>;
 }
 
 /// Thin in-memory inventory read model, useful for embedded/demo deployments.
@@ -255,37 +353,51 @@ pub struct InMemoryIdentityInventory {
     identities: RwLock<BTreeMap<String, StoredInventoryEntry>>,
 }
 
+#[async_trait]
 impl IdentityInventoryReadModel for InMemoryIdentityInventory {
-    fn upsert_federated(&self, identity: InventoryEntry) -> Result<()> {
-        ensure_real_identity_did(identity.did())?;
-        ensure!(
-            identity.kind == InventoryKind::Federated && identity.tenant.is_none(),
-            "federation intake inventory entry must be federated with no local tenant"
-        );
+    async fn upsert_derived(&self, identity: InventoryEntry, label: SecurityLabel) -> Result<()> {
+        identity.validate()?;
         let mut identities = self.identities.write();
+        if let Some(existing) = identities.get(identity.did()) {
+            ensure_safe_refresh(existing, &identity, &label)?;
+        }
         identities.insert(
             identity.did.clone(),
             StoredInventoryEntry {
                 entry: identity,
-                label: SecurityLabel::bottom(),
+                label,
             },
         );
         Ok(())
     }
 
-    fn list(&self, viewer: &SecurityContext) -> Result<Vec<InventoryEntry>> {
+    async fn query_page(
+        &self,
+        viewer: &SecurityContext,
+        filter: Option<&str>,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<InventoryEntry>> {
+        ensure!(limit > 0, "inventory page limit must be positive");
         let identities = self.identities.read();
         Ok(identities
             .values()
             .filter(|stored| {
                 stored.entry.did() != UNAUTHENTICATED_DID_SENTINEL
                     && viewer.can_access(&stored.label)
+                    && filter.is_none_or(|filter| matches_filter(&stored.entry, filter))
+                    && after.is_none_or(|after| stored.entry.did() > after)
             })
             .map(|stored| stored.entry.clone())
+            .take(limit)
             .collect())
     }
 
-    fn get(&self, viewer: Option<&SecurityContext>, did: &str) -> Result<Option<InventoryEntry>> {
+    async fn get(
+        &self,
+        viewer: Option<&SecurityContext>,
+        did: &str,
+    ) -> Result<Option<InventoryEntry>> {
         if did == UNAUTHENTICATED_DID_SENTINEL {
             return Ok(None);
         }
@@ -295,6 +407,29 @@ impl IdentityInventoryReadModel for InMemoryIdentityInventory {
             .filter(|stored| viewer.is_some_and(|clearance| clearance.can_access(&stored.label)))
             .map(|stored| stored.entry.clone()))
     }
+}
+
+fn ensure_safe_refresh(
+    existing: &StoredInventoryEntry,
+    incoming: &InventoryEntry,
+    incoming_label: &SecurityLabel,
+) -> Result<()> {
+    ensure!(
+        existing.entry.kind == incoming.kind,
+        "inventory refresh cannot change authority kind for {}",
+        incoming.did()
+    );
+    ensure!(
+        existing.entry.tenant == incoming.tenant,
+        "inventory refresh cannot change authority-resolved tenant for {}",
+        incoming.did()
+    );
+    ensure!(
+        incoming_label.can_access(&existing.label),
+        "inventory refresh cannot lower the security label for {}",
+        incoming.did()
+    );
+    Ok(())
 }
 
 /// Resolve and project foreign identities without granting local authority.
@@ -357,7 +492,7 @@ impl FederationIntake {
         did: &str,
         viewer: Option<&SecurityContext>,
     ) -> Result<ResolvedDiscovery> {
-        if self.inventory.get(viewer, did)?.is_none() {
+        if self.inventory.get(viewer, did).await?.is_none() {
             return Err(IdentityDirectoryReadError::NotFound.into());
         }
         let document = self.resolver.resolve_federated_document(did).await?;
@@ -368,9 +503,35 @@ impl FederationIntake {
         ensure_real_identity_did(did)?;
         let document = self.resolver.resolve_federated_document(did).await?;
         let identity = InventoryEntry::federated(did.to_owned(), &document)?;
-        self.inventory.upsert_federated(identity.clone())?;
+        self.inventory
+            .upsert_derived(identity.clone(), SecurityLabel::bottom())
+            .await?;
         Ok(identity)
     }
+}
+
+fn matches_filter(entry: &InventoryEntry, filter: &str) -> bool {
+    let filter = filter.trim().to_lowercase();
+    filter.is_empty()
+        || entry.did.to_lowercase().contains(&filter)
+        || entry
+            .handle
+            .as_deref()
+            .is_some_and(|value| value.to_lowercase().contains(&filter))
+        || entry
+            .tenant
+            .as_deref()
+            .is_some_and(|value| value.to_lowercase().contains(&filter))
+        || entry
+            .pds_endpoint
+            .as_deref()
+            .is_some_and(|value| value.to_lowercase().contains(&filter))
+        || match entry.kind {
+            InventoryKind::Local => "local",
+            InventoryKind::Federated => "federated",
+            InventoryKind::Unauthenticated => "unauthenticated",
+        }
+        .contains(&filter)
 }
 
 fn extract_handle(document: &Value) -> Result<Option<String>> {
@@ -520,7 +681,7 @@ mod tests {
         assert_eq!(resolved.tenant(), None);
         assert_eq!(resolved.pds_endpoint(), Some("https://pds.alice.example"));
 
-        let listed = inventory.list(&unauthenticated_viewer()).unwrap();
+        let listed = inventory.list(&unauthenticated_viewer()).await.unwrap();
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].did(), FEDERATED_DID);
         assert_eq!(listed[0].tenant(), None);
@@ -588,7 +749,7 @@ mod tests {
         assert_eq!(resolved.did(), FEDERATED_WEB_DID);
         assert_eq!(resolved.tenant(), None);
         assert_eq!(
-            inventory.list(&unauthenticated_viewer()).unwrap(),
+            inventory.list(&unauthenticated_viewer()).await.unwrap(),
             vec![resolved]
         );
         let viewer = unauthenticated_viewer();
@@ -604,36 +765,28 @@ mod tests {
         assert!(projected.get("certHashes").is_none());
     }
 
-    #[test]
-    fn inventory_listing_prefilters_above_clearance_without_a_hidden_count() {
+    #[tokio::test]
+    async fn inventory_listing_prefilters_above_clearance_without_a_hidden_count() {
         let inventory = InMemoryIdentityInventory::default();
-        let public = InventoryEntry {
-            did: "did:web:public.example".to_owned(),
-            handle: None,
-            kind: InventoryKind::Federated,
-            tenant: None,
-            pds_endpoint: None,
-        };
-        inventory.upsert_federated(public.clone()).unwrap();
-        inventory.identities.write().insert(
-            "did:web:hidden.example".to_owned(),
-            StoredInventoryEntry {
-                entry: InventoryEntry {
-                    did: "did:web:hidden.example".to_owned(),
-                    handle: None,
-                    kind: InventoryKind::Federated,
-                    tenant: None,
-                    pds_endpoint: None,
-                },
-                label: SecurityLabel::new(
+        let public =
+            InventoryEntry::indexed_federated("did:web:public.example", None, None).unwrap();
+        inventory
+            .upsert_derived(public.clone(), SecurityLabel::bottom())
+            .await
+            .unwrap();
+        inventory
+            .upsert_derived(
+                InventoryEntry::indexed_federated("did:web:hidden.example", None, None).unwrap(),
+                SecurityLabel::new(
                     Level::Secret,
                     hyprstream_rpc::auth::mac::Assurance::Unverified,
                     CompartmentSet::EMPTY,
                 ),
-            },
-        );
+            )
+            .await
+            .unwrap();
 
-        let visible = inventory.list(&unauthenticated_viewer()).unwrap();
+        let visible = inventory.list(&unauthenticated_viewer()).await.unwrap();
         assert_eq!(visible, vec![public]);
         assert_eq!(visible.len(), 1, "only the post-filter count is observable");
     }
@@ -671,9 +824,15 @@ mod tests {
         );
         let viewer = unauthenticated_viewer();
 
-        assert_eq!(inventory.get(Some(&viewer), HIDDEN_DID).unwrap(), None);
-        assert_eq!(inventory.get(Some(&viewer), MISSING_DID).unwrap(), None);
-        assert_eq!(inventory.get(None, HIDDEN_DID).unwrap(), None);
+        assert_eq!(
+            inventory.get(Some(&viewer), HIDDEN_DID).await.unwrap(),
+            None
+        );
+        assert_eq!(
+            inventory.get(Some(&viewer), MISSING_DID).await.unwrap(),
+            None
+        );
+        assert_eq!(inventory.get(None, HIDDEN_DID).await.unwrap(), None);
 
         for did in [HIDDEN_DID, MISSING_DID] {
             let error = intake.resolve(did, Some(&viewer)).await.unwrap_err();
@@ -683,6 +842,66 @@ mod tests {
                 "direct access to {did} must be 404-style, never forbidden: {error:#}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn federated_intake_cannot_demote_or_declassify_a_local_projection() {
+        let inventory = Arc::new(InMemoryIdentityInventory::default());
+        let local = InventoryEntry::local(
+            FEDERATED_WEB_DID,
+            Some("local.example".to_owned()),
+            "tenant-authority",
+            Some("https://local-pds.example".to_owned()),
+        )
+        .unwrap();
+        inventory
+            .upsert_derived(
+                local.clone(),
+                SecurityLabel::new(
+                    Level::Secret,
+                    hyprstream_rpc::auth::mac::Assurance::PqHybrid,
+                    CompartmentSet::single(3),
+                ),
+            )
+            .await
+            .unwrap();
+        let intake = FederationIntake::new(
+            Arc::new(FederatedDidResolver::new(
+                Arc::new(NeverResolver),
+                Arc::new(FixtureResolver {
+                    expected_did: FEDERATED_WEB_DID,
+                    document: serde_json::json!({
+                        "id": FEDERATED_WEB_DID,
+                        "alsoKnownAs": ["at://foreign.example"],
+                    }),
+                }),
+            )),
+            inventory.clone(),
+            Vec::new(),
+        );
+
+        let error = intake.intake(FEDERATED_WEB_DID).await.unwrap_err();
+        assert!(error.to_string().contains("cannot change authority kind"));
+        assert!(
+            inventory
+                .list(&unauthenticated_viewer())
+                .await
+                .unwrap()
+                .is_empty(),
+            "rejected federation refresh must not declassify the local row"
+        );
+        let privileged = SecurityContext::new(
+            Level::Secret,
+            CompartmentSet::single(3),
+            VerifiedKeyMaterial::PqHybrid,
+        );
+        assert_eq!(
+            inventory
+                .get(Some(&privileged), FEDERATED_WEB_DID)
+                .await
+                .unwrap(),
+            Some(local)
+        );
     }
 
     #[tokio::test]
@@ -704,6 +923,7 @@ mod tests {
         );
         assert!(inventory
             .list(&unauthenticated_viewer())
+            .await
             .unwrap()
             .is_empty());
         let error = intake
@@ -734,6 +954,7 @@ mod tests {
         assert!(
             inventory
                 .list(&unauthenticated_viewer())
+                .await
                 .unwrap()
                 .is_empty(),
             "legacy/corrupt sentinel rows must be filtered from inventory listing"
@@ -763,6 +984,7 @@ mod tests {
         assert!(error.to_string().contains("foreign issuer"));
         assert!(inventory
             .list(&unauthenticated_viewer())
+            .await
             .unwrap()
             .is_empty());
     }

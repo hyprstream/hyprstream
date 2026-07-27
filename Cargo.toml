@@ -27,6 +27,7 @@ members = [
     "crates/hyprstream-9p",
     "crates/hyprstream-pds",
     "crates/hyprstream-pds-service",
+    "crates/hyprstream-appview",
     "crates/hyprstream-workers-wasmtime",
     "crates/hyprstream-workers-python",
     "crates/hyprstream-k8s",
@@ -114,6 +115,7 @@ cas_types = { git = "https://github.com/huggingface/xet-core", tag = "git-xet-v0
 chunk_cache = { git = "https://github.com/huggingface/xet-core", tag = "git-xet-v0.2.0" }
 merklehash = { git = "https://github.com/huggingface/xet-core", tag = "git-xet-v0.2.0" }
 async-trait = "0.1"
+pglite-rs = { version = "=0.2.7", default-features = false }
 
 # Optional hyprstream-p2p (formerly gittorrent) transport support
 hyprstream-p2p = { path = "crates/hyprstream-p2p" }
