@@ -2,25 +2,25 @@
 -- Dedicated database per PAY-00 #6 (isolated from the identity store).
 -- All CREATE TABLE IF NOT EXISTS — idempotent on every startup.
 --
--- Amounts are stored as BYTEA (16-byte big-endian u128) because
--- tokio-postgres has no native i128 support.
+-- All 128-bit identifiers (AccountId, TransferId) and amounts (u128) are stored
+-- as strict 16-byte BYTEA. tokio-postgres has no native i128, and BIGINT would
+-- truncate/flip-sign u128 values.
 
 CREATE TABLE IF NOT EXISTS ledger_journal (
     seq         BIGSERIAL PRIMARY KEY,
-    prev_hash   BYTEA NOT NULL DEFAULT '\x00',
+    prev_hash   BYTEA NOT NULL,     -- 32 bytes (blake3)
     ts          BIGINT NOT NULL,
     op_cbor     BYTEA NOT NULL,
-    result_ok   BOOLEAN NOT NULL,
-    result_cbor BYTEA NOT NULL,
-    head_hash   BYTEA NOT NULL
+    result_cbor BYTEA NOT NULL,    -- CBOR of PersistedResult (see postgres.rs)
+    head_hash   BYTEA NOT NULL     -- 32 bytes (blake3)
 );
 
 CREATE TABLE IF NOT EXISTS ledger_accounts (
-    id               BIGINT PRIMARY KEY,
+    id               BYTEA PRIMARY KEY,   -- 16 bytes (u128 big-endian)
     unit_issuer      TEXT NOT NULL,
     unit_resource    TEXT NOT NULL,
     purpose_cbor     BYTEA NOT NULL,
-    debits_pending   BYTEA NOT NULL,
+    debits_pending   BYTEA NOT NULL,      -- 16 bytes (u128)
     debits_posted    BYTEA NOT NULL,
     credits_pending  BYTEA NOT NULL,
     credits_posted   BYTEA NOT NULL,
@@ -28,23 +28,22 @@ CREATE TABLE IF NOT EXISTS ledger_accounts (
 );
 
 CREATE TABLE IF NOT EXISTS ledger_pending (
-    transfer_id   BIGINT PRIMARY KEY,
+    transfer_id   BYTEA PRIMARY KEY,      -- 16 bytes (u128)
     transfer_cbor BYTEA NOT NULL,
     deadline      BIGINT NOT NULL,
     state         SMALLINT NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS ledger_outcomes (
-    transfer_id  BIGINT PRIMARY KEY,
-    result_ok    BOOLEAN NOT NULL,
-    result_cbor  BYTEA NOT NULL,
+    transfer_id  BYTEA PRIMARY KEY,      -- 16 bytes (u128)
+    result_cbor  BYTEA NOT NULL,         -- same PersistedResult encoding as journal
     seq          BIGINT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS ledger_outbox (
     seq          BIGSERIAL PRIMARY KEY,
     kind         SMALLINT NOT NULL,
-    transfer_id  BIGINT,
+    transfer_id  BYTEA,                  -- nullable (NULL for checkpoints)
     journal_seq  BIGINT NOT NULL,
     emitted      BOOLEAN NOT NULL DEFAULT FALSE
 );

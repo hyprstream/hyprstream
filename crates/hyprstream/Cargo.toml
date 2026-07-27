@@ -58,6 +58,7 @@ hyprstream-discovery = { path = "../hyprstream-discovery" }  # Service discovery
 hyprstream-pds = { path = "../hyprstream-pds" }  # atproto PDS record store: DAG-CBOR + MST + signed commit + CAR proof (#392/#431)
 hyprstream-pds-service = { path = "../hyprstream-pds-service" }  # authority-owned hosted-account tenant lookup
 hyprstream-ledger = { path = "../hyprstream-ledger", optional = true }  # Cellular credit ledger accounting plane (#923); the Phase-1 local-enforcer service (#925) lands behind the `ledger` feature, default off
+hyprstream-pay = { path = "../hyprstream-pay", optional = true }  # MIT settlement/tariff protocol surface (#1399)
 hyprstream-crypto = { path = "../hyprstream-crypto" }  # COSE composite (EdDSA + ML-DSA-65) sign/verify — used by the ledger checkpoint signer (#925)
 hyprstream-service = { path = "../hyprstream-service" }  # Service orchestration
 hyprstream-rpc-derive = { path = "../hyprstream-rpc-derive" }  # RPC code generation proc macros
@@ -252,6 +253,11 @@ pq-hybrid = []  # NO-OP alias: PQ primitives always compiled; Classical/Hybrid s
 # and the 1.9 suites pass. MemLedger is the Phase-1 backend; RocksLedger (item
 # 1.2) lands separately.
 ledger = ["dep:hyprstream-ledger"]
+# Production durable Postgres backend for the ledger (PAY-01 #1389).
+# Enables hyprstream-ledger/postgres + hyprstream-pay (#1399 seam crate).
+postgres-ledger = ["ledger", "hyprstream-ledger/postgres", "dep:hyprstream-pay"]
+# Settlement/tariff service + MIT seam crate (#1399). Implies ledger.
+pay = ["ledger", "dep:hyprstream-pay"]
 
 [build-dependencies]
 capnpc.workspace = true  # Cap'n Proto schema compiler

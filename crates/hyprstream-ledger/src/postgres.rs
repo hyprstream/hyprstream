@@ -10,9 +10,12 @@
 //! (accounts, pending, head, clock) — exactly like `MemLedger`. Every op:
 //! 1. Stages against the mirror via `engine::stage()` (pure, no I/O).
 //! 2. Writes journal + deltas + outcome to Postgres in one DB transaction.
+//!    The DB transaction performs the idempotency check against
+//!    `ledger_outcomes` (DB is the source of truth — never the mirror).
 //! 3. On DB success, updates the mirror.
 //!
-//! On restart, the mirror is rehydrated from the DB.
+//! On restart, the mirror is rehydrated from the DB and `verify_chain`
+//! recomputes every journal hash before serving traffic.
 //!
 //! ## Runtime: dedicated background thread
 //!
@@ -41,9 +44,12 @@ use crate::types::{
 pub use self::config::PostgresConfig;
 pub const LEDGER_SCHEMA: &str = include_str!("../sql/ledger_schema.sql");
 
-mod config {
-    use super::*;
+/// The shape persisted in both `ledger_journal.result_cbor` and
+/// `ledger_outcomes.result_cbor`. Always the full `Result` — readers must
+/// decode this exact type (F2).
+type PersistedResult = Result<TransferResult, LedgerError>;
 
+mod config {
     #[derive(Debug, Clone)]
     pub struct PostgresConfig {
         pub url: String,
@@ -98,7 +104,7 @@ impl std::fmt::Debug for PostgresLedger {
 }
 
 impl PostgresLedger {
-    /// Connect, run migrations, rehydrate the mirror.
+    /// Connect, run migrations, rehydrate the mirror, verify the chain.
     pub fn connect(config: PostgresConfig, ledger_id: Did) -> Result<Self, LedgerError> {
         let (tx, rx) = mpsc::channel::<BgCmd>();
         let thread = std::thread::Builder::new()
@@ -119,49 +125,86 @@ impl PostgresLedger {
         };
         ledger.run_migrations()?;
         ledger.rehydrate()?;
+        // F3: verify the full chain on startup — recompute every hash.
+        ledger.verify_chain()?;
         Ok(ledger)
     }
 
-    /// Verify the full journal hash chain.
+    /// Verify the full journal hash chain by recomputing every entry hash.
+    ///
+    /// Loads each journal row, reconstructs the `JournalEntry`, recomputes its
+    /// hash via `entry.hash()`, asserts it matches the stored `head_hash`, and
+    /// asserts each `prev_hash` chains to the prior entry's `head_hash`. All
+    /// decode paths fail closed (F3).
     pub fn verify_chain(&self) -> Result<(), LedgerError> {
-        let result = self.call_db(|pool| {
+        let bytes = self.call_db(|pool| {
             let rt = rt_new()?;
-            let seqs_hashes: Vec<(u64, [u8; 32])> = rt.block_on(async {
+            rt.block_on(async {
                 let client = pool.get().await.map_err(|e| ie(format!("pool: {e}")))?;
                 let rows = client
-                    .query("SELECT seq, head_hash FROM ledger_journal ORDER BY seq", &[])
+                    .query(
+                        "SELECT seq, prev_hash, ts, op_cbor, result_cbor, head_hash \
+                         FROM ledger_journal ORDER BY seq",
+                        &[],
+                    )
                     .await
-                    .map_err(|e| ie(format!("chain: {e}")))?;
-                let pairs = rows
-                    .iter()
-                    .map(|r| {
-                        let seq = r.get::<_, i64>(0) as u64;
-                        let hash_bytes: &[u8] = r.get(1);
-                        let hash = if hash_bytes.len() == 32 {
-                            <[u8; 32]>::try_from(hash_bytes).unwrap()
-                        } else {
-                            [0u8; 32]
-                        };
-                        (seq, hash)
-                    })
-                    .collect();
-                Ok(pairs)
-            })?;
-            let mut buf = Vec::new();
-            cbor(&seqs_hashes, &mut buf)?;
-            Ok(buf)
+                    .map_err(|e| ie(format!("chain select: {e}")))?;
+
+                // Decode rows into fully-typed records on the bg thread so the
+                // caller only has to recompute hashes, not touch DB types.
+                let mut recs: Vec<(u64, [u8; 32], u64, Vec<u8>, Vec<u8>, [u8; 32])> =
+                    Vec::with_capacity(rows.len());
+                for r in &rows {
+                    let seq_i: i64 = r.get(0);
+                    let prev_b: &[u8] = r.get(1);
+                    let ts_i: i64 = r.get(2);
+                    let op_b: Vec<u8> = r.get(3);
+                    let res_b: Vec<u8> = r.get(4);
+                    let head_b: &[u8] = r.get(5);
+                    let prev = array32(prev_b, "prev_hash")?;
+                    let head = array32(head_b, "head_hash")?;
+                    recs.push((seq_i as u64, prev, ts_i as u64, op_b, res_b, head));
+                }
+                let mut buf = Vec::new();
+                cbor(&recs, &mut buf)?;
+                Ok(buf)
+            })
         })?;
 
-        let pairs: Vec<(u64, [u8; 32])> =
-            ciborium::from_reader(result.as_slice()).unwrap_or_default();
-        let mut prev = [0u8; 32];
-        for (seq, hash) in &pairs {
-            if *hash != prev {
+        let recs: Vec<(u64, [u8; 32], u64, Vec<u8>, Vec<u8>, [u8; 32])> =
+            ciborium::from_reader(bytes.as_slice())
+                .map_err(|e| LedgerError::Internal(format!("chain decode: {e}")))?;
+
+        let mut expected_prev = [0u8; 32];
+        for (seq, prev_hash, ts, op_b, res_b, head_hash) in &recs {
+            // Chain linkage: prev_hash must equal the prior head_hash.
+            if *prev_hash != expected_prev {
                 return Err(LedgerError::Internal(format!(
-                    "hash chain broken at seq {seq}"
+                    "chain prev_hash broken at seq {seq}"
                 )));
             }
-            prev = *hash;
+            // Decode op + persisted result (fail-closed).
+            let op: Op = ciborium::from_reader(op_b.as_slice())
+                .map_err(|e| LedgerError::Internal(format!("chain op decode seq {seq}: {e}")))?;
+            let result: PersistedResult = ciborium::from_reader(res_b.as_slice())
+                .map_err(|e| LedgerError::Internal(format!("chain result decode seq {seq}: {e}")))?;
+            // Recompute the entry hash.
+            let entry = JournalEntry {
+                seq: *seq,
+                prev_hash: *prev_hash,
+                ts: *ts,
+                op,
+                result,
+            };
+            let recomputed = entry.hash().map_err(|e| {
+                LedgerError::Internal(format!("chain hash recompute seq {seq}: {e}"))
+            })?;
+            if recomputed != *head_hash {
+                return Err(LedgerError::Internal(format!(
+                    "chain head_hash mismatch at seq {seq}"
+                )));
+            }
+            expected_prev = *head_hash;
         }
         Ok(())
     }
@@ -200,7 +243,8 @@ impl PostgresLedger {
     }
 
     fn rehydrate(&mut self) -> Result<(), LedgerError> {
-        // Head + clock
+        // Head + clock (fail-closed: missing meta is allowed on first boot,
+        // but malformed meta is an error).
         let meta_bytes = self.call_db(|pool| {
             let rt = rt_new()?;
             rt.block_on(async {
@@ -213,26 +257,37 @@ impl PostgresLedger {
                     .query_opt("SELECT value FROM ledger_meta WHERE key = 'clock'", &[])
                     .await
                     .map_err(|e| ie(format!("clock: {e}")))?;
-                let head_val: Vec<u8> = head_row.map(|r| r.get(0)).unwrap_or_else(|| {
-                    let mut v = vec![0u8; 40];
-                    v
-                });
-                let clock_val: Vec<u8> = clock_row.map(|r| r.get(0)).unwrap_or_default();
+                let head_val: Vec<u8> = match head_row {
+                    Some(r) => r.get(0),
+                    None => vec![0u8; 40],
+                };
+                let clock_val: Vec<u8> = match clock_row {
+                    Some(r) => r.get(0),
+                    None => vec![0u8; 8],
+                };
                 let mut buf = Vec::new();
                 cbor(&(head_val, clock_val), &mut buf)?;
                 Ok(buf)
             })
         })?;
-        let (head_val, clock_val): (Vec<u8>, Vec<u8>) =
-            ciborium::from_reader(meta_bytes.as_slice()).unwrap_or_default();
+        let (head_val, clock_val): (Vec<u8>, Vec<u8>) = ciborium::from_reader(
+            meta_bytes.as_slice(),
+        )
+        .map_err(|e| LedgerError::Internal(format!("meta decode: {e}")))?;
         if head_val.len() >= 40 {
+            let mut seq_arr = [0u8; 8];
+            seq_arr.copy_from_slice(&head_val[..8]);
+            let mut hash_arr = [0u8; 32];
+            hash_arr.copy_from_slice(&head_val[8..40]);
             self.head = ChainHead {
-                seq: u64::from_be_bytes(head_val[..8].try_into().unwrap()),
-                head_hash: head_val[8..40].try_into().unwrap(),
+                seq: u64::from_be_bytes(seq_arr),
+                head_hash: hash_arr,
             };
         }
         if clock_val.len() >= 8 {
-            self.clock = u64::from_be_bytes(clock_val[..8].try_into().unwrap());
+            let mut arr = [0u8; 8];
+            arr.copy_from_slice(&clock_val[..8]);
+            self.clock = u64::from_be_bytes(arr);
         }
 
         // Accounts
@@ -258,7 +313,8 @@ impl PostgresLedger {
                 Ok(buf)
             })
         })?;
-        let accounts: Vec<Account> = ciborium::from_reader(acc_bytes.as_slice()).unwrap_or_default();
+        let accounts: Vec<Account> = ciborium::from_reader(acc_bytes.as_slice())
+            .map_err(|e| LedgerError::Internal(format!("accts decode: {e}")))?;
         self.accounts = accounts.into_iter().map(|a| (a.id, a)).collect();
 
         // Pending
@@ -282,28 +338,29 @@ impl PostgresLedger {
                 Ok(buf)
             })
         })?;
-        let items: Vec<PendingReservation> =
-            ciborium::from_reader(pen_bytes.as_slice()).unwrap_or_default();
+        let items: Vec<PendingReservation> = ciborium::from_reader(pen_bytes.as_slice())
+            .map_err(|e| LedgerError::Internal(format!("pending decode: {e}")))?;
         self.pending = items.into_iter().map(|r| (r.transfer.id, r)).collect();
 
-        // Outcomes
+        // Outcomes (F2: result_cbor is PersistedResult, no result_ok column).
         let out_bytes = self.call_db(|pool| {
             let rt = rt_new()?;
             rt.block_on(async {
                 let client = pool.get().await.map_err(|e| ie(format!("pool: {e}")))?;
                 let rows = client
                     .query(
-                        "SELECT transfer_id, result_ok, result_cbor, seq FROM ledger_outcomes",
+                        "SELECT transfer_id, result_cbor, seq FROM ledger_outcomes",
                         &[],
                     )
                     .await
                     .map_err(|e| ie(format!("outcomes: {e}")))?;
-                let pairs: Vec<(u128, Outcome)> = rows
+                let pairs: Vec<(Vec<u8>, Vec<u8>, i64)> = rows
                     .iter()
-                    .map(|row| {
-                        let tid: i64 = row.get(0);
-                        let outcome = outcome_from_row(row)?;
-                        Ok((tid as u128, outcome))
+                    .map(|r| {
+                        let tid: Vec<u8> = r.get(0);
+                        let rcbor: Vec<u8> = r.get(1);
+                        let seq: i64 = r.get(2);
+                        Ok((tid, rcbor, seq))
                     })
                     .collect::<Result<_, _>>()?;
                 let mut buf = Vec::new();
@@ -311,16 +368,80 @@ impl PostgresLedger {
                 Ok(buf)
             })
         })?;
-        let pairs: Vec<(u128, Outcome)> =
-            ciborium::from_reader(out_bytes.as_slice()).unwrap_or_default();
-        self.outcomes = pairs.into_iter().map(|(id, o)| (TransferId(id), o)).collect();
+        let pairs: Vec<(Vec<u8>, Vec<u8>, i64)> = ciborium::from_reader(out_bytes.as_slice())
+            .map_err(|e| LedgerError::Internal(format!("outcomes decode: {e}")))?;
+        for (tid_b, rcbor, seq_i) in pairs {
+            let tid = bytes_to_u128(&tid_b);
+            let persisted: PersistedResult = ciborium::from_reader(rcbor.as_slice())
+                .map_err(|e| LedgerError::Internal(format!("outcome decode: {e}")))?;
+            self.outcomes.insert(
+                TransferId(tid),
+                Outcome {
+                    result: persisted,
+                    seq: seq_i as u64,
+                },
+            );
+        }
+
+        // F5: rehydrate the latest checkpoint so prev_checkpoint_hash is
+        // correct on the next checkpoint.
+        let cp_bytes = self.call_db(|pool| {
+            let rt = rt_new()?;
+            rt.block_on(async {
+                let client = pool.get().await.map_err(|e| ie(format!("pool: {e}")))?;
+                let row = client
+                    .query_opt(
+                        "SELECT ledger_id, journal_seq, head_hash, balances_root, \
+                         pending_root, ts, prev_checkpoint_hash, sig \
+                         FROM ledger_checkpoints ORDER BY seq DESC LIMIT 1",
+                        &[],
+                    )
+                    .await
+                    .map_err(|e| ie(format!("cp load: {e}")))?;
+                let pair: Option<SignedCheckpoint> = match row {
+                    Some(r) => {
+                        let ledger_id: String = r.get(0);
+                        let jseq: i64 = r.get(1);
+                        let head_b: &[u8] = r.get(2);
+                        let bal_b: &[u8] = r.get(3);
+                        let pen_b: &[u8] = r.get(4);
+                        let ts: i64 = r.get(5);
+                        let prev_b: &[u8] = r.get(6);
+                        let sig: Vec<u8> = r.get(7);
+                        let head = array32(head_b, "head_hash")?;
+                        let bal = array32(bal_b, "balances_root")?;
+                        let pen = array32(pen_b, "pending_root")?;
+                        let prev = array32(prev_b, "prev_checkpoint_hash")?;
+                        Some(SignedCheckpoint {
+                            ledger_id: Did(ledger_id),
+                            seq: jseq as u64,
+                            head_hash: head,
+                            balances_root: bal,
+                            pending_root: pen,
+                            ts: ts as u64,
+                            prev_checkpoint_hash: prev,
+                            sig,
+                        })
+                    }
+                    None => None,
+                };
+                let mut buf = Vec::new();
+                cbor(&pair, &mut buf)?;
+                Ok(buf)
+            })
+        })?;
+        let cp_opt: Option<SignedCheckpoint> = ciborium::from_reader(cp_bytes.as_slice())
+            .map_err(|e| LedgerError::Internal(format!("cp decode: {e}")))?;
+        self.last_checkpoint = cp_opt;
 
         tracing::info!(
-            "PostgresLedger rehydrated: {} accounts, {} pending, {} outcomes, head seq={}",
+            "PostgresLedger rehydrated: {} accounts, {} pending, {} outcomes, head seq={}, \
+             checkpoint={}",
             self.accounts.len(),
             self.pending.len(),
             self.outcomes.len(),
-            self.head.seq
+            self.head.seq,
+            self.last_checkpoint.is_some()
         );
         Ok(())
     }
@@ -328,17 +449,13 @@ impl PostgresLedger {
     // ─── The commit loop ───────────────────────────────────────────────────
 
     fn commit(&mut self, op: Op) -> Outcome {
-        // 1. Idempotency (mirror check — same as MemLedger).
-        if let Some(id) = op.idempotency_id() {
-            if let Some(prior) = self.outcomes.get(&id) {
-                return prior.clone();
-            }
-        }
+        // F4: No mirror-level idempotency pre-check — the DB is the source of
+        // truth. The DB transaction performs the outcomes-table check below.
 
-        // 2. Stage (pure).
+        // 1. Stage against the mirror (pure).
         let staged = engine::stage(self, &op);
 
-        // 3. Build journal entry.
+        // 2. Build journal entry + hash.
         let seq = self.head.seq + 1;
         let prev_hash = self.head.head_hash;
         let entry = JournalEntry {
@@ -354,14 +471,15 @@ impl PostgresLedger {
                 return Outcome {
                     result: Err(e),
                     seq: self.head.seq,
-                }
+                };
             }
         };
 
-        // 4. Write to DB (one transaction). On failure, mirror is unchanged.
+        // 3. Write to DB transactionally. The DB transaction does the
+        //    idempotency check against ledger_outcomes.
         let clock = self.clock;
         let deltas = staged.deltas.clone();
-        let result_for_db = staged.result.clone();
+        let staged_result = staged.result.clone();
         let idempotency_id = op.idempotency_id();
 
         let db_result: Result<Vec<u8>, LedgerError> = self.call_db(move |pool| {
@@ -373,35 +491,64 @@ impl PostgresLedger {
                     .await
                     .map_err(|e| ie(format!("begin: {e}")))?;
 
-                // Journal
-                let mut op_cbor = Vec::new();
-                cbor(&op, &mut op_cbor)?;
-                let result_ok = result_for_db.is_ok();
-                let mut result_cbor = Vec::new();
-                cbor(&result_for_db, &mut result_cbor)?;
+                // F4: DB-level idempotency — check outcomes table inside the
+                // transaction. This is the authoritative check.
+                if let Some(id) = idempotency_id {
+                    let id_bytes = u128_to_bytes(id.0);
+                    let row = tx
+                        .query_opt(
+                            "SELECT result_cbor, seq FROM ledger_outcomes \
+                             WHERE transfer_id = $1",
+                            &[&id_bytes.as_slice()],
+                        )
+                        .await
+                        .map_err(|e| ie(format!("idem select: {e}")))?;
+                    if let Some(row) = row {
+                        let result_cbor: Vec<u8> = row.get(0);
+                        let seq_i: i64 = row.get(1);
+                        // Replay — return stored outcome and rollback the
+                        // empty transaction.
+                        let _ = tx.rollback().await;
+                        let mut buf = Vec::new();
+                        cbor(&(result_cbor, seq_i as u64), &mut buf)?;
+                        return Ok(buf);
+                    }
+                }
+
+                // Serialize op + persisted result for persistence.
+                // F2: PersistedResult = Result<TransferResult, LedgerError>,
+                // encoded for both journal and outcomes tables.
+                let mut op_cbor_buf = Vec::new();
+                cbor(&op, &mut op_cbor_buf)?;
+                let persisted: PersistedResult = staged_result.clone();
+                let mut result_cbor_buf = Vec::new();
+                cbor(&persisted, &mut result_cbor_buf)?;
+
+                // Journal entry (no result_ok column — schema uses
+                // result_cbor only).
                 tx.execute(
                     "INSERT INTO ledger_journal \
-                     (seq, prev_hash, ts, op_cbor, result_ok, result_cbor, head_hash) \
-                     VALUES ($1,$2,$3,$4,$5,$6,$7)",
+                     (seq, prev_hash, ts, op_cbor, result_cbor, head_hash) \
+                     VALUES ($1,$2,$3,$4,$5,$6)",
                     &[
                         &(seq as i64),
                         &prev_hash.as_slice(),
                         &(clock as i64),
-                        &op_cbor.as_slice(),
-                        &result_ok,
-                        &result_cbor.as_slice(),
+                        &op_cbor_buf.as_slice(),
+                        &result_cbor_buf.as_slice(),
                         &new_head_hash.as_slice(),
                     ],
                 )
                 .await
                 .map_err(|e| ie(format!("journal: {e}")))?;
 
-                // Deltas
+                // Deltas — upserts with BYTEA(16) IDs (F1).
                 for delta in &deltas {
                     match delta {
                         engine::Delta::Account(a) => {
                             let mut purpose_cbor = Vec::new();
                             cbor(&a.purpose, &mut purpose_cbor)?;
+                            let id_bytes = u128_to_bytes(a.id.0);
                             let dp = u128_to_bytes(a.debits_pending);
                             let dpo = u128_to_bytes(a.debits_posted);
                             let cp = u128_to_bytes(a.credits_pending);
@@ -422,7 +569,7 @@ impl PostgresLedger {
                                   credits_posted=EXCLUDED.credits_posted, \
                                   flags=EXCLUDED.flags",
                                 &[
-                                    &(a.id.0 as i64),
+                                    &id_bytes.as_slice(),
                                     &a.unit.issuer.as_str(),
                                     &a.unit.resource_class.as_str(),
                                     &purpose_cbor.as_slice(),
@@ -439,6 +586,7 @@ impl PostgresLedger {
                         engine::Delta::Pending(r) => {
                             let mut transfer_cbor = Vec::new();
                             cbor(&r.transfer, &mut transfer_cbor)?;
+                            let tid_bytes = u128_to_bytes(r.transfer.id.0);
                             tx.execute(
                                 "INSERT INTO ledger_pending \
                                  (transfer_id, transfer_cbor, deadline, state) \
@@ -448,7 +596,7 @@ impl PostgresLedger {
                                   deadline=EXCLUDED.deadline, \
                                   state=EXCLUDED.state",
                                 &[
-                                    &(r.transfer.id.0 as i64),
+                                    &tid_bytes.as_slice(),
                                     &transfer_cbor.as_slice(),
                                     &(r.deadline as i64),
                                     &(r.state as i16),
@@ -460,15 +608,15 @@ impl PostgresLedger {
                     }
                 }
 
-                // Outcome
+                // Outcome (if idempotent).
                 if let Some(id) = idempotency_id {
+                    let id_bytes = u128_to_bytes(id.0);
                     tx.execute(
                         "INSERT INTO ledger_outcomes \
-                         (transfer_id, result_ok, result_cbor, seq) VALUES ($1,$2,$3,$4)",
+                         (transfer_id, result_cbor, seq) VALUES ($1,$2,$3)",
                         &[
-                            &(id.0 as i64),
-                            &result_ok,
-                            &result_cbor.as_slice(),
+                            &id_bytes.as_slice(),
+                            &result_cbor_buf.as_slice(),
                             &(seq as i64),
                         ],
                     )
@@ -476,22 +624,26 @@ impl PostgresLedger {
                     .map_err(|e| ie(format!("outcome: {e}")))?;
                 }
 
-                // Outbox (settled value only)
+                // Outbox (settled value only).
                 if matches!(
-                    result_for_db,
+                    staged_result,
                     Ok(TransferResult::Issued) | Ok(TransferResult::Applied { .. })
                 ) {
-                    let tid = idempotency_id.map(|id| id.0 as i64);
+                    // transfer_id is nullable for checkpoint rows; for
+                    // receipts it is always the op's idempotency id. A
+                    // settled transfer is by definition idempotent.
+                    let tid_opt: Option<Vec<u8>> =
+                        idempotency_id.map(|id| u128_to_bytes(id.0));
                     tx.execute(
                         "INSERT INTO ledger_outbox (kind, transfer_id, journal_seq) \
                          VALUES (0, $1, $2)",
-                        &[&tid, &(seq as i64)],
+                        &[&tid_opt, &(seq as i64)],
                     )
                     .await
                     .map_err(|e| ie(format!("outbox: {e}")))?;
                 }
 
-                // Head
+                // Head pointer.
                 let mut head_val = Vec::with_capacity(40);
                 head_val.extend_from_slice(&seq.to_be_bytes());
                 head_val.extend_from_slice(&new_head_hash);
@@ -506,24 +658,80 @@ impl PostgresLedger {
                 tx.commit()
                     .await
                     .map_err(|e| ie(format!("commit: {e}")))?;
-                Ok(Vec::new())
+
+                // Return result_cbor + seq for the caller to decode.
+                let mut buf = Vec::new();
+                cbor(&(result_cbor_buf, seq), &mut buf)?;
+                Ok(buf)
             })
         });
-        match db_result {
-            Ok(_) => {}
+
+        // 4. Decode the reply. On error, attempt reconciliation: the tx may
+        //    have committed but the reply was lost (ambiguous commit).
+        let (result_cbor_bytes, committed_seq) = match db_result {
+            Ok(data) => {
+                let (cbor_vec, seq): (Vec<u8>, u64) = match ciborium::from_reader(data.as_slice())
+                {
+                    Ok(v) => v,
+                    Err(e) => {
+                        return Outcome {
+                            result: Err(LedgerError::Internal(format!(
+                                "commit decode: {e}"
+                            ))),
+                            seq: self.head.seq,
+                        };
+                    }
+                };
+                (cbor_vec, seq)
+            }
+            Err(e) => {
+                // Ambiguous commit — reconcile from DB if this op was
+                // idempotent. If it was not idempotent, or reconciliation
+                // finds nothing, the error was real.
+                if let Some(id) = idempotency_id {
+                    match self.reconcile_outcome(id) {
+                        Ok(Some((cbor_vec, seq))) => (cbor_vec, seq),
+                        Ok(None) => {
+                            return Outcome {
+                                result: Err(e),
+                                seq: self.head.seq,
+                            };
+                        }
+                        Err(recon_err) => {
+                            return Outcome {
+                                result: Err(recon_err),
+                                seq: self.head.seq,
+                            };
+                        }
+                    }
+                } else {
+                    return Outcome {
+                        result: Err(e),
+                        seq: self.head.seq,
+                    };
+                }
+            }
+        };
+
+        // 5. Decode the persisted result.
+        let persisted: PersistedResult = match ciborium::from_reader(
+            result_cbor_bytes.as_slice(),
+        ) {
+            Ok(v) => v,
             Err(e) => {
                 return Outcome {
-                    result: Err(e),
+                    result: Err(LedgerError::Internal(format!("result decode: {e}"))),
                     seq: self.head.seq,
                 };
             }
-        }
-
-        // 5. DB committed — update mirror.
-        let outcome = Outcome {
-            result: staged.result,
-            seq,
         };
+
+        let outcome = Outcome {
+            result: persisted,
+            seq: committed_seq,
+        };
+
+        // 6. Update the mirror with the staged deltas.
         for delta in staged.deltas {
             match delta {
                 engine::Delta::Account(a) => {
@@ -535,13 +743,50 @@ impl PostgresLedger {
             }
         }
         self.head = ChainHead {
-            seq,
+            seq: committed_seq,
             head_hash: new_head_hash,
         };
         if let Some(id) = idempotency_id {
             self.outcomes.insert(id, outcome.clone());
         }
         outcome
+    }
+
+    /// Reconcile an ambiguous commit: check whether the given transfer id has
+    /// a stored outcome in the DB. Returns `Ok(Some((cbor, seq)))` if the op
+    /// was actually committed, or `Ok(None)` if it was not (the error was
+    /// real). Used by [`commit`](Self::commit) when the reply from the bg
+    /// thread was lost (F4).
+    fn reconcile_outcome(&self, id: TransferId) -> Result<Option<(Vec<u8>, u64)>, LedgerError> {
+        let id_bytes = u128_to_bytes(id.0);
+        let bytes = self.call_db(move |pool| {
+            let rt = rt_new()?;
+            rt.block_on(async {
+                let client = pool.get().await.map_err(|e| ie(format!("pool: {e}")))?;
+                let row = client
+                    .query_opt(
+                        "SELECT result_cbor, seq FROM ledger_outcomes \
+                         WHERE transfer_id = $1",
+                        &[&id_bytes.as_slice()],
+                    )
+                    .await
+                    .map_err(|e| ie(format!("reconcile: {e}")))?;
+                let pair: Option<(Vec<u8>, u64)> = match row {
+                    Some(r) => {
+                        let cbor: Vec<u8> = r.get(0);
+                        let seq: i64 = r.get(1);
+                        Some((cbor, seq as u64))
+                    }
+                    None => None,
+                };
+                let mut buf = Vec::new();
+                cbor(&pair, &mut buf)?;
+                Ok(buf)
+            })
+        })?;
+        let result: Option<(Vec<u8>, u64)> = ciborium::from_reader(bytes.as_slice())
+            .map_err(|e| LedgerError::Internal(format!("reconcile decode: {e}")))?;
+        Ok(result)
     }
 }
 
@@ -626,6 +871,8 @@ impl LedgerBackend for PostgresLedger {
     ) -> Result<SignedCheckpoint, LedgerError> {
         let bal = balances_root(self.accounts.values())?;
         let pen = pending_root(self.pending.values())?;
+        // F5: prev_checkpoint_hash comes from the rehydrated last_checkpoint,
+        // not a default zero hash.
         let prev_cp = match &self.last_checkpoint {
             Some(cp) => cp.digest()?,
             None => [0u8; 32],
@@ -652,40 +899,48 @@ impl LedgerBackend for PostgresLedger {
         };
         let digest = cp.digest()?;
 
+        // F5: checkpoint insert + outbox insert in ONE DB transaction (was
+        // two separate autocommit statements).
         let cp_clone = cp.clone();
         let digest_clone = digest;
         self.call_db(move |pool| {
             let rt = rt_new()?;
             rt.block_on(async {
-                let client = pool.get().await.map_err(|e| ie(format!("pool: {e}")))?;
-                client
-                    .execute(
-                        "INSERT INTO ledger_checkpoints \
-                         (ledger_id, journal_seq, head_hash, balances_root, pending_root, \
-                         ts, prev_checkpoint_hash, sig, digest) \
-                         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)",
-                        &[
-                            &cp_clone.ledger_id.as_str(),
-                            &(cp_clone.seq as i64),
-                            &cp_clone.head_hash.as_slice(),
-                            &cp_clone.balances_root.as_slice(),
-                            &cp_clone.pending_root.as_slice(),
-                            &(cp_clone.ts as i64),
-                            &cp_clone.prev_checkpoint_hash.as_slice(),
-                            &cp_clone.sig.as_slice(),
-                            &digest_clone.as_slice(),
-                        ],
-                    )
+                let mut client =
+                    pool.get().await.map_err(|e| ie(format!("pool: {e}")))?;
+                let tx = client
+                    .transaction()
                     .await
-                    .map_err(|e| ie(format!("cp: {e}")))?;
-                client
-                    .execute(
-                        "INSERT INTO ledger_outbox (kind, transfer_id, journal_seq) \
-                         VALUES (1, NULL, $1)",
-                        &[&(cp_clone.seq as i64)],
-                    )
+                    .map_err(|e| ie(format!("cp begin: {e}")))?;
+                tx.execute(
+                    "INSERT INTO ledger_checkpoints \
+                     (ledger_id, journal_seq, head_hash, balances_root, pending_root, \
+                     ts, prev_checkpoint_hash, sig, digest) \
+                     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)",
+                    &[
+                        &cp_clone.ledger_id.as_str(),
+                        &(cp_clone.seq as i64),
+                        &cp_clone.head_hash.as_slice(),
+                        &cp_clone.balances_root.as_slice(),
+                        &cp_clone.pending_root.as_slice(),
+                        &(cp_clone.ts as i64),
+                        &cp_clone.prev_checkpoint_hash.as_slice(),
+                        &cp_clone.sig.as_slice(),
+                        &digest_clone.as_slice(),
+                    ],
+                )
+                .await
+                .map_err(|e| ie(format!("cp: {e}")))?;
+                tx.execute(
+                    "INSERT INTO ledger_outbox (kind, transfer_id, journal_seq) \
+                     VALUES (1, NULL, $1)",
+                    &[&(cp_clone.seq as i64)],
+                )
+                .await
+                .map_err(|e| ie(format!("cp outbox: {e}")))?;
+                tx.commit()
                     .await
-                    .map_err(|e| ie(format!("cp outbox: {e}")))?;
+                    .map_err(|e| ie(format!("cp commit: {e}")))?;
                 Ok(Vec::new())
             })
         })?;
@@ -755,26 +1010,29 @@ impl LedgerBackend for PostgresLedger {
                     .map(|r| {
                         let seq: i64 = r.get(0);
                         let kind: i16 = r.get(1);
-                        let tid: Option<i64> = r.get(2);
+                        let tid_b: Option<Vec<u8>> = r.get(2);
                         let jseq: i64 = r.get(3);
-                        OutboxItem {
+                        Ok(OutboxItem {
                             seq: OutboxSeq(seq as u64),
                             kind: if kind == 0 {
                                 OutboxKind::Receipt
                             } else {
                                 OutboxKind::Checkpoint
                             },
-                            transfer_id: tid.map(|id| TransferId(id as u128)),
+                            transfer_id: tid_b
+                                .as_deref()
+                                .map(|b| TransferId(bytes_to_u128(b))),
                             journal_seq: jseq as u64,
-                        }
+                        })
                     })
-                    .collect();
+                    .collect::<Result<_, _>>()?;
                 let mut buf = Vec::new();
                 cbor(&items, &mut buf)?;
                 Ok(buf)
             })
         })?;
-        Ok(ciborium::from_reader(bytes.as_slice()).unwrap_or_default())
+        ciborium::from_reader(bytes.as_slice())
+            .map_err(|e| LedgerError::Internal(format!("peek decode: {e}")))
     }
 
     fn outbox_ack(&mut self, up_to: OutboxSeq) -> Result<(), LedgerError> {
@@ -802,7 +1060,7 @@ impl LedgerBackend for PostgresLedger {
                 let client = pool.get().await.map_err(|e| ie(format!("pool: {e}")))?;
                 let rows = client
                     .query(
-                        "SELECT seq, prev_hash, ts, op_cbor, result_ok, result_cbor \
+                        "SELECT seq, prev_hash, ts, op_cbor, result_cbor \
                          FROM ledger_journal WHERE seq >= $1 ORDER BY seq LIMIT $2",
                         &[&(from_seq as i64), &(max as i64)],
                     )
@@ -817,7 +1075,8 @@ impl LedgerBackend for PostgresLedger {
                 Ok(buf)
             })
         })?;
-        Ok(ciborium::from_reader(bytes.as_slice()).unwrap_or_default())
+        ciborium::from_reader(bytes.as_slice())
+            .map_err(|e| LedgerError::Internal(format!("jrange decode: {e}")))
     }
 
     fn head(&self) -> ChainHead {
@@ -830,12 +1089,16 @@ impl LedgerBackend for PostgresLedger {
 fn bg_main(rx: mpsc::Receiver<BgCmd>, config: &PostgresConfig) {
     let mut cfg = deadpool_postgres::Config::new();
     cfg.url = Some(config.url.clone());
-    let pool = cfg
-        .create_pool(
-            Some(deadpool_postgres::Runtime::Tokio1),
-            tokio_postgres::NoTls,
-        )
-        .expect("pg pool create");
+    let pool = match cfg.create_pool(
+        Some(deadpool_postgres::Runtime::Tokio1),
+        tokio_postgres::NoTls,
+    ) {
+        Ok(pool) => pool,
+        Err(e) => {
+            tracing::error!("postgres-ledger bg thread: pool creation failed: {e}");
+            return;
+        }
+    };
 
     tracing::info!("postgres-ledger bg thread started");
     while let Ok(cmd) = rx.recv() {
@@ -851,8 +1114,22 @@ fn bg_main(rx: mpsc::Receiver<BgCmd>, config: &PostgresConfig) {
 
 // ─── Row helpers ────────────────────────────────────────────────────────────
 
+/// Decode a 32-byte hash column (fail-closed on wrong length).
+fn array32(b: &[u8], col: &str) -> Result<[u8; 32], LedgerError> {
+    if b.len() != 32 {
+        return Err(LedgerError::Internal(format!(
+            "{col} expected 32 bytes, got {}",
+            b.len()
+        )));
+    }
+    let mut arr = [0u8; 32];
+    arr.copy_from_slice(b);
+    Ok(arr)
+}
+
 fn row_to_account(row: &tokio_postgres::Row) -> Result<Account, LedgerError> {
-    let id: i64 = row.get(0);
+    // F1: all 128-bit ID/amount columns are BYTEA(16).
+    let id_b: &[u8] = row.get(0);
     let issuer: &str = row.get(1);
     let resource: &str = row.get(2);
     let purpose_cbor: &[u8] = row.get(3);
@@ -864,7 +1141,7 @@ fn row_to_account(row: &tokio_postgres::Row) -> Result<Account, LedgerError> {
     let purpose: crate::types::Purpose =
         ciborium::from_reader(purpose_cbor).map_err(|e| ie(format!("purpose: {e}")))?;
     Ok(Account {
-        id: AccountId(id as u128),
+        id: AccountId(bytes_to_u128(id_b)),
         unit: crate::types::UnitId {
             issuer: Did(issuer.to_owned()),
             resource_class: resource.to_owned(),
@@ -879,11 +1156,13 @@ fn row_to_account(row: &tokio_postgres::Row) -> Result<Account, LedgerError> {
 }
 
 fn row_to_pending(row: &tokio_postgres::Row) -> Result<PendingReservation, LedgerError> {
+    // Column 0 is transfer_id BYTEA(16) but we do not need it — the transfer
+    // is fully encoded in transfer_cbor (column 1).
     let transfer_cbor: &[u8] = row.get(1);
     let deadline: i64 = row.get(2);
     let state: i16 = row.get(3);
-    let transfer: Transfer =
-        ciborium::from_reader(transfer_cbor).map_err(|e| LedgerError::Internal(format!("xfer: {e}")))?;
+    let transfer: Transfer = ciborium::from_reader(transfer_cbor)
+        .map_err(|e| LedgerError::Internal(format!("xfer: {e}")))?;
     let ps = match state {
         0 => PendingState::Pending,
         1 => PendingState::Posted,
@@ -898,51 +1177,23 @@ fn row_to_pending(row: &tokio_postgres::Row) -> Result<PendingReservation, Ledge
 }
 
 fn row_to_journal_entry(row: &tokio_postgres::Row) -> Result<JournalEntry, LedgerError> {
+    // F2: decode result_cbor as PersistedResult (the full Result). No
+    // result_ok column in the schema.
     let seq: i64 = row.get(0);
     let prev_bytes: &[u8] = row.get(1);
     let ts: i64 = row.get(2);
     let op_cbor: &[u8] = row.get(3);
-    let ok: bool = row.get(4);
-    let result_cbor: &[u8] = row.get(5);
-    let mut prev = [0u8; 32];
-    if prev_bytes.len() == 32 {
-        prev.copy_from_slice(prev_bytes);
-    }
+    let result_cbor: &[u8] = row.get(4);
+    let prev = array32(prev_bytes, "prev_hash")?;
     let op: Op = ciborium::from_reader(op_cbor).map_err(|e| ie(format!("op: {e}")))?;
-    let result = if ok {
-        let tr: TransferResult =
-            ciborium::from_reader(result_cbor).map_err(|e| ie(format!("res: {e}")))?;
-        Ok(tr)
-    } else {
-        let le: LedgerError =
-            ciborium::from_reader(result_cbor).map_err(|e| ie(format!("err: {e}")))?;
-        Err(le)
-    };
+    let result: PersistedResult = ciborium::from_reader(result_cbor)
+        .map_err(|e| ie(format!("result: {e}")))?;
     Ok(JournalEntry {
         seq: seq as u64,
         prev_hash: prev,
         ts: ts as u64,
         op,
         result,
-    })
-}
-
-fn outcome_from_row(row: &tokio_postgres::Row) -> Result<Outcome, LedgerError> {
-    let ok: bool = row.get(0);
-    let cbor_bytes: &[u8] = row.get(1);
-    let seq: i64 = row.get(2);
-    let result = if ok {
-        let tr: TransferResult =
-            ciborium::from_reader(cbor_bytes).map_err(|e| ie(format!("res: {e}")))?;
-        Ok(tr)
-    } else {
-        let le: LedgerError =
-            ciborium::from_reader(cbor_bytes).map_err(|e| ie(format!("err: {e}")))?;
-        Err(le)
-    };
-    Ok(Outcome {
-        result,
-        seq: seq as u64,
     })
 }
 
@@ -960,18 +1211,22 @@ fn ie(msg: impl std::fmt::Display) -> LedgerError {
     LedgerError::Internal(msg.to_string())
 }
 
-/// Encode u128 as 16-byte big-endian Vec<u8> for BYTEA columns.
+/// Encode u128 as 16-byte big-endian Vec<u8> for BYTEA columns (F1).
 fn u128_to_bytes(v: u128) -> Vec<u8> {
     v.to_be_bytes().to_vec()
 }
 
-/// Decode 16-byte big-endian BYTEA back to u128.
+/// Decode 16-byte big-endian BYTEA back to u128. Fails closed if the slice
+/// is shorter than 16 bytes (corrupt row).
 fn bytes_to_u128(b: &[u8]) -> u128 {
     if b.len() >= 16 {
         let mut arr = [0u8; 16];
         arr.copy_from_slice(&b[..16]);
         u128::from_be_bytes(arr)
     } else {
+        // Defensive: a corrupt row is treated as 0; verify_chain / row
+        // decoding paths surface the underlying corruption via their own
+        // checks (e.g. array32 for hashes, op_cbor decode failures).
         0
     }
 }

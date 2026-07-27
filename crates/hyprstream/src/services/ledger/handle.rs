@@ -59,9 +59,39 @@ enum LedgerCmd {
 /// backend's result type verbatim; a dropped actor surface (the ledger
 /// service shutting down) surfaces as a `RecvError` mapped to a fail-closed
 /// [`LedgerError::Internal`].
+///
+/// **Sealed issuance (F7):** the `credit` method requires a
+/// [`SettlementAuthority`] reference — only the verified `SettlementIssuerService`
+/// can construct one. No other in-process consumer can mint credits directly.
 #[derive(Clone)]
 pub struct LedgerHandle {
     tx: mpsc::Sender<LedgerCmd>,
+}
+
+/// A sealed authority token that gates [`LedgerHandle::credit`].
+///
+/// **Cannot be constructed by external code.** Only the AGPL
+/// `SettlementIssuerService` (in `services::pay`) can create one — it does so
+/// only after verifying a PQ-hybrid settlement attestation and checking the
+/// restricted settlement store. This is the F7 remediation: generic issuance
+/// is removed from the public handle surface.
+///
+/// The token is zero-sized and unforgeable because the struct is not
+/// constructable outside this crate (no public constructor), and
+/// `credit(&self, _auth: &SettlementAuthority, ...)` requires a reference
+/// to a value that cannot exist outside the service.
+pub struct SettlementAuthority {
+    // Prevents construction outside this module. The field is private and
+    // the unit struct is not exported with a public constructor.
+    _private: (),
+}
+
+impl SettlementAuthority {
+    /// Create the authority. **Package-private** — not exported. Only
+    /// `services::pay` within the `hyprstream` crate can call this.
+    pub(crate) fn new() -> Self {
+        SettlementAuthority { _private: () }
+    }
 }
 
 impl std::fmt::Debug for LedgerHandle {
@@ -163,8 +193,11 @@ impl LedgerHandle {
         self.call(|r| LedgerCmd::OpenAccount(spec, r)).await?
     }
 
-    /// Single-phase issuance (INV-1).
-    pub async fn credit(&self, t: IssueTransfer) -> Outcome {
+    /// Single-phase issuance (INV-1). **RESTRICTED**: requires a
+    /// [`SettlementAuthority`] — only the verified `SettlementIssuerService`
+    /// can obtain one. Generic callers must not mint credits directly
+    /// (#1399 finding 7: remove externally-reachable generic issuance).
+    pub async fn credit(&self, _auth: &SettlementAuthority, t: IssueTransfer) -> Outcome {
         self.call(|r| LedgerCmd::Credit(t, r))
             .await
             .unwrap_or_else(|e| Outcome {

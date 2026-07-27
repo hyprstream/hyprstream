@@ -581,8 +581,37 @@ fn create_ledger_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
         ))
     };
 
-    // Phase-1 backend: MemLedger (RocksLedger is item 1.2). The grant verifier
-    // is the fail-closed StaticGrantVerifier until the UCAN wiring lands.
+    // Backend selection (PAY-01): PostgresLedger when postgres-ledger feature
+    // is compiled and a URL is configured; MemLedger for dev/test.
+    #[cfg(feature = "postgres-ledger")]
+    let backend: Box<dyn hyprstream_ledger::LedgerBackend + Send + 'static> =
+        if let Some(pg_url) = config.ledger_postgres_url.as_ref().filter(|u| !u.is_empty()) {
+            let pg_config = hyprstream_ledger::postgres::PostgresConfig {
+                url: pg_url.clone(),
+                pool_size: config.ledger_postgres_pool_size.unwrap_or(4),
+            };
+            let pg = hyprstream_ledger::postgres::PostgresLedger::connect(
+                pg_config,
+                cell_identity.clone(),
+            )
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "ledger: PostgresLedger::connect failed (fail-closed): {e}"
+                )
+            })?;
+            info!("Ledger backend: PostgresLedger (production durable)");
+            Box::new(pg)
+        } else {
+            info!("Ledger backend: MemLedger (no postgres URL configured — dev/test only)");
+            Box::new(MemLedger::new(cell_identity.clone()))
+        };
+
+    #[cfg(not(feature = "postgres-ledger"))]
+    let backend: Box<dyn hyprstream_ledger::LedgerBackend + Send + 'static> = {
+        info!("Ledger backend: MemLedger (postgres-ledger feature not compiled)");
+        Box::new(MemLedger::new(cell_identity.clone()))
+    };
+
     let verifier: Arc<dyn crate::services::ledger::GrantVerifier + Send + Sync> =
         Arc::new(StaticGrantVerifier::new());
     let sink: Arc<dyn crate::services::ledger::ReceiptSink + Send + Sync> =
@@ -590,7 +619,7 @@ fn create_ledger_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
 
     let service = LedgerService::spawn(
         lcfg,
-        Box::new(MemLedger::new(cell_identity.clone())),
+        backend,
         signer,
         verifier,
         sink,

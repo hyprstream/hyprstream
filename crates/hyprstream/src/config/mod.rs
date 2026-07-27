@@ -213,6 +213,18 @@ pub struct HyprConfig {
     #[cfg(feature = "ledger")]
     #[serde(default)]
     pub ledger: crate::services::ledger::LedgerConfig,
+
+    /// Postgres URL for the durable ledger backend (PAY-01 #1389).
+    /// When set and the `postgres-ledger` feature is compiled, the factory
+    /// constructs PostgresLedger. When empty/unset, MemLedger is used (dev/test).
+    #[cfg(feature = "postgres-ledger")]
+    #[serde(default)]
+    pub ledger_postgres_url: Option<String>,
+
+    /// Connection pool size for the PostgresLedger backend. Default 4.
+    #[cfg(feature = "postgres-ledger")]
+    #[serde(default)]
+    pub ledger_postgres_pool_size: Option<usize>,
 }
 
 /// Persistent secrets storage configuration.
@@ -2501,6 +2513,10 @@ impl HyprConfigBuilder {
             account: self.account,
             #[cfg(feature = "ledger")]
             ledger: Default::default(),
+            #[cfg(feature = "postgres-ledger")]
+            ledger_postgres_url: None,
+            #[cfg(feature = "postgres-ledger")]
+            ledger_postgres_pool_size: None,
         }
     }
 

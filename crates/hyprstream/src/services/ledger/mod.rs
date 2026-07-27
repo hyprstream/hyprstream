@@ -49,7 +49,7 @@ pub use enforcer::{
     AdmissionRequest, AdmissionResult, AuthenticatedSubject, AuthenticatedSubjectError,
     LocalEnforcer, Rejection,
 };
-pub use handle::LedgerHandle;
+pub use handle::{LedgerHandle, SettlementAuthority};
 pub use inference_spend::{
     observe_spend_result, InferenceSpendEmitter, SpendDecline, SpendFailure, SpendInput,
     SpendResult,

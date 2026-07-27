@@ -1,0 +1,147 @@
+//! # Settlement/tariff service (AGPL, #1399)
+//!
+//! The authenticated mesh service that implements the MIT-licensed
+//! [`hyprstream_pay`] traits: [`SettlementIssuer`] + [`TariffProvider`].
+//!
+//! ## Security model
+//!
+//! 1. **Peer auth**: transport-level (TLS 1.3 on QUIC, UDS peer credentials)
+//! 2. **Capability gate**: `#[authorize]` on RPC handlers
+//! 3. **Attestation verification**: the PQ-hybrid-signed settlement attestation
+//!    is re-verified server-side — never trusts a client assertion
+//! 4. **Settlement store**: the restricted DB row must exist and be in
+//!    `settlement_committed` state
+//! 5. **Restricted credit**: the only path to `LedgerHandle::credit` is through
+//!    the [`SettlementAuthority`] sealed token (F7)
+//!
+//! This module is AGPL (part of the `hyprstream` crate). The protocol surface
+//! (`hyprstream-pay`) is MIT.
+
+pub mod attestation;
+pub mod settlement_store;
+pub mod tariff;
+
+pub use attestation::SettlementAttestationVerifier;
+pub use settlement_store::{SettlementRow, SettlementStore};
+pub use tariff::StaticTariffProvider;
+
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use hyprstream_ledger::{IssueTransfer, TransferId};
+use hyprstream_pay::{IssueRequest, IssueResponse, PayError, SettlementIssuer};
+
+use super::ledger::{LedgerHandle, SettlementAuthority};
+
+/// The production settlement-issuer service.
+///
+/// Wires the settlement store + attestation verifier + the restricted
+/// ledger credit path. Only this service can mint purchased credits.
+pub struct SettlementIssuerService {
+    handle: LedgerHandle,
+    auth: SettlementAuthority,
+    store: Arc<dyn SettlementStore + Send + Sync>,
+    verifier: Arc<dyn SettlementAttestationVerifier + Send + Sync>,
+}
+
+impl std::fmt::Debug for SettlementIssuerService {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SettlementIssuerService").finish_non_exhaustive()
+    }
+}
+
+impl SettlementIssuerService {
+    /// Construct the settlement issuer. The `auth` token is created here —
+    /// it's `pub(crate)` so only the factory (inside `hyprstream`) can wire it.
+    pub fn new(
+        handle: LedgerHandle,
+        store: Arc<dyn SettlementStore + Send + Sync>,
+        verifier: Arc<dyn SettlementAttestationVerifier + Send + Sync>,
+    ) -> Self {
+        SettlementIssuerService {
+            handle,
+            auth: SettlementAuthority::new(),
+            store,
+            verifier,
+        }
+    }
+}
+
+#[async_trait]
+impl SettlementIssuer for SettlementIssuerService {
+    async fn issue(&self, req: IssueRequest) -> Result<IssueResponse, PayError> {
+        // 1. Verify the attestation server-side (PQ-hybrid signature check).
+        self.verifier
+            .verify(&req.attestation, &req.settlement_id)
+            .await?;
+
+        // 2. Load the committed settlement row from the restricted store.
+        let row = self
+            .store
+            .get_settlement(&req.settlement_id)
+            .await?
+            .ok_or_else(|| PayError::SettlementNotFound(req.settlement_id.clone()))?;
+
+        if !row.is_committed() {
+            return Err(PayError::SettlementNotCommitted(
+                req.settlement_id.clone(),
+                row.state_label(),
+            ));
+        }
+
+        // 3. Derive issuance fields from the settlement row (server-side,
+        //    never client-supplied).
+        let transfer_id = row.derive_transfer_id();
+        let issuer_liability = row.issuer_liability_account;
+        let destination = row.destination_account;
+        let unit = row.unit.clone();
+        let amount = row.amount_minor;
+        let grant_cid = row.grant_cid.clone();
+
+        // 4. Construct the internal IssueTransfer and call the restricted
+        //    credit path (F7: only SettlementAuthority can do this).
+        let issue = IssueTransfer {
+            id: transfer_id,
+            issuer_liability,
+            destination,
+            unit: hyprstream_ledger::UnitId {
+                issuer: hyprstream_ledger::Did(unit.issuer_did),
+                resource_class: unit.resource_class,
+            },
+            amount,
+            grant_cid: grant_cid.map(|b| hyprstream_ledger::Cid(b)),
+            user_data: [0u8; 32], // correlation: settlement_id hash
+        };
+
+        let outcome = self.handle.credit(&self.auth, issue).await;
+
+        Ok(IssueResponse {
+            transfer_id_lo: (transfer_id.0 & u64::MAX as u128) as u64,
+            transfer_id_hi: (transfer_id.0 >> 64) as u64,
+            outcome_seq: outcome.seq,
+            ok: outcome.is_ok(),
+            error: outcome.result.err().map(|e| e.to_string()),
+        })
+    }
+
+    async fn status(&self, settlement_id: &str) -> Result<IssueResponse, PayError> {
+        let row = self
+            .store
+            .get_settlement(settlement_id)
+            .await?
+            .ok_or_else(|| PayError::SettlementNotFound(settlement_id.to_owned()))?;
+
+        let transfer_id = row.derive_transfer_id();
+        Ok(IssueResponse {
+            transfer_id_lo: (transfer_id.0 & u64::MAX as u128) as u64,
+            transfer_id_hi: (transfer_id.0 >> 64) as u64,
+            outcome_seq: 0, // TODO: query the ledger for the outcome seq
+            ok: row.is_committed(),
+            error: if row.is_committed() {
+                None
+            } else {
+                Some(row.state_label())
+            },
+        })
+    }
+}
