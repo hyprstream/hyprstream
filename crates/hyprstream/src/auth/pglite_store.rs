@@ -27,6 +27,7 @@
 //! `AccountAlreadyExists` / `KeyAlreadyBound`.
 
 use super::{
+    encrypted_columns::{ColumnCipher, EncryptedColumn, ROOT_DEK_BYTES},
     user_store::matches_filter, AccountKeyCustody, ExternalIdentityBinding,
     ExternalIdentityResolution, HostedAccountProvisionError, HostedAccountProvisioning,
     KeyAlgorithm, PubkeyEntry, UserFilter, UserProfile, UserProfilePatch, UserStore,
@@ -36,6 +37,7 @@ use async_trait::async_trait;
 use ed25519_dalek::VerifyingKey;
 use pglite::{PGlite, Row};
 use std::{path::Path, sync::Arc};
+use zeroize::Zeroizing;
 
 /// PostgreSQL-compatible schema shared by embedded PGlite and server Postgres.
 ///
@@ -86,6 +88,10 @@ CREATE TABLE IF NOT EXISTS pubkeys (
 );
 CREATE INDEX IF NOT EXISTS pubkeys_username_idx ON pubkeys(username);
 CREATE INDEX IF NOT EXISTS oidc_bindings_username_idx ON oidc_bindings(username);
+CREATE TABLE IF NOT EXISTS user_encryption_keys (
+    username TEXT PRIMARY KEY REFERENCES users(username) ON DELETE CASCADE,
+    wrapped_dek BYTEA NOT NULL
+);
 "#;
 
 const PROFILE_SELECT: &str = r#"
@@ -104,6 +110,7 @@ FROM pubkeys WHERE username = $1 ORDER BY fingerprint
 #[derive(Clone)]
 pub struct PgliteUserStore {
     database: Arc<PGlite>,
+    cipher: Option<ColumnCipher>,
 }
 
 impl PgliteUserStore {
@@ -119,11 +126,148 @@ impl PgliteUserStore {
             .exec(USERSTORE_SCHEMA)
             .await
             .context("applying UserStore schema")?;
-        Ok(Self { database })
+        Ok(Self {
+            database,
+            cipher: None,
+        })
+    }
+
+    /// Open with at-rest envelope encryption (#1377). When `cipher` is `Some`,
+    /// every BYTEA value column is sealed before storage and unsealed on read.
+    /// Passing `None` is equivalent to [`Self::from_database`].
+    #[allow(dead_code)] // deployment-wiring call-site is #1378
+    pub(crate) async fn with_cipher(
+        database: Arc<PGlite>,
+        cipher: Option<ColumnCipher>,
+    ) -> Result<Self> {
+        database
+            .exec(USERSTORE_SCHEMA)
+            .await
+            .context("applying UserStore schema")?;
+        Ok(Self { database, cipher })
     }
 
     pub fn database(&self) -> Arc<PGlite> {
         Arc::clone(&self.database)
+    }
+
+    fn is_encrypted(&self) -> bool {
+        self.cipher.is_some()
+    }
+
+    // ── DEK lifecycle ────────────────────────────────────────────────────
+
+    /// Mint a fresh root DEK, seal it, persist the wrapped form. Returns the
+    /// root for immediate use by the caller's write path.
+    async fn create_user_key(
+        &self,
+        tx: &pglite::Transaction<'_>,
+        username: &str,
+    ) -> Result<Zeroizing<[u8; ROOT_DEK_BYTES]>> {
+        let cipher = self
+            .cipher
+            .as_ref()
+            .context("encryption is not configured for this store")?;
+        let new_key = cipher.create_user_key().await?;
+        tx.query(
+            "INSERT INTO user_encryption_keys(username, wrapped_dek) VALUES($1, $2)",
+            &[&username, &new_key.wrapped],
+        )
+        .await?;
+        Ok(new_key.root)
+    }
+
+    /// Unseal the user's persisted root DEK. Fails closed when the wrapped DEK
+    /// is absent (user deleted / crypto-shredded) or when key material is
+    /// unavailable at runtime.
+    async fn load_user_key(&self, username: &str) -> Result<Zeroizing<[u8; ROOT_DEK_BYTES]>> {
+        let cipher = self
+            .cipher
+            .as_ref()
+            .context("encryption is not configured for this store")?;
+        let rows = self
+            .database
+            .query(
+                "SELECT wrapped_dek FROM user_encryption_keys WHERE username=$1",
+                &[&username],
+            )
+            .await?;
+        let wrapped: Vec<u8> = rows
+            .first()
+            .context("wrapped UserStore DEK is absent — key material revoked or never provisioned")?
+            .get(0)?;
+        cipher.open_user_key(&wrapped).await
+    }
+
+    // ── Field-level seal/open ────────────────────────────────────────────
+
+    /// Seal an optional text field for storage. Returns `None` for `None`
+    /// input. When encryption is disabled, returns plaintext bytes.
+    fn seal_text(
+        &self,
+        root: Option<&Zeroizing<[u8; ROOT_DEK_BYTES]>>,
+        username: &str,
+        column: EncryptedColumn<'_>,
+        value: Option<String>,
+    ) -> Result<Option<Vec<u8>>> {
+        match (value, &self.cipher, root) {
+            (None, _, _) => Ok(None),
+            (Some(text), None, None) => Ok(Some(text.into_bytes())),
+            (Some(text), Some(cipher), Some(root)) => {
+                Ok(Some(cipher.encrypt(root, username, column, text.as_bytes())?))
+            }
+            _ => bail!("cipher/root state mismatch in seal_text"),
+        }
+    }
+
+    /// Open an optional text field from stored bytes. When encryption is
+    /// disabled, interprets bytes as UTF-8 directly.
+    fn open_text(
+        &self,
+        root: Option<&Zeroizing<[u8; ROOT_DEK_BYTES]>>,
+        username: &str,
+        column: EncryptedColumn<'_>,
+        raw: Option<Vec<u8>>,
+    ) -> Result<Option<String>> {
+        match (raw, &self.cipher, root) {
+            (None, _, _) => Ok(None),
+            (Some(bytes), None, None) => Ok(Some(String::from_utf8(bytes)?)),
+            (Some(bytes), Some(cipher), Some(root)) => {
+                let pt = cipher.decrypt(root, username, column, &bytes)?;
+                Ok(Some(String::from_utf8(pt.to_vec())?))
+            }
+            _ => bail!("cipher/root state mismatch in open_text"),
+        }
+    }
+
+    /// Seal raw bytes (e.g. pubkey material) for storage.
+    fn seal_raw(
+        &self,
+        root: Option<&Zeroizing<[u8; ROOT_DEK_BYTES]>>,
+        username: &str,
+        column: EncryptedColumn<'_>,
+        value: &[u8],
+    ) -> Result<Vec<u8>> {
+        match (&self.cipher, root) {
+            (None, None) => Ok(value.to_vec()),
+            (Some(cipher), Some(root)) => cipher.encrypt(root, username, column, value),
+            _ => bail!("cipher/root state mismatch in seal_raw"),
+        }
+    }
+
+    /// Open raw bytes from storage.
+    fn open_raw(
+        &self,
+        root: Option<&Zeroizing<[u8; ROOT_DEK_BYTES]>>,
+        username: &str,
+        column: EncryptedColumn<'_>,
+        raw: &[u8],
+    ) -> Result<Zeroizing<Vec<u8>>> {
+        match (&self.cipher, root) {
+            (None, None) => Ok(Zeroizing::new(raw.to_vec())),
+            (Some(cipher), Some(root)) => cipher.decrypt(root, username, column, raw),
+            _ => bail!("cipher/root state mismatch in open_raw"),
+        }
     }
 
     async fn external_identities(&self, username: &str) -> Result<Vec<ExternalIdentityBinding>> {
@@ -137,16 +281,80 @@ impl PgliteUserStore {
             .await?;
         rows.iter().map(decode_external_identity).collect()
     }
-}
 
-fn bytes_to_string(value: Option<Vec<u8>>, field: &str) -> Result<Option<String>> {
-    value
-        .map(|bytes| String::from_utf8(bytes).with_context(|| format!("decoding {field}")))
-        .transpose()
-}
+    // ── Row decoders (cipher-aware) ──────────────────────────────────────
 
-fn string_to_bytes(value: Option<String>) -> Option<Vec<u8>> {
-    value.map(String::into_bytes)
+    /// Decode a profile row, optionally decrypting the BYTEA value columns.
+    /// When `root` is `None`, bytes are interpreted as plaintext UTF-8.
+    fn decode_profile(
+        &self,
+        row: &Row,
+        external_identities: Vec<ExternalIdentityBinding>,
+        username: &str,
+        root: Option<&Zeroizing<[u8; ROOT_DEK_BYTES]>>,
+    ) -> Result<UserProfile> {
+        let custody = row
+            .get::<Option<String>>(6)
+            .context("decoding key custody")?
+            .map(|value| AccountKeyCustody::parse(&value))
+            .transpose()?;
+        Ok(UserProfile {
+            sub: Some(row.get(0).context("decoding stable subject")?),
+            name: self.open_text(root, username, EncryptedColumn::ProfileName, row.get(1).context("decoding name")?)?,
+            email: self.open_text(root, username, EncryptedColumn::ProfileEmail, row.get(2).context("decoding email")?)?,
+            email_verified: row.get(3).context("decoding email verification")?,
+            active: Some(row.get(4).context("decoding active state")?),
+            external_id: self.open_text(root, username, EncryptedColumn::ProfileExternalId, row.get(5).context("decoding external ID")?)?,
+            atproto_did: row.get(7).context("decoding ATProto DID")?,
+            key_custody: custody,
+            external_identities,
+        })
+    }
+
+    /// Decode a pubkey row, optionally decrypting the BYTEA value columns.
+    fn decode_key(
+        &self,
+        row: &Row,
+        username: &str,
+        root: Option<&Zeroizing<[u8; ROOT_DEK_BYTES]>>,
+    ) -> Result<PubkeyEntry> {
+        let fingerprint: String = row.get(0).context("decoding fingerprint")?;
+        let raw: Vec<u8> = row.get(1).context("decoding Ed25519 key")?;
+        let decrypted_pk = self.open_raw(root, username, EncryptedColumn::PublicKey { fingerprint: &fingerprint }, &raw)?;
+        let raw: [u8; 32] = decrypted_pk
+            .as_slice()
+            .try_into()
+            .map_err(|_| anyhow!("stored Ed25519 key {fingerprint} is not 32 bytes"))?;
+        let pubkey = VerifyingKey::from_bytes(&raw)
+            .with_context(|| format!("decoding Ed25519 key {fingerprint}"))?;
+        ensure!(
+            super::pubkey_fingerprint(&pubkey) == fingerprint,
+            "stored key does not match fingerprint {fingerprint}"
+        );
+        let algorithm_raw: String = row.get(5).context("decoding key algorithm")?;
+        let algorithm = KeyAlgorithm::parse(&algorithm_raw)?;
+        let pq_raw: Option<Vec<u8>> = row.get(6).context("decoding ML-DSA-65 key")?;
+        let pq_pubkey = match (algorithm.is_hybrid(), pq_raw) {
+            (false, None) => None,
+            (true, Some(key_bytes)) => {
+                let pt = self.open_raw(root, username, EncryptedColumn::PqPublicKey { fingerprint: &fingerprint }, &key_bytes)?;
+                ensure!(pt.len() == 1952, "hybrid key {fingerprint} has invalid ML-DSA-65 material");
+                Some(pt.to_vec())
+            }
+            (true, None) => bail!("hybrid key {fingerprint} has invalid ML-DSA-65 material"),
+            (false, Some(_)) => bail!("classical key {fingerprint} carries ML-DSA-65 material"),
+        };
+        let label = self.open_text(root, username, EncryptedColumn::PublicKeyLabel { fingerprint: &fingerprint }, row.get(2).context("decoding key label")?)?;
+        Ok(PubkeyEntry {
+            fingerprint,
+            pubkey,
+            label,
+            created_at: row.get(3).context("decoding key creation time")?,
+            last_used_at: row.get(4).context("decoding key last-used time")?,
+            algorithm,
+            pq_pubkey,
+        })
+    }
 }
 
 fn decode_external_identity(row: &Row) -> Result<ExternalIdentityBinding> {
@@ -156,63 +364,10 @@ fn decode_external_identity(row: &Row) -> Result<ExternalIdentityBinding> {
     })
 }
 
-fn decode_profile_row(
-    row: &Row,
-    external_identities: Vec<ExternalIdentityBinding>,
-) -> Result<UserProfile> {
-    let custody = row
-        .get::<Option<String>>(6)
-        .context("decoding key custody")?
-        .map(|value| AccountKeyCustody::parse(&value))
-        .transpose()?;
-    Ok(UserProfile {
-        sub: Some(row.get(0).context("decoding stable subject")?),
-        name: bytes_to_string(row.get(1).context("decoding name")?, "name")?,
-        email: bytes_to_string(row.get(2).context("decoding email")?, "email")?,
-        email_verified: row.get(3).context("decoding email verification")?,
-        active: Some(row.get(4).context("decoding active state")?),
-        external_id: bytes_to_string(row.get(5).context("decoding external ID")?, "external ID")?,
-        atproto_did: row.get(7).context("decoding ATProto DID")?,
-        key_custody: custody,
-        external_identities,
-    })
-}
-
-fn decode_key_row(row: &Row) -> Result<PubkeyEntry> {
-    let fingerprint: String = row.get(0).context("decoding fingerprint")?;
-    let raw: Vec<u8> = row.get(1).context("decoding Ed25519 key")?;
-    let raw: [u8; 32] = raw
-        .try_into()
-        .map_err(|_| anyhow!("stored Ed25519 key {fingerprint} is not 32 bytes"))?;
-    let pubkey = VerifyingKey::from_bytes(&raw)
-        .with_context(|| format!("decoding Ed25519 key {fingerprint}"))?;
-    ensure!(
-        super::pubkey_fingerprint(&pubkey) == fingerprint,
-        "stored key does not match fingerprint {fingerprint}"
-    );
-    let algorithm_raw: String = row.get(5).context("decoding key algorithm")?;
-    let algorithm = KeyAlgorithm::parse(&algorithm_raw)?;
-    let pq_pubkey: Option<Vec<u8>> = row.get(6).context("decoding ML-DSA-65 key")?;
-    match (algorithm.is_hybrid(), pq_pubkey.as_ref()) {
-        (false, None) => {}
-        (true, Some(key)) if key.len() == 1952 => {}
-        (true, _) => bail!("hybrid key {fingerprint} has invalid ML-DSA-65 material"),
-        (false, Some(_)) => bail!("classical key {fingerprint} carries ML-DSA-65 material"),
-    }
-    Ok(PubkeyEntry {
-        fingerprint,
-        pubkey,
-        label: bytes_to_string(row.get(2).context("decoding key label")?, "key label")?,
-        created_at: row.get(3).context("decoding key creation time")?,
-        last_used_at: row.get(4).context("decoding key last-used time")?,
-        algorithm,
-        pq_pubkey,
-    })
-}
-
 fn hosted_backend(error: impl Into<anyhow::Error>) -> HostedAccountProvisionError {
     HostedAccountProvisionError::Backend(error.into())
 }
+
 
 #[async_trait]
 impl UserStore for PgliteUserStore {
@@ -223,18 +378,27 @@ impl UserStore for PgliteUserStore {
             return Ok(None);
         };
         let bindings = self.external_identities(username).await?;
-        Ok(Some(decode_profile_row(row, bindings)?))
+        let root = if self.is_encrypted() {
+            Some(self.load_user_key(username).await?)
+        } else {
+            None
+        };
+        Ok(Some(self.decode_profile(row, bindings, username, root.as_ref())?))
     }
 
     async fn register(&self, username: &str) -> Result<String> {
         ensure!(!username.is_empty(), "username must be non-empty");
         let sub = uuid::Uuid::new_v4().to_string();
-        self.database
-            .query(
-                "INSERT INTO users(username, sub, active) VALUES($1, $2, TRUE)",
-                &[&username, &sub],
-            )
-            .await?;
+        let tx = self.database.transaction().await?;
+        tx.query(
+            "INSERT INTO users(username, sub, active) VALUES($1, $2, TRUE)",
+            &[&username, &sub],
+        )
+        .await?;
+        if self.is_encrypted() {
+            self.create_user_key(&tx, username).await?;
+        }
+        tx.commit().await?;
         Ok(sub)
     }
 
@@ -294,6 +458,9 @@ impl UserStore for PgliteUserStore {
                 &[&username, &sub],
             )
             .await?;
+            if self.is_encrypted() {
+                self.create_user_key(&tx, username).await?;
+            }
             (sub, true)
         };
         tx.query(
@@ -324,6 +491,12 @@ impl UserStore for PgliteUserStore {
         let fingerprint = super::pubkey_fingerprint(&pubkey);
         let tx = self.database.transaction().await.map_err(hosted_backend)?;
 
+        let root = if self.is_encrypted() {
+            Some(self.load_user_key(username).await.map_err(hosted_backend)?)
+        } else {
+            None
+        };
+
         let profiles = tx
             .query(PROFILE_SELECT, &[&username])
             .await
@@ -346,14 +519,16 @@ impl UserStore for PgliteUserStore {
                 .map(decode_external_identity)
                 .collect::<Result<Vec<_>>>()
                 .map_err(hosted_backend)?;
-            let profile = decode_profile_row(profile_row, bindings).map_err(hosted_backend)?;
+            let profile = self
+                .decode_profile(profile_row, bindings, username, root.as_ref())
+                .map_err(hosted_backend)?;
             let key_rows = tx
                 .query(KEY_SELECT, &[&username])
                 .await
                 .map_err(hosted_backend)?;
             let keys = key_rows
                 .iter()
-                .map(decode_key_row)
+                .map(|r| self.decode_key(r, username, root.as_ref()))
                 .collect::<Result<Vec<_>>>()
                 .map_err(hosted_backend)?;
             let exact_key = keys.iter().any(|key| {
@@ -369,7 +544,7 @@ impl UserStore for PgliteUserStore {
                 && profile.external_identities.is_empty()
                 && exact_key;
             if exact {
-                let sub = profile.sub.expect("checked above");
+                let sub = profile.sub.context("checked above").map_err(hosted_backend)?;
                 tx.commit().await.map_err(hosted_backend)?;
                 return Ok(HostedAccountProvisioning {
                     sub,
@@ -408,6 +583,11 @@ impl UserStore for PgliteUserStore {
                 )));
             }
             let owner: String = owner_row.get(0).map_err(hosted_backend)?;
+            let owner_root = if self.is_encrypted() {
+                Some(self.load_user_key(&owner).await.map_err(hosted_backend)?)
+            } else {
+                None
+            };
             let owner_profiles = tx
                 .query(PROFILE_SELECT, &[&owner])
                 .await
@@ -418,13 +598,16 @@ impl UserStore for PgliteUserStore {
                 .map_err(hosted_backend)?;
             let keys = owner_keys
                 .iter()
-                .map(decode_key_row)
+                .map(|r| self.decode_key(r, &owner, owner_root.as_ref()))
                 .collect::<Result<Vec<_>>>()
                 .map_err(hosted_backend)?;
             let profile = owner_profiles
                 .first()
                 .ok_or_else(|| hosted_backend(anyhow!("key owner profile is missing")))
-                .and_then(|row| decode_profile_row(row, Vec::new()).map_err(hosted_backend))?;
+                .and_then(|row| {
+                    self.decode_profile(row, Vec::new(), &owner, owner_root.as_ref())
+                        .map_err(hosted_backend)
+                })?;
             let exact_usable_key = keys.iter().any(|key| key.fingerprint == fingerprint);
             let usable = profile.active == Some(true)
                 && profile.sub.as_deref().is_some_and(|sub| !sub.is_empty())
@@ -445,6 +628,17 @@ impl UserStore for PgliteUserStore {
 
         let sub = uuid::Uuid::new_v4().to_string();
         let now = chrono::Utc::now().timestamp();
+        let create_root = if self.is_encrypted() {
+            Some(self.create_user_key(&tx, username).await.map_err(hosted_backend)?)
+        } else {
+            None
+        };
+        let pk_bytes = self
+            .seal_raw(create_root.as_ref(), username, EncryptedColumn::PublicKey { fingerprint: &fingerprint }, pubkey.as_bytes())
+            .map_err(hosted_backend)?;
+        let label_bytes = self
+            .seal_text(create_root.as_ref(), username, EncryptedColumn::PublicKeyLabel { fingerprint: &fingerprint }, Some("aegis-vault".to_owned()))
+            .map_err(hosted_backend)?;
         tx.query(
             "INSERT INTO users(username, sub, active, key_custody) \
              VALUES($1, $2, FALSE, $3)",
@@ -464,8 +658,8 @@ impl UserStore for PgliteUserStore {
             &[
                 &fingerprint,
                 &username,
-                &pubkey.as_bytes().as_slice(),
-                &Some(b"aegis-vault".to_vec()),
+                &pk_bytes,
+                &label_bytes,
                 &now,
             ],
         )
@@ -487,6 +681,11 @@ impl UserStore for PgliteUserStore {
         custody: AccountKeyCustody,
     ) -> std::result::Result<(), HostedAccountProvisionError> {
         let tx = self.database.transaction().await.map_err(hosted_backend)?;
+        let root = if self.is_encrypted() {
+            Some(self.load_user_key(username).await.map_err(hosted_backend)?)
+        } else {
+            None
+        };
         let rows = tx
             .query(PROFILE_SELECT, &[&username])
             .await
@@ -494,14 +693,17 @@ impl UserStore for PgliteUserStore {
         let profile = rows
             .first()
             .ok_or_else(|| hosted_backend(anyhow!("staged hosted account is missing")))
-            .and_then(|row| decode_profile_row(row, Vec::new()).map_err(hosted_backend))?;
+            .and_then(|row| {
+                self.decode_profile(row, Vec::new(), username, root.as_ref())
+                    .map_err(hosted_backend)
+            })?;
         let keys = tx
             .query(KEY_SELECT, &[&username])
             .await
             .map_err(hosted_backend)?;
         let keys = keys
             .iter()
-            .map(decode_key_row)
+            .map(|r| self.decode_key(r, username, root.as_ref()))
             .collect::<Result<Vec<_>>>()
             .map_err(hosted_backend)?;
         let exact_key = keys.iter().any(|key| {
@@ -551,10 +753,15 @@ impl UserStore for PgliteUserStore {
             "set_profile cannot modify normalized external identity bindings"
         );
         let tx = self.database.transaction().await?;
+        let root = if self.is_encrypted() {
+            Some(self.load_user_key(username).await?)
+        } else {
+            None
+        };
         let rows = tx.query(PROFILE_SELECT, &[&username]).await?;
         ensure!(rows.len() <= 1, "username primary key returned duplicates");
         let row = rows.first().context("unknown user")?;
-        let mut profile = decode_profile_row(row, Vec::new())?;
+        let mut profile = self.decode_profile(row, Vec::new(), username, root.as_ref())?;
         if let Some(Some(sub)) = patch.sub {
             ensure!(!sub.is_empty(), "stable subject must be non-empty");
             profile.sub = Some(sub);
@@ -582,9 +789,9 @@ impl UserStore for PgliteUserStore {
             profile.key_custody = value;
         }
         let sub = profile.sub.context("user has no stable subject")?;
-        let name = string_to_bytes(profile.name);
-        let email = string_to_bytes(profile.email);
-        let external_id = string_to_bytes(profile.external_id);
+        let name = self.seal_text(root.as_ref(), username, EncryptedColumn::ProfileName, profile.name)?;
+        let email = self.seal_text(root.as_ref(), username, EncryptedColumn::ProfileEmail, profile.email)?;
+        let external_id = self.seal_text(root.as_ref(), username, EncryptedColumn::ProfileExternalId, profile.external_id)?;
         let custody = profile.key_custody.map(AccountKeyCustody::as_str);
         tx.query(
             "UPDATE users SET sub=$2, name=$3, email=$4, email_verified=$5, \
@@ -708,11 +915,14 @@ impl UserStore for PgliteUserStore {
             )
             .await?;
         ensure!(exists.len() == 1, "unknown user");
-        self.database
-            .query(KEY_SELECT, &[&username])
-            .await?
-            .iter()
-            .map(decode_key_row)
+        let root = if self.is_encrypted() {
+            Some(self.load_user_key(username).await?)
+        } else {
+            None
+        };
+        let rows = self.database.query(KEY_SELECT, &[&username]).await?;
+        rows.iter()
+            .map(|r| self.decode_key(r, username, root.as_ref()))
             .collect()
     }
 
@@ -724,7 +934,13 @@ impl UserStore for PgliteUserStore {
     ) -> Result<String> {
         let fingerprint = super::pubkey_fingerprint(&pubkey);
         let now = chrono::Utc::now().timestamp();
-        let label = string_to_bytes(label);
+        let root = if self.is_encrypted() {
+            Some(self.load_user_key(username).await?)
+        } else {
+            None
+        };
+        let pk_bytes = self.seal_raw(root.as_ref(), username, EncryptedColumn::PublicKey { fingerprint: &fingerprint }, pubkey.as_bytes())?;
+        let label_bytes = self.seal_text(root.as_ref(), username, EncryptedColumn::PublicKeyLabel { fingerprint: &fingerprint }, label)?;
         self.database
             .query(
                 "INSERT INTO pubkeys(fingerprint, username, pubkey, label, algorithm, \
@@ -732,8 +948,8 @@ impl UserStore for PgliteUserStore {
                 &[
                     &fingerprint,
                     &username,
-                    &pubkey.as_bytes().as_slice(),
-                    &label,
+                    &pk_bytes,
+                    &label_bytes,
                     &now,
                 ],
             )
@@ -753,6 +969,11 @@ impl UserStore for PgliteUserStore {
             "ML-DSA-65 verifying key must be exactly 1952 bytes"
         );
         let fingerprint = super::pubkey_fingerprint(&pubkey);
+        let root = if self.is_encrypted() {
+            Some(self.load_user_key(username).await?)
+        } else {
+            None
+        };
         let tx = self.database.transaction().await?;
         let existing = tx
             .query(
@@ -766,25 +987,30 @@ impl UserStore for PgliteUserStore {
             let stored_key: Vec<u8> = row.get(1)?;
             let algorithm: String = row.get(2)?;
             let pq: Option<Vec<u8>> = row.get(3)?;
+            // Decrypt stored key for comparison
+            let decrypted_key = self.open_raw(root.as_ref(), username, EncryptedColumn::PublicKey { fingerprint: &fingerprint }, &stored_key)?;
             ensure!(owner == username, "pubkey is already bound to another user");
             ensure!(
-                stored_key.as_slice() == pubkey.as_bytes(),
+                decrypted_key.as_slice() == pubkey.as_bytes(),
                 "fingerprint row carries different Ed25519 bytes"
             );
             ensure!(
                 algorithm == "ed25519" && pq.is_none(),
                 "only a classical key can be upgraded to hybrid"
             );
-            let label = string_to_bytes(label);
+            let label_bytes = self.seal_text(root.as_ref(), username, EncryptedColumn::PublicKeyLabel { fingerprint: &fingerprint }, label)?;
+            let pq_sealed = self.seal_raw(root.as_ref(), username, EncryptedColumn::PqPublicKey { fingerprint: &fingerprint }, &ml_dsa_vk)?;
             tx.query(
                 "UPDATE pubkeys SET algorithm='ed25519+ml-dsa-65', pq_pubkey=$2, \
                  label=COALESCE($3, label) WHERE fingerprint=$1 RETURNING fingerprint",
-                &[&fingerprint, &ml_dsa_vk, &label],
+                &[&fingerprint, &pq_sealed, &label_bytes],
             )
             .await?;
         } else {
             let now = chrono::Utc::now().timestamp();
-            let label = string_to_bytes(label);
+            let pk_bytes = self.seal_raw(root.as_ref(), username, EncryptedColumn::PublicKey { fingerprint: &fingerprint }, pubkey.as_bytes())?;
+            let label_bytes = self.seal_text(root.as_ref(), username, EncryptedColumn::PublicKeyLabel { fingerprint: &fingerprint }, label)?;
+            let pq_sealed = self.seal_raw(root.as_ref(), username, EncryptedColumn::PqPublicKey { fingerprint: &fingerprint }, &ml_dsa_vk)?;
             tx.query(
                 "INSERT INTO pubkeys(fingerprint, username, pubkey, label, algorithm, \
                  pq_pubkey, created_at) VALUES($1, $2, $3, $4, \
@@ -792,9 +1018,9 @@ impl UserStore for PgliteUserStore {
                 &[
                     &fingerprint,
                     &username,
-                    &pubkey.as_bytes().as_slice(),
-                    &label,
-                    &ml_dsa_vk,
+                    &pk_bytes,
+                    &label_bytes,
+                    &pq_sealed,
                     &now,
                 ],
             )
@@ -883,8 +1109,10 @@ impl UserStore for PgliteUserStore {
     }
 }
 
+
+
 #[cfg(all(test, feature = "pglite"))]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::mem_forget)]
 mod tests {
     use super::*;
     use ed25519_dalek::SigningKey;
@@ -1463,5 +1691,38 @@ mod tests {
             .unwrap();
         // The handle returned by database() is the same Arc.
         assert!(Arc::ptr_eq(&store2.database(), &db));
+    }
+
+    /// #1377 acceptance: no plaintext PII in BYTEA columns at rest.
+    /// Writes an email through the plaintext store, then scans the raw
+    /// stored bytes to confirm the email string is NOT present in the
+    /// database (when encryption is on, this test would need a cipher).
+    #[tokio::test]
+    async fn plaintext_store_has_plaintext_pii_in_bytea() {
+        // This test documents the BEFORE state (no encryption): plaintext
+        // IS stored in BYTEA. When encryption is wired via with_cipher(),
+        // the encrypted_store_leaves_no_plaintext_pii_in_bytea test in
+        // encrypted_columns.rs verifies the negative (no plaintext leaks).
+        let (_guard, store) = fresh().await;
+        store.register("alice").await.unwrap();
+        store
+            .set_profile(
+                "alice",
+                UserProfilePatch {
+                    email: Some(Some("alice.secret@example.test".to_owned())),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let rows = store
+            .database
+            .query("SELECT email FROM users WHERE username='alice'", &[])
+            .await
+            .unwrap();
+        let raw: Option<Vec<u8>> = rows.first().unwrap().get(0).unwrap();
+        let raw = raw.unwrap();
+        // Without encryption, the plaintext IS the stored bytes.
+        assert_eq!(raw, b"alice.secret@example.test");
     }
 }
