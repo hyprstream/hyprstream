@@ -13,10 +13,14 @@ use tokio::sync::RwLock;
 /// A server-side session for an authenticated user.
 #[derive(Debug, Clone)]
 pub struct Session {
-    /// Authenticated username (local subject or mapped external subject).
+    /// Authenticated subject. ATProto browser sessions store the verified DID.
     pub username: String,
     /// How the user authenticated ("local" or provider slug).
     pub auth_method: String,
+    /// Verified ATProto DID for browser sessions created by the exchange seam.
+    pub atproto_did: Option<String>,
+    /// Authority-owned tenant binding resolved from the verified identity.
+    pub verified_tenant: Option<String>,
     /// When the user authenticated.
     pub authenticated_at: Instant,
     /// When the session expires.
@@ -48,10 +52,33 @@ impl SessionStore {
         let session = Session {
             username,
             auth_method,
+            atproto_did: None,
+            verified_tenant: None,
             authenticated_at: Instant::now(),
             expires_at: Instant::now() + self.ttl,
         };
 
+        self.sessions.write().await.insert(session_id.clone(), session);
+        session_id
+    }
+
+    /// Create a browser session from a server-verified ATProto identity.
+    pub async fn create_atproto(
+        &self,
+        did: String,
+        verified_tenant: Option<String>,
+    ) -> String {
+        let mut id_bytes = [0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut id_bytes);
+        let session_id = URL_SAFE_NO_PAD.encode(id_bytes);
+        let session = Session {
+            username: did.clone(),
+            auth_method: "atproto".to_owned(),
+            atproto_did: Some(did),
+            verified_tenant,
+            authenticated_at: Instant::now(),
+            expires_at: Instant::now() + self.ttl,
+        };
         self.sessions.write().await.insert(session_id.clone(), session);
         session_id
     }
@@ -88,6 +115,7 @@ impl Default for SessionStore {
 
 /// Extract session ID from request cookies.
 pub fn extract_session_id(headers: &axum::http::HeaderMap) -> Option<String> {
+    let prefix = format!("{SESSION_COOKIE_NAME}=");
     headers
         .get(axum::http::header::COOKIE)
         .and_then(|v| v.to_str().ok())
@@ -95,8 +123,8 @@ pub fn extract_session_id(headers: &axum::http::HeaderMap) -> Option<String> {
             cookies
                 .split(';')
                 .map(str::trim)
-                .find(|c| c.starts_with(SESSION_COOKIE_NAME))
-                .and_then(|c| c.strip_prefix(&format!("{SESSION_COOKIE_NAME}=")))
+                .find_map(|cookie| cookie.strip_prefix(&prefix))
+                .filter(|session_id| !session_id.is_empty())
                 .map(String::from)
         })
 }

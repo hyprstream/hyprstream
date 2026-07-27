@@ -21,12 +21,34 @@
 //! than extending the server response.
 
 use anyhow::{anyhow, ensure, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// The RFC 8693 token-exchange grant type.
 pub const GRANT_TYPE: &str = "urn:ietf:params:oauth:grant-type:token-exchange";
 /// Issued-token type the #1314 endpoint always mints (at+jwt / access_token).
 pub const ISSUED_TOKEN_TYPE: &str = "urn:ietf:params:oauth:token-type:access_token";
+/// Browser session exchange route on the hyprstream OAuth origin.
+pub const SESSION_EXCHANGE_PATH: &str = "/api/session/exchange";
+/// Server-derived viewer context route on the hyprstream OAuth origin.
+pub const WHOAMI_PATH: &str = "/api/session/whoami";
+
+/// Server-derived browser viewer authority.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionContext {
+    pub did: Option<String>,
+    pub kind: SessionKind,
+    pub tenant: Option<String>,
+    pub can_act_locally: bool,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum SessionKind {
+    Local,
+    Federated,
+    Unauthenticated,
+}
 
 /// A successfully exchanged short-lived Bearer (at+jwt).
 ///
@@ -118,6 +140,32 @@ pub fn parse_exchange_response(body: &str) -> Result<ExchangedToken> {
     })
 }
 
+/// Parse the exact session-exchange / whoami JSON response.
+pub fn parse_session_context(body: &str) -> Result<SessionContext> {
+    let context: SessionContext = serde_json::from_str(body)
+        .map_err(|e| anyhow!("session context response is not valid JSON: {e}"))?;
+    let valid = match context.kind {
+        SessionKind::Local => {
+            context.did.as_deref().is_some_and(|did| !did.is_empty())
+                && context
+                    .tenant
+                    .as_deref()
+                    .is_some_and(|tenant| !tenant.is_empty())
+                && context.can_act_locally
+        }
+        SessionKind::Federated => {
+            context.did.as_deref().is_some_and(|did| !did.is_empty())
+                && context.tenant.is_none()
+                && !context.can_act_locally
+        }
+        SessionKind::Unauthenticated => {
+            context.did.is_none() && context.tenant.is_none() && !context.can_act_locally
+        }
+    };
+    ensure!(valid, "session context contains inconsistent viewer authority");
+    Ok(context)
+}
+
 /// Decode the `sub` claim from an exchanged at+jwt and build a `Subject`.
 ///
 /// No signature verification (see the module authority note). Returns an error
@@ -135,7 +183,10 @@ pub fn subject_from_access_token(token: &str) -> Result<crate::Subject> {
 
 #[cfg(target_arch = "wasm32")]
 mod fetch {
-    use super::{exchange_form_body, parse_exchange_response, ExchangedToken};
+    use super::{
+        exchange_form_body, parse_exchange_response, parse_session_context, ExchangedToken,
+        SessionContext, SESSION_EXCHANGE_PATH, WHOAMI_PATH,
+    };
     use anyhow::{anyhow, ensure, Context, Result};
     use wasm_bindgen::JsCast as _;
     use wasm_bindgen_futures::JsFuture;
@@ -252,10 +303,88 @@ mod fetch {
         }
         parse_exchange_response(&text)
     }
+
+    /// Exchange a one-use ATProto service-auth JWT plus DPoP proof for the
+    /// opaque HttpOnly hyprstream browser session cookie.
+    pub async fn fetch_session_exchange(
+        exchange_endpoint: &str,
+        service_auth_jwt: &str,
+        dpop_proof: &str,
+    ) -> Result<SessionContext> {
+        let mut url = parse_origin(exchange_endpoint)?;
+        url.set_path(SESSION_EXCHANGE_PATH);
+
+        let headers = web_sys::Headers::new()
+            .map_err(|e| anyhow!("session-exchange header construction failed: {e:?}"))?;
+        headers
+            .set("authorization", &format!("Bearer {service_auth_jwt}"))
+            .map_err(|e| anyhow!("session-exchange authorization set failed: {e:?}"))?;
+        headers
+            .set("dpop", dpop_proof)
+            .map_err(|e| anyhow!("session-exchange DPoP set failed: {e:?}"))?;
+        headers
+            .set("accept", "application/json")
+            .map_err(|e| anyhow!("session-exchange accept set failed: {e:?}"))?;
+
+        let init = web_sys::RequestInit::new();
+        init.set_method("POST");
+        init.set_headers(headers.as_ref());
+        init.set_cache(web_sys::RequestCache::NoStore);
+        init.set_credentials(web_sys::RequestCredentials::Include);
+        init.set_redirect(web_sys::RequestRedirect::Error);
+
+        let request = web_sys::Request::new_with_str_and_init(url.as_str(), &init)
+            .map_err(|e| anyhow!("session-exchange request construction failed: {e:?}"))?;
+        session_context_fetch(request, "session-exchange").await
+    }
+
+    /// Fetch the current viewer authority using the opaque session cookie.
+    pub async fn fetch_session_context(exchange_endpoint: &str) -> Result<SessionContext> {
+        let mut url = parse_origin(exchange_endpoint)?;
+        url.set_path(WHOAMI_PATH);
+
+        let headers = web_sys::Headers::new()
+            .map_err(|e| anyhow!("whoami header construction failed: {e:?}"))?;
+        headers
+            .set("accept", "application/json")
+            .map_err(|e| anyhow!("whoami accept set failed: {e:?}"))?;
+        let init = web_sys::RequestInit::new();
+        init.set_method("GET");
+        init.set_headers(headers.as_ref());
+        init.set_cache(web_sys::RequestCache::NoStore);
+        init.set_credentials(web_sys::RequestCredentials::Include);
+        init.set_redirect(web_sys::RequestRedirect::Error);
+
+        let request = web_sys::Request::new_with_str_and_init(url.as_str(), &init)
+            .map_err(|e| anyhow!("whoami request construction failed: {e:?}"))?;
+        session_context_fetch(request, "whoami").await
+    }
+
+    async fn session_context_fetch(
+        request: web_sys::Request,
+        operation: &str,
+    ) -> Result<SessionContext> {
+        let window = web_sys::window().ok_or_else(|| anyhow!("browser window unavailable"))?;
+        let response_value = JsFuture::from(window.fetch_with_request(&request))
+            .await
+            .map_err(|e| anyhow!("{operation} fetch failed: {e:?}"))?;
+        let response: web_sys::Response = response_value
+            .dyn_into()
+            .map_err(|_| anyhow!("{operation} fetch returned a non-Response"))?;
+        let text = read_body_text(&response).await?;
+        if !response.ok() {
+            return Err(anyhow!(
+                "{operation} endpoint returned HTTP {}: {}",
+                response.status(),
+                text.trim()
+            ));
+        }
+        parse_session_context(&text)
+    }
 }
 
 #[cfg(target_arch = "wasm32")]
-pub use fetch::fetch_exchange_token;
+pub use fetch::{fetch_exchange_token, fetch_session_context, fetch_session_exchange};
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
@@ -363,5 +492,37 @@ mod tests {
         );
         assert!(rendered.contains("<redacted>"));
         assert!(rendered.contains("300"));
+    }
+
+    #[test]
+    fn parses_local_session_context() {
+        let context = parse_session_context(
+            r#"{"did":"did:web:alice.example","kind":"local","tenant":"acme","canActLocally":true}"#,
+        )
+        .unwrap();
+        assert_eq!(context.did.as_deref(), Some("did:web:alice.example"));
+        assert_eq!(context.kind, SessionKind::Local);
+        assert_eq!(context.tenant.as_deref(), Some("acme"));
+        assert!(context.can_act_locally);
+    }
+
+    #[test]
+    fn parses_unauthenticated_floor() {
+        let context = parse_session_context(
+            r#"{"did":null,"kind":"unauthenticated","tenant":null,"canActLocally":false}"#,
+        )
+        .unwrap();
+        assert_eq!(context.kind, SessionKind::Unauthenticated);
+        assert!(context.did.is_none());
+        assert!(context.tenant.is_none());
+        assert!(!context.can_act_locally);
+    }
+
+    #[test]
+    fn rejects_inconsistent_session_authority() {
+        assert!(parse_session_context(
+            r#"{"did":"did:web:alice.example","kind":"federated","tenant":"client-asserted","canActLocally":true}"#,
+        )
+        .is_err());
     }
 }

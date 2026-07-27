@@ -28,6 +28,7 @@
 
 pub mod auth;
 pub mod authorize;
+pub mod browser_session;
 pub mod challenge;
 pub mod cimd_cache;
 pub mod client_auth;
@@ -147,6 +148,14 @@ pub fn create_app(state: Arc<OAuthState>, cors_config: &crate::config::CorsConfi
         )
         .route("/oauth/revoke", post(revocation::revoke_token))
         .route("/oauth/logout", post(handle_logout))
+        .route(
+            browser_session::SESSION_EXCHANGE_PATH,
+            post(browser_session::exchange),
+        )
+        .route(
+            browser_session::WHOAMI_PATH,
+            get(browser_session::whoami),
+        )
         .route(
             "/oauth/external/authorize/:provider",
             get(oidc_callback::external_authorize),
