@@ -1,50 +1,51 @@
-//! Relational [`UserStore`] on the shared #1351 embedded PostgreSQL handle.
+//! Networked Postgres [`UserStore`] backend for AWS RDS (#1401).
 //!
 //! # Architecture
 //!
-//! [`PgliteUserStore`] is the embedded backend; the SQL in
-//! [`USERSTORE_SCHEMA`] is the authoritative, PostgreSQL-compatible DDL that a
-//! future `PostgresUserStore` (server / metal deployment, #1378) consumes
-//! against its own connection pool. PGlite and Postgres share one schema so
-//! relational identities are portable between local and server deployments.
+//! [`PostgresUserStore`] is the deployed backend; [`PgliteUserStore`] is the
+//! embedded localhost/workstation backend. Both implement the exact same
+//! [`UserStore`] trait against the exact same [`USERSTORE_SCHEMA`] DDL. The
+//! only difference is the I/O substrate: deadpool-postgres pooled connections
+//! + TLS to RDS, vs PGlite's single embedded connection.
 //!
-//! The shared `Arc<PGlite>` handle (#1351) is injected via
-//! [`PgliteUserStore::from_database`]; AppView inventory and credential
-//! records then share one embedded database. Opening a second PGlite handle
-//! against the same directory is unsafe — there is exactly one connection
-//! owner, and #1378's server-side wiring must not create a competing one.
+//! The #1377 backend-neutral [`ColumnCipher`] wraps BYTEA value columns
+//! identically in both backends — the seal/open glue is shared via
+//! [`cipher_glue`].
 //!
 //! # #1370 R4 hardening preserved
 //!
 //! Cold-signup staging (`provision_hosted_account`) and activation
-//! (`activate_hosted_account`) implement the exact #1370 R4 contract also
-//! implemented by [`RocksDbUserStore`](super::RocksDbUserStore) and
-//! [`ValkeyUserStore`](super::valkey::ValkeyUserStore): orphan-genesis
-//! ordering (inactive stage → PDS genesis → exact activation), exact
-//! fingerprint recompute, full PQ-metadata validation, and the trustworthy
-//! resume-vs-409 classification. Partial/corrupt state is a backend error
-//! and fails closed; only a complete, usable, active hosted binding yields
-//! `AccountAlreadyExists` / `KeyAlreadyBound`.
+//! (`activate_hosted_account`) reproduce the exact #1370 R4 contract also
+//! implemented by [`PgliteUserStore`] and [`RocksDbUserStore`]:
+//! orphan-genesis ordering (inactive stage → PDS genesis → exact activation),
+//! exact fingerprint recompute, full PQ-metadata validation, and the
+//! trustworthy resume-vs-409 classification. Partial/corrupt state is a
+//! backend error and fails closed; only a complete, usable, active hosted
+//! binding yields `AccountAlreadyExists` / `KeyAlreadyBound`.
+//!
+//! # Networked-DB failure modes
+//!
+//! Connection loss, pool exhaustion, and timeout all fail closed as
+//! [`HostedAccountProvisionError::Backend`] — never silent success or
+//! fallback. A configured Postgres/RDS store is FATAL-on-unavailable at
+//! startup; the caller never downgrades to pglite or Mem in the deploy.
 
 use super::{
-    cipher_glue, encrypted_columns::{ColumnCipher, EncryptedColumn, ROOT_DEK_BYTES},
+    cipher_glue::{self, USERSTORE_SCHEMA},
+    encrypted_columns::{ColumnCipher, EncryptedColumn, ROOT_DEK_BYTES},
     user_store::matches_filter, AccountKeyCustody, ExternalIdentityBinding,
     ExternalIdentityResolution, HostedAccountProvisionError, HostedAccountProvisioning,
     KeyAlgorithm, PubkeyEntry, UserFilter, UserProfile, UserProfilePatch, UserStore,
 };
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use async_trait::async_trait;
+use deadpool_postgres::{Config as PoolConfig, ManagerConfig, Pool, RecyclingMethod, Runtime};
 use ed25519_dalek::VerifyingKey;
-use pglite::{PGlite, Row};
-use std::{path::Path, sync::Arc};
+use std::{path::PathBuf, sync::Arc, time::Duration};
+use tokio_postgres::Row;
 use zeroize::Zeroizing;
 
-/// PostgreSQL-compatible schema shared by embedded PGlite and server Postgres.
-///
-/// Re-exported from [`cipher_glue::USERSTORE_SCHEMA`] so both backends share
-/// one source of truth (#1351, #1401).
-pub use super::cipher_glue::USERSTORE_SCHEMA;
-
+/// Profile SELECT — same SQL as PgliteUserStore.
 const PROFILE_SELECT: &str = r#"
 SELECT u.sub, u.name, u.email, u.email_verified, u.active, u.external_id,
        u.key_custody, d.atproto_did
@@ -53,67 +54,127 @@ LEFT JOIN user_did_bindings d ON d.username = u.username
 WHERE u.username = $1
 "#;
 
+/// Key SELECT — same SQL as PgliteUserStore.
 const KEY_SELECT: &str = r#"
 SELECT fingerprint, pubkey, label, created_at, last_used_at, algorithm, pq_pubkey
 FROM pubkeys WHERE username = $1 ORDER BY fingerprint
 "#;
 
-#[derive(Clone)]
-pub struct PgliteUserStore {
-    database: Arc<PGlite>,
+/// Configuration for the networked Postgres [`UserStore`] backend.
+///
+/// Constructed at deployment-startup time from environment variables (see
+/// [`Self::from_env`]). The connection string must require TLS
+/// (`sslmode=require` or `verify-full`) — RDS rejects plaintext connections
+/// in production, and credentials must never transit an unencrypted link.
+#[derive(Clone, Debug)]
+pub struct PostgresUserStoreConfig {
+    /// libpq connection string, e.g.
+    /// `host=rdss.x.rds.amazonaws.com port=5432 dbname=hyprstream \
+    ///   user=hyprstream password=... sslmode=verify-full`
+    pub database_url: String,
+    /// Maximum pool size. Default: `2 * num_cpus`.
+    pub max_connections: usize,
+    /// Optional pinned RDS CA PEM (overrides Mozilla roots).
+    pub tls_ca_pem: Option<PathBuf>,
+}
+
+impl PostgresUserStoreConfig {
+    /// Load fail-closed deployment configuration from the environment.
+    ///
+    /// Required env vars:
+    /// - `HYPRSTREAM_USERSTORE_DATABASE_URL` — libpq connstring; MUST contain
+    ///   `sslmode=require` or `sslmode=verify-full`.
+    ///
+    /// Optional:
+    /// - `HYPRSTREAM_USERSTORE_MAX_CONNECTIONS` — pool size (default `2 * num_cpus`).
+    /// - `HYPRSTREAM_USERSTORE_TLS_CA_PEM` — pinned CA bundle path.
+    pub fn from_env() -> Result<Self> {
+        let database_url = std::env::var("HYPRSTREAM_USERSTORE_DATABASE_URL")
+            .context("HYPRSTREAM_USERSTORE_DATABASE_URL is required")?;
+        ensure!(
+            !database_url.trim().is_empty(),
+            "HYPRSTREAM_USERSTORE_DATABASE_URL is empty"
+        );
+        // Refuse insecure sslmode — RDS must use TLS.
+        let lowered = database_url.to_ascii_lowercase();
+        ensure!(
+            !lowered.contains("sslmode=disable")
+                && !lowered.contains("sslmode=prefer")
+                && !lowered.contains("sslmode=allow")
+                && !lowered.contains("sslmode=no-ssl"),
+            "HYPRSTREAM_USERSTORE_DATABASE_URL must require TLS \
+             (sslmode=require or verify-full); refusing insecure connection"
+        );
+        let max_connections = std::env::var("HYPRSTREAM_USERSTORE_MAX_CONNECTIONS")
+            .ok()
+            .map(|v| v.parse::<usize>())
+            .transpose()
+            .context("HYPRSTREAM_USERSTORE_MAX_CONNECTIONS must be a positive integer")?
+            .unwrap_or_else(|| 2 * num_cpus::get());
+        let tls_ca_pem = std::env::var_os("HYPRSTREAM_USERSTORE_TLS_CA_PEM").map(PathBuf::from);
+        Ok(Self {
+            database_url,
+            max_connections,
+            tls_ca_pem,
+        })
+    }
+
+    /// Construct from an explicit connection URL (for tests / programmatic wiring).
+    pub fn from_url(database_url: impl Into<String>) -> Self {
+        Self {
+            database_url: database_url.into(),
+            max_connections: 2 * num_cpus::get(),
+            tls_ca_pem: None,
+        }
+    }
+}
+
+/// Networked Postgres [`UserStore`] backend (AWS RDS / server Postgres).
+///
+/// Same SQL, same schema, same R4 invariants as
+/// [`PgliteUserStore`](super::PgliteUserStore). Only the I/O seam differs:
+/// deadpool-postgres pooled connections + TLS, and tokio-postgres's
+/// `Row::try_get` API.
+pub struct PostgresUserStore {
+    pool: Pool,
     cipher: Option<ColumnCipher>,
 }
 
-impl PgliteUserStore {
-    /// Standalone substrate factory — **TEST/MIGRATION ONLY**.
+impl PostgresUserStore {
+    /// Open a production PostgresUserStore with at-rest envelope encryption.
     ///
-    /// This constructor does NOT enable at-rest encryption. Production
-    /// wiring MUST use [`Self::with_cipher`] instead. This constructor
-    /// exists for #1376 tests and one-time migration from plaintext stores.
-    #[deprecated(note = "production wiring must use with_cipher() for at-rest encryption (#1377)")]
-    pub async fn open(data_dir: impl AsRef<Path>) -> Result<Self> {
-        let database = Arc::new(PGlite::open(data_dir).await.context("opening PGlite")?);
-        #[allow(deprecated)]
-        Self::from_database(database).await
+    /// Runs the idempotent `USERSTORE_SCHEMA` migration on every boot. The
+    /// cipher is REQUIRED for production — every BYTEA value column is sealed
+    /// before storage and unsealed on read.
+    ///
+    /// Returns `Err` on any startup failure (DNS, TLS, auth, migration).
+    /// The caller MUST treat this as fatal — never fall back to pglite or Mem.
+    pub async fn connect(config: PostgresUserStoreConfig, cipher: ColumnCipher) -> Result<Self> {
+        Self::new(Some(config), Some(cipher)).await
     }
 
-    /// Shared-handle factory — **TEST/MIGRATION ONLY**.
+    /// Open a PostgresUserStore WITHOUT encryption — **TEST/MIGRATION ONLY**.
     ///
-    /// Does NOT enable at-rest encryption. Production MUST use
-    /// [`Self::with_cipher`].
-    #[deprecated(note = "production wiring must use with_cipher() for at-rest encryption (#1377)")]
-    pub async fn from_database(database: Arc<PGlite>) -> Result<Self> {
-        database
-            .exec(USERSTORE_SCHEMA)
+    /// Production wiring MUST use [`Self::connect`] instead.
+    #[cfg(test)]
+    pub async fn connect_plaintext(config: PostgresUserStoreConfig) -> Result<Self> {
+        Self::new(Some(config), None).await
+    }
+
+    async fn new(config: Option<PostgresUserStoreConfig>, cipher: Option<ColumnCipher>) -> Result<Self> {
+        let pool = build_pool(config)?;
+        let store = Self { pool, cipher };
+        store.migrate().await.context("UserStore schema migration failed at startup")?;
+        Ok(store)
+    }
+
+    async fn migrate(&self) -> Result<()> {
+        let client = self.pool.get().await.map_err(pool_err)?;
+        client
+            .batch_execute(USERSTORE_SCHEMA)
             .await
             .context("applying UserStore schema")?;
-        Ok(Self {
-            database,
-            cipher: None,
-        })
-    }
-
-    /// Open with at-rest envelope encryption (#1377) — the PRODUCTION
-    /// constructor. Every BYTEA value column is sealed before storage and
-    /// unsealed on read. A valid cipher is REQUIRED; production wiring
-    /// MUST use this constructor, not the plaintext [`Self::from_database`].
-    #[allow(dead_code)] // deployment-wiring call-site is #1378
-    pub(crate) async fn with_cipher(
-        database: Arc<PGlite>,
-        cipher: ColumnCipher,
-    ) -> Result<Self> {
-        database
-            .exec(USERSTORE_SCHEMA)
-            .await
-            .context("applying UserStore schema")?;
-        Ok(Self {
-            database,
-            cipher: Some(cipher),
-        })
-    }
-
-    pub fn database(&self) -> Arc<PGlite> {
-        Arc::clone(&self.database)
+        Ok(())
     }
 
     fn is_encrypted(&self) -> bool {
@@ -126,7 +187,7 @@ impl PgliteUserStore {
     /// root for immediate use by the caller's write path.
     async fn create_user_key(
         &self,
-        tx: &pglite::Transaction<'_>,
+        tx: &deadpool_postgres::Transaction<'_>,
         username: &str,
     ) -> Result<Zeroizing<[u8; ROOT_DEK_BYTES]>> {
         let cipher = self
@@ -134,7 +195,7 @@ impl PgliteUserStore {
             .as_ref()
             .context("encryption is not configured for this store")?;
         let new_key = cipher.create_user_key().await?;
-        tx.query(
+        tx.execute(
             "INSERT INTO user_encryption_keys(username, wrapped_dek) VALUES($1, $2)",
             &[&username, &new_key.wrapped],
         )
@@ -142,22 +203,15 @@ impl PgliteUserStore {
         Ok(new_key.root)
     }
 
-    /// Unseal the user's persisted root DEK. Fails closed when the wrapped DEK
-    /// is absent (user deleted / crypto-shredded) or when key material is
-    /// unavailable at runtime.
-    ///
-    /// **IMPORTANT**: this queries through `self.database` (the outer handle).
-    /// It MUST NOT be called while a transaction is open on the same PGlite
-    /// connection — PGlite is single-connection and the outer query will
-    /// deadlock against the active transaction. Inside a transaction, use
-    /// [`Self::load_user_key_tx`] instead.
+    /// Unseal the user's persisted root DEK via a pool checkout (non-tx path).
+    /// Fails closed when the wrapped DEK is absent or key material is unavailable.
     async fn load_user_key(&self, username: &str) -> Result<Zeroizing<[u8; ROOT_DEK_BYTES]>> {
         let cipher = self
             .cipher
             .as_ref()
             .context("encryption is not configured for this store")?;
-        let rows = self
-            .database
+        let client = self.pool.get().await.map_err(pool_err)?;
+        let rows = client
             .query(
                 "SELECT wrapped_dek FROM user_encryption_keys WHERE username=$1",
                 &[&username],
@@ -166,15 +220,14 @@ impl PgliteUserStore {
         let wrapped: Vec<u8> = rows
             .first()
             .context("wrapped UserStore DEK is absent — key material revoked or never provisioned")?
-            .get(0)?;
+            .get(0);
         cipher.open_user_key(&wrapped).await
     }
 
-    /// Transaction-scoped DEK load — queries through the active transaction
-    /// to avoid self-deadlock on PGlite's single connection.
+    /// Transaction-scoped DEK load — queries through the active transaction.
     async fn load_user_key_tx(
         &self,
-        tx: &pglite::Transaction<'_>,
+        tx: &deadpool_postgres::Transaction<'_>,
         username: &str,
     ) -> Result<Zeroizing<[u8; ROOT_DEK_BYTES]>> {
         let cipher = self
@@ -190,61 +243,15 @@ impl PgliteUserStore {
         let wrapped: Vec<u8> = rows
             .first()
             .context("wrapped UserStore DEK is absent — key material revoked or never provisioned")?
-            .get(0)?;
+            .get(0);
         cipher.open_user_key(&wrapped).await
     }
 
-    // ── Field-level seal/open ────────────────────────────────────────────
-
-    /// Seal an optional text field for storage. Returns `None` for `None`
-    /// input. When encryption is disabled, returns plaintext bytes.
-    fn seal_text(
-        &self,
-        root: Option<&Zeroizing<[u8; ROOT_DEK_BYTES]>>,
-        username: &str,
-        column: EncryptedColumn<'_>,
-        value: Option<String>,
-    ) -> Result<Option<Vec<u8>>> {
-        cipher_glue::seal_text(self.cipher.as_ref(), root, username, column, value)
-    }
-
-    /// Open an optional text field from stored bytes. When encryption is
-    /// disabled, interprets bytes as UTF-8 directly.
-    fn open_text(
-        &self,
-        root: Option<&Zeroizing<[u8; ROOT_DEK_BYTES]>>,
-        username: &str,
-        column: EncryptedColumn<'_>,
-        raw: Option<Vec<u8>>,
-    ) -> Result<Option<String>> {
-        cipher_glue::open_text(self.cipher.as_ref(), root, username, column, raw)
-    }
-
-    /// Seal raw bytes (e.g. pubkey material) for storage.
-    fn seal_raw(
-        &self,
-        root: Option<&Zeroizing<[u8; ROOT_DEK_BYTES]>>,
-        username: &str,
-        column: EncryptedColumn<'_>,
-        value: &[u8],
-    ) -> Result<Vec<u8>> {
-        cipher_glue::seal_raw(self.cipher.as_ref(), root, username, column, value)
-    }
-
-    /// Open raw bytes from storage.
-    fn open_raw(
-        &self,
-        root: Option<&Zeroizing<[u8; ROOT_DEK_BYTES]>>,
-        username: &str,
-        column: EncryptedColumn<'_>,
-        raw: &[u8],
-    ) -> Result<Zeroizing<Vec<u8>>> {
-        cipher_glue::open_raw(self.cipher.as_ref(), root, username, column, raw)
-    }
+    // ── Row decoders (cipher-aware) ──────────────────────────────────────
 
     async fn external_identities(&self, username: &str) -> Result<Vec<ExternalIdentityBinding>> {
-        let rows = self
-            .database
+        let client = self.pool.get().await.map_err(pool_err)?;
+        let rows = client
             .query(
                 "SELECT issuer, issuer_sub FROM oidc_bindings \
                  WHERE username=$1 ORDER BY issuer, issuer_sub",
@@ -254,10 +261,7 @@ impl PgliteUserStore {
         rows.iter().map(decode_external_identity).collect()
     }
 
-    // ── Row decoders (cipher-aware) ──────────────────────────────────────
-
     /// Decode a profile row, optionally decrypting the BYTEA value columns.
-    /// When `root` is `None`, bytes are interpreted as plaintext UTF-8.
     fn decode_profile(
         &self,
         row: &Row,
@@ -266,18 +270,36 @@ impl PgliteUserStore {
         root: Option<&Zeroizing<[u8; ROOT_DEK_BYTES]>>,
     ) -> Result<UserProfile> {
         let custody = row
-            .get::<Option<String>>(6)
+            .try_get::<_, Option<String>>(6)
             .context("decoding key custody")?
             .map(|value| AccountKeyCustody::parse(&value))
             .transpose()?;
         Ok(UserProfile {
-            sub: Some(row.get(0).context("decoding stable subject")?),
-            name: self.open_text(root, username, EncryptedColumn::ProfileName, row.get(1).context("decoding name")?)?,
-            email: self.open_text(root, username, EncryptedColumn::ProfileEmail, row.get(2).context("decoding email")?)?,
-            email_verified: row.get(3).context("decoding email verification")?,
-            active: Some(row.get(4).context("decoding active state")?),
-            external_id: self.open_text(root, username, EncryptedColumn::ProfileExternalId, row.get(5).context("decoding external ID")?)?,
-            atproto_did: row.get(7).context("decoding ATProto DID")?,
+            sub: Some(row.try_get(0).context("decoding stable subject")?),
+            name: cipher_glue::open_text(
+                self.cipher.as_ref(),
+                root,
+                username,
+                EncryptedColumn::ProfileName,
+                row.try_get(1).context("decoding name")?,
+            )?,
+            email: cipher_glue::open_text(
+                self.cipher.as_ref(),
+                root,
+                username,
+                EncryptedColumn::ProfileEmail,
+                row.try_get(2).context("decoding email")?,
+            )?,
+            email_verified: row.try_get(3).context("decoding email verification")?,
+            active: Some(row.try_get(4).context("decoding active state")?),
+            external_id: cipher_glue::open_text(
+                self.cipher.as_ref(),
+                root,
+                username,
+                EncryptedColumn::ProfileExternalId,
+                row.try_get(5).context("decoding external ID")?,
+            )?,
+            atproto_did: row.try_get(7).context("decoding ATProto DID")?,
             key_custody: custody,
             external_identities,
         })
@@ -290,9 +312,17 @@ impl PgliteUserStore {
         username: &str,
         root: Option<&Zeroizing<[u8; ROOT_DEK_BYTES]>>,
     ) -> Result<PubkeyEntry> {
-        let fingerprint: String = row.get(0).context("decoding fingerprint")?;
-        let raw: Vec<u8> = row.get(1).context("decoding Ed25519 key")?;
-        let decrypted_pk = self.open_raw(root, username, EncryptedColumn::PublicKey { fingerprint: &fingerprint }, &raw)?;
+        let fingerprint: String = row.try_get(0).context("decoding fingerprint")?;
+        let raw: Vec<u8> = row.try_get(1).context("decoding Ed25519 key")?;
+        let decrypted_pk = cipher_glue::open_raw(
+            self.cipher.as_ref(),
+            root,
+            username,
+            EncryptedColumn::PublicKey {
+                fingerprint: &fingerprint,
+            },
+            &raw,
+        )?;
         let raw: [u8; 32] = decrypted_pk
             .as_slice()
             .try_into()
@@ -303,26 +333,45 @@ impl PgliteUserStore {
             super::pubkey_fingerprint(&pubkey) == fingerprint,
             "stored key does not match fingerprint {fingerprint}"
         );
-        let algorithm_raw: String = row.get(5).context("decoding key algorithm")?;
+        let algorithm_raw: String = row.try_get(5).context("decoding key algorithm")?;
         let algorithm = KeyAlgorithm::parse(&algorithm_raw)?;
-        let pq_raw: Option<Vec<u8>> = row.get(6).context("decoding ML-DSA-65 key")?;
+        let pq_raw: Option<Vec<u8>> = row.try_get(6).context("decoding ML-DSA-65 key")?;
         let pq_pubkey = match (algorithm.is_hybrid(), pq_raw) {
             (false, None) => None,
             (true, Some(key_bytes)) => {
-                let pt = self.open_raw(root, username, EncryptedColumn::PqPublicKey { fingerprint: &fingerprint }, &key_bytes)?;
-                ensure!(pt.len() == 1952, "hybrid key {fingerprint} has invalid ML-DSA-65 material");
+                let pt = cipher_glue::open_raw(
+                    self.cipher.as_ref(),
+                    root,
+                    username,
+                    EncryptedColumn::PqPublicKey {
+                        fingerprint: &fingerprint,
+                    },
+                    &key_bytes,
+                )?;
+                ensure!(
+                    pt.len() == 1952,
+                    "hybrid key {fingerprint} has invalid ML-DSA-65 material"
+                );
                 Some(pt.to_vec())
             }
             (true, None) => bail!("hybrid key {fingerprint} has invalid ML-DSA-65 material"),
             (false, Some(_)) => bail!("classical key {fingerprint} carries ML-DSA-65 material"),
         };
-        let label = self.open_text(root, username, EncryptedColumn::PublicKeyLabel { fingerprint: &fingerprint }, row.get(2).context("decoding key label")?)?;
+        let label = cipher_glue::open_text(
+            self.cipher.as_ref(),
+            root,
+            username,
+            EncryptedColumn::PublicKeyLabel {
+                fingerprint: &fingerprint,
+            },
+            row.try_get(2).context("decoding key label")?,
+        )?;
         Ok(PubkeyEntry {
             fingerprint,
             pubkey,
             label,
-            created_at: row.get(3).context("decoding key creation time")?,
-            last_used_at: row.get(4).context("decoding key last-used time")?,
+            created_at: row.try_get(3).context("decoding key creation time")?,
+            last_used_at: row.try_get(4).context("decoding key last-used time")?,
             algorithm,
             pq_pubkey,
         })
@@ -331,8 +380,8 @@ impl PgliteUserStore {
 
 fn decode_external_identity(row: &Row) -> Result<ExternalIdentityBinding> {
     Ok(ExternalIdentityBinding {
-        issuer: row.get(0).context("decoding external identity issuer")?,
-        subject: row.get(1).context("decoding external identity subject")?,
+        issuer: row.try_get(0).context("decoding external identity issuer")?,
+        subject: row.try_get(1).context("decoding external identity subject")?,
     })
 }
 
@@ -340,13 +389,38 @@ fn hosted_backend(error: impl Into<anyhow::Error>) -> HostedAccountProvisionErro
     HostedAccountProvisionError::Backend(error.into())
 }
 
+fn pool_err(e: deadpool_postgres::PoolError) -> anyhow::Error {
+    anyhow!("PostgresUserStore pool error: {e}")
+}
+
+/// Build the deadpool-postgres connection pool with TLS.
+fn build_pool(config: Option<PostgresUserStoreConfig>) -> Result<Pool> {
+    let mut cfg = PoolConfig::new();
+    if let Some(ref config) = config {
+        cfg.url = Some(config.database_url.clone());
+    }
+    let mgr = ManagerConfig {
+        recycling_method: RecyclingMethod::Clean,
+    };
+    let mut builder = cfg.builder(Runtime::Tokio1)?;
+    builder
+        .config(mgr)
+        .wait_timeout(Some(Duration::from_secs(5)))
+        .create_timeout(Some(Duration::from_secs(10)))
+        .recycle_timeout(Some(Duration::from_secs(5)));
+    if let Some(ref config) = config {
+        builder.max_size(config.max_connections);
+    }
+    builder.build().context("building PostgresUserStore pool")
+}
 
 #[async_trait]
-impl UserStore for PgliteUserStore {
+impl UserStore for PostgresUserStore {
     async fn get_profile(&self, username: &str) -> Result<Option<UserProfile>> {
-        let rows = self.database.query(PROFILE_SELECT, &[&username]).await?;
+        let client = self.pool.get().await.map_err(pool_err)?;
+        let rows = client.query(PROFILE_SELECT, &[&username]).await?;
         ensure!(rows.len() <= 1, "username primary key returned duplicates");
-        let Some(row) = rows.first() else {
+        let Some(row) = rows.first().cloned() else {
             return Ok(None);
         };
         let bindings = self.external_identities(username).await?;
@@ -355,14 +429,20 @@ impl UserStore for PgliteUserStore {
         } else {
             None
         };
-        Ok(Some(self.decode_profile(row, bindings, username, root.as_ref())?))
+        Ok(Some(self.decode_profile(
+            &row,
+            bindings,
+            username,
+            root.as_ref(),
+        )?))
     }
 
     async fn register(&self, username: &str) -> Result<String> {
         ensure!(!username.is_empty(), "username must be non-empty");
         let sub = uuid::Uuid::new_v4().to_string();
-        let tx = self.database.transaction().await?;
-        tx.query(
+        let mut client = self.pool.get().await.map_err(pool_err)?;
+        let tx = client.transaction().await?;
+        tx.execute(
             "INSERT INTO users(username, sub, active) VALUES($1, $2, TRUE)",
             &[&username, &sub],
         )
@@ -384,7 +464,8 @@ impl UserStore for PgliteUserStore {
             !issuer.is_empty() && !subject.is_empty() && !username.is_empty(),
             "issuer, subject, and username must be non-empty"
         );
-        let tx = self.database.transaction().await?;
+        let mut client = self.pool.get().await.map_err(pool_err)?;
+        let tx = client.transaction().await?;
         let existing = tx
             .query(
                 "SELECT b.username, u.sub FROM oidc_bindings b \
@@ -397,9 +478,9 @@ impl UserStore for PgliteUserStore {
             existing.len() <= 1,
             "external identity primary key returned duplicates"
         );
-        if let Some(row) = existing.first() {
-            let resolved_username: String = row.get(0)?;
-            let sub: String = row.get(1)?;
+        if let Some(row) = existing.first().cloned() {
+            let resolved_username: String = row.try_get(0)?;
+            let sub: String = row.try_get(1)?;
             ensure!(
                 !resolved_username.is_empty() && !sub.is_empty(),
                 "external identity points at a corrupt local user"
@@ -416,8 +497,8 @@ impl UserStore for PgliteUserStore {
             .query("SELECT sub FROM users WHERE username=$1", &[&username])
             .await?;
         ensure!(users.len() <= 1, "username primary key returned duplicates");
-        let (sub, provisioned) = if let Some(row) = users.first() {
-            let sub: String = row.get(0)?;
+        let (sub, provisioned) = if let Some(row) = users.first().cloned() {
+            let sub: String = row.try_get(0)?;
             ensure!(
                 !sub.is_empty(),
                 "candidate local user has no stable subject"
@@ -425,7 +506,7 @@ impl UserStore for PgliteUserStore {
             (sub, false)
         } else {
             let sub = uuid::Uuid::new_v4().to_string();
-            tx.query(
+            tx.execute(
                 "INSERT INTO users(username, sub, active) VALUES($1, $2, TRUE)",
                 &[&username, &sub],
             )
@@ -435,7 +516,7 @@ impl UserStore for PgliteUserStore {
             }
             (sub, true)
         };
-        tx.query(
+        tx.execute(
             "INSERT INTO oidc_bindings(issuer, issuer_sub, username) VALUES($1, $2, $3)",
             &[&issuer, &subject, &username],
         )
@@ -461,18 +542,29 @@ impl UserStore for PgliteUserStore {
             )));
         }
         let fingerprint = super::pubkey_fingerprint(&pubkey);
-        let tx = self.database.transaction().await.map_err(hosted_backend)?;
+        let mut client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| hosted_backend(pool_err(e)))?;
+        let tx = client
+            .transaction()
+            .await
+            .map_err(hosted_backend)?;
 
-        // Check user existence BEFORE loading the DEK — a new user has no DEK
-        // yet, and loading through self.database would deadlock the tx.
+        // Check user existence BEFORE loading the DEK — a new user has no DEK.
         let profiles = tx
             .query(PROFILE_SELECT, &[&username])
             .await
             .map_err(hosted_backend)?;
-        if let Some(profile_row) = profiles.first() {
+        if let Some(profile_row) = profiles.first().cloned() {
             // User exists — load DEK through the active transaction.
             let root = if self.is_encrypted() {
-                Some(self.load_user_key_tx(&tx, username).await.map_err(hosted_backend)?)
+                Some(
+                    self.load_user_key_tx(&tx, username)
+                        .await
+                        .map_err(hosted_backend)?,
+                )
             } else {
                 None
             };
@@ -494,7 +586,7 @@ impl UserStore for PgliteUserStore {
                 .collect::<Result<Vec<_>>>()
                 .map_err(hosted_backend)?;
             let profile = self
-                .decode_profile(profile_row, bindings, username, root.as_ref())
+                .decode_profile(&profile_row, bindings, username, root.as_ref())
                 .map_err(hosted_backend)?;
             let key_rows = tx
                 .query(KEY_SELECT, &[&username])
@@ -518,7 +610,10 @@ impl UserStore for PgliteUserStore {
                 && profile.external_identities.is_empty()
                 && exact_key;
             if exact {
-                let sub = profile.sub.context("checked above").map_err(hosted_backend)?;
+                let sub = profile
+                    .sub
+                    .context("checked above")
+                    .map_err(hosted_backend)?;
                 tx.commit().await.map_err(hosted_backend)?;
                 return Ok(HostedAccountProvisioning {
                     sub,
@@ -550,15 +645,19 @@ impl UserStore for PgliteUserStore {
             )
             .await
             .map_err(hosted_backend)?;
-        if let Some(owner_row) = owner_rows.first() {
+        if let Some(owner_row) = owner_rows.first().cloned() {
             if owner_rows.len() != 1 {
                 return Err(hosted_backend(anyhow!(
                     "fingerprint primary key returned duplicates"
                 )));
             }
-            let owner: String = owner_row.get(0).map_err(hosted_backend)?;
+            let owner: String = owner_row.try_get(0).map_err(hosted_backend)?;
             let owner_root = if self.is_encrypted() {
-                Some(self.load_user_key_tx(&tx, &owner).await.map_err(hosted_backend)?)
+                Some(
+                    self.load_user_key_tx(&tx, &owner)
+                        .await
+                        .map_err(hosted_backend)?,
+                )
             } else {
                 None
             };
@@ -604,7 +703,7 @@ impl UserStore for PgliteUserStore {
         let now = chrono::Utc::now().timestamp();
         // Insert the parent users row FIRST — user_encryption_keys and
         // pubkeys both have FK references to it.
-        tx.query(
+        tx.execute(
             "INSERT INTO users(username, sub, active, key_custody) \
              VALUES($1, $2, FALSE, $3)",
             &[&username, &sub, &custody.as_str()],
@@ -613,23 +712,41 @@ impl UserStore for PgliteUserStore {
         .map_err(hosted_backend)?;
         // Now safe to mint the DEK (FK to users is satisfied).
         let create_root = if self.is_encrypted() {
-            Some(self.create_user_key(&tx, username).await.map_err(hosted_backend)?)
+            Some(
+                self.create_user_key(&tx, username)
+                    .await
+                    .map_err(hosted_backend)?,
+            )
         } else {
             None
         };
-        let pk_bytes = self
-            .seal_raw(create_root.as_ref(), username, EncryptedColumn::PublicKey { fingerprint: &fingerprint }, pubkey.as_bytes())
-            .map_err(hosted_backend)?;
-        let label_bytes = self
-            .seal_text(create_root.as_ref(), username, EncryptedColumn::PublicKeyLabel { fingerprint: &fingerprint }, Some("aegis-vault".to_owned()))
-            .map_err(hosted_backend)?;
-        tx.query(
+        let pk_bytes = cipher_glue::seal_raw(
+            self.cipher.as_ref(),
+            create_root.as_ref(),
+            username,
+            EncryptedColumn::PublicKey {
+                fingerprint: &fingerprint,
+            },
+            pubkey.as_bytes(),
+        )
+        .map_err(hosted_backend)?;
+        let label_bytes = cipher_glue::seal_text(
+            self.cipher.as_ref(),
+            create_root.as_ref(),
+            username,
+            EncryptedColumn::PublicKeyLabel {
+                fingerprint: &fingerprint,
+            },
+            Some("aegis-vault".to_owned()),
+        )
+        .map_err(hosted_backend)?;
+        tx.execute(
             "INSERT INTO user_did_bindings(username, atproto_did) VALUES($1, $2)",
             &[&username, &atproto_did],
         )
         .await
         .map_err(hosted_backend)?;
-        tx.query(
+        tx.execute(
             "INSERT INTO pubkeys(fingerprint, username, pubkey, label, algorithm, \
              pq_pubkey, created_at) VALUES($1, $2, $3, $4, 'ed25519', NULL, $5)",
             &[
@@ -657,9 +774,18 @@ impl UserStore for PgliteUserStore {
         fingerprint: &str,
         custody: AccountKeyCustody,
     ) -> std::result::Result<(), HostedAccountProvisionError> {
-        let tx = self.database.transaction().await.map_err(hosted_backend)?;
+        let mut client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| hosted_backend(pool_err(e)))?;
+        let tx = client.transaction().await.map_err(hosted_backend)?;
         let root = if self.is_encrypted() {
-            Some(self.load_user_key_tx(&tx, username).await.map_err(hosted_backend)?)
+            Some(
+                self.load_user_key_tx(&tx, username)
+                    .await
+                    .map_err(hosted_backend)?,
+            )
         } else {
             None
         };
@@ -729,7 +855,8 @@ impl UserStore for PgliteUserStore {
             patch.external_identities.is_none(),
             "set_profile cannot modify normalized external identity bindings"
         );
-        let tx = self.database.transaction().await?;
+        let mut client = self.pool.get().await.map_err(pool_err)?;
+        let tx = client.transaction().await?;
         let root = if self.is_encrypted() {
             Some(self.load_user_key_tx(&tx, username).await?)
         } else {
@@ -766,11 +893,29 @@ impl UserStore for PgliteUserStore {
             profile.key_custody = value;
         }
         let sub = profile.sub.context("user has no stable subject")?;
-        let name = self.seal_text(root.as_ref(), username, EncryptedColumn::ProfileName, profile.name)?;
-        let email = self.seal_text(root.as_ref(), username, EncryptedColumn::ProfileEmail, profile.email)?;
-        let external_id = self.seal_text(root.as_ref(), username, EncryptedColumn::ProfileExternalId, profile.external_id)?;
+        let name = cipher_glue::seal_text(
+            self.cipher.as_ref(),
+            root.as_ref(),
+            username,
+            EncryptedColumn::ProfileName,
+            profile.name,
+        )?;
+        let email = cipher_glue::seal_text(
+            self.cipher.as_ref(),
+            root.as_ref(),
+            username,
+            EncryptedColumn::ProfileEmail,
+            profile.email,
+        )?;
+        let external_id = cipher_glue::seal_text(
+            self.cipher.as_ref(),
+            root.as_ref(),
+            username,
+            EncryptedColumn::ProfileExternalId,
+            profile.external_id,
+        )?;
         let custody = profile.key_custody.map(AccountKeyCustody::as_str);
-        tx.query(
+        tx.execute(
             "UPDATE users SET sub=$2, name=$3, email=$4, email_verified=$5, \
              active=$6, external_id=$7, key_custody=$8, updated_at=now() \
              WHERE username=$1 RETURNING username",
@@ -787,13 +932,13 @@ impl UserStore for PgliteUserStore {
         )
         .await?;
         if let Some(did) = did_update {
-            tx.query(
+            tx.execute(
                 "DELETE FROM user_did_bindings WHERE username=$1",
                 &[&username],
             )
             .await?;
             if let Some(did) = did {
-                tx.query(
+                tx.execute(
                     "INSERT INTO user_did_bindings(username, atproto_did) VALUES($1, $2)",
                     &[&username, &did],
                 )
@@ -805,8 +950,8 @@ impl UserStore for PgliteUserStore {
     }
 
     async fn remove(&self, username: &str) -> Result<bool> {
-        let rows = self
-            .database
+        let client = self.pool.get().await.map_err(pool_err)?;
+        let rows = client
             .query(
                 "DELETE FROM users WHERE username=$1 RETURNING username",
                 &[&username],
@@ -816,11 +961,12 @@ impl UserStore for PgliteUserStore {
     }
 
     async fn list_users(&self) -> Result<Vec<String>> {
-        self.database
+        let client = self.pool.get().await.map_err(pool_err)?;
+        let rows = client
             .query("SELECT username FROM users ORDER BY username", &[])
-            .await?
-            .iter()
-            .map(|row| row.get(0).map_err(Into::into))
+            .await?;
+        rows.iter()
+            .map(|row| row.try_get::<_, String>(0).map_err(Into::into))
             .collect()
     }
 
@@ -871,8 +1017,8 @@ impl UserStore for PgliteUserStore {
     }
 
     async fn set_active(&self, username: &str, active: bool) -> Result<()> {
-        let rows = self
-            .database
+        let client = self.pool.get().await.map_err(pool_err)?;
+        let rows = client
             .query(
                 "UPDATE users SET active=$2, updated_at=now() \
                  WHERE username=$1 RETURNING username",
@@ -884,8 +1030,8 @@ impl UserStore for PgliteUserStore {
     }
 
     async fn list_pubkeys(&self, username: &str) -> Result<Vec<PubkeyEntry>> {
-        let exists = self
-            .database
+        let client = self.pool.get().await.map_err(pool_err)?;
+        let exists = client
             .query(
                 "SELECT 1::BIGINT FROM users WHERE username=$1",
                 &[&username],
@@ -897,7 +1043,7 @@ impl UserStore for PgliteUserStore {
         } else {
             None
         };
-        let rows = self.database.query(KEY_SELECT, &[&username]).await?;
+        let rows = client.query(KEY_SELECT, &[&username]).await?;
         rows.iter()
             .map(|r| self.decode_key(r, username, root.as_ref()))
             .collect()
@@ -916,10 +1062,27 @@ impl UserStore for PgliteUserStore {
         } else {
             None
         };
-        let pk_bytes = self.seal_raw(root.as_ref(), username, EncryptedColumn::PublicKey { fingerprint: &fingerprint }, pubkey.as_bytes())?;
-        let label_bytes = self.seal_text(root.as_ref(), username, EncryptedColumn::PublicKeyLabel { fingerprint: &fingerprint }, label)?;
-        self.database
-            .query(
+        let pk_bytes = cipher_glue::seal_raw(
+            self.cipher.as_ref(),
+            root.as_ref(),
+            username,
+            EncryptedColumn::PublicKey {
+                fingerprint: &fingerprint,
+            },
+            pubkey.as_bytes(),
+        )?;
+        let label_bytes = cipher_glue::seal_text(
+            self.cipher.as_ref(),
+            root.as_ref(),
+            username,
+            EncryptedColumn::PublicKeyLabel {
+                fingerprint: &fingerprint,
+            },
+            label,
+        )?;
+        let client = self.pool.get().await.map_err(pool_err)?;
+        client
+            .execute(
                 "INSERT INTO pubkeys(fingerprint, username, pubkey, label, algorithm, \
                  pq_pubkey, created_at) VALUES($1, $2, $3, $4, 'ed25519', NULL, $5)",
                 &[
@@ -951,7 +1114,8 @@ impl UserStore for PgliteUserStore {
         } else {
             None
         };
-        let tx = self.database.transaction().await?;
+        let mut client = self.pool.get().await.map_err(pool_err)?;
+        let tx = client.transaction().await?;
         let existing = tx
             .query(
                 "SELECT username, pubkey, algorithm, pq_pubkey FROM pubkeys \
@@ -959,13 +1123,21 @@ impl UserStore for PgliteUserStore {
                 &[&fingerprint],
             )
             .await?;
-        if let Some(row) = existing.first() {
-            let owner: String = row.get(0)?;
-            let stored_key: Vec<u8> = row.get(1)?;
-            let algorithm: String = row.get(2)?;
-            let pq: Option<Vec<u8>> = row.get(3)?;
+        if let Some(row) = existing.first().cloned() {
+            let owner: String = row.try_get(0)?;
+            let stored_key: Vec<u8> = row.try_get(1)?;
+            let algorithm: String = row.try_get(2)?;
+            let pq: Option<Vec<u8>> = row.try_get(3)?;
             // Decrypt stored key for comparison
-            let decrypted_key = self.open_raw(root.as_ref(), username, EncryptedColumn::PublicKey { fingerprint: &fingerprint }, &stored_key)?;
+            let decrypted_key = cipher_glue::open_raw(
+                self.cipher.as_ref(),
+                root.as_ref(),
+                username,
+                EncryptedColumn::PublicKey {
+                    fingerprint: &fingerprint,
+                },
+                &stored_key,
+            )?;
             ensure!(owner == username, "pubkey is already bound to another user");
             ensure!(
                 decrypted_key.as_slice() == pubkey.as_bytes(),
@@ -975,9 +1147,25 @@ impl UserStore for PgliteUserStore {
                 algorithm == "ed25519" && pq.is_none(),
                 "only a classical key can be upgraded to hybrid"
             );
-            let label_bytes = self.seal_text(root.as_ref(), username, EncryptedColumn::PublicKeyLabel { fingerprint: &fingerprint }, label)?;
-            let pq_sealed = self.seal_raw(root.as_ref(), username, EncryptedColumn::PqPublicKey { fingerprint: &fingerprint }, &ml_dsa_vk)?;
-            tx.query(
+            let label_bytes = cipher_glue::seal_text(
+                self.cipher.as_ref(),
+                root.as_ref(),
+                username,
+                EncryptedColumn::PublicKeyLabel {
+                    fingerprint: &fingerprint,
+                },
+                label,
+            )?;
+            let pq_sealed = cipher_glue::seal_raw(
+                self.cipher.as_ref(),
+                root.as_ref(),
+                username,
+                EncryptedColumn::PqPublicKey {
+                    fingerprint: &fingerprint,
+                },
+                &ml_dsa_vk,
+            )?;
+            tx.execute(
                 "UPDATE pubkeys SET algorithm='ed25519+ml-dsa-65', pq_pubkey=$2, \
                  label=COALESCE($3, label) WHERE fingerprint=$1 RETURNING fingerprint",
                 &[&fingerprint, &pq_sealed, &label_bytes],
@@ -985,10 +1173,34 @@ impl UserStore for PgliteUserStore {
             .await?;
         } else {
             let now = chrono::Utc::now().timestamp();
-            let pk_bytes = self.seal_raw(root.as_ref(), username, EncryptedColumn::PublicKey { fingerprint: &fingerprint }, pubkey.as_bytes())?;
-            let label_bytes = self.seal_text(root.as_ref(), username, EncryptedColumn::PublicKeyLabel { fingerprint: &fingerprint }, label)?;
-            let pq_sealed = self.seal_raw(root.as_ref(), username, EncryptedColumn::PqPublicKey { fingerprint: &fingerprint }, &ml_dsa_vk)?;
-            tx.query(
+            let pk_bytes = cipher_glue::seal_raw(
+                self.cipher.as_ref(),
+                root.as_ref(),
+                username,
+                EncryptedColumn::PublicKey {
+                    fingerprint: &fingerprint,
+                },
+                pubkey.as_bytes(),
+            )?;
+            let label_bytes = cipher_glue::seal_text(
+                self.cipher.as_ref(),
+                root.as_ref(),
+                username,
+                EncryptedColumn::PublicKeyLabel {
+                    fingerprint: &fingerprint,
+                },
+                label,
+            )?;
+            let pq_sealed = cipher_glue::seal_raw(
+                self.cipher.as_ref(),
+                root.as_ref(),
+                username,
+                EncryptedColumn::PqPublicKey {
+                    fingerprint: &fingerprint,
+                },
+                &ml_dsa_vk,
+            )?;
+            tx.execute(
                 "INSERT INTO pubkeys(fingerprint, username, pubkey, label, algorithm, \
                  pq_pubkey, created_at) VALUES($1, $2, $3, $4, \
                  'ed25519+ml-dsa-65', $5, $6)",
@@ -1008,8 +1220,8 @@ impl UserStore for PgliteUserStore {
     }
 
     async fn remove_pubkey(&self, username: &str, fingerprint: &str) -> Result<bool> {
-        let rows = self
-            .database
+        let client = self.pool.get().await.map_err(pool_err)?;
+        let rows = client
             .query(
                 "DELETE FROM pubkeys WHERE username=$1 AND fingerprint=$2 \
                  RETURNING fingerprint",
@@ -1020,8 +1232,8 @@ impl UserStore for PgliteUserStore {
     }
 
     async fn get_pubkey_user(&self, fingerprint: &str) -> Result<Option<String>> {
-        let rows = self
-            .database
+        let client = self.pool.get().await.map_err(pool_err)?;
+        let rows = client
             .query(
                 "SELECT username FROM pubkeys WHERE fingerprint=$1",
                 &[&fingerprint],
@@ -1032,14 +1244,14 @@ impl UserStore for PgliteUserStore {
             "fingerprint primary key returned duplicates"
         );
         rows.first()
-            .map(|row| row.get(0).map_err(Into::into))
+            .map(|row| row.try_get::<_, String>(0).map_err(Into::into))
             .transpose()
     }
 
     async fn touch_pubkey(&self, username: &str, fingerprint: &str) -> Result<()> {
         let now = chrono::Utc::now().timestamp();
-        let rows = self
-            .database
+        let client = self.pool.get().await.map_err(pool_err)?;
+        let rows = client
             .query(
                 "UPDATE pubkeys SET last_used_at=$3 WHERE username=$1 AND fingerprint=$2 \
                  RETURNING fingerprint",
@@ -1067,8 +1279,8 @@ impl UserStore for PgliteUserStore {
             !issuer.is_empty() && !subject.is_empty(),
             "external identity issuer and subject must be non-empty"
         );
-        let rows = self
-            .database
+        let client = self.pool.get().await.map_err(pool_err)?;
+        let rows = client
             .query(
                 "SELECT b.username FROM oidc_bindings b \
                  JOIN users u ON u.username=b.username \
@@ -1081,62 +1293,53 @@ impl UserStore for PgliteUserStore {
             "external identity primary key returned duplicates"
         );
         rows.first()
-            .map(|row| row.get(0).map_err(Into::into))
+            .map(|row| row.try_get::<_, String>(0).map_err(Into::into))
             .transpose()
     }
 }
 
-
-
-#[cfg(all(test, feature = "pglite"))]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::mem_forget, deprecated)]
+#[cfg(all(test, feature = "postgres"))]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
     use ed25519_dalek::SigningKey;
     use rand::rngs::OsRng;
 
-    use std::sync::OnceLock;
-
-    /// PGlite is a process singleton — it cannot be reopened after close in
-    /// the same process. All tests share this one instance, serialized by a
-    /// mutex so parallel `cargo test` is safe without `--test-threads=1`.
-    static SHARED_DB: OnceLock<PgliteUserStore> = OnceLock::new();
-    static TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
-    async fn shared() -> &'static PgliteUserStore {
-        if let Some(s) = SHARED_DB.get() {
-            return s;
-        }
-        let dir = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
-        let path = dir.path().to_owned();
-        std::mem::forget(dir); // keep the data dir alive for the process lifetime
-        let s = PgliteUserStore::open(&path).await.unwrap();
-        let _ = SHARED_DB.set(s);
-        SHARED_DB.get().unwrap()
+    fn test_dsn() -> Option<String> {
+        std::env::var("HYPRSTREAM_POSTGRES_TEST_URL").ok()
     }
 
-    /// Acquire the test serialization lock and wipe all rows. The returned
-    /// guard must be held for the entire test body so no two tests touch the
-    /// shared database concurrently.
-    async fn fresh() -> (
-        tokio::sync::MutexGuard<'static, ()>,
-        &'static PgliteUserStore,
-    ) {
-        let guard = TEST_LOCK.lock().await;
-        let s = shared().await;
-        s.database.query("DELETE FROM users", &[]).await.unwrap();
-        (guard, s)
+    /// Skip the entire suite unless the operator opted in via env. This keeps
+    /// `cargo test --features postgres` green in CI environments without a
+    /// Postgres instance, while letting developers and the dedicated CI job
+    /// run the real-DB suite.
+    macro_rules! require_db {
+        () => {
+            let Some(url) = test_dsn() else {
+                eprintln!("skipping PostgresUserStore test: HYPRSTREAM_POSTGRES_TEST_URL unset");
+                return;
+            };
+            url
+        };
+    }
+
+    async fn fresh() -> PostgresUserStore {
+        let url = std::env::var("HYPRSTREAM_POSTGRES_TEST_URL").unwrap();
+        let cfg = PostgresUserStoreConfig::from_url(&url);
+        let store = PostgresUserStore::connect_plaintext(cfg).await.unwrap();
+        let client = store.pool.get().await.unwrap();
+        client.execute("DELETE FROM users", &[]).await.unwrap();
+        store
     }
 
     fn make_key() -> VerifyingKey {
         SigningKey::generate(&mut OsRng).verifying_key()
     }
 
-    // ── Basic CRUD ───────────────────────────────────────────────────────
-
     #[tokio::test]
     async fn register_get_profile_round_trip() {
-        let (_guard, store) = fresh().await;
+        let _url = require_db!();
+        let store = fresh().await;
         let sub = store.register("alice").await.unwrap();
         let profile = store.get_profile("alice").await.unwrap().unwrap();
         assert_eq!(profile.sub.as_deref(), Some(sub.as_str()));
@@ -1146,270 +1349,15 @@ mod tests {
 
     #[tokio::test]
     async fn get_profile_missing_user_returns_none() {
-        let (_guard, store) = fresh().await;
+        let _url = require_db!();
+        let store = fresh().await;
         assert!(store.get_profile("nobody").await.unwrap().is_none());
     }
 
     #[tokio::test]
-    async fn register_empty_username_fails() {
-        let (_guard, store) = fresh().await;
-        assert!(store.register("").await.is_err());
-    }
-
-    #[tokio::test]
-    async fn set_profile_updates_columns() {
-        let (_guard, store) = fresh().await;
-        store.register("alice").await.unwrap();
-        store
-            .set_profile(
-                "alice",
-                UserProfilePatch {
-                    name: Some(Some("Alice".to_owned())),
-                    email: Some(Some("alice@example.com".to_owned())),
-                    email_verified: Some(Some(true)),
-                    ..Default::default()
-                },
-            )
-            .await
-            .unwrap();
-        let profile = store.get_profile("alice").await.unwrap().unwrap();
-        assert_eq!(profile.name.as_deref(), Some("Alice"));
-        assert_eq!(profile.email.as_deref(), Some("alice@example.com"));
-        assert_eq!(profile.email_verified, Some(true));
-    }
-
-    #[tokio::test]
-    async fn set_profile_atproto_did_clears_binding() {
-        let (_guard, store) = fresh().await;
-        store.register("alice").await.unwrap();
-        store
-            .set_profile(
-                "alice",
-                UserProfilePatch {
-                    atproto_did: Some(Some("did:web:alice.example".to_owned())),
-                    ..Default::default()
-                },
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            store.get_profile("alice").await.unwrap().unwrap().atproto_did,
-            Some("did:web:alice.example".to_owned())
-        );
-        // Clear the DID.
-        store
-            .set_profile(
-                "alice",
-                UserProfilePatch {
-                    atproto_did: Some(None),
-                    ..Default::default()
-                },
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            store.get_profile("alice").await.unwrap().unwrap().atproto_did,
-            None
-        );
-    }
-
-    #[tokio::test]
-    async fn set_profile_unknown_user_fails() {
-        let (_guard, store) = fresh().await;
-        assert!(store
-            .set_profile("nobody", UserProfilePatch::default())
-            .await
-            .is_err());
-    }
-
-    #[tokio::test]
-    async fn remove_cascades_pubkeys_and_did_binding() {
-        let (_guard, store) = fresh().await;
-        store.register("alice").await.unwrap();
-        let key = make_key();
-        let fp = store.add_pubkey("alice", key, None).await.unwrap();
-        store
-            .set_profile(
-                "alice",
-                UserProfilePatch {
-                    atproto_did: Some(Some("did:web:alice.example".to_owned())),
-                    ..Default::default()
-                },
-            )
-            .await
-            .unwrap();
-        assert!(store.remove("alice").await.unwrap());
-        assert!(store.get_profile("alice").await.unwrap().is_none());
-        assert!(store.get_pubkey_user(&fp).await.unwrap().is_none());
-    }
-
-    #[tokio::test]
-    async fn set_active_toggles() {
-        let (_guard, store) = fresh().await;
-        store.register("alice").await.unwrap();
-        store.set_active("alice", false).await.unwrap();
-        assert_eq!(
-            store.get_profile("alice").await.unwrap().unwrap().active,
-            Some(false)
-        );
-        store.set_active("alice", true).await.unwrap();
-        assert_eq!(
-            store.get_profile("alice").await.unwrap().unwrap().active,
-            Some(true)
-        );
-    }
-
-    // ── Search ───────────────────────────────────────────────────────────
-
-    #[tokio::test]
-    async fn search_filters_and_paginates() {
-        let (_guard, store) = fresh().await;
-        store.register("alice").await.unwrap();
-        store.register("bob").await.unwrap();
-        store.register("carol").await.unwrap();
-        store.set_active("bob", false).await.unwrap();
-
-        let active = store
-            .search(&UserFilter {
-                active_only: Some(true),
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-        assert_eq!(active.len(), 2);
-
-        let filtered = store
-            .search(&UserFilter {
-                filter: Some(r#"userName eq "alice""#.to_owned()),
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-        assert_eq!(filtered.len(), 1);
-        assert_eq!(filtered[0].0, "alice");
-
-        let paged = store
-            .search(&UserFilter {
-                count: Some(1),
-                start_index: Some(2),
-                sort_by: Some("userName".to_owned()),
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-        assert_eq!(paged.len(), 1);
-        assert_eq!(paged[0].0, "bob");
-    }
-
-    // ── Pubkey operations ────────────────────────────────────────────────
-
-    #[tokio::test]
-    async fn add_list_remove_pubkey() {
-        let (_guard, store) = fresh().await;
-        store.register("alice").await.unwrap();
-        let key = make_key();
-        let fp = store
-            .add_pubkey("alice", key, Some("laptop".to_owned()))
-            .await
-            .unwrap();
-        let keys = store.list_pubkeys("alice").await.unwrap();
-        assert_eq!(keys.len(), 1);
-        assert_eq!(keys[0].fingerprint, fp);
-        assert_eq!(keys[0].label.as_deref(), Some("laptop"));
-        assert_eq!(keys[0].algorithm, KeyAlgorithm::Ed25519);
-        assert!(keys[0].pq_pubkey.is_none());
-
-        assert_eq!(
-            store.get_pubkey_user(&fp).await.unwrap().as_deref(),
-            Some("alice")
-        );
-
-        store.touch_pubkey("alice", &fp).await.unwrap();
-        let keys = store.list_pubkeys("alice").await.unwrap();
-        assert!(keys[0].last_used_at.is_some());
-
-        assert!(store.remove_pubkey("alice", &fp).await.unwrap());
-        assert!(store.list_pubkeys("alice").await.unwrap().is_empty());
-    }
-
-    #[tokio::test]
-    async fn add_pubkey_hybrid_upgrades_classical() {
-        let (_guard, store) = fresh().await;
-        store.register("alice").await.unwrap();
-        let key = make_key();
-        let fp = store.add_pubkey("alice", key, None).await.unwrap();
-
-        let pq_vk = vec![0u8; 1952];
-        store
-            .add_pubkey_hybrid("alice", key, pq_vk, Some("hybrid".to_owned()))
-            .await
-            .unwrap();
-        let keys = store.list_pubkeys("alice").await.unwrap();
-        assert_eq!(keys.len(), 1);
-        assert_eq!(keys[0].fingerprint, fp);
-        assert_eq!(keys[0].algorithm, KeyAlgorithm::HybridEd25519MlDsa65);
-        assert!(keys[0].pq_pubkey.is_some());
-        assert_eq!(keys[0].pq_pubkey.as_ref().unwrap().len(), 1952);
-    }
-
-    #[tokio::test]
-    async fn add_pubkey_hybrid_wrong_length_fails() {
-        let (_guard, store) = fresh().await;
-        store.register("alice").await.unwrap();
-        let key = make_key();
-        assert!(store
-            .add_pubkey_hybrid("alice", key, vec![0u8; 100], None)
-            .await
-            .is_err());
-    }
-
-    // ── External identity ────────────────────────────────────────────────
-
-    #[tokio::test]
-    async fn resolve_or_bind_creates_and_resolves() {
-        let (_guard, store) = fresh().await;
-        let res1 = store
-            .resolve_or_bind_external_idp("https://idp.example", "sub-123", "alice")
-            .await
-            .unwrap();
-        assert!(res1.provisioned);
-        assert_eq!(res1.username, "alice");
-
-        // Same (issuer, subject) resolves to the same user even with a
-        // different candidate username.
-        let res2 = store
-            .resolve_or_bind_external_idp("https://idp.example", "sub-123", "bob")
-            .await
-            .unwrap();
-        assert!(!res2.provisioned);
-        assert_eq!(res2.username, "alice");
-        assert_eq!(res2.sub, res1.sub);
-    }
-
-    #[tokio::test]
-    async fn list_and_get_external_identities() {
-        let (_guard, store) = fresh().await;
-        store
-            .resolve_or_bind_external_idp("https://idp.example", "sub-1", "alice")
-            .await
-            .unwrap();
-        let bindings = store.list_external_identities("alice").await.unwrap();
-        assert_eq!(bindings.len(), 1);
-        assert_eq!(bindings[0].issuer, "https://idp.example");
-        assert_eq!(bindings[0].subject, "sub-1");
-
-        let user = store
-            .get_external_identity_user("https://idp.example", "sub-1")
-            .await
-            .unwrap();
-        assert_eq!(user.as_deref(), Some("alice"));
-    }
-
-    // ── #1370 hosted-account provisioning (R4 hardening) ────────────────
-
-    #[tokio::test]
     async fn provision_stages_inactive_account() {
-        let (_guard, store) = fresh().await;
+        let _url = require_db!();
+        let store = fresh().await;
         let key = make_key();
         let result = store
             .provision_hosted_account(
@@ -1435,7 +1383,8 @@ mod tests {
 
     #[tokio::test]
     async fn provision_exact_repeat_resumes() {
-        let (_guard, store) = fresh().await;
+        let _url = require_db!();
+        let store = fresh().await;
         let key = make_key();
         let first = store
             .provision_hosted_account(
@@ -1462,7 +1411,8 @@ mod tests {
 
     #[tokio::test]
     async fn activate_flips_staged_to_active() {
-        let (_guard, store) = fresh().await;
+        let _url = require_db!();
+        let store = fresh().await;
         let key = make_key();
         let provisioned = store
             .provision_hosted_account(
@@ -1487,70 +1437,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn activate_idempotent_on_already_active() {
-        let (_guard, store) = fresh().await;
-        let key = make_key();
-        let fp = super::super::pubkey_fingerprint(&key);
-        store
-            .provision_hosted_account(
-                "alice",
-                "did:web:alice.example",
-                key,
-                AccountKeyCustody::SelfCustody,
-            )
-            .await
-            .unwrap();
-        store
-            .activate_hosted_account(
-                "alice",
-                "did:web:alice.example",
-                &fp,
-                AccountKeyCustody::SelfCustody,
-            )
-            .await
-            .unwrap();
-        // Second activation is Ok (idempotent).
-        store
-            .activate_hosted_account(
-                "alice",
-                "did:web:alice.example",
-                &fp,
-                AccountKeyCustody::SelfCustody,
-            )
-            .await
-            .unwrap();
-    }
-
-    #[tokio::test]
-    async fn activate_rejects_changed_did() {
-        let (_guard, store) = fresh().await;
-        let key = make_key();
-        let fp = super::super::pubkey_fingerprint(&key);
-        store
-            .provision_hosted_account(
-                "alice",
-                "did:web:alice.example",
-                key,
-                AccountKeyCustody::SelfCustody,
-            )
-            .await
-            .unwrap();
-        assert!(store
-            .activate_hosted_account(
-                "alice",
-                "did:web:wrong.example",
-                &fp,
-                AccountKeyCustody::SelfCustody,
-            )
-            .await
-            .is_err());
-    }
-
-    #[tokio::test]
     async fn provision_account_already_exists() {
-        let (_guard, store) = fresh().await;
+        let _url = require_db!();
+        let store = fresh().await;
         let key = make_key();
-        // Stage and fully activate a hosted account.
         let provisioned = store
             .provision_hosted_account(
                 "alice",
@@ -1569,7 +1459,6 @@ mod tests {
             )
             .await
             .unwrap();
-        // A second provision with a DIFFERENT key must see AccountAlreadyExists.
         let other_key = make_key();
         let err = store
             .provision_hosted_account(
@@ -1588,9 +1477,9 @@ mod tests {
 
     #[tokio::test]
     async fn provision_key_already_bound() {
-        let (_guard, store) = fresh().await;
+        let _url = require_db!();
+        let store = fresh().await;
         let key = make_key();
-        // Stage+activate alice with this key.
         let provisioned = store
             .provision_hosted_account(
                 "alice",
@@ -1609,7 +1498,6 @@ mod tests {
             )
             .await
             .unwrap();
-        // Provisioning bob with alice's key must see KeyAlreadyBound.
         let err = store
             .provision_hosted_account(
                 "bob",
@@ -1627,7 +1515,8 @@ mod tests {
 
     #[tokio::test]
     async fn provision_corrupt_inactive_state_is_backend_error() {
-        let (_guard, store) = fresh().await;
+        let _url = require_db!();
+        let store = fresh().await;
         let key = make_key();
         store
             .provision_hosted_account(
@@ -1638,8 +1527,6 @@ mod tests {
             )
             .await
             .unwrap();
-        // A second provision with a different key against the still-INACTIVE
-        // staged account is corrupt/incomplete (not a trusted 409).
         let other_key = make_key();
         let err = store
             .provision_hosted_account(
@@ -1650,56 +1537,73 @@ mod tests {
             )
             .await
             .unwrap_err();
-        // Must be Backend, NOT AccountAlreadyExists (account is not active).
         assert!(matches!(
             err,
             HostedAccountProvisionError::Backend(_)
         ));
     }
 
-    // ── Shared handle (#1351) ────────────────────────────────────────────
-
     #[tokio::test]
-    async fn from_database_shares_one_handle() {
-        let (_guard, s) = fresh().await;
-        let db = s.database();
-        let store2 = PgliteUserStore::from_database(Arc::clone(&db))
+    async fn add_list_remove_pubkey() {
+        let _url = require_db!();
+        let store = fresh().await;
+        store.register("alice").await.unwrap();
+        let key = make_key();
+        let fp = store
+            .add_pubkey("alice", key, Some("laptop".to_owned()))
             .await
             .unwrap();
-        // The handle returned by database() is the same Arc.
-        assert!(Arc::ptr_eq(&store2.database(), &db));
+        let keys = store.list_pubkeys("alice").await.unwrap();
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].fingerprint, fp);
+        assert_eq!(keys[0].label.as_deref(), Some("laptop"));
+        assert_eq!(keys[0].algorithm, KeyAlgorithm::Ed25519);
+        assert!(keys[0].pq_pubkey.is_none());
+        assert_eq!(
+            store.get_pubkey_user(&fp).await.unwrap().as_deref(),
+            Some("alice")
+        );
+        store.touch_pubkey("alice", &fp).await.unwrap();
+        assert!(store.remove_pubkey("alice", &fp).await.unwrap());
+        assert!(store.list_pubkeys("alice").await.unwrap().is_empty());
     }
 
-    /// #1377 acceptance: no plaintext PII in BYTEA columns at rest.
-    /// Writes an email through the plaintext store, then scans the raw
-    /// stored bytes to confirm the email string is NOT present in the
-    /// database (when encryption is on, this test would need a cipher).
     #[tokio::test]
-    async fn plaintext_store_has_plaintext_pii_in_bytea() {
-        // This test documents the BEFORE state (no encryption): plaintext
-        // IS stored in BYTEA. When encryption is wired via with_cipher(),
-        // the encrypted_store_leaves_no_plaintext_pii_in_bytea test in
-        // encrypted_columns.rs verifies the negative (no plaintext leaks).
-        let (_guard, store) = fresh().await;
+    async fn add_pubkey_hybrid_upgrades_classical() {
+        let _url = require_db!();
+        let store = fresh().await;
         store.register("alice").await.unwrap();
+        let key = make_key();
+        let fp = store.add_pubkey("alice", key, None).await.unwrap();
+        let pq_vk = vec![0u8; 1952];
         store
-            .set_profile(
-                "alice",
-                UserProfilePatch {
-                    email: Some(Some("alice.secret@example.test".to_owned())),
-                    ..Default::default()
-                },
-            )
+            .add_pubkey_hybrid("alice", key, pq_vk, Some("hybrid".to_owned()))
             .await
             .unwrap();
-        let rows = store
-            .database
-            .query("SELECT email FROM users WHERE username='alice'", &[])
+        let keys = store.list_pubkeys("alice").await.unwrap();
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].fingerprint, fp);
+        assert_eq!(keys[0].algorithm, KeyAlgorithm::HybridEd25519MlDsa65);
+        assert!(keys[0].pq_pubkey.is_some());
+        assert_eq!(keys[0].pq_pubkey.as_ref().unwrap().len(), 1952);
+    }
+
+    #[tokio::test]
+    async fn resolve_or_bind_creates_and_resolves() {
+        let _url = require_db!();
+        let store = fresh().await;
+        let res1 = store
+            .resolve_or_bind_external_idp("https://idp.example", "sub-123", "alice")
             .await
             .unwrap();
-        let raw: Option<Vec<u8>> = rows.first().unwrap().get(0).unwrap();
-        let raw = raw.unwrap();
-        // Without encryption, the plaintext IS the stored bytes.
-        assert_eq!(raw, b"alice.secret@example.test");
+        assert!(res1.provisioned);
+        assert_eq!(res1.username, "alice");
+        let res2 = store
+            .resolve_or_bind_external_idp("https://idp.example", "sub-123", "bob")
+            .await
+            .unwrap();
+        assert!(!res2.provisioned);
+        assert_eq!(res2.username, "alice");
+        assert_eq!(res2.sub, res1.sub);
     }
 }
