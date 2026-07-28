@@ -92,6 +92,55 @@ pub(crate) fn pds_store_dir(ctx: &ServiceContext) -> anyhow::Result<std::path::P
     Ok(ctx.deployment_data_dir()?.join("pds-store"))
 }
 
+/// Select and open the PDS record store based on the configured backend (#1257).
+///
+/// When `[rds]` is configured (the deployed posture):
+/// - With `pds-postgres` feature: open against shared RDS Multi-AZ Postgres
+///   (FATAL-on-unavailable — never a silent local fallback).
+/// - Without `pds-postgres` feature: FATAL (binary not built for RDS).
+///
+/// When `[rds]` is not configured (local/workstation): open the RocksDB
+/// backend at `pds_store_dir(ctx)`.
+///
+/// `readonly` selects the resolver (`true`) vs publisher (`false`) posture.
+/// The D2 invariant (signed bytes verbatim, SQL = projection-free KV) is
+/// enforced by the Postgres backend regardless of this flag.
+fn open_pds_record_store(
+    ctx: &ServiceContext,
+    readonly: bool,
+) -> anyhow::Result<crate::services::discovery::PdsRecordStore> {
+    let config = load_config();
+    if config.rds.is_configured() {
+        #[cfg(feature = "pds-postgres")]
+        {
+            tracing::info!(
+                cell_id = %config.rds.cell_id,
+                "opening PDS record store against shared RDS Postgres ({} mode)",
+                if readonly { "read-only" } else { "read-write" }
+            );
+            return crate::services::discovery::PdsRecordStore::open_postgres(
+                &config.rds,
+                readonly,
+            );
+        }
+        #[cfg(not(feature = "pds-postgres"))]
+        {
+            anyhow::bail!(
+                "RDS is configured ([rds] section with url_file) but this binary was \
+                 not built with the `pds-postgres` feature — refusing to silently \
+                 fall back to local RocksDB. Rebuild with --features pds-postgres."
+            );
+        }
+    }
+    // Local RocksDB backend (workstation / dev).
+    let dir = pds_store_dir(ctx)?;
+    if readonly {
+        crate::services::discovery::PdsRecordStore::open_readonly(&dir)
+    } else {
+        crate::services::discovery::PdsRecordStore::open(&dir)
+    }
+}
+
 /// Populate every ordinary network service announcement from a fresh
 /// checkpoint-verifying PDS read. Missing or ambiguous state fails startup
 /// before any QUIC service can bind and advertise an incomplete bundle.
@@ -100,7 +149,7 @@ pub fn with_checkpointed_native_announcements(
     service_names: &[String],
 ) -> anyhow::Result<ServiceContext> {
     let acceptance_identity = hyprstream_discovery::deployment_registry_verifier()?;
-    let store = crate::services::discovery::PdsRecordStore::open_readonly(&pds_store_dir(&ctx)?)?
+    let store = open_pds_record_store(&ctx, true)?
         .with_at9p_deployment_verifier(acceptance_identity);
     let states = store.accepted_at9p_states()?;
     for service_name in service_names
@@ -789,7 +838,7 @@ fn create_registry_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawn
         );
         let audit_pq = hyprstream_rpc::node_identity::derive_mesh_mldsa_key(&audit_ed);
         let store = Arc::new(
-            crate::services::discovery::PdsRecordStore::open(&store_dir)?
+            open_pds_record_store(ctx, false)?
                 .with_at9p_acceptance_identity(acceptance_identity.verifying_key()),
         );
         let alarm_path = store_dir.join("at9p-duplicity.wal");
@@ -2088,24 +2137,27 @@ fn create_tui_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
     Ok(ctx.into_spawnable_quic(tui_service, tui_config.quic_port))
 }
 
-/// Open the PDS record store (#910a) read-only, bootstrapping an empty
-/// RocksDB database at `dir` first if nothing has been published yet.
+/// Open the PDS record store read-only, selecting the backend from config.
 ///
-/// `PdsRecordStore::open_readonly` requires the RocksDB files to already
-/// exist (`create_if_missing(false)`, matching `RocksDbUserStore::open_readonly`),
-/// which is normally true because the registry service (the writer) creates
-/// it. On a fresh install the discovery service may start before any model
-/// has ever been registered — bootstrap by briefly opening read-write (which
-/// creates the DB files) and releasing the handle, then retry read-only.
+/// For the **Postgres** backend (#1257): no bootstrap dance is needed — the
+/// schema migration runs on `connect`, and there is no single-writer lock to
+/// race. Just calls [`open_pds_record_store`] with `readonly = true`.
 ///
-/// Known limitation: if the registry and discovery services start
-/// concurrently on a brand-new install, both may race to bootstrap the same
-/// directory; one loses the RocksDB lock and its factory call fails, which
-/// the service manager will retry.
+/// For the **RocksDB** backend: bootstraps an empty database at `dir` first if
+/// nothing has been published yet (the registry service creates the DB files;
+/// on a fresh install the discovery service may start before any model has
+/// been registered). Known limitation: concurrent startup on a brand-new install
+/// may race the RocksDB lock; the service manager retries.
 fn open_pds_store_readonly(
-    dir: &std::path::Path,
+    ctx: &ServiceContext,
 ) -> anyhow::Result<crate::services::discovery::PdsRecordStore> {
-    match crate::services::discovery::PdsRecordStore::open_readonly(dir) {
+    let config = load_config();
+    if config.rds.is_configured() {
+        // Postgres: no bootstrap dance needed.
+        return open_pds_record_store(ctx, true);
+    }
+    let dir = pds_store_dir(ctx)?;
+    match crate::services::discovery::PdsRecordStore::open_readonly(&dir) {
         Ok(store) => Ok(store),
         Err(orig) => {
             // Bootstrap the DB files by briefly opening read-write, then retry
@@ -2113,11 +2165,11 @@ fn open_pds_store_readonly(
             // lock, or the path is corrupt), surface BOTH errors so the real
             // cause is visible rather than masked by the retry (#910a, fable M3).
             drop(
-                crate::services::discovery::PdsRecordStore::open(dir).with_context(|| {
+                crate::services::discovery::PdsRecordStore::open(&dir).with_context(|| {
                     format!("read-only open failed ({orig}); bootstrap open also failed")
                 })?,
             );
-            crate::services::discovery::PdsRecordStore::open_readonly(dir)
+            crate::services::discovery::PdsRecordStore::open_readonly(&dir)
         }
     }
 }
@@ -2162,9 +2214,8 @@ fn create_discovery_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spaw
     // registry process signs with its stable service credential, whose public
     // key is anchored in the global service trust store.
     let at9p_acceptance_identity = hyprstream_discovery::deployment_registry_verifier()?;
-    let pds_store_path = pds_store_dir(ctx)?;
     let pds_store = std::sync::Arc::new(
-        open_pds_store_readonly(&pds_store_path)
+        open_pds_store_readonly(ctx)
             .context("failed to open PDS record store (read-only)")?
             .with_at9p_deployment_verifier(at9p_acceptance_identity),
     );

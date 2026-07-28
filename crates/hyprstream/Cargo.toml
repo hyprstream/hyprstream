@@ -147,6 +147,13 @@ reflink-copy = "0.1"  # COW file copying (reflink when available)
 hyprstream-containedfs.workspace = true  # Path-contained filesystem operations
 rocksdb = "0.23"  # User credential store (RocksDbUserStore)
 fred = { version = "9", optional = true, features = ["i-scripts"] }  # Async Redis/Valkey client (ValkeyUserStore, ValkeyTokenStore)
+# Postgres-backed PDS record store (#1257). deadpool-postgres is async-only;
+# the sync PdsRecordStore API bridges to it via a dedicated OS thread that owns
+# the pool + a single-worker tokio runtime (see services/pds_record_pg.rs).
+deadpool-postgres = { version = "0.14", optional = true }
+tokio-postgres = { version = "0.7", optional = true }
+tokio-postgres-rustls = { version = "0.13", optional = true }
+rustls-native-certs = { version = "0.8", optional = true }
 hyprstream-tui = { path = "../hyprstream-tui" }  # Setup wizard TUI (WizardBackend trait + WizardApp)
 hyprstream-compositor = { path = "../hyprstream-compositor" }  # Pure TUI compositor (chrome state machine)
 waxterm = { path = "../waxterm", features = ["avt"] }  # Terminal abstraction for TUI rendering
@@ -259,6 +266,12 @@ pq-hybrid = []  # NO-OP alias: PQ primitives always compiled; Classical/Hybrid s
 # and the 1.9 suites pass. MemLedger is the Phase-1 backend; RocksLedger (item
 # 1.2) lands separately.
 ledger = ["dep:hyprstream-ledger"]
+# Postgres-backed PDS record store (#1257): RDS Multi-AZ is the deployed
+# backend; RocksDB stays for local/workstation. When a `[rds]` section is
+# configured the Postgres store is selected and is FATAL-on-unavailable —
+# never a silent local fallback. Honors D2 (signed bytes verbatim as
+# authoritative source-of-truth; SQL rows are a projection-free KV shell).
+pds-postgres = ["dep:deadpool-postgres", "dep:tokio-postgres", "dep:tokio-postgres-rustls", "dep:rustls", "dep:rustls-native-certs", "dep:rustls-pemfile"]
 
 [build-dependencies]
 capnpc.workspace = true  # Cap'n Proto schema compiler

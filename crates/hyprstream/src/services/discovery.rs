@@ -216,6 +216,16 @@ enum RecordBacking {
     /// `open_for_read_only` handle so writes from the publisher process become
     /// visible without a restart.
     ReadOnly(PathBuf),
+    /// Shared RDS (Multi-AZ Postgres) backend (#1257). Both the publisher and
+    /// the resolver connect to the same RDS instance — a write via one AZ is
+    /// immediately readable by the other. **D2 invariant**: values are the
+    /// exact signed bytes the publisher commits, stored verbatim in a
+    /// projection-free BYTEA KV; nothing is normalized into SQL columns.
+    #[cfg(feature = "pds-postgres")]
+    Postgres {
+        kv: super::pds_record_pg::PgKv,
+        readonly: bool,
+    },
 }
 
 impl PdsRecordStore {
@@ -252,6 +262,39 @@ impl PdsRecordStore {
         })
     }
 
+    /// Open the store against a shared RDS (Multi-AZ Postgres) instance (#1257).
+    ///
+    /// This is the **deployed** backend: two stateless PDS services in two AZs
+    /// share one RDS instance. A write via the publisher in AZ-a is immediately
+    /// readable by the resolver in AZ-b (MVCC, no reopen dance). The store is
+    /// **FATAL-on-unavailable** — `connect` fails at startup rather than
+    /// silently degrading to a local backend.
+    ///
+    /// **D2 invariant**: the signed record/commit/at9p bytes are stored
+    /// verbatim in a projection-free BYTEA KV table; SQL never normalizes,
+    /// parses, or reconstructs them. This is "ship the already-signed evidence
+    /// across the seam" at zero cost when region federation arrives.
+    ///
+    /// `readonly = true` selects the resolver posture (write methods bail);
+    /// `readonly = false` selects the publisher posture.
+    #[cfg(feature = "pds-postgres")]
+    pub fn open_postgres(
+        rds: &crate::config::RdsConfig,
+        readonly: bool,
+    ) -> AnyResult<Self> {
+        let url = rds.read_url()?;
+        let kv = super::pds_record_pg::PgKv::connect(
+            &url,
+            rds.root_cert.as_deref(),
+            &rds.cell_id,
+        )?;
+        Ok(Self {
+            backing: RecordBacking::Postgres { kv, readonly },
+            at9p_acceptance_identity: None,
+            at9p_advance_lock: parking_lot::Mutex::new(()),
+        })
+    }
+
     /// Pin the deployment identity that certifies accepted-state envelopes.
     pub(crate) fn with_at9p_deployment_verifier(
         mut self,
@@ -283,6 +326,18 @@ impl PdsRecordStore {
         commit: &Commit,
     ) -> AnyResult<()> {
         let RecordBacking::ReadWrite(db) = &self.backing else {
+            #[cfg(feature = "pds-postgres")]
+            if let RecordBacking::Postgres { kv, readonly } = &self.backing {
+                if *readonly {
+                    bail!("PdsRecordStore::put_record_and_commit called on a read-only Postgres store");
+                }
+                let ops = vec![
+                    (record_key(did, collection, tid), record.to_dag_cbor()),
+                    (commit_key(did), commit.to_dag_cbor()),
+                ];
+                kv.put_batch(&ops).context("PDS record+commit Postgres write failed")?;
+                return Ok(());
+            }
             bail!("PdsRecordStore::put_record_and_commit called on a read-only store");
         };
         let mut batch = rocksdb::WriteBatch::default();
@@ -298,6 +353,15 @@ impl PdsRecordStore {
     /// is refreshed.
     fn put_commit(&self, did: &str, commit: &Commit) -> AnyResult<()> {
         let RecordBacking::ReadWrite(db) = &self.backing else {
+            #[cfg(feature = "pds-postgres")]
+            if let RecordBacking::Postgres { kv, readonly } = &self.backing {
+                if *readonly {
+                    bail!("PdsRecordStore::put_commit called on a read-only Postgres store");
+                }
+                kv.put(&commit_key(did), &commit.to_dag_cbor())
+                    .context("PDS commit-only Postgres write failed")?;
+                return Ok(());
+            }
             bail!("PdsRecordStore::put_commit called on a read-only store");
         };
         db.put(commit_key(did), commit.to_dag_cbor())
@@ -317,6 +381,10 @@ impl PdsRecordStore {
             RecordBacking::ReadOnly(path) => {
                 let db = rocksdb::DB::open_for_read_only(&readonly_opts(), path, false)?;
                 load_at9p_state_from_db(&db, subject_cid512, acceptance_identity)
+            }
+            #[cfg(feature = "pds-postgres")]
+            RecordBacking::Postgres { kv, .. } => {
+                load_at9p_state_from_pg(kv, subject_cid512, acceptance_identity)
             }
         }
     }
@@ -389,6 +457,33 @@ impl PdsRecordStore {
                 let db = rocksdb::DB::open_for_read_only(&readonly_opts(), path, false)?;
                 read(&db)
             }
+            #[cfg(feature = "pds-postgres")]
+            RecordBacking::Postgres { kv, .. } => {
+                let prefix = b"at9p-state\0".to_vec();
+                let upper = super::pds_record_pg::prefix_upper_bound(&prefix);
+                let pairs = if let Some(end) = &upper {
+                    kv.range_scan(&prefix, end)?
+                } else {
+                    // All keys start with this prefix (0xFF continuation) —
+                    // scan everything and filter.
+                    kv.all_pairs()?
+                        .into_iter()
+                        .filter(|(k, _)| k.starts_with(&prefix[..]))
+                        .collect()
+                };
+                let mut states = Vec::new();
+                for (key, _) in pairs {
+                    let subject = std::str::from_utf8(&key[prefix.len()..])
+                        .context("accepted-state key is not UTF-8")?;
+                    let state = load_at9p_state_from_pg(kv, subject, acceptance_identity)?
+                        .ok_or_else(|| {
+                            anyhow!("accepted-state key disappeared during Postgres snapshot read")
+                        })?;
+                    states.push(state);
+                }
+                states.sort_by(|a, b| a.did.cmp(&b.did));
+                Ok(states)
+            }
         }
     }
 
@@ -400,6 +495,36 @@ impl PdsRecordStore {
         audit_key: &ed25519_dalek::SigningKey,
     ) -> AnyResult<ConditionalAdvance> {
         let RecordBacking::ReadWrite(db) = &self.backing else {
+            #[cfg(feature = "pds-postgres")]
+            if let RecordBacking::Postgres { kv, readonly } = &self.backing {
+                if *readonly {
+                    bail!("accepted did:at9p state write attempted on a read-only Postgres PDS store");
+                }
+                let _advance = self.at9p_advance_lock.lock();
+                let local_verifier =
+                    At9pAcceptanceVerifier::Local(acceptance_identity.verifying_key());
+                let current =
+                    load_at9p_state_from_pg(kv, &state.subject_cid512, &local_verifier)?;
+                if current.as_ref().map(AcceptedAt9pState::watermark) != expected {
+                    return current.map_or_else(
+                        || bail!(
+                            "conditional accepted-state advance expected a durable head, but none exists"
+                        ),
+                        |current| Ok(ConditionalAdvance::Conflict(Box::new(current))),
+                    );
+                }
+                let encoded = encode_at9p_state(state, acceptance_identity, audit_key)?;
+                let checkpoint =
+                    encode_at9p_checkpoint(state, &encoded, acceptance_identity)?;
+                let ops = vec![
+                    (at9p_state_key(&state.subject_cid512), encoded),
+                    (at9p_checkpoint_key(&state.subject_cid512), checkpoint),
+                ];
+                kv.put_batch(&ops).context(
+                    "synchronous accepted did:at9p state+checkpoint Postgres commit failed",
+                )?;
+                return Ok(ConditionalAdvance::Committed);
+            }
             bail!("accepted did:at9p state write attempted on a read-only PDS store");
         };
         let _advance = self.at9p_advance_lock.lock();
@@ -456,6 +581,8 @@ impl PdsRecordStore {
                     .with_context(|| format!("failed to reopen PDS record store at {path:?}"))?;
                 Self::load_repo_from(&db, did)
             }
+            #[cfg(feature = "pds-postgres")]
+            RecordBacking::Postgres { kv, .. } => Self::load_repo_from_pg(kv, did),
         }
     }
 
@@ -487,6 +614,49 @@ impl PdsRecordStore {
         let Some(commit_bytes) = db
             .get(commit_key(did))
             .context("PDS store commit read failed")?
+        else {
+            tracing::warn!(
+                did,
+                "PDS repo has records but no signed commit — refusing to serve (resolver holds no key)"
+            );
+            return Ok(None);
+        };
+        let commit = Commit::from_dag_cbor(&commit_bytes)
+            .with_context(|| format!("corrupt signed commit for {did}"))?;
+        Ok(Some(RepoState { records, commit }))
+    }
+
+    /// Postgres counterpart of [`load_repo_from`] (#1257). Uses a range scan
+    /// for the record prefix, then a point get for the commit — identical
+    /// semantics, D2-preserving (signed bytes verbatim).
+    #[cfg(feature = "pds-postgres")]
+    fn load_repo_from_pg(
+        kv: &super::pds_record_pg::PgKv,
+        did: &str,
+    ) -> AnyResult<Option<RepoState>> {
+        let prefix = record_prefix(did);
+        let mut records = BTreeMap::new();
+        let upper = super::pds_record_pg::prefix_upper_bound(&prefix);
+        let pairs = if let Some(end) = &upper {
+            kv.range_scan(&prefix, end)?
+        } else {
+            kv.all_pairs()?
+                .into_iter()
+                .filter(|(k, _)| k.starts_with(prefix.as_slice()))
+                .collect()
+        };
+        for (key, value) in pairs {
+            let (collection, tid) = parse_record_key(&key, did)?;
+            let record = ModelRecord::from_dag_cbor(&value)
+                .with_context(|| format!("corrupt PDS record for {did}/{collection}/{tid}"))?;
+            records.insert((collection, tid), record);
+        }
+        if records.is_empty() {
+            return Ok(None);
+        }
+        let Some(commit_bytes) = kv
+            .get(&commit_key(did))
+            .context("PDS Postgres commit read failed")?
         else {
             tracing::warn!(
                 did,
@@ -630,6 +800,38 @@ fn load_at9p_state_from_db(
             );
             anyhow::ensure!(
                 checkpoint.envelope_digest == h512(&envelope),
+                "accepted at9p checkpoint/state envelope mismatch"
+            );
+            Ok(Some(state))
+        }
+    }
+}
+
+/// Postgres counterpart of [`load_at9p_state_from_db`]. Uses `get_batch` for
+/// a snapshot-consistent read of the state envelope + checkpoint (#1257).
+#[cfg(feature = "pds-postgres")]
+fn load_at9p_state_from_pg(
+    kv: &super::pds_record_pg::PgKv,
+    subject: &str,
+    identity: &At9pAcceptanceVerifier,
+) -> AnyResult<Option<AcceptedAt9pState>> {
+    let vals = kv.get_batch(&[
+        at9p_state_key(subject),
+        at9p_checkpoint_key(subject),
+    ])?;
+    match (&vals[0], &vals[1]) {
+        (None, None) => Ok(None),
+        (Some(_), None) => bail!("accepted at9p state exists without its monotonic checkpoint"),
+        (None, Some(_)) => bail!("accepted at9p checkpoint exists without its state envelope"),
+        (Some(envelope), Some(checkpoint)) => {
+            let state = decode_at9p_state(subject, envelope, identity)?;
+            let checkpoint = decode_at9p_checkpoint(subject, checkpoint, identity)?;
+            anyhow::ensure!(
+                checkpoint.watermark == state.watermark(),
+                "accepted at9p checkpoint/body watermark mismatch"
+            );
+            anyhow::ensure!(
+                checkpoint.envelope_digest == h512(envelope),
                 "accepted at9p checkpoint/state envelope mismatch"
             );
             Ok(Some(state))

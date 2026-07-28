@@ -213,6 +213,92 @@ pub struct HyprConfig {
     #[cfg(feature = "ledger")]
     #[serde(default)]
     pub ledger: crate::services::ledger::LedgerConfig,
+
+    /// Shared RDS (Multi-AZ Postgres) substrate configuration (#1257 / #1401).
+    ///
+    /// ONE `[rds]` section feeds every Postgres-backed store — the PDS record
+    /// store (#1257, feature `pds-postgres`) and the user store (#1401,
+    /// feature-gated pg-userstore lane). Stores must not invent their own
+    /// connection config; they consume this seam so a single Multi-AZ RDS
+    /// instance serves both, matching the demo topology (one provider, one
+    /// region, two AZs, one RDS). When unset, stores fall back to their local
+    /// backends (RocksDB); when set, the Postgres backend is selected and is
+    /// FATAL-on-unavailable — never a silent local fallback.
+    ///
+    /// **D2 invariant** (`ARCH-recursive-federation-verdict-fable.md`): the
+    /// signed, content-addressed record/op-log bytes remain the authoritative
+    /// source of truth; the RDS rows are a projection-free KV shell over those
+    /// exact signed bytes, never a normalization of them.
+    #[serde(default)]
+    pub rds: RdsConfig,
+}
+
+/// Shared RDS (Multi-AZ Postgres) substrate configuration.
+///
+/// Metal provisioned the RDS instance and writes two files:
+/// - `url_file` — a file containing the Postgres connection URL
+///   (`postgresql://host:port/db`), read at startup. File-backed (not a bare
+///   config value) so rotation/repointing is a metal-side file swap, not a
+///   config reload.
+/// - `credentials_path` — path to a credentials file (or dir) holding the
+///   RDS user/password, resolved by the store. Shape mirrors the #1401
+///   pg-userstore lane; both stores read the SAME `[rds]` section.
+///
+/// `cell_id` stamps the cell (single-writer consistency domain) this node
+/// belongs to — the honorable-mention guard from the arch verdict so no code
+/// path assumes it is the only cell in the universe. For the demo leaf this is
+/// the one provider/region cell; it becomes the placement key at Stage 2.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RdsConfig {
+    /// Path to a file containing the RDS Postgres connection URL. When `None`,
+    /// the local backend (RocksDB) is used — the deployed posture is
+    /// Postgres-only, so `None` is local/workstation only.
+    #[serde(default)]
+    pub url_file: Option<PathBuf>,
+
+    /// Path to a credentials file/dir for RDS auth (user + password). Resolved
+    /// by the store; shape shared with #1401.
+    #[serde(default)]
+    pub credentials_path: Option<PathBuf>,
+
+    /// Optional PEM file of a private-CA root certificate for TLS to RDS
+    /// (e.g. the RDS CA bundle). ADDITIVE — public WebPKI roots remain enabled.
+    #[serde(default)]
+    pub root_cert: Option<PathBuf>,
+
+    /// Cell identifier (consistency-domain label). Stamped into the schema;
+    /// the demo leaf has exactly one cell. Honorable-mention guard from the
+    /// recursive-federation arch verdict.
+    #[serde(default = "default_rds_cell_id")]
+    pub cell_id: String,
+}
+
+fn default_rds_cell_id() -> String {
+    "demo-leaf".to_owned()
+}
+
+impl RdsConfig {
+    /// True when a Postgres URL is configured (the deployed posture).
+    pub fn is_configured(&self) -> bool {
+        self.url_file.is_some()
+    }
+
+    /// Read and return the connection URL from `url_file`. Fails closed on any
+    /// read/parse error — never returns an empty/local default.
+    pub fn read_url(&self) -> anyhow::Result<String> {
+        let path = self
+            .url_file
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("RDS url_file not configured"))?;
+        let url = std::fs::read_to_string(path)
+            .map_err(|e| anyhow::anyhow!("failed to read RDS url_file at {path:?}: {e}"))?;
+        let url = url.trim().to_owned();
+        anyhow::ensure!(
+            !url.is_empty(),
+            "RDS url_file at {path:?} is empty — refusing to start with no backend"
+        );
+        Ok(url)
+    }
 }
 
 /// Persistent secrets storage configuration.
