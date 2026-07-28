@@ -2839,49 +2839,57 @@ fn main() -> Result<()> {
 
         // ── Flight SQL client ───────────────────────────────────────────
         Some(("flight", sub_m)) => {
-            let args = FlightArgs::from_arg_matches(sub_m)
-                .map_err(|e| anyhow::anyhow!("{}", e))?;
+            #[cfg(not(feature = "metrics"))]
+            {
+                let _ = sub_m;
+                return Err(anyhow::anyhow!("Flight SQL client requires the 'metrics' feature"));
+            }
+            #[cfg(feature = "metrics")]
+            {
+                let args = FlightArgs::from_arg_matches(sub_m)
+                    .map_err(|e| anyhow::anyhow!("{}", e))?;
 
-            with_runtime(
-                RuntimeConfig {
-                    device: DeviceConfig::request_cpu(),
-                    multi_threaded: true,
-                },
-                || async move {
-                    use hyprstream_flight::client::{
-                        format_batches_as_csv, format_batches_as_json,
-                        format_batches_as_table, FlightClient,
-                    };
-
-                    let mut client = FlightClient::connect(&args.addr)
-                        .await
-                        .map_err(|e| anyhow::anyhow!("Failed to connect: {}", e))?;
-
-                    if let Some(sql) = args.query {
-                        let batches = client
-                            .query(&sql)
-                            .await
-                            .map_err(|e| anyhow::anyhow!("Query failed: {}", e))?;
-
-                        let output = match args.format.as_str() {
-                            "csv" => format_batches_as_csv(&batches),
-                            "json" => format_batches_as_json(&batches)
-                                .map_err(|e| anyhow::anyhow!("JSON format error: {}", e))?,
-                            _ => format_batches_as_table(&batches),
+                with_runtime(
+                    RuntimeConfig {
+                        device: DeviceConfig::request_cpu(),
+                        multi_threaded: true,
+                    },
+                    || async move {
+                        use hyprstream_flight::client::{
+                            format_batches_as_csv, format_batches_as_json,
+                            format_batches_as_table, FlightClient,
                         };
-                        print!("{}", output);
-                    } else {
-                        println!(
-                            "Connected to Flight SQL server at {}",
-                            args.addr
-                        );
-                        println!(
-                            "Interactive mode not yet implemented. Use --query to execute SQL."
-                        );
-                    }
-                    Ok(())
-                },
-            )?;
+
+                        let mut client = FlightClient::connect(&args.addr)
+                            .await
+                            .map_err(|e| anyhow::anyhow!("Failed to connect: {}", e))?;
+
+                        if let Some(sql) = args.query {
+                            let batches = client
+                                .query(&sql)
+                                .await
+                                .map_err(|e| anyhow::anyhow!("Query failed: {}", e))?;
+
+                            let output = match args.format.as_str() {
+                                "csv" => format_batches_as_csv(&batches),
+                                "json" => format_batches_as_json(&batches)
+                                    .map_err(|e| anyhow::anyhow!("JSON format error: {}", e))?,
+                                _ => format_batches_as_table(&batches),
+                            };
+                            print!("{}", output);
+                        } else {
+                            println!(
+                                "Connected to Flight SQL server at {}",
+                                args.addr
+                            );
+                            println!(
+                                "Interactive mode not yet implemented. Use --query to execute SQL."
+                            );
+                        }
+                        Ok(())
+                    },
+                )?;
+            }
         }
 
         // ── Sign OAuth challenge ─────────────────────────────────────────

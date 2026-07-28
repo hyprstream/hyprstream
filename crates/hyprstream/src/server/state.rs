@@ -12,6 +12,7 @@ use tokio::sync::RwLock;
 pub use crate::config::{CorsConfig, SamplingParamDefaults, ServerConfig};
 
 // Re-export context storage types
+#[cfg(feature = "metrics")]
 pub use hyprstream_metrics::storage::context::{ContextRecord, ContextStore, SearchResult};
 
 /// Shared server state
@@ -51,6 +52,7 @@ pub struct ServerState {
     pub published_jwt_verifying_keys: crate::auth::key_rotation::PublishedEd25519Keys,
 
     /// Context store for RAG/CAG (optional)
+    #[cfg(feature = "metrics")]
     pub context_store:
         Option<Arc<ContextStore<hyprstream_metrics::storage::duckdb::DuckDbBackend>>>,
 
@@ -241,6 +243,7 @@ impl ServerState {
             signing_key,
             verifying_key,
             published_jwt_verifying_keys,
+            #[cfg(feature = "metrics")]
             context_store: None, // Initialize via enable_context_store() if needed
             resource_url,
             oauth_issuer_url,
@@ -279,6 +282,7 @@ impl ServerState {
     ///
     /// # Returns
     /// A mutable reference to the initialized ContextStore
+    #[cfg(feature = "metrics")]
     pub async fn enable_context_store(
         &mut self,
         db_path: &str,
@@ -315,6 +319,7 @@ impl ServerState {
     }
 
     /// Get the context store if initialized
+    #[cfg(feature = "metrics")]
     pub fn get_context_store(
         &self,
     ) -> Option<&Arc<ContextStore<hyprstream_metrics::storage::duckdb::DuckDbBackend>>> {

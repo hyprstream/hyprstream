@@ -18,7 +18,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::{
-    extract::{Query, State},
+    extract::{rejection::FormRejection, Query, State},
     http::StatusCode,
     response::{Html, IntoResponse, Redirect, Response},
     Form,
@@ -29,8 +29,14 @@ use serde::Deserialize;
 
 use super::challenge;
 use super::device::html_escape;
+use super::identity_registration::IdentityApiError;
 use super::registration::{resolve_cimd_client, validate_redirect_uri};
 use super::state::{OAuthState, PendingAuthCode};
+use crate::auth::{AccountKeyCustody, HostedAccountProvisionError};
+
+const SIGNUP_ACTION: &str = "signup";
+const AUTHORIZE_ACTION: &str = "authorize";
+const SIGNUP_PROOF_DOMAIN: &[u8] = b"hyprstream-cold-signup-v1\0";
 
 /// Authorization request query parameters
 #[derive(Debug, Clone, Deserialize)]
@@ -100,6 +106,10 @@ pub struct AuthorizeQuery {
 /// `"{fingerprint}:{nonce}:{code_challenge}"`.
 #[derive(Debug, Deserialize)]
 pub struct ConsentForm {
+    /// Omitted/`authorize` authenticates an existing account. `signup`
+    /// provisions a new hosted account inside this same authorize transaction.
+    #[serde(default)]
+    pub action: Option<String>,
     pub client_id: String,
     pub redirect_uri: String,
     pub code_challenge: String,
@@ -114,6 +124,12 @@ pub struct ConsentForm {
     pub fingerprint: String,
     /// Base64-encoded Ed25519 signature
     pub signature: String,
+    /// Requested one-label hosted-account handle. Signup action only.
+    #[serde(default)]
+    pub handle: Option<String>,
+    /// Standard-base64 raw or SSH-wire Ed25519 public key. Signup action only.
+    #[serde(default)]
+    pub account_public_key: Option<String>,
     /// OIDC nonce (passed through from authorize request, stored in auth code)
     #[serde(default)]
     pub oidc_nonce: Option<String>,
@@ -163,7 +179,8 @@ pub async fn authorize_get(
             "Server Not Configured",
             "This server is not configured for local user authentication. \
              Contact your administrator to set up the user credential store.",
-        )).into_response();
+        ))
+        .into_response();
     }
 
     // Resolve client
@@ -171,7 +188,9 @@ pub async fn authorize_get(
         // Client ID Metadata Document flow (cache-aside via cimd_cache).
         match resolve_cimd_client(&state, &params.client_id).await {
             Ok(client) => (
-                client.client_name.unwrap_or_else(|| params.client_id.clone()),
+                client
+                    .client_name
+                    .unwrap_or_else(|| params.client_id.clone()),
                 client.redirect_uris,
             ),
             Err(e) => {
@@ -187,7 +206,10 @@ pub async fn authorize_get(
         let clients = state.clients.read().await;
         match clients.get(&params.client_id) {
             Some(client) => (
-                client.client_name.clone().unwrap_or_else(|| params.client_id.clone()),
+                client
+                    .client_name
+                    .clone()
+                    .unwrap_or_else(|| params.client_id.clone()),
                 client.redirect_uris.clone(),
             ),
             None => {
@@ -210,13 +232,17 @@ pub async fn authorize_get(
     }
 
     // Determine scopes
-    let scopes = params.scope.as_deref().unwrap_or(
-        &state.default_scopes.join(" ")
-    ).to_owned();
+    let scopes = params
+        .scope
+        .as_deref()
+        .unwrap_or(&state.default_scopes.join(" "))
+        .to_owned();
     let mut effective_request = params.clone();
     effective_request.scope = Some(scopes.clone());
     let effective_scopes: Vec<String> = scopes.split_whitespace().map(str::to_owned).collect();
-    if super::state::atproto_profile_active(&effective_scopes) && effective_request.dpop_jkt.is_none() {
+    if super::state::atproto_profile_active(&effective_scopes)
+        && effective_request.dpop_jkt.is_none()
+    {
         return error_response(
             StatusCode::BAD_REQUEST,
             "invalid_request",
@@ -241,13 +267,12 @@ pub async fn authorize_get(
     let nonce = issue_nonce(&state).await;
     // Bind the complete resolved request to the consent nonce. Hidden form
     // fields are transport echoes only and cannot change authority on POST.
-    state
-        .pending_authorize_bindings
-        .write()
-        .await
-        .insert(nonce.clone(), super::state::AuthorizeBinding {
+    state.pending_authorize_bindings.write().await.insert(
+        nonce.clone(),
+        super::state::AuthorizeBinding {
             request: effective_request.clone(),
-        });
+        },
+    );
 
     // Render challenge form
     let html = render_challenge_page(
@@ -282,11 +307,49 @@ fn consent_form_matches_request(form: &ConsentForm, request: &AuthorizeParams) -
         && nonempty(form.oidc_nonce.as_deref()) == nonempty(request.nonce.as_deref())
 }
 
+/// Domain-separated proof signed by the new vault key.
+///
+/// NUL delimiters make the byte contract unambiguous. The fingerprint is
+/// derived again from `account_public_key` before verification, so the proof
+/// binds the actual key as well as handle, single-use authorize nonce, and
+/// PAR/PKCE transaction.
+fn signup_proof_challenge(
+    handle: &str,
+    fingerprint: &str,
+    nonce: &str,
+    code_challenge: &str,
+) -> Vec<u8> {
+    let mut challenge = Vec::with_capacity(
+        SIGNUP_PROOF_DOMAIN.len()
+            + handle.len()
+            + fingerprint.len()
+            + nonce.len()
+            + code_challenge.len()
+            + 4,
+    );
+    challenge.extend_from_slice(SIGNUP_PROOF_DOMAIN);
+    for component in [handle, fingerprint, nonce, code_challenge] {
+        challenge.extend_from_slice(component.as_bytes());
+        challenge.push(0);
+    }
+    challenge
+}
+
 /// POST /oauth/authorize — verify Ed25519 signature, issue auth code
 pub async fn authorize_post(
     State(state): State<Arc<OAuthState>>,
-    Form(form): Form<ConsentForm>,
+    submitted: Result<Form<ConsentForm>, FormRejection>,
 ) -> Response {
+    let Form(form) = match submitted {
+        Ok(form) => form,
+        Err(_) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                "Authorization form is missing or malformed",
+            );
+        }
+    };
     // Validate and consume the nonce. Rejects forged nonces and enforces the 5-min TTL.
     // Single-use: remove from pending_nonces whether valid or expired.
     let (nonce_valid, authorize_binding) = {
@@ -322,7 +385,8 @@ pub async fn authorize_post(
             return Html(render_error_page(
                 "Invalid Request",
                 "Unknown client or redirect URI. Please restart the authorization flow.",
-            )).into_response();
+            ))
+            .into_response();
         };
         let fresh_nonce = issue_nonce(&state).await;
         // #1113 rev2 F3: re-stash the binding on error-retry so the PAR
@@ -357,84 +421,8 @@ pub async fn authorize_post(
         );
     }
 
-    // Reconstruct challenge: "{fingerprint}:{nonce}:{code_challenge}"
-    // Binds signature to the key identity and the PKCE session. The server
-    // does not trust client-declared usernames — it resolves the username
-    // from the pubkey reverse index keyed by `form.fingerprint`.
-    let challenge_str = format!("{}:{}:{}", form.fingerprint, form.nonce, effective.code_challenge);
-
-    // Get user store
-    let user_store = match state.user_store_reader() {
-        Some(store) => store,
-        None => {
-            return Html(render_error_page(
-                "Server Not Configured",
-                "User credential store not configured on this server.",
-            )).into_response();
-        }
-    };
-
-    // Verify Ed25519 challenge-response. The resolved username comes back
-    // from the reverse index; the client never asserts an identity.
-    let (resolved_username, verifying_key) = match challenge::verify_ed25519_response_by_fingerprint(
-        user_store.as_ref(),
-        &form.fingerprint,
-        &challenge_str,
-        &form.signature,
-    ).await {
-        Ok(pair) => pair,
-        Err(e) => {
-            if matches!(e, challenge::ChallengeError::UserStoreError(_)) {
-                tracing::error!(fingerprint = %form.fingerprint, "UserStore lookup error during authorize");
-            }
-            // Validate redirect_uri and re-derive client display info from the registry.
-            // Never trust the POST body for display values; return an error page if
-            // the client or redirect_uri is no longer valid.
-            let Some((client_name, redirect_host, localhost_warning)) =
-                derive_display_info(&state, &effective.client_id, &effective.redirect_uri).await
-            else {
-                return Html(render_error_page(
-                    "Invalid Request",
-                    "Unknown client or redirect URI. Please restart the authorization flow.",
-                )).into_response();
-            };
-            // Issue a fresh nonce so re-render shows a signable challenge.
-            let fresh_nonce = issue_nonce(&state).await;
-            // #1113 rev2 F3: re-stash the PAR-bound DPoP jkt under the fresh
-            // nonce so one failed consent signature doesn't lose the PAR key
-            // binding (which would break the later token exchange).
-            state
-                .pending_authorize_bindings
-                .write()
-                .await
-                .insert(fresh_nonce.clone(), authorize_binding.clone());
-            let html = render_challenge_page(
-                &client_name,
-                effective.scope.as_deref().unwrap_or(""),
-                &redirect_host,
-                &effective.client_id,
-                &effective.redirect_uri,
-                &effective.code_challenge,
-                effective.state.as_deref().unwrap_or(""),
-                effective.resource.as_deref().unwrap_or(""),
-                &fresh_nonce,
-                effective.nonce.as_deref().unwrap_or(""),
-                Some(e.message()),
-                localhost_warning.as_deref(),
-            );
-            return Html(html).into_response();
-        }
-    };
-
-    // Signature valid — generate auth code
-    let mut code_bytes = [0u8; 32];
-    rand::rngs::OsRng.fill_bytes(&mut code_bytes);
-    let code = URL_SAFE_NO_PAD.encode(code_bytes);
-
-    // #1113 rev2 finding 4: validate the requested scope set against the
-    // server-supported and client-declared scopes BEFORE minting an auth
-    // code. Garbage / undeclared tokens → invalid_scope. The granted set
-    // (intersection) is what the token response will echo (RFC 6749 §3.3).
+    // Validate the complete server-bound request before any irreversible
+    // signup mutation (authority allocation burns a permanent handle).
     let requested_scopes: Vec<String> = effective
         .scope
         .as_deref()
@@ -445,9 +433,6 @@ pub async fn authorize_post(
     let client_declared = match resolve_client_declared_scopes(&state, &effective.client_id).await {
         Some(declared) => declared,
         None => {
-            // #1146 T1.1: the client (and therefore its scope ceiling)
-            // could not be resolved — fail closed rather than silently
-            // validating against the full server-supported set.
             tracing::warn!(
                 client_id = %effective.client_id,
                 "authorize: client unresolvable at scope validation — failing closed"
@@ -463,10 +448,14 @@ pub async fn authorize_post(
     let granted_scopes = match super::state::validate_requested_scopes(
         &requested_scopes,
         &state.server_supported_scopes(),
-        if client_declared.is_empty() { None } else { Some(&client_declared) },
+        if client_declared.is_empty() {
+            None
+        } else {
+            Some(&client_declared)
+        },
         require_atproto,
     ) {
-        Ok(g) => g,
+        Ok(granted) => granted,
         Err(_) => {
             return error_response(
                 StatusCode::BAD_REQUEST,
@@ -475,7 +464,323 @@ pub async fn authorize_post(
             );
         }
     };
-    let resource = effective.resource.as_ref().filter(|s| !s.is_empty()).cloned();
+    let resource = effective
+        .resource
+        .as_ref()
+        .filter(|value| !value.is_empty())
+        .cloned();
+
+    // Get user store
+    let user_store = match state.user_store_reader() {
+        Some(store) => store,
+        None => {
+            return Html(render_error_page(
+                "Server Not Configured",
+                "User credential store not configured on this server.",
+            ))
+            .into_response();
+        }
+    };
+
+    let action = form.action.as_deref().unwrap_or(AUTHORIZE_ACTION);
+    let (resolved_username, verifying_key) = if action == SIGNUP_ACTION {
+        // Cold signup is deliberately reachable only from an ATProto PAR:
+        // `effective` is the server-side snapshot consumed with this nonce,
+        // including the DPoP thumbprint verified by /oauth/par.
+        let Some(dpop_jkt) = effective.dpop_jkt.as_deref() else {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                "Signup requires an ATProto Pushed Authorization Request bound to DPoP",
+            );
+        };
+        if !require_atproto {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_scope",
+                "Signup requires the atproto OAuth profile",
+            );
+        }
+        let Some(registration_api) = state.identity_registration_api.as_deref() else {
+            return error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "temporarily_unavailable",
+                "Hosted-account minting is not configured",
+            );
+        };
+        if let Err(error) = registration_api.check_oauth_signup_rate(dpop_jkt) {
+            return match error {
+                IdentityApiError::RateLimited => error_response(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "rate_limited",
+                    "Signup rate limit exceeded",
+                ),
+                _ => error_response(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request",
+                    "Signup authorization binding is invalid",
+                ),
+            };
+        }
+        let Some(handle) = form.handle.as_deref().filter(|value| !value.is_empty()) else {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                "Signup handle is required",
+            );
+        };
+        let Some(hosted_zone) = state.hosted_account_zone.as_ref() else {
+            return error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "temporarily_unavailable",
+                "Hosted-account zone is not configured",
+            );
+        };
+        let expected_did = match hosted_zone.host_for_label(handle) {
+            Ok(host) => format!("did:web:{host}"),
+            Err(_) => {
+                return error_response(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request",
+                    "Signup handle is not a valid hosted-account label",
+                );
+            }
+        };
+        let Some(account_public_key) = form
+            .account_public_key
+            .as_deref()
+            .filter(|value| !value.is_empty())
+        else {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                "Signup account_public_key is required",
+            );
+        };
+
+        let signup_challenge = signup_proof_challenge(
+            handle,
+            &form.fingerprint,
+            &form.nonce,
+            &effective.code_challenge,
+        );
+        let verifying_key = match challenge::verify_unregistered_ed25519_response(
+            account_public_key,
+            &form.fingerprint,
+            &signup_challenge,
+            &form.signature,
+        ) {
+            Ok(key) => key,
+            Err(error) => {
+                return error_response(StatusCode::BAD_REQUEST, "invalid_proof", error.message());
+            }
+        };
+
+        // The credential store is the first durable uniqueness commit. It
+        // stages the exact handle/DID/key binding inactive, or resumes that
+        // same verified pair. No authority reservation or PDS generation is
+        // published before this succeeds.
+        let provisioned = match user_store
+            .provision_hosted_account(
+                handle,
+                &expected_did,
+                verifying_key,
+                AccountKeyCustody::SelfCustody,
+            )
+            .await
+        {
+            Ok(provisioned) if provisioned.fingerprint == form.fingerprint => provisioned,
+            Ok(provisioned) => {
+                tracing::error!(
+                    expected = %form.fingerprint,
+                    actual = %provisioned.fingerprint,
+                    handle,
+                    "Credential store returned a mismatched signup key"
+                );
+                return error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "server_error",
+                    "Hosted-account credential binding failed",
+                );
+            }
+            Err(HostedAccountProvisionError::AccountAlreadyExists) => {
+                return error_response(
+                    StatusCode::CONFLICT,
+                    "handle_unavailable",
+                    "Requested hosted-account handle is unavailable",
+                );
+            }
+            Err(HostedAccountProvisionError::KeyAlreadyBound) => {
+                return error_response(
+                    StatusCode::CONFLICT,
+                    "key_already_bound",
+                    "Account public key is already bound",
+                );
+            }
+            Err(HostedAccountProvisionError::Backend(error)) => {
+                tracing::error!(%error, handle, "Atomic hosted-account AS provisioning failed");
+                return error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "server_error",
+                    "Hosted-account credential binding failed",
+                );
+            }
+        };
+
+        tracing::debug!(
+            handle,
+            resumed = provisioned.resumed,
+            "Hosted-account credential transaction is staged"
+        );
+
+        let minted =
+            match registration_api.mint_for_oauth_signup(handle, dpop_jkt, &form.fingerprint) {
+                Ok(result) => result,
+                Err(IdentityApiError::RateLimited) => {
+                    return error_response(
+                        StatusCode::TOO_MANY_REQUESTS,
+                        "rate_limited",
+                        "Signup rate limit exceeded",
+                    );
+                }
+                Err(error) => {
+                    // The staged credential binding is intentionally retained:
+                    // an exact retry can resume the authority/PDS transaction.
+                    // Authority conflicts after staging indicate inconsistent
+                    // backend state and are never a client-trusted 409.
+                    tracing::error!(?error, handle, "Hosted-account signup mint failed");
+                    return error_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "server_error",
+                        "Hosted-account minting failed",
+                    );
+                }
+            };
+        if expected_did.as_str() != minted.did {
+            tracing::error!(
+                requested_handle = handle,
+                minted_did = %minted.did,
+                "Authority returned a DID outside the configured host-form account zone"
+            );
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "server_error",
+                "Hosted-account authority binding is invalid",
+            );
+        }
+        if let Err(error) = user_store
+            .activate_hosted_account(
+                handle,
+                &minted.did,
+                &form.fingerprint,
+                AccountKeyCustody::SelfCustody,
+            )
+            .await
+        {
+            tracing::error!(?error, handle, "Hosted-account final AS activation failed");
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "server_error",
+                "Hosted-account activation failed",
+            );
+        }
+        (handle.to_owned(), verifying_key)
+    } else if action == AUTHORIZE_ACTION {
+        // Existing-account authorize challenge:
+        // "{fingerprint}:{nonce}:{code_challenge}".
+        let challenge_str = format!(
+            "{}:{}:{}",
+            form.fingerprint, form.nonce, effective.code_challenge
+        );
+        match challenge::verify_ed25519_response_by_fingerprint(
+            user_store.as_ref(),
+            &form.fingerprint,
+            &challenge_str,
+            &form.signature,
+        )
+        .await
+        {
+            Ok((username, verifying_key)) => match user_store.get_profile(&username).await {
+                Ok(Some(profile)) if profile.active != Some(false) => (username, verifying_key),
+                Ok(Some(_)) => {
+                    return error_response(
+                        StatusCode::FORBIDDEN,
+                        "access_denied",
+                        "Account is not active",
+                    );
+                }
+                Ok(None) => {
+                    tracing::error!(
+                        username,
+                        "Credential reverse index resolved to a missing user profile"
+                    );
+                    return error_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "server_error",
+                        "Account credential binding is inconsistent",
+                    );
+                }
+                Err(error) => {
+                    tracing::error!(%error, username, "UserStore activation check failed");
+                    return error_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "server_error",
+                        "Account activation could not be verified",
+                    );
+                }
+            },
+            Err(e) => {
+                if matches!(e, challenge::ChallengeError::UserStoreError(_)) {
+                    tracing::error!(fingerprint = %form.fingerprint, "UserStore lookup error during authorize");
+                }
+                // Validate redirect_uri and re-derive client display info from the registry.
+                // Never trust the POST body for display values; return an error page if
+                // the client or redirect_uri is no longer valid.
+                let Some((client_name, redirect_host, localhost_warning)) =
+                    derive_display_info(&state, &effective.client_id, &effective.redirect_uri)
+                        .await
+                else {
+                    return Html(render_error_page(
+                        "Invalid Request",
+                        "Unknown client or redirect URI. Please restart the authorization flow.",
+                    ))
+                    .into_response();
+                };
+                let fresh_nonce = issue_nonce(&state).await;
+                state
+                    .pending_authorize_bindings
+                    .write()
+                    .await
+                    .insert(fresh_nonce.clone(), authorize_binding.clone());
+                let html = render_challenge_page(
+                    &client_name,
+                    effective.scope.as_deref().unwrap_or(""),
+                    &redirect_host,
+                    &effective.client_id,
+                    &effective.redirect_uri,
+                    &effective.code_challenge,
+                    effective.state.as_deref().unwrap_or(""),
+                    effective.resource.as_deref().unwrap_or(""),
+                    &fresh_nonce,
+                    effective.nonce.as_deref().unwrap_or(""),
+                    Some(e.message()),
+                    localhost_warning.as_deref(),
+                );
+                return Html(html).into_response();
+            }
+        }
+    } else {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "Unknown authorize action",
+        );
+    };
+
+    // Signature valid — generate auth code
+    let mut code_bytes = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut code_bytes);
+    let code = URL_SAFE_NO_PAD.encode(code_bytes);
 
     let pending = PendingAuthCode {
         code: code.clone(),
@@ -495,7 +800,11 @@ pub async fn authorize_post(
         client_assertion_jkt: effective.client_assertion_jkt.clone(),
     };
 
-    state.pending_codes.write().await.insert(code.clone(), pending);
+    state
+        .pending_codes
+        .write()
+        .await
+        .insert(code.clone(), pending);
 
     tracing::info!(
         client_id = %effective.client_id,
@@ -595,7 +904,10 @@ async fn resolve_authorize_query(
     // strict profile (DPoP binding at PAR).
     if let Some(ref scope_str) = query.scope {
         if super::state::atproto_profile_active(
-            &scope_str.split_whitespace().map(str::to_owned).collect::<Vec<_>>(),
+            &scope_str
+                .split_whitespace()
+                .map(str::to_owned)
+                .collect::<Vec<_>>(),
         ) {
             return Err(error_response(
                 StatusCode::BAD_REQUEST,
@@ -641,13 +953,21 @@ async fn resolve_authorize_query(
     })
 }
 
-/// Generate a fresh nonce and record it in `pending_nonces` with a 5-min expiry.
-async fn issue_nonce(state: &OAuthState) -> String {
+fn fresh_nonce() -> String {
     let mut nonce_bytes = [0u8; 32];
     rand::rngs::OsRng.fill_bytes(&mut nonce_bytes);
-    let nonce = URL_SAFE_NO_PAD.encode(nonce_bytes);
+    URL_SAFE_NO_PAD.encode(nonce_bytes)
+}
+
+/// Generate a fresh nonce and record it in `pending_nonces` with a 5-min expiry.
+async fn issue_nonce(state: &OAuthState) -> String {
+    let nonce = fresh_nonce();
     let expiry = Instant::now() + Duration::from_secs(300);
-    state.pending_nonces.write().await.insert(nonce.clone(), expiry);
+    state
+        .pending_nonces
+        .write()
+        .await
+        .insert(nonce.clone(), expiry);
     nonce
 }
 
@@ -699,7 +1019,10 @@ async fn derive_display_info(
 /// restriction". Returns `None` (fail closed) when the client cannot be
 /// resolved at all; `Some(vec![])` only when a resolved client declared
 /// no scope ceiling.
-async fn resolve_client_declared_scopes(state: &OAuthState, client_id: &str) -> Option<Vec<String>> {
+async fn resolve_client_declared_scopes(
+    state: &OAuthState,
+    client_id: &str,
+) -> Option<Vec<String>> {
     let client = if client_id.starts_with("https://") {
         match state.cimd_cache.get(client_id).await {
             Some(c) => c,
@@ -771,7 +1094,8 @@ fn error_response(status: StatusCode, error: &str, description: &str) -> Respons
             "error": error,
             "error_description": description,
         })),
-    ).into_response()
+    )
+        .into_response()
 }
 
 /// Render an error page (HTML) for configuration errors.
@@ -877,6 +1201,7 @@ fn render_challenge_page(
     Copy the printed <em>Fingerprint</em> and <em>Signature</em> below.
   </div>
   <form method="post" action="/oauth/authorize">
+    <input type="hidden" name="action" value="authorize">
     <input type="hidden" name="client_id" value="{client_id_val}">
     <input type="hidden" name="redirect_uri" value="{redirect_uri_val}">
     <input type="hidden" name="code_challenge" value="{code_challenge_val}">
@@ -899,7 +1224,8 @@ fn render_challenge_page(
 </body>
 </html>"#,
         client_name_esc = html_escape(client_name),
-        scopes_display = scopes.split_whitespace()
+        scopes_display = scopes
+            .split_whitespace()
             .map(|s| format!("<code>{}</code>", html_escape(s)))
             .collect::<Vec<_>>()
             .join(", "),
@@ -923,6 +1249,7 @@ fn render_challenge_page(
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use ed25519_dalek::Signer as _;
 
     #[test]
     fn localhost_warning_fires_when_all_loopback() {
@@ -954,6 +1281,305 @@ mod tests {
     #[test]
     fn localhost_warning_empty_returns_none() {
         assert!(compute_localhost_warning(&[]).is_none());
+    }
+
+    #[test]
+    fn signup_proof_challenge_is_domain_separated_and_transaction_bound() {
+        let authorize_nonce = fresh_nonce();
+        let other_nonce = fresh_nonce();
+        let challenge =
+            signup_proof_challenge("alice", "SHA256:key", &authorize_nonce, "pkce-challenge");
+        assert!(challenge.starts_with(SIGNUP_PROOF_DOMAIN));
+        assert_ne!(
+            challenge,
+            signup_proof_challenge("bob", "SHA256:key", &authorize_nonce, "pkce-challenge")
+        );
+        assert_ne!(
+            challenge,
+            signup_proof_challenge("alice", "SHA256:key", &other_nonce, "pkce-challenge")
+        );
+        assert_ne!(
+            challenge,
+            signup_proof_challenge("alice", "SHA256:key", &authorize_nonce, "other-pkce")
+        );
+    }
+
+    #[tokio::test]
+    async fn signup_resumes_after_crash_after_genesis_before_activation() -> anyhow::Result<()> {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        use async_trait::async_trait;
+        use base64::engine::general_purpose::STANDARD;
+        use hyprstream_rpc::rpc_client::RpcClientImpl;
+        use hyprstream_rpc::signer::LocalSigner;
+        use hyprstream_rpc::transport::lazy_uds::LazyUdsTransport;
+
+        use crate::auth::{RocksDbUserStore, UserStore};
+        use crate::services::oauth::identity_registration::{
+            DidWebOriginAllowlist, FederatedIdentityIntake, HostedRegistrationMint,
+            IdentityConnectTimeResolver, IdentityRegistrationApi, RegistrationGenesisSigner,
+        };
+
+        struct SignupMint {
+            calls: AtomicUsize,
+            fail_after_publish_once: AtomicBool,
+        }
+        impl HostedRegistrationMint for SignupMint {
+            fn mint(
+                &self,
+                request: &hyprstream_pds_service::hosted_account_mint::HostedAccountRegistrationRequest,
+                _signer: &dyn hyprstream_pds_service::hosted_account_mint::HostedAccountGenesisSigner,
+            ) -> anyhow::Result<
+                hyprstream_pds_service::hosted_account_mint::HostedAccountRegistrationResult,
+            > {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                if self.fail_after_publish_once.swap(false, Ordering::SeqCst) {
+                    anyhow::bail!("simulated crash after durable PDS genesis publication");
+                }
+                Ok(
+                    hyprstream_pds_service::hosted_account_mint::HostedAccountRegistrationResult {
+                        handle: format!("at://{}.accounts.example.test", request.handle()),
+                        did: format!("did:web:{}.accounts.example.test", request.handle()),
+                        pds_endpoint: "https://pds.example.test".to_owned(),
+                        quic_url: "https://pds.example.test:4433".to_owned(),
+                        cert_hash: "fixture-cert-hash".to_owned(),
+                    },
+                )
+            }
+        }
+
+        struct UnusedSigner;
+        impl RegistrationGenesisSigner for UnusedSigner {
+            fn sign_genesis(
+                &self,
+                _caller: &str,
+                _operator_manual: bool,
+                _unsigned: &hyprstream_pds::UnsignedGenesisDidOp,
+            ) -> anyhow::Result<hyprstream_pds::DidOpSignature> {
+                anyhow::bail!("fake mint must not invoke the signer")
+            }
+        }
+
+        struct UnusedIntake;
+        #[async_trait]
+        impl FederatedIdentityIntake for UnusedIntake {
+            async fn intake(
+                &self,
+                _did: &str,
+            ) -> anyhow::Result<hyprstream_pds_service::federation_intake::InventoryEntry>
+            {
+                anyhow::bail!("federation intake is outside this test")
+            }
+        }
+
+        struct UnusedResolver;
+        impl IdentityConnectTimeResolver for UnusedResolver {
+            fn recognizes(&self, _did: &str) -> bool {
+                false
+            }
+
+            fn resolve(
+                &self,
+                _did: &str,
+            ) -> anyhow::Result<hyprstream_discovery::ConnectTimeDiscovery> {
+                anyhow::bail!("connect-time resolution is outside this test")
+            }
+        }
+
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[0x51; 32]);
+        let remote_key = ed25519_dalek::SigningKey::from_bytes(&[0x52; 32]).verifying_key();
+        let make_client = || {
+            Arc::new(
+                RpcClientImpl::new(
+                    LocalSigner::new(signing_key.clone()),
+                    LazyUdsTransport::new("/dev/null/oauth-signup-authorize-test.sock".into()),
+                    Some(remote_key),
+                )
+                .with_response_verify_policy(hyprstream_rpc::crypto::CryptoPolicy::Classical),
+            )
+        };
+        let mut config = crate::config::OAuthConfig::default();
+        config.external_url = Some("https://pds.example.test".to_owned());
+        let user_dir = tempfile::TempDir::new()?;
+        let user_store = Arc::new(RocksDbUserStore::open(user_dir.path())?);
+        let mint = Arc::new(SignupMint {
+            calls: AtomicUsize::new(0),
+            fail_after_publish_once: AtomicBool::new(true),
+        });
+        let identity_api = Arc::new(IdentityRegistrationApi::new(
+            mint.clone(),
+            Arc::new(UnusedSigner),
+            Arc::new(UnusedIntake),
+            Arc::new(UnusedResolver),
+            DidWebOriginAllowlist::new(std::iter::empty::<&str>())?,
+            Arc::new(crate::server::middleware::RateLimiter::new(10, 60)),
+        ));
+        let state = Arc::new(
+            OAuthState::new(
+                &config,
+                crate::services::PolicyClient::new(make_client()),
+                crate::services::DiscoveryClient::new(make_client()),
+                signing_key.verifying_key().to_bytes(),
+            )
+            .with_user_store(user_store.clone())
+            .with_identity_registration_api(identity_api)
+            .with_hosted_account_zone(crate::account::AccountZone::new("accounts.example.test")?),
+        );
+        state.clients.write().await.insert(
+            "signup-client".to_owned(),
+            super::super::state::RegisteredClient {
+                client_id: "signup-client".to_owned(),
+                redirect_uris: vec!["https://client.example/callback".to_owned()],
+                client_name: Some("Signup Client".to_owned()),
+                client_uri: None,
+                logo_uri: None,
+                grant_types: vec!["authorization_code".to_owned()],
+                response_types: vec!["code".to_owned()],
+                token_endpoint_auth_method: Some("none".to_owned()),
+                jwks: None,
+                jwks_uri: None,
+                hyprstream_node_did: None,
+                scope: Some("atproto".to_owned()),
+                dpop_bound_access_tokens: Some(true),
+                is_cimd: false,
+                registered_at: Instant::now(),
+            },
+        );
+
+        let nonce = fresh_nonce();
+        let code_challenge = "signup-pkce-challenge".to_owned();
+        let request = AuthorizeParams {
+            client_id: "signup-client".to_owned(),
+            redirect_uri: "https://client.example/callback".to_owned(),
+            code_challenge: code_challenge.clone(),
+            code_challenge_method: "S256".to_owned(),
+            response_type: "code".to_owned(),
+            state: Some("signup-state".to_owned()),
+            scope: Some("atproto".to_owned()),
+            resource: Some("https://pds.example.test".to_owned()),
+            nonce: None,
+            dpop_jkt: Some("par-verified-dpop-thumbprint".to_owned()),
+            client_assertion_jkt: None,
+        };
+        state
+            .pending_nonces
+            .write()
+            .await
+            .insert(nonce.clone(), Instant::now() + Duration::from_secs(300));
+        state.pending_authorize_bindings.write().await.insert(
+            nonce.clone(),
+            super::super::state::AuthorizeBinding { request },
+        );
+
+        let vault_key = ed25519_dalek::SigningKey::from_bytes(&[0x53; 32]);
+        let public_key = STANDARD.encode(vault_key.verifying_key().as_bytes());
+        let fingerprint = crate::auth::pubkey_fingerprint(&vault_key.verifying_key());
+        let challenge = signup_proof_challenge("alice", &fingerprint, &nonce, &code_challenge);
+        let signature = STANDARD.encode(vault_key.sign(&challenge).to_bytes());
+        let response = authorize_post(
+            State(state.clone()),
+            Ok(Form(ConsentForm {
+                action: Some(SIGNUP_ACTION.to_owned()),
+                client_id: "signup-client".to_owned(),
+                redirect_uri: "https://client.example/callback".to_owned(),
+                code_challenge,
+                scope: "atproto".to_owned(),
+                state: Some("signup-state".to_owned()),
+                resource: Some("https://pds.example.test".to_owned()),
+                nonce,
+                fingerprint: fingerprint.clone(),
+                signature,
+                handle: Some("alice".to_owned()),
+                account_public_key: Some(public_key),
+                oidc_nonce: None,
+            })),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(mint.calls.load(Ordering::SeqCst), 1);
+        let staged = user_store.get_profile("alice").await?.unwrap();
+        assert_eq!(staged.active, Some(false));
+        assert_eq!(
+            user_store.get_pubkey_user(&fingerprint).await?,
+            Some("alice".to_owned())
+        );
+        assert!(state.pending_codes.read().await.is_empty());
+
+        // A fresh, fully verified OAuth authorize transaction for the exact
+        // same handle/key resumes minting and performs final activation.
+        let retry_nonce = fresh_nonce();
+        let retry_code_challenge = "signup-pkce-challenge-retry".to_owned();
+        let retry_request = AuthorizeParams {
+            client_id: "signup-client".to_owned(),
+            redirect_uri: "https://client.example/callback".to_owned(),
+            code_challenge: retry_code_challenge.clone(),
+            code_challenge_method: "S256".to_owned(),
+            response_type: "code".to_owned(),
+            state: Some("signup-state-retry".to_owned()),
+            scope: Some("atproto".to_owned()),
+            resource: Some("https://pds.example.test".to_owned()),
+            nonce: None,
+            dpop_jkt: Some("par-verified-dpop-thumbprint".to_owned()),
+            client_assertion_jkt: None,
+        };
+        state.pending_nonces.write().await.insert(
+            retry_nonce.clone(),
+            Instant::now() + Duration::from_secs(300),
+        );
+        state.pending_authorize_bindings.write().await.insert(
+            retry_nonce.clone(),
+            super::super::state::AuthorizeBinding {
+                request: retry_request,
+            },
+        );
+        let retry_challenge =
+            signup_proof_challenge("alice", &fingerprint, &retry_nonce, &retry_code_challenge);
+        let retry_signature = STANDARD.encode(vault_key.sign(&retry_challenge).to_bytes());
+        let retry_response = authorize_post(
+            State(state.clone()),
+            Ok(Form(ConsentForm {
+                action: Some(SIGNUP_ACTION.to_owned()),
+                client_id: "signup-client".to_owned(),
+                redirect_uri: "https://client.example/callback".to_owned(),
+                code_challenge: retry_code_challenge,
+                scope: "atproto".to_owned(),
+                state: Some("signup-state-retry".to_owned()),
+                resource: Some("https://pds.example.test".to_owned()),
+                nonce: retry_nonce,
+                fingerprint: fingerprint.clone(),
+                signature: retry_signature,
+                handle: Some("alice".to_owned()),
+                account_public_key: Some(STANDARD.encode(vault_key.verifying_key().as_bytes())),
+                oidc_nonce: None,
+            })),
+        )
+        .await;
+
+        assert_eq!(retry_response.status(), StatusCode::SEE_OTHER);
+        assert_eq!(mint.calls.load(Ordering::SeqCst), 2);
+        let profile = user_store.get_profile("alice").await?.unwrap();
+        assert_eq!(
+            profile.atproto_did.as_deref(),
+            Some("did:web:alice.accounts.example.test")
+        );
+        assert_eq!(profile.key_custody, Some(AccountKeyCustody::SelfCustody));
+        assert_eq!(profile.active, Some(true));
+        assert!(profile.external_identities.is_empty());
+        assert_eq!(
+            user_store.get_pubkey_user(&fingerprint).await?,
+            Some("alice".to_owned())
+        );
+        let codes = state.pending_codes.read().await;
+        assert_eq!(codes.len(), 1);
+        let pending = codes.values().next().unwrap();
+        assert_eq!(pending.username, "alice");
+        assert_eq!(
+            pending.dpop_jkt.as_deref(),
+            Some("par-verified-dpop-thumbprint")
+        );
+        assert!(state.sessions.get("nonexistent").await.is_none());
+        Ok(())
     }
 
     /// #1113 rev2 F5: the authorization redirect URL MUST include `iss`
@@ -997,7 +1623,10 @@ mod tests {
             .map(|(_, v)| v.to_string())
             .unwrap();
         assert_eq!(iss, "https://pds.example.com");
-        assert!(!iss.ends_with('/'), "iss must be origin (no trailing slash)");
+        assert!(
+            !iss.ends_with('/'),
+            "iss must be origin (no trailing slash)"
+        );
     }
 
     /// #1146 T1.1: `resolve_client_declared_scopes` must re-resolve a CIMD
@@ -1068,11 +1697,10 @@ mod tests {
         );
 
         // DCR registry hit → declared scopes (empty vec = declared no ceiling).
-        state
-            .clients
-            .write()
-            .await
-            .insert("dcr-client".to_owned(), make_registered("dcr-client", Some("atproto"), false));
+        state.clients.write().await.insert(
+            "dcr-client".to_owned(),
+            make_registered("dcr-client", Some("atproto"), false),
+        );
         assert_eq!(
             resolve_client_declared_scopes(&state, "dcr-client").await,
             Some(vec!["atproto".to_owned()])

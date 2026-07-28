@@ -16,6 +16,7 @@ use async_trait::async_trait;
 use dashmap::DashMap;
 use git2db::{CloneBuilder, Git2DB, GitRef, RepoId, TrackedRepository};
 use parking_lot::Mutex;
+#[cfg_attr(not(feature = "metrics"), allow(unused_imports))]
 use std::collections::HashMap;
 use std::io::{Read as _, Write as _, Seek as _, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -26,7 +27,8 @@ use tokio::sync::RwLock;
 use tracing::{debug, error, warn};
 use uuid::Uuid;
 
-// Generated client types
+// Generated client types (RegistryClient is used in test and metrics-impl code)
+#[allow(unused_imports)]
 use crate::services::generated::registry_client::{
     RegistryClient, RegistryResponseVariant,
     RegistryHandler, RepoHandler, WorktreeHandler, CtlHandler,
@@ -63,6 +65,7 @@ use automerge::ReadDoc as _;
 // ============================================================================
 
 /// Convert generated variant fields into a TrackedRepository.
+#[cfg(feature = "metrics")]
 fn variant_to_tracked_repository(
     id: &str,
     name: &str,
@@ -3319,10 +3322,12 @@ impl RequestService for RegistryService {
 // MetricsRegistryClient Implementation (on generated RegistryClient)
 // ============================================================================
 
+#[cfg(feature = "metrics")]
 use hyprstream_metrics::checkpoint::manager::{
     RegistryClient as MetricsRegistryClient, RegistryError as MetricsRegistryError,
 };
 
+#[cfg(feature = "metrics")]
 #[async_trait]
 impl MetricsRegistryClient for RegistryClient {
     async fn get_by_name(

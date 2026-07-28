@@ -98,10 +98,9 @@ impl UserService {
     /// Get a user by username.
     pub async fn get(&self, username: &str) -> Result<Option<UserInfo>> {
         let profile = self.store.get_profile(username).await?;
-        let pubkeys = self.store.list_pubkeys(username).await.unwrap_or_default();
-
         match profile {
             Some(profile) => {
+                let pubkeys = self.store.list_pubkeys(username).await?;
                 // For backward compat, use first pubkey as the primary
                 let primary_pubkey = pubkeys.first()
                     .map(|pk| STANDARD.encode(pk.pubkey.as_bytes()))

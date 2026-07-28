@@ -8,6 +8,46 @@ use async_trait::async_trait;
 use ed25519_dalek::VerifyingKey;
 use serde::{Deserialize, Serialize};
 
+/// Who controls the account's authentication key material.
+///
+/// Cold signup provisions [`Self::SelfCustody`]. [`Self::Managed`] is the
+/// persisted seam for a later external-IdP-gated account flow; no such flow is
+/// implemented by the OAuth server today.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AccountKeyCustody {
+    SelfCustody,
+    Managed,
+}
+
+impl AccountKeyCustody {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::SelfCustody => "self_custody",
+            Self::Managed => "managed",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self> {
+        match value {
+            "self_custody" => Ok(Self::SelfCustody),
+            "managed" => Ok(Self::Managed),
+            other => anyhow::bail!("unknown account key custody value '{other}'"),
+        }
+    }
+}
+
+/// One external identity allowed to authenticate as a hosted account.
+///
+/// Demo cold-signup records carry an empty collection. Keeping the normalized
+/// `(issuer, subject)` pair in the account model makes a later OIDC RP additive
+/// instead of requiring a credential-store migration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExternalIdentityBinding {
+    pub issuer: String,
+    pub subject: String,
+}
+
 /// User profile data (OIDC standard claims + SCIM-informed fields).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct UserProfile {
@@ -34,6 +74,13 @@ pub struct UserProfile {
     /// here so the atproto OAuth profile can emit the mapped DID as `sub` (#1113 r5).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub atproto_did: Option<String>,
+    /// Account key custody mode. Absent only on records created before the
+    /// hosted-account model gained an explicit custody discriminator.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_custody: Option<AccountKeyCustody>,
+    /// Zero or more external IdP bindings. Empty for vault self-custody signup.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub external_identities: Vec<ExternalIdentityBinding>,
 }
 
 /// Tri-state patch for profile fields: omitted, explicitly cleared, or replaced.
@@ -46,6 +93,8 @@ pub struct UserProfilePatch {
     pub active: Option<Option<bool>>,
     pub external_id: Option<Option<String>>,
     pub atproto_did: Option<Option<String>>,
+    pub key_custody: Option<Option<AccountKeyCustody>>,
+    pub external_identities: Option<Vec<ExternalIdentityBinding>>,
 }
 
 impl From<UserProfile> for UserProfilePatch {
@@ -58,8 +107,35 @@ impl From<UserProfile> for UserProfilePatch {
             active: profile.active.map(Some),
             external_id: profile.external_id.map(Some),
             atproto_did: profile.atproto_did.map(Some),
+            key_custody: profile.key_custody.map(Some),
+            external_identities: (!profile.external_identities.is_empty())
+                .then_some(profile.external_identities),
         }
     }
+}
+
+/// Result of atomically inserting a hosted account into the AS credential
+/// store together with its first authentication key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostedAccountProvisioning {
+    pub sub: String,
+    pub fingerprint: String,
+    /// True when this call found the same complete credential binding created
+    /// by an earlier attempt. It may still be staged inactive; callers must
+    /// resume downstream publication/activation instead of treating it as a
+    /// conflict.
+    pub resumed: bool,
+}
+
+/// Fail-closed conflict/backend distinction for hosted-account provisioning.
+#[derive(Debug, thiserror::Error)]
+pub enum HostedAccountProvisionError {
+    #[error("the requested account already exists")]
+    AccountAlreadyExists,
+    #[error("the supplied key is already bound to another account")]
+    KeyAlreadyBound,
+    #[error("credential-store provisioning failed")]
+    Backend(#[source] anyhow::Error),
 }
 
 /// The public-key algorithm of a stored [`PubkeyEntry`].
@@ -165,6 +241,18 @@ pub struct UserFilter {
     pub sort_order: Option<String>,
 }
 
+/// Durable result of atomically resolving or binding an external IdP identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExternalIdentityResolution {
+    /// The authoritative local username. This can differ from the candidate
+    /// when `(issuer, subject)` was already bound.
+    pub username: String,
+    /// Stable local OIDC subject.
+    pub sub: String,
+    /// True only when this transaction created the local user.
+    pub provisioned: bool,
+}
+
 /// Abstraction over user credential stores.
 ///
 /// Supports profile CRUD and multi-pubkey management (like GitHub SSH keys).
@@ -178,6 +266,60 @@ pub trait UserStore: Send + Sync {
     /// Register a new user. Returns the generated subject UUID.
     async fn register(&self, username: &str) -> Result<String>;
 
+    /// Atomically resolve an existing external identity or bind it to the
+    /// candidate username. If the candidate does not exist, the same
+    /// transaction creates its active local profile and stable subject.
+    ///
+    /// Existing `(issuer, subject)` bindings are authoritative and are never
+    /// rebound to the candidate. Empty identifiers, dangling references, and
+    /// non-exact uniqueness races must fail closed.
+    async fn resolve_or_bind_external_idp(
+        &self,
+        _issuer: &str,
+        _subject: &str,
+        _username: &str,
+    ) -> Result<ExternalIdentityResolution> {
+        anyhow::bail!("external IdP binding is unsupported by this credential store")
+    }
+
+    /// Atomically create a hosted AS account and its first authentication key.
+    ///
+    /// Implementations must not overwrite either an existing username or an
+    /// existing key reverse-index entry. The account profile, DID mapping,
+    /// custody discriminator, empty external-binding collection, public key,
+    /// and reverse index become visible together. Repeating the exact same
+    /// `(username, DID, key, custody)` returns `Ok` with `resumed = true`.
+    ///
+    /// Conflict errors are trustworthy recovery signals: implementations may
+    /// return them only when the conflicting profile, key, and reverse index
+    /// form a complete usable hosted-account binding. Partial/corrupt state is
+    /// a backend error and must fail closed.
+    async fn provision_hosted_account(
+        &self,
+        _username: &str,
+        _atproto_did: &str,
+        _pubkey: VerifyingKey,
+        _custody: AccountKeyCustody,
+    ) -> std::result::Result<HostedAccountProvisioning, HostedAccountProvisionError> {
+        Err(HostedAccountProvisionError::Backend(anyhow::anyhow!(
+            "hosted-account provisioning is unsupported by this credential store"
+        )))
+    }
+
+    /// Atomically mark an exactly matching staged hosted binding active after
+    /// its durable PDS genesis is known to exist.
+    async fn activate_hosted_account(
+        &self,
+        _username: &str,
+        _atproto_did: &str,
+        _fingerprint: &str,
+        _custody: AccountKeyCustody,
+    ) -> std::result::Result<(), HostedAccountProvisionError> {
+        Err(HostedAccountProvisionError::Backend(anyhow::anyhow!(
+            "hosted-account activation is unsupported by this credential store"
+        )))
+    }
+
     /// Update a user's profile fields with tri-state patch semantics.
     async fn set_profile(&self, username: &str, patch: UserProfilePatch) -> Result<()>;
 
@@ -185,7 +327,7 @@ pub trait UserStore: Send + Sync {
     async fn remove(&self, username: &str) -> Result<bool>;
 
     /// List all registered usernames.
-    async fn list_users(&self) -> Vec<String>;
+    async fn list_users(&self) -> Result<Vec<String>>;
 
     /// Search users with SCIM-aligned filtering, sorting, and pagination.
     async fn search(&self, filter: &UserFilter) -> Result<Vec<(String, UserProfile)>>;
@@ -237,6 +379,48 @@ pub trait UserStore: Send + Sync {
 
     /// Update last_used_at timestamp for a pubkey.
     async fn touch_pubkey(&self, username: &str, fingerprint: &str) -> Result<()>;
+
+    /// List the normalized external identities bound to one local account.
+    /// Cold signup always returns an empty list.
+    async fn list_external_identities(
+        &self,
+        username: &str,
+    ) -> Result<Vec<ExternalIdentityBinding>> {
+        self.get_profile(username)
+            .await?
+            .map(|profile| profile.external_identities)
+            .ok_or_else(|| anyhow::anyhow!("User '{username}' not found"))
+    }
+
+    /// Resolve a normalized external `(issuer, subject)` identity to its local
+    /// account. The cold-signup demo never populates these bindings; this
+    /// interface is reserved for the later OIDC RP.
+    async fn get_external_identity_user(
+        &self,
+        issuer: &str,
+        subject: &str,
+    ) -> Result<Option<String>> {
+        if issuer.is_empty() || subject.is_empty() {
+            anyhow::bail!("external identity issuer and subject must be non-empty");
+        }
+        let mut match_user = None;
+        for username in self.list_users().await? {
+            let Some(profile) = self.get_profile(&username).await? else {
+                continue;
+            };
+            if profile
+                .external_identities
+                .iter()
+                .any(|binding| binding.issuer == issuer && binding.subject == subject)
+            {
+                if match_user.is_some() {
+                    anyhow::bail!("external identity binding is ambiguous for issuer and subject");
+                }
+                match_user = Some(username);
+            }
+        }
+        Ok(match_user)
+    }
 }
 
 /// Compute the SSH fingerprint of a pubkey (matches `ssh-keygen -l -E sha256`).
@@ -328,7 +512,10 @@ impl ScimFilter {
         if let Some(rest) = expr.strip_prefix("userName eq ") {
             return ScimFilter::UserNameEq(unquote(rest).to_owned());
         }
-        if let Some(rest) = expr.strip_prefix("id eq ").or_else(|| expr.strip_prefix("sub eq ")) {
+        if let Some(rest) = expr
+            .strip_prefix("id eq ")
+            .or_else(|| expr.strip_prefix("sub eq "))
+        {
             return ScimFilter::IdEq(unquote(rest).to_owned());
         }
         if let Some(rest) = expr.strip_prefix("externalId eq ") {
@@ -455,14 +642,38 @@ mod tests {
 
     #[test]
     fn test_matches_filter_username_eq() {
-        assert!(matches_filter(r#"userName eq "alice""#, "alice", &None, &None, None));
-        assert!(!matches_filter(r#"userName eq "alice""#, "bob", &None, &None, None));
+        assert!(matches_filter(
+            r#"userName eq "alice""#,
+            "alice",
+            &None,
+            &None,
+            None
+        ));
+        assert!(!matches_filter(
+            r#"userName eq "alice""#,
+            "bob",
+            &None,
+            &None,
+            None
+        ));
     }
 
     #[test]
     fn test_matches_filter_active_eq() {
-        assert!(matches_filter("active eq true", "u", &None, &None, Some(true)));
-        assert!(!matches_filter("active eq true", "u", &None, &None, Some(false)));
+        assert!(matches_filter(
+            "active eq true",
+            "u",
+            &None,
+            &None,
+            Some(true)
+        ));
+        assert!(!matches_filter(
+            "active eq true",
+            "u",
+            &None,
+            &None,
+            Some(false)
+        ));
     }
 
     #[test]
@@ -478,8 +689,14 @@ mod tests {
         assert_eq!(KeyAlgorithm::Ed25519.as_str(), "ed25519");
         assert_eq!(KeyAlgorithm::default(), KeyAlgorithm::Ed25519);
         // Accepts case/whitespace variants.
-        assert_eq!(KeyAlgorithm::parse("ed25519").unwrap(), KeyAlgorithm::Ed25519);
-        assert_eq!(KeyAlgorithm::parse("  Ed25519 ").unwrap(), KeyAlgorithm::Ed25519);
+        assert_eq!(
+            KeyAlgorithm::parse("ed25519").unwrap(),
+            KeyAlgorithm::Ed25519
+        );
+        assert_eq!(
+            KeyAlgorithm::parse("  Ed25519 ").unwrap(),
+            KeyAlgorithm::Ed25519
+        );
         // Unknown tags error (never silently fall back to Ed25519).
         assert!(KeyAlgorithm::parse("ml-dsa-65").is_err());
         assert!(KeyAlgorithm::parse("").is_err());
