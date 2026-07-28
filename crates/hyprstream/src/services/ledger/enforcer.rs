@@ -525,8 +525,12 @@ mod tests {
         ));
 
         // Backend + handle.
-        let mut backend = MemLedger::new(cell.clone())
-            .with_mint_verifier(Box::new(crate::services::ledger::enforcer::TestMintVerifier));
+        let mut backend = MemLedger::new(
+            cell.clone(),
+            Some(crate::services::ledger::enforcer::test_mint_authority(
+                &ed_sk,
+            )),
+        );
         let issuer_liab =
             AccountId::derive(&cell, &unit().issuer, &unit(), &Purpose::IssuerLiability).unwrap();
         let holder_acct = AccountId::derive(&cell, &holder, &unit(), &Purpose::Available).unwrap();
@@ -558,6 +562,7 @@ mod tests {
         // Issue `grant_cap` from the issuer liability to the holder.
         test_mint(
             &mut backend,
+            &ed_sk,
             hyprstream_ledger::IssueTransfer {
                 id: TransferId(1),
                 issuer_liability: issuer_liab,
@@ -1015,33 +1020,40 @@ mod tests {
     }
 }
 
-/// Install a permissive issuance authority and mint through the sealed path.
+/// Test issuance authority + a helper that mints through the sealed path.
 ///
-/// Issuance is gated on a verified, transfer-bound capability, so a fixture has
-/// to go through the same seam production does — there is no back door that
-/// skips it. The accept-all verifier stands in for the hybrid-PQC one.
+/// There is no permissive back door any more: the ledger verifies a real
+/// signature over the transfer against fixed key material, so a fixture has to
+/// hold the signing key and produce a genuine authorization — exactly what the
+/// service does in production.
 #[cfg(test)]
-#[derive(Debug)]
-pub(crate) struct TestMintVerifier;
-
-#[cfg(test)]
-impl hyprstream_ledger::MintVerifier for TestMintVerifier {
-    fn verify(&self, _signing_input: &[u8], _sig: &[u8]) -> Result<(), hyprstream_ledger::LedgerError> {
-        Ok(())
-    }
+pub(crate) fn test_mint_authority(
+    ed_sk: &ed25519_dalek::SigningKey,
+) -> hyprstream_ledger::MintAuthority {
+    hyprstream_ledger::MintAuthority::classical(ed_sk.verifying_key())
 }
 
 #[cfg(test)]
 pub(crate) fn test_mint(
     backend: &mut hyprstream_ledger::MemLedger,
+    ed_sk: &ed25519_dalek::SigningKey,
     t: hyprstream_ledger::IssueTransfer,
 ) -> hyprstream_ledger::Outcome {
     use hyprstream_ledger::LedgerBackend;
-    match backend.authorize_mint(&t, b"test") {
+    let fail = |e| hyprstream_ledger::Outcome {
+        result: Err(e),
+        seq: 0,
+    };
+    let input = match hyprstream_ledger::mint_signing_input(&t) {
+        Ok(i) => i,
+        Err(e) => return fail(e),
+    };
+    let sig = match hyprstream_crypto::cose_sign::sign_composite(ed_sk, None, &input, &[]) {
+        Ok(s) => s,
+        Err(e) => return fail(hyprstream_ledger::LedgerError::Internal(e.to_string())),
+    };
+    match backend.authorize_mint(&t, &sig) {
         Ok(cap) => backend.credit(cap),
-        Err(e) => hyprstream_ledger::Outcome {
-            result: Err(e),
-            seq: backend.head().seq,
-        },
+        Err(e) => fail(e),
     }
 }

@@ -158,10 +158,10 @@ pub struct PostgresLedger {
     head: ChainHead,
     clock: u64,
     last_checkpoint: Option<SignedCheckpoint>,
-    /// Verifies issuance authorizations. Defaults to
-    /// [`DenyAllMintVerifier`](crate::mint::DenyAllMintVerifier) so a ledger
-    /// nobody explicitly granted an issuance authority cannot mint.
-    mint_verifier: Box<dyn crate::mint::MintVerifier>,
+    /// The issuance authority, fixed at construction. `None` means this ledger
+    /// cannot mint at all — the fail-closed default for a ledger nobody
+    /// deliberately granted an issuance authority.
+    mint_authority: Option<crate::mint::MintAuthority>,
 }
 
 /// The durable single-writer lease (`ledger_meta.writer_lease`).
@@ -269,7 +269,16 @@ impl std::fmt::Debug for PostgresLedger {
 
 impl PostgresLedger {
     /// Connect, run migrations, rehydrate the mirror, verify the chain.
-    pub fn connect(config: PostgresConfig, ledger_id: Did) -> Result<Self, LedgerError> {
+    /// Connect, migrate, claim the writer lease, and rebuild from the journal.
+    ///
+    /// `mint_authority` is a **construction parameter, not a setter**: once a
+    /// `PostgresLedger` exists, what it will accept as a mint authorization
+    /// cannot be changed. `None` yields a ledger that cannot mint at all.
+    pub fn connect(
+        config: PostgresConfig,
+        ledger_id: Did,
+        mint_authority: Option<crate::mint::MintAuthority>,
+    ) -> Result<Self, LedgerError> {
         let (tx, rx) = mpsc::channel::<BgCmd>();
         let thread = std::thread::Builder::new()
             .name("postgres-ledger-bg".to_owned())
@@ -290,7 +299,7 @@ impl PostgresLedger {
             head: ChainHead::default(),
             clock: 0,
             last_checkpoint: None,
-            mint_verifier: Box::new(crate::mint::DenyAllMintVerifier),
+            mint_authority,
         };
         ledger.run_migrations()?;
         // Claim the writer lease BEFORE reading any authoritative state, so
@@ -299,17 +308,6 @@ impl PostgresLedger {
         ledger.acquire_writer_lease()?;
         ledger.rebuild_from_journal()?;
         Ok(ledger)
-    }
-
-    /// Install the issuance authority for this ledger.
-    ///
-    /// Without this, [`LedgerBackend::credit`] can never succeed: the default
-    /// verifier refuses every authorization, so an un-configured ledger is
-    /// mint-disabled rather than mint-open.
-    #[must_use]
-    pub fn with_mint_verifier(mut self, verifier: Box<dyn crate::mint::MintVerifier>) -> Self {
-        self.mint_verifier = verifier;
-        self
     }
 
     /// Claim the single-writer lease for this cell, or refuse to start.
@@ -953,6 +951,153 @@ impl PostgresLedger {
         Ok(())
     }
 
+    // ─── The fenced write path ─────────────────────────────────────────────
+
+    /// The **only** way this backend persists anything.
+    ///
+    /// Every durable mutation — journal commits, checkpoints, outbox
+    /// acknowledgements, the logical clock — runs through here, inside one
+    /// transaction that has already established the right to write:
+    ///
+    /// 1. **Poison check** (before any I/O): an instance that has already
+    ///    detected an integrity violation writes nothing, ever again.
+    /// 2. **Ordering**: the per-cell advisory lock.
+    /// 3. **Fencing**: the durable lease's epoch *and* owner must still match
+    ///    the ones this instance acquired. A writer that has been fenced out
+    ///    cannot persist anything, including proof-plane rows.
+    /// 4. **Staleness** (when `expect_head` is given): the authoritative head
+    ///    must still equal the head the caller derived its writes from.
+    ///
+    /// The body only runs once all four hold, and the heartbeat is renewed in
+    /// the same transaction that does the work — so authorization and write are
+    /// atomic, with no window between "we checked" and "we wrote".
+    ///
+    /// Having a single primitive is the point: the previous revision fenced
+    /// `commit` alone, which left `checkpoint`, `outbox_ack` and the clock
+    /// write as unfenced side doors a zombie writer could still reach.
+    fn fenced_write<F>(
+        &mut self,
+        expect_head: Option<ChainHead>,
+        body: F,
+    ) -> Result<Vec<u8>, LedgerError>
+    where
+        F: for<'a, 'b> FnOnce(
+                &'a tokio_postgres::Transaction<'b>,
+                ChainHead,
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = Result<Vec<u8>, LedgerError>> + Send + 'a>,
+            > + Send
+            + 'static,
+    {
+        self.poison_check()?;
+
+        let lock_key = advisory_key(&self.ledger_id);
+        let lease_epoch = self.lease_epoch;
+        let lease_owner = self.lease_owner;
+        let heartbeat = now_unix();
+
+        let result = self.call_db(move |pool| {
+            let rt = rt_new()?;
+            rt.block_on(async move {
+                let mut client = pool.get().await.map_err(|e| ie(format!("pool: {e}")))?;
+                let tx = client
+                    .transaction()
+                    .await
+                    .map_err(|e| ie(format!("begin: {e}")))?;
+
+                // Ordering boundary, per cell.
+                tx.execute("SELECT pg_advisory_xact_lock($1)", &[&lock_key])
+                    .await
+                    .map_err(|e| ie(format!("advisory lock: {e}")))?;
+
+                // Fencing. Read inside the boundary so the answer cannot be
+                // invalidated between the check and the write.
+                let lease_row = tx
+                    .query_opt(
+                        "SELECT value FROM ledger_meta WHERE key = $1 FOR UPDATE",
+                        &[&META_WRITER_LEASE],
+                    )
+                    .await
+                    .map_err(|e| ie(format!("lease check: {e}")))?;
+                let current = match lease_row {
+                    Some(r) => {
+                        let v: Vec<u8> = r.get(0);
+                        WriterLease::decode(&v)?
+                    }
+                    None => {
+                        return Err(LedgerError::WriterLeaseLost {
+                            expected: lease_epoch,
+                            found: 0,
+                        })
+                    }
+                };
+                if current.epoch != lease_epoch || current.owner != lease_owner {
+                    return Err(LedgerError::WriterLeaseLost {
+                        expected: lease_epoch,
+                        found: current.epoch,
+                    });
+                }
+
+                // Authoritative head, locked for the duration.
+                let head_row = tx
+                    .query_opt(
+                        "SELECT value FROM ledger_meta WHERE key = 'head' FOR UPDATE",
+                        &[],
+                    )
+                    .await
+                    .map_err(|e| ie(format!("head lock: {e}")))?;
+                let db_head = match head_row {
+                    Some(r) => {
+                        let val: Vec<u8> = r.get(0);
+                        decode_head(&val)?
+                    }
+                    None => ChainHead::default(),
+                };
+
+                // Staleness. Absolute counters are only meaningful relative to
+                // the state they were computed from, so a moved head means the
+                // caller's writes describe a state that no longer exists.
+                if let Some(expected) = expect_head {
+                    if db_head != expected {
+                        return Err(LedgerError::MirrorStale {
+                            mirror_seq: expected.seq,
+                            db_seq: db_head.seq,
+                        });
+                    }
+                }
+
+                let out = body(&tx, db_head).await?;
+
+                // Renew the heartbeat atomically with the work it authorized,
+                // so an active writer never looks abandoned and the renewal can
+                // never outlive a rolled-back transaction.
+                let renewed = WriterLease {
+                    epoch: lease_epoch,
+                    owner: lease_owner,
+                    heartbeat,
+                };
+                tx.execute(
+                    "UPDATE ledger_meta SET value = $2 WHERE key = $1",
+                    &[&META_WRITER_LEASE, &renewed.encode().as_slice()],
+                )
+                .await
+                .map_err(|e| ie(format!("lease renew: {e}")))?;
+
+                tx.commit().await.map_err(|e| ie(format!("commit: {e}")))?;
+                Ok(out)
+            })
+        });
+
+        // A fence violation is terminal: this instance's view is provably
+        // wrong, so it stops writing rather than continuing and hoping.
+        if let Err(e) = &result {
+            if is_fence_violation(e) {
+                self.poison(e.to_string());
+            }
+        }
+        result
+    }
+
     // ─── The commit loop ───────────────────────────────────────────────────
 
     fn commit(&mut self, op: Op) -> Outcome {
@@ -985,182 +1130,106 @@ impl PostgresLedger {
         // "these absolute counters describe the current state" checked rather
         // than assumed.
         let mirror_head = self.head;
-        let lease_epoch = self.lease_epoch;
-        let lease_owner = self.lease_owner;
-        let lock_key = advisory_key(&self.ledger_id);
-        let heartbeat = now_unix();
 
-        // 2. Write to DB transactionally. The DB transaction (a) acquires the
-        //    writer advisory lock, (b) locks + reads the authoritative head
-        //    row, (c) checks idempotency, (d) on commit builds the
-        //    JournalEntry from the DB head, inserts everything, and advances
-        //    the head. The CBOR wire format returned to the caller is a
-        //    4-tuple: `(result_cbor, seq, is_committed, new_head_hash)`.
-        //    `is_committed=false` covers both replay and ambiguous-commit
+        // 2. Write through the fenced path. `fenced_write` has already taken
+        //    the ordering lock, proven this instance still holds the writer
+        //    lease, and required the authoritative head to equal
+        //    `mirror_head` — so by the time the body runs, the staged absolute
+        //    counters are known to describe the current state. The body only
+        //    has to do the accounting work.
+        //
+        //    The CBOR wire reply is a 4-tuple:
+        //    `(result_cbor, seq, is_committed, new_head_hash)`.
+        //    `is_committed = false` covers both replay and ambiguous-commit
         //    reconciliation — in neither case does the caller apply deltas or
         //    advance its mirror head.
-        let db_result: Result<Vec<u8>, LedgerError> = self.call_db(move |pool| {
-            let rt = rt_new()?;
-            rt.block_on(async {
-                let mut client = pool.get().await.map_err(|e| ie(format!("pool: {e}")))?;
-                let tx = client
-                    .transaction()
-                    .await
-                    .map_err(|e| ie(format!("begin: {e}")))?;
+        let db_result: Result<Vec<u8>, LedgerError> =
+            self.fenced_write(Some(mirror_head), move |tx, db_head| {
+                Box::pin(async move {
+                    let (db_seq, db_prev_hash) = (db_head.seq, db_head.head_hash);
 
-                // Ordering boundary. Keyed per cell so distinct ledgers never
-                // serialize against each other. Auto-releases on commit or
-                // rollback.
-                tx.execute("SELECT pg_advisory_xact_lock($1)", &[&lock_key])
-                    .await
-                    .map_err(|e| ie(format!("advisory lock: {e}")))?;
-
-                // ── Fencing: are we still the writer? ───────────────────────
-                //
-                // Read inside the ordering boundary, so the answer cannot be
-                // invalidated between the check and the write. If another
-                // instance took the lease over, its epoch is strictly greater
-                // and this commit is refused. This is what makes correctness
-                // independent of connection liveness and wall-clock skew.
-                let lease_row = tx
-                    .query_opt(
-                        "SELECT value FROM ledger_meta WHERE key = $1 FOR UPDATE",
-                        &[&META_WRITER_LEASE],
-                    )
-                    .await
-                    .map_err(|e| ie(format!("lease check: {e}")))?;
-                let current = match lease_row {
-                    Some(r) => {
-                        let v: Vec<u8> = r.get(0);
-                        WriterLease::decode(&v)?
-                    }
-                    None => {
-                        // The lease we installed at startup is gone; treat that
-                        // as having been fenced out rather than re-claiming it.
-                        return Err(LedgerError::WriterLeaseLost {
-                            expected: lease_epoch,
-                            found: 0,
-                        });
-                    }
-                };
-                if current.epoch != lease_epoch || current.owner != lease_owner {
-                    return Err(LedgerError::WriterLeaseLost {
-                        expected: lease_epoch,
-                        found: current.epoch,
-                    });
-                }
-
-                // Lock + read the authoritative head row.
-                let head_row = tx
-                    .query_opt(
-                        "SELECT value FROM ledger_meta WHERE key = 'head' FOR UPDATE",
-                        &[],
-                    )
-                    .await
-                    .map_err(|e| ie(format!("head lock: {e}")))?;
-                let db_head = match head_row {
-                    Some(r) => {
-                        let val: Vec<u8> = r.get(0);
-                        decode_head(&val)?
-                    }
-                    None => ChainHead::default(),
-                };
-
-                // ── Proof: the mirror described this exact head ─────────────
-                //
-                // Staging produced absolute counters from `mirror_head`. If the
-                // authoritative head has moved, those counters describe a state
-                // that no longer exists and writing them would silently discard
-                // whatever advanced the head. Refuse instead.
-                if db_head != mirror_head {
-                    return Err(LedgerError::MirrorStale {
-                        mirror_seq: mirror_head.seq,
-                        db_seq: db_head.seq,
-                    });
-                }
-                let (db_seq, db_prev_hash) = (db_head.seq, db_head.head_hash);
-
-                // R2-F1: DB-level idempotency check inside the locked
-                // transaction. If the transfer_id already has an outcome, this
-                // is a replay — return the stored result verbatim and do NOT
-                // insert anything. The caller learns `is_committed=false` and
-                // skips both delta application and head advancement.
-                if let Some(id) = idempotency_id {
-                    let id_bytes = u128_to_bytes(id.0);
-                    let row = tx
-                        .query_opt(
-                            "SELECT result_cbor, seq FROM ledger_outcomes \
+                    // R2-F1: DB-level idempotency check inside the locked
+                    // transaction. If the transfer_id already has an outcome, this
+                    // is a replay — return the stored result verbatim and do NOT
+                    // insert anything. The caller learns `is_committed=false` and
+                    // skips both delta application and head advancement.
+                    if let Some(id) = idempotency_id {
+                        let id_bytes = u128_to_bytes(id.0);
+                        let row = tx
+                            .query_opt(
+                                "SELECT result_cbor, seq FROM ledger_outcomes \
                              WHERE transfer_id = $1",
-                            &[&id_bytes.as_slice()],
-                        )
-                        .await
-                        .map_err(|e| ie(format!("idem select: {e}")))?;
-                    if let Some(row) = row {
-                        let result_cbor: Vec<u8> = row.get(0);
-                        let seq_i: i64 = row.get(1);
-                        // Replay — rollback the empty transaction and surface
-                        // the stored outcome with is_committed=false. The
-                        // new_head_hash slot is unused on replay, so zero it.
-                        let _ = tx.rollback().await;
-                        let mut buf = Vec::new();
-                        cbor(&(result_cbor, seq_i as u64, false, [0u8; 32]), &mut buf)?;
-                        return Ok(buf);
+                                &[&id_bytes.as_slice()],
+                            )
+                            .await
+                            .map_err(|e| ie(format!("idem select: {e}")))?;
+                        if let Some(row) = row {
+                            let result_cbor: Vec<u8> = row.get(0);
+                            let seq_i: i64 = row.get(1);
+                            // Replay: surface the stored outcome with
+                            // is_committed=false and write nothing. The transaction
+                            // still commits (the heartbeat renewal is the only
+                            // change in it), so the lease stays live on a replay.
+                            // The new_head_hash slot is unused here, so zero it.
+                            let mut buf = Vec::new();
+                            cbor(&(result_cbor, seq_i as u64, false, [0u8; 32]), &mut buf)?;
+                            return Ok(buf);
+                        }
                     }
-                }
 
-                // Build the JournalEntry from the DB head — seq/prev_hash
-                // chain off the authoritative DB state, not the mirror.
-                let seq = db_seq + 1;
-                let prev_hash = db_prev_hash;
-                let entry = JournalEntry {
-                    seq,
-                    prev_hash,
-                    ts: clock,
-                    op: op.clone(),
-                    result: staged_result.clone(),
-                };
-                let new_head_hash = entry.hash().map_err(|e| ie(format!("entry hash: {e}")))?;
+                    // Build the JournalEntry from the DB head — seq/prev_hash
+                    // chain off the authoritative DB state, not the mirror.
+                    let seq = db_seq + 1;
+                    let prev_hash = db_prev_hash;
+                    let entry = JournalEntry {
+                        seq,
+                        prev_hash,
+                        ts: clock,
+                        op: op.clone(),
+                        result: staged_result.clone(),
+                    };
+                    let new_head_hash = entry.hash().map_err(|e| ie(format!("entry hash: {e}")))?;
 
-                // Serialize op + persisted result for persistence.
-                // F2: PersistedResult = Result<TransferResult, LedgerError>,
-                // encoded for both journal and outcomes tables.
-                let mut op_cbor_buf = Vec::new();
-                cbor(&op, &mut op_cbor_buf)?;
-                let persisted: PersistedResult = staged_result.clone();
-                let mut result_cbor_buf = Vec::new();
-                cbor(&persisted, &mut result_cbor_buf)?;
+                    // Serialize op + persisted result for persistence.
+                    // F2: PersistedResult = Result<TransferResult, LedgerError>,
+                    // encoded for both journal and outcomes tables.
+                    let mut op_cbor_buf = Vec::new();
+                    cbor(&op, &mut op_cbor_buf)?;
+                    let persisted: PersistedResult = staged_result.clone();
+                    let mut result_cbor_buf = Vec::new();
+                    cbor(&persisted, &mut result_cbor_buf)?;
 
-                // Journal entry (no result_ok column — schema uses
-                // result_cbor only).
-                tx.execute(
-                    "INSERT INTO ledger_journal \
+                    // Journal entry (no result_ok column — schema uses
+                    // result_cbor only).
+                    tx.execute(
+                        "INSERT INTO ledger_journal \
                      (seq, prev_hash, ts, op_cbor, result_cbor, head_hash) \
                      VALUES ($1,$2,$3,$4,$5,$6)",
-                    &[
-                        &(seq as i64),
-                        &prev_hash.as_slice(),
-                        &(clock as i64),
-                        &op_cbor_buf.as_slice(),
-                        &result_cbor_buf.as_slice(),
-                        &new_head_hash.as_slice(),
-                    ],
-                )
-                .await
-                .map_err(|e| ie(format!("journal: {e}")))?;
+                        &[
+                            &(seq as i64),
+                            &prev_hash.as_slice(),
+                            &(clock as i64),
+                            &op_cbor_buf.as_slice(),
+                            &result_cbor_buf.as_slice(),
+                            &new_head_hash.as_slice(),
+                        ],
+                    )
+                    .await
+                    .map_err(|e| ie(format!("journal: {e}")))?;
 
-                // Deltas — upserts with BYTEA(16) IDs (F1).
-                for delta in &deltas {
-                    match delta {
-                        engine::Delta::Account(a) => {
-                            let mut purpose_cbor = Vec::new();
-                            cbor(&a.purpose, &mut purpose_cbor)?;
-                            let id_bytes = u128_to_bytes(a.id.0);
-                            let dp = u128_to_bytes(a.debits_pending);
-                            let dpo = u128_to_bytes(a.debits_posted);
-                            let cp = u128_to_bytes(a.credits_pending);
-                            let cpo = u128_to_bytes(a.credits_posted);
-                            tx.execute(
-                                "INSERT INTO ledger_accounts \
+                    // Deltas — upserts with BYTEA(16) IDs (F1).
+                    for delta in &deltas {
+                        match delta {
+                            engine::Delta::Account(a) => {
+                                let mut purpose_cbor = Vec::new();
+                                cbor(&a.purpose, &mut purpose_cbor)?;
+                                let id_bytes = u128_to_bytes(a.id.0);
+                                let dp = u128_to_bytes(a.debits_pending);
+                                let dpo = u128_to_bytes(a.debits_posted);
+                                let cp = u128_to_bytes(a.credits_pending);
+                                let cpo = u128_to_bytes(a.credits_posted);
+                                tx.execute(
+                                    "INSERT INTO ledger_accounts \
                                  (id, unit_issuer, unit_resource, purpose_cbor, \
                                   debits_pending, debits_posted, credits_pending, \
                                   credits_posted, flags) \
@@ -1174,116 +1243,102 @@ impl PostgresLedger {
                                   credits_pending=EXCLUDED.credits_pending, \
                                   credits_posted=EXCLUDED.credits_posted, \
                                   flags=EXCLUDED.flags",
-                                &[
-                                    &id_bytes.as_slice(),
-                                    &a.unit.issuer.as_str(),
-                                    &a.unit.resource_class.as_str(),
-                                    &purpose_cbor.as_slice(),
-                                    &dp.as_slice(),
-                                    &dpo.as_slice(),
-                                    &cp.as_slice(),
-                                    &cpo.as_slice(),
-                                    &(a.flags.bits() as i32),
-                                ],
-                            )
-                            .await
-                            .map_err(|e| ie(format!("account: {e}")))?;
-                        }
-                        engine::Delta::Pending(r) => {
-                            let mut transfer_cbor = Vec::new();
-                            cbor(&r.transfer, &mut transfer_cbor)?;
-                            let tid_bytes = u128_to_bytes(r.transfer.id.0);
-                            tx.execute(
-                                "INSERT INTO ledger_pending \
+                                    &[
+                                        &id_bytes.as_slice(),
+                                        &a.unit.issuer.as_str(),
+                                        &a.unit.resource_class.as_str(),
+                                        &purpose_cbor.as_slice(),
+                                        &dp.as_slice(),
+                                        &dpo.as_slice(),
+                                        &cp.as_slice(),
+                                        &cpo.as_slice(),
+                                        &(a.flags.bits() as i32),
+                                    ],
+                                )
+                                .await
+                                .map_err(|e| ie(format!("account: {e}")))?;
+                            }
+                            engine::Delta::Pending(r) => {
+                                let mut transfer_cbor = Vec::new();
+                                cbor(&r.transfer, &mut transfer_cbor)?;
+                                let tid_bytes = u128_to_bytes(r.transfer.id.0);
+                                tx.execute(
+                                    "INSERT INTO ledger_pending \
                                  (transfer_id, transfer_cbor, deadline, state) \
                                  VALUES ($1,$2,$3,$4) \
                                  ON CONFLICT (transfer_id) DO UPDATE SET \
                                   transfer_cbor=EXCLUDED.transfer_cbor, \
                                   deadline=EXCLUDED.deadline, \
                                   state=EXCLUDED.state",
-                                &[
-                                    &tid_bytes.as_slice(),
-                                    &transfer_cbor.as_slice(),
-                                    &(r.deadline as i64),
-                                    &(r.state as i16),
-                                ],
-                            )
-                            .await
-                            .map_err(|e| ie(format!("pending: {e}")))?;
+                                    &[
+                                        &tid_bytes.as_slice(),
+                                        &transfer_cbor.as_slice(),
+                                        &(r.deadline as i64),
+                                        &(r.state as i16),
+                                    ],
+                                )
+                                .await
+                                .map_err(|e| ie(format!("pending: {e}")))?;
+                            }
                         }
                     }
-                }
 
-                // Outcome (if idempotent).
-                if let Some(id) = idempotency_id {
-                    let id_bytes = u128_to_bytes(id.0);
-                    tx.execute(
-                        "INSERT INTO ledger_outcomes \
+                    // Outcome (if idempotent).
+                    if let Some(id) = idempotency_id {
+                        let id_bytes = u128_to_bytes(id.0);
+                        tx.execute(
+                            "INSERT INTO ledger_outcomes \
                          (transfer_id, result_cbor, seq) VALUES ($1,$2,$3)",
-                        &[
-                            &id_bytes.as_slice(),
-                            &result_cbor_buf.as_slice(),
-                            &(seq as i64),
-                        ],
-                    )
-                    .await
-                    .map_err(|e| ie(format!("outcome: {e}")))?;
-                }
+                            &[
+                                &id_bytes.as_slice(),
+                                &result_cbor_buf.as_slice(),
+                                &(seq as i64),
+                            ],
+                        )
+                        .await
+                        .map_err(|e| ie(format!("outcome: {e}")))?;
+                    }
 
-                // Outbox (settled value only).
-                if matches!(
-                    staged_result,
-                    Ok(TransferResult::Issued) | Ok(TransferResult::Applied { .. })
-                ) {
-                    // transfer_id is nullable for checkpoint rows; for
-                    // receipts it is always the op's idempotency id. A
-                    // settled transfer is by definition idempotent.
-                    let tid_opt: Option<Vec<u8>> = idempotency_id.map(|id| u128_to_bytes(id.0));
-                    tx.execute(
-                        "INSERT INTO ledger_outbox (kind, transfer_id, journal_seq) \
+                    // Outbox (settled value only).
+                    if matches!(
+                        staged_result,
+                        Ok(TransferResult::Issued) | Ok(TransferResult::Applied { .. })
+                    ) {
+                        // transfer_id is nullable for checkpoint rows; for
+                        // receipts it is always the op's idempotency id. A
+                        // settled transfer is by definition idempotent.
+                        let tid_opt: Option<Vec<u8>> = idempotency_id.map(|id| u128_to_bytes(id.0));
+                        tx.execute(
+                            "INSERT INTO ledger_outbox (kind, transfer_id, journal_seq) \
                          VALUES (0, $1, $2)",
-                        &[&tid_opt, &(seq as i64)],
+                            &[&tid_opt, &(seq as i64)],
+                        )
+                        .await
+                        .map_err(|e| ie(format!("outbox: {e}")))?;
+                    }
+
+                    // Head pointer.
+                    let mut head_val = Vec::with_capacity(40);
+                    head_val.extend_from_slice(&seq.to_be_bytes());
+                    head_val.extend_from_slice(&new_head_hash);
+                    tx.execute(
+                        "INSERT INTO ledger_meta (key, value) VALUES ('head', $1) \
+                     ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value",
+                        &[&head_val.as_slice()],
                     )
                     .await
-                    .map_err(|e| ie(format!("outbox: {e}")))?;
-                }
+                    .map_err(|e| ie(format!("head: {e}")))?;
 
-                // Head pointer.
-                let mut head_val = Vec::with_capacity(40);
-                head_val.extend_from_slice(&seq.to_be_bytes());
-                head_val.extend_from_slice(&new_head_hash);
-                tx.execute(
-                    "INSERT INTO ledger_meta (key, value) VALUES ('head', $1) \
-                     ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value",
-                    &[&head_val.as_slice()],
-                )
-                .await
-                .map_err(|e| ie(format!("head: {e}")))?;
+                    // The heartbeat renewal and the transaction commit belong to
+                    // `fenced_write`, so they happen atomically with this work.
 
-                // Refresh the lease heartbeat in the same transaction. An
-                // actively committing writer therefore never looks abandoned,
-                // and the refresh is atomic with the work it authorizes.
-                let renewed = WriterLease {
-                    epoch: lease_epoch,
-                    owner: lease_owner,
-                    heartbeat,
-                };
-                tx.execute(
-                    "UPDATE ledger_meta SET value = $2 WHERE key = $1",
-                    &[&META_WRITER_LEASE, &renewed.encode().as_slice()],
-                )
-                .await
-                .map_err(|e| ie(format!("lease renew: {e}")))?;
-
-                tx.commit().await.map_err(|e| ie(format!("commit: {e}")))?;
-
-                // R2-F1: tagged wire reply — is_committed=true with the fresh
-                // head hash so the caller can advance its mirror.
-                let mut buf = Vec::new();
-                cbor(&(result_cbor_buf, seq, true, new_head_hash), &mut buf)?;
-                Ok(buf)
-            })
-        });
+                    // R2-F1: tagged wire reply — is_committed=true with the fresh
+                    // head hash so the caller can advance its mirror.
+                    let mut buf = Vec::new();
+                    cbor(&(result_cbor_buf, seq, true, new_head_hash), &mut buf)?;
+                    Ok(buf)
+                })
+            });
 
         // 3. Decode the 4-tuple wire reply. On error, attempt reconciliation:
         //    the tx may have committed but the reply was lost (ambiguous
@@ -1415,85 +1470,6 @@ impl PostgresLedger {
             self.outcomes.insert(id, outcome.clone());
         }
         outcome
-    }
-
-    /// Refresh the lease heartbeat, verifying we still hold it.
-    ///
-    /// Conditional on epoch **and** owner, so a lease that was taken over is
-    /// never resurrected by a stale writer's heartbeat: the `UPDATE` simply
-    /// matches no row, and this instance poisons itself instead.
-    fn renew_lease(&mut self) -> Result<(), LedgerError> {
-        let epoch = self.lease_epoch;
-        let owner = self.lease_owner;
-        let key = advisory_key(&self.ledger_id);
-        let now = now_unix();
-        let renewed = WriterLease {
-            epoch,
-            owner,
-            heartbeat: now,
-        }
-        .encode();
-
-        let bytes = self.call_db(move |pool| {
-            let rt = rt_new()?;
-            rt.block_on(async {
-                let mut client = pool.get().await.map_err(|e| ie(format!("pool: {e}")))?;
-                let tx = client
-                    .transaction()
-                    .await
-                    .map_err(|e| ie(format!("renew begin: {e}")))?;
-                tx.execute("SELECT pg_advisory_xact_lock($1)", &[&key])
-                    .await
-                    .map_err(|e| ie(format!("renew lock: {e}")))?;
-                let row = tx
-                    .query_opt(
-                        "SELECT value FROM ledger_meta WHERE key = $1 FOR UPDATE",
-                        &[&META_WRITER_LEASE],
-                    )
-                    .await
-                    .map_err(|e| ie(format!("renew select: {e}")))?;
-                let found = match row {
-                    Some(r) => {
-                        let v: Vec<u8> = r.get(0);
-                        WriterLease::decode(&v)?
-                    }
-                    None => {
-                        let mut buf = Vec::new();
-                        cbor(&(false, 0u64), &mut buf)?;
-                        return Ok(buf);
-                    }
-                };
-                if found.epoch != epoch || found.owner != owner {
-                    let mut buf = Vec::new();
-                    cbor(&(false, found.epoch), &mut buf)?;
-                    return Ok(buf);
-                }
-                tx.execute(
-                    "UPDATE ledger_meta SET value = $2 WHERE key = $1",
-                    &[&META_WRITER_LEASE, &renewed.as_slice()],
-                )
-                .await
-                .map_err(|e| ie(format!("renew update: {e}")))?;
-                tx.commit()
-                    .await
-                    .map_err(|e| ie(format!("renew commit: {e}")))?;
-                let mut buf = Vec::new();
-                cbor(&(true, epoch), &mut buf)?;
-                Ok(buf)
-            })
-        })?;
-
-        let (held, found): (bool, u64) = ciborium::from_reader(bytes.as_slice())
-            .map_err(|e| LedgerError::Internal(format!("renew decode: {e}")))?;
-        if !held {
-            let err = LedgerError::WriterLeaseLost {
-                expected: epoch,
-                found,
-            };
-            self.poison(err.to_string());
-            return Err(err);
-        }
-        Ok(())
     }
 
     /// Adopt committed journal entries this instance has not applied yet.
@@ -1639,7 +1615,7 @@ impl LedgerBackend for PostgresLedger {
         t: &'a IssueTransfer,
         sig: &[u8],
     ) -> Result<crate::mint::MintCapability<'a>, LedgerError> {
-        crate::mint::authorize(self.mint_verifier.as_ref(), t, sig)
+        crate::mint::authorize(self.mint_authority.as_ref(), t, sig)
     }
 
     fn debit(&mut self, t: Transfer) -> Outcome {
@@ -1706,18 +1682,17 @@ impl LedgerBackend for PostgresLedger {
         };
         let digest = cp.digest()?;
 
-        // F5: checkpoint insert + outbox insert in ONE DB transaction (was
-        // two separate autocommit statements).
+        // F5: checkpoint insert + outbox insert in ONE transaction. Fenced like
+        // every other durable write: a checkpoint is a signed public claim
+        // about ledger state, so a fenced-out writer must not be able to
+        // publish one. `expect_head` pins the head the checkpoint attests to,
+        // so a checkpoint can never describe a state other than the one that
+        // was current when it was signed.
         let cp_clone = cp.clone();
         let digest_clone = digest;
-        self.call_db(move |pool| {
-            let rt = rt_new()?;
-            rt.block_on(async {
-                let mut client = pool.get().await.map_err(|e| ie(format!("pool: {e}")))?;
-                let tx = client
-                    .transaction()
-                    .await
-                    .map_err(|e| ie(format!("cp begin: {e}")))?;
+        let attested_head = self.head;
+        self.fenced_write(Some(attested_head), move |tx, _db_head| {
+            Box::pin(async move {
                 tx.execute(
                     "INSERT INTO ledger_checkpoints \
                      (ledger_id, journal_seq, head_hash, balances_root, pending_root, \
@@ -1744,9 +1719,6 @@ impl LedgerBackend for PostgresLedger {
                 )
                 .await
                 .map_err(|e| ie(format!("cp outbox: {e}")))?;
-                tx.commit()
-                    .await
-                    .map_err(|e| ie(format!("cp commit: {e}")))?;
                 Ok(Vec::new())
             })
         })?;
@@ -1757,11 +1729,6 @@ impl LedgerBackend for PostgresLedger {
 
     fn tick(&mut self, _signer: &dyn CheckpointSigner) -> Result<TickReport, LedgerError> {
         self.poison_check()?;
-        // Keep the writer lease live even across idle periods, so an otherwise
-        // healthy writer is not treated as abandoned merely for having nothing
-        // to commit.
-        self.renew_lease()?;
-
         let now = now_unix().max(self.clock);
         self.clock = self.clock.max(now);
 
@@ -1778,19 +1745,21 @@ impl LedgerBackend for PostgresLedger {
             }
         }
 
+        // The clock write is fenced like everything else, and doubles as the
+        // idle-period lease renewal (`fenced_write` refreshes the heartbeat in
+        // the same transaction). That closes the window the previous revision
+        // had, where renewal and the clock write were separate operations and a
+        // takeover could land between them.
         let clock_val = self.clock.to_be_bytes().to_vec();
-        self.call_db(move |pool| {
-            let rt = rt_new()?;
-            rt.block_on(async {
-                let client = pool.get().await.map_err(|e| ie(format!("pool: {e}")))?;
-                client
-                    .execute(
-                        "INSERT INTO ledger_meta (key, value) VALUES ('clock', $1) \
-                         ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value",
-                        &[&clock_val.as_slice()],
-                    )
-                    .await
-                    .map_err(|e| ie(format!("clock: {e}")))?;
+        self.fenced_write(None, move |tx, _db_head| {
+            Box::pin(async move {
+                tx.execute(
+                    "INSERT INTO ledger_meta (key, value) VALUES ('clock', $1) \
+                     ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value",
+                    &[&clock_val.as_slice()],
+                )
+                .await
+                .map_err(|e| ie(format!("clock: {e}")))?;
                 Ok(Vec::new())
             })
         })?;
@@ -1848,17 +1817,18 @@ impl LedgerBackend for PostgresLedger {
     }
 
     fn outbox_ack(&mut self, up_to: OutboxSeq) -> Result<(), LedgerError> {
-        self.call_db(move |pool| {
-            let rt = rt_new()?;
-            rt.block_on(async {
-                let client = pool.get().await.map_err(|e| ie(format!("pool: {e}")))?;
-                client
-                    .execute(
-                        "UPDATE ledger_outbox SET emitted = TRUE WHERE seq <= $1",
-                        &[&(up_to.0 as i64)],
-                    )
-                    .await
-                    .map_err(|e| ie(format!("ack: {e}")))?;
+        // Fenced: acknowledging the outbox durably discards proof-plane work
+        // that may not have been emitted, so a fenced-out writer must not be
+        // able to do it. No `expect_head` — the acknowledgement is about what
+        // has already been drained, not about current account state.
+        self.fenced_write(None, move |tx, _db_head| {
+            Box::pin(async move {
+                tx.execute(
+                    "UPDATE ledger_outbox SET emitted = TRUE WHERE seq <= $1",
+                    &[&(up_to.0 as i64)],
+                )
+                .await
+                .map_err(|e| ie(format!("ack: {e}")))?;
                 Ok(Vec::new())
             })
         })?;
@@ -1968,13 +1938,24 @@ fn row_to_account(row: &tokio_postgres::Row) -> Result<Account, LedgerError> {
 }
 
 fn row_to_pending(row: &tokio_postgres::Row) -> Result<PendingReservation, LedgerError> {
-    // Column 0 is transfer_id BYTEA(16) but we do not need it — the transfer
-    // is fully encoded in transfer_cbor (column 1).
+    // The transfer is fully encoded in transfer_cbor, but the primary key is
+    // decoded strictly anyway and cross-checked against it. The two are
+    // written together and must agree; if they ever disagree, the row is
+    // damaged in a way that would silently mis-key a reservation — so it fails
+    // closed rather than trusting whichever copy happened to be read.
+    let tid_bytes: &[u8] = row.get(0);
+    let tid = TransferId(try_u128(tid_bytes, "ledger_pending.transfer_id")?);
     let transfer_cbor: &[u8] = row.get(1);
     let deadline: i64 = row.get(2);
     let state: i16 = row.get(3);
     let transfer: Transfer = ciborium::from_reader(transfer_cbor)
         .map_err(|e| LedgerError::Internal(format!("xfer: {e}")))?;
+    if transfer.id != tid {
+        return Err(LedgerError::CorruptRow(format!(
+            "ledger_pending primary key {:?} disagrees with the encoded transfer id {:?}",
+            tid, transfer.id
+        )));
+    }
     let ps = match state {
         0 => PendingState::Pending,
         1 => PendingState::Posted,
@@ -2017,6 +1998,21 @@ fn rt_new() -> Result<tokio::runtime::Runtime, LedgerError> {
 
 fn cbor<T: serde::Serialize>(val: &T, buf: &mut Vec<u8>) -> Result<(), LedgerError> {
     ciborium::into_writer(val, buf).map_err(|e| LedgerError::Internal(format!("cbor: {e}")))
+}
+
+/// Whether an error means this instance has provably lost the right to write.
+///
+/// These are the terminal ones: the lease moved out from under us, or the
+/// mirror no longer describes the authoritative state. Both mean anything this
+/// instance believes about the ledger may be wrong, so it stops writing rather
+/// than retrying against a view it cannot trust.
+fn is_fence_violation(e: &LedgerError) -> bool {
+    matches!(
+        e,
+        LedgerError::WriterLeaseLost { .. }
+            | LedgerError::MirrorStale { .. }
+            | LedgerError::Poisoned(_)
+    )
 }
 
 fn ie(msg: impl std::fmt::Display) -> LedgerError {

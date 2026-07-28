@@ -55,7 +55,7 @@ pub use journal::{
     TickReport,
 };
 pub use mem::MemLedger;
-pub use mint::{mint_signing_input, DenyAllMintVerifier, MintCapability, MintVerifier};
+pub use mint::{mint_signing_input, MintAuthority, MintCapability};
 pub use types::{
     Account, AccountFlags, AccountId, AccountSpec, BalanceView, Cid, Did, IssueTransfer, Outcome,
     PendingReservation, PendingState, Purpose, Transfer, TransferId, TransferResult, UnitId,

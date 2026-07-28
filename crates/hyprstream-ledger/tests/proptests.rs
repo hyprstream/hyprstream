@@ -26,42 +26,45 @@ fn unit() -> UnitId {
     }
 }
 
-/// Test issuance authority. Issuance is sealed behind a verified, transfer-bound
-/// capability (see `hyprstream_ledger::mint`), so a ledger under test has to be
-/// given an authority the same way production does — there is deliberately no
-/// back door that skips the seam.
-#[derive(Debug)]
-struct TestMintVerifier;
-
-impl hyprstream_ledger::MintVerifier for TestMintVerifier {
-    fn verify(&self, _signing_input: &[u8], sig: &[u8]) -> Result<(), LedgerError> {
-        // Stands in for a real hybrid-PQC check: accepts one fixed marker so the
-        // tests still exercise "authorization is required and is checked".
-        if sig == TEST_MINT_SIG {
-            Ok(())
-        } else {
-            Err(LedgerError::MintNotAuthorized("bad test signature".to_owned()))
-        }
-    }
+/// The signing key backing the test ledger's issuance authority.
+///
+/// Minting is sealed against fixed key material, so a test has to hold the key
+/// and produce a real signature — the same thing the production issuer does.
+/// There is deliberately no permissive verifier to inject instead.
+fn mint_key() -> ed25519_dalek::SigningKey {
+    ed25519_dalek::SigningKey::from_bytes(&[7u8; 32])
 }
-
-const TEST_MINT_SIG: &[u8] = b"test-mint-authorization";
 
 /// Authorize and issue in one step, the way the settlement issuer does.
 fn mint(l: &mut MemLedger, t: IssueTransfer) -> hyprstream_ledger::Outcome {
-    match l.authorize_mint(&t, TEST_MINT_SIG) {
+    let seq = l.head().seq;
+    let fail = |e| hyprstream_ledger::Outcome {
+        result: Err(e),
+        seq,
+    };
+    let input = match hyprstream_ledger::mint_signing_input(&t) {
+        Ok(i) => i,
+        Err(e) => return fail(e),
+    };
+    let sig = match hyprstream_crypto::cose_sign::sign_composite(&mint_key(), None, &input, &[]) {
+        Ok(s) => s,
+        Err(e) => return fail(LedgerError::Internal(e.to_string())),
+    };
+    match l.authorize_mint(&t, &sig) {
         Ok(cap) => l.credit(cap),
-        Err(e) => hyprstream_ledger::Outcome {
-            result: Err(e),
-            seq: l.head().seq,
-        },
+        Err(e) => fail(e),
     }
 }
 
 /// Build a ledger with an issuer-liability account (index 0) and `K_SPENDABLE`
 /// spendable accounts. Returns their account ids indexed 0..=K.
 fn fresh() -> (MemLedger, Vec<hyprstream_ledger::AccountId>) {
-    let mut l = MemLedger::new(ledger_id()).with_mint_verifier(Box::new(TestMintVerifier));
+    let mut l = MemLedger::new(
+        ledger_id(),
+        Some(hyprstream_ledger::MintAuthority::classical(
+            mint_key().verifying_key(),
+        )),
+    );
     let mut ids = Vec::new();
     let liability = l
         .open_account(AccountSpec::new(
@@ -410,7 +413,12 @@ fn timeout_bounds_are_plan_values() {
 
 #[test]
 fn issuance_rejects_available_account_even_with_empty_flags() {
-    let mut l = MemLedger::new(ledger_id()).with_mint_verifier(Box::new(TestMintVerifier));
+    let mut l = MemLedger::new(
+        ledger_id(),
+        Some(hyprstream_ledger::MintAuthority::classical(
+            mint_key().verifying_key(),
+        )),
+    );
     let source = l
         .open_account(AccountSpec {
             ledger_id: ledger_id(),
@@ -429,15 +437,18 @@ fn issuance_rejects_available_account_even_with_empty_flags() {
         ))
         .unwrap();
 
-    let out = mint(&mut l, IssueTransfer {
-        id: TransferId(1),
-        issuer_liability: source.id,
-        destination: dest.id,
-        unit: unit(),
-        amount: 10,
-        grant_cid: None,
-        user_data: ud(),
-    });
+    let out = mint(
+        &mut l,
+        IssueTransfer {
+            id: TransferId(1),
+            issuer_liability: source.id,
+            destination: dest.id,
+            unit: unit(),
+            amount: 10,
+            grant_cid: None,
+            user_data: ud(),
+        },
+    );
 
     assert_eq!(out.result, Err(LedgerError::NotIssuerLiability(source.id)));
 }

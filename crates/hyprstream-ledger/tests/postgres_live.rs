@@ -187,41 +187,64 @@ fn unit() -> UnitId {
     }
 }
 
-/// Test issuance authority. Minting is sealed behind a verified,
-/// transfer-bound capability, so tests must supply an authority exactly the way
-/// production does.
-#[derive(Debug)]
-struct TestMintVerifier;
-
-impl hyprstream_ledger::MintVerifier for TestMintVerifier {
-    fn verify(&self, _signing_input: &[u8], sig: &[u8]) -> Result<(), LedgerError> {
-        if sig == TEST_MINT_SIG {
-            Ok(())
-        } else {
-            Err(LedgerError::MintNotAuthorized(
-                "bad test signature".to_owned(),
-            ))
-        }
-    }
+/// The signing key backing the test ledger's issuance authority.
+///
+/// The mint is sealed against fixed key material — there is no verifier to
+/// inject — so a test authorizes issuance exactly the way production does: by
+/// signing the canonical transfer encoding with the key the ledger was built
+/// against.
+fn mint_key() -> ed25519_dalek::SigningKey {
+    ed25519_dalek::SigningKey::from_bytes(&[7u8; 32])
 }
 
-const TEST_MINT_SIG: &[u8] = b"test-mint-authorization";
+fn mint_authority() -> hyprstream_ledger::MintAuthority {
+    hyprstream_ledger::MintAuthority::classical(mint_key().verifying_key())
+}
 
-/// Connect a ledger with the test issuance authority installed.
+/// Connect a ledger with the test issuance authority installed at construction.
 fn connect(db: &TestDb) -> Result<PostgresLedger, LedgerError> {
-    PostgresLedger::connect(db.config(), ledger_id())
-        .map(|l| l.with_mint_verifier(Box::new(TestMintVerifier)))
+    PostgresLedger::connect(db.config(), ledger_id(), Some(mint_authority()))
+}
+
+/// Sign an issuance authorization with the given key.
+fn sign_mint(key: &ed25519_dalek::SigningKey, t: &IssueTransfer) -> Vec<u8> {
+    let input = hyprstream_ledger::mint_signing_input(t).unwrap();
+    hyprstream_crypto::cose_sign::sign_composite(key, None, &input, &[]).unwrap()
 }
 
 /// Authorize and issue in one step, the way the settlement issuer does.
 fn mint(l: &mut PostgresLedger, t: IssueTransfer) -> hyprstream_ledger::Outcome {
-    match l.authorize_mint(&t, TEST_MINT_SIG) {
+    let seq = l.head().seq;
+    let sig = sign_mint(&mint_key(), &t);
+    match l.authorize_mint(&t, &sig) {
         Ok(cap) => l.credit(cap),
         Err(e) => hyprstream_ledger::Outcome {
             result: Err(e),
-            seq: l.head().seq,
+            seq,
         },
     }
+}
+
+/// Read the current fencing epoch straight from the database.
+fn lease_epoch(db: &TestDb) -> u64 {
+    let hex = query_one_text(
+        &db.dsn(),
+        "SELECT encode(substring(value from 1 for 8), 'hex') FROM ledger_meta \
+         WHERE key = 'writer_lease'",
+    );
+    u64::from_str_radix(&hex, 16).unwrap()
+}
+
+/// Expire the current lease heartbeat in place, without touching epoch or
+/// owner. Models "the writer is gone" from the database's point of view while
+/// the instance is in fact still running.
+fn expire_lease(db: &TestDb) {
+    must_sql(
+        &db.dsn(),
+        "UPDATE ledger_meta \
+         SET value = substring(value from 1 for 24) || '\\x0000000000000001'::bytea \
+         WHERE key = 'writer_lease'",
+    );
 }
 
 struct NoopSigner(Did);
@@ -334,12 +357,7 @@ fn a_fenced_out_writer_cannot_commit_and_loses_no_update() {
     // Simulate A crashing without releasing: expire its heartbeat in place.
     // The lease row still names A's epoch, so this models "A is gone" purely
     // from the database's point of view, while A is in fact still running.
-    must_sql(
-        &db.dsn(),
-        "UPDATE ledger_meta \
-         SET value = substring(value from 1 for 24) || '\\x0000000000000001'::bytea \
-         WHERE key = 'writer_lease'",
-    );
+    expire_lease(&db);
 
     // Instance B legitimately takes over, bumping the fencing epoch, and does
     // real work that moves acct1's balance.
@@ -414,12 +432,7 @@ fn two_instances_with_conflicting_updates_do_not_lose_one() {
 
     // Both instances will touch the SAME accounts with DIFFERENT transfer ids,
     // which is precisely the shape that absolute-counter upserts lose.
-    must_sql(
-        &db.dsn(),
-        "UPDATE ledger_meta \
-         SET value = substring(value from 1 for 24) || '\\x0000000000000001'::bytea \
-         WHERE key = 'writer_lease'",
-    );
+    expire_lease(&db);
     let mut b = connect(&db).unwrap();
 
     // B moves 100 from acct1 to acct2.
@@ -443,6 +456,160 @@ fn two_instances_with_conflicting_updates_do_not_lose_one() {
     let c = connect(&db).expect("journal and materialized state disagree after concurrent writers");
     assert_eq!(c.balance(acct1).unwrap().available, expected_1);
     assert_eq!(c.balance(acct2).unwrap().available, expected_2);
+}
+
+// ─── 1b. The head compare-and-set, in isolation ─────────────────────────────
+
+/// The CAS must be load-bearing on its own, not merely shadowed by the lease
+/// fence. Here the writer keeps a **valid, live, un-taken-over lease** for the
+/// whole test — only the authoritative head moves out from under its mirror.
+/// The lease epoch is asserted unchanged, so nothing but the CAS can be what
+/// refuses the write.
+#[test]
+fn a_commit_staged_against_a_moved_head_is_refused_by_the_cas_alone() {
+    let dsn = require_pg!();
+    let db = TestDb::create(&dsn);
+
+    let mut a = connect(&db).unwrap();
+    let ids = open_accounts(&mut a, 2);
+    let (liability, acct1, acct2) = (ids[0], ids[1], ids[2]);
+    mint(&mut a, issue(900, liability, acct1, 1_000))
+        .result
+        .unwrap();
+
+    let epoch_before = lease_epoch(&db);
+
+    // Move the authoritative head behind the writer's back, leaving the lease
+    // completely intact. The mirror now describes a state that is no longer
+    // current, which is exactly the condition the CAS exists to catch.
+    must_sql(
+        &db.dsn(),
+        "UPDATE ledger_meta SET value = '\\x00000000000000ff'::bytea \
+             || substring(value from 9 for 32) \
+         WHERE key = 'head'",
+    );
+
+    let out = a.debit(spend(901, acct1, acct2, 10));
+    assert!(
+        matches!(out.result, Err(LedgerError::MirrorStale { .. })),
+        "a commit staged against a moved head must be refused by the CAS, got {:?}",
+        out.result
+    );
+
+    assert_eq!(
+        lease_epoch(&db),
+        epoch_before,
+        "the lease never moved, so the CAS — not the fence — must be what refused this"
+    );
+}
+
+/// Same isolation, for the checkpoint path: a checkpoint attests to a specific
+/// head, so it must not be publishable once that head has moved.
+#[test]
+fn a_checkpoint_attesting_to_a_moved_head_is_refused_by_the_cas_alone() {
+    let dsn = require_pg!();
+    let db = TestDb::create(&dsn);
+    let signer = NoopSigner(ledger_id());
+
+    let mut a = connect(&db).unwrap();
+    let ids = open_accounts(&mut a, 1);
+    mint(&mut a, issue(910, ids[0], ids[1], 100))
+        .result
+        .unwrap();
+
+    let epoch_before = lease_epoch(&db);
+    must_sql(
+        &db.dsn(),
+        "UPDATE ledger_meta SET value = '\\x00000000000000ff'::bytea \
+             || substring(value from 9 for 32) \
+         WHERE key = 'head'",
+    );
+
+    let err = a.checkpoint(&signer).unwrap_err();
+    assert!(
+        matches!(err, LedgerError::MirrorStale { .. }),
+        "a checkpoint must not attest to a head that has moved, got {err:?}"
+    );
+    assert_eq!(lease_epoch(&db), epoch_before);
+}
+
+// ─── 1c. A fenced-out writer persists NOTHING ───────────────────────────────
+
+/// Every durable write path, not just `commit`. A zombie writer must not be
+/// able to publish a checkpoint, acknowledge the outbox, or advance the clock —
+/// those were unfenced side doors before the single `fenced_write` primitive.
+#[test]
+fn a_fenced_out_writer_cannot_use_any_side_door() {
+    let dsn = require_pg!();
+    let db = TestDb::create(&dsn);
+    let signer = NoopSigner(ledger_id());
+
+    let mut a = connect(&db).unwrap();
+    let ids = open_accounts(&mut a, 1);
+    mint(&mut a, issue(920, ids[0], ids[1], 100))
+        .result
+        .unwrap();
+
+    // Snapshot the proof-plane state the zombie must not be able to change.
+    let checkpoints_before =
+        query_one_text(&db.dsn(), "SELECT count(*)::text FROM ledger_checkpoints");
+    let unemitted_before = query_one_text(
+        &db.dsn(),
+        "SELECT count(*)::text FROM ledger_outbox WHERE emitted = FALSE",
+    );
+    let clock_before = query_one_text(
+        &db.dsn(),
+        "SELECT coalesce((SELECT encode(value, 'hex') FROM ledger_meta WHERE key = 'clock'), '')",
+    );
+
+    // Fence A out: expire its heartbeat, let B take over and bump the epoch.
+    expire_lease(&db);
+    let b = connect(&db).expect("takeover of an expired lease should succeed");
+
+    // Each side door must be refused.
+    let cp = a.checkpoint(&signer);
+    assert!(
+        cp.is_err(),
+        "a fenced-out writer published a checkpoint: {:?}",
+        cp.map(|c| c.seq)
+    );
+
+    let ack = a.outbox_ack(hyprstream_ledger::OutboxSeq(u64::MAX));
+    assert!(
+        ack.is_err(),
+        "a fenced-out writer acknowledged the outbox: {ack:?}"
+    );
+
+    let tick = a.tick(&signer);
+    assert!(
+        tick.is_err(),
+        "a fenced-out writer advanced the clock: {tick:?}"
+    );
+
+    // ...and nothing durable changed.
+    assert_eq!(
+        query_one_text(&db.dsn(), "SELECT count(*)::text FROM ledger_checkpoints"),
+        checkpoints_before,
+        "a fenced-out writer wrote a checkpoint row"
+    );
+    assert_eq!(
+        query_one_text(
+            &db.dsn(),
+            "SELECT count(*)::text FROM ledger_outbox WHERE emitted = FALSE"
+        ),
+        unemitted_before,
+        "a fenced-out writer marked outbox rows emitted"
+    );
+    assert_eq!(
+        query_one_text(
+            &db.dsn(),
+            "SELECT coalesce((SELECT encode(value, 'hex') FROM ledger_meta WHERE key = 'clock'), '')"
+        ),
+        clock_before,
+        "a fenced-out writer advanced the durable clock"
+    );
+
+    drop(b);
 }
 
 // ─── 2. Journal-authoritative restart ───────────────────────────────────────
@@ -654,9 +821,17 @@ fn tick_and_checkpoint_survive_restart() {
 }
 
 // ─── 3. The mint is sealed ──────────────────────────────────────────────────
+//
+// This test crate is a genuine **out-of-crate consumer** of `hyprstream-ledger`
+// — the same position sol's exploit occupied. In R4 it could implement the
+// public `MintVerifier` trait as `Ok(())`, install it with `with_mint_verifier`,
+// and mint 1,000,000 units from meaningless bytes. Both of those APIs are gone:
+// verification is a concrete in-crate check against key material fixed at
+// construction, so there is nothing left to override.
 
+/// The R4 exploit, verbatim, now expected to fail closed.
 #[test]
-fn issuance_without_a_valid_authorization_is_refused() {
+fn the_r4_exploit_shape_no_longer_mints() {
     let dsn = require_pg!();
     let db = TestDb::create(&dsn);
 
@@ -664,19 +839,30 @@ fn issuance_without_a_valid_authorization_is_refused() {
     let ids = open_accounts(&mut l, 1);
     let (liability, acct) = (ids[0], ids[1]);
 
-    let t = issue(800, liability, acct, 1_000);
+    let t = issue(800, liability, acct, 1_000_000);
 
-    // A caller holding the backend still cannot mint: the capability `credit`
-    // requires can only come from a verified, transfer-bound authorization.
-    let err = l.authorize_mint(&t, b"forged").unwrap_err();
+    // Meaningless bytes, exactly as before.
+    for forged in [Vec::new(), vec![0u8; 64], b"AcceptAll".to_vec()] {
+        let err = l.authorize_mint(&t, &forged).unwrap_err();
+        assert!(
+            matches!(err, LedgerError::MintNotAuthorized(_)),
+            "garbage bytes minted a capability: {err:?}"
+        );
+    }
+
+    // A well-formed signature under an attacker-chosen key is no better: the
+    // authority is fixed at construction and cannot be swapped out.
+    let attacker = ed25519_dalek::SigningKey::from_bytes(&[99u8; 32]);
+    let err = l.authorize_mint(&t, &sign_mint(&attacker, &t)).unwrap_err();
     assert!(
         matches!(err, LedgerError::MintNotAuthorized(_)),
-        "expected the mint to be sealed, got {err:?}"
+        "an attacker-signed authorization minted a capability: {err:?}"
     );
 
-    // Nothing was issued.
-    assert!(
-        l.balance(acct).unwrap().credits_posted == 0,
+    // Nothing moved.
+    assert_eq!(
+        l.balance(acct).unwrap().credits_posted,
+        0,
         "a refused issuance still moved value"
     );
 }
@@ -686,38 +872,51 @@ fn a_ledger_with_no_issuance_authority_cannot_mint_at_all() {
     let dsn = require_pg!();
     let db = TestDb::create(&dsn);
 
-    // Deliberately NOT installing a verifier: the default must be deny, so an
-    // operator who has not wired an issuance authority gets a mint-disabled
-    // ledger rather than a mint-open one.
-    let mut l = PostgresLedger::connect(db.config(), ledger_id()).unwrap();
+    // Deliberately no authority: the default must be deny, so an operator who
+    // has not wired an issuance authority gets a mint-disabled ledger rather
+    // than a mint-open one.
+    let mut l = PostgresLedger::connect(db.config(), ledger_id(), None).unwrap();
     let ids = open_accounts(&mut l, 1);
     let t = issue(801, ids[0], ids[1], 1_000);
 
-    let err = l.authorize_mint(&t, TEST_MINT_SIG).unwrap_err();
+    // Even a correctly-signed authorization is refused — there is no authority
+    // to check it against.
+    let err = l
+        .authorize_mint(&t, &sign_mint(&mint_key(), &t))
+        .unwrap_err();
     assert!(
         matches!(err, LedgerError::MintNotAuthorized(_)),
         "an unconfigured ledger must refuse to mint, got {err:?}"
     );
 }
 
+/// A correctly-signed authorization works, and covers only its own transfer.
 #[test]
-fn an_authorization_cannot_be_moved_to_a_different_issuance() {
+fn a_valid_authorization_mints_exactly_what_it_authorized() {
     let dsn = require_pg!();
     let db = TestDb::create(&dsn);
 
     let mut l = connect(&db).unwrap();
-    let ids = open_accounts(&mut l, 2);
-    let (liability, acct1) = (ids[0], ids[1]);
+    let ids = open_accounts(&mut l, 1);
+    let (liability, acct) = (ids[0], ids[1]);
 
-    // The authorization binds the exact transfer, so the signature that covers
-    // a 1-unit issuance does not cover a larger one. (The type system also
-    // prevents reusing the capability itself, since it borrows its transfer.)
-    let small = issue(802, liability, acct1, 1);
-    let large = issue(802, liability, acct1, 1_000_000);
-    assert_ne!(
-        hyprstream_ledger::mint_signing_input(&small).unwrap(),
-        hyprstream_ledger::mint_signing_input(&large).unwrap(),
-        "authorization must bind the amount"
+    let small = issue(802, liability, acct, 1);
+    let sig = sign_mint(&mint_key(), &small);
+    let cap = l.authorize_mint(&small, &sig).unwrap();
+    assert!(l.credit(cap).is_ok());
+    assert_eq!(l.balance(acct).unwrap().credits_posted, 1);
+
+    // The same signature does not authorize a larger issuance under the same id.
+    let large = issue(802, liability, acct, 1_000_000);
+    let err = l.authorize_mint(&large, &sig).unwrap_err();
+    assert!(
+        matches!(err, LedgerError::MintNotAuthorized(_)),
+        "an authorization must bind the amount, got {err:?}"
+    );
+    assert_eq!(
+        l.balance(acct).unwrap().credits_posted,
+        1,
+        "the larger issuance must not have landed"
     );
 }
 

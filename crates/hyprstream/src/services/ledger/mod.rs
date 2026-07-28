@@ -37,7 +37,6 @@ pub mod credit_gate;
 pub mod enforcer;
 pub mod handle;
 pub mod inference_spend;
-pub mod mint_authority;
 pub mod service;
 pub mod signer;
 pub mod sink;
@@ -56,7 +55,6 @@ pub use inference_spend::{
     SpendResult,
 };
 pub use service::LedgerService;
-pub use mint_authority::CoseMintVerifier;
 pub use signer::CoseCheckpointSigner;
 pub use sink::{DebtBreaker, LoggingReceiptSink, ReceiptPayload, ReceiptSink};
 

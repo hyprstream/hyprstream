@@ -45,6 +45,10 @@ tracing = { workspace = true, optional = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
+# Tests sign real issuance authorizations — the mint is sealed against fixed
+# key material, so there is no permissive verifier to inject instead.
+hyprstream-crypto = { path = "../hyprstream-crypto" }
+ed25519-dalek = { workspace = true }
 # Live-PostgreSQL integration tests (tests/postgres_live.rs) drive the database
 # directly to set up legacy schemas and to tamper with persisted state. They are
 # compiled out unless the `postgres` feature is on, and skip at runtime unless

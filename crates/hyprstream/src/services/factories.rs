@@ -605,11 +605,24 @@ fn create_ledger_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
         ))
     };
 
-    let mint_verifier = crate::services::ledger::CoseMintVerifier::new(
-        ed_vk,
-        mint_pq_vk.clone(),
-        lcfg.require_pq_signatures,
-    );
+    // The mint authority is derived from the SAME key material the actor signs
+    // issuance authorizations with, so the two halves of the seal cannot drift
+    // apart. It is passed at backend construction and is immutable afterwards —
+    // there is no setter, which is what stops a consumer holding a backend from
+    // installing a permissive authority of its own.
+    let mint_authority = match &mint_pq_vk {
+        Some(pq) => Some(hyprstream_ledger::MintAuthority::hybrid(
+            ed_vk,
+            (**pq).clone(),
+        )),
+        None if lcfg.require_pq_signatures => {
+            anyhow::bail!(
+                "ledger: require_pq_signatures is set but no ML-DSA-65 verifying key is \
+                 available for the mint authority (fail-closed)"
+            )
+        }
+        None => Some(hyprstream_ledger::MintAuthority::classical(ed_vk)),
+    };
 
     // Backend selection (PAY-01 F8): BackendKind drives construction.
     // **Postgres = production (fail-closed on unavailability); Mem = dev/test.**
@@ -632,13 +645,14 @@ fn create_ledger_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
                 let pg = hyprstream_ledger::postgres::PostgresLedger::connect(
                     pg_config,
                     cell_identity.clone(),
+                    mint_authority,
                 ).map_err(|e| {
                     anyhow::anyhow!(
                         "ledger: PostgresLedger::connect FAILED (FATAL — no silent fallback): {e}"
                     )
                 })?;
                 info!("Ledger backend: PostgresLedger (production durable)");
-                Box::new(pg.with_mint_verifier(Box::new(mint_verifier)))
+                Box::new(pg)
             }
             #[cfg(not(feature = "postgres-ledger"))]
             {
@@ -660,7 +674,7 @@ fn create_ledger_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
                 );
             }
             info!("Ledger backend: MemLedger (dev/test only — all state is volatile)");
-            Box::new(MemLedger::new(cell_identity.clone()).with_mint_verifier(Box::new(mint_verifier)))
+            Box::new(MemLedger::new(cell_identity.clone(), mint_authority))
         }
     };
 
