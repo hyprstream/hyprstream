@@ -64,69 +64,130 @@ FROM pubkeys WHERE username = $1 ORDER BY fingerprint
 
 /// Configuration for the networked Postgres [`UserStore`] backend.
 ///
-/// Constructed at deployment-startup time from environment variables (see
-/// [`Self::from_env`]). The connection string must require TLS
-/// (`sslmode=require` or `verify-full`) — RDS rejects plaintext connections
-/// in production, and credentials must never transit an unencrypted link.
-#[derive(Clone, Debug)]
+/// Constructed at deployment-startup time from the file-backed credential
+/// inputs mandated by the metal RDS runtime contract v1.1 (see
+/// [`Self::from_env`]). The URL **must** contain `sslmode=verify-full`.
+///
+/// **No `Debug` impl** — `database_url` carries a password. Logging or
+/// debug-formatting this struct would leak the credential (metal v1.1 §4).
+#[derive(Clone)]
+#[allow(dead_code)] // wired once services/factories.rs gains a postgres selector
 pub struct PostgresUserStoreConfig {
-    /// libpq connection string, e.g.
-    /// `host=rdss.x.rds.amazonaws.com port=5432 dbname=hyprstream \
-    ///   user=hyprstream password=... sslmode=verify-full`
-    pub database_url: String,
+    /// libpq connection string read from the role-scoped URL file.
+    /// Contains `sslmode=verify-full`.
+    pub(crate) database_url: String,
     /// Maximum pool size. Default: `2 * num_cpus`.
     pub max_connections: usize,
-    /// Optional pinned RDS CA PEM (overrides Mozilla roots).
-    pub tls_ca_pem: Option<PathBuf>,
+    /// Path to the pinned RDS CA PEM file (mandatory in production;
+    /// `None` only in `#[cfg(test)]` plaintext paths).
+    pub(crate) ca_file: Option<PathBuf>,
 }
 
 impl PostgresUserStoreConfig {
-    /// Load fail-closed deployment configuration from the environment.
+    /// Load fail-closed deployment configuration from the file-backed
+    /// credential inputs mandated by the metal RDS runtime contract v1.1.
     ///
-    /// Required env vars:
-    /// - `HYPRSTREAM_USERSTORE_DATABASE_URL` — libpq connstring; MUST contain
-    ///   `sslmode=require` or `sslmode=verify-full`.
+    /// Required env vars (paths to projected credential files):
+    /// - `HYPRSTREAM_CREDENTIALS_URL_FILE` — newline-terminated libpq URL.
+    ///   The URL **must** contain exactly `sslmode=verify-full`.
+    /// - `HYPRSTREAM_CREDENTIALS_SSLROOTCERT_FILE` — pinned RDS CA PEM.
+    ///
+    /// No password-bearing URL is ever read from a direct env var; the
+    /// env var carries only the *path* to the secret file. The URL is
+    /// never emitted in any log, error, or Debug representation.
     ///
     /// Optional:
     /// - `HYPRSTREAM_USERSTORE_MAX_CONNECTIONS` — pool size (default `2 * num_cpus`).
-    /// - `HYPRSTREAM_USERSTORE_TLS_CA_PEM` — pinned CA bundle path.
     pub fn from_env() -> Result<Self> {
-        let database_url = std::env::var("HYPRSTREAM_USERSTORE_DATABASE_URL")
-            .context("HYPRSTREAM_USERSTORE_DATABASE_URL is required")?;
+        // ── URL file (the sole credential carrier) ─────────────────────
+        let url_file = std::env::var_os("HYPRSTREAM_CREDENTIALS_URL_FILE")
+            .context(
+                "HYPRSTREAM_CREDENTIALS_URL_FILE is required \
+                 (metal RDS runtime contract v1.1)",
+            );
+        let url_file = url_file?;
+        let database_url = std::fs::read_to_string(&url_file)
+            .with_context(|| {
+                format!(
+                    "reading credentials URL file {}",
+                    url_file.to_string_lossy()
+                )
+            })?
+            .trim()
+            .to_owned();
         ensure!(
-            !database_url.trim().is_empty(),
-            "HYPRSTREAM_USERSTORE_DATABASE_URL is empty"
+            !database_url.is_empty(),
+            "credentials URL file is empty: {}",
+            url_file.to_string_lossy()
         );
-        // Refuse insecure sslmode — RDS must use TLS.
+
+        // ── v1.1 positive TLS assertion ────────────────────────────────
         let lowered = database_url.to_ascii_lowercase();
+        // Scheme must be postgresql:// or postgres://
         ensure!(
-            !lowered.contains("sslmode=disable")
-                && !lowered.contains("sslmode=prefer")
-                && !lowered.contains("sslmode=allow")
-                && !lowered.contains("sslmode=no-ssl"),
-            "HYPRSTREAM_USERSTORE_DATABASE_URL must require TLS \
-             (sslmode=require or verify-full); refusing insecure connection"
+            lowered.starts_with("postgresql://") || lowered.starts_with("postgres://"),
+            "credentials URL must use postgresql:// or postgres:// scheme"
         );
+        // Exactly one sslmode=verify-full; reject every other sslmode value
+        // and duplicates/conflicts (metal v1.1 §"Positive TLS requirements").
+        for forbidden in [
+            "sslmode=disable",
+            "sslmode=allow",
+            "sslmode=prefer",
+            "sslmode=require",
+            "sslmode=verify-ca",
+        ] {
+            ensure!(
+                !lowered.contains(forbidden),
+                "credentials URL must use sslmode=verify-full, not {forbidden}"
+            );
+        }
+        let verify_full_count = lowered.matches("sslmode=verify-full").count();
+        ensure!(
+            verify_full_count == 1,
+            "credentials URL must contain exactly one sslmode=verify-full \
+             (found {verify_full_count} occurrences)"
+        );
+
+        // ── CA file (mandatory — the connector must load it, not infer) ─
+        let ca_file = std::env::var_os("HYPRSTREAM_CREDENTIALS_SSLROOTCERT_FILE")
+            .context(
+                "HYPRSTREAM_CREDENTIALS_SSLROOTCERT_FILE is required \
+                 (metal RDS runtime contract v1.1)",
+            )?;
+        // Fail-closed: the CA file must exist and be readable at startup.
+        std::fs::metadata(&ca_file).with_context(|| {
+            format!(
+                "credentials CA file is missing or unreadable: {}",
+                ca_file.to_string_lossy()
+            )
+        })?;
+
+        // ── Pool sizing (non-secret) ───────────────────────────────────
         let max_connections = std::env::var("HYPRSTREAM_USERSTORE_MAX_CONNECTIONS")
             .ok()
             .map(|v| v.parse::<usize>())
             .transpose()
             .context("HYPRSTREAM_USERSTORE_MAX_CONNECTIONS must be a positive integer")?
             .unwrap_or_else(|| 2 * num_cpus::get());
-        let tls_ca_pem = std::env::var_os("HYPRSTREAM_USERSTORE_TLS_CA_PEM").map(PathBuf::from);
+
         Ok(Self {
             database_url,
             max_connections,
-            tls_ca_pem,
+            ca_file: Some(PathBuf::from(ca_file)),
         })
     }
 
-    /// Construct from an explicit connection URL (for tests / programmatic wiring).
+    /// Construct from an explicit connection URL — **TEST/MIGRATION ONLY**.
+    ///
+    /// Production wiring MUST use [`Self::from_env`] which reads the
+    /// role-scoped URL file per metal v1.1.
+    #[cfg(test)]
     pub fn from_url(database_url: impl Into<String>) -> Self {
         Self {
             database_url: database_url.into(),
             max_connections: 2 * num_cpus::get(),
-            tls_ca_pem: None,
+            ca_file: None,
         }
     }
 }
@@ -137,6 +198,7 @@ impl PostgresUserStoreConfig {
 /// [`PgliteUserStore`](super::PgliteUserStore). Only the I/O seam differs:
 /// deadpool-postgres pooled connections + TLS, and tokio-postgres's
 /// `Row::try_get` API.
+#[allow(dead_code)] // wired once services/factories.rs gains a postgres selector
 pub struct PostgresUserStore {
     pool: Pool,
     cipher: Option<ColumnCipher>,
@@ -398,7 +460,7 @@ fn pool_err(e: deadpool_postgres::PoolError) -> anyhow::Error {
 /// Build the deadpool-postgres connection pool with mandatory TLS.
 ///
 /// The connector is built from either a pinned RDS CA PEM file (production,
-/// `tls_ca_pem`) or the Mozilla root set (test/dev). The contract requires
+/// `ca_file`) or the Mozilla root set (test/dev). The contract requires
 /// `sslmode=verify-full` — `from_env` rejects any URL that doesn't require TLS,
 /// and this connector negotiates rustls on every checkout.
 fn build_pool(config: Option<&PostgresUserStoreConfig>) -> Result<Pool> {
@@ -409,7 +471,7 @@ fn build_pool(config: Option<&PostgresUserStoreConfig>) -> Result<Pool> {
 
     // Build a rustls TLS connector — TLS is mandatory for RDS.
     let tls = {
-        let roots = match config.and_then(|c| c.tls_ca_pem.as_ref()) {
+        let roots = match config.and_then(|c| c.ca_file.as_ref()) {
             Some(ca_path) => {
                 let pem = std::fs::read(ca_path)
                     .with_context(|| format!("reading TLS CA PEM from {}", ca_path.display()))?;
@@ -428,6 +490,8 @@ fn build_pool(config: Option<&PostgresUserStoreConfig>) -> Result<Pool> {
                 );
                 store
             }
+            // Fallback: Mozilla roots (test/dev only — production always
+            // provides a pinned CA via from_env).
             None => {
                 let mut store = RootCertStore::empty();
                 store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
@@ -1165,10 +1229,16 @@ impl UserStore for PostgresUserStore {
             .await?;
         if let Some(row) = existing.first().cloned() {
             let owner: String = row.try_get(0)?;
+            // Ownership check MUST precede the decrypt: if owner != username
+            // we would be decrypting another user's key with the wrong DEK.
+            ensure!(
+                owner == username,
+                "pubkey is already bound to another user"
+            );
             let stored_key: Vec<u8> = row.try_get(1)?;
             let algorithm: String = row.try_get(2)?;
             let pq: Option<Vec<u8>> = row.try_get(3)?;
-            // Decrypt stored key for comparison
+            // Safe to decrypt: ownership verified above.
             let decrypted_key = cipher_glue::open_raw(
                 self.cipher.as_ref(),
                 root.as_ref(),
@@ -1178,7 +1248,6 @@ impl UserStore for PostgresUserStore {
                 },
                 &stored_key,
             )?;
-            ensure!(owner == username, "pubkey is already bound to another user");
             ensure!(
                 decrypted_key.as_slice() == pubkey.as_bytes(),
                 "fingerprint row carries different Ed25519 bytes"
