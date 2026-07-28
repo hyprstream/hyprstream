@@ -644,10 +644,14 @@ fn assemble_pool(config: Option<&PostgresUserStoreConfig>) -> Result<PoolAssembl
 
     let ca_file = config.and_then(|c| c.ca_file.as_deref());
     let roots = Arc::new(load_ca_roots(ca_file)?);
-    let verifier = WebPkiServerVerifier::builder(Arc::clone(&roots))
-        .build()
-        .context("building standard rustls WebPKI server verifier")?;
-    let client_config = rustls::ClientConfig::builder()
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let verifier =
+        WebPkiServerVerifier::builder_with_provider(Arc::clone(&roots), Arc::clone(&provider))
+            .build()
+            .context("building standard rustls WebPKI server verifier")?;
+    let client_config = rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .context("selecting safe default rustls protocol versions")?
         .with_webpki_verifier(Arc::clone(&verifier))
         .with_no_client_auth();
     let tls = MakeRustlsConnect::new(client_config);
@@ -2069,7 +2073,9 @@ mod tests {
             .unwrap_or_else(|e| panic!("TLS test URL file {:?} unreadable: {e}", url_path))
             .trim()
             .to_owned();
-        validate_pg_url(&raw).unwrap();
+        // Deliberately do not call validate_pg_url here. The adversarial
+        // endpoint is loopback and would be rejected before TLS; this test
+        // must reach certificate verification through the production pool.
         let config = PostgresUserStoreConfig {
             database_url: raw,
             max_connections: 1,
