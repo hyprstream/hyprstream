@@ -81,7 +81,7 @@ use hyprstream_service::Spawnable;
 use tokio::sync::Notify;
 use tracing::info;
 
-use crate::config::OAuthConfig;
+use crate::config::{CredentialsBackend, OAuthConfig};
 use crate::services::PolicyClient;
 use state::OAuthState;
 
@@ -592,123 +592,24 @@ impl Spawnable for OAuthService {
                 )
             })?;
 
-            // Load the user store (account system of record) based on the
-            // configured backend. A configured system-of-record failure fails
-            // closed — never silently fall back to a different account store.
-            // The credential/PDS production profile permits only encrypted
-            // PGlite and rejects its legacy plaintext-capable alternatives.
-            use crate::config::CredentialsBackend;
+            // Load account and device storage through the single production
+            // credential-store boundary. Account-store construction failure
+            // fails closed; no caller can inject a raw backend here.
             let credentials_config = crate::config::HyprConfig::load()
                 .map(|c| c.credentials)
                 .unwrap_or_default();
-            credentials_config
-                .backend
-                .ensure_allowed_for_build()
-                .map_err(|e| {
+            let (user_store, device_store_opt) =
+                crate::auth::ProductionUserStore::open_with_device_store(
+                    &credentials_dir,
+                    &credentials_config,
+                )
+                .await
+                .map_err(|error| {
                     hyprstream_rpc::error::RpcError::SpawnFailed(format!(
-                        "invalid credential backend: {e:#}"
+                        "failed to initialize production credential store: {error:#}"
                     ))
                 })?;
-
-            // The device store is independent of the user-store backend. It
-            // always uses RocksDB (device-authorization state is not account
-            // data and there is no pglite DeviceStore). Every match arm below
-            // assigns it, so the initial `None` is structurally required by
-            // Rust's initialization rules but is always overwritten before read.
-            #[allow(unused_assignments)]
-            let mut device_store_opt: Option<Arc<dyn crate::auth::DeviceStore>> = None;
-
-            // Helper: open a RocksDbUserStore solely for its DeviceStore trait
-            // (used when the account backend is not RocksDB).
-            #[cfg(any(feature = "pglite", feature = "valkey"))]
-            macro_rules! open_rocksdb_device_store {
-                () => {{
-                    match crate::auth::RocksDbUserStore::open(&credentials_dir) {
-                        Ok(ds) => {
-                            let arc: Arc<crate::auth::RocksDbUserStore> = Arc::new(ds);
-                            Some(arc as Arc<dyn crate::auth::DeviceStore>)
-                        }
-                        Err(e) => {
-                            tracing::warn!("Could not open device store (RocksDB): {e}");
-                            None
-                        }
-                    }
-                }};
-            }
-
-            let user_store: Option<Arc<dyn crate::auth::user_store::UserStore>> = match credentials_config.backend {
-                CredentialsBackend::Pglite => {
-                    #[cfg(feature = "pglite")]
-                    {
-                        let db_path = credentials_dir.join("pglite");
-                        // Open the shared PGlite handle explicitly so it can be
-                        // injected into other repositories (AppView inventory)
-                        // via from_database in the future. #1376's PgliteUserStore
-                        // owns the schema application; we own the connection.
-                        let database = Arc::new(
-                            pglite::PGlite::open(&db_path)
-                                .await
-                                .map_err(|e| hyprstream_rpc::error::RpcError::SpawnFailed(
-                                    format!("failed to open PGlite at {db_path:?}: {e}")
-                                ))?,
-                        );
-                        let store = crate::auth::PgliteUserStore::from_database(database)
-                            .await
-                            .map_err(|e| hyprstream_rpc::error::RpcError::SpawnFailed(
-                                format!("failed to initialize encrypted UserStore: {e:#}")
-                            ))?;
-                        info!("Encrypted user store (PGlite) opened at {:?}", db_path);
-                        device_store_opt = open_rocksdb_device_store!();
-                        Some(Arc::new(store) as Arc<dyn crate::auth::user_store::UserStore>)
-                    }
-                    #[cfg(not(feature = "pglite"))]
-                    {
-                        return Err(hyprstream_rpc::error::RpcError::SpawnFailed(
-                            "credentials.backend = \"pglite\" but binary was not compiled with --features pglite".to_owned()
-                        ));
-                    }
-                }
-                CredentialsBackend::Rocksdb => {
-                    match crate::auth::RocksDbUserStore::open(&credentials_dir) {
-                        Ok(store) => {
-                            info!("User store (RocksDB) opened at {:?}", credentials_dir);
-                            let arc = Arc::new(store);
-                            // RocksDbUserStore implements both traits — share the object.
-                            device_store_opt = Some(arc.clone() as Arc<dyn crate::auth::DeviceStore>);
-                            Some(arc as Arc<dyn crate::auth::user_store::UserStore>)
-                        }
-                        Err(e) => {
-                            return Err(hyprstream_rpc::error::RpcError::SpawnFailed(
-                                format!("failed to open RocksDB user store at {credentials_dir:?}: {e}")
-                            ));
-                        }
-                    }
-                }
-                CredentialsBackend::Valkey => {
-                    #[cfg(feature = "valkey")]
-                    {
-                        let url = &credentials_config.valkey.url;
-                        match crate::auth::ValkeyUserStore::connect(url).await {
-                            Ok(store) => {
-                                info!("User store (Valkey) connected at {url}");
-                                device_store_opt = open_rocksdb_device_store!();
-                                Some(Arc::new(store))
-                            }
-                            Err(e) => {
-                                return Err(hyprstream_rpc::error::RpcError::SpawnFailed(
-                                    format!("failed to connect Valkey user store at {url}: {e}")
-                                ));
-                            }
-                        }
-                    }
-                    #[cfg(not(feature = "valkey"))]
-                    {
-                        return Err(hyprstream_rpc::error::RpcError::SpawnFailed(
-                            "credentials.backend = \"valkey\" but binary was not compiled with --features valkey".to_owned()
-                        ));
-                    }
-                }
-            };
+            info!("Production credential store admitted at {:?}", credentials_dir);
 
             // Load the CA JWT signing key for browser WIT issuance (POST /oauth/wit).
             // Also seed the signing key store from the same root key.
@@ -890,9 +791,7 @@ impl Spawnable for OAuthService {
                     "OAuth user-token minting disabled: no deployment account zone"
                 ),
             }
-            if let Some(store) = user_store {
-                oauth_state = oauth_state.with_user_store(store);
-            }
+            oauth_state = oauth_state.with_user_store(user_store);
             if let Some(ds) = device_store_opt {
                 oauth_state = oauth_state.with_device_store(ds);
             }
@@ -1715,7 +1614,7 @@ mod tests {
             DiscoveryClient::new(dummy_rpc),
             service_key.verifying_key().to_bytes(),
         )
-        .with_user_store(user_store)
+        .with_user_store(crate::auth::ProductionUserStore::for_test(user_store))
         .with_hosted_account_store(hosted_account_store)
         .with_atproto_did_resolver(Arc::new(FixtureAtprotoDidResolver(
             atproto_document,

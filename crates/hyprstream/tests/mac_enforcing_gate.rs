@@ -11,6 +11,7 @@
 //! production remains operator-gated and floor-only.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
+#![cfg_attr(feature = "credential-pds", allow(dead_code, unused_imports))]
 
 use std::io::{self, Write};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -458,6 +459,7 @@ async fn unauthorized_subject_is_denied_and_audited_on_rpc_and_9p() -> Result<()
 // Positive acceptance path retained as the executable T8 contract.
 //
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg(not(feature = "credential-pds"))]
 async fn verified_atproto_identity_authorizes_rpc_and_9p() -> Result<()> {
     let _globals = GATE_GLOBALS.lock().await;
     let coverage = hyprstream_rpc::auth::mac::GenesisReport {
@@ -538,14 +540,14 @@ struct T8SessionCredential {
     ninep_bytes: Vec<u8>,
 }
 
+#[cfg(not(feature = "credential-pds"))]
 async fn t8_atproto_session_credential() -> Result<T8SessionCredential> {
     use base64::{
         engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
         Engine as _,
     };
     use ed25519_dalek::Signer as _;
-    use hyprstream_core::auth::rocksdb_store::RocksDbUserStore;
-    use hyprstream_core::auth::{PolicyManager, UserProfile, UserStore};
+    use hyprstream_core::auth::{PolicyManager, ProductionUserStore, UserProfile};
     use hyprstream_core::config::{CorsConfig, OAuthConfig, TokenConfig};
     use hyprstream_core::services::oauth::state::{
         AtprotoDidDocumentResolver, OAuthState, RegisteredClient,
@@ -597,7 +599,7 @@ async fn t8_atproto_session_credential() -> Result<T8SessionCredential> {
     )?;
 
     let user_dir = tempfile::TempDir::new()?;
-    let user_store = Arc::new(RocksDbUserStore::open(user_dir.path())?);
+    let user_store = ProductionUserStore::open(user_dir.path()).await?;
     let login_key = SigningKey::from_bytes(&[0x53; 32]);
     user_store.register("alice").await?;
     let fingerprint = user_store

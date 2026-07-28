@@ -1308,9 +1308,9 @@ mod tests {
                 [0x76; 32],
             )
             .with_user_service(Arc::new(
-                crate::services::oauth::user_service::UserService::new(Arc::new(
-                    UntouchedUserStore,
-                )),
+                crate::services::oauth::user_service::UserService::new(
+                    crate::auth::ProductionUserStore::for_test(Arc::new(UntouchedUserStore)),
+                ),
             )),
         );
 

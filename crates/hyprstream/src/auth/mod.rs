@@ -22,6 +22,7 @@ pub mod pglite_store;
 mod policy_manager;
 pub mod policy_migration;
 pub mod policy_templates;
+mod production_user_store;
 pub mod rocksdb_store;
 pub mod service_jwt;
 pub mod user_store;
@@ -49,6 +50,7 @@ pub use policy_migration::migrate_policy_csv;
 pub use policy_templates::{
     get_template, get_templates, PolicyTemplate, ServicePolicyRule, SERVICE_BASE_POLICIES,
 };
+pub use production_user_store::ProductionUserStore;
 pub use rocksdb_store::RocksDbUserStore;
 pub use user_store::{
     decode_pubkey_base64, pubkey_fingerprint, AccountKeyCustody, DeviceRecord, DeviceStore,

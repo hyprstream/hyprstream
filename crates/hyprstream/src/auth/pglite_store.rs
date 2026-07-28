@@ -8,11 +8,9 @@
 //! against its own connection pool. PGlite and Postgres share one schema so
 //! relational identities are portable between local and server deployments.
 //!
-//! The shared `Arc<PGlite>` handle (#1351) is injected via
-//! [`PgliteUserStore::from_database`]; AppView inventory and credential
-//! records then share one embedded database. Opening a second PGlite handle
-//! against the same directory is unsafe — there is exactly one connection
-//! owner, and #1378's server-side wiring must not create a competing one.
+//! The store owns one shared `Arc<PGlite>` handle. Opening a second PGlite
+//! handle against the same directory is unsafe — there is exactly one
+//! connection owner.
 //!
 //! # #1370 R4 hardening preserved
 //!
@@ -145,17 +143,13 @@ impl PgliteUserStore {
     ///
     /// Deployment key material is loaded before the database opens. There is
     /// no production constructor that can omit encryption.
-    pub async fn open(data_dir: impl AsRef<Path>) -> Result<Self> {
+    pub(crate) async fn open_admitted(
+        data_dir: impl AsRef<Path>,
+        _permit: &super::production_user_store::ProductionStorePermit,
+    ) -> Result<Self> {
         let cipher = ColumnCipher::from_deployment_env()
             .context("load deployment UserStore encryption configuration")?;
         let database = Arc::new(PGlite::open(data_dir).await.context("opening PGlite")?);
-        Self::with_cipher(database, cipher).await
-    }
-
-    /// Construct on an already-open production PGlite handle.
-    pub async fn from_database(database: Arc<PGlite>) -> Result<Self> {
-        let cipher = ColumnCipher::from_deployment_env()
-            .context("load deployment UserStore encryption configuration")?;
         Self::with_cipher(database, cipher).await
     }
 
@@ -169,7 +163,8 @@ impl PgliteUserStore {
         Ok(Self { database, cipher })
     }
 
-    pub fn database(&self) -> Arc<PGlite> {
+    #[cfg(test)]
+    fn database(&self) -> Arc<PGlite> {
         Arc::clone(&self.database)
     }
 
@@ -374,6 +369,9 @@ fn decode_external_identity(row: &Row) -> Result<ExternalIdentityBinding> {
 fn hosted_backend(error: impl Into<anyhow::Error>) -> HostedAccountProvisionError {
     HostedAccountProvisionError::Backend(error.into())
 }
+
+#[cfg(not(test))]
+impl super::user_store::private::Sealed for PgliteUserStore {}
 
 #[async_trait]
 impl UserStore for PgliteUserStore {
