@@ -1,0 +1,139 @@
+name: Publish browser WASM SDK
+
+on:
+  pull_request:
+    paths:
+      - 'crates/hyprstream-rpc-std/**'
+      - 'crates/hyprstream-rpc/**'
+      - 'crates/hyprstream-vfs/**'
+      - '.github/scripts/package-rpc-std-wasm.sh'
+      - '.github/scripts/verify-rpc-std-wasm-package.mjs'
+      - '.github/workflows/publish-rpc-std-wasm.yml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+  push:
+    branches: ['main']
+    tags: ['hyprstream-rpc-std-v*']
+  workflow_dispatch:
+
+# Build/PR jobs cannot publish. Each publishing job receives only an ephemeral
+# GitHub OIDC identity for npm trusted publishing; no npm token is supported.
+permissions:
+  contents: read
+
+concurrency:
+  group: rpc-std-wasm-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  NPM_REGISTRY: https://registry.npmjs.org
+  WASM_PACK_VERSION: 0.13.1
+
+jobs:
+  build-package-smoke:
+    name: Build once, package, and test clean install
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install Cap'n Proto
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends capnproto
+
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@1.97.0
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Install Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Install pinned wasm-pack
+        uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-pack@0.13.1
+
+      - name: Build, pack, and smoke test
+        run: bash .github/scripts/package-rpc-std-wasm.sh
+        env:
+          PACKAGE_CHANNEL: ${{ github.ref == 'refs/heads/main' && 'staging' || startsWith(github.ref, 'refs/tags/hyprstream-rpc-std-v') && 'production' || 'ci' }}
+
+      - name: Upload exact package and integrity evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: hyprstream-rpc-std-wasm-${{ github.sha }}
+          path: dist/hyprstream-rpc-std-wasm/
+          if-no-files-found: error
+          retention-days: 30
+
+      # npm publish --provenance supplies registry-side Sigstore evidence. This
+      # additional GitHub attestation covers the pre-publish tarball consumed by
+      # downstream www and can be verified before a registry publication exists.
+      - name: Attest packaged tarball provenance
+        if: github.event_name == 'push'
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: dist/hyprstream-rpc-std-wasm/*.tgz
+
+  publish-staging:
+    name: Publish main to staging dist-tag
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: build-package-smoke
+    runs-on: ubuntu-latest
+    environment: npm-staging
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: Install OIDC-capable npm CLI
+        run: npm install --global npm@11.6.2
+      - uses: actions/download-artifact@v4
+        with:
+          name: hyprstream-rpc-std-wasm-${{ github.sha }}
+          path: dist/hyprstream-rpc-std-wasm
+      - name: Verify the exact build artifact
+        id: package
+        run: echo "tarball=$(node .github/scripts/verify-rpc-std-wasm-package.mjs dist/hyprstream-rpc-std-wasm staging)" >> "$GITHUB_OUTPUT"
+      - name: Publish only under staging
+        run: npm publish "${{ steps.package.outputs.tarball }}" --registry "$NPM_REGISTRY" --tag staging --access public --provenance
+
+  publish-production:
+    name: Publish protected release tag
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/hyprstream-rpc-std-v')
+    needs: build-package-smoke
+    runs-on: ubuntu-latest
+    environment: npm-production
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: Install OIDC-capable npm CLI
+        run: npm install --global npm@11.6.2
+      - uses: actions/download-artifact@v4
+        with:
+          name: hyprstream-rpc-std-wasm-${{ github.sha }}
+          path: dist/hyprstream-rpc-std-wasm
+      - name: Verify exact semver, tag, and integrity
+        id: package
+        run: echo "tarball=$(node .github/scripts/verify-rpc-std-wasm-package.mjs dist/hyprstream-rpc-std-wasm production)" >> "$GITHUB_OUTPUT"
+      - name: Publish immutable production semver
+        run: npm publish "${{ steps.package.outputs.tarball }}" --registry "$NPM_REGISTRY" --tag latest --access public --provenance
