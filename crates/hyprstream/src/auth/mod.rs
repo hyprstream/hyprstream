@@ -14,8 +14,7 @@ pub mod jwt;
 pub mod key_rotation;
 pub mod mesh_trust;
 pub mod op_log;
-#[cfg(feature = "pglite")]
-mod encrypted_columns;
+pub mod encrypted_columns;
 #[cfg(feature = "pglite")]
 pub mod pglite_store;
 mod policy_manager;

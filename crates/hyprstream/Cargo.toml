@@ -27,6 +27,7 @@ path = "src/bin/main.rs"
 bytes.workspace = true
 pglite-rs = { workspace = true, optional = true }
 aes-gcm-siv.workspace = true             # At-rest UserStore envelope encryption (#1377)
+aes.workspace = true                     # Enable ZeroizeOnDrop on AES key schedules (#1377 M5)
 futures.workspace = true
 tokio.workspace = true
 tonic.workspace = true
@@ -227,6 +228,7 @@ cuda = []
 valkey = ["dep:fred"]  # Enable Valkey/Redis-backed user and token stores
 pglite = ["dep:pglite-rs"]  # Enable PGlite embedded relational UserStore (#1376)
 credential-pds = ["pglite"]  # Production credential/PDS service profile; intentionally excludes metrics/DuckDB
+userstore-plaintext-test = []  # NON-PRODUCTION: enables plaintext store constructors for migration/tests; credential-pds MUST NOT select this
 metrics = ["dep:hyprstream-metrics", "dep:hyprstream-flight"]  # Separate DuckDB-backed metrics/inference/Flight service build
 bnb = ["dep:bitsandbytes-sys"]  # Enable bitsandbytes KV cache quantization (requires compatible ROCm/CUDA)
 xet = ["git2db/xet-storage"]  # Enable XET large file storage
