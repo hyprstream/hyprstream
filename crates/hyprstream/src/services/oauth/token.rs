@@ -1270,6 +1270,52 @@ async fn issue_token_with_refresh(
         sub.to_owned()
     };
     let token_issuer = state.issuer_for_scopes(&scopes);
+    let issue_oidc_id_token =
+        scopes.iter().any(|scope| scope == "openid") && initial_auth && state.signing_key.is_some();
+    // Resolve the durable OIDC subject before issuing or persisting any token.
+    // A database outage must not change `sub` from the stable UUID to the local
+    // username, and a successful access token must not escape after a failed
+    // profile read.
+    let oidc_profile = if issue_oidc_id_token {
+        let Some(user_store) = state.user_store_reader() else {
+            tracing::error!(local_subject = %sub, "rejecting OIDC token issuance: relational user store is not configured");
+            return token_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "server_error",
+                Some("credential store is unavailable"),
+            );
+        };
+        let profile = match user_store.get_profile(sub).await {
+            Ok(Some(profile)) => profile,
+            Ok(None) => {
+                tracing::error!(local_subject = %sub, "rejecting OIDC token issuance: credential profile is missing");
+                return token_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "server_error",
+                    Some("credential profile is missing"),
+                );
+            }
+            Err(error) => {
+                tracing::error!(local_subject = %sub, %error, "rejecting OIDC token issuance: credential lookup failed");
+                return token_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "server_error",
+                    Some("credential store is unavailable"),
+                );
+            }
+        };
+        if profile.sub.as_deref().is_none_or(str::is_empty) {
+            tracing::error!(local_subject = %sub, "rejecting OIDC token issuance: stable subject is missing");
+            return token_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "server_error",
+                Some("credential profile has no stable subject"),
+            );
+        }
+        Some(profile)
+    } else {
+        None
+    };
 
     let result = state
         .policy_client
@@ -1350,8 +1396,7 @@ async fn issue_token_with_refresh(
 
             // Build OIDC id_token when: scope includes "openid", signing key is available,
             // and this is an initial authorization (not refresh/device per OIDC Core § 12.2).
-            let has_openid = scopes.iter().any(|s| s == "openid");
-            let id_token = if has_openid && initial_auth && state.signing_key.is_some() {
+            let id_token = if issue_oidc_id_token {
                 let id_exp = now + 300; // 5-minute id_token lifetime
                 let mut id_claims = hyprstream_rpc::auth::IdTokenClaims::new(
                     token_issuer,
@@ -1365,22 +1410,21 @@ async fn issue_token_with_refresh(
                 .with_tenant(hosted_account_tenant.clone());
 
                 // Add profile claims based on requested scopes.
-                if let Some(user_store) = state.user_store_reader() {
-                    if let Ok(Some(profile)) = user_store.get_profile(sub).await {
-                        if scopes.iter().any(|s| s == "profile") {
-                            id_claims.preferred_username = Some(sub.to_owned());
-                            id_claims.name = profile.name;
-                        }
-                        if scopes.iter().any(|s| s == "email") {
-                            id_claims.email = profile.email;
-                            id_claims.email_verified = profile.email_verified;
-                        }
-                        // Use stable UUID sub if available.
-                        if let Some(uuid_sub) = profile.sub {
-                            id_claims.sub = uuid_sub;
-                        }
-                    }
+                let Some(profile) = oidc_profile else {
+                    unreachable!("OIDC profile was loaded before token issuance")
+                };
+                if scopes.iter().any(|s| s == "profile") {
+                    id_claims.preferred_username = Some(sub.to_owned());
+                    id_claims.name = profile.name;
                 }
+                if scopes.iter().any(|s| s == "email") {
+                    id_claims.email = profile.email;
+                    id_claims.email_verified = profile.email_verified;
+                }
+                let Some(stable_sub) = profile.sub else {
+                    unreachable!("stable OIDC subject was validated before token issuance")
+                };
+                id_claims.sub = stable_sub;
 
                 // SAFETY: signing_key.is_some() checked in the outer condition.
                 let Some(ref sk) = state.signing_key else {

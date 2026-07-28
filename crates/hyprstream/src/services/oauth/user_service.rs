@@ -98,9 +98,13 @@ impl UserService {
     /// Get a user by username.
     pub async fn get(&self, username: &str) -> Result<Option<UserInfo>> {
         let profile = self.store.get_profile(username).await?;
+
         match profile {
             Some(profile) => {
                 let pubkeys = self.store.list_pubkeys(username).await?;
+                let sub = profile
+                    .sub
+                    .ok_or_else(|| anyhow!("User '{username}' has no stable subject"))?;
                 // For backward compat, use first pubkey as the primary
                 let primary_pubkey = pubkeys.first()
                     .map(|pk| STANDARD.encode(pk.pubkey.as_bytes()))
@@ -108,7 +112,7 @@ impl UserService {
 
                 Ok(Some(UserInfo {
                     username: username.to_owned(),
-                    sub: profile.sub.unwrap_or_default(),
+                    sub,
                     pubkey_base64: primary_pubkey,
                     name: profile.name,
                     email: profile.email,
@@ -139,10 +143,13 @@ impl UserService {
 
         let users = results
             .into_iter()
-            .map(|(username, profile)| {
-                UserInfo {
+            .map(|(username, profile)| -> Result<UserInfo> {
+                let sub = profile
+                    .sub
+                    .ok_or_else(|| anyhow!("User '{username}' has no stable subject"))?;
+                Ok(UserInfo {
                     username,
-                    sub: profile.sub.unwrap_or_default(),
+                    sub,
                     pubkey_base64: String::new(), // Omitted in list for size; use get() for full info
                     name: profile.name,
                     email: profile.email,
@@ -151,9 +158,9 @@ impl UserService {
                     external_id: profile.external_id,
                     atproto_did: profile.atproto_did,
                     pubkeys: vec![], // Omitted in list
-                }
+                })
             })
-            .collect();
+            .collect::<Result<Vec<_>>>()?;
 
         Ok(UserList {
             users,
