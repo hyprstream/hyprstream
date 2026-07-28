@@ -316,7 +316,10 @@ impl ColumnCipher {
         Ok(NewUserKey { root, wrapped })
     }
 
-    pub(crate) async fn open_user_key(&self, wrapped: &[u8]) -> Result<Zeroizing<[u8; ROOT_DEK_BYTES]>> {
+    pub(crate) async fn open_user_key(
+        &self,
+        wrapped: &[u8],
+    ) -> Result<Zeroizing<[u8; ROOT_DEK_BYTES]>> {
         let sealer = Arc::clone(&self.sealer);
         let wrapped = wrapped.to_vec();
         let plaintext = tokio::task::spawn_blocking(move || sealer.open(&wrapped))
@@ -410,7 +413,12 @@ impl ColumnCipher {
     ) -> Result<Option<Vec<u8>>> {
         match value {
             None => Ok(None),
-            Some(text) => Ok(Some(self.encrypt(root, username, column, text.as_bytes())?)),
+            Some(text) => Ok(Some(self.encrypt(
+                root,
+                username,
+                column,
+                text.as_bytes(),
+            )?)),
         }
     }
 
@@ -456,6 +464,7 @@ impl ColumnCipher {
     /// Construct a cipher backed by an in-process test sealer. For tests and
     /// migration tooling only — production MUST use [`Self::from_age_config`]
     /// or [`Self::new`] with a trust-mint-backed sealer.
+    #[cfg(any(test, feature = "userstore-plaintext-test"))]
     pub(crate) fn test_cipher() -> Self {
         Self::new(Arc::new(TestDekSealer))
     }
@@ -464,19 +473,25 @@ impl ColumnCipher {
 /// In-process DekSealer for tests and migration. Uses a fixed AES key — NOT
 /// for production. Exposed `pub(crate)` so store test modules can construct
 /// a cipher without shelling out to the `age` CLI.
+#[cfg(any(test, feature = "userstore-plaintext-test"))]
 pub(crate) struct TestDekSealer;
 
+#[cfg(any(test, feature = "userstore-plaintext-test"))]
 impl DekSealer for TestDekSealer {
-    pub(crate) fn seal(&self, plaintext: &[u8]) -> Result<Vec<u8>> {
-        let cipher = Aes256GcmSiv::new_from_slice(&TEST_KEK).unwrap();
+    fn seal(&self, plaintext: &[u8]) -> Result<Vec<u8>> {
+        let cipher = Aes256GcmSiv::new_from_slice(&TEST_KEK)
+            .map_err(|_| anyhow!("initialize test DEK sealer"))?;
         let mut nonce = [0u8; NONCE_BYTES];
         rand::rngs::OsRng.fill_bytes(&mut nonce);
         let ct = cipher
             .encrypt(
                 Nonce::from_slice(&nonce),
-                Payload { msg: plaintext, aad: TEST_WRAP_AAD },
+                Payload {
+                    msg: plaintext,
+                    aad: TEST_WRAP_AAD,
+                },
             )
-            .unwrap();
+            .map_err(|_| anyhow!("seal test DEK"))?;
         let mut out = nonce.to_vec();
         out.extend_from_slice(&ct);
         Ok(out)
@@ -487,18 +502,24 @@ impl DekSealer for TestDekSealer {
             ciphertext.len() >= NONCE_BYTES + TAG_BYTES,
             "test wrapped key is truncated"
         );
-        let cipher = Aes256GcmSiv::new_from_slice(&TEST_KEK).unwrap();
+        let cipher = Aes256GcmSiv::new_from_slice(&TEST_KEK)
+            .map_err(|_| anyhow!("initialize test DEK sealer"))?;
         let plaintext = cipher
             .decrypt(
                 Nonce::from_slice(&ciphertext[..NONCE_BYTES]),
-                Payload { msg: &ciphertext[NONCE_BYTES..], aad: TEST_WRAP_AAD },
+                Payload {
+                    msg: &ciphertext[NONCE_BYTES..],
+                    aad: TEST_WRAP_AAD,
+                },
             )
             .map_err(|_| anyhow!("test wrapped key authentication failed"))?;
         Ok(Zeroizing::new(plaintext))
     }
 }
 
+#[cfg(any(test, feature = "userstore-plaintext-test"))]
 const TEST_KEK: [u8; ROOT_DEK_BYTES] = [0xA7; ROOT_DEK_BYTES];
+#[cfg(any(test, feature = "userstore-plaintext-test"))]
 const TEST_WRAP_AAD: &[u8] = b"hyprstream.userstore.test-wrap.v1";
 
 fn field_context(username: &str, column: EncryptedColumn<'_>) -> Result<Vec<u8>> {
