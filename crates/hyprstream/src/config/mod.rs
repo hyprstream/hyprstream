@@ -2595,6 +2595,7 @@ impl HyprConfigBuilder {
             account: self.account,
             #[cfg(feature = "ledger")]
             ledger: Default::default(),
+            rds: Default::default(),
         }
     }
 

@@ -271,7 +271,7 @@ ledger = ["dep:hyprstream-ledger"]
 # configured the Postgres store is selected and is FATAL-on-unavailable —
 # never a silent local fallback. Honors D2 (signed bytes verbatim as
 # authoritative source-of-truth; SQL rows are a projection-free KV shell).
-pds-postgres = ["dep:deadpool-postgres", "dep:tokio-postgres", "dep:tokio-postgres-rustls", "dep:rustls", "dep:rustls-native-certs", "dep:rustls-pemfile"]
+pds-postgres = ["dep:deadpool-postgres", "dep:tokio-postgres", "dep:tokio-postgres-rustls", "dep:rustls-native-certs"]
 
 [build-dependencies]
 capnpc.workspace = true  # Cap'n Proto schema compiler

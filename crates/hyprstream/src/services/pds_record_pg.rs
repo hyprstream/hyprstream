@@ -270,7 +270,10 @@ async fn build_pool(
     url: &str,
     root_cert: Option<&std::path::Path>,
 ) -> AnyResult<deadpool_postgres::Pool> {
-    let cfg = deadpool_postgres::Config::from_url(url);
+    let cfg = deadpool_postgres::Config {
+        url: Some(url.to_owned()),
+        ..Default::default()
+    };
 
     let tls = tokio_postgres_rustls::MakeRustlsConnect::new(build_rustls_config(root_cert)?);
     let pool = cfg
@@ -287,15 +290,12 @@ fn build_rustls_config(
     let mut root_store = rustls::RootCertStore::empty();
 
     // Add the platform's trusted roots.
-    match rustls_native_certs::load_native_certs() {
-        Ok(certs) => {
-            for cert in certs {
-                let _ = root_store.add(cert);
-            }
-        }
-        Err(e) => {
-            tracing::warn!("failed to load native TLS roots for RDS: {e}");
-        }
+    let native = rustls_native_certs::load_native_certs();
+    for cert in native.certs {
+        let _ = root_store.add(cert);
+    }
+    for e in native.errors {
+        tracing::warn!("failed to load a native TLS root for RDS: {e}");
     }
 
     // Additively load an operator-provided root (private-CA RDS).
@@ -405,7 +405,7 @@ async fn cmd_get_batch(
     pool: &deadpool_postgres::Pool,
     keys: &[Vec<u8>],
 ) -> AnyResult<Vec<Option<Vec<u8>>>> {
-    let conn = pool
+    let mut conn = pool
         .get()
         .await
         .map_err(|e| anyhow::anyhow!("RDS get_batch: connection acquisition failed: {e}"))?;
@@ -526,6 +526,7 @@ async fn cmd_ping(pool: &deadpool_postgres::Pool) -> AnyResult<()> {
 }
 
 /// Send an error result on whatever reply channel the command carries.
+#[allow(clippy::match_same_arms)] // each arm's reply channel has a different payload type
 fn send_err(cmd: PgCmd, err: anyhow::Error) -> AnyResult<()> {
     match cmd {
         PgCmd::Get { reply, .. } => {
