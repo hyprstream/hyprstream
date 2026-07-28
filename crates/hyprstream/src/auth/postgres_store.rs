@@ -478,12 +478,36 @@ fn validate_pg_url(raw: &str) -> Result<()> {
         "credentials URL scheme must be postgresql:// or postgres://, got: {}",
         url.scheme()
     );
-    let host = url.host_str();
-    ensure!(
-        host.is_some_and(|h| !h.is_empty()),
-        "credentials URL must specify a nonempty DNS hostname (no host → \
-         driver defaults to local Unix socket)"
-    );
+    let host = url.host();
+    match host {
+        Some(url::Host::Domain(domain)) => {
+            // Reject localhost (including trailing-dot normalization).
+            let normalized = domain.trim_end_matches('.').to_ascii_lowercase();
+            ensure!(
+                normalized != "localhost",
+                "credentials URL host must be a remote DNS name, not localhost"
+            );
+            // The url crate treats 127.0.0.1 etc. as Domain for non-special
+            // schemes like postgresql://. Reject any domain that parses as
+            // an IPv4 address — only remote DNS names are valid RDS targets.
+            ensure!(
+                normalized.parse::<std::net::Ipv4Addr>().is_err(),
+                "credentials URL host must be a DNS name, not an IPv4 literal"
+            );
+        }
+        Some(url::Host::Ipv4(_)) => {
+            bail!("credentials URL host must be a DNS name, not an IPv4 literal");
+        }
+        Some(url::Host::Ipv6(_)) => {
+            bail!("credentials URL host must be a DNS name, not an IPv6 literal");
+        }
+        None => {
+            bail!(
+                "credentials URL must specify a nonempty DNS hostname \
+                 (no host → driver defaults to local Unix socket)"
+            );
+        }
+    }
     // Collect all sslmode query params by structural key match.
     let sslmodes: Vec<String> = url
         .query_pairs()
@@ -515,76 +539,96 @@ fn validate_pg_url(raw: &str) -> Result<()> {
 /// semantics). The URL is never passed to `tokio_postgres::Config::from_str`
 /// — individual fields are extracted from the parsed URL so no libpq sslmode
 /// parsing occurs.
-fn build_pool(config: Option<&PostgresUserStoreConfig>) -> Result<Pool> {
+/// Translate a validated v1.1 URL into a deadpool-postgres `PoolConfig`.
+///
+/// Extracted from `build_pool` so it can be causally tested without
+/// building a connection pool (which requires a TLS connector + host).
+/// Production `build_pool` calls THIS function — the test calls THIS
+/// function. If production changes the translation, the test breaks.
+fn build_pool_config(database_url: &str) -> Result<PoolConfig> {
+    let url = Url::parse(database_url)
+        .context("re-parsing validated credentials URL")?;
     let mut cfg = PoolConfig::new();
-
-    if let Some(config) = config {
-        // Parse the validated URL and populate deadpool Config fields
-        // individually — never pass the raw URL to the driver (it would
-        // choke on sslmode=verify-full).
-        let url = Url::parse(&config.database_url)
-            .context("re-parsing validated credentials URL")?;
-        cfg.host = url.host_str().map(|h| h.to_owned());
-        cfg.port = url.port();
-        let username = url.username();
-        if !username.is_empty() {
-            cfg.user = Some(username.to_owned());
-        }
-        if let Some(password) = url.password() {
-            cfg.password = Some(percent_decode(password));
-        }
-        let path = url.path().trim_start_matches('/');
-        if !path.is_empty() {
-            cfg.dbname = Some(path.to_owned());
-        }
-        // Copy non-security query params that deadpool Config knows about.
-        for (key, value) in url.query_pairs() {
-            match key.as_ref() {
-                "sslmode" | "sslrootcert" => { /* handled by connector */ }
-                "application_name" => {
-                    cfg.application_name = Some(value.into_owned());
-                }
-                _ => {}
-            }
-        }
-        // Translate verified sslmode=verify-full → driver Require + rustls.
-        cfg.ssl_mode = Some(SslMode::Require);
+    cfg.host = url.host_str().map(|h| h.to_owned());
+    cfg.port = url.port();
+    let username = url.username();
+    if !username.is_empty() {
+        cfg.user = Some(username.to_owned());
     }
+    if let Some(password) = url.password() {
+        cfg.password = Some(percent_decode(password));
+    }
+    let path = url.path().trim_start_matches('/');
+    if !path.is_empty() {
+        cfg.dbname = Some(path.to_owned());
+    }
+    for (key, value) in url.query_pairs() {
+        match key.as_ref() {
+            "sslmode" | "sslrootcert" => { /* handled by connector */ }
+            "application_name" => {
+                cfg.application_name = Some(value.into_owned());
+            }
+            _ => {}
+        }
+    }
+    cfg.ssl_mode = Some(SslMode::Require);
+    Ok(cfg)
+}
 
-    // Build a rustls TLS connector — TLS is mandatory for RDS.
-    let tls = {
-        let roots = match config.and_then(|c| c.ca_file.as_ref()) {
-            Some(ca_path) => {
-                let pem = std::fs::read(ca_path)
-                    .with_context(|| format!("reading TLS CA PEM from {}", ca_path.display()))?;
-                let mut reader = std::io::BufReader::new(pem.as_slice());
-                let mut store = RootCertStore::empty();
-                for cert in rustls_pemfile::certs(&mut reader) {
-                    let cert = cert.context("parsing TLS CA PEM")?;
-                    store
-                        .add(cert)
-                        .map_err(|e| anyhow!("invalid CA certificate in pinned PEM: {e}"))?;
-                }
-                ensure!(
-                    !store.is_empty(),
-                    "TLS CA PEM contained no certificates: {}",
-                    ca_path.display()
-                );
+/// Load TLS root certificates from the pinned CA file, or fall back to
+/// Mozilla roots (test/dev only). Extracted so the CA-loading path can
+/// be causally tested without building a full pool.
+fn load_ca_roots(ca_file: Option<&std::path::Path>) -> Result<RootCertStore> {
+    match ca_file {
+        Some(ca_path) => {
+            let pem = std::fs::read(ca_path)
+                .with_context(|| format!("reading TLS CA PEM from {}", ca_path.display()))?;
+            let mut reader = std::io::BufReader::new(pem.as_slice());
+            let mut store = RootCertStore::empty();
+            for cert in rustls_pemfile::certs(&mut reader) {
+                let cert = cert.context("parsing TLS CA PEM")?;
                 store
+                    .add(cert)
+                    .map_err(|e| anyhow!("invalid CA certificate in pinned PEM: {e}"))?;
             }
-            // Fallback: Mozilla roots (test/dev only — production always
-            // provides a pinned CA via from_env).
-            None => {
-                let mut store = RootCertStore::empty();
-                store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-                store
-            }
-        };
-        let client_config = rustls::ClientConfig::builder()
-            .with_root_certificates(roots)
-            .with_no_client_auth();
-        MakeRustlsConnect::new(client_config)
+            ensure!(
+                !store.is_empty(),
+                "TLS CA PEM contained no certificates: {}",
+                ca_path.display()
+            );
+            Ok(store)
+        }
+        None => {
+            let mut store = RootCertStore::empty();
+            store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+            Ok(store)
+        }
+    }
+}
+
+/// Build the deadpool-postgres connection pool with mandatory TLS.
+///
+/// **How `sslmode=verify-full` is delivered:**
+/// tokio-postgres 0.7.x does not accept `verify-full` as a libpq sslmode
+/// value (it accepts only `disable`/`prefer`/`require`). The v1.1 contract
+/// requirement is met by translating the validated `verify-full` policy into
+/// the driver's `SslMode::Require` (never plaintext) + a `MakeRustlsConnect`
+/// that performs CA-pinned hostname verification (the actual verify-full
+/// semantics). The URL is never passed to `tokio_postgres::Config::from_str`
+/// — individual fields are extracted from the parsed URL so no libpq sslmode
+/// parsing occurs.
+fn build_pool(config: Option<&PostgresUserStoreConfig>) -> Result<Pool> {
+    let cfg = match config {
+        Some(config) => build_pool_config(&config.database_url)?,
+        None => PoolConfig::new(),
     };
+
+    let ca_file = config.and_then(|c| c.ca_file.as_deref());
+    let roots = load_ca_roots(ca_file)?;
+    let client_config = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let tls = MakeRustlsConnect::new(client_config);
 
     let builder = cfg
         .builder(tls)
@@ -1881,6 +1925,30 @@ mod tests {
     }
 
     #[test]
+    fn validate_url_rejects_localhost() {
+        let url = "postgresql://user:secret@localhost/db?sslmode=verify-full";
+        assert!(validate_pg_url(url).is_err());
+    }
+
+    #[test]
+    fn validate_url_rejects_localhost_trailing_dot() {
+        let url = "postgresql://user:secret@localhost./db?sslmode=verify-full";
+        assert!(validate_pg_url(url).is_err());
+    }
+
+    #[test]
+    fn validate_url_rejects_ipv4_literal() {
+        let url = "postgresql://user:secret@127.0.0.1/db?sslmode=verify-full";
+        assert!(validate_pg_url(url).is_err());
+    }
+
+    #[test]
+    fn validate_url_rejects_ipv6_literal() {
+        let url = "postgresql://user:secret@[::1]/db?sslmode=verify-full";
+        assert!(validate_pg_url(url).is_err());
+    }
+
+    #[test]
     fn validate_url_rejects_bypass_sslmode_in_password() {
         // P0-2 bypass: "sslmode=verify-full" in the password field passes
         // substring checks but has NO sslmode query parameter. The structural
@@ -1901,43 +1969,45 @@ mod tests {
         assert!(validate_pg_url(url).is_err());
     }
 
-    /// Prove that a validated v1.1 URL produces a `PoolConfig` whose fields
-    /// are populated correctly and whose `ssl_mode` is `Require` (the driver
-    /// side of the verify-full translation). This does NOT connect — it only
-    /// checks the in-memory config struct.
+    /// Causal test: calls the PRODUCTION `build_pool_config` (not a
+    /// reimplementation) and asserts the returned `PoolConfig` has the
+    /// correct fields. If production changes the translation (e.g. reverts
+    /// to Prefer, removes field extraction, or sets cfg.url), THIS test
+    /// breaks — unlike the previous version which reimplemented the logic
+    /// and stayed green through any production regression.
     #[test]
-    fn validated_url_produces_correct_pool_config() {
-        let raw = "postgresql://myrole:mypass@rdshost.example:5432/hyprstream?sslmode=verify-full";
+    fn build_pool_config_translates_validated_url_causally() {
+        let raw = "postgresql://myrole:mypass@rdshost.example:5432/hyprstream?sslmode=verify-full&application_name=hyprstream";
         validate_pg_url(raw).unwrap();
-        let url = Url::parse(raw).unwrap();
-
-        let mut cfg = PoolConfig::new();
-        cfg.host = url.host_str().map(|h| h.to_owned());
-        cfg.port = url.port();
-        let username = url.username();
-        if !username.is_empty() {
-            cfg.user = Some(username.to_owned());
-        }
-        if let Some(password) = url.password() {
-            cfg.password = Some(
-                percent_encoding::percent_decode_str(password)
-                    .decode_utf8_lossy()
-                    .into_owned(),
-            );
-        }
-        let path = url.path().trim_start_matches('/');
-        if !path.is_empty() {
-            cfg.dbname = Some(path.to_owned());
-        }
-        cfg.ssl_mode = Some(SslMode::Require);
+        let cfg = build_pool_config(raw).unwrap();
 
         assert_eq!(cfg.host.as_deref(), Some("rdshost.example"));
         assert_eq!(cfg.port, Some(5432));
         assert_eq!(cfg.user.as_deref(), Some("myrole"));
         assert_eq!(cfg.password.as_deref(), Some("mypass"));
         assert_eq!(cfg.dbname.as_deref(), Some("hyprstream"));
+        assert_eq!(cfg.application_name.as_deref(), Some("hyprstream"));
         assert_eq!(cfg.ssl_mode, Some(SslMode::Require));
-        // The raw URL is NEVER stored in cfg.url — it would choke the driver.
+        // The raw URL must NEVER be stored — tokio-postgres 0.7.x chokes on
+        // sslmode=verify-full. This is the P0-1 fix.
         assert!(cfg.url.is_none());
+    }
+
+    /// Causal test: the production `load_ca_roots` function with no CA file
+    /// (test/dev fallback) returns a non-empty Mozilla root store.
+    #[test]
+    fn load_ca_roots_fallback_returns_mozilla_roots() {
+        let store = load_ca_roots(None).unwrap();
+        assert!(!store.is_empty(), "webpki-roots fallback must not be empty");
+    }
+
+    /// Causal test: the production `load_ca_roots` function fails on a
+    /// nonexistent CA file (fail-closed, not silently using fallback).
+    #[test]
+    fn load_ca_roots_rejects_nonexistent_file() {
+        let result = load_ca_roots(Some(std::path::Path::new(
+            "/nonexistent/ca-rds.pem",
+        )));
+        assert!(result.is_err());
     }
 }
