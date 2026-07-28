@@ -8,7 +8,7 @@
 //! against its own connection pool. PGlite and Postgres share one schema so
 //! relational identities are portable between local and server deployments.
 //!
-//! The shared `Arc<PGlite>` handle (#1351) is injected via
+//! The shared `Arc<PGlite>` handle (#1351) can be injected via
 //! [`PgliteUserStore::from_database`]; AppView inventory and credential
 //! records then share one embedded database. Opening a second PGlite handle
 //! against the same directory is unsafe — there is exactly one connection
@@ -37,7 +37,6 @@ use anyhow::{anyhow, bail, ensure, Context, Result};
 use async_trait::async_trait;
 use ed25519_dalek::VerifyingKey;
 use pglite::{PGlite, Row};
-#[cfg(feature = "userstore-plaintext-test")]
 use std::path::Path;
 use std::sync::Arc;
 use zeroize::Zeroizing;
@@ -122,27 +121,28 @@ pub struct PgliteUserStore {
 }
 
 impl PgliteUserStore {
-    /// **TEST/MIGRATION ONLY** — uses an in-process test cipher. Production
-    /// wiring MUST use [`Self::with_cipher`] with a trust-mint-backed cipher.
-    /// Gated behind `userstore-plaintext-test` (which `credential-pds` does
-    /// NOT select) so production builds cannot reach this path.
-    #[cfg(feature = "userstore-plaintext-test")]
+    /// Open the production relational credential store.
+    ///
+    /// Construction loads the deployment age recipient/identity ring and
+    /// fails before opening the database when key material is absent. There is
+    /// no production constructor that can omit the cipher.
     pub async fn open(data_dir: impl AsRef<Path>) -> Result<Self> {
+        let cipher = ColumnCipher::from_deployment_env()
+            .context("load deployment UserStore encryption configuration")?;
         let database = Arc::new(PGlite::open(data_dir).await.context("opening PGlite")?);
-        Self::from_database(database).await
+        Self::with_cipher(database, cipher).await
     }
 
-    /// **TEST/MIGRATION ONLY** — see [`Self::open`].
-    #[cfg(feature = "userstore-plaintext-test")]
+    /// Construct on an already-open production PGlite handle.
     pub async fn from_database(database: Arc<PGlite>) -> Result<Self> {
-        Self::with_cipher(database, ColumnCipher::test_cipher()).await
+        let cipher = ColumnCipher::from_deployment_env()
+            .context("load deployment UserStore encryption configuration")?;
+        Self::with_cipher(database, cipher).await
     }
 
-    /// The PRODUCTION constructor — requires a valid [`ColumnCipher`] for
-    /// at-rest envelope encryption. Every BYTEA value column is sealed
-    /// before storage and unsealed on read.
-    #[allow(dead_code)] // deployment-wiring call-site is #1378
-    pub(crate) async fn with_cipher(database: Arc<PGlite>, cipher: ColumnCipher) -> Result<Self> {
+    /// Internal constructor. Production callers cannot supply or omit the
+    /// cipher; tests in this module use it to inject a non-shelling sealer.
+    async fn with_cipher(database: Arc<PGlite>, cipher: ColumnCipher) -> Result<Self> {
         database
             .exec(USERSTORE_SCHEMA)
             .await

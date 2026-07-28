@@ -1226,10 +1226,12 @@ pub struct OAuthConfig {
     /// When set, this OAuth instance terminates the deployment's did:web host:
     /// `/.well-known/did.json` serves `<dir>/did.json` (replacing the dynamic
     /// node document), `/.well-known/at9p/<cid>.cbor` serves the cluster at9p
-    /// capsule, and `/.well-known/deployment/registry-service.jwt` serves the
-    /// current CA-signed registry deployment credential. All are public,
-    /// integrity-anchored bytes re-read on every request so an external
-    /// credential-refresh agent needs no restart.
+    /// capsule, `/.well-known/deployment/deployment-authority.log.json` serves
+    /// the current root-anchored authority log, and
+    /// `/.well-known/deployment/registry-service.jwt` serves the current
+    /// registry credential. All are public, integrity-anchored bytes re-read
+    /// on every request so an external credential-refresh agent needs no
+    /// restart.
     #[serde(default)]
     pub deployment_well_known_dir: Option<PathBuf>,
 
@@ -1460,12 +1462,24 @@ fn default_oauth_host() -> String { "0.0.0.0".to_owned() }
 fn default_oauth_port() -> u16 { 6791 }
 
 /// Which backend stores user credentials and refresh tokens.
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum CredentialsBackend {
     #[default]
     Rocksdb,
+    Pglite,
     Valkey,
+}
+
+fn default_credentials_backend() -> CredentialsBackend {
+    #[cfg(feature = "credential-pds")]
+    {
+        CredentialsBackend::Pglite
+    }
+    #[cfg(not(feature = "credential-pds"))]
+    {
+        CredentialsBackend::Rocksdb
+    }
 }
 
 /// Valkey connection settings (used when `backend = "valkey"`).
@@ -1488,16 +1502,29 @@ impl Default for ValkeyCredentialsConfig {
 /// # Example TOML
 /// ```toml
 /// [credentials]
+/// backend = "pglite"
+///
+/// # Or, for a networked backend:
+/// [credentials]
 /// backend = "valkey"
 /// [credentials.valkey]
 /// url = "redis://127.0.0.1:6379"
 /// ```
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CredentialsConfig {
-    #[serde(default)]
+    #[serde(default = "default_credentials_backend")]
     pub backend: CredentialsBackend,
     #[serde(default)]
     pub valkey: ValkeyCredentialsConfig,
+}
+
+impl Default for CredentialsConfig {
+    fn default() -> Self {
+        Self {
+            backend: default_credentials_backend(),
+            valkey: ValkeyCredentialsConfig::default(),
+        }
+    }
 }
 fn default_oauth_scopes() -> Vec<String> {
     // The DEFAULT GRANT set when a client omits `scope`. atproto transition
@@ -3029,6 +3056,21 @@ impl From<&crate::config::server::SamplingParamDefaults> for SamplingParams {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "credential-pds")]
+    #[test]
+    fn credential_pds_defaults_to_encrypted_pglite() {
+        assert_eq!(CredentialsConfig::default().backend, CredentialsBackend::Pglite);
+        let partial: CredentialsConfig =
+            toml::from_str("").unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(partial.backend, CredentialsBackend::Pglite);
+    }
+
+    #[cfg(not(feature = "credential-pds"))]
+    #[test]
+    fn general_build_retains_rocksdb_default() {
+        assert_eq!(CredentialsConfig::default().backend, CredentialsBackend::Rocksdb);
+    }
+
     #[test]
     fn standalone_inference_config_rejects_partial_stage_without_subset_loader() {
         let model = tempfile::TempDir::new().unwrap_or_else(|e| panic!("{e}"));

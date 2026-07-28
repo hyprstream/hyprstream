@@ -11,7 +11,8 @@ use tracing::info;
 
 // Core application imports
 use hyprstream_core::cli::commands::{
-    ExecutionMode, FlightArgs, ImageCommand, ServiceAction, TrainingAction, TuiAction, WorkerAction,
+    ExecutionMode, FlightArgs, ImageCommand, ServiceAction, TrainingAction, TrustCommand, TuiAction,
+    WorkerAction,
 };
 use hyprstream_core::cli::quick::{QuickCommand, RemoteQuickCommand, WorktreeQuickCommand};
 use hyprstream_core::cli::schema_cli;
@@ -135,6 +136,13 @@ fn build_cli() -> ClapCommand {
     app = app.subcommand(
         <ServiceAction as ClapSubcommand>::augment_subcommands(
             ClapCommand::new("service").about("Service management and lifecycle commands"),
+        ),
+    );
+
+    // Out-of-band deployment trust authority tooling.
+    app = app.subcommand(
+        <TrustCommand as ClapSubcommand>::augment_subcommands(
+            ClapCommand::new("trust").about("Mint and verify deployment trust artifacts"),
         ),
     );
 
@@ -1724,6 +1732,16 @@ fn main() -> Result<()> {
 
     // Parse CLI arguments using builder API
     let matches = build_cli().get_matches();
+
+    // Trust minting is intentionally independent of local service/config
+    // bootstrap. It must work on an offline operator machine and must never
+    // start a registry client or load instance credentials.
+    if let Some(("trust", sub_m)) = matches.subcommand() {
+        let command =
+            TrustCommand::from_arg_matches(sub_m).map_err(|error| anyhow::anyhow!("{error}"))?;
+        hyprstream_core::cli::trust::handle_trust_command(command)?;
+        return Ok(());
+    }
 
     // Extract global args
     let config_path = matches

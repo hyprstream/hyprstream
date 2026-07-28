@@ -264,8 +264,9 @@ pub fn create_app(state: Arc<OAuthState>, cors_config: &crate::config::CorsConfi
     if state.deployment_well_known_dir.is_some() {
         // #1137 serving half — deployment mode: this host terminates the
         // deployment's did:web. The static router owns `/.well-known/did.json`
-        // plus the at9p capsule and registry credential endpoints (each 404s
-        // when its file is absent — never a silent fall-through).
+        // plus the at9p capsule, authority log, and registry credential
+        // endpoints (each 404s when its file is absent — never a silent
+        // fall-through).
         did_router = did_router.merge(deployment_well_known::router(
             state.deployment_well_known_dir.clone(),
         ));
@@ -588,7 +589,9 @@ impl Spawnable for OAuthService {
             })?;
 
             // Load the user store and token store based on configured backend.
-            // Failure is non-fatal; endpoints will report "not configured" instead.
+            // Legacy backends retain their optional behavior. The encrypted
+            // PGlite production profile fails startup closed when deployment
+            // key material or the database is unavailable.
             use crate::config::CredentialsBackend;
             let credentials_config = crate::config::HyprConfig::load()
                 .map(|c| c.credentials)
@@ -608,6 +611,29 @@ impl Spawnable for OAuthService {
                             tracing::warn!("Could not open user store (endpoints will report 'not configured'): {}", e);
                             None
                         }
+                    }
+                }
+                CredentialsBackend::Pglite => {
+                    #[cfg(feature = "pglite")]
+                    {
+                        let path = credentials_dir.join("users.pglite");
+                        let store = crate::auth::PgliteUserStore::open(&path)
+                            .await
+                            .map_err(|e| hyprstream_rpc::error::RpcError::SpawnFailed(
+                                format!(
+                                    "encrypted PGlite UserStore startup failed at {}: {e:#}",
+                                    path.display()
+                                ),
+                            ))?;
+                        info!("Encrypted user store (PGlite) opened at {:?}", path);
+                        Some(Arc::new(store))
+                    }
+                    #[cfg(not(feature = "pglite"))]
+                    {
+                        return Err(hyprstream_rpc::error::RpcError::SpawnFailed(
+                            "credentials.backend = \"pglite\" but binary was not compiled with --features pglite"
+                                .to_owned(),
+                        ));
                     }
                 }
                 CredentialsBackend::Valkey => {
@@ -846,7 +872,7 @@ impl Spawnable for OAuthService {
             // Open persistent refresh token store (non-fatal — tokens simply don't survive restart).
             let token_db_path = credentials_dir.join("oauth-tokens");
             let token_store: Option<Arc<dyn crate::services::oauth::token_store::TokenStore>> = match credentials_config.backend {
-                CredentialsBackend::Rocksdb => {
+                CredentialsBackend::Rocksdb | CredentialsBackend::Pglite => {
                     match crate::services::oauth::token_store::RocksDbTokenStore::open(&token_db_path) {
                         Ok(s) => {
                             info!("Refresh token store (RocksDB) opened at {:?}", token_db_path);
