@@ -20,8 +20,8 @@ use hyprstream_crypto::{
     pq::{ml_dsa_sk_from_seed, ml_dsa_sk_to_vk_bytes, ml_dsa_vk_from_bytes},
 };
 use hyprstream_ledger::{
-    AccountId, AccountSpec, Cid, Did, IssueTransfer, LedgerBackend, MemLedger, Purpose, TransferId,
-    UnitId,
+    mint_signing_input, AccountId, AccountSpec, Cid, Did, IssueTransfer, LedgerBackend, MemLedger,
+    MintAuthority, Purpose, TransferId, UnitId,
 };
 use parking_lot::Mutex;
 
@@ -62,7 +62,18 @@ async fn fixture(
         &ed_sk.verifying_key().to_bytes(),
     ));
 
-    let mut backend = MemLedger::new(cell.clone());
+    // The issuance authority is deliberately its own keypair, distinct from the
+    // holder's: minting is a monetary authority, not a property of whoever holds
+    // an account. It is installed at construction — there is no setter — so this
+    // fixture mints through the same sealed path production does.
+    let mint_ed = ed25519_dalek::SigningKey::from_bytes(&[5u8; 32]);
+    let mint_pq = ml_dsa_sk_from_seed(&[6u8; 32]);
+    let mint_pq_vk = ml_dsa_vk_from_bytes(&ml_dsa_sk_to_vk_bytes(&mint_pq)).unwrap();
+
+    let mut backend = MemLedger::new(
+        cell.clone(),
+        Some(MintAuthority::hybrid(mint_ed.verifying_key(), mint_pq_vk)),
+    );
     let issuer_liab =
         AccountId::derive(&cell, &unit().issuer, &unit(), &Purpose::IssuerLiability).unwrap();
     let holder_acct = AccountId::derive(&cell, &holder, &unit(), &Purpose::Available).unwrap();
@@ -90,18 +101,26 @@ async fn fixture(
             Purpose::Available,
         ))
         .unwrap();
-    backend
-        .credit(IssueTransfer {
-            id: TransferId(1),
-            issuer_liability: issuer_liab,
-            destination: holder_acct,
-            unit: unit(),
-            amount: grant_cap,
-            grant_cid: Some(cid(1)),
-            user_data: [0u8; 32],
-        })
-        .result
-        .unwrap();
+    let issuance = IssueTransfer {
+        id: TransferId(1),
+        issuer_liability: issuer_liab,
+        destination: holder_acct,
+        unit: unit(),
+        amount: grant_cap,
+        grant_cid: Some(cid(1)),
+        user_data: [0u8; 32],
+    };
+    let mint_sig = sign_composite(
+        &mint_ed,
+        Some(&mint_pq),
+        &mint_signing_input(&issuance).unwrap(),
+        &[],
+    )
+    .unwrap();
+    let cap = backend
+        .authorize_mint(&issuance, &mint_sig)
+        .expect("the fixture's own authority authorizes this issuance");
+    backend.credit(cap).result.unwrap();
 
     let signer = Arc::new(CoseCheckpointSigner::classical(cell.clone(), ed_sk.clone()));
     let handle = LedgerHandle::spawn(Box::new(backend), signer);
