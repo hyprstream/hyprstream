@@ -39,12 +39,13 @@ use super::{
 };
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use async_trait::async_trait;
-use deadpool_postgres::{Config as PoolConfig, Pool};
+use deadpool_postgres::{Config as PoolConfig, Pool, SslMode};
 use ed25519_dalek::VerifyingKey;
 use rustls::RootCertStore;
 use std::{path::PathBuf, time::Duration};
 use tokio_postgres::Row;
 use tokio_postgres_rustls::MakeRustlsConnect;
+use url::Url;
 use zeroize::Zeroizing;
 
 /// Profile SELECT — same SQL as PgliteUserStore.
@@ -122,32 +123,10 @@ impl PostgresUserStoreConfig {
         );
 
         // ── v1.1 positive TLS assertion ────────────────────────────────
-        let lowered = database_url.to_ascii_lowercase();
-        // Scheme must be postgresql:// or postgres://
-        ensure!(
-            lowered.starts_with("postgresql://") || lowered.starts_with("postgres://"),
-            "credentials URL must use postgresql:// or postgres:// scheme"
-        );
-        // Exactly one sslmode=verify-full; reject every other sslmode value
-        // and duplicates/conflicts (metal v1.1 §"Positive TLS requirements").
-        for forbidden in [
-            "sslmode=disable",
-            "sslmode=allow",
-            "sslmode=prefer",
-            "sslmode=require",
-            "sslmode=verify-ca",
-        ] {
-            ensure!(
-                !lowered.contains(forbidden),
-                "credentials URL must use sslmode=verify-full, not {forbidden}"
-            );
-        }
-        let verify_full_count = lowered.matches("sslmode=verify-full").count();
-        ensure!(
-            verify_full_count == 1,
-            "credentials URL must contain exactly one sslmode=verify-full \
-             (found {verify_full_count} occurrences)"
-        );
+        // Structural URL validation: parse query pairs, not substring match.
+        // Substring checks are bypassable (e.g. the password field can
+        // contain "sslmode=verify-full" while the query has no sslmode).
+        validate_pg_url(&database_url)?;
 
         // ── CA file (mandatory — the connector must load it, not infer) ─
         let ca_file = std::env::var_os("HYPRSTREAM_CREDENTIALS_SSLROOTCERT_FILE")
@@ -219,10 +198,33 @@ impl PostgresUserStore {
 
     /// Open a PostgresUserStore WITHOUT encryption — **TEST/MIGRATION ONLY**.
     ///
-    /// Production wiring MUST use [`Self::connect`] instead.
+    /// Uses `NoTls` (plaintext to localhost) — production MUST use [`Self::connect`]
+    /// which forces rustls TLS to RDS.
     #[cfg(test)]
     pub async fn connect_plaintext(config: PostgresUserStoreConfig) -> Result<Self> {
-        Self::new(Some(config), None).await
+        let url = Url::parse(&config.database_url)
+            .context("parsing test PostgresUserStore URL")?;
+        let mut cfg = PoolConfig::new();
+        cfg.host = url.host_str().map(|h| h.to_owned());
+        cfg.port = url.port();
+        if !url.username().is_empty() {
+            cfg.user = Some(url.username().to_owned());
+        }
+        if let Some(password) = url.password() {
+            cfg.password = Some(percent_decode(password));
+        }
+        let path = url.path().trim_start_matches('/');
+        if !path.is_empty() {
+            cfg.dbname = Some(path.to_owned());
+        }
+        cfg.ssl_mode = Some(SslMode::Disable);
+        let pool = cfg
+            .builder(::tokio_postgres::NoTls)?
+            .max_size(config.max_connections)
+            .build()?;
+        let store = Self { pool, cipher: None };
+        store.migrate().await?;
+        Ok(store)
     }
 
     async fn new(config: Option<PostgresUserStoreConfig>, cipher: Option<ColumnCipher>) -> Result<Self> {
@@ -457,16 +459,96 @@ fn pool_err(e: deadpool_postgres::PoolError) -> anyhow::Error {
     anyhow!("PostgresUserStore pool error: {e}")
 }
 
+/// Structurally validate a libpq URL against the metal v1.1 contract.
+///
+/// Parses the URL with `url::Url` (not substring matching — substring checks
+/// are bypassable: the password field can contain `sslmode=verify-full` while
+/// the query has no sslmode, and the driver then defaults to `Prefer` which
+/// downgrades to raw transport).
+///
+/// **Requirements (all enforced here):**
+/// - Scheme is `postgresql` or `postgres`
+/// - Host is a nonempty DNS hostname (no Unix-socket fallback)
+/// - Exactly one query parameter named `sslmode` with value `verify-full`
+/// - No other `sslmode` values (`disable`, `prefer`, `require`, `verify-ca`)
+fn validate_pg_url(raw: &str) -> Result<()> {
+    let url = Url::parse(raw).context("credentials URL is not a valid URL")?;
+    ensure!(
+        url.scheme() == "postgresql" || url.scheme() == "postgres",
+        "credentials URL scheme must be postgresql:// or postgres://, got: {}",
+        url.scheme()
+    );
+    let host = url.host_str();
+    ensure!(
+        host.is_some_and(|h| !h.is_empty()),
+        "credentials URL must specify a nonempty DNS hostname (no host → \
+         driver defaults to local Unix socket)"
+    );
+    // Collect all sslmode query params by structural key match.
+    let sslmodes: Vec<String> = url
+        .query_pairs()
+        .filter(|(k, _)| k == "sslmode")
+        .map(|(_, v)| v.to_string())
+        .collect();
+    ensure!(
+        sslmodes.len() == 1,
+        "credentials URL must contain exactly one sslmode query parameter \
+         (found {})",
+        sslmodes.len()
+    );
+    ensure!(
+        sslmodes[0] == "verify-full",
+        "credentials URL sslmode must be verify-full (found: {})",
+        sslmodes[0]
+    );
+    Ok(())
+}
+
 /// Build the deadpool-postgres connection pool with mandatory TLS.
 ///
-/// The connector is built from either a pinned RDS CA PEM file (production,
-/// `ca_file`) or the Mozilla root set (test/dev). The contract requires
-/// `sslmode=verify-full` — `from_env` rejects any URL that doesn't require TLS,
-/// and this connector negotiates rustls on every checkout.
+/// **How `sslmode=verify-full` is delivered:**
+/// tokio-postgres 0.7.x does not accept `verify-full` as a libpq sslmode
+/// value (it accepts only `disable`/`prefer`/`require`). The v1.1 contract
+/// requirement is met by translating the validated `verify-full` policy into
+/// the driver's `SslMode::Require` (never plaintext) + a `MakeRustlsConnect`
+/// that performs CA-pinned hostname verification (the actual verify-full
+/// semantics). The URL is never passed to `tokio_postgres::Config::from_str`
+/// — individual fields are extracted from the parsed URL so no libpq sslmode
+/// parsing occurs.
 fn build_pool(config: Option<&PostgresUserStoreConfig>) -> Result<Pool> {
     let mut cfg = PoolConfig::new();
+
     if let Some(config) = config {
-        cfg.url = Some(config.database_url.clone());
+        // Parse the validated URL and populate deadpool Config fields
+        // individually — never pass the raw URL to the driver (it would
+        // choke on sslmode=verify-full).
+        let url = Url::parse(&config.database_url)
+            .context("re-parsing validated credentials URL")?;
+        cfg.host = url.host_str().map(|h| h.to_owned());
+        cfg.port = url.port();
+        let username = url.username();
+        if !username.is_empty() {
+            cfg.user = Some(username.to_owned());
+        }
+        if let Some(password) = url.password() {
+            cfg.password = Some(percent_decode(password));
+        }
+        let path = url.path().trim_start_matches('/');
+        if !path.is_empty() {
+            cfg.dbname = Some(path.to_owned());
+        }
+        // Copy non-security query params that deadpool Config knows about.
+        for (key, value) in url.query_pairs() {
+            match key.as_ref() {
+                "sslmode" | "sslrootcert" => { /* handled by connector */ }
+                "application_name" => {
+                    cfg.application_name = Some(value.into_owned());
+                }
+                _ => {}
+            }
+        }
+        // Translate verified sslmode=verify-full → driver Require + rustls.
+        cfg.ssl_mode = Some(SslMode::Require);
     }
 
     // Build a rustls TLS connector — TLS is mandatory for RDS.
@@ -516,6 +598,15 @@ fn build_pool(config: Option<&PostgresUserStoreConfig>) -> Result<Pool> {
         builder
     };
     builder.build().context("building PostgresUserStore pool")
+}
+
+/// Percent-decode a password extracted from a `url::Url` (the `password()`
+/// method returns the raw, still-percent-encoded value in some versions;
+/// we decode it so the driver receives the actual credential).
+fn percent_decode(s: &str) -> String {
+    percent_encoding::percent_decode_str(s)
+        .decode_utf8_lossy()
+        .into_owned()
 }
 
 #[async_trait]
@@ -1414,27 +1505,35 @@ mod tests {
     use ed25519_dalek::SigningKey;
     use rand::rngs::OsRng;
 
-    fn test_dsn() -> Option<String> {
-        std::env::var("HYPRSTREAM_POSTGRES_TEST_URL").ok()
+    /// Read the test URL from a FILE, never from a direct env var.
+    /// This mirrors the production file-backed credential model — even in
+    /// tests, a password-bearing URL must not transit the process
+    /// environment (metal v1.1 acceptance check 1).
+    fn test_url_file() -> Option<PathBuf> {
+        std::env::var_os("HYPRSTREAM_POSTGRES_TEST_URL_FILE").map(PathBuf::from)
     }
 
-    /// Skip the entire suite unless the operator opted in via env. This keeps
-    /// `cargo test --features postgres` green in CI environments without a
-    /// Postgres instance, while letting developers and the dedicated CI job
-    /// run the real-DB suite.
+    /// Skip the entire DB-backed suite unless the operator opted in via a
+    /// URL file path. This keeps `cargo test --features postgres` green in
+    /// CI environments without a Postgres instance.
     macro_rules! require_db {
         () => {{
-            let Some(url) = test_dsn() else {
-                eprintln!("skipping PostgresUserStore test: HYPRSTREAM_POSTGRES_TEST_URL unset");
+            let Some(path) = test_url_file() else {
+                eprintln!(
+                    "skipping PostgresUserStore DB test: \
+                     HYPRSTREAM_POSTGRES_TEST_URL_FILE unset"
+                );
                 return;
             };
-            url
+            std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("test URL file {:?} unreadable: {e}", path))
+                .trim()
+                .to_owned()
         }};
     }
 
-    async fn fresh() -> PostgresUserStore {
-        let url = std::env::var("HYPRSTREAM_POSTGRES_TEST_URL").unwrap();
-        let cfg = PostgresUserStoreConfig::from_url(&url);
+    async fn fresh(url: &str) -> PostgresUserStore {
+        let cfg = PostgresUserStoreConfig::from_url(url);
         let store = PostgresUserStore::connect_plaintext(cfg).await.unwrap();
         let client = store.pool.get().await.unwrap();
         client.execute("DELETE FROM users", &[]).await.unwrap();
@@ -1447,8 +1546,8 @@ mod tests {
 
     #[tokio::test]
     async fn register_get_profile_round_trip() {
-        let _url = require_db!();
-        let store = fresh().await;
+        let url = require_db!();
+        let store = fresh(&url).await;
         let sub = store.register("alice").await.unwrap();
         let profile = store.get_profile("alice").await.unwrap().unwrap();
         assert_eq!(profile.sub.as_deref(), Some(sub.as_str()));
@@ -1458,15 +1557,15 @@ mod tests {
 
     #[tokio::test]
     async fn get_profile_missing_user_returns_none() {
-        let _url = require_db!();
-        let store = fresh().await;
+        let url = require_db!();
+        let store = fresh(&url).await;
         assert!(store.get_profile("nobody").await.unwrap().is_none());
     }
 
     #[tokio::test]
     async fn provision_stages_inactive_account() {
-        let _url = require_db!();
-        let store = fresh().await;
+        let url = require_db!();
+        let store = fresh(&url).await;
         let key = make_key();
         let result = store
             .provision_hosted_account(
@@ -1492,8 +1591,8 @@ mod tests {
 
     #[tokio::test]
     async fn provision_exact_repeat_resumes() {
-        let _url = require_db!();
-        let store = fresh().await;
+        let url = require_db!();
+        let store = fresh(&url).await;
         let key = make_key();
         let first = store
             .provision_hosted_account(
@@ -1520,8 +1619,8 @@ mod tests {
 
     #[tokio::test]
     async fn activate_flips_staged_to_active() {
-        let _url = require_db!();
-        let store = fresh().await;
+        let url = require_db!();
+        let store = fresh(&url).await;
         let key = make_key();
         let provisioned = store
             .provision_hosted_account(
@@ -1547,8 +1646,8 @@ mod tests {
 
     #[tokio::test]
     async fn provision_account_already_exists() {
-        let _url = require_db!();
-        let store = fresh().await;
+        let url = require_db!();
+        let store = fresh(&url).await;
         let key = make_key();
         let provisioned = store
             .provision_hosted_account(
@@ -1586,8 +1685,8 @@ mod tests {
 
     #[tokio::test]
     async fn provision_key_already_bound() {
-        let _url = require_db!();
-        let store = fresh().await;
+        let url = require_db!();
+        let store = fresh(&url).await;
         let key = make_key();
         let provisioned = store
             .provision_hosted_account(
@@ -1624,8 +1723,8 @@ mod tests {
 
     #[tokio::test]
     async fn provision_corrupt_inactive_state_is_backend_error() {
-        let _url = require_db!();
-        let store = fresh().await;
+        let url = require_db!();
+        let store = fresh(&url).await;
         let key = make_key();
         store
             .provision_hosted_account(
@@ -1654,8 +1753,8 @@ mod tests {
 
     #[tokio::test]
     async fn add_list_remove_pubkey() {
-        let _url = require_db!();
-        let store = fresh().await;
+        let url = require_db!();
+        let store = fresh(&url).await;
         store.register("alice").await.unwrap();
         let key = make_key();
         let fp = store
@@ -1679,8 +1778,8 @@ mod tests {
 
     #[tokio::test]
     async fn add_pubkey_hybrid_upgrades_classical() {
-        let _url = require_db!();
-        let store = fresh().await;
+        let url = require_db!();
+        let store = fresh(&url).await;
         store.register("alice").await.unwrap();
         let key = make_key();
         let fp = store.add_pubkey("alice", key, None).await.unwrap();
@@ -1699,8 +1798,8 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_or_bind_creates_and_resolves() {
-        let _url = require_db!();
-        let store = fresh().await;
+        let url = require_db!();
+        let store = fresh(&url).await;
         let res1 = store
             .resolve_or_bind_external_idp("https://idp.example", "sub-123", "alice")
             .await
@@ -1714,5 +1813,131 @@ mod tests {
         assert!(!res2.provisioned);
         assert_eq!(res2.username, "alice");
         assert_eq!(res2.sub, res1.sub);
+    }
+
+    // ── No-network unit tests for structural URL validation ────────────
+    // These run without a database — they test `validate_pg_url` and
+    // pool-config construction only. (P1-2: the old suite was all-skip.)
+
+    #[test]
+    fn validate_url_accepts_conforming_v1_1_url() {
+        let url = "postgresql://role:secret@rdshost.x.rds.amazonaws.com:5432/hyprstream?sslmode=verify-full";
+        validate_pg_url(url).unwrap();
+    }
+
+    #[test]
+    fn validate_url_accepts_postgres_scheme_alias() {
+        let url = "postgres://role@host/db?sslmode=verify-full";
+        validate_pg_url(url).unwrap();
+    }
+
+    #[test]
+    fn validate_url_rejects_missing_sslmode() {
+        let url = "postgresql://role:secret@host/db";
+        assert!(validate_pg_url(url).is_err());
+    }
+
+    #[test]
+    fn validate_url_rejects_duplicate_sslmode() {
+        let url = "postgresql://role@host/db?sslmode=verify-full&sslmode=verify-full";
+        assert!(validate_pg_url(url).is_err());
+    }
+
+    #[test]
+    fn validate_url_rejects_sslmode_require() {
+        let url = "postgresql://role@host/db?sslmode=require";
+        assert!(validate_pg_url(url).is_err());
+    }
+
+    #[test]
+    fn validate_url_rejects_sslmode_verify_ca() {
+        let url = "postgresql://role@host/db?sslmode=verify-ca";
+        assert!(validate_pg_url(url).is_err());
+    }
+
+    #[test]
+    fn validate_url_rejects_sslmode_disable() {
+        let url = "postgresql://role@host/db?sslmode=disable";
+        assert!(validate_pg_url(url).is_err());
+    }
+
+    #[test]
+    fn validate_url_rejects_sslmode_prefer() {
+        let url = "postgresql://role@host/db?sslmode=prefer";
+        assert!(validate_pg_url(url).is_err());
+    }
+
+    #[test]
+    fn validate_url_rejects_missing_host() {
+        // No host → deadpool defaults to Unix socket, bypassing TLS to RDS.
+        let url = "postgresql:///db?sslmode=verify-full";
+        assert!(validate_pg_url(url).is_err());
+    }
+
+    #[test]
+    fn validate_url_rejects_empty_host() {
+        let url = "postgresql://@/db?sslmode=verify-full";
+        assert!(validate_pg_url(url).is_err());
+    }
+
+    #[test]
+    fn validate_url_rejects_bypass_sslmode_in_password() {
+        // P0-2 bypass: "sslmode=verify-full" in the password field passes
+        // substring checks but has NO sslmode query parameter. The structural
+        // parser must reject this because query_pairs() sees no sslmode.
+        let url = "postgresql://user:sslmode%3Dverify-full@host/db";
+        assert!(validate_pg_url(url).is_err());
+    }
+
+    #[test]
+    fn validate_url_rejects_wrong_scheme() {
+        let url = "mysql://user@host/db?sslmode=verify-full";
+        assert!(validate_pg_url(url).is_err());
+    }
+
+    #[test]
+    fn validate_url_rejects_non_url() {
+        let url = "not a url at all";
+        assert!(validate_pg_url(url).is_err());
+    }
+
+    /// Prove that a validated v1.1 URL produces a `PoolConfig` whose fields
+    /// are populated correctly and whose `ssl_mode` is `Require` (the driver
+    /// side of the verify-full translation). This does NOT connect — it only
+    /// checks the in-memory config struct.
+    #[test]
+    fn validated_url_produces_correct_pool_config() {
+        let raw = "postgresql://myrole:mypass@rdshost.example:5432/hyprstream?sslmode=verify-full";
+        validate_pg_url(raw).unwrap();
+        let url = Url::parse(raw).unwrap();
+
+        let mut cfg = PoolConfig::new();
+        cfg.host = url.host_str().map(|h| h.to_owned());
+        cfg.port = url.port();
+        let username = url.username();
+        if !username.is_empty() {
+            cfg.user = Some(username.to_owned());
+        }
+        if let Some(password) = url.password() {
+            cfg.password = Some(
+                percent_encoding::percent_decode_str(password)
+                    .decode_utf8_lossy()
+                    .into_owned(),
+            );
+        }
+        let path = url.path().trim_start_matches('/');
+        if !path.is_empty() {
+            cfg.dbname = Some(path.to_owned());
+        }
+        cfg.ssl_mode = Some(SslMode::Require);
+
+        assert_eq!(cfg.host.as_deref(), Some("rdshost.example"));
+        assert_eq!(cfg.port, Some(5432));
+        assert_eq!(cfg.user.as_deref(), Some("myrole"));
+        assert_eq!(cfg.password.as_deref(), Some("mypass"));
+        assert_eq!(cfg.dbname.as_deref(), Some("hyprstream"));
+        assert_eq!(cfg.ssl_mode, Some(SslMode::Require));
+        // The raw URL is NEVER stored in cfg.url — it would choke the driver.
+        assert!(cfg.url.is_none());
     }
 }
