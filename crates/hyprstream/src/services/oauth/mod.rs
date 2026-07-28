@@ -595,10 +595,20 @@ impl Spawnable for OAuthService {
             // Load the user store (account system of record) based on the
             // configured backend. A configured system-of-record failure fails
             // closed — never silently fall back to a different account store.
+            // The credential/PDS production profile permits only encrypted
+            // PGlite and rejects its legacy plaintext-capable alternatives.
             use crate::config::CredentialsBackend;
             let credentials_config = crate::config::HyprConfig::load()
                 .map(|c| c.credentials)
                 .unwrap_or_default();
+            credentials_config
+                .backend
+                .ensure_allowed_for_build()
+                .map_err(|e| {
+                    hyprstream_rpc::error::RpcError::SpawnFailed(format!(
+                        "invalid credential backend: {e:#}"
+                    ))
+                })?;
 
             // The device store is independent of the user-store backend. It
             // always uses RocksDB (device-authorization state is not account
@@ -611,7 +621,6 @@ impl Spawnable for OAuthService {
             // Helper: open a RocksDbUserStore solely for its DeviceStore trait
             // (used when the account backend is not RocksDB).
             #[cfg(any(feature = "pglite", feature = "valkey"))]
-            // (used when the account backend is not RocksDB).
             macro_rules! open_rocksdb_device_store {
                 () => {{
                     match crate::auth::RocksDbUserStore::open(&credentials_dir) {
@@ -646,9 +655,9 @@ impl Spawnable for OAuthService {
                         let store = crate::auth::PgliteUserStore::from_database(database)
                             .await
                             .map_err(|e| hyprstream_rpc::error::RpcError::SpawnFailed(
-                                format!("failed to initialize UserStore schema: {e}")
+                                format!("failed to initialize encrypted UserStore: {e:#}")
                             ))?;
-                        info!("User store (PGlite) opened at {:?}", db_path);
+                        info!("Encrypted user store (PGlite) opened at {:?}", db_path);
                         device_store_opt = open_rocksdb_device_store!();
                         Some(Arc::new(store) as Arc<dyn crate::auth::user_store::UserStore>)
                     }

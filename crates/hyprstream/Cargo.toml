@@ -228,7 +228,6 @@ cuda = []
 valkey = ["dep:fred"]  # Enable Valkey/Redis-backed user and token stores
 pglite = ["dep:pglite-rs"]  # Enable PGlite embedded relational UserStore (#1376)
 credential-pds = ["pglite"]  # Production credential/PDS service profile; intentionally excludes metrics/DuckDB
-userstore-plaintext-test = []  # NON-PRODUCTION: enables plaintext store constructors for migration/tests; credential-pds MUST NOT select this
 metrics = ["dep:hyprstream-metrics", "dep:hyprstream-flight"]  # Separate DuckDB-backed metrics/inference/Flight service build
 bnb = ["dep:bitsandbytes-sys"]  # Enable bitsandbytes KV cache quantization (requires compatible ROCm/CUDA)
 xet = ["git2db/xet-storage"]  # Enable XET large file storage
