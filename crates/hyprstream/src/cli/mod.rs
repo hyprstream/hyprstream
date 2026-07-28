@@ -24,6 +24,7 @@ pub mod shell_handlers;
 pub mod sign_challenge;
 pub mod systemd_setup;
 pub mod training_handlers;
+pub mod trust;
 pub mod tui_handlers;
 pub mod update_handlers;
 pub mod user_handlers;

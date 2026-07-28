@@ -125,6 +125,17 @@ async fn did_anchored_bootstrap_boots_same_node() {
         mint_credential(&fixture.ca, &fixture.registry),
     )
     .unwrap();
+    // Same authority-log gap as did_trust_e2e.rs: the bootstrap fetches it
+    // alongside the credential. Lay down a valid CA-signed log.
+    let (authority_log, _) = authority_log_and_checkpoint(&fixture.ca);
+    std::fs::write(
+        fixture
+            .well_known
+            .join("deployment")
+            .join("deployment-authority.log.json"),
+        authority_log.to_string(),
+    )
+    .unwrap();
 
     // Real HTTPS serving side (the REAL deployment well-known router).
     let rustls = axum_server::tls_rustls::RustlsConfig::from_der(
@@ -149,6 +160,10 @@ async fn did_anchored_bootstrap_boots_same_node() {
     register_discovery_key(discovery_sk.verifying_key());
 
     let node_key = SigningKey::from_bytes(&[0x65; 32]);
+    // Provision the OS-owned anti-rollback checkpoint via #1373's rootless
+    // HYPRSTREAM_DEPLOYMENT_TRUST_DIR seam — same production code path a
+    // rootless daemon takes, rooted in a secure temp dir. No global override.
+    ensure_trust_dir(&fixture.ca);
     hyprstream_discovery::bootstrap_deployment_process(
         node_key,
         DeploymentTrustSource::DidAnchored(fixture.anchors()),

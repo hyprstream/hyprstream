@@ -137,7 +137,10 @@ pub use service::{
     bootstrap_deployment_process, deployment_registry_verifier, resolve_and_authenticate_did_anchors,
     AuthorizationProvider, DiscoveryService, RecordCarData, RecordResolver, RegistryDeploymentVerifier,
     production_browser_currentness_verifier, production_browser_provisioning,
-    production_rpc_client,
+    production_rpc_client, verify_genesis_deployment_artifacts,
+    verify_deployment_artifacts_with_authority_log, verify_deployment_public_ca,
+    DeploymentAuthorityCheckpoint, DeploymentAuthorityLog, RegistryDelegationArtifact,
+    VerifiedDeploymentArtifacts,
 };
 
 // Re-export generated types that consumers need

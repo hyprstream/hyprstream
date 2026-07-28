@@ -498,6 +498,18 @@ fn validate_rotation_keys(keys: &[HybridRotationKey]) -> Result<()> {
             !keys[..index].contains(key),
             "duplicate hybrid rotation key at index {index}"
         );
+        ensure!(
+            !keys[..index]
+                .iter()
+                .any(|existing| existing.ed25519_pub == key.ed25519_pub),
+            "rotation key at index {index} reuses an Ed25519 component"
+        );
+        ensure!(
+            !keys[..index]
+                .iter()
+                .any(|existing| existing.mldsa65_pub == key.mldsa65_pub),
+            "rotation key at index {index} reuses an ML-DSA-65 component"
+        );
     }
     Ok(())
 }
@@ -695,6 +707,29 @@ mod tests {
             DidOp::signed_rotation(&genesis, vec![attacker.public], &attacker.ed, &attacker.pq)
                 .unwrap_err();
         assert!(error.to_string().contains("not authorized"));
+    }
+
+    #[test]
+    fn authority_set_rejects_reused_hybrid_components() {
+        let first = keys(31);
+        let second = keys(32);
+        let repeated_ed =
+            HybridRotationKey::new(first.public.ed25519_pub, second.public.mldsa65_pub.clone())
+                .unwrap();
+        let error = DidOp::signed_genesis(
+            vec![first.public.clone(), repeated_ed],
+            &first.ed,
+            &first.pq,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("reuses an Ed25519 component"));
+
+        let repeated_pq =
+            HybridRotationKey::new(second.public.ed25519_pub, first.public.mldsa65_pub.clone())
+                .unwrap();
+        let error = DidOp::signed_genesis(vec![first.public, repeated_pq], &first.ed, &first.pq)
+            .unwrap_err();
+        assert!(error.to_string().contains("reuses an ML-DSA-65 component"));
     }
 
     #[test]
