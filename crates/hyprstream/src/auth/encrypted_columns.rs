@@ -367,10 +367,6 @@ impl ColumnCipher {
         self.decrypt(root, username, column, raw)
     }
 
-    pub(crate) fn is_ciphertext(value: &[u8]) -> bool {
-        value.starts_with(CIPHERTEXT_MAGIC)
-    }
-
     /// Construct a cipher backed by an in-process test sealer.
     #[cfg(test)]
     pub(crate) fn test_cipher() -> Self {
