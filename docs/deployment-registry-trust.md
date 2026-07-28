@@ -13,11 +13,17 @@ The OS-owned deployment seam is deliberately small and fail-closed:
 - `/run/hyprstream/credentials/registry-service.jwt` is the separately
   provisioned, short-lived `service:registry` credential. Its `cnf.jwk` names the
   registry key that certifies accepted `did:at9p:<cid512>` state.
+- `/etc/hyprstream/trust/deployment-authority.log.json` is the public,
+  root-anchored authority-set history required for every enrolled credential.
+- `/etc/hyprstream/trust/deployment-authority.head.json` is the independently
+  provisioned expected log head: schema, deployment domain, log DID, sequence,
+  and head CID. The supplied log must match it exactly.
 
-Both files must be regular, root-owned, and not group/world writable. Missing,
+All installed files must be regular, root-owned, and not group/world writable. Missing,
 malformed, symlinked, or incorrectly owned material makes production resolver
-startup fail closed. Both JWT signature components are verified against the
-`/etc` pin before its key is represented by an opaque verification-only
+startup fail closed. Missing log or checkpoint never selects a less restrictive
+verifier. Both JWT signature components are verified against the checkpointed
+active authority before its key is represented by an opaque verification-only
 capability. The raw keys and one-shot witness are not exposed through the
 public service or Discovery APIs.
 
@@ -77,15 +83,16 @@ not become trust decisions: identity remains pinned by the configured at9p
 hash and mutual alias rule, while application responses remain pinned to the
 separately authenticated Discovery service key.
 
-The registry deployment credential is fetched from beside the capsule —
-`/.well-known/deployment/registry-service.jwt` — and validated with the exact
-same profile as the OS-owned file (CA-bound `kid`/`iss`/`deployment_domain`,
-one-hour freshness). The credential is CA-signed and short-lived, so the
-channel is untrusted by design; the OS-owned JWT file is required only when
-the OS-owned source is selected. Enrollment (operator-approved device flow,
-unattended machine attestation) and final `SecretsProfile` integration remain
-separate work; no client-authentication authority is inferred from the two
-public anchors.
+The registry deployment credential and current root-anchored authority log are
+fetched from beside the capsule at
+`/.well-known/deployment/registry-service.jwt` and
+`/.well-known/deployment/deployment-authority.log.json`. The log is
+authenticated against the capsule-derived hybrid root and must match the
+separately provisioned OS-owned head checkpoint exactly; the credential is then
+validated against that active set with the same closed profile as the OS-owned
+path. The HTTPS channel is untrusted by design and cannot redefine currentness.
+The OS-owned JWT and log files are required only when the OS-owned source is
+selected, but the OS-owned checkpoint is required for both enrolled sources.
 
 ### Serving the deployment well-known documents
 
@@ -98,12 +105,14 @@ service, and it already owns `/.well-known/did.json`):
 deployment_well_known_dir = "/var/lib/hyprstream/deployment-well-known"
 ```
 
-The operator provisions three public, integrity-anchored documents, re-read
+The operator provisions four public, integrity-anchored documents, re-read
 on every request (so the hourly credential refresh needs no restart):
 
 ```text
 <dir>/did.json                              the deployment DID document
 <dir>/at9p/<cid512>.cbor                    the cluster at9p genesis capsule
+<dir>/deployment/deployment-authority.log.json
+                                            the current root-anchored authority log
 <dir>/deployment/registry-service.jwt       the current CA-signed credential
 ```
 
@@ -175,6 +184,23 @@ optional JOSE/JWK metadata (`crit`, `use`, `key_ops`, or a JWK-local `alg` or
 token types, and a signature or key identifier that does not bind the pinned CA
 fail closed before a registry witness can be minted. The credential file is the
 compact JWT itself with no surrounding whitespace or trailing newline.
+
+The common operational form adds exactly one `delegation` claim to that closed
+claim set. It is canonical unpadded base64url JSON containing the scoped UCAN,
+the delegated 1,984-byte hybrid public key, and the stable authority-log DID.
+The separately installed or fetched root-anchored DidOp log must have that DID,
+its verified sequence and head CID must equal the independent checkpoint, and
+the UCAN issuer must still be in its active any-of-N authority set. The UCAN is
+restricted to this deployment's registry-service mint ability, exact profile
+and audience, and the one-hour ceiling. Direct rare-root credentials retain the
+original claim set without `delegation`, but they are subject to the same
+mandatory log/checkpoint test and fail after root retirement.
+
+This profile is deployment/registry scoped. It has no PDS or host identifier.
+The demo therefore projects one shared deployment CA and current credential to
+both PDS hosts; a per-PDS binding would require a new profile or separate roots.
+The exact mint, rotation, recovery, publisher, and Metal input contracts are in
+[`deployment-trust-contract.md`](deployment-trust-contract.md).
 
 Classical-only atproto peer keys remain supported only at the separately named
 peer/federation record-resolution surface. That P-256 interoperability path

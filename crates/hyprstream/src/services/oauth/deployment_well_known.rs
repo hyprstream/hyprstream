@@ -1,6 +1,6 @@
 //! Deployment static well-known endpoints (#1137 / #1136 serving half).
 //!
-//! The DID-anchored trust bootstrap (#1143) fetches three public,
+//! The DID-anchored trust bootstrap (#1143) fetches four public,
 //! integrity-anchored documents from the deployment's did:web host:
 //!
 //! - `/.well-known/did.json` — the deployment DID document (alsoKnownAs →
@@ -10,6 +10,9 @@
 //!   (self-certifying: BLAKE3-512 over its canonical bytes IS the DID);
 //! - `/.well-known/deployment/registry-service.jwt` — the current CA-signed
 //!   registry deployment credential (one-hour freshness profile).
+//! - `/.well-known/deployment/deployment-authority.log.json` — the current
+//!   root-anchored authority log. Its head must equal the node's separately
+//!   provisioned OS-owned anti-rollback checkpoint.
 //!
 //! None of these are secret: every one is verified by the fetcher (GATE
 //! canon → hash → sig for the capsule; mutual alsoKnownAs attestation for
@@ -26,6 +29,7 @@
 //! ```text
 //! <dir>/did.json
 //! <dir>/at9p/<cid>.cbor
+//! <dir>/deployment/deployment-authority.log.json
 //! <dir>/deployment/registry-service.jwt   (refreshed hourly by the CA holder)
 //! ```
 //!
@@ -65,6 +69,10 @@ where
         .route(
             "/.well-known/deployment/registry-service.jwt",
             get(serve_registry_credential),
+        )
+        .route(
+            "/.well-known/deployment/deployment-authority.log.json",
+            get(serve_authority_log),
         )
         .with_state(deployment_dir)
 }
@@ -122,6 +130,18 @@ async fn serve_registry_credential(State(deployment_dir): State<Option<PathBuf>>
     serve_file(
         &dir.join("deployment").join("registry-service.jwt"),
         "application/jwt",
+        MAX_CREDENTIAL_BYTES,
+    )
+    .await
+}
+
+async fn serve_authority_log(State(deployment_dir): State<Option<PathBuf>>) -> Response {
+    let Some(ref dir) = deployment_dir else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    serve_file(
+        &dir.join("deployment").join("deployment-authority.log.json"),
+        "application/json",
         MAX_CREDENTIAL_BYTES,
     )
     .await
