@@ -33,16 +33,17 @@
 use super::{
     cipher_glue::{self, USERSTORE_SCHEMA},
     encrypted_columns::{ColumnCipher, EncryptedColumn, ROOT_DEK_BYTES},
-    user_store::matches_filter, AccountKeyCustody, ExternalIdentityBinding,
-    ExternalIdentityResolution, HostedAccountProvisionError, HostedAccountProvisioning,
-    KeyAlgorithm, PubkeyEntry, UserFilter, UserProfile, UserProfilePatch, UserStore,
+    user_store::matches_filter,
+    AccountKeyCustody, ExternalIdentityBinding, ExternalIdentityResolution,
+    HostedAccountProvisionError, HostedAccountProvisioning, KeyAlgorithm, PubkeyEntry, UserFilter,
+    UserProfile, UserProfilePatch, UserStore,
 };
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use async_trait::async_trait;
 use deadpool_postgres::{Config as PoolConfig, Pool, SslMode};
 use ed25519_dalek::VerifyingKey;
-use rustls::RootCertStore;
-use std::{path::PathBuf, time::Duration};
+use rustls::{client::WebPkiServerVerifier, RootCertStore};
+use std::{path::PathBuf, sync::Arc, time::Duration};
 use tokio_postgres::Row;
 use tokio_postgres_rustls::MakeRustlsConnect;
 use url::Url;
@@ -101,11 +102,10 @@ impl PostgresUserStoreConfig {
     /// - `HYPRSTREAM_USERSTORE_MAX_CONNECTIONS` — pool size (default `2 * num_cpus`).
     pub fn from_env() -> Result<Self> {
         // ── URL file (the sole credential carrier) ─────────────────────
-        let url_file = std::env::var_os("HYPRSTREAM_CREDENTIALS_URL_FILE")
-            .context(
-                "HYPRSTREAM_CREDENTIALS_URL_FILE is required \
+        let url_file = std::env::var_os("HYPRSTREAM_CREDENTIALS_URL_FILE").context(
+            "HYPRSTREAM_CREDENTIALS_URL_FILE is required \
                  (metal RDS runtime contract v1.1)",
-            );
+        );
         let url_file = url_file?;
         let database_url = std::fs::read_to_string(&url_file)
             .with_context(|| {
@@ -129,11 +129,10 @@ impl PostgresUserStoreConfig {
         validate_pg_url(&database_url)?;
 
         // ── CA file (mandatory — the connector must load it, not infer) ─
-        let ca_file = std::env::var_os("HYPRSTREAM_CREDENTIALS_SSLROOTCERT_FILE")
-            .context(
-                "HYPRSTREAM_CREDENTIALS_SSLROOTCERT_FILE is required \
+        let ca_file = std::env::var_os("HYPRSTREAM_CREDENTIALS_SSLROOTCERT_FILE").context(
+            "HYPRSTREAM_CREDENTIALS_SSLROOTCERT_FILE is required \
                  (metal RDS runtime contract v1.1)",
-            )?;
+        )?;
         // Fail-closed: the CA file must exist and be readable at startup.
         std::fs::metadata(&ca_file).with_context(|| {
             format!(
@@ -192,7 +191,10 @@ impl PostgresUserStore {
     ///
     /// Returns `Err` on any startup failure (DNS, TLS, auth, migration).
     /// The caller MUST treat this as fatal — never fall back to pglite or Mem.
-    pub(crate) async fn connect(config: PostgresUserStoreConfig, cipher: ColumnCipher) -> Result<Self> {
+    pub(crate) async fn connect(
+        config: PostgresUserStoreConfig,
+        cipher: ColumnCipher,
+    ) -> Result<Self> {
         Self::new(Some(config), Some(cipher)).await
     }
 
@@ -202,8 +204,7 @@ impl PostgresUserStore {
     /// which forces rustls TLS to RDS.
     #[cfg(test)]
     pub async fn connect_plaintext(config: PostgresUserStoreConfig) -> Result<Self> {
-        let url = Url::parse(&config.database_url)
-            .context("parsing test PostgresUserStore URL")?;
+        let url = Url::parse(&config.database_url).context("parsing test PostgresUserStore URL")?;
         let mut cfg = PoolConfig::new();
         cfg.host = url.host_str().map(|h| h.to_owned());
         cfg.port = url.port();
@@ -227,10 +228,16 @@ impl PostgresUserStore {
         Ok(store)
     }
 
-    async fn new(config: Option<PostgresUserStoreConfig>, cipher: Option<ColumnCipher>) -> Result<Self> {
+    async fn new(
+        config: Option<PostgresUserStoreConfig>,
+        cipher: Option<ColumnCipher>,
+    ) -> Result<Self> {
         let pool = build_pool(config.as_ref())?;
         let store = Self { pool, cipher };
-        store.migrate().await.context("UserStore schema migration failed at startup")?;
+        store
+            .migrate()
+            .await
+            .context("UserStore schema migration failed at startup")?;
         Ok(store)
     }
 
@@ -446,8 +453,12 @@ impl PostgresUserStore {
 
 fn decode_external_identity(row: &Row) -> Result<ExternalIdentityBinding> {
     Ok(ExternalIdentityBinding {
-        issuer: row.try_get(0).context("decoding external identity issuer")?,
-        subject: row.try_get(1).context("decoding external identity subject")?,
+        issuer: row
+            .try_get(0)
+            .context("decoding external identity issuer")?,
+        subject: row
+            .try_get(1)
+            .context("decoding external identity subject")?,
     })
 }
 
@@ -549,8 +560,7 @@ fn validate_pg_url(raw: &str) -> Result<()> {
 /// Production `build_pool` calls THIS function — the test calls THIS
 /// function. If production changes the translation, the test breaks.
 fn build_pool_config(database_url: &str) -> Result<PoolConfig> {
-    let url = Url::parse(database_url)
-        .context("re-parsing validated credentials URL")?;
+    let url = Url::parse(database_url).context("re-parsing validated credentials URL")?;
     let mut cfg = PoolConfig::new();
     cfg.host = url.host_str().map(|h| h.to_owned());
     cfg.port = url.port();
@@ -609,27 +619,36 @@ fn load_ca_roots(ca_file: Option<&std::path::Path>) -> Result<RootCertStore> {
     }
 }
 
-/// Build the deadpool-postgres connection pool with mandatory TLS.
+struct PoolAssembly {
+    pool: Pool,
+    #[cfg(test)]
+    config: PoolConfig,
+    #[cfg(test)]
+    roots: Arc<RootCertStore>,
+    #[cfg(test)]
+    verifier: Arc<WebPkiServerVerifier>,
+}
+
+/// Assemble the production TLS connector and lazy deadpool pool without
+/// opening a network connection.
 ///
-/// **How `sslmode=verify-full` is delivered:**
-/// tokio-postgres 0.7.x does not accept `verify-full` as a libpq sslmode
-/// value (it accepts only `disable`/`prefer`/`require`). The v1.1 contract
-/// requirement is met by translating the validated `verify-full` policy into
-/// the driver's `SslMode::Require` (never plaintext) + a `MakeRustlsConnect`
-/// that performs CA-pinned hostname verification (the actual verify-full
-/// semantics). The URL is never passed to `tokio_postgres::Config::from_str`
-/// — individual fields are extracted from the parsed URL so no libpq sslmode
-/// parsing occurs.
-fn build_pool(config: Option<&PostgresUserStoreConfig>) -> Result<Pool> {
+/// The concrete `WebPkiServerVerifier` makes the normal rustls verifier an
+/// explicit invariant: there is no dangerous/custom verifier seam in this
+/// path. `build_pool` delegates to this helper, and focused tests inspect the
+/// exact roots, verifier, and translated connection configuration used here.
+fn assemble_pool(config: Option<&PostgresUserStoreConfig>) -> Result<PoolAssembly> {
     let cfg = match config {
         Some(config) => build_pool_config(&config.database_url)?,
         None => PoolConfig::new(),
     };
 
     let ca_file = config.and_then(|c| c.ca_file.as_deref());
-    let roots = load_ca_roots(ca_file)?;
+    let roots = Arc::new(load_ca_roots(ca_file)?);
+    let verifier = WebPkiServerVerifier::builder(Arc::clone(&roots))
+        .build()
+        .context("building standard rustls WebPKI server verifier")?;
     let client_config = rustls::ClientConfig::builder()
-        .with_root_certificates(roots)
+        .with_webpki_verifier(Arc::clone(&verifier))
         .with_no_client_auth();
     let tls = MakeRustlsConnect::new(client_config);
 
@@ -644,7 +663,25 @@ fn build_pool(config: Option<&PostgresUserStoreConfig>) -> Result<Pool> {
     } else {
         builder
     };
-    builder.build().context("building PostgresUserStore pool")
+    let pool = builder.build().context("building PostgresUserStore pool")?;
+
+    Ok(PoolAssembly {
+        pool,
+        #[cfg(test)]
+        config: cfg,
+        #[cfg(test)]
+        roots,
+        #[cfg(test)]
+        verifier,
+    })
+}
+
+/// Build the deadpool-postgres connection pool with mandatory TLS.
+///
+/// Pool construction is lazy: this assembles the pinned-CA rustls connector
+/// and deadpool manager, but no database connection occurs until checkout.
+fn build_pool(config: Option<&PostgresUserStoreConfig>) -> Result<Pool> {
+    Ok(assemble_pool(config)?.pool)
 }
 
 /// Percent-decode a password extracted from a `url::Url` (the `password()`
@@ -789,10 +826,7 @@ impl UserStore for PostgresUserStore {
             .get()
             .await
             .map_err(|e| hosted_backend(pool_err(e)))?;
-        let tx = client
-            .transaction()
-            .await
-            .map_err(hosted_backend)?;
+        let tx = client.transaction().await.map_err(hosted_backend)?;
 
         // Check user existence BEFORE loading the DEK — a new user has no DEK.
         let profiles = tx
@@ -991,13 +1025,7 @@ impl UserStore for PostgresUserStore {
         tx.execute(
             "INSERT INTO pubkeys(fingerprint, username, pubkey, label, algorithm, \
              pq_pubkey, created_at) VALUES($1, $2, $3, $4, 'ed25519', NULL, $5)",
-            &[
-                &fingerprint,
-                &username,
-                &pk_bytes,
-                &label_bytes,
-                &now,
-            ],
+            &[&fingerprint, &username, &pk_bytes, &label_bytes, &now],
         )
         .await
         .map_err(hosted_backend)?;
@@ -1327,13 +1355,7 @@ impl UserStore for PostgresUserStore {
             .execute(
                 "INSERT INTO pubkeys(fingerprint, username, pubkey, label, algorithm, \
                  pq_pubkey, created_at) VALUES($1, $2, $3, $4, 'ed25519', NULL, $5)",
-                &[
-                    &fingerprint,
-                    &username,
-                    &pk_bytes,
-                    &label_bytes,
-                    &now,
-                ],
+                &[&fingerprint, &username, &pk_bytes, &label_bytes, &now],
             )
             .await?;
         Ok(fingerprint)
@@ -1369,10 +1391,7 @@ impl UserStore for PostgresUserStore {
             let owner: String = row.try_get(0)?;
             // Ownership check MUST precede the decrypt: if owner != username
             // we would be decrypting another user's key with the wrong DEK.
-            ensure!(
-                owner == username,
-                "pubkey is already bound to another user"
-            );
+            ensure!(owner == username, "pubkey is already bound to another user");
             let stored_key: Vec<u8> = row.try_get(1)?;
             let algorithm: String = row.try_get(2)?;
             let pq: Option<Vec<u8>> = row.try_get(3)?;
@@ -1762,10 +1781,7 @@ mod tests {
             )
             .await
             .unwrap_err();
-        assert!(matches!(
-            err,
-            HostedAccountProvisionError::KeyAlreadyBound
-        ));
+        assert!(matches!(err, HostedAccountProvisionError::KeyAlreadyBound));
     }
 
     #[tokio::test]
@@ -1792,10 +1808,7 @@ mod tests {
             )
             .await
             .unwrap_err();
-        assert!(matches!(
-            err,
-            HostedAccountProvisionError::Backend(_)
-        ));
+        assert!(matches!(err, HostedAccountProvisionError::Backend(_)));
     }
 
     #[tokio::test]
@@ -1996,6 +2009,87 @@ mod tests {
         assert!(cfg.url.is_none());
     }
 
+    #[test]
+    fn pool_assembly_uses_explicit_ca_standard_verifier_and_required_tls() {
+        let temp = tempfile::tempdir().unwrap();
+        let ca_path = temp.path().join("rds-ca.pem");
+        let certified = rcgen::generate_simple_self_signed(vec![
+            "test-cluster.abc123.us-east-1.rds.amazonaws.com".to_owned(),
+        ])
+        .unwrap();
+        std::fs::write(&ca_path, certified.cert.pem()).unwrap();
+
+        let raw = "postgresql://myrole:mypass@test-cluster.abc123.us-east-1.rds.amazonaws.com:5432/hyprstream?sslmode=verify-full";
+        validate_pg_url(raw).unwrap();
+        let config = PostgresUserStoreConfig {
+            database_url: raw.to_owned(),
+            max_connections: 7,
+            ca_file: Some(ca_path),
+        };
+
+        // Production helper: pool construction is lazy and performs no I/O.
+        let assembly = assemble_pool(Some(&config)).unwrap();
+        assert_eq!(assembly.roots.len(), 1, "the explicit CA must be loaded");
+        let _: &WebPkiServerVerifier = assembly.verifier.as_ref();
+        assert_eq!(
+            assembly.config.host.as_deref(),
+            Some("test-cluster.abc123.us-east-1.rds.amazonaws.com")
+        );
+        assert_eq!(assembly.config.ssl_mode, Some(SslMode::Require));
+        assert_eq!(assembly.pool.status().max_size, 7);
+
+        // Exercise the public production seam too. This must stay causal: if
+        // build_pool stops delegating to the assembly above, its dead-code
+        // warning returns in the focused build.
+        let pool = build_pool(Some(&config)).unwrap();
+        assert_eq!(pool.status().max_size, 7);
+    }
+
+    /// Adversarial live test of the enforcing control through the production
+    /// pool and connector. The operator supplies only file paths in the
+    /// environment; the password-bearing URL remains file-backed.
+    ///
+    /// The endpoint must negotiate Postgres TLS while presenting a self-signed
+    /// certificate that is not rooted in the supplied RDS CA bundle. Success,
+    /// an authentication error, or a generic connectivity error all fail this
+    /// test: rejection must occur during certificate verification.
+    #[tokio::test]
+    async fn pinned_rds_ca_rejects_self_signed_tls_endpoint() {
+        let (Some(url_path), Some(ca_path)) = (
+            std::env::var_os("HYPRSTREAM_POSTGRES_TLS_TEST_URL_FILE"),
+            std::env::var_os("HYPRSTREAM_POSTGRES_TLS_TEST_CA_FILE"),
+        ) else {
+            eprintln!(
+                "skipping adversarial TLS test: HYPRSTREAM_POSTGRES_TLS_TEST_URL_FILE \
+                 and HYPRSTREAM_POSTGRES_TLS_TEST_CA_FILE must both be set"
+            );
+            return;
+        };
+        let raw = std::fs::read_to_string(&url_path)
+            .unwrap_or_else(|e| panic!("TLS test URL file {:?} unreadable: {e}", url_path))
+            .trim()
+            .to_owned();
+        validate_pg_url(&raw).unwrap();
+        let config = PostgresUserStoreConfig {
+            database_url: raw,
+            max_connections: 1,
+            ca_file: Some(PathBuf::from(ca_path)),
+        };
+
+        let pool = build_pool(Some(&config)).unwrap();
+        let error = pool
+            .get()
+            .await
+            .expect_err("self-signed TLS endpoint must not pass the pinned RDS CA verifier");
+        let chain = format!("{error:?}");
+        assert!(
+            chain.contains("InvalidCertificate")
+                || chain.contains("UnknownIssuer")
+                || chain.to_ascii_lowercase().contains("certificate"),
+            "connection failed for a reason other than certificate verification: {chain}"
+        );
+    }
+
     /// Causal test: the production `load_ca_roots` function with no CA file
     /// (test/dev fallback) returns a non-empty Mozilla root store.
     #[test]
@@ -2008,9 +2102,7 @@ mod tests {
     /// nonexistent CA file (fail-closed, not silently using fallback).
     #[test]
     fn load_ca_roots_rejects_nonexistent_file() {
-        let result = load_ca_roots(Some(std::path::Path::new(
-            "/nonexistent/ca-rds.pem",
-        )));
+        let result = load_ca_roots(Some(std::path::Path::new("/nonexistent/ca-rds.pem")));
         assert!(result.is_err());
     }
 }
