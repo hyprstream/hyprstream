@@ -74,9 +74,7 @@ enum PgCmd {
         reply: Sender<AnyResult<Vec<(Vec<u8>, Vec<u8>)>>>,
     },
     /// Ping (connection liveness check).
-    Ping {
-        reply: Sender<AnyResult<()>>,
-    },
+    Ping { reply: Sender<AnyResult<()>> },
 }
 
 /// Sync KV store backed by a deadpool-postgres pool running on a dedicated
@@ -94,19 +92,20 @@ impl PgKv {
     /// (recursive-federation arch verdict) — it does not gate any query; it is
     /// metadata only.
     pub(crate) fn connect(
-        url: &str,
-        root_cert_pem: Option<&std::path::Path>,
+        url: &crate::config::ValidatedRdsUrl,
+        root_cert_pem: &std::path::Path,
         cell_id: &str,
     ) -> AnyResult<Self> {
         let (cmd_tx, cmd_rx) = mpsc::channel::<PgCmd>();
-        let url = url.to_owned();
-        let root_cert = root_cert_pem.map(std::path::PathBuf::from);
+        let driver_url = url.driver_url().to_owned();
+        let dns_hostname = url.dns_hostname().to_owned();
+        let root_cert = root_cert_pem.to_path_buf();
         let cell_id = cell_id.to_owned();
 
         let thread = std::thread::Builder::new()
             .name("pds-pg-bridge".into())
             .spawn(move || {
-                bridge_main(url, root_cert.as_deref(), &cell_id, cmd_rx);
+                bridge_main(driver_url, dns_hostname, &root_cert, &cell_id, cmd_rx);
             })
             .context("failed to spawn pds-pg-bridge thread")?;
 
@@ -118,7 +117,8 @@ impl PgKv {
         // Verify connectivity + migration by pinging. This is the
         // FATAL-on-unavailable boundary: a failed ping here propagates as an
         // error from `connect`, refusing startup rather than degrading to local.
-        kv.ping().context("RDS connection check failed at startup")?;
+        kv.ping()
+            .context("RDS connection check failed at startup")?;
 
         Ok(kv)
     }
@@ -154,7 +154,11 @@ impl PgKv {
         })
     }
 
-    pub(crate) fn range_scan(&self, start: &[u8], end: &[u8]) -> AnyResult<Vec<(Vec<u8>, Vec<u8>)>> {
+    pub(crate) fn range_scan(
+        &self,
+        start: &[u8],
+        end: &[u8],
+    ) -> AnyResult<Vec<(Vec<u8>, Vec<u8>)>> {
         self.round_trip(|reply| PgCmd::RangeScan {
             start: start.to_owned(),
             end: end.to_owned(),
@@ -212,8 +216,9 @@ pub(crate) fn prefix_upper_bound(prefix: &[u8]) -> Option<Vec<u8>> {
 // ---------------------------------------------------------------------------
 
 fn bridge_main(
-    url: String,
-    root_cert: Option<&std::path::Path>,
+    driver_url: String,
+    dns_hostname: String,
+    root_cert: &std::path::Path,
     cell_id: &str,
     cmd_rx: Receiver<PgCmd>,
 ) {
@@ -233,7 +238,7 @@ fn bridge_main(
     };
 
     rt.block_on(async move {
-        let pool = match build_pool(&url, root_cert).await {
+        let pool = match build_pool(&driver_url, &dns_hostname, root_cert) {
             Ok(pool) => pool,
             Err(e) => {
                 tracing::error!("pds-pg-bridge: failed to create pool: {e}");
@@ -266,27 +271,48 @@ fn bridge_main(
     });
 }
 
-async fn build_pool(
-    url: &str,
-    root_cert: Option<&std::path::Path>,
+fn build_pool(
+    driver_url: &str,
+    dns_hostname: &str,
+    root_cert: &std::path::Path,
 ) -> AnyResult<deadpool_postgres::Pool> {
-    let cfg = deadpool_postgres::Config {
-        url: Some(url.to_owned()),
-        ..Default::default()
-    };
-
+    let pg_config = build_driver_config(driver_url, dns_hostname)?;
     let tls = tokio_postgres_rustls::MakeRustlsConnect::new(build_rustls_config(root_cert)?);
-    let pool = cfg
-        .create_pool(Some(deadpool_postgres::Runtime::Tokio1), tls)
-        .map_err(|e| anyhow::anyhow!("deadpool-postgres pool creation failed: {e}"))?;
-    Ok(pool)
+    let manager = deadpool_postgres::Manager::new(pg_config, tls);
+    deadpool_postgres::Pool::builder(manager)
+        .runtime(deadpool_postgres::Runtime::Tokio1)
+        .build()
+        .map_err(|e| anyhow::anyhow!("deadpool-postgres pool creation failed: {e}"))
 }
 
-/// Build a rustls client config for TLS to RDS. If `root_cert_pem` is given,
-/// load it additively alongside the WebPKI roots.
-fn build_rustls_config(
-    root_cert_pem: Option<&std::path::Path>,
-) -> AnyResult<rustls::ClientConfig> {
+/// Parse the translated URL with the pinned driver and reassert the effective
+/// transport policy. This prevents query-level `host`/`hostaddr` overrides or
+/// hostless defaults from changing the DNS endpoint validated by `RdsConfig`.
+fn build_driver_config(driver_url: &str, dns_hostname: &str) -> AnyResult<tokio_postgres::Config> {
+    let config = driver_url
+        .parse::<tokio_postgres::Config>()
+        .map_err(|e| anyhow::anyhow!("failed to construct validated RDS driver config: {e}"))?;
+
+    anyhow::ensure!(
+        config.get_ssl_mode() == tokio_postgres::config::SslMode::Require,
+        "validated RDS driver config did not retain mandatory TLS"
+    );
+    anyhow::ensure!(
+        config.get_hosts() == [tokio_postgres::config::Host::Tcp(dns_hostname.to_owned())],
+        "validated RDS driver config changed the contract DNS hostname"
+    );
+    anyhow::ensure!(
+        config.get_hostaddrs().is_empty(),
+        "validated RDS driver config must not override DNS with hostaddr"
+    );
+
+    Ok(config)
+}
+
+/// Build the rustls connector used by PostgreSQL. The explicit records CA is
+/// mandatory and loaded additively alongside platform roots. Standard rustls
+/// certificate and hostname verification remains enabled.
+fn build_rustls_config(root_cert_pem: &std::path::Path) -> AnyResult<rustls::ClientConfig> {
     let mut root_store = rustls::RootCertStore::empty();
 
     // Add the platform's trusted roots.
@@ -298,25 +324,30 @@ fn build_rustls_config(
         tracing::warn!("failed to load a native TLS root for RDS: {e}");
     }
 
-    // Additively load an operator-provided root (private-CA RDS).
-    if let Some(path) = root_cert_pem {
-        let pem = std::fs::read(path)
-            .map_err(|e| anyhow::anyhow!("failed to read RDS root_cert at {path:?}: {e}"))?;
-        for cert in rustls_pemfile::certs(&mut pem.as_slice())
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| anyhow::anyhow!("failed to parse RDS root_cert PEM at {path:?}: {e}"))?
-        {
-            root_store
-                .add(cert)
-                .map_err(|e| anyhow::anyhow!("failed to add RDS root cert: {e}"))?;
-        }
+    let pem = std::fs::read(root_cert_pem).map_err(|e| {
+        anyhow::anyhow!("failed to read RDS root_cert_file at {root_cert_pem:?}: {e}")
+    })?;
+    let certs = rustls_pemfile::certs(&mut pem.as_slice())
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| {
+            anyhow::anyhow!("failed to parse RDS root_cert_file PEM at {root_cert_pem:?}: {e}")
+        })?;
+    anyhow::ensure!(
+        !certs.is_empty(),
+        "RDS root_cert_file at {root_cert_pem:?} contains no certificates"
+    );
+    for cert in certs {
+        root_store
+            .add(cert)
+            .map_err(|e| anyhow::anyhow!("failed to add RDS root certificate: {e}"))?;
     }
 
-    Ok(
-        rustls::ClientConfig::builder()
-            .with_root_certificates(root_store)
-            .with_no_client_auth(),
-    )
+    let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
+    Ok(rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .map_err(|e| anyhow::anyhow!("failed to select safe RDS TLS protocol versions: {e}"))?
+        .with_root_certificates(root_store)
+        .with_no_client_auth())
 }
 
 /// Idempotent schema migration.
@@ -461,7 +492,10 @@ async fn cmd_put_batch(
             .prepare_typed(
                 "INSERT INTO pds_kv (key, value) VALUES ($1, $2)
                  ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
-                &[tokio_postgres::types::Type::BYTEA, tokio_postgres::types::Type::BYTEA],
+                &[
+                    tokio_postgres::types::Type::BYTEA,
+                    tokio_postgres::types::Type::BYTEA,
+                ],
             )
             .await
             .map_err(|e| anyhow::anyhow!("RDS put_batch: prepare statement failed: {e}"))?;
@@ -556,3 +590,75 @@ fn send_err(cmd: PgCmd, err: anyhow::Error) -> AnyResult<()> {
 
 // We need rustls-native-certs for loading the platform trust store; it's
 // declared as an optional dep under pds-postgres.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn translated_url(url: &str) -> crate::config::ValidatedRdsUrl {
+        crate::config::RdsConfig::validate_url(url)
+            .unwrap_or_else(|e| panic!("valid contract URL rejected: {e}"))
+    }
+
+    #[test]
+    fn valid_contract_url_builds_usable_require_driver_config_without_network() {
+        let validated = translated_url(
+            "postgresql://records:secret@db.internal.example:5432/records?sslmode=verify-full",
+        );
+        let config = build_driver_config(validated.driver_url(), validated.dns_hostname())
+            .unwrap_or_else(|e| panic!("driver config rejected: {e}"));
+
+        assert_eq!(
+            config.get_ssl_mode(),
+            tokio_postgres::config::SslMode::Require
+        );
+        assert_eq!(
+            config.get_hosts(),
+            [tokio_postgres::config::Host::Tcp(
+                "db.internal.example".to_owned()
+            )]
+        );
+        assert!(config.get_hostaddrs().is_empty());
+    }
+
+    #[test]
+    fn driver_config_rejects_query_host_and_hostaddr_overrides() {
+        for url in [
+            "postgresql://records:secret@db.internal.example/records?host=/tmp&sslmode=verify-full",
+            "postgresql://records:secret@db.internal.example/records?hostaddr=127.0.0.1&sslmode=verify-full",
+        ] {
+            let validated = translated_url(url);
+            assert!(
+                build_driver_config(validated.driver_url(), validated.dns_hostname()).is_err(),
+                "driver endpoint override was accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_ca_is_loaded_into_rustls_connector() {
+        let dir = tempfile::TempDir::new().unwrap_or_else(|e| panic!("{e}"));
+        let ca_path = dir.path().join("rds-ca.pem");
+        let certified = rcgen::generate_simple_self_signed(vec!["db.internal.example".to_owned()])
+            .unwrap_or_else(|e| panic!("{e}"));
+        std::fs::write(&ca_path, certified.cert.pem()).unwrap_or_else(|e| panic!("{e}"));
+
+        let client_config = build_rustls_config(&ca_path)
+            .unwrap_or_else(|e| panic!("explicit CA was not loadable: {e}"));
+        let _connector = tokio_postgres_rustls::MakeRustlsConnect::new(client_config);
+    }
+
+    #[test]
+    fn rustls_connector_rejects_missing_empty_and_malformed_ca() {
+        let dir = tempfile::TempDir::new().unwrap_or_else(|e| panic!("{e}"));
+        assert!(build_rustls_config(&dir.path().join("missing.pem")).is_err());
+
+        let empty = dir.path().join("empty.pem");
+        std::fs::write(&empty, b"").unwrap_or_else(|e| panic!("{e}"));
+        assert!(build_rustls_config(&empty).is_err());
+
+        let malformed = dir.path().join("malformed.pem");
+        std::fs::write(&malformed, b"not a certificate").unwrap_or_else(|e| panic!("{e}"));
+        assert!(build_rustls_config(&malformed).is_err());
+    }
+}

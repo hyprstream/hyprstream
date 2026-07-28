@@ -278,16 +278,12 @@ impl PdsRecordStore {
     /// `readonly = true` selects the resolver posture (write methods bail);
     /// `readonly = false` selects the publisher posture.
     #[cfg(feature = "pds-postgres")]
-    pub fn open_postgres(
-        rds: &crate::config::RdsConfig,
-        readonly: bool,
-    ) -> AnyResult<Self> {
+    pub fn open_postgres(rds: &crate::config::RdsConfig, readonly: bool) -> AnyResult<Self> {
         let url = rds.read_url()?;
-        let kv = super::pds_record_pg::PgKv::connect(
-            &url,
-            rds.root_cert.as_deref(),
-            &rds.cell_id,
-        )?;
+        let root_cert_file = rds
+            .root_cert_file()
+            .ok_or_else(|| anyhow!("RDS root_cert_file not configured"))?;
+        let kv = super::pds_record_pg::PgKv::connect(&url, root_cert_file, &rds.cell_id)?;
         Ok(Self {
             backing: RecordBacking::Postgres { kv, readonly },
             at9p_acceptance_identity: None,
@@ -335,7 +331,8 @@ impl PdsRecordStore {
                     (record_key(did, collection, tid), record.to_dag_cbor()),
                     (commit_key(did), commit.to_dag_cbor()),
                 ];
-                kv.put_batch(&ops).context("PDS record+commit Postgres write failed")?;
+                kv.put_batch(&ops)
+                    .context("PDS record+commit Postgres write failed")?;
                 return Ok(());
             }
             bail!("PdsRecordStore::put_record_and_commit called on a read-only store");
@@ -498,13 +495,14 @@ impl PdsRecordStore {
             #[cfg(feature = "pds-postgres")]
             if let RecordBacking::Postgres { kv, readonly } = &self.backing {
                 if *readonly {
-                    bail!("accepted did:at9p state write attempted on a read-only Postgres PDS store");
+                    bail!(
+                        "accepted did:at9p state write attempted on a read-only Postgres PDS store"
+                    );
                 }
                 let _advance = self.at9p_advance_lock.lock();
                 let local_verifier =
                     At9pAcceptanceVerifier::Local(acceptance_identity.verifying_key());
-                let current =
-                    load_at9p_state_from_pg(kv, &state.subject_cid512, &local_verifier)?;
+                let current = load_at9p_state_from_pg(kv, &state.subject_cid512, &local_verifier)?;
                 if current.as_ref().map(AcceptedAt9pState::watermark) != expected {
                     return current.map_or_else(
                         || bail!(
@@ -514,8 +512,7 @@ impl PdsRecordStore {
                     );
                 }
                 let encoded = encode_at9p_state(state, acceptance_identity, audit_key)?;
-                let checkpoint =
-                    encode_at9p_checkpoint(state, &encoded, acceptance_identity)?;
+                let checkpoint = encode_at9p_checkpoint(state, &encoded, acceptance_identity)?;
                 let ops = vec![
                     (at9p_state_key(&state.subject_cid512), encoded),
                     (at9p_checkpoint_key(&state.subject_cid512), checkpoint),
@@ -815,10 +812,7 @@ fn load_at9p_state_from_pg(
     subject: &str,
     identity: &At9pAcceptanceVerifier,
 ) -> AnyResult<Option<AcceptedAt9pState>> {
-    let vals = kv.get_batch(&[
-        at9p_state_key(subject),
-        at9p_checkpoint_key(subject),
-    ])?;
+    let vals = kv.get_batch(&[at9p_state_key(subject), at9p_checkpoint_key(subject)])?;
     match (&vals[0], &vals[1]) {
         (None, None) => Ok(None),
         (Some(_), None) => bail!("accepted at9p state exists without its monotonic checkpoint"),
@@ -1145,13 +1139,16 @@ struct StoreGenerationSource(Arc<crate::auth::key_rotation::Es256SigningKeyStore
 
 impl crate::auth::ActiveGenerationSource for StoreGenerationSource {
     fn active_generation(&self) -> AnyResult<Option<crate::auth::ActiveGeneration>> {
-        Ok(self.0.active_slot().map(|slot| crate::auth::ActiveGeneration {
-            seq: 0,
-            kid: slot.kid(),
-            verifying_key: *slot.key.verifying_key(),
-            signing_key: slot.key.as_ref().clone(),
-            head_at_op: None,
-        }))
+        Ok(self
+            .0
+            .active_slot()
+            .map(|slot| crate::auth::ActiveGeneration {
+                seq: 0,
+                kid: slot.kid(),
+                verifying_key: *slot.key.verifying_key(),
+                signing_key: slot.key.as_ref().clone(),
+                head_at_op: None,
+            }))
     }
 }
 
@@ -1185,7 +1182,10 @@ impl IntoPdsGenerationSource for Arc<crate::auth::key_rotation::Es256SigningKeyS
         Arc<dyn crate::auth::ActiveGenerationSource>,
         Option<Arc<crate::auth::key_rotation::Es256SigningKeyStore>>,
     ) {
-        (Arc::new(StoreGenerationSource(Arc::clone(&self))), Some(self))
+        (
+            Arc::new(StoreGenerationSource(Arc::clone(&self))),
+            Some(self),
+        )
     }
 }
 
@@ -1874,11 +1874,8 @@ mod pds_store_tests {
         let pds_store = Arc::new(PdsRecordStore::open(pds_dir.path()).expect("open rw"));
         let source: Arc<dyn crate::auth::ActiveGenerationSource> =
             Arc::new(SealedHeadEs256Source::new(state, secrets));
-        let publisher = PdsPublisher::with_generation_source(
-            Arc::clone(&pds_store),
-            DID.to_owned(),
-            source,
-        );
+        let publisher =
+            PdsPublisher::with_generation_source(Arc::clone(&pds_store), DID.to_owned(), source);
 
         publisher.publish("repo-a", SAMPLE_OID).expect("publish K1");
         let commit1 = pds_store
@@ -1899,7 +1896,9 @@ mod pds_store_tests {
 
         // Same publisher instance, new commit. It MUST be signed by K2 — the
         // publisher observed the rotation through the re-sealed head.
-        publisher.publish("repo-a", SAMPLE_OID_2).expect("publish K2");
+        publisher
+            .publish("repo-a", SAMPLE_OID_2)
+            .expect("publish K2");
         let commit2 = pds_store
             .load_repo(DID)
             .expect("load")
@@ -3306,7 +3305,9 @@ mod pds_store_tests {
         );
 
         // No durable anchor was written: the store holds no commit for this DID.
-        let RecordBacking::ReadWrite(db) = &store.backing else { panic!("read-write store") };
+        let RecordBacking::ReadWrite(db) = &store.backing else {
+            panic!("read-write store")
+        };
         assert!(
             db.get(commit_key(&path_form_did)).unwrap().is_none(),
             "no commit key must be persisted for a path-form authority",
