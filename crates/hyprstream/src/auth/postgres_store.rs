@@ -39,10 +39,12 @@ use super::{
 };
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use async_trait::async_trait;
-use deadpool_postgres::{Config as PoolConfig, ManagerConfig, Pool, RecyclingMethod, Runtime};
+use deadpool_postgres::{Config as PoolConfig, Pool};
 use ed25519_dalek::VerifyingKey;
-use std::{path::PathBuf, sync::Arc, time::Duration};
+use rustls::RootCertStore;
+use std::{path::PathBuf, time::Duration};
 use tokio_postgres::Row;
+use tokio_postgres_rustls::MakeRustlsConnect;
 use zeroize::Zeroizing;
 
 /// Profile SELECT — same SQL as PgliteUserStore.
@@ -149,7 +151,7 @@ impl PostgresUserStore {
     ///
     /// Returns `Err` on any startup failure (DNS, TLS, auth, migration).
     /// The caller MUST treat this as fatal — never fall back to pglite or Mem.
-    pub async fn connect(config: PostgresUserStoreConfig, cipher: ColumnCipher) -> Result<Self> {
+    pub(crate) async fn connect(config: PostgresUserStoreConfig, cipher: ColumnCipher) -> Result<Self> {
         Self::new(Some(config), Some(cipher)).await
     }
 
@@ -162,7 +164,7 @@ impl PostgresUserStore {
     }
 
     async fn new(config: Option<PostgresUserStoreConfig>, cipher: Option<ColumnCipher>) -> Result<Self> {
-        let pool = build_pool(config)?;
+        let pool = build_pool(config.as_ref())?;
         let store = Self { pool, cipher };
         store.migrate().await.context("UserStore schema migration failed at startup")?;
         Ok(store)
@@ -393,24 +395,62 @@ fn pool_err(e: deadpool_postgres::PoolError) -> anyhow::Error {
     anyhow!("PostgresUserStore pool error: {e}")
 }
 
-/// Build the deadpool-postgres connection pool with TLS.
-fn build_pool(config: Option<PostgresUserStoreConfig>) -> Result<Pool> {
+/// Build the deadpool-postgres connection pool with mandatory TLS.
+///
+/// The connector is built from either a pinned RDS CA PEM file (production,
+/// `tls_ca_pem`) or the Mozilla root set (test/dev). The contract requires
+/// `sslmode=verify-full` — `from_env` rejects any URL that doesn't require TLS,
+/// and this connector negotiates rustls on every checkout.
+fn build_pool(config: Option<&PostgresUserStoreConfig>) -> Result<Pool> {
     let mut cfg = PoolConfig::new();
-    if let Some(ref config) = config {
+    if let Some(config) = config {
         cfg.url = Some(config.database_url.clone());
     }
-    let mgr = ManagerConfig {
-        recycling_method: RecyclingMethod::Clean,
+
+    // Build a rustls TLS connector — TLS is mandatory for RDS.
+    let tls = {
+        let roots = match config.and_then(|c| c.tls_ca_pem.as_ref()) {
+            Some(ca_path) => {
+                let pem = std::fs::read(ca_path)
+                    .with_context(|| format!("reading TLS CA PEM from {}", ca_path.display()))?;
+                let mut reader = std::io::BufReader::new(pem.as_slice());
+                let mut store = RootCertStore::empty();
+                for cert in rustls_pemfile::certs(&mut reader) {
+                    let cert = cert.context("parsing TLS CA PEM")?;
+                    store
+                        .add(cert)
+                        .map_err(|e| anyhow!("invalid CA certificate in pinned PEM: {e}"))?;
+                }
+                ensure!(
+                    !store.is_empty(),
+                    "TLS CA PEM contained no certificates: {}",
+                    ca_path.display()
+                );
+                store
+            }
+            None => {
+                let mut store = RootCertStore::empty();
+                store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+                store
+            }
+        };
+        let client_config = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        MakeRustlsConnect::new(client_config)
     };
-    let mut builder = cfg.builder(Runtime::Tokio1)?;
-    builder
-        .config(mgr)
+
+    let builder = cfg
+        .builder(tls)
+        .context("creating deadpool-postgres pool builder")?
         .wait_timeout(Some(Duration::from_secs(5)))
         .create_timeout(Some(Duration::from_secs(10)))
         .recycle_timeout(Some(Duration::from_secs(5)));
-    if let Some(ref config) = config {
-        builder.max_size(config.max_connections);
-    }
+    let builder = if let Some(config) = config {
+        builder.max_size(config.max_connections)
+    } else {
+        builder
+    };
     builder.build().context("building PostgresUserStore pool")
 }
 
@@ -1314,13 +1354,13 @@ mod tests {
     /// Postgres instance, while letting developers and the dedicated CI job
     /// run the real-DB suite.
     macro_rules! require_db {
-        () => {
+        () => {{
             let Some(url) = test_dsn() else {
                 eprintln!("skipping PostgresUserStore test: HYPRSTREAM_POSTGRES_TEST_URL unset");
                 return;
             };
             url
-        };
+        }};
     }
 
     async fn fresh() -> PostgresUserStore {
