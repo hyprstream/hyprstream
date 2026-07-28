@@ -3,7 +3,7 @@
 //! # Architecture
 //!
 //! [`PostgresUserStore`] is the deployed backend; [`PgliteUserStore`] is the
-//! embedded localhost/workstation backend. Both implement the exact same
+//! embedded local/workstation backend. Both implement the exact same
 //! [`UserStore`] trait against the exact same [`USERSTORE_SCHEMA`] DDL. The
 //! only difference is the I/O substrate: deadpool-postgres pooled connections
 //! + TLS to RDS, vs PGlite's single embedded connection.
@@ -198,7 +198,7 @@ impl PostgresUserStore {
 
     /// Open a PostgresUserStore WITHOUT encryption — **TEST/MIGRATION ONLY**.
     ///
-    /// Uses `NoTls` (plaintext to localhost) — production MUST use [`Self::connect`]
+    /// Uses `NoTls` (plaintext to local Postgres) — production MUST use [`Self::connect`]
     /// which forces rustls TLS to RDS.
     #[cfg(test)]
     pub async fn connect_plaintext(config: PostgresUserStoreConfig) -> Result<Self> {
