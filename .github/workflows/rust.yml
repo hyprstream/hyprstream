@@ -35,7 +35,7 @@ env:
   # toolchain's components/targets, all baked. Bump this digest deliberately after
   # a builder-image publish so CI inputs stay reproducible (a follow-up automates
   # the bump — see build-image.yml).
-  BUILDER_IMAGE: ghcr.io/hyprstream/rust-builder-arm64@sha256:aa9feb1c8432ebf4583fcfc9c8236c371cb050f489c4d0882a7f2d8c8589120e
+  BUILDER_IMAGE: ghcr.io/hyprstream/rust-builder-arm64@sha256:2c7dd5d5c103f1ff44814ea204538d4b78f8f327a9f02437a2a8fc7412dcbb72
 
 # The fast lint jobs (clippy, wasm) run on the self-hosted Graviton (arm64)
 # runners and drive the build through `podman run` against the prebuilt
