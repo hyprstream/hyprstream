@@ -1,7 +1,7 @@
 //! Middleware for authentication, logging, and request processing
 
 use crate::auth::jwt;
-use crate::server::state::{ResourceAuthState, ServerState};
+use crate::server::state::ResourceAuthState;
 use axum::{
     extract::{Request, State},
     http::{header, HeaderValue, StatusCode},
@@ -582,13 +582,6 @@ pub(crate) async fn verify_resource_token_claims(
     claims.strip_federated_clearance(local_issuers);
     claims.strip_federated_tenant(local_issuers);
     Ok(claims)
-}
-
-pub(crate) async fn verify_token_claims(
-    state: &ServerState,
-    token: &str,
-) -> Result<jwt::Claims, &'static str> {
-    verify_resource_token_claims(&state.resource_auth_state(), token).await
 }
 
 /// Build WWW-Authenticate header value with resource_metadata URL (RFC 9728).

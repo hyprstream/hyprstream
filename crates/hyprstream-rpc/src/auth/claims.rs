@@ -682,6 +682,15 @@ mod tests {
     }
 
     #[test]
+    fn expiry_check_handles_i64_max_without_wrapping() {
+        let claims = Claims::new("alice".to_owned(), 0, i64::MAX);
+        assert!(
+            !claims.is_expired(),
+            "an i64::MAX expiry must not wrap into an expired timestamp"
+        );
+    }
+
+    #[test]
     fn test_claims_with_issuer() {
         let claims = Claims::new("alice".to_owned(), 1000, 2000)
             .with_issuer("https://a.example.com".to_owned());

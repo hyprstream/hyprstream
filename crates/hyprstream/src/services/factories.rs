@@ -1916,7 +1916,19 @@ fn create_mcp_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
                                 // Replay prevention: atomic check-and-record on the shared TtlCache.
                                 {
                                     let now = chrono::Utc::now().timestamp();
-                                    let ttl_secs = ((proof.iat + 120) - now).max(0) as u64;
+                                    let Some(ttl_secs) = proof
+                                        .iat
+                                        .checked_add(120)
+                                        .and_then(|deadline| deadline.checked_sub(now))
+                                        .filter(|remaining| *remaining > 0 && *remaining <= 180)
+                                        .and_then(|remaining| u64::try_from(remaining).ok())
+                                    else {
+                                        let mut res = (StatusCode::UNAUTHORIZED, "Authentication failed").into_response();
+                                        if let Ok(val) = header::HeaderValue::from_str(&www_authenticate) {
+                                            res.headers_mut().insert(header::WWW_AUTHENTICATE, val);
+                                        }
+                                        return res;
+                                    };
                                     let result = dpop_jti_seen.insert_if_absent_no_evict(
                                         crate::services::oauth::replay_key::dpop_jti(&proof.jti),
                                         (),

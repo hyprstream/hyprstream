@@ -429,6 +429,32 @@ mod dpop_stripping_tests {
     use super::*;
     use ed25519_dalek::Signer as _;
 
+    fn signed_ed25519_proof(iat: i64) -> String {
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[0x33; 32]);
+        let header = serde_json::json!({
+            "typ": "dpop+jwt",
+            "alg": "EdDSA",
+            "jwk": {
+                "kty": "OKP",
+                "crv": "Ed25519",
+                "x": URL_SAFE_NO_PAD.encode(signing_key.verifying_key().to_bytes()),
+            },
+        });
+        let payload = serde_json::json!({
+            "jti": "extreme-iat",
+            "htm": "POST",
+            "htu": "https://example.test/oauth/token",
+            "iat": iat,
+        });
+        let signing_input = format!(
+            "{}.{}",
+            URL_SAFE_NO_PAD.encode(header.to_string()),
+            URL_SAFE_NO_PAD.encode(payload.to_string()),
+        );
+        let signature = signing_key.sign(signing_input.as_bytes());
+        format!("{signing_input}.{}", URL_SAFE_NO_PAD.encode(signature.to_bytes()))
+    }
+
     #[test]
     fn dpop_composite_stripped_signature_rejected() {
         let (ml_sk, ml_vk) = hyprstream_rpc::crypto::pq::ml_dsa_generate_keypair();
@@ -471,5 +497,14 @@ mod dpop_stripping_tests {
         let err = verify_dpop_proof(&stripped, "POST", "https://example.test/oauth/token", None).err();
         assert!(matches!(err, Some(DpopError::SignatureInvalid)),
             "expected SignatureInvalid, got {err:?}");
+    }
+
+    #[test]
+    fn dpop_extreme_iat_is_rejected_without_signed_overflow() {
+        let proof = signed_ed25519_proof(i64::MIN);
+        assert!(matches!(
+            verify_dpop_proof(&proof, "POST", "https://example.test/oauth/token", None),
+            Err(DpopError::IatOutOfWindow { iat: i64::MIN, .. })
+        ));
     }
 }
