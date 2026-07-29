@@ -12,7 +12,7 @@ use ed25519_dalek::{SigningKey, VerifyingKey};
 use hyprstream_rpc::crypto::CryptoPolicy;
 
 use crate::auth::identity_store::{self, UserIdentityKeys};
-use crate::auth::{KeyAlgorithm, RocksDbUserStore, UserStore, pubkey_fingerprint};
+use crate::auth::{KeyAlgorithm, UserStore, pubkey_fingerprint};
 
 /// Where the client signing key comes from during enrollment.
 #[derive(Debug, Clone)]
@@ -73,7 +73,7 @@ pub struct EnrollOutcome {
 /// The test-only [`CryptoPolicy::Classical`] variant writes a classical-only
 /// identity with a loud notice — never a silent downgrade.
 pub async fn enroll_user(
-    store: &RocksDbUserStore,
+    store: &dyn UserStore,
     secrets_dir: &Path,
     username: &str,
     source: EnrollKeySource,
@@ -220,7 +220,7 @@ fn adopt_identity(
 /// enrollment goes through [`bind_user_signing_key_material`] directly.
 #[cfg(test)]
 pub(crate) async fn bind_user_signing_key(
-    store: &RocksDbUserStore,
+    store: &dyn UserStore,
     username: &str,
     vk: VerifyingKey,
 ) -> Result<()> {
@@ -238,7 +238,7 @@ pub(crate) async fn bind_user_signing_key(
 /// - bound to a different (stale `anonymous`) user: re-point;
 /// - unbound: add.
 pub(crate) async fn bind_user_signing_key_material(
-    store: &RocksDbUserStore,
+    store: &dyn UserStore,
     username: &str,
     vk: VerifyingKey,
     pq_vk: Option<Vec<u8>>,
@@ -284,6 +284,7 @@ pub(crate) async fn bind_user_signing_key_material(
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use crate::auth::RocksDbUserStore;
     use tempfile::TempDir;
 
     fn open(creds: &TempDir) -> RocksDbUserStore {

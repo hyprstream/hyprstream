@@ -9,6 +9,11 @@
 //!
 //! The database directory is `credentials_dir/users.db/`.
 
+#![cfg_attr(
+    all(feature = "credential-pds", not(test)),
+    allow(dead_code, unused_imports)
+)]
+
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use capnp::message::{Builder, ReaderOptions};
@@ -94,8 +99,20 @@ pub struct RocksDbUserStore {
 }
 
 impl RocksDbUserStore {
-    /// Open (or create) the RocksDB user store at the given directory.
-    pub fn open(credentials_dir: &Path) -> Result<Self> {
+    /// Open a production RocksDB handle after central admission.
+    pub(crate) fn open_admitted(
+        credentials_dir: &Path,
+        _permit: &super::production_user_store::ProductionStorePermit,
+    ) -> Result<Self> {
+        Self::open_inner(credentials_dir)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn open(credentials_dir: &Path) -> Result<Self> {
+        Self::open_inner(credentials_dir)
+    }
+
+    fn open_inner(credentials_dir: &Path) -> Result<Self> {
         let db_path = credentials_dir.join("users.db");
         std::fs::create_dir_all(&db_path)?;
 
@@ -115,7 +132,9 @@ impl RocksDbUserStore {
     ///
     /// Does not acquire the write lock, so this succeeds even when the server
     /// is running. All mutation methods will return `Err` at the RocksDB level.
-    pub fn open_readonly(credentials_dir: &Path) -> Result<Self> {
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub(crate) fn open_readonly(credentials_dir: &Path) -> Result<Self> {
         let db_path = credentials_dir.join("users.db");
 
         let mut opts = rocksdb::Options::default();
@@ -353,7 +372,11 @@ impl RocksDbUserStore {
     }
 }
 
+#[cfg(not(test))]
+impl super::user_store::private::Sealed for RocksDbUserStore {}
+
 #[async_trait]
+#[cfg(any(not(feature = "credential-pds"), test))]
 impl UserStore for RocksDbUserStore {
     async fn get_profile(&self, username: &str) -> Result<Option<UserProfile>> {
         Ok(self.get_raw(username)?.map(|(_, p, _)| p))
@@ -1518,7 +1541,9 @@ mod tests {
             )
             .await?;
 
-        let service = crate::services::oauth::user_service::UserService::new(store.clone());
+        let service = crate::services::oauth::user_service::UserService::new(
+            crate::auth::ProductionUserStore::for_test(store.clone()),
+        );
         service
             .update(
                 "alice",

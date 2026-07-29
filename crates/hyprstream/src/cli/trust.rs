@@ -6,6 +6,7 @@
 
 #![allow(clippy::print_stdout)]
 
+use crate::auth::age_seal::{AgeIdentities, AgeRecipients};
 use crate::cli::commands::{
     DelegateRegistrySignerArgs, MintDeploymentCaArgs, MintRegistryJwtArgs, RotateAuthorityArgs,
     TrustCommand, VerifyDeploymentArgs,
@@ -63,6 +64,7 @@ const DELEGATION_ABILITY: &str = "mint-registry-jwt";
 const MAX_AUTHORITY_LOG_OPERATIONS: usize = 128;
 const MAX_DELEGATION_BYTES: usize = 256 * 1024;
 const MAX_CLOUD_SECRET_BYTES: usize = 64 * 1024;
+const MAX_AGE_CIPHERTEXT_BYTES: usize = 256 * 1024;
 const PUBLIC_CA_INSTALL_PATH: &str = "/etc/hyprstream/trust/deployment-ca.hybrid";
 const AUTHORITY_LOG_INSTALL_PATH: &str = "/etc/hyprstream/trust/deployment-authority.log.json";
 const AUTHORITY_CHECKPOINT_INSTALL_PATH: &str =
@@ -893,56 +895,15 @@ fn combined_identities(generic: &[PathBuf], yubikey: &[PathBuf]) -> Result<Vec<P
 }
 
 fn encrypt_age(plaintext: &[u8], recipients: &[String]) -> Result<Vec<u8>> {
-    ensure!(!recipients.is_empty(), "no age recipients supplied");
-    let mut command = Command::new("age");
-    command
-        .arg("--encrypt")
-        .arg("--output")
-        .arg("-")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit());
-    for recipient in recipients {
-        command.arg("--recipient").arg(recipient);
-    }
-    command.arg("-");
-    let mut child = command.spawn().context("launch age encryption")?;
-    child
-        .stdin
-        .take()
-        .ok_or_else(|| anyhow!("age stdin unavailable"))?
-        .write_all(plaintext)
-        .context("write authority plaintext to age")?;
-    let output = child
-        .wait_with_output()
-        .context("wait for age encryption")?;
-    ensure!(output.status.success(), "age encryption failed");
-    ensure!(!output.stdout.is_empty(), "age produced empty ciphertext");
-    Ok(output.stdout)
+    AgeRecipients::new(recipients.to_vec())?
+        .seal(plaintext, MAX_AGE_CIPHERTEXT_BYTES)
+        .context("encrypt authority through deployment age seam")
 }
 
 fn decrypt_age(path: &Path, identities: &[PathBuf]) -> Result<Zeroizing<Vec<u8>>> {
-    let mut command = Command::new("age");
-    command
-        .arg("--decrypt")
-        .arg("--output")
-        .arg("-")
-        .stdin(Stdio::inherit())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit());
-    for identity in identities {
-        command.arg("--identity").arg(identity);
-    }
-    command.arg(path);
-    let output = command.output().context("launch age decryption")?;
-    let status = output.status;
-    let plaintext = Zeroizing::new(output.stdout);
-    ensure!(status.success(), "age decryption failed");
-    ensure!(
-        plaintext.len() <= 128 * 1024,
-        "decrypted authority bundle is too large"
-    );
-    Ok(plaintext)
+    AgeIdentities::new(identities.to_vec())?
+        .open_file(path, 128 * 1024)
+        .context("decrypt authority through deployment age seam")
 }
 
 fn decrypt_authority(

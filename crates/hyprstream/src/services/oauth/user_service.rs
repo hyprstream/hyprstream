@@ -8,7 +8,10 @@ use anyhow::{anyhow, Result};
 use base64::{engine::general_purpose::STANDARD, Engine};
 use ed25519_dalek::VerifyingKey;
 
-use crate::auth::{UserFilter, UserProfilePatch, UserStore, PubkeyEntry, decode_pubkey_base64};
+use crate::auth::{
+    ProductionUserStore, PubkeyEntry, UserFilter, UserProfilePatch, UserStore,
+    decode_pubkey_base64,
+};
 
 /// Shared user information type (SCIM-informed).
 #[derive(Debug, Clone)]
@@ -73,11 +76,11 @@ pub struct UserUpdate {
 
 /// Shared user CRUD service used by both SCIM HTTP and ZMQ RPC transports.
 pub struct UserService {
-    store: Arc<dyn UserStore>,
+    store: ProductionUserStore,
 }
 
 impl UserService {
-    pub fn new(store: Arc<dyn UserStore>) -> Self {
+    pub(crate) fn new(store: ProductionUserStore) -> Self {
         Self { store }
     }
 
@@ -232,7 +235,7 @@ impl UserService {
     }
 
     /// Get the underlying store for direct access (e.g., by OAuth handlers).
-    pub fn store(&self) -> Arc<dyn UserStore> {
-        Arc::clone(&self.store)
+    pub(crate) fn store(&self) -> Arc<dyn UserStore> {
+        self.store.clone_inner()
     }
 }

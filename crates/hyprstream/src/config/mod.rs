@@ -1466,14 +1466,37 @@ fn default_oauth_port() -> u16 { 6791 }
 /// `Pglite` selects the shared embedded PGlite/Postgres relational store for
 /// the **account system of record** (UserStore). Token and device stores
 /// remain on RocksDB/Valkey — a pglite TokenStore does not exist.
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum CredentialsBackend {
-    #[default]
     Rocksdb,
     Valkey,
     /// Relational UserStore on the shared #1351 PGlite substrate.
     Pglite,
+}
+
+fn default_credentials_backend() -> CredentialsBackend {
+    #[cfg(feature = "credential-pds")]
+    {
+        CredentialsBackend::Pglite
+    }
+    #[cfg(not(feature = "credential-pds"))]
+    {
+        CredentialsBackend::Rocksdb
+    }
+}
+
+impl CredentialsBackend {
+    /// The credential/PDS production profile must never select a backend that
+    /// can persist the protected UserStore columns as plaintext.
+    pub fn ensure_allowed_for_build(self) -> anyhow::Result<()> {
+        #[cfg(feature = "credential-pds")]
+        anyhow::ensure!(
+            self == Self::Pglite,
+            "credential-pds requires credentials.backend = \"pglite\""
+        );
+        Ok(())
+    }
 }
 
 /// Valkey connection settings (used when `backend = "valkey"`).
@@ -1500,12 +1523,21 @@ impl Default for ValkeyCredentialsConfig {
 /// [credentials.valkey]
 /// url = "redis://127.0.0.1:6379"
 /// ```
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CredentialsConfig {
-    #[serde(default)]
+    #[serde(default = "default_credentials_backend")]
     pub backend: CredentialsBackend,
     #[serde(default)]
     pub valkey: ValkeyCredentialsConfig,
+}
+
+impl Default for CredentialsConfig {
+    fn default() -> Self {
+        Self {
+            backend: default_credentials_backend(),
+            valkey: ValkeyCredentialsConfig::default(),
+        }
+    }
 }
 fn default_oauth_scopes() -> Vec<String> {
     // The DEFAULT GRANT set when a client omits `scope`. atproto transition
@@ -3037,6 +3069,26 @@ impl From<&crate::config::server::SamplingParamDefaults> for SamplingParams {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn credentials_backend_default_matches_build_profile() {
+        let config: CredentialsConfig =
+            toml::from_str("").unwrap_or_else(|error| panic!("{error}"));
+        #[cfg(feature = "credential-pds")]
+        assert_eq!(config.backend, CredentialsBackend::Pglite);
+        #[cfg(not(feature = "credential-pds"))]
+        assert_eq!(config.backend, CredentialsBackend::Rocksdb);
+    }
+
+    #[test]
+    fn credential_pds_rejects_plaintext_capable_backends() {
+        #[cfg(feature = "credential-pds")]
+        {
+            assert!(CredentialsBackend::Pglite.ensure_allowed_for_build().is_ok());
+            assert!(CredentialsBackend::Rocksdb.ensure_allowed_for_build().is_err());
+            assert!(CredentialsBackend::Valkey.ensure_allowed_for_build().is_err());
+        }
+    }
+
     #[test]
     fn standalone_inference_config_rejects_partial_stage_without_subset_loader() {
         let model = tempfile::TempDir::new().unwrap_or_else(|e| panic!("{e}"));
