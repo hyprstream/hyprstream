@@ -40,7 +40,7 @@ use super::{
 };
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use async_trait::async_trait;
-use deadpool_postgres::{Config as PoolConfig, Pool, Runtime, SslMode};
+use deadpool_postgres::{Config as PoolConfig, GenericClient, Pool, Runtime, SslMode};
 use ed25519_dalek::VerifyingKey;
 use rustls::{client::WebPkiServerVerifier, RootCertStore};
 use std::{path::PathBuf, sync::Arc, time::Duration};
@@ -279,35 +279,27 @@ impl PostgresUserStore {
     /// Unseal the user's persisted root DEK via a pool checkout (non-tx path).
     /// Fails closed when the wrapped DEK is absent or key material is unavailable.
     async fn load_user_key(&self, username: &str) -> Result<Zeroizing<[u8; ROOT_DEK_BYTES]>> {
-        let cipher = self
-            .cipher
-            .as_ref()
-            .context("encryption is not configured for this store")?;
         let client = self.pool.get().await.map_err(pool_err)?;
-        let rows = client
-            .query(
-                "SELECT wrapped_dek FROM user_encryption_keys WHERE username=$1",
-                &[&username],
-            )
-            .await?;
-        let wrapped: Vec<u8> = rows
-            .first()
-            .context("wrapped UserStore DEK is absent — key material revoked or never provisioned")?
-            .get(0);
-        cipher.open_user_key(&wrapped).await
+        self.load_user_key_from(&client, username).await
     }
 
-    /// Transaction-scoped DEK load — queries through the active transaction.
-    async fn load_user_key_tx(
+    /// Load a user's DEK through the caller's existing connection or transaction.
+    ///
+    /// A caller that already owns a pooled connection must not await another
+    /// pool checkout while retaining the first one.
+    async fn load_user_key_from<C>(
         &self,
-        tx: &deadpool_postgres::Transaction<'_>,
+        client: &C,
         username: &str,
-    ) -> Result<Zeroizing<[u8; ROOT_DEK_BYTES]>> {
+    ) -> Result<Zeroizing<[u8; ROOT_DEK_BYTES]>>
+    where
+        C: GenericClient,
+    {
         let cipher = self
             .cipher
             .as_ref()
             .context("encryption is not configured for this store")?;
-        let rows = tx
+        let rows = client
             .query(
                 "SELECT wrapped_dek FROM user_encryption_keys WHERE username=$1",
                 &[&username],
@@ -324,6 +316,17 @@ impl PostgresUserStore {
 
     async fn external_identities(&self, username: &str) -> Result<Vec<ExternalIdentityBinding>> {
         let client = self.pool.get().await.map_err(pool_err)?;
+        Self::external_identities_from(&client, username).await
+    }
+
+    /// Query identities through the caller's existing connection or transaction.
+    async fn external_identities_from<C>(
+        client: &C,
+        username: &str,
+    ) -> Result<Vec<ExternalIdentityBinding>>
+    where
+        C: GenericClient,
+    {
         let rows = client
             .query(
                 "SELECT issuer, issuer_sub FROM oidc_bindings \
@@ -711,9 +714,9 @@ impl UserStore for PostgresUserStore {
         let Some(row) = rows.first().cloned() else {
             return Ok(None);
         };
-        let bindings = self.external_identities(username).await?;
+        let bindings = Self::external_identities_from(&client, username).await?;
         let root = if self.is_encrypted() {
-            Some(self.load_user_key(username).await?)
+            Some(self.load_user_key_from(&client, username).await?)
         } else {
             None
         };
@@ -846,7 +849,7 @@ impl UserStore for PostgresUserStore {
             // User exists — load DEK through the active transaction.
             let root = if self.is_encrypted() {
                 Some(
-                    self.load_user_key_tx(&tx, username)
+                    self.load_user_key_from(&tx, username)
                         .await
                         .map_err(hosted_backend)?,
                 )
@@ -939,7 +942,7 @@ impl UserStore for PostgresUserStore {
             let owner: String = owner_row.try_get(0).map_err(hosted_backend)?;
             let owner_root = if self.is_encrypted() {
                 Some(
-                    self.load_user_key_tx(&tx, &owner)
+                    self.load_user_key_from(&tx, &owner)
                         .await
                         .map_err(hosted_backend)?,
                 )
@@ -1061,7 +1064,7 @@ impl UserStore for PostgresUserStore {
         let tx = client.transaction().await.map_err(hosted_backend)?;
         let root = if self.is_encrypted() {
             Some(
-                self.load_user_key_tx(&tx, username)
+                self.load_user_key_from(&tx, username)
                     .await
                     .map_err(hosted_backend)?,
             )
@@ -1137,7 +1140,7 @@ impl UserStore for PostgresUserStore {
         let mut client = self.pool.get().await.map_err(pool_err)?;
         let tx = client.transaction().await?;
         let root = if self.is_encrypted() {
-            Some(self.load_user_key_tx(&tx, username).await?)
+            Some(self.load_user_key_from(&tx, username).await?)
         } else {
             None
         };
@@ -1318,7 +1321,7 @@ impl UserStore for PostgresUserStore {
             .await?;
         ensure!(exists.len() == 1, "unknown user");
         let root = if self.is_encrypted() {
-            Some(self.load_user_key(username).await?)
+            Some(self.load_user_key_from(&client, username).await?)
         } else {
             None
         };
@@ -1576,6 +1579,7 @@ impl UserStore for PostgresUserStore {
 #[cfg(all(test, feature = "postgres"))]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
+    use super::super::encrypted_columns::DekSealer;
     use super::*;
     use ed25519_dalek::SigningKey;
     use rand::rngs::OsRng;
@@ -1608,10 +1612,37 @@ mod tests {
     }
 
     async fn fresh(url: &str) -> PostgresUserStore {
-        let cfg = PostgresUserStoreConfig::from_url(url);
+        fresh_with_max_connections(url, 2 * num_cpus::get()).await
+    }
+
+    async fn fresh_with_max_connections(url: &str, max_connections: usize) -> PostgresUserStore {
+        let mut cfg = PostgresUserStoreConfig::from_url(url);
+        cfg.max_connections = max_connections;
         let store = PostgresUserStore::connect_plaintext(cfg).await.unwrap();
-        let client = store.pool.get().await.unwrap();
-        client.execute("DELETE FROM users", &[]).await.unwrap();
+        {
+            let client = store.pool.get().await.unwrap();
+            client.execute("DELETE FROM users", &[]).await.unwrap();
+        }
+        store
+    }
+
+    struct TestDekSealer;
+
+    impl DekSealer for TestDekSealer {
+        fn seal(&self, plaintext: &[u8]) -> Result<Vec<u8>> {
+            Ok(plaintext.iter().map(|byte| byte ^ 0xA5).collect())
+        }
+
+        fn open(&self, ciphertext: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
+            Ok(Zeroizing::new(
+                ciphertext.iter().map(|byte| byte ^ 0xA5).collect(),
+            ))
+        }
+    }
+
+    async fn fresh_encrypted_with_one_connection(url: &str) -> PostgresUserStore {
+        let mut store = fresh_with_max_connections(url, 1).await;
+        store.cipher = Some(ColumnCipher::new(Arc::new(TestDekSealer)));
         store
     }
 
@@ -1635,6 +1666,35 @@ mod tests {
         let url = require_db!();
         let store = fresh(&url).await;
         assert!(store.get_profile("nobody").await.unwrap().is_none());
+    }
+
+    /// A one-slot pool turns a nested checkout into a deterministic timeout.
+    /// Both read paths must complete while using only the already checked-out
+    /// client for their auxiliary identity/DEK queries.
+    #[tokio::test]
+    async fn one_connection_pool_completes_composed_encrypted_reads() {
+        let url = require_db!();
+        let store = fresh_encrypted_with_one_connection(&url).await;
+        store.register("alice").await.unwrap();
+        let key = make_key();
+        let fingerprint = store
+            .add_pubkey("alice", key, Some("laptop".to_owned()))
+            .await
+            .unwrap();
+
+        let profile = tokio::time::timeout(Duration::from_secs(2), store.get_profile("alice"))
+            .await
+            .expect("get_profile must not wait for a second pool checkout")
+            .unwrap()
+            .expect("registered profile must exist");
+        assert!(profile.sub.is_some());
+
+        let keys = tokio::time::timeout(Duration::from_secs(2), store.list_pubkeys("alice"))
+            .await
+            .expect("list_pubkeys must not wait for a second pool checkout")
+            .unwrap();
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].fingerprint, fingerprint);
     }
 
     #[tokio::test]
