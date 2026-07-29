@@ -13,7 +13,7 @@ on:
       - 'rust-toolchain.toml'
   push:
     branches: ['main']
-    tags: ['hyprstream-rpc-std-v*']
+    tags: ['hyprstream-rpc-v*']
   workflow_dispatch:
 
 # Build/PR jobs cannot publish. Each publishing job receives only an ephemeral
@@ -63,7 +63,7 @@ jobs:
       - name: Build, pack, and smoke test
         run: bash .github/scripts/package-rpc-std-wasm.sh
         env:
-          PACKAGE_CHANNEL: ${{ github.ref == 'refs/heads/main' && 'staging' || startsWith(github.ref, 'refs/tags/hyprstream-rpc-std-v') && 'production' || 'ci' }}
+          PACKAGE_CHANNEL: ${{ github.ref == 'refs/heads/main' && 'staging' || startsWith(github.ref, 'refs/tags/hyprstream-rpc-v') && 'production' || 'ci' }}
 
       - name: Upload exact package and integrity evidence
         uses: actions/upload-artifact@v4
@@ -112,7 +112,7 @@ jobs:
 
   publish-production:
     name: Publish protected release tag
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/hyprstream-rpc-std-v')
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/hyprstream-rpc-v')
     needs: build-package-smoke
     runs-on: ubuntu-latest
     environment: npm-production

@@ -5,6 +5,8 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 
+const PACKAGE_NAME = '@hyprstream/rpc';
+const RELEASE_TAG_PREFIX = 'hyprstream-rpc';
 const [distDir, expectedChannel] = process.argv.slice(2);
 if (!distDir || !expectedChannel) {
   throw new Error('usage: verify-rpc-std-wasm-package.mjs <dist-dir> <staging|production>');
@@ -19,7 +21,7 @@ if (tarballs.length !== 1 || !entries.includes('integrity.json') || entries.leng
   throw new Error(`artifact must contain exactly one tarball and integrity.json: ${entries.join(', ')}`);
 }
 const evidence = JSON.parse(fs.readFileSync(path.join(distDir, 'integrity.json'), 'utf8'));
-if (evidence.schema !== 1 || evidence.package !== 'hyprstream-rpc-std') {
+if (evidence.schema !== 1 || evidence.package !== PACKAGE_NAME) {
   throw new Error('unexpected package evidence identity');
 }
 if (evidence.channel !== expectedChannel) {
@@ -39,7 +41,7 @@ if (sha256 !== evidence.sha256 || integrity !== evidence.integrity) {
 }
 
 if (expectedChannel === 'production') {
-  const expectedRef = `refs/tags/hyprstream-rpc-std-v${evidence.version}`;
+  const expectedRef = `refs/tags/${RELEASE_TAG_PREFIX}-v${evidence.version}`;
   if (process.env.GITHUB_REF !== expectedRef) {
     throw new Error(`production ref must be exactly ${expectedRef}`);
   }

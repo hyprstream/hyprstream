@@ -5,7 +5,9 @@ set -euo pipefail
 
 readonly ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 readonly CRATE_DIR="$ROOT/crates/hyprstream-rpc-std"
-readonly PACKAGE_NAME="hyprstream-rpc-std"
+readonly WASM_PACK_PACKAGE_NAME="hyprstream-rpc-std"
+readonly PACKAGE_NAME="@hyprstream/rpc"
+readonly RELEASE_TAG_PREFIX="hyprstream-rpc"
 readonly REGISTRY="https://registry.npmjs.org"
 readonly CHANNEL="${PACKAGE_CHANNEL:-ci}"
 readonly SHA="${GITHUB_SHA:-$(git -C "$ROOT" rev-parse HEAD)}"
@@ -24,7 +26,7 @@ PY
 
 case "$CHANNEL" in
   production)
-    expected_ref="refs/tags/${PACKAGE_NAME}-v${crate_version}"
+    expected_ref="refs/tags/${RELEASE_TAG_PREFIX}-v${crate_version}"
     if [[ "${GITHUB_REF:-}" != "$expected_ref" ]]; then
       echo "production requires exact immutable release tag $expected_ref" >&2
       exit 1
@@ -69,16 +71,16 @@ wasm-pack build \
   "$CRATE_DIR" \
   --locked
 
-# wasm-pack derives this unscoped npm name from the existing Cargo package. Do
-# not silently rename or scope it: namespace/ownership changes require an
-# explicit repository decision and npm trusted-publisher reconfiguration.
-node - "$PKG_DIR/package.json" "$package_version" "$PACKAGE_NAME" "$REGISTRY" <<'NODE'
+# wasm-pack derives its name from the Rust package. Validate that generated
+# identity before rewriting it to the explicitly authorized public npm scope.
+node - "$PKG_DIR/package.json" "$package_version" "$WASM_PACK_PACKAGE_NAME" "$PACKAGE_NAME" "$REGISTRY" <<'NODE'
 const fs = require('node:fs');
-const [manifestPath, version, expectedName, registry] = process.argv.slice(2);
+const [manifestPath, version, wasmPackName, packageName, registry] = process.argv.slice(2);
 const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
-if (manifest.name !== expectedName) {
-  throw new Error(`wasm-pack package name ${manifest.name} != ${expectedName}`);
+if (manifest.name !== wasmPackName) {
+  throw new Error(`wasm-pack package name ${manifest.name} != ${wasmPackName}`);
 }
+manifest.name = packageName;
 manifest.version = version;
 manifest.license = 'MIT';
 manifest.repository = {
