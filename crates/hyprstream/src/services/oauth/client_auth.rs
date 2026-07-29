@@ -633,6 +633,16 @@ mod tests {
     }
 
     #[test]
+    fn accepts_maximum_admitted_future_skew_and_lifetime() {
+        let mut claims = valid_claims();
+        let now = chrono::Utc::now().timestamp();
+        let iat = now + 60;
+        claims["iat"] = serde_json::json!(iat);
+        claims["exp"] = serde_json::json!(iat + MAX_CLIENT_ASSERTION_LIFETIME_SECS);
+        assert!(check_claims(&claims, "https://app.test/c", &issuer_audiences()).is_ok());
+    }
+
+    #[test]
     fn rejects_missing_jti() {
         let (sk, jwk) = ed25519_keypair_and_jwk();
         let mut claims = valid_claims();

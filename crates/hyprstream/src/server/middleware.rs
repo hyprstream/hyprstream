@@ -194,8 +194,8 @@ pub async fn auth_middleware(
                     result,
                 ) {
                     warn!("DPoP replay barrier is full; refusing fresh proof");
-                } else {
-                    debug!("DPoP proof jti already used: {}", proof.jti);
+                } else if result == InsertIfAbsentNoEvictResult::Duplicate {
+                    debug!("DPoP proof replayed");
                 }
                 return unauthorized_response("Authentication failed", &www_authenticate);
             }

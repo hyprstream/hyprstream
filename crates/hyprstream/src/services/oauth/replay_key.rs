@@ -23,32 +23,36 @@ pub type ReplayKey = [u8; 32];
 /// of its entry cap, rather than an exact multiple of this number.
 pub const REPLAY_BARRIER_ENTRY_BYTES: usize = 128;
 
-fn digest(parts: &[&[u8]]) -> ReplayKey {
+fn digest(domain: &[u8], components: &[&[u8]]) -> ReplayKey {
     let mut hasher = blake3::Hasher::new();
-    for part in parts {
-        hasher.update(part);
+    hasher.update(b"hyprstream:replay-key:v1\0");
+    hasher.update(&(domain.len() as u64).to_be_bytes());
+    hasher.update(domain);
+    for component in components {
+        hasher.update(&(component.len() as u64).to_be_bytes());
+        hasher.update(component);
     }
     *hasher.finalize().as_bytes()
 }
 
-/// Digest the exact raw key previously used for a DPoP proof JTI.
+/// Digest a DPoP proof JTI in its own replay domain.
 pub fn dpop_jti(jti: &str) -> ReplayKey {
-    digest(&[jti.as_bytes()])
+    digest(b"dpop", &[jti.as_bytes()])
 }
 
-/// Digest the exact raw key previously used for a one-use mount ticket.
+/// Digest a one-use mount ticket JTI in its own replay domain.
 pub fn mount_ticket_jti(jti: &str) -> ReplayKey {
-    digest(&[b"mount-ticket:", jti.as_bytes()])
+    digest(b"mount-ticket", &[jti.as_bytes()])
 }
 
-/// Digest the exact `{client_id}\x1f{jti}` client-assertion key.
+/// Digest a length-framed client-ID/JTI tuple in the client-assertion domain.
 pub fn client_assertion_jti(client_id: &str, jti: &str) -> ReplayKey {
-    digest(&[client_id.as_bytes(), b"\x1f", jti.as_bytes()])
+    digest(b"client-assertion", &[client_id.as_bytes(), jti.as_bytes()])
 }
 
-/// Digest the exact `{issuer}\x1f{jti}` ATProto service-assertion key.
+/// Digest a length-framed issuer/JTI tuple in the ATProto assertion domain.
 pub fn atproto_service_assertion_jti(issuer: &str, jti: &str) -> ReplayKey {
-    digest(&[issuer.as_bytes(), b"\x1f", jti.as_bytes()])
+    digest(b"atproto-service-assertion", &[issuer.as_bytes(), jti.as_bytes()])
 }
 
 #[cfg(test)]
@@ -56,21 +60,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn hashes_the_previous_raw_key_encoding() {
+    fn keys_are_fixed_size_domain_separated_and_tuple_framed() {
         assert_eq!(std::mem::size_of::<ReplayKey>(), 32);
         assert_eq!(REPLAY_BARRIER_ENTRY_BYTES, 128);
-        assert_eq!(dpop_jti("jti"), *blake3::hash(b"jti").as_bytes());
-        assert_eq!(
-            mount_ticket_jti("jti"),
-            *blake3::hash(b"mount-ticket:jti").as_bytes()
+        assert_ne!(dpop_jti("mount-ticket:x"), mount_ticket_jti("x"));
+        assert_ne!(dpop_jti("same"), mount_ticket_jti("same"));
+        assert_ne!(
+            client_assertion_jti("a", "b\x1fc"),
+            client_assertion_jti("a\x1fb", "c")
         );
-        assert_eq!(
-            client_assertion_jti("client", "jti"),
-            *blake3::hash(b"client\x1fjti").as_bytes()
-        );
-        assert_eq!(
-            atproto_service_assertion_jti("did:plc:issuer", "jti"),
-            *blake3::hash(b"did:plc:issuer\x1fjti").as_bytes()
+        assert_ne!(
+            atproto_service_assertion_jti("a", "b\x1fc"),
+            atproto_service_assertion_jti("a\x1fb", "c")
         );
     }
 }

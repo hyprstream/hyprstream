@@ -335,6 +335,21 @@ mod tests {
         );
     }
 
+    #[test]
+    fn replay_caps_cover_maximum_admitted_future_skew() {
+        assert_eq!(OAuthState::DPOP_JTI_MAX_ENTRIES, 216_000);
+        assert_eq!(OAuthState::ASSERTION_JTI_MAX_ENTRIES, 43_200);
+
+        let state = state_for_replay_barrier_tests();
+        let now = chrono::Utc::now().timestamp();
+        assert!(state.check_and_record_dpop_jti("dpop-future-skew", now + 60));
+        assert!(state.check_and_record_assertion_jti(
+            "client",
+            "assertion-future-skew",
+            now + 360
+        ));
+    }
+
     struct KeyReadErrorStore {
         profile: UserProfile,
     }
@@ -1229,17 +1244,16 @@ fn mesh_kem_public_for_policy(
 }
 
 impl OAuthState {
-    /// DPoP JTI replay barrier: 1,000 proofs/s sustained for 120s plus 20%
-    /// headroom. Keys are fixed BLAKE3-256 digests; 128 bytes/live entry
-    /// before allocator slack plans this at about 17.6 MiB.
-    const DPOP_JTI_MAX_ENTRIES: usize = 144_000;
+    /// DPoP admits iat up to 60 seconds in the future and retains through
+    /// iat + 120 seconds: 180 seconds at 1,000 proofs/s plus 20% headroom.
+    /// Fixed BLAKE3-256 digest keys plan 216,000 entries at about 26.4 MiB.
+    const DPOP_JTI_MAX_ENTRIES: usize = 216_000;
     /// Inline reap budget per access (heap pops). Bounds tail latency.
     const DPOP_JTI_REAP_BUDGET: usize = 64;
-    /// Client-assertion replay barrier: 100 assertions/s for the five-minute
-    /// maximum assertion lifetime plus 20% headroom. Fixed 32-byte digest keys
-    /// at 128 bytes/live entry plan 36,000 entries at about 4.4 MiB before
-    /// allocator slack.
-    const ASSERTION_JTI_MAX_ENTRIES: usize = 36_000;
+    /// Client assertions admit iat up to 60 seconds future and live for at
+    /// most 300 seconds from iat: 360 seconds at 100/s plus 20% headroom.
+    /// Fixed digest keys plan 43,200 entries at about 5.3 MiB.
+    const ASSERTION_JTI_MAX_ENTRIES: usize = 43_200;
     /// Inline reap budget per access (heap pops). Bounds tail latency.
     const ASSERTION_JTI_REAP_BUDGET: usize = 64;
 

@@ -342,6 +342,12 @@ async fn verify_mount_ticket(
     namespace_path: &str,
 ) -> Result<VerifiedAttach, &'static str> {
     let claims = crate::server::middleware::verify_token_claims(state, ticket).await?;
+    // Mount tickets are local, MAC-bound credentials. Federation can attest an
+    // identity for ordinary resource access, but cannot consume this shared
+    // replay barrier or choose a local tenant/clearance.
+    if claims.iss != state.oauth_issuer_url {
+        return Err("mount ticket issuer is not local");
+    }
     if !crate::services::oauth::mount_ticket::is_mount_ticket_for(&claims, plane, namespace_path) {
         return Err("token is not valid for this 9P plane/path");
     }
@@ -357,11 +363,36 @@ async fn verify_mount_ticket(
         Some(n) if !n.is_empty() => {}
         _ => return Err("empty subject"),
     }
+    // Validate all authority and time admission before consuming one-use
+    // replay state. The bounded duration also makes subsequent Instant
+    // arithmetic safe from attacker-controlled overflow.
+    claims
+        .tenant
+        .as_deref()
+        .filter(|tenant| !tenant.is_empty() && *tenant != "*")
+        .ok_or("mount ticket missing authority-bound tenant")?;
+    claims
+        .security_context(VerifiedKeyMaterial::Classical)
+        .ok_or("mount ticket missing verified Claims clearance")?;
     let Some(jti) = claims.jti.as_ref() else {
         return Err("mount ticket missing jti");
     };
     let now = chrono::Utc::now().timestamp();
-    let ttl = (claims.exp - now).max(0) as u64;
+    let max_lifetime = crate::services::oauth::mount_ticket::MOUNT_TICKET_TTL;
+    let lifetime = claims
+        .exp
+        .checked_sub(claims.iat)
+        .filter(|lifetime| *lifetime > 0 && *lifetime <= max_lifetime)
+        .ok_or("mount ticket lifetime is invalid")?;
+    let remaining = claims
+        .exp
+        .checked_sub(now)
+        .filter(|remaining| *remaining > 0 && *remaining <= max_lifetime)
+        .ok_or("mount ticket expired")?;
+    if claims.iat > now || lifetime > max_lifetime {
+        return Err("mount ticket issued in the future");
+    }
+    let ttl = u64::try_from(remaining).map_err(|_| "mount ticket lifetime is invalid")?;
     let result = state.dpop_jti_seen.insert_if_absent_no_evict(
         crate::services::oauth::replay_key::mount_ticket_jti(jti),
         (),
