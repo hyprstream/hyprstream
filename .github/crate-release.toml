@@ -53,8 +53,7 @@ internal = [
 # relicensing change; they do not alter a Cargo.toml license field themselves.
 [license_boundary]
 agpl_license = "AGPL-3.0-only"
-permissive_license = "PENDING_OPERATOR_DECISION"
-permissive_license_options = ["Apache-2.0", "MIT OR Apache-2.0"]
+apache_license = "Apache-2.0"
 
 agpl_services = [
   "hyprstream",
@@ -67,7 +66,7 @@ agpl_services = [
   "hyprstream-service",
 ]
 
-permissive_crates = [
+apache_crates = [
   "hyprstream-crypto",
   "hyprstream-rpc",
   "hyprstream-rpc-build",
@@ -76,4 +75,28 @@ permissive_crates = [
   "hyprstream-tui",
   "hyprstream-util",
   "hyprstream-vfs",
+  "hyprstream-workers-python",
+  "hyprstream-workers-python-guest",
+  "hyprstream-workers-tcl",
+  "hyprstream-workers-wasmtime",
+  "hyprstream-workers-wasmtime-fsguest",
 ]
+
+# Execution runtimes are Apache-2.0.  The inference runtime
+# still lives inside the AGPL service crate, and the workers facade still has
+# service wiring, so neither package-level boundary can be expressed yet.
+apache_runtime_targets = [
+  "hyprstream-workers",
+  "hyprstream-workers-python",
+  "hyprstream-workers-python-guest",
+  "hyprstream-workers-tcl",
+  "hyprstream-workers-wasmtime",
+  "hyprstream-workers-wasmtime-fsguest",
+]
+topology_blocked_runtime_targets = ["hyprstream-workers"]
+
+[license_boundary.inference_runtime]
+source_crate = "hyprstream"
+source_paths = ["src/runtime", "src/inference"]
+target_license = "Apache-2.0"
+extraction_required = true

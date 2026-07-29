@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fail if a planned permissive crate reaches a planned AGPL service crate."""
+"""Fail if a planned Apache-2.0 crate reaches a planned AGPL service crate."""
 
 from __future__ import annotations
 
@@ -44,23 +44,39 @@ def local_dependency_names(manifest: dict) -> set[str]:
 def main() -> None:
     policy = load(POLICY_PATH)["license_boundary"]
     services = set(policy["agpl_services"])
-    permissive = set(policy["permissive_crates"])
-    if services & permissive:
-        fail(f"classification overlap: {sorted(services & permissive)}")
+    apache = set(policy["apache_crates"])
+    runtime_targets = set(policy["apache_runtime_targets"])
+    runtime_blocked = set(policy["topology_blocked_runtime_targets"])
+    inference_runtime = policy["inference_runtime"]
+    if policy["apache_license"] != "Apache-2.0":
+        fail("Apache-2.0 must be the single permissive license")
+    if inference_runtime["target_license"] != policy["apache_license"]:
+        fail("inference runtime must use the selected Apache-2.0 license")
+    if services & apache:
+        fail(f"classification overlap: {sorted(services & apache)}")
+    if not runtime_blocked <= runtime_targets:
+        fail(
+            "topology-blocked runtime target is not declared Apache-2.0: "
+            f"{sorted(runtime_blocked - runtime_targets)}"
+        )
 
     manifests = {
         load(path)["package"]["name"]: load(path)
         for path in sorted((ROOT / "crates").glob("*/Cargo.toml"))
     }
-    unknown = (services | permissive) - set(manifests)
+    unknown = (services | apache | runtime_targets) - set(manifests)
     if unknown:
         fail(f"unknown package(s): {sorted(unknown)}")
+    if inference_runtime["source_crate"] not in services:
+        fail("inference runtime source crate must remain an AGPL service until extraction")
+    if not inference_runtime["extraction_required"]:
+        fail("inference runtime must require extraction before the license split")
 
     graph = {
         name: local_dependency_names(manifest)
         for name, manifest in manifests.items()
     }
-    for root in sorted(permissive):
+    for root in sorted(apache):
         queue = [(root, [root])]
         visited = {root}
         while queue:
@@ -69,14 +85,15 @@ def main() -> None:
                 if dependency not in manifests:
                     fail(f"{current} has an unknown local dependency {dependency}")
                 if dependency in services:
-                    fail("permissive-to-AGPL dependency: " + " -> ".join(chain + [dependency]))
+                    fail("Apache-2.0-to-AGPL dependency: " + " -> ".join(chain + [dependency]))
                 if dependency not in visited:
                     visited.add(dependency)
                     queue.append((dependency, chain + [dependency]))
 
     print(
         "license boundary OK: "
-        f"{len(permissive)} permissive roots do not reach {len(services)} AGPL services"
+        f"{len(apache)} Apache-2.0 roots do not reach {len(services)} AGPL services; "
+        f"{len(runtime_blocked)} runtime target(s) await topology extraction"
     )
 
 
