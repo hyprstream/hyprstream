@@ -65,9 +65,9 @@ export RUSTFLAGS
 wasm-pack build \
   --target web \
   --release \
-  --locked \
   --out-dir "$PKG_DIR" \
-  "$CRATE_DIR"
+  "$CRATE_DIR" \
+  --locked
 
 # wasm-pack derives this unscoped npm name from the existing Cargo package. Do
 # not silently rename or scope it: namespace/ownership changes require an
@@ -119,7 +119,10 @@ readonly TARBALL="${tarballs[0]}"
 # entrypoint. This catches missing package files and broken ESM/package metadata.
 consumer="$(mktemp -d)"
 trap 'rm -rf "$consumer"' EXIT
-npm init --yes --scope wasm-smoke --prefix "$consumer" >/dev/null
+(
+  cd "$consumer"
+  npm init --yes --scope wasm-smoke >/dev/null
+)
 npm install --prefix "$consumer" --ignore-scripts --package-lock=false "$TARBALL" >/dev/null
 cat > "$consumer/index.mjs" <<EOF
 import init from '${PACKAGE_NAME}';
