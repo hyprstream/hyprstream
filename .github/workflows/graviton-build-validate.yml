@@ -92,7 +92,8 @@ jobs:
             -e LIBTORCH_BYPASS_VERSION_CHECK=1 \
             -e CARGO_TERM_COLOR=always \
             hyprstream-builder-arm64:ci \
-            cargo build --release --no-default-features --features otel,gittorrent,xet
+            cargo build -p hyprstream --bin hyprstream --locked --release \
+              --no-default-features --features otel,gittorrent,xet,credential-pds
 
   cuda130-arm64-spike:
     # The Dockerfile target and normal dispatch-only workflow live on this

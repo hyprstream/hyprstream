@@ -20,7 +20,6 @@ doctest = true
 [[bin]]
 name = "hyprstream"
 path = "src/bin/main.rs"
-required-features = ["credential-pds"]
 
 
 [dependencies]
@@ -223,8 +222,8 @@ opentelemetry-stdout = { workspace = true, optional = true }
 [features]
 # The credential/PDS service is the default production shape. Keep DuckDB-backed
 # metrics opt-in: DuckDB and PGlite export overlapping PostgreSQL C symbols and
-# cannot be linked into the same process. The `hyprstream` binary target's
-# `required-features` prevents producing a deployable binary without this profile.
+# cannot be linked into the same process. The crate-level build assertion prevents
+# any Hyprstream build from silently omitting this profile.
 default = ["gittorrent", "xet", "systemd", "otel", "kata-vm", "nspawn", "credential-pds"]
 cuda = []
 valkey = ["dep:fred"]  # Enable Valkey/Redis-backed user and token stores

@@ -282,7 +282,7 @@ RUN --mount=type=cache,target=/root/.cargo/registry \
     --mount=type=cache,target=/root/.cargo/git \
     --mount=type=cache,target=/sccache \
     --mount=type=cache,target=/build/target,sharing=locked \
-    OPENSSL_NO_VENDOR=1 cargo build --locked --release --no-default-features --features otel,gittorrent,xet,credential-pds \
+    OPENSSL_NO_VENDOR=1 cargo build -p hyprstream --bin hyprstream --locked --release --no-default-features --features otel,gittorrent,xet,credential-pds \
     && mkdir -p /out \
     && cp /build/target/release/hyprstream /out/hyprstream
 
