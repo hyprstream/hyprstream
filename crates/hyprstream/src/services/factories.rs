@@ -92,6 +92,27 @@ pub(crate) fn pds_store_dir(ctx: &ServiceContext) -> anyhow::Result<std::path::P
     Ok(ctx.deployment_data_dir()?.join("pds-store"))
 }
 
+/// Check whether the checkpointed PDS store contains any accepted states.
+///
+/// At first boot (after `pds init-deployment-store` but before the discovery
+/// pipeline has processed any announcements) the store is empty. In that state
+/// `with_checkpointed_native_announcements` cannot construct checkpoint-verified
+/// QUIC announcements — the accepted states are written by the registry/
+/// discovery announcement pipeline, which runs AFTER services bind. Returning
+/// `false` here lets the caller defer QUIC startup (services bind via inproc/
+/// IPC and serve HTTP routes) without weakening the checkpoint gate: QUIC
+/// activates once the announcement pipeline populates accepted states.
+pub fn pds_store_has_accepted_states(ctx: &ServiceContext) -> anyhow::Result<bool> {
+    let store_dir = pds_store_dir(ctx)?;
+    if !store_dir.exists() {
+        return Ok(false);
+    }
+    let acceptance_identity = hyprstream_discovery::deployment_registry_verifier()?;
+    let store = crate::services::discovery::PdsRecordStore::open_readonly(&store_dir)?
+        .with_at9p_deployment_verifier(acceptance_identity);
+    Ok(!store.accepted_at9p_states()?.is_empty())
+}
+
 /// Populate every ordinary network service announcement from a fresh
 /// checkpoint-verifying PDS read. Missing or ambiguous state fails startup
 /// before any QUIC service can bind and advertise an incomplete bundle.

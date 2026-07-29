@@ -2183,7 +2183,7 @@ fn main() -> Result<()> {
                                 .with_federation_key_source(fed_src);
 
                                 // Wire QUIC shared config from --quic-bind or [quic] config
-                                let quic_cfg = if let Some(ref bind_addr) = quic_bind {
+                                let mut quic_cfg = if let Some(ref bind_addr) = quic_bind {
                                     let mut qc = hyprstream_core::config::QuicConfig::default();
                                     qc.enabled = true;
                                     qc.bind_addr = bind_addr.clone();
@@ -2353,10 +2353,37 @@ fn main() -> Result<()> {
                                 }
 
                                 if quic_cfg.enabled {
-                                    ctx = hyprstream_core::services::factories::with_checkpointed_native_announcements(
-                                        ctx,
-                                        &service_names,
-                                    )?;
+                                    // First-boot deferral: the checkpointed PDS store
+                                    // is empty until the discovery/registry announcement
+                                    // pipeline processes service registrations — which
+                                    // happens AFTER services bind. Rather than hard-fail
+                                    // at `with_checkpointed_native_announcements`
+                                    // (which requires pre-existing accepted states),
+                                    // defer QUIC startup: services bind via inproc/IPC
+                                    // and serve HTTP routes; QUIC activates once the
+                                    // announcement pipeline writes accepted states
+                                    // (typically on the next boot or after a runtime
+                                    // discovery cycle). This does NOT weaken the
+                                    // checkpoint gate — QUIC simply waits for the
+                                    // states it requires.
+                                    let has_states = hyprstream_core::services::factories::pds_store_has_accepted_states(&ctx)
+                                        .unwrap_or_else(|e| {
+                                            tracing::warn!("failed to read PDS accepted states; treating as first boot: {e}");
+                                            false
+                                        });
+                                    if has_states {
+                                        ctx = hyprstream_core::services::factories::with_checkpointed_native_announcements(
+                                            ctx,
+                                            &service_names,
+                                        )?;
+                                    } else {
+                                        tracing::info!(
+                                            "QUIC deferred: PDS store has no accepted states (first boot). \
+                                             Services will bind via inproc/IPC; QUIC activates after the \
+                                             discovery pipeline writes accepted states."
+                                        );
+                                        quic_cfg.enabled = false;
+                                    }
                                 }
 
                                 // Wire QUIC shared config (must be after key generation so jwt_verifying_key is set)
