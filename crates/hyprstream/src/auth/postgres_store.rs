@@ -40,7 +40,7 @@ use super::{
 };
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use async_trait::async_trait;
-use deadpool_postgres::{Config as PoolConfig, Pool, SslMode};
+use deadpool_postgres::{Config as PoolConfig, Pool, Runtime, SslMode};
 use ed25519_dalek::VerifyingKey;
 use rustls::{client::WebPkiServerVerifier, RootCertStore};
 use std::{path::PathBuf, sync::Arc, time::Duration};
@@ -636,13 +636,11 @@ struct PoolAssembly {
 /// explicit invariant: there is no dangerous/custom verifier seam in this
 /// path. `build_pool` delegates to this helper, and focused tests inspect the
 /// exact roots, verifier, and translated connection configuration used here.
-fn assemble_pool(config: Option<&PostgresUserStoreConfig>) -> Result<PoolAssembly> {
-    let cfg = match config {
-        Some(config) => build_pool_config(&config.database_url)?,
-        None => PoolConfig::new(),
-    };
-
-    let ca_file = config.and_then(|c| c.ca_file.as_deref());
+fn assemble_pool(
+    cfg: PoolConfig,
+    ca_file: Option<&std::path::Path>,
+    max_connections: Option<usize>,
+) -> Result<PoolAssembly> {
     let roots = Arc::new(load_ca_roots(ca_file)?);
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let verifier =
@@ -659,11 +657,12 @@ fn assemble_pool(config: Option<&PostgresUserStoreConfig>) -> Result<PoolAssembl
     let builder = cfg
         .builder(tls)
         .context("creating deadpool-postgres pool builder")?
+        .runtime(Runtime::Tokio1)
         .wait_timeout(Some(Duration::from_secs(5)))
         .create_timeout(Some(Duration::from_secs(10)))
         .recycle_timeout(Some(Duration::from_secs(5)));
-    let builder = if let Some(config) = config {
-        builder.max_size(config.max_connections)
+    let builder = if let Some(max_connections) = max_connections {
+        builder.max_size(max_connections)
     } else {
         builder
     };
@@ -685,7 +684,13 @@ fn assemble_pool(config: Option<&PostgresUserStoreConfig>) -> Result<PoolAssembl
 /// Pool construction is lazy: this assembles the pinned-CA rustls connector
 /// and deadpool manager, but no database connection occurs until checkout.
 fn build_pool(config: Option<&PostgresUserStoreConfig>) -> Result<Pool> {
-    Ok(assemble_pool(config)?.pool)
+    let cfg = match config {
+        Some(config) => build_pool_config(&config.database_url)?,
+        None => PoolConfig::new(),
+    };
+    let ca_file = config.and_then(|config| config.ca_file.as_deref());
+    let max_connections = config.map(|config| config.max_connections);
+    Ok(assemble_pool(cfg, ca_file, max_connections)?.pool)
 }
 
 /// Percent-decode a password extracted from a `url::Url` (the `password()`
@@ -2032,7 +2037,12 @@ mod tests {
         };
 
         // Production helper: pool construction is lazy and performs no I/O.
-        let assembly = assemble_pool(Some(&config)).unwrap();
+        let assembly = assemble_pool(
+            build_pool_config(&config.database_url).unwrap(),
+            config.ca_file.as_deref(),
+            Some(config.max_connections),
+        )
+        .unwrap();
         assert_eq!(assembly.roots.len(), 1, "the explicit CA must be loaded");
         let _: &WebPkiServerVerifier = assembly.verifier.as_ref();
         assert_eq!(
@@ -2050,44 +2060,39 @@ mod tests {
     }
 
     /// Adversarial live test of the enforcing control through the production
-    /// pool and connector. The operator supplies only file paths in the
-    /// environment; the password-bearing URL remains file-backed.
+    /// pool and connector.
     ///
     /// The endpoint must negotiate Postgres TLS while presenting a self-signed
     /// certificate that is not rooted in the supplied RDS CA bundle. Success,
     /// an authentication error, or a generic connectivity error all fail this
     /// test: rejection must occur during certificate verification.
     #[tokio::test]
+    #[ignore = "requires the local hs-tls-adversarial PostgreSQL fixture on 127.0.0.1:5434"]
     async fn pinned_rds_ca_rejects_self_signed_tls_endpoint() {
-        let (Some(url_path), Some(ca_path)) = (
-            std::env::var_os("HYPRSTREAM_POSTGRES_TLS_TEST_URL_FILE"),
-            std::env::var_os("HYPRSTREAM_POSTGRES_TLS_TEST_CA_FILE"),
-        ) else {
-            eprintln!(
-                "skipping adversarial TLS test: HYPRSTREAM_POSTGRES_TLS_TEST_URL_FILE \
-                 and HYPRSTREAM_POSTGRES_TLS_TEST_CA_FILE must both be set"
-            );
-            return;
-        };
-        let raw = std::fs::read_to_string(&url_path)
-            .unwrap_or_else(|e| panic!("TLS test URL file {:?} unreadable: {e}", url_path))
-            .trim()
-            .to_owned();
-        // Deliberately do not call validate_pg_url here. The adversarial
-        // endpoint is loopback and would be rejected before TLS; this test
-        // must reach certificate verification through the production pool.
-        let config = PostgresUserStoreConfig {
-            database_url: raw,
-            max_connections: 1,
-            ca_file: Some(PathBuf::from(ca_path)),
-        };
+        // The endpoint is addressed by its loopback IP, but the connector is
+        // deliberately given a DNS name. `hostaddr` pins the TCP peer while
+        // `host` remains the SNI and certificate-verification name. This
+        // bypasses URL validation only for this adversarial test; production
+        // keeps its canonical loopback rejections.
+        let mut cfg = build_pool_config(
+            "postgresql://postgres:adversarial-test@adversarial-selfsigned.local:5434/adversarial?sslmode=verify-full",
+        )
+        .unwrap();
+        cfg.hostaddr = Some("127.0.0.1".parse().unwrap());
+        let pool = assemble_pool(
+            cfg,
+            Some(std::path::Path::new("/etc/ssl/certs/ca-certificates.crt")),
+            Some(1),
+        )
+        .unwrap()
+        .pool;
 
-        let pool = build_pool(Some(&config)).unwrap();
         let error = pool
             .get()
             .await
             .expect_err("self-signed TLS endpoint must not pass the pinned RDS CA verifier");
         let chain = format!("{error:?}");
+        eprintln!("adversarial TLS rejection: {chain}");
         assert!(
             chain.contains("InvalidCertificate")
                 || chain.contains("UnknownIssuer")
