@@ -64,9 +64,70 @@ owned by an unrelated crates.io publisher and cannot be used by this project.
 | `chat-core` | **internal/not publishable** | Current crates.io name belongs to an unrelated publisher; rename and API review required. |
 | `hyprstream` | **internal/not publishable** | Product application, not an SDK; git dependencies and the full internal graph are unsuitable for crates.io. |
 | `hyprstream-appview` | **internal/not publishable** | Product-internal derived identity service with no standalone support contract. |
-| `hyprstream-tui` | **internal/not publishable** | Product UI/application crate, not a supported library API. |
+| `hyprstream-tui` | public later | Supported MIT client TUI for trust/crypto, bootstrap, and enrolment; its publish promotion follows the client dependency and accelerator-runtime download/verification work. |
 | `hyprstream-workers-python-guest` | **internal/not publishable** | Compiled WASM guest artifact, not a Rust consumer library. |
 | `hyprstream-workers-wasmtime-fsguest` | **internal/not publishable** | Test/validation WASI guest binary, not a consumer package. |
+
+## Licensing boundary and client/server split
+
+The repository currently has a workspace default of `license = "MIT"` in
+`[workspace.package]`, and carries both `LICENSE-MIT` and `LICENSE-AGPLV3`.
+Today every crate is effectively MIT except `crates/hyprstream`, whose manifest
+is `MIT OR AGPL-3.0-only`. That is a disjunction: recipients may select MIT and
+disregard AGPL. It therefore supplies no copyleft protection for the server.
+
+The approved target is a mixed, per-crate boundary, not a disjunction:
+
+| Boundary | Approved target |
+|---|---|
+| Services | `AGPL-3.0-only`: `hyprstream`, `hyprstream-pds`, `hyprstream-pds-service`, `hyprstream-appview`, `hyprstream-ledger`, `hyprstream-discovery`, `hyprstream-service`, and `hyprstream-k8s`. |
+| Libraries and client | The single policy value `license_boundary.permissive_license` is **PENDING_OPERATOR_DECISION**. It will be either `Apache-2.0` (recommended) or `MIT OR Apache-2.0`; it applies to `hyprstream-rpc`, `hyprstream-rpc-std`, `hyprstream-rpc-build`, `hyprstream-rpc-derive`, `hyprstream-crypto`, `hyprstream-tui`, `hyprstream-util`, `hyprstream-vfs`, and the future client binary. |
+
+`hyprstream-rpc` is the named exception that protects the client architecture:
+it remains permissive regardless of whether a client or a service consumes it.
+Making the protocol AGPL would prevent independent clients and collapse the
+client story. The TUI is a supported client artifact, not the server/product
+application; it provides the TUI, offline trust/crypto primitives, and
+bootstrap/enrolment while downloading and verifying the heavy accelerator
+runtime instead of bundling it. `hyprstream` remains internal/not publishable
+as the server/product application.
+
+This prospective split aligns three independent boundaries: client-side crates
+are permissive, service crates are AGPL-only, and the public client versus
+internal server release classification follows the same line. It is not yet
+implemented in manifests. Every crate must receive an explicit per-crate
+`license =` value when the separate relicensing change lands: inheriting the
+workspace MIT default is unsafe because a new service crate could silently take
+the wrong license. No license field is changed by this release-policy change.
+
+The permissive choice remains the one pending operator call. `Apache-2.0` is
+recommended because the Apache ICLA's sections 2 and 3 supply inbound copyright
+sublicensing and patent grants, while Apache-2.0 section 3 passes an express
+patent grant to downstream users with defensive termination. `MIT OR
+Apache-2.0` is also a legitimate intentional dual because both choices are
+permissive. The former `MIT OR AGPL-3.0-only` combination was different: its
+permissive branch nullified the intended copyleft.
+
+The legal basis for the prospective outbound licenses is the Apache ICLA:
+section 2 grants a perpetual, irrevocable copyright license including
+sublicensing, and section 3 grants patents. The change is prospective only.
+The repository is public, and the pre-split MIT releases `v0.2.0` (2026-02-04),
+`v0.3.0-rc1`, and `v0.4.0` (2026-06-18) already granted MIT rights to the
+service code; an AGPL-only release cannot revoke those grants. Every additional
+release before the split lands broadens that MIT-granted surface.
+
+The current disjunction was not an approved split implementation: before
+`fcf3f31a5` (2026-02-22, “Locking/threading improvements”), `hyprstream` used
+the workspace MIT license. That commit changed it to `MIT OR AGPL-3.0`.
+`806c167c3` later changed the AGPL spelling to `AGPL-3.0-only` for cargo-deny,
+but retained the `MIT OR` disjunction. License changes must therefore be their
+own reviewed commits, never incidental refactor changes.
+
+`scripts/check_license_boundary.py` enforces the architectural half of this
+policy in CI: no listed permissive crate may transitively depend on a listed
+AGPL service crate. The separate relicensing change must retain that assertion
+and add the explicit per-crate license declarations; a documented boundary
+without the graph check is not a boundary.
 
 ## Versioning and release tags
 
@@ -186,3 +247,14 @@ registries have identical staging semantics:
   production pin may silently drift to a main-branch package;
 - npm may have its own staging dist-tag/version strategy, while crates.io uses
   only immutable SemVer prereleases for pre-stable registry testing.
+
+### npm/crates.io source-artifact asymmetry
+
+`hyprstream-rpc-std` remains public later for crates.io because that registry
+ships Rust source and therefore requires its full local dependency graph to be
+published first. The sibling WASM SDK lane may publish the same interface to npm
+now because npm receives a compiled WASM artifact, which does not expose that
+Rust source dependency graph. This is intentional rather than a contradiction:
+the release order is WASM SDK first and Rust SDK last. The Rust route remains
+gated behind `hyprstream-rpc`, whose source release is blocked by the unreleased
+patched `moq-net` dependency.

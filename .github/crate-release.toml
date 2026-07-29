@@ -30,6 +30,7 @@ public_later = [
   "hyprstream-rpc",
   "hyprstream-rpc-std",
   "hyprstream-service",
+  "hyprstream-tui",
   "hyprstream-util",
   "hyprstream-vfs",
   "hyprstream-vfs-server",
@@ -44,7 +45,35 @@ internal = [
   "chat-core",
   "hyprstream",
   "hyprstream-appview",
-  "hyprstream-tui",
   "hyprstream-workers-python-guest",
   "hyprstream-workers-wasmtime-fsguest",
+]
+
+# Approved target boundary.  These values describe the intended per-crate
+# relicensing change; they do not alter a Cargo.toml license field themselves.
+[license_boundary]
+agpl_license = "AGPL-3.0-only"
+permissive_license = "PENDING_OPERATOR_DECISION"
+permissive_license_options = ["Apache-2.0", "MIT OR Apache-2.0"]
+
+agpl_services = [
+  "hyprstream",
+  "hyprstream-appview",
+  "hyprstream-discovery",
+  "hyprstream-k8s",
+  "hyprstream-ledger",
+  "hyprstream-pds",
+  "hyprstream-pds-service",
+  "hyprstream-service",
+]
+
+permissive_crates = [
+  "hyprstream-crypto",
+  "hyprstream-rpc",
+  "hyprstream-rpc-build",
+  "hyprstream-rpc-derive",
+  "hyprstream-rpc-std",
+  "hyprstream-tui",
+  "hyprstream-util",
+  "hyprstream-vfs",
 ]

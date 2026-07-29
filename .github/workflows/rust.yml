@@ -134,6 +134,7 @@ jobs:
         python3 scripts/check_rust_workflow_matrix.py
         python3 scripts/check_browser_wasm_gate.py
         python3 scripts/check_crate_release_policy.py
+        python3 scripts/check_license_boundary.py
 
   loopback-burndown:
     name: Loopback-literal burn-down (#1152 W4)
