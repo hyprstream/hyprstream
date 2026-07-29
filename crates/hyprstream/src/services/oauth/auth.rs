@@ -100,10 +100,10 @@ pub async fn require_bearer_token(
     if let Some(ref proof_str) = dpop_proof_str {
         let method = request.method().as_str();
         let uri = request.uri();
-        let htu = format!("{}{}",
-            uri.scheme_str().map(|s| format!("{s}://")).unwrap_or_default(),
-            uri.path(),
-        );
+        // RFC 9449 htu is the absolute target URI without query or fragment.
+        // Axum server requests normally carry origin-form URIs, so reconstruct
+        // the authority from the operator-configured canonical OAuth origin.
+        let htu = format!("{}{}", state.atproto_issuer_url(), uri.path());
         let proof = match super::dpop::verify_dpop_proof(proof_str, method, &htu, Some(&token)) {
             Ok(p) => p,
             Err(e) => {

@@ -4,6 +4,7 @@ pub mod flight;
 pub mod git;
 pub mod policy;
 pub mod training;
+pub mod trust;
 pub mod user;
 pub mod worker;
 
@@ -11,6 +12,10 @@ pub use flight::FlightArgs;
 pub use git::{GitAction, GitCommand};
 pub use policy::{PolicyCommand, RoleCommand, TokenCommand};
 pub use training::{TrainingAction, TrainingCommand};
+pub use trust::{
+    DelegateRegistrySignerArgs, MintDeploymentCaArgs, MintRegistryJwtArgs, RotateAuthorityArgs,
+    TrustCommand, VerifyDeploymentArgs,
+};
 pub use user::{UserCommand, UserKeysCommand, UserKeysImportFormat};
 pub use worker::{ImageCommand, WorkerAction};
 

@@ -19,7 +19,7 @@ use rand::RngCore;
 use serde::Deserialize;
 use sha2::{Sha256, Digest};
 
-use crate::auth::user_store::UserProfile;
+use crate::auth::user_store::UserProfilePatch;
 use crate::config::ProviderKind;
 use super::state::{OAuthState, PendingAuthCode, PendingExternalAuth};
 
@@ -403,7 +403,9 @@ pub async fn external_callback(
         }
     };
 
-    // Map external identity to local subject
+    // Map external identity to a candidate local username. This is a *hint* —
+    // the authoritative username is resolved by the credential store, not by
+    // the mapping function.
     let mapped_subject = match super::user_mapping::map_external_identity(
         &provider_slug,
         &external_claims,
@@ -417,54 +419,95 @@ pub async fn external_callback(
         }
     };
 
-    // Check provisioning
-    match super::user_mapping::should_provision(
+    // Resolve the issuer to use for the normalized (issuer, subject) binding.
+    // Prefer the provider's configured issuer_url, then the id_token `iss`
+    // claim, then the provider slug as a last-resort synthetic issuer.
+    let binding_issuer = provider.issuer_url.as_deref()
+        .or_else(|| external_claims["iss"].as_str())
+        .unwrap_or(&provider_slug)
+        .to_owned();
+    let external_sub = match external_claims["sub"].as_str() {
+        Some(s) if !s.is_empty() => s.to_owned(),
+        _ => {
+            tracing::error!(provider = %provider_slug, "External token missing required 'sub' claim — rejecting");
+            return (axum::http::StatusCode::BAD_REQUEST, "External token missing required 'sub' claim").into_response();
+        }
+    };
+
+    // Resolve the authoritative local username via the credential store.
+    // In auto-provision mode this atomically binds (issuer, subject) and may
+    // create the local account. In deny mode the binding must already exist.
+    // Either way: never continue with the pre-binding candidate if the store
+    // resolves a different authoritative username.
+    let authoritative_username = match super::user_mapping::should_provision(
         &provider.provisioning,
         &mapped_subject,
         &provider.allowed_domains,
     ) {
         Ok(true) => {
-            provision_federated_user(
+            // Auto-provision: atomically resolve-or-bind the external identity.
+            match provision_federated_user(
                 &state,
-                &provider_slug,
+                &binding_issuer,
+                &external_sub,
                 &mapped_subject,
                 &external_claims,
                 &provider.default_scopes,
-            ).await;
+            ).await {
+                Ok(username) => username,
+                Err(response) => return response,
+            }
         }
         Ok(false) => {
-            // Deny mode: user must already exist; reject unknown subjects early.
+            // Deny mode: the user must already exist. Resolve the normalized
+            // (issuer, subject) binding first, then fall back to the mapped
+            // username for legacy profiles that pre-date the binding table.
             if let Some(ref user_svc) = state.user_service {
-                match user_svc.store().get_profile(&mapped_subject).await {
-                    Ok(Some(_)) => {}
+                let store = user_svc.store();
+                // Try normalized binding first.
+                match store.get_external_identity_user(&binding_issuer, &external_sub).await {
+                    Ok(Some(username)) => username,
                     Ok(None) => {
-                        tracing::warn!(
-                            provider = %provider_slug,
-                            subject = %mapped_subject,
-                            "Deny mode: user not registered — rejecting"
-                        );
-                        return (
-                            axum::http::StatusCode::FORBIDDEN,
-                            format!("Access denied: '{mapped_subject}' is not registered. Contact your administrator."),
-                        ).into_response();
+                        // No normalized binding — try legacy username lookup.
+                        match store.get_profile(&mapped_subject).await {
+                            Ok(Some(_)) => mapped_subject.clone(),
+                            Ok(None) => {
+                                tracing::warn!(
+                                    provider = %provider_slug,
+                                    subject = %mapped_subject,
+                                    "Deny mode: user not registered — rejecting"
+                                );
+                                return (
+                                    axum::http::StatusCode::FORBIDDEN,
+                                    format!("Access denied: '{mapped_subject}' is not registered. Contact your administrator."),
+                                ).into_response();
+                            }
+                            Err(e) => {
+                                tracing::error!(subject = %mapped_subject, error = %e, "User lookup failed");
+                                return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "User lookup failed").into_response();
+                            }
+                        }
                     }
                     Err(e) => {
-                        tracing::error!(subject = %mapped_subject, error = %e, "User lookup failed");
+                        tracing::error!(issuer = %binding_issuer, subject = %external_sub, error = %e, "External identity lookup failed");
                         return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "User lookup failed").into_response();
                     }
                 }
+            } else {
+                mapped_subject.clone()
             }
         }
         Err(e) => {
             tracing::warn!(provider = %provider_slug, subject = %mapped_subject, error = %e, "Provisioning denied");
             return (axum::http::StatusCode::FORBIDDEN, format!("Access denied: {e}")).into_response();
         }
-    }
+    };
 
     tracing::info!(
         provider = %provider_slug,
         external_sub = %external_claims["sub"].as_str().unwrap_or("unknown"),
         mapped_subject = %mapped_subject,
+        authoritative_username = %authoritative_username,
         "External OIDC authentication successful"
     );
 
@@ -488,7 +531,7 @@ pub async fn external_callback(
         resource: pending.original_resource.clone(),
         created_at: Instant::now(),
         expires_at: Instant::now() + Duration::from_secs(60),
-        username: mapped_subject,
+        username: authoritative_username,
         verifying_key: None, // external OIDC — no local Ed25519 key binding
         dpop_jkt: None, // external OIDC flow — no PAR DPoP binding
         client_assertion_jkt: None, // external OIDC flow — no PAR client-auth binding
@@ -504,102 +547,129 @@ pub async fn external_callback(
     Redirect::temporary(&redirect_url).into_response()
 }
 
-/// Create a UserStore entry and write Casbin rules for a first-time federated login.
+/// Atomically resolve or bind an external IdP identity and provision profile
+/// data for a first-time federated login.
 ///
-/// Idempotent: if the subject already has a profile, skips all writes silently.
-/// Non-fatal: errors are logged but do not abort the login flow.
+/// Returns the authoritative local username — which may differ from the
+/// candidate when the `(issuer, subject)` binding already existed. The caller
+/// MUST use the returned username, never the pre-binding candidate.
+///
+/// Fail-closed: any credential-store error rejects the login. Casbin policy
+/// writes are best-effort (logged, not fatal) because they are a separate
+/// subsystem from the credential store.
 async fn provision_federated_user(
     state: &OAuthState,
-    provider_slug: &str,
-    subject: &str,
+    issuer: &str,
+    external_sub: &str,
+    candidate_username: &str,
     external_claims: &serde_json::Value,
     default_scopes: &[String],
-) {
+) -> Result<String, Response> {
     let Some(ref user_svc) = state.user_service else {
-        tracing::warn!(provider = %provider_slug, "No user store — skipping federated provisioning");
-        return;
+        tracing::error!("Federated provisioning failed: credential store is not configured");
+        return Err((
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "credential store is not configured",
+        )
+            .into_response());
     };
     let store = user_svc.store();
 
-    // Check idempotency before writing.
-    let already_exists = match store.get_profile(subject).await {
-        Ok(Some(_)) => true,
-        Ok(None) => false,
+    // Atomically resolve-or-bind the normalized (issuer, subject) identity.
+    // This is the authoritative step — it creates the local account and binding
+    // in one operation, or returns the existing binding's username.
+    let resolution = match store
+        .resolve_or_bind_external_idp(issuer, external_sub, candidate_username)
+        .await
+    {
+        Ok(r) => r,
         Err(e) => {
-            tracing::error!(subject = %subject, error = %e, "Failed to check user existence");
-            return;
+            tracing::error!(
+                issuer = %issuer,
+                external_sub = %external_sub,
+                candidate = %candidate_username,
+                error = %e,
+                "Failed to resolve or bind external identity — rejecting login"
+            );
+            return Err((
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to provision federated identity",
+            )
+                .into_response());
         }
     };
 
-    if already_exists {
-        tracing::debug!(subject = %subject, "Federated user already provisioned — skipping");
-        return;
-    }
-
-    // First login: register and populate profile from external claims.
-    if let Err(e) = store.register(subject).await {
-        tracing::error!(subject = %subject, error = %e, "Failed to register federated user");
-        return;
-    }
-    let profile = UserProfile {
-        sub: None,
-        name: external_claims["name"].as_str().map(str::to_owned),
-        email: external_claims["email"].as_str().map(str::to_owned),
-        email_verified: external_claims["email_verified"].as_bool(),
-        active: Some(true),
-        external_id: external_claims["sub"].as_str().map(str::to_owned),
-        atproto_did: None,
-        ..Default::default()
-    };
-    if let Err(e) = store.set_profile(subject, profile.into()).await {
-        tracing::warn!(subject = %subject, error = %e, "Failed to set profile for federated user");
-    }
-
-    // Write Casbin rules for default_scopes.
-    // Scope format: "action:resource_type:resource_id" — e.g. "infer:model:*", "read:*:*"
-    let Some(pm) = crate::auth::global_policy_manager() else {
-        tracing::warn!(provider = %provider_slug, "PolicyManager not available — default_scopes not applied");
-        return;
-    };
-
-    // Self-ownership rules: always grant access to the user's own namespace
-    // (user:{sub}:*) so JIT users can at minimum read/write their own profile
-    // and settings — regardless of what default_scopes the provider supplies.
-    // Addresses the zero-capabilities-on-first-login gap (#182).
-    let self_ns = format!("user:{subject}:*");
-    if let Err(e) = pm.add_policy_with_domain(subject, "*", &self_ns, "*", "allow").await {
-        tracing::warn!(subject = %subject, error = %e, "Failed to write self-ownership Casbin rule");
-    }
-
-    // If no scopes are configured by the provider, fall back to viewer-level
-    // defaults so the user can at minimum query models and registry entries.
-    // Operators can tighten or widen via policy templates after provisioning.
-    let effective_scopes: Vec<String> = if default_scopes.is_empty() {
-        vec!["query:model:*".to_owned(), "query:registry:*".to_owned()]
-    } else {
-        default_scopes.to_vec()
-    };
-
-    for scope in &effective_scopes {
-        let parts: Vec<&str> = scope.splitn(3, ':').collect();
-        let (action, resource) = match parts.as_slice() {
-            [action, rtype, rid] if *rtype == "*" && *rid == "*" => (*action, "*".to_owned()),
-            [action, rtype, rid] => (*action, format!("{rtype}:{rid}")),
-            [action] => (*action, "*".to_owned()),
-            _ => continue,
+    // Populate profile fields from external claims only for newly provisioned
+    // accounts. Existing accounts retain their configured profile.
+    if resolution.provisioned {
+        let profile = UserProfilePatch {
+            name: external_claims["name"].as_str().map(str::to_owned).map(Some),
+            email: external_claims["email"].as_str().map(str::to_owned).map(Some),
+            email_verified: external_claims["email_verified"].as_bool().map(Some),
+            active: Some(Some(true)),
+            external_id: external_claims["sub"].as_str().map(str::to_owned).map(Some),
+            ..Default::default()
         };
-        if let Err(e) = pm.add_policy_with_domain(subject, "*", &resource, action, "allow").await {
-            tracing::error!(subject = %subject, scope = %scope, error = %e, "Failed to write Casbin rule");
+        if let Err(e) = store.set_profile(&resolution.username, profile).await {
+            tracing::error!(
+                username = %resolution.username,
+                error = %e,
+                "Failed to set profile for newly provisioned federated user — rejecting login"
+            );
+            return Err((
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to provision federated user profile",
+            )
+                .into_response());
         }
     }
-    if let Err(e) = pm.save().await {
-        tracing::error!(subject = %subject, error = %e, "Failed to persist Casbin rules after provisioning");
+
+    // Write Casbin rules for default_scopes (best-effort — separate subsystem).
+    // Scope format: "action:resource_type:resource_id" — e.g. "infer:model:*", "read:*:*"
+    let subject = &resolution.username;
+    if let Some(pm) = crate::auth::global_policy_manager() {
+        // Self-ownership rules: always grant access to the user's own namespace
+        // (user:{sub}:*) so JIT users can at minimum read/write their own profile
+        // and settings — regardless of what default_scopes the provider supplies.
+        // Addresses the zero-capabilities-on-first-login gap (#182).
+        let self_ns = format!("user:{subject}:*");
+        if let Err(e) = pm.add_policy_with_domain(subject, "*", &self_ns, "*", "allow").await {
+            tracing::warn!(subject = %subject, error = %e, "Failed to write self-ownership Casbin rule");
+        }
+
+        // If no scopes are configured by the provider, fall back to viewer-level
+        // defaults so the user can at minimum query models and registry entries.
+        let effective_scopes: Vec<String> = if default_scopes.is_empty() {
+            vec!["query:model:*".to_owned(), "query:registry:*".to_owned()]
+        } else {
+            default_scopes.to_vec()
+        };
+
+        for scope in &effective_scopes {
+            let parts: Vec<&str> = scope.splitn(3, ':').collect();
+            let (action, resource) = match parts.as_slice() {
+                [action, rtype, rid] if *rtype == "*" && *rid == "*" => (*action, "*".to_owned()),
+                [action, rtype, rid] => (*action, format!("{rtype}:{rid}")),
+                [action] => (*action, "*".to_owned()),
+                _ => continue,
+            };
+            if let Err(e) = pm.add_policy_with_domain(subject, "*", &resource, action, "allow").await {
+                tracing::error!(subject = %subject, scope = %scope, error = %e, "Failed to write Casbin rule");
+            }
+        }
+        if let Err(e) = pm.save().await {
+            tracing::error!(subject = %subject, error = %e, "Failed to persist Casbin rules after provisioning");
+        }
+
+        tracing::info!(
+            subject = %subject,
+            provisioned = resolution.provisioned,
+            scopes = ?effective_scopes,
+            "Federated user provisioned"
+        );
+    } else {
+        tracing::warn!("PolicyManager not available — default_scopes not applied for {subject}");
     }
 
-    tracing::info!(
-        provider = %provider_slug,
-        subject = %subject,
-        scopes = ?effective_scopes,
-        "Federated user provisioned"
-    );
+    Ok(resolution.username)
 }

@@ -2631,7 +2631,7 @@ mod tests {
                         discovery,
                         authority_ca_key().verifying_key().to_bytes(),
                     )
-                    .with_user_store(user_store)
+                    .with_user_store(crate::auth::ProductionUserStore::for_test(user_store))
                     .with_hosted_account_zone(crate::account::AccountZone::new(
                         "example.test",
                     )?)

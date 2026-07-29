@@ -7,19 +7,14 @@
 //! wrapped DEK therefore makes every remaining ciphertext cryptographically
 //! unreadable without retaining a plaintext-key cache.
 //!
-//! ## Trust-mint seam alignment (#1371)
-//!
-//! The [`DekSealer`] trait is the boundary between the field-level cipher and
-//! the deployment key-wrapping mechanism. The production implementation
-//! ([`AgeCliDekSealer`]) invokes the `age` CLI, which supports the same KMS
-//! and YubiKey plugin ecosystem as the trust-mint tooling introduced in #1371.
-//! When #1371's Rust-native `encrypt_age` / identity-recipient primitives land
-//! in this branch's ancestry, a new `DekSealer` impl can wrap them directly;
-//! no change to the field-level cipher or the store is needed. The crypto
-//! design — per-user root DEK, HKDF-derived per-field keys, AES-256-GCM-SIV
-//! with `(username, column, row-binding)` AAD — is independent of the sealer
-//! implementation.
+//! [`DekSealer`] keeps the field cipher testable, while its production adapter
+//! calls the same [`AgeRecipients`](super::age_seal::AgeRecipients) and
+//! [`AgeIdentities`](super::age_seal::AgeIdentities) component used by the
+//! deployment trust mint. The crypto design — per-user root DEK, HKDF-derived
+//! per-field keys, AES-256-GCM-SIV with `(username, column, row-binding)` AAD —
+//! remains independent of the deployment key-wrapping implementation.
 
+use super::age_seal::{AgeIdentities, AgeRecipients};
 use aes_gcm_siv::{
     aead::{Aead, KeyInit, Payload},
     Aes256GcmSiv, Nonce,
@@ -28,19 +23,10 @@ use anyhow::{anyhow, ensure, Context, Result};
 use hkdf::Hkdf;
 use rand::RngCore as _;
 use sha2::Sha256;
-use std::{
-    collections::BTreeSet,
-    ffi::OsString,
-    io::Write as _,
-    path::PathBuf,
-    process::{Command, Stdio},
-    sync::Arc,
-};
-use zeroize::Zeroizing;
+use std::{ffi::OsString, path::PathBuf, sync::Arc};
+use zeroize::{ZeroizeOnDrop, Zeroizing};
 
-#[allow(dead_code)] // consumed by UserStoreEncryptionConfig::from_env, wired in #1378
 pub const AGE_RECIPIENTS_ENV: &str = "HYPRSTREAM_USERSTORE_AGE_RECIPIENTS";
-#[allow(dead_code)] // consumed by UserStoreEncryptionConfig::from_env, wired in #1378
 pub const AGE_IDENTITIES_ENV: &str = "HYPRSTREAM_USERSTORE_AGE_IDENTITIES";
 
 pub(crate) const ROOT_DEK_BYTES: usize = 32;
@@ -48,7 +34,6 @@ const NONCE_BYTES: usize = 12;
 const TAG_BYTES: usize = 16;
 const CIPHERTEXT_MAGIC: &[u8; 4] = b"HSC1";
 const CIPHERTEXT_HEADER_BYTES: usize = CIPHERTEXT_MAGIC.len() + NONCE_BYTES;
-#[allow(dead_code)] // consumed by AgeCliDekSealer, wired in #1378
 const MAX_WRAPPED_DEK_BYTES: usize = 64 * 1024;
 const MAX_COLUMN_PLAINTEXT_BYTES: usize = 1024 * 1024;
 const FIELD_KEY_SALT: &[u8] = b"hyprstream.userstore.field-key.v1";
@@ -60,46 +45,20 @@ const FIELD_CONTEXT_DOMAIN: &[u8] = b"hyprstream.userstore.column.v1";
 /// Identities are age identity files, including plugin identity files.
 ///
 /// Constructed at deployment-startup time from environment variables (see
-/// [`Self::from_env`]) and passed to [`ColumnCipher::from_age_config`]. The
-/// wiring call-site lives in the OAuth service factory (#1378).
-#[allow(dead_code)] // wired in #1378 service-factory cutover
+/// [`Self::from_env`]) and passed to [`ColumnCipher::from_age_config`].
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct UserStoreEncryptionConfig {
-    recipients: Vec<String>,
-    identities: Vec<PathBuf>,
+    recipients: AgeRecipients,
+    identities: AgeIdentities,
 }
 
-#[allow(dead_code)] // deployment-wiring call-site is #1378
 impl UserStoreEncryptionConfig {
     pub fn new(recipients: Vec<String>, identities: Vec<PathBuf>) -> Result<Self> {
-        let mut distinct = BTreeSet::new();
-        for recipient in recipients {
-            let recipient = recipient.trim();
-            ensure!(!recipient.is_empty(), "UserStore age recipient is empty");
-            ensure!(
-                recipient.is_ascii() && !recipient.contains(['\n', '\r', '\0']),
-                "UserStore age recipient contains invalid characters"
-            );
-            distinct.insert(recipient.to_owned());
-        }
-        ensure!(
-            !distinct.is_empty(),
-            "at least one UserStore age recipient is required"
-        );
-        ensure!(
-            !identities.is_empty(),
-            "at least one UserStore age identity is required"
-        );
-        for identity in &identities {
-            ensure!(
-                identity.is_file(),
-                "UserStore age identity file does not exist: {}",
-                identity.display()
-            );
-        }
         Ok(Self {
-            recipients: distinct.into_iter().collect(),
-            identities,
+            recipients: AgeRecipients::new(recipients)
+                .context("invalid UserStore age recipients")?,
+            identities: AgeIdentities::new(identities)
+                .context("invalid UserStore age identities")?,
         })
     }
 
@@ -119,14 +78,6 @@ impl UserStoreEncryptionConfig {
             .ok_or_else(|| anyhow!("{AGE_IDENTITIES_ENV} is required"))?;
         let identities = std::env::split_paths(&identity_list).collect();
         Self::new(recipients, identities)
-    }
-
-    fn recipients(&self) -> &[String] {
-        &self.recipients
-    }
-
-    fn identities(&self) -> &[PathBuf] {
-        &self.identities
     }
 }
 
@@ -192,70 +143,23 @@ pub(crate) trait DekSealer: Send + Sync {
     fn open(&self, ciphertext: &[u8]) -> Result<Zeroizing<Vec<u8>>>;
 }
 
-/// The production age CLI seam. The CLI is intentional: it supports the same
-/// age plugins (including deployment KMS plugins) as the trust-mint workflow.
-#[allow(dead_code)] // constructed via ColumnCipher::from_age_config, wired in #1378
-struct AgeCliDekSealer {
+/// Production adapter over the shared deployment trust-mint age seam.
+struct TrustMintAgeDekSealer {
     config: UserStoreEncryptionConfig,
 }
 
-#[allow(dead_code)] // deployment-wiring call-site is #1378
-impl AgeCliDekSealer {
+impl TrustMintAgeDekSealer {
     fn new(config: UserStoreEncryptionConfig) -> Self {
         Self { config }
     }
-
-    fn command(&self, decrypt: bool) -> Command {
-        let mut command = Command::new("age");
-        command
-            .arg(if decrypt { "--decrypt" } else { "--encrypt" })
-            .arg("--output")
-            .arg("-")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null());
-        if decrypt {
-            for identity in self.config.identities() {
-                command.arg("--identity").arg(identity);
-            }
-        } else {
-            for recipient in self.config.recipients() {
-                command.arg("--recipient").arg(recipient);
-            }
-        }
-        command.arg("-");
-        command
-    }
-
-    fn run(&self, decrypt: bool, input: &[u8]) -> Result<std::process::Output> {
-        let operation = if decrypt { "decryption" } else { "encryption" };
-        let mut child = self
-            .command(decrypt)
-            .spawn()
-            .with_context(|| format!("launch age {operation}"))?;
-        child
-            .stdin
-            .take()
-            .ok_or_else(|| anyhow!("age stdin unavailable"))?
-            .write_all(input)
-            .with_context(|| format!("write age {operation} input"))?;
-        child
-            .wait_with_output()
-            .with_context(|| format!("wait for age {operation}"))
-    }
 }
 
-impl DekSealer for AgeCliDekSealer {
+impl DekSealer for TrustMintAgeDekSealer {
     fn seal(&self, plaintext: &[u8]) -> Result<Vec<u8>> {
-        let output = self.run(false, plaintext)?;
-        ensure!(output.status.success(), "age encryption failed");
-        let ciphertext = output.stdout;
-        ensure!(!ciphertext.is_empty(), "age encryption returned no bytes");
-        ensure!(
-            ciphertext.len() <= MAX_WRAPPED_DEK_BYTES,
-            "wrapped UserStore DEK exceeds size limit"
-        );
-        Ok(ciphertext)
+        self.config
+            .recipients
+            .seal(plaintext, MAX_WRAPPED_DEK_BYTES)
+            .context("seal UserStore DEK through deployment trust")
     }
 
     fn open(&self, ciphertext: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
@@ -263,12 +167,11 @@ impl DekSealer for AgeCliDekSealer {
             !ciphertext.is_empty() && ciphertext.len() <= MAX_WRAPPED_DEK_BYTES,
             "wrapped UserStore DEK has invalid size"
         );
-        let output = self.run(true, ciphertext)?;
-        // Age may emit partial output before a failure. Guard stdout before
-        // checking status so every error path zeroizes those bytes.
-        let plaintext = Zeroizing::new(output.stdout);
-        ensure!(output.status.success(), "age decryption failed");
-        ensure!(!plaintext.is_empty(), "age decryption returned no bytes");
+        let plaintext = self
+            .config
+            .identities
+            .open(ciphertext, ROOT_DEK_BYTES)
+            .context("open UserStore DEK through deployment trust")?;
         ensure!(
             plaintext.len() == ROOT_DEK_BYTES,
             "unwrapped UserStore DEK has invalid length"
@@ -290,16 +193,19 @@ pub(crate) struct ColumnCipher {
 }
 
 impl ColumnCipher {
-    #[allow(dead_code)] // deployment-wiring call-site is #1378
-    pub fn from_age_config(config: UserStoreEncryptionConfig) -> Self {
-        Self::new(Arc::new(AgeCliDekSealer::new(config)))
+    fn from_age_config(config: UserStoreEncryptionConfig) -> Self {
+        Self::new(Arc::new(TrustMintAgeDekSealer::new(config)))
+    }
+
+    pub(crate) fn from_deployment_env() -> Result<Self> {
+        Ok(Self::from_age_config(UserStoreEncryptionConfig::from_env()?))
     }
 
     pub(crate) fn new(sealer: Arc<dyn DekSealer>) -> Self {
         Self { sealer }
     }
 
-    pub async fn create_user_key(&self) -> Result<NewUserKey> {
+    pub(crate) async fn create_user_key(&self) -> Result<NewUserKey> {
         let mut root = Zeroizing::new([0u8; ROOT_DEK_BYTES]);
         rand::rngs::OsRng.fill_bytes(&mut *root);
         let sealer = Arc::clone(&self.sealer);
@@ -316,7 +222,10 @@ impl ColumnCipher {
         Ok(NewUserKey { root, wrapped })
     }
 
-    pub async fn open_user_key(&self, wrapped: &[u8]) -> Result<Zeroizing<[u8; ROOT_DEK_BYTES]>> {
+    pub(crate) async fn open_user_key(
+        &self,
+        wrapped: &[u8],
+    ) -> Result<Zeroizing<[u8; ROOT_DEK_BYTES]>> {
         let sealer = Arc::clone(&self.sealer);
         let wrapped = wrapped.to_vec();
         let plaintext = tokio::task::spawn_blocking(move || sealer.open(&wrapped))
@@ -329,7 +238,7 @@ impl ColumnCipher {
             .map_err(|_| anyhow!("unwrapped UserStore DEK has invalid length"))
     }
 
-    pub fn encrypt(
+    pub(crate) fn encrypt(
         &self,
         root: &[u8; ROOT_DEK_BYTES],
         username: &str,
@@ -362,7 +271,7 @@ impl ColumnCipher {
         Ok(output)
     }
 
-    pub fn decrypt(
+    pub(crate) fn decrypt(
         &self,
         root: &[u8; ROOT_DEK_BYTES],
         username: &str,
@@ -395,7 +304,143 @@ impl ColumnCipher {
             .map_err(|_| anyhow!("authenticate/decrypt UserStore value column"))?;
         Ok(Zeroizing::new(plaintext))
     }
+
+    // ── Convenience: text/bytes seal/open for store backends ─────────────
+    // These are backend-neutral. Any relational store (pglite, PostgresUserStore)
+    // calls them at the BYTEA column boundary.
+
+    /// Seal an optional text field for storage. `None` in → `None` out.
+    pub(crate) fn seal_text(
+        &self,
+        root: &Zeroizing<[u8; ROOT_DEK_BYTES]>,
+        username: &str,
+        column: EncryptedColumn<'_>,
+        value: Option<String>,
+    ) -> Result<Option<Vec<u8>>> {
+        match value {
+            None => Ok(None),
+            Some(text) => Ok(Some(self.encrypt(
+                root,
+                username,
+                column,
+                text.as_bytes(),
+            )?)),
+        }
+    }
+
+    /// Open an optional text field from stored ciphertext.
+    pub(crate) fn open_text(
+        &self,
+        root: &Zeroizing<[u8; ROOT_DEK_BYTES]>,
+        username: &str,
+        column: EncryptedColumn<'_>,
+        raw: Option<Vec<u8>>,
+    ) -> Result<Option<String>> {
+        match raw {
+            None => Ok(None),
+            Some(bytes) => self
+                .decrypt(root, username, column, &bytes)
+                .and_then(zeroizing_bytes_into_string)
+                .map(Some),
+        }
+    }
+
+    /// Seal raw bytes (e.g. pubkey material) for storage.
+    pub(crate) fn seal_raw(
+        &self,
+        root: &Zeroizing<[u8; ROOT_DEK_BYTES]>,
+        username: &str,
+        column: EncryptedColumn<'_>,
+        value: &[u8],
+    ) -> Result<Vec<u8>> {
+        self.encrypt(root, username, column, value)
+    }
+
+    /// Open raw bytes from storage.
+    pub(crate) fn open_raw(
+        &self,
+        root: &Zeroizing<[u8; ROOT_DEK_BYTES]>,
+        username: &str,
+        column: EncryptedColumn<'_>,
+        raw: &[u8],
+    ) -> Result<Zeroizing<Vec<u8>>> {
+        self.decrypt(root, username, column, raw)
+    }
+
+    /// Construct a cipher backed by an in-process test sealer.
+    #[cfg(test)]
+    pub(crate) fn test_cipher() -> Self {
+        Self::new(Arc::new(TestDekSealer))
+    }
 }
+
+/// In-process DekSealer for tests. Uses a fixed AES key.
+#[cfg(test)]
+struct TestDekSealer;
+
+#[cfg(test)]
+impl DekSealer for TestDekSealer {
+    fn seal(&self, plaintext: &[u8]) -> Result<Vec<u8>> {
+        let cipher = Aes256GcmSiv::new_from_slice(&TEST_KEK)
+            .map_err(|_| anyhow!("initialize test DEK sealer"))?;
+        let mut nonce = [0u8; NONCE_BYTES];
+        rand::rngs::OsRng.fill_bytes(&mut nonce);
+        let ct = cipher
+            .encrypt(
+                Nonce::from_slice(&nonce),
+                Payload {
+                    msg: plaintext,
+                    aad: TEST_WRAP_AAD,
+                },
+            )
+            .map_err(|_| anyhow!("seal test DEK"))?;
+        let mut out = nonce.to_vec();
+        out.extend_from_slice(&ct);
+        Ok(out)
+    }
+
+    fn open(&self, ciphertext: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
+        ensure!(
+            ciphertext.len() >= NONCE_BYTES + TAG_BYTES,
+            "test wrapped key is truncated"
+        );
+        let cipher = Aes256GcmSiv::new_from_slice(&TEST_KEK)
+            .map_err(|_| anyhow!("initialize test DEK sealer"))?;
+        let plaintext = cipher
+            .decrypt(
+                Nonce::from_slice(&ciphertext[..NONCE_BYTES]),
+                Payload {
+                    msg: &ciphertext[NONCE_BYTES..],
+                    aad: TEST_WRAP_AAD,
+                },
+            )
+            .map_err(|_| anyhow!("test wrapped key authentication failed"))?;
+        Ok(Zeroizing::new(plaintext))
+    }
+}
+
+#[cfg(test)]
+const TEST_KEK: [u8; ROOT_DEK_BYTES] = [0xA7; ROOT_DEK_BYTES];
+#[cfg(test)]
+const TEST_WRAP_AAD: &[u8] = b"hyprstream.userstore.test-wrap.v1";
+
+fn zeroizing_bytes_into_string(mut plaintext: Zeroizing<Vec<u8>>) -> Result<String> {
+    match String::from_utf8(std::mem::take(&mut *plaintext)) {
+        Ok(value) => Ok(value),
+        Err(error) => {
+            let _invalid_plaintext = Zeroizing::new(error.into_bytes());
+            Err(anyhow!("decrypted UserStore text is not UTF-8"))
+        }
+    }
+}
+
+// aes-gcm-siv stores its key-generating schedule as `aes::Aes256`. This
+// assertion fails compilation if feature resolution ever drops AES's
+// `zeroize` implementation.
+const _: fn() = || {
+    fn assert_zeroize_on_drop<T: ZeroizeOnDrop>() {}
+    assert_zeroize_on_drop::<aes::Aes256>();
+};
 
 fn field_context(username: &str, column: EncryptedColumn<'_>) -> Result<Vec<u8>> {
     ensure!(
@@ -442,14 +487,12 @@ fn derive_field_key(
 mod tests {
     use super::*;
 
-    const TEST_KEK: [u8; ROOT_DEK_BYTES] = [0xA7; ROOT_DEK_BYTES];
-    const TEST_WRAP_AAD: &[u8] = b"hyprstream.userstore.test-wrap.v1";
-
-    struct TestSealer {
+    /// A sealer that can be made to fail on open, for testing fail-closed behavior.
+    struct FailableTestSealer {
         fail_open: bool,
     }
 
-    impl DekSealer for TestSealer {
+    impl DekSealer for FailableTestSealer {
         fn seal(&self, plaintext: &[u8]) -> Result<Vec<u8>> {
             let cipher = Aes256GcmSiv::new_from_slice(&TEST_KEK).unwrap();
             let mut nonce = [0u8; NONCE_BYTES];
@@ -491,7 +534,7 @@ mod tests {
     }
 
     fn cipher() -> ColumnCipher {
-        ColumnCipher::new(Arc::new(TestSealer { fail_open: false }))
+        ColumnCipher::test_cipher()
     }
 
     #[tokio::test]
@@ -592,7 +635,7 @@ mod tests {
             )
             .is_err());
 
-        let unavailable = ColumnCipher::new(Arc::new(TestSealer { fail_open: true }));
+        let unavailable = ColumnCipher::new(Arc::new(FailableTestSealer { fail_open: true }));
         assert!(unavailable.open_user_key(&key.wrapped).await.is_err());
     }
 

@@ -274,7 +274,7 @@ mod tests {
             DiscoveryClient::new(make_client()),
             signing_key.verifying_key().to_bytes(),
         )
-        .with_user_store(store)
+        .with_user_store(crate::auth::ProductionUserStore::for_test(store))
     }
 
     struct KeyReadErrorStore {
@@ -719,6 +719,32 @@ mod tests {
         assert!(canonical_issuer_origin("pds.example.com").is_none());
     }
 
+    #[test]
+    fn atproto_service_did_matches_browser_origin_encoding() {
+        assert_eq!(
+            atproto_service_did_for_origin("https://pds.example.test").as_deref(),
+            Some("did:web:pds.example.test")
+        );
+        assert_eq!(
+            atproto_service_did_for_origin("https://pds.example.test/oauth/par").as_deref(),
+            Some("did:web:pds.example.test")
+        );
+        assert_eq!(
+            atproto_service_did_for_origin("https://pds.example.test:443/oauth/par").as_deref(),
+            Some("did:web:pds.example.test")
+        );
+        assert_eq!(
+            atproto_service_did_for_origin("https://pds.example.test:8443/oauth/par").as_deref(),
+            Some("did:web:pds.example.test%3A8443")
+        );
+        assert_eq!(
+            atproto_service_did_for_origin("http://127.0.0.1:6791").as_deref(),
+            Some("did:web:127.0.0.1%3A6791")
+        );
+        assert!(atproto_service_did_for_origin("https://[::1]:8443").is_none());
+        assert!(atproto_service_did_for_origin("ftp://pds.example.test").is_none());
+    }
+
     /// #1113 rev2 F4/F6: the default grant set (omitted-scope fallback) must
     /// NOT include `atproto` — those scopes are supported-but-explicit. A
     /// client that omits `scope` must NOT silently activate the strict profile.
@@ -1017,8 +1043,10 @@ pub struct OAuthState {
     /// Deployment static well-known directory (#1137 serving half). When set,
     /// this OAuth instance terminates the deployment's did:web host: it serves
     /// `<dir>/did.json` in place of the dynamic node document, plus
-    /// `<dir>/at9p/<cid>.cbor` and `<dir>/deployment/registry-service.jwt`.
-    /// All three are public, integrity-anchored bytes — see
+    /// `<dir>/at9p/<cid>.cbor`,
+    /// `<dir>/deployment/deployment-authority.log.json`, and
+    /// `<dir>/deployment/registry-service.jwt`. All four are public,
+    /// integrity-anchored bytes — see
     /// `deployment_well_known.rs`. Copied from
     /// `OAuthConfig::deployment_well_known_dir`.
     pub deployment_well_known_dir: Option<std::path::PathBuf>,
@@ -1294,8 +1322,7 @@ impl OAuthState {
 
     /// Host service DID accepted in ATProto service-auth `aud`.
     pub fn atproto_service_did(&self) -> Option<String> {
-        super::did_document::issuer_authority(&self.issuer_url)
-            .map(|authority| format!("did:web:{authority}"))
+        atproto_service_did_for_origin(&self.issuer_url)
     }
 
     /// Set JWT signing key validity window for the JWKS endpoint.
@@ -1420,9 +1447,9 @@ impl OAuthState {
         self.signing_key.clone().map(Arc::new)
     }
 
-    /// Attach a user credential store. Creates a `UserService` backed by the store
-    /// for SCIM/RPC access and legacy OAuth handler reads.
-    pub fn with_user_store(mut self, store: Arc<dyn UserStore>) -> Self {
+    /// Attach an account store admitted by the sole production construction
+    /// boundary.
+    pub fn with_user_store(mut self, store: crate::auth::ProductionUserStore) -> Self {
         self.user_service = Some(Arc::new(UserService::new(store)));
         self
     }
@@ -1435,14 +1462,15 @@ impl OAuthState {
 
     /// Attach a pre-built `UserService`. Used when the service is constructed externally
     /// (e.g., for testing or when the store is shared across services).
-    pub fn with_user_service(mut self, service: Arc<UserService>) -> Self {
+    #[cfg(test)]
+    pub(crate) fn with_user_service(mut self, service: Arc<UserService>) -> Self {
         self.user_service = Some(service);
         self
     }
 
     /// Get read access to the user store via the UserService.
     /// Returns None if no user store is configured.
-    pub fn user_store_reader(&self) -> Option<Arc<dyn UserStore>> {
+    pub(crate) fn user_store_reader(&self) -> Option<Arc<dyn UserStore>> {
         self.user_service.as_ref().map(|s| s.store())
     }
 
@@ -2008,4 +2036,31 @@ pub fn canonical_issuer_origin(issuer_url: &str) -> Option<String> {
         return None;
     }
     Some(format!("{scheme}://{authority}"))
+}
+
+/// Convert the configured OAuth URL to the host-form `did:web` service DID
+/// used by ATProto service-auth audiences.
+///
+/// For supported DNS/IPv4 origins this mirrors the browser's
+/// `originToDidWeb`: URL parsing normalizes an explicit default port away,
+/// while a non-default port is retained and its domain-segment separator is
+/// encoded as `%3A`. IPv6 is rejected until client and server share one
+/// canonical DID representation for it.
+fn atproto_service_did_for_origin(issuer_url: &str) -> Option<String> {
+    let url = url::Url::parse(issuer_url).ok()?;
+    if !matches!(url.scheme(), "http" | "https")
+        || !url.username().is_empty()
+        || url.password().is_some()
+    {
+        return None;
+    }
+    let host = match url.host()? {
+        url::Host::Domain(domain) => domain.to_owned(),
+        url::Host::Ipv4(address) => address.to_string(),
+        url::Host::Ipv6(_) => return None,
+    };
+    Some(match url.port() {
+        Some(port) => format!("did:web:{host}%3A{port}"),
+        None => format!("did:web:{host}"),
+    })
 }

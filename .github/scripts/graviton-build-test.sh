@@ -42,11 +42,10 @@ run_phase() {
 }
 
 # Fail fast on browser-only composition regressions in the required merge-gate
-# job. Keep the WebTransport cfg scoped to this command so it cannot leak into
-# the native release/test phases below. This reuses the same checkout, target,
-# sccache process, and container instead of consuming another runner slot.
-run_phase "browser WASM check" env RUSTFLAGS=--cfg=web_sys_unstable_apis \
-  cargo check --target wasm32-unknown-unknown -p hyprstream-rpc
+# job. The child script scopes both browser cfgs to its own process so they
+# cannot leak into native release/test phases below. It checks the exact
+# browser-facing rpc + vfs + rpc-std package set used by www.
+run_phase "browser WASM check" bash .github/scripts/browser-wasm-check.sh
 
 # Default features (parity with the former x86 gate); libtorch is the image's
 # aarch64 wheel at /opt/libtorch, so NO download-libtorch feature here.

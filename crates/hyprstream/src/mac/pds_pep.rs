@@ -10,6 +10,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 #[cfg(not(target_arch = "wasm32"))]
 use async_trait::async_trait;
+use hyprstream_pds::ATPROTO_SIGNING_KEY_FILE;
 use hyprstream_pds_service::{
     AccountRecordReadAuthorizer, OAUTH_ACCOUNT_RESOLVER_SUBJECT, PDS_ACCOUNTS_DIRECTORY,
     PDS_ACCOUNT_RECORD_FILE,
@@ -45,11 +46,13 @@ fn pds_account_label() -> SecurityLabel {
     )
 }
 
-/// Trusted structural labels for the two account-store read objects.
+/// Trusted structural labels for the account-store read objects.
 ///
 /// The OAuth resolver reads only `/pds` (tenant names), while a scoped caller
 /// reads only the exact publication marker below a validated tenant and
-/// account label. Other paths remain unlabeled and therefore deny.
+/// account label. The account-specific `#atproto` secret is labeled for the
+/// fixed internal OAuth authority's service-auth signer, but no scoped
+/// account-reader API exposes it. Other paths remain unlabeled and deny.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct PdsAccountObjectLabelResolver;
 
@@ -60,11 +63,11 @@ impl ObjectLabelResolver for PdsAccountObjectLabelResolver {
         };
         match components {
             ["pds"] => Some(pds_account_label()),
-            ["pds", tenant, accounts, account, record]
+            ["pds", tenant, accounts, account, file]
                 if valid_tenant_component(tenant)
                     && *accounts == PDS_ACCOUNTS_DIRECTORY
                     && valid_account_component(account)
-                    && *record == PDS_ACCOUNT_RECORD_FILE =>
+                    && matches!(*file, PDS_ACCOUNT_RECORD_FILE | ATPROTO_SIGNING_KEY_FILE) =>
             {
                 Some(pds_account_label())
             }
@@ -990,7 +993,7 @@ mod tests {
     }
 
     #[test]
-    fn production_sources_label_only_account_reads_and_recognize_oauth() {
+    fn production_sources_label_only_account_artifacts_and_recognize_oauth() {
         let resolver = PdsAccountObjectLabelResolver;
         assert_eq!(
             resolver.resolve(ObjectRef::Path(&["pds"])),
@@ -1003,6 +1006,16 @@ mod tests {
                 PDS_ACCOUNTS_DIRECTORY,
                 "alice",
                 PDS_ACCOUNT_RECORD_FILE,
+            ])),
+            Some(pds_account_label())
+        );
+        assert_eq!(
+            resolver.resolve(ObjectRef::Path(&[
+                "pds",
+                "acme",
+                PDS_ACCOUNTS_DIRECTORY,
+                "alice",
+                ATPROTO_SIGNING_KEY_FILE,
             ])),
             Some(pds_account_label())
         );
@@ -1117,12 +1130,12 @@ mod tests {
             .unwrap();
         let entries = mount.readdir(&fid, &subject).await.unwrap();
         assert_eq!(entries.len(), 2);
-        assert!(entries.iter().any(|entry| entry.name == "acme" && entry.is_dir));
-        assert!(
-            entries
-                .iter()
-                .any(|entry| entry.name == "alias" && !entry.is_dir)
-        );
+        assert!(entries
+            .iter()
+            .any(|entry| entry.name == "acme" && entry.is_dir));
+        assert!(entries
+            .iter()
+            .any(|entry| entry.name == "alias" && !entry.is_dir));
         mount.clunk(fid, &subject).await;
     }
 }

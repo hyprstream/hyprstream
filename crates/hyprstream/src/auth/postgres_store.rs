@@ -182,6 +182,9 @@ pub struct PostgresUserStore {
     cipher: Option<ColumnCipher>,
 }
 
+#[cfg(not(test))]
+impl super::user_store::private::Sealed for PostgresUserStore {}
+
 impl PostgresUserStore {
     /// Open a production PostgresUserStore with at-rest envelope encryption.
     ///

@@ -1507,8 +1507,17 @@ static PROCESS_REGISTRY_VERIFIER: std::sync::OnceLock<RegistryDeploymentVerifier
     std::sync::OnceLock::new();
 
 const DEPLOYMENT_CA_ROOT_PATH: &str = "/etc/hyprstream/trust/deployment-ca.hybrid";
+const DEPLOYMENT_AUTHORITY_LOG_PATH: &str = "/etc/hyprstream/trust/deployment-authority.log.json";
+const DEPLOYMENT_AUTHORITY_CHECKPOINT_PATH: &str =
+    "/etc/hyprstream/trust/deployment-authority.head.json";
 const REGISTRY_DEPLOYMENT_CREDENTIAL_PATH: &str =
     "/run/hyprstream/credentials/registry-service.jwt";
+const DEPLOYMENT_TRUST_DIR_ENV: &str = "HYPRSTREAM_DEPLOYMENT_TRUST_DIR";
+const SYSTEMD_CREDENTIALS_DIRECTORY_ENV: &str = "CREDENTIALS_DIRECTORY";
+const DEPLOYMENT_CA_ROOT_FILE: &str = "deployment-ca.hybrid";
+const DEPLOYMENT_AUTHORITY_LOG_FILE: &str = "deployment-authority.log.json";
+const DEPLOYMENT_AUTHORITY_CHECKPOINT_FILE: &str = "deployment-authority.head.json";
+const REGISTRY_DEPLOYMENT_CREDENTIAL_FILE: &str = "registry-service.jwt";
 const REGISTRY_DEPLOYMENT_CREDENTIAL_PROFILE: &str = "hyprstream.registry-deployment.v1";
 const REGISTRY_DEPLOYMENT_CREDENTIAL_AUDIENCE: &str = "urn:hyprstream:service:registry";
 const REGISTRY_DEPLOYMENT_CREDENTIAL_MAX_TTL_SECONDS: i64 = 3_600;
@@ -1517,6 +1526,49 @@ const ED25519_PUBLIC_KEY_BYTES: usize = 32;
 const ML_DSA_65_PUBLIC_KEY_BYTES: usize = 1_952;
 const DEPLOYMENT_CA_ROOT_BYTES: usize = ED25519_PUBLIC_KEY_BYTES + ML_DSA_65_PUBLIC_KEY_BYTES;
 const HYBRID_JWT_SIGNATURE_BYTES: usize = 3_309 + 64;
+const AUTHORITY_LOG_SCHEMA: &str = "hyprstream.deployment-authority-log.v1";
+const AUTHORITY_CHECKPOINT_SCHEMA: &str = "hyprstream.deployment-authority-checkpoint.v1";
+const REGISTRY_DELEGATION_SCHEMA: &str = "hyprstream.registry-delegation.v1";
+const MAX_AUTHORITY_LOG_OPERATIONS: usize = 128;
+const MAX_REGISTRY_DELEGATION_BYTES: usize = 256 * 1024;
+const MAX_DEPLOYMENT_CLOUD_SECRET_BYTES: usize = 64 * 1024;
+const REGISTRY_DELEGATION_ABILITY: &str = "mint-registry-jwt";
+
+/// Signed DidOp authority history embedded in a registry delegation.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeploymentAuthorityLog {
+    pub schema: String,
+    pub deployment_domain: String,
+    pub did: String,
+    pub operations_b64: Vec<String>,
+}
+
+/// Independently provisioned expected head of the deployment authority log.
+///
+/// This checkpoint is deliberately separate from the remotely supplied log:
+/// a signature-valid historical prefix cannot redefine the expected sequence
+/// or CID and thereby reactivate retired authority keys.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeploymentAuthorityCheckpoint {
+    pub schema: String,
+    pub deployment_domain: String,
+    pub did: String,
+    pub sequence: u64,
+    pub head_cid: String,
+}
+
+/// Root/current-authority UCAN delegation embedded in delegated registry JWTs.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RegistryDelegationArtifact {
+    pub schema: String,
+    pub deployment_domain: String,
+    pub authority_log_did: String,
+    pub delegated_public_key_b64: String,
+    pub ucan_b64: String,
+}
 
 /// Non-optional Ed25519 + ML-DSA-65 deployment trust root.
 ///
@@ -1644,7 +1696,21 @@ struct AuthenticatedRegistryDeploymentIdentity {
 
 struct TrustedRegistryDeploymentCredentials {
     ca_verifying_key: HybridDeploymentCa,
+    authority_log: DeploymentAuthorityLog,
+    authority_checkpoint: DeploymentAuthorityCheckpoint,
     registry_credential: String,
+}
+
+enum DeploymentAuthorityState<'a> {
+    /// Explicit, one-time genesis verification before enrollment. Production
+    /// loaders never select this state from an absent file.
+    GenesisOnly,
+    /// Normal enrolled operation: both independently trusted checkpoint and
+    /// current root-anchored log are mandatory.
+    Enrolled {
+        authority_log: &'a DeploymentAuthorityLog,
+        authority_checkpoint: &'a DeploymentAuthorityCheckpoint,
+    },
 }
 
 /// JSON value decoded while preserving the security property that every object
@@ -1859,7 +1925,16 @@ fn validate_registry_credential_numeric_dates(
 fn validate_registry_deployment_credential_profile(
     token: &str,
     ca_verifying_key: &HybridDeploymentCa,
-) -> Result<[u8; 32]> {
+    authority_state: DeploymentAuthorityState<'_>,
+) -> Result<([u8; 32], i64)> {
+    anyhow::ensure!(
+        !token.is_empty() && !token.bytes().any(|byte| byte.is_ascii_whitespace()),
+        "registry credential must be compact with no whitespace"
+    );
+    anyhow::ensure!(
+        token.len() <= MAX_DEPLOYMENT_CLOUD_SECRET_BYTES,
+        "registry credential exceeds the 64 KiB cloud-secret contract"
+    );
     let mut segments = token.split('.');
     let protected_segment = segments.next().unwrap_or_default();
     let claims_segment = segments.next().unwrap_or_default();
@@ -1885,25 +1960,46 @@ fn validate_registry_deployment_credential_profile(
         "protected header typ must be exactly wit+jwt"
     );
     let domain = deployment_domain(ca_verifying_key);
-    anyhow::ensure!(
-        exact_string_member(protected, "kid", "protected header")? == domain,
-        "protected header kid does not bind the pinned deployment CA"
-    );
 
-    let claims = parse_unique_jwt_json(claims_segment, "credential claims", 16_384)?;
+    let claims = parse_unique_jwt_json(
+        claims_segment,
+        "credential claims",
+        MAX_REGISTRY_DELEGATION_BYTES + 16_384,
+    )?;
+    let claims_object = claims
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("credential claims must be a JSON object"))?;
+    let delegated = claims_object.contains_key("delegation");
+    let direct_members = [
+        "iss",
+        "sub",
+        "aud",
+        "exp",
+        "nbf",
+        "iat",
+        "deployment_domain",
+        "profile",
+        "cnf",
+    ];
+    let delegated_members = [
+        "iss",
+        "sub",
+        "aud",
+        "exp",
+        "nbf",
+        "iat",
+        "deployment_domain",
+        "profile",
+        "cnf",
+        "delegation",
+    ];
     let claims = exact_json_object(
         &claims,
-        &[
-            "iss",
-            "sub",
-            "aud",
-            "exp",
-            "nbf",
-            "iat",
-            "deployment_domain",
-            "profile",
-            "cnf",
-        ],
+        if delegated {
+            &delegated_members
+        } else {
+            &direct_members
+        },
         "credential claims",
     )?;
     anyhow::ensure!(
@@ -1956,14 +2052,69 @@ fn validate_registry_deployment_credential_profile(
         .try_into()
         .map_err(|_| anyhow::anyhow!("credential cnf.jwk.x must decode to exactly 32 bytes"))?;
 
+    let enrolled = match authority_state {
+        DeploymentAuthorityState::GenesisOnly => None,
+        DeploymentAuthorityState::Enrolled {
+            authority_log,
+            authority_checkpoint,
+        } => Some((
+            authority_log,
+            validate_deployment_authority_log(
+                ca_verifying_key,
+                authority_log,
+                authority_checkpoint,
+            )?,
+        )),
+    };
+    let delegated_ca;
+    let signing_ca = if delegated {
+        let (installed_authority_log, active) = enrolled.as_ref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "delegated credential is forbidden during one-time genesis verification"
+            )
+        })?;
+        let encoded = exact_string_member(claims, "delegation", "credential claims")?;
+        let bytes = decode_canonical_jwt_segment(
+            encoded,
+            "credential delegation",
+            MAX_REGISTRY_DELEGATION_BYTES,
+        )?;
+        let artifact: RegistryDelegationArtifact = serde_json::from_slice(&bytes)
+            .map_err(|error| anyhow::anyhow!("credential delegation is malformed: {error}"))?;
+        delegated_ca = validate_registry_delegation_artifact(
+            ca_verifying_key,
+            &artifact,
+            installed_authority_log,
+            active,
+            u64::try_from(now).map_err(|_| anyhow::anyhow!("system clock precedes Unix epoch"))?,
+        )?;
+        &delegated_ca
+    } else if let Some((_installed_authority_log, active)) = enrolled.as_ref() {
+        anyhow::ensure!(
+            active.rotation_keys.iter().any(|key| {
+                key.ed25519_pub == ca_verifying_key.ed25519.to_bytes()
+                    && key.mldsa65_pub
+                        == hyprstream_rpc::crypto::pq::ml_dsa_vk_bytes(&ca_verifying_key.ml_dsa_65)
+            }),
+            "direct root credential issuer is retired at the installed authority-log head"
+        );
+        ca_verifying_key
+    } else {
+        ca_verifying_key
+    };
+    anyhow::ensure!(
+        exact_string_member(protected, "kid", "protected header")? == signing_ca.domain(),
+        "protected header kid does not bind the authorized deployment signer"
+    );
+
     // Signature verification is deliberately last: no parsed material can mint
     // authority unless the exact closed profile is authenticated by the fixed CA.
     let dispatch = hyprstream_rpc::auth::jwt::parse_composite_dispatch(token, &["wit+jwt"])
         .map_err(|error| anyhow::anyhow!("credential composite dispatch rejected: {error}"))?;
     let verified = hyprstream_rpc::auth::jwt::decode_composite(
         token,
-        &ca_verifying_key.ml_dsa_65,
-        &ca_verifying_key.ed25519,
+        &signing_ca.ml_dsa_65,
+        &signing_ca.ed25519,
         Some(REGISTRY_DEPLOYMENT_CREDENTIAL_AUDIENCE),
         &dispatch,
     )
@@ -1972,74 +2123,548 @@ fn validate_registry_deployment_credential_profile(
         verified.sub == "service:registry" && verified.cnf_key_bytes() == Some(key),
         "verified credential differs from the exact deployment profile"
     );
-    Ok(key)
+    Ok((key, exp))
+}
+
+struct AuthoritySetUcanVerifier<'a> {
+    keys: &'a [crate::did_op::HybridRotationKey],
+}
+
+impl hyprstream_rpc::auth::ucan::UcanVerifier for AuthoritySetUcanVerifier<'_> {
+    fn verify(
+        &self,
+        _issuer: &hyprstream_rpc::auth::ucan::Did,
+        ed_key: &[u8; ED25519_PUBLIC_KEY_BYTES],
+        payload: &[u8],
+        signature: &[u8],
+    ) -> std::result::Result<(), hyprstream_rpc::auth::ucan::UcanError> {
+        use hyprstream_rpc::auth::ucan::UcanError;
+        let authority = self
+            .keys
+            .iter()
+            .find(|key| &key.ed25519_pub == ed_key)
+            .ok_or_else(|| {
+                UcanError::BadSignature("UCAN issuer is not in the active authority set".to_owned())
+            })?;
+        let (ed, pq) = authority
+            .verifying_keys()
+            .map_err(|error| UcanError::BadSignature(error.to_string()))?;
+        hyprstream_rpc::crypto::cose_sign::verify_composite(
+            signature,
+            &ed,
+            Some(&pq),
+            payload,
+            hyprstream_rpc::auth::ucan::token::UCAN_AAD,
+            true,
+        )
+        .map(|_| ())
+        .map_err(|error| UcanError::BadSignature(error.to_string()))
+    }
+}
+
+fn validate_registry_delegation_artifact(
+    root: &HybridDeploymentCa,
+    artifact: &RegistryDelegationArtifact,
+    installed_authority_log: &DeploymentAuthorityLog,
+    active: &crate::did_op::VerifiedDidOpLog,
+    now: u64,
+) -> Result<HybridDeploymentCa> {
+    use hyprstream_rpc::auth::ucan::{
+        validate as validate_ucan, Ability, Capability, CaveatValue, Caveats, Resource, Ucan,
+    };
+
+    anyhow::ensure!(
+        artifact.schema == REGISTRY_DELEGATION_SCHEMA,
+        "unsupported registry delegation schema"
+    );
+    anyhow::ensure!(
+        artifact.deployment_domain == root.domain(),
+        "registry delegation deployment domain does not match pinned root"
+    );
+    anyhow::ensure!(
+        artifact.authority_log_did == installed_authority_log.did,
+        "registry delegation names a different authority log"
+    );
+    let active_keys = &active.rotation_keys;
+
+    let delegated_public = base64::engine::general_purpose::STANDARD
+        .decode(&artifact.delegated_public_key_b64)
+        .context("decoding delegated registry-signer public key")?;
+    anyhow::ensure!(
+        delegated_public.len() == DEPLOYMENT_CA_ROOT_BYTES,
+        "delegated registry-signer public key has the wrong length"
+    );
+    let delegated = HybridDeploymentCa::from_public_key_bytes(
+        &delegated_public[..ED25519_PUBLIC_KEY_BYTES],
+        &delegated_public[ED25519_PUBLIC_KEY_BYTES..],
+    )?;
+
+    let ucan_bytes = base64::engine::general_purpose::STANDARD
+        .decode(&artifact.ucan_b64)
+        .context("decoding registry delegation UCAN")?;
+    anyhow::ensure!(
+        ucan_bytes.len() <= MAX_REGISTRY_DELEGATION_BYTES,
+        "registry delegation UCAN is too large"
+    );
+    let ucan = Ucan::from_cbor(&ucan_bytes).context("decoding registry delegation UCAN")?;
+    anyhow::ensure!(
+        ucan.proofs.is_empty(),
+        "registry delegation must be one authority-to-signer link"
+    );
+    validate_ucan(&ucan, &AuthoritySetUcanVerifier { keys: active_keys }, now)
+        .context("validating registry delegation UCAN")?;
+    anyhow::ensure!(
+        active_keys
+            .iter()
+            .any(|key| ucan.issuer().to_ed25519().ok() == Some(key.ed25519_pub)),
+        "registry delegation issuer is not an active authority"
+    );
+    anyhow::ensure!(
+        ucan.audience().to_ed25519()? == delegated.ed25519.to_bytes(),
+        "registry delegation audience does not match delegated signer"
+    );
+    let mut caveats = std::collections::BTreeMap::new();
+    caveats.insert(
+        "audience".to_owned(),
+        CaveatValue::Text(REGISTRY_DEPLOYMENT_CREDENTIAL_AUDIENCE.to_owned()),
+    );
+    caveats.insert(
+        "deployment_domain".to_owned(),
+        CaveatValue::Text(root.domain()),
+    );
+    caveats.insert(
+        "delegated_public_key_b64".to_owned(),
+        CaveatValue::Text(artifact.delegated_public_key_b64.clone()),
+    );
+    caveats.insert(
+        "max_ttl_seconds".to_owned(),
+        CaveatValue::Int(REGISTRY_DEPLOYMENT_CREDENTIAL_MAX_TTL_SECONDS),
+    );
+    caveats.insert(
+        "profile".to_owned(),
+        CaveatValue::Text(REGISTRY_DEPLOYMENT_CREDENTIAL_PROFILE.to_owned()),
+    );
+    let expected = Capability::with_caveats(
+        Resource::new(format!(
+            "hyprstream://deployment/{}/service/registry",
+            root.domain()
+        )),
+        Ability::new(REGISTRY_DELEGATION_ABILITY),
+        Caveats(caveats),
+    );
+    anyhow::ensure!(
+        ucan.capabilities() == [expected],
+        "registry delegation capability is not the exact registry-only scope"
+    );
+    anyhow::ensure!(
+        ucan.payload.expiration.is_some(),
+        "registry delegation must expire"
+    );
+    Ok(delegated)
+}
+
+fn validate_deployment_authority_log(
+    root: &HybridDeploymentCa,
+    log: &DeploymentAuthorityLog,
+    checkpoint: &DeploymentAuthorityCheckpoint,
+) -> Result<crate::did_op::VerifiedDidOpLog> {
+    anyhow::ensure!(
+        log.schema == AUTHORITY_LOG_SCHEMA,
+        "unsupported deployment authority-log schema"
+    );
+    anyhow::ensure!(
+        log.deployment_domain == root.domain(),
+        "deployment authority-log domain does not match pinned root"
+    );
+    anyhow::ensure!(
+        !log.operations_b64.is_empty() && log.operations_b64.len() <= MAX_AUTHORITY_LOG_OPERATIONS,
+        "deployment authority-log operation count is invalid"
+    );
+    let operations = log
+        .operations_b64
+        .iter()
+        .map(|encoded| {
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(encoded)
+                .context("decoding deployment authority operation")?;
+            crate::did_op::DidOp::from_dag_cbor(&bytes)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let active = crate::did_op::verify_did_op_log(&log.did, &operations)
+        .context("verifying deployment authority log")?;
+    anyhow::ensure!(
+        checkpoint.schema == AUTHORITY_CHECKPOINT_SCHEMA,
+        "unsupported deployment authority-checkpoint schema"
+    );
+    anyhow::ensure!(
+        checkpoint.deployment_domain == root.domain(),
+        "deployment authority checkpoint domain does not match pinned root"
+    );
+    anyhow::ensure!(
+        checkpoint.did == log.did
+            && checkpoint.did == active.did
+            && checkpoint.sequence == active.sequence
+            && checkpoint.head_cid == active.head_cid,
+        "deployment authority-log head does not match the independently trusted checkpoint"
+    );
+    let genesis = operations
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("deployment authority log is empty"))?;
+    let genesis_composite = hyprstream_rpc::crypto::cose_sign::assemble_composite_nested(
+        (
+            root.ed25519.to_bytes().to_vec(),
+            genesis.signature.ed25519.clone(),
+        ),
+        Some((
+            hyprstream_rpc::crypto::pq::ml_dsa_vk_bytes(&root.ml_dsa_65),
+            genesis.signature.mldsa65.clone(),
+        )),
+    )
+    .context("assembling pinned-root authority genesis signature")?;
+    hyprstream_rpc::crypto::cose_sign::verify_composite(
+        &genesis_composite,
+        &root.ed25519,
+        Some(&root.ml_dsa_65),
+        &genesis.signable_bytes(),
+        crate::did_op::DID_OP_SIGNATURE_CONTEXT,
+        true,
+    )
+    .context("authority-log genesis was not signed by the pinned root")?;
+    anyhow::ensure!(
+        genesis.rotation_keys.iter().any(|key| {
+            key.ed25519_pub == root.ed25519.to_bytes()
+                && key.mldsa65_pub == hyprstream_rpc::crypto::pq::ml_dsa_vk_bytes(&root.ml_dsa_65)
+        }),
+        "deployment authority-log genesis is not anchored by the pinned public root"
+    );
+    Ok(active)
+}
+
+/// Result of verifying the enrolled deployment artifact set consumed at
+/// production bootstrap. This exposes no authority material and cannot install
+/// or replace process trust.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VerifiedDeploymentArtifacts {
+    pub deployment_domain: String,
+    pub registry_public_key: [u8; ED25519_PUBLIC_KEY_BYTES],
+    pub expires_at: i64,
+}
+
+/// Parse the exact production public-root pin and return its stable deployment
+/// domain. This is the mint-time half of
+/// [`verify_deployment_artifacts_with_authority_log`].
+pub fn verify_deployment_public_ca(public_ca: &[u8]) -> Result<String> {
+    HybridDeploymentCa::from_os_pin(public_ca).map(|ca| ca.domain())
+}
+
+/// Explicitly verify a direct-root credential during one-time genesis before
+/// authority-log enrollment. Production startup never calls this function and
+/// never infers genesis mode from a missing file.
+///
+/// Tooling uses this entry point for pre-installation self-checks. Keeping the
+/// parser and validator here prevents a mint tool from accidentally blessing a
+/// byte layout or JWT shape that production would reject.
+pub fn verify_genesis_deployment_artifacts(
+    public_ca: &[u8],
+    registry_credential: &str,
+) -> Result<VerifiedDeploymentArtifacts> {
+    let ca = HybridDeploymentCa::from_os_pin(public_ca)?;
+    let (registry_public_key, expires_at) = validate_registry_deployment_credential_profile(
+        registry_credential,
+        &ca,
+        DeploymentAuthorityState::GenesisOnly,
+    )?;
+    Ok(VerifiedDeploymentArtifacts {
+        deployment_domain: ca.domain(),
+        registry_public_key,
+        expires_at,
+    })
+}
+
+/// Verify any enrolled deployment credential against the public root, the
+/// installed/current authority log, and its independently trusted head.
+pub fn verify_deployment_artifacts_with_authority_log(
+    public_ca: &[u8],
+    authority_log_json: &[u8],
+    authority_checkpoint_json: &[u8],
+    registry_credential: &str,
+) -> Result<VerifiedDeploymentArtifacts> {
+    anyhow::ensure!(
+        authority_log_json.len() <= MAX_DEPLOYMENT_CLOUD_SECRET_BYTES,
+        "installed deployment authority log is too large"
+    );
+    let ca = HybridDeploymentCa::from_os_pin(public_ca)?;
+    let authority_log: DeploymentAuthorityLog = serde_json::from_slice(authority_log_json)
+        .map_err(|error| {
+            anyhow::anyhow!("installed deployment authority log is malformed: {error}")
+        })?;
+    anyhow::ensure!(
+        authority_checkpoint_json.len() <= MAX_DEPLOYMENT_CLOUD_SECRET_BYTES,
+        "installed deployment authority checkpoint is too large"
+    );
+    let authority_checkpoint: DeploymentAuthorityCheckpoint =
+        serde_json::from_slice(authority_checkpoint_json).map_err(|error| {
+            anyhow::anyhow!("installed deployment authority checkpoint is malformed: {error}")
+        })?;
+    let (registry_public_key, expires_at) = validate_registry_deployment_credential_profile(
+        registry_credential,
+        &ca,
+        DeploymentAuthorityState::Enrolled {
+            authority_log: &authority_log,
+            authority_checkpoint: &authority_checkpoint,
+        },
+    )?;
+    Ok(VerifiedDeploymentArtifacts {
+        deployment_domain: ca.domain(),
+        registry_public_key,
+        expires_at,
+    })
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TrustFileOwner {
+    Root,
+    EffectiveUser,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct TrustedArtifactPath {
+    path: std::path::PathBuf,
+    owner: TrustFileOwner,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DeploymentTrustPaths {
+    public_ca: TrustedArtifactPath,
+    authority_log: TrustedArtifactPath,
+    authority_checkpoint: TrustedArtifactPath,
+    registry_credential: TrustedArtifactPath,
+}
+
+fn explicit_absolute_directory(
+    env_name: &str,
+    value: std::ffi::OsString,
+) -> Result<std::path::PathBuf> {
+    use std::path::Component;
+
+    let path = std::path::PathBuf::from(value);
+    anyhow::ensure!(
+        !path.as_os_str().is_empty(),
+        "{env_name} is present but empty"
+    );
+    anyhow::ensure!(path.is_absolute(), "{env_name} must be an absolute path");
+    anyhow::ensure!(
+        path.components()
+            .all(|component| matches!(component, Component::RootDir | Component::Normal(_))),
+        "{env_name} must not contain '..' components"
+    );
+    Ok(path)
+}
+
+fn resolve_deployment_trust_paths_from(
+    trust_directory: Option<std::ffi::OsString>,
+    credentials_directory: Option<std::ffi::OsString>,
+) -> Result<DeploymentTrustPaths> {
+    let (public_ca, authority_log, authority_checkpoint, trust_owner) = match trust_directory {
+        Some(value) => {
+            let directory = explicit_absolute_directory(DEPLOYMENT_TRUST_DIR_ENV, value)?;
+            (
+                directory.join(DEPLOYMENT_CA_ROOT_FILE),
+                directory.join(DEPLOYMENT_AUTHORITY_LOG_FILE),
+                directory.join(DEPLOYMENT_AUTHORITY_CHECKPOINT_FILE),
+                TrustFileOwner::EffectiveUser,
+            )
+        }
+        None => (
+            std::path::PathBuf::from(DEPLOYMENT_CA_ROOT_PATH),
+            std::path::PathBuf::from(DEPLOYMENT_AUTHORITY_LOG_PATH),
+            std::path::PathBuf::from(DEPLOYMENT_AUTHORITY_CHECKPOINT_PATH),
+            TrustFileOwner::Root,
+        ),
+    };
+    let (registry_credential, credential_owner) = match credentials_directory {
+        Some(value) => {
+            let directory = explicit_absolute_directory(SYSTEMD_CREDENTIALS_DIRECTORY_ENV, value)?;
+            (
+                directory.join(REGISTRY_DEPLOYMENT_CREDENTIAL_FILE),
+                TrustFileOwner::EffectiveUser,
+            )
+        }
+        None => (
+            std::path::PathBuf::from(REGISTRY_DEPLOYMENT_CREDENTIAL_PATH),
+            TrustFileOwner::Root,
+        ),
+    };
+    Ok(DeploymentTrustPaths {
+        public_ca: TrustedArtifactPath {
+            path: public_ca,
+            owner: trust_owner,
+        },
+        authority_log: TrustedArtifactPath {
+            path: authority_log,
+            owner: trust_owner,
+        },
+        authority_checkpoint: TrustedArtifactPath {
+            path: authority_checkpoint,
+            owner: trust_owner,
+        },
+        registry_credential: TrustedArtifactPath {
+            path: registry_credential,
+            owner: credential_owner,
+        },
+    })
+}
+
+fn resolve_deployment_trust_paths() -> Result<DeploymentTrustPaths> {
+    resolve_deployment_trust_paths_from(
+        std::env::var_os(DEPLOYMENT_TRUST_DIR_ENV),
+        std::env::var_os(SYSTEMD_CREDENTIALS_DIRECTORY_ENV),
+    )
 }
 
 #[cfg(unix)]
-fn read_os_owned_file(path: &std::path::Path, description: &str) -> Result<Vec<u8>> {
-    use std::os::unix::fs::MetadataExt as _;
+fn read_trusted_artifact(artifact: &TrustedArtifactPath, description: &str) -> Result<Vec<u8>> {
+    use std::io::Read as _;
+    use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
 
-    anyhow::ensure!(path.is_absolute(), "{description} path must be absolute");
-    let metadata = std::fs::symlink_metadata(path)
-        .map_err(|error| anyhow::anyhow!("{description} is unavailable at {path:?}: {error}"))?;
     anyhow::ensure!(
-        metadata.file_type().is_file(),
-        "{description} is not a regular file"
+        artifact.path.is_absolute(),
+        "{description} path must be absolute"
     );
-    anyhow::ensure!(metadata.uid() == 0, "{description} is not owned by root");
-    anyhow::ensure!(
-        metadata.mode() & 0o022 == 0,
-        "{description} is group/world writable"
-    );
-    for parent in path.ancestors().skip(1) {
+    let effective_uid = {
+        // SAFETY: geteuid has no preconditions and returns process-local state.
+        unsafe { libc::geteuid() }
+    };
+    let owner_is_allowed = |uid| match artifact.owner {
+        TrustFileOwner::Root => uid == 0,
+        TrustFileOwner::EffectiveUser => uid == 0 || uid == effective_uid,
+    };
+    for parent in artifact.path.ancestors().skip(1) {
         let parent_metadata = std::fs::symlink_metadata(parent).map_err(|error| {
             anyhow::anyhow!("{description} parent {parent:?} is unavailable: {error}")
         })?;
         anyhow::ensure!(
             parent_metadata.file_type().is_dir(),
-            "{description} parent {parent:?} is not a directory"
+            "{description} parent {parent:?} is not a real directory"
         );
         anyhow::ensure!(
-            parent_metadata.uid() == 0 && parent_metadata.mode() & 0o022 == 0,
-            "{description} parent {parent:?} is writable or not root-owned"
+            owner_is_allowed(parent_metadata.uid()),
+            "{description} parent {parent:?} has an untrusted owner"
+        );
+        anyhow::ensure!(
+            parent_metadata.mode() & 0o022 == 0,
+            "{description} parent {parent:?} is group/world writable"
         );
     }
-    std::fs::read(path)
-        .map_err(|error| anyhow::anyhow!("failed to read {description} at {path:?}: {error}"))
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(&artifact.path)
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "{description} is unavailable at {:?}: {error}",
+                artifact.path
+            )
+        })?;
+    let metadata = file.metadata().map_err(|error| {
+        anyhow::anyhow!(
+            "failed to inspect {description} at {:?}: {error}",
+            artifact.path
+        )
+    })?;
+    anyhow::ensure!(
+        metadata.file_type().is_file(),
+        "{description} is not a regular file"
+    );
+    anyhow::ensure!(
+        owner_is_allowed(metadata.uid()),
+        "{description} has an untrusted owner"
+    );
+    anyhow::ensure!(
+        metadata.mode() & 0o022 == 0,
+        "{description} is group/world writable"
+    );
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).map_err(|error| {
+        anyhow::anyhow!(
+            "failed to read {description} at {:?}: {error}",
+            artifact.path
+        )
+    })?;
+    Ok(bytes)
 }
 
 #[cfg(not(unix))]
-fn read_os_owned_file(_path: &std::path::Path, description: &str) -> Result<Vec<u8>> {
-    anyhow::bail!("{description} requires the OS-owned Unix deployment seam")
+fn read_trusted_artifact(_artifact: &TrustedArtifactPath, description: &str) -> Result<Vec<u8>> {
+    anyhow::bail!("{description} requires the trusted Unix deployment seam")
 }
 
-fn load_registry_deployment_credential() -> Result<String> {
-    String::from_utf8(read_os_owned_file(
-        std::path::Path::new(REGISTRY_DEPLOYMENT_CREDENTIAL_PATH),
+fn load_registry_deployment_credential(paths: &DeploymentTrustPaths) -> Result<String> {
+    String::from_utf8(read_trusted_artifact(
+        &paths.registry_credential,
         "registry deployment credential",
     )?)
     .map_err(|error| anyhow::anyhow!("registry deployment credential is not UTF-8: {error}"))
 }
 
-fn load_trusted_registry_deployment_credentials() -> Result<TrustedRegistryDeploymentCredentials> {
-    let ca_bytes = read_os_owned_file(
-        std::path::Path::new(DEPLOYMENT_CA_ROOT_PATH),
-        "deployment CA root",
-    )?;
+fn load_trusted_registry_deployment_credentials_from(
+    paths: &DeploymentTrustPaths,
+) -> Result<TrustedRegistryDeploymentCredentials> {
+    let ca_bytes = read_trusted_artifact(&paths.public_ca, "deployment CA root")?;
     let ca_verifying_key = HybridDeploymentCa::from_os_pin(&ca_bytes)?;
-    let registry_credential = load_registry_deployment_credential()?;
+    let authority_log_bytes =
+        read_trusted_artifact(&paths.authority_log, "deployment authority log")?;
+    anyhow::ensure!(
+        authority_log_bytes.len() <= MAX_DEPLOYMENT_CLOUD_SECRET_BYTES,
+        "deployment authority log exceeds the 64 KiB cloud-secret contract"
+    );
+    let authority_log = serde_json::from_slice(&authority_log_bytes)
+        .map_err(|error| anyhow::anyhow!("deployment authority log is malformed: {error}"))?;
+    let authority_checkpoint = load_deployment_authority_checkpoint_from(paths)?;
+    let registry_credential = load_registry_deployment_credential(paths)?;
     Ok(TrustedRegistryDeploymentCredentials {
         ca_verifying_key,
+        authority_log,
+        authority_checkpoint,
         registry_credential,
     })
+}
+
+fn load_trusted_registry_deployment_credentials() -> Result<TrustedRegistryDeploymentCredentials> {
+    let paths = resolve_deployment_trust_paths()?;
+    load_trusted_registry_deployment_credentials_from(&paths)
+}
+
+fn load_deployment_authority_checkpoint_from(
+    paths: &DeploymentTrustPaths,
+) -> Result<DeploymentAuthorityCheckpoint> {
+    let bytes = read_trusted_artifact(
+        &paths.authority_checkpoint,
+        "deployment authority checkpoint",
+    )?;
+    anyhow::ensure!(
+        bytes.len() <= MAX_DEPLOYMENT_CLOUD_SECRET_BYTES,
+        "deployment authority checkpoint exceeds the 64 KiB cloud-secret contract"
+    );
+    serde_json::from_slice(&bytes)
+        .map_err(|error| anyhow::anyhow!("deployment authority checkpoint is malformed: {error}"))
+}
+
+fn load_deployment_authority_checkpoint() -> Result<DeploymentAuthorityCheckpoint> {
+    let paths = resolve_deployment_trust_paths()?;
+    load_deployment_authority_checkpoint_from(&paths)
 }
 
 fn authenticate_registry_deployment_credentials(
     credentials: TrustedRegistryDeploymentCredentials,
 ) -> Result<AuthenticatedRegistryDeploymentIdentity> {
-    let key_bytes = validate_registry_deployment_credential_profile(
+    let (key_bytes, _expires_at) = validate_registry_deployment_credential_profile(
         &credentials.registry_credential,
         &credentials.ca_verifying_key,
+        DeploymentAuthorityState::Enrolled {
+            authority_log: &credentials.authority_log,
+            authority_checkpoint: &credentials.authority_checkpoint,
+        },
     )
     .map_err(|error| anyhow::anyhow!("registry deployment credential rejected: {error}"))?;
     let verifying_key = VerifyingKey::from_bytes(&key_bytes)
@@ -2209,21 +2834,34 @@ async fn authenticate_did_anchored_bootstrap(
 )> {
     seal_process_bootstrap_authority()?;
     let trust = crate::did_anchored::resolve_did_anchored_trust(anchors).await?;
-    let witness =
-        authenticate_registry_deployment_credentials(TrustedRegistryDeploymentCredentials {
-            ca_verifying_key: trust.ca_verifying_key,
-            registry_credential: trust.registry_credential,
-        })?;
+    let authority_checkpoint = load_deployment_authority_checkpoint()?;
+    let discovery_transport = trust.discovery_transport.clone();
+    let mesh_kem_recipient = trust.mesh_kem_recipient.clone();
+    let ml_dsa_65_keys = trust.ml_dsa_65_keys.clone();
+    let verifier = authenticate_resolved_did_trust(trust, authority_checkpoint)?;
     let authority = ProcessBootstrapAuthority {
         store_path: hyprstream_service::deployment_data_dir()?.join("pds-store"),
-        acceptance_identity: ProcessAcceptanceIdentity::Deployment(witness.verifier),
+        acceptance_identity: ProcessAcceptanceIdentity::Deployment(verifier),
     };
     Ok((
         authority,
-        trust.discovery_transport,
-        trust.mesh_kem_recipient,
-        trust.ml_dsa_65_keys,
+        discovery_transport,
+        mesh_kem_recipient,
+        ml_dsa_65_keys,
     ))
+}
+
+pub(crate) fn authenticate_resolved_did_trust(
+    trust: crate::did_anchored::DidAnchoredTrust,
+    authority_checkpoint: DeploymentAuthorityCheckpoint,
+) -> Result<RegistryDeploymentVerifier> {
+    authenticate_registry_deployment_credentials(TrustedRegistryDeploymentCredentials {
+        ca_verifying_key: trust.ca_verifying_key,
+        authority_log: trust.authority_log,
+        authority_checkpoint,
+        registry_credential: trust.registry_credential,
+    })
+    .map(|witness| witness.verifier)
 }
 
 /// Resolve the configured DID anchors and authenticate the fetched registry
@@ -2240,12 +2878,10 @@ pub async fn resolve_and_authenticate_did_anchors(
     anchors: &crate::DidAnchors,
 ) -> Result<(RegistryDeploymentVerifier, TransportConfig)> {
     let trust = crate::did_anchored::resolve_did_anchored_trust(anchors).await?;
-    let witness =
-        authenticate_registry_deployment_credentials(TrustedRegistryDeploymentCredentials {
-            ca_verifying_key: trust.ca_verifying_key,
-            registry_credential: trust.registry_credential,
-        })?;
-    Ok((witness.verifier, trust.discovery_transport))
+    let authority_checkpoint = load_deployment_authority_checkpoint()?;
+    let discovery_transport = trust.discovery_transport.clone();
+    let verifier = authenticate_resolved_did_trust(trust, authority_checkpoint)?;
+    Ok((verifier, discovery_transport))
 }
 
 #[cfg(test)]
@@ -2868,9 +3504,18 @@ mod resolver_tests {
         ca: &TestDeploymentCa,
         credential: String,
     ) -> Result<AuthenticatedRegistryDeploymentIdentity> {
-        authenticate_registry_deployment_credentials(TrustedRegistryDeploymentCredentials {
-            ca_verifying_key: ca.verifying_keys.clone(),
-            registry_credential: credential,
+        let (key_bytes, _expires_at) = validate_registry_deployment_credential_profile(
+            &credential,
+            &ca.verifying_keys,
+            DeploymentAuthorityState::GenesisOnly,
+        )?;
+        let verifying_key = VerifyingKey::from_bytes(&key_bytes)
+            .map_err(|error| anyhow::anyhow!("registry credential key is malformed: {error}"))?;
+        Ok(AuthenticatedRegistryDeploymentIdentity {
+            verifier: RegistryDeploymentVerifier {
+                verifying_key,
+                _deployment_ca: Arc::new(ca.verifying_keys.clone()),
+            },
         })
     }
 
@@ -3372,15 +4017,19 @@ mod resolver_tests {
         assert!(!production.contains("pub fn bootstrap_authenticated_process("));
         assert!(production.contains("/etc/hyprstream/trust/deployment-ca.hybrid"));
         assert!(production.contains("/run/hyprstream/credentials/registry-service.jwt"));
+        assert!(production.contains("HYPRSTREAM_DEPLOYMENT_TRUST_DIR"));
+        assert!(production.contains("CREDENTIALS_DIRECTORY"));
         let loader = production
             .split("fn load_trusted_registry_deployment_credentials()")
             .nth(1)
-            .expect("fixed deployment loader")
+            .expect("deployment trust loader")
             .split("fn authenticate_registry_deployment_credentials(")
             .next()
             .expect("loader body");
-        assert!(!loader.contains("CREDENTIALS_DIRECTORY"));
+        assert!(loader.contains("resolve_deployment_trust_paths()"));
+        assert!(loader.contains("load_trusted_registry_deployment_credentials_from(&paths)"));
         assert!(!loader.contains("dirs::config_dir"));
+        assert!(!loader.contains("HYPRSTREAM__SECRETS__PATH"));
     }
 
     fn service() -> DiscoveryService {
@@ -3967,69 +4616,289 @@ mod resolver_tests {
     }
 
     #[test]
-    fn redirected_credential_directories_have_zero_registry_authority() {
-        const CHILD: &str = "HYPRSTREAM_TEST_FIXED_REGISTRY_CREDENTIAL_CHILD";
-        const ATTACKER_KEY: &str = "HYPRSTREAM_TEST_ATTACKER_REGISTRY_KEY";
-        if std::env::var_os(CHILD).is_some() {
-            let key_bytes: [u8; 32] =
-                hex::decode(std::env::var(ATTACKER_KEY).expect("attacker registry key"))
-                    .expect("attacker key hex")
-                    .try_into()
-                    .expect("attacker key length");
-            let attacker = VerifyingKey::from_bytes(&key_bytes).expect("attacker key");
-            match load_trusted_registry_deployment_credentials() {
-                Ok(credentials) => {
-                    let witness = authenticate_registry_deployment_credentials(credentials)
-                        .expect("fixed OS-owned credential pair must authenticate");
-                    assert!(
-                        !witness.verifier.matches(&attacker),
-                        "ambient credential pair selected production authority"
-                    );
-                }
-                Err(error) => assert!(
-                    error.to_string().contains(DEPLOYMENT_CA_ROOT_PATH)
-                        || error
-                            .to_string()
-                            .contains(REGISTRY_DEPLOYMENT_CREDENTIAL_PATH),
-                    "startup did not fail at the fixed OS-owned seam: {error}"
-                ),
-            }
-            return;
-        }
+    fn deployment_trust_path_resolution_is_explicit_and_split() {
+        let fixed = resolve_deployment_trust_paths_from(None, None).expect("fixed paths");
+        assert_eq!(
+            fixed.public_ca.path,
+            std::path::Path::new(DEPLOYMENT_CA_ROOT_PATH)
+        );
+        assert_eq!(
+            fixed.authority_log.path,
+            std::path::Path::new(DEPLOYMENT_AUTHORITY_LOG_PATH)
+        );
+        assert_eq!(
+            fixed.authority_checkpoint.path,
+            std::path::Path::new(DEPLOYMENT_AUTHORITY_CHECKPOINT_PATH)
+        );
+        assert_eq!(
+            fixed.registry_credential.path,
+            std::path::Path::new(REGISTRY_DEPLOYMENT_CREDENTIAL_PATH)
+        );
+        assert_eq!(fixed.public_ca.owner, TrustFileOwner::Root);
+        assert_eq!(fixed.registry_credential.owner, TrustFileOwner::Root);
 
-        let alternate = tempfile::tempdir().expect("alternate credential directory");
+        let trust_dir = std::path::Path::new("/run/user/1000/hyprstream/trust");
+        let credentials_dir =
+            std::path::Path::new("/run/user/1000/systemd/credentials/hyprstream.service");
+        let overridden = resolve_deployment_trust_paths_from(
+            Some(trust_dir.as_os_str().to_owned()),
+            Some(credentials_dir.as_os_str().to_owned()),
+        )
+        .expect("explicit user-service paths");
+        assert_eq!(
+            overridden.public_ca.path,
+            trust_dir.join(DEPLOYMENT_CA_ROOT_FILE)
+        );
+        assert_eq!(
+            overridden.authority_log.path,
+            trust_dir.join(DEPLOYMENT_AUTHORITY_LOG_FILE)
+        );
+        assert_eq!(
+            overridden.authority_checkpoint.path,
+            trust_dir.join(DEPLOYMENT_AUTHORITY_CHECKPOINT_FILE)
+        );
+        assert_eq!(
+            overridden.registry_credential.path,
+            credentials_dir.join(REGISTRY_DEPLOYMENT_CREDENTIAL_FILE)
+        );
+        assert_eq!(overridden.public_ca.owner, TrustFileOwner::EffectiveUser);
+        assert_eq!(
+            overridden.registry_credential.owner,
+            TrustFileOwner::EffectiveUser
+        );
+
+        let trust_only =
+            resolve_deployment_trust_paths_from(Some(trust_dir.as_os_str().to_owned()), None)
+                .expect("trust-only override");
+        assert_eq!(
+            trust_only.public_ca.path,
+            trust_dir.join(DEPLOYMENT_CA_ROOT_FILE)
+        );
+        assert_eq!(
+            trust_only.registry_credential.path,
+            std::path::Path::new(REGISTRY_DEPLOYMENT_CREDENTIAL_PATH)
+        );
+        assert_eq!(trust_only.registry_credential.owner, TrustFileOwner::Root);
+
+        let credentials_only =
+            resolve_deployment_trust_paths_from(None, Some(credentials_dir.as_os_str().to_owned()))
+                .expect("credentials-only override");
+        assert_eq!(
+            credentials_only.public_ca.path,
+            std::path::Path::new(DEPLOYMENT_CA_ROOT_PATH)
+        );
+        assert_eq!(
+            credentials_only.registry_credential.path,
+            credentials_dir.join(REGISTRY_DEPLOYMENT_CREDENTIAL_FILE)
+        );
+        assert_eq!(credentials_only.public_ca.owner, TrustFileOwner::Root);
+    }
+
+    #[test]
+    fn invalid_present_trust_path_never_falls_back() {
+        for (name, trust_dir, credentials_dir) in [
+            (
+                DEPLOYMENT_TRUST_DIR_ENV,
+                Some(std::ffi::OsString::new()),
+                None,
+            ),
+            (
+                DEPLOYMENT_TRUST_DIR_ENV,
+                Some(std::ffi::OsString::from("relative/trust")),
+                None,
+            ),
+            (
+                DEPLOYMENT_TRUST_DIR_ENV,
+                Some(std::ffi::OsString::from("/secure/../other")),
+                None,
+            ),
+            (
+                SYSTEMD_CREDENTIALS_DIRECTORY_ENV,
+                None,
+                Some(std::ffi::OsString::new()),
+            ),
+            (
+                SYSTEMD_CREDENTIALS_DIRECTORY_ENV,
+                None,
+                Some(std::ffi::OsString::from("relative/credentials")),
+            ),
+            (
+                SYSTEMD_CREDENTIALS_DIRECTORY_ENV,
+                None,
+                Some(std::ffi::OsString::from("/secure/../other")),
+            ),
+        ] {
+            let error = resolve_deployment_trust_paths_from(trust_dir, credentials_dir)
+                .expect_err("invalid present override fell back");
+            assert!(
+                error.to_string().contains(name),
+                "error did not identify {name}: {error}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    fn user_service_trust_fixture() -> (
+        tempfile::TempDir,
+        DeploymentTrustPaths,
+        TestDeploymentCa,
+        SigningKey,
+    ) {
+        use base64::engine::general_purpose::STANDARD;
+
+        let fixture = tempfile::Builder::new()
+            .prefix(".trust-loader-test-")
+            .tempdir_in(env!("CARGO_MANIFEST_DIR"))
+            .expect("secure fixture directory");
+        let trust_dir = fixture.path().join("trust");
+        let credentials_dir = fixture.path().join("credentials");
+        std::fs::create_dir(&trust_dir).expect("trust directory");
+        std::fs::create_dir(&credentials_dir).expect("credentials directory");
+
         let ca = test_deployment_ca(0x71);
         let registry = SigningKey::from_bytes(&[0x72; 32]);
-        let jwt = exact_registry_credential(&ca, &registry);
-        let mut ca_pin = ca.verifying_keys.ed25519_bytes().to_vec();
-        ca_pin.extend_from_slice(&ca.verifying_keys.ml_dsa_65_bytes());
-        std::fs::write(alternate.path().join("ca-pubkey"), ca_pin).expect("alternate CA");
-        std::fs::write(alternate.path().join("registry-service-jwt"), jwt)
-            .expect("alternate registry JWT");
-        let user_config = alternate.path().join("user-config");
-        let user_credentials = user_config.join("hyprstream/credentials");
-        std::fs::create_dir_all(&user_credentials).expect("user credential fallback");
-        std::fs::copy(
-            alternate.path().join("ca-pubkey"),
-            user_credentials.join("ca-pubkey"),
+        let rotation_key = crate::did_op::HybridRotationKey::new(
+            ca.ed25519.verifying_key().to_bytes(),
+            hyprstream_crypto::pq::ml_dsa_sk_to_vk_bytes(&ca.ml_dsa_65),
         )
-        .expect("user CA copy");
-        std::fs::copy(
-            alternate.path().join("registry-service-jwt"),
-            user_credentials.join("registry-service-jwt"),
+        .expect("hybrid rotation key");
+        let genesis =
+            crate::did_op::DidOp::signed_genesis(vec![rotation_key], &ca.ed25519, &ca.ml_dsa_65)
+                .expect("signed authority genesis");
+        let did = genesis.genesis_did().expect("authority-log DID");
+        let active = crate::did_op::verify_did_op_log(&did, std::slice::from_ref(&genesis))
+            .expect("verified authority log");
+        let log = DeploymentAuthorityLog {
+            schema: AUTHORITY_LOG_SCHEMA.to_owned(),
+            deployment_domain: ca.verifying_keys.domain(),
+            did: did.clone(),
+            operations_b64: vec![STANDARD.encode(genesis.to_dag_cbor())],
+        };
+        let checkpoint = DeploymentAuthorityCheckpoint {
+            schema: AUTHORITY_CHECKPOINT_SCHEMA.to_owned(),
+            deployment_domain: ca.verifying_keys.domain(),
+            did,
+            sequence: active.sequence,
+            head_cid: active.head_cid,
+        };
+        let mut public_ca = ca.verifying_keys.ed25519_bytes().to_vec();
+        public_ca.extend_from_slice(&ca.verifying_keys.ml_dsa_65_bytes());
+        std::fs::write(trust_dir.join(DEPLOYMENT_CA_ROOT_FILE), public_ca).expect("deployment CA");
+        std::fs::write(
+            trust_dir.join(DEPLOYMENT_AUTHORITY_LOG_FILE),
+            serde_json::to_vec(&log).expect("authority-log JSON"),
         )
-        .expect("user JWT copy");
-        let status = std::process::Command::new(std::env::current_exe().expect("test executable"))
-            .arg("--exact")
-            .arg("service::resolver_tests::redirected_credential_directories_have_zero_registry_authority")
-            .arg("--nocapture")
-            .env(CHILD, "1")
-            .env("CREDENTIALS_DIRECTORY", alternate.path())
-            .env("XDG_CONFIG_HOME", &user_config)
-            .env(ATTACKER_KEY, hex::encode(registry.verifying_key().as_bytes()))
-            .status()
-            .expect("redirected credential subprocess");
-        assert!(status.success(), "redirected credential subprocess failed");
+        .expect("authority log");
+        std::fs::write(
+            trust_dir.join(DEPLOYMENT_AUTHORITY_CHECKPOINT_FILE),
+            serde_json::to_vec(&checkpoint).expect("checkpoint JSON"),
+        )
+        .expect("authority checkpoint");
+        std::fs::write(
+            credentials_dir.join(REGISTRY_DEPLOYMENT_CREDENTIAL_FILE),
+            exact_registry_credential(&ca, &registry),
+        )
+        .expect("registry credential");
+        let paths = resolve_deployment_trust_paths_from(
+            Some(trust_dir.into_os_string()),
+            Some(credentials_dir.into_os_string()),
+        )
+        .expect("fixture trust paths");
+        (fixture, paths, ca, registry)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn user_service_paths_preserve_complete_enrolled_verification() {
+        let (_fixture, paths, ca, registry) = user_service_trust_fixture();
+        let credentials = load_trusted_registry_deployment_credentials_from(&paths)
+            .expect("load explicit user-service artifacts");
+        let witness = authenticate_registry_deployment_credentials(credentials)
+            .expect("authenticate complete enrolled artifact set");
+        assert!(witness.verifier.matches(&registry.verifying_key()));
+        assert!(witness.verifier.matches_deployment_root(&ca.verifying_keys));
+
+        let (protected, mut claims) = exact_registry_credential_values(&ca, &registry);
+        claims["aud"] = serde_json::Value::String("urn:hyprstream:service:other".to_owned());
+        std::fs::write(
+            &paths.registry_credential.path,
+            sign_registry_credential_json(&ca, &protected.to_string(), &claims.to_string()),
+        )
+        .expect("invalid-audience credential");
+        let credentials = load_trusted_registry_deployment_credentials_from(&paths)
+            .expect("path loader must not pre-authenticate");
+        assert!(
+            authenticate_registry_deployment_credentials(credentials).is_err(),
+            "explicit path bypassed the closed JWT audience/profile verifier"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn user_service_paths_reject_writable_files_and_symlinks() {
+        use std::os::unix::fs::{symlink, PermissionsExt as _};
+
+        let (_fixture, paths, _ca, _registry) = user_service_trust_fixture();
+        std::fs::set_permissions(
+            &paths.registry_credential.path,
+            std::fs::Permissions::from_mode(0o622),
+        )
+        .expect("make credential writable");
+        let error = load_trusted_registry_deployment_credentials_from(&paths)
+            .err()
+            .expect("group-writable credential was trusted");
+        assert!(error.to_string().contains("group/world writable"));
+
+        let real_credential = paths
+            .registry_credential
+            .path
+            .with_file_name("registry-service.real.jwt");
+        std::fs::rename(&paths.registry_credential.path, &real_credential)
+            .expect("retain real credential");
+        std::fs::set_permissions(&real_credential, std::fs::Permissions::from_mode(0o600))
+            .expect("secure real credential");
+        symlink(&real_credential, &paths.registry_credential.path).expect("credential symlink");
+        let error = load_trusted_registry_deployment_credentials_from(&paths)
+            .err()
+            .expect("symlinked credential was trusted");
+        assert!(
+            error
+                .to_string()
+                .contains("Too many levels of symbolic links")
+                || error
+                    .to_string()
+                    .contains("registry deployment credential is unavailable"),
+            "unexpected symlink rejection: {error}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn user_service_paths_reject_writable_or_symlinked_ancestors() {
+        use std::os::unix::fs::{symlink, PermissionsExt as _};
+
+        let (fixture, paths, _ca, _registry) = user_service_trust_fixture();
+        std::fs::set_permissions(fixture.path(), std::fs::Permissions::from_mode(0o770))
+            .expect("make fixture parent writable");
+        let error = load_trusted_registry_deployment_credentials_from(&paths)
+            .err()
+            .expect("group-writable ancestor was trusted");
+        assert!(error.to_string().contains("parent"));
+        assert!(error.to_string().contains("group/world writable"));
+
+        std::fs::set_permissions(fixture.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("restore fixture parent");
+        let trust_dir = fixture.path().join("trust");
+        let real_trust_dir = fixture.path().join("real-trust");
+        std::fs::rename(&trust_dir, &real_trust_dir).expect("retain real trust directory");
+        symlink(&real_trust_dir, &trust_dir).expect("trust-directory symlink");
+        let error = load_trusted_registry_deployment_credentials_from(&paths)
+            .err()
+            .expect("symlinked trust ancestor was trusted");
+        assert!(
+            error.to_string().contains("not a real directory"),
+            "unexpected ancestor-symlink rejection: {error}"
+        );
     }
 
     #[test]
@@ -4062,11 +4931,8 @@ mod resolver_tests {
         let ca = test_deployment_ca(0x62);
         let registry = SigningKey::from_bytes(&[0x63; 32]);
         let witness =
-            authenticate_registry_deployment_credentials(TrustedRegistryDeploymentCredentials {
-                ca_verifying_key: ca.verifying_keys.clone(),
-                registry_credential: exact_registry_credential(&ca, &registry),
-            })
-            .expect("trusted pair");
+            authenticate_test_registry_credential(&ca, exact_registry_credential(&ca, &registry))
+                .expect("explicit genesis-only trusted pair");
         std::env::set_var("CREDENTIALS_DIRECTORY", "post-start-attacker-directory");
         std::env::set_var("XDG_CONFIG_HOME", "post-start-attacker-config");
         assert!(witness.verifier.matches(&registry.verifying_key()));

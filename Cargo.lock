@@ -69,6 +69,7 @@ dependencies = [
  "cfg-if 1.0.3",
  "cipher",
  "cpufeatures 0.2.17",
+ "zeroize",
 ]
 
 [[package]]
@@ -6817,6 +6818,7 @@ dependencies = [
 name = "hyprstream"
 version = "0.5.0"
 dependencies = [
+ "aes",
  "aes-gcm-siv",
  "anyhow",
  "async-stream",
@@ -7074,6 +7076,7 @@ dependencies = [
  "hyprstream-rpc-derive",
  "hyprstream-service",
  "hyprstream-util",
+ "libc",
  "p256",
  "parking_lot 0.12.4",
  "proptest",
@@ -7285,6 +7288,7 @@ dependencies = [
  "hyprstream-pds",
  "hyprstream-rpc",
  "hyprstream-vfs",
+ "p256",
  "parking_lot 0.12.4",
  "rand 0.8.5",
  "serde",

@@ -25,11 +25,26 @@ pub const USERSTORE_SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS users (
     username TEXT PRIMARY KEY CHECK (username <> ''),
     sub TEXT NOT NULL UNIQUE CHECK (sub <> ''),
-    name BYTEA,
-    email BYTEA,
+    name BYTEA CONSTRAINT users_name_storage_check CHECK (
+        name IS NULL OR (
+            octet_length(name) >= 32
+            AND substring(name from 1 for 4) = decode('48534331', 'hex')
+        )
+    ),
+    email BYTEA CONSTRAINT users_email_storage_check CHECK (
+        email IS NULL OR (
+            octet_length(email) >= 32
+            AND substring(email from 1 for 4) = decode('48534331', 'hex')
+        )
+    ),
     email_verified BOOLEAN,
     active BOOLEAN NOT NULL DEFAULT TRUE,
-    external_id BYTEA,
+    external_id BYTEA CONSTRAINT users_external_id_storage_check CHECK (
+        external_id IS NULL OR (
+            octet_length(external_id) >= 32
+            AND substring(external_id from 1 for 4) = decode('48534331', 'hex')
+        )
+    ),
     key_custody TEXT
         CHECK (key_custody IS NULL OR key_custody IN ('self_custody', 'managed')),
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -49,17 +64,30 @@ CREATE TABLE IF NOT EXISTS oidc_bindings (
 CREATE TABLE IF NOT EXISTS pubkeys (
     fingerprint TEXT PRIMARY KEY CHECK (fingerprint <> ''),
     username TEXT NOT NULL REFERENCES users(username) ON DELETE CASCADE,
-    pubkey BYTEA NOT NULL,
-    label BYTEA,
+    pubkey BYTEA NOT NULL
+        CONSTRAINT pubkeys_pubkey_storage_check CHECK (
+            octet_length(pubkey) = 64
+            AND substring(pubkey from 1 for 4) = decode('48534331', 'hex')
+        ),
+    label BYTEA CONSTRAINT pubkeys_label_storage_check CHECK (
+        label IS NULL OR (
+            octet_length(label) >= 32
+            AND substring(label from 1 for 4) = decode('48534331', 'hex')
+        )
+    ),
     algorithm TEXT NOT NULL DEFAULT 'ed25519'
         CHECK (algorithm IN ('ed25519', 'ed25519+ml-dsa-65')),
     pq_pubkey BYTEA,
     created_at BIGINT NOT NULL,
     last_used_at BIGINT,
-    CHECK (
+    CONSTRAINT pubkeys_algorithm_pq_storage_check CHECK (
         (algorithm = 'ed25519' AND pq_pubkey IS NULL)
-        OR
-        (algorithm = 'ed25519+ml-dsa-65' AND pq_pubkey IS NOT NULL)
+        OR (
+            algorithm = 'ed25519+ml-dsa-65'
+            AND pq_pubkey IS NOT NULL
+            AND octet_length(pq_pubkey) = 1984
+            AND substring(pq_pubkey from 1 for 4) = decode('48534331', 'hex')
+        )
     )
 );
 CREATE INDEX IF NOT EXISTS pubkeys_username_idx ON pubkeys(username);
@@ -89,9 +117,12 @@ pub(crate) fn seal_text(
     match (value, cipher, root) {
         (None, _, _) => Ok(None),
         (Some(text), None, None) => Ok(Some(text.into_bytes())),
-        (Some(text), Some(cipher), Some(root)) => {
-            Ok(Some(cipher.encrypt(root, username, column, text.as_bytes())?))
-        }
+        (Some(text), Some(cipher), Some(root)) => Ok(Some(cipher.encrypt(
+            root,
+            username,
+            column,
+            text.as_bytes(),
+        )?)),
         _ => bail!("cipher/root state mismatch in seal_text"),
     }
 }

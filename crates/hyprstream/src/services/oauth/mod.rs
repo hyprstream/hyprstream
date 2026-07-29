@@ -81,7 +81,7 @@ use hyprstream_service::Spawnable;
 use tokio::sync::Notify;
 use tracing::info;
 
-use crate::config::OAuthConfig;
+use crate::config::{CredentialsBackend, OAuthConfig};
 use crate::services::PolicyClient;
 use state::OAuthState;
 
@@ -184,7 +184,7 @@ pub fn create_app(state: Arc<OAuthState>, cors_config: &crate::config::CorsConfi
     };
 
     // ── Protected routes ───────────────────────────────────────────────────────
-    // All require a valid Bearer token (validated by require_bearer_token).
+    // All require a valid Bearer/DPoP token (validated by require_bearer_token).
     // Inserts AuthenticatedUser into request extensions for downstream handlers.
     let authority_router = Router::new()
         .route(
@@ -219,6 +219,10 @@ pub fn create_app(state: Arc<OAuthState>, cors_config: &crate::config::CorsConfi
         ));
 
     let protected_router = Router::new()
+        .route(
+            xrpc::GET_SERVICE_AUTH_PATH,
+            get(xrpc::get_service_auth),
+        )
         .route("/oauth/introspect", post(introspection::introspect_token))
         .route("/oauth/wit", post(wit_bootstrap::issue_browser_wit))
         .route(
@@ -264,8 +268,9 @@ pub fn create_app(state: Arc<OAuthState>, cors_config: &crate::config::CorsConfi
     if state.deployment_well_known_dir.is_some() {
         // #1137 serving half — deployment mode: this host terminates the
         // deployment's did:web. The static router owns `/.well-known/did.json`
-        // plus the at9p capsule and registry credential endpoints (each 404s
-        // when its file is absent — never a silent fall-through).
+        // plus the at9p capsule, authority log, and registry credential
+        // endpoints (each 404s when its file is absent — never a silent
+        // fall-through).
         did_router = did_router.merge(deployment_well_known::router(
             state.deployment_well_known_dir.clone(),
         ));
@@ -587,51 +592,24 @@ impl Spawnable for OAuthService {
                 )
             })?;
 
-            // Load the user store and token store based on configured backend.
-            // Failure is non-fatal; endpoints will report "not configured" instead.
-            use crate::config::CredentialsBackend;
+            // Load account and device storage through the single production
+            // credential-store boundary. Account-store construction failure
+            // fails closed; no caller can inject a raw backend here.
             let credentials_config = crate::config::HyprConfig::load()
                 .map(|c| c.credentials)
                 .unwrap_or_default();
-
-            let mut device_store_opt: Option<Arc<dyn crate::auth::DeviceStore>> = None;
-            let user_store: Option<Arc<dyn crate::auth::user_store::UserStore>> = match credentials_config.backend {
-                CredentialsBackend::Rocksdb => {
-                    match crate::auth::RocksDbUserStore::open(&credentials_dir) {
-                        Ok(store) => {
-                            info!("User store (RocksDB) opened at {:?}", credentials_dir);
-                            let arc = Arc::new(store);
-                            device_store_opt = Some(arc.clone() as Arc<dyn crate::auth::DeviceStore>);
-                            Some(arc as Arc<dyn crate::auth::user_store::UserStore>)
-                        }
-                        Err(e) => {
-                            tracing::warn!("Could not open user store (endpoints will report 'not configured'): {}", e);
-                            None
-                        }
-                    }
-                }
-                CredentialsBackend::Valkey => {
-                    #[cfg(feature = "valkey")]
-                    {
-                        let url = &credentials_config.valkey.url;
-                        match crate::auth::ValkeyUserStore::connect(url).await {
-                            Ok(store) => {
-                                info!("User store (Valkey) connected at {url}");
-                                Some(Arc::new(store))
-                            }
-                            Err(e) => {
-                                tracing::warn!("Could not connect user store (Valkey): {e}");
-                                None
-                            }
-                        }
-                    }
-                    #[cfg(not(feature = "valkey"))]
-                    {
-                        tracing::error!("credentials.backend = \"valkey\" but binary was not compiled with --features valkey");
-                        None
-                    }
-                }
-            };
+            let (user_store, device_store_opt) =
+                crate::auth::ProductionUserStore::open_with_device_store(
+                    &credentials_dir,
+                    &credentials_config,
+                )
+                .await
+                .map_err(|error| {
+                    hyprstream_rpc::error::RpcError::SpawnFailed(format!(
+                        "failed to initialize production credential store: {error:#}"
+                    ))
+                })?;
+            info!("Production credential store admitted at {:?}", credentials_dir);
 
             // Load the CA JWT signing key for browser WIT issuance (POST /oauth/wit).
             // Also seed the signing key store from the same root key.
@@ -813,9 +791,7 @@ impl Spawnable for OAuthService {
                     "OAuth user-token minting disabled: no deployment account zone"
                 ),
             }
-            if let Some(store) = user_store {
-                oauth_state = oauth_state.with_user_store(store);
-            }
+            oauth_state = oauth_state.with_user_store(user_store);
             if let Some(ds) = device_store_opt {
                 oauth_state = oauth_state.with_device_store(ds);
             }
@@ -844,9 +820,13 @@ impl Spawnable for OAuthService {
             oauth_state = oauth_state.with_jwt_key_timestamps(key_nbf, key_nbf + 14 * 86400);
 
             // Open persistent refresh token store (non-fatal — tokens simply don't survive restart).
+            // The token store is decoupled from the account backend: a pglite
+            // UserStore does not imply a pglite TokenStore — refresh tokens
+            // always go to RocksDB or Valkey.
             let token_db_path = credentials_dir.join("oauth-tokens");
             let token_store: Option<Arc<dyn crate::services::oauth::token_store::TokenStore>> = match credentials_config.backend {
-                CredentialsBackend::Rocksdb => {
+                // Pglite account store falls through to RocksDB for tokens.
+                CredentialsBackend::Pglite | CredentialsBackend::Rocksdb => {
                     match crate::services::oauth::token_store::RocksDbTokenStore::open(&token_db_path) {
                         Ok(s) => {
                             info!("Refresh token store (RocksDB) opened at {:?}", token_db_path);
@@ -1256,6 +1236,49 @@ mod tests {
         )
     }
 
+    fn dpop_resource_proof(
+        signing_key: &p256::ecdsa::SigningKey,
+        method: &str,
+        htu: &str,
+        access_token: &str,
+        jti: &str,
+        nonce: Option<&str>,
+    ) -> String {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+        use p256::ecdsa::signature::Signer as _;
+        use sha2::{Digest as _, Sha256};
+
+        let point = signing_key.verifying_key().to_encoded_point(false);
+        let header = serde_json::json!({
+            "typ": "dpop+jwt",
+            "alg": "ES256",
+            "jwk": {
+                "kty": "EC",
+                "crv": "P-256",
+                "x": URL_SAFE_NO_PAD.encode(point.x().unwrap()),
+                "y": URL_SAFE_NO_PAD.encode(point.y().unwrap()),
+            }
+        });
+        let mut payload = serde_json::json!({
+            "jti": jti,
+            "htm": method,
+            "htu": htu,
+            "iat": chrono::Utc::now().timestamp(),
+            "ath": URL_SAFE_NO_PAD.encode(Sha256::digest(access_token.as_bytes())),
+        });
+        if let Some(value) = nonce {
+            payload["nonce"] = serde_json::Value::String(value.to_owned());
+        }
+        let header = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&header).unwrap());
+        let payload = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&payload).unwrap());
+        let signing_input = format!("{header}.{payload}");
+        let signature: p256::ecdsa::Signature = signing_key.sign(signing_input.as_bytes());
+        format!(
+            "{signing_input}.{}",
+            URL_SAFE_NO_PAD.encode(signature.to_bytes())
+        )
+    }
+
     fn private_key_jwt_assertion(
         signing_key: &p256::ecdsa::SigningKey,
         kid: &str,
@@ -1403,8 +1426,8 @@ mod tests {
         use crate::services::generated::policy_client::IssueToken;
         use crate::services::{DiscoveryClient, PolicyClient, PolicyService};
 
-        const ISSUER: &str = "https://pds.example.test";
-        const GENERIC_ISSUER: &str = "https://pds.example.test/configured/path";
+        const ISSUER: &str = "https://pds.example.test:8443";
+        const GENERIC_ISSUER: &str = "https://pds.example.test:8443/configured/path";
         const CLIENT_ID: &str = "handler-client";
         const PRIVATE_CLIENT_ID: &str = "handler-private-client";
         const REDIRECT_URI: &str = "https://client.example.test/callback";
@@ -1569,10 +1592,15 @@ mod tests {
                 "accounts",
                 SyntheticNode::dir().with_child(
                     "alice",
-                    SyntheticNode::dir().with_child(
-                        "account-record.cbor",
-                        SyntheticNode::file(sealed_account.record_bytes().to_vec()),
-                    ),
+                    SyntheticNode::dir()
+                        .with_child(
+                            "account-record.cbor",
+                            SyntheticNode::file(sealed_account.record_bytes().to_vec()),
+                        )
+                        .with_child(
+                            hyprstream_pds::ATPROTO_SIGNING_KEY_FILE,
+                            SyntheticNode::file(atproto_signing_key.to_bytes().to_vec()),
+                        ),
                 ),
             ),
         );
@@ -1586,7 +1614,7 @@ mod tests {
             DiscoveryClient::new(dummy_rpc),
             service_key.verifying_key().to_bytes(),
         )
-        .with_user_store(user_store)
+        .with_user_store(crate::auth::ProductionUserStore::for_test(user_store))
         .with_hosted_account_store(hosted_account_store)
         .with_atproto_did_resolver(Arc::new(FixtureAtprotoDidResolver(
             atproto_document,
@@ -1696,7 +1724,7 @@ mod tests {
             ))
         };
         let service_jwt = make_service_jwt(
-            "did:web:pds.example.test",
+            "did:web:pds.example.test%3A8443",
             token_exchange::ATPROTO_EXCHANGE_NSID,
             "demo-1119-jti",
         )?;
@@ -1740,7 +1768,7 @@ mod tests {
             axum::http::StatusCode::UNAUTHORIZED
         );
         let wrong_lxm = make_service_jwt(
-            "did:web:pds.example.test",
+            "did:web:pds.example.test%3A8443",
             "com.atproto.repo.uploadBlob",
             "demo-1119-wrong-lxm",
         )?;
@@ -1768,7 +1796,7 @@ mod tests {
         assert_eq!(exchanged_claims["scope"], "transition:generic");
 
         let wrong_tenant_jwt = make_service_jwt(
-            "did:web:pds.example.test",
+            "did:web:pds.example.test%3A8443",
             token_exchange::ATPROTO_EXCHANGE_NSID,
             "demo-1119-wrong-tenant",
         )?;
@@ -2028,6 +2056,92 @@ mod tests {
         assert_eq!(claims["tenant"], HOSTED_TENANT);
         assert_eq!(claims["aud"], ISSUER);
         assert_eq!(claims["scope"], "atproto");
+
+        // The protected hosted-PDS route consumes the standard DPoP-bound
+        // OAuth access token and signs the exact #1354 method/audience with
+        // the account's persisted #atproto key.
+        let service_auth_htu = format!("{ISSUER}{}", xrpc::GET_SERVICE_AUTH_PATH);
+        let service_auth_uri = format!(
+            "{}?aud={}&lxm={}",
+            xrpc::GET_SERVICE_AUTH_PATH,
+            urlencoding::encode(&state.atproto_service_did().unwrap()),
+            urlencoding::encode(token_exchange::ATPROTO_SESSION_EXCHANGE_NSID),
+        );
+        let service_auth_proof = dpop_resource_proof(
+            &dpop_key,
+            "GET",
+            &service_auth_htu,
+            &token_response.access_token,
+            "handler-service-auth-jti",
+            Some(&token_nonce),
+        );
+        let service_auth = app
+            .clone()
+            .oneshot(
+                axum::http::Request::get(service_auth_uri)
+                    .header(
+                        axum::http::header::AUTHORIZATION,
+                        format!("DPoP {}", token_response.access_token),
+                    )
+                    .header("DPoP", service_auth_proof)
+                    .body(axum::body::Body::empty())?,
+            )
+            .await?;
+        let service_auth_status = service_auth.status();
+        let service_auth_cache_control = service_auth
+            .headers()
+            .get(axum::http::header::CACHE_CONTROL)
+            .cloned();
+        let service_auth_json = response_json(service_auth).await;
+        assert_eq!(
+            service_auth_status,
+            axum::http::StatusCode::OK,
+            "{service_auth_json}"
+        );
+        assert_eq!(
+            service_auth_cache_control.as_ref().unwrap(),
+            "no-store"
+        );
+        let service_jwt = service_auth_json["token"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("service-auth response token"))?
+            .to_owned();
+        let verified = token_exchange::verify_atproto_service_jwt(
+            &state,
+            &service_jwt,
+            token_exchange::ATPROTO_SESSION_EXCHANGE_NSID,
+        )
+        .await
+        .map_err(anyhow::Error::msg)?;
+        assert_eq!(verified.sub, MAPPED_DID);
+        assert_eq!(verified.verified_tenant.as_deref(), Some(HOSTED_TENANT));
+
+        // The first hyprstream_session is still issued by the existing #1354
+        // exchange route; getServiceAuth does not create a parallel session.
+        let session_proof = dpop_proof(
+            &dpop_key,
+            &format!("{ISSUER}{}", browser_session::SESSION_EXCHANGE_PATH),
+            "handler-session-exchange-jti",
+            None,
+        );
+        let session = app
+            .clone()
+            .oneshot(
+                axum::http::Request::post(browser_session::SESSION_EXCHANGE_PATH)
+                    .header(
+                        axum::http::header::AUTHORIZATION,
+                        format!("Bearer {service_jwt}"),
+                    )
+                    .header("DPoP", session_proof)
+                    .body(axum::body::Body::empty())?,
+            )
+            .await?;
+        assert_eq!(session.status(), axum::http::StatusCode::OK);
+        assert!(
+            session.headers()[axum::http::header::SET_COOKIE]
+                .to_str()?
+                .starts_with("hyprstream_session=")
+        );
 
         // A confidential atproto client signs private_key_jwt with the AS
         // issuer as the assertion audience (atproto mandate, #1146 T1.2),
