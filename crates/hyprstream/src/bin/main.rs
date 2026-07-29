@@ -2353,36 +2353,56 @@ fn main() -> Result<()> {
                                 }
 
                                 if quic_cfg.enabled {
-                                    // First-boot deferral: the checkpointed PDS store
-                                    // is empty until the discovery/registry announcement
-                                    // pipeline processes service registrations — which
-                                    // happens AFTER services bind. Rather than hard-fail
-                                    // at `with_checkpointed_native_announcements`
-                                    // (which requires pre-existing accepted states),
-                                    // defer QUIC startup: services bind via inproc/IPC
-                                    // and serve HTTP routes; QUIC activates once the
-                                    // announcement pipeline writes accepted states
-                                    // (typically on the next boot or after a runtime
-                                    // discovery cycle). This does NOT weaken the
-                                    // checkpoint gate — QUIC simply waits for the
-                                    // states it requires.
-                                    let has_states = hyprstream_core::services::factories::pds_store_has_accepted_states(&ctx)
-                                        .unwrap_or_else(|e| {
-                                            tracing::warn!("failed to read PDS accepted states; treating as first boot: {e}");
-                                            false
-                                        });
-                                    if has_states {
-                                        ctx = hyprstream_core::services::factories::with_checkpointed_native_announcements(
-                                            ctx,
-                                            &service_names,
-                                        )?;
-                                    } else {
-                                        tracing::info!(
-                                            "QUIC deferred: PDS store has no accepted states (first boot). \
-                                             Services will bind via inproc/IPC; QUIC activates after the \
-                                             discovery pipeline writes accepted states."
-                                        );
-                                        quic_cfg.enabled = false;
+                                    // The checkpoint gate: QUIC announcements require
+                                    // checkpoint-verified accepted states. Classify the
+                                    // store explicitly — only a genuine first-boot
+                                    // state may defer QUIC; every read/verify error or
+                                    // data-loss ambiguity fails closed here.
+                                    use hyprstream_core::services::factories::{
+                                        classify_pds_store_for_quic, PdsBootState,
+                                    };
+                                    match classify_pds_store_for_quic(&ctx) {
+                                        Ok(PdsBootState::Populated) => {
+                                            ctx = hyprstream_core::services::factories::with_checkpointed_native_announcements(
+                                                ctx,
+                                                &service_names,
+                                            )?;
+                                        }
+                                        Ok(PdsBootState::FirstBoot) => {
+                                            // An explicit --quic-bind that cannot be
+                                            // honored (no accepted states exist yet) is
+                                            // an error, never a silent disable.
+                                            if quic_bind.is_some() {
+                                                anyhow::bail!(
+                                                    "QUIC requested via --quic-bind but the PDS \
+                                                     accepted-state store is at first boot (no \
+                                                     accepted states written yet). Complete \
+                                                     discovery/registry provisioning, then restart \
+                                                     to activate QUIC."
+                                                );
+                                            }
+                                            // Genuine first boot, no explicit network
+                                            // request: defer QUIC for this run. Services
+                                            // bind via inproc/IPC and serve HTTP. QUIC is
+                                            // NOT re-enabled at runtime — a restart after
+                                            // provisioning is required.
+                                            tracing::warn!(
+                                                "QUIC disabled for this run: the PDS \
+                                                 accepted-state store is at first boot (no \
+                                                 accepted states written yet). Services will \
+                                                 bind via inproc/IPC and serve HTTP. Restart \
+                                                 after the discovery/registry pipeline writes \
+                                                 accepted states to activate QUIC. No runtime \
+                                                 auto-activation is implemented."
+                                            );
+                                            quic_cfg.enabled = false;
+                                        }
+                                        Err(e) => {
+                                            return Err(e).context(
+                                                "PDS accepted-state store read failed; \
+                                                 refusing to start QUIC (fail-closed)"
+                                            );
+                                        }
                                     }
                                 }
 

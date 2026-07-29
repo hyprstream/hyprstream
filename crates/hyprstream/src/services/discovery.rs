@@ -420,6 +420,21 @@ impl PdsRecordStore {
         options.set_sync(true);
         db.write_opt(batch, &options)
             .context("synchronous accepted did:at9p state+checkpoint commit failed")?;
+        // The store is no longer at first boot: clear the provisioning marker
+        // (written by `init-deployment-store`) so a later read of an empty
+        // store — which can now only mean data loss — fails closed instead of
+        // being mistaken for first boot. Best-effort: a missing marker on a
+        // steady-state commit is the normal case.
+        let marker = db.path().join(hyprstream_discovery::FIRST_BOOT_MARKER);
+        if marker.exists() {
+            if let Err(e) = std::fs::remove_file(&marker) {
+                tracing::warn!(
+                    "failed to remove first-boot marker {}: {e}; \
+                     the store is populated but the marker lingers",
+                    marker.display()
+                );
+            }
+        }
         Ok(ConditionalAdvance::Committed)
     }
 

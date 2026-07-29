@@ -85,9 +85,24 @@ impl CheckpointedPdsAcceptedStateSource {
     }
 }
 
+/// Filename of the first-boot provisioning marker.
+///
+/// Written by [`initialize_deployment_store`] (and any other path that creates
+/// a fresh empty store) and removed by the registry service on its first
+/// successful accepted-state commit. Its presence alongside an empty store is
+/// the ONLY lifecycle evidence that distinguishes a genuine first boot (store
+/// freshly provisioned, no accepted state written yet) from a steady-state
+/// store that lost its data. The QUIC startup gate reads it via
+/// [`crate::classify_pds_store_for_quic`]-equivalent logic in the app crate.
+pub const FIRST_BOOT_MARKER: &str = "FIRST-BOOT-PENDING";
+
 /// Explicitly create the empty checkpoint store for a newly provisioned
 /// deployment. Resolver startup never calls this: a missing store there is
 /// treated as lost security history and fails closed.
+///
+/// Also writes the [`FIRST_BOOT_MARKER`] so the QUIC startup gate can recognize
+/// this as a genuine first boot (defer-eligible) rather than data loss. The
+/// registry removes the marker once it writes the first accepted state.
 pub(crate) fn initialize_deployment_store() -> Result<()> {
     let path = hyprstream_service::deployment_data_dir()?.join("pds-store");
     anyhow::ensure!(
@@ -100,6 +115,9 @@ pub(crate) fn initialize_deployment_store() -> Result<()> {
     drop(rocksdb::DB::open(&opts, &path).with_context(|| {
         format!("failed to initialize checkpointed PDS store at {path:?}")
     })?);
+    std::fs::write(path.join(FIRST_BOOT_MARKER), b"").with_context(|| {
+        format!("failed to write first-boot marker at {}", path.join(FIRST_BOOT_MARKER).display())
+    })?;
     Ok(())
 }
 

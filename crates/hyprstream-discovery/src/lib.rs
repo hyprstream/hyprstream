@@ -63,6 +63,13 @@ pub fn initialize_deployment_checkpoint_store() -> anyhow::Result<()> {
     checkpointed_pds::initialize_deployment_store()
 }
 
+/// The first-boot provisioning marker filename, written by
+/// [`initialize_deployment_checkpoint_store`] and removed by the registry on
+/// its first accepted-state commit. Re-exported so the app crate's QUIC
+/// startup gate and registry writer can share the exact name.
+#[cfg(not(target_arch = "wasm32"))]
+pub use checkpointed_pds::FIRST_BOOT_MARKER;
+
 /// #893 (at9p D1) — `did:at9p` capsule resolver: turns a GATE-verified capsule
 /// into a dialable `TransportConfig::iroh` (sibling to
 /// `hyprstream_rpc::service_entry::decode_iroh`). Injectable at the

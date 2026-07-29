@@ -92,25 +92,72 @@ pub(crate) fn pds_store_dir(ctx: &ServiceContext) -> anyhow::Result<std::path::P
     Ok(ctx.deployment_data_dir()?.join("pds-store"))
 }
 
-/// Check whether the checkpointed PDS store contains any accepted states.
+/// The lifecycle state of the checkpointed PDS store, as seen by the QUIC
+/// startup gate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PdsBootState {
+    /// ≥1 checkpoint-verified accepted state is present. The caller MUST run
+    /// [`with_checkpointed_native_announcements`] to populate announcements.
+    Populated,
+    /// Genuine first boot: the store has never held an accepted state (the
+    /// [`hyprstream_discovery::FIRST_BOOT_MARKER`] is present alongside an empty
+    /// store, or the store directory does not yet exist). QUIC may be deferred
+    /// for this run; a restart is required after the registry writes its first
+    /// accepted state. No runtime auto-activation is implemented.
+    FirstBoot,
+}
+
+/// Classify the checkpointed PDS store for the QUIC startup gate.
 ///
-/// At first boot (after `pds init-deployment-store` but before the discovery
-/// pipeline has processed any announcements) the store is empty. In that state
-/// `with_checkpointed_native_announcements` cannot construct checkpoint-verified
-/// QUIC announcements — the accepted states are written by the registry/
-/// discovery announcement pipeline, which runs AFTER services bind. Returning
-/// `false` here lets the caller defer QUIC startup (services bind via inproc/
-/// IPC and serve HTTP routes) without weakening the checkpoint gate: QUIC
-/// activates once the announcement pipeline populates accepted states.
-pub fn pds_store_has_accepted_states(ctx: &ServiceContext) -> anyhow::Result<bool> {
+/// This replaces the prior emptiness check, which could not distinguish a
+/// freshly provisioned first-boot store from a steady-state store that lost
+/// its data, and which collapsed every read/decode/signature/consistency
+/// error into "first boot". The classification is:
+///
+/// - Store directory absent → [`PdsBootState::FirstBoot`] (no write has ever
+///   occurred — the registry has never run).
+/// - Store directory present, marker present, store empty →
+///   [`PdsBootState::FirstBoot`] (provisioned via `init-deployment-store`;
+///   the registry has not yet written an accepted state).
+/// - Store directory present, ≥1 verified accepted state →
+///   [`PdsBootState::Populated`].
+/// - Store directory present, empty, **no** marker → `Err` (possible data
+///   loss or corruption; a loud steady-state failure — never defer).
+/// - Any read/decode/signature/consistency failure → `Err` (propagated;
+///   fail-closed at the checkpoint boundary).
+///
+/// Only [`PdsBootState::FirstBoot`] may enter a QUIC deferral path; every
+/// other outcome either proceeds with checkpointed announcements or fails
+/// startup.
+pub fn classify_pds_store_for_quic(ctx: &ServiceContext) -> anyhow::Result<PdsBootState> {
     let store_dir = pds_store_dir(ctx)?;
     if !store_dir.exists() {
-        return Ok(false);
+        // Nothing has ever created the store — the registry has never written.
+        // This is a genuine first boot (or pre-provisioning).
+        return Ok(PdsBootState::FirstBoot);
     }
     let acceptance_identity = hyprstream_discovery::deployment_registry_verifier()?;
     let store = crate::services::discovery::PdsRecordStore::open_readonly(&store_dir)?
         .with_at9p_deployment_verifier(acceptance_identity);
-    Ok(!store.accepted_at9p_states()?.is_empty())
+    // Propagates decode, signature-verification, and consistency failures
+    // (half-checkpoint mismatches, watermark/digest mismatches) as Err —
+    // these are NEVER evidence of first boot.
+    let states = store.accepted_at9p_states()?;
+    if !states.is_empty() {
+        return Ok(PdsBootState::Populated);
+    }
+    // The store exists and opens cleanly but holds no accepted states. Only
+    // the provisioning marker distinguishes genuine first boot from data loss.
+    let marker = store_dir.join(hyprstream_discovery::FIRST_BOOT_MARKER);
+    if marker.exists() {
+        return Ok(PdsBootState::FirstBoot);
+    }
+    anyhow::bail!(
+        "PDS accepted-state store at {} exists but contains no verified accepted \
+         states and no first-boot provisioning marker. This indicates data loss \
+         or corruption, not first boot; refusing to defer QUIC startup.",
+        store_dir.display()
+    )
 }
 
 /// Populate every ordinary network service announcement from a fresh
@@ -2119,6 +2166,10 @@ fn create_tui_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
 /// has ever been registered — bootstrap by briefly opening read-write (which
 /// creates the DB files) and releasing the handle, then retry read-only.
 ///
+/// When this path creates a fresh empty store it also writes the
+/// [`hyprstream_discovery::FIRST_BOOT_MARKER`], so the QUIC startup gate
+/// recognizes it as a genuine first boot rather than data loss.
+///
 /// Known limitation: if the registry and discovery services start
 /// concurrently on a brand-new install, both may race to bootstrap the same
 /// directory; one loses the RocksDB lock and its factory call fails, which
@@ -2138,6 +2189,13 @@ fn open_pds_store_readonly(
                     format!("read-only open failed ({orig}); bootstrap open also failed")
                 })?,
             );
+            // This bootstrap created a fresh empty store — record first-boot
+            // lifecycle evidence so the QUIC gate doesn't mistake it for data
+            // loss on the next classification.
+            let marker = dir.join(hyprstream_discovery::FIRST_BOOT_MARKER);
+            if !marker.exists() {
+                let _ = std::fs::write(&marker, b"");
+            }
             crate::services::discovery::PdsRecordStore::open_readonly(dir)
         }
     }

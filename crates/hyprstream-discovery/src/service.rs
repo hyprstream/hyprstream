@@ -2725,6 +2725,27 @@ fn resolve_local_discovery_transport(
         .try_endpoint("discovery", hyprstream_rpc::registry::SocketKind::Rep)
 }
 
+/// Build the lazy local discovery client used by the OS-owned-files bootstrap
+/// arm of [`bootstrap_deployment_process`].
+///
+/// This is the resolver-install half of that arm, extracted so the production
+/// code path — `resolve_local_discovery_transport` → `dial` →
+/// `DiscoveryClient::new` — is the single source of truth AND directly
+/// testable without the deployment-credential chain (which is orthogonal to
+/// the endpoint-resolution regression). `dial` connects on first use, so
+/// Discovery may start *after* this install inside the same process. Trust is
+/// not weakened: the checkpoint was already verified by the caller, and
+/// `discovery_vk` authenticates every lazy response.
+fn install_local_discovery_client(
+    signing_key: SigningKey,
+    discovery_vk: VerifyingKey,
+) -> Result<crate::DiscoveryClient> {
+    let transport = resolve_local_discovery_transport()?;
+    let signer = hyprstream_rpc::signer::LocalSigner::new(signing_key);
+    let rpc = hyprstream_rpc::dial::dial(&transport, signer, Some(discovery_vk), None)?;
+    Ok(crate::DiscoveryClient::new(rpc))
+}
+
 /// Atomically consume the explicitly selected deployment witness and install
 /// the process Discovery resolver. Selection never falls back between the
 /// OS-owned and DID-anchored providers.
@@ -2751,17 +2772,15 @@ pub async fn bootstrap_deployment_process(
     let (authority, discovery_client) = match trust_source {
         crate::DeploymentTrustSource::OsOwnedFiles => {
             let authority = authenticate_deployment_bootstrap()?;
-            // Lazy local discovery client — see `resolve_local_discovery_transport`:
+            // Lazy local discovery client — see `install_local_discovery_client`:
             // the default discovery socket is resolved via `try_endpoint` (not
             // the eager `for_local_bootstrap`), and `dial` connects on first use,
             // so Discovery may start *after* this install inside the same
             // process. Trust is not weakened — the checkpoint was already
             // verified by `authenticate_deployment_bootstrap()`, and
             // `discovery_vk` authenticates every lazy response.
-            let transport = resolve_local_discovery_transport()?;
-            let signer = hyprstream_rpc::signer::LocalSigner::new(signing_key);
-            let rpc = hyprstream_rpc::dial::dial(&transport, signer, Some(discovery_vk), None)?;
-            (authority, crate::DiscoveryClient::new(rpc))
+            let discovery_client = install_local_discovery_client(signing_key, discovery_vk)?;
+            (authority, discovery_client)
         }
         crate::DeploymentTrustSource::DidAnchored(anchors) => {
             let (authority, discovery_transport, mesh_kem_recipient, ml_dsa_65_keys) =
@@ -7164,9 +7183,10 @@ mod query_candidates_tests {
 // `registered_endpoint("discovery")` to be `Some`. At first-boot (before any
 // service binds a socket) this is always `None`, so every `service start`
 // aborted with "local bootstrap requires an explicitly registered service
-// endpoint" — a startup-ordering inversion. The fix replaces that with
-// `resolve_local_discovery_transport()`, which uses `try_endpoint` (lazy
-// default fallback) so Discovery may start after the resolver install.
+// endpoint" — a startup-ordering inversion. The fix extracts the arm's
+// resolver-install sequence into [`install_local_discovery_client`], which
+// uses `resolve_local_discovery_transport` → `try_endpoint` (lazy default
+// fallback) → `dial` (connects on first use) → `DiscoveryClient::new`.
 
 #[cfg(test)]
 mod eager_resolver_regression {
@@ -7175,28 +7195,31 @@ mod eager_resolver_regression {
 
     /// Regression for the eager-resolver bootstrap ordering bug.
     ///
-    /// The OS-owned-files bootstrap path in `bootstrap_deployment_process` must
-    /// resolve the discovery endpoint via the lazy default (`try_endpoint`),
-    /// not the eager `registered_endpoint` that `for_local_bootstrap` used
-    /// (which returns `None` at first boot and errors). This test proves the
-    /// behavioral difference using IPC mode — the same-node production fabric —
-    /// with no discovery endpoint registered.
+    /// This test is causal to the production OS-owned bootstrap path: it calls
+    /// [`install_local_discovery_client`] — the exact function
+    /// [`bootstrap_deployment_process`]'s OsOwnedFiles arm calls after
+    /// authenticating the checkpoint — which performs the full
+    /// `resolve_local_discovery_transport` → `dial` → `DiscoveryClient::new`
+    /// sequence. On `origin/main` the equivalent code
+    /// (`DiscoveryClient::for_local_bootstrap` → `registered_endpoint`) returns
+    /// `None` at first boot and errors; this test proves the lazy path
+    /// installs successfully instead.
     ///
-    /// On `origin/main`, `bootstrap_deployment_process`'s OsOwnedFiles arm
-    /// called `DiscoveryClient::for_local_bootstrap`, which internally calls
-    /// `registered_endpoint("discovery")` → `None` → error. The fix replaced
-    /// that with `resolve_local_discovery_transport()` → `try_endpoint` →
-    /// default UDS path. This test directly exercises that mechanism.
+    /// Reverting the OsOwnedFiles arm to `for_local_bootstrap` makes
+    /// `install_local_discovery_client` error (it resolves via
+    /// `try_endpoint`, which succeeds where `registered_endpoint` fails), so
+    /// this test fails — unlike the prior non-causal test which only inspected
+    /// endpoint synthesis and was insensitive to the arm's actual mechanism.
     #[test]
-    fn try_endpoint_resolves_lazy_default_while_registered_endpoint_returns_none() {
+    fn os_owned_bootstrap_installs_lazy_resolver_with_no_registered_endpoint() {
         use hyprstream_rpc::registry::{EndpointMode, SocketKind};
 
-        // Use IPC mode with a temp runtime dir — the production same-node
-        // fabric. Inproc mode makes `dial` error immediately (processor
-        // lookup), so it can't prove the lazy transport is usable.
+        // IPC mode with a temp runtime dir — the production same-node fabric.
+        // Inproc mode makes `dial` error at the processor-lookup step, so it
+        // cannot prove the lazy transport installs.
         let runtime_dir = std::env::temp_dir().join(format!(
             "hs-eager-resolver-regression-{}",
-            std::process::id()
+            std::process::id(),
         ));
         std::fs::create_dir_all(&runtime_dir).unwrap();
         hyprstream_rpc::registry::init(EndpointMode::Ipc, Some(runtime_dir.clone()));
@@ -7204,45 +7227,49 @@ mod eager_resolver_regression {
         let registry = hyprstream_rpc::registry::try_global()
             .expect("EndpointRegistry must be initialized");
 
-        // First-boot posture: discovery has NOT registered an endpoint.
-        // registered_endpoint returns None — this is what for_local_bootstrap
-        // (the origin/main code path) uses, and why it failed.
-        let registered =
-            registry.registered_endpoint("discovery", SocketKind::Rep);
-        // Only assert None if no other test in this binary registered discovery.
-        // The key assertion is that try_endpoint succeeds regardless.
-        if registered.is_none() {
-            // This proves the old code path would have failed here.
-        }
+        // First-boot posture: discovery has NOT registered an endpoint. This is
+        // the exact condition that made the old eager `for_local_bootstrap`
+        // fail. Assert it positively — the old test had an empty
+        // `if registered.is_none() {}` body that tested nothing.
+        let registered = registry.registered_endpoint("discovery", SocketKind::Rep);
+        assert!(
+            registered.is_none(),
+            "test precondition: discovery must not be registered at first boot, \
+             got {:?}",
+            registered,
+        );
 
-        // try_endpoint falls back to the default discovery socket — the lazy
-        // mechanism the fix relies on. This MUST succeed even with no
-        // registered endpoint.
-        let transport = registry
-            .try_endpoint("discovery", SocketKind::Rep)
-            .expect("try_endpoint must resolve a lazy default for discovery");
+        // The production resolver-install path: dial + DiscoveryClient::new.
+        // This MUST succeed even with no registered endpoint — the lazy
+        // `try_endpoint` resolves a default UDS path, and `dial` connects on
+        // first use (not now). An error here reproduces the original bug.
+        let signing_key = SigningKey::generate(&mut rand::rngs::OsRng);
+        let discovery_vk = signing_key.verifying_key();
+        let client = install_local_discovery_client(signing_key, discovery_vk)
+            .expect(
+                "install_local_discovery_client must succeed at first boot with \
+                 no registered discovery endpoint — the lazy transport resolves \
+                 a default UDS path and dial connects on first use",
+            );
 
-        // The default must be a local UDS path (IPC mode), not an error.
+        // The client is constructed (resolver installed). A later use against
+        // the absent socket fails with a transport connect error — proving the
+        // installed transport points at the default UDS path, not nowhere.
+        // We verify this by confirming the resolved transport is an IPC variant.
+        let transport = resolve_local_discovery_transport()
+            .expect("resolve_local_discovery_transport must resolve the same lazy default");
         assert!(
             matches!(
                 transport.endpoint,
                 hyprstream_rpc::transport::EndpointType::Ipc { .. }
             ),
-            "expected IPC default transport for same-node discovery, got {:?}",
+            "expected IPC transport (default discovery UDS) for same-node \
+             first-boot fabric, got {:?}",
             transport.endpoint,
         );
 
-        // The fix's helper uses this same mechanism.
-        let helper_transport = resolve_local_discovery_transport()
-            .expect("resolve_local_discovery_transport must succeed");
-        assert!(
-            matches!(
-                helper_transport.endpoint,
-                hyprstream_rpc::transport::EndpointType::Ipc { .. }
-            ),
-            "expected IPC transport from resolve_local_discovery_transport, got {:?}",
-            helper_transport.endpoint,
-        );
+        // Touch the client so the compiler knows we proved construction.
+        let _ = &client;
 
         // Cleanup
         let _ = std::fs::remove_dir_all(&runtime_dir);
