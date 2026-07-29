@@ -63,12 +63,13 @@ pub fn initialize_deployment_checkpoint_store() -> anyhow::Result<()> {
     checkpointed_pds::initialize_deployment_store()
 }
 
-/// The first-boot provisioning marker filename, written by
-/// [`initialize_deployment_checkpoint_store`] and removed by the registry on
-/// its first accepted-state commit. Re-exported so the app crate's QUIC
-/// startup gate and registry writer can share the exact name.
+/// The first-boot provisioning marker RocksDB key, written by
+/// [`initialize_deployment_checkpoint_store`] and deleted by the registry in
+/// the same `WriteBatch` as its first accepted-state commit. Re-exported so
+/// the app crate's QUIC startup gate and registry writer can share the exact
+/// key.
 #[cfg(not(target_arch = "wasm32"))]
-pub use checkpointed_pds::FIRST_BOOT_MARKER;
+pub use checkpointed_pds::FIRST_BOOT_KEY;
 
 /// #893 (at9p D1) — `did:at9p` capsule resolver: turns a GATE-verified capsule
 /// into a dialable `TransportConfig::iroh` (sibling to

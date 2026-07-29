@@ -1523,10 +1523,14 @@ fn resolve_service_vk(service_name: &str) -> Option<VerifyingKey> {
     trust.resolve_one(service_name)
 }
 
+/// Install the process production resolver and return whether the
+/// authenticated trust source was the OS-owned bootstrap (`true`) or a
+/// DID-anchored source (`false`). The caller retains this selection so the
+/// QUIC startup gate can scope first-boot deferral to the OS-owned path only.
 async fn install_process_production_resolver(
     signing_key: &SigningKey,
     config: &HyprConfig,
-) -> Result<()> {
+) -> Result<bool> {
     // The bootstrap pins the discovery service key from the process trust
     // store; in CLI/service-start mode nothing has seeded it yet. Seed from
     // the node's own bootstrap-pubkeys (the same source resolve_service_vk
@@ -1556,6 +1560,13 @@ async fn install_process_production_resolver(
         }
         _ => trust_source,
     };
+    // Retain the authenticated selection before it is consumed by the
+    // bootstrap. The QUIC startup gate uses this to scope first-boot
+    // deferral to the OS-owned path only.
+    let is_os_owned_bootstrap = matches!(
+        trust_source,
+        hyprstream_discovery::DeploymentTrustSource::OsOwnedFiles
+    );
     hyprstream_discovery::bootstrap_deployment_process(
         signing_key.clone(),
         trust_source,
@@ -1564,7 +1575,8 @@ async fn install_process_production_resolver(
     .await?;
     hyprstream_rpc::envelope::install_browser_currentness_verifier(
         hyprstream_discovery::production_browser_currentness_verifier()?,
-    )
+    )?;
+    Ok(is_os_owned_bootstrap)
 }
 
 /// Install the process-global envelope verify configuration (#152, #160).
@@ -2006,24 +2018,25 @@ fn main() -> Result<()> {
         .context("Failed to create registry runtime")?;
 
     // Start services and create keypair
-    let (registry_client, signing_key, verifying_key): (
+    let (registry_client, signing_key, verifying_key, is_os_owned_bootstrap): (
         RegistryClient,
         SigningKey,
         VerifyingKey,
+        bool,
     ) = _registry_runtime
         .block_on(async {
             let keys_dir = config.models_dir().join(".registry").join("keys");
             let signing_key = load_or_generate_signing_key(&keys_dir).await?;
             let verifying_key = signing_key.verifying_key();
 
-            install_process_production_resolver(&signing_key, &config).await
+            let is_os_owned_bootstrap = install_process_production_resolver(&signing_key, &config).await
                 .context("Failed to install checkpoint-backed production resolver")?;
             let client = hyprstream_core::services::RegistryClient::from_resolver(
                 signing_key.clone(),
                 None,
             )?;
 
-            Ok::<_, anyhow::Error>((client, signing_key, verifying_key))
+            Ok::<_, anyhow::Error>((client, signing_key, verifying_key, is_os_owned_bootstrap))
         })
         .context("Failed to connect to services")?;
 
@@ -2354,55 +2367,73 @@ fn main() -> Result<()> {
 
                                 if quic_cfg.enabled {
                                     // The checkpoint gate: QUIC announcements require
-                                    // checkpoint-verified accepted states. Classify the
-                                    // store explicitly — only a genuine first-boot
-                                    // state may defer QUIC; every read/verify error or
-                                    // data-loss ambiguity fails closed here.
-                                    use hyprstream_core::services::factories::{
-                                        classify_pds_store_for_quic, PdsBootState,
-                                    };
-                                    match classify_pds_store_for_quic(&ctx) {
-                                        Ok(PdsBootState::Populated) => {
-                                            ctx = hyprstream_core::services::factories::with_checkpointed_native_announcements(
-                                                ctx,
-                                                &service_names,
-                                            )?;
-                                        }
-                                        Ok(PdsBootState::FirstBoot) => {
-                                            // An explicit --quic-bind that cannot be
-                                            // honored (no accepted states exist yet) is
-                                            // an error, never a silent disable.
-                                            if quic_bind.is_some() {
-                                                anyhow::bail!(
-                                                    "QUIC requested via --quic-bind but the PDS \
+                                    // checkpoint-verified accepted states.
+                                    //
+                                    // First-boot deferral (classify + defer) is scoped
+                                    // to the OS-owned bootstrap source ONLY. Every
+                                    // other authenticated trust source (DID-anchored,
+                                    // restarts, etc.) takes the normal checkpointed
+                                    // path with no classification, no deferral, and no
+                                    // quic_cfg mutation. This is the retained selection
+                                    // from install_process_production_resolver — the
+                                    // authenticated trust-source choice carried to this
+                                    // boundary.
+                                    if is_os_owned_bootstrap {
+                                        use hyprstream_core::services::factories::{
+                                            classify_pds_store_for_quic, PdsBootState,
+                                        };
+                                        match classify_pds_store_for_quic(&ctx) {
+                                            Ok(PdsBootState::Populated) => {
+                                                ctx = hyprstream_core::services::factories::with_checkpointed_native_announcements(
+                                                    ctx,
+                                                    &service_names,
+                                                )?;
+                                            }
+                                            Ok(PdsBootState::FirstBoot) => {
+                                                // An explicit --quic-bind that cannot be
+                                                // honored (no accepted states exist yet) is
+                                                // an error, never a silent disable.
+                                                if quic_bind.is_some() {
+                                                    anyhow::bail!(
+                                                        "QUIC requested via --quic-bind but the PDS \
+                                                         accepted-state store is at first boot (no \
+                                                         accepted states written yet). Complete \
+                                                         discovery/registry provisioning, then restart \
+                                                         to activate QUIC."
+                                                    );
+                                                }
+                                                // Genuine first boot, no explicit network
+                                                // request: defer QUIC for this run. Services
+                                                // bind via inproc/IPC and serve HTTP. QUIC is
+                                                // NOT re-enabled at runtime — a restart after
+                                                // provisioning is required.
+                                                tracing::warn!(
+                                                    "QUIC disabled for this run: the PDS \
                                                      accepted-state store is at first boot (no \
-                                                     accepted states written yet). Complete \
-                                                     discovery/registry provisioning, then restart \
-                                                     to activate QUIC."
+                                                     accepted states written yet). Services will \
+                                                     bind via inproc/IPC and serve HTTP. Restart \
+                                                     after the discovery/registry pipeline writes \
+                                                     accepted states to activate QUIC. No runtime \
+                                                     auto-activation is implemented."
+                                                );
+                                                quic_cfg.enabled = false;
+                                            }
+                                            Err(e) => {
+                                                return Err(e).context(
+                                                    "PDS accepted-state store read failed; \
+                                                     refusing to start QUIC (fail-closed)"
                                                 );
                                             }
-                                            // Genuine first boot, no explicit network
-                                            // request: defer QUIC for this run. Services
-                                            // bind via inproc/IPC and serve HTTP. QUIC is
-                                            // NOT re-enabled at runtime — a restart after
-                                            // provisioning is required.
-                                            tracing::warn!(
-                                                "QUIC disabled for this run: the PDS \
-                                                 accepted-state store is at first boot (no \
-                                                 accepted states written yet). Services will \
-                                                 bind via inproc/IPC and serve HTTP. Restart \
-                                                 after the discovery/registry pipeline writes \
-                                                 accepted states to activate QUIC. No runtime \
-                                                 auto-activation is implemented."
-                                            );
-                                            quic_cfg.enabled = false;
                                         }
-                                        Err(e) => {
-                                            return Err(e).context(
-                                                "PDS accepted-state store read failed; \
-                                                 refusing to start QUIC (fail-closed)"
-                                            );
-                                        }
+                                    } else {
+                                        // Non-OS-owned source (DID-anchored, etc.):
+                                        // always checkpoint — accepted states are
+                                        // required, never deferred. Missing states fail
+                                        // loudly here, exactly as before this PR.
+                                        ctx = hyprstream_core::services::factories::with_checkpointed_native_announcements(
+                                            ctx,
+                                            &service_names,
+                                        )?;
                                     }
                                 }
 
@@ -3105,6 +3136,55 @@ mod resolver_startup_controls {
         ] {
             assert!(production.contains(entry), "missing {entry}");
         }
+    }
+
+    /// The first-boot QUIC deferral (classify + defer) must be scoped to the
+    /// OS-owned bootstrap source ONLY. This structural test guards the property
+    /// that has silently regressed three times: if someone removes the
+    /// `is_os_owned_bootstrap` gate, the `classify_pds_store_for_quic` call
+    /// would fire on every QUIC-enabled start again.
+    #[test]
+    fn first_boot_quic_deferral_is_scoped_to_os_owned_bootstrap() {
+        let source = include_str!("main.rs");
+        let production = source
+            .split("mod resolver_startup_controls {")
+            .next()
+            .expect("production binary source");
+
+        // The retained trust-source selection must exist as an if-gate.
+        let gate_pos = production
+            .find("if is_os_owned_bootstrap {")
+            .expect("is_os_owned_bootstrap if-gate must exist");
+
+        // The classification must appear AFTER the gate (inside the gated
+        // branch), proving it's scoped to the OS-owned bootstrap source.
+        let classify_offset = production[gate_pos..]
+            .find("classify_pds_store_for_quic")
+            .expect("classify_pds_store_for_quic must exist inside the gated branch");
+
+        // The QUIC-disable mutation must appear AFTER the classification
+        // (inside the FirstBoot arm of the match), still within the gated branch.
+        let classify_end = gate_pos + classify_offset;
+        let defer_offset = production[classify_end..]
+            .find("quic_cfg.enabled = false")
+            .expect("quic_cfg.enabled = false must be after classify, inside the gated branch");
+
+        // After the defer, the non-bootstrap else branch must checkpoint
+        // directly — no classification, no deferral.
+        let defer_end = classify_end + defer_offset;
+        let else_offset = production[defer_end..]
+            .find("} else {")
+            .expect("non-bootstrap else branch must exist after the defer");
+        let else_start = defer_end + else_offset;
+        let else_region = &production[else_start..else_start + 800];
+        assert!(
+            else_region.contains("with_checkpointed_native_announcements"),
+            "non-bootstrap branch must call with_checkpointed_native_announcements directly"
+        );
+        assert!(
+            !else_region.contains("classify_pds_store_for_quic"),
+            "non-bootstrap branch must NOT classify the store"
+        );
     }
 
     #[test]

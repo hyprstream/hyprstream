@@ -85,24 +85,27 @@ impl CheckpointedPdsAcceptedStateSource {
     }
 }
 
-/// Filename of the first-boot provisioning marker.
+/// RocksDB key for the first-boot provisioning marker.
 ///
 /// Written by [`initialize_deployment_store`] (and any other path that creates
-/// a fresh empty store) and removed by the registry service on its first
-/// successful accepted-state commit. Its presence alongside an empty store is
-/// the ONLY lifecycle evidence that distinguishes a genuine first boot (store
-/// freshly provisioned, no accepted state written yet) from a steady-state
-/// store that lost its data. The QUIC startup gate reads it via
-/// [`crate::classify_pds_store_for_quic`]-equivalent logic in the app crate.
-pub const FIRST_BOOT_MARKER: &str = "FIRST-BOOT-PENDING";
+/// a fresh empty store) and deleted by the registry service **in the same
+/// synchronous `WriteBatch` as the first accepted-state commit** — so the
+/// lifecycle transition is atomic with provisioning completion, not a
+/// best-effort filesystem side-effect. Its presence alongside an empty store
+/// is the ONLY lifecycle evidence that distinguishes a genuine first boot
+/// (store freshly provisioned, no accepted state written yet) from a
+/// steady-state store that lost its data. The QUIC startup gate reads it via
+/// [`PdsRecordStore::first_boot_pending`] in the app crate.
+pub const FIRST_BOOT_KEY: &[u8] = b"first-boot-pending";
 
 /// Explicitly create the empty checkpoint store for a newly provisioned
 /// deployment. Resolver startup never calls this: a missing store there is
 /// treated as lost security history and fails closed.
 ///
-/// Also writes the [`FIRST_BOOT_MARKER`] so the QUIC startup gate can recognize
+/// Also writes the [`FIRST_BOOT_KEY`] so the QUIC startup gate can recognize
 /// this as a genuine first boot (defer-eligible) rather than data loss. The
-/// registry removes the marker once it writes the first accepted state.
+/// registry deletes the key (in the same RocksDB batch as the first
+/// accepted-state commit) once provisioning completes.
 pub(crate) fn initialize_deployment_store() -> Result<()> {
     let path = hyprstream_service::deployment_data_dir()?.join("pds-store");
     anyhow::ensure!(
@@ -112,12 +115,14 @@ pub(crate) fn initialize_deployment_store() -> Result<()> {
     );
     let mut opts = rocksdb::Options::default();
     opts.create_if_missing(true);
-    drop(rocksdb::DB::open(&opts, &path).with_context(|| {
-        format!("failed to initialize checkpointed PDS store at {path:?}")
-    })?);
-    std::fs::write(path.join(FIRST_BOOT_MARKER), b"").with_context(|| {
-        format!("failed to write first-boot marker at {}", path.join(FIRST_BOOT_MARKER).display())
-    })?;
+    let db = rocksdb::DB::open(&opts, &path)
+        .with_context(|| format!("failed to initialize checkpointed PDS store at {path:?}"))?;
+    // Write the first-boot marker as a durable RocksDB key (not a filesystem
+    // side-effect) so its deletion can be atomic with the first accepted-state
+    // commit. A failed put propagates — provisioning must not appear successful
+    // if the marker wasn't written.
+    db.put(FIRST_BOOT_KEY, b"")
+        .with_context(|| format!("failed to write first-boot marker in store at {path:?}"))?;
     Ok(())
 }
 

@@ -2774,7 +2774,7 @@ pub async fn bootstrap_deployment_process(
             let authority = authenticate_deployment_bootstrap()?;
             // Lazy local discovery client — see `install_local_discovery_client`:
             // the default discovery socket is resolved via `try_endpoint` (not
-            // the eager `for_local_bootstrap`), and `dial` connects on first use,
+            // the eager registered_endpoint path), and `dial` connects on first use,
             // so Discovery may start *after* this install inside the same
             // process. Trust is not weakened — the checkpoint was already
             // verified by `authenticate_deployment_bootstrap()`, and
@@ -7193,25 +7193,16 @@ mod eager_resolver_regression {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
     use super::*;
 
-    /// Regression for the eager-resolver bootstrap ordering bug.
+    /// Behavioral test: proves [`install_local_discovery_client`] succeeds at
+    /// first boot with no registered endpoint — the lazy `try_endpoint`
+    /// resolves a default UDS path and `dial` connects on first use (not now).
     ///
-    /// This test is causal to the production OS-owned bootstrap path: it calls
-    /// [`install_local_discovery_client`] — the exact function
-    /// [`bootstrap_deployment_process`]'s OsOwnedFiles arm calls after
-    /// authenticating the checkpoint — which performs the full
-    /// `resolve_local_discovery_transport` → `dial` → `DiscoveryClient::new`
-    /// sequence. On `origin/main` the equivalent code
-    /// (`DiscoveryClient::for_local_bootstrap` → `registered_endpoint`) returns
-    /// `None` at first boot and errors; this test proves the lazy path
-    /// installs successfully instead.
-    ///
-    /// Reverting the OsOwnedFiles arm to `for_local_bootstrap` makes
-    /// `install_local_discovery_client` error (it resolves via
-    /// `try_endpoint`, which succeeds where `registered_endpoint` fails), so
-    /// this test fails — unlike the prior non-causal test which only inspected
-    /// endpoint synthesis and was insensitive to the arm's actual mechanism.
+    /// This test exercises the extracted helper's mechanism (resolve → dial →
+    /// DiscoveryClient::new) and asserts `registered_endpoint` is `None`. It
+    /// does NOT by itself detect reversion of the OsOwnedFiles arm to
+    /// `for_local_bootstrap` — that is the job of the structural test below.
     #[test]
-    fn os_owned_bootstrap_installs_lazy_resolver_with_no_registered_endpoint() {
+    fn install_local_discovery_client_succeeds_with_no_registered_endpoint() {
         use hyprstream_rpc::registry::{EndpointMode, SocketKind};
 
         // IPC mode with a temp runtime dir — the production same-node fabric.
@@ -7227,10 +7218,7 @@ mod eager_resolver_regression {
         let registry = hyprstream_rpc::registry::try_global()
             .expect("EndpointRegistry must be initialized");
 
-        // First-boot posture: discovery has NOT registered an endpoint. This is
-        // the exact condition that made the old eager `for_local_bootstrap`
-        // fail. Assert it positively — the old test had an empty
-        // `if registered.is_none() {}` body that tested nothing.
+        // First-boot posture: discovery has NOT registered an endpoint.
         let registered = registry.registered_endpoint("discovery", SocketKind::Rep);
         assert!(
             registered.is_none(),
@@ -7239,39 +7227,68 @@ mod eager_resolver_regression {
             registered,
         );
 
-        // The production resolver-install path: dial + DiscoveryClient::new.
-        // This MUST succeed even with no registered endpoint — the lazy
-        // `try_endpoint` resolves a default UDS path, and `dial` connects on
-        // first use (not now). An error here reproduces the original bug.
+        // The resolver-install path: dial + DiscoveryClient::new.
         let signing_key = SigningKey::generate(&mut rand::rngs::OsRng);
         let discovery_vk = signing_key.verifying_key();
-        let client = install_local_discovery_client(signing_key, discovery_vk)
+        let _client = install_local_discovery_client(signing_key, discovery_vk)
             .expect(
                 "install_local_discovery_client must succeed at first boot with \
-                 no registered discovery endpoint — the lazy transport resolves \
-                 a default UDS path and dial connects on first use",
+                 no registered discovery endpoint",
             );
 
-        // The client is constructed (resolver installed). A later use against
-        // the absent socket fails with a transport connect error — proving the
-        // installed transport points at the default UDS path, not nowhere.
-        // We verify this by confirming the resolved transport is an IPC variant.
+        // Confirm the resolved transport is the default UDS path (IPC variant).
         let transport = resolve_local_discovery_transport()
-            .expect("resolve_local_discovery_transport must resolve the same lazy default");
+            .expect("resolve_local_discovery_transport must resolve the lazy default");
         assert!(
             matches!(
                 transport.endpoint,
                 hyprstream_rpc::transport::EndpointType::Ipc { .. }
             ),
-            "expected IPC transport (default discovery UDS) for same-node \
-             first-boot fabric, got {:?}",
+            "expected IPC transport (default discovery UDS), got {:?}",
             transport.endpoint,
         );
 
-        // Touch the client so the compiler knows we proved construction.
-        let _ = &client;
-
         // Cleanup
         let _ = std::fs::remove_dir_all(&runtime_dir);
+    }
+
+    /// Structural guard: the OsOwnedFiles arm of
+    /// [`bootstrap_deployment_process`] must call
+    /// [`install_local_discovery_client`] (the lazy resolver), not
+    /// `DiscoveryClient::for_local_bootstrap` (the eager resolver that fails at
+    /// first boot). This test inspects the production source of the arm — if
+    /// someone reverts the arm to `for_local_bootstrap`, this test fails.
+    ///
+    /// Together with the behavioral test above (which proves the helper
+    /// succeeds with no registered endpoint), this guards the production
+    /// install boundary: the arm calls the proven-correct helper, and the
+    /// helper works.
+    #[test]
+    fn os_owned_arm_uses_lazy_resolver_not_for_local_bootstrap() {
+        let source = include_str!("service.rs");
+        // Production code only — exclude this regression test module.
+        let production = source
+            .split("// ============================================================================\n// Regression: eager-resolver")
+            .next()
+            .expect("production source before regression test module");
+
+        // Find the OsOwnedFiles arm of bootstrap_deployment_process.
+        let arm = production
+            .find("DeploymentTrustSource::OsOwnedFiles =>")
+            .expect("OsOwnedFiles arm must exist in bootstrap_deployment_process");
+        let arm_block = &production[arm..arm + 800];
+
+        assert!(
+            arm_block.contains("install_local_discovery_client"),
+            "OsOwnedFiles arm must call install_local_discovery_client (lazy resolver), \
+             got:\n{}",
+            arm_block,
+        );
+        assert!(
+            !arm_block.contains("for_local_bootstrap"),
+            "OsOwnedFiles arm must NOT call for_local_bootstrap (eager resolver), \
+             got:\n{}",
+            arm_block,
+        );
     }
 }

@@ -100,10 +100,10 @@ pub enum PdsBootState {
     /// [`with_checkpointed_native_announcements`] to populate announcements.
     Populated,
     /// Genuine first boot: the store has never held an accepted state (the
-    /// [`hyprstream_discovery::FIRST_BOOT_MARKER`] is present alongside an empty
-    /// store, or the store directory does not yet exist). QUIC may be deferred
-    /// for this run; a restart is required after the registry writes its first
-    /// accepted state. No runtime auto-activation is implemented.
+    /// durable first-boot RocksDB key is present alongside an empty store).
+    /// QUIC may be deferred for this run; a restart is required after the
+    /// registry writes its first accepted state. No runtime auto-activation
+    /// is implemented.
     FirstBoot,
 }
 
@@ -123,6 +123,8 @@ pub enum PdsBootState {
 ///   [`PdsBootState::Populated`].
 /// - Store directory present, empty, **no** marker → `Err` (possible data
 ///   loss or corruption; a loud steady-state failure — never defer).
+/// - Store directory **absent** → `Err` (missing security history; run
+///   `init-deployment-store` to provision, or restore from backup).
 /// - Any read/decode/signature/consistency failure → `Err` (propagated;
 ///   fail-closed at the checkpoint boundary).
 ///
@@ -132,9 +134,16 @@ pub enum PdsBootState {
 pub fn classify_pds_store_for_quic(ctx: &ServiceContext) -> anyhow::Result<PdsBootState> {
     let store_dir = pds_store_dir(ctx)?;
     if !store_dir.exists() {
-        // Nothing has ever created the store — the registry has never written.
-        // This is a genuine first boot (or pre-provisioning).
-        return Ok(PdsBootState::FirstBoot);
+        // A missing store is indistinguishable from deletion of security
+        // history — the checkpoint source's documented rule. First boot is an
+        // explicit provisioning step (init-deployment-store), not an absent
+        // directory. Fail closed; do not defer.
+        anyhow::bail!(
+            "PDS accepted-state store at {} does not exist. Run \
+             `init-deployment-store` to provision a fresh deployment, or \
+             restore from backup. Refusing to defer QUIC startup.",
+            store_dir.display()
+        );
     }
     let acceptance_identity = hyprstream_discovery::deployment_registry_verifier()?;
     let store = crate::services::discovery::PdsRecordStore::open_readonly(&store_dir)?
@@ -147,9 +156,10 @@ pub fn classify_pds_store_for_quic(ctx: &ServiceContext) -> anyhow::Result<PdsBo
         return Ok(PdsBootState::Populated);
     }
     // The store exists and opens cleanly but holds no accepted states. Only
-    // the provisioning marker distinguishes genuine first boot from data loss.
-    let marker = store_dir.join(hyprstream_discovery::FIRST_BOOT_MARKER);
-    if marker.exists() {
+    // the durable first-boot marker (a RocksDB key deleted atomically with
+    // the first accepted-state commit) distinguishes genuine first boot from
+    // data loss.
+    if store.first_boot_pending()? {
         return Ok(PdsBootState::FirstBoot);
     }
     anyhow::bail!(
@@ -2166,9 +2176,9 @@ fn create_tui_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
 /// has ever been registered — bootstrap by briefly opening read-write (which
 /// creates the DB files) and releasing the handle, then retry read-only.
 ///
-/// When this path creates a fresh empty store it also writes the
-/// [`hyprstream_discovery::FIRST_BOOT_MARKER`], so the QUIC startup gate
-/// recognizes it as a genuine first boot rather than data loss.
+/// When this path creates a fresh empty store it also writes the durable
+/// first-boot RocksDB key, so the QUIC startup gate recognizes it as a
+/// genuine first boot rather than data loss.
 ///
 /// Known limitation: if the registry and discovery services start
 /// concurrently on a brand-new install, both may race to bootstrap the same
@@ -2184,18 +2194,17 @@ fn open_pds_store_readonly(
             // read-only. If bootstrap itself fails (e.g. the writer holds the
             // lock, or the path is corrupt), surface BOTH errors so the real
             // cause is visible rather than masked by the retry (#910a, fable M3).
-            drop(
-                crate::services::discovery::PdsRecordStore::open(dir).with_context(|| {
+            let store = crate::services::discovery::PdsRecordStore::open(dir)
+                .with_context(|| {
                     format!("read-only open failed ({orig}); bootstrap open also failed")
-                })?,
-            );
+                })?;
             // This bootstrap created a fresh empty store — record first-boot
-            // lifecycle evidence so the QUIC gate doesn't mistake it for data
-            // loss on the next classification.
-            let marker = dir.join(hyprstream_discovery::FIRST_BOOT_MARKER);
-            if !marker.exists() {
-                let _ = std::fs::write(&marker, b"");
-            }
+            // lifecycle evidence as a durable RocksDB key so the QUIC gate
+            // doesn't mistake it for data loss on the next classification.
+            // Propagate the error: a failed marker write must not appear
+            // successful.
+            store.mark_first_boot()?;
+            drop(store);
             crate::services::discovery::PdsRecordStore::open_readonly(dir)
         }
     }

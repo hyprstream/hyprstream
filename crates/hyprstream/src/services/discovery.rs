@@ -392,6 +392,36 @@ impl PdsRecordStore {
         }
     }
 
+    /// Check whether the first-boot provisioning marker (`FIRST_BOOT_KEY`) is
+    /// present in the store. The marker is written by `init-deployment-store`
+    /// and deleted atomically with the first accepted-state commit. Its
+    /// presence alongside an empty store is the ONLY lifecycle evidence that
+    /// distinguishes genuine first boot from data loss.
+    pub fn first_boot_pending(&self) -> AnyResult<bool> {
+        let check = |db: &rocksdb::DB| -> AnyResult<bool> {
+            Ok(db.get(hyprstream_discovery::FIRST_BOOT_KEY)?.is_some())
+        };
+        match &self.backing {
+            RecordBacking::ReadWrite(db) => check(db),
+            RecordBacking::ReadOnly(path) => {
+                let db = rocksdb::DB::open_for_read_only(&readonly_opts(), path, false)?;
+                check(&db)
+            }
+        }
+    }
+
+    /// Write the first-boot provisioning marker. Only valid on a read-write
+    /// store that has just been freshly created. Propagates the write error so
+    /// initialization cannot appear successful without the marker.
+    pub fn mark_first_boot(&self) -> AnyResult<()> {
+        let RecordBacking::ReadWrite(db) = &self.backing else {
+            bail!("first-boot marker write attempted on a read-only PDS store");
+        };
+        db.put(hyprstream_discovery::FIRST_BOOT_KEY, b"")
+            .context("failed to write first-boot provisioning marker")?;
+        Ok(())
+    }
+
     fn conditional_advance_at9p_state(
         &self,
         expected: Option<Watermark>,
@@ -416,25 +446,15 @@ impl PdsRecordStore {
         let mut batch = rocksdb::WriteBatch::default();
         batch.put(at9p_state_key(&state.subject_cid512), encoded);
         batch.put(at9p_checkpoint_key(&state.subject_cid512), checkpoint);
+        // Clear the first-boot provisioning marker in the SAME synchronous
+        // batch as the accepted-state commit — so the lifecycle transition is
+        // atomic with provisioning completion. A crash between commit and
+        // marker removal is impossible: they are one RocksDB write.
+        batch.delete(hyprstream_discovery::FIRST_BOOT_KEY);
         let mut options = rocksdb::WriteOptions::default();
         options.set_sync(true);
         db.write_opt(batch, &options)
             .context("synchronous accepted did:at9p state+checkpoint commit failed")?;
-        // The store is no longer at first boot: clear the provisioning marker
-        // (written by `init-deployment-store`) so a later read of an empty
-        // store — which can now only mean data loss — fails closed instead of
-        // being mistaken for first boot. Best-effort: a missing marker on a
-        // steady-state commit is the normal case.
-        let marker = db.path().join(hyprstream_discovery::FIRST_BOOT_MARKER);
-        if marker.exists() {
-            if let Err(e) = std::fs::remove_file(&marker) {
-                tracing::warn!(
-                    "failed to remove first-boot marker {}: {e}; \
-                     the store is populated but the marker lingers",
-                    marker.display()
-                );
-            }
-        }
         Ok(ConditionalAdvance::Committed)
     }
 
