@@ -7017,6 +7017,7 @@ dependencies = [
  "hyprstream-rpc-derive",
  "hyprstream-service",
  "hyprstream-util",
+ "libc",
  "p256",
  "parking_lot 0.12.4",
  "proptest",
