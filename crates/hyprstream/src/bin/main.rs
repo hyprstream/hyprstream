@@ -1579,6 +1579,33 @@ async fn install_process_production_resolver(
     Ok(is_os_owned_bootstrap)
 }
 
+/// The only startup policy that consumes PDS lifecycle classification.
+///
+/// `is_os_owned_bootstrap` is derived from the authenticated deployment trust
+/// source before bootstrap consumes it. Keeping the classifier inside this
+/// gate is intentional: DID-anchored deployments must take the ordinary
+/// checkpointed path without reading lifecycle state or mutating QUIC.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QuicCheckpointPolicy {
+    CheckpointedAnnouncements,
+    DeferForFirstBoot,
+}
+
+fn quic_checkpoint_policy(
+    is_os_owned_bootstrap: bool,
+    classify: impl FnOnce() -> Result<hyprstream_core::services::factories::PdsBootState>,
+) -> Result<QuicCheckpointPolicy> {
+    if !is_os_owned_bootstrap {
+        return Ok(QuicCheckpointPolicy::CheckpointedAnnouncements);
+    }
+
+    use hyprstream_core::services::factories::PdsBootState;
+    match classify()? {
+        PdsBootState::Populated => Ok(QuicCheckpointPolicy::CheckpointedAnnouncements),
+        PdsBootState::FirstBoot => Ok(QuicCheckpointPolicy::DeferForFirstBoot),
+    }
+}
+
 /// Install the process-global envelope verify configuration (#152, #160).
 ///
 /// MUST be called once at startup on **every** process entrypoint that serves
@@ -2369,27 +2396,26 @@ fn main() -> Result<()> {
                                     // The checkpoint gate: QUIC announcements require
                                     // checkpoint-verified accepted states.
                                     //
-                                    // First-boot deferral (classify + defer) is scoped
-                                    // to the OS-owned bootstrap source ONLY. Every
-                                    // other authenticated trust source (DID-anchored,
-                                    // restarts, etc.) takes the normal checkpointed
-                                    // path with no classification, no deferral, and no
-                                    // quic_cfg mutation. This is the retained selection
-                                    // from install_process_production_resolver — the
-                                    // authenticated trust-source choice carried to this
-                                    // boundary.
-                                    if is_os_owned_bootstrap {
-                                        use hyprstream_core::services::factories::{
-                                            classify_pds_store_for_quic, PdsBootState,
-                                        };
-                                        match classify_pds_store_for_quic(&ctx) {
-                                            Ok(PdsBootState::Populated) => {
+                                    // First-boot deferral is scoped to the OS-owned
+                                    // bootstrap source ONLY. An OS-owned deployment
+                                    // remains that source on restart, so it classifies
+                                    // then takes the ordinary checkpointed path when
+                                    // populated. DID-anchored deployments never read
+                                    // lifecycle state or mutate QUIC here.
+                                    match quic_checkpoint_policy(is_os_owned_bootstrap, || {
+                                        hyprstream_core::services::factories::classify_pds_store_for_quic(&ctx)
+                                    })
+                                    .context(
+                                        "PDS accepted-state store read failed; \
+                                         refusing to start QUIC (fail-closed)",
+                                    )? {
+                                        QuicCheckpointPolicy::CheckpointedAnnouncements => {
                                                 ctx = hyprstream_core::services::factories::with_checkpointed_native_announcements(
                                                     ctx,
                                                     &service_names,
                                                 )?;
-                                            }
-                                            Ok(PdsBootState::FirstBoot) => {
+                                        }
+                                        QuicCheckpointPolicy::DeferForFirstBoot => {
                                                 // An explicit --quic-bind that cannot be
                                                 // honored (no accepted states exist yet) is
                                                 // an error, never a silent disable.
@@ -2417,23 +2443,7 @@ fn main() -> Result<()> {
                                                      auto-activation is implemented."
                                                 );
                                                 quic_cfg.enabled = false;
-                                            }
-                                            Err(e) => {
-                                                return Err(e).context(
-                                                    "PDS accepted-state store read failed; \
-                                                     refusing to start QUIC (fail-closed)"
-                                                );
-                                            }
                                         }
-                                    } else {
-                                        // Non-OS-owned source (DID-anchored, etc.):
-                                        // always checkpoint — accepted states are
-                                        // required, never deferred. Missing states fail
-                                        // loudly here, exactly as before this PR.
-                                        ctx = hyprstream_core::services::factories::with_checkpointed_native_announcements(
-                                            ctx,
-                                            &service_names,
-                                        )?;
                                     }
                                 }
 
@@ -3138,52 +3148,40 @@ mod resolver_startup_controls {
         }
     }
 
-    /// The first-boot QUIC deferral (classify + defer) must be scoped to the
-    /// OS-owned bootstrap source ONLY. This structural test guards the property
-    /// that has silently regressed three times: if someone removes the
-    /// `is_os_owned_bootstrap` gate, the `classify_pds_store_for_quic` call
-    /// would fire on every QUIC-enabled start again.
+    /// Lifecycle classification is consumed only for the authenticated
+    /// OS-owned source. This is behavioral rather than positional: moving the
+    /// classifier outside `quic_checkpoint_policy`'s source gate makes the
+    /// DID-anchored case below invoke its deliberately failing classifier.
     #[test]
     fn first_boot_quic_deferral_is_scoped_to_os_owned_bootstrap() {
-        let source = include_str!("main.rs");
-        let production = source
-            .split("mod resolver_startup_controls {")
-            .next()
-            .expect("production binary source");
+        use std::cell::Cell;
 
-        // The retained trust-source selection must exist as an if-gate.
-        let gate_pos = production
-            .find("if is_os_owned_bootstrap {")
-            .expect("is_os_owned_bootstrap if-gate must exist");
+        use hyprstream_core::services::factories::PdsBootState;
 
-        // The classification must appear AFTER the gate (inside the gated
-        // branch), proving it's scoped to the OS-owned bootstrap source.
-        let classify_offset = production[gate_pos..]
-            .find("classify_pds_store_for_quic")
-            .expect("classify_pds_store_for_quic must exist inside the gated branch");
-
-        // The QUIC-disable mutation must appear AFTER the classification
-        // (inside the FirstBoot arm of the match), still within the gated branch.
-        let classify_end = gate_pos + classify_offset;
-        let defer_offset = production[classify_end..]
-            .find("quic_cfg.enabled = false")
-            .expect("quic_cfg.enabled = false must be after classify, inside the gated branch");
-
-        // After the defer, the non-bootstrap else branch must checkpoint
-        // directly — no classification, no deferral.
-        let defer_end = classify_end + defer_offset;
-        let else_offset = production[defer_end..]
-            .find("} else {")
-            .expect("non-bootstrap else branch must exist after the defer");
-        let else_start = defer_end + else_offset;
-        let else_region = &production[else_start..else_start + 800];
-        assert!(
-            else_region.contains("with_checkpointed_native_announcements"),
-            "non-bootstrap branch must call with_checkpointed_native_announcements directly"
+        let os_owned_calls = Cell::new(0);
+        assert_eq!(
+            super::quic_checkpoint_policy(true, || {
+                os_owned_calls.set(os_owned_calls.get() + 1);
+                Ok(PdsBootState::FirstBoot)
+            })
+            .expect("OS-owned classification succeeds"),
+            super::QuicCheckpointPolicy::DeferForFirstBoot,
         );
-        assert!(
-            !else_region.contains("classify_pds_store_for_quic"),
-            "non-bootstrap branch must NOT classify the store"
+        assert_eq!(os_owned_calls.get(), 1, "OS-owned input classifies once");
+
+        let did_anchored_calls = Cell::new(0);
+        assert_eq!(
+            super::quic_checkpoint_policy(false, || {
+                did_anchored_calls.set(did_anchored_calls.get() + 1);
+                anyhow::bail!("DID-anchored startup must never classify lifecycle state")
+            })
+            .expect("DID-anchored startup bypasses the classifier"),
+            super::QuicCheckpointPolicy::CheckpointedAnnouncements,
+        );
+        assert_eq!(
+            did_anchored_calls.get(),
+            0,
+            "DID-anchored input must not invoke the classifier"
         );
     }
 

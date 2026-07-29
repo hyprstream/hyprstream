@@ -114,8 +114,6 @@ pub enum PdsBootState {
 /// its data, and which collapsed every read/decode/signature/consistency
 /// error into "first boot". The classification is:
 ///
-/// - Store directory absent → [`PdsBootState::FirstBoot`] (no write has ever
-///   occurred — the registry has never run).
 /// - Store directory present, marker present, store empty →
 ///   [`PdsBootState::FirstBoot`] (provisioned via `init-deployment-store`;
 ///   the registry has not yet written an accepted state).
