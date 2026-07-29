@@ -1,6 +1,7 @@
 [package]
 name = "hyprstream-workers-python-guest"
 version = "0.1.0"
+publish = false
 edition = "2021"
 license = "MIT"
 description = "RustPython guest compiled to wasm32-unknown-unknown for the #505 capability sandbox (P1 host)"

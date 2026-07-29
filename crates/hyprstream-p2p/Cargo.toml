@@ -1,6 +1,7 @@
 [package]
 name = "hyprstream-p2p"
 version = "0.2.0"
+publish = false
 edition = "2021"
 authors = ["Erica Windsich <erica@cyberdione.ai>"]
 description = "Decentralized git hosting over iroh-blobs + a mainline DHT locator"

@@ -1,6 +1,7 @@
 [package]
 name = "hyprstream-workers-tcl"
 version = "0.1.0"
+publish = false
 edition.workspace = true
 license = "MIT"
 description = "Tcl (molt) shell for hyprstream VFS namespace"

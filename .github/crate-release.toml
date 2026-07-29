@@ -1,0 +1,50 @@
+# Public Rust crate release policy. Every package under crates/*/Cargo.toml must
+# appear exactly once. The order of public_now is the crates.io publish order.
+registry = "crates-io"
+tag_prefix = "crates-v"
+environment = "crates-io-publish"
+
+public_now = [
+  "hyprstream-rpc-build",
+  "hyprstream-rpc-derive",
+]
+
+public_later = [
+  "bitsandbytes-sys",
+  "cas-serve",
+  "git-xet-filter",
+  "git2db",
+  "hyprstream-9p",
+  "hyprstream-compositor",
+  "hyprstream-containedfs",
+  "hyprstream-crypto",
+  "hyprstream-discovery",
+  "hyprstream-flight",
+  "hyprstream-k8s",
+  "hyprstream-ledger",
+  "hyprstream-metrics",
+  "hyprstream-p2p",
+  "hyprstream-pds",
+  "hyprstream-pds-service",
+  "hyprstream-resource",
+  "hyprstream-rpc",
+  "hyprstream-rpc-std",
+  "hyprstream-service",
+  "hyprstream-util",
+  "hyprstream-vfs",
+  "hyprstream-vfs-server",
+  "hyprstream-workers",
+  "hyprstream-workers-python",
+  "hyprstream-workers-tcl",
+  "hyprstream-workers-wasmtime",
+  "waxterm",
+]
+
+internal = [
+  "chat-core",
+  "hyprstream",
+  "hyprstream-appview",
+  "hyprstream-tui",
+  "hyprstream-workers-python-guest",
+  "hyprstream-workers-wasmtime-fsguest",
+]
