@@ -27,3 +27,23 @@ agpl_services = [
   "hyprstream-pds-service",
   "hyprstream-service",
 ]
+
+# Packages outside the one-way Apache-library/AGPL-service boundary remain
+# explicit so deleting any classification fails closed.
+other_packages = [
+  "bitsandbytes-sys",
+  "cas-serve",
+  "chat-core",
+  "git-xet-filter",
+  "git2db",
+  "hyprstream-9p",
+  "hyprstream-compositor",
+  "hyprstream-containedfs",
+  "hyprstream-flight",
+  "hyprstream-metrics",
+  "hyprstream-p2p",
+  "hyprstream-resource",
+  "hyprstream-vfs-server",
+  "hyprstream-workers",
+  "waxterm",
+]
