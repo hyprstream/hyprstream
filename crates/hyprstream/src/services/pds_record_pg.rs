@@ -32,7 +32,10 @@
 //! whether the caller is on a tokio thread, a plain OS thread, or inside
 //! `block_in_place`).
 
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{
+    mpsc::{self, Receiver, Sender},
+    Arc,
+};
 use std::thread::JoinHandle;
 
 use anyhow::{Context as _, Result as AnyResult};
@@ -277,6 +280,17 @@ fn build_pool(
     root_cert: &std::path::Path,
 ) -> AnyResult<deadpool_postgres::Pool> {
     let pg_config = build_driver_config(driver_url, dns_hostname)?;
+    assemble_pool(pg_config, root_cert)
+}
+
+/// Assemble the production rustls connector and deadpool manager. `build_pool`
+/// calls this helper, and the live TLS tests below use it with an explicit
+/// loopback `hostaddr` only to direct the test TCP peer while retaining the
+/// production hostname as SNI and certificate-verification name.
+fn assemble_pool(
+    pg_config: tokio_postgres::Config,
+    root_cert: &std::path::Path,
+) -> AnyResult<deadpool_postgres::Pool> {
     let tls = tokio_postgres_rustls::MakeRustlsConnect::new(build_rustls_config(root_cert)?);
     let manager = deadpool_postgres::Manager::new(pg_config, tls);
     deadpool_postgres::Pool::builder(manager)
@@ -289,40 +303,51 @@ fn build_pool(
 /// transport policy. This prevents query-level `host`/`hostaddr` overrides or
 /// hostless defaults from changing the DNS endpoint validated by `RdsConfig`.
 fn build_driver_config(driver_url: &str, dns_hostname: &str) -> AnyResult<tokio_postgres::Config> {
-    let config = driver_url
-        .parse::<tokio_postgres::Config>()
-        .map_err(|e| anyhow::anyhow!("failed to construct validated RDS driver config: {e}"))?;
+    // Match the #1401 user-store path: never pass verify-full to tokio-postgres
+    // (0.7 accepts only disable/prefer/require). Extract only the connection
+    // fields from the already-validated URL and set Require directly. This also
+    // prevents query parameters such as host/hostaddr from overriding the
+    // validated endpoint or SNI name.
+    let url = url::Url::parse(driver_url)
+        .map_err(|e| anyhow::anyhow!("failed to reparse validated RDS URL: {e}"))?;
+    anyhow::ensure!(
+        url.host_str() == Some(dns_hostname),
+        "validated RDS URL changed the contract hostname"
+    );
 
-    anyhow::ensure!(
-        config.get_ssl_mode() == tokio_postgres::config::SslMode::Require,
-        "validated RDS driver config did not retain mandatory TLS"
-    );
-    anyhow::ensure!(
-        config.get_hosts() == [tokio_postgres::config::Host::Tcp(dns_hostname.to_owned())],
-        "validated RDS driver config changed the contract DNS hostname"
-    );
-    anyhow::ensure!(
-        config.get_hostaddrs().is_empty(),
-        "validated RDS driver config must not override DNS with hostaddr"
-    );
+    let mut config = tokio_postgres::Config::new();
+    config.host(dns_hostname);
+    if let Some(port) = url.port() {
+        config.port(port);
+    }
+    if !url.username().is_empty() {
+        config.user(url.username());
+    }
+    if let Some(password) = url.password() {
+        let password = urlencoding::decode(password).map_err(|e| {
+            anyhow::anyhow!("validated RDS password has invalid percent encoding: {e}")
+        })?;
+        config.password(password.into_owned());
+    }
+    let dbname = url.path().trim_start_matches('/');
+    if !dbname.is_empty() {
+        config.dbname(dbname);
+    }
+    for (key, value) in url.query_pairs() {
+        if key == "application_name" {
+            config.application_name(value.into_owned());
+        }
+    }
+    config.ssl_mode(tokio_postgres::config::SslMode::Require);
 
     Ok(config)
 }
 
 /// Build the rustls connector used by PostgreSQL. The explicit records CA is
-/// mandatory and loaded additively alongside platform roots. Standard rustls
-/// certificate and hostname verification remains enabled.
+/// mandatory and is the pinned trust store. Standard WebPKI certificate and
+/// hostname verification remains enabled.
 fn build_rustls_config(root_cert_pem: &std::path::Path) -> AnyResult<rustls::ClientConfig> {
     let mut root_store = rustls::RootCertStore::empty();
-
-    // Add the platform's trusted roots.
-    let native = rustls_native_certs::load_native_certs();
-    for cert in native.certs {
-        let _ = root_store.add(cert);
-    }
-    for e in native.errors {
-        tracing::warn!("failed to load a native TLS root for RDS: {e}");
-    }
 
     let pem = std::fs::read(root_cert_pem).map_err(|e| {
         anyhow::anyhow!("failed to read RDS root_cert_file at {root_cert_pem:?}: {e}")
@@ -342,11 +367,18 @@ fn build_rustls_config(root_cert_pem: &std::path::Path) -> AnyResult<rustls::Cli
             .map_err(|e| anyhow::anyhow!("failed to add RDS root certificate: {e}"))?;
     }
 
-    let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
+    let roots = Arc::new(root_store);
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let verifier = rustls::client::WebPkiServerVerifier::builder_with_provider(
+        Arc::clone(&roots),
+        Arc::clone(&provider),
+    )
+    .build()
+    .map_err(|e| anyhow::anyhow!("failed to build standard RDS WebPKI verifier: {e}"))?;
     Ok(rustls::ClientConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()
         .map_err(|e| anyhow::anyhow!("failed to select safe RDS TLS protocol versions: {e}"))?
-        .with_root_certificates(root_store)
+        .with_webpki_verifier(verifier)
         .with_no_client_auth())
 }
 
@@ -588,9 +620,6 @@ fn send_err(cmd: PgCmd, err: anyhow::Error) -> AnyResult<()> {
     Ok(())
 }
 
-// We need rustls-native-certs for loading the platform trust store; it's
-// declared as an optional dep under pds-postgres.
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -622,16 +651,21 @@ mod tests {
     }
 
     #[test]
-    fn driver_config_rejects_query_host_and_hostaddr_overrides() {
+    fn driver_config_ignores_query_host_and_hostaddr_overrides() {
         for url in [
             "postgresql://records:secret@db.internal.example/records?host=/tmp&sslmode=verify-full",
             "postgresql://records:secret@db.internal.example/records?hostaddr=127.0.0.1&sslmode=verify-full",
         ] {
             let validated = translated_url(url);
-            assert!(
-                build_driver_config(validated.driver_url(), validated.dns_hostname()).is_err(),
-                "driver endpoint override was accepted"
+            let config = build_driver_config(validated.driver_url(), validated.dns_hostname())
+                .unwrap_or_else(|e| panic!("driver config rejected valid URL: {e}"));
+            assert_eq!(
+                config.get_hosts(),
+                [tokio_postgres::config::Host::Tcp(
+                    "db.internal.example".to_owned()
+                )]
             );
+            assert!(config.get_hostaddrs().is_empty());
         }
     }
 
@@ -660,5 +694,108 @@ mod tests {
         let malformed = dir.path().join("malformed.pem");
         std::fs::write(&malformed, b"not a certificate").unwrap_or_else(|e| panic!("{e}"));
         assert!(build_rustls_config(&malformed).is_err());
+    }
+
+    fn tls_server_config(certified: &rcgen::CertifiedKey) -> AnyResult<rustls::ServerConfig> {
+        let key = rustls::pki_types::PrivatePkcs8KeyDer::from(certified.key_pair.serialize_der());
+        rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .map_err(|e| anyhow::anyhow!("test TLS provider rejected safe versions: {e}"))?
+        .with_no_client_auth()
+        .with_single_cert(vec![certified.cert.der().clone()], key.into())
+        .map_err(|e| anyhow::anyhow!("test TLS server config rejected certificate: {e}"))
+    }
+
+    async fn run_adversarial_tls_peer(
+        listener: tokio::net::TcpListener,
+        server_config: rustls::ServerConfig,
+        sni_tx: tokio::sync::oneshot::Sender<Option<String>>,
+    ) -> AnyResult<()> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (mut tcp, _) = listener
+            .accept()
+            .await
+            .context("test peer accepts client")?;
+        let mut ssl_request = [0_u8; 8];
+        tcp.read_exact(&mut ssl_request)
+            .await
+            .context("client sends PostgreSQL SSLRequest")?;
+        anyhow::ensure!(
+            ssl_request == [0, 0, 0, 8, 4, 210, 22, 47],
+            "client did not request PostgreSQL TLS"
+        );
+        tcp.write_all(b"S")
+            .await
+            .context("test peer accepts PostgreSQL TLS upgrade")?;
+
+        let start = tokio_rustls::LazyConfigAcceptor::new(rustls::server::Acceptor::default(), tcp)
+            .await
+            .context("client sends TLS ClientHello")?;
+        let sni = start.client_hello().server_name().map(str::to_owned);
+        sni_tx
+            .send(sni)
+            .map_err(|_| anyhow::anyhow!("test could not report observed SNI"))?;
+        // Certificate verification occurs on the client. An alert is expected
+        // here once it rejects this adversarial peer.
+        let _ = start.into_stream(Arc::new(server_config)).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn production_connector_sends_sni_and_rejects_an_unpinned_self_signed_peer(
+    ) -> AnyResult<()> {
+        let pinned_ca = rcgen::generate_simple_self_signed(vec!["rds.example.test".to_owned()])
+            .unwrap_or_else(|e| panic!("generate pinned CA fixture: {e}"));
+        let adversarial = rcgen::generate_simple_self_signed(vec!["rds.example.test".to_owned()])
+            .unwrap_or_else(|e| panic!("generate adversarial certificate: {e}"));
+        let temp = tempfile::tempdir().unwrap_or_else(|e| panic!("tempdir: {e}"));
+        let ca_path = temp.path().join("pinned-rds-ca.pem");
+        std::fs::write(&ca_path, pinned_ca.cert.pem())
+            .unwrap_or_else(|e| panic!("write pinned CA: {e}"));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .context("bind adversarial TLS peer")?;
+        let port = listener
+            .local_addr()
+            .context("read adversarial TLS peer address")?
+            .port();
+        let (sni_tx, sni_rx) = tokio::sync::oneshot::channel();
+        let peer = tokio::spawn(run_adversarial_tls_peer(
+            listener,
+            tls_server_config(&adversarial)?,
+            sni_tx,
+        ));
+
+        let validated = translated_url(&format!(
+            "postgresql://records:secret@rds.example.test:{port}/records?sslmode=verify-full"
+        ));
+        let mut config = build_driver_config(validated.driver_url(), validated.dns_hostname())
+            .unwrap_or_else(|e| panic!("production config construction: {e}"));
+        // Test transport only: preserve `rds.example.test` as the configured
+        // host/SNI while connecting to our local adversarial fixture.
+        config.hostaddr("127.0.0.1".parse().context("parse test loopback address")?);
+        let pool = assemble_pool(config, &ca_path)
+            .unwrap_or_else(|e| panic!("production connector assembly: {e}"));
+
+        let error = match pool.get().await {
+            Ok(_) => anyhow::bail!("an unpinned self-signed certificate was accepted"),
+            Err(error) => error,
+        };
+        let chain = format!("{error:?}").to_ascii_lowercase();
+        assert!(
+            chain.contains("certificate") || chain.contains("issuer"),
+            "connection failed before certificate verification: {chain}"
+        );
+        anyhow::ensure!(
+            sni_rx.await.context("test TLS peer reports SNI")?
+                == Some("rds.example.test".to_owned()),
+            "connector did not send the validated hostname as SNI"
+        );
+        peer.await.context("test TLS peer joins")??;
+        Ok(())
     }
 }

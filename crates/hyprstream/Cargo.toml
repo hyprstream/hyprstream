@@ -27,7 +27,7 @@ path = "src/bin/main.rs"
 bytes.workspace = true
 pglite-rs = { workspace = true, optional = true }
 futures.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["net", "io-util"] }
 tonic.workspace = true
 async-trait.workspace = true
 tokio-util.workspace = true
@@ -153,7 +153,6 @@ fred = { version = "9", optional = true, features = ["i-scripts"] }  # Async Red
 deadpool-postgres = { version = "0.14", optional = true }
 tokio-postgres = { version = "0.7", optional = true }
 tokio-postgres-rustls = { version = "0.13", optional = true }
-rustls-native-certs = { version = "0.8", optional = true }
 hyprstream-tui = { path = "../hyprstream-tui" }  # Setup wizard TUI (WizardBackend trait + WizardApp)
 hyprstream-compositor = { path = "../hyprstream-compositor" }  # Pure TUI compositor (chrome state machine)
 waxterm = { path = "../waxterm", features = ["avt"] }  # Terminal abstraction for TUI rendering
@@ -271,7 +270,7 @@ ledger = ["dep:hyprstream-ledger"]
 # configured the Postgres store is selected and is FATAL-on-unavailable —
 # never a silent local fallback. Honors D2 (signed bytes verbatim as
 # authoritative source-of-truth; SQL rows are a projection-free KV shell).
-pds-postgres = ["dep:deadpool-postgres", "dep:tokio-postgres", "dep:tokio-postgres-rustls", "dep:rustls-native-certs"]
+pds-postgres = ["dep:deadpool-postgres", "dep:tokio-postgres", "dep:tokio-postgres-rustls"]
 
 [build-dependencies]
 capnpc.workspace = true  # Cap'n Proto schema compiler
@@ -293,6 +292,7 @@ rand.workspace = true
 tower = { version = "0.5", features = ["util"] }
 # Test-only: WebSocket client for the 9P-over-WS attach round-trip (H1a / #764).
 tokio-tungstenite = "0.24"
+tokio-rustls.workspace = true
 # Test-only: the `testing` feature exposes `InMemoryMetricExporter` for the
 # token-burn meter tests. The SDK compiles it under cfg(test) or this feature;
 # dependencies are not built with cfg(test), so the feature is required here.

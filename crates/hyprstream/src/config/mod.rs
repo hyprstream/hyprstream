@@ -254,8 +254,8 @@ pub struct RdsConfig {
     pub url_file: Option<PathBuf>,
 
     /// TOML path to the records role's PEM CA file. Mandatory whenever
-    /// `url_file` is configured; the connector loads it additively alongside
-    /// platform roots.
+    /// `url_file` is configured; the connector pins this trust store for the
+    /// RDS connection.
     #[serde(default)]
     pub root_cert_file: Option<PathBuf>,
 
@@ -272,12 +272,15 @@ pub struct RdsConfig {
 /// does not implement `Debug` or `Display`. Metal's `verify-full` policy has
 /// already been checked structurally; the internal URL uses the pinned
 /// driver's `sslmode=require`, with CA and hostname verification supplied by
-/// the rustls connector.
+/// the rustls connector. It deliberately does not implement `Debug` or
+/// `Display`, so a password-bearing URL cannot leak through diagnostics.
+#[cfg(feature = "pds-postgres")]
 pub(crate) struct ValidatedRdsUrl {
     driver_url: String,
     dns_hostname: String,
 }
 
+#[cfg(feature = "pds-postgres")]
 impl ValidatedRdsUrl {
     #[cfg(feature = "pds-postgres")]
     pub(crate) fn driver_url(&self) -> &str {
@@ -307,6 +310,7 @@ impl RdsConfig {
     /// validation, that value is translated to the pinned driver's supported
     /// `require` mode; rustls supplies the CA and hostname verification that
     /// implements the validated verify-full policy.
+    #[cfg(feature = "pds-postgres")]
     pub(crate) fn read_url(&self) -> anyhow::Result<ValidatedRdsUrl> {
         let url_path = self
             .url_file
@@ -337,6 +341,7 @@ impl RdsConfig {
 
     /// Structurally validate the v1.1 URL and produce a driver-compatible URL.
     /// The URL itself is never included in an error.
+    #[cfg(feature = "pds-postgres")]
     pub(crate) fn validate_url(url: &str) -> anyhow::Result<ValidatedRdsUrl> {
         let mut parsed =
             url::Url::parse(url).map_err(|e| anyhow::anyhow!("not a valid URL: {e}"))?;
@@ -348,15 +353,29 @@ impl RdsConfig {
         );
 
         let dns_hostname = match parsed.host() {
-            Some(url::Host::Domain(host))
-                if !host.is_empty() && host.parse::<std::net::IpAddr>().is_err() =>
-            {
+            Some(url::Host::Domain(host)) if !host.is_empty() => {
+                let normalized = host.trim_end_matches('.').to_ascii_lowercase();
+                anyhow::ensure!(
+                    normalized != "localhost" && normalized != "127.0.0.1",
+                    "URL host must not be a local loopback endpoint"
+                );
                 host.to_owned()
             }
-            Some(url::Host::Domain(_)) | Some(url::Host::Ipv4(_)) | Some(url::Host::Ipv6(_)) => {
-                anyhow::bail!("URL host must be a DNS hostname, not an IP address")
+            Some(url::Host::Ipv4(host)) => {
+                anyhow::ensure!(
+                    host != std::net::Ipv4Addr::LOCALHOST,
+                    "URL host must not be a local loopback endpoint"
+                );
+                host.to_string()
             }
-            None => anyhow::bail!("URL is missing a DNS hostname"),
+            Some(url::Host::Ipv6(host)) => {
+                anyhow::ensure!(
+                    host != std::net::Ipv6Addr::LOCALHOST,
+                    "URL host must not be a local loopback endpoint"
+                );
+                host.to_string()
+            }
+            Some(url::Host::Domain(_)) | None => anyhow::bail!("URL is missing a nonempty host"),
         };
 
         let mut sslmode_values = Vec::new();
@@ -3402,6 +3421,7 @@ impl From<&crate::config::server::SamplingParamDefaults> for SamplingParams {
 mod tests {
     use super::*;
 
+    #[cfg(feature = "pds-postgres")]
     fn rds_fixture(url: &str) -> (tempfile::TempDir, RdsConfig) {
         let dir = tempfile::TempDir::new().unwrap_or_else(|e| panic!("{e}"));
         let url_file = dir.path().join("records-url");
@@ -3418,6 +3438,7 @@ mod tests {
         (dir, config)
     }
 
+    #[cfg(feature = "pds-postgres")]
     #[test]
     fn rds_contract_accepts_exact_verify_full_and_translates_for_driver() {
         let (_dir, config) = rds_fixture(
@@ -3438,6 +3459,16 @@ mod tests {
         assert_eq!(sslmodes, ["require"]);
     }
 
+    #[cfg(feature = "pds-postgres")]
+    #[test]
+    fn rds_contract_matches_decoded_sslmode_query_keys() {
+        let (_dir, config) = rds_fixture(
+            "postgresql://records:secret@db.internal.example/records?ssl%6dode=verify-full",
+        );
+        assert!(config.read_url().is_ok());
+    }
+
+    #[cfg(feature = "pds-postgres")]
     #[test]
     fn rds_contract_rejects_nonconforming_urls() {
         let rejected = [
@@ -3448,12 +3479,16 @@ mod tests {
             ),
             ("absent-host", "postgresql:///records?sslmode=verify-full"),
             (
-                "ipv4-host",
+                "canonical-ipv4-loopback",
                 "postgresql://127.0.0.1/records?sslmode=verify-full",
             ),
             (
-                "ipv6-host",
+                "canonical-ipv6-loopback",
                 "postgresql://[::1]/records?sslmode=verify-full",
+            ),
+            (
+                "localhost",
+                "postgresql://localhost/records?sslmode=verify-full",
             ),
             ("absent-sslmode", "postgresql://db.internal.example/records"),
             (
@@ -3485,6 +3520,10 @@ mod tests {
                 "postgresql://db.internal.example/records?sslmode=verify-full&sslmode=require",
             ),
             (
+                "decoded-duplicate",
+                "postgresql://db.internal.example/records?sslmode=verify-full&ssl%6dode=verify-full",
+            ),
+            (
                 "userinfo-marker-bypass",
                 "postgresql://user:sslmode=verify-full@db.internal.example/records",
             ),
@@ -3499,6 +3538,19 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "pds-postgres")]
+    #[test]
+    fn rds_contract_does_not_extend_loopback_rejection_to_other_ip_spellings() {
+        for url in [
+            "postgresql://192.0.2.10/records?sslmode=verify-full",
+            "postgresql://[2001:db8::10]/records?sslmode=verify-full",
+        ] {
+            let (_dir, config) = rds_fixture(url);
+            assert!(config.read_url().is_ok(), "relaxed contract rejected {url}");
+        }
+    }
+
+    #[cfg(feature = "pds-postgres")]
     #[test]
     fn rds_contract_requires_explicit_readable_ca_file() {
         let (_dir, mut config) = rds_fixture(
