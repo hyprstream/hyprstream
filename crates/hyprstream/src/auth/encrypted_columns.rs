@@ -138,7 +138,7 @@ impl<'a> EncryptedColumn<'a> {
     }
 }
 
-trait DekSealer: Send + Sync {
+pub(crate) trait DekSealer: Send + Sync {
     fn seal(&self, plaintext: &[u8]) -> Result<Vec<u8>>;
     fn open(&self, ciphertext: &[u8]) -> Result<Zeroizing<Vec<u8>>>;
 }
@@ -201,7 +201,7 @@ impl ColumnCipher {
         Ok(Self::from_age_config(UserStoreEncryptionConfig::from_env()?))
     }
 
-    fn new(sealer: Arc<dyn DekSealer>) -> Self {
+    pub(crate) fn new(sealer: Arc<dyn DekSealer>) -> Self {
         Self { sealer }
     }
 

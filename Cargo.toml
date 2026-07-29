@@ -117,6 +117,12 @@ merklehash = { git = "https://github.com/huggingface/xet-core", tag = "git-xet-v
 async-trait = "0.1"
 pglite-rs = { version = "=0.2.7", default-features = false }
 
+# Networked Postgres UserStore backend (#1401 — AWS RDS / server Postgres).
+deadpool-postgres = "0.14"
+tokio-postgres = { version = "0.7", features = ["with-chrono-0_4"] }
+tokio-postgres-rustls = "0.13"
+webpki-roots = "0.26"
+
 # Optional hyprstream-p2p (formerly gittorrent) transport support
 hyprstream-p2p = { path = "crates/hyprstream-p2p" }
 
@@ -139,6 +145,7 @@ axum-server = { version = "0.7", features = ["tls-rustls"] }
 tower-http = { version = "0.6", features = ["trace", "cors", "timeout"] }
 reqwest = { version = "0.11", features = ["json", "stream"] }
 url = "2.5"
+percent-encoding = "2.3"
 urlencoding = "2.1"
 
 # QUIC transport (HTTP/3 + WebTransport + ZMTP over QUIC)
