@@ -180,7 +180,7 @@ pub async fn auth_middleware(
             let now = chrono::Utc::now().timestamp();
             let ttl_secs = ((proof.iat + 120) - now).max(0) as u64;
             let result = state.dpop_jti_seen.insert_if_absent_no_evict(
-                proof.jti.clone(),
+                crate::services::oauth::replay_key::dpop_jti(&proof.jti),
                 (),
                 Duration::from_secs(ttl_secs),
             );
@@ -189,7 +189,10 @@ pub async fn auth_middleware(
                     crate::services::oauth::replay_metrics::DPOP,
                     result,
                 );
-                if result == InsertIfAbsentNoEvictResult::Full {
+                if crate::services::oauth::replay_metrics::should_warn_full(
+                    crate::services::oauth::replay_metrics::DPOP,
+                    result,
+                ) {
                     warn!("DPoP replay barrier is full; refusing fresh proof");
                 } else {
                     debug!("DPoP proof jti already used: {}", proof.jti);

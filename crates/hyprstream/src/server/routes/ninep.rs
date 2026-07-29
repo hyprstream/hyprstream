@@ -363,7 +363,7 @@ async fn verify_mount_ticket(
     let now = chrono::Utc::now().timestamp();
     let ttl = (claims.exp - now).max(0) as u64;
     let result = state.dpop_jti_seen.insert_if_absent_no_evict(
-        format!("mount-ticket:{jti}"),
+        crate::services::oauth::replay_key::mount_ticket_jti(jti),
         (),
         Duration::from_secs(ttl),
     );
@@ -372,7 +372,10 @@ async fn verify_mount_ticket(
             crate::services::oauth::replay_metrics::DPOP,
             result,
         );
-        if result == hyprstream_util::InsertIfAbsentNoEvictResult::Full {
+        if crate::services::oauth::replay_metrics::should_warn_full(
+            crate::services::oauth::replay_metrics::DPOP,
+            result,
+        ) {
             warn!("DPoP replay barrier is full; refusing fresh mount ticket");
         }
         return Err("mount ticket already used");
