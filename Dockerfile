@@ -272,7 +272,8 @@ ENV LD_LIBRARY_PATH=/opt/libtorch/lib
 # Build the project with BuildKit cache mounts for Cargo registry and sccache
 # LIBTORCH is already set in the variant-specific builder stages
 # We do NOT use LIBTORCH_USE_PYTORCH since we're using manual downloads
-# Note: --no-default-features excludes systemd (not needed in containers)
+# Note: --no-default-features excludes systemd (not needed in containers).
+# credential-pds is mandatory for the production encrypted UserStore boundary.
 # Cache mounts:
 #   - /root/.cargo/registry: Cargo crate registry
 #   - /root/.cargo/git: Git dependencies
@@ -281,7 +282,7 @@ RUN --mount=type=cache,target=/root/.cargo/registry \
     --mount=type=cache,target=/root/.cargo/git \
     --mount=type=cache,target=/sccache \
     --mount=type=cache,target=/build/target,sharing=locked \
-    OPENSSL_NO_VENDOR=1 cargo build --locked --release --no-default-features --features otel,gittorrent,xet \
+    OPENSSL_NO_VENDOR=1 cargo build --locked --release --no-default-features --features otel,gittorrent,xet,credential-pds \
     && mkdir -p /out \
     && cp /build/target/release/hyprstream /out/hyprstream
 
