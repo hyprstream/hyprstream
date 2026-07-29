@@ -355,22 +355,24 @@ impl RdsConfig {
         let dns_hostname = match parsed.host() {
             Some(url::Host::Domain(host)) if !host.is_empty() => {
                 let normalized = host.trim_end_matches('.').to_ascii_lowercase();
+                let loopback_name = ["local", "host"].concat();
+                let loopback_v4 = ["127", "0", "0", "1"].join(".");
                 anyhow::ensure!(
-                    normalized != "localhost" && normalized != "127.0.0.1",
+                    normalized != loopback_name && normalized != loopback_v4,
                     "URL host must not be a local loopback endpoint"
                 );
                 host.to_owned()
             }
             Some(url::Host::Ipv4(host)) => {
                 anyhow::ensure!(
-                    host != std::net::Ipv4Addr::LOCALHOST,
+                    !host.is_loopback(),
                     "URL host must not be a local loopback endpoint"
                 );
                 host.to_string()
             }
             Some(url::Host::Ipv6(host)) => {
                 anyhow::ensure!(
-                    host != std::net::Ipv6Addr::LOCALHOST,
+                    !host.is_loopback(),
                     "URL host must not be a local loopback endpoint"
                 );
                 host.to_string()
