@@ -1612,12 +1612,7 @@ mod tests {
     }
 
     async fn fresh(url: &str) -> PostgresUserStore {
-        fresh_with_max_connections(url, 2 * num_cpus::get()).await
-    }
-
-    async fn fresh_with_max_connections(url: &str, max_connections: usize) -> PostgresUserStore {
-        let mut cfg = PostgresUserStoreConfig::from_url(url);
-        cfg.max_connections = max_connections;
+        let cfg = PostgresUserStoreConfig::from_url(url);
         let store = PostgresUserStore::connect_plaintext(cfg).await.unwrap();
         {
             let client = store.pool.get().await.unwrap();
@@ -1641,7 +1636,13 @@ mod tests {
     }
 
     async fn fresh_encrypted_with_one_connection(url: &str) -> PostgresUserStore {
-        let mut store = fresh_with_max_connections(url, 1).await;
+        let mut cfg = PostgresUserStoreConfig::from_url(url);
+        cfg.max_connections = 1;
+        let mut store = PostgresUserStore::connect_plaintext(cfg).await.unwrap();
+        {
+            let client = store.pool.get().await.unwrap();
+            client.execute("DELETE FROM users", &[]).await.unwrap();
+        }
         store.cipher = Some(ColumnCipher::new(Arc::new(TestDekSealer)));
         store
     }
