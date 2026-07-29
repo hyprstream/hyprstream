@@ -19,7 +19,8 @@ duplicated, or publishable outside the allowlist.
   3. `hyprstream-crypto` `0.1.0` (leaf cryptographic primitives)
   4. `hyprstream-rpc` `0.1.0` (exactly depends on the three preceding crates)
 - Everything else sets `publish = false`, except that the stale `hyprstream`
-  crates.io name requires a separate Apache-2.0 deprecation-shim package rather
+  crates.io name is reserved by the separately packageable Apache-2.0
+  `release/hyprstream-deprecation-shim` artifact at exactly `0.5.0`, rather
   than republishing the real service. Looking reusable is not an API or
   maintenance commitment. Promotion to `public_now` requires an owner, API and
   SemVer review, package documentation, security review where applicable,
@@ -30,11 +31,13 @@ The existing crates.io package `hyprstream` is owned by the project maintainer
 account but is **not** the local application release channel: its seven
 Apache-2.0 versions (up to `0.1.0-alpha-6`) describe a different, stale product.
 The real service remains internal/non-publishable because of its broad local
-graph and `tch`/libtorch runtime. Before yanking those stale versions, publish a
-separate Apache-2.0 `hyprstream` deprecation shim with current install guidance;
-do not delete the package name or republish the service to occupy it. The name
-`chat-core` is owned by an unrelated crates.io publisher and cannot be used by
-this project.
+graph and `tch`/libtorch runtime. The excluded shim manifest must match the
+real service's exact `0.5.0` version, while containing no service dependencies
+or product implementation. The release order is fail-closed: **(1)** publish
+the Apache-2.0 shim, **(2)** verify `hyprstream@0.5.0` resolves from crates.io,
+then and only then **(3)** yank the seven stale versions. Do not delete the
+package name or republish the service to occupy it. The name `chat-core` is
+owned by an unrelated crates.io publisher and cannot be used by this project.
 
 ## Complete inventory
 
@@ -71,7 +74,7 @@ this project.
 | `hyprstream-workers-wasmtime` | public later | Sandbox security API and unpublished RPC/VFS dependencies need review. |
 | `waxterm` | public later | Packages cleanly, but lacks package docs and an explicit standalone compatibility owner. |
 | `chat-core` | **internal/not publishable** | Current crates.io name belongs to an unrelated publisher; rename and API review required. |
-| `hyprstream` | **internal/not publishable** | Real product/service crate (broad local graph and `tch`/libtorch); keep it non-publishable and use a separate Apache-2.0 deprecation shim to replace the stale public name. |
+| `hyprstream` | **internal/not publishable** | Real product/service crate (broad local graph and `tch`/libtorch); keep it non-publishable. The excluded standalone Apache-2.0 `hyprstream` 0.5.0 deprecation shim, not this crate, replaces the stale public name. |
 | `hyprstream-appview` | **internal/not publishable** | Product-internal derived identity service with no standalone support contract. |
 | `hyprstream-tui` | public later | Supported MIT client TUI for trust/crypto, bootstrap, and enrolment; its publish promotion follows the client dependency and accelerator-runtime download/verification work. |
 | `hyprstream-workers-python-guest` | **internal/not publishable** | Compiled WASM guest artifact, not a Rust consumer library. |
@@ -224,6 +227,23 @@ cargo publish --locked --registry crates-io -p hyprstream-crypto
 cargo package --locked -p hyprstream-rpc
 cargo publish --locked --registry crates-io -p hyprstream-rpc
 ```
+
+### Stale `hyprstream` deprecation shim
+
+The `hyprstream` 0.5.0 deprecation shim is a distinct, manually authorized
+operation. Its excluded manifest is deliberately not part of the SDK release
+train or the service workspace, so use the explicit manifest path:
+
+```bash
+cargo package --locked --manifest-path release/hyprstream-deprecation-shim/Cargo.toml
+cargo publish --locked --registry crates-io --manifest-path release/hyprstream-deprecation-shim/Cargo.toml
+cargo info hyprstream@0.5.0
+```
+
+The `cargo info` verification must confirm the public 0.5.0 shim before an
+authorized owner may yank any stale version. A publish failure, ambiguous
+registry result, or failed verification stops the procedure: do not yank first,
+do not republish `crates/hyprstream`, and do not substitute `0.2.0`.
 
 The local authenticated owner is currently `ewindisch`; the token is stored by
 Cargo for the default registry and must never be copied into GitHub secrets or

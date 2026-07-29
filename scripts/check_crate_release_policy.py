@@ -9,6 +9,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 POLICY_PATH = ROOT / ".github" / "crate-release.toml"
+SHIM_VERSION = "0.5.0"
 
 
 def load(path: Path) -> dict:
@@ -58,10 +59,62 @@ def main() -> None:
         fail("deprecation shim must reserve the source service's crates.io name")
     if shim["license"] != "Apache-2.0":
         fail("deprecation shim must remain Apache-2.0")
+    if shim["version"] != SHIM_VERSION:
+        fail(f"deprecation shim version must remain {SHIM_VERSION}, not {shim['version']}")
     if shim["required_before_yank"] is not True:
         fail("deprecation shim must be required before yanking the stale package")
+    if shim["release_order"] != ["publish-shim", "verify-shim", "yank-stale-versions"]:
+        fail("deprecation shim release order must publish, verify, then yank stale versions")
     if manifests[source_service][1]["package"].get("publish") is not False:
         fail(f"real service {source_service} must remain non-publishable; use the separate shim")
+
+    shim_relative_path = Path(shim["manifest_path"])
+    if shim_relative_path.is_absolute() or ".." in shim_relative_path.parts:
+        fail("deprecation shim manifest path must stay relative to the repository root")
+    shim_path = ROOT / shim_relative_path
+    if not shim_path.is_file():
+        fail(f"deprecation shim manifest is missing: {shim['manifest_path']}")
+    try:
+        shim_path.relative_to(ROOT / "crates")
+    except ValueError:
+        pass
+    else:
+        fail("deprecation shim must stay outside crates/ to avoid the real-service name collision")
+    root_workspace = load(ROOT / "Cargo.toml").get("workspace", {})
+    if str(shim_path.parent.relative_to(ROOT)) not in root_workspace.get("exclude", []):
+        fail("deprecation shim must be excluded from the normal workspace")
+
+    shim_manifest = load(shim_path)
+    shim_package = shim_manifest.get("package", {})
+    if shim_package.get("name") != shim["package_name"]:
+        fail("deprecation shim manifest must reserve the hyprstream package name")
+    if shim_package.get("version") != shim["version"]:
+        fail("deprecation shim manifest version must match deprecation_shim.version")
+    if shim_package.get("version") != manifests[source_service][1]["package"]["version"]:
+        fail("deprecation shim version must equal the real service version")
+    if shim_package.get("license") != shim["license"]:
+        fail("deprecation shim manifest must be Apache-2.0")
+    if shim_package.get("publish") != [policy["registry"]]:
+        fail(f"deprecation shim manifest must set publish = [\"{policy['registry']}\"]")
+    for section in ("dependencies", "build-dependencies", "dev-dependencies"):
+        if shim_manifest.get(section):
+            fail(f"deprecation shim must not carry {section}")
+
+    shim_lib = shim_path.parent / shim_manifest.get("lib", {}).get("path", "")
+    if not shim_lib.is_file():
+        fail("deprecation shim must include a documentation-only library target")
+    for line in shim_lib.read_text(encoding="utf-8").splitlines():
+        if line.strip() and not line.lstrip().startswith("//"):
+            fail("deprecation shim library must not contain product implementation")
+
+    readme_name = shim_package.get("readme")
+    readme_path = shim_path.parent / readme_name if isinstance(readme_name, str) else None
+    if readme_path is None or not readme_path.is_file():
+        fail("deprecation shim must include its README")
+    readme = readme_path.read_text(encoding="utf-8").lower()
+    for required_text in ("deprecated", "metrics", "install", "client"):
+        if required_text not in readme:
+            fail(f"deprecation shim README must include current {required_text} guidance")
 
     public = groups["public_now"]
     versions = set()

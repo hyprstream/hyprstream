@@ -56,7 +56,10 @@ internal = [
 package_name = "hyprstream"
 source_service = "hyprstream"
 license = "Apache-2.0"
+version = "0.5.0"
+manifest_path = "release/hyprstream-deprecation-shim/Cargo.toml"
 required_before_yank = true
+release_order = ["publish-shim", "verify-shim", "yank-stale-versions"]
 
 # Approved target boundary.  These values describe the intended per-crate
 # relicensing change; they do not alter a Cargo.toml license field themselves.
