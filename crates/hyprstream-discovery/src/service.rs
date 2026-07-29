@@ -2697,6 +2697,34 @@ enum ProcessBootstrapAuthorityState {
 static PROCESS_BOOTSTRAP_AUTHORITY: parking_lot::Mutex<ProcessBootstrapAuthorityState> =
     parking_lot::Mutex::new(ProcessBootstrapAuthorityState::Unsealed);
 
+/// Resolve the lazy local discovery transport for the OS-owned-files
+/// bootstrap path.
+///
+/// `try_endpoint` falls back to the default discovery socket when nothing is
+/// registered yet, and the transport returned by [`dial`](hyprstream_rpc::dial)
+/// connects on first use — so Discovery may start *after* the process resolver
+/// is installed (first-boot / standalone / `--ipc` containers sharing the IPC
+/// volume). This mirrors the same-node DID-anchored fabric in
+/// [`bootstrap_deployment_process`] and replaces the eager
+/// `DiscoveryClient::for_local_bootstrap`, which required
+/// `registered_endpoint("discovery")` to be `Some` — impossible at first-boot
+/// before any service binds, causing every `service start` to abort with
+/// "local bootstrap requires an explicitly registered service endpoint".
+///
+/// Trust is not weakened: the checkpoint was already verified by
+/// `authenticate_deployment_bootstrap`, and the caller still authenticates
+/// every lazy response with the pinned `discovery_vk`.
+fn resolve_local_discovery_transport(
+) -> anyhow::Result<hyprstream_rpc::transport::TransportConfig> {
+    hyprstream_rpc::registry::try_global()
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "EndpointRegistry not initialized — local discovery fabric unavailable"
+            )
+        })?
+        .try_endpoint("discovery", hyprstream_rpc::registry::SocketKind::Rep)
+}
+
 /// Atomically consume the explicitly selected deployment witness and install
 /// the process Discovery resolver. Selection never falls back between the
 /// OS-owned and DID-anchored providers.
@@ -2723,9 +2751,17 @@ pub async fn bootstrap_deployment_process(
     let (authority, discovery_client) = match trust_source {
         crate::DeploymentTrustSource::OsOwnedFiles => {
             let authority = authenticate_deployment_bootstrap()?;
-            let client =
-                crate::DiscoveryClient::for_local_bootstrap(signing_key, discovery_vk, None)?;
-            (authority, client)
+            // Lazy local discovery client — see `resolve_local_discovery_transport`:
+            // the default discovery socket is resolved via `try_endpoint` (not
+            // the eager `for_local_bootstrap`), and `dial` connects on first use,
+            // so Discovery may start *after* this install inside the same
+            // process. Trust is not weakened — the checkpoint was already
+            // verified by `authenticate_deployment_bootstrap()`, and
+            // `discovery_vk` authenticates every lazy response.
+            let transport = resolve_local_discovery_transport()?;
+            let signer = hyprstream_rpc::signer::LocalSigner::new(signing_key);
+            let rpc = hyprstream_rpc::dial::dial(&transport, signer, Some(discovery_vk), None)?;
+            (authority, crate::DiscoveryClient::new(rpc))
         }
         crate::DeploymentTrustSource::DidAnchored(anchors) => {
             let (authority, discovery_transport, mesh_kem_recipient, ml_dsa_65_keys) =
@@ -7116,5 +7152,59 @@ mod query_candidates_tests {
             "second heartbeat must win"
         );
         assert_eq!(set.candidates[0].allocatable[0].quantity, "8");
+    }
+}
+
+// ============================================================================
+// Regression: eager-resolver bootstrap ordering (#fix-eager-resolver)
+// ============================================================================
+//
+// Before the fix, `bootstrap_deployment_process`'s OsOwnedFiles arm called
+// `DiscoveryClient::for_local_bootstrap`, which requires
+// `registered_endpoint("discovery")` to be `Some`. At first-boot (before any
+// service binds a socket) this is always `None`, so every `service start`
+// aborted with "local bootstrap requires an explicitly registered service
+// endpoint" — a startup-ordering inversion. The fix replaces that with
+// `resolve_local_discovery_transport()`, which uses `try_endpoint` (lazy
+// default fallback) so Discovery may start after the resolver install.
+
+#[cfg(test)]
+mod eager_resolver_regression {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+    use super::*;
+
+    /// The OS-owned-files bootstrap path must resolve a lazy default discovery
+    /// transport even when no discovery endpoint has been registered yet — the
+    /// first-boot posture. On `origin/main` the equivalent code path
+    /// (`DiscoveryClient::for_local_bootstrap` → `registered_endpoint`) returns
+    /// `None` and errors; this test asserts the lazy resolution succeeds.
+    #[test]
+    fn local_discovery_transport_resolves_without_registered_endpoint() {
+        // Ensure the global EndpointRegistry exists (idempotent — no-op if
+        // another test already initialized it).
+        hyprstream_rpc::registry::init(
+            hyprstream_rpc::registry::EndpointMode::Inproc,
+            None,
+        );
+
+        // First-boot posture: discovery has not registered an endpoint.
+        // (If another test in this binary registered discovery, the lazy
+        // resolution is trivially satisfied — the assertion below still holds.)
+
+        // The fix's lazy helper must succeed regardless — it falls back to the
+        // default discovery socket via `try_endpoint`.
+        let transport = resolve_local_discovery_transport()
+            .expect("lazy discovery transport must resolve at first-boot");
+        assert!(
+            matches!(
+                transport.endpoint,
+                hyprstream_rpc::transport::EndpointType::Inproc { .. }
+                    | hyprstream_rpc::transport::EndpointType::Ipc { .. }
+                    | hyprstream_rpc::transport::EndpointType::SystemdFd { .. }
+            ),
+            "expected a local (inproc/IPC/systemd) transport for same-node \
+             bootstrap, got {:?}",
+            transport.endpoint,
+        );
     }
 }
