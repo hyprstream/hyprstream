@@ -8,6 +8,11 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
+/// 1,000 sustained proofs or mount tickets/s for the longest (five-minute)
+/// replay window, plus 20% headroom. Ordinary DPoP proofs expire after 120s.
+const DPOP_JTI_MAX_ENTRIES: usize = 360_000;
+const DPOP_JTI_REAP_BUDGET: usize = 64;
+
 // Re-export config types so other server modules can access them via server::state
 pub use crate::config::{CorsConfig, SamplingParamDefaults, ServerConfig};
 
@@ -72,7 +77,7 @@ pub struct ServerState {
 
     /// Per-request DPoP JTI dedup cache (RFC 9449 §11.1 replay prevention).
     /// Backed by the shared `TtlCache` with atomic check-and-record
-    /// (`insert_if_absent`); TTL = iat + 120s; self-evicting.
+    /// (`insert_if_absent_no_evict`); TTL = iat + 120s; fail-closed at capacity.
     pub dpop_jti_seen: Arc<TtlCache<String, ()>>,
 
     /// Per-subject request rate limiter (fixed window, 300 req/60s default).
@@ -127,7 +132,7 @@ impl ResourceAuthState {
             oauth_issuer_url,
             federation_resolver,
             jti_blocklist,
-            dpop_jti_seen: Arc::new(TtlCache::new(10_000, 64)),
+            dpop_jti_seen: Arc::new(TtlCache::new(DPOP_JTI_MAX_ENTRIES, DPOP_JTI_REAP_BUDGET)),
             rate_limiter: Arc::new(crate::server::middleware::RateLimiter::new(300, 60)),
         }
     }
@@ -249,7 +254,7 @@ impl ServerState {
             oauth_issuer_url,
             federation_resolver,
             jti_blocklist,
-            dpop_jti_seen: Arc::new(TtlCache::new(10_000, 64)),
+            dpop_jti_seen: Arc::new(TtlCache::new(DPOP_JTI_MAX_ENTRIES, DPOP_JTI_REAP_BUDGET)),
             rate_limiter: Arc::new(crate::server::middleware::RateLimiter::new(300, 60)),
             browser_provisioning_rate_limiter: Arc::new(
                 crate::server::middleware::RateLimiter::new(60, 60),

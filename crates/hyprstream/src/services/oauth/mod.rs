@@ -50,6 +50,7 @@ pub mod oidc_callback;
 pub mod oidc_discovery;
 pub mod par;
 pub mod registration;
+pub mod replay_metrics;
 pub mod revocation;
 pub mod rpc_handler;
 pub mod scim;

@@ -84,6 +84,10 @@ impl std::error::Error for ClientAuthError {}
 pub const JWT_BEARER_ASSERTION_TYPE: &str =
     "urn:ietf:params:oauth:client-assertion-type:jwt-bearer";
 
+/// Bounds replay-barrier residency for client assertions and follows the
+/// short-lived private_key_jwt profile expected by OAuth clients.
+const MAX_CLIENT_ASSERTION_LIFETIME_SECS: i64 = 300;
+
 /// A successfully verified client assertion.
 #[derive(Debug, Clone)]
 pub struct VerifiedAssertion {
@@ -456,6 +460,11 @@ fn check_claims(
             "exp {exp} is not in the future (now={now})"
         )));
     }
+    if exp - iat > MAX_CLIENT_ASSERTION_LIFETIME_SECS {
+        return Err(ClientAuthError::InvalidClaim(format!(
+            "assertion lifetime exceeds {MAX_CLIENT_ASSERTION_LIFETIME_SECS}s"
+        )));
+    }
 
     // aud may be a string or an array of strings (RFC 7519 §4.1.3). It
     // must include one of the accepted audiences — on all profile paths
@@ -685,6 +694,16 @@ mod tests {
             &issuer_audiences(),
         );
         assert!(got.is_err(), "expired assertion should not verify: {got:?}");
+    }
+
+    #[test]
+    fn rejects_client_assertion_lifetime_over_replay_barrier_window() {
+        let mut claims = valid_claims();
+        let now = chrono::Utc::now().timestamp();
+        claims["iat"] = serde_json::json!(now);
+        claims["exp"] = serde_json::json!(now + MAX_CLIENT_ASSERTION_LIFETIME_SECS + 1);
+        let got = check_claims(&claims, "https://app.test/c", &issuer_audiences());
+        assert!(matches!(got, Err(ClientAuthError::InvalidClaim(message)) if message.contains("lifetime")));
     }
 
     #[test]

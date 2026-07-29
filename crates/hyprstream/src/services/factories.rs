@@ -1726,8 +1726,10 @@ fn create_mcp_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
                     // Capture shared JTI blocklist for revocation checks (RFC 7009)
                     let mcp_jti_blocklist = SHARED_JTI_BLOCKLIST.get().map(Arc::clone);
                     // DPoP JTI replay cache (separate from OAI server's, RFC 9449).
+                    // 1,000 sustained DPoP proofs/s for the 120s replay window,
+                    // plus 20% headroom. This barrier never evicts live JTIs.
                     let mcp_dpop_jti_seen: std::sync::Arc<hyprstream_util::TtlCache<String, ()>> =
-                        std::sync::Arc::new(hyprstream_util::TtlCache::new(10_000, 64));
+                        std::sync::Arc::new(hyprstream_util::TtlCache::new(144_000, 64));
                     move |mut req: axum::extract::Request, next: axum::middleware::Next| {
                         let www_authenticate = www_authenticate.clone();
                         let mcp_resource_url = mcp_resource_url.clone();
@@ -1909,12 +1911,21 @@ fn create_mcp_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
                                 {
                                     let now = chrono::Utc::now().timestamp();
                                     let ttl_secs = ((proof.iat + 120) - now).max(0) as u64;
-                                    if !dpop_jti_seen.insert_if_absent(
+                                    let result = dpop_jti_seen.insert_if_absent_no_evict(
                                         proof.jti.clone(),
                                         (),
                                         std::time::Duration::from_secs(ttl_secs),
-                                    ) {
-                                        tracing::debug!(%method, %uri, jti = %proof.jti, "MCP: DPoP jti replayed");
+                                    );
+                                    if result != hyprstream_util::InsertIfAbsentNoEvictResult::Inserted {
+                                        crate::services::oauth::replay_metrics::record_rejection(
+                                            crate::services::oauth::replay_metrics::DPOP,
+                                            result,
+                                        );
+                                        if result == hyprstream_util::InsertIfAbsentNoEvictResult::Full {
+                                            tracing::warn!(%method, %uri, "MCP: DPoP replay barrier is full; refusing fresh proof");
+                                        } else {
+                                            tracing::debug!(%method, %uri, jti = %proof.jti, "MCP: DPoP jti replayed");
+                                        }
                                         let mut res = (StatusCode::UNAUTHORIZED, "Authentication failed").into_response();
                                         if let Ok(val) = header::HeaderValue::from_str(&www_authenticate) {
                                             res.headers_mut().insert(header::WWW_AUTHENTICATE, val);

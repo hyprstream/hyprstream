@@ -16,7 +16,7 @@ use super::user_service::UserService;
 use crate::auth::user_store::UserStore;
 use crate::config::OAuthConfig;
 use crate::services::{DiscoveryClient, PolicyClient};
-use hyprstream_util::TtlCache;
+use hyprstream_util::{InsertIfAbsentNoEvictResult, TtlCache};
 
 /// Read-only resolver used by the ATProto service-auth exchange perimeter.
 #[async_trait::async_trait]
@@ -1169,14 +1169,14 @@ fn mesh_kem_public_for_policy(
 }
 
 impl OAuthState {
-    /// DPoP jti replay-dedup cache: capacity bound (memory ceiling for the
-    /// `TtlCache<String, ()>`). 120s TTL per entry.
-    const DPOP_JTI_MAX_ENTRIES: usize = 10_000;
+    /// DPoP JTI replay barrier: 1,000 proofs/s sustained for 120s plus 20%
+    /// headroom. This is deliberately fail-closed: it must hold every live JTI.
+    const DPOP_JTI_MAX_ENTRIES: usize = 144_000;
     /// Inline reap budget per access (heap pops). Bounds tail latency.
     const DPOP_JTI_REAP_BUDGET: usize = 64;
-    /// Client-assertion jti replay-dedup cache: same bounds as the DPoP
-    /// registry; per-entry TTL is the assertion's remaining lifetime.
-    const ASSERTION_JTI_MAX_ENTRIES: usize = 10_000;
+    /// Client-assertion replay barrier: 100 assertions/s for the five-minute
+    /// maximum assertion lifetime plus 20% headroom.
+    const ASSERTION_JTI_MAX_ENTRIES: usize = 36_000;
     /// Inline reap budget per access (heap pops). Bounds tail latency.
     const ASSERTION_JTI_REAP_BUDGET: usize = 64;
 
@@ -1236,7 +1236,9 @@ impl OAuthState {
                 Self::ASSERTION_JTI_REAP_BUDGET,
             ),
             atproto_service_jti_seen: TtlCache::new(
-                Self::ASSERTION_JTI_MAX_ENTRIES,
+                // ATProto service assertions can live for one hour. Reserve
+                // 100 assertions/s plus 20% headroom for that full window.
+                432_000,
                 Self::ASSERTION_JTI_REAP_BUDGET,
             ),
             atproto_did_resolver: atproto_did_resolver(config),
@@ -1570,14 +1572,24 @@ impl OAuthState {
     /// Check a DPoP JTI for replay and record it if new.
     ///
     /// Returns `true` when the JTI is fresh (caller should proceed).
-    /// Returns `false` when the JTI has been seen within its validity window (replay).
+    /// Returns `false` when the JTI is a replay or the fail-closed barrier is full.
     /// Expired entries are pruned opportunistically on each call.
     pub fn check_and_record_dpop_jti(&self, jti: &str, iat: i64) -> bool {
         let now = chrono::Utc::now().timestamp();
         // Window ends at iat + 120s (±60s skew + 60s buffer); TTL = remainder.
         let ttl_secs = ((iat + 120) - now).max(0) as u64;
-        self.dpop_jti_seen
-            .insert_if_absent(jti.to_owned(), (), Duration::from_secs(ttl_secs))
+        let result = self.dpop_jti_seen.insert_if_absent_no_evict(
+            jti.to_owned(),
+            (),
+            Duration::from_secs(ttl_secs),
+        );
+        if result != InsertIfAbsentNoEvictResult::Inserted {
+            super::replay_metrics::record_rejection(super::replay_metrics::DPOP, result);
+            if result == InsertIfAbsentNoEvictResult::Full {
+                tracing::warn!("DPoP replay barrier is full; refusing fresh proof");
+            }
+        }
+        result == InsertIfAbsentNoEvictResult::Inserted
     }
 
     /// Atomically consume an ATProto service-auth assertion identifier.
@@ -1587,11 +1599,23 @@ impl OAuthState {
             return false;
         }
         let ttl_secs = remaining as u64;
-        self.atproto_service_jti_seen.insert_if_absent_no_evict(
+        let result = self.atproto_service_jti_seen.insert_if_absent_no_evict(
             format!("{issuer}\u{1f}{jti}"),
             (),
             Duration::from_secs(ttl_secs),
-        )
+        );
+        if result != InsertIfAbsentNoEvictResult::Inserted {
+            super::replay_metrics::record_rejection(
+                super::replay_metrics::ATPROTO_SERVICE_ASSERTION,
+                result,
+            );
+            if result == InsertIfAbsentNoEvictResult::Full {
+                tracing::warn!(
+                    "ATProto service-assertion replay barrier is full; refusing fresh assertion"
+                );
+            }
+        }
+        result == InsertIfAbsentNoEvictResult::Inserted
     }
 
     /// Check a client-assertion JTI for replay and record it if new
@@ -1604,15 +1628,25 @@ impl OAuthState {
     /// rejected as expired anyway.
     ///
     /// Returns `true` when the JTI is fresh (caller should proceed);
-    /// `false` when it was seen within its validity window (replay).
+    /// `false` when it is a replay or the fail-closed barrier is full.
     pub fn check_and_record_assertion_jti(&self, client_id: &str, jti: &str, exp: i64) -> bool {
         let now = chrono::Utc::now().timestamp();
         let ttl_secs = (exp - now).max(0) as u64;
-        self.assertion_jti_seen.insert_if_absent(
+        let result = self.assertion_jti_seen.insert_if_absent_no_evict(
             format!("{client_id}\u{1f}{jti}"),
             (),
             Duration::from_secs(ttl_secs),
-        )
+        );
+        if result != InsertIfAbsentNoEvictResult::Inserted {
+            super::replay_metrics::record_rejection(
+                super::replay_metrics::CLIENT_ASSERTION,
+                result,
+            );
+            if result == InsertIfAbsentNoEvictResult::Full {
+                tracing::warn!("client-assertion replay barrier is full; refusing fresh assertion");
+            }
+        }
+        result == InsertIfAbsentNoEvictResult::Inserted
     }
 
     /// Issue a fresh server-side DPoP nonce (RFC 9449 §8).

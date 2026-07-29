@@ -9,6 +9,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use hyprstream_rpc::auth::JtiBlocklist as _;
+use hyprstream_util::InsertIfAbsentNoEvictResult;
 use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
@@ -178,12 +179,21 @@ pub async fn auth_middleware(
         {
             let now = chrono::Utc::now().timestamp();
             let ttl_secs = ((proof.iat + 120) - now).max(0) as u64;
-            if !state.dpop_jti_seen.insert_if_absent(
+            let result = state.dpop_jti_seen.insert_if_absent_no_evict(
                 proof.jti.clone(),
                 (),
                 Duration::from_secs(ttl_secs),
-            ) {
-                debug!("DPoP proof jti already used: {}", proof.jti);
+            );
+            if result != InsertIfAbsentNoEvictResult::Inserted {
+                crate::services::oauth::replay_metrics::record_rejection(
+                    crate::services::oauth::replay_metrics::DPOP,
+                    result,
+                );
+                if result == InsertIfAbsentNoEvictResult::Full {
+                    warn!("DPoP replay barrier is full; refusing fresh proof");
+                } else {
+                    debug!("DPoP proof jti already used: {}", proof.jti);
+                }
                 return unauthorized_response("Authentication failed", &www_authenticate);
             }
         }
