@@ -437,7 +437,7 @@ fn check_claims(
     // audit anchor. Reject assertions dated beyond a 60s clock skew.
     let iat = claims.get("iat").and_then(Value::as_i64)
         .ok_or_else(|| ClientAuthError::InvalidClaim("missing iat".to_owned()))?;
-    if iat > now + 60 {
+    if iat > now.saturating_add(60) {
         return Err(ClientAuthError::InvalidClaim(format!(
             "iat {iat} is in the future (now={now})"
         )));
@@ -460,11 +460,10 @@ fn check_claims(
             "exp {exp} is not in the future (now={now})"
         )));
     }
-    if exp - iat > MAX_CLIENT_ASSERTION_LIFETIME_SECS {
-        return Err(ClientAuthError::InvalidClaim(format!(
-            "assertion lifetime exceeds {MAX_CLIENT_ASSERTION_LIFETIME_SECS}s"
-        )));
-    }
+    let _lifetime = exp
+        .checked_sub(iat)
+        .filter(|lifetime| *lifetime > 0 && *lifetime <= MAX_CLIENT_ASSERTION_LIFETIME_SECS)
+        .ok_or_else(|| ClientAuthError::InvalidClaim("assertion lifetime is invalid".to_owned()))?;
 
     // aud may be a string or an array of strings (RFC 7519 §4.1.3). It
     // must include one of the accepted audiences — on all profile paths
@@ -630,6 +629,15 @@ mod tests {
             matches!(&got, Err(ClientAuthError::InvalidClaim(c)) if c.contains("iat")),
             "future iat must be rejected: {got:?}"
         );
+    }
+
+    #[test]
+    fn rejects_extreme_timestamp_interval_without_overflow() {
+        let mut claims = valid_claims();
+        claims["iat"] = serde_json::json!(i64::MIN);
+        claims["exp"] = serde_json::json!(i64::MAX);
+        let got = check_claims(&claims, "https://app.test/c", &issuer_audiences());
+        assert!(matches!(got, Err(ClientAuthError::InvalidClaim(_))));
     }
 
     #[test]

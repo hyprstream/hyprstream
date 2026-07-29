@@ -350,6 +350,28 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn extreme_replay_expirations_are_rejected_without_consuming_capacity() {
+        let mut state = state_for_replay_barrier_tests();
+        state.assertion_jti_seen = TtlCache::new(1, 16);
+        assert!(!state.check_and_record_assertion_jti("client", "min", i64::MIN));
+        assert!(!state.check_and_record_assertion_jti("client", "max", i64::MAX));
+        assert!(state.check_and_record_assertion_jti(
+            "client",
+            "ordinary",
+            chrono::Utc::now().timestamp() + 60
+        ));
+
+        state.atproto_service_jti_seen = TtlCache::new(1, 16);
+        assert!(!state.check_and_record_atproto_service_jti("did:plc:test", "min", i64::MIN));
+        assert!(!state.check_and_record_atproto_service_jti("did:plc:test", "max", i64::MAX));
+        assert!(state.check_and_record_atproto_service_jti(
+            "did:plc:test",
+            "ordinary",
+            chrono::Utc::now().timestamp() + 60
+        ));
+    }
+
     struct KeyReadErrorStore {
         profile: UserProfile,
     }
@@ -1244,6 +1266,8 @@ fn mesh_kem_public_for_policy(
 }
 
 impl OAuthState {
+    const MAX_CLIENT_ASSERTION_REPLAY_SECS: i64 = 360;
+    const MAX_ATPROTO_SERVICE_ASSERTION_REPLAY_SECS: i64 = 3_600;
     /// DPoP admits iat up to 60 seconds in the future and retains through
     /// iat + 120 seconds: 180 seconds at 1,000 proofs/s plus 20% headroom.
     /// Fixed BLAKE3-256 digest keys plan 216,000 entries at about 26.4 MiB.
@@ -1661,7 +1685,14 @@ impl OAuthState {
     pub fn check_and_record_dpop_jti(&self, jti: &str, iat: i64) -> bool {
         let now = chrono::Utc::now().timestamp();
         // Window ends at iat + 120s (±60s skew + 60s buffer); TTL = remainder.
-        let ttl_secs = ((iat + 120) - now).max(0) as u64;
+        let Some(ttl_secs) = iat
+            .checked_add(120)
+            .and_then(|deadline| deadline.checked_sub(now))
+            .filter(|remaining| *remaining > 0 && *remaining <= 180)
+            .and_then(|remaining| u64::try_from(remaining).ok())
+        else {
+            return false;
+        };
         let result = self.dpop_jti_seen.insert_if_absent_no_evict(
             super::replay_key::dpop_jti(jti),
             (),
@@ -1678,11 +1709,15 @@ impl OAuthState {
 
     /// Atomically consume an ATProto service-auth assertion identifier.
     pub fn check_and_record_atproto_service_jti(&self, issuer: &str, jti: &str, exp: i64) -> bool {
-        let remaining = exp - chrono::Utc::now().timestamp();
-        if remaining <= 0 {
+        let Some(ttl_secs) = exp
+            .checked_sub(chrono::Utc::now().timestamp())
+            .filter(|remaining| {
+                *remaining > 0 && *remaining <= Self::MAX_ATPROTO_SERVICE_ASSERTION_REPLAY_SECS
+            })
+            .and_then(|remaining| u64::try_from(remaining).ok())
+        else {
             return false;
-        }
-        let ttl_secs = remaining as u64;
+        };
         let result = self.atproto_service_jti_seen.insert_if_absent_no_evict(
             super::replay_key::atproto_service_assertion_jti(issuer, jti),
             (),
@@ -1718,7 +1753,15 @@ impl OAuthState {
     /// `false` when it is a replay or the fail-closed barrier is full.
     pub fn check_and_record_assertion_jti(&self, client_id: &str, jti: &str, exp: i64) -> bool {
         let now = chrono::Utc::now().timestamp();
-        let ttl_secs = (exp - now).max(0) as u64;
+        let Some(ttl_secs) = exp
+            .checked_sub(now)
+            .filter(|remaining| {
+                *remaining > 0 && *remaining <= Self::MAX_CLIENT_ASSERTION_REPLAY_SECS
+            })
+            .and_then(|remaining| u64::try_from(remaining).ok())
+        else {
+            return false;
+        };
         let result = self.assertion_jti_seen.insert_if_absent_no_evict(
             super::replay_key::client_assertion_jti(client_id, jti),
             (),

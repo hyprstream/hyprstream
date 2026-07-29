@@ -178,7 +178,15 @@ pub async fn auth_middleware(
         // iat ±60s window). Atomic check-and-record on the shared TtlCache.
         {
             let now = chrono::Utc::now().timestamp();
-            let ttl_secs = ((proof.iat + 120) - now).max(0) as u64;
+            let Some(ttl_secs) = proof
+                .iat
+                .checked_add(120)
+                .and_then(|deadline| deadline.checked_sub(now))
+                .filter(|remaining| *remaining > 0 && *remaining <= 180)
+                .and_then(|remaining| u64::try_from(remaining).ok())
+            else {
+                return unauthorized_response("Authentication failed", &www_authenticate);
+            };
             let result = state.dpop_jti_seen.insert_if_absent_no_evict(
                 crate::services::oauth::replay_key::dpop_jti(&proof.jti),
                 (),

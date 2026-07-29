@@ -501,7 +501,7 @@ impl Claims {
 
     /// Check if token is expired (with 5-second leeway for clock skew).
     pub fn is_expired(&self) -> bool {
-        chrono::Utc::now().timestamp() > self.exp + 5
+        chrono::Utc::now().timestamp() > self.exp.saturating_add(5)
     }
 
     /// True if this token was issued by a local node.

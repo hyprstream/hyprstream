@@ -439,16 +439,22 @@ fn verified_attach_from_claims(
     let security_context = claims
         .security_context(VerifiedKeyMaterial::Classical)
         .ok_or("mount ticket missing verified Claims clearance")?;
-    let valid_for = (claims.exp - chrono::Utc::now().timestamp()).max(0) as u64;
-    if valid_for == 0 {
-        return Err("mount ticket expired");
-    }
+    let valid_for = claims
+        .exp
+        .checked_sub(chrono::Utc::now().timestamp())
+        .filter(|remaining| {
+            *remaining > 0 && *remaining <= crate::services::oauth::mount_ticket::MOUNT_TICKET_TTL
+        })
+        .and_then(|remaining| u64::try_from(remaining).ok())
+        .ok_or("mount ticket expired")?;
     let identity =
         VerifiedAttachIdentity::from_verified_credential(claims.sub.clone(), tenant.to_owned());
     let scope = VerifiedTokenScope::from_verified_token(
         *security_context.clearance(),
         Arc::from(NINEP_ALL_ACTIONS),
-        Instant::now() + Duration::from_secs(valid_for),
+        Instant::now()
+            .checked_add(Duration::from_secs(valid_for))
+            .ok_or("mount ticket expiry is invalid")?,
     );
     let session = SessionContext::from_verified_token(identity.clone(), security_context, scope);
     let verified = VerifiedAttach::try_new(identity, subject, session)

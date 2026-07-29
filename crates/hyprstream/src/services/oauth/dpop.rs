@@ -235,7 +235,7 @@ pub fn verify_dpop_proof(
 
     // Validate iat within ±60s.
     let now = chrono::Utc::now().timestamp();
-    if (iat - now).abs() > 60 {
+    if iat.abs_diff(now) > 60 {
         return Err(DpopError::IatOutOfWindow { iat, now });
     }
 
