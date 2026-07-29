@@ -95,6 +95,13 @@ pub mod rpc_types;
 pub mod typed;
 pub mod worker;
 
+// Postgres-backed PDS record store (#1257) — gated behind `pds-postgres`.
+// When a `[rds]` config section is present, the factory selects this backend;
+// otherwise the RocksDB local backend is used. D2 invariant: signed bytes are
+// the source of truth, SQL is a projection-free KV shell.
+#[cfg(feature = "pds-postgres")]
+pub(crate) mod pds_record_pg;
+
 /// Phase-1 cellular-ledger local-enforcer (epic #922, #925). Gated behind the
 /// `ledger` cargo feature, default off — the scheduler quota path is unchanged
 /// until an operator opts in.
