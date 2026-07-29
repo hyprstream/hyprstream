@@ -20,6 +20,24 @@ use hyprstream_util::{InsertIfAbsentNoEvictResult, TtlCache};
 
 use super::replay_key::ReplayKey;
 
+/// Result of attempting to admit a DPoP proof to its replay barrier.
+///
+/// The token endpoint needs this distinction so a saturated barrier remains
+/// separately metered and rate-limited instead of being logged as a replay.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DpopJtiAdmission {
+    Inserted,
+    Duplicate,
+    Full,
+    InvalidLifetime,
+}
+
+impl DpopJtiAdmission {
+    pub(crate) fn is_inserted(self) -> bool {
+        self == Self::Inserted
+    }
+}
+
 /// Read-only resolver used by the ATProto service-auth exchange perimeter.
 #[async_trait::async_trait]
 pub trait AtprotoDidDocumentResolver: Send + Sync {
@@ -310,14 +328,22 @@ mod tests {
         state.dpop_jti_seen = TtlCache::new(2, 16);
         let now = chrono::Utc::now().timestamp();
 
-        assert!(state.check_and_record_dpop_jti("dpop-first", now));
-        assert!(state.check_and_record_dpop_jti("dpop-second", now));
-        assert!(
-            !state.check_and_record_dpop_jti("dpop-fresh-when-full", now),
+        assert_eq!(
+            state.check_and_record_dpop_jti_admission("dpop-first", now),
+            DpopJtiAdmission::Inserted
+        );
+        assert_eq!(
+            state.check_and_record_dpop_jti_admission("dpop-second", now),
+            DpopJtiAdmission::Inserted
+        );
+        assert_eq!(
+            state.check_and_record_dpop_jti_admission("dpop-fresh-when-full", now),
+            DpopJtiAdmission::Full,
             "a fresh DPoP JTI must be refused once the barrier is full"
         );
-        assert!(
-            !state.check_and_record_dpop_jti("dpop-first", now),
+        assert_eq!(
+            state.check_and_record_dpop_jti_admission("dpop-first", now),
+            DpopJtiAdmission::Duplicate,
             "a full barrier must not evict an earlier DPoP JTI"
         );
 
@@ -1683,6 +1709,17 @@ impl OAuthState {
     /// Returns `false` when the JTI is a replay or the fail-closed barrier is full.
     /// Expired entries are pruned opportunistically on each call.
     pub fn check_and_record_dpop_jti(&self, jti: &str, iat: i64) -> bool {
+        self.check_and_record_dpop_jti_admission(jti, iat)
+            .is_inserted()
+    }
+
+    /// Check a DPoP JTI while retaining the fail-closed admission outcome for
+    /// callers that must distinguish an actual replay from a full barrier.
+    pub(crate) fn check_and_record_dpop_jti_admission(
+        &self,
+        jti: &str,
+        iat: i64,
+    ) -> DpopJtiAdmission {
         let now = chrono::Utc::now().timestamp();
         // Window ends at iat + 120s (±60s skew + 60s buffer); TTL = remainder.
         let Some(ttl_secs) = iat
@@ -1691,7 +1728,7 @@ impl OAuthState {
             .filter(|remaining| *remaining > 0 && *remaining <= 180)
             .and_then(|remaining| u64::try_from(remaining).ok())
         else {
-            return false;
+            return DpopJtiAdmission::InvalidLifetime;
         };
         let result = self.dpop_jti_seen.insert_if_absent_no_evict(
             super::replay_key::dpop_jti(jti),
@@ -1704,7 +1741,11 @@ impl OAuthState {
                 tracing::warn!("DPoP replay barrier is full; refusing fresh proof");
             }
         }
-        result == InsertIfAbsentNoEvictResult::Inserted
+        match result {
+            InsertIfAbsentNoEvictResult::Inserted => DpopJtiAdmission::Inserted,
+            InsertIfAbsentNoEvictResult::Duplicate => DpopJtiAdmission::Duplicate,
+            InsertIfAbsentNoEvictResult::Full => DpopJtiAdmission::Full,
+        }
     }
 
     /// Atomically consume an ATProto service-auth assertion identifier.

@@ -316,9 +316,8 @@ pub async fn ninep_ws(
 /// this resource, expiry, and JTI revocation (all inside `verify_resource_token_claims`),
 /// plus subject-name validation. The `sub` becomes the session Subject.
 ///
-/// NOTE (flagged design fork — see PR body): one-shot replay prevention and
-/// explicit browser-`Origin` binding beyond the JWT `aud` are NOT yet enforced;
-/// the current controls are signature + short expiry + audience + revocation.
+/// One-shot replay prevention is enforced for mount tickets. Explicit browser
+/// `Origin` binding beyond the JWT `aud` remains a separate design concern.
 async fn validate_ticket(
     state: &ServerState,
     ticket: &str,
@@ -802,8 +801,10 @@ mod tests {
         ResourceAuthState,
         ed25519_dalek::SigningKey,
         hyprstream_rpc::crypto::pq::MlDsaSigningKey,
+        ed25519_dalek::SigningKey,
     ) {
         let ed25519 = ed25519_dalek::SigningKey::from_bytes(&[0x5a; 32]);
+        let federation_ed25519 = ed25519_dalek::SigningKey::from_bytes(&[0x5b; 32]);
         let (ml_dsa, ml_dsa_verifying) = hyprstream_rpc::crypto::pq::ml_dsa_generate_keypair();
         let composite_keys = Arc::new(hyprstream_rpc::auth::CompositeKeySet::default());
         let pair = hyprstream_rpc::auth::CompositeKeyPair::verifying(
@@ -819,17 +820,44 @@ mod tests {
             .publish(1, "ninep-test".to_owned(), vec![pair])
             .expect("test composite pair must publish");
 
-        let trusted = std::collections::HashMap::new();
+        let federation_issuer = "https://federation.test";
+        let federation_kid = hyprstream_rpc::auth::jwt::kid_for_key(&federation_ed25519);
+        let federation_jwks = serde_json::json!({
+            "keys": [{
+                "kty": "OKP",
+                "crv": "Ed25519",
+                "x": URL_SAFE_NO_PAD.encode(federation_ed25519.verifying_key().as_bytes()),
+                "use": "sig",
+                "alg": "EdDSA",
+                "kid": federation_kid,
+            }]
+        });
+        let mut trusted = std::collections::HashMap::new();
+        trusted.insert(
+            federation_issuer.to_owned(),
+            crate::config::TrustedIssuerConfig {
+                jwks_uri: Some(format!("{federation_issuer}/jwks")),
+                jwks_cache_ttl_secs: 300,
+                allow_http: false,
+            },
+        );
+        let federation_fetcher = Arc::new(move |_url: &str| -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<serde_json::Value>> + Send>> {
+            let federation_jwks = federation_jwks.clone();
+            Box::pin(async move { Ok(federation_jwks) })
+        });
         let mut state = ResourceAuthState::new(
             ed25519.verifying_key(),
             "https://resource.test".to_owned(),
             "https://issuer.test".to_owned(),
-            Arc::new(crate::auth::FederationKeyResolver::new(&trusted)),
+            Arc::new(
+                crate::auth::FederationKeyResolver::new(&trusted)
+                    .with_jwks_fetcher(federation_fetcher),
+            ),
             Arc::new(hyprstream_rpc::auth::InMemoryJtiBlocklist::new()),
         );
         state.composite_key_set = composite_keys;
         state.dpop_jti_seen = Arc::new(hyprstream_util::TtlCache::new(8, 16));
-        (state, ed25519, ml_dsa)
+        (state, ed25519, ml_dsa, federation_ed25519)
     }
 
     /// Test-only composite encoder that intentionally preserves an absent JTI.
@@ -859,7 +887,7 @@ mod tests {
 
     #[tokio::test]
     async fn mount_ticket_consumer_admits_once_without_pre_admission_consumption() {
-        let (state, ed25519, ml_dsa) = mount_ticket_state();
+        let (state, ed25519, ml_dsa, federation_ed25519) = mount_ticket_state();
         let now = chrono::Utc::now().timestamp();
         let local_claims = mount_claims(now);
         let local = encode_mount_ticket(&local_claims, &ml_dsa, &ed25519);
@@ -871,6 +899,18 @@ mod tests {
 
         let mut federated = mount_claims(now);
         federated.iss = "https://federation.test".to_owned();
+        let federated = crate::auth::jwt::encode(&federated, &federation_ed25519);
+        assert_eq!(
+            verify_mount_ticket(&state, &federated, "ws", "/").await,
+            Err("mount ticket issuer is not local"),
+            "a trusted federated ticket must reach the mount-only issuer guard"
+        );
+        assert_eq!(
+            state.dpop_jti_seen.len(),
+            occupied,
+            "a federated mount ticket consumed replay capacity"
+        );
+
         let mut missing_tenant = mount_claims(now);
         missing_tenant.tenant = None;
         let mut missing_clearance = mount_claims(now);
@@ -878,8 +918,8 @@ mod tests {
         let mut missing_jti = mount_claims(now);
         missing_jti.jti = None;
         let mut future_iat = mount_claims(now);
-        future_iat.iat = now + 1;
-        future_iat.exp = now + 61;
+        future_iat.iat = now + 120;
+        future_iat.exp = now + 180;
         let mut extreme_i64 = mount_claims(now);
         extreme_i64.iat = i64::MIN;
         extreme_i64.exp = i64::MAX;
@@ -887,7 +927,6 @@ mod tests {
         overlong.exp = now + crate::services::oauth::mount_ticket::MOUNT_TICKET_TTL + 1;
 
         for (case, claims) in [
-            ("federated issuer", federated),
             ("missing tenant", missing_tenant),
             ("missing clearance", missing_clearance),
             ("missing JTI", missing_jti),

@@ -22,7 +22,7 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
-use super::state::{DeviceCodeStatus, OAuthState, RefreshTokenEntry};
+use super::state::{DeviceCodeStatus, DpopJtiAdmission, OAuthState, RefreshTokenEntry};
 use crate::services::generated::policy_client::IssueToken;
 use hyprstream_pds::repo_authority::is_path_form_did_web;
 use hyprstream_rpc::auth::{jwk_thumbprint, JwkThumbprintInput};
@@ -491,13 +491,17 @@ async fn verify_dpop_at_token_endpoint(
             )));
         }
     };
-    // JTI replay check.
-    if !state.check_and_record_dpop_jti(&proof.jti, proof.iat) {
-        tracing::warn!(jti = %proof.jti, "DPoP JTI replay detected");
+    // JTI replay check. A full barrier is already metered and warning-rate-
+    // limited at insertion; only a duplicate emits a generic debug event.
+    let admission = state.check_and_record_dpop_jti_admission(&proof.jti, proof.iat);
+    if !admission.is_inserted() {
+        if let Some(message) = dpop_jti_rejection_log_message(admission) {
+            tracing::debug!("{message}");
+        }
         return Some(Err(token_error(
             StatusCode::BAD_REQUEST,
             "invalid_dpop_proof",
-            Some("DPoP proof jti already used"),
+            Some("DPoP proof rejected"),
         )));
     }
 
@@ -535,6 +539,12 @@ async fn verify_dpop_at_token_endpoint(
     }
 
     Some(Ok(proof.jkt))
+}
+
+/// A saturated barrier is logged only by its rate-limited insertion path.
+/// Duplicate proofs receive a generic diagnostic that never includes a JTI.
+fn dpop_jti_rejection_log_message(admission: DpopJtiAdmission) -> Option<&'static str> {
+    (admission == DpopJtiAdmission::Duplicate).then_some("DPoP JTI replay rejected")
 }
 
 /// Build a `400 use_dpop_nonce` response with the current nonce in the
@@ -1558,6 +1568,19 @@ fn token_error_body(error: &str, description: Option<&str>) -> serde_json::Value
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dpop_replay_logging_is_generic_and_never_bypasses_full_rate_limit() {
+        assert_eq!(
+            dpop_jti_rejection_log_message(DpopJtiAdmission::Duplicate),
+            Some("DPoP JTI replay rejected")
+        );
+        assert_eq!(dpop_jti_rejection_log_message(DpopJtiAdmission::Full), None);
+        assert_eq!(
+            dpop_jti_rejection_log_message(DpopJtiAdmission::InvalidLifetime),
+            None
+        );
+    }
 
     #[test]
     fn hosted_account_tenant_is_zone_bound_into_host_form_did() {
