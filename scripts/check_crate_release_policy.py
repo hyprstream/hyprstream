@@ -50,6 +50,19 @@ def main() -> None:
     if missing or stale:
         fail(f"classification mismatch; unclassified={missing}, unknown={stale}")
 
+    shim = policy["deprecation_shim"]
+    source_service = shim["source_service"]
+    if source_service not in manifests:
+        fail(f"deprecation shim names unknown source service {source_service}")
+    if shim["package_name"] != source_service:
+        fail("deprecation shim must reserve the source service's crates.io name")
+    if shim["license"] != "Apache-2.0":
+        fail("deprecation shim must remain Apache-2.0")
+    if shim["required_before_yank"] is not True:
+        fail("deprecation shim must be required before yanking the stale package")
+    if manifests[source_service][1]["package"].get("publish") is not False:
+        fail(f"real service {source_service} must remain non-publishable; use the separate shim")
+
     public = groups["public_now"]
     versions = set()
     position = {name: index for index, name in enumerate(public)}

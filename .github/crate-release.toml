@@ -7,6 +7,8 @@ environment = "crates-io-publish"
 public_now = [
   "hyprstream-rpc-build",
   "hyprstream-rpc-derive",
+  "hyprstream-crypto",
+  "hyprstream-rpc",
 ]
 
 public_later = [
@@ -17,7 +19,6 @@ public_later = [
   "hyprstream-9p",
   "hyprstream-compositor",
   "hyprstream-containedfs",
-  "hyprstream-crypto",
   "hyprstream-discovery",
   "hyprstream-flight",
   "hyprstream-k8s",
@@ -27,7 +28,6 @@ public_later = [
   "hyprstream-pds",
   "hyprstream-pds-service",
   "hyprstream-resource",
-  "hyprstream-rpc",
   "hyprstream-rpc-std",
   "hyprstream-service",
   "hyprstream-tui",
@@ -48,6 +48,15 @@ internal = [
   "hyprstream-workers-python-guest",
   "hyprstream-workers-wasmtime-fsguest",
 ]
+
+# The real service is deliberately not publishable. Replacing the stale public
+# `hyprstream` name requires a separate, Apache-2.0 deprecation-shim package;
+# do not republish the service merely to occupy that name.
+[deprecation_shim]
+package_name = "hyprstream"
+source_service = "hyprstream"
+license = "Apache-2.0"
+required_before_yank = true
 
 # Approved target boundary.  These values describe the intended per-crate
 # relicensing change; they do not alter a Cargo.toml license field themselves.

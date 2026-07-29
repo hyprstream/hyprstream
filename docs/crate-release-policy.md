@@ -16,16 +16,25 @@ duplicated, or publishable outside the allowlist.
   1. `hyprstream-rpc-build` `0.1.0`
   2. `hyprstream-rpc-derive` `0.1.0` (exactly depends on
      `hyprstream-rpc-build =0.1.0`)
-- Everything else sets `publish = false`. Looking reusable is not an API or
+  3. `hyprstream-crypto` `0.1.0` (leaf cryptographic primitives)
+  4. `hyprstream-rpc` `0.1.0` (exactly depends on the three preceding crates)
+- Everything else sets `publish = false`, except that the stale `hyprstream`
+  crates.io name requires a separate Apache-2.0 deprecation-shim package rather
+  than republishing the real service. Looking reusable is not an API or
   maintenance commitment. Promotion to `public_now` requires an owner, API and
   SemVer review, package documentation, security review where applicable,
   crates.io name ownership, versioned local dependencies, and a successful
   packaged-source build.
 
 The existing crates.io package `hyprstream` is owned by the project maintainer
-account but is **not** the local application release channel; the current
-application crate remains internal/non-publishable. The name `chat-core` is
-owned by an unrelated crates.io publisher and cannot be used by this project.
+account but is **not** the local application release channel: its seven
+Apache-2.0 versions (up to `0.1.0-alpha-6`) describe a different, stale product.
+The real service remains internal/non-publishable because of its broad local
+graph and `tch`/libtorch runtime. Before yanking those stale versions, publish a
+separate Apache-2.0 `hyprstream` deprecation shim with current install guidance;
+do not delete the package name or republish the service to occupy it. The name
+`chat-core` is owned by an unrelated crates.io publisher and cannot be used by
+this project.
 
 ## Complete inventory
 
@@ -33,6 +42,8 @@ owned by an unrelated crates.io publisher and cannot be used by this project.
 |---|---|---|
 | `hyprstream-rpc-build` | **public now** | Documented build/codegen API; packages independently; first in release order. |
 | `hyprstream-rpc-derive` | **public now** | Documented proc-macro API; exact versioned dependency on `hyprstream-rpc-build`. |
+| `hyprstream-crypto` | **public now** | Transport-free cryptographic primitives; a dependency-free local leaf in the Rust SDK closure. |
+| `hyprstream-rpc` | **public now** | Rust SDK protocol surface; exact versioned dependencies on build, derive, and crypto complete the publishable closure. |
 | `bitsandbytes-sys` | public later | External CUDA/ROCm FFI/toolchain contract needs ownership and platform support policy. |
 | `cas-serve` | public later | XET git-source dependency and missing package docs. |
 | `git-xet-filter` | public later | XET git-source/default-feature dependency chain; API review required. |
@@ -40,7 +51,6 @@ owned by an unrelated crates.io publisher and cannot be used by this project.
 | `hyprstream-9p` | public later | Depends on unpublished RPC/VFS crates; wire/API stability review required. |
 | `hyprstream-compositor` | public later | Missing package docs and explicit external API owner. |
 | `hyprstream-containedfs` | public later | Security-sensitive path-containment contract needs dedicated review and support owner. |
-| `hyprstream-crypto` | public later | Cryptographic API requires independent security/API review before external commitment. |
 | `hyprstream-discovery` | public later | Deep unpublished dependency graph and security-sensitive discovery/admission surface. |
 | `hyprstream-flight` | public later | Depends on unpublished metrics/git2db stack; missing package docs. |
 | `hyprstream-k8s` | public later | CRD/version compatibility is a public API; ownership and compatibility policy required. |
@@ -50,8 +60,7 @@ owned by an unrelated crates.io publisher and cannot be used by this project.
 | `hyprstream-pds` | public later | Security/signing and atproto storage APIs need review; unpublished dependencies. |
 | `hyprstream-pds-service` | public later | Tenant service depends on unpublished PDS/RPC/VFS stack. |
 | `hyprstream-resource` | public later | Early authority/lifecycle interface scaffold; API not committed. |
-| `hyprstream-rpc` | public later | Large security/wire API plus unreleased patched `moq-net`; not ready for SemVer support. |
-| `hyprstream-rpc-std` | public later | Generated schema/client compatibility depends on unpublished RPC/VFS/worker crates. |
+| `hyprstream-rpc-std` | public later | Requires path dependencies on RPC/VFS/workers-tcl/9p and the unreleased patched `moq-net` wasm fix; `[patch.crates-io]` does not reach downstream consumers, so publishing it would resolve an unpatched crates.io `moq-net`. |
 | `hyprstream-service` | public later | Depends on unpublished RPC/PDS and evolving orchestration API. |
 | `hyprstream-util` | public later | Packages cleanly, but generic internal helpers lack an external API owner/docs commitment. |
 | `hyprstream-vfs` | public later | Core namespace/security API depends on unpublished RPC; stability review required. |
@@ -62,7 +71,7 @@ owned by an unrelated crates.io publisher and cannot be used by this project.
 | `hyprstream-workers-wasmtime` | public later | Sandbox security API and unpublished RPC/VFS dependencies need review. |
 | `waxterm` | public later | Packages cleanly, but lacks package docs and an explicit standalone compatibility owner. |
 | `chat-core` | **internal/not publishable** | Current crates.io name belongs to an unrelated publisher; rename and API review required. |
-| `hyprstream` | **internal/not publishable** | Product application, not an SDK; git dependencies and the full internal graph are unsuitable for crates.io. |
+| `hyprstream` | **internal/not publishable** | Real product/service crate (broad local graph and `tch`/libtorch); keep it non-publishable and use a separate Apache-2.0 deprecation shim to replace the stale public name. |
 | `hyprstream-appview` | **internal/not publishable** | Product-internal derived identity service with no standalone support contract. |
 | `hyprstream-tui` | public later | Supported MIT client TUI for trust/crypto, bootstrap, and enrolment; its publish promotion follows the client dependency and accelerator-runtime download/verification work. |
 | `hyprstream-workers-python-guest` | **internal/not publishable** | Compiled WASM guest artifact, not a Rust consumer library. |
@@ -208,6 +217,12 @@ cargo publish --locked --registry crates-io -p hyprstream-rpc-build
 # Wait until cargo search/info resolves 0.1.0 from crates.io.
 cargo package --locked -p hyprstream-rpc-derive
 cargo publish --locked --registry crates-io -p hyprstream-rpc-derive
+# The derive crate and crypto are independent after build is available.
+cargo package --locked -p hyprstream-crypto
+cargo publish --locked --registry crates-io -p hyprstream-crypto
+# Wait until both derive and crypto resolve from crates.io.
+cargo package --locked -p hyprstream-rpc
+cargo publish --locked --registry crates-io -p hyprstream-rpc
 ```
 
 The local authenticated owner is currently `ewindisch`; the token is stored by
@@ -222,13 +237,13 @@ Trusted Publishing** entry exactly as follows:
 | workflow filename | `publish-crates.yml` |
 | environment | `crates-io-publish` |
 
-Do this separately for `hyprstream-rpc-build` and
-`hyprstream-rpc-derive`. Add a second accountable maintainer/team owner where
-organizational policy permits, verify all owner emails, test one prerelease,
-then enable crates.io's **require trusted publishing** control for each crate so
-long-lived API tokens cannot publish updates. Retain a documented break-glass
-owner procedure; never store a crates.io token in repository or environment
-secrets for routine releases.
+Do this separately for `hyprstream-rpc-build`, `hyprstream-rpc-derive`,
+`hyprstream-crypto`, and `hyprstream-rpc`. Add a second accountable
+maintainer/team owner where organizational policy permits, verify all owner
+emails, test one prerelease, then enable crates.io's **require trusted
+publishing** control for each crate so long-lived API tokens cannot publish
+updates. Retain a documented break-glass owner procedure; never store a
+crates.io token in repository or environment secrets for routine releases.
 
 GitHub repository setup (not performed by this change):
 
@@ -292,6 +307,7 @@ ships Rust source and therefore requires its full local dependency graph to be
 published first. The sibling WASM SDK lane may publish the same interface to npm
 now because npm receives a compiled WASM artifact, which does not expose that
 Rust source dependency graph. This is intentional rather than a contradiction:
-the release order is WASM SDK first and Rust SDK last. The Rust route remains
-gated behind `hyprstream-rpc`, whose source release is blocked by the unreleased
-patched `moq-net` dependency.
+the release order is WASM SDK first and the source-distributed Rust SDK closure
+second. `hyprstream-rpc` is in that four-crate closure; only `hyprstream-rpc-std`
+remains blocked because its browser path requires the unreleased patched
+`moq-net` behavior and additional unpublished path dependencies.
