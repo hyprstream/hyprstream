@@ -2,7 +2,7 @@
 # Multi-variant build for Hyprstream supporting CPU, CUDA, and ROCm
 
 ARG VARIANT=cpu
-ARG DEBIAN_VERSION=bookworm
+ARG DEBIAN_VERSION=trixie
 ARG LIBTORCH_VERSION=2.10.0
 
 # LibTorch download URLs for manual installation
@@ -17,10 +17,9 @@ ARG LIBTORCH_CPU_URL=https://download.pytorch.org/libtorch/cpu/libtorch-shared-w
 
 FROM debian:${DEBIAN_VERSION} AS builder-base
 
-# Install build dependencies
-# Note: binutils from backports required for OpenSSL AVX-512 assembly compatibility
-RUN echo "deb http://deb.debian.org/debian bookworm-backports main" >> /etc/apt/sources.list && \
-    apt-get update && apt-get install -y \
+# Install build dependencies. Trixie's stock binutils is new enough for OpenSSL
+# AVX-512 assembly, so no backports repository or package pin is needed.
+RUN apt-get update && apt-get install -y \
     curl \
     wget \
     unzip \
@@ -36,7 +35,6 @@ RUN echo "deb http://deb.debian.org/debian bookworm-backports main" >> /etc/apt/
     cmake \
     clang \
     libclang-dev \
-    && apt-get install -y -t bookworm-backports binutils \
     && rm -rf /var/lib/apt/lists/* \
     && apt-get clean
 
@@ -157,8 +155,8 @@ ENV LD_LIBRARY_PATH=/opt/libtorch/lib
 # There is NO aarch64 libtorch zip at download.pytorch.org/libtorch/cpu — that
 # URL is x86_64-only. The PyTorch aarch64 manylinux_2_28 pip wheel, however,
 # bundles a complete CPU libtorch (torch/lib/*.so + torch/include), so we install
-# torch via pip and point LIBTORCH at the wheel's torch dir. bookworm ships
-# glibc 2.36, satisfying the wheel's manylinux_2_28 (glibc 2.28+) floor.
+# torch via pip and point LIBTORCH at the wheel's torch dir. Trixie ships a
+# newer glibc than the wheel's manylinux_2_28 (glibc 2.28+) floor.
 #
 # This stage is the toolchain+libtorch image only; the actual cargo build runs
 # either in the `builder` stage below (VARIANT=cpu-arm64) or by mounting the
@@ -171,7 +169,7 @@ ARG LIBTORCH_VERSION
 # wheel reports the same 2.10.0 but bypass keeps us resilient to wheel-suffix skew.
 ENV LIBTORCH_BYPASS_VERSION_CHECK=1
 
-# Python + pip to fetch the aarch64 torch wheel (bookworm python3 == 3.11 -> cp311).
+# Python + pip to fetch the aarch64 torch wheel.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         python3 python3-pip \
     && rm -rf /var/lib/apt/lists/* \
