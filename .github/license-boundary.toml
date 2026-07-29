@@ -1,0 +1,29 @@
+# Target map for the license-graph guard. This is intentionally separate from
+# Cargo manifest licenses so the guard lands before the mechanical relicense.
+[license_gate]
+apache_roots = [
+  "hyprstream-crypto",
+  "hyprstream-rpc",
+  "hyprstream-rpc-build",
+  "hyprstream-rpc-derive",
+  "hyprstream-rpc-std",
+  "hyprstream-tui",
+  "hyprstream-util",
+  "hyprstream-vfs",
+  "hyprstream-workers-python",
+  "hyprstream-workers-python-guest",
+  "hyprstream-workers-tcl",
+  "hyprstream-workers-wasmtime",
+  "hyprstream-workers-wasmtime-fsguest",
+]
+
+agpl_services = [
+  "hyprstream",
+  "hyprstream-appview",
+  "hyprstream-discovery",
+  "hyprstream-k8s",
+  "hyprstream-ledger",
+  "hyprstream-pds",
+  "hyprstream-pds-service",
+  "hyprstream-service",
+]
