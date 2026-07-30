@@ -267,6 +267,23 @@ def check_rust_text(text: str) -> None:
         f"(if={build_if!r})",
     )
 
+    # The merge-gate runners provision a dedicated cache EBS volume at this
+    # path. Every Rust container must bind it and direct Cargo's target there;
+    # otherwise a full link writes into the 80 GiB runner root and can exhaust
+    # it despite the 200 GiB cache volume being available.
+    required_cache_args = (
+        "-v /mnt/hypr-ci-cache:/mnt/hypr-ci-cache:Z",
+        "-e CARGO_TARGET_DIR=/mnt/hypr-ci-cache/target/hyprstream",
+    )
+    job_blocks = _job_blocks(text)
+    for name in ("clippy", "wasm", "build"):
+        block = job_blocks[name]
+        for argument in required_cache_args:
+            _assert(
+                argument in block,
+                f"rust.yml: job {name!r} must pass {argument!r} to Podman",
+            )
+
 
 def check_appimage_text(text: str) -> None:
     """Pin AppImage to one nightly cron, v* tags, and manual dispatch only."""
@@ -379,6 +396,22 @@ def _rust_mutations(rust_text: str) -> list[tuple[str, str]]:
         (
             "rename build job (removing the required gate)",
             rust_text.replace("  build:\n", "  build_renamed:\n", 1),
+        ),
+        (
+            "drop merge-gate cache mount",
+            rust_text.replace(
+                "          -v /mnt/hypr-ci-cache:/mnt/hypr-ci-cache:Z \\\n",
+                "",
+                1,
+            ),
+        ),
+        (
+            "drop merge-gate target directory",
+            rust_text.replace(
+                "          -e CARGO_TARGET_DIR=/mnt/hypr-ci-cache/target/hyprstream \\\n",
+                "",
+                1,
+            ),
         ),
     ]
 
