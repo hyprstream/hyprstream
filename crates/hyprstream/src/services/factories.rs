@@ -1423,24 +1423,26 @@ fn create_workflow_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawn
     }
     workflow_service.set_jwt_key_source(ctx.cluster_key_source());
 
-    // Pin the full authorized MCP relay key set so delegated-bearer requests
-    // (MCP tool calls relaying a caller JWT) pass verify_claims regardless of
-    // which authorized MCP instance signed them (rotation / HA). Fail-closed
-    // when the set is empty — no delegation is accepted until MCP keys are
-    // registered (#989 review).
-    let mcp_keys: Vec<[u8; 32]> = hyprstream_service::global_trust_store()
-        .keys_for_scope("mcp")
-        .iter()
-        .map(|vk| vk.to_bytes())
-        .collect();
-    if mcp_keys.is_empty() {
+    // Inject a LIVE MCP relay authorizer so accept_delegated_bearer consults
+    // current MCP-scope authorization at call time (not a frozen snapshot —
+    // retired keys are rejected, new keys accepted after factory start). The
+    // closure captures the global trust store and checks is_authorized for the
+    // "mcp" scope — independently scoped, fail-closed (#989 review).
+    let trust = hyprstream_service::global_trust_store();
+    let has_mcp_keys = !trust.keys_for_scope("mcp").is_empty();
+    if !has_mcp_keys {
         tracing::warn!(
             "workflow service started with no authorized MCP relay keys; \
              delegated-bearer MCP tool calls will be rejected until the mcp \
              service key(s) are registered (#989)"
         );
     }
-    workflow_service.set_mcp_relay_pubkeys(mcp_keys);
+    workflow_service.set_relay_authorizer(std::sync::Arc::new(move |pubkey: &[u8; 32]| {
+        match hyprstream_rpc::prelude::VerifyingKey::from_bytes(pubkey) {
+            Ok(vk) => trust.is_authorized(&vk, "mcp"),
+            Err(_) => false,
+        }
+    }));
 
     Ok(ctx.into_spawnable(workflow_service))
 }
