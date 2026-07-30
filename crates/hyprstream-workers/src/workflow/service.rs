@@ -729,7 +729,7 @@ impl WorkflowService {
         let lock = self.repo_lock(repo_id).await;
         let _guard = lock.lock().await;
         let mode = self.repo_mode(repo_id).await;
-        self.rescan_inner_locked(repo_id, mode).await
+        self.rescan_inner_locked(repo_id, mode).await.map(|_| ())
     }
 
     /// Rescan a repository with an explicit [`ParseMode`] (#1432 boundary).
@@ -746,6 +746,22 @@ impl WorkflowService {
         repo_id: &str,
         mode: super::parser::ParseMode,
     ) -> Result<()> {
+        self.rescan_repo_with_defs(repo_id, mode).await.map(|_| ())
+    }
+
+    /// Select a parse mode and atomically reconcile a repository, returning
+    /// the definitions that survived the scan.
+    ///
+    /// Adapter loaders use this instead of a separate `set_repo_mode` followed
+    /// by `scan_repo_with`: strict selection, scanning, stale eviction, and
+    /// registration must share the per-repo lock. Otherwise a stale Legacy
+    /// scan can register an unsupported workflow after strict selection but
+    /// before the adapter's later eviction (#1432 fail-closed boundary).
+    pub(crate) async fn rescan_repo_with_defs(
+        &self,
+        repo_id: &str,
+        mode: super::parser::ParseMode,
+    ) -> Result<Vec<WorkflowDef>> {
         let lock = self.repo_lock(repo_id).await;
         let _guard = lock.lock().await;
         self.set_repo_mode_locked(repo_id, mode).await;
@@ -762,7 +778,7 @@ impl WorkflowService {
         &self,
         repo_id: &str,
         mode: super::parser::ParseMode,
-    ) -> Result<()> {
+    ) -> Result<Vec<WorkflowDef>> {
         let workflows = self.scan_repo_with(repo_id, mode).await?;
 
         // Fresh set of workflow ids for this repo, per the scan.
@@ -778,7 +794,7 @@ impl WorkflowService {
         let mut repo_workflows = self.repo_workflows.write().await;
         let mut subscriptions = Vec::new();
 
-        for wf in workflows {
+        for wf in &workflows {
             let wf_id = self.register_workflow(wf.clone()).await?;
 
             for trigger in &wf.triggers {
@@ -790,7 +806,7 @@ impl WorkflowService {
         repo_workflows.insert(repo_id.to_owned(), subscriptions);
 
         tracing::info!(repo_id = %repo_id, mode = ?mode, "Rescanned repository");
-        Ok(())
+        Ok(workflows)
     }
 
     /// Start a subscriber adapter. Returns a CancellationToken to stop it.

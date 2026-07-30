@@ -80,32 +80,22 @@ impl GitHubActionsAdapter {
     /// generic adapter) unknown keys are tolerated, preserving non-gate
     /// caller compatibility (#1432 non-goal).
     ///
-    /// The chosen mode is recorded per-repo on the service
-    /// ([`WorkflowService::set_repo_mode`]) so that push-triggered rescans
-    /// retain strict rather than silently dropping back to legacy. This load
-    /// also **reconciles**: stale service registrations and adapter handlers
-    /// for this repo that are absent from the fresh set are evicted/dropped,
-    /// so a deleted or strict-rejected workflow can no longer be dispatched
-    /// or triggered (fail-closed).
+    /// The chosen mode, scan, stale-registration eviction, and registration
+    /// are one service-level atomic transition. Only after that transition
+    /// completes are this adapter's handlers rebuilt. A stale handler can
+    /// therefore only resolve a surviving strict registration; a rejected
+    /// workflow already fails `dispatch` with `WorkflowNotFound`.
     pub async fn load_repo_with(
         &mut self,
         repo_id: &str,
         service: &WorkflowService,
         mode: super::parser::ParseMode,
     ) -> Result<()> {
-        // Record the mode so event-triggered rescans retain strict.
-        service.set_repo_mode(repo_id, mode).await;
-
-        // Scan the repository for workflow files in the chosen mode.
-        let workflow_defs = service.scan_repo_with(repo_id, mode).await?;
-
-        // Reconcile the service registry: evict any prior registration for
-        // this repo that did not survive the fresh scan.
-        let fresh_ids: std::collections::HashSet<WorkflowId> = workflow_defs
-            .iter()
-            .map(|def| format!("{}:{}", def.repo_id, def.path))
-            .collect();
-        service.evict_stale_for_repo(repo_id, &fresh_ids).await;
+        // Hold the service's per-repo lock from mode selection through
+        // scan/evict/register. Do not split this into `set_repo_mode` plus a
+        // scan: a pre-existing Legacy rescan could otherwise commit a
+        // dispatchable unsupported workflow in between.
+        let workflow_defs = service.rescan_repo_with_defs(repo_id, mode).await?;
 
         // Reconcile this adapter's handlers: drop handlers whose workflow
         // belongs to this repo, then rebuild from the fresh set. Without
@@ -116,8 +106,7 @@ impl GitHubActionsAdapter {
             .retain(|h| !h.workflow_id().starts_with(&repo_prefix));
 
         for def in workflow_defs {
-            // Register the workflow definition.
-            let workflow_id = service.register_workflow(def.clone()).await?;
+            let workflow_id = format!("{}:{}", def.repo_id, def.path);
 
             // Build handlers from triggers.
             for trigger in &def.triggers {
