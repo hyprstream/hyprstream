@@ -37,6 +37,13 @@
 //!   validation and YAML emission — all compile with no cluster present.
 //! - `k8s`: pulls in the kube client + controller-runtime for code that needs a
 //!   live API server (see [`install`]). CRD types never require it.
+//! - `grant`: exposes only the service-neutral [`grant::TenantGrantService`]
+//!   boundary and generic TenantBinding status projection. Authority-bearing
+//!   signing and PDS allocation behavior moved to the downstream,
+//!   AGPL-licensed `hyprstream-k8s-pds` crate in #1422. Callers migrate
+//!   `hyprstream_k8s::grant::TenantGrantIssuer` to
+//!   `hyprstream_k8s_pds::TenantGrantIssuer` and pass it through
+//!   `operator::run_operator_with_grant_service` with both features enabled.
 //!
 //! All CRDs are `v1alpha1`; the conversion/upgrade path to a future stored
 //! version is noted per-resource and is out of scope for this crate (K5b owns
@@ -47,15 +54,10 @@ pub mod models;
 pub mod serving;
 pub mod training;
 
-/// CRD → grant compilation (#929): a [`mesh::TenantBinding`]'s authorable
-/// [`mesh::TenantEntitlement`] compiles into an issuer-signed UCAN grant + an
-/// `ai.hyprstream.ledger.allocation` record that lands in the tenant's
-/// inventory, plus the verification contract enforcers
-/// (#781/#787/#790/#793/#794/#527) will consume.
+/// Service-neutral TenantBinding grant reconciliation contract (#929/#1422).
 ///
-/// Gated behind `grant` because it needs the UCAN/COSE primitives
-/// (`hyprstream-rpc`) and the allocation lexicon (`hyprstream-pds`); the CRD
-/// *types* it lowers never require them.
+/// The AGPL `hyprstream-k8s-pds` adapter implements this contract with the
+/// issuer-signing and PDS allocation/CID behavior.
 #[cfg(feature = "grant")]
 pub mod grant;
 

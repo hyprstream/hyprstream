@@ -34,6 +34,7 @@ const MODEL_KIND: &str = "Model";
 const ADAPTER_KIND: &str = "Adapter";
 const TRAINING_RUN_KIND: &str = "TrainingRun";
 const INFERENCE_SERVICE_KIND: &str = "InferenceService";
+#[cfg(feature = "grant")]
 const TENANT_BINDING_KIND: &str = "TenantBinding";
 const TRAINING_RUN_FINALIZER: &str = "training.hyprstream.io/finalizer";
 const SERVING_APP_LABEL: &str = "hyprstream.io/serving-app";
@@ -246,13 +247,10 @@ pub struct OperatorState<R> {
     rpc: Arc<R>,
     config: OperatorConfig,
     tenant_bindings: TenantBindingCache,
-    /// The operator's tenant-grant issuer key (#929). `None` = the
-    /// `TenantBinding` controller compiles no grants (bindings stay the pure
-    /// namespace↔tenant map). Set by [`OperatorState::with_grant_issuer`] when
-    /// the `grant` feature is enabled and the operator was given issuer key
-    /// material at startup.
+    /// Downstream service adapter for tenant-grant issuance (#929/#1422).
+    /// `None` fails closed for authored entitlements.
     #[cfg(feature = "grant")]
-    tenant_grant_issuer: Option<Arc<crate::grant::TenantGrantIssuer>>,
+    tenant_grant_service: Option<Arc<dyn crate::grant::TenantGrantService>>,
     /// Monotonic allocation-epoch counter for compiled grants (#929). Revocation
     /// = stop renewing + bump the epoch; enforcers honor the epoch, never an
     /// unbounded bearer token (#921). Seeded at startup; a future renewal layer
@@ -272,22 +270,22 @@ where
             config,
             tenant_bindings: TenantBindingCache::default(),
             #[cfg(feature = "grant")]
-            tenant_grant_issuer: None,
+            tenant_grant_service: None,
             #[cfg(feature = "grant")]
             grant_epoch: Arc::new(std::sync::atomic::AtomicU64::new(1)),
         }
     }
 
-    /// Set the operator's tenant-grant issuer (#929), enabling the
-    /// `TenantBinding` → grant compilation controller. `None` disables grant
-    /// compilation (the default); bindings reconcile to the no-grant `Bound`
-    /// status only. Only available with the `grant` feature.
+    /// Set the downstream tenant-grant service (#929/#1422).
+    ///
+    /// `None` leaves entitlement-bearing bindings rejected; bindings without
+    /// entitlements remain ordinary namespace↔tenant mappings.
     #[cfg(feature = "grant")]
-    pub fn with_grant_issuer(
+    pub fn with_grant_service(
         mut self,
-        issuer: Option<Arc<crate::grant::TenantGrantIssuer>>,
+        service: Option<Arc<dyn crate::grant::TenantGrantService>>,
     ) -> Self {
-        self.tenant_grant_issuer = issuer;
+        self.tenant_grant_service = service;
         self
     }
 }
@@ -327,8 +325,8 @@ pub enum OperatorError {
 /// With the `grant` feature, this runs the `TenantBinding` controller too, but
 /// with no issuer configured: bindings without an entitlement reconcile to the
 /// no-grant `Bound` status, and an authored entitlement is `Rejected` (no
-/// issuer to sign it). Use [`run_operator_with_grant_issuer`] to enable grant
-/// compilation (#929).
+/// service to issue it). Use [`run_operator_with_grant_service`] to enable
+/// grant compilation (#929/#1422).
 pub async fn run_operator<R>(
     client: Client,
     rpc: Arc<R>,
@@ -341,20 +339,23 @@ where
     run_operator_with_state(client, state).await
 }
 
-/// Run every controller with the operator's tenant-grant issuer configured
-/// (#929): the `TenantBinding` controller compiles authored entitlements into
-/// issuer-signed grants. `None` behaves exactly like [`run_operator`].
+/// Run every controller with a downstream tenant-grant service configured.
+///
+/// The Apache operator owns generic reconciliation; the service owns
+/// authority-bearing issuance and PDS allocation behavior. `None` behaves
+/// exactly like [`run_operator`].
 #[cfg(feature = "grant")]
-pub async fn run_operator_with_grant_issuer<R>(
+pub async fn run_operator_with_grant_service<R>(
     client: Client,
     rpc: Arc<R>,
     config: OperatorConfig,
-    issuer: Option<Arc<crate::grant::TenantGrantIssuer>>,
+    service: Option<Arc<dyn crate::grant::TenantGrantService>>,
 ) -> Result<(), OperatorError>
 where
     R: HyprstreamOperatorRpc,
 {
-    let state = Arc::new(OperatorState::new(client.clone(), rpc, config).with_grant_issuer(issuer));
+    let state =
+        Arc::new(OperatorState::new(client.clone(), rpc, config).with_grant_service(service));
     run_operator_with_state(client, state).await
 }
 
@@ -551,11 +552,11 @@ where
 {
     use std::sync::atomic::Ordering;
 
-    // No issuer configured ⇒ grant compilation is disabled. Reflect a no-grant
+    // No service configured ⇒ grant compilation is disabled. Reflect a no-grant
     // Bound status only when the status is stale, so the controller does not
     // hot-loop an apiserver that has nothing to write.
-    let Some(issuer) = state.tenant_grant_issuer.clone() else {
-        if tenant_binding_status_observed_current(binding.as_ref()) {
+    let Some(service) = state.tenant_grant_service.clone() else {
+        if tenant_binding_status_without_service_up_to_date(binding.as_ref()) {
             return Ok(Action::requeue(state.config.requeue));
         }
         let status = crate::grant::compile_tenant_binding_status(
@@ -586,7 +587,7 @@ where
     let now = crate::grant::now_unix();
     let status = crate::grant::compile_tenant_binding_status(
         binding.as_ref(),
-        Some(issuer.as_ref()),
+        Some(service.as_ref()),
         epoch,
         now,
     );
@@ -613,6 +614,30 @@ fn tenant_binding_status_observed_current(binding: &TenantBinding) -> bool {
         .as_ref()
         .and_then(|status| status.observed_generation)
         == binding.meta().generation
+}
+
+/// A missing service is a fail-closed state for authored entitlements.
+///
+/// A status from a previously configured service must therefore be replaced
+/// with a rejection even when the CRD generation has not changed.
+#[cfg(feature = "grant")]
+fn tenant_binding_status_without_service_up_to_date(binding: &TenantBinding) -> bool {
+    if !tenant_binding_status_observed_current(binding) {
+        return false;
+    }
+    let Some(status) = binding.status.as_ref() else {
+        return false;
+    };
+    match binding.spec.entitlement.as_ref() {
+        Some(_) => {
+            status.bound == Some(false)
+                && status.phase.as_deref() == Some("Rejected")
+                && status.grant_cid.is_none()
+                && status.allocation_cid.is_none()
+                && status.epoch.is_none()
+        }
+        None => status.grant_cid.is_none() && status.allocation_cid.is_none(),
+    }
 }
 
 /// Whether a `TenantBinding`'s status is current enough to skip a reconcile at
@@ -1840,8 +1865,10 @@ mod tests {
     use super::*;
     use crate::{
         AdapterSpec, InferenceServiceSpec, ModelSpec, ModelStage, TenantBindingSpec,
-        TenantEntitlement, TenantGrantClass, TrainingRunSpec,
+        TrainingRunSpec,
     };
+    #[cfg(feature = "grant")]
+    use crate::{TenantEntitlement, TenantGrantClass};
 
     #[test]
     fn model_success_status_reports_observed_ref() {
@@ -2591,6 +2618,16 @@ mod tests {
         assert!(
             tenant_binding_status_up_to_date(&binding, 99),
             "a no-entitlement binding with a no-grant status is current at any epoch"
+        );
+    }
+
+    #[cfg(feature = "grant")]
+    #[test]
+    fn grant_status_previously_bound_is_not_current_without_service() {
+        let binding = bound_with_grant(Some(3), Some(7));
+        assert!(
+            !tenant_binding_status_without_service_up_to_date(&binding),
+            "removing the service must invalidate a previously issued grant status"
         );
     }
 }

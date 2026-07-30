@@ -7136,24 +7136,33 @@ dependencies = [
 name = "hyprstream-k8s"
 version = "0.1.0"
 dependencies = [
- "anyhow",
  "async-trait",
- "ed25519-dalek 2.2.0",
  "futures",
- "hyprstream-pds",
  "hyprstream-rpc",
  "hyprstream-vfs",
  "k8s-openapi",
  "kube",
  "parking_lot 0.12.4",
- "rand 0.8.5",
  "schemars",
  "serde",
  "serde_json",
  "serde_yaml",
  "thiserror 1.0.69",
  "tokio",
+ "toml 0.8.23",
  "tracing",
+]
+
+[[package]]
+name = "hyprstream-k8s-pds"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "ed25519-dalek 2.2.0",
+ "hyprstream-k8s",
+ "hyprstream-pds",
+ "hyprstream-rpc",
+ "rand 0.8.5",
 ]
 
 [[package]]
