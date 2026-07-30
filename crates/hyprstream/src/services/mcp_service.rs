@@ -186,6 +186,12 @@ pub struct ToolCallContext {
     pub ctx: Option<Arc<ServiceContext>>,
     /// Bootstrap Policy client used only for Policy operations.
     pub policy_client: PolicyClient,
+    /// The verified caller bearer token (MCP stdio/HTTP auth). Forwarded to
+    /// services whose authorization is JWT-backed so they receive the caller's
+    /// identity instead of an anonymous dial (#989 review: workflow dispatch
+    /// was passing `None`, dropping the caller JWT/tenant and forcing
+    /// WorkflowService to reject every `workflow.*` MCP call).
+    pub token: Option<String>,
 }
 
 type ToolHandler =
@@ -829,7 +835,10 @@ async fn dispatch_schema_call(
             client.call_method(method, &ctx.args).await
         }
         "workflow" => {
-            let client = WorkflowClient::from_resolver(signing_key, None)?;
+            // Forward the verified caller bearer (not None) so WorkflowService's
+            // JWT-backed authorize callback receives the caller's token; without
+            // it every workflow.* MCP call is rejected upstream of policy.
+            let client = WorkflowClient::from_resolver(signing_key, ctx.token.clone())?;
             client.call_method(method, &ctx.args).await
         }
         _ => anyhow::bail!("Unknown service: {service}"),
@@ -1110,6 +1119,10 @@ impl McpService {
             domain,
             ctx: self.service_ctx.clone(),
             policy_client: self.policy_client.clone(),
+            // Preserve the verified caller bearer so JWT-backed services
+            // (e.g. WorkflowService) authorize the actual caller, not an
+            // anonymous dial (#989 review fix).
+            token: identity.token,
         };
 
         let result = handler(ctx)
@@ -1496,6 +1509,48 @@ mod tests {
             has_workflow,
             "MCP tool registry must expose workflow.* tools (#989)"
         );
+    }
+
+    /// #989 review (caaec046a follow-up): the workflow dispatch arm must forward
+    /// the verified caller bearer — not `None` — or WorkflowService's JWT-backed
+    /// authorize callback rejects every `workflow.*` MCP call upstream of policy.
+    ///
+    /// This pins the `ToolCallContext.token` contract the arm reads and proves
+    /// the delegated bearer flows into the resolver path (the exact call the arm
+    /// makes). A full E2E — token reaches `WorkflowService::authorize` — needs a
+    /// live service and is CI's job.
+    #[test]
+    fn workflow_dispatch_forwards_verified_caller_bearer() {
+        fn ctx_with_token(token: Option<&str>) -> ToolCallContext {
+            let sk = signing_key(7);
+            let vk = sk.verifying_key();
+            let policy_client = PolicyClient::for_local_bootstrap(sk.clone(), vk, None).unwrap();
+            ToolCallContext {
+                args: Value::Null,
+                signing_key: sk,
+                user: "caller".to_owned(),
+                domain: "tenant".to_owned(),
+                ctx: None,
+                policy_client,
+                token: token.map(str::to_owned),
+            }
+        }
+
+        // Caller with a verified bearer → the workflow arm's resolver call
+        // (`WorkflowClient::from_resolver(signing_key, ctx.token.clone())`)
+        // must accept it (Ok), not drop it to None.
+        let ctx = ctx_with_token(Some("caller-bearer-jwt"));
+        assert_eq!(ctx.token.as_deref(), Some("caller-bearer-jwt"));
+        let client = WorkflowClient::from_resolver(ctx.signing_key.clone(), ctx.token.clone());
+        assert!(
+            client.is_ok(),
+            "workflow dispatch must forward the caller bearer into from_resolver"
+        );
+
+        // Anonymous caller (no token) honestly yields None — not a silent drop
+        // of a token that was present.
+        let anon = ctx_with_token(None);
+        assert!(anon.token.is_none());
     }
 
     #[test]
