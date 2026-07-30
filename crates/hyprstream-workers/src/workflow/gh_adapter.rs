@@ -58,13 +58,35 @@ impl GitHubActionsAdapter {
 
     /// Scan a repository for `.github/workflows/*.yml`, parse each,
     /// register with WorkflowService, and build EventHandlers from triggers.
+    ///
+    /// Generic (non-gate) loader: parses in [`Legacy`](super::parser::ParseMode)
+    /// mode via [`WorkflowService::scan_repo`]. The merge gate opts into
+    /// strict mode via [`Self::load_repo_with`] (#1432).
     pub async fn load_repo(
         &mut self,
         repo_id: &str,
         service: &WorkflowService,
     ) -> Result<()> {
+        self.load_repo_with(repo_id, service, super::parser::ParseMode::Legacy).await
+    }
+
+    /// Load a repository's workflows with an explicit [`ParseMode`] (#1432).
+    ///
+    /// This is the **gate-specific boundary** for strict selection: a merge
+    /// gate calls `load_repo_with(repo, svc, ParseMode::Strict)` so that a
+    /// workflow file using unsupported semantics (`permissions:`,
+    /// `concurrency:`, `services:`) is refused rather than silently loaded
+    /// with dropped keys. In [`ParseMode::Legacy`] (the default for the
+    /// generic adapter) unknown keys are tolerated, preserving non-gate
+    /// caller compatibility (#1432 non-goal).
+    pub async fn load_repo_with(
+        &mut self,
+        repo_id: &str,
+        service: &WorkflowService,
+        mode: super::parser::ParseMode,
+    ) -> Result<()> {
         // Scan the repository for workflow files.
-        let workflow_defs = service.scan_repo(repo_id).await?;
+        let workflow_defs = service.scan_repo_with(repo_id, mode).await?;
 
         for def in workflow_defs {
             // Register the workflow definition.
@@ -80,6 +102,7 @@ impl GitHubActionsAdapter {
 
         tracing::info!(
             repo_id = %repo_id,
+            mode = ?mode,
             handler_count = self.handlers.len(),
             "Loaded repository workflows"
         );
