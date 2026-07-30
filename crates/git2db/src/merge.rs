@@ -329,28 +329,43 @@ impl<'a> CandidateComposer<'a> {
     ///
     /// Performs an octopus-style cumulative merge: starting from `base`'s tree
     /// as the accumulator, each head is folded in with a three-way
-    /// `merge_trees` step whose **ancestor is the per-head merge base** —
-    /// `merge_base(base, head)` — rather than `base` itself. Computing the
-    /// ancestor per head is what keeps a *stale* head (one branched off an
-    /// older base) from silently dropping changes that only exist in the
-    /// supplied `base`: libgit2 only interprets a side as "deleted" when the
-    /// ancestor had the content, so using each head's true divergence point
-    /// preserves base-only additions.
+    /// `merge_trees` step whose **ancestor is the merge base of the
+    /// accumulator and the head** — `merge_base(current_tip, head)` — not
+    /// `merge_base(base, head)`. Folding against the *evolving* accumulator
+    /// (not a fixed `base`) is what keeps a stacked head (one built on top of
+    /// an earlier head) from producing a false add/add conflict, and keeps a
+    /// revert head from silently losing its revert: the ancestor reflects
+    /// what the head actually diverged from given everything folded so far.
+    ///
+    /// To give git a commit to resolve `merge_base` against mid-fold, each
+    /// step anchors an **unreachable intermediate commit** (no ref) over the
+    /// accumulated tree; the next iteration resolves its merge base from that
+    /// tip. The returned candidate is the final **octopus** commit with
+    /// parents `[base, ...heads]` — the intermediates are scaffolding only.
     ///
     /// Because each `merge_trees` step is a pure function of its three trees,
     /// the resulting tree OID is stable across reruns for the same inputs.
-    ///
-    /// On success, writes a **detached** commit — referenced by no ref, HEAD
-    /// unchanged — whose parents are `base` **plus** the `heads`. Including
-    /// `base` as a parent makes the candidate a descendant of `base`, so a
-    /// branch at `base` can fast-forward onto the candidate.
     ///
     /// # Errors
     ///
     /// Returns [`Git2DBError::MergeConflictReport`] if any step conflicts,
     /// carrying the structured [`ConflictReport`] for that step. Returns
-    /// [`Git2DBError::InvalidOperation`] if `heads` is empty, or if a head
-    /// shares no merge base with `base` (unrelated history).
+    /// [`Git2DBError::InvalidOperation`] if `heads` is empty, if `base`
+    /// appears in `heads`, or if a head shares no merge base with the
+    /// accumulator (unrelated history).
+    ///
+    /// # Garbage collection
+    ///
+    /// Each fold step writes an unreachable intermediate commit, and the
+    /// returned candidate is detached (referenced by no ref). All become
+    /// GC-eligible under git's default prune window unless the caller lands
+    /// the candidate onto a ref.
+    ///
+    /// # Duplicate heads
+    ///
+    /// Folding the same head twice is harmless: the second fold's
+    /// `merge_base(current_tip, head)` resolves to `head` (already absorbed),
+    /// so `merge_trees` is a no-op. Callers need not deduplicate.
     pub fn compose_candidate(
         &self,
         base: Oid,
@@ -362,50 +377,67 @@ impl<'a> CandidateComposer<'a> {
                 "compose_candidate requires at least one head",
             ));
         }
+        if heads.contains(&base) {
+            return Err(Git2DBError::invalid_operation(
+                "compose_candidate: base must not appear in heads",
+            ));
+        }
 
-        // Resolve the base commit + tree up front; base is also preserved as
-        // the first parent of the candidate so the result descends from it.
         let base_commit = self.commit_of(base)?;
-        let base_tree = base_commit.tree()?;
+        let mut accumulator = base_commit.tree()?;
+        let sig = self.signature_or_fallback()?;
 
-        // Resolve each head's tree and its *per-head* merge-base tree with
-        // `base`. Using the true divergence point as the ancestor (rather than
-        // `base_tree`) is what prevents a stale head from dropping base-only
-        // changes — see the method doc.
-        let mut head_trees: Vec<Tree<'a>> = Vec::with_capacity(heads.len());
-        let mut head_ancestors: Vec<Tree<'a>> = Vec::with_capacity(heads.len());
+        // `current_tip` is the evolving accumulator's commit identity. It
+        // starts at `base` and is updated to an unreachable intermediate
+        // commit after each head so the NEXT head's merge-base resolves
+        // against the accumulated state, not against `base`.
+        let mut current_tip = base;
         let mut head_commits: Vec<git2::Commit<'a>> = Vec::with_capacity(heads.len());
+
         for &h in heads {
-            let commit = self.commit_of(h)?;
-            head_trees.push(commit.tree()?);
-            // The per-head merge base is the ancestor for this step. A NotFound
-            // (unrelated history) surfaces as InvalidOperation via merge_base.
-            let ancestor_oid = self.merge_base(base, h)?;
-            head_ancestors.push(self.tree_of(ancestor_oid)?);
-            head_commits.push(commit);
-        }
+            let head_commit = self.commit_of(h)?;
+            let head_tree = head_commit.tree()?;
 
-        // Sequential fold: `accumulator` starts at base's tree and absorbs
-        // each head using that head's own merge-base tree as the ancestor.
-        let mut accumulator = base_tree.clone();
-        for (head_tree, head_ancestor) in head_trees.iter().zip(head_ancestors.iter()) {
-            let step = self.merge_trees(head_ancestor, &accumulator, head_tree)?;
-            match step.tree {
-                Some(t) => accumulator = self.repo.find_tree(t).map_err(Git2DBError::from)?,
+            // Merge base of the *current accumulator* and this head. This is
+            // the fix for stacked/revert heads: resolving against the evolved
+            // accumulator (not `base`) avoids false conflicts and lost reverts.
+            // A NotFound (unrelated history) surfaces as InvalidOperation.
+            let ancestor_oid = self.merge_base(current_tip, h)?;
+            let ancestor_tree = self.tree_of(ancestor_oid)?;
+
+            let step = self.merge_trees(&ancestor_tree, &accumulator, &head_tree)?;
+            let merged_tree = match step.tree {
+                Some(t) => t,
                 None => return Err(Git2DBError::MergeConflictReport(step.conflicts)),
-            }
+            };
+            accumulator = self
+                .repo
+                .find_tree(merged_tree)
+                .map_err(Git2DBError::from)?;
+
+            // Anchor an unreachable intermediate commit so the next iteration
+            // can resolve merge_base against the evolved accumulator. Parents
+            // = [current_tip, head] reflect the true merge ancestry.
+            let tip_commit = self.commit_of(current_tip)?;
+            let inter_parents = [&tip_commit, &head_commit];
+            current_tip = self
+                .repo
+                .commit(
+                    None,
+                    &sig,
+                    &sig,
+                    "git2db-merge: intermediate (unreachable)",
+                    &accumulator,
+                    &inter_parents,
+                )
+                .map_err(|e| Git2DBError::internal(format!("intermediate commit failed: {e}")))?;
+
+            head_commits.push(head_commit);
         }
 
-        // Detached commit: update_ref = None → no ref update, no HEAD move.
-        // Parents = [base, ...heads]: base is preserved in ancestry so the
-        // candidate is a descendant of base (fast-forwardable).
-        // Fall back to a deterministic identity when the repo has no
-        // configured signature (e.g. a fresh test repository).
-        let sig = self
-            .repo
-            .signature()
-            .or_else(|_| git2::Signature::now("git2db-merge", "git2db@local"))
-            .map_err(|e| Git2DBError::internal(format!("signature resolution failed: {e}")))?;
+        // Final octopus commit: parents = [base, ...heads]. update_ref = None
+        // → no ref update, HEAD unchanged. base as first parent makes the
+        // candidate a descendant of base (fast-forwardable).
         let mut parents: Vec<&git2::Commit<'_>> = Vec::with_capacity(head_commits.len() + 1);
         parents.push(&base_commit);
         for hc in &head_commits {
@@ -420,6 +452,18 @@ impl<'a> CandidateComposer<'a> {
             commit: commit_oid,
             tree: accumulator.id(),
         })
+    }
+
+    /// Resolve a signature for candidate/intermediate commits, falling back to
+    /// a static identity when the repo has no configured git identity (e.g. a
+    /// fresh test repository). The fallback uses `Signature::now`, so its
+    /// timestamp is **not** stable across runs — but it only affects commit
+    /// OIDs, never tree OIDs (which are content-addressed and deterministic).
+    fn signature_or_fallback(&self) -> Git2DBResult<git2::Signature<'static>> {
+        self.repo
+            .signature()
+            .or_else(|_| git2::Signature::now("git2db-merge", "git2db@local"))
+            .map_err(|e| Git2DBError::internal(format!("signature resolution failed: {e}")))
     }
 
     fn tree_of(&self, oid: Oid) -> Git2DBResult<Tree<'a>> {

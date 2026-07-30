@@ -4,7 +4,12 @@
 //!  1. clean three-way merge → conflict-free tree,
 //!  2. conflicting merge → structured `ConflictReport` (path + side),
 //!  3. sequential composition of 3 heads → deterministic, stable tree OID,
-//!  4. detached candidate commit does not move HEAD.
+//!  4. detached candidate commit does not move HEAD,
+//!  5. per-head merge base keeps a stale head from dropping base-only changes,
+//!  6. candidate descends from base (fast-forwardable),
+//!  7. unrelated histories yield an empty merge-base set,
+//!  8. conflict count uses distinct paths,
+//!  9. stacked/revert heads fold correctly against the accumulated candidate.
 //!
 //! All fixtures are built directly with `git2` against a `tempfile::TempDir`,
 //! mirroring the convention in `v2_core_operations.rs`. No network, no
@@ -16,9 +21,12 @@ use tempfile::TempDir;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
-/// Deterministic identity so commits are reproducible regardless of host git
-/// config. Same author/committer/time-shape (via `now`) keeps tree OIDs
-/// independent of commit metadata — what we assert on.
+/// A fixed author/committer identity independent of host git config.
+///
+/// `Signature::now` embeds the **current wall clock**, so the resulting
+/// commit OIDs are *not* stable across runs. Tree OIDs, however, are
+/// content-addressed and fully deterministic — so every test asserts on
+/// tree content/OID, never on a commit OID's value.
 fn sig() -> Result<Signature<'static>> {
     Ok(Signature::now(
         "git2db-merge-tests",
@@ -423,6 +431,106 @@ fn conflict_count_uses_distinct_paths() -> Result<()> {
     assert!(
         display.starts_with("1 conflict(s)"),
         "Display must report 1 conflict, got: {display}"
+    );
+    Ok(())
+}
+
+// ---- Fable P1: fold against the accumulated candidate, not a fixed base.
+// A stacked head (built on an earlier head) and a revert head must not
+// produce false conflicts or silently lose changes. ----
+
+#[test]
+fn stacked_head_folds_without_false_conflict() -> Result<()> {
+    let (_dir, repo, base) = base_repo()?;
+    let base_commit = repo.find_commit(base)?;
+
+    // head1: adds `stacked.txt` off base.
+    let head1 = commit(
+        &repo,
+        "head1",
+        &write_tree(&repo, &[("README.md", "# base\n"), ("stacked.txt", "v1\n")])?,
+        &[&base_commit],
+        false,
+    )?;
+    // head2: STACKED on head1, modifies stacked.txt. Its true merge-base
+    // with the accumulator (== head1's tree after head1 is folded) is head1,
+    // NOT base — base never had stacked.txt.
+    let head2 = commit(
+        &repo,
+        "head2",
+        &write_tree(&repo, &[("README.md", "# base\n"), ("stacked.txt", "v2\n")])?,
+        &[&repo.find_commit(head1)?],
+        false,
+    )?;
+
+    let composer = CandidateComposer::new(&repo);
+    let candidate = composer.compose_candidate(base, &[head1, head2], "stacked fold")?;
+
+    // With the old fixed-base ancestor this was a false add/add conflict on
+    // stacked.txt; the correct fold yields v2 (head2's modification) cleanly.
+    let tree = repo.find_tree(candidate.tree)?;
+    let entry = tree
+        .get_name("stacked.txt")
+        .ok_or("stacked.txt missing from result")?;
+    let blob = repo.find_blob(entry.id())?;
+    assert_eq!(
+        blob.content(),
+        b"v2\n",
+        "stacked head's modification must land"
+    );
+    Ok(())
+}
+
+#[test]
+fn revert_head_is_not_silently_lost() -> Result<()> {
+    let (_dir, repo, base) = base_repo()?;
+    let base_commit = repo.find_commit(base)?;
+
+    // head1: modifies x.txt v1 → v2 (off base; base's x.txt == v1).
+    let head1 = commit(
+        &repo,
+        "head1",
+        &write_tree(&repo, &[("README.md", "# base\n"), ("x.txt", "v2\n")])?,
+        &[&base_commit],
+        false,
+    )?;
+    // head2: STACKED on head1, reverts x.txt back to v1.
+    let head2 = commit(
+        &repo,
+        "head2",
+        &write_tree(&repo, &[("README.md", "# base\n"), ("x.txt", "v1\n")])?,
+        &[&repo.find_commit(head1)?],
+        false,
+    )?;
+
+    let composer = CandidateComposer::new(&repo);
+    let candidate = composer.compose_candidate(base, &[head1, head2], "fold revert")?;
+
+    // With the old fixed-base ancestor the revert was lost: merge_trees saw
+    // theirs==ancestor(base=v1) and kept ours(=v2). Folding against the
+    // accumulated candidate (ancestor=head1=v2) correctly applies the revert.
+    let tree = repo.find_tree(candidate.tree)?;
+    let entry = tree.get_name("x.txt").ok_or("x.txt missing from result")?;
+    let blob = repo.find_blob(entry.id())?;
+    assert_eq!(
+        blob.content(),
+        b"v1\n",
+        "revert head must take effect, not be silently lost"
+    );
+    Ok(())
+}
+
+#[test]
+fn compose_candidate_rejects_base_in_heads() -> Result<()> {
+    let (_dir, repo, base) = base_repo()?;
+    let composer = CandidateComposer::new(&repo);
+    let err = match composer.compose_candidate(base, &[base], "base as head") {
+        Ok(c) => return Err(format!("expected an error, got candidate {c:?}").into()),
+        Err(e) => e,
+    };
+    assert!(
+        err.to_string().contains("base must not appear in heads"),
+        "expected base-in-heads error, got: {err}"
     );
     Ok(())
 }
