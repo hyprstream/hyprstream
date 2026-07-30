@@ -49,7 +49,7 @@ use hyprstream_rpc::latch::{Terminal, TerminalStore};
 use hyprstream_rpc::prelude::*;
 use hyprstream_rpc::events::EventPublisher;
 use hyprstream_rpc::registry::{global as registry, SocketKind};
-use hyprstream_rpc::transport::TransportConfig;
+use hyprstream_rpc::transport::{EndpointType, TransportConfig};
 use hyprstream_rpc::stream_info::TransportConfig as WireTransportConfig;
 use lru::LruCache;
 use std::collections::HashSet;
@@ -330,6 +330,82 @@ enum RouteDecision {
     NoHealthyCandidate,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReplicaLocality {
+    CoLocated,
+    Remote,
+}
+
+struct RoutedReplica<T> {
+    value: T,
+    replica_id: crate::services::router::ReplicaId,
+    locality: ReplicaLocality,
+}
+
+/// Apply affinity-preserving selection and bounded dial-failure reselection.
+///
+/// A remote failure is marked down before the next placement. The co-located
+/// value is returned only when the router explicitly selects that replica; an
+/// exhausted/empty set is an error, never an implicit local fallback.
+async fn route_and_dial_replica<T, F, Fut>(
+    router: &mut crate::services::router::CellRouter,
+    load_state: &[crate::services::router::InferenceServerInfo],
+    co_located: crate::services::router::ReplicaId,
+    session_id: &str,
+    local_value: T,
+    mut dial_remote: F,
+) -> Result<RoutedReplica<T>>
+where
+    F: FnMut(crate::services::router::InferenceServerInfo) -> Fut,
+    Fut: std::future::Future<Output = Result<T>>,
+{
+    let mut local_value = Some(local_value);
+    let mut failures = Vec::new();
+    for _ in 0..load_state.len() {
+        let now = Instant::now();
+        match ModelService::route_decision(router, load_state, co_located, session_id, now) {
+            RouteDecision::CoLocated => {
+                let value = local_value
+                    .take()
+                    .ok_or_else(|| anyhow!("co-located inference client was already consumed"))?;
+                return Ok(RoutedReplica {
+                    value,
+                    replica_id: co_located,
+                    locality: ReplicaLocality::CoLocated,
+                });
+            }
+            RouteDecision::Remote(replica_id) => {
+                let candidate = load_state
+                    .iter()
+                    .find(|candidate| candidate.replica_id == replica_id)
+                    .cloned()
+                    .ok_or_else(|| anyhow!("router selected an absent replica"))?;
+                match dial_remote(candidate).await {
+                    Ok(value) => {
+                        return Ok(RoutedReplica {
+                            value,
+                            replica_id,
+                            locality: ReplicaLocality::Remote,
+                        });
+                    }
+                    Err(error) => {
+                        router.report_dial_fail(replica_id, now);
+                        failures.push(format!("{}: {error}", hex::encode(replica_id.as_bytes())));
+                    }
+                }
+            }
+            RouteDecision::NoHealthyCandidate => break,
+        }
+    }
+    if failures.is_empty() {
+        anyhow::bail!("no healthy inference replica candidates");
+    }
+    anyhow::bail!(
+        "inference replica candidates exhausted after dial/authorization failures: {}",
+        failures.join("; ")
+    )
+}
+
 impl ModelService {
     /// Create a new model service with infrastructure
     pub async fn new(
@@ -536,14 +612,11 @@ impl ModelService {
     /// `CellRouter::place`) over the P1 candidate set resolved into
     /// `load_state`.
     ///
-    /// Today a model still maps 1:1 to one co-located InferenceService in the
-    /// common case, so `load_state` has a single entry and HRW trivially picks
-    /// it; the fast path returns the in-process `model.client` directly (no
-    /// dial). `load_state` grows to multiple entries once cross-host replicas
-    /// are resolved into it (tracked separately — see the module-level P3 PR
-    /// notes). A placement identifier never supplies transport reach, a signer
-    /// key, or an authorization subject. A future cross-host path must resolve
-    /// and verify those roles independently before dialing (#282).
+    /// A co-located selection returns the in-process client directly. A remote
+    /// selection treats its transport only as a selector into Discovery's
+    /// checkpoint-current, identity-bound candidate set. Resolution,
+    /// authorization, readiness, or dial failure marks that replica down and
+    /// re-runs placement; exhaustion fails closed.
     ///
     /// `session_id` is the placement key (defaults to "default" when the caller
     /// has no session — keeps HRW stable for non-session-scoped requests like
@@ -552,28 +625,56 @@ impl ModelService {
         &self,
         model: &mut LoadedModel,
         session_id: &str,
-    ) -> InferenceClient {
-        let now = Instant::now();
+        bearer: &str,
+    ) -> Result<InferenceClient> {
         let co_located = Self::co_located_replica_id(model);
-        match Self::route_decision(&mut model.router, &model.load_state, co_located, session_id, now) {
-            RouteDecision::CoLocated => model.client.clone(),
-            RouteDecision::Remote(replica_id) => {
-                debug!(
-                    "router placed session {session_id} on remote replica {:?}, but placement \
-                     carries no reach or authority and no networked dial path is wired yet \
-                     (#282) — using co-located fallback",
-                    replica_id
-                );
-                model.client.clone()
-            }
-            RouteDecision::NoHealthyCandidate => {
-                warn!(
-                    "router found no healthy placement for session {session_id} \
-                     (replica set empty or every entry excluded) — using co-located fallback"
-                );
-                model.client.clone()
-            }
-        }
+        let resolution_service_name = model.instance.service_name();
+        let signing_key = self.signing_key.clone();
+        let bearer = bearer.to_owned();
+        let routed = route_and_dial_replica(
+            &mut model.router,
+            &model.load_state,
+            co_located,
+            session_id,
+            model.client.clone(),
+            move |candidate| {
+                let resolution_service_name = resolution_service_name.clone();
+                let signing_key = signing_key.clone();
+                let bearer = bearer.clone();
+                async move {
+                    anyhow::ensure!(
+                        matches!(
+                            &candidate.transport.endpoint,
+                            EndpointType::Quic { .. } | EndpointType::Iroh { .. }
+                        ),
+                        "remote inference replica advertised a non-network transport"
+                    );
+                    let rpc = hyprstream_discovery::production_inference_rpc_client_at_transport(
+                        &resolution_service_name,
+                        &candidate.transport,
+                        signing_key,
+                        None,
+                    )?;
+                    let client = InferenceClient::new(rpc)
+                        .with_delegated_bearer(bearer);
+                    anyhow::ensure!(
+                        client.is_ready().await?,
+                        "remote inference replica is not ready"
+                    );
+                    Ok(client)
+                }
+            },
+        )
+        .await?;
+        info!(
+            replica_id = %hex::encode(routed.replica_id.as_bytes()),
+            locality = ?routed.locality,
+            session_id,
+            tenant = model.instance.tenant(),
+            model_ref = model.instance.model_ref(),
+            "selected inference replica"
+        );
+        Ok(routed.value)
     }
 
     /// Opaque placement identifier for the co-located InferenceService.
@@ -1161,10 +1262,12 @@ impl ModelService {
         // swap it in here — the router body is session_id-keyed, not
         // subject-keyed, by design.
         let placement_key = ctx.subject().to_string();
-        let client = self.select_inference_server(model, &placement_key).await;
         let bearer = ctx
             .jwt_token()
             .ok_or_else(|| anyhow!("inference dispatch requires a verified bearer token"))?;
+        let client = self
+            .select_inference_server(model, &placement_key, bearer)
+            .await?;
         Ok(client.with_delegated_bearer(bearer.to_owned()))
     }
 
@@ -2509,6 +2612,120 @@ mod tests {
             Instant::now(),
         );
         assert_eq!(decision, RouteDecision::NoHealthyCandidate);
+    }
+
+    #[tokio::test]
+    async fn replica_dial_local_uses_fast_path_without_remote_attempt() {
+        let co_located = crate::services::router::ReplicaId::from_bytes([0x10; 32]);
+        let mut router = CellRouter::default();
+        let routed = route_and_dial_replica(
+            &mut router,
+            &[server(0x10, 1024, 0)],
+            co_located,
+            "sess-local",
+            "local-client",
+            |_candidate| async move {
+                panic!("co-located selection must not dial a remote transport")
+            },
+        )
+        .await
+        .unwrap_or_else(|error| panic!("local fast path failed: {error}"));
+        assert_eq!(routed.value, "local-client");
+        assert_eq!(routed.locality, ReplicaLocality::CoLocated);
+    }
+
+    #[tokio::test]
+    async fn replica_dial_remote_success_returns_remote_not_local() {
+        let co_located = crate::services::router::ReplicaId::from_bytes([0x10; 32]);
+        let remote = crate::services::router::ReplicaId::from_bytes([0x20; 32]);
+        let mut router = CellRouter::default();
+        let routed = route_and_dial_replica(
+            &mut router,
+            &[server(0x20, 1024, 0)],
+            co_located,
+            "sess-remote",
+            "local-client",
+            move |candidate| async move {
+                assert_eq!(candidate.replica_id, remote);
+                Ok("remote-client")
+            },
+        )
+        .await
+        .unwrap_or_else(|error| panic!("remote dial failed: {error}"));
+        assert_eq!(routed.value, "remote-client");
+        assert_eq!(routed.replica_id, remote);
+        assert_eq!(routed.locality, ReplicaLocality::Remote);
+    }
+
+    #[tokio::test]
+    async fn replica_dial_unauthorized_fails_closed_without_local_fallback() {
+        let co_located = crate::services::router::ReplicaId::from_bytes([0x10; 32]);
+        let remote = crate::services::router::ReplicaId::from_bytes([0x20; 32]);
+        let mut router = CellRouter::default();
+        let error = route_and_dial_replica(
+            &mut router,
+            &[server(0x20, 1024, 0)],
+            co_located,
+            "sess-unauthorized",
+            "local-client",
+            |_candidate| async move {
+                Err::<&str, _>(anyhow!("selected reach is not authorized"))
+            },
+        )
+        .await
+        .err()
+        .unwrap_or_else(|| panic!("unauthorized remote must fail"));
+        assert!(error.to_string().contains("not authorized"));
+        assert!(router.is_excluded(remote, Instant::now()).is_some());
+    }
+
+    #[tokio::test]
+    async fn replica_dial_unreachable_marks_down_and_reselects() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let co_located = crate::services::router::ReplicaId::from_bytes([0x10; 32]);
+        let load_state = vec![server(0x20, 1024, 0), server(0x30, 1024, 0)];
+        let mut router = CellRouter::default();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let dial_attempts = Arc::clone(&attempts);
+        let routed = route_and_dial_replica(
+            &mut router,
+            &load_state,
+            co_located,
+            "sess-reselect",
+            "local-client",
+            move |_candidate| {
+                let dial_attempts = Arc::clone(&dial_attempts);
+                async move {
+                    if dial_attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                        anyhow::bail!("remote unreachable");
+                    }
+                    Ok("remote-client")
+                }
+            },
+        )
+        .await
+        .unwrap_or_else(|error| panic!("second remote should be selected: {error}"));
+        assert_eq!(routed.value, "remote-client");
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn replica_dial_no_candidate_fails_closed() {
+        let co_located = crate::services::router::ReplicaId::from_bytes([0x10; 32]);
+        let mut router = CellRouter::default();
+        let error = route_and_dial_replica(
+            &mut router,
+            &[],
+            co_located,
+            "sess-empty",
+            "local-client",
+            |_candidate| async move { Ok("remote-client") },
+        )
+        .await
+        .err()
+        .unwrap_or_else(|| panic!("empty replica set must fail"));
+        assert_eq!(error.to_string(), "no healthy inference replica candidates");
     }
 
 }

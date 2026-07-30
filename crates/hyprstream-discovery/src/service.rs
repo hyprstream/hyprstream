@@ -2985,6 +2985,38 @@ pub fn production_rpc_client(
         .ok_or_else(|| anyhow::anyhow!("checkpoint-backed production resolver is not installed"))?;
     Ok(Arc::new(ProductionRpcClient::new(
         service_name,
+        service_name,
+        None,
+        signing_key,
+        token,
+        resolver,
+    )?))
+}
+
+/// Construct a production RPC client pinned to one router-selected advertised
+/// reach while retaining Discovery's opaque identity/currentness authority.
+///
+/// `resolution_service_name` selects the accepted dynamic inference entry.
+/// The generated RPC schema domain remains hard-bound to canonical
+/// `inference`; callers cannot choose a different application authority.
+///
+/// The selected reach is only a selector. It grants no authority: every call
+/// must still find that exact reach in the checkpoint-current, same-authority
+/// candidate set before Discovery constructs the crypto-bound dial.
+pub fn production_inference_rpc_client_at_transport(
+    resolution_service_name: &str,
+    selected_transport: &TransportConfig,
+    signing_key: SigningKey,
+    token: Option<String>,
+) -> Result<Arc<dyn RpcClient>> {
+    let resolver = PRODUCTION_RESOLVER
+        .get()
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("checkpoint-backed production resolver is not installed"))?;
+    Ok(Arc::new(ProductionRpcClient::new(
+        resolution_service_name,
+        "inference",
+        Some(selected_transport.clone()),
         signing_key,
         token,
         resolver,
@@ -3016,7 +3048,9 @@ pub fn production_browser_currentness_verifier() -> Result<Arc<dyn BrowserCurren
 }
 
 struct ProductionRpcClient {
-    service_name: String,
+    resolution_service_name: String,
+    service_domain: String,
+    selected_transport: Option<TransportConfig>,
     signing_key: SigningKey,
     token: Option<String>,
     resolver: Arc<DiscoveryServiceResolver>,
@@ -3025,20 +3059,29 @@ struct ProductionRpcClient {
 
 impl ProductionRpcClient {
     fn new(
-        service_name: &str,
+        resolution_service_name: &str,
+        service_domain: &str,
+        selected_transport: Option<TransportConfig>,
         signing_key: SigningKey,
         token: Option<String>,
         resolver: Arc<DiscoveryServiceResolver>,
     ) -> Result<Self> {
-        anyhow::ensure!(
-            !service_name.is_empty()
-                && service_name
-                    .bytes()
-                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-'),
-            "service name is not canonical"
-        );
+        for (label, name) in [
+            ("resolution service name", resolution_service_name),
+            ("service domain", service_domain),
+        ] {
+            anyhow::ensure!(
+                !name.is_empty()
+                    && name
+                        .bytes()
+                        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-'),
+                "{label} is not canonical"
+            );
+        }
         Ok(Self {
-            service_name: service_name.to_owned(),
+            resolution_service_name: resolution_service_name.to_owned(),
+            service_domain: service_domain.to_owned(),
+            selected_transport,
             signing_key,
             token,
             resolver,
@@ -3046,9 +3089,9 @@ impl ProductionRpcClient {
         })
     }
     async fn snapshots(&self) -> Result<Vec<ResolvedService>> {
-        let query = ServiceQuery::network(self.service_name.clone())?;
+        let query = ServiceQuery::network(self.resolution_service_name.clone())?;
         let max_attempts = query.max_attempts;
-        let snapshots = self.resolver.resolve_service_candidates(query).await?;
+        let mut snapshots = self.resolver.resolve_service_candidates(query).await?;
         let authority = snapshots
             .first()
             .ok_or_else(|| anyhow::anyhow!("resolver returned no validated alternatives"))?;
@@ -3056,6 +3099,14 @@ impl ProductionRpcClient {
             snapshots.iter().all(|item| item.same_authority(authority)),
             "resolver retry set crosses service authority"
         );
+        if let Some(selected) = &self.selected_transport {
+            snapshots.retain(|snapshot| snapshot.transport() == selected);
+            anyhow::ensure!(
+                !snapshots.is_empty(),
+                "router-selected reach is not a current authorized candidate for service '{}'",
+                self.resolution_service_name
+            );
+        }
         Ok(snapshots.into_iter().take(max_attempts).collect())
     }
     fn client_for(&self, snapshot: &ResolvedService) -> Result<Arc<dyn RpcClient>> {
@@ -3136,7 +3187,7 @@ impl RpcClient for ProductionRpcClient {
     }
     async fn call_for_service(&self, service: &str, payload: Vec<u8>) -> Result<Vec<u8>> {
         anyhow::ensure!(
-            service == self.service_name,
+            service == self.service_domain,
             "generated service authority mismatch"
         );
         let service = service.to_owned();
@@ -3156,7 +3207,7 @@ impl RpcClient for ProductionRpcClient {
         payload: Vec<u8>,
     ) -> Result<Vec<u8>> {
         anyhow::ensure!(
-            service == self.service_name,
+            service == self.service_domain,
             "generated service authority mismatch"
         );
         let service = service.to_owned();
@@ -3190,7 +3241,7 @@ impl RpcClient for ProductionRpcClient {
         options: CallOptions,
     ) -> Result<Vec<u8>> {
         anyhow::ensure!(
-            service == self.service_name,
+            service == self.service_domain,
             "generated service authority mismatch"
         );
         let service = service.to_owned();
@@ -3212,7 +3263,7 @@ impl RpcClient for ProductionRpcClient {
         options: CallOptions,
     ) -> Result<Vec<u8>> {
         anyhow::ensure!(
-            service == self.service_name,
+            service == self.service_domain,
             "generated service authority mismatch"
         );
         let service = service.to_owned();
@@ -3245,7 +3296,7 @@ impl RpcClient for ProductionRpcClient {
         ephemeral: [u8; 32],
     ) -> Result<Vec<u8>> {
         anyhow::ensure!(
-            service == self.service_name,
+            service == self.service_domain,
             "generated service authority mismatch"
         );
         let service = service.to_owned();
@@ -3266,7 +3317,7 @@ impl RpcClient for ProductionRpcClient {
         options: CallOptions,
     ) -> Result<Vec<u8>> {
         anyhow::ensure!(
-            service == self.service_name,
+            service == self.service_domain,
             "generated service authority mismatch"
         );
         let service = service.to_owned();
@@ -3291,7 +3342,7 @@ impl RpcClient for ProductionRpcClient {
         ephemeral: [u8; 32],
     ) -> Result<Vec<u8>> {
         anyhow::ensure!(
-            service == self.service_name,
+            service == self.service_domain,
             "generated service authority mismatch"
         );
         let service = service.to_owned();
@@ -3316,7 +3367,7 @@ impl RpcClient for ProductionRpcClient {
         options: CallOptions,
     ) -> Result<Vec<u8>> {
         anyhow::ensure!(
-            service == self.service_name,
+            service == self.service_domain,
             "generated service authority mismatch"
         );
         let service = service.to_owned();
@@ -4557,6 +4608,52 @@ mod resolver_tests {
             .resolve_service(ServiceQuery::network("model").expect("query"))
             .await
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn router_selected_reach_must_match_current_authorized_candidate() {
+        let (resolver, _) = production_fixture(false);
+        let expected = resolver
+            .resolve_service_candidates(ServiceQuery::network("model").expect("query"))
+            .await
+            .expect("candidate")
+            .remove(0)
+            .transport()
+            .clone();
+        let client = ProductionRpcClient::new(
+            "model",
+            "inference",
+            Some(expected),
+            SigningKey::from_bytes(&[0x71; 32]),
+            None,
+            Arc::new(resolver),
+        )
+        .expect("selected client");
+        assert_eq!(client.snapshots().await.expect("selected snapshot").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn router_selected_reach_rejects_unadvertised_transport_and_wrong_domain() {
+        let (resolver, _) = production_fixture(false);
+        let client = ProductionRpcClient::new(
+            "model",
+            "inference",
+            Some(TransportConfig::inproc("attacker-selected")),
+            SigningKey::from_bytes(&[0x72; 32]),
+            None,
+            Arc::new(resolver),
+        )
+        .expect("selected client");
+        let reach_error = match client.snapshots().await {
+            Ok(_) => panic!("unadvertised transport was authorized"),
+            Err(error) => error,
+        };
+        assert!(reach_error.to_string().contains("not a current authorized candidate"));
+        let domain_error = client
+            .call_for_service("model", Vec::new())
+            .await
+            .expect_err("resolution name was accepted as generated domain");
+        assert!(domain_error.to_string().contains("authority mismatch"));
     }
 
     #[tokio::test]
