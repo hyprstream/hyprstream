@@ -681,48 +681,61 @@ impl WorkflowService {
             .collect())
     }
 
-    /// Rescan a repository for workflow changes.
+    /// Rescan a repository for workflow changes (generic, non-persisting).
     ///
-    /// Retains the per-repo parse mode: a repo loaded in strict mode (via
-    /// `set_repo_mode` / `load_repo_with`) is rescanned in strict mode; a
-    /// repo that never opted in defaults to [`ParseMode::Legacy`]. This is
-    /// the generic entry point used by the event-triggered rescan path
-    /// (`HandlerResult::Rescan`) and `initialize`, so a gate's strict choice
-    /// survives push-triggered rescans rather than silently dropping back to
-    /// legacy (#1432 P1).
+    /// Resolves the per-repo parse mode and rescans in that mode, but does
+    /// **not** write the mode back to the store. This is the entry point used
+    /// by the event-triggered rescan path (`HandlerResult::Rescan`) and
+    /// `initialize`. Because it never persists, a concurrent generic rescan
+    /// that read a stale [`ParseMode::Legacy`] before a gate selected strict
+    /// cannot overwrite the newer strict selection (#1432 race fix): only the
+    /// explicit boundaries ([`Self::rescan_repo_with`], `load_repo_with`)
+    /// write the mode.
     pub async fn rescan_repo(&self, repo_id: &str) -> Result<()> {
         let mode = self.repo_mode(repo_id).await;
-        self.rescan_repo_with(repo_id, mode).await
+        self.rescan_inner(repo_id, mode).await
     }
 
-    /// Rescan a repository with an explicit [`ParseMode`] (#1432).
+    /// Rescan a repository with an explicit [`ParseMode`] (#1432 boundary).
     ///
-    /// The mode is **persisted** per-repo (via [`Self::set_repo_mode`]) so
-    /// that later event-triggered rescans through the generic
-    /// [`Self::rescan_repo`] retain it rather than silently dropping back to
-    /// legacy — regardless of whether strict was first selected via
-    /// `load_repo_with` or directly here.
+    /// **Persists** the mode per-repo (via [`Self::set_repo_mode`]) so that
+    /// later event-triggered rescans through the generic [`Self::rescan_repo`]
+    /// retain it. This is the explicit selection point: a gate calls this
+    /// (or `load_repo_with`) to opt into strict. The generic `rescan_repo`
+    /// does **not** persist, so it cannot clobber this selection.
     ///
-    /// **Fail-closed stale eviction:** a workflow that was previously
-    /// registered for this repo but is *absent* from the fresh scan set —
-    /// because it was rejected by strict mode, deleted, or otherwise failed
-    /// to parse — is **evicted** from the registry (via
-    /// [`Self::evict_stale_for_repo`]). Once evicted, [`Self::dispatch`]
-    /// returns
+    /// **Fail-closed stale eviction:** a workflow previously registered for
+    /// this repo but absent from the fresh scan set — because it was rejected
+    /// by strict mode, deleted, or otherwise failed to parse — is **evicted**
+    /// from the registry (via [`Self::evict_stale_for_repo`]). Once evicted,
+    /// [`Self::dispatch`] returns
     /// [`WorkflowNotFound`](crate::error::WorkerError::WorkflowNotFound) for
-    /// that id, so any lingering adapter handler built against the old
-    /// version can no longer dispatch it.
+    /// that id, so any lingering adapter handler built against the old version
+    /// can no longer dispatch it.
     pub async fn rescan_repo_with(
         &self,
         repo_id: &str,
         mode: super::parser::ParseMode,
     ) -> Result<()> {
-        // Persist the mode so the generic rescan path retains it (#1432):
-        // a caller that enters strict via rescan_repo_with directly (rather
-        // than load_repo_with) must still have its choice survive later
-        // event-triggered rescan_repo(repo) calls.
+        // Explicit selection: persist so the generic rescan path retains it.
+        // Only this boundary (and load_repo_with) writes the mode — the
+        // generic rescan_repo deliberately does not, to avoid a stale Legacy
+        // read overwriting a newer explicit Strict selection (#1432).
         self.set_repo_mode(repo_id, mode).await;
+        self.rescan_inner(repo_id, mode).await
+    }
 
+    /// Internal scan+evict+register worker (no mode persistence).
+    ///
+    /// Shared by [`Self::rescan_repo`] (generic, non-persisting) and
+    /// [`Self::rescan_repo_with`] (explicit, persisting). Keeping the mode
+    /// write out of this inner worker is what prevents a concurrent generic
+    /// Legacy rescan from overwriting a newer explicit Strict selection.
+    async fn rescan_inner(
+        &self,
+        repo_id: &str,
+        mode: super::parser::ParseMode,
+    ) -> Result<()> {
         let workflows = self.scan_repo_with(repo_id, mode).await?;
 
         // Fresh set of workflow ids for this repo, per the scan.
@@ -1351,6 +1364,92 @@ jobs:
             "rescan_repo_with(Strict) must persist the mode: a later generic \
              rescan_repo must stay strict and skip+evict the unknown-key workflow, \
              not silently fall back to legacy"
+        );
+        Ok(())
+    }
+
+    // ─── Rev 6 P1: generic rescan must NOT overwrite an explicit selection ──
+
+    #[tokio::test]
+    async fn generic_rescan_does_not_overwrite_explicit_strict_selection() -> TestResult {
+        // The generic rescan_repo(repo) resolves the stored mode and rescans
+        // in it but must NOT persist — otherwise a generic rescan that read a
+        // stale Legacy could clobber a newer explicit Strict selection.
+        // Enter strict explicitly, then run a generic rescan, then verify the
+        // mode is still strict behaviorally (a later generic rescan after an
+        // unknown-key mutation skips+evicts).
+        let tmp = tempfile::tempdir()?;
+        write_workflow(tmp.path(), KNOWN_YAML).await?;
+
+        let svc = test_service();
+        svc.register_repo_path("acme", PathBuf::from(tmp.path())).await;
+
+        // Explicit strict selection.
+        svc.rescan_repo_with("acme", super::super::parser::ParseMode::Strict)
+            .await?;
+        let wf_id = String::from("acme:.github/workflows/gate.yml");
+        assert!(workflow_ids(&svc.list_workflows().await?).contains(&wf_id));
+
+        // A generic rescan in between must not downgrade the stored mode.
+        svc.rescan_repo("acme").await?;
+        assert!(workflow_ids(&svc.list_workflows().await?).contains(&wf_id));
+
+        // Now mutate to add an unknown key. A generic rescan must STILL be
+        // strict (the intermediate generic rescan did not overwrite it).
+        write_workflow(tmp.path(), UNKNOWN_KEY_YAML).await?;
+        svc.rescan_repo("acme").await?;
+        assert!(
+            !workflow_ids(&svc.list_workflows().await?).contains(&wf_id),
+            "generic rescan must not overwrite the explicit strict selection: \
+             the intermediate rescan_repo(repo) should have left the stored \
+             mode as Strict"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn concurrent_generic_rescans_cannot_clobber_explicit_strict() -> TestResult {
+        use std::sync::Arc;
+        // Race invariant: regardless of how generic rescans interleave with
+        // an explicit strict selection, the final stored mode must be Strict
+        // (because only rescan_repo_with / load_repo_with persist; the generic
+        // rescan_repo never writes). Asserted behaviorally: after the batch,
+        // a generic rescan of an unknown-key workflow skips+evicts it.
+        let tmp = tempfile::tempdir()?;
+        write_workflow(tmp.path(), KNOWN_YAML).await?;
+        let root = tmp.path().to_owned();
+
+        let svc = Arc::new(test_service());
+        svc.register_repo_path("acme", PathBuf::from(&root)).await;
+
+        // Run an explicit strict selection concurrently with several generic
+        // rescans. The explicit one is the only writer.
+        let mut handles = Vec::new();
+        handles.push({
+            let svc = Arc::clone(&svc);
+            tokio::spawn(async move {
+                svc.rescan_repo_with("acme", super::super::parser::ParseMode::Strict).await
+            })
+        });
+        for _ in 0..4 {
+            let svc = Arc::clone(&svc);
+            handles.push(tokio::spawn(async move { svc.rescan_repo("acme").await }));
+        }
+        for h in handles {
+            h.await.map_err(|e| format!("join error: {e}"))??;
+        }
+
+        // Mutate to add an unknown key; a generic rescan must be strict.
+        write_workflow(&root, UNKNOWN_KEY_YAML).await?;
+        svc.rescan_repo("acme").await?;
+
+        let wf_id = String::from("acme:.github/workflows/gate.yml");
+        let listed = svc.list_workflows().await?;
+        assert!(
+            !workflow_ids(&listed).contains(&wf_id),
+            "after concurrent generic rescans interleaved with one explicit \
+             strict selection, the stored mode must remain Strict — the \
+             generic rescans must not have overwritten it"
         );
         Ok(())
     }
