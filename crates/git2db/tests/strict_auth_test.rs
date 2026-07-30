@@ -168,3 +168,30 @@ fn ambient_presets_opt_into_allow_ambient() {
     );
     assert_eq!(presets::public_only().auth_mode(), AuthMode::AllowAmbient);
 }
+
+// ---------------------------------------------------------------------------
+// NetworkConfig default — ambient must be off by default (issue #1429).
+// ---------------------------------------------------------------------------
+
+/// `use_credential_helper` must default to `false` so ordinary `GitManager`
+/// clones do not opt into ambient credential discovery (SSH agent / credential
+/// helper / ~/.gitconfig) by default.
+#[test]
+fn use_credential_helper_defaults_to_false() {
+    use git2db::config::NetworkConfig;
+    let cfg = NetworkConfig::default();
+    assert!(
+        !cfg.use_credential_helper,
+        "use_credential_helper must default to false (got true); ordinary clones must not \
+         consult ambient credentials unless explicitly enabled",
+    );
+}
+
+/// `AuthStrategy::is_ambient()` classifies `Default` and `SshAgent` as ambient
+/// (the two environment-backed strategies), and explicit strategies as not.
+#[test]
+fn is_ambient_classifies_environment_sources() {
+    assert!(AuthStrategy::Default.is_ambient());
+    assert!(AuthStrategy::SshAgent { username: None }.is_ambient());
+    assert!(!AuthStrategy::Token { token: "t".into() }.is_ambient());
+}

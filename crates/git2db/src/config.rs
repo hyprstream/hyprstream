@@ -45,8 +45,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 /// Main configuration for git2db operations
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[derive(Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Git2DBConfig {
     /// Repository management configuration
     pub repository: RepositoryConfig,
@@ -68,7 +67,6 @@ pub struct Git2DBConfig {
     #[serde(default)]
     pub xet: XetConfig,
 }
-
 
 impl Git2DBConfig {
     /// Create a configuration builder with git2db defaults
@@ -140,7 +138,7 @@ impl Git2DBConfig {
             .set_default("network.retry_base_delay_ms", 500u64)?
             .set_default("network.retry_max_delay_secs", 10u64)?
             .set_default("network.user_agent", format!("git2db/{}", crate::VERSION))?
-            .set_default("network.use_credential_helper", true)?
+            .set_default("network.use_credential_helper", false)?
             .set_default("performance.max_repo_cache", 100)?
             .set_default("performance.repo_cache_ttl_secs", 300u64)?
             .set_default("performance.auto_cleanup", true)?
@@ -282,7 +280,12 @@ pub struct NetworkConfig {
 }
 
 fn default_use_credential_helper() -> bool {
-    true
+    // Default off: ambient credential discovery (git credential helper,
+    // ~/.gitconfig, SSH agent) is an explicit opt-in. The secure default for
+    // git2db clones is strict certificates + ExplicitOnly auth, so an
+    // untrusted/forge-facing fetch cannot pick up operator credentials. See
+    // issue #1429.
+    false
 }
 
 fn default_network_timeout_secs() -> u64 {
@@ -324,7 +327,6 @@ fn default_cleanup_interval_secs() -> u64 {
 fn default_max_concurrent_ops() -> usize {
     10
 }
-
 
 impl Default for NetworkConfig {
     fn default() -> Self {
@@ -641,7 +643,6 @@ impl Default for WorktreeConfig {
         }
     }
 }
-
 
 /// XET large file storage configuration
 ///

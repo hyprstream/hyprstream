@@ -27,6 +27,19 @@ pub enum AuthStrategy {
     Default,
 }
 
+impl AuthStrategy {
+    /// Whether this strategy consults **ambient** credential sources — the
+    /// running SSH agent (`ssh_key_from_agent`), the git credential helper,
+    /// or `~/.gitconfig` — rather than explicit material the caller provided.
+    ///
+    /// `Default` and `SshAgent` are ambient. `SshKey` (explicit file path),
+    /// `UserPass`, and `Token` are explicit and always honored, including
+    /// under [`crate::callback_config::AuthMode::ExplicitOnly`].
+    pub fn is_ambient(&self) -> bool {
+        matches!(self, AuthStrategy::Default | AuthStrategy::SshAgent { .. })
+    }
+}
+
 /// Credential manager for handling authentication.
 ///
 /// Defaults to a **strict** security posture:
@@ -116,15 +129,15 @@ impl AuthManager {
         info!("Username from URL: {:?}", username_from_url);
         info!("Allowed credential types: {:?}", allowed_types);
 
-        // Try each strategy in order. Under ExplicitOnly, AuthStrategy::Default
-        // (ambient credential discovery) is refused so an untrusted fetch
-        // cannot silently pick up operator credentials.
+        // Try each strategy in order. Under ExplicitOnly, ambient strategies
+        // (AuthStrategy::Default → git credential helper / ~/.gitconfig;
+        // AuthStrategy::SshAgent → ssh-agent loaded keys) are refused so an
+        // untrusted fetch cannot silently pick up the operator's credentials.
         for strategy in &self.strategies {
-            if matches!(auth_mode, AuthMode::ExplicitOnly)
-                && matches!(strategy, AuthStrategy::Default)
-            {
+            if matches!(auth_mode, AuthMode::ExplicitOnly) && strategy.is_ambient() {
                 debug!(
-                    "Refusing ambient AuthStrategy::Default for {url} under ExplicitOnly auth mode"
+                    "Refusing ambient strategy {:?} for {url} under ExplicitOnly auth mode",
+                    strategy
                 );
                 continue;
             }
@@ -143,8 +156,8 @@ impl AuthManager {
         warn!("All authentication strategies failed for {}", url);
         if matches!(auth_mode, AuthMode::ExplicitOnly) {
             Err(git2::Error::from_str(
-                "No suitable explicit authentication method (ambient discovery refused under \
-                 ExplicitOnly auth mode)",
+                "No suitable explicit authentication method (ambient discovery — credential \
+                 helper, ~/.gitconfig, SSH agent — refused under ExplicitOnly auth mode)",
             ))
         } else {
             Err(git2::Error::from_str("No suitable authentication method"))

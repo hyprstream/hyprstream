@@ -71,24 +71,27 @@ pub enum CertificateConfig {
 /// Authentication provenance mode — whether ambient credential sources may be
 /// consulted.
 ///
-/// `ExplicitOnly` (the default) refuses [`AuthStrategy::Default`], which maps
-/// to libgit2's ambient credential discovery (`git credential` helper,
-/// `~/.gitconfig`, SSH agent fallback). This prevents an untrusted fetch from
-/// silently picking up the operator's personal credentials. Callers that
-/// intentionally want ambient discovery (e.g. a trusted first-party mirror
+/// `ExplicitOnly` (the default) refuses ambient strategies —
+/// [`AuthStrategy::Default`] (git credential helper, `~/.gitconfig`) **and**
+/// [`AuthStrategy::SshAgent`] (the running SSH agent's loaded keys). This
+/// prevents an untrusted fetch from silently picking up the operator's personal
+/// credentials via `Cred::ssh_key_from_agent` or `Cred::default`. Explicit
+/// strategies (`SshKey` file, `UserPass`, `Token`) are always honored. Callers
+/// that intentionally want ambient discovery (e.g. a trusted first-party mirror
 /// clone driven by the operator's own identity) must explicitly opt in via
 /// [`AuthMode::AllowAmbient`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum AuthMode {
     /// Only explicit authentication strategies are honored.
-    /// [`AuthStrategy::Default`] is rejected, so ambient credential sources
-    /// (credential helper, `~/.gitconfig`, SSH agent fallback) are never
-    /// consulted. Secure default for untrusted/forge-facing fetches.
+    /// Ambient strategies ([`AuthStrategy::Default`], [`AuthStrategy::SshAgent`])
+    /// are rejected, so the credential helper, `~/.gitconfig`, and the SSH
+    /// agent are never consulted. Secure default for untrusted/forge-facing
+    /// fetches.
     #[default]
     ExplicitOnly,
-    /// Permit ambient credential discovery via [`AuthStrategy::Default`].
-    /// Opt-in for trusted first-party mirrors where operator identity is
-    /// expected.
+    /// Permit ambient credential discovery via [`AuthStrategy::Default`] and
+    /// [`AuthStrategy::SshAgent`]. Opt-in for trusted first-party mirrors
+    /// where operator identity is expected.
     AllowAmbient,
 }
 
@@ -211,16 +214,16 @@ impl CallbackConfig {
         username_from_url: Option<&str>,
         allowed_types: git2::CredentialType,
     ) -> Result<git2::Cred, git2::Error> {
-        // Try each strategy in order. Under ExplicitOnly, AuthStrategy::Default
-        // (which maps to libgit2's ambient credential discovery: the git
-        // credential helper, ~/.gitconfig, SSH agent fallback) is refused so an
-        // untrusted fetch cannot silently pick up operator credentials.
+        // Try each strategy in order. Under ExplicitOnly, ambient strategies
+        // (AuthStrategy::Default → git credential helper / ~/.gitconfig;
+        // AuthStrategy::SshAgent → ssh-agent loaded keys) are refused so an
+        // untrusted fetch cannot silently pick up the operator's credentials.
+        // Explicit strategies (SshKey file, UserPass, Token) are always honored.
         for strategy in strategies {
-            if matches!(auth_mode, AuthMode::ExplicitOnly)
-                && matches!(strategy, AuthStrategy::Default)
-            {
+            if matches!(auth_mode, AuthMode::ExplicitOnly) && strategy.is_ambient() {
                 tracing::debug!(
-                    "Refusing ambient AuthStrategy::Default for {url} under ExplicitOnly auth mode"
+                    "Refusing ambient strategy {:?} for {url} under ExplicitOnly auth mode",
+                    strategy
                 );
                 continue;
             }
@@ -232,8 +235,8 @@ impl CallbackConfig {
 
         if matches!(auth_mode, AuthMode::ExplicitOnly) {
             Err(git2::Error::from_str(
-                "No suitable explicit authentication method (ambient discovery refused under \
-                 ExplicitOnly auth mode)",
+                "No suitable explicit authentication method (ambient discovery — credential \
+                 helper, ~/.gitconfig, SSH agent — refused under ExplicitOnly auth mode)",
             ))
         } else {
             Err(git2::Error::from_str("No suitable authentication method"))
@@ -439,6 +442,7 @@ impl CallbackConfigBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     #[test]
     fn test_callback_config_is_send() {
@@ -471,6 +475,10 @@ mod tests {
         git2::CredentialType::DEFAULT
     }
 
+    fn ssh_allowed() -> git2::CredentialType {
+        git2::CredentialType::SSH_KEY
+    }
+
     /// Under ExplicitOnly, a sole `AuthStrategy::Default` is refused — ambient
     /// credential sources (credential helper, ~/.gitconfig, SSH agent fallback)
     /// are not consulted.
@@ -488,6 +496,73 @@ mod tests {
             res.is_err(),
             "ExplicitOnly must refuse AuthStrategy::Default so ambient credentials are not \
              consulted",
+        );
+    }
+
+    /// Under ExplicitOnly, `AuthStrategy::SshAgent` is ALSO refused — it
+    /// consults the running SSH agent (`Cred::ssh_key_from_agent`), an ambient
+    /// source. An untrusted fetch must not silently use the operator's loaded
+    /// SSH keys.
+    #[test]
+    fn explicit_only_refuses_ambient_ssh_agent() {
+        let auth = vec![AuthStrategy::SshAgent {
+            username: Some("git".to_owned()),
+        }];
+        let res = CallbackConfig::handle_auth(
+            &auth,
+            AuthMode::ExplicitOnly,
+            "https://github.com/example/repo.git",
+            None,
+            ssh_allowed(),
+        );
+        assert!(
+            res.is_err(),
+            "ExplicitOnly must refuse AuthStrategy::SshAgent (ssh-agent is ambient)",
+        );
+    }
+
+    /// Under AllowAmbient, `AuthStrategy::SshAgent` is honored — the explicit
+    /// opt-in path for trusted first-party mirrors.
+    #[test]
+    fn allow_ambient_permits_ssh_agent() {
+        let auth = vec![AuthStrategy::SshAgent {
+            username: Some("git".to_owned()),
+        }];
+        let res = CallbackConfig::handle_auth(
+            &auth,
+            AuthMode::AllowAmbient,
+            "https://github.com/example/repo.git",
+            None,
+            ssh_allowed(),
+        );
+        assert!(
+            res.is_ok(),
+            "AllowAmbient must permit AuthStrategy::SshAgent"
+        );
+    }
+
+    /// `is_ambient()` classifies exactly the environment-backed strategies.
+    #[test]
+    fn is_ambient_classification() {
+        assert!(AuthStrategy::Default.is_ambient());
+        assert!(AuthStrategy::SshAgent { username: None }.is_ambient());
+        // Explicit strategies are never ambient.
+        assert!(!AuthStrategy::Token { token: "t".into() }.is_ambient());
+        assert!(
+            !AuthStrategy::UserPass {
+                username: "u".into(),
+                password: "p".into(),
+            }
+            .is_ambient()
+        );
+        assert!(
+            !AuthStrategy::SshKey {
+                username: "u".into(),
+                public_key: None,
+                private_key: PathBuf::from("/k"),
+                passphrase: None,
+            }
+            .is_ambient()
         );
     }
 

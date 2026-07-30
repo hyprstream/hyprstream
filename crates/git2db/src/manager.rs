@@ -291,18 +291,19 @@ impl GitManager {
             tracing::warn!("No access token configured");
         }
 
-        // Add SSH agent authentication
-        callback_builder = callback_builder.auth(AuthStrategy::SshAgent {
-            username: Some("git".to_owned()),
-        });
-
-        // The git credential helper (~/.gitconfig, osxkeychain, etc.) is an
-        // ambient credential source. It is only consulted when the operator
-        // explicitly enables it; in that case we opt into AllowAmbient so the
-        // ExplicitOnly default does not refuse the Default strategy at
-        // resolution time.
+        // Ambient credential sources — the SSH agent (`ssh_key_from_agent`),
+        // the git credential helper, and `~/.gitconfig` — are only consulted
+        // when the operator explicitly enables `use_credential_helper`. By
+        // default (issue #1429) the clone path is strict certs + ExplicitOnly
+        // auth: these strategies are added only here, behind the opt-in, and
+        // paired with AllowAmbient so ExplicitOnly does not refuse them at
+        // resolution time. The default secure path uses only the explicit
+        // token above (or anonymous access for public remotes).
         if self.config.network.use_credential_helper {
             callback_builder = callback_builder
+                .auth(AuthStrategy::SshAgent {
+                    username: Some("git".to_owned()),
+                })
                 .auth(AuthStrategy::Default)
                 .auth_mode(AuthMode::AllowAmbient);
         }
