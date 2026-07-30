@@ -4,12 +4,16 @@
 from __future__ import annotations
 
 import argparse
+import json
+import os
+import shlex
+import subprocess
 import tomllib
+from collections import deque
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-DEPENDENCY_SECTIONS = {"dependencies", "build-dependencies", "dev-dependencies"}
 CLASS_LICENSES = {
     "mit_packages": "MIT",
     "agpl_packages": "AGPL-3.0-only",
@@ -26,9 +30,115 @@ def fail(message: str) -> None:
     raise SystemExit(f"license boundary: {message}")
 
 
-def package_manifests(root: Path) -> dict[str, tuple[Path, dict]]:
+def cargo_workspace_manifest_paths(root: Path) -> set[Path]:
+    cargo = shlex.split(os.environ.get("LICENSE_BOUNDARY_CARGO_COMMAND", "cargo"))
+    command = cargo + [
+        "metadata",
+        "--format-version=1",
+        "--all-features",
+        "--offline",
+        "--no-deps",
+        "--manifest-path",
+        str(root / "Cargo.toml"),
+    ]
+    if (root / "Cargo.lock").is_file():
+        command.insert(len(cargo) + 4, "--locked")
+    else:
+        command.remove("--no-deps")
+    result = subprocess.run(
+        command,
+        cwd=root,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode:
+        fail(f"cargo metadata failed: {result.stderr.strip()}")
+    try:
+        metadata = json.loads(result.stdout)
+    except json.JSONDecodeError as error:
+        fail(f"cargo metadata returned invalid JSON: {error}")
+
+    workspace_members = set(metadata.get("workspace_members", []))
+    packages = {
+        package.get("id"): package
+        for package in metadata.get("packages", [])
+        if isinstance(package, dict)
+    }
+    if workspace_members - set(packages):
+        fail("cargo metadata omitted workspace member package data")
+
+    manifest_paths: set[Path] = set()
+    for package_id in workspace_members:
+        manifest_value = packages[package_id].get("manifest_path")
+        if not isinstance(manifest_value, str):
+            fail(f"cargo metadata package {package_id!r} has no manifest path")
+        manifest_path = Path(manifest_value).resolve()
+        if not manifest_path.is_relative_to(root):
+            fail(f"workspace member is outside repository: {manifest_path}")
+        manifest_paths.add(manifest_path)
+    return manifest_paths
+
+
+def configured_standalone_manifest_paths(root: Path, config: dict) -> set[Path]:
+    values = config.get("standalone_manifests")
+    if not isinstance(values, list) or not all(
+        isinstance(value, str) for value in values
+    ):
+        fail("missing or non-string classification 'standalone_manifests'")
+    if len(values) != len(set(values)):
+        fail(f"duplicate manifest in standalone_manifests: {values}")
+
+    paths: set[Path] = set()
+    for value in values:
+        path = (root / value).resolve()
+        if not path.is_relative_to(root):
+            fail(f"standalone manifest is outside repository: {value}")
+        if path.name != "Cargo.toml" or not path.is_file():
+            fail(f"standalone manifest does not exist: {value}")
+        paths.add(path)
+
+    root_manifest = load(root / "Cargo.toml")
+    exclusions = root_manifest.get("workspace", {}).get("exclude", [])
+    if not isinstance(exclusions, list) or not all(
+        isinstance(value, str) for value in exclusions
+    ):
+        fail("workspace.exclude must be a list of paths")
+    excluded_package_manifests: set[Path] = set()
+    for pattern in exclusions:
+        for excluded_path in root.glob(pattern):
+            manifest_path = (
+                excluded_path
+                if excluded_path.name == "Cargo.toml"
+                else excluded_path / "Cargo.toml"
+            )
+            if manifest_path.is_file():
+                excluded_package_manifests.add(manifest_path.resolve())
+    omitted = excluded_package_manifests - paths
+    unsupported = paths - excluded_package_manifests
+    if omitted or unsupported:
+        fail(
+            "standalone_manifests/workspace.exclude package mismatch; "
+            f"omitted: {[str(path.relative_to(root)) for path in sorted(omitted)]}; "
+            "not excluded: "
+            f"{[str(path.relative_to(root)) for path in sorted(unsupported)]}"
+        )
+    return paths
+
+
+def package_manifests(
+    root: Path, config: dict
+) -> dict[str, tuple[Path, dict]]:
     manifests: dict[str, tuple[Path, dict]] = {}
-    manifest_paths = {root / "Cargo.toml", *(root / "crates").rglob("Cargo.toml")}
+    workspace_paths = cargo_workspace_manifest_paths(root)
+    standalone_paths = configured_standalone_manifest_paths(root, config)
+    overlap = workspace_paths & standalone_paths
+    if overlap:
+        fail(
+            "standalone_manifests contains Cargo workspace member(s): "
+            f"{[str(path.relative_to(root)) for path in sorted(overlap)]}"
+        )
+    manifest_paths = workspace_paths | standalone_paths
     for path in sorted(manifest_paths):
         manifest = load(path)
         package = manifest.get("package")
@@ -79,107 +189,169 @@ def effective_package_license(
     fail(f"{manifest_path}: package must declare one exact license")
 
 
-def dependency_tables(manifest: dict) -> list[dict]:
-    tables = [
-        manifest[section]
-        for section in DEPENDENCY_SECTIONS
-        if isinstance(manifest.get(section), dict)
+def package_identity(manifest_path: Path, manifest: dict) -> tuple[str, str]:
+    package = manifest["package"]
+    name = package.get("name")
+    version = package.get("version")
+    if not isinstance(name, str) or not isinstance(version, str):
+        fail(f"{manifest_path}: package must declare a string name and version")
+    return name, version
+
+
+def locked_dependency_index(packages: list[dict], dependency: str) -> int:
+    fields = dependency.split(maxsplit=2)
+    name = fields[0]
+    candidates = [
+        index
+        for index, package in enumerate(packages)
+        if package.get("name") == name
     ]
-    targets = manifest.get("target", {})
-    if isinstance(targets, dict):
-        for target in targets.values():
-            if not isinstance(target, dict):
-                continue
-            tables.extend(
-                target[section]
-                for section in DEPENDENCY_SECTIONS
-                if isinstance(target.get(section), dict)
-            )
-    return tables
-
-
-def local_dependency_name(
-    alias: str,
-    dependency: object,
-    manifest_path: Path,
-    workspace_dependencies: dict,
-    workspace_manifest_path: Path,
-) -> str | None:
-    if not isinstance(dependency, dict):
-        return None
-
-    source = dependency
-    source_manifest = manifest_path
-    if dependency.get("workspace") is True:
-        if alias not in workspace_dependencies:
-            fail(
-                f"{manifest_path}: workspace dependency {alias!r} "
-                "is missing from [workspace.dependencies]"
-            )
-        inherited = workspace_dependencies[alias]
-        if not isinstance(inherited, dict):
-            return None
-        source = inherited
-        source_manifest = workspace_manifest_path
-
-    path = source.get("path")
-    if path is None:
-        return None
-
-    dependency_manifest_path = (source_manifest.parent / str(path) / "Cargo.toml").resolve()
-    if not dependency_manifest_path.is_file():
+    if len(fields) >= 2:
+        candidates = [
+            index
+            for index in candidates
+            if packages[index].get("version") == fields[1]
+        ]
+    if len(fields) == 3:
+        source = fields[2]
+        if not source.startswith("(") or not source.endswith(")"):
+            fail(f"invalid Cargo.lock dependency source: {dependency}")
+        source = source[1:-1].split("#", 1)[0]
+        candidates = [
+            index
+            for index in candidates
+            if str(packages[index].get("source", "")).split("#", 1)[0] == source
+        ]
+    if len(candidates) != 1:
         fail(
-            f"{manifest_path}: local dependency {alias!r} "
-            f"has no manifest at {dependency_manifest_path}"
+            f"Cargo.lock dependency {dependency!r} resolves to "
+            f"{len(candidates)} package identities"
         )
-    dependency_manifest = load(dependency_manifest_path)
-    package = dependency_manifest.get("package")
-    if not isinstance(package, dict) or "name" not in package:
-        fail(f"{dependency_manifest_path}: local dependency has no package name")
-    package_name = str(package["name"])
-    declared_name = source.get("package")
-    if declared_name is not None and str(declared_name) != package_name:
-        fail(
-            f"{manifest_path}: local dependency {alias!r} declares package "
-            f"{declared_name!r}, but {dependency_manifest_path} is {package_name!r}"
-        )
-    return package_name
+    return candidates[0]
 
 
-def dependency_graph(
+def resolved_lock_graphs(
     root: Path,
     manifests: dict[str, tuple[Path, dict]],
-    root_manifest: dict,
-) -> dict[str, set[str]]:
-    root_workspace_dependencies = root_manifest.get("workspace", {}).get("dependencies", {})
-    if not isinstance(root_workspace_dependencies, dict):
-        root_workspace_dependencies = {}
-
-    graph: dict[str, set[str]] = {}
-    for name, (manifest_path, manifest) in manifests.items():
-        own_workspace = manifest.get("workspace")
-        if isinstance(own_workspace, dict):
-            workspace_dependencies = own_workspace.get("dependencies", {})
-            workspace_manifest_path = manifest_path
-        else:
-            workspace_dependencies = root_workspace_dependencies
-            workspace_manifest_path = root / "Cargo.toml"
-        if not isinstance(workspace_dependencies, dict):
-            workspace_dependencies = {}
-        dependencies: set[str] = set()
-        for table in dependency_tables(manifest):
-            for alias, dependency in table.items():
-                dependency_name = local_dependency_name(
-                    str(alias),
-                    dependency,
-                    manifest_path,
-                    workspace_dependencies,
-                    workspace_manifest_path,
+    standalone_manifests: set[Path],
+) -> list[tuple[Path, list[dict]]]:
+    lock_paths = {root / "Cargo.lock"}
+    lock_paths.update(
+        manifest_path.parent / "Cargo.lock" for manifest_path in standalone_manifests
+    )
+    known_local = {
+        package_identity(manifest_path, manifest)
+        for manifest_path, manifest in manifests.values()
+    }
+    graphs: list[tuple[Path, list[dict]]] = []
+    for lock_path in sorted(lock_paths):
+        if not lock_path.is_file():
+            continue
+        lock = load(lock_path)
+        packages = lock.get("package")
+        if not isinstance(packages, list) or not all(
+            isinstance(package, dict) for package in packages
+        ):
+            fail(f"{lock_path}: Cargo.lock has no package graph")
+        for package in packages:
+            name = package.get("name")
+            version = package.get("version")
+            if not isinstance(name, str) or not isinstance(version, str):
+                fail(f"{lock_path}: resolved package has invalid identity")
+            if package.get("source") is None and (name, version) not in known_local:
+                fail(
+                    f"{lock_path}: resolved local package {name} {version} "
+                    "is outside the owner package universe"
                 )
-                if dependency_name is not None:
-                    dependencies.add(dependency_name)
-        graph[name] = dependencies
-    return graph
+            dependencies = package.get("dependencies", [])
+            if not isinstance(dependencies, list) or not all(
+                isinstance(dependency, str) for dependency in dependencies
+            ):
+                fail(f"{lock_path}: {name} has malformed resolved dependencies")
+        graphs.append((lock_path, packages))
+    if not graphs:
+        fail("no Cargo.lock graph covers the owner package universe")
+    return graphs
+
+
+def resolved_path_to_agpl(
+    packages: list[dict],
+    start: tuple[str, str],
+    agpl_names: set[str],
+) -> list[str] | None:
+    root_indices = [
+        index
+        for index, package in enumerate(packages)
+        if package.get("name") == start[0]
+        and package.get("version") == start[1]
+        and package.get("source") is None
+    ]
+    if len(root_indices) > 1:
+        fail(f"Cargo.lock has ambiguous local package identity {start[0]} {start[1]}")
+    if not root_indices:
+        return None
+
+    queue = deque([(root_indices[0], [start[0]])])
+    visited: set[int] = set()
+    while queue:
+        index, chain = queue.popleft()
+        if index in visited:
+            continue
+        visited.add(index)
+        package = packages[index]
+        if package.get("source") is None and package["name"] in agpl_names:
+            return chain
+        for dependency in package.get("dependencies", []):
+            dependency_index = locked_dependency_index(packages, dependency)
+            queue.append(
+                (dependency_index, chain + [str(packages[dependency_index]["name"])])
+            )
+    return None
+
+
+def resolved_paths_for_permissive_packages(
+    root: Path,
+    manifests: dict[str, tuple[Path, dict]],
+    permissive: set[str],
+    agpl: set[str],
+    standalone_manifests: set[Path],
+) -> dict[str, list[str] | None]:
+    graphs = resolved_lock_graphs(root, manifests, standalone_manifests)
+    paths: dict[str, list[str] | None] = {}
+    for package_name in sorted(permissive):
+        manifest_path, manifest = manifests[package_name]
+        identity = package_identity(manifest_path, manifest)
+        covered = False
+        found_path = None
+        for _, packages in graphs:
+            in_graph = any(
+                package.get("name") == identity[0]
+                and package.get("version") == identity[1]
+                and package.get("source") is None
+                for package in packages
+            )
+            if not in_graph:
+                continue
+            covered = True
+            path = resolved_path_to_agpl(packages, identity, agpl)
+            if path is not None:
+                found_path = path
+                break
+        if not covered:
+            resolved_locals = sorted(
+                {
+                    (str(lock_path), str(package.get("name")), str(package.get("version")))
+                    for lock_path, packages in graphs
+                    for package in packages
+                    if package.get("source") is None
+                }
+            )
+            fail(
+                f"permissive package {package_name!r} has no committed "
+                f"Cargo-resolved lock graph; resolved locals: {resolved_locals}"
+            )
+        paths[package_name] = found_path
+    return paths
 
 
 def classifications(config: dict, package_names: set[str]) -> dict[str, set[str]]:
@@ -225,27 +397,11 @@ def named_package_set(config: dict, key: str, package_names: set[str]) -> set[st
     return packages
 
 
-def path_to_class(
-    start: str, graph: dict[str, set[str]], targets: set[str]
-) -> list[str] | None:
-    queue = [(start, [start])]
-    visited = {start}
-    while queue:
-        current, chain = queue.pop(0)
-        for dependency in sorted(graph[current]):
-            if dependency in targets:
-                return chain + [dependency]
-            if dependency not in visited:
-                visited.add(dependency)
-                queue.append((dependency, chain + [dependency]))
-    return None
-
-
 def main(root: Path = ROOT) -> None:
     root = root.resolve()
     root_manifest = load(root / "Cargo.toml")
     config = load(root / ".github" / "license-boundary.toml")["license_gate"]
-    manifests = package_manifests(root)
+    manifests = package_manifests(root, config)
     classes = classifications(config, set(manifests))
     for class_name, expected_license in CLASS_LICENSES.items():
         for package_name in sorted(classes[class_name]):
@@ -286,20 +442,20 @@ def main(root: Path = ROOT) -> None:
             "permissive root/AGPL aggregator overlap: "
             f"{sorted(root_aggregator_overlap)}"
         )
+    role_omissions = permissive - permissive_roots - agpl_aggregators
+    if role_omissions:
+        fail(
+            "permissive package role omission; classify each as a reusable "
+            f"root or AGPL aggregator: {sorted(role_omissions)}"
+        )
 
-    graph = dependency_graph(root, manifests, root_manifest)
-    for package, dependencies in sorted(graph.items()):
-        unknown_dependencies = dependencies - set(manifests)
-        if unknown_dependencies:
-            fail(
-                f"{package} has unknown local dependency package(s): "
-                f"{sorted(unknown_dependencies)}"
-            )
-
-    paths_to_agpl = {
-        package: path_to_class(package, graph, agpl)
-        for package in sorted(permissive)
-    }
+    paths_to_agpl = resolved_paths_for_permissive_packages(
+        root,
+        manifests,
+        permissive,
+        agpl,
+        configured_standalone_manifest_paths(root, config),
+    )
     for permissive_root in sorted(permissive_roots):
         path = paths_to_agpl[permissive_root]
         if path is not None:
@@ -311,20 +467,6 @@ def main(root: Path = ROOT) -> None:
                 f"AGPL aggregator {aggregator!r} does not reach an AGPL package; "
                 "remove stale combined-distribution obligation"
             )
-
-    undeclared_aggregators = {
-        package: path
-        for package, path in paths_to_agpl.items()
-        if path is not None
-        and package not in permissive_roots
-        and package not in agpl_aggregators
-    }
-    if undeclared_aggregators:
-        package, path = sorted(undeclared_aggregators.items())[0]
-        fail(
-            f"{package} has an undeclared AGPL aggregation path: "
-            + " -> ".join(path)
-        )
 
     print(
         "license boundary OK: "

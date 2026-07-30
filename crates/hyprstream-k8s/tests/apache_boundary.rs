@@ -1,4 +1,4 @@
-//! Resolved license-boundary regression for reusable permissive roots.
+//! Resolved license-boundary regression for every permissive local package.
 //!
 //! Cargo's committed resolved lock graph is the source of dependency truth.
 //! It retains normal, build, dev, target, renamed, `[patch]`, and `[replace]`
@@ -7,8 +7,9 @@
 //! and classifies local packages by their SPDX metadata rather than copied
 //! names. Full metadata resolution remains in the causal fixtures. When
 //! #1417's omission-checked `.github/license-boundary.toml` is present, its
-//! `agpl_packages` partition augments manifest metadata and its
-//! `permissive_roots` list selects the production roots checked here.
+//! `agpl_packages` partition augments manifest metadata. Every MIT/Apache
+//! package must be exactly one of a strict reusable `permissive_root` or an
+//! `agpl_aggregator` with a real resolved path to a local AGPL package.
 
 #![allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 
@@ -27,7 +28,7 @@ struct CargoMetadata {
     resolve: Option<MetadataResolve>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 struct MetadataPackage {
     id: String,
     name: String,
@@ -127,6 +128,74 @@ fn policy_permissive_roots(workspace_root: &Path) -> Result<BTreeSet<String>, St
     policy_packages(workspace_root, "permissive_roots")
 }
 
+fn policy_agpl_aggregators(workspace_root: &Path) -> Result<BTreeSet<String>, String> {
+    policy_packages(workspace_root, "agpl_aggregators")
+}
+
+fn policy_permissive_packages(workspace_root: &Path) -> Result<BTreeSet<String>, String> {
+    let mut permissive = policy_packages(workspace_root, "mit_packages")?;
+    permissive.extend(policy_packages(workspace_root, "apache_packages")?);
+    Ok(permissive)
+}
+
+fn policy_standalone_manifests(workspace_root: &Path) -> Result<Vec<PathBuf>, String> {
+    let path = workspace_root.join(".github/license-boundary.toml");
+    let policy = load_toml(&path)?;
+    policy["license_gate"]["standalone_manifests"]
+        .as_array()
+        .ok_or_else(|| {
+            format!(
+                "{} must define license_gate.standalone_manifests",
+                path.display()
+            )
+        })?
+        .iter()
+        .map(|value| {
+            let relative = value.as_str().ok_or_else(|| {
+                format!(
+                    "{} has a non-string manifest in standalone_manifests",
+                    path.display()
+                )
+            })?;
+            let manifest = workspace_root.join(relative);
+            if !manifest.is_file() {
+                return Err(format!(
+                    "{} lists missing standalone manifest {relative}",
+                    path.display()
+                ));
+            }
+            Ok(manifest)
+        })
+        .collect()
+}
+
+fn validate_permissive_role_partition(
+    workspace_root: &Path,
+) -> Result<(BTreeSet<String>, BTreeSet<String>), String> {
+    let permissive = policy_permissive_packages(workspace_root)?;
+    let roots = policy_permissive_roots(workspace_root)?;
+    let aggregators = policy_agpl_aggregators(workspace_root)?;
+    let overlap = roots
+        .intersection(&aggregators)
+        .cloned()
+        .collect::<Vec<_>>();
+    if !overlap.is_empty() {
+        return Err(format!(
+            "permissive root/AGPL aggregator overlap: {overlap:?}"
+        ));
+    }
+    let roles = roots.union(&aggregators).cloned().collect::<BTreeSet<_>>();
+    let omissions = permissive.difference(&roles).cloned().collect::<Vec<_>>();
+    let non_permissive = roles.difference(&permissive).cloned().collect::<Vec<_>>();
+    if !omissions.is_empty() || !non_permissive.is_empty() {
+        return Err(format!(
+            "permissive role partition mismatch; omissions: {omissions:?}; \
+             non-permissive roles: {non_permissive:?}"
+        ));
+    }
+    Ok((roots, aggregators))
+}
+
 fn resolved_metadata(
     workspace_root: &Path,
     root_manifest_path: &Path,
@@ -183,6 +252,38 @@ fn local_metadata(
     }
     serde_json::from_slice(&output.stdout)
         .map_err(|error| format!("parse local-only cargo metadata JSON: {error}"))
+}
+
+fn standalone_manifest_metadata(manifest_path: &Path) -> Result<MetadataPackage, String> {
+    let manifest = load_toml(manifest_path)?;
+    let package = manifest
+        .get("package")
+        .and_then(Value::as_table)
+        .ok_or_else(|| format!("{} has no [package] table", manifest_path.display()))?;
+    let string = |key: &str| {
+        package
+            .get(key)
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .ok_or_else(|| {
+                format!(
+                    "{} package.{key} must be an explicit string",
+                    manifest_path.display()
+                )
+            })
+    };
+    let name = string("name")?;
+    let version = string("version")?;
+    let license = Some(string("license")?);
+    Ok(MetadataPackage {
+        id: format!("path+{}#{name}@{version}", manifest_path.display()),
+        name,
+        version,
+        license,
+        manifest_path: manifest_path.to_path_buf(),
+        source: None,
+        dependencies: Vec::new(),
+    })
 }
 
 fn load_cargo_lock(path: &Path) -> Result<CargoLock, String> {
@@ -575,84 +676,99 @@ fn assert_transitive_patch_resolved(
 }
 
 #[test]
-fn production_permissive_roots_complete_closures_exclude_agpl_packages() {
+fn production_every_permissive_package_has_the_declared_resolved_role() {
     let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
         .canonicalize()
         .expect("canonical workspace root");
-    let roots = policy_permissive_roots(&workspace_root).unwrap();
+    let (roots, aggregators) = validate_permissive_role_partition(&workspace_root).unwrap();
+    assert!(!roots.is_empty(), "policy must select reusable roots");
     assert!(
-        !roots.is_empty(),
-        "policy must select reusable permissive roots"
+        !aggregators.is_empty(),
+        "policy must select AGPL aggregators"
     );
 
-    let workspace_metadata =
+    let mut workspace_metadata =
         local_metadata(&workspace_root, &workspace_root.join("Cargo.toml")).unwrap();
     let workspace_lock = load_cargo_lock(&workspace_root.join("Cargo.lock")).unwrap();
-    let mut checked = BTreeSet::new();
+    let standalone_manifests = policy_standalone_manifests(&workspace_root).unwrap();
+    for manifest_path in &standalone_manifests {
+        let package = standalone_manifest_metadata(manifest_path).unwrap();
+        assert!(
+            workspace_metadata
+                .packages
+                .iter()
+                .all(|candidate| candidate.name != package.name),
+            "standalone manifest {} duplicates a workspace package",
+            manifest_path.display()
+        );
+        workspace_metadata.packages.push(package);
+    }
 
-    for root_name in &roots {
-        if let Some(root) = workspace_metadata
+    let roles = roots.union(&aggregators).cloned().collect::<BTreeSet<_>>();
+    let mut checked = BTreeSet::new();
+    for package_name in &roles {
+        let package = workspace_metadata
             .packages
             .iter()
-            .find(|package| &package.name == root_name)
-        {
-            let license = root.license.as_deref().expect("root license metadata");
-            assert!(
-                matches!(license, "MIT" | "Apache-2.0"),
-                "permissive root {root_name} has unauthorized license {license}"
-            );
+            .find(|candidate| &candidate.name == package_name)
+            .unwrap_or_else(|| panic!("policy package {package_name} has no local metadata"));
+        let license = package
+            .license
+            .as_deref()
+            .expect("package license metadata");
+        assert!(
+            matches!(license, "MIT" | "Apache-2.0"),
+            "permissive package {package_name} has unauthorized license {license}"
+        );
+
+        let boundary = if locked_root_index(&workspace_lock.package, package).is_ok() {
             assert_root_dependencies_locked(
                 &workspace_metadata,
                 &workspace_lock,
-                &root.manifest_path,
+                &package.manifest_path,
             )
             .unwrap();
             check_locked_apache_boundary_with(
                 &workspace_root,
-                &root.manifest_path,
+                &package.manifest_path,
                 &workspace_metadata.packages,
                 &workspace_lock,
             )
-            .unwrap();
-            checked.insert(root_name.clone());
-            continue;
-        }
+        } else {
+            let manifest_path = &package.manifest_path;
+            let lock_path = manifest_path
+                .parent()
+                .expect("standalone manifest parent")
+                .join("Cargo.lock");
+            let metadata = local_metadata(&workspace_root, manifest_path).unwrap();
+            let lock = load_cargo_lock(&lock_path).unwrap();
+            assert_root_dependencies_locked(&metadata, &lock, manifest_path).unwrap();
+            check_locked_apache_boundary_with(
+                &workspace_root,
+                manifest_path,
+                &metadata.packages,
+                &lock,
+            )
+        };
 
-        let manifest_path = workspace_root
-            .join("crates")
-            .join(root_name)
-            .join("Cargo.toml");
-        let metadata = local_metadata(&workspace_root, &manifest_path).unwrap();
-        let lock_path = manifest_path
-            .parent()
-            .expect("excluded root manifest parent")
-            .join("Cargo.lock");
-        let lock = load_cargo_lock(&lock_path).unwrap();
-        let root = root_metadata(&metadata.packages, &manifest_path).unwrap();
-        let license = root
-            .license
-            .as_deref()
-            .expect("excluded root license metadata");
-        assert!(
-            matches!(license, "MIT" | "Apache-2.0"),
-            "permissive root {root_name} has unauthorized license {license}"
-        );
-        assert_root_dependencies_locked(&metadata, &lock, &manifest_path).unwrap();
-        check_locked_apache_boundary_with(
-            &workspace_root,
-            &manifest_path,
-            &metadata.packages,
-            &lock,
-        )
-        .unwrap();
-        checked.insert(root_name.clone());
+        if roots.contains(package_name) {
+            boundary.unwrap_or_else(|error| {
+                panic!("reusable permissive root {package_name} is not strict: {error}")
+            });
+        } else {
+            let error = boundary.expect_err(&format!(
+                "AGPL aggregator {package_name} has no real AGPL path"
+            ));
+            assert!(
+                error.contains("permissive-root-to-AGPL dependency"),
+                "AGPL aggregator {package_name} failed for a non-boundary reason: {error}"
+            );
+        }
+        checked.insert(package_name.clone());
     }
 
-    assert_eq!(
-        checked, roots,
-        "every configured permissive root must be checked"
-    );
+    assert_eq!(checked, roles, "every permissive package must be checked");
 }
 
 #[test]
@@ -989,6 +1105,46 @@ anyhow = "=99.0.0""#,
     );
     let error = check_apache_boundary(directory.path(), &root_manifest).unwrap_err();
     assert!(error.contains("apache-root -> anyhow"), "{error}");
+}
+
+#[test]
+fn patched_local_agpl_app_omitted_from_both_roles_is_rejected() {
+    let (directory, root_manifest) = patched_anyhow_fixture(
+        r#"[dependencies]
+anyhow = "=99.0.0""#,
+    );
+    write_fixture(
+        &root_manifest,
+        r#"[package]
+name = "app"
+version = "0.1.0"
+license = "Apache-2.0"
+
+[dependencies]
+anyhow = "=99.0.0"
+"#,
+    );
+    write_fixture(
+        &directory.path().join(".github/license-boundary.toml"),
+        r#"[license_gate]
+mit_packages = []
+agpl_packages = ["anyhow"]
+apache_packages = ["app"]
+permissive_roots = []
+agpl_aggregators = []
+"#,
+    );
+
+    let resolved_error = check_apache_boundary(directory.path(), &root_manifest).unwrap_err();
+    assert!(
+        resolved_error.contains("app -> anyhow"),
+        "fixture must prove the registry declaration resolves to local AGPL: {resolved_error}"
+    );
+    let role_error = validate_permissive_role_partition(directory.path()).unwrap_err();
+    assert!(
+        role_error.contains("omissions: [\"app\"]"),
+        "an app omitted from both resolved roles must fail closed: {role_error}"
+    );
 }
 
 #[test]

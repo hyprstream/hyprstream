@@ -56,7 +56,7 @@ Multiple agents may share the one checkout at the repo root. That checkout has a
 
 | Crate | Purpose |
 |-------|---------|
-| `hyprstream` | Main app: runtime, storage, git, training, API, services, CLI, native MAC (MIT OR AGPL-3.0) |
+| `hyprstream` | Apache-2.0 main app: runtime, storage, git, training, API, services, CLI, native MAC; its combined distribution currently carries AGPL obligations through `hyprstream-flight` |
 | `git2db` | Git repository management library (has own CLAUDE.md) |
 | `git-xet-filter` | XET/LFS large file storage (libgit2 filter) |
 | `gittorrent` | P2P model distribution |
@@ -275,5 +275,15 @@ See: `README.md`, `DEVELOP.md`, `CONTRIBUTING.md`, `crates/git2db/CLAUDE.md`, `d
 
 ## Licensing
 
-- **hyprstream**: MIT OR AGPL-3.0 (user's choice)
-- **All other crates**: MIT
+- **MIT**: exactly `bitsandbytes-sys`, `cas-serve`, and `git-xet-filter`.
+- **AGPL-3.0-only**: exactly `hyprstream-flight`, `hyprstream-metrics`,
+  `hyprstream-vfs-server`, and `hyprstream-workers`.
+- **Apache-2.0**: every other local Cargo package, including `hyprstream`.
+
+Those are source-package declarations, not a waiver of combined-distribution
+obligations. The Apache-declared `hyprstream` application currently aggregates
+the AGPL-declared `hyprstream-flight` package, so a combined distribution must
+satisfy the applicable AGPL terms. The exhaustive owner map, the one declared
+aggregator, and the reusable permissive-only roots are enforced by
+`.github/license-boundary.toml`; reusable roots must have no Cargo-resolved path
+to any local AGPL package.

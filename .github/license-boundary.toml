@@ -47,15 +47,41 @@ apache_packages = [
   "waxterm",
 ]
 
+# Cargo metadata is authoritative for workspace membership. These packages are
+# intentionally excluded from the root workspace and are therefore the only
+# additional standalone manifests included in the owner package universe.
+standalone_manifests = [
+  "crates/bitsandbytes-sys/Cargo.toml",
+  "crates/hyprstream-workers-python-guest/Cargo.toml",
+  "crates/hyprstream-workers-wasmtime-fsguest/Cargo.toml",
+]
+
 # Reusable permissive-only roots retain a strict complete resolved-graph
 # guarantee: none may reach a local AGPL package through any dependency source.
 permissive_roots = [
+  "bitsandbytes-sys",
+  "cas-serve",
+  "chat-core",
+  "git-xet-filter",
+  "git2db",
+  "hyprstream-9p",
+  "hyprstream-appview",
+  "hyprstream-compositor",
+  "hyprstream-containedfs",
   "hyprstream-crypto",
+  "hyprstream-discovery",
   "hyprstream-k8s",
+  "hyprstream-k8s-pds",
+  "hyprstream-ledger",
+  "hyprstream-p2p",
+  "hyprstream-pds",
+  "hyprstream-pds-service",
+  "hyprstream-resource",
   "hyprstream-rpc",
   "hyprstream-rpc-build",
   "hyprstream-rpc-derive",
   "hyprstream-rpc-std",
+  "hyprstream-service",
   "hyprstream-tui",
   "hyprstream-util",
   "hyprstream-vfs",
@@ -64,6 +90,7 @@ permissive_roots = [
   "hyprstream-workers-tcl",
   "hyprstream-workers-wasmtime",
   "hyprstream-workers-wasmtime-fsguest",
+  "waxterm",
 ]
 
 # Apache-declared application source may aggregate AGPL components. Combined
