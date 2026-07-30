@@ -133,12 +133,41 @@ def configured_standalone_manifest_paths(root: Path, config: dict) -> set[Path]:
     return paths
 
 
+def configured_duplicate_manifest_paths(
+    root: Path, config: dict, standalone_paths: set[Path]
+) -> set[Path]:
+    values = config.get("duplicate_package_manifests")
+    if not isinstance(values, list) or not all(
+        isinstance(value, str) for value in values
+    ):
+        fail("missing or non-string classification 'duplicate_package_manifests'")
+    if len(values) != len(set(values)):
+        fail(f"duplicate manifest in duplicate_package_manifests: {values}")
+
+    paths = {(root / value).resolve() for value in values}
+    outside = {path for path in paths if not path.is_relative_to(root)}
+    if outside:
+        fail(
+            "duplicate package manifest is outside repository: "
+            f"{[str(path) for path in sorted(outside)]}"
+        )
+    non_standalone = paths - standalone_paths
+    if non_standalone:
+        fail(
+            "duplicate_package_manifests contains non-standalone manifest(s): "
+            f"{[str(path.relative_to(root)) for path in sorted(non_standalone)]}"
+        )
+    return paths
+
+
 def package_manifests(
     root: Path, config: dict
-) -> dict[str, tuple[Path, dict]]:
-    manifests: dict[str, tuple[Path, dict]] = {}
+) -> tuple[dict[str, tuple[Path, dict]], list[tuple[str, Path, dict]]]:
     workspace_paths = cargo_workspace_manifest_paths(root)
     standalone_paths = configured_standalone_manifest_paths(root, config)
+    approved_duplicates = configured_duplicate_manifest_paths(
+        root, config, standalone_paths
+    )
     overlap = workspace_paths & standalone_paths
     if overlap:
         fail(
@@ -146,16 +175,52 @@ def package_manifests(
             f"{[str(path.relative_to(root)) for path in sorted(overlap)]}"
         )
     manifest_paths = workspace_paths | standalone_paths
+    by_name: dict[str, list[tuple[Path, dict]]] = {}
     for path in sorted(manifest_paths):
         manifest = load(path)
         package = manifest.get("package")
         if not isinstance(package, dict) or "name" not in package:
             continue
         name = str(package["name"])
-        if name in manifests:
-            fail(f"duplicate package name {name!r}")
-        manifests[name] = (path, manifest)
-    return manifests
+        by_name.setdefault(name, []).append((path, manifest))
+
+    manifests: dict[str, tuple[Path, dict]] = {}
+    entries: list[tuple[str, Path, dict]] = []
+    observed_duplicates: set[Path] = set()
+    for name, named_manifests in sorted(by_name.items()):
+        paths = {path for path, _ in named_manifests}
+        approved = paths & approved_duplicates
+        canonical = paths - approved
+        if len(named_manifests) > 1 and len(canonical) != 1:
+            fail(
+                f"duplicate package name {name!r}; list every non-canonical "
+                "standalone manifest in duplicate_package_manifests"
+            )
+        if len(named_manifests) == 1 and approved:
+            fail(
+                "duplicate_package_manifests lists a unique package manifest: "
+                f"{next(iter(approved)).relative_to(root)}"
+            )
+        canonical_path = next(iter(canonical))
+        canonical_manifest = next(
+            manifest
+            for path, manifest in named_manifests
+            if path == canonical_path
+        )
+        manifests[name] = (canonical_path, canonical_manifest)
+        observed_duplicates |= approved
+        entries.extend(
+            (name, path, manifest) for path, manifest in named_manifests
+        )
+
+    stale_duplicates = approved_duplicates - observed_duplicates
+    if stale_duplicates:
+        fail(
+            "duplicate_package_manifests contains manifest(s) without a "
+            "duplicate package name: "
+            f"{[str(path.relative_to(root)) for path in sorted(stale_duplicates)]}"
+        )
+    return manifests, entries
 
 
 def effective_package_license(
@@ -408,20 +473,24 @@ def main(root: Path = ROOT) -> None:
     root = root.resolve()
     root_manifest = load(root / "Cargo.toml")
     config = load(root / ".github" / "license-boundary.toml")["license_gate"]
-    manifests = package_manifests(root, config)
+    manifests, manifest_entries = package_manifests(root, config)
     classes = classifications(config, set(manifests))
-    for class_name, expected_license in CLASS_LICENSES.items():
-        for package_name in sorted(classes[class_name]):
-            manifest_path, manifest = manifests[package_name]
-            actual_license = effective_package_license(
-                root, manifest_path, manifest, root_manifest
+    package_classes = {
+        package_name: (class_name, expected_license)
+        for class_name, expected_license in CLASS_LICENSES.items()
+        for package_name in classes[class_name]
+    }
+    for package_name, manifest_path, manifest in manifest_entries:
+        class_name, expected_license = package_classes[package_name]
+        actual_license = effective_package_license(
+            root, manifest_path, manifest, root_manifest
+        )
+        if actual_license != expected_license:
+            fail(
+                f"{manifest_path.relative_to(root)} ({package_name}) is classified "
+                f"as {class_name} requiring {expected_license!r}, but its resolved "
+                f"manifest license is {actual_license!r}"
             )
-            if actual_license != expected_license:
-                fail(
-                    f"{package_name} is classified as {class_name} requiring "
-                    f"{expected_license!r}, but its resolved manifest license is "
-                    f"{actual_license!r}"
-                )
 
     permissive = classes["mit_packages"] | classes["apache_packages"]
     agpl = classes["agpl_packages"]
@@ -479,7 +548,7 @@ def main(root: Path = ROOT) -> None:
         "license boundary OK: "
         f"{len(permissive_roots)} reusable MIT/Apache roots do not reach "
         f"{len(agpl)} AGPL packages; {len(agpl_aggregators)} declared AGPL "
-        f"aggregator; {len(manifests)} package licenses match policy"
+        f"aggregator; {len(manifest_entries)} package licenses match policy"
     )
 
 

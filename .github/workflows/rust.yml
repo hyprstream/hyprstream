@@ -131,6 +131,7 @@ jobs:
       run: |
         python3 scripts/check_rust_workflow_matrix.py
         python3 scripts/check_browser_wasm_gate.py
+        python3 scripts/check_crate_release_policy.py
         python3 -m unittest discover -s scripts/tests -p 'test_check_license_boundary.py'
         python3 scripts/check_license_boundary.py
 

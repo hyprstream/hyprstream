@@ -37,6 +37,8 @@ class LicenseBoundaryFixtures(unittest.TestCase):
         apache_packages: tuple[str, ...] = ("apache", "middle"),
         permissive_roots: tuple[str, ...] = ("apache", "middle"),
         agpl_aggregators: tuple[str, ...] = (),
+        duplicate_manifest_license: str | None = None,
+        approve_duplicate_manifest: bool = True,
         policy_text: str | None = None,
     ) -> subprocess.CompletedProcess[str]:
         with tempfile.TemporaryDirectory() as directory:
@@ -73,10 +75,31 @@ class LicenseBoundaryFixtures(unittest.TestCase):
                 f"crates/{middle_name}",
                 *(f"tools/{package}" for package in extra_workspace_members),
             ]
+            exclusions = [f"crates/{service_name}"]
+            standalone_manifests = [f"crates/{service_name}/Cargo.toml"]
+            duplicate_manifests: list[str] = []
+            if duplicate_manifest_license is not None:
+                duplicate_path = "release/duplicate/Cargo.toml"
+                (root / "release" / "duplicate" / "src").mkdir(parents=True)
+                (root / "release" / "duplicate" / "src" / "lib.rs").write_text(
+                    "", encoding="utf-8"
+                )
+                (root / duplicate_path).write_text(
+                    "[package]\n"
+                    f'name = "{first_name}"\n'
+                    f'version = "{package_versions[0]}"\n'
+                    'edition = "2021"\n'
+                    f'license = "{duplicate_manifest_license}"\n',
+                    encoding="utf-8",
+                )
+                exclusions.append("release/duplicate")
+                standalone_manifests.append(duplicate_path)
+                if approve_duplicate_manifest:
+                    duplicate_manifests.append(duplicate_path)
             (root / "Cargo.toml").write_text(
                 "[workspace]\n"
                 f"members = {members!r}\n"
-                f'exclude = ["crates/{service_name}"]\n'
+                f"exclude = {exclusions!r}\n"
                 'resolver = "2"\n\n'
                 "[workspace.package]\n"
                 f'license = "{workspace_license}"\n\n'
@@ -124,8 +147,8 @@ class LicenseBoundaryFixtures(unittest.TestCase):
                     f"mit_packages = {list(mit_packages)!r}\n"
                     f"agpl_packages = {list(agpl_packages)!r}\n"
                     f"apache_packages = {list(apache_packages)!r}\n"
-                    "standalone_manifests = "
-                    f"['crates/{service_name}/Cargo.toml']\n"
+                    f"standalone_manifests = {standalone_manifests!r}\n"
+                    f"duplicate_package_manifests = {duplicate_manifests!r}\n"
                     f"permissive_roots = {list(permissive_roots)!r}\n"
                     f"agpl_aggregators = {list(agpl_aggregators)!r}\n"
                 )
@@ -399,6 +422,7 @@ class LicenseBoundaryFixtures(unittest.TestCase):
                     lines.extend(
                         [
                             "standalone_manifests = ['crates/service/Cargo.toml']",
+                            "duplicate_package_manifests = []",
                             "permissive_roots = ['apache']",
                             "agpl_aggregators = []",
                         ]
@@ -431,6 +455,25 @@ class LicenseBoundaryFixtures(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("3 package licenses match policy", result.stdout)
+
+    def test_approved_duplicate_package_manifest_is_license_checked(self) -> None:
+        result = self.run_fixture(duplicate_manifest_license="Apache-2.0")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("4 package licenses match policy", result.stdout)
+
+    def test_wrong_license_in_approved_duplicate_manifest_fails(self) -> None:
+        result = self.run_fixture(duplicate_manifest_license="MIT")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("release/duplicate/Cargo.toml", result.stderr)
+        self.assertIn("resolved manifest license is 'MIT'", result.stderr)
+
+    def test_unapproved_duplicate_package_name_fails(self) -> None:
+        result = self.run_fixture(
+            duplicate_manifest_license="Apache-2.0",
+            approve_duplicate_manifest=False,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("duplicate package name 'apache'", result.stderr)
 
     def test_apache_application_agpl_aggregation_is_explicit_and_allowed(self) -> None:
         result = self.run_fixture(

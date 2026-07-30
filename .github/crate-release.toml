@@ -1,0 +1,77 @@
+# Public Rust crate release policy. Every package under crates/*/Cargo.toml must
+# appear exactly once. The order of public_now is the crates.io publish order.
+registry = "crates-io"
+tag_prefix = "crates-v"
+environment = "crates-io-publish"
+
+public_now = [
+  "hyprstream-rpc-build",
+  "hyprstream-rpc-derive",
+  "hyprstream-crypto",
+  "hyprstream-rpc",
+]
+
+public_later = [
+  "bitsandbytes-sys",
+  "cas-serve",
+  "git-xet-filter",
+  "git2db",
+  "hyprstream-9p",
+  "hyprstream-compositor",
+  "hyprstream-containedfs",
+  "hyprstream-discovery",
+  "hyprstream-flight",
+  "hyprstream-k8s",
+  "hyprstream-k8s-pds",
+  "hyprstream-ledger",
+  "hyprstream-metrics",
+  "hyprstream-p2p",
+  "hyprstream-pds",
+  "hyprstream-pds-service",
+  "hyprstream-resource",
+  "hyprstream-rpc-std",
+  "hyprstream-service",
+  "hyprstream-tui",
+  "hyprstream-util",
+  "hyprstream-vfs",
+  "hyprstream-vfs-server",
+  "hyprstream-workers",
+  "hyprstream-workers-python",
+  "hyprstream-workers-tcl",
+  "hyprstream-workers-wasmtime",
+  "waxterm",
+]
+
+internal = [
+  "chat-core",
+  "hyprstream",
+  "hyprstream-appview",
+  "hyprstream-workers-python-guest",
+  "hyprstream-workers-wasmtime-fsguest",
+]
+
+# The real service is deliberately not publishable. Replacing the stale public
+# `hyprstream` name requires a separate, Apache-2.0 deprecation-shim package;
+# do not republish the service merely to occupy that name.
+[deprecation_shim]
+package_name = "hyprstream"
+source_service = "hyprstream"
+license = "Apache-2.0"
+version = "0.5.0"
+manifest_path = "release/hyprstream-deprecation-shim/Cargo.toml"
+required_before_yank = true
+release_order = ["publish-shim", "verify-shim", "yank-stale-versions"]
+
+# The final package-license ruling. The exhaustive manifest-path inventory and
+# dependency-boundary roles live in policy_path; the release checker proves
+# these named exceptions and the Apache default remain identical to it.
+[license_boundary]
+policy_path = ".github/license-boundary.toml"
+mit_packages = ["bitsandbytes-sys", "cas-serve", "git-xet-filter"]
+agpl_packages = [
+  "hyprstream-flight",
+  "hyprstream-metrics",
+  "hyprstream-vfs-server",
+  "hyprstream-workers",
+]
+all_other_packages = "Apache-2.0"

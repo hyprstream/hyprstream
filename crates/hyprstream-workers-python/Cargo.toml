@@ -1,6 +1,7 @@
 [package]
 name = "hyprstream-workers-python"
 version = "0.1.0"
+publish = false
 edition.workspace = true
 license = "Apache-2.0"
 description = "RustPython engine + /lang/python 9P shell over the hyprstream-workers-wasmtime sandbox"

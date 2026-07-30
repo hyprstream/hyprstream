@@ -1,6 +1,7 @@
 [package]
 name = "bitsandbytes-sys"
 version = "0.1.0"
+publish = false
 edition = "2021"
 description = "Rust FFI bindings for bitsandbytes quantization library"
 license = "MIT"

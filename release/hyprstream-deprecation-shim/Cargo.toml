@@ -1,0 +1,12 @@
+[package]
+name = "hyprstream"
+version = "0.5.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Deprecated placeholder for the stale Hyprstream metrics crate; see current install and client guidance."
+readme = "README.md"
+repository = "https://github.com/hyprstream/hyprstream"
+publish = ["crates-io"]
+
+[lib]
+path = "src/lib.rs"

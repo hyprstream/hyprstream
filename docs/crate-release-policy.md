@@ -1,0 +1,274 @@
+# Public Rust crate release policy
+
+This document defines the supported crates.io surface for this repository. The
+machine-readable source of truth is [`.github/crate-release.toml`](../.github/crate-release.toml),
+and `scripts/check_crate_release_policy.py` fails closed if any package is absent,
+duplicated, or publishable outside the allowlist.
+
+## Registry, namespace, and support boundary
+
+- Registry: the default Cargo registry, `crates-io` (`https://crates.io`). No
+  alternate registry or source replacement is part of this release channel.
+- Namespace: crates.io has one flat, global, first-come-first-served namespace;
+  it has no organization scope analogous to npm. A `hyprstream-*` prefix is a
+  naming convention, not an access-control boundary.
+- Initial supported crates, in dependency/publish order:
+  1. `hyprstream-rpc-build` `0.1.0`
+  2. `hyprstream-rpc-derive` `0.1.0` (exactly depends on
+     `hyprstream-rpc-build =0.1.0`)
+  3. `hyprstream-crypto` `0.1.0` (leaf cryptographic primitives)
+  4. `hyprstream-rpc` `0.1.0` (exactly depends on the three preceding crates)
+- Everything else sets `publish = false`, except that the stale `hyprstream`
+  crates.io name is reserved by the separately packageable Apache-2.0
+  `release/hyprstream-deprecation-shim` artifact at exactly `0.5.0`, rather
+  than republishing the real service. Looking reusable is not an API or
+  maintenance commitment. Promotion to `public_now` requires an owner, API and
+  SemVer review, package documentation, security review where applicable,
+  crates.io name ownership, versioned local dependencies, and a successful
+  packaged-source build.
+
+The existing crates.io package `hyprstream` is owned by the project maintainer
+account but is **not** the local application release channel: its seven
+Apache-2.0 versions (up to `0.1.0-alpha-6`) describe a different, stale product.
+The real service remains internal/non-publishable because of its broad local
+graph and `tch`/libtorch runtime. The excluded shim manifest must match the
+real service's exact `0.5.0` version, while containing no service dependencies
+or product implementation. The release order is fail-closed: **(1)** publish
+the Apache-2.0 shim, **(2)** verify `hyprstream@0.5.0` resolves from crates.io,
+then and only then **(3)** yank the seven stale versions. Do not delete the
+package name or republish the service to occupy it. The name `chat-core` is
+owned by an unrelated crates.io publisher and cannot be used by this project.
+
+## Complete inventory
+
+| Crate | Class | Reason / promotion gate |
+|---|---|---|
+| `hyprstream-rpc-build` | **public now** | Documented build/codegen API; packages independently; first in release order. |
+| `hyprstream-rpc-derive` | **public now** | Documented proc-macro API; exact versioned dependency on `hyprstream-rpc-build`. |
+| `hyprstream-crypto` | **public now** | Transport-free cryptographic primitives; a dependency-free local leaf in the Rust SDK closure. |
+| `hyprstream-rpc` | **public now** | Rust SDK protocol surface; exact versioned dependencies on build, derive, and crypto complete the publishable closure. |
+| `bitsandbytes-sys` | public later | External CUDA/ROCm FFI/toolchain contract needs ownership and platform support policy. |
+| `cas-serve` | public later | XET git-source dependency and missing package docs. |
+| `git-xet-filter` | public later | XET git-source/default-feature dependency chain; API review required. |
+| `git2db` | public later | XET git-source/default-feature chain and broad storage API commitment. |
+| `hyprstream-9p` | public later | Depends on unpublished RPC/VFS crates; wire/API stability review required. |
+| `hyprstream-compositor` | public later | Missing package docs and explicit external API owner. |
+| `hyprstream-containedfs` | public later | Security-sensitive path-containment contract needs dedicated review and support owner. |
+| `hyprstream-discovery` | public later | Deep unpublished dependency graph and security-sensitive discovery/admission surface. |
+| `hyprstream-flight` | public later | Depends on unpublished metrics/git2db stack; missing package docs. |
+| `hyprstream-k8s` | public later | CRD/version compatibility is a public API; ownership and compatibility policy required. |
+| `hyprstream-k8s-pds` | public later | Tenant-grant/PDS adapter API and downstream AGPL aggregation contract require an owner and compatibility review. |
+| `hyprstream-ledger` | public later | Accounting/security semantics need independent review and an API owner. |
+| `hyprstream-metrics` | public later | Depends on unpublished git2db and native data stack; missing package docs. |
+| `hyprstream-p2p` | public later | Depends on unpublished RPC; network protocol/support commitment not yet declared. |
+| `hyprstream-pds` | public later | Security/signing and atproto storage APIs need review; unpublished dependencies. |
+| `hyprstream-pds-service` | public later | Tenant service depends on unpublished PDS/RPC/VFS stack. |
+| `hyprstream-resource` | public later | Early authority/lifecycle interface scaffold; API not committed. |
+| `hyprstream-rpc-std` | public later | Requires path dependencies on RPC/VFS/workers-tcl/9p and the unreleased patched `moq-net` wasm fix; `[patch.crates-io]` does not reach downstream consumers, so publishing it would resolve an unpatched crates.io `moq-net`. |
+| `hyprstream-service` | public later | Depends on unpublished RPC/PDS and evolving orchestration API. |
+| `hyprstream-util` | public later | Packages cleanly, but generic internal helpers lack an external API owner/docs commitment. |
+| `hyprstream-vfs` | public later | Core namespace/security API depends on unpublished RPC; stability review required. |
+| `hyprstream-vfs-server` | public later | Linux/FUSE/vhost-user platform contract and unpublished dependency chain. |
+| `hyprstream-workers` | public later | Git-source Kata/Nydus dependencies and a broad sandbox security/platform contract. |
+| `hyprstream-workers-python` | public later | Depends on unpublished VFS/wasmtime stack; guest/runtime compatibility policy required. |
+| `hyprstream-workers-tcl` | public later | Custom git-source `molt` fork and unpublished VFS dependency. |
+| `hyprstream-workers-wasmtime` | public later | Sandbox security API and unpublished RPC/VFS dependencies need review. |
+| `waxterm` | public later | Packages cleanly, but lacks package docs and an explicit standalone compatibility owner. |
+| `chat-core` | **internal/not publishable** | Current crates.io name belongs to an unrelated publisher; rename and API review required. |
+| `hyprstream` | **internal/not publishable** | Real product/service crate (broad local graph and `tch`/libtorch); keep it non-publishable. The excluded standalone Apache-2.0 `hyprstream` 0.5.0 deprecation shim, not this crate, replaces the stale public name. |
+| `hyprstream-appview` | **internal/not publishable** | Product-internal derived identity service with no standalone support contract. |
+| `hyprstream-tui` | public later | Supported Apache-2.0 client TUI for trust/crypto, bootstrap, and enrolment; its publish promotion follows the client dependency and accelerator-runtime download/verification work. |
+| `hyprstream-workers-python-guest` | **internal/not publishable** | Compiled WASM guest artifact, not a Rust consumer library. |
+| `hyprstream-workers-wasmtime-fsguest` | **internal/not publishable** | Test/validation WASI guest binary, not a consumer package. |
+
+## Licensing boundary and client/server split
+
+The final ruling is package-based and uses exact SPDX expressions:
+
+| License | Local Cargo packages |
+|---|---|
+| `MIT` | `bitsandbytes-sys`, `cas-serve`, `git-xet-filter` |
+| `AGPL-3.0-only` | `hyprstream-metrics`, `hyprstream-flight`, `hyprstream-vfs-server`, `hyprstream-workers` |
+| `Apache-2.0` | Every other local Cargo package, including the real `hyprstream` application, the excluded `hyprstream` deprecation shim, clients, libraries, adapters, and guest artifacts. |
+
+These are exact licenses, not compound expressions. In particular,
+`MIT OR Apache-2.0` and `MIT OR AGPL-3.0-only` do not satisfy the ruling.
+The workspace default is `Apache-2.0`, and each package manifest also declares
+its exact effective license so moving a package into or out of the workspace
+cannot silently change it.
+
+`.github/license-boundary.toml` is the exhaustive manifest and dependency-role
+source of truth. It covers Cargo workspace members plus every manifest excluded
+from the workspace. The release-only deprecation shim intentionally shares the
+`hyprstream` package name and version with the non-publishable application; its
+manifest is listed as an approved duplicate and is independently license
+checked. `.github/crate-release.toml` repeats the MIT and AGPL exception sets
+and declares Apache-2.0 for every other package, while
+`scripts/check_crate_release_policy.py` rejects drift between the two policies.
+
+`scripts/check_license_boundary.py` resolves the committed Cargo lock graphs,
+requires exact classification parity for the full local package universe, and
+fails if a reusable MIT or Apache package reaches a local AGPL package.
+Apache-licensed application or adapter packages that aggregate AGPL components
+must be named explicitly in `agpl_aggregators`; their combined distributions
+carry the applicable AGPL obligations. The current declared aggregator is the
+real `hyprstream` application.
+
+`deny.toml` keeps AGPL out of the global dependency allowlist and grants
+name-scoped exceptions only to the four AGPL packages. This prevents an
+unreviewed AGPL dependency or a newly mislicensed first-party package from
+passing `cargo deny`.
+
+## Versioning and release tags
+
+The initial public crates use a synchronized release train because the derive
+crate consumes the build crate's generated structures. A release tag is
+`crates-v<SemVer>`, for example `crates-v0.1.0` or
+`crates-v0.2.0-rc.1`. The workflow requires:
+
+1. a protected **annotated** tag;
+2. a tag target reachable from protected `main`;
+3. an exact match between tag SemVer and every `public_now` manifest version;
+4. dependency order and exact sibling version pins from the policy checker.
+
+Stable tags are immutable production releases. crates.io versions are
+permanent: they cannot be overwritten or deleted (yanking only changes future
+resolution). Never move or reuse a release tag/version after a partial release;
+fix forward with a new version.
+
+crates.io does **not** provide a meaningful main-branch staging channel. Main
+runs validation only. When registry-level consumer testing is needed before a
+stable release, publish an intentionally immutable SemVer prerelease such as
+`0.2.0-alpha.1` or `0.2.0-rc.1` from the matching protected tag. It is not an
+ephemeral snapshot and must not be called “staging.”
+
+## Trusted publishing and one-time bootstrap
+
+The release workflow is `.github/workflows/publish-crates.yml` and the protected
+GitHub environment is `crates-io-publish`. It requests only `contents: read`,
+`id-token: write`, and `attestations: write`; checkout credentials are not
+persisted. `rust-lang/crates-io-auth-action` exchanges the GitHub OIDC JWT for a
+short-lived, job-scoped crates.io token and revokes it in its post step.
+
+Trusted-publisher tokens cannot create new crate names. Therefore a verified
+crates.io owner must perform the **first** publish once, manually, in dependency
+order from the reviewed release commit (commands shown for the operator; CI and
+this policy change do not execute them):
+
+```bash
+cargo package --locked -p hyprstream-rpc-build
+cargo publish --locked --registry crates-io -p hyprstream-rpc-build
+# Wait until cargo search/info resolves 0.1.0 from crates.io.
+cargo package --locked -p hyprstream-rpc-derive
+cargo publish --locked --registry crates-io -p hyprstream-rpc-derive
+# The derive crate and crypto are independent after build is available.
+cargo package --locked -p hyprstream-crypto
+cargo publish --locked --registry crates-io -p hyprstream-crypto
+# Wait until both derive and crypto resolve from crates.io.
+cargo package --locked -p hyprstream-rpc
+cargo publish --locked --registry crates-io -p hyprstream-rpc
+```
+
+### Stale `hyprstream` deprecation shim
+
+The `hyprstream` 0.5.0 deprecation shim is a distinct, manually authorized
+operation. Its excluded manifest is deliberately not part of the SDK release
+train or the service workspace, so use the explicit manifest path:
+
+```bash
+cargo package --locked --manifest-path release/hyprstream-deprecation-shim/Cargo.toml
+cargo publish --locked --registry crates-io --manifest-path release/hyprstream-deprecation-shim/Cargo.toml
+cargo info hyprstream@0.5.0
+```
+
+The `cargo info` verification must confirm the public 0.5.0 shim before an
+authorized owner may yank any stale version. A publish failure, ambiguous
+registry result, or failed verification stops the procedure: do not yank first,
+do not republish `crates/hyprstream`, and do not substitute `0.2.0`.
+
+The local authenticated owner is currently `ewindisch`; the token is stored by
+Cargo for the default registry and must never be copied into GitHub secrets or
+logs. After each bootstrap package exists, configure its crates.io **Settings →
+Trusted Publishing** entry exactly as follows:
+
+| Field | Value |
+|---|---|
+| GitHub owner | `hyprstream` |
+| repository | `hyprstream` |
+| workflow filename | `publish-crates.yml` |
+| environment | `crates-io-publish` |
+
+Do this separately for `hyprstream-rpc-build`, `hyprstream-rpc-derive`,
+`hyprstream-crypto`, and `hyprstream-rpc`. Add a second accountable
+maintainer/team owner where organizational policy permits, verify all owner
+emails, test one prerelease, then enable crates.io's **require trusted
+publishing** control for each crate so long-lived API tokens cannot publish
+updates. Retain a documented break-glass owner procedure; never store a
+crates.io token in repository or environment secrets for routine releases.
+
+GitHub repository setup (not performed by this change):
+
+1. Create environment `crates-io-publish`; allow deployments only from protected
+   `crates-v*` tags and require release-maintainer approval.
+2. Create an active tag ruleset matching `refs/tags/crates-v*`; restrict tag
+   creation to release maintainers and block updates, force-pushes, and deletion.
+3. Protect `main` with the existing merge queue/checks. Review changes to the
+   publish workflow, policy, scripts, or public manifests as release-security
+   changes.
+4. Ensure unrelated cloud OIDC trust policies do not accept the publish
+   environment subject. The crates.io OIDC binding is repository owner/name,
+   exact workflow filename, and exact environment.
+
+## Verification, provenance, and smoke test
+
+For every crate in order, CI performs Cargo's full `cargo package --locked`
+packaged-source build (no `--no-verify`), rejects archives over 10 MiB, records
+`cargo package --list`, and computes SHA-256. On retry after a partial run, an
+existing crates.io version is accepted only when its registry checksum exactly
+matches the local `.crate`; a mismatch fails closed. New uploads wait for index
+propagation before the next dependent crate.
+
+GitHub artifact attestations bind each `.crate` digest to the protected workflow
+run and release commit. The `.crate` files, content inventories, and
+`SHA256SUMS` are retained as workflow evidence. Consumers verify downloaded
+evidence with:
+
+```bash
+gh attestation verify hyprstream-rpc-build-0.1.0.crate \
+  --repo hyprstream/hyprstream
+sha256sum -c SHA256SUMS
+```
+
+The post-publish smoke test creates a new temporary Cargo project with exact
+`=<version>` dependencies, generates a fresh lockfile, runs `cargo check
+--locked`, and asserts metadata sources are registry URLs rather than workspace
+paths or Git sources.
+
+## Browser WASM/npm coordination
+
+The browser npm publisher is intentionally unchanged. The two channels must
+share these policy invariants without sharing credentials or pretending the
+registries have identical staging semantics:
+
+- production npm and Rust artifacts must identify the same protected source
+  commit and compatible RPC/schema revision;
+- each registry uses its own least-privilege trusted publisher/provenance and
+  immutable version;
+- checksums/content manifests and clean external-consumer smoke tests are
+  mandatory on both sides;
+- promotion requires explicit version changes and protected release intent; no
+  production pin may silently drift to a main-branch package;
+- npm may have its own staging dist-tag/version strategy, while crates.io uses
+  only immutable SemVer prereleases for pre-stable registry testing.
+
+### npm/crates.io source-artifact asymmetry
+
+`hyprstream-rpc-std` remains public later for crates.io because that registry
+ships Rust source and therefore requires its full local dependency graph to be
+published first. The sibling WASM SDK lane may publish the same interface to npm
+now because npm receives a compiled WASM artifact, which does not expose that
+Rust source dependency graph. This is intentional rather than a contradiction:
+the release order is WASM SDK first and the source-distributed Rust SDK closure
+second. `hyprstream-rpc` is in that four-crate closure; only `hyprstream-rpc-std`
+remains blocked because its browser path requires the unreleased patched
+`moq-net` behavior and additional unpublished path dependencies.

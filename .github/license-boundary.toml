@@ -54,6 +54,15 @@ standalone_manifests = [
   "crates/bitsandbytes-sys/Cargo.toml",
   "crates/hyprstream-workers-python-guest/Cargo.toml",
   "crates/hyprstream-workers-wasmtime-fsguest/Cargo.toml",
+  "release/hyprstream-deprecation-shim/Cargo.toml",
+]
+
+# The release-only shim deliberately uses the same Cargo package name and
+# version as the non-publishable application. Keep that collision explicit:
+# every listed manifest is still license-checked, while the application remains
+# the canonical resolved-graph node for the shared package identity.
+duplicate_package_manifests = [
+  "release/hyprstream-deprecation-shim/Cargo.toml",
 ]
 
 # Reusable permissive-only roots retain a strict complete resolved-graph

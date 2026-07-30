@@ -1,6 +1,7 @@
 [package]
 name = "hyprstream-rpc"
 version = "0.1.0"
+publish = ["crates-io"]
 edition.workspace = true
 license = "Apache-2.0"
 repository.workspace = true
@@ -11,11 +12,11 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 # Re-export derive macros
-hyprstream-rpc-derive = { path = "../hyprstream-rpc-derive" }
+hyprstream-rpc-derive = { version = "=0.1.0", path = "../hyprstream-rpc-derive" }
 
 # Light, transport-free crypto primitives (COSE, ML-DSA/ML-KEM, KDF/MAC, did:key).
 # Re-exported under `crypto::` / `did_key` so existing paths keep working (#916).
-hyprstream-crypto = { path = "../hyprstream-crypto" }
+hyprstream-crypto = { version = "=0.1.0", path = "../hyprstream-crypto" }
 
 # Cap'n Proto serialization
 capnp = { workspace = true }
@@ -168,7 +169,7 @@ systemd = ["dep:systemd"]
 
 [build-dependencies]
 capnpc = { workspace = true }
-hyprstream-rpc-build = { path = "../hyprstream-rpc-build" }
+hyprstream-rpc-build = { version = "=0.1.0", path = "../hyprstream-rpc-build" }
 
 [dev-dependencies]
 tokio-test = { workspace = true }
