@@ -63,7 +63,7 @@ const ALLOWED_SCHEMES: &[&str] = &["https", "http", "ssh", "git"];
 /// - IPv4 addresses (including non-canonical forms like octal/hex octets)
 ///   are normalized to canonical dotted-decimal.
 /// - IPv6 literals are normalized and returned in bracketed form
-///   (`[2001:db8::1]`).
+///   (`[2001:db8::cafe]`).
 /// - Default scheme ports are stripped (`:443`/`:80` for HTTPS/HTTP, `:22`
 ///   for SSH, `:9418` for the git protocol); any other port is preserved.
 ///
@@ -81,11 +81,24 @@ const ALLOWED_SCHEMES: &[&str] = &["https", "http", "ssh", "git"];
 /// re-canonicalized explicitly via [`url::Host::parse`] — the same
 /// standards-based host algorithm, applied uniformly regardless of scheme.
 ///
+/// **Backslash is rejected outright (fail closed), not parsed.** The WHATWG
+/// URL Standard treats `\` as equivalent to `/` within a "special" scheme
+/// (`http`/`https`), ending the authority early — but the pinned libgit2
+/// 1.9.x C parser treats `\` as an ordinary authority character and keeps
+/// splitting userinfo at the last `@`. The same input string is therefore
+/// assigned a *different* authority by this function than by the transport
+/// that actually opens the connection: `https://github.com\@evil.example/x`
+/// resolves to `github.com` here but libgit2 connects to `evil.example`.
+/// Any input containing `\` is a parser-differential attack surface, not a
+/// case this function can resolve by parsing more cleverly — it returns
+/// `None` unconditionally rather than risk agreeing with the wrong parser.
+/// See #1429 Kimi-K3 r3 P1.
+///
 /// Returns `None` for local paths (`file://`, bare paths), malformed URLs,
-/// URLs using a scheme outside [`ALLOWED_SCHEMES`], or URLs where the
-/// authority cannot be reliably determined. Callers must treat `None` as
-/// "authority unknown" and refuse the credential, not fall back to an
-/// unscoped release.
+/// URLs using a scheme outside [`ALLOWED_SCHEMES`], URLs containing a
+/// backslash, or URLs where the authority cannot be reliably determined.
+/// Callers must treat `None` as "authority unknown" and refuse the
+/// credential, not fall back to an unscoped release.
 ///
 /// # Examples
 /// ```text
@@ -96,11 +109,21 @@ const ALLOWED_SCHEMES: &[&str] = &["https", "http", "ssh", "git"];
 /// https://evil.example/repo@github.com    → "evil.example" (path @ ignored)
 /// ssh://git@github.com:22/user/repo.git   → "github.com"
 /// git@github.com:user/repo.git            → "github.com"   (scp-like)
-/// https://[2001:db8::1]/repo.git          → "[2001:db8::1]"
+/// https://[2001:db8::cafe]/repo.git       → "[2001:db8::cafe]"
+/// https://github.com\@evil.example/x.git  → None            (backslash rejected)
 /// ```
 pub fn extract_git_authority(url: &str) -> Option<String> {
     let trimmed = url.trim();
     if trimmed.is_empty() {
+        return None;
+    }
+
+    // Fail closed on any backslash before doing any other parsing — see the
+    // doc comment above for the exact WHATWG-vs-libgit2 differential this
+    // closes. This must run before the scp-like/URL branch split and before
+    // `url::Url::parse`, since the differential exists regardless of which
+    // branch would otherwise handle the input.
+    if trimmed.contains('\\') {
         return None;
     }
 
@@ -935,5 +958,44 @@ mod tests {
     #[test]
     fn extract_scp_like_authority_requires_at_sign() {
         assert_eq!(extract_git_authority("github.com:owner/repo.git"), None);
+    }
+
+    // ---- Backslash: WHATWG-vs-libgit2 authority differential (#1429 r3 P1) ----
+
+    /// The exact differential the r3 review causally proved against the real
+    /// pinned libgit2 stack: for a "special" scheme, WHATWG (`url::Url::parse`)
+    /// treats `\` as ending the authority early, resolving to `github.com` —
+    /// but libgit2's own C parser treats `\` as an ordinary authority
+    /// character and splits userinfo at the last `@`, resolving to
+    /// `evil.example`. Because the two parsers disagree on what the
+    /// authority even is, the function must refuse to answer at all.
+    #[test]
+    fn extract_git_authority_rejects_backslash_differential() {
+        assert_eq!(
+            extract_git_authority("https://github.com\\@evil.example/repo.git"),
+            None,
+            "a backslash-containing authority is a WHATWG/libgit2 parser \
+             differential and must fail closed, not resolve to either parser's answer",
+        );
+    }
+
+    /// Backslash is rejected regardless of scheme or position — this is not
+    /// specific to the `https` special-scheme case above.
+    #[test]
+    fn extract_git_authority_rejects_backslash_anywhere() {
+        assert_eq!(extract_git_authority("ssh://git@github.com\\evil/x"), None);
+        assert_eq!(extract_git_authority("https://evil.example/\\@github.com"), None);
+        assert_eq!(extract_git_authority("http://github.com\\.evil.example/x"), None);
+    }
+
+    /// scp-like syntax is covered by the same top-level guard: a backslash
+    /// anywhere in scp-like input is rejected before the `@`/`:` boundary
+    /// logic ever runs.
+    #[test]
+    fn extract_git_authority_rejects_backslash_in_scp_like() {
+        assert_eq!(
+            extract_git_authority("git@github.com\\evil.example:owner/repo.git"),
+            None
+        );
     }
 }
