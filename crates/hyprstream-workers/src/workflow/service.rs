@@ -697,6 +697,12 @@ impl WorkflowService {
 
     /// Rescan a repository with an explicit [`ParseMode`] (#1432).
     ///
+    /// The mode is **persisted** per-repo (via [`Self::set_repo_mode`]) so
+    /// that later event-triggered rescans through the generic
+    /// [`Self::rescan_repo`] retain it rather than silently dropping back to
+    /// legacy — regardless of whether strict was first selected via
+    /// `load_repo_with` or directly here.
+    ///
     /// **Fail-closed stale eviction:** a workflow that was previously
     /// registered for this repo but is *absent* from the fresh scan set —
     /// because it was rejected by strict mode, deleted, or otherwise failed
@@ -711,6 +717,12 @@ impl WorkflowService {
         repo_id: &str,
         mode: super::parser::ParseMode,
     ) -> Result<()> {
+        // Persist the mode so the generic rescan path retains it (#1432):
+        // a caller that enters strict via rescan_repo_with directly (rather
+        // than load_repo_with) must still have its choice survive later
+        // event-triggered rescan_repo(repo) calls.
+        self.set_repo_mode(repo_id, mode).await;
+
         let workflows = self.scan_repo_with(repo_id, mode).await?;
 
         // Fresh set of workflow ids for this repo, per the scan.
@@ -1304,6 +1316,41 @@ jobs:
         assert!(
             workflow_ids(&svc.list_workflows().await?).contains(&wf_id),
             "unregistered repo must default to legacy and keep the unknown-key workflow"
+        );
+        Ok(())
+    }
+
+    // ─── Rev 5 P1: rescan_repo_with persists mode for later generic rescan ──
+
+    #[tokio::test]
+    async fn explicit_rescan_with_strict_persists_mode_for_generic_rescan() -> TestResult {
+        // Enter strict via rescan_repo_with DIRECTLY (not load_repo_with nor
+        // set_repo_mode). The mode must persist so a later generic
+        // rescan_repo(repo) — the path HandlerResult::Rescan / initialize use
+        // — stays strict rather than falling back to legacy.
+        let tmp = tempfile::tempdir()?;
+        write_workflow(tmp.path(), KNOWN_YAML).await?;
+
+        let svc = test_service();
+        svc.register_repo_path("acme", PathBuf::from(tmp.path())).await;
+
+        // Enter strict via the explicit rescan variant only.
+        svc.rescan_repo_with("acme", super::super::parser::ParseMode::Strict)
+            .await?;
+        let wf_id = String::from("acme:.github/workflows/gate.yml");
+        assert!(workflow_ids(&svc.list_workflows().await?).contains(&wf_id));
+
+        // Mutate to add an unknown key, then trigger the GENERIC rescan path
+        // (no mode arg). It must have retained strict from the prior
+        // rescan_repo_with call.
+        write_workflow(tmp.path(), UNKNOWN_KEY_YAML).await?;
+        svc.rescan_repo("acme").await?;
+
+        assert!(
+            !workflow_ids(&svc.list_workflows().await?).contains(&wf_id),
+            "rescan_repo_with(Strict) must persist the mode: a later generic \
+             rescan_repo must stay strict and skip+evict the unknown-key workflow, \
+             not silently fall back to legacy"
         );
         Ok(())
     }
