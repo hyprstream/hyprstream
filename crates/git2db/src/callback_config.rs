@@ -102,6 +102,36 @@ pub struct CertificatePinning {
     pub fingerprint: Vec<u8>,
 }
 
+/// Off-site redirect policy for credential-bearing git operations.
+///
+/// libgit2's default (`Initial`) allows an off-site redirect on the initial
+/// request. Since the credential callback receives the *original* URL (not the
+/// redirect target) in the pinned libgit2 1.9.x, this means a token bound to
+/// host A can be offered to a redirect target host B (Sol P1 #1429). The
+/// secure default is [`RedirectPolicy::None`] — no off-site redirects.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum RedirectPolicy {
+    /// Do not follow any off-site redirects at any stage. **Secure default.**
+    /// Same-authority redirects (e.g. path changes on the same host) may still
+    /// be followed by the transport.
+    #[default]
+    None,
+    /// Follow off-site redirects on the initial request only (libgit2's
+    /// default). **Insecure with host-scoped credentials** — the credential
+    /// callback cannot verify the effective peer after redirect.
+    Initial,
+}
+
+impl RedirectPolicy {
+    /// Convert to the `git2` crate's redirect type.
+    pub fn to_git2(self) -> git2::RemoteRedirect {
+        match self {
+            RedirectPolicy::None => git2::RemoteRedirect::None,
+            RedirectPolicy::Initial => git2::RemoteRedirect::Initial,
+        }
+    }
+}
+
 /// Send-safe callback configuration
 ///
 /// This type captures the *configuration* for callbacks rather than the callbacks themselves.
@@ -120,6 +150,11 @@ pub struct CallbackConfig {
 
     /// Certificate validation configuration
     pub certificates: CertificateConfig,
+
+    /// Off-site redirect policy. Defaults to [`RedirectPolicy::None`] (no
+    /// off-site redirects) to prevent credential exfiltration via redirect
+    /// when host-scoped credentials are present.
+    pub redirect_policy: RedirectPolicy,
 
     /// Pack progress reporting
     pub pack_progress: bool,
@@ -288,27 +323,29 @@ impl CallbackConfig {
                 if !allowed_types.contains(CredentialType::USER_PASS_PLAINTEXT) {
                     return Err(git2::Error::from_str("Token authentication not allowed"));
                 }
-                // Enforce host scope (issue #1429 Sol P1): a token bound to an
-                // exact origin host is only offered when the request URL's host
-                // matches, preventing exfiltration to a caller-selected remote.
+                // Enforce authority scope (issue #1429 Sol P1): the authority
+                // is extracted path-safely and canonicalized, preventing
+                // path/query `@` spoofing, case confusion, port confusion,
+                // and IPv6 truncation.
                 if let Some(bound) = host {
-                    match crate::auth::extract_git_host(url) {
-                        Some(req_host) if req_host == bound.as_str() => {}
-                        Some(req_host) => {
+                    match crate::auth::extract_git_authority(url) {
+                        Some(req_auth) if req_auth == *bound => {}
+                        Some(req_auth) => {
                             tracing::debug!(
-                                "Refusing host-scoped token for {url}: bound to {bound:?}, \
-                                 request host is {req_host:?}"
+                                "Refusing authority-scoped token for {url}: bound to \
+                                 {bound:?}, request authority is {req_auth:?}"
                             );
                             return Err(git2::Error::from_str(
-                                "Token is scoped to a different host",
+                                "Token is scoped to a different authority",
                             ));
                         }
                         None => {
                             tracing::debug!(
-                                "Refusing host-scoped token for {url}: could not parse host"
+                                "Refusing authority-scoped token for {url}: could not parse \
+                                 authority"
                             );
                             return Err(git2::Error::from_str(
-                                "Token is host-scoped but request URL host is unparseable",
+                                "Token is authority-scoped but request URL is unparseable",
                             ));
                         }
                     }
@@ -448,6 +485,14 @@ impl CallbackConfigBuilder {
     /// Set certificate configuration
     pub fn certificates(mut self, certs: CertificateConfig) -> Self {
         self.config.certificates = certs;
+        self
+    }
+
+    /// Set the off-site redirect policy (default: [`RedirectPolicy::None`] —
+    /// no off-site redirects). See [`RedirectPolicy`] for why the default
+    /// matters when a host-scoped credential is configured.
+    pub fn redirect_policy(mut self, policy: RedirectPolicy) -> Self {
+        self.config.redirect_policy = policy;
         self
     }
 

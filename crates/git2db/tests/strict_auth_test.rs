@@ -21,7 +21,9 @@
 
 use git2::CertificateCheckStatus;
 use git2db::auth::{AuthManager, AuthStrategy};
-use git2db::callback_config::{AuthMode, CallbackConfig, CertificateConfig, CertificatePinning};
+use git2db::callback_config::{
+    AuthMode, CallbackConfig, CertificateConfig, CertificatePinning, RedirectPolicy,
+};
 
 /// The default `CertificateConfig` must be `Strict`, not `AcceptAll`.
 #[test]
@@ -50,6 +52,66 @@ fn default_callback_config_is_strict_and_explicit() {
     let cfg = CallbackConfig::default();
     assert!(matches!(cfg.certificates, CertificateConfig::Strict));
     assert!(matches!(cfg.auth_mode, AuthMode::ExplicitOnly));
+}
+
+// ---------------------------------------------------------------------------
+// Off-site redirect policy — issue #1429 Sol P1 (revision round 2).
+// ---------------------------------------------------------------------------
+
+/// The default `RedirectPolicy` must be `None` (no off-site redirects), not
+/// libgit2's own default (`Initial`, which allows one). Under the pinned
+/// libgit2 1.9.x, the credential callback receives the pre-redirect URL even
+/// after libgit2 follows an off-site redirect, so a host-scoped credential
+/// could otherwise be offered to the redirect target.
+#[test]
+fn default_redirect_policy_is_none() {
+    assert_eq!(RedirectPolicy::default(), RedirectPolicy::None);
+}
+
+/// The default `CallbackConfig` (the send-safe clone path) carries the secure
+/// redirect default.
+#[test]
+fn default_callback_config_redirect_policy_is_none() {
+    let cfg = CallbackConfig::default();
+    assert_eq!(cfg.redirect_policy, RedirectPolicy::None);
+}
+
+/// `RedirectPolicy::None` maps to `git2::RemoteRedirect::None` (block every
+/// off-site redirect); `Initial` maps to libgit2's own default
+/// (`RemoteRedirect::Initial`, follow on the first request only). This is the
+/// literal knob applied to `FetchOptions::follow_redirects`.
+#[test]
+fn redirect_policy_maps_to_git2_remote_redirect() {
+    assert!(matches!(
+        RedirectPolicy::None.to_git2(),
+        git2::RemoteRedirect::None
+    ));
+    assert!(matches!(
+        RedirectPolicy::Initial.to_git2(),
+        git2::RemoteRedirect::Initial
+    ));
+}
+
+/// The legacy sync `AuthManager` path — which has no `FetchOptions` of its
+/// own to enforce the policy against — must still default to `None` so any
+/// caller that plumbs `AuthManager::redirect_policy()` into its own
+/// `FetchOptions::follow_redirects` inherits the secure default rather than
+/// libgit2's `Initial`.
+#[test]
+fn auth_manager_default_redirect_policy_is_none() {
+    assert_eq!(AuthManager::new().redirect_policy(), RedirectPolicy::None);
+    assert_eq!(
+        AuthManager::with_strategies(vec![]).redirect_policy(),
+        RedirectPolicy::None
+    );
+}
+
+/// `AuthManager::with_redirect_policy` is the explicit, opt-in-only escape
+/// hatch — the default is never silently `Initial`.
+#[test]
+fn auth_manager_redirect_policy_is_explicit_opt_in() {
+    let mgr = AuthManager::new().with_redirect_policy(RedirectPolicy::Initial);
+    assert_eq!(mgr.redirect_policy(), RedirectPolicy::Initial);
 }
 
 // ---------------------------------------------------------------------------
