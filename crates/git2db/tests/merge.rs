@@ -215,9 +215,10 @@ fn sequential_composition_is_deterministic_across_reruns() -> Result<()> {
         ]
     );
 
-    // The detached commit must be addressable and carry all heads as parents.
+    // The detached commit must be addressable and carry base + heads as
+    // parents (base preserved so the candidate descends from it).
     let commit_obj = repo.find_commit(first.commit)?;
-    assert_eq!(commit_obj.parent_count(), 3, "parents == heads");
+    assert_eq!(commit_obj.parent_count(), 4, "parents == base + heads");
     assert_eq!(commit_obj.tree()?.id(), first.tree);
     Ok(())
 }
@@ -263,6 +264,165 @@ fn compose_candidate_rejects_empty_heads() -> Result<()> {
         err.to_string()
             .contains("compose_candidate requires at least one head"),
         "expected empty-heads error, got: {err}"
+    );
+    Ok(())
+}
+
+// ---- P1.1: per-head merge base keeps a stale head from dropping base-only
+// changes. ----
+
+/// Build a three-commit history so a head can be "stale" relative to base:
+///   `root` ── `base` (adds base-only feature `base_only.txt`)
+///      └──── `stale` (adds `head.txt`, branched off `root`, lacks the feature)
+fn stale_head_fixture() -> Result<(TempDir, Repository, Oid, Oid)> {
+    let dir = TempDir::new()?;
+    let repo = Repository::init(dir.path())?;
+    let root = {
+        let t = write_tree(&repo, &[("shared.txt", "root\n")])?;
+        commit(&repo, "root", &t, &[], true)?
+    };
+    let base = {
+        let t = write_tree(
+            &repo,
+            &[("shared.txt", "root\n"), ("base_only.txt", "keep me\n")],
+        )?;
+        commit(&repo, "base", &t, &[&repo.find_commit(root)?], false)?
+    };
+    let stale = {
+        // Branched off `root` — does NOT carry base_only.txt.
+        let t = write_tree(&repo, &[("shared.txt", "root\n"), ("head.txt", "head\n")])?;
+        commit(&repo, "stale", &t, &[&repo.find_commit(root)?], false)?
+    };
+    Ok((dir, repo, base, stale))
+}
+
+#[test]
+fn stale_head_does_not_drop_base_only_changes() -> Result<()> {
+    let (_dir, repo, base, stale) = stale_head_fixture()?;
+
+    let composer = CandidateComposer::new(&repo);
+    let candidate = composer.compose_candidate(base, &[stale], "fold stale head")?;
+
+    // The base-only feature must survive: the stale head never touched it, so
+    // merging it in must not delete `base_only.txt`. (With a fixed
+    // ancestor=base_tree this path would read as "deleted by theirs".)
+    let tree = repo.find_tree(candidate.tree)?;
+    let names = sorted_names(&tree)?;
+    assert!(
+        names.contains(&"base_only.txt".to_owned()),
+        "base-only feature was dropped by stale head; tree = {names:?}"
+    );
+    assert!(names.contains(&"head.txt".to_owned()), "head addition lost");
+    assert!(names.contains(&"shared.txt".to_owned()), "shared file lost");
+    Ok(())
+}
+
+// ---- P1.2: base preserved in ancestry → candidate is fast-forwardable. ----
+
+#[test]
+fn candidate_descends_from_base_for_fast_forward() -> Result<()> {
+    let (_dir, repo, base) = base_repo()?;
+    let base_commit = repo.find_commit(base)?;
+    let head = commit(
+        &repo,
+        "head",
+        &write_tree(&repo, &[("README.md", "# base\n"), ("y.txt", "y\n")])?,
+        &[&base_commit],
+        false,
+    )?;
+
+    let composer = CandidateComposer::new(&repo);
+    let candidate = composer.compose_candidate(base, &[head], "ff-able")?;
+
+    // base must be an ancestor of the candidate (graph_descendant_of(base,
+    // candidate) == false ⟺ base is NOT a descendant of candidate; we want the
+    // inverse: candidate descends from base).
+    assert!(
+        repo.graph_descendant_of(candidate.commit, base)?,
+        "candidate must descend from base so a branch at base can fast-forward"
+    );
+    // And base's merge-base with the candidate is base itself.
+    let mb = repo.merge_base(base, candidate.commit)?;
+    assert_eq!(
+        mb, base,
+        "base must be the merge base of itself and the candidate"
+    );
+    Ok(())
+}
+
+// ---- P2: merge_bases returns empty for unrelated histories. ----
+
+#[test]
+fn merge_bases_empty_for_unrelated_histories() -> Result<()> {
+    let dir = TempDir::new()?;
+    let repo = Repository::init(dir.path())?;
+
+    // Two independent root commits in the same object database, with no
+    // shared ancestry.
+    let a = {
+        let t = write_tree(&repo, &[("a.txt", "a\n")])?;
+        commit(&repo, "a", &t, &[], false)?
+    };
+    let b = {
+        let t = write_tree(&repo, &[("b.txt", "b\n")])?;
+        commit(&repo, "b", &t, &[], false)?
+    };
+
+    let composer = CandidateComposer::new(&repo);
+    let bases = composer.merge_bases(a, b)?;
+    assert!(
+        bases.is_empty(),
+        "unrelated histories must yield an empty merge-base set, got {bases:?}"
+    );
+    // The singular form surfaces the same case as a typed InvalidOperation.
+    let err = composer
+        .merge_base(a, b)
+        .err()
+        .ok_or("expected an error for unrelated merge_base")?;
+    assert!(
+        err.to_string().contains("no merge base"),
+        "expected a 'no merge base' error, got: {err}"
+    );
+    Ok(())
+}
+
+// ---- P3: conflict count counts distinct paths, not stage entries. ----
+
+#[test]
+fn conflict_count_uses_distinct_paths() -> Result<()> {
+    let (_dir, repo, _base) = base_repo()?;
+
+    // A single modify/modify conflict on `same.txt` produces two stage
+    // entries (Ours + Theirs) but is one conflicted path.
+    let ours_tree = write_tree(&repo, &[("same.txt", "ours\n")])?;
+    let theirs_tree = write_tree(&repo, &[("same.txt", "theirs\n")])?;
+    let base_tree = write_tree(&repo, &[("same.txt", "base\n")])?;
+
+    let composer = CandidateComposer::new(&repo);
+    let res = composer.merge_trees(&base_tree, &ours_tree, &theirs_tree)?;
+    assert!(res.has_conflicts());
+
+    let report = &res.conflicts;
+    assert_eq!(
+        report.len(),
+        1,
+        "len() must count distinct conflicted paths, not stage entries"
+    );
+    // A modify/modify conflict where the ancestor carried the file yields
+    // three stage entries (Ancestor + Ours + Theirs); the point is that this
+    // raw entry count exceeds the distinct-path count.
+    assert!(
+        report.entry_count() >= 2,
+        "entry_count() must reflect multiple stage entries, got {}",
+        report.entry_count()
+    );
+    assert_eq!(report.paths(), vec!["same.txt"]);
+
+    // Display reports the distinct-path count, not the raw entry count.
+    let display = report.to_string();
+    assert!(
+        display.starts_with("1 conflict(s)"),
+        "Display must report 1 conflict, got: {display}"
     );
     Ok(())
 }

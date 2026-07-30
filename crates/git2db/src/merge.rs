@@ -117,12 +117,19 @@ impl ConflictReport {
         self.entries.is_empty()
     }
 
-    /// Number of captured (path, side) entries.
+    /// Number of **distinct conflicted paths**.
     ///
-    /// One conflicted path typically contributes 2–3 entries (one per
-    /// present stage); use [`paths`](Self::paths) for a de-duplicated path
-    /// count.
+    /// This is the meaningful "conflict count": a modify/modify conflict on
+    /// one file is one conflict, even though it contributes two stage entries
+    /// (`Ours` and `Theirs`). For the raw per-side entry count, use
+    /// [`entry_count`](Self::entry_count).
     pub fn len(&self) -> usize {
+        self.paths().len()
+    }
+
+    /// Raw number of `(path, side)` entries captured — one per present stage,
+    /// so a single conflicted path typically counts as 2–3.
+    pub fn entry_count(&self) -> usize {
         self.entries.len()
     }
 
@@ -133,7 +140,7 @@ impl ConflictReport {
 
     /// Distinct conflicted paths, in first-seen order.
     pub fn paths(&self) -> Vec<&str> {
-        let mut seen = Vec::new();
+        let mut seen: Vec<&str> = Vec::new();
         for e in &self.entries {
             if !seen.contains(&e.path.as_str()) {
                 seen.push(e.path.as_str());
@@ -145,12 +152,15 @@ impl ConflictReport {
 
 impl fmt::Display for ConflictReport {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{} conflict(s)", self.entries.len())?;
-        for e in self.entries.iter().take(8) {
-            write!(f, "; {}={}", e.side, e.path)?;
+        // Count distinct paths, not raw stage entries: one conflicted file is
+        // one conflict regardless of how many sides are present.
+        let paths = self.paths();
+        write!(f, "{} conflict(s)", paths.len())?;
+        for path in paths.iter().take(8) {
+            write!(f, "; {path}")?;
         }
-        if self.entries.len() > 8 {
-            write!(f, "; …(+{} more)", self.entries.len() - 8)?;
+        if paths.len() > 8 {
+            write!(f, "; …(+{} more)", paths.len() - 8)?;
         }
         Ok(())
     }
@@ -200,7 +210,11 @@ pub struct Candidate {
 ///
 /// ```rust,no_run
 /// # use git2db::merge::CandidateComposer;
-/// # fn example(repo: &git2::Repository) -> Result<(), Box<dyn std::error::Error>> {
+/// # fn example(
+/// #     repo: &git2::Repository,
+/// #     oid_a: git2::Oid,
+/// #     oid_b: git2::Oid,
+/// # ) -> Result<(), Box<dyn std::error::Error>> {
 /// let composer = CandidateComposer::new(repo);
 /// let mb = composer.merge_base(oid_a, oid_b)?;
 /// # Ok(())
@@ -218,22 +232,32 @@ impl<'a> CandidateComposer<'a> {
 
     /// Compute the best common ancestor of two commits (`git merge-base`).
     ///
-    /// Thin, pure-read wrapper over [`git2::Repository::merge_base`].
+    /// Thin, pure-read wrapper over [`git2::Repository::merge_base`]. Returns
+    /// [`Git2DBError::InvalidOperation`] when the two commits share no history
+    /// (libgit2's `NotFound`), matching the "no common ancestor" semantics of
+    /// [`merge_bases`](Self::merge_bases).
     pub fn merge_base(&self, one: Oid, two: Oid) -> Git2DBResult<Oid> {
-        self.repo
-            .merge_base(one, two)
-            .map_err(|e| Git2DBError::internal(format!("merge_base failed: {e}")))
+        match self.repo.merge_base(one, two) {
+            Ok(oid) => Ok(oid),
+            Err(e) if e.code() == git2::ErrorCode::NotFound => Err(Git2DBError::invalid_operation(
+                format!("no merge base found for {one} and {two} (unrelated histories)"),
+            )),
+            Err(e) => Err(Git2DBError::internal(format!("merge_base failed: {e}"))),
+        }
     }
 
     /// Compute all merge bases of two commits (`git merge-base --all`).
     ///
     /// Thin, pure-read wrapper over [`git2::Repository::merge_bases`]. Returns
-    /// an empty `Vec` when the commits share no history.
+    /// an empty `Vec` when the commits share no history (libgit2's `NotFound`
+    /// is mapped to the empty set, since "no common ancestor" is a well-defined
+    /// answer rather than an error here).
     pub fn merge_bases(&self, one: Oid, two: Oid) -> Git2DBResult<Vec<Oid>> {
-        self.repo
-            .merge_bases(one, two)
-            .map_err(|e| Git2DBError::internal(format!("merge_bases failed: {e}")))
-            .map(|arr| arr.iter().copied().collect())
+        match self.repo.merge_bases(one, two) {
+            Ok(arr) => Ok(arr.iter().copied().collect()),
+            Err(e) if e.code() == git2::ErrorCode::NotFound => Ok(Vec::new()),
+            Err(e) => Err(Git2DBError::internal(format!("merge_bases failed: {e}"))),
+        }
     }
 
     /// Three-way merge of trees, fully in memory.
@@ -274,19 +298,28 @@ impl<'a> CandidateComposer<'a> {
     ///
     /// Performs an octopus-style cumulative merge: starting from `base`'s tree
     /// as the accumulator, each head is folded in with a three-way
-    /// `merge_trees(ancestor = base_tree, ours = accumulator, theirs = head)`
-    /// step. Because each step is a pure function of its three trees, the
-    /// resulting tree OID is stable across reruns for the same inputs.
+    /// `merge_trees` step whose **ancestor is the per-head merge base** —
+    /// `merge_base(base, head)` — rather than `base` itself. Computing the
+    /// ancestor per head is what keeps a *stale* head (one branched off an
+    /// older base) from silently dropping changes that only exist in the
+    /// supplied `base`: libgit2 only interprets a side as "deleted" when the
+    /// ancestor had the content, so using each head's true divergence point
+    /// preserves base-only additions.
+    ///
+    /// Because each `merge_trees` step is a pure function of its three trees,
+    /// the resulting tree OID is stable across reruns for the same inputs.
     ///
     /// On success, writes a **detached** commit — referenced by no ref, HEAD
-    /// unchanged — whose parents are the `heads` (the common base is implied
-    /// by the merge bases and is not duplicated as a parent).
+    /// unchanged — whose parents are `base` **plus** the `heads`. Including
+    /// `base` as a parent makes the candidate a descendant of `base`, so a
+    /// branch at `base` can fast-forward onto the candidate.
     ///
     /// # Errors
     ///
     /// Returns [`Git2DBError::MergeConflictReport`] if any step conflicts,
     /// carrying the structured [`ConflictReport`] for that step. Returns
-    /// [`Git2DBError::InvalidOperation`] if `heads` is empty.
+    /// [`Git2DBError::InvalidOperation`] if `heads` is empty, or if a head
+    /// shares no merge base with `base` (unrelated history).
     pub fn compose_candidate(
         &self,
         base: Oid,
@@ -299,32 +332,42 @@ impl<'a> CandidateComposer<'a> {
             ));
         }
 
-        // Resolve trees and parent commits up front so a missing head fails
-        // fast before any merge work is done.
-        let base_tree = self.tree_of(base)?;
-        let mut head_trees = Vec::with_capacity(heads.len());
-        let mut parent_commits = Vec::with_capacity(heads.len());
+        // Resolve the base commit + tree up front; base is also preserved as
+        // the first parent of the candidate so the result descends from it.
+        let base_commit = self.commit_of(base)?;
+        let base_tree = base_commit.tree()?;
+
+        // Resolve each head's tree and its *per-head* merge-base tree with
+        // `base`. Using the true divergence point as the ancestor (rather than
+        // `base_tree`) is what prevents a stale head from dropping base-only
+        // changes — see the method doc.
+        let mut head_trees: Vec<Tree<'a>> = Vec::with_capacity(heads.len());
+        let mut head_ancestors: Vec<Tree<'a>> = Vec::with_capacity(heads.len());
+        let mut head_commits: Vec<git2::Commit<'a>> = Vec::with_capacity(heads.len());
         for &h in heads {
             let commit = self.commit_of(h)?;
             head_trees.push(commit.tree()?);
-            parent_commits.push(commit);
+            // The per-head merge base is the ancestor for this step. A NotFound
+            // (unrelated history) surfaces as InvalidOperation via merge_base.
+            let ancestor_oid = self.merge_base(base, h)?;
+            head_ancestors.push(self.tree_of(ancestor_oid)?);
+            head_commits.push(commit);
         }
 
-        // Sequential fold: base_tree is the fixed ancestor for every step
-        // (the common merge base), and `accumulator` carries the running
-        // composed tree.
+        // Sequential fold: `accumulator` starts at base's tree and absorbs
+        // each head using that head's own merge-base tree as the ancestor.
         let mut accumulator = base_tree.clone();
-        for head_tree in &head_trees {
-            let step = self.merge_trees(&base_tree, &accumulator, head_tree)?;
+        for (head_tree, head_ancestor) in head_trees.iter().zip(head_ancestors.iter()) {
+            let step = self.merge_trees(head_ancestor, &accumulator, head_tree)?;
             match step.tree {
                 Some(t) => accumulator = self.repo.find_tree(t).map_err(Git2DBError::from)?,
-                None => {
-                    return Err(Git2DBError::MergeConflictReport(step.conflicts));
-                }
+                None => return Err(Git2DBError::MergeConflictReport(step.conflicts)),
             }
         }
 
         // Detached commit: update_ref = None → no ref update, no HEAD move.
+        // Parents = [base, ...heads]: base is preserved in ancestry so the
+        // candidate is a descendant of base (fast-forwardable).
         // Fall back to a deterministic identity when the repo has no
         // configured signature (e.g. a fresh test repository).
         let sig = self
@@ -332,10 +375,14 @@ impl<'a> CandidateComposer<'a> {
             .signature()
             .or_else(|_| git2::Signature::now("git2db-merge", "git2db@local"))
             .map_err(|e| Git2DBError::internal(format!("signature resolution failed: {e}")))?;
-        let parent_refs: Vec<&git2::Commit<'_>> = parent_commits.iter().collect();
+        let mut parents: Vec<&git2::Commit<'_>> = Vec::with_capacity(head_commits.len() + 1);
+        parents.push(&base_commit);
+        for hc in &head_commits {
+            parents.push(hc);
+        }
         let commit_oid = self
             .repo
-            .commit(None, &sig, &sig, message, &accumulator, &parent_refs)
+            .commit(None, &sig, &sig, message, &accumulator, &parents)
             .map_err(|e| Git2DBError::internal(format!("detached commit failed: {e}")))?;
 
         Ok(Candidate {
@@ -397,7 +444,9 @@ mod tests {
                 },
             ],
         };
-        assert_eq!(r.len(), 3);
+        // len() counts distinct conflicted paths (2), not stage entries (3).
+        assert_eq!(r.len(), 2);
+        assert_eq!(r.entry_count(), 3);
         assert_eq!(r.paths(), vec!["a", "b"]);
     }
 
