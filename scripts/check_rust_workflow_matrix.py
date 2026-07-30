@@ -272,6 +272,7 @@ def check_rust_text(text: str) -> None:
     # otherwise a full link writes into the 80 GiB runner root and can exhaust
     # it despite the 200 GiB cache volume being available.
     required_cache_args = (
+        "--security-opt label=disable",
         "-v /mnt/hypr-ci-cache:/mnt/hypr-ci-cache",
         "-e CARGO_TARGET_DIR=/mnt/hypr-ci-cache/target/hyprstream",
     )
@@ -286,6 +287,10 @@ def check_rust_text(text: str) -> None:
         _assert(
             "-v /mnt/hypr-ci-cache:/mnt/hypr-ci-cache:Z" not in block,
             f"rust.yml: job {name!r} must not SELinux-relabel the cache EBS mount",
+        )
+        _assert(
+            re.search(r"\\\n[ \t]*#", block) is None,
+            f"rust.yml: job {name!r} must not put comments inside continued shell commands",
         )
 
 
@@ -422,6 +427,18 @@ def _rust_mutations(rust_text: str) -> list[tuple[str, str]]:
             rust_text.replace(
                 "          -v /mnt/hypr-ci-cache:/mnt/hypr-ci-cache \\\n",
                 "          -v /mnt/hypr-ci-cache:/mnt/hypr-ci-cache:Z \\\n",
+                1,
+            ),
+        ),
+        (
+            "disable cache label bypass",
+            rust_text.replace("--security-opt label=disable ", "", 1),
+        ),
+        (
+            "comment inside continued Podman command",
+            rust_text.replace(
+                "          -v /mnt/hypr-ci-cache:/mnt/hypr-ci-cache \\\n",
+                "          # unsafe inline comment \\\n          -v /mnt/hypr-ci-cache:/mnt/hypr-ci-cache \\\n",
                 1,
             ),
         ),
