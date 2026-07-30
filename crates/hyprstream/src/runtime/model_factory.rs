@@ -262,14 +262,16 @@ impl ModelFactory {
         }
 
         Self::validate_stage_range(&request.layer_range, config.num_hidden_layers)?;
-        let weights = Self::load_weights_for_stage(
+        let plan = Self::stage_weight_plan(
             model_path,
             config.num_hidden_layers,
             request.layer_range.clone(),
-            device,
-            dtype,
-        )
-        .await?;
+        )?;
+        let metadata = Self::stage_tensor_metadata(&plan)?;
+        Self::validate_stage_tensor_schema(&config, &request.layer_range, &metadata)?;
+        let weights =
+            Self::load_weights_for_stage_plan(plan, request.layer_range.clone(), device, dtype)
+                .await?;
 
         Self::create_llama_model(
             config,
@@ -480,6 +482,288 @@ impl ModelFactory {
         Ok(plan)
     }
 
+    /// Read only selected safetensors headers before allocating any `tch` tensor.
+    ///
+    /// This preflight deliberately reuses the authoritative I/O plan. It opens no
+    /// shard outside that plan and calls neither `TensorView::data()` nor a
+    /// device-placement API, so a schema mismatch fails before model memory is
+    /// materialized.
+    fn stage_tensor_metadata(
+        plan: &BTreeMap<PathBuf, BTreeSet<String>>,
+    ) -> Result<BTreeMap<String, Vec<usize>>> {
+        use memmap2::Mmap;
+        use std::fs::File;
+
+        let mut metadata = BTreeMap::new();
+        for (shard, names) in plan {
+            let file = File::open(shard).with_context(|| {
+                format!("failed to open required stage shard {}", shard.display())
+            })?;
+            let mmap = unsafe { Mmap::map(&file) }.with_context(|| {
+                format!("failed to mmap required stage shard {}", shard.display())
+            })?;
+            let tensors = safetensors::SafeTensors::deserialize(&mmap).with_context(|| {
+                format!("failed to parse required stage shard {}", shard.display())
+            })?;
+
+            for name in names {
+                let view = tensors.tensor(name).with_context(|| {
+                    format!(
+                        "authoritative weight_map assigns `{name}` to {}, but the tensor is absent",
+                        shard.display()
+                    )
+                })?;
+                if metadata
+                    .insert(name.clone(), view.shape().to_vec())
+                    .is_some()
+                {
+                    bail!("authoritative stage plan contains duplicate tensor `{name}`");
+                }
+            }
+        }
+        Ok(metadata)
+    }
+
+    fn stage_metadata_alias<'a>(
+        metadata: &'a BTreeMap<String, Vec<usize>>,
+        aliases: &[&str],
+        description: &str,
+    ) -> Result<(String, &'a [usize])> {
+        aliases
+            .iter()
+            .find_map(|name| {
+                metadata
+                    .get(*name)
+                    .map(|shape| ((*name).to_owned(), shape.as_slice()))
+            })
+            .ok_or_else(|| {
+                anyhow!(
+                    "selected stage metadata is missing required {description}; expected one of {}",
+                    aliases.join(", ")
+                )
+            })
+    }
+
+    fn require_stage_shape(
+        metadata: &BTreeMap<String, Vec<usize>>,
+        name: &str,
+        expected: &[usize],
+    ) -> Result<()> {
+        let actual = metadata.get(name).ok_or_else(|| {
+            anyhow!("selected stage metadata is missing required tensor `{name}`")
+        })?;
+        if actual.as_slice() != expected {
+            bail!(
+                "stage tensor `{name}` shape mismatch: config requires {:?}, checkpoint has {:?}",
+                expected,
+                actual
+            );
+        }
+        Ok(())
+    }
+
+    fn require_optional_stage_shape(
+        metadata: &BTreeMap<String, Vec<usize>>,
+        name: &str,
+        expected: &[usize],
+    ) -> Result<()> {
+        if metadata.contains_key(name) {
+            Self::require_stage_shape(metadata, name, expected)?;
+        }
+        Ok(())
+    }
+
+    /// Fail closed when authoritative config dimensions disagree with selected
+    /// tensor headers. This is stricter than the legacy whole-model loader,
+    /// which historically reconciles embedding dimensions after loading: stage
+    /// mode must prove the checkpoint/config pair is coherent before allocating
+    /// a requested subset.
+    fn validate_stage_tensor_schema(
+        config: &ModelConfig,
+        layer_range: &Range<usize>,
+        metadata: &BTreeMap<String, Vec<usize>>,
+    ) -> Result<()> {
+        Self::validate_stage_range(layer_range, config.num_hidden_layers)?;
+
+        let hidden = config.hidden_size;
+        let intermediate = config.intermediate_size;
+        let query_width = config
+            .num_attention_heads
+            .checked_mul(config.head_dim)
+            .ok_or_else(|| anyhow!("query projection width overflows usize"))?;
+        let kv_width = config
+            .num_key_value_heads
+            .checked_mul(config.head_dim)
+            .ok_or_else(|| anyhow!("key/value projection width overflows usize"))?;
+        if hidden == 0 || intermediate == 0 || query_width == 0 || kv_width == 0 {
+            bail!(
+                "stage config contains an invalid zero dimension: hidden={hidden}, \
+                 intermediate={intermediate}, query_width={query_width}, kv_width={kv_width}"
+            );
+        }
+
+        let is_first = layer_range.start == 0;
+        let is_last = layer_range.end == config.num_hidden_layers;
+        if is_first {
+            let (name, shape) = Self::stage_metadata_alias(
+                metadata,
+                &["model.embed_tokens.weight", "embed_tokens.weight"],
+                "embedding tensor",
+            )?;
+            let expected = [config.vocab_size, hidden];
+            if shape != expected {
+                bail!(
+                    "stage tensor `{name}` shape mismatch: config requires {:?}, checkpoint has {:?}",
+                    expected,
+                    shape
+                );
+            }
+        }
+
+        if is_last {
+            let (norm_name, norm_shape) = Self::stage_metadata_alias(
+                metadata,
+                &["model.norm.weight", "norm.weight"],
+                "final norm tensor",
+            )?;
+            let expected_norm = [hidden];
+            if norm_shape != expected_norm {
+                bail!(
+                    "stage tensor `{norm_name}` shape mismatch: config requires {:?}, checkpoint has {:?}",
+                    expected_norm,
+                    norm_shape
+                );
+            }
+
+            if let Some((head_name, head_shape)) = ["lm_head.weight", "model.lm_head.weight"]
+                .into_iter()
+                .find_map(|name| metadata.get(name).map(|shape| (name, shape.as_slice())))
+            {
+                let expected_head = [config.vocab_size, hidden];
+                if head_shape != expected_head {
+                    bail!(
+                        "stage tensor `{head_name}` shape mismatch: config requires {:?}, \
+                         checkpoint has {:?}",
+                        expected_head,
+                        head_shape
+                    );
+                }
+            } else if !is_first {
+                bail!("a non-first final stage requires an explicit lm_head tensor");
+            }
+            // A complete-range stage without an explicit head ties the already
+            // validated embedding, so its [vocab, hidden] contract is identical.
+        }
+
+        for layer in layer_range.clone() {
+            let prefix = format!("model.layers.{layer}");
+            let q_proj = format!("{prefix}.self_attn.q_proj.weight");
+            let c_attn = format!("{prefix}.self_attn.c_attn.weight");
+            if metadata.contains_key(&q_proj) {
+                let k_proj = format!("{prefix}.self_attn.k_proj.weight");
+                let v_proj = format!("{prefix}.self_attn.v_proj.weight");
+                Self::require_stage_shape(metadata, &q_proj, &[query_width, hidden])?;
+                Self::require_stage_shape(metadata, &k_proj, &[kv_width, hidden])?;
+                Self::require_stage_shape(metadata, &v_proj, &[kv_width, hidden])?;
+                Self::require_optional_stage_shape(
+                    metadata,
+                    &format!("{prefix}.self_attn.q_proj.bias"),
+                    &[query_width],
+                )?;
+                Self::require_optional_stage_shape(
+                    metadata,
+                    &format!("{prefix}.self_attn.k_proj.bias"),
+                    &[kv_width],
+                )?;
+                Self::require_optional_stage_shape(
+                    metadata,
+                    &format!("{prefix}.self_attn.v_proj.bias"),
+                    &[kv_width],
+                )?;
+            } else if metadata.contains_key(&c_attn) {
+                if config.num_key_value_heads != config.num_attention_heads {
+                    bail!(
+                        "stage layer {layer} uses combined c_attn with grouped-query config \
+                         (attention heads {}, key/value heads {}), which the dense Llama \
+                         constructor cannot represent",
+                        config.num_attention_heads,
+                        config.num_key_value_heads
+                    );
+                }
+                let combined_width = query_width
+                    .checked_mul(3)
+                    .ok_or_else(|| anyhow!("combined attention width overflows usize"))?;
+                Self::require_stage_shape(metadata, &c_attn, &[combined_width, hidden])?;
+                Self::require_optional_stage_shape(
+                    metadata,
+                    &format!("{prefix}.self_attn.c_attn.bias"),
+                    &[combined_width],
+                )?;
+            } else {
+                bail!(
+                    "selected stage metadata is missing required attention projection for layer \
+                     {layer}; expected `{q_proj}` or `{c_attn}`"
+                );
+            }
+
+            let o_proj = format!("{prefix}.self_attn.o_proj.weight");
+            let c_proj = format!("{prefix}.self_attn.c_proj.weight");
+            let output_name = if metadata.contains_key(&o_proj) {
+                o_proj.as_str()
+            } else {
+                c_proj.as_str()
+            };
+            Self::require_stage_shape(metadata, output_name, &[hidden, query_width])?;
+            let output_bias = output_name
+                .strip_suffix(".weight")
+                .map(|prefix| format!("{prefix}.bias"))
+                .unwrap_or_else(|| format!("{output_name}.bias"));
+            Self::require_optional_stage_shape(metadata, &output_bias, &[hidden])?;
+
+            for (suffix, expected) in [
+                ("mlp.gate_proj.weight", [intermediate, hidden]),
+                ("mlp.up_proj.weight", [intermediate, hidden]),
+                ("mlp.down_proj.weight", [hidden, intermediate]),
+            ] {
+                Self::require_stage_shape(metadata, &format!("{prefix}.{suffix}"), &expected)?;
+            }
+            for (suffix, expected) in [
+                ("mlp.gate_proj.bias", [intermediate]),
+                ("mlp.up_proj.bias", [intermediate]),
+                ("mlp.down_proj.bias", [hidden]),
+            ] {
+                Self::require_optional_stage_shape(
+                    metadata,
+                    &format!("{prefix}.{suffix}"),
+                    &expected,
+                )?;
+            }
+            Self::require_stage_shape(
+                metadata,
+                &format!("{prefix}.input_layernorm.weight"),
+                &[hidden],
+            )?;
+            Self::require_stage_shape(
+                metadata,
+                &format!("{prefix}.post_attention_layernorm.weight"),
+                &[hidden],
+            )?;
+
+            let q_norm = format!("{prefix}.self_attn.q_norm.weight");
+            let k_norm = format!("{prefix}.self_attn.k_norm.weight");
+            if config.use_qk_norm
+                || metadata.contains_key(&q_norm)
+                || metadata.contains_key(&k_norm)
+            {
+                Self::require_stage_shape(metadata, &q_norm, &[config.head_dim])?;
+                Self::require_stage_shape(metadata, &k_norm, &[config.head_dim])?;
+            }
+        }
+
+        Ok(())
+    }
+
+    #[cfg(test)]
     async fn load_weights_for_stage(
         model_path: &Path,
         num_layers: usize,
@@ -488,6 +772,15 @@ impl ModelFactory {
         dtype: DType,
     ) -> Result<HashMap<String, Tensor>> {
         let plan = Self::stage_weight_plan(model_path, num_layers, layer_range.clone())?;
+        Self::load_weights_for_stage_plan(plan, layer_range, device, dtype).await
+    }
+
+    async fn load_weights_for_stage_plan(
+        plan: BTreeMap<PathBuf, BTreeSet<String>>,
+        layer_range: Range<usize>,
+        device: &Device,
+        dtype: DType,
+    ) -> Result<HashMap<String, Tensor>> {
         let planned_tensors: usize = plan.values().map(BTreeSet::len).sum();
         info!(
             "Loading stage {:?}: {} exact tensor(s) from {} shard(s)",
@@ -1516,11 +1809,19 @@ mod stage_subset_tests {
         }
 
         fn i64(name: impl Into<String>) -> Self {
+            Self::i64_shape(name, &[1])
+        }
+
+        fn i64_shape(name: impl Into<String>, shape: &[usize]) -> Self {
+            let elements = shape.iter().product();
+            let data = (0..elements)
+                .flat_map(|index| (index as i64 + 7).to_le_bytes())
+                .collect();
             Self {
                 name: name.into(),
                 dtype: Dtype::I64,
-                shape: vec![1],
-                data: 7_i64.to_le_bytes().to_vec(),
+                shape: shape.to_vec(),
+                data,
             }
         }
     }
@@ -1557,6 +1858,193 @@ mod stage_subset_tests {
             .values()
             .map(|tensor| tensor.numel() * tensor.kind().elt_size_in_bytes())
             .sum()
+    }
+
+    fn tiny_dense_tensors(explicit_head: bool) -> Vec<FixtureTensor> {
+        let mut tensors = vec![
+            FixtureTensor::f32("model.embed_tokens.weight", &[8, 4], 0.01),
+            FixtureTensor::f32("model.norm.weight", &[4], 1.0),
+        ];
+        if explicit_head {
+            tensors.push(FixtureTensor::f32("lm_head.weight", &[8, 4], 0.02));
+        }
+
+        let prefix = "model.layers.0";
+        for (suffix, shape, seed) in [
+            ("self_attn.q_proj.weight", vec![4, 4], 0.03),
+            ("self_attn.k_proj.weight", vec![4, 4], 0.04),
+            ("self_attn.v_proj.weight", vec![4, 4], 0.05),
+            ("self_attn.o_proj.weight", vec![4, 4], 0.06),
+            ("mlp.gate_proj.weight", vec![8, 4], 0.07),
+            ("mlp.up_proj.weight", vec![8, 4], 0.08),
+            ("mlp.down_proj.weight", vec![4, 8], 0.09),
+            ("input_layernorm.weight", vec![4], 1.0),
+            ("post_attention_layernorm.weight", vec![4], 1.0),
+        ] {
+            tensors.push(FixtureTensor::f32(
+                format!("{prefix}.{suffix}"),
+                &shape,
+                seed,
+            ));
+        }
+        tensors
+    }
+
+    fn write_tiny_dense_checkpoint(dir: &Path, tensors: &[FixtureTensor]) {
+        const SHARD: &str = "model-00001-of-00001.safetensors";
+        write_shard(dir, SHARD, tensors);
+        let entries: Vec<_> = tensors
+            .iter()
+            .map(|tensor| (tensor.name.as_str(), SHARD))
+            .collect();
+        write_index(dir, &entries);
+
+        let config = serde_json::json!({
+            "architectures": ["LlamaForCausalLM"],
+            "model_type": "llama",
+            "hidden_size": 4,
+            "intermediate_size": 8,
+            "num_hidden_layers": 1,
+            "num_attention_heads": 2,
+            "num_key_value_heads": 2,
+            "head_dim": 2,
+            "vocab_size": 8,
+            "max_position_embeddings": 16,
+            "rms_norm_eps": 0.00001
+        });
+        std::fs::write(
+            dir.join("config.json"),
+            serde_json::to_vec(&config).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn stage_schema_validates_all_dense_roles() {
+        let dir = tempfile::tempdir().unwrap();
+        write_tiny_dense_checkpoint(dir.path(), &tiny_dense_tensors(true));
+
+        let config = ModelConfig::load(dir.path(), &HashMap::new()).unwrap();
+        let plan = ModelFactory::stage_weight_plan(dir.path(), 1, 0..1).unwrap();
+        let metadata = ModelFactory::stage_tensor_metadata(&plan).unwrap();
+        ModelFactory::validate_stage_tensor_schema(&config, &(0..1), &metadata).unwrap();
+
+        for (name, bad_shape) in [
+            ("model.embed_tokens.weight", vec![7, 4]),
+            ("model.embed_tokens.weight", vec![8, 5]),
+            ("lm_head.weight", vec![7, 4]),
+            ("model.norm.weight", vec![5]),
+            ("model.layers.0.self_attn.q_proj.weight", vec![3, 4]),
+            ("model.layers.0.mlp.down_proj.weight", vec![4, 7]),
+            ("model.layers.0.input_layernorm.weight", vec![5]),
+        ] {
+            let mut mismatched = metadata.clone();
+            mismatched.insert(name.to_owned(), bad_shape);
+            let error = ModelFactory::validate_stage_tensor_schema(&config, &(0..1), &mismatched)
+                .unwrap_err();
+            assert!(
+                error.to_string().contains(name) && error.to_string().contains("shape mismatch"),
+                "unexpected schema error for {name}: {error}"
+            );
+        }
+
+        let mut missing_layer_weight = metadata.clone();
+        missing_layer_weight.remove("model.layers.0.self_attn.k_proj.weight");
+        let missing_error =
+            ModelFactory::validate_stage_tensor_schema(&config, &(0..1), &missing_layer_weight)
+                .unwrap_err();
+        assert!(
+            missing_error
+                .to_string()
+                .contains("model.layers.0.self_attn.k_proj.weight"),
+            "unexpected missing-weight error: {missing_error}"
+        );
+
+        // With no explicit head, a complete-range stage ties the already
+        // validated [vocab, hidden] embedding.
+        let mut tied = metadata;
+        tied.remove("lm_head.weight");
+        ModelFactory::validate_stage_tensor_schema(&config, &(0..1), &tied).unwrap();
+    }
+
+    #[tokio::test]
+    async fn stage_schema_mismatch_fails_before_tensor_materialization() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut tensors = tiny_dense_tensors(false);
+        *tensors
+            .iter_mut()
+            .find(|tensor| tensor.name == "model.embed_tokens.weight")
+            .unwrap() = FixtureTensor::f32("model.embed_tokens.weight", &[7, 4], 0.01);
+        *tensors
+            .iter_mut()
+            .find(|tensor| tensor.name == "model.layers.0.self_attn.q_proj.weight")
+            .unwrap() = FixtureTensor::i64_shape("model.layers.0.self_attn.q_proj.weight", &[4, 4]);
+        write_tiny_dense_checkpoint(dir.path(), &tensors);
+
+        let error = ModelFactory::create_stage(
+            dir.path(),
+            &Device::Cpu,
+            DType::Float,
+            None,
+            KVQuantType::None,
+            None,
+            ModelStageRequest { layer_range: 0..1 },
+        )
+        .await
+        .err()
+        .expect("config/tensor mismatch must fail");
+        assert!(
+            error.to_string().contains("model.embed_tokens.weight")
+                && error.to_string().contains("shape mismatch"),
+            "config mismatch must fail before the selected unsupported-dtype sentinel is \
+             materialized: {error}"
+        );
+        assert!(
+            !error.to_string().contains("unsupported dtype"),
+            "selected tensors were materialized before schema validation: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn stage_schema_complete_range_matches_whole_model() {
+        let dir = tempfile::tempdir().unwrap();
+        write_tiny_dense_checkpoint(dir.path(), &tiny_dense_tensors(false));
+
+        let whole = ModelFactory::create(
+            dir.path(),
+            &Device::Cpu,
+            DType::Float,
+            None,
+            KVQuantType::None,
+            None,
+        )
+        .await
+        .unwrap();
+        let stage = ModelFactory::create_stage(
+            dir.path(),
+            &Device::Cpu,
+            DType::Float,
+            None,
+            KVQuantType::None,
+            None,
+            ModelStageRequest { layer_range: 0..1 },
+        )
+        .await
+        .unwrap();
+
+        let input = Tensor::from_slice(&[0_i64, 1, 2]).reshape([1, 3]);
+        let whole_logits = whole.forward(&input, None).unwrap();
+        let stage_logits = stage.forward(&input, None).unwrap();
+        assert_eq!(whole_logits.size(), stage_logits.size());
+        assert!(
+            whole_logits.to_device(Device::Cpu).allclose(
+                &stage_logits.to_device(Device::Cpu),
+                1e-5,
+                1e-5,
+                false
+            ),
+            "valid complete-range stage forward diverged from ModelFactory::create"
+        );
     }
 
     #[tokio::test]
