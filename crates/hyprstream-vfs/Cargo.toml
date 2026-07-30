@@ -3,7 +3,7 @@ name = "hyprstream-vfs"
 version = "0.1.0"
 publish = false
 edition.workspace = true
-license.workspace = true
+license = "Apache-2.0"
 description = "Plan9-inspired VFS namespace multiplexer for hyprstream"
 
 [dependencies]

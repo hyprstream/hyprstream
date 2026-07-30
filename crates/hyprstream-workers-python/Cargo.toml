@@ -3,7 +3,7 @@ name = "hyprstream-workers-python"
 version = "0.1.0"
 publish = false
 edition.workspace = true
-license = "MIT"
+license = "Apache-2.0"
 description = "RustPython engine + /lang/python 9P shell over the hyprstream-workers-wasmtime sandbox"
 
 # Host-target workspace member. Like the engine crate it does NOT depend on

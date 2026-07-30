@@ -1,0 +1,24 @@
+[package]
+name = "hyprstream-k8s-pds"
+version = "0.1.0"
+publish = false
+edition.workspace = true
+license = "Apache-2.0"
+repository.workspace = true
+description = "AGPL tenant-grant and PDS allocation adapter for hyprstream-k8s"
+
+[dependencies]
+anyhow = { workspace = true }
+ed25519-dalek = { workspace = true }
+hyprstream-k8s = { path = "../hyprstream-k8s", features = ["grant"] }
+hyprstream-pds = { path = "../hyprstream-pds" }
+hyprstream-rpc = { path = "../hyprstream-rpc" }
+rand = { workspace = true }
+
+[dev-dependencies]
+# Compile the supported downstream operator composition without changing the
+# adapter's production dependency surface.
+hyprstream-k8s = { path = "../hyprstream-k8s", features = ["k8s", "grant"] }
+
+[lints]
+workspace = true

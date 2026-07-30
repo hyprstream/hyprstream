@@ -3,7 +3,7 @@ name = "hyprstream-workers-wasmtime-fsguest"
 version = "0.1.0"
 publish = false
 edition = "2021"
-license = "MIT"
+license = "Apache-2.0"
 description = "Trivial wasm32-wasip1 guest doing file ops, for the #506 Profile-B WASI-over-VFS validation"
 
 # NOT a workspace member (mirrors hyprstream-workers-python-guest). It is a wasm-only

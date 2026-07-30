@@ -6,7 +6,7 @@ edition.workspace = true
 description = "Agentic Infrastructure"
 documentation = "https://docs.rs/hyprstream"
 readme = "README.md"
-license = "MIT OR AGPL-3.0-only"
+license = "Apache-2.0"
 exclude = [
     "**/*.pyc",
     "**/__pycache__/",
@@ -27,6 +27,12 @@ path = "src/bin/main.rs"
 # Arrow and DataFusion dependencies removed - focused on ML inference only
 bytes.workspace = true
 pglite-rs = { workspace = true, optional = true }
+deadpool-postgres = { workspace = true, optional = true }  # Networked Postgres UserStore (#1401)
+tokio-postgres = { workspace = true, optional = true }     # Networked Postgres UserStore (#1401)
+tokio-postgres-rustls = { workspace = true, optional = true }  # TLS for RDS (#1401)
+webpki-roots = { workspace = true, optional = true }       # Mozilla CA roots for RDS TLS (#1401)
+aes-gcm-siv.workspace = true             # At-rest UserStore envelope encryption (#1377)
+aes.workspace = true                     # Enable ZeroizeOnDrop on AES key schedules (#1377 M5)
 futures.workspace = true
 tokio.workspace = true
 tonic.workspace = true
@@ -172,7 +178,7 @@ blake3.workspace = true                  # Fast cryptographic hashing for checks
 ciborium.workspace = true                # Canonical CBOR for tamper-evident audit records (#677 Fu6)
 tempfile.workspace = true                # Temporary files for model conversion
 base64.workspace = true                  # JWT token encoding
-ed25519-dalek.workspace = true           # JWT Ed25519 signatures
+ed25519-dalek = { workspace = true, features = ["pkcs8"] } # JWT/PIV Ed25519 signatures
 ssh-key = { version = "0.6", features = ["ed25519", "encryption"] }  # OpenSSH Ed25519 key import (user create --ssh)
 p256.workspace = true                    # ES256 DPoP verification (atproto interop)
 k256.workspace = true                    # ES256K ATProto service-auth verification
@@ -189,6 +195,7 @@ axum = { workspace = true, features = ["ws"] }
 axum-server.workspace = true
 tower-http.workspace = true
 url.workspace = true
+percent-encoding.workspace = true
 urlencoding.workspace = true
 shellexpand.workspace = true
 
@@ -226,7 +233,9 @@ default = ["gittorrent", "xet", "systemd", "otel", "kata-vm", "nspawn"]
 cuda = []
 valkey = ["dep:fred"]  # Enable Valkey/Redis-backed user and token stores
 pglite = ["dep:pglite-rs"]  # Enable PGlite embedded relational UserStore (#1376)
+postgres = ["dep:deadpool-postgres", "dep:tokio-postgres", "dep:tokio-postgres-rustls", "dep:webpki-roots"]  # Networked Postgres UserStore for RDS (#1401)
 credential-pds = ["pglite"]  # Production credential/PDS service profile; intentionally excludes metrics/DuckDB
+credential-pds-postgres = ["postgres"]  # Production credential/PDS with RDS Postgres backend (#1401)
 metrics = ["dep:hyprstream-metrics", "dep:hyprstream-flight"]  # Separate DuckDB-backed metrics/inference/Flight service build
 bnb = ["dep:bitsandbytes-sys"]  # Enable bitsandbytes KV cache quantization (requires compatible ROCm/CUDA)
 xet = ["git2db/xet-storage"]  # Enable XET large file storage

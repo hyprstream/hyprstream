@@ -160,13 +160,13 @@ jobs:
     name: Build arm64 CPU AppImage
     runs-on: [self-hosted, linux, arm64, graviton, hyprstream-merge-gate]
     timeout-minutes: 150
-    env:
-      BUILDER_IMAGE: ghcr.io/hyprstream/rust-builder-arm64@sha256:aa9feb1c8432ebf4583fcfc9c8236c371cb050f489c4d0882a7f2d8c8589120e
-
     steps:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
+
+      - name: Load builder image pin
+        run: bash .github/scripts/load-builder-image.sh
 
       - name: Pull arm64 builder image
         run: podman pull "$BUILDER_IMAGE"

@@ -3,7 +3,7 @@ name = "hyprstream-workers"
 version = "0.1.0"
 publish = false
 edition.workspace = true
-license.workspace = true
+license = "AGPL-3.0-only"
 repository.workspace = true
 description = "Isolated workload execution using Kata Containers with CRI-aligned APIs"
 

@@ -57,6 +57,7 @@ owned by an unrelated crates.io publisher and cannot be used by this project.
 | `hyprstream-discovery` | public later | Deep unpublished dependency graph and security-sensitive discovery/admission surface. |
 | `hyprstream-flight` | public later | Depends on unpublished metrics/git2db stack; missing package docs. |
 | `hyprstream-k8s` | public later | CRD/version compatibility is a public API; ownership and compatibility policy required. |
+| `hyprstream-k8s-pds` | public later | Tenant-grant/PDS adapter API and downstream AGPL aggregation contract require an owner and compatibility review. |
 | `hyprstream-ledger` | public later | Accounting/security semantics need independent review and an API owner. |
 | `hyprstream-metrics` | public later | Depends on unpublished git2db and native data stack; missing package docs. |
 | `hyprstream-p2p` | public later | Depends on unpublished RPC; network protocol/support commitment not yet declared. |
@@ -76,107 +77,47 @@ owned by an unrelated crates.io publisher and cannot be used by this project.
 | `chat-core` | **internal/not publishable** | Current crates.io name belongs to an unrelated publisher; rename and API review required. |
 | `hyprstream` | **internal/not publishable** | Real product/service crate (broad local graph and `tch`/libtorch); keep it non-publishable. The excluded standalone Apache-2.0 `hyprstream` 0.5.0 deprecation shim, not this crate, replaces the stale public name. |
 | `hyprstream-appview` | **internal/not publishable** | Product-internal derived identity service with no standalone support contract. |
-| `hyprstream-tui` | public later | Supported MIT client TUI for trust/crypto, bootstrap, and enrolment; its publish promotion follows the client dependency and accelerator-runtime download/verification work. |
+| `hyprstream-tui` | public later | Supported Apache-2.0 client TUI for trust/crypto, bootstrap, and enrolment; its publish promotion follows the client dependency and accelerator-runtime download/verification work. |
 | `hyprstream-workers-python-guest` | **internal/not publishable** | Compiled WASM guest artifact, not a Rust consumer library. |
 | `hyprstream-workers-wasmtime-fsguest` | **internal/not publishable** | Test/validation WASI guest binary, not a consumer package. |
 
 ## Licensing boundary and client/server split
 
-The repository currently has a workspace default of `license = "MIT"` in
-`[workspace.package]`, and carries both `LICENSE-MIT` and `LICENSE-AGPLV3`.
-Today every crate is effectively MIT except `crates/hyprstream`, whose manifest
-is `MIT OR AGPL-3.0-only`. That is a disjunction: recipients may select MIT and
-disregard AGPL. It therefore supplies no copyleft protection for the server.
+The final ruling is package-based and uses exact SPDX expressions:
 
-The approved target is a mixed, per-crate boundary, not a disjunction:
-
-| Boundary | Approved target |
+| License | Local Cargo packages |
 |---|---|
-| Services | `AGPL-3.0-only`: the service/orchestration portions of `hyprstream`, plus `hyprstream-pds`, `hyprstream-pds-service`, `hyprstream-appview`, `hyprstream-ledger`, `hyprstream-discovery`, `hyprstream-service`, and `hyprstream-k8s`. |
-| Libraries, client, and runtimes | `Apache-2.0`: `hyprstream-rpc`, `hyprstream-rpc-std`, `hyprstream-rpc-build`, `hyprstream-rpc-derive`, `hyprstream-crypto`, `hyprstream-tui`, `hyprstream-util`, `hyprstream-vfs`, the `hyprstream-workers*` execution runtimes, the inference runtime, and the future client binary. |
+| `MIT` | `bitsandbytes-sys`, `cas-serve`, `git-xet-filter` |
+| `AGPL-3.0-only` | `hyprstream-metrics`, `hyprstream-flight`, `hyprstream-vfs-server`, `hyprstream-workers` |
+| `Apache-2.0` | Every other local Cargo package, including the real `hyprstream` application, the excluded `hyprstream` deprecation shim, clients, libraries, adapters, and guest artifacts. |
 
-`hyprstream-rpc` is the named exception that protects the client architecture:
-it remains Apache-2.0 regardless of whether a client or a service consumes it.
-Making the protocol AGPL would prevent independent clients and collapse the
-client story. The TUI is a supported client artifact, not the server/product
-application; it provides the TUI, offline trust/crypto primitives, and
-bootstrap/enrolment while downloading and verifying the heavy accelerator
-runtime instead of bundling it. `hyprstream` remains internal/not publishable
-as the server/product application.
+These are exact licenses, not compound expressions. In particular,
+`MIT OR Apache-2.0` and `MIT OR AGPL-3.0-only` do not satisfy the ruling.
+The workspace default is `Apache-2.0`, and each package manifest also declares
+its exact effective license so moving a package into or out of the workspace
+cannot silently change it.
 
-### Runtime/service sub-boundary and required extraction
+`.github/license-boundary.toml` is the exhaustive manifest and dependency-role
+source of truth. It covers Cargo workspace members plus every manifest excluded
+from the workspace. The release-only deprecation shim intentionally shares the
+`hyprstream` package name and version with the non-publishable application; its
+manifest is listed as an approved duplicate and is independently license
+checked. `.github/crate-release.toml` repeats the MIT and AGPL exception sets
+and declares Apache-2.0 for every other package, while
+`scripts/check_crate_release_policy.py` rejects drift between the two policies.
 
-The split is not “monolith equals AGPL.” Execution engines are permissive; the
-services that schedule, route, admit tenants, and integrate ledger/billing are
-AGPL-only. The inference runtime—including model execution, kernels,
-device/accelerator handling, and the `tch` binding—is Apache-2.0. The
-`hyprstream-workers*` sandbox execution runtimes are also Apache-2.0 targets.
-This is the strongest
-case for Apache-2.0's express patent grant and defensive termination: inference
-is the most patent-dense code in the tree, the Apache ICLA already supplies the
-inbound rights, and the established ML-runtime ecosystem is permissive.
+`scripts/check_license_boundary.py` resolves the committed Cargo lock graphs,
+requires exact classification parity for the full local package universe, and
+fails if a reusable MIT or Apache package reaches a local AGPL package.
+Apache-licensed application or adapter packages that aggregate AGPL components
+must be named explicitly in `agpl_aggregators`; their combined distributions
+carry the applicable AGPL obligations. The current declared aggregator is the
+real `hyprstream` application.
 
-That target cannot be expressed in current Cargo packages. `hyprstream` is the
-only crate that links `tch`, but it contains both the intended Apache-2.0
-runtime (`src/runtime`: 25,719 lines in 28 files; `src/inference`: 1,068 lines
-in 5 files) and the intended AGPL orchestration service—about 26.8k runtime
-lines in total. Relicensing the whole crate as AGPL-only now would silently
-relicense that runtime incorrectly. The runtime must first be extracted into a
-Apache-2.0 crate; this is a prerequisite, not optional cleanup. The current
-`hyprstream-workers` facade likewise still has AGPL service-wiring dependencies,
-so it must be split before it can carry the runtime's permissive license.
-
-This is the same seam identified by client/server layering, licensing, and now
-runtime/service separation. It elevates the extraction in
-`PLAN-crypto-wizard-terraform.md` section 0b from architectural hygiene to a
-prerequisite for the license split. A permissive downloadable runtime also keeps
-the thin client's verified install path free of a separate-process or
-mere-aggregation argument.
-
-The existing graph assertion enforces all currently separable Apache-2.0 roots,
-including the worker runtime crates that already have clean dependency graphs.
-It deliberately records, rather than pretends to enforce, the two
-topology-blocked targets (`hyprstream`'s inference runtime and the mixed
-`hyprstream-workers` facade). Once extracted, each must move into the enforced
-Apache-2.0-root set before its license field changes.
-
-This prospective split aligns three independent boundaries: client/server,
-licensing, and runtime/service. It is not yet implemented in manifests. Every
-crate must receive an explicit per-crate
-`license =` value when the separate relicensing change lands: inheriting the
-workspace MIT default is unsafe because a new service crate could silently take
-the wrong license. No license field is changed by this release-policy change.
-
-Apache-2.0 is the selected, single permissive license. The Apache ICLA's
-sections 2 and 3 supply inbound copyright sublicensing and patent grants, while
-Apache-2.0 section 3 passes an express patent grant to downstream users with
-defensive termination. `MIT OR Apache-2.0` is not this policy's choice because
-a downstream recipient could elect the MIT disjunct and lose that express
-patent protection. The former `MIT OR AGPL-3.0-only` combination was different
-again: its MIT branch nullified the intended copyleft.
-
-The legal basis for the prospective outbound licenses is the Apache ICLA:
-section 2 grants a perpetual, irrevocable copyright license including
-sublicensing, and section 3 grants patents. The change is prospective only.
-The repository is public, and the pre-split MIT releases `v0.2.0` (2026-02-04),
-`v0.3.0-rc1`, and `v0.4.0` (2026-06-18) already granted MIT rights to the
-service code; an AGPL-only release cannot revoke those grants. Every additional
-release before the split lands broadens that MIT-granted surface.
-
-The current disjunction was not an approved split implementation: before
-`fcf3f31a5` (2026-02-22, “Locking/threading improvements”), `hyprstream` used
-the workspace MIT license. That commit changed it to `MIT OR AGPL-3.0`.
-`806c167c3` later changed the AGPL spelling to `AGPL-3.0-only` for cargo-deny,
-but retained the `MIT OR` disjunction. License changes must therefore be their
-own reviewed commits, never incidental refactor changes.
-
-`scripts/check_license_boundary.py` enforces the currently expressible
-architectural half of this policy in CI: no listed Apache-2.0 crate may
-transitively depend on a listed AGPL service crate, and the topology-blocked
-runtime targets must remain explicitly recorded. The separate extraction and
-relicensing changes must retain and expand that assertion with explicit
-per-crate license declarations; a documented boundary without the graph check
-is not a boundary.
+`deny.toml` keeps AGPL out of the global dependency allowlist and grants
+name-scoped exceptions only to the four AGPL packages. This prevents an
+unreviewed AGPL dependency or a newly mislicensed first-party package from
+passing `cargo deny`.
 
 ## Versioning and release tags
 

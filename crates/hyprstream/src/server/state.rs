@@ -2,11 +2,19 @@
 
 use crate::services::generated::model_client::{LoadModelRequest, ModelClient};
 use crate::services::{PolicyClient, RegistryClient};
+use crate::services::oauth::replay_key::ReplayKey;
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use hyprstream_util::TtlCache;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
+
+/// 1,000 sustained proofs or mount tickets/s for the longest (five-minute)
+/// replay window, plus 20% headroom. Ordinary DPoP proofs expire after 120s.
+/// Fixed BLAKE3-256 digest keys at 128 bytes/live entry plan this at about
+/// 43.9 MiB before allocator slack.
+const DPOP_JTI_MAX_ENTRIES: usize = 360_000;
+const DPOP_JTI_REAP_BUDGET: usize = 64;
 
 // Re-export config types so other server modules can access them via server::state
 pub use crate::config::{CorsConfig, SamplingParamDefaults, ServerConfig};
@@ -72,8 +80,8 @@ pub struct ServerState {
 
     /// Per-request DPoP JTI dedup cache (RFC 9449 §11.1 replay prevention).
     /// Backed by the shared `TtlCache` with atomic check-and-record
-    /// (`insert_if_absent`); TTL = iat + 120s; self-evicting.
-    pub dpop_jti_seen: Arc<TtlCache<String, ()>>,
+    /// (`insert_if_absent_no_evict`); TTL = iat + 120s; fail-closed at capacity.
+    pub dpop_jti_seen: Arc<TtlCache<ReplayKey, ()>>,
 
     /// Per-subject request rate limiter (fixed window, 300 req/60s default).
     pub rate_limiter: Arc<crate::server::middleware::RateLimiter>,
@@ -106,7 +114,7 @@ pub struct ResourceAuthState {
     pub oauth_issuer_url: String,
     pub federation_resolver: Arc<crate::auth::FederationKeyResolver>,
     pub jti_blocklist: Arc<hyprstream_rpc::auth::InMemoryJtiBlocklist>,
-    pub dpop_jti_seen: Arc<TtlCache<String, ()>>,
+    pub dpop_jti_seen: Arc<TtlCache<ReplayKey, ()>>,
     pub rate_limiter: Arc<crate::server::middleware::RateLimiter>,
 }
 
@@ -127,7 +135,7 @@ impl ResourceAuthState {
             oauth_issuer_url,
             federation_resolver,
             jti_blocklist,
-            dpop_jti_seen: Arc::new(TtlCache::new(10_000, 64)),
+            dpop_jti_seen: Arc::new(TtlCache::new(DPOP_JTI_MAX_ENTRIES, DPOP_JTI_REAP_BUDGET)),
             rate_limiter: Arc::new(crate::server::middleware::RateLimiter::new(300, 60)),
         }
     }
@@ -249,7 +257,7 @@ impl ServerState {
             oauth_issuer_url,
             federation_resolver,
             jti_blocklist,
-            dpop_jti_seen: Arc::new(TtlCache::new(10_000, 64)),
+            dpop_jti_seen: Arc::new(TtlCache::new(DPOP_JTI_MAX_ENTRIES, DPOP_JTI_REAP_BUDGET)),
             rate_limiter: Arc::new(crate::server::middleware::RateLimiter::new(300, 60)),
             browser_provisioning_rate_limiter: Arc::new(
                 crate::server::middleware::RateLimiter::new(60, 60),

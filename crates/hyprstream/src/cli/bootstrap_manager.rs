@@ -17,7 +17,7 @@ use hyprstream_tui::wizard::backend::*;
 
 use crate::auth::identity_store;
 use crate::auth::policy_templates::{get_template, get_templates};
-use crate::auth::{RocksDbUserStore, PolicyManager};
+use crate::auth::{PolicyManager, ProductionUserStore};
 use crate::cli::gpu_detect;
 use crate::cli::policy_handlers::{
     load_or_generate_signing_key, mint_local_token, parse_duration,
@@ -168,7 +168,10 @@ impl BootstrapManager {
                 return;
             }
         };
-        let store = match RocksDbUserStore::open(&credentials_dir) {
+        let store = match self
+            .rt
+            .block_on(ProductionUserStore::open(&credentials_dir))
+        {
             Ok(s) => s,
             Err(e) => {
                 tracing::warn!(
@@ -196,7 +199,7 @@ impl BootstrapManager {
         // envelope traffic.
         let policy = hyprstream_rpc::envelope::mandatory_envelope_policy();
         match self.rt.block_on(
-            enroll_user(&store, &secrets_dir, username, EnrollKeySource::Generate, policy),
+            enroll_user(&*store, &secrets_dir, username, EnrollKeySource::Generate, policy),
         ) {
             Ok(outcome) => {
                 // Surface enrollment notices (e.g. the classical-downgrade

@@ -40,7 +40,6 @@ env:
   SCCACHE_BUCKET: ${{ vars.AWS_SCCACHE_BUCKET }}
   SCCACHE_REGION: ${{ vars.AWS_SCCACHE_REGION }}
   CARGO_INCREMENTAL: 0
-  BUILDER_IMAGE: ghcr.io/hyprstream/rust-builder-arm64@sha256:aa9feb1c8432ebf4583fcfc9c8236c371cb050f489c4d0882a7f2d8c8589120e
 
 jobs:
   resolve-pr:
@@ -95,6 +94,9 @@ jobs:
       with:
         ref: ${{ needs.resolve-pr.outputs.sha }}
         persist-credentials: false
+
+    - name: Load builder image pin
+      run: bash .github/scripts/load-builder-image.sh
 
     - name: Report validated revision
       run: |

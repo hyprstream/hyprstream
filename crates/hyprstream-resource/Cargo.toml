@@ -3,7 +3,7 @@ name = "hyprstream-resource"
 version = "0.1.0"
 publish = false
 edition.workspace = true
-license = "MIT"
+license = "Apache-2.0"
 repository.workspace = true
 description = "Dependency-light authority and lifecycle contracts for dual-attested resources (#1067)"
 

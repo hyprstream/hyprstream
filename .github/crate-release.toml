@@ -22,6 +22,7 @@ public_later = [
   "hyprstream-discovery",
   "hyprstream-flight",
   "hyprstream-k8s",
+  "hyprstream-k8s-pds",
   "hyprstream-ledger",
   "hyprstream-metrics",
   "hyprstream-p2p",
@@ -61,54 +62,16 @@ manifest_path = "release/hyprstream-deprecation-shim/Cargo.toml"
 required_before_yank = true
 release_order = ["publish-shim", "verify-shim", "yank-stale-versions"]
 
-# Approved target boundary.  These values describe the intended per-crate
-# relicensing change; they do not alter a Cargo.toml license field themselves.
+# The final package-license ruling. The exhaustive manifest-path inventory and
+# dependency-boundary roles live in policy_path; the release checker proves
+# these named exceptions and the Apache default remain identical to it.
 [license_boundary]
-agpl_license = "AGPL-3.0-only"
-apache_license = "Apache-2.0"
-
-agpl_services = [
-  "hyprstream",
-  "hyprstream-appview",
-  "hyprstream-discovery",
-  "hyprstream-k8s",
-  "hyprstream-ledger",
-  "hyprstream-pds",
-  "hyprstream-pds-service",
-  "hyprstream-service",
-]
-
-apache_crates = [
-  "hyprstream-crypto",
-  "hyprstream-rpc",
-  "hyprstream-rpc-build",
-  "hyprstream-rpc-derive",
-  "hyprstream-rpc-std",
-  "hyprstream-tui",
-  "hyprstream-util",
-  "hyprstream-vfs",
-  "hyprstream-workers-python",
-  "hyprstream-workers-python-guest",
-  "hyprstream-workers-tcl",
-  "hyprstream-workers-wasmtime",
-  "hyprstream-workers-wasmtime-fsguest",
-]
-
-# Execution runtimes are Apache-2.0.  The inference runtime
-# still lives inside the AGPL service crate, and the workers facade still has
-# service wiring, so neither package-level boundary can be expressed yet.
-apache_runtime_targets = [
+policy_path = ".github/license-boundary.toml"
+mit_packages = ["bitsandbytes-sys", "cas-serve", "git-xet-filter"]
+agpl_packages = [
+  "hyprstream-flight",
+  "hyprstream-metrics",
+  "hyprstream-vfs-server",
   "hyprstream-workers",
-  "hyprstream-workers-python",
-  "hyprstream-workers-python-guest",
-  "hyprstream-workers-tcl",
-  "hyprstream-workers-wasmtime",
-  "hyprstream-workers-wasmtime-fsguest",
 ]
-topology_blocked_runtime_targets = ["hyprstream-workers"]
-
-[license_boundary.inference_runtime]
-source_crate = "hyprstream"
-source_paths = ["src/runtime", "src/inference"]
-target_license = "Apache-2.0"
-extraction_required = true
+all_other_packages = "Apache-2.0"

@@ -156,7 +156,10 @@ pub struct ValkeyUserStore {
 }
 
 impl ValkeyUserStore {
-    pub async fn connect(url: &str) -> Result<Self> {
+    pub(crate) async fn connect_admitted(
+        url: &str,
+        _permit: &super::production_user_store::ProductionStorePermit,
+    ) -> Result<Self> {
         let config = RedisConfig::from_url(url).context("invalid Valkey URL")?;
         let pool = Builder::from_config(config).build_pool(8)?;
         pool.connect();
@@ -280,7 +283,11 @@ impl ValkeyUserStore {
     }
 }
 
+#[cfg(not(test))]
+impl super::user_store::private::Sealed for ValkeyUserStore {}
+
 #[async_trait]
+#[cfg(any(not(feature = "credential-pds"), test))]
 impl UserStore for ValkeyUserStore {
     async fn get_profile(&self, username: &str) -> Result<Option<UserProfile>> {
         self.get_profile_raw(username).await

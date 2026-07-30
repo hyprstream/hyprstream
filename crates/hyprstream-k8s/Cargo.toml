@@ -3,7 +3,7 @@ name = "hyprstream-k8s"
 version = "0.1.0"
 publish = false
 edition = "2021"
-license = "MIT"
+license = "Apache-2.0"
 repository = "https://github.com/hyprstream/hyprstream"
 description = "Kubernetes CRD schemas for hyprstream resources under *.hyprstream.io (Model, Adapter, TrainingRun, InferenceService, TenantBinding)"
 
@@ -32,20 +32,10 @@ k8s = [
     "dep:async-trait",
     "dep:parking_lot",
 ]
-# CRD → grant compilation (#929): a `TenantBinding`'s authorable entitlement
-# compiles into an issuer-signed UCAN grant + an `ai.hyprstream.ledger.allocation`
-# record. Pure logic — no cluster, no kube client — so it is a feature separate
-# from `k8s`. Pulls the UCAN/COSE primitives (`hyprstream-rpc`) and the
-# allocation lexicon (`hyprstream-pds`); the CRD *types* it lowers never require
-# them. `k8s` + `grant` together enable the operator reconcile wiring that
-# compiles a binding's entitlement into a grant on observe.
-grant = [
-    "dep:hyprstream-rpc",
-    "dep:hyprstream-pds",
-    "dep:ed25519-dalek",
-    "dep:anyhow",
-    "dep:rand",
-]
+# Service-neutral TenantBinding → grant reconciliation boundary (#929/#1422).
+# The authority-bearing implementation lives downstream in
+# `hyprstream-k8s-pds`; this feature contains no service dependency.
+grant = ["dep:cid"]
 
 [dependencies]
 # `derive` gives the CustomResource derive + CustomResourceExt (kube-core, no client).
@@ -67,15 +57,13 @@ hyprstream-vfs = { path = "../hyprstream-vfs", optional = true }
 hyprstream-rpc = { path = "../hyprstream-rpc", optional = true }
 async-trait = { version = "0.1", optional = true }
 parking_lot = { workspace = true, optional = true }
-
-# CRD → grant compilation (#929), gated behind the `grant` feature.
-hyprstream-pds = { path = "../hyprstream-pds", optional = true }
-ed25519-dalek = { workspace = true, optional = true }
-anyhow = { workspace = true, optional = true }
-rand = { workspace = true, optional = true }
+cid = { version = "0.11", optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "sync"] }
+toml = { workspace = true }
+tempfile = { workspace = true }
+semver = "1"
 
 [lints]
 workspace = true

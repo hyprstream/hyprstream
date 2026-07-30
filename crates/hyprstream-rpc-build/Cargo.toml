@@ -3,7 +3,7 @@ name = "hyprstream-rpc-build"
 version = "0.1.0"
 publish = ["crates-io"]
 edition.workspace = true
-license.workspace = true
+license = "Apache-2.0"
 repository.workspace = true
 description = "Shared Cap'n Proto build helpers, schema types, and TypeScript codegen"
 

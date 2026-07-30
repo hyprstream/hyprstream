@@ -5,7 +5,10 @@
 //!
 //! Also provides JWT token authentication with Ed25519 signatures.
 
+pub(crate) mod age_seal;
 pub mod device_challenge;
+#[cfg_attr(not(feature = "pglite"), allow(dead_code))]
+pub mod encrypted_columns;
 pub mod federation;
 pub mod federation_admission;
 pub mod id_token_verify;
@@ -14,11 +17,16 @@ pub mod jwt;
 pub mod key_rotation;
 pub mod mesh_trust;
 pub mod op_log;
+#[cfg(any(feature = "pglite", feature = "postgres"))]
+mod cipher_glue;
 #[cfg(feature = "pglite")]
 pub mod pglite_store;
+#[cfg(feature = "postgres")]
+pub mod postgres_store;
 mod policy_manager;
 pub mod policy_migration;
 pub mod policy_templates;
+mod production_user_store;
 pub mod rocksdb_store;
 pub mod service_jwt;
 pub mod user_store;
@@ -38,6 +46,8 @@ pub use op_log::{
 };
 #[cfg(feature = "pglite")]
 pub use pglite_store::PgliteUserStore;
+#[cfg(feature = "postgres")]
+pub use postgres_store::PostgresUserStore;
 pub use policy_manager::{
     federation_registration_resource, global_policy_manager, set_global_policy_manager,
     write_policy_file, PolicyError, PolicyManager,
@@ -46,6 +56,7 @@ pub use policy_migration::migrate_policy_csv;
 pub use policy_templates::{
     get_template, get_templates, PolicyTemplate, ServicePolicyRule, SERVICE_BASE_POLICIES,
 };
+pub use production_user_store::ProductionUserStore;
 pub use rocksdb_store::RocksDbUserStore;
 pub use user_store::{
     decode_pubkey_base64, pubkey_fingerprint, AccountKeyCustody, DeviceRecord, DeviceStore,

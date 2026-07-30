@@ -2,7 +2,7 @@
 # Multi-variant build for Hyprstream supporting CPU, CUDA, and ROCm
 
 ARG VARIANT=cpu
-ARG DEBIAN_VERSION=bookworm
+ARG DEBIAN_VERSION=trixie
 ARG LIBTORCH_VERSION=2.10.0
 
 # LibTorch download URLs for manual installation
@@ -17,10 +17,11 @@ ARG LIBTORCH_CPU_URL=https://download.pytorch.org/libtorch/cpu/libtorch-shared-w
 
 FROM debian:${DEBIAN_VERSION} AS builder-base
 
-# Install build dependencies
-# Note: binutils from backports required for OpenSSL AVX-512 assembly compatibility
-RUN echo "deb http://deb.debian.org/debian bookworm-backports main" >> /etc/apt/sources.list && \
-    apt-get update && apt-get install -y \
+# Install build dependencies. The former backports binutils workaround was for
+# x86 OpenSSL AVX-512 assembly and was never relevant to the native arm64
+# builder image. Trixie's stock binutils is current, so no suite-specific
+# backports source or pin is required for any builder variant.
+RUN apt-get update && apt-get install -y \
     curl \
     wget \
     unzip \
@@ -36,7 +37,6 @@ RUN echo "deb http://deb.debian.org/debian bookworm-backports main" >> /etc/apt/
     cmake \
     clang \
     libclang-dev \
-    && apt-get install -y -t bookworm-backports binutils \
     && rm -rf /var/lib/apt/lists/* \
     && apt-get clean
 
@@ -53,13 +53,46 @@ ENV SCCACHE_DIR=/sccache
 # CUDA 12.8 Builder
 #############################################
 
-FROM builder-base AS builder-cuda128
+# NVIDIA publishes the supported CUDA 12.8 and 13.0 APT packages only in its
+# Debian 12 repository. That repository's legacy key binding is rejected by
+# Trixie's sqv, so keep these x86 CUDA *toolchain* stages on Bookworm. Their
+# final runtime stages below are Debian 13; copying Bookworm libraries into a
+# newer glibc runtime is ABI-safe. The arm64 builder and all Trixie-built
+# binaries continue to use the Debian 13 runtime floor.
+FROM debian:bookworm AS builder-cuda-base
+
+RUN apt-get update && apt-get install -y \
+    curl \
+    wget \
+    unzip \
+    build-essential \
+    pkg-config \
+    libssl-dev \
+    libsystemd-dev \
+    git \
+    dialog \
+    rsync \
+    ca-certificates \
+    capnproto \
+    cmake \
+    clang \
+    libclang-dev \
+    && rm -rf /var/lib/apt/lists/* \
+    && apt-get clean
+
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+ENV PATH="/root/.cargo/bin:${PATH}"
+RUN cargo install sccache --locked
+ENV RUSTC_WRAPPER=sccache
+ENV SCCACHE_DIR=/sccache
+
+FROM builder-cuda-base AS builder-cuda128
 ARG LIBTORCH_CUDA128_URL
 ARG LIBTORCH_VERSION
 
 ENV LIBTORCH_BYPASS_VERSION_CHECK=1
 
-# Install CUDA repository and runtime libraries (needed for linking)
+# Install CUDA runtime libraries from NVIDIA's matching Debian 12 repository.
 RUN wget https://developer.download.nvidia.com/compute/cuda/repos/debian12/x86_64/cuda-keyring_1.1-1_all.deb && \
     dpkg -i cuda-keyring_1.1-1_all.deb && \
     rm cuda-keyring_1.1-1_all.deb && \
@@ -83,13 +116,13 @@ ENV LD_LIBRARY_PATH=/opt/libtorch/lib
 # CUDA 13.0 Builder
 #############################################
 
-FROM builder-base AS builder-cuda130
+FROM builder-cuda-base AS builder-cuda130
 ARG LIBTORCH_CUDA130_URL
 ARG LIBTORCH_VERSION
 
 ENV LIBTORCH_BYPASS_VERSION_CHECK=1
 
-# Install CUDA repository and runtime libraries (needed for linking)
+# Install CUDA runtime libraries from NVIDIA's matching Debian 12 repository.
 RUN wget https://developer.download.nvidia.com/compute/cuda/repos/debian12/x86_64/cuda-keyring_1.1-1_all.deb && \
     dpkg -i cuda-keyring_1.1-1_all.deb && \
     rm cuda-keyring_1.1-1_all.deb && \
@@ -157,8 +190,8 @@ ENV LD_LIBRARY_PATH=/opt/libtorch/lib
 # There is NO aarch64 libtorch zip at download.pytorch.org/libtorch/cpu — that
 # URL is x86_64-only. The PyTorch aarch64 manylinux_2_28 pip wheel, however,
 # bundles a complete CPU libtorch (torch/lib/*.so + torch/include), so we install
-# torch via pip and point LIBTORCH at the wheel's torch dir. bookworm ships
-# glibc 2.36, satisfying the wheel's manylinux_2_28 (glibc 2.28+) floor.
+# torch via pip and point LIBTORCH at the wheel's torch dir. Trixie ships a
+# newer glibc than the wheel's manylinux_2_28 (glibc 2.28+) floor.
 #
 # This stage is the toolchain+libtorch image only; the actual cargo build runs
 # either in the `builder` stage below (VARIANT=cpu-arm64) or by mounting the
@@ -171,7 +204,7 @@ ARG LIBTORCH_VERSION
 # wheel reports the same 2.10.0 but bypass keeps us resilient to wheel-suffix skew.
 ENV LIBTORCH_BYPASS_VERSION_CHECK=1
 
-# Python + pip to fetch the aarch64 torch wheel (bookworm python3 == 3.11 -> cp311).
+# Python + pip to fetch the aarch64 torch wheel.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         python3 python3-pip \
     && rm -rf /var/lib/apt/lists/* \
@@ -293,7 +326,7 @@ RUN --mount=type=cache,target=/root/.cargo/registry \
 # CUDA 12.8 Runtime
 #############################################
 
-FROM gcr.io/distroless/cc-debian12 AS runtime-cuda128
+FROM gcr.io/distroless/cc-debian13 AS runtime-cuda128
 
 # Copy required system libraries
 COPY --from=builder /usr/lib/x86_64-linux-gnu/libgomp.so.1 /usr/lib/x86_64-linux-gnu/
@@ -313,7 +346,7 @@ COPY --from=builder /opt/libtorch/lib/ /opt/libtorch/lib/
 # CUDA 13.0 Runtime
 #############################################
 
-FROM gcr.io/distroless/cc-debian12 AS runtime-cuda130
+FROM gcr.io/distroless/cc-debian13 AS runtime-cuda130
 
 # Copy required system libraries
 COPY --from=builder /usr/lib/x86_64-linux-gnu/libgomp.so.1 /usr/lib/x86_64-linux-gnu/
@@ -333,7 +366,7 @@ COPY --from=builder /opt/libtorch/lib/ /opt/libtorch/lib/
 # ROCm 7.1 Runtime
 #############################################
 
-FROM gcr.io/distroless/cc-debian12 AS runtime-rocm71
+FROM gcr.io/distroless/cc-debian13 AS runtime-rocm71
 
 # Copy required system libraries
 COPY --from=builder /usr/lib/x86_64-linux-gnu/libgomp.so.1 /usr/lib/x86_64-linux-gnu/
@@ -348,7 +381,7 @@ COPY --from=builder /opt/libtorch/lib/ /opt/libtorch/lib/
 # CPU Runtime
 #############################################
 
-FROM gcr.io/distroless/cc-debian12 AS runtime-cpu
+FROM gcr.io/distroless/cc-debian13 AS runtime-cpu
 
 # Copy required system libraries
 COPY --from=builder /usr/lib/x86_64-linux-gnu/libgomp.so.1 /usr/lib/x86_64-linux-gnu/
@@ -367,9 +400,9 @@ COPY --from=builder /opt/libtorch/lib/ /opt/libtorch/lib/
 # pip wheel's libtorch). Debian multilib lives under /usr/lib/aarch64-linux-gnu
 # on arm64, so the system-library COPYs cannot share the x86_64 runtime stage.
 # Selected via `FROM runtime-${VARIANT}` when VARIANT=cpu-arm64. gcr.io/distroless
-# cc-debian12 is multi-arch, so the base resolves to its arm64 variant natively.
+# cc-debian13 is multi-arch, so the base resolves to its arm64 variant natively.
 
-FROM gcr.io/distroless/cc-debian12 AS runtime-cpu-arm64
+FROM gcr.io/distroless/cc-debian13 AS runtime-cpu-arm64
 
 # Copy required system libraries (arm64 multilib path)
 COPY --from=builder /usr/lib/aarch64-linux-gnu/libgomp.so.1 /usr/lib/aarch64-linux-gnu/

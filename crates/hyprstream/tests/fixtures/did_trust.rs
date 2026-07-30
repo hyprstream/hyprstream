@@ -6,7 +6,10 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use base64::{
+    engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
+    Engine as _,
+};
 use ed25519_dalek::{Signer as _, SigningKey};
 use hyprstream_discovery::{DeploymentTrustSource, DidAnchors};
 use hyprstream_pds::at9p::{
@@ -197,4 +200,78 @@ pub fn make_tls() -> TlsMaterial {
         chain_der: vec![leaf.der().to_vec(), ca.der().to_vec()],
         key_der: leaf_key.serialize_der(),
     }
+}
+
+/// Construct a valid root-anchored deployment authority log (JSON for the
+/// well-known HTTPS endpoint) and its matching independent anti-rollback
+/// checkpoint, signed by the fixture's deployment CA.
+///
+/// Both halves derive from the same genesis DidOp so the production
+/// `validate_deployment_authority_log` check passes exactly as it would in
+/// a real deployment.
+pub fn authority_log_and_checkpoint(
+    ca: &SigningKey,
+) -> (
+    serde_json::Value,
+    hyprstream_discovery::DeploymentAuthorityCheckpoint,
+) {
+    use hyprstream_discovery::did_op::{DidOp, HybridRotationKey};
+
+    let domain = deployment_domain(ca);
+    let pq = hyprstream_rpc::crypto::pq::ml_dsa_sk_from_seed(&ca.to_bytes());
+    let rotation_key = HybridRotationKey::from_signing_keys(ca, &pq);
+    let genesis = DidOp::signed_genesis(vec![rotation_key], ca, &pq)
+        .expect("fixture genesis DidOp must sign under the deployment CA");
+    let did = genesis
+        .genesis_did()
+        .expect("fixture genesis DidOp must derive a DID");
+    let verified = hyprstream_discovery::did_op::verify_did_op_log(
+        &did,
+        std::slice::from_ref(&genesis),
+    )
+    .expect("fixture genesis DidOp must verify");
+    let log = json!({
+        "schema": "hyprstream.deployment-authority-log.v1",
+        "deployment_domain": domain,
+        "did": did,
+        "operations_b64": [STANDARD.encode(genesis.to_dag_cbor())],
+    });
+    let checkpoint = hyprstream_discovery::DeploymentAuthorityCheckpoint {
+        schema: "hyprstream.deployment-authority-checkpoint.v1".to_owned(),
+        deployment_domain: domain,
+        did,
+        sequence: verified.sequence,
+        head_cid: verified.head_cid,
+    };
+    (log, checkpoint)
+}
+
+/// Provision the OS-owned authority checkpoint via #1373's rootless
+/// `HYPRSTREAM_DEPLOYMENT_TRUST_DIR` env-var seam — the SAME production
+/// code path a rootless local daemon takes, just rooted in a secure temp
+/// directory instead of `/etc/hyprstream/trust/`. No global override, no
+/// production-reachable bypass: `read_trusted_artifact` still enforces
+/// ownership and permission checks on the temp-dir files.
+///
+/// The `OnceLock<TempDir>` keeps the directory alive for the entire test
+/// process.  Created inside `CARGO_MANIFEST_DIR` (not `/tmp`) so the
+/// ancestor-chain permission checks pass — mirroring #1373's own unit-test
+/// fixture pattern.
+static E2E_TRUST_DIR: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+
+pub fn ensure_trust_dir(ca: &SigningKey) {
+    E2E_TRUST_DIR.get_or_init(|| {
+        let dir = tempfile::Builder::new()
+            .prefix(".e2e-trust-")
+            .tempdir_in(env!("CARGO_MANIFEST_DIR"))
+            .expect("secure trust fixture directory");
+        let (_, checkpoint) = authority_log_and_checkpoint(ca);
+        std::fs::write(
+            dir.path().join("deployment-authority.head.json"),
+            serde_json::to_vec(&checkpoint).expect("checkpoint JSON"),
+        )
+        .expect("authority checkpoint");
+        std::env::set_var("HYPRSTREAM_DEPLOYMENT_TRUST_DIR", dir.path());
+        dir
+    });
 }

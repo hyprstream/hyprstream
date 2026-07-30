@@ -3,7 +3,7 @@ name = "hyprstream-rpc-std"
 version = "0.1.0"
 publish = false
 edition.workspace = true
-license = "MIT"
+license = "Apache-2.0"
 description = "Standard hyprstream service schemas and generated clients"
 links = "hyprstream_rpc_std"
 

@@ -51,6 +51,30 @@ def main() -> None:
     if missing or stale:
         fail(f"classification mismatch; unclassified={missing}, unknown={stale}")
 
+    license_boundary = policy.get("license_boundary")
+    if not isinstance(license_boundary, dict):
+        fail("missing license_boundary ruling")
+    license_policy_path = license_boundary.get("policy_path")
+    if license_policy_path != ".github/license-boundary.toml":
+        fail("license_boundary.policy_path must name .github/license-boundary.toml")
+    license_policy = load(ROOT / license_policy_path).get("license_gate", {})
+    for key in ("mit_packages", "agpl_packages"):
+        if license_boundary.get(key) != license_policy.get(key):
+            fail(f"license_boundary.{key} diverges from {license_policy_path}")
+    if license_boundary.get("all_other_packages") != "Apache-2.0":
+        fail("license_boundary.all_other_packages must remain Apache-2.0")
+    license_classes = {
+        key: set(license_policy.get(key, []))
+        for key in ("mit_packages", "agpl_packages", "apache_packages")
+    }
+    if (
+        license_classes["apache_packages"]
+        != set(manifests)
+        - license_classes["mit_packages"]
+        - license_classes["agpl_packages"]
+    ):
+        fail("license policy does not classify every other crate as Apache-2.0")
+
     shim = policy["deprecation_shim"]
     source_service = shim["source_service"]
     if source_service not in manifests:

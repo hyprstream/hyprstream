@@ -11,7 +11,8 @@ use tracing::info;
 
 // Core application imports
 use hyprstream_core::cli::commands::{
-    ExecutionMode, FlightArgs, ImageCommand, ServiceAction, TrainingAction, TuiAction, WorkerAction,
+    ExecutionMode, FlightArgs, ImageCommand, ServiceAction, TrainingAction, TrustCommand, TuiAction,
+    WorkerAction,
 };
 use hyprstream_core::cli::quick::{QuickCommand, RemoteQuickCommand, WorktreeQuickCommand};
 use hyprstream_core::cli::schema_cli;
@@ -135,6 +136,13 @@ fn build_cli() -> ClapCommand {
     app = app.subcommand(
         <ServiceAction as ClapSubcommand>::augment_subcommands(
             ClapCommand::new("service").about("Service management and lifecycle commands"),
+        ),
+    );
+
+    // Out-of-band deployment trust authority tooling.
+    app = app.subcommand(
+        <TrustCommand as ClapSubcommand>::augment_subcommands(
+            ClapCommand::new("trust").about("Mint and verify deployment trust artifacts"),
         ),
     );
 
@@ -1515,10 +1523,14 @@ fn resolve_service_vk(service_name: &str) -> Option<VerifyingKey> {
     trust.resolve_one(service_name)
 }
 
+/// Install the process production resolver and return whether the
+/// authenticated trust source was the OS-owned bootstrap (`true`) or a
+/// DID-anchored source (`false`). The caller retains this selection so the
+/// QUIC startup gate can scope first-boot deferral to the OS-owned path only.
 async fn install_process_production_resolver(
     signing_key: &SigningKey,
     config: &HyprConfig,
-) -> Result<()> {
+) -> Result<bool> {
     // The bootstrap pins the discovery service key from the process trust
     // store; in CLI/service-start mode nothing has seeded it yet. Seed from
     // the node's own bootstrap-pubkeys (the same source resolve_service_vk
@@ -1548,6 +1560,13 @@ async fn install_process_production_resolver(
         }
         _ => trust_source,
     };
+    // Retain the authenticated selection before it is consumed by the
+    // bootstrap. The QUIC startup gate uses this to scope first-boot
+    // deferral to the OS-owned path only.
+    let is_os_owned_bootstrap = matches!(
+        trust_source,
+        hyprstream_discovery::DeploymentTrustSource::OsOwnedFiles
+    );
     hyprstream_discovery::bootstrap_deployment_process(
         signing_key.clone(),
         trust_source,
@@ -1556,7 +1575,35 @@ async fn install_process_production_resolver(
     .await?;
     hyprstream_rpc::envelope::install_browser_currentness_verifier(
         hyprstream_discovery::production_browser_currentness_verifier()?,
-    )
+    )?;
+    Ok(is_os_owned_bootstrap)
+}
+
+/// The only startup policy that consumes PDS lifecycle classification.
+///
+/// `is_os_owned_bootstrap` is derived from the authenticated deployment trust
+/// source before bootstrap consumes it. Keeping the classifier inside this
+/// gate is intentional: DID-anchored deployments must take the ordinary
+/// checkpointed path without reading lifecycle state or mutating QUIC.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QuicCheckpointPolicy {
+    CheckpointedAnnouncements,
+    DeferForFirstBoot,
+}
+
+fn quic_checkpoint_policy(
+    is_os_owned_bootstrap: bool,
+    classify: impl FnOnce() -> Result<hyprstream_core::services::factories::PdsBootState>,
+) -> Result<QuicCheckpointPolicy> {
+    if !is_os_owned_bootstrap {
+        return Ok(QuicCheckpointPolicy::CheckpointedAnnouncements);
+    }
+
+    use hyprstream_core::services::factories::PdsBootState;
+    match classify()? {
+        PdsBootState::Populated => Ok(QuicCheckpointPolicy::CheckpointedAnnouncements),
+        PdsBootState::FirstBoot => Ok(QuicCheckpointPolicy::DeferForFirstBoot),
+    }
 }
 
 /// Install the process-global envelope verify configuration (#152, #160).
@@ -1724,6 +1771,16 @@ fn main() -> Result<()> {
 
     // Parse CLI arguments using builder API
     let matches = build_cli().get_matches();
+
+    // Trust minting is intentionally independent of local service/config
+    // bootstrap. It must work on an offline operator machine and must never
+    // start a registry client or load instance credentials.
+    if let Some(("trust", sub_m)) = matches.subcommand() {
+        let command =
+            TrustCommand::from_arg_matches(sub_m).map_err(|error| anyhow::anyhow!("{error}"))?;
+        hyprstream_core::cli::trust::handle_trust_command(command)?;
+        return Ok(());
+    }
 
     // Extract global args
     let config_path = matches
@@ -1988,24 +2045,25 @@ fn main() -> Result<()> {
         .context("Failed to create registry runtime")?;
 
     // Start services and create keypair
-    let (registry_client, signing_key, verifying_key): (
+    let (registry_client, signing_key, verifying_key, is_os_owned_bootstrap): (
         RegistryClient,
         SigningKey,
         VerifyingKey,
+        bool,
     ) = _registry_runtime
         .block_on(async {
             let keys_dir = config.models_dir().join(".registry").join("keys");
             let signing_key = load_or_generate_signing_key(&keys_dir).await?;
             let verifying_key = signing_key.verifying_key();
 
-            install_process_production_resolver(&signing_key, &config).await
+            let is_os_owned_bootstrap = install_process_production_resolver(&signing_key, &config).await
                 .context("Failed to install checkpoint-backed production resolver")?;
             let client = hyprstream_core::services::RegistryClient::from_resolver(
                 signing_key.clone(),
                 None,
             )?;
 
-            Ok::<_, anyhow::Error>((client, signing_key, verifying_key))
+            Ok::<_, anyhow::Error>((client, signing_key, verifying_key, is_os_owned_bootstrap))
         })
         .context("Failed to connect to services")?;
 
@@ -2165,7 +2223,7 @@ fn main() -> Result<()> {
                                 .with_federation_key_source(fed_src);
 
                                 // Wire QUIC shared config from --quic-bind or [quic] config
-                                let quic_cfg = if let Some(ref bind_addr) = quic_bind {
+                                let mut quic_cfg = if let Some(ref bind_addr) = quic_bind {
                                     let mut qc = hyprstream_core::config::QuicConfig::default();
                                     qc.enabled = true;
                                     qc.bind_addr = bind_addr.clone();
@@ -2335,10 +2393,58 @@ fn main() -> Result<()> {
                                 }
 
                                 if quic_cfg.enabled {
-                                    ctx = hyprstream_core::services::factories::with_checkpointed_native_announcements(
-                                        ctx,
-                                        &service_names,
-                                    )?;
+                                    // The checkpoint gate: QUIC announcements require
+                                    // checkpoint-verified accepted states.
+                                    //
+                                    // First-boot deferral is scoped to the OS-owned
+                                    // bootstrap source ONLY. An OS-owned deployment
+                                    // remains that source on restart, so it classifies
+                                    // then takes the ordinary checkpointed path when
+                                    // populated. DID-anchored deployments never read
+                                    // lifecycle state or mutate QUIC here.
+                                    match quic_checkpoint_policy(is_os_owned_bootstrap, || {
+                                        hyprstream_core::services::factories::classify_pds_store_for_quic(&ctx)
+                                    })
+                                    .context(
+                                        "PDS accepted-state store read failed; \
+                                         refusing to start QUIC (fail-closed)",
+                                    )? {
+                                        QuicCheckpointPolicy::CheckpointedAnnouncements => {
+                                                ctx = hyprstream_core::services::factories::with_checkpointed_native_announcements(
+                                                    ctx,
+                                                    &service_names,
+                                                )?;
+                                        }
+                                        QuicCheckpointPolicy::DeferForFirstBoot => {
+                                                // An explicit --quic-bind that cannot be
+                                                // honored (no accepted states exist yet) is
+                                                // an error, never a silent disable.
+                                                if quic_bind.is_some() {
+                                                    anyhow::bail!(
+                                                        "QUIC requested via --quic-bind but the PDS \
+                                                         accepted-state store is at first boot (no \
+                                                         accepted states written yet). Complete \
+                                                         discovery/registry provisioning, then restart \
+                                                         to activate QUIC."
+                                                    );
+                                                }
+                                                // Genuine first boot, no explicit network
+                                                // request: defer QUIC for this run. Services
+                                                // bind via inproc/IPC and serve HTTP. QUIC is
+                                                // NOT re-enabled at runtime — a restart after
+                                                // provisioning is required.
+                                                tracing::warn!(
+                                                    "QUIC disabled for this run: the PDS \
+                                                     accepted-state store is at first boot (no \
+                                                     accepted states written yet). Services will \
+                                                     bind via inproc/IPC and serve HTTP. Restart \
+                                                     after the discovery/registry pipeline writes \
+                                                     accepted states to activate QUIC. No runtime \
+                                                     auto-activation is implemented."
+                                                );
+                                                quic_cfg.enabled = false;
+                                        }
+                                    }
                                 }
 
                                 // Wire QUIC shared config (must be after key generation so jwt_verifying_key is set)
@@ -3040,6 +3146,43 @@ mod resolver_startup_controls {
         ] {
             assert!(production.contains(entry), "missing {entry}");
         }
+    }
+
+    /// Lifecycle classification is consumed only for the authenticated
+    /// OS-owned source. This is behavioral rather than positional: moving the
+    /// classifier outside `quic_checkpoint_policy`'s source gate makes the
+    /// DID-anchored case below invoke its deliberately failing classifier.
+    #[test]
+    fn first_boot_quic_deferral_is_scoped_to_os_owned_bootstrap() {
+        use std::cell::Cell;
+
+        use hyprstream_core::services::factories::PdsBootState;
+
+        let os_owned_calls = Cell::new(0);
+        assert_eq!(
+            super::quic_checkpoint_policy(true, || {
+                os_owned_calls.set(os_owned_calls.get() + 1);
+                Ok(PdsBootState::FirstBoot)
+            })
+            .expect("OS-owned classification succeeds"),
+            super::QuicCheckpointPolicy::DeferForFirstBoot,
+        );
+        assert_eq!(os_owned_calls.get(), 1, "OS-owned input classifies once");
+
+        let did_anchored_calls = Cell::new(0);
+        assert_eq!(
+            super::quic_checkpoint_policy(false, || {
+                did_anchored_calls.set(did_anchored_calls.get() + 1);
+                anyhow::bail!("DID-anchored startup must never classify lifecycle state")
+            })
+            .expect("DID-anchored startup bypasses the classifier"),
+            super::QuicCheckpointPolicy::CheckpointedAnnouncements,
+        );
+        assert_eq!(
+            did_anchored_calls.get(),
+            0,
+            "DID-anchored input must not invoke the classifier"
+        );
     }
 
     #[test]

@@ -3,7 +3,7 @@ name = "hyprstream-discovery"
 version = "0.1.0"
 publish = false
 edition.workspace = true
-license = "MIT"
+license = "Apache-2.0"
 repository.workspace = true
 description = "Service discovery and endpoint resolution for hyprstream"
 
@@ -66,6 +66,9 @@ p256 = { workspace = true }
 # Production accepted-state authority is read directly from the concrete
 # checkpointed PDS store. No downstream callback/trait can supply authority.
 rocksdb = "0.23"
+
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
 
 [dev-dependencies]
 # #431 / #524 — build/verify real CAR proofs in getRecord + placement tests.

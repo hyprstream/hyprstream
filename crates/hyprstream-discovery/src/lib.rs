@@ -63,6 +63,14 @@ pub fn initialize_deployment_checkpoint_store() -> anyhow::Result<()> {
     checkpointed_pds::initialize_deployment_store()
 }
 
+/// The first-boot provisioning marker RocksDB key, written by
+/// [`initialize_deployment_checkpoint_store`] and deleted by the registry in
+/// the same `WriteBatch` as its first accepted-state commit. Re-exported so
+/// the app crate's QUIC startup gate and registry writer can share the exact
+/// key.
+#[cfg(not(target_arch = "wasm32"))]
+pub use checkpointed_pds::FIRST_BOOT_KEY;
+
 /// #893 (at9p D1) — `did:at9p` capsule resolver: turns a GATE-verified capsule
 /// into a dialable `TransportConfig::iroh` (sibling to
 /// `hyprstream_rpc::service_entry::decode_iroh`). Injectable at the
@@ -137,7 +145,10 @@ pub use service::{
     bootstrap_deployment_process, deployment_registry_verifier, resolve_and_authenticate_did_anchors,
     AuthorizationProvider, DiscoveryService, RecordCarData, RecordResolver, RegistryDeploymentVerifier,
     production_browser_currentness_verifier, production_browser_provisioning,
-    production_rpc_client,
+    production_rpc_client, verify_genesis_deployment_artifacts,
+    verify_deployment_artifacts_with_authority_log, verify_deployment_public_ca,
+    DeploymentAuthorityCheckpoint, DeploymentAuthorityLog, RegistryDelegationArtifact,
+    VerifiedDeploymentArtifacts,
 };
 
 // Re-export generated types that consumers need
