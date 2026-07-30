@@ -30,13 +30,6 @@ env:
   SCCACHE_BUCKET: ${{ vars.AWS_SCCACHE_BUCKET }}
   SCCACHE_REGION: ${{ vars.AWS_SCCACHE_REGION }}
   CARGO_INCREMENTAL: 0
-  # Pinned arm64 rust-builder image (built by build-image.yml): toolchain +
-  # libtorch + capnproto + sccache + cargo-nextest + git-lfs + the pinned Rust
-  # toolchain's components/targets, all baked. Bump this digest deliberately after
-  # a builder-image publish so CI inputs stay reproducible (a follow-up automates
-  # the bump — see build-image.yml).
-  BUILDER_IMAGE: ghcr.io/hyprstream/rust-builder-arm64@sha256:aa9feb1c8432ebf4583fcfc9c8236c371cb050f489c4d0882a7f2d8c8589120e
-
 # The fast lint jobs (clippy, wasm) run on the self-hosted Graviton (arm64)
 # runners and drive the build through `podman run` against the prebuilt
 # rust-builder image (rust + capnproto + clang + libtorch). We DELIBERATELY do
@@ -74,6 +67,11 @@ jobs:
     - uses: actions/checkout@v4
       with:
         persist-credentials: false
+
+    # The immutable arm64 builder image is shared by rust.yml, the preflight,
+    # and AppImage packaging. Keep its sole pin in .github/builder-image.env.
+    - name: Load builder image pin
+      run: bash .github/scripts/load-builder-image.sh
 
     - name: Configure AWS credentials (OIDC → sccache S3)
       uses: aws-actions/configure-aws-credentials@v4
@@ -174,6 +172,9 @@ jobs:
       with:
         persist-credentials: false
 
+    - name: Load builder image pin
+      run: bash .github/scripts/load-builder-image.sh
+
     - name: Configure AWS credentials (OIDC → sccache S3)
       uses: aws-actions/configure-aws-credentials@v4
       with:
@@ -244,6 +245,9 @@ jobs:
     - uses: actions/checkout@v4
       with:
         persist-credentials: false
+
+    - name: Load builder image pin
+      run: bash .github/scripts/load-builder-image.sh
 
     - name: Configure AWS credentials (OIDC → sccache S3)
       uses: aws-actions/configure-aws-credentials@v4

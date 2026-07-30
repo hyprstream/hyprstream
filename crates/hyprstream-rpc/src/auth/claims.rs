@@ -501,7 +501,7 @@ impl Claims {
 
     /// Check if token is expired (with 5-second leeway for clock skew).
     pub fn is_expired(&self) -> bool {
-        chrono::Utc::now().timestamp() > self.exp + 5
+        chrono::Utc::now().timestamp() > self.exp.saturating_add(5)
     }
 
     /// True if this token was issued by a local node.
@@ -679,6 +679,15 @@ mod tests {
         assert_eq!(claims.iss, "");
         assert!(claims.aud.is_none());
         assert!(claims.token.is_none());
+    }
+
+    #[test]
+    fn expiry_check_handles_i64_max_without_wrapping() {
+        let claims = Claims::new("alice".to_owned(), 0, i64::MAX);
+        assert!(
+            !claims.is_expired(),
+            "an i64::MAX expiry must not wrap into an expired timestamp"
+        );
     }
 
     #[test]

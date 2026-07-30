@@ -17,8 +17,12 @@ pub mod jwt;
 pub mod key_rotation;
 pub mod mesh_trust;
 pub mod op_log;
+#[cfg(any(feature = "pglite", feature = "postgres"))]
+mod cipher_glue;
 #[cfg(feature = "pglite")]
 pub mod pglite_store;
+#[cfg(feature = "postgres")]
+pub mod postgres_store;
 mod policy_manager;
 pub mod policy_migration;
 pub mod policy_templates;
@@ -42,6 +46,8 @@ pub use op_log::{
 };
 #[cfg(feature = "pglite")]
 pub use pglite_store::PgliteUserStore;
+#[cfg(feature = "postgres")]
+pub use postgres_store::PostgresUserStore;
 pub use policy_manager::{
     federation_registration_resource, global_policy_manager, set_global_policy_manager,
     write_policy_file, PolicyError, PolicyManager,

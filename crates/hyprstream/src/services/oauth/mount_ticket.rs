@@ -152,6 +152,7 @@ pub async fn issue_mount_ticket(
         );
     };
     let mut claims = hyprstream_rpc::auth::Claims::new(user.user.clone(), now, exp)
+        .with_jti()
         .with_issuer(state.issuer_url.clone())
         .with_audience(Some(audience.clone()))
         .with_cap(capability.clone())
@@ -286,6 +287,7 @@ mod freeze_tests {
             None,
         )
         .unwrap();
+        assert!(claims.jti.is_some(), "issued mount tickets must be one-use");
         assert_eq!(claims.tenant.as_deref(), Some("tenant-a.example"));
         assert_eq!(claims.clearance, source.clearance);
     }

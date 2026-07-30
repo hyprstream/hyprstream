@@ -17,7 +17,7 @@
 //! A `TenantBinding` is an **admin-authorable surface**, never itself the
 //! authority: when [`TenantBindingSpec::entitlement`] is set, the operator
 //! *compiles* it into an issuer-signed UCAN grant (the operator signs as issuer)
-//! and an [`hyprstream_pds::ledger::AllocationRecord`] that lands in the
+//! and a PDS allocation record that lands in the
 //! tenant's inventory (PDS collection `ai.hyprstream.ledger.allocation`). The
 //! enforcers (#781/#787/#790/#793/#794/#527) verify the *presented grant*, not
 //! the CRD — the CRD only carries authorable intent. The compiled CIDs + epoch
@@ -93,8 +93,8 @@ pub struct TenantBindingSpec {
 
 /// The authorable entitlement carried by a [`TenantBindingSpec`].
 ///
-/// This is the k8s-side, dependency-free mirror of the fields the compiler
-/// ([`crate::grant`]) lowers into an `ai.hyprstream.ledger.allocation` record.
+/// This is the k8s-side, dependency-free mirror of the fields a downstream
+/// [`crate::grant::TenantGrantService`] lowers into its authority artifacts.
 /// It deliberately re-uses no `hyprstream-pds` / `hyprstream-rpc` types so the
 /// CRD schema keeps compiling with no features and no cluster; the compiler
 /// validates and maps these into the issuer-signed grant artifacts.
@@ -127,11 +127,10 @@ fn default_grant_class() -> TenantGrantClass {
     TenantGrantClass::Underwritten
 }
 
-/// The k8s-side mirror of [`hyprstream_pds::ledger::GrantClass`].
+/// Service-neutral grant classification.
 ///
 /// Serialized as the lexicon string (`"prepaid"` / `"underwritten"`) so the
-/// value is identical on the wire whether read from a CRD or an allocation
-/// record; the compiler maps it to the PDS type.
+/// value is stable on the wire; downstream adapters map it to service types.
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum TenantGrantClass {
@@ -146,7 +145,7 @@ pub enum TenantGrantClass {
 }
 
 impl TenantGrantClass {
-    /// The lexicon string form (matches `hyprstream_pds::ledger::GrantClass::as_str`).
+    /// Stable service-neutral string form.
     pub fn as_str(self) -> &'static str {
         match self {
             TenantGrantClass::Prepaid => "prepaid",

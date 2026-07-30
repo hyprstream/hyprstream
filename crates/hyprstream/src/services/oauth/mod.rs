@@ -50,6 +50,8 @@ pub mod oidc_callback;
 pub mod oidc_discovery;
 pub mod par;
 pub mod registration;
+pub mod replay_key;
+pub mod replay_metrics;
 pub mod revocation;
 pub mod rpc_handler;
 pub mod scim;
@@ -1704,13 +1706,18 @@ mod tests {
                 "alg": "ES256", "typ": "JWT", "kid": "#atproto"
             }))?,
         );
-        let make_service_jwt = |audience: &str, lxm: &str, jti: &str| -> anyhow::Result<String> {
+        let make_service_jwt_with_times = |audience: &str,
+                                           lxm: &str,
+                                           jti: &str,
+                                           iat: i64,
+                                           exp: i64|
+         -> anyhow::Result<String> {
             let payload = URL_SAFE_NO_PAD.encode(
                 serde_json::to_vec(&serde_json::json!({
                     "iss": MAPPED_DID,
                     "aud": audience,
-                    "iat": now,
-                    "exp": now + 60,
+                    "iat": iat,
+                    "exp": exp,
                     "lxm": lxm,
                     "jti": jti
                 }))?,
@@ -1722,6 +1729,9 @@ mod tests {
                 "{signing_input}.{}",
                 URL_SAFE_NO_PAD.encode(signature.to_bytes())
             ))
+        };
+        let make_service_jwt = |audience: &str, lxm: &str, jti: &str| {
+            make_service_jwt_with_times(audience, lxm, jti, now, now + 60)
         };
         let service_jwt = make_service_jwt(
             "did:web:pds.example.test%3A8443",
@@ -1777,6 +1787,24 @@ mod tests {
             .oneshot(exchange_request(&wrong_lxm, HOSTED_TENANT))
             .await?;
         assert_eq!(rejected_lxm.status(), axum::http::StatusCode::UNAUTHORIZED);
+
+        // The verifier must reject an unrepresentable signed interval before
+        // DID resolution, replay admission, or a token exchange can occur.
+        let extreme_interval = make_service_jwt_with_times(
+            "did:web:pds.example.test%3A8443",
+            token_exchange::ATPROTO_EXCHANGE_NSID,
+            "demo-1119-extreme-interval",
+            i64::MIN,
+            i64::MAX,
+        )?;
+        let rejected_extreme_interval = app
+            .clone()
+            .oneshot(exchange_request(&extreme_interval, HOSTED_TENANT))
+            .await?;
+        assert_eq!(
+            rejected_extreme_interval.status(),
+            axum::http::StatusCode::UNAUTHORIZED
+        );
 
         // #1314: the authority-owned account record supplies the binding. A
         // matching request succeeds and the minted credential carries exactly
