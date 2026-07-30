@@ -99,6 +99,12 @@ pub struct WorkflowService {
     /// Registered repo paths (repo_id → filesystem root)
     repo_paths: RwLock<HashMap<String, PathBuf>>,
 
+    /// Per-repo parse mode (#1432): a gate that loads a repo in strict mode
+    /// records it here so that later rescans (event-triggered or manual)
+    /// retain strict rather than silently dropping back to legacy.
+    /// Default for an unregistered repo is [`ParseMode::Legacy`].
+    repo_modes: RwLock<HashMap<String, super::parser::ParseMode>>,
+
     /// Active subscriptions (sub_id → WorkflowSubscription)
     subscriptions: RwLock<HashMap<String, WorkflowSubscription>>,
 
@@ -154,6 +160,7 @@ impl WorkflowService {
             runs: Arc::new(RwLock::new(HashMap::new())),
             repo_workflows: RwLock::new(HashMap::new()),
             repo_paths: RwLock::new(HashMap::new()),
+            repo_modes: RwLock::new(HashMap::new()),
             subscriptions: RwLock::new(HashMap::new()),
             handlers: RwLock::new(Vec::new()),
             event_loop_handle: tokio::sync::Mutex::new(None),
@@ -174,6 +181,52 @@ impl WorkflowService {
     pub async fn register_repo_path(&self, repo_id: impl Into<String>, path: PathBuf) {
         let mut repo_paths = self.repo_paths.write().await;
         repo_paths.insert(repo_id.into(), path);
+    }
+
+    /// Set the per-repo parse mode (#1432).
+    ///
+    /// A gate that loads a repo in strict mode records it here so that later
+    /// rescans retain strict (the default for an unregistered repo is
+    /// [`ParseMode::Legacy`]). Typically called by
+    /// [`GitHubActionsAdapter::load_repo_with`](super::gh_adapter::GitHubActionsAdapter::load_repo_with).
+    pub async fn set_repo_mode(&self, repo_id: &str, mode: super::parser::ParseMode) {
+        let mut repo_modes = self.repo_modes.write().await;
+        repo_modes.insert(repo_id.to_owned(), mode);
+    }
+
+    /// Resolve the per-repo parse mode, defaulting to [`ParseMode::Legacy`]
+    /// for repos that never opted into strict.
+    async fn repo_mode(&self, repo_id: &str) -> super::parser::ParseMode {
+        self.repo_modes
+            .read()
+            .await
+            .get(repo_id)
+            .copied()
+            .unwrap_or(super::parser::ParseMode::Legacy)
+    }
+
+    /// Evict stale registrations for a repo (#1432 fail-closed).
+    ///
+    /// Removes any `repo_id:*` registry entry absent from `fresh_ids`, so a
+    /// workflow that was rejected by strict mode, deleted, or otherwise no
+    /// longer present in the fresh scan becomes undispatchable
+    /// (`dispatch` → [`WorkflowNotFound`](crate::error::WorkerError::WorkflowNotFound)).
+    pub(crate) async fn evict_stale_for_repo(
+        &self,
+        repo_id: &str,
+        fresh_ids: &HashSet<WorkflowId>,
+    ) {
+        let stale_prefix = format!("{repo_id}:");
+        let mut workflows_lock = self.workflows.write().await;
+        let stale_keys: Vec<WorkflowId> = workflows_lock
+            .keys()
+            .filter(|id| id.starts_with(&stale_prefix) && !fresh_ids.contains(*id))
+            .cloned()
+            .collect();
+        for key in &stale_keys {
+            tracing::info!(workflow_id = %key, "Evicting stale workflow registration");
+            workflows_lock.remove(key);
+        }
     }
 
     /// Set the VFS namespace for workflow execution.
@@ -628,13 +681,18 @@ impl WorkflowService {
             .collect())
     }
 
-    /// Rescan a repository for workflow changes (legacy mode).
+    /// Rescan a repository for workflow changes.
     ///
-    /// Generic entry point — delegates to [`Self::rescan_repo_with`] with
-    /// [`ParseMode::Legacy`]. The merge gate uses
-    /// [`Self::rescan_repo_with`] with [`ParseMode::Strict`].
+    /// Retains the per-repo parse mode: a repo loaded in strict mode (via
+    /// `set_repo_mode` / `load_repo_with`) is rescanned in strict mode; a
+    /// repo that never opted in defaults to [`ParseMode::Legacy`]. This is
+    /// the generic entry point used by the event-triggered rescan path
+    /// (`HandlerResult::Rescan`) and `initialize`, so a gate's strict choice
+    /// survives push-triggered rescans rather than silently dropping back to
+    /// legacy (#1432 P1).
     pub async fn rescan_repo(&self, repo_id: &str) -> Result<()> {
-        self.rescan_repo_with(repo_id, super::parser::ParseMode::Legacy).await
+        let mode = self.repo_mode(repo_id).await;
+        self.rescan_repo_with(repo_id, mode).await
     }
 
     /// Rescan a repository with an explicit [`ParseMode`] (#1432).
@@ -642,13 +700,12 @@ impl WorkflowService {
     /// **Fail-closed stale eviction:** a workflow that was previously
     /// registered for this repo but is *absent* from the fresh scan set —
     /// because it was rejected by strict mode, deleted, or otherwise failed
-    /// to parse — is **evicted** from the registry. This is the fix for the
-    /// stale-handler gap: once evicted, [`Self::dispatch`] returns
+    /// to parse — is **evicted** from the registry (via
+    /// [`Self::evict_stale_for_repo`]). Once evicted, [`Self::dispatch`]
+    /// returns
     /// [`WorkflowNotFound`](crate::error::WorkerError::WorkflowNotFound) for
     /// that id, so any lingering adapter handler built against the old
-    /// version can no longer dispatch it. Without eviction, a strict-rejected
-    /// workflow would keep its prior registration live and continue
-    /// dispatching.
+    /// version can no longer dispatch it.
     pub async fn rescan_repo_with(
         &self,
         repo_id: &str,
@@ -662,21 +719,8 @@ impl WorkflowService {
             .map(|wf| format!("{}:{}", wf.repo_id, wf.path))
             .collect();
 
-        // Evict stale registrations: any registry entry belonging to this
-        // repo that did not survive the fresh scan is removed so it can no
-        // longer be dispatched (fail-closed).
-        let stale_prefix = format!("{repo_id}:");
-        let mut workflows_lock = self.workflows.write().await;
-        let stale_keys: Vec<WorkflowId> = workflows_lock
-            .keys()
-            .filter(|id| id.starts_with(&stale_prefix) && !fresh_ids.contains(*id))
-            .cloned()
-            .collect();
-        for key in &stale_keys {
-            tracing::info!(workflow_id = %key, "Evicting stale workflow registration on rescan");
-            workflows_lock.remove(key);
-        }
-        drop(workflows_lock);
+        // Evict stale registrations absent from the fresh set (fail-closed).
+        self.evict_stale_for_repo(repo_id, &fresh_ids).await;
 
         // Register the fresh set and rebuild subscriptions.
         let mut repo_workflows = self.repo_workflows.write().await;
@@ -693,7 +737,7 @@ impl WorkflowService {
 
         repo_workflows.insert(repo_id.to_owned(), subscriptions);
 
-        tracing::info!(repo_id = %repo_id, mode = ?mode, evicted = stale_keys.len(), "Rescanned repository");
+        tracing::info!(repo_id = %repo_id, mode = ?mode, "Rescanned repository");
         Ok(())
     }
 
@@ -1205,6 +1249,61 @@ jobs:
         assert!(
             workflow_ids(&listed).contains(&wf_id),
             "legacy rescan must keep the unknown-key workflow registered"
+        );
+        Ok(())
+    }
+
+    // ─── Rev 4 P1-A: strict mode retained across the generic rescan path ────
+
+    #[tokio::test]
+    async fn strict_mode_retained_across_legacy_signature_rescan() -> TestResult {
+        // The event-triggered rescan calls the generic `rescan_repo(repo)`
+        // (no mode arg). Once a gate has loaded the repo in strict mode
+        // (recorded via set_repo_mode), that rescan must RETAIN strict —
+        // otherwise a push that mutates the workflow to add an unknown key
+        // would silently reload it in legacy mode (the bypass).
+        let tmp = tempfile::tempdir()?;
+        write_workflow(tmp.path(), KNOWN_YAML).await?;
+
+        let svc = test_service();
+        svc.register_repo_path("acme", PathBuf::from(tmp.path())).await;
+        // Gate loads in strict mode → records the mode per-repo.
+        svc.set_repo_mode("acme", super::super::parser::ParseMode::Strict).await;
+        svc.rescan_repo("acme").await?; // registers the known workflow
+
+        let wf_id = String::from("acme:.github/workflows/gate.yml");
+        assert!(workflow_ids(&svc.list_workflows().await?).contains(&wf_id));
+
+        // Mutate to add an unknown key, then trigger the GENERIC rescan path
+        // (the one HandlerResult::Rescan / initialize use — no mode arg).
+        write_workflow(tmp.path(), UNKNOWN_KEY_YAML).await?;
+        svc.rescan_repo("acme").await?; // must still be strict → skip + evict
+
+        assert!(
+            !workflow_ids(&svc.list_workflows().await?).contains(&wf_id),
+            "strict mode must be retained across the generic rescan path; \
+             a now-unknown-key workflow must be skipped and evicted, not \
+             silently reloaded in legacy mode"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn strict_mode_default_is_legacy_for_unregistered_repo() -> TestResult {
+        // A repo that never opted into strict must rescan in legacy mode —
+        // guards against the mode store accidentally defaulting to strict.
+        let tmp = tempfile::tempdir()?;
+        write_workflow(tmp.path(), UNKNOWN_KEY_YAML).await?;
+
+        let svc = test_service();
+        svc.register_repo_path("acme", PathBuf::from(tmp.path())).await;
+        // No set_repo_mode call → default Legacy.
+        svc.rescan_repo("acme").await?;
+
+        let wf_id = String::from("acme:.github/workflows/gate.yml");
+        assert!(
+            workflow_ids(&svc.list_workflows().await?).contains(&wf_id),
+            "unregistered repo must default to legacy and keep the unknown-key workflow"
         );
         Ok(())
     }

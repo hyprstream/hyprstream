@@ -79,14 +79,41 @@ impl GitHubActionsAdapter {
     /// with dropped keys. In [`ParseMode::Legacy`] (the default for the
     /// generic adapter) unknown keys are tolerated, preserving non-gate
     /// caller compatibility (#1432 non-goal).
+    ///
+    /// The chosen mode is recorded per-repo on the service
+    /// ([`WorkflowService::set_repo_mode`]) so that push-triggered rescans
+    /// retain strict rather than silently dropping back to legacy. This load
+    /// also **reconciles**: stale service registrations and adapter handlers
+    /// for this repo that are absent from the fresh set are evicted/dropped,
+    /// so a deleted or strict-rejected workflow can no longer be dispatched
+    /// or triggered (fail-closed).
     pub async fn load_repo_with(
         &mut self,
         repo_id: &str,
         service: &WorkflowService,
         mode: super::parser::ParseMode,
     ) -> Result<()> {
-        // Scan the repository for workflow files.
+        // Record the mode so event-triggered rescans retain strict.
+        service.set_repo_mode(repo_id, mode).await;
+
+        // Scan the repository for workflow files in the chosen mode.
         let workflow_defs = service.scan_repo_with(repo_id, mode).await?;
+
+        // Reconcile the service registry: evict any prior registration for
+        // this repo that did not survive the fresh scan.
+        let fresh_ids: std::collections::HashSet<WorkflowId> = workflow_defs
+            .iter()
+            .map(|def| format!("{}:{}", def.repo_id, def.path))
+            .collect();
+        service.evict_stale_for_repo(repo_id, &fresh_ids).await;
+
+        // Reconcile this adapter's handlers: drop handlers whose workflow
+        // belongs to this repo, then rebuild from the fresh set. Without
+        // this, a strict-rejected/deleted workflow's handler would persist
+        // and keep firing (the fail-closed gap).
+        let repo_prefix = format!("{repo_id}:");
+        self.handlers
+            .retain(|h| !h.workflow_id().starts_with(&repo_prefix));
 
         for def in workflow_defs {
             // Register the workflow definition.
@@ -250,6 +277,136 @@ impl SubscriberAdapter for GitHubActionsAdapter {
             }
         }
 
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::events::EventSubscriber;
+    use hyprstream_vfs::Subject;
+    use std::path::PathBuf;
+
+    const KNOWN_YAML: &str = r#"
+name: Gate
+on: push
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    steps:
+      - run: cargo test
+"#;
+
+    const UNKNOWN_KEY_YAML: &str = r#"
+name: Gate
+on: push
+permissions:
+  contents: read
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    steps:
+      - run: cargo test
+"#;
+
+    async fn write_workflow(
+        root: &std::path::Path,
+        yaml: &str,
+    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let dir = root.join(".github").join("workflows");
+        tokio::fs::create_dir_all(&dir).await?;
+        tokio::fs::write(dir.join("gate.yml"), yaml).await?;
+        Ok(())
+    }
+
+    type TestResult = std::result::Result<(), Box<dyn std::error::Error>>;
+
+    fn adapter() -> std::result::Result<GitHubActionsAdapter, Box<dyn std::error::Error>> {
+        Ok(GitHubActionsAdapter::new(EventSubscriber::new()?, Subject::new("gate-test")))
+    }
+
+    fn service() -> super::super::service::WorkflowService {
+        use hyprstream_rpc::prelude::SigningKey;
+        use hyprstream_rpc::transport::TransportConfig;
+        use rand::rngs::OsRng;
+        super::super::service::WorkflowService::new(
+            TransportConfig::inproc("test-gh-adapter"),
+            SigningKey::generate(&mut OsRng),
+        )
+    }
+
+    /// P1-B (rev 4): a repeated strict load must reconcile — a workflow that
+    /// is now strict-rejected must have BOTH its registration evicted AND its
+    /// adapter handler dropped, so it can no longer be triggered.
+    #[tokio::test]
+    async fn strict_load_reconciles_stale_handler() -> TestResult {
+        let tmp = tempfile::tempdir()?;
+        write_workflow(tmp.path(), KNOWN_YAML).await?;
+
+        let svc = service();
+        svc.register_repo_path("acme", PathBuf::from(tmp.path())).await;
+
+        let mut adp = adapter()?;
+        adp.load_repo_with("acme", &svc, super::super::parser::ParseMode::Strict)
+            .await?;
+        // `on: push` builds a TopicPatternHandler → at least one handler.
+        assert!(
+            !adp.handlers.is_empty(),
+            "known workflow should register at least one handler"
+        );
+        assert!(
+            svc.list_workflows().await?.iter().any(|i| i.id
+                == "acme:.github/workflows/gate.yml"),
+            "workflow should be registered after first strict load"
+        );
+
+        // Mutate to add an unknown key and reload in strict mode.
+        write_workflow(tmp.path(), UNKNOWN_KEY_YAML).await?;
+        adp.load_repo_with("acme", &svc, super::super::parser::ParseMode::Strict)
+            .await?;
+
+        // Adapter handlers for this repo must be dropped (reconcile).
+        let repo_prefix = "acme:";
+        let remaining = adp
+            .handlers
+            .iter()
+            .filter(|h| h.workflow_id().starts_with(repo_prefix))
+            .count();
+        assert_eq!(
+            remaining, 0,
+            "strict-rejected workflow's adapter handlers must be dropped on reconcile"
+        );
+        // And the registration must be evicted from the service.
+        assert!(
+            !svc.list_workflows().await?.iter().any(|i| i.id
+                == "acme:.github/workflows/gate.yml"),
+            "strict-rejected workflow's registration must be evicted on reconcile"
+        );
+        Ok(())
+    }
+
+    /// Legacy reload keeps the workflow (and its handler) — guards against the
+    /// reconcile path accidentally evicting under the generic/legacy loader.
+    #[tokio::test]
+    async fn legacy_load_keeps_unknown_key_workflow() -> TestResult {
+        let tmp = tempfile::tempdir()?;
+        write_workflow(tmp.path(), UNKNOWN_KEY_YAML).await?;
+
+        let svc = service();
+        svc.register_repo_path("acme", PathBuf::from(tmp.path())).await;
+
+        let mut adp = adapter()?;
+        adp.load_repo("acme", &svc).await?; // legacy
+        assert!(
+            !adp.handlers.is_empty(),
+            "legacy load keeps the unknown-key workflow's handlers"
+        );
+        assert!(
+            svc.list_workflows().await?.iter().any(|i| i.id
+                == "acme:.github/workflows/gate.yml"),
+            "legacy load keeps the unknown-key workflow registered"
+        );
         Ok(())
     }
 }
