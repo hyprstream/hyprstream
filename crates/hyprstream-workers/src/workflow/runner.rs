@@ -17,6 +17,7 @@
 //!   governs wall-clock run/step duration, a different axis)
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -26,7 +27,8 @@ use tokio_util::sync::CancellationToken;
 
 use hyprstream_workers_tcl::TclShell;
 // VFS proxy no longer needed — TclShell awaits namespace operations directly.
-use hyprstream_vfs::{Namespace, Subject};
+use hyprstream_vfs::overlay::passthrough_rootfs_overlay;
+use hyprstream_vfs::{BindFlag, MountTarget, Namespace, Subject};
 
 use crate::config::WorkflowConfig;
 
@@ -58,6 +60,44 @@ pub struct StepRunResult {
     pub name: String,
     pub success: bool,
     pub output: String,
+}
+
+/// A composed candidate worktree made available to a workflow job at `/src`.
+///
+/// The host path is canonicalized once by the trusted control plane. Each job
+/// receives a fresh OverlayFs upper over this immutable lower, so a workflow
+/// write copies up into job-local scratch and never mutates the git2db tree.
+#[derive(Clone, Debug)]
+pub struct CandidateWorktree {
+    root: Arc<PathBuf>,
+}
+
+impl CandidateWorktree {
+    pub fn from_host_path(path: impl AsRef<Path>) -> RunnerResult<Self> {
+        let root = std::fs::canonicalize(path.as_ref())
+            .map_err(|e| RunnerError::VfsError(format!("canonicalize candidate worktree: {e}")))?;
+        if !root.is_dir() {
+            return Err(RunnerError::VfsError(format!(
+                "candidate worktree is not a directory: {}", root.display()
+            )));
+        }
+        Ok(Self { root: Arc::new(root) })
+    }
+
+    fn mount_for_job(&self) -> RunnerResult<(MountTarget, tempfile::TempDir)> {
+        let scratch = tempfile::Builder::new()
+            .prefix("hyprstream-candidate-")
+            .tempdir()
+            .map_err(|e| RunnerError::VfsError(format!("create candidate overlay scratch: {e}")))?;
+        let upper = scratch.path().join("upper");
+        let work = scratch.path().join("work");
+        std::fs::create_dir(&upper)
+            .and_then(|_| std::fs::create_dir(&work))
+            .map_err(|e| RunnerError::VfsError(format!("create candidate overlay dirs: {e}")))?;
+        let mount = passthrough_rootfs_overlay(self.root.as_ref(), &upper, &work)
+            .map_err(|e| RunnerError::VfsError(format!("compose candidate worktree mount: {e}")))?;
+        Ok((Arc::new(mount) as MountTarget, scratch))
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -142,6 +182,7 @@ pub struct WorkflowRunner {
     job_timeout: Duration,
     step_timeout: Duration,
     scheduler: Option<Arc<JobScheduler>>,
+    candidate_worktree: Option<CandidateWorktree>,
 }
 
 impl WorkflowRunner {
@@ -166,6 +207,7 @@ impl WorkflowRunner {
             job_timeout: Duration::from_secs(config.job_timeout_secs),
             step_timeout: Duration::from_secs(config.step_timeout_secs),
             scheduler: None,
+            candidate_worktree: None,
         }
     }
 
@@ -173,6 +215,14 @@ impl WorkflowRunner {
     /// isolation are placed onto its sandbox pool instead of running in-proc.
     pub fn with_scheduler(mut self, scheduler: Arc<JobScheduler>) -> Self {
         self.scheduler = Some(scheduler);
+        self
+    }
+
+    /// Bind a git2db-composed candidate worktree into each job namespace at
+    /// `/src`. The supplied host path is never exposed directly: every job gets
+    /// a distinct copy-up overlay and the bind is mediated as the job Subject.
+    pub fn with_candidate_worktree(mut self, candidate: CandidateWorktree) -> Self {
+        self.candidate_worktree = Some(candidate);
         self
     }
 
@@ -224,6 +274,7 @@ impl WorkflowRunner {
                 let ns = Arc::clone(&self.ns);
                 let sem = Arc::clone(&self.script_semaphore);
                 let scheduler = self.scheduler.clone();
+                let candidate_worktree = self.candidate_worktree.clone();
                 let job_timeout = job
                     .timeout_minutes
                     .map(|m| Duration::from_secs(u64::from(m) * 60))
@@ -237,7 +288,7 @@ impl WorkflowRunner {
 
                 join_set.spawn(async move {
                     let result = run_job(
-                        ns, sem, scheduler, &job, &name, env, &inputs, &subject, cancel,
+                        ns, sem, scheduler, candidate_worktree, &job, &name, env, &inputs, &subject, cancel,
                         job_timeout, step_timeout,
                     ).await;
                     (name, result)
@@ -298,6 +349,7 @@ async fn run_job(
     ns: Arc<Namespace>,
     semaphore: Arc<Semaphore>,
     scheduler: Option<Arc<JobScheduler>>,
+    candidate_worktree: Option<CandidateWorktree>,
     job: &Job,
     job_name: &str,
     env: HashMap<String, String>,
@@ -333,7 +385,7 @@ async fn run_job(
     // `timeout-minutes:` already folded into `job_timeout` by the caller.
     let outcome = tokio::time::timeout(
         job_timeout,
-        run_job_steps(ns, semaphore, job, job_name, env, inputs, subject, cancel, step_timeout),
+        run_job_steps(ns, semaphore, candidate_worktree, job, job_name, env, inputs, subject, cancel, step_timeout),
     )
     .await;
 
@@ -361,6 +413,7 @@ async fn run_job(
 async fn run_job_steps(
     ns: Arc<Namespace>,
     semaphore: Arc<Semaphore>,
+    candidate_worktree: Option<CandidateWorktree>,
     job: &Job,
     job_name: &str,
     env: HashMap<String, String>,
@@ -388,6 +441,19 @@ async fn run_job_steps(
         let _ = forked.unmount("/config");
         let _ = forked.unmount("/private");
         let _ = forked.unmount("/srv");
+
+        // Candidate source enters only this forked, Subject-scoped namespace.
+        // Its lower is the git2db materialization; writes copy up into a
+        // job-local overlay retained until the job completes.
+        let _candidate_scratch = if let Some(candidate) = candidate_worktree {
+            let (mount, scratch) = candidate.mount_for_job()?;
+            forked
+                .bind_mount_as("/src", mount, BindFlag::Replace, subject)
+                .map_err(|e| RunnerError::VfsError(format!("bind candidate at /src: {e}")))?;
+            Some(scratch)
+        } else {
+            None
+        };
 
         // Write env vars to /env/* in forked namespace.
         // We use an in-memory mount for env vars.
@@ -1188,6 +1254,45 @@ mod tests {
         ns.mount("/config", config_mount).unwrap();
 
         Arc::new(ns)
+    }
+
+    /// A git2db materialized tree is exposed only through a fresh job overlay:
+    /// reads see the candidate lower while writes copy up and leave the source
+    /// tree untouched. This exercises the actual Plan 9 mount seam used by
+    /// `run_job_steps`, not a host-path shortcut.
+    #[tokio::test]
+    async fn candidate_worktree_binds_at_src_with_job_local_copy_up() {
+        let source = tempfile::tempdir().unwrap();
+        let source_file = source.path().join("Cargo.toml");
+        std::fs::write(&source_file, b"[package]\nname = \"candidate\"\n").unwrap();
+
+        let candidate = CandidateWorktree::from_host_path(source.path()).unwrap();
+        let (mount, _scratch) = candidate.mount_for_job().unwrap();
+        let mut ns = Namespace::new();
+        let subject = test_subject();
+        ns.bind_mount_as("/src", mount, BindFlag::Replace, &subject)
+            .unwrap();
+
+        assert_eq!(
+            ns.cat("/src/Cargo.toml", &subject).await.unwrap(),
+            b"[package]\nname = \"candidate\"\n"
+        );
+        ns.echo("/src/Cargo.toml", b"[package]\nname = \"job-local\"\n", &subject)
+            .await
+            .unwrap();
+        assert_eq!(
+            ns.cat("/src/Cargo.toml", &subject).await.unwrap(),
+            b"[package]\nname = \"job-local\"\n"
+        );
+        assert_eq!(
+            std::fs::read(source_file).unwrap(),
+            b"[package]\nname = \"candidate\"\n",
+            "candidate source lower must never be mutated by a job"
+        );
+        assert!(
+            ns.cat("/etc/passwd", &subject).await.is_err(),
+            "the composed candidate mount must not confer ambient host-path access"
+        );
     }
 
     fn make_namespace_with_slow_action(delay: std::time::Duration) -> Arc<Namespace> {
