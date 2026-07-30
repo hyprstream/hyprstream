@@ -302,6 +302,13 @@ jobs:
           -e CARGO_INCREMENTAL=0 -e CARGO_TERM_COLOR=always \
           "$BUILDER_IMAGE" \
           bash -euo pipefail -c '
+            # #1425 r4: install the real headless-browser dependency as root,
+            # before switching to the non-root ci user below — graviton-build-
+            # test.sh runs as ci and cannot apt-get/dnf install. This makes the
+            # required merge-group build path actually launch a browser for the
+            # wasm_browser_fetch conformance test, not just compile-check it.
+            bash /build/.github/scripts/install-chromium.sh
+
             # cargo-nextest, git-lfs, the wasm targets and clippy are baked into the
             # builder image (BUILDER_IMAGE, Dockerfile builder-cpu-arm64) — no runtime
             # installs here. Only set up the NON-ROOT user: several fail-closed tests

@@ -7,6 +7,17 @@ regressions could pass both PR checks and the required merge-group job.
 
 This zero-build check locks one shared script into both CI paths and proves that
 the script retains the complete package set, target, and browser-only cfgs.
+
+#1425 r4: a `cargo check` compile pass cannot catch a regression in the actual
+browser-fetch runtime behavior (JS callback, Request/Response, nonce retry,
+response rejection) — only real execution can. The fast PR `WASM (browser
+client)` job runs that real execution, but it is explicitly skipped on
+`merge_group` (rust.yml `wasm` job `if:`), so a required merge-group `build`
+could go green without ever launching a browser. This gate additionally locks
+the required merge driver (graviton-build-test.sh) to invoking the real
+browser-execution script (browser-wasm-test-ci.sh) — not just the compile-only
+check — and locks the workflow to installing the browser dependency as root
+*before* it drops to the non-root `ci` user that script runs as.
 """
 
 from __future__ import annotations
@@ -35,6 +46,15 @@ MERGE_DRIVER_WORKFLOW_INVOCATION = (
     "/build/.github/scripts/graviton-build-test.sh"
 )
 MERGE_INVOCATION = "bash .github/scripts/browser-wasm-check.sh"
+# #1425 r4: the required merge-group build path must invoke the REAL browser
+# runner (not just the compile-only check above), and must install the
+# browser as root before it creates/switches to the non-root `ci` user that
+# runs graviton-build-test.sh (that user cannot apt-get/dnf install).
+WORKFLOW_CHROMIUM_INSTALL_INVOCATION = (
+    "bash /build/.github/scripts/install-chromium.sh"
+)
+WORKFLOW_USERADD = "useradd -m ci"
+MERGE_REAL_EXECUTION_INVOCATION = "bash .github/scripts/browser-wasm-test-ci.sh"
 EXPECTED_EXECUTION_TAIL = """\
 append_rustflag '--cfg=web_sys_unstable_apis'
 append_rustflag '--cfg=getrandom_backend="wasm_js"'
@@ -94,6 +114,29 @@ def check(workflow: str, merge_driver: str, wasm_check: str) -> None:
         merge_driver.count(MERGE_INVOCATION) == 1,
         "required merge driver must invoke the shared browser check exactly once",
     )
+    # #1425 r4: the required merge-group build must actually launch a browser,
+    # not just compile-check — and the browser dependency must be installed
+    # as root before the workflow drops to the non-root `ci` user that runs
+    # graviton-build-test.sh, or the real-execution invocation below fails
+    # closed at runtime with no browser available.
+    _assert(
+        merge_driver.count(MERGE_REAL_EXECUTION_INVOCATION) == 1,
+        "required merge driver must invoke the real browser-execution script "
+        "(browser-wasm-test-ci.sh) exactly once, not only the compile-only check",
+    )
+    _assert(
+        workflow.count(WORKFLOW_CHROMIUM_INSTALL_INVOCATION) == 1,
+        "rust.yml required build must install the browser (install-chromium.sh) "
+        "exactly once, as root",
+    )
+    _assert(
+        WORKFLOW_CHROMIUM_INSTALL_INVOCATION in workflow
+        and WORKFLOW_USERADD in workflow
+        and workflow.index(WORKFLOW_CHROMIUM_INSTALL_INVOCATION)
+        < workflow.index(WORKFLOW_USERADD),
+        "rust.yml required build must install the browser BEFORE switching to "
+        "the non-root ci user (that user cannot apt-get/dnf install)",
+    )
     packages = _package_set(wasm_check)
     _assert(
         packages == EXPECTED_PACKAGES,
@@ -128,6 +171,41 @@ def mutations(
         (
             "remove PR invocation",
             workflow.replace(WORKFLOW_INVOCATION, "true", 1),
+            merge_driver,
+            wasm_check,
+        ),
+        (
+            "remove real browser execution from merge driver",
+            workflow,
+            merge_driver.replace(MERGE_REAL_EXECUTION_INVOCATION, "true", 1),
+            wasm_check,
+        ),
+        (
+            "duplicate real browser execution invocation",
+            workflow,
+            merge_driver.replace(
+                MERGE_REAL_EXECUTION_INVOCATION,
+                MERGE_REAL_EXECUTION_INVOCATION + "\n" + MERGE_REAL_EXECUTION_INVOCATION,
+                1,
+            ),
+            wasm_check,
+        ),
+        (
+            "remove chromium install from required build job",
+            workflow.replace(WORKFLOW_CHROMIUM_INSTALL_INVOCATION, "true", 1),
+            merge_driver,
+            wasm_check,
+        ),
+        (
+            "install chromium after switching to non-root ci user",
+            (
+                workflow.replace(WORKFLOW_CHROMIUM_INSTALL_INVOCATION, "true", 1)
+                .replace(
+                    WORKFLOW_USERADD,
+                    WORKFLOW_USERADD + "\n            " + WORKFLOW_CHROMIUM_INSTALL_INVOCATION,
+                    1,
+                )
+            ),
             merge_driver,
             wasm_check,
         ),
