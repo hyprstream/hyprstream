@@ -1,7 +1,8 @@
 //! Authentication and credential management
 //!
-//! Consolidated authentication patterns from the original codebase
+//! Consolidated authentication patterns from the original codebase.
 
+use crate::callback_config::{AuthMode, CertificateConfig};
 use git2::{Cred, CredentialType, RemoteCallbacks};
 use std::path::PathBuf;
 use tracing::{debug, info, warn};
@@ -26,22 +27,53 @@ pub enum AuthStrategy {
     Default,
 }
 
-/// Credential manager for handling authentication
+/// Credential manager for handling authentication.
+///
+/// Defaults to a **strict** security posture:
+/// - [`CertificateConfig::Strict`] — certificates are validated by libgit2
+///   against the system trust store; a cert that fails verification rejects
+///   the fetch. The previous always-`CertificateOk` behavior is gone.
+/// - [`AuthMode::ExplicitOnly`] — ambient credential discovery
+///   (`AuthStrategy::Default`, i.e. the git credential helper, `~/.gitconfig`,
+///   SSH agent fallback) is refused unless the caller explicitly opts in via
+///   [`AuthManager::with_auth_mode`]`(AllowAmbient)`.
 pub struct AuthManager {
     strategies: Vec<AuthStrategy>,
+    certificate_mode: CertificateConfig,
+    auth_mode: AuthMode,
 }
 
 impl AuthManager {
-    /// Create a new authentication manager
+    /// Create a new authentication manager with no strategies, strict
+    /// certificate validation, and `ExplicitOnly` auth mode.
     pub fn new() -> Self {
         Self {
-            strategies: vec![AuthStrategy::Default],
+            strategies: Vec::new(),
+            certificate_mode: CertificateConfig::Strict,
+            auth_mode: AuthMode::ExplicitOnly,
         }
     }
 
-    /// Create authentication manager with strategies
+    /// Create authentication manager with strategies. Certificate validation
+    /// defaults to strict and auth mode to `ExplicitOnly`.
     pub fn with_strategies(strategies: Vec<AuthStrategy>) -> Self {
-        Self { strategies }
+        Self {
+            strategies,
+            certificate_mode: CertificateConfig::Strict,
+            auth_mode: AuthMode::ExplicitOnly,
+        }
+    }
+
+    /// Set the certificate validation mode.
+    pub fn with_certificate_mode(mut self, mode: CertificateConfig) -> Self {
+        self.certificate_mode = mode;
+        self
+    }
+
+    /// Set the authentication provenance mode.
+    pub fn with_auth_mode(mut self, mode: AuthMode) -> Self {
+        self.auth_mode = mode;
+        self
     }
 
     /// Add an authentication strategy
@@ -49,31 +81,33 @@ impl AuthManager {
         self.strategies.push(strategy);
     }
 
-    /// Create remote callbacks with authentication
+    /// Create remote callbacks with authentication and certificate handling.
+    ///
+    /// Security posture:
+    /// - Under `Strict` (default) the certificate callback returns
+    ///   `CertificatePassthrough`, deferring to libgit2's built-in verification.
+    ///   It never returns `CertificateOk` unconditionally, so an invalid or
+    ///   untrusted certificate fails the fetch.
+    /// - Under `ExplicitOnly` (default) `AuthStrategy::Default` is skipped, so
+    ///   ambient credential sources are not consulted.
     pub fn create_callbacks(&self) -> RemoteCallbacks<'_> {
         let mut callbacks = RemoteCallbacks::new();
 
+        let auth_mode = self.auth_mode;
         callbacks.credentials(move |url, username_from_url, allowed_types| {
-            self.handle_credentials(url, username_from_url, allowed_types)
+            self.handle_credentials(auth_mode, url, username_from_url, allowed_types)
         });
 
-        callbacks.certificate_check(|cert, valid| {
-            // For now, accept all certificates
-            // TODO: Implement proper certificate validation based on config
-            debug!(
-                "Certificate check: valid={}, host={:?}",
-                valid,
-                cert.as_hostkey().map(|h| h.hostkey())
-            );
-            Ok(git2::CertificateCheckStatus::CertificateOk)
-        });
+        let cert_mode = self.certificate_mode.clone();
+        callbacks.certificate_check(move |cert, _host| Self::handle_certificate(&cert_mode, cert));
 
         callbacks
     }
 
-    /// Handle credential requests
+    /// Handle credential requests.
     fn handle_credentials(
         &self,
+        auth_mode: AuthMode,
         url: &str,
         username_from_url: Option<&str>,
         allowed_types: CredentialType,
@@ -82,8 +116,18 @@ impl AuthManager {
         info!("Username from URL: {:?}", username_from_url);
         info!("Allowed credential types: {:?}", allowed_types);
 
-        // Try each strategy in order
+        // Try each strategy in order. Under ExplicitOnly, AuthStrategy::Default
+        // (ambient credential discovery) is refused so an untrusted fetch
+        // cannot silently pick up operator credentials.
         for strategy in &self.strategies {
+            if matches!(auth_mode, AuthMode::ExplicitOnly)
+                && matches!(strategy, AuthStrategy::Default)
+            {
+                debug!(
+                    "Refusing ambient AuthStrategy::Default for {url} under ExplicitOnly auth mode"
+                );
+                continue;
+            }
             match self.try_strategy(strategy, url, username_from_url, allowed_types) {
                 Ok(cred) => {
                     info!("Authentication successful with strategy: {:?}", strategy);
@@ -97,7 +141,37 @@ impl AuthManager {
         }
 
         warn!("All authentication strategies failed for {}", url);
-        Err(git2::Error::from_str("No suitable authentication method"))
+        if matches!(auth_mode, AuthMode::ExplicitOnly) {
+            Err(git2::Error::from_str(
+                "No suitable explicit authentication method (ambient discovery refused under \
+                 ExplicitOnly auth mode)",
+            ))
+        } else {
+            Err(git2::Error::from_str("No suitable authentication method"))
+        }
+    }
+
+    /// Certificate check shared between the sync and send-safe callback paths.
+    /// Delegates to [`crate::callback_config::CallbackConfig::certificate_decision`]
+    /// so the two paths cannot drift on the security boundary.
+    fn handle_certificate(
+        mode: &CertificateConfig,
+        cert: &git2::cert::Cert<'_>,
+    ) -> Result<git2::CertificateCheckStatus, git2::Error> {
+        let hostkey = cert.as_hostkey().and_then(|hk| {
+            hk.hostkey().map(|bytes| {
+                let host = std::str::from_utf8(bytes).unwrap_or("");
+                (host, bytes)
+            })
+        });
+        let status = crate::callback_config::CallbackConfig::certificate_decision(mode, hostkey)?;
+        if matches!(mode, CertificateConfig::AcceptAll) {
+            debug!(
+                "Accepting certificate unconditionally (AcceptAll mode): hostkey={:?}",
+                cert.as_hostkey().map(|h| h.hostkey())
+            );
+        }
+        Ok(status)
     }
 
     /// Try a specific authentication strategy
@@ -172,6 +246,16 @@ impl AuthManager {
     /// Get the number of configured strategies (for testing)
     pub fn strategy_count(&self) -> usize {
         self.strategies.len()
+    }
+
+    /// Get the configured certificate validation mode.
+    pub fn certificate_mode(&self) -> CertificateConfig {
+        self.certificate_mode.clone()
+    }
+
+    /// Get the configured authentication provenance mode.
+    pub fn auth_mode(&self) -> AuthMode {
+        self.auth_mode
     }
 
     /// Get the strategies (for testing)
@@ -251,13 +335,17 @@ impl AuthBuilder {
         self
     }
 
-    /// Add default credentials (fallback)
+    /// Add default credentials (fallback). Maps to libgit2's ambient credential
+    /// discovery (git credential helper, `~/.gitconfig`, SSH agent fallback).
+    /// Only honored when the `AuthManager` is built with
+    /// [`AuthMode::AllowAmbient`]; under the default `ExplicitOnly` mode this
+    /// strategy is refused at resolution time.
     pub fn default_fallback(mut self) -> Self {
         self.strategies.push(AuthStrategy::Default);
         self
     }
 
-    /// Build the authentication manager
+    /// Build the authentication manager (strict certs, `ExplicitOnly` auth).
     pub fn build(self) -> AuthManager {
         AuthManager::with_strategies(self.strategies)
     }
@@ -269,28 +357,36 @@ impl Default for AuthBuilder {
     }
 }
 
-/// Helper function to create common authentication configurations
+/// Helper function to create common authentication configurations.
+///
+/// Presets that include ambient discovery (`AuthStrategy::Default`) opt into
+/// [`AuthMode::AllowAmbient`] explicitly, since their purpose is operator-style
+/// access to first-party/trusted remotes. The strict certificate default is
+/// preserved in every preset.
 pub mod presets {
     use super::*;
 
-    /// Standard SSH configuration (agent + fallback)
+    /// Standard SSH configuration (agent + ambient fallback). Opts into
+    /// `AllowAmbient` because the ambient fallback is the explicit intent.
     pub fn ssh_standard() -> AuthManager {
         AuthBuilder::new()
             .ssh_agent(Some("git".to_owned()))
             .default_fallback()
             .build()
+            .with_auth_mode(AuthMode::AllowAmbient)
     }
 
-    /// GitHub personal access token
+    /// GitHub personal access token with SSH-agent and ambient fallback.
     pub fn github_token<T: Into<String>>(token: T) -> AuthManager {
         AuthBuilder::new()
             .token(token)
             .ssh_agent(Some("git".to_owned()))
             .default_fallback()
             .build()
+            .with_auth_mode(AuthMode::AllowAmbient)
     }
 
-    /// SSH key file authentication
+    /// SSH key file authentication with agent and ambient fallback.
     pub fn ssh_key_file<U, P>(
         username: U,
         private_key: P,
@@ -305,11 +401,16 @@ pub mod presets {
             .ssh_agent(Some("git".to_owned()))
             .default_fallback()
             .build()
+            .with_auth_mode(AuthMode::AllowAmbient)
     }
 
-    /// Public repository access only
+    /// Public repository access via ambient discovery only. Opts into
+    /// `AllowAmbient`.
     pub fn public_only() -> AuthManager {
-        AuthBuilder::new().default_fallback().build()
+        AuthBuilder::new()
+            .default_fallback()
+            .build()
+            .with_auth_mode(AuthMode::AllowAmbient)
     }
 }
 
@@ -338,5 +439,35 @@ mod tests {
 
         let public_auth = presets::public_only();
         assert_eq!(public_auth.strategies.len(), 1);
+    }
+
+    #[test]
+    fn auth_manager_builder_chains_modes() {
+        let mgr = AuthManager::with_strategies(vec![AuthStrategy::Token { token: "t".into() }])
+            .with_certificate_mode(CertificateConfig::AcceptAll)
+            .with_auth_mode(AuthMode::AllowAmbient);
+        assert!(matches!(
+            mgr.certificate_mode(),
+            CertificateConfig::AcceptAll
+        ));
+        assert_eq!(mgr.auth_mode(), AuthMode::AllowAmbient);
+    }
+
+    /// The credentials callback under ExplicitOnly must refuse the Default
+    /// strategy even though it is present in the strategy list (ambient
+    /// discovery never consulted). Mirrors the callback_config unit test but
+    /// exercises the AuthManager (sync) path.
+    #[test]
+    fn auth_manager_explicit_only_refuses_default() {
+        let mgr = AuthManager::with_strategies(vec![AuthStrategy::Default]);
+        // allowed_types includes DEFAULT, so the only reason to fail is the
+        // ExplicitOnly refusal of the ambient Default strategy.
+        let res = mgr.handle_credentials(
+            AuthMode::ExplicitOnly,
+            "https://example.com/repo.git",
+            None,
+            CredentialType::DEFAULT,
+        );
+        assert!(res.is_err());
     }
 }

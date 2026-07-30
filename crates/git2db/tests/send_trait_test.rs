@@ -6,7 +6,7 @@
 
 use git2db::{
     auth::AuthStrategy,
-    callback_config::{CallbackConfigBuilder, ProgressConfig},
+    callback_config::{AuthMode, CallbackConfigBuilder, ProgressConfig},
     clone_options::{CloneOptions, CloneOptionsBuilder},
     manager::GitManager,
 };
@@ -66,6 +66,7 @@ async fn test_clone_with_send_safe_progress() -> Result<(), Box<dyn std::error::
         .callback_config(
             CallbackConfigBuilder::new()
                 .auth(AuthStrategy::Default)
+                .auth_mode(AuthMode::AllowAmbient)
                 .progress(ProgressConfig::Channel(reporter))
                 .build(),
         )
@@ -104,6 +105,7 @@ async fn test_clone_future_is_send() -> Result<(), Box<dyn std::error::Error>> {
         .callback_config(
             CallbackConfigBuilder::new()
                 .auth(AuthStrategy::Default)
+                .auth_mode(AuthMode::AllowAmbient)
                 .build(),
         )
         .build();
@@ -139,6 +141,7 @@ async fn test_concurrent_clones_with_send() {
                     .callback_config(
                         CallbackConfigBuilder::new()
                             .auth(AuthStrategy::Default)
+                            .auth_mode(AuthMode::AllowAmbient)
                             .progress(ProgressConfig::Stdout)
                             .build(),
                     )
@@ -180,6 +183,7 @@ fn test_callback_config_auth_strategies() {
             token: "test_token".to_owned(),
         })
         .auth(AuthStrategy::Default)
+        .auth_mode(AuthMode::AllowAmbient)
         .build();
 
     // Verify we have 3 auth strategies
