@@ -399,12 +399,14 @@ pub(super) async fn verify_atproto_service_jwt(
     if claims.exp <= now {
         return Err("ATProto service JWT is expired".to_owned());
     }
-    if claims.iat > now + 5 || claims.exp <= claims.iat {
+    if claims.iat > now.saturating_add(5) || claims.exp <= claims.iat {
         return Err("ATProto service JWT has an invalid iat/exp interval".to_owned());
     }
-    if claims.exp - claims.iat > MAX_ATPROTO_SERVICE_TOKEN_LIFETIME {
-        return Err("ATProto service JWT lifetime exceeds one hour".to_owned());
-    }
+    let _lifetime = claims
+        .exp
+        .checked_sub(claims.iat)
+        .filter(|lifetime| *lifetime > 0 && *lifetime <= MAX_ATPROTO_SERVICE_TOKEN_LIFETIME)
+        .ok_or_else(|| "ATProto service JWT has an invalid iat/exp interval".to_owned())?;
     if claims.jti.is_empty() || claims.jti.len() > 256 {
         return Err("ATProto service JWT jti must be 1..=256 bytes".to_owned());
     }

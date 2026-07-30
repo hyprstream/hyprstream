@@ -1,7 +1,7 @@
 //! Middleware for authentication, logging, and request processing
 
 use crate::auth::jwt;
-use crate::server::state::{ResourceAuthState, ServerState};
+use crate::server::state::ResourceAuthState;
 use axum::{
     extract::{Request, State},
     http::{header, HeaderValue, StatusCode},
@@ -9,6 +9,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use hyprstream_rpc::auth::JtiBlocklist as _;
+use hyprstream_util::InsertIfAbsentNoEvictResult;
 use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
@@ -177,13 +178,33 @@ pub async fn auth_middleware(
         // iat ±60s window). Atomic check-and-record on the shared TtlCache.
         {
             let now = chrono::Utc::now().timestamp();
-            let ttl_secs = ((proof.iat + 120) - now).max(0) as u64;
-            if !state.dpop_jti_seen.insert_if_absent(
-                proof.jti.clone(),
+            let Some(ttl_secs) = proof
+                .iat
+                .checked_add(120)
+                .and_then(|deadline| deadline.checked_sub(now))
+                .filter(|remaining| *remaining > 0 && *remaining <= 180)
+                .and_then(|remaining| u64::try_from(remaining).ok())
+            else {
+                return unauthorized_response("Authentication failed", &www_authenticate);
+            };
+            let result = state.dpop_jti_seen.insert_if_absent_no_evict(
+                crate::services::oauth::replay_key::dpop_jti(&proof.jti),
                 (),
                 Duration::from_secs(ttl_secs),
-            ) {
-                debug!("DPoP proof jti already used: {}", proof.jti);
+            );
+            if result != InsertIfAbsentNoEvictResult::Inserted {
+                crate::services::oauth::replay_metrics::record_rejection(
+                    crate::services::oauth::replay_metrics::DPOP,
+                    result,
+                );
+                if crate::services::oauth::replay_metrics::should_warn_full(
+                    crate::services::oauth::replay_metrics::DPOP,
+                    result,
+                ) {
+                    warn!("DPoP replay barrier is full; refusing fresh proof");
+                } else if result == InsertIfAbsentNoEvictResult::Duplicate {
+                    debug!("DPoP proof replayed");
+                }
                 return unauthorized_response("Authentication failed", &www_authenticate);
             }
         }
@@ -561,13 +582,6 @@ pub(crate) async fn verify_resource_token_claims(
     claims.strip_federated_clearance(local_issuers);
     claims.strip_federated_tenant(local_issuers);
     Ok(claims)
-}
-
-pub(crate) async fn verify_token_claims(
-    state: &ServerState,
-    token: &str,
-) -> Result<jwt::Claims, &'static str> {
-    verify_resource_token_claims(&state.resource_auth_state(), token).await
 }
 
 /// Build WWW-Authenticate header value with resource_metadata URL (RFC 9728).
