@@ -14,5 +14,10 @@ hyprstream-pds = { path = "../hyprstream-pds" }
 hyprstream-rpc = { path = "../hyprstream-rpc" }
 rand = { workspace = true }
 
+[dev-dependencies]
+# Compile the supported downstream operator composition without changing the
+# adapter's production dependency surface.
+hyprstream-k8s = { path = "../hyprstream-k8s", features = ["k8s", "grant"] }
+
 [lints]
 workspace = true

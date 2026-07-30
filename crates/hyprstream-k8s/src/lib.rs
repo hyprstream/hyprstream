@@ -52,8 +52,11 @@
 //!   | `hyprstream_k8s::grant::TENANT_GRANT_ABILITY` | `hyprstream_k8s_pds::TENANT_GRANT_ABILITY` |
 //!   | `hyprstream_k8s::grant::now_unix` | `hyprstream_k8s_pds::now_unix` for adapter callers; the substrate helper remains at its old path |
 //!   | `operator::run_operator_with_grant_issuer` | `operator::run_operator_with_grant_service` |
+//!   | `OperatorState::with_grant_issuer` | `OperatorState::with_grant_service` |
+//!   | `compile_tenant_binding_status(binding, issuer, epoch, now)` | `compile_tenant_binding_status(binding, service, epoch, now)`, where `service` is `Option<&dyn TenantGrantService>` |
 //!
-//!   The adapter crate documents a compiling downstream composition example.
+//!   The adapter crate contains a compiling `k8s,grant` operator composition
+//!   example and compile fixture.
 //!
 //! All CRDs are `v1alpha1`; the conversion/upgrade path to a future stored
 //! version is noted per-resource and is out of scope for this crate (K5b owns

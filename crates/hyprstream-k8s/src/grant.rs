@@ -9,7 +9,7 @@
 use std::fmt;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use cid::Cid;
+use cid::{Cid, Version};
 use kube::Resource;
 
 use crate::mesh::{TenantBinding, TenantBindingStatus};
@@ -35,9 +35,14 @@ impl ContentReference {
         let parsed = Cid::try_from(value.as_str()).map_err(|error| {
             TenantGrantServiceError::new(format!("invalid content reference: {error}"))
         })?;
+        if parsed.version() != Version::V1 {
+            return Err(TenantGrantServiceError::new(
+                "content reference must be CIDv1",
+            ));
+        }
         if parsed.to_string() != value {
             return Err(TenantGrantServiceError::new(
-                "content reference must use canonical CID encoding",
+                "content reference must use canonical lowercase base32 CIDv1 encoding",
             ));
         }
         Ok(Self(value))
@@ -341,18 +346,37 @@ mod tests {
 
     #[test]
     fn malformed_artifact_pairs_are_unrepresentable() {
-        for (grant, allocation) in [
-            ("", VALID_CID),
-            (" ", VALID_CID),
-            ("not-a-cid", VALID_CID),
-            (VALID_CID, ""),
-            (VALID_CID, "\t"),
-            (VALID_CID, "not-a-cid"),
-            (" not-a-cid", "not-a-cid "),
+        const CID_V0: &str = "QmdfTbBqBPQ7VNxZEYEj14VmRuZBkqFbiwReogJgS1zR1n";
+        let parsed = Cid::try_from(VALID_CID).expect("fixture must be a valid CIDv1");
+        let uppercase = parsed
+            .to_string_of_base(cid::multibase::Base::Base32Upper)
+            .expect("base32 encoding");
+        let base58 = parsed
+            .to_string_of_base(cid::multibase::Base::Base58Btc)
+            .expect("base58 encoding");
+        let base64 = parsed
+            .to_string_of_base(cid::multibase::Base::Base64)
+            .expect("base64 encoding");
+        let ipfs_path = format!("/ipfs/{VALID_CID}");
+
+        for invalid in [
+            "",
+            " ",
+            "\t",
+            "not-a-cid",
+            CID_V0,
+            uppercase.as_str(),
+            base58.as_str(),
+            base64.as_str(),
+            ipfs_path.as_str(),
         ] {
             assert!(
-                TenantGrantArtifacts::new(grant, allocation, 7).is_err(),
-                "malformed pair unexpectedly accepted: {grant:?}, {allocation:?}"
+                TenantGrantArtifacts::new(invalid, VALID_CID, 7).is_err(),
+                "invalid grant reference unexpectedly accepted: {invalid:?}"
+            );
+            assert!(
+                TenantGrantArtifacts::new(VALID_CID, invalid, 7).is_err(),
+                "invalid allocation reference unexpectedly accepted: {invalid:?}"
             );
         }
     }

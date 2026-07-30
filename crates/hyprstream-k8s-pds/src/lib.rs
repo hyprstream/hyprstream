@@ -43,16 +43,41 @@
 //! ## Downstream composition
 //!
 //! The Apache substrate depends only on its service-neutral contract. A
-//! downstream binary opts into this AGPL adapter and passes the issuer through
-//! that contract:
+//! downstream binary enables the substrate's `k8s,grant` features, opts into
+//! this AGPL adapter, and passes the issuer to the generic operator without
+//! contacting a cluster during compilation:
 //!
-//! ```
+//! ```no_run
 //! use std::sync::Arc;
-//! use hyprstream_k8s::grant::TenantGrantService;
+//! use hyprstream_k8s::kube::Client;
+//! use hyprstream_k8s::operator::{
+//!     run_operator_with_grant_service, HyprstreamOperatorRpc, OperatorConfig,
+//!     OperatorError, OperatorState,
+//! };
 //! use hyprstream_k8s_pds::TenantGrantIssuer;
 //!
-//! fn grant_service(issuer: TenantGrantIssuer) -> Arc<dyn TenantGrantService> {
-//!     Arc::new(issuer)
+//! fn configured_state<R: HyprstreamOperatorRpc>(
+//!     client: Client,
+//!     rpc: Arc<R>,
+//!     config: OperatorConfig,
+//!     issuer: TenantGrantIssuer,
+//! ) -> OperatorState<R> {
+//!     OperatorState::new(client, rpc, config)
+//!         .with_grant_service(Some(Arc::new(issuer)))
+//! }
+//!
+//! async fn run<R: HyprstreamOperatorRpc>(
+//!     client: Client,
+//!     rpc: Arc<R>,
+//!     config: OperatorConfig,
+//!     issuer: TenantGrantIssuer,
+//! ) -> Result<(), OperatorError> {
+//!     run_operator_with_grant_service(
+//!         client,
+//!         rpc,
+//!         config,
+//!         Some(Arc::new(issuer)),
+//!     ).await
 //! }
 //! ```
 
