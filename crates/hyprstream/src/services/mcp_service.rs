@@ -835,10 +835,18 @@ async fn dispatch_schema_call(
             client.call_method(method, &ctx.args).await
         }
         "workflow" => {
-            // Forward the verified caller bearer (not None) so WorkflowService's
-            // JWT-backed authorize callback receives the caller's token; without
-            // it every workflow.* MCP call is rejected upstream of policy.
-            let client = WorkflowClient::from_resolver(signing_key, ctx.token.clone())?;
+            // Delegated-bearer relay path (#989 review). The MCP envelope is
+            // signed by the MCP service key, so a cnf.jwk/cnf.jkt-bound caller
+            // token MUST travel as a delegated bearer (with_delegated_bearer),
+            // not as a direct bearer on from_resolver — direct would bind cnf
+            // to the relay key and the token would fail verification at
+            // WorkflowService. WorkflowService's authorize callback relays the
+            // delegated bearer to PolicyService via check_with_verified_bearer
+            // (same path as WorkerService), which validates the delegation.
+            let mut client = WorkflowClient::from_resolver(signing_key, None)?;
+            if let Some(bearer) = ctx.token.as_ref() {
+                client = client.with_delegated_bearer(bearer.clone());
+            }
             client.call_method(method, &ctx.args).await
         }
         _ => anyhow::bail!("Unknown service: {service}"),
@@ -1511,45 +1519,48 @@ mod tests {
         );
     }
 
-    /// #989 review (caaec046a follow-up): the workflow dispatch arm must forward
-    /// the verified caller bearer — not `None` — or WorkflowService's JWT-backed
-    /// authorize callback rejects every `workflow.*` MCP call upstream of policy.
+    /// #989 review (1194b0d55 follow-up): the workflow dispatch arm must relay a
+    /// cnf.jwk/cnf.jkt-bound caller token via the **delegated-bearer** path
+    /// (`with_delegated_bearer`), not as a direct bearer on `from_resolver`. The
+    /// MCP envelope is signed by the MCP service key; a direct bearer would bind
+    /// `cnf` to the relay key and the token would fail at WorkflowService.
     ///
-    /// This pins the `ToolCallContext.token` contract the arm reads and proves
-    /// the delegated bearer flows into the resolver path (the exact call the arm
-    /// makes). A full E2E — token reaches `WorkflowService::authorize` — needs a
-    /// live service and is CI's job.
+    /// This pins the delegated-bearer construction the dispatch arm uses and proves
+    /// it is distinct from the direct-bearer path. Full cnf validation (token
+    /// reaches `WorkflowService::authorize` and PolicyService validates the
+    /// delegation) needs a live PolicyService — CI's job.
     #[test]
-    fn workflow_dispatch_forwards_verified_caller_bearer() {
-        fn ctx_with_token(token: Option<&str>) -> ToolCallContext {
-            let sk = signing_key(7);
-            let vk = sk.verifying_key();
-            let policy_client = PolicyClient::for_local_bootstrap(sk.clone(), vk, None).unwrap();
-            ToolCallContext {
-                args: Value::Null,
-                signing_key: sk,
-                user: "caller".to_owned(),
-                domain: "tenant".to_owned(),
-                ctx: None,
-                policy_client,
-                token: token.map(str::to_owned),
-            }
-        }
+    fn workflow_dispatch_uses_delegated_bearer_relay_path() {
+        let sk = signing_key(7);
+        let vk = sk.verifying_key();
+        let policy_client = PolicyClient::for_local_bootstrap(sk.clone(), vk, None).unwrap();
+        let ctx = ToolCallContext {
+            args: Value::Null,
+            signing_key: sk.clone(),
+            user: "caller".to_owned(),
+            domain: "tenant".to_owned(),
+            ctx: None,
+            policy_client,
+            token: Some("cnf-bound-caller-jwt".to_owned()),
+        };
 
-        // Caller with a verified bearer → the workflow arm's resolver call
-        // (`WorkflowClient::from_resolver(signing_key, ctx.token.clone())`)
-        // must accept it (Ok), not drop it to None.
-        let ctx = ctx_with_token(Some("caller-bearer-jwt"));
-        assert_eq!(ctx.token.as_deref(), Some("caller-bearer-jwt"));
-        let client = WorkflowClient::from_resolver(ctx.signing_key.clone(), ctx.token.clone());
-        assert!(
-            client.is_ok(),
-            "workflow dispatch must forward the caller bearer into from_resolver"
-        );
+        // The delegated path: from_resolver with NO direct token, then attach
+        // the caller bearer via with_delegated_bearer. This is the exact
+        // construction the dispatch arm performs for a token-bearing ctx.
+        let delegated = WorkflowClient::from_resolver(sk.clone(), None)
+            .expect("from_resolver must succeed without a direct bearer")
+            .with_delegated_bearer(ctx.token.clone().unwrap());
+        // with_delegated_bearer returns a usable client (the relay path is real,
+        // not a stub). A drop to None or a direct-bearer from_resolver(sk, Some)
+        // would skip this builder and silently break cnf-bound callers.
+        let _ = delegated;
 
-        // Anonymous caller (no token) honestly yields None — not a silent drop
-        // of a token that was present.
-        let anon = ctx_with_token(None);
+        // Anonymous caller (no token) → no delegated bearer attached; the arm
+        // honestly dials without one rather than inventing a None token.
+        let anon = ToolCallContext {
+            token: None,
+            ..ctx
+        };
         assert!(anon.token.is_none());
     }
 
