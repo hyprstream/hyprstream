@@ -2046,6 +2046,109 @@ mod tests {
         Ok(())
     }
 
+    /// #324/N2 measurement contract for the keyed producer used by inter-host
+    /// activation traffic.
+    ///
+    /// This is opt-in because finding the exact boundary deliberately encrypts
+    /// and serializes several hundred MiB. The binary search is bounded to 27 iterations
+    /// over [8 KiB, 64 MiB], and every probe uses a fresh origin so a rejected
+    /// oversized Group cannot affect the next result.
+    #[tokio::test]
+    #[ignore = "bounded 32 MiB MoQ application-frame ceiling measurement"]
+    async fn measure_keyed_application_frame_ceiling() -> Result<()> {
+        const DECODE_BF16_BYTES: usize = 8 * 1024;
+        const PREFILL_BF16_BYTES: usize = 64 * 1024 * 1024;
+        const RECOMMENDED_ACTIVATION_DATA_BUDGET: usize = 31 * 1024 * 1024;
+        const MOQ_SERIALIZED_FRAME_CAP: usize = 32 * 1024 * 1024;
+        const EXPECTED_DECODE_FRAME_BYTES: usize = 8_408;
+        const EXPECTED_BUDGET_FRAME_BYTES: usize = 32_506_072;
+        const EXPECTED_KEYED_PAYLOAD_CEILING_BYTES: usize = 33_554_223;
+
+        let decode_frame = keyed_application_frame_probe(DECODE_BF16_BYTES)
+            .await?
+            .map_err(|error| anyhow!("8 KiB decode probe rejected: {error}"))?;
+        assert_eq!(decode_frame, EXPECTED_DECODE_FRAME_BYTES);
+
+        let budget_frame = keyed_application_frame_probe(RECOMMENDED_ACTIVATION_DATA_BUDGET)
+            .await?
+            .map_err(|error| anyhow!("31 MiB safety-budget probe rejected: {error}"))?;
+        assert_eq!(budget_frame, EXPECTED_BUDGET_FRAME_BYTES);
+        assert_eq!(MOQ_SERIALIZED_FRAME_CAP - budget_frame, 1_048_360);
+
+        let prefill_error = keyed_application_frame_probe(PREFILL_BF16_BYTES)
+            .await?
+            .expect_err("64 MiB prefill probe unexpectedly fit one MoQ frame");
+        assert!(
+            prefill_error.contains("frame too large"),
+            "64 MiB prefill failed for a non-causal reason: {prefill_error}"
+        );
+
+        let mut accepted = DECODE_BF16_BYTES;
+        let mut rejected = PREFILL_BF16_BYTES;
+        while rejected - accepted > 1 {
+            let candidate = accepted + (rejected - accepted) / 2;
+            match keyed_application_frame_probe(candidate).await? {
+                Ok(_) => accepted = candidate,
+                Err(error) if error.contains("frame too large") => rejected = candidate,
+                Err(error) => anyhow::bail!(
+                    "payload probe at {candidate} bytes failed for a non-causal reason: {error}"
+                ),
+            }
+        }
+
+        let ceiling_frame = keyed_application_frame_probe(accepted)
+            .await?
+            .map_err(|error| anyhow!("ceiling probe rejected: {error}"))?;
+        let first_rejected_error = keyed_application_frame_probe(rejected)
+            .await?
+            .expect_err("first payload above the measured ceiling unexpectedly succeeded");
+
+        assert_eq!(rejected, accepted + 1);
+        assert_eq!(accepted, EXPECTED_KEYED_PAYLOAD_CEILING_BYTES);
+        assert_eq!(ceiling_frame, MOQ_SERIALIZED_FRAME_CAP);
+        assert!(first_rejected_error.contains("frame too large"));
+        Ok(())
+    }
+
+    async fn keyed_application_frame_probe(
+        payload_len: usize,
+    ) -> Result<std::result::Result<usize, String>> {
+        let origin = origin();
+        let (_client_secret, client_pub) = crate::crypto::generate_ephemeral_keypair();
+        let ctx = StreamContext::from_third_party_interop_dh(&client_pub.to_bytes())?;
+        let topic = ctx.topic().to_owned();
+        let mut publisher = origin.publisher(&ctx)?;
+
+        // The producer treats activation bytes as opaque. Alternating bytes
+        // encode BF16 1.0 on little-endian hosts while keeping the fixture
+        // deterministic and representative of a BF16 tensor buffer.
+        let mut payload = vec![0_u8; payload_len];
+        for value in payload.chunks_exact_mut(2) {
+            value.copy_from_slice(&[0x80, 0x3f]);
+        }
+
+        if let Err(error) = publisher.publish_data(&payload).await {
+            return Ok(Err(error.to_string()));
+        }
+
+        let path = origin.broadcast_path(&topic);
+        let broadcast = origin
+            .consumer()
+            .announced_broadcast(path.as_str())
+            .await
+            .ok_or_else(|| anyhow!("probe broadcast not announced"))?;
+        let track = broadcast.subscribe_track(&Track::new(STREAM_TRACK))?;
+        let mut group = track
+            .get_group(0)
+            .await?
+            .ok_or_else(|| anyhow!("probe Group 0 missing"))?;
+        let frame = group
+            .read_frame()
+            .await?
+            .ok_or_else(|| anyhow!("probe frame missing"))?;
+        Ok(Ok(frame.len()))
+    }
+
     /// #554 identified profile: a standards-compatible MoQT track carries only
     /// opaque Object bytes, an authenticated rekey resets the per-epoch sequence
     /// and traffic keys, and the relay-visible Group identity remains monotonic.
