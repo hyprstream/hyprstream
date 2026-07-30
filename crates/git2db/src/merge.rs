@@ -59,11 +59,16 @@ impl fmt::Display for ConflictSide {
 
 /// A single conflicted path entry captured from [`git2::Index::conflicts`].
 ///
-/// Paths are decoded lossily from the raw bytes libgit2 reports; git paths
-/// are conventionally UTF-8 but are not guaranteed to be.
+/// Git paths are raw bytes (conventionally UTF-8, but not guaranteed to be),
+/// so the entry stores both the exact [`path_bytes`](Self::path_bytes) — used
+/// for identity/dedup — and a lossy [`path`](Self::path) display string.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConflictEntry {
-    /// Repository-relative path of the conflicted entry (lossy UTF-8).
+    /// Raw repository-relative path bytes, as libgit2 reports them.
+    pub path_bytes: Vec<u8>,
+    /// Lossy UTF-8 display form of [`path_bytes`](Self::path_bytes). Two
+    /// distinct non-UTF-8 paths may share this display string, so use
+    /// [`path_bytes`](Self::path_bytes) for identity comparisons.
     pub path: String,
     /// Which stage of the three-way merge this entry represents.
     pub side: ConflictSide,
@@ -92,18 +97,21 @@ impl ConflictReport {
             let conflict = conflict.map_err(Git2DBError::from)?;
             if let Some(a) = conflict.ancestor {
                 entries.push(ConflictEntry {
+                    path_bytes: a.path.clone(),
                     path: String::from_utf8_lossy(&a.path).into_owned(),
                     side: ConflictSide::Ancestor,
                 });
             }
             if let Some(o) = conflict.our {
                 entries.push(ConflictEntry {
+                    path_bytes: o.path.clone(),
                     path: String::from_utf8_lossy(&o.path).into_owned(),
                     side: ConflictSide::Ours,
                 });
             }
             if let Some(t) = conflict.their {
                 entries.push(ConflictEntry {
+                    path_bytes: t.path.clone(),
                     path: String::from_utf8_lossy(&t.path).into_owned(),
                     side: ConflictSide::Theirs,
                 });
@@ -138,12 +146,35 @@ impl ConflictReport {
         self.entries.iter()
     }
 
-    /// Distinct conflicted paths, in first-seen order.
+    /// Distinct conflicted paths' display strings, in first-seen order.
+    ///
+    /// Dedup is by raw [`ConflictEntry::path_bytes`], **not** the lossy
+    /// `path` string: two distinct non-UTF-8 git paths that happen to share
+    /// a lossy display string are counted separately (a `String`-keyed dedup
+    /// would undercount them). The returned display strings may therefore
+    /// contain visually-duplicate values; use
+    /// [`path_keys`](Self::path_keys) for exact byte identity.
     pub fn paths(&self) -> Vec<&str> {
-        let mut seen: Vec<&str> = Vec::new();
+        let mut seen_keys: Vec<&[u8]> = Vec::new();
+        let mut out: Vec<&str> = Vec::new();
         for e in &self.entries {
-            if !seen.contains(&e.path.as_str()) {
-                seen.push(e.path.as_str());
+            if !seen_keys.contains(&e.path_bytes.as_slice()) {
+                seen_keys.push(e.path_bytes.as_slice());
+                out.push(e.path.as_str());
+            }
+        }
+        out
+    }
+
+    /// Distinct conflicted paths' raw byte keys, in first-seen order.
+    ///
+    /// This is the identity-stable view: two paths are the same path iff
+    /// their byte keys are equal, regardless of UTF-8 validity.
+    pub fn path_keys(&self) -> Vec<&[u8]> {
+        let mut seen: Vec<&[u8]> = Vec::new();
+        for e in &self.entries {
+            if !seen.contains(&e.path_bytes.as_slice()) {
+                seen.push(e.path_bytes.as_slice());
             }
         }
         seen
@@ -424,30 +455,62 @@ mod tests {
         assert!(r.is_empty());
         assert_eq!(r.len(), 0);
         assert!(r.paths().is_empty());
+        assert!(r.path_keys().is_empty());
+    }
+
+    /// Helper: build an entry from raw path bytes (lossy display derived).
+    fn entry(bytes: &[u8], side: ConflictSide) -> ConflictEntry {
+        ConflictEntry {
+            path_bytes: bytes.to_vec(),
+            path: String::from_utf8_lossy(bytes).into_owned(),
+            side,
+        }
     }
 
     #[test]
     fn conflict_report_paths_dedups() {
         let r = ConflictReport {
             entries: vec![
-                ConflictEntry {
-                    path: "a".into(),
-                    side: ConflictSide::Ours,
-                },
-                ConflictEntry {
-                    path: "a".into(),
-                    side: ConflictSide::Theirs,
-                },
-                ConflictEntry {
-                    path: "b".into(),
-                    side: ConflictSide::Ours,
-                },
+                entry(b"a", ConflictSide::Ours),
+                entry(b"a", ConflictSide::Theirs),
+                entry(b"b", ConflictSide::Ours),
             ],
         };
         // len() counts distinct conflicted paths (2), not stage entries (3).
         assert_eq!(r.len(), 2);
         assert_eq!(r.entry_count(), 3);
         assert_eq!(r.paths(), vec!["a", "b"]);
+        assert_eq!(r.path_keys(), vec![b"a".as_slice(), b"b".as_slice()]);
+    }
+
+    #[test]
+    fn conflict_report_dedups_by_raw_bytes_not_lossy_string() {
+        // Two distinct non-UTF-8 byte paths that both lossy-convert to the
+        // same display string (one U+FFFD). A String-keyed dedup would
+        // collapse them and undercount; byte-keyed dedup keeps them apart.
+        let lossy_a = String::from_utf8_lossy(b"\x80").into_owned();
+        let lossy_b = String::from_utf8_lossy(b"\xfe").into_owned();
+        assert_eq!(
+            lossy_a, lossy_b,
+            "test precondition: both lossy strings must be equal"
+        );
+        let r = ConflictReport {
+            entries: vec![
+                entry(b"\x80", ConflictSide::Ours),
+                entry(b"\xfe", ConflictSide::Theirs),
+            ],
+        };
+        assert_eq!(
+            r.len(),
+            2,
+            "distinct raw-byte paths must not collide via the lossy String"
+        );
+        assert_eq!(r.entry_count(), 2);
+        assert_eq!(r.path_keys().len(), 2);
+        // paths() returns one display representative per distinct byte key,
+        // so its length matches the byte-keyed count even though the two
+        // display strings are visually identical.
+        assert_eq!(r.paths().len(), 2);
     }
 
     #[test]
