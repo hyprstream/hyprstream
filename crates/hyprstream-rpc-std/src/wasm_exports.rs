@@ -80,6 +80,12 @@ pub async fn browser_session_whoami(
 #[wasm_bindgen]
 pub struct VfsShell {
     shell: std::cell::RefCell<hyprstream_workers_tcl::TclShell>,
+    /// The server-issued `DPoP-Nonce` from the exchange that authenticated
+    /// this shell (`None` if the AS did not return one). Exposed so the
+    /// caller can persist it and pass it back as `exchange_nonce` on the
+    /// next `connect()` for the same DPoP key, avoiding an extra
+    /// `use_dpop_nonce` round-trip (#1425 r1 P1#4).
+    exchange_nonce: Option<String>,
 }
 
 #[wasm_bindgen]
@@ -98,10 +104,14 @@ impl VfsShell {
     /// - `exchange_endpoint`: HTTPS origin hosting the #1314 `POST /oauth/token`.
     /// - `subject_token` / `subject_token_type`: the credential to exchange
     ///   (e.g. an atproto JWT, `subject_token_type = urn:ietf:params:oauth:token-type:jwt`).
-    /// - `exchange_dpop_proof`: an RFC 9449 DPoP proof JWT (#1425) the caller
-    ///   built over `htm=POST, htu={exchange_endpoint}/oauth/token`, signed by
-    ///   the browser's DPoP key. The AS verifies it and binds the minted token
-    ///   to the proof key's `cnf.jkt`, returning `token_type: DPoP`.
+    ///
+    /// #1425 r1 P1#3/#4: the browser-held DPoP key is the same Ed25519 key
+    /// used for RPC envelope signing (`signer_pubkey` + `sign_fn`). The
+    /// exchange generates a fresh DPoP proof from this key, handles the
+    /// RFC 9449 §8 nonce lifecycle (bootstrap → retry), and the AS binds the
+    /// issued token with `cnf.jkt` matching this key. `exchange_nonce` is the
+    /// persisted server nonce from a previous exchange (pass `None` on first
+    /// connect); the returned nonce is available for the caller to persist.
     pub async fn connect(
         registry_origin: &str,
         model_origin: &str,
@@ -112,47 +122,63 @@ impl VfsShell {
         exchange_endpoint: &str,
         subject_token: String,
         subject_token_type: String,
-        exchange_dpop_proof: String,
+        exchange_nonce: Option<String>,
     ) -> Result<VfsShell, JsError> {
         console_error_panic_hook::set_once();
 
+        // The Ed25519 signer pubkey doubles as the DPoP key — one browser-held
+        // key through exchange and every RPC request (#1425 r1 P1#3).
+        let dpop_pubkey: [u8; 32] = signer_pubkey
+            .try_into()
+            .map_err(|_| JsError::new("signer_pubkey must be exactly 32 bytes"))?;
+
         // 1) Exchange the atproto/external JWT for a short-lived at+jwt access
-        //    token (#1314 / #1425). The request carries the public browser
-        //    client_id + the DPoP proof, so the AS mints a sender-bound
-        //    (`token_type: DPoP`, `cnf.jkt`) token rather than a bearer.
+        //    token (#1314 / #1425). The WASM module generates the DPoP proof
+        //    from the browser key, handles nonce bootstrap/retry, and returns
+        //    the response nonce for the caller to persist.
         web_sys::console::log_1(&"[VfsShell] Exchanging subject token...".into());
         let exchanged = hyprstream_rpc::wasm_token_exchange::fetch_exchange_token(
             exchange_endpoint,
             &subject_token,
             &subject_token_type,
-            &exchange_dpop_proof,
+            &dpop_pubkey,
+            &sign_fn,
+            exchange_nonce.as_deref(),
         )
         .await
         .map_err(|e| JsError::new(&e.to_string()))?;
 
         // 2) Derive the display Subject from the freshly-minted token's `sub`.
-        //    The response does not echo `sub` (the mint stamps `sub = verified.sub`),
-        //    so decode it client-side. Authority is re-verified by the server on
-        //    every RPC; this decode is bookkeeping only.
         let subject = hyprstream_rpc::wasm_token_exchange::subject_from_access_token(
             &exchanged.access_token,
         )
         .map_err(|e| JsError::new(&e.to_string()))?;
         web_sys::console::log_1(&"[VfsShell] Subject resolved from exchanged token".into());
+        let returned_nonce = exchanged.nonce.clone();
 
         // 3) Connect to registry + model through the resolved browser-provisioning
-        //    path (the only working browser dial), presenting the access token as
-        //    the default JWT on every request. The `dial_wasm::dial` stub is dropped.
+        //    path, presenting the access token as the default JWT on every
+        //    request. The `dial_wasm::dial` stub is dropped.
         //
-        //    #1425 NOTE: the exchanged token is sender-bound (`token_type: DPoP`,
-        //    `cnf.jkt`). The resource server rejects a `cnf.jkt`-bound token
-        //    presented as a plain Bearer (RFC 9449 §7), so a fully functional
-        //    browser→RPC path requires the resolved RPC client to present
-        //    `Authorization: DPoP` plus a fresh matching proof (and access-token
-        //    hash `ath`) on every request. That per-request DPoP wiring in the
-        //    wasm RPC client is the use-surface follow-on this issue explicitly
-        //    defers (VfsShell UI is out of scope); the exchange contract itself
-        //    — the scope of #1425 — is complete and wire-tested.
+        //    #1425 r1 P1#3: the exchanged token is sender-bound (`token_type:
+        //    DPoP`, `cnf.jkt` = the thumbprint of `signer_pubkey`). For the
+        //    Cap'n Proto RPC transport, sender-constraint proof-of-possession
+        //    is the `SignedEnvelope` itself: every RPC request is individually
+        //    COSE-signed by this SAME Ed25519 key, and the server
+        //    unconditionally compares the JWT's `cnf.jkt` against the
+        //    envelope's verified signer key on every call (R2b,
+        //    `service/svc.rs`), rejecting the request if they differ. Because
+        //    `dpop_pubkey == signer_pubkey` here, this token cannot be
+        //    presented over an envelope signed by any other key — there is no
+        //    separate "Bearer" code path to downgrade to on this transport: a
+        //    `cnf`-bound JWT is checked against the actual signer on every
+        //    single request, not just the one that minted it. A distinct
+        //    RFC 9449 htm/htu/jti/ath proof JWT per RPC call would be
+        //    redundant here (the whole message is already signed); it remains
+        //    required — and is generated per-request — for the HTTP OAuth
+        //    surface (`require_bearer_token` middleware on
+        //    `/oauth/userinfo` etc.), which has no per-message envelope
+        //    signature to fall back on.
         let bearer = Some(exchanged.access_token);
         web_sys::console::log_1(&"[VfsShell] Connecting to registry...".into());
         let reg_client: Arc<dyn hyprstream_rpc::rpc_client::RpcClient> = Arc::new(
@@ -195,6 +221,7 @@ impl VfsShell {
 
         Ok(VfsShell {
             shell: std::cell::RefCell::new(shell),
+            exchange_nonce: returned_nonce,
         })
     }
 
@@ -203,5 +230,14 @@ impl VfsShell {
         let mut shell = self.shell.borrow_mut();
         shell.eval(script).await
             .map_err(|e| JsError::new(&e))
+    }
+
+    /// The server-issued DPoP nonce from the exchange that authenticated this
+    /// shell, if any. Persist this and pass it as `exchange_nonce` on the
+    /// next `connect()` call for the same DPoP key to skip an extra
+    /// `use_dpop_nonce` round-trip (#1425 r1 P1#4).
+    #[wasm_bindgen(getter = exchangeNonce)]
+    pub fn exchange_nonce(&self) -> Option<String> {
+        self.exchange_nonce.clone()
     }
 }

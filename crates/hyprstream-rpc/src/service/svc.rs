@@ -1633,6 +1633,62 @@ mod empty_iss_gate_tests {
         );
     }
 
+    // ── #1425 r1 P1#3: the browser exchange mints a `cnf.jkt`-bound token for
+    //    the SAME Ed25519 key used to sign RPC envelopes (`VfsShell::connect`
+    //    passes `signer_pubkey` as both the DPoP key and the envelope signer).
+    //    These tests exercise `verify_claims` — the actual, unmodified server
+    //    RPC dispatch path every transport (QUIC/UDS/inproc/iroh) runs — with
+    //    a token shaped exactly like that mint, proving the sender-bound
+    //    token is usable when the envelope is signed by the matching key and
+    //    is rejected when signed by a different one. No separate per-request
+    //    DPoP proof JWT is needed on this transport: the envelope signature
+    //    itself is the freshly-signed proof of possession for every call.
+
+    #[tokio::test]
+    async fn browser_cnf_jkt_token_succeeds_over_matching_envelope_signer() {
+        let (svc, ca) = mock_service();
+        let browser_key = SigningKey::from_bytes(&[0x51; 32]);
+        let now = chrono::Utc::now().timestamp();
+        let claims = Claims::new("alice".to_owned(), now, now + 3600)
+            .with_cnf_jkt(browser_key.verifying_key().as_bytes());
+        let token = crate::auth::jwt::encode(&claims, &ca);
+        let mut ctx = ctx_with_token(token, /* is_local_caller */ true);
+        // The envelope is signed by the SAME key the browser used for DPoP —
+        // exactly what `VfsShell::connect` arranges by construction.
+        ctx.cnf = browser_key.verifying_key().to_bytes();
+
+        svc.verify_claims(&mut ctx)
+            .await
+            .expect("cnf.jkt-bound token over its own signing key must be accepted");
+        assert_eq!(ctx.subject().name(), Some("alice"));
+    }
+
+    #[tokio::test]
+    async fn browser_cnf_jkt_token_rejected_over_mismatched_envelope_signer() {
+        let (svc, ca) = mock_service();
+        let browser_key = SigningKey::from_bytes(&[0x52; 32]);
+        let attacker_key = SigningKey::from_bytes(&[0x53; 32]);
+        let now = chrono::Utc::now().timestamp();
+        let claims = Claims::new("alice".to_owned(), now, now + 3600)
+            .with_cnf_jkt(browser_key.verifying_key().as_bytes());
+        let token = crate::auth::jwt::encode(&claims, &ca);
+        let mut ctx = ctx_with_token(token, /* is_local_caller */ true);
+        // An attacker who stole the token string signs the envelope with a
+        // DIFFERENT key — there is no "present as Bearer" downgrade path on
+        // this transport: cnf is checked against the actual signer whenever
+        // it is present, unconditionally.
+        ctx.cnf = attacker_key.verifying_key().to_bytes();
+
+        let err = svc
+            .verify_claims(&mut ctx)
+            .await
+            .expect_err("cnf.jkt-bound token over a foreign envelope signer must be rejected");
+        assert!(
+            err.to_string().contains("cnf.jkt"),
+            "unexpected error: {err:#}"
+        );
+    }
+
     #[tokio::test]
     async fn delegated_bearer_is_denied_by_default() {
         let (svc, ca) = mock_service();

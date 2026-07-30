@@ -62,7 +62,7 @@ fn base_metadata(issuer: &str, scopes: &[String], require_par: bool) -> serde_js
         // accepts DPoP proofs at the token endpoint. ES256 is the
         // browser-classical DPoP algorithm the sender-bound contract (#1425)
         // uses; it is the value advertised, and it is supported.
-        "dpop_signing_alg_values_supported": ["ES256"],
+        "dpop_signing_alg_values_supported": ["ES256", "EdDSA"],
         "dpop_bound_access_tokens_supported": true,
         "authorization_response_iss_parameter_supported": true,
         "scopes_supported": scopes_supported,

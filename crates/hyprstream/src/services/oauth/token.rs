@@ -79,6 +79,9 @@ pub struct TokenRequest {
     pub audience: Option<String>,
     #[serde(default)]
     pub tenant: Option<String>,
+    // RFC 8707 resource indicator (token-exchange, #1425).
+    #[serde(default)]
+    pub resource: Option<String>,
 }
 
 /// POST /oauth/token — token exchange
@@ -223,7 +226,11 @@ pub async fn exchange_token(
                     &subject_token_type,
                     dpop_header.as_deref(),
                     params.audience.as_deref(),
+                    params.resource.as_deref(),
                     params.scope.as_deref(),
+                    params.requested_token_type.as_deref(),
+                    params.actor_token.as_deref(),
+                    params.tenant.as_deref(),
                     &params.client_id,
                 )
                 .await;
@@ -1996,6 +2003,7 @@ mod tests {
             scope: None,
             audience: None,
             tenant: None,
+            resource: None,
         };
         let resp = exchange_refresh_token(Arc::clone(&state), params, None, None, None).await;
 
@@ -2061,6 +2069,7 @@ mod tests {
             scope: None,
             audience: None,
             tenant: None,
+            resource: None,
         };
         let response =
             exchange_refresh_token(Arc::clone(&state), params, None, None, None).await;
@@ -2119,6 +2128,7 @@ mod tests {
             scope: None,
             audience: None,
             tenant: None,
+            resource: None,
         };
         let resp = exchange_refresh_token(state.clone(), params, None, None, None).await;
 

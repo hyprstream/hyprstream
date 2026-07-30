@@ -21,6 +21,7 @@
 //! than extending the server response.
 
 use anyhow::{anyhow, ensure, Result};
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use serde::{Deserialize, Serialize};
 
 /// The RFC 8693 token-exchange grant type.
@@ -86,6 +87,11 @@ pub struct ExchangedToken {
     /// token (the #1425 browser contract), `"Bearer"` otherwise. Drives
     /// whether downstream RPC requests must carry a DPoP proof.
     pub token_type: TokenType,
+    /// The server-issued `DPoP-Nonce` from a successful response (#1425 r1
+    /// P1#4). The caller persists this and supplies it on the next exchange
+    /// / resource request to avoid a `use_dpop_nonce` round-trip. `None` when
+    /// the AS did not return a nonce (e.g. a non-DPoP response).
+    pub nonce: Option<String>,
 }
 
 /// The OAuth `token_type` of an [`ExchangedToken`].
@@ -195,6 +201,7 @@ pub fn parse_exchange_response(body: &str) -> Result<ExchangedToken> {
         access_token: resp.access_token,
         expires_in: resp.expires_in.unwrap_or(0).max(0),
         token_type,
+        nonce: None,
     })
 }
 
@@ -236,14 +243,142 @@ pub fn subject_from_access_token(token: &str) -> Result<crate::Subject> {
 }
 
 // ============================================================================
+// DPoP proof helpers (RFC 9449) — pure, native-testable (#1425 r1 P1 #3/#4)
+// ============================================================================
+
+/// Build the RFC 9449 DPoP JWT signing input (`header.payload`) for an
+/// Ed25519 key. The caller signs `signing_input` with the private key and
+/// assembles the proof via [`assemble_dpop_proof`].
+///
+/// Pure / native-testable: the wasm32 glue calls this, invokes the JS sign
+/// callback, and assembles. Keeping the construction here means the htm/htu/
+/// iat/jti/ath/nonce/alg/jwk shape is tested once, natively, rather than
+/// only through wasm32-only glue.
+pub fn ed25519_dpop_signing_input(
+    pubkey: &[u8; 32],
+    htm: &str,
+    htu: &str,
+    iat: i64,
+    jti: &str,
+    ath: Option<&str>,
+    nonce: Option<&str>,
+) -> Result<(String, String)> {
+    let x = URL_SAFE_NO_PAD.encode(pubkey);
+    let header = serde_json::json!({
+        "typ": "dpop+jwt",
+        "alg": "EdDSA",
+        "jwk": {"kty": "OKP", "crv": "Ed25519", "x": x}
+    });
+    let mut payload = serde_json::json!({
+        "jti": jti,
+        "htm": htm,
+        "htu": htu,
+        "iat": iat,
+    });
+    if let Some(ath) = ath {
+        payload["ath"] = serde_json::Value::String(ath.to_owned());
+    }
+    if let Some(nonce) = nonce {
+        payload["nonce"] = serde_json::Value::String(nonce.to_owned());
+    }
+    let header_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&header)?);
+    let payload_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&payload)?);
+    let signing_input = format!("{header_b64}.{payload_b64}");
+    Ok((signing_input, header_b64))
+}
+
+/// Assemble a complete DPoP proof JWT from the signing input and signature.
+pub fn assemble_dpop_proof(signing_input: &str, signature: &[u8]) -> String {
+    format!("{signing_input}.{}", URL_SAFE_NO_PAD.encode(signature))
+}
+
+/// Compute the RFC 7638 JWK thumbprint (`cnf.jkt`) for an Ed25519 public key.
+pub fn ed25519_dpop_jkt(pubkey: &[u8; 32]) -> String {
+    crate::auth::jwk_thumbprint(&crate::auth::JwkThumbprintInput::Ed25519 { x: pubkey })
+}
+
+/// Check whether an HTTP error response body is a `use_dpop_nonce` error
+/// (RFC 9449 §8). The browser retries with a fresh proof carrying the
+/// `DPoP-Nonce` response header.
+pub fn is_use_dpop_nonce_response(status: u16, body: &str) -> bool {
+    status == 400
+        && serde_json::from_str::<serde_json::Value>(body)
+            .ok()
+            .and_then(|v| {
+                v.get("error")
+                    .and_then(serde_json::Value::as_str)
+                    .map(|s| s == "use_dpop_nonce")
+            })
+            .unwrap_or(false)
+}
+
+/// Compute the DPoP `ath` value: `base64url(SHA-256(access_token))`.
+pub fn dpop_ath(access_token: &str) -> String {
+    use sha2::{Digest, Sha256};
+    URL_SAFE_NO_PAD.encode(Sha256::digest(access_token.as_bytes()))
+}
+
+/// Generate a fresh, random DPoP `jti` (RFC 9449 requires a unique value per
+/// proof so the AS can detect replay). Pure / native-testable so JTI
+/// freshness is a plain unit test rather than something only exercisable
+/// inside the `wasm32`-only fetch glue (#1425 r1 P1#4).
+pub fn generate_dpop_jti() -> String {
+    use rand::RngCore as _;
+    let mut jti_bytes = [0u8; 16];
+    rand::rngs::OsRng.fill_bytes(&mut jti_bytes);
+    URL_SAFE_NO_PAD.encode(jti_bytes)
+}
+
+/// Outcome of one token-exchange fetch attempt, decided from the response's
+/// status/body/headers (RFC 9449 §8 nonce lifecycle). Pure / native-testable:
+/// the `wasm32` glue calls this after every `fetch` to decide whether to
+/// return, retry with a fresh nonce, or fail (#1425 r1 P1#4).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NonceOutcome {
+    /// The request succeeded; the caller should parse the body.
+    Success,
+    /// The AS requires a server nonce; retry once with this fresh value.
+    RetryWithNonce(String),
+    /// The AS requires a nonce but returned no `DPoP-Nonce` header to retry
+    /// with, or the retry budget (one retry) is exhausted.
+    Failed,
+}
+
+/// Decide the next action for a token-exchange fetch attempt.
+///
+/// `attempt` is 0 for the bootstrap request, 1 for the nonce retry. Only a
+/// bootstrap attempt (`attempt == 0`) may be retried; a failure on attempt 1
+/// is always [`NonceOutcome::Failed`] (RFC 9449 §8 bounds the retry to one
+/// round-trip so a malicious/misbehaving AS cannot force an infinite loop).
+pub fn decide_nonce_outcome(
+    attempt: u8,
+    response_ok: bool,
+    status: u16,
+    body: &str,
+    fresh_nonce_header: Option<&str>,
+) -> NonceOutcome {
+    if response_ok {
+        return NonceOutcome::Success;
+    }
+    if attempt == 0 && is_use_dpop_nonce_response(status, body) {
+        if let Some(fresh) = fresh_nonce_header {
+            return NonceOutcome::RetryWithNonce(fresh.to_owned());
+        }
+    }
+    NonceOutcome::Failed
+}
+
+// ============================================================================
 // Browser fetch glue (wasm32 only)
 // ============================================================================
 
 #[cfg(target_arch = "wasm32")]
 mod fetch {
     use super::{
-        exchange_form_body, parse_exchange_response, parse_session_context, ExchangedToken,
-        SessionContext, SESSION_EXCHANGE_PATH, WHOAMI_PATH,
+        assemble_dpop_proof, decide_nonce_outcome, ed25519_dpop_signing_input,
+        exchange_form_body, generate_dpop_jti, parse_exchange_response, parse_session_context,
+        BROWSER_PUBLIC_CLIENT_ID, ExchangedToken, NonceOutcome, SessionContext,
+        SESSION_EXCHANGE_PATH, WHOAMI_PATH,
     };
     use anyhow::{anyhow, ensure, Context, Result};
     use wasm_bindgen::JsCast as _;
@@ -308,73 +443,145 @@ mod fetch {
         String::from_utf8(bytes).context("token-exchange response was not valid UTF-8")
     }
 
+    /// Build and sign an Ed25519 DPoP proof by calling the browser's sign
+    /// callback (`dpop_sign_fn`). The callback receives the JWT signing input
+    /// bytes and returns a 64-byte Ed25519 signature.
+    async fn build_ed25519_dpop_proof(
+        pubkey: &[u8; 32],
+        sign_fn: &js_sys::Function,
+        htm: &str,
+        htu: &str,
+        ath: Option<&str>,
+        nonce: Option<&str>,
+    ) -> Result<String> {
+        let iat = chrono::Utc::now().timestamp();
+        let jti = generate_dpop_jti();
+        let (signing_input, _) = ed25519_dpop_signing_input(
+            pubkey, htm, htu, iat, &jti, ath, nonce,
+        )?;
+        // Call the JS sign callback: sign_fn(Uint8Array) → Promise<Uint8Array(64)>.
+        let input_array = js_sys::Uint8Array::from(signing_input.as_bytes());
+        let result = sign_fn
+            .call1(&wasm_bindgen::JsValue::UNDEFINED, &input_array)
+            .map_err(|e| anyhow!("DPoP sign callback invocation failed: {e:?}"))?;
+        let promise: js_sys::Promise = result
+            .dyn_into()
+            .map_err(|_| anyhow!("DPoP sign callback did not return a Promise"))?;
+        let signature_value = JsFuture::from(promise)
+            .await
+            .map_err(|e| anyhow!("DPoP sign callback failed: {e:?}"))?;
+        let signature_array: js_sys::Uint8Array = signature_value
+            .dyn_into()
+            .map_err(|_| anyhow!("DPoP sign callback returned non-Uint8Array"))?;
+        Ok(assemble_dpop_proof(&signing_input, &signature_array.to_vec()))
+    }
+
     /// POST an RFC 8693 token-exchange grant to `{exchange_endpoint}/oauth/token`
     /// and return the short-lived at+jwt access token.
     ///
-    /// #1425: the request now carries the required **public** `client_id`
-    /// ([`BROWSER_PUBLIC_CLIENT_ID`]) and a `DPoP` proof header so the AS
-    /// mints a **sender-bound** (`token_type: DPoP`, `cnf.jkt`) token rather
-    /// than a bearer. `dpop_proof` is the RFC 9449 proof JWT the caller built
-    /// over `htm=POST, htu={origin}/oauth/token`; the AS verifies it (method,
-    /// URI, `iat`, `jti`, server nonce) and binds the minted token to the
-    /// proof key's `jkt`. The returned [`ExchangedToken::token_type`] is
-    /// `DPoP`; every resource request presenting that token must likewise
-    /// carry a fresh matching DPoP proof (RFC 9449 §7). CORS is open (#1316).
+    /// #1425 r1 P1#3/#4: the request carries the required public `client_id`
+    /// ([`BROWSER_PUBLIC_CLIENT_ID`]) and a DPoP proof header generated from
+    /// the browser-held Ed25519 key (`dpop_pubkey` + `dpop_sign_fn`). The AS
+    /// mints a **sender-bound** (`token_type: DPoP`, `cnf.jkt`) token bound to
+    /// this key.
+    ///
+    /// **Nonce lifecycle (RFC 9449 §8):** `nonce` is the server-issued nonce
+    /// from a previous successful response (persisted by the caller). On a
+    /// `use_dpop_nonce` error, this function extracts the fresh `DPoP-Nonce`
+    /// response header, generates a new proof carrying it, and retries once.
+    /// On success, the response's `DPoP-Nonce` is returned in
+    /// [`ExchangedToken::nonce`] for the caller to persist.
+    ///
+    /// Every downstream resource request presenting the returned token must
+    /// carry a fresh DPoP proof (with `ath`) from the same key — the resource
+    /// server rejects a `cnf.jkt`-bound token presented as Bearer (RFC 9449 §7).
     pub async fn fetch_exchange_token(
         exchange_endpoint: &str,
         subject_token: &str,
         subject_token_type: &str,
-        dpop_proof: &str,
+        dpop_pubkey: &[u8; 32],
+        dpop_sign_fn: &js_sys::Function,
+        nonce: Option<&str>,
     ) -> Result<ExchangedToken> {
         let mut url = parse_origin(exchange_endpoint)?;
         url.set_path("/oauth/token");
+        let token_endpoint_htu = url.as_str().to_owned();
+        let body = exchange_form_body(subject_token, subject_token_type, BROWSER_PUBLIC_CLIENT_ID);
 
-        let body = exchange_form_body(
-            subject_token,
-            subject_token_type,
-            BROWSER_PUBLIC_CLIENT_ID,
-        );
+        let mut current_nonce = nonce.map(str::to_owned);
 
-        let headers = web_sys::Headers::new()
-            .map_err(|e| anyhow!("token-exchange header construction failed: {e:?}"))?;
-        headers
-            .set("content-type", "application/x-www-form-urlencoded")
-            .map_err(|e| anyhow!("token-exchange content-type set failed: {e:?}"))?;
-        headers
-            .set("accept", "application/json")
-            .map_err(|e| anyhow!("token-exchange accept set failed: {e:?}"))?;
-        headers
-            .set("dpop", dpop_proof)
-            .map_err(|e| anyhow!("token-exchange DPoP header set failed: {e:?}"))?;
+        // Up to two attempts: bootstrap → use_dpop_nonce retry.
+        for attempt in 0..2u8 {
+            let proof = build_ed25519_dpop_proof(
+                dpop_pubkey,
+                dpop_sign_fn,
+                "POST",
+                &token_endpoint_htu,
+                None, // no ath at the token endpoint
+                current_nonce.as_deref(),
+            )
+            .await?;
 
-        let init = web_sys::RequestInit::new();
-        init.set_method("POST");
-        init.set_body(&js_sys::JsString::from(body.as_str()));
-        init.set_headers(headers.as_ref());
-        init.set_cache(web_sys::RequestCache::NoStore);
-        init.set_credentials(web_sys::RequestCredentials::SameOrigin);
-        init.set_redirect(web_sys::RequestRedirect::Error);
+            let headers = web_sys::Headers::new()
+                .map_err(|e| anyhow!("token-exchange header construction failed: {e:?}"))?;
+            headers
+                .set("content-type", "application/x-www-form-urlencoded")
+                .map_err(|e| anyhow!("token-exchange content-type set failed: {e:?}"))?;
+            headers
+                .set("accept", "application/json")
+                .map_err(|e| anyhow!("token-exchange accept set failed: {e:?}"))?;
+            headers
+                .set("dpop", &proof)
+                .map_err(|e| anyhow!("token-exchange DPoP header set failed: {e:?}"))?;
 
-        let request = web_sys::Request::new_with_str_and_init(url.as_str(), &init)
-            .map_err(|e| anyhow!("token-exchange request construction failed: {e:?}"))?;
-        let window = web_sys::window().ok_or_else(|| anyhow!("browser window unavailable"))?;
-        let response_value = JsFuture::from(window.fetch_with_request(&request))
-            .await
-            .map_err(|e| anyhow!("token-exchange fetch failed: {e:?}"))?;
-        let response: web_sys::Response = response_value
-            .dyn_into()
-            .map_err(|_| anyhow!("token-exchange fetch returned a non-Response"))?;
+            let init = web_sys::RequestInit::new();
+            init.set_method("POST");
+            init.set_body(&js_sys::JsString::from(body.as_str()));
+            init.set_headers(headers.as_ref());
+            init.set_cache(web_sys::RequestCache::NoStore);
+            init.set_credentials(web_sys::RequestCredentials::SameOrigin);
+            init.set_redirect(web_sys::RequestRedirect::Error);
 
-        let text = read_body_text(&response).await?;
-        if !response.ok() {
-            // The body is read first so a streamed OAuth error payload is surfaced.
-            return Err(anyhow!(
-                "token-exchange endpoint returned HTTP {}: {}",
-                response.status(),
-                text.trim()
-            ));
+            let request = web_sys::Request::new_with_str_and_init(url.as_str(), &init)
+                .map_err(|e| anyhow!("token-exchange request construction failed: {e:?}"))?;
+            let window =
+                web_sys::window().ok_or_else(|| anyhow!("browser window unavailable"))?;
+            let response_value = JsFuture::from(window.fetch_with_request(&request))
+                .await
+                .map_err(|e| anyhow!("token-exchange fetch failed: {e:?}"))?;
+            let response: web_sys::Response = response_value
+                .dyn_into()
+                .map_err(|_| anyhow!("token-exchange fetch returned a non-Response"))?;
+
+            let text = read_body_text(&response).await?;
+            let status = response.status();
+            let response_ok = response.ok();
+            let fresh_nonce_header = response.headers().get("DPoP-Nonce").ok().flatten();
+
+            // RFC 9449 §8 nonce lifecycle, decided by the same pure function
+            // the native tests exercise directly (#1425 r1 P1#4).
+            match decide_nonce_outcome(attempt, response_ok, status, &text, fresh_nonce_header.as_deref()) {
+                NonceOutcome::Success => {}
+                NonceOutcome::RetryWithNonce(fresh) => {
+                    current_nonce = Some(fresh);
+                    continue;
+                }
+                NonceOutcome::Failed => {
+                    return Err(anyhow!(
+                        "token-exchange endpoint returned HTTP {status}: {}",
+                        text.trim()
+                    ));
+                }
+            }
+
+            // Success: parse body + carry the response nonce for the caller to persist.
+            let mut token = parse_exchange_response(&text)?;
+            token.nonce = fresh_nonce_header;
+            return Ok(token);
         }
-        parse_exchange_response(&text)
+        Err(anyhow!(
+            "token-exchange: exhausted nonce retries (this should not happen)"
+        ))
     }
 
     /// Exchange a one-use ATProto service-auth JWT plus DPoP proof for the
@@ -463,7 +670,6 @@ pub use fetch::{fetch_exchange_token, fetch_session_context, fetch_session_excha
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 
     fn jwt(payload_json: &str) -> String {
         let header = URL_SAFE_NO_PAD.encode(r#"{"alg":"EdDSA","typ":"at+jwt"}"#);
@@ -505,6 +711,166 @@ mod tests {
         // The AS matches this literal; a drift here breaks the wire contract.
         assert_eq!(BROWSER_PUBLIC_CLIENT_ID, "hyprstream-browser-vfs");
         assert!(!BROWSER_PUBLIC_CLIENT_ID.is_empty());
+    }
+
+    // ── #1425 r1: pure DPoP proof helpers (RFC 9449) ──────────────────────────
+
+    #[test]
+    fn ed25519_dpop_signing_input_has_correct_shape() {
+        let pubkey = [0x42; 32];
+        let (signing_input, _header) =
+            ed25519_dpop_signing_input(&pubkey, "POST", "https://as.example/oauth/token", 1700000000, "jti-1", None, None)
+                .unwrap();
+        // Two dots → three segments (header.payload.???).
+        assert_eq!(signing_input.matches('.').count(), 1);
+        let (h, p) = signing_input.split_once('.').unwrap();
+        let header: serde_json::Value =
+            serde_json::from_slice(&URL_SAFE_NO_PAD.decode(h).unwrap()).unwrap();
+        let payload: serde_json::Value =
+            serde_json::from_slice(&URL_SAFE_NO_PAD.decode(p).unwrap()).unwrap();
+        assert_eq!(header["typ"], "dpop+jwt");
+        assert_eq!(header["alg"], "EdDSA");
+        assert_eq!(header["jwk"]["kty"], "OKP");
+        assert_eq!(header["jwk"]["crv"], "Ed25519");
+        assert_eq!(payload["htm"], "POST");
+        assert_eq!(payload["htu"], "https://as.example/oauth/token");
+        assert_eq!(payload["iat"], 1700000000);
+        assert_eq!(payload["jti"], "jti-1");
+        assert!(payload.get("ath").is_none(), "ath must be absent when not provided");
+        assert!(payload.get("nonce").is_none(), "nonce must be absent when not provided");
+    }
+
+    #[test]
+    fn ed25519_dpop_signing_input_includes_ath_and_nonce() {
+        let pubkey = [0x11; 32];
+        let (signing_input, _) =
+            ed25519_dpop_signing_input(&pubkey, "GET", "https://rpc.example/v1/models", 1, "j", Some("ath-hash"), Some("nonce-val"))
+                .unwrap();
+        let (_, p) = signing_input.split_once('.').unwrap();
+        let payload: serde_json::Value =
+            serde_json::from_slice(&URL_SAFE_NO_PAD.decode(p).unwrap()).unwrap();
+        assert_eq!(payload["ath"], "ath-hash");
+        assert_eq!(payload["nonce"], "nonce-val");
+    }
+
+    #[test]
+    fn assemble_dpop_proof_produces_three_segments() {
+        let proof = assemble_dpop_proof("aaa.bbb", &[0xCD; 64]);
+        let parts: Vec<&str> = proof.split('.').collect();
+        assert_eq!(parts.len(), 3);
+        assert_eq!(parts[0], "aaa");
+        assert_eq!(parts[1], "bbb");
+    }
+
+    #[test]
+    fn is_use_dpop_nonce_response_detects_400_nonce_error() {
+        assert!(is_use_dpop_nonce_response(
+            400,
+            r#"{"error":"use_dpop_nonce","error_description":"nonce required"}"#
+        ));
+        // Not 400
+        assert!(!is_use_dpop_nonce_response(
+            401,
+            r#"{"error":"use_dpop_nonce"}"#
+        ));
+        // 400 but different error
+        assert!(!is_use_dpop_nonce_response(
+            400,
+            r#"{"error":"invalid_dpop_proof"}"#
+        ));
+        // Non-JSON
+        assert!(!is_use_dpop_nonce_response(400, "not json"));
+    }
+
+    #[test]
+    fn ed25519_dpop_jkt_matches_server_thumbprint() {
+        let pubkey = [0x65; 32];
+        let jkt = ed25519_dpop_jkt(&pubkey);
+        // The server computes the same RFC 7638 thumbprint for an OKP Ed25519 key.
+        let expected = crate::auth::jwk_thumbprint(&crate::auth::JwkThumbprintInput::Ed25519 {
+            x: &pubkey,
+        });
+        assert_eq!(jkt, expected);
+    }
+
+    #[test]
+    fn dpop_ath_is_base64url_sha256() {
+        let ath = dpop_ath("hello.world.token");
+        use sha2::{Digest, Sha256};
+        assert_eq!(
+            ath,
+            URL_SAFE_NO_PAD.encode(Sha256::digest(b"hello.world.token"))
+        );
+    }
+
+    // ── #1425 r1 P1#4: JTI freshness + nonce-lifecycle decision (native) ─────
+
+    #[test]
+    fn generate_dpop_jti_is_fresh_every_call() {
+        let a = generate_dpop_jti();
+        let b = generate_dpop_jti();
+        assert_ne!(a, b, "two proofs must never reuse a jti");
+        // 16 random bytes, base64url-no-pad-encoded.
+        assert_eq!(URL_SAFE_NO_PAD.decode(&a).unwrap().len(), 16);
+    }
+
+    #[test]
+    fn nonce_bootstrap_success_needs_no_retry() {
+        // First-ever request for a key: the AS may accept without a nonce.
+        let outcome = decide_nonce_outcome(0, true, 200, "{}", None);
+        assert_eq!(outcome, NonceOutcome::Success);
+    }
+
+    #[test]
+    fn nonce_required_failure_retries_with_fresh_nonce() {
+        let body = r#"{"error":"use_dpop_nonce","error_description":"nonce required"}"#;
+        let outcome = decide_nonce_outcome(0, false, 400, body, Some("fresh-nonce-1"));
+        assert_eq!(
+            outcome,
+            NonceOutcome::RetryWithNonce("fresh-nonce-1".to_owned())
+        );
+    }
+
+    #[test]
+    fn nonce_retry_success_completes() {
+        // Second attempt, now carrying the fresh nonce, succeeds.
+        let outcome = decide_nonce_outcome(1, true, 200, "{}", None);
+        assert_eq!(outcome, NonceOutcome::Success);
+    }
+
+    #[test]
+    fn nonce_required_but_no_header_to_retry_with_fails() {
+        // Server said use_dpop_nonce but (contrary to RFC 9449 §8) omitted the
+        // DPoP-Nonce header — nothing to retry with, must fail closed.
+        let body = r#"{"error":"use_dpop_nonce"}"#;
+        let outcome = decide_nonce_outcome(0, false, 400, body, None);
+        assert_eq!(outcome, NonceOutcome::Failed);
+    }
+
+    #[test]
+    fn nonce_retry_budget_is_exactly_one_exhausted_on_second_failure() {
+        // Even a legitimate use_dpop_nonce + fresh header on attempt 1 (the
+        // retry itself) must NOT trigger a third attempt — bounds the loop.
+        let body = r#"{"error":"use_dpop_nonce"}"#;
+        let outcome = decide_nonce_outcome(1, false, 400, body, Some("another-nonce"));
+        assert_eq!(outcome, NonceOutcome::Failed);
+    }
+
+    #[test]
+    fn dpop_mismatch_error_is_not_a_nonce_retry() {
+        // A key/proof mismatch (invalid_dpop_proof) must propagate as a hard
+        // failure, never be mistaken for a retryable nonce error.
+        let body = r#"{"error":"invalid_dpop_proof","error_description":"proof key mismatch"}"#;
+        let outcome = decide_nonce_outcome(0, false, 400, body, Some("irrelevant-nonce"));
+        assert_eq!(outcome, NonceOutcome::Failed);
+    }
+
+    #[test]
+    fn nonce_expired_status_is_not_retried() {
+        // A 401 (e.g. expired access/refresh token) is not a use_dpop_nonce
+        // shape and must not be retried regardless of body content.
+        let outcome = decide_nonce_outcome(0, false, 401, "{\"error\":\"use_dpop_nonce\"}", Some("n"));
+        assert_eq!(outcome, NonceOutcome::Failed);
     }
 
     #[test]
@@ -587,6 +953,7 @@ mod tests {
             access_token: "secret-bearer-value".to_owned(),
             expires_in: 300,
             token_type: TokenType::Bearer,
+            nonce: None,
         };
         let rendered = format!("{t:?}");
         assert!(
