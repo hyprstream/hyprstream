@@ -2,7 +2,7 @@
 name = "hyprstream-compositor"
 version = "0.1.0"
 edition = "2021"
-license = "MIT"
+license = "Apache-2.0"
 description = "Pure Rust TUI compositor — WASM-compatible chrome state machine"
 
 [dependencies]

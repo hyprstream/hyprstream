@@ -44,16 +44,25 @@ allow = [
     "CDLA-Permissive-2.0", # Community Data License Agreement (permissive data license — webpki-roots CA certs)
 ]
 
-# hyprstream itself is dual-licensed MIT OR AGPL-3.0-only (first-party).
-# Allow AGPL only for the root binary crate — not as a blanket allow.
+# Owner-approved first-party AGPL packages. Keep AGPL name-scoped rather than
+# adding it to the global allow list.
 [[licenses.exceptions]]
-name = "hyprstream"
+name = "hyprstream-metrics"
 version = "*"
-allow = ["MIT", "AGPL-3.0-only"]
+allow = ["AGPL-3.0-only"]
 
-# Authority-bearing Kubernetes grant/PDS adapter (#1422).
 [[licenses.exceptions]]
-name = "hyprstream-k8s-pds"
+name = "hyprstream-flight"
+version = "*"
+allow = ["AGPL-3.0-only"]
+
+[[licenses.exceptions]]
+name = "hyprstream-vfs-server"
+version = "*"
+allow = ["AGPL-3.0-only"]
+
+[[licenses.exceptions]]
+name = "hyprstream-workers"
 version = "*"
 allow = ["AGPL-3.0-only"]
 

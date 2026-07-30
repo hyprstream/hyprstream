@@ -2,7 +2,7 @@
 name = "hyprstream-vfs-server"
 version = "0.1.0"
 edition.workspace = true
-license.workspace = true
+license = "AGPL-3.0-only"
 description = "Serves a hyprstream VFS Namespace over vhost-user-fs to a Cloud Hypervisor guest (FS-A, #362), or as a local /dev/fuse mount for non-VM sandbox backends (#653)"
 
 # Native-only (Linux): vhost-user-fs + fuse-backend-rs virtio transport are not
