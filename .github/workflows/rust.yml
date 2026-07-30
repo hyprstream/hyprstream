@@ -86,7 +86,9 @@ jobs:
       run: |
         podman run --rm \
           -v "$PWD":/build:Z -w /build \
-          -v /mnt/hypr-ci-cache:/mnt/hypr-ci-cache:Z \
+          # The EBS cache filesystem rejects SELinux relabel xattrs; leave this shared
+          # ephemeral runner cache unlabeled and retain :Z only on the checked-out source.
+          -v /mnt/hypr-ci-cache:/mnt/hypr-ci-cache \
           -e RUSTC_WRAPPER=sccache -e SCCACHE_BUCKET -e SCCACHE_REGION \
           -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY -e AWS_SESSION_TOKEN \
           -e AWS_REGION -e AWS_DEFAULT_REGION \
@@ -194,7 +196,9 @@ jobs:
       run: |
         podman run --rm \
           -v "$PWD":/build:Z -w /build \
-          -v /mnt/hypr-ci-cache:/mnt/hypr-ci-cache:Z \
+          # The EBS cache filesystem rejects SELinux relabel xattrs; leave this shared
+          # ephemeral runner cache unlabeled and retain :Z only on the checked-out source.
+          -v /mnt/hypr-ci-cache:/mnt/hypr-ci-cache \
           -e RUSTC_WRAPPER=sccache -e SCCACHE_BUCKET -e SCCACHE_REGION \
           -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY -e AWS_SESSION_TOKEN \
           -e AWS_REGION -e AWS_DEFAULT_REGION \
@@ -271,7 +275,9 @@ jobs:
       run: |
         podman run --rm \
           -v "$PWD":/build:Z -w /build \
-          -v /mnt/hypr-ci-cache:/mnt/hypr-ci-cache:Z \
+          # The EBS cache filesystem rejects SELinux relabel xattrs; leave this shared
+          # ephemeral runner cache unlabeled and retain :Z only on the checked-out source.
+          -v /mnt/hypr-ci-cache:/mnt/hypr-ci-cache \
           -e RUSTC_WRAPPER=sccache -e SCCACHE_BUCKET -e SCCACHE_REGION \
           -e SCCACHE_IDLE_TIMEOUT=0 \
           -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY -e AWS_SESSION_TOKEN \

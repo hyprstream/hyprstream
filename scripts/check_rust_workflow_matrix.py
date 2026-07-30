@@ -272,7 +272,7 @@ def check_rust_text(text: str) -> None:
     # otherwise a full link writes into the 80 GiB runner root and can exhaust
     # it despite the 200 GiB cache volume being available.
     required_cache_args = (
-        "-v /mnt/hypr-ci-cache:/mnt/hypr-ci-cache:Z",
+        "-v /mnt/hypr-ci-cache:/mnt/hypr-ci-cache",
         "-e CARGO_TARGET_DIR=/mnt/hypr-ci-cache/target/hyprstream",
     )
     job_blocks = _job_blocks(text)
@@ -283,6 +283,10 @@ def check_rust_text(text: str) -> None:
                 argument in block,
                 f"rust.yml: job {name!r} must pass {argument!r} to Podman",
             )
+        _assert(
+            "-v /mnt/hypr-ci-cache:/mnt/hypr-ci-cache:Z" not in block,
+            f"rust.yml: job {name!r} must not SELinux-relabel the cache EBS mount",
+        )
 
 
 def check_appimage_text(text: str) -> None:
@@ -400,7 +404,7 @@ def _rust_mutations(rust_text: str) -> list[tuple[str, str]]:
         (
             "drop merge-gate cache mount",
             rust_text.replace(
-                "          -v /mnt/hypr-ci-cache:/mnt/hypr-ci-cache:Z \\\n",
+                "          -v /mnt/hypr-ci-cache:/mnt/hypr-ci-cache \\\n",
                 "",
                 1,
             ),
@@ -410,6 +414,14 @@ def _rust_mutations(rust_text: str) -> list[tuple[str, str]]:
             rust_text.replace(
                 "          -e CARGO_TARGET_DIR=/mnt/hypr-ci-cache/target/hyprstream \\\n",
                 "",
+                1,
+            ),
+        ),
+        (
+            "SELinux-relabel cache mount (the EBS cache rejects xattrs)",
+            rust_text.replace(
+                "          -v /mnt/hypr-ci-cache:/mnt/hypr-ci-cache \\\n",
+                "          -v /mnt/hypr-ci-cache:/mnt/hypr-ci-cache:Z \\\n",
                 1,
             ),
         ),
