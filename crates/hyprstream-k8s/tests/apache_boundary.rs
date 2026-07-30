@@ -186,18 +186,57 @@ fn check_apache_boundary(workspace_root: &Path, root_manifest_path: &Path) -> Re
             .get(&id)
             .ok_or_else(|| format!("resolved graph has no node for {id}"))?;
         for dependency in &node.deps {
-            let dependency_package = packages.get(&dependency.pkg).ok_or_else(|| {
-                format!(
+            if !packages.contains_key(&dependency.pkg) {
+                return Err(format!(
                     "resolved graph references unknown dependency {}",
                     dependency.pkg
-                )
-            })?;
-            if dependency_package.source.is_none() {
-                queue.push_back((dependency.pkg.clone(), chain.clone()));
+                ));
             }
+            queue.push_back((dependency.pkg.clone(), chain.clone()));
         }
     }
     Ok(())
+}
+
+fn assert_transitive_patch_resolved(
+    metadata: &CargoMetadata,
+    external_name: &str,
+    local_name: &str,
+) {
+    let external = metadata
+        .packages
+        .iter()
+        .find(|package| package.name == external_name)
+        .unwrap_or_else(|| panic!("fixture did not resolve external package {external_name}"));
+    assert!(
+        external.source.is_some(),
+        "fixture package {external_name} must come from a registry"
+    );
+    let local = metadata
+        .packages
+        .iter()
+        .find(|package| package.name == local_name)
+        .unwrap_or_else(|| panic!("fixture did not resolve local package {local_name}"));
+    assert!(
+        local.source.is_none(),
+        "fixture package {local_name} must resolve to the local patch"
+    );
+    let resolve = metadata
+        .resolve
+        .as_ref()
+        .expect("fixture metadata must include a resolved graph");
+    let external_node = resolve
+        .nodes
+        .iter()
+        .find(|node| node.id == external.id)
+        .unwrap_or_else(|| panic!("fixture graph omitted external package {external_name}"));
+    assert!(
+        external_node
+            .deps
+            .iter()
+            .any(|dependency| dependency.pkg == local.id),
+        "fixture graph must contain {external_name} -> {local_name}"
+    );
 }
 
 #[test]
@@ -433,4 +472,31 @@ anyhow = "=1.0.102""#,
     );
     let error = check_apache_boundary(directory.path(), &root_manifest).unwrap_err();
     assert!(error.contains("apache-root -> anyhow"), "{error}");
+}
+
+#[test]
+fn transitive_registry_dependency_patched_to_local_agpl_is_rejected() {
+    let directory = fixture_workspace(
+        "MIT",
+        r#"[patch.crates-io]
+itoa = { path = "crates/service" }"#,
+    );
+    let root_manifest = write_fixture_packages(
+        directory.path(),
+        r#"[dependencies]
+serde_json = "=1.0.150""#,
+        "itoa",
+        "1.0.99",
+        r#"license = "AGPL-3.0-only""#,
+    );
+
+    let metadata = resolved_metadata(directory.path(), &root_manifest)
+        .expect("transitive patch fixture must resolve offline");
+    assert_transitive_patch_resolved(&metadata, "serde_json", "itoa");
+
+    let error = check_apache_boundary(directory.path(), &root_manifest).unwrap_err();
+    assert!(
+        error.contains("apache-root -> serde_json -> itoa"),
+        "complete dependency chain missing from boundary failure: {error}"
+    );
 }
