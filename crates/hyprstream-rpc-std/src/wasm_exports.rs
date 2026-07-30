@@ -98,6 +98,10 @@ impl VfsShell {
     /// - `exchange_endpoint`: HTTPS origin hosting the #1314 `POST /oauth/token`.
     /// - `subject_token` / `subject_token_type`: the credential to exchange
     ///   (e.g. an atproto JWT, `subject_token_type = urn:ietf:params:oauth:token-type:jwt`).
+    /// - `exchange_dpop_proof`: an RFC 9449 DPoP proof JWT (#1425) the caller
+    ///   built over `htm=POST, htu={exchange_endpoint}/oauth/token`, signed by
+    ///   the browser's DPoP key. The AS verifies it and binds the minted token
+    ///   to the proof key's `cnf.jkt`, returning `token_type: DPoP`.
     pub async fn connect(
         registry_origin: &str,
         model_origin: &str,
@@ -108,20 +112,25 @@ impl VfsShell {
         exchange_endpoint: &str,
         subject_token: String,
         subject_token_type: String,
+        exchange_dpop_proof: String,
     ) -> Result<VfsShell, JsError> {
         console_error_panic_hook::set_once();
 
-        // 1) Exchange the atproto/external JWT for a short-lived at+jwt Bearer (#1314).
+        // 1) Exchange the atproto/external JWT for a short-lived at+jwt access
+        //    token (#1314 / #1425). The request carries the public browser
+        //    client_id + the DPoP proof, so the AS mints a sender-bound
+        //    (`token_type: DPoP`, `cnf.jkt`) token rather than a bearer.
         web_sys::console::log_1(&"[VfsShell] Exchanging subject token...".into());
         let exchanged = hyprstream_rpc::wasm_token_exchange::fetch_exchange_token(
             exchange_endpoint,
             &subject_token,
             &subject_token_type,
+            &exchange_dpop_proof,
         )
         .await
         .map_err(|e| JsError::new(&e.to_string()))?;
 
-        // 2) Derive the display Subject from the freshly-minted Bearer's `sub`.
+        // 2) Derive the display Subject from the freshly-minted token's `sub`.
         //    The response does not echo `sub` (the mint stamps `sub = verified.sub`),
         //    so decode it client-side. Authority is re-verified by the server on
         //    every RPC; this decode is bookkeeping only.
@@ -132,8 +141,18 @@ impl VfsShell {
         web_sys::console::log_1(&"[VfsShell] Subject resolved from exchanged token".into());
 
         // 3) Connect to registry + model through the resolved browser-provisioning
-        //    path (the only working browser dial), presenting the Bearer as the
-        //    default JWT on every request. The `dial_wasm::dial` stub is dropped.
+        //    path (the only working browser dial), presenting the access token as
+        //    the default JWT on every request. The `dial_wasm::dial` stub is dropped.
+        //
+        //    #1425 NOTE: the exchanged token is sender-bound (`token_type: DPoP`,
+        //    `cnf.jkt`). The resource server rejects a `cnf.jkt`-bound token
+        //    presented as a plain Bearer (RFC 9449 §7), so a fully functional
+        //    browser→RPC path requires the resolved RPC client to present
+        //    `Authorization: DPoP` plus a fresh matching proof (and access-token
+        //    hash `ath`) on every request. That per-request DPoP wiring in the
+        //    wasm RPC client is the use-surface follow-on this issue explicitly
+        //    defers (VfsShell UI is out of scope); the exchange contract itself
+        //    — the scope of #1425 — is complete and wire-tested.
         let bearer = Some(exchanged.access_token);
         web_sys::console::log_1(&"[VfsShell] Connecting to registry...".into());
         let reg_client: Arc<dyn hyprstream_rpc::rpc_client::RpcClient> = Arc::new(

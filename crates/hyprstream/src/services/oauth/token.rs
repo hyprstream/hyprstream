@@ -26,6 +26,8 @@ use super::state::{DeviceCodeStatus, DpopJtiAdmission, OAuthState, RefreshTokenE
 use crate::services::generated::policy_client::IssueToken;
 use hyprstream_pds::repo_authority::is_path_form_did_web;
 use hyprstream_rpc::auth::{jwk_thumbprint, JwkThumbprintInput};
+// #1425: the public browser client_id routes the sender-bound exchange.
+use hyprstream_rpc::wasm_token_exchange::BROWSER_PUBLIC_CLIENT_ID;
 
 /// Device code grant type URN (RFC 8628).
 const DEVICE_CODE_GRANT_TYPE: &str = "urn:ietf:params:oauth:grant-type:device_code";
@@ -207,6 +209,22 @@ pub async fn exchange_token(
                     params.scope.as_deref(),
                     params.audience.as_deref(),
                     resolver.as_ref(),
+                )
+                .await;
+            }
+            // #1425: the browser RFC 8693 sender-bound exchange (DPoP +
+            // cnf.jkt). Routed on the public browser client_id so it cannot be
+            // confused with the generic OIDC/WIT bearer exchange or the UCAN
+            // grant path. DPoP is mandatory inside the handler.
+            if params.client_id == BROWSER_PUBLIC_CLIENT_ID {
+                return super::token_exchange::exchange_browser_token_exchange(
+                    &state,
+                    &subject_token,
+                    &subject_token_type,
+                    dpop_header.as_deref(),
+                    params.audience.as_deref(),
+                    params.scope.as_deref(),
+                    &params.client_id,
                 )
                 .await;
             }

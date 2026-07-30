@@ -27,6 +27,20 @@ use serde::{Deserialize, Serialize};
 pub const GRANT_TYPE: &str = "urn:ietf:params:oauth:grant-type:token-exchange";
 /// Issued-token type the #1314 endpoint always mints (at+jwt / access_token).
 pub const ISSUED_TOKEN_TYPE: &str = "urn:ietf:params:oauth:token-type:access_token";
+
+/// The well-known public `client_id` the browser VfsShell presents at the
+/// RFC 8693 token-exchange endpoint (#1425).
+///
+/// This is a **public client** identifier (RFC 9700 / OAuth 2.1 `none`
+/// token-endpoint auth method): it names the browser client so the AS can
+/// apply the public-client token-exchange contract, but it is **not a client
+/// secret and not a proof of identity**. There is no corresponding secret —
+/// the sender binding comes entirely from the RFC 9449 DPoP proof
+/// (`cnf.jkt`), not from this identifier. The same constant is the
+/// single source of truth the AS matches against (`hyprstream` imports it
+/// from this crate) so the wire contract cannot drift between client and
+/// server.
+pub const BROWSER_PUBLIC_CLIENT_ID: &str = "hyprstream-browser-vfs";
 /// Browser session exchange route on the hyprstream OAuth origin.
 pub const SESSION_EXCHANGE_PATH: &str = "/api/session/exchange";
 /// Server-derived viewer context route on the hyprstream OAuth origin.
@@ -50,10 +64,16 @@ pub enum SessionKind {
     Unauthenticated,
 }
 
-/// A successfully exchanged short-lived Bearer (at+jwt).
+/// A successfully exchanged short-lived access token (#1314 / #1425).
+///
+/// `token_type` records whether the AS minted a sender-bound (`DPoP`,
+/// RFC 9449) or bearer (`Bearer`) token. A `DPoP` token carries `cnf.jkt`
+/// and **must** be presented as `Authorization: DPoP` with a fresh matching
+/// proof on every resource request — the resource server rejects a
+/// `cnf.jkt`-bound token presented as `Bearer` (RFC 9449 §7).
 ///
 /// `Debug` is manual and redacts `access_token` so an accidental `{:?}` log
-/// can't leak the Bearer.
+/// can't leak the credential.
 #[derive(Clone, PartialEq, Eq)]
 pub struct ExchangedToken {
     /// The at+jwt `access_token` — presented as the client's default JWT.
@@ -62,6 +82,33 @@ pub struct ExchangedToken {
     /// uses a static default-JWT; a refresh path (`withTokenProvider`) is the
     /// future-work follow-on the recon notes.
     pub expires_in: i64,
+    /// The OAuth `token_type` the AS returned — `"DPoP"` for a sender-bound
+    /// token (the #1425 browser contract), `"Bearer"` otherwise. Drives
+    /// whether downstream RPC requests must carry a DPoP proof.
+    pub token_type: TokenType,
+}
+
+/// The OAuth `token_type` of an [`ExchangedToken`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TokenType {
+    /// `token_type: Bearer` — no key binding.
+    Bearer,
+    /// `token_type: DPoP` (RFC 9449) — sender-bound via `cnf.jkt`; every
+    /// resource request needs a matching DPoP proof.
+    Dpop,
+}
+
+impl TokenType {
+    /// Parse the `token_type` field, case-insensitively. `None` (field
+    /// omitted) is treated as `Bearer` for backward compatibility with the
+    /// pre-#1424 endpoint shape.
+    fn parse(raw: Option<&str>) -> Result<Self, String> {
+        match raw.map(str::to_ascii_lowercase).as_deref() {
+            None | Some("bearer") => Ok(TokenType::Bearer),
+            Some("dpop") => Ok(TokenType::Dpop),
+            Some(other) => Err(format!("unsupported token_type: {other}")),
+        }
+    }
 }
 
 impl std::fmt::Debug for ExchangedToken {
@@ -69,6 +116,7 @@ impl std::fmt::Debug for ExchangedToken {
         f.debug_struct("ExchangedToken")
             .field("access_token", &"<redacted>")
             .field("expires_in", &self.expires_in)
+            .field("token_type", &self.token_type)
             .finish()
     }
 }
@@ -86,13 +134,24 @@ struct ExchangeResponse {
 
 /// Build the `application/x-www-form-urlencoded` body for an RFC 8693 exchange.
 ///
-/// `grant_type` and the `subject_token_type` constant are URL-safe; the
-/// `subject_token` (a JWT) is percent-encoded defensively.
-pub fn exchange_form_body(subject_token: &str, subject_token_type: &str) -> String {
+/// #1425: the body now carries the required **public** `client_id`
+/// ([`BROWSER_PUBLIC_CLIENT_ID`]) and is sent alongside a `DPoP` proof
+/// header for sender-bound exchange. `grant_type` and the
+/// `subject_token_type` constant are URL-safe; the `subject_token` (a JWT)
+/// and `client_id` are percent-encoded defensively.
+pub fn exchange_form_body(
+    subject_token: &str,
+    subject_token_type: &str,
+    client_id: &str,
+) -> String {
     format!(
-        "grant_type={GRANT_TYPE}&subject_token={}&subject_token_type={}",
+        "grant_type={GRANT_TYPE}\
+         &subject_token={}\
+         &subject_token_type={}\
+         &client_id={}",
         percent_encode(subject_token),
         percent_encode(subject_token_type),
+        percent_encode(client_id),
     )
 }
 
@@ -112,9 +171,11 @@ fn percent_encode(input: &str) -> String {
 /// Parse the JSON body of a successful `POST /oauth/token` exchange.
 ///
 /// Validates `access_token` is present and, when the endpoint sets them, that
-/// `token_type` is `Bearer` and `issued_token_type` is the access-token type —
+/// `token_type` is a supported value (`Bearer` or, since #1425, `DPoP` for a
+/// sender-bound token) and `issued_token_type` is the access-token type —
 /// defending against a misrouted/shape-changed response being treated as a
-/// valid Bearer.
+/// valid credential. The parsed [`TokenType`] tells the caller whether
+/// downstream resource requests must carry a DPoP proof.
 pub fn parse_exchange_response(body: &str) -> Result<ExchangedToken> {
     let resp: ExchangeResponse = serde_json::from_str(body)
         .map_err(|e| anyhow!("token-exchange response is not valid JSON: {e}"))?;
@@ -122,12 +183,8 @@ pub fn parse_exchange_response(body: &str) -> Result<ExchangedToken> {
         !resp.access_token.is_empty(),
         "token-exchange response omitted access_token"
     );
-    if let Some(token_type) = &resp.token_type {
-        ensure!(
-            token_type.eq_ignore_ascii_case("Bearer"),
-            "token-exchange token_type is not Bearer: {token_type}"
-        );
-    }
+    let token_type = TokenType::parse(resp.token_type.as_deref())
+        .map_err(|e| anyhow!("token-exchange {e}"))?;
     if let Some(issued) = &resp.issued_token_type {
         ensure!(
             issued == ISSUED_TOKEN_TYPE,
@@ -137,6 +194,7 @@ pub fn parse_exchange_response(body: &str) -> Result<ExchangedToken> {
     Ok(ExchangedToken {
         access_token: resp.access_token,
         expires_in: resp.expires_in.unwrap_or(0).max(0),
+        token_type,
     })
 }
 
@@ -251,19 +309,31 @@ mod fetch {
     }
 
     /// POST an RFC 8693 token-exchange grant to `{exchange_endpoint}/oauth/token`
-    /// and return the short-lived at+jwt Bearer.
+    /// and return the short-lived at+jwt access token.
     ///
-    /// Form-encoded body, **no DPoP** — the generic exchange path (#1314) is
-    /// bearer-only; only the UCAN-grant path needs DPoP. CORS is open (#1316).
+    /// #1425: the request now carries the required **public** `client_id`
+    /// ([`BROWSER_PUBLIC_CLIENT_ID`]) and a `DPoP` proof header so the AS
+    /// mints a **sender-bound** (`token_type: DPoP`, `cnf.jkt`) token rather
+    /// than a bearer. `dpop_proof` is the RFC 9449 proof JWT the caller built
+    /// over `htm=POST, htu={origin}/oauth/token`; the AS verifies it (method,
+    /// URI, `iat`, `jti`, server nonce) and binds the minted token to the
+    /// proof key's `jkt`. The returned [`ExchangedToken::token_type`] is
+    /// `DPoP`; every resource request presenting that token must likewise
+    /// carry a fresh matching DPoP proof (RFC 9449 §7). CORS is open (#1316).
     pub async fn fetch_exchange_token(
         exchange_endpoint: &str,
         subject_token: &str,
         subject_token_type: &str,
+        dpop_proof: &str,
     ) -> Result<ExchangedToken> {
         let mut url = parse_origin(exchange_endpoint)?;
         url.set_path("/oauth/token");
 
-        let body = exchange_form_body(subject_token, subject_token_type);
+        let body = exchange_form_body(
+            subject_token,
+            subject_token_type,
+            BROWSER_PUBLIC_CLIENT_ID,
+        );
 
         let headers = web_sys::Headers::new()
             .map_err(|e| anyhow!("token-exchange header construction failed: {e:?}"))?;
@@ -273,6 +343,9 @@ mod fetch {
         headers
             .set("accept", "application/json")
             .map_err(|e| anyhow!("token-exchange accept set failed: {e:?}"))?;
+        headers
+            .set("dpop", dpop_proof)
+            .map_err(|e| anyhow!("token-exchange DPoP header set failed: {e:?}"))?;
 
         let init = web_sys::RequestInit::new();
         init.set_method("POST");
@@ -403,21 +476,35 @@ mod tests {
         // `:` is not RFC 3986 unreserved, so the caller-supplied URN is encoded;
         // the server's form parser decodes %3A back to ':'. A valid JWT
         // (base64url-no-pad + '.') is already unreserved, so it passes through.
-        let body = exchange_form_body("abc.def.ghi", "urn:ietf:params:oauth:token-type:jwt");
+        // #1425: the body also carries the public client_id.
+        let body = exchange_form_body(
+            "abc.def.ghi",
+            "urn:ietf:params:oauth:token-type:jwt",
+            BROWSER_PUBLIC_CLIENT_ID,
+        );
         assert_eq!(
             body,
             "grant_type=urn:ietf:params:oauth:grant-type:token-exchange\
              &subject_token=abc.def.ghi\
-             &subject_token_type=urn%3Aietf%3Aparams%3Aoauth%3Atoken-type%3Ajwt"
+             &subject_token_type=urn%3Aietf%3Aparams%3Aoauth%3Atoken-type%3Ajwt\
+             &client_id=hyprstream-browser-vfs"
         );
     }
 
     #[test]
     fn form_body_percent_encodes_non_unreserved() {
         // base64url-no-pad never produces '+', but a tampered/odd token could carry it.
-        let body = exchange_form_body("a+b c", "t/y");
+        let body = exchange_form_body("a+b c", "t/y", "c w");
         assert!(body.contains("subject_token=a%2Bb%20c"), "{body}");
         assert!(body.contains("subject_token_type=t%2Fy"), "{body}");
+        assert!(body.contains("client_id=c%20w"), "{body}");
+    }
+
+    #[test]
+    fn browser_public_client_id_is_stable() {
+        // The AS matches this literal; a drift here breaks the wire contract.
+        assert_eq!(BROWSER_PUBLIC_CLIENT_ID, "hyprstream-browser-vfs");
+        assert!(!BROWSER_PUBLIC_CLIENT_ID.is_empty());
     }
 
     #[test]
@@ -426,6 +513,7 @@ mod tests {
         let t = parse_exchange_response(body).unwrap();
         assert_eq!(t.access_token, "aaa.bbb.ccc");
         assert_eq!(t.expires_in, 300);
+        assert_eq!(t.token_type, TokenType::Bearer);
     }
 
     #[test]
@@ -434,6 +522,8 @@ mod tests {
         let t = parse_exchange_response(body).unwrap();
         assert_eq!(t.access_token, "x.y.z");
         assert_eq!(t.expires_in, 0);
+        // Omitted token_type defaults to Bearer (pre-#1424 endpoint shape).
+        assert_eq!(t.token_type, TokenType::Bearer);
     }
 
     #[test]
@@ -443,9 +533,21 @@ mod tests {
     }
 
     #[test]
-    fn parse_rejects_non_bearer_token_type() {
-        let body = r#"{"access_token":"x","token_type":"DPoP","expires_in":300}"#;
+    fn parse_rejects_unknown_token_type() {
+        // #1425: only Bearer and DPoP are accepted; an unexpected token_type
+        // must not be treated as a usable credential.
+        let body = r#"{"access_token":"x","token_type":"N_A","expires_in":300}"#;
         assert!(parse_exchange_response(body).is_err());
+    }
+
+    #[test]
+    fn parse_accepts_dpop_token_type() {
+        // #1425: the sender-bound exchange returns token_type: DPoP. The
+        // client must accept it (and downstream requests must carry a proof).
+        let body = r#"{"access_token":"x.y.z","issued_token_type":"urn:ietf:params:oauth:token-type:access_token","token_type":"DPoP","expires_in":300}"#;
+        let t = parse_exchange_response(body).unwrap();
+        assert_eq!(t.access_token, "x.y.z");
+        assert_eq!(t.token_type, TokenType::Dpop);
     }
 
     #[test]
@@ -484,6 +586,7 @@ mod tests {
         let t = ExchangedToken {
             access_token: "secret-bearer-value".to_owned(),
             expires_in: 300,
+            token_type: TokenType::Bearer,
         };
         let rendered = format!("{t:?}");
         assert!(

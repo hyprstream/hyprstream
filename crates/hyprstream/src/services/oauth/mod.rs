@@ -2930,6 +2930,181 @@ mod tests {
         assert_eq!(valid_exchange_claims["sub"], "scope-valid-user");
         assert_eq!(valid_exchange_claims["scope"], "read:*:*");
 
+        // ── #1425: browser RFC 8693 sender-bound exchange contract ────────────
+        //
+        // Wire-level coverage of the DPoP+cnf.jkt browser exchange: positive
+        // (client_id + DPoP → DPoP-bound token), and negatives (missing proof,
+        // audience substitution, replayed jti). The request body is the exact
+        // form the WASM client sends — built via `exchange_form_body`
+        // (grant_type, subject_token, subject_token_type, client_id) — so the
+        // contract is tested against the frontend's generated request, not a
+        // Rust-local fixture.
+        use rand::Rng as _;
+        use hyprstream_rpc::auth::{jwk_thumbprint, JwkThumbprintInput};
+        use hyprstream_rpc::wasm_token_exchange::BROWSER_PUBLIC_CLIENT_ID;
+        let browser_subject = state
+            .policy_client
+            .issue_token(&IssueToken {
+                requested_scopes: Some(vec!["read:*:*".to_owned()]),
+                ttl: Some(300),
+                audience: Some(ISSUER.to_owned()),
+                subject: Some("browser-user".to_owned()),
+                user_pub_key: None,
+                dpop_jkt: None,
+                issuer: None,
+                tenant: Some("example.test".to_owned()),
+                require_clearance: false,
+            })
+            .await?
+            .token;
+        let browser_dpop_key = p256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
+        let browser_point = browser_dpop_key.verifying_key().to_encoded_point(false);
+        let browser_x: [u8; 32] = browser_point.x().unwrap().as_slice().try_into().unwrap();
+        let browser_y: [u8; 32] = browser_point.y().unwrap().as_slice().try_into().unwrap();
+        let expected_browser_jkt = jwk_thumbprint(&JwkThumbprintInput::Es256 {
+            x: &browser_x,
+            y: &browser_y,
+        });
+        let token_endpoint_url = format!("{ISSUER}/oauth/token");
+        // Each exchange needs a fresh DPoP jti (the jti is single-use); the
+        // proof KEY is constant, so cnf.jkt is stable across all of them.
+        let fresh_browser_proof = || -> String {
+            let jti = format!(
+                "browser-{}",
+                URL_SAFE_NO_PAD.encode(rand::rngs::OsRng.gen::<[u8; 8]>())
+            );
+            dpop_proof(&browser_dpop_key, &token_endpoint_url, &jti, None)
+        };
+
+        // Build the exact WASM request body (`exchange_form_body`) + an
+        // optional `audience` override, as owned pairs `post_form` accepts.
+        let browser_fields =
+            |subject: &str, audience: Option<&str>| -> Vec<(String, String)> {
+                let body = hyprstream_rpc::wasm_token_exchange::exchange_form_body(
+                    subject,
+                    "urn:ietf:params:oauth:token-type:access_token",
+                    BROWSER_PUBLIC_CLIENT_ID,
+                );
+                let mut pairs: Vec<(String, String)> =
+                    url::form_urlencoded::parse(body.as_bytes())
+                        .into_owned()
+                        .collect();
+                if let Some(aud) = audience {
+                    pairs.push(("audience".to_owned(), aud.to_owned()));
+                }
+                pairs
+            };
+        let str_slice = strs_of;
+        fn strs_of(pairs: &[(String, String)]) -> Vec<(&str, &str)> {
+            pairs.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect()
+        }
+
+        // Negative: no DPoP proof → sender binding is mandatory.
+        let np = browser_fields(&browser_subject, Some(ISSUER));
+        let np_refs = str_slice(&np);
+        let no_proof = post_form(&app, "/oauth/token", &np_refs, None, false).await;
+        assert_eq!(no_proof.status(), axum::http::StatusCode::BAD_REQUEST);
+        assert_eq!(response_json(no_proof).await["error"], "invalid_request");
+
+        // Negative: audience substitution → invalid_target. The browser token
+        // is restricted to the Hyprstream RPC service resource (the AS origin).
+        let ef = browser_fields(&browser_subject, Some("https://evil.example"));
+        let ef_refs = str_slice(&ef);
+        let evil_proof = fresh_browser_proof();
+        let evil = post_form(&app, "/oauth/token", &ef_refs, Some(&evil_proof), false).await;
+        assert_eq!(evil.status(), axum::http::StatusCode::BAD_REQUEST);
+        assert_eq!(response_json(evil).await["error"], "invalid_target");
+
+        // Positive: client_id + valid DPoP proof → DPoP-bound access token.
+        let pf = browser_fields(&browser_subject, Some(ISSUER));
+        let pf_refs = str_slice(&pf);
+        let ok_proof = fresh_browser_proof();
+        let browser_ok =
+            post_form(&app, "/oauth/token", &pf_refs, Some(&ok_proof), false).await;
+        assert_eq!(
+            browser_ok.status(),
+            axum::http::StatusCode::OK,
+            "browser exchange positive path must succeed"
+        );
+        // #1425 acceptance 5: no token leakage. The response is no-store and
+        // never echoes the token in a redirect/Location header.
+        assert_eq!(
+            browser_ok
+                .headers()
+                .get(axum::http::header::CACHE_CONTROL)
+                .and_then(|v| v.to_str().ok()),
+            Some("no-store")
+        );
+        assert!(browser_ok.headers().get(axum::http::header::LOCATION).is_none());
+        let browser_json = response_json(browser_ok).await;
+        assert_eq!(browser_json["token_type"].as_str(), Some("DPoP"));
+        assert_eq!(
+            browser_json["issued_token_type"].as_str(),
+            Some("urn:ietf:params:oauth:token-type:access_token")
+        );
+        // Access-token only: no refresh token (rotation is a separately
+        // reviewed, metadata-advertised policy).
+        assert!(
+            browser_json.get("refresh_token").is_none(),
+            "browser exchange must not issue a refresh token"
+        );
+        let browser_access = browser_json["access_token"].as_str().unwrap();
+        // The token never appears anywhere except the access_token field.
+        assert_eq!(
+            browser_json
+                .as_object()
+                .unwrap()
+                .iter()
+                .filter(|(_, v)| v.as_str().is_some_and(|s| s.contains(browser_access)))
+                .count(),
+            1,
+            "access_token must not be echoed in any other response field"
+        );
+        let browser_claims = jwt_claims(browser_access);
+        assert_eq!(browser_claims["sub"], "browser-user");
+        assert_eq!(
+            browser_claims["cnf"]["jkt"].as_str(),
+            Some(expected_browser_jkt.as_str()),
+            "minted token must be bound to the DPoP proof key (cnf.jkt)"
+        );
+        assert_eq!(
+            browser_claims["aud"].as_str(),
+            Some(ISSUER),
+            "issued token audience must be restricted to the RPC service resource"
+        );
+        // The "use" half of acceptance 3 (a DPoP-bound token cannot be used as
+        // a plain Bearer; a resource request needs a matching proof + ath) is
+        // enforced by the existing resource middleware in `auth.rs` the moment
+        // the exchange mints `cnf.jkt` — the binding just verified above. That
+        // enforcement has its own coverage in `auth.rs`; the #1425 deliverable
+        // is the exchange producing the binding.
+
+        // Negative: replayed DPoP proof (same jti) → invalid_dpop_proof.
+        // A fresh subject token avoids the subject-replay check.
+        let replay_subject = state
+            .policy_client
+            .issue_token(&IssueToken {
+                requested_scopes: Some(vec!["read:*:*".to_owned()]),
+                ttl: Some(300),
+                audience: Some(ISSUER.to_owned()),
+                subject: Some("browser-replay".to_owned()),
+                user_pub_key: None,
+                dpop_jkt: None,
+                issuer: None,
+                tenant: Some("example.test".to_owned()),
+                require_clearance: false,
+            })
+            .await?
+            .token;
+        let rf = browser_fields(&replay_subject, Some(ISSUER));
+        let rf_refs = str_slice(&rf);
+        // Reuse the positive proof's jti → single-use replay rejection.
+        let replay =
+            post_form(&app, "/oauth/token", &rf_refs, Some(&ok_proof), false).await;
+        assert_eq!(replay.status(), axum::http::StatusCode::BAD_REQUEST);
+        assert_eq!(response_json(replay).await["error"], "invalid_dpop_proof");
+
+
         // The real composite token minted above authenticates to a protected
         // OAuth route. This failed when middleware routed every JWT through
         // the fixed EdDSA key.
