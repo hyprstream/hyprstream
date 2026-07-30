@@ -736,7 +736,26 @@ impl WorkflowService {
         repo_id: &str,
         mode: super::parser::ParseMode,
     ) -> Result<()> {
+        // Phase 1: scan (blocking I/O in spawn_blocking).
         let workflows = self.scan_repo_with(repo_id, mode).await?;
+
+        // Revalidation guard (#1432 race fix): the blocking scan can outlive
+        // a concurrent explicit mode change. If an explicit Strict selection
+        // landed while we were scanning in Legacy, our Legacy results are
+        // stale — applying them would re-register workflows the strict
+        // selection rejected, leaving the registry fail-open. Discard.
+        let current_mode = self.repo_mode(repo_id).await;
+        if current_mode != mode {
+            tracing::info!(
+                repo_id = %repo_id,
+                scanned_mode = ?mode,
+                current_mode = ?current_mode,
+                "Discarding stale rescan results: repo mode changed during scan"
+            );
+            return Ok(());
+        }
+
+        // Phase 2: commit (evict + register) — mode unchanged since scan.
 
         // Fresh set of workflow ids for this repo, per the scan.
         let fresh_ids: HashSet<WorkflowId> = workflows
@@ -1450,6 +1469,52 @@ jobs:
             "after concurrent generic rescans interleaved with one explicit \
              strict selection, the stored mode must remain Strict — the \
              generic rescans must not have overwritten it"
+        );
+        Ok(())
+    }
+
+    // ─── Rev 7 P1: stale Legacy scan must not commit after explicit Strict ──
+
+    #[tokio::test]
+    async fn stale_legacy_scan_discarded_after_explicit_strict() -> TestResult {
+        // Deterministic race regression: a generic Legacy scan that read
+        // Legacy before an explicit Strict selection can finish its blocking
+        // scan AFTER the Strict selection committed. Without the revalidation
+        // guard, it would re-register legacy workflows (including the
+        // unknown-key one), leaving the registry fail-open until another
+        // rescan. The guard discards the stale results.
+        let tmp = tempfile::tempdir()?;
+        write_workflow(tmp.path(), UNKNOWN_KEY_YAML).await?;
+
+        let svc = test_service();
+        svc.register_repo_path("acme", PathBuf::from(tmp.path())).await;
+
+        // Explicit Strict runs first and completes.
+        svc.rescan_repo_with("acme", super::super::parser::ParseMode::Strict)
+            .await?;
+        // Strict skips the unknown-key workflow → registry has no acme entry.
+        let acme_entries: Vec<_> = workflow_ids(&svc.list_workflows().await?)
+            .into_iter()
+            .filter(|id| id.starts_with("acme:"))
+            .collect();
+        assert!(
+            acme_entries.is_empty(),
+            "strict selection should skip the unknown-key workflow"
+        );
+
+        // Simulate the stale Legacy scan finishing after Strict. Call
+        // rescan_inner directly with Legacy (as if the generic path read
+        // Legacy before the Strict selection). The revalidation guard must
+        // detect the mode changed (Legacy → Strict) and discard.
+        svc.rescan_inner("acme", super::super::parser::ParseMode::Legacy)
+            .await?;
+
+        // Registry must STILL be strict — no extra rescan needed.
+        let wf_id = String::from("acme:.github/workflows/gate.yml");
+        assert!(
+            !workflow_ids(&svc.list_workflows().await?).contains(&wf_id),
+            "stale Legacy scan must be discarded: registry stays strict \
+             immediately after the interleaving, no extra rescan required"
         );
         Ok(())
     }
