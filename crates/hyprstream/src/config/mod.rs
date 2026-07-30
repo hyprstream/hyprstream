@@ -1476,24 +1476,16 @@ pub enum CredentialsBackend {
 }
 
 fn default_credentials_backend() -> CredentialsBackend {
-    #[cfg(feature = "credential-pds")]
-    {
-        CredentialsBackend::Pglite
-    }
-    #[cfg(not(feature = "credential-pds"))]
-    {
-        CredentialsBackend::Rocksdb
-    }
+    CredentialsBackend::Pglite
 }
 
 impl CredentialsBackend {
-    /// The credential/PDS production profile must never select a backend that
-    /// can persist the protected UserStore columns as plaintext.
+    /// Production must never select a backend that can persist protected
+    /// UserStore columns as plaintext.
     pub fn ensure_allowed_for_build(self) -> anyhow::Result<()> {
-        #[cfg(feature = "credential-pds")]
         anyhow::ensure!(
             self == Self::Pglite,
-            "credential-pds requires credentials.backend = \"pglite\""
+            "encrypted credential storage requires credentials.backend = \"pglite\""
         );
         Ok(())
     }
@@ -3073,20 +3065,14 @@ mod tests {
     fn credentials_backend_default_matches_build_profile() {
         let config: CredentialsConfig =
             toml::from_str("").unwrap_or_else(|error| panic!("{error}"));
-        #[cfg(feature = "credential-pds")]
         assert_eq!(config.backend, CredentialsBackend::Pglite);
-        #[cfg(not(feature = "credential-pds"))]
-        assert_eq!(config.backend, CredentialsBackend::Rocksdb);
     }
 
     #[test]
     fn credential_pds_rejects_plaintext_capable_backends() {
-        #[cfg(feature = "credential-pds")]
-        {
-            assert!(CredentialsBackend::Pglite.ensure_allowed_for_build().is_ok());
-            assert!(CredentialsBackend::Rocksdb.ensure_allowed_for_build().is_err());
-            assert!(CredentialsBackend::Valkey.ensure_allowed_for_build().is_err());
-        }
+        assert!(CredentialsBackend::Pglite.ensure_allowed_for_build().is_ok());
+        assert!(CredentialsBackend::Rocksdb.ensure_allowed_for_build().is_err());
+        assert!(CredentialsBackend::Valkey.ensure_allowed_for_build().is_err());
     }
 
     #[test]
