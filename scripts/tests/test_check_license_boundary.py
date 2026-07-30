@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 import tempfile
@@ -146,6 +147,20 @@ class LicenseBoundaryFixtures(unittest.TestCase):
         result = self.run_fixture(
             apache_manifest='[dependencies]\nmiddle = { path = "../middle" }\n'
         )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_fixture_ignores_missing_parent_rustc_wrapper(self) -> None:
+        original = os.environ.get("RUSTC_WRAPPER")
+        os.environ["RUSTC_WRAPPER"] = "missing-ci-sccache"
+        try:
+            result = self.run_fixture(
+                apache_manifest='[dependencies]\nmiddle = { path = "../middle" }\n'
+            )
+        finally:
+            if original is None:
+                os.environ.pop("RUSTC_WRAPPER", None)
+            else:
+                os.environ["RUSTC_WRAPPER"] = original
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_direct_apache_root_dependency_fails(self) -> None:

@@ -45,12 +45,19 @@ def cargo_workspace_manifest_paths(root: Path) -> set[Path]:
         command.insert(len(cargo) + 4, "--locked")
     else:
         command.remove("--no-deps")
+    # The license-boundary checker is metadata-only.  Its fixture subprocesses
+    # must not inherit a workflow-level compiler wrapper: the hosted deny job
+    # deliberately does not install sccache, and Cargo still consults
+    # RUSTC_WRAPPER while probing rustc for `cargo metadata`.
+    environment = os.environ.copy()
+    environment.pop("RUSTC_WRAPPER", None)
     result = subprocess.run(
         command,
         cwd=root,
         text=True,
         capture_output=True,
         check=False,
+        env=environment,
     )
     if result.returncode:
         fail(f"cargo metadata failed: {result.stderr.strip()}")
