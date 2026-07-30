@@ -36,14 +36,24 @@
 //! - default (no features): CRD *type* definitions, schema derivation, CEL
 //!   validation and YAML emission — all compile with no cluster present.
 //! - `k8s`: pulls in the kube client + controller-runtime for code that needs a
-//!   live API server (see [`install`]). CRD types never require it.
+//!   live API server (see the `install` module). CRD types never require it.
 //! - `grant`: exposes only the service-neutral [`grant::TenantGrantService`]
 //!   boundary and generic TenantBinding status projection. Authority-bearing
 //!   signing and PDS allocation behavior moved to the downstream,
-//!   AGPL-licensed `hyprstream-k8s-pds` crate in #1422. Callers migrate
-//!   `hyprstream_k8s::grant::TenantGrantIssuer` to
-//!   `hyprstream_k8s_pds::TenantGrantIssuer` and pass it through
-//!   `operator::run_operator_with_grant_service` with both features enabled.
+//!   AGPL-licensed `hyprstream-k8s-pds` crate in #1422.
+//!
+//!   | Previous path | New path |
+//!   | --- | --- |
+//!   | `hyprstream_k8s::grant::TenantGrantIssuer` | `hyprstream_k8s_pds::TenantGrantIssuer` |
+//!   | `hyprstream_k8s::grant::TenantGrantVerifier` | `hyprstream_k8s_pds::TenantGrantVerifier` |
+//!   | `hyprstream_k8s::grant::CompiledTenantGrant` | `hyprstream_k8s_pds::CompiledTenantGrant` |
+//!   | `hyprstream_k8s::grant::VerifiedTenantGrant` | `hyprstream_k8s_pds::VerifiedTenantGrant` |
+//!   | `hyprstream_k8s::grant::TENANT_GRANT_ED25519_PURPOSE` | `hyprstream_k8s_pds::TENANT_GRANT_ED25519_PURPOSE` |
+//!   | `hyprstream_k8s::grant::TENANT_GRANT_ABILITY` | `hyprstream_k8s_pds::TENANT_GRANT_ABILITY` |
+//!   | `hyprstream_k8s::grant::now_unix` | `hyprstream_k8s_pds::now_unix` for adapter callers; the substrate helper remains at its old path |
+//!   | `operator::run_operator_with_grant_issuer` | `operator::run_operator_with_grant_service` |
+//!
+//!   The adapter crate documents a compiling downstream composition example.
 //!
 //! All CRDs are `v1alpha1`; the conversion/upgrade path to a future stored
 //! version is noted per-resource and is out of scope for this crate (K5b owns

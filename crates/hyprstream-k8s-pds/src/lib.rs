@@ -39,6 +39,22 @@
 //! - **S6 short-ttl sender-bound (DPoP) renewal** — greenfield (#921 gap 2);
 //!   the `epoch` counter on the allocation record is the revocation handle
 //!   until the renewal layer exists.
+//!
+//! ## Downstream composition
+//!
+//! The Apache substrate depends only on its service-neutral contract. A
+//! downstream binary opts into this AGPL adapter and passes the issuer through
+//! that contract:
+//!
+//! ```
+//! use std::sync::Arc;
+//! use hyprstream_k8s::grant::TenantGrantService;
+//! use hyprstream_k8s_pds::TenantGrantIssuer;
+//!
+//! fn grant_service(issuer: TenantGrantIssuer) -> Arc<dyn TenantGrantService> {
+//!     Arc::new(issuer)
+//! }
+//! ```
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -707,13 +723,10 @@ impl TenantGrantService for TenantGrantIssuer {
         epoch: u64,
         now: u64,
     ) -> Result<TenantGrantArtifacts, TenantGrantServiceError> {
-        self.compile(binding, epoch, now)
-            .map(|compiled| TenantGrantArtifacts {
-                grant_cid: compiled.grant_cid,
-                allocation_cid: compiled.allocation_cid,
-                epoch: compiled.epoch,
-            })
-            .map_err(|error| TenantGrantServiceError::new(format!("{error:#}")))
+        let compiled = self
+            .compile(binding, epoch, now)
+            .map_err(|error| TenantGrantServiceError::new(format!("{error:#}")))?;
+        TenantGrantArtifacts::new(compiled.grant_cid, compiled.allocation_cid, compiled.epoch)
     }
 }
 

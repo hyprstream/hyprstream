@@ -666,8 +666,12 @@ fn tenant_binding_status_up_to_date(binding: &TenantBinding, epoch: u64) -> bool
     match binding.spec.entitlement.as_ref() {
         Some(_) => {
             status.epoch == Some(epoch)
-                && status.grant_cid.as_ref().is_some()
-                && status.allocation_cid.as_ref().is_some()
+                && status.grant_cid.as_ref().is_some_and(|reference| {
+                    crate::grant::ContentReference::parse(reference.clone()).is_ok()
+                })
+                && status.allocation_cid.as_ref().is_some_and(|reference| {
+                    crate::grant::ContentReference::parse(reference.clone()).is_ok()
+                })
         }
         None => status.grant_cid.as_ref().is_none(),
     }
@@ -2516,6 +2520,7 @@ mod tests {
     /// Build a TenantBinding whose status claims a grant compiled at `epoch`.
     #[cfg(feature = "grant")]
     fn bound_with_grant(observed_generation: Option<i64>, epoch: Option<u64>) -> TenantBinding {
+        const VALID_CID: &str = "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3g3gd3lst2gq2r2a6y4m5x4zi";
         let mut binding = TenantBinding::new(
             "tb",
             TenantBindingSpec {
@@ -2534,8 +2539,8 @@ mod tests {
             phase: Some("Bound".to_owned()),
             message: None,
             observed_generation,
-            grant_cid: Some("bafyreibafyreibafyreibafyreibafyre".to_owned()),
-            allocation_cid: Some("bafyreibafyreibafyreibafyreibafyre".to_owned()),
+            grant_cid: Some(VALID_CID.to_owned()),
+            allocation_cid: Some(VALID_CID.to_owned()),
             epoch,
         });
         // meta().generation defaults to None on a ::new binding; align it with
@@ -2595,6 +2600,33 @@ mod tests {
             !tenant_binding_status_up_to_date(&binding, 7),
             "a missing allocation CID must force a recompile"
         );
+    }
+
+    #[cfg(feature = "grant")]
+    #[test]
+    fn grant_status_malformed_references_force_recompile() {
+        for (grant, allocation) in [
+            ("", "not-a-cid"),
+            (" ", "not-a-cid"),
+            (
+                "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3g3gd3lst2gq2r2a6y4m5x4zi",
+                "",
+            ),
+            (
+                "not-a-cid",
+                "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3g3gd3lst2gq2r2a6y4m5x4zi",
+            ),
+        ] {
+            let mut binding = bound_with_grant(Some(3), Some(7));
+            if let Some(status) = binding.status.as_mut() {
+                status.grant_cid = Some(grant.to_owned());
+                status.allocation_cid = Some(allocation.to_owned());
+            }
+            assert!(
+                !tenant_binding_status_up_to_date(&binding, 7),
+                "malformed status unexpectedly remained current: {grant:?}, {allocation:?}"
+            );
+        }
     }
 
     #[cfg(feature = "grant")]

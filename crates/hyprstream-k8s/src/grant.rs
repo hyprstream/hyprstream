@@ -9,19 +9,91 @@
 use std::fmt;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use cid::Cid;
 use kube::Resource;
 
 use crate::mesh::{TenantBinding, TenantBindingStatus};
 
-/// Opaque references produced by a service-specific grant compiler.
+/// A validated, canonical content identifier.
+///
+/// This service-neutral type validates only the content-addressing envelope:
+/// it deliberately knows nothing about UCANs, PDS records, or how their bytes
+/// are produced. Keeping the inner string private makes malformed successful
+/// service results unrepresentable.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ContentReference(String);
+
+impl ContentReference {
+    /// Parse a canonical CID string.
+    pub fn parse(value: impl Into<String>) -> Result<Self, TenantGrantServiceError> {
+        let value = value.into();
+        if value.trim() != value {
+            return Err(TenantGrantServiceError::new(
+                "content reference must not contain surrounding whitespace",
+            ));
+        }
+        let parsed = Cid::try_from(value.as_str()).map_err(|error| {
+            TenantGrantServiceError::new(format!("invalid content reference: {error}"))
+        })?;
+        if parsed.to_string() != value {
+            return Err(TenantGrantServiceError::new(
+                "content reference must use canonical CID encoding",
+            ));
+        }
+        Ok(Self(value))
+    }
+
+    /// Borrow the canonical CID string.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    fn into_string(self) -> String {
+        self.0
+    }
+}
+
+/// Validated references produced by a service-specific grant compiler.
 ///
 /// The Kubernetes substrate records these values as observed status but never
 /// interprets their service-specific contents.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TenantGrantArtifacts {
-    pub grant_cid: String,
-    pub allocation_cid: String,
-    pub epoch: u64,
+    grant_cid: ContentReference,
+    allocation_cid: ContentReference,
+    epoch: u64,
+}
+
+impl TenantGrantArtifacts {
+    /// Validate both references before constructing a successful artifact pair.
+    pub fn new(
+        grant_cid: impl Into<String>,
+        allocation_cid: impl Into<String>,
+        epoch: u64,
+    ) -> Result<Self, TenantGrantServiceError> {
+        let grant_cid = ContentReference::parse(grant_cid)?;
+        let allocation_cid = ContentReference::parse(allocation_cid)?;
+        Ok(Self {
+            grant_cid,
+            allocation_cid,
+            epoch,
+        })
+    }
+
+    /// The validated grant CID.
+    pub fn grant_cid(&self) -> &ContentReference {
+        &self.grant_cid
+    }
+
+    /// The validated allocation CID.
+    pub fn allocation_cid(&self) -> &ContentReference {
+        &self.allocation_cid
+    }
+
+    /// The revocation epoch the service compiled.
+    pub fn epoch(&self) -> u64 {
+        self.epoch
+    }
 }
 
 /// A fail-closed service error safe to reflect in Kubernetes status.
@@ -88,25 +160,33 @@ pub fn compile_tenant_binding_status(
                 "entitlement present but operator has no tenant-grant service configured",
             ),
             Some(service) => match service.compile_grant(binding, epoch, now) {
-                Ok(compiled) if compiled.epoch != epoch => rejected_status(
+                Ok(compiled) if compiled.epoch() != epoch => rejected_status(
                     generation,
                     &format!(
                         "grant compilation failed: service returned epoch {} for requested epoch {epoch}",
-                        compiled.epoch
+                        compiled.epoch()
                     ),
                 ),
-                Ok(compiled) => TenantBindingStatus {
-                    bound: Some(true),
-                    phase: Some("Bound".to_owned()),
-                    message: Some(format!(
-                        "compiled grant {} (allocation {}); PDS publish pending #910",
-                        compiled.grant_cid, compiled.allocation_cid
-                    )),
-                    observed_generation: generation,
-                    grant_cid: Some(compiled.grant_cid),
-                    allocation_cid: Some(compiled.allocation_cid),
-                    epoch: Some(compiled.epoch),
-                },
+                Ok(compiled) => {
+                    let TenantGrantArtifacts {
+                        grant_cid,
+                        allocation_cid,
+                        epoch,
+                    } = compiled;
+                    TenantBindingStatus {
+                        bound: Some(true),
+                        phase: Some("Bound".to_owned()),
+                        message: Some(format!(
+                            "compiled grant {} (allocation {}); PDS publish pending #910",
+                            grant_cid.as_str(),
+                            allocation_cid.as_str()
+                        )),
+                        observed_generation: generation,
+                        grant_cid: Some(grant_cid.into_string()),
+                        allocation_cid: Some(allocation_cid.into_string()),
+                        epoch: Some(epoch),
+                    }
+                }
                 Err(error) => {
                     rejected_status(generation, &format!("grant compilation failed: {error}"))
                 }
@@ -145,6 +225,8 @@ mod tests {
     use super::*;
     use crate::mesh::{TenantBindingSpec, TenantEntitlement, TenantGrantClass};
 
+    const VALID_CID: &str = "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3g3gd3lst2gq2r2a6y4m5x4zi";
+
     struct RecordingService;
 
     impl TenantGrantService for RecordingService {
@@ -157,11 +239,7 @@ mod tests {
             assert_eq!(binding.spec.tenant, "did:web:acme");
             assert_eq!(epoch, 7);
             assert_eq!(now, 1_700_000_000);
-            Ok(TenantGrantArtifacts {
-                grant_cid: "bafy-grant".to_owned(),
-                allocation_cid: "bafy-allocation".to_owned(),
-                epoch,
-            })
+            TenantGrantArtifacts::new(VALID_CID, VALID_CID, epoch)
         }
     }
 
@@ -196,8 +274,8 @@ mod tests {
             1_700_000_000,
         );
         assert_eq!(compiled.bound, Some(true));
-        assert_eq!(compiled.grant_cid.as_deref(), Some("bafy-grant"));
-        assert_eq!(compiled.allocation_cid.as_deref(), Some("bafy-allocation"));
+        assert_eq!(compiled.grant_cid.as_deref(), Some(VALID_CID));
+        assert_eq!(compiled.allocation_cid.as_deref(), Some(VALID_CID));
         assert_eq!(compiled.epoch, Some(7));
     }
 
@@ -242,11 +320,7 @@ mod tests {
             epoch: u64,
             _now: u64,
         ) -> Result<TenantGrantArtifacts, TenantGrantServiceError> {
-            Ok(TenantGrantArtifacts {
-                grant_cid: "bafy-grant".to_owned(),
-                allocation_cid: "bafy-allocation".to_owned(),
-                epoch: epoch + 1,
-            })
+            TenantGrantArtifacts::new(VALID_CID, VALID_CID, epoch + 1)
         }
     }
 
@@ -263,5 +337,23 @@ mod tests {
         assert!(status.grant_cid.is_none());
         assert!(status.allocation_cid.is_none());
         assert!(status.epoch.is_none());
+    }
+
+    #[test]
+    fn malformed_artifact_pairs_are_unrepresentable() {
+        for (grant, allocation) in [
+            ("", VALID_CID),
+            (" ", VALID_CID),
+            ("not-a-cid", VALID_CID),
+            (VALID_CID, ""),
+            (VALID_CID, "\t"),
+            (VALID_CID, "not-a-cid"),
+            (" not-a-cid", "not-a-cid "),
+        ] {
+            assert!(
+                TenantGrantArtifacts::new(grant, allocation, 7).is_err(),
+                "malformed pair unexpectedly accepted: {grant:?}, {allocation:?}"
+            );
+        }
     }
 }
