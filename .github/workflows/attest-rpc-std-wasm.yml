@@ -1,0 +1,54 @@
+name: Attest browser WASM tarball
+
+# Deliberately a SEPARATE workflow filename from publish-rpc-std-wasm.yml. The
+# npm trusted publisher for @hyprstream/rpc is bound to publish-rpc-std-wasm.yml
+# (plus the npm-staging environment), so THIS workflow's OIDC identity can NEVER
+# satisfy npm's publisher policy — it can only mint a GitHub artifact
+# attestation. This is the required isolation: the build job (which runs
+# untrusted repository build code) no longer holds id-token, and the only job
+# that mints an npm-accepted identity is the post-approval publish job. This
+# workflow never executes repository build code and never publishes; it only
+# attests an already-built tarball downloaded from the build run.
+#
+# NOTE: like all `workflow_run` triggers, this runs the workflow definition from
+# the repository DEFAULT branch, so it only takes effect after this file is
+# merged to main. It is a provenance convenience, not a publish gate; npm's own
+# `--provenance` remains the registry-side Sigstore evidence.
+on:
+  workflow_run:
+    workflows: ['Publish browser WASM SDK']
+    types: [completed]
+
+permissions:
+  contents: read
+
+jobs:
+  attest-tarball:
+    name: Attest packed tarball provenance (isolated trust domain)
+    if: github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - name: Download the exact packed tarball from the build run
+        uses: actions/download-artifact@v4
+        with:
+          name: hyprstream-rpc-std-wasm-${{ github.event.workflow_run.head_sha }}
+          path: dist/hyprstream-rpc-std-wasm
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Confirm the artifact contains exactly one tarball + evidence
+        run: |
+          set -euo pipefail
+          mapfile -t tgzs < <(find dist/hyprstream-rpc-std-wasm -maxdepth 1 -type f -name '*.tgz' -print)
+          if [[ ${#tgzs[@]} -ne 1 ]]; then
+            echo "expected exactly one tarball to attest, found ${#tgzs[@]}" >&2
+            exit 1
+          fi
+          test -f dist/hyprstream-rpc-std-wasm/integrity.json
+      - name: Attest packed tarball provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: dist/hyprstream-rpc-std-wasm/*.tgz

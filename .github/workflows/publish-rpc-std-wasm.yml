@@ -1,18 +1,30 @@
 name: Publish browser WASM SDK
 
 # This workflow can NEVER publish merely because a PR merged into main.
-#   - pull_request: build, pack, and smoke-test only (no publish).
-#   - push to main : build, pack, smoke, attest, and expose the exact
-#                    deterministic staging artifact identity — but DO NOT
-#                    publish. The identity is surfaced so a human can review it
-#                    before any publish is authorized.
-#   - push tag     : build + publish immutable production semver (protected
-#                    npm-production environment + exact release tag).
+#   - pull_request: build, pack, and smoke-test only (no publish, no id-token).
+#   - push to main : build, pack, smoke, and expose the exact deterministic
+#                    staging artifact identity — but DO NOT publish. (The tarball
+#                    attestation runs in a SEPARATE workflow file,
+#                    attest-rpc-std-wasm.yml, so its id-token cannot satisfy
+#                    npm's trusted publisher bound to THIS filename.)
+#   - push tag     : build + publish immutable production semver (exact release
+#                    tag).
 #   - workflow_dispatch (main only): the ONLY way to publish staging. Requires
-#                    the operator to pre-state the exact version and SHA-256
-#                    the build must reproduce, then rebuilds, verifies the
-#                    rebuilt tarball matches both inputs bit-for-bit, and only
-#                    then asks the protected npm-staging environment to publish.
+#                    the operator to pre-state the exact version and SHA-256 the
+#                    build must reproduce, then rebuilds, verifies the rebuilt
+#                    tarball's MANIFEST and hashes match both inputs bit-for-bit,
+#                    and only then publishes.
+#
+# EXTERNAL PREREQUISITES (not facts; must be created and re-verified by the
+# release owner before any publish succeeds — none are created from this source
+# lane): (1) an npm trusted publisher for @hyprstream/rpc bound to THIS workflow
+# filename plus the `npm-staging` environment (one publisher per package, so
+# staging is the single authorized lane); (2) a GitHub `npm-staging` environment
+# with required independent reviewers, no self-review/bypass, restricted to the
+# `main` branch; (3) for production, a separate `npm-production` environment and
+# an active tag ruleset protecting `hyprstream-rpc-v*` (production is NOT
+# authorized by the current staging-only binding and will fail closed at npm
+# until separately configured).
 on:
   pull_request:
     paths:
@@ -22,6 +34,7 @@ on:
       - '.github/scripts/package-rpc-std-wasm.sh'
       - '.github/scripts/verify-rpc-std-wasm-package.mjs'
       - '.github/workflows/publish-rpc-std-wasm.yml'
+      - '.github/workflows/attest-rpc-std-wasm.yml'
       - 'Cargo.lock'
       - 'rust-toolchain.toml'
   push:
@@ -30,15 +43,15 @@ on:
   workflow_dispatch:
     inputs:
       expected_version:
-        description: 'Exact staging version the rebuilt tarball must carry (copy from the expose-staging-identity job summary on main, e.g. 0.1.0-dev.1234.48fa145a56eb). Publish is refused if the rebuilt artifact differs.'
+        description: 'Exact staging version the rebuilt tarball MANIFEST must carry (copy from the expose-staging-identity job summary on main, e.g. 0.1.0-dev.1234.48fa145a56eb). Publish is refused if the rebuilt artifact differs.'
         required: true
       expected_sha256:
         description: 'Exact hex SHA-256 the rebuilt tarball must have (copy from the expose-staging-identity job summary on main). Publish is refused if the rebuilt artifact differs.'
         required: true
 
-# Build/PR/identity jobs cannot publish. Each publishing job receives only an
-# ephemeral GitHub OIDC identity for npm trusted publishing; no npm token is
-# supported and there is no token fallback.
+# The default grant is contents:read with NO id-token. Only the publish jobs
+# below escalate to id-token: write for npm trusted publishing (OIDC); there is
+# no npm token and no token fallback.
 permissions:
   contents: read
 
@@ -55,9 +68,14 @@ jobs:
     name: Build once, package, and test clean install
     runs-on: ubuntu-latest
     permissions:
+      # Deliberately NO id-token: write. This job executes untrusted repository
+      # build code (the wasm-pack/cargo build graph). With id-token it could mint
+      # the workflow-scoped OIDC JWT that npm trusted publishing matches, so it
+      # must not hold it. Only the post-approval publish jobs below may mint an
+      # npm-accepted identity. Tarball attestation lives in a SEPARATE workflow
+      # file (attest-rpc-std-wasm.yml) whose identity cannot satisfy npm's
+      # publisher policy (which binds this filename + the npm-staging env).
       contents: read
-      id-token: write
-      attestations: write
     steps:
       - uses: actions/checkout@v4
         with:
@@ -101,14 +119,12 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
-      # npm publish --provenance supplies registry-side Sigstore evidence. This
-      # additional GitHub attestation covers the pre-publish tarball consumed by
-      # downstream www and can be verified before a registry publication exists.
-      - name: Attest packaged tarball provenance
-        if: github.event_name == 'push'
-        uses: actions/attest-build-provenance@v2
-        with:
-          subject-path: dist/hyprstream-rpc-std-wasm/*.tgz
+      # NOTE: tarball provenance attestation is intentionally NOT performed in
+      # this job. It needs id-token: write, which this build job must not hold.
+      # The attestation runs in a separate workflow file
+      # (.github/workflows/attest-rpc-std-wasm.yml) triggered after this build,
+      # whose workflow identity cannot satisfy the npm trusted publisher (bound
+      # to THIS filename + the npm-staging environment).
 
   # Read-only identity exposure. This job performs NO registry write and holds
   # no id-token. It surfaces the exact deterministic staging version, tarball
@@ -183,12 +199,14 @@ jobs:
           ].join('\n') + '\n');
           NODE
 
-  # Manual staging gate. This job NEVER runs from a push (so merging the PR
-  # cannot publish). It only runs from an explicit workflow_dispatch on main,
-  # requires the operator to pre-state the exact version and SHA-256, and only
-  # publishes after the rebuilt artifact matches both the pre-statement and the
-  # freshly exposed identity — and after the protected npm-staging environment
-  # (required reviewers) approves. Tokenless npm Trusted Publishing/OIDC only.
+  # Manual staging gate — the ONLY job permitted to mint an npm-accepted OIDC
+  # identity for @hyprstream/rpc. It NEVER runs from a push (so merging the PR
+  # cannot publish); it only runs from an explicit workflow_dispatch on main. It
+  # requires the operator to pre-state the exact version and SHA-256, then
+  # verifies the rebuilt tarball's OWN manifest name/version plus its hashes
+  # against both the pre-statement and the freshly exposed identity, and only
+  # then publishes — inside the npm-staging environment (which the npm trusted
+  # publisher binds as the single authorized lane). Tokenless OIDC only.
   publish-staging:
     name: Publish main to staging dist-tag (manual gate)
     if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
@@ -211,7 +229,7 @@ jobs:
         with:
           name: hyprstream-rpc-std-wasm-${{ github.sha }}
           path: dist/hyprstream-rpc-std-wasm
-      - name: Verify channel, ref, integrity, and operator pre-statement
+      - name: Verify tarball manifest, channel, ref, hashes, and operator pre-statement
         id: package
         env:
           EXPECTED_VERSION: ${{ github.event.inputs.expected_version }}
