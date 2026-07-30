@@ -127,12 +127,13 @@ pub struct WorkflowService {
     /// local bootstrap key is trusted; federated JWTs are rejected.
     jwt_key_source: Option<std::sync::Arc<dyn hyprstream_rpc::auth::JwtKeySource>>,
 
-    /// Independently-pinned MCP relay verifying key. Only envelopes signed by
-    /// this key are accepted as delegated-bearer relays (#989 review:
+    /// Independently-scoped MCP relay verifying keys. Only envelopes signed by
+    /// one of these keys are accepted as delegated-bearer relays (#989 review:
     /// `accept_delegated_bearer` defaults to `false`, so `verify_claims`
-    /// rejects relayed caller tokens before policy). `None` ⇒ fail-closed
-    /// (no delegation accepted) until the factory pins the MCP key.
-    mcp_relay_pubkey: Option<[u8; 32]>,
+    /// rejects relayed caller tokens before policy). Supports the full
+    /// authorized key set (rotation / HA); empty ⇒ fail-closed (no delegation
+    /// accepted).
+    mcp_relay_pubkeys: Vec<[u8; 32]>,
 
     /// Workflow execution engine
     runner: Option<WorkflowRunner>,
@@ -162,7 +163,7 @@ impl WorkflowService {
             authorize_fn: None,
             expected_audience: None,
             jwt_key_source: None,
-            mcp_relay_pubkey: None,
+            mcp_relay_pubkeys: Vec::new(),
             runner: None,
         }
     }
@@ -236,12 +237,12 @@ impl WorkflowService {
         self.jwt_key_source = Some(src);
     }
 
-    /// Pin the MCP relay verifying key so delegated-bearer requests signed by
-    /// the MCP service are accepted at `verify_claims` (#989 review). Without
-    /// this, `accept_delegated_bearer` stays `false` and every relayed caller
-    /// token is rejected before the policy callback runs.
-    pub fn set_mcp_relay_pubkey(&mut self, pubkey: [u8; 32]) {
-        self.mcp_relay_pubkey = Some(pubkey);
+    /// Pin the authorized MCP relay key set so delegated-bearer requests signed
+    /// by any currently authorized MCP key are accepted at `verify_claims`
+    /// (#989 review). Supports the full set (rotation / HA); empty ⇒ fail-closed
+    /// (no delegation accepted) until the factory populates it.
+    pub fn set_mcp_relay_pubkeys(&mut self, pubkeys: Vec<[u8; 32]>) {
+        self.mcp_relay_pubkeys = pubkeys;
     }
 
     /// Initialize the service: scan all registered repos and register their workflows.
@@ -911,15 +912,13 @@ impl RequestService for WorkflowService {
         self.jwt_key_source.clone()
     }
 
-    /// Accept delegated-bearer requests only from the independently-pinned MCP
-    /// relay key (#989 review). `verify_claims` calls this before policy; the
-    /// default `false` rejects all relayed caller tokens. We return `true`
-    /// solely for the pinned MCP key — fail-closed for every other signer and
-    /// when no relay is pinned.
+    /// Accept delegated-bearer requests only from an independently-scoped MCP
+    /// relay key in the authorized set (#989 review). `verify_claims` calls this
+    /// before policy; the default `false` rejects all relayed caller tokens. We
+    /// return `true` solely for a key in the pinned set — fail-closed for every
+    /// other signer and when the set is empty (no MCP keys authorized).
     fn accept_delegated_bearer(&self, signer_pubkey: &[u8; 32]) -> bool {
-        self.mcp_relay_pubkey
-            .map(|pinned| signer_pubkey == &pinned)
-            .unwrap_or(false)
+        self.mcp_relay_pubkeys.iter().any(|k| signer_pubkey == k)
     }
 }
 
@@ -985,12 +984,12 @@ mod tests {
     /// `jwt_key_source` half follows the identical field→setter→override
     /// pattern, compile-checked by the override above; a full round-trip would
     /// need a `JwtKeySource` stub, deferred).
-    /// #989 review (fc8fe8b2a follow-up): `accept_delegated_bearer` defaulted to
-    /// `false`, so `verify_claims` rejected every relayed caller token before the
-    /// policy callback. This pins the gate: fail-closed without a pin, accept
-    /// ONLY the independently-pinned MCP relay key, reject all other signers.
+    /// #989 review (fdfbf0594 follow-up): `accept_delegated_bearer` defaults to
+    /// `false`, so `verify_claims` rejects relayed caller tokens before policy.
+    /// These tests pin the full authorized MCP relay key set (multi-key /
+    /// rotation / HA), fail-closed when empty, and reject non-MCP signers.
     #[test]
-    fn workflow_accepts_delegated_bearer_only_from_pinned_mcp_relay() {
+    fn workflow_accepts_delegated_bearer_from_authorized_mcp_key_set() {
         use super::{SigningKey, WorkflowService};
         use hyprstream_rpc::service::RequestService;
         use hyprstream_rpc::transport::TransportConfig;
@@ -998,22 +997,58 @@ mod tests {
         let sk = SigningKey::from_bytes(&[0x42; 32]);
         let mut svc = WorkflowService::new(TransportConfig::inproc("wf-relay-test"), sk);
 
-        // Default: no relay pinned → fail-closed (verify_claims would reject).
+        // Empty set → fail-closed (verify_claims would reject all relays).
         assert!(!RequestService::accept_delegated_bearer(&svc, &[0u8; 32]));
 
-        // Pin the MCP relay key (as the factory does via the trust store).
-        let relay = [0xAB; 32];
-        svc.set_mcp_relay_pubkey(relay);
+        // Pin two authorized MCP keys (HA / rotation overlap window).
+        let key_a = [0xAB; 32];
+        let key_b = [0xCD; 32];
+        svc.set_mcp_relay_pubkeys(vec![key_a, key_b]);
 
-        // Accept delegated bearers ONLY from the pinned MCP relay key.
-        assert!(RequestService::accept_delegated_bearer(&svc, &relay),
-            "must accept the pinned MCP relay");
-        // Reject every other signer — independently pinned, not a wildcard.
-        assert!(!RequestService::accept_delegated_bearer(&svc, &[0xCD; 32]),
-            "must reject a non-pinned signer");
+        // Both authorized MCP keys are accepted.
+        assert!(RequestService::accept_delegated_bearer(&svc, &key_a),
+            "must accept authorized MCP key A");
+        assert!(RequestService::accept_delegated_bearer(&svc, &key_b),
+            "must accept authorized MCP key B");
+
+        // Non-MCP signers rejected — independently scoped, not a wildcard.
+        assert!(!RequestService::accept_delegated_bearer(&svc, &[0xEF; 32]),
+            "must reject a non-authorized signer");
         assert!(!RequestService::accept_delegated_bearer(&svc, &[0u8; 32]),
             "must reject the zero key");
     }
+
+    /// Rotation: after key rotation, the old MCP key is removed from the set and
+    /// the new key is added. Old-key-signed relays must be rejected.
+    #[test]
+    fn workflow_relay_rotation_rejects_retired_key() {
+        use super::{SigningKey, WorkflowService};
+        use hyprstream_rpc::service::RequestService;
+        use hyprstream_rpc::transport::TransportConfig;
+
+        let sk = SigningKey::from_bytes(&[0x99; 32]);
+        let mut svc = WorkflowService::new(TransportConfig::inproc("wf-rotation"), sk);
+
+        let old_key = [0x11; 32];
+        let new_key = [0x22; 32];
+
+        // Pre-rotation: only old_key is authorized.
+        svc.set_mcp_relay_pubkeys(vec![old_key]);
+        assert!(RequestService::accept_delegated_bearer(&svc, &old_key));
+
+        // Rotation: replace the set with only the new key (old key retired).
+        svc.set_mcp_relay_pubkeys(vec![new_key]);
+        assert!(RequestService::accept_delegated_bearer(&svc, &new_key),
+            "must accept the new MCP key after rotation");
+        assert!(!RequestService::accept_delegated_bearer(&svc, &old_key),
+            "must reject the retired MCP key after rotation");
+
+        // Overlap window: both keys authorized simultaneously.
+        svc.set_mcp_relay_pubkeys(vec![old_key, new_key]);
+        assert!(RequestService::accept_delegated_bearer(&svc, &old_key));
+        assert!(RequestService::accept_delegated_bearer(&svc, &new_key));
+    }
+
 
     #[test]
     fn jwt_expected_audience_round_trips_through_request_service() {
