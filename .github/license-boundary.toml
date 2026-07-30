@@ -3,6 +3,7 @@
 [license_gate]
 apache_roots = [
   "hyprstream-crypto",
+  "hyprstream-k8s",
   "hyprstream-rpc",
   "hyprstream-rpc-build",
   "hyprstream-rpc-derive",
@@ -21,7 +22,7 @@ agpl_services = [
   "hyprstream",
   "hyprstream-appview",
   "hyprstream-discovery",
-  "hyprstream-k8s",
+  "hyprstream-k8s-pds",
   "hyprstream-ledger",
   "hyprstream-pds",
   "hyprstream-pds-service",

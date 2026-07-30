@@ -23,27 +23,30 @@ class LicenseBoundaryFixtures(unittest.TestCase):
         apache_roots: tuple[str, ...] = ("apache",),
         agpl_services: tuple[str, ...] = ("service",),
         other_packages: tuple[str, ...] = ("middle",),
+        package_names: tuple[str, str, str] = ("apache", "middle", "service"),
+        policy_text: str | None = None,
     ) -> subprocess.CompletedProcess[str]:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
+            apache_name, middle_name, service_name = package_names
             (root / ".github").mkdir()
-            for package in ("apache", "middle", "service"):
+            for package in package_names:
                 (root / "crates" / package).mkdir(parents=True)
             (root / "vendor" / "ghost").mkdir(parents=True)
 
             (root / "Cargo.toml").write_text(
                 "[workspace]\n"
-                'members = ["crates/apache", "crates/middle"]\n'
-                'exclude = ["crates/service"]\n'
+                f'members = ["crates/{apache_name}", "crates/{middle_name}"]\n'
+                f'exclude = ["crates/{service_name}"]\n'
                 'resolver = "2"\n\n'
                 "[workspace.dependencies]\n"
                 f"{workspace_dependencies}",
                 encoding="utf-8",
             )
             manifests = {
-                "apache": apache_manifest,
-                "middle": middle_manifest,
-                "service": "",
+                apache_name: apache_manifest,
+                middle_name: middle_manifest,
+                service_name: "",
             }
             for package, extra in manifests.items():
                 (root / "crates" / package / "Cargo.toml").write_text(
@@ -61,12 +64,15 @@ class LicenseBoundaryFixtures(unittest.TestCase):
                 'edition = "2021"\n',
                 encoding="utf-8",
             )
+            if policy_text is None:
+                policy_text = (
+                    "[license_gate]\n"
+                    f"apache_roots = {list(apache_roots)!r}\n"
+                    f"agpl_services = {list(agpl_services)!r}\n"
+                    f"other_packages = {list(other_packages)!r}\n"
+                )
             (root / ".github" / "license-boundary.toml").write_text(
-                "[license_gate]\n"
-                f"apache_roots = {list(apache_roots)!r}\n"
-                f"agpl_services = {list(agpl_services)!r}\n"
-                f"other_packages = {list(other_packages)!r}\n",
-                encoding="utf-8",
+                policy_text, encoding="utf-8"
             )
             return subprocess.run(
                 [sys.executable, str(CHECKER), "--root", str(root)],
@@ -98,6 +104,28 @@ class LicenseBoundaryFixtures(unittest.TestCase):
         )
         self.assert_boundary_failure(result)
         self.assertIn("apache -> middle -> service", result.stderr)
+
+    def test_k8s_to_pds_adapter_complete_path_fails(self) -> None:
+        result = self.run_fixture(
+            package_names=("hyprstream-k8s", "neutral-bridge", "hyprstream-k8s-pds"),
+            apache_roots=("hyprstream-k8s",),
+            agpl_services=("hyprstream-k8s-pds",),
+            other_packages=("neutral-bridge",),
+            apache_manifest=(
+                "[dependencies]\n"
+                'neutral-bridge = { path = "../neutral-bridge" }\n'
+            ),
+            middle_manifest=(
+                "[dependencies]\n"
+                'pds-adapter = { package = "hyprstream-k8s-pds", '
+                'path = "../hyprstream-k8s-pds" }\n'
+            ),
+        )
+        self.assert_boundary_failure(result)
+        self.assertIn(
+            "hyprstream-k8s -> neutral-bridge -> hyprstream-k8s-pds",
+            result.stderr,
+        )
 
     def test_renamed_dependency_fails(self) -> None:
         result = self.run_fixture(
@@ -145,6 +173,13 @@ class LicenseBoundaryFixtures(unittest.TestCase):
         result = self.run_fixture(other_packages=("middle", "ghost"))
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("unknown package(s): ['ghost']", result.stderr)
+
+    def test_malformed_policy_fails_closed(self) -> None:
+        result = self.run_fixture(
+            policy_text="[license_gate]\napache_roots = [",
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("TOMLDecodeError", result.stderr)
 
     def test_unknown_local_dependency_fails(self) -> None:
         result = self.run_fixture(
