@@ -73,6 +73,13 @@ pub struct TokenRequest {
     pub requested_token_type: Option<String>,
     #[serde(default)]
     pub actor_token: Option<String>,
+    // RFC 8693 §2.1 actor-token type indicator (#1425 r2 P2). Modeled
+    // explicitly so it is never silently dropped by the form extractor —
+    // a request that names an actor_token_type but omits actor_token must
+    // still be recognized and rejected by the browser handler, not treated
+    // as if it had no actor field at all.
+    #[serde(default)]
+    pub actor_token_type: Option<String>,
     #[serde(default)]
     pub scope: Option<String>,
     #[serde(default)]
@@ -230,6 +237,7 @@ pub async fn exchange_token(
                     params.scope.as_deref(),
                     params.requested_token_type.as_deref(),
                     params.actor_token.as_deref(),
+                    params.actor_token_type.as_deref(),
                     params.tenant.as_deref(),
                     &params.client_id,
                 )
@@ -2000,6 +2008,7 @@ mod tests {
             subject_token_type: None,
             requested_token_type: None,
             actor_token: None,
+            actor_token_type: None,
             scope: None,
             audience: None,
             tenant: None,
@@ -2066,6 +2075,7 @@ mod tests {
             subject_token_type: None,
             requested_token_type: None,
             actor_token: None,
+            actor_token_type: None,
             scope: None,
             audience: None,
             tenant: None,
@@ -2125,6 +2135,7 @@ mod tests {
             subject_token_type: None,
             requested_token_type: None,
             actor_token: None,
+            actor_token_type: None,
             scope: None,
             audience: None,
             tenant: None,

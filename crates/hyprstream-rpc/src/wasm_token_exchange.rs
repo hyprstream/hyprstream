@@ -142,22 +142,28 @@ struct ExchangeResponse {
 ///
 /// #1425: the body now carries the required **public** `client_id`
 /// ([`BROWSER_PUBLIC_CLIENT_ID`]) and is sent alongside a `DPoP` proof
-/// header for sender-bound exchange. `grant_type` and the
-/// `subject_token_type` constant are URL-safe; the `subject_token` (a JWT)
-/// and `client_id` are percent-encoded defensively.
+/// header for sender-bound exchange. #1425 r2 P2: the body also carries the
+/// RFC 8707 `resource` the caller is targeting — the browser always knows
+/// this (it is the same origin `fetch_exchange_token` is calling), so the
+/// contract is explicit rather than the server inferring a default. `grant_type`
+/// and the `subject_token_type` constant are URL-safe; `subject_token`,
+/// `client_id`, and `resource` are percent-encoded defensively.
 pub fn exchange_form_body(
     subject_token: &str,
     subject_token_type: &str,
     client_id: &str,
+    resource: &str,
 ) -> String {
     format!(
         "grant_type={GRANT_TYPE}\
          &subject_token={}\
          &subject_token_type={}\
-         &client_id={}",
+         &client_id={}\
+         &resource={}",
         percent_encode(subject_token),
         percent_encode(subject_token_type),
         percent_encode(client_id),
+        percent_encode(resource),
     )
 }
 
@@ -203,6 +209,44 @@ pub fn parse_exchange_response(body: &str) -> Result<ExchangedToken> {
         token_type,
         nonce: None,
     })
+}
+
+/// Verify an [`ExchangedToken`] is actually sender-bound to `dpop_pubkey`
+/// before the caller (the browser sender-bound exchange) trusts it (#1425 r2
+/// P2).
+///
+/// [`parse_exchange_response`] treats an omitted or `Bearer` `token_type` as
+/// backward-compatible (other, non-browser callers of this endpoint shape
+/// still expect that). But `fetch_exchange_token` is *exclusively* the
+/// sender-bound browser exchange: a response that comes back as `Bearer` (a
+/// misrouted request, a downgraded/compatibility responder, or a proxy that
+/// stripped the DPoP semantics) must be rejected here rather than silently
+/// installed as if it were correctly bound — the caller only checks
+/// `token_type` `once, at parse time`, and every downstream RPC assumes the
+/// installed credential really is `cnf.jkt`-bound to this key.
+///
+/// This also independently confirms the token's `cnf.jkt` (decoded from the
+/// unverified JWT payload — the server re-verifies the signature and binding
+/// on every RPC; this is client-side defense in depth, not the trust
+/// boundary) equals [`ed25519_dpop_jkt`] of the exact key that produced the
+/// proof, so a compatibility/misrouted response bound to some *other* key
+/// cannot be mistaken for a token this browser can actually use.
+pub fn verify_sender_bound_token(token: &ExchangedToken, dpop_pubkey: &[u8; 32]) -> Result<()> {
+    ensure!(
+        token.token_type == TokenType::Dpop,
+        "sender-bound browser exchange requires token_type: DPoP; got Bearer or an omitted token_type"
+    );
+    let claims = crate::auth::decode_unverified(&token.access_token)
+        .map_err(|e| anyhow!("exchanged access_token is not a decodable JWT: {e}"))?;
+    let actual_jkt = claims
+        .cnf_jkt()
+        .ok_or_else(|| anyhow!("exchanged token carries no cnf.jkt; sender binding is missing"))?;
+    let expected_jkt = ed25519_dpop_jkt(dpop_pubkey);
+    ensure!(
+        actual_jkt == expected_jkt,
+        "exchanged token cnf.jkt does not match the browser DPoP key"
+    );
+    Ok(())
 }
 
 /// Parse the exact session-exchange / whoami JSON response.
@@ -377,8 +421,8 @@ mod fetch {
     use super::{
         assemble_dpop_proof, decide_nonce_outcome, ed25519_dpop_signing_input,
         exchange_form_body, generate_dpop_jti, parse_exchange_response, parse_session_context,
-        BROWSER_PUBLIC_CLIENT_ID, ExchangedToken, NonceOutcome, SessionContext,
-        SESSION_EXCHANGE_PATH, WHOAMI_PATH,
+        verify_sender_bound_token, BROWSER_PUBLIC_CLIENT_ID, ExchangedToken, NonceOutcome,
+        SessionContext, SESSION_EXCHANGE_PATH, WHOAMI_PATH,
     };
     use anyhow::{anyhow, ensure, Context, Result};
     use wasm_bindgen::JsCast as _;
@@ -504,9 +548,20 @@ mod fetch {
         nonce: Option<&str>,
     ) -> Result<ExchangedToken> {
         let mut url = parse_origin(exchange_endpoint)?;
+        // #1425 r2 P2: the canonical resource is this exact origin, no
+        // trailing slash — computed from the validated input string (not the
+        // re-serialized `url::Url`, which normalizes an empty path to `/` and
+        // would otherwise silently drift from the server's
+        // `canonical_issuer_origin` no-trailing-slash form).
+        let resource = exchange_endpoint.trim_end_matches('/');
         url.set_path("/oauth/token");
         let token_endpoint_htu = url.as_str().to_owned();
-        let body = exchange_form_body(subject_token, subject_token_type, BROWSER_PUBLIC_CLIENT_ID);
+        let body = exchange_form_body(
+            subject_token,
+            subject_token_type,
+            BROWSER_PUBLIC_CLIENT_ID,
+            resource,
+        );
 
         let mut current_nonce = nonce.map(str::to_owned);
 
@@ -577,6 +632,10 @@ mod fetch {
             // Success: parse body + carry the response nonce for the caller to persist.
             let mut token = parse_exchange_response(&text)?;
             token.nonce = fresh_nonce_header;
+            // #1425 r2 P2: fail closed rather than installing a misrouted or
+            // compatibility (Bearer / foreign-key) response as if it were
+            // this browser's sender-bound credential.
+            verify_sender_bound_token(&token, dpop_pubkey)?;
             return Ok(token);
         }
         Err(anyhow!(
@@ -682,28 +741,91 @@ mod tests {
         // `:` is not RFC 3986 unreserved, so the caller-supplied URN is encoded;
         // the server's form parser decodes %3A back to ':'. A valid JWT
         // (base64url-no-pad + '.') is already unreserved, so it passes through.
-        // #1425: the body also carries the public client_id.
+        // #1425: the body also carries the public client_id. #1425 r2 P2: and
+        // the canonical resource the browser is targeting.
         let body = exchange_form_body(
             "abc.def.ghi",
             "urn:ietf:params:oauth:token-type:jwt",
             BROWSER_PUBLIC_CLIENT_ID,
+            "https://as.example",
         );
         assert_eq!(
             body,
             "grant_type=urn:ietf:params:oauth:grant-type:token-exchange\
              &subject_token=abc.def.ghi\
              &subject_token_type=urn%3Aietf%3Aparams%3Aoauth%3Atoken-type%3Ajwt\
-             &client_id=hyprstream-browser-vfs"
+             &client_id=hyprstream-browser-vfs\
+             &resource=https%3A%2F%2Fas.example"
         );
     }
 
     #[test]
     fn form_body_percent_encodes_non_unreserved() {
         // base64url-no-pad never produces '+', but a tampered/odd token could carry it.
-        let body = exchange_form_body("a+b c", "t/y", "c w");
+        let body = exchange_form_body("a+b c", "t/y", "c w", "r s");
         assert!(body.contains("subject_token=a%2Bb%20c"), "{body}");
         assert!(body.contains("subject_token_type=t%2Fy"), "{body}");
         assert!(body.contains("client_id=c%20w"), "{body}");
+        assert!(body.contains("resource=r%20s"), "{body}");
+    }
+
+    // ── #1425 r2 P2: sender-bound response verification ───────────────────────
+
+    fn dpop_bound_token(pubkey: &[u8; 32], token_type: TokenType) -> ExchangedToken {
+        let jkt = ed25519_dpop_jkt(pubkey);
+        let header = URL_SAFE_NO_PAD.encode(r#"{"alg":"EdDSA","typ":"at+jwt"}"#);
+        let payload = URL_SAFE_NO_PAD.encode(format!(
+            r#"{{"sub":"alice","exp":9999999999,"iat":1,"cnf":{{"jkt":"{jkt}"}}}}"#
+        ));
+        ExchangedToken {
+            access_token: format!("{header}.{payload}.sig"),
+            expires_in: 300,
+            token_type,
+            nonce: None,
+        }
+    }
+
+    #[test]
+    fn verify_sender_bound_token_accepts_matching_dpop_token() {
+        let pubkey = [0x71; 32];
+        let token = dpop_bound_token(&pubkey, TokenType::Dpop);
+        verify_sender_bound_token(&token, &pubkey).expect("matching DPoP token must be accepted");
+    }
+
+    #[test]
+    fn verify_sender_bound_token_rejects_bearer() {
+        let pubkey = [0x72; 32];
+        let token = dpop_bound_token(&pubkey, TokenType::Bearer);
+        let err = verify_sender_bound_token(&token, &pubkey)
+            .expect_err("a Bearer response must be rejected by the sender-bound fetch");
+        assert!(err.to_string().contains("DPoP"), "unexpected error: {err:#}");
+    }
+
+    #[test]
+    fn verify_sender_bound_token_rejects_foreign_key_binding() {
+        let pubkey = [0x73; 32];
+        let attacker_pubkey = [0x74; 32];
+        // Bound to a DIFFERENT key than the one that produced the proof.
+        let token = dpop_bound_token(&attacker_pubkey, TokenType::Dpop);
+        let err = verify_sender_bound_token(&token, &pubkey)
+            .expect_err("a token bound to a foreign key must be rejected");
+        assert!(err.to_string().contains("cnf.jkt"), "unexpected error: {err:#}");
+    }
+
+    #[test]
+    fn verify_sender_bound_token_rejects_missing_cnf() {
+        let pubkey = [0x75; 32];
+        let header = URL_SAFE_NO_PAD.encode(r#"{"alg":"EdDSA","typ":"at+jwt"}"#);
+        let payload = URL_SAFE_NO_PAD.encode(r#"{"sub":"alice","exp":9999999999,"iat":1}"#);
+        let token = ExchangedToken {
+            access_token: format!("{header}.{payload}.sig"),
+            expires_in: 300,
+            token_type: TokenType::Dpop,
+            nonce: None,
+        };
+        let err = verify_sender_bound_token(&token, &pubkey)
+            .expect_err("a token with no cnf.jkt at all must be rejected");
+        assert!(err.to_string().contains("cnf.jkt"), "unexpected error: {err:#}");
     }
 
     #[test]

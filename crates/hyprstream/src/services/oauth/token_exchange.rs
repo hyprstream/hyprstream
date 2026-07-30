@@ -265,6 +265,7 @@ pub(super) async fn exchange_browser_token_exchange(
     scope: Option<&str>,
     requested_token_type: Option<&str>,
     actor_token: Option<&str>,
+    actor_token_type: Option<&str>,
     tenant: Option<&str>,
     client_id: &str,
 ) -> Response {
@@ -289,6 +290,19 @@ pub(super) async fn exchange_browser_token_exchange(
             StatusCode::BAD_REQUEST,
             "invalid_request",
             "actor_token (delegation) is not supported for browser token-exchange",
+        );
+    }
+    // #1425 r2 P2: `actor_token_type` is rejected independently of
+    // `actor_token` — a request naming the type but omitting the token (or
+    // sending only the type) must not be treated as if it carried no actor
+    // field at all. Checked here, before proof admission or subject-token
+    // consumption, so neither the DPoP replay registry nor the subject-token
+    // single-use registry is ever touched by a request this contract refuses.
+    if actor_token_type.is_some() {
+        return tx_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "actor_token_type is not supported for browser token-exchange",
         );
     }
     if let Some(rtt) = requested_token_type {

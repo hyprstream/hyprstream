@@ -2936,9 +2936,9 @@ mod tests {
         // (client_id + DPoP → DPoP-bound token), and negatives (missing proof,
         // audience substitution, replayed jti). The request body is the exact
         // form the WASM client sends — built via `exchange_form_body`
-        // (grant_type, subject_token, subject_token_type, client_id) — so the
-        // contract is tested against the frontend's generated request, not a
-        // Rust-local fixture.
+        // (grant_type, subject_token, subject_token_type, client_id, resource)
+        // — so the contract is tested against the frontend's generated
+        // request, not a Rust-local fixture.
         use rand::Rng as _;
         use hyprstream_rpc::auth::{jwk_thumbprint, JwkThumbprintInput};
         use hyprstream_rpc::wasm_token_exchange::BROWSER_PUBLIC_CLIENT_ID;
@@ -2978,12 +2978,21 @@ mod tests {
 
         // Build the exact WASM request body (`exchange_form_body`) + an
         // optional `audience` override, as owned pairs `post_form` accepts.
+        //
+        // #1425 r2 P2: `exchange_form_body` now always sends `resource` — the
+        // real `fetch_exchange_token` computes it from the exact origin it is
+        // calling (`exchange_endpoint`), which in this test harness is
+        // `ISSUER`. This is the same value the real browser client would send
+        // for a correctly configured deployment (the AS's own origin), so
+        // every test built from this helper now exercises the client
+        // actually sending the modeled resource, not a native-only fixture.
         let browser_fields =
             |subject: &str, audience: Option<&str>| -> Vec<(String, String)> {
                 let body = hyprstream_rpc::wasm_token_exchange::exchange_form_body(
                     subject,
                     "urn:ietf:params:oauth:token-type:access_token",
                     BROWSER_PUBLIC_CLIENT_ID,
+                    ISSUER,
                 );
                 let mut pairs: Vec<(String, String)> =
                     url::form_urlencoded::parse(body.as_bytes())
@@ -3319,8 +3328,8 @@ mod tests {
             "key substitution must surface as invalid_dpop_proof"
         );
 
-        // ── #1425 r1 P2: RFC 8693 fields the browser contract does not accept ──
-        // All four are rejected before DPoP verification/subject-token
+        // ── #1425 r1/r2 P2: RFC 8693 fields the browser contract does not accept ──
+        // All are rejected before DPoP verification/subject-token
         // consumption, so the (already-used) `browser_subject` string is safe
         // to reuse — none of these requests reach subject-token verification.
         let mut actor_fields = browser_fields(&browser_subject, Some(ISSUER));
@@ -3329,6 +3338,66 @@ mod tests {
             post_form(&app, "/oauth/token", &str_slice(&actor_fields), None, false).await;
         assert_eq!(actor_resp.status(), axum::http::StatusCode::BAD_REQUEST);
         assert_eq!(response_json(actor_resp).await["error"], "invalid_request");
+
+        // ── #1425 r2 P2: `actor_token_type` alone (no `actor_token`) must not
+        //    be treated as if the request carried no actor field at all — the
+        //    prior revision only modeled/rejected `actor_token`, so an
+        //    `actor_token_type`-only request was silently dropped by the form
+        //    extractor and reached subject-token verification unrejected.
+        //    No DPoP proof is supplied here either, proving (via the returned
+        //    `invalid_request`, not "requires a DPoP proof") that this is
+        //    rejected before DPoP admission and before subject-token
+        //    consumption — `browser_subject` remains safe to reuse below.
+        let mut actor_type_standalone_fields = browser_fields(&browser_subject, Some(ISSUER));
+        actor_type_standalone_fields.push((
+            "actor_token_type".to_owned(),
+            "urn:ietf:params:oauth:token-type:jwt".to_owned(),
+        ));
+        let actor_type_standalone_resp = post_form(
+            &app,
+            "/oauth/token",
+            &str_slice(&actor_type_standalone_fields),
+            None,
+            false,
+        )
+        .await;
+        assert_eq!(
+            actor_type_standalone_resp.status(),
+            axum::http::StatusCode::BAD_REQUEST,
+            "actor_token_type alone must be rejected, not silently ignored"
+        );
+        assert_eq!(
+            response_json(actor_type_standalone_resp).await["error"],
+            "invalid_request"
+        );
+
+        // Duplicate `actor_token_type` fields: proves the rejection is real
+        // field modeling (caught by the same axum::Form duplicate-key
+        // detection already proven for `resource`), not a single manually
+        // inserted value that a second, differently-encoded copy could evade.
+        let mut actor_type_dup_fields = browser_fields(&browser_subject, Some(ISSUER));
+        actor_type_dup_fields.push((
+            "actor_token_type".to_owned(),
+            "urn:ietf:params:oauth:token-type:jwt".to_owned(),
+        ));
+        actor_type_dup_fields.push((
+            "actor_token_type".to_owned(),
+            "urn:ietf:params:oauth:token-type:access_token".to_owned(),
+        ));
+        let actor_type_dup_resp = post_form(
+            &app,
+            "/oauth/token",
+            &str_slice(&actor_type_dup_fields),
+            None,
+            false,
+        )
+        .await;
+        assert!(
+            actor_type_dup_resp.status().is_client_error(),
+            "duplicate actor_token_type fields must be rejected, not silently take the last \
+             value (got {})",
+            actor_type_dup_resp.status()
+        );
 
         let mut rtt_fields = browser_fields(&browser_subject, Some(ISSUER));
         rtt_fields.push((
@@ -3348,7 +3417,10 @@ mod tests {
         assert_eq!(response_json(tenant_resp).await["error"], "invalid_request");
 
         // `resource` mismatch → invalid_target, mirroring the `audience` negative above.
+        // `browser_fields` now sends the correct `resource` by default (the
+        // real client always does); strip it before substituting the bad value.
         let mut resource_bad_fields = browser_fields(&browser_subject, None);
+        resource_bad_fields.retain(|(k, _)| k != "resource");
         resource_bad_fields.push(("resource".to_owned(), "https://evil.example".to_owned()));
         let resource_bad_resp = post_form(
             &app,
@@ -3366,6 +3438,7 @@ mod tests {
         // twice — a duplicate cannot silently smuggle a second, later-wins
         // value past the single-value check above.
         let mut dup_resource_fields = browser_fields(&browser_subject, None);
+        dup_resource_fields.retain(|(k, _)| k != "resource");
         dup_resource_fields.push(("resource".to_owned(), ISSUER.to_owned()));
         dup_resource_fields.push(("resource".to_owned(), "https://evil.example".to_owned()));
         let dup_resource_resp = post_form(
@@ -3385,6 +3458,10 @@ mod tests {
 
         // `resource` matching the canonical RPC resource is accepted (a fresh
         // subject token, since this request runs the full exchange to success).
+        // #1425 r2 P2: `browser_fields` already sends the correct `resource`
+        // by default via the real `exchange_form_body` — this positive case
+        // needs no manual field push, which is exactly the point: the browser
+        // caller's own request, unmodified, must succeed.
         let resource_ok_subject = state
             .policy_client
             .issue_token(&IssueToken {
@@ -3400,8 +3477,7 @@ mod tests {
             })
             .await?
             .token;
-        let mut resource_ok_fields = browser_fields(&resource_ok_subject, None);
-        resource_ok_fields.push(("resource".to_owned(), ISSUER.to_owned()));
+        let resource_ok_fields = browser_fields(&resource_ok_subject, None);
         // A brand-new DPoP key: `browser_dpop_key` was already marked "nonced"
         // by the earlier positive exchange above, so its bootstrap window has
         // closed — reusing it here would spuriously hit `use_dpop_nonce`.

@@ -7418,6 +7418,7 @@ dependencies = [
  "uuid 1.18.1",
  "wasm-bindgen",
  "wasm-bindgen-futures",
+ "wasm-bindgen-test",
  "web-sys",
  "web-time",
  "web-transport-iroh",
