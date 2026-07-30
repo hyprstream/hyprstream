@@ -1418,6 +1418,10 @@ fn create_workflow_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawn
         service_token(&sk),
     )?;
     workflow_service.set_authorize_fn(crate::services::worker::build_authorize_fn(policy_client));
+    if let Some(issuer) = ctx.oauth_issuer_url() {
+        workflow_service.set_expected_audience(issuer.to_owned());
+    }
+    workflow_service.set_jwt_key_source(ctx.cluster_key_source());
 
     Ok(ctx.into_spawnable(workflow_service))
 }

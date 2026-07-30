@@ -117,6 +117,16 @@ pub struct WorkflowService {
     /// Optional authorization callback (injected by parent crate)
     authorize_fn: Option<AuthorizeFn>,
 
+    /// Expected JWT audience — fed to the envelope-verification layer so a
+    /// JWT-bearing IPC/QUIC request is validated before the policy `authorize`
+    /// callback runs (same seam as `WorkerService`). Without this, JWT-auth
+    /// requests fail at envelope verification with an audience mismatch.
+    expected_audience: Option<String>,
+
+    /// JWT verification key source (local + federated). `None` ⇒ only the
+    /// local bootstrap key is trusted; federated JWTs are rejected.
+    jwt_key_source: Option<std::sync::Arc<dyn hyprstream_rpc::auth::JwtKeySource>>,
+
     /// Workflow execution engine
     runner: Option<WorkflowRunner>,
 }
@@ -143,6 +153,8 @@ impl WorkflowService {
             transport,
             signing_key,
             authorize_fn: None,
+            expected_audience: None,
+            jwt_key_source: None,
             runner: None,
         }
     }
@@ -197,6 +209,23 @@ impl WorkflowService {
     /// Set the authorization callback for policy checks.
     pub fn set_authorize_fn(&mut self, authorize_fn: AuthorizeFn) {
         self.authorize_fn = Some(authorize_fn);
+    }
+
+    /// Set the expected JWT audience for envelope-verification-time validation
+    /// (mirrors `WorkerService::set_expected_audience`). Fed by the factory from
+    /// the OAuth issuer URL so JWT-authenticated IPC/QUIC requests are accepted
+    /// before the per-request policy check.
+    pub fn set_expected_audience(&mut self, audience: String) {
+        self.expected_audience = Some(audience);
+    }
+
+    /// Set the JWT verification key source (local + federated). Fed by the
+    /// factory from the cluster key source.
+    pub fn set_jwt_key_source(
+        &mut self,
+        src: std::sync::Arc<dyn hyprstream_rpc::auth::JwtKeySource>,
+    ) {
+        self.jwt_key_source = Some(src);
     }
 
     /// Initialize the service: scan all registered repos and register their workflows.
@@ -857,6 +886,14 @@ impl RequestService for WorkflowService {
     fn signing_key(&self) -> SigningKey {
         self.signing_key.clone()
     }
+
+    fn expected_audience(&self) -> Option<&str> {
+        self.expected_audience.as_deref()
+    }
+
+    fn jwt_key_source(&self) -> Option<std::sync::Arc<dyn hyprstream_rpc::auth::JwtKeySource>> {
+        self.jwt_key_source.clone()
+    }
 }
 
 /// Extract the `repo_id` from a `workflow_id` following the `repo_id:path`
@@ -911,6 +948,36 @@ mod tests {
     // invariant the dispatch boundary depends on instead.
 
     use hyprstream_vfs::Subject;
+
+    /// #989 review P2-1: the factory must feed the OAuth issuer audience (and
+    /// cluster JWT key source) into `WorkflowService` so JWT-authenticated
+    /// IPC/QUIC requests pass envelope verification *before* the policy
+    /// `authorize` callback. Without the `expected_audience`/`jwt_key_source`
+    /// `RequestService` overrides, both default to `None` and JWT auth fails
+    /// upstream of policy. This pins the audience half of the wiring (the
+    /// `jwt_key_source` half follows the identical field→setter→override
+    /// pattern, compile-checked by the override above; a full round-trip would
+    /// need a `JwtKeySource` stub, deferred).
+    #[test]
+    fn jwt_expected_audience_round_trips_through_request_service() {
+        use super::{SigningKey, WorkflowService};
+        use hyprstream_rpc::service::RequestService;
+        use hyprstream_rpc::transport::TransportConfig;
+
+        let sk = SigningKey::from_bytes(&[0x42; 32]);
+        let mut svc =
+            WorkflowService::new(TransportConfig::inproc("wf-plumb-test"), sk);
+        // Default: no audience configured → a JWT-auth request would be denied
+        // at envelope verification (the pre-fix behavior the review flagged).
+        assert!(RequestService::expected_audience(&svc).is_none());
+        assert!(RequestService::jwt_key_source(&svc).is_none());
+
+        svc.set_expected_audience("https://test.hyprstream.local".to_owned());
+        assert_eq!(
+            RequestService::expected_audience(&svc),
+            Some("https://test.hyprstream.local")
+        );
+    }
 
     #[test]
     fn anonymous_subject_must_not_round_trip_through_string() {

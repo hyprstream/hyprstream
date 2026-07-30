@@ -27,6 +27,7 @@ use crate::services::generated::model_client::ModelClient;
 use crate::services::generated::policy_client::PolicyCheck;
 use crate::services::generated::tui_client::TuiClient;
 use crate::services::{PolicyClient, RegistryClient};
+use hyprstream_workers::generated::workflow_client::WorkflowClient;
 use async_trait::async_trait;
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use futures::future::BoxFuture;
@@ -323,6 +324,10 @@ fn register_schema_tools(reg: &mut ToolRegistry) {
     register_top_level!(reg, registry_client::schema_metadata());
     register_top_level!(reg, policy_client::schema_metadata());
     register_top_level!(reg, tui_client::schema_metadata());
+    register_top_level!(
+        reg,
+        hyprstream_workers::generated::workflow_client::schema_metadata()
+    );
     // Scoped tools: recursive tree walk for all services with nested scopes
     register_scoped_tools_recursive(
         reg,
@@ -821,6 +826,10 @@ async fn dispatch_schema_call(
         "policy" => ctx.policy_client.call_method(method, &ctx.args).await,
         "tui" => {
             let client = TuiClient::from_resolver(signing_key, None)?;
+            client.call_method(method, &ctx.args).await
+        }
+        "workflow" => {
+            let client = WorkflowClient::from_resolver(signing_key, None)?;
             client.call_method(method, &ctx.args).await
         }
         _ => anyhow::bail!("Unknown service: {service}"),
@@ -1472,6 +1481,21 @@ mod tests {
 
     fn signing_key(seed: u8) -> SigningKey {
         SigningKey::from_bytes(&[seed; 32])
+    }
+
+    /// #989: workflow tools must be advertised to MCP clients. Proves both that
+    /// `register_schema_tools` walks `workflow_client::schema_metadata()` AND
+    /// that the schema/metadata are wired (a missing registration would leave
+    /// `workflow.list`/`workflow.dispatch`/… invisible to MCP).
+    #[test]
+    fn workflow_tools_registered_for_mcp() {
+        let mut reg = ToolRegistry::new();
+        register_schema_tools(&mut reg);
+        let has_workflow = reg.list().any(|t| t.name.starts_with("workflow."));
+        assert!(
+            has_workflow,
+            "MCP tool registry must expose workflow.* tools (#989)"
+        );
     }
 
     #[test]
