@@ -103,6 +103,9 @@ jobs:
         with:
           tool: wasm-pack@0.13.1
 
+      - name: Adversarial probe — verifier must reject duplicate manifest entries
+        run: node .github/scripts/verify-rpc-std-wasm-package.probe.mjs
+
       - name: Build, pack, and smoke test
         run: bash .github/scripts/package-rpc-std-wasm.sh
         env:

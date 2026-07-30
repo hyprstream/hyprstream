@@ -131,9 +131,20 @@ console.log(path.join(distDir, tarballs[0]));
 // USTAR is implemented to extract a small JSON manifest: header name/size/type,
 // the prefix field, and 512-byte block padding. No PAX/GNU long-name support is
 // needed for an npm pack of a short path.
+//
+// Deliberately scans the WHOLE archive rather than returning on the first
+// match. npm's own extraction is last-entry-wins for a duplicated path, so a
+// tarball carrying two `package/package.json` entries is ambiguous: which one
+// is "the" manifest depends on which reader you ask. Rather than pick a
+// side (and risk this verifier approving a manifest npm would not actually
+// materialize), refuse any tarball with more than one entry at the target
+// path outright — an npm pack of a single source directory can never produce
+// that, so its presence only indicates a hand-crafted or tampered archive.
 function extractTarEntry(gzPath, entryName) {
   const tar = zlib.gunzipSync(fs.readFileSync(gzPath));
   const decode = (buf) => buf.toString('utf8').replace(/\0+$/, '');
+  let found;
+  let matchCount = 0;
   for (let off = 0; off + 512 <= tar.length; ) {
     const header = tar.subarray(off, off + 512);
     const name = decode(header.subarray(0, 100));
@@ -150,10 +161,20 @@ function extractTarEntry(gzPath, entryName) {
         if (Number.isNaN(size) || size < 0 || off + size > tar.length) {
           throw new Error(`corrupt tar entry ${entryName}: bad size ${size}`);
         }
-        return tar.subarray(off, off + size);
+        matchCount += 1;
+        if (matchCount > 1) {
+          throw new Error(
+            `tarball contains more than one ${entryName} entry; refusing an ambiguous manifest ` +
+            '(npm extraction is last-entry-wins and could diverge from this check)'
+          );
+        }
+        found = tar.subarray(off, off + size);
       }
     }
     off += Math.ceil(size / 512) * 512; // skip data + padding
   }
-  throw new Error(`tar entry ${entryName} not found`);
+  if (!found) {
+    throw new Error(`tar entry ${entryName} not found`);
+  }
+  return found;
 }

@@ -29,6 +29,11 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+      # actions: read is required for actions/download-artifact@v4 to fetch an
+      # artifact from a DIFFERENT run (this job passes run-id, since the build
+      # ran in the upstream publish workflow's run, not this one). Without it
+      # the download 403s and this convenience job fails every time.
+      actions: read
       id-token: write
       attestations: write
     steps:
