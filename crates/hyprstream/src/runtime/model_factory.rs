@@ -3,9 +3,11 @@
 //! This replaces the chaotic multiple paths for model creation with a single,
 //! clean factory pattern.
 
-use anyhow::{anyhow, Result};
-use std::collections::HashMap;
-use std::path::Path;
+use anyhow::{anyhow, bail, Context, Result};
+use serde::Deserialize;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::ops::Range;
+use std::path::{Path, PathBuf};
 use tch::{Device, Kind as DType, Tensor};
 use tracing::{debug, info, instrument, warn};
 
@@ -70,6 +72,23 @@ fn glob_shard_files(model_path: &Path) -> Result<Vec<std::path::PathBuf>> {
 
 /// Factory for creating models with proper configuration management
 pub struct ModelFactory;
+
+/// Authoritative request for one contiguous Llama-family pipeline stage.
+///
+/// Stage position is derived from the range and the checkpoint's authoritative
+/// `num_hidden_layers`: a range starting at zero owns the embedding, while a
+/// range ending at `num_hidden_layers` owns the final norm and LM head. Keeping
+/// those roles implicit prevents a caller from requesting an inconsistent
+/// range/role combination.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ModelStageRequest {
+    pub layer_range: Range<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SafetensorsIndex {
+    weight_map: BTreeMap<String, String>,
+}
 
 impl ModelFactory {
     /// Detect the dtype of a model by examining its tensors
@@ -195,6 +214,75 @@ impl ModelFactory {
         }
     }
 
+    /// Create one Llama-family pipeline stage from an authoritative HF index.
+    ///
+    /// Unlike [`Self::create`], stage mode never falls back to a single-file or
+    /// glob-discovered whole-model load. It requires
+    /// `model.safetensors.index.json`, resolves the exact tensor names for the
+    /// requested global layer range and its first/last role, opens only shards
+    /// containing those names, and constructs no tensor outside that set.
+    ///
+    /// Llama, Qwen, and Mistral checkpoints use the production-wired
+    /// `LlamaModel` stage path. Qwen3.5 remains deliberately out of scope.
+    #[instrument(
+        name = "model_factory.create_stage",
+        skip(device, dtype, device_pool),
+        fields(
+            model_path = %model_path.display(),
+            layer_start = request.layer_range.start,
+            layer_end = request.layer_range.end,
+        )
+    )]
+    pub async fn create_stage(
+        model_path: &Path,
+        device: &Device,
+        dtype: DType,
+        max_context: Option<usize>,
+        kv_quant_type: KVQuantType,
+        device_pool: Option<&DevicePool>,
+        request: ModelStageRequest,
+    ) -> Result<Box<dyn ModelOperations>> {
+        let config_path = model_path.join("config.json");
+        if !config_path.is_file() {
+            bail!(
+                "stage loading requires authoritative config {}",
+                config_path.display()
+            );
+        }
+        let empty_weights = HashMap::new();
+        let config = ModelConfig::load(model_path, &empty_weights)?;
+        if !matches!(
+            &config.architecture,
+            ModelArchitecture::Llama | ModelArchitecture::Qwen | ModelArchitecture::Mistral
+        ) {
+            bail!(
+                "stage loading is supported only for Llama-family checkpoints; got {:?}",
+                config.architecture
+            );
+        }
+
+        Self::validate_stage_range(&request.layer_range, config.num_hidden_layers)?;
+        let weights = Self::load_weights_for_stage(
+            model_path,
+            config.num_hidden_layers,
+            request.layer_range.clone(),
+            device,
+            dtype,
+        )
+        .await?;
+
+        Self::create_llama_model(
+            config,
+            weights,
+            device,
+            dtype,
+            max_context,
+            kv_quant_type,
+            device_pool,
+            Some(request.layer_range),
+        )
+    }
+
     /// Find all shard files in a model directory.
     ///
     /// Prefers `model.safetensors.index.json` (authoritative HuggingFace shard manifest)
@@ -247,6 +335,190 @@ impl ModelFactory {
             paths.iter().map(|p| p.file_name().unwrap_or_default()).collect::<Vec<_>>()
         );
         Ok(paths)
+    }
+
+    fn validate_stage_range(layer_range: &Range<usize>, num_layers: usize) -> Result<()> {
+        if layer_range.start >= layer_range.end || layer_range.end > num_layers {
+            bail!(
+                "invalid stage layer range {:?} for checkpoint with {} layers",
+                layer_range,
+                num_layers
+            );
+        }
+        Ok(())
+    }
+
+    fn llama_layer_index(name: &str) -> Option<usize> {
+        let rest = name.strip_prefix("model.layers.")?;
+        let (index, suffix) = rest.split_once('.')?;
+        if suffix.is_empty() {
+            return None;
+        }
+        index.parse().ok()
+    }
+
+    fn resolve_required_alias(
+        weight_map: &BTreeMap<String, String>,
+        aliases: &[&str],
+        description: &str,
+    ) -> Result<String> {
+        aliases
+            .iter()
+            .find(|name| weight_map.contains_key(**name))
+            .map(|name| (*name).to_owned())
+            .ok_or_else(|| {
+                anyhow!(
+                    "stage weight_map is missing required {description}; expected one of {}",
+                    aliases.join(", ")
+                )
+            })
+    }
+
+    /// Resolve one stage to exact manifest tensor names grouped by shard.
+    ///
+    /// The returned map is the complete I/O plan: callers must not open any
+    /// other shard or enumerate any other tensor while constructing weights.
+    fn stage_weight_plan(
+        model_path: &Path,
+        num_layers: usize,
+        layer_range: Range<usize>,
+    ) -> Result<BTreeMap<PathBuf, BTreeSet<String>>> {
+        Self::validate_stage_range(&layer_range, num_layers)?;
+
+        let index_path = model_path.join("model.safetensors.index.json");
+        let content = std::fs::read_to_string(&index_path).with_context(|| {
+            format!(
+                "stage loading requires authoritative shard index {}",
+                index_path.display()
+            )
+        })?;
+        let index: SafetensorsIndex = serde_json::from_str(&content).with_context(|| {
+            format!(
+                "stage loading requires a valid `weight_map` object in {}",
+                index_path.display()
+            )
+        })?;
+        if index.weight_map.is_empty() {
+            bail!(
+                "stage loading requires a non-empty `weight_map` in {}",
+                index_path.display()
+            );
+        }
+        if let Some((name, _)) = index
+            .weight_map
+            .iter()
+            .find(|(name, shard)| name.is_empty() || shard.is_empty())
+        {
+            bail!(
+                "stage weight_map in {} contains an empty tensor name or shard for `{name}`",
+                index_path.display()
+            );
+        }
+
+        let manifest_layers: BTreeSet<_> = index
+            .weight_map
+            .keys()
+            .filter_map(|name| Self::llama_layer_index(name))
+            .collect();
+        let expected_layers: BTreeSet<_> = (0..num_layers).collect();
+        if manifest_layers != expected_layers {
+            bail!(
+                "stage weight_map decoder layers {:?} do not exactly match expected range 0..{}",
+                manifest_layers,
+                num_layers
+            );
+        }
+
+        let mut required = BTreeSet::new();
+        for layer in layer_range.clone() {
+            let layer_names: Vec<_> = index
+                .weight_map
+                .keys()
+                .filter(|name| Self::llama_layer_index(name) == Some(layer))
+                .cloned()
+                .collect();
+            if layer_names.is_empty() {
+                bail!("stage weight_map has no tensors for required decoder layer {layer}");
+            }
+            required.extend(layer_names);
+        }
+
+        let is_first = layer_range.start == 0;
+        let is_last = layer_range.end == num_layers;
+        if is_first {
+            required.insert(Self::resolve_required_alias(
+                &index.weight_map,
+                &["model.embed_tokens.weight", "embed_tokens.weight"],
+                "embedding tensor",
+            )?);
+        }
+        if is_last {
+            required.insert(Self::resolve_required_alias(
+                &index.weight_map,
+                &["model.norm.weight", "norm.weight"],
+                "final norm tensor",
+            )?);
+
+            if let Some(lm_head) = ["lm_head.weight", "model.lm_head.weight"]
+                .into_iter()
+                .find(|name| index.weight_map.contains_key(*name))
+            {
+                required.insert(lm_head.to_owned());
+            } else if !is_first {
+                bail!("a non-first final stage requires an explicit lm_head tensor in weight_map");
+            }
+        }
+
+        let mut plan: BTreeMap<PathBuf, BTreeSet<String>> = BTreeMap::new();
+        for name in required {
+            let shard = index.weight_map.get(&name).ok_or_else(|| {
+                anyhow!("required stage tensor `{name}` disappeared from weight_map")
+            })?;
+            plan.entry(model_path.join(shard)).or_default().insert(name);
+        }
+
+        Ok(plan)
+    }
+
+    async fn load_weights_for_stage(
+        model_path: &Path,
+        num_layers: usize,
+        layer_range: Range<usize>,
+        device: &Device,
+        dtype: DType,
+    ) -> Result<HashMap<String, Tensor>> {
+        let plan = Self::stage_weight_plan(model_path, num_layers, layer_range.clone())?;
+        let planned_tensors: usize = plan.values().map(BTreeSet::len).sum();
+        info!(
+            "Loading stage {:?}: {} exact tensor(s) from {} shard(s)",
+            layer_range,
+            planned_tensors,
+            plan.len()
+        );
+
+        let mut weights = HashMap::with_capacity(planned_tensors);
+        for (shard, names) in plan {
+            Self::load_safetensors_file_selected(&shard, &names, &mut weights, device, dtype)
+                .await?;
+        }
+
+        if weights.len() != planned_tensors {
+            bail!(
+                "stage loader planned {planned_tensors} tensors but materialized {}",
+                weights.len()
+            );
+        }
+        let loaded_bytes: usize = weights
+            .values()
+            .map(|tensor| tensor.numel() * tensor.kind().elt_size_in_bytes())
+            .sum();
+        info!(
+            "Loaded authoritative stage {:?}: {} tensor(s), {} byte(s)",
+            layer_range,
+            weights.len(),
+            loaded_bytes
+        );
+        Ok(weights)
     }
 
     /// Create model using incremental loading for large sharded models
@@ -339,16 +611,46 @@ impl ModelFactory {
         device: &Device,
         dtype: DType,
     ) -> Result<()> {
-        // Check if mmap is enabled via environment variable.
+        Self::load_safetensors_file_inner(path, None, weights, device, dtype).await
+    }
+
+    /// Load only `selected` tensor names from one safetensors shard.
+    ///
+    /// Selection happens before `TensorView::data()` and before any `tch::Tensor`
+    /// construction, so an unselected tensor is never materialized even when it
+    /// shares a physical shard with selected tensors.
+    async fn load_safetensors_file_selected(
+        path: &Path,
+        selected: &BTreeSet<String>,
+        weights: &mut HashMap<String, Tensor>,
+        device: &Device,
+        dtype: DType,
+    ) -> Result<()> {
+        Self::load_safetensors_file_inner(path, Some(selected), weights, device, dtype).await
+    }
+
+    async fn load_safetensors_file_inner(
+        path: &Path,
+        selected: Option<&BTreeSet<String>>,
+        weights: &mut HashMap<String, Tensor>,
+        device: &Device,
+        dtype: DType,
+    ) -> Result<()> {
+        // Stage selection always uses mmap: only selected tensor pages are copied
+        // into owned CPU/device storage, so unrelated bytes in a shared shard do
+        // not become a whole-shard heap allocation. Whole-model loading retains
+        // its existing environment-controlled behavior.
         //
-        // #315 note: mmap is an opt-in *optimization* selected solely by this env
-        // var (it is independent of `RuntimeConfig.mmap`, which today gates nothing
-        // here). It is not a correctness fallback — both paths deserialize the same
-        // tensors — so it is left as-is, but logged so the chosen path is explicit.
-        let use_mmap = std::env::var("HYPRSTREAM_USE_MMAP")
-            .map(|v| v.to_lowercase() == "true" || v == "1")
-            .unwrap_or(false);
-        debug!("safetensors load path: {}", if use_mmap { "mmap" } else { "read" });
+        // #315 note: for whole-model mode this env var is independent of
+        // `RuntimeConfig.mmap`, which today gates nothing here.
+        let use_mmap = selected.is_some()
+            || std::env::var("HYPRSTREAM_USE_MMAP")
+                .map(|v| v.to_lowercase() == "true" || v == "1")
+                .unwrap_or(false);
+        debug!(
+            "safetensors load path: {}",
+            if use_mmap { "mmap" } else { "read" }
+        );
 
         // Load file data in a blocking task to avoid blocking the async runtime
         let path_buf = path.to_path_buf();
@@ -365,7 +667,9 @@ impl ModelFactory {
             // Note: We must deserialize and create tensors while mmap is alive
             // The tensors will copy the data they need during creation
             let tensors = safetensors::SafeTensors::deserialize(&mmap)?;
-            Self::create_tensors_from_safetensors(tensors, weights, device, dtype)?;
+            Self::create_tensors_from_safetensors_selected(
+                tensors, selected, weights, device, dtype,
+            )?;
 
             // mmap drops here - tensors have already copied what they need
             return Ok(());
@@ -377,7 +681,7 @@ impl ModelFactory {
         // 2. Un-smudged pointers (fallback via explicit load_file)
         let tensor_data = Self::load_file_with_pointer_detection(&path_buf).await?;
         let tensors = safetensors::SafeTensors::deserialize(&tensor_data)?;
-        Self::create_tensors_from_safetensors(tensors, weights, device, dtype)
+        Self::create_tensors_from_safetensors_selected(tensors, selected, weights, device, dtype)
     }
 
     /// Load file with automatic LFS/XET pointer detection
@@ -429,8 +733,35 @@ impl ModelFactory {
         device: &Device,
         dtype: DType,
     ) -> Result<()> {
+        Self::create_tensors_from_safetensors_selected(tensors, None, weights, device, dtype)
+    }
+
+    fn create_tensors_from_safetensors_selected(
+        tensors: safetensors::SafeTensors,
+        selected: Option<&BTreeSet<String>>,
+        weights: &mut HashMap<String, Tensor>,
+        device: &Device,
+        dtype: DType,
+    ) -> Result<()> {
         let mut total_size_mb = 0.0;
-        let tensors_list = tensors.tensors();
+        let tensors_list = if let Some(selected) = selected {
+            selected
+                .iter()
+                .map(|name| {
+                    tensors
+                        .tensor(name)
+                        .map(|view| (name.clone(), view))
+                        .with_context(|| {
+                            format!(
+                                "authoritative weight_map assigns `{name}` to this shard, \
+                                 but the tensor is absent"
+                            )
+                        })
+                })
+                .collect::<Result<Vec<_>>>()?
+        } else {
+            tensors.tensors()
+        };
         let tensor_count = tensors_list.len();
 
         info!(
@@ -680,7 +1011,16 @@ impl ModelFactory {
         match config.architecture {
             ModelArchitecture::Llama => {
                 info!("Creating Llama model");
-                Self::create_llama_model(config, weights, device, dtype, max_context, kv_quant_type, device_pool)
+                Self::create_llama_model(
+                    config,
+                    weights,
+                    device,
+                    dtype,
+                    max_context,
+                    kv_quant_type,
+                    device_pool,
+                    None,
+                )
             }
             ModelArchitecture::Qwen => {
                 info!("Creating Qwen model");
@@ -693,7 +1033,16 @@ impl ModelFactory {
             ModelArchitecture::Mistral => {
                 info!("Creating Mistral model");
                 // For now, Mistral uses Llama architecture
-                Self::create_llama_model(config, weights, device, dtype, max_context, kv_quant_type, device_pool)
+                Self::create_llama_model(
+                    config,
+                    weights,
+                    device,
+                    dtype,
+                    max_context,
+                    kv_quant_type,
+                    device_pool,
+                    None,
+                )
             }
             ModelArchitecture::Janus => {
                 info!("Creating Janus multimodal model");
@@ -722,6 +1071,7 @@ impl ModelFactory {
         max_context: Option<usize>,
         kv_quant_type: KVQuantType,
         device_pool: Option<&DevicePool>,
+        stage_range: Option<Range<usize>>,
     ) -> Result<Box<dyn ModelOperations>> {
         use super::architectures::llama::LlamaConfig;
         use super::device_pool::LayerDeviceMap;
@@ -795,7 +1145,25 @@ impl ModelFactory {
         // copy at each stage boundary. Single-device pools and `None` take the
         // original whole-model path unchanged.
         let num_layers = llama_config.num_hidden_layers as usize;
-        let model = if let Some(pool) = device_pool.filter(|p| !p.is_single()) {
+        let model = if let Some(layer_range) = stage_range {
+            let device_map = if let Some(pool) = device_pool.filter(|p| !p.is_single()) {
+                LayerDeviceMap::even_split(pool, num_layers)?
+            } else {
+                LayerDeviceMap::single(*device, num_layers)?
+            };
+            info!(
+                "Building authoritative Llama stage {:?} of {} global layer(s)",
+                layer_range, num_layers
+            );
+            LlamaModel::stage_from_weights_with_config(
+                &mut weights,
+                llama_config,
+                &device_map,
+                layer_range,
+                dtype,
+                kv_quant_type,
+            )?
+        } else if let Some(pool) = device_pool.filter(|p| !p.is_single()) {
             let device_map = LayerDeviceMap::even_split(pool, num_layers)?;
             info!(
                 "🔀 Building Llama model as a multi-device pipeline: {} layer(s) across \
@@ -839,7 +1207,16 @@ impl ModelFactory {
         // The key difference is in the config values, not the architecture
         info!("   Using Llama architecture with Qwen configuration");
         info!("   rope_theta: {} (from config)", config.rope_theta);
-        Self::create_llama_model(config, weights, device, dtype, max_context, kv_quant_type, device_pool)
+        Self::create_llama_model(
+            config,
+            weights,
+            device,
+            dtype,
+            max_context,
+            kv_quant_type,
+            device_pool,
+            None,
+        )
     }
 
     fn create_gemma_model(
@@ -1108,5 +1485,292 @@ impl ModelFactory {
         }
 
         Ok(all_weights)
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod stage_subset_tests {
+    use super::*;
+    use safetensors::tensor::{serialize, Dtype, TensorView};
+
+    struct FixtureTensor {
+        name: String,
+        dtype: Dtype,
+        shape: Vec<usize>,
+        data: Vec<u8>,
+    }
+
+    impl FixtureTensor {
+        fn f32(name: impl Into<String>, shape: &[usize], seed: f32) -> Self {
+            let elements = shape.iter().product();
+            let data = (0..elements)
+                .flat_map(|index| (seed + index as f32 * 0.01).to_le_bytes())
+                .collect();
+            Self {
+                name: name.into(),
+                dtype: Dtype::F32,
+                shape: shape.to_vec(),
+                data,
+            }
+        }
+
+        fn i64(name: impl Into<String>) -> Self {
+            Self {
+                name: name.into(),
+                dtype: Dtype::I64,
+                shape: vec![1],
+                data: 7_i64.to_le_bytes().to_vec(),
+            }
+        }
+    }
+
+    fn write_shard(dir: &Path, name: &str, tensors: &[FixtureTensor]) {
+        let views: Vec<_> = tensors
+            .iter()
+            .map(|tensor| {
+                (
+                    tensor.name.clone(),
+                    TensorView::new(tensor.dtype, tensor.shape.clone(), &tensor.data).unwrap(),
+                )
+            })
+            .collect();
+        let bytes = serialize(views, &None).unwrap();
+        std::fs::write(dir.join(name), bytes).unwrap();
+    }
+
+    fn write_index(dir: &Path, entries: &[(&str, &str)]) {
+        let weight_map: BTreeMap<_, _> = entries
+            .iter()
+            .map(|(tensor, shard)| ((*tensor).to_owned(), (*shard).to_owned()))
+            .collect();
+        let index = serde_json::json!({ "weight_map": weight_map });
+        std::fs::write(
+            dir.join("model.safetensors.index.json"),
+            serde_json::to_vec(&index).unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn loaded_bytes(weights: &HashMap<String, Tensor>) -> usize {
+        weights
+            .values()
+            .map(|tensor| tensor.numel() * tensor.kind().elt_size_in_bytes())
+            .sum()
+    }
+
+    #[tokio::test]
+    async fn out_of_range_sentinel_in_needed_shard_is_never_materialized() {
+        let dir = tempfile::tempdir().unwrap();
+        let shard = "model-00001-of-00001.safetensors";
+        write_shard(
+            dir.path(),
+            shard,
+            &[
+                FixtureTensor::f32("model.embed_tokens.weight", &[2, 2], 0.1),
+                FixtureTensor::f32("model.layers.0.marker.weight", &[2, 2], 0.2),
+                FixtureTensor::i64("model.layers.1.sentinel.weight"),
+            ],
+        );
+        write_index(
+            dir.path(),
+            &[
+                ("model.embed_tokens.weight", shard),
+                ("model.layers.0.marker.weight", shard),
+                ("model.layers.1.sentinel.weight", shard),
+            ],
+        );
+
+        let stage =
+            ModelFactory::load_weights_for_stage(dir.path(), 2, 0..1, &Device::Cpu, DType::Float)
+                .await
+                .unwrap();
+        assert_eq!(stage.len(), 2);
+        assert!(stage.contains_key("model.embed_tokens.weight"));
+        assert!(stage.contains_key("model.layers.0.marker.weight"));
+        assert!(!stage.contains_key("model.layers.1.sentinel.weight"));
+
+        let full_error = ModelFactory::load_weights(dir.path(), &Device::Cpu, DType::Float)
+            .await
+            .unwrap_err();
+        assert!(
+            full_error.to_string().contains("unsupported dtype"),
+            "the sentinel must prove that whole-shard tensor materialization fails: {full_error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn stage_create_uses_real_range_and_opens_only_needed_shards() {
+        const NEEDED: &str = "model-00001-of-00002.safetensors";
+        const UNNEEDED: &str = "model-00002-of-00002.safetensors";
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut tensors = vec![FixtureTensor::f32(
+            "model.embed_tokens.weight",
+            &[8, 4],
+            0.1,
+        )];
+        let prefix = "model.layers.0";
+        for (suffix, shape) in [
+            ("self_attn.q_proj.weight", vec![4, 4]),
+            ("self_attn.k_proj.weight", vec![4, 4]),
+            ("self_attn.v_proj.weight", vec![4, 4]),
+            ("self_attn.o_proj.weight", vec![4, 4]),
+            ("mlp.gate_proj.weight", vec![8, 4]),
+            ("mlp.up_proj.weight", vec![8, 4]),
+            ("mlp.down_proj.weight", vec![4, 8]),
+            ("input_layernorm.weight", vec![4]),
+            ("post_attention_layernorm.weight", vec![4]),
+        ] {
+            tensors.push(FixtureTensor::f32(
+                format!("{prefix}.{suffix}"),
+                &shape,
+                0.2,
+            ));
+        }
+        write_shard(dir.path(), NEEDED, &tensors);
+
+        let mut entries: Vec<(String, String)> = tensors
+            .iter()
+            .map(|tensor| (tensor.name.clone(), NEEDED.to_owned()))
+            .collect();
+        entries.push((
+            "model.layers.1.self_attn.q_proj.weight".to_owned(),
+            UNNEEDED.to_owned(),
+        ));
+        let borrowed_entries: Vec<_> = entries
+            .iter()
+            .map(|(tensor, shard)| (tensor.as_str(), shard.as_str()))
+            .collect();
+        write_index(dir.path(), &borrowed_entries);
+
+        let config = serde_json::json!({
+            "architectures": ["LlamaForCausalLM"],
+            "model_type": "llama",
+            "hidden_size": 4,
+            "intermediate_size": 8,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 2,
+            "num_key_value_heads": 2,
+            "head_dim": 2,
+            "vocab_size": 8,
+            "max_position_embeddings": 16,
+            "rms_norm_eps": 0.00001
+        });
+        std::fs::write(
+            dir.path().join("config.json"),
+            serde_json::to_vec(&config).unwrap(),
+        )
+        .unwrap();
+
+        // UNNEEDED intentionally does not exist. Successful construction proves
+        // the real [0,1) request did not open it.
+        let model = ModelFactory::create_stage(
+            dir.path(),
+            &Device::Cpu,
+            DType::Float,
+            None,
+            KVQuantType::None,
+            None,
+            ModelStageRequest { layer_range: 0..1 },
+        )
+        .await
+        .unwrap();
+        let input = Tensor::from_slice(&[0_i64, 1]).reshape([1, 2]);
+        let embedded = model.embed_tokens(&input).unwrap();
+        assert_eq!(embedded.size(), [1, 2, 4]);
+    }
+
+    #[tokio::test]
+    async fn partial_stage_loads_fewer_tensors_and_bytes_than_whole_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = "model-00001-of-00002.safetensors";
+        let last = "model-00002-of-00002.safetensors";
+        write_shard(
+            dir.path(),
+            first,
+            &[
+                FixtureTensor::f32("model.embed_tokens.weight", &[8, 4], 0.1),
+                FixtureTensor::f32("model.layers.0.marker.weight", &[4, 4], 0.2),
+            ],
+        );
+        write_shard(
+            dir.path(),
+            last,
+            &[
+                FixtureTensor::f32("model.layers.1.marker.weight", &[16, 16], 0.3),
+                FixtureTensor::f32("model.norm.weight", &[4], 0.4),
+                FixtureTensor::f32("lm_head.weight", &[8, 4], 0.5),
+            ],
+        );
+        write_index(
+            dir.path(),
+            &[
+                ("model.embed_tokens.weight", first),
+                ("model.layers.0.marker.weight", first),
+                ("model.layers.1.marker.weight", last),
+                ("model.norm.weight", last),
+                ("lm_head.weight", last),
+            ],
+        );
+
+        let partial =
+            ModelFactory::load_weights_for_stage(dir.path(), 2, 1..2, &Device::Cpu, DType::Float)
+                .await
+                .unwrap();
+        let whole = ModelFactory::load_weights(dir.path(), &Device::Cpu, DType::Float)
+            .await
+            .unwrap();
+
+        let partial_names: BTreeSet<_> = partial.keys().map(String::as_str).collect();
+        assert_eq!(
+            partial_names,
+            BTreeSet::from([
+                "lm_head.weight",
+                "model.layers.1.marker.weight",
+                "model.norm.weight",
+            ])
+        );
+        assert!(partial.len() < whole.len());
+        assert!(loaded_bytes(&partial) < loaded_bytes(&whole));
+    }
+
+    #[tokio::test]
+    async fn stage_mode_fails_closed_without_a_valid_index() {
+        let dir = tempfile::tempdir().unwrap();
+        write_shard(
+            dir.path(),
+            "model.safetensors",
+            &[FixtureTensor::f32(
+                "model.embed_tokens.weight",
+                &[2, 2],
+                0.1,
+            )],
+        );
+
+        let missing =
+            ModelFactory::load_weights_for_stage(dir.path(), 1, 0..1, &Device::Cpu, DType::Float)
+                .await
+                .unwrap_err();
+        assert!(
+            missing
+                .to_string()
+                .contains("requires authoritative shard index"),
+            "got: {missing}"
+        );
+
+        std::fs::write(
+            dir.path().join("model.safetensors.index.json"),
+            br#"{"weight_map":[]}"#,
+        )
+        .unwrap();
+        let malformed =
+            ModelFactory::load_weights_for_stage(dir.path(), 1, 0..1, &Device::Cpu, DType::Float)
+                .await
+                .unwrap_err();
+        assert!(
+            malformed.to_string().contains("valid `weight_map` object"),
+            "got: {malformed}"
+        );
     }
 }
