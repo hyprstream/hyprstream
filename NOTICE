@@ -1,0 +1,19 @@
+# Hyprstream MIT-origin attribution notice
+
+Copyright 2025 Erica Windisch, Cyberdione Labs.
+
+Portions of this source distribution were originally released under the MIT
+License by the copyright holder above. Their MIT-origin attribution and
+permission notice are preserved in `LICENSE-MIT` and must accompany copies or
+substantial portions of that MIT-origin source.
+
+This attribution is intentionally non-exhaustive: it applies to every
+MIT-origin portion of the repository, including portions now distributed in a
+package classified Apache-2.0, AGPL-3.0-only, MIT, or under a later package
+classification. It is not a list of AGPL packages and must not be used as one.
+
+Current package licensing is stated by each package manifest and enforced by
+`.github/license-boundary.toml`. `LICENSE-APACHE` and `LICENSE-AGPLV3` remain
+the canonical texts for their respective current classifications. This notice
+records MIT provenance and attribution; it does not grant a new MIT license for
+later contributions.
