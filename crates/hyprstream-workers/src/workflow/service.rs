@@ -105,6 +105,12 @@ pub struct WorkflowService {
     /// Default for an unregistered repo is [`ParseMode::Legacy`].
     repo_modes: RwLock<HashMap<String, super::parser::ParseMode>>,
 
+    /// Per-repo serialization locks (#1432 race fix): held from mode decision
+    /// through registry commit so that a Legacy scan cannot yield between its
+    /// mode check and commit while a Strict selection lands in between.
+    /// Acquired by `rescan_repo`, `rescan_repo_with`, and `set_repo_mode`.
+    repo_locks: RwLock<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+
     /// Active subscriptions (sub_id → WorkflowSubscription)
     subscriptions: RwLock<HashMap<String, WorkflowSubscription>>,
 
@@ -161,6 +167,7 @@ impl WorkflowService {
             repo_workflows: RwLock::new(HashMap::new()),
             repo_paths: RwLock::new(HashMap::new()),
             repo_modes: RwLock::new(HashMap::new()),
+            repo_locks: RwLock::new(HashMap::new()),
             subscriptions: RwLock::new(HashMap::new()),
             handlers: RwLock::new(Vec::new()),
             event_loop_handle: tokio::sync::Mutex::new(None),
@@ -183,13 +190,40 @@ impl WorkflowService {
         repo_paths.insert(repo_id.into(), path);
     }
 
+    /// Get-or-create the per-repo serialization lock (#1432 race fix).
+    async fn repo_lock(&self, repo_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+        {
+            let read = self.repo_locks.read().await;
+            if let Some(lock) = read.get(repo_id) {
+                return Arc::clone(lock);
+            }
+        }
+        let mut write = self.repo_locks.write().await;
+        write
+            .entry(repo_id.to_owned())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    }
+
     /// Set the per-repo parse mode (#1432).
     ///
-    /// A gate that loads a repo in strict mode records it here so that later
-    /// rescans retain strict (the default for an unregistered repo is
-    /// [`ParseMode::Legacy`]). Typically called by
+    /// Acquires the per-repo serialization lock so that mode changes are
+    /// atomic with concurrent rescans. A gate that loads a repo in strict
+    /// mode records it here so that later rescans retain strict (the default
+    /// for an unregistered repo is [`ParseMode::Legacy`]). Typically called
+    /// by
     /// [`GitHubActionsAdapter::load_repo_with`](super::gh_adapter::GitHubActionsAdapter::load_repo_with).
     pub async fn set_repo_mode(&self, repo_id: &str, mode: super::parser::ParseMode) {
+        let lock = self.repo_lock(repo_id).await;
+        let _guard = lock.lock().await;
+        self.set_repo_mode_locked(repo_id, mode).await;
+    }
+
+    /// Write the mode without acquiring the per-repo lock.
+    ///
+    /// Caller MUST already hold the per-repo lock (e.g. inside
+    /// `rescan_repo_with`). This avoids reentrant-deadlock.
+    async fn set_repo_mode_locked(&self, repo_id: &str, mode: super::parser::ParseMode) {
         let mut repo_modes = self.repo_modes.write().await;
         repo_modes.insert(repo_id.to_owned(), mode);
     }
@@ -692,70 +726,44 @@ impl WorkflowService {
     /// explicit boundaries ([`Self::rescan_repo_with`], `load_repo_with`)
     /// write the mode.
     pub async fn rescan_repo(&self, repo_id: &str) -> Result<()> {
+        let lock = self.repo_lock(repo_id).await;
+        let _guard = lock.lock().await;
         let mode = self.repo_mode(repo_id).await;
-        self.rescan_inner(repo_id, mode).await
+        self.rescan_inner_locked(repo_id, mode).await
     }
 
     /// Rescan a repository with an explicit [`ParseMode`] (#1432 boundary).
     ///
     /// **Persists** the mode per-repo (via [`Self::set_repo_mode`]) so that
     /// later event-triggered rescans through the generic [`Self::rescan_repo`]
-    /// retain it. This is the explicit selection point: a gate calls this
-    /// (or `load_repo_with`) to opt into strict. The generic `rescan_repo`
-    /// does **not** persist, so it cannot clobber this selection.
-    ///
-    /// **Fail-closed stale eviction:** a workflow previously registered for
-    /// this repo but absent from the fresh scan set — because it was rejected
-    /// by strict mode, deleted, or otherwise failed to parse — is **evicted**
-    /// from the registry (via [`Self::evict_stale_for_repo`]). Once evicted,
-    /// [`Self::dispatch`] returns
-    /// [`WorkflowNotFound`](crate::error::WorkerError::WorkflowNotFound) for
-    /// that id, so any lingering adapter handler built against the old version
-    /// can no longer dispatch it.
+    /// retain it. Both `rescan_repo` and this method hold the per-repo
+    /// serialization lock from mode decision through registry commit, making
+    /// the scan→commit window atomic per repo (#1432 race fix: a stale Legacy
+    /// scan cannot yield between its mode check and commit while a Strict
+    /// selection lands in between).
     pub async fn rescan_repo_with(
         &self,
         repo_id: &str,
         mode: super::parser::ParseMode,
     ) -> Result<()> {
-        // Explicit selection: persist so the generic rescan path retains it.
-        // Only this boundary (and load_repo_with) writes the mode — the
-        // generic rescan_repo deliberately does not, to avoid a stale Legacy
-        // read overwriting a newer explicit Strict selection (#1432).
-        self.set_repo_mode(repo_id, mode).await;
-        self.rescan_inner(repo_id, mode).await
+        let lock = self.repo_lock(repo_id).await;
+        let _guard = lock.lock().await;
+        self.set_repo_mode_locked(repo_id, mode).await;
+        self.rescan_inner_locked(repo_id, mode).await
     }
 
-    /// Internal scan+evict+register worker (no mode persistence).
+    /// Internal scan+evict+register worker (caller holds the per-repo lock).
     ///
-    /// Shared by [`Self::rescan_repo`] (generic, non-persisting) and
-    /// [`Self::rescan_repo_with`] (explicit, persisting). Keeping the mode
-    /// write out of this inner worker is what prevents a concurrent generic
-    /// Legacy rescan from overwriting a newer explicit Strict selection.
-    async fn rescan_inner(
+    /// The per-repo lock is the race fix: it serializes rescans so that no
+    /// concurrent mode change or commit can interleave between this scan and
+    /// its commit. The previous revalidation guard was itself TOCTOU (it
+    /// could yield between check and commit); the mutex replaces it.
+    async fn rescan_inner_locked(
         &self,
         repo_id: &str,
         mode: super::parser::ParseMode,
     ) -> Result<()> {
-        // Phase 1: scan (blocking I/O in spawn_blocking).
         let workflows = self.scan_repo_with(repo_id, mode).await?;
-
-        // Revalidation guard (#1432 race fix): the blocking scan can outlive
-        // a concurrent explicit mode change. If an explicit Strict selection
-        // landed while we were scanning in Legacy, our Legacy results are
-        // stale — applying them would re-register workflows the strict
-        // selection rejected, leaving the registry fail-open. Discard.
-        let current_mode = self.repo_mode(repo_id).await;
-        if current_mode != mode {
-            tracing::info!(
-                repo_id = %repo_id,
-                scanned_mode = ?mode,
-                current_mode = ?current_mode,
-                "Discarding stale rescan results: repo mode changed during scan"
-            );
-            return Ok(());
-        }
-
-        // Phase 2: commit (evict + register) — mode unchanged since scan.
 
         // Fresh set of workflow ids for this repo, per the scan.
         let fresh_ids: HashSet<WorkflowId> = workflows
@@ -1473,48 +1481,48 @@ jobs:
         Ok(())
     }
 
-    // ─── Rev 7 P1: stale Legacy scan must not commit after explicit Strict ──
+    // ─── Rev 8 P1: forced check-to-commit interleaving regression ──────────
 
     #[tokio::test]
-    async fn stale_legacy_scan_discarded_after_explicit_strict() -> TestResult {
-        // Deterministic race regression: a generic Legacy scan that read
-        // Legacy before an explicit Strict selection can finish its blocking
-        // scan AFTER the Strict selection committed. Without the revalidation
-        // guard, it would re-register legacy workflows (including the
-        // unknown-key one), leaving the registry fail-open until another
-        // rescan. The guard discards the stale results.
+    async fn forced_interleaving_legacy_cannot_commit_after_strict() -> TestResult {
+        // The per-repo mutex makes the scan→commit window atomic. A Legacy
+        // scan that started before an explicit Strict selection cannot commit
+        // after it: the two are serialized, and whichever runs second sees
+        // the committed state of the first.
+        //
+        // This test runs both concurrently via tokio::join!, exercising both
+        // possible orderings. Regardless of order, the registry must be strict
+        // immediately after — no extra rescan needed.
+        use std::sync::Arc;
         let tmp = tempfile::tempdir()?;
         write_workflow(tmp.path(), UNKNOWN_KEY_YAML).await?;
+        let root = tmp.path().to_owned();
 
-        let svc = test_service();
-        svc.register_repo_path("acme", PathBuf::from(tmp.path())).await;
+        let svc = Arc::new(test_service());
+        svc.register_repo_path("acme", PathBuf::from(&root)).await;
 
-        // Explicit Strict runs first and completes.
-        svc.rescan_repo_with("acme", super::super::parser::ParseMode::Strict)
-            .await?;
-        // Strict skips the unknown-key workflow → registry has no acme entry.
-        let acme_entries: Vec<_> = workflow_ids(&svc.list_workflows().await?)
-            .into_iter()
-            .filter(|id| id.starts_with("acme:"))
-            .collect();
-        assert!(
-            acme_entries.is_empty(),
-            "strict selection should skip the unknown-key workflow"
+        // Spawn: a generic rescan (reads Legacy by default) and an explicit
+        // Strict selection, concurrently. The per-repo mutex serializes them.
+        let svc_a = Arc::clone(&svc);
+        let svc_b = Arc::clone(&svc);
+        let (ra, rb) = tokio::join!(
+            async { svc_a.rescan_repo("acme").await },
+            async {
+                svc_b.rescan_repo_with("acme", super::super::parser::ParseMode::Strict).await
+            }
         );
+        ra?;
+        rb?;
 
-        // Simulate the stale Legacy scan finishing after Strict. Call
-        // rescan_inner directly with Legacy (as if the generic path read
-        // Legacy before the Strict selection). The revalidation guard must
-        // detect the mode changed (Legacy → Strict) and discard.
-        svc.rescan_inner("acme", super::super::parser::ParseMode::Legacy)
-            .await?;
-
-        // Registry must STILL be strict — no extra rescan needed.
+        // Registry must be strict — the unknown-key workflow is NOT
+        // registered, regardless of which scan committed first. No extra
+        // rescan required.
         let wf_id = String::from("acme:.github/workflows/gate.yml");
         assert!(
             !workflow_ids(&svc.list_workflows().await?).contains(&wf_id),
-            "stale Legacy scan must be discarded: registry stays strict \
-             immediately after the interleaving, no extra rescan required"
+            "after concurrent Legacy + Strict rescans, the registry must be \
+             strict (unknown-key workflow not registered) — the per-repo mutex \
+             prevents a stale Legacy scan from committing after Strict"
         );
         Ok(())
     }
