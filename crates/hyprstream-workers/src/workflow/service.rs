@@ -383,6 +383,13 @@ impl WorkflowService {
     /// Uses the path registered via `register_repo_path`. Returns an empty
     /// Vec (not an error) if no path is registered for the repo or if the
     /// workflows directory does not exist.
+    ///
+    /// Workflows are parsed in **strict / fail-closed** mode
+    /// ([`Workflow::parse_strict`]): a file with an unknown structural key
+    /// (e.g. `permissions:`, `concurrency:`, `services:`) is **skipped** with
+    /// a warn-log rather than silently loaded with dropped semantics. This is
+    /// the merge-gate loader path (#1432) — failing closed here means the
+    /// gate never executes a workflow it does not fully understand.
     pub(crate) async fn scan_repo(&self, repo_id: &str) -> Result<Vec<WorkflowDef>> {
         tracing::info!(repo_id = %repo_id, "Scanning repository for workflows");
 
@@ -435,10 +442,10 @@ impl WorkflowService {
                     }
                 };
 
-                let workflow = match Workflow::parse(&yaml) {
+                let workflow = match Workflow::parse_strict(&yaml) {
                     Ok(w) => w,
                     Err(e) => {
-                        tracing::warn!(path = %path.display(), error = %e, "Failed to parse workflow");
+                        tracing::warn!(path = %path.display(), error = %e, "Failed to parse workflow (strict mode); skipping");
                         continue;
                     }
                 };
@@ -744,7 +751,11 @@ impl WorkflowHandler for WorkflowService {
                 jobs: HashMap::new(),
             }
         } else {
-            Workflow::parse(&data.yaml)?
+            // Gate loader path: strict mode rejects unknown structural keys
+            // so a workflow using unsupported semantics (e.g. `permissions:`,
+            // `concurrency:`) is refused rather than silently registered with
+            // dropped semantics (#1432).
+            Workflow::parse_strict(&data.yaml)?
         };
         let triggers = extract_triggers(&workflow);
         let workflow_def = WorkflowDef {
