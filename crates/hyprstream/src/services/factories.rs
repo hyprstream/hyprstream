@@ -1423,6 +1423,20 @@ fn create_workflow_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawn
     }
     workflow_service.set_jwt_key_source(ctx.cluster_key_source());
 
+    // Pin the MCP relay key so delegated-bearer requests (MCP tool calls
+    // relaying a caller JWT) pass verify_claims instead of being rejected as
+    // unauthorized relays (#989 review). Fail-closed if the MCP service key
+    // isn't registered yet — no delegation is accepted until it is pinned.
+    if let Some(mcp_vk) = hyprstream_service::global_trust_store().resolve_one("mcp") {
+        workflow_service.set_mcp_relay_pubkey(mcp_vk.to_bytes());
+    } else {
+        tracing::warn!(
+            "workflow service started without a pinned MCP relay key; \
+             delegated-bearer MCP tool calls will be rejected until the mcp \
+             service key is registered (#989)"
+        );
+    }
+
     Ok(ctx.into_spawnable(workflow_service))
 }
 
