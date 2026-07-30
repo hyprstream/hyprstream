@@ -51,6 +51,12 @@ name = "hyprstream"
 version = "*"
 allow = ["MIT", "AGPL-3.0-only"]
 
+# Authority-bearing Kubernetes grant/PDS adapter (#1422).
+[[licenses.exceptions]]
+name = "hyprstream-k8s-pds"
+version = "*"
+allow = ["AGPL-3.0-only"]
+
 # systemd/libsystemd-sys are LGPL + GCC exception.
 # The GCC exception permits non-copyleft software to dynamically link against LGPL libraries
 # without triggering the copyleft requirement; hyprstream links libsystemd dynamically.
