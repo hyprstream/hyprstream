@@ -1,5 +1,18 @@
 name: Publish browser WASM SDK
 
+# This workflow can NEVER publish merely because a PR merged into main.
+#   - pull_request: build, pack, and smoke-test only (no publish).
+#   - push to main : build, pack, smoke, attest, and expose the exact
+#                    deterministic staging artifact identity — but DO NOT
+#                    publish. The identity is surfaced so a human can review it
+#                    before any publish is authorized.
+#   - push tag     : build + publish immutable production semver (protected
+#                    npm-production environment + exact release tag).
+#   - workflow_dispatch (main only): the ONLY way to publish staging. Requires
+#                    the operator to pre-state the exact version and SHA-256
+#                    the build must reproduce, then rebuilds, verifies the
+#                    rebuilt tarball matches both inputs bit-for-bit, and only
+#                    then asks the protected npm-staging environment to publish.
 on:
   pull_request:
     paths:
@@ -15,9 +28,17 @@ on:
     branches: ['main']
     tags: ['hyprstream-rpc-v*']
   workflow_dispatch:
+    inputs:
+      expected_version:
+        description: 'Exact staging version the rebuilt tarball must carry (copy from the expose-staging-identity job summary on main, e.g. 0.1.0-dev.1234.48fa145a56eb). Publish is refused if the rebuilt artifact differs.'
+        required: true
+      expected_sha256:
+        description: 'Exact hex SHA-256 the rebuilt tarball must have (copy from the expose-staging-identity job summary on main). Publish is refused if the rebuilt artifact differs.'
+        required: true
 
-# Build/PR jobs cannot publish. Each publishing job receives only an ephemeral
-# GitHub OIDC identity for npm trusted publishing; no npm token is supported.
+# Build/PR/identity jobs cannot publish. Each publishing job receives only an
+# ephemeral GitHub OIDC identity for npm trusted publishing; no npm token is
+# supported and there is no token fallback.
 permissions:
   contents: read
 
@@ -41,6 +62,10 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
+          # Full history so the staging version's commit-count component is
+          # exact and reproducible (a shallow clone would make packaging fail
+          # closed for the staging channel).
+          fetch-depth: 0
 
       - name: Install Cap'n Proto
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends capnproto
@@ -63,7 +88,10 @@ jobs:
       - name: Build, pack, and smoke test
         run: bash .github/scripts/package-rpc-std-wasm.sh
         env:
-          PACKAGE_CHANNEL: ${{ github.ref == 'refs/heads/main' && 'staging' || startsWith(github.ref, 'refs/tags/hyprstream-rpc-v') && 'production' || 'ci' }}
+          # PRs use the throwaway ci channel; main + manual staging dispatch
+          # use staging; protected release tags use production. No value here
+          # can publish on its own — publishing needs a separate gated job.
+          PACKAGE_CHANNEL: ${{ (github.event_name == 'pull_request') && 'ci' || (startsWith(github.ref, 'refs/tags/hyprstream-rpc-v') && 'production') || 'staging' }}
 
       - name: Upload exact package and integrity evidence
         uses: actions/upload-artifact@v4
@@ -82,10 +110,89 @@ jobs:
         with:
           subject-path: dist/hyprstream-rpc-std-wasm/*.tgz
 
-  publish-staging:
-    name: Publish main to staging dist-tag
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+  # Read-only identity exposure. This job performs NO registry write and holds
+  # no id-token. It surfaces the exact deterministic staging version, tarball
+  # SHA-256, npm SHA-512 SRI, npm shasum, and file inventory so a human can
+  # review the artifact identity before any write-capable publishing job runs.
+  # It runs on push-to-main (where no publish follows) and on the manual
+  # staging dispatch (where publish-staging depends on it).
+  expose-staging-identity:
+    name: Expose exact staging artifact identity (read-only)
+    if: github.event_name != 'pull_request' && !startsWith(github.ref, 'refs/tags/hyprstream-rpc-v') && github.ref == 'refs/heads/main'
     needs: build-package-smoke
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.identity.outputs.version }}
+      sha256: ${{ steps.identity.outputs.sha256 }}
+      integrity: ${{ steps.identity.outputs.integrity }}
+      npm_shasum: ${{ steps.identity.outputs.npm_shasum }}
+      tarball: ${{ steps.identity.outputs.tarball }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: hyprstream-rpc-std-wasm-${{ github.sha }}
+          path: dist/hyprstream-rpc-std-wasm
+      - name: Read and expose artifact identity
+        id: identity
+        run: |
+          set -euo pipefail
+          node <<'NODE'
+          const fs = require('node:fs');
+          const evidence = JSON.parse(fs.readFileSync('dist/hyprstream-rpc-std-wasm/integrity.json', 'utf8'));
+          if (evidence.schema !== 1) throw new Error('unexpected evidence schema');
+          if (evidence.package !== '@hyprstream/rpc') throw new Error('unexpected package identity');
+          if (evidence.channel !== 'staging') throw new Error(`not a staging artifact: ${evidence.channel}`);
+          if (!evidence.version.includes('-dev.')) throw new Error('staging version must be a unique dev prerelease');
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, [
+            `version=${evidence.version}`,
+            `sha256=${evidence.sha256}`,
+            `integrity=${evidence.integrity}`,
+            `npm_shasum=${evidence.npmShasum}`,
+            `tarball=${evidence.tarball}`,
+          ].join('\n') + '\n');
+          const inv = evidence.files.map(f => `| \`${f.path}\` | ${f.size} |`).join('\n');
+          fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, [
+            '### Staging artifact identity (read-only — nothing is published)',
+            '',
+            '| field | value |',
+            '|---|---|',
+            `| package | \`${evidence.package}\` |`,
+            `| version | \`${evidence.version}\` |`,
+            `| channel | \`${evidence.channel}\` |`,
+            `| tarball | \`${evidence.tarball}\` |`,
+            `| sha256 | \`${evidence.sha256}\` |`,
+            `| integrity (SRI) | \`${evidence.integrity}\` |`,
+            `| npm shasum | \`${evidence.npmShasum}\` |`,
+            `| source commit | \`${evidence.source.commit}\` |`,
+            `| source ref | \`${evidence.source.ref}\` |`,
+            '',
+            '#### File inventory',
+            '',
+            '| path | size |',
+            '|---|---|',
+            inv,
+            '',
+            'A push to `main` **never publishes**. To publish this exact artifact under the `staging` dist-tag, re-run this workflow manually on this commit (GitHub Actions → "Run workflow" → branch `main`) supplying:',
+            '',
+            '- `expected_version`: the version above',
+            '- `expected_sha256`: the sha256 above',
+            '',
+            'The dispatch rebuilds, verifies the rebuilt tarball matches both inputs bit-for-bit, and only then asks the protected `npm-staging` environment (required reviewers) to publish.',
+          ].join('\n') + '\n');
+          NODE
+
+  # Manual staging gate. This job NEVER runs from a push (so merging the PR
+  # cannot publish). It only runs from an explicit workflow_dispatch on main,
+  # requires the operator to pre-state the exact version and SHA-256, and only
+  # publishes after the rebuilt artifact matches both the pre-statement and the
+  # freshly exposed identity — and after the protected npm-staging environment
+  # (required reviewers) approves. Tokenless npm Trusted Publishing/OIDC only.
+  publish-staging:
+    name: Publish main to staging dist-tag (manual gate)
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
+    needs: [build-package-smoke, expose-staging-identity]
     runs-on: ubuntu-latest
     environment: npm-staging
     permissions:
@@ -104,9 +211,30 @@ jobs:
         with:
           name: hyprstream-rpc-std-wasm-${{ github.sha }}
           path: dist/hyprstream-rpc-std-wasm
-      - name: Verify the exact build artifact
+      - name: Verify channel, ref, integrity, and operator pre-statement
         id: package
+        env:
+          EXPECTED_VERSION: ${{ github.event.inputs.expected_version }}
+          EXPECTED_SHA256: ${{ github.event.inputs.expected_sha256 }}
         run: echo "tarball=$(node .github/scripts/verify-rpc-std-wasm-package.mjs dist/hyprstream-rpc-std-wasm staging)" >> "$GITHUB_OUTPUT"
+      - name: Cross-check against the exposed identity
+        env:
+          EXPOSED_VERSION: ${{ needs.expose-staging-identity.outputs.version }}
+          EXPOSED_SHA256: ${{ needs.expose-staging-identity.outputs.sha256 }}
+        run: |
+          set -euo pipefail
+          node <<'NODE'
+          const fs = require('node:fs');
+          const evidence = JSON.parse(fs.readFileSync('dist/hyprstream-rpc-std-wasm/integrity.json', 'utf8'));
+          const exposedVersion = process.env.EXPOSED_VERSION;
+          const exposedSha = process.env.EXPOSED_SHA256;
+          if (!exposedVersion || !exposedSha) throw new Error('expose-staging-identity outputs are missing');
+          if (evidence.version !== exposedVersion)
+            throw new Error(`artifact version ${evidence.version} != exposed ${exposedVersion}`);
+          if (evidence.sha256 !== exposedSha)
+            throw new Error(`artifact sha256 ${evidence.sha256} != exposed ${exposedSha}`);
+          console.log(`identity confirmed: ${evidence.package}@${evidence.version} sha256=${evidence.sha256}`);
+          NODE
       - name: Publish only under staging
         run: npm publish "${{ steps.package.outputs.tarball }}" --registry "$NPM_REGISTRY" --tag staging --access public --provenance
 

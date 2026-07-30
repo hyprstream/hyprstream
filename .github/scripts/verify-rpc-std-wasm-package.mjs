@@ -1,6 +1,11 @@
 #!/usr/bin/env node
 // Verify the downloaded build artifact before a publishing job hands it to npm.
 // This intentionally performs no network access and accepts no credentials.
+//
+// Optional operator pre-statement (used by the manual staging gate): if the
+// EXPECTED_VERSION and/or EXPECTED_SHA256 environment variables are set, the
+// artifact's evidence must match them exactly. This lets a reviewer pre-state
+// the identity out-of-band and refuse a build that diverges.
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -49,9 +54,28 @@ if (expectedChannel === 'production') {
     throw new Error('production package must use the crate release semver, not a prerelease/floating version');
   }
 } else {
-  if (process.env.GITHUB_REF !== 'refs/heads/main' || !evidence.version.includes('-dev.')) {
-    throw new Error('staging package must be a unique main-branch dev prerelease');
+  if (process.env.GITHUB_REF !== 'refs/heads/main') {
+    throw new Error('staging publication is restricted to refs/heads/main');
   }
+  // Commit-deterministic dev prerelease: <crate-version>-dev.<commit-count>.<short-sha>
+  if (!/^\d+\.\d+\.\d+-dev\.\d+\.[0-9a-f]{7,}$/.test(evidence.version)) {
+    throw new Error(`staging version must be a commit-deterministic dev prerelease, got ${evidence.version}`);
+  }
+}
+
+// Operator pre-statement gate. When the publishing job is driven by a manual
+// dispatch that pre-stated the exact identity, refuse any divergence before
+// handing the tarball to npm.
+const expectedVersion = process.env.EXPECTED_VERSION;
+const expectedSha256 = process.env.EXPECTED_SHA256;
+if (expectedVersion !== undefined && expectedVersion !== evidence.version) {
+  throw new Error(`artifact version ${evidence.version} != operator pre-stated ${expectedVersion}`);
+}
+if (expectedSha256 !== undefined && expectedSha256 !== evidence.sha256) {
+  throw new Error(`artifact sha256 ${evidence.sha256} != operator pre-stated ${expectedSha256}`);
+}
+if ((expectedVersion === undefined) !== (expectedSha256 === undefined)) {
+  throw new Error('EXPECTED_VERSION and EXPECTED_SHA256 must be set together');
 }
 
 console.log(path.join(distDir, tarballs[0]));

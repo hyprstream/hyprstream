@@ -5,6 +5,8 @@
 .context
 _future
 target
+# npm tarball + integrity evidence emitted by .github/scripts/package-rpc-std-wasm.sh
+dist
 codegen-out
 models
 libtorch

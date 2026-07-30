@@ -11,9 +11,17 @@ readonly RELEASE_TAG_PREFIX="hyprstream-rpc"
 readonly REGISTRY="https://registry.npmjs.org"
 readonly CHANNEL="${PACKAGE_CHANNEL:-ci}"
 readonly SHA="${GITHUB_SHA:-$(git -C "$ROOT" rev-parse HEAD)}"
-readonly RUN_NUMBER="${GITHUB_RUN_NUMBER:-0}"
-readonly RUN_ATTEMPT="${GITHUB_RUN_ATTEMPT:-1}"
 readonly SHORT_SHA="${SHA:0:12}"
+# Commit count reachable from HEAD. Used for the staging version so that the
+# same main commit ALWAYS yields the same staging version — independent of the
+# CI run number — letting an operator pre-state and verify the exact identity
+# before authorizing a publish. Full history (checkout fetch-depth: 0) is
+# required for this to be exact; a shallow clone makes this fail closed.
+readonly COMMIT_COUNT="$(git -C "$ROOT" rev-list --count HEAD 2>/dev/null || echo 0)"
+if [[ "$COMMIT_COUNT" == "0" && "$CHANNEL" == "staging" ]]; then
+  echo "staging version needs full git history (commit count); refusing to publish a floating version" >&2
+  exit 1
+fi
 
 crate_version="$({
   python3 - "$CRATE_DIR/Cargo.toml" <<'PY'
@@ -38,10 +46,15 @@ case "$CHANNEL" in
       echo "staging publication is restricted to refs/heads/main" >&2
       exit 1
     fi
-    package_version="${crate_version}-dev.${RUN_NUMBER}.${RUN_ATTEMPT}.${SHORT_SHA}"
+    # Commit-deterministic: 0.1.0-dev.<commit-count>.<short-sha>. The same
+    # main commit reproduces this exact version across independent CI runs, so
+    # the staging version is not tied to a particular run number.
+    package_version="${crate_version}-dev.${COMMIT_COUNT}.${SHORT_SHA}"
     ;;
   ci)
-    package_version="${crate_version}-ci.${RUN_NUMBER}.${RUN_ATTEMPT}.${SHORT_SHA}"
+    # Throwaway PR channel: never published. Commit-derived so it does not
+    # depend on the CI run number either.
+    package_version="${crate_version}-ci.${COMMIT_COUNT}.${SHORT_SHA}"
     ;;
   *)
     echo "unknown PACKAGE_CHANNEL: $CHANNEL" >&2
