@@ -1,7 +1,55 @@
-# Target map for the license-graph guard. This is intentionally separate from
-# Cargo manifest licenses so the guard lands before the mechanical relicense.
+# Exhaustive owner-approved license map for every local Cargo package.
+# The guard requires exact manifest parity and fails closed on new packages.
 [license_gate]
-apache_roots = [
+mit_packages = [
+  "bitsandbytes-sys",
+  "cas-serve",
+  "git-xet-filter",
+]
+
+agpl_packages = [
+  "hyprstream-flight",
+  "hyprstream-metrics",
+  "hyprstream-vfs-server",
+  "hyprstream-workers",
+]
+
+apache_packages = [
+  "chat-core",
+  "git2db",
+  "hyprstream",
+  "hyprstream-9p",
+  "hyprstream-appview",
+  "hyprstream-compositor",
+  "hyprstream-containedfs",
+  "hyprstream-crypto",
+  "hyprstream-discovery",
+  "hyprstream-k8s",
+  "hyprstream-k8s-pds",
+  "hyprstream-ledger",
+  "hyprstream-p2p",
+  "hyprstream-pds",
+  "hyprstream-pds-service",
+  "hyprstream-resource",
+  "hyprstream-rpc",
+  "hyprstream-rpc-build",
+  "hyprstream-rpc-derive",
+  "hyprstream-rpc-std",
+  "hyprstream-service",
+  "hyprstream-tui",
+  "hyprstream-util",
+  "hyprstream-vfs",
+  "hyprstream-workers-python",
+  "hyprstream-workers-python-guest",
+  "hyprstream-workers-tcl",
+  "hyprstream-workers-wasmtime",
+  "hyprstream-workers-wasmtime-fsguest",
+  "waxterm",
+]
+
+# Reusable permissive-only roots retain a strict complete resolved-graph
+# guarantee: none may reach a local AGPL package through any dependency source.
+permissive_roots = [
   "hyprstream-crypto",
   "hyprstream-k8s",
   "hyprstream-rpc",
@@ -18,33 +66,9 @@ apache_roots = [
   "hyprstream-workers-wasmtime-fsguest",
 ]
 
-agpl_services = [
+# Apache-declared application source may aggregate AGPL components. Combined
+# distributions carry the AGPL obligation even though the application's own
+# source files remain Apache-2.0.
+agpl_aggregators = [
   "hyprstream",
-  "hyprstream-appview",
-  "hyprstream-discovery",
-  "hyprstream-k8s-pds",
-  "hyprstream-ledger",
-  "hyprstream-pds",
-  "hyprstream-pds-service",
-  "hyprstream-service",
-]
-
-# Packages outside the one-way Apache-library/AGPL-service boundary remain
-# explicit so deleting any classification fails closed.
-other_packages = [
-  "bitsandbytes-sys",
-  "cas-serve",
-  "chat-core",
-  "git-xet-filter",
-  "git2db",
-  "hyprstream-9p",
-  "hyprstream-compositor",
-  "hyprstream-containedfs",
-  "hyprstream-flight",
-  "hyprstream-metrics",
-  "hyprstream-p2p",
-  "hyprstream-resource",
-  "hyprstream-vfs-server",
-  "hyprstream-workers",
-  "waxterm",
 ]

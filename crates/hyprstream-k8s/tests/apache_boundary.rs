@@ -1,4 +1,4 @@
-//! License-boundary regression for the reusable Kubernetes substrate.
+//! Resolved license-boundary regression for reusable permissive roots.
 //!
 //! Cargo's committed resolved lock graph is the source of dependency truth.
 //! It retains normal, build, dev, target, renamed, `[patch]`, and `[replace]`
@@ -7,8 +7,8 @@
 //! and classifies local packages by their SPDX metadata rather than copied
 //! names. Full metadata resolution remains in the causal fixtures. When
 //! #1417's omission-checked `.github/license-boundary.toml` is present, its
-//! `agpl_services` partition augments manifest metadata; that is the only
-//! policy integration seam.
+//! `agpl_packages` partition augments manifest metadata and its
+//! `permissive_roots` list selects the production roots checked here.
 
 #![allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 
@@ -100,23 +100,31 @@ fn contains_agpl_identifier(expression: &str) -> bool {
         .any(|identifier| identifier.starts_with("AGPL-"))
 }
 
-fn policy_agpl_packages(workspace_root: &Path) -> Result<BTreeSet<String>, String> {
+fn policy_packages(workspace_root: &Path, key: &str) -> Result<BTreeSet<String>, String> {
     let path = workspace_root.join(".github/license-boundary.toml");
     if !path.exists() {
         return Ok(BTreeSet::new());
     }
     let policy = load_toml(&path)?;
-    policy["license_gate"]["agpl_services"]
+    policy["license_gate"][key]
         .as_array()
-        .ok_or_else(|| format!("{} must define license_gate.agpl_services", path.display()))?
+        .ok_or_else(|| format!("{} must define license_gate.{key}", path.display()))?
         .iter()
         .map(|value| {
             value
                 .as_str()
                 .map(str::to_owned)
-                .ok_or_else(|| format!("{} has a non-string AGPL package", path.display()))
+                .ok_or_else(|| format!("{} has a non-string package in {key}", path.display()))
         })
         .collect()
+}
+
+fn policy_agpl_packages(workspace_root: &Path) -> Result<BTreeSet<String>, String> {
+    policy_packages(workspace_root, "agpl_packages")
+}
+
+fn policy_permissive_roots(workspace_root: &Path) -> Result<BTreeSet<String>, String> {
+    policy_packages(workspace_root, "permissive_roots")
 }
 
 fn resolved_metadata(
@@ -301,7 +309,19 @@ fn declared_dependency_matches_locked(
     }
 
     match (&dependency.source, &package.source) {
-        (Some(declared), Some(resolved)) => Ok(source_identity_matches(resolved, declared)),
+        // A crates.io declaration may resolve from a Git or local `[patch]` /
+        // `[replace]`. The exact root lock edge, package name, and version
+        // remain identity-bearing; `--locked` validates the substitution.
+        (Some(declared), Some(resolved)) => {
+            Ok(source_identity_matches(resolved, declared) || declared.starts_with("registry+"))
+        }
+        (Some(declared), None) if declared.starts_with("registry+") => {
+            Ok(local_packages.iter().any(|candidate| {
+                candidate.name == package.name
+                    && candidate.version == package.version
+                    && candidate.source.is_none()
+            }))
+        }
         (None, None) => Ok(true),
         _ => Ok(false),
     }
@@ -379,21 +399,6 @@ fn assert_root_dependencies_locked(
     Ok(())
 }
 
-fn check_locked_apache_boundary(
-    workspace_root: &Path,
-    root_manifest_path: &Path,
-) -> Result<(), String> {
-    let metadata = local_metadata(workspace_root, &workspace_root.join("Cargo.toml"))?;
-    let lock = load_cargo_lock(&workspace_root.join("Cargo.lock"))?;
-    assert_root_dependencies_locked(&metadata, &lock, root_manifest_path)?;
-    check_locked_apache_boundary_with(
-        workspace_root,
-        root_manifest_path,
-        &metadata.packages,
-        &lock,
-    )
-}
-
 fn check_locked_apache_boundary_with(
     policy_root: &Path,
     root_manifest_path: &Path,
@@ -423,19 +428,19 @@ fn check_locked_apache_boundary_with(
                 })
                 .ok_or_else(|| {
                     format!(
-                        "resolved local package {} {} has no local manifest metadata; Apache boundary fails closed",
+                        "resolved local package {} {} has no local manifest metadata; permissive boundary fails closed",
                         package.name, package.version
                     )
                 })?;
             let license = metadata_package.license.as_deref().ok_or_else(|| {
                 format!(
-                    "{} has no resolved package license; Apache boundary fails closed",
+                    "{} has no resolved package license; permissive boundary fails closed",
                     metadata_package.manifest_path.display()
                 )
             })?;
             if policy_agpl.contains(&package.name) || contains_agpl_identifier(license) {
                 return Err(format!(
-                    "Apache-2.0-to-AGPL dependency: {} ({license})",
+                    "permissive-root-to-AGPL dependency: {} ({license})",
                     chain.join(" -> ")
                 ));
             }
@@ -500,13 +505,13 @@ fn check_apache_boundary(workspace_root: &Path, root_manifest_path: &Path) -> Re
         if package.source.is_none() {
             let license = package.license.as_deref().ok_or_else(|| {
                 format!(
-                    "{} has no resolved package license; Apache boundary fails closed",
+                    "{} has no resolved package license; permissive boundary fails closed",
                     package.manifest_path.display()
                 )
             })?;
             if policy_agpl.contains(&package.name) || contains_agpl_identifier(license) {
                 return Err(format!(
-                    "Apache-2.0-to-AGPL dependency: {} ({license})",
+                    "permissive-root-to-AGPL dependency: {} ({license})",
                     chain.join(" -> ")
                 ));
             }
@@ -570,13 +575,84 @@ fn assert_transitive_patch_resolved(
 }
 
 #[test]
-fn hyprstream_k8s_complete_local_closure_excludes_agpl_services() {
+fn production_permissive_roots_complete_closures_exclude_agpl_packages() {
     let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
         .canonicalize()
         .expect("canonical workspace root");
-    let root_manifest_path = workspace_root.join("crates/hyprstream-k8s/Cargo.toml");
-    check_locked_apache_boundary(&workspace_root, &root_manifest_path).unwrap();
+    let roots = policy_permissive_roots(&workspace_root).unwrap();
+    assert!(
+        !roots.is_empty(),
+        "policy must select reusable permissive roots"
+    );
+
+    let workspace_metadata =
+        local_metadata(&workspace_root, &workspace_root.join("Cargo.toml")).unwrap();
+    let workspace_lock = load_cargo_lock(&workspace_root.join("Cargo.lock")).unwrap();
+    let mut checked = BTreeSet::new();
+
+    for root_name in &roots {
+        if let Some(root) = workspace_metadata
+            .packages
+            .iter()
+            .find(|package| &package.name == root_name)
+        {
+            let license = root.license.as_deref().expect("root license metadata");
+            assert!(
+                matches!(license, "MIT" | "Apache-2.0"),
+                "permissive root {root_name} has unauthorized license {license}"
+            );
+            assert_root_dependencies_locked(
+                &workspace_metadata,
+                &workspace_lock,
+                &root.manifest_path,
+            )
+            .unwrap();
+            check_locked_apache_boundary_with(
+                &workspace_root,
+                &root.manifest_path,
+                &workspace_metadata.packages,
+                &workspace_lock,
+            )
+            .unwrap();
+            checked.insert(root_name.clone());
+            continue;
+        }
+
+        let manifest_path = workspace_root
+            .join("crates")
+            .join(root_name)
+            .join("Cargo.toml");
+        let metadata = local_metadata(&workspace_root, &manifest_path).unwrap();
+        let lock_path = manifest_path
+            .parent()
+            .expect("excluded root manifest parent")
+            .join("Cargo.lock");
+        let lock = load_cargo_lock(&lock_path).unwrap();
+        let root = root_metadata(&metadata.packages, &manifest_path).unwrap();
+        let license = root
+            .license
+            .as_deref()
+            .expect("excluded root license metadata");
+        assert!(
+            matches!(license, "MIT" | "Apache-2.0"),
+            "permissive root {root_name} has unauthorized license {license}"
+        );
+        assert_root_dependencies_locked(&metadata, &lock, &manifest_path).unwrap();
+        check_locked_apache_boundary_with(
+            &workspace_root,
+            &manifest_path,
+            &metadata.packages,
+            &lock,
+        )
+        .unwrap();
+        checked.insert(root_name.clone());
+    }
+
+    assert_eq!(
+        checked, roots,
+        "every configured permissive root must be checked"
+    );
 }
 
 #[test]
@@ -882,9 +958,7 @@ renamed = { package = "new-service", path = "../service" }"#,
     write_fixture(
         &directory.path().join(".github/license-boundary.toml"),
         r#"[license_gate]
-apache_roots = ["apache-root"]
-agpl_services = ["new-service"]
-other_packages = []
+agpl_packages = ["new-service"]
 "#,
     );
     let error = check_apache_boundary(directory.path(), &root_manifest).unwrap_err();

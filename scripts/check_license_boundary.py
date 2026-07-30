@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Reject a configured Apache-2.0 root that reaches an AGPL-3.0-only service."""
+"""Enforce the owner's exhaustive package licenses and one-way AGPL boundary."""
 
 from __future__ import annotations
 
@@ -10,7 +10,11 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 DEPENDENCY_SECTIONS = {"dependencies", "build-dependencies", "dev-dependencies"}
-CLASS_NAMES = ("apache_roots", "agpl_services", "other_packages")
+CLASS_LICENSES = {
+    "mit_packages": "MIT",
+    "agpl_packages": "AGPL-3.0-only",
+    "apache_packages": "Apache-2.0",
+}
 
 
 def load(path: Path) -> dict:
@@ -24,7 +28,8 @@ def fail(message: str) -> None:
 
 def package_manifests(root: Path) -> dict[str, tuple[Path, dict]]:
     manifests: dict[str, tuple[Path, dict]] = {}
-    for path in sorted((root / "crates").rglob("Cargo.toml")):
+    manifest_paths = {root / "Cargo.toml", *(root / "crates").rglob("Cargo.toml")}
+    for path in sorted(manifest_paths):
         manifest = load(path)
         package = manifest.get("package")
         if not isinstance(package, dict) or "name" not in package:
@@ -34,6 +39,44 @@ def package_manifests(root: Path) -> dict[str, tuple[Path, dict]]:
             fail(f"duplicate package name {name!r}")
         manifests[name] = (path, manifest)
     return manifests
+
+
+def effective_package_license(
+    root: Path,
+    manifest_path: Path,
+    manifest: dict,
+    root_manifest: dict,
+) -> str:
+    package = manifest["package"]
+    license_value = package.get("license")
+    if isinstance(license_value, str):
+        if not license_value:
+            fail(f"{manifest_path}: package license is blank")
+        return license_value
+
+    if (
+        isinstance(license_value, dict)
+        and license_value.get("workspace") is True
+        and set(license_value) == {"workspace"}
+    ):
+        workspace_manifest = (
+            manifest
+            if manifest_path == root / "Cargo.toml" or "workspace" in manifest
+            else root_manifest
+        )
+        workspace_license = (
+            workspace_manifest.get("workspace", {})
+            .get("package", {})
+            .get("license")
+        )
+        if not isinstance(workspace_license, str) or not workspace_license:
+            fail(
+                f"{manifest_path}: package license inherits a missing or blank "
+                "workspace.package.license"
+            )
+        return workspace_license
+
+    fail(f"{manifest_path}: package must declare one exact license")
 
 
 def dependency_tables(manifest: dict) -> list[dict]:
@@ -141,16 +184,18 @@ def dependency_graph(
 
 def classifications(config: dict, package_names: set[str]) -> dict[str, set[str]]:
     classes: dict[str, set[str]] = {}
-    for class_name in CLASS_NAMES:
+    for class_name in CLASS_LICENSES:
         values = config.get(class_name)
         if not isinstance(values, list):
             fail(f"missing classification {class_name!r}")
+        if not all(isinstance(value, str) for value in values):
+            fail(f"non-string package in {class_name}: {values}")
         if len(values) != len(set(values)):
             fail(f"duplicate package in {class_name}: {values}")
-        classes[class_name] = {str(value) for value in values}
+        classes[class_name] = set(values)
 
     classified: set[str] = set()
-    for class_name in CLASS_NAMES:
+    for class_name in CLASS_LICENSES:
         overlap = classified & classes[class_name]
         if overlap:
             fail(f"classification overlap: {sorted(overlap)}")
@@ -165,14 +210,82 @@ def classifications(config: dict, package_names: set[str]) -> dict[str, set[str]
     return classes
 
 
+def named_package_set(config: dict, key: str, package_names: set[str]) -> set[str]:
+    values = config.get(key)
+    if not isinstance(values, list):
+        fail(f"missing classification {key!r}")
+    if not all(isinstance(value, str) for value in values):
+        fail(f"non-string package in {key}: {values}")
+    if len(values) != len(set(values)):
+        fail(f"duplicate package in {key}: {values}")
+    packages = set(values)
+    unknown = packages - package_names
+    if unknown:
+        fail(f"unknown package(s) in {key}: {sorted(unknown)}")
+    return packages
+
+
+def path_to_class(
+    start: str, graph: dict[str, set[str]], targets: set[str]
+) -> list[str] | None:
+    queue = [(start, [start])]
+    visited = {start}
+    while queue:
+        current, chain = queue.pop(0)
+        for dependency in sorted(graph[current]):
+            if dependency in targets:
+                return chain + [dependency]
+            if dependency not in visited:
+                visited.add(dependency)
+                queue.append((dependency, chain + [dependency]))
+    return None
+
+
 def main(root: Path = ROOT) -> None:
     root = root.resolve()
     root_manifest = load(root / "Cargo.toml")
     config = load(root / ".github" / "license-boundary.toml")["license_gate"]
     manifests = package_manifests(root)
     classes = classifications(config, set(manifests))
-    apache = classes["apache_roots"]
-    services = classes["agpl_services"]
+    for class_name, expected_license in CLASS_LICENSES.items():
+        for package_name in sorted(classes[class_name]):
+            manifest_path, manifest = manifests[package_name]
+            actual_license = effective_package_license(
+                root, manifest_path, manifest, root_manifest
+            )
+            if actual_license != expected_license:
+                fail(
+                    f"{package_name} is classified as {class_name} requiring "
+                    f"{expected_license!r}, but its resolved manifest license is "
+                    f"{actual_license!r}"
+                )
+
+    permissive = classes["mit_packages"] | classes["apache_packages"]
+    agpl = classes["agpl_packages"]
+    permissive_roots = named_package_set(
+        config, "permissive_roots", set(manifests)
+    )
+    agpl_aggregators = named_package_set(
+        config, "agpl_aggregators", set(manifests)
+    )
+    non_permissive_roots = permissive_roots - permissive
+    if non_permissive_roots:
+        fail(
+            "permissive_roots contains non-MIT/Apache package(s): "
+            f"{sorted(non_permissive_roots)}"
+        )
+    non_permissive_aggregators = agpl_aggregators - permissive
+    if non_permissive_aggregators:
+        fail(
+            "agpl_aggregators contains non-MIT/Apache package(s): "
+            f"{sorted(non_permissive_aggregators)}"
+        )
+    root_aggregator_overlap = permissive_roots & agpl_aggregators
+    if root_aggregator_overlap:
+        fail(
+            "permissive root/AGPL aggregator overlap: "
+            f"{sorted(root_aggregator_overlap)}"
+        )
 
     graph = dependency_graph(root, manifests, root_manifest)
     for package, dependencies in sorted(graph.items()):
@@ -183,21 +296,41 @@ def main(root: Path = ROOT) -> None:
                 f"{sorted(unknown_dependencies)}"
             )
 
-    for apache_root in sorted(apache):
-        queue = [(apache_root, [apache_root])]
-        visited = {apache_root}
-        while queue:
-            current, chain = queue.pop(0)
-            for dependency in sorted(graph[current]):
-                if dependency in services:
-                    fail("Apache-2.0-to-AGPL dependency: " + " -> ".join(chain + [dependency]))
-                if dependency not in visited:
-                    visited.add(dependency)
-                    queue.append((dependency, chain + [dependency]))
+    paths_to_agpl = {
+        package: path_to_class(package, graph, agpl)
+        for package in sorted(permissive)
+    }
+    for permissive_root in sorted(permissive_roots):
+        path = paths_to_agpl[permissive_root]
+        if path is not None:
+            fail("permissive-root-to-AGPL dependency: " + " -> ".join(path))
+
+    for aggregator in sorted(agpl_aggregators):
+        if paths_to_agpl[aggregator] is None:
+            fail(
+                f"AGPL aggregator {aggregator!r} does not reach an AGPL package; "
+                "remove stale combined-distribution obligation"
+            )
+
+    undeclared_aggregators = {
+        package: path
+        for package, path in paths_to_agpl.items()
+        if path is not None
+        and package not in permissive_roots
+        and package not in agpl_aggregators
+    }
+    if undeclared_aggregators:
+        package, path = sorted(undeclared_aggregators.items())[0]
+        fail(
+            f"{package} has an undeclared AGPL aggregation path: "
+            + " -> ".join(path)
+        )
 
     print(
         "license boundary OK: "
-        f"{len(apache)} Apache-2.0 roots do not reach {len(services)} AGPL services"
+        f"{len(permissive_roots)} reusable MIT/Apache roots do not reach "
+        f"{len(agpl)} AGPL packages; {len(agpl_aggregators)} declared AGPL "
+        f"aggregator; {len(manifests)} package licenses match policy"
     )
 
 

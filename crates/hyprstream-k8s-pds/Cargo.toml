@@ -2,7 +2,7 @@
 name = "hyprstream-k8s-pds"
 version = "0.1.0"
 edition.workspace = true
-license = "AGPL-3.0-only"
+license = "Apache-2.0"
 repository.workspace = true
 description = "AGPL tenant-grant and PDS allocation adapter for hyprstream-k8s"
 

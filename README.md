@@ -538,16 +538,21 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
 
 Licensing is assigned per crate:
 
-**MIT OR AGPL-3.0 (your choice)** — the main `hyprstream` application.
+**MIT** — `bitsandbytes-sys`, `cas-serve`, and `git-xet-filter`.
 
-**Apache-2.0** — the reusable Kubernetes substrate, `hyprstream-k8s`.
+**AGPL-3.0-only** — `hyprstream-metrics`, `hyprstream-flight`,
+`hyprstream-vfs-server`, and `hyprstream-workers`.
 
-**AGPL-3.0-only** — the authority-bearing Kubernetes PDS grant adapter,
-`hyprstream-k8s-pds`.
+**Apache-2.0** — every other local Cargo package.
 
-**MIT** — the remaining first-party crates whose manifests declare or inherit
-MIT, including the RPC/security, namespace, worker, TUI, metrics, storage, and
-service crates. Each crate's `Cargo.toml` is the authoritative assignment.
+These are source-package declarations. They are distinct from the obligations
+for a combined distribution: for example, the Apache-declared `hyprstream`
+application currently aggregates AGPL components through
+`hyprstream-flight`, so a combined distribution must satisfy the applicable
+AGPL terms. Reusable permissive-only roots are listed separately and guarded
+against acquiring an AGPL dependency in
+`.github/license-boundary.toml`. The policy is exhaustive and CI requires every
+local package manifest to match it exactly.
 
 See [LICENSE-MIT](LICENSE-MIT), [LICENSE-AGPLV3](LICENSE-AGPLV3), and
 [LICENSE-APACHE](LICENSE-APACHE) for the corresponding license terms.
