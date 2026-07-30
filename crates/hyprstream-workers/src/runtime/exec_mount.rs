@@ -47,9 +47,13 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use rand::RngCore;
 use tokio::sync::Notify;
 
 use hyprstream_rpc::latch::{Terminal, TerminalStore};
+use hyprstream_rpc::moq_stream::{MoqStreamOrigin, MoqStreamPublisher};
+use hyprstream_rpc::stream_info::Job;
+use hyprstream_rpc::streaming::StreamContext;
 use hyprstream_vfs::{DirEntry, Fid, Mount, MountError, Stat, Subject};
 // `parking_lot::Mutex` for the ctl write→read latch (interior mutability
 // through the `&Fid` that `Mount::write` receives). When this branch is
@@ -173,6 +177,120 @@ impl TerminalStatus {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Task-local fd streams (#1434)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Hard per-fd retained-output ceiling for the shadow-CI projection.  The
+/// backing MoQ stream keeps its `Job` profile (ordered, retained, terminal);
+/// this cap bounds the Plan 9 reader's local materialization.
+const MAX_RETAINED_FD_BYTES: usize = 1024 * 1024;
+
+/// A bounded terminal byte stream projected by one Plan 9 fd.
+struct TaskFdStream {
+    state: tokio::sync::Mutex<TaskFdState>,
+    wake: Arc<Notify>,
+}
+
+struct TaskFdState {
+    bytes: Vec<u8>,
+    closed: bool,
+    truncated: bool,
+    publisher: MoqStreamPublisher,
+}
+
+impl TaskFdStream {
+    fn new(origin: &MoqStreamOrigin, instance: &str, fd: u8) -> Result<Self, MountError> {
+        let mut mac_key = [0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut mac_key);
+        let context = StreamContext::new(
+            format!("exec-{instance}-fd-{fd}"),
+            format!("exec-{}-fd-{fd}", uuid::Uuid::new_v4()),
+            mac_key,
+            [0u8; 32],
+        )
+        .with_qos_preset::<Job>();
+        let publisher = origin
+            .publisher(&context)
+            .map_err(|e| MountError::Io(format!("create fd/{fd} MoQ stream: {e}")))?;
+        Ok(Self {
+            state: tokio::sync::Mutex::new(TaskFdState {
+                bytes: Vec::new(),
+                closed: false,
+                truncated: false,
+                publisher,
+            }),
+            wake: Arc::new(Notify::new()),
+        })
+    }
+
+    async fn append(&self, data: &[u8]) -> Result<(), MountError> {
+        let mut state = self.state.lock().await;
+        if state.closed {
+            return Err(MountError::InvalidArgument("fd stream is already closed".into()));
+        }
+        let available = MAX_RETAINED_FD_BYTES.saturating_sub(state.bytes.len());
+        let retained = &data[..data.len().min(available)];
+        if !retained.is_empty() {
+            state
+                .publisher
+                .publish_data(retained)
+                .await
+                .map_err(|e| MountError::Io(format!("publish fd stream data: {e}")))?;
+            state.bytes.extend_from_slice(retained);
+        }
+        if retained.len() != data.len() {
+            state.truncated = true;
+        }
+        drop(state);
+        self.wake.notify_waiters();
+        Ok(())
+    }
+
+    async fn close(&self) -> Result<(), MountError> {
+        let mut state = self.state.lock().await;
+        if !state.closed {
+            if state.truncated && state.bytes.len() < MAX_RETAINED_FD_BYTES {
+                let marker = b"\n[hyprstream: output truncated]\n";
+                let room = MAX_RETAINED_FD_BYTES - state.bytes.len();
+                state.bytes.extend_from_slice(&marker[..marker.len().min(room)]);
+            }
+            state
+                .publisher
+                .complete_ref(b"exec-fd-eof")
+                .await
+                .map_err(|e| MountError::Io(format!("complete fd stream: {e}")))?;
+            state.closed = true;
+        }
+        drop(state);
+        self.wake.notify_waiters();
+        Ok(())
+    }
+
+    async fn read_until_closed(&self, offset: u64) -> Vec<u8> {
+        loop {
+            let notified = self.wake.notified();
+            {
+                let state = self.state.lock().await;
+                let start = offset as usize;
+                if start < state.bytes.len() {
+                    return state.bytes[start..].to_vec();
+                }
+                if state.closed {
+                    return Vec::new();
+                }
+            }
+            notified.await;
+        }
+    }
+}
+
+struct InstanceFdStreams {
+    stdin: tokio::sync::Mutex<Vec<u8>>,
+    stdout: TaskFdStream,
+    stderr: TaskFdStream,
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Fid types
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -191,6 +309,10 @@ enum ExecFidKind {
     Exit(String),
     /// `/exec/instances/<id>/ns`.
     Ns(String),
+    /// `/exec/instances/<id>/fd/`.
+    FdDir(String),
+    /// `/exec/instances/<id>/fd/{0,1,2}`.
+    Fd(String, u8),
 }
 
 /// Fid state for the exec mount.
@@ -215,6 +337,12 @@ struct ExecFid {
 /// issue; see the design doc §4).
 pub struct ExecMount {
     pool: Arc<SandboxPool>,
+    /// Task-local MoQ origin for per-instance stdio. It is intentionally not
+    /// served as a new public network plane: `/exec` is the capability surface.
+    fd_origin: MoqStreamOrigin,
+    /// Per-instance fd state. Output streams use the existing MoQ publisher
+    /// contract; the Plan 9 files retain their bounded local materialization.
+    fd_streams: tokio::sync::Mutex<HashMap<String, Arc<InstanceFdStreams>>>,
     /// Retained terminal state (EV7, `hyprstream_rpc::latch`) for instances
     /// that have been `destroy`ed through this mount. `latch()` is called
     /// exactly once per instance (write-once), so a late `exit` read is
@@ -250,6 +378,8 @@ impl ExecMount {
     pub fn new(pool: Arc<SandboxPool>) -> Self {
         Self {
             pool,
+            fd_origin: MoqStreamOrigin::standalone().with_prefix("local/exec").build(),
+            fd_streams: tokio::sync::Mutex::new(HashMap::new()),
             terminal: TerminalStore::new(),
             terminal_ids: PmMutex::new(std::collections::HashSet::new()),
             waiters: PmMutex::new(HashMap::new()),
@@ -278,6 +408,71 @@ impl ExecMount {
                 .entry(id.to_owned())
                 .or_insert_with(|| Arc::new(Notify::new())),
         )
+    }
+
+    async fn fd_streams_for(&self, id: &str) -> Result<Arc<InstanceFdStreams>, MountError> {
+        let mut streams = self.fd_streams.lock().await;
+        if let Some(existing) = streams.get(id) {
+            return Ok(Arc::clone(existing));
+        }
+        let created = Arc::new(InstanceFdStreams {
+            stdin: tokio::sync::Mutex::new(Vec::new()),
+            stdout: TaskFdStream::new(&self.fd_origin, id, 1)?,
+            stderr: TaskFdStream::new(&self.fd_origin, id, 2)?,
+        });
+        streams.insert(id.to_owned(), Arc::clone(&created));
+        Ok(created)
+    }
+
+    /// Publish one completed task execution into the instance's terminal fd
+    /// streams. The runtime calls this after `SandboxBackend::exec_sync`; the
+    /// Plan 9 readers observe the same bounded output and then EOF.
+    pub async fn publish_exec_result(
+        &self,
+        id: &str,
+        stdout: &[u8],
+        stderr: &[u8],
+    ) -> Result<(), MountError> {
+        if self.pool.get(id).await.is_none() && !self.terminal.is_latched(&id.to_owned()) {
+            return Err(MountError::NotFound(format!("instances/{id}")));
+        }
+        let streams = self.fd_streams_for(id).await?;
+        streams.stdout.append(stdout).await?;
+        streams.stderr.append(stderr).await?;
+        streams.stdout.close().await?;
+        streams.stderr.close().await?;
+        Ok(())
+    }
+
+    /// Execute through the selected sandbox backend and project the terminal
+    /// stdout/stderr onto this instance's fd streams. This is the task-runtime
+    /// bridge: callers do not receive a second host-path or socket interface.
+    pub async fn exec_sync_to_fds(
+        &self,
+        id: &str,
+        command: &[String],
+        timeout_secs: u64,
+    ) -> Result<i32, MountError> {
+        let sandbox = self
+            .pool
+            .get(id)
+            .await
+            .ok_or_else(|| MountError::NotFound(format!("instances/{id}")))?;
+        let (exit_code, stdout, stderr) = self
+            .pool
+            .backend()
+            .exec_sync(&sandbox, command, timeout_secs)
+            .await
+            .map_err(|e| MountError::Io(e.to_string()))?;
+        self.publish_exec_result(id, &stdout, &stderr).await?;
+        Ok(exit_code)
+    }
+
+    async fn close_fd_streams(&self, id: &str) -> Result<(), MountError> {
+        let streams = self.fd_streams_for(id).await?;
+        streams.stdout.close().await?;
+        streams.stderr.close().await?;
+        Ok(())
     }
 
     /// Resolve the verb against the pool/backend for instance `id`.
@@ -339,6 +534,9 @@ impl ExecMount {
                     .stop(&sandbox)
                     .await
                     .map_err(|e| MountError::Io(e.to_string()))?;
+                // A stopped task can no longer produce output. Latch both
+                // reader streams to EOF so pending fd/1 and fd/2 readers wake.
+                self.close_fd_streams(id).await?;
                 Ok("ok: stopped\n".to_owned())
             }
             Verb::Destroy => {
@@ -363,6 +561,7 @@ impl ExecMount {
                     },
                 );
                 self.terminal_ids.lock().insert(id.to_owned());
+                self.close_fd_streams(id).await?;
                 // Wake any `exit` reader already blocked on this id.
                 self.waiter_for(id).notify_waiters();
                 Ok("ok: destroyed\n".to_owned())
@@ -455,6 +654,14 @@ impl Mount for ExecMount {
             [id, "status"] => ExecFidKind::Status((*id).to_owned()),
             [id, "exit"] => ExecFidKind::Exit((*id).to_owned()),
             [id, "ns"] => ExecFidKind::Ns((*id).to_owned()),
+            [id, "fd"] => ExecFidKind::FdDir((*id).to_owned()),
+            [id, "fd", fd] => {
+                let fd = fd.parse::<u8>().map_err(|_| MountError::NotFound(components.join("/")))?;
+                if fd > 2 {
+                    return Err(MountError::NotFound(components.join("/")));
+                }
+                ExecFidKind::Fd((*id).to_owned(), fd)
+            }
             _ => return Err(MountError::NotFound(components.join("/"))),
         };
 
@@ -465,7 +672,9 @@ impl Mount for ExecMount {
             | ExecFidKind::Ctl(id)
             | ExecFidKind::Status(id)
             | ExecFidKind::Exit(id)
-            | ExecFidKind::Ns(id) => Some(id.as_str()),
+            | ExecFidKind::Ns(id)
+            | ExecFidKind::FdDir(id)
+            | ExecFidKind::Fd(id, _) => Some(id.as_str()),
             ExecFidKind::InstancesDir => None,
         };
         if let Some(id) = id_to_check {
@@ -505,7 +714,15 @@ impl Mount for ExecMount {
             ExecFidKind::Status(id) => self.read_status(id).await?.into_bytes(),
             ExecFidKind::Exit(id) => self.read_exit(id).await?.into_bytes(),
             ExecFidKind::Ns(id) => self.read_ns(id).await?.into_bytes(),
-            ExecFidKind::InstancesDir | ExecFidKind::InstanceDir(_) => {
+            ExecFidKind::Fd(_, 0) => {
+                return Err(MountError::NotSupported("fd/0 is write-only".into()));
+            }
+            ExecFidKind::Fd(id, 1) => self.fd_streams_for(id).await?.stdout.read_until_closed(0).await,
+            ExecFidKind::Fd(id, 2) => self.fd_streams_for(id).await?.stderr.read_until_closed(0).await,
+            ExecFidKind::Fd(_, _) => {
+                return Err(MountError::NotFound("invalid exec fd".into()));
+            }
+            ExecFidKind::InstancesDir | ExecFidKind::InstanceDir(_) | ExecFidKind::FdDir(_) => {
                 return Err(MountError::IsDirectory("use readdir".into()));
             }
         };
@@ -554,6 +771,18 @@ impl Mount for ExecMount {
                 *inner.write_buf.lock() = response_bytes;
                 Ok(data.len() as u32)
             }
+            ExecFidKind::Fd(id, 0) => {
+                let streams = self.fd_streams_for(id).await?;
+                let mut stdin = streams.stdin.lock().await;
+                if stdin.len().saturating_add(data.len()) > MAX_RETAINED_FD_BYTES {
+                    return Err(MountError::InvalidArgument(
+                        "fd/0 input exceeds bounded task stream capacity".into(),
+                    ));
+                }
+                stdin.extend_from_slice(data);
+                Ok(data.len() as u32)
+            }
+            ExecFidKind::Fd(_, 1 | 2) => Err(MountError::NotSupported("fd/1 and fd/2 are read-only".into())),
             _ => Err(MountError::NotSupported("read-only".into())),
         }
     }
@@ -615,7 +844,21 @@ impl Mount for ExecMount {
                     size: 0,
                     stat: None,
                 },
+                DirEntry {
+                    name: "fd".into(),
+                    is_dir: true,
+                    size: 0,
+                    stat: None,
+                },
             ]),
+            ExecFidKind::FdDir(_) => Ok((0..=2)
+                .map(|fd| DirEntry {
+                    name: fd.to_string(),
+                    is_dir: false,
+                    size: 0,
+                    stat: None,
+                })
+                .collect()),
             _ => Err(MountError::NotDirectory(format!("{:?}", inner.kind))),
         }
     }
@@ -633,6 +876,8 @@ impl Mount for ExecMount {
             ExecFidKind::Status(_) => ("status".to_owned(), 0),
             ExecFidKind::Exit(_) => ("exit".to_owned(), 0),
             ExecFidKind::Ns(_) => ("ns".to_owned(), 0),
+            ExecFidKind::FdDir(_) => ("fd".to_owned(), QTDIR),
+            ExecFidKind::Fd(_, fd) => (fd.to_string(), 0),
         };
 
         Ok(Stat {
@@ -725,7 +970,7 @@ mod tests {
         }
 
         fn supports_exec(&self) -> bool {
-            false
+            true
         }
 
         async fn exec_sync(
@@ -734,9 +979,7 @@ mod tests {
             _command: &[String],
             _timeout_secs: u64,
         ) -> WorkerResult<(i32, Vec<u8>, Vec<u8>)> {
-            Err(crate::error::WorkerError::ExecFailed(
-                "not supported".into(),
-            ))
+            Ok((0, b"fake stdout\n".to_vec(), b"fake stderr\n".to_vec()))
         }
 
         async fn update_resources(
@@ -977,8 +1220,127 @@ mod tests {
         assert!(names.contains(&"status"));
         assert!(names.contains(&"exit"));
         assert!(names.contains(&"ns"));
-        // fd/ is deliberately not present — deferred to the streaming plane / #170.
-        assert!(!names.contains(&"fd"));
+        assert!(names.contains(&"fd"));
+
+        let fd_dir = mount.walk(&[&id, "fd"], &subject()).await.unwrap();
+        let fd_entries = mount.readdir(&fd_dir, &subject()).await.unwrap();
+        let fd_names: Vec<&str> = fd_entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(fd_names, ["0", "1", "2"]);
+    }
+
+    #[tokio::test]
+    async fn fd_output_blocks_until_runtime_publishes_then_latches_eof() {
+        let pool = make_pool().await;
+        let id = pool.acquire(&admission_subject(), &PodSandboxConfig::default()).await.unwrap();
+        let mount = Arc::new(ExecMount::new(pool));
+
+        let reader = {
+            let mount = Arc::clone(&mount);
+            let id = id.clone();
+            tokio::spawn(async move {
+                let mut fid = mount.walk(&[&id, "fd", "1"], &subject()).await.unwrap();
+                mount.open(&mut fid, 0, &subject()).await.unwrap();
+                mount.read(&fid, 0, 4096, &subject()).await.unwrap()
+            })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert!(!reader.is_finished(), "fd/1 must wait for terminal task output");
+
+        mount
+            .publish_exec_result(&id, b"build output\n", b"warning output\n")
+            .await
+            .unwrap();
+
+        let stdout = tokio::time::timeout(std::time::Duration::from_secs(2), reader)
+            .await
+            .expect("fd/1 reader did not wake on task completion")
+            .unwrap();
+        assert_eq!(stdout, b"build output\n");
+
+        let mut stderr_fid = mount.walk(&[&id, "fd", "2"], &subject()).await.unwrap();
+        mount.open(&mut stderr_fid, 0, &subject()).await.unwrap();
+        assert_eq!(
+            mount.read(&stderr_fid, 0, 4096, &subject()).await.unwrap(),
+            b"warning output\n"
+        );
+        assert!(
+            mount.read(&stderr_fid, 4096, 4096, &subject()).await.unwrap().is_empty(),
+            "terminal stderr must report EOF after retained bytes"
+        );
+    }
+
+    #[tokio::test]
+    async fn backend_exec_sync_is_projected_to_terminal_fd_streams() {
+        let pool = make_pool().await;
+        let id = pool.acquire(&admission_subject(), &PodSandboxConfig::default()).await.unwrap();
+        let mount = ExecMount::new(pool);
+
+        assert_eq!(
+            mount
+                .exec_sync_to_fds(&id, &["build".to_owned()], 30)
+                .await
+                .unwrap(),
+            0
+        );
+        let mut stdout = mount.walk(&[&id, "fd", "1"], &subject()).await.unwrap();
+        mount.open(&mut stdout, 0, &subject()).await.unwrap();
+        assert_eq!(
+            mount.read(&stdout, 0, 4096, &subject()).await.unwrap(),
+            b"fake stdout\n"
+        );
+        let mut stderr = mount.walk(&[&id, "fd", "2"], &subject()).await.unwrap();
+        mount.open(&mut stderr, 0, &subject()).await.unwrap();
+        assert_eq!(
+            mount.read(&stderr, 0, 4096, &subject()).await.unwrap(),
+            b"fake stderr\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn fd_stdin_is_write_only_and_retained_for_task_runtime() {
+        let pool = make_pool().await;
+        let id = pool.acquire(&admission_subject(), &PodSandboxConfig::default()).await.unwrap();
+        let mount = ExecMount::new(pool);
+        let mut fid = mount.walk(&[&id, "fd", "0"], &subject()).await.unwrap();
+        mount.open(&mut fid, 1, &subject()).await.unwrap();
+        assert_eq!(mount.write(&fid, 0, b"input", &subject()).await.unwrap(), 5);
+        assert!(matches!(
+            mount.read(&fid, 0, 4096, &subject()).await,
+            Err(MountError::NotSupported(_))
+        ));
+        let streams = mount.fd_streams_for(&id).await.unwrap();
+        assert_eq!(&*streams.stdin.lock().await, b"input");
+    }
+
+    #[tokio::test]
+    async fn stopping_instance_latches_waiting_fd_reader_to_eof() {
+        let pool = make_pool().await;
+        let id = pool.acquire(&admission_subject(), &PodSandboxConfig::default()).await.unwrap();
+        let mount = Arc::new(ExecMount::new(pool));
+        let reader = {
+            let mount = Arc::clone(&mount);
+            let id = id.clone();
+            tokio::spawn(async move {
+                let mut fid = mount.walk(&[&id, "fd", "2"], &subject()).await.unwrap();
+                mount.open(&mut fid, 0, &subject()).await.unwrap();
+                mount.read(&fid, 0, 4096, &subject()).await.unwrap()
+            })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert!(!reader.is_finished(), "fd reader must wait before cancellation");
+
+        let mut ctl = mount.walk(&[&id, "ctl"], &subject()).await.unwrap();
+        mount.open(&mut ctl, 2, &subject()).await.unwrap();
+        mount.write(&ctl, 0, b"stop", &subject()).await.unwrap();
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(2), reader)
+                .await
+                .expect("cancellation did not wake fd reader")
+                .unwrap()
+                .is_empty(),
+            "cancelled stream must latch terminal EOF"
+        );
     }
 
     #[tokio::test]
