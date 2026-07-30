@@ -7175,6 +7175,7 @@ dependencies = [
  "kube",
  "parking_lot 0.12.4",
  "schemars",
+ "semver",
  "serde",
  "serde_json",
  "serde_yaml",

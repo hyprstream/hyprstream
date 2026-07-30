@@ -17,6 +17,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use semver::{Version, VersionReq};
 use serde::Deserialize;
 use toml::Value;
 
@@ -37,9 +38,13 @@ struct MetadataPackage {
     dependencies: Vec<DeclaredDependency>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 struct DeclaredDependency {
     name: String,
+    req: String,
+    source: Option<String>,
+    path: Option<PathBuf>,
+    rename: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -242,6 +247,66 @@ fn locked_root_index(packages: &[LockedPackage], root: &MetadataPackage) -> Resu
     }
 }
 
+fn source_identity_matches(resolved: &str, declared: &str) -> bool {
+    resolved == declared
+        || resolved
+            .strip_prefix(declared)
+            .is_some_and(|suffix| suffix.starts_with('#'))
+        || declared
+            .strip_prefix(resolved)
+            .is_some_and(|suffix| suffix.starts_with('#'))
+}
+
+fn declared_dependency_matches_locked(
+    dependency: &DeclaredDependency,
+    package: &LockedPackage,
+    local_packages: &[MetadataPackage],
+) -> Result<bool, String> {
+    if package.name != dependency.name {
+        return Ok(false);
+    }
+    let requirement = VersionReq::parse(&dependency.req).map_err(|error| {
+        format!(
+            "parse declared requirement {} for {}: {error}",
+            dependency.req, dependency.name
+        )
+    })?;
+    let version = Version::parse(&package.version).map_err(|error| {
+        format!(
+            "parse locked version {} for {}: {error}",
+            package.version, package.name
+        )
+    })?;
+    if !requirement.matches(&version) {
+        return Ok(false);
+    }
+
+    if let Some(path) = &dependency.path {
+        if package.source.is_some() {
+            return Ok(false);
+        }
+        let declared_path = path
+            .canonicalize()
+            .map_err(|error| format!("resolve declared dependency {}: {error}", path.display()))?;
+        return Ok(local_packages.iter().any(|candidate| {
+            candidate.name == package.name
+                && candidate.version == package.version
+                && candidate.source.is_none()
+                && candidate
+                    .manifest_path
+                    .parent()
+                    .and_then(|parent| parent.canonicalize().ok())
+                    .is_some_and(|resolved_path| resolved_path == declared_path)
+        }));
+    }
+
+    match (&dependency.source, &package.source) {
+        (Some(declared), Some(resolved)) => Ok(source_identity_matches(resolved, declared)),
+        (None, None) => Ok(true),
+        _ => Ok(false),
+    }
+}
+
 fn root_metadata<'a>(
     packages: &'a [MetadataPackage],
     root_manifest_path: &Path,
@@ -273,20 +338,42 @@ fn assert_root_dependencies_locked(
     let root = root_metadata(&metadata.packages, root_manifest_path)?;
     let root_index = locked_root_index(&lock.package, root)?;
     let locked_root = &lock.package[root_index];
-    let locked_dependency_names = locked_root
+    let locked_dependency_indices = locked_root
         .dependencies
         .iter()
-        .map(|dependency| {
-            locked_dependency_index(&lock.package, dependency)
-                .map(|index| lock.package[index].name.as_str())
-        })
+        .map(|dependency| locked_dependency_index(&lock.package, dependency))
         .collect::<Result<BTreeSet<_>, _>>()?;
     for dependency in &root.dependencies {
-        if !locked_dependency_names.contains(dependency.name.as_str()) {
-            return Err(format!(
-                "Cargo.lock omitted declared all-feature dependency {} -> {}",
-                root.name, dependency.name
-            ));
+        let matches = locked_dependency_indices
+            .iter()
+            .copied()
+            .map(|index| {
+                declared_dependency_matches_locked(
+                    dependency,
+                    &lock.package[index],
+                    &metadata.packages,
+                )
+                .map(|matches| matches.then_some(index))
+            })
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        let alias = dependency.rename.as_deref().unwrap_or(&dependency.name);
+        match matches.as_slice() {
+            [_] => {}
+            [] => {
+                return Err(format!(
+                    "Cargo.lock omitted exact resolved root dependency {alias} \
+                     (package {} {}, source {:?}, path {:?})",
+                    dependency.name, dependency.req, dependency.source, dependency.path
+                ));
+            }
+            _ => {
+                return Err(format!(
+                    "declared root dependency {alias} ambiguously matches multiple lock identities"
+                ));
+            }
         }
     }
     Ok(())
@@ -502,6 +589,136 @@ fn production_lock_covers_every_declared_root_dependency_without_registry_source
     let metadata = local_metadata(&workspace_root, &workspace_root.join("Cargo.toml")).unwrap();
     let lock = load_cargo_lock(&workspace_root.join("Cargo.lock")).unwrap();
     assert_root_dependencies_locked(&metadata, &lock, &root_manifest_path).unwrap();
+}
+
+#[test]
+fn root_lock_identity_check_rejects_omitted_renamed_agpl_version() {
+    let directory = tempfile::tempdir().unwrap();
+    write_fixture(
+        &directory.path().join("Cargo.toml"),
+        r#"[workspace]
+members = ["root"]
+exclude = ["service-v1", "service-v2"]
+resolver = "2"
+"#,
+    );
+    let root_manifest = directory.path().join("root/Cargo.toml");
+    write_fixture(
+        &root_manifest,
+        r#"[package]
+name = "apache-root"
+version = "0.1.0"
+license = "Apache-2.0"
+
+[dependencies]
+service_v1 = { package = "service", path = "../service-v1", optional = true }
+service_v2 = { package = "service", path = "../service-v2", optional = true }
+
+[features]
+both = ["dep:service_v1", "dep:service_v2"]
+"#,
+    );
+    write_fixture(
+        &directory.path().join("service-v1/Cargo.toml"),
+        r#"[package]
+name = "service"
+version = "1.0.0"
+license = "MIT"
+"#,
+    );
+    write_fixture(
+        &directory.path().join("service-v2/Cargo.toml"),
+        r#"[package]
+name = "service"
+version = "2.0.0"
+license = "AGPL-3.0-only"
+"#,
+    );
+    for package in ["root", "service-v1", "service-v2"] {
+        write_fixture(&directory.path().join(package).join("src/lib.rs"), "");
+    }
+
+    let mut metadata = resolved_metadata(directory.path(), &root_manifest)
+        .expect("duplicate-version alias fixture must resolve offline");
+    let mut lock = load_cargo_lock(&directory.path().join("Cargo.lock"))
+        .expect("duplicate-version alias fixture must write Cargo.lock");
+
+    let root_manifest_canonical = root_manifest.canonicalize().unwrap();
+    let root_metadata_index = metadata
+        .packages
+        .iter()
+        .position(|package| {
+            package
+                .manifest_path
+                .canonicalize()
+                .is_ok_and(|path| path == root_manifest_canonical)
+        })
+        .expect("fixture root metadata");
+    let mut duplicate_alias = metadata.packages[root_metadata_index]
+        .dependencies
+        .iter()
+        .find(|dependency| dependency.rename.as_deref() == Some("service_v1"))
+        .expect("service_v1 declaration")
+        .clone();
+    duplicate_alias.rename = Some("service_v1_duplicate".to_owned());
+    metadata.packages[root_metadata_index]
+        .dependencies
+        .push(duplicate_alias);
+
+    assert_root_dependencies_locked(&metadata, &lock, &root_manifest)
+        .expect("multiple aliases may resolve to the same exact lock identity");
+    let boundary_error = check_locked_apache_boundary_with(
+        directory.path(),
+        &root_manifest,
+        &metadata.packages,
+        &lock,
+    )
+    .unwrap_err();
+    assert!(
+        boundary_error.contains("AGPL-3.0-only"),
+        "complete fixture lock must reach its AGPL identity: {boundary_error}"
+    );
+
+    let root_lock_index =
+        locked_root_index(&lock.package, &metadata.packages[root_metadata_index]).unwrap();
+    let agpl_edge_index = lock.package[root_lock_index]
+        .dependencies
+        .iter()
+        .position(|dependency| {
+            locked_dependency_index(&lock.package, dependency).is_ok_and(|index| {
+                let package = &lock.package[index];
+                package.name == "service" && package.version == "2.0.0" && package.source.is_none()
+            })
+        })
+        .expect("root edge to AGPL service 2.0.0");
+    lock.package[root_lock_index]
+        .dependencies
+        .remove(agpl_edge_index);
+
+    assert!(
+        lock.package[root_lock_index]
+            .dependencies
+            .iter()
+            .any(|dependency| {
+                locked_dependency_index(&lock.package, dependency).is_ok_and(|index| {
+                    let package = &lock.package[index];
+                    package.name == "service" && package.version == "1.0.0"
+                })
+            }),
+        "MIT service 1.0.0 root edge must remain"
+    );
+    assert!(
+        lock.package.iter().any(|package| {
+            package.name == "service" && package.version == "2.0.0" && package.source.is_none()
+        }),
+        "AGPL package identity must remain in the lock after only its root edge is removed"
+    );
+
+    let error = assert_root_dependencies_locked(&metadata, &lock, &root_manifest).unwrap_err();
+    assert!(
+        error.contains("omitted exact resolved root dependency service_v2"),
+        "identity consistency must reject the missing AGPL edge before traversal: {error}"
+    );
 }
 
 fn write_fixture(path: &Path, contents: &str) {
