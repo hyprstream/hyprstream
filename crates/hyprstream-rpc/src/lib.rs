@@ -123,6 +123,10 @@ pub mod rpc_client;
 pub mod stream_info;
 pub mod stream_epoch;
 pub mod zmtp_framing;
+// #324/N1 intentionally stops at a crate-internal data contract. The allow is
+// removed when the first reassembly/transport consumer lands.
+#[allow(dead_code)]
+pub(crate) mod activation_envelope;
 
 // ============================================================================
 // Cross-platform modules (available on all targets including wasm32)
