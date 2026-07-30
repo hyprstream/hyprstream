@@ -273,22 +273,38 @@ impl GitManager {
 
         let mut callback_builder = CallbackConfigBuilder::new();
 
-        // Add token authentication if configured
+        // Add token authentication if configured. The token is only attached
+        // to the default clone path when it is host-scoped (access_token_host
+        // is set): a process-global, host-unscoped token must not be offered
+        // to a caller-selected remote, since that would exfiltrate the
+        // operator's trusted-forge credential (issue #1429 Sol P1).
         let token_from_config = self.config.network.access_token.clone();
         let token_from_env = std::env::var("GIT2DB_NETWORK__ACCESS_TOKEN").ok();
-
+        let token_host = self.config.network.access_token_host.clone();
         let token = token_from_config.or(token_from_env);
 
-        if let Some(ref token_value) = token {
-            tracing::info!(
-                "Using token authentication (token starts with: {})",
-                &token_value.chars().take(10).collect::<String>()
-            );
-            callback_builder = callback_builder.auth(AuthStrategy::Token {
-                token: token_value.clone(),
-            });
-        } else {
-            tracing::warn!("No access token configured");
+        match (token, &token_host) {
+            (Some(token_value), Some(host)) => {
+                tracing::info!(
+                    "Using host-scoped token authentication bound to {} (token starts with: {})",
+                    host,
+                    &token_value.chars().take(10).collect::<String>()
+                );
+                callback_builder = callback_builder.auth(AuthStrategy::Token {
+                    token: token_value,
+                    host: Some(host.clone()),
+                });
+            }
+            (Some(_token_value), None) => {
+                tracing::warn!(
+                    "Access token configured without access_token_host — not attaching to \
+                     default clone path to prevent credential exfiltration to caller-selected \
+                     remotes. Set network.access_token_host to scope the token."
+                );
+            }
+            (None, _) => {
+                tracing::debug!("No access token configured");
+            }
         }
 
         // Ambient credential sources — the SSH agent (`ssh_key_from_agent`),

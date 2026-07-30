@@ -277,6 +277,14 @@ pub struct NetworkConfig {
     /// Personal access token (e.g., for GitHub, GitLab, Hugging Face)
     /// Can also be set via GIT2DB_NETWORK__ACCESS_TOKEN env var
     pub access_token: Option<String>,
+    /// The exact origin host (e.g. `"github.com"`) that `access_token` is
+    /// bound to. When set, the default clone path attaches the token scoped to
+    /// this host — it is only offered to a remote whose URL host matches. When
+    /// unset, the token is **not** attached to the default clone path at all
+    /// (fail-closed against exfiltration to a caller-selected remote). See
+    /// issue #1429.
+    #[serde(default)]
+    pub access_token_host: Option<String>,
 }
 
 fn default_use_credential_helper() -> bool {
@@ -339,6 +347,7 @@ impl Default for NetworkConfig {
             user_agent: default_user_agent(),
             use_credential_helper: default_use_credential_helper(),
             access_token: None,
+            access_token_host: None,
         }
     }
 }
@@ -538,6 +547,7 @@ mod tests {
             user_agent: "test-agent".to_owned(),
             use_credential_helper: true,
             access_token: Some("test-token".to_owned()),
+            access_token_host: None,
         };
         assert_eq!(network_config.timeout_secs, 120);
         assert_eq!(network_config.max_retries, 5);

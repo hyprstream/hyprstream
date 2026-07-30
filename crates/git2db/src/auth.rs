@@ -21,8 +21,15 @@ pub enum AuthStrategy {
     },
     /// Use username/password
     UserPass { username: String, password: String },
-    /// Use personal access token
-    Token { token: String },
+    /// Use a personal access token.
+    ///
+    /// `host` optionally binds the token to an exact origin host (e.g.
+    /// `"github.com"`). When set, the credential callback only offers the
+    /// token when the request URL's host matches — a token configured for
+    /// host A is never sent to host B. `None` means unscoped; unscoped tokens
+    /// must not be attached to default/untrusted clone paths (see
+    /// [`crate::manager::GitManager::default_clone_options`]).
+    Token { token: String, host: Option<String> },
     /// Use default credentials (for public repos)
     Default,
 }
@@ -38,6 +45,48 @@ impl AuthStrategy {
     pub fn is_ambient(&self) -> bool {
         matches!(self, AuthStrategy::Default | AuthStrategy::SshAgent { .. })
     }
+}
+
+/// Extract the host component from a git remote URL.
+///
+/// Handles the common forms:
+/// - `https://github.com/user/repo.git` → `github.com`
+/// - `https://user@github.com/user/repo.git` → `github.com`
+/// - `ssh://git@github.com:22/user/repo.git` → `github.com`
+/// - `git@github.com:user/repo.git` (scp-like) → `github.com`
+///
+/// Returns `None` for unparseable URLs or local paths (`file://`, bare paths).
+pub fn extract_git_host(url: &str) -> Option<&str> {
+    let url = url.trim();
+    // scp-like: user@host:path
+    if let Some(at) = url.find('@') {
+        let after_at = &url[at + 1..];
+        if let Some(colon) = after_at.find(':') {
+            if !url.contains("://") {
+                let host = &after_at[..colon];
+                if !host.is_empty() {
+                    return Some(host);
+                }
+            }
+        }
+    }
+    // scheme://[user@]host[:port]/path
+    let after_scheme = url.split_once("://").map(|(_, rest)| rest)?;
+    // strip userinfo
+    let host_port = after_scheme.rsplit('@').next().unwrap_or(after_scheme);
+    // strip path
+    let host_port = host_scheme_host(host_port);
+    // strip port
+    let host = host_port.split(':').next().unwrap_or(host_port);
+    if host.is_empty() || host == "file" {
+        return None;
+    }
+    Some(host)
+}
+
+/// Take the leading host segment before the first `/`.
+fn host_scheme_host(s: &str) -> &str {
+    s.split('/').next().unwrap_or(s)
 }
 
 /// Credential manager for handling authentication.
@@ -191,7 +240,7 @@ impl AuthManager {
     fn try_strategy(
         &self,
         strategy: &AuthStrategy,
-        _url: &str,
+        url: &str,
         username_from_url: Option<&str>,
         allowed_types: CredentialType,
     ) -> Result<Cred, git2::Error> {
@@ -235,14 +284,36 @@ impl AuthManager {
                 }
             }
 
-            AuthStrategy::Token { token } => {
-                if allowed_types.contains(CredentialType::USER_PASS_PLAINTEXT) {
-                    info!("Trying token authentication");
-                    // For GitHub and similar services, use token as password with empty username
-                    Cred::userpass_plaintext("", token)
-                } else {
-                    Err(git2::Error::from_str("Token authentication not allowed"))
+            AuthStrategy::Token { token, host } => {
+                if !allowed_types.contains(CredentialType::USER_PASS_PLAINTEXT) {
+                    return Err(git2::Error::from_str("Token authentication not allowed"));
                 }
+                // Enforce host scope: a token bound to an exact origin host is
+                // only offered when the request URL's host matches. This closes
+                // credential exfiltration via caller-selected remotes (issue
+                // #1429 Sol P1): a process-global token configured for a
+                // trusted forge is never sent to an unrelated host.
+                if let Some(ref bound) = host {
+                    if let Some(req_host) = extract_git_host(url) {
+                        if req_host != bound.as_str() {
+                            debug!(
+                                "Refusing host-scoped token for {url}: bound to {bound:?}, \
+                                 request host is {req_host:?}"
+                            );
+                            return Err(git2::Error::from_str(
+                                "Token is scoped to a different host",
+                            ));
+                        }
+                    } else {
+                        debug!("Refusing host-scoped token for {url}: could not parse host");
+                        return Err(git2::Error::from_str(
+                            "Token is host-scoped but request URL host is unparseable",
+                        ));
+                    }
+                }
+                info!("Trying token authentication");
+                // For GitHub and similar services, use token as password with empty username
+                Cred::userpass_plaintext("", token)
             }
 
             AuthStrategy::Default => {
@@ -337,13 +408,29 @@ impl AuthBuilder {
         self
     }
 
-    /// Add token authentication
+    /// Add token authentication (host-unscoped — use `token_scoped` to bind
+    /// the token to an exact origin host).
     pub fn token<T>(mut self, token: T) -> Self
     where
         T: Into<String>,
     {
         self.strategies.push(AuthStrategy::Token {
             token: token.into(),
+            host: None,
+        });
+        self
+    }
+
+    /// Add token authentication bound to an exact origin host. The token is
+    /// only offered when the request URL's host matches `host`.
+    pub fn token_scoped<T, H>(mut self, token: T, host: H) -> Self
+    where
+        T: Into<String>,
+        H: Into<String>,
+    {
+        self.strategies.push(AuthStrategy::Token {
+            token: token.into(),
+            host: Some(host.into()),
         });
         self
     }
@@ -456,9 +543,12 @@ mod tests {
 
     #[test]
     fn auth_manager_builder_chains_modes() {
-        let mgr = AuthManager::with_strategies(vec![AuthStrategy::Token { token: "t".into() }])
-            .with_certificate_mode(CertificateConfig::AcceptAll)
-            .with_auth_mode(AuthMode::AllowAmbient);
+        let mgr = AuthManager::with_strategies(vec![AuthStrategy::Token {
+            token: "t".into(),
+            host: None,
+        }])
+        .with_certificate_mode(CertificateConfig::AcceptAll)
+        .with_auth_mode(AuthMode::AllowAmbient);
         assert!(matches!(
             mgr.certificate_mode(),
             CertificateConfig::AcceptAll
@@ -482,5 +572,36 @@ mod tests {
             CredentialType::DEFAULT,
         );
         assert!(res.is_err());
+    }
+
+    #[test]
+    fn extract_git_host_parses_common_url_forms() {
+        assert_eq!(
+            extract_git_host("https://github.com/user/repo.git"),
+            Some("github.com")
+        );
+        assert_eq!(
+            extract_git_host("https://user@github.com/user/repo.git"),
+            Some("github.com")
+        );
+        assert_eq!(
+            extract_git_host("ssh://git@github.com:22/user/repo.git"),
+            Some("github.com")
+        );
+        assert_eq!(
+            extract_git_host("git@github.com:user/repo.git"),
+            Some("github.com")
+        );
+        assert_eq!(
+            extract_git_host("https://huggingface.co/Qwen/Qwen3"),
+            Some("huggingface.co")
+        );
+    }
+
+    #[test]
+    fn extract_git_host_rejects_local_and_unparseable() {
+        assert_eq!(extract_git_host("file:///path/to/repo"), None);
+        assert_eq!(extract_git_host("/local/path"), None);
+        assert_eq!(extract_git_host("not-a-url"), None);
     }
 }

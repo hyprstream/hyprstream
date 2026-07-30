@@ -180,6 +180,7 @@ fn test_callback_config_auth_strategies() {
             username: Some("git".to_owned()),
         })
         .auth(AuthStrategy::Token {
+            host: None,
             token: "test_token".to_owned(),
         })
         .auth(AuthStrategy::Default)

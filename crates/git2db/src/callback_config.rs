@@ -245,7 +245,7 @@ impl CallbackConfig {
 
     fn try_auth_strategy(
         strategy: &AuthStrategy,
-        _url: &str,
+        url: &str,
         username_from_url: Option<&str>,
         allowed_types: git2::CredentialType,
     ) -> Result<git2::Cred, git2::Error> {
@@ -284,12 +284,36 @@ impl CallbackConfig {
                     Err(git2::Error::from_str("Username/password not allowed"))
                 }
             }
-            AuthStrategy::Token { token } => {
-                if allowed_types.contains(CredentialType::USER_PASS_PLAINTEXT) {
-                    Cred::userpass_plaintext("", token)
-                } else {
-                    Err(git2::Error::from_str("Token authentication not allowed"))
+            AuthStrategy::Token { token, host } => {
+                if !allowed_types.contains(CredentialType::USER_PASS_PLAINTEXT) {
+                    return Err(git2::Error::from_str("Token authentication not allowed"));
                 }
+                // Enforce host scope (issue #1429 Sol P1): a token bound to an
+                // exact origin host is only offered when the request URL's host
+                // matches, preventing exfiltration to a caller-selected remote.
+                if let Some(bound) = host {
+                    match crate::auth::extract_git_host(url) {
+                        Some(req_host) if req_host == bound.as_str() => {}
+                        Some(req_host) => {
+                            tracing::debug!(
+                                "Refusing host-scoped token for {url}: bound to {bound:?}, \
+                                 request host is {req_host:?}"
+                            );
+                            return Err(git2::Error::from_str(
+                                "Token is scoped to a different host",
+                            ));
+                        }
+                        None => {
+                            tracing::debug!(
+                                "Refusing host-scoped token for {url}: could not parse host"
+                            );
+                            return Err(git2::Error::from_str(
+                                "Token is host-scoped but request URL host is unparseable",
+                            ));
+                        }
+                    }
+                }
+                Cred::userpass_plaintext("", token)
             }
             AuthStrategy::Default => {
                 if allowed_types.contains(CredentialType::DEFAULT) {
@@ -547,7 +571,13 @@ mod tests {
         assert!(AuthStrategy::Default.is_ambient());
         assert!(AuthStrategy::SshAgent { username: None }.is_ambient());
         // Explicit strategies are never ambient.
-        assert!(!AuthStrategy::Token { token: "t".into() }.is_ambient());
+        assert!(
+            !AuthStrategy::Token {
+                token: "t".into(),
+                host: None
+            }
+            .is_ambient()
+        );
         assert!(
             !AuthStrategy::UserPass {
                 username: "u".into(),
@@ -592,6 +622,7 @@ mod tests {
         let auth = vec![
             AuthStrategy::Token {
                 token: "ghp_explicit".to_owned(),
+                host: None,
             },
             AuthStrategy::Default,
         ];
@@ -624,5 +655,70 @@ mod tests {
             res.is_err(),
             "ExplicitOnly with only ambient strategies must fail closed",
         );
+    }
+
+    // ---- Host-scoped Token: a token for host A is never offered to host B ----
+
+    /// A token bound to `github.com` must NOT be offered when the request URL
+    /// points at a different host (`evil.example`). This is the host-A/host-B
+    /// negative test required by the #1429 Sol P1 fix.
+    #[test]
+    fn host_scoped_token_refused_for_different_host() {
+        let auth = vec![AuthStrategy::Token {
+            token: "trusted-forge-token".to_owned(),
+            host: Some("github.com".to_owned()),
+        }];
+        // Host B: the caller-selected remote is NOT github.com.
+        let res = CallbackConfig::handle_auth(
+            &auth,
+            AuthMode::ExplicitOnly,
+            "https://evil.example/untrusted/repo.git",
+            None,
+            user_pass_allowed(),
+        );
+        assert!(
+            res.is_err(),
+            "A host-scoped token bound to github.com must not be offered to evil.example",
+        );
+    }
+
+    /// The same host-scoped token IS offered when the request URL's host
+    /// matches the bound origin — the positive control for the negative test.
+    #[test]
+    fn host_scoped_token_offered_for_matching_host() {
+        let auth = vec![AuthStrategy::Token {
+            token: "trusted-forge-token".to_owned(),
+            host: Some("github.com".to_owned()),
+        }];
+        let res = CallbackConfig::handle_auth(
+            &auth,
+            AuthMode::ExplicitOnly,
+            "https://github.com/user/repo.git",
+            None,
+            user_pass_allowed(),
+        );
+        assert!(
+            res.is_ok(),
+            "A host-scoped token must be offered to its bound host",
+        );
+    }
+
+    /// An unscoped token (host: None) is offered to any host — this is the
+    /// behavior the caller explicitly constructs; it is not attached to the
+    /// default clone path (see manager.rs).
+    #[test]
+    fn unscoped_token_offered_to_any_host() {
+        let auth = vec![AuthStrategy::Token {
+            token: "explicit-unscoped".to_owned(),
+            host: None,
+        }];
+        let res = CallbackConfig::handle_auth(
+            &auth,
+            AuthMode::ExplicitOnly,
+            "https://anyhost.example/repo.git",
+            None,
+            user_pass_allowed(),
+        );
+        assert!(res.is_ok(), "An unscoped explicit Token is always honored");
     }
 }

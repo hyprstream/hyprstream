@@ -151,6 +151,7 @@ fn auth_manager_defaults_are_strict_and_explicit() {
 fn auth_manager_with_strategies_defaults_strict() {
     let mgr = AuthManager::with_strategies(vec![AuthStrategy::Token {
         token: "x".to_owned(),
+        host: None,
     }]);
     assert!(matches!(mgr.certificate_mode(), CertificateConfig::Strict));
     assert!(matches!(mgr.auth_mode(), AuthMode::ExplicitOnly));
@@ -193,5 +194,11 @@ fn use_credential_helper_defaults_to_false() {
 fn is_ambient_classifies_environment_sources() {
     assert!(AuthStrategy::Default.is_ambient());
     assert!(AuthStrategy::SshAgent { username: None }.is_ambient());
-    assert!(!AuthStrategy::Token { token: "t".into() }.is_ambient());
+    assert!(
+        !AuthStrategy::Token {
+            token: "t".into(),
+            host: None
+        }
+        .is_ambient()
+    );
 }
