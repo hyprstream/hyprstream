@@ -202,6 +202,32 @@ jobs:
             sccache --show-stats
           '
 
+    # #1425 r3: actually EXECUTES crates/hyprstream-rpc/tests/wasm_browser_fetch.rs
+    # in a real headless browser, as an isolated named wasm test artifact — not
+    # just a compile check. Deliberately does not use `wasm-pack test`: it
+    # unconditionally passes `--tests` to cargo, which additionally compiles
+    # every other (native-only) test target in the crate and fails before a
+    # browser is ever launched. browser-wasm-test.sh builds only the named
+    # integration test via `cargo test --test <name>` (never `--tests`) and
+    # runs it through a wasm-bindgen version-matched wasm-bindgen-test-runner.
+    # browser-wasm-test-ci.sh installs a headless-capable Chromium + matching
+    # chromedriver from the container's own package repo (arch-correct for
+    # this arm64/Graviton runner, unlike Google's x64-only Chrome-for-Testing
+    # distribution) before delegating to it.
+    - name: Run browser-fetch conformance test (headless Chromium, rust-builder container)
+      run: |
+        podman run --rm \
+          -v "$PWD":/build:Z -w /build \
+          -e RUSTC_WRAPPER=sccache -e SCCACHE_BUCKET -e SCCACHE_REGION \
+          -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY -e AWS_SESSION_TOKEN \
+          -e AWS_REGION -e AWS_DEFAULT_REGION \
+          -e CARGO_INCREMENTAL=0 -e CARGO_TERM_COLOR=always \
+          "$BUILDER_IMAGE" \
+          bash -euo pipefail -c '
+            bash /build/.github/scripts/browser-wasm-test-ci.sh
+            sccache --show-stats
+          '
+
   build:
     # MERGE GATE — not a per-PR-push check. The heavy build+test runs in the merge
     # queue (`merge_group`) against the synthetic merge candidate (latest main + the
