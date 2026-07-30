@@ -1,12 +1,14 @@
 //! License-boundary regression for the reusable Kubernetes substrate.
 //!
-//! Cargo's resolved metadata graph is the source of dependency truth. Running
-//! with all features includes optional edges, and metadata retains normal,
-//! build, dev, target, renamed, `[patch]`, and `[replace]` resolution. Local
-//! packages are classified by their resolved SPDX metadata rather than copied
-//! names. When #1417's omission-checked `.github/license-boundary.toml` is
-//! present, its `agpl_services` partition augments manifest metadata; that is
-//! the only policy integration seam.
+//! Cargo's committed resolved lock graph is the source of dependency truth.
+//! It retains normal, build, dev, target, renamed, `[patch]`, and `[replace]`
+//! resolution without requiring every registry source to be cached. A
+//! `--no-deps --locked --offline` metadata call validates the local manifests
+//! and classifies local packages by their SPDX metadata rather than copied
+//! names. Full metadata resolution remains in the causal fixtures. When
+//! #1417's omission-checked `.github/license-boundary.toml` is present, its
+//! `agpl_services` partition augments manifest metadata; that is the only
+//! policy integration seam.
 
 #![allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 
@@ -28,9 +30,16 @@ struct CargoMetadata {
 struct MetadataPackage {
     id: String,
     name: String,
+    version: String,
     license: Option<String>,
     manifest_path: PathBuf,
     source: Option<String>,
+    dependencies: Vec<DeclaredDependency>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DeclaredDependency {
+    name: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -41,12 +50,26 @@ struct MetadataResolve {
 #[derive(Debug, Deserialize)]
 struct MetadataNode {
     id: String,
-    deps: Vec<MetadataDependency>,
+    deps: Vec<ResolvedDependency>,
 }
 
 #[derive(Debug, Deserialize)]
-struct MetadataDependency {
+struct ResolvedDependency {
     pkg: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct CargoLock {
+    package: Vec<LockedPackage>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LockedPackage {
+    name: String,
+    version: String,
+    source: Option<String>,
+    #[serde(default)]
+    dependencies: Vec<String>,
 }
 
 fn load_toml(path: &Path) -> Result<Value, String> {
@@ -117,6 +140,226 @@ fn resolved_metadata(
     }
     serde_json::from_slice(&output.stdout)
         .map_err(|error| format!("parse cargo metadata JSON: {error}"))
+}
+
+fn local_metadata(
+    workspace_root: &Path,
+    root_manifest_path: &Path,
+) -> Result<CargoMetadata, String> {
+    let output = Command::new(env!("CARGO"))
+        .args([
+            "metadata",
+            "--format-version=1",
+            "--all-features",
+            "--locked",
+            "--offline",
+            "--no-deps",
+            "--manifest-path",
+        ])
+        .arg(root_manifest_path)
+        .current_dir(workspace_root)
+        .env("CARGO_TERM_COLOR", "never")
+        .output()
+        .map_err(|error| format!("run local-only cargo metadata: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "local-only cargo metadata failed ({}): {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    serde_json::from_slice(&output.stdout)
+        .map_err(|error| format!("parse local-only cargo metadata JSON: {error}"))
+}
+
+fn load_cargo_lock(path: &Path) -> Result<CargoLock, String> {
+    let contents =
+        fs::read_to_string(path).map_err(|error| format!("read {}: {error}", path.display()))?;
+    toml::from_str(&contents).map_err(|error| format!("parse {}: {error}", path.display()))
+}
+
+fn locked_dependency_index(packages: &[LockedPackage], dependency: &str) -> Result<usize, String> {
+    let name = dependency
+        .split_whitespace()
+        .next()
+        .ok_or_else(|| "Cargo.lock contains an empty dependency reference".to_owned())?;
+    let mut candidates = packages
+        .iter()
+        .enumerate()
+        .filter(|(_, package)| package.name == name)
+        .collect::<Vec<_>>();
+    if dependency != name {
+        let mut fields = dependency[name.len()..].trim().splitn(2, ' ');
+        let version = fields
+            .next()
+            .ok_or_else(|| format!("invalid Cargo.lock dependency reference {dependency}"))?;
+        candidates.retain(|(_, package)| package.version == version);
+        if let Some(source) = fields.next() {
+            let source = source
+                .strip_prefix('(')
+                .and_then(|value| value.strip_suffix(')'))
+                .ok_or_else(|| format!("invalid Cargo.lock dependency source {dependency}"))?;
+            candidates.retain(|(_, package)| {
+                package.source.as_deref().is_some_and(|candidate| {
+                    candidate == source
+                        || candidate
+                            .strip_prefix(source)
+                            .is_some_and(|suffix| suffix.starts_with('#'))
+                })
+            });
+        }
+    }
+    match candidates.as_slice() {
+        [(index, _)] => Ok(*index),
+        [] => Err(format!(
+            "Cargo.lock dependency {dependency} has no resolved package"
+        )),
+        _ => Err(format!(
+            "Cargo.lock dependency {dependency} is ambiguous across resolved packages"
+        )),
+    }
+}
+
+fn locked_root_index(packages: &[LockedPackage], root: &MetadataPackage) -> Result<usize, String> {
+    let matches = packages
+        .iter()
+        .enumerate()
+        .filter(|(_, package)| {
+            package.name == root.name && package.version == root.version && package.source.is_none()
+        })
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [index] => Ok(*index),
+        [] => Err(format!(
+            "Cargo.lock omitted local root {} {}",
+            root.name, root.version
+        )),
+        _ => Err(format!(
+            "Cargo.lock has ambiguous local roots named {} {}",
+            root.name, root.version
+        )),
+    }
+}
+
+fn root_metadata<'a>(
+    packages: &'a [MetadataPackage],
+    root_manifest_path: &Path,
+) -> Result<&'a MetadataPackage, String> {
+    let root_manifest = root_manifest_path
+        .canonicalize()
+        .map_err(|error| format!("resolve {}: {error}", root_manifest_path.display()))?;
+    packages
+        .iter()
+        .find(|package| {
+            package
+                .manifest_path
+                .canonicalize()
+                .is_ok_and(|path| path == root_manifest)
+        })
+        .ok_or_else(|| {
+            format!(
+                "cargo metadata omitted root package {}",
+                root_manifest.display()
+            )
+        })
+}
+
+fn assert_root_dependencies_locked(
+    metadata: &CargoMetadata,
+    lock: &CargoLock,
+    root_manifest_path: &Path,
+) -> Result<(), String> {
+    let root = root_metadata(&metadata.packages, root_manifest_path)?;
+    let root_index = locked_root_index(&lock.package, root)?;
+    let locked_root = &lock.package[root_index];
+    let locked_dependency_names = locked_root
+        .dependencies
+        .iter()
+        .map(|dependency| {
+            locked_dependency_index(&lock.package, dependency)
+                .map(|index| lock.package[index].name.as_str())
+        })
+        .collect::<Result<BTreeSet<_>, _>>()?;
+    for dependency in &root.dependencies {
+        if !locked_dependency_names.contains(dependency.name.as_str()) {
+            return Err(format!(
+                "Cargo.lock omitted declared all-feature dependency {} -> {}",
+                root.name, dependency.name
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn check_locked_apache_boundary(
+    workspace_root: &Path,
+    root_manifest_path: &Path,
+) -> Result<(), String> {
+    let metadata = local_metadata(workspace_root, &workspace_root.join("Cargo.toml"))?;
+    let lock = load_cargo_lock(&workspace_root.join("Cargo.lock"))?;
+    assert_root_dependencies_locked(&metadata, &lock, root_manifest_path)?;
+    check_locked_apache_boundary_with(
+        workspace_root,
+        root_manifest_path,
+        &metadata.packages,
+        &lock,
+    )
+}
+
+fn check_locked_apache_boundary_with(
+    policy_root: &Path,
+    root_manifest_path: &Path,
+    local_packages: &[MetadataPackage],
+    lock: &CargoLock,
+) -> Result<(), String> {
+    let policy_agpl = policy_agpl_packages(policy_root)?;
+    let root = root_metadata(local_packages, root_manifest_path)?;
+    let root_index = locked_root_index(&lock.package, root)?;
+
+    let mut queue = VecDeque::from([(root_index, Vec::<String>::new())]);
+    let mut visited = BTreeSet::new();
+    while let Some((index, mut chain)) = queue.pop_front() {
+        if !visited.insert(index) {
+            continue;
+        }
+        let package = &lock.package[index];
+        chain.push(package.name.clone());
+
+        if package.source.is_none() {
+            let metadata_package = local_packages
+                .iter()
+                .find(|candidate| {
+                    candidate.name == package.name
+                        && candidate.version == package.version
+                        && candidate.source.is_none()
+                })
+                .ok_or_else(|| {
+                    format!(
+                        "resolved local package {} {} has no local manifest metadata; Apache boundary fails closed",
+                        package.name, package.version
+                    )
+                })?;
+            let license = metadata_package.license.as_deref().ok_or_else(|| {
+                format!(
+                    "{} has no resolved package license; Apache boundary fails closed",
+                    metadata_package.manifest_path.display()
+                )
+            })?;
+            if policy_agpl.contains(&package.name) || contains_agpl_identifier(license) {
+                return Err(format!(
+                    "Apache-2.0-to-AGPL dependency: {} ({license})",
+                    chain.join(" -> ")
+                ));
+            }
+        }
+
+        for dependency in &package.dependencies {
+            let dependency_index = locked_dependency_index(&lock.package, dependency)?;
+            queue.push_back((dependency_index, chain.clone()));
+        }
+    }
+    Ok(())
 }
 
 fn check_apache_boundary(workspace_root: &Path, root_manifest_path: &Path) -> Result<(), String> {
@@ -246,7 +489,19 @@ fn hyprstream_k8s_complete_local_closure_excludes_agpl_services() {
         .canonicalize()
         .expect("canonical workspace root");
     let root_manifest_path = workspace_root.join("crates/hyprstream-k8s/Cargo.toml");
-    check_apache_boundary(&workspace_root, &root_manifest_path).unwrap();
+    check_locked_apache_boundary(&workspace_root, &root_manifest_path).unwrap();
+}
+
+#[test]
+fn production_lock_covers_every_declared_root_dependency_without_registry_sources() {
+    let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .canonicalize()
+        .expect("canonical workspace root");
+    let root_manifest_path = workspace_root.join("crates/hyprstream-k8s/Cargo.toml");
+    let metadata = local_metadata(&workspace_root, &workspace_root.join("Cargo.toml")).unwrap();
+    let lock = load_cargo_lock(&workspace_root.join("Cargo.lock")).unwrap();
+    assert_root_dependencies_locked(&metadata, &lock, &root_manifest_path).unwrap();
 }
 
 fn write_fixture(path: &Path, contents: &str) {
@@ -493,6 +748,19 @@ serde_json = "=1.0.150""#,
     let metadata = resolved_metadata(directory.path(), &root_manifest)
         .expect("transitive patch fixture must resolve offline");
     assert_transitive_patch_resolved(&metadata, "serde_json", "itoa");
+    let lock = load_cargo_lock(&directory.path().join("Cargo.lock"))
+        .expect("transitive patch fixture must write a resolved Cargo.lock");
+    let locked_error = check_locked_apache_boundary_with(
+        directory.path(),
+        &root_manifest,
+        &metadata.packages,
+        &lock,
+    )
+    .unwrap_err();
+    assert!(
+        locked_error.contains("apache-root -> serde_json -> itoa"),
+        "locked graph omitted complete dependency chain: {locked_error}"
+    );
 
     let error = check_apache_boundary(directory.path(), &root_manifest).unwrap_err();
     assert!(
