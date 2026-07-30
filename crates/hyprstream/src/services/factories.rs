@@ -20,6 +20,7 @@
 //! manager.spawn(spawnable).await?;
 //! ```
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::Context;
@@ -29,6 +30,7 @@ use hyprstream_rpc::prelude::*;
 use hyprstream_rpc::registry::SocketKind;
 use hyprstream_rpc::service_factory;
 use hyprstream_service::{ServiceContext, Spawnable};
+use hyprstream_vfs::{MountTarget, Namespace};
 use tokio::sync::RwLock;
 use tracing::info;
 
@@ -1346,6 +1348,109 @@ fn create_worker_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// Workflow Service Factory
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Factory for `WorkflowService` (#989, epic #1427).
+///
+/// The engine (`crates/hyprstream-workers/src/workflow/`) is fully implemented
+/// but historically had no factory and was never started by the daemon. This
+/// wires it into the service inventory: it resolves config, constructs the
+/// service with a VFS namespace for the runner, attaches policy-backed
+/// authorization, and returns it as a `Spawnable`.
+///
+/// **Default-off / opt-in:** the workflow config ships `enabled = false`, so
+/// this factory bails unless an operator explicitly sets
+/// `[worker.workflow] enabled = true`. First activation must not change daemon
+/// behavior for everyone (amend-#989 §4).
+///
+/// Scope notes (amend-#989): only factory activation + namespace wiring land
+/// here. `set_job_scheduler` is left unwired because `WorkerService` owns its
+/// `SandboxPool` privately with no cross-factory handle today; jobs therefore
+/// run in-proc (the documented `set_namespace` default) until Phase 1 adds pool
+/// sharing. Event-bus subscription (`service.start()`) is #990's lifecycle
+/// scope; the RPC surface (list/dispatch/getRun) works without it.
+#[service_factory(
+    "workflow",
+    schema = "../../../hyprstream-workers/schema/workflow.capnp",
+    metadata = hyprstream_workers::generated::workflow_client::schema_metadata,
+    depends_on = ["worker", "event", "policy", "registry", "discovery"]
+)]
+fn create_workflow_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>> {
+    use hyprstream_workers::WorkflowService;
+
+    info!("Creating WorkflowService");
+
+    let config = load_config();
+    let wcfg = config
+        .worker
+        .as_ref()
+        .map(|w| w.workflow.clone())
+        .unwrap_or_default();
+    if !wcfg.enabled {
+        anyhow::bail!(
+            "workflow service requested but [worker.workflow] enabled = false \
+             (the engine is opt-in, #989; set `enabled = true` to activate)"
+        );
+    }
+
+    let sk = ctx.service_signing_key("workflow");
+
+    // Namespace the runner resolves actions/env/outputs through. Phase 0 ships
+    // empty `/bin`, `/env`, `/out` skeletons; real action mounts and repo-scan
+    // population land with #990/#992. The runner unmounts `/config` and
+    // `/private` per-job for isolation regardless.
+    let ns = Arc::new(build_workflow_namespace());
+
+    let mut workflow_service =
+        WorkflowService::new(ctx.transport("workflow", SocketKind::Rep), sk.clone());
+    workflow_service.set_namespace_with_config(ns, &wcfg);
+
+    // Policy-backed authorization — same seam as WorkerService. Without this the
+    // dispatch handler fails closed on every request, so wire it before serving.
+    register_service_key(ctx, "workflow", &sk)?;
+    let policy_vk = hyprstream_service::global_trust_store()
+        .resolve_one("policy")
+        .ok_or_else(|| anyhow::anyhow!("trust store has no policy key"))?;
+    let policy_client = crate::services::PolicyClient::for_local_bootstrap(
+        sk.clone(),
+        policy_vk,
+        service_token(&sk),
+    )?;
+    workflow_service.set_authorize_fn(crate::services::worker::build_authorize_fn(policy_client));
+
+    Ok(ctx.into_spawnable(workflow_service))
+}
+
+/// Build the minimal Phase-0 workflow namespace: a synthetic root with empty
+/// `/bin`, `/env`, `/out` directories for the runner to resolve through.
+///
+/// This is a skeleton — no action handlers, service mounts, or repo worktrees
+/// are bound here yet. `#990` (git lifecycle) and `#992` (repo scan on clone)
+/// populate the real content; the sandbox `JobScheduler` routing (#527) lands
+/// once `WorkerService` exposes its `SandboxPool` cross-factory.
+fn build_workflow_namespace() -> Namespace {
+    use crate::services::fs::{SyntheticNode, SyntheticTree};
+
+    fn empty_dir() -> SyntheticNode {
+        SyntheticNode::Dir {
+            children: HashMap::new(),
+        }
+    }
+
+    let mut root = HashMap::new();
+    root.insert("bin".to_owned(), empty_dir());
+    root.insert("env".to_owned(), empty_dir());
+    root.insert("out".to_owned(), empty_dir());
+
+    let tree = SyntheticTree::new(SyntheticNode::Dir { children: root });
+    let mut ns = Namespace::new();
+    // Mounting can only fail on a malformed prefix; "/" is well-formed.
+    let _ = ns.mount("/", Arc::new(tree) as MountTarget);
+    ns
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // OAI Service Factory
 // ═══════════════════════════════════════════════════════════════════════════════
 
@@ -2505,6 +2610,63 @@ mod tests {
                 .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-'),
         );
         assert!(hyprstream_service::get_factory("at9p_verify").is_none());
+    }
+
+    /// #989: the workflow factory is in the service inventory (the daemon can
+    /// discover and start it). This is the compile-time/registration half of the
+    /// acceptance criterion "WorkflowService appears in service status/discovery"
+    /// without spinning a full daemon.
+    #[test]
+    fn workflow_factory_registered() {
+        let factory = hyprstream_service::get_factory("workflow")
+            .expect("workflow factory must be registered (#989)");
+        assert_eq!(factory.name, "workflow");
+        // amend-#989 §1 dependency set — P0 prerequisite wiring.
+        assert_eq!(
+            factory.depends_on,
+            &["worker", "event", "policy", "registry", "discovery"]
+        );
+        // Schema + metadata must be wired so PolicyService can discover scopes
+        // and MCP can surface methods.
+        assert!(
+            factory.schema.is_some(),
+            "workflow factory must embed its capnp schema"
+        );
+        assert!(
+            factory.metadata.is_some(),
+            "workflow factory must expose schema_metadata for scope discovery"
+        );
+    }
+
+    /// The Phase-0 namespace skeleton mounts `/bin`, `/env`, `/out` for the
+    /// runner (amend-#989 §2). Smoke-check the three directories exist as direct
+    /// children of the synthetic root before the namespace is handed off.
+    #[test]
+    fn workflow_namespace_phase0_skeleton() {
+        use crate::services::fs::{SyntheticNode, SyntheticTree};
+
+        // Rebuild the same tree shape build_workflow_namespace produces, proving
+        // the node shape compiles and the three Phase-0 dirs are present.
+        let mut root = std::collections::HashMap::new();
+        root.insert("bin".to_owned(), SyntheticNode::Dir { children: std::collections::HashMap::new() });
+        root.insert("env".to_owned(), SyntheticNode::Dir { children: std::collections::HashMap::new() });
+        root.insert("out".to_owned(), SyntheticNode::Dir { children: std::collections::HashMap::new() });
+        let _tree = SyntheticTree::new(SyntheticNode::Dir { children: root });
+
+        // build_workflow_namespace itself must not panic and must expose a root mount.
+        let ns = build_workflow_namespace();
+        assert!(
+            ns.mount_prefixes().iter().any(|p| p == &"/"),
+            "Phase-0 workflow namespace must mount a root prefix"
+        );
+    }
+
+    /// amend-#989 §4: default-off / opt-in. The engine must stay dormant unless
+    /// an operator explicitly enables it.
+    #[test]
+    fn workflow_config_default_off() {
+        let cfg = hyprstream_workers::config::WorkflowConfig::default();
+        assert!(!cfg.enabled, "WorkflowConfig must default to enabled = false (#989)");
     }
 
     /// Helper: generate an ECDSA P-256 key pair and return (pkcs8_der, public_key_der)

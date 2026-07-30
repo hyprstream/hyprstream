@@ -234,6 +234,14 @@ pub struct WorkflowConfig {
 
     /// Enable automatic workflow discovery on repo events
     pub auto_discover: bool,
+
+    /// Opt-in activation of the WorkflowService factory (#989).
+    ///
+    /// The engine is fully implemented but historically had no factory, so the
+    /// daemon never started it. First activation must not change daemon behavior
+    /// for everyone — `enabled = false` by default; an operator who wants the
+    /// workflow service sets `[worker.workflow] enabled = true`.
+    pub enabled: bool,
 }
 
 impl Default for WorkflowConfig {
@@ -244,6 +252,9 @@ impl Default for WorkflowConfig {
             job_timeout_secs: 3600,  // 1 hour
             step_timeout_secs: 600,  // 10 minutes
             auto_discover: true,
+            // Default-off: the workflow engine is opt-in (#989). The factory
+            // bails unless an operator explicitly sets `enabled = true`.
+            enabled: false,
         }
     }
 }
