@@ -1,3 +1,0 @@
-# Optional /etc/hosts fixture (manual/root-owned; bringup.sh never installs it).
-127.0.0.1 accounts.localhost pds.accounts.localhost alice.accounts.localhost www.accounts.localhost
-::1 accounts.localhost pds.accounts.localhost alice.accounts.localhost www.accounts.localhost

@@ -1,5 +1,4 @@
-# All generated material is local-only. Some entries contain private keys.
-/generated/
-/private/
-/state/
-/runtime/
+# Disposable task-owned runs. The harness removes these on every normal exit.
+/runs/
+__pycache__/
+*.pyc

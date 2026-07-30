@@ -1,4 +1,0 @@
-basicConstraints=critical,CA:FALSE
-keyUsage=critical,digitalSignature,keyEncipherment
-extendedKeyUsage=serverAuth
-subjectAltName=DNS:accounts.localhost,DNS:*.accounts.localhost,DNS:pds.accounts.localhost,IP:127.0.0.1,IP:::1
