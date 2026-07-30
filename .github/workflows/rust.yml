@@ -84,10 +84,10 @@ jobs:
 
     - name: Run Clippy (in rust-builder container)
       run: |
+        # The EBS cache filesystem rejects SELinux relabel xattrs; leave this shared
+        # ephemeral runner cache unlabeled and retain :Z only on the checked-out source.
         podman run --rm \
           -v "$PWD":/build:Z -w /build \
-          # The EBS cache filesystem rejects SELinux relabel xattrs; leave this shared
-          # ephemeral runner cache unlabeled and retain :Z only on the checked-out source.
           -v /mnt/hypr-ci-cache:/mnt/hypr-ci-cache \
           -e RUSTC_WRAPPER=sccache -e SCCACHE_BUCKET -e SCCACHE_REGION \
           -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY -e AWS_SESSION_TOKEN \
@@ -194,10 +194,10 @@ jobs:
     # merge-group build, preventing the two gates from drifting apart.
     - name: Check wasm32 browser build (in rust-builder container)
       run: |
+        # The EBS cache filesystem rejects SELinux relabel xattrs; leave this shared
+        # ephemeral runner cache unlabeled and retain :Z only on the checked-out source.
         podman run --rm \
           -v "$PWD":/build:Z -w /build \
-          # The EBS cache filesystem rejects SELinux relabel xattrs; leave this shared
-          # ephemeral runner cache unlabeled and retain :Z only on the checked-out source.
           -v /mnt/hypr-ci-cache:/mnt/hypr-ci-cache \
           -e RUSTC_WRAPPER=sccache -e SCCACHE_BUCKET -e SCCACHE_REGION \
           -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY -e AWS_SESSION_TOKEN \
@@ -273,10 +273,10 @@ jobs:
     # in-image sccache reaches the same-region S3 bucket.
     - name: WASM preflight + build + test (in rust-builder container)
       run: |
+        # The EBS cache filesystem rejects SELinux relabel xattrs; leave this shared
+        # ephemeral runner cache unlabeled and retain :Z only on the checked-out source.
         podman run --rm \
           -v "$PWD":/build:Z -w /build \
-          # The EBS cache filesystem rejects SELinux relabel xattrs; leave this shared
-          # ephemeral runner cache unlabeled and retain :Z only on the checked-out source.
           -v /mnt/hypr-ci-cache:/mnt/hypr-ci-cache \
           -e RUSTC_WRAPPER=sccache -e SCCACHE_BUCKET -e SCCACHE_REGION \
           -e SCCACHE_IDLE_TIMEOUT=0 \
