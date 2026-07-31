@@ -2046,6 +2046,157 @@ mod tests {
         Ok(())
     }
 
+    /// #324/N2 measurement contract for the keyed producer used by inter-host
+    /// activation traffic.
+    ///
+    /// This is opt-in because finding the exact boundary cumulatively encrypts
+    /// and serializes several hundred MiB. The binary search is bounded to 27
+    /// iterations over [8 KiB, 64 MiB], but the 64 MiB upper bound is never
+    /// materialized. Every real probe uses a fresh origin so a rejected oversized
+    /// Group cannot affect the next result.
+    #[tokio::test]
+    #[ignore = "bounded 32 MiB MoQ application-frame ceiling measurement"]
+    async fn measure_keyed_application_frame_ceiling() -> Result<()> {
+        const DECODE_BF16_BYTES: usize = 8 * 1024;
+        const PREFILL_BF16_BYTES: usize = 64 * 1024 * 1024;
+        const RECOMMENDED_ACTIVATION_DATA_BUDGET: usize = 31 * 1024 * 1024;
+        const MOQ_SERIALIZED_FRAME_CAP: usize = 32 * 1024 * 1024;
+        const EXPECTED_DECODE_FRAME_BYTES: usize = 8_408;
+        const EXPECTED_BUDGET_FRAME_BYTES: usize = 32_506_072;
+        const EXPECTED_KEYED_PAYLOAD_CEILING_BYTES: usize = 33_554_223;
+
+        let decode_frame = keyed_application_frame_probe(DECODE_BF16_BYTES)
+            .await?
+            .map_err(|error| anyhow!("8 KiB decode probe rejected: {error}"))?;
+        assert_eq!(decode_frame, EXPECTED_DECODE_FRAME_BYTES);
+
+        let budget_frame = keyed_application_frame_probe(RECOMMENDED_ACTIVATION_DATA_BUDGET)
+            .await?
+            .map_err(|error| anyhow!("31 MiB safety-budget probe rejected: {error}"))?;
+        assert_eq!(budget_frame, EXPECTED_BUDGET_FRAME_BYTES);
+        assert_eq!(MOQ_SERIALIZED_FRAME_CAP - budget_frame, 1_048_360);
+
+        // The keyed path is non-compressing: AES-GCM preserves plaintext length,
+        // then Cap'n Proto and the chained MAC only add bytes. A payload already
+        // larger than the serialized MoQ cap therefore cannot fit. Keep 64 MiB
+        // as a numeric rejected upper bound; do not send it through production.
+        const {
+            assert!(PREFILL_BF16_BYTES > MOQ_SERIALIZED_FRAME_CAP);
+        }
+
+        assert_negative_control_not_materialized(PREFILL_BF16_BYTES)?;
+
+        let mut accepted = DECODE_BF16_BYTES;
+        let mut rejected = PREFILL_BF16_BYTES;
+        while rejected - accepted > 1 {
+            let candidate = accepted + (rejected - accepted) / 2;
+            match keyed_application_frame_probe(candidate).await? {
+                Ok(_) => accepted = candidate,
+                Err(error) if error.contains("frame too large") => rejected = candidate,
+                Err(error) => anyhow::bail!(
+                    "payload probe at {candidate} bytes failed for a non-causal reason: {error}"
+                ),
+            }
+        }
+
+        let ceiling_frame = keyed_application_frame_probe(accepted)
+            .await?
+            .map_err(|error| anyhow!("ceiling probe rejected: {error}"))?;
+        let first_rejected_error = keyed_application_frame_probe(rejected)
+            .await?
+            .expect_err("first payload above the measured ceiling unexpectedly succeeded");
+
+        assert_eq!(rejected, accepted + 1);
+        assert_eq!(accepted, EXPECTED_KEYED_PAYLOAD_CEILING_BYTES);
+        assert_eq!(ceiling_frame, MOQ_SERIALIZED_FRAME_CAP);
+        assert!(first_rejected_error.contains("frame too large"));
+        assert!(PREFILL_BF16_BYTES >= rejected);
+        Ok(())
+    }
+
+    /// The representative prefill upper bound is a number used by the search,
+    /// never a payload passed to the keyed production serializer.
+    #[test]
+    fn prefill_negative_control_does_not_invoke_allocator() -> Result<()> {
+        assert_negative_control_not_materialized(64 * 1024 * 1024)
+    }
+
+    fn assert_negative_control_not_materialized(payload_len: usize) -> Result<()> {
+        // The injected allocator records an attempted materialization without
+        // allocating. The size guard must return before invoking it.
+        let mut allocation_attempted = false;
+        let error = deterministic_bf16_probe_payload_with(payload_len, |_| {
+            allocation_attempted = true;
+            Vec::new()
+        })
+        .expect_err("negative-control payload unexpectedly reached the allocator");
+        anyhow::ensure!(!allocation_attempted, "negative control invoked allocator");
+        anyhow::ensure!(
+            error.to_string().contains("refusing to materialize"),
+            "negative-control guard failed for a non-causal reason: {error}"
+        );
+        Ok(())
+    }
+
+    async fn keyed_application_frame_probe(
+        payload_len: usize,
+    ) -> Result<std::result::Result<usize, String>> {
+        let payload = deterministic_bf16_probe_payload_with(payload_len, |len| vec![0_u8; len])?;
+        let origin = origin();
+        let (_client_secret, client_pub) = crate::crypto::generate_ephemeral_keypair();
+        let ctx = StreamContext::from_third_party_interop_dh(&client_pub.to_bytes())?;
+        let topic = ctx.topic().to_owned();
+        let mut publisher = origin.publisher(&ctx)?;
+
+        if let Err(error) = publisher.publish_data(&payload).await {
+            return Ok(Err(error.to_string()));
+        }
+
+        let path = origin.broadcast_path(&topic);
+        let broadcast = origin
+            .consumer()
+            .announced_broadcast(path.as_str())
+            .await
+            .ok_or_else(|| anyhow!("probe broadcast not announced"))?;
+        let track = broadcast.subscribe_track(&Track::new(STREAM_TRACK))?;
+        let mut group = track
+            .get_group(0)
+            .await?
+            .ok_or_else(|| anyhow!("probe Group 0 missing"))?;
+        let frame = group
+            .read_frame()
+            .await?
+            .ok_or_else(|| anyhow!("probe frame missing"))?;
+        Ok(Ok(frame.len()))
+    }
+
+    fn deterministic_bf16_probe_payload_with(
+        payload_len: usize,
+        allocate: impl FnOnce(usize) -> Vec<u8>,
+    ) -> Result<Vec<u8>> {
+        // The first binary-search candidate is 32 MiB + 4 KiB. No subsequent
+        // candidate is larger, so anything above this is a numeric bound only.
+        const MAX_MATERIALIZED_PROBE_BYTES: usize = 32 * 1024 * 1024 + 4 * 1024;
+        anyhow::ensure!(
+            payload_len <= MAX_MATERIALIZED_PROBE_BYTES,
+            "refusing to materialize {payload_len}-byte negative-control payload"
+        );
+
+        // The producer treats activation bytes as opaque. Alternating bytes
+        // encode BF16 1.0 on little-endian hosts while keeping the fixture
+        // deterministic and representative of a BF16 tensor buffer.
+        let mut payload = allocate(payload_len);
+        anyhow::ensure!(
+            payload.len() == payload_len,
+            "probe allocator returned {} bytes for requested {payload_len}",
+            payload.len()
+        );
+        for value in payload.chunks_exact_mut(2) {
+            value.copy_from_slice(&[0x80, 0x3f]);
+        }
+        Ok(payload)
+    }
+
     /// #554 identified profile: a standards-compatible MoQT track carries only
     /// opaque Object bytes, an authenticated rekey resets the per-epoch sequence
     /// and traffic keys, and the relay-visible Group identity remains monotonic.
