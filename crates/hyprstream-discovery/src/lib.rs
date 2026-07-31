@@ -151,6 +151,11 @@ pub use service::{
     DeploymentAuthorityCheckpoint, DeploymentAuthorityLog, RegistryDelegationArtifact,
     VerifiedDeploymentArtifacts,
 };
+#[cfg(feature = "test-fixtures")]
+#[doc(hidden)]
+pub use service::test_fixtures::{
+    install_production_inference_fixture, ProductionInferenceFixture,
+};
 
 // Re-export generated types that consumers need
 pub use generated::discovery_client::{

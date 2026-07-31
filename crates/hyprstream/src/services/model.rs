@@ -2495,6 +2495,620 @@ mod tests {
         }
     }
 
+    const SELECTOR_BEARER: &str = "fixture-delegated-bearer";
+    static SELECTOR_BOUNDARY_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    static SELECTOR_DIAL_STATE: std::sync::OnceLock<Arc<BoundaryDialState>> =
+        std::sync::OnceLock::new();
+    static SELECTOR_FIXTURE: std::sync::OnceLock<hyprstream_discovery::ProductionInferenceFixture> =
+        std::sync::OnceLock::new();
+
+    #[derive(Clone, Debug)]
+    struct ReadinessObservation {
+        transport: TransportConfig,
+        service: String,
+        method_discriminator: u16,
+        delegated_bearer: Option<String>,
+        jwt: Option<String>,
+    }
+
+    #[derive(Default)]
+    struct BoundaryDialBehavior {
+        failures_remaining: usize,
+        fail_all: bool,
+    }
+
+    #[derive(Default)]
+    struct BoundaryDialState {
+        dials: parking_lot::Mutex<Vec<TransportConfig>>,
+        readiness: parking_lot::Mutex<Vec<ReadinessObservation>>,
+        expected_bearer: parking_lot::Mutex<Option<String>>,
+        behavior: parking_lot::Mutex<BoundaryDialBehavior>,
+    }
+
+    impl BoundaryDialState {
+        fn reset(&self, expected_bearer: Option<&str>) {
+            self.dials.lock().clear();
+            self.readiness.lock().clear();
+            *self.expected_bearer.lock() = expected_bearer.map(ToOwned::to_owned);
+            *self.behavior.lock() = BoundaryDialBehavior::default();
+        }
+
+        fn fail_next(&self, count: usize) {
+            self.behavior.lock().failures_remaining = count;
+        }
+
+        fn fail_all(&self) {
+            self.behavior.lock().fail_all = true;
+        }
+    }
+
+    struct BoundaryRpcClient {
+        transport: TransportConfig,
+        state: Arc<BoundaryDialState>,
+        request_id: std::sync::atomic::AtomicU64,
+    }
+
+    impl BoundaryRpcClient {
+        fn new(transport: TransportConfig, state: Arc<BoundaryDialState>) -> Self {
+            Self {
+                transport,
+                state,
+                request_id: std::sync::atomic::AtomicU64::new(1),
+            }
+        }
+
+        fn unsupported() -> Result<Vec<u8>> {
+            anyhow::bail!("selector fixture received an unexpected RPC method")
+        }
+    }
+
+    #[async_trait]
+    impl hyprstream_rpc::RpcClient for BoundaryRpcClient {
+        async fn call(&self, _payload: Vec<u8>) -> Result<Vec<u8>> {
+            Self::unsupported()
+        }
+
+        async fn call_for_service(
+            &self,
+            _service_domain: &str,
+            _payload: Vec<u8>,
+        ) -> Result<Vec<u8>> {
+            Self::unsupported()
+        }
+
+        async fn call_for_service_with_method(
+            &self,
+            _service_domain: &str,
+            _method_discriminator: u16,
+            _payload: Vec<u8>,
+        ) -> Result<Vec<u8>> {
+            Self::unsupported()
+        }
+
+        async fn call_with_options(
+            &self,
+            _payload: Vec<u8>,
+            _options: hyprstream_rpc::CallOptions,
+        ) -> Result<Vec<u8>> {
+            Self::unsupported()
+        }
+
+        async fn call_with_options_for_service(
+            &self,
+            _service_domain: &str,
+            _payload: Vec<u8>,
+            _options: hyprstream_rpc::CallOptions,
+        ) -> Result<Vec<u8>> {
+            Self::unsupported()
+        }
+
+        async fn call_with_options_for_service_with_method(
+            &self,
+            service_domain: &str,
+            method_discriminator: u16,
+            payload: Vec<u8>,
+            options: hyprstream_rpc::CallOptions,
+        ) -> Result<Vec<u8>> {
+            let reader = capnp::serialize::read_message(
+                &mut std::io::Cursor::new(&payload),
+                capnp::message::ReaderOptions::new(),
+            )?;
+            let request = reader.get_root::<crate::inference_capnp::inference_request::Reader>()?;
+            anyhow::ensure!(
+                matches!(
+                    request.which()?,
+                    crate::inference_capnp::inference_request::Which::IsReady(())
+                ),
+                "selector fixture received a non-readiness request"
+            );
+            let expected_bearer = self.state.expected_bearer.lock().clone();
+            self.state.readiness.lock().push(ReadinessObservation {
+                transport: self.transport.clone(),
+                service: service_domain.to_owned(),
+                method_discriminator,
+                delegated_bearer: options.delegated_bearer.clone(),
+                jwt: options.jwt.clone(),
+            });
+            anyhow::ensure!(
+                service_domain == InferenceClient::SERVICE_NAME,
+                "readiness used the wrong generated service authority"
+            );
+            anyhow::ensure!(
+                method_discriminator == 2,
+                "readiness used the wrong schema method discriminator"
+            );
+            anyhow::ensure!(
+                options.jwt.is_none() && options.delegated_bearer == expected_bearer,
+                "readiness did not carry the expected delegated bearer"
+            );
+            let should_fail = {
+                let mut behavior = self.state.behavior.lock();
+                if behavior.fail_all {
+                    true
+                } else if behavior.failures_remaining > 0 {
+                    behavior.failures_remaining -= 1;
+                    true
+                } else {
+                    false
+                }
+            };
+            if should_fail {
+                anyhow::bail!("fixture readiness failure");
+            }
+            crate::services::generated::inference_client::serialize_response(
+                request.get_id(),
+                &crate::services::generated::inference_client::InferenceResponseVariant::IsReadyResult(
+                    true,
+                ),
+            )
+        }
+
+        async fn call_streaming(
+            &self,
+            _payload: Vec<u8>,
+            _ephemeral_pubkey: [u8; 32],
+        ) -> Result<Vec<u8>> {
+            Self::unsupported()
+        }
+
+        async fn call_streaming_for_service(
+            &self,
+            _service_domain: &str,
+            _payload: Vec<u8>,
+            _ephemeral_pubkey: [u8; 32],
+        ) -> Result<Vec<u8>> {
+            Self::unsupported()
+        }
+
+        async fn call_streaming_for_service_with_method(
+            &self,
+            _service_domain: &str,
+            _method_discriminator: u16,
+            _payload: Vec<u8>,
+            _ephemeral_pubkey: [u8; 32],
+        ) -> Result<Vec<u8>> {
+            Self::unsupported()
+        }
+
+        async fn open_stream(
+            &self,
+            _payload: Vec<u8>,
+        ) -> Result<Box<dyn hyprstream_rpc::stream_consumer::StreamHandle>> {
+            anyhow::bail!("selector fixture received an unexpected streaming RPC")
+        }
+
+        async fn open_stream_from_info(
+            &self,
+            _stream_info: hyprstream_rpc::stream_info::StreamInfo,
+            _client_secret: [u8; 32],
+            _client_pubkey: [u8; 32],
+        ) -> Result<Box<dyn hyprstream_rpc::stream_consumer::StreamHandle>> {
+            anyhow::bail!("selector fixture received an unexpected stream-open RPC")
+        }
+
+        fn next_id(&self) -> u64 {
+            self.request_id.fetch_add(1, Ordering::Relaxed)
+        }
+    }
+
+    fn selector_instance() -> InferenceInstanceId {
+        InferenceInstanceId::new("fixture-tenant", "fixture-model:main", 0)
+            .unwrap_or_else(|error| panic!("fixture inference identity failed: {error}"))
+    }
+
+    fn remote_transport(port: u16) -> TransportConfig {
+        TransportConfig::quic(
+            std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+            "fixture.test",
+        )
+        .with_connect_mode()
+    }
+
+    fn selector_fixture() -> (
+        &'static hyprstream_discovery::ProductionInferenceFixture,
+        &'static Arc<BoundaryDialState>,
+    ) {
+        let state = SELECTOR_DIAL_STATE.get_or_init(|| Arc::new(BoundaryDialState::default()));
+        let fixture = SELECTOR_FIXTURE.get_or_init(|| {
+            let dial_state = Arc::clone(state);
+            let dial = Arc::new(move |transport: &TransportConfig| {
+                dial_state.dials.lock().push(transport.clone());
+                Ok(Arc::new(BoundaryRpcClient::new(
+                    transport.clone(),
+                    Arc::clone(&dial_state),
+                )) as Arc<dyn hyprstream_rpc::RpcClient>)
+            });
+            hyprstream_discovery::install_production_inference_fixture(
+                &selector_instance().service_name(),
+                &[remote_transport(41_001)],
+                dial,
+            )
+            .unwrap_or_else(|error| panic!("install selector fixture failed: {error}"))
+        });
+        (fixture, state)
+    }
+
+    async fn selector_model_service() -> ModelService {
+        let _ = hyprstream_rpc::moq_event::init_global_moq_event_origin(
+            hyprstream_rpc::moq_event::MoqEventOrigin::new(),
+        );
+        let infrastructure_state = Arc::new(BoundaryDialState::default());
+        let infrastructure_rpc = Arc::new(BoundaryRpcClient::new(
+            TransportConfig::inproc("selector-infrastructure"),
+            infrastructure_state,
+        )) as Arc<dyn hyprstream_rpc::RpcClient>;
+        ModelService::new(
+            ModelServiceConfig::default(),
+            SigningKey::from_bytes(&[0x41; 32]),
+            PolicyClient::new(Arc::clone(&infrastructure_rpc)),
+            RegistryClient::new(infrastructure_rpc),
+            TransportConfig::inproc("selector-model-service"),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("construct model-free selector service failed: {error}"))
+    }
+
+    fn selector_loaded_model(
+        load_state: Vec<InferenceServerInfo>,
+        local_state: Arc<BoundaryDialState>,
+    ) -> LoadedModel {
+        let local_transport = TransportConfig::inproc("selector-local-inference");
+        let network_transport = load_state
+            .iter()
+            .find(|candidate| {
+                matches!(
+                    &candidate.transport.endpoint,
+                    EndpointType::Quic { .. } | EndpointType::Iroh { .. }
+                )
+            })
+            .map_or_else(
+                || local_transport.clone(),
+                |candidate| candidate.transport.clone(),
+            );
+        LoadedModel {
+            instance: selector_instance(),
+            model_ref: "fixture-model:main".to_owned(),
+            transport: local_transport.clone(),
+            network_transport,
+            service_handle: hyprstream_service::SpawnedService::dummy(),
+            client: InferenceClient::new(Arc::new(BoundaryRpcClient::new(
+                local_transport,
+                local_state,
+            ))),
+            router: CellRouter::default(),
+            load_state,
+            loaded_at: Instant::now(),
+            last_used: Instant::now(),
+            ttt_config: None,
+            generation_defaults: crate::config::SamplingParams::default(),
+        }
+    }
+
+    fn server_at(id: u8, transport: TransportConfig) -> InferenceServerInfo {
+        InferenceServerInfo {
+            replica_id: crate::services::router::ReplicaId::from_bytes([id; 32]),
+            transport,
+            gpu_memory_free: 1024,
+            active_sessions: 0,
+            last_heartbeat: Instant::now(),
+        }
+    }
+
+    fn exclude_local(model: &mut LoadedModel) -> crate::services::router::ReplicaId {
+        let local = ModelService::co_located_replica_id(model);
+        model.router.report_dial_fail(local, Instant::now());
+        local
+    }
+
+    #[tokio::test]
+    async fn selector_boundary_fixed_authority_exact_reach_and_delegated_readiness() {
+        let _guard = SELECTOR_BOUNDARY_LOCK.lock().await;
+        let (fixture, dial_state) = selector_fixture();
+        let advertised = remote_transport(41_011);
+        fixture
+            .reset(std::slice::from_ref(&advertised))
+            .unwrap_or_else(|error| panic!("reset selector fixture failed: {error}"));
+        dial_state.reset(Some(SELECTOR_BEARER));
+        let local_state = Arc::new(BoundaryDialState::default());
+        let local = server_at(0x10, TransportConfig::inproc("selector-local"));
+        let remote = server_at(0x20, advertised.clone());
+        let mut model = selector_loaded_model(vec![local, remote], local_state);
+        exclude_local(&mut model);
+        let service = selector_model_service().await;
+
+        service
+            .select_inference_server(&mut model, "selector-positive", SELECTOR_BEARER)
+            .await
+            .unwrap_or_else(|error| panic!("production selector rejected exact reach: {error}"));
+
+        let dials = dial_state.dials.lock().clone();
+        assert_eq!(dials, vec![advertised.clone()]);
+        let readiness = dial_state.readiness.lock().clone();
+        assert_eq!(readiness.len(), 1);
+        assert_eq!(readiness[0].transport, advertised);
+        assert_eq!(readiness[0].service, "inference");
+        assert_eq!(readiness[0].method_discriminator, 2);
+        assert_eq!(
+            readiness[0].delegated_bearer.as_deref(),
+            Some(SELECTOR_BEARER)
+        );
+        assert!(readiness[0].jwt.is_none());
+        assert_ne!(selector_instance().service_name(), "inference");
+    }
+
+    #[tokio::test]
+    async fn selector_boundary_rejects_unadvertised_reach_before_bearer_disclosure() {
+        let _guard = SELECTOR_BOUNDARY_LOCK.lock().await;
+        let (fixture, dial_state) = selector_fixture();
+        fixture
+            .reset(&[remote_transport(41_021)])
+            .unwrap_or_else(|error| panic!("reset selector fixture failed: {error}"));
+        dial_state.reset(Some(SELECTOR_BEARER));
+        let local_state = Arc::new(BoundaryDialState::default());
+        let selected_id = crate::services::router::ReplicaId::from_bytes([0x22; 32]);
+        let mut model = selector_loaded_model(
+            vec![
+                server_at(0x10, TransportConfig::inproc("selector-local")),
+                server_at(0x22, remote_transport(41_022)),
+            ],
+            local_state,
+        );
+        exclude_local(&mut model);
+        let error = selector_model_service()
+            .await
+            .select_inference_server(&mut model, "selector-unadvertised", SELECTOR_BEARER)
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("unadvertised reach was accepted"));
+        assert!(error
+            .to_string()
+            .contains("not a current authorized candidate"));
+        assert!(dial_state.dials.lock().is_empty());
+        assert!(dial_state.readiness.lock().is_empty());
+        assert!(model
+            .router
+            .is_excluded(selected_id, Instant::now())
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn selector_boundary_rejects_stale_reach_before_bearer_disclosure() {
+        let _guard = SELECTOR_BOUNDARY_LOCK.lock().await;
+        let (fixture, dial_state) = selector_fixture();
+        let advertised = remote_transport(41_031);
+        fixture
+            .reset(std::slice::from_ref(&advertised))
+            .unwrap_or_else(|error| panic!("reset selector fixture failed: {error}"));
+        fixture.mark_stale();
+        dial_state.reset(Some(SELECTOR_BEARER));
+        let selected_id = crate::services::router::ReplicaId::from_bytes([0x23; 32]);
+        let mut model = selector_loaded_model(
+            vec![
+                server_at(0x10, TransportConfig::inproc("selector-local")),
+                server_at(0x23, advertised),
+            ],
+            Arc::new(BoundaryDialState::default()),
+        );
+        exclude_local(&mut model);
+        assert!(selector_model_service()
+            .await
+            .select_inference_server(&mut model, "selector-stale", SELECTOR_BEARER)
+            .await
+            .is_err());
+        assert!(dial_state.dials.lock().is_empty());
+        assert!(dial_state.readiness.lock().is_empty());
+        assert!(model
+            .router
+            .is_excluded(selected_id, Instant::now())
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn selector_boundary_rejects_cross_authority_retry_set_before_bearer_disclosure() {
+        let _guard = SELECTOR_BOUNDARY_LOCK.lock().await;
+        let (fixture, dial_state) = selector_fixture();
+        let selected = remote_transport(41_041);
+        fixture
+            .reset(std::slice::from_ref(&selected))
+            .unwrap_or_else(|error| panic!("reset selector fixture failed: {error}"));
+        fixture
+            .add_foreign_authority(&remote_transport(41_042))
+            .unwrap_or_else(|error| panic!("add foreign fixture authority failed: {error}"));
+        dial_state.reset(Some(SELECTOR_BEARER));
+        let selected_id = crate::services::router::ReplicaId::from_bytes([0x24; 32]);
+        let mut model = selector_loaded_model(
+            vec![
+                server_at(0x10, TransportConfig::inproc("selector-local")),
+                server_at(0x24, selected),
+            ],
+            Arc::new(BoundaryDialState::default()),
+        );
+        exclude_local(&mut model);
+        let error = selector_model_service()
+            .await
+            .select_inference_server(&mut model, "selector-authority", SELECTOR_BEARER)
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("cross-authority retry set was accepted"));
+        assert!(error
+            .to_string()
+            .contains("ambiguous validated service authority"));
+        assert!(dial_state.dials.lock().is_empty());
+        assert!(dial_state.readiness.lock().is_empty());
+        assert!(model
+            .router
+            .is_excluded(selected_id, Instant::now())
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn selector_boundary_rejects_non_network_transport_before_bearer_disclosure() {
+        let _guard = SELECTOR_BOUNDARY_LOCK.lock().await;
+        let (fixture, dial_state) = selector_fixture();
+        fixture
+            .reset(&[remote_transport(41_051)])
+            .unwrap_or_else(|error| panic!("reset selector fixture failed: {error}"));
+        dial_state.reset(Some(SELECTOR_BEARER));
+        let selected_id = crate::services::router::ReplicaId::from_bytes([0x25; 32]);
+        let mut model = selector_loaded_model(
+            vec![
+                server_at(0x10, TransportConfig::inproc("selector-local")),
+                server_at(0x25, TransportConfig::ipc("/run/hyprstream/attacker.sock")),
+            ],
+            Arc::new(BoundaryDialState::default()),
+        );
+        exclude_local(&mut model);
+        let error = selector_model_service()
+            .await
+            .select_inference_server(&mut model, "selector-transport", SELECTOR_BEARER)
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("non-network remote transport was accepted"));
+        assert!(error.to_string().contains("non-network transport"));
+        assert!(dial_state.dials.lock().is_empty());
+        assert!(dial_state.readiness.lock().is_empty());
+        assert!(model
+            .router
+            .is_excluded(selected_id, Instant::now())
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn selector_boundary_failure_marks_exact_selected_replica_and_reselects_once() {
+        let _guard = SELECTOR_BOUNDARY_LOCK.lock().await;
+        let (fixture, dial_state) = selector_fixture();
+        let first = remote_transport(41_061);
+        let second = remote_transport(41_062);
+        fixture
+            .reset(&[first.clone(), second.clone()])
+            .unwrap_or_else(|error| panic!("reset selector fixture failed: {error}"));
+        dial_state.reset(Some(SELECTOR_BEARER));
+        dial_state.fail_next(1);
+        let first_id = crate::services::router::ReplicaId::from_bytes([0x26; 32]);
+        let second_id = crate::services::router::ReplicaId::from_bytes([0x27; 32]);
+        let mut model = selector_loaded_model(
+            vec![
+                server_at(0x10, TransportConfig::inproc("selector-local")),
+                server_at(0x26, first.clone()),
+                server_at(0x27, second.clone()),
+            ],
+            Arc::new(BoundaryDialState::default()),
+        );
+        exclude_local(&mut model);
+        selector_model_service()
+            .await
+            .select_inference_server(&mut model, "selector-reselect", SELECTOR_BEARER)
+            .await
+            .unwrap_or_else(|error| panic!("bounded reselection did not recover: {error}"));
+        let dials = dial_state.dials.lock().clone();
+        assert_eq!(dials.len(), 2);
+        assert_ne!(dials[0], dials[1]);
+        let (failed_id, surviving_id) = if dials[0] == first {
+            (first_id, second_id)
+        } else {
+            assert_eq!(dials[0], second);
+            (second_id, first_id)
+        };
+        assert!(model
+            .router
+            .is_excluded(failed_id, Instant::now())
+            .is_some());
+        assert!(model
+            .router
+            .is_excluded(surviving_id, Instant::now())
+            .is_none());
+        assert_eq!(dial_state.readiness.lock().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn selector_boundary_explicit_colocation_returns_local_client_without_remote_dial() {
+        let _guard = SELECTOR_BOUNDARY_LOCK.lock().await;
+        let (fixture, dial_state) = selector_fixture();
+        fixture
+            .reset(&[remote_transport(41_071)])
+            .unwrap_or_else(|error| panic!("reset selector fixture failed: {error}"));
+        dial_state.reset(Some(SELECTOR_BEARER));
+        let local_state = Arc::new(BoundaryDialState::default());
+        local_state.reset(None);
+        let mut model = selector_loaded_model(
+            vec![server_at(0x10, TransportConfig::inproc("selector-local"))],
+            Arc::clone(&local_state),
+        );
+        let client = selector_model_service()
+            .await
+            .select_inference_server(&mut model, "selector-local", SELECTOR_BEARER)
+            .await
+            .unwrap_or_else(|error| panic!("explicit co-location failed: {error}"));
+        assert!(dial_state.dials.lock().is_empty());
+        assert!(dial_state.readiness.lock().is_empty());
+        assert!(client
+            .is_ready()
+            .await
+            .unwrap_or_else(|error| panic!("returned local client failed: {error}")));
+        assert_eq!(local_state.readiness.lock().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn selector_boundary_exhaustion_fails_without_local_fallback() {
+        let _guard = SELECTOR_BOUNDARY_LOCK.lock().await;
+        let (fixture, dial_state) = selector_fixture();
+        let first = remote_transport(41_081);
+        let second = remote_transport(41_082);
+        fixture
+            .reset(&[first.clone(), second.clone()])
+            .unwrap_or_else(|error| panic!("reset selector fixture failed: {error}"));
+        dial_state.reset(Some(SELECTOR_BEARER));
+        dial_state.fail_all();
+        let first_id = crate::services::router::ReplicaId::from_bytes([0x28; 32]);
+        let second_id = crate::services::router::ReplicaId::from_bytes([0x29; 32]);
+        let local_state = Arc::new(BoundaryDialState::default());
+        local_state.reset(None);
+        let mut model = selector_loaded_model(
+            vec![
+                server_at(0x10, TransportConfig::inproc("selector-local")),
+                server_at(0x28, first),
+                server_at(0x29, second),
+            ],
+            Arc::clone(&local_state),
+        );
+        exclude_local(&mut model);
+        let error = selector_model_service()
+            .await
+            .select_inference_server(&mut model, "selector-exhausted", SELECTOR_BEARER)
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("exhausted remote candidates fell back locally"));
+        assert!(error.to_string().contains("candidates exhausted"));
+        assert_eq!(dial_state.dials.lock().len(), 2);
+        assert_eq!(dial_state.readiness.lock().len(), 2);
+        assert!(local_state.readiness.lock().is_empty());
+        assert!(model.router.is_excluded(first_id, Instant::now()).is_some());
+        assert!(model
+            .router
+            .is_excluded(second_id, Instant::now())
+            .is_some());
+    }
+
     /// Degenerate/solo case (acceptance criterion): a single-entry replica set
     /// (today's actual `load_state` shape at load time) always classifies as
     /// `CoLocated` — no regression from pre-P3 behavior.
@@ -2612,120 +3226,6 @@ mod tests {
             Instant::now(),
         );
         assert_eq!(decision, RouteDecision::NoHealthyCandidate);
-    }
-
-    #[tokio::test]
-    async fn replica_dial_local_uses_fast_path_without_remote_attempt() {
-        let co_located = crate::services::router::ReplicaId::from_bytes([0x10; 32]);
-        let mut router = CellRouter::default();
-        let routed = route_and_dial_replica(
-            &mut router,
-            &[server(0x10, 1024, 0)],
-            co_located,
-            "sess-local",
-            "local-client",
-            |_candidate| async move {
-                panic!("co-located selection must not dial a remote transport")
-            },
-        )
-        .await
-        .unwrap_or_else(|error| panic!("local fast path failed: {error}"));
-        assert_eq!(routed.value, "local-client");
-        assert_eq!(routed.locality, ReplicaLocality::CoLocated);
-    }
-
-    #[tokio::test]
-    async fn replica_dial_remote_success_returns_remote_not_local() {
-        let co_located = crate::services::router::ReplicaId::from_bytes([0x10; 32]);
-        let remote = crate::services::router::ReplicaId::from_bytes([0x20; 32]);
-        let mut router = CellRouter::default();
-        let routed = route_and_dial_replica(
-            &mut router,
-            &[server(0x20, 1024, 0)],
-            co_located,
-            "sess-remote",
-            "local-client",
-            move |candidate| async move {
-                assert_eq!(candidate.replica_id, remote);
-                Ok("remote-client")
-            },
-        )
-        .await
-        .unwrap_or_else(|error| panic!("remote dial failed: {error}"));
-        assert_eq!(routed.value, "remote-client");
-        assert_eq!(routed.replica_id, remote);
-        assert_eq!(routed.locality, ReplicaLocality::Remote);
-    }
-
-    #[tokio::test]
-    async fn replica_dial_unauthorized_fails_closed_without_local_fallback() {
-        let co_located = crate::services::router::ReplicaId::from_bytes([0x10; 32]);
-        let remote = crate::services::router::ReplicaId::from_bytes([0x20; 32]);
-        let mut router = CellRouter::default();
-        let error = route_and_dial_replica(
-            &mut router,
-            &[server(0x20, 1024, 0)],
-            co_located,
-            "sess-unauthorized",
-            "local-client",
-            |_candidate| async move {
-                Err::<&str, _>(anyhow!("selected reach is not authorized"))
-            },
-        )
-        .await
-        .err()
-        .unwrap_or_else(|| panic!("unauthorized remote must fail"));
-        assert!(error.to_string().contains("not authorized"));
-        assert!(router.is_excluded(remote, Instant::now()).is_some());
-    }
-
-    #[tokio::test]
-    async fn replica_dial_unreachable_marks_down_and_reselects() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-
-        let co_located = crate::services::router::ReplicaId::from_bytes([0x10; 32]);
-        let load_state = vec![server(0x20, 1024, 0), server(0x30, 1024, 0)];
-        let mut router = CellRouter::default();
-        let attempts = Arc::new(AtomicUsize::new(0));
-        let dial_attempts = Arc::clone(&attempts);
-        let routed = route_and_dial_replica(
-            &mut router,
-            &load_state,
-            co_located,
-            "sess-reselect",
-            "local-client",
-            move |_candidate| {
-                let dial_attempts = Arc::clone(&dial_attempts);
-                async move {
-                    if dial_attempts.fetch_add(1, Ordering::SeqCst) == 0 {
-                        anyhow::bail!("remote unreachable");
-                    }
-                    Ok("remote-client")
-                }
-            },
-        )
-        .await
-        .unwrap_or_else(|error| panic!("second remote should be selected: {error}"));
-        assert_eq!(routed.value, "remote-client");
-        assert_eq!(attempts.load(Ordering::SeqCst), 2);
-    }
-
-    #[tokio::test]
-    async fn replica_dial_no_candidate_fails_closed() {
-        let co_located = crate::services::router::ReplicaId::from_bytes([0x10; 32]);
-        let mut router = CellRouter::default();
-        let error = route_and_dial_replica(
-            &mut router,
-            &[],
-            co_located,
-            "sess-empty",
-            "local-client",
-            |_candidate| async move { Ok("remote-client") },
-        )
-        .await
-        .err()
-        .unwrap_or_else(|| panic!("empty replica set must fail"));
-        assert_eq!(error.to_string(), "no healthy inference replica candidates");
     }
 
 }

@@ -3111,6 +3111,10 @@ impl ProductionRpcClient {
     }
     fn client_for(&self, snapshot: &ResolvedService) -> Result<Arc<dyn RpcClient>> {
         let (kem, pq) = snapshot.crypto_stores()?;
+        #[cfg(feature = "test-fixtures")]
+        if let Some(client) = test_fixtures::dial_override(snapshot.transport())? {
+            return Ok(client);
+        }
         let signer = hyprstream_rpc::signer::LocalSigner::new(self.signing_key.clone());
         hyprstream_rpc::dial::dial_with_crypto_stores(
             snapshot.transport(),
@@ -3171,6 +3175,204 @@ impl ProductionRpcClient {
             snapshot,
             invalidated: false,
         })
+    }
+}
+
+#[cfg(feature = "test-fixtures")]
+#[doc(hidden)]
+pub mod test_fixtures {
+    use super::*;
+    use hyprstream_crypto::pq::ml_dsa_sk_to_vk_bytes;
+    use hyprstream_pds::at9p::{
+        CapsuleBody, HybridKeyPair, ServiceEndpoint, ServiceEntry, ServiceType,
+        Transport as At9pTransport,
+    };
+    use hyprstream_pds::at9p_duplicity::AcceptedAt9pState;
+    use hyprstream_pds::at9p_sign::{sign_capsule, sign_update_record};
+
+    type DialOverride = dyn Fn(&TransportConfig) -> Result<Arc<dyn RpcClient>> + Send + Sync;
+
+    static DIAL_OVERRIDE: std::sync::OnceLock<Arc<DialOverride>> = std::sync::OnceLock::new();
+
+    struct FixtureAcceptedStates(parking_lot::Mutex<HashMap<String, AcceptedAt9pState>>);
+
+    impl AcceptedStateSource for FixtureAcceptedStates {
+        fn accepted_state(&self, did: &str) -> Result<Option<AcceptedAt9pState>> {
+            Ok(self.0.lock().get(did).cloned())
+        }
+    }
+
+    #[derive(Clone)]
+    struct FixtureAuthority {
+        state: AcceptedAt9pState,
+        signing: SigningKey,
+        request_kem_recipient: hyprstream_rpc::crypto::hybrid_kem::RecipientPublic,
+    }
+
+    /// Mutable handle for one process-global, model-free production resolver
+    /// fixture. The resolver and dial hook are installed once; individual tests
+    /// reset only the accepted-state and announcement data behind that fixed
+    /// authority boundary.
+    #[derive(Clone)]
+    pub struct ProductionInferenceFixture {
+        service_name: String,
+        announced: Arc<RwLock<HashMap<String, Vec<AnnouncedEndpoint>>>>,
+        states: Arc<FixtureAcceptedStates>,
+        primary: FixtureAuthority,
+        foreign: FixtureAuthority,
+    }
+
+    fn authority(service_name: &str, tag: u8) -> Result<FixtureAuthority> {
+        let signing = SigningKey::from_bytes(&[tag; 32]);
+        let pq_signing = hyprstream_rpc::node_identity::derive_mesh_mldsa_key(&signing);
+        let keys = HybridKeyPair::new(
+            signing.verifying_key().to_bytes().to_vec(),
+            ml_dsa_sk_to_vk_bytes(&pq_signing),
+        )?;
+        let endpoint = ServiceEndpoint::new(At9pTransport::Iroh, "iroh://fixture")?;
+        let service = ServiceEntry::new(
+            format!("#{service_name}"),
+            ServiceType::NinePExport,
+            endpoint,
+        )?;
+        let body = CapsuleBody::new(vec![keys], vec![service])?;
+        let genesis = sign_capsule(body.clone(), &signing, &pq_signing)?;
+        let subject = genesis.cid512()?;
+        let update = sign_update_record(
+            subject,
+            1,
+            [1; 64],
+            body,
+            "2099-01-01T00:00:00Z".to_owned(),
+            &signing,
+            &pq_signing,
+        )?;
+        let state = AcceptedAt9pState::from_persisted_update(&update.to_dag_cbor()?)?;
+        let request_kem_recipient = hyprstream_rpc::crypto::hybrid_kem::generate_recipient(
+            hyprstream_rpc::crypto::hybrid_kem::SuiteId::HyKemX25519MlKem768,
+        )?
+        .public()
+        .clone();
+        Ok(FixtureAuthority {
+            state,
+            signing,
+            request_kem_recipient,
+        })
+    }
+
+    fn announcement(
+        authority: &FixtureAuthority,
+        transport: &TransportConfig,
+        last_heartbeat: Instant,
+    ) -> Result<AnnouncedEndpoint> {
+        anyhow::ensure!(
+            matches!(&transport.endpoint, EndpointType::Quic { .. }),
+            "production inference fixture advertises only QUIC candidates"
+        );
+        Ok(AnnouncedEndpoint {
+            socket_kind: "quic".to_owned(),
+            endpoint: transport.endpoint_string(),
+            service_jwt: "fixture-verified".to_owned(),
+            service_did: Did::from(authority.state.did.clone()),
+            capabilities: ["hyprstream-rpc/1".to_owned(), "hyprstream-moq/1".to_owned()]
+                .into_iter()
+                .collect(),
+            accepted_state_digest: authority.state.head_digest.to_vec(),
+            accepted_state_epoch: authority.state.epoch,
+            response_key_id: format!("{}#response-current", authority.state.did),
+            request_kem_key_id: format!("{}#kem-current", authority.state.did),
+            request_kem_recipient: authority.request_kem_recipient.encode(),
+            expires_at_unix_ms: 4_070_908_800_000,
+            source_signer: authority.signing.verifying_key().to_bytes(),
+            last_heartbeat,
+        })
+    }
+
+    impl ProductionInferenceFixture {
+        /// Restore one same-authority set of fresh, checkpoint-current reaches.
+        pub fn reset(&self, transports: &[TransportConfig]) -> Result<()> {
+            {
+                let mut states = self.states.0.lock();
+                states.clear();
+                states.insert(self.primary.state.did.clone(), self.primary.state.clone());
+            }
+            let endpoints = transports
+                .iter()
+                .map(|transport| announcement(&self.primary, transport, Instant::now()))
+                .collect::<Result<Vec<_>>>()?;
+            self.announced
+                .write()
+                .insert(self.service_name.clone(), endpoints);
+            Ok(())
+        }
+
+        /// Age every announcement beyond the production freshness bound.
+        pub fn mark_stale(&self) {
+            if let Some(endpoints) = self.announced.write().get_mut(&self.service_name) {
+                for endpoint in endpoints {
+                    endpoint.last_heartbeat =
+                        Instant::now() - ANNOUNCED_ENDPOINT_TTL - Duration::from_secs(1);
+                }
+            }
+        }
+
+        /// Add a fresh candidate backed by a different accepted DID authority.
+        pub fn add_foreign_authority(&self, transport: &TransportConfig) -> Result<()> {
+            self.states
+                .0
+                .lock()
+                .insert(self.foreign.state.did.clone(), self.foreign.state.clone());
+            self.announced
+                .write()
+                .entry(self.service_name.clone())
+                .or_default()
+                .push(announcement(&self.foreign, transport, Instant::now())?);
+            Ok(())
+        }
+    }
+
+    /// Install the sole process-global resolver fixture used by downstream
+    /// model-selector unit tests. This API exists only under `test-fixtures`.
+    pub fn install_production_inference_fixture(
+        service_name: &str,
+        transports: &[TransportConfig],
+        dial_override: Arc<dyn Fn(&TransportConfig) -> Result<Arc<dyn RpcClient>> + Send + Sync>,
+    ) -> Result<ProductionInferenceFixture> {
+        anyhow::ensure!(
+            PRODUCTION_RESOLVER.get().is_none() && DIAL_OVERRIDE.get().is_none(),
+            "production inference fixture is already installed"
+        );
+        let primary = authority(service_name, 0x61)?;
+        let foreign = authority(service_name, 0x62)?;
+        let states = Arc::new(FixtureAcceptedStates(parking_lot::Mutex::new(
+            HashMap::new(),
+        )));
+        let announced = Arc::new(RwLock::new(HashMap::new()));
+        let fixture = ProductionInferenceFixture {
+            service_name: service_name.to_owned(),
+            announced: Arc::clone(&announced),
+            states: Arc::clone(&states),
+            primary,
+            foreign,
+        };
+        fixture.reset(transports)?;
+        DIAL_OVERRIDE.set(dial_override).map_err(|_| {
+            anyhow::anyhow!("production inference fixture dial is already installed")
+        })?;
+        PRODUCTION_RESOLVER
+            .set(Arc::new(DiscoveryServiceResolver {
+                announced_endpoints: announced,
+                accepted_state_source: states,
+                discovery_client: None,
+            }))
+            .map_err(|_| {
+                anyhow::anyhow!("production inference fixture resolver is already installed")
+            })?;
+        Ok(fixture)
+    }
+
+    pub(super) fn dial_override(transport: &TransportConfig) -> Result<Option<Arc<dyn RpcClient>>> {
+        DIAL_OVERRIDE.get().map(|dial| dial(transport)).transpose()
     }
 }
 
