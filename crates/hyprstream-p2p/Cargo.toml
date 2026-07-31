@@ -74,9 +74,9 @@ blake3 = { workspace = true }
 
 # iroh-blobs content-addressed byte transport (F1, #899). This is now the
 # sole object plane behind `put_object`/`get_object` (F3 retired libp2p).
-# 0.101.0 pins iroh =1.0.0-rc.0 - the exact version the workspace pins via
-# web-transport-iroh 0.5.x; co-bump all three together (see workspace Cargo.toml).
-iroh-blobs = { version = "=0.101.0", default-features = false, features = ["fs-store"] }
+# 0.103.0 is the first release to take iroh ^1.0.0 (0.101.0/0.102.0 pinned the
+# rc's exactly); co-bump all three together (see workspace Cargo.toml).
+iroh-blobs = { version = "=0.103.0", default-features = false, features = ["fs-store"] }
 multihash = "0.19"
 sha2 = "0.10"
 
