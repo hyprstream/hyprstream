@@ -162,26 +162,21 @@ pub struct MoeRouting {
 /// stability does not depend on the `tch` version, and so the module stays
 /// `tch`-free. Unrecognized dtypes fall through to [`KvDtype::Other`], keyed by
 /// a canonicalized name.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub enum KvDtype {
     Float64,
     Float32,
     Float16,
+    #[default]
     BFloat16,
     /// Any other dtype, identified by its canonicalized (trimmed, lowercased) name.
     Other(String),
 }
 
-impl Default for KvDtype {
-    fn default() -> Self {
-        KvDtype::BFloat16
-    }
-}
-
 impl KvDtype {
     /// Parse a dtype from a HuggingFace `dtype`/`torch_dtype` string, case- and
     /// alias-insensitive.
-    pub fn from_str(s: &str) -> Self {
+    pub fn from_name(s: &str) -> Self {
         let n = s.trim().to_ascii_lowercase();
         match n.as_str() {
             "float64" | "double" | "f64" => KvDtype::Float64,
@@ -216,9 +211,10 @@ impl std::fmt::Display for KvDtype {
 /// Mirrors the Cap'n Proto `KVQuantType` (`none`/`int8`/`nf4`/`fp4`) but is
 /// owned here so the fingerprint is independent of schema codegen. Convert at
 /// the engine boundary with a `match`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum KvQuantMode {
     /// Full precision (FP16/BF16).
+    #[default]
     None,
     /// 8-bit integer quantization.
     Int8,
@@ -226,12 +222,6 @@ pub enum KvQuantMode {
     Nf4,
     /// 4-bit FloatingPoint.
     Fp4,
-}
-
-impl Default for KvQuantMode {
-    fn default() -> Self {
-        KvQuantMode::None
-    }
 }
 
 impl KvQuantMode {
@@ -1274,8 +1264,8 @@ mod tests {
         KvCompatDescriptor {
             format_version: KV_COMPAT_FORMAT_VERSION,
             weights: WeightIdentity::base_only("sha256:my-model-weights"),
-            model_name: "my-model".to_string(),
-            architecture: "llama".to_string(),
+            model_name: "my-model".to_owned(),
+            architecture: "llama".to_owned(),
             model_version: 1,
             num_hidden_layers: 32,
             num_attention_heads: 32,
@@ -1309,7 +1299,7 @@ mod tests {
             block_size: KV_BLOCK_SIZE_DEFAULT,
             max_context: 4096,
             vocab_size: 32_000,
-            tokenizer_hash: Some("deadbeef".to_string()),
+            tokenizer_hash: Some("deadbeef".to_owned()),
         }
     }
 
@@ -1450,9 +1440,9 @@ mod tests {
         );
         assert_field_diverges(
             "layer_types",
-            |d| d.layer_types = vec!["global".to_string(), "local".to_string()],
+            |d| d.layer_types = vec!["global".to_owned(), "local".to_owned()],
             Some(KvCompatMismatch::LayerTypes {
-                expected: vec!["global".to_string(), "local".to_string()],
+                expected: vec!["global".to_owned(), "local".to_owned()],
                 observed: Vec::new(),
             }),
         );
@@ -1461,9 +1451,9 @@ mod tests {
         {
             let mut d = baseline();
             let fp0 = d.fingerprint();
-            d.layer_types = vec!["GLOBAL".to_string(), "Local".to_string()];
+            d.layer_types = vec!["GLOBAL".to_owned(), "Local".to_owned()];
             let mut d2 = baseline();
-            d2.layer_types = vec!["global".to_string(), "local".to_string()];
+            d2.layer_types = vec!["global".to_owned(), "local".to_owned()];
             assert_eq!(
                 d.fingerprint(),
                 d2.fingerprint(),
@@ -1732,16 +1722,16 @@ mod tests {
 
     #[test]
     fn kvdtype_is_case_and_alias_insensitive() {
-        assert_eq!(KvDtype::from_str("BFLOAT16"), KvDtype::BFloat16);
-        assert_eq!(KvDtype::from_str("  bf16 "), KvDtype::BFloat16);
-        assert_eq!(KvDtype::from_str("float16"), KvDtype::Float16);
-        assert_eq!(KvDtype::from_str("FP16"), KvDtype::Float16);
-        assert_eq!(KvDtype::from_str("float32"), KvDtype::Float32);
+        assert_eq!(KvDtype::from_name("BFLOAT16"), KvDtype::BFloat16);
+        assert_eq!(KvDtype::from_name("  bf16 "), KvDtype::BFloat16);
+        assert_eq!(KvDtype::from_name("float16"), KvDtype::Float16);
+        assert_eq!(KvDtype::from_name("FP16"), KvDtype::Float16);
+        assert_eq!(KvDtype::from_name("float32"), KvDtype::Float32);
         // Two descriptors differing only by dtype *spelling* must hash equally.
         let mut d1 = baseline();
         let mut d2 = baseline();
-        d1.dtype = KvDtype::from_str("BFLOAT16");
-        d2.dtype = KvDtype::from_str("bfloat16");
+        d1.dtype = KvDtype::from_name("BFLOAT16");
+        d2.dtype = KvDtype::from_name("bfloat16");
         assert_eq!(d1.fingerprint(), d2.fingerprint());
     }
 
@@ -1766,7 +1756,7 @@ mod tests {
             KvQuantMode::Nf4,
             KvQuantMode::Fp4,
         ];
-        let strs: Vec<&str> = modes.iter().map(|m| m.as_canonical_str()).collect();
+        let strs: Vec<&str> = modes.iter().map(KvQuantMode::as_canonical_str).collect();
         let unique: std::collections::HashSet<&str> = strs.iter().copied().collect();
         assert_eq!(unique.len(), modes.len(), "quant mode names must be unique");
     }
