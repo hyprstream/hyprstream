@@ -75,3 +75,14 @@ cargo test --locked \
   --manifest-path "$CRATE_MANIFEST" \
   --target wasm32-unknown-unknown \
   --test "$TEST_NAME"
+
+# Runtime execution receipt. When the caller supplies BROWSER_ATTEST_NONCE,
+# echo it into a receipt file — reached only after the browser run above
+# succeeded (set -e). The caller asserts the receipt out-of-band, so a change
+# anywhere in the invocation chain that stops this script from running (or
+# from reaching this point) is detected by the receipt being absent or stale,
+# with no static analysis of the chain required. Local runs without the nonce
+# write nothing.
+if [[ -n "${BROWSER_ATTEST_NONCE:-}" ]]; then
+  printf '%s\n' "$BROWSER_ATTEST_NONCE" > "$REPO_ROOT/browser-wasm-receipt.txt"
+fi
