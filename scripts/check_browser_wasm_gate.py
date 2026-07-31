@@ -8,51 +8,51 @@ regressions could pass both PR checks and the required merge-group job.
 This zero-build check locks one shared script into both CI paths and proves that
 the script retains the complete package set, target, and browser-only cfgs.
 
-#1425 r4/r5: a `cargo check` compile pass cannot catch a regression in the
-actual browser-fetch runtime behavior (JS callback, Request/Response, nonce
-retry, response rejection) — only real execution can. The fast PR `WASM
-(browser client)` job runs that real execution, but it is explicitly skipped
-on `merge_group` (rust.yml `wasm` job `if:`), so a required merge-group
-`build` could go green without ever launching a browser.
+A `cargo check` compile pass cannot catch a regression in the actual
+browser-fetch runtime behavior (JS callback, Request/Response, nonce retry,
+response rejection) — only real execution can. The fast PR `WASM (browser
+client)` job runs that real execution, but it is explicitly skipped on
+`merge_group` (rust.yml `wasm` job `if:`), so a required merge-group `build`
+could go green without ever launching a browser.
 
-r4 added raw-substring assertions locking the required merge driver
+An earlier revision of this gate locked the required merge driver
 (graviton-build-test.sh) to invoking the real browser-execution script, and
 the workflow to installing the browser as root before dropping to the
-non-root `ci` user. An independent r5 review demonstrated seven adversarial
-mutations that satisfied every r4 assertion while removing the actual
-security-critical execution:
+non-root `ci` user, using raw-substring assertions plus a *reachable-until-
+proven-dead* control-flow model: a line counted unless the model could prove
+the enclosing branch always-false. Independent review broke that model the
+same way every round — anything the model could not parse (an unrecognized
+construct, a non-literal condition it gave up on) defaulted to *reachable*,
+so an escape only had to reach outside the model's small recognized
+vocabulary, not defeat it.
 
-  1. commenting out the root install invocation in rust.yml
-  2. commenting out the non-root `runuser` invocation in rust.yml
-  3. commenting out the real-execution phase in graviton-build-test.sh
-  4. hiding the root install behind an `if false; then ... fi` branch
-  5. replacing install-chromium.sh's body with a bare `exit 0`
-  6. replacing browser-wasm-test-ci.sh's body with a bare `exit 0`
-  7. replacing browser-wasm-test.sh's real `cargo test` runner with a
-     compile-only `cargo check`
+This revision inverts the default: a critical invocation now counts as
+executed only when every enclosing construct is one this model recognizes
+AND proves reachable. Anything unrecognized — an unmodeled construct (`case`,
+a `&&`/`||` guard on the invocation line itself), a condition shape the
+evaluator cannot decide from a bare command name, a preceding unconditional
+`exit` in the same linear scope, or a shell function shadowing the invoked
+command — makes the gate fail closed. The model does not attempt to be a
+general shell interpreter; it only has to be complete over the constructs the
+six real hop files actually use for their own conditional logic
+(`command -v foo`-style existence checks, `[[ -z "$VAR" ]]`-style dynamic
+string tests), which continue to evaluate as legitimately reachable.
 
-Root causes: (a) raw substring counting cannot distinguish an executable
-command from a comment or from code inside an always-false branch, and
-(b) the gate never read install-chromium.sh, browser-wasm-test-ci.sh, or
-browser-wasm-test.sh at all, so replacing any of their bodies with a no-op
-was invisible to it.
-
-r5 fixes both: every critical invocation is now checked for (i) appearing as
-a literal, non-comment line and (ii) being *reachable* under a narrow
-if/then/elif/else/fi model that recognizes a closed set of always-false
-shell conditions (`false`, `[ 0 = 1 ]`, etc.) — deliberately not a general
-shell interpreter, just enough to defeat the exact hiding pattern demonstrated
-above. All three previously-uninspected scripts are now read and asserted to
-contain their real command bodies, and the full six-hop chain is checked file
-by file: rust.yml -> install-chromium.sh (root) -> `runuser -u ci` ->
-graviton-build-test.sh -> browser-wasm-test-ci.sh -> browser-wasm-test.sh ->
-named `wasm_browser_fetch` executed via `cargo test` (never `cargo check`).
+Every critical invocation is checked for (i) appearing as a literal,
+non-comment line, (ii) being reachable under the fail-closed model above,
+(iii) not sharing its line with an unevaluated `&&`/`||` guard, and (iv) not
+naming a command that is shadowed by an earlier function definition in the
+same script. The full six-hop chain is checked file by file: rust.yml ->
+install-chromium.sh (root) -> `runuser -u ci` -> graviton-build-test.sh ->
+browser-wasm-test-ci.sh -> browser-wasm-test.sh -> named `wasm_browser_fetch`
+executed via `cargo test` (never `cargo check`).
 """
 
 from __future__ import annotations
 
 import pathlib
 import re
+import shlex
 import sys
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -147,31 +147,18 @@ def _cfg_set(script: str) -> set[str]:
 
 
 # ---------------------------------------------------------------------------
-# Executable-command reachability: a narrow, auditable model that answers
-# "is this line a real, non-comment command that is not sealed inside an
-# always-false branch?" It is NOT a general shell interpreter — it recognizes
-# exactly the always-false condition spellings a mutation would plausibly use
-# to hide a command while keeping the surrounding script syntactically valid,
-# and treats every other condition (including all real runtime checks this
-# repository's scripts actually use, e.g. `command -v apt-get`, `[[ -z "$X" ]]`)
-# as reachable. That asymmetry is deliberate: the goal is to reject the
-# specific `if false; then ...; fi` hiding pattern demonstrated by the r5
-# review, not to prove general shell reachability.
+# Executable-command reachability: a conservative, fail-closed model that
+# answers "is this line proven, by a construct this model recognizes, to be a
+# real command that runs?" It is NOT a general shell interpreter. It is
+# complete over exactly the constructs the six hop files legitimately use
+# (if/elif/else/fi and while/until/do/done with either a literal or a
+# dynamic-but-auditable condition, e.g. `command -v apt-get` or
+# `[[ -z "$VAR" ]]`) and treats everything else — `case`, a `&&`/`||` guard
+# on the invocation line, a bare variable used as the condition's command, an
+# unparsable condition, a preceding unconditional `exit` in the same linear
+# scope, or a shell function shadowing the invoked command — as NOT proven
+# reachable. Default-reachable was the bug; default-unreachable is the fix.
 # ---------------------------------------------------------------------------
-
-_ALWAYS_FALSE_CONDITIONS = {
-    "false",
-    "[ 0 = 1 ]",
-    "[ 1 = 0 ]",
-    "[ 0 -eq 1 ]",
-    "[ 1 -eq 0 ]",
-    "[[ 0 = 1 ]]",
-    "[[ 1 = 0 ]]",
-    "[[ 0 == 1 ]]",
-    "[[ 1 == 0 ]]",
-    "test 0 = 1",
-    "test 1 = 0",
-}
 
 _IF_THEN_RE = re.compile(r"^if\s+(?P<cond>.+?)\s*;\s*then\s*$")
 _IF_ONLY_RE = re.compile(r"^if\s+(?P<cond>.+)$")
@@ -179,73 +166,289 @@ _THEN_ONLY_RE = re.compile(r"^then\s*$")
 _ELIF_THEN_RE = re.compile(r"^elif\s+(?P<cond>.+?)\s*;\s*then\s*$")
 _ELSE_RE = re.compile(r"^else\s*$")
 _FI_RE = re.compile(r"^fi\s*$")
+_WHILE_DO_RE = re.compile(r"^while\s+(?P<cond>.+?)\s*;\s*do\s*$")
+_UNTIL_DO_RE = re.compile(r"^until\s+(?P<cond>.+?)\s*;\s*do\s*$")
+_DONE_RE = re.compile(r"^done\s*$")
+# `for`/`select` are loop headers this model does not evaluate at all (unlike
+# `while`/`until`, which have a literal-decidable condition slot) — treated
+# the same way as `case`: always unreachable, since none of the six hop
+# files legitimately wrap a critical invocation in either.
+_FOR_DO_RE = re.compile(r"^for\s+.+?\s*;\s*do\s*$")
+_SELECT_DO_RE = re.compile(r"^select\s+.+?\s*;\s*do\s*$")
+_CASE_IN_RE = re.compile(r"^case\s+.+\s+in\s*$")
+_ESAC_RE = re.compile(r"^esac\s*$")
+_EXIT_RE = re.compile(r"^exit(\s+[0-9]+)?\s*$")
+_FUNC_DEF_RE = re.compile(
+    r"^(?:function\s+)?(?P<name1>[A-Za-z_][A-Za-z0-9_-]*)\s*\(\)\s*\{?\s*$"
+    r"|^function\s+(?P<name2>[A-Za-z_][A-Za-z0-9_-]*)\s*\{?\s*$"
+)
 
 
 def _norm_cond(cond: str) -> str:
     return " ".join(cond.split())
 
 
-def _is_always_false(cond: str) -> bool:
-    return _norm_cond(cond) in _ALWAYS_FALSE_CONDITIONS
+def _evaluate_test_body(tokens: list[str]) -> bool | None:
+    """Literally evaluate a bracket/`test` body's token list, or ``None`` if
+    this model cannot decide it (a dynamic operand, or an operator/arity this
+    narrow evaluator does not cover) — ``None`` here still means "recognized
+    bracket-test shape, undecidable value", never "unrecognized construct"."""
+    if len(tokens) == 2 and tokens[0] in {"-n", "-z"} and "$" not in tokens[1]:
+        truthy = bool(tokens[1])
+        return truthy if tokens[0] == "-n" else not truthy
+    if (
+        len(tokens) == 3
+        and tokens[0] == "!"
+        and tokens[1] in {"-n", "-z"}
+        and "$" not in tokens[2]
+    ):
+        truthy = bool(tokens[2])
+        inner = truthy if tokens[1] == "-n" else not truthy
+        return not inner
+    if len(tokens) != 3 or any("$" in token for token in tokens):
+        return None
+    left, operator, right = tokens
+    if operator in {"=", "==", "!="}:
+        equal = left == right
+        return equal if operator != "!=" else not equal
+    if operator in {"-eq", "-ne", "-gt", "-lt", "-ge", "-le"}:
+        try:
+            left_i, right_i = int(left, 10), int(right, 10)
+        except ValueError:
+            return None
+        if operator == "-eq":
+            return left_i == right_i
+        if operator == "-ne":
+            return left_i != right_i
+        if operator == "-gt":
+            return left_i > right_i
+        if operator == "-lt":
+            return left_i < right_i
+        if operator == "-ge":
+            return left_i >= right_i
+        return left_i <= right_i
+    return None
+
+
+def _condition_shape(cond: str) -> str:
+    """Classify an `if`/`elif`/`while`/`until` condition string as one of:
+
+    - ``"true"`` / ``"false"``: literally decidable from the text alone.
+    - ``"dynamic"``: a recognized construct (bracket/`test` form, or a bare
+      command invocation) whose truth this model cannot decide — a real
+      runtime check like `command -v apt-get` or `[[ -z "$VAR" ]]`. Treated
+      as reachable: these are exactly the legitimate conditionals the hop
+      scripts use, and rejecting them would break the real, correct gate.
+    - ``"unrecognized"``: a shape this model does not audit at all — a bare
+      variable used as the condition's command (`if $F; then`), or text that
+      does not even shell-tokenize. Treated as NOT reachable (fail-closed):
+      the whole point of inverting this model is that an unauditable
+      condition must not silently pass as proof of reachability.
+    """
+    normalized = _norm_cond(cond)
+    if normalized.startswith("! "):
+        inner = _condition_shape(normalized[2:])
+        return {"true": "false", "false": "true"}.get(inner, inner)
+    if normalized in {"true", "/bin/true", ":"}:
+        return "true"
+    if normalized in {"false", "/bin/false"}:
+        return "false"
+
+    try:
+        tokens = shlex.split(normalized)
+    except ValueError:
+        return "unrecognized"
+    if not tokens:
+        return "unrecognized"
+
+    if tokens[:1] == ["test"]:
+        body = tokens[1:]
+    elif tokens[0] in {"[", "[["}:
+        closing = "]" if tokens[0] == "[" else "]]"
+        if tokens[-1:] != [closing]:
+            return "unrecognized"
+        body = tokens[1:-1]
+    else:
+        # A bare-command condition: a legitimate, auditable runtime check
+        # (`command -v apt-get`) UNLESS the command itself is indirected
+        # through a variable, which this model cannot audit at all.
+        if tokens[0].startswith("$"):
+            return "unrecognized"
+        return "dynamic"
+
+    literal = _evaluate_test_body(body)
+    if literal is True:
+        return "true"
+    if literal is False:
+        return "false"
+    return "dynamic"
 
 
 def _is_comment(line: str) -> bool:
     return line.strip().startswith("#")
 
 
-def _reachability(lines: list[str]) -> list[bool]:
-    """Return, per line index, whether that line is reachable.
+def _shadowed_commands(script: str) -> set[str]:
+    """Names of shell functions defined anywhere in `script` — a function
+    redefining one of the commands a critical invocation names (`bash`,
+    `cargo`, `apt-get`, `dnf`, ...) would shadow the real command."""
+    names: set[str] = set()
+    for raw in script.splitlines():
+        stripped = raw.strip()
+        if _is_comment(stripped):
+            continue
+        match = _FUNC_DEF_RE.match(stripped)
+        if match:
+            name = match.group("name1") or match.group("name2")
+            if name:
+                names.add(name)
+    return names
 
-    `stack[i]` is True while inside a branch known to be unreachable (an
-    always-false `if`/`elif` arm that has not yet hit its `else`).
+
+def _needle_tokens(needle: str) -> list[str]:
+    try:
+        return shlex.split(needle)
+    except ValueError:
+        return needle.split()
+
+
+def _reachability(lines: list[str]) -> list[bool]:
+    """Return, per line index, whether that line is proven reachable.
+
+    A line is reachable only when (a) no enclosing `if`/`elif`/`while`/
+    `until` frame is proven dead or unrecognized, (b) it is not inside a
+    `case`/`esac` block (not modeled — always treated as unreachable), and
+    (c) no unconditional `exit` earlier in the same linear scope precedes it.
+    Each nested scope tracks its own linear-exit state independently: an
+    `exit` inside an `if` body does not kill lines after that `if` closes.
     """
-    stack: list[bool] = []
+    stack: list[tuple[str, bool]] = []
+    exit_dead_stack: list[bool] = []
+    top_level_exit_dead = False
     pending_cond: str | None = None
     reachable: list[bool] = []
 
-    for raw in lines:
+    # Prefix paren depth per line, so a bare `exit` embedded in a nested
+    # command substitution or subshell (e.g. an awk script's own `exit`
+    # statement inside `$(...)`) is never mistaken for a bash-level
+    # unconditional exit in the enclosing script's linear flow. Net-counting
+    # literal `(`/`)` characters is an approximation, not a shell parser —
+    # sufficient here because the hop files only nest parens via command
+    # substitution and array-literal syntax, both of which balance.
+    paren_depth_at: list[int] = []
+    _running_depth = 0
+    for _raw in lines:
+        paren_depth_at.append(_running_depth)
+        _running_depth += _raw.count("(") - _raw.count(")")
+        if _running_depth < 0:
+            _running_depth = 0
+
+    def _current_exit_dead() -> bool:
+        return exit_dead_stack[-1] if exit_dead_stack else top_level_exit_dead
+
+    def _mark_exit_dead() -> None:
+        nonlocal top_level_exit_dead
+        if exit_dead_stack:
+            exit_dead_stack[-1] = True
+        else:
+            top_level_exit_dead = True
+
+    def _line_reachable() -> bool:
+        return not any(dead for _, dead in stack) and not _current_exit_dead()
+
+    def _push(kind: str, dead: bool) -> None:
+        stack.append((kind, dead))
+        exit_dead_stack.append(False)
+
+    def _pop() -> None:
+        stack.pop()
+        exit_dead_stack.pop()
+
+    for _idx, raw in enumerate(lines):
         stripped = raw.strip()
 
         if pending_cond is not None:
             if _THEN_ONLY_RE.match(stripped):
-                stack.append(_is_always_false(pending_cond))
+                shape = _condition_shape(pending_cond)
+                _push("if", shape in {"false", "unrecognized"})
                 pending_cond = None
-                reachable.append(not any(stack))
+                reachable.append(_line_reachable())
                 continue
-            # A bare `if <cond>` not immediately followed by `then` on its own
-            # line: drop the pending condition (conservatively reachable) and
-            # fall through to process this line normally below.
+            # A bare `if <cond>` not immediately followed by `then` on its
+            # own line does not match this model's recognized shape at all.
             pending_cond = None
 
         match = _IF_THEN_RE.match(stripped)
         if match:
-            stack.append(_is_always_false(match.group("cond")))
-            reachable.append(not any(stack))
+            shape = _condition_shape(match.group("cond"))
+            _push("if", shape in {"false", "unrecognized"})
+            reachable.append(_line_reachable())
             continue
 
         match = _ELIF_THEN_RE.match(stripped)
-        if match and stack:
-            stack[-1] = _is_always_false(match.group("cond"))
-            reachable.append(not any(stack))
+        if match and stack and stack[-1][0] == "if":
+            shape = _condition_shape(match.group("cond"))
+            stack[-1] = ("if", shape in {"false", "unrecognized"})
+            reachable.append(_line_reachable())
             continue
 
-        if _ELSE_RE.match(stripped) and stack:
-            stack[-1] = not stack[-1]
-            reachable.append(not any(stack))
+        if _ELSE_RE.match(stripped) and stack and stack[-1][0] == "if":
+            stack[-1] = ("if", not stack[-1][1])
+            reachable.append(_line_reachable())
             continue
 
-        if _FI_RE.match(stripped) and stack:
-            stack.pop()
-            reachable.append(not any(stack))
+        if _FI_RE.match(stripped) and stack and stack[-1][0] == "if":
+            _pop()
+            reachable.append(_line_reachable())
             continue
 
         match = _IF_ONLY_RE.match(stripped)
         if match and stripped.startswith("if "):
             pending_cond = match.group("cond")
-            reachable.append(not any(stack))
+            reachable.append(_line_reachable())
             continue
 
-        reachable.append(not any(stack))
+        match = _WHILE_DO_RE.match(stripped)
+        if match:
+            shape = _condition_shape(match.group("cond"))
+            _push("loop", shape in {"false", "unrecognized"})
+            reachable.append(_line_reachable())
+            continue
+
+        match = _UNTIL_DO_RE.match(stripped)
+        if match:
+            shape = _condition_shape(match.group("cond"))
+            _push("loop", shape in {"true", "unrecognized"})
+            reachable.append(_line_reachable())
+            continue
+
+        if _FOR_DO_RE.match(stripped) or _SELECT_DO_RE.match(stripped):
+            _push("loop", True)
+            reachable.append(_line_reachable())
+            continue
+
+        if _DONE_RE.match(stripped) and stack and stack[-1][0] == "loop":
+            _pop()
+            reachable.append(_line_reachable())
+            continue
+
+        if _CASE_IN_RE.match(stripped):
+            # `case`/`esac` pattern matching is not modeled at all: nothing
+            # inside can be proven reachable, regardless of which arm a
+            # critical invocation sits in.
+            _push("case", True)
+            reachable.append(_line_reachable())
+            continue
+
+        if _ESAC_RE.match(stripped) and stack and stack[-1][0] == "case":
+            _pop()
+            reachable.append(_line_reachable())
+            continue
+
+        line_reachable = _line_reachable()
+        reachable.append(line_reachable)
+        if line_reachable and paren_depth_at[_idx] == 0 and _EXIT_RE.match(stripped):
+            _mark_exit_dead()
 
     return reachable
 
@@ -254,9 +457,9 @@ def _assert_executable_once(
     label: str, script_name: str, script: str, needle: str
 ) -> None:
     """Assert `needle` appears exactly once in `script`, as a real
-    (non-comment), reachable command line — not merely present as text
-    anywhere (a comment, or inside an always-false branch, both count as
-    absent for this purpose)."""
+    (non-comment), reachable command line, not sharing its line with an
+    unevaluated `&&`/`||` guard, and not naming a command shadowed by an
+    earlier function definition — anything else counts as absent."""
     lines = script.splitlines()
     matches = [i for i, line in enumerate(lines) if needle in line]
     _assert(
@@ -271,8 +474,21 @@ def _assert_executable_once(
     reach = _reachability(lines)
     _assert(
         reach[idx],
-        f"{script_name}'s {label} line must be reachable, not sealed inside an "
-        "always-false branch",
+        f"{script_name}'s {label} line ({idx + 1}) is not proven reachable — an "
+        "enclosing construct is dead, unrecognized (case/&&/||/exit/unaudited "
+        "condition), or shadowed; extend the model deliberately if this is a "
+        "legitimate new construct",
+    )
+    _assert(
+        "&&" not in lines[idx] and "||" not in lines[idx],
+        f"{script_name}'s {label} line ({idx + 1}) uses a compound && / || guard, "
+        "which this model does not evaluate — express the guard as if/then/fi",
+    )
+    shadowed = _shadowed_commands(script) & set(_needle_tokens(needle))
+    _assert(
+        not shadowed,
+        f"{script_name}'s {label} invokes {sorted(shadowed)}, which is redefined "
+        "as a shell function in this script — the real command would never run",
     )
 
 
@@ -398,19 +614,91 @@ def mutations(
         raise AssertionError(f"mutation setup: {needle!r} not found to comment out")
 
     def _wrap_if_false(script: str, needle: str) -> str:
+        return _wrap_if(script, needle, "false")
+
+    def _wrap_if(script: str, needle: str, condition: str) -> str:
         lines = script.splitlines(keepends=True)
         for i, line in enumerate(lines):
             if needle in line and not _is_comment(line):
                 indent = line[: len(line) - len(line.lstrip())]
                 newline = "\n" if line.endswith("\n") else ""
                 wrapped = (
-                    f"{indent}if false; then\n"
+                    f"{indent}if {condition}; then\n"
                     f"{line.rstrip(chr(10))}\n"
                     f"{indent}fi{newline}"
                 )
                 lines[i] = wrapped
                 return "".join(lines)
         raise AssertionError(f"mutation setup: {needle!r} not found to wrap")
+
+    def _wrap_while(script: str, needle: str, condition: str) -> str:
+        lines = script.splitlines(keepends=True)
+        for i, line in enumerate(lines):
+            if needle in line and not _is_comment(line):
+                indent = line[: len(line) - len(line.lstrip())]
+                newline = "\n" if line.endswith("\n") else ""
+                lines[i] = (
+                    f"{indent}while {condition}; do\n"
+                    f"{line.rstrip(chr(10))}\n"
+                    f"{indent}done{newline}"
+                )
+                return "".join(lines)
+        raise AssertionError(f"mutation setup: {needle!r} not found to wrap")
+
+    def _prepend_line(script: str, needle: str, new_line: str) -> str:
+        lines = script.splitlines(keepends=True)
+        for i, line in enumerate(lines):
+            if needle in line and not _is_comment(line):
+                indent = line[: len(line) - len(line.lstrip())]
+                lines.insert(i, f"{indent}{new_line}\n")
+                return "".join(lines)
+        raise AssertionError(f"mutation setup: {needle!r} not found to prepend before")
+
+    def _wrap_case(script: str, needle: str) -> str:
+        lines = script.splitlines(keepends=True)
+        for i, line in enumerate(lines):
+            if needle in line and not _is_comment(line):
+                indent = line[: len(line) - len(line.lstrip())]
+                newline = "\n" if line.endswith("\n") else ""
+                wrapped = (
+                    f'{indent}case "$RUNNER_OS" in\n'
+                    f"{indent}  *)\n"
+                    f"{line.rstrip(chr(10))}\n"
+                    f"{indent}    ;;\n"
+                    f"{indent}esac{newline}"
+                )
+                lines[i] = wrapped
+                return "".join(lines)
+        raise AssertionError(f"mutation setup: {needle!r} not found to wrap in case")
+
+    def _wrap_for(script: str, needle: str) -> str:
+        lines = script.splitlines(keepends=True)
+        for i, line in enumerate(lines):
+            if needle in line and not _is_comment(line):
+                indent = line[: len(line) - len(line.lstrip())]
+                newline = "\n" if line.endswith("\n") else ""
+                wrapped = (
+                    f"{indent}for _unused in 1; do\n"
+                    f"{line.rstrip(chr(10))}\n"
+                    f"{indent}done{newline}"
+                )
+                lines[i] = wrapped
+                return "".join(lines)
+        raise AssertionError(f"mutation setup: {needle!r} not found to wrap in for")
+
+    def _guard_with_false_and(script: str, needle: str) -> str:
+        lines = script.splitlines(keepends=True)
+        for i, line in enumerate(lines):
+            if needle in line and not _is_comment(line):
+                lines[i] = line.replace(needle, f"false && {needle}", 1)
+                return "".join(lines)
+        raise AssertionError(f"mutation setup: {needle!r} not found to && guard")
+
+    def _shadow_command(script: str, command: str) -> str:
+        lines = script.splitlines(keepends=True)
+        insert_at = 1 if lines and lines[0].startswith("#!") else 0
+        lines[insert_at:insert_at] = [f"{command}() {{\n", ":\n", "}\n"]
+        return "".join(lines)
 
     cases: list[tuple[str, str, str, str, str, str, str]] = [
         (
@@ -514,9 +802,9 @@ def mutations(
             browser_test_ci,
             browser_test,
         ),
-        # ---- the seven r5-demonstrated escapes, reproduced exactly ----
+        # ---- the seven adversarially-demonstrated escapes, reproduced exactly ----
         (
-            "r5#1: root install command commented out",
+            "escape#1: root install command commented out",
             _comment_out(workflow, WORKFLOW_CHROMIUM_INSTALL_INVOCATION),
             merge_driver,
             wasm_check,
@@ -525,7 +813,7 @@ def mutations(
             browser_test,
         ),
         (
-            "r5#2: non-root runuser command commented out",
+            "escape#2: non-root runuser command commented out",
             _comment_out(workflow, MERGE_DRIVER_WORKFLOW_INVOCATION),
             merge_driver,
             wasm_check,
@@ -534,7 +822,7 @@ def mutations(
             browser_test,
         ),
         (
-            "r5#3: real browser phase commented out",
+            "escape#3: real browser phase commented out",
             workflow,
             _comment_out(merge_driver, MERGE_REAL_EXECUTION_INVOCATION),
             wasm_check,
@@ -543,7 +831,7 @@ def mutations(
             browser_test,
         ),
         (
-            "r5#4: root install hidden behind false branch",
+            "escape#4: root install hidden behind false branch",
             _wrap_if_false(workflow, WORKFLOW_CHROMIUM_INSTALL_INVOCATION),
             merge_driver,
             wasm_check,
@@ -551,8 +839,58 @@ def mutations(
             browser_test_ci,
             browser_test,
         ),
+        # Literal equivalents of `false` must not reopen escape#4: exercise
+        # comparison evaluation, boolean command evaluation, and constant
+        # loop-body reachability across the critical hops.
         (
-            "r5#5: install-chromium.sh replaced by exit 0",
+            "root install hidden behind unequal literal comparison",
+            _wrap_if(workflow, WORKFLOW_CHROMIUM_INSTALL_INVOCATION, "[ 1 = 2 ]"),
+            merge_driver,
+            wasm_check,
+            install_chromium,
+            browser_test_ci,
+            browser_test,
+        ),
+        (
+            "root install hidden behind /bin/false",
+            _wrap_if(workflow, WORKFLOW_CHROMIUM_INSTALL_INVOCATION, "/bin/false"),
+            merge_driver,
+            wasm_check,
+            install_chromium,
+            browser_test_ci,
+            browser_test,
+        ),
+        (
+            "runuser hidden behind ! true",
+            _wrap_if(workflow, MERGE_DRIVER_WORKFLOW_INVOCATION, "! true"),
+            merge_driver,
+            wasm_check,
+            install_chromium,
+            browser_test_ci,
+            browser_test,
+        ),
+        (
+            "real browser phase hidden in while false",
+            workflow,
+            _wrap_while(merge_driver, MERGE_REAL_EXECUTION_INVOCATION, "false"),
+            wasm_check,
+            install_chromium,
+            browser_test_ci,
+            browser_test,
+        ),
+        (
+            "real browser phase hidden in until true",
+            workflow,
+            _wrap_while(merge_driver, MERGE_REAL_EXECUTION_INVOCATION, "true").replace(
+                "while true; do", "until true; do", 1
+            ),
+            wasm_check,
+            install_chromium,
+            browser_test_ci,
+            browser_test,
+        ),
+        (
+            "escape#5: install-chromium.sh replaced by exit 0",
             workflow,
             merge_driver,
             wasm_check,
@@ -561,7 +899,7 @@ def mutations(
             browser_test,
         ),
         (
-            "r5#6: browser-wasm-test-ci.sh replaced by exit 0",
+            "escape#6: browser-wasm-test-ci.sh replaced by exit 0",
             workflow,
             merge_driver,
             wasm_check,
@@ -570,7 +908,7 @@ def mutations(
             browser_test,
         ),
         (
-            "r5#7: browser-wasm-test.sh replaced by compile-only cargo check",
+            "escape#7: browser-wasm-test.sh replaced by compile-only cargo check",
             workflow,
             merge_driver,
             wasm_check,
@@ -584,7 +922,7 @@ def mutations(
                 1,
             ),
         ),
-        # ---- additional coupling cases the r5 finding requires ----
+        # ---- additional coupling cases ----
         (
             "runuser hidden behind false branch",
             _wrap_if_false(workflow, MERGE_DRIVER_WORKFLOW_INVOCATION),
@@ -656,6 +994,173 @@ def mutations(
             install_chromium,
             browser_test_ci,
             _comment_out(browser_test, CARGO_TEST_NAMED_ARG),
+        ),
+        # ---- fail-closed inversion: constructs not modeled at all ----
+        (
+            "root install hidden inside an unmodeled case statement",
+            _wrap_case(workflow, WORKFLOW_CHROMIUM_INSTALL_INVOCATION),
+            merge_driver,
+            wasm_check,
+            install_chromium,
+            browser_test_ci,
+            browser_test,
+        ),
+        (
+            "real browser phase hidden inside an unmodeled case statement",
+            workflow,
+            _wrap_case(merge_driver, MERGE_REAL_EXECUTION_INVOCATION),
+            wasm_check,
+            install_chromium,
+            browser_test_ci,
+            browser_test,
+        ),
+        (
+            "root install hidden inside an unmodeled for-loop header",
+            _wrap_for(workflow, WORKFLOW_CHROMIUM_INSTALL_INVOCATION),
+            merge_driver,
+            wasm_check,
+            install_chromium,
+            browser_test_ci,
+            browser_test,
+        ),
+        (
+            "real browser phase hidden inside an unmodeled for-loop header",
+            workflow,
+            _wrap_for(merge_driver, MERGE_REAL_EXECUTION_INVOCATION),
+            wasm_check,
+            install_chromium,
+            browser_test_ci,
+            browser_test,
+        ),
+        (
+            'root install gated behind an always-false unary test ([ -n "" ])',
+            _wrap_if(workflow, WORKFLOW_CHROMIUM_INSTALL_INVOCATION, '[ -n "" ]'),
+            merge_driver,
+            wasm_check,
+            install_chromium,
+            browser_test_ci,
+            browser_test,
+        ),
+        (
+            'runuser gated behind [ ! -z "" ] (negated always-true -z)',
+            _wrap_if(workflow, MERGE_DRIVER_WORKFLOW_INVOCATION, '[ ! -z "" ]'),
+            merge_driver,
+            wasm_check,
+            install_chromium,
+            browser_test_ci,
+            browser_test,
+        ),
+        (
+            "real browser phase gated behind an out-of-range integer comparison ([ 1 -gt 2 ])",
+            workflow,
+            _wrap_if(merge_driver, MERGE_REAL_EXECUTION_INVOCATION, "[ 1 -gt 2 ]"),
+            wasm_check,
+            install_chromium,
+            browser_test_ci,
+            browser_test,
+        ),
+        (
+            "root install gated behind [ 1 -lt 0 ]",
+            _wrap_if(workflow, WORKFLOW_CHROMIUM_INSTALL_INVOCATION, "[ 1 -lt 0 ]"),
+            merge_driver,
+            wasm_check,
+            install_chromium,
+            browser_test_ci,
+            browser_test,
+        ),
+        (
+            "root install gated behind [ 0 -ge 1 ]",
+            _wrap_if(workflow, WORKFLOW_CHROMIUM_INSTALL_INVOCATION, "[ 0 -ge 1 ]"),
+            merge_driver,
+            wasm_check,
+            install_chromium,
+            browser_test_ci,
+            browser_test,
+        ),
+        (
+            "root install gated behind [ 1 -le 0 ]",
+            _wrap_if(workflow, WORKFLOW_CHROMIUM_INSTALL_INVOCATION, "[ 1 -le 0 ]"),
+            merge_driver,
+            wasm_check,
+            install_chromium,
+            browser_test_ci,
+            browser_test,
+        ),
+        (
+            "root install gated behind a bare variable used as the command (F=false; if $F)",
+            _prepend_line(
+                _wrap_if(workflow, WORKFLOW_CHROMIUM_INSTALL_INVOCATION, "$INSTALL_GATE"),
+                "if $INSTALL_GATE; then",
+                "F=false",
+            ).replace("$INSTALL_GATE", "$F"),
+            merge_driver,
+            wasm_check,
+            install_chromium,
+            browser_test_ci,
+            browser_test,
+        ),
+        (
+            "real browser phase gated behind a false && chain on the same line",
+            workflow,
+            _guard_with_false_and(merge_driver, MERGE_REAL_EXECUTION_INVOCATION),
+            wasm_check,
+            install_chromium,
+            browser_test_ci,
+            browser_test,
+        ),
+        (
+            "root install gated behind a false && chain on the same line",
+            _guard_with_false_and(workflow, WORKFLOW_CHROMIUM_INSTALL_INVOCATION),
+            merge_driver,
+            wasm_check,
+            install_chromium,
+            browser_test_ci,
+            browser_test,
+        ),
+        (
+            "root install preceded by an unconditional exit 0 in the same scope",
+            _prepend_line(workflow, WORKFLOW_CHROMIUM_INSTALL_INVOCATION, "exit 0"),
+            merge_driver,
+            wasm_check,
+            install_chromium,
+            browser_test_ci,
+            browser_test,
+        ),
+        (
+            "real browser phase preceded by an unconditional exit 0 in the same scope",
+            workflow,
+            _prepend_line(merge_driver, MERGE_REAL_EXECUTION_INVOCATION, "exit 0"),
+            wasm_check,
+            install_chromium,
+            browser_test_ci,
+            browser_test,
+        ),
+        (
+            "rust.yml's bash invocations shadowed by a no-op bash() function",
+            _shadow_command(workflow, "bash"),
+            merge_driver,
+            wasm_check,
+            install_chromium,
+            browser_test_ci,
+            browser_test,
+        ),
+        (
+            "browser-wasm-test.sh's cargo invocation shadowed by a no-op function",
+            workflow,
+            merge_driver,
+            wasm_check,
+            install_chromium,
+            browser_test_ci,
+            _shadow_command(browser_test, "cargo"),
+        ),
+        (
+            "install-chromium.sh's apt-get invocation shadowed by a no-op function",
+            workflow,
+            merge_driver,
+            wasm_check,
+            _shadow_command(install_chromium, "apt-get"),
+            browser_test_ci,
+            browser_test,
         ),
     ]
     for package in sorted(EXPECTED_PACKAGES):
