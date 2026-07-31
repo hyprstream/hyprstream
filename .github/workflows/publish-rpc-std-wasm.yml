@@ -1,0 +1,288 @@
+name: Publish browser WASM SDK
+
+# This workflow can NEVER publish merely because a PR merged into main.
+#   - pull_request: build, pack, and smoke-test only (no publish, no id-token).
+#   - push to main : build, pack, smoke, and expose the exact deterministic
+#                    staging artifact identity — but DO NOT publish. (The tarball
+#                    attestation runs in a SEPARATE workflow file,
+#                    attest-rpc-std-wasm.yml, so its id-token cannot satisfy
+#                    npm's trusted publisher bound to THIS filename.)
+#   - push tag     : build + publish immutable production semver (exact release
+#                    tag).
+#   - workflow_dispatch (main only): the ONLY way to publish staging. Requires
+#                    the operator to pre-state the exact version and SHA-256 the
+#                    build must reproduce, then rebuilds, verifies the rebuilt
+#                    tarball's MANIFEST and hashes match both inputs bit-for-bit,
+#                    and only then publishes.
+#
+# EXTERNAL PREREQUISITES (not facts; must be created and re-verified by the
+# release owner before any publish succeeds — none are created from this source
+# lane): (1) an npm trusted publisher for @hyprstream/rpc bound to THIS workflow
+# filename plus the `npm-staging` environment (one publisher per package, so
+# staging is the single authorized lane); (2) a GitHub `npm-staging` environment
+# with required independent reviewers, no self-review/bypass, restricted to the
+# `main` branch; (3) for production, a separate `npm-production` environment and
+# an active tag ruleset protecting `hyprstream-rpc-v*` (production is NOT
+# authorized by the current staging-only binding and will fail closed at npm
+# until separately configured).
+on:
+  pull_request:
+    paths:
+      - 'crates/hyprstream-rpc-std/**'
+      - 'crates/hyprstream-rpc/**'
+      - 'crates/hyprstream-vfs/**'
+      - '.github/scripts/package-rpc-std-wasm.sh'
+      - '.github/scripts/verify-rpc-std-wasm-package.mjs'
+      - '.github/workflows/publish-rpc-std-wasm.yml'
+      - '.github/workflows/attest-rpc-std-wasm.yml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+  push:
+    branches: ['main']
+    tags: ['hyprstream-rpc-v*']
+  workflow_dispatch:
+    inputs:
+      expected_version:
+        description: 'Exact staging version the rebuilt tarball MANIFEST must carry (copy from the expose-staging-identity job summary on main, e.g. 0.1.0-dev.1234.48fa145a56eb). Publish is refused if the rebuilt artifact differs.'
+        required: true
+      expected_sha256:
+        description: 'Exact hex SHA-256 the rebuilt tarball must have (copy from the expose-staging-identity job summary on main). Publish is refused if the rebuilt artifact differs.'
+        required: true
+
+# The default grant is contents:read with NO id-token. Only the publish jobs
+# below escalate to id-token: write for npm trusted publishing (OIDC); there is
+# no npm token and no token fallback.
+permissions:
+  contents: read
+
+concurrency:
+  group: rpc-std-wasm-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  NPM_REGISTRY: https://registry.npmjs.org
+  WASM_PACK_VERSION: 0.13.1
+
+jobs:
+  build-package-smoke:
+    name: Build once, package, and test clean install
+    runs-on: ubuntu-latest
+    permissions:
+      # Deliberately NO id-token: write. This job executes untrusted repository
+      # build code (the wasm-pack/cargo build graph). With id-token it could mint
+      # the workflow-scoped OIDC JWT that npm trusted publishing matches, so it
+      # must not hold it. Only the post-approval publish jobs below may mint an
+      # npm-accepted identity. Tarball attestation lives in a SEPARATE workflow
+      # file (attest-rpc-std-wasm.yml) whose identity cannot satisfy npm's
+      # publisher policy (which binds this filename + the npm-staging env).
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          # Full history so the staging version's commit-count component is
+          # exact and reproducible (a shallow clone would make packaging fail
+          # closed for the staging channel).
+          fetch-depth: 0
+
+      - name: Install Cap'n Proto
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends capnproto
+
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@1.97.0
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Install Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Install pinned wasm-pack
+        uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-pack@0.13.1
+
+      - name: Adversarial probe — verifier must reject duplicate manifest entries
+        run: node .github/scripts/verify-rpc-std-wasm-package.probe.mjs
+
+      - name: Build, pack, and smoke test
+        run: bash .github/scripts/package-rpc-std-wasm.sh
+        env:
+          # PRs use the throwaway ci channel; main + manual staging dispatch
+          # use staging; protected release tags use production. No value here
+          # can publish on its own — publishing needs a separate gated job.
+          PACKAGE_CHANNEL: ${{ (github.event_name == 'pull_request') && 'ci' || (startsWith(github.ref, 'refs/tags/hyprstream-rpc-v') && 'production') || 'staging' }}
+
+      - name: Upload exact package and integrity evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: hyprstream-rpc-std-wasm-${{ github.sha }}
+          path: dist/hyprstream-rpc-std-wasm/
+          if-no-files-found: error
+          retention-days: 30
+
+      # NOTE: tarball provenance attestation is intentionally NOT performed in
+      # this job. It needs id-token: write, which this build job must not hold.
+      # The attestation runs in a separate workflow file
+      # (.github/workflows/attest-rpc-std-wasm.yml) triggered after this build,
+      # whose workflow identity cannot satisfy the npm trusted publisher (bound
+      # to THIS filename + the npm-staging environment).
+
+  # Read-only identity exposure. This job performs NO registry write and holds
+  # no id-token. It surfaces the exact deterministic staging version, tarball
+  # SHA-256, npm SHA-512 SRI, npm shasum, and file inventory so a human can
+  # review the artifact identity before any write-capable publishing job runs.
+  # It runs on push-to-main (where no publish follows) and on the manual
+  # staging dispatch (where publish-staging depends on it).
+  expose-staging-identity:
+    name: Expose exact staging artifact identity (read-only)
+    if: github.event_name != 'pull_request' && !startsWith(github.ref, 'refs/tags/hyprstream-rpc-v') && github.ref == 'refs/heads/main'
+    needs: build-package-smoke
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.identity.outputs.version }}
+      sha256: ${{ steps.identity.outputs.sha256 }}
+      integrity: ${{ steps.identity.outputs.integrity }}
+      npm_shasum: ${{ steps.identity.outputs.npm_shasum }}
+      tarball: ${{ steps.identity.outputs.tarball }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: hyprstream-rpc-std-wasm-${{ github.sha }}
+          path: dist/hyprstream-rpc-std-wasm
+      - name: Read and expose artifact identity
+        id: identity
+        run: |
+          set -euo pipefail
+          node <<'NODE'
+          const fs = require('node:fs');
+          const evidence = JSON.parse(fs.readFileSync('dist/hyprstream-rpc-std-wasm/integrity.json', 'utf8'));
+          if (evidence.schema !== 1) throw new Error('unexpected evidence schema');
+          if (evidence.package !== '@hyprstream/rpc') throw new Error('unexpected package identity');
+          if (evidence.channel !== 'staging') throw new Error(`not a staging artifact: ${evidence.channel}`);
+          if (!evidence.version.includes('-dev.')) throw new Error('staging version must be a unique dev prerelease');
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, [
+            `version=${evidence.version}`,
+            `sha256=${evidence.sha256}`,
+            `integrity=${evidence.integrity}`,
+            `npm_shasum=${evidence.npmShasum}`,
+            `tarball=${evidence.tarball}`,
+          ].join('\n') + '\n');
+          const inv = evidence.files.map(f => `| \`${f.path}\` | ${f.size} |`).join('\n');
+          fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, [
+            '### Staging artifact identity (read-only — nothing is published)',
+            '',
+            '| field | value |',
+            '|---|---|',
+            `| package | \`${evidence.package}\` |`,
+            `| version | \`${evidence.version}\` |`,
+            `| channel | \`${evidence.channel}\` |`,
+            `| tarball | \`${evidence.tarball}\` |`,
+            `| sha256 | \`${evidence.sha256}\` |`,
+            `| integrity (SRI) | \`${evidence.integrity}\` |`,
+            `| npm shasum | \`${evidence.npmShasum}\` |`,
+            `| source commit | \`${evidence.source.commit}\` |`,
+            `| source ref | \`${evidence.source.ref}\` |`,
+            '',
+            '#### File inventory',
+            '',
+            '| path | size |',
+            '|---|---|',
+            inv,
+            '',
+            'A push to `main` **never publishes**. To publish this exact artifact under the `staging` dist-tag, re-run this workflow manually on this commit (GitHub Actions → "Run workflow" → branch `main`) supplying:',
+            '',
+            '- `expected_version`: the version above',
+            '- `expected_sha256`: the sha256 above',
+            '',
+            'The dispatch rebuilds, verifies the rebuilt tarball matches both inputs bit-for-bit, and only then asks the protected `npm-staging` environment (required reviewers) to publish.',
+          ].join('\n') + '\n');
+          NODE
+
+  # Manual staging gate — the ONLY job permitted to mint an npm-accepted OIDC
+  # identity for @hyprstream/rpc. It NEVER runs from a push (so merging the PR
+  # cannot publish); it only runs from an explicit workflow_dispatch on main. It
+  # requires the operator to pre-state the exact version and SHA-256, then
+  # verifies the rebuilt tarball's OWN manifest name/version plus its hashes
+  # against both the pre-statement and the freshly exposed identity, and only
+  # then publishes — inside the npm-staging environment (which the npm trusted
+  # publisher binds as the single authorized lane). Tokenless OIDC only.
+  publish-staging:
+    name: Publish main to staging dist-tag (manual gate)
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
+    needs: [build-package-smoke, expose-staging-identity]
+    runs-on: ubuntu-latest
+    environment: npm-staging
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: Install OIDC-capable npm CLI
+        run: npm install --global npm@11.6.2
+      - uses: actions/download-artifact@v4
+        with:
+          name: hyprstream-rpc-std-wasm-${{ github.sha }}
+          path: dist/hyprstream-rpc-std-wasm
+      - name: Verify tarball manifest, channel, ref, hashes, and operator pre-statement
+        id: package
+        env:
+          EXPECTED_VERSION: ${{ github.event.inputs.expected_version }}
+          EXPECTED_SHA256: ${{ github.event.inputs.expected_sha256 }}
+        run: echo "tarball=$(node .github/scripts/verify-rpc-std-wasm-package.mjs dist/hyprstream-rpc-std-wasm staging)" >> "$GITHUB_OUTPUT"
+      - name: Cross-check against the exposed identity
+        env:
+          EXPOSED_VERSION: ${{ needs.expose-staging-identity.outputs.version }}
+          EXPOSED_SHA256: ${{ needs.expose-staging-identity.outputs.sha256 }}
+        run: |
+          set -euo pipefail
+          node <<'NODE'
+          const fs = require('node:fs');
+          const evidence = JSON.parse(fs.readFileSync('dist/hyprstream-rpc-std-wasm/integrity.json', 'utf8'));
+          const exposedVersion = process.env.EXPOSED_VERSION;
+          const exposedSha = process.env.EXPOSED_SHA256;
+          if (!exposedVersion || !exposedSha) throw new Error('expose-staging-identity outputs are missing');
+          if (evidence.version !== exposedVersion)
+            throw new Error(`artifact version ${evidence.version} != exposed ${exposedVersion}`);
+          if (evidence.sha256 !== exposedSha)
+            throw new Error(`artifact sha256 ${evidence.sha256} != exposed ${exposedSha}`);
+          console.log(`identity confirmed: ${evidence.package}@${evidence.version} sha256=${evidence.sha256}`);
+          NODE
+      - name: Publish only under staging
+        run: npm publish "${{ steps.package.outputs.tarball }}" --registry "$NPM_REGISTRY" --tag staging --access public --provenance
+
+  publish-production:
+    name: Publish protected release tag
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/hyprstream-rpc-v')
+    needs: build-package-smoke
+    runs-on: ubuntu-latest
+    environment: npm-production
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: Install OIDC-capable npm CLI
+        run: npm install --global npm@11.6.2
+      - uses: actions/download-artifact@v4
+        with:
+          name: hyprstream-rpc-std-wasm-${{ github.sha }}
+          path: dist/hyprstream-rpc-std-wasm
+      - name: Verify exact semver, tag, and integrity
+        id: package
+        run: echo "tarball=$(node .github/scripts/verify-rpc-std-wasm-package.mjs dist/hyprstream-rpc-std-wasm production)" >> "$GITHUB_OUTPUT"
+      - name: Publish immutable production semver
+        run: npm publish "${{ steps.package.outputs.tarball }}" --registry "$NPM_REGISTRY" --tag latest --access public --provenance

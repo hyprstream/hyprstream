@@ -11,6 +11,9 @@ description = "Git-native database operations using libgit2 with submodules as s
 git2.workspace = true
 libc.workspace = true
 
+# Standards-based (WHATWG URL) authority parsing for credential host-scoping
+url.workspace = true
+
 # Async runtime
 tokio.workspace = true
 

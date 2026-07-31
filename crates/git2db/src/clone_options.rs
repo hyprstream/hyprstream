@@ -24,7 +24,7 @@
 //! ```
 
 use crate::callback_config::CallbackConfig;
-use git2::{build::CheckoutBuilder, FetchOptions, RemoteCallbacks};
+use git2::{FetchOptions, RemoteCallbacks, build::CheckoutBuilder};
 
 /// Send-safe options for cloning a repository
 #[derive(Default, Clone)]
@@ -91,9 +91,11 @@ impl CloneOptions {
             ..Default::default()
         };
 
-        // Create callbacks from config if present
+        // Create callbacks from config if present, and extract the redirect
+        // policy so it can be applied to FetchOptions.
         if let Some(ref config) = self.callback_config {
             options.callbacks = Some(config.create_callbacks());
+            options.redirect_policy = config.redirect_policy;
         }
 
         options
@@ -112,6 +114,8 @@ pub(crate) struct LegacyCloneOptions<'cb> {
     pub _update_submodules: bool,
     pub proxy_url: Option<String>,
     pub _timeout_seconds: Option<u32>,
+    /// Off-site redirect policy (default: None — no off-site redirects).
+    pub redirect_policy: crate::callback_config::RedirectPolicy,
 }
 
 impl<'cb> LegacyCloneOptions<'cb> {
@@ -125,6 +129,11 @@ impl<'cb> LegacyCloneOptions<'cb> {
         if let Some(callbacks) = self.callbacks.take() {
             fetch_opts.remote_callbacks(callbacks);
         }
+
+        // Apply redirect policy: default is None (no off-site redirects) to
+        // prevent credential exfiltration via redirect when host-scoped
+        // credentials are present (Sol P1 #1429).
+        fetch_opts.follow_redirects(self.redirect_policy.to_git2());
 
         // Apply proxy settings
         if let Some(proxy_url) = &self.proxy_url {

@@ -27,15 +27,15 @@ HyprStream is the runtime for AI that gets smarter the more you use it: a Plan 9
 ```bash
 export LIBTORCH=/path/to/libtorch
 export LD_LIBRARY_PATH=$LIBTORCH/lib:$LD_LIBRARY_PATH
-cargo build --release                    # Standard (includes xet, gittorrent, systemd, otel, kata-vm)
+cargo build --release                    # Standard (includes encrypted credential/PDS, xet, gittorrent, systemd, otel, kata-vm)
 cargo build --features cuda --release    # CUDA marker (backend from tch-rs/libtorch)
 cargo build --features bnb --release     # bitsandbytes quantization
 cargo build --features overlayfs --release
-cargo build --no-default-features --features "gittorrent,xet,otel" --release  # No systemd/kata
+cargo build --no-default-features --features "gittorrent,xet,otel,credential-pds" --release  # No systemd/kata; encrypted credentials remain mandatory
 cargo test --workspace --release
 ```
 
-**Feature flags**: `default = [gittorrent, xet, systemd, otel, kata-vm]`, `cuda` (empty marker), `bnb`, `valkey` (Valkey/Redis user+token stores), `overlayfs`, `oci-image` (RAFS ImageFs), `kata-vm` (implies `oci-image`), `download-libtorch`, `experimental`, `pq-hybrid` (NO-OP alias — PQ primitives always compiled, Classical/Hybrid selected at runtime)
+**Feature flags**: `default = [gittorrent, xet, systemd, otel, kata-vm, nspawn, credential-pds]`, `credential-pds` (mandatory encrypted production UserStore profile; implies `pglite`), `cuda` (empty marker), `bnb`, `valkey` (Valkey/Redis user+token stores), `overlayfs`, `oci-image` (RAFS ImageFs), `kata-vm` (implies `oci-image`), `download-libtorch`, `experimental`, `pq-hybrid` (NO-OP alias — PQ primitives always compiled, Classical/Hybrid selected at runtime)
 **Backend**: CPU/CUDA/ROCm controlled by tch-rs dependency (fork: github.com/hyprstream/tch-rs branch: hip), NOT cargo features
 
 ## Working Tree & Worktrees (multi-agent safety)

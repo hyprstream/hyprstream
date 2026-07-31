@@ -47,6 +47,11 @@ run_phase() {
 # browser-facing rpc + vfs + rpc-std package set used by www.
 run_phase "browser WASM check" bash .github/scripts/browser-wasm-check.sh
 
+# Prove the production credential profile is causal: omitting it must fail the
+# build, never silently skip the deployable target.
+run_phase "credential-pds negative build gate" \
+  bash .github/scripts/credential-pds-build-gate.sh
+
 # #1425 r4: the compile-only check above cannot catch a regression in the
 # actual browser-fetch runtime behavior (JS callback, Request/Response, nonce
 # retry, response rejection) — only real execution can. Chromium + a matching

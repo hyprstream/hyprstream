@@ -7,6 +7,12 @@
 //! - Memory-mapped disk persistence
 //! - FlightSQL interface for embeddings and similarity search
 
+#[cfg(not(feature = "credential-pds"))]
+compile_error!(
+    "security invariant: every Hyprstream build requires the `credential-pds` \
+     feature so the production UserStore cannot fall back to plaintext storage"
+);
+
 #[cfg(all(feature = "metrics", feature = "pglite"))]
 compile_error!(
     "features `metrics` and `pglite` are mutually exclusive: DuckDB and PGlite \

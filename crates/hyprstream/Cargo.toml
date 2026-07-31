@@ -227,8 +227,9 @@ opentelemetry-stdout = { workspace = true, optional = true }
 [features]
 # The credential/PDS service is the default production shape. Keep DuckDB-backed
 # metrics opt-in: DuckDB and PGlite export overlapping PostgreSQL C symbols and
-# cannot be linked into the same process.
-default = ["gittorrent", "xet", "systemd", "otel", "kata-vm", "nspawn"]
+# cannot be linked into the same process. The crate-level build assertion prevents
+# any Hyprstream build from silently omitting this profile.
+default = ["gittorrent", "xet", "systemd", "otel", "kata-vm", "nspawn", "credential-pds"]
 cuda = []
 valkey = ["dep:fred"]  # Enable Valkey/Redis-backed user and token stores
 pglite = ["dep:pglite-rs"]  # Enable PGlite embedded relational UserStore (#1376)

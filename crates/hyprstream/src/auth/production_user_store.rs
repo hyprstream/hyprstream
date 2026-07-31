@@ -244,7 +244,9 @@ mod tests {
             assert!(
                 error
                     .to_string()
-                    .contains("credential-pds requires credentials.backend = \"pglite\""),
+                    .contains(
+                        "encrypted credential storage requires credentials.backend = \"pglite\"",
+                    ),
                 "unexpected admission error: {error:#}"
             );
         }
