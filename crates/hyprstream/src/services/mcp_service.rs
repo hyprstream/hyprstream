@@ -1525,43 +1525,49 @@ mod tests {
     /// MCP envelope is signed by the MCP service key; a direct bearer would bind
     /// `cnf` to the relay key and the token would fail at WorkflowService.
     ///
-    /// This pins the delegated-bearer construction the dispatch arm uses and proves
-    /// it is distinct from the direct-bearer path. Full cnf validation (token
-    /// reaches `WorkflowService::authorize` and PolicyService validates the
-    /// delegation) needs a live PolicyService — CI's job.
+    /// `WorkflowClient::from_resolver` unconditionally requires
+    /// `hyprstream_discovery`'s checkpoint-backed production resolver to be
+    /// installed (`production_rpc_client` bails otherwise) — a process-bootstrap
+    /// singleton no unit test installs, and no local/inproc registration can
+    /// substitute for. Dynamically constructing a real `WorkflowClient` here is
+    /// therefore not possible in an isolated unit test; pin the dispatch arm's
+    /// bearer semantics structurally instead, directly over its source text, so
+    /// no bootstrap globals (registry/policy/discovery) are needed at all. Full
+    /// runtime validation (token reaches `WorkflowService::authorize` via a live
+    /// resolver + PolicyService) remains CI/integration-test scope.
     #[test]
     fn workflow_dispatch_uses_delegated_bearer_relay_path() {
-        let sk = signing_key(7);
-        let vk = sk.verifying_key();
-        let policy_client = PolicyClient::for_local_bootstrap(sk.clone(), vk, None).unwrap();
-        let ctx = ToolCallContext {
-            args: Value::Null,
-            signing_key: sk.clone(),
-            user: "caller".to_owned(),
-            domain: "tenant".to_owned(),
-            ctx: None,
-            policy_client,
-            token: Some("cnf-bound-caller-jwt".to_owned()),
-        };
+        let source = include_str!("mcp_service.rs");
+        let production = source
+            .split("// Tests")
+            .next()
+            .expect("'// Tests' banner marker must exist to bound the production text");
 
-        // The delegated path: from_resolver with NO direct token, then attach
-        // the caller bearer via with_delegated_bearer. This is the exact
-        // construction the dispatch arm performs for a token-bearing ctx.
-        let delegated = WorkflowClient::from_resolver(sk.clone(), None)
-            .expect("from_resolver must succeed without a direct bearer")
-            .with_delegated_bearer(ctx.token.clone().unwrap());
-        // with_delegated_bearer returns a usable client (the relay path is real,
-        // not a stub). A drop to None or a direct-bearer from_resolver(sk, Some)
-        // would skip this builder and silently break cnf-bound callers.
-        let _ = delegated;
+        let arm_start = production
+            .find("\"workflow\" => {")
+            .expect("dispatch_schema_call must have a \"workflow\" match arm");
+        let arm_end = production[arm_start..]
+            .find("_ => anyhow::bail!(\"Unknown service: {service}\")")
+            .expect("the workflow arm must be followed by the catch-all match arm");
+        let workflow_arm = &production[arm_start..arm_start + arm_end];
 
-        // Anonymous caller (no token) → no delegated bearer attached; the arm
-        // honestly dials without one rather than inventing a None token.
-        let anon = ToolCallContext {
-            token: None,
-            ..ctx
-        };
-        assert!(anon.token.is_none());
+        assert!(
+            workflow_arm.contains("WorkflowClient::from_resolver(signing_key, None)"),
+            "workflow arm must dial with from_resolver(signing_key, None) — no direct bearer"
+        );
+        assert!(
+            workflow_arm.contains("if let Some(bearer) = ctx.token.as_ref()"),
+            "workflow arm must branch on the caller's verified token"
+        );
+        assert!(
+            workflow_arm.contains("client = client.with_delegated_bearer(bearer.clone());"),
+            "workflow arm must relay the caller token via with_delegated_bearer, not a direct bearer"
+        );
+        assert!(
+            !workflow_arm.contains("from_resolver(signing_key, Some"),
+            "workflow arm must NOT pass the caller token as a direct bearer on from_resolver — \
+             a cnf.jwk/cnf.jkt-bound caller token would fail verification at WorkflowService"
+        );
     }
 
     #[test]
