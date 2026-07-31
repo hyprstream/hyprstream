@@ -52,6 +52,19 @@ run_phase "browser WASM check" bash .github/scripts/browser-wasm-check.sh
 run_phase "credential-pds negative build gate" \
   bash .github/scripts/credential-pds-build-gate.sh
 
+# #1425 r4: the compile-only check above cannot catch a regression in the
+# actual browser-fetch runtime behavior (JS callback, Request/Response, nonce
+# retry, response rejection) — only real execution can. Chromium + a matching
+# chromedriver were installed as root by the workflow before this script
+# dropped to the non-root `ci` user (see rust.yml's `build` job), so
+# browser-wasm-test-ci.sh finds them already on PATH and skips straight to
+# resolving + running crates/hyprstream-rpc/tests/wasm_browser_fetch.rs in a
+# real headless Chromium — the same required-merge-gate invariant the fast PR
+# `WASM (browser client)` job checks, but the fast job is explicitly skipped
+# on `merge_group` (rust.yml:167), so this is the only required-gate path that
+# actually launches a browser for the synthetic merge candidate.
+run_phase "browser WASM real execution" bash .github/scripts/browser-wasm-test-ci.sh
+
 # Default features (parity with the former x86 gate); libtorch is the image's
 # aarch64 wheel at /opt/libtorch, so NO download-libtorch feature here.
 run_phase "native release build" cargo build --release
