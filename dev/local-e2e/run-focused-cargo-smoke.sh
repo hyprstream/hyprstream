@@ -4,6 +4,11 @@ set -Eeuo pipefail
 
 umask 077
 
+command -v rg >/dev/null 2>&1 || {
+  printf 'focused-cargo-smoke: required tool rg (ripgrep) is not on PATH\n' >&2
+  exit 1
+}
+
 harness_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 cargo_tmp=
 cleanup() {
@@ -53,17 +58,12 @@ if executable is not None:
     print(executable)
 ' "$target_name" "$metadata"
   )"
-  if [[ -z "$executable" ]]; then
-    executable="$(
-      find "${CARGO_TARGET_DIR:?}/debug/deps" -maxdepth 1 -type f \
-        -name "$target_name-*" -perm -0100 -printf '%T@ %p\n' |
-        sort -nr |
-        head -n 1 |
-        cut -d' ' -f2-
-    )"
-  fi
+  # No mtime-guessing fallback: CARGO_TARGET_DIR is a shared BuildQ slot, and
+  # the newest matching binary under it can belong to a different worktree's
+  # concurrent build of the same package. Fail closed instead of laundering
+  # a foreign artifact through run_exact as if this checkout produced it.
   [[ -n "$executable" && -x "$executable" ]] || {
-    printf 'focused-cargo-smoke: no executable test artifact for %s\n' \
+    printf 'focused-cargo-smoke: no executable test artifact for %s in this invocation'"'"'s cargo JSON output\n' \
       "$target_name" >&2
     return 1
   }
@@ -84,6 +84,16 @@ run_exact() {
   "$test_binary" --exact "$test_name" --nocapture
 }
 
+# A shared target can contain a fresh fingerprint from an older worktree with
+# the same workspace package ID. Refresh this leaf's mtime while holding the
+# exclusive lease so Cargo recompiles the current checkout's public interface.
+# Applied once, before the first build that depends on hyprstream-util
+# (hyprstream-discovery and hyprstream both do; hyprstream-rpc does not), so
+# every dependent build in this script sees the refreshed fingerprint rather
+# than only the last one.
+[[ -f crates/hyprstream-util/src/lib.rs && ! -L crates/hyprstream-util/src/lib.rs ]]
+touch crates/hyprstream-util/src/lib.rs
+
 discovery_test="$(build_lib_test_binary hyprstream-discovery hyprstream_discovery)"
 run_exact "$discovery_test" \
   service::resolver_tests::deployment_trust_path_resolution_is_explicit_and_split
@@ -102,11 +112,6 @@ run_exact "$rpc_test" \
 run_exact "$rpc_test" \
   transport::lazy_quinn::tests::wrong_cert_pin_does_not_connect
 
-# A shared target can contain a fresh fingerprint from an older worktree with
-# the same workspace package ID. Refresh this leaf's mtime while holding the
-# exclusive lease so Cargo recompiles the current checkout's public interface.
-[[ -f crates/hyprstream-util/src/lib.rs && ! -L crates/hyprstream-util/src/lib.rs ]]
-touch crates/hyprstream-util/src/lib.rs
 hyprstream_test="$(build_lib_test_binary hyprstream hyprstream_core)"
 run_exact "$hyprstream_test" \
   services::oauth::xrpc::tests::service_auth_query_is_strict_and_method_bound

@@ -11,7 +11,7 @@ trap 'rm -rf -- "$task_root"' EXIT
 export TMPDIR="$task_root"
 export PYTHONDONTWRITEBYTECODE=1
 
-python3 -m unittest discover -s "$harness_dir/tests" -p 'test_*.py' -v
+python3 "$harness_dir/tests/run_discovered_suite.py" "$harness_dir/tests"
 python3 "$harness_dir/causal_harness.py" owned-run \
   --task-root "$task_root" -- \
   python3 -c '
