@@ -277,6 +277,14 @@ impl TaskFdStream {
         Ok(())
     }
 
+    /// Whether this stream has already latched EOF (a prior `exec`, or a
+    /// `stop`/`destroy` through `apply_verb`). Checked by `exec_task` *before*
+    /// invoking the backend so a second exec on one instance fails fast
+    /// instead of running the command and then discarding its output.
+    async fn is_closed(&self) -> bool {
+        self.state.lock().await.closed
+    }
+
     async fn read_until_closed(&self, offset: u64, count: u32) -> Vec<u8> {
         loop {
             let notified = self.wake.notified();
@@ -403,6 +411,10 @@ impl ExecMount {
     pub fn new(pool: Arc<SandboxPool>) -> Self {
         Self {
             pool,
+            // Unsubscribed shadow state today: nothing reads from this origin
+            // (the 9P fd reads below serve the local `TaskFdStream` buffer
+            // instead). Deferred, not wired, pending epic #608's stream-plane
+            // mount — see Finding 3 of REVIEW-connie-1447-r2-k3-2026-07-30.md.
             fd_origin: MoqStreamOrigin::standalone().with_prefix("local/exec").build(),
             fd_streams: tokio::sync::Mutex::new(HashMap::new()),
             terminal: TerminalStore::new(),
@@ -492,6 +504,19 @@ impl ExecMount {
         if &task_subject != caller {
             return Err(MountError::PermissionDenied(
                 "caller does not own this task's Subject-scoped namespace".into(),
+            ));
+        }
+        // Fail fast, before touching the backend (#1447 r2/k3 Finding B): the
+        // per-instance fd streams are a one-shot latch, so a second exec on an
+        // instance whose streams already closed (stopped, destroyed, or a
+        // prior exec completed) must not run the command only to discard its
+        // output afterward.
+        let streams = self.fd_streams_for(id).await?;
+        if streams.stdout.is_closed().await || streams.stderr.is_closed().await {
+            return Err(MountError::InvalidArgument(
+                "instance's exec stdio is already closed (stopped, destroyed, or a prior \
+                 exec already ran); each instance supports at most one exec"
+                    .into(),
             ));
         }
         let (exit_code, stdout, stderr) = self
@@ -763,8 +788,18 @@ impl Mount for ExecMount {
             ExecFidKind::Status(id) => self.read_status(id).await?.into_bytes(),
             ExecFidKind::Exit(id) => self.read_exit(id).await?.into_bytes(),
             ExecFidKind::Ns(id) => self.read_ns(id).await?.into_bytes(),
-            ExecFidKind::Fd(id, 1) => self.fd_streams_for(id).await?.stdout.read_until_closed(offset, count).await,
-            ExecFidKind::Fd(id, 2) => self.fd_streams_for(id).await?.stderr.read_until_closed(offset, count).await,
+            // `read_until_closed` already applies `offset`/`count` (it slices
+            // the retained buffer at `[offset, offset+count)`), so its result
+            // must be returned directly here — falling through to the shared
+            // offset tail below would re-apply `offset` a second time and
+            // silently corrupt or premature-EOF any nonzero-offset fd read
+            // (#1447 r2/k3 Finding A).
+            ExecFidKind::Fd(id, 1) => {
+                return Ok(self.fd_streams_for(id).await?.stdout.read_until_closed(offset, count).await);
+            }
+            ExecFidKind::Fd(id, 2) => {
+                return Ok(self.fd_streams_for(id).await?.stderr.read_until_closed(offset, count).await);
+            }
             ExecFidKind::Fd(_, _) => {
                 return Err(MountError::NotFound("invalid exec fd".into()));
             }
@@ -1301,6 +1336,39 @@ mod tests {
         assert!(
             mount.read(&stderr_fid, 4096, 4096, &subject()).await.unwrap().is_empty(),
             "terminal stderr must report EOF after retained bytes"
+        );
+    }
+
+    /// Regression (#1447 r2/k3 Finding A): `read_until_closed` already slices
+    /// the retained buffer at `[offset, offset+count)`; `Mount::read`'s shared
+    /// offset tail must NOT re-apply `offset` to that already-offset result.
+    /// Every other fd test in this suite reads at offset 0 or at an offset
+    /// past end-of-buffer, both of which look identical under the buggy
+    /// double-application and the correct behavior — only a nonzero,
+    /// in-range offset (mid-buffer, on a buffer bigger than one read) can
+    /// distinguish them. With a double application, offset=3/count=4 over a
+    /// 10-byte buffer computes `bytes[3..7]` ("3456") in `read_until_closed`,
+    /// then re-applies offset 3 to that 4-byte result (`"3456"[3..]` = "6"
+    /// only) — silently wrong data, not even an empty read.
+    #[tokio::test]
+    async fn fd_read_at_nonzero_offset_is_not_double_applied() {
+        let pool = make_pool().await;
+        let id = pool.acquire(&admission_subject(), &PodSandboxConfig::default()).await.unwrap();
+        let mount = ExecMount::new(pool);
+
+        mount
+            .publish_exec_result(&id, b"0123456789", b"")
+            .await
+            .unwrap();
+
+        let mut fid = mount.walk(&[&id, "fd", "1"], &subject()).await.unwrap();
+        mount.open(&mut fid, 0, &subject()).await.unwrap();
+
+        let data = mount.read(&fid, 3, 4, &subject()).await.unwrap();
+        assert_eq!(
+            data, b"3456",
+            "offset=3,count=4 over a 10-byte retained buffer must return bytes[3..7] \
+             verbatim from read_until_closed, not re-offset a second time"
         );
     }
 
