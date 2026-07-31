@@ -3380,50 +3380,7 @@ impl<'a> TextStream<'a> {
                     // identity is stamped for reuse. This is the pull-based
                     // complement to the registry's push-based delta invalidation.
                     let expected = engine.kv_compat_fingerprint_for(adapter_generation);
-                    let stored = cache_guard.compat_fingerprint();
-                    let cache_is_empty = cache_guard.cached_token_count() == 0;
-                    match crate::runtime::kv_compat::decide_cache_reuse(
-                        expected.as_ref(),
-                        stored.as_ref(),
-                        cache_is_empty,
-                    ) {
-                        crate::runtime::kv_compat::CacheReuseDecision::Reuse => {
-                            tracing::debug!(target: "kv_compat", "KV cache reuse: compatible");
-                        }
-                        crate::runtime::kv_compat::CacheReuseDecision::StampFresh => {
-                            // Empty cache under an authoritative identity: stamp
-                            // it so the KV about to be produced is attributable.
-                            if let Some(exp) = expected {
-                                cache_guard.set_compat_fingerprint(exp);
-                            }
-                        }
-                        crate::runtime::kv_compat::CacheReuseDecision::DiscardAndRecompute => {
-                            // Fail-closed: discard the (untrusted or mismatched)
-                            // KV and recompute from zero.
-                            let reason = match (expected.as_ref(), stored.as_ref()) {
-                                (_, Some(s)) => format!(
-                                    "stamp mismatch (stored={}, expected={})",
-                                    s.to_hex(),
-                                    expected
-                                        .map(|e| e.to_hex())
-                                        .unwrap_or_else(|| "<none>".into())
-                                ),
-                                (_, None) if !cache_is_empty =>
-                                    "populated cache with no compatibility stamp".into(),
-                                _ => "no authoritative compatibility identity".into(),
-                            };
-                            tracing::info!(
-                                target: "kv_compat",
-                                reason = %reason,
-                                "KV cache not reusable: discarding and recomputing (fail-closed)"
-                            );
-                            cache_guard.set_cached_tokens(Vec::new());
-                            cache_guard.clear_all();
-                            if let Some(exp) = expected {
-                                cache_guard.set_compat_fingerprint(exp);
-                            }
-                        }
-                    }
+                    cache_guard.apply_reuse_policy(expected);
 
                     let matched = cache_guard.prefix_match_len(&prompt_tokens);
                     if matched > 0 {

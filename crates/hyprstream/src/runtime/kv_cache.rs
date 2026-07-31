@@ -32,7 +32,9 @@ use tch::Device;
 use tch::{Kind as DType, Tensor};
 
 use super::KVQuantType;
-use super::kv_compat::KvCompatFingerprint;
+use super::kv_compat::{
+    decide_cache_reuse, CacheReuseDecision, KvCompatFingerprint,
+};
 use super::torch_utils::{estimate_tensor_size_mb, safe_zeros};
 
 // ============================================================================
@@ -2057,6 +2059,62 @@ impl KVCacheManager {
         self.compat_fingerprint = Some(fp);
     }
 
+    /// Apply the fail-closed KV compatibility policy to this real cache.
+    ///
+    /// This is the production state-transition boundary for #1277. A compatible
+    /// stamped cache is retained. A fresh empty cache is stamped before prefill.
+    /// Every incompatible or unproven cache has both its token IDs and layer
+    /// tensors discarded, then is re-stamped only when an authoritative expected
+    /// fingerprint is available.
+    pub fn apply_reuse_policy(
+        &mut self,
+        expected: Option<KvCompatFingerprint>,
+    ) -> CacheReuseDecision {
+        let stored = self.compat_fingerprint();
+        let cache_is_empty = self.cached_token_count() == 0;
+        let decision =
+            decide_cache_reuse(expected.as_ref(), stored.as_ref(), cache_is_empty);
+
+        match decision {
+            CacheReuseDecision::Reuse => {
+                tracing::debug!(target: "kv_compat", "KV cache reuse: compatible");
+            }
+            CacheReuseDecision::StampFresh => {
+                if let Some(expected) = expected {
+                    self.set_compat_fingerprint(expected);
+                }
+            }
+            CacheReuseDecision::DiscardAndRecompute => {
+                let reason = match stored {
+                    Some(stored) => format!(
+                        "stamp mismatch (stored={}, expected={})",
+                        stored.to_hex(),
+                        expected
+                            .map(|fingerprint| fingerprint.to_hex())
+                            .unwrap_or_else(|| "<none>".to_owned())
+                    ),
+                    None if !cache_is_empty => {
+                        "populated cache with no compatibility stamp".to_owned()
+                    }
+                    None => "no authoritative compatibility identity".to_owned(),
+                };
+                tracing::info!(
+                    target: "kv_compat",
+                    reason = %reason,
+                    "KV cache not reusable: discarding and recomputing (fail-closed)"
+                );
+
+                self.set_cached_tokens(Vec::new());
+                self.clear_all();
+                if let Some(expected) = expected {
+                    self.set_compat_fingerprint(expected);
+                }
+            }
+        }
+
+        decision
+    }
+
     /// Enable or disable caching
     pub fn set_enabled(&mut self, enabled: bool) {
         self.enabled = enabled;
@@ -2673,69 +2731,94 @@ mod tests {
         Ok(())
     }
 
-    /// The cache-level lifecycle the KV-compat reuse guard (#1277) relies on:
-    /// `cached_token_count() == 0` is the "provably empty" signal, and a populated
-    /// cache with no stamp must be rejected (DiscardAndRecompute), never adopted.
-    #[test]
-    fn test_kv_compat_fail_closed_lifecycle() {
+    fn compat_test_fingerprint(base_revision: &str) -> KvCompatFingerprint {
         use crate::runtime::kv_compat::{
-            decide_cache_reuse, CacheReuseDecision, KvCompatDescriptor, WeightIdentity,
-            KV_COMPAT_FORMAT_VERSION,
+            KvCompatDescriptor, WeightIdentity, KV_COMPAT_FORMAT_VERSION,
         };
 
-        let expected = KvCompatDescriptor {
+        KvCompatDescriptor {
             format_version: KV_COMPAT_FORMAT_VERSION,
-            weights: WeightIdentity::base_only("sha256:base"),
+            weights: WeightIdentity::base_only(base_revision),
             tokenizer_hash: Some("deadbeef".to_owned()),
             ..Default::default()
         }
-        .fingerprint();
+        .fingerprint()
+    }
 
+    /// Populate both reuse signals on a real manager: token IDs used by prefix
+    /// matching and layer tensors used by attention.
+    fn populate_compat_test_cache(manager: &mut KVCacheManager) {
+        manager.set_cached_tokens(vec![1, 2, 3, 4]);
+        let updated = manager.with_layer_cache(0, |cache| {
+            let keys = Tensor::ones([1, 4, 2, 4], (DType::Float, Device::Cpu));
+            let values = Tensor::ones([1, 4, 2, 4], (DType::Float, Device::Cpu));
+            cache.update(&keys, &values, 0).expect("populate layer cache");
+        });
+        assert_eq!(updated, Some(()));
+    }
+
+    fn compat_test_layer_seq_pos(manager: &KVCacheManager) -> usize {
+        manager
+            .with_layer_cache(0, |cache| cache.seq_pos)
+            .expect("layer 0 exists")
+    }
+
+    #[test]
+    fn apply_reuse_policy_retains_compatible_real_cache() {
+        let expected = compat_test_fingerprint("sha256:base");
         let mut manager = KVCacheManager::new(2, 64, KVQuantType::None);
 
-        // (1) Fresh cache: empty, un-stamped. An authoritative identity is available
-        //     → stamp fresh and let prefill populate it.
-        assert_eq!(manager.cached_token_count(), 0);
-        assert!(manager.compat_fingerprint().is_none());
         assert_eq!(
-            decide_cache_reuse(Some(&expected), manager.compat_fingerprint().as_ref(), true),
+            manager.apply_reuse_policy(Some(expected)),
             CacheReuseDecision::StampFresh
         );
-        manager.set_compat_fingerprint(expected);
+        assert_eq!(manager.compat_fingerprint(), Some(expected));
 
-        // (2) Cache now populated but its stamp matches → reuse.
-        manager.set_cached_tokens(vec![1, 2, 3, 4]);
+        populate_compat_test_cache(&mut manager);
         assert_eq!(
-            decide_cache_reuse(
-                Some(&expected),
-                manager.compat_fingerprint().as_ref(),
-                manager.cached_token_count() == 0
-            ),
+            manager.apply_reuse_policy(Some(expected)),
             CacheReuseDecision::Reuse
         );
+        assert_eq!(manager.cached_token_count(), 4);
+        assert_eq!(compat_test_layer_seq_pos(&manager), 4);
+        assert_eq!(manager.compat_fingerprint(), Some(expected));
+    }
 
-        // (3) A populated cache carrying NO stamp (e.g. produced before stamping
-        //     existed) must be rejected, never silently adopted.
-        let mut unstamped = KVCacheManager::new(2, 64, KVQuantType::None);
-        unstamped.set_cached_tokens(vec![9, 9, 9]);
-        assert_eq!(
-            decide_cache_reuse(
-                Some(&expected),
-                unstamped.compat_fingerprint().as_ref(),
-                unstamped.cached_token_count() == 0
-            ),
-            CacheReuseDecision::DiscardAndRecompute,
-            "an unstamped populated cache must fail-closed to discard"
-        );
+    #[test]
+    fn apply_reuse_policy_discards_and_restamps_incompatible_real_cache() {
+        let original = compat_test_fingerprint("sha256:old");
+        let expected = compat_test_fingerprint("sha256:new");
+        let mut manager = KVCacheManager::new(2, 64, KVQuantType::None);
 
-        // (4) Discard clears the emptiness signal so the cache is treated fresh again.
-        unstamped.set_cached_tokens(Vec::new());
-        unstamped.clear_all();
-        assert_eq!(unstamped.cached_token_count(), 0);
         assert_eq!(
-            decide_cache_reuse(Some(&expected), unstamped.compat_fingerprint().as_ref(), true),
+            manager.apply_reuse_policy(Some(original)),
             CacheReuseDecision::StampFresh
         );
+        populate_compat_test_cache(&mut manager);
+
+        assert_eq!(
+            manager.apply_reuse_policy(Some(expected)),
+            CacheReuseDecision::DiscardAndRecompute
+        );
+        assert_eq!(manager.cached_token_count(), 0);
+        assert_eq!(compat_test_layer_seq_pos(&manager), 0);
+        assert_eq!(manager.compat_fingerprint(), Some(expected));
+    }
+
+    #[test]
+    fn apply_reuse_policy_discards_populated_unstamped_real_cache() {
+        let expected = compat_test_fingerprint("sha256:base");
+        let mut manager = KVCacheManager::new(2, 64, KVQuantType::None);
+        populate_compat_test_cache(&mut manager);
+        assert!(manager.compat_fingerprint().is_none());
+
+        assert_eq!(
+            manager.apply_reuse_policy(Some(expected)),
+            CacheReuseDecision::DiscardAndRecompute
+        );
+        assert_eq!(manager.cached_token_count(), 0);
+        assert_eq!(compat_test_layer_seq_pos(&manager), 0);
+        assert_eq!(manager.compat_fingerprint(), Some(expected));
     }
 
     // ========================================================================
