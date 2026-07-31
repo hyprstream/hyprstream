@@ -173,11 +173,23 @@ hyprstream-rpc-build = { path = "../hyprstream-rpc-build" }
 [dev-dependencies]
 tokio-test = { workspace = true }
 tracing-subscriber = { workspace = true }
+
+# Native-only test deps (real QUIC/UDP networking; not wasm32-buildable — moved
+# out of the unconditional section so `cargo test --target wasm32-unknown-unknown`
+# (the #1425 r2 P2 browser fetch test) does not try to compile a native UDP/mio
+# stack for the browser target).
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 noq = { version = "=1.0.0-rc.0", default-features = false, features = ["rustls-aws-lc-rs"] }
 # Quinn hides the negotiated NamedGroup behind this upstream diagnostic feature.
 # Enabling it only for tests lets live zmtp assertions use handshake_data without
 # packet parsing or changing production wire behavior.
 quinn = { workspace = true, features = ["__rustls-post-quantum-test"] }
+
+# wasm32-only test deps: a real, browser-executed fetch/JS-callback test for
+# the #1425 sender-bound token exchange (r2 P2). Runs via
+# `wasm-pack test --headless --chrome -p hyprstream-rpc`.
+[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
+wasm-bindgen-test = "0.3"
 
 [lints]
 workspace = true

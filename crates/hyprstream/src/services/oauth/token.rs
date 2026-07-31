@@ -26,6 +26,8 @@ use super::state::{DeviceCodeStatus, DpopJtiAdmission, OAuthState, RefreshTokenE
 use crate::services::generated::policy_client::IssueToken;
 use hyprstream_pds::repo_authority::is_path_form_did_web;
 use hyprstream_rpc::auth::{jwk_thumbprint, JwkThumbprintInput};
+// #1425: the public browser client_id routes the sender-bound exchange.
+use hyprstream_rpc::wasm_token_exchange::BROWSER_PUBLIC_CLIENT_ID;
 
 /// Device code grant type URN (RFC 8628).
 const DEVICE_CODE_GRANT_TYPE: &str = "urn:ietf:params:oauth:grant-type:device_code";
@@ -71,12 +73,22 @@ pub struct TokenRequest {
     pub requested_token_type: Option<String>,
     #[serde(default)]
     pub actor_token: Option<String>,
+    // RFC 8693 §2.1 actor-token type indicator (#1425 r2 P2). Modeled
+    // explicitly so it is never silently dropped by the form extractor —
+    // a request that names an actor_token_type but omits actor_token must
+    // still be recognized and rejected by the browser handler, not treated
+    // as if it had no actor field at all.
+    #[serde(default)]
+    pub actor_token_type: Option<String>,
     #[serde(default)]
     pub scope: Option<String>,
     #[serde(default)]
     pub audience: Option<String>,
     #[serde(default)]
     pub tenant: Option<String>,
+    // RFC 8707 resource indicator (token-exchange, #1425).
+    #[serde(default)]
+    pub resource: Option<String>,
 }
 
 /// POST /oauth/token — token exchange
@@ -207,6 +219,27 @@ pub async fn exchange_token(
                     params.scope.as_deref(),
                     params.audience.as_deref(),
                     resolver.as_ref(),
+                )
+                .await;
+            }
+            // #1425: the browser RFC 8693 sender-bound exchange (DPoP +
+            // cnf.jkt). Routed on the public browser client_id so it cannot be
+            // confused with the generic OIDC/WIT bearer exchange or the UCAN
+            // grant path. DPoP is mandatory inside the handler.
+            if params.client_id == BROWSER_PUBLIC_CLIENT_ID {
+                return super::token_exchange::exchange_browser_token_exchange(
+                    &state,
+                    &subject_token,
+                    &subject_token_type,
+                    dpop_header.as_deref(),
+                    params.audience.as_deref(),
+                    params.resource.as_deref(),
+                    params.scope.as_deref(),
+                    params.requested_token_type.as_deref(),
+                    params.actor_token.as_deref(),
+                    params.actor_token_type.as_deref(),
+                    params.tenant.as_deref(),
+                    &params.client_id,
                 )
                 .await;
             }
@@ -1975,9 +2008,11 @@ mod tests {
             subject_token_type: None,
             requested_token_type: None,
             actor_token: None,
+            actor_token_type: None,
             scope: None,
             audience: None,
             tenant: None,
+            resource: None,
         };
         let resp = exchange_refresh_token(Arc::clone(&state), params, None, None, None).await;
 
@@ -2040,9 +2075,11 @@ mod tests {
             subject_token_type: None,
             requested_token_type: None,
             actor_token: None,
+            actor_token_type: None,
             scope: None,
             audience: None,
             tenant: None,
+            resource: None,
         };
         let response =
             exchange_refresh_token(Arc::clone(&state), params, None, None, None).await;
@@ -2098,9 +2135,11 @@ mod tests {
             subject_token_type: None,
             requested_token_type: None,
             actor_token: None,
+            actor_token_type: None,
             scope: None,
             audience: None,
             tenant: None,
+            resource: None,
         };
         let resp = exchange_refresh_token(state.clone(), params, None, None, None).await;
 

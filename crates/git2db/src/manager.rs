@@ -3,12 +3,12 @@
 //! This module provides centralized Git management following hyprstream's patterns
 //! for thread safety and connection pooling.
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use dashmap::DashMap;
-use git2::{build::RepoBuilder, Repository, Signature};
+use git2::{Repository, Signature, build::RepoBuilder};
+use hyprstream_containedfs::contained_join;
 use once_cell::sync::OnceCell;
 use parking_lot::RwLock;
-use hyprstream_containedfs::contained_join;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -264,44 +264,70 @@ impl GitManager {
         }
 
         // Set up timeout (cap at u32::MAX seconds, ~136 years)
-        builder = builder.timeout(u32::try_from(self.config.network.timeout_secs).unwrap_or(u32::MAX));
+        builder =
+            builder.timeout(u32::try_from(self.config.network.timeout_secs).unwrap_or(u32::MAX));
 
         // Set up authentication
         use crate::auth::AuthStrategy;
-        use crate::callback_config::{CallbackConfigBuilder, CertificateConfig};
+        use crate::callback_config::{AuthMode, CallbackConfigBuilder, CertificateConfig};
 
         let mut callback_builder = CallbackConfigBuilder::new();
 
-        // Add token authentication if configured
+        // Add token authentication if configured. The token is only attached
+        // to the default clone path when it is host-scoped (access_token_host
+        // is set): a process-global, host-unscoped token must not be offered
+        // to a caller-selected remote, since that would exfiltrate the
+        // operator's trusted-forge credential (issue #1429 Sol P1).
         let token_from_config = self.config.network.access_token.clone();
         let token_from_env = std::env::var("GIT2DB_NETWORK__ACCESS_TOKEN").ok();
-
+        let token_host = self.config.network.access_token_host.clone();
         let token = token_from_config.or(token_from_env);
 
-        if let Some(ref token_value) = token {
-            tracing::info!(
-                "Using token authentication (token starts with: {})",
-                &token_value.chars().take(10).collect::<String>()
-            );
-            callback_builder = callback_builder.auth(AuthStrategy::Token {
-                token: token_value.clone(),
-            });
-        } else {
-            tracing::warn!("No access token configured");
+        match (token, &token_host) {
+            (Some(token_value), Some(host)) => {
+                tracing::info!(
+                    "Using host-scoped token authentication bound to {} (token starts with: {})",
+                    host,
+                    &token_value.chars().take(10).collect::<String>()
+                );
+                callback_builder = callback_builder.auth(AuthStrategy::Token {
+                    token: token_value,
+                    host: Some(host.clone()),
+                });
+            }
+            (Some(_token_value), None) => {
+                tracing::warn!(
+                    "Access token configured without access_token_host — not attaching to \
+                     default clone path to prevent credential exfiltration to caller-selected \
+                     remotes. Set network.access_token_host to scope the token."
+                );
+            }
+            (None, _) => {
+                tracing::debug!("No access token configured");
+            }
         }
 
-        // Add SSH agent authentication
-        callback_builder = callback_builder.auth(AuthStrategy::SshAgent {
-            username: Some("git".to_owned()),
-        });
-
-        // Add default credential helper if enabled (for git credentials, osxkeychain, etc.)
+        // Ambient credential sources — the SSH agent (`ssh_key_from_agent`),
+        // the git credential helper, and `~/.gitconfig` — are only consulted
+        // when the operator explicitly enables `use_credential_helper`. By
+        // default (issue #1429) the clone path is strict certs + ExplicitOnly
+        // auth: these strategies are added only here, behind the opt-in, and
+        // paired with AllowAmbient so ExplicitOnly does not refuse them at
+        // resolution time. The default secure path uses only the explicit
+        // token above (or anonymous access for public remotes).
         if self.config.network.use_credential_helper {
-            callback_builder = callback_builder.auth(AuthStrategy::Default);
+            callback_builder = callback_builder
+                .auth(AuthStrategy::SshAgent {
+                    username: Some("git".to_owned()),
+                })
+                .auth(AuthStrategy::Default)
+                .auth_mode(AuthMode::AllowAmbient);
         }
 
-        // Use system certificate validation
-        callback_builder = callback_builder.certificates(CertificateConfig::SystemDefault);
+        // Strict certificate validation is the builder default; set it
+        // explicitly for clarity. libgit2 validates against the system trust
+        // store and rejects on cert failure.
+        callback_builder = callback_builder.certificates(CertificateConfig::Strict);
 
         builder = builder.callback_config(callback_builder.build());
 
@@ -340,7 +366,9 @@ impl GitManager {
 
         // Check cache first (lock-free read with DashMap)
         if let Some(entry) = self.repo_cache.get(&path) {
-            if !entry.is_expired(Duration::from_secs(self.config.performance.repo_cache_ttl_secs)) {
+            if !entry.is_expired(Duration::from_secs(
+                self.config.performance.repo_cache_ttl_secs,
+            )) {
                 entry.touch();
                 trace!("Repository cache hit for {:?}", path);
                 return Ok(entry.cache.clone());
@@ -491,16 +519,20 @@ impl GitManager {
         // local repository (e.g. RPC registration in local-file test
         // harnesses, or same-host repo mirroring).
         if options.shallow && url.starts_with("file://") {
-            debug!("Disabling shallow clone for local file:// transport: {}", url);
+            debug!(
+                "Disabling shallow clone for local file:// transport: {}",
+                url
+            );
             options.shallow = false;
             options.depth = None;
         }
 
         // Acquire operation permit
-        let _permit =
-            self.operation_semaphore.acquire().await.map_err(|e| {
-                Git2DBError::internal(format!("Failed to acquire semaphore: {e}"))
-            })?;
+        let _permit = self
+            .operation_semaphore
+            .acquire()
+            .await
+            .map_err(|e| Git2DBError::internal(format!("Failed to acquire semaphore: {e}")))?;
 
         // Track operation
         let operation_id = format!("clone_{}", target_path.display());
@@ -556,10 +588,7 @@ impl GitManager {
 
             // Perform clone
             let repo = builder.clone(&url, &validated_path).map_err(|e| {
-                Git2DBError::repository(
-                    &validated_path,
-                    format!("Failed to clone repository: {e}"),
-                )
+                Git2DBError::repository(&validated_path, format!("Failed to clone repository: {e}"))
             })?;
 
             info!("Successfully cloned repository to {:?}", validated_path);
@@ -621,10 +650,9 @@ impl GitManager {
         opts.valid(true);
         opts.working_tree(true);
 
-        wt.prune(Some(&mut opts))
-            .map_err(|e| {
-                Git2DBError::repository(&base_repo_path, format!("Failed to prune worktree: {e}"))
-            })?;
+        wt.prune(Some(&mut opts)).map_err(|e| {
+            Git2DBError::repository(&base_repo_path, format!("Failed to prune worktree: {e}"))
+        })?;
 
         info!("Successfully removed worktree '{}'", worktree_name);
         Ok(())
@@ -840,7 +868,9 @@ mod tests {
 
         // All should succeed without conflicts
         for handle in handles {
-            let result = handle.await.map_err(|e| crate::Git2DBError::internal(format!("Task join error: {e}")))?;
+            let result = handle
+                .await
+                .map_err(|e| crate::Git2DBError::internal(format!("Task join error: {e}")))?;
             assert!(result.is_ok());
         }
 
@@ -878,14 +908,31 @@ mod tests {
 
         // Default signature
         let sig = manager.create_signature(None, None)?;
-        assert_eq!(sig.name().ok_or_else(|| crate::Git2DBError::internal("no name"))?, "git2db");
-        assert_eq!(sig.email().ok_or_else(|| crate::Git2DBError::internal("no email"))?, "git2db@local");
+        assert_eq!(
+            sig.name()
+                .ok_or_else(|| crate::Git2DBError::internal("no name"))?,
+            "git2db"
+        );
+        assert_eq!(
+            sig.email()
+                .ok_or_else(|| crate::Git2DBError::internal("no email"))?,
+            "git2db@local"
+        );
 
         // Custom signature
-        let custom_sig = manager
-            .create_signature(Some("Test User"), Some("test@example.com"))?;
-        assert_eq!(custom_sig.name().ok_or_else(|| crate::Git2DBError::internal("no name"))?, "Test User");
-        assert_eq!(custom_sig.email().ok_or_else(|| crate::Git2DBError::internal("no email"))?, "test@example.com");
+        let custom_sig = manager.create_signature(Some("Test User"), Some("test@example.com"))?;
+        assert_eq!(
+            custom_sig
+                .name()
+                .ok_or_else(|| crate::Git2DBError::internal("no name"))?,
+            "Test User"
+        );
+        assert_eq!(
+            custom_sig
+                .email()
+                .ok_or_else(|| crate::Git2DBError::internal("no email"))?,
+            "test@example.com"
+        );
         Ok(())
     }
 }
