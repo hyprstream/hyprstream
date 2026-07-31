@@ -66,6 +66,15 @@ if (manifest.name !== evidence.package || manifest.name !== PACKAGE_NAME) {
 if (manifest.version !== evidence.version) {
   throw new Error(`tarball manifest version ${manifest.version} != evidence version ${evidence.version}`);
 }
+// The published license must be the crate's own, read independently from the
+// checked-out source rather than trusted from the tarball or the packaging
+// step that produced it — a hardcoded/stale manifest license (e.g. shipped
+// after the crate's Cargo.toml moved to a different license) must be refused
+// here even if every hash matches.
+const crateLicense = readCrateLicense();
+if (manifest.license !== crateLicense) {
+  throw new Error(`tarball manifest license ${manifest.license} != authoritative crate license ${crateLicense}`);
+}
 // A publishable package must not declare scripts or runtime dependencies that
 // could run on install; the browser bundle is self-contained.
 if (manifest.scripts && Object.keys(manifest.scripts).length > 0) {
@@ -124,6 +133,28 @@ if (expectedSha256 !== undefined && expectedSha256 !== sha256) {
 }
 
 console.log(path.join(distDir, tarballs[0]));
+
+// --- Authoritative crate license ------------------------------------------
+// Dependency-free: this is one scalar field, not a reason to add a TOML
+// parser dependency to a script whose whole point is verifying without one.
+// Scoped to the `[package]` table specifically (not a bare whole-file regex)
+// so a `license` key belonging to some other table can never be picked up.
+function readCrateLicense() {
+  const cargoTomlPath = path.join('crates', 'hyprstream-rpc-std', 'Cargo.toml');
+  const lines = fs.readFileSync(cargoTomlPath, 'utf8').split(/\r?\n/);
+  let inPackageTable = false;
+  for (const line of lines) {
+    const tableHeader = line.match(/^\[([^\]]*)\]\s*$/);
+    if (tableHeader) {
+      inPackageTable = tableHeader[1] === 'package';
+      continue;
+    }
+    if (!inPackageTable) continue;
+    const licenseLine = line.match(/^license\s*=\s*"([^"]+)"/);
+    if (licenseLine) return licenseLine[1];
+  }
+  throw new Error(`no license field in [package] table of ${cargoTomlPath}`);
+}
 
 // --- Minimal dependency-free USTAR/tar reader ---------------------------------
 // Reads a gzip-compressed POSIX/USTAR tar and returns the bytes of a single
