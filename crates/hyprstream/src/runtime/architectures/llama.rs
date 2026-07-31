@@ -1586,10 +1586,12 @@ impl LlamaModel {
     /// - `is_last`  (`layer_range.end == devices.len()`) → keep `norm` + `lm_head`
     ///   (or the tied transpose).
     ///
-    /// `weights` must already contain (at least) this stage's tensors; the loader
-    /// is responsible for shard selection (a later ticket). Tensors not on the
-    /// target device are moved with a single `.to()` at construction — the *only*
-    /// placement cost; the forward path then does zero intra-stage copies.
+    /// `weights` must already contain (at least) this stage's tensors. Production
+    /// stage requests use `ModelFactory::create_stage`, whose authoritative
+    /// HF-index loader supplies only the requested range and role tensors.
+    /// Tensors not on the target device are moved with a single `.to()` at
+    /// construction — the *only* placement cost; the forward path then does zero
+    /// intra-stage copies.
     ///
     /// State sizing follows the **owned** layer count, not the global count
     /// (M-LOAD seam #2): the KV-cache manager and `self.layers` are both sized to
