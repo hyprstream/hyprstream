@@ -8,11 +8,11 @@ from __future__ import annotations
 
 import argparse
 import atexit
+import hashlib
 import json
 import os
 from pathlib import Path
 import re
-import shutil
 import signal
 import socket
 import stat
@@ -36,6 +36,38 @@ CORE_SERVICES = (
 IMMUTABLE_IMAGE = re.compile(r"^[^@\s]+@sha256:[0-9a-f]{64}$")
 FULL_SHA = re.compile(r"^[0-9a-f]{40}$")
 SAFE_NAME = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,63}$")
+REVIEW_IDENTITY = re.compile(r"^[a-z0-9][a-z0-9_.:/-]{0,127}$")
+INFERENCE_CONTRACT_RELATIVE = Path(
+    "modules/hyprstream-instance/fixtures/inference-contract/draft-v1.json"
+)
+QUADLET_TEMPLATE_RELATIVE = Path("stacks/hyprstream-staging/templates")
+REPEATABLE_QUADLET_KEYS = frozenset({"Environment", "Volume"})
+QUADLET_DESCRIPTIONS = {
+    "event": "HyprStream event bus (PUB/SUB)",
+    "policy": "HyprStream authorization (Casbin)",
+    "discovery": "HyprStream discovery",
+    "registry": "HyprStream model registry",
+    "streams": "HyprStream token streaming",
+    "model": "HyprStream model inference (CPU, synthetic staging fixture)",
+    "oai": "HyprStream OpenAI-compatible API",
+    "oauth": "HyprStream OAuth and DID document listener",
+}
+QUADLET_DEPENDENCIES = {
+    "event": ("network.target", None),
+    "policy": ("hyprstream-event.service", "hyprstream-event.service"),
+    "discovery": ("hyprstream-policy.service", "hyprstream-policy.service"),
+    "registry": ("hyprstream-event.service", "hyprstream-event.service"),
+    "streams": ("hyprstream-event.service", "hyprstream-event.service"),
+    "model": (
+        "hyprstream-registry.service hyprstream-policy.service",
+        "hyprstream-registry.service hyprstream-policy.service",
+    ),
+    "oai": ("hyprstream-policy.service", "hyprstream-policy.service"),
+    "oauth": (
+        "hyprstream-policy.service hyprstream-discovery.service",
+        "hyprstream-policy.service hyprstream-discovery.service",
+    ),
+}
 
 
 class HarnessError(RuntimeError):
@@ -103,6 +135,11 @@ class OwnedRun:
         self.context: dict[str, Any] = {}
         self.cleanup_armed = False
         self.closed = False
+        self.task_fd: int | None = None
+        self.run_fd: int | None = None
+        self.task_identity: tuple[int, int] | None = None
+        self.run_identity: tuple[int, int] | None = None
+        self.marker_identity: tuple[int, int] | None = None
 
     def __enter__(self) -> "OwnedRun":
         root_info = _lstat_directory(self.task_root, "task root")
@@ -111,6 +148,15 @@ class OwnedRun:
             _fail("task root must be owned by the current uid")
         if stat.S_IMODE(root_info.st_mode) & 0o077:
             _fail("task root must not grant group/other permissions")
+        directory_flags = os.O_RDONLY | os.O_DIRECTORY
+        if hasattr(os, "O_NOFOLLOW"):
+            directory_flags |= os.O_NOFOLLOW
+        self.task_fd = os.open(self.task_root, directory_flags)
+        task_fd_info = os.fstat(self.task_fd)
+        self.task_identity = (task_fd_info.st_dev, task_fd_info.st_ino)
+        if self.task_identity != (root_info.st_dev, root_info.st_ino):
+            self._close_cleanup_fds()
+            _fail("task root identity changed while opening it")
 
         # Cleanup is armed before mkdtemp performs the first run mutation.
         self.cleanup_armed = True
@@ -120,7 +166,16 @@ class OwnedRun:
                 tempfile.mkdtemp(prefix=f"run-{self.run_id}-", dir=self.task_root)
             )
             os.chmod(self.run_root, 0o700)
+            self.run_fd = os.open(
+                self.run_root.name, directory_flags, dir_fd=self.task_fd
+            )
+            run_info = os.fstat(self.run_fd)
+            self.run_identity = (run_info.st_dev, run_info.st_ino)
             self._write_owned_file("owner.marker", self.marker_nonce.encode() + b"\n")
+            marker_info = os.stat(
+                "owner.marker", dir_fd=self.run_fd, follow_symlinks=False
+            )
+            self.marker_identity = (marker_info.st_dev, marker_info.st_ino)
 
             xdg: dict[str, str] = {}
             for env_name, relative in (
@@ -169,7 +224,7 @@ class OwnedRun:
             raise
 
     def _write_owned_file(self, relative: str, content: bytes) -> Path:
-        if self.run_root is None:
+        if self.run_root is None or self.run_fd is None:
             _fail("run root has not been created")
         if not SAFE_NAME.fullmatch(relative):
             _fail(f"unsafe owned-file name: {relative}")
@@ -177,36 +232,49 @@ class OwnedRun:
         flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
         if hasattr(os, "O_NOFOLLOW"):
             flags |= os.O_NOFOLLOW
-        fd = os.open(destination, flags, 0o600)
+        fd = os.open(relative, flags, 0o600, dir_fd=self.run_fd)
         try:
             os.write(fd, content)
             os.fsync(fd)
+            info = os.fstat(fd)
         finally:
             os.close(fd)
-        if stat.S_IMODE(destination.lstat().st_mode) != 0o600:
+        if not stat.S_ISREG(info.st_mode) or stat.S_IMODE(info.st_mode) != 0o600:
             _fail(f"owned file mode is not 0600: {destination}")
         return destination
 
     def write_secret(self, name: str, content: bytes) -> Path:
-        if self.run_root is None:
+        if self.run_root is None or self.run_fd is None:
             _fail("run root has not been created")
         if not SAFE_NAME.fullmatch(name):
             _fail(f"unsafe secret name: {name}")
         secrets = self.run_root / "secrets"
-        info = _lstat_directory(secrets, "secret directory")
+        directory_flags = os.O_RDONLY | os.O_DIRECTORY
+        if hasattr(os, "O_NOFOLLOW"):
+            directory_flags |= os.O_NOFOLLOW
+        secrets_fd = os.open("secrets", directory_flags, dir_fd=self.run_fd)
+        info = os.fstat(secrets_fd)
         if info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o700:
+            os.close(secrets_fd)
             _fail("secret directory ownership/mode changed")
         flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
         if hasattr(os, "O_NOFOLLOW"):
             flags |= os.O_NOFOLLOW
         destination = secrets / name
-        fd = os.open(destination, flags, 0o600)
         try:
-            os.write(fd, content)
-            os.fsync(fd)
+            fd = os.open(name, flags, 0o600, dir_fd=secrets_fd)
+            try:
+                os.write(fd, content)
+                os.fsync(fd)
+                secret_info = os.fstat(fd)
+            finally:
+                os.close(fd)
         finally:
-            os.close(fd)
-        if stat.S_IMODE(destination.lstat().st_mode) != 0o600:
+            os.close(secrets_fd)
+        if (
+            not stat.S_ISREG(secret_info.st_mode)
+            or stat.S_IMODE(secret_info.st_mode) != 0o600
+        ):
             _fail("secret file mode is not 0600")
         return destination
 
@@ -220,53 +288,147 @@ class OwnedRun:
         return environment
 
     def _cleanup_incomplete(self) -> None:
-        for reservation in self.sockets:
-            reservation.close()
-        self.sockets.clear()
-        if self.run_root is None:
-            self.closed = True
-            return
-        try:
-            info = self.run_root.lstat()
-        except FileNotFoundError:
-            self.closed = True
-            return
-        if not stat.S_ISDIR(info.st_mode):
-            _fail("incomplete run root was replaced; refusing cleanup")
-        if (
-            self.run_root.parent != self.task_root
-            or info.st_uid != os.getuid()
-            or stat.S_IMODE(info.st_mode) != 0o700
-        ):
-            _fail("incomplete run ownership changed; refusing cleanup")
-        shutil.rmtree(self.run_root)
-        self.closed = True
+        self._cleanup_owned_run("incomplete")
 
     def close(self) -> None:
         if self.closed or not self.cleanup_armed:
             return
+        self._cleanup_owned_run("completed")
+
+    @staticmethod
+    def _remove_tree_at(directory_fd: int) -> None:
+        """Remove only entries reachable through an already verified directory fd."""
+        directory_flags = os.O_RDONLY | os.O_DIRECTORY
+        if hasattr(os, "O_NOFOLLOW"):
+            directory_flags |= os.O_NOFOLLOW
+        for name in os.listdir(directory_fd):
+            info = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+            if stat.S_ISDIR(info.st_mode):
+                child_fd = os.open(name, directory_flags, dir_fd=directory_fd)
+                try:
+                    child_info = os.fstat(child_fd)
+                    if (child_info.st_dev, child_info.st_ino) != (
+                        info.st_dev,
+                        info.st_ino,
+                    ):
+                        _fail("run child identity changed; refusing cleanup")
+                    OwnedRun._remove_tree_at(child_fd)
+                    current = os.stat(
+                        name, dir_fd=directory_fd, follow_symlinks=False
+                    )
+                    if (current.st_dev, current.st_ino) != (
+                        info.st_dev,
+                        info.st_ino,
+                    ):
+                        _fail("run child was substituted; refusing cleanup")
+                    os.rmdir(name, dir_fd=directory_fd)
+                finally:
+                    os.close(child_fd)
+            else:
+                os.unlink(name, dir_fd=directory_fd)
+
+    def _close_cleanup_fds(self) -> None:
+        if self.run_fd is not None:
+            os.close(self.run_fd)
+            self.run_fd = None
+        if self.task_fd is not None:
+            os.close(self.task_fd)
+            self.task_fd = None
+
+    def _cleanup_owned_run(self, phase: str) -> None:
         for reservation in self.sockets:
             reservation.close()
         self.sockets.clear()
-        if self.run_root is not None:
-            try:
-                run_info = self.run_root.lstat()
-            except FileNotFoundError:
-                self.closed = True
-                return
-            if not stat.S_ISDIR(run_info.st_mode):
-                _fail("run root was replaced; refusing cleanup")
+        if self.run_root is None:
+            self._close_cleanup_fds()
+            self.closed = True
+            return
+        try:
+            if (
+                self.task_fd is None
+                or self.run_fd is None
+                or self.task_identity is None
+                or self.run_identity is None
+                or self.marker_identity is None
+            ):
+                _fail(f"{phase} cleanup lacks captured ownership identity")
             _reject_symlink_components(self.run_root)
-            marker = self.run_root / "owner.marker"
-            info = _lstat_regular(marker, "run ownership marker")
-            if info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o600:
-                _fail("run ownership marker ownership/mode changed; refusing cleanup")
-            if marker.read_text(encoding="utf-8") != self.marker_nonce + "\n":
-                _fail("run ownership marker content changed; refusing cleanup")
+            try:
+                current_task = self.task_root.lstat()
+            except FileNotFoundError:
+                _fail(f"{phase} task root is missing; refusing cleanup")
+            task_fd_info = os.fstat(self.task_fd)
+            if (
+                (current_task.st_dev, current_task.st_ino) != self.task_identity
+                or (task_fd_info.st_dev, task_fd_info.st_ino)
+                != self.task_identity
+            ):
+                _fail(f"{phase} task-root identity changed; refusing cleanup")
             if self.run_root.parent != self.task_root:
-                _fail("run root escaped its task root; refusing cleanup")
-            shutil.rmtree(self.run_root)
-        self.closed = True
+                _fail(f"{phase} run root escaped its task root; refusing cleanup")
+            try:
+                run_info = os.stat(
+                    self.run_root.name,
+                    dir_fd=self.task_fd,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                _fail(f"{phase} run root is missing; refusing cleanup")
+            run_fd_info = os.fstat(self.run_fd)
+            if not stat.S_ISDIR(run_info.st_mode) or (
+                run_info.st_dev,
+                run_info.st_ino,
+            ) != self.run_identity:
+                _fail(f"{phase} run root was substituted; refusing cleanup")
+            if (run_fd_info.st_dev, run_fd_info.st_ino) != self.run_identity:
+                _fail(f"{phase} run directory fd identity changed")
+            if (
+                run_info.st_uid != os.getuid()
+                or stat.S_IMODE(run_info.st_mode) != 0o700
+            ):
+                _fail(f"{phase} run ownership changed; refusing cleanup")
+            try:
+                marker_info = os.stat(
+                    "owner.marker", dir_fd=self.run_fd, follow_symlinks=False
+                )
+            except FileNotFoundError:
+                _fail(f"{phase} ownership marker is missing; refusing cleanup")
+            if not stat.S_ISREG(marker_info.st_mode) or (
+                marker_info.st_dev,
+                marker_info.st_ino,
+            ) != self.marker_identity:
+                _fail(f"{phase} ownership marker changed; refusing cleanup")
+            if (
+                marker_info.st_uid != os.getuid()
+                or stat.S_IMODE(marker_info.st_mode) != 0o600
+            ):
+                _fail("run ownership marker ownership/mode changed; refusing cleanup")
+            marker_fd = os.open(
+                "owner.marker",
+                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=self.run_fd,
+            )
+            try:
+                marker_content = os.read(marker_fd, 4097)
+                if os.read(marker_fd, 1):
+                    _fail("run ownership marker is too large; refusing cleanup")
+            finally:
+                os.close(marker_fd)
+            if marker_content != (self.marker_nonce + "\n").encode():
+                _fail("run ownership marker content changed; refusing cleanup")
+            self._remove_tree_at(self.run_fd)
+            current_run = os.stat(
+                self.run_root.name,
+                dir_fd=self.task_fd,
+                follow_symlinks=False,
+            )
+            if (current_run.st_dev, current_run.st_ino) != self.run_identity:
+                _fail(f"{phase} run root changed during cleanup; refusing removal")
+            os.rmdir(self.run_root.name, dir_fd=self.task_fd)
+            self.closed = True
+        finally:
+            self._close_cleanup_fds()
+            self.closed = True
 
     def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
         self.close()
@@ -325,85 +487,286 @@ def _read_json(path: Path, description: str) -> dict[str, Any]:
     return value
 
 
+def _canonical_inference_contract() -> dict[str, Any]:
+    return _read_json(
+        Path(__file__).with_name("fixtures") / "ingest-inference-contract-v1.json",
+        "bundled reviewed ingest inference contract",
+    )
+
+
 def validate_inference_contract(contract: dict[str, Any]) -> str:
-    if contract.get("contract_version") != "v1":
-        _fail("inference contract_version must be v1")
-    if contract.get("implementation_merge") != (
-        "6440b151dcc0238a0f92d877f2052ce2271395d8"
-    ):
-        _fail("inference implementation merge is not the reviewed v1 revision")
-    if contract.get("deployment_source_revision") != (
-        "995fc622ae08b2baa1983646419ecccf4fe6a386"
-    ):
-        _fail("inference deployment source is not the reviewed v1 revision")
-    contract_evidence = contract.get("contract_evidence")
-    if contract_evidence != {
-        "document_id": "inference-service-to-metal-runtime-contract-2026-07-26",
-        "producer_prs": {
-            "implementation": 1356,
-            "publisher": 1358,
-            "immutable_index": 1360,
-        },
-    }:
-        _fail("inference contract evidence is not the reviewed v1 evidence")
-    image = contract.get("image")
-    if not isinstance(image, dict):
-        _fail("inference image contract is missing")
-    digest = image.get("index_digest")
-    image_reference = f"{image.get('repository')}@{digest}"
-    if not IMMUTABLE_IMAGE.fullmatch(image_reference):
-        _fail("inference image must be an immutable digest reference")
-    evidence = image.get("publisher_evidence")
-    if (
-        not isinstance(evidence, dict)
-        or evidence.get("status") != "verified"
-        or not isinstance(evidence.get("reference"), str)
-        or not evidence["reference"].startswith("https://")
-    ):
-        _fail("inference publisher evidence must be verified")
-    services = contract.get("services")
+    canonical = _canonical_inference_contract()
+    if set(contract) != set(canonical):
+        _fail("inference top-level key set is not the exact reviewed v1 schema")
+    if contract != canonical:
+        _fail("inference contract values are not the exact reviewed v1 artifact")
+    services = contract["services"]
     if not isinstance(services, list) or len(services) != 2:
         _fail("inference contract must contain exactly two services")
-    seen_ports: set[int] = set()
-    seen_sockets: set[str] = set()
+    expected_service_keys = set(canonical["services"][0])
     for replica, service in enumerate(services):
-        if not isinstance(service, dict):
-            _fail("inference service entry must be an object")
-        expected_name = f"inference-cpu-{replica}"
-        if service.get("replica") != replica:
-            _fail("inference replicas must be ordered 0, 1")
-        for field in ("inference_service_id", "unit_name", "container_name"):
-            if service.get(field) != expected_name:
-                _fail(f"inference {field} must be {expected_name}")
-        endpoint = service.get("listen_endpoint", {})
-        if endpoint != {
-            "transport": "udp",
-            "address": "0.0.0.0",
-            "port": 7440 + replica,
-        }:
-            _fail(f"inference replica {replica} listen endpoint is not exact")
-        port = endpoint["port"]
-        if port in seen_ports:
-            _fail("inference listen ports must be unique")
-        seen_ports.add(port)
-        health = service.get("health_endpoint", {})
-        expected_socket = f"{expected_name}.sock"
-        if health != {
-            "transport": "authenticated-inference-ipc",
-            "socket": expected_socket,
-        }:
-            _fail(f"inference replica {replica} health endpoint is not exact")
-        if expected_socket in seen_sockets:
-            _fail("inference health sockets must be unique")
-        seen_sockets.add(expected_socket)
-        probe = service.get("direct_probe")
-        if probe != {
-            "authentication_scope": "query",
-            "readiness_expectation": "isReady=true",
-            "health_expectation": "modelLoaded=true,status=ok",
-        }:
-            _fail(f"inference replica {replica} direct probe schema is not exact")
+        if not isinstance(service, dict) or set(service) != expected_service_keys:
+            _fail(
+                f"inference replica {replica} key set is not the exact reviewed schema"
+            )
+        if service != canonical["services"][replica]:
+            _fail(f"inference replica {replica} values are not exact")
+    image = contract["image"]
+    image_reference = f"{image['repository']}@{image['index_digest']}"
+    if not IMMUTABLE_IMAGE.fullmatch(image_reference):
+        _fail("inference image must be an immutable digest reference")
     return image_reference
+
+
+def _read_bytes(path: Path, description: str) -> bytes:
+    _reject_symlink_components(path)
+    _lstat_regular(path, description)
+    try:
+        return path.read_bytes()
+    except OSError as error:
+        _fail(f"could not read {description}: {error}")
+
+
+def _parse_review_record(path: Path, expected_sha: str) -> tuple[str, str, bytes]:
+    content = _read_bytes(path, "independent review record")
+    try:
+        lines = content.decode("utf-8").splitlines()
+    except UnicodeDecodeError as error:
+        _fail(f"independent review record is not UTF-8: {error}")
+    expected_prefix = (
+        f"PASS {expected_sha}",
+        "Review-Schema: independent-review-v1",
+    )
+    if tuple(lines[:2]) != expected_prefix or len(lines) < 4:
+        _fail(
+            "every independent review must begin with exact PASS SHA and "
+            "independent-review-v1 schema"
+        )
+    fields: dict[str, str] = {}
+    for line in lines[2:4]:
+        if ": " not in line:
+            _fail("review identity header is malformed")
+        key, value = line.split(": ", 1)
+        if key in fields:
+            _fail("review identity header is duplicated")
+        fields[key] = value
+    if set(fields) != {"Reviewer-Identity", "Review-Seat"}:
+        _fail("review identity header keys are not exact")
+    reviewer = fields["Reviewer-Identity"]
+    seat = fields["Review-Seat"]
+    if not REVIEW_IDENTITY.fullmatch(reviewer) or not REVIEW_IDENTITY.fullmatch(seat):
+        _fail("reviewer and seat identities must be structured safe identifiers")
+    return reviewer, seat, hashlib.sha256(content).digest()
+
+
+def _parse_quadlet(
+    text: str, description: str
+) -> list[tuple[str, list[tuple[str, str]]]]:
+    sections: list[tuple[str, list[tuple[str, str]]]] = []
+    seen_sections: set[str] = set()
+    current: list[tuple[str, str]] | None = None
+    seen_keys: set[str] = set()
+    repeated_values: dict[str, set[str]] = {}
+    for line_number, raw_line in enumerate(text.splitlines(), 1):
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        section_match = re.fullmatch(r"\[([A-Za-z][A-Za-z0-9]*)\]", line)
+        if section_match:
+            section = section_match.group(1)
+            if section in seen_sections:
+                _fail(f"{description} has duplicate [{section}] section")
+            seen_sections.add(section)
+            current = []
+            sections.append((section, current))
+            seen_keys = set()
+            repeated_values = {}
+            continue
+        if current is None or "=" not in line:
+            _fail(f"{description}:{line_number} is not a canonical directive")
+        key, value = line.split("=", 1)
+        if not re.fullmatch(r"[A-Za-z][A-Za-z0-9]*", key) or not value:
+            _fail(f"{description}:{line_number} has an invalid key/value")
+        if key in seen_keys and key not in REPEATABLE_QUADLET_KEYS:
+            _fail(f"{description} has duplicate {key}= directive")
+        if key in REPEATABLE_QUADLET_KEYS:
+            values = repeated_values.setdefault(key, set())
+            if value in values:
+                _fail(f"{description} repeats an identical {key}= directive")
+            values.add(value)
+        seen_keys.add(key)
+        current.append((key, value))
+    return sections
+
+
+def _quadlet_fields(
+    parsed: list[tuple[str, list[tuple[str, str]]]], section_name: str
+) -> list[tuple[str, str]]:
+    for name, fields in parsed:
+        if name == section_name:
+            return fields
+    _fail(f"Quadlet is missing [{section_name}]")
+
+
+def _render_source_template(
+    template: str, values: dict[str, str], description: str
+) -> str:
+    placeholders = set(re.findall(r"\$\{([a-z0-9_]+)\}", template))
+    if placeholders != set(values):
+        _fail(
+            f"{description} source template placeholders are not exact: "
+            f"{sorted(placeholders)}"
+        )
+    rendered = template
+    for key, value in values.items():
+        if "\n" in value or "\r" in value or "${" in value:
+            _fail(f"{description} render value for {key} is unsafe")
+        rendered = rendered.replace(f"${{{key}}}", value)
+    return rendered
+
+
+def _expected_quadlet_sections(
+    service: str,
+    image: str,
+    extra_environment: list[str],
+) -> list[tuple[str, list[tuple[str, str]]]]:
+    after, requires = QUADLET_DEPENDENCIES[service]
+    unit = [("Description", QUADLET_DESCRIPTIONS[service]), ("After", after)]
+    if requires is not None:
+        unit.append(("Requires", requires))
+    container = [
+        ("Image", image),
+        ("ContainerName", f"hyprstream-{service}"),
+        ("Network", "host"),
+        ("Volume", "hyprstream-ipc.volume:/run/hyprstream"),
+        ("Volume", "/var/lib/hyprstream:/var/lib/hyprstream:z"),
+        ("EnvironmentFile", "/var/lib/hyprstream/hyprstream.env"),
+        *(("Environment", value) for value in extra_environment),
+        ("Exec", f"service start {service} --foreground --ipc"),
+        ("AutoUpdate", "registry"),
+    ]
+    return [
+        ("Unit", unit),
+        ("Container", container),
+        ("Service", [("Restart", "always")]),
+        ("Install", [("WantedBy", "default.target")]),
+    ]
+
+
+def _validate_rendered_quadlets(
+    source_root: Path, render_dir: Path, image: str
+) -> list[str]:
+    expected_files = {filename for filename, _ in CORE_SERVICES}
+    expected_files.add("hyprstream-ipc.volume")
+    actual_files = {entry.name for entry in render_dir.iterdir()}
+    if actual_files != expected_files:
+        _fail(
+            "rendered Quadlet file set is not exact; "
+            f"unexpected/missing={sorted(actual_files ^ expected_files)}"
+        )
+    template_root = source_root / QUADLET_TEMPLATE_RELATIVE
+    _reject_symlink_components(template_root)
+    _lstat_directory(template_root, "ingest Quadlet template directory")
+    rendered_services: list[str] = []
+    for filename, service in CORE_SERVICES:
+        path = render_dir / filename
+        text = _read_bytes(path, f"rendered {service} Quadlet").decode("utf-8")
+        if re.search(r"\$\{[^}]+\}|@@[A-Z_]+@@", text):
+            _fail(f"rendered {service} Quadlet contains an unresolved placeholder")
+        parsed = _parse_quadlet(text, f"rendered {service} Quadlet")
+        container = _quadlet_fields(parsed, "Container")
+        environment = [value for key, value in container if key == "Environment"]
+        template_values = {"hyprstream_image": image}
+        if service == "model":
+            if len(environment) != 2:
+                _fail("rendered model Quadlet must have exactly two model inputs")
+            expected_prefixes = (
+                "HYPRSTREAM__MODELS__DEFAULT=",
+                "HYPRSTREAM__MODELS__REPOSITORY=",
+            )
+            model_values: list[str] = []
+            for entry, prefix in zip(environment, expected_prefixes, strict=True):
+                if not entry.startswith(prefix):
+                    _fail("rendered model environment inputs are not exact")
+                model_values.append(entry.removeprefix(prefix))
+            if (
+                model_values[0] != model_values[1]
+                or "synthetic" not in model_values[0]
+                or not re.fullmatch(
+                    r"model://[a-z0-9][a-z0-9._/-]*", model_values[0]
+                )
+            ):
+                _fail("rendered model fixture must be one synthetic model reference")
+            template_values["synthetic_model_fixture"] = model_values[0]
+        elif service == "oauth":
+            if len(environment) != 6:
+                _fail("rendered OAuth Quadlet must have exactly six TLS inputs")
+            environment_map: dict[str, str] = {}
+            for entry in environment:
+                if "=" not in entry:
+                    _fail("rendered OAuth environment input is malformed")
+                key, value = entry.split("=", 1)
+                if key in environment_map:
+                    _fail("rendered OAuth environment key is duplicated")
+                environment_map[key] = value
+            expected_environment_keys = {
+                "HYPRSTREAM__TLS__ENABLED",
+                "HYPRSTREAM__TLS__MODE",
+                "HYPRSTREAM__TLS__SERVER_NAME",
+                "HYPRSTREAM__TLS__ACME_DOMAIN",
+                "HYPRSTREAM__TLS__ACME_CONTACT",
+                "HYPRSTREAM__TLS__ACME_CACHE_DIR",
+            }
+            if set(environment_map) != expected_environment_keys:
+                _fail("rendered OAuth TLS environment key set is not exact")
+            hostname = environment_map["HYPRSTREAM__TLS__SERVER_NAME"]
+            contact = environment_map["HYPRSTREAM__TLS__ACME_CONTACT"]
+            if (
+                environment_map["HYPRSTREAM__TLS__ENABLED"] != "true"
+                or environment_map["HYPRSTREAM__TLS__MODE"] != "acme"
+                or environment_map["HYPRSTREAM__TLS__ACME_DOMAIN"] != hostname
+                or environment_map["HYPRSTREAM__TLS__ACME_CACHE_DIR"]
+                != "/var/lib/hyprstream/acme"
+                or not re.fullmatch(
+                    r"(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+"
+                    r"staging\.lab\.hyprstream\.com",
+                    hostname,
+                )
+                or not re.fullmatch(r"mailto:[^@\s]+@[^@\s]+\.[^@\s]+", contact)
+            ):
+                _fail("rendered OAuth TLS/trust inputs are not exact")
+            template_values["hyprstream_discovery_hostname"] = hostname
+            template_values["hyprstream_acme_email"] = contact.removeprefix("mailto:")
+        elif environment:
+            _fail(f"rendered {service} Quadlet has unexpected environment inputs")
+        expected_sections = _expected_quadlet_sections(service, image, environment)
+        if parsed != expected_sections:
+            _fail(f"rendered {service} Quadlet directives are not exact")
+        template_path = template_root / f"{filename}.tftpl"
+        template = _read_bytes(
+            template_path, f"ingest source template for {service}"
+        ).decode("utf-8")
+        expected_render = _render_source_template(
+            template, template_values, f"ingest {service} template"
+        )
+        if text != expected_render:
+            _fail(
+                f"rendered {service} Quadlet is not byte-canonical to ingest source"
+            )
+        rendered_services.append(service)
+    volume_path = render_dir / "hyprstream-ipc.volume"
+    volume_text = _read_bytes(volume_path, "rendered IPC volume").decode("utf-8")
+    if _parse_quadlet(volume_text, "rendered IPC volume") != [
+        ("Volume", [("Driver", "local")])
+    ]:
+        _fail("rendered IPC volume directives are not exact")
+    volume_template = _read_bytes(
+        template_root / "hyprstream-ipc.volume.tftpl",
+        "ingest source IPC volume template",
+    ).decode("utf-8")
+    if volume_text != volume_template:
+        _fail("rendered IPC volume is not byte-canonical to ingest source")
+    return rendered_services
 
 
 def verify_ingest_contract(
@@ -423,74 +786,61 @@ def verify_ingest_contract(
         _lstat_directory(path, description)
     if len(review_records) < 2 or len(set(review_records)) != len(review_records):
         _fail("at least two distinct independent review records are required")
-    for review_record in review_records:
-        _reject_symlink_components(review_record)
-        _lstat_regular(review_record, "independent review record")
 
     head = _run_git(source_root, "rev-parse", "HEAD")
     if head != expected_sha:
         _fail(f"ingest checkout head {head} does not match {expected_sha}")
     if _run_git(source_root, "status", "--porcelain=v1", "--untracked-files=all"):
         _fail("ingest checkout must be completely clean")
+    review_file_identities: set[tuple[int, int]] = set()
+    review_digests: set[bytes] = set()
+    reviewer_identities: set[str] = set()
+    review_seats: set[str] = set()
     for review_record in review_records:
-        review_lines = review_record.read_text(encoding="utf-8").splitlines()
-        if not review_lines:
-            _fail("independent review record is empty")
-        first_line = review_lines[0]
-        if first_line != f"PASS {expected_sha}":
-            _fail(
-                "every independent review first line must be exactly "
-                "PASS <expected-sha>"
-            )
+        _reject_symlink_components(review_record)
+        info = _lstat_regular(review_record, "independent review record")
+        reviewer, seat, digest = _parse_review_record(review_record, expected_sha)
+        review_file_identities.add((info.st_dev, info.st_ino))
+        review_digests.add(digest)
+        reviewer_identities.add(reviewer)
+        review_seats.add(seat)
+    review_count = len(review_records)
+    if len(review_file_identities) != review_count:
+        _fail("independent review records must have distinct device/inode identity")
+    if len(review_digests) != review_count:
+        _fail("independent review records must have distinct content digests")
+    if len(reviewer_identities) != review_count or len(review_seats) != review_count:
+        _fail("independent reviews require distinct reviewer and seat identities")
 
-    image_references: set[str] = set()
-    rendered_services: list[str] = []
-    for filename, service in CORE_SERVICES:
-        path = render_dir / filename
-        _reject_symlink_components(path)
-        _lstat_regular(path, f"rendered {service} Quadlet")
-        text = path.read_text(encoding="utf-8")
-        if re.search(r"\$\{[^}]+\}|@@[A-Z_]+@@", text):
-            _fail(f"rendered {service} Quadlet contains an unresolved placeholder")
-        exact_lines = set(text.splitlines())
-        required = {
-            f"ContainerName=hyprstream-{service}",
-            "Volume=hyprstream-ipc.volume:/run/hyprstream",
-            f"Exec=service start {service} --foreground --ipc",
-        }
-        missing = sorted(required - exact_lines)
-        if missing:
-            _fail(f"rendered {service} Quadlet is missing exact lines: {missing}")
-        image_lines = [
-            line.removeprefix("Image=")
-            for line in text.splitlines()
-            if line.startswith("Image=")
-        ]
-        if len(image_lines) != 1 or not IMMUTABLE_IMAGE.fullmatch(image_lines[0]):
-            _fail(f"rendered {service} Quadlet must name one immutable image")
-        image_references.add(image_lines[0])
-        rendered_services.append(service)
-    if len(image_references) != 1:
-        _fail("all rendered core services must use one immutable image")
-
-    volume = render_dir / "hyprstream-ipc.volume"
-    _reject_symlink_components(volume)
-    _lstat_regular(volume, "rendered IPC volume")
-    if "[Volume]" not in volume.read_text(encoding="utf-8").splitlines():
-        _fail("rendered IPC volume is not a Quadlet volume")
-
+    bundled_contract_path = (
+        Path(__file__).with_name("fixtures") / "ingest-inference-contract-v1.json"
+    )
+    source_contract_path = source_root / INFERENCE_CONTRACT_RELATIVE
+    bundled_bytes = _read_bytes(
+        bundled_contract_path, "bundled reviewed ingest inference contract"
+    )
+    source_bytes = _read_bytes(
+        source_contract_path, "ingest-owned versioned inference contract"
+    )
+    supplied_bytes = _read_bytes(
+        inference_contract_path, "rendered versioned inference contract"
+    )
+    if source_bytes != bundled_bytes:
+        _fail("ingest-owned inference artifact is not the reviewed v1 artifact")
+    if supplied_bytes != source_bytes:
+        _fail("rendered inference artifact is not byte-exact to ingest source")
     inference_contract = _read_json(
-        inference_contract_path, "versioned inference contract"
+        inference_contract_path, "rendered versioned inference contract"
     )
     inference_image = validate_inference_contract(inference_contract)
-    core_image = next(iter(image_references))
-    if inference_image != core_image:
-        _fail("core and inference contracts must pin the same immutable image")
+    rendered_services = _validate_rendered_quadlets(
+        source_root, render_dir, inference_image
+    )
     return {
         "contract_version": "ingest-render-v1",
         "source_sha": expected_sha,
         "core_services": rendered_services,
-        "core_image": core_image,
+        "core_image": inference_image,
         "inference_services": ["inference-cpu-0", "inference-cpu-1"],
     }
 

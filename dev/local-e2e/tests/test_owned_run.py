@@ -4,6 +4,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import shutil
 import socket
 import stat
 import tempfile
@@ -68,6 +69,76 @@ class OwnedRunTests(unittest.TestCase):
             self.assertEqual(stat.S_IMODE(context_path.lstat().st_mode), 0o600)
             parsed = json.loads(context_path.read_text(encoding="utf-8"))
             self.assertNotIn("secret", json.dumps(parsed).lower())
+
+    def _initialization_failure(self, mutation) -> None:
+        class FailingRun(HARNESS.OwnedRun):
+            def _write_owned_file(self, relative: str, content: bytes) -> Path:
+                if relative == "context.json":
+                    mutation(self)
+                    raise RuntimeError("injected initialization failure")
+                return super()._write_owned_file(relative, content)
+
+        with self.assertRaises(HARNESS.HarnessError):
+            FailingRun(self.task_root).__enter__()
+
+    def test_initialization_failure_rejects_missing_and_changed_marker(self) -> None:
+        for action in ("missing", "changed"):
+            with self.subTest(action=action):
+                leaked: list[Path] = []
+
+                def mutate(run) -> None:
+                    assert run.run_root is not None
+                    leaked.append(run.run_root)
+                    marker = run.run_root / "owner.marker"
+                    if action == "missing":
+                        marker.unlink()
+                    else:
+                        marker.write_text("wrong nonce\n", encoding="utf-8")
+
+                self._initialization_failure(mutate)
+                self.assertEqual(len(leaked), 1)
+                self.assertTrue(leaked[0].is_dir())
+                shutil.rmtree(leaked[0])
+
+    def test_initialization_failure_rejects_directory_substitution(self) -> None:
+        original = self.task_root / "preserved-original"
+        replacement: list[Path] = []
+
+        def mutate(run) -> None:
+            assert run.run_root is not None
+            run.run_root.rename(original)
+            run.run_root.mkdir(mode=0o700)
+            (run.run_root / "canary").write_text("preserve\n", encoding="utf-8")
+            replacement.append(run.run_root)
+
+        self._initialization_failure(mutate)
+        self.assertTrue(original.is_dir())
+        self.assertEqual(
+            (replacement[0] / "canary").read_text(encoding="utf-8"), "preserve\n"
+        )
+        shutil.rmtree(original)
+        shutil.rmtree(replacement[0])
+
+    def test_initialization_failure_rejects_ancestor_symlink_substitution(self) -> None:
+        original_task = self.task_root.with_name("task-preserved")
+        decoy = self.task_root.with_name("task-decoy")
+        original_runs: list[Path] = []
+
+        def mutate(run) -> None:
+            assert run.run_root is not None
+            original_runs.append(run.run_root)
+            self.task_root.rename(original_task)
+            decoy.mkdir(mode=0o700)
+            self.task_root.symlink_to(decoy, target_is_directory=True)
+
+        self._initialization_failure(mutate)
+        self.assertTrue(self.task_root.is_symlink())
+        self.assertTrue(
+            (original_task / original_runs[0].name / "owner.marker").is_file()
+        )
+        self.task_root.unlink()
+        shutil.rmtree(original_task)
+        shutil.rmtree(decoy)
 
 
 if __name__ == "__main__":

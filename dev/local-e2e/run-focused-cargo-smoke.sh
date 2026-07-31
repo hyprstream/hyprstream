@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Invoked once inside the shared build-helper lease by run-offline-smoke.sh.
+# Invoked once inside the fleet BuildQ lease by run-offline-smoke.sh.
 set -Eeuo pipefail
 
 umask 077

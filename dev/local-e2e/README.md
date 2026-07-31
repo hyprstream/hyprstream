@@ -19,15 +19,20 @@ review records `PASS`.
 - unique run IDs, XDG roots, unit projections, and held loopback ports;
 - mode-0600, no-follow secret files and symlink rejection;
 - cleanup that requires an exact regular-file ownership marker;
-- exact rendered core graph validation for Event, Policy, Discovery, Registry,
-  Streams, Model, OAI, and OAuth;
-- the separate versioned two-replica inference contract;
-- wrong-image, wrong-port, missing-service, dirty-source, and non-PASS-review
-  negatives;
+- identical device/inode, content-digest, structured reviewer, and review-seat
+  rejection across exact-head PASS records;
+- parsed and byte-canonical rendered core graph validation against ingest-owned
+  templates for Event, Policy, Discovery, Registry, Streams, Model, OAI, and
+  OAuth;
+- byte-exact comparison of the separate versioned two-replica inference
+  artifact against both ingest source and the reviewed bundled v1 artifact;
+- deletion/mutation of every inference field plus duplicate command/key,
+  extra-volume/directive/file, wrong-dependency, stale/mixed-head, hard-link,
+  copied-review, and initialization-substitution negatives;
 - exact transport/HTTP/RPC response classes and JSON schemas.
 
 `run-offline-smoke.sh` additionally runs focused Rust tests against the current
-checkout with `Cargo.lock` and `--locked` through the shared build helper. The
+checkout with `Cargo.lock` and `--locked` through the fleet BuildQ wrapper. The
 tests cover positive and negative trust-directory selection, symlink/writable
 trust rejection, positive and wrong-pin TLS transport behavior, exact
 service-auth/session response behavior, authenticated session success/replay
@@ -69,14 +74,18 @@ python3 dev/local-e2e/causal_harness.py verify-ingest \
 Requirements:
 
 - the source checkout is clean and exactly at `FULL_SHA`;
-- two distinct independent reviews each start with exactly `PASS FULL_SHA`;
+- two independent reviews have distinct device/inode identities, SHA-256
+  digests, reviewer identities, and seat identities; each starts with
+  `PASS FULL_SHA`, `Review-Schema: independent-review-v1`,
+  `Reviewer-Identity: ID`, and `Review-Seat: ID`;
 - every path component and input is non-symlink;
-- all eight concrete core Quadlets use one immutable digest and the exact
-  ingest service commands/shared IPC volume;
+- the rendered file set is exact, and all eight concrete core Quadlets parse to
+  the unique canonical sections/directives and are byte-exact renders of the
+  templates in that ingest checkout;
 - no template placeholder remains;
-- the separate inference contract is version `v1`, pins the reviewed
-  implementation/image evidence, and contains exactly replicas 0/1 with
-  ports 7440/7441 and the reviewed authenticated readiness/health schemas.
+- the separate inference document is byte-exact to both the ingest-owned
+  versioned artifact and this adapter's reviewed v1 fixture, including every
+  top-level, lifecycle/routing, image/evidence, and per-replica field.
 
 Until ingest !100 has a reviewed final artifact, this command must fail and PR
 #1383 is not merge-ready. Inference application output remains a separate
