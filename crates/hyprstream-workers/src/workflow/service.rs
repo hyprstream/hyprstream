@@ -117,6 +117,23 @@ pub struct WorkflowService {
     /// Optional authorization callback (injected by parent crate)
     authorize_fn: Option<AuthorizeFn>,
 
+    /// Expected JWT audience — fed to the envelope-verification layer so a
+    /// JWT-bearing IPC/QUIC request is validated before the policy `authorize`
+    /// callback runs (same seam as `WorkerService`). Without this, JWT-auth
+    /// requests fail at envelope verification with an audience mismatch.
+    expected_audience: Option<String>,
+
+    /// JWT verification key source (local + federated). `None` ⇒ only the
+    /// local bootstrap key is trusted; federated JWTs are rejected.
+    jwt_key_source: Option<std::sync::Arc<dyn hyprstream_rpc::auth::JwtKeySource>>,
+
+    /// Live MCP relay authorization — injected by the factory as a closure over
+    /// the global trust store so `accept_delegated_bearer` consults **current**
+    /// MCP-scope authorization at call time, not a frozen snapshot (#989 review:
+    /// a snapshot permits retired keys forever and rejects keys added after
+    /// factory start). `None` ⇒ fail-closed (no delegation accepted).
+    relay_authorizer: Option<std::sync::Arc<dyn Fn(&[u8; 32]) -> bool + Send + Sync>>,
+
     /// Workflow execution engine
     runner: Option<WorkflowRunner>,
 }
@@ -143,6 +160,9 @@ impl WorkflowService {
             transport,
             signing_key,
             authorize_fn: None,
+            expected_audience: None,
+            jwt_key_source: None,
+            relay_authorizer: None,
             runner: None,
         }
     }
@@ -197,6 +217,35 @@ impl WorkflowService {
     /// Set the authorization callback for policy checks.
     pub fn set_authorize_fn(&mut self, authorize_fn: AuthorizeFn) {
         self.authorize_fn = Some(authorize_fn);
+    }
+
+    /// Set the expected JWT audience for envelope-verification-time validation
+    /// (mirrors `WorkerService::set_expected_audience`). Fed by the factory from
+    /// the OAuth issuer URL so JWT-authenticated IPC/QUIC requests are accepted
+    /// before the per-request policy check.
+    pub fn set_expected_audience(&mut self, audience: String) {
+        self.expected_audience = Some(audience);
+    }
+
+    /// Set the JWT verification key source (local + federated). Fed by the
+    /// factory from the cluster key source.
+    pub fn set_jwt_key_source(
+        &mut self,
+        src: std::sync::Arc<dyn hyprstream_rpc::auth::JwtKeySource>,
+    ) {
+        self.jwt_key_source = Some(src);
+    }
+
+    /// Inject a **live** MCP relay authorizer so `accept_delegated_bearer`
+    /// consults current MCP-scope authorization at call time (not a frozen
+    /// snapshot — retired keys are rejected, new keys accepted after factory
+    /// start). The factory typically passes a closure over the global trust
+    /// store's `is_authorized(key, "mcp")`. `None` (never called) ⇒ fail-closed.
+    pub fn set_relay_authorizer(
+        &mut self,
+        authorizer: std::sync::Arc<dyn Fn(&[u8; 32]) -> bool + Send + Sync>,
+    ) {
+        self.relay_authorizer = Some(authorizer);
     }
 
     /// Initialize the service: scan all registered repos and register their workflows.
@@ -857,6 +906,26 @@ impl RequestService for WorkflowService {
     fn signing_key(&self) -> SigningKey {
         self.signing_key.clone()
     }
+
+    fn expected_audience(&self) -> Option<&str> {
+        self.expected_audience.as_deref()
+    }
+
+    fn jwt_key_source(&self) -> Option<std::sync::Arc<dyn hyprstream_rpc::auth::JwtKeySource>> {
+        self.jwt_key_source.clone()
+    }
+
+    /// Accept delegated-bearer requests by consulting the **live** MCP relay
+    /// authorizer (#989 review). `verify_claims` calls this before policy; the
+    /// default `false` rejects all relayed caller tokens. We delegate to the
+    /// injected authorizer (which checks current MCP-scope authorization) —
+    /// fail-closed when no authorizer is set.
+    fn accept_delegated_bearer(&self, signer_pubkey: &[u8; 32]) -> bool {
+        self.relay_authorizer
+            .as_ref()
+            .map(|f| f(signer_pubkey))
+            .unwrap_or(false)
+    }
 }
 
 /// Extract the `repo_id` from a `workflow_id` following the `repo_id:path`
@@ -911,6 +980,104 @@ mod tests {
     // invariant the dispatch boundary depends on instead.
 
     use hyprstream_vfs::Subject;
+
+    /// #989 review P2-1: the factory must feed the OAuth issuer audience (and
+    /// cluster JWT key source) into `WorkflowService` so JWT-authenticated
+    /// IPC/QUIC requests pass envelope verification *before* the policy
+    /// `authorize` callback. Without the `expected_audience`/`jwt_key_source`
+    /// `RequestService` overrides, both default to `None` and JWT auth fails
+    /// upstream of policy. This pins the audience half of the wiring (the
+    /// `jwt_key_source` half follows the identical field→setter→override
+    /// pattern, compile-checked by the override above; a full round-trip would
+    /// need a `JwtKeySource` stub, deferred).
+    /// #989 review (68d11b838 follow-up): `accept_delegated_bearer` must consult
+    /// a LIVE authorizer, not a frozen key snapshot. These tests inject mock
+    /// authorizers to prove: fail-closed when unset, multi-key acceptance, non-
+    /// MCP rejection, and — critically — that live revocation takes effect
+    /// immediately (no stale snapshot).
+    #[test]
+    fn workflow_accepts_delegated_bearer_from_live_mcp_authorizer() {
+        use super::{SigningKey, WorkflowService};
+        use hyprstream_rpc::service::RequestService;
+        use hyprstream_rpc::transport::TransportConfig;
+
+        let sk = SigningKey::from_bytes(&[0x42; 32]);
+        let mut svc = WorkflowService::new(TransportConfig::inproc("wf-relay-test"), sk);
+
+        // No authorizer set → fail-closed (verify_claims would reject).
+        assert!(!RequestService::accept_delegated_bearer(&svc, &[0u8; 32]));
+
+        // Inject a live authorizer accepting two MCP keys.
+        let key_a = [0xAB; 32];
+        let key_b = [0xCD; 32];
+        svc.set_relay_authorizer(std::sync::Arc::new(move |pk: &[u8; 32]| {
+            *pk == key_a || *pk == key_b
+        }));
+
+        assert!(RequestService::accept_delegated_bearer(&svc, &key_a),
+            "must accept authorized MCP key A");
+        assert!(RequestService::accept_delegated_bearer(&svc, &key_b),
+            "must accept authorized MCP key B");
+        // Non-MCP signer rejected — independently scoped, not a wildcard.
+        assert!(!RequestService::accept_delegated_bearer(&svc, &[0xEF; 32]));
+        assert!(!RequestService::accept_delegated_bearer(&svc, &[0u8; 32]));
+    }
+
+    /// Live revocation: the same key goes from accepted to rejected **without
+    /// re-injecting the authorizer** — proving there is no frozen snapshot. A
+    /// shared `AtomicBool` simulates the trust store revoking the key at runtime.
+    #[test]
+    fn workflow_relay_revocation_takes_effect_immediately() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        use super::{SigningKey, WorkflowService};
+        use hyprstream_rpc::service::RequestService;
+        use hyprstream_rpc::transport::TransportConfig;
+
+        let sk = SigningKey::from_bytes(&[0x99; 32]);
+        let mut svc = WorkflowService::new(TransportConfig::inproc("wf-revoke"), sk);
+
+        // Shared live-authorization flag (simulates the trust store's state).
+        let authorized = std::sync::Arc::new(AtomicBool::new(true));
+        let flag = authorized.clone();
+        svc.set_relay_authorizer(std::sync::Arc::new(move |_pk: &[u8; 32]| {
+            flag.load(Ordering::Relaxed)
+        }));
+
+        let key = [0x77; 32];
+        // While authorized → accepted.
+        assert!(RequestService::accept_delegated_bearer(&svc, &key),
+            "must accept while the key is live-authorized");
+
+        // Simulate live revocation (trust store removes / expires the key).
+        authorized.store(false, Ordering::Relaxed);
+
+        // Same key, same authorizer, same service — now rejected. No snapshot.
+        assert!(!RequestService::accept_delegated_bearer(&svc, &key),
+            "must reject immediately after live revocation (no frozen snapshot)");
+    }
+
+
+    #[test]
+    fn jwt_expected_audience_round_trips_through_request_service() {
+        use super::{SigningKey, WorkflowService};
+        use hyprstream_rpc::service::RequestService;
+        use hyprstream_rpc::transport::TransportConfig;
+
+        let sk = SigningKey::from_bytes(&[0x42; 32]);
+        let mut svc =
+            WorkflowService::new(TransportConfig::inproc("wf-plumb-test"), sk);
+        // Default: no audience configured → a JWT-auth request would be denied
+        // at envelope verification (the pre-fix behavior the review flagged).
+        assert!(RequestService::expected_audience(&svc).is_none());
+        assert!(RequestService::jwt_key_source(&svc).is_none());
+
+        svc.set_expected_audience("https://test.hyprstream.local".to_owned());
+        assert_eq!(
+            RequestService::expected_audience(&svc),
+            Some("https://test.hyprstream.local")
+        );
+    }
 
     #[test]
     fn anonymous_subject_must_not_round_trip_through_string() {

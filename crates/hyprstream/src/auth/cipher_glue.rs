@@ -1,16 +1,27 @@
 //! Shared glue between relational [`UserStore`] backends and the
-//! backend-neutral [`ColumnCipher`] (#1401).
+//! backend-neutral `ColumnCipher`.
 //!
-//! The four seal/open free functions and the `USERSTORE_SCHEMA` DDL live here
-//! so that [`PgliteUserStore`](super::pglite_store::PgliteUserStore) and
-//! [`PostgresUserStore`](super::postgres_store::PostgresUserStore) share one
-//! source of truth for value-column encryption and schema. Neither this module
-//! nor [`encrypted_columns`] has any backend-specific (pglite / tokio-postgres)
-//! dependency — the cipher is pure AES-GCM-SIV + HKDF + age CLI, and the DDL
-//! is standard PostgreSQL.
+//! `USERSTORE_SCHEMA` is the one source of truth for the relational DDL and is
+//! consumed by every relational backend, so it is compiled whenever any of them
+//! is enabled.
+//!
+//! The four seal/open free functions below serve the server-Postgres backend
+//! specifically: they take the cipher and root key as `Option`s, because that
+//! backend can run with value-column encryption absent. `PgliteUserStore` holds
+//! a non-optional `ColumnCipher` — encryption is unconditional there — so it
+//! seals the same columns through the inherent `ColumnCipher::seal_*`/`open_*`
+//! methods instead, and never calls these. They are therefore compiled only
+//! with the `postgres` backend, matching their callers.
+//!
+//! Neither this module nor [`encrypted_columns`] has any backend-specific
+//! (pglite / tokio-postgres) dependency — the cipher is pure AES-GCM-SIV +
+//! HKDF + age CLI, and the DDL is standard PostgreSQL.
 
+#[cfg(feature = "postgres")]
 use super::encrypted_columns::{ColumnCipher, EncryptedColumn, ROOT_DEK_BYTES};
+#[cfg(feature = "postgres")]
 use anyhow::{bail, Result};
+#[cfg(feature = "postgres")]
 use zeroize::Zeroizing;
 
 /// PostgreSQL-compatible schema shared by embedded PGlite and server Postgres.
@@ -100,13 +111,17 @@ CREATE TABLE IF NOT EXISTS user_encryption_keys (
 
 // ── Field-level seal/open free functions ─────────────────────────────
 //
-// These are the shared glue between the backend-neutral [`ColumnCipher`] and
-// each store's read/write paths. They are parameterized by
-// `(cipher, root, username, column, value)` — no `self`, no backend type.
+// These bridge the backend-neutral `ColumnCipher` and the server-Postgres
+// store's read/write paths. They are parameterized by
+// `(cipher, root, username, column, value)` — no `self`, no backend type —
+// and are `Option`-taking because that backend may run without value-column
+// encryption configured. Backends whose cipher is unconditional call the
+// inherent `ColumnCipher` methods directly rather than these.
 
 /// Seal an optional text field for storage. Returns `None` for `None`
 /// input. When encryption is disabled (`cipher` and `root` both `None`),
 /// returns plaintext bytes.
+#[cfg(feature = "postgres")]
 pub(crate) fn seal_text(
     cipher: Option<&ColumnCipher>,
     root: Option<&Zeroizing<[u8; ROOT_DEK_BYTES]>>,
@@ -129,6 +144,7 @@ pub(crate) fn seal_text(
 
 /// Open an optional text field from stored bytes. When encryption is
 /// disabled, interprets bytes as UTF-8 directly.
+#[cfg(feature = "postgres")]
 pub(crate) fn open_text(
     cipher: Option<&ColumnCipher>,
     root: Option<&Zeroizing<[u8; ROOT_DEK_BYTES]>>,
@@ -148,6 +164,7 @@ pub(crate) fn open_text(
 }
 
 /// Seal raw bytes (e.g. pubkey material) for storage.
+#[cfg(feature = "postgres")]
 pub(crate) fn seal_raw(
     cipher: Option<&ColumnCipher>,
     root: Option<&Zeroizing<[u8; ROOT_DEK_BYTES]>>,
@@ -163,6 +180,7 @@ pub(crate) fn seal_raw(
 }
 
 /// Open raw bytes from storage.
+#[cfg(feature = "postgres")]
 pub(crate) fn open_raw(
     cipher: Option<&ColumnCipher>,
     root: Option<&Zeroizing<[u8; ROOT_DEK_BYTES]>>,
