@@ -32,6 +32,9 @@ use tch::Device;
 use tch::{Kind as DType, Tensor};
 
 use super::KVQuantType;
+use super::kv_compat::{
+    decide_cache_reuse, CacheReuseDecision, KvCompatFingerprint,
+};
 use super::torch_utils::{estimate_tensor_size_mb, safe_zeros};
 
 // ============================================================================
@@ -1930,6 +1933,11 @@ pub struct KVCacheManager {
     cached_token_ids: Vec<i64>,
     /// Where this cache's tensors currently reside
     location: CacheLocation,
+    /// Compatibility fingerprint under which this cache's KV was produced
+    /// (#1277). `None` until the cache is first populated; the engine stamps it
+    /// at reuse time and rejects (clears + recomputes) on mismatch against the
+    /// current expected fingerprint.
+    compat_fingerprint: Option<KvCompatFingerprint>,
 }
 
 impl KVCacheManager {
@@ -1956,6 +1964,7 @@ impl KVCacheManager {
             access_count: AtomicU64::new(0),
             cached_token_ids: Vec::new(),
             location: CacheLocation::Gpu,
+            compat_fingerprint: None,
         }
     }
 
@@ -1990,6 +1999,7 @@ impl KVCacheManager {
             access_count: AtomicU64::new(0),
             cached_token_ids: Vec::new(),
             location: CacheLocation::Gpu,
+            compat_fingerprint: None,
         }
     }
 
@@ -2033,6 +2043,76 @@ impl KVCacheManager {
         for mut cache_ref in self.layer_caches.iter_mut() {
             cache_ref.clear();
         }
+    }
+
+    /// The compatibility fingerprint stamped on this cache, or `None` until the
+    /// cache is first populated (#1277).
+    pub fn compat_fingerprint(&self) -> Option<KvCompatFingerprint> {
+        self.compat_fingerprint
+    }
+
+    /// Stamp (or re-stamp) the compatibility fingerprint under which this
+    /// cache's KV is being produced. Called by the engine at reuse time: a fresh
+    /// cache is stamped with the current config; an incompatible cache is
+    /// cleared and re-stamped after its stale KV is discarded.
+    pub fn set_compat_fingerprint(&mut self, fp: KvCompatFingerprint) {
+        self.compat_fingerprint = Some(fp);
+    }
+
+    /// Apply the fail-closed KV compatibility policy to this real cache.
+    ///
+    /// This is the production state-transition boundary for #1277. A compatible
+    /// stamped cache is retained. A fresh empty cache is stamped before prefill.
+    /// Every incompatible or unproven cache has both its token IDs and layer
+    /// tensors discarded, then is re-stamped only when an authoritative expected
+    /// fingerprint is available.
+    pub fn apply_reuse_policy(
+        &mut self,
+        expected: Option<KvCompatFingerprint>,
+    ) -> CacheReuseDecision {
+        let stored = self.compat_fingerprint();
+        let cache_is_empty = self.cached_token_count() == 0;
+        let decision =
+            decide_cache_reuse(expected.as_ref(), stored.as_ref(), cache_is_empty);
+
+        match decision {
+            CacheReuseDecision::Reuse => {
+                tracing::debug!(target: "kv_compat", "KV cache reuse: compatible");
+            }
+            CacheReuseDecision::StampFresh => {
+                if let Some(expected) = expected {
+                    self.set_compat_fingerprint(expected);
+                }
+            }
+            CacheReuseDecision::DiscardAndRecompute => {
+                let reason = match stored {
+                    Some(stored) => format!(
+                        "stamp mismatch (stored={}, expected={})",
+                        stored.to_hex(),
+                        expected
+                            .map(|fingerprint| fingerprint.to_hex())
+                            .unwrap_or_else(|| "<none>".to_owned())
+                    ),
+                    None if !cache_is_empty => {
+                        "populated cache with no compatibility stamp".to_owned()
+                    }
+                    None => "no authoritative compatibility identity".to_owned(),
+                };
+                tracing::info!(
+                    target: "kv_compat",
+                    reason = %reason,
+                    "KV cache not reusable: discarding and recomputing (fail-closed)"
+                );
+
+                self.set_cached_tokens(Vec::new());
+                self.clear_all();
+                if let Some(expected) = expected {
+                    self.set_compat_fingerprint(expected);
+                }
+            }
+        }
+
+        decision
     }
 
     /// Enable or disable caching
@@ -2649,6 +2729,96 @@ mod tests {
         assert_eq!(pool.used_blocks(), 0);
         assert_eq!(pool.owner_of(block), None);
         Ok(())
+    }
+
+    fn compat_test_fingerprint(base_revision: &str) -> KvCompatFingerprint {
+        use crate::runtime::kv_compat::{
+            KvCompatDescriptor, WeightIdentity, KV_COMPAT_FORMAT_VERSION,
+        };
+
+        KvCompatDescriptor {
+            format_version: KV_COMPAT_FORMAT_VERSION,
+            weights: WeightIdentity::base_only(base_revision),
+            tokenizer_hash: Some("deadbeef".to_owned()),
+            ..Default::default()
+        }
+        .fingerprint()
+    }
+
+    /// Populate both reuse signals on a real manager: token IDs used by prefix
+    /// matching and layer tensors used by attention.
+    fn populate_compat_test_cache(manager: &mut KVCacheManager) {
+        manager.set_cached_tokens(vec![1, 2, 3, 4]);
+        let updated = manager.with_layer_cache(0, |cache| {
+            let keys = Tensor::ones([1, 4, 2, 4], (DType::Float, Device::Cpu));
+            let values = Tensor::ones([1, 4, 2, 4], (DType::Float, Device::Cpu));
+            cache.update(&keys, &values, 0).expect("populate layer cache");
+        });
+        assert_eq!(updated, Some(()));
+    }
+
+    fn compat_test_layer_seq_pos(manager: &KVCacheManager) -> usize {
+        manager
+            .with_layer_cache(0, |cache| cache.seq_pos)
+            .expect("layer 0 exists")
+    }
+
+    #[test]
+    fn apply_reuse_policy_retains_compatible_real_cache() {
+        let expected = compat_test_fingerprint("sha256:base");
+        let mut manager = KVCacheManager::new(2, 64, KVQuantType::None);
+
+        assert_eq!(
+            manager.apply_reuse_policy(Some(expected)),
+            CacheReuseDecision::StampFresh
+        );
+        assert_eq!(manager.compat_fingerprint(), Some(expected));
+
+        populate_compat_test_cache(&mut manager);
+        assert_eq!(
+            manager.apply_reuse_policy(Some(expected)),
+            CacheReuseDecision::Reuse
+        );
+        assert_eq!(manager.cached_token_count(), 4);
+        assert_eq!(compat_test_layer_seq_pos(&manager), 4);
+        assert_eq!(manager.compat_fingerprint(), Some(expected));
+    }
+
+    #[test]
+    fn apply_reuse_policy_discards_and_restamps_incompatible_real_cache() {
+        let original = compat_test_fingerprint("sha256:old");
+        let expected = compat_test_fingerprint("sha256:new");
+        let mut manager = KVCacheManager::new(2, 64, KVQuantType::None);
+
+        assert_eq!(
+            manager.apply_reuse_policy(Some(original)),
+            CacheReuseDecision::StampFresh
+        );
+        populate_compat_test_cache(&mut manager);
+
+        assert_eq!(
+            manager.apply_reuse_policy(Some(expected)),
+            CacheReuseDecision::DiscardAndRecompute
+        );
+        assert_eq!(manager.cached_token_count(), 0);
+        assert_eq!(compat_test_layer_seq_pos(&manager), 0);
+        assert_eq!(manager.compat_fingerprint(), Some(expected));
+    }
+
+    #[test]
+    fn apply_reuse_policy_discards_populated_unstamped_real_cache() {
+        let expected = compat_test_fingerprint("sha256:base");
+        let mut manager = KVCacheManager::new(2, 64, KVQuantType::None);
+        populate_compat_test_cache(&mut manager);
+        assert!(manager.compat_fingerprint().is_none());
+
+        assert_eq!(
+            manager.apply_reuse_policy(Some(expected)),
+            CacheReuseDecision::DiscardAndRecompute
+        );
+        assert_eq!(manager.cached_token_count(), 0);
+        assert_eq!(compat_test_layer_seq_pos(&manager), 0);
+        assert_eq!(manager.compat_fingerprint(), Some(expected));
     }
 
     // ========================================================================
