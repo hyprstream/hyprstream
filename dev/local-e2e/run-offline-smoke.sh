@@ -6,7 +6,7 @@ umask 077
 
 harness_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 repo="$(cd -- "$harness_dir/../.." && pwd -P)"
-buildq=/home/birdetta/projects/cyberdione/.fleet-coord/buildq
+buildq=/home/birdetta/projects/cyberdione/build-skills/.claude/skills/buildq/scripts/buildq
 git_common_dir="$(git -C "$repo" rev-parse --path-format=absolute --git-common-dir)"
 main_checkout="$(cd -- "$git_common_dir/.." && pwd -P)"
 default_libtorch="$main_checkout/appimage/libtorch-cache/cuda130/libtorch"
