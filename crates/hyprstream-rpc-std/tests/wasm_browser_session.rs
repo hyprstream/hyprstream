@@ -1,9 +1,9 @@
-//! Real, browser-executed tests for `BrowserSession`
-//! (hyprstream/hyprstream#1442) — the shared session/resolved-client API
-//! that constructs direct typed RPC clients without `VfsShell`.
+//! Real, browser-executed tests for `BrowserSession` — the shared
+//! session/resolved-client API that constructs direct typed RPC clients
+//! without `VfsShell`.
 //!
 //! Follows the established pattern from
-//! `hyprstream-rpc/tests/wasm_browser_fetch.rs` (#1425 r2 P2): a JS-side
+//! `hyprstream-rpc/tests/wasm_browser_fetch.rs`: a JS-side
 //! `fetch` override records every request and returns scripted responses, so
 //! this exercises the real `wasm32` glue (`BrowserSession::establish` /
 //! `renew` / `revoke`) against the unmodified production code path, not a

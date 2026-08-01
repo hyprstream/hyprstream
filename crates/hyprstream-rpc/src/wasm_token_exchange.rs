@@ -775,7 +775,7 @@ pub use fetch::{
 };
 
 // ============================================================================
-// BrowserSession support (hyprstream/hyprstream#1442) — pure, native-testable
+// BrowserSession support — pure, native-testable
 // ============================================================================
 
 /// Classify a `fetch_exchange_token` (or `verify_sender_bound_token`) failure

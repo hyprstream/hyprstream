@@ -1,15 +1,15 @@
-//! Shared browser session / resolved-client API (hyprstream/hyprstream#1442).
+//! Shared browser session / resolved-client API.
 //!
 //! `BrowserSession` consumes a verified Hyprstream browser session
 //! established from the PDS flow (RFC 8693 token-exchange + RFC 9449 DPoP
-//! sender binding, #1425) and constructs direct typed Registry, Model, and
+//! sender binding) and constructs direct typed Registry, Model, and
 //! Policy RPC clients through the resolved browser-provisioning path
 //! (`wasm_rpc_client::build_resolved_client`) — without requiring
 //! `VfsShell`/`TclShell`.
 //!
 //! The exchange, nonce lifecycle, and sender-binding verification are
 //! entirely delegated to `hyprstream_rpc::wasm_token_exchange`
-//! (`fetch_exchange_token` / `verify_sender_bound_token`, #1425 r1/r2): this
+//! (`fetch_exchange_token` / `verify_sender_bound_token`): this
 //! module adds session *lifecycle* (renewal, revocation, expiry tracking)
 //! and multi-service client construction on top of that already-verified
 //! exchange, plus a stable error-code taxonomy for callers.
@@ -34,9 +34,8 @@ use crate::wasm_rpc_client::{build_resolved_client, WasmRpcClient};
 
 /// RFC 8693 §2.1: presenting the current access token as the subject of a
 /// fresh exchange (a "chained" exchange) to obtain a renewed one bound to
-/// the same DPoP key. The #1444 P1 fix hardened exactly this path — the new
-/// proof's key must match the *current* token's `cnf.jkt` before the
-/// replay registry consumes it.
+/// the same DPoP key. The server requires the new proof's key to match the
+/// *current* token's `cnf.jkt` before the replay registry consumes it.
 const REFRESH_SUBJECT_TOKEN_TYPE: &str = "urn:ietf:params:oauth:token-type:access_token";
 
 /// A verified Hyprstream browser session: a sender-bound (`cnf.jkt`) access
@@ -72,8 +71,8 @@ impl BrowserSession {
     /// Establish a session by exchanging `subject_token` (e.g. an ATProto
     /// service-auth JWT) for a hyprstream access token sender-bound to
     /// `signer_pubkey`/`sign_fn` — the same Ed25519 key used for RPC
-    /// envelope signing (#1425 r1 P1#3: one browser-held key through
-    /// exchange and every RPC request). `signer_ml_dsa65_pubkey`/`pq_sign_fn`
+    /// envelope signing, so one browser-held key covers both the exchange
+    /// and every RPC request. `signer_ml_dsa65_pubkey`/`pq_sign_fn`
     /// are the hybrid PQ arm, required by every resolved client this session
     /// constructs.
     ///
