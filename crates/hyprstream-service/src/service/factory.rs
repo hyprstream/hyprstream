@@ -1145,6 +1145,10 @@ mod tests {
             .arg("--nocapture")
             .env(CHILD, "1")
             .env(EXPECTED, &expected)
+            // The child resolves deployment paths, so it must not inherit an
+            // instance namespace that another test in this binary may have set
+            // in the shared process environment while this fork happens.
+            .env_remove("HYPRSTREAM_INSTANCE")
             .env("XDG_DATA_HOME", deployment.path())
             .env("HYPRSTREAM__PDS__STORE_PATH", caller_store.path())
             .env(
