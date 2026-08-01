@@ -63,6 +63,14 @@ getrandom = { version = "0.3", features = ["wasm_js"] }
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 tokio = { workspace = true }
 
+# wasm32-only test deps: a real, browser-executed test for the
+# hyprstream/hyprstream#1442 `BrowserSession` API (mirrors
+# hyprstream-rpc/tests/wasm_browser_fetch.rs, #1425 r2 P2). Runs via
+# `wasm-pack test --headless --chrome -p hyprstream-rpc-std --test wasm_browser_session`.
+[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
+wasm-bindgen-test = "0.3"
+ed25519-dalek = { workspace = true }
+
 [build-dependencies]
 capnpc = { workspace = true }
 hyprstream-rpc-build = { path = "../hyprstream-rpc-build" }
