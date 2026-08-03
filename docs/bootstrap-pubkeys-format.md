@@ -14,19 +14,31 @@ The file is a flat JSON object mapping service name to a base64-encoded
 
 ```json
 {
-  "policy": "MCowBQYDK2VwAyEA...",
-  "discovery": "MCowBQYDK2VwAyEA..."
+  "policy": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+  "discovery": "q6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6s"
 }
 ```
+
+(The values above are synthetic 32-byte patterns for illustration — a real
+value is any 43-character URL-safe-no-pad base64 string that decodes to the
+32 raw bytes of the Ed25519 verifying key.)
 
 - **Shape**: flat `{ "<service>": "<key>" }`. Not an envelope, not a list of
   `{service, key_type, public_key}` objects.
 - **Base64 alphabet**: `URL_SAFE_NO_PAD` (RFC 4648 §5, no `+`, `/`, or `=`).
   Standard-alphabet base64 (with `+`/`/`/`=`) will fail to decode.
 - **Key type**: Ed25519 only, exactly 32 raw bytes after decoding. No other
-  curve or encoding is accepted.
-- **Service names**: validated by `validate_service_name` — non-empty, at
-  most 64 bytes, `[a-z0-9-]` only.
+  curve or encoding is accepted. In particular, do **not** encode a DER/SPKI
+  (`SubjectPublicKeyInfo`) blob — that decodes to 44 bytes and is rejected.
+  If you have a PEM/DER key (e.g. from `openssl genpkey -algorithm ed25519`),
+  extract the raw key first: the raw 32 bytes are the *last* 32 bytes of the
+  DER SPKI (`openssl pkey -pubout -outform DER | tail -c 32`), then base64
+  those with the URL-safe-no-pad alphabet.
+- **Service names**: the loader (`load_bootstrap_pubkeys`) does **not**
+  validate names — it accepts any JSON string key. `validate_service_name`
+  (non-empty, at most 64 bytes, `[a-z0-9-]` only) runs producer-side only
+  (wizard / bootstrap manager). Consumers look up the exact names
+  `discovery` and `policy`, so anything else parses but is ignored.
 
 Produced by `write_bootstrap_pubkeys` and consumed by `load_bootstrap_pubkeys`
 in `crates/hyprstream/src/auth/identity_store.rs`.
@@ -37,10 +49,17 @@ The wizard mints a keypair for every registered factory, but the runtime only
 *resolves* two of them before Discovery is up:
 
 - `discovery` — required. `install_process_production_resolver`
-  (`crates/hyprstream/src/bin/main.rs`) resolves this on every command except
-  `trust` and `wizard`; without it, deployment bootstrap fails with "trust
-  store has no authenticated discovery key."
-- `policy` — required by the same bootstrap path for policy enforcement.
+  (`crates/hyprstream/src/bin/main.rs`) resolves this on every command that
+  reaches the shared production resolver; bootstrap/provisioning commands
+  (`trust`, `wizard`, `pds init-deployment-store`, `pds join`, and the
+  no-subcommand first-run wizard path) dispatch before it. Without it,
+  deployment bootstrap fails with "trust store has no authenticated
+  discovery key."
+- `policy` — required for policy enforcement, but resolved by a different
+  path: the standalone worker startup (when the CLI spawns its own
+  `WorkerService` because the `worker` service is not already running)
+  resolves `policy` to build its authorization client;
+  `install_process_production_resolver` itself resolves only `discovery`.
 
 Provisioning keys under any other service name (for example a name matching
 some other artifact you have on hand) satisfies nothing — the loader will
