@@ -4131,12 +4131,12 @@ mod resolver_tests {
             (
                 "future nbf",
                 "nbf",
-                serde_json::json!(checked_test_time(now, 61)),
+                serde_json::json!(checked_test_time(now, 3600)),
             ),
             (
                 "future iat",
                 "iat",
-                serde_json::json!(checked_test_time(now, 61)),
+                serde_json::json!(checked_test_time(now, 3600)),
             ),
             (
                 "nbf after iat",
