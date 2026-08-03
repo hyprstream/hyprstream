@@ -44,7 +44,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fs::OpenOptions,
     io::{Read as _, Write as _},
-    os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _},
+    os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _},
     path::{Path, PathBuf},
     process::{Command, Stdio},
 };
@@ -65,6 +65,7 @@ const MAX_AUTHORITY_LOG_OPERATIONS: usize = 128;
 const MAX_DELEGATION_BYTES: usize = 256 * 1024;
 const MAX_CLOUD_SECRET_BYTES: usize = 64 * 1024;
 const MAX_AGE_CIPHERTEXT_BYTES: usize = 256 * 1024;
+const MAX_AGE_IDENTITY_BYTES: usize = 4 * 1024;
 const PUBLIC_CA_INSTALL_PATH: &str = "/etc/hyprstream/trust/deployment-ca.hybrid";
 const AUTHORITY_LOG_INSTALL_PATH: &str = "/etc/hyprstream/trust/deployment-authority.log.json";
 const AUTHORITY_CHECKPOINT_INSTALL_PATH: &str =
@@ -78,6 +79,7 @@ const DELEGATION_INSTALL_PATH: &str =
     "/etc/hyprstream/trust/delegated/registry-signer.delegation.json";
 const REGISTRY_PUBLIC_KEY_INSTALL_PATH: &str =
     "/etc/hyprstream/trust/delegated/registry-public-key";
+const REFRESH_IDENTITY_INSTALL_PATH: &str = "/etc/hyprstream/trust/delegated/refresh-identity";
 const TRUST_REFRESH_SERVICE_UNIT_PATH: &str = "/etc/systemd/system/hyprstream-trust-refresh.service";
 const TRUST_REFRESH_TIMER_UNIT_PATH: &str = "/etc/systemd/system/hyprstream-trust-refresh.timer";
 const CREDENTIALS_RUN_DIR: &str = "/run/hyprstream/credentials";
@@ -729,7 +731,7 @@ fn verify_publisher_artifact(
 }
 
 /// Nothing else in the repository installs the OS-owned trust directory or
-/// keeps the 1-hour registry credential refreshed (hyprstream#1468) — every
+/// keeps the 1-hour registry credential refreshed — every
 /// prior `trust mint-*` command only produces local artifacts under the
 /// operator's ceremony directory. This command projects those artifacts onto
 /// the fixed paths `hyprstream-discovery::service::read_trusted_artifact`
@@ -743,6 +745,7 @@ fn install_deployment_trust(args: &InstallDeploymentTrustArgs) -> Result<()> {
          root-owned (see hyprstream-discovery's read_trusted_artifact), and this command does not \
          attempt to chown files it does not itself own"
     );
+    validate_refresh_interval(&args.refresh_interval)?;
 
     let public_ca = read_limited(&args.public_ca, PUBLIC_CA_BYTES)?;
     ensure!(
@@ -767,7 +770,7 @@ fn install_deployment_trust(args: &InstallDeploymentTrustArgs) -> Result<()> {
         args.force,
     )?;
     commit_outputs(vec![
-        PendingOutput::new(&public_ca_dest, public_ca, 0o644),
+        PendingOutput::new(&public_ca_dest, public_ca.clone(), 0o644),
         PendingOutput::new(&authority_log_dest, pretty_json_bytes(&authority_log)?, 0o644),
         PendingOutput::new(
             &authority_checkpoint_dest,
@@ -786,7 +789,20 @@ fn install_deployment_trust(args: &InstallDeploymentTrustArgs) -> Result<()> {
             .registry_public_key
             .as_ref()
             .ok_or_else(|| anyhow!("--registry-public-key is required with --delegated-key"))?;
-        install_trust_refresher(args, delegated_key, delegation, registry_public_key)?;
+        let refresh_identity = args
+            .refresh_identity
+            .as_ref()
+            .ok_or_else(|| anyhow!("--refresh-identity is required with --delegated-key"))?;
+        install_trust_refresher(
+            args,
+            &public_ca,
+            &authority_log,
+            &authority_checkpoint,
+            delegated_key,
+            delegation,
+            registry_public_key,
+            refresh_identity,
+        )?;
         refresher_enabled = true;
     }
 
@@ -805,54 +821,94 @@ fn install_deployment_trust(args: &InstallDeploymentTrustArgs) -> Result<()> {
     Ok(())
 }
 
-/// `mkdir -p` with the given mode, refusing to follow or replace a symlink at
-/// any level — mirrors the fail-closed posture `read_trusted_artifact`
-/// requires of every ancestor of a trust path it reads.
+/// `mkdir -p` with the given mode on the leaf. Every component of the path —
+/// not just the leaf — is inspected with `symlink_metadata` and must be a
+/// non-symlink directory owned by root (or by the given owner), mirroring the
+/// fail-closed posture `read_trusted_artifact` requires of every ancestor of
+/// a trust path it reads. Guarantee: at the moment each component was
+/// inspected it was a root/owner-owned real directory. Not guaranteed: the
+/// checks are lstat-based, not O_NOFOLLOW-handle-based, so a component
+/// swapped between inspection and use is not detected (TOCTOU).
 fn ensure_root_owned_dir(dir: &Path, mode: u32) -> Result<()> {
-    match std::fs::symlink_metadata(dir) {
-        Ok(metadata) => {
-            ensure!(
-                !metadata.file_type().is_symlink(),
-                "refusing to install through a symlinked directory: {}",
-                dir.display()
-            );
-            ensure!(
-                metadata.is_dir(),
-                "install target parent exists and is not a directory: {}",
-                dir.display()
-            );
+    ensure_owned_dir(dir, mode, 0)
+}
+
+fn ensure_owned_dir(dir: &Path, mode: u32, owner_uid: u32) -> Result<()> {
+    let mut ancestors: Vec<&Path> = dir.ancestors().collect();
+    ancestors.reverse();
+    for component in ancestors {
+        if component.as_os_str().is_empty() {
+            continue;
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            if let Some(parent) = dir.parent() {
-                if parent != dir {
-                    ensure_root_owned_dir(parent, 0o755)?;
+        let is_leaf = component == dir;
+        match std::fs::symlink_metadata(component) {
+            Ok(metadata) => {
+                ensure!(
+                    !metadata.file_type().is_symlink(),
+                    "refusing to install through a symlinked path component: {}",
+                    component.display()
+                );
+                ensure!(
+                    metadata.is_dir(),
+                    "install path component exists and is not a directory: {}",
+                    component.display()
+                );
+                let uid = metadata.uid();
+                ensure!(
+                    uid == 0 || uid == owner_uid,
+                    "install path component {} is owned by uid {uid}, not root; refusing to \
+                     install trust material under a directory another user controls",
+                    component.display()
+                );
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::create_dir(component)
+                    .with_context(|| format!("create directory {}", component.display()))?;
+                if !is_leaf {
+                    std::fs::set_permissions(component, std::fs::Permissions::from_mode(0o755))
+                        .with_context(|| {
+                            format!("set permissions on {}", component.display())
+                        })?;
                 }
             }
-            std::fs::create_dir(dir)
-                .with_context(|| format!("create directory {}", dir.display()))?;
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("inspect directory {}", component.display()))
+            }
         }
-        Err(error) => {
-            return Err(error).with_context(|| format!("inspect directory {}", dir.display()))
+        if is_leaf {
+            std::fs::set_permissions(component, std::fs::Permissions::from_mode(mode))
+                .with_context(|| format!("set permissions on {}", component.display()))?;
         }
     }
-    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode))
-        .with_context(|| format!("set permissions on {}", dir.display()))?;
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn install_trust_refresher(
     args: &InstallDeploymentTrustArgs,
+    public_ca: &[u8],
+    authority_log: &AuthorityLogFile,
+    authority_checkpoint: &AuthorityCheckpointFile,
     delegated_key: &Path,
     delegation: &Path,
     registry_public_key: &Path,
+    refresh_identity: &Path,
 ) -> Result<()> {
     let delegated_key_bytes = read_limited(delegated_key, MAX_AGE_CIPHERTEXT_BYTES)?;
     let delegation_artifact: DelegationArtifact =
         read_json_limited(delegation, MAX_DELEGATION_BYTES)?;
-    ensure!(
-        delegation_artifact.schema == DELEGATION_SCHEMA,
-        "unsupported delegation schema"
-    );
+    // Full cryptographic validation against the just-verified authority log:
+    // an expired, tampered, or wrong-deployment delegation must fail install
+    // rather than be discovered by the first unattended refresh.
+    validate_delegation_artifact(
+        public_ca,
+        authority_log,
+        authority_checkpoint,
+        &delegation_artifact,
+        now_unix_u64()?,
+    )
+    .context("delegation artifact does not verify against the installed authority log")?;
     let registry_public_key_bytes = read_limited(registry_public_key, 32)?;
     let registry_public_key_array: [u8; 32] = registry_public_key_bytes
         .clone()
@@ -860,15 +916,24 @@ fn install_trust_refresher(
         .map_err(|_| anyhow!("registry_public_key must be exactly 32 bytes"))?;
     VerifyingKey::from_bytes(&registry_public_key_array)
         .context("invalid registry Ed25519 public key")?;
+    let refresh_identity_bytes = read_limited(refresh_identity, MAX_AGE_IDENTITY_BYTES)?;
+    validate_age_identity_contents(&refresh_identity_bytes)
+        .with_context(|| format!("refresh identity {}", refresh_identity.display()))?;
 
     ensure_root_owned_dir(Path::new(DELEGATED_DIR), 0o750)?;
-    ensure_root_owned_dir(Path::new(CREDENTIALS_RUN_DIR), 0o755)?;
+    ensure_root_owned_dir(Path::new(CREDENTIALS_RUN_DIR), 0o750)?;
 
     let delegated_key_dest = PathBuf::from(DELEGATED_SIGNER_INSTALL_PATH);
     let delegation_dest = PathBuf::from(DELEGATION_INSTALL_PATH);
     let registry_public_key_dest = PathBuf::from(REGISTRY_PUBLIC_KEY_INSTALL_PATH);
+    let refresh_identity_dest = PathBuf::from(REFRESH_IDENTITY_INSTALL_PATH);
     preflight_outputs(
-        [&delegated_key_dest, &delegation_dest, &registry_public_key_dest],
+        [
+            &delegated_key_dest,
+            &delegation_dest,
+            &registry_public_key_dest,
+            &refresh_identity_dest,
+        ],
         args.force,
     )?;
     commit_outputs(vec![
@@ -879,6 +944,7 @@ fn install_trust_refresher(
             0o644,
         ),
         PendingOutput::new(&registry_public_key_dest, registry_public_key_bytes, 0o644),
+        PendingOutput::new(&refresh_identity_dest, refresh_identity_bytes, 0o600),
     ])?;
 
     let service_dest = PathBuf::from(TRUST_REFRESH_SERVICE_UNIT_PATH);
@@ -913,11 +979,68 @@ fn run_systemctl(args: &[&str]) -> Result<()> {
     Ok(())
 }
 
+/// Refuse a refresh interval that is not a plain systemd time span of the
+/// form `<positive integer><s|min|h>`. The value is interpolated verbatim
+/// into the generated timer unit, so anything containing whitespace or
+/// control characters could inject unit directives, and a typo would only
+/// surface as a late systemd parse failure instead of failing the install.
+fn validate_refresh_interval(interval: &str) -> Result<()> {
+    let digits_ok = |digits: &str| {
+        !digits.is_empty()
+            && !digits.starts_with('0')
+            && digits.bytes().all(|byte| byte.is_ascii_digit())
+    };
+    let valid = interval
+        .strip_suffix("min")
+        .or_else(|| interval.strip_suffix('s'))
+        .or_else(|| interval.strip_suffix('h'))
+        .is_some_and(digits_ok);
+    ensure!(
+        valid,
+        "invalid --refresh-interval {interval:?}: use a positive integer with an s, min, or h \
+         suffix and no whitespace (for example 30min)"
+    );
+    Ok(())
+}
+
+/// The refresh identity is passed by path to `age --decrypt --identity`, which
+/// expects a plaintext identity file: optional `#` comment or blank lines plus
+/// at least one native X25519 identity line. Encrypted or plugin identities
+/// would make the unattended refresher fail at its first timer firing, so
+/// they are rejected at install time.
+fn validate_age_identity_contents(bytes: &[u8]) -> Result<()> {
+    let text = std::str::from_utf8(bytes).context("age identity file is not UTF-8 text")?;
+    let mut has_identity = false;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        ensure!(
+            line.starts_with("AGE-SECRET-KEY-1"),
+            "age identity file must contain only comment lines and plaintext \
+             AGE-SECRET-KEY-1... identity lines"
+        );
+        has_identity = true;
+    }
+    ensure!(
+        has_identity,
+        "age identity file contains no AGE-SECRET-KEY-1... identity line"
+    );
+    Ok(())
+}
+
 /// The refresher only ever needs the delegated (non-root) signer: it must
 /// never be able to sign directly with the root authority, matching the
 /// least-privilege split the ceremony (docs/deployment-trust-ceremony.md)
-/// establishes between minting and day-to-day operation.
+/// establishes between minting and day-to-day operation. The installed
+/// refresh identity enforces the same split at the encryption layer: it is a
+/// `--signer-recipient` of the delegated signer only, so even with the unit's
+/// read access to the trust directory it can never open the operator-held
+/// root authority bundle, which is sealed to a disjoint recipient ring.
 fn trust_refresh_service_unit() -> String {
+    // The unit assumes the packaged binary location; the installer does not
+    // encode its own (possibly temporary) executable path into the unit.
     format!(
         r#"[Unit]
 Description=Hyprstream registry deployment credential refresh
@@ -934,12 +1057,19 @@ ExecStart=/usr/bin/hyprstream trust mint-registry-jwt \
   --via-delegated-signer {DELEGATED_SIGNER_INSTALL_PATH} \
   --delegation {DELEGATION_INSTALL_PATH} \
   --registry-public-key {REGISTRY_PUBLIC_KEY_INSTALL_PATH} \
+  --identity {REFRESH_IDENTITY_INSTALL_PATH} \
   --jwt {REGISTRY_JWT_INSTALL_PATH} \
   --contract {CREDENTIALS_RUN_DIR}/deployment-trust.contract.json \
   --force
 # mint-registry-jwt writes {REGISTRY_JWT_INSTALL_PATH} through the same
 # staged-file-then-rename commit path every other trust artifact uses, so a
 # concurrent reader never observes a partially-written credential.
+# RuntimeDirectory recreates the tmpfs-backed credentials directory after a
+# reboot (ReadWritePaths sandbox setup fails if it is missing); Preserve keeps
+# the minted credential alive after this oneshot unit exits.
+RuntimeDirectory=hyprstream/credentials
+RuntimeDirectoryMode=0750
+RuntimeDirectoryPreserve=yes
 ProtectSystem=strict
 ReadWritePaths={CREDENTIALS_RUN_DIR}
 ReadOnlyPaths={DEPLOYMENT_TRUST_DIR}
@@ -2831,12 +2961,22 @@ mod tests {
         let unit = trust_refresh_service_unit();
         assert!(unit.contains("--via-delegated-signer /etc/hyprstream/trust/delegated/registry-delegated-signer.age"));
         assert!(unit.contains("--delegation /etc/hyprstream/trust/delegated/registry-signer.delegation.json"));
+        assert!(unit.contains("--identity /etc/hyprstream/trust/delegated/refresh-identity"));
         assert!(unit.contains("--jwt /run/hyprstream/credentials/registry-service.jwt"));
         assert!(unit.contains("--force"));
         assert!(
             !unit.contains("--root") && !unit.contains("deployment-ca.age"),
             "refresher unit must never reference the root authority — only the delegated signer"
         );
+    }
+
+    #[test]
+    fn trust_refresh_service_unit_recreates_the_runtime_credentials_directory() {
+        let unit = trust_refresh_service_unit();
+        assert!(unit.contains("RuntimeDirectory=hyprstream/credentials"));
+        assert!(unit.contains("RuntimeDirectoryMode=0750"));
+        assert!(unit.contains("RuntimeDirectoryPreserve=yes"));
+        assert!(unit.contains("ReadWritePaths=/run/hyprstream/credentials"));
     }
 
     #[test]
@@ -2847,24 +2987,86 @@ mod tests {
     }
 
     #[test]
-    fn ensure_root_owned_dir_creates_missing_directory_with_mode() {
+    fn refresh_interval_accepts_only_plain_time_spans() {
+        for valid in ["30min", "45s", "1h", "90s"] {
+            validate_refresh_interval(valid).unwrap();
+        }
+        for invalid in [
+            "",
+            "30",
+            "30 min",
+            "0s",
+            "015min",
+            "30m",
+            "5hr",
+            "-5min",
+            "30min\nOnCalendar=*-*-* *:*:*",
+            "30min\n[Install]\nWantedBy=multi-user.target",
+        ] {
+            assert!(
+                validate_refresh_interval(invalid).is_err(),
+                "interval {invalid:?} was accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn refresh_identity_must_be_a_plaintext_age_identity() {
+        validate_age_identity_contents(
+            b"# created: 2026-01-01\n# public key: age1example\nAGE-SECRET-KEY-1EXAMPLE\n",
+        )
+        .unwrap();
+        for invalid in [
+            &b""[..],
+            b"# only comments\n",
+            b"age-encryption.org/v1\n-> X25519 ciphertext",
+            b"AGE-PLUGIN-YUBIKEY-1EXAMPLE\n",
+            b"\xff\xfe not utf-8 \xff",
+        ] {
+            assert!(
+                validate_age_identity_contents(invalid).is_err(),
+                "identity contents {invalid:?} were accepted"
+            );
+        }
+    }
+
+    fn current_uid() -> u32 {
+        nix::unistd::Uid::effective().as_raw()
+    }
+
+    #[test]
+    fn ensure_owned_dir_creates_missing_directory_with_mode() {
         let base = tempfile::tempdir().unwrap();
         let target = base.path().join("a/b/c");
-        ensure_root_owned_dir(&target, 0o750).unwrap();
+        ensure_owned_dir(&target, 0o750, current_uid()).unwrap();
         let metadata = std::fs::metadata(&target).unwrap();
         assert!(metadata.is_dir());
         assert_eq!(metadata.permissions().mode() & 0o777, 0o750);
         // Idempotent: a second call against the same real directory succeeds.
-        ensure_root_owned_dir(&target, 0o750).unwrap();
+        ensure_owned_dir(&target, 0o750, current_uid()).unwrap();
     }
 
     #[test]
-    fn ensure_root_owned_dir_rejects_symlinked_target() {
+    fn ensure_owned_dir_rejects_symlinked_target() {
         let base = tempfile::tempdir().unwrap();
         let real = base.path().join("real");
         std::fs::create_dir(&real).unwrap();
         let link = base.path().join("link");
         std::os::unix::fs::symlink(&real, &link).unwrap();
-        assert!(ensure_root_owned_dir(&link, 0o755).is_err());
+        assert!(ensure_owned_dir(&link, 0o755, current_uid()).is_err());
+    }
+
+    #[test]
+    fn ensure_owned_dir_rejects_symlinked_intermediate_component() {
+        let base = tempfile::tempdir().unwrap();
+        let real = base.path().join("real");
+        std::fs::create_dir_all(real.join("leaf")).unwrap();
+        let mid = base.path().join("mid");
+        std::os::unix::fs::symlink(&real, &mid).unwrap();
+        // The full path exists and its leaf is a real directory, but it is
+        // reached through a symlinked intermediate component.
+        let through_link = mid.join("leaf");
+        assert!(std::fs::metadata(&through_link).unwrap().is_dir());
+        assert!(ensure_owned_dir(&through_link, 0o755, current_uid()).is_err());
     }
 }

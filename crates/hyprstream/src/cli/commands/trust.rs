@@ -276,6 +276,13 @@ pub struct InstallDeploymentTrustArgs {
     #[arg(long, requires = "delegated_key")]
     pub registry_public_key: Option<PathBuf>,
 
+    /// Plaintext age X25519 identity file (AGE-SECRET-KEY-1...) the unattended
+    /// refresher uses to decrypt the delegated signer. Required with
+    /// --delegated-key. Installed root-only; this identity can open only the
+    /// separately encrypted delegated signer, never the root authority bundle.
+    #[arg(long, requires = "delegated_key", value_name = "AGE_IDENTITY_FILE")]
+    pub refresh_identity: Option<PathBuf>,
+
     /// Refresh interval for the registry credential's 1-hour TTL. Must leave
     /// headroom for the profile's 60-second clock-skew allowance.
     #[arg(
@@ -286,7 +293,8 @@ pub struct InstallDeploymentTrustArgs {
     )]
     pub refresh_interval: String,
 
-    /// Replace existing installed files.
+    /// Replace existing installed trust artifacts. The two systemd unit files
+    /// are always overwritten regardless of this flag.
     #[arg(long)]
     pub force: bool,
 
