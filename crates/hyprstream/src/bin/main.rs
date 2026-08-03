@@ -1567,6 +1567,21 @@ async fn install_process_production_resolver(
         trust_source,
         hyprstream_discovery::DeploymentTrustSource::OsOwnedFiles
     );
+    // `remote_node` only has meaning for a DID-anchored bootstrap (it selects
+    // between the lazy same-node fabric and a required, liveness-checked
+    // dial of the DID-advertised transport). The OS-owned bootstrap always
+    // installs the lazy local client regardless of this flag — silently, so
+    // an operator who set `cluster_remote_node = true` expecting a remote
+    // Discovery reach would otherwise get no error and no such reach. Fail
+    // closed instead, mirroring the `cluster_anchor_root_cert` check above.
+    if is_os_owned_bootstrap && config.cluster_remote_node {
+        anyhow::bail!(
+            "cluster_remote_node is set but no DID anchors are configured; \
+             remote-node Discovery reach requires cluster_at9p_did and \
+             cluster_did_web (DidAnchored mode) — the OS-owned trust source \
+             has no remote-Discovery story and would silently ignore this flag"
+        );
+    }
     hyprstream_discovery::bootstrap_deployment_process(
         signing_key.clone(),
         trust_source,

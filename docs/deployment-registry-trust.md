@@ -1,5 +1,29 @@
 # Deployment registry trust provisioning
 
+## Terminology
+
+Four words describe overlapping scopes in this codebase and its docs; they
+are not synonyms:
+
+- **Node** — one running Hyprstream process/host with its own signing key.
+  Nodes are the only thing that exists; there is no separate "cell" or
+  "cluster" object anywhere in the type system.
+- **Cell** — the set of nodes sharing one deployment CA (one admitted
+  trust root, one ledger). A cell is emergent, not a distinct entity: a cell
+  is simply what you get when N nodes are provisioned with the same
+  `/etc/hyprstream/trust/*` artifacts (or the same DID anchor). Multi-node is
+  still single-cell; there is currently no cross-cell interaction in this
+  repository (see `placement-indexer-architecture.md`'s "not ... a
+  cross-cell directory").
+- **Cluster** (as in `cluster_at9p_did` / `cluster_did_web`) — the specific
+  configuration surface for pointing a node at a DID-anchored deployment. It
+  names the same scope as "cell," from the perspective of one node's config.
+- **Deployment** — this document's scope: the CA, authority log, and
+  credential that anchor trust for a cell. "Deployment trust" and "cell
+  trust" mean the same thing.
+- **Federation** — interaction *across* cells. Not implemented; out of
+  scope for every document in this section.
+
 Production Discovery/PDS authority is rooted before commands, factories, plugins,
 or generated clients run. The executable consults only the explicit deployment
 trust sources described below. It does not consult XDG/user configuration,

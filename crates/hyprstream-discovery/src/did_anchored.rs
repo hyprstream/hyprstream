@@ -318,7 +318,10 @@ fn reach_from_capsule(verified: &VerifiedCapsule, document: &Value) -> Result<Tr
         })
         .ok_or_else(|| {
             anyhow::anyhow!(
-                "capsule has no NinePExport service entry {DEPLOYMENT_REACH_SERVICE:?} for deployment reach"
+                "capsule has no NinePExport service entry {DEPLOYMENT_REACH_SERVICE:?} for deployment reach. \
+                 cluster_at9p_did must pin a deployment anchor capsule signed by the deployment CA and \
+                 advertising {DEPLOYMENT_REACH_SERVICE:?} reach — not a node's own identity capsule \
+                 (e.g. the `#pds` capsule a node's OAuth service renders for itself)."
             )
         })?;
     match entry.endpoint.transport {
