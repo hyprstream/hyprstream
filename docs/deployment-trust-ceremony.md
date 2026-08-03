@@ -232,6 +232,36 @@ automated wrapper will not work.
 `CARGO_TARGET_DIR`, copy it out before using it — pooled slots are reclaimed and your binary will
 vanish mid-ceremony.
 
+## Running the ceremony from the wizard
+
+`hyprstream wizard --deployment-trust` runs the same four steps after node bootstrap. It is opt-in:
+without the flag the wizard sets up node-local trust only, exactly as before.
+
+The wizard enumerates attached tokens with `ykman list` and picks the mode from the firmware it
+reports, saying which one it chose and why:
+
+| What it finds | Mode |
+|---|---|
+| no token | software recipients, labelled **dev-grade** on screen, in the summary, and in `deployment-trust-mode.json` |
+| firmware < 5.7.4 | `--yubikey` age-recipient mode |
+| firmware >= 5.7.4 | `--piv-slot` mode (slot `9c` by default) |
+| several tokens | asks which one; `--deployment-trust-serial <SERIAL>` answers ahead of time |
+| detection failed | **refuses to continue** — not knowing whether hardware is attached is not the same as knowing it is absent |
+
+A software root is never selected while a token is attached unless `--deployment-trust-software` says
+so explicitly. The break-glass prompt defaults to `age-keygen | age -p` and refuses a bare identity
+file unless `--deployment-trust-allow-plaintext-break-glass` is passed.
+
+`--non-interactive` never reaches a prompt: without `--deployment-trust` the phase does not run at
+all, and with it, an attached token stops the run with both ways forward rather than hanging on a PIN
+that no one is there to type.
+
+The wizard leaves the public artifacts in the ceremony directory; installing them to
+`/etc/hyprstream/trust/` is still the operator's step (see *After the ceremony*).
+
+> The `--piv-slot` path remains **unverified on real 5.7.4 hardware**. The firmware rule that selects
+> it is tested; what `ykman piv keys import` and `yubico-piv-tool` do on a token is not.
+
 ## Local development
 
 `dev/local-e2e/` mints a **throwaway** deployment authority, standing in for the offline ceremony so
