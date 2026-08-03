@@ -8,8 +8,8 @@
 
 use crate::auth::age_seal::{AgeIdentities, AgeRecipients};
 use crate::cli::commands::{
-    DelegateRegistrySignerArgs, MintDeploymentCaArgs, MintRegistryJwtArgs, RotateAuthorityArgs,
-    TrustCommand, VerifyDeploymentArgs,
+    DelegateRegistrySignerArgs, InstallDeploymentTrustArgs, MintDeploymentCaArgs,
+    MintRegistryJwtArgs, RotateAuthorityArgs, TrustCommand, VerifyDeploymentArgs,
 };
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use base64::{
@@ -70,6 +70,17 @@ const AUTHORITY_LOG_INSTALL_PATH: &str = "/etc/hyprstream/trust/deployment-autho
 const AUTHORITY_CHECKPOINT_INSTALL_PATH: &str =
     "/etc/hyprstream/trust/deployment-authority.head.json";
 const REGISTRY_JWT_INSTALL_PATH: &str = "/run/hyprstream/credentials/registry-service.jwt";
+const DEPLOYMENT_TRUST_DIR: &str = "/etc/hyprstream/trust";
+const DELEGATED_DIR: &str = "/etc/hyprstream/trust/delegated";
+const DELEGATED_SIGNER_INSTALL_PATH: &str =
+    "/etc/hyprstream/trust/delegated/registry-delegated-signer.age";
+const DELEGATION_INSTALL_PATH: &str =
+    "/etc/hyprstream/trust/delegated/registry-signer.delegation.json";
+const REGISTRY_PUBLIC_KEY_INSTALL_PATH: &str =
+    "/etc/hyprstream/trust/delegated/registry-public-key";
+const TRUST_REFRESH_SERVICE_UNIT_PATH: &str = "/etc/systemd/system/hyprstream-trust-refresh.service";
+const TRUST_REFRESH_TIMER_UNIT_PATH: &str = "/etc/systemd/system/hyprstream-trust-refresh.timer";
+const CREDENTIALS_RUN_DIR: &str = "/run/hyprstream/credentials";
 
 #[cfg(test)]
 static SECRET_BUNDLE_DROPS: [std::sync::atomic::AtomicUsize; 3] = [
@@ -226,6 +237,7 @@ pub fn handle_trust_command(command: TrustCommand) -> Result<()> {
         TrustCommand::MintRegistryJwt(args) => mint_registry_jwt(&args),
         TrustCommand::VerifyDeployment(args) => verify_deployment(&args),
         TrustCommand::RotateAuthority(args) => rotate_authority(&args),
+        TrustCommand::Install(args) => install_deployment_trust(&args),
     }
 }
 
@@ -714,6 +726,243 @@ fn verify_publisher_artifact(
         "contract artifact SHA-256 does not match authenticated bytes"
     );
     Ok(())
+}
+
+/// Nothing else in the repository installs the OS-owned trust directory or
+/// keeps the 1-hour registry credential refreshed (hyprstream#1468) — every
+/// prior `trust mint-*` command only produces local artifacts under the
+/// operator's ceremony directory. This command projects those artifacts onto
+/// the fixed paths `hyprstream-discovery::service::read_trusted_artifact`
+/// actually reads, and, when delegated-signer material is supplied,
+/// additionally installs and enables a systemd timer that keeps the registry
+/// credential minted within its TTL.
+fn install_deployment_trust(args: &InstallDeploymentTrustArgs) -> Result<()> {
+    ensure!(
+        nix::unistd::Uid::effective().is_root(),
+        "trust install must run as root: the fixed paths under {DEPLOYMENT_TRUST_DIR} must be \
+         root-owned (see hyprstream-discovery's read_trusted_artifact), and this command does not \
+         attempt to chown files it does not itself own"
+    );
+
+    let public_ca = read_limited(&args.public_ca, PUBLIC_CA_BYTES)?;
+    ensure!(
+        public_ca.len() == PUBLIC_CA_BYTES,
+        "public_ca must be exactly {PUBLIC_CA_BYTES} bytes"
+    );
+    hyprstream_discovery::verify_deployment_public_ca(&public_ca)
+        .context("public_ca is not a valid production deployment CA")?;
+    let authority_log: AuthorityLogFile = read_json_limited(&args.authority_log, MAX_CLOUD_SECRET_BYTES)?;
+    let authority_checkpoint: AuthorityCheckpointFile =
+        read_json_limited(&args.authority_checkpoint, MAX_CLOUD_SECRET_BYTES)?;
+    validate_authority_log(&public_ca, &authority_log, &authority_checkpoint)
+        .context("authority log/checkpoint do not verify against public_ca")?;
+
+    ensure_root_owned_dir(Path::new(DEPLOYMENT_TRUST_DIR), 0o755)?;
+
+    let public_ca_dest = PathBuf::from(PUBLIC_CA_INSTALL_PATH);
+    let authority_log_dest = PathBuf::from(AUTHORITY_LOG_INSTALL_PATH);
+    let authority_checkpoint_dest = PathBuf::from(AUTHORITY_CHECKPOINT_INSTALL_PATH);
+    preflight_outputs(
+        [&public_ca_dest, &authority_log_dest, &authority_checkpoint_dest],
+        args.force,
+    )?;
+    commit_outputs(vec![
+        PendingOutput::new(&public_ca_dest, public_ca, 0o644),
+        PendingOutput::new(&authority_log_dest, pretty_json_bytes(&authority_log)?, 0o644),
+        PendingOutput::new(
+            &authority_checkpoint_dest,
+            pretty_json_bytes(&authority_checkpoint)?,
+            0o644,
+        ),
+    ])?;
+
+    let mut refresher_enabled = false;
+    if let Some(delegated_key) = &args.delegated_key {
+        let delegation = args
+            .delegation
+            .as_ref()
+            .ok_or_else(|| anyhow!("--delegation is required with --delegated-key"))?;
+        let registry_public_key = args
+            .registry_public_key
+            .as_ref()
+            .ok_or_else(|| anyhow!("--registry-public-key is required with --delegated-key"))?;
+        install_trust_refresher(args, delegated_key, delegation, registry_public_key)?;
+        refresher_enabled = true;
+    }
+
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "schema": "hyprstream.deployment-trust-install-output.v1",
+            "installed": [
+                PUBLIC_CA_INSTALL_PATH,
+                AUTHORITY_LOG_INSTALL_PATH,
+                AUTHORITY_CHECKPOINT_INSTALL_PATH,
+            ],
+            "refresher_enabled": refresher_enabled,
+        }))?
+    );
+    Ok(())
+}
+
+/// `mkdir -p` with the given mode, refusing to follow or replace a symlink at
+/// any level — mirrors the fail-closed posture `read_trusted_artifact`
+/// requires of every ancestor of a trust path it reads.
+fn ensure_root_owned_dir(dir: &Path, mode: u32) -> Result<()> {
+    match std::fs::symlink_metadata(dir) {
+        Ok(metadata) => {
+            ensure!(
+                !metadata.file_type().is_symlink(),
+                "refusing to install through a symlinked directory: {}",
+                dir.display()
+            );
+            ensure!(
+                metadata.is_dir(),
+                "install target parent exists and is not a directory: {}",
+                dir.display()
+            );
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            if let Some(parent) = dir.parent() {
+                if parent != dir {
+                    ensure_root_owned_dir(parent, 0o755)?;
+                }
+            }
+            std::fs::create_dir(dir)
+                .with_context(|| format!("create directory {}", dir.display()))?;
+        }
+        Err(error) => {
+            return Err(error).with_context(|| format!("inspect directory {}", dir.display()))
+        }
+    }
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode))
+        .with_context(|| format!("set permissions on {}", dir.display()))?;
+    Ok(())
+}
+
+fn install_trust_refresher(
+    args: &InstallDeploymentTrustArgs,
+    delegated_key: &Path,
+    delegation: &Path,
+    registry_public_key: &Path,
+) -> Result<()> {
+    let delegated_key_bytes = read_limited(delegated_key, MAX_AGE_CIPHERTEXT_BYTES)?;
+    let delegation_artifact: DelegationArtifact =
+        read_json_limited(delegation, MAX_DELEGATION_BYTES)?;
+    ensure!(
+        delegation_artifact.schema == DELEGATION_SCHEMA,
+        "unsupported delegation schema"
+    );
+    let registry_public_key_bytes = read_limited(registry_public_key, 32)?;
+    let registry_public_key_array: [u8; 32] = registry_public_key_bytes
+        .clone()
+        .try_into()
+        .map_err(|_| anyhow!("registry_public_key must be exactly 32 bytes"))?;
+    VerifyingKey::from_bytes(&registry_public_key_array)
+        .context("invalid registry Ed25519 public key")?;
+
+    ensure_root_owned_dir(Path::new(DELEGATED_DIR), 0o750)?;
+    ensure_root_owned_dir(Path::new(CREDENTIALS_RUN_DIR), 0o755)?;
+
+    let delegated_key_dest = PathBuf::from(DELEGATED_SIGNER_INSTALL_PATH);
+    let delegation_dest = PathBuf::from(DELEGATION_INSTALL_PATH);
+    let registry_public_key_dest = PathBuf::from(REGISTRY_PUBLIC_KEY_INSTALL_PATH);
+    preflight_outputs(
+        [&delegated_key_dest, &delegation_dest, &registry_public_key_dest],
+        args.force,
+    )?;
+    commit_outputs(vec![
+        PendingOutput::new(&delegated_key_dest, delegated_key_bytes, 0o600),
+        PendingOutput::new(
+            &delegation_dest,
+            pretty_json_bytes(&delegation_artifact)?,
+            0o644,
+        ),
+        PendingOutput::new(&registry_public_key_dest, registry_public_key_bytes, 0o644),
+    ])?;
+
+    let service_dest = PathBuf::from(TRUST_REFRESH_SERVICE_UNIT_PATH);
+    let timer_dest = PathBuf::from(TRUST_REFRESH_TIMER_UNIT_PATH);
+    preflight_outputs([&service_dest, &timer_dest], true)?;
+    commit_outputs(vec![
+        PendingOutput::new(
+            &service_dest,
+            trust_refresh_service_unit().into_bytes(),
+            0o644,
+        ),
+        PendingOutput::new(
+            &timer_dest,
+            trust_refresh_timer_unit(&args.refresh_interval).into_bytes(),
+            0o644,
+        ),
+    ])?;
+
+    if !args.no_enable {
+        run_systemctl(&["daemon-reload"])?;
+        run_systemctl(&["enable", "--now", "hyprstream-trust-refresh.timer"])?;
+    }
+    Ok(())
+}
+
+fn run_systemctl(args: &[&str]) -> Result<()> {
+    let status = Command::new("systemctl")
+        .args(args)
+        .status()
+        .with_context(|| format!("run systemctl {}", args.join(" ")))?;
+    ensure!(status.success(), "systemctl {} failed: {status}", args.join(" "));
+    Ok(())
+}
+
+/// The refresher only ever needs the delegated (non-root) signer: it must
+/// never be able to sign directly with the root authority, matching the
+/// least-privilege split the ceremony (docs/deployment-trust-ceremony.md)
+/// establishes between minting and day-to-day operation.
+fn trust_refresh_service_unit() -> String {
+    format!(
+        r#"[Unit]
+Description=Hyprstream registry deployment credential refresh
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists={DEPLOYMENT_TRUST_DIR}/deployment-ca.hybrid
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/hyprstream trust mint-registry-jwt \
+  --public-ca {PUBLIC_CA_INSTALL_PATH} \
+  --authority-log {AUTHORITY_LOG_INSTALL_PATH} \
+  --authority-checkpoint {AUTHORITY_CHECKPOINT_INSTALL_PATH} \
+  --via-delegated-signer {DELEGATED_SIGNER_INSTALL_PATH} \
+  --delegation {DELEGATION_INSTALL_PATH} \
+  --registry-public-key {REGISTRY_PUBLIC_KEY_INSTALL_PATH} \
+  --jwt {REGISTRY_JWT_INSTALL_PATH} \
+  --contract {CREDENTIALS_RUN_DIR}/deployment-trust.contract.json \
+  --force
+# mint-registry-jwt writes {REGISTRY_JWT_INSTALL_PATH} through the same
+# staged-file-then-rename commit path every other trust artifact uses, so a
+# concurrent reader never observes a partially-written credential.
+ProtectSystem=strict
+ReadWritePaths={CREDENTIALS_RUN_DIR}
+ReadOnlyPaths={DEPLOYMENT_TRUST_DIR}
+NoNewPrivileges=yes
+"#
+    )
+}
+
+fn trust_refresh_timer_unit(refresh_interval: &str) -> String {
+    format!(
+        r#"[Unit]
+Description=Periodic refresh of the Hyprstream registry deployment credential
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec={refresh_interval}
+AccuracySec=1min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+"#
+    )
 }
 
 fn rotate_authority(args: &RotateAuthorityArgs) -> Result<()> {
@@ -2575,5 +2824,47 @@ mod tests {
             &format!("{token}\n")
         )
         .is_err());
+    }
+
+    #[test]
+    fn trust_refresh_service_unit_only_uses_the_delegated_signer() {
+        let unit = trust_refresh_service_unit();
+        assert!(unit.contains("--via-delegated-signer /etc/hyprstream/trust/delegated/registry-delegated-signer.age"));
+        assert!(unit.contains("--delegation /etc/hyprstream/trust/delegated/registry-signer.delegation.json"));
+        assert!(unit.contains("--jwt /run/hyprstream/credentials/registry-service.jwt"));
+        assert!(unit.contains("--force"));
+        assert!(
+            !unit.contains("--root") && !unit.contains("deployment-ca.age"),
+            "refresher unit must never reference the root authority — only the delegated signer"
+        );
+    }
+
+    #[test]
+    fn trust_refresh_timer_unit_uses_the_requested_interval() {
+        let unit = trust_refresh_timer_unit("30min");
+        assert!(unit.contains("OnUnitActiveSec=30min"));
+        assert!(unit.contains("WantedBy=timers.target"));
+    }
+
+    #[test]
+    fn ensure_root_owned_dir_creates_missing_directory_with_mode() {
+        let base = tempfile::tempdir().unwrap();
+        let target = base.path().join("a/b/c");
+        ensure_root_owned_dir(&target, 0o750).unwrap();
+        let metadata = std::fs::metadata(&target).unwrap();
+        assert!(metadata.is_dir());
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o750);
+        // Idempotent: a second call against the same real directory succeeds.
+        ensure_root_owned_dir(&target, 0o750).unwrap();
+    }
+
+    #[test]
+    fn ensure_root_owned_dir_rejects_symlinked_target() {
+        let base = tempfile::tempdir().unwrap();
+        let real = base.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let link = base.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert!(ensure_root_owned_dir(&link, 0o755).is_err());
     }
 }
