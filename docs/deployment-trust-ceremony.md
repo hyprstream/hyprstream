@@ -210,11 +210,30 @@ Verified: succeeds with **no root bundle and no hardware token**. The credential
 
 Verify anything with `hyprstream trust verify-deployment`, which uses the production verifier.
 
+#### What unattended refresh costs you
+
+The credential above expires in an hour, so a deployed host re-mints it on a timer with no
+operator present. That is only possible if the host can decrypt the delegated signer by itself —
+so `--identity` (`online-signer.key` above) must be resident on the host, root-owned and `0600`,
+where `hyprstream trust install --refresh-identity` puts it.
+
+Accept this deliberately: **root compromise on a deployed host yields the delegated signer**, and
+with it the ability to mint registry credentials until the delegation expires. That is the price of
+unattended operation, and it is why the delegation is scoped to the registry service and given a
+short life rather than being a second root. It is *not* a path to the root authority — the root
+bundle is sealed to a disjoint recipient set that this identity cannot open, and it never touches a
+deployed host.
+
+Two consequences worth planning for: keep the delegation TTL short enough that a compromise window
+you would tolerate is the same window you actually have, and treat rotating the delegated signer —
+not just the JWT — as a routine operation rather than an incident-only one.
+
 ### 6. After the ceremony
 
 - `deployment-ca.age` → offline storage with the token. Never onto a deployed host.
 - Public artifacts (`deployment-ca.hybrid`, authority log, checkpoint) → `/etc/hyprstream/trust/`.
 - Delegated signer + delegation → the deployment environment.
+- Online-signer identity → the deployment environment, for unattended refresh only (see above).
 - **Destroy the ceremony working directory** (`shred` key material, then remove it).
 
 ## Gotchas (each cost real time)
