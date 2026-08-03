@@ -318,7 +318,10 @@ fn reach_from_capsule(verified: &VerifiedCapsule, document: &Value) -> Result<Tr
         })
         .ok_or_else(|| {
             anyhow::anyhow!(
-                "capsule has no NinePExport service entry {DEPLOYMENT_REACH_SERVICE:?} for deployment reach"
+                "capsule has no NinePExport service entry {DEPLOYMENT_REACH_SERVICE:?} for deployment reach; \
+                 the pinned did:at9p must be an ANCHOR capsule signed by the deployment CA, not a node \
+                 identity capsule — mint one with `hyprstream trust mint-anchor-capsule` and publish it \
+                 (with its did.json) under the deployment well-known directory"
             )
         })?;
     match entry.endpoint.transport {
@@ -371,13 +374,53 @@ fn reach_from_capsule(verified: &VerifiedCapsule, document: &Value) -> Result<Tr
     }
 }
 
-pub(crate) async fn verify_did_anchored_document(
+/// Deployment material an anchor capsule contributes, once the capsule and the
+/// `did:web` document have mutually attested to each other.
+///
+/// This is the verification-only half of the DID-anchored bootstrap — the part
+/// a minting ceremony can self-check offline, before publication and before any
+/// registry credential or authority log exists.
+#[derive(Clone, Debug)]
+pub struct VerifiedAnchorMaterial {
+    /// The GATE-verified `did:at9p` the document reciprocally names.
+    pub at9p_did: String,
+    /// Raw hybrid deployment root taken from the capsule's primary subject
+    /// key: the 32-byte Ed25519 key followed by the 1952-byte ML-DSA-65 key,
+    /// the same layout the OS-owned `deployment-ca.hybrid` pin uses.
+    pub deployment_ca_public: Vec<u8>,
+    /// Deployment reach decoded from the capsule's `#ns` NinePExport entry.
+    pub discovery_transport: TransportConfig,
+}
+
+/// Verify an anchor capsule against its `did:web` document through the
+/// production resolution path, without needing the registry credential or
+/// authority log the live bootstrap also fetches.
+///
+/// Minting ceremonies call this on their own output: material this rejects is
+/// material a node would refuse at boot.
+pub async fn verify_anchor_material(
     anchors: &DidAnchors,
     document: &Value,
     capsule_source: Arc<dyn CapsuleSource>,
-    registry_credential: String,
-    authority_log: DeploymentAuthorityLog,
-) -> Result<DidAnchoredTrust> {
+) -> Result<VerifiedAnchorMaterial> {
+    let (identity, ca, discovery_transport) =
+        resolve_anchor_pair(anchors, document, capsule_source).await?;
+    let mut deployment_ca_public = ca.ed25519_bytes().to_vec();
+    deployment_ca_public.extend_from_slice(&ca.ml_dsa_65_bytes());
+    Ok(VerifiedAnchorMaterial {
+        at9p_did: identity.at9p_did.as_str().to_owned(),
+        deployment_ca_public,
+        discovery_transport,
+    })
+}
+
+/// Shared core of the DID-anchored trust decision: reciprocal naming, the
+/// capsule GATE, and the CA + reach the GATE-verified capsule carries.
+async fn resolve_anchor_pair(
+    anchors: &DidAnchors,
+    document: &Value,
+    capsule_source: Arc<dyn CapsuleSource>,
+) -> Result<(AuthoritativeIdentity, HybridDeploymentCa, TransportConfig)> {
     anyhow::ensure!(
         document.get("id").and_then(Value::as_str) == Some(anchors.cluster_did_web.as_str()),
         "did:web document id does not match configured cluster_did_web"
@@ -409,7 +452,22 @@ pub(crate) async fn verify_did_anchored_document(
         ),
         "capsule deployment reach is not a network transport"
     );
+    Ok((
+        authoritative_identity,
+        ca_verifying_key,
+        discovery_transport,
+    ))
+}
 
+pub(crate) async fn verify_did_anchored_document(
+    anchors: &DidAnchors,
+    document: &Value,
+    capsule_source: Arc<dyn CapsuleSource>,
+    registry_credential: String,
+    authority_log: DeploymentAuthorityLog,
+) -> Result<DidAnchoredTrust> {
+    let (authoritative_identity, ca_verifying_key, discovery_transport) =
+        resolve_anchor_pair(anchors, document, capsule_source).await?;
     Ok(DidAnchoredTrust {
         ca_verifying_key,
         discovery_transport,
