@@ -273,6 +273,12 @@ fn mint_deployment_ca(args: &MintDeploymentCaArgs) -> Result<()> {
                      confirm the overwrite."
                 );
             }
+            if args.force {
+                println!(
+                    "  WARNING: --force bypasses the PIV slot occupancy check. \
+                     Any existing key in slot {slot} will be IRREVERSIBLY destroyed."
+                );
+            }
             let recovery_key = SigningKey::generate(&mut rand::rngs::OsRng);
             let (slot, public) = piv_import_ed25519(slot, &recovery_key)?;
             (
@@ -1788,40 +1794,73 @@ fn validate_delegation_artifact(
     )
 }
 
-/// Inputs collected from probing a PIV slot before a destructive import.
+/// `ykman` argv (after the program name) that asks whether a PIV slot holds
+/// a private key, plus the stderr marker it prints when the slot has none.
 ///
-/// Kept as a plain data struct so the safety decision in
-/// [`slot_occupied_from_probe`] can be unit-tested without launching
-/// external processes or relying on a real YubiKey being attached.
+/// `{slot}` is substituted with the validated slot id.
+const PIV_KEY_PROBE: PivProbe = PivProbe {
+    argv: &["piv", "keys", "info", "{slot}"],
+    absent_marker: "No key stored in slot",
+};
+
+/// `ykman` argv that asks whether a PIV slot holds a certificate object,
+/// plus the stderr marker it prints when the slot has none. `-` sends any
+/// certificate found to stdout, which the probe discards.
+const PIV_CERT_PROBE: PivProbe = PivProbe {
+    argv: &["piv", "certificates", "export", "{slot}", "-"],
+    absent_marker: "No certificate found",
+};
+
+/// A single `ykman` presence probe: what to run, and how to recognise a
+/// definitive "nothing is here" answer.
 #[derive(Clone, Copy, Debug)]
-struct SlotProbeInputs {
-    /// `yubico-piv-tool -a read-certificate` exited successfully, i.e. the
-    /// slot holds a certificate object.
-    cert_present: bool,
-    /// A separate key-presence probe (`ykman piv keys list`) indicated a
-    /// key occupies the slot. A slot with a key but no certificate is
-    /// exactly the state [`piv_import_ed25519`] leaves behind: it imports
-    /// a key without minting a certificate object. Probing certificate
-    /// alone misses that state, which is why this field exists.
-    key_present: bool,
-    /// Any probe failed to produce a definitive answer (PCSC failure,
-    /// token removed, binary not found, unexpected non-zero exit).
-    /// Treated as occupied: the safe default is to refuse the destructive
-    /// import rather than silently permit it.
-    probe_indeterminate: bool,
+struct PivProbe {
+    argv: &'static [&'static str],
+    absent_marker: &'static str,
 }
 
-/// Decide whether a PIV slot must be treated as occupied.
+/// Decide whether a probe definitively reported an empty slot.
 ///
-/// Pure wrapper over [`SlotProbeInputs`] so the safety logic can be tested
-/// without a YubiKey. The decision is:
-/// - If any probe was indeterminate, treat as occupied (fail closed).
-/// - Otherwise, occupied iff the slot has a certificate OR a key object.
-fn slot_occupied_from_probe(inputs: SlotProbeInputs) -> bool {
-    if inputs.probe_indeterminate {
-        return true;
+/// `ykman` signals absence as exit 1 with a specific message on stderr.
+/// Every other outcome is indeterminate and must NOT read as absent:
+/// exit 0 (the object exists), a different exit-1 message (PCSC failure,
+/// no token present, locked slot), exit 2 (argument or subcommand error —
+/// including a subcommand that does not exist), or no exit code at all
+/// (killed by signal). Refusing a destructive import on an indeterminate
+/// answer is recoverable; permitting one is not.
+fn probe_reports_absent(probe: PivProbe, exit_code: Option<i32>, stderr: &str) -> bool {
+    exit_code == Some(1) && stderr.contains(probe.absent_marker)
+}
+
+/// Combine both probe results into the occupancy decision.
+///
+/// The slot is occupied unless BOTH probes definitively reported absence.
+/// Split out from [`piv_slot_occupied`] so the decision — including the
+/// fail-closed handling of every indeterminate outcome — is unit-testable
+/// against the exact exit codes and stderr text the real binary emits.
+fn slot_occupied_from_probes(key: (Option<i32>, &str), cert: (Option<i32>, &str)) -> bool {
+    !probe_reports_absent(PIV_KEY_PROBE, key.0, key.1)
+        || !probe_reports_absent(PIV_CERT_PROBE, cert.0, cert.1)
+}
+
+/// Run one `ykman` presence probe and return its exit code and stderr.
+///
+/// A failure to launch `ykman` at all is returned as an error rather than
+/// as a probe result: the caller propagates it, which aborts the mint
+/// before anything destructive runs.
+fn run_piv_probe(probe: PivProbe, slot: &str) -> Result<(Option<i32>, String)> {
+    let mut command = Command::new("ykman");
+    for arg in probe.argv {
+        command.arg(if *arg == "{slot}" { slot } else { arg });
     }
-    inputs.cert_present || inputs.key_present
+    let output = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .with_context(|| format!("launch ykman {}", probe.argv.join(" ")))?;
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    Ok((output.status.code(), stderr))
 }
 
 /// Check whether a PIV slot already holds a key or certificate.
@@ -1829,79 +1868,31 @@ fn slot_occupied_from_probe(inputs: SlotProbeInputs) -> bool {
 /// `ykman piv keys import` silently overwrites slot contents; this check
 /// gives the caller a chance to warn or refuse before the import runs.
 ///
-/// Probes BOTH the certificate object (via `yubico-piv-tool -a
-/// read-certificate`) AND the key object (via `ykman piv keys list`).
-/// Probing certificate alone misses the exact state left behind by
-/// [`piv_import_ed25519`]: a key imported without minting a certificate
-/// object, which reads as empty to a certificate-only probe. Any probe
-/// error (PCSC failure, token removed, binary missing) is treated as
-/// "occupied" — the safe default that refuses a destructive overwrite
-/// rather than silently permitting it.
+/// Probes BOTH objects, because either alone misses a real state:
+/// - `ykman piv keys info <slot>` reports key metadata regardless of
+///   certificate state, which is what catches the key-but-no-certificate
+///   slot [`piv_import_ed25519`] leaves behind.
+/// - `ykman piv certificates export <slot> -` catches a slot holding a
+///   certificate whose private key lives elsewhere or has been deleted.
+///
+/// Any outcome that is not a definitive "absent" — PCSC failure, token
+/// removed, locked slot, unexpected exit status — reads as occupied. If
+/// `ykman` cannot be launched at all this returns an error, which also
+/// stops the import.
 fn piv_slot_occupied(slot: &str) -> Result<bool> {
     let slot = validate_piv_slot(slot)?;
-    Ok(slot_occupied_from_probe(probe_piv_slot(&slot)?))
-}
-
-/// Probe a PIV slot for certificate and key presence. See
-/// [`slot_occupied_from_probe`] for the decision rule applied to the
-/// returned inputs.
-fn probe_piv_slot(slot: &str) -> Result<SlotProbeInputs> {
-    // Certificate probe: a slot with no certificate object returns a
-    // non-zero exit; a slot with any certificate object returns zero.
-    let cert_present = match Command::new("yubico-piv-tool")
-        .args(["-a", "read-certificate", "-s"])
-        .arg(slot)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-    {
-        Ok(status) => status.success(),
-        Err(_) => {
-            return Ok(SlotProbeInputs {
-                cert_present: false,
-                key_present: false,
-                probe_indeterminate: true,
-            });
-        }
-    };
-
-    // Key-presence probe: `ykman piv keys list` enumerates keys in all PIV
-    // slots regardless of whether a certificate object has been minted.
-    // This is what catches the key-but-no-certificate state produced by
-    // `piv_import_ed25519`, which the certificate probe above cannot see.
-    let key_present = match Command::new("ykman")
-        .args(["piv", "keys", "list"])
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
-    {
-        Ok(output) if output.status.success() => {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            // ykman prints one row per occupied slot with the slot id as
-            // the leading whitespace-delimited token (e.g. "9a    ED25519
-            // ..."). Match only the first token so "9a" does not match
-            // inside another row's fingerprint or policy string.
-            stdout
-                .lines()
-                .any(|line| line.split_whitespace().next() == Some(slot))
-        }
-        _ => {
-            // ykman unavailable or returned non-zero: indeterminate. Fail
-            // closed rather than silently allowing an overwrite.
-            return Ok(SlotProbeInputs {
-                cert_present,
-                key_present: false,
-                probe_indeterminate: true,
-            });
-        }
-    };
-
-    Ok(SlotProbeInputs {
-        cert_present,
-        key_present,
-        probe_indeterminate: false,
-    })
+    let key = run_piv_probe(PIV_KEY_PROBE, &slot)?;
+    // Short-circuit: a key is the object the guard exists to protect, so
+    // there is no reason to touch the card a second time once one is
+    // known (or suspected) to be present.
+    if !probe_reports_absent(PIV_KEY_PROBE, key.0, &key.1) {
+        return Ok(true);
+    }
+    let cert = run_piv_probe(PIV_CERT_PROBE, &slot)?;
+    Ok(slot_occupied_from_probes(
+        (key.0, &key.1),
+        (cert.0, &cert.1),
+    ))
 }
 
 fn piv_import_ed25519(slot: &str, key: &SigningKey) -> Result<(String, VerifyingKey)> {
@@ -2510,7 +2501,9 @@ fn now_unix_u64() -> Result<u64> {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
+// `print_stderr` is exempted alongside unwrap/expect so a test that has to
+// skip (external binary absent) can say so instead of passing silently.
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::print_stderr)]
 mod tests {
     use super::*;
 
@@ -3363,77 +3356,135 @@ mod tests {
 
     // ---- PIV slot occupancy guard ------------------------------------
 
-    /// Helper: build probe inputs without spelling every field each call.
-    fn probe(cert: bool, key: bool, indeterminate: bool) -> SlotProbeInputs {
-        SlotProbeInputs {
-            cert_present: cert,
-            key_present: key,
-            probe_indeterminate: indeterminate,
-        }
+    /// Verbatim stderr from `ykman piv keys info 9c` against a YubiKey
+    /// whose slot holds no key.
+    const YKMAN_NO_KEY: &str = "ERROR: No key stored in slot 9C (SIGNATURE).\n";
+    /// Verbatim stderr from `ykman piv certificates export 9c -` against a
+    /// YubiKey whose slot holds no certificate.
+    const YKMAN_NO_CERT: &str = "ERROR: No certificate found.\n";
+
+    /// The only state that permits a destructive import: both objects
+    /// definitively reported absent.
+    #[test]
+    fn piv_slot_empty_only_when_both_probes_report_absent() {
+        assert!(!slot_occupied_from_probes(
+            (Some(1), YKMAN_NO_KEY),
+            (Some(1), YKMAN_NO_CERT),
+        ));
     }
 
-    /// The primary scenario the guard exists for: an operator re-runs
-    /// import against a slot they already provisioned. `piv_import_ed25519`
-    /// imports a key but does not mint a certificate object, so a
-    /// certificate-only probe reads this state as EMPTY. The key-presence
-    /// probe must catch it.
+    /// The primary scenario the guard exists for: `piv_import_ed25519`
+    /// imports a key without minting a certificate, so a certificate-only
+    /// probe reads that slot as empty. The key probe must catch it.
     #[test]
     fn piv_slot_with_key_but_no_certificate_is_occupied() {
-        assert!(slot_occupied_from_probe(probe(false, true, false)));
+        assert!(slot_occupied_from_probes(
+            (Some(0), ""),
+            (Some(1), YKMAN_NO_CERT),
+        ));
     }
 
-    /// A slot with a certificate is occupied regardless of key state.
+    /// The mirror case: a certificate whose private key lives elsewhere.
     #[test]
-    fn piv_slot_with_certificate_is_occupied() {
-        assert!(slot_occupied_from_probe(probe(true, false, false)));
-        assert!(slot_occupied_from_probe(probe(true, true, false)));
+    fn piv_slot_with_certificate_but_no_key_is_occupied() {
+        assert!(slot_occupied_from_probes(
+            (Some(1), YKMAN_NO_KEY),
+            (Some(0), "")
+        ));
     }
 
-    /// A definitively empty slot (no cert, no key, all probes ran clean)
-    /// is the only state that reads as not occupied.
+    /// Exit 1 carrying a message OTHER than the absence marker is a
+    /// transient failure, not an empty slot. Either probe failing this
+    /// way must refuse the import.
     #[test]
-    fn piv_slot_definitively_empty_is_not_occupied() {
-        assert!(!slot_occupied_from_probe(probe(false, false, false)));
+    fn piv_slot_transient_failure_is_not_absence() {
+        let transient = "ERROR: Failed to connect to YubiKey.\n";
+        assert!(slot_occupied_from_probes(
+            (Some(1), transient),
+            (Some(1), YKMAN_NO_CERT),
+        ));
+        assert!(slot_occupied_from_probes(
+            (Some(1), YKMAN_NO_KEY),
+            (Some(1), transient),
+        ));
     }
 
-    /// Any probe that cannot produce a definitive answer (PCSC failure,
-    /// token removed, binary missing) must be treated as occupied — never
-    /// as empty. This is the fail-closed rule.
+    /// Exit 2 is how `ykman` reports a subcommand or argument it does not
+    /// recognise. It must never read as "slot is empty" — that inversion
+    /// is exactly how a wrong command name turns the guard into a
+    /// rubber stamp.
     #[test]
-    fn piv_slot_probe_indeterminate_fails_closed() {
-        assert!(slot_occupied_from_probe(probe(false, false, true)));
+    fn piv_slot_argument_error_is_not_absence() {
+        assert!(slot_occupied_from_probes(
+            (Some(2), "Error: No such command 'list'.\n"),
+            (Some(1), YKMAN_NO_CERT),
+        ));
     }
 
-    /// Indeterminate dominates: even when a partial probe suggested the
-    /// slot was empty, an indeterminate result on the other probe must
-    /// not downgrade the slot to "safe to overwrite".
+    /// Absence requires BOTH the exit code and the marker. Matching the
+    /// marker alone would let any failure that happens to quote the
+    /// message — a usage error echoing it, a wrapper relaying it —
+    /// clear the guard.
     #[test]
-    fn piv_slot_indeterminate_dominates_empty_signals() {
-        assert!(slot_occupied_from_probe(probe(true, false, true)));
+    fn piv_slot_absence_marker_alone_is_not_absence() {
+        assert!(slot_occupied_from_probes(
+            (Some(2), "Usage error near: No key stored in slot 9C\n"),
+            (Some(1), YKMAN_NO_CERT),
+        ));
+        assert!(slot_occupied_from_probes(
+            (Some(1), YKMAN_NO_KEY),
+            (Some(2), "Usage error near: No certificate found\n"),
+        ));
     }
 
-    /// The slot string passed to `ykman piv keys list` matching must be
-    /// matched only as the leading token of a row, never as a substring
-    /// of a fingerprint or policy string. A slot id like "9a" must not
-    /// match a row for "9c" whose fingerprint happens to contain "9a".
-    /// This is enforced at the call site via `split_whitespace().next()`;
-    /// this test pins the matching primitive itself.
+    /// A probe killed by a signal reports no exit code at all.
     #[test]
-    fn ykman_row_match_is_first_token_only() {
-        let slot = "9a";
-        let rows = "9c    ED25519     PIN_ONCE   ALWAYS   9a01deadbeef\n";
-        assert!(
-            !rows
-                .lines()
-                .any(|line| line.split_whitespace().next() == Some(slot)),
-            "slot 9a must not match a row whose first token is 9c"
-        );
-        let rows_with_9a = "9a    ED25519     PIN_ONCE   ALWAYS   ---\n9c    X25519\n";
-        assert!(
-            rows_with_9a
-                .lines()
-                .any(|line| line.split_whitespace().next() == Some(slot)),
-            "slot 9a must match a row whose first token is 9a"
-        );
+    fn piv_slot_signal_kill_is_not_absence() {
+        assert!(slot_occupied_from_probes(
+            (None, ""),
+            (Some(1), YKMAN_NO_CERT)
+        ));
+    }
+
+    /// The classification tests above all feed the probes synthetic
+    /// output, so none of them can catch the failure that actually
+    /// shipped: an argv naming a subcommand `ykman` does not have. This
+    /// test runs the real binary and asserts each probe's subcommand is
+    /// recognised — `ykman` exits 0 on `--help` for a command it has and
+    /// 2 for one it does not, without touching a YubiKey.
+    ///
+    /// Skipped when `ykman` is not installed, so the suite stays
+    /// hermetic; on any host that has it, a renamed or invented
+    /// subcommand fails here instead of silently inverting the guard.
+    #[test]
+    fn ykman_probe_subcommands_exist_in_the_real_binary() {
+        for probe in [PIV_KEY_PROBE, PIV_CERT_PROBE] {
+            // Everything up to the slot placeholder is the subcommand path.
+            let subcommand: Vec<&str> = probe
+                .argv
+                .iter()
+                .copied()
+                .take_while(|arg| *arg != "{slot}")
+                .collect();
+            let mut command = Command::new("ykman");
+            let status = command
+                .args(&subcommand)
+                .arg("--help")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+            let Ok(status) = status else {
+                eprintln!("ykman not installed; skipping subcommand existence check");
+                return;
+            };
+            assert_eq!(
+                status.code(),
+                Some(0),
+                "ykman does not recognise the subcommand `{}` used by the PIV \
+                 slot probe",
+                subcommand.join(" ")
+            );
+        }
     }
 }
