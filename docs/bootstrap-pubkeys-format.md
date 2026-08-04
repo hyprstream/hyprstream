@@ -94,6 +94,34 @@ Upgrading a service is therefore a per-entry operation: rewrite one value in
 the 1984-byte form, leave the rest alone. Nothing else in the file, and no
 other node, has to change at the same time.
 
+## Hybrid is mandatory for this node's own services
+
+The two forms above describe what the *parser* accepts. What this node's
+provisioning *writes* is narrower: **every service entry is hybrid**. There is
+no classical provisioning mode and no flag to request one.
+
+The ML-DSA-65 half of each entry is derived from that service's Ed25519 key
+(HKDF, `hyprstream-mesh-mldsa-v1`) rather than generated independently. That is
+required, not merely convenient: every signer in the tree derives its
+post-quantum key the same way, so an independently generated key would publish
+a public key that nothing ever signs with. It also means a service's secret
+material stays a single Ed25519 seed — there is no second private key to
+persist, protect, back up or rotate.
+
+Consequently a classical **service** entry is not a supported configuration; it
+is stale material from a pre-hybrid provisioning run. The runtime refuses it
+with an actionable error when it resolves service keys, rather than trusting it
+classically and then failing each RPC later with an opaque "no anchored
+ML-DSA-65 signer key". The fix is to re-provision: `hyprstream wizard`, or
+`hyprstream service repair`. Per-service keys and JWTs are preserved across a
+re-run, so the identities do not change — only the published entries gain their
+post-quantum half.
+
+The low-level loader still reads classical entries so tooling, and that error
+itself, can report precisely which services are stale. This rule is scoped to
+the node's own services: external classical clients and federated peers do not
+appear in this file and are unaffected by it.
+
 ## Which service names matter
 
 The wizard mints a keypair for every registered factory, but the runtime only
