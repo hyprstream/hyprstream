@@ -1712,6 +1712,22 @@ fn install_envelope_verify_config(oauth: Option<&hyprstream_core::config::OAuthC
 ///
 /// Set `HYPRSTREAM_SESSION_PQ_OVERLAY=0` for a mesh-only deployment that wants
 /// every unenrolled identity rejected at the envelope layer as before.
+///
+/// # Operator limitations at this revision — read before enabling
+///
+/// The overlay's approve / promote / revoke operations exist as library calls
+/// and have **no operator surface yet**: nothing here, no RPC method, no CLI.
+/// Two consequences an operator must know about up front:
+///
+/// - Every binding stays at first-contact provenance for its lifetime.
+///   Out-of-band promotion is unreachable, so the overlay cannot raise MAC
+///   assurance for anyone — a browser client is `Classical` and stays there.
+/// - A refused rebinding is loud but **unanswerable**. A client that rotates
+///   its ML-DSA-65 key while keeping its Ed25519 identity is refused here,
+///   cannot be approved (no surface), and cannot be routed around through the
+///   admin-anchored store (immutable after install). Restarting the daemon
+///   clears the overlay and is currently the only way through. Until the
+///   operator surface lands, plan rotations around a restart.
 fn install_session_pq_overlay() {
     let disabled = std::env::var("HYPRSTREAM_SESSION_PQ_OVERLAY")
         .map(|v| matches!(v.trim(), "0" | "false" | "off" | "no"))
@@ -1730,7 +1746,9 @@ fn install_session_pq_overlay() {
         tracing::info!(
             "session PQ overlay installed: unenrolled identities bind their ML-DSA-65 key \
              at first contact (verifiable, assurance capped at Classical); rebinding an \
-             established identity is refused and surfaced, never silently applied"
+             established identity is refused and surfaced, never silently applied. \
+             No approve/promote/revoke surface exists yet: a refused rebinding requires \
+             a daemon restart to clear."
         );
     }
 }

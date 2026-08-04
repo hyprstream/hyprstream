@@ -1518,7 +1518,13 @@ impl SignedEnvelope {
             None
         };
         let aad = envelope_external_aad();
-        crate::crypto::cose_sign::sign_composite(signing_key, pq, signing_data, &aad)
+        // PQ-bound: the inner EdDSA layer commits to the ML-DSA-65 key above it.
+        // Request envelopes are the one composite whose ML-DSA-65 key a verifier
+        // may RECORD (first contact) rather than resolve from a trust store, so
+        // the Ed25519 signature has to cover which PQ key is being claimed.
+        // Without that, a captured envelope's inner layer can be re-used under a
+        // different outer key by someone who never held the Ed25519 secret.
+        crate::crypto::cose_sign::sign_composite_pq_bound(signing_key, pq, signing_data, &aad)
     }
 
     /// Create, hybrid-encrypt (HyKEM `#mesh-kem` → COSE_Encrypt0), and dual-sign
@@ -1803,9 +1809,9 @@ impl SignedEnvelope {
             .is_ok();
             if sender_holds_identity {
                 if let Some(overlay) = crate::session_pq_overlay::global_session_pq_overlay() {
-                    // Refuses the write and publishes the event; it cannot
-                    // overwrite the established binding.
-                    let _ = overlay.observe_first_contact(self.cnf, presented);
+                    // Publish-only: this key has NOT been proven, so it must not
+                    // reach a code path that could record it.
+                    overlay.surface_rebind(self.cnf, presented);
                 }
             }
             return Err(EnvelopeError::PqSignatureInvalid(
@@ -1815,7 +1821,7 @@ impl SignedEnvelope {
             ));
         }
 
-        crate::crypto::cose_sign::verify_composite(
+        let verified = crate::crypto::cose_sign::verify_composite(
             &self.cose,
             ed_vk,
             anchor.as_ref().map(PqAnchor::key),
@@ -1825,13 +1831,30 @@ impl SignedEnvelope {
         )
         .map_err(|e| EnvelopeError::PqSignatureInvalid(e.to_string()))?;
 
-        // Commit a first-contact observation only now: the composite verified
-        // against the presented key, so the client demonstrably held BOTH the
-        // Ed25519 and the ML-DSA-65 private keys. Recording before this point
-        // would let anyone who can shape an envelope squat an identity's
-        // binding with a key they do not control.
+        // Commit a first-contact observation only now, and only if the composite
+        // proved possession of the Ed25519 private key *alongside* the ML-DSA-65
+        // one.
+        //
+        // `verified.pq_bound` is exactly that proof. The nesting alone is not:
+        // it binds inner→outer, so an unbound composite can be rebuilt by anyone
+        // holding a COPY of the inner layer — they discard the outer, re-sign
+        // `payload ‖ inner_signature` with an ML-DSA key of their own, and the
+        // result verifies with their PQ key under the captured identity. Only
+        // the inner layer's commitment to the outer key rules that out, because
+        // that commitment sits inside the Ed25519 signature.
+        //
+        // An unbound composite still verifies (it may be a peer resolved from
+        // the anchored store, or an older client); it simply cannot establish a
+        // binding.
         #[cfg(not(target_arch = "wasm32"))]
         if let Some(PqAnchor::FirstContact(key)) = &anchor {
+            if !verified.pq_bound {
+                return Err(EnvelopeError::PqSignatureInvalid(
+                    "first contact requires the inner EdDSA layer to commit to its ML-DSA-65 \
+                     key; an uncommitted composite cannot establish a binding"
+                        .to_owned(),
+                ));
+            }
             if let Some(overlay) = crate::session_pq_overlay::global_session_pq_overlay() {
                 let outcome = overlay.observe_first_contact(self.cnf, key);
                 if !matches!(
@@ -1839,9 +1862,9 @@ impl SignedEnvelope {
                     crate::session_pq_overlay::FirstContactOutcome::Recorded
                         | crate::session_pq_overlay::FirstContactOutcome::AlreadyBound(_)
                 ) {
-                    // A racing contact took the slot, or the overlay is full.
-                    // Fail closed rather than serve a request whose signer this
-                    // node did not end up remembering.
+                    // A racing contact took the slot. Fail closed rather than
+                    // serve a request whose signer this node did not end up
+                    // remembering.
                     return Err(EnvelopeError::PqSignatureInvalid(
                         "first-contact ML-DSA-65 binding was not recorded".to_owned(),
                     ));

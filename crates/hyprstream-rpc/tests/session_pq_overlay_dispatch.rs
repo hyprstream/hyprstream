@@ -17,7 +17,11 @@
 //!   and leaves the binding intact;
 //! - a self-asserted key the client cannot actually sign with is never recorded;
 //! - a PQ-less envelope from a bound identity does not clear the binding;
-//! - an out-of-band promotion does raise assurance, and can be revoked.
+//! - an out-of-band promotion does raise assurance, and can be revoked;
+//! - a captured envelope cannot be re-outer-signed to squat the sender's
+//!   binding, at this node or at one that cannot even decrypt the request;
+//! - an admin-anchored key always wins over an overlay entry;
+//! - a flood of self-minted identities cannot lock legitimate clients out.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -77,12 +81,45 @@ impl PqBindingEventSink for RecordingSink {
     }
 }
 
+/// Stands in for the admin-anchored `KeyedPqTrustStore`, which is immutable
+/// after install. Tests need to enroll a key mid-run to exercise precedence,
+/// and need to read the store back to prove the overlay never wrote through to
+/// it.
+#[derive(Default)]
+struct AnchoredStore {
+    bindings: Mutex<std::collections::HashMap<[u8; 32], Vec<u8>>>,
+}
+
+impl AnchoredStore {
+    fn bind(&self, identity: [u8; 32], vk: &MlDsaVerifyingKey) {
+        self.bindings
+            .lock()
+            .insert(identity, hyprstream_rpc::crypto::pq::ml_dsa_vk_bytes(vk));
+    }
+    fn unbind(&self, identity: &[u8; 32]) {
+        self.bindings.lock().remove(identity);
+    }
+    fn has(&self, identity: &[u8; 32]) -> bool {
+        self.bindings.lock().contains_key(identity)
+    }
+}
+
+impl envelope::PqTrustStore for AnchoredStore {
+    fn ml_dsa_key_for(&self, ed25519_pubkey: &[u8; 32]) -> Option<MlDsaVerifyingKey> {
+        self.bindings
+            .lock()
+            .get(ed25519_pubkey)
+            .and_then(|b| ml_dsa_vk_from_bytes(b).ok())
+    }
+}
+
 struct Fixtures {
     server_sk: SigningKey,
     overlay: Arc<SessionPqOverlay>,
     sink: Arc<RecordingSink>,
-    /// The admin-anchored store, kept so tests can assert it never grew.
-    store: Arc<envelope::KeyedPqTrustStore>,
+    /// The admin-anchored store, kept so tests can prove the overlay never
+    /// wrote through to it.
+    anchored: Arc<AnchoredStore>,
 }
 
 fn fixtures() -> &'static Fixtures {
@@ -92,11 +129,10 @@ fn fixtures() -> &'static Fixtures {
 
         // An EMPTY admin-anchored store: no operator enrolled anybody. This is
         // the state a real deployment is in with respect to a browser.
-        let store = Arc::new(envelope::KeyedPqTrustStore::new());
-        assert!(store.is_empty());
+        let anchored = Arc::new(AnchoredStore::default());
         envelope::install_verify_config(envelope::EnvelopeVerifyConfig {
             policy: hyprstream_rpc::crypto::CryptoPolicy::Hybrid,
-            pq_store: Some(store.clone()),
+            pq_store: Some(anchored.clone()),
         })
         .expect("verify config installs once per test binary");
 
@@ -109,7 +145,7 @@ fn fixtures() -> &'static Fixtures {
             server_sk,
             overlay,
             sink,
-            store,
+            anchored,
         }
     })
 }
@@ -264,6 +300,42 @@ async fn dispatch(service: &ObservingService, signed: &SignedEnvelope) -> Result
     .await
 }
 
+/// Rewrite only the OUTER ML-DSA layer, keeping the sender's inner EdDSA
+/// COSE_Sign1 byte-for-byte. Uses **no** Ed25519 private key — the whole point
+/// is that holding the captured bytes is enough to do this.
+fn swap_outer_layer(signed: &mut SignedEnvelope, attacker_pq: &MlDsaSigningKey) -> Vec<u8> {
+    use hyprstream_rpc::crypto::cose_sign::{decode_composite_for_test, encode_composite_for_test};
+
+    let payload = signed
+        .encrypted_envelope
+        .clone()
+        .expect("the mesh-kem shape signs over the ciphertext");
+    let aad = hyprstream_rpc::crypto::cose_sign1::build_external_aad(
+        envelope::ENVELOPE_SCHEMA_ID,
+        envelope::REQUEST_ENVELOPE_TYPE_ID,
+    );
+    let (inner_bytes, _) = decode_composite_for_test(&signed.cose).unwrap();
+    let (ed_sig, _) =
+        hyprstream_rpc::crypto::cose_sign::split_composite(&signed.cose).unwrap();
+
+    let attacker_kid = ml_dsa_sk_to_vk_bytes(attacker_pq);
+    let tbs = hyprstream_rpc::crypto::cose_sign::outer_tbs(
+        attacker_kid.clone(),
+        &payload,
+        &ed_sig,
+        &aad,
+    );
+    let attacker_sig = hyprstream_rpc::crypto::pq::ml_dsa_sign(attacker_pq, &tbs);
+    let attacker_outer = hyprstream_rpc::crypto::cose_sign::outer_layer_for_test(
+        attacker_kid.clone(),
+        attacker_sig,
+    )
+    .unwrap();
+
+    signed.cose = encode_composite_for_test(inner_bytes, Some(attacker_outer)).unwrap();
+    attacker_kid
+}
+
 fn refusals_for(identity: &[u8; 32]) -> usize {
     fixtures()
         .sink
@@ -320,7 +392,7 @@ async fn unenrolled_hybrid_client_dispatches_and_stays_classical() {
 
     // The admin-anchored store was consulted, never written.
     assert!(
-        f.store.is_empty(),
+        !f.anchored.has(&client.identity()),
         "the overlay must never write through to the admin-anchored store"
     );
 }
@@ -346,7 +418,7 @@ async fn an_established_binding_serves_later_requests() {
         "the binding is recorded once, not re-recorded per request"
     );
     assert_eq!(refusals_for(&client.identity()), 0);
-    assert!(f.store.is_empty());
+    assert!(!f.anchored.has(&client.identity()));
 }
 
 /// The service-worker / cache-replacement case: the same identity comes back
@@ -391,7 +463,7 @@ async fn a_different_pq_key_for_a_bound_identity_is_refused_and_surfaced() {
         ),
         hyprstream_rpc::crypto::pq::ml_dsa_vk_bytes(&original_key)
     );
-    assert!(f.store.is_empty());
+    assert!(!f.anchored.has(&client.identity()));
 }
 
 /// The rebinding alarm must be attributable. Anyone can copy a public key into
@@ -434,7 +506,7 @@ async fn a_rebinding_alarm_cannot_be_injected_by_a_stranger() {
         ),
         hyprstream_rpc::crypto::pq::ml_dsa_vk_bytes(&victim.pq_vk())
     );
-    assert!(f.store.is_empty());
+    assert!(!f.anchored.has(&victim.identity()));
 }
 
 /// A PQ key the client asserts but cannot sign with must never be recorded:
@@ -467,7 +539,7 @@ async fn an_unusable_self_asserted_key_is_never_recorded() {
         "nothing may be recorded for a composite that did not verify"
     );
     assert_eq!(first_contacts_for(&client.identity()), 0);
-    assert!(f.store.is_empty());
+    assert!(!f.anchored.has(&client.identity()));
 }
 
 /// Downgrade monotonicity: an envelope arriving without the PQ layer from an
@@ -508,7 +580,220 @@ async fn a_pq_less_envelope_does_not_clear_an_established_binding() {
         f.overlay.provenance_for(&client.identity()),
         Some(PqProvenance::TofuBound)
     );
-    assert!(f.store.is_empty());
+    assert!(!f.anchored.has(&client.identity()));
+}
+
+/// The outer layer of a captured envelope can be re-signed by anyone who holds
+/// the bytes — the nesting binds inner→outer, not outer→inner. If first contact
+/// recorded such a composite, an attacker with no Ed25519 key would squat the
+/// sender's binding and lock them out of their own identity.
+///
+/// The inner layer's commitment to the key above it is what makes that
+/// impossible, and this is the proof.
+#[tokio::test]
+async fn an_outer_layer_swap_cannot_squat_the_senders_binding() {
+    let f = fixtures();
+    let victim = DynamicClient::new(0xA9);
+    let attacker_pq = ml_dsa_sk_from_seed(&[0xEE; 32]);
+
+    // The victim's own genuine envelope, as any node it talks to receives it.
+    let mut captured = victim.signed_request("overlay-swap", b"legitimate work");
+    let attacker_kid = swap_outer_layer(&mut captured, &attacker_pq);
+
+    let service = ObservingService::new("overlay-swap");
+    dispatch(&service, &captured)
+        .await
+        .expect_err("a re-outer-signed capture must not be served");
+    assert!(!service.was_invoked());
+
+    assert!(
+        f.overlay.provenance_for(&victim.identity()).is_none(),
+        "no binding may be established from a composite whose Ed25519 signature \
+         does not cover the PQ key being claimed"
+    );
+
+    // And the victim is not locked out of their own identity.
+    let victim_svc = ObservingService::new("overlay-swap-2");
+    dispatch(
+        &victim_svc,
+        &victim.signed_request("overlay-swap-2", b"hello"),
+    )
+    .await
+    .expect("the victim still owns their identity");
+    assert_eq!(
+        hyprstream_rpc::crypto::pq::ml_dsa_vk_bytes(
+            &f.overlay.verifying_key_for(&victim.identity()).unwrap()
+        ),
+        hyprstream_rpc::crypto::pq::ml_dsa_vk_bytes(&victim.pq_vk())
+    );
+    assert_ne!(
+        hyprstream_rpc::crypto::pq::ml_dsa_vk_bytes(&victim.pq_vk()),
+        attacker_kid
+    );
+    assert!(!f.anchored.has(&victim.identity()));
+}
+
+/// The recording guard, pinned on its own. A composite signed by the true key
+/// holder but WITHOUT the inner commitment is perfectly valid — it just does
+/// not prove the Ed25519 private key was involved in choosing the PQ key, so it
+/// must not establish a binding. This is what stands between a captured
+/// envelope and a squatted identity even if the signing side regresses.
+#[tokio::test]
+async fn an_uncommitted_composite_cannot_establish_a_binding() {
+    use ed25519_dalek::Signer as _;
+    use hyprstream_rpc::crypto::cose_sign::{assemble_composite_nested, inner_tbs, outer_tbs};
+
+    let f = fixtures();
+    let client = DynamicClient::new(0xAC);
+    let mut signed = client.signed_request("overlay-uncommitted", b"hello");
+
+    // Sign the same payload properly, with both real private keys, in the
+    // UNBOUND shape — what an older client emits, or what a regression in the
+    // signing side would emit. Every signature here is genuine.
+    let payload = signed.encrypted_envelope.clone().unwrap();
+    let aad = hyprstream_rpc::crypto::cose_sign1::build_external_aad(
+        envelope::ENVELOPE_SCHEMA_ID,
+        envelope::REQUEST_ENVELOPE_TYPE_ID,
+    );
+    let ed_kid = signed.cnf.to_vec();
+    let pq_kid = ml_dsa_sk_to_vk_bytes(&client.pq_sk);
+    let ed_sig = client
+        .ed_sk
+        .sign(&inner_tbs(ed_kid.clone(), &payload, &aad, true))
+        .to_bytes()
+        .to_vec();
+    let pq_sig = hyprstream_rpc::crypto::pq::ml_dsa_sign(
+        &client.pq_sk,
+        &outer_tbs(pq_kid.clone(), &payload, &ed_sig, &aad),
+    );
+    signed.cose =
+        assemble_composite_nested((ed_kid, ed_sig), Some((pq_kid, pq_sig))).unwrap();
+
+    let service = ObservingService::new("overlay-uncommitted");
+    dispatch(&service, &signed)
+        .await
+        .expect_err("an uncommitted composite must not establish a binding");
+    assert!(!service.was_invoked());
+    assert!(f.overlay.provenance_for(&client.identity()).is_none());
+    assert!(!f.anchored.has(&client.identity()));
+}
+
+/// The overlay commit runs inside `verify_cose`, which the envelope lifecycle
+/// executes before decryption and before the replay-nonce commit. So a captured
+/// envelope re-aimed at a node that cannot even decrypt it still reaches the
+/// recording step — and must still record nothing.
+#[tokio::test]
+async fn a_capture_replayed_at_a_node_that_cannot_decrypt_records_nothing() {
+    let f = fixtures();
+    let victim = DynamicClient::new(0xAA);
+    let attacker_pq = ml_dsa_sk_from_seed(&[0xED; 32]);
+
+    let mut captured = victim.signed_request("overlay-crossnode", b"work for node A");
+    swap_outer_layer(&mut captured, &attacker_pq);
+
+    // A different node: different signing key, so a different `#mesh-kem`
+    // recipient and no way to open the ciphertext.
+    let (other_node_sk, _) = generate_signing_keypair();
+    let service = ObservingService::new("overlay-crossnode");
+    support::install_explicit_dispatch_pep();
+    let res = process_request(
+        &to_wire(&captured),
+        &service,
+        EnvelopeVerification::AnySigner,
+        &other_node_sk,
+        &envelope::InMemoryNonceCache::new(),
+        CarrierContext::iroh(),
+    )
+    .await;
+
+    assert!(res.is_err());
+    assert!(!service.was_invoked());
+    assert!(
+        f.overlay.provenance_for(&victim.identity()).is_none(),
+        "an undeliverable replay must not poison a node's binding table"
+    );
+    assert!(!f.anchored.has(&victim.identity()));
+}
+
+/// An admin-anchored enrollment outranks anything the overlay holds, and the
+/// two answers — which key verifies, and how much assurance it carries — stay
+/// pinned together. Without this, a reordering would let a session-scoped key
+/// inherit the anchored `PqHybrid` assurance.
+#[tokio::test]
+async fn an_admin_anchored_key_outranks_an_overlay_entry() {
+    let f = fixtures();
+    let client = DynamicClient::new(0xAB);
+
+    // The operator enrolls K1 for this identity out of band.
+    let anchored_pq = ml_dsa_sk_from_seed(&[0xC1; 32]);
+    let anchored_vk = ml_dsa_vk_from_bytes(&ml_dsa_sk_to_vk_bytes(&anchored_pq)).unwrap();
+    f.anchored.bind(client.identity(), &anchored_vk);
+
+    // The overlay independently holds K2 for the same identity.
+    let overlay_vk = client.pq_vk();
+    let _ = f
+        .overlay
+        .observe_first_contact(client.identity(), &overlay_vk);
+    assert_ne!(
+        hyprstream_rpc::crypto::pq::ml_dsa_vk_bytes(&anchored_vk),
+        hyprstream_rpc::crypto::pq::ml_dsa_vk_bytes(&overlay_vk)
+    );
+
+    // A request signed with the ANCHORED key verifies, and carries the
+    // anchored assurance.
+    let anchored_client = DynamicClient {
+        ed_sk: client.ed_sk.clone(),
+        pq_sk: anchored_pq,
+    };
+    let svc = ObservingService::new("overlay-precedence");
+    dispatch(
+        &svc,
+        &anchored_client.signed_request("overlay-precedence", b"anchored"),
+    )
+    .await
+    .expect("the admin-anchored key must be the verify anchor");
+    assert_eq!(
+        svc.observed_key_material(),
+        Some(VerifiedKeyMaterial::PqHybrid),
+        "assurance must come from the store, not from the overlay entry"
+    );
+
+    // A request signed with the OVERLAY key is rejected: the overlay must not
+    // shadow the enrollment.
+    let shadow = ObservingService::new("overlay-precedence-2");
+    dispatch(
+        &shadow,
+        &client.signed_request("overlay-precedence-2", b"overlay"),
+    )
+    .await
+    .expect_err("an overlay entry must not shadow an admin-anchored key");
+    assert!(!shadow.was_invoked());
+
+    f.anchored.unbind(&client.identity());
+}
+
+/// A flood of self-minted identities costs an attacker nothing but keypairs and
+/// runs before authorization. It must not be able to switch the feature off for
+/// everyone else.
+#[tokio::test]
+async fn a_flood_of_self_minted_identities_does_not_lock_out_new_clients() {
+    let f = fixtures();
+    let flood_overlay = SessionPqOverlay::new(Arc::new(RecordingSink::default())).with_max_entries(3);
+
+    for i in 0..6u8 {
+        let flooder = DynamicClient::new(0xF0 + i);
+        let _ = flood_overlay.observe_first_contact(flooder.identity(), &flooder.pq_vk());
+    }
+    assert_eq!(flood_overlay.len(), 3);
+
+    // A genuine new client still gets in.
+    let legit = DynamicClient::new(0x0C);
+    assert!(matches!(
+        flood_overlay.observe_first_contact(legit.identity(), &legit.pq_vk()),
+        FirstContactOutcome::Recorded
+    ));
+    assert!(flood_overlay.verifying_key_for(&legit.identity()).is_some());
+    assert!(!f.anchored.has(&legit.identity()));
 }
 
 /// Out-of-band promotion is the only route to `PqHybrid`, and it is reversible.
@@ -556,7 +841,7 @@ async fn out_of_band_promotion_raises_assurance_and_can_be_revoked() {
         Some(VerifiedKeyMaterial::Classical),
         "a revoked promotion returns to first-contact continuity"
     );
-    assert!(f.store.is_empty());
+    assert!(!f.anchored.has(&client.identity()));
 }
 
 /// Rotation is permitted, but only through the same visible path an attack
@@ -600,5 +885,5 @@ async fn rotation_travels_the_visible_rebinding_path() {
         Some(VerifiedKeyMaterial::Classical),
         "an approved rotation confers no trust of its own"
     );
-    assert!(f.store.is_empty());
+    assert!(!f.anchored.has(&client.identity()));
 }

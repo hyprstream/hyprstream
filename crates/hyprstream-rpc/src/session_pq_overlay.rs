@@ -30,6 +30,23 @@
 //!   this, and [`PqProvenance::key_material`] refuses to map `TofuBound` to
 //!   anything above `Classical`.
 //!
+//! # What a composite has to prove before anything is recorded
+//!
+//! The nested composite binds inner→outer — the outer ML-DSA-65 layer signs
+//! `payload ‖ inner_signature` — and **not** outer→inner. So a composite that
+//! verifies proves possession of the ML-DSA-65 key plus possession of one
+//! Ed25519 *signature*, which is not the same as possession of the Ed25519
+//! *private key*: anyone holding a copy of a valid inner layer can drop the
+//! outer, re-sign with an ML-DSA key of their own, and produce a composite that
+//! verifies under the captured identity.
+//!
+//! That is survivable while the PQ key is always resolved from a trust store,
+//! and fatal the moment it is recorded. So a binding is established only from a
+//! composite whose inner EdDSA layer *commits* to the key above it
+//! ([`crate::crypto::cose_sign::PQ_BINDING_HEADER_LABEL`]) — a commitment that
+//! lives inside the Ed25519 signature. An uncommitted composite still verifies;
+//! it just cannot establish a binding.
+//!
 //! # Rebinding is loud by construction
 //!
 //! TOFU's security value is change detection, not initial trust. A silent
@@ -79,9 +96,15 @@ const FINGERPRINT_DOMAIN: &[u8] = b"hyprstream/pq-composite-fingerprint/v1";
 /// remembered.
 pub const DEFAULT_TOFU_TTL_MS: i64 = 12 * 60 * 60 * 1000;
 
-/// Default ceiling on retained bindings. Recording costs an attacker a full
-/// verified hybrid signature per entry, which is cheap enough that an unbounded
-/// map is a memory-exhaustion surface.
+/// Default ceiling on retained bindings.
+///
+/// Recording costs an attacker only a self-minted Ed25519 + ML-DSA-65 keypair —
+/// no enrollment, no credential, no prior relationship — and the verify path
+/// runs before authorization, so an unbounded map is a memory-exhaustion
+/// surface. At the ceiling the least-recently-seen first-contact entry is
+/// evicted rather than the new one refused; see
+/// [`SessionPqOverlay::observe_first_contact`] for why refusing is the worse
+/// failure. Promoted bindings are never evicted.
 pub const DEFAULT_MAX_ENTRIES: usize = 4096;
 
 /// How a PQ verifying key came to be associated with an Ed25519 identity.
@@ -142,6 +165,9 @@ struct OverlayEntry {
     /// promoted binding, which outlives the session that created it and is
     /// withdrawn by revocation rather than by lapse.
     expires_at_ms: Option<i64>,
+    /// Monotonically increasing stamp of the last contact that touched this
+    /// entry. Orders eviction when the table is full.
+    last_seen_seq: u64,
 }
 
 impl OverlayEntry {
@@ -288,6 +314,10 @@ pub trait PqBindingEventSink: Send + Sync {
 
     /// A promotion or a whole binding was withdrawn.
     fn on_revoked(&self, _identity: &[u8; 32], _from: PqProvenance, _to: Option<PqProvenance>) {}
+
+    /// A first-contact binding was evicted to make room. The identity loses
+    /// change detection until it is seen again.
+    fn on_evicted(&self, _identity: &[u8; 32]) {}
 }
 
 /// Sink that records events to `tracing` at warning level.
@@ -341,6 +371,14 @@ impl PqBindingEventSink for TracingPqBindingEventSink {
             "PQ binding withdrawn"
         );
     }
+
+    fn on_evicted(&self, identity: &[u8; 32]) {
+        tracing::warn!(
+            identity = %hex::encode(identity),
+            "PQ binding evicted under capacity pressure; change detection for this identity \
+             is reset until it is seen again"
+        );
+    }
 }
 
 /// The fingerprint compared over the out-of-band channel.
@@ -382,6 +420,9 @@ pub struct SessionPqOverlay {
     sink: Arc<dyn PqBindingEventSink>,
     tofu_ttl_ms: i64,
     max_entries: usize,
+    /// Recency counter for eviction ordering. Wall-clock is unsuitable: many
+    /// first contacts can land inside one millisecond.
+    contact_seq: std::sync::atomic::AtomicU64,
 }
 
 impl Default for SessionPqOverlay {
@@ -399,6 +440,7 @@ impl SessionPqOverlay {
             sink,
             tofu_ttl_ms: DEFAULT_TOFU_TTL_MS,
             max_entries: DEFAULT_MAX_ENTRIES,
+            contact_seq: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -458,9 +500,14 @@ impl SessionPqOverlay {
 
     /// Offer a PQ key observed at first contact.
     ///
-    /// **Call only after the whole composite has verified against
-    /// `presented_vk`**, so that possession of both private keys is proven
-    /// before anything is written.
+    /// **Call only after the composite has verified against `presented_vk` AND
+    /// reported the inner layer's commitment to it** (`CompositeVerified::
+    /// pq_bound`). Verification alone is not enough: the nesting binds
+    /// inner→outer only, so a composite without that commitment proves
+    /// possession of the ML-DSA-65 key plus possession of one replayable
+    /// Ed25519 signature — not of the Ed25519 private key. Recording on those
+    /// weaker grounds lets anyone holding a captured envelope bind their own PQ
+    /// key to the sender's identity.
     ///
     /// This never overwrites a **live** entry. A live entry naming a different
     /// key produces [`FirstContactOutcome::RebindRefused`], and the event
@@ -484,12 +531,18 @@ impl SessionPqOverlay {
     ) -> FirstContactOutcome {
         let now = crate::envelope::current_timestamp();
         let presented_bytes = ml_dsa_vk_bytes(presented_vk);
+        let seq = self
+            .contact_seq
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut evicted: Option<[u8; 32]> = None;
+        let mut return_capacity_exhausted = false;
 
         let outcome = {
             let mut entries = self.entries.write();
-            match entries.get(&ed25519_pubkey) {
+            match entries.get_mut(&ed25519_pubkey) {
                 Some(entry) if entry.is_live(now) => {
                     if entry.ml_dsa_vk == presented_bytes {
+                        entry.last_seen_seq = seq;
                         FirstContactOutcome::AlreadyBound(entry.provenance)
                     } else {
                         // Refuse. The established binding stays exactly as it
@@ -504,14 +557,44 @@ impl SessionPqOverlay {
                     }
                 }
                 _ => {
-                    // Vacant or lapsed. Reclaim lapsed entries before consulting
-                    // the ceiling so a quiet period is not permanently fatal.
+                    // Vacant or lapsed. Reclaim lapsed entries first — a quiet
+                    // period must not be permanently fatal.
                     if entries.len() >= self.max_entries {
                         entries.retain(|_, e| e.is_live(now));
                     }
-                    if entries.len() >= self.max_entries
-                        && !entries.contains_key(&ed25519_pubkey)
-                    {
+                    // Still full: evict the least-recently-seen *first-contact*
+                    // entry rather than refusing the new one.
+                    //
+                    // Refusing was the obvious fail-closed choice and it is the
+                    // wrong one here. Recording costs an attacker only a
+                    // self-minted keypair — no enrollment, no credential — and
+                    // this runs before authorization, so filling the table is
+                    // seconds of work. Under refusal that locks out every NEW
+                    // dynamic client until entries lapse, i.e. an unauthenticated
+                    // party gets to switch the feature off. Under eviction the
+                    // worst an attacker achieves is resetting other identities'
+                    // change detection, which is the same exposure a lapse
+                    // already carries, and legitimate clients keep connecting.
+                    //
+                    // Promoted bindings are never evicted: they are an operator
+                    // statement, not session continuity.
+                    if entries.len() >= self.max_entries && !entries.contains_key(&ed25519_pubkey) {
+                        let victim = entries
+                            .iter()
+                            .filter(|(_, e)| e.provenance == PqProvenance::TofuBound)
+                            .min_by_key(|(_, e)| e.last_seen_seq)
+                            .map(|(id, _)| *id);
+                        match victim {
+                            Some(id) => {
+                                entries.remove(&id);
+                                evicted = Some(id);
+                            }
+                            // Every slot holds a promotion. Refuse rather than
+                            // discard operator-established trust.
+                            None => return_capacity_exhausted = true,
+                        }
+                    }
+                    if return_capacity_exhausted {
                         FirstContactOutcome::CapacityExhausted
                     } else {
                         entries.insert(
@@ -520,6 +603,7 @@ impl SessionPqOverlay {
                                 ml_dsa_vk: presented_bytes,
                                 provenance: PqProvenance::TofuBound,
                                 expires_at_ms: Some(now.saturating_add(self.tofu_ttl_ms)),
+                                last_seen_seq: seq,
                             },
                         );
                         FirstContactOutcome::Recorded
@@ -537,13 +621,53 @@ impl SessionPqOverlay {
             FirstContactOutcome::CapacityExhausted => {
                 tracing::warn!(
                     identity = %hex::encode(ed25519_pubkey),
-                    "PQ overlay at capacity; first-contact binding refused (request fails closed)"
+                    "PQ overlay at capacity with every slot promoted; first-contact binding \
+                     refused (request fails closed)"
                 );
             }
             FirstContactOutcome::AlreadyBound(_) => {}
         }
+        if let Some(id) = evicted {
+            // An evicted identity loses change detection: its next contact is a
+            // fresh first contact. Say so, rather than letting the table quietly
+            // forget.
+            tracing::warn!(
+                evicted_identity = %hex::encode(id),
+                admitted_identity = %hex::encode(ed25519_pubkey),
+                "PQ overlay at capacity; evicted the least-recently-seen first-contact binding"
+            );
+            self.sink.on_evicted(&id);
+        }
 
         outcome
+    }
+
+    /// Publish a rebinding event **without any possibility of recording**.
+    ///
+    /// The verify path reaches a rebinding attempt before the presented key has
+    /// been checked against anything — the whole point is that the request is
+    /// being rejected. [`Self::observe_first_contact`] must not be reused there:
+    /// its contract is "the composite already verified against this key", and a
+    /// binding that lapses between the lookup and the call would send it down
+    /// the recording branch with an unproven key. This entry point cannot
+    /// record under any interleaving.
+    pub fn surface_rebind(&self, ed25519_pubkey: [u8; 32], presented_vk: &MlDsaVerifyingKey) {
+        let now = crate::envelope::current_timestamp();
+        let event = {
+            let entries = self.entries.read();
+            entries
+                .get(&ed25519_pubkey)
+                .filter(|e| e.is_live(now))
+                .map(|entry| RebindEvent {
+                    identity: ed25519_pubkey,
+                    established_vk: entry.ml_dsa_vk.clone(),
+                    established_provenance: entry.provenance,
+                    presented_vk: ml_dsa_vk_bytes(presented_vk),
+                })
+        };
+        if let Some(event) = event {
+            self.sink.on_rebind_refused(&event);
+        }
     }
 
     /// Replace an established binding, under an approval that answers a
@@ -570,6 +694,9 @@ impl SessionPqOverlay {
                             ml_dsa_vk: approval.event.presented_vk.clone(),
                             provenance: approval.provenance,
                             expires_at_ms,
+                            last_seen_seq: self
+                                .contact_seq
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
                         },
                     );
                     true
@@ -994,14 +1121,72 @@ mod tests {
     }
 
     #[test]
-    fn capacity_is_bounded() {
+    fn a_full_table_evicts_the_stalest_entry_rather_than_locking_new_clients_out() {
+        let (overlay, _sink) = overlay_with_sink();
+        let overlay = overlay.with_max_entries(2);
+        let stale = ed_identity(13);
+        let recent = ed_identity(14);
+        let arriving = ed_identity(15);
+
+        let _ = overlay.observe_first_contact(stale, &pq_key(26));
+        let _ = overlay.observe_first_contact(recent, &pq_key(27));
+        // Touch `recent` so `stale` is unambiguously the least-recently-seen.
+        let _ = overlay.observe_first_contact(recent, &pq_key(27));
+
+        assert!(matches!(
+            overlay.observe_first_contact(arriving, &pq_key(28)),
+            FirstContactOutcome::Recorded
+        ));
+        assert!(
+            overlay.verifying_key_for(&arriving).is_some(),
+            "a new client must not be locked out by a full table"
+        );
+        assert!(overlay.verifying_key_for(&stale).is_none());
+        assert!(overlay.verifying_key_for(&recent).is_some());
+    }
+
+    #[test]
+    fn a_promoted_binding_is_never_evicted() {
         let (overlay, _sink) = overlay_with_sink();
         let overlay = overlay.with_max_entries(1);
-        let _ = overlay.observe_first_contact(ed_identity(13), &pq_key(26));
+        let promoted = ed_identity(16);
+        let key = pq_key(29);
+        let _ = overlay.observe_first_contact(promoted, &key);
+        overlay
+            .promote_out_of_band(&promoted, &composite_fingerprint(&promoted, &key), "printed")
+            .unwrap();
+
+        // Every slot holds operator-established trust, so the arriving identity
+        // is refused rather than that trust discarded.
         assert!(matches!(
-            overlay.observe_first_contact(ed_identity(14), &pq_key(27)),
+            overlay.observe_first_contact(ed_identity(17), &pq_key(30)),
             FirstContactOutcome::CapacityExhausted
         ));
+        assert_eq!(
+            overlay.provenance_for(&promoted),
+            Some(PqProvenance::OobVerified)
+        );
+    }
+
+    #[test]
+    fn surfacing_a_rebind_can_never_record() {
+        let (overlay, sink) = overlay_with_sink();
+        let id = ed_identity(18);
+        let original = pq_key(31);
+        let other = pq_key(32);
+
+        // No binding at all: surfacing must not create one.
+        overlay.surface_rebind(id, &other);
+        assert!(overlay.verifying_key_for(&id).is_none());
+        assert_eq!(CountingSink::count(&sink.refused), 0);
+
+        let _ = overlay.observe_first_contact(id, &original);
+        overlay.surface_rebind(id, &other);
+        assert_eq!(CountingSink::count(&sink.refused), 1);
+        assert_eq!(
+            ml_dsa_vk_bytes(&overlay.verifying_key_for(&id).unwrap()),
+            ml_dsa_vk_bytes(&original)
+        );
     }
 
     #[test]
