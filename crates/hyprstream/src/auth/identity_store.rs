@@ -486,6 +486,26 @@ impl BootstrapPubkey {
         Self { ed25519, ml_dsa_65: Some(ml_dsa_65) }
     }
 
+    /// The hybrid entry for a service that signs with `service_key`.
+    ///
+    /// The ML-DSA-65 half is DERIVED from the service's Ed25519 key with
+    /// [`hyprstream_rpc::node_identity::derive_mesh_mldsa_key`] rather than
+    /// generated independently. That is not merely convenient — it is required
+    /// for the entry to be usable: every signer in the tree (the local signer,
+    /// the service dispatch default, the published `#mesh-pq` verification
+    /// method) produces its post-quantum signature from exactly that
+    /// derivation, so an independently generated key would anchor a public key
+    /// nothing ever signs with. It also keeps the service's secret material a
+    /// single Ed25519 seed — nothing new to persist, protect, back up or
+    /// rotate.
+    pub fn for_service_key(service_key: &SigningKey) -> Result<Self> {
+        let pq_sk = hyprstream_rpc::node_identity::derive_mesh_mldsa_key(service_key);
+        let pq_vk_bytes = hyprstream_rpc::crypto::pq::ml_dsa_sk_to_vk_bytes(&pq_sk);
+        let pq_vk = hyprstream_rpc::crypto::pq::ml_dsa_vk_from_bytes(&pq_vk_bytes)
+            .context("derived mesh ML-DSA-65 verifying key is malformed")?;
+        Ok(Self::hybrid(service_key.verifying_key(), pq_vk))
+    }
+
     /// Whether this entry carries a bound post-quantum key.
     pub fn is_hybrid(&self) -> bool {
         self.ml_dsa_65.is_some()
@@ -626,6 +646,43 @@ pub fn load_bootstrap_pubkeys_hybrid(
     }
 
     Ok(map)
+}
+
+/// Reject a `bootstrap-pubkeys` map that still carries Ed25519-only service
+/// entries.
+///
+/// Every service this node provisions gets a bound ML-DSA-65 key: there is no
+/// classical-only install path, so a classical entry here is stale material
+/// from a pre-hybrid provisioning run, not a supported configuration. Left
+/// alone it does not degrade gracefully — the service is simply never anchored
+/// in the post-quantum trust store, and its RPC is later refused with an
+/// opaque "no anchored ML-DSA-65 signer key" at verification time. Failing
+/// here converts that into an actionable provisioning error.
+///
+/// Deliberately NOT enforced inside [`load_bootstrap_pubkeys_hybrid`]: the
+/// low-level loader must stay able to read a legacy file so tooling — and this
+/// error itself — can report precisely which entries are stale.
+pub fn ensure_bootstrap_pubkeys_hybrid(
+    entries: &std::collections::HashMap<String, BootstrapPubkey>,
+) -> Result<()> {
+    let mut classical: Vec<&str> = entries
+        .iter()
+        .filter(|(_, entry)| !entry.is_hybrid())
+        .map(|(name, _)| name.as_str())
+        .collect();
+    if classical.is_empty() {
+        return Ok(());
+    }
+    classical.sort_unstable();
+    Err(anyhow!(
+        "bootstrap-pubkeys has Ed25519-only entries for service(s): {}. Service \
+         identities must be hybrid (Ed25519 + ML-DSA-65); these were written by a \
+         pre-hybrid provisioning run and cannot be anchored for post-quantum \
+         verification. Re-provision this node by running 'hyprstream wizard' — \
+         it re-provisions in place, preserving existing keys while binding the \
+         ML-DSA-65 half for every service — to rewrite {BOOTSTRAP_PUBKEYS_NAME}.",
+        classical.join(", ")
+    ))
 }
 
 /// Write bootstrap pubkeys, encoding hybrid entries in their concatenated form.
@@ -1834,6 +1891,95 @@ mod tests {
     fn write_raw_bootstrap_pubkeys(dir: &std::path::Path, entries: &[(&str, &str)]) {
         let json: std::collections::BTreeMap<&str, &str> = entries.iter().copied().collect();
         write_secret(dir, "bootstrap-pubkeys", &serde_json::to_vec(&json).unwrap()).unwrap();
+    }
+
+    // ── mandatory hybrid service entries ─────────────────────────────────────
+
+    /// A classical service entry is a hard, actionable error — never a silent
+    /// downgrade to the classical floor.
+    #[test]
+    fn classical_service_entry_is_a_hard_actionable_error() {
+        let dir = TempDir::new().unwrap();
+        let mut map = std::collections::HashMap::new();
+        map.insert(
+            "discovery".to_owned(),
+            BootstrapPubkey::classical(bootstrap_ed_key(11).verifying_key()),
+        );
+        map.insert(
+            "policy".to_owned(),
+            BootstrapPubkey::for_service_key(&bootstrap_ed_key(12)).unwrap(),
+        );
+        write_bootstrap_pubkeys_hybrid(dir.path(), &map).unwrap();
+
+        // The low-level loader still reads the file, so the error can name the
+        // offending entries precisely.
+        let loaded = load_bootstrap_pubkeys_hybrid(dir.path()).unwrap();
+        assert_eq!(loaded.len(), 2);
+
+        let err = format!("{:#}", ensure_bootstrap_pubkeys_hybrid(&loaded).unwrap_err());
+        assert!(err.contains("discovery"), "error names the classical service: {err}");
+        assert!(
+            !err.contains("policy"),
+            "error must not implicate the hybrid service: {err}"
+        );
+        assert!(err.contains("wizard"), "error names the working recovery: {err}");
+        assert!(
+            !err.contains("service repair"),
+            "error must not name the dead-end 'service repair' command: {err}"
+        );
+        assert!(err.contains("ML-DSA-65"), "error names what is missing: {err}");
+    }
+
+    /// An all-hybrid file passes, and an unprovisioned (empty) node is not an
+    /// error — there are no service identities to be wrong about yet.
+    #[test]
+    fn hybrid_service_entries_and_empty_file_both_pass() {
+        let mut map = std::collections::HashMap::new();
+        for (name, seed) in [("policy", 21u8), ("discovery", 22), ("inference", 23)] {
+            map.insert(
+                name.to_owned(),
+                BootstrapPubkey::for_service_key(&bootstrap_ed_key(seed)).unwrap(),
+            );
+        }
+        ensure_bootstrap_pubkeys_hybrid(&map).unwrap();
+        ensure_bootstrap_pubkeys_hybrid(&std::collections::HashMap::new()).unwrap();
+    }
+
+    /// A provisioned service entry round-trips through the file and then
+    /// verifies a real hybrid signature made with the keys the service actually
+    /// signs with — the Ed25519 key plus the ML-DSA-65 key derived from it.
+    #[test]
+    fn provisioned_service_entry_verifies_a_hybrid_signature_end_to_end() {
+        use ed25519_dalek::Signer;
+
+        let dir = TempDir::new().unwrap();
+        let service_key = bootstrap_ed_key(31);
+
+        let mut map = std::collections::HashMap::new();
+        map.insert(
+            "discovery".to_owned(),
+            BootstrapPubkey::for_service_key(&service_key).unwrap(),
+        );
+        write_bootstrap_pubkeys_hybrid(dir.path(), &map).unwrap();
+
+        let loaded = load_bootstrap_pubkeys_hybrid(dir.path()).unwrap();
+        let entry = &loaded["discovery"];
+        assert!(entry.is_hybrid());
+        ensure_bootstrap_pubkeys_hybrid(&loaded).unwrap();
+
+        // Sign exactly as the service's own signer does.
+        let msg = b"service response payload";
+        let ed_sig = service_key.sign(msg);
+        let pq_sk = hyprstream_rpc::node_identity::derive_mesh_mldsa_key(&service_key);
+        let pq_sig = hyprstream_rpc::crypto::pq::ml_dsa_sign(&pq_sk, msg);
+
+        entry.verify(msg, &ed_sig, Some(&pq_sig)).unwrap();
+
+        // And the Ed25519 signature alone is not enough for a provisioned service.
+        assert!(
+            entry.verify(msg, &ed_sig, None).is_err(),
+            "a provisioned service entry must require both signatures"
+        );
     }
 
     #[test]
