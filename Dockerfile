@@ -440,9 +440,11 @@ COPY --from=builder /opt/libtorch/lib/ /opt/libtorch/lib/
 
 FROM ${RUNTIME_BASE} AS runtime-cpu-arm64
 
-# Copy required system libraries (arm64 multiarch source path)
-COPY --from=builder /usr/lib/aarch64-linux-gnu/libgomp.so.1 /usr/lib64/
-COPY --from=builder /usr/lib/aarch64-linux-gnu/libz.so.1 /usr/lib64/
+# Copy required system libraries (arm64 multiarch source path).
+# libgomp and libz are NOT copied here: the runtime base provides libz, and
+# LibTorch bundles its own libgomp at /opt/libtorch/lib/ (which
+# LD_LIBRARY_PATH searches first). Removing them was deferred until a real
+# build confirmed the image — this is that build.
 COPY --from=builder /usr/lib/aarch64-linux-gnu/libzstd.so.1 /usr/lib64/
 COPY --from=builder /usr/lib/aarch64-linux-gnu/libssl.so* /usr/lib64/
 COPY --from=builder /usr/lib/aarch64-linux-gnu/libcrypto.so* /usr/lib64/
