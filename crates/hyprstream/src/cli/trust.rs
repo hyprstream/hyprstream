@@ -884,6 +884,88 @@ fn ensure_owned_dir(dir: &Path, mode: u32, owner_uid: u32) -> Result<()> {
     Ok(())
 }
 
+/// Fail closed if the `age` binary is not on `PATH`, the refresh identity
+/// cannot decrypt the delegated signer ciphertext, the decrypted bundle is not
+/// a `RegistryDelegatedSigner`, or its public bytes do not match the
+/// root-authorized delegation artifact. Every condition is checked before the
+/// installer writes any output or enables the timer, so a misconfigured
+/// deployment is reported immediately rather than discovered by the first
+/// unattended timer firing.
+fn trial_decrypt_delegated_signer(
+    delegated_key: &Path,
+    refresh_identity: &Path,
+    artifact: &DelegationArtifact,
+) -> Result<()> {
+    // The refresher shells out to the `age` binary; a host without it cannot
+    // honor the timer, so fail closed early with a clear message.
+    let age_probe = std::process::Command::new("age")
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .context("the `age` binary is not installed or not executable; the trust refresher requires it")?;
+    ensure!(
+        age_probe.success(),
+        "the `age` binary is not installed or not executable; the trust refresher requires it"
+    );
+
+    // Reproduce the exact decrypt path the refresher's ExecStart follows:
+    // `age --decrypt --identity <refresh_identity>` on the delegated signer.
+    let identities = vec![refresh_identity.to_path_buf()];
+    let plaintext = decrypt_age(delegated_key, &identities)
+        .context("refresh identity cannot decrypt the delegated signer ciphertext")?;
+    let bundle: AuthorityBundle =
+        serde_json::from_slice(&plaintext).context("decode delegated authority bundle")?;
+    ensure!(
+        bundle.schema == AUTHORITY_BUNDLE_SCHEMA,
+        "unsupported authority bundle schema in delegated signer"
+    );
+    ensure!(
+        bundle.purpose == AuthorityPurpose::RegistryDelegatedSigner,
+        "decrypted delegated signer is not a RegistryDelegatedSigner; the \
+         refresher ExecStart rejects any other purpose"
+    );
+
+    // Reconstruct the full LoadedAuthority the same way decrypt_authority does,
+    // so the public-bytes comparison uses the identical derivation path the
+    // refresher will exercise on every timer firing. software_recovery is
+    // false because the refresher ExecStart never passes --software-recovery.
+    let pq_seed = decode_fixed_b64::<32>(&bundle.ml_dsa_65_seed_b64, "ML-DSA-65 seed")?;
+    let pq = ml_dsa_sk_from_seed(&pq_seed);
+    let ed = match &bundle.ed25519 {
+        Ed25519Secret::Software { seed_b64, public_b64 } => {
+            let seed = decode_fixed_b64::<32>(seed_b64, "Ed25519 seed")?;
+            let key = SigningKey::from_bytes(&seed);
+            ensure!(
+                STANDARD.decode(public_b64)? == key.verifying_key().as_bytes(),
+                "delegated Ed25519 public key does not match seed"
+            );
+            LoadedEdSigner::Software(key)
+        }
+        Ed25519Secret::YubikeyPiv { slot, public_b64, .. } => {
+            validate_piv_slot(slot)?;
+            let public_bytes = decode_fixed_b64::<32>(public_b64, "PIV Ed25519 public key")?;
+            let public = VerifyingKey::from_bytes(&public_bytes).context("invalid PIV public key")?;
+            LoadedEdSigner::YubikeyPiv { slot: slot.clone(), public }
+        }
+    };
+    let trial = LoadedAuthority {
+        bundle,
+        ed,
+        pq,
+    };
+    let trial_public = trial.public_bytes();
+    let declared = STANDARD
+        .decode(&artifact.delegated_public_key_b64)
+        .context("decode delegated public key from delegation artifact")?;
+    ensure!(
+        trial_public == declared,
+        "decrypted delegated signer public key does not match the root-authorized delegation"
+    );
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn install_trust_refresher(
     args: &InstallDeploymentTrustArgs,
@@ -919,6 +1001,18 @@ fn install_trust_refresher(
     let refresh_identity_bytes = read_limited(refresh_identity, MAX_AGE_IDENTITY_BYTES)?;
     validate_age_identity_contents(&refresh_identity_bytes)
         .with_context(|| format!("refresh identity {}", refresh_identity.display()))?;
+
+    // Trial-decrypt the delegated signer with the refresh identity before
+    // writing any outputs or enabling the timer. If the identity cannot open
+    // the ciphertext, or the decrypted public key does not match the root-
+    // authorized delegation, the install must fail closed here rather than
+    // silently succeed and then fail on every timer firing.
+    trial_decrypt_delegated_signer(
+        delegated_key,
+        refresh_identity,
+        &delegation_artifact,
+    )
+    .context("trial decrypt of the delegated signer with the refresh identity failed")?;
 
     ensure_root_owned_dir(Path::new(DELEGATED_DIR), 0o750)?;
     ensure_root_owned_dir(Path::new(CREDENTIALS_RUN_DIR), 0o750)?;
@@ -2392,7 +2486,7 @@ fn now_unix_u64() -> Result<u64> {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::print_stderr)]
 mod tests {
     use super::*;
 
@@ -3068,5 +3162,177 @@ mod tests {
         let through_link = mid.join("leaf");
         assert!(std::fs::metadata(&through_link).unwrap().is_dir());
         assert!(ensure_owned_dir(&through_link, 0o755, current_uid()).is_err());
+    }
+
+    /// Generate a fresh age identity/recipient pair via `age-keygen`, returning
+    /// (identity_lines, recipient_string). Returns None when the `age-keygen`
+    /// binary is not available (CI without age installed).
+    fn age_keypair() -> Option<(String, String)> {
+        let output = std::process::Command::new("age-keygen")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let text = String::from_utf8(output.stdout).ok()?;
+        let recipient = text
+            .lines()
+            .find_map(|line| line.strip_prefix("# public key: ").map(str::to_owned))?;
+        let identity = text
+            .lines()
+            .find(|line| line.starts_with("AGE-SECRET-KEY-1"))?
+            .to_owned();
+        Some((identity, recipient))
+    }
+
+    /// Return true when the `age` binary is available on PATH.
+    fn age_available() -> bool {
+        std::process::Command::new("age")
+            .arg("--version")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok()
+    }
+
+    /// Build a temp-dir fixture: encrypts a delegated authority bundle to the
+    /// given recipient, writes the ciphertext and identity to temp files, and
+    /// returns (delegated_key_path, identity_path, public_bytes).
+    fn trial_fixture(
+        dir: &Path,
+        authority: &LoadedAuthority,
+        identity: &str,
+        recipient: &str,
+    ) -> (PathBuf, PathBuf, Vec<u8>) {
+        let public_bytes = authority.public_bytes();
+        let plaintext = serialize_secret_json(&authority.bundle).unwrap();
+        let encrypted = encrypt_age(&plaintext, &[recipient.to_owned()]).unwrap();
+        let delegated_key_path = dir.join("delegated.age");
+        std::fs::write(&delegated_key_path, &encrypted).unwrap();
+        let identity_path = dir.join("identity");
+        std::fs::write(&identity_path, identity).unwrap();
+        (delegated_key_path, identity_path, public_bytes)
+    }
+
+    fn placeholder_artifact(domain: &str, public_bytes: &[u8]) -> DelegationArtifact {
+        DelegationArtifact {
+            schema: DELEGATION_SCHEMA.to_owned(),
+            deployment_domain: domain.to_owned(),
+            authority_log_did: "did:web:placeholder".to_owned(),
+            delegated_public_key_b64: STANDARD.encode(public_bytes),
+            ucan_b64: STANDARD.encode(b"placeholder"),
+        }
+    }
+
+    #[test]
+    fn trial_decrypt_succeeds_when_identity_matches() {
+        if !age_available() {
+            eprintln!("skipping: age binary not on PATH");
+            return;
+        }
+        let Some((identity, recipient)) = age_keypair() else {
+            eprintln!("skipping: age-keygen binary not on PATH");
+            return;
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let authority = test_authority(AuthorityPurpose::RegistryDelegatedSigner, None);
+        let (delegated_key_path, identity_path, public_bytes) =
+            trial_fixture(dir.path(), &authority, &identity, &recipient);
+        let artifact = placeholder_artifact(&authority.bundle.deployment_domain, &public_bytes);
+
+        trial_decrypt_delegated_signer(&delegated_key_path, &identity_path, &artifact)
+            .expect("matching identity and artifact must pass trial decrypt");
+    }
+
+    #[test]
+    fn trial_decrypt_fails_when_identity_does_not_match() {
+        if !age_available() {
+            eprintln!("skipping: age binary not on PATH");
+            return;
+        }
+        let Some((identity, recipient)) = age_keypair() else {
+            eprintln!("skipping: age-keygen binary not on PATH");
+            return;
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let authority = test_authority(AuthorityPurpose::RegistryDelegatedSigner, None);
+        let (delegated_key_path, _identity_path, public_bytes) =
+            trial_fixture(dir.path(), &authority, &identity, &recipient);
+
+        // A different identity that cannot decrypt the ciphertext.
+        let wrong_identity = age_keypair().expect("age-keygen available").0;
+        let wrong_identity_path = dir.path().join("wrong-identity");
+        std::fs::write(&wrong_identity_path, &wrong_identity).unwrap();
+
+        let artifact = placeholder_artifact(&authority.bundle.deployment_domain, &public_bytes);
+
+        let err =
+            trial_decrypt_delegated_signer(&delegated_key_path, &wrong_identity_path, &artifact)
+                .unwrap_err();
+        assert!(
+            err.to_string().contains("cannot decrypt"),
+            "expected decrypt failure, got: {err}"
+        );
+    }
+
+    #[test]
+    fn trial_decrypt_fails_when_public_key_mismatch() {
+        if !age_available() {
+            eprintln!("skipping: age binary not on PATH");
+            return;
+        }
+        let Some((identity, recipient)) = age_keypair() else {
+            eprintln!("skipping: age-keygen binary not on PATH");
+            return;
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let authority = test_authority(AuthorityPurpose::RegistryDelegatedSigner, None);
+        let (delegated_key_path, identity_path, _public_bytes) =
+            trial_fixture(dir.path(), &authority, &identity, &recipient);
+
+        // Artifact claims a different public key than the one encrypted in the
+        // delegated signer ciphertext.
+        let other = test_authority(AuthorityPurpose::RegistryDelegatedSigner, None);
+        let artifact =
+            placeholder_artifact(&authority.bundle.deployment_domain, &other.public_bytes());
+
+        let err = trial_decrypt_delegated_signer(&delegated_key_path, &identity_path, &artifact)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("does not match"),
+            "expected public-key mismatch, got: {err}"
+        );
+    }
+
+    #[test]
+    fn trial_decrypt_fails_when_bundle_is_not_a_delegated_signer() {
+        if !age_available() {
+            eprintln!("skipping: age binary not on PATH");
+            return;
+        }
+        let Some((identity, recipient)) = age_keypair() else {
+            eprintln!("skipping: age-keygen binary not on PATH");
+            return;
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        // Root authority accidentally installed as the delegated signer.
+        let authority = test_authority(AuthorityPurpose::Root, None);
+        let (delegated_key_path, identity_path, public_bytes) =
+            trial_fixture(dir.path(), &authority, &identity, &recipient);
+        let artifact = placeholder_artifact(&authority.bundle.deployment_domain, &public_bytes);
+
+        let err = trial_decrypt_delegated_signer(&delegated_key_path, &identity_path, &artifact)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("not a RegistryDelegatedSigner"),
+            "expected purpose mismatch, got: {err}"
+        );
     }
 }
