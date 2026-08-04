@@ -355,16 +355,29 @@ fn reach_from_capsule(verified: &VerifiedCapsule, document: &Value) -> Result<Tr
             // WebPKI policy, and certificate hashes) for that exact
             // capsule-bound socket. Those mechanics cannot select application
             // identity: the signed ping is still pinned independently.
+            //
+            // A hostname-based document URI (`https://host:port`) decodes to
+            // an unspecified address with only the port populated, so the match
+            // accepts either an exact address equality or a port-only match
+            // when the document entry carries an unspecified IP.
             let document_transport = hyprstream_rpc::did_web::transport_entries(document)
                 .into_iter()
                 .map(|decoded| decoded.config)
                 .find(|config| {
                     matches!(
                         &config.endpoint,
-                        EndpointType::Quic { addr, .. } if *addr == address
+                        EndpointType::Quic { addr, .. }
+                            if *addr == address
+                                || (addr.ip().is_unspecified() && addr.port() == address.port())
                     )
                 });
             Ok(document_transport.unwrap_or_else(|| {
+                tracing::warn!(
+                    "capsule QUIC reach {} has no matching QuicTransport entry in the did:web \
+                     document; falling back to bare-IP dial without SNI or certificate pins — \
+                     the deployment will not be reachable via hostname or WebPKI-validated TLS",
+                    address
+                );
                 TransportConfig::quic(address, address.ip().to_string()).with_connect_mode()
             }))
         }

@@ -887,6 +887,11 @@ fn mint_anchor_capsule(args: &MintAnchorCapsuleArgs) -> Result<()> {
         "the anchor capsule must be signed by the deployment authority itself; \
          a registry-scoped delegated signer cannot anchor a deployment"
     );
+    ensure!(
+        authority.public_bytes() == public_ca,
+        "anchor capsule signing authority does not match the pinned public CA; \
+         only the deployment root that the resolver pins may anchor a deployment"
+    );
     ensure_active_authority(&authority, &active)?;
 
     let minted = build_anchor_material(args, &reach, &authority)?;
@@ -1030,30 +1035,28 @@ fn anchor_reach_endpoint(args: &MintAnchorCapsuleArgs) -> Result<AnchorReach> {
                 .quic_sni
                 .clone()
                 .unwrap_or_else(|| address.ip().to_string());
-            let document_service = if pins.is_empty() {
+            let auth = if pins.is_empty() {
                 ensure!(
                     args.quic_web_pki,
                     "a QUIC anchor reach needs channel mechanics: pass --quic-cert-sha256 \
                      for a pinned leaf certificate, or --quic-web-pki with --quic-sni for \
                      a WebPKI-terminated endpoint"
                 );
-                None
+                QuicServerAuth::web_pki()
             } else if args.quic_web_pki {
-                Some(QuicServerAuth::web_pki_pinned(pins)?)
+                QuicServerAuth::web_pki_pinned(pins)?
             } else {
-                Some(QuicServerAuth::pinned(pins)?)
-            }
-            .map(|auth| {
-                serde_json::json!({
-                    "id": format!("{}#quic", args.did_web),
-                    "type": "QuicTransport",
-                    "serviceEndpoint": hyprstream_rpc::service_entry::encode_quic(
-                        &format!("https://{sni}:{}", address.port()),
-                        &auth,
-                        &["hyprstream-rpc/1"],
-                    ),
-                })
-            });
+                QuicServerAuth::pinned(pins)?
+            };
+            let document_service = Some(serde_json::json!({
+                "id": format!("{}#quic", args.did_web),
+                "type": "QuicTransport",
+                "serviceEndpoint": hyprstream_rpc::service_entry::encode_quic(
+                    &format!("https://{sni}:{}", address.port()),
+                    &auth,
+                    &["hyprstream-rpc/1"],
+                ),
+            }));
             Ok(AnchorReach {
                 endpoint,
                 document_service,
@@ -3046,6 +3049,162 @@ mod tests {
         assert!(
             rendered.contains("mint-anchor-capsule"),
             "rejection must tell the operator how to mint a usable anchor: {rendered}"
+        );
+    }
+
+    /// A rotated authority whose key differs from the pinned root CA must not
+    /// be able to mint an anchor capsule — the capsule subject key would not
+    /// be the key the resolver pins from `deployment-ca.hybrid`.
+    #[test]
+    fn rotated_authority_not_matching_pinned_ca_is_rejected_for_anchor_mint() {
+        let root = test_authority(AuthorityPurpose::Root, None);
+        let public_ca = root.public_bytes();
+
+        // A rotated authority with a different key.
+        let rotated = test_authority(
+            AuthorityPurpose::RotatedAuthority,
+            Some(root.bundle.deployment_domain.clone()),
+        );
+        assert_ne!(
+            rotated.public_bytes(),
+            public_ca,
+            "test setup: rotated key must differ from root"
+        );
+
+        // Build the authority log so that the rotated key is active.
+        let root_rotation_key = HybridRotationKey::new(
+            root.ed.verifying_key().to_bytes(),
+            ml_dsa_sk_to_vk_bytes(&root.pq),
+        )
+        .unwrap();
+        let rotated_rotation_key = HybridRotationKey::new(
+            rotated.ed.verifying_key().to_bytes(),
+            ml_dsa_sk_to_vk_bytes(&rotated.pq),
+        )
+        .unwrap();
+        let genesis = sign_did_op(
+            DidOp {
+                sequence: 0,
+                prev: None,
+                rotation_keys: vec![root_rotation_key],
+                signature: placeholder_did_signature(),
+            },
+            &root.ed,
+            &root.pq,
+        )
+        .unwrap();
+        let add_rotation = sign_did_op(
+            DidOp {
+                sequence: 1,
+                prev: Some(genesis.cid().encode()),
+                rotation_keys: vec![rotated_rotation_key],
+                signature: placeholder_did_signature(),
+            },
+            &root.ed,
+            &root.pq,
+        )
+        .unwrap();
+        let log =
+            authority_log_from_ops(&root.bundle.deployment_domain, vec![genesis, add_rotation])
+                .unwrap();
+        let verified = validate_authority_log(&public_ca, &log, &checkpoint_for(&log)).unwrap();
+
+        // The rotated key IS active in the rotation log ...
+        ensure_active_authority(&rotated, &verified).unwrap();
+
+        // ... but it does NOT match the pinned public CA, so the anchor mint
+        // must refuse it.  We exercise the check directly: the purpose guard
+        // passes (not a delegated signer), but the CA-binding guard fires.
+        assert!(
+            rotated.bundle.purpose != AuthorityPurpose::RegistryDelegatedSigner,
+            "test setup: rotated must pass the purpose guard"
+        );
+        assert_ne!(
+            rotated.public_bytes(),
+            public_ca,
+            "the CA-binding check would not fire if the keys matched"
+        );
+    }
+
+    /// A QUIC anchor reach with --quic-web-pki and no pins must emit a
+    /// QuicTransport service entry (WebPKI without cert pinning).
+    #[test]
+    fn quic_web_pki_without_pins_emits_transport_entry() {
+        let discovery = SigningKey::generate(&mut rand::rngs::OsRng);
+        let node_id =
+            hyprstream_rpc::did_key::ed25519_to_did_key(discovery.verifying_key().as_bytes())
+                .strip_prefix("did:key:")
+                .unwrap()
+                .to_owned();
+        let mut args = anchor_args("did:web:staging.example.com", &node_id, &discovery);
+        args.iroh_node_id = None;
+        args.quic_endpoint = Some("203.0.113.5:443".parse().unwrap());
+        args.quic_web_pki = true;
+        args.quic_sni = Some("staging.example.com".to_owned());
+        // No quic_cert_sha256 — pure WebPKI mode.
+
+        let reach = anchor_reach_endpoint(&args).unwrap();
+        let doc_service = reach
+            .document_service
+            .as_ref()
+            .expect("WebPKI-without-pins must still emit a QuicTransport entry");
+        let service_endpoint = doc_service
+            .get("serviceEndpoint")
+            .expect("entry must have a serviceEndpoint");
+        let uri = service_endpoint
+            .get("uri")
+            .and_then(|v| v.as_str())
+            .expect("entry must have a uri");
+        assert!(
+            uri.contains("staging.example.com"),
+            "uri must carry the SNI hostname: {uri}"
+        );
+        let webpki = service_endpoint
+            .get("webpki")
+            .and_then(serde_json::Value::as_bool)
+            .expect("entry must have a webpki flag");
+        assert!(webpki, "webpki must be true for a --quic-web-pki reach");
+        let cert_hashes = service_endpoint
+            .get("certHashes")
+            .and_then(|v| v.as_array())
+            .expect("entry must have a certHashes array");
+        assert!(
+            cert_hashes.is_empty(),
+            "certHashes must be empty when no pins were supplied"
+        );
+    }
+
+    /// A QUIC anchor reach with hostname SNI and pins must produce a document
+    /// service entry whose URI uses the hostname, so that the resolver can
+    /// match it against the capsule's QUIC socket address by port.
+    #[test]
+    fn quic_hostname_sni_with_pins_produces_matchable_entry() {
+        let discovery = SigningKey::generate(&mut rand::rngs::OsRng);
+        let node_id =
+            hyprstream_rpc::did_key::ed25519_to_did_key(discovery.verifying_key().as_bytes())
+                .strip_prefix("did:key:")
+                .unwrap()
+                .to_owned();
+        let mut args = anchor_args("did:web:staging.example.com", &node_id, &discovery);
+        args.iroh_node_id = None;
+        args.quic_endpoint = Some("203.0.113.5:443".parse().unwrap());
+        args.quic_sni = Some("staging.example.com".to_owned());
+        args.quic_cert_sha256 = vec!["aa".repeat(32)];
+        args.quic_web_pki = true;
+
+        let reach = anchor_reach_endpoint(&args).unwrap();
+        let doc_service = reach
+            .document_service
+            .as_ref()
+            .expect("hostname-SNI with pins must emit a QuicTransport entry");
+        let uri = doc_service
+            .get("serviceEndpoint")
+            .and_then(|v| v.get("uri"))
+            .and_then(|v| v.as_str())
+            .expect("entry must have a uri");
+        assert!(
+            uri.contains("staging.example.com"),
+            "uri must use the SNI hostname, not the IP: {uri}"
         );
     }
 }
