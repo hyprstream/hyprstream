@@ -27,6 +27,12 @@ on:
 permissions:
   contents: read
 
+# Cancel stale runs when a new commit is pushed to the same PR — the
+# Graviton runner pool is shared and scarce.
+concurrency:
+  group: oci-runtime-validate-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build-runtime-and-smoke-test:
     # Same self-hosted Graviton pool as build-image.yml and the merge gate:
