@@ -109,10 +109,14 @@ There are two distinct YubiKey roles, and conflating them overstates what you ha
 | Flag | What it does | Firmware |
 |---|---|---|
 | `--yubikey age1yubikey1…` | Token acts as an **age recipient**: it decrypts the authority bundle. The bundle's private key is briefly **in host memory** during a ceremony. | any PIV-capable (verified on **5.4.3**) |
-| `--piv-slot <SLOT>` | The **Ed25519 leg lives in the token** and never reaches host memory. | **≥ 5.7.4** — Ed25519-in-PIV. **Not verified here** (test token was 5.4.3) |
+| `--piv-slot <SLOT>` | The Ed25519 root is generated in host memory, imported into the PIV slot, and its recovery seed is stored inside the age-encrypted authority bundle — so any bundle recipient can reconstruct the software signer. The token only **gates signing** behind PIN + touch; it does **not** confine the key. | **≥ 5.7.4** — Ed25519-in-PIV. **Not verified here** (test token was 5.4.3) |
 
-Both are legitimate. Only the second is "the key never leaves the hardware." Say which one you are
-running; do not let "we use YubiKeys" imply the stronger claim.
+Neither role confines the Ed25519 key to the hardware. Both the `--yubikey` age recipient and the
+`--piv-slot` import path place the bundle private key (or its recoverable seed) inside host memory
+and inside the age-encrypted authority bundle. The PIV path additionally gates signing behind a
+hardware touch prompt, but a bundle recipient can still sign without the token by reconstructing
+the software signer from the seed. Say which one you are running, and do not let "we use YubiKeys"
+imply hardware confinement that neither path actually provides.
 
 `--kms-plugin` accepts a cloud/PQ-HSM age-plugin recipient for organizations preferring an HSM.
 
