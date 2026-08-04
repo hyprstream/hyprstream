@@ -2091,6 +2091,30 @@ fn main() -> Result<()> {
         }
     }
 
+    // ── `service repair` early dispatch ──────────────────────────────────────
+    // `service repair` must run on a partially-broken install — including one
+    // whose bootstrap-pubkeys is stale (classical-only) and trips the hybrid
+    // gate below. Dispatch it before the gate so the operator always has an
+    // in-product diagnostic, and let run_repair_checks flag the stale file.
+    if let Some(("service", sub_m)) = matches.subcommand() {
+        if let Some(("repair", _)) = sub_m.subcommand() {
+            let verbose = sub_m
+                .subcommand_matches("repair")
+                .map(|m| m.get_flag("verbose"))
+                .unwrap_or(false);
+            let models_dir = config.models_dir().clone();
+            return with_runtime(
+                RuntimeConfig {
+                    device: DeviceConfig::request_cpu(),
+                    multi_threaded: true,
+                },
+                || async move {
+                    hyprstream_core::cli::service_handlers::run_repair_checks(&models_dir, verbose).await
+                },
+            );
+        }
+    }
+
     // Start registry service ONCE at CLI level
     let _registry_runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()

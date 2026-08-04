@@ -678,9 +678,9 @@ pub fn ensure_bootstrap_pubkeys_hybrid(
         "bootstrap-pubkeys has Ed25519-only entries for service(s): {}. Service \
          identities must be hybrid (Ed25519 + ML-DSA-65); these were written by a \
          pre-hybrid provisioning run and cannot be anchored for post-quantum \
-         verification. Re-provision this node — run 'hyprstream wizard', or \
-         'hyprstream service repair' — to rewrite {BOOTSTRAP_PUBKEYS_NAME} with \
-         the bound ML-DSA-65 key for every service.",
+         verification. Re-provision this node by running 'hyprstream wizard' — \
+         it re-provisions in place, preserving existing keys while binding the \
+         ML-DSA-65 half for every service — to rewrite {BOOTSTRAP_PUBKEYS_NAME}.",
         classical.join(", ")
     ))
 }
@@ -1922,7 +1922,7 @@ mod tests {
             !err.contains("policy"),
             "error must not implicate the hybrid service: {err}"
         );
-        assert!(err.contains("wizard") || err.contains("repair"), "error names the fix: {err}");
+        assert!(err.contains("wizard"), "error names the working recovery: {err}");
         assert!(err.contains("ML-DSA-65"), "error names what is missing: {err}");
     }
 

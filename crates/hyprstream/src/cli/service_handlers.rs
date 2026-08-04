@@ -430,7 +430,7 @@ pub async fn handle_service_status(
 ///
 /// Extracted from the old `handle_service_repair` so it can be called as part
 /// of `handle_service_install` without the surrounding summary chrome.
-pub(crate) async fn run_repair_checks(
+pub async fn run_repair_checks(
     models_dir: &Path,
     verbose: bool,
 ) -> Result<()> {
@@ -714,6 +714,53 @@ pub(crate) async fn run_repair_checks(
         } else {
             print_check(label, CheckStatus::Warn, "policy.csv not found");
             warnings.push("Run 'hyprstream service install' again after fixing policy files".to_owned());
+        }
+    }
+
+    // 8. Bootstrap-pubkeys hybrid posture
+    //
+    // A stale Ed25519-only file (from a pre-hybrid provisioning run) blocks
+    // startup: service identities can never be anchored for post-quantum
+    // verification. Detect it here and name the recovery, rather than letting
+    // the operator discover it from a startup refusal.
+    {
+        let label = "Hybrid bootstrap";
+        match crate::config::HyprConfig::resolve_secrets_dir() {
+            Ok(secrets_dir) => {
+                match crate::auth::identity_store::load_bootstrap_pubkeys_hybrid(&secrets_dir) {
+                    Ok(entries) if entries.is_empty() => {
+                        print_check(label, CheckStatus::Ok, "unprovisioned (clean)");
+                    }
+                    Ok(entries) => {
+                        match crate::auth::identity_store::ensure_bootstrap_pubkeys_hybrid(&entries) {
+                            Ok(()) => {
+                                let n = entries.len();
+                                let noun = if n == 1 { "entry" } else { "entries" };
+                                print_check(label, CheckStatus::Ok,
+                                    &format!("{n} hybrid {noun} bound"));
+                            }
+                            Err(e) => {
+                                print_check(label, CheckStatus::Fail, &format!("{e}"));
+                                all_passed = false;
+                                warnings.push(
+                                    "Re-provision with 'hyprstream wizard' to bind \
+                                     ML-DSA-65 keys for every service".to_owned()
+                                );
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        print_check(label, CheckStatus::Fail, &format!("parse error: {e}"));
+                        all_passed = false;
+                        warnings.push(
+                            "Fix the file or re-provision with 'hyprstream wizard'".to_owned()
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                print_check(label, CheckStatus::Warn, &format!("secrets dir: {e}"));
+            }
         }
     }
 
