@@ -113,34 +113,49 @@ jobs:
           mkdir -p "$DATA_DIR" "$RUN_DIR" "$SECRETS_DIR"
           chmod 777 "$DATA_DIR" "$RUN_DIR" "$SECRETS_DIR"
 
-          echo "Starting container (oauth foreground)…"
-          podman run --rm -d --name hs-smoke \
+          # Shared volume mounts for both the bootstrap and service containers.
+          VOL_ARGS=(
+            -v "$DATA_DIR":/var/lib/hyprstream:z
+            -v "$RUN_DIR":/run/hyprstream:z
+            -v "$SECRETS_DIR":/tmp/hs-secrets:z
+            -e HYPRSTREAM__SECRETS__PATH=/tmp/hs-secrets
+            -e XDG_DATA_HOME=/var/lib/hyprstream
+            -e HOME=/var/lib/hyprstream
+          )
+
+          # Step 1: bootstrap credentials (one-shot, exits on completion).
+          # Uses the image ENTRYPOINT [/hyprstream] directly — no shell needed.
+          echo "Bootstrapping credentials…"
+          podman run --rm \
             --network host \
-            -v "$DATA_DIR":/var/lib/hyprstream:z \
-            -v "$RUN_DIR":/run/hyprstream:z \
-            -v "$SECRETS_DIR":/tmp/hs-secrets:z \
-            -e HYPRSTREAM__SECRETS__PATH=/tmp/hs-secrets \
-            -e XDG_DATA_HOME=/var/lib/hyprstream \
-            -e HOME=/var/lib/hyprstream \
-            --entrypoint /bin/bash \
+            "${VOL_ARGS[@]}" \
             hyprstream-runtime-ci:latest \
-            -c '/hyprstream wizard --non-interactive --bootstrap-only 2>&1 && exec /hyprstream service start oauth --foreground --ipc'
+            wizard --non-interactive --bootstrap-only
+
+          # Step 2: start the OAuth service in detached mode (long-running).
+          # Use --name so we can inspect/logs later. No --rm so logs survive.
+          echo "Starting OAuth service…"
+          podman run -d --name hs-smoke \
+            --network host \
+            "${VOL_ARGS[@]}" \
+            hyprstream-runtime-ci:latest \
+            service start oauth --foreground --ipc
 
           # Wait up to 120 s for the OAuth HTTP face to bind :6791, then
           # probe /health from the host (the runner has curl).
           echo "Waiting for :6791 to serve /health…"
           ok=0
           for i in $(seq 1 60); do
+            if curl -sf --max-time 3 http://127.0.0.1:6791/health; then
+              ok=1
+              break
+            fi
             # Check the container is still running — if it exited, capture logs.
             if ! podman ps --filter name=hs-smoke --filter status=running | grep -q hs-smoke; then
               echo "::error::Container exited before /health responded."
               echo "=== container logs ==="
               podman logs hs-smoke 2>&1 | tail -80
               exit 1
-            fi
-            if curl -sf --max-time 3 http://127.0.0.1:6791/health; then
-              ok=1
-              break
             fi
             sleep 2
           done
