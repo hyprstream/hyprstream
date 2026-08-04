@@ -261,6 +261,18 @@ fn mint_deployment_ca(args: &MintDeploymentCaArgs) -> Result<()> {
 
     let (ed_secret, ed_signer) = match args.piv_slot.as_deref() {
         Some(slot) => {
+            // Destructive overwrite guard: ykman piv keys import silently
+            // replaces whatever is in the slot. Check first and refuse unless
+            // --force was given, so a daily-driver YubiKey's existing key
+            // (SSH, PIV cert, age identity) is not destroyed behind a
+            // routine-looking touch prompt.
+            if !args.force && piv_slot_occupied(slot)? {
+                anyhow::bail!(
+                    "PIV slot {slot} already contains a key or certificate. \
+                     Re-running will IRREVERSIBLY overwrite it. Pass --force to \
+                     confirm the overwrite."
+                );
+            }
             let recovery_key = SigningKey::generate(&mut rand::rngs::OsRng);
             let (slot, public) = piv_import_ed25519(slot, &recovery_key)?;
             (
@@ -1774,6 +1786,25 @@ fn validate_delegation_artifact(
         &active.rotation_keys,
         now,
     )
+}
+
+/// Check whether a PIV slot already holds a key or certificate.
+///
+/// `ykman piv keys import` silently overwrites slot contents; this check
+/// gives the caller a chance to warn or refuse before the import runs.
+fn piv_slot_occupied(slot: &str) -> Result<bool> {
+    let slot = validate_piv_slot(slot)?;
+    // Try reading the slot's certificate object. A slot with no object
+    // returns a non-zero exit; a slot with any data returns zero.
+    let status = Command::new("yubico-piv-tool")
+        .args(["-a", "read-certificate", "-s"])
+        .arg(&slot)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .context("launch yubico-piv-tool to read slot status")?;
+    Ok(status.success())
 }
 
 fn piv_import_ed25519(slot: &str, key: &SigningKey) -> Result<(String, VerifyingKey)> {

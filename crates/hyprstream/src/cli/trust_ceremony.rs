@@ -46,8 +46,12 @@ pub const CEREMONY_MODE_SCHEMA: &str = "hyprstream.deployment-trust-ceremony-mod
 /// Human-visible grade of a software root. Deliberately shouty.
 pub const DEV_GRADE_LABEL: &str = "DEV-GRADE — software root, no hardware gating, not for production";
 
-/// Grade of a token-gated root.
-const HARDWARE_GRADE_LABEL: &str = "hardware-gated deployment root";
+/// Grade of a token-gated root. The convenience signing path requires the
+/// token (PIN + touch), but the root seed is generated in host memory and
+/// stored in the age-encrypted authority bundle — it is recoverable by any
+/// bundle recipient, so "hardware-confined" would be materially false.
+const TOKEN_GATED_GRADE_LABEL: &str =
+    "token-gated deployment root (seed recoverable from bundle)";
 
 /// The delegation lifetime the ceremony requests (30 days).
 const DELEGATION_TTL_SECONDS: u64 = 2_592_000;
@@ -173,7 +177,9 @@ pub trait AgeYubikeyPlugin {
 /// How the deployment root will be protected.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CeremonyMode {
-    /// Ed25519 leg is generated into a PIV slot and never enters host memory.
+    /// Ed25519 root is generated in host memory, imported into a PIV slot for
+    /// token-gated signing (PIN + touch). The recovery seed is stored in the
+    /// age-encrypted authority bundle — the key is NOT hardware-confined.
     HardwarePiv { token: DetectedToken, slot: String },
     /// Token decrypts the authority bundle; the bundle is briefly in memory.
     HardwareAgeRecipient { token: DetectedToken },
@@ -202,13 +208,26 @@ impl CeremonyMode {
         if self.is_dev_grade() {
             DEV_GRADE_LABEL
         } else {
-            HARDWARE_GRADE_LABEL
+            TOKEN_GATED_GRADE_LABEL
         }
     }
 
-    /// True only when the classical leg is confined to the token.
+    /// Whether the Ed25519 root key is **truly** confined to the hardware token
+    /// and cannot be extracted. In the current ceremony the key is generated in
+    /// host memory, imported into the PIV slot, and its seed is stored in the
+    /// age-encrypted authority bundle — so any bundle recipient can reconstruct
+    /// the software signer. This method returns `false` to reflect that reality
+    /// honestly in the audit record.
     #[must_use]
     pub fn ed25519_confined_to_hardware(&self) -> bool {
+        false
+    }
+
+    /// True when the convenience signing path is token-gated (requires PIN +
+    /// touch on the hardware token). This is what the PIV mode actually
+    /// provides; it does not imply the seed is confined.
+    #[must_use]
+    pub fn token_gated_signing(&self) -> bool {
         matches!(self, Self::HardwarePiv { .. })
     }
 
@@ -402,7 +421,9 @@ pub fn select_mode_for_token(request: &CeremonyRequest, token: &DetectedToken) -
             },
             rationale: format!(
                 "{} runs firmware {} (>= {PIV_ED25519_MIN_FIRMWARE}), so the Ed25519 leg is \
-                 generated into PIV slot {} and never enters host memory",
+                 imported into PIV slot {} for token-gated signing (PIN + touch). The seed \
+                 is stored in the age-encrypted authority bundle and is recoverable by any \
+                 bundle recipient — signing convenience is token-gated, not hardware-confined.",
                 token.label(),
                 token.firmware,
                 request.piv_slot
@@ -790,6 +811,14 @@ pub struct CeremonyModeRecord {
     pub grade: String,
     pub dev_grade: bool,
     pub ed25519_confined_to_hardware: bool,
+    /// Whether the root seed is recoverable from the authority bundle by any
+    /// bundle recipient (always true in the current ceremony — the seed is
+    /// stored as `recovery_seed_b64` inside the age-encrypted bundle).
+    pub seed_recoverable_from_bundle: bool,
+    /// Whether the convenience signing path is gated by the hardware token
+    /// (requires PIN + touch). True for PIV mode; does NOT imply the seed is
+    /// hardware-confined.
+    pub token_gated_signing: bool,
     pub token_model: Option<String>,
     pub token_serial: Option<String>,
     pub token_firmware: Option<String>,
@@ -809,6 +838,8 @@ pub fn mode_record(mode: &CeremonyMode, break_glass: &BreakGlass, rationale: &st
         grade: mode.grade_label().to_owned(),
         dev_grade: mode.is_dev_grade(),
         ed25519_confined_to_hardware: mode.ed25519_confined_to_hardware(),
+        seed_recoverable_from_bundle: true,
+        token_gated_signing: mode.token_gated_signing(),
         token_model: token.map(|token| token.model.clone()),
         token_serial: token.map(|token| token.serial.clone()),
         token_firmware: token.map(|token| token.firmware.to_string()),
@@ -1235,8 +1266,9 @@ mod tests {
                 slot: DEFAULT_PIV_SLOT.to_owned(),
             }
         );
-        assert!(mode.ed25519_confined_to_hardware());
-        assert!(rationale.contains("never enters host memory"));
+        assert!(!mode.ed25519_confined_to_hardware());
+        assert!(mode.token_gated_signing());
+        assert!(rationale.contains("token-gated signing"));
     }
 
     #[test]
@@ -1437,7 +1469,8 @@ mod tests {
         else {
             panic!("expected a hardware mode");
         };
-        assert!(mode.ed25519_confined_to_hardware());
+        assert!(!mode.ed25519_confined_to_hardware());
+        assert!(mode.token_gated_signing());
         let CeremonyPlan::Proceed { mode, .. } = select_mode_for_token(&request, &old_token())
         else {
             panic!("expected a hardware mode");
@@ -1728,6 +1761,8 @@ mod tests {
         assert!(record.dev_grade);
         assert_eq!(record.grade, DEV_GRADE_LABEL);
         assert!(!record.ed25519_confined_to_hardware);
+        assert!(!record.token_gated_signing);
+        assert!(record.seed_recoverable_from_bundle);
         assert_eq!(record.token_serial, None);
         assert_eq!(record.piv_slot, None);
         assert!(!record.break_glass_protected);
@@ -1746,7 +1781,9 @@ mod tests {
             "firmware 5.7.4",
         );
         assert!(!record.dev_grade);
-        assert!(record.ed25519_confined_to_hardware);
+        assert!(!record.ed25519_confined_to_hardware);
+        assert!(record.token_gated_signing);
+        assert!(record.seed_recoverable_from_bundle);
         assert_eq!(record.token_firmware.as_deref(), Some("5.7.4"));
         assert_eq!(record.token_serial.as_deref(), Some("22222222"));
         assert_eq!(record.piv_slot.as_deref(), Some(DEFAULT_PIV_SLOT));
