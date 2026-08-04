@@ -243,6 +243,47 @@ fn build_cli() -> ClapCommand {
                     .value_name("ROLE")
                     .default_value("admin")
                     .help("Role to assign the local user under --non-interactive (admin|operator|trainer|viewer). Default is admin; use operator/viewer in tests for least-privilege."),
+            )
+            .arg(
+                Arg::new("deployment_trust")
+                    .long("deployment-trust")
+                    .action(clap::ArgAction::SetTrue)
+                    .help("Run the deployment-trust ceremony after node bootstrap — detects an attached YubiKey and mints the deployment root, delegated signer, and registry credential. Opt-in: node bootstrap alone is unchanged without it."),
+            )
+            .arg(
+                Arg::new("deployment_trust_dir")
+                    .long("deployment-trust-dir")
+                    .value_name("DIR")
+                    .requires("deployment_trust")
+                    .help("Absolute ceremony working directory (default: <models-dir>/deployment-ceremony). Destroy it once the artifacts are distributed."),
+            )
+            .arg(
+                Arg::new("deployment_trust_software")
+                    .long("deployment-trust-software")
+                    .action(clap::ArgAction::SetTrue)
+                    .requires("deployment_trust")
+                    .help("Mint a DEV-GRADE software deployment root even if a hardware token is attached. Never selected on your behalf."),
+            )
+            .arg(
+                Arg::new("deployment_trust_serial")
+                    .long("deployment-trust-serial")
+                    .value_name("SERIAL")
+                    .requires("deployment_trust")
+                    .help("Bind the deployment root to the token with this serial when several are attached."),
+            )
+            .arg(
+                Arg::new("deployment_trust_piv_slot")
+                    .long("deployment-trust-piv-slot")
+                    .value_name("SLOT")
+                    .requires("deployment_trust")
+                    .help("PIV slot holding the Ed25519 leg on firmware 5.7.4+ (default: 9c)."),
+            )
+            .arg(
+                Arg::new("deployment_trust_allow_plaintext_break_glass")
+                    .long("deployment-trust-allow-plaintext-break-glass")
+                    .action(clap::ArgAction::SetTrue)
+                    .requires("deployment_trust")
+                    .help("Accept an unencrypted break-glass identity. Only for a throwaway root you destroy immediately afterwards."),
             ),
     );
 
@@ -1954,7 +1995,31 @@ fn main() -> Result<()> {
                     .get_one::<String>("initial_user_role")
                     .cloned()
                     .unwrap_or_else(|| "admin".to_owned());
-                let use_tui = tui_mode || (pds_url.is_none() && !non_interactive && !bootstrap_only && supports_tui());
+                let deployment_trust = hyprstream_core::cli::wizard_handlers::DeploymentTrustOptions {
+                    enabled: sub_m.get_flag("deployment_trust"),
+                    dir: sub_m.get_one::<String>("deployment_trust_dir").map(std::path::PathBuf::from),
+                    force_software: sub_m.get_flag("deployment_trust_software"),
+                    serial: sub_m.get_one::<String>("deployment_trust_serial").cloned(),
+                    piv_slot: sub_m.get_one::<String>("deployment_trust_piv_slot").cloned(),
+                    allow_plaintext_break_glass: sub_m
+                        .get_flag("deployment_trust_allow_plaintext_break_glass"),
+                };
+                let wizard_options = hyprstream_core::cli::WizardOptions {
+                    non_interactive,
+                    start_services,
+                    bootstrap_only,
+                    enable_federation,
+                    initial_user_role,
+                    deployment_trust,
+                };
+                // The TUI wizard has no ceremony flow yet, so an explicit
+                // --deployment-trust keeps the text wizard.
+                let use_tui = tui_mode
+                    || (pds_url.is_none()
+                        && !non_interactive
+                        && !bootstrap_only
+                        && !wizard_options.deployment_trust.enabled
+                        && supports_tui());
                 let config = config.clone();
                 return with_runtime(
                     RuntimeConfig { device: DeviceConfig::request_cpu(), multi_threaded: true },
@@ -1963,8 +2028,7 @@ fn main() -> Result<()> {
                             hyprstream_core::cli::handle_wizard_tui(&models_dir, &services).await
                         } else {
                             hyprstream_core::cli::handle_wizard(
-                                &models_dir, &services, non_interactive, start_services,
-                                bootstrap_only, enable_federation, &initial_user_role,
+                                &models_dir, &services, wizard_options,
                             ).await?;
                             if let Some(pds_url) = pds_url {
                                 hyprstream_core::cli::pds_handlers::handle_pds_join(
@@ -1986,7 +2050,9 @@ fn main() -> Result<()> {
                         // First-run fallback (no `wizard` subcommand) defaults
                         // federation to off — explicit opt-in only.
                         hyprstream_core::cli::handle_wizard(
-                            &models_dir, &services, false, false, false, false, "admin",
+                            &models_dir,
+                            &services,
+                            hyprstream_core::cli::WizardOptions::first_run(),
                         ).await
                     }
                 },
@@ -3070,7 +3136,9 @@ fn main() -> Result<()> {
                         } else {
                             // First-run auto-wizard defaults federation to off.
                             hyprstream_core::cli::handle_wizard(
-                                &models_dir, &services, false, false, false, false, "admin",
+                                &models_dir,
+                            &services,
+                            hyprstream_core::cli::WizardOptions::first_run(),
                             ).await
                         }
                     },
