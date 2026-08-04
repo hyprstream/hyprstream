@@ -1007,15 +1007,64 @@ impl KeyedPqTrustStore {
 
     /// Bind an Ed25519 signer identity to its trusted ML-DSA-65 verifying key
     /// (stored as raw vk bytes; re-decoded on lookup).
+    ///
+    /// Anchoring is **monotonic and conflict-resistant**: once an identity is
+    /// bound to a specific ML-DSA-65 key, a subsequent attempt to bind it to a
+    /// *different* key is refused (not silently overwritten). The same key
+    /// re-registered is an idempotent no-op. This prevents a stale or hostile
+    /// seeding source from silently substituting a different PQ identity for an
+    /// already-anchored peer — the last writer does not win.
     pub fn bind(
         &mut self,
         ed25519_pubkey: [u8; 32],
         ml_dsa_vk: &crate::crypto::pq::MlDsaVerifyingKey,
     ) {
-        self.bindings.insert(
-            ed25519_pubkey,
-            crate::crypto::pq::ml_dsa_vk_bytes(ml_dsa_vk),
-        );
+        let new_bytes = crate::crypto::pq::ml_dsa_vk_bytes(ml_dsa_vk);
+        if let Some(existing) = self.bindings.get(&ed25519_pubkey) {
+            if existing == &new_bytes {
+                return; // idempotent re-registration of the same key
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            tracing::error!(
+                ed25519 = %hex::encode(ed25519_pubkey),
+                "PQ anchor conflict: identity is already bound to a different \
+                 ML-DSA-65 key; refusing to rebind. The existing anchor is \
+                 retained — investigate if this is unexpected."
+            );
+            return;
+        }
+        self.bindings.insert(ed25519_pubkey, new_bytes);
+    }
+
+    /// Register an identity that may or may not carry a bound ML-DSA-65 key.
+    ///
+    /// Anchoring is **monotonic**: a `None` key never clears or replaces an
+    /// anchor already established for that identity. Re-registering a
+    /// previously hybrid identity from a classical-only source (a legacy
+    /// bootstrap file, a re-enrollment that omitted the PQ half) therefore
+    /// cannot silently downgrade the peer back to classical.
+    ///
+    /// Equally, a `Some` registration with a *different* PQ key than the one
+    /// already anchored is refused (see [`bind`]) — a rebind is not silent.
+    ///
+    /// Returns whether the identity is anchored after the call.
+    pub fn register(
+        &mut self,
+        ed25519_pubkey: [u8; 32],
+        ml_dsa_vk: Option<&crate::crypto::pq::MlDsaVerifyingKey>,
+    ) -> bool {
+        match ml_dsa_vk {
+            Some(vk) => {
+                self.bind(ed25519_pubkey, vk);
+                true
+            }
+            None => self.bindings.contains_key(&ed25519_pubkey),
+        }
+    }
+
+    /// Whether this identity has an anchored ML-DSA-65 key.
+    pub fn is_anchored(&self, ed25519_pubkey: &[u8; 32]) -> bool {
+        self.bindings.contains_key(ed25519_pubkey)
     }
 
     /// Number of bindings.
@@ -1741,20 +1790,19 @@ impl SignedEnvelope {
         let signing_data = self.signed_bytes();
         let aad = envelope_external_aad();
 
-        let anchored_pq = if verify_policy.uses_pq() {
-            Some(
-                pq_store
-                    .and_then(|store| store.ml_dsa_key_for(&self.cnf))
-                    .ok_or_else(|| {
-                        EnvelopeError::PqSignatureInvalid(
-                            "mandatory Hybrid suite requires an anchored ML-DSA-65 signer key"
-                                .to_owned(),
-                        )
-                    })?,
-            )
-        } else {
-            None
-        };
+        // The PQ requirement is derived PER IDENTITY, not deployment-wide.
+        // An identity with an anchored ML-DSA-65 key MUST present a verifying
+        // outer PQ layer even where the global policy still admits classical
+        // peers — anchoring a peer is what turns PQ on for that peer. An
+        // identity with no anchor falls back to the global policy, so a
+        // deployment holding no hybrid material behaves exactly as before.
+        let anchored_pq = pq_store.and_then(|store| store.ml_dsa_key_for(&self.cnf));
+        if anchored_pq.is_none() && verify_policy.uses_pq() {
+            return Err(EnvelopeError::PqSignatureInvalid(
+                "mandatory Hybrid suite requires an anchored ML-DSA-65 signer key".to_owned(),
+            ));
+        }
+        let require_pq = anchored_pq.is_some();
 
         crate::crypto::cose_sign::verify_composite(
             &self.cose,
@@ -1762,7 +1810,7 @@ impl SignedEnvelope {
             anchored_pq.as_ref(),
             &signing_data,
             &aad,
-            verify_policy.uses_pq(),
+            require_pq,
         )
         .map_err(|e| EnvelopeError::PqSignatureInvalid(e.to_string()))?;
 
@@ -2500,19 +2548,16 @@ impl ResponseEnvelope {
         };
         let aad = response_envelope_external_aad();
 
-        let anchored_pq = if verify_policy.uses_pq() {
-            Some(
-                pq_store
-                    .and_then(|store| store.ml_dsa_key_for(&self.cnf))
-                    .ok_or_else(|| {
-                        anyhow!(
-                            "mandatory Hybrid suite requires an anchored ML-DSA-65 response key"
-                        )
-                    })?,
-            )
-        } else {
-            None
-        };
+        // Per-identity PQ requirement, mirroring the request side: an anchored
+        // responder MUST present a verifying outer PQ layer regardless of the
+        // global policy; an unanchored responder falls back to that policy.
+        let anchored_pq = pq_store.and_then(|store| store.ml_dsa_key_for(&self.cnf));
+        if anchored_pq.is_none() && verify_policy.uses_pq() {
+            return Err(anyhow!(
+                "mandatory Hybrid suite requires an anchored ML-DSA-65 response key"
+            ));
+        }
+        let require_pq = anchored_pq.is_some();
 
         crate::crypto::cose_sign::verify_composite(
             &self.cose,
@@ -2520,7 +2565,7 @@ impl ResponseEnvelope {
             anchored_pq.as_ref(),
             &signing_data,
             &aad,
-            verify_policy.uses_pq(),
+            require_pq,
         )
         .map_err(|e| anyhow::anyhow!("Response signature verification failed: {e}"))?;
 
@@ -4681,5 +4726,190 @@ mod tests {
             .get_root::<crate::common_capnp::response_envelope::Reader>()
             .unwrap();
         assert!(ResponseEnvelope::read_from(response_reader).is_err());
+    }
+
+    // =========================================================================
+    // Per-identity PQ enforcement: anchoring an identity turns PQ on for THAT
+    // identity, without a deployment-wide flag day for everyone else.
+    // =========================================================================
+
+    /// An anchored identity must present the outer ML-DSA-65 layer even where
+    /// the deployment's global policy still admits classical peers.
+    #[test]
+    fn anchored_identity_rejects_classical_under_classical_policy() {
+        let (sk, vk) = generate_signing_keypair();
+        let (_pq_sk, pq_vk) = crate::crypto::pq::ml_dsa_generate_keypair();
+        let cache = TestNonceCache::new();
+        let signed = SignedEnvelope::new_signed(RequestEnvelope::anonymous(vec![1]), &sk);
+        let store = pq_store_for(vk.to_bytes(), &pq_vk);
+        let res = signed.verify_with(&vk, &cache, Some(&store), CryptoPolicy::Classical);
+        assert!(
+            res.is_err(),
+            "an anchored identity must not be admitted with a classical-only signature"
+        );
+    }
+
+    /// The same anchored identity is admitted when it signs hybrid.
+    #[test]
+    fn anchored_identity_accepts_hybrid_under_classical_policy() -> crate::EnvelopeResult<()> {
+        let (sk, vk) = generate_signing_keypair();
+        let (pq_sk, pq_vk) = crate::crypto::pq::ml_dsa_generate_keypair();
+        let cache = TestNonceCache::new();
+        let signed =
+            SignedEnvelope::new_signed_hybrid(RequestEnvelope::anonymous(vec![2]), &sk, &pq_sk);
+        let store = pq_store_for(vk.to_bytes(), &pq_vk);
+        signed.verify_with(&vk, &cache, Some(&store), CryptoPolicy::Classical)?;
+        Ok(())
+    }
+
+    /// No flag day: an identity with no anchored PQ key keeps behaving exactly
+    /// as before under a classical-permissive policy, even when a PQ store is
+    /// consulted and holds bindings for other identities.
+    #[test]
+    fn unanchored_identity_unchanged_under_classical_policy() -> crate::EnvelopeResult<()> {
+        let (sk, vk) = generate_signing_keypair();
+        let (other_sk, other_vk) = generate_signing_keypair();
+        let (_pq_sk, pq_vk) = crate::crypto::pq::ml_dsa_generate_keypair();
+        let cache = TestNonceCache::new();
+
+        // A store that anchors somebody else entirely.
+        let store = pq_store_for(other_vk.to_bytes(), &pq_vk);
+        let signed = SignedEnvelope::new_signed(RequestEnvelope::anonymous(vec![3]), &sk);
+        signed.verify_with(&vk, &cache, Some(&store), CryptoPolicy::Classical)?;
+
+        // An entirely empty store is likewise unchanged.
+        let empty = KeyedPqTrustStore::new();
+        let signed2 = SignedEnvelope::new_signed(RequestEnvelope::anonymous(vec![4]), &other_sk);
+        signed2.verify_with(&other_vk, &cache, Some(&empty), CryptoPolicy::Classical)?;
+        Ok(())
+    }
+
+    /// One process, one store, two services: the anchored one is enforced and
+    /// the unanchored one is not.
+    #[test]
+    fn mixed_anchored_and_unanchored_services_in_one_store() -> crate::EnvelopeResult<()> {
+        let (anchored_sk, anchored_vk) = generate_signing_keypair();
+        let (legacy_sk, legacy_vk) = generate_signing_keypair();
+        let (pq_sk, pq_vk) = crate::crypto::pq::ml_dsa_generate_keypair();
+        let cache = TestNonceCache::new();
+
+        let mut store = KeyedPqTrustStore::new();
+        store.bind(anchored_vk.to_bytes(), &pq_vk);
+
+        // Anchored service: classical rejected, hybrid accepted.
+        let classical = SignedEnvelope::new_signed(RequestEnvelope::anonymous(vec![5]), &anchored_sk);
+        assert!(
+            classical
+                .verify_with(&anchored_vk, &cache, Some(&store), CryptoPolicy::Classical)
+                .is_err(),
+            "anchored service must be held to the hybrid signature"
+        );
+        let hybrid = SignedEnvelope::new_signed_hybrid(
+            RequestEnvelope::anonymous(vec![6]),
+            &anchored_sk,
+            &pq_sk,
+        );
+        hybrid.verify_with(&anchored_vk, &cache, Some(&store), CryptoPolicy::Classical)?;
+
+        // Unanchored service in the SAME store keeps the classical floor.
+        let legacy = SignedEnvelope::new_signed(RequestEnvelope::anonymous(vec![7]), &legacy_sk);
+        legacy.verify_with(&legacy_vk, &cache, Some(&store), CryptoPolicy::Classical)?;
+        Ok(())
+    }
+
+    /// Anchoring is monotonic: re-registering an anchored identity from a
+    /// classical-only source must not drop the binding, or enforcement could be
+    /// switched back off by replaying a legacy enrollment.
+    #[test]
+    fn anchored_identity_cannot_be_downgraded_to_unanchored() {
+        let (sk, vk) = generate_signing_keypair();
+        let (_pq_sk, pq_vk) = crate::crypto::pq::ml_dsa_generate_keypair();
+        let cache = TestNonceCache::new();
+
+        let mut store = KeyedPqTrustStore::new();
+        assert!(store.register(vk.to_bytes(), Some(&pq_vk)));
+        assert!(store.register(vk.to_bytes(), None), "classical re-registration must not clear the anchor");
+        assert!(store.is_anchored(&vk.to_bytes()));
+        assert_eq!(store.len(), 1);
+
+        // And the surviving anchor still enforces the PQ leg.
+        let classical = SignedEnvelope::new_signed(RequestEnvelope::anonymous(vec![8]), &sk);
+        assert!(
+            classical
+                .verify_with(&vk, &cache, Some(&store), CryptoPolicy::Classical)
+                .is_err(),
+            "the surviving anchor must still require the hybrid signature"
+        );
+    }
+
+    /// Registering an unanchored identity leaves it unanchored (a classical
+    /// entry never fabricates a binding).
+    #[test]
+    fn classical_registration_anchors_nothing() {
+        let (_sk, vk) = generate_signing_keypair();
+        let mut store = KeyedPqTrustStore::new();
+        assert!(!store.register(vk.to_bytes(), None));
+        assert!(store.is_empty());
+    }
+
+    /// A differing PQ key for an already-anchored identity is refused — the
+    /// existing anchor is retained and the rebind is not silent. This prevents
+    /// a stale bootstrap entry (or hostile seeding source) from substituting a
+    /// different PQ identity for an operator-anchored peer.
+    #[test]
+    fn differing_pq_rebind_is_refused_not_silent() {
+        let (_sk1, vk) = generate_signing_keypair();
+        let (_pq_sk_a, pq_vk_a) = crate::crypto::pq::ml_dsa_generate_keypair();
+        let (_pq_sk_b, pq_vk_b) = crate::crypto::pq::ml_dsa_generate_keypair();
+
+        let mut store = KeyedPqTrustStore::new();
+        store.bind(vk.to_bytes(), &pq_vk_a);
+
+        // Attempt to rebind to a different PQ key — must be refused.
+        store.bind(vk.to_bytes(), &pq_vk_b);
+
+        // The original anchor survives.
+        let anchored_vk = store.ml_dsa_key_for(&vk.to_bytes()).expect("anchor survived");
+        let original_bytes = crate::crypto::pq::ml_dsa_vk_bytes(&pq_vk_a);
+        let survived_bytes = crate::crypto::pq::ml_dsa_vk_bytes(&anchored_vk);
+        assert_eq!(
+            original_bytes, survived_bytes,
+            "the original PQ key must be retained, not the attempted rebind"
+        );
+        assert_eq!(store.len(), 1, "no duplicate entry created");
+
+        // Re-registering the SAME key via register() is idempotent.
+        store.register(vk.to_bytes(), Some(&pq_vk_a));
+        assert_eq!(store.len(), 1);
+    }
+
+    /// The response side enforces the same per-identity rule.
+    #[test]
+    fn anchored_responder_rejects_classical_response() -> anyhow::Result<()> {
+        let (sk, vk) = generate_signing_keypair();
+        let (pq_sk, pq_vk) = crate::crypto::pq::ml_dsa_generate_keypair();
+        let store = pq_store_for(vk.to_bytes(), &pq_vk);
+
+        let classical = ResponseEnvelope::new_signed(21, vec![1, 2], &sk);
+        assert!(
+            classical
+                .verify_with(Some(&vk), Some(&store), CryptoPolicy::Classical)
+                .is_err(),
+            "an anchored responder must not be admitted with a classical-only signature"
+        );
+
+        let hybrid = ResponseEnvelope::new_signed_hybrid(22, vec![3, 4], &sk, &pq_sk);
+        hybrid.verify_with(Some(&vk), Some(&store), CryptoPolicy::Classical)?;
+        Ok(())
+    }
+
+    /// No flag day on the response side either.
+    #[test]
+    fn unanchored_responder_unchanged_under_classical_policy() -> anyhow::Result<()> {
+        let (sk, vk) = generate_signing_keypair();
+        let empty = KeyedPqTrustStore::new();
+        let classical = ResponseEnvelope::new_signed(23, vec![5, 6], &sk);
+        classical.verify_with(Some(&vk), Some(&empty), CryptoPolicy::Classical)?;
+        Ok(())
     }
 }
