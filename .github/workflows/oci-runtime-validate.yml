@@ -85,7 +85,9 @@ jobs:
       - name: Binary executes (ld.so + library closure)
         run: |
           echo "Running /hyprstream --version inside the image…"
-          podman run --rm hyprstream-runtime-ci:latest /hyprstream --version
+          # ENTRYPOINT is ["/hyprstream"], so --version is an arg to the binary,
+          # not a separate command.
+          podman run --rm hyprstream-runtime-ci:latest --version
 
       # ── Serving probe: the OAuth HTTP face on :6791 ───────────────────
       # Start the OAuth service inside the container and prove it is
