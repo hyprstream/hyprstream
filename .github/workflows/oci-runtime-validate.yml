@@ -112,6 +112,8 @@ jobs:
             -v "$RUN_DIR":/run/hyprstream:z \
             -v "$SECRETS_DIR":/tmp/hs-secrets:z \
             -e HYPRSTREAM__SECRETS__PATH=/tmp/hs-secrets \
+            -e XDG_DATA_HOME=/var/lib/hyprstream \
+            -e HOME=/var/lib/hyprstream \
             --entrypoint /bin/bash \
             hyprstream-runtime-ci:latest \
             -c '/hyprstream wizard --non-interactive --bootstrap-only 2>&1 && exec /hyprstream service start oauth --foreground --ipc'
