@@ -554,7 +554,8 @@ against acquiring an AGPL dependency in
 `.github/license-boundary.toml`. The policy is exhaustive and CI requires every
 local package manifest to match it exactly.
 
-See [LICENSE-MIT](LICENSE-MIT), [LICENSE-AGPLV3](LICENSE-AGPLV3), and
+See [NOTICE](NOTICE) for MIT-origin source attribution, and
+[LICENSE-MIT](LICENSE-MIT), [LICENSE-AGPLV3](LICENSE-AGPLV3), and
 [LICENSE-APACHE](LICENSE-APACHE) for the corresponding license terms.
 
 ## Acknowledgments
