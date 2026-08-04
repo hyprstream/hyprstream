@@ -38,7 +38,10 @@ value is any 43-character URL-safe-no-pad base64 string that decodes to the
   validate names — it accepts any JSON string key. `validate_service_name`
   (non-empty, at most 64 bytes, `[a-z0-9-]` only) runs producer-side only
   (wizard / bootstrap manager). Consumers look up the exact names
-  `discovery` and `policy`, so anything else parses but is ignored.
+  `discovery` and `policy`, so other names are loaded as unattested TOFU
+  entries in the global trust store but are never resolved by the runtime
+  bootstrap path — they are trusted for their named scope if a caller
+  looks them up, so do not add entries you do not intend to trust.
 
 Produced by `write_bootstrap_pubkeys` and consumed by `load_bootstrap_pubkeys`
 in `crates/hyprstream/src/auth/identity_store.rs`.
