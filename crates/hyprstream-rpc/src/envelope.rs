@@ -1007,15 +1007,32 @@ impl KeyedPqTrustStore {
 
     /// Bind an Ed25519 signer identity to its trusted ML-DSA-65 verifying key
     /// (stored as raw vk bytes; re-decoded on lookup).
+    ///
+    /// Anchoring is **monotonic and conflict-resistant**: once an identity is
+    /// bound to a specific ML-DSA-65 key, a subsequent attempt to bind it to a
+    /// *different* key is refused (not silently overwritten). The same key
+    /// re-registered is an idempotent no-op. This prevents a stale or hostile
+    /// seeding source from silently substituting a different PQ identity for an
+    /// already-anchored peer — the last writer does not win.
     pub fn bind(
         &mut self,
         ed25519_pubkey: [u8; 32],
         ml_dsa_vk: &crate::crypto::pq::MlDsaVerifyingKey,
     ) {
-        self.bindings.insert(
-            ed25519_pubkey,
-            crate::crypto::pq::ml_dsa_vk_bytes(ml_dsa_vk),
-        );
+        let new_bytes = crate::crypto::pq::ml_dsa_vk_bytes(ml_dsa_vk);
+        if let Some(existing) = self.bindings.get(&ed25519_pubkey) {
+            if existing == &new_bytes {
+                return; // idempotent re-registration of the same key
+            }
+            tracing::error!(
+                ed25519 = %hex::encode(ed25519_pubkey),
+                "PQ anchor conflict: identity is already bound to a different \
+                 ML-DSA-65 key; refusing to rebind. The existing anchor is \
+                 retained — investigate if this is unexpected."
+            );
+            return;
+        }
+        self.bindings.insert(ed25519_pubkey, new_bytes);
     }
 
     /// Register an identity that may or may not carry a bound ML-DSA-65 key.
@@ -1025,6 +1042,9 @@ impl KeyedPqTrustStore {
     /// previously hybrid identity from a classical-only source (a legacy
     /// bootstrap file, a re-enrollment that omitted the PQ half) therefore
     /// cannot silently downgrade the peer back to classical.
+    ///
+    /// Equally, a `Some` registration with a *different* PQ key than the one
+    /// already anchored is refused (see [`bind`]) — a rebind is not silent.
     ///
     /// Returns whether the identity is anchored after the call.
     pub fn register(
@@ -4829,6 +4849,37 @@ mod tests {
         let mut store = KeyedPqTrustStore::new();
         assert!(!store.register(vk.to_bytes(), None));
         assert!(store.is_empty());
+    }
+
+    /// A differing PQ key for an already-anchored identity is refused — the
+    /// existing anchor is retained and the rebind is not silent. This prevents
+    /// a stale bootstrap entry (or hostile seeding source) from substituting a
+    /// different PQ identity for an operator-anchored peer.
+    #[test]
+    fn differing_pq_rebind_is_refused_not_silent() {
+        let (_sk1, vk) = generate_signing_keypair();
+        let (_pq_sk_a, pq_vk_a) = crate::crypto::pq::ml_dsa_generate_keypair();
+        let (_pq_sk_b, pq_vk_b) = crate::crypto::pq::ml_dsa_generate_keypair();
+
+        let mut store = KeyedPqTrustStore::new();
+        store.bind(vk.to_bytes(), &pq_vk_a);
+
+        // Attempt to rebind to a different PQ key — must be refused.
+        store.bind(vk.to_bytes(), &pq_vk_b);
+
+        // The original anchor survives.
+        let anchored_vk = store.ml_dsa_key_for(&vk.to_bytes()).expect("anchor survived");
+        let original_bytes = crate::crypto::pq::ml_dsa_vk_bytes(&pq_vk_a);
+        let survived_bytes = crate::crypto::pq::ml_dsa_vk_bytes(&anchored_vk);
+        assert_eq!(
+            original_bytes, survived_bytes,
+            "the original PQ key must be retained, not the attempted rebind"
+        );
+        assert_eq!(store.len(), 1, "no duplicate entry created");
+
+        // Re-registering the SAME key via register() is idempotent.
+        store.register(vk.to_bytes(), Some(&pq_vk_a));
+        assert_eq!(store.len(), 1);
     }
 
     /// The response side enforces the same per-identity rule.

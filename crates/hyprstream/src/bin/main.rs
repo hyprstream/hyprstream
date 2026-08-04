@@ -1657,6 +1657,11 @@ fn install_envelope_verify_config(oauth: Option<&hyprstream_core::config::OAuthC
             &secrets_dir,
         );
         tracing::info!("bootstrap PQ trust store seeded with {anchored} service binding(s)");
+    } else {
+        tracing::warn!(
+            "secrets directory unresolvable; bootstrap PQ bindings not seeded. \
+             Under Hybrid envelope policy local services may be unverifiable."
+        );
     }
 
     tracing::info!("mesh PQ trust store installed with {} peer binding(s)", keyed_store.len());
