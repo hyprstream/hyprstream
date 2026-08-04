@@ -1129,6 +1129,7 @@ pub fn write_registry_public_key(out: &Path, public_key: &[u8; 32]) -> Result<()
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 
