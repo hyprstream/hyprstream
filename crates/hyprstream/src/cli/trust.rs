@@ -882,17 +882,7 @@ fn mint_anchor_capsule(args: &MintAnchorCapsuleArgs) -> Result<()> {
 
     let identities = combined_identities(&args.identities, &args.yubikey_identities)?;
     let authority = decrypt_authority(&args.authority_key, &identities, args.software_recovery)?;
-    ensure!(
-        authority.bundle.purpose != AuthorityPurpose::RegistryDelegatedSigner,
-        "the anchor capsule must be signed by the deployment authority itself; \
-         a registry-scoped delegated signer cannot anchor a deployment"
-    );
-    ensure!(
-        authority.public_bytes() == public_ca,
-        "anchor capsule signing authority does not match the pinned public CA; \
-         only the deployment root that the resolver pins may anchor a deployment"
-    );
-    ensure_active_authority(&authority, &active)?;
+    ensure_anchor_authority(&authority, &public_ca, &active)?;
 
     let minted = build_anchor_material(args, &reach, &authority)?;
     commit_outputs(vec![
@@ -1636,6 +1626,33 @@ fn ensure_active_authority(
             .any(|key| { public[..32] == key.ed25519_pub && public[32..] == key.mldsa65_pub }),
         "authority key is not active at the rotation-log head"
     );
+    Ok(())
+}
+
+/// Verify that `authority` is the deployment root that the resolver pins and is
+/// therefore permitted to mint an anchor capsule.
+///
+/// This bundles the three guard checks `mint_anchor_capsule` runs before it
+/// builds the capsule body: purpose (not a delegated signer), CA-binding (key
+/// matches the pinned root), and rotation-log activeness. It is the seam the
+/// minter's self-check tests exercise so removing any single guard turns the
+/// test red.
+fn ensure_anchor_authority(
+    authority: &LoadedAuthority,
+    public_ca: &[u8],
+    active: &hyprstream_discovery::did_op::VerifiedDidOpLog,
+) -> Result<()> {
+    ensure!(
+        authority.bundle.purpose != AuthorityPurpose::RegistryDelegatedSigner,
+        "the anchor capsule must be signed by the deployment authority itself; \
+         a registry-scoped delegated signer cannot anchor a deployment"
+    );
+    ensure!(
+        authority.public_bytes() == public_ca,
+        "anchor capsule signing authority does not match the pinned public CA; \
+         only the deployment root that the resolver pins may anchor a deployment"
+    );
+    ensure_active_authority(authority, active)?;
     Ok(())
 }
 
@@ -3113,8 +3130,10 @@ mod tests {
         ensure_active_authority(&rotated, &verified).unwrap();
 
         // ... but it does NOT match the pinned public CA, so the anchor mint
-        // must refuse it.  We exercise the check directly: the purpose guard
-        // passes (not a delegated signer), but the CA-binding guard fires.
+        // guard (the same one `mint_anchor_capsule` runs before it builds the
+        // capsule body) must refuse it. Routing through `ensure_anchor_authority`
+        // makes the test causal: remove the CA-binding `ensure!` inside it and
+        // this assertion fails.
         assert!(
             rotated.bundle.purpose != AuthorityPurpose::RegistryDelegatedSigner,
             "test setup: rotated must pass the purpose guard"
@@ -3123,6 +3142,12 @@ mod tests {
             rotated.public_bytes(),
             public_ca,
             "the CA-binding check would not fire if the keys matched"
+        );
+        let error = ensure_anchor_authority(&rotated, &public_ca, &verified)
+            .expect_err("a rotated authority not matching the pinned CA must be refused");
+        assert!(
+            format!("{error:#}").contains("does not match the pinned public CA"),
+            "rejection must name the CA-binding mismatch: {error:#}"
         );
     }
 
