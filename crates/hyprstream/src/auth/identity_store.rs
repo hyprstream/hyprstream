@@ -1923,6 +1923,10 @@ mod tests {
             "error must not implicate the hybrid service: {err}"
         );
         assert!(err.contains("wizard"), "error names the working recovery: {err}");
+        assert!(
+            !err.contains("service repair"),
+            "error must not name the dead-end 'service repair' command: {err}"
+        );
         assert!(err.contains("ML-DSA-65"), "error names what is missing: {err}");
     }
 

@@ -782,7 +782,11 @@ pub async fn run_repair_checks(
         println!("    Some checks failed. Review output above.");
     }
 
-    Ok(())
+    if all_passed {
+        Ok(())
+    } else {
+        Err(anyhow::anyhow!("one or more repair checks failed; review output above"))
+    }
 }
 
 #[allow(dead_code)]

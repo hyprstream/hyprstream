@@ -2920,6 +2920,10 @@ fn main() -> Result<()> {
                 }
 
                 ServiceAction::Repair { verbose } => {
+                    // Normally handled by the early dispatch above (before
+                    // the hybrid gate). This arm is a defense-in-depth fallback
+                    // that runs the same diagnostic checks if the early
+                    // dispatch is ever bypassed.
                     let models_dir = config_for_service.models_dir().clone();
                     with_runtime(
                         RuntimeConfig {
@@ -2927,7 +2931,7 @@ fn main() -> Result<()> {
                             multi_threaded: true,
                         },
                         || async move {
-                            handle_service_install(&models_dir, &services, None, false, false, hyprstream_service::ServiceTarget::User, verbose).await
+                            hyprstream_core::cli::service_handlers::run_repair_checks(&models_dir, verbose).await
                         },
                     )?;
                 }

@@ -112,10 +112,9 @@ Consequently a classical **service** entry is not a supported configuration; it
 is stale material from a pre-hybrid provisioning run. The runtime refuses it
 with an actionable error when it resolves service keys, rather than trusting it
 classically and then failing each RPC later with an opaque "no anchored
-ML-DSA-65 signer key". The fix is to re-provision: `hyprstream wizard`, or
-`hyprstream service repair`. Per-service keys and JWTs are preserved across a
-re-run, so the identities do not change — only the published entries gain their
-post-quantum half.
+ML-DSA-65 signer key". The fix is to re-provision with `hyprstream wizard`.
+Per-service keys and JWTs are preserved across a re-run, so the identities do
+not change — only the published entries gain their post-quantum half.
 
 The low-level loader still reads classical entries so tooling, and that error
 itself, can report precisely which services are stale. This rule is scoped to
