@@ -1024,6 +1024,7 @@ impl KeyedPqTrustStore {
             if existing == &new_bytes {
                 return; // idempotent re-registration of the same key
             }
+            #[cfg(not(target_arch = "wasm32"))]
             tracing::error!(
                 ed25519 = %hex::encode(ed25519_pubkey),
                 "PQ anchor conflict: identity is already bound to a different \
