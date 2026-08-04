@@ -450,6 +450,47 @@ pub fn encode_composite_for_test(inner: Vec<u8>, outer: Option<Vec<u8>>) -> Resu
     encode_composite(inner, outer)
 }
 
+/// The ML-DSA-65 verifying key the composite's outer layer **claims** for
+/// itself, read out of that layer's `kid` protected header.
+///
+/// # This value is not trusted
+///
+/// It is attacker-controlled wire data: whoever produced the composite chose
+/// it. It carries exactly one property — an outer signature that verifies
+/// against it proves the producer held the matching ML-DSA-65 private key —
+/// and it proves *nothing* about that key belonging to the identity in the
+/// inner EdDSA layer. [`verify_composite`] therefore never reads it as an
+/// anchor; it only compares it against a key the caller resolved from a trust
+/// source, and rejects a mismatch.
+///
+/// The one legitimate use is as a *candidate* offered to a trust-on-first-use
+/// record: verify the whole composite against this candidate first, so that
+/// possession of both the EdDSA and the ML-DSA-65 private keys is proven, and
+/// only then record the pairing — at a provenance that grants no additional
+/// trust.
+///
+/// Returns `Ok(None)` when the composite has no outer layer (classical-only) or
+/// when its outer layer carries no `kid`.
+pub fn self_asserted_outer_pq_key(
+    cose_composite_bytes: &[u8],
+) -> Result<Option<MlDsaVerifyingKey>> {
+    let (_, outer_bytes) = decode_composite(cose_composite_bytes)?;
+    let Some(ob) = outer_bytes else {
+        return Ok(None);
+    };
+    let outer =
+        CoseSign1::from_slice(&ob).map_err(|e| anyhow!("malformed outer ML-DSA COSE_Sign1: {e}"))?;
+    let outer_alg = header_alg(&outer)?;
+    if outer_alg != ALG_ML_DSA_65 {
+        bail!("outer COSE_Sign1 must be ML-DSA-65, got alg={outer_alg}");
+    }
+    let kid = &outer.protected.header.key_id;
+    if kid.is_empty() {
+        return Ok(None);
+    }
+    crate::pq::ml_dsa_vk_from_bytes(kid).map(Some)
+}
+
 /// Outcome of composite verification.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompositeVerified {
