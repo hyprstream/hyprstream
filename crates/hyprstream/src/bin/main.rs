@@ -1506,6 +1506,10 @@ fn resolve_service_vk(service_name: &str) -> Option<VerifyingKey> {
     let Ok(secrets_dir) = HyprConfig::resolve_secrets_dir() else {
         return None;
     };
+    // Only the Ed25519 half is needed here: the ML-DSA-65 half of these same
+    // entries is anchored into the process-global PQ trust store when the
+    // envelope verify config is installed (that store is immutable afterwards,
+    // so it is seeded once at construction rather than lazily here).
     if let Ok(pubkeys) = hyprstream_core::auth::identity_store::load_bootstrap_pubkeys(&secrets_dir) {
         for (name, vk) in &pubkeys {
             trust.insert(
@@ -1651,10 +1655,30 @@ fn install_envelope_verify_config(oauth: Option<&hyprstream_core::config::OAuthC
     // Mesh kid-anchored PQ trust store (#157, Option A): populated eagerly from
     // admin-configured `mesh_peers`, immutable after install. An empty store
     // under Hybrid fails closed for unknown peers (correct, by design).
-    let keyed_store = match oauth {
+    let mut keyed_store = match oauth {
         Some(oauth) => hyprstream_core::auth::mesh_trust::build_mesh_pq_trust_store(oauth),
         None => KeyedPqTrustStore::new(),
     };
+
+    // The node's own OS-owned bootstrap-pubkeys anchor the local services'
+    // Ed25519 identities; hybrid entries additionally carry the ML-DSA-65 key
+    // bound to that identity. Anchor those here, into the SAME store the
+    // envelope verify path consults, so supplying hybrid material actually
+    // turns PQ enforcement on for those services. A classical-only file
+    // anchors nothing and changes nothing.
+    if let Ok(secrets_dir) = HyprConfig::resolve_secrets_dir() {
+        let anchored = hyprstream_core::auth::mesh_trust::seed_bootstrap_pq_bindings(
+            &mut keyed_store,
+            &secrets_dir,
+        );
+        tracing::info!("bootstrap PQ trust store seeded with {anchored} service binding(s)");
+    } else {
+        tracing::warn!(
+            "secrets directory unresolvable; bootstrap PQ bindings not seeded. \
+             Under Hybrid envelope policy local services may be unverifiable."
+        );
+    }
+
     tracing::info!("mesh PQ trust store installed with {} peer binding(s)", keyed_store.len());
 
     // Per-host mesh identity roster (#328): bind each enrolled peer's Ed25519
