@@ -411,6 +411,10 @@ pub fn write_service_jwt(
 /// Contains the pubkeys of PolicyService and DiscoveryService, which must be
 /// known to all services so they can verify RPC responses from these bootstrap
 /// services without querying discovery (chicken-and-egg).
+///
+/// Wire format (see `docs/bootstrap-pubkeys-format.md`): a flat JSON object
+/// `{ "<service>": "<base64>" }`, base64 using the URL-safe-no-pad alphabet
+/// (RFC 4648 §5, no `+`/`/`/`=`), decoding to exactly 32 raw Ed25519 bytes.
 pub fn load_bootstrap_pubkeys(
     credentials_dir: &std::path::Path,
 ) -> Result<std::collections::HashMap<String, VerifyingKey>> {
@@ -418,13 +422,25 @@ pub fn load_bootstrap_pubkeys(
     match read_secret(credentials_dir, NAME) {
         Ok(Some(bytes)) => {
             let json: std::collections::HashMap<String, String> = serde_json::from_slice(&bytes)
-                .context("bootstrap-pubkeys is not valid JSON")?;
+                .context(
+                    "bootstrap-pubkeys is not valid JSON: expected a flat object \
+                     `{ \"<service>\": \"<base64>\" }` (see docs/bootstrap-pubkeys-format.md)",
+                )?;
             let mut map = std::collections::HashMap::new();
             for (name, b64) in json {
-                let pubkey_bytes: Vec<u8> = URL_SAFE_NO_PAD.decode(b64)
-                    .with_context(|| format!("invalid base64 in bootstrap-pubkeys for '{name}'"))?;
-                let arr: [u8; 32] = pubkey_bytes.try_into()
-                    .map_err(|_| anyhow!("bootstrap-pubkey for '{name}' must be 32 bytes"))?;
+                let pubkey_bytes: Vec<u8> = URL_SAFE_NO_PAD.decode(&b64).with_context(|| {
+                    format!(
+                        "invalid base64 in bootstrap-pubkeys for '{name}': expected \
+                         URL-safe-no-pad alphabet (RFC 4648 §5, no '+'/'/'/'='), got {b64:?}"
+                    )
+                })?;
+                let arr: [u8; 32] = pubkey_bytes.try_into().map_err(|v: Vec<u8>| {
+                    anyhow!(
+                        "bootstrap-pubkey for '{name}' must decode to exactly 32 bytes \
+                         (raw Ed25519 verifying key); got {} bytes",
+                        v.len()
+                    )
+                })?;
                 let vk = VerifyingKey::from_bytes(&arr)
                     .map_err(|e| anyhow!("invalid bootstrap-pubkey for '{name}': {e}"))?;
                 map.insert(name, vk);

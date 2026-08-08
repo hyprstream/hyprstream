@@ -921,10 +921,18 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
         //
         // The inner EdDSA layer always binds the pinned hybrid-composite alg-id
         // into its AAD (#278). There is no classical request construction path.
-        let hybrid = true;
+        //
+        // The inner layer also commits to the ML-DSA-65 key above it, so a
+        // captured inner layer cannot be re-used under a different outer key.
+        // This is what lets a server record this client's PQ key at first
+        // contact on the strength of the Ed25519 signature.
         let ed_kid = ed_pubkey.to_vec();
-        let ed_tbs =
-            crate::crypto::cose_sign::inner_tbs(ed_kid.clone(), signing_data, &aad, hybrid);
+        let ed_tbs = crate::crypto::cose_sign::inner_tbs_pq_bound(
+            ed_kid.clone(),
+            &pq_kid,
+            signing_data,
+            &aad,
+        );
         let ed_sig = self.signer.sign(&ed_tbs).await?.to_vec();
 
         let pq_tbs =
@@ -935,9 +943,9 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
                  refusing to emit an incomplete mandatory Hybrid composite"
             )
         })?;
-        let cose = crate::crypto::cose_sign::assemble_composite_nested(
+        let cose = crate::crypto::cose_sign::assemble_composite_nested_pq_bound(
             (ed_kid, ed_sig),
-            Some((pq_kid, pq_sig)),
+            (pq_kid, pq_sig),
         )?;
 
         let signed = SignedEnvelope {

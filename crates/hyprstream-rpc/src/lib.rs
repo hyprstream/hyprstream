@@ -208,6 +208,12 @@ pub mod did_plc;
 pub mod did_url;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod admission;
+// Additive, session-scoped PQ binding overlay: trust-on-first-use continuity
+// for dynamically-identified clients, with out-of-band promotion. Consulted by
+// the envelope verify path after the admin-anchored store misses; never mutates
+// that store.
+#[cfg(not(target_arch = "wasm32"))]
+pub mod session_pq_overlay;
 // The real, method-dispatched `IdentityResolver` (#579). Native-only: the
 // did:web arm depends on `did_web`'s DID-document helpers.
 #[cfg(not(target_arch = "wasm32"))]
