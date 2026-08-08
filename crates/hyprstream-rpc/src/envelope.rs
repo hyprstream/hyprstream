@@ -985,6 +985,44 @@ pub trait PqTrustStore: Send + Sync {
     ) -> Option<crate::crypto::pq::MlDsaVerifyingKey>;
 }
 
+/// The ML-DSA-65 key an envelope's signature is checked against, plus how it
+/// was obtained.
+///
+/// The distinction exists so the commit step can tell "already trusted for this
+/// identity" from "asserted by this very envelope and not yet recorded". The
+/// second kind must not be written down until the composite has verified
+/// against it.
+enum PqAnchor {
+    /// Resolved from the admin-anchored store or from an already-established
+    /// overlay binding.
+    Anchored(crate::crypto::pq::MlDsaVerifyingKey),
+    /// Asserted by this envelope for an identity with no binding on file.
+    #[cfg(not(target_arch = "wasm32"))]
+    FirstContact(crate::crypto::pq::MlDsaVerifyingKey),
+    /// This identity has a binding on file and the envelope asserts a
+    /// different key. The request is rejected either way; the key is carried
+    /// so the event can be raised once the EdDSA layer proves who sent it.
+    #[cfg(not(target_arch = "wasm32"))]
+    Rebind {
+        established: crate::crypto::pq::MlDsaVerifyingKey,
+        presented: crate::crypto::pq::MlDsaVerifyingKey,
+    },
+}
+
+impl PqAnchor {
+    fn key(&self) -> &crate::crypto::pq::MlDsaVerifyingKey {
+        match self {
+            PqAnchor::Anchored(k) => k,
+            #[cfg(not(target_arch = "wasm32"))]
+            PqAnchor::FirstContact(k) => k,
+            // The established key, so the composite check fails on the kid
+            // mismatch rather than on a key the envelope chose.
+            #[cfg(not(target_arch = "wasm32"))]
+            PqAnchor::Rebind { established, .. } => established,
+        }
+    }
+}
+
 /// In-memory kid-anchored ML-DSA-65 trust store mapping an Ed25519 signer
 /// identity to its trusted ML-DSA-65 verifying key.
 ///
@@ -1529,7 +1567,13 @@ impl SignedEnvelope {
             None
         };
         let aad = envelope_external_aad();
-        crate::crypto::cose_sign::sign_composite(signing_key, pq, signing_data, &aad)
+        // PQ-bound: the inner EdDSA layer commits to the ML-DSA-65 key above it.
+        // Request envelopes are the one composite whose ML-DSA-65 key a verifier
+        // may RECORD (first contact) rather than resolve from a trust store, so
+        // the Ed25519 signature has to cover which PQ key is being claimed.
+        // Without that, a captured envelope's inner layer can be re-used under a
+        // different outer key by someone who never held the Ed25519 secret.
+        crate::crypto::cose_sign::sign_composite_pq_bound(signing_key, pq, signing_data, &aad)
     }
 
     /// Create, hybrid-encrypt (HyKEM `#mesh-kem` → COSE_Encrypt0), and dual-sign
@@ -1790,31 +1834,161 @@ impl SignedEnvelope {
         let signing_data = self.signed_bytes();
         let aad = envelope_external_aad();
 
-        // The PQ requirement is derived PER IDENTITY, not deployment-wide.
-        // An identity with an anchored ML-DSA-65 key MUST present a verifying
-        // outer PQ layer even where the global policy still admits classical
-        // peers — anchoring a peer is what turns PQ on for that peer. An
-        // identity with no anchor falls back to the global policy, so a
-        // deployment holding no hybrid material behaves exactly as before.
-        let anchored_pq = pq_store.and_then(|store| store.ml_dsa_key_for(&self.cnf));
-        if anchored_pq.is_none() && verify_policy.uses_pq() {
+        // The PQ requirement is per identity on top of the global policy.
+        // Under a PQ-bearing policy the anchor is resolved as before (store,
+        // then session overlay, then first contact). Under a classical policy
+        // an identity with an anchored ML-DSA-65 key STILL requires a
+        // verifying outer PQ layer — anchoring a peer is what turns PQ on for
+        // that peer — while an identity with no anchor keeps the classical
+        // floor, so a deployment holding no hybrid material behaves exactly
+        // as before.
+        let anchor = if verify_policy.uses_pq() {
+            Some(self.resolve_pq_anchor(pq_store)?)
+        } else {
+            pq_store
+                .and_then(|store| store.ml_dsa_key_for(&self.cnf))
+                .map(PqAnchor::Anchored)
+        };
+        let require_pq = anchor.is_some();
+
+        // A rebinding attempt is rejected without ever consulting the key the
+        // envelope chose. It is raised as an event only if the EdDSA layer
+        // verifies — otherwise anyone who merely knows an identity's public
+        // key could inject alarms about it, and a security-event channel that
+        // unauthenticated senders can drive is worse than none.
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(PqAnchor::Rebind { presented, .. }) = &anchor {
+            let sender_holds_identity = crate::crypto::cose_sign::verify_composite(
+                &self.cose,
+                ed_vk,
+                None,
+                &signing_data,
+                &aad,
+                false,
+            )
+            .is_ok();
+            if sender_holds_identity {
+                if let Some(overlay) = crate::session_pq_overlay::global_session_pq_overlay() {
+                    // Publish-only: this key has NOT been proven, so it must not
+                    // reach a code path that could record it.
+                    overlay.surface_rebind(self.cnf, presented);
+                }
+            }
             return Err(EnvelopeError::PqSignatureInvalid(
-                "mandatory Hybrid suite requires an anchored ML-DSA-65 signer key".to_owned(),
+                "presented ML-DSA-65 key differs from this identity's established binding; \
+                 rebinding requires explicit approval"
+                    .to_owned(),
             ));
         }
-        let require_pq = anchored_pq.is_some();
 
-        crate::crypto::cose_sign::verify_composite(
+        let verified = crate::crypto::cose_sign::verify_composite(
             &self.cose,
             ed_vk,
-            anchored_pq.as_ref(),
+            anchor.as_ref().map(PqAnchor::key),
             &signing_data,
             &aad,
             require_pq,
         )
         .map_err(|e| EnvelopeError::PqSignatureInvalid(e.to_string()))?;
 
+        // Commit a first-contact observation only now, and only if the composite
+        // proved possession of the Ed25519 private key *alongside* the ML-DSA-65
+        // one.
+        //
+        // `verified.pq_bound` is exactly that proof. The nesting alone is not:
+        // it binds inner→outer, so an unbound composite can be rebuilt by anyone
+        // holding a COPY of the inner layer — they discard the outer, re-sign
+        // `payload ‖ inner_signature` with an ML-DSA key of their own, and the
+        // result verifies with their PQ key under the captured identity. Only
+        // the inner layer's commitment to the outer key rules that out, because
+        // that commitment sits inside the Ed25519 signature.
+        //
+        // An unbound composite still verifies (it may be a peer resolved from
+        // the anchored store, or an older client); it simply cannot establish a
+        // binding.
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(PqAnchor::FirstContact(key)) = &anchor {
+            if !verified.pq_bound {
+                return Err(EnvelopeError::PqSignatureInvalid(
+                    "first contact requires the inner EdDSA layer to commit to its ML-DSA-65 \
+                     key; an uncommitted composite cannot establish a binding"
+                        .to_owned(),
+                ));
+            }
+            if let Some(overlay) = crate::session_pq_overlay::global_session_pq_overlay() {
+                let outcome = overlay.observe_first_contact(self.cnf, key);
+                if !matches!(
+                    outcome,
+                    crate::session_pq_overlay::FirstContactOutcome::Recorded
+                        | crate::session_pq_overlay::FirstContactOutcome::AlreadyBound(_)
+                ) {
+                    // A racing contact took the slot. Fail closed rather than
+                    // serve a request whose signer this node did not end up
+                    // remembering.
+                    return Err(EnvelopeError::PqSignatureInvalid(
+                        "first-contact ML-DSA-65 binding was not recorded".to_owned(),
+                    ));
+                }
+            }
+        }
+
         Ok(())
+    }
+
+    /// Resolve the ML-DSA-65 key this envelope's signature is checked against.
+    ///
+    /// Order, and why:
+    ///
+    /// 1. The admin-anchored [`PqTrustStore`]. Operator-enrolled bindings are
+    ///    the strongest anchor and are never displaced by anything below.
+    /// 2. An established overlay binding. If the envelope presents a different
+    ///    key than the one on file, this reports a rebinding attempt and the
+    ///    caller rejects the request; the binding on file is left untouched — a
+    ///    rotation is applied only through the overlay's explicit approval
+    ///    path.
+    /// 3. First contact. The key the composite asserts for itself becomes a
+    ///    *candidate* only; it is trusted for nothing until the whole composite
+    ///    verifies against it, and even then it is recorded at a provenance
+    ///    that cannot raise MAC assurance.
+    ///
+    /// With no overlay installed, only step 1 exists and the behavior is
+    /// unchanged: an unanchored identity fails closed.
+    fn resolve_pq_anchor(&self, pq_store: Option<&dyn PqTrustStore>) -> EnvelopeResult<PqAnchor> {
+        if let Some(key) = pq_store.and_then(|store| store.ml_dsa_key_for(&self.cnf)) {
+            return Ok(PqAnchor::Anchored(key));
+        }
+
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(overlay) = crate::session_pq_overlay::global_session_pq_overlay() {
+            let presented = crate::crypto::cose_sign::self_asserted_outer_pq_key(&self.cose)
+                .map_err(|e| EnvelopeError::PqSignatureInvalid(e.to_string()))?;
+
+            if let Some(established) = overlay.verifying_key_for(&self.cnf) {
+                let Some(presented) = presented else {
+                    // No outer layer to compare. The binding stands: a
+                    // PQ-less envelope from a bound identity is rejected by
+                    // the composite check below, and clears nothing.
+                    return Ok(PqAnchor::Anchored(established));
+                };
+                if crate::crypto::pq::ml_dsa_vk_bytes(&presented)
+                    != crate::crypto::pq::ml_dsa_vk_bytes(&established)
+                {
+                    return Ok(PqAnchor::Rebind {
+                        established,
+                        presented,
+                    });
+                }
+                return Ok(PqAnchor::Anchored(established));
+            }
+
+            if let Some(candidate) = presented {
+                return Ok(PqAnchor::FirstContact(candidate));
+            }
+        }
+
+        Err(EnvelopeError::PqSignatureInvalid(
+            "mandatory Hybrid suite requires an anchored ML-DSA-65 signer key".to_owned(),
+        ))
     }
 
     /// Compute the bytes that were signed.

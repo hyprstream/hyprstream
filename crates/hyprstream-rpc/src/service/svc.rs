@@ -499,8 +499,14 @@ impl EnvelopeContext {
     ///   the kid-anchored binding the rest of the TCB uses — the PQ key is
     ///   resolved from the trust store keyed by the EdDSA identity, never
     ///   self-asserted.
+    ///   A session-overlay binding also reaches `PqHybrid`, but **only** when it
+    ///   has been confirmed out of band; a first-contact binding is capped at
+    ///   `Classical` by
+    ///   [`crate::session_pq_overlay::PqProvenance::key_material`].
     /// - **`Classical`** — the `cnf` Ed25519 signer key is verified but NO bound
-    ///   ML-DSA-65 anchor is present (the federation edge, or a pre-PQ identity).
+    ///   ML-DSA-65 anchor is present (the federation edge, or a pre-PQ
+    ///   identity), or the only binding is a first-contact one, which makes the
+    ///   signature checkable without making the signer more trusted.
     /// - **`Unverified`** — the `cnf` key is zeroed (a callback-service context
     ///   with no real envelope; assurance floors to the S1 `Unverified` floor
     ///   so it dominates nothing above it).
@@ -530,6 +536,16 @@ impl EnvelopeContext {
             if let Some(store) = crate::envelope::global_pq_store() {
                 if store.ml_dsa_key_for(&self.cnf).is_some() {
                     return crate::auth::mac::VerifiedKeyMaterial::PqHybrid;
+                }
+            }
+            // A session overlay binding makes the signature checkable; whether
+            // it makes the signer more believed is a separate question, and
+            // `PqProvenance::key_material` is the only place it is answered. A
+            // first-contact binding maps to Classical there — the overlay lets
+            // the request in, it does not promote the requester.
+            if let Some(overlay) = crate::session_pq_overlay::global_session_pq_overlay() {
+                if let Some(provenance) = overlay.provenance_for(&self.cnf) {
+                    return provenance.key_material();
                 }
             }
         }

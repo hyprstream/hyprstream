@@ -1609,12 +1609,10 @@ impl HybridDeploymentCa {
         hyprstream_rpc::auth::composite_kid(&self.ml_dsa_65, &self.ed25519)
     }
 
-    #[cfg(test)]
     pub(crate) fn ed25519_bytes(&self) -> [u8; ED25519_PUBLIC_KEY_BYTES] {
         self.ed25519.to_bytes()
     }
 
-    #[cfg(test)]
     pub(crate) fn ml_dsa_65_bytes(&self) -> Vec<u8> {
         hyprstream_rpc::crypto::pq::ml_dsa_vk_bytes(&self.ml_dsa_65)
     }
