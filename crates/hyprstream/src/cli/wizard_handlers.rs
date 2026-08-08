@@ -56,6 +56,8 @@ struct TextWizardSummary {
     templates_applied: Vec<String>,
     users_created: Vec<(String, String)>,
     tokens_generated: Vec<(String, String, String)>,
+    /// Grade line for the deployment root, when a ceremony ran.
+    deployment_trust: Option<String>,
 }
 
 impl TextWizardSummary {
@@ -64,6 +66,7 @@ impl TextWizardSummary {
             templates_applied: Vec::new(),
             users_created: Vec::new(),
             tokens_generated: Vec::new(),
+            deployment_trust: None,
         }
     }
 }
@@ -87,6 +90,55 @@ pub async fn handle_wizard_tui(models_dir: &Path, config_services: &[String]) ->
     Ok(())
 }
 
+/// Opt-in deployment-trust ceremony settings.
+///
+/// Deployment trust is a separate layer from node bootstrap: none of this runs
+/// unless `enabled` is set, and the wizard's node-local behaviour is unchanged
+/// when it is not.
+#[derive(Clone, Debug, Default)]
+pub struct DeploymentTrustOptions {
+    /// Run the ceremony after node bootstrap.
+    pub enabled: bool,
+    /// Absolute ceremony working directory. Defaults under the models dir.
+    pub dir: Option<std::path::PathBuf>,
+    /// Mint a software root even if a token is attached.
+    pub force_software: bool,
+    /// Token serial to use when several are attached.
+    pub serial: Option<String>,
+    /// PIV slot for the Ed25519 leg on firmware that supports it.
+    pub piv_slot: Option<String>,
+    /// Accept an unencrypted break-glass identity. Throwaway roots only.
+    pub allow_plaintext_break_glass: bool,
+}
+
+/// Everything `hyprstream wizard` was invoked with.
+#[derive(Clone, Debug, Default)]
+pub struct WizardOptions {
+    /// Accept defaults without prompting.
+    pub non_interactive: bool,
+    /// Start services once setup finishes.
+    pub start_services: bool,
+    /// Run only phase 1 (node bootstrap).
+    pub bootstrap_only: bool,
+    /// Apply the federation-open policy template.
+    pub enable_federation: bool,
+    /// Role assigned to the local user under `--non-interactive`.
+    pub initial_user_role: String,
+    /// Deployment-trust ceremony settings.
+    pub deployment_trust: DeploymentTrustOptions,
+}
+
+impl WizardOptions {
+    /// Defaults for the first-run path: interactive, no federation, admin user.
+    #[must_use]
+    pub fn first_run() -> Self {
+        Self {
+            initial_user_role: "admin".to_owned(),
+            ..Self::default()
+        }
+    }
+}
+
 /// Handle `hyprstream wizard` — interactive setup wizard.
 ///
 /// When `bootstrap_only` is true, only phase 1 (trust-root setup) runs.
@@ -96,34 +148,21 @@ pub async fn handle_wizard_tui(models_dir: &Path, config_services: &[String]) ->
 pub async fn handle_wizard(
     models_dir: &Path,
     config_services: &[String],
-    non_interactive: bool,
-    start_services: bool,
-    bootstrap_only: bool,
-    enable_federation: bool,
-    initial_user_role: &str,
+    options: WizardOptions,
 ) -> Result<()> {
     // Install systemd units before entering spawn_blocking (async operation).
-    if !bootstrap_only && hyprstream_rpc::has_systemd() {
+    if !options.bootstrap_only && hyprstream_rpc::has_systemd() {
         handle_service_install(models_dir, config_services, None, false, false, hyprstream_service::ServiceTarget::User, false).await?;
     }
 
     let rt = tokio::runtime::Handle::current();
     let models_dir = models_dir.to_path_buf();
     let config_services = config_services.to_vec();
-    let initial_user_role = initial_user_role.to_owned();
 
     tokio::task::spawn_blocking(move || {
         let mut backend =
-            crate::cli::bootstrap_manager::BootstrapManager::new(rt, models_dir, config_services.clone());
-        run_text_wizard(
-            &mut backend,
-            non_interactive,
-            bootstrap_only,
-            start_services,
-            enable_federation,
-            &initial_user_role,
-            &config_services,
-        )
+            crate::cli::bootstrap_manager::BootstrapManager::new(rt, models_dir.clone(), config_services.clone());
+        run_text_wizard(&mut backend, &options, &models_dir, &config_services)
     })
     .await??;
 
@@ -136,13 +175,12 @@ pub async fn handle_wizard(
 
 fn run_text_wizard(
     backend: &mut impl WizardBackend,
-    non_interactive: bool,
-    bootstrap_only: bool,
-    start_services_flag: bool,
-    enable_federation: bool,
-    initial_user_role: &str,
+    options: &WizardOptions,
+    models_dir: &Path,
     config_services: &[String],
 ) -> Result<()> {
+    let non_interactive = options.non_interactive;
+
     println!();
     println!("  Hyprstream Setup Wizard");
     println!("  {}", "=".repeat(40));
@@ -153,7 +191,7 @@ fn run_text_wizard(
     // Phase 1: Environment bootstrap
     text_phase_bootstrap(backend)?;
 
-    if bootstrap_only {
+    if options.bootstrap_only {
         return Ok(());
     }
 
@@ -161,16 +199,19 @@ fn run_text_wizard(
     text_phase_binary_install(non_interactive)?;
 
     // Phase 3: Policy template selection
-    text_phase_templates(backend, non_interactive, enable_federation, &mut summary)?;
+    text_phase_templates(backend, non_interactive, options.enable_federation, &mut summary)?;
 
     // Phase 4: User/role creation
-    text_phase_users(backend, non_interactive, initial_user_role, &mut summary)?;
+    text_phase_users(backend, non_interactive, &options.initial_user_role, &mut summary)?;
 
     // Phase 5: Token generation
     text_phase_tokens(backend, non_interactive, &mut summary)?;
 
-    // Phase 6: Service startup
-    text_phase_services(backend, config_services, non_interactive, start_services_flag)?;
+    // Phase 6: Deployment trust (opt-in; separate from node-local trust)
+    text_phase_deployment_trust(options, models_dir, &mut summary)?;
+
+    // Phase 7: Service startup
+    text_phase_services(backend, config_services, non_interactive, options.start_services)?;
 
     // Summary
     print_summary(&summary);
@@ -633,7 +674,308 @@ fn token_preview(token: &str) -> String {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Phase 6: Services (via WizardBackend)
+// Phase 6: Deployment trust (opt-in ceremony)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Run the deployment-trust ceremony, if the operator asked for it.
+///
+/// Node bootstrap sets up node-local trust and stops there; this phase is the
+/// separate, deliberately opt-in deployment layer. When it is not requested the
+/// wizard behaves exactly as it did before, including under `--non-interactive`,
+/// where the phase never reaches a prompt.
+fn text_phase_deployment_trust(
+    options: &WizardOptions,
+    models_dir: &Path,
+    summary: &mut TextWizardSummary,
+) -> Result<()> {
+    use crate::cli::trust_ceremony as ceremony;
+    use crate::cli::trust_ceremony::{AgeYubikeyPlugin as _, TokenDetector as _};
+
+    let settings = &options.deployment_trust;
+    let request = ceremony::CeremonyRequest {
+        enabled: settings.enabled,
+        interactive: !options.non_interactive,
+        force_software: settings.force_software,
+        serial: settings.serial.clone(),
+        piv_slot: settings
+            .piv_slot
+            .clone()
+            .unwrap_or_else(|| ceremony::DEFAULT_PIV_SLOT.to_owned()),
+    };
+
+    if !request.enabled {
+        return Ok(());
+    }
+
+    println!("  Phase 6: Deployment Trust");
+    println!("  {}", "-".repeat(40));
+    println!();
+
+    println!("    Looking for a hardware token...");
+    let detection = ceremony::SystemTokenDetector.detect();
+    let mut plan = ceremony::plan_ceremony(&request, &detection);
+
+    if let ceremony::CeremonyPlan::ChooseToken { tokens, rationale } = &plan {
+        println!("    {rationale}.");
+        let labels: Vec<String> = tokens.iter().map(ceremony::DetectedToken::label).collect();
+        let chosen = Select::new("  Which token should hold the deployment root?", labels.clone())
+            .prompt()
+            .map_err(|e| anyhow::anyhow!("no token was chosen: {e}"))?;
+        let index = labels
+            .iter()
+            .position(|label| *label == chosen)
+            .ok_or_else(|| anyhow::anyhow!("token selection did not match an attached token"))?;
+        let token = tokens
+            .get(index)
+            .ok_or_else(|| anyhow::anyhow!("token selection did not match an attached token"))?
+            .clone();
+        plan = ceremony::select_mode_for_token(&request, &token);
+    }
+
+    let (mode, rationale) = match plan {
+        ceremony::CeremonyPlan::Skipped { reason } => {
+            println!("    {reason}.");
+            println!();
+            return Ok(());
+        }
+        ceremony::CeremonyPlan::Blocked { reason, remedy } => {
+            print_check("Deployment trust", CheckStatus::Fail, &reason);
+            println!("    {remedy}.");
+            return Err(anyhow::anyhow!(
+                "deployment trust ceremony cannot run: {reason} — {remedy}"
+            ));
+        }
+        ceremony::CeremonyPlan::ChooseToken { .. } => {
+            return Err(anyhow::anyhow!(
+                "several tokens are attached and none was chosen; pass \
+                 --deployment-trust-serial <SERIAL>"
+            ));
+        }
+        ceremony::CeremonyPlan::Proceed { mode, rationale } => (mode, rationale),
+    };
+
+    println!("    {rationale}.");
+    if mode.is_dev_grade() {
+        println!();
+        println!("    !! {}", ceremony::DEV_GRADE_LABEL);
+        println!("    !! Anyone who can read the recipient files holds the deployment root.");
+        println!("    !! Upgrade to hardware later with `hyprstream trust rotate-authority`.");
+        println!();
+    }
+
+    let missing = ceremony::missing_tools(ceremony::required_tools(&mode), ceremony::tool_on_path);
+    if !missing.is_empty() {
+        return Err(anyhow::anyhow!(
+            "the {} ceremony needs {} on PATH; install {} and re-run",
+            mode.mode_id(),
+            missing.join(", "),
+            missing.join(" and ")
+        ));
+    }
+
+    let dir = match settings.dir.clone() {
+        Some(dir) => dir,
+        None => models_dir.join("deployment-ceremony"),
+    };
+    let dir = if dir.is_absolute() {
+        dir
+    } else {
+        std::env::current_dir()
+            .map_err(|e| anyhow::anyhow!("resolve the ceremony directory: {e}"))?
+            .join(dir)
+    };
+    let paths = ceremony::CeremonyPaths::new(dir)?;
+    ceremony::create_ceremony_dir(paths.dir())?;
+    println!("    Ceremony working directory: {}", paths.dir().display());
+
+    // Primary recipient: the token's own age identity, or a software key.
+    let (primary_recipient, unlock_identity) = match &mode {
+        ceremony::CeremonyMode::HardwarePiv { token, .. }
+        | ceremony::CeremonyMode::HardwareAgeRecipient { token } => {
+            println!();
+            println!("    Generating the token's age identity (PIN + touch required for every");
+            println!("    use). Follow the prompts on your terminal and the token.");
+            let plugin = ceremony::SystemAgeYubikeyPlugin;
+            let recipient = plugin
+                .generate_identity(&format!("hyprstream deployment root ({})", token.serial))
+                .map_err(|e| anyhow::anyhow!("generate the token's age identity: {e}"))?;
+            plugin
+                .export_identity_file(&paths.yubikey_identity())
+                .map_err(|e| anyhow::anyhow!("export the token's age identity: {e}"))?;
+            (
+                recipient,
+                ceremony::UnlockIdentity::Yubikey(paths.yubikey_identity()),
+            )
+        }
+        ceremony::CeremonyMode::SoftwareDevGrade => {
+            let recipient = ceremony::generate_software_identity(&paths.primary_identity())?;
+            (
+                recipient,
+                ceremony::UnlockIdentity::Age(paths.primary_identity()),
+            )
+        }
+    };
+
+    let break_glass = prompt_break_glass(&mode, &primary_recipient, &paths, options)?;
+    println!("    Break-glass: {}", break_glass.kind_id());
+
+    // The online signer is an autonomous key: no token, no root.
+    let signer_recipient = ceremony::generate_software_identity(&paths.online_signer_identity())?;
+
+    // The credential binds the registry service key node bootstrap just made.
+    let credentials_dir = crate::auth::identity_store::credentials_dir()?;
+    let pubkeys = crate::auth::identity_store::load_bootstrap_pubkeys(&credentials_dir)?;
+    let registry_key = pubkeys.get("registry").ok_or_else(|| {
+        anyhow::anyhow!(
+            "no registry service key in {}; run node bootstrap before the ceremony",
+            credentials_dir.display()
+        )
+    })?;
+    ceremony::write_registry_public_key(&paths.registry_public_key(), registry_key.as_bytes())?;
+
+    let inputs = ceremony::CeremonyInputs {
+        mode: mode.clone(),
+        primary_recipient,
+        break_glass: break_glass.clone(),
+        unlock_identity,
+        signer_recipient,
+        paths: paths.clone(),
+    };
+
+    println!();
+    for (step, command) in ceremony::ceremony_commands(&inputs)?.into_iter().enumerate() {
+        println!("    Ceremony step {}/4...", step + 1);
+        crate::cli::trust::handle_trust_command(command)?;
+    }
+
+    let record = ceremony::mode_record(&mode, &break_glass, &rationale);
+    std::fs::write(
+        paths.mode_record(),
+        serde_json::to_vec_pretty(&record)?,
+    )?;
+
+    print_check("Deployment trust", CheckStatus::Ok, mode.grade_label());
+    println!();
+    println!("    The public artifacts are NOT installed yet. Copy them to a deployed host:");
+    println!("      {}", paths.public_ca().display());
+    println!("      {}", paths.authority_log().display());
+    println!("      {}", paths.authority_checkpoint().display());
+    println!("    Keep {} offline — it never belongs on a deployed host.", paths.authority_key().display());
+    println!();
+
+    summary.deployment_trust = Some(format!("{} — {}", mode.mode_id(), mode.grade_label()));
+    Ok(())
+}
+
+/// Walk the operator through a break-glass recipient the tooling can trust.
+///
+/// The trust CLI can only see that two recipients differ; whether the second is
+/// protected is decided here, and an unprotected one is refused by default.
+fn prompt_break_glass(
+    mode: &crate::cli::trust_ceremony::CeremonyMode,
+    primary_recipient: &str,
+    paths: &crate::cli::trust_ceremony::CeremonyPaths,
+    options: &WizardOptions,
+) -> Result<crate::cli::trust_ceremony::BreakGlass> {
+    use crate::cli::trust_ceremony as ceremony;
+
+    const SECOND_TOKEN: &str = "A second hardware token (best — same protection as the primary)";
+    const PASSPHRASE: &str = "A passphrase-encrypted identity file (age-keygen | age -p)";
+    const PLAINTEXT: &str = "An unencrypted identity file (throwaway roots only)";
+
+    let policy = if options.deployment_trust.allow_plaintext_break_glass {
+        ceremony::PlaintextPolicy::AllowedByOverride
+    } else if mode.is_dev_grade() {
+        ceremony::PlaintextPolicy::AllowedForDevGradeRoot
+    } else {
+        ceremony::PlaintextPolicy::Refuse
+    };
+
+    // A scripted run cannot answer a prompt or type a passphrase. It only gets
+    // here for a dev-grade root, where an unencrypted backup adds no exposure.
+    let break_glass = if options.non_interactive {
+        let recipient = ceremony::generate_software_identity(&paths.break_glass_identity())?;
+        ceremony::BreakGlass::PlaintextIdentity {
+            identity_file: paths.break_glass_identity(),
+            recipient,
+        }
+    } else {
+        println!();
+        println!("    A deployment root needs a second recipient, or losing the primary loses");
+        println!("    the root. The root is exactly as strong as its weakest recipient.");
+        let choice = Select::new(
+            "  How should the break-glass recipient be protected?",
+            vec![SECOND_TOKEN, PASSPHRASE, PLAINTEXT],
+        )
+        .with_starting_cursor(if mode.is_dev_grade() { 1 } else { 0 })
+        .prompt()
+        .map_err(|e| anyhow::anyhow!("no break-glass recipient was chosen: {e}"))?;
+
+        match choice {
+            SECOND_TOKEN => {
+                println!("    Prepare the second token elsewhere with:");
+                println!(
+                    "      age-plugin-yubikey --generate --name \"hyprstream break-glass\" \\"
+                );
+                println!("        --pin-policy always --touch-policy always");
+                let recipient = Text::new("  Paste its age1yubikey1… recipient:")
+                    .prompt()
+                    .map_err(|e| anyhow::anyhow!("no break-glass recipient was entered: {e}"))?;
+                ceremony::BreakGlass::SecondToken {
+                    recipient: recipient.trim().to_owned(),
+                }
+            }
+            PASSPHRASE => {
+                let destination = Text::new("  Where should the encrypted backup identity go?")
+                    .with_default(&paths.break_glass_identity().display().to_string())
+                    .prompt()
+                    .map_err(|e| anyhow::anyhow!("no backup destination was entered: {e}"))?;
+                let destination = std::path::PathBuf::from(destination.trim());
+                println!("    Choose a passphrase and store it apart from the file itself.");
+                let recipient =
+                    ceremony::generate_passphrase_encrypted_identity(&destination)?;
+                match ceremony::classify_identity_file(
+                    &std::fs::read_to_string(&destination).unwrap_or_default(),
+                ) {
+                    ceremony::IdentityFileKind::PassphraseEncrypted => {}
+                    ceremony::IdentityFileKind::PlaintextAgeIdentity => {
+                        return Err(anyhow::anyhow!(
+                            "{} was written unencrypted; delete it and retry",
+                            destination.display()
+                        ));
+                    }
+                    ceremony::IdentityFileKind::Unconfirmed => {
+                        println!(
+                            "    Note: {} is encrypted, but its passphrase stanza could not be \
+                             confirmed from here.",
+                            destination.display()
+                        );
+                    }
+                }
+                ceremony::BreakGlass::PassphraseEncrypted {
+                    identity_file: destination,
+                    recipient,
+                }
+            }
+            _ => {
+                let recipient =
+                    ceremony::generate_software_identity(&paths.break_glass_identity())?;
+                ceremony::BreakGlass::PlaintextIdentity {
+                    identity_file: paths.break_glass_identity(),
+                    recipient,
+                }
+            }
+        }
+    };
+
+    if let Err(reason) = ceremony::validate_break_glass(&break_glass, primary_recipient, policy) {
+        return Err(anyhow::anyhow!("{reason}"));
+    }
+    Ok(break_glass)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Phase 7: Services
 // ─────────────────────────────────────────────────────────────────────────────
 
 fn text_phase_services(
@@ -642,7 +984,7 @@ fn text_phase_services(
     non_interactive: bool,
     start_flag: bool,
 ) -> Result<()> {
-    println!("  Phase 6: Services");
+    println!("  Phase 7: Services");
     println!("  {}", "-".repeat(40));
     println!();
 
@@ -714,9 +1056,14 @@ fn print_summary(summary: &TextWizardSummary) {
         }
     }
 
+    if let Some(deployment_trust) = &summary.deployment_trust {
+        println!("  Deployment trust: {deployment_trust}");
+    }
+
     if summary.templates_applied.is_empty()
         && summary.users_created.is_empty()
         && summary.tokens_generated.is_empty()
+        && summary.deployment_trust.is_none()
     {
         println!("  Environment bootstrapped with default settings.");
     }
