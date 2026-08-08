@@ -1242,7 +1242,7 @@ mod tests {
             async fn remove(&self, _: &str) -> anyhow::Result<bool> {
                 unreachable!()
             }
-            async fn list_users(&self) -> Vec<String> {
+            async fn list_users(&self) -> anyhow::Result<Vec<String>> {
                 unreachable!()
             }
             async fn search(&self, _: &UserFilter) -> anyhow::Result<Vec<(String, UserProfile)>> {
@@ -1308,9 +1308,9 @@ mod tests {
                 [0x76; 32],
             )
             .with_user_service(Arc::new(
-                crate::services::oauth::user_service::UserService::new(Arc::new(
-                    UntouchedUserStore,
-                )),
+                crate::services::oauth::user_service::UserService::new(
+                    crate::auth::ProductionUserStore::for_test(Arc::new(UntouchedUserStore)),
+                ),
             )),
         );
 

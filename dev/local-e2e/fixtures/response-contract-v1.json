@@ -1,0 +1,84 @@
+{
+  "contract_version": "v1",
+  "cases": {
+    "wrong_ca": {
+      "class": "tls_failure",
+      "status": null,
+      "body": null
+    },
+    "wrong_trust_directory": {
+      "class": "startup_failure",
+      "status": null,
+      "body": null
+    },
+    "service_auth_bad_request": {
+      "class": "http_json",
+      "status": 400,
+      "body": {
+        "exact_keys": ["error", "message"],
+        "fields": {
+          "error": {"literal": "InvalidRequest"},
+          "message": {"type": "nonempty_string"}
+        }
+      }
+    },
+    "session_exchange_missing_bearer": {
+      "class": "http_json",
+      "status": 401,
+      "body": {
+        "exact_keys": ["error", "error_description"],
+        "fields": {
+          "error": {"literal": "invalid_token"},
+          "error_description": {"type": "nonempty_string"}
+        }
+      }
+    },
+    "session_exchange_missing_dpop": {
+      "class": "http_json",
+      "status": 400,
+      "body": {
+        "exact_keys": ["error", "error_description"],
+        "fields": {
+          "error": {"literal": "invalid_dpop_proof"},
+          "error_description": {"type": "nonempty_string"}
+        }
+      }
+    },
+    "whoami_unauthenticated": {
+      "class": "http_json",
+      "status": 200,
+      "body": {
+        "exact": {
+          "did": null,
+          "kind": "unauthenticated",
+          "tenant": null,
+          "canActLocally": false
+        }
+      }
+    },
+    "inference_ready": {
+      "class": "authenticated_rpc",
+      "status": null,
+      "body": {
+        "exact": {"isReady": true}
+      }
+    },
+    "inference_healthy": {
+      "class": "authenticated_rpc",
+      "status": null,
+      "body": {
+        "exact": {"modelLoaded": true, "status": "ok"}
+      }
+    },
+    "inference_application_output": {
+      "class": "authenticated_rpc",
+      "status": null,
+      "body": {
+        "exact_keys": ["output"],
+        "fields": {
+          "output": {"type": "nonempty_string"}
+        }
+      }
+    }
+  }
+}

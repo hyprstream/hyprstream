@@ -30,13 +30,6 @@ env:
   SCCACHE_BUCKET: ${{ vars.AWS_SCCACHE_BUCKET }}
   SCCACHE_REGION: ${{ vars.AWS_SCCACHE_REGION }}
   CARGO_INCREMENTAL: 0
-  # Pinned arm64 rust-builder image (built by build-image.yml): toolchain +
-  # libtorch + capnproto + sccache + cargo-nextest + git-lfs + the pinned Rust
-  # toolchain's components/targets, all baked. Bump this digest deliberately after
-  # a builder-image publish so CI inputs stay reproducible (a follow-up automates
-  # the bump — see build-image.yml).
-  BUILDER_IMAGE: ghcr.io/hyprstream/rust-builder-arm64@sha256:aa9feb1c8432ebf4583fcfc9c8236c371cb050f489c4d0882a7f2d8c8589120e
-
 # The fast lint jobs (clippy, wasm) run on the self-hosted Graviton (arm64)
 # runners and drive the build through `podman run` against the prebuilt
 # rust-builder image (rust + capnproto + clang + libtorch). We DELIBERATELY do
@@ -75,6 +68,11 @@ jobs:
       with:
         persist-credentials: false
 
+    # The immutable arm64 builder image is shared by rust.yml, the preflight,
+    # and AppImage packaging. Keep its sole pin in .github/builder-image.env.
+    - name: Load builder image pin
+      run: bash .github/scripts/load-builder-image.sh
+
     - name: Configure AWS credentials (OIDC → sccache S3)
       uses: aws-actions/configure-aws-credentials@v4
       with:
@@ -86,13 +84,17 @@ jobs:
 
     - name: Run Clippy (in rust-builder container)
       run: |
+        # Runner boot labels this target subtree container_file_t; leave the
+        # container confined and retain :Z only on the checked-out source.
         podman run --rm \
           -v "$PWD":/build:Z -w /build \
+          -v /mnt/hypr-ci-cache:/mnt/hypr-ci-cache \
           -e RUSTC_WRAPPER=sccache -e SCCACHE_BUCKET -e SCCACHE_REGION \
           -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY -e AWS_SESSION_TOKEN \
           -e AWS_REGION -e AWS_DEFAULT_REGION \
           -e LIBTORCH=/opt/libtorch -e LD_LIBRARY_PATH=/opt/libtorch/lib \
           -e LIBTORCH_BYPASS_VERSION_CHECK=1 -e OPENSSL_NO_VENDOR=1 \
+          -e CARGO_TARGET_DIR=/mnt/hypr-ci-cache/target/hyprstream \
           -e CARGO_INCREMENTAL=0 -e CARGO_TERM_COLOR=always \
           "$BUILDER_IMAGE" \
           bash -euo pipefail -c '
@@ -132,7 +134,8 @@ jobs:
       # NOT add `|| true`.
       run: |
         python3 scripts/check_rust_workflow_matrix.py
-        python3 scripts/check_browser_wasm_gate.py
+        python3 -m unittest discover -s scripts/tests -p 'test_check_license_boundary.py'
+        python3 scripts/check_license_boundary.py
 
   loopback-burndown:
     name: Loopback-literal burn-down (#1152 W4)
@@ -172,6 +175,9 @@ jobs:
       with:
         persist-credentials: false
 
+    - name: Load builder image pin
+      run: bash .github/scripts/load-builder-image.sh
+
     - name: Configure AWS credentials (OIDC → sccache S3)
       uses: aws-actions/configure-aws-credentials@v4
       with:
@@ -187,6 +193,36 @@ jobs:
     # merge-group build, preventing the two gates from drifting apart.
     - name: Check wasm32 browser build (in rust-builder container)
       run: |
+        # Runner boot labels this target subtree container_file_t; leave the
+        # container confined and retain :Z only on the checked-out source.
+        podman run --rm \
+          -v "$PWD":/build:Z -w /build \
+          -v /mnt/hypr-ci-cache:/mnt/hypr-ci-cache \
+          -e RUSTC_WRAPPER=sccache -e SCCACHE_BUCKET -e SCCACHE_REGION \
+          -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY -e AWS_SESSION_TOKEN \
+          -e AWS_REGION -e AWS_DEFAULT_REGION \
+          -e CARGO_TARGET_DIR=/mnt/hypr-ci-cache/target/hyprstream \
+          -e CARGO_INCREMENTAL=0 -e CARGO_TERM_COLOR=always \
+          "$BUILDER_IMAGE" \
+          bash -euo pipefail -c '
+            bash /build/.github/scripts/browser-wasm-check.sh
+            sccache --show-stats
+          '
+
+    # #1425 r3: actually EXECUTES crates/hyprstream-rpc/tests/wasm_browser_fetch.rs
+    # in a real headless browser, as an isolated named wasm test artifact — not
+    # just a compile check. Deliberately does not use `wasm-pack test`: it
+    # unconditionally passes `--tests` to cargo, which additionally compiles
+    # every other (native-only) test target in the crate and fails before a
+    # browser is ever launched. browser-wasm-test.sh builds only the named
+    # integration test via `cargo test --test <name>` (never `--tests`) and
+    # runs it through a wasm-bindgen version-matched wasm-bindgen-test-runner.
+    # browser-wasm-test-ci.sh installs a headless-capable Chromium + matching
+    # chromedriver from the container's own package repo (arch-correct for
+    # this arm64/Graviton runner, unlike Google's x64-only Chrome-for-Testing
+    # distribution) before delegating to it.
+    - name: Run browser-fetch conformance test (headless Chromium, rust-builder container)
+      run: |
         podman run --rm \
           -v "$PWD":/build:Z -w /build \
           -e RUSTC_WRAPPER=sccache -e SCCACHE_BUCKET -e SCCACHE_REGION \
@@ -195,7 +231,7 @@ jobs:
           -e CARGO_INCREMENTAL=0 -e CARGO_TERM_COLOR=always \
           "$BUILDER_IMAGE" \
           bash -euo pipefail -c '
-            bash /build/.github/scripts/browser-wasm-check.sh
+            bash /build/.github/scripts/browser-wasm-test-ci.sh
             sccache --show-stats
           '
 
@@ -243,6 +279,9 @@ jobs:
       with:
         persist-credentials: false
 
+    - name: Load builder image pin
+      run: bash .github/scripts/load-builder-image.sh
+
     - name: Configure AWS credentials (OIDC → sccache S3)
       uses: aws-actions/configure-aws-credentials@v4
       with:
@@ -252,6 +291,19 @@ jobs:
     - name: Pull builder image
       run: podman pull "$BUILDER_IMAGE"
 
+    # Runtime execution receipt for the browser-WASM conformance phase: a
+    # fresh per-run nonce is handed into the container; browser-wasm-test.sh
+    # echoes it into browser-wasm-receipt.txt only after the headless-browser
+    # run has succeeded, and the required assert step below fails this job if
+    # the receipt is absent or stale. Execution of the browser phase is proven
+    # by observing it, not by statically analyzing the script chain — any
+    # change that stops the phase from actually running (skipped invocation,
+    # dead-coded branch, shadowed command) leaves no receipt and fails the
+    # sole required merge-group check.
+    - name: Generate browser conformance nonce
+      run: |
+        echo "BROWSER_ATTEST_NONCE=$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')" >> "$GITHUB_ENV"
+
     # Browser-WASM preflight + full merge-gate build/test run in ONE container,
     # so sccache stays warm and the bind-mounted target/ persists across the
     # browser check → native build → wasm guests → nextest → doctests. AWS creds
@@ -259,17 +311,29 @@ jobs:
     # in-image sccache reaches the same-region S3 bucket.
     - name: WASM preflight + build + test (in rust-builder container)
       run: |
+        # Runner boot labels this target subtree container_file_t; leave the
+        # container confined and retain :Z only on the checked-out source.
         podman run --rm \
           -v "$PWD":/build:Z -w /build \
+          -v /mnt/hypr-ci-cache:/mnt/hypr-ci-cache \
           -e RUSTC_WRAPPER=sccache -e SCCACHE_BUCKET -e SCCACHE_REGION \
           -e SCCACHE_IDLE_TIMEOUT=0 \
           -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY -e AWS_SESSION_TOKEN \
           -e AWS_REGION -e AWS_DEFAULT_REGION \
           -e LIBTORCH=/opt/libtorch -e LD_LIBRARY_PATH=/opt/libtorch/lib \
           -e LIBTORCH_BYPASS_VERSION_CHECK=1 -e OPENSSL_NO_VENDOR=1 \
+          -e CARGO_TARGET_DIR=/mnt/hypr-ci-cache/target/hyprstream \
           -e CARGO_INCREMENTAL=0 -e CARGO_TERM_COLOR=always \
+          -e BROWSER_ATTEST_NONCE \
           "$BUILDER_IMAGE" \
           bash -euo pipefail -c '
+            # #1425 r4: install the real headless-browser dependency as root,
+            # before switching to the non-root ci user below — graviton-build-
+            # test.sh runs as ci and cannot apt-get/dnf install. This makes the
+            # required merge-group build path actually launch a browser for the
+            # wasm_browser_fetch conformance test, not just compile-check it.
+            bash /build/.github/scripts/install-chromium.sh
+
             # cargo-nextest, git-lfs, the wasm targets and clippy are baked into the
             # builder image (BUILDER_IMAGE, Dockerfile builder-cpu-arm64) — no runtime
             # installs here. Only set up the NON-ROOT user: several fail-closed tests
@@ -282,3 +346,14 @@ jobs:
             chown -R ci:ci /build
             runuser -u ci -- bash -euo pipefail /build/.github/scripts/graviton-build-test.sh
           '
+
+    # The receipt is written by browser-wasm-test.sh only after the headless
+    # browser actually executed the conformance test in THIS run (the nonce is
+    # fresh per run, so a stale or checked-in file cannot satisfy it). This
+    # step must be able to fail — do NOT add `|| true`.
+    - name: Assert browser conformance receipt
+      run: |
+        grep -qx "$BROWSER_ATTEST_NONCE" browser-wasm-receipt.txt || {
+          echo "browser-wasm conformance phase did not execute in this run (receipt missing or stale)" >&2
+          exit 1
+        }

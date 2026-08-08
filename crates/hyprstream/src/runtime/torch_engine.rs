@@ -138,6 +138,11 @@ pub struct TorchEngine {
     /// Current active session owner for KV cache selection
     /// If set, generation uses the corresponding cache from the registry
     active_cache_owner: Arc<Mutex<Option<crate::runtime::kv_cache::CacheOwner>>>,
+    /// KV-cache compatibility descriptor for the loaded model (#1277). The
+    /// authoritative identity every reusable/durable KV lookup is checked
+    /// against; `None` until a model is loaded. Built from the model config +
+    /// runtime config at load time, finalized with the tokenizer identity.
+    kv_compat: Arc<Mutex<Option<crate::runtime::kv_compat::KvCompatDescriptor>>>,
     // Note: XET/LFS handled by git-xet-filter + ModelFactory::load_file_with_pointer_detection()
     // Note: Pre-training not supported (persistent_model doesn't expose VarStore), LoRA only
 }
@@ -272,6 +277,32 @@ impl TorchEngine {
             "[TorchEngine] Initialized KV cache registry: {} layers, max_seq_len={}, budget={:?}",
             num_layers, max_seq_len, memory_budget
         );
+    }
+
+    /// Expected KV-cache compatibility fingerprint for the loaded model under the
+    /// given adapter/delta generation, or `None` when no authoritative identity is
+    /// available.
+    ///
+    /// The effective identity folds in the base-weight content digest, the full
+    /// effective architecture/runtime config, and the live `adapter_generation`
+    /// actually applied to the request. Returns `None` when no descriptor was
+    /// built (the base-weight digest could not be computed) or when the descriptor
+    /// is not yet authoritatively complete (tokenizer identity not yet folded in,
+    /// or tokenizer hashing failed). The session-reuse path treats `None` as
+    /// **fail-closed**: it discards a cache rather than reusing it under a
+    /// missing or uncertain identity — it never treats absence as "no gating".
+    pub fn kv_compat_fingerprint_for(
+        &self,
+        adapter_generation: u64,
+    ) -> Option<crate::runtime::kv_compat::KvCompatFingerprint> {
+        let guard = self.kv_compat.lock();
+        let desc = guard.as_ref()?;
+        if !desc.is_authoritatively_complete() {
+            return None;
+        }
+        let mut effective = desc.clone();
+        effective.weights.adapter_generation = adapter_generation;
+        Some(crate::runtime::kv_compat::KvCompatFingerprint::of(&effective))
     }
 
     /// Compute a KV cache memory budget based on model size and available GPU memory.
@@ -627,6 +658,7 @@ impl TorchEngine {
             eos_token_id: Arc::new(AtomicU32::new(0)),
             kv_cache_registry: None, // Initialized after model load when config is known
             active_cache_owner: Arc::new(Mutex::new(None)),
+            kv_compat: Arc::new(Mutex::new(None)), // Built from model config at load time (#1277)
         })
     }
 
@@ -732,6 +764,102 @@ impl TorchEngine {
         self.var_store.lock().is_some()
     }
 
+    /// Authoritative content digest of the base weights actually loaded from
+    /// `model_path` — a canonical SHA-256 over the **loader-selected**
+    /// `.safetensors` shards' **resolved** bytes (shard count + length-prefixed
+    /// name + per-shard content digest), in sorted name order. This is the
+    /// base-weight identity for the KV-compat fingerprint (#1277): two snapshots
+    /// sharing a basename but differing in content diverge here, unlike a
+    /// path/label.
+    ///
+    /// The shard set comes from the **same selector the loader uses**
+    /// (`ModelFactory::find_shard_files_for_digest`, the digest-authoritative
+    /// variant of the loader's selector: `model.safetensors.index.json` →
+    /// `model.safetensors` → shard-name glob), so the digest covers EXACTLY the
+    /// shards the loader reads — an extra/unreferenced `.safetensors` in the
+    /// directory (stale shard, alt-precision copy) cannot shift the fingerprint
+    /// while the loaded weights are identical. Unlike the loader, the digest
+    /// REJECTS an ambiguous manifest-less multi-shard glob set regardless of
+    /// `HYPRSTREAM_STRICT_LOADER` — fingerprint authority is stricter than
+    /// loader permissiveness.
+    ///
+    /// The digest hashes the **resolved** bytes — the identical resolution path
+    /// the loader walks (`ModelFactory::resolve_weight_for_digest` transparently
+    /// resolves an un-smudged LFS/XET pointer to its object content), so it never
+    /// hashes a pointer stub in place of the real tensors. It is **fail-closed**:
+    /// any selection/read/resolve error, an empty selection, an
+    /// index-referenced shard that is missing, or an ambiguous manifest-less
+    /// multi-shard set propagates, so the caller declines to mint a descriptor
+    /// and KV reuse fails closed rather than hashing a partial shard set.
+    async fn weights_content_digest(model_path: &Path) -> Result<String> {
+        use crate::runtime::kv_compat;
+        use crate::runtime::model_factory::{ModelFactory, ResolvedWeight};
+
+        // Resolve the loader-selected shard set (the digest-authoritative
+        // variant of the loader's own selector).
+        let shards = ModelFactory::find_shard_files_for_digest(model_path)?;
+
+        // Fail closed on an empty or inconsistent selection: the loader would
+        // have nothing authoritative to load (or the index disagrees with the
+        // directory), so reuse must be declined rather than minted over a
+        // partial/ambiguous set.
+        if shards.is_empty() {
+            anyhow::bail!(
+                "no loader-selected .safetensors weight shards in {}",
+                model_path.display()
+            );
+        }
+        for shard in &shards {
+            if !shard.is_file() {
+                anyhow::bail!(
+                    "loader-selected shard {} is missing or not a regular file",
+                    shard.display()
+                );
+            }
+        }
+
+        let mut digested: Vec<(String, [u8; 32])> = Vec::with_capacity(shards.len());
+        for shard in &shards {
+            let name = shard
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("")
+                .to_owned();
+            // Resolve transparently (LFS/XET pointer → object content), then
+            // hash the resolved bytes. Large ordinary shards stream; resolved
+            // pointers and small files hash their owned bytes.
+            let shard_digest = match ModelFactory::resolve_weight_for_digest(shard).await? {
+                ResolvedWeight::Owned(bytes) => kv_compat::shard_content_digest(&bytes),
+                ResolvedWeight::File(file) => Self::stream_file_digest(file)?,
+            };
+            digested.push((name, shard_digest));
+        }
+        Ok(kv_compat::base_weight_digest_from_shards(&digested))
+    }
+
+    /// SHA-256 of a file's bytes, streamed in 64 KiB chunks so a multi-GB shard
+    /// is never fully buffered into memory just to hash it. Returns the resolved
+    /// read error (fail-closed) rather than a partial digest.
+    fn stream_file_digest(
+        file: std::fs::File,
+    ) -> std::result::Result<[u8; 32], std::io::Error> {
+        use sha2::Digest;
+        use std::io::Read;
+        let mut hasher = sha2::Sha256::new();
+        let mut f = file;
+        let mut buf = [0u8; 65536];
+        loop {
+            let n = f.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            hasher.update(&buf[..n]);
+        }
+        let mut out = [0u8; 32];
+        out.copy_from_slice(hasher.finalize().as_slice());
+        Ok(out)
+    }
+
     /// Initialize XET storage with default configuration
     /// Initialize the persistent model instance using ModelFactory
     async fn initialize_persistent_model(&mut self, model_path: &Path) -> Result<()> {
@@ -807,6 +935,106 @@ impl TorchEngine {
             model_info.vocab_size = config.vocab_size as u32;
             model_info.context_length = effective_max_context as u32;
             model_info.architecture = config.model_type.clone();
+        }
+
+        // Build the KV-cache compatibility descriptor (#1277): the authoritative
+        // identity of the model + runtime config that produces this engine's KV.
+        // Every reusable/durable KV lookup is checked against its fingerprint.
+        // Built here (where the full `ModelConfig` is in scope) from authoritative
+        // inputs only — never a human label. The base-weight identity is a content
+        // digest of the resolved shards; the tokenizer identity is folded in later
+        // by `load_tokenizer`, before any generation reads the fingerprint. If no
+        // authoritative base digest can be computed, the descriptor is left unset
+        // and the cache boundary fails closed (KV recomputed, not reused).
+        match Self::weights_content_digest(model_path).await {
+            Ok(base_revision) => {
+                use crate::runtime::kv_compat::{
+                    KvCompatDescriptor, KvDtype, KvQuantMode, MoeRouting, RopeScalingFp,
+                    WeightIdentity, KV_COMPAT_FORMAT_VERSION,
+                };
+                let kv_quant = match self.config.kv_quant_type {
+                    crate::runtime::KVQuantType::None => KvQuantMode::None,
+                    crate::runtime::KVQuantType::Int8 => KvQuantMode::Int8,
+                    crate::runtime::KVQuantType::Nf4 => KvQuantMode::Nf4,
+                    crate::runtime::KVQuantType::Fp4 => KvQuantMode::Fp4,
+                };
+                // `model_name` is a display label for mismatch messages; the
+                // authoritative weight identity is the content digest above.
+                let model_name = model_path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("")
+                    .to_owned();
+                let descriptor = KvCompatDescriptor {
+                    format_version: KV_COMPAT_FORMAT_VERSION,
+                    weights: WeightIdentity::base_only(base_revision),
+                    model_name,
+                    architecture: config.model_type.clone(),
+                    model_version: config.version,
+                    num_hidden_layers: config.num_hidden_layers,
+                    num_attention_heads: config.num_attention_heads,
+                    num_key_value_heads: config.num_key_value_heads,
+                    head_dim: config.head_dim,
+                    hidden_size: config.hidden_size,
+                    // Effective attention behavior — every field below can change
+                    // KV *values* without changing coarse geometry (#1277 review).
+                    use_qk_norm: config.use_qk_norm,
+                    partial_rotary_factor_bits: config.partial_rotary_factor.map(f32::to_bits),
+                    layer_types: config.layer_types.clone(),
+                    linear_key_head_dim: config.linear_key_head_dim,
+                    linear_value_head_dim: config.linear_value_head_dim,
+                    linear_num_key_heads: config.linear_num_key_heads,
+                    linear_num_value_heads: config.linear_num_value_heads,
+                    linear_conv_kernel_dim: config.linear_conv_kernel_dim,
+                    // Effective model config — each demonstrably changes hidden
+                    // states / downstream K/V without changing coarse geometry
+                    // (#1277 review finding F3): normalization epsilon, activation,
+                    // embedding/attention scaling, MoE routing, and local-RoPE /
+                    // sliding-window. Taken verbatim from the resolved ModelConfig
+                    // that constructs the model.
+                    rms_norm_eps_bits: config.rms_norm_eps.to_bits(),
+                    layer_norm_eps_bits: config.layer_norm_eps.map(f32::to_bits),
+                    hidden_activation: config.hidden_activation.clone(),
+                    scale_embeddings: config.scale_embeddings,
+                    query_pre_attn_scalar_bits: config.query_pre_attn_scalar.map(f32::to_bits),
+                    moe: MoeRouting {
+                        is_moe: config.is_moe,
+                        num_experts: config.num_experts,
+                        num_experts_per_tok: config.num_experts_per_tok,
+                        moe_intermediate_size: config.moe_intermediate_size,
+                        shared_expert_intermediate_size: config.shared_expert_intermediate_size,
+                    },
+                    sliding_window: config.sliding_window,
+                    rope_local_base_freq_bits: config.rope_local_base_freq.map(f32::to_bits),
+                    rope_theta_bits: config.rope_theta.to_bits(),
+                    rope_scaling: config
+                        .rope_scaling
+                        .as_ref()
+                        .map(|rs| RopeScalingFp::new(&rs.rope_type, rs.factor)),
+                    max_position_embeddings: config.max_position_embeddings,
+                    dtype: KvDtype::from_name(&config.dtype),
+                    kv_quant,
+                    block_size: crate::runtime::kv_cache::BLOCK_SIZE,
+                    max_context: effective_max_context,
+                    vocab_size: config.vocab_size,
+                    // Folded in by `load_tokenizer`; descriptor is non-authoritative
+                    // (fingerprint = None) until then, so reuse fails closed.
+                    tokenizer_hash: None,
+                };
+                *self.kv_compat.lock() = Some(descriptor);
+            }
+            Err(e) => {
+                warn!(
+                    "Cannot compute authoritative base-weight digest for {}: {} \
+                     — KV-cache reuse disabled (fail-closed)",
+                    model_path.display(),
+                    e
+                );
+                // Leave kv_compat unset (None): the reuse boundary will discard
+                // rather than adopt any cache, since there is no authoritative
+                // identity to compare against.
+                *self.kv_compat.lock() = None;
+            }
         }
 
         // Use the factory to create the model. When `device_pool` is set and
@@ -926,6 +1154,40 @@ impl TorchEngine {
             self.tokenizer_vocab_size.store(final_vocab_size, Ordering::Relaxed);
 
             info!("Final tokenizer vocabulary size: {}", final_vocab_size);
+
+            // Fold the tokenizer identity into the KV-compat descriptor (#1277).
+            // Cached token ids are only meaningful relative to one tokenizer, so
+            // a different tokenizer (even with the same vocab size) must reject.
+            // The on-disk `tokenizer.json` bytes are the authoritative identity;
+            // deterministic model-driven mutation (e.g. Qwen vocab padding) is
+            // already captured by `vocab_size`. FAIL-CLOSED: if the bytes cannot
+            // be hashed, the tokenizer identity is left unset, the descriptor is
+            // non-authoritative (fingerprint = None), and the cache boundary
+            // discards rather than adopts any cache — we never silently degrade
+            // to a weaker vocab-only identity.
+            {
+                let mut guard = self.kv_compat.lock();
+                let tokenizer_hash = match std::fs::read(&tokenizer_path) {
+                    Ok(bytes) => {
+                        use sha2::{Digest, Sha256};
+                        let mut hasher = Sha256::new();
+                        hasher.update(&bytes);
+                        Some(hex::encode(hasher.finalize()))
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            "Could not read {} for KV-compat tokenizer identity ({}): \
+                             KV-cache reuse disabled (fail-closed)",
+                            tokenizer_path.display(),
+                            e
+                        );
+                        None
+                    }
+                };
+                if let Some(desc) = guard.as_mut() {
+                    desc.set_tokenizer(final_vocab_size, tokenizer_hash);
+                }
+            }
 
             // Thread safe assignment
             let mut tokenizer_guard = self.tokenizer.lock();
@@ -1717,6 +1979,10 @@ impl TorchEngine {
     /// during generation. The delta is locked per-token (not held across the entire
     /// generation) to allow concurrent training updates.
     ///
+    /// `adapter_generation` is the live LoRA/delta generation actually applied to
+    /// this request; it is folded into the KV-compat expected identity so a
+    /// re-adapted model is detected as incompatible and its stale KV rejected.
+    ///
     /// `tenant_id` is the effective tenant whose delta contributed to the weights
     /// (`Some` only when a per-tenant delta is in play, `None` otherwise), and
     /// `weight_epoch` is that delta's current weight epoch. The pair is threaded
@@ -1731,6 +1997,7 @@ impl TorchEngine {
         delta: Option<std::sync::Arc<parking_lot::Mutex<crate::training::TenantDelta>>>,
         tenant_id: Option<String>,
         weight_epoch: u64,
+        adapter_generation: u64,
     ) -> Result<TextStream<'_>> {
         if let Some(seed) = request.seed {
             self.set_seed(seed as u64);
@@ -1740,7 +2007,14 @@ impl TorchEngine {
             request.timeout_ms = Some(self.config.default_generation_timeout_ms);
         }
 
-        TextStream::new_with_delta(self, request, delta, tenant_id, weight_epoch)
+        TextStream::new_with_delta(
+            self,
+            request,
+            delta,
+            tenant_id,
+            weight_epoch,
+            adapter_generation,
+        )
     }
 
     /// Non-streaming generation with optional delta (convenience wrapper)
@@ -1750,6 +2024,7 @@ impl TorchEngine {
         delta: Option<std::sync::Arc<parking_lot::Mutex<crate::training::TenantDelta>>>,
         tenant_id: Option<String>,
         weight_epoch: u64,
+        adapter_generation: u64,
     ) -> Result<crate::config::GenerationResult> {
         use futures::StreamExt;
 
@@ -1759,7 +2034,8 @@ impl TorchEngine {
             ));
         }
 
-        let mut stream = self.generate_with_delta(request, delta, tenant_id, weight_epoch)?;
+        let mut stream =
+            self.generate_with_delta(request, delta, tenant_id, weight_epoch, adapter_generation)?;
         let mut accumulated_text = String::new();
 
         while let Some(text_chunk) = stream.next().await {
@@ -2400,6 +2676,348 @@ mod tests {
         );
     }
 
+    // ---- base-weight content digest (#1277, finding F1) ----
+    //
+    // The pure framing/digest helpers live in `kv_compat`; these cover the engine
+    // seam: loader-selected shard-set resolution (extra/unreferenced `.safetensors`
+    // files are never hashed), fail-closed selection, resolved-byte hashing
+    // (incl. LFS/XET pointer handling), determinism, and parity with the pure
+    // helpers.
+
+    use crate::runtime::kv_compat;
+
+    /// Write `bytes` to `dir/shard_name`.
+    fn write_shard(dir: &std::path::Path, shard_name: &str, bytes: &[u8]) -> std::path::PathBuf {
+        use std::io::Write;
+        let p = dir.join(shard_name);
+        let mut f = std::fs::File::create(&p).unwrap();
+        f.write_all(bytes).unwrap();
+        p
+    }
+
+    /// Write a minimal `model.safetensors.index.json` whose `weight_map`
+    /// references exactly `shard_names`.
+    fn write_index(dir: &std::path::Path, shard_names: &[&str]) {
+        let weight_map: serde_json::Map<String, serde_json::Value> = shard_names
+            .iter()
+            .enumerate()
+            .map(|(i, name)| {
+                (format!("tensor.{i}"), serde_json::Value::String((*name).to_owned()))
+            })
+            .collect();
+        let index = serde_json::json!({ "weight_map": weight_map });
+        std::fs::write(
+            dir.join("model.safetensors.index.json"),
+            serde_json::to_string_pretty(&index).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn weights_content_digest_is_deterministic_and_matches_pure() {
+        let dir = tempfile::tempdir().unwrap();
+        write_shard(dir.path(), "model-00001-of-00002.safetensors", b"AAAA-content");
+        write_shard(dir.path(), "model-00002-of-00002.safetensors", b"BBBB-content");
+        write_index(dir.path(), &[
+            "model-00001-of-00002.safetensors",
+            "model-00002-of-00002.safetensors",
+        ]);
+        let a = TorchEngine::weights_content_digest(dir.path()).await.unwrap();
+        let b = TorchEngine::weights_content_digest(dir.path()).await.unwrap();
+        assert_eq!(a, b, "digest must be deterministic across runs");
+        // Parity with the pure framing helper (engine resolves+hashes, pure fn frames).
+        let expected = kv_compat::base_weight_digest_from_shards(&[
+            ("model-00001-of-00002.safetensors".into(), kv_compat::shard_content_digest(b"AAAA-content")),
+            ("model-00002-of-00002.safetensors".into(), kv_compat::shard_content_digest(b"BBBB-content")),
+        ]);
+        assert_eq!(a, expected, "engine digest must equal the pure framing over resolved bytes");
+    }
+
+    #[tokio::test]
+    async fn weights_content_digest_same_basename_different_bytes_diverge() {
+        let d1 = tempfile::tempdir().unwrap();
+        let d2 = tempfile::tempdir().unwrap();
+        write_shard(d1.path(), "model-00001-of-00002.safetensors", b"content-A");
+        write_shard(d1.path(), "model-00002-of-00002.safetensors", b"content-B");
+        write_index(d1.path(), &[
+            "model-00001-of-00002.safetensors",
+            "model-00002-of-00002.safetensors",
+        ]);
+        write_shard(d2.path(), "model-00001-of-00002.safetensors", b"content-A!");
+        write_shard(d2.path(), "model-00002-of-00002.safetensors", b"content-B");
+        write_index(d2.path(), &[
+            "model-00001-of-00002.safetensors",
+            "model-00002-of-00002.safetensors",
+        ]);
+        let a = TorchEngine::weights_content_digest(d1.path()).await.unwrap();
+        let b = TorchEngine::weights_content_digest(d2.path()).await.unwrap();
+        assert_ne!(a, b, "same basenames, different content must diverge");
+    }
+
+    /// Two shard sets equal as a (name → content) map but enumerated in
+    /// different creation order must produce the same digest (sorted determinism).
+    #[tokio::test]
+    async fn weights_content_digest_is_order_independent() {
+        let d1 = tempfile::tempdir().unwrap();
+        let d2 = tempfile::tempdir().unwrap();
+        write_shard(d1.path(), "model-00001-of-00002.safetensors", b"X");
+        write_shard(d1.path(), "model-00002-of-00002.safetensors", b"Y");
+        write_index(d1.path(), &[
+            "model-00001-of-00002.safetensors",
+            "model-00002-of-00002.safetensors",
+        ]);
+        // Reverse creation order in d2.
+        write_shard(d2.path(), "model-00002-of-00002.safetensors", b"Y");
+        write_shard(d2.path(), "model-00001-of-00002.safetensors", b"X");
+        write_index(d2.path(), &[
+            "model-00001-of-00002.safetensors",
+            "model-00002-of-00002.safetensors",
+        ]);
+        let a = TorchEngine::weights_content_digest(d1.path()).await.unwrap();
+        let b = TorchEngine::weights_content_digest(d2.path()).await.unwrap();
+        assert_eq!(a, b, "digest must be independent of enumeration order");
+    }
+
+    #[tokio::test]
+    async fn weights_content_digest_empty_dir_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(
+            TorchEngine::weights_content_digest(dir.path()).await.is_err(),
+            "an empty model dir must fail closed, not mint a partial digest"
+        );
+    }
+
+    #[tokio::test]
+    async fn weights_content_digest_no_safetensors_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        write_shard(dir.path(), "config.json", b"{}");
+        write_shard(dir.path(), "tokenizer.json", b"{}");
+        assert!(
+            TorchEngine::weights_content_digest(dir.path()).await.is_err(),
+            "a dir with no .safetensors shards must fail closed"
+        );
+    }
+
+    /// A small (<1 KiB) ordinary shard that is NOT an LFS pointer must be hashed
+    /// as content (not skipped, not treated as a pointer).
+    #[tokio::test]
+    async fn weights_content_digest_small_plain_shard_hashed_as_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let bytes = b"tiny-but-real-weights";
+        write_shard(dir.path(), "model.safetensors", bytes);
+        let digest = TorchEngine::weights_content_digest(dir.path()).await.unwrap();
+        let expected = kv_compat::base_weight_digest_from_shards(&[(
+            "model.safetensors".into(),
+            kv_compat::shard_content_digest(bytes),
+        )]);
+        assert_eq!(
+            digest, expected,
+            "a small non-pointer shard must hash its content bytes"
+        );
+    }
+
+    /// An un-smudged LFS/XET pointer shard must fail closed (never be hashed as a
+    /// pointer stub). With no resolvable object store in the test environment,
+    /// resolution errors out → the digest declines.
+    #[tokio::test]
+    async fn weights_content_digest_pointer_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        // A canonical LFS pointer header (<1 KiB). It is not resolvable here.
+        let pointer = b"version https://git-lfs.github.com/spec/v1\noid sha256:0000000000000000000000000000000000000000000000000000000000000000\nsize 1234\n";
+        write_shard(dir.path(), "model.safetensors", pointer);
+        assert!(
+            TorchEngine::weights_content_digest(dir.path()).await.is_err(),
+            "an un-smudged LFS pointer must fail closed, not be hashed as a stub"
+        );
+    }
+
+    /// An unreadable shard must fail closed (read error propagates), not produce
+    /// a digest over the readable remainder. Skipped when running as root (root
+    /// bypasses the 0o000 permission).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn weights_content_digest_unreadable_shard_fails_closed() {
+        // Root bypasses the 0o000 permission, so the read would succeed and the
+        // fail-closed assertion could not hold — skip silently under root.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let p = write_shard(dir.path(), "model.safetensors", b"real-content");
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let res = TorchEngine::weights_content_digest(dir.path()).await;
+        // Restore so tempdir cleanup can remove it.
+        let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o644));
+        assert!(
+            res.is_err(),
+            "an unreadable shard must fail closed, not hash a partial set"
+        );
+    }
+
+    /// An extra/unreferenced `.safetensors` in the directory must NOT shift the
+    /// digest: only the index-referenced (loader-selected) shards are hashed.
+    #[tokio::test]
+    async fn weights_content_digest_ignores_unreferenced_extra_shard() {
+        let dir = tempfile::tempdir().unwrap();
+        write_shard(dir.path(), "model-00001-of-00002.safetensors", b"AAAA-content");
+        write_shard(dir.path(), "model-00002-of-00002.safetensors", b"BBBB-content");
+        write_index(dir.path(), &[
+            "model-00001-of-00002.safetensors",
+            "model-00002-of-00002.safetensors",
+        ]);
+        let selected_only = TorchEngine::weights_content_digest(dir.path()).await.unwrap();
+
+        // A stale shard with a shard-like name the loader never references.
+        write_shard(dir.path(), "model-00003-of-00002.safetensors", b"STALE-alt-precision");
+        let with_extra = TorchEngine::weights_content_digest(dir.path()).await.unwrap();
+
+        assert_eq!(
+            selected_only, with_extra,
+            "an unreferenced extra shard must be invariant to the digest"
+        );
+        let expected = kv_compat::base_weight_digest_from_shards(&[
+            ("model-00001-of-00002.safetensors".into(), kv_compat::shard_content_digest(b"AAAA-content")),
+            ("model-00002-of-00002.safetensors".into(), kv_compat::shard_content_digest(b"BBBB-content")),
+        ]);
+        assert_eq!(
+            with_extra, expected,
+            "digest must cover exactly the loader-selected set, no more"
+        );
+    }
+
+    /// With a single `model.safetensors`, an extra shard-like file is not part
+    /// of the loader's selection and must not shift the digest.
+    #[tokio::test]
+    async fn weights_content_digest_single_file_ignores_extra_shard() {
+        let dir = tempfile::tempdir().unwrap();
+        write_shard(dir.path(), "model.safetensors", b"single-file-weights");
+        let baseline = TorchEngine::weights_content_digest(dir.path()).await.unwrap();
+        let expected = kv_compat::base_weight_digest_from_shards(&[(
+            "model.safetensors".into(),
+            kv_compat::shard_content_digest(b"single-file-weights"),
+        )]);
+        assert_eq!(baseline, expected);
+
+        // Even a name matching the shard glob is not selected when
+        // `model.safetensors` is the loader's pick.
+        write_shard(dir.path(), "model-00001-of-00001.safetensors", b"UNREFERENCED");
+        let with_extra = TorchEngine::weights_content_digest(dir.path()).await.unwrap();
+        assert_eq!(
+            baseline, with_extra,
+            "an extra shard next to model.safetensors must be invariant"
+        );
+    }
+
+    /// Changing a SELECTED shard changes the digest; adding, removing, or
+    /// mutating an UNREFERENCED shard does not.
+    #[tokio::test]
+    async fn weights_content_digest_selected_mutations_diverge_unreferenced_do_not() {
+        let dir = tempfile::tempdir().unwrap();
+        write_shard(dir.path(), "model-00001-of-00002.safetensors", b"AAAA-content");
+        write_shard(dir.path(), "model-00002-of-00002.safetensors", b"BBBB-content");
+        write_index(dir.path(), &[
+            "model-00001-of-00002.safetensors",
+            "model-00002-of-00002.safetensors",
+        ]);
+        let baseline = TorchEngine::weights_content_digest(dir.path()).await.unwrap();
+
+        // Add an unreferenced shard.
+        let extra = write_shard(dir.path(), "stale-backup.safetensors", b"stale");
+        assert_eq!(
+            TorchEngine::weights_content_digest(dir.path()).await.unwrap(),
+            baseline,
+            "adding an unreferenced shard must not change the digest"
+        );
+        // Mutate the unreferenced shard.
+        write_shard(dir.path(), "stale-backup.safetensors", b"stale-CHANGED");
+        assert_eq!(
+            TorchEngine::weights_content_digest(dir.path()).await.unwrap(),
+            baseline,
+            "mutating an unreferenced shard must not change the digest"
+        );
+        // Remove the unreferenced shard.
+        std::fs::remove_file(&extra).unwrap();
+        assert_eq!(
+            TorchEngine::weights_content_digest(dir.path()).await.unwrap(),
+            baseline,
+            "removing an unreferenced shard must not change the digest"
+        );
+        // Change a SELECTED shard.
+        write_shard(dir.path(), "model-00002-of-00002.safetensors", b"BBBB-CHANGED");
+        assert_ne!(
+            TorchEngine::weights_content_digest(dir.path()).await.unwrap(),
+            baseline,
+            "changing a selected shard must change the digest"
+        );
+    }
+
+    /// A directory whose only `.safetensors` files match no loader selection
+    /// pattern has ZERO selected shards and must fail closed (reuse declined).
+    #[tokio::test]
+    async fn weights_content_digest_zero_selected_shards_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        write_shard(dir.path(), "backup.safetensors", b"not-a-selected-shard");
+        write_shard(dir.path(), "optimizer.safetensors", b"also-not-selected");
+        assert!(
+            TorchEngine::weights_content_digest(dir.path()).await.is_err(),
+            "a dir with no loader-selected shards must fail closed"
+        );
+    }
+
+    /// An index referencing a shard that does not exist on disk is an
+    /// inconsistent selection and must fail closed (reuse declined).
+    #[tokio::test]
+    async fn weights_content_digest_missing_index_shard_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        write_shard(dir.path(), "model-00001-of-00002.safetensors", b"AAAA-content");
+        write_index(dir.path(), &[
+            "model-00001-of-00002.safetensors",
+            "model-00002-of-00002.safetensors", // referenced but absent
+        ]);
+        assert!(
+            TorchEngine::weights_content_digest(dir.path()).await.is_err(),
+            "an index referencing a missing shard must fail closed"
+        );
+    }
+
+    /// A manifest-less MULTI-shard glob selection is ambiguous (the glob can
+    /// silently drop/duplicate shards), so the digest must fail closed —
+    /// decline reuse — even though the LOADER only warns in its permissive
+    /// default mode. Fingerprint authority is stricter than loader
+    /// permissiveness (#1277 revise-4): this holds regardless of
+    /// `HYPRSTREAM_STRICT_LOADER` (the test env does not set it, exercising
+    /// the permissive loader path).
+    #[tokio::test]
+    async fn weights_content_digest_manifestless_multi_shard_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        write_shard(dir.path(), "model-00001-of-00002.safetensors", b"AAAA-content");
+        write_shard(dir.path(), "model-00002-of-00002.safetensors", b"BBBB-content");
+        // NO model.safetensors.index.json — the loader warns and continues;
+        // the digest must refuse.
+        assert!(
+            TorchEngine::weights_content_digest(dir.path()).await.is_err(),
+            "an ambiguous manifest-less multi-shard glob set must fail closed"
+        );
+    }
+
+    /// A SINGLE globbed shard (no index, no model.safetensors) is unambiguous
+    /// and must still digest — only multi-shard glob sets are ambiguous.
+    #[tokio::test]
+    async fn weights_content_digest_single_globbed_shard_passes() {
+        let dir = tempfile::tempdir().unwrap();
+        write_shard(dir.path(), "model-00001-of-00001.safetensors", b"single-shard-content");
+        let digest = TorchEngine::weights_content_digest(dir.path()).await.unwrap();
+        let expected = kv_compat::base_weight_digest_from_shards(&[(
+            "model-00001-of-00001.safetensors".into(),
+            kv_compat::shard_content_digest(b"single-shard-content"),
+        )]);
+        assert_eq!(
+            digest, expected,
+            "a single globbed shard is unambiguous and must digest"
+        );
+    }
+
     #[test]
     fn test_generation_config_in_engine_has_correct_max_tokens() {
         // Create a minimal runtime config
@@ -2688,7 +3306,9 @@ pub struct TextStream<'a> {
 
 impl<'a> TextStream<'a> {
     fn new(engine: &'a TorchEngine, request: GenerationRequest) -> Result<Self> {
-        Self::new_with_delta(engine, request, None, None, 0)
+        // No delta path: no tenant dependency and adapter generation 0 (base
+        // weights only).
+        Self::new_with_delta(engine, request, None, None, 0, 0)
     }
 
     fn new_with_delta(
@@ -2697,6 +3317,7 @@ impl<'a> TextStream<'a> {
         delta: Option<std::sync::Arc<parking_lot::Mutex<crate::training::TenantDelta>>>,
         tenant_id: Option<String>,
         weight_epoch: u64,
+        adapter_generation: u64,
     ) -> Result<Self> {
         let prompt_tokens = engine.tokenize(&request.prompt)?;
         let prompt_len = prompt_tokens.len();
@@ -2747,7 +3368,20 @@ impl<'a> TextStream<'a> {
             let prefix_len = if let Some(model_arc) = &engine.persistent_model {
                 let model = model_arc.lock();
                 if let Some(cache) = model.get_kv_cache() {
-                    let cache_guard = cache.lock();
+                    let mut cache_guard = cache.lock();
+
+                    // KV-cache compatibility guard (#1277): KV produced under an
+                    // incompatible (or unproven) model/runtime config is never
+                    // reused. The policy is **fail-closed** via
+                    // `decide_cache_reuse`: a stamp mismatch, an unstamped but
+                    // *populated* cache, or the absence of an authoritative
+                    // expected identity all discard the KV and recompute. Only a
+                    // genuinely fresh (empty) cache under an authoritative
+                    // identity is stamped for reuse. This is the pull-based
+                    // complement to the registry's push-based delta invalidation.
+                    let expected = engine.kv_compat_fingerprint_for(adapter_generation);
+                    cache_guard.apply_reuse_policy(expected);
+
                     let matched = cache_guard.prefix_match_len(&prompt_tokens);
                     if matched > 0 {
                         tracing::info!(

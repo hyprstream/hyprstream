@@ -23,7 +23,7 @@ use serde_json::Value;
 
 use crate::at9p_alias::At9pAliasResolver;
 use crate::at9p_resolver::CapsuleSource;
-use crate::service::HybridDeploymentCa;
+use crate::service::{DeploymentAuthorityLog, HybridDeploymentCa};
 
 const MAX_CAPSULE_BYTES: usize = 4 * 1024 * 1024;
 const DEPLOYMENT_REACH_SERVICE: &str = "#ns";
@@ -107,6 +107,10 @@ pub(crate) struct DidAnchoredTrust {
     /// profile, enforced by `validate_registry_deployment_credential_profile`),
     /// so the byte channel needs no trust of its own.
     pub registry_credential: String,
+    /// Current root-anchored authority log fetched beside the credential.
+    /// Its verified head must match the independently provisioned local
+    /// checkpoint before the credential is accepted.
+    pub authority_log: DeploymentAuthorityLog,
     /// The document's `#mesh-kem` hybrid-KEM recipient public, when published.
     /// Required by the REMOTE-node bootstrap arm (QUIC forbids cleartext
     /// envelopes); the same-node arm never encrypts over the local fabric.
@@ -187,6 +191,44 @@ impl HttpWellKnownCapsuleSource {
             bytes.extend_from_slice(&chunk);
         }
         String::from_utf8(bytes).context("registry deployment credential is not UTF-8")
+    }
+
+    /// Fetch the current root-anchored authority log from beside the registry
+    /// credential. HTTPS transports untrusted bytes; the capsule-derived root
+    /// and independent local head checkpoint authenticate them later.
+    async fn fetch_authority_log(&self) -> Result<DeploymentAuthorityLog> {
+        let prefix = self
+            .document_url
+            .strip_suffix("did.json")
+            .ok_or_else(|| anyhow::anyhow!("derived did:web URL does not end in did.json"))?;
+        let url = format!("{prefix}deployment/deployment-authority.log.json");
+        let mut response = self
+            .http
+            .get(&url)
+            .send()
+            .await
+            .with_context(|| format!("failed to fetch deployment authority log from {url}"))?
+            .error_for_status()
+            .with_context(|| format!("deployment authority-log endpoint rejected {url}"))?;
+        if let Some(length) = response.content_length() {
+            anyhow::ensure!(
+                length <= MAX_CREDENTIAL_BYTES as u64,
+                "deployment authority log exceeds {MAX_CREDENTIAL_BYTES}-byte limit"
+            );
+        }
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .context("failed to read deployment authority-log body")?
+        {
+            anyhow::ensure!(
+                bytes.len().saturating_add(chunk.len()) <= MAX_CREDENTIAL_BYTES,
+                "deployment authority log exceeds {MAX_CREDENTIAL_BYTES}-byte limit"
+            );
+            bytes.extend_from_slice(&chunk);
+        }
+        serde_json::from_slice(&bytes).context("deployment authority log is malformed")
     }
 
     fn capsule_url(&self, did: &str) -> Result<String> {
@@ -276,7 +318,11 @@ fn reach_from_capsule(verified: &VerifiedCapsule, document: &Value) -> Result<Tr
         })
         .ok_or_else(|| {
             anyhow::anyhow!(
-                "capsule has no NinePExport service entry {DEPLOYMENT_REACH_SERVICE:?} for deployment reach"
+"capsule has no NinePExport service entry {DEPLOYMENT_REACH_SERVICE:?} for deployment reach; \
+                 the pinned did:at9p must be an ANCHOR capsule signed by the deployment CA, not a node's \
+                 own identity capsule (e.g. the `#pds` capsule a node's OAuth service renders for \
+                 itself) — mint one with `hyprstream trust mint-anchor-capsule` and publish it \
+                 (with its did.json) under the deployment well-known directory"
             )
         })?;
     match entry.endpoint.transport {
@@ -310,16 +356,42 @@ fn reach_from_capsule(verified: &VerifiedCapsule, document: &Value) -> Result<Tr
             // WebPKI policy, and certificate hashes) for that exact
             // capsule-bound socket. Those mechanics cannot select application
             // identity: the signed ping is still pinned independently.
+            //
+            // A hostname-based document URI (`https://host:port`) decodes to
+            // an unspecified address with only the port populated, so the match
+            // accepts either an exact address equality or a port-only match
+            // when the document entry carries an unspecified IP.
             let document_transport = hyprstream_rpc::did_web::transport_entries(document)
                 .into_iter()
                 .map(|decoded| decoded.config)
                 .find(|config| {
                     matches!(
                         &config.endpoint,
-                        EndpointType::Quic { addr, .. } if *addr == address
+                        EndpointType::Quic { addr, .. }
+                            if *addr == address
+                                || (addr.ip().is_unspecified() && addr.port() == address.port())
                     )
+                })
+                .map(|mut config| {
+                    // A hostname-based document URI decodes to an unspecified
+                    // IP with only the port populated. The capsule carries the
+                    // real dial address, so substitute it: without this rewrite
+                    // the config would dial 0.0.0.0:port and never connect,
+                    // turning a verified capsule into an unusable one.
+                    if let EndpointType::Quic { addr, .. } = &mut config.endpoint {
+                        if addr.ip().is_unspecified() {
+                            *addr = address;
+                        }
+                    }
+                    config
                 });
             Ok(document_transport.unwrap_or_else(|| {
+                tracing::warn!(
+                    "capsule QUIC reach {} has no matching QuicTransport entry in the did:web \
+                     document; falling back to bare-IP dial without SNI or certificate pins — \
+                     the deployment will not be reachable via hostname or WebPKI-validated TLS",
+                    address
+                );
                 TransportConfig::quic(address, address.ip().to_string()).with_connect_mode()
             }))
         }
@@ -329,12 +401,53 @@ fn reach_from_capsule(verified: &VerifiedCapsule, document: &Value) -> Result<Tr
     }
 }
 
-pub(crate) async fn verify_did_anchored_document(
+/// Deployment material an anchor capsule contributes, once the capsule and the
+/// `did:web` document have mutually attested to each other.
+///
+/// This is the verification-only half of the DID-anchored bootstrap — the part
+/// a minting ceremony can self-check offline, before publication and before any
+/// registry credential or authority log exists.
+#[derive(Clone, Debug)]
+pub struct VerifiedAnchorMaterial {
+    /// The GATE-verified `did:at9p` the document reciprocally names.
+    pub at9p_did: String,
+    /// Raw hybrid deployment root taken from the capsule's primary subject
+    /// key: the 32-byte Ed25519 key followed by the 1952-byte ML-DSA-65 key,
+    /// the same layout the OS-owned `deployment-ca.hybrid` pin uses.
+    pub deployment_ca_public: Vec<u8>,
+    /// Deployment reach decoded from the capsule's `#ns` NinePExport entry.
+    pub discovery_transport: TransportConfig,
+}
+
+/// Verify an anchor capsule against its `did:web` document through the
+/// production resolution path, without needing the registry credential or
+/// authority log the live bootstrap also fetches.
+///
+/// Minting ceremonies call this on their own output: material this rejects is
+/// material a node would refuse at boot.
+pub async fn verify_anchor_material(
     anchors: &DidAnchors,
     document: &Value,
     capsule_source: Arc<dyn CapsuleSource>,
-    registry_credential: String,
-) -> Result<DidAnchoredTrust> {
+) -> Result<VerifiedAnchorMaterial> {
+    let (identity, ca, discovery_transport) =
+        resolve_anchor_pair(anchors, document, capsule_source).await?;
+    let mut deployment_ca_public = ca.ed25519_bytes().to_vec();
+    deployment_ca_public.extend_from_slice(&ca.ml_dsa_65_bytes());
+    Ok(VerifiedAnchorMaterial {
+        at9p_did: identity.at9p_did.as_str().to_owned(),
+        deployment_ca_public,
+        discovery_transport,
+    })
+}
+
+/// Shared core of the DID-anchored trust decision: reciprocal naming, the
+/// capsule GATE, and the CA + reach the GATE-verified capsule carries.
+async fn resolve_anchor_pair(
+    anchors: &DidAnchors,
+    document: &Value,
+    capsule_source: Arc<dyn CapsuleSource>,
+) -> Result<(AuthoritativeIdentity, HybridDeploymentCa, TransportConfig)> {
     anyhow::ensure!(
         document.get("id").and_then(Value::as_str) == Some(anchors.cluster_did_web.as_str()),
         "did:web document id does not match configured cluster_did_web"
@@ -366,12 +479,28 @@ pub(crate) async fn verify_did_anchored_document(
         ),
         "capsule deployment reach is not a network transport"
     );
+    Ok((
+        authoritative_identity,
+        ca_verifying_key,
+        discovery_transport,
+    ))
+}
 
+pub(crate) async fn verify_did_anchored_document(
+    anchors: &DidAnchors,
+    document: &Value,
+    capsule_source: Arc<dyn CapsuleSource>,
+    registry_credential: String,
+    authority_log: DeploymentAuthorityLog,
+) -> Result<DidAnchoredTrust> {
+    let (authoritative_identity, ca_verifying_key, discovery_transport) =
+        resolve_anchor_pair(anchors, document, capsule_source).await?;
     Ok(DidAnchoredTrust {
         ca_verifying_key,
         discovery_transport,
         authoritative_identity,
         registry_credential,
+        authority_log,
         mesh_kem_recipient: hyprstream_rpc::did_web::mesh_kem_recipient(document),
         ml_dsa_65_keys: hyprstream_rpc::did_web::verification_method_ml_dsa_65_keys(document),
     })
@@ -397,9 +526,18 @@ pub(crate) async fn resolve_did_anchored_trust(anchors: &DidAnchors) -> Result<D
         .fetch_registry_credential()
         .await
         .context("failed to fetch registry deployment credential")?;
-    let trust =
-        verify_did_anchored_document(anchors, &document, capsule_source, registry_credential)
-            .await?;
+    let authority_log = capsule_source
+        .fetch_authority_log()
+        .await
+        .context("failed to fetch deployment authority log")?;
+    let trust = verify_did_anchored_document(
+        anchors,
+        &document,
+        capsule_source,
+        registry_credential,
+        authority_log,
+    )
+    .await?;
     tracing::info!(
         at9p = %trust.authoritative_identity.at9p_did,
         did_web = %trust.authoritative_identity.classical_did,
@@ -412,7 +550,11 @@ pub(crate) async fn resolve_did_anchored_trust(anchors: &DidAnchors) -> Result<D
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-    use ed25519_dalek::SigningKey;
+    use base64::{
+        engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
+        Engine as _,
+    };
+    use ed25519_dalek::{Signer as _, SigningKey};
     use hyprstream_crypto::pq::{ml_dsa_generate_keypair, ml_dsa_vk_bytes, MlDsaSigningKey};
     use hyprstream_pds::at9p::{
         CapsuleBody, HybridKeyPair, ServiceEndpoint, ServiceEntry, ServiceType, Transport,
@@ -420,7 +562,18 @@ mod tests {
     };
     use hyprstream_pds::at9p_sign::sign_capsule;
     use hyprstream_pds::dag_cbor::DagCbor;
+    use hyprstream_rpc::{
+        auth::ucan::{
+            Ability, Capability, CaveatValue, Caveats, Did as UcanDid, Resource, Ucan, UcanPayload,
+        },
+        crypto::{
+            cose_sign::{assemble_composite_nested, inner_tbs, outer_tbs, split_composite},
+            pq::{ml_dsa_sign, ml_dsa_sk_to_vk_bytes},
+        },
+    };
     use serde_json::json;
+    use std::collections::BTreeMap;
+    use std::net::SocketAddr;
 
     struct FixedCapsuleSource(Vec<u8>);
 
@@ -459,6 +612,200 @@ mod tests {
         SigningKey::from_bytes(&[tag; 32])
             .verifying_key()
             .to_bytes()
+    }
+
+    fn unused_authority_log() -> DeploymentAuthorityLog {
+        DeploymentAuthorityLog {
+            schema: "unused-test-schema".to_owned(),
+            deployment_domain: "unused-test-domain".to_owned(),
+            did: "did:plc:unusedtestauthoritylog".to_owned(),
+            operations_b64: vec![],
+        }
+    }
+
+    fn sign_nested_for_test(
+        payload: &[u8],
+        aad: &[u8],
+        ed: &SigningKey,
+        pq: &MlDsaSigningKey,
+    ) -> Vec<u8> {
+        let ed_signature = ed.sign(&inner_tbs(
+            ed.verifying_key().to_bytes().to_vec(),
+            payload,
+            aad,
+            true,
+        ));
+        let pq_public =
+            hyprstream_rpc::crypto::pq::ml_dsa_vk_from_bytes(&ml_dsa_sk_to_vk_bytes(pq)).unwrap();
+        let pq_signature = ml_dsa_sign(
+            pq,
+            &outer_tbs(
+                ml_dsa_vk_bytes(&pq_public),
+                payload,
+                &ed_signature.to_bytes(),
+                aad,
+            ),
+        );
+        assemble_composite_nested(
+            (
+                ed.verifying_key().to_bytes().to_vec(),
+                ed_signature.to_bytes().to_vec(),
+            ),
+            Some((ml_dsa_vk_bytes(&pq_public), pq_signature)),
+        )
+        .unwrap()
+    }
+
+    fn authority_log_and_checkpoint(
+        root: &CapsuleSigner,
+        deployment_domain: &str,
+    ) -> (
+        DeploymentAuthorityLog,
+        crate::service::DeploymentAuthorityCheckpoint,
+    ) {
+        let mut genesis = crate::did_op::DidOp {
+            sequence: 0,
+            prev: None,
+            rotation_keys: vec![crate::did_op::HybridRotationKey::new(
+                root.ed.verifying_key().to_bytes(),
+                ml_dsa_sk_to_vk_bytes(&root.pq),
+            )
+            .unwrap()],
+            signature: crate::did_op::HybridDidOpSignature {
+                ed25519: vec![0; 64],
+                mldsa65: vec![0; 3_309],
+            },
+        };
+        let composite = sign_nested_for_test(
+            &genesis.signable_bytes(),
+            crate::did_op::DID_OP_SIGNATURE_CONTEXT,
+            &root.ed,
+            &root.pq,
+        );
+        let (ed25519, mldsa65) = split_composite(&composite).unwrap();
+        genesis.signature = crate::did_op::HybridDidOpSignature {
+            ed25519,
+            mldsa65: mldsa65.unwrap(),
+        };
+        let did = genesis.genesis_did().unwrap();
+        let verified = crate::did_op::verify_did_op_log(&did, &[genesis.clone()]).unwrap();
+        (
+            DeploymentAuthorityLog {
+                schema: "hyprstream.deployment-authority-log.v1".to_owned(),
+                deployment_domain: deployment_domain.to_owned(),
+                did: did.clone(),
+                operations_b64: vec![STANDARD.encode(genesis.to_dag_cbor())],
+            },
+            crate::service::DeploymentAuthorityCheckpoint {
+                schema: "hyprstream.deployment-authority-checkpoint.v1".to_owned(),
+                deployment_domain: deployment_domain.to_owned(),
+                did,
+                sequence: verified.sequence,
+                head_cid: verified.head_cid,
+            },
+        )
+    }
+
+    fn delegated_registry_credential(
+        root: &CapsuleSigner,
+        authority_log: &DeploymentAuthorityLog,
+        deployment_domain: &str,
+        registry: &SigningKey,
+    ) -> String {
+        let delegated_ed = SigningKey::from_bytes(&[0xA2; 32]);
+        let (delegated_pq, _) = ml_dsa_generate_keypair();
+        let mut delegated_public = delegated_ed.verifying_key().to_bytes().to_vec();
+        delegated_public.extend_from_slice(&ml_dsa_sk_to_vk_bytes(&delegated_pq));
+        let now = u64::try_from(chrono::Utc::now().timestamp()).unwrap();
+        let mut caveats = BTreeMap::new();
+        caveats.insert(
+            "audience".to_owned(),
+            CaveatValue::Text("urn:hyprstream:service:registry".to_owned()),
+        );
+        caveats.insert(
+            "deployment_domain".to_owned(),
+            CaveatValue::Text(deployment_domain.to_owned()),
+        );
+        caveats.insert(
+            "delegated_public_key_b64".to_owned(),
+            CaveatValue::Text(STANDARD.encode(&delegated_public)),
+        );
+        caveats.insert("max_ttl_seconds".to_owned(), CaveatValue::Int(3_600));
+        caveats.insert(
+            "profile".to_owned(),
+            CaveatValue::Text("hyprstream.registry-deployment.v1".to_owned()),
+        );
+        let payload = UcanPayload {
+            issuer: UcanDid::from_ed25519(&root.ed.verifying_key().to_bytes()),
+            audience: UcanDid::from_ed25519(&delegated_ed.verifying_key().to_bytes()),
+            capabilities: vec![Capability::with_caveats(
+                Resource::new(format!(
+                    "hyprstream://deployment/{deployment_domain}/service/registry"
+                )),
+                Ability::new("mint-registry-jwt"),
+                Caveats(caveats),
+            )],
+            not_before: Some(now),
+            expiration: Some(now + 3_600),
+            nonce: vec![0xA3; 16],
+        };
+        let ucan = Ucan {
+            signature: sign_nested_for_test(
+                &payload.signing_bytes().unwrap(),
+                hyprstream_rpc::auth::ucan::token::UCAN_AAD,
+                &root.ed,
+                &root.pq,
+            ),
+            payload,
+            proofs: vec![],
+        };
+        let artifact = crate::service::RegistryDelegationArtifact {
+            schema: "hyprstream.registry-delegation.v1".to_owned(),
+            deployment_domain: deployment_domain.to_owned(),
+            authority_log_did: authority_log.did.clone(),
+            delegated_public_key_b64: STANDARD.encode(&delegated_public),
+            ucan_b64: STANDARD.encode(ucan.to_cbor().unwrap()),
+        };
+        let exp = i64::try_from(now + 60).unwrap();
+        let now = i64::try_from(now).unwrap();
+        let kid = hyprstream_rpc::auth::composite_kid(
+            &hyprstream_rpc::crypto::pq::ml_dsa_vk_from_bytes(&ml_dsa_sk_to_vk_bytes(
+                &delegated_pq,
+            ))
+            .unwrap(),
+            &delegated_ed.verifying_key(),
+        );
+        let protected = URL_SAFE_NO_PAD.encode(
+            serde_json::to_vec(&json!({
+                "alg": "ML-DSA-65-Ed25519",
+                "typ": "wit+jwt",
+                "kid": kid,
+            }))
+            .unwrap(),
+        );
+        let claims = URL_SAFE_NO_PAD.encode(
+            serde_json::to_vec(&json!({
+                "iss": format!("urn:hyprstream:deployment:{deployment_domain}"),
+                "sub": "service:registry",
+                "aud": "urn:hyprstream:service:registry",
+                "exp": exp,
+                "nbf": now,
+                "iat": now,
+                "deployment_domain": deployment_domain,
+                "profile": "hyprstream.registry-deployment.v1",
+                "cnf": {"jwk": {
+                    "kty": "OKP",
+                    "crv": "Ed25519",
+                    "x": URL_SAFE_NO_PAD.encode(registry.verifying_key().as_bytes()),
+                }},
+                "delegation": URL_SAFE_NO_PAD.encode(serde_json::to_vec(&artifact).unwrap()),
+            }))
+            .unwrap(),
+        );
+        let signing_input = format!("{protected}.{claims}");
+        let mut signature = ml_dsa_sign(&delegated_pq, signing_input.as_bytes());
+        signature.extend_from_slice(&delegated_ed.sign(signing_input.as_bytes()).to_bytes());
+        format!("{signing_input}.{}", URL_SAFE_NO_PAD.encode(signature))
     }
 
     fn capsule_with_carrier(
@@ -578,6 +925,7 @@ mod tests {
             &document(web, Some(&configured_did)),
             Arc::new(FixedCapsuleSource(served_bytes)),
             "unused-test-credential".to_owned(),
+            unused_authority_log(),
         )
         .await
         .err()
@@ -600,6 +948,7 @@ mod tests {
             &document(web, Some(&at9p)),
             Arc::new(FixedCapsuleSource(bytes)),
             "unused-test-credential".to_owned(),
+            unused_authority_log(),
         )
         .await
         .err()
@@ -621,6 +970,7 @@ mod tests {
             &document(web, Some(&at9p)),
             Arc::new(FixedCapsuleSource(bytes)),
             "unused-test-credential".to_owned(),
+            unused_authority_log(),
         )
         .await
         .unwrap();
@@ -638,6 +988,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn delegated_registry_token_bootstraps_through_did_anchored_log_and_checkpoint() {
+        let web = "did:web:cluster.example";
+        let root = capsule_signer(0x51);
+        let mut endpoint =
+            ServiceEndpoint::new(Transport::Iroh, "iroh://delegated-bootstrap").unwrap();
+        endpoint.node_id = Some(multikey(&[0xC1; 32]));
+        let service = ServiceEntry::new("#ns", ServiceType::NinePExport, endpoint).unwrap();
+        let mut body = CapsuleBody::new(vec![root.pair.clone()], vec![service]).unwrap();
+        body.also_known_as = Some(vec![web.to_owned()]);
+        let capsule = sign_capsule(body, &root.ed, &root.pq).unwrap();
+        let capsule_bytes = capsule.to_dag_cbor().unwrap();
+        let at9p = format!("did:at9p:{}", capsule.cid512().unwrap());
+        let anchors = DidAnchors {
+            cluster_at9p_did: at9p.clone(),
+            cluster_did_web: web.to_owned(),
+            extra_root_cert_pem: None,
+        };
+        let root_pq =
+            hyprstream_rpc::crypto::pq::ml_dsa_vk_from_bytes(&ml_dsa_sk_to_vk_bytes(&root.pq))
+                .unwrap();
+        let deployment_domain =
+            hyprstream_rpc::auth::composite_kid(&root_pq, &root.ed.verifying_key());
+        let (authority_log, checkpoint) = authority_log_and_checkpoint(&root, &deployment_domain);
+        let registry = SigningKey::from_bytes(&[0x52; 32]);
+        let credential =
+            delegated_registry_credential(&root, &authority_log, &deployment_domain, &registry);
+
+        let trust = verify_did_anchored_document(
+            &anchors,
+            &document(web, Some(&at9p)),
+            Arc::new(FixedCapsuleSource(capsule_bytes)),
+            credential,
+            authority_log,
+        )
+        .await
+        .unwrap();
+        let verifier = crate::service::authenticate_resolved_did_trust(trust, checkpoint)
+            .expect("delegated DID-anchored deployment credential");
+        assert!(verifier.matches(&registry.verifying_key()));
+    }
+
+    #[tokio::test]
     async fn substituted_document_ca_and_reach_are_ignored() {
         let web = "did:web:cluster.example";
         let (bytes, at9p) = capsule(web, 4);
@@ -652,6 +1044,7 @@ mod tests {
             &document_with_ca_and_reach(web, Some(&at9p), [0x07; 32], [0x45; 32]),
             Arc::new(FixedCapsuleSource(bytes.clone())),
             "unused-test-credential".to_owned(),
+            unused_authority_log(),
         )
         .await
         .unwrap();
@@ -660,6 +1053,7 @@ mod tests {
             &document_with_ca_and_reach(web, Some(&at9p), [0x66; 32], [0xEE; 32]),
             Arc::new(FixedCapsuleSource(bytes)),
             "unused-test-credential".to_owned(),
+            unused_authority_log(),
         )
         .await
         .unwrap();
@@ -695,6 +1089,7 @@ mod tests {
             &document(web, Some(&at9p)),
             Arc::new(FixedCapsuleSource(classical_only)),
             "unused-test-credential".to_owned(),
+            unused_authority_log(),
         )
         .await
         .err()
@@ -719,6 +1114,7 @@ mod tests {
             &document(web, Some(&at9p)),
             Arc::new(FixedCapsuleSource(bytes)),
             "unused-test-credential".to_owned(),
+            unused_authority_log(),
         )
         .await
         .err()
@@ -760,6 +1156,7 @@ mod tests {
             &document,
             Arc::new(FixedCapsuleSource(bytes)),
             "unused-test-credential".to_owned(),
+            unused_authority_log(),
         )
         .await
         .unwrap();
@@ -770,6 +1167,122 @@ mod tests {
                 assert_eq!(auth.accept_cert_hashes(), &[[0xA5; 32]]);
             }
             other => panic!("expected capsule-bound QUIC reach, got {other:?}"),
+        }
+    }
+
+    /// When the document QUIC entry uses a hostname URI (decoding to an
+    /// unspecified IP) and the port matches the capsule's real address, the
+    /// port-match relaxation must fire AND the returned config must dial the
+    /// capsule's real socket address — not `0.0.0.0:port`.
+    ///
+    /// Removing the address-rewrite in `reach_from_capsule` turns this test
+    /// red: the config would dial an unspecified address and never connect.
+    #[tokio::test]
+    async fn quic_port_match_with_hostname_uri_rewrites_dial_address() {
+        let web = "did:web:cluster.example";
+        let signer = capsule_signer(7);
+        let capsule_addr: SocketAddr = "203.0.113.10:443".parse().unwrap();
+        let endpoint =
+            ServiceEndpoint::new(Transport::Quic, format!("quic://{capsule_addr}")).unwrap();
+        let service = ServiceEntry::new("#ns", ServiceType::NinePExport, endpoint).unwrap();
+        let mut body = CapsuleBody::new(vec![signer.pair], vec![service]).unwrap();
+        body.also_known_as = Some(vec![web.to_owned()]);
+        let capsule = sign_capsule(body, &signer.ed, &signer.pq).unwrap();
+        let bytes = capsule.to_dag_cbor().unwrap();
+        let at9p = format!("did:at9p:{}", capsule.cid512().unwrap());
+        let anchors = DidAnchors {
+            cluster_at9p_did: at9p.clone(),
+            cluster_did_web: web.to_owned(),
+            extra_root_cert_pem: None,
+        };
+        let channel_auth =
+            hyprstream_rpc::transport::QuicServerAuth::pinned(vec![[0xB7; 32]]).unwrap();
+        let mut document = document(web, Some(&at9p));
+        // Hostname URI decodes to 0.0.0.0:443 — port matches, IP does not.
+        document["service"] = json!([{
+            "id": format!("{web}#quic"),
+            "type": "QuicTransport",
+            "serviceEndpoint": hyprstream_rpc::service_entry::encode_quic(
+                "https://staging.example.com:443",
+                &channel_auth,
+                &["hyprstream-rpc/1"],
+            ),
+        }]);
+
+        let trust = verify_did_anchored_document(
+            &anchors,
+            &document,
+            Arc::new(FixedCapsuleSource(bytes)),
+            "unused-test-credential".to_owned(),
+            unused_authority_log(),
+        )
+        .await
+        .expect("hostname-URI port match must verify");
+        match trust.discovery_transport.endpoint {
+            EndpointType::Quic { addr, auth, .. } => {
+                assert_eq!(
+                    addr, capsule_addr,
+                    "dial address must be the capsule's real socket, not 0.0.0.0"
+                );
+                assert!(!auth.require_web_pki());
+                assert_eq!(auth.accept_cert_hashes(), &[[0xB7; 32]]);
+            }
+            other => panic!("expected capsule-bound QUIC reach, got {other:?}"),
+        }
+    }
+
+    /// When the document QUIC entry's port does NOT match the capsule's address
+    /// (and the IP is unspecified from a hostname URI), no entry matches and the
+    /// resolver falls back to a bare-IP dial without SNI or certificate pins.
+    #[tokio::test]
+    async fn quic_neither_port_nor_address_match_falls_back_to_bare_ip() {
+        let web = "did:web:cluster.example";
+        let signer = capsule_signer(9);
+        let capsule_addr: SocketAddr = "203.0.113.20:443".parse().unwrap();
+        let endpoint =
+            ServiceEndpoint::new(Transport::Quic, format!("quic://{capsule_addr}")).unwrap();
+        let service = ServiceEntry::new("#ns", ServiceType::NinePExport, endpoint).unwrap();
+        let mut body = CapsuleBody::new(vec![signer.pair], vec![service]).unwrap();
+        body.also_known_as = Some(vec![web.to_owned()]);
+        let capsule = sign_capsule(body, &signer.ed, &signer.pq).unwrap();
+        let bytes = capsule.to_dag_cbor().unwrap();
+        let at9p = format!("did:at9p:{}", capsule.cid512().unwrap());
+        let anchors = DidAnchors {
+            cluster_at9p_did: at9p.clone(),
+            cluster_did_web: web.to_owned(),
+            extra_root_cert_pem: None,
+        };
+        let channel_auth =
+            hyprstream_rpc::transport::QuicServerAuth::pinned(vec![[0xC9; 32]]).unwrap();
+        let mut document = document(web, Some(&at9p));
+        // Port 8443 does not match the capsule's port 443.
+        document["service"] = json!([{
+            "id": format!("{web}#quic"),
+            "type": "QuicTransport",
+            "serviceEndpoint": hyprstream_rpc::service_entry::encode_quic(
+                "https://staging.example.com:8443",
+                &channel_auth,
+                &["hyprstream-rpc/1"],
+            ),
+        }]);
+
+        let trust = verify_did_anchored_document(
+            &anchors,
+            &document,
+            Arc::new(FixedCapsuleSource(bytes)),
+            "unused-test-credential".to_owned(),
+            unused_authority_log(),
+        )
+        .await
+        .expect("fallback to bare-IP dial must still verify");
+        match trust.discovery_transport.endpoint {
+            EndpointType::Quic { addr, auth, .. } => {
+                // Fallback: bare capsule address, WebPKI default, no cert pins.
+                assert_eq!(addr, capsule_addr);
+                assert!(auth.require_web_pki());
+                assert!(auth.accept_cert_hashes().is_empty());
+            }
+            other => panic!("expected fallback QUIC reach, got {other:?}"),
         }
     }
 }

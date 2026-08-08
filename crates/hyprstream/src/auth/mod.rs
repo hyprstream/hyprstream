@@ -5,21 +5,31 @@
 //!
 //! Also provides JWT token authentication with Ed25519 signatures.
 
+pub(crate) mod age_seal;
 pub mod device_challenge;
-pub mod identity_store;
-pub mod key_rotation;
-pub mod op_log;
-pub mod service_jwt;
+#[cfg_attr(not(feature = "pglite"), allow(dead_code))]
+pub mod encrypted_columns;
 pub mod federation;
 pub mod federation_admission;
-pub mod mesh_trust;
 pub mod id_token_verify;
+pub mod identity_store;
 pub mod jwt;
+pub mod key_rotation;
+pub mod mesh_trust;
+pub mod op_log;
+#[cfg(any(feature = "pglite", feature = "postgres"))]
+mod cipher_glue;
+#[cfg(feature = "pglite")]
+pub mod pglite_store;
+#[cfg(feature = "postgres")]
+pub mod postgres_store;
 mod policy_manager;
 pub mod policy_migration;
 pub mod policy_templates;
-pub mod user_store;
+mod production_user_store;
 pub mod rocksdb_store;
+pub mod service_jwt;
+pub mod user_store;
 #[cfg(feature = "valkey")]
 pub mod valkey;
 
@@ -27,21 +37,33 @@ pub use hyprstream_rpc::annotations_capnp::ScopeAction;
 
 pub use federation::FederationKeyResolver;
 pub use jwt::{Claims, JwtError};
-pub use key_rotation::{SigningKeyStore, Es256SigningKeyStore, Es256KeySlot, RotationStores};
+pub use key_rotation::{Es256KeySlot, Es256SigningKeyStore, RotationStores, SigningKeyStore};
+pub use key_rotation::{MlDsaKeySlot, MlDsaSigningKeyStore};
 pub use op_log::{
     load_head_verifying_key, load_or_init_head_signing_key, publish_head_verifying_key,
     resolve_oplog_state_dir, seal_op_log_head, ActiveGeneration, ActiveGenerationSource,
     FixedGenerationSource, SealedHeadEs256Source, SealedOpLogHead,
 };
-pub use key_rotation::{MlDsaSigningKeyStore, MlDsaKeySlot};
+#[cfg(feature = "pglite")]
+pub use pglite_store::PgliteUserStore;
+#[cfg(feature = "postgres")]
+pub use postgres_store::PostgresUserStore;
 pub use policy_manager::{
     federation_registration_resource, global_policy_manager, set_global_policy_manager,
     write_policy_file, PolicyError, PolicyManager,
 };
 pub use policy_migration::migrate_policy_csv;
-pub use policy_templates::{PolicyTemplate, ServicePolicyRule, SERVICE_BASE_POLICIES, get_template, get_templates};
-pub use user_store::{DeviceRecord, DeviceStore, KeyAlgorithm, UserFilter, UserProfile, UserProfilePatch, UserStore, PubkeyEntry, pubkey_fingerprint, decode_pubkey_base64};
+pub use policy_templates::{
+    get_template, get_templates, PolicyTemplate, ServicePolicyRule, SERVICE_BASE_POLICIES,
+};
+pub use production_user_store::ProductionUserStore;
 pub use rocksdb_store::RocksDbUserStore;
+pub use user_store::{
+    decode_pubkey_base64, pubkey_fingerprint, AccountKeyCustody, DeviceRecord, DeviceStore,
+    ExternalIdentityBinding, ExternalIdentityResolution, HostedAccountProvisionError,
+    HostedAccountProvisioning, KeyAlgorithm, PubkeyEntry, UserFilter, UserProfile,
+    UserProfilePatch, UserStore,
+};
 #[cfg(feature = "valkey")]
 pub use valkey::ValkeyUserStore;
 
@@ -284,21 +306,21 @@ impl Operation {
     /// permission but not `ttt.writeback`.
     pub fn as_str(&self) -> &'static str {
         match self {
-            Operation::Infer   => "infer.generate",
-            Operation::Train   => "ttt.train",
+            Operation::Infer => "infer.generate",
+            Operation::Train => "ttt.train",
             // `Query` (model status) and `MeshStatus` (mesh read ability) are
             // the SAME wire action `query.status` by design — the mesh read
             // right IS the canonical status read (#319). `from_dot_str` resolves
             // the string back to `Query` (its canonical owner).
             Operation::Query | Operation::MeshStatus => "query.status",
-            Operation::Write   => "persist.save",
-            Operation::Serve   => "serve.api",
-            Operation::Manage  => "ttt.writeback",
+            Operation::Write => "persist.save",
+            Operation::Serve => "serve.api",
+            Operation::Manage => "ttt.writeback",
             Operation::Context => "context.augment",
             Operation::Subscribe => "subscribe",
             Operation::Publish => "publish",
-            Operation::Spawn   => "spawn",
-            Operation::Create  => "create",
+            Operation::Spawn => "spawn",
+            Operation::Create => "create",
             // Mesh (#319). `mesh.rpc` is the umbrella invoke right (alias
             // `inference:peer-call` accepted on parse). The authority actions
             // `infer.stage` / `delta.submit` are deliberately distinct strings
@@ -306,8 +328,8 @@ impl Operation {
             // model grant can never satisfy a mesh-authority gate. (The read
             // ability `MeshStatus` shares the `query.status` arm above.)
             Operation::MeshInvoke => "mesh.rpc",
-            Operation::MeshStage  => "infer.stage",
-            Operation::MeshDelta  => "delta.submit",
+            Operation::MeshStage => "infer.stage",
+            Operation::MeshDelta => "delta.submit",
         }
     }
 
@@ -390,8 +412,7 @@ impl std::str::FromStr for Operation {
     type Err = anyhow::Error;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Self::from_dot_str(s)
-            .ok_or_else(|| anyhow::anyhow!("Unknown operation: {}", s))
+        Self::from_dot_str(s).ok_or_else(|| anyhow::anyhow!("Unknown operation: {}", s))
     }
 }
 
@@ -431,8 +452,7 @@ pub fn capabilities_to_access_string(
     if capabilities.has::<Serve>() && policy_manager.check_sync(user, resource, Operation::Serve) {
         permitted.push("serve");
     }
-    if capabilities.has::<Manage>()
-        && policy_manager.check_sync(user, resource, Operation::Manage)
+    if capabilities.has::<Manage>() && policy_manager.check_sync(user, resource, Operation::Manage)
     {
         permitted.push("manage");
     }
@@ -489,16 +509,43 @@ mod tests {
         assert!(matches!(Operation::from_str("query"), Ok(Operation::Query)));
         assert!(matches!(Operation::from_str("write"), Ok(Operation::Write)));
         assert!(matches!(Operation::from_str("serve"), Ok(Operation::Serve)));
-        assert!(matches!(Operation::from_str("manage"), Ok(Operation::Manage)));
-        assert!(matches!(Operation::from_str("context"), Ok(Operation::Context)));
+        assert!(matches!(
+            Operation::from_str("manage"),
+            Ok(Operation::Manage)
+        ));
+        assert!(matches!(
+            Operation::from_str("context"),
+            Ok(Operation::Context)
+        ));
         // Dot-namespaced strings (emitted by Display) must also round-trip
-        assert!(matches!("infer.generate".parse::<Operation>(), Ok(Operation::Infer)));
-        assert!(matches!("ttt.train".parse::<Operation>(), Ok(Operation::Train)));
-        assert!(matches!("ttt.writeback".parse::<Operation>(), Ok(Operation::Manage)));
-        assert!(matches!("query.status".parse::<Operation>(), Ok(Operation::Query)));
-        assert!(matches!("persist.save".parse::<Operation>(), Ok(Operation::Write)));
-        assert!(matches!("serve.api".parse::<Operation>(), Ok(Operation::Serve)));
-        assert!(matches!("context.augment".parse::<Operation>(), Ok(Operation::Context)));
+        assert!(matches!(
+            "infer.generate".parse::<Operation>(),
+            Ok(Operation::Infer)
+        ));
+        assert!(matches!(
+            "ttt.train".parse::<Operation>(),
+            Ok(Operation::Train)
+        ));
+        assert!(matches!(
+            "ttt.writeback".parse::<Operation>(),
+            Ok(Operation::Manage)
+        ));
+        assert!(matches!(
+            "query.status".parse::<Operation>(),
+            Ok(Operation::Query)
+        ));
+        assert!(matches!(
+            "persist.save".parse::<Operation>(),
+            Ok(Operation::Write)
+        ));
+        assert!(matches!(
+            "serve.api".parse::<Operation>(),
+            Ok(Operation::Serve)
+        ));
+        assert!(matches!(
+            "context.augment".parse::<Operation>(),
+            Ok(Operation::Context)
+        ));
         // Verify format!("{}", op).parse() round-trip for every variant.
         for op in Operation::all() {
             let displayed = format!("{}", op);
@@ -521,24 +568,52 @@ mod tests {
         assert_eq!(Operation::MeshInvoke.as_str(), "mesh.rpc");
         assert_eq!(Operation::MeshStage.as_str(), "infer.stage");
         assert_eq!(Operation::MeshDelta.as_str(), "delta.submit");
-        assert_eq!(Operation::from_dot_str("mesh.rpc"), Some(Operation::MeshInvoke));
-        assert_eq!(Operation::from_dot_str("mesh:rpc"), Some(Operation::MeshInvoke));
-        assert_eq!(Operation::from_dot_str("inference:peer-call"), Some(Operation::MeshInvoke));
-        assert_eq!(Operation::from_dot_str("infer.stage"), Some(Operation::MeshStage));
-        assert_eq!(Operation::from_dot_str("delta.submit"), Some(Operation::MeshDelta));
+        assert_eq!(
+            Operation::from_dot_str("mesh.rpc"),
+            Some(Operation::MeshInvoke)
+        );
+        assert_eq!(
+            Operation::from_dot_str("mesh:rpc"),
+            Some(Operation::MeshInvoke)
+        );
+        assert_eq!(
+            Operation::from_dot_str("inference:peer-call"),
+            Some(Operation::MeshInvoke)
+        );
+        assert_eq!(
+            Operation::from_dot_str("infer.stage"),
+            Some(Operation::MeshStage)
+        );
+        assert_eq!(
+            Operation::from_dot_str("delta.submit"),
+            Some(Operation::MeshDelta)
+        );
         // The mesh-authority strings are DISTINCT from the model-namespace
         // strings, so a model grant can never satisfy a mesh-authority gate.
         assert_ne!(Operation::MeshStage.as_str(), Operation::Infer.as_str());
         assert_ne!(Operation::MeshDelta.as_str(), Operation::Write.as_str());
         // The mesh read ability reuses the canonical `query.status` wire action.
         assert_eq!(Operation::MeshStatus.as_str(), "query.status");
-        assert_eq!(Operation::from_dot_str("query.status"), Some(Operation::Query));
+        assert_eq!(
+            Operation::from_dot_str("query.status"),
+            Some(Operation::Query)
+        );
         // Codes are distinct from the model-capability codes.
-        for op in [Operation::MeshInvoke, Operation::MeshStage, Operation::MeshDelta, Operation::MeshStatus] {
+        for op in [
+            Operation::MeshInvoke,
+            Operation::MeshStage,
+            Operation::MeshDelta,
+            Operation::MeshStatus,
+        ] {
             assert_eq!(Operation::from_code(op.code()), Some(op));
         }
         // Mesh ops are part of `all()` so `check_all` can report them (#1096).
-        for op in &[Operation::MeshInvoke, Operation::MeshStage, Operation::MeshDelta, Operation::MeshStatus] {
+        for op in &[
+            Operation::MeshInvoke,
+            Operation::MeshStage,
+            Operation::MeshDelta,
+            Operation::MeshStatus,
+        ] {
             assert!(Operation::all().contains(op));
         }
     }
@@ -583,8 +658,14 @@ mod tests {
         }
         assert_eq!(Operation::MeshStatus.scope_action(), None);
         // `subscribe`/`publish` are distinct enforced abilities — NOT context/serve.
-        assert_eq!(Operation::from_capability("subscribe"), Some(Operation::Subscribe));
-        assert_eq!(Operation::from_capability("publish"), Some(Operation::Publish));
+        assert_eq!(
+            Operation::from_capability("subscribe"),
+            Some(Operation::Subscribe)
+        );
+        assert_eq!(
+            Operation::from_capability("publish"),
+            Some(Operation::Publish)
+        );
         assert_eq!(Operation::Subscribe.as_capability(), "subscribe");
         assert_eq!(Operation::Publish.as_capability(), "publish");
         // Unknown tokens fail closed.
@@ -622,17 +703,44 @@ mod tests {
     #[test]
     fn test_operation_from_dot_str() {
         // New dot-namespaced strings
-        assert_eq!(Operation::from_dot_str("infer.generate"), Some(Operation::Infer));
+        assert_eq!(
+            Operation::from_dot_str("infer.generate"),
+            Some(Operation::Infer)
+        );
         assert_eq!(Operation::from_dot_str("ttt.train"), Some(Operation::Train));
-        assert_eq!(Operation::from_dot_str("ttt.writeback"), Some(Operation::Manage));
-        assert_eq!(Operation::from_dot_str("ttt.evict"), Some(Operation::Manage));
+        assert_eq!(
+            Operation::from_dot_str("ttt.writeback"),
+            Some(Operation::Manage)
+        );
+        assert_eq!(
+            Operation::from_dot_str("ttt.evict"),
+            Some(Operation::Manage)
+        );
         assert_eq!(Operation::from_dot_str("ttt.zero"), Some(Operation::Manage));
-        assert_eq!(Operation::from_dot_str("query.status"), Some(Operation::Query));
-        assert_eq!(Operation::from_dot_str("query.delta"), Some(Operation::Query));
-        assert_eq!(Operation::from_dot_str("persist.save"), Some(Operation::Write));
-        assert_eq!(Operation::from_dot_str("persist.export"), Some(Operation::Write));
-        assert_eq!(Operation::from_dot_str("persist.snapshot"), Some(Operation::Write));
-        assert_eq!(Operation::from_dot_str("context.augment"), Some(Operation::Context));
+        assert_eq!(
+            Operation::from_dot_str("query.status"),
+            Some(Operation::Query)
+        );
+        assert_eq!(
+            Operation::from_dot_str("query.delta"),
+            Some(Operation::Query)
+        );
+        assert_eq!(
+            Operation::from_dot_str("persist.save"),
+            Some(Operation::Write)
+        );
+        assert_eq!(
+            Operation::from_dot_str("persist.export"),
+            Some(Operation::Write)
+        );
+        assert_eq!(
+            Operation::from_dot_str("persist.snapshot"),
+            Some(Operation::Write)
+        );
+        assert_eq!(
+            Operation::from_dot_str("context.augment"),
+            Some(Operation::Context)
+        );
         assert_eq!(Operation::from_dot_str("serve.api"), Some(Operation::Serve));
         // Legacy flat strings
         assert_eq!(Operation::from_dot_str("infer"), Some(Operation::Infer));

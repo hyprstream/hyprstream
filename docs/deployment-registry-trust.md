@@ -1,9 +1,39 @@
 # Deployment registry trust provisioning
 
+> This document covers deployment-level trust: the OS-owned CA pin, authority
+> log/checkpoint, and registry credential below. It does not cover
+> `bootstrap-pubkeys`, the unrelated node-local, unattested service-key file —
+> see [bootstrap-pubkeys-format.md](bootstrap-pubkeys-format.md).
+
+## Terminology
+
+Four words describe overlapping scopes in this codebase and its docs; they
+are not synonyms:
+
+- **Node** — one running Hyprstream process/host with its own signing key.
+  Nodes are the only thing that exists; there is no separate "cell" or
+  "cluster" object anywhere in the type system.
+- **Cell** — the set of nodes sharing one deployment CA (one admitted
+  trust root, one ledger). A cell is emergent, not a distinct entity: a cell
+  is simply what you get when N nodes are provisioned with the same
+  `/etc/hyprstream/trust/*` artifacts (or the same DID anchor). Multi-node is
+  still single-cell; there is currently no cross-cell interaction in this
+  repository (see `placement-indexer-architecture.md`'s "not ... a
+  cross-cell directory").
+- **Cluster** (as in `cluster_at9p_did` / `cluster_did_web`) — the specific
+  configuration surface for pointing a node at a DID-anchored deployment. It
+  names the same scope as "cell," from the perspective of one node's config.
+- **Deployment** — this document's scope: the CA, authority log, and
+  credential that anchor trust for a cell. "Deployment trust" and "cell
+  trust" mean the same thing.
+- **Federation** — interaction *across* cells. Not implemented; out of
+  scope for every document in this section.
+
 Production Discovery/PDS authority is rooted before commands, factories, plugins,
-or generated clients run. The executable does not consult
-`CREDENTIALS_DIRECTORY`, XDG/user configuration, `HYPRSTREAM__SECRETS__PATH`, a
-public setter, or a caller-provided path for this authority.
+or generated clients run. The executable consults only the explicit deployment
+trust sources described below. It does not consult XDG/user configuration,
+`HYPRSTREAM__SECRETS__PATH`, a public setter, or an arbitrary caller-provided
+file path for this authority.
 
 The OS-owned deployment seam is deliberately small and fail-closed:
 
@@ -13,21 +43,55 @@ The OS-owned deployment seam is deliberately small and fail-closed:
 - `/run/hyprstream/credentials/registry-service.jwt` is the separately
   provisioned, short-lived `service:registry` credential. Its `cnf.jwk` names the
   registry key that certifies accepted `did:at9p:<cid512>` state.
+- `/etc/hyprstream/trust/deployment-authority.log.json` is the public,
+  root-anchored authority-set history required for every enrolled credential.
+- `/etc/hyprstream/trust/deployment-authority.head.json` is the independently
+  provisioned expected log head: schema, deployment domain, log DID, sequence,
+  and head CID. The supplied log must match it exactly.
 
-Both files must be regular, root-owned, and not group/world writable. Missing,
-malformed, symlinked, or incorrectly owned material makes production resolver
-startup fail closed. Both JWT signature components are verified against the
-`/etc` pin before its key is represented by an opaque verification-only
-capability. The raw keys and one-shot witness are not exposed through the
-public service or Discovery APIs.
+By default, all installed files and parent directories must be real,
+root-owned paths and not group/world writable. Missing, malformed, symlinked,
+or incorrectly owned material makes production resolver startup fail closed.
+Missing log or checkpoint never selects a less restrictive verifier. Both JWT
+signature components are verified against the checkpointed active authority
+before its key is represented by an opaque verification-only capability. The
+raw keys and one-shot witness are not exposed through the public service or
+Discovery APIs.
 
 The repository does not yet contain an operator enrollment protocol. Deployments
 using this OS-owned source must therefore provision the `/etc` pin through their
 OS image, configuration manager, measured-boot policy, or equivalent root-owned
 mechanism, and project the registry JWT into the fixed `/run` location before
-starting hyprstream. User-mode service-manager installations that cannot provide
-these fixed OS-owned files are intentionally not production-authoritative and
-fail closed; ambient credential-directory fallback is not supported.
+starting hyprstream.
+
+## Explicit user-service trust paths
+
+A rootless service may select a complete public trust directory with:
+
+```text
+HYPRSTREAM_DEPLOYMENT_TRUST_DIR=/absolute/path/to/trust
+```
+
+That directory must contain exactly the same named public artifacts:
+`deployment-ca.hybrid`, `deployment-authority.log.json`, and
+`deployment-authority.head.json`. The registry JWT is independently resolved
+from systemd's absolute `$CREDENTIALS_DIRECTORY` as
+`$CREDENTIALS_DIRECTORY/registry-service.jwt`. Either variable being present
+but empty, relative, or containing `..` components is a startup error; it
+never falls back to a fixed path. When a variable is absent, only its fixed
+root-owned path is used.
+
+Explicit user-service artifacts and every real ancestor must be owned by root
+or the daemon's effective user and must not be group/world writable. Symlinks
+are rejected and the final file is opened with `O_NOFOLLOW`. This mode trusts
+the service account to provision its own development trust inputs; it does not
+turn XDG or general secret directories into authority.
+
+Path selection changes no cryptographic rule. The CA is still exactly the
+mandatory 1,984-byte Ed25519 + ML-DSA-65 pair; the authority log must still
+match the independent checkpoint exactly; and the registry JWT still passes
+the closed profile, audience, shape, lifetime, currentness, delegation, and
+both-signature checks. Any incomplete or invalid selected set fails startup.
 
 The CA authenticates the registry credential. The registry key in that credential
 then certifies the purpose-derived audit key used by accepted-state envelopes and
@@ -77,15 +141,16 @@ not become trust decisions: identity remains pinned by the configured at9p
 hash and mutual alias rule, while application responses remain pinned to the
 separately authenticated Discovery service key.
 
-The registry deployment credential is fetched from beside the capsule —
-`/.well-known/deployment/registry-service.jwt` — and validated with the exact
-same profile as the OS-owned file (CA-bound `kid`/`iss`/`deployment_domain`,
-one-hour freshness). The credential is CA-signed and short-lived, so the
-channel is untrusted by design; the OS-owned JWT file is required only when
-the OS-owned source is selected. Enrollment (operator-approved device flow,
-unattended machine attestation) and final `SecretsProfile` integration remain
-separate work; no client-authentication authority is inferred from the two
-public anchors.
+The registry deployment credential and current root-anchored authority log are
+fetched from beside the capsule at
+`/.well-known/deployment/registry-service.jwt` and
+`/.well-known/deployment/deployment-authority.log.json`. The log is
+authenticated against the capsule-derived hybrid root and must match the
+separately provisioned OS-owned head checkpoint exactly; the credential is then
+validated against that active set with the same closed profile as the OS-owned
+path. The HTTPS channel is untrusted by design and cannot redefine currentness.
+The OS-owned JWT and log files are required only when the OS-owned source is
+selected, but the OS-owned checkpoint is required for both enrolled sources.
 
 ### Serving the deployment well-known documents
 
@@ -98,12 +163,14 @@ service, and it already owns `/.well-known/did.json`):
 deployment_well_known_dir = "/var/lib/hyprstream/deployment-well-known"
 ```
 
-The operator provisions three public, integrity-anchored documents, re-read
+The operator provisions four public, integrity-anchored documents, re-read
 on every request (so the hourly credential refresh needs no restart):
 
 ```text
 <dir>/did.json                              the deployment DID document
 <dir>/at9p/<cid512>.cbor                    the cluster at9p genesis capsule
+<dir>/deployment/deployment-authority.log.json
+                                            the current root-anchored authority log
 <dir>/deployment/registry-service.jwt       the current CA-signed credential
 ```
 
@@ -175,6 +242,23 @@ optional JOSE/JWK metadata (`crit`, `use`, `key_ops`, or a JWK-local `alg` or
 token types, and a signature or key identifier that does not bind the pinned CA
 fail closed before a registry witness can be minted. The credential file is the
 compact JWT itself with no surrounding whitespace or trailing newline.
+
+The common operational form adds exactly one `delegation` claim to that closed
+claim set. It is canonical unpadded base64url JSON containing the scoped UCAN,
+the delegated 1,984-byte hybrid public key, and the stable authority-log DID.
+The separately installed or fetched root-anchored DidOp log must have that DID,
+its verified sequence and head CID must equal the independent checkpoint, and
+the UCAN issuer must still be in its active any-of-N authority set. The UCAN is
+restricted to this deployment's registry-service mint ability, exact profile
+and audience, and the one-hour ceiling. Direct rare-root credentials retain the
+original claim set without `delegation`, but they are subject to the same
+mandatory log/checkpoint test and fail after root retirement.
+
+This profile is deployment/registry scoped. It has no PDS or host identifier.
+The demo therefore projects one shared deployment CA and current credential to
+both PDS hosts; a per-PDS binding would require a new profile or separate roots.
+The exact mint, rotation, recovery, publisher, and Metal input contracts are in
+[`deployment-trust-contract.md`](deployment-trust-contract.md).
 
 Classical-only atproto peer keys remain supported only at the separately named
 peer/federation record-resolution surface. That P-256 interoperability path

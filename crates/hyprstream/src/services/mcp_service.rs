@@ -27,6 +27,7 @@ use crate::services::generated::model_client::ModelClient;
 use crate::services::generated::policy_client::PolicyCheck;
 use crate::services::generated::tui_client::TuiClient;
 use crate::services::{PolicyClient, RegistryClient};
+use hyprstream_workers::generated::workflow_client::WorkflowClient;
 use async_trait::async_trait;
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use futures::future::BoxFuture;
@@ -185,6 +186,12 @@ pub struct ToolCallContext {
     pub ctx: Option<Arc<ServiceContext>>,
     /// Bootstrap Policy client used only for Policy operations.
     pub policy_client: PolicyClient,
+    /// The verified caller bearer token (MCP stdio/HTTP auth). Forwarded to
+    /// services whose authorization is JWT-backed so they receive the caller's
+    /// identity instead of an anonymous dial (#989 review: workflow dispatch
+    /// was passing `None`, dropping the caller JWT/tenant and forcing
+    /// WorkflowService to reject every `workflow.*` MCP call).
+    pub token: Option<String>,
 }
 
 type ToolHandler =
@@ -323,6 +330,10 @@ fn register_schema_tools(reg: &mut ToolRegistry) {
     register_top_level!(reg, registry_client::schema_metadata());
     register_top_level!(reg, policy_client::schema_metadata());
     register_top_level!(reg, tui_client::schema_metadata());
+    register_top_level!(
+        reg,
+        hyprstream_workers::generated::workflow_client::schema_metadata()
+    );
     // Scoped tools: recursive tree walk for all services with nested scopes
     register_scoped_tools_recursive(
         reg,
@@ -823,6 +834,21 @@ async fn dispatch_schema_call(
             let client = TuiClient::from_resolver(signing_key, None)?;
             client.call_method(method, &ctx.args).await
         }
+        "workflow" => {
+            // Delegated-bearer relay path (#989 review). The MCP envelope is
+            // signed by the MCP service key, so a cnf.jwk/cnf.jkt-bound caller
+            // token MUST travel as a delegated bearer (with_delegated_bearer),
+            // not as a direct bearer on from_resolver — direct would bind cnf
+            // to the relay key and the token would fail verification at
+            // WorkflowService. WorkflowService's authorize callback relays the
+            // delegated bearer to PolicyService via check_with_verified_bearer
+            // (same path as WorkerService), which validates the delegation.
+            let mut client = WorkflowClient::from_resolver(signing_key, None)?;
+            if let Some(bearer) = ctx.token.as_ref() {
+                client = client.with_delegated_bearer(bearer.clone());
+            }
+            client.call_method(method, &ctx.args).await
+        }
         _ => anyhow::bail!("Unknown service: {service}"),
     }
 }
@@ -1101,6 +1127,10 @@ impl McpService {
             domain,
             ctx: self.service_ctx.clone(),
             policy_client: self.policy_client.clone(),
+            // Preserve the verified caller bearer so JWT-backed services
+            // (e.g. WorkflowService) authorize the actual caller, not an
+            // anonymous dial (#989 review fix).
+            token: identity.token,
         };
 
         let result = handler(ctx)
@@ -1472,6 +1502,72 @@ mod tests {
 
     fn signing_key(seed: u8) -> SigningKey {
         SigningKey::from_bytes(&[seed; 32])
+    }
+
+    /// #989: workflow tools must be advertised to MCP clients. Proves both that
+    /// `register_schema_tools` walks `workflow_client::schema_metadata()` AND
+    /// that the schema/metadata are wired (a missing registration would leave
+    /// `workflow.list`/`workflow.dispatch`/… invisible to MCP).
+    #[test]
+    fn workflow_tools_registered_for_mcp() {
+        let mut reg = ToolRegistry::new();
+        register_schema_tools(&mut reg);
+        let has_workflow = reg.list().any(|t| t.name.starts_with("workflow."));
+        assert!(
+            has_workflow,
+            "MCP tool registry must expose workflow.* tools (#989)"
+        );
+    }
+
+    /// #989 review (1194b0d55 follow-up): the workflow dispatch arm must relay a
+    /// cnf.jwk/cnf.jkt-bound caller token via the **delegated-bearer** path
+    /// (`with_delegated_bearer`), not as a direct bearer on `from_resolver`. The
+    /// MCP envelope is signed by the MCP service key; a direct bearer would bind
+    /// `cnf` to the relay key and the token would fail at WorkflowService.
+    ///
+    /// `WorkflowClient::from_resolver` unconditionally requires
+    /// `hyprstream_discovery`'s checkpoint-backed production resolver to be
+    /// installed (`production_rpc_client` bails otherwise) — a process-bootstrap
+    /// singleton no unit test installs, and no local/inproc registration can
+    /// substitute for. Dynamically constructing a real `WorkflowClient` here is
+    /// therefore not possible in an isolated unit test; pin the dispatch arm's
+    /// bearer semantics structurally instead, directly over its source text, so
+    /// no bootstrap globals (registry/policy/discovery) are needed at all. Full
+    /// runtime validation (token reaches `WorkflowService::authorize` via a live
+    /// resolver + PolicyService) remains CI/integration-test scope.
+    #[test]
+    fn workflow_dispatch_uses_delegated_bearer_relay_path() {
+        let source = include_str!("mcp_service.rs");
+        let production = source
+            .split("// Tests")
+            .next()
+            .expect("'// Tests' banner marker must exist to bound the production text");
+
+        let arm_start = production
+            .find("\"workflow\" => {")
+            .expect("dispatch_schema_call must have a \"workflow\" match arm");
+        let arm_end = production[arm_start..]
+            .find("_ => anyhow::bail!(\"Unknown service: {service}\")")
+            .expect("the workflow arm must be followed by the catch-all match arm");
+        let workflow_arm = &production[arm_start..arm_start + arm_end];
+
+        assert!(
+            workflow_arm.contains("WorkflowClient::from_resolver(signing_key, None)"),
+            "workflow arm must dial with from_resolver(signing_key, None) — no direct bearer"
+        );
+        assert!(
+            workflow_arm.contains("if let Some(bearer) = ctx.token.as_ref()"),
+            "workflow arm must branch on the caller's verified token"
+        );
+        assert!(
+            workflow_arm.contains("client = client.with_delegated_bearer(bearer.clone());"),
+            "workflow arm must relay the caller token via with_delegated_bearer, not a direct bearer"
+        );
+        assert!(
+            !workflow_arm.contains("from_resolver(signing_key, Some"),
+            "workflow arm must NOT pass the caller token as a direct bearer on from_resolver — \
+             a cnf.jwk/cnf.jkt-bound caller token would fail verification at WorkflowService"
+        );
     }
 
     #[test]

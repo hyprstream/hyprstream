@@ -17,11 +17,16 @@ use axum::{
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
+use subtle::ConstantTimeEq as _;
 
-use super::state::OAuthState;
+use super::state::{DpopJtiAdmission, OAuthState};
 use crate::mac::exchange::{GrantDecision, GrantError, GrantRequest, GrantedAccess};
 use crate::services::generated::policy_client::IssueToken;
 use hyprstream_pds::repo_authority::is_path_form_did_web;
+// #1425: the browser RFC 8693 sender-bound contract. The public client_id is
+// the single source of truth shared with the WASM client (`hyprstream-rpc`),
+// so the wire contract cannot drift between client and server.
+use hyprstream_rpc::wasm_token_exchange::BROWSER_PUBLIC_CLIENT_ID;
 
 const TOKEN_TYPE_ID_TOKEN: &str = "urn:ietf:params:oauth:token-type:id_token";
 const TOKEN_TYPE_ACCESS_TOKEN: &str = "urn:ietf:params:oauth:token-type:access_token";
@@ -29,12 +34,18 @@ const TOKEN_TYPE_JWT: &str = "urn:ietf:params:oauth:token-type:jwt";
 const ISSUED_TOKEN_TYPE: &str = "urn:ietf:params:oauth:token-type:access_token";
 pub const ATPROTO_EXCHANGE_NSID: &str = "ai.hyprstream.identity.exchangeUcan";
 pub const ATPROTO_SESSION_EXCHANGE_NSID: &str = "ai.hyprstream.identity.exchangeSession";
-const MAX_ATPROTO_SERVICE_TOKEN_LIFETIME: i64 = 3600;
+pub(super) const MAX_ATPROTO_SERVICE_TOKEN_LIFETIME: i64 = 3600;
 pub(super) const MAX_ATPROTO_EXCHANGE_TOKEN_TTL: u32 = 300;
 
 pub(super) struct VerifiedSubject {
     pub(super) sub: String,
     cnf_key_bytes: Option<[u8; 32]>,
+    /// RFC 9449 `cnf.jkt` sender-binding thumbprint on the subject token, when
+    /// present. A DPoP-bound access-token subject MUST be exchanged under a
+    /// token-endpoint proof from the **same** key (#1425 P1: the subject
+    /// token's sender constraint must be preserved, not re-bound to an
+    /// attacker's key).
+    cnf_jkt: Option<String>,
     iat: i64,
     /// Authority from a locally validated OAuth access-token grant. Identity
     /// tokens and generic JWTs do not carry a server-authorized OAuth grant.
@@ -200,6 +211,380 @@ pub async fn exchange_token_exchange(
     }
 }
 
+/// The canonical Hyprstream RPC service resource/audience the browser
+/// sender-bound exchange mints for: the AS origin (`issuer` without path).
+/// The browser presents the exchanged token back to RPC services on this
+/// origin, so the mint is restricted to exactly it (#1425 audience/resource
+/// restriction). Any caller-supplied `audience` MUST match this value —
+/// substitution is rejected as `invalid_target`.
+fn browser_exchange_audience(state: &OAuthState) -> String {
+    state.atproto_issuer_url()
+}
+
+/// POST /oauth/token — the **browser** RFC 8693 token-exchange grant composed
+/// with RFC 9449 DPoP (#1425).
+///
+/// This is the sender-bound contract the WASM `VfsShell` uses: it exchanges an
+/// atproto/external subject token for a short-lived at+jwt access token that is
+/// **bound to the browser's DPoP key** (`cnf.jkt`) and **audience-restricted**
+/// to the Hyprstream RPC service. It is distinct from the generic
+/// [`exchange_token_exchange`] (bearer, optional DPoP) and the UCAN grant path.
+///
+/// **Public client rule (RFC 9700):** `client_id` is the well-known public
+/// browser client ([`BROWSER_PUBLIC_CLIENT_ID`]) — it identifies the browser
+/// client and is **not a client secret and not a proof of identity**. There is
+/// no secret; the sender binding comes entirely from the verified DPoP proof.
+///
+/// **Sender binding (RFC 9449):** a fresh DPoP proof is **mandatory** at the
+/// token endpoint. The proof's method (`POST`), URI (`{issuer}/oauth/token`),
+/// `iat`, `jti` (single-use, replay-rejected), and server-issued nonce are all
+/// verified here; the proof key's `jkt` becomes the minted token's `cnf.jkt`,
+/// and the response carries `token_type: DPoP`. The resource layer
+/// (`auth.rs`) then refuses to accept the token as a plain Bearer and requires
+/// a matching proof + `ath` on every use, so the binding is enforced end to
+/// end — a stolen DPoP-bound token is unusable without the key.
+///
+/// **Audience/resource restriction:** the issued token targets
+/// [`browser_exchange_audience`] (the AS origin / RPC service resource). A
+/// caller-supplied `audience` that differs is rejected (`invalid_target`).
+///
+/// **Access-token only:** no refresh token is issued (RFC 8693 browser/public
+/// client rotation is a separately reviewed, metadata-advertised policy).
+///
+/// **Assurance boundary:** this composes Classical browser authentication
+/// (Ed25519/ES256 DPoP) with RFC 8693/9449. It does **not** claim `PqHybrid`
+/// identity assurance; hybrid RPC transport signing is independent of this
+/// Classical sender binding.
+pub(super) async fn exchange_browser_token_exchange(
+    state: &Arc<OAuthState>,
+    subject_token: &str,
+    subject_token_type: &str,
+    dpop_header: Option<&str>,
+    audience: Option<&str>,
+    resource: Option<&str>,
+    scope: Option<&str>,
+    requested_token_type: Option<&str>,
+    actor_token: Option<&str>,
+    actor_token_type: Option<&str>,
+    tenant: Option<&str>,
+    client_id: &str,
+) -> Response {
+    // Public client rule: the browser client_id is a public identifier. It is
+    // not authenticated here — there is no secret. The routing in `token.rs`
+    // only reaches this handler for the well-known browser client, so a
+    // mismatch is a contract violation, not an auth failure.
+    if client_id != BROWSER_PUBLIC_CLIENT_ID {
+        return tx_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "browser token-exchange requires the public browser client_id",
+        );
+    }
+
+    // ── P2: Explicitly reject RFC 8693 fields this contract does not support ──
+    // The browser exchange is a leaf path, not a general-purpose delegation
+    // flow. Fields that are silently ignored in the generic handler MUST be
+    // explicitly rejected here so there is no second, ambiguous interpretation.
+    if actor_token.is_some() {
+        return tx_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "actor_token (delegation) is not supported for browser token-exchange",
+        );
+    }
+    // #1425 r2 P2: `actor_token_type` is rejected independently of
+    // `actor_token` — a request naming the type but omitting the token (or
+    // sending only the type) must not be treated as if it carried no actor
+    // field at all. Checked here, before proof admission or subject-token
+    // consumption, so neither the DPoP replay registry nor the subject-token
+    // single-use registry is ever touched by a request this contract refuses.
+    if actor_token_type.is_some() {
+        return tx_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "actor_token_type is not supported for browser token-exchange",
+        );
+    }
+    if let Some(rtt) = requested_token_type {
+        if rtt != ISSUED_TOKEN_TYPE {
+            return tx_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_target",
+                "browser token-exchange issues access_token only",
+            );
+        }
+    }
+    if tenant.is_some() {
+        return tx_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "tenant is not a browser token-exchange parameter (authority is resolved from the subject token)",
+        );
+    }
+
+    // ── P2: Audience/resource restriction (#1425) ────────────────────────────
+    // Checked before DPoP verification and subject-token consumption so a
+    // malformed request fails fast. The browser token targets the Hyprstream
+    // RPC service resource (the canonical AS origin the metadata advertises).
+    // RFC 8707 `resource` and RFC 8693 `audience` both scope the issued token;
+    // for this contract they MUST both equal (or be omitted, defaulting to)
+    // the RPC service origin.
+    let rpc_resource = browser_exchange_audience(state);
+    for requested in [audience, resource].into_iter().flatten() {
+        if requested != rpc_resource {
+            return tx_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_target",
+                "browser exchange audience/resource must be the Hyprstream RPC service resource",
+            );
+        }
+    }
+
+    // ── 1. Mandatory DPoP proof (RFC 9449 sender binding) ───────────────────
+    let Some(proof_str) = dpop_header else {
+        return tx_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "browser token-exchange requires a DPoP proof (sender-binding)",
+        );
+    };
+    // The DPoP htu is the canonical token endpoint the AS advertises
+    // (`{origin}/oauth/token`), matching the browser's absolute request URI
+    // and the RFC 8414 `token_endpoint` value — not the possibly path-bearing
+    // configured `issuer_url`.
+    let token_endpoint = format!("{}/oauth/token", state.atproto_issuer_url());
+    let proof = match super::dpop::verify_dpop_proof(proof_str, "POST", &token_endpoint, None) {
+        Ok(p) => p,
+        Err(error) => {
+            tracing::warn!(%error, "browser exchange rejected invalid DPoP proof");
+            return tx_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_dpop_proof",
+                "DPoP proof verification failed",
+            );
+        }
+    };
+    // Single-use jti: a replayed proof is rejected (RFC 9449 §6.1).
+    let admission = state.check_and_record_dpop_jti_admission(&proof.jti, proof.iat);
+    if !admission.is_inserted() {
+        if admission == DpopJtiAdmission::Duplicate {
+            tracing::debug!("browser exchange: DPoP JTI replay rejected");
+        }
+        return tx_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_dpop_proof",
+            "DPoP proof rejected",
+        );
+    }
+    // Server-nonce policy (RFC 9449 §8): once a key has been issued a nonce,
+    // every subsequent proof MUST carry a valid server nonce. A bootstrap
+    // (first proof from this jkt) is accepted and a fresh nonce is issued in
+    // the success response.
+    let client_needs_nonce = state.dpop_client_requires_nonce(&proof.jkt).await;
+    let nonce_to_return: Option<String> = match (client_needs_nonce, proof.nonce.as_deref()) {
+        (true, None) => {
+            let fresh = state.issue_dpop_nonce().await;
+            state.mark_dpop_client_nonced(&proof.jkt).await;
+            tracing::warn!(jkt = %proof.jkt, "browser exchange: DPoP nonce required but omitted");
+            return dpop_nonce_tx_error(
+                &fresh,
+                "use_dpop_nonce",
+                "DPoP proof must include a server-issued nonce",
+            );
+        }
+        (_, Some(presented)) => {
+            if !state.verify_dpop_nonce(presented).await {
+                let fresh = state.issue_dpop_nonce().await;
+                state.mark_dpop_client_nonced(&proof.jkt).await;
+                tracing::warn!(jkt = %proof.jkt, "browser exchange: DPoP nonce invalid/expired");
+                return dpop_nonce_tx_error(
+                    &fresh,
+                    "use_dpop_nonce",
+                    "DPoP nonce invalid or expired",
+                );
+            }
+            None
+        }
+        (false, None) => {
+            // Bootstrap: accept; issue a fresh nonce on the success path.
+            Some(state.issue_dpop_nonce().await)
+        }
+    };
+
+    // ── 3. Verify the subject token ──────────────────────────────────────────
+    // P2: ID tokens are NOT accepted for the browser contract. `verify_id_token`
+    // validates no audience/client binding, so trusting an issuer alone is not
+    // sufficient to establish the token was minted for this browser client.
+    // The browser exchanges a `jwt` (atproto/external service assertion) or an
+    // `access_token` (subject to same-key cnf.jkt confirmation below).
+    let verified = match subject_token_type {
+        TOKEN_TYPE_ACCESS_TOKEN => verify_access_token(state, subject_token).await,
+        TOKEN_TYPE_JWT => verify_jwt(state, subject_token).await,
+        TOKEN_TYPE_ID_TOKEN => Err(
+            "id_token is not supported for browser token-exchange \
+             (no audience/client binding)"
+                .to_owned(),
+        ),
+        _ => Err(
+            "unsupported subject_token_type for browser exchange; \
+             supported: access_token, jwt"
+                .to_owned(),
+        ),
+    };
+    let verified = match verified {
+        Ok(v) => v,
+        Err(e) => return tx_error(StatusCode::UNAUTHORIZED, "invalid_grant", &e),
+    };
+
+    // ── 4. Scope + tenant + subject invariants (shared with the generic path) ──
+    let requested_scopes = match attenuate_exchange_scopes(&verified, scope) {
+        Ok(s) => s,
+        Err(description) => return tx_error(StatusCode::BAD_REQUEST, "invalid_scope", description),
+    };
+    let tenant = match exchange_tenant(&verified, None) {
+        Ok(t) => t,
+        Err(description) => return tx_error(StatusCode::BAD_REQUEST, "invalid_target", description),
+    };
+    // ── Subject-token sender-constraint preservation (#1425 P1) ──────────────
+    // A DPoP-bound subject access token (cnf.jkt present) MUST be exchanged
+    // under a token-endpoint proof from the **same** key. Without this check,
+    // a stolen sender-constrained token string can be re-bound to an
+    // attacker-owned key — defeating the source token's sender constraint.
+    // The one-use subject-token hash only makes this a race, not proof of
+    // possession. The check fires BEFORE the replay registry consumes the
+    // subject token so a mismatched key is rejected without burning it.
+    if let Some(ref subject_jkt) = verified.cnf_jkt {
+        if subject_jkt
+            .as_bytes()
+            .ct_eq(proof.jkt.as_bytes())
+            .unwrap_u8()
+            == 0
+        {
+            tracing::warn!(
+                sub = %verified.sub,
+                subject_cnf_jkt = %subject_jkt,
+                proof_jkt = %proof.jkt,
+                "browser exchange: DPoP proof key does not match the subject token's cnf.jkt"
+            );
+            return tx_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_dpop_proof",
+                "DPoP proof key must match the subject token's sender binding (cnf.jkt)",
+            );
+        }
+    }
+    if is_path_form_did_web(&verified.sub) {
+        return tx_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_grant",
+            "path-form did:web account subjects are frozen; \
+             host-form account minting is not available yet (#1159)",
+        );
+    }
+    let subject_identity = crate::server::middleware::AuthenticatedUser {
+        user: verified.sub.clone(),
+        verified_tenant: tenant.clone(),
+        token: None,
+        exp: None,
+    };
+    if subject_identity.authorization_domain().is_err() {
+        return tx_error(
+            StatusCode::UNAUTHORIZED,
+            "invalid_grant",
+            "subject token has no valid verified hosted-account tenant binding",
+        );
+    }
+    // Replay-protect the subject token exactly as the generic path does.
+    let fresh = if let Some((issuer, jti, exp)) = verified.atproto_replay.as_ref() {
+        state.check_and_record_atproto_service_jti(issuer, jti, *exp)
+    } else {
+        let token_hash = URL_SAFE_NO_PAD.encode(Sha256::digest(subject_token.as_bytes()));
+        state.check_and_record_dpop_jti(&token_hash, verified.iat)
+    };
+    if !fresh {
+        return tx_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_grant",
+            "subject_token already used (replay)",
+        );
+    }
+
+    let requested_scopes_ref = requested_scopes.as_deref().unwrap_or_default();
+    let output_issuer = state.issuer_for_scopes(requested_scopes_ref);
+
+    // ── 5. Mint the sender-bound (cnf.jkt) access token via PolicyService ────
+    // `dpop_jkt = proof.jkt` is the cnf.jkt binding. No refresh token is
+    // issued (access-token only; rotation is a separately reviewed policy).
+    let result = state
+        .policy_client
+        .issue_token(&IssueToken {
+            requested_scopes,
+            ttl: Some(state.token_ttl.min(verified.ttl_ceiling.unwrap_or(state.token_ttl))),
+            audience: Some(rpc_resource),
+            subject: Some(verified.sub.clone()),
+            user_pub_key: None,
+            dpop_jkt: Some(proof.jkt.clone()),
+            // RFC 8693 credentials cross a network boundary; never inherit the
+            // PolicyService's empty-issuer local-IPC profile.
+            issuer: Some(output_issuer),
+            tenant,
+            require_clearance: verified.require_clearance,
+        })
+        .await;
+
+    let token_info = match result {
+        Ok(ti) => ti,
+        Err(e) => {
+            tracing::error!(sub = %verified.sub, error = %e, "browser exchange issuance failed");
+            return tx_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "server_error",
+                "Failed to issue token",
+            );
+        }
+    };
+
+    // ── 6. DPoP response (access-token only) + fresh nonce for the next proof ─
+    let now = chrono::Utc::now().timestamp();
+    let expires_in = (token_info.expires_at - now).max(0);
+    // Mark this jkt as nonce-eligible so the next exchange/refresh proof from
+    // it is required to carry a server nonce.
+    state.mark_dpop_client_nonced(&proof.jkt).await;
+    let nonce = match nonce_to_return {
+        Some(n) => n,
+        None => state.issue_dpop_nonce().await,
+    };
+    tracing::info!(sub = %verified.sub, "Browser sender-bound token exchanged (cnf.jkt, DPoP)");
+    let mut resp = (
+        StatusCode::OK,
+        [
+            (header::CACHE_CONTROL, "no-store"),
+            (header::PRAGMA, "no-cache"),
+        ],
+        Json(serde_json::json!({
+            "access_token": token_info.token,
+            "issued_token_type": ISSUED_TOKEN_TYPE,
+            "token_type": "DPoP",
+            "expires_in": expires_in,
+        })),
+    )
+        .into_response();
+    if let Ok(val) = axum::http::HeaderValue::from_str(&nonce) {
+        resp.headers_mut().insert("DPoP-Nonce", val);
+    }
+    resp
+}
+
+/// Build a `400` OAuth error response that also carries a fresh `DPoP-Nonce`
+/// header (RFC 9449 §8 retry contract) for the browser exchange path.
+fn dpop_nonce_tx_error(nonce: &str, error: &str, description: &str) -> Response {
+    let mut resp = tx_error(StatusCode::BAD_REQUEST, error, description);
+    if let Ok(val) = axum::http::HeaderValue::from_str(nonce) {
+        resp.headers_mut().insert("DPoP-Nonce", val);
+    }
+    resp
+}
+
 /// Verify an OIDC ID token from a trusted issuer (CrossAppAccessProvider path).
 ///
 /// `aud` is not strictly enforced — ID tokens target the OIDC client_id, not our
@@ -240,6 +625,7 @@ async fn verify_id_token(state: &Arc<OAuthState>, token: &str) -> Result<Verifie
             .ok_or_else(|| "id_token subject is empty".to_owned())?
             .to_owned(),
         cnf_key_bytes: None, // ID tokens carry no key binding
+        cnf_jkt: None,
         iat: claims.iat,
         granted_scopes: None,
         verified_tenant: None,
@@ -261,9 +647,11 @@ async fn verify_access_token(state: &OAuthState, token: &str) -> Result<Verified
         .as_ref()
         .map(|_| claims.granted_scopes().map(str::to_owned).collect());
     let cnf_key_bytes = claims.cnf_key_bytes();
+    let cnf_jkt = claims.cnf_jkt().map(str::to_owned);
     Ok(VerifiedSubject {
         sub: claims.sub,
         cnf_key_bytes,
+        cnf_jkt,
         iat: claims.iat,
         granted_scopes,
         verified_tenant: claims.tenant,
@@ -340,6 +728,7 @@ async fn verify_jwt(state: &Arc<OAuthState>, token: &str) -> Result<VerifiedSubj
             .ok_or_else(|| "JWT subject is empty".to_owned())?
             .to_owned(),
         cnf_key_bytes,
+        cnf_jkt: claims.cnf_jkt().map(str::to_owned),
         iat: claims.iat,
         granted_scopes: None,
         verified_tenant: claims.tenant,
@@ -399,12 +788,14 @@ pub(super) async fn verify_atproto_service_jwt(
     if claims.exp <= now {
         return Err("ATProto service JWT is expired".to_owned());
     }
-    if claims.iat > now + 5 || claims.exp <= claims.iat {
+    if claims.iat > now.saturating_add(5) || claims.exp <= claims.iat {
         return Err("ATProto service JWT has an invalid iat/exp interval".to_owned());
     }
-    if claims.exp - claims.iat > MAX_ATPROTO_SERVICE_TOKEN_LIFETIME {
-        return Err("ATProto service JWT lifetime exceeds one hour".to_owned());
-    }
+    let _lifetime = claims
+        .exp
+        .checked_sub(claims.iat)
+        .filter(|lifetime| *lifetime > 0 && *lifetime <= MAX_ATPROTO_SERVICE_TOKEN_LIFETIME)
+        .ok_or_else(|| "ATProto service JWT has an invalid iat/exp interval".to_owned())?;
     if claims.jti.is_empty() || claims.jti.len() > 256 {
         return Err("ATProto service JWT jti must be 1..=256 bytes".to_owned());
     }
@@ -454,6 +845,7 @@ pub(super) async fn verify_atproto_service_jwt(
     Ok(VerifiedSubject {
         sub: claims.iss.clone(),
         cnf_key_bytes: None,
+        cnf_jkt: None,
         iat: claims.iat,
         granted_scopes: Some(vec!["transition:generic".to_owned()]),
         verified_tenant,
@@ -1565,6 +1957,7 @@ mod tests {
         let local_subject = VerifiedSubject {
             sub: "did:plc:abcdefghijklmnqrstuvwx2p".to_owned(),
             cnf_key_bytes: None,
+            cnf_jkt: None,
             iat: 1,
             granted_scopes: None,
             verified_tenant: Some("tenant-source".to_owned()),
@@ -1587,6 +1980,7 @@ mod tests {
         let external_enrolled_subject = VerifiedSubject {
             sub: "did:plc:externalenrolledsubject".to_owned(),
             cnf_key_bytes: None,
+            cnf_jkt: None,
             iat: 1,
             granted_scopes: Some(vec!["transition:generic".to_owned()]),
             verified_tenant: None,

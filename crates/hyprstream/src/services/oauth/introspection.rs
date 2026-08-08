@@ -93,22 +93,26 @@ async fn introspect_refresh(
 ) -> Response {
     match state.get_refresh_token(token).await {
         Ok(Some(entry)) => {
-            let tenant = super::token::resolve_hosted_account_binding(
-                state,
-                &entry.username,
-            )
-                .await
-                .ok()
-                .map(|(_, tenant)| tenant);
-            if !caller_may_introspect_tenant(caller, tenant.as_deref()) {
+            let (hosted_did, tenant) =
+                match super::token::resolve_hosted_account_binding(state, &entry.username).await {
+                    Ok(binding) => binding,
+                    Err(error) => {
+                        tracing::warn!(
+                            username = %entry.username,
+                            %error,
+                            "refresh-token introspection failed closed on account binding lookup"
+                        );
+                        return inactive_response();
+                    }
+                };
+            if !caller_may_introspect_tenant(caller, Some(&tenant)) {
                 return inactive_response();
             }
 
             // Match the mint boundary: generic tokens retain the username,
             // while active atproto-profile tokens report the mapped DID.
             let sub = if super::state::atproto_profile_active(&entry.scopes) {
-                state.check_atproto_account_eligibility(&entry.username).await
-                    .unwrap_or_else(|_| entry.username.clone())
+                hosted_did
             } else {
                 entry.username.clone()
             };

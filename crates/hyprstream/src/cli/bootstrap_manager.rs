@@ -17,7 +17,7 @@ use hyprstream_tui::wizard::backend::*;
 
 use crate::auth::identity_store;
 use crate::auth::policy_templates::{get_template, get_templates};
-use crate::auth::{RocksDbUserStore, PolicyManager};
+use crate::auth::{PolicyManager, ProductionUserStore};
 use crate::cli::gpu_detect;
 use crate::cli::policy_handlers::{
     load_or_generate_signing_key, mint_local_token, parse_duration,
@@ -168,7 +168,10 @@ impl BootstrapManager {
                 return;
             }
         };
-        let store = match RocksDbUserStore::open(&credentials_dir) {
+        let store = match self
+            .rt
+            .block_on(ProductionUserStore::open(&credentials_dir))
+        {
             Ok(s) => s,
             Err(e) => {
                 tracing::warn!(
@@ -196,7 +199,7 @@ impl BootstrapManager {
         // envelope traffic.
         let policy = hyprstream_rpc::envelope::mandatory_envelope_policy();
         match self.rt.block_on(
-            enroll_user(&store, &secrets_dir, username, EnrollKeySource::Generate, policy),
+            enroll_user(&*store, &secrets_dir, username, EnrollKeySource::Generate, policy),
         ) {
             Ok(outcome) => {
                 // Surface enrollment notices (e.g. the classical-downgrade
@@ -716,46 +719,15 @@ async fn do_bootstrap(
         // Generate independent keypairs for each registered service
         use hyprstream_service::list_factories;
 
-        let mut bootstrap_pubkeys = std::collections::HashMap::new();
-        let now = chrono::Utc::now().timestamp();
-
-        for factory in list_factories() {
-            let service_name = factory.name;
-
-            // PolicyService's identity IS the root/CA key: unlike every other
-            // service it has no independent per-service keypair, so it resolves
-            // to `root_key` rather than `load_or_generate_service_signing_key`
-            // (which would read/generate a divergent `policy/signing-key`).
-            //
-            // But it is NOT skipped: we still mint a CA-signed `service:policy`
-            // JWT — self-signed in the sense that the CA JWT key signs it, with
-            // `cnf` binding the root verifying key — and persist it to
-            // `policy/service-jwt`. That makes PolicyService symmetric with
-            // every other service and keeps the trust store (which records
-            // `root_key.verifying_key()` for "policy") in lockstep with the
-            // on-disk JWT, so a later `service repair`/reinstall can no longer
-            // leave a stale `policy` key/JWT pair that disagrees with the
-            // current CA key (#448). It also enables future per-service
-            // rotation of the policy credential.
-            let service_key = if service_name == "policy" {
-                root_key.clone()
-            } else {
-                identity_store::load_or_generate_service_signing_key(
-                    &credentials_dir, service_name,
-                )?
-            };
-            let service_vk = service_key.verifying_key();
-
-            let jwt = crate::auth::service_jwt::issue_or_load_service_jwt(
-                &credentials_dir, service_name, &ca_jwt_key, &service_vk, &local_issuer_url, now,
-            )?;
-            identity_store::write_service_jwt(&credentials_dir, service_name, &jwt)?;
-
-            bootstrap_pubkeys.insert(service_name.to_owned(), service_vk);
-        }
-
-        // Write bootstrap pubkeys for all services
-        identity_store::write_bootstrap_pubkeys(&credentials_dir, &bootstrap_pubkeys)?;
+        let service_names: Vec<&str> = list_factories().map(|f| f.name).collect();
+        let bootstrap_pubkeys = provision_service_identities(
+            &credentials_dir,
+            &root_key,
+            &ca_jwt_key,
+            &local_issuer_url,
+            &service_names,
+            chrono::Utc::now().timestamp(),
+        )?;
 
         tracing::info!(
             "Generated service keypairs + JWTs for {} services",
@@ -772,12 +744,140 @@ async fn do_bootstrap(
     Ok(())
 }
 
+/// Provision one identity per named service: an Ed25519 signing key, a CA-signed
+/// service JWT, and the `bootstrap-pubkeys` entry that publishes the key.
+///
+/// Every entry written here is hybrid (Ed25519 + a derived ML-DSA-65 key). There
+/// is no classical provisioning mode and no flag to request one: the derived
+/// post-quantum key is what the service's own signer signs with, so publishing
+/// it is what makes the service verifiable at all. Re-running is idempotent —
+/// existing per-service keys and JWTs are loaded rather than replaced, so the
+/// entries it rewrites describe the same identities.
+fn provision_service_identities(
+    credentials_dir: &std::path::Path,
+    root_key: &ed25519_dalek::SigningKey,
+    ca_jwt_key: &ed25519_dalek::SigningKey,
+    local_issuer_url: &str,
+    service_names: &[&str],
+    now: i64,
+) -> anyhow::Result<std::collections::HashMap<String, identity_store::BootstrapPubkey>> {
+    let mut bootstrap_pubkeys = std::collections::HashMap::new();
+
+    for service_name in service_names {
+        let service_name = *service_name;
+
+        // PolicyService's identity IS the root/CA key: unlike every other
+        // service it has no independent per-service keypair, so it resolves
+        // to `root_key` rather than `load_or_generate_service_signing_key`
+        // (which would read/generate a divergent `policy/signing-key`).
+        //
+        // But it is NOT skipped: we still mint a CA-signed `service:policy`
+        // JWT — self-signed in the sense that the CA JWT key signs it, with
+        // `cnf` binding the root verifying key — and persist it to
+        // `policy/service-jwt`. That makes PolicyService symmetric with
+        // every other service and keeps the trust store (which records
+        // `root_key.verifying_key()` for "policy") in lockstep with the
+        // on-disk JWT, so a later `service repair`/reinstall can no longer
+        // leave a stale `policy` key/JWT pair that disagrees with the
+        // current CA key (#448). It also enables future per-service
+        // rotation of the policy credential.
+        let service_key = if service_name == "policy" {
+            root_key.clone()
+        } else {
+            identity_store::load_or_generate_service_signing_key(credentials_dir, service_name)?
+        };
+        let service_vk = service_key.verifying_key();
+
+        let jwt = crate::auth::service_jwt::issue_or_load_service_jwt(
+            credentials_dir, service_name, ca_jwt_key, &service_vk, local_issuer_url, now,
+        )?;
+        identity_store::write_service_jwt(credentials_dir, service_name, &jwt)?;
+
+        // The hybrid entry: the Ed25519 identity plus the ML-DSA-65 key derived
+        // from it. This is what `seed_bootstrap_pq_bindings` later anchors, and
+        // what turns post-quantum enforcement on for this service.
+        bootstrap_pubkeys.insert(
+            service_name.to_owned(),
+            identity_store::BootstrapPubkey::for_service_key(&service_key)?,
+        );
+    }
+
+    identity_store::write_bootstrap_pubkeys_hybrid(credentials_dir, &bootstrap_pubkeys)?;
+
+    Ok(bootstrap_pubkeys)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::auth::{RocksDbUserStore, UserStore};
     use crate::cli::enroll::bind_user_signing_key;
     use tempfile::TempDir;
+
+    /// A fresh provisioning run writes a hybrid entry for EVERY service, and
+    /// those entries anchor into the post-quantum trust store.
+    ///
+    /// There is no classical provisioning mode to compare against — this is the
+    /// only path, so the assertion is that it has no classical output at all.
+    #[test]
+    fn provisioning_writes_hybrid_entries_that_anchor_for_every_service() -> anyhow::Result<()> {
+        use ed25519_dalek::SigningKey;
+        use hyprstream_rpc::envelope::{KeyedPqTrustStore, PqTrustStore};
+
+        let creds = TempDir::new()?;
+        let root_key = SigningKey::generate(&mut rand::rngs::OsRng);
+        let ca_jwt_key =
+            hyprstream_rpc::node_identity::derive_purpose_key(&root_key, "hyprstream-jwt-v1");
+        let services = ["policy", "discovery", "inference", "storage"];
+
+        let provisioned = provision_service_identities(
+            creds.path(),
+            &root_key,
+            &ca_jwt_key,
+            "https://node.invalid",
+            &services,
+            1_700_000_000,
+        )?;
+
+        assert_eq!(provisioned.len(), services.len());
+        for name in services {
+            let entry = provisioned
+                .get(name)
+                .unwrap_or_else(|| panic!("no bootstrap entry provisioned for '{name}'"));
+            assert!(entry.is_hybrid(), "service '{name}' was provisioned classical");
+        }
+
+        // What landed on disk is hybrid too, and passes the strict check.
+        let on_disk = identity_store::load_bootstrap_pubkeys_hybrid(creds.path())?;
+        assert_eq!(on_disk.len(), services.len());
+        identity_store::ensure_bootstrap_pubkeys_hybrid(&on_disk)?;
+
+        // Every provisioned service anchors into the PQ trust store.
+        let mut store = KeyedPqTrustStore::new();
+        let anchored =
+            crate::auth::mesh_trust::seed_bootstrap_pq_bindings(&mut store, creds.path());
+        assert_eq!(anchored, services.len(), "every service must anchor");
+        for name in services {
+            let entry = &on_disk[name];
+            assert!(
+                store.ml_dsa_key_for(&entry.ed25519.to_bytes()).is_some(),
+                "service '{name}' is not anchored in the PQ trust store"
+            );
+        }
+
+        // The anchored ML-DSA key is the one the service's signer signs with.
+        let policy_pq = store
+            .ml_dsa_key_for(&root_key.verifying_key().to_bytes())
+            .ok_or_else(|| anyhow::anyhow!("policy identity not anchored"))?;
+        let msg = b"anchored-key round trip";
+        let sig = hyprstream_rpc::crypto::pq::ml_dsa_sign(
+            &hyprstream_rpc::node_identity::derive_mesh_mldsa_key(&root_key),
+            msg,
+        );
+        hyprstream_rpc::crypto::pq::ml_dsa_verify(&policy_pq, msg, &sig)?;
+
+        Ok(())
+    }
 
     /// Replicates the register + bind sequence performed by
     /// `register_local_identity` against a temp store/secrets dir, then asserts

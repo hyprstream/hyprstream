@@ -27,15 +27,15 @@ HyprStream is the runtime for AI that gets smarter the more you use it: a Plan 9
 ```bash
 export LIBTORCH=/path/to/libtorch
 export LD_LIBRARY_PATH=$LIBTORCH/lib:$LD_LIBRARY_PATH
-cargo build --release                    # Standard (includes xet, gittorrent, systemd, otel, kata-vm)
+cargo build --release                    # Standard (includes encrypted credential/PDS, xet, gittorrent, systemd, otel, kata-vm)
 cargo build --features cuda --release    # CUDA marker (backend from tch-rs/libtorch)
 cargo build --features bnb --release     # bitsandbytes quantization
 cargo build --features overlayfs --release
-cargo build --no-default-features --features "gittorrent,xet,otel" --release  # No systemd/kata
+cargo build --no-default-features --features "gittorrent,xet,otel,credential-pds" --release  # No systemd/kata; encrypted credentials remain mandatory
 cargo test --workspace --release
 ```
 
-**Feature flags**: `default = [gittorrent, xet, systemd, otel, kata-vm]`, `cuda` (empty marker), `bnb`, `valkey` (Valkey/Redis user+token stores), `overlayfs`, `oci-image` (RAFS ImageFs), `kata-vm` (implies `oci-image`), `download-libtorch`, `experimental`, `pq-hybrid` (NO-OP alias — PQ primitives always compiled, Classical/Hybrid selected at runtime)
+**Feature flags**: `default = [gittorrent, xet, systemd, otel, kata-vm, nspawn, credential-pds]`, `credential-pds` (mandatory encrypted production UserStore profile; implies `pglite`), `cuda` (empty marker), `bnb`, `valkey` (Valkey/Redis user+token stores), `overlayfs`, `oci-image` (RAFS ImageFs), `kata-vm` (implies `oci-image`), `download-libtorch`, `experimental`, `pq-hybrid` (NO-OP alias — PQ primitives always compiled, Classical/Hybrid selected at runtime)
 **Backend**: CPU/CUDA/ROCm controlled by tch-rs dependency (fork: github.com/hyprstream/tch-rs branch: hip), NOT cargo features
 
 ## Working Tree & Worktrees (multi-agent safety)
@@ -56,7 +56,7 @@ Multiple agents may share the one checkout at the repo root. That checkout has a
 
 | Crate | Purpose |
 |-------|---------|
-| `hyprstream` | Main app: runtime, storage, git, training, API, services, CLI, native MAC (MIT OR AGPL-3.0) |
+| `hyprstream` | Apache-2.0 main app: runtime, storage, git, training, API, services, CLI, native MAC; its combined distribution currently carries AGPL obligations through `hyprstream-flight` |
 | `git2db` | Git repository management library (has own CLAUDE.md) |
 | `git-xet-filter` | XET/LFS large file storage (libgit2 filter) |
 | `gittorrent` | P2P model distribution |
@@ -275,5 +275,15 @@ See: `README.md`, `DEVELOP.md`, `CONTRIBUTING.md`, `crates/git2db/CLAUDE.md`, `d
 
 ## Licensing
 
-- **hyprstream**: MIT OR AGPL-3.0 (user's choice)
-- **All other crates**: MIT
+- **MIT**: exactly `bitsandbytes-sys`, `cas-serve`, and `git-xet-filter`.
+- **AGPL-3.0-only**: exactly `hyprstream-flight`, `hyprstream-metrics`,
+  `hyprstream-vfs-server`, and `hyprstream-workers`.
+- **Apache-2.0**: every other local Cargo package, including `hyprstream`.
+
+Those are source-package declarations, not a waiver of combined-distribution
+obligations. The Apache-declared `hyprstream` application currently aggregates
+the AGPL-declared `hyprstream-flight` package, so a combined distribution must
+satisfy the applicable AGPL terms. The exhaustive owner map, the one declared
+aggregator, and the reusable permissive-only roots are enforced by
+`.github/license-boundary.toml`; reusable roots must have no Cargo-resolved path
+to any local AGPL package.

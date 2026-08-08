@@ -10,12 +10,15 @@ use base64::Engine;
 use crate::auth::user_store::UserStore;
 
 /// Error types for Ed25519 challenge-response verification.
+#[derive(Debug)]
 #[allow(dead_code)]
 pub(super) enum ChallengeError {
     /// Username contains ':', which would make the challenge string ambiguous.
     InvalidUsername,
     /// Fingerprint string is malformed (empty, contains ':' delimiter conflict, etc.).
     InvalidFingerprint,
+    /// Presented public key is not a canonical supported Ed25519 encoding.
+    InvalidPublicKey,
     /// Signature is not valid base64.
     InvalidSignatureEncoding,
     /// Signature is not exactly 64 bytes (88 base64 chars).
@@ -39,6 +42,8 @@ impl ChallengeError {
             ChallengeError::InvalidUsername => "Username must not contain ':'",
             ChallengeError::InvalidFingerprint =>
                 "Invalid key fingerprint format. Expected `SHA256:...` from `hyprstream sign-challenge`.",
+            ChallengeError::InvalidPublicKey =>
+                "Invalid account public key (expected base64 Ed25519 key bytes).",
             ChallengeError::InvalidSignatureEncoding =>
                 "Invalid signature encoding (expected base64).",
             ChallengeError::InvalidSignatureLength =>
@@ -55,6 +60,36 @@ impl ChallengeError {
                 "Invalid signature. Ensure you signed the correct challenge string.",
         }
     }
+}
+
+/// Verify proof-of-possession for a not-yet-registered vault key.
+///
+/// Unlike normal authorize, signup cannot resolve the key from a reverse
+/// index. The caller presents the public key; this function derives its
+/// canonical fingerprint, requires the submitted fingerprint to match, and
+/// verifies the domain-separated signup challenge before any account mutation.
+pub(super) fn verify_unregistered_ed25519_response(
+    public_key_b64: &str,
+    fingerprint: &str,
+    challenge: &[u8],
+    sig_b64: &str,
+) -> Result<ed25519_dalek::VerifyingKey, ChallengeError> {
+    let verifying_key = crate::auth::decode_pubkey_base64(public_key_b64)
+        .map_err(|_| ChallengeError::InvalidPublicKey)?;
+    if crate::auth::pubkey_fingerprint(&verifying_key) != fingerprint {
+        return Err(ChallengeError::InvalidFingerprint);
+    }
+    let sig_bytes = STANDARD
+        .decode(sig_b64)
+        .map_err(|_| ChallengeError::InvalidSignatureEncoding)?;
+    let sig_array: [u8; 64] = sig_bytes
+        .try_into()
+        .map_err(|_| ChallengeError::InvalidSignatureLength)?;
+    let signature = ed25519_dalek::Signature::from_bytes(&sig_array);
+    verifying_key
+        .verify_strict(challenge, &signature)
+        .map_err(|_| ChallengeError::SignatureInvalid)?;
+    Ok(verifying_key)
 }
 
 /// Verify an Ed25519 challenge-response.
@@ -78,16 +113,20 @@ pub(super) async fn verify_ed25519_response(
         return Err(ChallengeError::InvalidUsername);
     }
 
-    let sig_bytes = STANDARD.decode(sig_b64)
+    let sig_bytes = STANDARD
+        .decode(sig_b64)
         .map_err(|_| ChallengeError::InvalidSignatureEncoding)?;
 
-    let sig_array: [u8; 64] = sig_bytes.try_into()
+    let sig_array: [u8; 64] = sig_bytes
+        .try_into()
         .map_err(|_| ChallengeError::InvalidSignatureLength)?;
 
     let signature = ed25519_dalek::Signature::from_bytes(&sig_array);
 
     // Get all pubkeys for the user and try each one
-    let pubkeys = user_store.list_pubkeys(username).await
+    let pubkeys = user_store
+        .list_pubkeys(username)
+        .await
         .map_err(ChallengeError::UserStoreError)?;
 
     if pubkeys.is_empty() {
@@ -96,7 +135,11 @@ pub(super) async fn verify_ed25519_response(
 
     // Try to verify against each registered pubkey
     for entry in &pubkeys {
-        if entry.pubkey.verify_strict(challenge.as_bytes(), &signature).is_ok() {
+        if entry
+            .pubkey
+            .verify_strict(challenge.as_bytes(), &signature)
+            .is_ok()
+        {
             // Optionally touch the pubkey to update last_used_at
             let _ = user_store.touch_pubkey(username, &entry.fingerprint).await;
             return Ok(entry.pubkey);
@@ -130,26 +173,36 @@ pub(super) async fn verify_ed25519_response_by_fingerprint(
         return Err(ChallengeError::InvalidFingerprint);
     }
 
-    let sig_bytes = STANDARD.decode(sig_b64)
+    let sig_bytes = STANDARD
+        .decode(sig_b64)
         .map_err(|_| ChallengeError::InvalidSignatureEncoding)?;
-    let sig_array: [u8; 64] = sig_bytes.try_into()
+    let sig_array: [u8; 64] = sig_bytes
+        .try_into()
         .map_err(|_| ChallengeError::InvalidSignatureLength)?;
     let signature = ed25519_dalek::Signature::from_bytes(&sig_array);
 
-    let Some(username) = user_store.get_pubkey_user(fingerprint).await
+    let Some(username) = user_store
+        .get_pubkey_user(fingerprint)
+        .await
         .map_err(ChallengeError::UserStoreError)?
     else {
         return Err(ChallengeError::UnknownFingerprint);
     };
 
-    let pubkeys = user_store.list_pubkeys(&username).await
+    let pubkeys = user_store
+        .list_pubkeys(&username)
+        .await
         .map_err(ChallengeError::UserStoreError)?;
     let Some(entry) = pubkeys.into_iter().find(|e| e.fingerprint == fingerprint) else {
         // Reverse index pointed at this user but the key is gone — treat as unknown.
         return Err(ChallengeError::UnknownFingerprint);
     };
 
-    if entry.pubkey.verify_strict(challenge.as_bytes(), &signature).is_err() {
+    if entry
+        .pubkey
+        .verify_strict(challenge.as_bytes(), &signature)
+        .is_err()
+    {
         return Err(ChallengeError::SignatureInvalid);
     }
 
@@ -164,4 +217,44 @@ pub(crate) fn html_escape(s: &str) -> String {
         .replace('>', "&gt;")
         .replace('"', "&quot;")
         .replace('\'', "&#x27;")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ed25519_dalek::Signer as _;
+
+    #[test]
+    fn unregistered_key_proof_requires_matching_key_fingerprint_and_signature() {
+        let key = ed25519_dalek::SigningKey::from_bytes(&[0x31; 32]);
+        let public_key = STANDARD.encode(key.verifying_key().as_bytes());
+        let fingerprint = crate::auth::pubkey_fingerprint(&key.verifying_key());
+        let challenge = b"hyprstream-cold-signup-v1\0alice\0fingerprint\0nonce\0pkce\0";
+        let signature = STANDARD.encode(key.sign(challenge).to_bytes());
+
+        let Ok(verified) =
+            verify_unregistered_ed25519_response(&public_key, &fingerprint, challenge, &signature)
+        else {
+            panic!("valid signup proof must verify");
+        };
+        assert_eq!(verified, key.verifying_key());
+        assert!(matches!(
+            verify_unregistered_ed25519_response(
+                &public_key,
+                "SHA256:not-the-presented-key",
+                challenge,
+                &signature,
+            ),
+            Err(ChallengeError::InvalidFingerprint)
+        ));
+        assert!(matches!(
+            verify_unregistered_ed25519_response(
+                &public_key,
+                &fingerprint,
+                b"tampered",
+                &signature,
+            ),
+            Err(ChallengeError::SignatureInvalid)
+        ));
+    }
 }

@@ -2,7 +2,7 @@
 # Multi-variant build for Hyprstream supporting CPU, CUDA, and ROCm
 
 ARG VARIANT=cpu
-ARG DEBIAN_VERSION=bookworm
+ARG DEBIAN_VERSION=trixie
 ARG LIBTORCH_VERSION=2.10.0
 
 # LibTorch download URLs for manual installation
@@ -11,16 +11,29 @@ ARG LIBTORCH_CUDA130_URL=https://download.pytorch.org/libtorch/cu130/libtorch-sh
 ARG LIBTORCH_ROCM_URL=https://download.pytorch.org/libtorch/rocm7.1/libtorch-shared-with-deps-${LIBTORCH_VERSION}%2Brocm7.1.zip
 ARG LIBTORCH_CPU_URL=https://download.pytorch.org/libtorch/cpu/libtorch-shared-with-deps-${LIBTORCH_VERSION}%2Bcpu.zip
 
+# Runtime base for every variant, pinned by multi-arch index digest so amd64 and
+# arm64 resolve from one immutable reference. This image ships no package
+# manager, runs as an unprivileged user, and provides glibc, libstdc++, libgcc,
+# libz, and a shell; only OpenSSL has to be carried over from the builder (see
+# the runtime stages). Bump by replacing the digest, never by moving to a tag.
+ARG RUNTIME_BASE=registry.access.redhat.com/hi/core-runtime@sha256:80bd4bd4e74c8ab4e372cf355b335dbd30d91e9e5669822283299e65c64788e2
+
+# Unprivileged runtime account provided by the runtime base. Declared here so
+# the USER instruction and any future ownership rules share one source.
+ARG RUNTIME_UID=65532
+ARG RUNTIME_GID=65532
+
 #############################################
 # Base Builder - Common for all variants
 #############################################
 
 FROM debian:${DEBIAN_VERSION} AS builder-base
 
-# Install build dependencies
-# Note: binutils from backports required for OpenSSL AVX-512 assembly compatibility
-RUN echo "deb http://deb.debian.org/debian bookworm-backports main" >> /etc/apt/sources.list && \
-    apt-get update && apt-get install -y \
+# Install build dependencies. The former backports binutils workaround was for
+# x86 OpenSSL AVX-512 assembly and was never relevant to the native arm64
+# builder image. Trixie's stock binutils is current, so no suite-specific
+# backports source or pin is required for any builder variant.
+RUN apt-get update && apt-get install -y \
     curl \
     wget \
     unzip \
@@ -36,7 +49,6 @@ RUN echo "deb http://deb.debian.org/debian bookworm-backports main" >> /etc/apt/
     cmake \
     clang \
     libclang-dev \
-    && apt-get install -y -t bookworm-backports binutils \
     && rm -rf /var/lib/apt/lists/* \
     && apt-get clean
 
@@ -53,13 +65,46 @@ ENV SCCACHE_DIR=/sccache
 # CUDA 12.8 Builder
 #############################################
 
-FROM builder-base AS builder-cuda128
+# NVIDIA publishes the supported CUDA 12.8 and 13.0 APT packages only in its
+# Debian 12 repository. That repository's legacy key binding is rejected by
+# Trixie's sqv, so keep these x86 CUDA *toolchain* stages on Bookworm. Their
+# final runtime stages below are Debian 13; copying Bookworm libraries into a
+# newer glibc runtime is ABI-safe. The arm64 builder and all Trixie-built
+# binaries continue to use the Debian 13 runtime floor.
+FROM debian:bookworm AS builder-cuda-base
+
+RUN apt-get update && apt-get install -y \
+    curl \
+    wget \
+    unzip \
+    build-essential \
+    pkg-config \
+    libssl-dev \
+    libsystemd-dev \
+    git \
+    dialog \
+    rsync \
+    ca-certificates \
+    capnproto \
+    cmake \
+    clang \
+    libclang-dev \
+    && rm -rf /var/lib/apt/lists/* \
+    && apt-get clean
+
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+ENV PATH="/root/.cargo/bin:${PATH}"
+RUN cargo install sccache --locked
+ENV RUSTC_WRAPPER=sccache
+ENV SCCACHE_DIR=/sccache
+
+FROM builder-cuda-base AS builder-cuda128
 ARG LIBTORCH_CUDA128_URL
 ARG LIBTORCH_VERSION
 
 ENV LIBTORCH_BYPASS_VERSION_CHECK=1
 
-# Install CUDA repository and runtime libraries (needed for linking)
+# Install CUDA runtime libraries from NVIDIA's matching Debian 12 repository.
 RUN wget https://developer.download.nvidia.com/compute/cuda/repos/debian12/x86_64/cuda-keyring_1.1-1_all.deb && \
     dpkg -i cuda-keyring_1.1-1_all.deb && \
     rm cuda-keyring_1.1-1_all.deb && \
@@ -83,13 +128,13 @@ ENV LD_LIBRARY_PATH=/opt/libtorch/lib
 # CUDA 13.0 Builder
 #############################################
 
-FROM builder-base AS builder-cuda130
+FROM builder-cuda-base AS builder-cuda130
 ARG LIBTORCH_CUDA130_URL
 ARG LIBTORCH_VERSION
 
 ENV LIBTORCH_BYPASS_VERSION_CHECK=1
 
-# Install CUDA repository and runtime libraries (needed for linking)
+# Install CUDA runtime libraries from NVIDIA's matching Debian 12 repository.
 RUN wget https://developer.download.nvidia.com/compute/cuda/repos/debian12/x86_64/cuda-keyring_1.1-1_all.deb && \
     dpkg -i cuda-keyring_1.1-1_all.deb && \
     rm cuda-keyring_1.1-1_all.deb && \
@@ -157,8 +202,8 @@ ENV LD_LIBRARY_PATH=/opt/libtorch/lib
 # There is NO aarch64 libtorch zip at download.pytorch.org/libtorch/cpu — that
 # URL is x86_64-only. The PyTorch aarch64 manylinux_2_28 pip wheel, however,
 # bundles a complete CPU libtorch (torch/lib/*.so + torch/include), so we install
-# torch via pip and point LIBTORCH at the wheel's torch dir. bookworm ships
-# glibc 2.36, satisfying the wheel's manylinux_2_28 (glibc 2.28+) floor.
+# torch via pip and point LIBTORCH at the wheel's torch dir. Trixie ships a
+# newer glibc than the wheel's manylinux_2_28 (glibc 2.28+) floor.
 #
 # This stage is the toolchain+libtorch image only; the actual cargo build runs
 # either in the `builder` stage below (VARIANT=cpu-arm64) or by mounting the
@@ -171,7 +216,7 @@ ARG LIBTORCH_VERSION
 # wheel reports the same 2.10.0 but bypass keeps us resilient to wheel-suffix skew.
 ENV LIBTORCH_BYPASS_VERSION_CHECK=1
 
-# Python + pip to fetch the aarch64 torch wheel (bookworm python3 == 3.11 -> cp311).
+# Python + pip to fetch the aarch64 torch wheel.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         python3 python3-pip \
     && rm -rf /var/lib/apt/lists/* \
@@ -272,7 +317,8 @@ ENV LD_LIBRARY_PATH=/opt/libtorch/lib
 # Build the project with BuildKit cache mounts for Cargo registry and sccache
 # LIBTORCH is already set in the variant-specific builder stages
 # We do NOT use LIBTORCH_USE_PYTORCH since we're using manual downloads
-# Note: --no-default-features excludes systemd (not needed in containers)
+# Note: --no-default-features excludes systemd (not needed in containers).
+# credential-pds is mandatory for the production encrypted UserStore boundary.
 # Cache mounts:
 #   - /root/.cargo/registry: Cargo crate registry
 #   - /root/.cargo/git: Git dependencies
@@ -281,25 +327,39 @@ RUN --mount=type=cache,target=/root/.cargo/registry \
     --mount=type=cache,target=/root/.cargo/git \
     --mount=type=cache,target=/sccache \
     --mount=type=cache,target=/build/target,sharing=locked \
-    OPENSSL_NO_VENDOR=1 cargo build --locked --release --no-default-features --features otel,gittorrent,xet \
+    OPENSSL_NO_VENDOR=1 cargo build -p hyprstream --bin hyprstream --locked --release --no-default-features --features otel,gittorrent,xet,credential-pds \
     && mkdir -p /out \
     && cp /build/target/release/hyprstream /out/hyprstream
 
 #############################################
-# Runtime Stage Selection (Distroless)
+# Runtime Stage Selection
 #############################################
+#
+# The runtime base is a package-manager-free image whose default account is
+# unprivileged. Its library search path is /usr/lib64, NOT the Debian multiarch
+# directories the builder uses, so every system-library COPY lands in /usr/lib64
+# regardless of the builder's source path. The builder stays Debian-based: the
+# binary it produces requires no glibc/libstdc++ symbol newer than the runtime
+# base provides, and its ELF interpreter resolves through the base's /lib
+# symlink.
+#
+# Only OpenSSL genuinely has to be carried over — the runtime base supplies
+# libc, libm, libdl, libpthread, librt, libstdc++, libgcc_s, and libz. libgomp
+# and libz are copied anyway so the runtime keeps the exact implementations the
+# LibTorch build was validated against rather than silently adopting the base
+# image's; LD_LIBRARY_PATH puts LibTorch's own bundled copies first in any case.
 
 #############################################
 # CUDA 12.8 Runtime
 #############################################
 
-FROM gcr.io/distroless/cc-debian12 AS runtime-cuda128
+FROM ${RUNTIME_BASE} AS runtime-cuda128
 
 # Copy required system libraries
-COPY --from=builder /usr/lib/x86_64-linux-gnu/libgomp.so.1 /usr/lib/x86_64-linux-gnu/
-COPY --from=builder /usr/lib/x86_64-linux-gnu/libz.so.1 /usr/lib/x86_64-linux-gnu/
-COPY --from=builder /usr/lib/x86_64-linux-gnu/libssl.so* /usr/lib/x86_64-linux-gnu/
-COPY --from=builder /usr/lib/x86_64-linux-gnu/libcrypto.so* /usr/lib/x86_64-linux-gnu/
+COPY --from=builder /usr/lib/x86_64-linux-gnu/libgomp.so.1 /usr/lib64/
+COPY --from=builder /usr/lib/x86_64-linux-gnu/libz.so.1 /usr/lib64/
+COPY --from=builder /usr/lib/x86_64-linux-gnu/libssl.so* /usr/lib64/
+COPY --from=builder /usr/lib/x86_64-linux-gnu/libcrypto.so* /usr/lib64/
 
 # Copy CUDA runtime libraries from builder (toolkit includes runtime)
 COPY --from=builder /usr/local/cuda-12.8/lib64/libcudart.so* /usr/local/cuda/lib64/
@@ -313,13 +373,13 @@ COPY --from=builder /opt/libtorch/lib/ /opt/libtorch/lib/
 # CUDA 13.0 Runtime
 #############################################
 
-FROM gcr.io/distroless/cc-debian12 AS runtime-cuda130
+FROM ${RUNTIME_BASE} AS runtime-cuda130
 
 # Copy required system libraries
-COPY --from=builder /usr/lib/x86_64-linux-gnu/libgomp.so.1 /usr/lib/x86_64-linux-gnu/
-COPY --from=builder /usr/lib/x86_64-linux-gnu/libz.so.1 /usr/lib/x86_64-linux-gnu/
-COPY --from=builder /usr/lib/x86_64-linux-gnu/libssl.so* /usr/lib/x86_64-linux-gnu/
-COPY --from=builder /usr/lib/x86_64-linux-gnu/libcrypto.so* /usr/lib/x86_64-linux-gnu/
+COPY --from=builder /usr/lib/x86_64-linux-gnu/libgomp.so.1 /usr/lib64/
+COPY --from=builder /usr/lib/x86_64-linux-gnu/libz.so.1 /usr/lib64/
+COPY --from=builder /usr/lib/x86_64-linux-gnu/libssl.so* /usr/lib64/
+COPY --from=builder /usr/lib/x86_64-linux-gnu/libcrypto.so* /usr/lib64/
 
 # Copy CUDA runtime libraries from builder (toolkit includes runtime)
 COPY --from=builder /usr/local/cuda-13.0/lib64/libcudart.so* /usr/local/cuda/lib64/
@@ -333,13 +393,13 @@ COPY --from=builder /opt/libtorch/lib/ /opt/libtorch/lib/
 # ROCm 7.1 Runtime
 #############################################
 
-FROM gcr.io/distroless/cc-debian12 AS runtime-rocm71
+FROM ${RUNTIME_BASE} AS runtime-rocm71
 
 # Copy required system libraries
-COPY --from=builder /usr/lib/x86_64-linux-gnu/libgomp.so.1 /usr/lib/x86_64-linux-gnu/
-COPY --from=builder /usr/lib/x86_64-linux-gnu/libz.so.1 /usr/lib/x86_64-linux-gnu/
-COPY --from=builder /usr/lib/x86_64-linux-gnu/libssl.so* /usr/lib/x86_64-linux-gnu/
-COPY --from=builder /usr/lib/x86_64-linux-gnu/libcrypto.so* /usr/lib/x86_64-linux-gnu/
+COPY --from=builder /usr/lib/x86_64-linux-gnu/libgomp.so.1 /usr/lib64/
+COPY --from=builder /usr/lib/x86_64-linux-gnu/libz.so.1 /usr/lib64/
+COPY --from=builder /usr/lib/x86_64-linux-gnu/libssl.so* /usr/lib64/
+COPY --from=builder /usr/lib/x86_64-linux-gnu/libcrypto.so* /usr/lib64/
 
 # Copy entire LibTorch lib directory (includes Tensile libraries for ROCm)
 COPY --from=builder /opt/libtorch/lib/ /opt/libtorch/lib/
@@ -348,13 +408,13 @@ COPY --from=builder /opt/libtorch/lib/ /opt/libtorch/lib/
 # CPU Runtime
 #############################################
 
-FROM gcr.io/distroless/cc-debian12 AS runtime-cpu
+FROM ${RUNTIME_BASE} AS runtime-cpu
 
 # Copy required system libraries
-COPY --from=builder /usr/lib/x86_64-linux-gnu/libgomp.so.1 /usr/lib/x86_64-linux-gnu/
-COPY --from=builder /usr/lib/x86_64-linux-gnu/libz.so.1 /usr/lib/x86_64-linux-gnu/
-COPY --from=builder /usr/lib/x86_64-linux-gnu/libssl.so* /usr/lib/x86_64-linux-gnu/
-COPY --from=builder /usr/lib/x86_64-linux-gnu/libcrypto.so* /usr/lib/x86_64-linux-gnu/
+COPY --from=builder /usr/lib/x86_64-linux-gnu/libgomp.so.1 /usr/lib64/
+COPY --from=builder /usr/lib/x86_64-linux-gnu/libz.so.1 /usr/lib64/
+COPY --from=builder /usr/lib/x86_64-linux-gnu/libssl.so* /usr/lib64/
+COPY --from=builder /usr/lib/x86_64-linux-gnu/libcrypto.so* /usr/lib64/
 
 # Copy entire LibTorch lib directory
 COPY --from=builder /opt/libtorch/lib/ /opt/libtorch/lib/
@@ -364,18 +424,19 @@ COPY --from=builder /opt/libtorch/lib/ /opt/libtorch/lib/
 #############################################
 #
 # Variant of runtime-cpu for the builder-cpu-arm64 toolchain (PyTorch aarch64
-# pip wheel's libtorch). Debian multilib lives under /usr/lib/aarch64-linux-gnu
-# on arm64, so the system-library COPYs cannot share the x86_64 runtime stage.
-# Selected via `FROM runtime-${VARIANT}` when VARIANT=cpu-arm64. gcr.io/distroless
-# cc-debian12 is multi-arch, so the base resolves to its arm64 variant natively.
+# pip wheel's libtorch). The Debian builder keeps its multiarch libraries under
+# /usr/lib/aarch64-linux-gnu, so the COPY SOURCE paths differ from the x86_64
+# stage and the two cannot be merged; the destination is /usr/lib64 on both.
+# Selected via `FROM runtime-${VARIANT}` when VARIANT=cpu-arm64. The runtime base
+# is a multi-arch index, so it resolves to its arm64 variant natively.
 
-FROM gcr.io/distroless/cc-debian12 AS runtime-cpu-arm64
+FROM ${RUNTIME_BASE} AS runtime-cpu-arm64
 
-# Copy required system libraries (arm64 multilib path)
-COPY --from=builder /usr/lib/aarch64-linux-gnu/libgomp.so.1 /usr/lib/aarch64-linux-gnu/
-COPY --from=builder /usr/lib/aarch64-linux-gnu/libz.so.1 /usr/lib/aarch64-linux-gnu/
-COPY --from=builder /usr/lib/aarch64-linux-gnu/libssl.so* /usr/lib/aarch64-linux-gnu/
-COPY --from=builder /usr/lib/aarch64-linux-gnu/libcrypto.so* /usr/lib/aarch64-linux-gnu/
+# Copy required system libraries (arm64 multiarch source path)
+COPY --from=builder /usr/lib/aarch64-linux-gnu/libgomp.so.1 /usr/lib64/
+COPY --from=builder /usr/lib/aarch64-linux-gnu/libz.so.1 /usr/lib64/
+COPY --from=builder /usr/lib/aarch64-linux-gnu/libssl.so* /usr/lib64/
+COPY --from=builder /usr/lib/aarch64-linux-gnu/libcrypto.so* /usr/lib64/
 
 # Copy entire LibTorch lib directory
 COPY --from=builder /opt/libtorch/lib/ /opt/libtorch/lib/
@@ -394,8 +455,20 @@ COPY --from=builder /out/hyprstream /hyprstream
 # Set library paths
 ENV LD_LIBRARY_PATH=/opt/libtorch/lib:/usr/local/cuda/lib64
 
-# Expose default ports
+# Expose default ports. Both are above 1024, so the unprivileged runtime account
+# can bind them without any capability grant.
 EXPOSE 8080 50051
 
-# Run hyprstream (distroless uses absolute paths)
+# Run unprivileged. The runtime base already defaults to this account, but state
+# it explicitly so the image never silently reverts to root if the base changes,
+# and so `podman inspect` reports the account this image is supported on. The
+# binary and its libraries are root-owned and world-readable/executable, which
+# is what an immutable runtime wants: the service can execute them and cannot
+# rewrite them.
+ARG RUNTIME_UID
+ARG RUNTIME_GID
+USER ${RUNTIME_UID}:${RUNTIME_GID}
+
+# Run hyprstream (the runtime base has no working directory conventions of its
+# own, so use an absolute path)
 ENTRYPOINT ["/hyprstream"]

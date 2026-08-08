@@ -95,6 +95,16 @@ pub struct WasmRpcClient {
     inner: RpcClientImpl<JsSigner, WtConnection>,
 }
 
+impl WasmRpcClient {
+    /// Wrap an already-built resolved client (see [`build_resolved_client`]).
+    /// Shared by [`WasmRpcClient::connect_resolved`] and by
+    /// `browser_session::BrowserSession`, which constructs direct typed
+    /// clients without a `VfsShell`.
+    pub(crate) fn from_resolved(inner: RpcClientImpl<JsSigner, WtConnection>) -> Self {
+        Self { inner }
+    }
+}
+
 fn call_options(jwt: Option<String>, delegated_bearer: Option<String>) -> CallOptions {
     let options = CallOptions::new();
     let options = match jwt {
@@ -243,7 +253,7 @@ impl WasmRpcClient {
             jwt,
         )
         .await?;
-        Ok(Self { inner })
+        Ok(Self::from_resolved(inner))
     }
 
     /// Builder: set a dynamic token provider called on every RPC request.

@@ -112,6 +112,18 @@ impl AuthorityHostedAccountBinding {
 /// Deployment authority that allocates local tenant bindings.
 pub trait HostedAccountAuthority: Send + Sync {
     fn allocate(&self, requested_handle: &str) -> Result<AuthorityHostedAccountBinding>;
+
+    /// Allocate or resume the authority reservation for one authenticated
+    /// transaction. Production implementations bind the permanent label to
+    /// this idempotency key; the default preserves existing test/fake
+    /// authorities while still keeping the client out of tenant/DID choice.
+    fn allocate_for_transaction(
+        &self,
+        requested_handle: &str,
+        _transaction_id: &str,
+    ) -> Result<AuthorityHostedAccountBinding> {
+        self.allocate(requested_handle)
+    }
 }
 
 /// Request-scoped signer for the user-held priority-zero Hybrid rotation key.
@@ -145,6 +157,7 @@ pub struct HostedPdsAccountPublication<'a> {
     tenant: &'a str,
     account: &'a SealedHostedAccount,
     repo: &'a HostedRepoGenesis,
+    transaction_id: Option<&'a str>,
 }
 
 impl HostedPdsAccountPublication<'_> {
@@ -166,6 +179,13 @@ impl HostedPdsAccountPublication<'_> {
     #[must_use]
     pub fn repo(&self) -> &HostedRepoGenesis {
         self.repo
+    }
+
+    /// Authenticated idempotency identity for OAuth cold signup. Manual
+    /// registrations have no transaction identity and remain one-shot.
+    #[must_use]
+    pub fn transaction_id(&self) -> Option<&str> {
+        self.transaction_id
     }
 
     /// Exact bytes served at [`DID_DOCUMENT_PATH`].
@@ -214,6 +234,30 @@ impl HostedPdsAccountMinter {
         request: &HostedAccountRegistrationRequest,
         signer: &dyn HostedAccountGenesisSigner,
     ) -> Result<HostedAccountRegistrationResult> {
+        self.mint_inner(request, signer, None)
+    }
+
+    /// Mint or idempotently resume a cold-signup generation bound to the
+    /// already-verified vault-key fingerprint.
+    pub fn mint_for_transaction(
+        &self,
+        request: &HostedAccountRegistrationRequest,
+        signer: &dyn HostedAccountGenesisSigner,
+        transaction_id: &str,
+    ) -> Result<HostedAccountRegistrationResult> {
+        ensure!(
+            !transaction_id.is_empty(),
+            "hosted-account mint transaction id must not be empty"
+        );
+        self.mint_inner(request, signer, Some(transaction_id))
+    }
+
+    fn mint_inner(
+        &self,
+        request: &HostedAccountRegistrationRequest,
+        signer: &dyn HostedAccountGenesisSigner,
+        transaction_id: Option<&str>,
+    ) -> Result<HostedAccountRegistrationResult> {
         ensure!(
             !request.handle.is_empty(),
             "hosted account handle must not be empty"
@@ -231,10 +275,13 @@ impl HostedPdsAccountMinter {
             "live hosted-PDS QUIC discovery is incomplete"
         );
 
-        let binding = self
-            .authority
-            .allocate(&request.handle)
-            .context("hosted-account authority allocation failed")?;
+        let binding = match transaction_id {
+            Some(transaction_id) => self
+                .authority
+                .allocate_for_transaction(&request.handle, transaction_id),
+            None => self.authority.allocate(&request.handle),
+        }
+        .context("hosted-account authority allocation failed")?;
         ensure!(
             binding.name.label() == request.handle,
             "authority allocation does not match the requested handle"
@@ -268,6 +315,7 @@ impl HostedPdsAccountMinter {
                 tenant: binding.tenant(),
                 account: &account,
                 repo: &repo,
+                transaction_id,
             })
             .context("hosted PDS account publication failed")?;
 

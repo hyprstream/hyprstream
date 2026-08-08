@@ -1,0 +1,4 @@
+# Disposable task-owned runs. The harness removes these on every normal exit.
+/runs/
+__pycache__/
+*.pyc

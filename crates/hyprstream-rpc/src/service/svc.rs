@@ -499,8 +499,14 @@ impl EnvelopeContext {
     ///   the kid-anchored binding the rest of the TCB uses — the PQ key is
     ///   resolved from the trust store keyed by the EdDSA identity, never
     ///   self-asserted.
+    ///   A session-overlay binding also reaches `PqHybrid`, but **only** when it
+    ///   has been confirmed out of band; a first-contact binding is capped at
+    ///   `Classical` by
+    ///   [`crate::session_pq_overlay::PqProvenance::key_material`].
     /// - **`Classical`** — the `cnf` Ed25519 signer key is verified but NO bound
-    ///   ML-DSA-65 anchor is present (the federation edge, or a pre-PQ identity).
+    ///   ML-DSA-65 anchor is present (the federation edge, or a pre-PQ
+    ///   identity), or the only binding is a first-contact one, which makes the
+    ///   signature checkable without making the signer more trusted.
     /// - **`Unverified`** — the `cnf` key is zeroed (a callback-service context
     ///   with no real envelope; assurance floors to the S1 `Unverified` floor
     ///   so it dominates nothing above it).
@@ -530,6 +536,16 @@ impl EnvelopeContext {
             if let Some(store) = crate::envelope::global_pq_store() {
                 if store.ml_dsa_key_for(&self.cnf).is_some() {
                     return crate::auth::mac::VerifiedKeyMaterial::PqHybrid;
+                }
+            }
+            // A session overlay binding makes the signature checkable; whether
+            // it makes the signer more believed is a separate question, and
+            // `PqProvenance::key_material` is the only place it is answered. A
+            // first-contact binding maps to Classical there — the overlay lets
+            // the request in, it does not promote the requester.
+            if let Some(overlay) = crate::session_pq_overlay::global_session_pq_overlay() {
+                if let Some(provenance) = overlay.provenance_for(&self.cnf) {
+                    return provenance.key_material();
                 }
             }
         }
@@ -1630,6 +1646,62 @@ mod empty_iss_gate_tests {
         assert!(
             svc.cached_subjects.lock().is_empty(),
             "no signer may be cached for did:unknown"
+        );
+    }
+
+    // ── #1425 r1 P1#3: the browser exchange mints a `cnf.jkt`-bound token for
+    //    the SAME Ed25519 key used to sign RPC envelopes (`VfsShell::connect`
+    //    passes `signer_pubkey` as both the DPoP key and the envelope signer).
+    //    These tests exercise `verify_claims` — the actual, unmodified server
+    //    RPC dispatch path every transport (QUIC/UDS/inproc/iroh) runs — with
+    //    a token shaped exactly like that mint, proving the sender-bound
+    //    token is usable when the envelope is signed by the matching key and
+    //    is rejected when signed by a different one. No separate per-request
+    //    DPoP proof JWT is needed on this transport: the envelope signature
+    //    itself is the freshly-signed proof of possession for every call.
+
+    #[tokio::test]
+    async fn browser_cnf_jkt_token_succeeds_over_matching_envelope_signer() {
+        let (svc, ca) = mock_service();
+        let browser_key = SigningKey::from_bytes(&[0x51; 32]);
+        let now = chrono::Utc::now().timestamp();
+        let claims = Claims::new("alice".to_owned(), now, now + 3600)
+            .with_cnf_jkt(browser_key.verifying_key().as_bytes());
+        let token = crate::auth::jwt::encode(&claims, &ca);
+        let mut ctx = ctx_with_token(token, /* is_local_caller */ true);
+        // The envelope is signed by the SAME key the browser used for DPoP —
+        // exactly what `VfsShell::connect` arranges by construction.
+        ctx.cnf = browser_key.verifying_key().to_bytes();
+
+        svc.verify_claims(&mut ctx)
+            .await
+            .expect("cnf.jkt-bound token over its own signing key must be accepted");
+        assert_eq!(ctx.subject().name(), Some("alice"));
+    }
+
+    #[tokio::test]
+    async fn browser_cnf_jkt_token_rejected_over_mismatched_envelope_signer() {
+        let (svc, ca) = mock_service();
+        let browser_key = SigningKey::from_bytes(&[0x52; 32]);
+        let attacker_key = SigningKey::from_bytes(&[0x53; 32]);
+        let now = chrono::Utc::now().timestamp();
+        let claims = Claims::new("alice".to_owned(), now, now + 3600)
+            .with_cnf_jkt(browser_key.verifying_key().as_bytes());
+        let token = crate::auth::jwt::encode(&claims, &ca);
+        let mut ctx = ctx_with_token(token, /* is_local_caller */ true);
+        // An attacker who stole the token string signs the envelope with a
+        // DIFFERENT key — there is no "present as Bearer" downgrade path on
+        // this transport: cnf is checked against the actual signer whenever
+        // it is present, unconditionally.
+        ctx.cnf = attacker_key.verifying_key().to_bytes();
+
+        let err = svc
+            .verify_claims(&mut ctx)
+            .await
+            .expect_err("cnf.jkt-bound token over a foreign envelope signer must be rejected");
+        assert!(
+            err.to_string().contains("cnf.jkt"),
+            "unexpected error: {err:#}"
         );
     }
 

@@ -7,6 +7,19 @@
 //! - Memory-mapped disk persistence
 //! - FlightSQL interface for embeddings and similarity search
 
+#[cfg(not(feature = "credential-pds"))]
+compile_error!(
+    "security invariant: every Hyprstream build requires the `credential-pds` \
+     feature so the production UserStore cannot fall back to plaintext storage"
+);
+
+#[cfg(all(feature = "metrics", feature = "pglite"))]
+compile_error!(
+    "features `metrics` and `pglite` are mutually exclusive: DuckDB and PGlite \
+     export overlapping PostgreSQL C symbols; build the credential/PDS service \
+     with `credential-pds`, and metrics/inference/Flight as a separate service"
+);
+
 // Re-export capnp modules from hyprstream-rpc (compiled once, shared by all crates)
 pub use hyprstream_rpc::annotations_capnp;
 pub use hyprstream_rpc::common_capnp;

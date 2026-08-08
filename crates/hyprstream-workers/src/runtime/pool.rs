@@ -15,7 +15,7 @@ use crate::error::{Result, WorkerError};
 
 use super::admission::{self, AdmissionTracker};
 use super::backend::SandboxBackend;
-use super::client::LinuxContainerResources;
+use super::client::{KeyValue, LinuxContainerResources};
 use super::{PodSandbox, PodSandboxConfig, PodSandboxState};
 use hyprstream_vfs::Subject;
 
@@ -69,6 +69,11 @@ pub struct SandboxPool {
     /// per-Subject/per-group quotas, bounded wait-queue, resource-aware fit.
     admission: AdmissionTracker,
 }
+
+/// Verified task principal consumed by the backend's per-sandbox VFS setup.
+/// This is assigned by [`SandboxPool::acquire`], never accepted from a caller's
+/// untrusted sandbox annotations.
+const SUBJECT_ANNOTATION: &str = "hyprstream.io/subject";
 
 impl SandboxPool {
     /// Create a new sandbox pool with a backend.
@@ -165,7 +170,20 @@ impl SandboxPool {
             .reserve(subject, group_selector.as_deref(), demand)
             .await?;
 
-        let obtained = self.obtain_sandbox(config).await;
+        // The backend constructs the sandbox's namespace during startup. Put
+        // the verified admission principal in the configuration *before* that
+        // point so Kata/OCI/nspawn all serve the task VFS under the same
+        // Subject. A supplied annotation is overwritten rather than trusted.
+        let mut task_config = config.clone();
+        task_config
+            .annotations
+            .retain(|annotation| annotation.key != SUBJECT_ANNOTATION);
+        task_config.annotations.push(KeyValue {
+            key: SUBJECT_ANNOTATION.to_owned(),
+            value: subject.to_string(),
+        });
+
+        let obtained = self.obtain_sandbox(&task_config).await;
         let mut sandbox = match obtained {
             Ok(sandbox) => sandbox,
             Err(e) => {

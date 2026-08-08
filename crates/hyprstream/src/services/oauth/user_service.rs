@@ -8,7 +8,10 @@ use anyhow::{anyhow, Result};
 use base64::{engine::general_purpose::STANDARD, Engine};
 use ed25519_dalek::VerifyingKey;
 
-use crate::auth::{UserFilter, UserProfilePatch, UserStore, PubkeyEntry, decode_pubkey_base64};
+use crate::auth::{
+    ProductionUserStore, PubkeyEntry, UserFilter, UserProfilePatch, UserStore,
+    decode_pubkey_base64,
+};
 
 /// Shared user information type (SCIM-informed).
 #[derive(Debug, Clone)]
@@ -73,11 +76,11 @@ pub struct UserUpdate {
 
 /// Shared user CRUD service used by both SCIM HTTP and ZMQ RPC transports.
 pub struct UserService {
-    store: Arc<dyn UserStore>,
+    store: ProductionUserStore,
 }
 
 impl UserService {
-    pub fn new(store: Arc<dyn UserStore>) -> Self {
+    pub(crate) fn new(store: ProductionUserStore) -> Self {
         Self { store }
     }
 
@@ -98,10 +101,13 @@ impl UserService {
     /// Get a user by username.
     pub async fn get(&self, username: &str) -> Result<Option<UserInfo>> {
         let profile = self.store.get_profile(username).await?;
-        let pubkeys = self.store.list_pubkeys(username).await.unwrap_or_default();
 
         match profile {
             Some(profile) => {
+                let pubkeys = self.store.list_pubkeys(username).await?;
+                let sub = profile
+                    .sub
+                    .ok_or_else(|| anyhow!("User '{username}' has no stable subject"))?;
                 // For backward compat, use first pubkey as the primary
                 let primary_pubkey = pubkeys.first()
                     .map(|pk| STANDARD.encode(pk.pubkey.as_bytes()))
@@ -109,7 +115,7 @@ impl UserService {
 
                 Ok(Some(UserInfo {
                     username: username.to_owned(),
-                    sub: profile.sub.unwrap_or_default(),
+                    sub,
                     pubkey_base64: primary_pubkey,
                     name: profile.name,
                     email: profile.email,
@@ -140,10 +146,13 @@ impl UserService {
 
         let users = results
             .into_iter()
-            .map(|(username, profile)| {
-                UserInfo {
+            .map(|(username, profile)| -> Result<UserInfo> {
+                let sub = profile
+                    .sub
+                    .ok_or_else(|| anyhow!("User '{username}' has no stable subject"))?;
+                Ok(UserInfo {
                     username,
-                    sub: profile.sub.unwrap_or_default(),
+                    sub,
                     pubkey_base64: String::new(), // Omitted in list for size; use get() for full info
                     name: profile.name,
                     email: profile.email,
@@ -152,9 +161,9 @@ impl UserService {
                     external_id: profile.external_id,
                     atproto_did: profile.atproto_did,
                     pubkeys: vec![], // Omitted in list
-                }
+                })
             })
-            .collect();
+            .collect::<Result<Vec<_>>>()?;
 
         Ok(UserList {
             users,
@@ -226,7 +235,7 @@ impl UserService {
     }
 
     /// Get the underlying store for direct access (e.g., by OAuth handlers).
-    pub fn store(&self) -> Arc<dyn UserStore> {
-        Arc::clone(&self.store)
+    pub(crate) fn store(&self) -> Arc<dyn UserStore> {
+        self.store.clone_inner()
     }
 }

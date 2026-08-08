@@ -24,7 +24,7 @@
 //!
 //! The mount ticket rides the URL query (`?ticket=<at+jwt>`) because a browser
 //! `WebSocket` cannot set request headers. It is validated at the WS upgrade
-//! via [`crate::server::middleware::verify_token_claims`] — the exact same
+//! via [`crate::server::middleware::verify_resource_token_claims`] — the exact same
 //! chain `auth_middleware` uses (issuer routing, Ed25519/ML-DSA signature +
 //! audience validation, JTI revocation). The validated `sub` becomes the
 //! session [`Subject`], threaded onto every 9P op by [`MountBackend`] (the
@@ -72,7 +72,7 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{split, AsyncReadExt, AsyncWriteExt};
 use tracing::{debug, info, warn};
 
-use crate::server::state::ServerState;
+use crate::server::state::{ResourceAuthState, ServerState};
 
 const PLANE_WS: &str = "ws";
 const PLANE_WEBTRANSPORT: &str = "webtransport";
@@ -310,15 +310,14 @@ pub async fn ninep_ws(
 }
 
 /// Validate a mount ticket to a session [`Subject`], reusing the server auth
-/// chain ([`verify_token_claims`](crate::server::middleware::verify_token_claims)).
+/// chain ([`verify_resource_token_claims`](crate::server::middleware::verify_resource_token_claims)).
 ///
 /// Real controls enforced here: Ed25519/ML-DSA signature, audience binding to
-/// this resource, expiry, and JTI revocation (all inside `verify_token_claims`),
+/// this resource, expiry, and JTI revocation (all inside `verify_resource_token_claims`),
 /// plus subject-name validation. The `sub` becomes the session Subject.
 ///
-/// NOTE (flagged design fork — see PR body): one-shot replay prevention and
-/// explicit browser-`Origin` binding beyond the JWT `aud` are NOT yet enforced;
-/// the current controls are signature + short expiry + audience + revocation.
+/// One-shot replay prevention is enforced for mount tickets. Explicit browser
+/// `Origin` binding beyond the JWT `aud` remains a separate design concern.
 async fn validate_ticket(
     state: &ServerState,
     ticket: &str,
@@ -326,22 +325,29 @@ async fn validate_ticket(
     plane: &str,
     namespace_path: &str,
 ) -> Result<VerifiedAttach, &'static str> {
-    verify_mount_ticket(state, ticket, plane, namespace_path).await
+    let resource_state = state.resource_auth_state();
+    verify_mount_ticket(&resource_state, ticket, plane, namespace_path).await
 }
 
 /// Transport-agnostic core of mount-ticket validation, shared by H1a's
 /// URL-query path ([`validate_ticket`]) and H1b's `Tattach.uname` path
 /// ([`TicketAttachAuthorizer`]). Both present the same mount-ticket JWT;
 /// only *where* it rides differs (WS query vs 9P attach), so the verification —
-/// signature, expiry, revocation (in `verify_token_claims`), explicit
+/// signature, expiry, revocation (in `verify_resource_token_claims`), explicit
 /// mount-capability marker, then subject-name validation — is identical.
 async fn verify_mount_ticket(
-    state: &ServerState,
+    state: &ResourceAuthState,
     ticket: &str,
     plane: &str,
     namespace_path: &str,
 ) -> Result<VerifiedAttach, &'static str> {
-    let claims = crate::server::middleware::verify_token_claims(state, ticket).await?;
+    let claims = crate::server::middleware::verify_resource_token_claims(state, ticket).await?;
+    // Mount tickets are local, MAC-bound credentials. Federation can attest an
+    // identity for ordinary resource access, but cannot consume this shared
+    // replay barrier or choose a local tenant/clearance.
+    if claims.iss != state.oauth_issuer_url {
+        return Err("mount ticket issuer is not local");
+    }
     if !crate::services::oauth::mount_ticket::is_mount_ticket_for(&claims, plane, namespace_path) {
         return Err("token is not valid for this 9P plane/path");
     }
@@ -357,16 +363,52 @@ async fn verify_mount_ticket(
         Some(n) if !n.is_empty() => {}
         _ => return Err("empty subject"),
     }
+    // Validate all authority and time admission before consuming one-use
+    // replay state. The bounded duration also makes subsequent Instant
+    // arithmetic safe from attacker-controlled overflow.
+    claims
+        .tenant
+        .as_deref()
+        .filter(|tenant| !tenant.is_empty() && *tenant != "*")
+        .ok_or("mount ticket missing authority-bound tenant")?;
+    claims
+        .security_context(VerifiedKeyMaterial::Classical)
+        .ok_or("mount ticket missing verified Claims clearance")?;
     let Some(jti) = claims.jti.as_ref() else {
         return Err("mount ticket missing jti");
     };
     let now = chrono::Utc::now().timestamp();
-    let ttl = (claims.exp - now).max(0) as u64;
-    if !state.dpop_jti_seen.insert_if_absent(
-        format!("mount-ticket:{jti}"),
+    let max_lifetime = crate::services::oauth::mount_ticket::MOUNT_TICKET_TTL;
+    let lifetime = claims
+        .exp
+        .checked_sub(claims.iat)
+        .filter(|lifetime| *lifetime > 0 && *lifetime <= max_lifetime)
+        .ok_or("mount ticket lifetime is invalid")?;
+    let remaining = claims
+        .exp
+        .checked_sub(now)
+        .filter(|remaining| *remaining > 0 && *remaining <= max_lifetime)
+        .ok_or("mount ticket expired")?;
+    if claims.iat > now || lifetime > max_lifetime {
+        return Err("mount ticket issued in the future");
+    }
+    let ttl = u64::try_from(remaining).map_err(|_| "mount ticket lifetime is invalid")?;
+    let result = state.dpop_jti_seen.insert_if_absent_no_evict(
+        crate::services::oauth::replay_key::mount_ticket_jti(jti),
         (),
         Duration::from_secs(ttl),
-    ) {
+    );
+    if result != hyprstream_util::InsertIfAbsentNoEvictResult::Inserted {
+        crate::services::oauth::replay_metrics::record_rejection(
+            crate::services::oauth::replay_metrics::DPOP,
+            result,
+        );
+        if crate::services::oauth::replay_metrics::should_warn_full(
+            crate::services::oauth::replay_metrics::DPOP,
+            result,
+        ) {
+            warn!("DPoP replay barrier is full; refusing fresh mount ticket");
+        }
         return Err("mount ticket already used");
     }
     verified_attach_from_claims(claims, subject)
@@ -397,16 +439,22 @@ fn verified_attach_from_claims(
     let security_context = claims
         .security_context(VerifiedKeyMaterial::Classical)
         .ok_or("mount ticket missing verified Claims clearance")?;
-    let valid_for = (claims.exp - chrono::Utc::now().timestamp()).max(0) as u64;
-    if valid_for == 0 {
-        return Err("mount ticket expired");
-    }
+    let valid_for = claims
+        .exp
+        .checked_sub(chrono::Utc::now().timestamp())
+        .filter(|remaining| {
+            *remaining > 0 && *remaining <= crate::services::oauth::mount_ticket::MOUNT_TICKET_TTL
+        })
+        .and_then(|remaining| u64::try_from(remaining).ok())
+        .ok_or("mount ticket expired")?;
     let identity =
         VerifiedAttachIdentity::from_verified_credential(claims.sub.clone(), tenant.to_owned());
     let scope = VerifiedTokenScope::from_verified_token(
         *security_context.clearance(),
         Arc::from(NINEP_ALL_ACTIONS),
-        Instant::now() + Duration::from_secs(valid_for),
+        Instant::now()
+            .checked_add(Duration::from_secs(valid_for))
+            .ok_or("mount ticket expiry is invalid")?,
     );
     let session = SessionContext::from_verified_token(identity.clone(), security_context, scope);
     let verified = VerifiedAttach::try_new(identity, subject, session)
@@ -617,7 +665,8 @@ impl AttachAuthorizer for TicketAttachAuthorizer {
         // NO fallback to a default export after an explicit selector
         // (#877/#1071 fail-closed contract).
         let requested_ns = aname_to_namespace_path(aname)?;
-        match verify_mount_ticket(&self.state, uname, PLANE_WEBTRANSPORT, &requested_ns).await {
+        let resource_state = self.state.resource_auth_state();
+        match verify_mount_ticket(&resource_state, uname, PLANE_WEBTRANSPORT, &requested_ns).await {
             Ok(verified) => Ok(verified),
             Err(reason) => {
                 warn!(reason, aname = %aname, "9P WT attach rejected: invalid mount ticket or export");
@@ -728,8 +777,175 @@ pub fn register_ninep_wt_handler(state: ServerState) {
 mod tests {
     use super::*;
     use axum::{routing::get, Router};
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+    use ed25519_dalek::Signer as _;
     use hyprstream_9p::msg::{self, Response as P9Response};
     use tokio_tungstenite::tungstenite::Message as WsMessage;
+
+    fn mount_claims(now: i64) -> hyprstream_rpc::auth::Claims {
+        hyprstream_rpc::auth::Claims::new("alice".to_owned(), now, now + 60)
+            .with_issuer("https://issuer.test".to_owned())
+            .with_audience(Some("https://resource.test".to_owned()))
+            .with_cap(crate::services::oauth::mount_ticket::ticket_capability("ws", "/"))
+            .with_tenant("tenant.test".to_owned())
+            .with_clearance(hyprstream_rpc::auth::mac::SecurityLabel::new(
+                hyprstream_rpc::auth::mac::Level::Secret,
+                hyprstream_rpc::auth::mac::Assurance::Classical,
+                hyprstream_rpc::auth::mac::CompartmentSet::EMPTY,
+            ))
+            .with_jti()
+    }
+
+    fn mount_ticket_state(
+    ) -> (
+        ResourceAuthState,
+        ed25519_dalek::SigningKey,
+        hyprstream_rpc::crypto::pq::MlDsaSigningKey,
+        ed25519_dalek::SigningKey,
+    ) {
+        let ed25519 = ed25519_dalek::SigningKey::from_bytes(&[0x5a; 32]);
+        let federation_ed25519 = ed25519_dalek::SigningKey::from_bytes(&[0x5b; 32]);
+        let (ml_dsa, ml_dsa_verifying) = hyprstream_rpc::crypto::pq::ml_dsa_generate_keypair();
+        let composite_keys = Arc::new(hyprstream_rpc::auth::CompositeKeySet::default());
+        let pair = hyprstream_rpc::auth::CompositeKeyPair::verifying(
+            crate::auth::jwt::composite_kid(&ml_dsa_verifying, &ed25519.verifying_key()),
+            ml_dsa_verifying,
+            ed25519.verifying_key(),
+            hyprstream_rpc::auth::CompositePairRole::OAuth,
+            hyprstream_rpc::auth::CompositePairState::Active,
+            0,
+            i64::MAX,
+        );
+        composite_keys
+            .publish(1, "ninep-test".to_owned(), vec![pair])
+            .expect("test composite pair must publish");
+
+        let federation_issuer = "https://federation.test";
+        let federation_kid = hyprstream_rpc::auth::jwt::kid_for_key(&federation_ed25519);
+        let federation_jwks = serde_json::json!({
+            "keys": [{
+                "kty": "OKP",
+                "crv": "Ed25519",
+                "x": URL_SAFE_NO_PAD.encode(federation_ed25519.verifying_key().as_bytes()),
+                "use": "sig",
+                "alg": "EdDSA",
+                "kid": federation_kid,
+            }]
+        });
+        let mut trusted = std::collections::HashMap::new();
+        trusted.insert(
+            federation_issuer.to_owned(),
+            crate::config::TrustedIssuerConfig {
+                jwks_uri: Some(format!("{federation_issuer}/jwks")),
+                jwks_cache_ttl_secs: 300,
+                allow_http: false,
+            },
+        );
+        let federation_fetcher = Arc::new(move |_url: &str| -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<serde_json::Value>> + Send>> {
+            let federation_jwks = federation_jwks.clone();
+            Box::pin(async move { Ok(federation_jwks) })
+        });
+        let mut state = ResourceAuthState::new(
+            ed25519.verifying_key(),
+            "https://resource.test".to_owned(),
+            "https://issuer.test".to_owned(),
+            Arc::new(
+                crate::auth::FederationKeyResolver::new(&trusted)
+                    .with_jwks_fetcher(federation_fetcher),
+            ),
+            Arc::new(hyprstream_rpc::auth::InMemoryJtiBlocklist::new()),
+        );
+        state.composite_key_set = composite_keys;
+        state.dpop_jti_seen = Arc::new(hyprstream_util::TtlCache::new(8, 16));
+        (state, ed25519, ml_dsa, federation_ed25519)
+    }
+
+    /// Test-only composite encoder that intentionally preserves an absent JTI.
+    /// Production encoders correctly add one, but this consumer must reject a
+    /// signed legacy/malformed ticket before it touches replay state.
+    fn encode_mount_ticket(
+        claims: &hyprstream_rpc::auth::Claims,
+        ml_dsa: &hyprstream_rpc::crypto::pq::MlDsaSigningKey,
+        ed25519: &ed25519_dalek::SigningKey,
+    ) -> String {
+        let ml_dsa_verifying = ml_dsa::Keypair::verifying_key(ml_dsa);
+        let kid = crate::auth::jwt::composite_kid(&ml_dsa_verifying, &ed25519.verifying_key());
+        let header = serde_json::json!({
+            "alg": "ML-DSA-65-Ed25519",
+            "typ": "at+jwt",
+            "kid": kid,
+        });
+        let signing_input = format!(
+            "{}.{}",
+            URL_SAFE_NO_PAD.encode(serde_json::to_vec(&header).expect("test header serializes")),
+            URL_SAFE_NO_PAD.encode(serde_json::to_vec(claims).expect("test claims serialize")),
+        );
+        let mut signature = hyprstream_rpc::crypto::pq::ml_dsa_sign(ml_dsa, signing_input.as_bytes());
+        signature.extend_from_slice(&ed25519.sign(signing_input.as_bytes()).to_bytes());
+        format!("{signing_input}.{}", URL_SAFE_NO_PAD.encode(signature))
+    }
+
+    #[tokio::test]
+    async fn mount_ticket_consumer_admits_once_without_pre_admission_consumption() {
+        let (state, ed25519, ml_dsa, federation_ed25519) = mount_ticket_state();
+        let now = chrono::Utc::now().timestamp();
+        let local_claims = mount_claims(now);
+        let local = encode_mount_ticket(&local_claims, &ml_dsa, &ed25519);
+        let first = verify_mount_ticket(&state, &local, "ws", "/").await;
+        assert!(first.is_ok(), "local ticket rejected: {first:?}");
+        assert!(verify_mount_ticket(&state, &local, "ws", "/").await.is_err());
+        let occupied = state.dpop_jti_seen.len();
+        assert_eq!(occupied, 1);
+
+        let mut federated = mount_claims(now);
+        federated.iss = "https://federation.test".to_owned();
+        let federated = crate::auth::jwt::encode(&federated, &federation_ed25519);
+        assert_eq!(
+            verify_mount_ticket(&state, &federated, "ws", "/").await,
+            Err("mount ticket issuer is not local"),
+            "a trusted federated ticket must reach the mount-only issuer guard"
+        );
+        assert_eq!(
+            state.dpop_jti_seen.len(),
+            occupied,
+            "a federated mount ticket consumed replay capacity"
+        );
+
+        let mut missing_tenant = mount_claims(now);
+        missing_tenant.tenant = None;
+        let mut missing_clearance = mount_claims(now);
+        missing_clearance.clearance = None;
+        let mut missing_jti = mount_claims(now);
+        missing_jti.jti = None;
+        let mut future_iat = mount_claims(now);
+        future_iat.iat = now + 120;
+        future_iat.exp = now + 180;
+        let mut extreme_i64 = mount_claims(now);
+        extreme_i64.iat = i64::MIN;
+        extreme_i64.exp = i64::MAX;
+        let mut overlong = mount_claims(now);
+        overlong.exp = now + crate::services::oauth::mount_ticket::MOUNT_TICKET_TTL + 1;
+
+        for (case, claims) in [
+            ("missing tenant", missing_tenant),
+            ("missing clearance", missing_clearance),
+            ("missing JTI", missing_jti),
+            ("future iat", future_iat),
+            ("extreme i64", extreme_i64),
+            ("overlong lifetime", overlong),
+        ] {
+            let token = encode_mount_ticket(&claims, &ml_dsa, &ed25519);
+            assert!(
+                verify_mount_ticket(&state, &token, "ws", "/").await.is_err(),
+                "{case} ticket was accepted"
+            );
+            assert_eq!(
+                state.dpop_jti_seen.len(),
+                occupied,
+                "{case} ticket consumed replay capacity"
+            );
+        }
+    }
 
     struct TransportTestDecider;
 

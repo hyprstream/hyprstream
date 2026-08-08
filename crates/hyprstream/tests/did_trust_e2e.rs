@@ -150,6 +150,16 @@ impl Fixture {
             .to_owned();
         std::fs::write(at9p_dir.join(format!("{cid}.cbor")), capsule_bytes).unwrap();
         std::fs::write(deployment_dir.join("registry-service.jwt"), credential).unwrap();
+        // The bootstrap fetches the authority log alongside the credential —
+        // a missing log 404s and aborts the resolve before any negative-test
+        // leg (capsule/credential/GATE) is reached. Always lay down a valid,
+        // CA-signed authority log so the well-known family is complete.
+        let (authority_log, _) = authority_log_and_checkpoint(&self.ca);
+        std::fs::write(
+            deployment_dir.join("deployment-authority.log.json"),
+            authority_log.to_string(),
+        )
+        .unwrap();
     }
 
     fn write_valid(&self) {
@@ -225,6 +235,11 @@ async fn build_fixture() -> Fixture {
         _dir: dir,
     };
     fixture.write_valid();
+
+    // Provision the OS-owned anti-rollback checkpoint via #1373's rootless
+    // HYPRSTREAM_DEPLOYMENT_TRUST_DIR seam — the same production code path a
+    // rootless daemon takes, rooted in a secure temp dir. No global override.
+    ensure_trust_dir(&fixture.ca);
 
     // Real HTTPS serving side: the REAL deployment well-known router.
     let rustls = axum_server::tls_rustls::RustlsConfig::from_der(

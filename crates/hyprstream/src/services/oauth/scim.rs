@@ -215,16 +215,19 @@ fn base_url() -> String {
 }
 
 /// Find a user by id (sub) or userName.
-async fn find_user(svc: &user_service::UserService, id: &str) -> Option<user_service::UserInfo> {
-    if let Ok(Some(i)) = svc.get(id).await {
-        return Some(i);
+async fn find_user(
+    svc: &user_service::UserService,
+    id: &str,
+) -> anyhow::Result<Option<user_service::UserInfo>> {
+    if let Some(i) = svc.get(id).await? {
+        return Ok(Some(i));
     }
     // Try by sub/id
     let filter = UserFilter {
         filter: Some(format!("id eq \"{}\"", id)),
         ..Default::default()
     };
-    svc.list(&filter).await.ok().and_then(|l| l.users.into_iter().next())
+    Ok(svc.list(&filter).await?.users.into_iter().next())
 }
 
 /// Build a SCIM JSON response with standard headers.
@@ -317,8 +320,16 @@ pub async fn create_user(
     };
 
     // Check for duplicate userName
-    if let Ok(Some(_)) = svc.get(&user_name).await {
-        return scim_error(409, "uniqueness", &format!("User '{}' already exists", user_name));
+    match svc.get(&user_name).await {
+        Ok(Some(_)) => {
+            return scim_error(
+                409,
+                "uniqueness",
+                &format!("User '{}' already exists", user_name),
+            );
+        }
+        Ok(None) => {}
+        Err(error) => return scim_error_simple(500, &error.to_string()),
     }
 
     let pubkey_base64 = body
@@ -367,7 +378,8 @@ pub async fn create_user(
 
     let info = match svc.get(&user_name).await {
         Ok(Some(i)) => i,
-        _ => return scim_error_simple(500, "User not found after creation"),
+        Ok(None) => return scim_error_simple(500, "User not found after creation"),
+        Err(error) => return scim_error_simple(500, &error.to_string()),
     };
 
     let base_url = {
@@ -402,10 +414,10 @@ pub async fn get_user(
         Err(e) => return *e,
     };
 
-    let info = find_user(svc, &id).await;
-    let info = match info {
-        Some(i) => i,
-        None => return scim_error_simple(404, "Resource not found"),
+    let info = match find_user(svc, &id).await {
+        Ok(Some(i)) => i,
+        Ok(None) => return scim_error_simple(404, "Resource not found"),
+        Err(error) => return scim_error_simple(500, &error.to_string()),
     };
 
     let base_url = base_url();
@@ -428,8 +440,9 @@ pub async fn replace_user(
     };
 
     let info = match find_user(svc, &id).await {
-        Some(i) => i,
-        None => return scim_error_simple(404, "Resource not found"),
+        Ok(Some(i)) => i,
+        Ok(None) => return scim_error_simple(404, "Resource not found"),
+        Err(error) => return scim_error_simple(500, &error.to_string()),
     };
 
     let current_etag = compute_etag(&info.sub, info.active);
@@ -460,24 +473,31 @@ pub async fn replace_user(
         atproto_did: hosted_account_did.map(Some),
     };
 
-    match svc.update(&info.username, update).await {
-        Ok(updated) => {
-            if let Some(want_active) = active {
-                if want_active && !info.active {
-                    let _ = svc.resume(&info.username).await;
-                } else if !want_active && info.active {
-                    let _ = svc.suspend(&info.username).await;
-                }
-            }
-
-            let info = svc.get(&info.username).await.ok().flatten().unwrap_or(updated);
-            let url = base_url();
-            let scim = user_to_scim(&info, &url, true);
-            let etag = scim.meta.version.clone().unwrap_or_default();
-            scim_response(StatusCode::OK, &scim, &etag)
-        }
-        Err(e) => scim_error_simple(500, &e.to_string()),
+    if let Err(error) = svc.update(&info.username, update).await {
+        return scim_error_simple(500, &error.to_string());
     }
+    if let Some(want_active) = active {
+        let active_result = if want_active && !info.active {
+            svc.resume(&info.username).await
+        } else if !want_active && info.active {
+            svc.suspend(&info.username).await
+        } else {
+            Ok(())
+        };
+        if let Err(error) = active_result {
+            return scim_error_simple(500, &error.to_string());
+        }
+    }
+
+    let updated = match svc.get(&info.username).await {
+        Ok(Some(updated)) => updated,
+        Ok(None) => return scim_error_simple(500, "User not found after replacement"),
+        Err(error) => return scim_error_simple(500, &error.to_string()),
+    };
+    let url = base_url();
+    let scim = user_to_scim(&updated, &url, true);
+    let etag = scim.meta.version.clone().unwrap_or_default();
+    scim_response(StatusCode::OK, &scim, &etag)
 }
 
 /// DELETE /scim/v2/Users/:id — Delete user (soft delete: set active=false) (RFC 7644 §3.6).
@@ -492,8 +512,9 @@ pub async fn delete_user(
     };
 
     let info = match find_user(svc, &id).await {
-        Some(i) => i,
-        None => return scim_error_simple(404, "Resource not found"),
+        Ok(Some(i)) => i,
+        Ok(None) => return scim_error_simple(404, "Resource not found"),
+        Err(error) => return scim_error_simple(500, &error.to_string()),
     };
 
     let current_etag = compute_etag(&info.sub, info.active);
@@ -522,8 +543,9 @@ pub async fn list_user_keys(
     };
 
     let info = match find_user(svc, &id).await {
-        Some(i) => i,
-        None => return scim_error_simple(404, "Resource not found"),
+        Ok(Some(i)) => i,
+        Ok(None) => return scim_error_simple(404, "Resource not found"),
+        Err(error) => return scim_error_simple(500, &error.to_string()),
     };
 
     let resources: Vec<serde_json::Value> = info.pubkeys.iter().map(|pk| {
@@ -561,8 +583,9 @@ pub async fn add_user_key(
     };
 
     let info = match find_user(svc, &id).await {
-        Some(i) => i,
-        None => return scim_error_simple(404, "Resource not found"),
+        Ok(Some(i)) => i,
+        Ok(None) => return scim_error_simple(404, "Resource not found"),
+        Err(error) => return scim_error_simple(500, &error.to_string()),
     };
 
     let pubkey_b64 = match body.get("pubkeyBase64").and_then(|v| v.as_str()) {
@@ -603,8 +626,9 @@ pub async fn remove_user_key(
     };
 
     let info = match find_user(svc, &id).await {
-        Some(i) => i,
-        None => return scim_error_simple(404, "Resource not found"),
+        Ok(Some(i)) => i,
+        Ok(None) => return scim_error_simple(404, "Resource not found"),
+        Err(error) => return scim_error_simple(500, &error.to_string()),
     };
 
     // Normalize: ensure SHA256: prefix is present regardless of whether client included it
