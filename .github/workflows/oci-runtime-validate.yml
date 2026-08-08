@@ -271,5 +271,7 @@ jobs:
           podman rm -f "$SMOKE_CONTAINER" 2>/dev/null || true
           podman rmi "$SMOKE_IMAGE" 2>/dev/null || true
           if [ -n "${SMOKE_TMP:-}" ]; then
-            rm -rf "$SMOKE_TMP"
+            # Files the container wrote are owned by a subuid of the runner
+            # user; delete them inside the user namespace where they are ours.
+            podman unshare rm -rf "$SMOKE_TMP" || rm -rf "$SMOKE_TMP"
           fi
