@@ -1,5 +1,10 @@
 # Deployment registry trust provisioning
 
+> This document covers deployment-level trust: the OS-owned CA pin, authority
+> log/checkpoint, and registry credential below. It does not cover
+> `bootstrap-pubkeys`, the unrelated node-local, unattested service-key file —
+> see [bootstrap-pubkeys-format.md](bootstrap-pubkeys-format.md).
+
 Production Discovery/PDS authority is rooted before commands, factories, plugins,
 or generated clients run. The executable consults only the explicit deployment
 trust sources described below. It does not consult XDG/user configuration,
