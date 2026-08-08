@@ -13,6 +13,9 @@ pub enum TrustCommand {
     VerifyDeployment(VerifyDeploymentArgs),
     /// Add or replace an authority key through the signed rotation log.
     RotateAuthority(RotateAuthorityArgs),
+    /// Install ceremony outputs to the fixed OS-owned trust paths, and
+    /// optionally enable the unattended registry-credential refresher.
+    Install(InstallDeploymentTrustArgs),
 }
 
 #[derive(Debug, Args)]
@@ -242,6 +245,63 @@ pub struct RotateAuthorityArgs {
     /// Replace existing output files.
     #[arg(long)]
     pub force: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct InstallDeploymentTrustArgs {
+    /// Ceremony-produced public root to install (source; not the install path).
+    #[arg(long, default_value = "deployment-ca.hybrid")]
+    pub public_ca: PathBuf,
+
+    /// Ceremony-produced authority log to install (source).
+    #[arg(long, default_value = "deployment-authority.log.json")]
+    pub authority_log: PathBuf,
+
+    /// Ceremony-produced authority checkpoint to install (source).
+    #[arg(long, default_value = "deployment-authority.head.json")]
+    pub authority_checkpoint: PathBuf,
+
+    /// Also install the delegated online signer and enable the unattended
+    /// registry-credential refresher (systemd timer). Omit to install only
+    /// the three OS-owned public artifacts.
+    #[arg(long, requires = "delegation")]
+    pub delegated_key: Option<PathBuf>,
+
+    /// Delegation authorizing --delegated-key. Required with --delegated-key.
+    #[arg(long, requires = "delegated_key")]
+    pub delegation: Option<PathBuf>,
+
+    /// Raw 32-byte Ed25519 registry-service public key for the refresher's
+    /// `mint-registry-jwt --registry-public-key`. Required with --delegated-key.
+    #[arg(long, requires = "delegated_key")]
+    pub registry_public_key: Option<PathBuf>,
+
+    /// Plaintext age X25519 identity file (AGE-SECRET-KEY-1...) the unattended
+    /// refresher uses to decrypt the delegated signer. Required with
+    /// --delegated-key. Installed root-only; this identity can open only the
+    /// separately encrypted delegated signer, never the root authority bundle.
+    #[arg(long, requires = "delegated_key", value_name = "AGE_IDENTITY_FILE")]
+    pub refresh_identity: Option<PathBuf>,
+
+    /// Refresh interval for the registry credential's 1-hour TTL. Must leave
+    /// headroom for the profile's 60-second clock-skew allowance.
+    #[arg(
+        long,
+        default_value = "30min",
+        requires = "delegated_key",
+        value_name = "SYSTEMD_TIME_SPAN"
+    )]
+    pub refresh_interval: String,
+
+    /// Replace existing installed trust artifacts. The two systemd unit files
+    /// are always overwritten regardless of this flag.
+    #[arg(long)]
+    pub force: bool,
+
+    /// Skip `systemctl enable --now` (write/print units only; for offline
+    /// testing or non-systemd environments).
+    #[arg(long)]
+    pub no_enable: bool,
 }
 
 #[derive(Debug, Args)]

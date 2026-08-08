@@ -8,8 +8,8 @@
 
 use crate::auth::age_seal::{AgeIdentities, AgeRecipients};
 use crate::cli::commands::{
-    DelegateRegistrySignerArgs, MintDeploymentCaArgs, MintRegistryJwtArgs, RotateAuthorityArgs,
-    TrustCommand, VerifyDeploymentArgs,
+    DelegateRegistrySignerArgs, InstallDeploymentTrustArgs, MintDeploymentCaArgs,
+    MintRegistryJwtArgs, RotateAuthorityArgs, TrustCommand, VerifyDeploymentArgs,
 };
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use base64::{
@@ -44,7 +44,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fs::OpenOptions,
     io::{Read as _, Write as _},
-    os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _},
+    os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _},
     path::{Path, PathBuf},
     process::{Command, Stdio},
 };
@@ -65,11 +65,25 @@ const MAX_AUTHORITY_LOG_OPERATIONS: usize = 128;
 const MAX_DELEGATION_BYTES: usize = 256 * 1024;
 const MAX_CLOUD_SECRET_BYTES: usize = 64 * 1024;
 const MAX_AGE_CIPHERTEXT_BYTES: usize = 256 * 1024;
+const MAX_AGE_IDENTITY_BYTES: usize = 4 * 1024;
 const PUBLIC_CA_INSTALL_PATH: &str = "/etc/hyprstream/trust/deployment-ca.hybrid";
 const AUTHORITY_LOG_INSTALL_PATH: &str = "/etc/hyprstream/trust/deployment-authority.log.json";
 const AUTHORITY_CHECKPOINT_INSTALL_PATH: &str =
     "/etc/hyprstream/trust/deployment-authority.head.json";
 const REGISTRY_JWT_INSTALL_PATH: &str = "/run/hyprstream/credentials/registry-service.jwt";
+const DEPLOYMENT_TRUST_DIR: &str = "/etc/hyprstream/trust";
+const DELEGATED_DIR: &str = "/etc/hyprstream/trust/delegated";
+const DELEGATED_SIGNER_INSTALL_PATH: &str =
+    "/etc/hyprstream/trust/delegated/registry-delegated-signer.age";
+const DELEGATION_INSTALL_PATH: &str =
+    "/etc/hyprstream/trust/delegated/registry-signer.delegation.json";
+const REGISTRY_PUBLIC_KEY_INSTALL_PATH: &str =
+    "/etc/hyprstream/trust/delegated/registry-public-key";
+const REFRESH_IDENTITY_INSTALL_PATH: &str = "/etc/hyprstream/trust/delegated/refresh-identity";
+const TRUST_REFRESH_SERVICE_UNIT_PATH: &str =
+    "/etc/systemd/system/hyprstream-trust-refresh.service";
+const TRUST_REFRESH_TIMER_UNIT_PATH: &str = "/etc/systemd/system/hyprstream-trust-refresh.timer";
+const CREDENTIALS_RUN_DIR: &str = "/run/hyprstream/credentials";
 
 #[cfg(test)]
 static SECRET_BUNDLE_DROPS: [std::sync::atomic::AtomicUsize; 3] = [
@@ -226,6 +240,7 @@ pub fn handle_trust_command(command: TrustCommand) -> Result<()> {
         TrustCommand::MintRegistryJwt(args) => mint_registry_jwt(&args),
         TrustCommand::VerifyDeployment(args) => verify_deployment(&args),
         TrustCommand::RotateAuthority(args) => rotate_authority(&args),
+        TrustCommand::Install(args) => install_deployment_trust(&args),
     }
 }
 
@@ -714,6 +729,453 @@ fn verify_publisher_artifact(
         "contract artifact SHA-256 does not match authenticated bytes"
     );
     Ok(())
+}
+
+/// Nothing else in the repository installs the OS-owned trust directory or
+/// keeps the 1-hour registry credential refreshed — every
+/// prior `trust mint-*` command only produces local artifacts under the
+/// operator's ceremony directory. This command projects those artifacts onto
+/// the fixed paths `hyprstream-discovery::service::read_trusted_artifact`
+/// actually reads, and, when delegated-signer material is supplied,
+/// additionally installs and enables a systemd timer that keeps the registry
+/// credential minted within its TTL.
+fn install_deployment_trust(args: &InstallDeploymentTrustArgs) -> Result<()> {
+    ensure!(
+        nix::unistd::Uid::effective().is_root(),
+        "trust install must run as root: the fixed paths under {DEPLOYMENT_TRUST_DIR} must be \
+         root-owned (see hyprstream-discovery's read_trusted_artifact), and this command does not \
+         attempt to chown files it does not itself own"
+    );
+    validate_refresh_interval(&args.refresh_interval)?;
+
+    let public_ca = read_limited(&args.public_ca, PUBLIC_CA_BYTES)?;
+    ensure!(
+        public_ca.len() == PUBLIC_CA_BYTES,
+        "public_ca must be exactly {PUBLIC_CA_BYTES} bytes"
+    );
+    hyprstream_discovery::verify_deployment_public_ca(&public_ca)
+        .context("public_ca is not a valid production deployment CA")?;
+    let authority_log: AuthorityLogFile =
+        read_json_limited(&args.authority_log, MAX_CLOUD_SECRET_BYTES)?;
+    let authority_checkpoint: AuthorityCheckpointFile =
+        read_json_limited(&args.authority_checkpoint, MAX_CLOUD_SECRET_BYTES)?;
+    validate_authority_log(&public_ca, &authority_log, &authority_checkpoint)
+        .context("authority log/checkpoint do not verify against public_ca")?;
+
+    ensure_root_owned_dir(Path::new(DEPLOYMENT_TRUST_DIR), 0o755)?;
+
+    let public_ca_dest = PathBuf::from(PUBLIC_CA_INSTALL_PATH);
+    let authority_log_dest = PathBuf::from(AUTHORITY_LOG_INSTALL_PATH);
+    let authority_checkpoint_dest = PathBuf::from(AUTHORITY_CHECKPOINT_INSTALL_PATH);
+    preflight_outputs(
+        [
+            &public_ca_dest,
+            &authority_log_dest,
+            &authority_checkpoint_dest,
+        ],
+        args.force,
+    )?;
+    commit_outputs(vec![
+        PendingOutput::new(&public_ca_dest, public_ca.clone(), 0o644),
+        PendingOutput::new(
+            &authority_log_dest,
+            pretty_json_bytes(&authority_log)?,
+            0o644,
+        ),
+        PendingOutput::new(
+            &authority_checkpoint_dest,
+            pretty_json_bytes(&authority_checkpoint)?,
+            0o644,
+        ),
+    ])?;
+
+    let mut refresher_enabled = false;
+    if let Some(delegated_key) = &args.delegated_key {
+        let delegation = args
+            .delegation
+            .as_ref()
+            .ok_or_else(|| anyhow!("--delegation is required with --delegated-key"))?;
+        let registry_public_key = args
+            .registry_public_key
+            .as_ref()
+            .ok_or_else(|| anyhow!("--registry-public-key is required with --delegated-key"))?;
+        let refresh_identity = args
+            .refresh_identity
+            .as_ref()
+            .ok_or_else(|| anyhow!("--refresh-identity is required with --delegated-key"))?;
+        install_trust_refresher(
+            args,
+            &public_ca,
+            &authority_log,
+            &authority_checkpoint,
+            delegated_key,
+            delegation,
+            registry_public_key,
+            refresh_identity,
+        )?;
+        refresher_enabled = true;
+    }
+
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "schema": "hyprstream.deployment-trust-install-output.v1",
+            "installed": [
+                PUBLIC_CA_INSTALL_PATH,
+                AUTHORITY_LOG_INSTALL_PATH,
+                AUTHORITY_CHECKPOINT_INSTALL_PATH,
+            ],
+            "refresher_enabled": refresher_enabled,
+        }))?
+    );
+    Ok(())
+}
+
+/// `mkdir -p` with the given mode on the leaf. Every component of the path —
+/// not just the leaf — is inspected with `symlink_metadata` and must be a
+/// non-symlink directory owned by root (or by the given owner) and writable by
+/// nobody else, mirroring the fail-closed posture `read_trusted_artifact`
+/// requires of every ancestor of a trust path it reads. Guarantee: at the
+/// moment each component was inspected it was a root/owner-owned real
+/// directory no other user could write into. Not guaranteed: the
+/// checks are lstat-based, not O_NOFOLLOW-handle-based, so a component
+/// swapped between inspection and use is not detected (TOCTOU).
+fn ensure_root_owned_dir(dir: &Path, mode: u32) -> Result<()> {
+    ensure_owned_dir(dir, mode, 0)
+}
+
+fn ensure_owned_dir(dir: &Path, mode: u32, owner_uid: u32) -> Result<()> {
+    let mut ancestors: Vec<&Path> = dir.ancestors().collect();
+    ancestors.reverse();
+    for component in ancestors {
+        if component.as_os_str().is_empty() {
+            continue;
+        }
+        let is_leaf = component == dir;
+        match std::fs::symlink_metadata(component) {
+            Ok(metadata) => {
+                ensure!(
+                    !metadata.file_type().is_symlink(),
+                    "refusing to install through a symlinked path component: {}",
+                    component.display()
+                );
+                ensure!(
+                    metadata.is_dir(),
+                    "install path component exists and is not a directory: {}",
+                    component.display()
+                );
+                let uid = metadata.uid();
+                ensure!(
+                    uid == 0 || uid == owner_uid,
+                    "install path component {} is owned by uid {uid}, not root; refusing to \
+                     install trust material under a directory another user controls",
+                    component.display()
+                );
+                let mode = metadata.mode();
+                ensure!(
+                    mode & 0o022 == 0,
+                    "install path component {} is group/world writable (mode {:04o}); refusing \
+                     to install trust material under a directory other users can modify",
+                    component.display(),
+                    mode & 0o7777
+                );
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::create_dir(component)
+                    .with_context(|| format!("create directory {}", component.display()))?;
+                if !is_leaf {
+                    std::fs::set_permissions(component, std::fs::Permissions::from_mode(0o755))
+                        .with_context(|| format!("set permissions on {}", component.display()))?;
+                }
+            }
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("inspect directory {}", component.display()))
+            }
+        }
+        if is_leaf {
+            std::fs::set_permissions(component, std::fs::Permissions::from_mode(mode))
+                .with_context(|| format!("set permissions on {}", component.display()))?;
+        }
+    }
+    Ok(())
+}
+
+/// Fail closed if the `age` binary is not on `PATH`, the refresh identity
+/// cannot decrypt the delegated signer ciphertext, the decrypted bundle is not
+/// a `RegistryDelegatedSigner`, or its public bytes do not match the
+/// root-authorized delegation artifact. Every condition is checked before the
+/// installer writes any output or enables the timer, so a misconfigured
+/// deployment is reported immediately rather than discovered by the first
+/// unattended timer firing.
+fn trial_decrypt_delegated_signer(
+    delegated_key: &Path,
+    refresh_identity: &Path,
+    artifact: &DelegationArtifact,
+) -> Result<()> {
+    // The refresher shells out to the `age` binary; a host without it cannot
+    // honor the timer, so fail closed early with a clear message.
+    let age_probe = std::process::Command::new("age")
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .context(
+            "the `age` binary is not installed or not executable; the trust refresher requires it",
+        )?;
+    ensure!(
+        age_probe.success(),
+        "the `age` binary is not installed or not executable; the trust refresher requires it"
+    );
+
+    // Reproduce the exact decrypt path the refresher's ExecStart follows:
+    // `age --decrypt --identity <refresh_identity>` on the delegated signer.
+    // decrypt_authority reconstructs the full LoadedAuthority and asserts the
+    // bundle's own public-key fingerprint, so the public-bytes comparison uses
+    // the identical derivation path the refresher will exercise on every timer
+    // firing. software_recovery is false because the refresher ExecStart never
+    // passes --software-recovery.
+    let identities = vec![refresh_identity.to_path_buf()];
+    let trial = decrypt_authority(delegated_key, &identities, false)
+        .context("refresh identity cannot decrypt the delegated signer ciphertext")?;
+    ensure!(
+        trial.bundle.purpose == AuthorityPurpose::RegistryDelegatedSigner,
+        "decrypted delegated signer is not a RegistryDelegatedSigner; the \
+         refresher ExecStart rejects any other purpose"
+    );
+    let trial_public = trial.public_bytes();
+    let declared = STANDARD
+        .decode(&artifact.delegated_public_key_b64)
+        .context("decode delegated public key from delegation artifact")?;
+    ensure!(
+        trial_public == declared,
+        "decrypted delegated signer public key does not match the root-authorized delegation"
+    );
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn install_trust_refresher(
+    args: &InstallDeploymentTrustArgs,
+    public_ca: &[u8],
+    authority_log: &AuthorityLogFile,
+    authority_checkpoint: &AuthorityCheckpointFile,
+    delegated_key: &Path,
+    delegation: &Path,
+    registry_public_key: &Path,
+    refresh_identity: &Path,
+) -> Result<()> {
+    let delegated_key_bytes = read_limited(delegated_key, MAX_AGE_CIPHERTEXT_BYTES)?;
+    let delegation_artifact: DelegationArtifact =
+        read_json_limited(delegation, MAX_DELEGATION_BYTES)?;
+    // Full cryptographic validation against the just-verified authority log:
+    // an expired, tampered, or wrong-deployment delegation must fail install
+    // rather than be discovered by the first unattended refresh.
+    validate_delegation_artifact(
+        public_ca,
+        authority_log,
+        authority_checkpoint,
+        &delegation_artifact,
+        now_unix_u64()?,
+    )
+    .context("delegation artifact does not verify against the installed authority log")?;
+    let registry_public_key_bytes = read_limited(registry_public_key, 32)?;
+    let registry_public_key_array: [u8; 32] = registry_public_key_bytes
+        .clone()
+        .try_into()
+        .map_err(|_| anyhow!("registry_public_key must be exactly 32 bytes"))?;
+    VerifyingKey::from_bytes(&registry_public_key_array)
+        .context("invalid registry Ed25519 public key")?;
+    let refresh_identity_bytes = read_limited(refresh_identity, MAX_AGE_IDENTITY_BYTES)?;
+    validate_age_identity_contents(&refresh_identity_bytes)
+        .with_context(|| format!("refresh identity {}", refresh_identity.display()))?;
+
+    // Trial-decrypt the delegated signer with the refresh identity before
+    // writing any outputs or enabling the timer. If the identity cannot open
+    // the ciphertext, or the decrypted public key does not match the root-
+    // authorized delegation, the install must fail closed here rather than
+    // silently succeed and then fail on every timer firing.
+    trial_decrypt_delegated_signer(delegated_key, refresh_identity, &delegation_artifact)
+        .context("trial decrypt of the delegated signer with the refresh identity failed")?;
+
+    ensure_root_owned_dir(Path::new(DELEGATED_DIR), 0o750)?;
+    ensure_root_owned_dir(Path::new(CREDENTIALS_RUN_DIR), 0o750)?;
+
+    let delegated_key_dest = PathBuf::from(DELEGATED_SIGNER_INSTALL_PATH);
+    let delegation_dest = PathBuf::from(DELEGATION_INSTALL_PATH);
+    let registry_public_key_dest = PathBuf::from(REGISTRY_PUBLIC_KEY_INSTALL_PATH);
+    let refresh_identity_dest = PathBuf::from(REFRESH_IDENTITY_INSTALL_PATH);
+    preflight_outputs(
+        [
+            &delegated_key_dest,
+            &delegation_dest,
+            &registry_public_key_dest,
+            &refresh_identity_dest,
+        ],
+        args.force,
+    )?;
+    commit_outputs(vec![
+        PendingOutput::new(&delegated_key_dest, delegated_key_bytes, 0o600),
+        PendingOutput::new(
+            &delegation_dest,
+            pretty_json_bytes(&delegation_artifact)?,
+            0o644,
+        ),
+        PendingOutput::new(&registry_public_key_dest, registry_public_key_bytes, 0o644),
+        PendingOutput::new(&refresh_identity_dest, refresh_identity_bytes, 0o600),
+    ])?;
+
+    let service_dest = PathBuf::from(TRUST_REFRESH_SERVICE_UNIT_PATH);
+    let timer_dest = PathBuf::from(TRUST_REFRESH_TIMER_UNIT_PATH);
+    preflight_outputs([&service_dest, &timer_dest], true)?;
+    commit_outputs(vec![
+        PendingOutput::new(
+            &service_dest,
+            trust_refresh_service_unit().into_bytes(),
+            0o644,
+        ),
+        PendingOutput::new(
+            &timer_dest,
+            trust_refresh_timer_unit(&args.refresh_interval).into_bytes(),
+            0o644,
+        ),
+    ])?;
+
+    if !args.no_enable {
+        run_systemctl(&["daemon-reload"])?;
+        run_systemctl(&["enable", "--now", "hyprstream-trust-refresh.timer"])?;
+    }
+    Ok(())
+}
+
+fn run_systemctl(args: &[&str]) -> Result<()> {
+    let status = Command::new("systemctl")
+        .args(args)
+        .status()
+        .with_context(|| format!("run systemctl {}", args.join(" ")))?;
+    ensure!(
+        status.success(),
+        "systemctl {} failed: {status}",
+        args.join(" ")
+    );
+    Ok(())
+}
+
+/// Refuse a refresh interval that is not a plain systemd time span of the
+/// form `<positive integer><s|min|h>`. The value is interpolated verbatim
+/// into the generated timer unit, so anything containing whitespace or
+/// control characters could inject unit directives, and a typo would only
+/// surface as a late systemd parse failure instead of failing the install.
+fn validate_refresh_interval(interval: &str) -> Result<()> {
+    let digits_ok = |digits: &str| {
+        !digits.is_empty()
+            && !digits.starts_with('0')
+            && digits.bytes().all(|byte| byte.is_ascii_digit())
+    };
+    let valid = interval
+        .strip_suffix("min")
+        .or_else(|| interval.strip_suffix('s'))
+        .or_else(|| interval.strip_suffix('h'))
+        .is_some_and(digits_ok);
+    ensure!(
+        valid,
+        "invalid --refresh-interval {interval:?}: use a positive integer with an s, min, or h \
+         suffix and no whitespace (for example 30min)"
+    );
+    Ok(())
+}
+
+/// The refresh identity is passed by path to `age --decrypt --identity`, which
+/// expects a plaintext identity file: optional `#` comment or blank lines plus
+/// at least one native X25519 identity line. Encrypted or plugin identities
+/// would make the unattended refresher fail at its first timer firing, so
+/// they are rejected at install time.
+fn validate_age_identity_contents(bytes: &[u8]) -> Result<()> {
+    let text = std::str::from_utf8(bytes).context("age identity file is not UTF-8 text")?;
+    let mut has_identity = false;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        ensure!(
+            line.starts_with("AGE-SECRET-KEY-1"),
+            "age identity file must contain only comment lines and plaintext \
+             AGE-SECRET-KEY-1... identity lines"
+        );
+        has_identity = true;
+    }
+    ensure!(
+        has_identity,
+        "age identity file contains no AGE-SECRET-KEY-1... identity line"
+    );
+    Ok(())
+}
+
+/// The refresher only ever needs the delegated (non-root) signer: it must
+/// never be able to sign directly with the root authority, matching the
+/// least-privilege split the ceremony (docs/deployment-trust-ceremony.md)
+/// establishes between minting and day-to-day operation. The installed
+/// refresh identity enforces the same split at the encryption layer: it is a
+/// `--signer-recipient` of the delegated signer only, so even with the unit's
+/// read access to the trust directory it can never open the operator-held
+/// root authority bundle, which is sealed to a disjoint recipient ring.
+fn trust_refresh_service_unit() -> String {
+    // The unit assumes the packaged binary location; the installer does not
+    // encode its own (possibly temporary) executable path into the unit.
+    format!(
+        r#"[Unit]
+Description=Hyprstream registry deployment credential refresh
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists={DEPLOYMENT_TRUST_DIR}/deployment-ca.hybrid
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/hyprstream trust mint-registry-jwt \
+  --public-ca {PUBLIC_CA_INSTALL_PATH} \
+  --authority-log {AUTHORITY_LOG_INSTALL_PATH} \
+  --authority-checkpoint {AUTHORITY_CHECKPOINT_INSTALL_PATH} \
+  --via-delegated-signer {DELEGATED_SIGNER_INSTALL_PATH} \
+  --delegation {DELEGATION_INSTALL_PATH} \
+  --registry-public-key {REGISTRY_PUBLIC_KEY_INSTALL_PATH} \
+  --identity {REFRESH_IDENTITY_INSTALL_PATH} \
+  --jwt {REGISTRY_JWT_INSTALL_PATH} \
+  --contract {CREDENTIALS_RUN_DIR}/deployment-trust.contract.json \
+  --force
+# mint-registry-jwt writes {REGISTRY_JWT_INSTALL_PATH} through the same
+# staged-file-then-rename commit path every other trust artifact uses, so a
+# concurrent reader never observes a partially-written credential.
+# RuntimeDirectory recreates the tmpfs-backed credentials directory after a
+# reboot (ReadWritePaths sandbox setup fails if it is missing); Preserve keeps
+# the minted credential alive after this oneshot unit exits.
+RuntimeDirectory=hyprstream/credentials
+RuntimeDirectoryMode=0750
+RuntimeDirectoryPreserve=yes
+ProtectSystem=strict
+ReadWritePaths={CREDENTIALS_RUN_DIR}
+ReadOnlyPaths={DEPLOYMENT_TRUST_DIR}
+NoNewPrivileges=yes
+"#
+    )
+}
+
+fn trust_refresh_timer_unit(refresh_interval: &str) -> String {
+    format!(
+        r#"[Unit]
+Description=Periodic refresh of the Hyprstream registry deployment credential
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec={refresh_interval}
+AccuracySec=1min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+"#
+    )
 }
 
 fn rotate_authority(args: &RotateAuthorityArgs) -> Result<()> {
@@ -2013,7 +2475,7 @@ fn now_unix_u64() -> Result<u64> {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::print_stderr)]
 mod tests {
     use super::*;
 
@@ -2575,5 +3037,318 @@ mod tests {
             &format!("{token}\n")
         )
         .is_err());
+    }
+
+    #[test]
+    fn trust_refresh_service_unit_only_uses_the_delegated_signer() {
+        let unit = trust_refresh_service_unit();
+        assert!(unit.contains(
+            "--via-delegated-signer /etc/hyprstream/trust/delegated/registry-delegated-signer.age"
+        ));
+        assert!(unit.contains(
+            "--delegation /etc/hyprstream/trust/delegated/registry-signer.delegation.json"
+        ));
+        assert!(unit.contains("--identity /etc/hyprstream/trust/delegated/refresh-identity"));
+        assert!(unit.contains("--jwt /run/hyprstream/credentials/registry-service.jwt"));
+        assert!(unit.contains("--force"));
+        assert!(
+            !unit.contains("--root") && !unit.contains("deployment-ca.age"),
+            "refresher unit must never reference the root authority — only the delegated signer"
+        );
+    }
+
+    #[test]
+    fn trust_refresh_service_unit_recreates_the_runtime_credentials_directory() {
+        let unit = trust_refresh_service_unit();
+        assert!(unit.contains("RuntimeDirectory=hyprstream/credentials"));
+        assert!(unit.contains("RuntimeDirectoryMode=0750"));
+        assert!(unit.contains("RuntimeDirectoryPreserve=yes"));
+        assert!(unit.contains("ReadWritePaths=/run/hyprstream/credentials"));
+    }
+
+    #[test]
+    fn trust_refresh_timer_unit_uses_the_requested_interval() {
+        let unit = trust_refresh_timer_unit("30min");
+        assert!(unit.contains("OnUnitActiveSec=30min"));
+        assert!(unit.contains("WantedBy=timers.target"));
+    }
+
+    #[test]
+    fn refresh_interval_accepts_only_plain_time_spans() {
+        for valid in ["30min", "45s", "1h", "90s"] {
+            validate_refresh_interval(valid).unwrap();
+        }
+        for invalid in [
+            "",
+            "30",
+            "30 min",
+            "0s",
+            "015min",
+            "30m",
+            "5hr",
+            "-5min",
+            "30min\nOnCalendar=*-*-* *:*:*",
+            "30min\n[Install]\nWantedBy=multi-user.target",
+        ] {
+            assert!(
+                validate_refresh_interval(invalid).is_err(),
+                "interval {invalid:?} was accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn refresh_identity_must_be_a_plaintext_age_identity() {
+        validate_age_identity_contents(
+            b"# created: 2026-01-01\n# public key: age1example\nAGE-SECRET-KEY-1EXAMPLE\n",
+        )
+        .unwrap();
+        for invalid in [
+            &b""[..],
+            b"# only comments\n",
+            b"age-encryption.org/v1\n-> X25519 ciphertext",
+            b"AGE-PLUGIN-YUBIKEY-1EXAMPLE\n",
+            b"\xff\xfe not utf-8 \xff",
+        ] {
+            assert!(
+                validate_age_identity_contents(invalid).is_err(),
+                "identity contents {invalid:?} were accepted"
+            );
+        }
+    }
+
+    fn current_uid() -> u32 {
+        nix::unistd::Uid::effective().as_raw()
+    }
+
+    /// A tempdir under the crate directory rather than the system temp dir:
+    /// ensure_owned_dir inspects every ancestor of the install path, and the
+    /// sticky world-writable system temp dir would be rejected as an ancestor.
+    fn owned_ancestry_tempdir() -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix("trust-install-test-")
+            .tempdir_in(env!("CARGO_MANIFEST_DIR"))
+            .unwrap()
+    }
+
+    #[test]
+    fn ensure_owned_dir_creates_missing_directory_with_mode() {
+        let base = owned_ancestry_tempdir();
+        let target = base.path().join("a/b/c");
+        ensure_owned_dir(&target, 0o750, current_uid()).unwrap();
+        let metadata = std::fs::metadata(&target).unwrap();
+        assert!(metadata.is_dir());
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o750);
+        // Idempotent: a second call against the same real directory succeeds.
+        ensure_owned_dir(&target, 0o750, current_uid()).unwrap();
+    }
+
+    #[test]
+    fn ensure_owned_dir_rejects_symlinked_target() {
+        let base = owned_ancestry_tempdir();
+        let real = base.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let link = base.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert!(ensure_owned_dir(&link, 0o755, current_uid()).is_err());
+    }
+
+    #[test]
+    fn ensure_owned_dir_rejects_group_writable_existing_component() {
+        let base = owned_ancestry_tempdir();
+        let mid = base.path().join("mid");
+        std::fs::create_dir(&mid).unwrap();
+        std::fs::set_permissions(&mid, std::fs::Permissions::from_mode(0o775)).unwrap();
+        let error = ensure_owned_dir(&mid.join("leaf"), 0o755, current_uid()).unwrap_err();
+        assert!(
+            error.to_string().contains("group/world writable"),
+            "unexpected rejection: {error}"
+        );
+    }
+
+    #[test]
+    fn ensure_owned_dir_rejects_symlinked_intermediate_component() {
+        let base = owned_ancestry_tempdir();
+        let real = base.path().join("real");
+        std::fs::create_dir_all(real.join("leaf")).unwrap();
+        let mid = base.path().join("mid");
+        std::os::unix::fs::symlink(&real, &mid).unwrap();
+        // The full path exists and its leaf is a real directory, but it is
+        // reached through a symlinked intermediate component.
+        let through_link = mid.join("leaf");
+        assert!(std::fs::metadata(&through_link).unwrap().is_dir());
+        assert!(ensure_owned_dir(&through_link, 0o755, current_uid()).is_err());
+    }
+
+    /// Generate a fresh age identity/recipient pair via `age-keygen`, returning
+    /// (identity_lines, recipient_string). Returns None when the `age-keygen`
+    /// binary is not available (CI without age installed).
+    fn age_keypair() -> Option<(String, String)> {
+        let output = std::process::Command::new("age-keygen")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let text = String::from_utf8(output.stdout).ok()?;
+        let recipient = text
+            .lines()
+            .find_map(|line| line.strip_prefix("# public key: ").map(str::to_owned))?;
+        let identity = text
+            .lines()
+            .find(|line| line.starts_with("AGE-SECRET-KEY-1"))?
+            .to_owned();
+        Some((identity, recipient))
+    }
+
+    /// Return true when the `age` binary is available on PATH.
+    fn age_available() -> bool {
+        std::process::Command::new("age")
+            .arg("--version")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok()
+    }
+
+    /// Build a temp-dir fixture: encrypts a delegated authority bundle to the
+    /// given recipient, writes the ciphertext and identity to temp files, and
+    /// returns (delegated_key_path, identity_path, public_bytes).
+    fn trial_fixture(
+        dir: &Path,
+        authority: &LoadedAuthority,
+        identity: &str,
+        recipient: &str,
+    ) -> (PathBuf, PathBuf, Vec<u8>) {
+        let public_bytes = authority.public_bytes();
+        let plaintext = serialize_secret_json(&authority.bundle).unwrap();
+        let encrypted = encrypt_age(&plaintext, &[recipient.to_owned()]).unwrap();
+        let delegated_key_path = dir.join("delegated.age");
+        std::fs::write(&delegated_key_path, &encrypted).unwrap();
+        let identity_path = dir.join("identity");
+        std::fs::write(&identity_path, identity).unwrap();
+        (delegated_key_path, identity_path, public_bytes)
+    }
+
+    fn placeholder_artifact(domain: &str, public_bytes: &[u8]) -> DelegationArtifact {
+        DelegationArtifact {
+            schema: DELEGATION_SCHEMA.to_owned(),
+            deployment_domain: domain.to_owned(),
+            authority_log_did: "did:web:placeholder".to_owned(),
+            delegated_public_key_b64: STANDARD.encode(public_bytes),
+            ucan_b64: STANDARD.encode(b"placeholder"),
+        }
+    }
+
+    #[test]
+    fn trial_decrypt_succeeds_when_identity_matches() {
+        if !age_available() {
+            eprintln!("skipping: age binary not on PATH");
+            return;
+        }
+        let Some((identity, recipient)) = age_keypair() else {
+            eprintln!("skipping: age-keygen binary not on PATH");
+            return;
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let authority = test_authority(AuthorityPurpose::RegistryDelegatedSigner, None);
+        let (delegated_key_path, identity_path, public_bytes) =
+            trial_fixture(dir.path(), &authority, &identity, &recipient);
+        let artifact = placeholder_artifact(&authority.bundle.deployment_domain, &public_bytes);
+
+        trial_decrypt_delegated_signer(&delegated_key_path, &identity_path, &artifact)
+            .expect("matching identity and artifact must pass trial decrypt");
+    }
+
+    #[test]
+    fn trial_decrypt_fails_when_identity_does_not_match() {
+        if !age_available() {
+            eprintln!("skipping: age binary not on PATH");
+            return;
+        }
+        let Some((identity, recipient)) = age_keypair() else {
+            eprintln!("skipping: age-keygen binary not on PATH");
+            return;
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let authority = test_authority(AuthorityPurpose::RegistryDelegatedSigner, None);
+        let (delegated_key_path, _identity_path, public_bytes) =
+            trial_fixture(dir.path(), &authority, &identity, &recipient);
+
+        // A different identity that cannot decrypt the ciphertext.
+        let wrong_identity = age_keypair().expect("age-keygen available").0;
+        let wrong_identity_path = dir.path().join("wrong-identity");
+        std::fs::write(&wrong_identity_path, &wrong_identity).unwrap();
+
+        let artifact = placeholder_artifact(&authority.bundle.deployment_domain, &public_bytes);
+
+        let err =
+            trial_decrypt_delegated_signer(&delegated_key_path, &wrong_identity_path, &artifact)
+                .unwrap_err();
+        assert!(
+            err.to_string().contains("cannot decrypt"),
+            "expected decrypt failure, got: {err}"
+        );
+    }
+
+    #[test]
+    fn trial_decrypt_fails_when_public_key_mismatch() {
+        if !age_available() {
+            eprintln!("skipping: age binary not on PATH");
+            return;
+        }
+        let Some((identity, recipient)) = age_keypair() else {
+            eprintln!("skipping: age-keygen binary not on PATH");
+            return;
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let authority = test_authority(AuthorityPurpose::RegistryDelegatedSigner, None);
+        let (delegated_key_path, identity_path, _public_bytes) =
+            trial_fixture(dir.path(), &authority, &identity, &recipient);
+
+        // Artifact claims a different public key than the one encrypted in the
+        // delegated signer ciphertext.
+        let other = test_authority(AuthorityPurpose::RegistryDelegatedSigner, None);
+        let artifact =
+            placeholder_artifact(&authority.bundle.deployment_domain, &other.public_bytes());
+
+        let err = trial_decrypt_delegated_signer(&delegated_key_path, &identity_path, &artifact)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("does not match"),
+            "expected public-key mismatch, got: {err}"
+        );
+    }
+
+    #[test]
+    fn trial_decrypt_fails_when_bundle_is_not_a_delegated_signer() {
+        if !age_available() {
+            eprintln!("skipping: age binary not on PATH");
+            return;
+        }
+        let Some((identity, recipient)) = age_keypair() else {
+            eprintln!("skipping: age-keygen binary not on PATH");
+            return;
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        // Root authority accidentally installed as the delegated signer.
+        let authority = test_authority(AuthorityPurpose::Root, None);
+        let (delegated_key_path, identity_path, public_bytes) =
+            trial_fixture(dir.path(), &authority, &identity, &recipient);
+        let artifact = placeholder_artifact(&authority.bundle.deployment_domain, &public_bytes);
+
+        let err = trial_decrypt_delegated_signer(&delegated_key_path, &identity_path, &artifact)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("not a RegistryDelegatedSigner"),
+            "expected purpose mismatch, got: {err}"
+        );
     }
 }
