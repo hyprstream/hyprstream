@@ -135,7 +135,9 @@ pub mod podspec;
 pub use hyprstream_rpc::registry::SocketKind;
 pub use hyprstream_rpc::resolver::Resolver;
 #[cfg(not(target_arch = "wasm32"))]
-pub use did_anchored::{DeploymentTrustSource, DidAnchors};
+pub use did_anchored::{
+    verify_anchor_material, DeploymentTrustSource, DidAnchors, VerifiedAnchorMaterial,
+};
 pub use plc_directory::{
     ConnectTimeDiscovery, DidOpSuccessorWitness, InMemoryPlcDirectoryStore, LivePlcDiscovery,
     PlcDirectory, PlcDirectoryRecord, PlcDirectoryStore, ResolvedPlcIdentity,

@@ -1711,6 +1711,61 @@ fn install_envelope_verify_config(oauth: Option<&hyprstream_core::config::OAuthC
              peer ML-DSA bindings required for cross-node traffic"
         );
     }
+
+    install_session_pq_overlay();
+}
+
+/// Install the session PQ binding overlay, the runtime anchoring path for
+/// clients no operator can pre-enroll (browsers and other device-generated
+/// identities).
+///
+/// It is consulted only after the admin-anchored store above misses, so it
+/// cannot displace an operator's enrollment, and a binding it establishes at
+/// first contact is capped at `Classical` assurance — it makes a request
+/// verifiable, it does not make the requester more trusted. Promotion to
+/// `PqHybrid` requires an out-of-band fingerprint comparison.
+///
+/// Set `HYPRSTREAM_SESSION_PQ_OVERLAY=0` for a mesh-only deployment that wants
+/// every unenrolled identity rejected at the envelope layer as before.
+///
+/// # Operator limitations at this revision — read before enabling
+///
+/// The overlay's approve / promote / revoke operations exist as library calls
+/// and have **no operator surface yet**: nothing here, no RPC method, no CLI.
+/// Two consequences an operator must know about up front:
+///
+/// - Every binding stays at first-contact provenance for its lifetime.
+///   Out-of-band promotion is unreachable, so the overlay cannot raise MAC
+///   assurance for anyone — a browser client is `Classical` and stays there.
+/// - A refused rebinding is loud but **unanswerable**. A client that rotates
+///   its ML-DSA-65 key while keeping its Ed25519 identity is refused here,
+///   cannot be approved (no surface), and cannot be routed around through the
+///   admin-anchored store (immutable after install). Restarting the daemon
+///   clears the overlay and is currently the only way through. Until the
+///   operator surface lands, plan rotations around a restart.
+fn install_session_pq_overlay() {
+    let disabled = std::env::var("HYPRSTREAM_SESSION_PQ_OVERLAY")
+        .map(|v| matches!(v.trim(), "0" | "false" | "off" | "no"))
+        .unwrap_or(false);
+    if disabled {
+        tracing::info!(
+            "session PQ overlay disabled by configuration; identities without an \
+             admin-anchored ML-DSA-65 key are rejected at the envelope layer"
+        );
+        return;
+    }
+    let overlay = std::sync::Arc::new(hyprstream_rpc::session_pq_overlay::SessionPqOverlay::new(
+        std::sync::Arc::new(hyprstream_rpc::session_pq_overlay::TracingPqBindingEventSink),
+    ));
+    if hyprstream_rpc::session_pq_overlay::install_session_pq_overlay(overlay).is_ok() {
+        tracing::info!(
+            "session PQ overlay installed: unenrolled identities bind their ML-DSA-65 key \
+             at first contact (verifiable, assurance capped at Classical); rebinding an \
+             established identity is refused and surfaced, never silently applied. \
+             No approve/promote/revoke surface exists yet: a refused rebinding requires \
+             a daemon restart to clear."
+        );
+    }
 }
 
 fn main() -> Result<()> {

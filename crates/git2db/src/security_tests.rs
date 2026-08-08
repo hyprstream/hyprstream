@@ -3,7 +3,7 @@
 //! This module contains security-focused tests to verify that all
 //! critical security fixes are working correctly.
 
-#![allow(clippy::unwrap_used)]
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use crate::config::Git2DBConfig;
 use crate::errors::Git2DBError;
@@ -374,5 +374,422 @@ mod regression_tests {
         // Should have successful registrations
         let success_count = results.iter().filter(|r| r.is_ok()).count();
         assert!(success_count > 0, "At least some registrations should succeed");
+    }
+}
+
+/// Adversarial tests for the untrusted-repo clone guards (issue #1430):
+/// submodule auto-init, content-filter smudge (XET/LFS), and credential
+/// scoping must all be refused for a [`crate::clone_options::CloneTrust::Untrusted`]
+/// clone. Each guard is proven load-bearing by a matching positive control —
+/// the identical fixture cloned WITHOUT the guard in effect, showing the
+/// unguarded behavior (submodule fetched / filter expanded) actually occurs.
+/// Per the task, each guard was manually verified to fail (assertion fails,
+/// not "doesn't compile") when its corresponding clamp in
+/// `CloneOptions::effective_submodule_mode` / `effective_filter_mode` /
+/// `validate_trust` was temporarily removed — see the PR description /
+/// RESULT report for the exact removal-and-rerun transcript.
+mod untrusted_repo_guards {
+    use crate::callback_config::CallbackConfigBuilder;
+    use crate::clone_options::{CloneOptions, CloneTrust, FilterMode, SubmoduleMode};
+    use crate::config::Git2DBConfig;
+    use crate::errors::Git2DBError;
+    use crate::manager::GitManager;
+    use git2::{Repository, Signature};
+    use std::path::Path;
+    use tempfile::tempdir;
+
+    fn test_manager() -> GitManager {
+        let mut config = Git2DBConfig::default();
+        config.performance.auto_cleanup = false; // avoid background task spawning in tests
+        GitManager::new(config)
+    }
+
+    fn file_url(path: &Path) -> String {
+        format!("file://{}", path.display())
+    }
+
+    /// Commit whatever is currently staged in `repo`'s index, against
+    /// whatever parent HEAD currently resolves to (none for the first
+    /// commit).
+    fn commit_index(repo: &Repository, message: &str) -> git2::Oid {
+        let sig = Signature::now("git2db-test", "test@git2db.invalid").unwrap();
+        let mut index = repo.index().unwrap();
+        let tree_id = index.write_tree().unwrap();
+        let tree = repo.find_tree(tree_id).unwrap();
+        let parent = repo.head().ok().and_then(|h| h.peel_to_commit().ok());
+        let parents: Vec<&git2::Commit<'_>> = parent.iter().collect();
+        repo.commit(Some("HEAD"), &sig, &sig, message, &tree, &parents)
+            .unwrap()
+    }
+
+    /// A small "target" repository with one committed file — stands in for
+    /// the dependency a submodule would pull in.
+    fn init_target_repo(path: &Path, filename: &str, content: &str) {
+        let repo = Repository::init(path).unwrap();
+        std::fs::write(path.join(filename), content).unwrap();
+        repo.index()
+            .unwrap()
+            .add_path(Path::new(filename))
+            .unwrap();
+        repo.index().unwrap().write().unwrap();
+        commit_index(&repo, "initial");
+    }
+
+    /// An "outer" repository — standing in for an untrusted PR head — that
+    /// declares a real libgit2 submodule (proper `.gitmodules` + gitlink tree
+    /// entry, via `git_submodule_add_setup`/`clone`/`add_finalize`, exactly
+    /// as a real `git submodule add` would) pointing at `target_url`.
+    fn init_outer_repo_with_submodule(path: &Path, target_url: &str, submodule_path: &str) {
+        let repo = Repository::init(path).unwrap();
+        std::fs::write(path.join("outer.txt"), "outer repo content\n").unwrap();
+        repo.index()
+            .unwrap()
+            .add_path(Path::new("outer.txt"))
+            .unwrap();
+        repo.index().unwrap().write().unwrap();
+        commit_index(&repo, "outer initial");
+
+        let mut submodule = repo
+            .submodule(target_url, Path::new(submodule_path), true)
+            .expect("submodule add_setup");
+        submodule.clone(None).expect("submodule clone step");
+        submodule.add_finalize().expect("submodule add_finalize");
+        commit_index(&repo, "add submodule");
+    }
+
+    /// A repository with a file bearing the `ident` gitattribute — this
+    /// exercises libgit2's own built-in `ident` content filter, which is
+    /// registered and invoked through the *identical* `git_filter_register` +
+    /// `.gitattributes`-driven mechanism that `git-xet-filter` uses for the
+    /// real XET/LFS smudge filter (see `crates/git-xet-filter/src/filter.rs`:
+    /// same filter API, same `attributes` string match, same libgit2 checkout
+    /// pipeline). We use `ident` instead of the real XET filter because
+    /// invoking real XET smudge requires a live CAS endpoint / `XETHUB_TOKEN`
+    /// — out of scope for a hermetic unit test. `disable_filters(true)`
+    /// suppresses `ident` and XET/LFS identically, because both run through
+    /// the same libgit2 filter-application code path during checkout.
+    fn init_repo_with_ident_file(path: &Path) {
+        let repo = Repository::init(path).unwrap();
+        std::fs::write(path.join(".gitattributes"), "id.txt ident\n").unwrap();
+        std::fs::write(path.join("id.txt"), "$Id$\n").unwrap();
+        {
+            let mut index = repo.index().unwrap();
+            index.add_path(Path::new(".gitattributes")).unwrap();
+            index.add_path(Path::new("id.txt")).unwrap();
+            index.write().unwrap();
+        }
+        commit_index(&repo, "add ident file");
+    }
+
+    // ---- Guard 1: SubmoduleMode ----
+
+    /// Adversarial: a repo with `.gitmodules` (a real, properly-registered
+    /// libgit2 submodule) cloned as `CloneTrust::Untrusted` must NOT have its
+    /// submodule initialized — even though the caller explicitly (and
+    /// wrongly) requested `SubmoduleMode::Enabled`. This is the exact
+    /// acceptance scenario named in issue #1430.
+    #[tokio::test]
+    async fn untrusted_clone_does_not_initialize_submodule() {
+        let manager = test_manager();
+
+        let target_dir = tempdir().unwrap();
+        init_target_repo(target_dir.path(), "secret.txt", "attacker-controlled payload\n");
+
+        let outer_dir = tempdir().unwrap();
+        init_outer_repo_with_submodule(
+            outer_dir.path(),
+            &file_url(target_dir.path()),
+            "vendor/target",
+        );
+
+        let dest_dir = tempdir().unwrap();
+        let dest_path = dest_dir.path().join("clone");
+
+        let options = CloneOptions::builder()
+            .trust(CloneTrust::Untrusted)
+            // Attempted override — Untrusted must clamp this regardless.
+            .submodule_mode(SubmoduleMode::Enabled)
+            .build();
+
+        let repo = manager
+            .clone_repository(&file_url(outer_dir.path()), &dest_path, Some(options))
+            .await
+            .expect("untrusted clone of the outer repo itself must still succeed");
+
+        let submodule = repo
+            .find_submodule("vendor/target")
+            .expect(".gitmodules entry must still be visible (only init/update are refused)");
+        assert!(
+            submodule.open().is_err(),
+            "submodule must NOT be checked out under CloneTrust::Untrusted, even though the \
+             caller requested SubmoduleMode::Enabled"
+        );
+        assert!(
+            !dest_path.join("vendor/target/secret.txt").exists(),
+            "submodule content must not have been fetched from the (attacker-controlled) \
+             submodule URL"
+        );
+    }
+
+    /// Positive control for the test above: the identical fixture, but
+    /// `CloneTrust::Trusted` + `SubmoduleMode::Enabled` DOES fetch and check
+    /// out the submodule. This proves the guard above is load-bearing — a
+    /// test that passed regardless of the guard would prove nothing.
+    #[tokio::test]
+    async fn trusted_clone_with_submodule_enabled_does_initialize_submodule() {
+        let manager = test_manager();
+
+        let target_dir = tempdir().unwrap();
+        init_target_repo(target_dir.path(), "secret.txt", "attacker-controlled payload\n");
+
+        let outer_dir = tempdir().unwrap();
+        init_outer_repo_with_submodule(
+            outer_dir.path(),
+            &file_url(target_dir.path()),
+            "vendor/target",
+        );
+
+        let dest_dir = tempdir().unwrap();
+        let dest_path = dest_dir.path().join("clone");
+
+        let options = CloneOptions::builder()
+            .trust(CloneTrust::Trusted)
+            .submodule_mode(SubmoduleMode::Enabled)
+            .build();
+
+        let repo = manager
+            .clone_repository(&file_url(outer_dir.path()), &dest_path, Some(options))
+            .await
+            .expect("trusted clone should succeed");
+
+        let submodule = repo.find_submodule("vendor/target").unwrap();
+        assert!(
+            submodule.open().is_ok(),
+            "submodule SHOULD be checked out when trusted + explicitly enabled"
+        );
+        let content = std::fs::read_to_string(dest_path.join("vendor/target/secret.txt"))
+            .expect("submodule content should have been fetched to disk");
+        assert_eq!(content, "attacker-controlled payload\n");
+    }
+
+    /// The secure DEFAULT (no explicit trust/mode at all) also leaves the
+    /// submodule uninitialized — matches pre-#1430 behavior, where submodule
+    /// initialization was never wired into `clone_repository` in the first
+    /// place. Guards against a future default flip being unnoticed.
+    #[tokio::test]
+    async fn default_clone_options_do_not_initialize_submodule() {
+        let manager = test_manager();
+
+        let target_dir = tempdir().unwrap();
+        init_target_repo(target_dir.path(), "secret.txt", "payload\n");
+        let outer_dir = tempdir().unwrap();
+        init_outer_repo_with_submodule(
+            outer_dir.path(),
+            &file_url(target_dir.path()),
+            "vendor/target",
+        );
+
+        let dest_dir = tempdir().unwrap();
+        let dest_path = dest_dir.path().join("clone");
+
+        let repo = manager
+            .clone_repository(
+                &file_url(outer_dir.path()),
+                &dest_path,
+                Some(CloneOptions::default()),
+            )
+            .await
+            .unwrap();
+
+        assert!(repo.find_submodule("vendor/target").unwrap().open().is_err());
+    }
+
+    // ---- Guard 2: FilterMode ----
+
+    /// Adversarial: cloning as `CloneTrust::Untrusted` must not run ANY
+    /// libgit2 content filter during checkout — proven here via the built-in
+    /// `ident` filter (see `init_repo_with_ident_file` doc comment for why
+    /// this proxies XET/LFS). The caller even (wrongly) requests
+    /// `FilterMode::Enabled`; `Untrusted` must clamp it to `Passthrough`
+    /// regardless.
+    #[tokio::test]
+    async fn untrusted_clone_does_not_expand_ident_filter() {
+        let manager = test_manager();
+
+        let src_dir = tempdir().unwrap();
+        init_repo_with_ident_file(src_dir.path());
+
+        let dest_dir = tempdir().unwrap();
+        let dest_path = dest_dir.path().join("clone");
+
+        let options = CloneOptions::builder()
+            .trust(CloneTrust::Untrusted)
+            // Attempted override — Untrusted must clamp this regardless.
+            .filter_mode(FilterMode::Enabled)
+            .build();
+
+        manager
+            .clone_repository(&file_url(src_dir.path()), &dest_path, Some(options))
+            .await
+            .expect("untrusted clone should still succeed");
+
+        let content = std::fs::read_to_string(dest_path.join("id.txt")).unwrap();
+        assert_eq!(
+            content, "$Id$\n",
+            "content filters (ident, standing in for XET/LFS smudge) must NOT run under \
+             CloneTrust::Untrusted"
+        );
+    }
+
+    /// Positive control: the identical fixture, `CloneTrust::Trusted` +
+    /// `FilterMode::Enabled` (the default), DOES expand the ident filter —
+    /// proving `disable_filters` above is what suppressed it, not some
+    /// unrelated reason the file happened to stay unexpanded.
+    #[tokio::test]
+    async fn trusted_clone_with_filters_enabled_does_expand_ident_filter() {
+        let manager = test_manager();
+
+        let src_dir = tempdir().unwrap();
+        init_repo_with_ident_file(src_dir.path());
+
+        let dest_dir = tempdir().unwrap();
+        let dest_path = dest_dir.path().join("clone");
+
+        let options = CloneOptions::builder()
+            .trust(CloneTrust::Trusted)
+            .filter_mode(FilterMode::Enabled)
+            .build();
+
+        manager
+            .clone_repository(&file_url(src_dir.path()), &dest_path, Some(options))
+            .await
+            .unwrap();
+
+        let content = std::fs::read_to_string(dest_path.join("id.txt")).unwrap();
+        assert!(
+            content.starts_with("$Id: "),
+            "the ident filter SHOULD expand $Id$ when filters are enabled and trusted, got: \
+             {content:?}"
+        );
+    }
+
+    // ---- Guard 3: scoped-token-only / no ambient fallback ----
+
+    /// Adversarial: an untrusted clone request carrying an unscoped
+    /// (`host: None`) token must be refused BEFORE any network operation is
+    /// attempted — proven by pointing the clone at an unresolvable
+    /// `.invalid` host and asserting the failure is `Git2DBError::Configuration`
+    /// (from `validate_trust`), not a network/DNS error that would indicate
+    /// the guard let the request through to the transport layer.
+    #[tokio::test]
+    async fn untrusted_clone_rejects_unscoped_token_before_network() {
+        use crate::auth::AuthStrategy;
+
+        let manager = test_manager();
+        let options = CloneOptions::builder()
+            .trust(CloneTrust::Untrusted)
+            .callback_config(
+                CallbackConfigBuilder::new()
+                    .auth(AuthStrategy::Token {
+                        token: "should-never-be-sent".to_owned(),
+                        host: None,
+                    })
+                    .build(),
+            )
+            .build();
+
+        let dest_dir = tempdir().unwrap();
+        let result = manager
+            .clone_repository(
+                "https://untrusted-guard-test.invalid/should-never-be-fetched.git",
+                &dest_dir.path().join("clone"),
+                Some(options),
+            )
+            .await
+            .map(|_repo| ());
+
+        match result {
+            Err(Git2DBError::Configuration { message }) => {
+                assert!(
+                    message.contains("unscoped"),
+                    "expected the unscoped-token refusal message, got: {message}"
+                );
+            }
+            other => panic!(
+                "expected Git2DBError::Configuration from validate_trust (refused before any \
+                 network attempt), got: {other:?}"
+            ),
+        }
+    }
+
+    /// Same shape, but for `AuthMode::AllowAmbient` under `Untrusted`.
+    #[tokio::test]
+    async fn untrusted_clone_rejects_allow_ambient_before_network() {
+        use crate::callback_config::AuthMode;
+
+        let manager = test_manager();
+        let options = CloneOptions::builder()
+            .trust(CloneTrust::Untrusted)
+            .callback_config(
+                CallbackConfigBuilder::new()
+                    .auth_mode(AuthMode::AllowAmbient)
+                    .build(),
+            )
+            .build();
+
+        let dest_dir = tempdir().unwrap();
+        let result = manager
+            .clone_repository(
+                "https://untrusted-guard-test.invalid/should-never-be-fetched.git",
+                &dest_dir.path().join("clone"),
+                Some(options),
+            )
+            .await
+            .map(|_repo| ());
+
+        assert!(
+            matches!(result, Err(Git2DBError::Configuration { .. })),
+            "expected Git2DBError::Configuration from validate_trust, got: {result:?}"
+        );
+    }
+
+    /// A host-scoped token IS accepted under `Untrusted` and the clone
+    /// proceeds normally — the scoped-token-only path this whole mode exists
+    /// to allow (e.g. a merge gate's scoped GitHub App installation token).
+    #[tokio::test]
+    async fn untrusted_clone_accepts_host_scoped_token() {
+        use crate::auth::AuthStrategy;
+
+        let manager = test_manager();
+        let src_dir = tempdir().unwrap();
+        init_target_repo(src_dir.path(), "readme.txt", "hello\n");
+
+        // The token is scoped to a host the fixture's file:// URL does not
+        // match, but that's fine here: we're only proving validate_trust
+        // lets a host-scoped token past construction-time validation (it is
+        // simply never offered for a `file://` URL, which the credential
+        // callback never even gets invoked for on a local transport).
+        let options = CloneOptions::builder()
+            .trust(CloneTrust::Untrusted)
+            .callback_config(
+                CallbackConfigBuilder::new()
+                    .auth(AuthStrategy::Token {
+                        token: "scoped".to_owned(),
+                        host: Some("github.com".to_owned()),
+                    })
+                    .build(),
+            )
+            .build();
+
+        let dest_dir = tempdir().unwrap();
+        let result = manager
+            .clone_repository(&file_url(src_dir.path()), &dest_dir.path().join("clone"), Some(options))
+            .await
+            .map(|_repo| ());
+
+        assert!(
+            result.is_ok(),
+            "a host-scoped token must be accepted under Untrusted, got: {result:?}"
+        );
     }
 }

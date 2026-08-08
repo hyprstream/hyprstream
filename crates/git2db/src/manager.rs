@@ -34,7 +34,7 @@ fn ensure_libgit2_initialized() {
     });
 }
 
-use crate::clone_options::CloneOptions;
+use crate::clone_options::{CloneOptions, SubmoduleMode};
 use crate::config::Git2DBConfig;
 use crate::errors::{Git2DBError, Git2DBResult};
 use crate::repository::{CacheStats, RepositoryCache};
@@ -513,6 +513,11 @@ impl GitManager {
         let target_path = target_path.to_path_buf();
         let mut options = options.unwrap_or_else(|| self.default_clone_options());
 
+        // Refuse to even start the network operation if an `Untrusted` clone
+        // is misconfigured with ambient auth or an unscoped token — see
+        // `CloneOptions::validate_trust` (issue #1430).
+        options.validate_trust()?;
+
         // libgit2's local transport rejects shallow fetch over `file://` —
         // disable it here so callers that default to prefer_shallow (the
         // global config default) don't get an opaque failure when cloning a
@@ -592,6 +597,25 @@ impl GitManager {
             })?;
 
             info!("Successfully cloned repository to {:?}", validated_path);
+
+            // Submodule handling. `submodule_mode` here is the value already
+            // resolved by `CloneOptions::effective_submodule_mode` — the
+            // `CloneTrust::Untrusted` clamp has already forced it to
+            // `Disabled` for an untrusted clone by the time it reaches here,
+            // so this is the ONLY place a fresh clone's submodules are
+            // touched. A `.gitmodules` submodule URL is taken verbatim from
+            // the just-cloned repository's own content, so initializing it
+            // under `Disabled` would fetch from an attacker-chosen remote for
+            // an untrusted repo (issue #1430).
+            if git2_options.submodule_mode == SubmoduleMode::Enabled {
+                init_submodules(&repo)?;
+            } else {
+                debug!(
+                    "Skipping submodule initialization for {:?} (SubmoduleMode::Disabled)",
+                    validated_path
+                );
+            }
+
             Ok(repo)
         })
         .await
@@ -761,6 +785,48 @@ impl GitManager {
     pub fn driver_registry(&self) -> &Arc<DriverRegistry> {
         &self.driver_registry
     }
+}
+
+/// Initialize and update every submodule declared by `repo`'s `.gitmodules`.
+///
+/// Equivalent to `git submodule init && git submodule update`. Mirrors
+/// `Git2DB::init_submodules` (registry.rs), which performs the same operation
+/// for the registry's own tracked-repos-as-submodules; this free function is
+/// the equivalent for an arbitrary freshly-cloned repository.
+///
+/// Callers MUST gate this behind [`crate::clone_options::SubmoduleMode`] —
+/// a submodule's URL is taken verbatim from the repository's own
+/// `.gitmodules` content, so calling this against an untrusted repository
+/// means fetching from an attacker-chosen remote. See issue #1430.
+fn init_submodules(repo: &Repository) -> Git2DBResult<()> {
+    let submodules = repo
+        .submodules()
+        .map_err(|e| Git2DBError::submodule("*", format!("Failed to list submodules: {e}")))?;
+
+    if submodules.is_empty() {
+        debug!("No submodules found in cloned repository");
+        return Ok(());
+    }
+
+    info!("Initializing {} submodule(s)", submodules.len());
+
+    for mut submodule in submodules {
+        let name = submodule.name().unwrap_or("unknown").to_owned();
+
+        debug!("Initializing submodule: {}", name);
+        submodule
+            .init(false)
+            .map_err(|e| Git2DBError::submodule(&name, format!("Failed to init: {e}")))?;
+
+        let mut update_opts = git2::SubmoduleUpdateOptions::new();
+        submodule
+            .update(true, Some(&mut update_opts))
+            .map_err(|e| Git2DBError::submodule(&name, format!("Failed to update: {e}")))?;
+
+        info!("Initialized submodule: {}", name);
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]

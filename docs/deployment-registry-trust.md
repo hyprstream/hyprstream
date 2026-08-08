@@ -1,5 +1,10 @@
 # Deployment registry trust provisioning
 
+> This document covers deployment-level trust: the OS-owned CA pin, authority
+> log/checkpoint, and registry credential below. It does not cover
+> `bootstrap-pubkeys`, the unrelated node-local, unattested service-key file —
+> see [bootstrap-pubkeys-format.md](bootstrap-pubkeys-format.md).
+
 ## Terminology
 
 Four words describe overlapping scopes in this codebase and its docs; they
