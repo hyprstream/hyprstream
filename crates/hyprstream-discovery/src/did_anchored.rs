@@ -318,9 +318,10 @@ fn reach_from_capsule(verified: &VerifiedCapsule, document: &Value) -> Result<Tr
         })
         .ok_or_else(|| {
             anyhow::anyhow!(
-                "capsule has no NinePExport service entry {DEPLOYMENT_REACH_SERVICE:?} for deployment reach; \
-                 the pinned did:at9p must be an ANCHOR capsule signed by the deployment CA, not a node \
-                 identity capsule — mint one with `hyprstream trust mint-anchor-capsule` and publish it \
+"capsule has no NinePExport service entry {DEPLOYMENT_REACH_SERVICE:?} for deployment reach; \
+                 the pinned did:at9p must be an ANCHOR capsule signed by the deployment CA, not a node's \
+                 own identity capsule (e.g. the `#pds` capsule a node's OAuth service renders for \
+                 itself) — mint one with `hyprstream trust mint-anchor-capsule` and publish it \
                  (with its did.json) under the deployment well-known directory"
             )
         })?;
