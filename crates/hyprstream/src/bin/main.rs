@@ -1547,23 +1547,42 @@ fn resolve_service_vk(service_name: &str) -> Option<VerifyingKey> {
     let Ok(secrets_dir) = HyprConfig::resolve_secrets_dir() else {
         return None;
     };
-    // Only the Ed25519 half is needed here: the ML-DSA-65 half of these same
-    // entries is anchored into the process-global PQ trust store when the
-    // envelope verify config is installed (that store is immutable afterwards,
-    // so it is seeded once at construction rather than lazily here).
-    if let Ok(pubkeys) = hyprstream_core::auth::identity_store::load_bootstrap_pubkeys(&secrets_dir) {
-        for (name, vk) in &pubkeys {
-            trust.insert(
-                *vk,
-                hyprstream_service::Attestation {
-                    scopes: std::iter::once(name.clone()).collect(),
-                    subject: None,
-                    jwt: None,
-                    expires_at: 0,
-                    attested_by: None,
-                },
-            );
-        }
+    // Load the full entries so the hybrid requirement can be enforced before
+    // anything is trusted. Only the Ed25519 half is inserted here: the
+    // ML-DSA-65 half of these same entries is anchored into the process-global
+    // PQ trust store when the envelope verify config is installed (that store
+    // is immutable afterwards, so it is seeded once at construction rather
+    // than lazily here).
+    let entries =
+        match hyprstream_core::auth::identity_store::load_bootstrap_pubkeys_hybrid(&secrets_dir) {
+            Ok(entries) => entries,
+            Err(e) => {
+                tracing::error!("bootstrap-pubkeys could not be read: {e:#}");
+                return None;
+            }
+        };
+    // A classical-only service entry is refused rather than seeded. Seeding it
+    // would not fail safe by half-measures: the service would be trusted
+    // classically here and then denied at envelope verification for having no
+    // anchored post-quantum key, with an error that names neither the file nor
+    // the fix. Refusing here reports the actual provisioning fault.
+    if let Err(e) =
+        hyprstream_core::auth::identity_store::ensure_bootstrap_pubkeys_hybrid(&entries)
+    {
+        tracing::error!("{e:#}");
+        return None;
+    }
+    for (name, entry) in &entries {
+        trust.insert(
+            entry.ed25519,
+            hyprstream_service::Attestation {
+                scopes: std::iter::once(name.clone()).collect(),
+                subject: None,
+                jwt: None,
+                expires_at: 0,
+                attested_by: None,
+            },
+        );
     }
     trust.resolve_one(service_name)
 }
@@ -1576,6 +1595,21 @@ async fn install_process_production_resolver(
     signing_key: &SigningKey,
     config: &HyprConfig,
 ) -> Result<bool> {
+    // Every service identity this node provisions is hybrid, so a classical
+    // service entry means the node was provisioned by a pre-hybrid wizard and
+    // its services can never be anchored for post-quantum verification. Fail
+    // startup here, where the fix can be named, instead of letting each RPC
+    // fail later with an opaque "no anchored ML-DSA-65 signer key". An
+    // unprovisioned node has no entries and is unaffected.
+    //
+    // Scoped to this node's OWN service identities. External classical clients
+    // and federated peers do not appear in this file and are not affected.
+    if let Ok(secrets_dir) = HyprConfig::resolve_secrets_dir() {
+        let entries =
+            hyprstream_core::auth::identity_store::load_bootstrap_pubkeys_hybrid(&secrets_dir)?;
+        hyprstream_core::auth::identity_store::ensure_bootstrap_pubkeys_hybrid(&entries)?;
+    }
+
     // The bootstrap pins the discovery service key from the process trust
     // store; in CLI/service-start mode nothing has seeded it yet. Seed from
     // the node's own bootstrap-pubkeys (the same source resolve_service_vk
@@ -2198,6 +2232,30 @@ fn main() -> Result<()> {
         }
     }
 
+    // ── `service repair` early dispatch ──────────────────────────────────────
+    // `service repair` must run on a partially-broken install — including one
+    // whose bootstrap-pubkeys is stale (classical-only) and trips the hybrid
+    // gate below. Dispatch it before the gate so the operator always has an
+    // in-product diagnostic, and let run_repair_checks flag the stale file.
+    if let Some(("service", sub_m)) = matches.subcommand() {
+        if let Some(("repair", _)) = sub_m.subcommand() {
+            let verbose = sub_m
+                .subcommand_matches("repair")
+                .map(|m| m.get_flag("verbose"))
+                .unwrap_or(false);
+            let models_dir = config.models_dir().clone();
+            return with_runtime(
+                RuntimeConfig {
+                    device: DeviceConfig::request_cpu(),
+                    multi_threaded: true,
+                },
+                || async move {
+                    hyprstream_core::cli::service_handlers::run_repair_checks(&models_dir, verbose).await
+                },
+            );
+        }
+    }
+
     // Start registry service ONCE at CLI level
     let _registry_runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -2420,8 +2478,13 @@ fn main() -> Result<()> {
                                         )?,
                                     );
 
-                                    // Load bootstrap pubkeys (all service pubkeys) into trust store
-                                    if let Ok(pubkeys) = hyprstream_core::auth::identity_store::load_bootstrap_pubkeys(&secrets_dir) {
+                                    // Load bootstrap pubkeys (all service pubkeys) into trust store.
+                                    // Service identities are hybrid by construction; a classical
+                                    // entry is stale provisioning and is refused, not trusted.
+                                    if let Ok(entries) = hyprstream_core::auth::identity_store::load_bootstrap_pubkeys_hybrid(&secrets_dir) {
+                                        hyprstream_core::auth::identity_store::ensure_bootstrap_pubkeys_hybrid(&entries)?;
+                                        let pubkeys: std::collections::HashMap<String, VerifyingKey> =
+                                            entries.into_iter().map(|(n, e)| (n, e.ed25519)).collect();
                                         for (svc_name, vk) in &pubkeys {
                                             hyprstream_service::global_trust_store().insert(
                                                 *vk,
@@ -2492,12 +2555,17 @@ fn main() -> Result<()> {
                                         )?,
                                     );
 
-                                    // Load bootstrap pubkeys (all service pubkeys) into trust store
-                                    let pubkeys = hyprstream_core::auth::identity_store::load_bootstrap_pubkeys(&secrets_dir)
+                                    // Load bootstrap pubkeys (all service pubkeys) into trust store.
+                                    // Service identities are hybrid by construction; a classical
+                                    // entry is stale provisioning and is refused, not trusted.
+                                    let entries = hyprstream_core::auth::identity_store::load_bootstrap_pubkeys_hybrid(&secrets_dir)
                                         .context("Bootstrap pubkeys not found — run 'hyprstream wizard' first")?;
-                                    if pubkeys.is_empty() {
+                                    if entries.is_empty() {
                                         anyhow::bail!("Bootstrap pubkeys file is empty — run 'hyprstream wizard' first");
                                     }
+                                    hyprstream_core::auth::identity_store::ensure_bootstrap_pubkeys_hybrid(&entries)?;
+                                    let pubkeys: std::collections::HashMap<String, VerifyingKey> =
+                                        entries.into_iter().map(|(n, e)| (n, e.ed25519)).collect();
                                     for (svc_name, vk) in &pubkeys {
                                         hyprstream_service::global_trust_store().insert(
                                             *vk,
@@ -2993,6 +3061,10 @@ fn main() -> Result<()> {
                 }
 
                 ServiceAction::Repair { verbose } => {
+                    // Normally handled by the early dispatch above (before
+                    // the hybrid gate). This arm is a defense-in-depth fallback
+                    // that runs the same diagnostic checks if the early
+                    // dispatch is ever bypassed.
                     let models_dir = config_for_service.models_dir().clone();
                     with_runtime(
                         RuntimeConfig {
@@ -3000,7 +3072,7 @@ fn main() -> Result<()> {
                             multi_threaded: true,
                         },
                         || async move {
-                            handle_service_install(&models_dir, &services, None, false, false, hyprstream_service::ServiceTarget::User, verbose).await
+                            hyprstream_core::cli::service_handlers::run_repair_checks(&models_dir, verbose).await
                         },
                     )?;
                 }

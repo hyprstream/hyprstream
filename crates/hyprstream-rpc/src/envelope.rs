@@ -1842,6 +1842,17 @@ impl SignedEnvelope {
         // that peer — while an identity with no anchor keeps the classical
         // floor, so a deployment holding no hybrid material behaves exactly
         // as before.
+        //
+        // The unanchored branch is DELIBERATE INTEROP POLICY, not laxity, and
+        // must not be tightened here. It is the only place a signer this node
+        // does not itself provision — an external client, or a federated peer
+        // whose key comes from its own published document — can be admitted on
+        // terms other than our own. This node's own service identities are
+        // always provisioned hybrid and therefore always anchored, so making
+        // them mandatorily hybrid is achieved entirely by what gets anchored,
+        // and needs no change on this line. Deciding what the unanchored
+        // branch may admit is a separate, interop-facing question; do not
+        // settle it as a side effect of an internal-identity change.
         let anchor = if verify_policy.uses_pq() {
             Some(self.resolve_pq_anchor(pq_store)?)
         } else {
@@ -1874,6 +1885,7 @@ impl SignedEnvelope {
                     overlay.surface_rebind(self.cnf, presented);
                 }
             }
+
             return Err(EnvelopeError::PqSignatureInvalid(
                 "presented ML-DSA-65 key differs from this identity's established binding; \
                  rebinding requires explicit approval"
@@ -4988,6 +5000,54 @@ mod tests {
         // Unanchored service in the SAME store keeps the classical floor.
         let legacy = SignedEnvelope::new_signed(RequestEnvelope::anonymous(vec![7]), &legacy_sk);
         legacy.verify_with(&legacy_vk, &cache, Some(&store), CryptoPolicy::Classical)?;
+        Ok(())
+    }
+
+    /// The interop guarantee, in the shape a real deployment has it.
+    ///
+    /// Every internal service identity is provisioned hybrid and is therefore
+    /// anchored, so the store is non-empty and PQ is enforced for all of them.
+    /// An external classical client — an identity this node does not provision
+    /// and never anchors — must keep verifying on its Ed25519 signature alone
+    /// in that same process, against that same store. Making internal service
+    /// identities mandatorily hybrid must not reach this path.
+    #[test]
+    fn unanchored_interop_client_still_verifies_classically() -> crate::EnvelopeResult<()> {
+        let cache = TestNonceCache::new();
+
+        // Two internal services, both hybrid and both anchored.
+        let (svc_a_sk, svc_a_vk) = generate_signing_keypair();
+        let (svc_b_sk, svc_b_vk) = generate_signing_keypair();
+        let (svc_a_pq_sk, svc_a_pq_vk) = crate::crypto::pq::ml_dsa_generate_keypair();
+        let (svc_b_pq_sk, svc_b_pq_vk) = crate::crypto::pq::ml_dsa_generate_keypair();
+        let mut store = KeyedPqTrustStore::new();
+        store.bind(svc_a_vk.to_bytes(), &svc_a_pq_vk);
+        store.bind(svc_b_vk.to_bytes(), &svc_b_pq_vk);
+
+        // Both services verify hybrid, and neither can fall back to classical.
+        for (sk, vk, pq_sk, tag) in [
+            (&svc_a_sk, &svc_a_vk, &svc_a_pq_sk, 10u8),
+            (&svc_b_sk, &svc_b_vk, &svc_b_pq_sk, 11u8),
+        ] {
+            SignedEnvelope::new_signed_hybrid(RequestEnvelope::anonymous(vec![tag]), sk, pq_sk)
+                .verify_with(vk, &cache, Some(&store), CryptoPolicy::Classical)?;
+            assert!(
+                SignedEnvelope::new_signed(RequestEnvelope::anonymous(vec![tag + 100]), sk)
+                    .verify_with(vk, &cache, Some(&store), CryptoPolicy::Classical)
+                    .is_err(),
+                "an anchored service identity must not verify classically"
+            );
+        }
+
+        // The interop client: not a service, never anchored, classical only.
+        let (client_sk, client_vk) = generate_signing_keypair();
+        assert!(
+            !store.is_anchored(&client_vk.to_bytes()),
+            "the interop client must not be anchored — that is what this test is about"
+        );
+        SignedEnvelope::new_signed(RequestEnvelope::anonymous(vec![12]), &client_sk)
+            .verify_with(&client_vk, &cache, Some(&store), CryptoPolicy::Classical)?;
+
         Ok(())
     }
 
