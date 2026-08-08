@@ -8,8 +8,8 @@
 
 use crate::auth::age_seal::{AgeIdentities, AgeRecipients};
 use crate::cli::commands::{
-    DelegateRegistrySignerArgs, MintDeploymentCaArgs, MintRegistryJwtArgs, RotateAuthorityArgs,
-    TrustCommand, VerifyDeploymentArgs,
+    DelegateRegistrySignerArgs, MintAnchorCapsuleArgs, MintDeploymentCaArgs, MintRegistryJwtArgs,
+    RotateAuthorityArgs, TrustCommand, VerifyDeploymentArgs,
 };
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use base64::{
@@ -24,6 +24,11 @@ use hyprstream_discovery::{
     DeploymentAuthorityCheckpoint as AuthorityCheckpointFile,
     DeploymentAuthorityLog as AuthorityLogFile, RegistryDelegationArtifact as DelegationArtifact,
 };
+use hyprstream_pds::at9p::{
+    CapsuleBody, HybridKeyPair, ServiceEndpoint, ServiceEntry, ServiceType, Transport,
+};
+use hyprstream_pds::at9p_sign::{sign_capsule_detached, CapsuleEd25519Signer};
+use hyprstream_rpc::transport::QuicServerAuth;
 use hyprstream_rpc::{
     auth::ucan::{
         validate as validate_ucan, Ability, Capability, CaveatValue, Caveats, Did, Resource, Ucan,
@@ -59,6 +64,8 @@ const AUTHORITY_LOG_SCHEMA: &str = "hyprstream.deployment-authority-log.v1";
 const AUTHORITY_CHECKPOINT_SCHEMA: &str = "hyprstream.deployment-authority-checkpoint.v1";
 const DELEGATION_SCHEMA: &str = "hyprstream.registry-delegation.v1";
 const PUBLISHER_MANIFEST_SCHEMA: &str = "hyprstream.deployment-trust-publisher-manifest.v1";
+/// Capsule service id the DID-anchored resolver requires for deployment reach.
+const ANCHOR_REACH_SERVICE: &str = "#ns";
 const DELEGATION_RESOURCE_PREFIX: &str = "hyprstream://deployment";
 const DELEGATION_ABILITY: &str = "mint-registry-jwt";
 const MAX_AUTHORITY_LOG_OPERATIONS: usize = 128;
@@ -206,6 +213,16 @@ impl LoadedEdSigner {
     }
 }
 
+impl CapsuleEd25519Signer for LoadedEdSigner {
+    fn verifying_key(&self) -> VerifyingKey {
+        Self::verifying_key(self)
+    }
+
+    fn sign_detached(&self, tbs: &[u8]) -> Result<[u8; 64]> {
+        self.sign(tbs)
+    }
+}
+
 struct LoadedAuthority {
     bundle: AuthorityBundle,
     ed: LoadedEdSigner,
@@ -226,6 +243,7 @@ pub fn handle_trust_command(command: TrustCommand) -> Result<()> {
         TrustCommand::MintRegistryJwt(args) => mint_registry_jwt(&args),
         TrustCommand::VerifyDeployment(args) => verify_deployment(&args),
         TrustCommand::RotateAuthority(args) => rotate_authority(&args),
+        TrustCommand::MintAnchorCapsule(args) => mint_anchor_capsule(&args),
     }
 }
 
@@ -841,6 +859,330 @@ fn rotate_authority(args: &RotateAuthorityArgs) -> Result<()> {
     Ok(())
 }
 
+/// Mint the deployment anchor capsule plus the `did:web` document that vouches
+/// for it.
+///
+/// The two outputs are inseparable: the `did:at9p` identifier IS the BLAKE3-512
+/// CID of the capsule, and the document must name that exact identifier back.
+/// Both are re-verified through the production DID-anchored resolver before
+/// anything is written.
+fn mint_anchor_capsule(args: &MintAnchorCapsuleArgs) -> Result<()> {
+    preflight_outputs([&args.capsule_out, &args.did_json_out], args.force)?;
+    ensure!(
+        args.did_web.starts_with("did:web:"),
+        "--did-web must be a did:web identifier (for example did:web:staging.example.com)"
+    );
+    let reach = anchor_reach_endpoint(args)?;
+
+    let public_ca = read_limited(&args.public_ca, PUBLIC_CA_BYTES)?;
+    let log: AuthorityLogFile = read_json_limited(&args.authority_log, MAX_CLOUD_SECRET_BYTES)?;
+    let checkpoint: AuthorityCheckpointFile =
+        read_json_limited(&args.authority_checkpoint, MAX_CLOUD_SECRET_BYTES)?;
+    let active = validate_authority_log(&public_ca, &log, &checkpoint)?;
+
+    let identities = combined_identities(&args.identities, &args.yubikey_identities)?;
+    let authority = decrypt_authority(&args.authority_key, &identities, args.software_recovery)?;
+    ensure_anchor_authority(&authority, &public_ca, &active)?;
+
+    let minted = build_anchor_material(args, &reach, &authority)?;
+    commit_outputs(vec![
+        PendingOutput::new(&args.capsule_out, minted.capsule_bytes.clone(), 0o644),
+        PendingOutput::new(
+            &args.did_json_out,
+            pretty_json_bytes(&minted.document)?,
+            0o644,
+        ),
+    ])?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "schema": "hyprstream.deployment-anchor-capsule-output.v1",
+            "deployment_domain": authority.bundle.deployment_domain,
+            "cluster_at9p_did": minted.at9p_did,
+            "cluster_did_web": args.did_web,
+            "capsule_path": display_path(&args.capsule_out),
+            "capsule_bytes": minted.capsule_bytes.len(),
+            "capsule_sha256": sha256_hex(&minted.capsule_bytes),
+            "did_json_path": display_path(&args.did_json_out),
+            "publish": {
+                "capsule": format!(".well-known/at9p/{}.cbor", minted.cid512),
+                "document": ".well-known/did.json",
+            },
+            "reach": reach.summary,
+            "mesh_material_published": args.mesh_pq.is_some(),
+        }))?
+    );
+    Ok(())
+}
+
+/// A minted, self-verified anchor pair, before it touches the filesystem.
+struct MintedAnchor {
+    capsule_bytes: Vec<u8>,
+    cid512: String,
+    at9p_did: String,
+    document: serde_json::Value,
+}
+
+/// Build and self-verify the anchor capsule and its document.
+///
+/// The capsule publishes the deployment authority as its primary subject key —
+/// that key IS the deployment CA the resolver installs — and signs itself with
+/// that same authority under pinned Hybrid.
+fn build_anchor_material(
+    args: &MintAnchorCapsuleArgs,
+    reach: &AnchorReach,
+    authority: &LoadedAuthority,
+) -> Result<MintedAnchor> {
+    let subject_key = HybridKeyPair::new(
+        authority.ed.verifying_key().to_bytes(),
+        ml_dsa_sk_to_vk_bytes(&authority.pq),
+    )
+    .context("deployment authority is not a valid at9p hybrid subject key")?;
+    let service = ServiceEntry::new(
+        ANCHOR_REACH_SERVICE,
+        ServiceType::NinePExport,
+        reach.endpoint.clone(),
+    )
+    .context("build the deployment-reach service entry")?;
+    let mut body = CapsuleBody::new(vec![subject_key], vec![service])
+        .context("build the anchor capsule body")?;
+    body.also_known_as = Some(vec![args.did_web.clone()]);
+    let capsule = sign_capsule_detached(body, &authority.ed, &authority.pq)
+        .context("hybrid-sign the anchor capsule")?;
+    let capsule_bytes = capsule.to_dag_cbor()?;
+    let cid512 = capsule.cid512()?;
+    let at9p_did = format!("did:at9p:{cid512}");
+    let document = anchor_did_document(args, &at9p_did, &authority.ed.verifying_key(), reach)?;
+
+    // Publishing material the production resolver would reject is the one
+    // failure this command exists to prevent: check before anything is written.
+    let verified =
+        verify_anchor_material_offline(&at9p_did, &args.did_web, &document, &capsule_bytes)
+            .context(
+                "the minted anchor pair was rejected by the production DID-anchored verifier; \
+                 nothing was written",
+            )?;
+    ensure!(
+        verified.deployment_ca_public == authority.public_bytes(),
+        "verified anchor capsule yields a different deployment CA than the signing authority"
+    );
+
+    Ok(MintedAnchor {
+        capsule_bytes,
+        cid512,
+        at9p_did,
+        document,
+    })
+}
+
+/// The capsule's deployment-reach entry plus the document-side mechanics that
+/// must describe the same endpoint.
+struct AnchorReach {
+    endpoint: ServiceEndpoint,
+    /// Optional `did:web` transport service entry contributing channel
+    /// mechanics (SNI, WebPKI policy, cert pins) for the capsule-bound socket.
+    document_service: Option<serde_json::Value>,
+    summary: serde_json::Value,
+}
+
+/// Build the `#ns` endpoint from the operator-supplied anchor-node reach.
+fn anchor_reach_endpoint(args: &MintAnchorCapsuleArgs) -> Result<AnchorReach> {
+    match (args.iroh_node_id.as_deref(), args.quic_endpoint) {
+        (Some(node_id), None) => {
+            let node_id = node_id.strip_prefix("did:key:").unwrap_or(node_id);
+            hyprstream_rpc::did_key::decode_ed25519_multikey(node_id)
+                .context("--iroh-node-id must be an Ed25519 Multikey (z6Mk...)")?;
+            let mut endpoint = ServiceEndpoint::new(Transport::Iroh, format!("iroh://{node_id}"))
+                .context("build the iroh deployment-reach endpoint")?;
+            endpoint.node_id = Some(node_id.to_owned());
+            endpoint.relay = args.iroh_relay.clone();
+            Ok(AnchorReach {
+                endpoint,
+                document_service: None,
+                summary: serde_json::json!({
+                    "transport": "iroh",
+                    "node_id": node_id,
+                    "relay": args.iroh_relay,
+                }),
+            })
+        }
+        (None, Some(address)) => {
+            let endpoint = ServiceEndpoint::new(Transport::Quic, format!("quic://{address}"))
+                .context("build the QUIC deployment-reach endpoint")?;
+            let pins = args
+                .quic_cert_sha256
+                .iter()
+                .map(|pin| {
+                    let raw = hex::decode(pin.trim())
+                        .with_context(|| format!("--quic-cert-sha256 {pin} is not hex"))?;
+                    let raw: [u8; 32] = raw.try_into().map_err(|_| {
+                        anyhow!("--quic-cert-sha256 {pin} is not a 32-byte SHA-256 digest")
+                    })?;
+                    Ok(raw)
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let sni = args
+                .quic_sni
+                .clone()
+                .unwrap_or_else(|| address.ip().to_string());
+            let auth = if pins.is_empty() {
+                ensure!(
+                    args.quic_web_pki,
+                    "a QUIC anchor reach needs channel mechanics: pass --quic-cert-sha256 \
+                     for a pinned leaf certificate, or --quic-web-pki with --quic-sni for \
+                     a WebPKI-terminated endpoint"
+                );
+                QuicServerAuth::web_pki()
+            } else if args.quic_web_pki {
+                QuicServerAuth::web_pki_pinned(pins)?
+            } else {
+                QuicServerAuth::pinned(pins)?
+            };
+            let document_service = Some(serde_json::json!({
+                "id": format!("{}#quic", args.did_web),
+                "type": "QuicTransport",
+                "serviceEndpoint": hyprstream_rpc::service_entry::encode_quic(
+                    &format!("https://{sni}:{}", address.port()),
+                    &auth,
+                    &["hyprstream-rpc/1"],
+                ),
+            }));
+            Ok(AnchorReach {
+                endpoint,
+                document_service,
+                summary: serde_json::json!({
+                    "transport": "quic",
+                    "address": address.to_string(),
+                    "sni": sni,
+                    "cert_pins": args.quic_cert_sha256.len(),
+                    "web_pki": args.quic_web_pki,
+                }),
+            })
+        }
+        _ => bail!(
+            "exactly one anchor reach is required: pass --iroh-node-id <MULTIKEY> or \
+             --quic-endpoint <IP:PORT>"
+        ),
+    }
+}
+
+/// Render the deployment `did:web` document that reciprocally vouches for the
+/// anchor capsule.
+///
+/// The reciprocal `alsoKnownAs` is what the resolver checks; the `#mesh-kem`
+/// keyAgreement and the single `#mesh-pq` verification method are what a
+/// remote-node bootstrap additionally requires, and they belong to the
+/// Discovery service the capsule's reach points at — not to the CA.
+fn anchor_did_document(
+    args: &MintAnchorCapsuleArgs,
+    at9p_did: &str,
+    ca_ed: &VerifyingKey,
+    reach: &AnchorReach,
+) -> Result<serde_json::Value> {
+    let did_web = &args.did_web;
+    let mut verification_method = vec![serde_json::json!({
+        "id": format!("{did_web}#deployment-ca"),
+        "type": "Multikey",
+        "controller": did_web,
+        "publicKeyMultibase": hyprstream_rpc::did_key::ed25519_to_did_key(ca_ed.as_bytes())
+            .strip_prefix("did:key:")
+            .unwrap_or_default()
+            .to_owned(),
+    })];
+    let mut key_agreement = Vec::new();
+    if let (Some(pq), Some(x25519), Some(mlkem)) = (
+        args.mesh_pq.as_deref(),
+        args.mesh_kem_x25519.as_deref(),
+        args.mesh_kem_mlkem768.as_deref(),
+    ) {
+        verification_method.push(serde_json::json!({
+            "id": format!("{did_web}#mesh-pq"),
+            "type": "Multikey",
+            "controller": did_web,
+            "publicKeyMultibase": pq,
+        }));
+        key_agreement.push(serde_json::json!({
+            "id": format!("{did_web}#mesh-kem-x25519"),
+            "type": "Multikey",
+            "controller": did_web,
+            "publicKeyMultibase": x25519,
+        }));
+        key_agreement.push(serde_json::json!({
+            "id": format!("{did_web}#mesh-kem-mlkem768"),
+            "type": "Multikey",
+            "controller": did_web,
+            "publicKeyMultibase": mlkem,
+        }));
+    }
+    let service: Vec<serde_json::Value> = reach.document_service.clone().into_iter().collect();
+    let document = serde_json::json!({
+        "@context": [
+            "https://www.w3.org/ns/did/v1",
+            "https://w3id.org/security/multikey/v1",
+        ],
+        "id": did_web,
+        "alsoKnownAs": [at9p_did],
+        "verificationMethod": verification_method,
+        "keyAgreement": key_agreement,
+        "service": service,
+    });
+
+    // Re-parse the rendered document with the production extractors: material
+    // that decodes to nothing here would leave a remote-node bootstrap without
+    // an encryption recipient or a response-authentication anchor.
+    if args.mesh_pq.is_some() {
+        ensure!(
+            hyprstream_rpc::did_web::mesh_kem_recipient(&document).is_some(),
+            "--mesh-kem-x25519 / --mesh-kem-mlkem768 did not decode to an x25519 + ML-KEM-768 \
+             hybrid recipient; pass the Discovery service's multibase #mesh-kem keys"
+        );
+        let pq_keys = hyprstream_rpc::did_web::verification_method_ml_dsa_65_keys(&document);
+        ensure!(
+            pq_keys.len() == 1,
+            "--mesh-pq must decode to exactly one ML-DSA-65 Multikey (decoded {})",
+            pq_keys.len()
+        );
+    }
+    Ok(document)
+}
+
+/// Round-trip a freshly minted capsule/document pair through the production
+/// DID-anchored verifier, serving the capsule from memory instead of the
+/// deployment's well-known endpoint.
+fn verify_anchor_material_offline(
+    at9p_did: &str,
+    did_web: &str,
+    document: &serde_json::Value,
+    capsule_bytes: &[u8],
+) -> Result<hyprstream_discovery::VerifiedAnchorMaterial> {
+    struct MintedCapsule(Vec<u8>);
+
+    #[async_trait::async_trait]
+    impl hyprstream_discovery::at9p_resolver::CapsuleSource for MintedCapsule {
+        async fn fetch_capsule(&self, _did: &str) -> Result<Vec<u8>> {
+            Ok(self.0.clone())
+        }
+    }
+
+    let anchors = match hyprstream_discovery::DeploymentTrustSource::from_anchors(
+        Some(at9p_did),
+        Some(did_web),
+    )? {
+        hyprstream_discovery::DeploymentTrustSource::DidAnchored(anchors) => anchors,
+        hyprstream_discovery::DeploymentTrustSource::OsOwnedFiles => {
+            bail!("minted anchors did not select the DID-anchored trust source")
+        }
+    };
+    let source = std::sync::Arc::new(MintedCapsule(capsule_bytes.to_vec()));
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("build the verification runtime")?
+        .block_on(hyprstream_discovery::verify_anchor_material(
+            &anchors, document, source,
+        ))
+}
+
 fn root_recipient_ring(args: &MintDeploymentCaArgs) -> Result<Vec<String>> {
     for recipient in &args.yubikey_recipients {
         ensure!(
@@ -1284,6 +1626,33 @@ fn ensure_active_authority(
             .any(|key| { public[..32] == key.ed25519_pub && public[32..] == key.mldsa65_pub }),
         "authority key is not active at the rotation-log head"
     );
+    Ok(())
+}
+
+/// Verify that `authority` is the deployment root that the resolver pins and is
+/// therefore permitted to mint an anchor capsule.
+///
+/// This bundles the three guard checks `mint_anchor_capsule` runs before it
+/// builds the capsule body: purpose (not a delegated signer), CA-binding (key
+/// matches the pinned root), and rotation-log activeness. It is the seam the
+/// minter's self-check tests exercise so removing any single guard turns the
+/// test red.
+fn ensure_anchor_authority(
+    authority: &LoadedAuthority,
+    public_ca: &[u8],
+    active: &hyprstream_discovery::did_op::VerifiedDidOpLog,
+) -> Result<()> {
+    ensure!(
+        authority.bundle.purpose != AuthorityPurpose::RegistryDelegatedSigner,
+        "the anchor capsule must be signed by the deployment authority itself; \
+         a registry-scoped delegated signer cannot anchor a deployment"
+    );
+    ensure!(
+        authority.public_bytes() == public_ca,
+        "anchor capsule signing authority does not match the pinned public CA; \
+         only the deployment root that the resolver pins may anchor a deployment"
+    );
+    ensure_active_authority(authority, active)?;
     Ok(())
 }
 
@@ -2575,5 +2944,292 @@ mod tests {
             &format!("{token}\n")
         )
         .is_err());
+    }
+
+    fn multibase(codec: [u8; 2], key: &[u8]) -> String {
+        let mut payload = Vec::with_capacity(2 + key.len());
+        payload.extend_from_slice(&codec);
+        payload.extend_from_slice(key);
+        format!("z{}", bs58::encode(payload).into_string())
+    }
+
+    /// Anchor-minting arguments for an iroh-reachable deployment whose
+    /// Discovery service is `discovery`, with paths that are never written
+    /// (these tests exercise the material, not the commit).
+    fn anchor_args(did_web: &str, node_id: &str, discovery: &SigningKey) -> MintAnchorCapsuleArgs {
+        let kem = hyprstream_rpc::node_identity::derive_mesh_kem_recipient(discovery)
+            .unwrap()
+            .public();
+        let mesh_pq = hyprstream_rpc::node_identity::derive_mesh_mldsa_key(discovery);
+        MintAnchorCapsuleArgs {
+            public_ca: PathBuf::from("deployment-ca.hybrid"),
+            authority_key: PathBuf::from("deployment-ca.age"),
+            authority_log: PathBuf::from("deployment-authority.log.json"),
+            authority_checkpoint: PathBuf::from("deployment-authority.head.json"),
+            identities: Vec::new(),
+            yubikey_identities: Vec::new(),
+            software_recovery: false,
+            did_web: did_web.to_owned(),
+            iroh_node_id: Some(node_id.to_owned()),
+            iroh_relay: None,
+            quic_endpoint: None,
+            quic_sni: None,
+            quic_cert_sha256: Vec::new(),
+            quic_web_pki: false,
+            mesh_kem_x25519: Some(multibase([0xec, 0x01], &kem.eks[0])),
+            mesh_kem_mlkem768: Some(multibase([0x8c, 0x24], &kem.eks[1])),
+            mesh_pq: Some(multibase([0x91, 0x24], &ml_dsa_sk_to_vk_bytes(&mesh_pq))),
+            capsule_out: PathBuf::from("anchor-capsule.cbor"),
+            did_json_out: PathBuf::from("did.json"),
+            force: false,
+        }
+    }
+
+    /// The whole point of the minter: what it emits must survive the same
+    /// resolution the DID-anchored bootstrap performs, and must hand back the
+    /// deployment CA that signed it.
+    #[test]
+    fn minted_anchor_pair_verifies_through_the_production_resolver() {
+        let authority = test_authority(AuthorityPurpose::Root, None);
+        let carrier = SigningKey::generate(&mut rand::rngs::OsRng);
+        let discovery = SigningKey::generate(&mut rand::rngs::OsRng);
+        let node_id =
+            hyprstream_rpc::did_key::ed25519_to_did_key(carrier.verifying_key().as_bytes())
+                .strip_prefix("did:key:")
+                .unwrap()
+                .to_owned();
+        let args = anchor_args("did:web:staging.example.com", &node_id, &discovery);
+        let reach = anchor_reach_endpoint(&args).unwrap();
+
+        let minted = build_anchor_material(&args, &reach, &authority).unwrap();
+
+        // Independently re-run the production verifier over the emitted bytes.
+        let verified = verify_anchor_material_offline(
+            &minted.at9p_did,
+            &args.did_web,
+            &minted.document,
+            &minted.capsule_bytes,
+        )
+        .expect("minted anchor capsule must verify through the production resolver");
+        assert_eq!(verified.at9p_did, minted.at9p_did);
+        assert_eq!(verified.deployment_ca_public, authority.public_bytes());
+        assert_eq!(
+            verified.discovery_transport.endpoint,
+            hyprstream_rpc::transport::EndpointType::Iroh {
+                node_id: carrier.verifying_key().to_bytes(),
+                direct_addrs: Vec::new(),
+                relay_url: None,
+            }
+        );
+
+        // The document half carries what a remote-node bootstrap additionally
+        // demands: a hybrid KEM recipient and exactly one ML-DSA-65 anchor.
+        assert_eq!(
+            hyprstream_rpc::did_web::mesh_kem_recipient(&minted.document),
+            Some(
+                hyprstream_rpc::node_identity::derive_mesh_kem_recipient(&discovery)
+                    .unwrap()
+                    .public()
+            )
+        );
+        assert_eq!(
+            hyprstream_rpc::did_web::verification_method_ml_dsa_65_keys(&minted.document).len(),
+            1
+        );
+    }
+
+    /// A node identity capsule (no deployment-reach entry) must be refused, and
+    /// the refusal must name the command that produces a usable one.
+    #[test]
+    fn capsule_without_deployment_reach_is_refused_with_minting_guidance() {
+        let did_web = "did:web:staging.example.com";
+        let ed = SigningKey::generate(&mut rand::rngs::OsRng);
+        let (pq, _) = ml_dsa_generate_keypair();
+        let subject =
+            HybridKeyPair::new(ed.verifying_key().to_bytes(), ml_dsa_sk_to_vk_bytes(&pq)).unwrap();
+        let endpoint =
+            ServiceEndpoint::new(Transport::Https, "https://staging.example.com").unwrap();
+        let service = ServiceEntry::new("#pds", ServiceType::AtprotoPds, endpoint).unwrap();
+        let mut body = CapsuleBody::new(vec![subject], vec![service]).unwrap();
+        body.also_known_as = Some(vec![did_web.to_owned()]);
+        let capsule = sign_capsule_detached(body, &ed, &pq).unwrap();
+        let bytes = capsule.to_dag_cbor().unwrap();
+        let at9p_did = format!("did:at9p:{}", capsule.cid512().unwrap());
+        let document = serde_json::json!({
+            "id": did_web,
+            "alsoKnownAs": [at9p_did],
+        });
+
+        let error = verify_anchor_material_offline(&at9p_did, did_web, &document, &bytes)
+            .expect_err("a capsule with no deployment reach must not verify");
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("mint-anchor-capsule"),
+            "rejection must tell the operator how to mint a usable anchor: {rendered}"
+        );
+    }
+
+    /// A rotated authority whose key differs from the pinned root CA must not
+    /// be able to mint an anchor capsule — the capsule subject key would not
+    /// be the key the resolver pins from `deployment-ca.hybrid`.
+    #[test]
+    fn rotated_authority_not_matching_pinned_ca_is_rejected_for_anchor_mint() {
+        let root = test_authority(AuthorityPurpose::Root, None);
+        let public_ca = root.public_bytes();
+
+        // A rotated authority with a different key.
+        let rotated = test_authority(
+            AuthorityPurpose::RotatedAuthority,
+            Some(root.bundle.deployment_domain.clone()),
+        );
+        assert_ne!(
+            rotated.public_bytes(),
+            public_ca,
+            "test setup: rotated key must differ from root"
+        );
+
+        // Build the authority log so that the rotated key is active.
+        let root_rotation_key = HybridRotationKey::new(
+            root.ed.verifying_key().to_bytes(),
+            ml_dsa_sk_to_vk_bytes(&root.pq),
+        )
+        .unwrap();
+        let rotated_rotation_key = HybridRotationKey::new(
+            rotated.ed.verifying_key().to_bytes(),
+            ml_dsa_sk_to_vk_bytes(&rotated.pq),
+        )
+        .unwrap();
+        let genesis = sign_did_op(
+            DidOp {
+                sequence: 0,
+                prev: None,
+                rotation_keys: vec![root_rotation_key],
+                signature: placeholder_did_signature(),
+            },
+            &root.ed,
+            &root.pq,
+        )
+        .unwrap();
+        let add_rotation = sign_did_op(
+            DidOp {
+                sequence: 1,
+                prev: Some(genesis.cid().encode()),
+                rotation_keys: vec![rotated_rotation_key],
+                signature: placeholder_did_signature(),
+            },
+            &root.ed,
+            &root.pq,
+        )
+        .unwrap();
+        let log =
+            authority_log_from_ops(&root.bundle.deployment_domain, vec![genesis, add_rotation])
+                .unwrap();
+        let verified = validate_authority_log(&public_ca, &log, &checkpoint_for(&log)).unwrap();
+
+        // The rotated key IS active in the rotation log ...
+        ensure_active_authority(&rotated, &verified).unwrap();
+
+        // ... but it does NOT match the pinned public CA, so the anchor mint
+        // guard (the same one `mint_anchor_capsule` runs before it builds the
+        // capsule body) must refuse it. Routing through `ensure_anchor_authority`
+        // makes the test causal: remove the CA-binding `ensure!` inside it and
+        // this assertion fails.
+        assert!(
+            rotated.bundle.purpose != AuthorityPurpose::RegistryDelegatedSigner,
+            "test setup: rotated must pass the purpose guard"
+        );
+        assert_ne!(
+            rotated.public_bytes(),
+            public_ca,
+            "the CA-binding check would not fire if the keys matched"
+        );
+        let error = ensure_anchor_authority(&rotated, &public_ca, &verified)
+            .expect_err("a rotated authority not matching the pinned CA must be refused");
+        assert!(
+            format!("{error:#}").contains("does not match the pinned public CA"),
+            "rejection must name the CA-binding mismatch: {error:#}"
+        );
+    }
+
+    /// A QUIC anchor reach with --quic-web-pki and no pins must emit a
+    /// QuicTransport service entry (WebPKI without cert pinning).
+    #[test]
+    fn quic_web_pki_without_pins_emits_transport_entry() {
+        let discovery = SigningKey::generate(&mut rand::rngs::OsRng);
+        let node_id =
+            hyprstream_rpc::did_key::ed25519_to_did_key(discovery.verifying_key().as_bytes())
+                .strip_prefix("did:key:")
+                .unwrap()
+                .to_owned();
+        let mut args = anchor_args("did:web:staging.example.com", &node_id, &discovery);
+        args.iroh_node_id = None;
+        args.quic_endpoint = Some("203.0.113.5:443".parse().unwrap());
+        args.quic_web_pki = true;
+        args.quic_sni = Some("staging.example.com".to_owned());
+        // No quic_cert_sha256 — pure WebPKI mode.
+
+        let reach = anchor_reach_endpoint(&args).unwrap();
+        let doc_service = reach
+            .document_service
+            .as_ref()
+            .expect("WebPKI-without-pins must still emit a QuicTransport entry");
+        let service_endpoint = doc_service
+            .get("serviceEndpoint")
+            .expect("entry must have a serviceEndpoint");
+        let uri = service_endpoint
+            .get("uri")
+            .and_then(|v| v.as_str())
+            .expect("entry must have a uri");
+        assert!(
+            uri.contains("staging.example.com"),
+            "uri must carry the SNI hostname: {uri}"
+        );
+        let webpki = service_endpoint
+            .get("webpki")
+            .and_then(serde_json::Value::as_bool)
+            .expect("entry must have a webpki flag");
+        assert!(webpki, "webpki must be true for a --quic-web-pki reach");
+        let cert_hashes = service_endpoint
+            .get("certHashes")
+            .and_then(|v| v.as_array())
+            .expect("entry must have a certHashes array");
+        assert!(
+            cert_hashes.is_empty(),
+            "certHashes must be empty when no pins were supplied"
+        );
+    }
+
+    /// A QUIC anchor reach with hostname SNI and pins must produce a document
+    /// service entry whose URI uses the hostname, so that the resolver can
+    /// match it against the capsule's QUIC socket address by port.
+    #[test]
+    fn quic_hostname_sni_with_pins_produces_matchable_entry() {
+        let discovery = SigningKey::generate(&mut rand::rngs::OsRng);
+        let node_id =
+            hyprstream_rpc::did_key::ed25519_to_did_key(discovery.verifying_key().as_bytes())
+                .strip_prefix("did:key:")
+                .unwrap()
+                .to_owned();
+        let mut args = anchor_args("did:web:staging.example.com", &node_id, &discovery);
+        args.iroh_node_id = None;
+        args.quic_endpoint = Some("203.0.113.5:443".parse().unwrap());
+        args.quic_sni = Some("staging.example.com".to_owned());
+        args.quic_cert_sha256 = vec!["aa".repeat(32)];
+        args.quic_web_pki = true;
+
+        let reach = anchor_reach_endpoint(&args).unwrap();
+        let doc_service = reach
+            .document_service
+            .as_ref()
+            .expect("hostname-SNI with pins must emit a QuicTransport entry");
+        let uri = doc_service
+            .get("serviceEndpoint")
+            .and_then(|v| v.get("uri"))
+            .and_then(|v| v.as_str())
+            .expect("entry must have a uri");
+        assert!(
+            uri.contains("staging.example.com"),
+            "uri must use the SNI hostname, not the IP: {uri}"
+        );
     }
 }
