@@ -80,7 +80,8 @@ const DELEGATION_INSTALL_PATH: &str =
 const REGISTRY_PUBLIC_KEY_INSTALL_PATH: &str =
     "/etc/hyprstream/trust/delegated/registry-public-key";
 const REFRESH_IDENTITY_INSTALL_PATH: &str = "/etc/hyprstream/trust/delegated/refresh-identity";
-const TRUST_REFRESH_SERVICE_UNIT_PATH: &str = "/etc/systemd/system/hyprstream-trust-refresh.service";
+const TRUST_REFRESH_SERVICE_UNIT_PATH: &str =
+    "/etc/systemd/system/hyprstream-trust-refresh.service";
 const TRUST_REFRESH_TIMER_UNIT_PATH: &str = "/etc/systemd/system/hyprstream-trust-refresh.timer";
 const CREDENTIALS_RUN_DIR: &str = "/run/hyprstream/credentials";
 
@@ -754,7 +755,8 @@ fn install_deployment_trust(args: &InstallDeploymentTrustArgs) -> Result<()> {
     );
     hyprstream_discovery::verify_deployment_public_ca(&public_ca)
         .context("public_ca is not a valid production deployment CA")?;
-    let authority_log: AuthorityLogFile = read_json_limited(&args.authority_log, MAX_CLOUD_SECRET_BYTES)?;
+    let authority_log: AuthorityLogFile =
+        read_json_limited(&args.authority_log, MAX_CLOUD_SECRET_BYTES)?;
     let authority_checkpoint: AuthorityCheckpointFile =
         read_json_limited(&args.authority_checkpoint, MAX_CLOUD_SECRET_BYTES)?;
     validate_authority_log(&public_ca, &authority_log, &authority_checkpoint)
@@ -766,12 +768,20 @@ fn install_deployment_trust(args: &InstallDeploymentTrustArgs) -> Result<()> {
     let authority_log_dest = PathBuf::from(AUTHORITY_LOG_INSTALL_PATH);
     let authority_checkpoint_dest = PathBuf::from(AUTHORITY_CHECKPOINT_INSTALL_PATH);
     preflight_outputs(
-        [&public_ca_dest, &authority_log_dest, &authority_checkpoint_dest],
+        [
+            &public_ca_dest,
+            &authority_log_dest,
+            &authority_checkpoint_dest,
+        ],
         args.force,
     )?;
     commit_outputs(vec![
         PendingOutput::new(&public_ca_dest, public_ca.clone(), 0o644),
-        PendingOutput::new(&authority_log_dest, pretty_json_bytes(&authority_log)?, 0o644),
+        PendingOutput::new(
+            &authority_log_dest,
+            pretty_json_bytes(&authority_log)?,
+            0o644,
+        ),
         PendingOutput::new(
             &authority_checkpoint_dest,
             pretty_json_bytes(&authority_checkpoint)?,
@@ -823,10 +833,11 @@ fn install_deployment_trust(args: &InstallDeploymentTrustArgs) -> Result<()> {
 
 /// `mkdir -p` with the given mode on the leaf. Every component of the path —
 /// not just the leaf — is inspected with `symlink_metadata` and must be a
-/// non-symlink directory owned by root (or by the given owner), mirroring the
-/// fail-closed posture `read_trusted_artifact` requires of every ancestor of
-/// a trust path it reads. Guarantee: at the moment each component was
-/// inspected it was a root/owner-owned real directory. Not guaranteed: the
+/// non-symlink directory owned by root (or by the given owner) and writable by
+/// nobody else, mirroring the fail-closed posture `read_trusted_artifact`
+/// requires of every ancestor of a trust path it reads. Guarantee: at the
+/// moment each component was inspected it was a root/owner-owned real
+/// directory no other user could write into. Not guaranteed: the
 /// checks are lstat-based, not O_NOFOLLOW-handle-based, so a component
 /// swapped between inspection and use is not detected (TOCTOU).
 fn ensure_root_owned_dir(dir: &Path, mode: u32) -> Result<()> {
@@ -860,15 +871,21 @@ fn ensure_owned_dir(dir: &Path, mode: u32, owner_uid: u32) -> Result<()> {
                      install trust material under a directory another user controls",
                     component.display()
                 );
+                let mode = metadata.mode();
+                ensure!(
+                    mode & 0o022 == 0,
+                    "install path component {} is group/world writable (mode {:04o}); refusing \
+                     to install trust material under a directory other users can modify",
+                    component.display(),
+                    mode & 0o7777
+                );
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 std::fs::create_dir(component)
                     .with_context(|| format!("create directory {}", component.display()))?;
                 if !is_leaf {
                     std::fs::set_permissions(component, std::fs::Permissions::from_mode(0o755))
-                        .with_context(|| {
-                            format!("set permissions on {}", component.display())
-                        })?;
+                        .with_context(|| format!("set permissions on {}", component.display()))?;
                 }
             }
             Err(error) => {
@@ -904,7 +921,9 @@ fn trial_decrypt_delegated_signer(
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
-        .context("the `age` binary is not installed or not executable; the trust refresher requires it")?;
+        .context(
+            "the `age` binary is not installed or not executable; the trust refresher requires it",
+        )?;
     ensure!(
         age_probe.success(),
         "the `age` binary is not installed or not executable; the trust refresher requires it"
@@ -912,49 +931,19 @@ fn trial_decrypt_delegated_signer(
 
     // Reproduce the exact decrypt path the refresher's ExecStart follows:
     // `age --decrypt --identity <refresh_identity>` on the delegated signer.
+    // decrypt_authority reconstructs the full LoadedAuthority and asserts the
+    // bundle's own public-key fingerprint, so the public-bytes comparison uses
+    // the identical derivation path the refresher will exercise on every timer
+    // firing. software_recovery is false because the refresher ExecStart never
+    // passes --software-recovery.
     let identities = vec![refresh_identity.to_path_buf()];
-    let plaintext = decrypt_age(delegated_key, &identities)
+    let trial = decrypt_authority(delegated_key, &identities, false)
         .context("refresh identity cannot decrypt the delegated signer ciphertext")?;
-    let bundle: AuthorityBundle =
-        serde_json::from_slice(&plaintext).context("decode delegated authority bundle")?;
     ensure!(
-        bundle.schema == AUTHORITY_BUNDLE_SCHEMA,
-        "unsupported authority bundle schema in delegated signer"
-    );
-    ensure!(
-        bundle.purpose == AuthorityPurpose::RegistryDelegatedSigner,
+        trial.bundle.purpose == AuthorityPurpose::RegistryDelegatedSigner,
         "decrypted delegated signer is not a RegistryDelegatedSigner; the \
          refresher ExecStart rejects any other purpose"
     );
-
-    // Reconstruct the full LoadedAuthority the same way decrypt_authority does,
-    // so the public-bytes comparison uses the identical derivation path the
-    // refresher will exercise on every timer firing. software_recovery is
-    // false because the refresher ExecStart never passes --software-recovery.
-    let pq_seed = decode_fixed_b64::<32>(&bundle.ml_dsa_65_seed_b64, "ML-DSA-65 seed")?;
-    let pq = ml_dsa_sk_from_seed(&pq_seed);
-    let ed = match &bundle.ed25519 {
-        Ed25519Secret::Software { seed_b64, public_b64 } => {
-            let seed = decode_fixed_b64::<32>(seed_b64, "Ed25519 seed")?;
-            let key = SigningKey::from_bytes(&seed);
-            ensure!(
-                STANDARD.decode(public_b64)? == key.verifying_key().as_bytes(),
-                "delegated Ed25519 public key does not match seed"
-            );
-            LoadedEdSigner::Software(key)
-        }
-        Ed25519Secret::YubikeyPiv { slot, public_b64, .. } => {
-            validate_piv_slot(slot)?;
-            let public_bytes = decode_fixed_b64::<32>(public_b64, "PIV Ed25519 public key")?;
-            let public = VerifyingKey::from_bytes(&public_bytes).context("invalid PIV public key")?;
-            LoadedEdSigner::YubikeyPiv { slot: slot.clone(), public }
-        }
-    };
-    let trial = LoadedAuthority {
-        bundle,
-        ed,
-        pq,
-    };
     let trial_public = trial.public_bytes();
     let declared = STANDARD
         .decode(&artifact.delegated_public_key_b64)
@@ -1007,12 +996,8 @@ fn install_trust_refresher(
     // the ciphertext, or the decrypted public key does not match the root-
     // authorized delegation, the install must fail closed here rather than
     // silently succeed and then fail on every timer firing.
-    trial_decrypt_delegated_signer(
-        delegated_key,
-        refresh_identity,
-        &delegation_artifact,
-    )
-    .context("trial decrypt of the delegated signer with the refresh identity failed")?;
+    trial_decrypt_delegated_signer(delegated_key, refresh_identity, &delegation_artifact)
+        .context("trial decrypt of the delegated signer with the refresh identity failed")?;
 
     ensure_root_owned_dir(Path::new(DELEGATED_DIR), 0o750)?;
     ensure_root_owned_dir(Path::new(CREDENTIALS_RUN_DIR), 0o750)?;
@@ -1069,7 +1054,11 @@ fn run_systemctl(args: &[&str]) -> Result<()> {
         .args(args)
         .status()
         .with_context(|| format!("run systemctl {}", args.join(" ")))?;
-    ensure!(status.success(), "systemctl {} failed: {status}", args.join(" "));
+    ensure!(
+        status.success(),
+        "systemctl {} failed: {status}",
+        args.join(" ")
+    );
     Ok(())
 }
 
@@ -3053,8 +3042,12 @@ mod tests {
     #[test]
     fn trust_refresh_service_unit_only_uses_the_delegated_signer() {
         let unit = trust_refresh_service_unit();
-        assert!(unit.contains("--via-delegated-signer /etc/hyprstream/trust/delegated/registry-delegated-signer.age"));
-        assert!(unit.contains("--delegation /etc/hyprstream/trust/delegated/registry-signer.delegation.json"));
+        assert!(unit.contains(
+            "--via-delegated-signer /etc/hyprstream/trust/delegated/registry-delegated-signer.age"
+        ));
+        assert!(unit.contains(
+            "--delegation /etc/hyprstream/trust/delegated/registry-signer.delegation.json"
+        ));
         assert!(unit.contains("--identity /etc/hyprstream/trust/delegated/refresh-identity"));
         assert!(unit.contains("--jwt /run/hyprstream/credentials/registry-service.jwt"));
         assert!(unit.contains("--force"));
@@ -3128,9 +3121,19 @@ mod tests {
         nix::unistd::Uid::effective().as_raw()
     }
 
+    /// A tempdir under the crate directory rather than the system temp dir:
+    /// ensure_owned_dir inspects every ancestor of the install path, and the
+    /// sticky world-writable system temp dir would be rejected as an ancestor.
+    fn owned_ancestry_tempdir() -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix("trust-install-test-")
+            .tempdir_in(env!("CARGO_MANIFEST_DIR"))
+            .unwrap()
+    }
+
     #[test]
     fn ensure_owned_dir_creates_missing_directory_with_mode() {
-        let base = tempfile::tempdir().unwrap();
+        let base = owned_ancestry_tempdir();
         let target = base.path().join("a/b/c");
         ensure_owned_dir(&target, 0o750, current_uid()).unwrap();
         let metadata = std::fs::metadata(&target).unwrap();
@@ -3142,7 +3145,7 @@ mod tests {
 
     #[test]
     fn ensure_owned_dir_rejects_symlinked_target() {
-        let base = tempfile::tempdir().unwrap();
+        let base = owned_ancestry_tempdir();
         let real = base.path().join("real");
         std::fs::create_dir(&real).unwrap();
         let link = base.path().join("link");
@@ -3151,8 +3154,21 @@ mod tests {
     }
 
     #[test]
+    fn ensure_owned_dir_rejects_group_writable_existing_component() {
+        let base = owned_ancestry_tempdir();
+        let mid = base.path().join("mid");
+        std::fs::create_dir(&mid).unwrap();
+        std::fs::set_permissions(&mid, std::fs::Permissions::from_mode(0o775)).unwrap();
+        let error = ensure_owned_dir(&mid.join("leaf"), 0o755, current_uid()).unwrap_err();
+        assert!(
+            error.to_string().contains("group/world writable"),
+            "unexpected rejection: {error}"
+        );
+    }
+
+    #[test]
     fn ensure_owned_dir_rejects_symlinked_intermediate_component() {
-        let base = tempfile::tempdir().unwrap();
+        let base = owned_ancestry_tempdir();
         let real = base.path().join("real");
         std::fs::create_dir_all(real.join("leaf")).unwrap();
         let mid = base.path().join("mid");
