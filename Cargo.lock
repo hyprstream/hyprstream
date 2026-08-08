@@ -6900,6 +6900,7 @@ dependencies = [
  "hyprstream-ledger",
  "hyprstream-metrics",
  "hyprstream-p2p",
+ "hyprstream-pay",
  "hyprstream-pds",
  "hyprstream-pds-service",
  "hyprstream-rpc",
@@ -7206,11 +7207,15 @@ dependencies = [
  "bitflags 2.11.0",
  "blake3",
  "ciborium",
+ "deadpool-postgres",
  "ed25519-dalek 2.2.0",
  "hyprstream-crypto",
  "proptest",
  "serde",
  "thiserror 1.0.69",
+ "tokio",
+ "tokio-postgres",
+ "tracing",
 ]
 
 [[package]]
@@ -7288,6 +7293,18 @@ dependencies = [
  "toml 0.8.23",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "hyprstream-pay"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "blake3",
+ "ciborium",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
 ]
 
 [[package]]
@@ -12550,6 +12567,8 @@ dependencies = [
  "chrono",
  "fallible-iterator 0.2.0",
  "postgres-protocol",
+ "serde_core",
+ "serde_json",
 ]
 
 [[package]]

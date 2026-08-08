@@ -101,6 +101,11 @@ pub mod worker;
 #[cfg(feature = "ledger")]
 pub mod ledger;
 
+/// Settlement/tariff service (#1399). Behind the `pay` cargo feature.
+/// Implements the MIT `hyprstream_pay` traits with AGPL service logic.
+#[cfg(feature = "pay")]
+pub mod pay;
+
 pub use core::{
     Continuation, EnvelopeContext, RequestService,
 };

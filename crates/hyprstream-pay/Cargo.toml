@@ -1,0 +1,25 @@
+[package]
+name = "hyprstream-pay"
+version = "0.1.0"
+edition.workspace = true
+license = "MIT"
+repository.workspace = true
+description = "MIT-licensed settlement/tariff RPC contract + client stub — the protocol surface cyberdione-product links against (#1399)"
+
+# This crate is intentionally MIT-only (not dual MIT/AGPL like hyprstream).
+# It contains ONLY the protocol traits, types, capability model, and a client
+# stub. The AGPL service implementation lives in `hyprstream::services::pay`.
+
+[dependencies]
+serde = { workspace = true }
+# Canonical DAG-CBOR + content addressing for the settlement attestation
+# (PAY-ARCH-01): the blob must have one byte representation and a stable CID so
+# a future exchange record (#926) can embed it verbatim.
+ciborium = { workspace = true }
+blake3 = { workspace = true }
+serde_json = { workspace = true }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+
+[lints]
+workspace = true
