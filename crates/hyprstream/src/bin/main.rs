@@ -243,6 +243,47 @@ fn build_cli() -> ClapCommand {
                     .value_name("ROLE")
                     .default_value("admin")
                     .help("Role to assign the local user under --non-interactive (admin|operator|trainer|viewer). Default is admin; use operator/viewer in tests for least-privilege."),
+            )
+            .arg(
+                Arg::new("deployment_trust")
+                    .long("deployment-trust")
+                    .action(clap::ArgAction::SetTrue)
+                    .help("Run the deployment-trust ceremony after node bootstrap — detects an attached YubiKey and mints the deployment root, delegated signer, and registry credential. Opt-in: node bootstrap alone is unchanged without it."),
+            )
+            .arg(
+                Arg::new("deployment_trust_dir")
+                    .long("deployment-trust-dir")
+                    .value_name("DIR")
+                    .requires("deployment_trust")
+                    .help("Absolute ceremony working directory (default: <models-dir>/deployment-ceremony). Destroy it once the artifacts are distributed."),
+            )
+            .arg(
+                Arg::new("deployment_trust_software")
+                    .long("deployment-trust-software")
+                    .action(clap::ArgAction::SetTrue)
+                    .requires("deployment_trust")
+                    .help("Mint a DEV-GRADE software deployment root even if a hardware token is attached. Never selected on your behalf."),
+            )
+            .arg(
+                Arg::new("deployment_trust_serial")
+                    .long("deployment-trust-serial")
+                    .value_name("SERIAL")
+                    .requires("deployment_trust")
+                    .help("Bind the deployment root to the token with this serial when several are attached."),
+            )
+            .arg(
+                Arg::new("deployment_trust_piv_slot")
+                    .long("deployment-trust-piv-slot")
+                    .value_name("SLOT")
+                    .requires("deployment_trust")
+                    .help("PIV slot holding the Ed25519 leg on firmware 5.7.4+ (default: 9c)."),
+            )
+            .arg(
+                Arg::new("deployment_trust_allow_plaintext_break_glass")
+                    .long("deployment-trust-allow-plaintext-break-glass")
+                    .action(clap::ArgAction::SetTrue)
+                    .requires("deployment_trust")
+                    .help("Accept an unencrypted break-glass identity. Only for a throwaway root you destroy immediately afterwards."),
             ),
     );
 
@@ -1605,6 +1646,21 @@ async fn install_process_production_resolver(
         trust_source,
         hyprstream_discovery::DeploymentTrustSource::OsOwnedFiles
     );
+    // `remote_node` only has meaning for a DID-anchored bootstrap (it selects
+    // between the lazy same-node fabric and a required, liveness-checked
+    // dial of the DID-advertised transport). The OS-owned bootstrap always
+    // installs the lazy local client regardless of this flag — silently, so
+    // an operator who set `cluster_remote_node = true` expecting a remote
+    // Discovery reach would otherwise get no error and no such reach. Fail
+    // closed instead, mirroring the `cluster_anchor_root_cert` check above.
+    if is_os_owned_bootstrap && config.cluster_remote_node {
+        anyhow::bail!(
+            "cluster_remote_node is set but no DID anchors are configured; \
+             remote-node Discovery reach requires cluster_at9p_did and \
+             cluster_did_web (DidAnchored mode) — the OS-owned trust source \
+             has no remote-Discovery story and would silently ignore this flag"
+        );
+    }
     hyprstream_discovery::bootstrap_deployment_process(
         signing_key.clone(),
         trust_source,
@@ -1691,6 +1747,11 @@ fn install_envelope_verify_config(oauth: Option<&hyprstream_core::config::OAuthC
             &secrets_dir,
         );
         tracing::info!("bootstrap PQ trust store seeded with {anchored} service binding(s)");
+    } else {
+        tracing::warn!(
+            "secrets directory unresolvable; bootstrap PQ bindings not seeded. \
+             Under Hybrid envelope policy local services may be unverifiable."
+        );
     }
 
     tracing::info!("mesh PQ trust store installed with {} peer binding(s)", keyed_store.len());
@@ -1747,6 +1808,61 @@ fn install_envelope_verify_config(oauth: Option<&hyprstream_core::config::OAuthC
         tracing::info!(
             "envelope verify policy: HYBRID enforced (SNS nested COSE); \
              peer ML-DSA bindings required for cross-node traffic"
+        );
+    }
+
+    install_session_pq_overlay();
+}
+
+/// Install the session PQ binding overlay, the runtime anchoring path for
+/// clients no operator can pre-enroll (browsers and other device-generated
+/// identities).
+///
+/// It is consulted only after the admin-anchored store above misses, so it
+/// cannot displace an operator's enrollment, and a binding it establishes at
+/// first contact is capped at `Classical` assurance — it makes a request
+/// verifiable, it does not make the requester more trusted. Promotion to
+/// `PqHybrid` requires an out-of-band fingerprint comparison.
+///
+/// Set `HYPRSTREAM_SESSION_PQ_OVERLAY=0` for a mesh-only deployment that wants
+/// every unenrolled identity rejected at the envelope layer as before.
+///
+/// # Operator limitations at this revision — read before enabling
+///
+/// The overlay's approve / promote / revoke operations exist as library calls
+/// and have **no operator surface yet**: nothing here, no RPC method, no CLI.
+/// Two consequences an operator must know about up front:
+///
+/// - Every binding stays at first-contact provenance for its lifetime.
+///   Out-of-band promotion is unreachable, so the overlay cannot raise MAC
+///   assurance for anyone — a browser client is `Classical` and stays there.
+/// - A refused rebinding is loud but **unanswerable**. A client that rotates
+///   its ML-DSA-65 key while keeping its Ed25519 identity is refused here,
+///   cannot be approved (no surface), and cannot be routed around through the
+///   admin-anchored store (immutable after install). Restarting the daemon
+///   clears the overlay and is currently the only way through. Until the
+///   operator surface lands, plan rotations around a restart.
+fn install_session_pq_overlay() {
+    let disabled = std::env::var("HYPRSTREAM_SESSION_PQ_OVERLAY")
+        .map(|v| matches!(v.trim(), "0" | "false" | "off" | "no"))
+        .unwrap_or(false);
+    if disabled {
+        tracing::info!(
+            "session PQ overlay disabled by configuration; identities without an \
+             admin-anchored ML-DSA-65 key are rejected at the envelope layer"
+        );
+        return;
+    }
+    let overlay = std::sync::Arc::new(hyprstream_rpc::session_pq_overlay::SessionPqOverlay::new(
+        std::sync::Arc::new(hyprstream_rpc::session_pq_overlay::TracingPqBindingEventSink),
+    ));
+    if hyprstream_rpc::session_pq_overlay::install_session_pq_overlay(overlay).is_ok() {
+        tracing::info!(
+            "session PQ overlay installed: unenrolled identities bind their ML-DSA-65 key \
+             at first contact (verifiable, assurance capped at Classical); rebinding an \
+             established identity is refused and surfaced, never silently applied. \
+             No approve/promote/revoke surface exists yet: a refused rebinding requires \
+             a daemon restart to clear."
         );
     }
 }
@@ -2007,7 +2123,31 @@ fn main() -> Result<()> {
                     .get_one::<String>("initial_user_role")
                     .cloned()
                     .unwrap_or_else(|| "admin".to_owned());
-                let use_tui = tui_mode || (pds_url.is_none() && !non_interactive && !bootstrap_only && supports_tui());
+                let deployment_trust = hyprstream_core::cli::wizard_handlers::DeploymentTrustOptions {
+                    enabled: sub_m.get_flag("deployment_trust"),
+                    dir: sub_m.get_one::<String>("deployment_trust_dir").map(std::path::PathBuf::from),
+                    force_software: sub_m.get_flag("deployment_trust_software"),
+                    serial: sub_m.get_one::<String>("deployment_trust_serial").cloned(),
+                    piv_slot: sub_m.get_one::<String>("deployment_trust_piv_slot").cloned(),
+                    allow_plaintext_break_glass: sub_m
+                        .get_flag("deployment_trust_allow_plaintext_break_glass"),
+                };
+                let wizard_options = hyprstream_core::cli::WizardOptions {
+                    non_interactive,
+                    start_services,
+                    bootstrap_only,
+                    enable_federation,
+                    initial_user_role,
+                    deployment_trust,
+                };
+                // The TUI wizard has no ceremony flow yet, so an explicit
+                // --deployment-trust keeps the text wizard.
+                let use_tui = tui_mode
+                    || (pds_url.is_none()
+                        && !non_interactive
+                        && !bootstrap_only
+                        && !wizard_options.deployment_trust.enabled
+                        && supports_tui());
                 let config = config.clone();
                 return with_runtime(
                     RuntimeConfig { device: DeviceConfig::request_cpu(), multi_threaded: true },
@@ -2016,8 +2156,7 @@ fn main() -> Result<()> {
                             hyprstream_core::cli::handle_wizard_tui(&models_dir, &services).await
                         } else {
                             hyprstream_core::cli::handle_wizard(
-                                &models_dir, &services, non_interactive, start_services,
-                                bootstrap_only, enable_federation, &initial_user_role,
+                                &models_dir, &services, wizard_options,
                             ).await?;
                             if let Some(pds_url) = pds_url {
                                 hyprstream_core::cli::pds_handlers::handle_pds_join(
@@ -2039,7 +2178,9 @@ fn main() -> Result<()> {
                         // First-run fallback (no `wizard` subcommand) defaults
                         // federation to off — explicit opt-in only.
                         hyprstream_core::cli::handle_wizard(
-                            &models_dir, &services, false, false, false, false, "admin",
+                            &models_dir,
+                            &services,
+                            hyprstream_core::cli::WizardOptions::first_run(),
                         ).await
                     }
                 },
@@ -3161,7 +3302,9 @@ fn main() -> Result<()> {
                         } else {
                             // First-run auto-wizard defaults federation to off.
                             hyprstream_core::cli::handle_wizard(
-                                &models_dir, &services, false, false, false, false, "admin",
+                                &models_dir,
+                            &services,
+                            hyprstream_core::cli::WizardOptions::first_run(),
                             ).await
                         }
                     },

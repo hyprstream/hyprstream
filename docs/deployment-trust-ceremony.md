@@ -109,10 +109,14 @@ There are two distinct YubiKey roles, and conflating them overstates what you ha
 | Flag | What it does | Firmware |
 |---|---|---|
 | `--yubikey age1yubikey1…` | Token acts as an **age recipient**: it decrypts the authority bundle. The bundle's private key is briefly **in host memory** during a ceremony. | any PIV-capable (verified on **5.4.3**) |
-| `--piv-slot <SLOT>` | The **Ed25519 leg lives in the token** and never reaches host memory. | **≥ 5.7.4** — Ed25519-in-PIV. **Not verified here** (test token was 5.4.3) |
+| `--piv-slot <SLOT>` | The Ed25519 root is generated in host memory, imported into the PIV slot, and its recovery seed is stored inside the age-encrypted authority bundle — so any bundle recipient can reconstruct the software signer. The token only **gates signing** behind PIN + touch; it does **not** confine the key. | **≥ 5.7.4** — Ed25519-in-PIV. **Not verified here** (test token was 5.4.3) |
 
-Both are legitimate. Only the second is "the key never leaves the hardware." Say which one you are
-running; do not let "we use YubiKeys" imply the stronger claim.
+Neither role confines the Ed25519 key to the hardware. Both the `--yubikey` age recipient and the
+`--piv-slot` import path place the bundle private key (or its recoverable seed) inside host memory
+and inside the age-encrypted authority bundle. The PIV path additionally gates signing behind a
+hardware touch prompt, but a bundle recipient can still sign without the token by reconstructing
+the software signer from the seed. Say which one you are running, and do not let "we use YubiKeys"
+imply hardware confinement that neither path actually provides.
 
 `--kms-plugin` accepts a cloud/PQ-HSM age-plugin recipient for organizations preferring an HSM.
 
@@ -210,11 +214,30 @@ Verified: succeeds with **no root bundle and no hardware token**. The credential
 
 Verify anything with `hyprstream trust verify-deployment`, which uses the production verifier.
 
+#### What unattended refresh costs you
+
+The credential above expires in an hour, so a deployed host re-mints it on a timer with no
+operator present. That is only possible if the host can decrypt the delegated signer by itself —
+so `--identity` (`online-signer.key` above) must be resident on the host, root-owned and `0600`,
+where `hyprstream trust install --refresh-identity` puts it.
+
+Accept this deliberately: **root compromise on a deployed host yields the delegated signer**, and
+with it the ability to mint registry credentials until the delegation expires. That is the price of
+unattended operation, and it is why the delegation is scoped to the registry service and given a
+short life rather than being a second root. It is *not* a path to the root authority — the root
+bundle is sealed to a disjoint recipient set that this identity cannot open, and it never touches a
+deployed host.
+
+Two consequences worth planning for: keep the delegation TTL short enough that a compromise window
+you would tolerate is the same window you actually have, and treat rotating the delegated signer —
+not just the JWT — as a routine operation rather than an incident-only one.
+
 ### 6. After the ceremony
 
 - `deployment-ca.age` → offline storage with the token. Never onto a deployed host.
 - Public artifacts (`deployment-ca.hybrid`, authority log, checkpoint) → `/etc/hyprstream/trust/`.
 - Delegated signer + delegation → the deployment environment.
+- Online-signer identity → the deployment environment, for unattended refresh only (see above).
 - **Destroy the ceremony working directory** (`shred` key material, then remove it).
 
 ## Gotchas (each cost real time)
@@ -231,6 +254,36 @@ automated wrapper will not work.
 **A build-queue slot is not durable storage.** If you build the binary through a shared/pooled
 `CARGO_TARGET_DIR`, copy it out before using it — pooled slots are reclaimed and your binary will
 vanish mid-ceremony.
+
+## Running the ceremony from the wizard
+
+`hyprstream wizard --deployment-trust` runs the same four steps after node bootstrap. It is opt-in:
+without the flag the wizard sets up node-local trust only, exactly as before.
+
+The wizard enumerates attached tokens with `ykman list` and picks the mode from the firmware it
+reports, saying which one it chose and why:
+
+| What it finds | Mode |
+|---|---|
+| no token | software recipients, labelled **dev-grade** on screen, in the summary, and in `deployment-trust-mode.json` |
+| firmware < 5.7.4 | `--yubikey` age-recipient mode |
+| firmware >= 5.7.4 | `--piv-slot` mode (slot `9c` by default) |
+| several tokens | asks which one; `--deployment-trust-serial <SERIAL>` answers ahead of time |
+| detection failed | **refuses to continue** — not knowing whether hardware is attached is not the same as knowing it is absent |
+
+A software root is never selected while a token is attached unless `--deployment-trust-software` says
+so explicitly. The break-glass prompt defaults to `age-keygen | age -p` and refuses a bare identity
+file unless `--deployment-trust-allow-plaintext-break-glass` is passed.
+
+`--non-interactive` never reaches a prompt: without `--deployment-trust` the phase does not run at
+all, and with it, an attached token stops the run with both ways forward rather than hanging on a PIN
+that no one is there to type.
+
+The wizard leaves the public artifacts in the ceremony directory; installing them to
+`/etc/hyprstream/trust/` is still the operator's step (see *After the ceremony*).
+
+> The `--piv-slot` path remains **unverified on real 5.7.4 hardware**. The firmware rule that selects
+> it is tested; what `ykman piv keys import` and `yubico-piv-tool` do on a token is not.
 
 ## Local development
 

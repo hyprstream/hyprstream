@@ -318,7 +318,11 @@ fn reach_from_capsule(verified: &VerifiedCapsule, document: &Value) -> Result<Tr
         })
         .ok_or_else(|| {
             anyhow::anyhow!(
-                "capsule has no NinePExport service entry {DEPLOYMENT_REACH_SERVICE:?} for deployment reach"
+"capsule has no NinePExport service entry {DEPLOYMENT_REACH_SERVICE:?} for deployment reach; \
+                 the pinned did:at9p must be an ANCHOR capsule signed by the deployment CA, not a node's \
+                 own identity capsule (e.g. the `#pds` capsule a node's OAuth service renders for \
+                 itself) — mint one with `hyprstream trust mint-anchor-capsule` and publish it \
+                 (with its did.json) under the deployment well-known directory"
             )
         })?;
     match entry.endpoint.transport {
@@ -352,16 +356,42 @@ fn reach_from_capsule(verified: &VerifiedCapsule, document: &Value) -> Result<Tr
             // WebPKI policy, and certificate hashes) for that exact
             // capsule-bound socket. Those mechanics cannot select application
             // identity: the signed ping is still pinned independently.
+            //
+            // A hostname-based document URI (`https://host:port`) decodes to
+            // an unspecified address with only the port populated, so the match
+            // accepts either an exact address equality or a port-only match
+            // when the document entry carries an unspecified IP.
             let document_transport = hyprstream_rpc::did_web::transport_entries(document)
                 .into_iter()
                 .map(|decoded| decoded.config)
                 .find(|config| {
                     matches!(
                         &config.endpoint,
-                        EndpointType::Quic { addr, .. } if *addr == address
+                        EndpointType::Quic { addr, .. }
+                            if *addr == address
+                                || (addr.ip().is_unspecified() && addr.port() == address.port())
                     )
+                })
+                .map(|mut config| {
+                    // A hostname-based document URI decodes to an unspecified
+                    // IP with only the port populated. The capsule carries the
+                    // real dial address, so substitute it: without this rewrite
+                    // the config would dial 0.0.0.0:port and never connect,
+                    // turning a verified capsule into an unusable one.
+                    if let EndpointType::Quic { addr, .. } = &mut config.endpoint {
+                        if addr.ip().is_unspecified() {
+                            *addr = address;
+                        }
+                    }
+                    config
                 });
             Ok(document_transport.unwrap_or_else(|| {
+                tracing::warn!(
+                    "capsule QUIC reach {} has no matching QuicTransport entry in the did:web \
+                     document; falling back to bare-IP dial without SNI or certificate pins — \
+                     the deployment will not be reachable via hostname or WebPKI-validated TLS",
+                    address
+                );
                 TransportConfig::quic(address, address.ip().to_string()).with_connect_mode()
             }))
         }
@@ -371,13 +401,53 @@ fn reach_from_capsule(verified: &VerifiedCapsule, document: &Value) -> Result<Tr
     }
 }
 
-pub(crate) async fn verify_did_anchored_document(
+/// Deployment material an anchor capsule contributes, once the capsule and the
+/// `did:web` document have mutually attested to each other.
+///
+/// This is the verification-only half of the DID-anchored bootstrap — the part
+/// a minting ceremony can self-check offline, before publication and before any
+/// registry credential or authority log exists.
+#[derive(Clone, Debug)]
+pub struct VerifiedAnchorMaterial {
+    /// The GATE-verified `did:at9p` the document reciprocally names.
+    pub at9p_did: String,
+    /// Raw hybrid deployment root taken from the capsule's primary subject
+    /// key: the 32-byte Ed25519 key followed by the 1952-byte ML-DSA-65 key,
+    /// the same layout the OS-owned `deployment-ca.hybrid` pin uses.
+    pub deployment_ca_public: Vec<u8>,
+    /// Deployment reach decoded from the capsule's `#ns` NinePExport entry.
+    pub discovery_transport: TransportConfig,
+}
+
+/// Verify an anchor capsule against its `did:web` document through the
+/// production resolution path, without needing the registry credential or
+/// authority log the live bootstrap also fetches.
+///
+/// Minting ceremonies call this on their own output: material this rejects is
+/// material a node would refuse at boot.
+pub async fn verify_anchor_material(
     anchors: &DidAnchors,
     document: &Value,
     capsule_source: Arc<dyn CapsuleSource>,
-    registry_credential: String,
-    authority_log: DeploymentAuthorityLog,
-) -> Result<DidAnchoredTrust> {
+) -> Result<VerifiedAnchorMaterial> {
+    let (identity, ca, discovery_transport) =
+        resolve_anchor_pair(anchors, document, capsule_source).await?;
+    let mut deployment_ca_public = ca.ed25519_bytes().to_vec();
+    deployment_ca_public.extend_from_slice(&ca.ml_dsa_65_bytes());
+    Ok(VerifiedAnchorMaterial {
+        at9p_did: identity.at9p_did.as_str().to_owned(),
+        deployment_ca_public,
+        discovery_transport,
+    })
+}
+
+/// Shared core of the DID-anchored trust decision: reciprocal naming, the
+/// capsule GATE, and the CA + reach the GATE-verified capsule carries.
+async fn resolve_anchor_pair(
+    anchors: &DidAnchors,
+    document: &Value,
+    capsule_source: Arc<dyn CapsuleSource>,
+) -> Result<(AuthoritativeIdentity, HybridDeploymentCa, TransportConfig)> {
     anyhow::ensure!(
         document.get("id").and_then(Value::as_str) == Some(anchors.cluster_did_web.as_str()),
         "did:web document id does not match configured cluster_did_web"
@@ -409,7 +479,22 @@ pub(crate) async fn verify_did_anchored_document(
         ),
         "capsule deployment reach is not a network transport"
     );
+    Ok((
+        authoritative_identity,
+        ca_verifying_key,
+        discovery_transport,
+    ))
+}
 
+pub(crate) async fn verify_did_anchored_document(
+    anchors: &DidAnchors,
+    document: &Value,
+    capsule_source: Arc<dyn CapsuleSource>,
+    registry_credential: String,
+    authority_log: DeploymentAuthorityLog,
+) -> Result<DidAnchoredTrust> {
+    let (authoritative_identity, ca_verifying_key, discovery_transport) =
+        resolve_anchor_pair(anchors, document, capsule_source).await?;
     Ok(DidAnchoredTrust {
         ca_verifying_key,
         discovery_transport,
@@ -488,6 +573,7 @@ mod tests {
     };
     use serde_json::json;
     use std::collections::BTreeMap;
+    use std::net::SocketAddr;
 
     struct FixedCapsuleSource(Vec<u8>);
 
@@ -1081,6 +1167,122 @@ mod tests {
                 assert_eq!(auth.accept_cert_hashes(), &[[0xA5; 32]]);
             }
             other => panic!("expected capsule-bound QUIC reach, got {other:?}"),
+        }
+    }
+
+    /// When the document QUIC entry uses a hostname URI (decoding to an
+    /// unspecified IP) and the port matches the capsule's real address, the
+    /// port-match relaxation must fire AND the returned config must dial the
+    /// capsule's real socket address — not `0.0.0.0:port`.
+    ///
+    /// Removing the address-rewrite in `reach_from_capsule` turns this test
+    /// red: the config would dial an unspecified address and never connect.
+    #[tokio::test]
+    async fn quic_port_match_with_hostname_uri_rewrites_dial_address() {
+        let web = "did:web:cluster.example";
+        let signer = capsule_signer(7);
+        let capsule_addr: SocketAddr = "203.0.113.10:443".parse().unwrap();
+        let endpoint =
+            ServiceEndpoint::new(Transport::Quic, format!("quic://{capsule_addr}")).unwrap();
+        let service = ServiceEntry::new("#ns", ServiceType::NinePExport, endpoint).unwrap();
+        let mut body = CapsuleBody::new(vec![signer.pair], vec![service]).unwrap();
+        body.also_known_as = Some(vec![web.to_owned()]);
+        let capsule = sign_capsule(body, &signer.ed, &signer.pq).unwrap();
+        let bytes = capsule.to_dag_cbor().unwrap();
+        let at9p = format!("did:at9p:{}", capsule.cid512().unwrap());
+        let anchors = DidAnchors {
+            cluster_at9p_did: at9p.clone(),
+            cluster_did_web: web.to_owned(),
+            extra_root_cert_pem: None,
+        };
+        let channel_auth =
+            hyprstream_rpc::transport::QuicServerAuth::pinned(vec![[0xB7; 32]]).unwrap();
+        let mut document = document(web, Some(&at9p));
+        // Hostname URI decodes to 0.0.0.0:443 — port matches, IP does not.
+        document["service"] = json!([{
+            "id": format!("{web}#quic"),
+            "type": "QuicTransport",
+            "serviceEndpoint": hyprstream_rpc::service_entry::encode_quic(
+                "https://staging.example.com:443",
+                &channel_auth,
+                &["hyprstream-rpc/1"],
+            ),
+        }]);
+
+        let trust = verify_did_anchored_document(
+            &anchors,
+            &document,
+            Arc::new(FixedCapsuleSource(bytes)),
+            "unused-test-credential".to_owned(),
+            unused_authority_log(),
+        )
+        .await
+        .expect("hostname-URI port match must verify");
+        match trust.discovery_transport.endpoint {
+            EndpointType::Quic { addr, auth, .. } => {
+                assert_eq!(
+                    addr, capsule_addr,
+                    "dial address must be the capsule's real socket, not 0.0.0.0"
+                );
+                assert!(!auth.require_web_pki());
+                assert_eq!(auth.accept_cert_hashes(), &[[0xB7; 32]]);
+            }
+            other => panic!("expected capsule-bound QUIC reach, got {other:?}"),
+        }
+    }
+
+    /// When the document QUIC entry's port does NOT match the capsule's address
+    /// (and the IP is unspecified from a hostname URI), no entry matches and the
+    /// resolver falls back to a bare-IP dial without SNI or certificate pins.
+    #[tokio::test]
+    async fn quic_neither_port_nor_address_match_falls_back_to_bare_ip() {
+        let web = "did:web:cluster.example";
+        let signer = capsule_signer(9);
+        let capsule_addr: SocketAddr = "203.0.113.20:443".parse().unwrap();
+        let endpoint =
+            ServiceEndpoint::new(Transport::Quic, format!("quic://{capsule_addr}")).unwrap();
+        let service = ServiceEntry::new("#ns", ServiceType::NinePExport, endpoint).unwrap();
+        let mut body = CapsuleBody::new(vec![signer.pair], vec![service]).unwrap();
+        body.also_known_as = Some(vec![web.to_owned()]);
+        let capsule = sign_capsule(body, &signer.ed, &signer.pq).unwrap();
+        let bytes = capsule.to_dag_cbor().unwrap();
+        let at9p = format!("did:at9p:{}", capsule.cid512().unwrap());
+        let anchors = DidAnchors {
+            cluster_at9p_did: at9p.clone(),
+            cluster_did_web: web.to_owned(),
+            extra_root_cert_pem: None,
+        };
+        let channel_auth =
+            hyprstream_rpc::transport::QuicServerAuth::pinned(vec![[0xC9; 32]]).unwrap();
+        let mut document = document(web, Some(&at9p));
+        // Port 8443 does not match the capsule's port 443.
+        document["service"] = json!([{
+            "id": format!("{web}#quic"),
+            "type": "QuicTransport",
+            "serviceEndpoint": hyprstream_rpc::service_entry::encode_quic(
+                "https://staging.example.com:8443",
+                &channel_auth,
+                &["hyprstream-rpc/1"],
+            ),
+        }]);
+
+        let trust = verify_did_anchored_document(
+            &anchors,
+            &document,
+            Arc::new(FixedCapsuleSource(bytes)),
+            "unused-test-credential".to_owned(),
+            unused_authority_log(),
+        )
+        .await
+        .expect("fallback to bare-IP dial must still verify");
+        match trust.discovery_transport.endpoint {
+            EndpointType::Quic { addr, auth, .. } => {
+                // Fallback: bare capsule address, WebPKI default, no cert pins.
+                assert_eq!(addr, capsule_addr);
+                assert!(auth.require_web_pki());
+                assert!(auth.accept_cert_hashes().is_empty());
+            }
+            other => panic!("expected fallback QUIC reach, got {other:?}"),
         }
     }
 }
