@@ -348,6 +348,8 @@ RUN --mount=type=cache,target=/root/.cargo/registry \
 # and libz are copied anyway so the runtime keeps the exact implementations the
 # LibTorch build was validated against rather than silently adopting the base
 # image's; LD_LIBRARY_PATH puts LibTorch's own bundled copies first in any case.
+# libzstd is carried because Debian trixie's libcrypto links it transitively
+# and the runtime base does not ship it.
 
 #############################################
 # CUDA 12.8 Runtime
@@ -355,9 +357,12 @@ RUN --mount=type=cache,target=/root/.cargo/registry \
 
 FROM ${RUNTIME_BASE} AS runtime-cuda128
 
-# Copy required system libraries
+# Copy required system libraries. libzstd is a transitive dependency of
+# OpenSSL on Debian trixie (libcrypto links libzstd); the runtime base
+# does not ship it.
 COPY --from=builder /usr/lib/x86_64-linux-gnu/libgomp.so.1 /usr/lib64/
 COPY --from=builder /usr/lib/x86_64-linux-gnu/libz.so.1 /usr/lib64/
+COPY --from=builder /usr/lib/x86_64-linux-gnu/libzstd.so.1 /usr/lib64/
 COPY --from=builder /usr/lib/x86_64-linux-gnu/libssl.so* /usr/lib64/
 COPY --from=builder /usr/lib/x86_64-linux-gnu/libcrypto.so* /usr/lib64/
 
@@ -378,6 +383,7 @@ FROM ${RUNTIME_BASE} AS runtime-cuda130
 # Copy required system libraries
 COPY --from=builder /usr/lib/x86_64-linux-gnu/libgomp.so.1 /usr/lib64/
 COPY --from=builder /usr/lib/x86_64-linux-gnu/libz.so.1 /usr/lib64/
+COPY --from=builder /usr/lib/x86_64-linux-gnu/libzstd.so.1 /usr/lib64/
 COPY --from=builder /usr/lib/x86_64-linux-gnu/libssl.so* /usr/lib64/
 COPY --from=builder /usr/lib/x86_64-linux-gnu/libcrypto.so* /usr/lib64/
 
@@ -398,6 +404,7 @@ FROM ${RUNTIME_BASE} AS runtime-rocm71
 # Copy required system libraries
 COPY --from=builder /usr/lib/x86_64-linux-gnu/libgomp.so.1 /usr/lib64/
 COPY --from=builder /usr/lib/x86_64-linux-gnu/libz.so.1 /usr/lib64/
+COPY --from=builder /usr/lib/x86_64-linux-gnu/libzstd.so.1 /usr/lib64/
 COPY --from=builder /usr/lib/x86_64-linux-gnu/libssl.so* /usr/lib64/
 COPY --from=builder /usr/lib/x86_64-linux-gnu/libcrypto.so* /usr/lib64/
 
@@ -413,6 +420,7 @@ FROM ${RUNTIME_BASE} AS runtime-cpu
 # Copy required system libraries
 COPY --from=builder /usr/lib/x86_64-linux-gnu/libgomp.so.1 /usr/lib64/
 COPY --from=builder /usr/lib/x86_64-linux-gnu/libz.so.1 /usr/lib64/
+COPY --from=builder /usr/lib/x86_64-linux-gnu/libzstd.so.1 /usr/lib64/
 COPY --from=builder /usr/lib/x86_64-linux-gnu/libssl.so* /usr/lib64/
 COPY --from=builder /usr/lib/x86_64-linux-gnu/libcrypto.so* /usr/lib64/
 
@@ -432,9 +440,12 @@ COPY --from=builder /opt/libtorch/lib/ /opt/libtorch/lib/
 
 FROM ${RUNTIME_BASE} AS runtime-cpu-arm64
 
-# Copy required system libraries (arm64 multiarch source path)
-COPY --from=builder /usr/lib/aarch64-linux-gnu/libgomp.so.1 /usr/lib64/
-COPY --from=builder /usr/lib/aarch64-linux-gnu/libz.so.1 /usr/lib64/
+# Copy required system libraries (arm64 multiarch source path).
+# libgomp and libz are NOT copied here: the runtime base provides libz, and
+# LibTorch bundles its own libgomp at /opt/libtorch/lib/ (which
+# LD_LIBRARY_PATH searches first). Removing them was deferred until a real
+# build confirmed the image — this is that build.
+COPY --from=builder /usr/lib/aarch64-linux-gnu/libzstd.so.1 /usr/lib64/
 COPY --from=builder /usr/lib/aarch64-linux-gnu/libssl.so* /usr/lib64/
 COPY --from=builder /usr/lib/aarch64-linux-gnu/libcrypto.so* /usr/lib64/
 
