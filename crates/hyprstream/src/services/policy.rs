@@ -380,6 +380,31 @@ fn published_service_key_response(
 
 /// Confirmation material is mandatory: an absent or malformed `cnf.jwk` must
 /// never turn a valid CA token into authority for arbitrary key material.
+/// Claims for a renewed service JWT.
+///
+/// `aud` is stamped alongside `iss` — the same shape the provisioning path
+/// mints — because strict composite audience validation rejects an aud-less
+/// token on every dispatch, and the on-disk reuse predicate treats a token
+/// that does not bind the local issuer URL in both claims as stale.
+fn renewed_service_claims(
+    subject: String,
+    now: i64,
+    expires_at: i64,
+    issuer: &str,
+    tenant: String,
+    cnf_key: &[u8; 32],
+) -> hyprstream_rpc::auth::Claims {
+    let mut claims = hyprstream_rpc::auth::Claims::new(subject, now, expires_at)
+        .with_tenant(tenant)
+        .with_cnf_jwk(cnf_key);
+    if !issuer.is_empty() {
+        claims = claims
+            .with_issuer(issuer.to_owned())
+            .with_audience(Some(issuer.to_owned()));
+    }
+    claims
+}
+
 /// Verify a service JWT presented to `registerServiceKey`.
 ///
 /// Hybrid (`ML-DSA-65-Ed25519`) tokens resolve their composite kid through
@@ -1785,10 +1810,8 @@ impl PolicyHandler for PolicyService {
 
         let issuer = self.default_audience.clone().unwrap_or_default();
         let tenant = ctx.domain()?;
-        let claims = hyprstream_rpc::auth::Claims::new(subject.clone(), now, expires_at)
-            .with_issuer(issuer)
-            .with_tenant(tenant)
-            .with_cnf_jwk(vk.as_bytes());
+        let claims =
+            renewed_service_claims(subject.clone(), now, expires_at, &issuer, tenant, &ctx.cnf);
 
         let token = match self.sign_token(&claims, true).await {
             Ok(t) => t,
@@ -2153,6 +2176,36 @@ mod tests {
             hyprstream_rpc::crypto::CryptoPolicy::Classical,
         )
         .is_ok());
+    }
+
+    /// A renewed service JWT binds the issuer URL in BOTH `iss` and `aud`
+    /// (matching the provisioning mint, which strict composite audience
+    /// validation requires); with no issuer configured, neither is stamped.
+    #[test]
+    fn renewed_service_claims_bind_issuer_and_audience() {
+        let cnf = [7u8; 32];
+        let claims = renewed_service_claims(
+            "service:model".to_owned(),
+            100,
+            200,
+            "http://localhost:9080",
+            "tenant-a.example".to_owned(),
+            &cnf,
+        );
+        assert_eq!(claims.iss, "http://localhost:9080");
+        assert_eq!(claims.aud.as_deref(), Some("http://localhost:9080"));
+        assert_eq!(claims.sub, "service:model");
+
+        let bare = renewed_service_claims(
+            "service:model".to_owned(),
+            100,
+            200,
+            "",
+            "tenant-a.example".to_owned(),
+            &cnf,
+        );
+        assert!(bare.iss.is_empty());
+        assert!(bare.aud.is_none());
     }
 
     /// A composite service JWT signed by a DIFFERENT pair (unknown kid)

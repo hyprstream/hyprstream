@@ -14,10 +14,11 @@ const NEW_EXPIRY_TTL: i64 = 30 * 86_400;
 const RENEW_THRESHOLD: i64 = 7 * 86_400;
 
 /// Load an existing service JWT from disk, or sign a new one if absent,
-/// within `RENEW_THRESHOLD` seconds of expiry, missing an `iss`, or carrying
-/// a classical (non-PQ-covering) header alg — the last two are backfills that
-/// re-mint tokens older bootstraps produced in shapes the dispatch plane now
-/// rejects.
+/// within `RENEW_THRESHOLD` seconds of expiry, not binding the local issuer
+/// URL in BOTH `iss` and `aud`, or carrying a classical (non-PQ-covering)
+/// header alg — the last two are backfills that re-mint tokens older
+/// bootstraps (or older renewal paths, which stamped `iss` but not `aud`)
+/// produced in shapes the composite dispatch verification now rejects.
 ///
 /// Does NOT write to disk — callers are responsible for persisting the
 /// returned JWT via `identity_store::write_service_jwt`.
@@ -34,15 +35,18 @@ pub fn issue_or_load_service_jwt(
         None => true,
         Some(ref jwt) => {
             let exp = decode_jwt_exp(jwt).unwrap_or(0);
-            // Re-issue if near expiry OR if the persisted token has no `iss`
-            // (older bootstraps minted empty-issuer service JWTs, which the
-            // #328 gate rejects on the IPC/AnySigner plane — see below) OR if
-            // the persisted token's header alg is not PQ-covering (older
+            // Re-issue if near expiry OR if the persisted token does not bind
+            // the local issuer URL in BOTH `iss` and `aud` (older bootstraps
+            // minted empty-issuer service JWTs, which the #328 gate rejects
+            // on the IPC/AnySigner plane — see below — and older renewal
+            // paths stamped `iss` without `aud`, which strict composite
+            // audience validation rejects on every dispatch) OR if the
+            // persisted token's header alg is not PQ-covering (older
             // bootstraps minted classical EdDSA service JWTs, which the
             // mandatory Hybrid dispatch policy rejects at registration — the
-            // same backfill shape as the empty-`iss` re-issue).
+            // same backfill shape).
             (exp - now) <= RENEW_THRESHOLD
-                || decode_jwt_iss(jwt).is_none_or(|s| s.is_empty())
+                || !claims_bind_local_issuer(jwt, local_issuer_url)
                 || !header_alg_covers_pq(jwt)
         }
     };
@@ -94,6 +98,24 @@ pub fn issue_or_load_service_jwt(
     ))
 }
 
+/// Whether the persisted token binds the local issuer URL in BOTH `iss` and
+/// `aud` — the shape a fresh mint produces. An empty `iss` always forces a
+/// re-issue (the #328 gate rejects it); when a local issuer URL is
+/// configured, a mismatched `iss` or a missing/mismatched `aud` (older
+/// renewal paths stamped `iss` without `aud`) forces one too, because strict
+/// composite audience validation rejects such tokens on every dispatch.
+fn claims_bind_local_issuer(jwt: &str, local_issuer_url: &str) -> bool {
+    let iss = decode_jwt_iss(jwt);
+    if iss.as_deref().is_none_or(str::is_empty) {
+        return false;
+    }
+    if local_issuer_url.is_empty() {
+        return true;
+    }
+    iss.as_deref() == Some(local_issuer_url)
+        && decode_jwt_aud(jwt).as_deref() == Some(local_issuer_url)
+}
+
 /// Whether the persisted token's header `alg` carries a post-quantum
 /// component. Classical (`EdDSA`) tokens fail the mandatory Hybrid dispatch
 /// policy and must be re-minted.
@@ -123,6 +145,15 @@ fn decode_jwt_iss(jwt: &str) -> Option<String> {
     let payload = URL_SAFE_NO_PAD.decode(payload_b64).ok()?;
     let value: serde_json::Value = serde_json::from_slice(&payload).ok()?;
     value.get("iss")?.as_str().map(ToOwned::to_owned)
+}
+
+/// Decode the `aud` claim without verifying the signature — the `iss` twin
+/// used by the aud-backfill check in `issue_or_load_service_jwt`.
+fn decode_jwt_aud(jwt: &str) -> Option<String> {
+    let payload_b64 = jwt.split('.').nth(1)?;
+    let payload = URL_SAFE_NO_PAD.decode(payload_b64).ok()?;
+    let value: serde_json::Value = serde_json::from_slice(&payload).ok()?;
+    value.get("aud")?.as_str().map(ToOwned::to_owned)
 }
 
 #[cfg(test)]
@@ -267,6 +298,52 @@ mod tests {
         .unwrap();
         assert_eq!(verified.sub, "service:model");
         assert_eq!(verified.iss, issuer);
+    }
+
+    /// A persisted hybrid token that carries `iss` but NO `aud` (the shape an
+    /// older renewal path produced) is re-issued with both bound to the local
+    /// issuer URL — strict composite audience validation rejects an aud-less
+    /// token on every dispatch, so it must not be treated as current.
+    #[test]
+    fn audless_persisted_hybrid_jwt_is_reissued_with_audience() {
+        let dir = tempfile::tempdir().unwrap();
+        let ca = SigningKey::from_bytes(&[3u8; 32]);
+        let svc = SigningKey::from_bytes(&[4u8; 32]);
+        let issuer = "http://localhost:6791";
+        let now = chrono::Utc::now().timestamp();
+
+        // Hybrid, far from expiry, correct issuer — but no aud.
+        let legacy_claims =
+            hyprstream_rpc::auth::Claims::new("service:model".to_owned(), now, now + 30 * 86_400)
+                .with_issuer(issuer.to_owned())
+                .with_cnf_jwk(svc.verifying_key().as_bytes());
+        let ca_pq = hyprstream_rpc::node_identity::derive_mesh_mldsa_key(&ca);
+        let ca_pq_vk = hyprstream_rpc::crypto::pq::ml_dsa_sk_to_vk(&ca_pq);
+        let legacy = hyprstream_rpc::auth::jwt::encode_service_jwt_hybrid(
+            &legacy_claims, &ca, &ca_pq, &ca_pq_vk,
+        );
+        assert!(decode_jwt_aud(&legacy).is_none());
+        super::super::identity_store::write_service_jwt(dir.path(), "model", &legacy).unwrap();
+
+        let jwt = issue_or_load_service_jwt(
+            dir.path(), "model", &ca, &svc.verifying_key(), issuer, now,
+        )
+        .unwrap();
+        assert_ne!(jwt, legacy, "aud-less token must not be returned as-is");
+        assert_eq!(decode_jwt_iss(&jwt).as_deref(), Some(issuer));
+        assert_eq!(decode_jwt_aud(&jwt).as_deref(), Some(issuer));
+
+        // The re-minted token passes strict composite audience validation.
+        let dispatch =
+            hyprstream_rpc::auth::jwt::parse_composite_dispatch(&jwt, &["wit+jwt"]).unwrap();
+        hyprstream_rpc::auth::jwt::decode_composite(
+            &jwt,
+            &ca_pq_vk,
+            &ca.verifying_key(),
+            Some(issuer),
+            &dispatch,
+        )
+        .unwrap();
     }
 
     /// A persisted hybrid token far from expiry (with issuer) is returned
