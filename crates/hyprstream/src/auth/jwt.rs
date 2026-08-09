@@ -179,6 +179,33 @@ pub fn encode_composite_service_jwt(
     format!("{signing_input}.{sig_b64}")
 }
 
+/// Encode a service WIT with the mandatory hybrid suite for the dispatch plane.
+///
+/// Prefers the active OAuth composite pair from the composite signing
+/// authority (rotation-aware, mirroring PolicyService's token signing seam).
+/// When the authority has no usable active pair — a fresh install before
+/// rotation initialization — falls back to the self-contained CA JWT pair
+/// `(derive_mesh_mldsa_key(fallback_ed), fallback_ed)`, whose composite kid
+/// the dispatch key sources resolve offline from the `ca-mldsa-pubkey`
+/// credential. A classical WIT is never minted: the dispatch plane's Hybrid
+/// policy would reject it unconditionally.
+pub fn encode_service_jwt_hybrid_via_authority(
+    claims: &Claims,
+    fallback_ed: &ed25519_dalek::SigningKey,
+) -> String {
+    if let Ok(snapshot) = hyprstream_rpc::auth::global_composite_key_set().mint_snapshot() {
+        if let Some((ml_key, ed_key)) = snapshot
+            .active_signing_pair(hyprstream_rpc::auth::CompositePairRole::OAuth)
+            .and_then(hyprstream_rpc::auth::CompositeKeyPair::signing_keys)
+        {
+            return encode_composite_service_jwt(claims, &ml_key, &ed_key);
+        }
+    }
+    let pq = hyprstream_rpc::node_identity::derive_mesh_mldsa_key(fallback_ed);
+    let pq_vk = hyprstream_rpc::crypto::pq::ml_dsa_sk_to_vk(&pq);
+    hyprstream_rpc::auth::jwt::encode_service_jwt_hybrid(claims, fallback_ed, &pq, &pq_vk)
+}
+
 /// Build a JWK for an ML-DSA-65 key (`kty: "AKP"`).
 pub fn ml_dsa_65_jwk(
     vk: &hyprstream_rpc::crypto::pq::MlDsaVerifyingKey,

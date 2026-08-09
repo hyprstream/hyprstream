@@ -57,6 +57,14 @@ pub fn ml_dsa_sk_to_vk_bytes(key: &MlDsaSigningKey) -> Vec<u8> {
     ml_dsa_vk_bytes(&key.verifying_key())
 }
 
+/// Derive the ML-DSA-65 verifying key from a signing key.
+///
+/// Convenience for callers outside this crate that hold a signing key but do
+/// not depend on the `ml_dsa` crate's `Keypair` trait directly.
+pub fn ml_dsa_sk_to_vk(key: &MlDsaSigningKey) -> MlDsaVerifyingKey {
+    key.verifying_key().clone()
+}
+
 pub fn ml_dsa_vk_from_bytes(bytes: &[u8]) -> Result<MlDsaVerifyingKey> {
     let encoded = EncodedVerifyingKey::<MlDsa65>::try_from(bytes).map_err(|_| {
         anyhow::anyhow!("invalid ML-DSA-65 verifying key length (expected 1952 bytes)")

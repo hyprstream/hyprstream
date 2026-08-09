@@ -1074,9 +1074,8 @@ pub trait RequestService: 'static {
                 ];
                 let dispatch = crate::auth::parse_composite_dispatch(&token, &allowed_types)
                     .map_err(|error| anyhow::anyhow!("JWT dispatch failed: {error}"))?;
-                let snapshot = key_source.composite_key_set().snapshot();
-                let pair = snapshot
-                    .pair(dispatch.kid())
+                let pair = key_source
+                    .composite_pair(dispatch.kid())
                     .ok_or_else(|| anyhow::anyhow!("unknown composite JWT kid"))?;
                 crate::auth::jwt::decode_composite(
                     &token,
@@ -2299,6 +2298,47 @@ mod stripping_defense_tests {
                 "Hybrid policy must accept post-quantum alg {alg}"
             );
         }
+    }
+
+    /// A freshly minted hybrid service WIT — the exact pair (derived ML-DSA,
+    /// CA Ed25519) a clean bootstrap signs with — passes the Hybrid alg gate
+    /// and round-trips through the real dispatch verification: header-alg
+    /// gate, composite dispatch, key-source pair resolution, and composite
+    /// decode. An unknown composite kid still fails to resolve.
+    #[allow(clippy::unwrap_used, clippy::expect_used)]
+    #[test]
+    fn hybrid_service_jwt_passes_gate_and_dispatch_verification() {
+        use crate::auth::{jwt, ClusterKeySource, JwtKeySource};
+
+        let ca_ed = ed25519_dalek::SigningKey::from_bytes(&[0x61; 32]);
+        let ca_pq = crate::node_identity::derive_mesh_mldsa_key(&ca_ed);
+        let ca_pq_vk = crate::crypto::pq::ml_dsa_sk_to_vk(&ca_pq);
+
+        let issuer = "http://localhost:9080";
+        let now = chrono::Utc::now().timestamp();
+        let claims = crate::auth::Claims::new("service:discovery".to_owned(), now, now + 3600)
+            .with_issuer(issuer.to_owned());
+        let token = jwt::encode_service_jwt_hybrid(&claims, &ca_ed, &ca_pq, &ca_pq_vk);
+
+        // The minted alg satisfies the Hybrid policy floor.
+        let alg = jwt::header_alg(&token).unwrap().unwrap();
+        assert!(jwt_alg_satisfies_policy(CryptoPolicy::Hybrid, &alg).is_ok());
+
+        // The dispatch path resolves the composite kid to BOTH halves and the
+        // token verifies against them.
+        let key_source = ClusterKeySource::new(ca_ed.verifying_key(), issuer.to_owned())
+            .with_ca_composite_key(ca_pq_vk.clone());
+        let dispatch = crate::auth::parse_composite_dispatch(&token, &["wit+jwt"]).unwrap();
+        let pair = key_source
+            .composite_pair(dispatch.kid())
+            .expect("CA composite kid must resolve on the dispatch plane");
+        let verified =
+            jwt::decode_composite(&token, pair.ml_dsa(), pair.ed25519(), None, &dispatch)
+                .expect("hybrid service JWT must verify with the resolved pair");
+        assert_eq!(verified.sub, "service:discovery");
+
+        // Unknown kids stay unresolvable — fail closed.
+        assert!(key_source.composite_pair("some-other-kid").is_none());
     }
 }
 

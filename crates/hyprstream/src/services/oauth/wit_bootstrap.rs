@@ -123,7 +123,10 @@ pub async fn issue_browser_wit(
         claims = claims.with_tenant(domain);
     }
 
-    let wit = hyprstream_rpc::auth::jwt::encode_service_jwt(&claims, ca_key);
+    // Hybrid mint: the browser presents this WIT in ZMQ envelope calls, which
+    // the dispatch plane verifies under a mandatory Hybrid crypto policy — a
+    // classical EdDSA WIT would be rejected on exactly the plane it is for.
+    let wit = crate::auth::jwt::encode_service_jwt_hybrid_via_authority(&claims, ca_key);
 
     tracing::info!(sub = %sub, "Browser WIT issued");
 
@@ -213,12 +216,35 @@ mod tests {
             .await
             .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        let claims = crate::auth::jwt::decode(
-            json["wit"].as_str().unwrap(),
-            &ed25519_dalek::SigningKey::from_bytes(&[0x73; 32]).verifying_key(),
-            None,
-        )
-        .unwrap();
-        assert_eq!(claims.tenant.as_deref(), Some("tenant-a.example"));
+        let wit = json["wit"].as_str().unwrap();
+
+        // The browser WIT is minted hybrid — the dispatch plane's Hybrid
+        // policy would reject a classical EdDSA WIT — so it must dispatch as
+        // a composite wit+jwt.
+        let dispatch =
+            hyprstream_rpc::auth::jwt::parse_composite_dispatch(wit, &["wit+jwt"]).unwrap();
+
+        // When no composite signing authority is active, the mint falls back
+        // to the self-contained CA pair derived from the CA JWT key; verify
+        // with that exact pair when its kid matches. (A sibling test may have
+        // published a process-global authority pair, in which case the kid
+        // differs; the composite dispatch shape above is asserted either way.)
+        let ca = ed25519_dalek::SigningKey::from_bytes(&[0x73; 32]);
+        let ca_pq = hyprstream_rpc::node_identity::derive_mesh_mldsa_key(&ca);
+        let ca_pq_vk = hyprstream_rpc::crypto::pq::ml_dsa_sk_to_vk(&ca_pq);
+        if dispatch.kid() == crate::auth::jwt::composite_kid(&ca_pq_vk, &ca.verifying_key()) {
+            let claims = hyprstream_rpc::auth::jwt::decode_composite(
+                wit,
+                &ca_pq_vk,
+                &ca.verifying_key(),
+                None,
+                &dispatch,
+            )
+            .unwrap();
+            assert_eq!(claims.tenant.as_deref(), Some("tenant-a.example"));
+        } else {
+            let claims = hyprstream_rpc::auth::decode_unverified(wit).unwrap();
+            assert_eq!(claims.tenant.as_deref(), Some("tenant-a.example"));
+        }
     }
 }

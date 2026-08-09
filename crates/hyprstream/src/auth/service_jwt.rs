@@ -13,8 +13,11 @@ use ed25519_dalek::{SigningKey, VerifyingKey};
 const NEW_EXPIRY_TTL: i64 = 30 * 86_400;
 const RENEW_THRESHOLD: i64 = 7 * 86_400;
 
-/// Load an existing service JWT from disk, or sign a new one if absent or
-/// within `RENEW_THRESHOLD` seconds of expiry.
+/// Load an existing service JWT from disk, or sign a new one if absent,
+/// within `RENEW_THRESHOLD` seconds of expiry, missing an `iss`, or carrying
+/// a classical (non-PQ-covering) header alg — the last two are backfills that
+/// re-mint tokens older bootstraps produced in shapes the dispatch plane now
+/// rejects.
 ///
 /// Does NOT write to disk — callers are responsible for persisting the
 /// returned JWT via `identity_store::write_service_jwt`.
@@ -33,8 +36,14 @@ pub fn issue_or_load_service_jwt(
             let exp = decode_jwt_exp(jwt).unwrap_or(0);
             // Re-issue if near expiry OR if the persisted token has no `iss`
             // (older bootstraps minted empty-issuer service JWTs, which the
-            // #328 gate rejects on the IPC/AnySigner plane — see below).
-            (exp - now) <= RENEW_THRESHOLD || decode_jwt_iss(jwt).is_none_or(|s| s.is_empty())
+            // #328 gate rejects on the IPC/AnySigner plane — see below) OR if
+            // the persisted token's header alg is not PQ-covering (older
+            // bootstraps minted classical EdDSA service JWTs, which the
+            // mandatory Hybrid dispatch policy rejects at registration — the
+            // same backfill shape as the empty-`iss` re-issue).
+            (exp - now) <= RENEW_THRESHOLD
+                || decode_jwt_iss(jwt).is_none_or(|s| s.is_empty())
+                || !header_alg_covers_pq(jwt)
         }
     };
 
@@ -63,10 +72,39 @@ pub fn issue_or_load_service_jwt(
     )
     .with_cnf_jwk(service_vk.as_bytes());
     if !local_issuer_url.is_empty() {
-        claims = claims.with_issuer(local_issuer_url.to_owned());
+        // Stamp `aud` alongside `iss`: composite verification is strict about
+        // the audience (an absent `aud` is rejected when the verifier expects
+        // one), and every service's expected audience is this same issuer URL.
+        claims = claims
+            .with_issuer(local_issuer_url.to_owned())
+            .with_audience(Some(local_issuer_url.to_owned()));
     }
 
-    Ok(hyprstream_rpc::auth::jwt::encode_service_jwt(&claims, ca_jwt_key))
+    // Mint the mandatory hybrid (ML-DSA-65-Ed25519) form: the dispatch plane
+    // enforces a Hybrid crypto policy with no bypass, so a classical EdDSA
+    // service JWT would be rejected at the very first registration and a
+    // clean deployment could never start. The post-quantum half is derived
+    // deterministically from the CA JWT signing key — the same self-contained
+    // derivation `BootstrapPubkey::for_service_key` uses for service
+    // identities — so nothing new is persisted, protected, or rotated.
+    let ca_pq = hyprstream_rpc::node_identity::derive_mesh_mldsa_key(ca_jwt_key);
+    let ca_pq_vk = hyprstream_rpc::crypto::pq::ml_dsa_sk_to_vk(&ca_pq);
+    Ok(hyprstream_rpc::auth::jwt::encode_service_jwt_hybrid(
+        &claims, ca_jwt_key, &ca_pq, &ca_pq_vk,
+    ))
+}
+
+/// Whether the persisted token's header `alg` carries a post-quantum
+/// component. Classical (`EdDSA`) tokens fail the mandatory Hybrid dispatch
+/// policy and must be re-minted.
+fn header_alg_covers_pq(jwt: &str) -> bool {
+    matches!(
+        hyprstream_rpc::auth::jwt::header_alg(jwt)
+            .ok()
+            .flatten()
+            .as_deref(),
+        Some("ML-DSA-65" | "ML-DSA-65-Ed25519")
+    )
 }
 
 fn decode_jwt_exp(jwt: &str) -> Option<i64> {
@@ -179,6 +217,79 @@ mod tests {
             root_key.verifying_key().as_bytes(),
             policy_vk.as_bytes()
         );
+    }
+
+    /// A persisted classical (EdDSA) service JWT is re-minted as hybrid on
+    /// load, even when far from expiry and carrying an issuer — classical
+    /// tokens fail the mandatory Hybrid dispatch policy at registration, so
+    /// an upgrade heals them the same way the empty-`iss` backfill does.
+    #[test]
+    fn classical_persisted_jwt_is_reissued_hybrid() {
+        let dir = tempfile::tempdir().unwrap();
+        let ca = SigningKey::from_bytes(&[3u8; 32]);
+        let svc = SigningKey::from_bytes(&[4u8; 32]);
+        let issuer = "http://localhost:6791";
+        // Real wall-clock time: the re-minted token is verified through
+        // decode_composite below, which enforces iat/exp against the clock.
+        let now = chrono::Utc::now().timestamp();
+
+        // A classical token with issuer + far-future expiry, persisted.
+        let legacy_claims =
+            hyprstream_rpc::auth::Claims::new("service:model".to_owned(), now, now + 30 * 86_400)
+                .with_issuer(issuer.to_owned())
+                .with_cnf_jwk(svc.verifying_key().as_bytes());
+        let legacy = hyprstream_rpc::auth::jwt::encode_service_jwt(&legacy_claims, &ca);
+        super::super::identity_store::write_service_jwt(dir.path(), "model", &legacy).unwrap();
+
+        let jwt = issue_or_load_service_jwt(
+            dir.path(), "model", &ca, &svc.verifying_key(), issuer, now,
+        )
+        .unwrap();
+        assert_ne!(jwt, legacy, "classical token must not be returned as-is");
+        assert_eq!(
+            hyprstream_rpc::auth::jwt::header_alg(&jwt).unwrap().as_deref(),
+            Some("ML-DSA-65-Ed25519"),
+        );
+
+        // The re-minted token verifies against the exact derived pair, via the
+        // real composite dispatch path.
+        let ca_pq = hyprstream_rpc::node_identity::derive_mesh_mldsa_key(&ca);
+        let ca_pq_vk = hyprstream_rpc::crypto::pq::ml_dsa_sk_to_vk(&ca_pq);
+        let dispatch =
+            hyprstream_rpc::auth::jwt::parse_composite_dispatch(&jwt, &["wit+jwt"]).unwrap();
+        let verified = hyprstream_rpc::auth::jwt::decode_composite(
+            &jwt,
+            &ca_pq_vk,
+            &ca.verifying_key(),
+            None,
+            &dispatch,
+        )
+        .unwrap();
+        assert_eq!(verified.sub, "service:model");
+        assert_eq!(verified.iss, issuer);
+    }
+
+    /// A persisted hybrid token far from expiry (with issuer) is returned
+    /// as-is — the alg backfill fires only for classical tokens.
+    #[test]
+    fn hybrid_persisted_jwt_is_returned_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let ca = SigningKey::from_bytes(&[3u8; 32]);
+        let svc = SigningKey::from_bytes(&[4u8; 32]);
+        let issuer = "http://localhost:6791";
+        let now = 1_000_000;
+
+        let first = issue_or_load_service_jwt(
+            dir.path(), "model", &ca, &svc.verifying_key(), issuer, now,
+        )
+        .unwrap();
+        super::super::identity_store::write_service_jwt(dir.path(), "model", &first).unwrap();
+
+        let second = issue_or_load_service_jwt(
+            dir.path(), "model", &ca, &svc.verifying_key(), issuer, now,
+        )
+        .unwrap();
+        assert_eq!(first, second);
     }
 
     /// A persisted legacy empty-issuer token is re-minted with the issuer set,

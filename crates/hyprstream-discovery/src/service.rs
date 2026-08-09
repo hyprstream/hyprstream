@@ -5978,15 +5978,50 @@ impl DiscoveryHandler for DiscoveryService {
         // R3: Verify service JWT signature + subject matches serviceName.
         // Full JWT verification (not decode_unverified) to prevent forged identities.
         if !service_jwt.is_empty() {
-            let verified = hyprstream_rpc::auth::jwt::decode_with_key(
-                &service_jwt,
-                &self.jwt_verifying_key,
-                self.expected_audience.as_deref(),
-            )
-            .map_err(|e| {
-                tracing::warn!("Service JWT verification failed in announce: {}", e);
-                anyhow::anyhow!("Invalid service JWT in announce: {}", e)
-            })?;
+            // Service JWTs are minted hybrid (ML-DSA-65-Ed25519); the composite
+            // kid resolves through the key source (ledger pairs + the CA
+            // composite pair). Classical EdDSA remains accepted here for
+            // tokens minted before the hybrid cutover.
+            let is_composite = hyprstream_rpc::auth::jwt::header_alg(&service_jwt)
+                .ok()
+                .flatten()
+                .is_some_and(|alg| alg == "ML-DSA-65-Ed25519");
+            let verified = if is_composite {
+                let dispatch =
+                    hyprstream_rpc::auth::jwt::parse_composite_dispatch(&service_jwt, &["wit+jwt"])
+                        .map_err(|e| {
+                            tracing::warn!("Service JWT dispatch failed in announce: {}", e);
+                            anyhow::anyhow!("Invalid service JWT in announce: {}", e)
+                        })?;
+                let pair = self
+                    .jwt_key_source
+                    .as_ref()
+                    .and_then(|ks| ks.composite_pair(dispatch.kid()))
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("Invalid service JWT in announce: unknown composite kid")
+                    })?;
+                hyprstream_rpc::auth::jwt::decode_composite(
+                    &service_jwt,
+                    pair.ml_dsa(),
+                    pair.ed25519(),
+                    self.expected_audience.as_deref(),
+                    &dispatch,
+                )
+                .map_err(|e| {
+                    tracing::warn!("Service JWT verification failed in announce: {}", e);
+                    anyhow::anyhow!("Invalid service JWT in announce: {}", e)
+                })?
+            } else {
+                hyprstream_rpc::auth::jwt::decode_with_key(
+                    &service_jwt,
+                    &self.jwt_verifying_key,
+                    self.expected_audience.as_deref(),
+                )
+                .map_err(|e| {
+                    tracing::warn!("Service JWT verification failed in announce: {}", e);
+                    anyhow::anyhow!("Invalid service JWT in announce: {}", e)
+                })?
+            };
             // Check that sub matches "service:{serviceName}"
             let expected_sub = format!("service:{}", svc_name);
             if verified.sub != expected_sub {
