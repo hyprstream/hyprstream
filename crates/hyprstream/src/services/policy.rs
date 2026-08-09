@@ -380,6 +380,72 @@ fn published_service_key_response(
 
 /// Confirmation material is mandatory: an absent or malformed `cnf.jwk` must
 /// never turn a valid CA token into authority for arbitrary key material.
+/// Verify a service JWT presented to `registerServiceKey`.
+///
+/// Hybrid (`ML-DSA-65-Ed25519`) tokens resolve their composite kid through
+/// the same key-source path the dispatch plane uses, with the CA's own
+/// derived pair as the authoritative fallback (PolicyService IS the CA, so it
+/// can reconstruct the exact pair the hybrid service-JWT mint signs with); an
+/// unknown kid fails closed. Classical EdDSA tokens verify against the CA key
+/// only when `policy` permits classical — matching the dispatch alg gate.
+fn verify_service_registration_jwt(
+    service_jwt: &str,
+    key_source: Option<&dyn hyprstream_rpc::auth::JwtKeySource>,
+    ca_jwt_key: &SigningKey,
+    policy: hyprstream_rpc::crypto::CryptoPolicy,
+) -> Result<hyprstream_rpc::auth::Claims> {
+    let is_composite = hyprstream_rpc::auth::jwt::header_alg(service_jwt)
+        .ok()
+        .flatten()
+        .is_some_and(|alg| alg == "ML-DSA-65-Ed25519");
+    if is_composite {
+        let dispatch =
+            hyprstream_rpc::auth::jwt::parse_composite_dispatch(service_jwt, &["wit+jwt"])
+                .map_err(|e| anyhow!("Invalid service JWT: {e}"))?;
+        let pair = key_source
+            .and_then(|ks| ks.composite_pair(dispatch.kid()))
+            .or_else(|| {
+                let pq_vk = hyprstream_rpc::crypto::pq::ml_dsa_sk_to_vk(
+                    &hyprstream_rpc::node_identity::derive_mesh_mldsa_key(ca_jwt_key),
+                );
+                let ed_vk = ca_jwt_key.verifying_key();
+                let kid = hyprstream_rpc::auth::composite_kid(&pq_vk, &ed_vk);
+                (kid == dispatch.kid()).then(|| {
+                    hyprstream_rpc::auth::CompositeKeyPair::verifying(
+                        kid,
+                        pq_vk,
+                        ed_vk,
+                        hyprstream_rpc::auth::CompositePairRole::Policy,
+                        hyprstream_rpc::auth::CompositePairState::Active,
+                        0,
+                        i64::MAX,
+                    )
+                })
+            })
+            .ok_or_else(|| anyhow!("Invalid service JWT: unknown composite kid"))?;
+        hyprstream_rpc::auth::jwt::decode_composite(
+            service_jwt,
+            pair.ml_dsa(),
+            pair.ed25519(),
+            None,
+            &dispatch,
+        )
+        .map_err(|e| anyhow!("Invalid service JWT: {e}"))
+    } else {
+        anyhow::ensure!(
+            !policy.uses_pq(),
+            "Invalid service JWT: Hybrid crypto policy requires a post-quantum alg; \
+             classical-only token rejected"
+        );
+        hyprstream_rpc::auth::jwt::decode_with_key(
+            service_jwt,
+            &ca_jwt_key.verifying_key(),
+            None,
+        )
+        .map_err(|e| anyhow!("Invalid service JWT: {e}"))
+    }
+}
+
 fn validate_service_key_registration(
     claims: &hyprstream_rpc::auth::Claims,
     service_name: &str,
@@ -1643,11 +1709,12 @@ impl PolicyHandler for PolicyService {
         // Verify the caller is who they claim to be.
         // The service JWT must be signed by the CA (our jwt_signing_key) and
         // its subject must match "service:{serviceName}".
-        let claims = hyprstream_rpc::auth::jwt::decode_with_key(
+        let claims = verify_service_registration_jwt(
             &data.service_jwt,
-            &self.jwt_signing_key.verifying_key(),
-            None,
-        ).map_err(|e| anyhow!("Invalid service JWT: {e}"))?;
+            self.jwt_key_source.as_deref(),
+            &self.jwt_signing_key,
+            hyprstream_rpc::envelope::global_verify_policy(),
+        )?;
 
         // Verify the provided verifying key matches the JWT's cnf.jwk claim.
         let vk_bytes: [u8; 32] = data.verifying_key.as_slice().try_into()
@@ -2012,6 +2079,101 @@ pub(crate) async fn watch_policy_file(
 mod tests {
     use super::*;
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+
+    /// Mint the exact hybrid service JWT a fresh bootstrap produces for
+    /// `service:{name}`: composite-signed by the CA pair derived from
+    /// `ca_jwt_key`.
+    fn bootstrap_hybrid_service_jwt(ca_jwt_key: &SigningKey, name: &str) -> String {
+        let now = chrono::Utc::now().timestamp();
+        let claims =
+            hyprstream_rpc::auth::Claims::new(format!("service:{name}"), now, now + 3600);
+        let ca_pq = hyprstream_rpc::node_identity::derive_mesh_mldsa_key(ca_jwt_key);
+        let ca_pq_vk = hyprstream_rpc::crypto::pq::ml_dsa_sk_to_vk(&ca_pq);
+        hyprstream_rpc::auth::jwt::encode_service_jwt_hybrid(&claims, ca_jwt_key, &ca_pq, &ca_pq_vk)
+    }
+
+    /// A freshly bootstrapped hybrid service JWT passes the registration
+    /// verification under a Hybrid policy — through the dispatch-style
+    /// key-source resolution when the source carries the CA composite pair,
+    /// and through the CA's own derived pair when no key source is wired.
+    #[test]
+    fn registration_accepts_hybrid_service_jwt_under_hybrid_policy() {
+        let ca = SigningKey::from_bytes(&[0x2A; 32]);
+        let jwt = bootstrap_hybrid_service_jwt(&ca, "discovery");
+
+        // Key-source path: the same composite resolution the dispatch plane uses.
+        let ca_pq = hyprstream_rpc::node_identity::derive_mesh_mldsa_key(&ca);
+        let key_source = hyprstream_rpc::auth::ClusterKeySource::new(
+            ca.verifying_key(),
+            "http://localhost:9080".to_owned(),
+        )
+        .with_ca_composite_key(hyprstream_rpc::crypto::pq::ml_dsa_sk_to_vk(&ca_pq));
+        let claims = verify_service_registration_jwt(
+            &jwt,
+            Some(&key_source),
+            &ca,
+            hyprstream_rpc::crypto::CryptoPolicy::Hybrid,
+        )
+        .unwrap();
+        assert_eq!(claims.sub, "service:discovery");
+
+        // CA-fallback path: no key source wired, PolicyService derives the pair.
+        let claims = verify_service_registration_jwt(
+            &jwt,
+            None,
+            &ca,
+            hyprstream_rpc::crypto::CryptoPolicy::Hybrid,
+        )
+        .unwrap();
+        assert_eq!(claims.sub, "service:discovery");
+    }
+
+    /// A classical EdDSA service JWT is rejected at registration under a
+    /// Hybrid policy (matching the dispatch alg gate), and accepted only
+    /// under Classical.
+    #[test]
+    fn registration_rejects_classical_service_jwt_under_hybrid_policy() {
+        let ca = SigningKey::from_bytes(&[0x2B; 32]);
+        let now = chrono::Utc::now().timestamp();
+        let claims =
+            hyprstream_rpc::auth::Claims::new("service:discovery".to_owned(), now, now + 3600);
+        let jwt = hyprstream_rpc::auth::jwt::encode_service_jwt(&claims, &ca);
+
+        assert!(verify_service_registration_jwt(
+            &jwt,
+            None,
+            &ca,
+            hyprstream_rpc::crypto::CryptoPolicy::Hybrid,
+        )
+        .is_err());
+        assert!(verify_service_registration_jwt(
+            &jwt,
+            None,
+            &ca,
+            hyprstream_rpc::crypto::CryptoPolicy::Classical,
+        )
+        .is_ok());
+    }
+
+    /// A composite service JWT signed by a DIFFERENT pair (unknown kid)
+    /// fails closed — neither the key source nor the CA fallback resolves it.
+    #[test]
+    fn registration_rejects_unknown_composite_kid() {
+        let ca = SigningKey::from_bytes(&[0x2C; 32]);
+        let other = SigningKey::from_bytes(&[0x2D; 32]);
+        let jwt = bootstrap_hybrid_service_jwt(&other, "discovery");
+
+        let result = verify_service_registration_jwt(
+            &jwt,
+            None,
+            &ca,
+            hyprstream_rpc::crypto::CryptoPolicy::Hybrid,
+        );
+        assert!(
+            result.is_err(),
+            "a composite kid the CA did not sign for must fail closed"
+        );
+    }
 
     async fn test_service_with_manager(
         manager: Arc<PolicyManager>,
