@@ -3,6 +3,7 @@
 [license_gate]
 mit_packages = [
   "bitsandbytes-sys",
+  "hyprstream-pay",
   "cas-serve",
   "git-xet-filter",
 ]
@@ -60,6 +61,7 @@ standalone_manifests = [
 # guarantee: none may reach a local AGPL package through any dependency source.
 permissive_roots = [
   "bitsandbytes-sys",
+  "hyprstream-pay",
   "cas-serve",
   "chat-core",
   "git-xet-filter",
