@@ -158,6 +158,8 @@ pub mod stream_mount;
 pub mod wasm_exports;
 #[cfg(target_arch = "wasm32")]
 pub mod wasm_rpc_client;
+#[cfg(target_arch = "wasm32")]
+pub mod browser_session;
 // Pure framing/reach-parsing for the moq worker — host-testable (not wasm-gated).
 pub mod moq_frame;
 #[cfg(target_arch = "wasm32")]

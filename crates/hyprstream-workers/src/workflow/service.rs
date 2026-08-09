@@ -1,6 +1,6 @@
 //! WorkflowService - RequestService implementation for workflow orchestration
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -99,6 +99,18 @@ pub struct WorkflowService {
     /// Registered repo paths (repo_id → filesystem root)
     repo_paths: RwLock<HashMap<String, PathBuf>>,
 
+    /// Per-repo parse mode (#1432): a gate that loads a repo in strict mode
+    /// records it here so that later rescans (event-triggered or manual)
+    /// retain strict rather than silently dropping back to legacy.
+    /// Default for an unregistered repo is [`ParseMode::Legacy`].
+    repo_modes: RwLock<HashMap<String, super::parser::ParseMode>>,
+
+    /// Per-repo serialization locks (#1432 race fix): held from mode decision
+    /// through registry commit so that a Legacy scan cannot yield between its
+    /// mode check and commit while a Strict selection lands in between.
+    /// Acquired by `rescan_repo`, `rescan_repo_with`, and `set_repo_mode`.
+    repo_locks: RwLock<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+
     /// Active subscriptions (sub_id → WorkflowSubscription)
     subscriptions: RwLock<HashMap<String, WorkflowSubscription>>,
 
@@ -116,6 +128,23 @@ pub struct WorkflowService {
 
     /// Optional authorization callback (injected by parent crate)
     authorize_fn: Option<AuthorizeFn>,
+
+    /// Expected JWT audience — fed to the envelope-verification layer so a
+    /// JWT-bearing IPC/QUIC request is validated before the policy `authorize`
+    /// callback runs (same seam as `WorkerService`). Without this, JWT-auth
+    /// requests fail at envelope verification with an audience mismatch.
+    expected_audience: Option<String>,
+
+    /// JWT verification key source (local + federated). `None` ⇒ only the
+    /// local bootstrap key is trusted; federated JWTs are rejected.
+    jwt_key_source: Option<std::sync::Arc<dyn hyprstream_rpc::auth::JwtKeySource>>,
+
+    /// Live MCP relay authorization — injected by the factory as a closure over
+    /// the global trust store so `accept_delegated_bearer` consults **current**
+    /// MCP-scope authorization at call time, not a frozen snapshot (#989 review:
+    /// a snapshot permits retired keys forever and rejects keys added after
+    /// factory start). `None` ⇒ fail-closed (no delegation accepted).
+    relay_authorizer: Option<std::sync::Arc<dyn Fn(&[u8; 32]) -> bool + Send + Sync>>,
 
     /// Workflow execution engine
     runner: Option<WorkflowRunner>,
@@ -137,12 +166,17 @@ impl WorkflowService {
             runs: Arc::new(RwLock::new(HashMap::new())),
             repo_workflows: RwLock::new(HashMap::new()),
             repo_paths: RwLock::new(HashMap::new()),
+            repo_modes: RwLock::new(HashMap::new()),
+            repo_locks: RwLock::new(HashMap::new()),
             subscriptions: RwLock::new(HashMap::new()),
             handlers: RwLock::new(Vec::new()),
             event_loop_handle: tokio::sync::Mutex::new(None),
             transport,
             signing_key,
             authorize_fn: None,
+            expected_audience: None,
+            jwt_key_source: None,
+            relay_authorizer: None,
             runner: None,
         }
     }
@@ -154,6 +188,79 @@ impl WorkflowService {
     pub async fn register_repo_path(&self, repo_id: impl Into<String>, path: PathBuf) {
         let mut repo_paths = self.repo_paths.write().await;
         repo_paths.insert(repo_id.into(), path);
+    }
+
+    /// Get-or-create the per-repo serialization lock (#1432 race fix).
+    async fn repo_lock(&self, repo_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+        {
+            let read = self.repo_locks.read().await;
+            if let Some(lock) = read.get(repo_id) {
+                return Arc::clone(lock);
+            }
+        }
+        let mut write = self.repo_locks.write().await;
+        write
+            .entry(repo_id.to_owned())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    }
+
+    /// Set the per-repo parse mode (#1432).
+    ///
+    /// Acquires the per-repo serialization lock so that mode changes are
+    /// atomic with concurrent rescans. A gate that loads a repo in strict
+    /// mode records it here so that later rescans retain strict (the default
+    /// for an unregistered repo is [`ParseMode::Legacy`]). Typically called
+    /// by
+    /// [`GitHubActionsAdapter::load_repo_with`](super::gh_adapter::GitHubActionsAdapter::load_repo_with).
+    pub async fn set_repo_mode(&self, repo_id: &str, mode: super::parser::ParseMode) {
+        let lock = self.repo_lock(repo_id).await;
+        let _guard = lock.lock().await;
+        self.set_repo_mode_locked(repo_id, mode).await;
+    }
+
+    /// Write the mode without acquiring the per-repo lock.
+    ///
+    /// Caller MUST already hold the per-repo lock (e.g. inside
+    /// `rescan_repo_with`). This avoids reentrant-deadlock.
+    async fn set_repo_mode_locked(&self, repo_id: &str, mode: super::parser::ParseMode) {
+        let mut repo_modes = self.repo_modes.write().await;
+        repo_modes.insert(repo_id.to_owned(), mode);
+    }
+
+    /// Resolve the per-repo parse mode, defaulting to [`ParseMode::Legacy`]
+    /// for repos that never opted into strict.
+    async fn repo_mode(&self, repo_id: &str) -> super::parser::ParseMode {
+        self.repo_modes
+            .read()
+            .await
+            .get(repo_id)
+            .copied()
+            .unwrap_or(super::parser::ParseMode::Legacy)
+    }
+
+    /// Evict stale registrations for a repo (#1432 fail-closed).
+    ///
+    /// Removes any `repo_id:*` registry entry absent from `fresh_ids`, so a
+    /// workflow that was rejected by strict mode, deleted, or otherwise no
+    /// longer present in the fresh scan becomes undispatchable
+    /// (`dispatch` → [`WorkflowNotFound`](crate::error::WorkerError::WorkflowNotFound)).
+    pub(crate) async fn evict_stale_for_repo(
+        &self,
+        repo_id: &str,
+        fresh_ids: &HashSet<WorkflowId>,
+    ) {
+        let stale_prefix = format!("{repo_id}:");
+        let mut workflows_lock = self.workflows.write().await;
+        let stale_keys: Vec<WorkflowId> = workflows_lock
+            .keys()
+            .filter(|id| id.starts_with(&stale_prefix) && !fresh_ids.contains(*id))
+            .cloned()
+            .collect();
+        for key in &stale_keys {
+            tracing::info!(workflow_id = %key, "Evicting stale workflow registration");
+            workflows_lock.remove(key);
+        }
     }
 
     /// Set the VFS namespace for workflow execution.
@@ -197,6 +304,35 @@ impl WorkflowService {
     /// Set the authorization callback for policy checks.
     pub fn set_authorize_fn(&mut self, authorize_fn: AuthorizeFn) {
         self.authorize_fn = Some(authorize_fn);
+    }
+
+    /// Set the expected JWT audience for envelope-verification-time validation
+    /// (mirrors `WorkerService::set_expected_audience`). Fed by the factory from
+    /// the OAuth issuer URL so JWT-authenticated IPC/QUIC requests are accepted
+    /// before the per-request policy check.
+    pub fn set_expected_audience(&mut self, audience: String) {
+        self.expected_audience = Some(audience);
+    }
+
+    /// Set the JWT verification key source (local + federated). Fed by the
+    /// factory from the cluster key source.
+    pub fn set_jwt_key_source(
+        &mut self,
+        src: std::sync::Arc<dyn hyprstream_rpc::auth::JwtKeySource>,
+    ) {
+        self.jwt_key_source = Some(src);
+    }
+
+    /// Inject a **live** MCP relay authorizer so `accept_delegated_bearer`
+    /// consults current MCP-scope authorization at call time (not a frozen
+    /// snapshot — retired keys are rejected, new keys accepted after factory
+    /// start). The factory typically passes a closure over the global trust
+    /// store's `is_authorized(key, "mcp")`. `None` (never called) ⇒ fail-closed.
+    pub fn set_relay_authorizer(
+        &mut self,
+        authorizer: std::sync::Arc<dyn Fn(&[u8; 32]) -> bool + Send + Sync>,
+    ) {
+        self.relay_authorizer = Some(authorizer);
     }
 
     /// Initialize the service: scan all registered repos and register their workflows.
@@ -329,13 +465,34 @@ impl WorkflowService {
         handlers.push(handler);
     }
 
-    /// Scan a repository for `.github/workflows/*.yml` files.
+    /// Scan a repository for `.github/workflows/*.yml` files (legacy mode).
+    ///
+    /// Generic loader entry point — parses in [`ParseMode::Legacy`], so
+    /// unknown keys are silently dropped. Used by the GitHub Actions adapter
+    /// and other non-gate callers. The merge gate must opt into strict mode
+    /// via [`Self::scan_repo_with`] (#1432 scope item 2; non-goal: changing
+    /// the default for non-gate callers).
     ///
     /// Uses the path registered via `register_repo_path`. Returns an empty
     /// Vec (not an error) if no path is registered for the repo or if the
     /// workflows directory does not exist.
     pub(crate) async fn scan_repo(&self, repo_id: &str) -> Result<Vec<WorkflowDef>> {
-        tracing::info!(repo_id = %repo_id, "Scanning repository for workflows");
+        self.scan_repo_with(repo_id, super::parser::ParseMode::Legacy).await
+    }
+
+    /// Scan a repository with an explicit [`ParseMode`] (#1432).
+    ///
+    /// In [`ParseMode::Strict`] a file with an unknown structural key
+    /// (e.g. `permissions:`, `concurrency:`, `services:`) is **skipped** with
+    /// a warn-log rather than silently loaded with dropped semantics — the
+    /// merge-gate boundary selects this mode so the gate never loads a
+    /// workflow it cannot fully model.
+    pub(crate) async fn scan_repo_with(
+        &self,
+        repo_id: &str,
+        mode: super::parser::ParseMode,
+    ) -> Result<Vec<WorkflowDef>> {
+        tracing::info!(repo_id = %repo_id, mode = ?mode, "Scanning repository for workflows");
 
         let root = {
             let repo_paths = self.repo_paths.read().await;
@@ -386,10 +543,15 @@ impl WorkflowService {
                     }
                 };
 
-                let workflow = match Workflow::parse(&yaml) {
+                let workflow = match Workflow::parse_with(&yaml, mode) {
                     Ok(w) => w,
                     Err(e) => {
-                        tracing::warn!(path = %path.display(), error = %e, "Failed to parse workflow");
+                        tracing::warn!(
+                            path = %path.display(),
+                            error = %e,
+                            "Failed to parse workflow ({:?} mode); skipping",
+                            mode,
+                        );
                         continue;
                     }
                 };
@@ -553,15 +715,86 @@ impl WorkflowService {
             .collect())
     }
 
-    /// Rescan a repository for workflow changes
+    /// Rescan a repository for workflow changes (generic, non-persisting).
+    ///
+    /// Resolves the per-repo parse mode and rescans in that mode, but does
+    /// **not** write the mode back to the store. This is the entry point used
+    /// by the event-triggered rescan path (`HandlerResult::Rescan`) and
+    /// `initialize`. Because it never persists, a concurrent generic rescan
+    /// that read a stale [`ParseMode::Legacy`] before a gate selected strict
+    /// cannot overwrite the newer strict selection (#1432 race fix): only the
+    /// explicit boundaries ([`Self::rescan_repo_with`], `load_repo_with`)
+    /// write the mode.
     pub async fn rescan_repo(&self, repo_id: &str) -> Result<()> {
-        let workflows = self.scan_repo(repo_id).await?;
+        let lock = self.repo_lock(repo_id).await;
+        let _guard = lock.lock().await;
+        let mode = self.repo_mode(repo_id).await;
+        self.rescan_inner_locked(repo_id, mode).await.map(|_| ())
+    }
 
-        // Update subscriptions for this repo
+    /// Rescan a repository with an explicit [`ParseMode`] (#1432 boundary).
+    ///
+    /// **Persists** the mode per-repo (via [`Self::set_repo_mode`]) so that
+    /// later event-triggered rescans through the generic [`Self::rescan_repo`]
+    /// retain it. Both `rescan_repo` and this method hold the per-repo
+    /// serialization lock from mode decision through registry commit, making
+    /// the scan→commit window atomic per repo (#1432 race fix: a stale Legacy
+    /// scan cannot yield between its mode check and commit while a Strict
+    /// selection lands in between).
+    pub async fn rescan_repo_with(
+        &self,
+        repo_id: &str,
+        mode: super::parser::ParseMode,
+    ) -> Result<()> {
+        self.rescan_repo_with_defs(repo_id, mode).await.map(|_| ())
+    }
+
+    /// Select a parse mode and atomically reconcile a repository, returning
+    /// the definitions that survived the scan.
+    ///
+    /// Adapter loaders use this instead of a separate `set_repo_mode` followed
+    /// by `scan_repo_with`: strict selection, scanning, stale eviction, and
+    /// registration must share the per-repo lock. Otherwise a stale Legacy
+    /// scan can register an unsupported workflow after strict selection but
+    /// before the adapter's later eviction (#1432 fail-closed boundary).
+    pub(crate) async fn rescan_repo_with_defs(
+        &self,
+        repo_id: &str,
+        mode: super::parser::ParseMode,
+    ) -> Result<Vec<WorkflowDef>> {
+        let lock = self.repo_lock(repo_id).await;
+        let _guard = lock.lock().await;
+        self.set_repo_mode_locked(repo_id, mode).await;
+        self.rescan_inner_locked(repo_id, mode).await
+    }
+
+    /// Internal scan+evict+register worker (caller holds the per-repo lock).
+    ///
+    /// The per-repo lock is the race fix: it serializes rescans so that no
+    /// concurrent mode change or commit can interleave between this scan and
+    /// its commit. The previous revalidation guard was itself TOCTOU (it
+    /// could yield between check and commit); the mutex replaces it.
+    async fn rescan_inner_locked(
+        &self,
+        repo_id: &str,
+        mode: super::parser::ParseMode,
+    ) -> Result<Vec<WorkflowDef>> {
+        let workflows = self.scan_repo_with(repo_id, mode).await?;
+
+        // Fresh set of workflow ids for this repo, per the scan.
+        let fresh_ids: HashSet<WorkflowId> = workflows
+            .iter()
+            .map(|wf| format!("{}:{}", wf.repo_id, wf.path))
+            .collect();
+
+        // Evict stale registrations absent from the fresh set (fail-closed).
+        self.evict_stale_for_repo(repo_id, &fresh_ids).await;
+
+        // Register the fresh set and rebuild subscriptions.
         let mut repo_workflows = self.repo_workflows.write().await;
         let mut subscriptions = Vec::new();
 
-        for wf in workflows {
+        for wf in &workflows {
             let wf_id = self.register_workflow(wf.clone()).await?;
 
             for trigger in &wf.triggers {
@@ -572,8 +805,8 @@ impl WorkflowService {
 
         repo_workflows.insert(repo_id.to_owned(), subscriptions);
 
-        tracing::info!(repo_id = %repo_id, "Rescanned repository");
-        Ok(())
+        tracing::info!(repo_id = %repo_id, mode = ?mode, "Rescanned repository");
+        Ok(workflows)
     }
 
     /// Start a subscriber adapter. Returns a CancellationToken to stop it.
@@ -695,6 +928,10 @@ impl WorkflowHandler for WorkflowService {
                 jobs: HashMap::new(),
             }
         } else {
+            // Generic RPC register path: legacy mode. Unknown keys are
+            // silently dropped (non-gate caller compatibility, #1432
+            // non-goal). The merge gate selects strict mode at its own
+            // loader boundary (`scan_repo_with`/`load_repo_with`), not here.
             Workflow::parse(&data.yaml)?
         };
         let triggers = extract_triggers(&workflow);
@@ -857,6 +1094,26 @@ impl RequestService for WorkflowService {
     fn signing_key(&self) -> SigningKey {
         self.signing_key.clone()
     }
+
+    fn expected_audience(&self) -> Option<&str> {
+        self.expected_audience.as_deref()
+    }
+
+    fn jwt_key_source(&self) -> Option<std::sync::Arc<dyn hyprstream_rpc::auth::JwtKeySource>> {
+        self.jwt_key_source.clone()
+    }
+
+    /// Accept delegated-bearer requests by consulting the **live** MCP relay
+    /// authorizer (#989 review). `verify_claims` calls this before policy; the
+    /// default `false` rejects all relayed caller tokens. We delegate to the
+    /// injected authorizer (which checks current MCP-scope authorization) —
+    /// fail-closed when no authorizer is set.
+    fn accept_delegated_bearer(&self, signer_pubkey: &[u8; 32]) -> bool {
+        self.relay_authorizer
+            .as_ref()
+            .map(|f| f(signer_pubkey))
+            .unwrap_or(false)
+    }
 }
 
 /// Extract the `repo_id` from a `workflow_id` following the `repo_id:path`
@@ -911,6 +1168,480 @@ mod tests {
     // invariant the dispatch boundary depends on instead.
 
     use hyprstream_vfs::Subject;
+    use hyprstream_rpc::prelude::SigningKey;
+    use hyprstream_rpc::transport::TransportConfig;
+    use rand::rngs::OsRng;
+    use std::path::PathBuf;
+
+    fn test_service() -> super::WorkflowService {
+        super::WorkflowService::new(
+            TransportConfig::inproc("test-workflow-service"),
+            SigningKey::generate(&mut OsRng),
+        )
+    }
+
+    /// Minimal known-subset workflow YAML (parses in both modes).
+    const KNOWN_YAML: &str = r#"
+name: Gate
+on: push
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    steps:
+      - run: cargo test
+"#;
+
+    /// Same workflow with an unknown top-level key (`permissions:`). Parses
+    /// in legacy mode (silently dropped) but is REJECTED by strict mode.
+    const UNKNOWN_KEY_YAML: &str = r#"
+name: Gate
+on: push
+permissions:
+  contents: read
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    steps:
+      - run: cargo test
+"#;
+
+    async fn write_workflow(
+        repo_root: &std::path::Path,
+        yaml: &str,
+    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let dir = repo_root.join(".github").join("workflows");
+        tokio::fs::create_dir_all(&dir).await?;
+        tokio::fs::write(dir.join("gate.yml"), yaml).await?;
+        Ok(())
+    }
+
+    fn workflow_ids(info: &[super::WorkflowInfo]) -> Vec<String> {
+        info.iter().map(|i| i.id.clone()).collect()
+    }
+
+    type TestResult = std::result::Result<(), Box<dyn std::error::Error>>;
+
+    // ─── Finding B: generic loader stays legacy; gate opts in via _with ─────
+
+    #[tokio::test]
+    async fn legacy_scan_accepts_unknown_keys() -> TestResult {
+        // The generic (non-gate) loader must tolerate unknown keys — forcing
+        // strict globally breaks legacy non-gate compatibility (#1432
+        // non-goal).
+        let tmp = tempfile::tempdir()?;
+        write_workflow(tmp.path(), UNKNOWN_KEY_YAML).await?;
+
+        let svc = test_service();
+        svc.register_repo_path("acme", PathBuf::from(tmp.path())).await;
+
+        let defs = svc.scan_repo("acme").await?;
+        assert_eq!(defs.len(), 1, "legacy mode loads the unknown-key workflow");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn strict_scan_skips_unknown_keys() -> TestResult {
+        let tmp = tempfile::tempdir()?;
+        write_workflow(tmp.path(), UNKNOWN_KEY_YAML).await?;
+
+        let svc = test_service();
+        svc.register_repo_path("acme", PathBuf::from(tmp.path())).await;
+
+        let defs = svc
+            .scan_repo_with("acme", super::super::parser::ParseMode::Strict)
+            .await?;
+        assert!(defs.is_empty(), "strict mode skips the unknown-key workflow");
+        Ok(())
+    }
+
+    // ─── Finding A: strict rescan evicts the stale registration, fail-closed ─
+
+    #[tokio::test]
+    async fn strict_rescan_evicts_stale_registration() -> TestResult {
+        // 1. Load a valid (known-subset) workflow under strict mode → registered.
+        let tmp = tempfile::tempdir()?;
+        write_workflow(tmp.path(), KNOWN_YAML).await?;
+
+        let svc = test_service();
+        svc.register_repo_path("acme", PathBuf::from(tmp.path())).await;
+
+        svc.rescan_repo_with("acme", super::super::parser::ParseMode::Strict)
+            .await?;
+
+        let wf_id = String::from("acme:.github/workflows/gate.yml");
+        let after_first = svc.list_workflows().await?;
+        assert!(
+            workflow_ids(&after_first).contains(&wf_id),
+            "known-subset workflow should be registered after first scan"
+        );
+
+        // 2. Mutate the file to add an unknown key. Strict rescan must now
+        //    skip it AND evict the now-stale registration — otherwise the
+        //    stale workflow stays dispatchable (the fail-closed gap).
+        write_workflow(tmp.path(), UNKNOWN_KEY_YAML).await?;
+        svc.rescan_repo_with("acme", super::super::parser::ParseMode::Strict)
+            .await?;
+
+        let after_second = svc.list_workflows().await?;
+        assert!(
+            !workflow_ids(&after_second).contains(&wf_id),
+            "stale registration must be evicted: a strict-rejected workflow \
+             must not remain dispatchable"
+        );
+
+        // 3. Fail-closed confirmation: dispatching the evicted id must now
+        //    be WorkflowNotFound, not a stale run.
+        match svc
+            .dispatch(&wf_id, std::collections::HashMap::new(), &Subject::anonymous())
+            .await
+        {
+            Err(crate::error::WorkerError::WorkflowNotFound(id)) => assert_eq!(id, wf_id),
+            other => panic!("expected WorkflowNotFound for evicted workflow, got {other:?}"),
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn legacy_rescan_keeps_workflow_when_unknown_key_present() -> TestResult {
+        // Legacy rescan must keep the registration (unknown keys tolerated) —
+        // guards against accidentally evicting under the generic path.
+        let tmp = tempfile::tempdir()?;
+        write_workflow(tmp.path(), UNKNOWN_KEY_YAML).await?;
+
+        let svc = test_service();
+        svc.register_repo_path("acme", PathBuf::from(tmp.path())).await;
+
+        svc.rescan_repo("acme").await?;
+        let wf_id = String::from("acme:.github/workflows/gate.yml");
+        let listed = svc.list_workflows().await?;
+        assert!(
+            workflow_ids(&listed).contains(&wf_id),
+            "legacy rescan must keep the unknown-key workflow registered"
+        );
+        Ok(())
+    }
+
+    // ─── Rev 4 P1-A: strict mode retained across the generic rescan path ────
+
+    #[tokio::test]
+    async fn strict_mode_retained_across_legacy_signature_rescan() -> TestResult {
+        // The event-triggered rescan calls the generic `rescan_repo(repo)`
+        // (no mode arg). Once a gate has loaded the repo in strict mode
+        // (recorded via set_repo_mode), that rescan must RETAIN strict —
+        // otherwise a push that mutates the workflow to add an unknown key
+        // would silently reload it in legacy mode (the bypass).
+        let tmp = tempfile::tempdir()?;
+        write_workflow(tmp.path(), KNOWN_YAML).await?;
+
+        let svc = test_service();
+        svc.register_repo_path("acme", PathBuf::from(tmp.path())).await;
+        // Gate loads in strict mode → records the mode per-repo.
+        svc.set_repo_mode("acme", super::super::parser::ParseMode::Strict).await;
+        svc.rescan_repo("acme").await?; // registers the known workflow
+
+        let wf_id = String::from("acme:.github/workflows/gate.yml");
+        assert!(workflow_ids(&svc.list_workflows().await?).contains(&wf_id));
+
+        // Mutate to add an unknown key, then trigger the GENERIC rescan path
+        // (the one HandlerResult::Rescan / initialize use — no mode arg).
+        write_workflow(tmp.path(), UNKNOWN_KEY_YAML).await?;
+        svc.rescan_repo("acme").await?; // must still be strict → skip + evict
+
+        assert!(
+            !workflow_ids(&svc.list_workflows().await?).contains(&wf_id),
+            "strict mode must be retained across the generic rescan path; \
+             a now-unknown-key workflow must be skipped and evicted, not \
+             silently reloaded in legacy mode"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn strict_mode_default_is_legacy_for_unregistered_repo() -> TestResult {
+        // A repo that never opted into strict must rescan in legacy mode —
+        // guards against the mode store accidentally defaulting to strict.
+        let tmp = tempfile::tempdir()?;
+        write_workflow(tmp.path(), UNKNOWN_KEY_YAML).await?;
+
+        let svc = test_service();
+        svc.register_repo_path("acme", PathBuf::from(tmp.path())).await;
+        // No set_repo_mode call → default Legacy.
+        svc.rescan_repo("acme").await?;
+
+        let wf_id = String::from("acme:.github/workflows/gate.yml");
+        assert!(
+            workflow_ids(&svc.list_workflows().await?).contains(&wf_id),
+            "unregistered repo must default to legacy and keep the unknown-key workflow"
+        );
+        Ok(())
+    }
+
+    // ─── Rev 5 P1: rescan_repo_with persists mode for later generic rescan ──
+
+    #[tokio::test]
+    async fn explicit_rescan_with_strict_persists_mode_for_generic_rescan() -> TestResult {
+        // Enter strict via rescan_repo_with DIRECTLY (not load_repo_with nor
+        // set_repo_mode). The mode must persist so a later generic
+        // rescan_repo(repo) — the path HandlerResult::Rescan / initialize use
+        // — stays strict rather than falling back to legacy.
+        let tmp = tempfile::tempdir()?;
+        write_workflow(tmp.path(), KNOWN_YAML).await?;
+
+        let svc = test_service();
+        svc.register_repo_path("acme", PathBuf::from(tmp.path())).await;
+
+        // Enter strict via the explicit rescan variant only.
+        svc.rescan_repo_with("acme", super::super::parser::ParseMode::Strict)
+            .await?;
+        let wf_id = String::from("acme:.github/workflows/gate.yml");
+        assert!(workflow_ids(&svc.list_workflows().await?).contains(&wf_id));
+
+        // Mutate to add an unknown key, then trigger the GENERIC rescan path
+        // (no mode arg). It must have retained strict from the prior
+        // rescan_repo_with call.
+        write_workflow(tmp.path(), UNKNOWN_KEY_YAML).await?;
+        svc.rescan_repo("acme").await?;
+
+        assert!(
+            !workflow_ids(&svc.list_workflows().await?).contains(&wf_id),
+            "rescan_repo_with(Strict) must persist the mode: a later generic \
+             rescan_repo must stay strict and skip+evict the unknown-key workflow, \
+             not silently fall back to legacy"
+        );
+        Ok(())
+    }
+
+    // ─── Rev 6 P1: generic rescan must NOT overwrite an explicit selection ──
+
+    #[tokio::test]
+    async fn generic_rescan_does_not_overwrite_explicit_strict_selection() -> TestResult {
+        // The generic rescan_repo(repo) resolves the stored mode and rescans
+        // in it but must NOT persist — otherwise a generic rescan that read a
+        // stale Legacy could clobber a newer explicit Strict selection.
+        // Enter strict explicitly, then run a generic rescan, then verify the
+        // mode is still strict behaviorally (a later generic rescan after an
+        // unknown-key mutation skips+evicts).
+        let tmp = tempfile::tempdir()?;
+        write_workflow(tmp.path(), KNOWN_YAML).await?;
+
+        let svc = test_service();
+        svc.register_repo_path("acme", PathBuf::from(tmp.path())).await;
+
+        // Explicit strict selection.
+        svc.rescan_repo_with("acme", super::super::parser::ParseMode::Strict)
+            .await?;
+        let wf_id = String::from("acme:.github/workflows/gate.yml");
+        assert!(workflow_ids(&svc.list_workflows().await?).contains(&wf_id));
+
+        // A generic rescan in between must not downgrade the stored mode.
+        svc.rescan_repo("acme").await?;
+        assert!(workflow_ids(&svc.list_workflows().await?).contains(&wf_id));
+
+        // Now mutate to add an unknown key. A generic rescan must STILL be
+        // strict (the intermediate generic rescan did not overwrite it).
+        write_workflow(tmp.path(), UNKNOWN_KEY_YAML).await?;
+        svc.rescan_repo("acme").await?;
+        assert!(
+            !workflow_ids(&svc.list_workflows().await?).contains(&wf_id),
+            "generic rescan must not overwrite the explicit strict selection: \
+             the intermediate rescan_repo(repo) should have left the stored \
+             mode as Strict"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn concurrent_generic_rescans_cannot_clobber_explicit_strict() -> TestResult {
+        use std::sync::Arc;
+        // Race invariant: regardless of how generic rescans interleave with
+        // an explicit strict selection, the final stored mode must be Strict
+        // (because only rescan_repo_with / load_repo_with persist; the generic
+        // rescan_repo never writes). Asserted behaviorally: after the batch,
+        // a generic rescan of an unknown-key workflow skips+evicts it.
+        let tmp = tempfile::tempdir()?;
+        write_workflow(tmp.path(), KNOWN_YAML).await?;
+        let root = tmp.path().to_owned();
+
+        let svc = Arc::new(test_service());
+        svc.register_repo_path("acme", PathBuf::from(&root)).await;
+
+        // Run an explicit strict selection concurrently with several generic
+        // rescans. The explicit one is the only writer.
+        let mut handles = Vec::new();
+        handles.push({
+            let svc = Arc::clone(&svc);
+            tokio::spawn(async move {
+                svc.rescan_repo_with("acme", super::super::parser::ParseMode::Strict).await
+            })
+        });
+        for _ in 0..4 {
+            let svc = Arc::clone(&svc);
+            handles.push(tokio::spawn(async move { svc.rescan_repo("acme").await }));
+        }
+        for h in handles {
+            h.await.map_err(|e| format!("join error: {e}"))??;
+        }
+
+        // Mutate to add an unknown key; a generic rescan must be strict.
+        write_workflow(&root, UNKNOWN_KEY_YAML).await?;
+        svc.rescan_repo("acme").await?;
+
+        let wf_id = String::from("acme:.github/workflows/gate.yml");
+        let listed = svc.list_workflows().await?;
+        assert!(
+            !workflow_ids(&listed).contains(&wf_id),
+            "after concurrent generic rescans interleaved with one explicit \
+             strict selection, the stored mode must remain Strict — the \
+             generic rescans must not have overwritten it"
+        );
+        Ok(())
+    }
+
+    // ─── Rev 8 P1: forced check-to-commit interleaving regression ──────────
+
+    #[tokio::test]
+    async fn forced_interleaving_legacy_cannot_commit_after_strict() -> TestResult {
+        // The per-repo mutex makes the scan→commit window atomic. A Legacy
+        // scan that started before an explicit Strict selection cannot commit
+        // after it: the two are serialized, and whichever runs second sees
+        // the committed state of the first.
+        //
+        // This test runs both concurrently via tokio::join!, exercising both
+        // possible orderings. Regardless of order, the registry must be strict
+        // immediately after — no extra rescan needed.
+        use std::sync::Arc;
+        let tmp = tempfile::tempdir()?;
+        write_workflow(tmp.path(), UNKNOWN_KEY_YAML).await?;
+        let root = tmp.path().to_owned();
+
+        let svc = Arc::new(test_service());
+        svc.register_repo_path("acme", PathBuf::from(&root)).await;
+
+        // Spawn: a generic rescan (reads Legacy by default) and an explicit
+        // Strict selection, concurrently. The per-repo mutex serializes them.
+        let svc_a = Arc::clone(&svc);
+        let svc_b = Arc::clone(&svc);
+        let (ra, rb) = tokio::join!(
+            async { svc_a.rescan_repo("acme").await },
+            async {
+                svc_b.rescan_repo_with("acme", super::super::parser::ParseMode::Strict).await
+            }
+        );
+        ra?;
+        rb?;
+
+        // Registry must be strict — the unknown-key workflow is NOT
+        // registered, regardless of which scan committed first. No extra
+        // rescan required.
+        let wf_id = String::from("acme:.github/workflows/gate.yml");
+        assert!(
+            !workflow_ids(&svc.list_workflows().await?).contains(&wf_id),
+            "after concurrent Legacy + Strict rescans, the registry must be \
+             strict (unknown-key workflow not registered) — the per-repo mutex \
+             prevents a stale Legacy scan from committing after Strict"
+        );
+        Ok(())
+    }
+
+    // ─── Regression guard kept from prior revision ──────────────────────────
+
+    /// #989 review P2-1: the factory must feed the OAuth issuer audience (and
+    /// cluster JWT key source) into `WorkflowService` so JWT-authenticated
+    /// IPC/QUIC requests pass envelope verification *before* the policy
+    /// `authorize` callback. Without the `expected_audience`/`jwt_key_source`
+    /// `RequestService` overrides, both default to `None` and JWT auth fails
+    /// upstream of policy. This pins the audience half of the wiring (the
+    /// `jwt_key_source` half follows the identical field→setter→override
+    /// pattern, compile-checked by the override above; a full round-trip would
+    /// need a `JwtKeySource` stub, deferred).
+    /// #989 review (68d11b838 follow-up): `accept_delegated_bearer` must consult
+    /// a LIVE authorizer, not a frozen key snapshot. These tests inject mock
+    /// authorizers to prove: fail-closed when unset, multi-key acceptance, non-
+    /// MCP rejection, and — critically — that live revocation takes effect
+    /// immediately (no stale snapshot).
+    #[test]
+    fn workflow_accepts_delegated_bearer_from_live_mcp_authorizer() {
+        use super::{SigningKey, WorkflowService};
+        use hyprstream_rpc::service::RequestService;
+        use hyprstream_rpc::transport::TransportConfig;
+
+        let sk = SigningKey::from_bytes(&[0x42; 32]);
+        let mut svc = WorkflowService::new(TransportConfig::inproc("wf-relay-test"), sk);
+
+        // No authorizer set → fail-closed (verify_claims would reject).
+        assert!(!RequestService::accept_delegated_bearer(&svc, &[0u8; 32]));
+
+        // Inject a live authorizer accepting two MCP keys.
+        let key_a = [0xAB; 32];
+        let key_b = [0xCD; 32];
+        svc.set_relay_authorizer(std::sync::Arc::new(move |pk: &[u8; 32]| {
+            *pk == key_a || *pk == key_b
+        }));
+
+        assert!(RequestService::accept_delegated_bearer(&svc, &key_a),
+            "must accept authorized MCP key A");
+        assert!(RequestService::accept_delegated_bearer(&svc, &key_b),
+            "must accept authorized MCP key B");
+        // Non-MCP signer rejected — independently scoped, not a wildcard.
+        assert!(!RequestService::accept_delegated_bearer(&svc, &[0xEF; 32]));
+        assert!(!RequestService::accept_delegated_bearer(&svc, &[0u8; 32]));
+    }
+
+    /// Live revocation: the same key goes from accepted to rejected **without
+    /// re-injecting the authorizer** — proving there is no frozen snapshot. A
+    /// shared `AtomicBool` simulates the trust store revoking the key at runtime.
+    #[test]
+    fn workflow_relay_revocation_takes_effect_immediately() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        use super::{SigningKey, WorkflowService};
+        use hyprstream_rpc::service::RequestService;
+        use hyprstream_rpc::transport::TransportConfig;
+
+        let sk = SigningKey::from_bytes(&[0x99; 32]);
+        let mut svc = WorkflowService::new(TransportConfig::inproc("wf-revoke"), sk);
+
+        // Shared live-authorization flag (simulates the trust store's state).
+        let authorized = std::sync::Arc::new(AtomicBool::new(true));
+        let flag = authorized.clone();
+        svc.set_relay_authorizer(std::sync::Arc::new(move |_pk: &[u8; 32]| {
+            flag.load(Ordering::Relaxed)
+        }));
+
+        let key = [0x77; 32];
+        // While authorized → accepted.
+        assert!(RequestService::accept_delegated_bearer(&svc, &key),
+            "must accept while the key is live-authorized");
+
+        // Simulate live revocation (trust store removes / expires the key).
+        authorized.store(false, Ordering::Relaxed);
+
+        // Same key, same authorizer, same service — now rejected. No snapshot.
+        assert!(!RequestService::accept_delegated_bearer(&svc, &key),
+            "must reject immediately after live revocation (no frozen snapshot)");
+    }
+
+
+    #[test]
+    fn jwt_expected_audience_round_trips_through_request_service() {
+        use super::{SigningKey, WorkflowService};
+        use hyprstream_rpc::service::RequestService;
+        use hyprstream_rpc::transport::TransportConfig;
+
+        let sk = SigningKey::from_bytes(&[0x42; 32]);
+        let mut svc =
+            WorkflowService::new(TransportConfig::inproc("wf-plumb-test"), sk);
+        // Default: no audience configured → a JWT-auth request would be denied
+        // at envelope verification (the pre-fix behavior the review flagged).
+        assert!(RequestService::expected_audience(&svc).is_none());
+        assert!(RequestService::jwt_key_source(&svc).is_none());
+
+        svc.set_expected_audience("https://test.hyprstream.local".to_owned());
+        assert_eq!(
+            RequestService::expected_audience(&svc),
+            Some("https://test.hyprstream.local")
+        );
+    }
 
     #[test]
     fn anonymous_subject_must_not_round_trip_through_string() {

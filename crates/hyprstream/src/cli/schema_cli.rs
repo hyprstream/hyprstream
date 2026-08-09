@@ -409,9 +409,12 @@ async fn dispatch_top_level(
             bail!("Worker service has no top-level methods. Use: tool worker <runtime|sandbox|container|image> <method>")
         }
         "workflow" => {
-            bail!(
-                "Workflow service is not yet registered. Service factory needs to be implemented."
-            )
+            // #989: WorkflowService factory is registered (default-off). The
+            // factory still has to be started (`[worker.workflow] enabled = true`)
+            // for this dispatch to reach a live service; `from_resolver` dials
+            // the registered endpoint and errors clearly if nothing is listening.
+            let client = workflow_client::WorkflowClient::from_resolver(signing_key, None)?;
+            client.call_method(method, args).await
         }
         _ => bail!("Unknown service: {}", service),
     }
@@ -438,6 +441,9 @@ async fn dispatch_scoped_dynamic(
             let client = WorkerClient::from_resolver(signing_key, None)?;
             client.call_scoped_method(scope_chain, method, args).await
         }
+        // "workflow" has no scoped sub-resources (unlike worker's
+        // runtime/sandbox/container/image scopes) — its methods (list/dispatch/
+        // getRun/…) are all top-level and dispatched via dispatch_dynamic.
         _ => bail!("Service '{}' has no scoped methods", service),
     }
 }
@@ -454,6 +460,7 @@ fn get_top_level_methods(service: &str) -> Vec<MethodView> {
         "inference" => extract_methods!(inference_client::schema_metadata()),
         "policy" => extract_methods!(policy_client::schema_metadata()),
         "worker" => extract_methods!(worker_client::schema_metadata()),
+        "workflow" => extract_methods!(workflow_client::schema_metadata()),
         _ => Vec::new(),
     }
 }

@@ -135,7 +135,9 @@ pub mod podspec;
 pub use hyprstream_rpc::registry::SocketKind;
 pub use hyprstream_rpc::resolver::Resolver;
 #[cfg(not(target_arch = "wasm32"))]
-pub use did_anchored::{DeploymentTrustSource, DidAnchors};
+pub use did_anchored::{
+    verify_anchor_material, DeploymentTrustSource, DidAnchors, VerifiedAnchorMaterial,
+};
 pub use plc_directory::{
     ConnectTimeDiscovery, DidOpSuccessorWitness, InMemoryPlcDirectoryStore, LivePlcDiscovery,
     PlcDirectory, PlcDirectoryRecord, PlcDirectoryStore, ResolvedPlcIdentity,
@@ -145,10 +147,16 @@ pub use service::{
     bootstrap_deployment_process, deployment_registry_verifier, resolve_and_authenticate_did_anchors,
     AuthorizationProvider, DiscoveryService, RecordCarData, RecordResolver, RegistryDeploymentVerifier,
     production_browser_currentness_verifier, production_browser_provisioning,
-    production_rpc_client, verify_genesis_deployment_artifacts,
+    production_inference_rpc_client_at_transport, production_rpc_client,
+    verify_genesis_deployment_artifacts,
     verify_deployment_artifacts_with_authority_log, verify_deployment_public_ca,
     DeploymentAuthorityCheckpoint, DeploymentAuthorityLog, RegistryDelegationArtifact,
     VerifiedDeploymentArtifacts,
+};
+#[cfg(feature = "test-fixtures")]
+#[doc(hidden)]
+pub use service::test_fixtures::{
+    install_production_inference_fixture, ProductionInferenceFixture,
 };
 
 // Re-export generated types that consumers need

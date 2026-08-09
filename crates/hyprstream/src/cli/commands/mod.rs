@@ -13,8 +13,9 @@ pub use git::{GitAction, GitCommand};
 pub use policy::{PolicyCommand, RoleCommand, TokenCommand};
 pub use training::{TrainingAction, TrainingCommand};
 pub use trust::{
-    DelegateRegistrySignerArgs, MintDeploymentCaArgs, MintRegistryJwtArgs, RotateAuthorityArgs,
-    TrustCommand, VerifyDeploymentArgs,
+    DelegateRegistrySignerArgs, InstallDeploymentTrustArgs, MintAnchorCapsuleArgs,
+    MintDeploymentCaArgs, MintRegistryJwtArgs, RotateAuthorityArgs, TrustCommand,
+    VerifyDeploymentArgs,
 };
 pub use user::{UserCommand, UserKeysCommand, UserKeysImportFormat};
 pub use worker::{ImageCommand, WorkerAction};
@@ -271,10 +272,12 @@ pub enum ServiceAction {
         verbose: bool,
     },
 
-    /// Diagnose, initialize, and repair hyprstream installation
+    /// Diagnose the hyprstream installation
     ///
-    /// Alias for `service install --verbose`. Runs all setup checks and fixes
-    /// without starting services.
+    /// Runs all setup checks (directories, registry, policy, signing keys,
+    /// TLS, bootstrap-pubkeys hybrid posture) and reports status without
+    /// starting services. Dispatches before the hybrid gate so it works on
+    /// a partially-broken install.
     Repair {
         /// Show verbose output for each check
         #[arg(long, short = 'v')]

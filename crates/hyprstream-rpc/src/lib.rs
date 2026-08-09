@@ -123,6 +123,10 @@ pub mod rpc_client;
 pub mod stream_info;
 pub mod stream_epoch;
 pub mod zmtp_framing;
+// #324/N1 intentionally stops at a crate-internal data contract. The allow is
+// removed when the first reassembly/transport consumer lands.
+#[allow(dead_code)]
+pub(crate) mod activation_envelope;
 
 // ============================================================================
 // Cross-platform modules (available on all targets including wasm32)
@@ -204,6 +208,12 @@ pub mod did_plc;
 pub mod did_url;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod admission;
+// Additive, session-scoped PQ binding overlay: trust-on-first-use continuity
+// for dynamically-identified clients, with out-of-band promotion. Consulted by
+// the envelope verify path after the admin-anchored store misses; never mutates
+// that store.
+#[cfg(not(target_arch = "wasm32"))]
+pub mod session_pq_overlay;
 // The real, method-dispatched `IdentityResolver` (#579). Native-only: the
 // did:web arm depends on `did_web`'s DID-document helpers.
 #[cfg(not(target_arch = "wasm32"))]

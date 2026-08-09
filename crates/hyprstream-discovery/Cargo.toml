@@ -15,6 +15,9 @@ crate-type = ["rlib"]  # rlib-only: OnceLock singletons must be shared workspace
 # Pulls in `hyprstream-k8s`, whose re-exported `k8s-openapi` gives the PodSpec /
 # Quantity / Affinity types at the single workspace-pinned `v1_32` version.
 k8s = ["dep:hyprstream-k8s"]
+# Model-free downstream fixtures for the production selector boundary. Never
+# enabled by production features; `hyprstream` enables it only as a dev-dependency.
+test-fixtures = []
 
 [dependencies]
 # Workspace crates

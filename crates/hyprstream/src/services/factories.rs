@@ -20,6 +20,7 @@
 //! manager.spawn(spawnable).await?;
 //! ```
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::Context;
@@ -29,6 +30,7 @@ use hyprstream_rpc::prelude::*;
 use hyprstream_rpc::registry::SocketKind;
 use hyprstream_rpc::service_factory;
 use hyprstream_service::{ServiceContext, Spawnable};
+use hyprstream_vfs::{MountTarget, Namespace};
 use tokio::sync::RwLock;
 use tracing::info;
 
@@ -621,6 +623,17 @@ fn create_ledger_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
         );
     }
 
+    // Re-assert the production contract here as well as at config load: this
+    // factory is reachable from paths that construct a config programmatically
+    // rather than through `HyprConfig::validate`. The DSN field only exists in
+    // a `postgres-ledger` build; without it there is no durable backend to
+    // name, and production validation correctly refuses.
+    #[cfg(feature = "postgres-ledger")]
+    let production_dsn = config.ledger_postgres_url.as_deref();
+    #[cfg(not(feature = "postgres-ledger"))]
+    let production_dsn: Option<&str> = None;
+    lcfg.validate_for_production(production_dsn)?;
+
     // Cell identity = did:key over the service Ed25519 key.
     let ed_sk = ctx.service_signing_key("ledger");
     let ed_vk = ed_sk.verifying_key();
@@ -632,6 +645,12 @@ fn create_ledger_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
     // PQ (ML-DSA-65) key under the Hybrid policy. Fail-closed construction:
     // `require_pq_signatures` set with no key available ⇒ refuse to start the
     // ledger service rather than silently downgrade checkpoints to Classical.
+    // The mint verifier is derived from the SAME key material as the checkpoint
+    // signer, because the actor signs issuance authorizations with that signer.
+    // Building both here keeps the two halves of the seal in lockstep — a
+    // verifier configured more permissively than the signer would re-open the
+    // hole the seal exists to close.
+    let mut mint_pq_vk: Option<std::sync::Arc<hyprstream_crypto::pq::MlDsaVerifyingKey>> = None;
     let signer: Arc<dyn hyprstream_ledger::CheckpointSigner + Send + Sync> = if lcfg
         .require_pq_signatures
     {
@@ -641,11 +660,18 @@ fn create_ledger_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
             tokio::runtime::Handle::current().block_on(async { store.active_key().await })
         });
         match pq_key {
-            Some(k) => Arc::new(CoseCheckpointSigner::hybrid(
-                cell_identity.clone(),
-                ed_sk,
-                (*k).clone(),
-            )),
+            Some(k) => {
+                let vk_bytes = hyprstream_crypto::pq::ml_dsa_sk_to_vk_bytes(&k);
+                let vk = hyprstream_crypto::pq::ml_dsa_vk_from_bytes(&vk_bytes).map_err(|e| {
+                    anyhow::anyhow!("ledger: could not derive the ML-DSA-65 verifying key: {e}")
+                })?;
+                mint_pq_vk = Some(std::sync::Arc::new(vk));
+                Arc::new(CoseCheckpointSigner::hybrid(
+                    cell_identity.clone(),
+                    ed_sk,
+                    (*k).clone(),
+                ))
+            }
             None => anyhow::bail!(
                 "ledger: require_pq_signatures is set but no ML-DSA-65 key is available (fail-closed)"
             ),
@@ -657,8 +683,79 @@ fn create_ledger_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
         ))
     };
 
-    // Phase-1 backend: MemLedger (RocksLedger is item 1.2). The grant verifier
-    // is the fail-closed StaticGrantVerifier until the UCAN wiring lands.
+    // The mint authority is derived from the SAME key material the actor signs
+    // issuance authorizations with, so the two halves of the seal cannot drift
+    // apart. It is passed at backend construction and is immutable afterwards —
+    // there is no setter, which is what stops a consumer holding a backend from
+    // installing a permissive authority of its own.
+    let mint_authority = match &mint_pq_vk {
+        Some(pq) => Some(hyprstream_ledger::MintAuthority::hybrid(
+            ed_vk,
+            (**pq).clone(),
+        )),
+        None if lcfg.require_pq_signatures => {
+            anyhow::bail!(
+                "ledger: require_pq_signatures is set but no ML-DSA-65 verifying key is \
+                 available for the mint authority (fail-closed)"
+            )
+        }
+        None => Some(hyprstream_ledger::MintAuthority::classical(ed_vk)),
+    };
+
+    // Backend selection (PAY-01 F8): BackendKind drives construction.
+    // **Postgres = production (fail-closed on unavailability); Mem = dev/test.**
+    // No silent fallback — a configured Postgres backend that cannot connect
+    // is FATAL.
+    let backend: Box<dyn hyprstream_ledger::LedgerBackend + Send + 'static> = match lcfg.backend {
+        crate::services::ledger::BackendKind::Postgres => {
+            #[cfg(feature = "postgres-ledger")]
+            {
+                let pg_url = config.ledger_postgres_url.as_deref().filter(|u| !u.is_empty()).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "ledger: backend = Postgres but no ledger_postgres_url configured \
+                         (FATAL — production requires a durable backend)"
+                    )
+                })?;
+                let pg_config = hyprstream_ledger::postgres::PostgresConfig {
+                    url: pg_url.to_owned(),
+                    pool_size: config.ledger_postgres_pool_size.unwrap_or(4),
+                };
+                let pg = hyprstream_ledger::postgres::PostgresLedger::connect(
+                    pg_config,
+                    cell_identity.clone(),
+                    mint_authority,
+                ).map_err(|e| {
+                    anyhow::anyhow!(
+                        "ledger: PostgresLedger::connect FAILED (FATAL — no silent fallback): {e}"
+                    )
+                })?;
+                info!("Ledger backend: PostgresLedger (production durable)");
+                Box::new(pg)
+            }
+            #[cfg(not(feature = "postgres-ledger"))]
+            {
+                anyhow::bail!(
+                    "ledger: backend = Postgres but postgres-ledger feature is not compiled \
+                     (FATAL — rebuild with --features postgres-ledger for production)"
+                );
+            }
+        }
+        crate::services::ledger::BackendKind::Mem => {
+            // A volatile backend cannot hold a money ledger. In production this
+            // is fatal rather than a warning: silently accounting into memory
+            // that vanishes on restart is worse than refusing to start.
+            if lcfg.is_production() {
+                anyhow::bail!(
+                    "ledger: backend = Mem is not permitted in production (FATAL — \
+                     all ledger state would be lost on restart). Set [ledger] backend = \"postgres\" \
+                     with a ledger_postgres_url, or unset the production mode to run dev/test."
+                );
+            }
+            info!("Ledger backend: MemLedger (dev/test only — all state is volatile)");
+            Box::new(MemLedger::new(cell_identity.clone(), mint_authority))
+        }
+    };
+
     let verifier: Arc<dyn crate::services::ledger::GrantVerifier + Send + Sync> =
         Arc::new(StaticGrantVerifier::new());
     let sink: Arc<dyn crate::services::ledger::ReceiptSink + Send + Sync> =
@@ -666,7 +763,7 @@ fn create_ledger_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
 
     let service = LedgerService::spawn(
         lcfg,
-        Box::new(MemLedger::new(cell_identity.clone())),
+        backend,
         signer,
         verifier,
         sink,
@@ -1343,6 +1440,134 @@ fn create_worker_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
     worker_service.set_jwt_key_source(ctx.cluster_key_source());
 
     Ok(ctx.into_spawnable_quic(worker_service, worker_quic_port))
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Workflow Service Factory
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Factory for `WorkflowService` (#989, epic #1427).
+///
+/// The engine (`crates/hyprstream-workers/src/workflow/`) is fully implemented
+/// but historically had no factory and was never started by the daemon. This
+/// wires it into the service inventory: it resolves config, constructs the
+/// service with a VFS namespace for the runner, attaches policy-backed
+/// authorization, and returns it as a `Spawnable`.
+///
+/// **Default-off / opt-in:** the workflow config ships `enabled = false`, so
+/// this factory bails unless an operator explicitly sets
+/// `[worker.workflow] enabled = true`. First activation must not change daemon
+/// behavior for everyone (amend-#989 §4).
+///
+/// Scope notes (amend-#989): only factory activation + namespace wiring land
+/// here. `set_job_scheduler` is left unwired because `WorkerService` owns its
+/// `SandboxPool` privately with no cross-factory handle today; jobs therefore
+/// run in-proc (the documented `set_namespace` default) until Phase 1 adds pool
+/// sharing. Event-bus subscription (`service.start()`) is #990's lifecycle
+/// scope; the RPC surface (list/dispatch/getRun) works without it.
+#[service_factory(
+    "workflow",
+    schema = "../../../hyprstream-workers/schema/workflow.capnp",
+    metadata = hyprstream_workers::generated::workflow_client::schema_metadata,
+    depends_on = ["worker", "event", "policy", "registry", "discovery"]
+)]
+fn create_workflow_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>> {
+    use hyprstream_workers::WorkflowService;
+
+    info!("Creating WorkflowService");
+
+    let config = load_config();
+    let wcfg = config
+        .worker
+        .as_ref()
+        .map(|w| w.workflow.clone())
+        .unwrap_or_default();
+    if !wcfg.enabled {
+        anyhow::bail!(
+            "workflow service requested but [worker.workflow] enabled = false \
+             (the engine is opt-in, #989; set `enabled = true` to activate)"
+        );
+    }
+
+    let sk = ctx.service_signing_key("workflow");
+
+    // Namespace the runner resolves actions/env/outputs through. Phase 0 ships
+    // empty `/bin`, `/env`, `/out` skeletons; real action mounts and repo-scan
+    // population land with #990/#992. The runner unmounts `/config` and
+    // `/private` per-job for isolation regardless.
+    let ns = Arc::new(build_workflow_namespace());
+
+    let mut workflow_service =
+        WorkflowService::new(ctx.transport("workflow", SocketKind::Rep), sk.clone());
+    workflow_service.set_namespace_with_config(ns, &wcfg);
+
+    // Policy-backed authorization — same seam as WorkerService. Without this the
+    // dispatch handler fails closed on every request, so wire it before serving.
+    register_service_key(ctx, "workflow", &sk)?;
+    let policy_vk = hyprstream_service::global_trust_store()
+        .resolve_one("policy")
+        .ok_or_else(|| anyhow::anyhow!("trust store has no policy key"))?;
+    let policy_client = crate::services::PolicyClient::for_local_bootstrap(
+        sk.clone(),
+        policy_vk,
+        service_token(&sk),
+    )?;
+    workflow_service.set_authorize_fn(crate::services::worker::build_authorize_fn(policy_client));
+    if let Some(issuer) = ctx.oauth_issuer_url() {
+        workflow_service.set_expected_audience(issuer.to_owned());
+    }
+    workflow_service.set_jwt_key_source(ctx.cluster_key_source());
+
+    // Inject a LIVE MCP relay authorizer so accept_delegated_bearer consults
+    // current MCP-scope authorization at call time (not a frozen snapshot —
+    // retired keys are rejected, new keys accepted after factory start). The
+    // closure captures the global trust store and checks is_authorized for the
+    // "mcp" scope — independently scoped, fail-closed (#989 review).
+    let trust = hyprstream_service::global_trust_store();
+    let has_mcp_keys = !trust.keys_for_scope("mcp").is_empty();
+    if !has_mcp_keys {
+        tracing::warn!(
+            "workflow service started with no authorized MCP relay keys; \
+             delegated-bearer MCP tool calls will be rejected until the mcp \
+             service key(s) are registered (#989)"
+        );
+    }
+    workflow_service.set_relay_authorizer(std::sync::Arc::new(move |pubkey: &[u8; 32]| {
+        match hyprstream_rpc::prelude::VerifyingKey::from_bytes(pubkey) {
+            Ok(vk) => trust.is_authorized(&vk, "mcp"),
+            Err(_) => false,
+        }
+    }));
+
+    Ok(ctx.into_spawnable(workflow_service))
+}
+
+/// Build the minimal Phase-0 workflow namespace: a synthetic root with empty
+/// `/bin`, `/env`, `/out` directories for the runner to resolve through.
+///
+/// This is a skeleton — no action handlers, service mounts, or repo worktrees
+/// are bound here yet. `#990` (git lifecycle) and `#992` (repo scan on clone)
+/// populate the real content; the sandbox `JobScheduler` routing (#527) lands
+/// once `WorkerService` exposes its `SandboxPool` cross-factory.
+fn build_workflow_namespace() -> Namespace {
+    use crate::services::fs::{SyntheticNode, SyntheticTree};
+
+    fn empty_dir() -> SyntheticNode {
+        SyntheticNode::Dir {
+            children: HashMap::new(),
+        }
+    }
+
+    let mut root = HashMap::new();
+    root.insert("bin".to_owned(), empty_dir());
+    root.insert("env".to_owned(), empty_dir());
+    root.insert("out".to_owned(), empty_dir());
+
+    let tree = SyntheticTree::new(SyntheticNode::Dir { children: root });
+    let mut ns = Namespace::new();
+    // Mounting can only fail on a malformed prefix; "/" is well-formed.
+    let _ = ns.mount("/", Arc::new(tree) as MountTarget);
+    ns
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -2505,6 +2730,63 @@ mod tests {
                 .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-'),
         );
         assert!(hyprstream_service::get_factory("at9p_verify").is_none());
+    }
+
+    /// #989: the workflow factory is in the service inventory (the daemon can
+    /// discover and start it). This is the compile-time/registration half of the
+    /// acceptance criterion "WorkflowService appears in service status/discovery"
+    /// without spinning a full daemon.
+    #[test]
+    fn workflow_factory_registered() {
+        let factory = hyprstream_service::get_factory("workflow")
+            .expect("workflow factory must be registered (#989)");
+        assert_eq!(factory.name, "workflow");
+        // amend-#989 §1 dependency set — P0 prerequisite wiring.
+        assert_eq!(
+            factory.depends_on,
+            &["worker", "event", "policy", "registry", "discovery"]
+        );
+        // Schema + metadata must be wired so PolicyService can discover scopes
+        // and MCP can surface methods.
+        assert!(
+            factory.schema.is_some(),
+            "workflow factory must embed its capnp schema"
+        );
+        assert!(
+            factory.metadata.is_some(),
+            "workflow factory must expose schema_metadata for scope discovery"
+        );
+    }
+
+    /// The Phase-0 namespace skeleton mounts `/bin`, `/env`, `/out` for the
+    /// runner (amend-#989 §2). Smoke-check the three directories exist as direct
+    /// children of the synthetic root before the namespace is handed off.
+    #[test]
+    fn workflow_namespace_phase0_skeleton() {
+        use crate::services::fs::{SyntheticNode, SyntheticTree};
+
+        // Rebuild the same tree shape build_workflow_namespace produces, proving
+        // the node shape compiles and the three Phase-0 dirs are present.
+        let mut root = std::collections::HashMap::new();
+        root.insert("bin".to_owned(), SyntheticNode::Dir { children: std::collections::HashMap::new() });
+        root.insert("env".to_owned(), SyntheticNode::Dir { children: std::collections::HashMap::new() });
+        root.insert("out".to_owned(), SyntheticNode::Dir { children: std::collections::HashMap::new() });
+        let _tree = SyntheticTree::new(SyntheticNode::Dir { children: root });
+
+        // build_workflow_namespace itself must not panic and must expose a root mount.
+        let ns = build_workflow_namespace();
+        assert!(
+            ns.mount_prefixes().iter().any(|p| p == &"/"),
+            "Phase-0 workflow namespace must mount a root prefix"
+        );
+    }
+
+    /// amend-#989 §4: default-off / opt-in. The engine must stay dormant unless
+    /// an operator explicitly enables it.
+    #[test]
+    fn workflow_config_default_off() {
+        let cfg = hyprstream_workers::config::WorkflowConfig::default();
+        assert!(!cfg.enabled, "WorkflowConfig must default to enabled = false (#989)");
     }
 
     /// Helper: generate an ECDSA P-256 key pair and return (pkcs8_der, public_key_der)

@@ -753,6 +753,15 @@ async fn verified_tenant_domains_isolate_pairwise_rpc_callers() -> Result<()> {
     };
     assert!(err.to_string().contains("no verified tenant domain"), "domain-less caller must fail closed, got: {err}");
 
+    // Release every caller-owned RPC handle before draining the substrates
+    // (matches `iroh_rpc::rpc_request_response_round_trip` and
+    // `lazy_iroh::lazy_iroh_connects_on_first_send_and_caches`). This test
+    // holds three live policy clients simultaneously (run 30570551382); left
+    // alive across `substrate.shutdown()`, their retained iroh connections
+    // race noq's driver teardown and can trip its GSO-batch assertion.
+    drop(policy_a);
+    drop(policy_b);
+    drop(anonymous_policy);
     client_a_substrate.shutdown().await?;
     client_b_substrate.shutdown().await?;
     anonymous_substrate.shutdown().await?;

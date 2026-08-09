@@ -2930,6 +2930,737 @@ mod tests {
         assert_eq!(valid_exchange_claims["sub"], "scope-valid-user");
         assert_eq!(valid_exchange_claims["scope"], "read:*:*");
 
+        // ── #1425: browser RFC 8693 sender-bound exchange contract ────────────
+        //
+        // Wire-level coverage of the DPoP+cnf.jkt browser exchange: positive
+        // (client_id + DPoP → DPoP-bound token), and negatives (missing proof,
+        // audience substitution, replayed jti). The request body is the exact
+        // form the WASM client sends — built via `exchange_form_body`
+        // (grant_type, subject_token, subject_token_type, client_id, resource)
+        // — so the contract is tested against the frontend's generated
+        // request, not a Rust-local fixture.
+        use rand::Rng as _;
+        use hyprstream_rpc::auth::{jwk_thumbprint, JwkThumbprintInput};
+        use hyprstream_rpc::wasm_token_exchange::BROWSER_PUBLIC_CLIENT_ID;
+        let browser_subject = state
+            .policy_client
+            .issue_token(&IssueToken {
+                requested_scopes: Some(vec!["read:*:*".to_owned()]),
+                ttl: Some(300),
+                audience: Some(ISSUER.to_owned()),
+                subject: Some("browser-user".to_owned()),
+                user_pub_key: None,
+                dpop_jkt: None,
+                issuer: None,
+                tenant: Some("example.test".to_owned()),
+                require_clearance: false,
+            })
+            .await?
+            .token;
+        let browser_dpop_key = p256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
+        let browser_point = browser_dpop_key.verifying_key().to_encoded_point(false);
+        let browser_x: [u8; 32] = browser_point.x().unwrap().as_slice().try_into().unwrap();
+        let browser_y: [u8; 32] = browser_point.y().unwrap().as_slice().try_into().unwrap();
+        let expected_browser_jkt = jwk_thumbprint(&JwkThumbprintInput::Es256 {
+            x: &browser_x,
+            y: &browser_y,
+        });
+        let token_endpoint_url = format!("{ISSUER}/oauth/token");
+        // Each exchange needs a fresh DPoP jti (the jti is single-use); the
+        // proof KEY is constant, so cnf.jkt is stable across all of them.
+        let fresh_browser_proof = || -> String {
+            let jti = format!(
+                "browser-{}",
+                URL_SAFE_NO_PAD.encode(rand::rngs::OsRng.gen::<[u8; 8]>())
+            );
+            dpop_proof(&browser_dpop_key, &token_endpoint_url, &jti, None)
+        };
+
+        // Build the exact WASM request body (`exchange_form_body`) + an
+        // optional `audience` override, as owned pairs `post_form` accepts.
+        //
+        // #1425 r2 P2: `exchange_form_body` now always sends `resource` — the
+        // real `fetch_exchange_token` computes it from the exact origin it is
+        // calling (`exchange_endpoint`), which in this test harness is
+        // `ISSUER`. This is the same value the real browser client would send
+        // for a correctly configured deployment (the AS's own origin), so
+        // every test built from this helper now exercises the client
+        // actually sending the modeled resource, not a native-only fixture.
+        let browser_fields =
+            |subject: &str, audience: Option<&str>| -> Vec<(String, String)> {
+                let body = hyprstream_rpc::wasm_token_exchange::exchange_form_body(
+                    subject,
+                    "urn:ietf:params:oauth:token-type:access_token",
+                    BROWSER_PUBLIC_CLIENT_ID,
+                    ISSUER,
+                );
+                let mut pairs: Vec<(String, String)> =
+                    url::form_urlencoded::parse(body.as_bytes())
+                        .into_owned()
+                        .collect();
+                if let Some(aud) = audience {
+                    pairs.push(("audience".to_owned(), aud.to_owned()));
+                }
+                pairs
+            };
+        let str_slice = strs_of;
+        fn strs_of(pairs: &[(String, String)]) -> Vec<(&str, &str)> {
+            pairs.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect()
+        }
+
+        // Negative: no DPoP proof → sender binding is mandatory.
+        let np = browser_fields(&browser_subject, Some(ISSUER));
+        let np_refs = str_slice(&np);
+        let no_proof = post_form(&app, "/oauth/token", &np_refs, None, false).await;
+        assert_eq!(no_proof.status(), axum::http::StatusCode::BAD_REQUEST);
+        assert_eq!(response_json(no_proof).await["error"], "invalid_request");
+
+        // Negative: audience substitution → invalid_target. The browser token
+        // is restricted to the Hyprstream RPC service resource (the AS origin).
+        let ef = browser_fields(&browser_subject, Some("https://evil.example"));
+        let ef_refs = str_slice(&ef);
+        let evil_proof = fresh_browser_proof();
+        let evil = post_form(&app, "/oauth/token", &ef_refs, Some(&evil_proof), false).await;
+        assert_eq!(evil.status(), axum::http::StatusCode::BAD_REQUEST);
+        assert_eq!(response_json(evil).await["error"], "invalid_target");
+
+        // Positive: client_id + valid DPoP proof → DPoP-bound access token.
+        let pf = browser_fields(&browser_subject, Some(ISSUER));
+        let pf_refs = str_slice(&pf);
+        let ok_proof = fresh_browser_proof();
+        let browser_ok =
+            post_form(&app, "/oauth/token", &pf_refs, Some(&ok_proof), false).await;
+        assert_eq!(
+            browser_ok.status(),
+            axum::http::StatusCode::OK,
+            "browser exchange positive path must succeed"
+        );
+        // #1425 acceptance 5: no token leakage. The response is no-store and
+        // never echoes the token in a redirect/Location header.
+        assert_eq!(
+            browser_ok
+                .headers()
+                .get(axum::http::header::CACHE_CONTROL)
+                .and_then(|v| v.to_str().ok()),
+            Some("no-store")
+        );
+        assert!(browser_ok.headers().get(axum::http::header::LOCATION).is_none());
+        let browser_json = response_json(browser_ok).await;
+        assert_eq!(browser_json["token_type"].as_str(), Some("DPoP"));
+        assert_eq!(
+            browser_json["issued_token_type"].as_str(),
+            Some("urn:ietf:params:oauth:token-type:access_token")
+        );
+        // Access-token only: no refresh token (rotation is a separately
+        // reviewed, metadata-advertised policy).
+        assert!(
+            browser_json.get("refresh_token").is_none(),
+            "browser exchange must not issue a refresh token"
+        );
+        let browser_access = browser_json["access_token"].as_str().unwrap();
+        // The token never appears anywhere except the access_token field.
+        assert_eq!(
+            browser_json
+                .as_object()
+                .unwrap()
+                .iter()
+                .filter(|(_, v)| v.as_str().is_some_and(|s| s.contains(browser_access)))
+                .count(),
+            1,
+            "access_token must not be echoed in any other response field"
+        );
+        let browser_claims = jwt_claims(browser_access);
+        assert_eq!(browser_claims["sub"], "browser-user");
+        assert_eq!(
+            browser_claims["cnf"]["jkt"].as_str(),
+            Some(expected_browser_jkt.as_str()),
+            "minted token must be bound to the DPoP proof key (cnf.jkt)"
+        );
+        assert_eq!(
+            browser_claims["aud"].as_str(),
+            Some(ISSUER),
+            "issued token audience must be restricted to the RPC service resource"
+        );
+        // The "use" half of acceptance 3 (a DPoP-bound token cannot be used as
+        // a plain Bearer; a resource request needs a matching proof + ath) is
+        // enforced by the existing resource middleware in `auth.rs` the moment
+        // the exchange mints `cnf.jkt` — the binding just verified above. That
+        // enforcement has its own coverage in `auth.rs`; the #1425 deliverable
+        // is the exchange producing the binding.
+
+        // Negative: replayed DPoP proof (same jti) → invalid_dpop_proof.
+        // A fresh subject token avoids the subject-replay check.
+        let replay_subject = state
+            .policy_client
+            .issue_token(&IssueToken {
+                requested_scopes: Some(vec!["read:*:*".to_owned()]),
+                ttl: Some(300),
+                audience: Some(ISSUER.to_owned()),
+                subject: Some("browser-replay".to_owned()),
+                user_pub_key: None,
+                dpop_jkt: None,
+                issuer: None,
+                tenant: Some("example.test".to_owned()),
+                require_clearance: false,
+            })
+            .await?
+            .token;
+        let rf = browser_fields(&replay_subject, Some(ISSUER));
+        let rf_refs = str_slice(&rf);
+        // Reuse the positive proof's jti → single-use replay rejection.
+        let replay =
+            post_form(&app, "/oauth/token", &rf_refs, Some(&ok_proof), false).await;
+        assert_eq!(replay.status(), axum::http::StatusCode::BAD_REQUEST);
+        assert_eq!(response_json(replay).await["error"], "invalid_dpop_proof");
+
+        // ── #1425 r1 P1#3: DPoP resource-use wire tests (cnf.jkt token on a
+        //    protected route) ────────────────────────────────────────────────
+        // The exchanged `browser_access` token carries cnf.jkt = the DPoP key's
+        // thumbprint. The resource layer (`require_bearer_token` middleware on
+        // `/oauth/userinfo`) enforces: cnf.jkt tokens rejected as Bearer, DPoP
+        // proof verified (htm/htu/ath/jti/nonce), cnf.jkt matched to the proof
+        // key. These tests exercise that enforcement with the ACTUAL token the
+        // exchange minted, not a fixture.
+        use axum::body::Body as Body_;
+        let userinfo_htu = format!("{ISSUER}/oauth/userinfo");
+
+        // Bearer downgrade rejection (RFC 9449 §7): cnf.jkt token as Bearer.
+        let bearer_downgrade = app
+            .clone()
+            .oneshot(
+                axum::http::Request::get("/oauth/userinfo")
+                    .header(axum::http::header::AUTHORIZATION, format!("Bearer {browser_access}"))
+                    .body(Body_::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            bearer_downgrade.status(),
+            axum::http::StatusCode::UNAUTHORIZED,
+            "cnf.jkt-bound token presented as Bearer MUST be rejected"
+        );
+
+        // DPoP proof without nonce → 401 use_dpop_nonce (the exchange marked
+        // this key as nonced). Extract the fresh nonce for the retry.
+        let no_nonce_jti = format!("res-no-nonce-{}", URL_SAFE_NO_PAD.encode(rand::rngs::OsRng.gen::<[u8; 8]>()));
+        let no_nonce_proof = dpop_resource_proof(
+            &browser_dpop_key,
+            "GET",
+            &userinfo_htu,
+            browser_access,
+            &no_nonce_jti,
+            None,
+        );
+        let no_nonce_resp = app
+            .clone()
+            .oneshot(
+                axum::http::Request::get("/oauth/userinfo")
+                    .header(axum::http::header::AUTHORIZATION, format!("DPoP {browser_access}"))
+                    .header("DPoP", &no_nonce_proof)
+                    .body(Body_::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(no_nonce_resp.status(), axum::http::StatusCode::UNAUTHORIZED);
+        let resource_nonce = no_nonce_resp
+            .headers()
+            .get("DPoP-Nonce")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
+        assert!(resource_nonce.is_some(), "use_dpop_nonce response MUST carry a DPoP-Nonce header");
+
+        // Resource success WITH the nonce: matching proof key + ath + nonce.
+        let success_jti = format!("res-ok-{}", URL_SAFE_NO_PAD.encode(rand::rngs::OsRng.gen::<[u8; 8]>()));
+        let success_proof = dpop_resource_proof(
+            &browser_dpop_key,
+            "GET",
+            &userinfo_htu,
+            browser_access,
+            &success_jti,
+            resource_nonce.as_deref(),
+        );
+        let resource_ok = app
+            .clone()
+            .oneshot(
+                axum::http::Request::get("/oauth/userinfo")
+                    .header(axum::http::header::AUTHORIZATION, format!("DPoP {browser_access}"))
+                    .header("DPoP", &success_proof)
+                    .body(Body_::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_ne!(
+            resource_ok.status(),
+            axum::http::StatusCode::UNAUTHORIZED,
+            "DPoP token with matching proof + nonce + cnf.jkt + ath MUST be accepted at the resource"
+        );
+
+        // Key mismatch rejection: attacker proof key ≠ the token's cnf.jkt.
+        let attacker_key = p256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
+        let mismatch_jti = format!("res-mismatch-{}", URL_SAFE_NO_PAD.encode(rand::rngs::OsRng.gen::<[u8; 8]>()));
+        let mismatch_proof = dpop_resource_proof(
+            &attacker_key,
+            "GET",
+            &userinfo_htu,
+            browser_access,
+            &mismatch_jti,
+            resource_nonce.as_deref(),
+        );
+        let mismatch_resp = app
+            .clone()
+            .oneshot(
+                axum::http::Request::get("/oauth/userinfo")
+                    .header(axum::http::header::AUTHORIZATION, format!("DPoP {browser_access}"))
+                    .header("DPoP", &mismatch_proof)
+                    .body(Body_::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            mismatch_resp.status(),
+            axum::http::StatusCode::UNAUTHORIZED,
+            "DPoP proof from a different key MUST be rejected (cnf.jkt mismatch)"
+        );
+
+        // ── #1425 r1 P1#2: Subject-token cnf.jkt same-key binding ───────────
+        // A DPoP-bound subject access token MUST be exchanged under a proof
+        // from the SAME key. An attacker who steals the token string cannot
+        // re-bind it to their own key.
+        let subject_key = p256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
+        let subject_point = subject_key.verifying_key().to_encoded_point(false);
+        let subject_x: [u8; 32] = subject_point.x().unwrap().as_slice().try_into().unwrap();
+        let subject_y: [u8; 32] = subject_point.y().unwrap().as_slice().try_into().unwrap();
+        let subject_jkt = jwk_thumbprint(&JwkThumbprintInput::Es256 {
+            x: &subject_x,
+            y: &subject_y,
+        });
+
+        // Mint a DPoP-bound subject token (carries cnf.jkt = subject_key's jkt).
+        let cnf_bound_subject = state
+            .policy_client
+            .issue_token(&IssueToken {
+                requested_scopes: Some(vec!["read:*:*".to_owned()]),
+                ttl: Some(300),
+                audience: Some(ISSUER.to_owned()),
+                subject: Some("cnf-bound-user".to_owned()),
+                user_pub_key: None,
+                dpop_jkt: Some(subject_jkt.clone()),
+                issuer: None,
+                tenant: Some("example.test".to_owned()),
+                require_clearance: false,
+            })
+            .await?
+            .token;
+
+        // Same-key positive: exchange the bound subject under a proof from the
+        // SAME key. Bootstrap (no nonce) is fine — this is the first exchange
+        // for this DPoP key.
+        let same_key_jti = format!("same-key-{}", URL_SAFE_NO_PAD.encode(rand::rngs::OsRng.gen::<[u8; 8]>()));
+        let same_key_proof = dpop_proof(&subject_key, &token_endpoint_url, &same_key_jti, None);
+        let same_key_fields = browser_fields(&cnf_bound_subject, Some(ISSUER));
+        let same_key_refs = str_slice(&same_key_fields);
+        let same_key_resp = post_form(
+            &app,
+            "/oauth/token",
+            &same_key_refs,
+            Some(&same_key_proof),
+            false,
+        )
+        .await;
+        assert_eq!(
+            same_key_resp.status(),
+            axum::http::StatusCode::OK,
+            "same-key exchange (subject cnf.jkt == proof key) must succeed"
+        );
+        let same_key_json = response_json(same_key_resp).await;
+        assert_eq!(same_key_json["token_type"].as_str(), Some("DPoP"));
+        let same_key_access = same_key_json["access_token"].as_str().unwrap();
+        let same_key_claims = jwt_claims(same_key_access);
+        assert_eq!(
+            same_key_claims["cnf"]["jkt"].as_str(),
+            Some(subject_jkt.as_str()),
+            "minted token must carry the SAME cnf.jkt as the subject token"
+        );
+
+        // Cross-key negative (A-token / B-proof): exchange a fresh DPoP-bound
+        // subject token under a proof from a DIFFERENT key. The same-key check
+        // must reject the substitution before consuming the subject token.
+        let attacker_subject_key = p256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
+        let cnf_bound_subject_2 = state
+            .policy_client
+            .issue_token(&IssueToken {
+                requested_scopes: Some(vec!["read:*:*".to_owned()]),
+                ttl: Some(300),
+                audience: Some(ISSUER.to_owned()),
+                subject: Some("cnf-bound-user-2".to_owned()),
+                user_pub_key: None,
+                dpop_jkt: Some(subject_jkt.clone()),
+                issuer: None,
+                tenant: Some("example.test".to_owned()),
+                require_clearance: false,
+            })
+            .await?
+            .token;
+        let cross_key_jti = format!("cross-key-{}", URL_SAFE_NO_PAD.encode(rand::rngs::OsRng.gen::<[u8; 8]>()));
+        let cross_key_proof = dpop_proof(&attacker_subject_key, &token_endpoint_url, &cross_key_jti, None);
+        let cross_key_fields = browser_fields(&cnf_bound_subject_2, Some(ISSUER));
+        let cross_key_refs = str_slice(&cross_key_fields);
+        let cross_key_resp = post_form(
+            &app,
+            "/oauth/token",
+            &cross_key_refs,
+            Some(&cross_key_proof),
+            false,
+        )
+        .await;
+        assert_eq!(
+            cross_key_resp.status(),
+            axum::http::StatusCode::BAD_REQUEST,
+            "cross-key exchange (subject cnf.jkt ≠ proof key) MUST be rejected"
+        );
+        assert_eq!(
+            response_json(cross_key_resp).await["error"],
+            "invalid_dpop_proof",
+            "key substitution must surface as invalid_dpop_proof"
+        );
+
+        // ── #1425 r1/r2 P2: RFC 8693 fields the browser contract does not accept ──
+        // All are rejected before DPoP verification/subject-token
+        // consumption, so the (already-used) `browser_subject` string is safe
+        // to reuse — none of these requests reach subject-token verification.
+        let mut actor_fields = browser_fields(&browser_subject, Some(ISSUER));
+        actor_fields.push(("actor_token".to_owned(), "some-actor-jwt".to_owned()));
+        let actor_resp =
+            post_form(&app, "/oauth/token", &str_slice(&actor_fields), None, false).await;
+        assert_eq!(actor_resp.status(), axum::http::StatusCode::BAD_REQUEST);
+        assert_eq!(response_json(actor_resp).await["error"], "invalid_request");
+
+        // ── #1425 r2 P2: `actor_token_type` alone (no `actor_token`) must not
+        //    be treated as if the request carried no actor field at all — the
+        //    prior revision only modeled/rejected `actor_token`, so an
+        //    `actor_token_type`-only request was silently dropped by the form
+        //    extractor and reached subject-token verification unrejected.
+        //    No DPoP proof is supplied here either, proving (via the returned
+        //    `invalid_request`, not "requires a DPoP proof") that this is
+        //    rejected before DPoP admission and before subject-token
+        //    consumption — `browser_subject` remains safe to reuse below.
+        let mut actor_type_standalone_fields = browser_fields(&browser_subject, Some(ISSUER));
+        actor_type_standalone_fields.push((
+            "actor_token_type".to_owned(),
+            "urn:ietf:params:oauth:token-type:jwt".to_owned(),
+        ));
+        let actor_type_standalone_resp = post_form(
+            &app,
+            "/oauth/token",
+            &str_slice(&actor_type_standalone_fields),
+            None,
+            false,
+        )
+        .await;
+        assert_eq!(
+            actor_type_standalone_resp.status(),
+            axum::http::StatusCode::BAD_REQUEST,
+            "actor_token_type alone must be rejected, not silently ignored"
+        );
+        assert_eq!(
+            response_json(actor_type_standalone_resp).await["error"],
+            "invalid_request"
+        );
+
+        // Duplicate `actor_token_type` fields: proves the rejection is real
+        // field modeling (caught by the same axum::Form duplicate-key
+        // detection already proven for `resource`), not a single manually
+        // inserted value that a second, differently-encoded copy could evade.
+        let mut actor_type_dup_fields = browser_fields(&browser_subject, Some(ISSUER));
+        actor_type_dup_fields.push((
+            "actor_token_type".to_owned(),
+            "urn:ietf:params:oauth:token-type:jwt".to_owned(),
+        ));
+        actor_type_dup_fields.push((
+            "actor_token_type".to_owned(),
+            "urn:ietf:params:oauth:token-type:access_token".to_owned(),
+        ));
+        let actor_type_dup_resp = post_form(
+            &app,
+            "/oauth/token",
+            &str_slice(&actor_type_dup_fields),
+            None,
+            false,
+        )
+        .await;
+        assert!(
+            actor_type_dup_resp.status().is_client_error(),
+            "duplicate actor_token_type fields must be rejected, not silently take the last \
+             value (got {})",
+            actor_type_dup_resp.status()
+        );
+
+        let mut rtt_fields = browser_fields(&browser_subject, Some(ISSUER));
+        rtt_fields.push((
+            "requested_token_type".to_owned(),
+            "urn:ietf:params:oauth:token-type:refresh_token".to_owned(),
+        ));
+        let rtt_resp =
+            post_form(&app, "/oauth/token", &str_slice(&rtt_fields), None, false).await;
+        assert_eq!(rtt_resp.status(), axum::http::StatusCode::BAD_REQUEST);
+        assert_eq!(response_json(rtt_resp).await["error"], "invalid_target");
+
+        let mut tenant_fields = browser_fields(&browser_subject, Some(ISSUER));
+        tenant_fields.push(("tenant".to_owned(), "some-other-tenant".to_owned()));
+        let tenant_resp =
+            post_form(&app, "/oauth/token", &str_slice(&tenant_fields), None, false).await;
+        assert_eq!(tenant_resp.status(), axum::http::StatusCode::BAD_REQUEST);
+        assert_eq!(response_json(tenant_resp).await["error"], "invalid_request");
+
+        // `resource` mismatch → invalid_target, mirroring the `audience` negative above.
+        // `browser_fields` now sends the correct `resource` by default (the
+        // real client always does); strip it before substituting the bad value.
+        let mut resource_bad_fields = browser_fields(&browser_subject, None);
+        resource_bad_fields.retain(|(k, _)| k != "resource");
+        resource_bad_fields.push(("resource".to_owned(), "https://evil.example".to_owned()));
+        let resource_bad_resp = post_form(
+            &app,
+            "/oauth/token",
+            &str_slice(&resource_bad_fields),
+            None,
+            false,
+        )
+        .await;
+        assert_eq!(resource_bad_resp.status(), axum::http::StatusCode::BAD_REQUEST);
+        assert_eq!(response_json(resource_bad_resp).await["error"], "invalid_target");
+
+        // Duplicate `resource` fields: `axum::Form<TokenRequest>` deserializes
+        // via serde's generated struct visitor, which errors on a field set
+        // twice — a duplicate cannot silently smuggle a second, later-wins
+        // value past the single-value check above.
+        let mut dup_resource_fields = browser_fields(&browser_subject, None);
+        dup_resource_fields.retain(|(k, _)| k != "resource");
+        dup_resource_fields.push(("resource".to_owned(), ISSUER.to_owned()));
+        dup_resource_fields.push(("resource".to_owned(), "https://evil.example".to_owned()));
+        let dup_resource_resp = post_form(
+            &app,
+            "/oauth/token",
+            &str_slice(&dup_resource_fields),
+            None,
+            false,
+        )
+        .await;
+        assert!(
+            dup_resource_resp.status().is_client_error(),
+            "duplicate resource fields must be rejected, not silently take the last value \
+             (got {})",
+            dup_resource_resp.status()
+        );
+
+        // `resource` matching the canonical RPC resource is accepted (a fresh
+        // subject token, since this request runs the full exchange to success).
+        // #1425 r2 P2: `browser_fields` already sends the correct `resource`
+        // by default via the real `exchange_form_body` — this positive case
+        // needs no manual field push, which is exactly the point: the browser
+        // caller's own request, unmodified, must succeed.
+        let resource_ok_subject = state
+            .policy_client
+            .issue_token(&IssueToken {
+                requested_scopes: Some(vec!["read:*:*".to_owned()]),
+                ttl: Some(300),
+                audience: Some(ISSUER.to_owned()),
+                subject: Some("resource-field-user".to_owned()),
+                user_pub_key: None,
+                dpop_jkt: None,
+                issuer: None,
+                tenant: Some("example.test".to_owned()),
+                require_clearance: false,
+            })
+            .await?
+            .token;
+        let resource_ok_fields = browser_fields(&resource_ok_subject, None);
+        // A brand-new DPoP key: `browser_dpop_key` was already marked "nonced"
+        // by the earlier positive exchange above, so its bootstrap window has
+        // closed — reusing it here would spuriously hit `use_dpop_nonce`.
+        let resource_ok_key = p256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
+        let resource_ok_jti = format!(
+            "resource-ok-{}",
+            URL_SAFE_NO_PAD.encode(rand::rngs::OsRng.gen::<[u8; 8]>())
+        );
+        let resource_ok_proof =
+            dpop_proof(&resource_ok_key, &token_endpoint_url, &resource_ok_jti, None);
+        let resource_ok_resp = post_form(
+            &app,
+            "/oauth/token",
+            &str_slice(&resource_ok_fields),
+            Some(&resource_ok_proof),
+            false,
+        )
+        .await;
+        assert_eq!(
+            resource_ok_resp.status(),
+            axum::http::StatusCode::OK,
+            "resource matching the canonical RPC resource must be accepted"
+        );
+
+        // ── #1425 r1 P2: id_token is not a supported browser subject type ──────
+        let mut idt_fields = browser_fields(&browser_subject, Some(ISSUER));
+        for pair in idt_fields.iter_mut() {
+            if pair.0 == "subject_token_type" {
+                pair.1 = "urn:ietf:params:oauth:token-type:id_token".to_owned();
+            }
+        }
+        // A brand-new DPoP key (bootstrap, no nonce needed): `browser_dpop_key`
+        // is already nonced by the earlier positive exchange.
+        let idt_key = p256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
+        let idt_jti = format!(
+            "idt-{}",
+            URL_SAFE_NO_PAD.encode(rand::rngs::OsRng.gen::<[u8; 8]>())
+        );
+        let idt_proof = dpop_proof(&idt_key, &token_endpoint_url, &idt_jti, None);
+        let idt_resp = post_form(
+            &app,
+            "/oauth/token",
+            &str_slice(&idt_fields),
+            Some(&idt_proof),
+            false,
+        )
+        .await;
+        assert_eq!(idt_resp.status(), axum::http::StatusCode::UNAUTHORIZED);
+        assert_eq!(response_json(idt_resp).await["error"], "invalid_grant");
+
+        // ── #1425 r1 P1#3/#4: the actual WASM-shared functions, end to end ─────
+        // Builds the DPoP proof with the SAME pure functions
+        // `wasm_token_exchange::fetch_exchange_token` calls from the browser
+        // (`ed25519_dpop_signing_input` + `assemble_dpop_proof`), signed by a
+        // real `ed25519_dalek` key — not a Rust-local reconstruction of the
+        // wire shape, the literal shared code. Exercises bootstrap, the
+        // `use_dpop_nonce` retry, and confirms the minted `cnf.jkt` is exactly
+        // `ed25519_dpop_jkt(pubkey)` — the same equality `VfsShell::connect`
+        // relies on to make the token usable on the RPC path (proven against
+        // the real RPC verifier in `service/svc.rs`'s
+        // `browser_cnf_jkt_token_succeeds_over_matching_envelope_signer`).
+        use hyprstream_rpc::wasm_token_exchange::{
+            assemble_dpop_proof, ed25519_dpop_jkt, ed25519_dpop_signing_input,
+        };
+        let wasm_key = ed25519_dalek::SigningKey::from_bytes(&[0x91; 32]);
+        let wasm_pubkey: [u8; 32] = wasm_key.verifying_key().to_bytes();
+        let build_wasm_proof = |jti: &str, nonce: Option<&str>| -> String {
+            use ed25519_dalek::Signer as _;
+            let iat = chrono::Utc::now().timestamp();
+            let (signing_input, _) = ed25519_dpop_signing_input(
+                &wasm_pubkey,
+                "POST",
+                &token_endpoint_url,
+                iat,
+                jti,
+                None,
+                nonce,
+            )
+            .unwrap();
+            let signature = wasm_key.sign(signing_input.as_bytes());
+            assemble_dpop_proof(&signing_input, &signature.to_bytes())
+        };
+        let wasm_subject = state
+            .policy_client
+            .issue_token(&IssueToken {
+                requested_scopes: Some(vec!["read:*:*".to_owned()]),
+                ttl: Some(300),
+                audience: Some(ISSUER.to_owned()),
+                subject: Some("wasm-shared-fn-user".to_owned()),
+                user_pub_key: None,
+                dpop_jkt: None,
+                issuer: None,
+                tenant: Some("example.test".to_owned()),
+                require_clearance: false,
+            })
+            .await?
+            .token;
+        // Bootstrap: no nonce yet for this key.
+        let wasm_bootstrap_proof = build_wasm_proof("wasm-shared-bootstrap", None);
+        let wasm_fields = browser_fields(&wasm_subject, Some(ISSUER));
+        let wasm_bootstrap_resp = post_form(
+            &app,
+            "/oauth/token",
+            &str_slice(&wasm_fields),
+            Some(&wasm_bootstrap_proof),
+            false,
+        )
+        .await;
+        assert_eq!(
+            wasm_bootstrap_resp.status(),
+            axum::http::StatusCode::OK,
+            "bootstrap exchange via the real wasm_token_exchange helpers must succeed"
+        );
+        let wasm_json = response_json(wasm_bootstrap_resp).await;
+        let wasm_access = wasm_json["access_token"].as_str().unwrap().to_owned();
+        let wasm_claims = jwt_claims(&wasm_access);
+        assert_eq!(
+            wasm_claims["cnf"]["jkt"].as_str(),
+            Some(ed25519_dpop_jkt(&wasm_pubkey).as_str()),
+            "minted cnf.jkt must equal ed25519_dpop_jkt(pubkey) — the exact check \
+             VfsShell::connect relies on to make the token usable over the matching \
+             RPC envelope signer"
+        );
+
+        // use_dpop_nonce round trip: a second exchange from the SAME wasm key,
+        // without a nonce, must now be required to retry — proving the server
+        // half of the nonce lifecycle the WASM client's `decide_nonce_outcome`
+        // reacts to is real, not asserted only in the pure unit tests.
+        let wasm_subject_2 = state
+            .policy_client
+            .issue_token(&IssueToken {
+                requested_scopes: Some(vec!["read:*:*".to_owned()]),
+                ttl: Some(300),
+                audience: Some(ISSUER.to_owned()),
+                subject: Some("wasm-shared-fn-user-2".to_owned()),
+                user_pub_key: None,
+                dpop_jkt: None,
+                issuer: None,
+                tenant: Some("example.test".to_owned()),
+                require_clearance: false,
+            })
+            .await?
+            .token;
+        let wasm_no_nonce_proof = build_wasm_proof("wasm-shared-no-nonce", None);
+        let wasm_fields_2 = browser_fields(&wasm_subject_2, Some(ISSUER));
+        let wasm_nonce_required_resp = post_form(
+            &app,
+            "/oauth/token",
+            &str_slice(&wasm_fields_2),
+            Some(&wasm_no_nonce_proof),
+            false,
+        )
+        .await;
+        assert_eq!(wasm_nonce_required_resp.status(), axum::http::StatusCode::BAD_REQUEST);
+        let wasm_fresh_nonce = wasm_nonce_required_resp
+            .headers()
+            .get("DPoP-Nonce")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned)
+            .expect("use_dpop_nonce response must carry a fresh DPoP-Nonce");
+        assert_eq!(
+            response_json(wasm_nonce_required_resp).await["error"],
+            "use_dpop_nonce"
+        );
+        // Retry with a fresh proof carrying the server nonce — matches exactly
+        // what `decide_nonce_outcome` -> `NonceOutcome::RetryWithNonce` drives
+        // the browser client to do.
+        let wasm_retry_proof =
+            build_wasm_proof("wasm-shared-retry", Some(&wasm_fresh_nonce));
+        let wasm_retry_resp = post_form(
+            &app,
+            "/oauth/token",
+            &str_slice(&wasm_fields_2),
+            Some(&wasm_retry_proof),
+            false,
+        )
+        .await;
+        assert_eq!(
+            wasm_retry_resp.status(),
+            axum::http::StatusCode::OK,
+            "nonce retry via the real wasm_token_exchange helpers must succeed"
+        );
+
         // The real composite token minted above authenticates to a protected
         // OAuth route. This failed when middleware routed every JWT through
         // the fixed EdDSA key.

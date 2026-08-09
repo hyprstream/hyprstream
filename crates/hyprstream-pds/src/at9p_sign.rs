@@ -38,10 +38,11 @@ use anyhow::{ensure, Context, Result};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 
 use hyprstream_crypto::cose_sign::{
-    assemble_composite_nested, sign_composite, split_composite, verify_composite,
+    assemble_composite_nested, inner_tbs, outer_tbs, sign_composite, split_composite,
+    verify_composite,
 };
 use hyprstream_crypto::pq::{
-    ml_dsa_sk_to_vk_bytes, ml_dsa_vk_bytes, ml_dsa_vk_from_bytes, MlDsaSigningKey,
+    ml_dsa_sign, ml_dsa_sk_to_vk_bytes, ml_dsa_vk_bytes, ml_dsa_vk_from_bytes, MlDsaSigningKey,
     MlDsaVerifyingKey,
 };
 
@@ -179,6 +180,66 @@ fn verify_record(
     Ok(())
 }
 
+/// An Ed25519 capsule signer whose secret half may live outside the process.
+///
+/// The deployment-authority ceremony keeps its classical leg in a YubiKey PIV
+/// slot, so the inner EdDSA layer cannot be produced from an in-process
+/// [`SigningKey`]. Implementors sign the inner COSE layer's detached
+/// to-be-signed bytes out-of-band and return the raw 64-byte signature; the
+/// ML-DSA-65 leg is still an in-process key, so GATE 2 (hybrid PINNED) is
+/// unchanged — this trait only relocates the classical half.
+pub trait CapsuleEd25519Signer {
+    /// The public half the capsule publishes as its subject key.
+    fn verifying_key(&self) -> VerifyingKey;
+
+    /// Sign the inner EdDSA layer's detached to-be-signed bytes.
+    fn sign_detached(&self, tbs: &[u8]) -> Result<[u8; 64]>;
+}
+
+impl CapsuleEd25519Signer for SigningKey {
+    fn verifying_key(&self) -> VerifyingKey {
+        SigningKey::verifying_key(self)
+    }
+
+    fn sign_detached(&self, tbs: &[u8]) -> Result<[u8; 64]> {
+        use ed25519_dalek::Signer as _;
+        Ok(self.sign(tbs).to_bytes())
+    }
+}
+
+/// Sign `payload` under the pinned-Hybrid composite path with an out-of-band
+/// classical signer, binding `context`.
+///
+/// Layer-for-layer equivalent to [`sign_record`]: the inner EdDSA to-be-signed
+/// bytes come from [`inner_tbs`] with `hybrid = true` (the same
+/// `layer_aad` binding `sign_composite` applies), and the outer ML-DSA-65 layer
+/// signs `payload ‖ inner_signature` via [`outer_tbs`]. The outer key is still
+/// mandatory, so there is no classical-only production here either (R4).
+fn sign_record_detached(
+    payload: &[u8],
+    context: &str,
+    ed: &dyn CapsuleEd25519Signer,
+    pq_sk: &MlDsaSigningKey,
+) -> Result<CoseCompositeSignature> {
+    let protected = context_protected_header(context);
+    let ed_kid = ed.verifying_key().to_bytes().to_vec();
+    let ed_sig = ed.sign_detached(&inner_tbs(ed_kid.clone(), payload, &protected, true))?;
+    let pq_kid = ml_dsa_sk_to_vk_bytes(pq_sk);
+    let pq_sig = ml_dsa_sign(
+        pq_sk,
+        &outer_tbs(pq_kid.clone(), payload, &ed_sig, &protected),
+    );
+    // Round-trip through the canonical composite encoding so the decomposed
+    // signatures stored on the record are exactly what the assembled nested
+    // composite carries — the shape `verify_record` will rebuild.
+    let composite = assemble_composite_nested((ed_kid, ed_sig.to_vec()), Some((pq_kid, pq_sig)))
+        .context("at9p detached composite assembly failed")?;
+    let (ed_sig, pq_sig) = split_composite(&composite)?;
+    let pq_sig = pq_sig
+        .ok_or_else(|| anyhow::anyhow!("at9p detached signing produced no ML-DSA-65 layer"))?;
+    CoseCompositeSignature::new(context, protected, ed_sig, pq_sig)
+}
+
 /// Sign a capsule body with one of its subject keys, producing a fully-signed
 /// [`Capsule`]. Self-certifying: the signing keys MUST match **some** published
 /// `body.subject_keys` entry (an atomic Ed25519↔ML-DSA-65 pair), not a
@@ -188,12 +249,23 @@ pub fn sign_capsule(
     ed_sk: &SigningKey,
     pq_sk: &MlDsaSigningKey,
 ) -> Result<Capsule> {
+    sign_capsule_detached(body, ed_sk, pq_sk)
+}
+
+/// [`sign_capsule`] for an authority whose Ed25519 leg signs out-of-band
+/// (YubiKey PIV, KMS). Applies the identical subject-key self-certification
+/// checks and the identical pinned-Hybrid composite construction.
+pub fn sign_capsule_detached(
+    body: CapsuleBody,
+    ed: &dyn CapsuleEd25519Signer,
+    pq_sk: &MlDsaSigningKey,
+) -> Result<Capsule> {
     body.validate()?;
     // Select the subject key the signer claims to be by its Ed25519 identity,
     // then require the ML-DSA-65 half to match the SAME entry — the atomic hybrid
     // binding. This admits any published key as the self-cert signer while
     // forbidding a mismatched cross-pair.
-    let signer_ed = ed_sk.verifying_key().to_bytes();
+    let signer_ed = ed.verifying_key().to_bytes();
     let entry = body.subject_key_for_ed25519(&signer_ed).ok_or_else(|| {
         anyhow::anyhow!("signing ed25519 key is not a published capsule subject key")
     })?;
@@ -203,7 +275,7 @@ pub fn sign_capsule(
     );
 
     let payload = body.to_dag_cbor()?;
-    let signatures = sign_record(&payload, CAPSULE_SIGNATURE_CONTEXT, ed_sk, pq_sk)?;
+    let signatures = sign_record_detached(&payload, CAPSULE_SIGNATURE_CONTEXT, ed, pq_sk)?;
     Capsule::new(body, signatures)
 }
 

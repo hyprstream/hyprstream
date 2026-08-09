@@ -1,0 +1,277 @@
+name: OCI Runtime Image Validation
+
+# Build a CPU/arm64 runtime image on every PR that can break it, then run the
+# image and prove it executes, starts as its service, and either serves /health
+# or refuses cleanly at deployment-trust enforcement (a bare CI container has
+# no deployment CA). Before this workflow, NO pull_request-triggered job
+# built a runtime image — a runtime regression first appeared as a broken
+# publish on main (see docker-build.yml / build-image.yml trigger tables).
+#
+# Validates the CPU arm64 path ONLY. CUDA/ROCm need GPU-host validation and
+# amd64 is not exercised here — both are noted gaps. The arm64 CPU path is the
+# one whose runtime base, library destinations, and USER directive changed in
+# the core-runtime migration.
+#
+# Path filter rationale: only files that are COPYed into the builder stage or
+# that define the image itself can affect the runtime artifact. Rust source
+# outside crates/ (e.g. docs, .github) cannot change what enters the image.
+on:
+  pull_request:
+    paths:
+      - 'Dockerfile'
+      - '.github/workflows/oci-runtime-validate.yml'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'crates/**'
+      - 'rust-toolchain.toml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Cancel stale runs when a new commit is pushed to the same PR — the
+# Graviton runner pool is shared and scarce.
+concurrency:
+  group: oci-runtime-validate-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-runtime-and-smoke-test:
+    # Same self-hosted Graviton pool as build-image.yml and the merge gate:
+    # native arm64 (no qemu), podman-only (Rocky 10 golden AMI).
+    runs-on: [self-hosted, linux, arm64, graviton, hyprstream-merge-gate]
+    # The build is the long pole: the builder-stage-only job in build-image.yml
+    # budgets 60 minutes on this same runner class, and this job additionally
+    # builds the runtime stage (COPY-only layers) and runs a smoke test bounded
+    # at ~4 minutes. 75 keeps headroom over that sibling budget without letting
+    # a wedged build hold a scarce runner for two hours.
+    timeout-minutes: 75
+    # Every mutable resource this job creates on the shared runner is suffixed
+    # with the run id so concurrent runs from different PRs cannot destroy each
+    # other's image, container, or port.
+    env:
+      SMOKE_IMAGE: hyprstream-runtime-ci:${{ github.run_id }}
+      SMOKE_CONTAINER: hs-smoke-${{ github.run_id }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Runner sanity
+        run: |
+          uname -m
+          . /etc/os-release && echo "$PRETTY_NAME"
+          podman --version
+          curl --version | head -1
+
+      # ── Build ──────────────────────────────────────────────────────────
+      # Build the full image through the runtime stage. This is the step
+      # that was completely missing from CI: docker-build.yml only runs on
+      # push to main, build-image.yml builds the BUILDER stage only.
+      - name: Build runtime image (cpu-arm64)
+        run: |
+          podman build \
+            --target runtime \
+            --build-arg VARIANT=cpu-arm64 \
+            -t "$SMOKE_IMAGE" \
+            -f Dockerfile \
+            .
+
+      # ── Security property: runs as uid 65532, NOT uid 0 ───────────────
+      # The core-runtime migration's entire point is moving off uid 0.
+      # Check the built image config, not the Dockerfile text.
+      - name: Assert image User is 65532:65532
+        run: |
+          user="$(podman inspect "$SMOKE_IMAGE" --format '{{.Config.User}}')"
+          echo "Image User: $user"
+          if [ "$user" != "65532:65532" ]; then
+            echo "::error::Image runs as '$user' — expected 65532:65532 (non-root)."
+            echo "A regression to root means the core-runtime security property is lost."
+            exit 1
+          fi
+          echo "OK: image runs as uid 65532."
+
+      # ── Binary executes on the runtime base ───────────────────────────
+      # If the ELF interpreter, glibc/libstdc++ symbol versions, or library
+      # search path (ld.so) are wrong, the binary fails to exec here. This
+      # catches the exact class of regression the core-runtime migration
+      # risks: library COPY destinations moved from Debian multiarch dirs
+      # to /usr/lib64.
+      - name: Binary executes (ld.so + library closure)
+        run: |
+          echo "Running /hyprstream --version inside the image…"
+          # ENTRYPOINT is ["/hyprstream"], so --version is an arg to the binary,
+          # not a separate command.
+          podman run --rm "$SMOKE_IMAGE" --version
+
+      # ── Serving smoke test: the OAuth HTTP face ───────────────────────
+      # Start the OAuth service inside the container and gate on what a bare
+      # CI container can honestly prove.
+      #
+      # KNOWN GAP: full serving requires deployment trust infrastructure
+      # (/etc/hyprstream/trust/deployment-ca.hybrid and related files) that
+      # a bare CI container does not have. The wizard bootstrap creates
+      # signing keys and service JWTs, but NOT the deployment CA root — that
+      # is provisioned by the deployment stack (cyberdione/metal). Minting
+      # throwaway trust inside this job is not currently possible: the trust
+      # ceremony shells out to age-keygen for identities, and the distroless
+      # runtime image contains only the hyprstream binary; the registry
+      # credential additionally requires decrypting the authority bundle.
+      # The service's trusted-artifact loader also rejects any trust path
+      # whose ancestor directories are group/world-writable, which rules out
+      # the 777 volume mounts the unprivileged runtime uid needs elsewhere.
+      #
+      # What this step therefore GATES (hard-fails on):
+      #   1. The wizard bootstrap must complete (credential files writable
+      #      by uid 65532, config machinery works on the runtime base).
+      #   2. The service container must start, and then EITHER serve
+      #      GET /health (the full pass, once trust is provisioned) OR exit
+      #      with the recognized deployment-trust refusal in its logs —
+      #      which proves startup ran all the way to trust enforcement.
+      #      Any other exit, and any silent hang that neither serves nor
+      #      refuses, fails the job.
+      #
+      # The OAuth service's axum face serves GET /health as a public MAC
+      # exemption (no credential needed). Default bind: 0.0.0.0:6791,
+      # plaintext HTTP when no TLS config is set (the CI case). The port is
+      # published to a run-id-derived host port instead of --network host so
+      # concurrent runs on the shared pool never contend for one socket.
+      # Credential bootstrap: the foreground service path requires
+      # bootstrap-pubkeys, so we run `wizard --non-interactive --bootstrap-only`
+      # first. HYPRSTREAM__SECRETS__PATH points at a writable tmpfs so the
+      # unprivileged uid 65532 can create credential files.
+      - name: Container starts and serves or refuses cleanly
+        run: |
+          set -euo pipefail
+
+          # Host port derived from the run id: unique per concurrent run,
+          # stable within one run.
+          SMOKE_PORT=$(( 20000 + GITHUB_RUN_ID % 10000 ))
+
+          # One scratch root (recorded for the always-run cleanup step) with
+          # writable dirs for uid 65532 inside the container.
+          SMOKE_TMP="$(mktemp -d)"
+          echo "SMOKE_TMP=$SMOKE_TMP" >> "$GITHUB_ENV"
+          DATA_DIR="$SMOKE_TMP/data"
+          RUN_DIR="$SMOKE_TMP/run"
+          SECRETS_DIR="$SMOKE_TMP/secrets"
+          mkdir -p "$DATA_DIR" "$RUN_DIR" "$SECRETS_DIR"
+          chmod 777 "$DATA_DIR" "$RUN_DIR" "$SECRETS_DIR"
+
+          # Shared volume mounts for both the bootstrap and service containers.
+          VOL_ARGS=(
+            -v "$DATA_DIR":/var/lib/hyprstream:z
+            -v "$RUN_DIR":/run/hyprstream:z
+            -v "$SECRETS_DIR":/tmp/hs-secrets:z
+            -e HYPRSTREAM__SECRETS__PATH=/tmp/hs-secrets
+            -e XDG_DATA_HOME=/var/lib/hyprstream
+            -e HOME=/var/lib/hyprstream
+          )
+
+          # Step 1: bootstrap credentials (one-shot, exits on completion).
+          # Uses the image ENTRYPOINT [/hyprstream] directly — no shell needed.
+          echo "Bootstrapping credentials…"
+          podman run --rm \
+            "${VOL_ARGS[@]}" \
+            "$SMOKE_IMAGE" \
+            wizard --non-interactive --bootstrap-only
+
+          # Step 2: start the OAuth service in detached mode (long-running).
+          # Use --name so we can inspect/logs later. No --rm so logs survive.
+          echo "Starting OAuth service…"
+          podman run -d --name "$SMOKE_CONTAINER" \
+            -p "127.0.0.1:${SMOKE_PORT}:6791" \
+            "${VOL_ARGS[@]}" \
+            "$SMOKE_IMAGE" \
+            service start oauth --foreground --ipc
+
+          # Wait up to 120 s for /health, watching for an early exit.
+          echo "Waiting for 127.0.0.1:${SMOKE_PORT} to serve /health…"
+          ok=0
+          refusal=0
+          for i in $(seq 1 60); do
+            if curl -sf --max-time 3 "http://127.0.0.1:${SMOKE_PORT}/health"; then
+              ok=1
+              break
+            fi
+            if [ "$(podman inspect --format '{{.State.Status}}' "$SMOKE_CONTAINER")" != "running" ]; then
+              # The container exited before serving. The only acceptable exit
+              # is the deployment-trust refusal: it proves startup reached
+              # trust enforcement on the new runtime base.
+              if podman logs "$SMOKE_CONTAINER" 2>&1 | grep -q "deployment CA root"; then
+                refusal=1
+              else
+                echo "::error::Container exited before /health responded, without the recognized deployment-trust refusal."
+                echo "=== container logs (last 80 lines) ==="
+                podman logs "$SMOKE_CONTAINER" 2>&1 | tail -80
+                exit 1
+              fi
+              break
+            fi
+            sleep 2
+          done
+
+          if [ "$ok" = "1" ]; then
+            echo "SMOKE_OUTCOME=served" >> "$GITHUB_ENV"
+            echo ""
+            echo "OK: OAuth service is serving /health."
+          elif [ "$refusal" = "1" ]; then
+            echo "SMOKE_OUTCOME=trust-refusal" >> "$GITHUB_ENV"
+            echo "OK: service started on the runtime base and refused cleanly at deployment-trust enforcement (no CA in a bare CI container — expected)."
+            echo "=== container logs (last 20 lines) ==="
+            podman logs "$SMOKE_CONTAINER" 2>&1 | tail -20
+          else
+            echo "::error::Timeout: container stayed up but /health did not respond within 120 s."
+            echo "=== container logs (last 80 lines) ==="
+            podman logs "$SMOKE_CONTAINER" 2>&1 | tail -80
+            exit 1
+          fi
+
+      # ── Verify uid of the smoke container ─────────────────────────────
+      # Belt-and-suspenders: the image-config check above proves the
+      # declared user; this proves the smoke container actually got it.
+      # A missing container is a hard failure — an absent target must never
+      # read as a passing assertion. `podman top` reads the host's /proc,
+      # so the distroless image needs no `id` binary for the live probe.
+      - name: Assert smoke container runs as uid 65532
+        run: |
+          set -euo pipefail
+          if ! podman container exists "$SMOKE_CONTAINER"; then
+            echo "::error::Smoke container is missing — the serving step never created it."
+            exit 1
+          fi
+          state="$(podman inspect --format '{{.State.Status}}' "$SMOKE_CONTAINER")"
+          if [ "$state" = "running" ]; then
+            uid="$(podman top "$SMOKE_CONTAINER" user | tail -n +2 | head -1)"
+            echo "Running uid: $uid"
+            if [ "$uid" != "65532" ]; then
+              echo "::error::Process runs as uid '$uid' — expected 65532."
+              exit 1
+            fi
+            echo "OK: live process runs as uid 65532."
+          elif [ "${SMOKE_OUTCOME:-}" = "trust-refusal" ]; then
+            # The accepted trust-refusal exit leaves no live process to probe;
+            # verify the user the exited container was created with.
+            user="$(podman inspect --format '{{.Config.User}}' "$SMOKE_CONTAINER")"
+            echo "Exited container user: $user"
+            if [ "$user" != "65532:65532" ]; then
+              echo "::error::Smoke container was created as '$user' — expected 65532:65532."
+              exit 1
+            fi
+            echo "OK: container ran as 65532:65532 (exited on the accepted trust refusal)."
+          else
+            echo "::error::Container is '$state' without an accepted outcome — cannot verify the running uid."
+            exit 1
+          fi
+
+      # Always clean up, even on failure: the runner pool is shared and
+      # long-lived, so containers, per-run image tags, and scratch dirs must
+      # not accumulate across runs.
+      - name: Cleanup container, image, and scratch dirs
+        if: always()
+        run: |
+          podman rm -f "$SMOKE_CONTAINER" 2>/dev/null || true
+          podman rmi "$SMOKE_IMAGE" 2>/dev/null || true
+          if [ -n "${SMOKE_TMP:-}" ]; then
+            # Files the container wrote are owned by a subuid of the runner
+            # user; delete them inside the user namespace where they are ours.
+            podman unshare rm -rf "$SMOKE_TMP" || rm -rf "$SMOKE_TMP"
+          fi

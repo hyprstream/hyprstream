@@ -45,8 +45,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 /// Main configuration for git2db operations
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[derive(Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Git2DBConfig {
     /// Repository management configuration
     pub repository: RepositoryConfig,
@@ -68,7 +67,6 @@ pub struct Git2DBConfig {
     #[serde(default)]
     pub xet: XetConfig,
 }
-
 
 impl Git2DBConfig {
     /// Create a configuration builder with git2db defaults
@@ -140,7 +138,7 @@ impl Git2DBConfig {
             .set_default("network.retry_base_delay_ms", 500u64)?
             .set_default("network.retry_max_delay_secs", 10u64)?
             .set_default("network.user_agent", format!("git2db/{}", crate::VERSION))?
-            .set_default("network.use_credential_helper", true)?
+            .set_default("network.use_credential_helper", false)?
             .set_default("performance.max_repo_cache", 100)?
             .set_default("performance.repo_cache_ttl_secs", 300u64)?
             .set_default("performance.auto_cleanup", true)?
@@ -279,10 +277,23 @@ pub struct NetworkConfig {
     /// Personal access token (e.g., for GitHub, GitLab, Hugging Face)
     /// Can also be set via GIT2DB_NETWORK__ACCESS_TOKEN env var
     pub access_token: Option<String>,
+    /// The exact origin host (e.g. `"github.com"`) that `access_token` is
+    /// bound to. When set, the default clone path attaches the token scoped to
+    /// this host — it is only offered to a remote whose URL host matches. When
+    /// unset, the token is **not** attached to the default clone path at all
+    /// (fail-closed against exfiltration to a caller-selected remote). See
+    /// issue #1429.
+    #[serde(default)]
+    pub access_token_host: Option<String>,
 }
 
 fn default_use_credential_helper() -> bool {
-    true
+    // Default off: ambient credential discovery (git credential helper,
+    // ~/.gitconfig, SSH agent) is an explicit opt-in. The secure default for
+    // git2db clones is strict certificates + ExplicitOnly auth, so an
+    // untrusted/forge-facing fetch cannot pick up operator credentials. See
+    // issue #1429.
+    false
 }
 
 fn default_network_timeout_secs() -> u64 {
@@ -325,7 +336,6 @@ fn default_max_concurrent_ops() -> usize {
     10
 }
 
-
 impl Default for NetworkConfig {
     fn default() -> Self {
         Self {
@@ -337,6 +347,7 @@ impl Default for NetworkConfig {
             user_agent: default_user_agent(),
             use_credential_helper: default_use_credential_helper(),
             access_token: None,
+            access_token_host: None,
         }
     }
 }
@@ -536,6 +547,7 @@ mod tests {
             user_agent: "test-agent".to_owned(),
             use_credential_helper: true,
             access_token: Some("test-token".to_owned()),
+            access_token_host: None,
         };
         assert_eq!(network_config.timeout_secs, 120);
         assert_eq!(network_config.max_retries, 5);
@@ -641,7 +653,6 @@ impl Default for WorktreeConfig {
         }
     }
 }
-
 
 /// XET large file storage configuration
 ///

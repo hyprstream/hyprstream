@@ -1,0 +1,97 @@
+{
+  "contract_version": "v1",
+  "implementation_merge": "6440b151dcc0238a0f92d877f2052ce2271395d8",
+  "deployment_source_revision": "995fc622ae08b2baa1983646419ecccf4fe6a386",
+  "contract_evidence": {
+    "document_id": "inference-service-to-metal-runtime-contract-2026-07-26",
+    "producer_prs": {
+      "implementation": 1356,
+      "publisher": 1358,
+      "immutable_index": 1360
+    }
+  },
+  "image": {
+    "repository": "ghcr.io/hyprstream/hyprstream",
+    "index_digest": "sha256:fbd85ef1c61401c92bcaa85092187679e547f95afa5431aec83018010a52b0ce",
+    "publisher_evidence": {
+      "status": "verified",
+      "reference": "https://github.com/hyprstream/hyprstream/actions/runs/30242489019"
+    }
+  },
+  "required_platform_intent": {
+    "network_discovery": true,
+    "enforcing_mac": true
+  },
+  "routing": {
+    "canonical_first_hop_route": "authenticated-inference-rpc",
+    "first_hop": "load-balanced",
+    "second_hop": "replica-pinned",
+    "discovery_registration": "not-a-pool"
+  },
+  "lifecycle": {
+    "drain_order": [
+      "remove-from-first-hop",
+      "stop-new-admission",
+      "best-effort-completion-window",
+      "authenticated-shutdown-or-sigterm",
+      "transport-drain",
+      "termination-timeout",
+      "process-exit-unloads-engine"
+    ],
+    "restart_on_failure": true
+  },
+  "services": [
+    {
+      "inference_service_id": "inference-cpu-0",
+      "unit_name": "inference-cpu-0",
+      "container_name": "inference-cpu-0",
+      "replica": 0,
+      "listen_endpoint": { "transport": "udp", "address": "0.0.0.0", "port": 7440 },
+      "advertised_reach_endpoint": { "scheme": "quic", "host": "10.31.1.31", "port": 7440, "path": "/moq" },
+      "health_endpoint": { "transport": "authenticated-inference-ipc", "socket": "inference-cpu-0.sock" },
+      "direct_probe": {
+        "authentication_scope": "query",
+        "readiness_expectation": "isReady=true",
+        "health_expectation": "modelLoaded=true,status=ok"
+      },
+      "pds_ownership": { "pds_id": "pds-a", "owner_key": "inference-cpu-0" },
+      "model": {
+        "path": "/models/demo",
+        "reference": "model://pds-a/demo/replica-0",
+        "oid": "0123456789abcdef0123456789abcdef01234567",
+        "config_reference": "config://pds-a/inference-cpu-0"
+      },
+      "identity_reference": "identity://inference",
+      "credential_projection_reference": "projection://pds-a/inference-cpu-0",
+      "cpu_budget_cores": 4,
+      "memory_budget_mib": 8192,
+      "inference_isolation_profile": "dedicated-process"
+    },
+    {
+      "inference_service_id": "inference-cpu-1",
+      "unit_name": "inference-cpu-1",
+      "container_name": "inference-cpu-1",
+      "replica": 1,
+      "listen_endpoint": { "transport": "udp", "address": "0.0.0.0", "port": 7441 },
+      "advertised_reach_endpoint": { "scheme": "quic", "host": "10.31.1.31", "port": 7441, "path": "/moq" },
+      "health_endpoint": { "transport": "authenticated-inference-ipc", "socket": "inference-cpu-1.sock" },
+      "direct_probe": {
+        "authentication_scope": "query",
+        "readiness_expectation": "isReady=true",
+        "health_expectation": "modelLoaded=true,status=ok"
+      },
+      "pds_ownership": { "pds_id": "pds-a", "owner_key": "inference-cpu-1" },
+      "model": {
+        "path": "/models/demo",
+        "reference": "model://pds-a/demo/replica-1",
+        "oid": "0123456789abcdef0123456789abcdef01234567",
+        "config_reference": "config://pds-a/inference-cpu-1"
+      },
+      "identity_reference": "identity://inference",
+      "credential_projection_reference": "projection://pds-a/inference-cpu-1",
+      "cpu_budget_cores": 4,
+      "memory_budget_mib": 8192,
+      "inference_isolation_profile": "dedicated-process"
+    }
+  ]
+}
