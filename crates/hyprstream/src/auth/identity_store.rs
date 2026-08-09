@@ -169,6 +169,7 @@ fn missing_in_readonly(secrets_dir: &std::path::Path, name: &str) -> anyhow::Err
 /// credentials/
 ///   ca-key            # CA private key (policy service only)
 ///   ca-pubkey         # CA verifying key (public, all services)
+///   ca-mldsa-pubkey   # CA derived ML-DSA-65 verifying key (public, all services)
 ///   {service}/
 ///     signing-key     # service's own Ed25519 private key
 ///     service-jwt     # CA-signed JWT certificate
@@ -311,6 +312,36 @@ pub fn load_ca_verifying_key(credentials_dir: &std::path::Path) -> Result<Verify
 /// Write the CA verifying key to the credentials directory.
 pub fn write_ca_verifying_key(credentials_dir: &std::path::Path, key: &VerifyingKey) -> Result<()> {
     write_secret(credentials_dir, "ca-pubkey", key.as_bytes())
+}
+
+/// Load the CA's derived ML-DSA-65 verifying key (public, distributed to all
+/// services).
+///
+/// This is the post-quantum half of the CA JWT composite pair: the CA signs
+/// hybrid service WITs with `(derive_mesh_mldsa_key(ca_jwt_key), ca_jwt_key)`,
+/// and verifiers resolve the composite kid to this key plus `ca-pubkey`.
+pub fn load_ca_ml_dsa_verifying_key(
+    credentials_dir: &std::path::Path,
+) -> Result<hyprstream_rpc::crypto::pq::MlDsaVerifyingKey> {
+    const NAME: &str = "ca-mldsa-pubkey";
+    if let Some(bytes) = read_secret(credentials_dir, NAME)? {
+        hyprstream_rpc::crypto::pq::ml_dsa_vk_from_bytes(&bytes)
+            .map_err(|e| anyhow!("invalid ca-mldsa-pubkey: {e}"))
+    } else {
+        Err(missing_in_readonly(credentials_dir, NAME))
+    }
+}
+
+/// Write the CA's derived ML-DSA-65 verifying key to the credentials directory.
+pub fn write_ca_ml_dsa_verifying_key(
+    credentials_dir: &std::path::Path,
+    key: &hyprstream_rpc::crypto::pq::MlDsaVerifyingKey,
+) -> Result<()> {
+    write_secret(
+        credentials_dir,
+        "ca-mldsa-pubkey",
+        &hyprstream_rpc::crypto::pq::ml_dsa_vk_bytes(key),
+    )
 }
 
 fn provisioned_service_jwt_dir(

@@ -712,9 +712,18 @@ async fn do_bootstrap(
                 identity_store::write_ca_verifying_key(&credentials_dir, &ca_jwt_key.verifying_key())?;
             }
         }
-        // Always sync signing-key and verifying key (derived from root_key, harmless to overwrite)
+        // Always sync signing-key and verifying keys (derived from root_key, harmless to overwrite).
+        // The ML-DSA-65 verifying key is the post-quantum half of the CA JWT
+        // composite pair: hybrid service JWTs are signed with the exact pair
+        // (derive_mesh_mldsa_key(ca_jwt_key), ca_jwt_key), and verifiers need
+        // this public key on disk to resolve the composite kid.
         identity_store::write_secret(&credentials_dir, "signing-key", &root_key.to_bytes())?;
         identity_store::write_ca_verifying_key(&credentials_dir, &ca_jwt_key.verifying_key())?;
+        let ca_pq = hyprstream_rpc::node_identity::derive_mesh_mldsa_key(&ca_jwt_key);
+        identity_store::write_ca_ml_dsa_verifying_key(
+            &credentials_dir,
+            &hyprstream_rpc::crypto::pq::ml_dsa_sk_to_vk(&ca_pq),
+        )?;
 
         // Generate independent keypairs for each registered service
         use hyprstream_service::list_factories;

@@ -385,6 +385,13 @@ pub struct ServiceContext {
     #[allow(clippy::disallowed_types)]
     ml_dsa_verifying_keys:
         std::sync::Arc<std::sync::RwLock<Vec<hyprstream_rpc::crypto::pq::MlDsaVerifyingKey>>>,
+
+    /// The CA's derived ML-DSA-65 verifying key — the post-quantum half of the
+    /// CA JWT composite pair. Paired with `ca_verifying_key` it lets the key
+    /// sources resolve the composite kid of hybrid service JWTs.
+    ///
+    /// In multi-process mode, loaded from the `ca-mldsa-pubkey` credential.
+    ca_ml_dsa_verifying_key: Option<hyprstream_rpc::crypto::pq::MlDsaVerifyingKey>,
 }
 
 impl ServiceContext {
@@ -415,6 +422,7 @@ impl ServiceContext {
                 #[allow(clippy::disallowed_types)]
                 std::sync::Arc::new(std::sync::RwLock::new(Vec::new()))
             },
+            ca_ml_dsa_verifying_key: None,
         }
     }
 
@@ -472,6 +480,16 @@ impl ServiceContext {
         self
     }
 
+    /// Set the CA's derived ML-DSA-65 verifying key (the post-quantum half of
+    /// the CA JWT composite pair used for hybrid service JWTs).
+    pub fn with_ca_ml_dsa_verifying_key(
+        mut self,
+        key: hyprstream_rpc::crypto::pq::MlDsaVerifyingKey,
+    ) -> Self {
+        self.ca_ml_dsa_verifying_key = Some(key);
+        self
+    }
+
     /// Swap the signing key to an independent per-service key.
     ///
     /// Used in IPC mode for non-policy services: replaces the root/CA key
@@ -501,8 +519,16 @@ impl ServiceContext {
             "hyprstream-jwt-v1",
         );
         let ca_verifying_key = ca_signing_key.verifying_key();
+        // The CA JWT composite pair: service JWTs must be hybrid because the
+        // dispatch plane enforces a Hybrid crypto policy with no bypass. The
+        // ML-DSA-65 half is derived from the CA JWT signing key so the pair
+        // stays a single Ed25519 secret.
+        let ca_pq = hyprstream_rpc::node_identity::derive_mesh_mldsa_key(&ca_signing_key);
+        let ca_pq_vk = hyprstream_rpc::crypto::pq::ml_dsa_sk_to_vk(&ca_pq);
 
-        let mut ctx = self.with_ca_verifying_key(ca_verifying_key);
+        let mut ctx = self
+            .with_ca_verifying_key(ca_verifying_key)
+            .with_ca_ml_dsa_verifying_key(ca_pq_vk.clone());
 
         let now = chrono::Utc::now().timestamp();
         let expiry = now + 7 * 86_400; // 7 days
@@ -567,7 +593,12 @@ impl ServiceContext {
                     .with_audience(Some(iss.clone()));
             }
 
-            let jwt = hyprstream_rpc::auth::jwt::encode_service_jwt(&claims, &ca_signing_key);
+            let jwt = hyprstream_rpc::auth::jwt::encode_service_jwt_hybrid(
+                &claims,
+                &ca_signing_key,
+                &ca_pq,
+                &ca_pq_vk,
+            );
 
             ctx = ctx.with_service_key(name, service_key);
 
@@ -720,12 +751,20 @@ impl ServiceContext {
             let source = source.with_ml_dsa_verifying_keys(self.ml_dsa_verifying_keys.clone());
             // Authoritative local CA key for offline service-JWT resolution
             // (no dependency on the HTTP /oauth/jwks endpoint at startup).
-            let source = source.with_local_ca_key(self.jwt_verifying_key());
+            let mut source = source.with_local_ca_key(self.jwt_verifying_key());
+            // The CA composite pair (derived ML-DSA-65 + CA Ed25519) resolves
+            // hybrid service JWTs offline for the same startup-ordering reason.
+            if let Some(pq_vk) = self.ca_ml_dsa_verifying_key.clone() {
+                source = source.with_local_ca_composite(pq_vk, self.jwt_verifying_key());
+            }
             std::sync::Arc::new(source)
         } else {
             let source =
                 hyprstream_rpc::auth::ClusterKeySource::new(self.jwt_verifying_key(), issuer_url);
-            let source = source.with_ml_dsa_verifying_keys(self.ml_dsa_verifying_keys.clone());
+            let mut source = source.with_ml_dsa_verifying_keys(self.ml_dsa_verifying_keys.clone());
+            if let Some(pq_vk) = self.ca_ml_dsa_verifying_key.clone() {
+                source = source.with_ca_composite_key(pq_vk);
+            }
             std::sync::Arc::new(source)
         }
     }

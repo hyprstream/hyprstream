@@ -326,6 +326,39 @@ pub fn encode_service_jwt(claims: &Claims, signing_key: &SigningKey) -> String {
     encode_with_header(&claims, signing_key, &header)
 }
 
+/// Encode a composite ML-DSA-65-Ed25519 service WIT (`typ: "wit+jwt"`).
+///
+/// Per draft-ietf-jose-pq-composite-sigs, the signature is
+/// `ml_dsa_sig (3309 bytes) ∥ ed25519_sig (64 bytes)` over
+/// `base64url(header).base64url(payload)`, and the `kid` is the
+/// [`composite_kid`] thumbprint binding the exact key pair — the shape
+/// [`parse_composite_dispatch`] and [`decode_composite`] verify.
+/// Automatically assigns a `jti` if the claims don't already have one.
+pub fn encode_service_jwt_hybrid(
+    claims: &Claims,
+    ed: &SigningKey,
+    ml_dsa: &crate::crypto::pq::MlDsaSigningKey,
+    ml_dsa_vk: &crate::crypto::pq::MlDsaVerifyingKey,
+) -> String {
+    let kid = composite_kid(ml_dsa_vk, &ed.verifying_key());
+    let header = format!(
+        r#"{{"alg":"ML-DSA-65-Ed25519","typ":"wit+jwt","kid":"{}"}}"#,
+        kid
+    );
+    let claims = ensure_jti(claims);
+    let header_b64 = URL_SAFE_NO_PAD.encode(&header);
+    let payload_json = serde_json::to_string(claims.as_ref()).unwrap_or_else(|_e| {
+        #[cfg(not(target_arch = "wasm32"))]
+        tracing::error!("JWT claims serialization failed: {}", _e);
+        "{}".to_owned()
+    });
+    let payload_b64 = URL_SAFE_NO_PAD.encode(&payload_json);
+    let signing_input = format!("{header_b64}.{payload_b64}");
+    let mut signature = crate::crypto::pq::ml_dsa_sign(ml_dsa, signing_input.as_bytes());
+    signature.extend_from_slice(&ed.sign(signing_input.as_bytes()).to_bytes());
+    format!("{signing_input}.{}", URL_SAFE_NO_PAD.encode(signature))
+}
+
 fn ensure_jti(claims: &Claims) -> std::borrow::Cow<'_, Claims> {
     if claims.jti.is_some() {
         std::borrow::Cow::Borrowed(claims)
@@ -768,6 +801,40 @@ mod tests {
         let separately_valid = composite_token_with_keys("wit+jwt", &pq_sk, &pq, &ed_sk);
         assert!(matches!(
             decode_composite(&separately_valid, &pq, &ed, None, &dispatch),
+            Err(JwtError::InvalidSignature)
+        ));
+    }
+
+    /// A freshly minted hybrid service WIT carries the composite alg/typ/kid
+    /// shape the dispatch path verifies, and round-trips through the real
+    /// composite verification (`parse_composite_dispatch` + `decode_composite`).
+    #[test]
+    fn hybrid_service_jwt_round_trips_composite_dispatch() {
+        let (pq, pq_vk) = crate::crypto::pq::ml_dsa_generate_keypair();
+        let ed = make_key(0x51);
+        let claims = Claims::new("service:discovery".to_owned(), 0, 9_999_999_999);
+        let token = encode_service_jwt_hybrid(&claims, &ed, &pq, &pq_vk);
+
+        let header = parse_protected_header(&token).unwrap();
+        assert_eq!(header.alg, "ML-DSA-65-Ed25519");
+        assert_eq!(header.typ, "wit+jwt");
+        assert_eq!(header.kid, composite_kid(&pq_vk, &ed.verifying_key()));
+
+        let dispatch = parse_composite_dispatch(&token, &["wit+jwt"]).unwrap();
+        let verified =
+            decode_composite(&token, &pq_vk, &ed.verifying_key(), None, &dispatch).unwrap();
+        assert_eq!(verified.sub, "service:discovery");
+        assert!(verified.jti.is_some(), "a jti must be assigned when absent");
+
+        // Neither half alone verifies: a wrong Ed25519 or ML-DSA key fails closed.
+        let other_ed = make_key(0x52);
+        assert!(matches!(
+            decode_composite(&token, &pq_vk, &other_ed.verifying_key(), None, &dispatch),
+            Err(JwtError::InvalidSignature)
+        ));
+        let (_, other_pq_vk) = crate::crypto::pq::ml_dsa_generate_keypair();
+        assert!(matches!(
+            decode_composite(&token, &other_pq_vk, &ed.verifying_key(), None, &dispatch),
             Err(JwtError::InvalidSignature)
         ));
     }

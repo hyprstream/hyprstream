@@ -380,6 +380,108 @@ fn published_service_key_response(
 
 /// Confirmation material is mandatory: an absent or malformed `cnf.jwk` must
 /// never turn a valid CA token into authority for arbitrary key material.
+/// Claims for a renewed service JWT.
+///
+/// `aud` is stamped alongside `iss` — the same shape the provisioning path
+/// mints — because strict composite audience validation rejects an aud-less
+/// token on every dispatch, and the on-disk reuse predicate treats a token
+/// that does not bind the local issuer URL in both claims as stale.
+fn renewed_service_claims(
+    subject: String,
+    now: i64,
+    expires_at: i64,
+    issuer: &str,
+    tenant: String,
+    cnf_key: &[u8; 32],
+) -> hyprstream_rpc::auth::Claims {
+    let mut claims = hyprstream_rpc::auth::Claims::new(subject, now, expires_at)
+        .with_tenant(tenant)
+        .with_cnf_jwk(cnf_key);
+    if !issuer.is_empty() {
+        claims = claims
+            .with_issuer(issuer.to_owned())
+            .with_audience(Some(issuer.to_owned()));
+    }
+    claims
+}
+
+/// Verify a service JWT presented to `registerServiceKey`.
+///
+/// Hybrid (`ML-DSA-65-Ed25519`) tokens resolve their composite kid through
+/// the same key-source path the dispatch plane uses, with the CA's own
+/// derived pair as the authoritative fallback (PolicyService IS the CA, so it
+/// can reconstruct the exact pair the hybrid service-JWT mint signs with); an
+/// unknown kid fails closed. Classical EdDSA tokens verify against the CA key
+/// only when `policy` permits classical — matching the dispatch alg gate.
+fn verify_service_registration_jwt(
+    service_jwt: &str,
+    key_source: Option<&dyn hyprstream_rpc::auth::JwtKeySource>,
+    ca_jwt_key: &SigningKey,
+    policy: hyprstream_rpc::crypto::CryptoPolicy,
+) -> Result<hyprstream_rpc::auth::Claims> {
+    let is_composite = hyprstream_rpc::auth::jwt::header_alg(service_jwt)
+        .ok()
+        .flatten()
+        .is_some_and(|alg| alg == "ML-DSA-65-Ed25519");
+    if is_composite {
+        let dispatch =
+            hyprstream_rpc::auth::jwt::parse_composite_dispatch(service_jwt, &["wit+jwt"])
+                .map_err(|e| anyhow!("Invalid service JWT: {e}"))?;
+        let pair = key_source
+            .and_then(|ks| ks.composite_pair(dispatch.kid()))
+            .or_else(|| {
+                let pq_vk = hyprstream_rpc::crypto::pq::ml_dsa_sk_to_vk(
+                    &hyprstream_rpc::node_identity::derive_mesh_mldsa_key(ca_jwt_key),
+                );
+                let ed_vk = ca_jwt_key.verifying_key();
+                let kid = hyprstream_rpc::auth::composite_kid(&pq_vk, &ed_vk);
+                (kid == dispatch.kid()).then(|| {
+                    hyprstream_rpc::auth::CompositeKeyPair::verifying(
+                        kid,
+                        pq_vk,
+                        ed_vk,
+                        hyprstream_rpc::auth::CompositePairRole::Policy,
+                        hyprstream_rpc::auth::CompositePairState::Active,
+                        0,
+                        i64::MAX,
+                    )
+                })
+            })
+            .ok_or_else(|| anyhow!("Invalid service JWT: unknown composite kid"))?;
+        // Signing-domain separation: service certification is the Policy
+        // domain. The OAuth-role pair legitimately signs browser and workload
+        // WITs (`wit+jwt` too), so accepting its kid here would let anyone
+        // holding an OAuth-plane token mint an installable service identity
+        // with an arbitrary `cnf`. Only Policy-role pairs — the ledger's
+        // Policy slot and the derived CA pair, which is constructed with the
+        // Policy role — may certify service keys.
+        anyhow::ensure!(
+            pair.role() == hyprstream_rpc::auth::CompositePairRole::Policy,
+            "Invalid service JWT: composite pair role is not authorized for service certification"
+        );
+        hyprstream_rpc::auth::jwt::decode_composite(
+            service_jwt,
+            pair.ml_dsa(),
+            pair.ed25519(),
+            None,
+            &dispatch,
+        )
+        .map_err(|e| anyhow!("Invalid service JWT: {e}"))
+    } else {
+        anyhow::ensure!(
+            !policy.uses_pq(),
+            "Invalid service JWT: Hybrid crypto policy requires a post-quantum alg; \
+             classical-only token rejected"
+        );
+        hyprstream_rpc::auth::jwt::decode_with_key(
+            service_jwt,
+            &ca_jwt_key.verifying_key(),
+            None,
+        )
+        .map_err(|e| anyhow!("Invalid service JWT: {e}"))
+    }
+}
+
 fn validate_service_key_registration(
     claims: &hyprstream_rpc::auth::Claims,
     service_name: &str,
@@ -1643,11 +1745,12 @@ impl PolicyHandler for PolicyService {
         // Verify the caller is who they claim to be.
         // The service JWT must be signed by the CA (our jwt_signing_key) and
         // its subject must match "service:{serviceName}".
-        let claims = hyprstream_rpc::auth::jwt::decode_with_key(
+        let claims = verify_service_registration_jwt(
             &data.service_jwt,
-            &self.jwt_signing_key.verifying_key(),
-            None,
-        ).map_err(|e| anyhow!("Invalid service JWT: {e}"))?;
+            self.jwt_key_source.as_deref(),
+            &self.jwt_signing_key,
+            hyprstream_rpc::envelope::global_verify_policy(),
+        )?;
 
         // Verify the provided verifying key matches the JWT's cnf.jwk claim.
         let vk_bytes: [u8; 32] = data.verifying_key.as_slice().try_into()
@@ -1718,10 +1821,8 @@ impl PolicyHandler for PolicyService {
 
         let issuer = self.default_audience.clone().unwrap_or_default();
         let tenant = ctx.domain()?;
-        let claims = hyprstream_rpc::auth::Claims::new(subject.clone(), now, expires_at)
-            .with_issuer(issuer)
-            .with_tenant(tenant)
-            .with_cnf_jwk(vk.as_bytes());
+        let claims =
+            renewed_service_claims(subject.clone(), now, expires_at, &issuer, tenant, &ctx.cnf);
 
         let token = match self.sign_token(&claims, true).await {
             Ok(t) => t,
@@ -2012,6 +2113,209 @@ pub(crate) async fn watch_policy_file(
 mod tests {
     use super::*;
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+
+    /// Mint the exact hybrid service JWT a fresh bootstrap produces for
+    /// `service:{name}`: composite-signed by the CA pair derived from
+    /// `ca_jwt_key`.
+    fn bootstrap_hybrid_service_jwt(ca_jwt_key: &SigningKey, name: &str) -> String {
+        let now = chrono::Utc::now().timestamp();
+        let claims =
+            hyprstream_rpc::auth::Claims::new(format!("service:{name}"), now, now + 3600);
+        let ca_pq = hyprstream_rpc::node_identity::derive_mesh_mldsa_key(ca_jwt_key);
+        let ca_pq_vk = hyprstream_rpc::crypto::pq::ml_dsa_sk_to_vk(&ca_pq);
+        hyprstream_rpc::auth::jwt::encode_service_jwt_hybrid(&claims, ca_jwt_key, &ca_pq, &ca_pq_vk)
+    }
+
+    /// A freshly bootstrapped hybrid service JWT passes the registration
+    /// verification under a Hybrid policy — through the dispatch-style
+    /// key-source resolution when the source carries the CA composite pair,
+    /// and through the CA's own derived pair when no key source is wired.
+    #[test]
+    fn registration_accepts_hybrid_service_jwt_under_hybrid_policy() {
+        let ca = SigningKey::from_bytes(&[0x2A; 32]);
+        let jwt = bootstrap_hybrid_service_jwt(&ca, "discovery");
+
+        // Key-source path: the same composite resolution the dispatch plane uses.
+        let ca_pq = hyprstream_rpc::node_identity::derive_mesh_mldsa_key(&ca);
+        let key_source = hyprstream_rpc::auth::ClusterKeySource::new(
+            ca.verifying_key(),
+            "http://localhost:9080".to_owned(),
+        )
+        .with_ca_composite_key(hyprstream_rpc::crypto::pq::ml_dsa_sk_to_vk(&ca_pq));
+        let claims = verify_service_registration_jwt(
+            &jwt,
+            Some(&key_source),
+            &ca,
+            hyprstream_rpc::crypto::CryptoPolicy::Hybrid,
+        )
+        .unwrap();
+        assert_eq!(claims.sub, "service:discovery");
+
+        // CA-fallback path: no key source wired, PolicyService derives the pair.
+        let claims = verify_service_registration_jwt(
+            &jwt,
+            None,
+            &ca,
+            hyprstream_rpc::crypto::CryptoPolicy::Hybrid,
+        )
+        .unwrap();
+        assert_eq!(claims.sub, "service:discovery");
+    }
+
+    /// A classical EdDSA service JWT is rejected at registration under a
+    /// Hybrid policy (matching the dispatch alg gate), and accepted only
+    /// under Classical.
+    #[test]
+    fn registration_rejects_classical_service_jwt_under_hybrid_policy() {
+        let ca = SigningKey::from_bytes(&[0x2B; 32]);
+        let now = chrono::Utc::now().timestamp();
+        let claims =
+            hyprstream_rpc::auth::Claims::new("service:discovery".to_owned(), now, now + 3600);
+        let jwt = hyprstream_rpc::auth::jwt::encode_service_jwt(&claims, &ca);
+
+        assert!(verify_service_registration_jwt(
+            &jwt,
+            None,
+            &ca,
+            hyprstream_rpc::crypto::CryptoPolicy::Hybrid,
+        )
+        .is_err());
+        assert!(verify_service_registration_jwt(
+            &jwt,
+            None,
+            &ca,
+            hyprstream_rpc::crypto::CryptoPolicy::Classical,
+        )
+        .is_ok());
+    }
+
+    /// A renewed service JWT binds the issuer URL in BOTH `iss` and `aud`
+    /// (matching the provisioning mint, which strict composite audience
+    /// validation requires); with no issuer configured, neither is stamped.
+    #[test]
+    fn renewed_service_claims_bind_issuer_and_audience() {
+        let cnf = [7u8; 32];
+        let claims = renewed_service_claims(
+            "service:model".to_owned(),
+            100,
+            200,
+            "http://localhost:9080",
+            "tenant-a.example".to_owned(),
+            &cnf,
+        );
+        assert_eq!(claims.iss, "http://localhost:9080");
+        assert_eq!(claims.aud.as_deref(), Some("http://localhost:9080"));
+        assert_eq!(claims.sub, "service:model");
+
+        let bare = renewed_service_claims(
+            "service:model".to_owned(),
+            100,
+            200,
+            "",
+            "tenant-a.example".to_owned(),
+            &cnf,
+        );
+        assert!(bare.iss.is_empty());
+        assert!(bare.aud.is_none());
+    }
+
+    /// Signing-domain separation: a `wit+jwt` composite-signed by the ACTIVE
+    /// OAUTH-role pair — the pair that legitimately signs browser/workload
+    /// WITs — must be rejected by the registration verification even though
+    /// its kid resolves, while the same token signed by a Policy-role pair
+    /// is accepted. Otherwise a compromised OAuth signing key could mint an
+    /// installable service identity with an arbitrary `cnf`.
+    #[test]
+    fn registration_rejects_oauth_role_pair_and_accepts_policy_role_pair() {
+        use hyprstream_rpc::auth::{
+            CompositeKeyPair, CompositeKeySet, CompositePairRole, CompositePairState,
+        };
+        use std::sync::Arc;
+
+        let ca = SigningKey::from_bytes(&[0x2E; 32]);
+        let now = chrono::Utc::now().timestamp();
+        let claims =
+            hyprstream_rpc::auth::Claims::new("service:discovery".to_owned(), now, now + 3600);
+
+        let mut role_pairs = Vec::new();
+        for (seed, role) in [
+            (0x2Fu8, CompositePairRole::OAuth),
+            (0x30u8, CompositePairRole::Policy),
+        ] {
+            let ed = SigningKey::from_bytes(&[seed; 32]);
+            let (pq, pq_vk) = hyprstream_rpc::crypto::pq::ml_dsa_generate_keypair();
+            let jwt = crate::auth::jwt::encode_composite_service_jwt(&claims, &pq, &ed);
+            let kid = crate::auth::jwt::composite_kid(&pq_vk, &ed.verifying_key());
+            role_pairs.push((
+                jwt,
+                CompositeKeyPair::signing(
+                    kid,
+                    Arc::new(pq),
+                    Arc::new(ed),
+                    role,
+                    CompositePairState::Active,
+                    0,
+                    i64::MAX,
+                ),
+            ));
+        }
+
+        let key_set = Arc::new(CompositeKeySet::default());
+        key_set
+            .publish(
+                1,
+                "role-separation".to_owned(),
+                role_pairs.iter().map(|(_, pair)| pair.clone()).collect(),
+            )
+            .unwrap();
+        let key_source = hyprstream_rpc::auth::ClusterKeySource::new(
+            ca.verifying_key(),
+            "http://localhost:9080".to_owned(),
+        )
+        .with_composite_key_set(key_set);
+
+        let (oauth_jwt, _) = &role_pairs[0];
+        assert!(
+            verify_service_registration_jwt(
+                oauth_jwt,
+                Some(&key_source),
+                &ca,
+                hyprstream_rpc::crypto::CryptoPolicy::Hybrid,
+            )
+            .is_err(),
+            "an OAuth-role pair must not certify a service identity"
+        );
+
+        let (policy_jwt, _) = &role_pairs[1];
+        let verified = verify_service_registration_jwt(
+            policy_jwt,
+            Some(&key_source),
+            &ca,
+            hyprstream_rpc::crypto::CryptoPolicy::Hybrid,
+        )
+        .unwrap();
+        assert_eq!(verified.sub, "service:discovery");
+    }
+
+    /// A composite service JWT signed by a DIFFERENT pair (unknown kid)
+    /// fails closed — neither the key source nor the CA fallback resolves it.
+    #[test]
+    fn registration_rejects_unknown_composite_kid() {
+        let ca = SigningKey::from_bytes(&[0x2C; 32]);
+        let other = SigningKey::from_bytes(&[0x2D; 32]);
+        let jwt = bootstrap_hybrid_service_jwt(&other, "discovery");
+
+        let result = verify_service_registration_jwt(
+            &jwt,
+            None,
+            &ca,
+            hyprstream_rpc::crypto::CryptoPolicy::Hybrid,
+        );
+        assert!(
+            result.is_err(),
+            "a composite kid the CA did not sign for must fail closed"
+        );
+    }
 
     async fn test_service_with_manager(
         manager: Arc<PolicyManager>,

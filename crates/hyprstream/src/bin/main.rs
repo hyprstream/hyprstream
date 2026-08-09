@@ -2477,6 +2477,16 @@ fn main() -> Result<()> {
                                             &secrets_dir,
                                         )?,
                                     );
+                                    // The CA's derived ML-DSA-65 verifying key resolves the
+                                    // composite kid of hybrid service JWTs. Absent only on
+                                    // pre-hybrid credentials; re-running the wizard writes it.
+                                    match hyprstream_core::auth::identity_store::load_ca_ml_dsa_verifying_key(&secrets_dir) {
+                                        Ok(pq_vk) => ctx = ctx.with_ca_ml_dsa_verifying_key(pq_vk),
+                                        Err(e) => tracing::warn!(
+                                            "ca-mldsa-pubkey unavailable — hybrid service JWTs will not verify \
+                                             until the wizard re-provisions credentials: {e}"
+                                        ),
+                                    }
 
                                     // Load bootstrap pubkeys (all service pubkeys) into trust store.
                                     // Service identities are hybrid by construction; a classical
@@ -2554,6 +2564,16 @@ fn main() -> Result<()> {
                                             &secrets_dir,
                                         )?,
                                     );
+                                    // The CA's derived ML-DSA-65 verifying key resolves the
+                                    // composite kid of hybrid service JWTs. Absent only on
+                                    // pre-hybrid credentials; re-running the wizard writes it.
+                                    match hyprstream_core::auth::identity_store::load_ca_ml_dsa_verifying_key(&secrets_dir) {
+                                        Ok(pq_vk) => ctx = ctx.with_ca_ml_dsa_verifying_key(pq_vk),
+                                        Err(e) => tracing::warn!(
+                                            "ca-mldsa-pubkey unavailable — hybrid service JWTs will not verify \
+                                             until the wizard re-provisions credentials: {e}"
+                                        ),
+                                    }
 
                                     // Load bootstrap pubkeys (all service pubkeys) into trust store.
                                     // Service identities are hybrid by construction; a classical
