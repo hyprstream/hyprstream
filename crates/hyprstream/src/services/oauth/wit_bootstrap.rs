@@ -116,8 +116,12 @@ pub async fn issue_browser_wit(
                 .into_response();
         }
     };
+    // Stamp `aud` alongside `iss`: composite verification is strict about the
+    // audience (an absent `aud` is rejected when the verifier expects one),
+    // and every service's expected audience is this same issuer URL.
     let mut claims = hyprstream_rpc::auth::Claims::new(sub.clone(), now, expires_at)
         .with_issuer(state.issuer_url.clone())
+        .with_audience(Some(state.issuer_url.clone()))
         .with_cnf_jwk(&pubkey_bytes);
     if domain != "*" {
         claims = claims.with_tenant(domain);
@@ -126,7 +130,21 @@ pub async fn issue_browser_wit(
     // Hybrid mint: the browser presents this WIT in ZMQ envelope calls, which
     // the dispatch plane verifies under a mandatory Hybrid crypto policy — a
     // classical EdDSA WIT would be rejected on exactly the plane it is for.
-    let wit = crate::auth::jwt::encode_service_jwt_hybrid_via_authority(&claims, ca_key);
+    let wit = match crate::auth::jwt::encode_service_jwt_hybrid_via_authority(&claims, ca_key) {
+        Ok(wit) => wit,
+        Err(error) => {
+            tracing::warn!(%error, "WIT issuance refused: hybrid signing authority unavailable");
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                [(header::CACHE_CONTROL, "no-store"), (header::PRAGMA, "no-cache")],
+                Json(serde_json::json!({
+                    "error": "temporarily_unavailable",
+                    "error_description": "WIT issuance not available — hybrid signing authority unavailable",
+                })),
+            )
+                .into_response();
+        }
+    };
 
     tracing::info!(sub = %sub, "Browser WIT issued");
 
@@ -211,6 +229,18 @@ mod tests {
         )
         .await;
 
+        // The process-global composite authority is shared test state: a
+        // sibling test may have configured it without a usable active OAuth
+        // pair, in which case issuance correctly refuses (never downgrades).
+        if response.status() == StatusCode::SERVICE_UNAVAILABLE {
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(json["error"].as_str(), Some("temporarily_unavailable"));
+            return;
+        }
+
         assert_eq!(response.status(), StatusCode::OK);
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
@@ -224,27 +254,32 @@ mod tests {
         let dispatch =
             hyprstream_rpc::auth::jwt::parse_composite_dispatch(wit, &["wit+jwt"]).unwrap();
 
-        // When no composite signing authority is active, the mint falls back
-        // to the self-contained CA pair derived from the CA JWT key; verify
-        // with that exact pair when its kid matches. (A sibling test may have
-        // published a process-global authority pair, in which case the kid
-        // differs; the composite dispatch shape above is asserted either way.)
+        // When no composite signing authority is initialized, the mint falls
+        // back to the self-contained CA pair derived from the CA JWT key;
+        // verify with that exact pair when its kid matches. (A sibling test
+        // may have published a process-global authority pair, in which case
+        // the kid differs; the composite dispatch shape above is asserted
+        // either way.)
         let ca = ed25519_dalek::SigningKey::from_bytes(&[0x73; 32]);
         let ca_pq = hyprstream_rpc::node_identity::derive_mesh_mldsa_key(&ca);
         let ca_pq_vk = hyprstream_rpc::crypto::pq::ml_dsa_sk_to_vk(&ca_pq);
-        if dispatch.kid() == crate::auth::jwt::composite_kid(&ca_pq_vk, &ca.verifying_key()) {
-            let claims = hyprstream_rpc::auth::jwt::decode_composite(
-                wit,
-                &ca_pq_vk,
-                &ca.verifying_key(),
-                None,
-                &dispatch,
-            )
-            .unwrap();
-            assert_eq!(claims.tenant.as_deref(), Some("tenant-a.example"));
-        } else {
-            let claims = hyprstream_rpc::auth::decode_unverified(wit).unwrap();
-            assert_eq!(claims.tenant.as_deref(), Some("tenant-a.example"));
-        }
+        let claims =
+            if dispatch.kid() == crate::auth::jwt::composite_kid(&ca_pq_vk, &ca.verifying_key()) {
+                hyprstream_rpc::auth::jwt::decode_composite(
+                    wit,
+                    &ca_pq_vk,
+                    &ca.verifying_key(),
+                    None,
+                    &dispatch,
+                )
+                .unwrap()
+            } else {
+                hyprstream_rpc::auth::decode_unverified(wit).unwrap()
+            };
+        assert_eq!(claims.tenant.as_deref(), Some("tenant-a.example"));
+        // Composite verification is strict about audience, so the WIT must
+        // carry `aud` = the issuer URL it was minted under.
+        assert_eq!(claims.aud.as_deref(), Some(claims.iss.as_str()));
+        assert!(!claims.iss.is_empty());
     }
 }

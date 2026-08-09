@@ -145,7 +145,17 @@ pub async fn exchange_workload_wit(
     // dispatch plane, whose mandatory Hybrid crypto policy rejects classical
     // EdDSA tokens. (The JWT-SVID below stays EdDSA — it is consumed by
     // external SPIFFE validators, not by the dispatch plane.)
-    let wit = crate::auth::jwt::encode_service_jwt_hybrid_via_authority(&claims, &ca_key);
+    let wit = match crate::auth::jwt::encode_service_jwt_hybrid_via_authority(&claims, &ca_key) {
+        Ok(wit) => wit,
+        Err(error) => {
+            tracing::warn!(%error, "WIT issuance refused: hybrid signing authority unavailable");
+            return oauth_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "temporarily_unavailable",
+                Some("WIT issuance not available — hybrid signing authority unavailable"),
+            );
+        }
+    };
 
     tracing::info!(
         source_issuer = %source.iss,

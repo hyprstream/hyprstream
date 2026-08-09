@@ -41,6 +41,7 @@ pub const NODE_CREDENTIAL_NAMES: &[&str] = &[
     "quic-key",
     "quic-cert",
     "ca-pubkey",
+    "ca-mldsa-pubkey",
     "bootstrap-pubkeys",
 ];
 
@@ -84,6 +85,7 @@ pub const ALL_CREDENTIAL_NAMES: &[&str] = &[
     "quic-cert",
     "ca-key",
     "ca-pubkey",
+    "ca-mldsa-pubkey",
     "bootstrap-pubkeys",
     "service-jwt",
 ];
