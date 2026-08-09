@@ -215,7 +215,11 @@ impl ClusterKeySource {
     /// resolves to BOTH halves (this ML-DSA key + the CA Ed25519 key).
     ///
     /// This is how hybrid service WITs — signed by the exact pair
-    /// `(derived ML-DSA, CA Ed25519)` — verify on the dispatch plane.
+    /// `(derived ML-DSA, CA Ed25519)` — verify on the dispatch plane. The
+    /// pair is registered under the Policy role: it belongs to the CA /
+    /// service-certification signing domain, so role-constrained consumers
+    /// (service-key certification, announcements) accept it while the
+    /// OAuth-role token-issuance domain stays separate.
     pub fn with_ca_composite_key(
         mut self,
         ml_dsa_vk: crate::crypto::pq::MlDsaVerifyingKey,
@@ -525,7 +529,9 @@ impl JwksKeySource {
 
     /// Bind the CA's derived ML-DSA-65 verifying key so the CA composite kid
     /// resolves to BOTH halves (this ML-DSA key + the CA Ed25519 key) for
-    /// hybrid service-JWT verification. See [`ClusterKeySource::with_ca_composite_key`].
+    /// hybrid service-JWT verification. Registered under the Policy role —
+    /// the CA / service-certification signing domain — exactly like
+    /// [`ClusterKeySource::with_ca_composite_key`].
     pub fn with_local_ca_composite(
         mut self,
         ml_dsa_vk: crate::crypto::pq::MlDsaVerifyingKey,

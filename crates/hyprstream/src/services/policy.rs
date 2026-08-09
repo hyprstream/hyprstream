@@ -448,6 +448,17 @@ fn verify_service_registration_jwt(
                 })
             })
             .ok_or_else(|| anyhow!("Invalid service JWT: unknown composite kid"))?;
+        // Signing-domain separation: service certification is the Policy
+        // domain. The OAuth-role pair legitimately signs browser and workload
+        // WITs (`wit+jwt` too), so accepting its kid here would let anyone
+        // holding an OAuth-plane token mint an installable service identity
+        // with an arbitrary `cnf`. Only Policy-role pairs — the ledger's
+        // Policy slot and the derived CA pair, which is constructed with the
+        // Policy role — may certify service keys.
+        anyhow::ensure!(
+            pair.role() == hyprstream_rpc::auth::CompositePairRole::Policy,
+            "Invalid service JWT: composite pair role is not authorized for service certification"
+        );
         hyprstream_rpc::auth::jwt::decode_composite(
             service_jwt,
             pair.ml_dsa(),
@@ -2206,6 +2217,84 @@ mod tests {
         );
         assert!(bare.iss.is_empty());
         assert!(bare.aud.is_none());
+    }
+
+    /// Signing-domain separation: a `wit+jwt` composite-signed by the ACTIVE
+    /// OAUTH-role pair — the pair that legitimately signs browser/workload
+    /// WITs — must be rejected by the registration verification even though
+    /// its kid resolves, while the same token signed by a Policy-role pair
+    /// is accepted. Otherwise a compromised OAuth signing key could mint an
+    /// installable service identity with an arbitrary `cnf`.
+    #[test]
+    fn registration_rejects_oauth_role_pair_and_accepts_policy_role_pair() {
+        use hyprstream_rpc::auth::{
+            CompositeKeyPair, CompositeKeySet, CompositePairRole, CompositePairState,
+        };
+        use std::sync::Arc;
+
+        let ca = SigningKey::from_bytes(&[0x2E; 32]);
+        let now = chrono::Utc::now().timestamp();
+        let claims =
+            hyprstream_rpc::auth::Claims::new("service:discovery".to_owned(), now, now + 3600);
+
+        let mut role_pairs = Vec::new();
+        for (seed, role) in [
+            (0x2Fu8, CompositePairRole::OAuth),
+            (0x30u8, CompositePairRole::Policy),
+        ] {
+            let ed = SigningKey::from_bytes(&[seed; 32]);
+            let (pq, pq_vk) = hyprstream_rpc::crypto::pq::ml_dsa_generate_keypair();
+            let jwt = crate::auth::jwt::encode_composite_service_jwt(&claims, &pq, &ed);
+            let kid = crate::auth::jwt::composite_kid(&pq_vk, &ed.verifying_key());
+            role_pairs.push((
+                jwt,
+                CompositeKeyPair::signing(
+                    kid,
+                    Arc::new(pq),
+                    Arc::new(ed),
+                    role,
+                    CompositePairState::Active,
+                    0,
+                    i64::MAX,
+                ),
+            ));
+        }
+
+        let key_set = Arc::new(CompositeKeySet::default());
+        key_set
+            .publish(
+                1,
+                "role-separation".to_owned(),
+                role_pairs.iter().map(|(_, pair)| pair.clone()).collect(),
+            )
+            .unwrap();
+        let key_source = hyprstream_rpc::auth::ClusterKeySource::new(
+            ca.verifying_key(),
+            "http://localhost:9080".to_owned(),
+        )
+        .with_composite_key_set(key_set);
+
+        let (oauth_jwt, _) = &role_pairs[0];
+        assert!(
+            verify_service_registration_jwt(
+                oauth_jwt,
+                Some(&key_source),
+                &ca,
+                hyprstream_rpc::crypto::CryptoPolicy::Hybrid,
+            )
+            .is_err(),
+            "an OAuth-role pair must not certify a service identity"
+        );
+
+        let (policy_jwt, _) = &role_pairs[1];
+        let verified = verify_service_registration_jwt(
+            policy_jwt,
+            Some(&key_source),
+            &ca,
+            hyprstream_rpc::crypto::CryptoPolicy::Hybrid,
+        )
+        .unwrap();
+        assert_eq!(verified.sub, "service:discovery");
     }
 
     /// A composite service JWT signed by a DIFFERENT pair (unknown kid)

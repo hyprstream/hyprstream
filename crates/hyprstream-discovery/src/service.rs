@@ -6000,6 +6000,17 @@ impl DiscoveryHandler for DiscoveryService {
                     .ok_or_else(|| {
                         anyhow::anyhow!("Invalid service JWT in announce: unknown composite kid")
                     })?;
+                // Signing-domain separation: announcements assert a service
+                // identity, which is certified by the Policy/CA domain only —
+                // the ledger's Policy slot and the derived CA pair (registered
+                // under the Policy role). The OAuth-role pair signs browser
+                // and workload WITs and must not be able to certify a service
+                // announcement.
+                anyhow::ensure!(
+                    pair.role() == hyprstream_rpc::auth::CompositePairRole::Policy,
+                    "Invalid service JWT in announce: composite pair role is not authorized \
+                     for service certification"
+                );
                 hyprstream_rpc::auth::jwt::decode_composite(
                     &service_jwt,
                     pair.ml_dsa(),

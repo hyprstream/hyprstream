@@ -1074,6 +1074,14 @@ pub trait RequestService: 'static {
                 ];
                 let dispatch = crate::auth::parse_composite_dispatch(&token, &allowed_types)
                     .map_err(|error| anyhow::anyhow!("JWT dispatch failed: {error}"))?;
+                // Role note: pairs of BOTH issuer roles are acceptable at this
+                // layer — the OAuth pair signs browser access tokens and
+                // browser/workload WITs, the Policy pair signs PolicyService-
+                // issued tokens including service WITs — because this is
+                // transport authentication only. Handlers whose decisions
+                // confer signing-domain privileges (e.g. service-key
+                // certification, announcements) must additionally constrain
+                // the resolved pair's role themselves.
                 let pair = key_source
                     .composite_pair(dispatch.kid())
                     .ok_or_else(|| anyhow::anyhow!("unknown composite JWT kid"))?;
