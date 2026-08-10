@@ -36,6 +36,7 @@ pub use crate::services::generated::model_client::KVQuantType;
 pub mod tensor_sampling; // Device-agnostic tensor-based sampling
 pub mod device_pool; // Multi-GPU device abstraction (DevicePool) — Send+Sync, holds only Device values
 pub mod image_utils; // Image loading and preprocessing for multimodal models
+pub mod inference_stage; // Thread-local execution boundary for one decoder stage
 pub mod inference_profile; // Explicit inference isolation/deployment scheduling profile
 pub mod kv_cache; // Key-Value caching for efficient autoregressive generation
 pub mod kv_compat; // KV-cache compatibility fingerprint + rejection policy (#1277)
@@ -50,6 +51,7 @@ pub mod torch_utils; // Utilities for safe PyTorch operations with OOM handling
 pub mod weight_provider; // Weight provider for streaming large models
 
 // Primary exports - use TorchEngine as default
+pub use inference_stage::{InferenceStage, StageContract, StageInput, StageOutput};
 pub use torch_engine::{TorchEngine, TextStream, GenerationStats};
 
 // Multi-GPU device abstraction
