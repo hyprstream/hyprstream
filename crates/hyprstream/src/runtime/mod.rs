@@ -51,7 +51,9 @@ pub mod torch_utils; // Utilities for safe PyTorch operations with OOM handling
 pub mod weight_provider; // Weight provider for streaming large models
 
 // Primary exports - use TorchEngine as default
-pub use inference_stage::{InferenceStage, StageContract, StageInput, StageOutput};
+pub use inference_stage::{
+    InferenceStage, StageContract, StageInput, StageOutput, StageSequence, StageTensor,
+};
 pub use torch_engine::{TorchEngine, TextStream, GenerationStats};
 
 // Multi-GPU device abstraction
