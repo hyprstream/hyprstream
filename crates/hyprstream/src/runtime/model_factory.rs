@@ -2028,6 +2028,22 @@ mod stage_subset_tests {
         .unwrap();
     }
 
+    fn assert_pointer_resolution_error(error: anyhow::Error) {
+        let message = error.to_string();
+        let normalized = message.to_lowercase();
+        assert!(
+            normalized.contains("pointer")
+                || normalized.contains("lfs")
+                || normalized.contains("xet"),
+            "stage path did not report pointer resolution: {message}"
+        );
+        assert!(
+            !normalized.contains("failed to parse required stage shard")
+                && !normalized.contains("invalid safetensors"),
+            "stage path reached safetensors parsing before pointer resolution: {message}"
+        );
+    }
+
     #[tokio::test]
     async fn stage_schema_validates_all_dense_roles() {
         let dir = tempfile::tempdir().unwrap();
@@ -2154,6 +2170,35 @@ mod stage_subset_tests {
             ),
             "valid complete-range stage forward diverged from ModelFactory::create"
         );
+    }
+
+    #[tokio::test]
+    async fn stage_pointer_shard_fails_before_mmap_in_preflight_and_selected_load() {
+        const SHARD: &str = "model-00001-of-00001.safetensors";
+
+        let dir = tempfile::tempdir().unwrap();
+        write_tiny_dense_checkpoint(dir.path(), &tiny_dense_tensors(true));
+        std::fs::write(
+            dir.path().join(SHARD),
+            b"version https://git-lfs.github.com/spec/v1\n\
+oid sha256:0000000000000000000000000000000000000000000000000000000000000000\n\
+size 4096\n",
+        )
+        .unwrap();
+
+        let plan = ModelFactory::stage_weight_plan(dir.path(), 1, 0..1).unwrap();
+        let preflight_error = ModelFactory::stage_tensor_metadata(&plan).await.unwrap_err();
+        assert_pointer_resolution_error(preflight_error);
+
+        let selected_error = ModelFactory::load_weights_for_stage_plan(
+            plan,
+            0..1,
+            &Device::Cpu,
+            DType::Float,
+        )
+        .await
+        .unwrap_err();
+        assert_pointer_resolution_error(selected_error);
     }
 
     #[tokio::test]
