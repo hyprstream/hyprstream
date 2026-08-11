@@ -375,17 +375,89 @@ fn verify_mldsa65(
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
-    use super::*;
     use super::super::parser::ParsedProof;
+    use super::*;
+
+    fn load_vector(id: &str) -> Vec<u8> {
+        let vectors = super::super::tests::load_positive_vectors();
+        vectors
+            .iter()
+            .find(|(v_id, _)| v_id == id)
+            .unwrap_or_else(|| panic!("vector {id} must exist"))
+            .1
+            .clone()
+    }
 
     #[test]
     fn test_p1_unattributed_signature_verifies() {
-        let vectors = super::super::tests::load_positive_vectors();
-        let p1 = vectors.iter().find(|(id, _)| id == "P-1").unwrap();
-        let proof = ParsedProof::parse(&p1.1).expect("P-1 should parse");
-        assert_eq!(proof.disposition, super::super::ProofDisposition::Unattributed);
+        let proof = ParsedProof::parse(&load_vector("P-1")).expect("P-1 should parse");
+        assert_eq!(proof.disposition, ProofDisposition::Unattributed);
+        assert_eq!(proof.structure, CoseStructure::Sign1);
         let result = verify_unattributed(&proof);
-        assert!(result.is_ok(), "P-1 Ed25519 signature should verify: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "P-1 Ed25519 signature should verify: {:?}",
+            result.err()
+        );
+    }
+
+    /// A corrupted self-asserted Ed25519 signature on the unattributed path
+    /// must be rejected by the real verification entry point — not merely by
+    /// a primitive called out of band.
+    #[test]
+    fn test_p1_corrupted_signature_denies() {
+        let mut proof = ParsedProof::parse(&load_vector("P-1")).expect("P-1 should parse");
+        proof.signatures[0].signature[0] ^= 0xFF;
+        assert!(
+            verify_proof_signatures(&proof, None).is_err(),
+            "corrupted Ed25519 signature must deny"
+        );
+    }
+
+    /// Authenticated `COSE_Sign` (P-2 hybrid, P-5 two logical groups) cannot
+    /// be verified from a single `cnf` key: without per-entry enrollment
+    /// resolution one key holder could impersonate distinct signer groups.
+    /// Both must deny, with and without a `cnf` key present.
+    #[test]
+    fn test_authenticated_cosign_denies_without_enrollment() {
+        let cnf = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]).verifying_key();
+        for id in ["P-2", "P-5"] {
+            let proof = ParsedProof::parse(&load_vector(id)).expect("parse");
+            assert_eq!(proof.disposition, ProofDisposition::Authenticated);
+            assert_eq!(proof.structure, CoseStructure::Sign);
+            assert!(
+                verify_proof_signatures(&proof, None).is_err(),
+                "{id} must deny with no cnf key"
+            );
+            assert!(
+                verify_proof_signatures(&proof, Some(&cnf)).is_err(),
+                "{id} must deny rather than verify every entry with one cnf key"
+            );
+        }
+    }
+
+    /// An authenticated proof presented with no resolved credential key must
+    /// be Rejected, never downgraded to the unattributed path.
+    #[test]
+    fn test_authenticated_without_cnf_key_denies() {
+        for id in ["P-3", "P-4"] {
+            let proof = ParsedProof::parse(&load_vector(id)).expect("parse");
+            assert_eq!(proof.disposition, ProofDisposition::Authenticated);
+            assert!(
+                verify_proof_signatures(&proof, None).is_err(),
+                "{id} without a resolved cnf key must deny"
+            );
+        }
+    }
+
+    /// The wrong `cnf` key must not verify an authenticated `COSE_Sign1`.
+    #[test]
+    fn test_authenticated_sign1_wrong_cnf_key_denies() {
+        let proof = ParsedProof::parse(&load_vector("P-4")).expect("P-4 parse");
+        let wrong = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]).verifying_key();
+        assert!(
+            verify_proof_signatures(&proof, Some(&wrong)).is_err(),
+            "P-4 must deny under a non-enrolled cnf key"
+        );
     }
 }
-

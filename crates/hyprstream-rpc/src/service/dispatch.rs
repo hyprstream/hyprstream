@@ -397,7 +397,9 @@ where
         }
 
         // Gate 3: Challenge validation (unattributed proofs only).
-        if proof.disposition == crate::proof::ProofDisposition::Unattributed {
+        // validate() atomically returns the matched challenge's accept_until
+        // so we can compute replay expiry without a TOCTOU race.
+        let challenge_accept_until: Option<u64> = if proof.disposition == crate::proof::ProofDisposition::Unattributed {
             let challenge = proof.claims.nonce.as_ref()
                 .ok_or_else(|| anyhow::anyhow!("unattributed proof missing Nonce claim"))?;
             let now_secs = std::time::SystemTime::now()
@@ -406,17 +408,21 @@ where
                 .unwrap_or(0);
             match crate::proof::admission::global_challenge_manager() {
                 Some(mgr) => {
-                    if !mgr.validate(challenge, now_secs) {
-                        warn!("{} unattributed proof challenge invalid/expired", service.name());
-                        anyhow::bail!("proof challenge validation failed");
-                    }
+                    let accept_until = mgr.validate(challenge, now_secs)
+                        .ok_or_else(|| {
+                            warn!("{} unattributed proof challenge invalid/expired", service.name());
+                            anyhow::anyhow!("proof challenge validation failed")
+                        })?;
+                    Some(accept_until)
                 }
                 None => {
                     warn!("{} no challenge manager installed; denying unattributed proof", service.name());
                     anyhow::bail!("unattributed proof requires a challenge manager to be installed");
                 }
             }
-        }
+        } else {
+            None
+        };
 
         // Gate 4: Replay admission using the process-global ProofReplayStore.
         // No auto-install: the store must be explicitly installed at startup.
@@ -426,25 +432,11 @@ where
                 anyhow::anyhow!("no ProofReplayStore installed; install via set_global_proof_replay_store at startup")
             })?;
 
-        // Compute the replay key and expiry.
-        // Replay expiry = min(proof.exp, challenge_accept_until) for
-        // unattributed proofs; proof.exp for authenticated.
-        let replay_expiry = if proof.disposition == crate::proof::ProofDisposition::Unattributed {
-            // Challenge was validated above; use the challenge manager's
-            // accept_until to bound replay retention. If the manager is
-            // installed (required for unattributed), get its current's
-            // accept_until; otherwise deny (already denied above).
-            let now_secs = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
-            let challenge_accept_until = crate::proof::admission::global_challenge_manager()
-                .and_then(|mgr| mgr.current(now_secs))
-                .map(|c| c.accept_until)
-                .unwrap_or(now_secs); // fallback: immediate expiry
-            proof.claims.exp.min(challenge_accept_until)
-        } else {
-            proof.claims.exp
+        // Compute replay expiry using the atomically-returned challenge
+        // accept_until (no TOCTOU race).
+        let replay_expiry = match challenge_accept_until {
+            Some(au) => proof.claims.exp.min(au),
+            None => proof.claims.exp,
         };
 
         let replay_key = match proof.disposition {

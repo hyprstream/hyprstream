@@ -91,11 +91,16 @@ impl ChallengeManager {
     }
 
     /// Validate a presented challenge against all still-acceptable values.
-    /// A proof citing any challenge value validates iff `now` precedes its
-    /// `accept_until`.
-    pub fn validate(&self, presented: &[u8], now: u64) -> bool {
+    /// Returns the matched challenge's `accept_until` if valid, or `None`.
+    /// This atomically returns the deadline so the caller can compute
+    /// `min(proof.exp, accept_until)` without a TOCTOU race against
+    /// rotation.
+    pub fn validate(&self, presented: &[u8], now: u64) -> Option<u64> {
         let chals = self.challenges.read();
-        chals.iter().any(|c| c.is_valid_at(presented, now))
+        chals
+            .iter()
+            .find(|c| c.is_valid_at(presented, now))
+            .map(|c| c.accept_until)
     }
 
     /// Rotate to a new challenge value. The previous challenge(s) remain
@@ -114,6 +119,7 @@ impl ChallengeManager {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 
@@ -143,5 +149,68 @@ mod tests {
         assert_eq!(ch.replay_record_expiry(1050), 1010);
         // proof.exp = 1005, challenge_accept_until = 1010 → min = 1005
         assert_eq!(ch.replay_record_expiry(1005), 1005);
+    }
+
+    /// A proof citing a rotated-out but still-acceptable challenge must be
+    /// retained against **its own** `accept_until`, not the current
+    /// challenge's. Validating and then separately reading `current()` would
+    /// return the wrong (later) deadline and let a rotated-out proof outlive
+    /// its acceptance window.
+    #[test]
+    fn validate_returns_the_matched_challenge_deadline_not_the_current_one() {
+        let mgr = ChallengeManager::new(ServerChallenge::new(vec![0x01; 16], 1000, 1005), 5);
+        mgr.rotate(vec![0x02; 16], 30, 1000); // new: window_end 1030, accept_until 1035
+
+        let old = mgr
+            .validate(&[0x01; 16], 1002)
+            .expect("rotated-out challenge is still acceptable inside its overlap");
+        let new = mgr
+            .validate(&[0x02; 16], 1002)
+            .expect("current challenge is acceptable");
+
+        assert_eq!(old, 1005, "matched deadline must be the old challenge's");
+        assert_eq!(new, 1035);
+        assert_ne!(
+            old,
+            mgr.current(1002).expect("a current challenge exists").accept_until,
+            "the matched deadline must not be the current challenge's deadline"
+        );
+        // The retention window follows the matched deadline.
+        assert_eq!(1_000_000u64.min(old), 1005);
+    }
+
+    /// Validation is a single atomic read: a value whose own deadline has
+    /// passed denies even while a newer challenge is live.
+    #[test]
+    fn validate_denies_expired_value_while_a_newer_one_is_live() {
+        let mgr = ChallengeManager::new(ServerChallenge::new(vec![0x01; 16], 1000, 1005), 5);
+        mgr.rotate(vec![0x02; 16], 30, 1000);
+        assert_eq!(mgr.validate(&[0x01; 16], 1006), None);
+        assert_eq!(mgr.validate(&[0x02; 16], 1006), Some(1035));
+    }
+
+    /// An unknown value denies regardless of timing.
+    #[test]
+    fn validate_denies_unknown_value() {
+        let mgr = ChallengeManager::new(ServerChallenge::new(vec![0x01; 16], 1000, 1005), 5);
+        assert_eq!(mgr.validate(&[0xff; 16], 1002), None);
+    }
+
+    /// Rotation prunes values whose acceptance deadline has passed, so a
+    /// stockpiled proof citing a long-dead challenge can never re-validate.
+    #[test]
+    fn rotation_prunes_expired_challenges() {
+        let mgr = ChallengeManager::new(ServerChallenge::new(vec![0x01; 16], 1000, 1005), 5);
+        mgr.rotate(vec![0x02; 16], 30, 1010);
+        assert_eq!(mgr.validate(&[0x01; 16], 1002), None);
+        assert_eq!(mgr.challenges.read().len(), 1);
+    }
+
+    /// When every challenge has expired the manager advertises nothing: the
+    /// caller must refuse service rather than publish an unusable challenge.
+    #[test]
+    fn current_is_none_when_rotation_has_stalled() {
+        let mgr = ChallengeManager::new(ServerChallenge::new(vec![0x01; 16], 1000, 1005), 5);
+        assert!(mgr.current(1006).is_none());
     }
 }
