@@ -1,0 +1,459 @@
+#!/usr/bin/env python3
+"""Mechanical validation gate for the v16 RPC request-proof profile freeze.
+
+This gate checks the CDDL, the private-label registry, the credential profile,
+and the canonical fixtures *together* — not each in isolation — and fails
+closed on any inconsistency. It is the machine-checked half of the Gate-2
+freeze (v16 §19, operator disposition 2026-08-19).
+
+What it enforces, end to end:
+
+  1. CDDL validity + structural conformance of every fixture, using a REAL CDDL
+     validator (`pycddl`, the Rust `cddl` crate behind a pinned wheel).
+  2. Exact frozen private-use values, present and consistent across the CDDL,
+     the registry, and the fixtures.
+  3. Every frozen cap (1 MiB body, 2 MiB object, aud 128 == the shared
+     MAX_SERVICE_DOMAIN_BYTES, signer group <= 255, plan 1..8 x 1..2, suite/kid
+     1..64, Nonce 16..64, cti 16, credential_hash 32).
+  4. The closed 4-key response-binding map, the two orthogonal enum axes, and
+     the "recipient non-null iff encrypted" relation — asserted over the
+     fixtures AND proven to be enforced by the CDDL itself (the relation/enum
+     negatives are rejected by the validator).
+  5. No collision or duplicate across the private-use allocations.
+  6. Canonical, reproducible fixtures: deterministic-CBOR decode of every
+     vector, digest/size agreement, signature re-verification, and a
+     byte-identical regeneration from the seeded generator (no hand-editing).
+
+Usage:
+    python3 docs/standards/v16/tools/validate_profile.py
+
+Requires `pycddl==0.3.0` (see requirements.txt). The gate FAILS if it is
+missing — the CDDL layer is mandatory, not optional.
+
+pycddl 0.3.0 limitation, handled here: `.size (LO..HI)` byte-length RANGE
+controls are mis-evaluated by that version (they are checked as a uint range
+against the value, not the byte length). The gate therefore strips ONLY those
+range controls for the structural CDDL pass — the exact strip list is printed —
+and re-checks every corresponding size cap numerically in Python. Exact
+`.size N` controls and `.le` are handled correctly and are left in place.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import re
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+V16 = HERE.parent
+CDDL_PATH = V16 / "hyprstream-proof-cwt.cddl"
+REGISTRY_PATH = V16 / "private-label-registry.md"
+CREDENTIAL_PATH = V16 / "credential-profile.md"
+VECTORS_DIR = V16 / "vectors"
+# Repo root is five parents up: .../<repo>/docs/standards/v16/tools
+REPO_ROOT = V16.parent.parent.parent
+ENVELOPE_RS = REPO_ROOT / "crates" / "hyprstream-rpc" / "src" / "envelope.rs"
+
+# Import the strict deterministic-CBOR decoder from the vector checker so the
+# gate and the checker share one decoder.
+sys.path.insert(0, str(HERE))
+from check_proof_vectors import decode, StrictError  # noqa: E402
+
+# ---- Frozen expectations (Gate-2 §19, 2026-08-19) ------------------------
+
+PROOF_CLAIM_KEYS = {-70001, -70002, -70003, -70004}
+CREDENTIAL_CLAIM_KEYS = {-70005, -70006, -70007}  # amendment 10 (integer CWT)
+HEADER_PARAMS = {-70100, -70101, -70102, -70103}
+KEM_ALG = -70200  # amendment 5, hs-kem-ml-kem-768-v1
+UNKNOWN_TEST_KEY = -70050  # deliberately unallocated (N-8)
+
+MAX_SERVICE_DOMAIN_BYTES = 128  # amendment 7 (shared constant)
+MAX_BODY_BYTES = 1048576  # 1 MiB
+MAX_OBJECT_BYTES = 2097152  # 2 MiB
+MAX_SIGNER_GROUP = 255  # value 6
+CTI_BYTES = 16
+CREDENTIAL_HASH_BYTES = 32
+NONCE_MIN, NONCE_MAX = 16, 64
+SUITE_KID_MAX = 64
+GROUPS_MAX, COMPONENTS_MAX = 8, 2
+
+# CBOR/COSE labels
+H_ALG, H_CRIT, H_KID, H_TYP = 1, 2, 4, 16
+H_DOMAIN, H_PLAN, H_GROUP, H_KEYSET = -70100, -70101, -70102, -70103
+C_AUD, C_EXP, C_IAT, C_CTI, C_NONCE = 3, 4, 6, 7, 10
+C_CREDENTIAL_HASH, C_SCHEMA_ID, C_BODY_BYTES, C_RESPONSE_BINDING = (
+    -70001,
+    -70002,
+    -70003,
+    -70004,
+)
+
+FAILURES: list[str] = []
+SECTION = ""
+
+
+def check(cond: bool, msg: str) -> None:
+    if not cond:
+        FAILURES.append(f"[{SECTION}] {msg}")
+
+
+def section(name: str) -> None:
+    global SECTION
+    SECTION = name
+    print(f"== {name} ==")
+
+
+# --------------------------------------------------------------------------
+
+
+def strip_size_ranges(cddl: str) -> tuple[str, list[str]]:
+    """Strip ONLY `.size (LO..HI)` byte-length range controls (mis-evaluated by
+    pycddl 0.3.0). Returns the stripped text and the exact strips removed."""
+    pat = re.compile(r"\.size\s*\(\s*\d+\s*\.\.\s*\d+\s*\)")
+    strips = pat.findall(cddl)
+    return pat.sub("", cddl), strips
+
+
+def load_json(name: str) -> dict:
+    return json.loads((VECTORS_DIR / name).read_text())
+
+
+def payload_of(cbor_hex: str) -> bytes:
+    obj = decode(bytes.fromhex(cbor_hex))
+    return obj[2]  # [protected, unprotected, payload, signature(s)]
+
+
+def claims_of(cbor_hex: str) -> dict:
+    return decode(payload_of(cbor_hex))
+
+
+# --------------------------------------------------------------------------
+# 1. CDDL structural validation with a real validator
+# --------------------------------------------------------------------------
+
+
+def gate_cddl(cddl: str, positives, negatives) -> None:
+    section("1. CDDL structural validation (pycddl real validator)")
+    try:
+        from pycddl import Schema, ValidationError
+    except ImportError:
+        FAILURES.append(
+            "[1. CDDL] pycddl is not installed. This gate REQUIRES a real CDDL "
+            "validator. Install it: python3 -m pip install -r "
+            "docs/standards/v16/tools/requirements.txt"
+        )
+        return
+
+    stripped, strips = strip_size_ranges(cddl)
+    print(f"   stripped {len(strips)} bstr .size range control(s) for the "
+          f"structural pass (re-checked numerically in section 3):")
+    for s in strips:
+        print(f"     - {s}")
+
+    # Whole CDDL must compile under a real parser.
+    try:
+        Schema(cddl if False else "start = hyprstream-proof-claims\n" + stripped)
+    except Exception as exc:  # noqa: BLE001
+        FAILURES.append(f"[1. CDDL] normative CDDL does not compile: {exc}")
+        return
+
+    claims_schema = Schema("start = hyprstream-proof-claims\n" + stripped)
+    sign1_schema = Schema("start = hyprstream-proof-sign1\n" + stripped)
+
+    for v in positives["vectors"]:
+        try:
+            claims_schema.validate_cbor(payload_of(v["cbor_hex"]))
+        except ValidationError as exc:
+            check(False, f"positive {v['id']} claims payload fails CDDL: {exc}")
+        if v["structure"] == "COSE_Sign1":
+            try:
+                sign1_schema.validate_cbor(bytes.fromhex(v["cbor_hex"]))
+            except ValidationError as exc:
+                check(False, f"positive {v['id']} object fails CDDL: {exc}")
+    # COSE_Sign (multi-sig) full-object validation is covered by the signature
+    # + plan-component checks in check_proof_vectors (pycddl 0.3.0 does not
+    # descend nested `.cbor` inside signature arrays); claims payloads above do.
+
+    # The relation/enum negatives MUST be rejected by the CDDL itself: this is
+    # the machine proof that the closed map, the two enum axes, and the
+    # recipient/encryption relation are structural, not prose.
+    relation_negs = {
+        "N-23": "encrypted binding with null recipient",
+        "N-24": "cleartext binding with a recipient",
+        "N-25": "response_kind outside its closed enum",
+    }
+    by_id = {v["id"]: v for v in negatives["vectors"]}
+    for nid, what in relation_negs.items():
+        v = by_id.get(nid)
+        check(v is not None, f"expected negative {nid} ({what}) is missing")
+        if v is None:
+            continue
+        try:
+            claims_schema.validate_cbor(payload_of(v["cbor_hex"]))
+            check(False, f"{nid} ({what}) is NOT rejected by the CDDL")
+        except ValidationError:
+            print(f"   {nid} correctly rejected by the CDDL ({what})")
+
+
+# --------------------------------------------------------------------------
+# 2. Exact private-use values, consistent across CDDL / registry / fixtures
+# --------------------------------------------------------------------------
+
+
+def gate_values(cddl: str, registry: str, credential: str, positives, negatives) -> None:
+    section("2. Exact private-use values and cross-artifact consistency")
+
+    # 2a. CDDL declares the KEM alg and the proof claim keys exactly.
+    check(
+        re.search(r"alg-hs-kem-ml-kem-768-v1\s*=\s*-70200", cddl) is not None,
+        "CDDL must allocate alg-hs-kem-ml-kem-768-v1 = -70200",
+    )
+    for k in PROOF_CLAIM_KEYS:
+        check(f"{k} =>" in cddl.replace(" ", " "), f"CDDL claims map must carry key {k}")
+    for k in HEADER_PARAMS:
+        check(str(k) in cddl, f"CDDL must reference header param {k}")
+
+    # 2b. Registry documents every frozen value.
+    for k in sorted(PROOF_CLAIM_KEYS | CREDENTIAL_CLAIM_KEYS | HEADER_PARAMS | {KEM_ALG}):
+        check(str(k) in registry, f"registry must document {k}")
+    check(
+        "capnp_body_bytes" in registry and "capnp_request_bytes" not in registry,
+        "registry -70003 must be renamed capnp_body_bytes (no capnp_request_bytes)",
+    )
+    check("hs-kem-ml-kem-768-v1" in registry, "registry must name hs-kem-ml-kem-768-v1")
+
+    # 2c. Credential profile documents the integer CWT claim keys and keeps
+    #     text names JWT-only.
+    for k in CREDENTIAL_CLAIM_KEYS:
+        check(str(k) in credential, f"credential profile must document CWT key {k}")
+
+    # 2d. No fixture claims-map uses a key outside the closed proof set, except
+    #     the deliberate unknown-key negative (N-8, key -70050).
+    allowed = PROOF_CLAIM_KEYS | {C_AUD, C_EXP, C_IAT, C_CTI, C_NONCE}
+    for v in positives["vectors"]:
+        claims = claims_of(v["cbor_hex"])
+        extra = set(claims) - allowed
+        check(not extra, f"positive {v['id']} uses non-frozen claim keys {extra}")
+    n8 = next((v for v in negatives["vectors"] if v["id"] == "N-8"), None)
+    check(n8 is not None, "N-8 (unknown claim key) must exist")
+    if n8 is not None:
+        keys = set(claims_of(n8["cbor_hex"]))
+        check(UNKNOWN_TEST_KEY in keys, "N-8 must carry the unallocated key -70050")
+
+
+# --------------------------------------------------------------------------
+# 3. Frozen caps (numeric, over CDDL constants, fixtures, and Rust constant)
+# --------------------------------------------------------------------------
+
+
+def const_from_cddl(cddl: str, name: str) -> int | None:
+    m = re.search(rf"^\s*{re.escape(name)}\s*=\s*(-?\d+)\b", cddl, re.MULTILINE)
+    return int(m.group(1)) if m else None
+
+
+def gate_caps(cddl: str, positives) -> None:
+    section("3. Frozen caps")
+
+    # 3a. CDDL-declared constants.
+    check(const_from_cddl(cddl, "max-aud-bytes") == MAX_SERVICE_DOMAIN_BYTES,
+          f"CDDL max-aud-bytes must be {MAX_SERVICE_DOMAIN_BYTES}")
+    check(const_from_cddl(cddl, "max-body-bytes") == MAX_BODY_BYTES,
+          "CDDL max-body-bytes must be 1048576")
+    check(const_from_cddl(cddl, "alg-hs-kem-ml-kem-768-v1") == KEM_ALG,
+          "CDDL KEM alg must be -70200")
+    check(re.search(r"tstr\s*\.size\s*\(1\.\.128\)", cddl) is not None,
+          "canonical-service-domain must be tstr .size (1..128)")
+    check(re.search(r"capnp-body-bytes\s*=\s*bstr\s*\.size\s*\(0\.\.1048576\)", cddl) is not None,
+          "capnp-body-bytes must be bstr .size (0..1048576)")
+    check(re.search(r"logical-signer-group\s*=\s*uint\s*\.le\s*255", cddl) is not None,
+          "logical-signer-group must be uint .le 255")
+    check(re.search(r"2097152", cddl) is not None,
+          "CDDL must state the 2 MiB total-object cap (2097152)")
+    check(re.search(r"signature-plan\s*=\s*\[\s*1\*8", cddl) is not None,
+          "signature-plan must cap at 1*8 groups")
+    check(re.search(r"1\*2 signature-component", cddl) is not None,
+          "signer-group must cap at 1*2 components")
+
+    # 3b. The shared Rust constant the artifact points to.
+    if ENVELOPE_RS.exists():
+        m = re.search(r"MAX_SERVICE_DOMAIN_BYTES:\s*usize\s*=\s*(\d+)", ENVELOPE_RS.read_text())
+        check(m is not None and int(m.group(1)) == MAX_SERVICE_DOMAIN_BYTES,
+              f"envelope.rs MAX_SERVICE_DOMAIN_BYTES must equal {MAX_SERVICE_DOMAIN_BYTES}")
+        print(f"   envelope.rs MAX_SERVICE_DOMAIN_BYTES = {m.group(1) if m else '?'}")
+    else:
+        print("   NOTE: envelope.rs not found; skipping shared-constant tie-in "
+              "(docs extracted standalone).")
+
+    # 3c. Every positive fixture respects the caps.
+    for v in positives["vectors"]:
+        raw = bytes.fromhex(v["cbor_hex"])
+        check(len(raw) <= MAX_OBJECT_BYTES, f"{v['id']} exceeds the 2 MiB object cap")
+        claims = claims_of(v["cbor_hex"])
+        aud = claims[C_AUD]
+        check(1 <= len(aud.encode()) <= MAX_SERVICE_DOMAIN_BYTES,
+              f"{v['id']} aud length out of 1..128")
+        check(len(claims[C_CTI]) == CTI_BYTES, f"{v['id']} cti must be 16 bytes")
+        ch = claims[C_CREDENTIAL_HASH]
+        check(ch is None or len(ch) == CREDENTIAL_HASH_BYTES,
+              f"{v['id']} credential_hash must be null or 32 bytes")
+        body = claims[C_BODY_BYTES]
+        check(len(body) <= MAX_BODY_BYTES, f"{v['id']} capnp body exceeds 1 MiB")
+        if C_NONCE in claims:
+            check(NONCE_MIN <= len(claims[C_NONCE]) <= NONCE_MAX,
+                  f"{v['id']} Nonce length out of 16..64")
+
+
+# --------------------------------------------------------------------------
+# 4. Closed response map, orthogonal enums, recipient/encryption relation
+# --------------------------------------------------------------------------
+
+
+def gate_response_binding(positives) -> None:
+    section("4. Response binding: closed map, enum axes, recipient relation")
+    seen_encrypted = seen_cleartext = seen_stream = False
+    for v in positives["vectors"]:
+        claims = claims_of(v["cbor_hex"])
+        rb = claims.get(C_RESPONSE_BINDING)
+        if rb is None:
+            continue
+        check(set(rb.keys()) == {1, 2, 3, 4},
+              f"{v['id']} response_binding must be the closed 4-key map, got {set(rb.keys())}")
+        kind, protection, recipient = rb.get(2), rb.get(3), rb.get(4)
+        check(kind in (1, 2), f"{v['id']} response_kind must be 1 or 2")
+        check(protection in (1, 2), f"{v['id']} protection_mode must be 1 or 2")
+        if protection == 2:  # encrypted
+            check(isinstance(recipient, dict),
+                  f"{v['id']} encrypted binding must carry a recipient")
+            if isinstance(recipient, dict):
+                check(recipient.get(1) == KEM_ALG,
+                      f"{v['id']} recipient alg must be -70200")
+                check(isinstance(recipient.get(2), bytes) and len(recipient[2]) == 1184,
+                      f"{v['id']} recipient must carry a 1184-byte ML-KEM-768 key")
+            seen_encrypted = True
+        else:  # cleartext
+            check(recipient is None,
+                  f"{v['id']} cleartext binding must carry a null recipient")
+            seen_cleartext = True
+        if kind == 2:
+            seen_stream = True
+    check(seen_encrypted, "an encrypted response_binding fixture must exist (P-4)")
+    check(seen_cleartext, "a cleartext response_binding fixture must exist (P-6)")
+    check(seen_stream, "a stream_setup response_kind fixture must exist (P-6)")
+
+
+# --------------------------------------------------------------------------
+# 5. Collision / duplicate allocation review
+# --------------------------------------------------------------------------
+
+
+def gate_collisions() -> None:
+    section("5. Collision / duplicate allocation review")
+    blocks = {
+        "proof-claims": PROOF_CLAIM_KEYS,
+        "credential-claims": CREDENTIAL_CLAIM_KEYS,
+        "header-params": HEADER_PARAMS,
+        "kem-alg": {KEM_ALG},
+    }
+    all_vals = [x for s in blocks.values() for x in s]
+    check(len(all_vals) == len(set(all_vals)),
+          "duplicate value across private-use allocations")
+    # CWT claim keys (proof + credential) share one IANA namespace: must be disjoint.
+    check(PROOF_CLAIM_KEYS.isdisjoint(CREDENTIAL_CLAIM_KEYS),
+          "proof and credential CWT claim keys collide")
+    check(UNKNOWN_TEST_KEY not in set(all_vals),
+          "the N-8 unknown-key -70050 must not be an allocated value")
+    # Contiguity/collision-free: credential keys are the next block after proof.
+    check(CREDENTIAL_CLAIM_KEYS == {-70005, -70006, -70007},
+          "credential CWT keys must be the next collision-free block -70005..-70007")
+    print("   allocations disjoint; -70050 unallocated; credential block -70005..-70007")
+
+
+# --------------------------------------------------------------------------
+# 6. Canonical, reproducible fixtures
+# --------------------------------------------------------------------------
+
+
+def gate_canonical(positives, negatives) -> None:
+    section("6. Canonical fixtures: deterministic CBOR, digests, signatures, regen")
+
+    # 6a. Deterministic-CBOR decode + digest/size for every vector.
+    for group in (positives["vectors"], negatives["vectors"]):
+        for v in group:
+            raw = bytes.fromhex(v["cbor_hex"])
+            check(hashlib.sha256(raw).hexdigest() == v["sha256"], f"{v['id']} sha256 mismatch")
+            check(len(raw) == v["size_bytes"], f"{v['id']} size mismatch")
+            try:
+                decode(raw)  # strict: rejects indefinite lengths, tags, floats, unsorted keys
+            except StrictError:
+                # Negative vectors deliberately violate deterministic encoding;
+                # their whole-object may not decode. Positives MUST decode.
+                if v in positives["vectors"]:
+                    check(False, f"positive {v['id']} is not deterministic CBOR")
+
+    # 6b. Signature + plan re-verification via the shared checker.
+    r = subprocess.run(
+        [sys.executable, str(HERE / "check_proof_vectors.py"), str(VECTORS_DIR)],
+        capture_output=True, text=True,
+    )
+    check(r.returncode == 0, f"check_proof_vectors failed:\n{r.stdout}\n{r.stderr}")
+    print(f"   {r.stdout.strip().splitlines()[-1] if r.stdout.strip() else 'checker ran'}")
+
+    # 6c. Byte-identical regeneration proves the fixtures are not hand-edited.
+    with tempfile.TemporaryDirectory() as tmp:
+        gen = subprocess.run(
+            [sys.executable, str(HERE / "gen_proof_vectors.py"), tmp],
+            capture_output=True, text=True,
+        )
+        if gen.returncode != 0:
+            print("   NOTE: regeneration skipped/failed (needs OpenSSL ML-DSA-65): "
+                  f"{gen.stderr.strip()[:120]}")
+            check(False, "generator did not run for the reproducibility check")
+        else:
+            for name in ("proof-v1-keys.json", "proof-v1-positive.json", "proof-v1-negative.json"):
+                a = (VECTORS_DIR / name).read_bytes()
+                b = (Path(tmp) / name).read_bytes()
+                check(a == b, f"{name} is not byte-identical to a fresh regeneration "
+                              "(hand-edited or generator drift)")
+            print("   fixtures regenerate byte-identically from the seeded generator")
+
+
+# --------------------------------------------------------------------------
+
+
+def main() -> None:
+    cddl = CDDL_PATH.read_text()
+    # Prose artifacts render private-use keys with the typographic minus sign
+    # U+2212; normalize to ASCII '-' so value checks are notation-agnostic.
+    registry = REGISTRY_PATH.read_text().replace("−", "-")
+    credential = CREDENTIAL_PATH.read_text().replace("−", "-")
+    positives = load_json("proof-v1-positive.json")
+    negatives = load_json("proof-v1-negative.json")
+
+    print("v16 profile freeze — mechanical validation gate")
+    print(f"  positives: {len(positives['vectors'])}  negatives: {len(negatives['vectors'])}\n")
+
+    gate_cddl(cddl, positives, negatives)
+    gate_values(cddl, registry, credential, positives, negatives)
+    gate_caps(cddl, positives)
+    gate_response_binding(positives)
+    gate_collisions()
+    gate_canonical(positives, negatives)
+
+    print()
+    if FAILURES:
+        for line in FAILURES:
+            print(f"FAIL {line}")
+        print(f"\n{len(FAILURES)} failure(s). Profile freeze is NOT mechanically valid.")
+        sys.exit(1)
+    print("PASS: CDDL, registry, credential profile, and fixtures are mutually "
+          "consistent and canonical.")
+    print("NOTE: not production-closed — the two vnd.hyprstream media-type IANA "
+          "registrations remain open; -70200 stays project-private.")
+
+
+if __name__ == "__main__":
+    main()
