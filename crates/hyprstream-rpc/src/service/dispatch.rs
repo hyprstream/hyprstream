@@ -397,24 +397,82 @@ where
         }
 
         // Gate 3: Challenge validation (unattributed proofs only).
-        // Without a domain challenge manager installed, unattributed proofs
-        // DENY — presence alone is not sufficient.
         if proof.disposition == crate::proof::ProofDisposition::Unattributed {
-            anyhow::bail!(
-                "unattributed proof challenge validation requires a domain challenge manager \
-                 to be installed; failing closed until ChallengeManager is wired into dispatch"
-            );
+            let challenge = proof.claims.nonce.as_ref()
+                .ok_or_else(|| anyhow::anyhow!("unattributed proof missing Nonce claim"))?;
+            let now_secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            match crate::proof::admission::global_challenge_manager() {
+                Some(mgr) => {
+                    if !mgr.validate(challenge, now_secs) {
+                        warn!("{} unattributed proof challenge invalid/expired", service.name());
+                        anyhow::bail!("proof challenge validation failed");
+                    }
+                }
+                None => {
+                    warn!("{} no challenge manager installed; denying unattributed proof", service.name());
+                    anyhow::bail!("unattributed proof requires a challenge manager to be installed");
+                }
+            }
         }
 
-        // Gate 4: Replay admission.
-        // The proper replay admission uses the canonical #1516 substrate
-        // with (signer_thumbprint, request_id) keyed admission, partitioned
-        // by disposition, with per-proof expiry and domain-wide guarantees.
-        // Until that substrate is wired, proof replay admission DENIES.
-        anyhow::bail!(
-            "proof replay admission requires the canonical #1516 store substrate; \
-             failing closed until domain-wide replay is wired"
-        );
+        // Gate 4: Replay admission using the canonical #1516-pattern
+        // proof replay store (ProofReplayStore trait with process-global
+        // registration, per-partition capacity, and per-entry expiry).
+        crate::proof::admission::ensure_proof_replay_store();
+        let replay_store = crate::proof::admission::global_proof_replay_store()
+            .ok_or_else(|| anyhow::anyhow!("proof replay store not available"))?;
+
+        // Compute the replay key.
+        let _now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let replay_key = match proof.disposition {
+            crate::proof::ProofDisposition::Unattributed => {
+                let thumbprint = proof.unattributed_replay_thumbprint()
+                    .ok_or_else(|| anyhow::anyhow!("cannot compute unattributed thumbprint"))?;
+                // Replay expiry = min(proof.exp, challenge_accept_until).
+                // Without per-challenge accept_until tracking, use proof.exp.
+                crate::proof::admission::ProofReplayKey {
+                    signer_thumbprint: thumbprint,
+                    request_id: proof.claims.request_id,
+                }
+            }
+            crate::proof::ProofDisposition::Authenticated => {
+                // For authenticated proofs, the thumbprint is the
+                // credential-bound primary signer-suite key hash.
+                // Until cnf/enrollment resolution is fully wired, use
+                // the cnf Ed25519 key hash.
+                let cnf_key = ctx.authenticated_signer_key()
+                    .ok_or_else(|| anyhow::anyhow!("authenticated proof: no cnf signer key"))?;
+                use sha2::{Digest, Sha256};
+                crate::proof::admission::ProofReplayKey {
+                    signer_thumbprint: Sha256::digest(cnf_key.as_bytes()).into(),
+                    request_id: proof.claims.request_id,
+                }
+            }
+        };
+
+        match replay_store.check_and_insert(
+            proof.disposition,
+            &replay_key,
+            proof.claims.exp,
+        ) {
+            crate::proof::admission::ProofAdmissionResult::Admitted => {
+                debug!("{} proof replay admission: admitted", service.name());
+            }
+            crate::proof::admission::ProofAdmissionResult::Replayed => {
+                warn!("{} proof replay detected", service.name());
+                anyhow::bail!("proof replay detected");
+            }
+            crate::proof::admission::ProofAdmissionResult::Failed => {
+                warn!("{} proof replay store at capacity (fail-closed)", service.name());
+                anyhow::bail!("proof replay store at capacity");
+            }
+        }
     }
 
     // 3. Handle request

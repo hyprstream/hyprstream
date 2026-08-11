@@ -19,6 +19,7 @@
 //! - [`challenge`] — rotating server challenge for unattributed proofs.
 //! - [`response`] — response proof binding types.
 
+pub mod admission;
 pub mod cbor_audit;
 pub mod challenge;
 pub mod claims;

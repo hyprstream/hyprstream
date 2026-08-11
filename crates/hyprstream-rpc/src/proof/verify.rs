@@ -79,9 +79,15 @@ fn verify_unattributed(proof: &ParsedProof) -> Result<()> {
                             .map_err(|e| anyhow!("sig {i} Ed25519 verification: {e}"))?;
                     }
                     ALG_ML_DSA_65 => {
-                        // ML-DSA-65 verification is not yet wired.
-                        // FAIL-CLOSED: deny rather than skip.
-                        bail!("ML-DSA-65 signature verification not implemented; denying proof");
+                        let pq_key = extract_mldsa65_key_from_protected(
+                            &proof.protected_bytes, &parsed_sig.kid,
+                        )?
+                        .ok_or_else(|| anyhow!("sig {i}: no ML-DSA-65 key for kid"))?;
+                        sign
+                            .verify_signature(i, &[], |s, d| {
+                                verify_mldsa65(s, d, &pq_key)
+                            })
+                            .map_err(|e| anyhow!("sig {i} ML-DSA-65 verification: {e}"))?;
                     }
                     other => bail!("unknown algorithm {other} in signature; denying"),
                 }
@@ -119,7 +125,10 @@ fn verify_authenticated(proof: &ParsedProof, cnf_key: &ed25519_dalek::VerifyingK
                             .map_err(|e| anyhow!("cnf Ed25519 sig {i}: {e}"))?;
                     }
                     ALG_ML_DSA_65 => {
-                        bail!("ML-DSA-65 cnf verification not implemented; denying");
+                        // For authenticated proofs, the ML-DSA-65 PQ key must
+                        // come from the credential cnf/trust store. Without
+                        // enrollment resolution, deny.
+                        bail!("ML-DSA-65 cnf key resolution not implemented; denying authenticated proof with hybrid suite");
                     }
                     other => bail!("unknown algorithm {other}; denying"),
                 }
@@ -279,7 +288,98 @@ fn verify_ed25519(
     key.verify(data, &sig).map_err(|_| "Ed25519 verification failed")
 }
 
-#[cfg(test)]
+/// Extract an ML-DSA-65 public key from the body-protected header's
+/// COSE_KeySet by matching kid.
+fn extract_mldsa65_key_from_protected(
+    protected_bytes: &[u8],
+    kid: &[u8],
+) -> Result<Option<crate::crypto::pq::MlDsaVerifyingKey>> {
+    let protected: ciborium::Value =
+        ciborium::de::from_reader(&mut std::io::Cursor::new(protected_bytes))
+            .map_err(|e| anyhow!("protected header decode: {e}"))?;
+
+    let map = match &protected {
+        ciborium::Value::Map(m) => m,
+        _ => bail!("protected header not a map"),
+    };
+
+    let key_set = map
+        .iter()
+        .find(|(k, _)| {
+            matches!(k,
+                ciborium::Value::Integer(i)
+                if i128::from(*i) == super::HEADER_HS_UNATTRIBUTED_KEY_SET as i128
+            )
+        })
+        .map(|(_, v)| v);
+
+    let key_set = match key_set {
+        Some(v) => v,
+        None => return Ok(None),
+    };
+
+    let key_arr = match key_set {
+        ciborium::Value::Array(a) => a,
+        _ => bail!("key set not an array"),
+    };
+
+    for key_val in key_arr {
+        let key_map = match key_val {
+            ciborium::Value::Map(m) => m,
+            _ => continue,
+        };
+
+        // Check kty == 7 (AKP)
+        let kty = key_map.iter().find(|(k, _)| {
+            matches!(k, ciborium::Value::Integer(i) if i128::from(*i) == 7)
+        }).and_then(|(_, v)| match v {
+            ciborium::Value::Integer(i) => Some(i128::from(*i)),
+            _ => None,
+        });
+
+        if kty != Some(7) {
+            continue;
+        }
+
+        // Match kid
+        let key_kid = key_map.iter().find(|(k, _)| {
+            matches!(k, ciborium::Value::Integer(i) if i128::from(*i) == 2)
+        }).and_then(|(_, v)| match v {
+            ciborium::Value::Bytes(b) => Some(b.clone()),
+            _ => None,
+        }).unwrap_or_default();
+
+        if key_kid != kid {
+            continue;
+        }
+
+        // Extract pub (label -1) — 1952-byte ML-DSA-65 public key
+        let pub_key = key_map.iter().find(|(k, _)| {
+            matches!(k, ciborium::Value::Integer(i) if i128::from(*i) == -1)
+        }).and_then(|(_, v)| match v {
+            ciborium::Value::Bytes(b) => Some(b.clone()),
+            _ => None,
+        }).ok_or_else(|| anyhow!("AKP key missing pub field"))?;
+
+        if pub_key.len() != 1952 {
+            bail!("ML-DSA-65 pub must be 1952 bytes, got {}", pub_key.len());
+        }
+
+        let vk = crate::crypto::pq::ml_dsa_vk_from_bytes(&pub_key)?;
+        return Ok(Some(vk));
+    }
+
+    Ok(None)
+}
+
+/// Verify an ML-DSA-65 signature.
+fn verify_mldsa65(
+    sig: &[u8],
+    data: &[u8],
+    key: &crate::crypto::pq::MlDsaVerifyingKey,
+) -> Result<(), &'static str> {
+    crate::crypto::pq::ml_dsa_verify(key, data, sig).map_err(|_| "ML-DSA-65 verification failed")
+}
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -296,3 +396,4 @@ mod tests {
         assert!(result.is_ok(), "P-1 Ed25519 signature should verify: {:?}", result.err());
     }
 }
+
