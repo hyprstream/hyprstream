@@ -53,6 +53,7 @@ pub use crate::envelope::EnvelopeVerification;
 /// * `Ok(response_bytes)` - Signed response. Any streaming pump has already been
 ///   spawned onto the current `LocalSet`.
 /// * `Err(e)` - Processing error (already logged)
+#[allow(deprecated)]
 pub async fn process_request<S>(
     raw_bytes: &[u8],
     service: &S,
@@ -370,99 +371,26 @@ where
         return Ok(bytes);
     }
 
-    // 2c. Proof-CWT signature verification and replay admission (v16 §5.2
-    // pipeline: after policy, before handler). The proof was structurally
-    // parsed above; here we verify the cryptographic signatures, check
-    // credential binding, and admit the replay key atomically.
+    // 2c. Proof-CWT verification gate (v16 §5.2 pipeline: after policy,
+    // before handler). If a proof CWT is present, ALL required verification
+    // gates MUST pass before the handler runs. Failure on any gate denies
+    // the request — there is no fail-open path.
     //
-    // Signature verification reconstructs each COSE Sig_structure from the
-    // parsed proof fields and verifies each component signature against the
-    // resolved key material (credential cnf for authenticated proofs;
-    // self-asserted key set for unattributed proofs).
-    if let Some(ref proof) = parsed_proof {
-        // For unattributed proofs: validate the server challenge (Nonce)
-        // against the current challenge window. The challenge manager is        // For unattributed proofs: validate the server challenge (Nonce)
-        // against the current challenge window. The challenge manager is
-        // process-global; a domain-wide shared manager is the production
-        // deployment (v16 §4.6).
-        if proof.disposition == crate::proof::ProofDisposition::Unattributed {
-            // Challenge validation: the proof's Nonce claim must match a
-            // current challenge. Without a global challenge manager wired
-            // into dispatch yet, this is a TODO — for now, require the
-            // challenge to be present (already enforced by the parser) but
-            // do not validate it against a specific value.
-            //
-            // TODO: wire ChallengeManager into dispatch and validate the
-            // proof's nonce claim against the current domain challenge.
-        }
-
-        // Credential hash binding: if the proof is authenticated, the
-        // credential_hash must match the presented credential's hash.
-        // For now this is enforced by the parser's structural check
-        // (presence/non-null consistency). Exact hash comparison requires
-        // the credential bytes from claims verification — TODO.
-        //
-        // TODO: compare proof.claims.credential_hash against
-        // SHA-256(ctx.jwt_token()) when a credential is presented.
-
-        // Replay admission: atomically check-and-insert the proof's replay
-        // key. This MUST be after policy evaluation so rejected/denied
-        // requests never consume replay capacity.
-        //
-        // The replay key is (signer_thumbprint, request_id). For
-        // unattributed proofs the thumbprint is computed from the canonical
-        // (plan, key_set) tuple. For authenticated proofs it requires the
-        // credential-bound primary signer-suite record — TODO when cnf
-        // resolution is wired.
-        if let Some(thumbprint) = proof.unattributed_replay_thumbprint() {
-            // Unattributed proof: compute replay record expiry as
-            // min(proof.exp, challenge_accept_until).
-            // Without a challenge manager wired, use proof.exp directly.
-            let replay_expiry = proof.claims.exp; // TODO: min(exp, challenge_accept_until)
-            let replay_key = crate::proof::replay::ReplayKey {
-                signer_thumbprint: thumbprint,
-                request_id: proof.claims.request_id,
-            };
-            // Process-global in-memory replay store (dual-read migration).
-            // TODO: replace with domain-wide Valkey/Redis backend.
-            use std::sync::OnceLock;
-            use crate::proof::replay::ReplayStore;
-            static REPLAY_STORE: OnceLock<crate::proof::replay::InMemoryReplayStore> =
-                OnceLock::new();
-            let store = REPLAY_STORE.get_or_init(crate::proof::replay::InMemoryReplayStore::default);
-            match store.check_and_insert(
-                crate::proof::ProofDisposition::Unattributed,
-                &replay_key,
-                replay_expiry,
-            ) {
-                crate::proof::replay::AdmissionResult::Admitted => {
-                    debug!("{} proof replay admission: admitted", service.name());
-                }
-                crate::proof::replay::AdmissionResult::Replayed => {
-                    warn!("{} proof replay admission: denied (replay)", service.name());
-                    anyhow::bail!("proof replay detected");
-                }
-                crate::proof::replay::AdmissionResult::Failed => {
-                    warn!("{} proof replay admission: store at capacity (fail-closed)", service.name());
-                    anyhow::bail!("proof replay store at capacity");
-                }
-            }
-        }
-
-        // At this point the proof is structurally valid, freshness-checked,
-        // body-verified, policy-permitted, and replay-admitted. Cryptographic
-        // signature verification against the resolved key material is the
-        // remaining TODO — it requires cnf/enrollment resolution from the
-        // claims context.
-        //
-        // TODO: reconstruct COSE Sig_structure for each signature entry and
-        // verify against resolved keys (cnf-bound suite for authenticated;
-        // self-asserted key set for unattributed).
-        debug!(
-            "{} proof-CWT admitted to handler: disposition={:?} request_id={}",
-            service.name(),
-            proof.disposition,
-            hex::encode(proof.claims.request_id)
+    // Required gates in order:
+    //   1. COSE signature verification (every component against resolved keys)
+    //   2. Credential cnf/hash binding (authenticated proofs only)
+    //   3. Challenge validation (unattributed proofs only)
+    //   4. Replay admission (both dispositions, partitioned)
+    //
+    // Until every gate is fully implemented, a present proof CWT is DENIED.
+    // This is the fail-closed position: no unsigned proof reaches the handler.
+    if let Some(ref _proof) = parsed_proof {
+        warn!(
+            "{} proof-CWT present but signature verification is not fully wired — failing closed",
+            service.name()
+        );
+        anyhow::bail!(
+            "proof-CWT present but full signature/credential/challenge verification pipeline is not yet implemented; failing closed per v16 §1.2 invariant 7"
         );
     }
 

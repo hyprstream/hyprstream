@@ -1,3 +1,4 @@
+#![allow(deprecated)]
 //! End-to-end proof that a dynamically-identified client — one no operator
 //! could have pre-enrolled — completes a real dispatch round-trip under the
 //! production-mandatory Hybrid suite.

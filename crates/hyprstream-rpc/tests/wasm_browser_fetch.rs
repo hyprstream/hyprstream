@@ -1,3 +1,4 @@
+#![allow(deprecated)]
 //! #1425 r2 P2: a real, browser-executed `fetch_exchange_token` test.
 //!
 //! Runs the actual `wasm32` fetch glue in a real browser

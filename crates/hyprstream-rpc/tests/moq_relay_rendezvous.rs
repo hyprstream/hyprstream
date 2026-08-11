@@ -1,3 +1,4 @@
+#![allow(deprecated)]
 //! moq relay rendezvous (#358).
 //!
 //! Restores the rendezvous property the ZMQ→moq migration removed: NEITHER the

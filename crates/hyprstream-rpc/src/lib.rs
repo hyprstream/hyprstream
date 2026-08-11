@@ -1,3 +1,4 @@
+#![allow(deprecated)]
 //! RPC infrastructure for hyprstream services.
 //!
 //! This crate provides:

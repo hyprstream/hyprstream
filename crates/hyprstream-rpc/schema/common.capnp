@@ -47,13 +47,13 @@ struct FederatedToken {
 # Contains all request metadata and payload. The entire serialized RequestEnvelope
 # is signed by SignedEnvelope.sig for clear signing scope.
 struct RequestEnvelope {
-  requestId @0 :UInt64;            # Unique request ID for correlation
+  requestId @0 :UInt64;            # DEPRECATED: replaced by proof CWT cti. Retained for wire compat.
   payload @1 :Data;                # Serialized inner request (RegistryRequest, etc.)
   iat @2 :Int64;                   # Unix millis, for expiration check
-  nonce @3 :Data $fixedSize(16);   # 16 random bytes for replay protection
+  nonce @3 :Data $fixedSize(16);   # DEPRECATED: replaced by proof CWT cti replay admission.
   authorization @4 :Authorization; # Authorization context
   delegationToken @5 :Text $optional;  # Delegation token relayed by a trusted service
-  wth @6 :Data $fixedSize(32) $optional;  # SHA-256 of jwtToken (WIT binding)
+  wth @6 :Data $fixedSize(32) $optional;  # DEPRECATED: replaced by proof CWT credential_hash (-70001).
   clientDhPublic @7 :Data $fixedSize(32) $optional;  # LEGACY classical DH pubkey (removed at S5 #556; superseded by clientKemPublic)
   clientKemPublic @8 :Data $optional;  # S3 #554: client ephemeral hybrid-KEM RecipientPublic.encode() (X25519+ML-KEM-768) for PQ stream key agreement
   responseKemRecipient @9 :Data $optional;  # #1044: fresh per-call HyKEM recipient for the unary response (distinct from stream KEM material)

@@ -1,3 +1,4 @@
+#![allow(deprecated)]
 //! #1483: the regression node for the browser-hybrid blind spot.
 //!
 //! Every hybrid integration test in this crate used to hand-anchor its

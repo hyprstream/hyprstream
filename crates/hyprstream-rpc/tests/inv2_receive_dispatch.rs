@@ -1,3 +1,4 @@
+#![allow(deprecated)]
 //! INV-2 receive-side dispatch enforcement (#1042).
 //!
 //! Proves `service::dispatch::process_request` — the shared envelope-verify →

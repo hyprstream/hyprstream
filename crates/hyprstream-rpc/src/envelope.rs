@@ -529,11 +529,13 @@ impl FromCapnp for Subject {
 ///
 /// # Replay Protection
 ///
-/// - `nonce`: 16 random bytes, must be unique per request
-/// - `iat`: Unix milliseconds, requests older than 5 minutes are rejected
+/// Legacy: `nonce` + `iat` nonce-cache replay. Superseded by v16 proof CWT
+/// `cti`-based replay admission (§4.5). Retained for dual-read wire compat;
+/// the proof-CWT path is fail-closed when present.
 #[derive(Debug, Clone)]
 pub struct RequestEnvelope {
-    /// Unique request ID for correlation and logging
+    /// DEPRECATED: replaced by proof CWT `cti`. Retained for wire compat.
+    #[deprecated(note = "replaced by proof CWT cti; retained for wire compat")]
     pub request_id: u64,
 
     /// Serialized inner request (e.g., RegistryRequest, InferenceRequest)
@@ -542,7 +544,8 @@ pub struct RequestEnvelope {
     /// Unix timestamp in milliseconds for expiration check
     pub iat: i64,
 
-    /// Random nonce for replay protection (16 bytes)
+    /// DEPRECATED: replaced by proof CWT `cti` replay admission.
+    #[deprecated(note = "replaced by proof CWT cti; retained for wire compat")]
     pub nonce: [u8; 16],
 
     /// Authorization context
@@ -557,9 +560,8 @@ pub struct RequestEnvelope {
     /// is finalized.
     pub delegation_token: Option<String>,
 
-    /// SHA-256 hash of the WIT JWT string (WIMSE wth claim).
-    /// Binds this proof to a specific Workload Identity Token even when
-    /// the JWT is omitted (trust-store cache-hit path).
+    /// DEPRECATED: replaced by proof CWT `credential_hash` (-70001).
+    #[deprecated(note = "replaced by proof CWT credential_hash; retained for wire compat")]
     pub wth: Option<[u8; 32]>,
 
     /// Client's ephemeral DH public key for stream key derivation.
@@ -592,6 +594,7 @@ pub struct RequestEnvelope {
     pub proof_cwt: Option<Vec<u8>>,
 }
 
+#[allow(deprecated)]
 impl RequestEnvelope {
     /// Create a new request envelope with fresh request ID, nonce, and timestamp.
     pub fn new(payload: Vec<u8>) -> Self {
@@ -1482,6 +1485,7 @@ pub const MAX_TIMESTAMP_AGE_MS: i64 = 5 * 60 * 1000;
 /// Maximum clock skew tolerance (30 seconds into the future).
 pub const MAX_CLOCK_SKEW_MS: i64 = 30 * 1000;
 
+#[allow(deprecated)]
 impl SignedEnvelope {
     /// Create and sign a new envelope.
     ///
@@ -2105,6 +2109,7 @@ impl SignedEnvelope {
     }
 }
 
+#[allow(deprecated)]
 impl ToCapnp for RequestEnvelope {
     type Builder<'a> = common_capnp::request_envelope::Builder<'a>;
 
@@ -2139,6 +2144,7 @@ impl ToCapnp for RequestEnvelope {
     }
 }
 
+#[allow(deprecated)]
 impl FromCapnp for RequestEnvelope {
     type Reader<'a> = common_capnp::request_envelope::Reader<'a>;
 
@@ -2285,6 +2291,7 @@ impl FromCapnp for RequestEnvelope {
     }
 }
 
+#[allow(deprecated)]
 impl ToCapnp for SignedEnvelope {
     type Builder<'a> = common_capnp::signed_envelope::Builder<'a>;
 
@@ -2311,6 +2318,7 @@ impl ToCapnp for SignedEnvelope {
     }
 }
 
+#[allow(deprecated)]
 impl FromCapnp for SignedEnvelope {
     type Reader<'a> = common_capnp::signed_envelope::Reader<'a>;
 
@@ -2442,6 +2450,7 @@ pub struct ResponseEnvelope {
     pub policy: crate::crypto::CryptoPolicy,
 }
 
+#[allow(deprecated)]
 impl ResponseEnvelope {
     /// Response signing-data: `request_id (8 bytes LE) || payload`.
     fn signing_data(request_id: u64, payload: &[u8]) -> Vec<u8> {
@@ -2801,6 +2810,7 @@ impl ResponseEnvelope {
     }
 }
 
+#[allow(deprecated)]
 impl ToCapnp for ResponseEnvelope {
     type Builder<'a> = common_capnp::response_envelope::Builder<'a>;
 
@@ -2816,6 +2826,7 @@ impl ToCapnp for ResponseEnvelope {
     }
 }
 
+#[allow(deprecated)]
 impl FromCapnp for ResponseEnvelope {
     type Reader<'a> = common_capnp::response_envelope::Reader<'a>;
 

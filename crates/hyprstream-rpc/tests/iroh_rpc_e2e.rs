@@ -1,3 +1,4 @@
+#![allow(deprecated)]
 //! End-to-end Phase 2 canary: real SignedEnvelope round-trip over iroh.
 //!
 //! Wires a minimal [`RequestService`] through:

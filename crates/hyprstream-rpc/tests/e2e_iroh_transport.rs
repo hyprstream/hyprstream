@@ -1,3 +1,4 @@
+#![allow(deprecated)]
 //! E4 (#421) — Iroh transport end-to-end (single host, two endpoints).
 //!
 //! Validates that the Iroh substrate (#410, PRIMARY production transport, default

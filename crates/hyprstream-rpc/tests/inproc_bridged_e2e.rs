@@ -1,3 +1,4 @@
+#![allow(deprecated)]
 //! End-to-end test for the default (inproc) flipped serve path — the #136 cut's
 //! most-used path, previously untested (the UDS canary covers ipc only).
 //!

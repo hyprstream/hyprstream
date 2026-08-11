@@ -1,3 +1,4 @@
+#![allow(deprecated)]
 //! #1153 integration: authenticate the `/moq` WebTransport CONNECT and bind
 //! tenant scoping.
 //!
