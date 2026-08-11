@@ -8,7 +8,7 @@ use hex;
 // Vector loading
 // ---------------------------------------------------------------------------
 
-fn load_positive_vectors() -> Vec<(String, Vec<u8>)> {
+pub(crate) fn load_positive_vectors() -> Vec<(String, Vec<u8>)> {
     let json_str = include_str!("../../../../docs/standards/v16/vectors/proof-v1-positive.json");
     let parsed: serde_json::Value = serde_json::from_str(json_str).expect("valid JSON");
     parsed["vectors"]

@@ -25,6 +25,7 @@ pub mod claims;
 pub mod parser;
 pub mod plan;
 pub mod response;
+pub mod verify;
 
 #[cfg(test)]
 mod tests;
