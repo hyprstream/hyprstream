@@ -87,7 +87,10 @@ impl ResponseBinding {
                     mode = Some(ResponseMode::from_u64(m)?);
                 }
                 3 => {
-                    kem_recipient = Some(KemRecipient::decode(val)?);
+                    kem_recipient = match val {
+                        CborValue::Null => None,
+                        _ => Some(KemRecipient::decode(val)?),
+                    };
                 }
                 _ => bail!("response_binding: unknown key {ik}"),
             }
@@ -95,7 +98,8 @@ impl ResponseBinding {
 
         let response_schema_id = response_schema_id
             .ok_or_else(|| anyhow::anyhow!("response_binding: missing response_schema_id"))?;
-        let mode = mode.ok_or_else(|| anyhow::anyhow!("response_binding: missing response_mode"))?;
+        let mode =
+            mode.ok_or_else(|| anyhow::anyhow!("response_binding: missing response_mode"))?;
 
         // Encrypted mode MUST carry KEM recipient; others MUST NOT.
         match mode {
@@ -141,7 +145,10 @@ impl KemRecipient {
                 2 => {
                     let k = decode_bstr(val, "encapsulation_key")?;
                     if k.len() != 1184 {
-                        bail!("kem_recipient: encapsulation_key must be 1184 bytes, got {}", k.len());
+                        bail!(
+                            "kem_recipient: encapsulation_key must be 1184 bytes, got {}",
+                            k.len()
+                        );
                     }
                     encapsulation_key = Some(k);
                 }
@@ -157,8 +164,8 @@ impl KemRecipient {
         }
 
         let alg = alg.ok_or_else(|| anyhow::anyhow!("kem_recipient: missing alg"))?;
-        let encapsulation_key =
-            encapsulation_key.ok_or_else(|| anyhow::anyhow!("kem_recipient: missing encapsulation_key"))?;
+        let encapsulation_key = encapsulation_key
+            .ok_or_else(|| anyhow::anyhow!("kem_recipient: missing encapsulation_key"))?;
         let kid = kid.ok_or_else(|| anyhow::anyhow!("kem_recipient: missing kid"))?;
 
         Ok(Self {

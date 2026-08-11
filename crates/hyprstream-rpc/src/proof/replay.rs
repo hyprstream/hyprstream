@@ -95,7 +95,10 @@ impl InMemoryReplayStore {
     }
 
     #[cfg(not(target_arch = "wasm32"))]
-    fn lock(&self, partition: ProofDisposition) -> parking_lot::MutexGuard<'_, HashMap<ReplayKey, u64>> {
+    fn lock(
+        &self,
+        partition: ProofDisposition,
+    ) -> parking_lot::MutexGuard<'_, HashMap<ReplayKey, u64>> {
         match partition {
             ProofDisposition::Authenticated => self.authenticated.lock(),
             ProofDisposition::Unattributed => self.unattributed.lock(),

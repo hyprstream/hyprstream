@@ -11,10 +11,10 @@ use ciborium::value::Value as CborValue;
 
 #[allow(unused_imports)]
 use super::{
-    CREDENTIAL_HASH_SIZE, MAX_AUD_BYTES, MAX_BODY_BYTES, MIN_CHALLENGE_BYTES,
-    MAX_CHALLENGE_BYTES, REQUEST_ID_SIZE, CLAIM_CAPNP_BODY_BYTES, CLAIM_CAPNP_SCHEMA_ID,
-    CLAIM_CREDENTIAL_HASH, CLAIM_RESPONSE_BINDING, CWT_CLAIM_AUD, CWT_CLAIM_CTI, CWT_CLAIM_EXP,
-    CWT_CLAIM_IAT, CWT_CLAIM_NONCE, CredentialHash, RequestId,
+    CredentialHash, RequestId, CLAIM_CAPNP_BODY_BYTES, CLAIM_CAPNP_SCHEMA_ID,
+    CLAIM_CREDENTIAL_HASH, CLAIM_RESPONSE_BINDING, CREDENTIAL_HASH_SIZE, CWT_CLAIM_AUD,
+    CWT_CLAIM_CTI, CWT_CLAIM_EXP, CWT_CLAIM_IAT, CWT_CLAIM_NONCE, MAX_AUD_BYTES, MAX_BODY_BYTES,
+    MAX_CHALLENGE_BYTES, MIN_CHALLENGE_BYTES, REQUEST_ID_SIZE,
 };
 use crate::proof::response::ResponseBinding;
 
@@ -54,9 +54,13 @@ impl ProofClaims {
     /// - Every listed claim is present (absent claims deny).
     /// - Proof-v1 size caps on `aud`, body bytes, challenge.
     pub fn decode(payload: &[u8]) -> Result<Self> {
-        // Deterministic decode: reject indefinite lengths, tags, floats,
-        // non-minimal integers, unsorted or duplicate map keys.
-        let value = deterministic_decode(payload)?;
+        // Raw-byte deterministic audit BEFORE ciborium deserialization
+        // (ciborium resolves indefinite lengths and non-minimal integers
+        // transparently, destroying the evidence).
+        super::cbor_audit::audit_deterministic(payload)?;
+
+        let value: CborValue = ciborium::de::from_reader(&mut std::io::Cursor::new(payload))
+            .map_err(|e| anyhow::anyhow!("proof claims: CBOR decode failed: {e}"))?;
 
         let map = match &value {
             CborValue::Map(m) => m,
@@ -81,7 +85,7 @@ impl ProofClaims {
             };
             match ik {
                 x if x == CWT_CLAIM_AUD as i128 => {
-                    aud = Some(decode_text(val, "aud", MAX_AUD_BYTES)?);
+                    aud = Some(decode_text(val, "aud", 1, MAX_AUD_BYTES)?);
                 }
                 x if x == CWT_CLAIM_EXP as i128 => {
                     exp = Some(decode_uint(val, "exp")?);
@@ -93,7 +97,12 @@ impl ProofClaims {
                     cti = Some(decode_bstr_fixed(val, "cti", REQUEST_ID_SIZE)?);
                 }
                 x if x == CWT_CLAIM_NONCE as i128 => {
-                    nonce = Some(decode_bstr_range(val, "Nonce", MIN_CHALLENGE_BYTES, MAX_CHALLENGE_BYTES)?);
+                    nonce = Some(decode_bstr_range(
+                        val,
+                        "Nonce",
+                        MIN_CHALLENGE_BYTES,
+                        MAX_CHALLENGE_BYTES,
+                    )?);
                 }
                 x if x == CLAIM_CREDENTIAL_HASH as i128 => {
                     credential_hash = Some(decode_credential_hash(val)?);
@@ -104,7 +113,10 @@ impl ProofClaims {
                 x if x == CLAIM_CAPNP_BODY_BYTES as i128 => {
                     let b = decode_bstr(val, "capnp_request_bytes")?;
                     if b.len() > MAX_BODY_BYTES {
-                        bail!("proof claims: capnp_request_bytes exceeds {} bytes", MAX_BODY_BYTES);
+                        bail!(
+                            "proof claims: capnp_request_bytes exceeds {} bytes",
+                            MAX_BODY_BYTES
+                        );
                     }
                     capnp_request_bytes = Some(b);
                 }
@@ -165,91 +177,16 @@ fn decode_credential_hash(val: &CborValue) -> Result<Option<CredentialHash>> {
 }
 
 // ---------------------------------------------------------------------------
-// Deterministic decode helpers
+// Typed CBOR extractors — deterministic encoding is enforced at the byte
+// level by `cbor_audit::audit_deterministic` before ciborium deserialization.
 // ---------------------------------------------------------------------------
 
-/// Decode CBOR under RFC 8949 core deterministic constraints.
-///
-/// Rejects indefinite lengths, tags, floating-point values, non-minimal
-/// integers, and unsorted or duplicate map keys. This is the acceptance
-/// criterion: non-deterministic encodings deny.
-fn deterministic_decode(bytes: &[u8]) -> Result<CborValue> {
-    let mut reader = std::io::Cursor::new(bytes);
-    let value: CborValue = ciborium::de::from_reader(&mut reader)
-        .map_err(|e| anyhow::anyhow!("proof claims: CBOR decode failed: {e}"))?;
-
-    // Reject trailing data.
-    let position = reader.position() as usize;
-    if position != bytes.len() {
-        bail!("proof claims: trailing data after CBOR ({})", bytes.len() - position);
-    }
-
-    // Walk the value tree and enforce deterministic constraints.
-    check_deterministic(&value)?;
-
-    Ok(value)
-}
-
-fn check_deterministic(v: &CborValue) -> Result<()> {
-    match v {
-        CborValue::Integer(_) | CborValue::Bytes(_) | CborValue::Text(_) | CborValue::Bool(_)
-        | CborValue::Null => {}
-        CborValue::Float(_) => bail!("proof claims: floating-point value denied"),
-        CborValue::Tag(tag, _) => {
-            bail!("proof claims: CBOR tag {} denied", tag);
-        }
-        CborValue::Array(arr) => {
-            for elem in arr {
-                check_deterministic(elem)?;
-            }
-        }
-        CborValue::Map(m) => {
-            // Check that keys are in ascending canonical order and unique.
-            let mut prev: Option<&CborValue> = None;
-            for (key, val) in m.iter() {
-                if let Some(p) = prev {
-                    if !canonical_key_less(p, key) {
-                        if p == key {
-                            bail!("proof claims: duplicate map key");
-                        }
-                        bail!("proof claims: map keys not in canonical order");
-                    }
-                }
-                check_deterministic(key)?;
-                check_deterministic(val)?;
-                prev = Some(key);
-            }
-        }
-        _ => bail!("proof claims: unrecognized CBOR value"),
-    }
-    Ok(())
-}
-
-/// RFC 8949 deterministic map-key ordering: by the canonical encoding's
-/// sort order (shorter keys first, then lexicographic). `ciborium::Map`
-/// is a `Vec<(Value, Value)>` preserving insertion order, so we check here.
-fn canonical_key_less(a: &CborValue, b: &CborValue) -> bool {
-    // RFC 8949 §4.2.1: map keys sorted by bytewise lexicographic order of
-    // their deterministic encodings. We compare the CBOR-encoded bytes.
-    let a_bytes = cbor_canonical_bytes(a);
-    let b_bytes = cbor_canonical_bytes(b);
-    a_bytes < b_bytes
-}
-
-
-fn cbor_canonical_bytes(v: &CborValue) -> Vec<u8> {
-    let mut buf = Vec::new();
-    let _ = ciborium::ser::into_writer(v, &mut buf);
-    buf
-}
-
-// ---------------------------------------------------------------------------
-// Typed CBOR extractors
-// ---------------------------------------------------------------------------
-
-fn decode_text(v: &CborValue, name: &str, max_bytes: usize) -> Result<String> {
+fn decode_text(v: &CborValue, name: &str, min_bytes: usize, max_bytes: usize) -> Result<String> {
     match v {
         CborValue::Text(s) => {
+            if s.len() < min_bytes {
+                bail!("proof claims: {name} must be at least {min_bytes} bytes");
+            }
             if s.len() > max_bytes {
                 bail!("proof claims: {name} exceeds {max_bytes} bytes");
             }
@@ -292,15 +229,13 @@ fn decode_bstr_fixed<const N: usize>(v: &CborValue, name: &str, size: usize) -> 
     Ok(arr)
 }
 
-fn decode_bstr_range(
-    v: &CborValue,
-    name: &str,
-    min: usize,
-    max: usize,
-) -> Result<Vec<u8>> {
+fn decode_bstr_range(v: &CborValue, name: &str, min: usize, max: usize) -> Result<Vec<u8>> {
     let b = decode_bstr(v, name)?;
     if b.len() < min || b.len() > max {
-        bail!("proof claims: {name} must be {min}..{max} bytes, got {}", b.len());
+        bail!(
+            "proof claims: {name} must be {min}..{max} bytes, got {}",
+            b.len()
+        );
     }
     Ok(b)
 }

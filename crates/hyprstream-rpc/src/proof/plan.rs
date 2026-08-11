@@ -9,9 +9,8 @@ use anyhow::{bail, Result};
 use ciborium::value::Value as CborValue;
 
 use super::{
-    ALG_ED25519, ALG_ML_DSA_65, MAX_COMPONENTS_PER_GROUP, MAX_KID_BYTES,
-    MAX_SIGNER_GROUPS, MAX_SIGNATURE_ENTRIES, MAX_SUITE_ID_BYTES, SUITE_CLASSICAL,
-    SUITE_HYBRID,
+    ALG_ED25519, ALG_ML_DSA_65, MAX_COMPONENTS_PER_GROUP, MAX_KID_BYTES, MAX_SIGNATURE_ENTRIES,
+    MAX_SIGNER_GROUPS, MAX_SUITE_ID_BYTES, SUITE_CLASSICAL, SUITE_HYBRID,
 };
 
 /// A single component within a signer group (one COSE algorithm + key ID).
@@ -184,7 +183,7 @@ fn decode_components(v: &CborValue) -> Result<Vec<SignatureComponent>> {
                     alg = Some(decode_int(val, "alg")?);
                 }
                 2 => {
-                    let k = decode_bstr(val, "kid")?;
+                    let k = decode_kid(val)?;
                     if k.is_empty() || k.len() > MAX_KID_BYTES {
                         bail!("kid: must be 1..{MAX_KID_BYTES} bytes, got {}", k.len());
                     }
@@ -266,9 +265,13 @@ fn decode_text(v: &CborValue, name: &str, max: usize) -> Result<String> {
     }
 }
 
-fn decode_bstr(v: &CborValue, name: &str) -> Result<Vec<u8>> {
+/// Decode a kid value — accept both CBOR text strings and byte strings,
+/// normalizing to raw bytes. The frozen canonical vectors use text-string
+/// kids (e.g. "unattributed-ed25519-1"), so both forms must be accepted.
+fn decode_kid(v: &CborValue) -> Result<Vec<u8>> {
     match v {
         CborValue::Bytes(b) => Ok(b.clone()),
-        _ => bail!("{name}: must be bstr"),
+        CborValue::Text(s) => Ok(s.as_bytes().to_vec()),
+        _ => bail!("kid: must be bstr or tstr"),
     }
 }
