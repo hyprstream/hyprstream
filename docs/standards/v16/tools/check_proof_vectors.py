@@ -1,0 +1,315 @@
+#!/usr/bin/env python3
+"""Check the checked-in proof-v1 vectors.
+
+Verifies, for the positive vectors, that:
+  * `sha256` and `size_bytes` match `cbor_hex`;
+  * the object decodes as an untagged COSE_Sign1/COSE_Sign structure;
+  * every payload and protected-header bucket is RFC 8949 core-deterministic
+    (definite lengths, sorted unique map keys, no tags, no floats);
+  * every signature verifies over the profile's `Sig_structure` with a
+    zero-length `external_aad`, using the published test keys; and
+  * every signature entry's `(alg, kid, group)` matches exactly one component
+    of the signed `signature_plan`.
+
+For the negative vectors it verifies only the digest and that the bytes differ
+from every positive vector: their expected disposition is `deny`, which is a
+statement about a verifier, not about these bytes.
+
+Usage:  python3 check_proof_vectors.py [vectors_dir]
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+
+FAILURES: list[str] = []
+
+
+def fail(msg: str) -> None:
+    FAILURES.append(msg)
+
+
+# --------------------------------------------------------------------------
+# Minimal strict CBOR decoder (rejects everything the profile forbids)
+# --------------------------------------------------------------------------
+
+
+class StrictError(Exception):
+    pass
+
+
+def decode(data: bytes, *, strict: bool = True):
+    value, rest = _decode(data, strict)
+    if rest:
+        raise StrictError("trailing data")
+    return value
+
+
+def _decode(b: bytes, strict: bool):
+    if not b:
+        raise StrictError("truncated")
+    ib = b[0]
+    major, ai = ib >> 5, ib & 0x1F
+    rest = b[1:]
+    if ai == 31:
+        raise StrictError("indefinite length")
+    if ai < 24:
+        val = ai
+    elif ai == 24:
+        val, rest = rest[0], rest[1:]
+        if strict and val < 24:
+            raise StrictError("non-minimal integer encoding")
+    elif ai in (25, 26, 27):
+        n = {25: 2, 26: 4, 27: 8}[ai]
+        val, rest = int.from_bytes(rest[:n], "big"), rest[n:]
+        if strict and val < {25: 24, 26: 0x10000, 27: 0x100000000}[ai]:
+            raise StrictError("non-minimal integer encoding")
+    else:
+        raise StrictError(f"unsupported additional information {ai}")
+
+    if major == 7:
+        # Only the three simple values the profile uses; floats (ai 25-27) and
+        # every other simple value are rejected above or here.
+        if ai in (20, 21, 22):
+            return {20: False, 21: True, 22: None}[ai], rest
+        raise StrictError("floating-point and other simple values are forbidden")
+    if major == 0:
+        return val, rest
+    if major == 1:
+        return -1 - val, rest
+    if major == 2:
+        return rest[:val], rest[val:]
+    if major == 3:
+        return rest[:val].decode("utf-8"), rest[val:]
+    if major == 4:
+        out = []
+        for _ in range(val):
+            item, rest = _decode(rest, strict)
+            out.append(item)
+        return out, rest
+    if major == 5:
+        out = {}
+        prev_key_bytes = None
+        for _ in range(val):
+            before = rest
+            key, rest = _decode(rest, strict)
+            key_bytes = before[: len(before) - len(rest)]
+            if strict:
+                if prev_key_bytes is not None and key_bytes <= prev_key_bytes:
+                    raise StrictError("map keys not sorted / duplicated")
+                prev_key_bytes = key_bytes
+            value, rest = _decode(rest, strict)
+            out[key] = value
+        return out, rest
+    if major == 6:
+        raise StrictError("tags are forbidden in this profile")
+    raise StrictError("unreachable")
+
+
+def enc_head(major: int, value: int) -> bytes:
+    if value < 24:
+        return bytes([(major << 5) | value])
+    if value < 0x100:
+        return bytes([(major << 5) | 24, value])
+    if value < 0x10000:
+        return bytes([(major << 5) | 25]) + value.to_bytes(2, "big")
+    if value < 0x100000000:
+        return bytes([(major << 5) | 26]) + value.to_bytes(4, "big")
+    return bytes([(major << 5) | 27]) + value.to_bytes(8, "big")
+
+
+def enc(obj) -> bytes:
+    if obj is None:
+        return b"\xf6"
+    if isinstance(obj, int):
+        return enc_head(0, obj) if obj >= 0 else enc_head(1, -1 - obj)
+    if isinstance(obj, bytes):
+        return enc_head(2, len(obj)) + obj
+    if isinstance(obj, str):
+        raw = obj.encode()
+        return enc_head(3, len(raw)) + raw
+    if isinstance(obj, list):
+        return enc_head(4, len(obj)) + b"".join(enc(i) for i in obj)
+    if isinstance(obj, dict):
+        items = sorted(((enc(k), enc(v)) for k, v in obj.items()), key=lambda kv: kv[0])
+        return enc_head(5, len(items)) + b"".join(k + v for k, v in items)
+    raise TypeError(type(obj))
+
+
+ALG_ED25519, ALG_ML_DSA_65 = -19, -49
+H_ALG, H_CRIT, H_KID, H_TYP = 1, 2, 4, 16
+H_DOMAIN, H_PLAN, H_GROUP, H_KEYSET = -70100, -70101, -70102, -70103
+
+
+def ml_dsa_verify(public: bytes, message: bytes, signature: bytes) -> bool:
+    with tempfile.TemporaryDirectory() as tmp:
+        key_path = Path(tmp) / "pub.der"
+        # Rebuild the SPKI: SEQUENCE { SEQUENCE { OID }, BIT STRING }
+        oid = bytes.fromhex("06096086480165030403") + b"\x12"  # id-ml-dsa-65
+        alg_id = b"\x30" + bytes([len(oid)]) + oid
+        bitstring_body = b"\x00" + public
+        bitstring = b"\x03" + _der_len(len(bitstring_body)) + bitstring_body
+        body = alg_id + bitstring
+        spki = b"\x30" + _der_len(len(body)) + body
+        key_path.write_bytes(spki)
+        msg_path, sig_path = Path(tmp) / "m", Path(tmp) / "s"
+        msg_path.write_bytes(message)
+        sig_path.write_bytes(signature)
+        proc = subprocess.run(
+            [
+                "openssl",
+                "pkeyutl",
+                "-verify",
+                "-pubin",
+                "-inkey",
+                str(key_path),
+                "-keyform",
+                "DER",
+                "-rawin",
+                "-in",
+                str(msg_path),
+                "-sigfile",
+                str(sig_path),
+            ],
+            capture_output=True,
+        )
+        return proc.returncode == 0
+
+
+def _der_len(n: int) -> bytes:
+    if n < 0x80:
+        return bytes([n])
+    raw = n.to_bytes((n.bit_length() + 7) // 8, "big")
+    return bytes([0x80 | len(raw)]) + raw
+
+
+def main() -> None:
+    vectors_dir = (
+        Path(sys.argv[1])
+        if len(sys.argv) > 1
+        else Path(__file__).resolve().parent.parent / "vectors"
+    )
+    keys = json.loads((vectors_dir / "proof-v1-keys.json").read_text())["keys"]
+    ed_by_kid = {
+        bytes.fromhex(k["kid_hex"]): bytes.fromhex(k["public_hex"])
+        for k in keys["ed25519"]
+    }
+    ml_by_kid = {
+        bytes.fromhex(k["kid_hex"]): bytes.fromhex(k["public_hex"])
+        for k in keys["ml_dsa_65"]
+    }
+
+    positive = json.loads((vectors_dir / "proof-v1-positive.json").read_text())
+    negative = json.loads((vectors_dir / "proof-v1-negative.json").read_text())
+
+    def check_digest(vec):
+        raw = bytes.fromhex(vec["cbor_hex"])
+        if hashlib.sha256(raw).hexdigest() != vec["sha256"]:
+            fail(f"{vec['id']}: sha256 mismatch")
+        if len(raw) != vec["size_bytes"]:
+            fail(f"{vec['id']}: size mismatch")
+        return raw
+
+    def plan_components(plan):
+        out = []
+        for grp in plan:
+            for comp in grp[3]:
+                out.append((grp[1], comp[1], comp[2]))
+        return out
+
+    def verify_component(vec, alg, kid, tbs, sig):
+        if alg == ALG_ED25519:
+            pub = ed_by_kid.get(kid)
+            if pub is None:
+                fail(f"{vec['id']}: unknown Ed25519 kid {kid!r}")
+                return
+            try:
+                Ed25519PublicKey.from_public_bytes(pub).verify(sig, tbs)
+            except InvalidSignature:
+                fail(f"{vec['id']}: Ed25519 signature does not verify")
+        elif alg == ALG_ML_DSA_65:
+            pub = ml_by_kid.get(kid)
+            if pub is None:
+                fail(f"{vec['id']}: unknown ML-DSA-65 kid {kid!r}")
+                return
+            if not ml_dsa_verify(pub, tbs, sig):
+                fail(f"{vec['id']}: ML-DSA-65 signature does not verify")
+        else:
+            fail(f"{vec['id']}: algorithm {alg} is not in the profile")
+
+    for vec in positive["vectors"]:
+        raw = check_digest(vec)
+        try:
+            obj = decode(raw)
+        except StrictError as exc:
+            fail(f"{vec['id']}: not deterministic CBOR: {exc}")
+            continue
+        if not isinstance(obj, list) or len(obj) != 4:
+            fail(f"{vec['id']}: not a 4-element COSE structure")
+            continue
+        body_protected, unprotected, payload, tail = obj
+        if unprotected:
+            fail(f"{vec['id']}: unprotected header is not empty")
+        try:
+            body_hdr = decode(body_protected)
+            decode(payload)
+        except StrictError as exc:
+            fail(f"{vec['id']}: protected/payload not deterministic: {exc}")
+            continue
+        plan = body_hdr.get(H_PLAN)
+        if plan is None:
+            fail(f"{vec['id']}: no signature_plan in the body protected headers")
+            continue
+        components = plan_components(plan)
+        if vec["structure"] == "COSE_Sign1":
+            tbs = enc(["Signature1", body_protected, b"", payload])
+            alg, kid, grp = body_hdr[H_ALG], body_hdr[H_KID], body_hdr[H_GROUP]
+            if (grp, alg, kid) not in components:
+                fail(f"{vec['id']}: signature does not match a plan component")
+            verify_component(vec, alg, kid, tbs, tail)
+        else:
+            seen = []
+            for entry in tail:
+                sprot, sunprot, sig = entry
+                if sunprot:
+                    fail(f"{vec['id']}: signature unprotected header is not empty")
+                shdr = decode(sprot)
+                alg, kid, grp = shdr[H_ALG], shdr[H_KID], shdr[H_GROUP]
+                if (grp, alg, kid) not in components:
+                    fail(f"{vec['id']}: entry {kid!r} matches no plan component")
+                if (grp, alg, kid) in seen:
+                    fail(f"{vec['id']}: duplicate plan component {kid!r}")
+                seen.append((grp, alg, kid))
+                verify_component(
+                    vec, alg, kid, enc(["Signature", body_protected, sprot, b"", payload]), sig
+                )
+            if len(seen) != len(components):
+                fail(f"{vec['id']}: signature entries do not cover the plan exactly")
+
+    positive_bytes = {v["cbor_hex"] for v in positive["vectors"]}
+    for vec in negative["vectors"]:
+        check_digest(vec)
+        if vec["expect"] != "deny":
+            fail(f"{vec['id']}: negative vector must expect deny")
+        if vec["id"] != "N-2" and vec["cbor_hex"] in positive_bytes:
+            fail(f"{vec['id']}: negative vector duplicates a positive vector")
+
+    total = len(positive["vectors"]) + len(negative["vectors"])
+    if FAILURES:
+        for line in FAILURES:
+            print(f"FAIL {line}")
+        print(f"{len(FAILURES)} failure(s) across {total} vectors")
+        sys.exit(1)
+    print(f"OK: {len(positive['vectors'])} positive, {len(negative['vectors'])} negative vectors check out")
+
+
+if __name__ == "__main__":
+    main()
