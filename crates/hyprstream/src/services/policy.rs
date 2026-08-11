@@ -128,8 +128,6 @@ pub struct PolicyService {
     /// Event prefix state for secure event transport (Phase 7).
     /// PolicyService is a blind relay — stores opaque wrapped blobs, never plaintext keys.
     event_prefixes: RwLock<HashMap<EventPrefixKey, EventPrefixState>>,
-    /// Shared JWT ID blocklist for access token revocation.
-    jti_blocklist: Arc<hyprstream_rpc::auth::InMemoryCredentialRevocationStore>,
     /// ES256 (P-256) key rotation store for DPoP/atproto interop.
     es256_key_store: Option<Arc<crate::auth::Es256SigningKeyStore>>,
     /// ML-DSA-65 key rotation store for PQ-hybrid composite token issuance.
@@ -163,7 +161,6 @@ impl PolicyService {
             jwt_key_source: None,
             transport,
             event_prefixes: RwLock::new(HashMap::new()),
-            jti_blocklist: Arc::new(hyprstream_rpc::auth::InMemoryCredentialRevocationStore::new()),
             es256_key_store: None,
             ml_dsa_key_store: None,
             token_clearance_resolver: Arc::new(|subject| {
@@ -171,11 +168,6 @@ impl PolicyService {
                 policy.clearance_for(subject)
             }),
         }
-    }
-
-    /// Get a shared reference to the JWT ID blocklist (for wiring into OAuthState).
-    pub fn jti_blocklist_arc(&self) -> Arc<hyprstream_rpc::auth::InMemoryCredentialRevocationStore> {
-        Arc::clone(&self.jti_blocklist)
     }
 
     /// Set the default audience for issued tokens (typically the OAuth issuer URL).
@@ -1985,12 +1977,8 @@ impl RequestService for PolicyService {
         hyprstream_service::global_trust_store().resolve_subject(signer_pubkey)
     }
 
-    fn credential_revocation_store(&self) -> Option<&dyn hyprstream_rpc::auth::CredentialRevocationStore> {
-        // The default trait method returns the process-global store that
-        // PolicyService published at startup. Override only if a test needs
-        // a store that differs from the global.
-        hyprstream_rpc::auth::global_credential_revocation_store().map(std::convert::AsRef::as_ref)
-    }
+    // credential_revocation_store() uses the default trait impl, which
+    // returns the process-global store. No override needed.
 
     fn cache_key_binding(
         &self,

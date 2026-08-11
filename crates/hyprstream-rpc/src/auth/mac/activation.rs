@@ -310,7 +310,7 @@ pub fn remember_verified_claims(
         return;
     };
     // Derive the JWT credential ID from `(iss, jti)`. CWT credential paths
-    // use [`remember_verified_subject_credential`] with an explicit CWT
+    // use [`remember_verified_claims_with_credential`] with an explicit CWT
     // CredentialId so `cti` bytes are never stringified.
     let credential_id = claims
         .jti

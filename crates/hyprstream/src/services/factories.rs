@@ -61,12 +61,6 @@ fn service_token(signing_key: &SigningKey) -> Option<String> {
 static SHARED_GIT2DB: std::sync::OnceLock<Arc<RwLock<Git2DB>>> = std::sync::OnceLock::new();
 
 /// Shared JTI blocklist Arc — set by `create_policy_service`, read by
-/// `create_oauth_service`. Because PolicyService is always created first
-/// (OAuthService `depends_on = ["policy"]`), the lock is always populated
-/// before `create_oauth_service` runs.
-static SHARED_JTI_BLOCKLIST: std::sync::OnceLock<Arc<hyprstream_rpc::auth::InMemoryCredentialRevocationStore>> =
-    std::sync::OnceLock::new();
-
 /// Get or initialize the shared Git2DB registry for the given models directory.
 fn get_or_init_git2db(models_dir: &std::path::Path) -> anyhow::Result<Arc<RwLock<Git2DB>>> {
     if let Some(existing) = SHARED_GIT2DB.get() {
@@ -887,13 +881,14 @@ fn create_policy_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
     // implementations via the default trait method). There is exactly one
     // store — no per-service fallback. Both publications MUST succeed —
     // a second store from a race is a startup error.
-    let shared_store = policy_service.jti_blocklist_arc();
-    if SHARED_JTI_BLOCKLIST.set(Arc::clone(&shared_store)).is_err() {
-        anyhow::bail!("SHARED_JTI_BLOCKLIST already set (publication race)");
-    }
-    if hyprstream_rpc::auth::set_global_credential_revocation_store(shared_store).is_err() {
-        anyhow::bail!("global credential-revocation store already set (publication race)");
-    }
+    // Publish the credential-revocation store globally. PolicyService is
+    // the sole owner; all consumers (OAI, OAuth, MCP, RPC verify_claims)
+    // read the global. There is no separate store instance.
+    let store = std::sync::Arc::new(
+        hyprstream_rpc::auth::InMemoryCredentialRevocationStore::new(),
+    );
+    hyprstream_rpc::auth::set_global_credential_revocation_store(store)
+        .map_err(|_| anyhow::anyhow!("global credential-revocation store already set (publication race)"))?;
 
     Ok(ctx.into_spawnable_quic(policy_service, config.policy.quic_port))
 }
@@ -1651,14 +1646,6 @@ fn create_oai_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
                 resource_url,
                 oauth_issuer_url,
                 &config.oauth.trusted_issuers,
-                // Use the PolicyService-owned shared credential-revocation store.
-                // There is exactly one store — no per-service fallback and no
-                // second store. PolicyService must have published it by now
-                // (it is a startup dependency); absence is a startup error.
-                SHARED_JTI_BLOCKLIST
-                    .get()
-                    .cloned()
-                    .context("PolicyService has not published the shared credential-revocation store")?,
                 ninep_decider,
             )
             .await
@@ -1718,16 +1705,11 @@ fn create_xet_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
         crate::auth::FederationKeyResolver::new(&config.oauth.trusted_issuers)
             .with_policy_client(Arc::new(policy_client)),
     );
-    let jti_blocklist = SHARED_JTI_BLOCKLIST
-        .get()
-        .map(Arc::clone)
-        .context("PolicyService did not publish the shared JTI blocklist before Xet startup")?;
     let auth = ResourceAuthState::new(
         ctx.jwt_verifying_key(),
         config.xet.resource_url(),
         config.oauth.issuer_url(),
         federation_resolver,
-        jti_blocklist,
     );
     let cas_pep = tokio::task::block_in_place(|| {
         tokio::runtime::Handle::current().block_on(crate::mac::production_cas_pep(
@@ -1814,16 +1796,11 @@ fn create_flight_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
         crate::auth::FederationKeyResolver::new(&config.oauth.trusted_issuers)
             .with_policy_client(Arc::new(policy_client.clone())),
     );
-    let jti_blocklist = SHARED_JTI_BLOCKLIST
-        .get()
-        .map(Arc::clone)
-        .context("PolicyService did not publish the shared JTI blocklist before Flight startup")?;
     let auth = crate::server::state::ResourceAuthState::new(
         ctx.jwt_verifying_key(),
         config.flight.resource_url(),
         config.oauth.issuer_url(),
         federation_resolver,
-        jti_blocklist,
     );
     let authorizer = Arc::new(crate::services::flight::TenantFlightAuthorizer::new(
         auth,
@@ -1885,7 +1862,7 @@ fn create_oauth_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnabl
     // Pass signing key instead of a pre-created PolicyClient.
     // OAuthService runs in its own tokio runtime (separate thread), so the
     // PolicyClient must be created inside that runtime for ZMQ async I/O to work.
-    let mut oauth_service = OAuthService::new(
+    let oauth_service = OAuthService::new(
         config.oauth.clone(),
         config.tls.clone(),
         config.account.clone(),
@@ -1896,13 +1873,6 @@ fn create_oauth_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnabl
     )
     .with_quic_config(config.quic.clone())
     .with_identity_registration_api(identity_registration_api);
-    if let Some(bl) = SHARED_JTI_BLOCKLIST.get() {
-        oauth_service = oauth_service.with_jti_blocklist(Arc::clone(bl));
-    } else {
-        tracing::warn!(
-            "JTI blocklist not set by PolicyService factory — revoked access tokens will not be blocked at RPC layer"
-        );
-    }
 
     Ok(Box::new(oauth_service))
 }

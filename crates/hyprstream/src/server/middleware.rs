@@ -1411,9 +1411,12 @@ mod rotation_aware_tests {
 
     #[test]
     fn revoked_jti_still_rejected() {
-        // A rotation-signed token decodes cleanly, but the shared jti-blocklist
-        // check `verify_token_claims` performs after decode still rejects it.
-        use hyprstream_rpc::auth::{CredentialId, CredentialRevocationStore as _, InMemoryCredentialRevocationStore};
+        // A rotation-signed token decodes cleanly, but the global
+        // credential-revocation store check still rejects it.
+        use hyprstream_rpc::auth::{
+            global_credential_revocation_store, set_global_credential_revocation_store,
+            CredentialId, InMemoryCredentialRevocationStore,
+        };
 
         let ca = new_key();
         let rotation = new_key();
@@ -1431,11 +1434,17 @@ mod rotation_aware_tests {
         .unwrap();
         assert_eq!(claims.jti.as_deref(), Some("jti-777"));
 
-        let blocklist = InMemoryCredentialRevocationStore::new();
+        // Ensure the global store is set.
+        if global_credential_revocation_store().is_none() {
+            let _ = set_global_credential_revocation_store(std::sync::Arc::new(
+                InMemoryCredentialRevocationStore::new(),
+            ));
+        }
+        let store = global_credential_revocation_store().unwrap();
         let issuer = claims.iss.as_str();
-        blocklist.revoke_credential(CredentialId::jwt(issuer, "jti-777"), now() + 3600);
+        store.revoke_credential(CredentialId::jwt(issuer, "jti-777"), now() + 3600);
         // This mirrors the exact post-decode check in `verify_token_claims`.
-        assert!(blocklist.is_revoked(&CredentialId::jwt(issuer, claims.jti.as_deref().unwrap())));
+        assert!(store.is_revoked(&CredentialId::jwt(issuer, claims.jti.as_deref().unwrap())));
     }
 
     #[test]
@@ -1850,7 +1859,10 @@ mod composite_aware_tests {
 
     #[test]
     fn composite_jti_remains_subject_to_revocation() {
-        use hyprstream_rpc::auth::{CredentialId, CredentialRevocationStore as _, InMemoryCredentialRevocationStore};
+        use hyprstream_rpc::auth::{
+            global_credential_revocation_store, set_global_credential_revocation_store,
+            CredentialId, InMemoryCredentialRevocationStore,
+        };
 
         let ca = new_ed_key();
         let (pq, pq_vk) = new_ml_dsa();
@@ -1878,9 +1890,14 @@ mod composite_aware_tests {
         .unwrap();
         let jti = verified.jti.as_deref().unwrap();
         let issuer = verified.iss.as_str();
-        let blocklist = InMemoryCredentialRevocationStore::new();
-        blocklist.revoke_credential(CredentialId::jwt(issuer, jti), verified.exp);
-        assert!(blocklist.is_revoked(&CredentialId::jwt(issuer, jti)));
+        if global_credential_revocation_store().is_none() {
+            let _ = set_global_credential_revocation_store(std::sync::Arc::new(
+                InMemoryCredentialRevocationStore::new(),
+            ));
+        }
+        let store = global_credential_revocation_store().unwrap();
+        store.revoke_credential(CredentialId::jwt(issuer, jti), verified.exp);
+        assert!(store.is_revoked(&CredentialId::jwt(issuer, jti)));
     }
 
     #[test]

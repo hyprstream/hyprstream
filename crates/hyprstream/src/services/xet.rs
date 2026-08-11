@@ -439,7 +439,7 @@ mod tests {
     use axum::http::Request as HttpRequest;
     use hyprstream_rpc::auth::{
         CompositeKeyPair, CompositeKeySet, CompositePairRole, CompositePairState,
-        CredentialId, InMemoryCredentialRevocationStore,
+        CredentialId,
     };
     use std::collections::HashMap;
     use tower::ServiceExt; // oneshot
@@ -515,7 +515,6 @@ mod tests {
                 AUDIENCE.to_owned(),
                 ISSUER.to_owned(),
                 federation_resolver,
-                Arc::new(InMemoryCredentialRevocationStore::new()),
             ),
             // These handler tests exercise successful byte/range behavior.
             // Production installs the fail-closed MAC authorizer in the factory.

@@ -441,7 +441,6 @@ pub struct OAuthService {
     /// JWTs signed by PolicyService, derived from the root signing key.
     jwt_verifying_key: [u8; 32],
     /// Shared JTI blocklist (same Arc as PolicyService) for cross-plane revocation.
-    jti_blocklist: Option<Arc<hyprstream_rpc::auth::InMemoryCredentialRevocationStore>>,
     /// Authority-owned hosted-account records for ATProto DID → tenant
     /// resolution. Attached by the PDS service composition layer.
     hosted_account_store: Option<Arc<hyprstream_pds_service::AccountRecordStore>>,
@@ -468,7 +467,6 @@ impl OAuthService {
             control_transport,
             verifying_key,
             jwt_verifying_key: jwt_verifying_key.to_bytes(),
-            jti_blocklist: None,
             hosted_account_store: None,
             identity_registration_api: None,
         }
@@ -477,15 +475,6 @@ impl OAuthService {
     /// Attach the global QUIC configuration for DID-doc cert-hash publication (#185).
     pub fn with_quic_config(mut self, quic: crate::config::QuicConfig) -> Self {
         self.quic_config = Some(quic);
-        self
-    }
-
-    /// Attach the shared JTI blocklist (same Arc as PolicyService).
-    pub fn with_jti_blocklist(
-        mut self,
-        bl: Arc<hyprstream_rpc::auth::InMemoryCredentialRevocationStore>,
-    ) -> Self {
-        self.jti_blocklist = Some(bl);
         self
     }
 
@@ -813,9 +802,6 @@ impl Spawnable for OAuthService {
             }
             if let Some(sink) = audit_sink {
                 oauth_state = oauth_state.with_audit_sink(sink);
-            }
-            if let Some(bl) = self.jti_blocklist {
-                oauth_state = oauth_state.with_jti_blocklist(bl);
             }
             // Populate legacy JWKS nbf/exp from signing-key file mtime (used when store absent).
             let key_nbf = crate::auth::identity_store::node_signing_key_mtime(&credentials_dir);
