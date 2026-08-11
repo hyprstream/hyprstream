@@ -97,8 +97,13 @@ fn verify_unattributed(proof: &ParsedProof) -> Result<()> {
     }
 }
 
-/// Verify an authenticated proof's Ed25519 component against the
-/// credential cnf-bound key.
+/// Verify an authenticated proof's component signatures.
+///
+/// COSE_Sign1: verifies the single Ed25519 component against the cnf key.
+/// COSE_Sign: DENIES. Multi-party proofs require per-entry enrollment
+/// resolution (kid → enrolled suite → ordered component keys → epoch).
+/// Using one cnf key for all entries would allow a single signer to
+/// impersonate distinct logical signer/approver groups (P-5 topology).
 fn verify_authenticated(proof: &ParsedProof, cnf_key: &ed25519_dalek::VerifyingKey) -> Result<()> {
     let cbor_bytes = proof_to_cose_bytes(proof)?;
 
@@ -113,27 +118,14 @@ fn verify_authenticated(proof: &ParsedProof, cnf_key: &ed25519_dalek::VerifyingK
                 .map_err(|e| anyhow!("cnf Ed25519 verification failed: {e}"))
         }
         CoseStructure::Sign => {
-            let sign = coset::CoseSign::from_slice(&cbor_bytes)
-                .map_err(|e| anyhow!("COSE_Sign decode: {e}"))?;
-            for (i, parsed_sig) in proof.signatures.iter().enumerate() {
-                match parsed_sig.alg {
-                    ALG_ED25519 => {
-                        sign
-                            .verify_signature(i, &[], |s, d| {
-                                verify_ed25519(s, d, cnf_key)
-                            })
-                            .map_err(|e| anyhow!("cnf Ed25519 sig {i}: {e}"))?;
-                    }
-                    ALG_ML_DSA_65 => {
-                        // For authenticated proofs, the ML-DSA-65 PQ key must
-                        // come from the credential cnf/trust store. Without
-                        // enrollment resolution, deny.
-                        bail!("ML-DSA-65 cnf key resolution not implemented; denying authenticated proof with hybrid suite");
-                    }
-                    other => bail!("unknown algorithm {other}; denying"),
-                }
-            }
-            Ok(())
+            // Per-entry enrollment resolution (kid → enrolled suite → ordered
+            // component keys → epoch) is required for multi-party proofs.
+            // Without it, a single cnf key cannot safely verify entries
+            // claiming distinct logical signer groups.
+            bail!(
+                "authenticated COSE_Sign requires per-entry enrollment/cnf \
+                 resolution; not yet implemented — denying"
+            );
         }
     }
 }

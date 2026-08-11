@@ -418,34 +418,45 @@ where
             }
         }
 
-        // Gate 4: Replay admission using the canonical #1516-pattern
-        // proof replay store (ProofReplayStore trait with process-global
-        // registration, per-partition capacity, and per-entry expiry).
-        crate::proof::admission::ensure_proof_replay_store();
+        // Gate 4: Replay admission using the process-global ProofReplayStore.
+        // No auto-install: the store must be explicitly installed at startup.
+        // If absent, deny fail-closed.
         let replay_store = crate::proof::admission::global_proof_replay_store()
-            .ok_or_else(|| anyhow::anyhow!("proof replay store not available"))?;
+            .ok_or_else(|| {
+                anyhow::anyhow!("no ProofReplayStore installed; install via set_global_proof_replay_store at startup")
+            })?;
 
-        // Compute the replay key.
-        let _now_secs = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
+        // Compute the replay key and expiry.
+        // Replay expiry = min(proof.exp, challenge_accept_until) for
+        // unattributed proofs; proof.exp for authenticated.
+        let replay_expiry = if proof.disposition == crate::proof::ProofDisposition::Unattributed {
+            // Challenge was validated above; use the challenge manager's
+            // accept_until to bound replay retention. If the manager is
+            // installed (required for unattributed), get its current's
+            // accept_until; otherwise deny (already denied above).
+            let now_secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let challenge_accept_until = crate::proof::admission::global_challenge_manager()
+                .and_then(|mgr| mgr.current(now_secs))
+                .map(|c| c.accept_until)
+                .unwrap_or(now_secs); // fallback: immediate expiry
+            proof.claims.exp.min(challenge_accept_until)
+        } else {
+            proof.claims.exp
+        };
+
         let replay_key = match proof.disposition {
             crate::proof::ProofDisposition::Unattributed => {
                 let thumbprint = proof.unattributed_replay_thumbprint()
                     .ok_or_else(|| anyhow::anyhow!("cannot compute unattributed thumbprint"))?;
-                // Replay expiry = min(proof.exp, challenge_accept_until).
-                // Without per-challenge accept_until tracking, use proof.exp.
                 crate::proof::admission::ProofReplayKey {
                     signer_thumbprint: thumbprint,
                     request_id: proof.claims.request_id,
                 }
             }
             crate::proof::ProofDisposition::Authenticated => {
-                // For authenticated proofs, the thumbprint is the
-                // credential-bound primary signer-suite key hash.
-                // Until cnf/enrollment resolution is fully wired, use
-                // the cnf Ed25519 key hash.
                 let cnf_key = ctx.authenticated_signer_key()
                     .ok_or_else(|| anyhow::anyhow!("authenticated proof: no cnf signer key"))?;
                 use sha2::{Digest, Sha256};
@@ -459,7 +470,7 @@ where
         match replay_store.check_and_insert(
             proof.disposition,
             &replay_key,
-            proof.claims.exp,
+            replay_expiry,
         ) {
             crate::proof::admission::ProofAdmissionResult::Admitted => {
                 debug!("{} proof replay admission: admitted", service.name());

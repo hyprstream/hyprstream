@@ -113,12 +113,8 @@ pub fn global_proof_replay_store() -> Option<&'static dyn ProofReplayStore> {
     PROOF_REPLAY_STORE.get().map(|s| &**s)
 }
 
-/// Install the default in-memory store if none is installed.
-pub fn ensure_proof_replay_store() {
-    if PROOF_REPLAY_STORE.get().is_none() {
-        let _ = PROOF_REPLAY_STORE.set(Box::new(InMemoryProofReplayStore::default()));
-    }
-}
+// Removed: auto-install was a fail-open. The store must be explicitly
+// installed via set_global_proof_replay_store(). Dispatch denies when absent.
 
 // ---------------------------------------------------------------------------
 // Process-global challenge manager
