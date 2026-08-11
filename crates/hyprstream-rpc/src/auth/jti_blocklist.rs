@@ -297,6 +297,7 @@ mod tests {
         };
 
         // Start from a clean cache.
+        let _cache_guard = crate::auth::mac::activation::CACHE_TEST_LOCK.lock();
         flush_verified_subject_cache_generation();
 
         let now = chrono::Utc::now().timestamp();
@@ -364,6 +365,88 @@ mod tests {
         assert_trait_shape::<InMemoryCredentialRevocationStore>();
     }
 
+    // ── CWT typed eviction: insertion via typed boundary, revoke, evict ───
+
+    /// A CWT credential (cti bytes) inserted via the checked boundary is
+    /// evicted when that exact `(iss, cti)` credential is revoked. JWT
+    /// credentials with the same text value survive — disjoint namespaces.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn cwt_credential_is_evicted_by_typed_revoke() {
+        use crate::auth::mac::{
+            flush_verified_subject_cache_generation, remember_verified_claims_with_credential,
+            revoke_verified_subject_credential, VerifiedKeyMaterial,
+        };
+
+        let _cache_guard = crate::auth::mac::activation::CACHE_TEST_LOCK.lock();
+        flush_verified_subject_cache_generation();
+
+        let issuer = "https://cwt.example";
+        let now = chrono::Utc::now().timestamp();
+        let shared_bytes = b"same-id".to_vec();
+
+        let cwt_id = CredentialId {
+            issuer: issuer.to_owned(),
+            value: CredentialValue::Cwt(shared_bytes.clone()),
+        };
+        let jwt_id = CredentialId {
+            issuer: issuer.to_owned(),
+            value: CredentialValue::Jwt(String::from_utf8(shared_bytes).unwrap()),
+        };
+
+        // Build verified Claims for the CWT-backed subject.
+        let cwt_claims = crate::auth::Claims::new("cwt-subject".to_owned(), now, now + 300)
+            .with_issuer(issuer.to_owned())
+            .with_clearance(crate::auth::mac::SecurityLabel::new(
+                crate::auth::mac::Level::Secret,
+                crate::auth::mac::Assurance::Classical,
+                crate::auth::mac::CompartmentSet::EMPTY,
+            ));
+        let cwt_subject = crate::envelope::Subject::new("cwt-subject");
+        remember_verified_claims_with_credential(
+            &cwt_subject,
+            &cwt_claims,
+            VerifiedKeyMaterial::Classical,
+            None,
+            cwt_id.clone(),
+        );
+
+        // Build verified Claims for the JWT-backed subject.
+        let jwt_claims = crate::auth::Claims::new("jwt-subject".to_owned(), now, now + 300)
+            .with_issuer(issuer.to_owned())
+            .with_clearance(crate::auth::mac::SecurityLabel::new(
+                crate::auth::mac::Level::Secret,
+                crate::auth::mac::Assurance::Classical,
+                crate::auth::mac::CompartmentSet::EMPTY,
+            ));
+        let jwt_subject = crate::envelope::Subject::new("jwt-subject");
+        remember_verified_claims_with_credential(
+            &jwt_subject,
+            &jwt_claims,
+            VerifiedKeyMaterial::Classical,
+            None,
+            jwt_id.clone(),
+        );
+
+        // Revoke the CWT credential — evicts only the CWT entry.
+        let evicted = revoke_verified_subject_credential(&cwt_id);
+        assert_eq!(
+            evicted, 1,
+            "CWT credential eviction must remove exactly 1 entry"
+        );
+
+        // The JWT entry survives — different namespace.
+        let jwt_evicted = revoke_verified_subject_credential(&jwt_id);
+        assert_eq!(
+            jwt_evicted, 1,
+            "JWT credential entry must still exist (different namespace from CWT)"
+        );
+
+        // Re-revoking CWT returns 0 (already gone).
+        let re_evicted = revoke_verified_subject_credential(&cwt_id);
+        assert_eq!(re_evicted, 0, "CWT entry already evicted");
+    }
+
     // ── Session revocation evicts all carrying credentials ───────────────
 
     /// Session revocation evicts all carrying handles. After `revoke_session`:
@@ -381,6 +464,7 @@ mod tests {
         };
 
         // Start clean.
+        let _cache_guard = crate::auth::mac::activation::CACHE_TEST_LOCK.lock();
         flush_verified_subject_cache_generation();
 
         let now = chrono::Utc::now().timestamp();

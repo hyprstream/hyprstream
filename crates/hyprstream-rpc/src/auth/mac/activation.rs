@@ -309,6 +309,80 @@ pub fn remember_verified_claims(
     let Some(context) = claims.security_context(key_material) else {
         return;
     };
+    // Derive the JWT credential ID from `(iss, jti)`. CWT credential paths
+    // use [`remember_verified_subject_credential`] with an explicit CWT
+    // CredentialId so `cti` bytes are never stringified.
+    let credential_id = claims
+        .jti
+        .as_ref()
+        .map(|jti| crate::auth::CredentialId::jwt(&claims.iss, jti));
+    insert_verified_subject_entry(
+        name,
+        context,
+        verified_tenant,
+        claims.exp,
+        credential_id,
+    );
+}
+
+/// Cache a verified-Claims binding with an explicit [`CredentialId`],
+/// for credential encodings whose identifier is not derivable from
+/// `Claims::jti` (notably CWT `cti` byte strings).
+///
+/// This is the **only** insertion path for CWT credentials. It repeats
+/// every invariant check that [`remember_verified_claims`] enforces:
+/// `sub` must match `subject.name()`, `exp` must be in the future,
+/// `security_context` must be derivable from `Claims × VerifiedKeyMaterial`,
+/// and the credential ID's issuer must match `claims.iss`.
+/// The cache entry is keyed by the caller-supplied `credential_id`, so
+/// eviction targets the exact `(iss, jti/cti)` pair.
+///
+/// `credential_id.issuer` MUST equal `claims.iss`. This prevents a caller
+/// from attaching a credential ID from a different issuer to a cache
+/// entry, which would break issuer-scoped eviction.
+pub fn remember_verified_claims_with_credential(
+    subject: &Subject,
+    claims: &crate::auth::Claims,
+    key_material: VerifiedKeyMaterial,
+    verified_tenant: Option<&str>,
+    credential_id: crate::auth::CredentialId,
+) {
+    use super::SubjectContextClaims as _;
+
+    let Some(name) = subject.name() else {
+        return;
+    };
+    if claims.exp <= chrono::Utc::now().timestamp() {
+        return;
+    }
+    if claims.sub != name {
+        return;
+    }
+    let Some(context) = claims.security_context(key_material) else {
+        return;
+    };
+    // The credential ID's issuer must match the claims' issuer, so
+    // issuer-scoped eviction cannot be subverted by attaching a
+    // foreign-issuer credential ID.
+    if !credential_id.is_valid() || credential_id.issuer != claims.iss {
+        return;
+    }
+    insert_verified_subject_entry(
+        name,
+        context,
+        verified_tenant,
+        claims.exp,
+        Some(credential_id),
+    );
+}
+
+fn insert_verified_subject_entry(
+    name: &str,
+    context: SecurityContext,
+    verified_tenant: Option<&str>,
+    expires_at: i64,
+    credential_id: Option<crate::auth::CredentialId>,
+) {
     let mut cache = verified_subjects().write();
     let generation = cache.generation;
     cache.subjects.insert(
@@ -316,11 +390,8 @@ pub fn remember_verified_claims(
         VerifiedSubjectEntry {
             context,
             tenant: verified_tenant.map(str::to_owned),
-            expires_at: claims.exp,
-            credential_id: claims
-                .jti
-                .as_ref()
-                .map(|jti| crate::auth::CredentialId::jwt(&claims.iss, jti)),
+            expires_at,
+            credential_id,
             generation,
         },
     );
@@ -355,11 +426,15 @@ pub fn subject_context(
     global_mac_activation_control().select_context(verified)
 }
 
+/// Test lock for tests that touch the global verified-subjects cache.
+/// All tests across modules that insert/evict/flush cache entries MUST
+/// acquire this lock to prevent parallel test interference.
+#[cfg(test)]
+pub(crate) static CACHE_TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    static TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
     fn report(complete: bool) -> GenesisReport {
         GenesisReport {
@@ -375,7 +450,7 @@ mod tests {
 
     #[test]
     fn widening_requires_complete_coverage_and_narrowing_is_always_available() {
-        let _guard = TEST_LOCK.lock();
+        let _guard = CACHE_TEST_LOCK.lock();
         let control = MacActivationControl::default();
         let incomplete = report(false);
         let mut evidence = MacActivationEvidence {
@@ -398,7 +473,7 @@ mod tests {
 
     #[test]
     fn unverified_attach_transport_structurally_blocks_g2_widening() {
-        let _guard = TEST_LOCK.lock();
+        let _guard = CACHE_TEST_LOCK.lock();
         let control = MacActivationControl::default();
         control.block_unverified_attach_transport("worker-uds-vsock");
 
@@ -421,7 +496,7 @@ mod tests {
 
     #[test]
     fn jti_revocation_and_generation_rotation_evict_cached_subjects() {
-        let _guard = TEST_LOCK.lock();
+        let _guard = CACHE_TEST_LOCK.lock();
         flush_verified_subject_cache_generation();
 
         let now = chrono::Utc::now().timestamp();

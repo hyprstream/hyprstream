@@ -439,7 +439,7 @@ mod tests {
     use axum::http::Request as HttpRequest;
     use hyprstream_rpc::auth::{
         CompositeKeyPair, CompositeKeySet, CompositePairRole, CompositePairState,
-        CredentialId, CredentialRevocationStore as _, InMemoryCredentialRevocationStore,
+        CredentialId, InMemoryCredentialRevocationStore,
     };
     use std::collections::HashMap;
     use tower::ServiceExt; // oneshot
@@ -670,10 +670,18 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let issuer = TestIssuer::new();
         let state = with_test_issuer(test_state_with_xorb(dir.path(), HASH, b"x"), &issuer);
-        state.auth.jti_blocklist.revoke_credential(
-            CredentialId::jwt(ISSUER, "revoked-xet"),
-            chrono::Utc::now().timestamp() + 3600,
-        );
+        // Publish the revocation to the global credential-revocation store,
+        // which is what the middleware checks. If the global isn't set yet,
+        // set it from the state's local instance so both are the same store.
+        if hyprstream_rpc::auth::global_credential_revocation_store().is_none() {
+            let _ = hyprstream_rpc::auth::set_global_credential_revocation_store(
+                Arc::new(hyprstream_rpc::auth::InMemoryCredentialRevocationStore::new()),
+            );
+        }
+        let cred_id = CredentialId::jwt(ISSUER, "revoked-xet");
+        hyprstream_rpc::auth::global_credential_revocation_store()
+            .expect("global store must be set")
+            .revoke_credential(cred_id, chrono::Utc::now().timestamp() + 3600);
         let token = issuer.token(AUDIENCE, "revoked-xet");
 
         let resp = create_xet_router(state)

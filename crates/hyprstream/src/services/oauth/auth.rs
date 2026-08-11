@@ -237,6 +237,48 @@ pub(super) async fn validate_oauth_access_token(
     state: &OAuthState,
     token: &str,
 ) -> Result<hyprstream_rpc::auth::Claims, &'static str> {
+    let claims = verify_access_token(state, token, AudiencePolicy::Exact).await?;
+
+    // Fail-closed revocation: if the token carries a jti but no store is
+    // configured, reject — a potentially-revoked credential must not be
+    // admitted when revocation status cannot be checked.
+    if let Some(jti) = claims.jti.as_deref() {
+        let cred_id = hyprstream_rpc::auth::CredentialId::jwt(&claims.iss, jti);
+        match hyprstream_rpc::auth::global_credential_revocation_store() {
+            Some(store) => {
+                if store.is_revoked(&cred_id) {
+                    return Err("JWT revoked");
+                }
+            }
+            None => return Err("revocation store unavailable"),
+        }
+    }
+    Ok(claims)
+}
+
+/// Audience policy for [`verify_access_token`].
+///
+/// - `Exact`: the token's `aud` must match the resource server's canonical
+///   audience or issuer URL. Used by resource-server auth (OAI, MCP).
+/// - `AnyLocalIssuer`: the token's `aud` may be any RFC 8707 resource
+///   audience; the issuer must still be local. Used by the revocation
+///   endpoint (RFC 7009), which must be able to revoke resource-audience
+///   tokens, not just OAuth-self-audience tokens.
+pub(super) enum AudiencePolicy {
+    Exact,
+    AnyLocalIssuer,
+}
+
+/// One signature/profile/local-issuer verification stack with caller-
+/// selected audience policy. Both [`validate_oauth_access_token`] (resource
+/// auth, exact audience) and the revocation endpoint (any local-issuer
+/// resource audience) call this function. No unverified authority
+/// derivation: signature, typ, and local-issuer checks are always enforced.
+pub(super) async fn verify_access_token(
+    state: &OAuthState,
+    token: &str,
+    audience_policy: AudiencePolicy,
+) -> Result<hyprstream_rpc::auth::Claims, &'static str> {
     let header = hyprstream_rpc::auth::parse_protected_header(token)
         .map_err(|_| "JWT header invalid")?;
     if !hyprstream_rpc::auth::is_rfc9068_access_token_type(&header.typ) {
@@ -246,14 +288,20 @@ pub(super) async fn validate_oauth_access_token(
     let canonical_audience = state.atproto_issuer_url();
     let unverified = hyprstream_rpc::auth::decode_unverified(token)
         .map_err(|_| "JWT claims invalid")?;
-    let expected_audience = match unverified.aud.as_deref() {
-        Some(audience)
+
+    // Audience policy dispatch. Both paths enforce a non-empty audience.
+    let expected_audience = match (&audience_policy, unverified.aud.as_deref()) {
+        (AudiencePolicy::Exact, Some(audience))
             if audience == canonical_audience || audience == state.issuer_url.as_str() =>
         {
             audience.to_owned()
         }
+        (AudiencePolicy::AnyLocalIssuer, Some(audience)) if !audience.is_empty() => {
+            audience.to_owned()
+        }
         _ => return Err("JWT audience invalid"),
     };
+
     let claims = match header.alg.as_str() {
         "ML-DSA-65-Ed25519" => {
             let dispatch = hyprstream_rpc::auth::parse_composite_dispatch(
@@ -285,23 +333,11 @@ pub(super) async fn validate_oauth_access_token(
         _ => return Err("JWT algorithm unsupported"),
     };
 
+    // Local-issuer enforcement is always applied, regardless of audience
+    // policy. A federated token is never accepted through either path.
     let issuer_is_local = claims.iss == canonical_audience || claims.iss == state.issuer_url;
     if !issuer_is_local {
         return Err("JWT issuer invalid");
-    }
-    // Fail-closed revocation: if the token carries a jti but no store is
-    // configured, reject — a potentially-revoked credential must not be
-    // admitted when revocation status cannot be checked.
-    if let Some(jti) = claims.jti.as_deref() {
-        let cred_id = hyprstream_rpc::auth::CredentialId::jwt(&claims.iss, jti);
-        match hyprstream_rpc::auth::global_credential_revocation_store() {
-            Some(store) => {
-                if store.is_revoked(&cred_id) {
-                    return Err("JWT revoked");
-                }
-            }
-            None => return Err("revocation store unavailable"),
-        }
     }
     Ok(claims)
 }
