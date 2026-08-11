@@ -391,6 +391,23 @@ where
                     if actual_hash.as_slice() != expected_hash {
                         anyhow::bail!("proof credential hash does not match presented credential");
                     }
+
+                    // A proof must not outlive the credential that authorizes
+                    // it (§4.5). The enrollment record bounds the enrollment's
+                    // own validity; this bounds the presented credential
+                    // instance, so an admin-anchored enrollment with no expiry
+                    // cannot extend a short-lived token's reach.
+                    if let Some(credential_exp) =
+                        ctx.claims().map(|claims| claims.exp).filter(|exp| *exp > 0)
+                    {
+                        let credential_exp = credential_exp as u64;
+                        if proof.claims.exp > credential_exp {
+                            anyhow::bail!(
+                                "proof exp {} exceeds the presented credential's exp {credential_exp}",
+                                proof.claims.exp
+                            );
+                        }
+                    }
                 }
                 Ok(verified)
             })();

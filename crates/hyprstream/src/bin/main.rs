@@ -1812,7 +1812,7 @@ fn install_envelope_verify_config(oauth: Option<&hyprstream_core::config::OAuthC
     }
 
     install_session_pq_overlay();
-    install_proof_admission();
+    install_proof_admission(oauth);
 }
 
 /// Install the v16 proof admission substrate: the rotating server challenge
@@ -1831,7 +1831,7 @@ fn install_envelope_verify_config(oauth: Option<&hyprstream_core::config::OAuthC
 /// here instead — the same trait, a different substrate. Installing this one
 /// across several instances would silently weaken "admitted once per domain"
 /// to "once per node", so the log line below states the guarantee in force.
-fn install_proof_admission() {
+fn install_proof_admission(oauth: Option<&hyprstream_core::config::OAuthConfig>) {
     use hyprstream_rpc::proof::admission::{
         set_global_challenge_manager, set_global_proof_replay_store, InMemoryProofReplayStore,
         ProofReplayStore,
@@ -1858,6 +1858,23 @@ fn install_proof_admission() {
             "proof challenge manager installed: {DEFAULT_CHALLENGE_WINDOW_SECS}s window, \
              {DEFAULT_CHALLENGE_OVERLAP_SECS}s acceptance overlap"
         );
+    }
+
+    // The enrollment resolver comes from the SAME admin-anchored `mesh_peers`
+    // roster that seeds the PQ trust store and the identity roster — one
+    // enrollment source, not a parallel one. An entrypoint with no config in
+    // scope enrols nothing, and an unenrolled credential then denies rather
+    // than falling back to a self-asserted key.
+    if let Some(oauth) = oauth {
+        let resolver = hyprstream_core::auth::mesh_trust::build_mesh_enrollment_resolver(oauth);
+        if hyprstream_rpc::proof::enrollment::set_global_enrollment_resolver(Box::new(resolver))
+            .is_ok()
+        {
+            tracing::info!(
+                "proof enrollment resolver installed from {} mesh peer(s)",
+                oauth.mesh_peers.len()
+            );
+        }
     }
 
     // Partitioned by disposition, fail-closed on capacity: an unexpired

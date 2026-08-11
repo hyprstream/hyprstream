@@ -155,6 +155,110 @@ pub fn build_mesh_identity_roster(oauth: &OAuthConfig) -> Vec<([u8; 32], Subject
     roster
 }
 
+/// Build the v16 proof enrollment resolver from the same admin-anchored
+/// `mesh_peers` roster that seeds the PQ trust store and the identity roster.
+///
+/// Each configured peer is enrolled as **one** logical signer using the
+/// weakly-non-separable Ed25519 + ML-DSA-65 suite, pinning that peer's exact
+/// published component keys in suite order. The peer's Ed25519 public key is
+/// the key ID for both components: kids are opaque in the profile, and a
+/// deployment's kid convention is enrollment data. The two components share
+/// one logical signer group and count as one approval.
+///
+/// Deliberately partial, and fail-closed where it is:
+///
+/// - **Approvers.** `mesh_peers` describes signers, not approval roles, so no
+///   approver is enrolled here. A method whose generated policy requires
+///   approvals therefore denies until a manifest supplies them — it is never
+///   satisfied by a primary signer standing in for an approver.
+/// - **Service response signers.** Likewise absent, so response-proof
+///   verification denies rather than trusting any enrolled key.
+/// - **Enrollment expiry.** Admin-anchored entries are established out-of-band
+///   and do not themselves expire, matching the existing trust-store
+///   convention. The *credential's* expiry still bounds every proof: dispatch
+///   independently requires `proof.exp` not to exceed the verified
+///   credential's `exp`.
+///
+/// An invalid entry is logged and skipped: a malformed peer key must not
+/// silently enrol the wrong identity.
+pub fn build_mesh_enrollment_resolver(
+    oauth: &OAuthConfig,
+) -> hyprstream_rpc::proof::enrollment::InMemoryEnrollmentResolver {
+    use hyprstream_rpc::proof::enrollment::{
+        ComponentKey, EnrolledComponent, InMemoryEnrollmentResolver, SignerRole, SignerSuiteRecord,
+    };
+
+    let mut resolver = InMemoryEnrollmentResolver::new();
+    for (label, peer) in &oauth.mesh_peers {
+        let ed_bytes = match decode_multikey(&peer.ed25519_multibase, &MULTICODEC_ED25519_PUB) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::error!("mesh_peer '{label}': invalid ed25519_multibase, not enrolled: {e}");
+                continue;
+            }
+        };
+        let ed_pubkey: [u8; 32] = match ed_bytes.as_slice().try_into() {
+            Ok(a) => a,
+            Err(_) => {
+                tracing::error!(
+                    "mesh_peer '{label}': ed25519 key is {} bytes (expected 32), not enrolled",
+                    ed_bytes.len()
+                );
+                continue;
+            }
+        };
+        let ed_vk = match ed25519_dalek::VerifyingKey::from_bytes(&ed_pubkey) {
+            Ok(vk) => vk,
+            Err(e) => {
+                tracing::error!("mesh_peer '{label}': invalid ed25519 verifying key, not enrolled: {e}");
+                continue;
+            }
+        };
+        let pq_bytes = match decode_multikey(&peer.mldsa65_multibase, &MULTICODEC_ML_DSA_65_PUB) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::error!("mesh_peer '{label}': invalid mldsa65_multibase, not enrolled: {e}");
+                continue;
+            }
+        };
+        let pq_vk = match hyprstream_rpc::crypto::pq::ml_dsa_vk_from_bytes(&pq_bytes) {
+            Ok(vk) => vk,
+            Err(e) => {
+                tracing::error!(
+                    "mesh_peer '{label}': invalid ML-DSA-65 verifying key, not enrolled: {e}"
+                );
+                continue;
+            }
+        };
+
+        let subject = hyprstream_rpc::node_identity::mesh_host_subject(label);
+        let principal = subject
+            .name()
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| label.clone());
+        let record = SignerSuiteRecord {
+            principal,
+            suite_id: hyprstream_rpc::proof::SUITE_HYBRID.to_owned(),
+            components: vec![
+                EnrolledComponent::new(ed_pubkey.to_vec(), ComponentKey::Ed25519(ed_vk)),
+                EnrolledComponent::new(ed_pubkey.to_vec(), ComponentKey::MlDsa65(Box::new(pq_vk))),
+            ],
+            epoch: 0,
+            role: SignerRole::Primary,
+            approver_role: None,
+            not_after: u64::MAX,
+            revoked: false,
+        };
+        match resolver.enrol_primary(&ed_vk, record) {
+            Ok(()) => tracing::info!(
+                "mesh_peer '{label}': enrolled as a hybrid primary proof signer"
+            ),
+            Err(e) => tracing::error!("mesh_peer '{label}': enrollment rejected: {e}"),
+        }
+    }
+    resolver
+}
+
 /// Encode raw key bytes as a `Multikey` `publicKeyMultibase` string (base58btc,
 /// multicodec-prefixed). Inverse of [`decode_multikey`]; used by tests and by
 /// operators generating peer entries.
@@ -180,6 +284,83 @@ mod tests {
             oauth.mesh_peers.insert(k.to_owned(), v);
         }
         oauth
+    }
+
+    // -- v16 proof enrollment ------------------------------------------------
+
+    fn peer_entry() -> (SigningKey, MeshPeerConfig) {
+        let ed = SigningKey::generate(&mut OsRng);
+        let pq_sk = hyprstream_rpc::node_identity::derive_mesh_mldsa_key(&ed);
+        let cfg = MeshPeerConfig {
+            ed25519_multibase: encode_multikey(
+                &ed.verifying_key().to_bytes(),
+                &MULTICODEC_ED25519_PUB,
+            ),
+            mldsa65_multibase: encode_multikey(
+                &pq::ml_dsa_sk_to_vk_bytes(&pq_sk),
+                &MULTICODEC_ML_DSA_65_PUB,
+            ),
+        };
+        (ed, cfg)
+    }
+
+    /// A configured peer becomes one hybrid primary signer whose exact
+    /// published component keys are pinned in suite order.
+    #[test]
+    fn a_mesh_peer_is_enrolled_as_one_hybrid_primary_signer() {
+        use hyprstream_rpc::proof::enrollment::EnrollmentResolver;
+
+        let (ed, cfg) = peer_entry();
+        let oauth = oauth_with_peers(vec![("peer-a", cfg)]);
+        let resolver = build_mesh_enrollment_resolver(&oauth);
+
+        let record = resolver
+            .resolve_primary(&ed.verifying_key())
+            .expect("the configured peer must resolve");
+        assert_eq!(record.suite_id, hyprstream_rpc::proof::SUITE_HYBRID);
+        assert_eq!(record.components.len(), 2);
+        assert_eq!(record.components[0].alg, hyprstream_rpc::proof::ALG_ED25519);
+        assert_eq!(record.components[1].alg, hyprstream_rpc::proof::ALG_ML_DSA_65);
+        assert!(record.pins_ed25519(&ed.verifying_key()));
+    }
+
+    /// An unconfigured key resolves to nothing, and no approver or service
+    /// signer is invented — a method requiring either denies.
+    #[test]
+    fn mesh_enrollment_invents_no_signer_it_was_not_given() {
+        use hyprstream_rpc::proof::enrollment::EnrollmentResolver;
+
+        let (ed, cfg) = peer_entry();
+        let stranger = SigningKey::generate(&mut OsRng);
+        let oauth = oauth_with_peers(vec![("peer-a", cfg)]);
+        let resolver = build_mesh_enrollment_resolver(&oauth);
+
+        assert!(resolver.resolve_primary(&stranger.verifying_key()).is_none());
+        assert!(resolver
+            .resolve_approver(&ed.verifying_key().to_bytes())
+            .is_none());
+        assert!(resolver.resolve_service("registry.svc.hyprstream.test").is_none());
+    }
+
+    /// A malformed peer is skipped rather than enrolled under wrong material.
+    #[test]
+    fn a_malformed_peer_is_not_enrolled() {
+        use hyprstream_rpc::proof::enrollment::EnrollmentResolver;
+
+        let (ed, mut cfg) = peer_entry();
+        cfg.mldsa65_multibase = "znot-a-multikey".to_owned();
+        let oauth = oauth_with_peers(vec![("peer-a", cfg)]);
+        let resolver = build_mesh_enrollment_resolver(&oauth);
+        assert!(resolver.resolve_primary(&ed.verifying_key()).is_none());
+    }
+
+    #[test]
+    fn empty_mesh_peers_enrol_nothing() {
+        use hyprstream_rpc::proof::enrollment::EnrollmentResolver;
+
+        let resolver = build_mesh_enrollment_resolver(&OAuthConfig::default());
+        let stranger = SigningKey::generate(&mut OsRng);
+        assert!(resolver.resolve_primary(&stranger.verifying_key()).is_none());
     }
 
     #[test]

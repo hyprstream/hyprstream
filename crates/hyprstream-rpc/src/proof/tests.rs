@@ -244,11 +244,20 @@ fn n22_response_proof_for_another_request_denies() {
 }
 
 /// N-2 — the exact P-2 bytes presented in the credential/authorization slot.
-/// The credential path requires an `at+jwt` (or CWT access-token) type and an
-/// issuer key; a proof CWT carries the proof `typ` and is signed by a
-/// cnf-bound request-proof key, so it can never be consumed as a credential.
+///
+/// The real credential-slot parser must reject them. Two independent rules do
+/// so, and both are exercised here against the frozen vector rather than
+/// asserted in prose:
+///
+/// 1. **Encoding.** The credential slot carries a compact-serialization token.
+///    The proof is binary CBOR, so the protected-header parse fails outright.
+/// 2. **Type.** Even shaped as a compact token, a header whose `typ` is a
+///    proof media type is not in any credential slot's closed allowed-type
+///    list, so no issuer key is ever consulted.
 #[test]
 fn n2_proof_in_the_credential_slot_denies() {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+
     let vectors = load_negative_vectors();
     let n2 = vectors
         .iter()
@@ -256,17 +265,55 @@ fn n2_proof_in_the_credential_slot_denies() {
         .expect("N-2 must exist");
 
     // It is a valid *proof* in the proof slot ...
-    let as_proof = crate::proof::parser::ParsedProof::parse(&n2.1);
-    assert!(as_proof.is_ok(), "N-2 is P-2's bytes: valid in the proof slot");
-
-    // ... and is not a credential in the credential slot. The credential slot
-    // is a compact-serialization token; these bytes are neither UTF-8 nor a
-    // three-part JWS, so no issuer key is ever consulted.
-    let as_credential = std::str::from_utf8(&n2.1);
     assert!(
-        as_credential.is_err() || as_credential.unwrap().split('.').count() != 3,
-        "a proof CWT must not parse as a credential token"
+        crate::proof::parser::ParsedProof::parse(&n2.1).is_ok(),
+        "N-2 is P-2's bytes: valid in the proof slot"
     );
+
+    // ... and the real credential-slot parser rejects the same bytes.
+    let as_token = String::from_utf8_lossy(&n2.1);
+    assert!(
+        crate::auth::jwt::parse_protected_header(&as_token).is_err(),
+        "a proof CWT must not parse as a credential protected header"
+    );
+
+    // The type rule holds independently of the encoding rule: a
+    // compact-shaped token whose typ is the proof media type is rejected by
+    // the same closed allowed-type dispatch the credential slot uses, for
+    // both the request-proof and response-proof media types.
+    let credential_slot_types = [
+        crate::auth::RFC9068_ACCESS_TOKEN_TYPES[0],
+        crate::auth::RFC9068_ACCESS_TOKEN_TYPES[1],
+        "wit+jwt",
+    ];
+    for proof_typ in [
+        crate::proof::PROOF_TYP,
+        crate::proof::RESPONSE_PROOF_TYP,
+    ] {
+        assert!(
+            !credential_slot_types.contains(&proof_typ),
+            "a proof media type must never be an accepted credential type"
+        );
+        let header = format!(
+            r#"{{"alg":"ML-DSA-65-Ed25519","typ":"{proof_typ}","kid":"k1"}}"#
+        );
+        let token = format!(
+            "{}.{}.{}",
+            URL_SAFE_NO_PAD.encode(header),
+            URL_SAFE_NO_PAD.encode(&n2.1),
+            URL_SAFE_NO_PAD.encode([0u8; 64])
+        );
+        // The header itself parses — this is not an encoding rejection ...
+        assert!(
+            crate::auth::jwt::parse_protected_header(&token).is_ok(),
+            "the constructed token must be well-formed, so the type rule is what denies"
+        );
+        // ... and the credential dispatch still refuses it on type alone.
+        assert!(
+            crate::auth::parse_composite_dispatch(&token, &credential_slot_types).is_err(),
+            "a proof-typed token must be rejected by the credential slot"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
