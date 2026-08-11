@@ -1,4 +1,3 @@
-#![allow(deprecated)]
 //! End-to-end Phase 2 canary: real SignedEnvelope round-trip over iroh.
 //!
 //! Wires a minimal [`RequestService`] through:
@@ -377,7 +376,7 @@ async fn hykem_encrypted_envelope_round_trip_over_iroh() -> Result<()> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cleartext_envelope_rejected_on_iroh_receive() -> Result<()> {
     use hyprstream_rpc::envelope::{
-        current_timestamp, generate_nonce, Authorization, RequestEnvelope,
+        current_timestamp,  Authorization, RequestEnvelope,
     };
 
     // ─── Server side ──────────────────────────────────────────────────────
@@ -427,7 +426,7 @@ async fn cleartext_envelope_rejected_on_iroh_receive() -> Result<()> {
         request_id: 99,
         payload: b"ping-payload".to_vec(),
         iat: current_timestamp(),
-        nonce: generate_nonce(),
+        nonce: [0u8; 16],
         authorization: Authorization::None,
         delegation_token: None,
         wth: None,
@@ -478,7 +477,7 @@ async fn cleartext_envelope_rejected_on_iroh_receive() -> Result<()> {
 async fn false_encrypted_marker_never_reaches_custom_processor_over_iroh() -> Result<()> {
     use bytes::Bytes;
     use hyprstream_rpc::envelope::{
-        current_timestamp, generate_nonce, Authorization, RequestEnvelope,
+        current_timestamp,  Authorization, RequestEnvelope,
     };
 
     let invocations = Arc::new(AtomicUsize::new(0));
@@ -514,7 +513,7 @@ async fn false_encrypted_marker_never_reaches_custom_processor_over_iroh() -> Re
             request_id: 31337,
             payload: b"visible-cleartext-sentinel".to_vec(),
             iat: current_timestamp(),
-            nonce: generate_nonce(),
+            nonce: [0u8; 16],
             authorization: Authorization::None,
             delegation_token: None,
             wth: None,

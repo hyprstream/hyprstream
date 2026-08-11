@@ -1,4 +1,3 @@
-#![allow(deprecated)]
 //! Networked moq subscription over `web_transport_quinn` (#274).
 //!
 //! End-to-end proof of the issue-#274 streaming path: a daemon serves the moq

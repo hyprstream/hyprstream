@@ -1,4 +1,3 @@
-#![allow(deprecated)]
 //! #1483: the regression node for the browser-hybrid blind spot.
 //!
 //! Every hybrid integration test in this crate used to hand-anchor its
@@ -199,7 +198,7 @@ impl BrowserShapedClient {
             request_id: 42,
             payload: payload.to_vec(),
             iat: envelope::current_timestamp(),
-            nonce: envelope::generate_nonce(),
+            nonce: [0u8; 16],
             authorization: Authorization::None,
             delegation_token: None,
             wth: None,

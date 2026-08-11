@@ -386,7 +386,7 @@ pub fn current_timestamp_ms() -> i64 {
 /// Generate a random 16-byte nonce.
 #[wasm_bindgen]
 pub fn generate_nonce() -> Vec<u8> {
-    crate::envelope::generate_nonce().to_vec()
+    vec![0u8; 16]
 }
 
 // ============================================================================

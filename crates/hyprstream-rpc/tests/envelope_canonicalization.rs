@@ -1,4 +1,3 @@
-#![allow(deprecated)]
 use ed25519_dalek::SigningKey;
 use hyprstream_rpc::envelope::{Authorization, KeyedPqTrustStore, RequestEnvelope, SignedEnvelope};
 use hyprstream_rpc::node_identity::derive_mesh_mldsa_key;

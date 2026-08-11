@@ -24,7 +24,6 @@ pub mod challenge;
 pub mod claims;
 pub mod parser;
 pub mod plan;
-pub mod replay;
 pub mod response;
 
 #[cfg(test)]

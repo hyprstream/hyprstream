@@ -1,4 +1,3 @@
-#![allow(deprecated)]
 //! End-to-end proof that a dynamically-identified client — one no operator
 //! could have pre-enrolled — completes a real dispatch round-trip under the
 //! production-mandatory Hybrid suite.
@@ -183,7 +182,7 @@ impl DynamicClient {
             request_id: 7,
             payload: payload.to_vec(),
             iat: envelope::current_timestamp(),
-            nonce: envelope::generate_nonce(),
+            nonce: [0u8; 16],
             authorization: Authorization::None,
             delegation_token: None,
             wth: None,

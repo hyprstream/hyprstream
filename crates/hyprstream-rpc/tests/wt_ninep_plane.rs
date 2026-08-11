@@ -1,4 +1,3 @@
-#![allow(deprecated)]
 //! `/9p` WebTransport plane path-mux (H1b / #765).
 //!
 //! Proves the third arm of the QUIC WebTransport path mux

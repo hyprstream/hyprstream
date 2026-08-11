@@ -181,7 +181,6 @@ pub struct EnvelopeContext {
     is_local_caller: bool,
 }
 
-#[allow(deprecated)]
 impl EnvelopeContext {
     /// Create context from a verified SignedEnvelope (AnySigner path).
     ///

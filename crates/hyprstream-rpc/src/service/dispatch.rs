@@ -53,7 +53,6 @@ pub use crate::envelope::EnvelopeVerification;
 /// * `Ok(response_bytes)` - Signed response. Any streaming pump has already been
 ///   spawned onto the current `LocalSet`.
 /// * `Err(e)` - Processing error (already logged)
-#[allow(deprecated)]
 pub async fn process_request<S>(
     raw_bytes: &[u8],
     service: &S,

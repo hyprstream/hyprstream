@@ -1,4 +1,3 @@
-#![allow(deprecated)]
 //! End-to-end MoQ event-plane tests (#421-E5).
 //!
 //! These tests exercise the full moq origin → announce → subscribe path for the

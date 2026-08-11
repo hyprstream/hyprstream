@@ -1,4 +1,3 @@
-#![allow(deprecated)]
 //! End-to-end canary: real SignedEnvelope round-trip over the same-host UDS plane.
 //!
 //! Mirrors `iroh_rpc_e2e.rs` but over a Unix-domain socket, exercising the exact

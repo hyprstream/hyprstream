@@ -1,4 +1,3 @@
-#![allow(deprecated)]
 //! Round-trip tests for the code-generated `StreamInfo`/`StreamOpt` codec (#273).
 //!
 //! The Cap'n Proto derive macro now generates the `ToCapnp`/`FromCapnp` impls for

@@ -1,4 +1,3 @@
-#![allow(deprecated)]
 //! INV-2 receive-side dispatch enforcement (#1042).
 //!
 //! Proves `service::dispatch::process_request` — the shared envelope-verify →
@@ -298,7 +297,7 @@ fn request_envelope(payload: &[u8]) -> RequestEnvelope {
         request_id: 7,
         payload: payload.to_vec(),
         iat: envelope::current_timestamp(),
-        nonce: envelope::generate_nonce(),
+        nonce: [0u8; 16],
         authorization: Authorization::None,
         delegation_token: None,
         wth: None,
