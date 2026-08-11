@@ -58,6 +58,7 @@ struct RequestEnvelope {
   clientKemPublic @8 :Data $optional;  # S3 #554: client ephemeral hybrid-KEM RecipientPublic.encode() (X25519+ML-KEM-768) for PQ stream key agreement
   responseKemRecipient @9 :Data $optional;  # #1044: fresh per-call HyKEM recipient for the unary response (distinct from stream KEM material)
   serviceDomain @10 :Text $optional;  # #1044: canonical destination service, authenticated inside the sealed request
+  proofCwt @11 :Data $optional;  # v16 proof CWT (application/vnd.hyprstream.proof+cwt)
 }
 
 # Signed wrapper - signature covers serialized RequestEnvelope bytes
