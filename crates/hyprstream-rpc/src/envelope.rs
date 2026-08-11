@@ -2268,7 +2268,17 @@ impl FromCapnp for RequestEnvelope {
                 if !has {
                     None
                 } else {
-                    Some(reader.get_proof_cwt()?.to_vec())
+                    let data = reader.get_proof_cwt()?;
+                    // Enforce the proof-v1 total-object cap before allocation
+                    // to prevent oversized proofs from consuming memory.
+                    if data.len() > crate::proof::MAX_COSE_OBJECT_BYTES {
+                        anyhow::bail!(
+                            "proofCwt size {} exceeds max {} bytes",
+                            data.len(),
+                            crate::proof::MAX_COSE_OBJECT_BYTES
+                        );
+                    }
+                    Some(data.to_vec())
                 }
             },
         })

@@ -110,59 +110,71 @@ where
         _ => {}
     }
 
-    // Proof-CWT verification: if a proof CWT is present on the envelope,
-    // parse and validate it against the signed request body and service
-    // domain (v16 §5.2 pipeline step: parse canonical COSE and proof
-    // payload under bounds). This is the production-path integration of
-    // the hs-rpc-proof-v1 parser.
-    if let Some(proof_cwt) = &ctx.envelope_proof_cwt {
+    // Proof-CWT structural parse (v16 §5.2 pipeline: parse canonical COSE
+    // and proof payload under bounds). This runs the bounded parser which
+    // validates the profile's structural rules (typ, hs_domain, crit,
+    // signature plan, claims, key set) but does NOT verify cryptographic
+    // signatures. Signature verification and replay admission run after
+    // policy evaluation, immediately before handler entry.
+    let parsed_proof = if let Some(proof_cwt) = &ctx.envelope_proof_cwt {
         let proof = crate::proof::parser::ParsedProof::parse(proof_cwt)
             .with_context(|| format!("{} proof-CWT parse failed", service.name()))?;
+
+        // CRITICAL: only request proofs are valid in request dispatch.
+        if proof.kind != crate::proof::ProofKind::Request {
+            warn!(
+                "{} rejected {} proof in request dispatch",
+                service.name(),
+                match proof.kind {
+                    crate::proof::ProofKind::Response => "response",
+                    crate::proof::ProofKind::Request => "request",
+                }
+            );
+            anyhow::bail!("proof kind mismatch: only request proofs accepted in dispatch");
+        }
 
         // The proof's aud MUST match the service domain.
         if proof.claims.aud != actual_service_domain {
             warn!(
-                "{} proof aud '{}' does not match dispatcher '{}'",
+                "{} proof aud mismatch: '{}' vs '{}'",
                 service.name(), proof.claims.aud, actual_service_domain
             );
             anyhow::bail!("proof aud mismatch");
         }
 
-        // The proof's capnp_request_bytes MUST equal the actual payload.
-        if proof.claims.capnp_request_bytes != payload {
-            warn!(
-                "{} proof request body hash mismatch ({} vs {} bytes)",
-                service.name(),
-                proof.claims.capnp_request_bytes.len(),
-                payload.len()
-            );
-            anyhow::bail!("proof request body mismatch");
-        }
-
-        // Freshness check: iat within clock-skew tolerance, exp not exceeded.
+        // Freshness: per-disposition bounds against verifier clock.
         let now_secs = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        let skew_tolerance = 30u64; // seconds
-        let proof_max_lifetime = 300u64; // 5 minutes for authenticated
-        if proof.claims.iat.abs_diff(now_secs) > skew_tolerance {
-            warn!("{} proof iat outside clock-skew tolerance", service.name());
-            anyhow::bail!("proof freshness: iat outside tolerance");
+        let skew_tolerance_secs: u64 = 30;
+        let max_lifetime_secs: u64 = match proof.disposition {
+            crate::proof::ProofDisposition::Authenticated => 300,  // 5 min
+            crate::proof::ProofDisposition::Unattributed => 30,   // seconds-scale
+        };
+        if proof.claims.iat.abs_diff(now_secs) > skew_tolerance_secs {
+            anyhow::bail!("proof freshness: iat outside {skew_tolerance_secs}s tolerance");
         }
-        if proof.claims.exp <= now_secs || proof.claims.exp > now_secs + proof_max_lifetime {
-            warn!("{} proof exp invalid", service.name());
-            anyhow::bail!("proof freshness: exp invalid");
+        if proof.claims.exp <= now_secs {
+            anyhow::bail!("proof freshness: exp expired");
+        }
+        if proof.claims.exp > now_secs + max_lifetime_secs {
+            anyhow::bail!(
+                "proof freshness: exp exceeds {max_lifetime_secs}s max lifetime for {:?}",
+                proof.disposition
+            );
         }
 
         debug!(
-            "{} proof-CWT verified: kind={:?} disposition={:?} request_id={}",
+            "{} proof-CWT parsed (not yet crypto-verified): disposition={:?} request_id={}",
             service.name(),
-            proof.kind,
             proof.disposition,
             hex::encode(proof.claims.request_id)
         );
-    }
+        Some(proof)
+    } else {
+        None
+    };
     let transcript_policy = if carrier.requires_browser_provisioning() {
         crate::browser_provisioning::BrowserTranscriptPolicy::Required {
             request_id,
@@ -175,6 +187,21 @@ where
     };
     let (browser_transcript, payload) =
         crate::browser_provisioning::recover_request_payload(&payload, transcript_policy)?;
+
+    // After carrier recovery: verify proof body bytes match the ONE decoded
+    // request body that feeds both PEP and handler (v16 §5.1 invariant).
+    if let Some(ref proof) = parsed_proof {
+        if proof.claims.capnp_request_bytes != payload {
+            warn!(
+                "{} proof body mismatch after carrier recovery: {} vs {} bytes",
+                service.name(),
+                proof.claims.capnp_request_bytes.len(),
+                payload.len()
+            );
+            anyhow::bail!("proof body bytes do not match decoded request body");
+        }
+    }
+
     ctx.browser_method_discriminator = browser_transcript
         .as_ref()
         .map(|transcript| transcript.method_discriminator);
@@ -341,6 +368,102 @@ where
         let mut bytes = Vec::new();
         serialize::write_message(&mut bytes, &message)?;
         return Ok(bytes);
+    }
+
+    // 2c. Proof-CWT signature verification and replay admission (v16 §5.2
+    // pipeline: after policy, before handler). The proof was structurally
+    // parsed above; here we verify the cryptographic signatures, check
+    // credential binding, and admit the replay key atomically.
+    //
+    // Signature verification reconstructs each COSE Sig_structure from the
+    // parsed proof fields and verifies each component signature against the
+    // resolved key material (credential cnf for authenticated proofs;
+    // self-asserted key set for unattributed proofs).
+    if let Some(ref proof) = parsed_proof {
+        // For unattributed proofs: validate the server challenge (Nonce)
+        // against the current challenge window. The challenge manager is        // For unattributed proofs: validate the server challenge (Nonce)
+        // against the current challenge window. The challenge manager is
+        // process-global; a domain-wide shared manager is the production
+        // deployment (v16 §4.6).
+        if proof.disposition == crate::proof::ProofDisposition::Unattributed {
+            // Challenge validation: the proof's Nonce claim must match a
+            // current challenge. Without a global challenge manager wired
+            // into dispatch yet, this is a TODO — for now, require the
+            // challenge to be present (already enforced by the parser) but
+            // do not validate it against a specific value.
+            //
+            // TODO: wire ChallengeManager into dispatch and validate the
+            // proof's nonce claim against the current domain challenge.
+        }
+
+        // Credential hash binding: if the proof is authenticated, the
+        // credential_hash must match the presented credential's hash.
+        // For now this is enforced by the parser's structural check
+        // (presence/non-null consistency). Exact hash comparison requires
+        // the credential bytes from claims verification — TODO.
+        //
+        // TODO: compare proof.claims.credential_hash against
+        // SHA-256(ctx.jwt_token()) when a credential is presented.
+
+        // Replay admission: atomically check-and-insert the proof's replay
+        // key. This MUST be after policy evaluation so rejected/denied
+        // requests never consume replay capacity.
+        //
+        // The replay key is (signer_thumbprint, request_id). For
+        // unattributed proofs the thumbprint is computed from the canonical
+        // (plan, key_set) tuple. For authenticated proofs it requires the
+        // credential-bound primary signer-suite record — TODO when cnf
+        // resolution is wired.
+        if let Some(thumbprint) = proof.unattributed_replay_thumbprint() {
+            // Unattributed proof: compute replay record expiry as
+            // min(proof.exp, challenge_accept_until).
+            // Without a challenge manager wired, use proof.exp directly.
+            let replay_expiry = proof.claims.exp; // TODO: min(exp, challenge_accept_until)
+            let replay_key = crate::proof::replay::ReplayKey {
+                signer_thumbprint: thumbprint,
+                request_id: proof.claims.request_id,
+            };
+            // Process-global in-memory replay store (dual-read migration).
+            // TODO: replace with domain-wide Valkey/Redis backend.
+            use std::sync::OnceLock;
+            use crate::proof::replay::ReplayStore;
+            static REPLAY_STORE: OnceLock<crate::proof::replay::InMemoryReplayStore> =
+                OnceLock::new();
+            let store = REPLAY_STORE.get_or_init(crate::proof::replay::InMemoryReplayStore::default);
+            match store.check_and_insert(
+                crate::proof::ProofDisposition::Unattributed,
+                &replay_key,
+                replay_expiry,
+            ) {
+                crate::proof::replay::AdmissionResult::Admitted => {
+                    debug!("{} proof replay admission: admitted", service.name());
+                }
+                crate::proof::replay::AdmissionResult::Replayed => {
+                    warn!("{} proof replay admission: denied (replay)", service.name());
+                    anyhow::bail!("proof replay detected");
+                }
+                crate::proof::replay::AdmissionResult::Failed => {
+                    warn!("{} proof replay admission: store at capacity (fail-closed)", service.name());
+                    anyhow::bail!("proof replay store at capacity");
+                }
+            }
+        }
+
+        // At this point the proof is structurally valid, freshness-checked,
+        // body-verified, policy-permitted, and replay-admitted. Cryptographic
+        // signature verification against the resolved key material is the
+        // remaining TODO — it requires cnf/enrollment resolution from the
+        // claims context.
+        //
+        // TODO: reconstruct COSE Sig_structure for each signature entry and
+        // verify against resolved keys (cnf-bound suite for authenticated;
+        // self-asserted key set for unattributed).
+        debug!(
+            "{} proof-CWT admitted to handler: disposition={:?} request_id={}",
+            service.name(),
+            proof.disposition,
+            hex::encode(proof.claims.request_id)
+        );
     }
 
     // 3. Handle request
