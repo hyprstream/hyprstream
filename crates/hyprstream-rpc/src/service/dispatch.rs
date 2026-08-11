@@ -374,14 +374,39 @@ where
     // before handler). Every required gate MUST pass before handler entry.
     // No gate is skipped — unimplemented checks deny fail-closed.
     if let Some(ref proof) = parsed_proof {
-        // Gate 1: COSE signature verification — every required component
-        // MUST cryptographically verify. ML-DSA-65 components deny until
-        // verification is wired (not silently skipped).
-        let cnf_key = ctx.authenticated_signer_key();
-        crate::proof::verify::verify_proof_signatures(proof, cnf_key.as_ref())
-            .with_context(|| format!("{} proof signature verification failed", service.name()))?;
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
 
-        // Gate 2: Credential hash binding (authenticated proofs only).
+        // Gate 1: COSE signature verification — every required component MUST
+        // cryptographically verify under the key its own enrolled signer-suite
+        // record pins. Verification also yields the replay namespace this
+        // proof is admitted under; it is never derived from wire material.
+        let cnf_key = ctx.authenticated_signer_key();
+        let verified = crate::proof::verify::verify_proof_signatures(
+            proof,
+            cnf_key.as_ref(),
+            crate::proof::enrollment::global_enrollment_resolver(),
+            now_secs,
+        )
+        .with_context(|| format!("{} proof signature verification failed", service.name()))?;
+
+        // Gate 2: Credential hash binding.
+        //
+        // Presenting a credential never leaves the proof in the unattributed
+        // branch (§4.4): hash absence is permitted only when no credential is
+        // presented, so a credential alongside an unattributed proof denies
+        // rather than silently dropping to system-low.
+        if proof.disposition == crate::proof::ProofDisposition::Unattributed
+            && ctx.jwt_token().is_some()
+        {
+            warn!(
+                "{} credential presented with an unattributed proof; denying",
+                service.name()
+            );
+            anyhow::bail!("credential presented with a proof carrying no credential_hash");
+        }
         // Missing credential MUST deny — no skip/downgrade.
         if proof.disposition == crate::proof::ProofDisposition::Authenticated {
             let expected_hash = proof.claims.credential_hash
@@ -402,10 +427,6 @@ where
         let challenge_accept_until: Option<u64> = if proof.disposition == crate::proof::ProofDisposition::Unattributed {
             let challenge = proof.claims.nonce.as_ref()
                 .ok_or_else(|| anyhow::anyhow!("unattributed proof missing Nonce claim"))?;
-            let now_secs = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
             match crate::proof::admission::global_challenge_manager() {
                 Some(mgr) => {
                     let accept_until = mgr.validate(challenge, now_secs)
@@ -439,24 +460,14 @@ where
             None => proof.claims.exp,
         };
 
-        let replay_key = match proof.disposition {
-            crate::proof::ProofDisposition::Unattributed => {
-                let thumbprint = proof.unattributed_replay_thumbprint()
-                    .ok_or_else(|| anyhow::anyhow!("cannot compute unattributed thumbprint"))?;
-                crate::proof::admission::ProofReplayKey {
-                    signer_thumbprint: thumbprint,
-                    request_id: proof.claims.request_id,
-                }
-            }
-            crate::proof::ProofDisposition::Authenticated => {
-                let cnf_key = ctx.authenticated_signer_key()
-                    .ok_or_else(|| anyhow::anyhow!("authenticated proof: no cnf signer key"))?;
-                use sha2::{Digest, Sha256};
-                crate::proof::admission::ProofReplayKey {
-                    signer_thumbprint: Sha256::digest(cnf_key.as_bytes()).into(),
-                    request_id: proof.claims.request_id,
-                }
-            }
+        // The replay namespace comes from verification, not from wire
+        // material: the credential-bound primary signer-suite thumbprint
+        // (exact suite ID, ordered pinned component keys, enrollment epoch)
+        // for authenticated proofs, and the (plan, key set) thumbprint for
+        // unattributed ones.
+        let replay_key = crate::proof::admission::ProofReplayKey {
+            signer_thumbprint: verified.replay_thumbprint,
+            request_id: proof.claims.request_id,
         };
 
         match replay_store.check_and_insert(

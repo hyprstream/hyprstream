@@ -12,6 +12,8 @@
 //! # Layout
 //!
 //! - [`claims`] — proof CWT claims-set types and bounded CBOR decode.
+//! - [`enrollment`] — per-entry enrolled signer-suite resolution for
+//!   authenticated and response proofs.
 //! - [`plan`] — canonical signature-plan types and validation.
 //! - [`parser`] — bounded COSE object parse, header/`crit` validation, and
 //!   proof-vector decode.
@@ -23,6 +25,7 @@ pub mod admission;
 pub mod cbor_audit;
 pub mod challenge;
 pub mod claims;
+pub mod enrollment;
 pub mod parser;
 pub mod plan;
 pub mod response;

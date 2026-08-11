@@ -23,6 +23,142 @@ pub(crate) fn load_positive_vectors() -> Vec<(String, Vec<u8>)> {
         .collect()
 }
 
+// ---------------------------------------------------------------------------
+// Frozen enrollment fixtures
+//
+// The gate-2 key roster is the enrollment source for the authenticated and
+// response vectors. Two *separate* deployments are modelled, because the
+// profile forbids one component key from being enrolled for both a hybrid and
+// a standalone suite: the hybrid deployment enrols `client-ed25519-1` +
+// `client-mldsa65-1` as one WNS signer, the classical deployment enrols
+// `client-ed25519-1` alone. A vector accepted by one MUST be denied by the
+// other — that is the cross-suite separation the profile requires.
+// ---------------------------------------------------------------------------
+
+use crate::proof::enrollment::{
+    ComponentKey, EnrolledComponent, InMemoryEnrollmentResolver, SignerRole, SignerSuiteRecord,
+};
+
+/// The frozen fixture clock: `iat` 1786000000, `exp` 1786000030.
+pub(crate) const FIXTURE_NOW: u64 = 1_786_000_010;
+/// The frozen fixture `request_id` (CWT `cti`) every vector carries.
+pub(crate) const FIXTURE_REQUEST_ID: crate::proof::RequestId = [
+    0x3f, 0x1c, 0x9a, 0x04, 0xb7, 0xd2, 0x41, 0x6e, 0x8c, 0x05, 0xa9, 0x13, 0x7b, 0x6e, 0x2d, 0x80,
+];
+/// Enrollment validity comfortably covering the fixture proofs' `exp`.
+const FIXTURE_NOT_AFTER: u64 = 1_786_000_600;
+
+fn keys_json() -> serde_json::Value {
+    let s = include_str!("../../../../docs/standards/v16/vectors/proof-v1-keys.json");
+    serde_json::from_str(s).expect("valid key roster JSON")
+}
+
+fn public_hex(family: &str, kid_ascii: &str) -> Vec<u8> {
+    let json = keys_json();
+    let entry = json["keys"][family]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|k| k["kid_ascii"].as_str() == Some(kid_ascii))
+        .unwrap_or_else(|| panic!("{family} key {kid_ascii} must exist in the roster"))
+        .clone();
+    hex::decode(entry["public_hex"].as_str().unwrap()).unwrap()
+}
+
+pub(crate) fn ed25519_public(kid_ascii: &str) -> ed25519_dalek::VerifyingKey {
+    let bytes: [u8; 32] = public_hex("ed25519", kid_ascii).try_into().unwrap();
+    ed25519_dalek::VerifyingKey::from_bytes(&bytes).unwrap()
+}
+
+fn ed_component(kid_ascii: &str) -> EnrolledComponent {
+    EnrolledComponent::new(
+        kid_ascii.as_bytes().to_vec(),
+        ComponentKey::Ed25519(ed25519_public(kid_ascii)),
+    )
+}
+
+fn mldsa_component(kid_ascii: &str) -> EnrolledComponent {
+    let vk = crate::crypto::pq::ml_dsa_vk_from_bytes(&public_hex("ml_dsa_65", kid_ascii)).unwrap();
+    EnrolledComponent::new(
+        kid_ascii.as_bytes().to_vec(),
+        ComponentKey::MlDsa65(Box::new(vk)),
+    )
+}
+
+fn record(
+    principal: &str,
+    suite_id: &str,
+    components: Vec<EnrolledComponent>,
+    role: SignerRole,
+) -> SignerSuiteRecord {
+    SignerSuiteRecord {
+        principal: principal.to_owned(),
+        suite_id: suite_id.to_owned(),
+        components,
+        epoch: 1,
+        role,
+        not_after: FIXTURE_NOT_AFTER,
+        revoked: false,
+    }
+}
+
+/// A deployment that enrols the client as one WNS hybrid signer (P-2).
+pub(crate) fn hybrid_enrollment() -> InMemoryEnrollmentResolver {
+    let mut resolver = InMemoryEnrollmentResolver::new();
+    resolver
+        .enrol_primary(
+            &ed25519_public("client-ed25519-1"),
+            record(
+                "client",
+                crate::proof::SUITE_HYBRID,
+                vec![
+                    ed_component("client-ed25519-1"),
+                    mldsa_component("client-mldsa65-1"),
+                ],
+                SignerRole::Primary,
+            ),
+        )
+        .unwrap();
+    resolver
+}
+
+/// A deployment that enrols the client as a standalone Ed25519 signer, an
+/// anchored approver, and the service response signer (P-3, P-4, P-5).
+pub(crate) fn classical_enrollment() -> InMemoryEnrollmentResolver {
+    let mut resolver = InMemoryEnrollmentResolver::new();
+    resolver
+        .enrol_primary(
+            &ed25519_public("client-ed25519-1"),
+            record(
+                "client",
+                crate::proof::SUITE_CLASSICAL,
+                vec![ed_component("client-ed25519-1")],
+                SignerRole::Primary,
+            ),
+        )
+        .unwrap();
+    resolver
+        .enrol_approver(record(
+            "approver",
+            crate::proof::SUITE_CLASSICAL,
+            vec![ed_component("approver-ed25519-1")],
+            SignerRole::Approver,
+        ))
+        .unwrap();
+    resolver
+        .enrol_service(
+            "registry.svc.hyprstream.test",
+            record(
+                "registry-service",
+                crate::proof::SUITE_CLASSICAL,
+                vec![ed_component("service-ed25519-1")],
+                SignerRole::Service,
+            ),
+        )
+        .unwrap();
+    resolver
+}
+
 fn load_negative_vectors() -> Vec<(String, Vec<u8>, String)> {
     let json_str = include_str!("../../../../docs/standards/v16/vectors/proof-v1-negative.json");
     let parsed: serde_json::Value = serde_json::from_str(json_str).expect("valid JSON");
@@ -56,17 +192,18 @@ fn all_positive_vectors_accept() {
     }
 }
 
-/// Every negative vector MUST be denied by the parser.
+/// Every negative vector MUST be denied.
 ///
-/// Exceptions: N-2 is P-2 presented in the wrong slot (the parser cannot
-/// detect this without credential context), and N-22 is a response proof
-/// whose cti mismatch is a stateful verifier obligation. These two are
-/// tracked as verifier-side checks, not parser rules.
+/// Two are denied by the verifier rather than the parser, because they are
+/// context-dependent: N-2 is P-2's exact bytes presented in the credential
+/// slot, and N-22 is a well-formed response proof answering a different
+/// request. Both are covered by dedicated tests below, so nothing is merely
+/// skipped.
 #[test]
 fn all_negative_vectors_deny() {
-    let skip_parser = ["N-2", "N-22"]; // verifier-side, not parser-side
+    let verifier_side = ["N-2", "N-22"];
     for (id, cbor, deny_class) in load_negative_vectors() {
-        if skip_parser.contains(&id.as_str()) {
+        if verifier_side.contains(&id.as_str()) {
             continue;
         }
         let result = crate::proof::parser::ParsedProof::parse(&cbor);
@@ -75,6 +212,60 @@ fn all_negative_vectors_deny() {
             "negative vector {id} ({deny_class}) should deny, but was accepted"
         );
     }
+}
+
+/// N-22 — a response proof that is entirely well-formed and correctly signed
+/// by the enrolled service, but answers a different request, must deny.
+#[test]
+fn n22_response_proof_for_another_request_denies() {
+    let vectors = load_negative_vectors();
+    let n22 = vectors
+        .iter()
+        .find(|(id, _, _)| id == "N-22")
+        .expect("N-22 must exist");
+    let proof = crate::proof::parser::ParsedProof::parse(&n22.1).expect("N-22 parses; it is a stateful denial");
+    assert_ne!(
+        proof.claims.request_id, FIXTURE_REQUEST_ID,
+        "N-22's cti is deliberately not the request it is presented against"
+    );
+    let resolver = classical_enrollment();
+    assert!(
+        crate::proof::verify::verify_response_proof(
+            &proof,
+            "registry.svc.hyprstream.test",
+            &FIXTURE_REQUEST_ID,
+            &resolver,
+            FIXTURE_NOW,
+        )
+        .is_err(),
+        "a response proof can never verify for another request ID"
+    );
+}
+
+/// N-2 — the exact P-2 bytes presented in the credential/authorization slot.
+/// The credential path requires an `at+jwt` (or CWT access-token) type and an
+/// issuer key; a proof CWT carries the proof `typ` and is signed by a
+/// cnf-bound request-proof key, so it can never be consumed as a credential.
+#[test]
+fn n2_proof_in_the_credential_slot_denies() {
+    let vectors = load_negative_vectors();
+    let n2 = vectors
+        .iter()
+        .find(|(id, _, _)| id == "N-2")
+        .expect("N-2 must exist");
+
+    // It is a valid *proof* in the proof slot ...
+    let as_proof = crate::proof::parser::ParsedProof::parse(&n2.1);
+    assert!(as_proof.is_ok(), "N-2 is P-2's bytes: valid in the proof slot");
+
+    // ... and is not a credential in the credential slot. The credential slot
+    // is a compact-serialization token; these bytes are neither UTF-8 nor a
+    // three-part JWS, so no issuer key is ever consulted.
+    let as_credential = std::str::from_utf8(&n2.1);
+    assert!(
+        as_credential.is_err() || as_credential.unwrap().split('.').count() != 3,
+        "a proof CWT must not parse as a credential token"
+    );
 }
 
 // ---------------------------------------------------------------------------
