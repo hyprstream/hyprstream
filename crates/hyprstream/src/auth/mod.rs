@@ -16,6 +16,7 @@ pub mod identity_store;
 pub mod jwt;
 pub mod key_rotation;
 pub mod mesh_trust;
+pub mod proof_enrollment;
 pub mod op_log;
 #[cfg(any(feature = "pglite", feature = "postgres"))]
 mod cipher_glue;

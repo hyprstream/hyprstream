@@ -23,6 +23,14 @@ use crate::ToCapnp;
 ///   valid signer accepted; transport TLS provides peer authentication.
 pub use crate::envelope::EnvelopeVerification;
 
+/// The one externally visible pre-handler denial (§14.2 `DispatchDenied`).
+///
+/// Every pre-handler denial carries exactly this text, so the external surface
+/// is uniform and the internal cause is confined to the operator's log. It is
+/// paired with the server's current challenge in the response's fixed slot,
+/// which is likewise attached to every denial regardless of cause.
+pub const DISPATCH_DENIED: &str = "dispatch denied";
+
 /// Process a request through the full envelope verification pipeline.
 ///
 /// Unified handler for all transport front-ends. The only difference between
@@ -110,71 +118,6 @@ where
         _ => {}
     }
 
-    // Proof-CWT structural parse (v16 §5.2 pipeline: parse canonical COSE
-    // and proof payload under bounds). This runs the bounded parser which
-    // validates the profile's structural rules (typ, hs_domain, crit,
-    // signature plan, claims, key set) but does NOT verify cryptographic
-    // signatures. Signature verification and replay admission run after
-    // policy evaluation, immediately before handler entry.
-    let parsed_proof = if let Some(proof_cwt) = &ctx.envelope_proof_cwt {
-        let proof = crate::proof::parser::ParsedProof::parse(proof_cwt)
-            .with_context(|| format!("{} proof-CWT parse failed", service.name()))?;
-
-        // CRITICAL: only request proofs are valid in request dispatch.
-        if proof.kind != crate::proof::ProofKind::Request {
-            warn!(
-                "{} rejected {} proof in request dispatch",
-                service.name(),
-                match proof.kind {
-                    crate::proof::ProofKind::Response => "response",
-                    crate::proof::ProofKind::Request => "request",
-                }
-            );
-            anyhow::bail!("proof kind mismatch: only request proofs accepted in dispatch");
-        }
-
-        // The proof's aud MUST match the service domain.
-        if proof.claims.aud != actual_service_domain {
-            warn!(
-                "{} proof aud mismatch: '{}' vs '{}'",
-                service.name(), proof.claims.aud, actual_service_domain
-            );
-            anyhow::bail!("proof aud mismatch");
-        }
-
-        // Freshness: per-disposition bounds against verifier clock.
-        let now_secs = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        let skew_tolerance_secs: u64 = 30;
-        let max_lifetime_secs: u64 = match proof.disposition {
-            crate::proof::ProofDisposition::Authenticated => 300,  // 5 min
-            crate::proof::ProofDisposition::Unattributed => 30,   // seconds-scale
-        };
-        if proof.claims.iat.abs_diff(now_secs) > skew_tolerance_secs {
-            anyhow::bail!("proof freshness: iat outside {skew_tolerance_secs}s tolerance");
-        }
-        if proof.claims.exp <= now_secs {
-            anyhow::bail!("proof freshness: exp expired");
-        }
-        if proof.claims.exp > now_secs + max_lifetime_secs {
-            anyhow::bail!(
-                "proof freshness: exp exceeds {max_lifetime_secs}s max lifetime for {:?}",
-                proof.disposition
-            );
-        }
-
-        debug!(
-            "{} proof-CWT parsed (not yet crypto-verified): disposition={:?} request_id={}",
-            service.name(),
-            proof.disposition,
-            hex::encode(proof.claims.request_id)
-        );
-        Some(proof)
-    } else {
-        None
-    };
     let transcript_policy = if carrier.requires_browser_provisioning() {
         crate::browser_provisioning::BrowserTranscriptPolicy::Required {
             request_id,
@@ -187,20 +130,6 @@ where
     };
     let (browser_transcript, payload) =
         crate::browser_provisioning::recover_request_payload(&payload, transcript_policy)?;
-
-    // After carrier recovery: verify proof body bytes match the ONE decoded
-    // request body that feeds both PEP and handler (v16 §5.1 invariant).
-    if let Some(ref proof) = parsed_proof {
-        if proof.claims.capnp_request_bytes != payload {
-            warn!(
-                "{} proof body mismatch after carrier recovery: {} vs {} bytes",
-                service.name(),
-                proof.claims.capnp_request_bytes.len(),
-                payload.len()
-            );
-            anyhow::bail!("proof body bytes do not match decoded request body");
-        }
-    }
 
     ctx.browser_method_discriminator = browser_transcript
         .as_ref()
@@ -303,7 +232,17 @@ where
     // When rotation cannot produce a usable challenge the denial still goes
     // out — it simply advertises none, which is service refusal rather than
     // an unusable challenge the client would burn its one retry on.
-    let dispatch_denied = |reason: &str| -> Result<Vec<u8>> {
+    let dispatch_denied = |cause: &str| -> Result<Vec<u8>> {
+        // The cause is for the operator's log, never for the payload. Unknown
+        // service/method, malformed body, invalid credential, missing session,
+        // revocation, replay, signature-threshold failure, resource limit, and
+        // policy absence are externally indistinguishable (§14.2): no response
+        // reveals whether a credential ID, session, subject, signer, or label
+        // exists.
+        debug!(
+            "{} pre-handler denial (id={request_id}): {cause}",
+            service.name()
+        );
         let now_secs = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -311,7 +250,7 @@ where
         let challenge = crate::proof::admission::global_challenge_manager()
             .and_then(|mgr| mgr.current_or_rotate(now_secs))
             .map(|c| c.value);
-        let payload = service.build_error_payload(request_id, reason);
+        let payload = service.build_error_payload(request_id, DISPATCH_DENIED);
         let signed = sign_response_with_challenge(payload, challenge)?;
         serialize_response(&signed)
     };
@@ -331,8 +270,111 @@ where
             request_id,
             e
         );
-        return dispatch_denied(&e.to_string());
+        return dispatch_denied(&format!("claims verification: {e}"));
     }
+
+    // Proof-CWT structural parse and profile gates (§5.2: parse canonical COSE
+    // and proof payload under bounds, then bind the service coordinate and
+    // freshness). Cryptographic verification and replay admission follow.
+    //
+    // Deliberately placed after the denial surface exists: a structural,
+    // audience, freshness, or body-binding failure is a pre-handler denial
+    // like any other, and must leave through the same uniform response rather
+    // than dropping the connection and telling the client nothing.
+    let parsed_proof = {
+        let parsed = (|| -> Result<Option<crate::proof::parser::ParsedProof>> {
+        // Proof-CWT structural parse (v16 §5.2 pipeline: parse canonical COSE
+        // and proof payload under bounds). This runs the bounded parser which
+        // validates the profile's structural rules (typ, hs_domain, crit,
+        // signature plan, claims, key set) but does NOT verify cryptographic
+        // signatures. Signature verification and replay admission run after
+        // policy evaluation, immediately before handler entry.
+        let parsed = if let Some(proof_cwt) = &ctx.envelope_proof_cwt {
+            let proof = crate::proof::parser::ParsedProof::parse(proof_cwt)
+                    .with_context(|| format!("{} proof-CWT parse failed", service.name()))?;
+
+            // CRITICAL: only request proofs are valid in request dispatch.
+            if proof.kind != crate::proof::ProofKind::Request {
+                warn!(
+                    "{} rejected {} proof in request dispatch",
+                    service.name(),
+                    match proof.kind {
+                        crate::proof::ProofKind::Response => "response",
+                        crate::proof::ProofKind::Request => "request",
+                    }
+                );
+                anyhow::bail!("proof kind mismatch: only request proofs accepted in dispatch");
+            }
+
+            // The proof's aud MUST match the service domain.
+            if proof.claims.aud != actual_service_domain {
+                warn!(
+                    "{} proof aud mismatch: '{}' vs '{}'",
+                    service.name(), proof.claims.aud, actual_service_domain
+                );
+                anyhow::bail!("proof aud mismatch");
+            }
+
+            // Freshness: per-disposition bounds against verifier clock.
+            let now_secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let skew_tolerance_secs: u64 = 30;
+            let max_lifetime_secs: u64 = match proof.disposition {
+                crate::proof::ProofDisposition::Authenticated => 300,  // 5 min
+                crate::proof::ProofDisposition::Unattributed => 30,   // seconds-scale
+            };
+            if proof.claims.iat.abs_diff(now_secs) > skew_tolerance_secs {
+                anyhow::bail!("proof freshness: iat outside {skew_tolerance_secs}s tolerance");
+            }
+            if proof.claims.exp <= now_secs {
+                anyhow::bail!("proof freshness: exp expired");
+            }
+            if proof.claims.exp > now_secs + max_lifetime_secs {
+                anyhow::bail!(
+                    "proof freshness: exp exceeds {max_lifetime_secs}s max lifetime for {:?}",
+                    proof.disposition
+                );
+            }
+
+            debug!(
+                "{} proof-CWT parsed (not yet crypto-verified): disposition={:?} request_id={}",
+                service.name(),
+                proof.disposition,
+                hex::encode(proof.claims.request_id)
+            );
+            Some(proof)
+        } else {
+            None
+        };
+        // After carrier recovery: verify proof body bytes match the ONE decoded
+        // request body that feeds both PEP and handler (v16 §5.1 invariant).
+        if let Some(ref proof) = parsed {
+            if proof.claims.capnp_request_bytes != payload {
+                warn!(
+                    "{} proof body mismatch after carrier recovery: {} vs {} bytes",
+                    service.name(),
+                    proof.claims.capnp_request_bytes.len(),
+                    payload.len()
+                );
+                anyhow::bail!("proof body bytes do not match decoded request body");
+            }
+        }
+            Ok(parsed)
+        })();
+        match parsed {
+            Ok(parsed) => parsed,
+            Err(e) => {
+                warn!(
+                    "{} proof admission denied (id={}): {e:#}",
+                    service.name(),
+                    request_id
+                );
+                return dispatch_denied(&format!("proof gate: {e:#}"));
+            }
+        }
+    };
 
     // 2c. Proof authority (v16 §5.2 pipeline step 3). The credential was
     // parsed and verified above (step 2); this cryptographically verifies the

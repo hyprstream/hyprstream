@@ -131,6 +131,16 @@ pub struct SignerSuiteRecord {
     /// threshold rules. Meaningful only for [`SignerRole::Approver`]; the
     /// name is enrollment data, never taken from the request.
     pub approver_role: Option<String>,
+    /// The enrollment policy this record was issued under (§4.4).
+    ///
+    /// Component-key separation is normative: a key enrolled for the WNS
+    /// hybrid suite MUST NOT simultaneously be enrolled for a standalone
+    /// suite, a different hybrid, another protocol or domain separator, or a
+    /// different logical signer group. An exception requires a separate
+    /// operator-approved cryptographic analysis and an explicit policy
+    /// identifier — this field carries it, so an overlap can never be
+    /// silently inherited from a key's other role.
+    pub enrollment_policy_id: String,
     /// Credential/session expiry. A proof whose `exp` exceeds this denies.
     pub not_after: u64,
     /// Whether the enrollment has been revoked.
@@ -353,6 +363,7 @@ mod tests {
             epoch: 1,
             role,
             approver_role: None,
+            enrollment_policy_id: "test-enrollment-v1".to_owned(),
             not_after: 2_000,
             revoked: false,
         }

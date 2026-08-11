@@ -27,8 +27,18 @@ use super::{
 };
 
 /// One additional enrolled logical signer that approved this request.
+///
+/// Carries everything a generated approver rule must constrain: which signed
+/// logical group it occupied, the suite it verified under, the enrolled
+/// principal, and the enrolled approver role. Dropping any of these would let
+/// an unnamed group, or a group under the wrong suite, count toward a
+/// threshold.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerifiedApprover {
+    /// The signed plan's logical signer group ID this approver occupied.
+    pub group_id: u64,
+    /// The exact suite ID this group declared and verified under.
+    pub suite: String,
     /// The enrolled principal this approver group resolved to.
     pub principal: String,
     /// The approver role the enrollment carries, when it names one.
@@ -322,8 +332,10 @@ fn verify_authenticated(
         .groups
         .iter()
         .filter(|g| g.group_id != primary_group_id)
-        .filter_map(|g| resolved.get(&g.group_id))
-        .map(|record| VerifiedApprover {
+        .filter_map(|g| resolved.get(&g.group_id).map(|record| (g, record)))
+        .map(|(group, record)| VerifiedApprover {
+            group_id: group.group_id,
+            suite: record.suite_id.clone(),
             principal: record.principal.clone(),
             role: record.approver_role.clone(),
         })
@@ -986,6 +998,7 @@ mod tests {
             epoch: 1,
             role: SignerRole::Approver,
             approver_role: None,
+            enrollment_policy_id: "test-enrollment-v1".to_owned(),
             not_after: 1_786_000_600,
             revoked: false,
         };
@@ -1023,6 +1036,7 @@ mod tests {
                     epoch: 1,
                     role: SignerRole::Primary,
                     approver_role: None,
+            enrollment_policy_id: "test-enrollment-v1".to_owned(),
                     not_after: 1_786_000_600,
                     revoked: false,
                 },
@@ -1040,6 +1054,7 @@ mod tests {
                 epoch: 1,
                 role: SignerRole::Approver,
                 approver_role: None,
+            enrollment_policy_id: "test-enrollment-v1".to_owned(),
                 not_after: 1_786_000_600,
                 revoked: false,
             })
@@ -1129,6 +1144,7 @@ mod tests {
                     epoch: 1,
                     role: SignerRole::Service,
                     approver_role: None,
+            enrollment_policy_id: "test-enrollment-v1".to_owned(),
                     not_after: 1_786_000_600,
                     revoked: false,
                 },

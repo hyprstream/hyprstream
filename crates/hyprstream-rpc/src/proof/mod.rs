@@ -152,6 +152,44 @@ impl ProofKind {
     }
 }
 
+/// Whether `presented` is a request- or response-proof CWT rather than a
+/// credential.
+///
+/// A proof CWT and a credential are disjoint by construction (§4.2): a
+/// verifier MUST reject a token whose protected type does not match the slot
+/// it was presented in. This is the credential slot's half of that rule, and
+/// it covers both presentations — a compact-serialization token whose header
+/// `typ` names a proof media type, and a raw COSE object carrying the proof
+/// `typ` header (the shape a CWT credential slot would accept).
+///
+/// It is a cheap, bounded structural check: it never verifies a signature and
+/// never consults an issuer key, because a proof presented as a credential
+/// must be refused before any key material is resolved.
+pub fn is_proof_typed_credential(presented: &[u8]) -> bool {
+    // Compact serialization: header.payload.signature, header is base64url JSON.
+    if let Ok(text) = std::str::from_utf8(presented) {
+        if let Some((header_b64, rest)) = text.split_once('.') {
+            if rest.contains('.') && header_b64.len() <= 4096 {
+                use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+                if let Ok(bytes) = URL_SAFE_NO_PAD.decode(header_b64) {
+                    if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+                        if let Some(typ) = value.get("typ").and_then(|t| t.as_str()) {
+                            if typ == PROOF_TYP || typ == RESPONSE_PROOF_TYP {
+                                return true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // COSE object: the bounded parser establishes the typ/domain pair, so a
+    // proof presented where a CWT credential is expected is refused by the
+    // same rule that admits it in the proof slot.
+    parser::ParsedProof::parse(presented).is_ok()
+}
+
 /// Disposition of a proof relative to credential presence. Determines the
 /// replay key and partition.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

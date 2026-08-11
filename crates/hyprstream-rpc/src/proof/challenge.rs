@@ -109,15 +109,38 @@ impl ChallengeManager {
         }
     }
 
-    /// Create a self-rotating manager seeded from the OS CSPRNG.
+    /// Create a self-rotating manager seeded from the OS CSPRNG, for a
+    /// deployment whose replay admission domain is a single verifier instance.
     ///
     /// Rotation is lazy rather than timer-driven: the current challenge is
     /// regenerated when its window has elapsed, at the moment it is next
     /// needed. A server that stops serving therefore cannot leave a stale
     /// challenge advertised, and there is no rotation task to stall.
+    ///
+    /// Returns `None` for any other replay domain. Challenge validity is
+    /// scoped to the replay admission domain and has **one exact deadline
+    /// shared by verification and replay garbage collection** (§4.7): an
+    /// independently random per-process challenge cannot provide that across
+    /// several verifiers, so a shared or affine-routed domain must install a
+    /// domain-wide challenge source instead of this one. Refusing here is why
+    /// a multi-instance deployment cannot silently disagree about challenge
+    /// freshness.
     #[cfg(not(target_arch = "wasm32"))]
-    pub fn rotating(window_seconds: u64, overlap_seconds: u64, now: u64) -> Self {
-        Self::rotating_with(window_seconds, overlap_seconds, now, random_challenge_value)
+    pub fn rotating_for_domain(
+        domain: super::admission::ReplayDomainGuarantee,
+        window_seconds: u64,
+        overlap_seconds: u64,
+        now: u64,
+    ) -> Option<Self> {
+        if domain != super::admission::ReplayDomainGuarantee::SingleVerifierInstance {
+            return None;
+        }
+        Some(Self::rotating_with(
+            window_seconds,
+            overlap_seconds,
+            now,
+            random_challenge_value,
+        ))
     }
 
     /// Self-rotating manager over an explicit value source. Production passes

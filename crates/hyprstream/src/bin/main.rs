@@ -1834,7 +1834,7 @@ fn install_envelope_verify_config(oauth: Option<&hyprstream_core::config::OAuthC
 fn install_proof_admission(oauth: Option<&hyprstream_core::config::OAuthConfig>) {
     use hyprstream_rpc::proof::admission::{
         set_global_challenge_manager, set_global_proof_replay_store, InMemoryProofReplayStore,
-        ProofReplayStore,
+        ProofReplayStore, ReplayDomainGuarantee,
     };
     use hyprstream_rpc::proof::challenge::{
         ChallengeManager, DEFAULT_CHALLENGE_OVERLAP_SECS, DEFAULT_CHALLENGE_WINDOW_SECS,
@@ -1845,51 +1845,138 @@ fn install_proof_admission(oauth: Option<&hyprstream_core::config::OAuthConfig>)
         .map(|d| d.as_secs())
         .unwrap_or(0);
 
-    // The challenge is generated from the OS CSPRNG at startup and rotates
-    // lazily on its window, so there is no rotation task that can stall and
-    // leave an expired value advertised.
-    let manager = ChallengeManager::rotating(
+    // The replay admission domain is an operator statement about deployment
+    // topology, not something startup may assume. "Admitted once" means once
+    // per service domain, so a node that shares its service domain with other
+    // verifiers cannot satisfy it with a process-local map — and startup
+    // cannot tell the difference by inspection.
+    //
+    // The operator therefore declares it. Absent declaration, nothing is
+    // installed and every proof-bearing request denies at admission, which is
+    // the correct posture for an undeclared topology: it is visible and safe,
+    // rather than a silent per-node guarantee that reads as domain-wide.
+    let declared_domain = std::env::var("HYPRSTREAM_REPLAY_ADMISSION_DOMAIN").ok();
+    let guarantee = match declared_domain.as_deref() {
+        Some("single-verifier-instance") => Some(ReplayDomainGuarantee::SingleVerifierInstance),
+        Some(other) => {
+            tracing::error!(
+                "HYPRSTREAM_REPLAY_ADMISSION_DOMAIN='{other}' names a topology this build \
+                 cannot provide in-process: a shared linearizable backend or \
+                 namespace-affine routing must be installed explicitly. Proof \
+                 admission denies."
+            );
+            None
+        }
+        None => {
+            tracing::warn!(
+                "no HYPRSTREAM_REPLAY_ADMISSION_DOMAIN declared; proof replay admission \
+                 is not installed and proof-bearing requests will deny. Set \
+                 'single-verifier-instance' only when this node is the sole verifier \
+                 for its service domain."
+            );
+            None
+        }
+    };
+
+    let Some(guarantee) = guarantee else {
+        return;
+    };
+
+    // The challenge is scoped to the SAME replay admission domain: one exact
+    // deadline shared by verification and replay collection. A per-process
+    // random challenge can only provide that for a single verifier, so any
+    // other topology gets no challenge manager and unattributed proofs deny.
+    match ChallengeManager::rotating_for_domain(
+        guarantee,
         DEFAULT_CHALLENGE_WINDOW_SECS,
         DEFAULT_CHALLENGE_OVERLAP_SECS,
         now,
-    );
-    if set_global_challenge_manager(manager).is_ok() {
-        tracing::info!(
-            "proof challenge manager installed: {DEFAULT_CHALLENGE_WINDOW_SECS}s window, \
-             {DEFAULT_CHALLENGE_OVERLAP_SECS}s acceptance overlap"
-        );
+    ) {
+        Some(manager) => {
+            if set_global_challenge_manager(manager).is_ok() {
+                tracing::info!(
+                    "proof challenge manager installed for {guarantee:?}: \
+                     {DEFAULT_CHALLENGE_WINDOW_SECS}s window, \
+                     {DEFAULT_CHALLENGE_OVERLAP_SECS}s acceptance overlap"
+                );
+            }
+        }
+        None => tracing::error!(
+            "replay domain {guarantee:?} needs a domain-wide challenge source; \
+             unattributed proofs deny"
+        ),
     }
 
-    // The enrollment resolver comes from the SAME admin-anchored `mesh_peers`
-    // roster that seeds the PQ trust store and the identity roster — one
-    // enrollment source, not a parallel one. An entrypoint with no config in
-    // scope enrols nothing, and an unenrolled credential then denies rather
-    // than falling back to a self-asserted key.
+    // Request-proof signers are their own enrollment with their own
+    // lifecycle, loaded from an operator-authored manifest. They are NOT
+    // derived from the mesh/envelope identity: component-key separation is
+    // normative, and a transport key carries no enrollment epoch, validity,
+    // revocation state, approver role, or enrollment-policy identifier.
+    //
+    // The mesh roster is consulted only to learn which keys already belong to
+    // another protocol, so a manifest cannot silently reuse one. Absent
+    // manifest, nothing is enrolled and authenticated proofs deny.
     if let Some(oauth) = oauth {
-        let resolver = hyprstream_core::auth::mesh_trust::build_mesh_enrollment_resolver(oauth);
-        if hyprstream_rpc::proof::enrollment::set_global_enrollment_resolver(Box::new(resolver))
-            .is_ok()
-        {
-            tracing::info!(
-                "proof enrollment resolver installed from {} mesh peer(s)",
-                oauth.mesh_peers.len()
-            );
+        let manifest_path = HyprConfig::resolve_secrets_dir()
+            .map(|dir| dir.join("proof-enrollment.toml"))
+            .ok();
+        match manifest_path {
+            Some(path) if path.exists() => {
+                match hyprstream_core::auth::proof_enrollment::ProofEnrollmentManifest::load(&path)
+                {
+                    Ok(manifest) => {
+                        let foreign =
+                            hyprstream_core::auth::proof_enrollment::mesh_protocol_keys(oauth);
+                        let entries = manifest.entries.len();
+                        let resolver = hyprstream_core::auth::proof_enrollment::build_resolver(
+                            &manifest,
+                            &foreign,
+                            &Default::default(),
+                            now,
+                        );
+                        if hyprstream_rpc::proof::enrollment::set_global_enrollment_resolver(
+                            Box::new(resolver),
+                        )
+                        .is_ok()
+                        {
+                            tracing::info!(
+                                "proof enrollment manifest loaded from {} ({entries} entr(ies))",
+                                path.display()
+                            );
+                        }
+                    }
+                    Err(e) => tracing::error!(
+                        "proof enrollment manifest at {} is unusable; \
+                         authenticated proofs will deny: {e:#}",
+                        path.display()
+                    ),
+                }
+            }
+            _ => tracing::info!(
+                "no proof enrollment manifest present; authenticated proofs deny \
+                 until one is provisioned"
+            ),
         }
     }
 
     // Partitioned by disposition, fail-closed on capacity: an unexpired
-    // accepted record is never evicted to make room for a new one.
+    // accepted record is never evicted to make room.
     const REPLAY_CAPACITY_PER_PARTITION: usize = 100_000;
-    let store: Box<dyn ProofReplayStore> = Box::new(
-        InMemoryProofReplayStore::single_verifier_instance(REPLAY_CAPACITY_PER_PARTITION),
-    );
-    let guarantee = store.domain_guarantee();
+    let store: Box<dyn ProofReplayStore> = match guarantee {
+        ReplayDomainGuarantee::SingleVerifierInstance => Box::new(
+            InMemoryProofReplayStore::single_verifier_instance(REPLAY_CAPACITY_PER_PARTITION),
+        ),
+        // Unreachable today: the declaration parser above accepts no other
+        // value precisely because this build ships no other substrate.
+        other => {
+            tracing::error!("no replay store implementation for {other:?}; admission denies");
+            return;
+        }
+    };
     if set_global_proof_replay_store(store).is_ok() {
         tracing::info!(
-            "proof replay store installed: {guarantee:?}, \
-             {REPLAY_CAPACITY_PER_PARTITION} records per partition. \
-             A multi-instance service domain MUST replace this with a shared \
-             linearizable backend or namespace-affine routing."
+            "proof replay store installed: operator-declared {guarantee:?}, \
+             {REPLAY_CAPACITY_PER_PARTITION} records per partition"
         );
     }
 }

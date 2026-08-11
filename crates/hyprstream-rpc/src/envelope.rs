@@ -201,7 +201,19 @@ impl FromCapnp for Authorization {
             Which::None(()) => Ok(Self::None),
             Which::Local(r) => Ok(Self::Local(TokenClaims::read_from(r?)?)),
             Which::Federated(r) => Ok(Self::Federated(FederatedToken::read_from(r?)?)),
-            Which::IdJag(r) => Ok(Self::IdJag(r?.to_str()?.to_owned())),
+            Which::IdJag(r) => {
+                let token = r?;
+                // Type-confusion separation (§4.2, vector N-2): a proof CWT
+                // presented in the credential/authorization slot is refused
+                // here, before any issuer key is resolved, on every transport
+                // that carries this envelope.
+                if crate::proof::is_proof_typed_credential(token.as_bytes()) {
+                    anyhow::bail!(
+                        "authorization slot carries a proof CWT, not a credential"
+                    );
+                }
+                Ok(Self::IdJag(token.to_str()?.to_owned()))
+            }
         }
     }
 }

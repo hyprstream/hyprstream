@@ -98,6 +98,7 @@ fn record(
         epoch: 1,
         role,
         approver_role: None,
+            enrollment_policy_id: "test-enrollment-v1".to_owned(),
         not_after: FIXTURE_NOT_AFTER,
         revoked: false,
     }
@@ -138,14 +139,16 @@ pub(crate) fn classical_enrollment() -> InMemoryEnrollmentResolver {
             ),
         )
         .unwrap();
-    resolver
-        .enrol_approver(record(
-            "approver",
-            crate::proof::SUITE_CLASSICAL,
-            vec![ed_component("approver-ed25519-1")],
-            SignerRole::Approver,
-        ))
-        .unwrap();
+    let mut approver = record(
+        "approver",
+        crate::proof::SUITE_CLASSICAL,
+        vec![ed_component("approver-ed25519-1")],
+        SignerRole::Approver,
+    );
+    // The enrolled approver role is enrollment data; a generated approver rule
+    // names it per group, and a group holding a different role denies.
+    approver.approver_role = Some("security".to_owned());
+    resolver.enrol_approver(approver).unwrap();
     resolver
         .enrol_service(
             "registry.svc.hyprstream.test",
@@ -240,6 +243,92 @@ fn n22_response_proof_for_another_request_denies() {
         )
         .is_err(),
         "a response proof can never verify for another request ID"
+    );
+}
+
+/// N-2 at the request-envelope credential slot: the frozen bytes presented in
+/// the authorization slot of a real `RequestEnvelope` must be refused when the
+/// envelope is decoded, on every transport that carries it.
+///
+/// Both presentations are covered: the raw COSE object (the shape a CWT
+/// credential slot accepts) and a compact-serialization token whose header
+/// `typ` names a proof media type. A genuine credential in the same slot is
+/// unaffected.
+#[test]
+fn n2_in_the_request_envelope_credential_slot_denies() {
+    use crate::envelope::{Authorization, RequestEnvelope};
+    use crate::{FromCapnp, ToCapnp};
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+
+    let vectors = load_negative_vectors();
+    let n2 = &vectors
+        .iter()
+        .find(|(id, _, _)| id == "N-2")
+        .expect("N-2 must exist")
+        .1;
+
+    let roundtrip = |auth: Authorization| -> anyhow::Result<Authorization> {
+        let envelope = RequestEnvelope::anonymous(vec![1, 2, 3]).with_authorization(auth);
+        let mut message = capnp::message::Builder::new_default();
+        {
+            let mut builder =
+                message.init_root::<crate::common_capnp::request_envelope::Builder>();
+            envelope.write_to(&mut builder);
+        }
+        let mut bytes = Vec::new();
+        capnp::serialize::write_message(&mut bytes, &message)?;
+        let reader = capnp::serialize::read_message(
+            &mut &bytes[..],
+            capnp::message::ReaderOptions::new(),
+        )?;
+        let decoded = RequestEnvelope::read_from(
+            reader.get_root::<crate::common_capnp::request_envelope::Reader>()?,
+        )?;
+        Ok(decoded.authorization)
+    };
+
+    // 1. The raw COSE proof object. Two independent facts hold, and both are
+    //    required: the byte-level rule refuses these exact bytes wherever a
+    //    credential slot accepts bytes (the CWT credential path), and this
+    //    envelope's Text slot cannot carry them intact in the first place.
+    assert!(
+        crate::proof::is_proof_typed_credential(n2),
+        "the credential-slot guard must refuse the exact proof bytes"
+    );
+    let through_text_slot = String::from_utf8_lossy(n2).into_owned();
+    assert_ne!(
+        through_text_slot.as_bytes(),
+        n2.as_slice(),
+        "a Text credential slot cannot deliver a proof CWT intact"
+    );
+
+    // 2. The same proof wrapped as a compact token carrying the proof typ.
+    for proof_typ in [crate::proof::PROOF_TYP, crate::proof::RESPONSE_PROOF_TYP] {
+        let header = format!(r#"{{"alg":"EdDSA","typ":"{proof_typ}","kid":"k1"}}"#);
+        let token = format!(
+            "{}.{}.{}",
+            URL_SAFE_NO_PAD.encode(header),
+            URL_SAFE_NO_PAD.encode(n2),
+            URL_SAFE_NO_PAD.encode([0u8; 64])
+        );
+        assert!(
+            roundtrip(Authorization::IdJag(token)).is_err(),
+            "a {proof_typ}-typed token in the credential slot must be refused"
+        );
+    }
+
+    // 3. A credential-shaped token in the same slot still decodes: the gate
+    //    rejects proof typing, not the slot itself.
+    let credential_header = r#"{"alg":"EdDSA","typ":"at+jwt","kid":"k1"}"#;
+    let credential = format!(
+        "{}.{}.{}",
+        URL_SAFE_NO_PAD.encode(credential_header),
+        URL_SAFE_NO_PAD.encode(br#"{"sub":"alice"}"#),
+        URL_SAFE_NO_PAD.encode([0u8; 64])
+    );
+    assert!(
+        roundtrip(Authorization::IdJag(credential)).is_ok(),
+        "an ordinary credential must still be accepted"
     );
 }
 
@@ -386,7 +475,17 @@ fn test_n16_unattributed_no_nonce_denies() {
 /// the method policy that matches its actual signing topology.
 #[test]
 fn frozen_vectors_satisfy_only_their_matching_method_policy() {
-    use crate::proof::policy::{evaluate, ApproverRule, CryptoSuite, SignaturePolicy};
+    use crate::proof::policy::{
+        evaluate, AllowedApproverGroup, ApproverRule, CryptoSuite, SignaturePolicy,
+    };
+
+    // P-5's approver occupies signed logical signer group 2 under the
+    // standalone suite; the fixture enrols it with the "security" role.
+    let allowed_group_2 = || AllowedApproverGroup {
+        group_id: 2,
+        suite: CryptoSuite::Classical,
+        role: "security".to_owned(),
+    };
 
     let classical = classical_enrollment();
     let hybrid = hybrid_enrollment();
@@ -447,7 +546,10 @@ fn frozen_vectors_satisfy_only_their_matching_method_policy() {
     assert!(evaluate(
         &SignaturePolicy::TokenBoundAndApproved {
             primary_suite: CryptoSuite::Hybrid,
-            approver_rule: ApproverRule::KOfN { k: 1, n: 1 },
+            approver_rule: ApproverRule::KOfN {
+                k: 1,
+                groups: vec![allowed_group_2()],
+            },
         },
         p2.disposition,
         &p2_v
@@ -469,7 +571,10 @@ fn frozen_vectors_satisfy_only_their_matching_method_policy() {
     assert!(evaluate(
         &SignaturePolicy::TokenBoundAndApproved {
             primary_suite: CryptoSuite::Classical,
-            approver_rule: ApproverRule::KOfN { k: 1, n: 1 },
+            approver_rule: ApproverRule::KOfN {
+                k: 1,
+                groups: vec![allowed_group_2()],
+            },
         },
         p5.disposition,
         &p5_v
@@ -479,7 +584,10 @@ fn frozen_vectors_satisfy_only_their_matching_method_policy() {
     assert!(evaluate(
         &SignaturePolicy::TokenBoundAndApproved {
             primary_suite: CryptoSuite::Classical,
-            approver_rule: ApproverRule::KOfN { k: 2, n: 3 },
+            approver_rule: ApproverRule::KOfN {
+                k: 2,
+                groups: vec![allowed_group_2()],
+            },
         },
         p5.disposition,
         &p5_v
