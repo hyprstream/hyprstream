@@ -251,14 +251,17 @@ where
     let response_recipient = ctx.response_kem_recipient.clone();
     let request_iat = ctx.request_iat;
     let request_nonce = ctx.request_nonce;
-    let sign_response = |payload: Vec<u8>| -> Result<ResponseEnvelope> {
+    let sign_response_with_challenge = |payload: Vec<u8>,
+                                        server_challenge: Option<Vec<u8>>|
+     -> Result<ResponseEnvelope> {
         if carrier.forbids_cleartext_envelope() {
             let recipient = response_recipient
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("missing authenticated response recipient"))?;
-            ResponseEnvelope::new_signed_encrypted(
+            ResponseEnvelope::new_signed_encrypted_with_challenge(
                 request_id,
                 payload,
+                server_challenge,
                 signing_key,
                 &response_pq_key,
                 recipient,
@@ -268,14 +271,49 @@ where
             )
             .map_err(Into::into)
         } else {
-            ResponseEnvelope::new_signed_with_policy(
+            ResponseEnvelope::new_signed_with_challenge(
                 request_id,
                 payload,
+                server_challenge,
                 signing_key,
                 Some(&response_pq_key),
                 crate::crypto::CryptoPolicy::Hybrid,
             )
         }
+    };
+    let sign_response = |payload: Vec<u8>| sign_response_with_challenge(payload, None);
+
+    /// Serialize a signed response envelope to wire bytes.
+    fn serialize_response(signed: &ResponseEnvelope) -> Result<Vec<u8>> {
+        let mut message = Builder::new_default();
+        let mut builder = message.init_root::<crate::common_capnp::response_envelope::Builder>();
+        signed.write_to(&mut builder);
+        let mut bytes = Vec::new();
+        serialize::write_message(&mut bytes, &message)?;
+        Ok(bytes)
+    }
+
+    // Every pre-handler denial goes out through this one path (§14.2): the
+    // same shape, and always carrying the server's current challenge in the
+    // fixed response slot (§4.7). Because every denial carries one, its
+    // presence reveals nothing about the internal cause, and a client that
+    // has no challenge yet obtains a usable one from its first denial and
+    // retries exactly once with a fresh request_id.
+    //
+    // When rotation cannot produce a usable challenge the denial still goes
+    // out — it simply advertises none, which is service refusal rather than
+    // an unusable challenge the client would burn its one retry on.
+    let dispatch_denied = |reason: &str| -> Result<Vec<u8>> {
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let challenge = crate::proof::admission::global_challenge_manager()
+            .and_then(|mgr| mgr.current_or_rotate(now_secs))
+            .map(|c| c.value);
+        let payload = service.build_error_payload(request_id, reason);
+        let signed = sign_response_with_challenge(payload, challenge)?;
+        serialize_response(&signed)
     };
     debug!(
         "{} verified request from {} (id={})",
@@ -293,16 +331,7 @@ where
             request_id,
             e
         );
-        let error_payload = service.build_error_payload(request_id, &e.to_string());
-        let signed_response = sign_response(error_payload)?;
-
-        let mut message = Builder::new_default();
-        let mut builder = message.init_root::<crate::common_capnp::response_envelope::Builder>();
-        signed_response.write_to(&mut builder);
-
-        let mut bytes = Vec::new();
-        serialize::write_message(&mut bytes, &message)?;
-        return Ok(bytes);
+        return dispatch_denied(&e.to_string());
     }
 
     // 2b. Mandatory native-MAC dispatch PEP (epic #1267 T3, #1268).
@@ -357,23 +386,18 @@ where
             request_id,
             reason,
         );
-        let error_payload =
-            service.build_error_payload(request_id, &format!("MAC deny: {reason:?}"));
-        let signed_response = sign_response(error_payload)?;
-
-        let mut message = Builder::new_default();
-        let mut builder = message.init_root::<crate::common_capnp::response_envelope::Builder>();
-        signed_response.write_to(&mut builder);
-
-        let mut bytes = Vec::new();
-        serialize::write_message(&mut bytes, &message)?;
-        return Ok(bytes);
+        return dispatch_denied(&format!("MAC deny: {reason:?}"));
     }
 
     // 2c. Proof-CWT verification gate (v16 §5.2 pipeline: after policy,
     // before handler). Every required gate MUST pass before handler entry.
     // No gate is skipped — unimplemented checks deny fail-closed.
     if let Some(ref proof) = parsed_proof {
+      // Every gate below denies through the one uniform DispatchDenied
+      // surface, so a proof denial is externally indistinguishable from any
+      // other pre-handler denial and still hands the client a usable
+      // challenge to retry with.
+      let proof_admission = (|| -> Result<()> {
         let now_secs = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -493,6 +517,17 @@ where
                 anyhow::bail!("proof replay admission could not be guaranteed");
             }
         }
+        Ok(())
+      })();
+
+      if let Err(e) = proof_admission {
+        warn!(
+            "{} proof admission denied (id={}): {e:#}",
+            service.name(),
+            request_id
+        );
+        return dispatch_denied("dispatch denied");
+      }
     }
 
     // 3. Handle request

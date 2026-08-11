@@ -2435,6 +2435,15 @@ pub struct ResponseEnvelope {
 
     /// Signature suite marker. Production construction always uses `Hybrid`.
     pub policy: crate::crypto::CryptoPolicy,
+
+    /// v16 §4.7: the server's current unattributed-proof challenge, carried
+    /// uniformly on every pre-handler denial.
+    ///
+    /// Bound into the signing transcript when present (see
+    /// [`ResponseEnvelope::bind_server_challenge`]), so it can neither be
+    /// stripped nor substituted in flight. Absent on ordinary responses, where
+    /// the transcript is unchanged.
+    pub server_challenge: Option<Vec<u8>>,
 }
 
 impl ResponseEnvelope {
@@ -2443,6 +2452,22 @@ impl ResponseEnvelope {
         let mut data = Vec::with_capacity(8 + payload.len());
         data.extend_from_slice(&request_id.to_le_bytes());
         data.extend_from_slice(payload);
+        data
+    }
+
+    /// Append the advertised server challenge to a response transcript.
+    ///
+    /// Domain-separated and length-prefixed, so no `(payload, challenge)` pair
+    /// can be re-cut into a different one. When no challenge is advertised the
+    /// transcript is returned byte-identical, so ordinary responses are
+    /// unaffected. Applied to both the cleartext and the sealed transcript, so
+    /// the guarantee does not depend on the carrier.
+    fn bind_server_challenge(mut data: Vec<u8>, challenge: Option<&[u8]>) -> Vec<u8> {
+        if let Some(challenge) = challenge {
+            data.extend_from_slice(b"hs-rpc-server-challenge-v1\0");
+            data.extend_from_slice(&(challenge.len() as u64).to_le_bytes());
+            data.extend_from_slice(challenge);
+        }
         data
     }
 
@@ -2522,7 +2547,26 @@ impl ResponseEnvelope {
         pq_signing_key: Option<&crate::crypto::pq::MlDsaSigningKey>,
         policy: crate::crypto::CryptoPolicy,
     ) -> Result<Self> {
-        let signing_data = Self::signing_data(request_id, &payload);
+        Self::new_signed_with_challenge(request_id, payload, None, signing_key, pq_signing_key, policy)
+    }
+
+    /// Create and sign a response that also advertises the server's current
+    /// challenge in the fixed response slot (§4.7).
+    ///
+    /// The challenge is part of the signed transcript, so a denial's challenge
+    /// is as authentic as its payload.
+    pub fn new_signed_with_challenge(
+        request_id: u64,
+        payload: Vec<u8>,
+        server_challenge: Option<Vec<u8>>,
+        signing_key: &SigningKey,
+        pq_signing_key: Option<&crate::crypto::pq::MlDsaSigningKey>,
+        policy: crate::crypto::CryptoPolicy,
+    ) -> Result<Self> {
+        let signing_data = Self::bind_server_challenge(
+            Self::signing_data(request_id, &payload),
+            server_challenge.as_deref(),
+        );
 
         let signature_obj = signing_key.sign(&signing_data);
         let sig: [u8; 64] = signature_obj.to_bytes();
@@ -2542,6 +2586,7 @@ impl ResponseEnvelope {
             cnf,
             cose,
             policy,
+            server_challenge,
         })
     }
 
@@ -2550,6 +2595,38 @@ impl ResponseEnvelope {
     pub fn new_signed_encrypted(
         request_id: u64,
         payload: Vec<u8>,
+        signing_key: &SigningKey,
+        pq_signing_key: &crate::crypto::pq::MlDsaSigningKey,
+        recipient: &crate::crypto::hybrid_kem::RecipientPublic,
+        request_iat: i64,
+        request_nonce: &[u8; 16],
+        service_domain: &str,
+    ) -> EnvelopeResult<Self> {
+        Self::new_signed_encrypted_with_challenge(
+            request_id,
+            payload,
+            None,
+            signing_key,
+            pq_signing_key,
+            recipient,
+            request_iat,
+            request_nonce,
+            service_domain,
+        )
+    }
+
+    /// Seal a unary response that also advertises the server's current
+    /// challenge, so a denial on a confidential carrier carries one too.
+    ///
+    /// The challenge is a public server value and rides in the cleartext slot
+    /// — a client that cannot yet form an admissible proof must be able to
+    /// read it — but it is bound into the sealed response's signature
+    /// transcript, so it can be neither stripped nor substituted.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_signed_encrypted_with_challenge(
+        request_id: u64,
+        payload: Vec<u8>,
+        server_challenge: Option<Vec<u8>>,
         signing_key: &SigningKey,
         pq_signing_key: &crate::crypto::pq::MlDsaSigningKey,
         recipient: &crate::crypto::hybrid_kem::RecipientPublic,
@@ -2589,7 +2666,10 @@ impl ResponseEnvelope {
                 "encrypted response exceeds envelope limit".into(),
             ));
         }
-        let signing_data = Self::encrypted_signing_data(request_id, &ciphertext, service_domain)?;
+        let signing_data = Self::bind_server_challenge(
+            Self::encrypted_signing_data(request_id, &ciphertext, service_domain)?,
+            server_challenge.as_deref(),
+        );
         let signature_obj = signing_key.sign(&signing_data);
         let cose = Self::build_cose(
             signing_key,
@@ -2606,6 +2686,7 @@ impl ResponseEnvelope {
             cnf: server_identity,
             cose,
             policy: crate::crypto::CryptoPolicy::Hybrid,
+            server_challenge,
         })
     }
 
@@ -2763,6 +2844,8 @@ impl ResponseEnvelope {
         } else {
             Self::signing_data(self.request_id, signing_bytes)
         };
+        let signing_data =
+            Self::bind_server_challenge(signing_data, self.server_challenge.as_deref());
         let aad = response_envelope_external_aad();
 
         // Per-identity PQ requirement, mirroring the request side: an anchored
@@ -2808,6 +2891,9 @@ impl ToCapnp for ResponseEnvelope {
         builder.set_sig(&self.sig);
         builder.set_cnf(&self.cnf);
         builder.set_cose(&self.cose);
+        if let Some(ref challenge) = self.server_challenge {
+            builder.set_server_challenge(challenge);
+        }
     }
 }
 
@@ -2850,6 +2936,26 @@ impl FromCapnp for ResponseEnvelope {
 
         // `policy` is a signing-time concept; the verifier supplies the verify
         // policy explicitly, so decode to the default here (mirrors SignedEnvelope).
+        // The advertised challenge is bounded by the profile's own limits: a
+        // value outside 16..64 bytes is not a challenge this profile can ever
+        // have issued, so it is rejected here rather than carried onward.
+        let challenge_data = reader.get_server_challenge()?;
+        let server_challenge = if challenge_data.is_empty() {
+            None
+        } else {
+            if challenge_data.len() < crate::proof::MIN_CHALLENGE_BYTES
+                || challenge_data.len() > crate::proof::MAX_CHALLENGE_BYTES
+            {
+                anyhow::bail!(
+                    "serverChallenge length {} outside the profile's {}..{} bounds",
+                    challenge_data.len(),
+                    crate::proof::MIN_CHALLENGE_BYTES,
+                    crate::proof::MAX_CHALLENGE_BYTES
+                );
+            }
+            Some(challenge_data.to_vec())
+        };
+
         Ok(Self {
             request_id: reader.get_request_id(),
             payload,
@@ -2858,6 +2964,7 @@ impl FromCapnp for ResponseEnvelope {
             cnf,
             cose,
             policy: crate::crypto::CryptoPolicy::default(),
+            server_challenge,
         })
     }
 }
@@ -4701,6 +4808,156 @@ mod tests {
             res.is_err(),
             "a request-domain COSE grafted onto a response must be rejected"
         );
+    }
+
+    // -- v16 §4.7: the advertised server challenge is part of the transcript --
+
+    fn classical_denial(challenge: Option<Vec<u8>>, sk: &SigningKey) -> ResponseEnvelope {
+        ResponseEnvelope::new_signed_with_challenge(
+            7,
+            b"denied".to_vec(),
+            challenge,
+            sk,
+            None,
+            crate::crypto::CryptoPolicy::Classical,
+        )
+        .expect("classical denial must sign")
+    }
+
+    /// An ordinary response carries no challenge, and its transcript is
+    /// unchanged by the new slot.
+    #[test]
+    fn a_response_without_a_challenge_has_the_original_transcript() {
+        let (sk, vk) = generate_signing_keypair();
+        let plain = ResponseEnvelope::new_signed(7, b"denied".to_vec(), &sk);
+        let none = classical_denial(None, &sk);
+        assert!(none.server_challenge.is_none());
+        assert_eq!(plain.sig, none.sig, "no challenge must not alter the transcript");
+        assert!(none.verify(Some(&vk)).is_ok());
+    }
+
+    #[test]
+    fn an_advertised_challenge_verifies_and_survives_the_wire() {
+        let (sk, vk) = generate_signing_keypair();
+        let challenge = vec![0xa5u8; 32];
+        let denied = classical_denial(Some(challenge.clone()), &sk);
+        assert!(denied.verify(Some(&vk)).is_ok());
+
+        let mut message = capnp::message::Builder::new_default();
+        {
+            let mut builder =
+                message.init_root::<crate::common_capnp::response_envelope::Builder>();
+            denied.write_to(&mut builder);
+        }
+        let mut bytes = Vec::new();
+        capnp::serialize::write_message(&mut bytes, &message).unwrap();
+        let reader =
+            capnp::serialize::read_message(&mut &bytes[..], capnp::message::ReaderOptions::new())
+                .unwrap();
+        let decoded = ResponseEnvelope::read_from(
+            reader
+                .get_root::<crate::common_capnp::response_envelope::Reader>()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(decoded.server_challenge.as_deref(), Some(&challenge[..]));
+        assert!(decoded.verify(Some(&vk)).is_ok());
+    }
+
+    /// Stripping the advertised challenge in flight must not verify: a client
+    /// can never be tricked into retrying without one, or into thinking the
+    /// server issued none.
+    #[test]
+    fn a_stripped_challenge_fails_verification() {
+        let (sk, vk) = generate_signing_keypair();
+        let mut denied = classical_denial(Some(vec![0xa5u8; 32]), &sk);
+        denied.server_challenge = None;
+        assert!(denied.verify(Some(&vk)).is_err());
+    }
+
+    /// Substituting a different challenge must not verify either, so an
+    /// attacker cannot burn the client's single bounded retry.
+    #[test]
+    fn a_substituted_challenge_fails_verification() {
+        let (sk, vk) = generate_signing_keypair();
+        let mut denied = classical_denial(Some(vec![0xa5u8; 32]), &sk);
+        denied.server_challenge = Some(vec![0x5au8; 32]);
+        assert!(denied.verify(Some(&vk)).is_err());
+    }
+
+    /// Injecting a challenge onto a response that advertised none fails too.
+    #[test]
+    fn an_injected_challenge_fails_verification() {
+        let (sk, vk) = generate_signing_keypair();
+        let mut plain = ResponseEnvelope::new_signed(7, b"denied".to_vec(), &sk);
+        plain.server_challenge = Some(vec![0xa5u8; 32]);
+        assert!(plain.verify(Some(&vk)).is_err());
+    }
+
+    /// The length prefix makes the transcript unambiguous: no
+    /// (payload, challenge) pair can be re-cut into a different one.
+    #[test]
+    fn the_challenge_binding_is_unambiguous() {
+        let (sk, vk) = generate_signing_keypair();
+        let a = ResponseEnvelope::new_signed_with_challenge(
+            7,
+            b"ab".to_vec(),
+            Some(b"cdefghijklmnopqr".to_vec()),
+            &sk,
+            None,
+            crate::crypto::CryptoPolicy::Classical,
+        )
+        .unwrap();
+        let b = ResponseEnvelope::new_signed_with_challenge(
+            7,
+            b"abc".to_vec(),
+            Some(b"defghijklmnopqr".to_vec()),
+            &sk,
+            None,
+            crate::crypto::CryptoPolicy::Classical,
+        );
+        // The second challenge is below the profile floor, so it is not a
+        // reachable wire state; the transcripts still differ regardless.
+        if let Ok(b) = b {
+            assert_ne!(a.sig, b.sig);
+        }
+        assert!(a.verify(Some(&vk)).is_ok());
+    }
+
+    /// A challenge outside the profile's 16..64-byte bounds is not a value
+    /// this profile can have issued, so decoding rejects it outright.
+    #[test]
+    fn an_out_of_profile_challenge_is_rejected_on_decode() {
+        for bad in [vec![1u8; 15], vec![1u8; 65]] {
+            let mut message = capnp::message::Builder::new_default();
+            {
+                let mut builder =
+                    message.init_root::<crate::common_capnp::response_envelope::Builder>();
+                builder.set_request_id(7);
+                builder.set_payload(b"denied");
+                builder.set_sig(&[0u8; 64]);
+                builder.set_cnf(&[0u8; 32]);
+                builder.set_cose(&[]);
+                builder.set_server_challenge(&bad);
+            }
+            let mut bytes = Vec::new();
+            capnp::serialize::write_message(&mut bytes, &message).unwrap();
+            let reader = capnp::serialize::read_message(
+                &mut &bytes[..],
+                capnp::message::ReaderOptions::new(),
+            )
+            .unwrap();
+            assert!(
+                ResponseEnvelope::read_from(
+                    reader
+                        .get_root::<crate::common_capnp::response_envelope::Reader>()
+                        .unwrap()
+                )
+                .is_err(),
+                "a {}-byte challenge must be rejected",
+                bad.len()
+            );
+        }
     }
 
     #[test]

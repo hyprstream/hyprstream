@@ -1812,6 +1812,69 @@ fn install_envelope_verify_config(oauth: Option<&hyprstream_core::config::OAuthC
     }
 
     install_session_pq_overlay();
+    install_proof_admission();
+}
+
+/// Install the v16 proof admission substrate: the rotating server challenge
+/// and the replay admission store (§4.6, §4.7).
+///
+/// Called from the same startup path as the envelope verify config, so every
+/// entrypoint that serves RPC installs both. Both registrations are
+/// first-write-wins and neither is auto-installed by dispatch: an absent
+/// challenge manager or replay store denies at admission rather than admitting
+/// under a guarantee nobody made.
+///
+/// **Deployment note.** The in-memory store declares
+/// `SingleVerifierInstance`, which is the honest guarantee for a node that
+/// admits requests for its own service domain by itself. A domain served by
+/// several verifier instances needs a shared linearizable backend installed
+/// here instead — the same trait, a different substrate. Installing this one
+/// across several instances would silently weaken "admitted once per domain"
+/// to "once per node", so the log line below states the guarantee in force.
+fn install_proof_admission() {
+    use hyprstream_rpc::proof::admission::{
+        set_global_challenge_manager, set_global_proof_replay_store, InMemoryProofReplayStore,
+        ProofReplayStore,
+    };
+    use hyprstream_rpc::proof::challenge::{
+        ChallengeManager, DEFAULT_CHALLENGE_OVERLAP_SECS, DEFAULT_CHALLENGE_WINDOW_SECS,
+    };
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    // The challenge is generated from the OS CSPRNG at startup and rotates
+    // lazily on its window, so there is no rotation task that can stall and
+    // leave an expired value advertised.
+    let manager = ChallengeManager::rotating(
+        DEFAULT_CHALLENGE_WINDOW_SECS,
+        DEFAULT_CHALLENGE_OVERLAP_SECS,
+        now,
+    );
+    if set_global_challenge_manager(manager).is_ok() {
+        tracing::info!(
+            "proof challenge manager installed: {DEFAULT_CHALLENGE_WINDOW_SECS}s window, \
+             {DEFAULT_CHALLENGE_OVERLAP_SECS}s acceptance overlap"
+        );
+    }
+
+    // Partitioned by disposition, fail-closed on capacity: an unexpired
+    // accepted record is never evicted to make room for a new one.
+    const REPLAY_CAPACITY_PER_PARTITION: usize = 100_000;
+    let store: Box<dyn ProofReplayStore> = Box::new(
+        InMemoryProofReplayStore::single_verifier_instance(REPLAY_CAPACITY_PER_PARTITION),
+    );
+    let guarantee = store.domain_guarantee();
+    if set_global_proof_replay_store(store).is_ok() {
+        tracing::info!(
+            "proof replay store installed: {guarantee:?}, \
+             {REPLAY_CAPACITY_PER_PARTITION} records per partition. \
+             A multi-instance service domain MUST replace this with a shared \
+             linearizable backend or namespace-affine routing."
+        );
+    }
 }
 
 /// Install the session PQ binding overlay, the runtime anchoring path for
