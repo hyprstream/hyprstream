@@ -470,7 +470,8 @@ where
             request_id: proof.claims.request_id,
         };
 
-        match replay_store.check_and_insert(
+        match crate::proof::admission::admit_request_proof(
+            replay_store,
             proof.disposition,
             &replay_key,
             replay_expiry,
@@ -483,8 +484,13 @@ where
                 anyhow::bail!("proof replay detected");
             }
             crate::proof::admission::ProofAdmissionResult::Failed => {
-                warn!("{} proof replay store at capacity (fail-closed)", service.name());
-                anyhow::bail!("proof replay store at capacity");
+                // Capacity, backend unavailability, or a namespace this node
+                // holds no history for. Every one of them is a denial.
+                warn!(
+                    "{} proof replay admission failed closed (capacity, backend, or namespace affinity)",
+                    service.name()
+                );
+                anyhow::bail!("proof replay admission could not be guaranteed");
             }
         }
     }

@@ -1,9 +1,23 @@
 //! Proof replay admission and challenge manager wiring.
 //!
-//! Follows the #1516 `CredentialRevocationStore` pattern: a trait with
-//! process-global `OnceLock` registration, an in-memory default, and
-//! `set_global_*()` / `global_*()` accessors. Installed at startup;
-//! dispatch calls the globals.
+//! "Admitted once" means once per **replay admission domain** — the complete
+//! set of verifier instances that can admit requests for one service domain —
+//! never once per node (§4.6). A deployment satisfies that with exactly one
+//! of three shapes, and every store must say which one it is:
+//!
+//! 1. a single verifier instance;
+//! 2. a shared store with linearizable check-and-insert; or
+//! 3. per-node stores with **mandatory** replay-namespace-affine routing,
+//!    where failover to a node holding no history for that namespace denies
+//!    rather than admits.
+//!
+//! There is exactly one store family here. Request-proof replay admission and
+//! one-shot credential consumption are two operations on the same trait, not
+//! two stores: a deployment cannot satisfy one and silently miss the other.
+//! One-shot consumption additionally requires a domain-wide linearizable
+//! consume — key-affine routing is not sufficient for it, because the
+//! credential, not the proof signer set, is the admission key and may be
+//! presented at any node.
 
 use std::collections::HashMap;
 use std::sync::OnceLock;
@@ -14,55 +28,128 @@ use sha2::{Digest, Sha256};
 use super::{ProofDisposition, RequestId};
 
 // ---------------------------------------------------------------------------
-// Replay admission store (canonical #1516 pattern)
+// Replay admission store
 // ---------------------------------------------------------------------------
 
-/// The replay admission key: (signer thumbprint, request_id).
+/// The replay admission key: (signer namespace thumbprint, request_id).
+///
+/// The thumbprint is the credential-bound primary signer-suite thumbprint for
+/// authenticated proofs and the (plan, key set) thumbprint for unattributed
+/// ones. It is produced by verification, never taken from the wire.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ProofReplayKey {
     pub signer_thumbprint: [u8; 32],
     pub request_id: RequestId,
 }
 
+/// A one-shot credential's admission identity: issuer plus the credential's
+/// own identifier bytes (JWT `jti` text or CWT `cti` bytes, kept in their own
+/// namespace — two issuers producing the same value never collide).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct OneShotCredentialId {
+    pub issuer: String,
+    pub value: Vec<u8>,
+}
+
 /// The outcome of a replay admission check.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProofAdmissionResult {
+    /// Admitted exactly once in this domain.
     Admitted,
+    /// This exact key was already admitted.
     Replayed,
+    /// The store could not guarantee admission — capacity, backend
+    /// unavailability, or a guarantee the deployment does not provide. Always
+    /// a denial; never an admission.
     Failed,
 }
 
-/// Proof replay admission store trait. Follows the same pattern as
-/// `CredentialRevocationStore` — process-global, trait-based, with
-/// per-partition fail-closed capacity and per-entry expiry.
+/// How a deployment satisfies domain-wide "admitted once" (§4.6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplayDomainGuarantee {
+    /// Exactly one verifier instance admits for this service domain.
+    SingleVerifierInstance,
+    /// A shared store providing linearizable check-and-insert across every
+    /// verifier in the domain.
+    LinearizableSharedStore,
+    /// Per-node stores with mandatory replay-namespace-affine routing. Every
+    /// admission must first confirm this node owns the key's namespace.
+    NamespaceAffineRouting,
+}
+
+/// Proof replay admission store.
+///
+/// Implementations are the substrate (in-process for a single verifier, or a
+/// shared linearizable backend); this trait is the only admission surface.
 pub trait ProofReplayStore: Send + Sync {
+    /// Which domain-wide guarantee this deployment provides. Dispatch refuses
+    /// to admit under a guarantee the store cannot honour for the key at hand.
+    fn domain_guarantee(&self) -> ReplayDomainGuarantee;
+
+    /// Whether this node owns the replay namespace for `signer_thumbprint`.
+    ///
+    /// Only consulted under [`ReplayDomainGuarantee::NamespaceAffineRouting`],
+    /// where a node that does not own the namespace holds none of its history
+    /// and MUST deny rather than admit. The other guarantees own every
+    /// namespace by construction.
+    fn owns_namespace(&self, signer_thumbprint: &[u8; 32]) -> bool {
+        let _ = signer_thumbprint;
+        !matches!(
+            self.domain_guarantee(),
+            ReplayDomainGuarantee::NamespaceAffineRouting
+        )
+    }
+
+    /// Atomically admit a fresh key or reject a replay, within the partition
+    /// for `partition`. Capacity pressure MUST NOT evict an unexpired accepted
+    /// record: the partition fails closed instead.
     fn check_and_insert(
         &self,
         partition: ProofDisposition,
         key: &ProofReplayKey,
         expires_at: u64,
     ) -> ProofAdmissionResult;
+
+    /// Consume a one-shot credential ID exactly once in the domain.
+    ///
+    /// This is the single admission action for a one-shot credential: it does
+    /// not additionally create a proof replay entry. It requires a domain-wide
+    /// linearizable consume; a store whose guarantee is namespace-affine
+    /// routing MUST fail rather than consume locally.
+    fn consume_one_shot_credential(
+        &self,
+        id: &OneShotCredentialId,
+        expires_at: u64,
+    ) -> ProofAdmissionResult;
 }
 
-/// In-memory proof replay store with per-partition capacity and
-/// fail-closed behavior. Entries expire after their `expires_at` timestamp.
+/// In-memory replay store for a deployment with exactly one verifier instance.
+///
+/// Partitioned by disposition, so saturation of the unattributed partition can
+/// neither delay nor deny authenticated admission. Capacity fails closed: an
+/// unexpired accepted record is never evicted to make room.
+///
+/// This shape is sound **only** as
+/// [`ReplayDomainGuarantee::SingleVerifierInstance`]. A multi-instance
+/// deployment needs a shared linearizable backend implementing the same trait;
+/// there is deliberately no in-memory constructor that claims a guarantee this
+/// type cannot provide.
 pub struct InMemoryProofReplayStore {
     authenticated: parking_lot::Mutex<HashMap<ProofReplayKey, u64>>,
     unattributed: parking_lot::Mutex<HashMap<ProofReplayKey, u64>>,
+    one_shot: parking_lot::Mutex<HashMap<OneShotCredentialId, u64>>,
     max_per_partition: usize,
 }
 
-impl Default for InMemoryProofReplayStore {
-    fn default() -> Self {
-        Self::new(100_000)
-    }
-}
-
 impl InMemoryProofReplayStore {
-    pub fn new(max_per_partition: usize) -> Self {
+    /// Construct the single-verifier-instance store. The name is the
+    /// deployment assertion: installing this in a multi-instance domain breaks
+    /// the domain-wide guarantee.
+    pub fn single_verifier_instance(max_per_partition: usize) -> Self {
         Self {
             authenticated: Default::default(),
             unattributed: Default::default(),
+            one_shot: Default::default(),
             max_per_partition,
         }
     }
@@ -78,29 +165,57 @@ impl InMemoryProofReplayStore {
     }
 }
 
+/// Admit `key` into `map` under fail-closed capacity: collect only records
+/// whose signed expiry has passed, then refuse when the partition is full.
+fn admit_into<K: std::hash::Hash + Eq + Clone>(
+    map: &mut HashMap<K, u64>,
+    key: &K,
+    expires_at: u64,
+    max: usize,
+    now: u64,
+) -> ProofAdmissionResult {
+    if map.contains_key(key) {
+        return ProofAdmissionResult::Replayed;
+    }
+    // Collect expired records only — an unexpired accepted record is never
+    // evicted to make room.
+    map.retain(|_, exp| *exp > now);
+    if map.len() >= max {
+        return ProofAdmissionResult::Failed;
+    }
+    map.insert(key.clone(), expires_at);
+    ProofAdmissionResult::Admitted
+}
+
 impl ProofReplayStore for InMemoryProofReplayStore {
+    fn domain_guarantee(&self) -> ReplayDomainGuarantee {
+        ReplayDomainGuarantee::SingleVerifierInstance
+    }
+
     fn check_and_insert(
         &self,
         partition: ProofDisposition,
         key: &ProofReplayKey,
         expires_at: u64,
     ) -> ProofAdmissionResult {
-        let mut map = self.lock(partition);
-        if map.contains_key(key) {
-            return ProofAdmissionResult::Replayed;
-        }
-        // Opportunistic GC
         let now = current_unix_seconds();
-        map.retain(|_, exp| *exp > now);
-        if map.len() >= self.max_per_partition {
-            return ProofAdmissionResult::Failed;
-        }
-        map.insert(key.clone(), expires_at);
-        ProofAdmissionResult::Admitted
+        let max = self.max_per_partition;
+        admit_into(&mut self.lock(partition), key, expires_at, max, now)
+    }
+
+    fn consume_one_shot_credential(
+        &self,
+        id: &OneShotCredentialId,
+        expires_at: u64,
+    ) -> ProofAdmissionResult {
+        let now = current_unix_seconds();
+        let max = self.max_per_partition;
+        admit_into(&mut self.one_shot.lock(), id, expires_at, max, now)
     }
 }
 
-// Process-global registration (same pattern as CredentialRevocationStore)
+// Process-global registration. There is no auto-install: an absent store is a
+// denial, never a locally-defaulted admission.
 static PROOF_REPLAY_STORE: OnceLock<Box<dyn ProofReplayStore>> = OnceLock::new();
 
 pub fn set_global_proof_replay_store(
@@ -113,8 +228,39 @@ pub fn global_proof_replay_store() -> Option<&'static dyn ProofReplayStore> {
     PROOF_REPLAY_STORE.get().map(|s| &**s)
 }
 
-// Removed: auto-install was a fail-open. The store must be explicitly
-// installed via set_global_proof_replay_store(). Dispatch denies when absent.
+/// Admit one request proof, enforcing the domain guarantee before the store
+/// is consulted.
+///
+/// Under namespace-affine routing a node that does not own the key's namespace
+/// holds none of its history, so it denies instead of admitting locally.
+pub fn admit_request_proof(
+    store: &dyn ProofReplayStore,
+    partition: ProofDisposition,
+    key: &ProofReplayKey,
+    expires_at: u64,
+) -> ProofAdmissionResult {
+    if !store.owns_namespace(&key.signer_thumbprint) {
+        return ProofAdmissionResult::Failed;
+    }
+    store.check_and_insert(partition, key, expires_at)
+}
+
+/// Consume one one-shot credential ID, enforcing the domain guarantee first.
+///
+/// Namespace-affine routing is keyed by the proof signer set, but a one-shot
+/// credential can be presented at any node, so affinity cannot make its
+/// consumption domain-wide. Such a deployment fails closed here rather than
+/// consuming locally and admitting the same credential twice.
+pub fn consume_one_shot_credential(
+    store: &dyn ProofReplayStore,
+    id: &OneShotCredentialId,
+    expires_at: u64,
+) -> ProofAdmissionResult {
+    if store.domain_guarantee() == ReplayDomainGuarantee::NamespaceAffineRouting {
+        return ProofAdmissionResult::Failed;
+    }
+    store.consume_one_shot_credential(id, expires_at)
+}
 
 // ---------------------------------------------------------------------------
 // Process-global challenge manager
@@ -197,4 +343,398 @@ fn current_unix_seconds() -> u64 {
 #[cfg(target_arch = "wasm32")]
 fn current_unix_seconds() -> u64 {
     0
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    fn key(thumb: u8, id: u8) -> ProofReplayKey {
+        ProofReplayKey {
+            signer_thumbprint: [thumb; 32],
+            request_id: [id; 16],
+        }
+    }
+
+    fn far_future() -> u64 {
+        current_unix_seconds() + 3_600
+    }
+
+    #[test]
+    fn a_fresh_key_is_admitted_once_and_never_twice() {
+        let store = InMemoryProofReplayStore::single_verifier_instance(16);
+        let k = key(1, 1);
+        assert_eq!(
+            admit_request_proof(&store, ProofDisposition::Authenticated, &k, far_future()),
+            ProofAdmissionResult::Admitted
+        );
+        assert_eq!(
+            admit_request_proof(&store, ProofDisposition::Authenticated, &k, far_future()),
+            ProofAdmissionResult::Replayed
+        );
+    }
+
+    /// The same request_id under a different signer namespace is a different
+    /// request, so the thumbprint must be part of the key.
+    #[test]
+    fn the_signer_namespace_is_part_of_the_key() {
+        let store = InMemoryProofReplayStore::single_verifier_instance(16);
+        assert_eq!(
+            admit_request_proof(
+                &store,
+                ProofDisposition::Authenticated,
+                &key(1, 7),
+                far_future()
+            ),
+            ProofAdmissionResult::Admitted
+        );
+        assert_eq!(
+            admit_request_proof(
+                &store,
+                ProofDisposition::Authenticated,
+                &key(2, 7),
+                far_future()
+            ),
+            ProofAdmissionResult::Admitted
+        );
+    }
+
+    /// Partitions are separate: the same key in the other partition is a
+    /// distinct record, and a saturated unattributed partition can neither
+    /// delay nor deny authenticated admission.
+    #[test]
+    fn partitions_are_independent_and_saturation_does_not_cross() {
+        let store = InMemoryProofReplayStore::single_verifier_instance(2);
+        let k = key(1, 1);
+        assert_eq!(
+            admit_request_proof(&store, ProofDisposition::Unattributed, &k, far_future()),
+            ProofAdmissionResult::Admitted
+        );
+        assert_eq!(
+            admit_request_proof(&store, ProofDisposition::Authenticated, &k, far_future()),
+            ProofAdmissionResult::Admitted
+        );
+
+        // Saturate the unattributed partition.
+        assert_eq!(
+            admit_request_proof(
+                &store,
+                ProofDisposition::Unattributed,
+                &key(1, 2),
+                far_future()
+            ),
+            ProofAdmissionResult::Admitted
+        );
+        assert_eq!(
+            admit_request_proof(
+                &store,
+                ProofDisposition::Unattributed,
+                &key(1, 3),
+                far_future()
+            ),
+            ProofAdmissionResult::Failed
+        );
+
+        // The authenticated partition is unaffected.
+        assert_eq!(
+            admit_request_proof(
+                &store,
+                ProofDisposition::Authenticated,
+                &key(1, 3),
+                far_future()
+            ),
+            ProofAdmissionResult::Admitted
+        );
+    }
+
+    /// Capacity pressure fails closed. It never evicts an unexpired accepted
+    /// record to make room, so an admitted proof can never be re-admitted.
+    #[test]
+    fn capacity_fails_closed_without_evicting_unexpired_records() {
+        let store = InMemoryProofReplayStore::single_verifier_instance(1);
+        let admitted = key(1, 1);
+        assert_eq!(
+            admit_request_proof(
+                &store,
+                ProofDisposition::Authenticated,
+                &admitted,
+                far_future()
+            ),
+            ProofAdmissionResult::Admitted
+        );
+        assert_eq!(
+            admit_request_proof(
+                &store,
+                ProofDisposition::Authenticated,
+                &key(1, 2),
+                far_future()
+            ),
+            ProofAdmissionResult::Failed
+        );
+        // The first record survived the pressure.
+        assert_eq!(
+            admit_request_proof(
+                &store,
+                ProofDisposition::Authenticated,
+                &admitted,
+                far_future()
+            ),
+            ProofAdmissionResult::Replayed
+        );
+    }
+
+    /// Records are collectable once their signed expiry has passed; because
+    /// verification enforces the identical deadline, nothing admissible is
+    /// ever collected.
+    #[test]
+    fn expired_records_are_collected() {
+        let store = InMemoryProofReplayStore::single_verifier_instance(1);
+        let stale = key(1, 1);
+        // Expiry already in the past.
+        assert_eq!(
+            store.check_and_insert(ProofDisposition::Authenticated, &stale, 1),
+            ProofAdmissionResult::Admitted
+        );
+        // A new key can be admitted: the stale record is collected, not evicted.
+        assert_eq!(
+            admit_request_proof(
+                &store,
+                ProofDisposition::Authenticated,
+                &key(1, 2),
+                far_future()
+            ),
+            ProofAdmissionResult::Admitted
+        );
+    }
+
+    #[test]
+    fn a_one_shot_credential_is_consumed_exactly_once() {
+        let store = InMemoryProofReplayStore::single_verifier_instance(16);
+        let id = OneShotCredentialId {
+            issuer: "https://issuer.example".into(),
+            value: b"one-shot-1".to_vec(),
+        };
+        assert_eq!(
+            consume_one_shot_credential(&store, &id, far_future()),
+            ProofAdmissionResult::Admitted
+        );
+        assert_eq!(
+            consume_one_shot_credential(&store, &id, far_future()),
+            ProofAdmissionResult::Replayed
+        );
+    }
+
+    /// Credential IDs are issuer-scoped: two issuers producing the same value
+    /// never consume each other's credential.
+    #[test]
+    fn one_shot_credential_ids_are_issuer_scoped() {
+        let store = InMemoryProofReplayStore::single_verifier_instance(16);
+        let a = OneShotCredentialId {
+            issuer: "https://a.example".into(),
+            value: b"same".to_vec(),
+        };
+        let b = OneShotCredentialId {
+            issuer: "https://b.example".into(),
+            value: b"same".to_vec(),
+        };
+        assert_eq!(
+            consume_one_shot_credential(&store, &a, far_future()),
+            ProofAdmissionResult::Admitted
+        );
+        assert_eq!(
+            consume_one_shot_credential(&store, &b, far_future()),
+            ProofAdmissionResult::Admitted
+        );
+    }
+
+    /// One-shot consumption does not create a second proof replay entry: it is
+    /// the single admission action for that credential.
+    #[test]
+    fn one_shot_consumption_is_a_separate_namespace_from_proof_replay() {
+        let store = InMemoryProofReplayStore::single_verifier_instance(16);
+        let id = OneShotCredentialId {
+            issuer: "https://issuer.example".into(),
+            value: vec![1u8; 16],
+        };
+        assert_eq!(
+            consume_one_shot_credential(&store, &id, far_future()),
+            ProofAdmissionResult::Admitted
+        );
+        // A proof whose request_id happens to equal the credential value is
+        // still admissible: the two namespaces do not alias.
+        assert_eq!(
+            admit_request_proof(
+                &store,
+                ProofDisposition::Authenticated,
+                &key(0, 1),
+                far_future()
+            ),
+            ProofAdmissionResult::Admitted
+        );
+    }
+
+    // -- domain guarantees --------------------------------------------------
+
+    /// A namespace-affine deployment that routes a request to a node holding
+    /// no history for that namespace MUST deny, not admit.
+    struct AffineStore {
+        owned: [u8; 32],
+        inner: InMemoryProofReplayStore,
+    }
+
+    impl ProofReplayStore for AffineStore {
+        fn domain_guarantee(&self) -> ReplayDomainGuarantee {
+            ReplayDomainGuarantee::NamespaceAffineRouting
+        }
+        fn owns_namespace(&self, signer_thumbprint: &[u8; 32]) -> bool {
+            *signer_thumbprint == self.owned
+        }
+        fn check_and_insert(
+            &self,
+            partition: ProofDisposition,
+            key: &ProofReplayKey,
+            expires_at: u64,
+        ) -> ProofAdmissionResult {
+            self.inner.check_and_insert(partition, key, expires_at)
+        }
+        fn consume_one_shot_credential(
+            &self,
+            id: &OneShotCredentialId,
+            expires_at: u64,
+        ) -> ProofAdmissionResult {
+            self.inner.consume_one_shot_credential(id, expires_at)
+        }
+    }
+
+    #[test]
+    fn affine_routing_denies_a_namespace_this_node_does_not_own() {
+        let store = AffineStore {
+            owned: [1u8; 32],
+            inner: InMemoryProofReplayStore::single_verifier_instance(16),
+        };
+        assert_eq!(
+            admit_request_proof(
+                &store,
+                ProofDisposition::Authenticated,
+                &key(1, 1),
+                far_future()
+            ),
+            ProofAdmissionResult::Admitted,
+            "the owned namespace is admitted"
+        );
+        assert_eq!(
+            admit_request_proof(
+                &store,
+                ProofDisposition::Authenticated,
+                &key(2, 1),
+                far_future()
+            ),
+            ProofAdmissionResult::Failed,
+            "failover to a node without this namespace's history must deny"
+        );
+    }
+
+    /// Key-affine routing cannot make one-shot consumption domain-wide, so an
+    /// affine deployment fails closed rather than consuming locally.
+    #[test]
+    fn affine_routing_cannot_consume_a_one_shot_credential() {
+        let store = AffineStore {
+            owned: [1u8; 32],
+            inner: InMemoryProofReplayStore::single_verifier_instance(16),
+        };
+        let id = OneShotCredentialId {
+            issuer: "https://issuer.example".into(),
+            value: b"one-shot".to_vec(),
+        };
+        assert_eq!(
+            consume_one_shot_credential(&store, &id, far_future()),
+            ProofAdmissionResult::Failed
+        );
+    }
+
+    /// A store whose backend is unavailable reports Failed, and Failed is
+    /// always a denial — it is never treated as "not seen before".
+    #[test]
+    fn an_unavailable_backend_fails_closed() {
+        struct DeadBackend;
+        impl ProofReplayStore for DeadBackend {
+            fn domain_guarantee(&self) -> ReplayDomainGuarantee {
+                ReplayDomainGuarantee::LinearizableSharedStore
+            }
+            fn check_and_insert(
+                &self,
+                _p: ProofDisposition,
+                _k: &ProofReplayKey,
+                _e: u64,
+            ) -> ProofAdmissionResult {
+                ProofAdmissionResult::Failed
+            }
+            fn consume_one_shot_credential(
+                &self,
+                _id: &OneShotCredentialId,
+                _e: u64,
+            ) -> ProofAdmissionResult {
+                ProofAdmissionResult::Failed
+            }
+        }
+        let store = DeadBackend;
+        assert_eq!(
+            admit_request_proof(
+                &store,
+                ProofDisposition::Authenticated,
+                &key(1, 1),
+                far_future()
+            ),
+            ProofAdmissionResult::Failed
+        );
+        assert_eq!(
+            consume_one_shot_credential(
+                &store,
+                &OneShotCredentialId {
+                    issuer: "i".into(),
+                    value: vec![1],
+                },
+                far_future()
+            ),
+            ProofAdmissionResult::Failed
+        );
+    }
+
+    /// A linearizable shared store owns every namespace by construction.
+    #[test]
+    fn a_linearizable_store_owns_every_namespace() {
+        struct Shared(InMemoryProofReplayStore);
+        impl ProofReplayStore for Shared {
+            fn domain_guarantee(&self) -> ReplayDomainGuarantee {
+                ReplayDomainGuarantee::LinearizableSharedStore
+            }
+            fn check_and_insert(
+                &self,
+                p: ProofDisposition,
+                k: &ProofReplayKey,
+                e: u64,
+            ) -> ProofAdmissionResult {
+                self.0.check_and_insert(p, k, e)
+            }
+            fn consume_one_shot_credential(
+                &self,
+                id: &OneShotCredentialId,
+                e: u64,
+            ) -> ProofAdmissionResult {
+                self.0.consume_one_shot_credential(id, e)
+            }
+        }
+        let store = Shared(InMemoryProofReplayStore::single_verifier_instance(16));
+        assert!(store.owns_namespace(&[9u8; 32]));
+        assert_eq!(
+            admit_request_proof(
+                &store,
+                ProofDisposition::Authenticated,
+                &key(9, 1),
+                far_future()
+            ),
+            ProofAdmissionResult::Admitted
+        );
+    }
 }
