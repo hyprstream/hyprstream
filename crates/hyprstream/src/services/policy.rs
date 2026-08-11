@@ -1986,7 +1986,10 @@ impl RequestService for PolicyService {
     }
 
     fn credential_revocation_store(&self) -> Option<&dyn hyprstream_rpc::auth::CredentialRevocationStore> {
-        Some(self.jti_blocklist.as_ref())
+        // The default trait method returns the process-global store that
+        // PolicyService published at startup. Override only if a test needs
+        // a store that differs from the global.
+        hyprstream_rpc::auth::global_credential_revocation_store().map(std::convert::AsRef::as_ref)
     }
 
     fn cache_key_binding(

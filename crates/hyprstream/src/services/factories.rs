@@ -882,10 +882,18 @@ fn create_policy_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnab
         policy_service = policy_service.with_ml_dsa_key_store(ml_dsa_store);
     }
 
-    // Publish the JTI blocklist Arc so OAuthService (created later) can share it.
-    // This wires POST /oauth/revoke → PolicyService RPC enforcement: a revoked
-    // access token is rejected by both the HTTP path and the RPC auth check.
-    let _ = SHARED_JTI_BLOCKLIST.set(policy_service.jti_blocklist_arc());
+    // Publish the credential-revocation store both process-locally (for
+    // OAuthService/OAI created later) and globally (for all RequestService
+    // implementations via the default trait method). There is exactly one
+    // store — no per-service fallback. Both publications MUST succeed —
+    // a second store from a race is a startup error.
+    let shared_store = policy_service.jti_blocklist_arc();
+    if SHARED_JTI_BLOCKLIST.set(Arc::clone(&shared_store)).is_err() {
+        anyhow::bail!("SHARED_JTI_BLOCKLIST already set (publication race)");
+    }
+    if hyprstream_rpc::auth::set_global_credential_revocation_store(shared_store).is_err() {
+        anyhow::bail!("global credential-revocation store already set (publication race)");
+    }
 
     Ok(ctx.into_spawnable_quic(policy_service, config.policy.quic_port))
 }
@@ -1643,12 +1651,14 @@ fn create_oai_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
                 resource_url,
                 oauth_issuer_url,
                 &config.oauth.trusted_issuers,
-                // Share the PolicyService-owned JTI blocklist so POST /oauth/revoke
-                // immediately invalidates tokens at the OAI resource server.
+                // Use the PolicyService-owned shared credential-revocation store.
+                // There is exactly one store — no per-service fallback and no
+                // second store. PolicyService must have published it by now
+                // (it is a startup dependency); absence is a startup error.
                 SHARED_JTI_BLOCKLIST
                     .get()
-                    .map(Arc::clone)
-                    .unwrap_or_else(|| Arc::new(hyprstream_rpc::auth::InMemoryCredentialRevocationStore::new())),
+                    .cloned()
+                    .context("PolicyService has not published the shared credential-revocation store")?,
                 ninep_decider,
             )
             .await
@@ -2024,8 +2034,8 @@ fn create_mcp_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
                     let mcp_oauth_issuer_clone = mcp_oauth_issuer.clone();
                     let mcp_federation_resolver = mcp_federation_resolver.clone();
                     let jwt_key_source = jwt_key_source.clone();
-                    // Capture shared JTI blocklist for revocation checks (RFC 7009)
-                    let mcp_jti_blocklist = SHARED_JTI_BLOCKLIST.get().map(Arc::clone);
+                    // The credential-revocation store is global; no per-service
+                    // capture needed.
                     // DPoP JTI replay cache (separate from OAI server's, RFC 9449).
                     // 1,000 sustained DPoP proofs/s for the admitted 180s
                     // maximum residency (60s future iat skew + 120s), plus
@@ -2043,12 +2053,10 @@ fn create_mcp_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
                         let mcp_oauth_issuer = mcp_oauth_issuer_clone.clone();
                         let federation_resolver = mcp_federation_resolver.clone();
                         let jwt_key_source = jwt_key_source.clone();
-                        let jti_blocklist = mcp_jti_blocklist.clone();
                         let dpop_jti_seen = mcp_dpop_jti_seen.clone();
                         async move {
                             use axum::http::{header, StatusCode};
                             use axum::response::IntoResponse;
-                            use hyprstream_rpc::auth::CredentialRevocationStore as _;
                             use subtle::ConstantTimeEq as _;
                             let method = req.method().clone();
                             let uri = req.uri().clone();
@@ -2161,11 +2169,19 @@ fn create_mcp_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
                                 tracing::warn!(%method, %uri, "MCP auth rejected: invalid subject");
                                 return (StatusCode::UNAUTHORIZED, "Authentication failed").into_response();
                             }
-                            // JTI revocation check (RFC 7009)
+                            // Credential revocation check — fail-closed on
+                            // store absence: a token with a jti that cannot
+                            // be checked for revocation is rejected.
                             if let Some(ref jti) = claims.jti {
                                 let cred_id = hyprstream_rpc::auth::CredentialId::jwt(&claims.iss, jti);
-                                let revoked = jti_blocklist.as_ref().map(|bl| bl.is_revoked(&cred_id)).unwrap_or(false);
-                                if revoked {
+                                let revoked_or_unavailable = match hyprstream_rpc::auth::global_credential_revocation_store() {
+                                    Some(bl) => bl.is_revoked(&cred_id),
+                                    None => {
+                                        tracing::warn!(%method, %uri, %jti, "MCP: no revocation store configured — rejecting token with jti");
+                                        true // fail-closed
+                                    }
+                                };
+                                if revoked_or_unavailable {
                                     tracing::warn!(%method, %uri, %jti, sub = %claims.sub, "MCP: revoked token presented");
                                     let mut res = (StatusCode::UNAUTHORIZED, "Authentication failed").into_response();
                                     if let Ok(val) = header::HeaderValue::from_str(&www_authenticate) {

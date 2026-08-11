@@ -217,7 +217,10 @@ struct VerifiedSubjectEntry {
     context: SecurityContext,
     tenant: Option<String>,
     expires_at: i64,
-    jti: Option<String>,
+    /// Issuer-scoped credential ID `(iss, jti/cti)` this entry was derived
+    /// from. Typed so eviction targets the exact credential without
+    /// cross-issuer or JWT/CWT ambiguity.
+    credential_id: Option<crate::auth::CredentialId>,
     generation: u64,
 }
 
@@ -232,20 +235,19 @@ fn verified_subjects() -> &'static RwLock<VerifiedSubjectCache> {
     SUBJECTS.get_or_init(|| RwLock::new(VerifiedSubjectCache::default()))
 }
 
-/// Revoke every cached subject context derived from `jti`.
+/// Revoke every cached subject context derived from the given credential.
 ///
-/// The shared in-memory JTI blocklist calls this hook on every revocation, so
-/// VFS/CAS/MoQ lookups cannot continue using authority cached before the
-/// blocklist update.
-pub fn revoke_verified_subject_jti(jti: &str) -> usize {
-    if jti.is_empty() {
-        return 0;
-    }
+/// The shared credential-revocation store calls this hook on every
+/// revocation, so VFS/CAS/MoQ lookups cannot continue using authority
+/// cached before the blocklist update. The typed `CredentialId` ensures
+/// only entries derived from the exact `(iss, jti/cti)` pair are evicted
+/// — no cross-issuer or JWT/CWT ambiguity.
+pub fn revoke_verified_subject_credential(id: &crate::auth::CredentialId) -> usize {
     let mut cache = verified_subjects().write();
     let before = cache.subjects.len();
     cache
         .subjects
-        .retain(|_, entry| entry.jti.as_deref() != Some(jti));
+        .retain(|_, entry| entry.credential_id.as_ref() != Some(id));
     before.saturating_sub(cache.subjects.len())
 }
 
@@ -315,7 +317,10 @@ pub fn remember_verified_claims(
             context,
             tenant: verified_tenant.map(str::to_owned),
             expires_at: claims.exp,
-            jti: claims.jti.clone(),
+            credential_id: claims
+                .jti
+                .as_ref()
+                .map(|jti| crate::auth::CredentialId::jwt(&claims.iss, jti)),
             generation,
         },
     );
@@ -424,6 +429,7 @@ mod tests {
             crate::auth::Claims::new("did:web:alice".to_owned(), now, now + 300).with_clearance(
                 SecurityLabel::new(Level::Secret, Assurance::Classical, CompartmentSet::EMPTY),
             );
+        claims.iss = "https://local.example".to_owned();
         claims.jti = Some("revocable-jti".to_owned());
         let subject = Subject::new("did:web:alice");
         remember_verified_claims(
@@ -434,8 +440,13 @@ mod tests {
         );
 
         assert_eq!(verified_subjects().read().subjects.len(), 1);
-        assert_eq!(revoke_verified_subject_jti("other-jti"), 0);
-        assert_eq!(revoke_verified_subject_jti("revocable-jti"), 1);
+        let other_id = crate::auth::CredentialId::jwt("https://local.example", "other-jti");
+        let revocable_id = crate::auth::CredentialId::jwt("https://local.example", "revocable-jti");
+        let cross_issuer_id = crate::auth::CredentialId::jwt("https://other.example", "revocable-jti");
+        assert_eq!(revoke_verified_subject_credential(&other_id), 0);
+        assert_eq!(revoke_verified_subject_credential(&cross_issuer_id), 0,
+            "same jti from a different issuer must NOT evict");
+        assert_eq!(revoke_verified_subject_credential(&revocable_id), 1);
         assert!(verified_subjects().read().subjects.is_empty());
 
         remember_verified_claims(

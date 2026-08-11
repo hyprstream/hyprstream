@@ -10,7 +10,6 @@ use axum::response::{IntoResponse, Response};
 use axum::Form;
 use serde::Deserialize;
 
-use hyprstream_rpc::auth::CredentialRevocationStore as _;
 
 use super::state::OAuthState;
 
@@ -44,18 +43,25 @@ pub async fn revoke_token(
     }
 
     if is_access_hint || params.token_type_hint.is_none() {
-        if let Some(ref blocklist) = state.jti_blocklist {
-            match hyprstream_rpc::auth::decode_unverified(&params.token) {
+        // Use the process-global credential-revocation store.
+        if let Some(store) = hyprstream_rpc::auth::global_credential_revocation_store() {
+            // Verify the token using the same single verification stack as
+            // the auth path (typ, aud, issuer, composite/classical). An
+            // unverified token's iss/jti/exp are attacker-controlled; a
+            // forged token must not revoke another credential. If
+            // verification fails, return 200 per RFC 7009 but do not
+            // modify the store.
+            match super::auth::validate_oauth_access_token(state.as_ref(), &params.token).await {
                 Ok(claims) => {
-                    if let Some(jti) = claims.jti {
+                    if let Some(ref jti) = claims.jti {
                         let cred_id = hyprstream_rpc::auth::CredentialId::jwt(&claims.iss, jti);
-                        blocklist.revoke_credential(cred_id, claims.exp);
+                        store.revoke_credential(cred_id, claims.exp);
                         tracing::info!(sub = %claims.sub, "Revoked access token via credential revocation store");
                     }
                 }
                 Err(_) => {
-                    // Not a valid JWT — may be a refresh token tried above, or invalid.
-                    // RFC 7009: always 200.
+                    // Token verification failed — may be expired, wrong key,
+                    // or not a JWT. RFC 7009: still 200.
                 }
             }
         }

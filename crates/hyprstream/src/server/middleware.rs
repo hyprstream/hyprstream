@@ -8,7 +8,6 @@ use axum::{
     middleware::Next,
     response::{IntoResponse, Response},
 };
-use hyprstream_rpc::auth::CredentialRevocationStore as _;
 use hyprstream_util::InsertIfAbsentNoEvictResult;
 use std::sync::Arc;
 use std::time::Duration;
@@ -569,12 +568,16 @@ pub(crate) async fn verify_resource_token_claims(
         }
     };
 
-    // Credential revocation check (RFC 7009) — shared issuer-scoped store
-    // with the OAuth revocation endpoint.
+    // Credential revocation check (RFC 7009) — fail-closed on store absence.
     if let Some(ref jti) = claims.jti {
         let cred_id = hyprstream_rpc::auth::CredentialId::jwt(&claims.iss, jti);
-        if state.jti_blocklist.is_revoked(&cred_id) {
-            return Err("revoked token");
+        match hyprstream_rpc::auth::global_credential_revocation_store() {
+            Some(store) => {
+                if store.is_revoked(&cred_id) {
+                    return Err("revoked token");
+                }
+            }
+            None => return Err("revocation store unavailable"),
         }
     }
 

@@ -13,8 +13,50 @@
 //! (issuer-scoped `(iss, jti/cti)` key).
 
 use std::collections::HashMap;
+use std::sync::{Arc, OnceLock};
 
 use super::credential::CredentialId;
+
+// ── Global store ──────────────────────────────────────────────────────────
+
+/// Process-global credential-revocation store. Set once at startup (by
+/// PolicyService or equivalent bootstrap) so every `RequestService`
+/// implementation shares exactly one store. Before it is set, verification
+/// fails closed — no token with a jti can be admitted until the store is
+/// published.
+static GLOBAL_STORE: OnceLock<Arc<dyn CredentialRevocationStore>> = OnceLock::new();
+
+/// Publish the process-global credential-revocation store. Called once at
+/// startup; a second call returns an error so the caller can detect a
+/// publication race (two services trying to set different stores). The
+/// caller MUST propagate this error — ignoring it allows two divergent
+/// stores, breaking the one-store invariant.
+pub fn set_global_credential_revocation_store(
+    store: Arc<dyn CredentialRevocationStore>,
+) -> Result<(), GlobalStoreAlreadySet> {
+    GLOBAL_STORE.set(store).map_err(|_| GlobalStoreAlreadySet)
+}
+
+/// Error returned when the global store was already published with a
+/// different instance.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GlobalStoreAlreadySet;
+
+impl std::fmt::Display for GlobalStoreAlreadySet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "global credential-revocation store already published (one-store invariant)"
+        )
+    }
+}
+
+impl std::error::Error for GlobalStoreAlreadySet {}
+
+/// Access the process-global credential-revocation store, if published.
+pub fn global_credential_revocation_store() -> Option<&'static Arc<dyn CredentialRevocationStore>> {
+    GLOBAL_STORE.get()
+}
 
 /// Trait for a credential-revocation store keyed by issuer-scoped
 /// [`CredentialId`].
@@ -26,7 +68,15 @@ use super::credential::CredentialId;
 /// because publication and eviction are a single method call.
 pub trait CredentialRevocationStore: Send + Sync {
     /// Returns `true` if the given issuer-scoped credential has been revoked.
-    fn is_revoked(&self, id: &CredentialId) -> bool;
+    ///
+    /// An invalid credential ID (empty issuer or value) returns `true`
+    /// (fail-closed): per v16 §3.1, malformed identifiers deny.
+    fn is_revoked(&self, id: &CredentialId) -> bool {
+        if !id.is_valid() {
+            return true;
+        }
+        self.is_revoked_checked(id)
+    }
 
     /// Revoke a credential. `expires_at` is the token's `exp` — the entry
     /// can be garbage-collected after this time.
@@ -36,6 +86,10 @@ pub trait CredentialRevocationStore: Send + Sync {
     /// blocklist check while cached contexts derived from the revoked token
     /// are being removed.
     fn revoke_credential(&self, id: CredentialId, expires_at: i64);
+
+    /// The checked revocation lookup — called by `is_revoked` after
+    /// validation. Implementations provide the actual store lookup.
+    fn is_revoked_checked(&self, id: &CredentialId) -> bool;
 }
 
 /// In-memory credential-revocation store with periodic cleanup.
@@ -74,7 +128,7 @@ impl InMemoryCredentialRevocationStore {
 }
 
 impl CredentialRevocationStore for InMemoryCredentialRevocationStore {
-    fn is_revoked(&self, id: &CredentialId) -> bool {
+    fn is_revoked_checked(&self, id: &CredentialId) -> bool {
         #[cfg(not(target_arch = "wasm32"))]
         {
             self.revoked.read().contains_key(id)
@@ -116,36 +170,21 @@ impl CredentialRevocationStore for InMemoryCredentialRevocationStore {
         // Phase 2 — EVICT: flush cached subject contexts derived from the
         // revoked credential. This runs strictly AFTER the blocklist insert,
         // so the window in which a new verification could pass while a stale
-        // handle survives is closed from both sides.
+        // handle survives is closed from both sides. The typed CredentialId
+        // ensures only entries derived from the exact `(iss, jti/cti)` pair
+        // are evicted — no cross-issuer or JWT/CWT ambiguity.
         #[cfg(not(target_arch = "wasm32"))]
         {
-            let jti_str = match &id.value {
-                super::credential::CredentialValue::Jwt(s) => Some(s.as_str()),
-                // CWT cti bytes are not stringified — eviction by bare jti
-                // applies to the JWT jti namespace only. The CWT eviction
-                // path will be wired when CWT credential verification lands;
-                // the blocklist publication above is the security-critical
-                // gate regardless.
-                super::credential::CredentialValue::Cwt(_) => None,
-            };
-            if let Some(jti) = jti_str {
-                crate::auth::mac::revoke_verified_subject_jti(jti);
-            }
+            crate::auth::mac::revoke_verified_subject_credential(&id);
         }
     }
 }
 
-// ── Backward-compat type alias ───────────────────────────────────────────
+// ── Removed: InMemoryJtiBlocklist alias ──────────────────────────────────
 //
-// `InMemoryJtiBlocklist` is kept as a deprecated alias for the concrete
-// struct. The old trait name `JtiBlocklist` is NOT aliasable (it was a
-// trait, and Rust does not support trait aliases); all callers must use
-// the new trait name `CredentialRevocationStore`. The concrete struct is
-// safe to alias because the type itself is unchanged — only the trait
-// method signatures changed.
-
-#[deprecated(note = "use `InMemoryCredentialRevocationStore` (issuer-scoped)")]
-pub type InMemoryJtiBlocklist = InMemoryCredentialRevocationStore;
+// The old names (`JtiBlocklist`, `InMemoryJtiBlocklist`) are deleted
+// entirely — no deprecated alias. All callers have been migrated to
+// `CredentialRevocationStore` / `InMemoryCredentialRevocationStore`.
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
@@ -199,17 +238,28 @@ mod tests {
         );
     }
 
-    /// An empty issuer still produces a valid (if unusual) CredentialId —
-    /// legacy tokens with empty `iss` are scoped to the empty-string issuer.
+    /// Empty issuer and empty jti values are rejected as malformed (v16 §3.1).
+    /// `is_revoked` returns `true` (fail-closed) for invalid IDs — they can
+    /// never pass a revocation check.
     #[test]
-    fn empty_issuer_is_a_valid_scope() {
+    fn empty_issuer_and_jti_are_rejected() {
         let store = InMemoryCredentialRevocationStore::new();
-        let id_empty = CredentialId::jwt("", "tok-1");
-        let id_set = CredentialId::jwt("https://a.example", "tok-1");
+        let empty_iss = CredentialId::jwt("", "tok-1");
+        let empty_jti = CredentialId::jwt("https://a.example", "");
+        let empty_cti = CredentialId {
+            issuer: "https://a.example".to_owned(),
+            value: CredentialValue::Cwt(vec![]),
+        };
 
-        store.revoke_credential(id_empty.clone(), 9_999_999_999);
-        assert!(store.is_revoked(&id_empty));
-        assert!(!store.is_revoked(&id_set));
+        assert!(!empty_iss.is_valid(), "empty issuer is invalid");
+        assert!(!empty_jti.is_valid(), "empty jti is invalid");
+        assert!(!empty_cti.is_valid(), "empty cti is invalid");
+
+        // Fail-closed: invalid IDs report as revoked even though nothing was
+        // explicitly revoked.
+        assert!(store.is_revoked(&empty_iss), "empty issuer → fail-closed");
+        assert!(store.is_revoked(&empty_jti), "empty jti → fail-closed");
+        assert!(store.is_revoked(&empty_cti), "empty cti → fail-closed");
     }
 
     /// TTL cleanup evicts expired entries but keeps live ones.
@@ -232,41 +282,168 @@ mod tests {
 
     // ── Revocation-before-eviction ordering ───────────────────────────────
 
-    /// `revoke_credential` publishes to the blocklist before evicting
-    /// handles. We verify this by checking that after a revoke, the
-    /// credential IS in the blocklist (published) — the eviction hook
-    /// (revoke_verified_subject_jti) is called within the same method and
-    /// cannot be invoked separately by the caller.
+    /// `revoke_credential` publishes to the blocklist and evicts derived
+    /// handles in one call. We verify both effects: the credential is
+    /// published (blocklist reports revoked) AND the verified-subject cache
+    /// entry derived from that credential is evicted. Since the method is
+    /// synchronous, the caller cannot observe an intermediate state where
+    /// eviction happened but publication didn't.
+    #[cfg(not(target_arch = "wasm32"))]
     #[test]
-    fn revoke_credential_publishes_before_evicting() {
+    fn revoke_credential_publishes_then_evicts_subject() {
+        use crate::auth::mac::{
+            flush_verified_subject_cache_generation, remember_verified_claims,
+            revoke_verified_subject_credential, VerifiedKeyMaterial,
+        };
+
+        // Start from a clean cache.
+        flush_verified_subject_cache_generation();
+
+        let now = chrono::Utc::now().timestamp();
+        let issuer = "https://ordering.example";
+        let jti = "ordering-test";
+
+        // Remember a verified subject for this credential.
+        let mut claims = crate::auth::Claims::new("alice".to_owned(), now, now + 300)
+            .with_issuer(issuer.to_owned())
+            .with_clearance(crate::auth::mac::SecurityLabel::new(
+                crate::auth::mac::Level::Secret,
+                crate::auth::mac::Assurance::Classical,
+                crate::auth::mac::CompartmentSet::EMPTY,
+            ));
+        claims.jti = Some(jti.to_owned());
+        let subject = crate::envelope::Subject::new("alice");
+        remember_verified_claims(&subject, &claims, VerifiedKeyMaterial::Classical, None);
+
+        // Revoke the credential: publish then evict.
         let store = InMemoryCredentialRevocationStore::new();
-        let id = CredentialId::jwt("https://a.example", "ordering-test");
+        let id = CredentialId::jwt(issuer, jti);
+        store.revoke_credential(id.clone(), now + 300);
 
-        // Before revoke: not revoked.
-        assert!(!store.is_revoked(&id));
+        // Publication: the blocklist reports revoked.
+        assert!(store.is_revoked(&id), "credential must be published");
 
-        // revoke_credential is the single API entry point — it publishes
-        // then evicts. The caller cannot reverse the order because there
-        // is no separate "evict" method on the trait.
-        store.revoke_credential(id.clone(), 9_999_999_999);
+        // Eviction: the verified-subject cache entry derived from this
+        // credential is gone. We check the eviction function directly
+        // (subject_context goes through the activation control which may
+        // return the anonymous floor regardless of cache state).
+        // A second call to evict the same ID returns 0 (already evicted).
+        let evicted = revoke_verified_subject_credential(&id);
+        assert_eq!(evicted, 0, "entry was already evicted by revoke_credential");
 
-        // After revoke: published (is_revoked returns true).
-        assert!(store.is_revoked(&id), "credential must be published as revoked");
+        // Cross-issuer: a subject from a DIFFERENT issuer with the same jti
+        // must survive — typed eviction does not cross-evict.
+        flush_verified_subject_cache_generation();
+        let mut claims_b = crate::auth::Claims::new("bob".to_owned(), now, now + 300)
+            .with_issuer("https://other.example".to_owned())
+            .with_clearance(crate::auth::mac::SecurityLabel::new(
+                crate::auth::mac::Level::Secret,
+                crate::auth::mac::Assurance::Classical,
+                crate::auth::mac::CompartmentSet::EMPTY,
+            ));
+        claims_b.jti = Some(jti.to_owned());
+        let subject_b = crate::envelope::Subject::new("bob");
+        remember_verified_claims(&subject_b, &claims_b, VerifiedKeyMaterial::Classical, None);
+
+        // Directly evict issuer-A's ID — must NOT evict issuer-B's subject.
+        let cross_evicted = revoke_verified_subject_credential(&id);
+        assert_eq!(
+            cross_evicted, 0,
+            "cross-issuer same-jti subject must NOT be evicted by issuer-A's credential ID"
+        );
     }
 
-    /// The `CredentialRevocationStore` trait does NOT expose a bare eviction
-    /// method. The only way to trigger eviction is through
-    /// `revoke_credential`, which publishes first. This is a compile-time
-    /// guarantee: the trait has exactly two methods, `is_revoked` and
-    /// `revoke_credential`.
+    /// The `CredentialRevocationStore` trait provides no separate eviction
+    /// method — the only way to trigger eviction is through
+    /// `revoke_credential`, which publishes first.
     #[test]
-    fn trait_surface_enforces_ordering() {
-        // If this test compiles, the trait has exactly the expected methods.
+    fn trait_surface_has_no_bare_eviction() {
+        // The trait has is_revoked (with default validation), is_revoked_checked,
+        // and revoke_credential. There is no separate "evict" method.
         fn assert_trait_shape<S: CredentialRevocationStore>() {}
         assert_trait_shape::<InMemoryCredentialRevocationStore>();
     }
 
     // ── Session revocation evicts all carrying credentials ───────────────
+
+    /// Session revocation evicts all carrying handles. After `revoke_session`:
+    /// the session status is Revoked AND the verified-subject cache generation
+    /// is flushed, removing every cached handle.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn session_revocation_evicts_cached_handles() {
+        use crate::auth::credential::{
+            ActiveOrRevoked, InMemorySessionRegistry, SessionKind, SessionRegistry, SessionState,
+        };
+        use crate::auth::mac::{
+            flush_verified_subject_cache_generation, remember_verified_claims,
+            revoke_verified_subject_credential, VerifiedKeyMaterial,
+        };
+
+        // Start clean.
+        flush_verified_subject_cache_generation();
+
+        let now = chrono::Utc::now().timestamp();
+        let issuer = "https://session.example";
+        let jti = "ses-cred-1";
+
+        // Remember a verified subject derived from a credential that carries
+        // the session being revoked.
+        let mut claims = crate::auth::Claims::new("alice".to_owned(), now, now + 300)
+            .with_issuer(issuer.to_owned())
+            .with_clearance(crate::auth::mac::SecurityLabel::new(
+                crate::auth::mac::Level::Secret,
+                crate::auth::mac::Assurance::Classical,
+                crate::auth::mac::CompartmentSet::EMPTY,
+            ));
+        claims.jti = Some(jti.to_owned());
+        let subject = crate::envelope::Subject::new("alice");
+        remember_verified_claims(&subject, &claims, VerifiedKeyMaterial::Classical, None);
+
+        // Probe: the subject IS cached (evicting its credential returns 1).
+        let cred_id = CredentialId::jwt(issuer, jti);
+        let evicted_before = revoke_verified_subject_credential(&cred_id);
+        assert_eq!(evicted_before, 1, "subject must be cached before session revocation");
+
+        // Re-insert (the probe evicted it).
+        remember_verified_claims(&subject, &claims, VerifiedKeyMaterial::Classical, None);
+
+        // Register a session and revoke it.
+        let reg = InMemorySessionRegistry::new();
+        let key = SessionKey::oidc(issuer, "ses-1");
+        reg.register_session(
+            key.clone(),
+            SessionState {
+                subject: "alice".to_owned(),
+                tenant: "default".to_owned(),
+                kind: SessionKind::Interactive,
+                created_at: now,
+                expires_at: now + 300,
+                status: ActiveOrRevoked::Active,
+                clearance_epoch: 0,
+            },
+        )
+        .unwrap();
+
+        // Publication: session is active before revocation.
+        assert!(!reg.is_revoked(&key), "session must be active before revoke");
+
+        // Revoke the session — this publishes (marks revoked) then evicts
+        // (flushes the generation, removing all cached handles).
+        reg.revoke_session(&key);
+
+        // Publication: session is now revoked.
+        assert!(reg.is_revoked(&key), "session must be revoked");
+
+        // Eviction: the verified-subject cache entry is gone (the generation
+        // flush removed it). Trying to evict the credential returns 0 because
+        // it was already removed by the session revocation's generation flush.
+        let evicted_after = revoke_verified_subject_credential(&cred_id);
+        assert_eq!(
+            evicted_after, 0,
+            "subject must be evicted by session revocation's generation flush"
+        );
+    }
 
     /// A session registry marks a session revoked and subsequent
     /// `is_revoked` checks return true.
@@ -280,14 +457,14 @@ mod tests {
         let key = SessionKey::oidc("https://a.example", "ses-1");
         let state = SessionState {
             subject: "alice".to_owned(),
-            tenant: None,
+            tenant: "default".to_owned(),
             kind: crate::auth::credential::SessionKind::Interactive,
             created_at: 0,
             expires_at: 9_999_999_999,
             status: ActiveOrRevoked::Active,
             clearance_epoch: 0,
         };
-        reg.register_session(key.clone(), state);
+        reg.register_session(key.clone(), state).unwrap();
         assert!(!reg.is_revoked(&key), "session is active");
 
         reg.revoke_session(&key);
@@ -295,6 +472,60 @@ mod tests {
         assert_eq!(
             reg.session_state(&key).unwrap().status,
             ActiveOrRevoked::Revoked
+        );
+    }
+
+    /// An expired session reports as revoked even if its status bit is Active.
+    #[test]
+    fn expired_session_is_revoked() {
+        use crate::auth::credential::{
+            ActiveOrRevoked, InMemorySessionRegistry, SessionKind, SessionRegistry, SessionState,
+        };
+
+        let reg = InMemorySessionRegistry::new();
+        let key = SessionKey::oidc("https://a.example", "ses-expired");
+        let state = SessionState {
+            subject: "alice".to_owned(),
+            tenant: "default".to_owned(),
+            kind: SessionKind::Interactive,
+            created_at: 0,
+            expires_at: 1, // expired at time 1
+            status: ActiveOrRevoked::Active,
+            clearance_epoch: 0,
+        };
+        reg.register_session(key.clone(), state).unwrap();
+        assert!(
+            reg.is_revoked(&key),
+            "expired session must report as revoked"
+        );
+    }
+
+    /// A revoked session key cannot be re-registered (no reactivation).
+    #[test]
+    fn revoked_session_cannot_be_reactivated() {
+        use crate::auth::credential::{
+            ActiveOrRevoked, InMemorySessionRegistry, SessionKind, SessionRegistry, SessionState,
+        };
+
+        let reg = InMemorySessionRegistry::new();
+        let key = SessionKey::oidc("https://a.example", "ses-no-react");
+        let state = SessionState {
+            subject: "alice".to_owned(),
+            tenant: "default".to_owned(),
+            kind: SessionKind::Interactive,
+            created_at: 0,
+            expires_at: 9_999_999_999,
+            status: ActiveOrRevoked::Active,
+            clearance_epoch: 0,
+        };
+        reg.register_session(key.clone(), state.clone()).unwrap();
+        reg.revoke_session(&key);
+
+        // Re-registration must fail — revoked sessions are never reassigned.
+        let result = reg.register_session(key.clone(), state);
+        assert!(
+            result.is_err(),
+            "a revoked session key must not be reactivated"
         );
     }
 
@@ -325,7 +556,7 @@ mod tests {
 
         let oidc_state = SessionState {
             subject: "alice".to_owned(),
-            tenant: None,
+            tenant: "default".to_owned(),
             kind: SessionKind::Interactive,
             created_at: 0,
             expires_at: 9_999_999_999,
@@ -334,7 +565,7 @@ mod tests {
         };
         let wl_state = SessionState {
             subject: "service:model".to_owned(),
-            tenant: None,
+            tenant: "default".to_owned(),
             kind: SessionKind::Workload,
             created_at: 0,
             expires_at: 9_999_999_999,
@@ -342,8 +573,8 @@ mod tests {
             clearance_epoch: 0,
         };
 
-        reg.register_session(oidc_key.clone(), oidc_state);
-        reg.register_session(wl_key.clone(), wl_state);
+        reg.register_session(oidc_key.clone(), oidc_state).unwrap();
+        reg.register_session(wl_key.clone(), wl_state).unwrap();
 
         // Revoke the OIDC session.
         reg.revoke_session(&oidc_key);

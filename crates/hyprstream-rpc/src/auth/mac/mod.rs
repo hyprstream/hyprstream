@@ -124,7 +124,7 @@ pub mod pep;
 pub use activation::{
     anonymous_floor, block_identity_widening_for_unverified_attach_transport,
     flush_verified_subject_cache_generation, global_mac_activation_control,
-    remember_verified_claims, remember_verified_subject, revoke_verified_subject_jti,
+    remember_verified_claims, remember_verified_subject, revoke_verified_subject_credential,
     subject_context, MacActivationControl, MacActivationError, MacActivationEvidence,
     MacActivationMode,
 };

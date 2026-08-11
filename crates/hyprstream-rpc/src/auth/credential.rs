@@ -89,6 +89,14 @@ impl CredentialId {
             value: CredentialValue::cwt(cti),
         }
     }
+
+    /// Whether this credential ID is well-formed (non-empty issuer and value).
+    ///
+    /// Per v16 §3.1: empty issuer and malformed identifiers deny. Verification
+    /// boundaries MUST treat an invalid credential ID as fail-closed.
+    pub fn is_valid(&self) -> bool {
+        !self.issuer.is_empty() && !self.value.is_empty()
+    }
 }
 
 impl fmt::Display for CredentialId {
@@ -161,6 +169,11 @@ impl SessionKey {
             id: SessionIdentifier::WorkloadSessionId(id.into()),
         }
     }
+
+    /// Whether this session key is well-formed (non-empty issuer and identifier).
+    pub fn is_valid(&self) -> bool {
+        !self.issuer.is_empty() && !self.id.is_empty()
+    }
 }
 
 // ── Session state ─────────────────────────────────────────────────────────
@@ -190,9 +203,11 @@ pub enum ActiveOrRevoked {
 pub struct SessionState {
     /// Subject identifier (`sub` claim).
     pub subject: String,
-    /// Verified tenant/domain, if the session is tenant-bound.
-    pub tenant: Option<String>,
-    /// Interactive or workload session kind.
+    /// Verified tenant/domain (required per v16 §3.3 — every session is
+    /// tenant-bound).
+    pub tenant: String,
+    /// Interactive or workload session kind. MUST match the [`SessionKey`]'s
+    /// identifier variant (OIDC sid → Interactive, workload → Workload).
     pub kind: SessionKind,
     /// Creation timestamp (Unix seconds).
     pub created_at: i64,
@@ -210,14 +225,21 @@ pub struct SessionState {
 ///
 /// Per v16 §3.3: revoking a `SessionKey` rejects every credential and handle
 /// carrying that session ID. The trait is designed so a Valkey/Redis backend
-/// (issue #1256) can drop in later with the same interface.
+/// (the identity-storage substrate) can drop in later with the same interface.
 pub trait SessionRegistry: Send + Sync {
     /// Look up the state of a session, if known.
     fn session_state(&self, key: &SessionKey) -> Option<SessionState>;
 
-    /// Register a new session. Overwrites a prior entry for the same key
-    /// (session refresh re-registers with an updated clearance epoch).
-    fn register_session(&self, key: SessionKey, state: SessionState);
+    /// Register a new session. Returns `Err` if a session already exists at
+    /// the given key — session identifiers are never reassigned (v16 §3.3).
+    /// A revoked session CANNOT be reactivated by re-registration. Also
+    /// rejects a key/state kind mismatch (OIDC sid must pair with Interactive,
+    /// workload must pair with Workload).
+    fn register_session(
+        &self,
+        key: SessionKey,
+        state: SessionState,
+    ) -> Result<(), SessionRegisterError>;
 
     /// Revoke a session: mark it revoked, then evict every credential
     /// derived from it.
@@ -228,10 +250,83 @@ pub trait SessionRegistry: Send + Sync {
     /// authority is being flushed.
     fn revoke_session(&self, key: &SessionKey);
 
-    /// Whether a session is currently revoked (or unknown). Returns `true`
-    /// if the session is revoked OR not found (fail-closed for unknown
-    /// sessions when the caller requires a known-active session).
+    /// Whether a session is currently revoked, expired, or unknown. Returns
+    /// `true` if the session is revoked, expired, OR not found (fail-closed
+    /// for unknown sessions).
     fn is_revoked(&self, key: &SessionKey) -> bool;
+}
+
+/// Error returned when a session already exists at the given key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionExists;
+
+impl std::fmt::Display for SessionExists {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "session already exists (identifiers are never reassigned)")
+    }
+}
+
+impl std::error::Error for SessionExists {}
+
+/// Error returned when a session key's identifier variant disagrees with the
+/// session state's kind (v16 §3.3 coherence requirement).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionKindMismatch;
+
+impl std::fmt::Display for SessionKindMismatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "session key variant does not match session state kind"
+        )
+    }
+}
+
+impl std::error::Error for SessionKindMismatch {}
+
+/// Error returned by [`SessionRegistry::register_session`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionRegisterError {
+    /// A session already exists at the given key.
+    Exists(SessionExists),
+    /// The key's identifier variant disagrees with the state's kind.
+    KindMismatch(SessionKindMismatch),
+}
+
+impl std::fmt::Display for SessionRegisterError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Exists(e) => write!(f, "{e}"),
+            Self::KindMismatch(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl std::error::Error for SessionRegisterError {}
+
+impl From<SessionExists> for SessionRegisterError {
+    fn from(e: SessionExists) -> Self {
+        Self::Exists(e)
+    }
+}
+
+impl From<SessionKindMismatch> for SessionRegisterError {
+    fn from(e: SessionKindMismatch) -> Self {
+        Self::KindMismatch(e)
+    }
+}
+
+/// Validate that a session key's identifier variant matches the session state
+/// kind (OIDC sid → Interactive, workload → Workload).
+fn validate_key_kind_coherence(
+    key: &SessionKey,
+    state: &SessionState,
+) -> Result<(), SessionKindMismatch> {
+    match (&key.id, state.kind) {
+        (SessionIdentifier::OidcSid(_), SessionKind::Interactive)
+        | (SessionIdentifier::WorkloadSessionId(_), SessionKind::Workload) => Ok(()),
+        _ => Err(SessionKindMismatch),
+    }
 }
 
 /// In-memory session registry with TTL cleanup.
@@ -275,17 +370,40 @@ impl SessionRegistry for InMemorySessionRegistry {
         }
     }
 
-    fn register_session(&self, key: SessionKey, state: SessionState) {
+    fn register_session(
+        &self,
+        key: SessionKey,
+        state: SessionState,
+    ) -> Result<(), SessionRegisterError> {
+        // Reject malformed keys (empty issuer or session identifier).
+        if !key.is_valid() {
+            return Err(SessionKindMismatch.into());
+        }
+        // Require nonempty subject and tenant (v16 §3.3 record shape).
+        if state.subject.is_empty() || state.tenant.is_empty() {
+            return Err(SessionKindMismatch.into());
+        }
+        validate_key_kind_coherence(&key, &state)?;
         #[cfg(not(target_arch = "wasm32"))]
         {
-            self.sessions.write().insert(key, state);
+            let mut map = self.sessions.write();
+            if map.contains_key(&key) {
+                return Err(SessionExists.into());
+            }
+            map.insert(key, state);
+            Ok(())
         }
         #[cfg(target_arch = "wasm32")]
         {
-            self.sessions
+            let mut map = self
+                .sessions
                 .write()
-                .expect("session registry lock poisoned")
-                .insert(key, state);
+                .expect("session registry lock poisoned");
+            if map.contains_key(&key) {
+                return Err(SessionExists.into());
+            }
+            map.insert(key, state);
+            Ok(())
         }
     }
 
@@ -311,9 +429,10 @@ impl SessionRegistry for InMemorySessionRegistry {
 
         // Phase 2 — EVICT: flush the verified-subject cache generation so
         // cached handles derived from credentials carrying this session are
-        // invalidated. The generation flush is a broad eviction (the cache
-        // does not yet index by session ID); when session-indexed handle
-        // eviction lands, it will target only handles for this session.
+        // invalidated. This is a conservative broad eviction: it flushes
+        // ALL cached handles, not just those for this session. The
+        // correctness guarantee holds (no stale authority survives), at
+        // the cost of re-verifying unrelated subjects on their next access.
         #[cfg(not(target_arch = "wasm32"))]
         {
             crate::auth::mac::flush_verified_subject_cache_generation();
@@ -322,7 +441,10 @@ impl SessionRegistry for InMemorySessionRegistry {
 
     fn is_revoked(&self, key: &SessionKey) -> bool {
         match self.session_state(key) {
-            Some(state) => state.status == ActiveOrRevoked::Revoked,
+            Some(state) => {
+                state.status == ActiveOrRevoked::Revoked
+                    || state.expires_at <= chrono::Utc::now().timestamp()
+            }
             None => true, // fail-closed for unknown sessions
         }
     }

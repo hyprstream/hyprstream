@@ -9,7 +9,6 @@
 
 use std::sync::Arc;
 
-use hyprstream_rpc::auth::CredentialRevocationStore as _;
 use subtle::ConstantTimeEq;
 use axum::{
     extract::{Request, State},
@@ -290,15 +289,19 @@ pub(super) async fn validate_oauth_access_token(
     if !issuer_is_local {
         return Err("JWT issuer invalid");
     }
-    if claims
-        .jti
-        .as_deref()
-        .is_some_and(|jti| {
-            let cred_id = hyprstream_rpc::auth::CredentialId::jwt(&claims.iss, jti);
-            state.jti_blocklist.as_ref().is_some_and(|list| list.is_revoked(&cred_id))
-        })
-    {
-        return Err("JWT revoked");
+    // Fail-closed revocation: if the token carries a jti but no store is
+    // configured, reject — a potentially-revoked credential must not be
+    // admitted when revocation status cannot be checked.
+    if let Some(jti) = claims.jti.as_deref() {
+        let cred_id = hyprstream_rpc::auth::CredentialId::jwt(&claims.iss, jti);
+        match hyprstream_rpc::auth::global_credential_revocation_store() {
+            Some(store) => {
+                if store.is_revoked(&cred_id) {
+                    return Err("JWT revoked");
+                }
+            }
+            None => return Err("revocation store unavailable"),
+        }
     }
     Ok(claims)
 }
