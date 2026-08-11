@@ -34,6 +34,7 @@ fn test_envelope_serialization_deterministic() {
         client_kem_public: None,
         response_kem_recipient: None,
         service_domain: None,
+        proof_cwt: None,
     };
 
     let envelope2 = envelope1.clone();
@@ -69,6 +70,7 @@ fn test_envelope_signature_verification_stable() -> anyhow::Result<()> {
         client_kem_public: None,
         response_kem_recipient: None,
         service_domain: None,
+        proof_cwt: None,
     };
 
     let signed1 = make_signed(envelope.clone(), &signing_key);
@@ -150,6 +152,7 @@ fn test_envelope_canonical_form() {
         client_kem_public: None,
         response_kem_recipient: None,
         service_domain: None,
+        proof_cwt: None,
     };
 
     let bytes = envelope.to_bytes();
@@ -181,6 +184,7 @@ fn test_envelope_with_authorization_deterministic() {
         client_kem_public: None,
         response_kem_recipient: None,
         service_domain: None,
+        proof_cwt: None,
     };
 
     let bytes1 = envelope.to_bytes();
@@ -210,6 +214,7 @@ fn test_envelope_different_data_different_bytes() {
             eks: vec![vec![0x11; 32], vec![0x22; 1184]],
         }),
         service_domain: Some("canonical-a".to_owned()),
+        proof_cwt: None,
     };
 
     let envelope2 = RequestEnvelope {
@@ -227,6 +232,7 @@ fn test_envelope_different_data_different_bytes() {
             eks: vec![vec![0x33; 32], vec![0x44; 1184]],
         }),
         service_domain: Some("canonical-b".to_owned()),
+        proof_cwt: None,
     };
 
     let bytes1 = envelope1.to_bytes();
@@ -258,6 +264,7 @@ fn test_populated_response_recipient_changes_canonical_bytes() {
         client_kem_public: None,
         response_kem_recipient: Some(recipient(0x55, 0x66)),
         service_domain: Some("canonical-service".to_owned()),
+        proof_cwt: None,
     };
     let first_again = first.to_bytes();
     assert_eq!(first_again, first.to_bytes());

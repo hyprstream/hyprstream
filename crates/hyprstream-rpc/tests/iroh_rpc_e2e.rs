@@ -434,6 +434,7 @@ async fn cleartext_envelope_rejected_on_iroh_receive() -> Result<()> {
         client_kem_public: None,
         response_kem_recipient: None,
         service_domain: None,
+        proof_cwt: None,
     };
     let signed = SignedEnvelope::new_signed_hybrid(envelope, &client_signing, &client_pq_sk);
     let mut wire = Vec::new();
@@ -520,6 +521,7 @@ async fn false_encrypted_marker_never_reaches_custom_processor_over_iroh() -> Re
             client_kem_public: None,
             response_kem_recipient: None,
             service_domain: None,
+            proof_cwt: None,
         },
         &signer,
         &pq_signer,

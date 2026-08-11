@@ -583,6 +583,13 @@ pub struct RequestEnvelope {
     /// Canonical destination service. On untrusted carriers this is required,
     /// carried only in the signed+sealed request, and checked by dispatch.
     pub service_domain: Option<String>,
+
+    /// v16 proof CWT (`application/vnd.hyprstream.proof+cwt`). When present,
+    /// carries the canonical request body, credential hash, response binding,
+    /// and one 128-bit request_id replacing requestId+nonce. Servers verify
+    /// this in the dispatch pipeline; the legacy nonce-based replay cache is
+    /// the fallback during dual-read migration.
+    pub proof_cwt: Option<Vec<u8>>,
 }
 
 impl RequestEnvelope {
@@ -600,6 +607,7 @@ impl RequestEnvelope {
             client_kem_public: None,
             response_kem_recipient: None,
             service_domain: None,
+            proof_cwt: None,
         }
     }
 
@@ -667,6 +675,12 @@ impl RequestEnvelope {
         validate_service_domain(&service_domain)?;
         self.service_domain = Some(service_domain);
         Ok(self)
+    }
+
+    /// Attach a v16 proof CWT to this envelope.
+    pub fn with_proof_cwt(mut self, proof_cwt: Vec<u8>) -> Self {
+        self.proof_cwt = Some(proof_cwt);
+        self
     }
 
     /// Create an envelope for an anonymous request.
@@ -1657,6 +1671,7 @@ impl SignedEnvelope {
             client_kem_public: None,
             response_kem_recipient: None,
             service_domain: None,
+            proof_cwt: None,
         }
     }
 
@@ -2118,6 +2133,9 @@ impl ToCapnp for RequestEnvelope {
         if let Some(ref service_domain) = self.service_domain {
             builder.set_service_domain(service_domain);
         }
+        if let Some(ref proof_cwt) = self.proof_cwt {
+            builder.set_proof_cwt(proof_cwt);
+        }
     }
 }
 
@@ -2245,6 +2263,11 @@ impl FromCapnp for RequestEnvelope {
             client_kem_public,
             response_kem_recipient,
             service_domain,
+            proof_cwt: reader
+                .reborrow()
+                .get_proof_cwt()
+                .ok()
+                .map(<[u8]>::to_vec),
         })
     }
 }
@@ -3471,6 +3494,7 @@ mod tests {
             client_kem_public: None,
             response_kem_recipient: None,
             service_domain: None,
+            proof_cwt: None,
         };
 
         let mut message = Builder::new_default();
@@ -3515,6 +3539,7 @@ mod tests {
             client_kem_public: None,
             response_kem_recipient: None,
             service_domain: None,
+            proof_cwt: None,
         };
 
         // Seal to the node's #mesh-kem public, dual-signed (EdDSA + ML-DSA-65).
@@ -3578,6 +3603,7 @@ mod tests {
             client_kem_public: None,
             response_kem_recipient: None,
             service_domain: None,
+            proof_cwt: None,
         };
         let signed =
             SignedEnvelope::new_signed_encrypted_mesh_kem(envelope, &node_sk, &pq_sk, &kem_pub)
@@ -3630,6 +3656,7 @@ mod tests {
                 client_kem_public: None,
                 response_kem_recipient: None,
                 service_domain: None,
+                proof_cwt: None,
             },
             &node_sk,
             &pq_sk,
@@ -3833,6 +3860,7 @@ mod tests {
             client_kem_public: None,
             response_kem_recipient: None,
             service_domain: None,
+            proof_cwt: None,
         };
 
         let mut signed = test_new_signed(envelope, &signing_key);
@@ -3880,6 +3908,7 @@ mod tests {
             client_kem_public: None,
             response_kem_recipient: None,
             service_domain: None,
+            proof_cwt: None,
         };
 
         let mut signed = test_new_signed(envelope, &signing_key);
@@ -4983,7 +5012,8 @@ mod tests {
         store.bind(anchored_vk.to_bytes(), &pq_vk);
 
         // Anchored service: classical rejected, hybrid accepted.
-        let classical = SignedEnvelope::new_signed(RequestEnvelope::anonymous(vec![5]), &anchored_sk);
+        let classical =
+            SignedEnvelope::new_signed(RequestEnvelope::anonymous(vec![5]), &anchored_sk);
         assert!(
             classical
                 .verify_with(&anchored_vk, &cache, Some(&store), CryptoPolicy::Classical)
@@ -5045,8 +5075,12 @@ mod tests {
             !store.is_anchored(&client_vk.to_bytes()),
             "the interop client must not be anchored — that is what this test is about"
         );
-        SignedEnvelope::new_signed(RequestEnvelope::anonymous(vec![12]), &client_sk)
-            .verify_with(&client_vk, &cache, Some(&store), CryptoPolicy::Classical)?;
+        SignedEnvelope::new_signed(RequestEnvelope::anonymous(vec![12]), &client_sk).verify_with(
+            &client_vk,
+            &cache,
+            Some(&store),
+            CryptoPolicy::Classical,
+        )?;
 
         Ok(())
     }
@@ -5062,7 +5096,10 @@ mod tests {
 
         let mut store = KeyedPqTrustStore::new();
         assert!(store.register(vk.to_bytes(), Some(&pq_vk)));
-        assert!(store.register(vk.to_bytes(), None), "classical re-registration must not clear the anchor");
+        assert!(
+            store.register(vk.to_bytes(), None),
+            "classical re-registration must not clear the anchor"
+        );
         assert!(store.is_anchored(&vk.to_bytes()));
         assert_eq!(store.len(), 1);
 
@@ -5103,7 +5140,9 @@ mod tests {
         store.bind(vk.to_bytes(), &pq_vk_b);
 
         // The original anchor survives.
-        let anchored_vk = store.ml_dsa_key_for(&vk.to_bytes()).expect("anchor survived");
+        let anchored_vk = store
+            .ml_dsa_key_for(&vk.to_bytes())
+            .expect("anchor survived");
         let original_bytes = crate::crypto::pq::ml_dsa_vk_bytes(&pq_vk_a);
         let survived_bytes = crate::crypto::pq::ml_dsa_vk_bytes(&anchored_vk);
         assert_eq!(

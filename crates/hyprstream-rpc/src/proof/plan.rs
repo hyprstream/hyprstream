@@ -265,13 +265,10 @@ fn decode_text(v: &CborValue, name: &str, max: usize) -> Result<String> {
     }
 }
 
-/// Decode a kid value — accept both CBOR text strings and byte strings,
-/// normalizing to raw bytes. The frozen canonical vectors use text-string
-/// kids (e.g. "unattributed-ed25519-1"), so both forms must be accepted.
+/// Decode a kid value. The frozen CDDL specifies `bstr .size (1..64)`.
 fn decode_kid(v: &CborValue) -> Result<Vec<u8>> {
     match v {
         CborValue::Bytes(b) => Ok(b.clone()),
-        CborValue::Text(s) => Ok(s.as_bytes().to_vec()),
-        _ => bail!("kid: must be bstr or tstr"),
+        _ => bail!("kid: must be bstr"),
     }
 }

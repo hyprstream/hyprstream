@@ -305,6 +305,7 @@ fn request_envelope(payload: &[u8]) -> RequestEnvelope {
         client_kem_public: None,
         response_kem_recipient: None,
         service_domain: Some("inv2-sentinel".to_owned()),
+        proof_cwt: None,
     }
 }
 

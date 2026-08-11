@@ -187,7 +187,6 @@ impl ParsedProof {
             let alg = get_int_or_default(&protected_map, COSE_HEADER_ALG, 0)?;
             let kid = match get_value(&protected_map, COSE_HEADER_KID) {
                 Some(CborValue::Bytes(b)) => b.clone(),
-                Some(CborValue::Text(s)) => s.as_bytes().to_vec(),
                 _ => bail!("proof: Sign1 missing kid in merged protected header"),
             };
             let group_id = match get_value(&protected_map, HEADER_HS_LOGICAL_SIGNER_GROUP) {
@@ -255,17 +254,62 @@ impl ParsedProof {
     /// ordered public component keys, enrollment epoch) resolved by the
     /// verifier from the credential `cnf`, which is outside the parser's
     /// scope.
+    /// Compute the SHA-256 replay namespace thumbprint for an unattributed
+    /// proof: SHA-256 of the canonical encoding of `(signature_plan,
+    /// unattributed_key_set)` under the proof-key-set domain separator.
+    ///
+    /// The frozen profile specifies the exact tuple, not a superset hash of
+    /// the protected headers. We extract the two values from the protected
+    /// header CBOR and serialize them as a canonical CBOR array for hashing.
+    ///
+    /// Returns `None` for authenticated proofs — the authenticated thumbprint
+    /// requires the credential-bound primary signer-suite record resolved by
+    /// the verifier from the credential `cnf`, which is outside the parser's
+    /// scope.
     pub fn unattributed_replay_thumbprint(&self) -> Option<[u8; 32]> {
         if self.disposition != ProofDisposition::Unattributed {
             return None;
         }
-        // The thumbprint is over the body protected header bytes which contain
-        // the signature_plan and unattributed_key_set as CBOR values.
-        // The domain separator is applied by the caller.
+
+        // Re-decode the protected header to extract the exact plan and
+        // key_set values.
+        let protected: CborValue =
+            ciborium::de::from_reader(&mut std::io::Cursor::new(&self.protected_bytes)).ok()?;
+        let pmap = match &protected {
+            CborValue::Map(m) => m,
+            _ => return None,
+        };
+
+        let plan_val = pmap
+            .iter()
+            .find(|(k, _)| {
+                matches!(k,
+                    CborValue::Integer(i)
+                    if i128::from(*i) == HEADER_HS_SIGNATURE_PLAN as i128
+                )
+            })
+            .map(|(_, v)| v)?;
+        let key_set_val = pmap
+            .iter()
+            .find(|(k, _)| {
+                matches!(k,
+                    CborValue::Integer(i)
+                    if i128::from(*i) == HEADER_HS_UNATTRIBUTED_KEY_SET as i128
+                )
+            })
+            .map(|(_, v)| v)?;
+
+        // Serialize the canonical tuple [plan, key_set] for hashing.
+        let tuple = CborValue::Array(vec![plan_val.clone(), key_set_val.clone()]);
+        let mut tuple_bytes = Vec::new();
+        if ciborium::ser::into_writer(&tuple, &mut tuple_bytes).is_err() {
+            return None;
+        }
+
         use sha2::{Digest, Sha256};
         let mut hasher = Sha256::new();
         hasher.update(b"hs-proof-key-set-replay-v1");
-        hasher.update(&self.protected_bytes);
+        hasher.update(&tuple_bytes);
         let result = hasher.finalize();
         let mut out = [0u8; 32];
         out.copy_from_slice(&result);
@@ -311,7 +355,6 @@ fn parse_signature_entry(v: &CborValue) -> Result<ParsedSignature> {
 
     let kid = match get_value(&pmap, COSE_HEADER_KID) {
         Some(CborValue::Bytes(b)) => b.clone(),
-        Some(CborValue::Text(s)) => s.as_bytes().to_vec(),
         _ => bail!("sig protected: missing kid"),
     };
 
@@ -451,7 +494,6 @@ fn validate_unattributed_key_set(ks_val: &CborValue, plan: &SignaturePlan) -> Re
         let kty = get_int_from_map(&key_map, 1, "kty")?;
         let kid = match get_value_from_map(&key_map, 2) {
             Some(CborValue::Bytes(b)) => b.clone(),
-            Some(CborValue::Text(s)) => s.as_bytes().to_vec(),
             _ => bail!("proof: key-set element missing kid"),
         };
         let alg = get_int_from_map(&key_map, 3, "alg")?;

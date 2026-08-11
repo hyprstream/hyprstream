@@ -81,10 +81,13 @@ impl ChallengeManager {
         }
     }
 
-    /// Get the current (newest) challenge for attaching to `DispatchDenied`.
-    pub fn current(&self) -> Option<ServerChallenge> {
+    /// Get the current (newest still-valid) challenge for attaching to
+    /// `DispatchDenied`. Returns `None` if rotation has stalled and all
+    /// challenges have expired — the caller must refuse service rather than
+    /// advertise an unusable challenge.
+    pub fn current(&self, now: u64) -> Option<ServerChallenge> {
         let chals = self.challenges.read();
-        chals.last().cloned()
+        chals.iter().rev().find(|c| now < c.accept_until).cloned()
     }
 
     /// Validate a presented challenge against all still-acceptable values.
