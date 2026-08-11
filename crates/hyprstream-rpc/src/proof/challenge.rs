@@ -63,7 +63,10 @@ impl ServerChallenge {
 /// In production this rotates on a reviewed schedule (e.g. every 30 seconds
 /// with a 5-second overlap). Tests can use fixed values.
 pub struct ChallengeManager {
-    current: parking_lot::RwLock<ServerChallenge>,
+    /// All still-acceptable challenges, including the current one and any
+    /// rotated-out values whose `accept_until` has not passed. A proof
+    /// citing any of these values validates if `now < accept_until`.
+    challenges: parking_lot::RwLock<Vec<ServerChallenge>>,
     /// The overlap duration in seconds (how long after rotation a previous
     /// challenge is still accepted).
     overlap_seconds: u64,
@@ -73,28 +76,37 @@ impl ChallengeManager {
     /// Create with an initial challenge and a rotation overlap.
     pub fn new(initial: ServerChallenge, overlap_seconds: u64) -> Self {
         Self {
-            current: parking_lot::RwLock::new(initial),
+            challenges: parking_lot::RwLock::new(vec![initial]),
             overlap_seconds,
         }
     }
 
-    /// Get the current challenge (for attaching to `DispatchDenied` responses).
-    pub fn current(&self) -> ServerChallenge {
-        self.current.read().clone()
+    /// Get the current (newest) challenge for attaching to `DispatchDenied`.
+    pub fn current(&self) -> Option<ServerChallenge> {
+        let chals = self.challenges.read();
+        chals.last().cloned()
     }
 
-    /// Validate a presented challenge against the current challenge.
+    /// Validate a presented challenge against all still-acceptable values.
+    /// A proof citing any challenge value validates iff `now` precedes its
+    /// `accept_until`.
     pub fn validate(&self, presented: &[u8], now: u64) -> bool {
-        self.current.read().is_valid_at(presented, now)
+        let chals = self.challenges.read();
+        chals.iter().any(|c| c.is_valid_at(presented, now))
     }
 
-    /// Rotate to a new challenge value. The previous challenge remains
-    /// accepted until its own `accept_until` deadline.
+    /// Rotate to a new challenge value. The previous challenge(s) remain
+    /// accepted until their own `accept_until` deadline, so a retry that
+    /// crosses rotation is not denied early.
     pub fn rotate(&self, value: Vec<u8>, window_seconds: u64, now: u64) {
         let window_end = now + window_seconds;
         let accept_until = window_end + self.overlap_seconds;
         let new = ServerChallenge::new(value, window_end, accept_until);
-        *self.current.write() = new;
+        let mut chals = self.challenges.write();
+        // Prune expired challenges (accept_until has passed).
+        chals.retain(|c| c.accept_until > now);
+        // Push the new challenge.
+        chals.push(new);
     }
 }
 

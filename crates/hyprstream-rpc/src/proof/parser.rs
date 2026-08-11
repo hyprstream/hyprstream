@@ -246,20 +246,30 @@ impl ParsedProof {
         })
     }
 
-    /// The replay key component from the proof's signer identity.
+    /// Compute the SHA-256 replay namespace thumbprint for an unattributed
+    /// proof: SHA-256 of the canonical encoding of `(signature_plan,
+    /// unattributed_key_set)` under the proof-key-set domain separator.
     ///
-    /// For authenticated proofs this is the credential-bound primary signer
-    /// suite thumbprint; for unattributed proofs it is the canonical
-    /// plan/key-set thumbprint. The caller computes the actual SHA-256
-    /// thumbprint from this data.
-    pub fn replay_namespace_input(&self) -> Vec<u8> {
-        // The canonical encoding of [signature_plan, unattributed_key_set]
-        // for unattributed, or the signer-suite data for authenticated.
-        // The caller hashes this with the appropriate domain separator.
-        let mut buf = Vec::new();
-        let _ =
-            ciborium::ser::into_writer(&CborValue::Bytes(self.protected_bytes.clone()), &mut buf);
-        buf
+    /// Returns `None` for authenticated proofs — the authenticated thumbprint
+    /// requires the credential-bound primary signer-suite record (suite ID,
+    /// ordered public component keys, enrollment epoch) resolved by the
+    /// verifier from the credential `cnf`, which is outside the parser's
+    /// scope.
+    pub fn unattributed_replay_thumbprint(&self) -> Option<[u8; 32]> {
+        if self.disposition != ProofDisposition::Unattributed {
+            return None;
+        }
+        // The thumbprint is over the body protected header bytes which contain
+        // the signature_plan and unattributed_key_set as CBOR values.
+        // The domain separator is applied by the caller.
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(b"hs-proof-key-set-replay-v1");
+        hasher.update(&self.protected_bytes);
+        let result = hasher.finalize();
+        let mut out = [0u8; 32];
+        out.copy_from_slice(&result);
+        Some(out)
     }
 }
 
