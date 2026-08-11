@@ -97,6 +97,7 @@ fn record(
         components,
         epoch: 1,
         role,
+        approver_role: None,
         not_after: FIXTURE_NOT_AFTER,
         revoked: false,
     }
@@ -328,4 +329,122 @@ fn test_n16_unattributed_no_nonce_denies() {
     let vectors = load_negative_vectors();
     let n16 = vectors.iter().find(|(id, _, _)| id == "N-16").unwrap();
     assert!(crate::proof::parser::ParsedProof::parse(&n16.1).is_err());
+}
+
+// ---------------------------------------------------------------------------
+// Generated method policy against the frozen vectors
+// ---------------------------------------------------------------------------
+
+/// The verified output of a frozen vector must satisfy — and only satisfy —
+/// the method policy that matches its actual signing topology.
+#[test]
+fn frozen_vectors_satisfy_only_their_matching_method_policy() {
+    use crate::proof::policy::{evaluate, ApproverRule, CryptoSuite, SignaturePolicy};
+
+    let classical = classical_enrollment();
+    let hybrid = hybrid_enrollment();
+    let cnf = ed25519_public("client-ed25519-1");
+    let parse = |id: &str| {
+        let v = load_positive_vectors();
+        let bytes = &v.iter().find(|(vid, _)| vid == id).unwrap().1;
+        crate::proof::parser::ParsedProof::parse(bytes).unwrap()
+    };
+
+    // P-1: unattributed, standalone suite, no approvers.
+    let p1 = parse("P-1");
+    let p1_v =
+        crate::proof::verify::verify_proof_signatures(&p1, None, None, FIXTURE_NOW).unwrap();
+    assert!(evaluate(
+        &SignaturePolicy::UnauthenticatedOrTokenBound {
+            suite: CryptoSuite::Classical
+        },
+        p1.disposition,
+        &p1_v
+    )
+    .is_ok());
+    // The same proof cannot satisfy a token-bound method...
+    assert!(evaluate(
+        &SignaturePolicy::TokenBound {
+            suite: CryptoSuite::Classical
+        },
+        p1.disposition,
+        &p1_v
+    )
+    .is_err());
+    // ...nor a public method that requires the hybrid suite.
+    assert!(evaluate(
+        &SignaturePolicy::UnauthenticatedOrTokenBound {
+            suite: CryptoSuite::Hybrid
+        },
+        p1.disposition,
+        &p1_v
+    )
+    .is_err());
+
+    // P-2: authenticated hybrid, one logical signer, no approvers.
+    let p2 = parse("P-2");
+    let p2_v =
+        crate::proof::verify::verify_proof_signatures(&p2, Some(&cnf), Some(&hybrid), FIXTURE_NOW)
+            .unwrap();
+    assert_eq!(p2_v.primary_suite, crate::proof::SUITE_HYBRID);
+    assert!(p2_v.approvers.is_empty());
+    assert!(evaluate(
+        &SignaturePolicy::TokenBound {
+            suite: CryptoSuite::Hybrid
+        },
+        p2.disposition,
+        &p2_v
+    )
+    .is_ok());
+    // A method that requires an approval is not satisfied by one signer.
+    assert!(evaluate(
+        &SignaturePolicy::TokenBoundAndApproved {
+            primary_suite: CryptoSuite::Hybrid,
+            approver_rule: ApproverRule::KOfN { k: 1, n: 1 },
+        },
+        p2.disposition,
+        &p2_v
+    )
+    .is_err());
+
+    // P-5: authenticated, two distinct logical signer groups.
+    let p5 = parse("P-5");
+    let p5_v = crate::proof::verify::verify_proof_signatures(
+        &p5,
+        Some(&cnf),
+        Some(&classical),
+        FIXTURE_NOW,
+    )
+    .unwrap();
+    assert_eq!(p5_v.primary_principal.as_deref(), Some("client"));
+    assert_eq!(p5_v.approvers.len(), 1);
+    assert_eq!(p5_v.approvers[0].principal, "approver");
+    assert!(evaluate(
+        &SignaturePolicy::TokenBoundAndApproved {
+            primary_suite: CryptoSuite::Classical,
+            approver_rule: ApproverRule::KOfN { k: 1, n: 1 },
+        },
+        p5.disposition,
+        &p5_v
+    )
+    .is_ok());
+    // Two approvals are required; one does not satisfy the threshold.
+    assert!(evaluate(
+        &SignaturePolicy::TokenBoundAndApproved {
+            primary_suite: CryptoSuite::Classical,
+            approver_rule: ApproverRule::KOfN { k: 2, n: 3 },
+        },
+        p5.disposition,
+        &p5_v
+    )
+    .is_err());
+    // A method declaring no approver rule rejects the extra approval group.
+    assert!(evaluate(
+        &SignaturePolicy::TokenBound {
+            suite: CryptoSuite::Classical
+        },
+        p5.disposition,
+        &p5_v
+    )
+    .is_err());
 }

@@ -15,6 +15,8 @@
 //! - [`enrollment`] — per-entry enrolled signer-suite resolution for
 //!   authenticated and response proofs.
 //! - [`plan`] — canonical signature-plan types and validation.
+//! - [`policy`] — generated per-method signature policy (suite, disposition,
+//!   approver threshold) resolved for the decoded leaf.
 //! - [`parser`] — bounded COSE object parse, header/`crit` validation, and
 //!   proof-vector decode.
 //! - [`replay`] — replay admission store, partitioned by disposition.
@@ -28,6 +30,7 @@ pub mod claims;
 pub mod enrollment;
 pub mod parser;
 pub mod plan;
+pub mod policy;
 pub mod response;
 pub mod verify;
 

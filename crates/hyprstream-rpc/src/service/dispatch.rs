@@ -334,6 +334,127 @@ where
         return dispatch_denied(&e.to_string());
     }
 
+    // 2c. Proof authority (v16 §5.2 pipeline step 3). The credential was
+    // parsed and verified above (step 2); this cryptographically verifies the
+    // signer entries and the credential hash/cnf binding BEFORE the decoded
+    // leaf's generated policy and before dispatch MAC, so no unverified proof
+    // claim can influence authorization.
+    //
+    // Denials leave through the one uniform DispatchDenied surface, so a proof
+    // denial is externally indistinguishable from any other pre-handler denial
+    // and still hands the client a usable challenge to retry with.
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let verified_proof = match parsed_proof.as_ref() {
+        None => None,
+        Some(proof) => {
+            let authority = (|| -> Result<crate::proof::verify::VerifiedProof> {
+                // Every required component MUST cryptographically verify under
+                // the key its own enrolled signer-suite record pins.
+                // Verification also yields the replay namespace this proof is
+                // admitted under; it is never derived from wire material.
+                let cnf_key = ctx.authenticated_signer_key();
+                let verified = crate::proof::verify::verify_proof_signatures(
+                    proof,
+                    cnf_key.as_ref(),
+                    crate::proof::enrollment::global_enrollment_resolver(),
+                    now_secs,
+                )
+                .with_context(|| {
+                    format!("{} proof signature verification failed", service.name())
+                })?;
+
+                // Credential hash binding. Presenting a credential never
+                // leaves the proof in the unattributed branch (§4.4): hash
+                // absence is permitted only when no credential is presented,
+                // so a credential alongside an unattributed proof denies
+                // rather than silently dropping to system-low.
+                if proof.disposition == crate::proof::ProofDisposition::Unattributed
+                    && ctx.jwt_token().is_some()
+                {
+                    anyhow::bail!("credential presented with a proof carrying no credential_hash");
+                }
+                // Missing credential MUST deny — no skip/downgrade.
+                if proof.disposition == crate::proof::ProofDisposition::Authenticated {
+                    let expected_hash = proof.claims.credential_hash.ok_or_else(|| {
+                        anyhow::anyhow!("authenticated proof missing credential_hash")
+                    })?;
+                    let jwt = ctx.jwt_token().ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "authenticated proof: no credential (JWT) resolved from claims"
+                        )
+                    })?;
+                    use sha2::{Digest, Sha256};
+                    let actual_hash = Sha256::digest(jwt.as_bytes());
+                    if actual_hash.as_slice() != expected_hash {
+                        anyhow::bail!("proof credential hash does not match presented credential");
+                    }
+                }
+                Ok(verified)
+            })();
+            match authority {
+                Ok(verified) => Some(verified),
+                Err(e) => {
+                    warn!(
+                        "{} proof authority denied (id={}): {e:#}",
+                        service.name(),
+                        request_id
+                    );
+                    return dispatch_denied("dispatch denied");
+                }
+            }
+        }
+    };
+
+    // 2d. Generated per-method signature policy (§5.2 step 5, §4.4). The
+    // decoded leaf — not the caller — decides whether this method may be
+    // dispatched unattributed at all, which cryptographic suite its primary
+    // logical signer must use, and which enrolled approvers must sign.
+    // Enrollment says who signed; this says what the method requires.
+    //
+    // A leaf the generated table does not list is unlisted and denies. This
+    // gate runs only for proof-bearing requests: the pre-v16 path has no
+    // signed leaf to resolve, and is governed by the legacy checks below until
+    // the migration completes.
+    if let (Some(proof), Some(verified)) = (parsed_proof.as_ref(), verified_proof.as_ref()) {
+        let leaf_path = match ctx.browser_method_discriminator {
+            Some(method) => method.to_string(),
+            // No derived leaf path: an empty path denies rather than falling
+            // back to a coarser, more permissive row.
+            None => {
+                warn!(
+                    "{} proof-bearing request has no derived leaf path (id={})",
+                    service.name(),
+                    request_id
+                );
+                return dispatch_denied("dispatch denied");
+            }
+        };
+        let decision = match crate::proof::policy::global_method_policy() {
+            Some(table) => match table.policy_for(actual_service_domain, &leaf_path) {
+                Some(policy) => {
+                    crate::proof::policy::evaluate(&policy, proof.disposition, verified)
+                }
+                None => Err(anyhow::anyhow!(
+                    "unlisted (service, leaf) row for '{actual_service_domain}':'{leaf_path}'"
+                )),
+            },
+            None => Err(anyhow::anyhow!(
+                "no generated method policy table installed; proof-bearing dispatch denies"
+            )),
+        };
+        if let Err(e) = decision {
+            warn!(
+                "{} generated method policy denied (id={}): {e:#}",
+                service.name(),
+                request_id
+            );
+            return dispatch_denied("dispatch denied");
+        }
+    }
+
     // 2b. Mandatory native-MAC dispatch PEP (epic #1267 T3, #1268).
     //
     // This is the mandatory, unavoidable gate between claims verification
@@ -389,62 +510,11 @@ where
         return dispatch_denied(&format!("MAC deny: {reason:?}"));
     }
 
-    // 2c. Proof-CWT verification gate (v16 §5.2 pipeline: after policy,
-    // before handler). Every required gate MUST pass before handler entry.
-    // No gate is skipped — unimplemented checks deny fail-closed.
-    if let Some(ref proof) = parsed_proof {
-      // Every gate below denies through the one uniform DispatchDenied
-      // surface, so a proof denial is externally indistinguishable from any
-      // other pre-handler denial and still hands the client a usable
-      // challenge to retry with.
+    // 2e. Replay admission (§5.2 step 7). Deliberately last: the pipeline
+    // admits the replay key only after policy evaluation, so rejected and
+    // denied requests never consume store capacity.
+    if let (Some(proof), Some(verified)) = (parsed_proof.as_ref(), verified_proof.as_ref()) {
       let proof_admission = (|| -> Result<()> {
-        let now_secs = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-
-        // Gate 1: COSE signature verification — every required component MUST
-        // cryptographically verify under the key its own enrolled signer-suite
-        // record pins. Verification also yields the replay namespace this
-        // proof is admitted under; it is never derived from wire material.
-        let cnf_key = ctx.authenticated_signer_key();
-        let verified = crate::proof::verify::verify_proof_signatures(
-            proof,
-            cnf_key.as_ref(),
-            crate::proof::enrollment::global_enrollment_resolver(),
-            now_secs,
-        )
-        .with_context(|| format!("{} proof signature verification failed", service.name()))?;
-
-        // Gate 2: Credential hash binding.
-        //
-        // Presenting a credential never leaves the proof in the unattributed
-        // branch (§4.4): hash absence is permitted only when no credential is
-        // presented, so a credential alongside an unattributed proof denies
-        // rather than silently dropping to system-low.
-        if proof.disposition == crate::proof::ProofDisposition::Unattributed
-            && ctx.jwt_token().is_some()
-        {
-            warn!(
-                "{} credential presented with an unattributed proof; denying",
-                service.name()
-            );
-            anyhow::bail!("credential presented with a proof carrying no credential_hash");
-        }
-        // Missing credential MUST deny — no skip/downgrade.
-        if proof.disposition == crate::proof::ProofDisposition::Authenticated {
-            let expected_hash = proof.claims.credential_hash
-                .ok_or_else(|| anyhow::anyhow!("authenticated proof missing credential_hash"))?;
-            let jwt = ctx.jwt_token()
-                .ok_or_else(|| anyhow::anyhow!("authenticated proof: no credential (JWT) resolved from claims"))?;
-            use sha2::{Digest, Sha256};
-            let actual_hash = Sha256::digest(jwt.as_bytes());
-            if actual_hash.as_slice() != expected_hash {
-                warn!("{} proof credential_hash mismatch", service.name());
-                anyhow::bail!("proof credential hash does not match presented credential");
-            }
-        }
-
         // Gate 3: Challenge validation (unattributed proofs only).
         // validate() atomically returns the matched challenge's accept_until
         // so we can compute replay expiry without a TOCTOU race.
@@ -483,6 +553,55 @@ where
             Some(au) => proof.claims.exp.min(au),
             None => proof.claims.exp,
         };
+
+        // The issuer-declared credential profile selects the admission key
+        // (§3.4, §4.5). A one-shot credential's ID is consumed atomically and
+        // domain-wide as its SINGLE admission action: request_id still
+        // correlates the response but creates no second replay entry. The
+        // profile is read only from verified, issuer-signed claims — a caller
+        // cannot mark its own token one-shot, and a method cannot reinterpret
+        // a reusable token as one-shot.
+        let one_shot = ctx
+            .claims()
+            .and_then(|claims| {
+                claims
+                    .credential_use
+                    .filter(|use_profile| use_profile.is_one_shot())
+                    .map(|_| claims)
+            })
+            .map(|claims| -> Result<crate::proof::admission::OneShotCredentialId> {
+                // A one-shot credential with no credential ID cannot be
+                // consumed, so it can never be admitted.
+                let value = claims.jti.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!("one-shot credential carries no credential ID (jti/cti)")
+                })?;
+                Ok(crate::proof::admission::OneShotCredentialId {
+                    issuer: claims.iss.clone(),
+                    value: value.as_bytes().to_vec(),
+                })
+            })
+            .transpose()?;
+
+        if let Some(credential_id) = one_shot {
+            return match crate::proof::admission::consume_one_shot_credential(
+                replay_store,
+                &credential_id,
+                replay_expiry,
+            ) {
+                crate::proof::admission::ProofAdmissionResult::Admitted => {
+                    debug!("{} one-shot credential consumed", service.name());
+                    Ok(())
+                }
+                crate::proof::admission::ProofAdmissionResult::Replayed => {
+                    anyhow::bail!("one-shot credential already consumed")
+                }
+                crate::proof::admission::ProofAdmissionResult::Failed => {
+                    // Including a deployment whose routing cannot make the
+                    // consume domain-wide linearizable.
+                    anyhow::bail!("one-shot credential consumption could not be guaranteed")
+                }
+            };
+        }
 
         // The replay namespace comes from verification, not from wire
         // material: the credential-bound primary signer-suite thumbprint

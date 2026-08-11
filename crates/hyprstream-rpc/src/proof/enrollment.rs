@@ -127,6 +127,10 @@ pub struct SignerSuiteRecord {
     pub epoch: u64,
     /// The role this record is enrolled for.
     pub role: SignerRole,
+    /// The named approver role this enrollment holds, for role-specific
+    /// threshold rules. Meaningful only for [`SignerRole::Approver`]; the
+    /// name is enrollment data, never taken from the request.
+    pub approver_role: Option<String>,
     /// Credential/session expiry. A proof whose `exp` exceeds this denies.
     pub not_after: u64,
     /// Whether the enrollment has been revoked.
@@ -348,6 +352,7 @@ mod tests {
             )],
             epoch: 1,
             role,
+            approver_role: None,
             not_after: 2_000,
             revoked: false,
         }

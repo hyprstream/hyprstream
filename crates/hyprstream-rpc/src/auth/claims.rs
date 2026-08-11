@@ -109,6 +109,29 @@ pub struct ActClaim {
     pub act: Option<Box<ActClaim>>,
 }
 
+/// The issuer-declared credential use profile (design §3.4, frozen credential
+/// profile §4).
+///
+/// `Reusable` does not consume the credential ID: replay admission is keyed by
+/// the proof, so many fresh proofs may use one credential.
+/// `OneShotTransaction` consumes the credential ID atomically and domain-wide
+/// before handler admission, and creates no second proof replay entry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CredentialUse {
+    #[serde(rename = "reusable")]
+    Reusable,
+    #[serde(rename = "one-shot-transaction")]
+    OneShotTransaction,
+}
+
+impl CredentialUse {
+    /// Whether this profile consumes the credential ID as its single
+    /// admission action.
+    pub fn is_one_shot(self) -> bool {
+        matches!(self, Self::OneShotTransaction)
+    }
+}
+
 /// JWT claims for authentication.
 ///
 /// Casbin remains the server-side policy authority. OAuth access tokens also
@@ -152,6 +175,17 @@ pub struct Claims {
     /// Ed25519 challenge-response.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cnf: Option<Cnf>,
+    /// **Credential use profile (§3.4).** The issuer-declared profile for this
+    /// credential, covered by the token signature.
+    ///
+    /// Absent means `Reusable`, which is the profile's own default for user
+    /// access tokens and ordinary workload identity tokens. A caller cannot
+    /// mark its own token one-shot and a method cannot reinterpret a reusable
+    /// token as one-shot because it mutates: the value is only ever read from
+    /// verified, issuer-signed claims.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_use: Option<CredentialUse>,
+
     /// Original JWT token for end-to-end verification.
     /// When present, downstream services MUST verify this token
     /// independently rather than trusting the envelope claims alone.
@@ -319,6 +353,9 @@ impl FromCapnp for Claims {
             // the legacy structured scope list remains unused by Claims.
             scope,
             cnf,
+            // The credential use profile is issuer-signed and rides the JWT;
+            // the envelope Claims carrier cannot assert it. Absent = Reusable.
+            credential_use: None,
             token,
             // MAC clearance (S8/#574) is not carried on the Cap'n Proto envelope
             // surface today; it rides the JWT (the hybrid-signed authority token).
@@ -347,6 +384,7 @@ impl Claims {
             aud: None,
             scope: None,
             cnf: None,
+            credential_use: None,
             token: None,
             clearance: None,
             act: None,

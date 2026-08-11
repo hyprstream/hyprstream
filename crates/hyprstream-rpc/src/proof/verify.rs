@@ -26,6 +26,15 @@ use super::{
     ProofDisposition, ProofKind, ALG_ED25519, ALG_ML_DSA_65,
 };
 
+/// One additional enrolled logical signer that approved this request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedApprover {
+    /// The enrolled principal this approver group resolved to.
+    pub principal: String,
+    /// The approver role the enrollment carries, when it names one.
+    pub role: Option<String>,
+}
+
 /// What a successful verification establishes about the proof's signers.
 #[derive(Debug, Clone)]
 pub struct VerifiedProof {
@@ -37,6 +46,13 @@ pub struct VerifiedProof {
     /// unattributed key set proves only internal proof consistency and is
     /// never an identity.
     pub primary_principal: Option<String>,
+    /// The exact suite ID the primary logical signer group declared and
+    /// verified under. The method's generated policy compares against this,
+    /// never against a scalar hint on the body.
+    pub primary_suite: String,
+    /// The additional enrolled logical signers that approved, in ascending
+    /// group order. Empty for a single-signer proof.
+    pub approvers: Vec<VerifiedApprover>,
 }
 
 /// Verify all component signatures on a parsed request proof.
@@ -65,9 +81,23 @@ pub fn verify_proof_signatures(
             let thumbprint = proof.unattributed_replay_thumbprint().ok_or_else(|| {
                 anyhow!("unattributed proof: cannot compute replay namespace thumbprint")
             })?;
+            let primary_suite = proof
+                .plan
+                .groups
+                .first()
+                .map(|g| g.suite_id.clone())
+                .ok_or_else(|| anyhow!("unattributed proof has an empty signature plan"))?;
+            if proof.plan.groups.len() != 1 {
+                bail!(
+                    "unattributed proof must carry exactly one signer group, got {}",
+                    proof.plan.groups.len()
+                );
+            }
             Ok(VerifiedProof {
                 replay_thumbprint: thumbprint,
                 primary_principal: None,
+                primary_suite,
+                approvers: Vec::new(),
             })
         }
         ProofDisposition::Authenticated => {
@@ -139,6 +169,8 @@ pub fn verify_response_proof(
     Ok(VerifiedProof {
         replay_thumbprint: record.replay_thumbprint(),
         primary_principal: Some(record.principal),
+        primary_suite: record.suite_id,
+        approvers: Vec::new(),
     })
 }
 
@@ -283,9 +315,26 @@ fn verify_authenticated(
     check_distinct_signers(&resolved)?;
     verify_entries_against_records(proof, &resolved)?;
 
+    // Approvers in ascending plan-group order, so a threshold rule sees the
+    // same set the signed plan declares.
+    let mut approvers: Vec<VerifiedApprover> = proof
+        .plan
+        .groups
+        .iter()
+        .filter(|g| g.group_id != primary_group_id)
+        .filter_map(|g| resolved.get(&g.group_id))
+        .map(|record| VerifiedApprover {
+            principal: record.principal.clone(),
+            role: record.approver_role.clone(),
+        })
+        .collect();
+    approvers.shrink_to_fit();
+
     Ok(VerifiedProof {
         replay_thumbprint: primary.replay_thumbprint(),
         primary_principal: Some(primary.principal),
+        primary_suite: primary.suite_id,
+        approvers,
     })
 }
 
@@ -936,6 +985,7 @@ mod tests {
             )],
             epoch: 1,
             role: SignerRole::Approver,
+            approver_role: None,
             not_after: 1_786_000_600,
             revoked: false,
         };
@@ -972,6 +1022,7 @@ mod tests {
                     )],
                     epoch: 1,
                     role: SignerRole::Primary,
+                    approver_role: None,
                     not_after: 1_786_000_600,
                     revoked: false,
                 },
@@ -988,6 +1039,7 @@ mod tests {
                 )],
                 epoch: 1,
                 role: SignerRole::Approver,
+                approver_role: None,
                 not_after: 1_786_000_600,
                 revoked: false,
             })
@@ -1076,6 +1128,7 @@ mod tests {
                     )],
                     epoch: 1,
                     role: SignerRole::Service,
+                    approver_role: None,
                     not_after: 1_786_000_600,
                     revoked: false,
                 },
