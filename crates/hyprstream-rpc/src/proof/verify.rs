@@ -20,7 +20,7 @@ use ed25519_dalek::Verifier;
 use super::{
     parser::{CoseStructure, ParsedProof},
     ProofDisposition,
-    ALG_ED25519,
+    ALG_ED25519, ALG_ML_DSA_65,
 };
 
 /// Verify all component signatures on a parsed proof.
@@ -57,9 +57,6 @@ fn verify_unattributed(proof: &ParsedProof) -> Result<()> {
         CoseStructure::Sign1 => {
             let sign1 = coset::CoseSign1::from_slice(&cbor_bytes)
                 .map_err(|e| anyhow!("COSE_Sign1 decode: {e}"))?;
-            // External AAD is zero-length per the frozen profile.
-            // The payload is embedded in the COSE object, so use
-            // verify_signature (not verify_detached_signature).
             sign1
                 .verify_signature(&[], |sig, data| {
                     verify_ed25519(sig, data, &keys[0].1)
@@ -69,16 +66,24 @@ fn verify_unattributed(proof: &ParsedProof) -> Result<()> {
         CoseStructure::Sign => {
             let sign = coset::CoseSign::from_slice(&cbor_bytes)
                 .map_err(|e| anyhow!("COSE_Sign decode: {e}"))?;
-            // Verify each signature entry using the alg from our own parser.
+            // Every required component MUST verify. No component is skipped.
             for (i, parsed_sig) in proof.signatures.iter().enumerate() {
-                if parsed_sig.alg == ALG_ED25519 {
-                    let key = find_key_by_kid(&keys, &parsed_sig.kid)
-                        .ok_or_else(|| anyhow!("signature {i}: no matching Ed25519 key for kid"))?;
-                    sign
-                        .verify_signature(i, &[], |s, d| {
-                            verify_ed25519(s, d, key)
-                        })
-                        .map_err(|e| anyhow!("signature {i} Ed25519 verification: {e}"))?;
+                match parsed_sig.alg {
+                    ALG_ED25519 => {
+                        let key = find_key_by_kid(&keys, &parsed_sig.kid)
+                            .ok_or_else(|| anyhow!("sig {i}: no Ed25519 key for kid"))?;
+                        sign
+                            .verify_signature(i, &[], |s, d| {
+                                verify_ed25519(s, d, key)
+                            })
+                            .map_err(|e| anyhow!("sig {i} Ed25519 verification: {e}"))?;
+                    }
+                    ALG_ML_DSA_65 => {
+                        // ML-DSA-65 verification is not yet wired.
+                        // FAIL-CLOSED: deny rather than skip.
+                        bail!("ML-DSA-65 signature verification not implemented; denying proof");
+                    }
+                    other => bail!("unknown algorithm {other} in signature; denying"),
                 }
             }
             Ok(())
@@ -105,12 +110,18 @@ fn verify_authenticated(proof: &ParsedProof, cnf_key: &ed25519_dalek::VerifyingK
             let sign = coset::CoseSign::from_slice(&cbor_bytes)
                 .map_err(|e| anyhow!("COSE_Sign decode: {e}"))?;
             for (i, parsed_sig) in proof.signatures.iter().enumerate() {
-                if parsed_sig.alg == ALG_ED25519 {
-                    sign
-                        .verify_signature(i, &[], |s, d| {
-                            verify_ed25519(s, d, cnf_key)
-                        })
-                        .map_err(|e| anyhow!("cnf Ed25519 verification (sig {i}): {e}"))?;
+                match parsed_sig.alg {
+                    ALG_ED25519 => {
+                        sign
+                            .verify_signature(i, &[], |s, d| {
+                                verify_ed25519(s, d, cnf_key)
+                            })
+                            .map_err(|e| anyhow!("cnf Ed25519 sig {i}: {e}"))?;
+                    }
+                    ALG_ML_DSA_65 => {
+                        bail!("ML-DSA-65 cnf verification not implemented; denying");
+                    }
+                    other => bail!("unknown algorithm {other}; denying"),
                 }
             }
             Ok(())

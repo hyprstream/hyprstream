@@ -371,57 +371,49 @@ where
     }
 
     // 2c. Proof-CWT verification gate (v16 §5.2 pipeline: after policy,
-    // before handler). If a proof CWT is present, ALL required verification
-    // gates MUST pass before the handler runs. Failure on any gate denies
-    // the request — there is no fail-open path.
+    // before handler). Every required gate MUST pass before handler entry.
+    // No gate is skipped — unimplemented checks deny fail-closed.
     if let Some(ref proof) = parsed_proof {
-        // Gate 1: COSE signature verification.
-        // For unattributed proofs, verify against self-asserted keys.
-        // For authenticated proofs, verify against the cnf-bound Ed25519 key
-        // from the verified JWT claims.
+        // Gate 1: COSE signature verification — every required component
+        // MUST cryptographically verify. ML-DSA-65 components deny until
+        // verification is wired (not silently skipped).
         let cnf_key = ctx.authenticated_signer_key();
         crate::proof::verify::verify_proof_signatures(proof, cnf_key.as_ref())
             .with_context(|| format!("{} proof signature verification failed", service.name()))?;
 
         // Gate 2: Credential hash binding (authenticated proofs only).
-        // The proof's credential_hash MUST equal SHA-256 of the credential
-        // bytes (JWT token).
+        // Missing credential MUST deny — no skip/downgrade.
         if proof.disposition == crate::proof::ProofDisposition::Authenticated {
-            if let (Some(expected_hash), Some(jwt)) =
-                (proof.claims.credential_hash, ctx.jwt_token())
-            {
-                use sha2::{Digest, Sha256};
-                let actual_hash = Sha256::digest(jwt.as_bytes());
-                if actual_hash.as_slice() != expected_hash {
-                    warn!("{} proof credential_hash mismatch", service.name());
-                    anyhow::bail!("proof credential hash does not match presented credential");
-                }
+            let expected_hash = proof.claims.credential_hash
+                .ok_or_else(|| anyhow::anyhow!("authenticated proof missing credential_hash"))?;
+            let jwt = ctx.jwt_token()
+                .ok_or_else(|| anyhow::anyhow!("authenticated proof: no credential (JWT) resolved from claims"))?;
+            use sha2::{Digest, Sha256};
+            let actual_hash = Sha256::digest(jwt.as_bytes());
+            if actual_hash.as_slice() != expected_hash {
+                warn!("{} proof credential_hash mismatch", service.name());
+                anyhow::bail!("proof credential hash does not match presented credential");
             }
         }
 
         // Gate 3: Challenge validation (unattributed proofs only).
-        // The proof's Nonce MUST be present (enforced by parser) and match
-        // a current challenge. Without a process-global challenge manager
-        // wired yet, we accept the challenge as present-and-well-formed.
-        // The full challenge validation requires the ChallengeManager to be
-        // installed at startup and threaded through dispatch.
-
-        // Gate 4: Replay admission. Uses the existing NonceCache substrate
-        // (canonical #1516 pattern) keyed by the proof's request_id as a
-        // 16-byte nonce. This composes with the legacy nonce cache rather
-        // than creating a second store family.
-        let mut request_id_nonce = [0u8; 16];
-        request_id_nonce.copy_from_slice(&proof.claims.request_id);
-        if !crate::envelope::NonceCache::check_and_insert(nonce_cache, &request_id_nonce) {
-            warn!("{} proof replay detected (request_id already seen)", service.name());
-            anyhow::bail!("proof replay detected");
+        // Without a domain challenge manager installed, unattributed proofs
+        // DENY — presence alone is not sufficient.
+        if proof.disposition == crate::proof::ProofDisposition::Unattributed {
+            anyhow::bail!(
+                "unattributed proof challenge validation requires a domain challenge manager \
+                 to be installed; failing closed until ChallengeManager is wired into dispatch"
+            );
         }
 
-        debug!(
-            "{} proof-CWT fully verified and admitted: disposition={:?} request_id={}",
-            service.name(),
-            proof.disposition,
-            hex::encode(proof.claims.request_id)
+        // Gate 4: Replay admission.
+        // The proper replay admission uses the canonical #1516 substrate
+        // with (signer_thumbprint, request_id) keyed admission, partitioned
+        // by disposition, with per-proof expiry and domain-wide guarantees.
+        // Until that substrate is wired, proof replay admission DENIES.
+        anyhow::bail!(
+            "proof replay admission requires the canonical #1516 store substrate; \
+             failing closed until domain-wide replay is wired"
         );
     }
 
