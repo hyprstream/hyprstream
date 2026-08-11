@@ -64,7 +64,7 @@ static SHARED_GIT2DB: std::sync::OnceLock<Arc<RwLock<Git2DB>>> = std::sync::Once
 /// `create_oauth_service`. Because PolicyService is always created first
 /// (OAuthService `depends_on = ["policy"]`), the lock is always populated
 /// before `create_oauth_service` runs.
-static SHARED_JTI_BLOCKLIST: std::sync::OnceLock<Arc<hyprstream_rpc::auth::InMemoryJtiBlocklist>> =
+static SHARED_JTI_BLOCKLIST: std::sync::OnceLock<Arc<hyprstream_rpc::auth::InMemoryCredentialRevocationStore>> =
     std::sync::OnceLock::new();
 
 /// Get or initialize the shared Git2DB registry for the given models directory.
@@ -1648,7 +1648,7 @@ fn create_oai_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
                 SHARED_JTI_BLOCKLIST
                     .get()
                     .map(Arc::clone)
-                    .unwrap_or_else(|| Arc::new(hyprstream_rpc::auth::InMemoryJtiBlocklist::new())),
+                    .unwrap_or_else(|| Arc::new(hyprstream_rpc::auth::InMemoryCredentialRevocationStore::new())),
                 ninep_decider,
             )
             .await
@@ -2048,7 +2048,7 @@ fn create_mcp_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
                         async move {
                             use axum::http::{header, StatusCode};
                             use axum::response::IntoResponse;
-                            use hyprstream_rpc::auth::JtiBlocklist as _;
+                            use hyprstream_rpc::auth::CredentialRevocationStore as _;
                             use subtle::ConstantTimeEq as _;
                             let method = req.method().clone();
                             let uri = req.uri().clone();
@@ -2163,7 +2163,8 @@ fn create_mcp_service(ctx: &ServiceContext) -> anyhow::Result<Box<dyn Spawnable>
                             }
                             // JTI revocation check (RFC 7009)
                             if let Some(ref jti) = claims.jti {
-                                let revoked = jti_blocklist.as_ref().map(|bl| bl.is_revoked(jti)).unwrap_or(false);
+                                let cred_id = hyprstream_rpc::auth::CredentialId::jwt(&claims.iss, jti);
+                                let revoked = jti_blocklist.as_ref().map(|bl| bl.is_revoked(&cred_id)).unwrap_or(false);
                                 if revoked {
                                     tracing::warn!(%method, %uri, %jti, sub = %claims.sub, "MCP: revoked token presented");
                                     let mut res = (StatusCode::UNAUTHORIZED, "Authentication failed").into_response();

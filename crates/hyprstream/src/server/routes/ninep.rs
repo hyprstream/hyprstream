@@ -853,7 +853,7 @@ mod tests {
                 crate::auth::FederationKeyResolver::new(&trusted)
                     .with_jwks_fetcher(federation_fetcher),
             ),
-            Arc::new(hyprstream_rpc::auth::InMemoryJtiBlocklist::new()),
+            Arc::new(hyprstream_rpc::auth::InMemoryCredentialRevocationStore::new()),
         );
         state.composite_key_set = composite_keys;
         state.dpop_jti_seen = Arc::new(hyprstream_util::TtlCache::new(8, 16));

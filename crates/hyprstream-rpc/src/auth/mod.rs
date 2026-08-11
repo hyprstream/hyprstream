@@ -14,6 +14,7 @@ pub mod atproto_perimeter;
 pub mod claims;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod composite;
+pub mod credential;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod federation;
 pub mod jti_blocklist;
@@ -46,9 +47,13 @@ pub use composite::{
     CompositeKeyPair, CompositeKeySet, CompositeKeySetSnapshot, CompositePairRole,
     CompositePairState, global_composite_key_set,
 };
+pub use credential::{
+    ActiveOrRevoked, CredentialId, CredentialValue, InMemorySessionRegistry, SessionIdentifier,
+    SessionKey, SessionKind, SessionRegistry, SessionState,
+};
 #[cfg(not(target_arch = "wasm32"))]
 pub use federation::{FederationKey, FederationKeySource};
-pub use jti_blocklist::{InMemoryJtiBlocklist, JtiBlocklist};
+pub use jti_blocklist::{CredentialRevocationStore, InMemoryCredentialRevocationStore};
 pub use jwt::{
     CompositeJwtDispatch, JwkThumbprintInput, JwtError, ProtectedHeader,
     RFC9068_ACCESS_TOKEN_TYPES, composite_kid, decode, decode_unverified, decode_with_any_key,

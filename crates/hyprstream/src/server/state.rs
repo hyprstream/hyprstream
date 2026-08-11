@@ -76,7 +76,7 @@ pub struct ServerState {
 
     /// Shared JTI blocklist for access token revocation (RFC 7009).
     /// Populated by the OAuth revocation endpoint; checked on every request.
-    pub jti_blocklist: Arc<hyprstream_rpc::auth::InMemoryJtiBlocklist>,
+    pub jti_blocklist: Arc<hyprstream_rpc::auth::InMemoryCredentialRevocationStore>,
 
     /// Per-request DPoP JTI dedup cache (RFC 9449 §11.1 replay prevention).
     /// Backed by the shared `TtlCache` with atomic check-and-record
@@ -113,7 +113,7 @@ pub struct ResourceAuthState {
     pub resource_url: String,
     pub oauth_issuer_url: String,
     pub federation_resolver: Arc<crate::auth::FederationKeyResolver>,
-    pub jti_blocklist: Arc<hyprstream_rpc::auth::InMemoryJtiBlocklist>,
+    pub jti_blocklist: Arc<hyprstream_rpc::auth::InMemoryCredentialRevocationStore>,
     pub dpop_jti_seen: Arc<TtlCache<ReplayKey, ()>>,
     pub rate_limiter: Arc<crate::server::middleware::RateLimiter>,
 }
@@ -124,7 +124,7 @@ impl ResourceAuthState {
         resource_url: String,
         oauth_issuer_url: String,
         federation_resolver: Arc<crate::auth::FederationKeyResolver>,
-        jti_blocklist: Arc<hyprstream_rpc::auth::InMemoryJtiBlocklist>,
+        jti_blocklist: Arc<hyprstream_rpc::auth::InMemoryCredentialRevocationStore>,
     ) -> Self {
         Self {
             verifying_key: Arc::new(verifying_key),
@@ -198,7 +198,7 @@ impl ServerState {
         resource_url: String,
         oauth_issuer_url: String,
         trusted_issuers: &HashMap<String, crate::config::TrustedIssuerConfig>,
-        jti_blocklist: Arc<hyprstream_rpc::auth::InMemoryJtiBlocklist>,
+        jti_blocklist: Arc<hyprstream_rpc::auth::InMemoryCredentialRevocationStore>,
         ninep_decider: Arc<dyn hyprstream_9p::AccessDecider>,
     ) -> Result<Self, anyhow::Error> {
         let signing_key = Arc::new(signing_key);

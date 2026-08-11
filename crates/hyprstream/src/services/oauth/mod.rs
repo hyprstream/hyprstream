@@ -441,7 +441,7 @@ pub struct OAuthService {
     /// JWTs signed by PolicyService, derived from the root signing key.
     jwt_verifying_key: [u8; 32],
     /// Shared JTI blocklist (same Arc as PolicyService) for cross-plane revocation.
-    jti_blocklist: Option<Arc<hyprstream_rpc::auth::InMemoryJtiBlocklist>>,
+    jti_blocklist: Option<Arc<hyprstream_rpc::auth::InMemoryCredentialRevocationStore>>,
     /// Authority-owned hosted-account records for ATProto DID → tenant
     /// resolution. Attached by the PDS service composition layer.
     hosted_account_store: Option<Arc<hyprstream_pds_service::AccountRecordStore>>,
@@ -483,7 +483,7 @@ impl OAuthService {
     /// Attach the shared JTI blocklist (same Arc as PolicyService).
     pub fn with_jti_blocklist(
         mut self,
-        bl: Arc<hyprstream_rpc::auth::InMemoryJtiBlocklist>,
+        bl: Arc<hyprstream_rpc::auth::InMemoryCredentialRevocationStore>,
     ) -> Self {
         self.jti_blocklist = Some(bl);
         self

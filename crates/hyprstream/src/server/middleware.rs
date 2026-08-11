@@ -8,7 +8,7 @@ use axum::{
     middleware::Next,
     response::{IntoResponse, Response},
 };
-use hyprstream_rpc::auth::JtiBlocklist as _;
+use hyprstream_rpc::auth::CredentialRevocationStore as _;
 use hyprstream_util::InsertIfAbsentNoEvictResult;
 use std::sync::Arc;
 use std::time::Duration;
@@ -569,10 +569,11 @@ pub(crate) async fn verify_resource_token_claims(
         }
     };
 
-    // JTI revocation check (RFC 7009) — shared blocklist with the OAuth
-    // revocation endpoint.
+    // Credential revocation check (RFC 7009) — shared issuer-scoped store
+    // with the OAuth revocation endpoint.
     if let Some(ref jti) = claims.jti {
-        if state.jti_blocklist.is_revoked(jti) {
+        let cred_id = hyprstream_rpc::auth::CredentialId::jwt(&claims.iss, jti);
+        if state.jti_blocklist.is_revoked(&cred_id) {
             return Err("revoked token");
         }
     }
@@ -1409,7 +1410,7 @@ mod rotation_aware_tests {
     fn revoked_jti_still_rejected() {
         // A rotation-signed token decodes cleanly, but the shared jti-blocklist
         // check `verify_token_claims` performs after decode still rejects it.
-        use hyprstream_rpc::auth::{InMemoryJtiBlocklist, JtiBlocklist as _};
+        use hyprstream_rpc::auth::{CredentialId, CredentialRevocationStore as _, InMemoryCredentialRevocationStore};
 
         let ca = new_key();
         let rotation = new_key();
@@ -1427,10 +1428,11 @@ mod rotation_aware_tests {
         .unwrap();
         assert_eq!(claims.jti.as_deref(), Some("jti-777"));
 
-        let blocklist = InMemoryJtiBlocklist::new();
-        blocklist.revoke("jti-777".to_owned(), now() + 3600);
+        let blocklist = InMemoryCredentialRevocationStore::new();
+        let issuer = claims.iss.as_str();
+        blocklist.revoke_credential(CredentialId::jwt(issuer, "jti-777"), now() + 3600);
         // This mirrors the exact post-decode check in `verify_token_claims`.
-        assert!(blocklist.is_revoked(claims.jti.as_deref().unwrap()));
+        assert!(blocklist.is_revoked(&CredentialId::jwt(issuer, claims.jti.as_deref().unwrap())));
     }
 
     #[test]
@@ -1845,7 +1847,7 @@ mod composite_aware_tests {
 
     #[test]
     fn composite_jti_remains_subject_to_revocation() {
-        use hyprstream_rpc::auth::{InMemoryJtiBlocklist, JtiBlocklist as _};
+        use hyprstream_rpc::auth::{CredentialId, CredentialRevocationStore as _, InMemoryCredentialRevocationStore};
 
         let ca = new_ed_key();
         let (pq, pq_vk) = new_ml_dsa();
@@ -1872,9 +1874,10 @@ mod composite_aware_tests {
         )
         .unwrap();
         let jti = verified.jti.as_deref().unwrap();
-        let blocklist = InMemoryJtiBlocklist::new();
-        blocklist.revoke(jti.to_owned(), verified.exp);
-        assert!(blocklist.is_revoked(jti));
+        let issuer = verified.iss.as_str();
+        let blocklist = InMemoryCredentialRevocationStore::new();
+        blocklist.revoke_credential(CredentialId::jwt(issuer, jti), verified.exp);
+        assert!(blocklist.is_revoked(&CredentialId::jwt(issuer, jti)));
     }
 
     #[test]

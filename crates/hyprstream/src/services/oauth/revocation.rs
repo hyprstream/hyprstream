@@ -10,7 +10,7 @@ use axum::response::{IntoResponse, Response};
 use axum::Form;
 use serde::Deserialize;
 
-use hyprstream_rpc::auth::JtiBlocklist as _;
+use hyprstream_rpc::auth::CredentialRevocationStore as _;
 
 use super::state::OAuthState;
 
@@ -48,8 +48,9 @@ pub async fn revoke_token(
             match hyprstream_rpc::auth::decode_unverified(&params.token) {
                 Ok(claims) => {
                     if let Some(jti) = claims.jti {
-                        blocklist.revoke(jti, claims.exp);
-                        tracing::info!(sub = %claims.sub, "Revoked access token via jti blocklist");
+                        let cred_id = hyprstream_rpc::auth::CredentialId::jwt(&claims.iss, jti);
+                        blocklist.revoke_credential(cred_id, claims.exp);
+                        tracing::info!(sub = %claims.sub, "Revoked access token via credential revocation store");
                     }
                 }
                 Err(_) => {

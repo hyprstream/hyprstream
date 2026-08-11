@@ -800,11 +800,12 @@ pub trait RequestService: 'static {
         true
     }
 
-    /// JWT ID blocklist for access token revocation.
+    /// Credential revocation store for access token revocation.
     ///
-    /// When `Some`, `verify_claims()` rejects tokens whose `jti` appears
-    /// in the blocklist. Override to provide a shared blocklist instance.
-    fn jti_blocklist(&self) -> Option<&dyn crate::auth::JtiBlocklist> {
+    /// When `Some`, `verify_claims()` rejects tokens whose issuer-scoped
+    /// `(iss, jti)` appears in the store. Override to provide a shared
+    /// revocation store instance.
+    fn credential_revocation_store(&self) -> Option<&dyn crate::auth::CredentialRevocationStore> {
         None
     }
 
@@ -1142,11 +1143,12 @@ pub trait RequestService: 'static {
             _ => anyhow::bail!("unsupported JWT algorithm"),
         };
 
-        // Check jti against blocklist (revoked access tokens)
+        // Check credential against the revocation store (revoked access tokens)
         if let Some(ref jti) = verified.jti {
-            if let Some(blocklist) = self.jti_blocklist() {
-                if blocklist.is_revoked(jti) {
-                    tracing::warn!(jti = %jti, sub = %verified.sub, "Revoked JWT rejected");
+            if let Some(store) = self.credential_revocation_store() {
+                let cred_id = crate::auth::CredentialId::jwt(&verified.iss, jti);
+                if store.is_revoked(&cred_id) {
+                    tracing::warn!(jti = %jti, iss = %verified.iss, sub = %verified.sub, "Revoked JWT rejected");
                     anyhow::bail!("JWT has been revoked");
                 }
             }

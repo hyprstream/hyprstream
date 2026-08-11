@@ -439,7 +439,7 @@ mod tests {
     use axum::http::Request as HttpRequest;
     use hyprstream_rpc::auth::{
         CompositeKeyPair, CompositeKeySet, CompositePairRole, CompositePairState,
-        InMemoryJtiBlocklist, JtiBlocklist as _,
+        CredentialId, CredentialRevocationStore as _, InMemoryCredentialRevocationStore,
     };
     use std::collections::HashMap;
     use tower::ServiceExt; // oneshot
@@ -515,7 +515,7 @@ mod tests {
                 AUDIENCE.to_owned(),
                 ISSUER.to_owned(),
                 federation_resolver,
-                Arc::new(InMemoryJtiBlocklist::new()),
+                Arc::new(InMemoryCredentialRevocationStore::new()),
             ),
             // These handler tests exercise successful byte/range behavior.
             // Production installs the fail-closed MAC authorizer in the factory.
@@ -670,8 +670,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let issuer = TestIssuer::new();
         let state = with_test_issuer(test_state_with_xorb(dir.path(), HASH, b"x"), &issuer);
-        state.auth.jti_blocklist.revoke(
-            "revoked-xet".to_owned(),
+        state.auth.jti_blocklist.revoke_credential(
+            CredentialId::jwt(ISSUER, "revoked-xet"),
             chrono::Utc::now().timestamp() + 3600,
         );
         let token = issuer.token(AUDIENCE, "revoked-xet");

@@ -129,7 +129,7 @@ pub struct PolicyService {
     /// PolicyService is a blind relay — stores opaque wrapped blobs, never plaintext keys.
     event_prefixes: RwLock<HashMap<EventPrefixKey, EventPrefixState>>,
     /// Shared JWT ID blocklist for access token revocation.
-    jti_blocklist: Arc<hyprstream_rpc::auth::InMemoryJtiBlocklist>,
+    jti_blocklist: Arc<hyprstream_rpc::auth::InMemoryCredentialRevocationStore>,
     /// ES256 (P-256) key rotation store for DPoP/atproto interop.
     es256_key_store: Option<Arc<crate::auth::Es256SigningKeyStore>>,
     /// ML-DSA-65 key rotation store for PQ-hybrid composite token issuance.
@@ -163,7 +163,7 @@ impl PolicyService {
             jwt_key_source: None,
             transport,
             event_prefixes: RwLock::new(HashMap::new()),
-            jti_blocklist: Arc::new(hyprstream_rpc::auth::InMemoryJtiBlocklist::new()),
+            jti_blocklist: Arc::new(hyprstream_rpc::auth::InMemoryCredentialRevocationStore::new()),
             es256_key_store: None,
             ml_dsa_key_store: None,
             token_clearance_resolver: Arc::new(|subject| {
@@ -174,7 +174,7 @@ impl PolicyService {
     }
 
     /// Get a shared reference to the JWT ID blocklist (for wiring into OAuthState).
-    pub fn jti_blocklist_arc(&self) -> Arc<hyprstream_rpc::auth::InMemoryJtiBlocklist> {
+    pub fn jti_blocklist_arc(&self) -> Arc<hyprstream_rpc::auth::InMemoryCredentialRevocationStore> {
         Arc::clone(&self.jti_blocklist)
     }
 
@@ -1985,7 +1985,7 @@ impl RequestService for PolicyService {
         hyprstream_service::global_trust_store().resolve_subject(signer_pubkey)
     }
 
-    fn jti_blocklist(&self) -> Option<&dyn hyprstream_rpc::auth::JtiBlocklist> {
+    fn credential_revocation_store(&self) -> Option<&dyn hyprstream_rpc::auth::CredentialRevocationStore> {
         Some(self.jti_blocklist.as_ref())
     }
 

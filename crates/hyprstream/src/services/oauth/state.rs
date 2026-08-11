@@ -1218,7 +1218,7 @@ pub struct OAuthState {
     /// When present, JWKS serves all slots and issuance uses the active key.
     pub signing_key_store: Option<Arc<crate::auth::SigningKeyStore>>,
     /// Shared JWT ID blocklist for access token revocation (shared with PolicyService).
-    pub jti_blocklist: Option<Arc<hyprstream_rpc::auth::InMemoryJtiBlocklist>>,
+    pub jti_blocklist: Option<Arc<hyprstream_rpc::auth::InMemoryCredentialRevocationStore>>,
     /// ES256 (P-256) signing key rotation store for JWKS and DPoP/atproto interop.
     pub es256_key_store: Option<Arc<crate::auth::Es256SigningKeyStore>>,
     /// ML-DSA-65 signing key rotation store for PQ-hybrid JWT issuance.
@@ -1542,7 +1542,7 @@ impl OAuthState {
     /// revoked tokens — closing the gap between HTTP revocation and RPC auth.
     pub fn with_jti_blocklist(
         mut self,
-        bl: Arc<hyprstream_rpc::auth::InMemoryJtiBlocklist>,
+        bl: Arc<hyprstream_rpc::auth::InMemoryCredentialRevocationStore>,
     ) -> Self {
         self.jti_blocklist = Some(bl);
         self

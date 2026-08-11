@@ -9,7 +9,7 @@
 
 use std::sync::Arc;
 
-use hyprstream_rpc::auth::JtiBlocklist as _;
+use hyprstream_rpc::auth::CredentialRevocationStore as _;
 use subtle::ConstantTimeEq;
 use axum::{
     extract::{Request, State},
@@ -293,7 +293,10 @@ pub(super) async fn validate_oauth_access_token(
     if claims
         .jti
         .as_deref()
-        .is_some_and(|jti| state.jti_blocklist.as_ref().is_some_and(|list| list.is_revoked(jti)))
+        .is_some_and(|jti| {
+            let cred_id = hyprstream_rpc::auth::CredentialId::jwt(&claims.iss, jti);
+            state.jti_blocklist.as_ref().is_some_and(|list| list.is_revoked(&cred_id))
+        })
     {
         return Err("JWT revoked");
     }
